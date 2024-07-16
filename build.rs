@@ -4,8 +4,8 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    // Base path to the NDI SDK
-    let ndi_sdk_path = "C:\\Program Files\\NDI\\NDI 6 SDK";
+    // Base path to the NDI SDK from the environment variable
+    let ndi_sdk_path = env::var("NDI_SDK_DIR").expect("NDI_SDK_DIR environment variable not set");
 
     // Paths to the include and main header file
     let ndi_include_path = format!("{}\\Include", ndi_sdk_path);
@@ -14,9 +14,9 @@ fn main() {
     // Determine if we are targeting 64-bit or 32-bit
     let target = env::var("TARGET").expect("TARGET environment variable not set");
     let (lib_subdir, lib_name) = if target.contains("x86_64") {
-        ("x64", "Processing.NDI.Lib.x64.lib")
+        ("x64", "Processing.NDI.Lib.x64")
     } else {
-        ("x86", "Processing.NDI.Lib.x86.lib")
+        ("x86", "Processing.NDI.Lib.x86")
     };
 
     // Path to the library directory
@@ -29,12 +29,13 @@ fn main() {
     // Generate the bindings
     let bindings = bindgen::Builder::default()
         .header(main_header)
-        .clang_arg(format!("-I{}", ndi_include_path)) // Include the NDI SDK directory
+        .clang_arg(format!("-I{}", ndi_include_path))
         .generate()
         .expect("Unable to generate bindings");
 
     // Write the bindings to the $OUT_DIR/bindings.rs file
-    let out_path = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR environment variable not set"));
+    let out_path =
+        PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR environment variable not set"));
     bindings
         .write_to_file(out_path.join("bindings.rs"))
         .expect("Couldn't write bindings!");
