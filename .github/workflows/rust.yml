@@ -32,10 +32,7 @@ jobs:
         run: curl -L -o NDI.exe ${{ secrets.LIBRARY_URL }}
 
       - name: Install NDI SDK Library (Windows)
-        run: .\NDI.exe /VERYSILENT /LOG=out.txt /NORESTART /SUPPRESSMSGBOXES
-
-      - name: Display install log
-        run: Get-Content out.txt
+        run: Start-Process -FilePath '.\NDI.exe' -ArgumentList '/VERYSILENT', '/LOG=out.txt', '/NORESTART', '/SUPPRESSMSGBOXES' -Wait; Get-Content out.txt
 
       - name: Set Environment Variables (Windows)
         run: |
