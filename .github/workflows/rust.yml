@@ -32,7 +32,7 @@ jobs:
         run: curl -L -o NDI_6_SDK.zip ${{ secrets.NDI_SDK_ZIP_URL }}
 
       - name: Install NDI SDK Library (Windows)
-        run: Expand-Archive -Path '.\NDI_6_SDK.zip' -DestinationPath $env:NDI_SDK_DIR 
+        run: Expand-Archive -Path '.\NDI_6_SDK.zip' -DestinationPath $env:NDI_SDK_DIR
 
       - name: Set Environment Variables (Windows)
         run: |
@@ -58,9 +58,21 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  lint:
+    name: Lint
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Run Clippy
+        run: cargo clippy -- -D warnings
+
   publish:
     name: Publish
-    needs: [test, format]
+    needs: [test, format, lint]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: windows-latest
     steps:
