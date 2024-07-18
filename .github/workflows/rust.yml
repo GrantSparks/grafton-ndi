@@ -37,7 +37,7 @@ jobs:
         run: |
           echo "NDI_SDK_DIR=C:\Library" >> $GITHUB_ENV
           echo "C:\Library\Bin\x64" >> $GITHUB_PATH
-          echo "C:\Library\bin;%PATH%" | Out-File -Encoding ASCII -Append $env:GITHUB_ENV
+          echo "C:\Library\bin;%PATH%" >> $GITHUB_ENV
 
       - uses: Swatinem/rust-cache@v2
 
