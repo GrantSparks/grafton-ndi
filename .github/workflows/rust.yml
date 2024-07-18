@@ -33,7 +33,8 @@ jobs:
       - name: Install Third-Party Library (Windows)
         run: |
           .\library_installer.exe /VERYSILENT /SUPPRESSMSGBOXES /DIR=C:\Library
-          echo "C:\Library\bin" >> $Env:GITHUB_PATH
+          echo "C:\Library\" >> $Env:NDI_SDK_DIR 
+          echo "%NDI_SDK_DIR%\Bin\x64" >> $Env:GITHUB_PATH
 
       - name: Set Environment Variables (Windows)
         run: |
