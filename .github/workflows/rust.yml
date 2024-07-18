@@ -28,20 +28,16 @@ jobs:
       - name: Install LLVM for bindgen (Windows)
         run: choco install llvm
 
-      - name: Download Third-Party Library Installer (Windows)
-        run: curl -L -o library_installer.exe ${{ secrets.LIBRARY_URL }}
+      - name: Download NDI SDK Library Installer (Windows)
+        run: curl -L -o NDI.exe ${{ secrets.LIBRARY_URL }}
 
       - name: Install Third-Party Library (Windows)
-        run: .\library_installer.exe /VERYSILENT /SUPPRESSMSGBOXES /DIR=C:\Library
-
-      - name: List contents of Library installation directory (Windows)
-        run: Get-ChildItem -Path C:\Library -Recurse
-        shell: pwsh
+        run: .\NDI.exe /VERYSILENT /LOG /NORESTART /SUPPRESSMSGBOXES
 
       - name: Set Environment Variables (Windows)
         run: |
-          echo "NDI_SDK_DIR=C:\Library" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          echo "C:\Library\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "NDI_SDK_DIR='C:\Program Files\NDI\NDI 6 SDK\'" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "'C:\Program Files\NDI\NDI 6 SDK\Bin\x64'" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
         shell: pwsh
 
       - uses: Swatinem/rust-cache@v2
