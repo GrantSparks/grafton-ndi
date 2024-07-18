@@ -53,7 +53,13 @@ use ndi_lib::{
     NDIlib_recv_color_format_e_NDIlib_recv_color_format_max, NDIlib_recv_connect,
     NDIlib_recv_create_v3, NDIlib_recv_create_v3_t, NDIlib_recv_destroy, NDIlib_recv_free_audio_v3,
     NDIlib_recv_free_metadata, NDIlib_recv_free_video_v2, NDIlib_recv_instance_t,
-    NDIlib_recv_ptz_is_supported, NDIlib_recv_ptz_recall_preset,
+    NDIlib_recv_ptz_auto_focus, NDIlib_recv_ptz_exposure_auto, NDIlib_recv_ptz_exposure_manual,
+    NDIlib_recv_ptz_exposure_manual_v2, NDIlib_recv_ptz_focus, NDIlib_recv_ptz_focus_speed,
+    NDIlib_recv_ptz_is_supported, NDIlib_recv_ptz_pan_tilt, NDIlib_recv_ptz_pan_tilt_speed,
+    NDIlib_recv_ptz_recall_preset, NDIlib_recv_ptz_store_preset,
+    NDIlib_recv_ptz_white_balance_auto, NDIlib_recv_ptz_white_balance_indoor,
+    NDIlib_recv_ptz_white_balance_manual, NDIlib_recv_ptz_white_balance_oneshot,
+    NDIlib_recv_ptz_white_balance_outdoor, NDIlib_recv_ptz_zoom, NDIlib_recv_ptz_zoom_speed,
     NDIlib_send_add_connection_metadata, NDIlib_send_capture,
     NDIlib_send_clear_connection_metadata, NDIlib_send_create, NDIlib_send_create_t,
     NDIlib_send_destroy, NDIlib_send_free_metadata, NDIlib_send_get_no_connections,
@@ -761,6 +767,70 @@ impl Recv {
 
     pub fn ptz_recall_preset(&self, preset: u32, speed: f32) -> bool {
         unsafe { NDIlib_recv_ptz_recall_preset(self.instance, preset as i32, speed) }
+    }
+
+    pub fn ptz_zoom(&self, zoom_value: f32) -> bool {
+        unsafe { NDIlib_recv_ptz_zoom(self.instance, zoom_value) }
+    }
+
+    pub fn ptz_zoom_speed(&self, zoom_speed: f32) -> bool {
+        unsafe { NDIlib_recv_ptz_zoom_speed(self.instance, zoom_speed) }
+    }
+
+    pub fn ptz_pan_tilt(&self, pan_value: f32, tilt_value: f32) -> bool {
+        unsafe { NDIlib_recv_ptz_pan_tilt(self.instance, pan_value, tilt_value) }
+    }
+
+    pub fn ptz_pan_tilt_speed(&self, pan_speed: f32, tilt_speed: f32) -> bool {
+        unsafe { NDIlib_recv_ptz_pan_tilt_speed(self.instance, pan_speed, tilt_speed) }
+    }
+
+    pub fn ptz_store_preset(&self, preset_no: i32) -> bool {
+        unsafe { NDIlib_recv_ptz_store_preset(self.instance, preset_no) }
+    }
+
+    pub fn ptz_auto_focus(&self) -> bool {
+        unsafe { NDIlib_recv_ptz_auto_focus(self.instance) }
+    }
+
+    pub fn ptz_focus(&self, focus_value: f32) -> bool {
+        unsafe { NDIlib_recv_ptz_focus(self.instance, focus_value) }
+    }
+
+    pub fn ptz_focus_speed(&self, focus_speed: f32) -> bool {
+        unsafe { NDIlib_recv_ptz_focus_speed(self.instance, focus_speed) }
+    }
+
+    pub fn ptz_white_balance_auto(&self) -> bool {
+        unsafe { NDIlib_recv_ptz_white_balance_auto(self.instance) }
+    }
+
+    pub fn ptz_white_balance_indoor(&self) -> bool {
+        unsafe { NDIlib_recv_ptz_white_balance_indoor(self.instance) }
+    }
+
+    pub fn ptz_white_balance_outdoor(&self) -> bool {
+        unsafe { NDIlib_recv_ptz_white_balance_outdoor(self.instance) }
+    }
+
+    pub fn ptz_white_balance_oneshot(&self) -> bool {
+        unsafe { NDIlib_recv_ptz_white_balance_oneshot(self.instance) }
+    }
+
+    pub fn ptz_white_balance_manual(&self, red: f32, blue: f32) -> bool {
+        unsafe { NDIlib_recv_ptz_white_balance_manual(self.instance, red, blue) }
+    }
+
+    pub fn ptz_exposure_auto(&self) -> bool {
+        unsafe { NDIlib_recv_ptz_exposure_auto(self.instance) }
+    }
+
+    pub fn ptz_exposure_manual(&self, exposure_level: f32) -> bool {
+        unsafe { NDIlib_recv_ptz_exposure_manual(self.instance, exposure_level) }
+    }
+
+    pub fn ptz_exposure_manual_v2(&self, iris: f32, gain: f32, shutter_speed: f32) -> bool {
+        unsafe { NDIlib_recv_ptz_exposure_manual_v2(self.instance, iris, gain, shutter_speed) }
     }
 }
 
