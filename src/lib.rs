@@ -13,7 +13,9 @@ use std::{
 };
 
 use ndi_lib::{
-    true_, NDIlib_FourCC_video_type_e, NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA,
+    true_, NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+    NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_max, NDIlib_FourCC_video_type_e,
+    NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA,
     NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRX,
     NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_I420,
     NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NV12,
@@ -242,7 +244,6 @@ impl Drop for Find {
 
 #[derive(Debug, Clone, Copy)]
 pub enum FourCCVideoType {
-    Unknown = 0,
     UYVY,
     UYVA,
     P216,
@@ -260,7 +261,6 @@ pub enum FourCCVideoType {
 impl From<FourCCVideoType> for NDIlib_FourCC_video_type_e {
     fn from(fourcc: FourCCVideoType) -> Self {
         match fourcc {
-            FourCCVideoType::Unknown => 0,
             FourCCVideoType::UYVY => NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY,
             FourCCVideoType::UYVA => NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVA,
             FourCCVideoType::P216 => NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_P216,
@@ -329,7 +329,7 @@ impl VideoFrame {
         VideoFrame {
             xres: 0,
             yres: 0,
-            fourcc: FourCCVideoType::Unknown,
+            fourcc: FourCCVideoType::RGBA,
             frame_rate_n: 0,
             frame_rate_d: 0,
             picture_aspect_ratio: 0.0,
@@ -439,7 +439,7 @@ impl AudioFrame {
             no_channels: 0,
             no_samples: 0,
             timecode: 0,
-            fourcc: AudioType::Unknown(0),
+            fourcc: AudioType::Max,
             data: Vec::new(),
             channel_stride_in_bytes: 0,
             metadata: None,
@@ -509,15 +509,14 @@ impl Default for AudioFrame {
 pub enum AudioType {
     FLTP,
     Max,
-    Unknown(i32),
 }
 
 impl From<i32> for AudioType {
     fn from(value: i32) -> Self {
-        match value {
-            1884572742 => AudioType::FLTP,
-            2147483647 => AudioType::Max,
-            _ => AudioType::Unknown(value),
+        if let NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP = value {
+            AudioType::FLTP
+        } else {
+            AudioType::Max
         }
     }
 }
@@ -525,9 +524,8 @@ impl From<i32> for AudioType {
 impl From<AudioType> for i32 {
     fn from(audio_type: AudioType) -> Self {
         match audio_type {
-            AudioType::FLTP => 1884572742,
-            AudioType::Max => 2147483647,
-            AudioType::Unknown(value) => value,
+            AudioType::FLTP => NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            AudioType::Max => NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_max,
         }
     }
 }
