@@ -16,6 +16,8 @@ env:
 jobs:
   setup:
     uses: ./.github/workflows/setup-environment.yml
+    with:
+      sdk_url: ${{ secrets.NDI_SDK_ZIP_URL }}
 
   test:
     name: Test
@@ -23,9 +25,6 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Use SDK Path
-        run: echo ${{ needs.setup.outputs.sdk_path }}
 
       - uses: Swatinem/rust-cache@v2
 

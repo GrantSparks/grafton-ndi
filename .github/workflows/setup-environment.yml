@@ -2,6 +2,11 @@ name: Setup Environment
 
 on:
   workflow_call:
+    inputs:
+      sdk_url:
+        description: "The URL to download the NDI SDK"
+        required: true
+        type: string
     outputs:
       sdk_path:
         description: "The path to the NDI SDK"
@@ -24,7 +29,7 @@ jobs:
         run: choco install llvm
 
       - name: Download NDI SDK Library Installer (Windows)
-        run: curl -L -o NDI_6_SDK.zip ${{ secrets.NDI_SDK_ZIP_URL }}
+        run: curl -L -o NDI_6_SDK.zip ${{ inputs.sdk_url }}
 
       - name: Install NDI SDK Library (Windows)
         id: install-sdk
