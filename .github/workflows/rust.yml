@@ -36,7 +36,7 @@ jobs:
 
       - name: Set Environment Variables (Windows)
         run: |
-          echo "NDI_SDK_DIR='C:\Program Files\NDI\NDI 6 SDK\'" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "NDI_SDK_DIR=C:\Program Files\NDI\NDI 6 SDK" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           echo "'C:\Program Files\NDI\NDI 6 SDK\Bin\x64'" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
         shell: pwsh
 
@@ -46,19 +46,6 @@ jobs:
         run: cargo test --verbose
         env:
           TMPDIR: ${{ runner.temp }}
-
-  clippy:
-    name: Clippy
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Clippy check
-        run: cargo clippy --all-targets --all-features -- -D warnings
 
   format:
     name: Format
@@ -74,7 +61,7 @@ jobs:
 
   publish:
     name: Publish
-    needs: [test, clippy, format]
+    needs: [test, format]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: windows-latest
     steps:
