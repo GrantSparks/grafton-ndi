@@ -1,0 +1,88 @@
+name: Rust CI/CD
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["*"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: Test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install LLVM for bindgen (Windows)
+        run: choco install llvm
+
+      - name: Download Third-Party Library Installer (Windows)
+        run: curl -L -o library_installer.exe ${{ secrets.LIBRARY_URL }}
+
+      - name: Install Third-Party Library (Windows)
+        run: |
+          .\library_installer.exe /VERYSILENT /SUPPRESSMSGBOXES /DIR=C:\Library
+          echo "C:\Library\bin" >> $Env:GITHUB_PATH
+
+      - name: Set Environment Variables (Windows)
+        run: |
+          setx PATH "C:\Library\bin;%PATH%"
+          refreshenv
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --verbose
+        env:
+          TMPDIR: ${{ runner.temp }}
+
+  clippy:
+    name: Clippy
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy check
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  format:
+    name: Format
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  publish:
+    name: Publish
+    needs: [test, clippy, format]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Publish to crates.io
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
