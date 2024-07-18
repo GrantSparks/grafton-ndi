@@ -49,8 +49,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Use SDK Path
-        run: echo ${{ needs.setup.outputs.sdk_path }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
@@ -65,9 +65,6 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Use SDK Path
-        run: echo ${{ needs.setup.outputs.sdk_path }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -84,9 +81,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Use SDK Path
-        run: echo ${{ needs.setup.outputs.sdk_path }}
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -102,9 +96,6 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Use SDK Path
-        run: echo ${{ needs.setup.outputs.sdk_path }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
