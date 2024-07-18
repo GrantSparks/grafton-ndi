@@ -29,10 +29,10 @@ jobs:
         run: choco install llvm
 
       - name: Download NDI SDK Library Installer (Windows)
-        run: curl -L -o NDI.exe ${{ secrets.LIBRARY_URL }}
+        run: curl -L -o NDI_6_SDK.zip ${{ secrets.NDI_SDK_ZIP_URL }}
 
       - name: Install NDI SDK Library (Windows)
-        run: Start-Process -FilePath '.\NDI.exe' -ArgumentList '/VERYSILENT', '/LOG=out.txt', '/NORESTART', '/SUPPRESSMSGBOXES' -Wait; Get-Content out.txt
+        run: Expand-Archive -Path '.\NDI_6_SDK.zip' -DestinationPath $env:NDI_SDK_DIR 
 
       - name: Set Environment Variables (Windows)
         run: |
