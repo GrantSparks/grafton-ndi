@@ -34,7 +34,8 @@ jobs:
         run: .\library_installer.exe /VERYSILENT /SUPPRESSMSGBOXES /DIR=C:\Library
 
       - name: Debug: List contents of C:\Library
-        run: Get-ChildItem -Path C:\Library -Recurse
+        run: dir C:\Library /s
+        shell: powershell
 
       - name: Set Environment Variables (Windows)
         run: |
