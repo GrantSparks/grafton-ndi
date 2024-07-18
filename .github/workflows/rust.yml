@@ -31,8 +31,11 @@ jobs:
       - name: Download NDI SDK Library Installer (Windows)
         run: curl -L -o NDI.exe ${{ secrets.LIBRARY_URL }}
 
-      - name: Install Third-Party Library (Windows)
-        run: .\NDI.exe /VERYSILENT /LOG /NORESTART /SUPPRESSMSGBOXES
+      - name: Install NDI SDK Library (Windows)
+        run: .\NDI.exe /VERYSILENT /LOG=out.txt /NORESTART /SUPPRESSMSGBOXES
+
+      - name: Display install log
+        run: Get-Content out.txt
 
       - name: Set Environment Variables (Windows)
         run: |
