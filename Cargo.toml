@@ -11,7 +11,7 @@ homepage = "https://www.grafton.ai"
 categories = ["api-bindings"]
 keywords = ["ndi", "video", "audio", "network"]
 readme = "README.md"
-exclude = ["target/", ".gitignore", ".github/"]
+exclude = ["target/", ".gitignore", ".github/", "NDI_6_SDK.zip"]
 
 [dependencies]
 png = "0.17.13"
