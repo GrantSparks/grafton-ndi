@@ -33,11 +33,16 @@ jobs:
       - name: Install Third-Party Library (Windows)
         run: .\library_installer.exe /VERYSILENT /SUPPRESSMSGBOXES /DIR=C:\Library
 
+      - name: Debug: List contents of C:\Library
+        run: dir C:\Library /s
+        shell: powershell
+
       - name: Set Environment Variables (Windows)
         run: |
-          echo "NDI_SDK_DIR=C:\Library" >> $GITHUB_ENV
-          echo "C:\Library\Bin\x64" >> $GITHUB_PATH
-          echo "C:\Library\bin;%PATH%" >> $GITHUB_ENV
+          echo "NDI_SDK_DIR=C:\Library" >> $env:GITHUB_ENV
+          echo "C:\Library\Bin\x64" >> $env:GITHUB_PATH
+          [System.Environment]::SetEnvironmentVariable('NDI_SDK_DIR', 'C:\Library', [System.EnvironmentVariableTarget]::Process)
+        shell: powershell
 
       - uses: Swatinem/rust-cache@v2
 
@@ -45,6 +50,7 @@ jobs:
         run: cargo test --verbose
         env:
           TMPDIR: ${{ runner.temp }}
+          NDI_SDK_DIR: C:\Library
 
   clippy:
     name: Clippy
@@ -58,6 +64,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy check
         run: cargo clippy --all-targets --all-features -- -D warnings
+        env:
+          NDI_SDK_DIR: C:\Library
 
   format:
     name: Format
@@ -70,6 +78,8 @@ jobs:
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
+        env:
+          NDI_SDK_DIR: C:\Library
 
   publish:
     name: Publish
@@ -85,3 +95,4 @@ jobs:
         run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+          NDI_SDK_DIR: C:\Library
