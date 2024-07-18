@@ -31,15 +31,13 @@ jobs:
         run: curl -L -o library_installer.exe ${{ secrets.LIBRARY_URL }}
 
       - name: Install Third-Party Library (Windows)
-        run: |
-          .\library_installer.exe /VERYSILENT /SUPPRESSMSGBOXES /DIR=C:\Library
-          echo "C:\Library\" >> $Env:NDI_SDK_DIR 
-          echo "%NDI_SDK_DIR%\Bin\x64" >> $Env:GITHUB_PATH
+        run: .\library_installer.exe /VERYSILENT /SUPPRESSMSGBOXES /DIR=C:\Library
 
       - name: Set Environment Variables (Windows)
         run: |
-          setx PATH "C:\Library\bin;%PATH%"
-          refreshenv
+          echo "NDI_SDK_DIR=C:\Library" >> $GITHUB_ENV
+          echo "C:\Library\Bin\x64" >> $GITHUB_PATH
+          echo "C:\Library\bin;%PATH%" | Out-File -Encoding ASCII -Append $env:GITHUB_ENV
 
       - uses: Swatinem/rust-cache@v2
 
