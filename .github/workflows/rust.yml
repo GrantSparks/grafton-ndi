@@ -15,32 +15,7 @@ env:
 
 jobs:
   setup:
-    runs-on: windows-latest
-    outputs:
-      sdk_path: ${{ steps.set-sdk-path.outputs.sdk_path }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - name: Install LLVM for bindgen (Windows)
-        run: choco install llvm
-
-      - name: Download NDI SDK Library Installer (Windows)
-        run: curl -L -o NDI_6_SDK.zip ${{ secrets.NDI_SDK_ZIP_URL }}
-
-      - name: Install NDI SDK Library (Windows)
-        id: install-sdk
-        run: Expand-Archive -Path '.\NDI_6_SDK.zip' -DestinationPath $env:NDI_SDK_DIR
-
-      - name: Set Environment Variables (Windows)
-        id: set-sdk-path
-        run: |
-          echo "%NDI_SDK_DIR%\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        shell: pwsh
+    uses: ./.github/workflows/setup-environment.yml
 
   test:
     name: Test
@@ -49,8 +24,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Use SDK Path
+        run: echo ${{ needs.setup.outputs.sdk_path }}
 
       - uses: Swatinem/rust-cache@v2
 
