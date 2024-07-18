@@ -11,7 +11,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  NDI_SDK_DIR: C:\Library
+  NDI_SDK_DIR: C:\Program Files\NDI\NDI 6 SDK
 
 jobs:
   test:
@@ -36,8 +36,7 @@ jobs:
 
       - name: Set Environment Variables (Windows)
         run: |
-          echo "NDI_SDK_DIR=C:\Program Files\NDI\NDI 6 SDK" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          echo "'C:\Program Files\NDI\NDI 6 SDK\Bin\x64'" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "%NDI_SDK_DIR%\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
         shell: pwsh
 
       - uses: Swatinem/rust-cache@v2
