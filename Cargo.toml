@@ -1,6 +1,6 @@
 [package]
 name = "grafton-ndi"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 build = "build.rs"
 authors = ["Grant Sparks <grant@grafton.ai>"]
@@ -9,15 +9,7 @@ license = "Apache-2.0"
 repository = "https://github.com/GrantSparks/grafton-ndi"
 homepage = "https://www.grafton.ai"
 categories = ["api-bindings"]
-keywords = ["ndi", "video", "audio", "network", "discovery", "broadcast"]
-include = [
-    "Cargo.toml",
-    "src/**/*",
-    "build.rs",
-    "README.md",
-    "LICENSE",
-    "examples/**/*",
-]
+keywords = ["ndi", "video", "audio", "network"]
 readme = "README.md"
 exclude = ["target/", ".gitignore", ".github/"]
 
