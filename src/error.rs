@@ -10,5 +10,7 @@ pub enum Error {
     #[error("Invalid UTF-8 string in data: {0}")]
     InvalidUtf8(String),
     #[error("Invalid CString: {0}")]
-    InvalidCString(#[from] NulError), 
+    InvalidCString(#[from] NulError),
+    #[error("Failed to capture frame: {0}")]
+    CaptureFailed(String),
 }

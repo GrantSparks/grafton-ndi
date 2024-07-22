@@ -248,23 +248,32 @@ impl Source {
         }
     }
 
-    fn to_raw(&self) -> NDIlib_source_t {
-        NDIlib_source_t {
-            p_ndi_name: CString::new(self.name.clone()).unwrap().into_raw(),
-            __bindgen_anon_1: if let Some(url) = &self.url_address {
-                NDIlib_source_t__bindgen_ty_1 {
-                    p_url_address: CString::new(url.clone()).unwrap().into_raw(),
-                }
-            } else if let Some(ip) = &self.ip_address {
-                NDIlib_source_t__bindgen_ty_1 {
-                    p_ip_address: CString::new(ip.clone()).unwrap().into_raw(),
-                }
-            } else {
-                NDIlib_source_t__bindgen_ty_1 {
-                    p_url_address: std::ptr::null(),
-                }
-            },
-        }
+    fn to_raw(&self) -> Result<NDIlib_source_t, Error> {
+        let p_ndi_name = CString::new(self.name.clone()).map_err(Error::InvalidCString)?;
+        let p_url_address = self
+            .url_address
+            .as_ref()
+            .map(|s| CString::new(s.clone()).map_err(Error::InvalidCString))
+            .transpose()?
+            .map_or(ptr::null(), |s| s.into_raw());
+
+        let p_ip_address = self
+            .ip_address
+            .as_ref()
+            .map(|s| CString::new(s.clone()).map_err(Error::InvalidCString))
+            .transpose()?
+            .map_or(ptr::null(), |s| s.into_raw());
+
+        let __bindgen_anon_1 = if !p_url_address.is_null() {
+            NDIlib_source_t__bindgen_ty_1 { p_url_address }
+        } else {
+            NDIlib_source_t__bindgen_ty_1 { p_ip_address }
+        };
+
+        Ok(NDIlib_source_t {
+            p_ndi_name: p_ndi_name.into_raw(),
+            __bindgen_anon_1,
+        })
     }
 }
 
@@ -395,9 +404,11 @@ impl VideoFrame {
         data: Box<[u8]>,
         metadata: Option<String>,
         timestamp: i64,
-    ) -> Self {
-        let metadata_cstr = metadata.map(|m| CString::new(m).unwrap());
-        VideoFrame {
+    ) -> Result<Self, Error> {
+        let metadata_cstr = metadata
+            .map(|m| CString::new(m).map_err(Error::InvalidCString))
+            .transpose()?;
+        Ok(VideoFrame {
             xres,
             yres,
             fourcc,
@@ -412,7 +423,7 @@ impl VideoFrame {
             },
             p_metadata: metadata_cstr.as_ref().map_or(ptr::null(), |m| m.as_ptr()),
             timestamp,
-        }
+        })
     }
 
     pub(crate) fn to_raw(&self) -> NDIlib_video_frame_v2_t {
@@ -549,8 +560,8 @@ impl AudioFrame {
         data: Box<[u8]>,
         metadata: Option<String>,
         timestamp: i64,
-    ) -> Self {
-        AudioFrame {
+    ) -> Result<Self, Error> {
+        Ok(AudioFrame {
             sample_rate,
             no_channels,
             no_samples,
@@ -560,7 +571,7 @@ impl AudioFrame {
             channel_stride_in_bytes: no_samples * 4, // assuming 4 bytes per sample for float
             metadata,
             timestamp,
-        }
+        })
     }
 
     pub(crate) fn to_raw(&self) -> NDIlib_audio_frame_v3_t {
@@ -575,7 +586,10 @@ impl AudioFrame {
                 channel_stride_in_bytes: self.channel_stride_in_bytes,
             },
             p_metadata: match &self.metadata {
-                Some(metadata) => CString::new(metadata.clone()).unwrap().into_raw(),
+                Some(metadata) => CString::new(metadata.clone())
+                    .map_err(Error::InvalidCString)
+                    .unwrap()
+                    .into_raw(),
                 None => ptr::null(),
             },
             timestamp: self.timestamp,
@@ -796,17 +810,21 @@ impl Receiver {
         }
     }
 
-    pub(crate) fn to_raw(&self) -> NDIlib_recv_create_v3_t {
-        NDIlib_recv_create_v3_t {
-            source_to_connect_to: self.source_to_connect_to.to_raw(),
+    pub(crate) fn to_raw(&self) -> Result<NDIlib_recv_create_v3_t, Error> {
+        let p_ndi_recv_name = match &self.ndi_recv_name {
+            Some(name) => CString::new(name.clone())
+                .map_err(Error::InvalidCString)?
+                .into_raw(),
+            None => ptr::null(),
+        };
+
+        Ok(NDIlib_recv_create_v3_t {
+            source_to_connect_to: self.source_to_connect_to.to_raw()?,
             color_format: self.color_format.into(),
             bandwidth: self.bandwidth.into(),
             allow_video_fields: self.allow_video_fields,
-            p_ndi_recv_name: match &self.ndi_recv_name {
-                Some(name) => CString::new(name.clone()).unwrap().into_raw(),
-                None => ptr::null(),
-            },
-        }
+            p_ndi_recv_name,
+        })
     }
 }
 
@@ -817,7 +835,7 @@ pub struct Recv<'a> {
 
 impl<'a> Recv<'a> {
     pub fn new(_ndi: &'a NDI, create: Receiver) -> Result<Self, Error> {
-        let create_t = create.to_raw();
+        let create_t = create.to_raw()?;
         let instance = unsafe { NDIlib_recv_create_v3(&create_t) };
         if instance.is_null() {
             Err(Error::InitializationFailed(
@@ -832,7 +850,7 @@ impl<'a> Recv<'a> {
         }
     }
 
-    pub fn capture(&self, timeout_ms: u32) -> Result<FrameType, &'static str> {
+    pub fn capture(&self, timeout_ms: u32) -> Result<FrameType, Error> {
         let video_frame = VideoFrame::new();
         let audio_frame = AudioFrame::new();
         let metadata_frame = MetadataFrame::new();
@@ -864,7 +882,7 @@ impl<'a> Recv<'a> {
                 MetadataFrame::from_raw(raw_metadata_frame),
             )),
             NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(FrameType::None),
-            _ => Err("Failed to capture frame"),
+            _ => Err(Error::CaptureFailed("Failed to capture frame".into())),
         }
     }
 
@@ -1003,20 +1021,27 @@ pub struct Send {
 }
 
 impl Send {
-    pub fn new(create_settings: Sender) -> Result<Self, &'static str> {
+    pub fn new(create_settings: Sender) -> Result<Self, Error> {
+        let p_ndi_name = CString::new(create_settings.name).map_err(Error::InvalidCString)?;
+        let p_groups = match create_settings.groups {
+            Some(ref groups) => CString::new(groups.clone())
+                .map_err(Error::InvalidCString)?
+                .into_raw(),
+            None => ptr::null(),
+        };
+
         let c_settings = NDIlib_send_create_t {
-            p_ndi_name: CString::new(create_settings.name).unwrap().into_raw(),
-            p_groups: match create_settings.groups {
-                Some(ref groups) => CString::new(groups.clone()).unwrap().into_raw(),
-                None => ptr::null(),
-            },
+            p_ndi_name: p_ndi_name.into_raw(),
+            p_groups,
             clock_video: create_settings.clock_video,
             clock_audio: create_settings.clock_audio,
         };
 
         let instance = unsafe { NDIlib_send_create(&c_settings) };
         if instance.is_null() {
-            Err("Failed to create NDI send instance")
+            Err(Error::InitializationFailed(
+                "Failed to create NDI send instance".into(),
+            ))
         } else {
             Ok(Send { instance })
         }
@@ -1046,7 +1071,7 @@ impl Send {
         }
     }
 
-    pub fn capture(&self, timeout_ms: u32) -> Result<FrameType, &'static str> {
+    pub fn capture(&self, timeout_ms: u32) -> Result<FrameType, Error> {
         let metadata_frame = MetadataFrame::new();
         let frame_type =
             unsafe { NDIlib_send_capture(self.instance, &mut metadata_frame.to_raw(), timeout_ms) };
@@ -1055,7 +1080,7 @@ impl Send {
             NDIlib_frame_type_e_NDIlib_frame_type_metadata => Ok(FrameType::Metadata(
                 MetadataFrame::from_raw(metadata_frame.to_raw()),
             )),
-            _ => Err("Failed to capture frame"),
+            _ => Err(Error::CaptureFailed("Failed to capture frame".into())),
         }
     }
 
@@ -1081,8 +1106,10 @@ impl Send {
         unsafe { NDIlib_send_add_connection_metadata(self.instance, &metadata_frame.to_raw()) }
     }
 
-    pub fn set_failover(&self, source: &Source) {
-        unsafe { NDIlib_send_set_failover(self.instance, &source.to_raw()) }
+    pub fn set_failover(&self, source: &Source) -> Result<(), Error> {
+        let raw_source = source.to_raw()?;
+        unsafe { NDIlib_send_set_failover(self.instance, &raw_source) }
+        Ok(())
     }
 
     pub fn get_source_name(&self) -> Source {
