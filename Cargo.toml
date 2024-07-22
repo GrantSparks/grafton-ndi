@@ -15,6 +15,7 @@ exclude = ["target/", ".gitignore", ".github/", "NDI_6_SDK.zip"]
 
 [dependencies]
 png = "0.17.13"
+thiserror = "1.0.61"
 
 [build-dependencies]
 bindgen = "0.69.4"

@@ -1,16 +1,19 @@
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
-
-mod ndi_lib;
-
 use std::{
     ffi::{CStr, CString},
+    fmt::{self, Display, Formatter},
     os::raw::c_char,
     ptr,
 };
 
+mod error;
+pub use error::Error;
+
+mod ndi_lib;
+
 use ndi_lib::{
-    true_, NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+    NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
     NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_max, NDIlib_FourCC_video_type_e,
     NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA,
     NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRX,
@@ -67,24 +70,16 @@ use ndi_lib::{
     NDIlib_video_frame_v2_t__bindgen_ty_1,
 };
 
-pub struct NDI {
-    initialized: bool,
-}
+pub struct NDI;
 
 impl NDI {
-    pub fn new() -> Result<Self, &'static str> {
-        if true_ == 1 && Self::initialize() {
-            Ok(NDI { initialized: true })
+    pub fn new() -> Result<Self, Error> {
+        if Self::initialize() {
+            Ok(NDI)
         } else {
-            Err("Failed to initialize NDI library")
-        }
-    }
-
-    pub fn version() -> &'static str {
-        unsafe {
-            CStr::from_ptr(Self::get_version())
-                .to_str()
-                .expect("Invalid UTF-8 string")
+            Err(Error::InitializationFailed(
+                "NDIlib_initialize failed".into(),
+            ))
         }
     }
 
@@ -92,27 +87,124 @@ impl NDI {
         unsafe { NDIlib_is_supported_CPU() }
     }
 
-    fn initialize() -> bool {
-        unsafe { NDIlib_initialize() }
+    pub fn version() -> Result<String, Error> {
+        unsafe {
+            let version_ptr = NDIlib_version();
+            if version_ptr.is_null() {
+                return Err(Error::NullPointer("NDIlib_version".into()));
+            }
+            let c_str = CStr::from_ptr(version_ptr);
+            c_str
+                .to_str()
+                .map(|s| s.to_owned())
+                .map_err(|e| Error::InvalidUtf8(e.to_string()))
+        }
     }
 
-    fn get_version() -> *const c_char {
-        unsafe { NDIlib_version() }
+    fn initialize() -> bool {
+        unsafe { NDIlib_initialize() }
     }
 }
 
 impl Drop for NDI {
     fn drop(&mut self) {
-        if self.initialized {
-            unsafe {
-                NDIlib_destroy();
-            }
+        unsafe { NDIlib_destroy() };
+    }
+}
+
+#[derive(Debug)]
+pub struct Finder {
+    pub show_local_sources: bool,
+    pub groups: Option<String>,
+    pub extra_ips: Option<String>,
+}
+
+impl Finder {
+    pub fn new(show_local_sources: bool, groups: Option<&str>, extra_ips: Option<&str>) -> Self {
+        Finder {
+            show_local_sources,
+            groups: groups.map(|s| s.to_string()),
+            extra_ips: extra_ips.map(|s| s.to_string()),
         }
     }
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
+impl Default for Finder {
+    fn default() -> Self {
+        Finder {
+            show_local_sources: true,
+            groups: None,
+            extra_ips: None,
+        }
+    }
+}
+
+pub struct Find<'a> {
+    instance: NDIlib_find_instance_t,
+    ndi: std::marker::PhantomData<&'a NDI>,
+}
+
+impl<'a> Find<'a> {
+    pub fn new(_ndi: &'a NDI, settings: Finder) -> Result<Self, Error> {
+        let groups_cstr = settings
+            .groups
+            .map(CString::new)
+            .transpose()
+            .map_err(Error::InvalidCString)?;
+        let extra_ips_cstr = settings
+            .extra_ips
+            .map(CString::new)
+            .transpose()
+            .map_err(Error::InvalidCString)?;
+
+        let create_settings = NDIlib_find_create_t {
+            show_local_sources: settings.show_local_sources,
+            p_groups: groups_cstr.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+            p_extra_ips: extra_ips_cstr.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+        };
+
+        let instance = unsafe { NDIlib_find_create_v2(&create_settings) };
+        if instance.is_null() {
+            return Err(Error::InitializationFailed(
+                "NDIlib_find_create_v2 failed".into(),
+            ));
+        }
+        Ok(Find {
+            instance,
+            ndi: std::marker::PhantomData,
+        })
+    }
+
+    pub fn wait_for_sources(&self, timeout: u32) -> bool {
+        unsafe { NDIlib_find_wait_for_sources(self.instance, timeout) }
+    }
+
+    pub fn get_sources(&self, timeout: u32) -> Result<Vec<Source>, Error> {
+        let mut no_sources = 0;
+        let sources_ptr =
+            unsafe { NDIlib_find_get_sources(self.instance, &mut no_sources, timeout) };
+        if sources_ptr.is_null() {
+            return Err(Error::NullPointer("NDIlib_find_get_sources".into()));
+        }
+        let sources = unsafe {
+            (0..no_sources)
+                .map(|i| {
+                    let source = &*sources_ptr.add(i as usize);
+                    Source::from_raw(source)
+                })
+                .collect()
+        };
+        Ok(sources)
+    }
+}
+
+impl<'a> Drop for Find<'a> {
+    fn drop(&mut self) {
+        unsafe { NDIlib_find_destroy(self.instance) };
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Source {
     pub name: String,
     pub url_address: Option<String>,
@@ -120,16 +212,16 @@ pub struct Source {
 }
 
 impl Source {
-    fn from_raw(raw: &NDIlib_source_t) -> Self {
+    fn from_raw(ndi_source: &NDIlib_source_t) -> Self {
         let name = unsafe {
-            CStr::from_ptr(raw.p_ndi_name)
+            CStr::from_ptr(ndi_source.p_ndi_name)
                 .to_string_lossy()
                 .into_owned()
         };
         let url_address = unsafe {
-            if !raw.__bindgen_anon_1.p_url_address.is_null() {
+            if !ndi_source.__bindgen_anon_1.p_url_address.is_null() {
                 Some(
-                    CStr::from_ptr(raw.__bindgen_anon_1.p_url_address)
+                    CStr::from_ptr(ndi_source.__bindgen_anon_1.p_url_address)
                         .to_string_lossy()
                         .into_owned(),
                 )
@@ -138,9 +230,9 @@ impl Source {
             }
         };
         let ip_address = unsafe {
-            if !raw.__bindgen_anon_1.p_ip_address.is_null() {
+            if !ndi_source.__bindgen_anon_1.p_ip_address.is_null() {
                 Some(
-                    CStr::from_ptr(raw.__bindgen_anon_1.p_ip_address)
+                    CStr::from_ptr(ndi_source.__bindgen_anon_1.p_ip_address)
                         .to_string_lossy()
                         .into_owned(),
                 )
@@ -159,89 +251,26 @@ impl Source {
     fn to_raw(&self) -> NDIlib_source_t {
         NDIlib_source_t {
             p_ndi_name: CString::new(self.name.clone()).unwrap().into_raw(),
-            __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
-                p_url_address: match &self.url_address {
-                    Some(url) => CString::new(url.clone()).unwrap().into_raw(),
-                    None => ptr::null(),
-                },
+            __bindgen_anon_1: if let Some(url) = &self.url_address {
+                NDIlib_source_t__bindgen_ty_1 {
+                    p_url_address: CString::new(url.clone()).unwrap().into_raw(),
+                }
+            } else if let Some(ip) = &self.ip_address {
+                NDIlib_source_t__bindgen_ty_1 {
+                    p_ip_address: CString::new(ip.clone()).unwrap().into_raw(),
+                }
+            } else {
+                NDIlib_source_t__bindgen_ty_1 {
+                    p_url_address: std::ptr::null(),
+                }
             },
         }
     }
 }
 
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct Finder {
-    show_local_sources: bool,
-    p_groups: *const std::os::raw::c_char,
-    p_extra_ips: *const std::os::raw::c_char,
-}
-
-impl Default for Finder {
-    fn default() -> Self {
-        Finder {
-            show_local_sources: false,
-            p_groups: std::ptr::null(),
-            p_extra_ips: std::ptr::null(),
-        }
-    }
-}
-
-impl Finder {
-    pub fn new(show_local_sources: bool, groups: Option<&str>, extra_ips: Option<&str>) -> Self {
-        Finder {
-            show_local_sources,
-            p_groups: groups.map_or(std::ptr::null(), |g| {
-                CString::new(g).unwrap().into_raw() as *const std::os::raw::c_char
-            }),
-            p_extra_ips: extra_ips.map_or(std::ptr::null(), |ip| {
-                CString::new(ip).unwrap().into_raw() as *const std::os::raw::c_char
-            }),
-        }
-    }
-}
-
-pub struct Find {
-    instance: NDIlib_find_instance_t,
-}
-
-impl Find {
-    pub fn new(create: Finder) -> Result<Self, &'static str> {
-        let create_t = NDIlib_find_create_t {
-            show_local_sources: create.show_local_sources,
-            p_groups: create.p_groups,
-            p_extra_ips: create.p_extra_ips,
-        };
-        let instance = unsafe { NDIlib_find_create_v2(&create_t) };
-        if instance.is_null() {
-            Err("Failed to create NDI find instance")
-        } else {
-            Ok(Find { instance })
-        }
-    }
-
-    pub fn wait_for_sources(&self, timeout_ms: u32) -> bool {
-        unsafe { NDIlib_find_wait_for_sources(self.instance, timeout_ms) }
-    }
-
-    pub fn get_sources(&self, timeout_ms: u32) -> Vec<Source> {
-        let mut source_count = 0;
-        let sources =
-            unsafe { NDIlib_find_get_sources(self.instance, &mut source_count, timeout_ms) };
-        if sources.is_null() {
-            vec![]
-        } else {
-            let raw_sources = unsafe { std::slice::from_raw_parts(sources, source_count as usize) };
-            raw_sources.iter().map(Source::from_raw).collect()
-        }
-    }
-}
-
-impl Drop for Find {
-    fn drop(&mut self) {
-        unsafe {
-            NDIlib_find_destroy(self.instance);
-        }
+impl Display for Source {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name)
     }
 }
 
@@ -321,10 +350,16 @@ pub struct VideoFrame {
     pub picture_aspect_ratio: f32,
     pub frame_format_type: FrameFormatType,
     pub timecode: i64,
-    pub p_data: *mut u8,
-    pub line_stride_or_size: LineStrideOrSize, // Union
-    pub p_metadata: *const ::std::os::raw::c_char,
+    pub data: Box<[u8]>,
+    pub line_stride_or_size: LineStrideOrSize,
+    pub p_metadata: *const c_char,
     pub timestamp: i64,
+}
+
+impl Default for VideoFrame {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VideoFrame {
@@ -338,12 +373,45 @@ impl VideoFrame {
             picture_aspect_ratio: 0.0,
             frame_format_type: FrameFormatType::Interlaced,
             timecode: 0,
-            p_data: ptr::null_mut(),
+            data: vec![].into_boxed_slice(),
             line_stride_or_size: LineStrideOrSize {
                 line_stride_in_bytes: 0,
             },
             p_metadata: ptr::null(),
             timestamp: 0,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_data(
+        xres: i32,
+        yres: i32,
+        fourcc: FourCCVideoType,
+        frame_rate_n: i32,
+        frame_rate_d: i32,
+        picture_aspect_ratio: f32,
+        frame_format_type: FrameFormatType,
+        timecode: i64,
+        data: Box<[u8]>,
+        metadata: Option<String>,
+        timestamp: i64,
+    ) -> Self {
+        let metadata_cstr = metadata.map(|m| CString::new(m).unwrap());
+        VideoFrame {
+            xres,
+            yres,
+            fourcc,
+            frame_rate_n,
+            frame_rate_d,
+            picture_aspect_ratio,
+            frame_format_type,
+            timecode,
+            data,
+            line_stride_or_size: LineStrideOrSize {
+                line_stride_in_bytes: xres * 4,
+            },
+            p_metadata: metadata_cstr.as_ref().map_or(ptr::null(), |m| m.as_ptr()),
+            timestamp,
         }
     }
 
@@ -357,7 +425,7 @@ impl VideoFrame {
             picture_aspect_ratio: self.picture_aspect_ratio,
             frame_format_type: self.frame_format_type.into(),
             timecode: self.timecode,
-            p_data: self.p_data,
+            p_data: self.data.as_ptr() as *mut u8,
             __bindgen_anon_1: unsafe {
                 NDIlib_video_frame_v2_t__bindgen_ty_1 {
                     line_stride_in_bytes: self.line_stride_or_size.line_stride_in_bytes,
@@ -369,6 +437,13 @@ impl VideoFrame {
     }
 
     pub(crate) fn from_raw(raw: NDIlib_video_frame_v2_t) -> Self {
+        let data_len = (raw.xres * raw.yres * 4) as usize;
+        let data = unsafe {
+            std::slice::from_raw_parts(raw.p_data, data_len)
+                .to_vec()
+                .into_boxed_slice()
+        };
+
         VideoFrame {
             xres: raw.xres,
             yres: raw.yres,
@@ -405,7 +480,7 @@ impl VideoFrame {
                 _ => FrameFormatType::Max,
             },
             timecode: raw.timecode,
-            p_data: raw.p_data,
+            data,
             line_stride_or_size: unsafe {
                 LineStrideOrSize {
                     line_stride_in_bytes: raw.__bindgen_anon_1.line_stride_in_bytes,
@@ -417,9 +492,17 @@ impl VideoFrame {
     }
 }
 
-impl Default for VideoFrame {
-    fn default() -> Self {
-        Self::new()
+impl Drop for VideoFrame {
+    fn drop(&mut self) {
+        // Free the metadata if it exists
+        if !self.p_metadata.is_null() {
+            unsafe {
+                let _ = CString::from_raw(self.p_metadata as *mut c_char);
+            }
+        }
+
+        // Explicitly drop the data buffer
+        let _ = std::mem::take(&mut self.data);
     }
 }
 
@@ -429,10 +512,16 @@ pub struct AudioFrame {
     pub no_samples: i32,
     pub timecode: i64,
     pub fourcc: AudioType,
-    pub data: Vec<u8>,
+    pub data: Box<[u8]>,
     pub channel_stride_in_bytes: i32,
     pub metadata: Option<String>,
     pub timestamp: i64,
+}
+
+impl Default for AudioFrame {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AudioFrame {
@@ -443,10 +532,34 @@ impl AudioFrame {
             no_samples: 0,
             timecode: 0,
             fourcc: AudioType::Max,
-            data: Vec::new(),
+            data: vec![].into_boxed_slice(),
             channel_stride_in_bytes: 0,
             metadata: None,
             timestamp: 0,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_data(
+        sample_rate: i32,
+        no_channels: i32,
+        no_samples: i32,
+        timecode: i64,
+        fourcc: AudioType,
+        data: Box<[u8]>,
+        metadata: Option<String>,
+        timestamp: i64,
+    ) -> Self {
+        AudioFrame {
+            sample_rate,
+            no_channels,
+            no_samples,
+            timecode,
+            fourcc,
+            data,
+            channel_stride_in_bytes: no_samples * 4, // assuming 4 bytes per sample for float
+            metadata,
+            timestamp,
         }
     }
 
@@ -470,6 +583,14 @@ impl AudioFrame {
     }
 
     pub(crate) fn from_raw(raw: NDIlib_audio_frame_v3_t) -> Self {
+        let data_len =
+            (raw.no_samples * raw.no_channels * std::mem::size_of::<f32>() as i32) as usize;
+        let data = unsafe {
+            std::slice::from_raw_parts(raw.p_data, data_len)
+                .to_vec()
+                .into_boxed_slice()
+        };
+
         let metadata = if raw.p_metadata.is_null() {
             None
         } else {
@@ -488,13 +609,7 @@ impl AudioFrame {
             no_samples: raw.no_samples,
             timecode: raw.timecode,
             fourcc: raw.FourCC.into(),
-            data: unsafe {
-                Vec::from_raw_parts(
-                    raw.p_data,
-                    raw.__bindgen_anon_1.data_size_in_bytes as usize,
-                    raw.__bindgen_anon_1.data_size_in_bytes as usize,
-                )
-            },
+            data,
             channel_stride_in_bytes: unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes },
             metadata,
             timestamp: raw.timestamp,
@@ -502,9 +617,17 @@ impl AudioFrame {
     }
 }
 
-impl Default for AudioFrame {
-    fn default() -> Self {
-        Self::new()
+impl Drop for AudioFrame {
+    fn drop(&mut self) {
+        // Free the metadata if it exists
+        if let Some(metadata) = self.metadata.take() {
+            unsafe {
+                let _ = CString::from_vec_unchecked(metadata.into_bytes());
+            }
+        }
+
+        // Explicitly drop the data buffer
+        let _ = std::mem::take(&mut self.data);
     }
 }
 
@@ -687,20 +810,25 @@ impl Receiver {
     }
 }
 
-pub struct Recv {
+pub struct Recv<'a> {
     instance: NDIlib_recv_instance_t,
+    ndi: std::marker::PhantomData<&'a NDI>,
 }
 
-impl Recv {
-    pub fn new(create: Receiver) -> Result<Self, &'static str> {
+impl<'a> Recv<'a> {
+    pub fn new(_ndi: &'a NDI, create: Receiver) -> Result<Self, Error> {
         let create_t = create.to_raw();
         let instance = unsafe { NDIlib_recv_create_v3(&create_t) };
         if instance.is_null() {
-            Err("Failed to create NDI recv instance")
+            Err(Error::InitializationFailed(
+                "Failed to create NDI recv instance".into(),
+            ))
         } else {
             unsafe { NDIlib_recv_connect(instance, &create_t.source_to_connect_to) };
-
-            Ok(Recv { instance })
+            Ok(Recv {
+                instance,
+                ndi: std::marker::PhantomData,
+            })
         }
     }
 
@@ -831,7 +959,7 @@ impl Recv {
     }
 }
 
-impl Drop for Recv {
+impl<'a> Drop for Recv<'a> {
     fn drop(&mut self) {
         unsafe {
             NDIlib_recv_destroy(self.instance);

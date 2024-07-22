@@ -1,21 +1,29 @@
-use std::time::{Duration, Instant};
+use std::{
+    ffi::CString,
+    time::{Duration, Instant},
+};
 
 use grafton_ndi::*;
 
 fn main() {
-    if let Ok(_ndi) = NDI::new() {
+    if let Ok(ndi) = NDI::new() {
         println!("NDI initialized successfully.");
 
-        // We first need to look for a source on the network
-        // let finder = Finder::default();
-        let finder = Finder::new(false, None, Some("192.168.0.110"));
-        let ndi_find = Find::new(finder).expect("Failed to create NDI find instance");
+        // Create a CString for the IP address and convert to &str
+        let ip_address = CString::new("192.168.0.110").expect("CString::new failed");
+        let ip_str = ip_address
+            .to_str()
+            .expect("CString to str conversion failed");
+
+        // Create an NDI finder to locate sources on the network
+        let finder = Finder::new(false, None, Some(ip_str));
+        let ndi_find = Find::new(&ndi, finder).expect("Failed to create NDI find instance");
 
         // We wait until there is at least one source on the network
         let mut sources = vec![];
         while sources.is_empty() {
             if ndi_find.wait_for_sources(1000) {
-                sources = ndi_find.get_sources(1000);
+                sources = ndi_find.get_sources(1000).expect("Failed to get sources");
             }
         }
 
@@ -37,7 +45,7 @@ fn main() {
             Some("Example PTZ Receiver".to_string()),
         );
 
-        let ndi_recv = Recv::new(receiver).expect("Failed to create NDI recv instance");
+        let ndi_recv = Recv::new(&ndi, receiver).expect("Failed to create NDI recv instance");
 
         // Run for 5 seconds
         let start = Instant::now();
@@ -66,8 +74,7 @@ fn main() {
             }
         }
 
-        // Destroy the receiver
-        drop(ndi_recv);
+        // The NDI receiver will be destroyed automatically when it goes out of scope
     } else {
         println!("Cannot run NDI. Most likely because the CPU is not sufficient (see SDK documentation).");
     }

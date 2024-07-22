@@ -1,16 +1,24 @@
+use grafton_ndi::{
+    Error, Find, Finder, FrameType, Receiver, Recv, RecvBandwidth, RecvColorFormat, VideoFrame, NDI,
+};
+use std::ffi::CString;
 use std::fs::File;
 
-use grafton_ndi::{
-    Find, Finder, FrameType, Receiver, Recv, RecvBandwidth, RecvColorFormat, VideoFrame, NDI,
-};
-
-fn main() -> Result<(), &'static str> {
+fn main() -> Result<(), Error> {
     // Initialize the NDI library and ensure it's properly cleaned up
-    if let Ok(_ndi) = NDI::new() {
+    if let Ok(ndi) = NDI::new() {
+        // Create a CString for the IP address
+        let ip_address =
+            CString::new("192.168.0.110").map_err(Error::InvalidCString)?;
+
+        // Convert the CString to &str
+        let ip_str = ip_address
+            .to_str()
+            .map_err(|_| Error::InvalidUtf8("CString to str conversion failed".into()))?;
+
         // Create an NDI finder to locate sources on the network
-        // let finder = Finder::default();
-        let finder = Finder::new(false, None, Some("192.168.0.110"));
-        let ndi_find = Find::new(finder)?;
+        let finder = Finder::new(false, None, Some(ip_str));
+        let ndi_find = Find::new(&ndi, finder)?;
 
         // Wait until we find a source named "CAMERA4"
         let source_name = "CAMERA4";
@@ -20,7 +28,7 @@ fn main() -> Result<(), &'static str> {
             // Wait until the sources on the network have changed
             println!("Looking for sources ...");
             ndi_find.wait_for_sources(5000);
-            let sources = ndi_find.get_sources(5000);
+            let sources = ndi_find.get_sources(5000)?;
 
             for source in &sources {
                 if source.name.contains(source_name) {
@@ -30,9 +38,9 @@ fn main() -> Result<(), &'static str> {
             }
         }
 
-        let source =
-            found_source.unwrap_or_else(|| panic!("Failed to find source {}", source_name));
-
+        let source = found_source.ok_or_else(|| {
+            Error::InitializationFailed(format!("Failed to find source {}", source_name))
+        })?;
         println!("Found source: {:?}", source);
 
         // We now have the desired source, so we create a receiver to look at it.
@@ -43,12 +51,12 @@ fn main() -> Result<(), &'static str> {
             false,
             None,
         );
-        let ndi_recv = Recv::new(receiver)?;
+        let ndi_recv = Recv::new(&ndi, receiver)?;
 
         // Wait until we have a video frame
         let mut video_frame: Option<VideoFrame> = None;
         while video_frame.is_none() {
-            // Sleep for 3 seconds
+            // Sleep for 5 seconds
             std::thread::sleep(std::time::Duration::from_secs(5));
 
             println!("Waiting for video frame ...");
@@ -74,23 +82,23 @@ fn main() -> Result<(), &'static str> {
             if let Err(e) = save_frame_as_png(&frame) {
                 eprintln!("Failed to save frame as PNG: {}", e);
             }
-
-            // Free the data
-            ndi_recv.free_video(&frame);
         }
 
         // The NDI receiver will be destroyed automatically when it goes out of scope
-        // The NDI library will be destroyed automatically when `_ndi` goes out of scope
+        // The NDI library will be destroyed automatically when `ndi` goes out of scope
     } else {
-        return Err("Failed to initialize NDI library");
+        return Err(Error::InitializationFailed(
+            "Failed to initialize NDI library".into(),
+        ));
     }
 
     Ok(())
 }
 
-fn save_frame_as_png(video_frame: &VideoFrame) -> Result<(), &'static str> {
+fn save_frame_as_png(video_frame: &VideoFrame) -> Result<(), Error> {
     let path = "CoolNDIImage.png";
-    let file = File::create(path).map_err(|_| "Failed to create file")?;
+    let file = File::create(path)
+        .map_err(|_| Error::InitializationFailed("Failed to create file".into()))?;
     let mut encoder = png::Encoder::new(file, video_frame.xres as u32, video_frame.yres as u32);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
@@ -103,21 +111,16 @@ fn save_frame_as_png(video_frame: &VideoFrame) -> Result<(), &'static str> {
         unsafe { video_frame.line_stride_or_size.line_stride_in_bytes }
     );
 
-    // Ensure the p_data pointer is valid
-    if video_frame.p_data.is_null() {
-        return Err("Frame data pointer is null");
+    // Ensure the data is not empty
+    if video_frame.data.is_empty() {
+        return Err(Error::InitializationFailed("Frame data is empty".into()));
     }
 
     let mut writer = encoder
         .write_header()
-        .map_err(|_| "Failed to write PNG header")?;
+        .map_err(|_| Error::InitializationFailed("Failed to write PNG header".into()))?;
     writer
-        .write_image_data(unsafe {
-            let data_len =
-                (video_frame.yres * video_frame.line_stride_or_size.line_stride_in_bytes) as usize;
-            println!("Data length: {}", data_len);
-            std::slice::from_raw_parts(video_frame.p_data, data_len)
-        })
-        .map_err(|_| "Failed to write PNG data")?;
+        .write_image_data(&video_frame.data)
+        .map_err(|_| Error::InitializationFailed("Failed to write PNG data".into()))?;
     Ok(())
 }
