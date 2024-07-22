@@ -1,20 +1,14 @@
 use grafton_ndi::{Error, Find, Finder, NDI};
-use std::ffi::CString;
 use std::time::{Duration, Instant};
 
 fn main() -> Result<(), Error> {
     // Initialize the NDI library and ensure it's properly cleaned up
     if let Ok(ndi) = NDI::new() {
-        // Create a CString for the IP address
-        let ip_address = CString::new("192.168.0.110").expect("CString::new failed");
-
-        // Convert the CString to &str
-        let ip_str = ip_address
-            .to_str()
-            .expect("CString to str conversion failed");
+        // The IP address as a string
+        let ip_address = "192.168.0.110";
 
         // Create an NDI finder to locate sources on the network
-        let finder = Finder::new(false, None, Some(ip_str));
+        let finder = Finder::new(false, None, Some(ip_address));
         let ndi_find = Find::new(&ndi, finder)?;
 
         // Run for 15 seconds
