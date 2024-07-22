@@ -24,7 +24,6 @@ fn main() -> Result<(), Error> {
             // Get the updated list of sources
             println!("Getting sources...");
             let sources = ndi_find.get_sources(5000)?;
-            println!("Sources retrieved.");
 
             // Display all the sources
             println!("Network sources ({} found).", sources.len());

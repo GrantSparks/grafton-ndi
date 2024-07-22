@@ -184,7 +184,7 @@ impl<'a> Find<'a> {
         let sources_ptr =
             unsafe { NDIlib_find_get_sources(self.instance, &mut no_sources, timeout) };
         if sources_ptr.is_null() {
-            return Err(Error::NullPointer("NDIlib_find_get_sources".into()));
+            return Ok(vec![]);
         }
         let sources = unsafe {
             (0..no_sources)
