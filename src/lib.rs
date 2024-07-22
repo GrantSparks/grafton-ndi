@@ -1016,12 +1016,13 @@ impl Tally {
 }
 
 #[derive(Debug)]
-pub struct Send {
+pub struct Send<'a> {
     instance: NDIlib_send_instance_t,
+    ndi: std::marker::PhantomData<&'a NDI>,
 }
 
-impl Send {
-    pub fn new(create_settings: Sender) -> Result<Self, Error> {
+impl<'a> Send<'a> {
+    pub fn new(_ndi: &'a NDI, create_settings: Sender) -> Result<Self, Error> {
         let p_ndi_name = CString::new(create_settings.name).map_err(Error::InvalidCString)?;
         let p_groups = match create_settings.groups {
             Some(ref groups) => CString::new(groups.clone())
@@ -1043,7 +1044,10 @@ impl Send {
                 "Failed to create NDI send instance".into(),
             ))
         } else {
-            Ok(Send { instance })
+            Ok(Send {
+                instance,
+                ndi: std::marker::PhantomData,
+            })
         }
     }
 
@@ -1118,7 +1122,7 @@ impl Send {
     }
 }
 
-impl Drop for Send {
+impl<'a> Drop for Send<'a> {
     fn drop(&mut self) {
         unsafe {
             NDIlib_send_destroy(self.instance);
