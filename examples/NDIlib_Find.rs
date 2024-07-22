@@ -39,7 +39,7 @@ fn main() -> Result<(), Error> {
             }
         }
 
-        // The NDI finder will be destroyed automatically when it goes out of scope
+        // The ndi_find will be destroyed automatically when it goes out of scope
         // The NDI library will be destroyed automatically when `ndi` goes out of scope
     } else {
         return Err(Error::InitializationFailed(
