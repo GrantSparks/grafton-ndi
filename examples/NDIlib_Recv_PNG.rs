@@ -1,22 +1,14 @@
+use std::fs::File;
+
 use grafton_ndi::{
     Error, Find, Finder, FrameType, Receiver, Recv, RecvBandwidth, RecvColorFormat, VideoFrame, NDI,
 };
-use std::ffi::CString;
-use std::fs::File;
 
 fn main() -> Result<(), Error> {
     // Initialize the NDI library and ensure it's properly cleaned up
     if let Ok(ndi) = NDI::new() {
-        // Create a CString for the IP address
-        let ip_address = CString::new("192.168.0.110").map_err(Error::InvalidCString)?;
-
-        // Convert the CString to &str
-        let ip_str = ip_address
-            .to_str()
-            .map_err(|_| Error::InvalidUtf8("CString to str conversion failed".into()))?;
-
         // Create an NDI finder to locate sources on the network
-        let finder = Finder::new(false, None, Some(ip_str));
+        let finder = Finder::new(false, None, Some("192.168.0.110"));
         let ndi_find = Find::new(&ndi, finder)?;
 
         // Wait until we find a source named "CAMERA4"
@@ -25,7 +17,7 @@ fn main() -> Result<(), Error> {
 
         while found_source.is_none() {
             // Wait until the sources on the network have changed
-            println!("Looking for sources ...");
+            println!("Looking for source {}...", source_name);
             ndi_find.wait_for_sources(5000);
             let sources = ndi_find.get_sources(5000)?;
 

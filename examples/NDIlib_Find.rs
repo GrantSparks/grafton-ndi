@@ -1,14 +1,12 @@
-use grafton_ndi::{Error, Find, Finder, NDI};
 use std::time::{Duration, Instant};
+
+use grafton_ndi::{Error, Find, Finder, NDI};
 
 fn main() -> Result<(), Error> {
     // Initialize the NDI library and ensure it's properly cleaned up
     if let Ok(ndi) = NDI::new() {
-        // The IP address as a string
-        let ip_address = "192.168.0.110";
-
         // Create an NDI finder to locate sources on the network
-        let finder = Finder::new(false, None, Some(ip_address));
+        let finder = Finder::new(false, None, Some("192.168.0.110"));
         let ndi_find = Find::new(&ndi, finder)?;
 
         // Run for 15 seconds
