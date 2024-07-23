@@ -472,33 +472,59 @@ impl VideoFrame {
             );
         }
 
-        let bytes_per_pixel = match raw.FourCC {
+        let data_size = match raw.FourCC {
             NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA
             | NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRX
             | NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBA
-            | NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBX => 4,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY => 2,
+            | NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBX => {
+                (raw.xres * raw.yres * 4) as usize
+            }
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY => {
+                (raw.xres * raw.yres * 2) as usize
+            }
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_P216
+            | NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_PA16 => {
+                let bytes_per_channel = 2;
+                let luma_size = (raw.xres * raw.yres * bytes_per_channel) as usize;
+                let chroma_size = (raw.xres * raw.yres * bytes_per_channel / 2) as usize;
+                let alpha_size =
+                    if raw.FourCC == NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_PA16 {
+                        luma_size
+                    } else {
+                        0
+                    };
+                luma_size + chroma_size + alpha_size
+            }
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_YV12
+            | NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_I420 => {
+                let y_plane_size = (raw.xres * raw.yres) as usize;
+                let uv_plane_size = (raw.xres * raw.yres / 4) as usize;
+                y_plane_size + 2 * uv_plane_size
+            }
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NV12 => {
+                let y_plane_size = (raw.xres * raw.yres) as usize;
+                let uv_plane_size = (raw.xres * raw.yres / 2) as usize;
+                y_plane_size + uv_plane_size
+            }
             _ => {
                 panic!("Unsupported FourCC format");
             }
         };
 
-        let data_len = (raw.xres * raw.yres * bytes_per_pixel) as usize;
-
-        if data_len == 0 {
+        if data_size == 0 {
             panic!("Calculated data length is zero");
         }
 
         let data = unsafe {
             assert!(!raw.p_data.is_null(), "raw.p_data is null");
-            std::slice::from_raw_parts(raw.p_data, data_len).to_vec()
+            std::slice::from_raw_parts(raw.p_data, data_size).to_vec()
         };
 
-        if data.len() != data_len {
+        if data.len() != data_size {
             panic!(
                 "Mismatch between data length ({} bytes) and calculated data length ({} bytes)",
                 data.len(),
-                data_len
+                data_size
             );
         }
 
