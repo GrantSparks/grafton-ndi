@@ -659,18 +659,50 @@ impl AudioFrame {
     }
 
     pub(crate) fn from_raw(raw: NDIlib_audio_frame_v3_t) -> Self {
-        let data_len =
-            (raw.no_samples * raw.no_channels * std::mem::size_of::<f32>() as i32) as usize;
-        let data = unsafe { std::slice::from_raw_parts(raw.p_data, data_len).to_vec() };
+        if raw.p_data.is_null() {
+            panic!("Received a null pointer for raw audio frame data");
+        }
+
+        if raw.sample_rate <= 0 {
+            panic!("Invalid sample rate: {}", raw.sample_rate);
+        }
+
+        if raw.no_channels <= 0 {
+            panic!("Invalid number of channels: {}", raw.no_channels);
+        }
+
+        if raw.no_samples <= 0 {
+            panic!("Invalid number of samples: {}", raw.no_samples);
+        }
+
+        let bytes_per_sample = 4; // 4 bytes per sample for floating-point audio
+        let data_size = (raw.no_samples * raw.no_channels * bytes_per_sample) as usize;
+
+        if data_size == 0 {
+            panic!("Calculated data length is zero");
+        }
+
+        let data = unsafe {
+            assert!(!raw.p_data.is_null(), "raw.p_data is null");
+            std::slice::from_raw_parts(raw.p_data, data_size).to_vec()
+        };
+
+        if data.len() != data_size {
+            panic!(
+                "Mismatch between data length ({} bytes) and calculated data length ({} bytes)",
+                data.len(),
+                data_size
+            );
+        }
 
         let metadata = if raw.p_metadata.is_null() {
             None
         } else {
             unsafe {
                 Some(
-                    CString::from_raw(raw.p_metadata as *mut c_char)
-                        .into_string()
-                        .unwrap(),
+                    CStr::from_ptr(raw.p_metadata)
+                        .to_string_lossy()
+                        .into_owned(),
                 )
             }
         };
@@ -680,7 +712,10 @@ impl AudioFrame {
             no_channels: raw.no_channels,
             no_samples: raw.no_samples,
             timecode: raw.timecode,
-            fourcc: raw.FourCC.into(),
+            fourcc: match raw.FourCC {
+                NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP => AudioType::FLTP,
+                _ => AudioType::Max,
+            },
             data,
             channel_stride_in_bytes: unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes },
             metadata,
