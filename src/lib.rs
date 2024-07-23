@@ -579,6 +579,16 @@ impl VideoFrame {
     }
 }
 
+impl Drop for VideoFrame {
+    fn drop(&mut self) {
+        if !self.p_metadata.is_null() {
+            unsafe {
+                let _ = CString::from_raw(self.p_metadata as *mut c_char);
+            }
+        }
+    }
+}
+
 pub struct AudioFrame {
     pub sample_rate: i32,
     pub no_channels: i32,
@@ -587,13 +597,17 @@ pub struct AudioFrame {
     pub fourcc: AudioType,
     pub data: Vec<u8>,
     pub channel_stride_in_bytes: i32,
-    pub metadata: Option<String>,
+    pub metadata: Option<CString>,
     pub timestamp: i64,
 }
 
-impl Default for AudioFrame {
-    fn default() -> Self {
-        Self::new()
+impl Drop for AudioFrame {
+    fn drop(&mut self) {
+        if let Some(metadata) = self.metadata.take() {
+            unsafe {
+                let _ = CString::from_raw(metadata.into_raw());
+            }
+        }
     }
 }
 
@@ -623,6 +637,9 @@ impl AudioFrame {
         metadata: Option<String>,
         timestamp: i64,
     ) -> Result<Self, Error> {
+        let metadata_cstring = metadata
+            .map(|m| CString::new(m).map_err(Error::InvalidCString))
+            .transpose()?;
         Ok(AudioFrame {
             sample_rate,
             no_channels,
@@ -631,7 +648,7 @@ impl AudioFrame {
             fourcc,
             data,
             channel_stride_in_bytes: no_samples * 4, // assuming 4 bytes per sample for float
-            metadata,
+            metadata: metadata_cstring,
             timestamp,
         })
     }
@@ -647,13 +664,7 @@ impl AudioFrame {
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: self.channel_stride_in_bytes,
             },
-            p_metadata: match &self.metadata {
-                Some(metadata) => CString::new(metadata.clone())
-                    .map_err(Error::InvalidCString)
-                    .unwrap()
-                    .into_raw(),
-                None => ptr::null(),
-            },
+            p_metadata: self.metadata.as_ref().map_or(ptr::null(), |m| m.as_ptr()),
             timestamp: self.timestamp,
         }
     }
@@ -718,9 +729,15 @@ impl AudioFrame {
             },
             data,
             channel_stride_in_bytes: unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes },
-            metadata,
+            metadata: metadata.map(|m| CString::new(m).unwrap()),
             timestamp: raw.timestamp,
         }
+    }
+}
+
+impl Default for AudioFrame {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -784,6 +801,16 @@ impl MetadataFrame {
 impl Default for MetadataFrame {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for MetadataFrame {
+    fn drop(&mut self) {
+        if !self.p_data.is_null() {
+            unsafe {
+                let _ = CString::from_raw(self.p_data);
+            }
+        }
     }
 }
 

@@ -30,7 +30,7 @@ fn main() {
     let bindings = bindgen::Builder::default()
         .header(main_header)
         .clang_arg(format!("-I{}", ndi_include_path))
-        // .layout_tests(false)
+        //.layout_tests(false)
         .derive_default(true)
         .generate()
         .expect("Unable to generate bindings");

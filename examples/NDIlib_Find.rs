@@ -6,6 +6,7 @@ fn main() -> Result<(), Error> {
     // Initialize the NDI library and ensure it's properly cleaned up
     if let Ok(ndi) = NDI::new() {
         // Create an NDI finder to locate sources on the network
+        // let finder = Finder::default();
         let finder = Finder::new(false, None, Some("192.168.0.110"));
         let ndi_find = Find::new(&ndi, finder)?;
 
