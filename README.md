@@ -33,9 +33,7 @@ cargo run --example NDIlib_Find
 
 The following example demonstrates how to use the `grafton-ndi` library to find NDI sources on the network and receive frames from a source.
 
-```rust
 https://github.com/GrantSparks/grafton-ndi/blob/e3841377cc2f26447b6239165c086e89aa11b2ad/examples/NDIlib_Find.rs
-```
 
 ## Best Practices
 
