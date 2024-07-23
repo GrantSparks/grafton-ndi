@@ -560,6 +560,12 @@ impl VideoFrame {
             panic!("Invalid line stride in bytes: {}", line_stride_in_bytes);
         }
 
+        let p_metadata = if raw.p_metadata.is_null() {
+            ptr::null()
+        } else {
+            unsafe { CString::from_raw(raw.p_metadata as *mut c_char).into_raw() }
+        };
+
         VideoFrame {
             xres: raw.xres,
             yres: raw.yres,
@@ -573,7 +579,7 @@ impl VideoFrame {
             line_stride_or_size: LineStrideOrSize {
                 line_stride_in_bytes,
             },
-            p_metadata: raw.p_metadata,
+            p_metadata,
             timestamp: raw.timestamp,
         }
     }
@@ -709,13 +715,7 @@ impl AudioFrame {
         let metadata = if raw.p_metadata.is_null() {
             None
         } else {
-            unsafe {
-                Some(
-                    CStr::from_ptr(raw.p_metadata)
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-            }
+            Some(unsafe { CString::from_raw(raw.p_metadata as *mut c_char) })
         };
 
         AudioFrame {
@@ -729,7 +729,7 @@ impl AudioFrame {
             },
             data,
             channel_stride_in_bytes: unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes },
-            metadata: metadata.map(|m| CString::new(m).unwrap()),
+            metadata,
             timestamp: raw.timestamp,
         }
     }
