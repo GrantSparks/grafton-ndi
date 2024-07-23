@@ -35,9 +35,11 @@ use ndi_lib::{
     NDIlib_frame_format_type_e_NDIlib_frame_format_type_interleaved,
     NDIlib_frame_format_type_e_NDIlib_frame_format_type_max,
     NDIlib_frame_format_type_e_NDIlib_frame_format_type_progressive,
-    NDIlib_frame_type_e_NDIlib_frame_type_audio, NDIlib_frame_type_e_NDIlib_frame_type_metadata,
-    NDIlib_frame_type_e_NDIlib_frame_type_none, NDIlib_frame_type_e_NDIlib_frame_type_video,
-    NDIlib_initialize, NDIlib_is_supported_CPU, NDIlib_metadata_frame_t, NDIlib_recv_bandwidth_e,
+    NDIlib_frame_type_e_NDIlib_frame_type_audio, NDIlib_frame_type_e_NDIlib_frame_type_error,
+    NDIlib_frame_type_e_NDIlib_frame_type_metadata, NDIlib_frame_type_e_NDIlib_frame_type_none,
+    NDIlib_frame_type_e_NDIlib_frame_type_status_change,
+    NDIlib_frame_type_e_NDIlib_frame_type_video, NDIlib_initialize, NDIlib_is_supported_CPU,
+    NDIlib_metadata_frame_t, NDIlib_recv_bandwidth_e,
     NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_audio_only,
     NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
     NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest,
@@ -349,7 +351,6 @@ pub union LineStrideOrSize {
     pub data_size_in_bytes: i32,
 }
 
-#[repr(C)]
 pub struct VideoFrame {
     pub xres: i32,
     pub yres: i32,
@@ -359,7 +360,7 @@ pub struct VideoFrame {
     pub picture_aspect_ratio: f32,
     pub frame_format_type: FrameFormatType,
     pub timecode: i64,
-    pub data: Box<[u8]>,
+    pub data: Vec<u8>,
     pub line_stride_or_size: LineStrideOrSize,
     pub p_metadata: *const c_char,
     pub timestamp: i64,
@@ -382,7 +383,7 @@ impl VideoFrame {
             picture_aspect_ratio: 0.0,
             frame_format_type: FrameFormatType::Interlaced,
             timecode: 0,
-            data: vec![].into_boxed_slice(),
+            data: vec![],
             line_stride_or_size: LineStrideOrSize {
                 line_stride_in_bytes: 0,
             },
@@ -401,13 +402,18 @@ impl VideoFrame {
         picture_aspect_ratio: f32,
         frame_format_type: FrameFormatType,
         timecode: i64,
-        data: Box<[u8]>,
+        data: Vec<u8>,
         metadata: Option<String>,
         timestamp: i64,
     ) -> Result<Self, Error> {
-        let metadata_cstr = metadata
-            .map(|m| CString::new(m).map_err(Error::InvalidCString))
-            .transpose()?;
+        let p_metadata = match metadata {
+            Some(m) => {
+                let c_string = CString::new(m).map_err(Error::InvalidCString)?;
+                c_string.into_raw() as *const c_char
+            }
+            None => ptr::null(),
+        };
+
         Ok(VideoFrame {
             xres,
             yres,
@@ -421,7 +427,7 @@ impl VideoFrame {
             line_stride_or_size: LineStrideOrSize {
                 line_stride_in_bytes: xres * 4,
             },
-            p_metadata: metadata_cstr.as_ref().map_or(ptr::null(), |m| m.as_ptr()),
+            p_metadata,
             timestamp,
         })
     }
@@ -448,72 +454,102 @@ impl VideoFrame {
     }
 
     pub(crate) fn from_raw(raw: NDIlib_video_frame_v2_t) -> Self {
-        let data_len = (raw.xres * raw.yres * 4) as usize;
-        let data = unsafe {
-            std::slice::from_raw_parts(raw.p_data, data_len)
-                .to_vec()
-                .into_boxed_slice()
+        if raw.p_data.is_null() {
+            panic!("Received a null pointer for raw video frame data");
+        }
+
+        if raw.xres <= 0 || raw.yres <= 0 {
+            panic!(
+                "Invalid frame dimensions: xres: {}, yres: {}",
+                raw.xres, raw.yres
+            );
+        }
+
+        if raw.frame_rate_N <= 0 || raw.frame_rate_D <= 0 {
+            panic!(
+                "Invalid frame rate: frame_rate_N: {}, frame_rate_D: {}",
+                raw.frame_rate_N, raw.frame_rate_D
+            );
+        }
+
+        let bytes_per_pixel = match raw.FourCC {
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA
+            | NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRX
+            | NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBA
+            | NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBX => 4,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY => 2,
+            _ => {
+                panic!("Unsupported FourCC format");
+            }
         };
+
+        let data_len = (raw.xres * raw.yres * bytes_per_pixel) as usize;
+
+        if data_len == 0 {
+            panic!("Calculated data length is zero");
+        }
+
+        let data = unsafe {
+            assert!(!raw.p_data.is_null(), "raw.p_data is null");
+            std::slice::from_raw_parts(raw.p_data, data_len).to_vec()
+        };
+
+        if data.len() != data_len {
+            panic!(
+                "Mismatch between data length ({} bytes) and calculated data length ({} bytes)",
+                data.len(),
+                data_len
+            );
+        }
+
+        let fourcc = match raw.FourCC {
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY => FourCCVideoType::UYVY,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVA => FourCCVideoType::UYVA,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_P216 => FourCCVideoType::P216,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_PA16 => FourCCVideoType::PA16,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_YV12 => FourCCVideoType::YV12,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_I420 => FourCCVideoType::I420,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NV12 => FourCCVideoType::NV12,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA => FourCCVideoType::BGRA,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRX => FourCCVideoType::BGRX,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBA => FourCCVideoType::RGBA,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBX => FourCCVideoType::RGBX,
+            _ => FourCCVideoType::Max,
+        };
+
+        let frame_format_type = match raw.frame_format_type {
+            NDIlib_frame_format_type_e_NDIlib_frame_format_type_progressive => {
+                FrameFormatType::Progressive
+            }
+            NDIlib_frame_format_type_e_NDIlib_frame_format_type_interleaved => {
+                FrameFormatType::Interlaced
+            }
+            NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_0 => FrameFormatType::Field0,
+            NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_1 => FrameFormatType::Field1,
+            _ => FrameFormatType::Max,
+        };
+
+        let line_stride_in_bytes = unsafe { raw.__bindgen_anon_1.line_stride_in_bytes };
+        if line_stride_in_bytes <= 0 {
+            panic!("Invalid line stride in bytes: {}", line_stride_in_bytes);
+        }
 
         VideoFrame {
             xres: raw.xres,
             yres: raw.yres,
-            fourcc: match raw.FourCC {
-                NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY => FourCCVideoType::UYVY,
-                NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVA => FourCCVideoType::UYVA,
-                NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_P216 => FourCCVideoType::P216,
-                NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_PA16 => FourCCVideoType::PA16,
-                NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_YV12 => FourCCVideoType::YV12,
-                NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_I420 => FourCCVideoType::I420,
-                NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NV12 => FourCCVideoType::NV12,
-                NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA => FourCCVideoType::BGRA,
-                NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRX => FourCCVideoType::BGRX,
-                NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBA => FourCCVideoType::RGBA,
-                NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBX => FourCCVideoType::RGBX,
-                _ => FourCCVideoType::Max,
-            },
+            fourcc,
             frame_rate_n: raw.frame_rate_N,
             frame_rate_d: raw.frame_rate_D,
             picture_aspect_ratio: raw.picture_aspect_ratio,
-            frame_format_type: match raw.frame_format_type {
-                NDIlib_frame_format_type_e_NDIlib_frame_format_type_progressive => {
-                    FrameFormatType::Progressive
-                }
-                NDIlib_frame_format_type_e_NDIlib_frame_format_type_interleaved => {
-                    FrameFormatType::Interlaced
-                }
-                NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_0 => {
-                    FrameFormatType::Field0
-                }
-                NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_1 => {
-                    FrameFormatType::Field1
-                }
-                _ => FrameFormatType::Max,
-            },
+            frame_format_type,
             timecode: raw.timecode,
             data,
-            line_stride_or_size: unsafe {
-                LineStrideOrSize {
-                    line_stride_in_bytes: raw.__bindgen_anon_1.line_stride_in_bytes,
-                }
+            line_stride_or_size: LineStrideOrSize {
+                line_stride_in_bytes,
             },
             p_metadata: raw.p_metadata,
             timestamp: raw.timestamp,
         }
-    }
-}
-
-impl Drop for VideoFrame {
-    fn drop(&mut self) {
-        // Free the metadata if it exists
-        if !self.p_metadata.is_null() {
-            unsafe {
-                let _ = CString::from_raw(self.p_metadata as *mut c_char);
-            }
-        }
-
-        // Explicitly drop the data buffer
-        let _ = std::mem::take(&mut self.data);
     }
 }
 
@@ -523,7 +559,7 @@ pub struct AudioFrame {
     pub no_samples: i32,
     pub timecode: i64,
     pub fourcc: AudioType,
-    pub data: Box<[u8]>,
+    pub data: Vec<u8>,
     pub channel_stride_in_bytes: i32,
     pub metadata: Option<String>,
     pub timestamp: i64,
@@ -543,7 +579,7 @@ impl AudioFrame {
             no_samples: 0,
             timecode: 0,
             fourcc: AudioType::Max,
-            data: vec![].into_boxed_slice(),
+            data: vec![],
             channel_stride_in_bytes: 0,
             metadata: None,
             timestamp: 0,
@@ -557,7 +593,7 @@ impl AudioFrame {
         no_samples: i32,
         timecode: i64,
         fourcc: AudioType,
-        data: Box<[u8]>,
+        data: Vec<u8>,
         metadata: Option<String>,
         timestamp: i64,
     ) -> Result<Self, Error> {
@@ -599,11 +635,7 @@ impl AudioFrame {
     pub(crate) fn from_raw(raw: NDIlib_audio_frame_v3_t) -> Self {
         let data_len =
             (raw.no_samples * raw.no_channels * std::mem::size_of::<f32>() as i32) as usize;
-        let data = unsafe {
-            std::slice::from_raw_parts(raw.p_data, data_len)
-                .to_vec()
-                .into_boxed_slice()
-        };
+        let data = unsafe { std::slice::from_raw_parts(raw.p_data, data_len).to_vec() };
 
         let metadata = if raw.p_metadata.is_null() {
             None
@@ -628,20 +660,6 @@ impl AudioFrame {
             metadata,
             timestamp: raw.timestamp,
         }
-    }
-}
-
-impl Drop for AudioFrame {
-    fn drop(&mut self) {
-        // Free the metadata if it exists
-        if let Some(metadata) = self.metadata.take() {
-            unsafe {
-                let _ = CString::from_vec_unchecked(metadata.into_bytes());
-            }
-        }
-
-        // Explicitly drop the data buffer
-        let _ = std::mem::take(&mut self.data);
     }
 }
 
@@ -855,12 +873,10 @@ impl<'a> Recv<'a> {
         let audio_frame = AudioFrame::new();
         let metadata_frame = MetadataFrame::new();
 
-        // Create raw structs
         let mut raw_video_frame = video_frame.to_raw();
         let mut raw_audio_frame = audio_frame.to_raw();
         let mut raw_metadata_frame = metadata_frame.to_raw();
 
-        // Call the function with pointers to the raw structs
         let frame_type = unsafe {
             NDIlib_recv_capture_v3(
                 self.instance,
@@ -882,7 +898,14 @@ impl<'a> Recv<'a> {
                 MetadataFrame::from_raw(raw_metadata_frame),
             )),
             NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(FrameType::None),
-            _ => Err(Error::CaptureFailed("Failed to capture frame".into())),
+            NDIlib_frame_type_e_NDIlib_frame_type_error => {
+                Err(Error::CaptureFailed("Received an error frame".into()))
+            }
+            NDIlib_frame_type_e_NDIlib_frame_type_status_change => Ok(FrameType::StatusChange),
+            _ => Err(Error::CaptureFailed(format!(
+                "Unknown frame type: {}",
+                frame_type
+            ))),
         }
     }
 
@@ -985,12 +1008,12 @@ impl<'a> Drop for Recv<'a> {
     }
 }
 
-// Enum to represent different frame types
 pub enum FrameType {
     Video(VideoFrame),
     Audio(AudioFrame),
     Metadata(MetadataFrame),
     None,
+    StatusChange,
 }
 
 #[derive(Debug, Clone)]

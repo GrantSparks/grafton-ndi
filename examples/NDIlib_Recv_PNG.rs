@@ -8,8 +8,7 @@ fn main() -> Result<(), Error> {
     // Initialize the NDI library and ensure it's properly cleaned up
     if let Ok(ndi) = NDI::new() {
         // Create a CString for the IP address
-        let ip_address =
-            CString::new("192.168.0.110").map_err(Error::InvalidCString)?;
+        let ip_address = CString::new("192.168.0.110").map_err(Error::InvalidCString)?;
 
         // Convert the CString to &str
         let ip_str = ip_address

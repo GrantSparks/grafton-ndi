@@ -47,12 +47,15 @@ fn main() {
 
         let ndi_recv = Recv::new(&ndi, receiver).expect("Failed to create NDI recv instance");
 
-        // Run for 5 seconds
+        // Run for 15 seconds
         let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(5) {
+        while start.elapsed() < Duration::from_secs(15) {
+            println!("Waiting for a frame...");
             // Receive something
             match ndi_recv.capture(1000) {
-                Ok(FrameType::None) => {}
+                Ok(FrameType::None) => {
+                    println!("Received nothing");
+                }
                 Ok(FrameType::Video(_)) => {
                     println!("Received a video frame");
                     // Handle video frame
@@ -64,6 +67,10 @@ fn main() {
                 Ok(FrameType::Metadata(_)) => {
                     println!("Received a metadata frame");
                     // Handle metadata frame
+                }
+                Ok(FrameType::StatusChange) => {
+                    println!("Received a status change frame");
+                    // Handle status change frame
                 }
                 Err(_) => {
                     if ndi_recv.ptz_is_supported() {
