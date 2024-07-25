@@ -14,16 +14,16 @@ env:
   NDI_SDK_DIR: C:\Program Files\NDI\NDI 6 SDK
 
 jobs:
-  test:
-    name: Test
+  setup:
+    name: Setup Environment
     runs-on: windows-latest
+    outputs:
+      NDI_SDK_DIR: ${{ steps.set-env.outputs.NDI_SDK_DIR }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
 
       - name: Install LLVM for bindgen (Windows)
         run: choco install llvm
@@ -35,9 +35,24 @@ jobs:
         run: Expand-Archive -Path '.\NDI_6_SDK.zip' -DestinationPath $env:NDI_SDK_DIR
 
       - name: Set Environment Variables (Windows)
-        run: |
-          echo "%NDI_SDK_DIR%\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        id: set-env
+        run: echo "%NDI_SDK_DIR%\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
         shell: pwsh
+        env:
+          NDI_SDK_DIR: $env:NDI_SDK_DIR
+
+  test:
+    name: Test
+    runs-on: windows-latest
+    needs: setup
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set Environment Variables
+        run: echo "%NDI_SDK_DIR%\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        shell: pwsh
+        env:
+          NDI_SDK_DIR: ${{ needs.setup.outputs.NDI_SDK_DIR }}
 
       - uses: Swatinem/rust-cache@v2
 
@@ -49,27 +64,20 @@ jobs:
   format:
     name: Format
     runs-on: windows-latest
+    needs: setup
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set Environment Variables
+        run: echo "%NDI_SDK_DIR%\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        shell: pwsh
+        env:
+          NDI_SDK_DIR: ${{ needs.setup.outputs.NDI_SDK_DIR }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
-
-      - name: Install LLVM for bindgen (Windows)
-        run: choco install llvm
-
-      - name: Download NDI SDK Library Installer (Windows)
-        run: curl -L -o NDI_6_SDK.zip ${{ secrets.NDI_SDK_ZIP_URL }}
-
-      - name: Install NDI SDK Library (Windows)
-        run: Expand-Archive -Path '.\NDI_6_SDK.zip' -DestinationPath $env:NDI_SDK_DIR
-
-      - name: Set Environment Variables (Windows)
-        run: |
-          echo "%NDI_SDK_DIR%\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        shell: pwsh
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -77,27 +85,20 @@ jobs:
   lint:
     name: Lint
     runs-on: windows-latest
+    needs: setup
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set Environment Variables
+        run: echo "%NDI_SDK_DIR%\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        shell: pwsh
+        env:
+          NDI_SDK_DIR: ${{ needs.setup.outputs.NDI_SDK_DIR }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-
-      - name: Install LLVM for bindgen (Windows)
-        run: choco install llvm
-
-      - name: Download NDI SDK Library Installer (Windows)
-        run: curl -L -o NDI_6_SDK.zip ${{ secrets.NDI_SDK_ZIP_URL }}
-
-      - name: Install NDI SDK Library (Windows)
-        run: Expand-Archive -Path '.\NDI_6_SDK.zip' -DestinationPath $env:NDI_SDK_DIR
-
-      - name: Set Environment Variables (Windows)
-        run: |
-          echo "%NDI_SDK_DIR%\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        shell: pwsh
 
       - name: Run Clippy
         run: cargo clippy -- -D warnings
@@ -105,53 +106,32 @@ jobs:
   semver:
     name: Check semver
     runs-on: windows-latest
+    needs: setup
     if: github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install LLVM for bindgen (Windows)
-        run: choco install llvm
-
-      - name: Download NDI SDK Library Installer (Windows)
-        run: curl -L -o NDI_6_SDK.zip ${{ secrets.NDI_SDK_ZIP_URL }}
-
-      - name: Install NDI SDK Library (Windows)
-        run: Expand-Archive -Path '.\NDI_6_SDK.zip' -DestinationPath $env:NDI_SDK_DIR
-
-      - name: Set Environment Variables (Windows)
-        run: |
-          echo "%NDI_SDK_DIR%\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Set Environment Variables
+        run: echo "%NDI_SDK_DIR%\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
         shell: pwsh
+        env:
+          NDI_SDK_DIR: ${{ needs.setup.outputs.NDI_SDK_DIR }}
 
       - uses: obi1kenobi/cargo-semver-checks-action@v2
 
   publish:
     name: Publish
+    runs-on: windows-latest
     needs: [test, format, lint, semver]
     if: github.ref == 'refs/heads/main' && startsWith(github.ref, 'refs/tags/')
-    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install LLVM for bindgen (Windows)
-        run: choco install llvm
-
-      - name: Download NDI SDK Library Installer (Windows)
-        run: curl -L -o NDI_6_SDK.zip ${{ secrets.NDI_SDK_ZIP_URL }}
-
-      - name: Install NDI SDK Library (Windows)
-        run: Expand-Archive -Path '.\NDI_6_SDK.zip' -DestinationPath $env:NDI_SDK_DIR
-
-      - name: Set Environment Variables (Windows)
-        run: |
-          echo "%NDI_SDK_DIR%\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Set Environment Variables
+        run: echo "%NDI_SDK_DIR%\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
         shell: pwsh
+        env:
+          NDI_SDK_DIR: ${{ needs.setup.outputs.NDI_SDK_DIR }}
 
       - uses: Swatinem/rust-cache@v2
 
