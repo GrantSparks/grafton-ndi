@@ -102,10 +102,36 @@ jobs:
       - name: Run Clippy
         run: cargo clippy -- -D warnings
 
+  semver:
+    name: Check semver
+    runs-on: windows-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install LLVM for bindgen (Windows)
+        run: choco install llvm
+
+      - name: Download NDI SDK Library Installer (Windows)
+        run: curl -L -o NDI_6_SDK.zip ${{ secrets.NDI_SDK_ZIP_URL }}
+
+      - name: Install NDI SDK Library (Windows)
+        run: Expand-Archive -Path '.\NDI_6_SDK.zip' -DestinationPath $env:NDI_SDK_DIR
+
+      - name: Set Environment Variables (Windows)
+        run: |
+          echo "%NDI_SDK_DIR%\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        shell: pwsh
+
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+
   publish:
     name: Publish
-    needs: [test, format, lint]
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [test, format, lint, semver]
+    if: github.ref == 'refs/heads/main' && startsWith(github.ref, 'refs/tags/')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
