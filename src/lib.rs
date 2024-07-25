@@ -346,6 +346,7 @@ impl From<FrameFormatType> for NDIlib_frame_format_type_e {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub union LineStrideOrSize {
     pub line_stride_in_bytes: i32,
     pub data_size_in_bytes: i32,
@@ -603,7 +604,7 @@ pub struct AudioFrame {
     pub fourcc: AudioType,
     pub data: Vec<u8>,
     pub channel_stride_in_bytes: i32,
-    pub metadata: Option<CString>,
+    pub metadata: Option<CString>, // TODO: I think this should be a String
     pub timestamp: i64,
 }
 
@@ -624,7 +625,7 @@ impl AudioFrame {
             no_channels: 0,
             no_samples: 0,
             timecode: 0,
-            fourcc: AudioType::Max,
+            fourcc: AudioType::Max, // TODO: Is this the right default?
             data: vec![],
             channel_stride_in_bytes: 0,
             metadata: None,
@@ -638,8 +639,8 @@ impl AudioFrame {
         no_channels: i32,
         no_samples: i32,
         timecode: i64,
-        fourcc: AudioType,
-        data: Vec<u8>,
+        fourcc: AudioType, // TODO: Can this be merged with the fourcc on VideoFrame?
+        data: Vec<u8>,     // TODO: Many of these fields could be combined into a struct
         metadata: Option<String>,
         timestamp: i64,
     ) -> Result<Self, Error> {
@@ -653,7 +654,7 @@ impl AudioFrame {
             timecode,
             fourcc,
             data,
-            channel_stride_in_bytes: no_samples * 4, // assuming 4 bytes per sample for float
+            channel_stride_in_bytes: no_samples * 4,
             metadata: metadata_cstring,
             timestamp,
         })
@@ -692,7 +693,7 @@ impl AudioFrame {
             panic!("Invalid number of samples: {}", raw.no_samples);
         }
 
-        let bytes_per_sample = 4; // 4 bytes per sample for floating-point audio
+        let bytes_per_sample = 4;
         let data_size = (raw.no_samples * raw.no_channels * bytes_per_sample) as usize;
 
         if data_size == 0 {
@@ -932,6 +933,8 @@ impl Receiver {
             p_ndi_recv_name,
         })
     }
+
+    // TODO: Does this need a drop impl since it made a CString in to_raw?
 }
 
 pub struct Recv<'a> {
