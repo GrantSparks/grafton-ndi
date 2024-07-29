@@ -11,13 +11,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  NDI_SDK_DIR: "C:\NDI\NDI 6 SDK"
 
 jobs:
   setup:
     name: Setup Environment
     runs-on: windows-latest
-    outputs:
-      NDI_SDK_DIR: ${{ steps.set-env.outputs.NDI_SDK_DIR }}
     steps:
       - uses: actions/checkout@v4
 
@@ -32,8 +31,7 @@ jobs:
 
       - name: Install NDI SDK Library (Windows)
         run: |
-          Expand-Archive -Path '.\NDI_6_SDK.zip' -DestinationPath 'C:\NDI\NDI 6 SDK'
-          echo "NDI_SDK_DIR=C:\NDI\NDI 6 SDK" >> $GITHUB_ENV
+          Expand-Archive -Path '.\NDI_6_SDK.zip' -DestinationPath $env:NDI_SDK_DIR
 
   test:
     name: Test
@@ -52,6 +50,7 @@ jobs:
         run: cargo test --verbose
         env:
           TMPDIR: ${{ runner.temp }}
+          NDI_SDK_DIR: ${{ env.NDI_SDK_DIR }}
 
   format:
     name: Format
@@ -71,6 +70,8 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+        env:
+          NDI_SDK_DIR: ${{ env.NDI_SDK_DIR }}
 
   lint:
     name: Lint
@@ -90,6 +91,8 @@ jobs:
 
       - name: Run Clippy
         run: cargo clippy -- -D warnings
+        env:
+          NDI_SDK_DIR: ${{ env.NDI_SDK_DIR }}
 
   semver:
     name: Check semver
@@ -104,6 +107,8 @@ jobs:
         shell: pwsh
 
       - uses: obi1kenobi/cargo-semver-checks-action@v2
+        env:
+          NDI_SDK_DIR: ${{ env.NDI_SDK_DIR }}
 
   publish:
     name: Publish
@@ -123,3 +128,4 @@ jobs:
         run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+          NDI_SDK_DIR: ${{ env.NDI_SDK_DIR }}
