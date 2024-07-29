@@ -768,9 +768,9 @@ impl From<AudioType> for i32 {
 }
 
 pub struct MetadataFrame {
-    length: i32,
-    timecode: i64,
-    p_data: *mut c_char,
+    pub length: i32,
+    pub timecode: i64,
+    pub p_data: *mut c_char,
 }
 
 impl MetadataFrame {
