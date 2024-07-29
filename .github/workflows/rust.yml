@@ -42,11 +42,12 @@ jobs:
     name: Test
     runs-on: windows-latest
     needs: setup
-    env:
-      NDI_SDK_DIR: ${{ env.NDI_SDK_DIR }}
-      PATH: ${{ env.NDI_SDK_DIR }}\Bin\x64;${{ env.PATH }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set Environment Variables
+        run: echo "$env:NDI_SDK_DIR\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        shell: pwsh
 
       - uses: Swatinem/rust-cache@v2
 
@@ -54,16 +55,18 @@ jobs:
         run: cargo test --verbose
         env:
           TMPDIR: ${{ runner.temp }}
+          PATH: ${{ env.NDI_SDK_DIR }}\Bin\x64;${{ env.PATH }}
 
   format:
     name: Format
     runs-on: windows-latest
     needs: setup
-    env:
-      NDI_SDK_DIR: ${{ env.NDI_SDK_DIR }}
-      PATH: ${{ env.NDI_SDK_DIR }}\Bin\x64;${{ env.PATH }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set Environment Variables
+        run: echo "$env:NDI_SDK_DIR\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        shell: pwsh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -72,16 +75,19 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+        env:
+          PATH: ${{ env.NDI_SDK_DIR }}\Bin\x64;${{ env.PATH }}
 
   lint:
     name: Lint
     runs-on: windows-latest
     needs: setup
-    env:
-      NDI_SDK_DIR: ${{ env.NDI_SDK_DIR }}
-      PATH: ${{ env.NDI_SDK_DIR }}\Bin\x64;${{ env.PATH }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set Environment Variables
+        run: echo "$env:NDI_SDK_DIR\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        shell: pwsh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -90,30 +96,36 @@ jobs:
 
       - name: Run Clippy
         run: cargo clippy -- -D warnings
+        env:
+          PATH: ${{ env.NDI_SDK_DIR }}\Bin\x64;${{ env.PATH }}
 
   semver:
     name: Check semver
     runs-on: windows-latest
     needs: setup
     if: github.ref == 'refs/heads/main'
-    env:
-      NDI_SDK_DIR: ${{ env.NDI_SDK_DIR }}
-      PATH: ${{ env.NDI_SDK_DIR }}\Bin\x64;${{ env.PATH }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set Environment Variables
+        run: echo "$env:NDI_SDK_DIR\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        shell: pwsh
+
       - uses: obi1kenobi/cargo-semver-checks-action@v2
+        env:
+          PATH: ${{ env.NDI_SDK_DIR }}\Bin\x64;${{ env.PATH }}
 
   publish:
     name: Publish
     runs-on: windows-latest
     needs: [test, format, lint, semver]
     if: github.ref == 'refs/heads/main' && startsWith(github.ref, 'refs/tags/')
-    env:
-      NDI_SDK_DIR: ${{ env.NDI_SDK_DIR }}
-      PATH: ${{ env.NDI_SDK_DIR }}\Bin\x64;${{ env.PATH }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set Environment Variables
+        run: echo "$env:NDI_SDK_DIR\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        shell: pwsh
 
       - uses: Swatinem/rust-cache@v2
 
@@ -121,3 +133,4 @@ jobs:
         run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+          PATH: ${{ env.NDI_SDK_DIR }}\Bin\x64;${{ env.PATH }}
