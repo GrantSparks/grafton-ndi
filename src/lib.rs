@@ -4,7 +4,7 @@ use std::{
     ffi::{CStr, CString},
     fmt::{self, Display, Formatter},
     os::raw::c_char,
-    ptr,
+    ptr, slice,
 };
 
 mod error;
@@ -54,11 +54,11 @@ use ndi_lib::{
     NDIlib_recv_color_format_e_NDIlib_recv_color_format_fastest,
     NDIlib_recv_color_format_e_NDIlib_recv_color_format_max, NDIlib_recv_connect,
     NDIlib_recv_create_v3, NDIlib_recv_create_v3_t, NDIlib_recv_destroy, NDIlib_recv_free_audio_v3,
-    NDIlib_recv_free_metadata, NDIlib_recv_free_video_v2, NDIlib_recv_instance_t,
-    NDIlib_recv_ptz_auto_focus, NDIlib_recv_ptz_exposure_auto, NDIlib_recv_ptz_exposure_manual,
-    NDIlib_recv_ptz_exposure_manual_v2, NDIlib_recv_ptz_focus, NDIlib_recv_ptz_focus_speed,
-    NDIlib_recv_ptz_is_supported, NDIlib_recv_ptz_pan_tilt, NDIlib_recv_ptz_pan_tilt_speed,
-    NDIlib_recv_ptz_recall_preset, NDIlib_recv_ptz_store_preset,
+    NDIlib_recv_free_metadata, NDIlib_recv_free_string, NDIlib_recv_free_video_v2,
+    NDIlib_recv_instance_t, NDIlib_recv_ptz_auto_focus, NDIlib_recv_ptz_exposure_auto,
+    NDIlib_recv_ptz_exposure_manual, NDIlib_recv_ptz_exposure_manual_v2, NDIlib_recv_ptz_focus,
+    NDIlib_recv_ptz_focus_speed, NDIlib_recv_ptz_is_supported, NDIlib_recv_ptz_pan_tilt,
+    NDIlib_recv_ptz_pan_tilt_speed, NDIlib_recv_ptz_recall_preset, NDIlib_recv_ptz_store_preset,
     NDIlib_recv_ptz_white_balance_auto, NDIlib_recv_ptz_white_balance_indoor,
     NDIlib_recv_ptz_white_balance_manual, NDIlib_recv_ptz_white_balance_oneshot,
     NDIlib_recv_ptz_white_balance_outdoor, NDIlib_recv_ptz_zoom, NDIlib_recv_ptz_zoom_speed,
@@ -320,6 +320,25 @@ impl From<FourCCVideoType> for NDIlib_FourCC_video_type_e {
     }
 }
 
+impl From<NDIlib_FourCC_video_type_e> for FourCCVideoType {
+    fn from(fourcc: NDIlib_FourCC_video_type_e) -> Self {
+        match fourcc {
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY => FourCCVideoType::UYVY,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVA => FourCCVideoType::UYVA,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_P216 => FourCCVideoType::P216,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_PA16 => FourCCVideoType::PA16,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_YV12 => FourCCVideoType::YV12,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_I420 => FourCCVideoType::I420,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NV12 => FourCCVideoType::NV12,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA => FourCCVideoType::BGRA,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRX => FourCCVideoType::BGRX,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBA => FourCCVideoType::RGBA,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBX => FourCCVideoType::RGBX,
+            _ => FourCCVideoType::Max,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum FrameFormatType {
     Progressive,
@@ -345,11 +364,58 @@ impl From<FrameFormatType> for NDIlib_frame_format_type_e {
     }
 }
 
+impl From<NDIlib_frame_format_type_e> for FrameFormatType {
+    fn from(format: NDIlib_frame_format_type_e) -> Self {
+        match format {
+            NDIlib_frame_format_type_e_NDIlib_frame_format_type_progressive => {
+                FrameFormatType::Progressive
+            }
+            NDIlib_frame_format_type_e_NDIlib_frame_format_type_interleaved => {
+                FrameFormatType::Interlaced
+            }
+            NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_0 => FrameFormatType::Field0,
+            NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_1 => FrameFormatType::Field1,
+            _ => FrameFormatType::Max,
+        }
+    }
+}
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub union LineStrideOrSize {
     pub line_stride_in_bytes: i32,
     pub data_size_in_bytes: i32,
+}
+
+impl From<LineStrideOrSize> for NDIlib_video_frame_v2_t__bindgen_ty_1 {
+    fn from(value: LineStrideOrSize) -> Self {
+        unsafe {
+            if value.line_stride_in_bytes != 0 {
+                NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                    line_stride_in_bytes: value.line_stride_in_bytes,
+                }
+            } else {
+                NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                    data_size_in_bytes: value.data_size_in_bytes,
+                }
+            }
+        }
+    }
+}
+
+impl From<NDIlib_video_frame_v2_t__bindgen_ty_1> for LineStrideOrSize {
+    fn from(value: NDIlib_video_frame_v2_t__bindgen_ty_1) -> Self {
+        unsafe {
+            if value.line_stride_in_bytes != 0 {
+                LineStrideOrSize {
+                    line_stride_in_bytes: value.line_stride_in_bytes,
+                }
+            } else {
+                LineStrideOrSize {
+                    data_size_in_bytes: value.data_size_in_bytes,
+                }
+            }
+        }
+    }
 }
 
 pub struct VideoFrame {
@@ -363,77 +429,67 @@ pub struct VideoFrame {
     pub timecode: i64,
     pub data: Vec<u8>,
     pub line_stride_or_size: LineStrideOrSize,
-    pub p_metadata: *const c_char,
+    pub metadata: Option<CString>,
     pub timestamp: i64,
+    memory_owned: bool,
+    metadata_memory_owned: bool,
 }
 
 impl Default for VideoFrame {
     fn default() -> Self {
-        Self::new()
+        VideoFrame::new(
+            1920,
+            1080,
+            FourCCVideoType::BGRA,
+            60,
+            1,
+            16.0 / 9.0,
+            FrameFormatType::Interlaced,
+        )
     }
 }
 
 impl VideoFrame {
-    pub fn new() -> Self {
-        VideoFrame {
-            xres: 0,
-            yres: 0,
-            fourcc: FourCCVideoType::RGBA,
-            frame_rate_n: 0,
-            frame_rate_d: 0,
-            picture_aspect_ratio: 0.0,
-            frame_format_type: FrameFormatType::Interlaced,
-            timecode: 0,
-            data: vec![],
-            line_stride_or_size: LineStrideOrSize {
-                line_stride_in_bytes: 0,
-            },
-            p_metadata: ptr::null(),
-            timestamp: 0,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_data(
+    pub fn new(
         xres: i32,
         yres: i32,
         fourcc: FourCCVideoType,
         frame_rate_n: i32,
         frame_rate_d: i32,
-        picture_aspect_ratio: f32,
-        frame_format_type: FrameFormatType,
-        timecode: i64,
-        data: Vec<u8>,
-        metadata: Option<String>,
-        timestamp: i64,
-    ) -> Result<Self, Error> {
-        let p_metadata = match metadata {
-            Some(m) => {
-                let c_string = CString::new(m).map_err(Error::InvalidCString)?;
-                c_string.into_raw() as *const c_char
-            }
-            None => ptr::null(),
+        aspect_ratio: f32,
+        format: FrameFormatType,
+    ) -> Self {
+        let bpp = match fourcc {
+            FourCCVideoType::BGRA => 32,
+            // Add other formats and their bpp as needed
+            _ => 32, // Default to 32 bpp if unknown
         };
 
-        Ok(VideoFrame {
+        let stride = (xres * bpp + 7) / 8;
+        let buffer_size: usize = (yres * stride) as usize;
+        let data = vec![0u8; buffer_size];
+
+        VideoFrame {
             xres,
             yres,
             fourcc,
             frame_rate_n,
             frame_rate_d,
-            picture_aspect_ratio,
-            frame_format_type,
-            timecode,
+            picture_aspect_ratio: aspect_ratio,
+            frame_format_type: format,
+            timecode: 0,
             data,
             line_stride_or_size: LineStrideOrSize {
-                line_stride_in_bytes: xres * 4,
+                line_stride_in_bytes: stride,
             },
-            p_metadata,
-            timestamp,
-        })
+            metadata: None,
+            timestamp: 0,
+            memory_owned: true,
+            metadata_memory_owned: false,
+        }
     }
 
-    pub(crate) fn to_raw(&self) -> NDIlib_video_frame_v2_t {
+    pub fn to_raw(&self) -> NDIlib_video_frame_v2_t {
         NDIlib_video_frame_v2_t {
             xres: self.xres,
             yres: self.yres,
@@ -444,153 +500,68 @@ impl VideoFrame {
             frame_format_type: self.frame_format_type.into(),
             timecode: self.timecode,
             p_data: self.data.as_ptr() as *mut u8,
-            __bindgen_anon_1: unsafe {
-                NDIlib_video_frame_v2_t__bindgen_ty_1 {
-                    line_stride_in_bytes: self.line_stride_or_size.line_stride_in_bytes,
-                }
+            __bindgen_anon_1: self.line_stride_or_size.into(),
+            p_metadata: match &self.metadata {
+                Some(meta) => meta.as_ptr(),
+                None => ptr::null(),
             },
-            p_metadata: self.p_metadata,
             timestamp: self.timestamp,
         }
     }
 
-    pub(crate) fn from_raw(raw: NDIlib_video_frame_v2_t) -> Self {
-        if raw.p_data.is_null() {
-            panic!("Received a null pointer for raw video frame data");
-        }
+    /// Creates a `VideoFrame` from a raw NDI video frame.
+    ///
+    /// # Safety
+    ///
+    /// This function assumes the given `NDIlib_video_frame_v2_t` is valid and correctly allocated.
+    /// The caller must ensure that the raw data remains valid for the lifetime of the `VideoFrame`.
+    pub unsafe fn from_raw(c_frame: &NDIlib_video_frame_v2_t) -> Self {
+        let data_size = c_frame.__bindgen_anon_1.data_size_in_bytes;
+        let data = slice::from_raw_parts(c_frame.p_data, data_size as usize).to_vec();
 
-        if raw.xres <= 0 || raw.yres <= 0 {
-            panic!(
-                "Invalid frame dimensions: xres: {}, yres: {}",
-                raw.xres, raw.yres
-            );
-        }
-
-        if raw.frame_rate_N <= 0 || raw.frame_rate_D <= 0 {
-            panic!(
-                "Invalid frame rate: frame_rate_N: {}, frame_rate_D: {}",
-                raw.frame_rate_N, raw.frame_rate_D
-            );
-        }
-
-        let data_size = match raw.FourCC {
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA
-            | NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRX
-            | NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBA
-            | NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBX => {
-                (raw.xres * raw.yres * 4) as usize
-            }
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY => {
-                (raw.xres * raw.yres * 2) as usize
-            }
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_P216
-            | NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_PA16 => {
-                let bytes_per_channel = 2;
-                let luma_size = (raw.xres * raw.yres * bytes_per_channel) as usize;
-                let chroma_size = (raw.xres * raw.yres * bytes_per_channel / 2) as usize;
-                let alpha_size =
-                    if raw.FourCC == NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_PA16 {
-                        luma_size
-                    } else {
-                        0
-                    };
-                luma_size + chroma_size + alpha_size
-            }
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_YV12
-            | NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_I420 => {
-                let y_plane_size = (raw.xres * raw.yres) as usize;
-                let uv_plane_size = (raw.xres * raw.yres / 4) as usize;
-                y_plane_size + 2 * uv_plane_size
-            }
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NV12 => {
-                let y_plane_size = (raw.xres * raw.yres) as usize;
-                let uv_plane_size = (raw.xres * raw.yres / 2) as usize;
-                y_plane_size + uv_plane_size
-            }
-            _ => {
-                panic!("Unsupported FourCC format");
-            }
-        };
-
-        if data_size == 0 {
-            panic!("Calculated data length is zero");
-        }
-
-        let data = unsafe {
-            assert!(!raw.p_data.is_null(), "raw.p_data is null");
-            std::slice::from_raw_parts(raw.p_data, data_size).to_vec()
-        };
-
-        if data.len() != data_size {
-            panic!(
-                "Mismatch between data length ({} bytes) and calculated data length ({} bytes)",
-                data.len(),
-                data_size
-            );
-        }
-
-        let fourcc = match raw.FourCC {
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY => FourCCVideoType::UYVY,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVA => FourCCVideoType::UYVA,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_P216 => FourCCVideoType::P216,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_PA16 => FourCCVideoType::PA16,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_YV12 => FourCCVideoType::YV12,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_I420 => FourCCVideoType::I420,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NV12 => FourCCVideoType::NV12,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA => FourCCVideoType::BGRA,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRX => FourCCVideoType::BGRX,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBA => FourCCVideoType::RGBA,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBX => FourCCVideoType::RGBX,
-            _ => FourCCVideoType::Max,
-        };
-
-        let frame_format_type = match raw.frame_format_type {
-            NDIlib_frame_format_type_e_NDIlib_frame_format_type_progressive => {
-                FrameFormatType::Progressive
-            }
-            NDIlib_frame_format_type_e_NDIlib_frame_format_type_interleaved => {
-                FrameFormatType::Interlaced
-            }
-            NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_0 => FrameFormatType::Field0,
-            NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_1 => FrameFormatType::Field1,
-            _ => FrameFormatType::Max,
-        };
-
-        let line_stride_in_bytes = unsafe { raw.__bindgen_anon_1.line_stride_in_bytes };
-        if line_stride_in_bytes <= 0 {
-            panic!("Invalid line stride in bytes: {}", line_stride_in_bytes);
-        }
-
-        let p_metadata = if raw.p_metadata.is_null() {
-            ptr::null()
+        let metadata = if c_frame.p_metadata.is_null() {
+            None
         } else {
-            unsafe { CString::from_raw(raw.p_metadata as *mut c_char).into_raw() }
+            Some(CStr::from_ptr(c_frame.p_metadata).to_owned())
         };
 
         VideoFrame {
-            xres: raw.xres,
-            yres: raw.yres,
-            fourcc,
-            frame_rate_n: raw.frame_rate_N,
-            frame_rate_d: raw.frame_rate_D,
-            picture_aspect_ratio: raw.picture_aspect_ratio,
-            frame_format_type,
-            timecode: raw.timecode,
+            xres: c_frame.xres,
+            yres: c_frame.yres,
+            fourcc: FourCCVideoType::from(c_frame.FourCC),
+            frame_rate_n: c_frame.frame_rate_N,
+            frame_rate_d: c_frame.frame_rate_D,
+            picture_aspect_ratio: c_frame.picture_aspect_ratio,
+            frame_format_type: FrameFormatType::from(c_frame.frame_format_type),
+            timecode: c_frame.timecode,
             data,
             line_stride_or_size: LineStrideOrSize {
-                line_stride_in_bytes,
+                data_size_in_bytes: data_size,
             },
-            p_metadata,
-            timestamp: raw.timestamp,
+            metadata,
+            timestamp: c_frame.timestamp,
+            memory_owned: true,
+            metadata_memory_owned: true,
         }
     }
 }
 
 impl Drop for VideoFrame {
     fn drop(&mut self) {
-        if !self.p_metadata.is_null() {
+        if self.memory_owned {
             unsafe {
-                let _ = CString::from_raw(self.p_metadata as *mut c_char);
+                // TODO:  Is this needed?  The original allocation was a Rust Vec<u8>
+                let buffer_ptr = self.data.as_mut_ptr();
+                let buffer_size = self.data.len();
+                Vec::from_raw_parts(buffer_ptr, buffer_size, buffer_size);
+            }
+        }
+
+        if self.metadata_memory_owned {
+            if let Some(meta) = &self.metadata {
+                unsafe {
+                    let _ = CString::from_raw(meta.as_ptr() as *mut c_char);
+                }
             }
         }
     }
@@ -604,7 +575,7 @@ pub struct AudioFrame {
     pub fourcc: AudioType,
     pub data: Vec<u8>,
     pub channel_stride_in_bytes: i32,
-    pub metadata: Option<CString>, // TODO: I think this should be a String
+    pub metadata: Option<CString>,
     pub timestamp: i64,
 }
 
@@ -960,7 +931,7 @@ impl<'a> Recv<'a> {
     }
 
     pub fn capture(&self, timeout_ms: u32) -> Result<FrameType, Error> {
-        let video_frame = VideoFrame::new();
+        let video_frame = VideoFrame::default();
         let audio_frame = AudioFrame::new();
         let metadata_frame = MetadataFrame::new();
 
@@ -979,9 +950,9 @@ impl<'a> Recv<'a> {
         };
 
         match frame_type {
-            NDIlib_frame_type_e_NDIlib_frame_type_video => {
-                Ok(FrameType::Video(VideoFrame::from_raw(raw_video_frame)))
-            }
+            NDIlib_frame_type_e_NDIlib_frame_type_video => unsafe {
+                Ok(FrameType::Video(VideoFrame::from_raw(&raw_video_frame)))
+            },
             NDIlib_frame_type_e_NDIlib_frame_type_audio => {
                 Ok(FrameType::Audio(AudioFrame::from_raw(raw_audio_frame)))
             }
@@ -1000,21 +971,36 @@ impl<'a> Recv<'a> {
         }
     }
 
+    /// This function is private because for the design of this library it is expected that this memory has been allocated by Rust
+    #[allow(dead_code)]
     pub fn free_video(&self, video_frame: &VideoFrame) {
         unsafe {
             NDIlib_recv_free_video_v2(self.instance, &video_frame.to_raw());
         }
     }
 
+    /// This function is private because for the design of this library it is expected that this memory has been allocated by Rust
+    #[allow(dead_code)]
     pub fn free_audio(&self, audio_frame: &AudioFrame) {
         unsafe {
             NDIlib_recv_free_audio_v3(self.instance, &audio_frame.to_raw());
         }
     }
 
+    /// This function is private because for the design of this library it is expected that this memory has been allocated by Rust
+    #[allow(dead_code)]
     pub fn free_metadata(&self, metadata_frame: &MetadataFrame) {
         unsafe {
             NDIlib_recv_free_metadata(self.instance, &metadata_frame.to_raw());
+        }
+    }
+
+    /// This function is private because for the design of this library it is expected that this memory has been allocated by Rust
+    #[allow(dead_code)]
+    pub fn free_string(&self, string: &str) {
+        let c_string = CString::new(string).expect("Failed to create CString");
+        unsafe {
+            NDIlib_recv_free_string(self.instance, c_string.into_raw());
         }
     }
 
