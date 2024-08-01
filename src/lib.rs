@@ -8,69 +8,10 @@ use std::{
 };
 
 mod error;
-pub use error::Error;
+pub use error::*;
 
 mod ndi_lib;
-
-use ndi_lib::{
-    NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
-    NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_max, NDIlib_FourCC_video_type_e,
-    NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA,
-    NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRX,
-    NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_I420,
-    NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NV12,
-    NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_P216,
-    NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_PA16,
-    NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBA,
-    NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBX,
-    NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVA,
-    NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY,
-    NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_YV12,
-    NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_max, NDIlib_audio_frame_v3_t,
-    NDIlib_audio_frame_v3_t__bindgen_ty_1, NDIlib_destroy, NDIlib_find_create_t,
-    NDIlib_find_create_v2, NDIlib_find_destroy, NDIlib_find_get_sources, NDIlib_find_instance_t,
-    NDIlib_find_wait_for_sources, NDIlib_frame_format_type_e,
-    NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_0,
-    NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_1,
-    NDIlib_frame_format_type_e_NDIlib_frame_format_type_interleaved,
-    NDIlib_frame_format_type_e_NDIlib_frame_format_type_max,
-    NDIlib_frame_format_type_e_NDIlib_frame_format_type_progressive,
-    NDIlib_frame_type_e_NDIlib_frame_type_audio, NDIlib_frame_type_e_NDIlib_frame_type_error,
-    NDIlib_frame_type_e_NDIlib_frame_type_metadata, NDIlib_frame_type_e_NDIlib_frame_type_none,
-    NDIlib_frame_type_e_NDIlib_frame_type_status_change,
-    NDIlib_frame_type_e_NDIlib_frame_type_video, NDIlib_initialize, NDIlib_is_supported_CPU,
-    NDIlib_metadata_frame_t, NDIlib_recv_bandwidth_e,
-    NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_audio_only,
-    NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
-    NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest,
-    NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_max,
-    NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_metadata_only, NDIlib_recv_capture_v3,
-    NDIlib_recv_color_format_e, NDIlib_recv_color_format_e_NDIlib_recv_color_format_BGRX_BGRA,
-    NDIlib_recv_color_format_e_NDIlib_recv_color_format_BGRX_BGRA_flipped,
-    NDIlib_recv_color_format_e_NDIlib_recv_color_format_RGBX_RGBA,
-    NDIlib_recv_color_format_e_NDIlib_recv_color_format_UYVY_BGRA,
-    NDIlib_recv_color_format_e_NDIlib_recv_color_format_UYVY_RGBA,
-    NDIlib_recv_color_format_e_NDIlib_recv_color_format_best,
-    NDIlib_recv_color_format_e_NDIlib_recv_color_format_fastest,
-    NDIlib_recv_color_format_e_NDIlib_recv_color_format_max, NDIlib_recv_connect,
-    NDIlib_recv_create_v3, NDIlib_recv_create_v3_t, NDIlib_recv_destroy, NDIlib_recv_free_audio_v3,
-    NDIlib_recv_free_metadata, NDIlib_recv_free_string, NDIlib_recv_free_video_v2,
-    NDIlib_recv_instance_t, NDIlib_recv_ptz_auto_focus, NDIlib_recv_ptz_exposure_auto,
-    NDIlib_recv_ptz_exposure_manual, NDIlib_recv_ptz_exposure_manual_v2, NDIlib_recv_ptz_focus,
-    NDIlib_recv_ptz_focus_speed, NDIlib_recv_ptz_is_supported, NDIlib_recv_ptz_pan_tilt,
-    NDIlib_recv_ptz_pan_tilt_speed, NDIlib_recv_ptz_recall_preset, NDIlib_recv_ptz_store_preset,
-    NDIlib_recv_ptz_white_balance_auto, NDIlib_recv_ptz_white_balance_indoor,
-    NDIlib_recv_ptz_white_balance_manual, NDIlib_recv_ptz_white_balance_oneshot,
-    NDIlib_recv_ptz_white_balance_outdoor, NDIlib_recv_ptz_zoom, NDIlib_recv_ptz_zoom_speed,
-    NDIlib_send_add_connection_metadata, NDIlib_send_capture,
-    NDIlib_send_clear_connection_metadata, NDIlib_send_create, NDIlib_send_create_t,
-    NDIlib_send_destroy, NDIlib_send_free_metadata, NDIlib_send_get_no_connections,
-    NDIlib_send_get_source_name, NDIlib_send_get_tally, NDIlib_send_instance_t,
-    NDIlib_send_send_audio_v3, NDIlib_send_send_metadata, NDIlib_send_send_video_async_v2,
-    NDIlib_send_send_video_v2, NDIlib_send_set_failover, NDIlib_source_t,
-    NDIlib_source_t__bindgen_ty_1, NDIlib_tally_t, NDIlib_version, NDIlib_video_frame_v2_t,
-    NDIlib_video_frame_v2_t__bindgen_ty_1,
-};
+use ndi_lib::*;
 
 pub struct NDI;
 
@@ -114,7 +55,7 @@ impl Drop for NDI {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Finder {
     pub show_local_sources: bool,
     pub groups: Option<String>,
@@ -131,16 +72,6 @@ impl Finder {
     }
 }
 
-impl Default for Finder {
-    fn default() -> Self {
-        Finder {
-            show_local_sources: true,
-            groups: None,
-            extra_ips: None,
-        }
-    }
-}
-
 pub struct Find<'a> {
     instance: NDIlib_find_instance_t,
     ndi: std::marker::PhantomData<&'a NDI>,
@@ -150,11 +81,13 @@ impl<'a> Find<'a> {
     pub fn new(_ndi: &'a NDI, settings: Finder) -> Result<Self, Error> {
         let groups_cstr = settings
             .groups
+            .as_deref()
             .map(CString::new)
             .transpose()
             .map_err(Error::InvalidCString)?;
         let extra_ips_cstr = settings
             .extra_ips
+            .as_deref()
             .map(CString::new)
             .transpose()
             .map_err(Error::InvalidCString)?;
@@ -254,16 +187,18 @@ impl Source {
         let p_ndi_name = CString::new(self.name.clone()).map_err(Error::InvalidCString)?;
         let p_url_address = self
             .url_address
-            .as_ref()
-            .map(|s| CString::new(s.clone()).map_err(Error::InvalidCString))
-            .transpose()?
+            .as_deref()
+            .map(CString::new)
+            .transpose()
+            .map_err(Error::InvalidCString)?
             .map_or(ptr::null(), |s| s.into_raw());
 
         let p_ip_address = self
             .ip_address
-            .as_ref()
-            .map(|s| CString::new(s.clone()).map_err(Error::InvalidCString))
-            .transpose()?
+            .as_deref()
+            .map(CString::new)
+            .transpose()
+            .map_err(Error::InvalidCString)?
             .map_or(ptr::null(), |s| s.into_raw());
 
         let __bindgen_anon_1 = if !p_url_address.is_null() {
@@ -379,6 +314,7 @@ impl From<NDIlib_frame_format_type_e> for FrameFormatType {
         }
     }
 }
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub union LineStrideOrSize {
@@ -430,6 +366,7 @@ impl From<NDIlib_video_frame_v2_t__bindgen_ty_1> for LineStrideOrSize {
         }
     }
 }
+
 pub struct VideoFrame {
     pub xres: i32,
     pub yres: i32,
@@ -740,7 +677,7 @@ pub enum AudioType {
 
 impl From<i32> for AudioType {
     fn from(value: i32) -> Self {
-        if let NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP = value {
+        if value == NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP {
             AudioType::FLTP
         } else {
             AudioType::Max
