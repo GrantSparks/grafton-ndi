@@ -32,7 +32,7 @@ fn main() {
             Some("Example PTZ Receiver".to_string()),
         );
 
-        let ndi_recv = Recv::new(&ndi, receiver).expect("Failed to create NDI recv instance");
+        let mut ndi_recv = Recv::new(&ndi, receiver).expect("Failed to create NDI recv instance");
 
         // Run for 30 seconds
         let start = Instant::now();

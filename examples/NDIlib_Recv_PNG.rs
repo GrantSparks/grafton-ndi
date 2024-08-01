@@ -42,7 +42,7 @@ fn main() -> Result<(), Error> {
             false,
             None,
         );
-        let ndi_recv = Recv::new(&ndi, receiver)?;
+        let mut ndi_recv = Recv::new(&ndi, receiver)?;
 
         // Wait until we have a video frame
         let mut video_frame: Option<VideoFrame> = None;
@@ -61,7 +61,6 @@ fn main() -> Result<(), Error> {
                             "Stride does not match width, skipping frame with resolution: {}x{}",
                             frame.xres, frame.yres
                         );
-                        ndi_recv.free_video(&frame);
                     }
                 }
                 _ => println!("Failed to capture a video frame or no video frame available."),

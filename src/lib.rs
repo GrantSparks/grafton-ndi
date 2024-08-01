@@ -4,7 +4,7 @@ use std::{
     ffi::{CStr, CString},
     fmt::{self, Display, Formatter},
     os::raw::c_char,
-    ptr, slice,
+    ptr,
 };
 
 mod error;
@@ -386,6 +386,19 @@ pub union LineStrideOrSize {
     pub data_size_in_bytes: i32,
 }
 
+impl fmt::Debug for LineStrideOrSize {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // For debugging purposes, we'll assume that we're interested in `line_stride_in_bytes`
+        unsafe {
+            write!(
+                f,
+                "LineStrideOrSize {{ line_stride_in_bytes: {} }}",
+                self.line_stride_in_bytes
+            )
+        }
+    }
+}
+
 impl From<LineStrideOrSize> for NDIlib_video_frame_v2_t__bindgen_ty_1 {
     fn from(value: LineStrideOrSize) -> Self {
         unsafe {
@@ -417,7 +430,6 @@ impl From<NDIlib_video_frame_v2_t__bindgen_ty_1> for LineStrideOrSize {
         }
     }
 }
-
 pub struct VideoFrame {
     pub xres: i32,
     pub yres: i32,
@@ -431,8 +443,25 @@ pub struct VideoFrame {
     pub line_stride_or_size: LineStrideOrSize,
     pub metadata: Option<CString>,
     pub timestamp: i64,
-    memory_owned: bool,
-    metadata_memory_owned: bool,
+}
+
+impl fmt::Debug for VideoFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VideoFrame")
+            .field("xres", &self.xres)
+            .field("yres", &self.yres)
+            .field("fourcc", &self.fourcc)
+            .field("frame_rate_n", &self.frame_rate_n)
+            .field("frame_rate_d", &self.frame_rate_d)
+            .field("picture_aspect_ratio", &self.picture_aspect_ratio)
+            .field("frame_format_type", &self.frame_format_type)
+            .field("timecode", &self.timecode)
+            .field("data (bytes)", &self.data.len())
+            .field("line_stride_or_size", &self.line_stride_or_size)
+            .field("metadata", &self.metadata)
+            .field("timestamp", &self.timestamp)
+            .finish()
+    }
 }
 
 impl Default for VideoFrame {
@@ -484,8 +513,6 @@ impl VideoFrame {
             },
             metadata: None,
             timestamp: 0,
-            memory_owned: true,
-            metadata_memory_owned: false,
         }
     }
 
@@ -516,57 +543,49 @@ impl VideoFrame {
     /// This function assumes the given `NDIlib_video_frame_v2_t` is valid and correctly allocated.
     /// The caller must ensure that the raw data remains valid for the lifetime of the `VideoFrame`.
     pub unsafe fn from_raw(c_frame: &NDIlib_video_frame_v2_t) -> Self {
-        let data_size = c_frame.__bindgen_anon_1.data_size_in_bytes;
-        let data = slice::from_raw_parts(c_frame.p_data, data_size as usize).to_vec();
+        let data_size = c_frame.__bindgen_anon_1.data_size_in_bytes as usize;
+        if c_frame.p_data.is_null() || data_size == 0 {
+            panic!("Invalid video frame data");
+        }
+
+        let data = std::slice::from_raw_parts(c_frame.p_data, data_size).to_vec();
 
         let metadata = if c_frame.p_metadata.is_null() {
             None
         } else {
-            Some(CStr::from_ptr(c_frame.p_metadata).to_owned())
+            Some(CString::from(CStr::from_ptr(c_frame.p_metadata)))
         };
 
         VideoFrame {
             xres: c_frame.xres,
             yres: c_frame.yres,
-            fourcc: FourCCVideoType::from(c_frame.FourCC),
+            fourcc: c_frame.FourCC.into(),
             frame_rate_n: c_frame.frame_rate_N,
             frame_rate_d: c_frame.frame_rate_D,
             picture_aspect_ratio: c_frame.picture_aspect_ratio,
-            frame_format_type: FrameFormatType::from(c_frame.frame_format_type),
+            frame_format_type: c_frame.frame_format_type.into(),
             timecode: c_frame.timecode,
             data,
             line_stride_or_size: LineStrideOrSize {
-                data_size_in_bytes: data_size,
+                data_size_in_bytes: data_size as i32,
             },
             metadata,
             timestamp: c_frame.timestamp,
-            memory_owned: true,
-            metadata_memory_owned: true,
         }
     }
 }
 
 impl Drop for VideoFrame {
     fn drop(&mut self) {
-        if self.memory_owned {
+        if let Some(meta) = &self.metadata {
             unsafe {
-                // TODO:  Is this needed?  The original allocation was a Rust Vec<u8>
-                let buffer_ptr = self.data.as_mut_ptr();
-                let buffer_size = self.data.len();
-                Vec::from_raw_parts(buffer_ptr, buffer_size, buffer_size);
-            }
-        }
-
-        if self.metadata_memory_owned {
-            if let Some(meta) = &self.metadata {
-                unsafe {
-                    let _ = CString::from_raw(meta.as_ptr() as *mut c_char);
-                }
+                let _ = CString::from_raw(meta.as_ptr() as *mut c_char);
             }
         }
     }
 }
 
+#[derive(Debug)]
 pub struct AudioFrame {
     pub sample_rate: i32,
     pub no_channels: i32,
@@ -577,16 +596,6 @@ pub struct AudioFrame {
     pub channel_stride_in_bytes: i32,
     pub metadata: Option<CString>,
     pub timestamp: i64,
-}
-
-impl Drop for AudioFrame {
-    fn drop(&mut self) {
-        if let Some(metadata) = self.metadata.take() {
-            unsafe {
-                let _ = CString::from_raw(metadata.into_raw());
-            }
-        }
-    }
 }
 
 impl AudioFrame {
@@ -713,6 +722,16 @@ impl Default for AudioFrame {
     }
 }
 
+impl Drop for AudioFrame {
+    fn drop(&mut self) {
+        if let Some(metadata) = self.metadata.take() {
+            unsafe {
+                let _ = CString::from_raw(metadata.into_raw());
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioType {
     FLTP,
@@ -738,6 +757,7 @@ impl From<AudioType> for i32 {
     }
 }
 
+#[derive(Debug)]
 pub struct MetadataFrame {
     pub length: i32,
     pub timecode: i64,
@@ -773,16 +793,6 @@ impl MetadataFrame {
 impl Default for MetadataFrame {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Drop for MetadataFrame {
-    fn drop(&mut self) {
-        if !self.p_data.is_null() {
-            unsafe {
-                let _ = CString::from_raw(self.p_data);
-            }
-        }
     }
 }
 
@@ -930,40 +940,54 @@ impl<'a> Recv<'a> {
         }
     }
 
-    pub fn capture(&self, timeout_ms: u32) -> Result<FrameType, Error> {
-        let video_frame = VideoFrame::default();
-        let audio_frame = AudioFrame::new();
-        let metadata_frame = MetadataFrame::new();
-
-        let mut raw_video_frame = video_frame.to_raw();
-        let mut raw_audio_frame = audio_frame.to_raw();
-        let mut raw_metadata_frame = metadata_frame.to_raw();
+    pub fn capture(&mut self, timeout_ms: u32) -> Result<FrameType, Error> {
+        let mut video_frame = NDIlib_video_frame_v2_t::default();
+        let mut audio_frame = NDIlib_audio_frame_v3_t::default();
+        let mut metadata_frame = NDIlib_metadata_frame_t::default();
 
         let frame_type = unsafe {
             NDIlib_recv_capture_v3(
                 self.instance,
-                &mut raw_video_frame as *mut _,
-                &mut raw_audio_frame as *mut _,
-                &mut raw_metadata_frame as *mut _,
+                &mut video_frame,
+                &mut audio_frame,
+                &mut metadata_frame,
                 timeout_ms,
             )
         };
 
         match frame_type {
-            NDIlib_frame_type_e_NDIlib_frame_type_video => unsafe {
-                Ok(FrameType::Video(VideoFrame::from_raw(&raw_video_frame)))
-            },
-            NDIlib_frame_type_e_NDIlib_frame_type_audio => {
-                Ok(FrameType::Audio(AudioFrame::from_raw(raw_audio_frame)))
+            NDIlib_frame_type_e_NDIlib_frame_type_video => {
+                if video_frame.p_data.is_null() {
+                    Err(Error::NullPointer("Video frame data is null".into()))
+                } else {
+                    let frame = unsafe { VideoFrame::from_raw(&video_frame) };
+                    unsafe { NDIlib_recv_free_video_v2(self.instance, &video_frame) };
+                    Ok(FrameType::Video(frame))
+                }
             }
-            NDIlib_frame_type_e_NDIlib_frame_type_metadata => Ok(FrameType::Metadata(
-                MetadataFrame::from_raw(raw_metadata_frame),
-            )),
+            NDIlib_frame_type_e_NDIlib_frame_type_audio => {
+                if audio_frame.p_data.is_null() {
+                    Err(Error::NullPointer("Audio frame data is null".into()))
+                } else {
+                    let frame = AudioFrame::from_raw(audio_frame);
+                    unsafe { NDIlib_recv_free_audio_v3(self.instance, &audio_frame) };
+                    Ok(FrameType::Audio(frame))
+                }
+            }
+            NDIlib_frame_type_e_NDIlib_frame_type_metadata => {
+                if metadata_frame.p_data.is_null() {
+                    Err(Error::NullPointer("Metadata frame data is null".into()))
+                } else {
+                    let frame = MetadataFrame::from_raw(metadata_frame);
+                    unsafe { NDIlib_recv_free_metadata(self.instance, &metadata_frame) };
+                    Ok(FrameType::Metadata(frame))
+                }
+            }
             NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(FrameType::None),
+            NDIlib_frame_type_e_NDIlib_frame_type_status_change => Ok(FrameType::StatusChange),
             NDIlib_frame_type_e_NDIlib_frame_type_error => {
                 Err(Error::CaptureFailed("Received an error frame".into()))
             }
-            NDIlib_frame_type_e_NDIlib_frame_type_status_change => Ok(FrameType::StatusChange),
             _ => Err(Error::CaptureFailed(format!(
                 "Unknown frame type: {}",
                 frame_type
@@ -971,31 +995,6 @@ impl<'a> Recv<'a> {
         }
     }
 
-    /// This function is private because for the design of this library it is expected that this memory has been allocated by Rust
-    #[allow(dead_code)]
-    pub fn free_video(&self, video_frame: &VideoFrame) {
-        unsafe {
-            NDIlib_recv_free_video_v2(self.instance, &video_frame.to_raw());
-        }
-    }
-
-    /// This function is private because for the design of this library it is expected that this memory has been allocated by Rust
-    #[allow(dead_code)]
-    pub fn free_audio(&self, audio_frame: &AudioFrame) {
-        unsafe {
-            NDIlib_recv_free_audio_v3(self.instance, &audio_frame.to_raw());
-        }
-    }
-
-    /// This function is private because for the design of this library it is expected that this memory has been allocated by Rust
-    #[allow(dead_code)]
-    pub fn free_metadata(&self, metadata_frame: &MetadataFrame) {
-        unsafe {
-            NDIlib_recv_free_metadata(self.instance, &metadata_frame.to_raw());
-        }
-    }
-
-    /// This function is private because for the design of this library it is expected that this memory has been allocated by Rust
     #[allow(dead_code)]
     pub fn free_string(&self, string: &str) {
         let c_string = CString::new(string).expect("Failed to create CString");
@@ -1085,6 +1084,7 @@ impl<'a> Drop for Recv<'a> {
     }
 }
 
+#[derive(Debug)]
 pub enum FrameType {
     Video(VideoFrame),
     Audio(AudioFrame),
