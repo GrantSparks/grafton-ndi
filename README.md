@@ -2,6 +2,10 @@
 
 Unofficial idiomatic Rust bindings for the [NDI 6 SDK](https://ndi.video/for-developers/ndi-sdk/).
 
+## Usage
+
+See our blog article on [how to use the NDI SDK with Rust](https://blog.grafton.ai/configuration-management-for-rust-applications-15b2a0346b80).
+
 ## Requirements
 
 This library has been developed and tested on Windows 10, but it should work on other platforms easily enough (please contribute!). You need to have the [NDI 6 SDK](https://ndi.video/for-developers/ndi-sdk/) installed for your platform. After installation, make sure your library path (or system PATH on Windows) includes the NDI library binaries location, (e.g., `%NDI_SDK_DIR%\Bin\x64` for Windows PATH).
