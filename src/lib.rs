@@ -541,9 +541,9 @@ impl VideoFrame {
     /// # Safety
     ///
     /// This function assumes the given `NDIlib_video_frame_v2_t` is valid and correctly allocated.
-    /// The caller must ensure that the raw data remains valid for the lifetime of the `VideoFrame`.
     pub unsafe fn from_raw(c_frame: &NDIlib_video_frame_v2_t) -> Self {
-        let data_size = c_frame.__bindgen_anon_1.data_size_in_bytes as usize;
+        let data_size =
+            c_frame.__bindgen_anon_1.data_size_in_bytes as usize * c_frame.yres as usize;
         if c_frame.p_data.is_null() || data_size == 0 {
             panic!("Invalid video frame data");
         }

@@ -53,15 +53,7 @@ fn main() -> Result<(), Error> {
             println!("Waiting for video frame ...");
             match ndi_recv.capture(60000) {
                 Ok(FrameType::Video(frame)) => {
-                    // Ensure that the stride matches the width
-                    if unsafe { frame.line_stride_or_size.line_stride_in_bytes } == frame.xres * 4 {
-                        video_frame = Some(frame);
-                    } else {
-                        println!(
-                            "Stride does not match width, skipping frame with resolution: {}x{}",
-                            frame.xres, frame.yres
-                        );
-                    }
+                    video_frame = Some(frame);
                 }
                 _ => println!("Failed to capture a video frame or no video frame available."),
             }
@@ -77,9 +69,7 @@ fn main() -> Result<(), Error> {
         // The NDI receiver will be destroyed automatically when it goes out of scope
         // The NDI library will be destroyed automatically when `ndi` goes out of scope
     } else {
-        return Err(Error::InitializationFailed(
-            "Failed to initialize NDI library".into(),
-        ));
+        return Err(Error::InitializationFailed("Failed with error".into()));
     }
 
     Ok(())
@@ -87,8 +77,10 @@ fn main() -> Result<(), Error> {
 
 fn save_frame_as_png(video_frame: &VideoFrame) -> Result<(), Error> {
     let path = "CoolNDIImage.png";
+
     let file = File::create(path)
-        .map_err(|_| Error::InitializationFailed("Failed to create file".into()))?;
+        .map_err(|e| Error::InitializationFailed(format!("Failed to create file: {}", e)))?;
+
     let mut encoder = png::Encoder::new(file, video_frame.xres as u32, video_frame.yres as u32);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
@@ -108,9 +100,11 @@ fn save_frame_as_png(video_frame: &VideoFrame) -> Result<(), Error> {
 
     let mut writer = encoder
         .write_header()
-        .map_err(|_| Error::InitializationFailed("Failed to write PNG header".into()))?;
+        .map_err(|e| Error::InitializationFailed(format!("Failed to write PNG header: {}", e)))?;
+
     writer
         .write_image_data(&video_frame.data)
-        .map_err(|_| Error::InitializationFailed("Failed to write PNG data".into()))?;
+        .map_err(|e| Error::InitializationFailed(format!("Failed to write PNG data: {}", e)))?;
+
     Ok(())
 }
