@@ -87,10 +87,10 @@ fn save_frame_as_png(video_frame: &VideoFrame) -> Result<(), Error> {
 
     // Debugging info
     println!(
-        "Saving frame with resolution: {}x{}, line stride: {}",
+        "Saving frame with resolution: {}x{}, data_size_in_bytes: {}",
         video_frame.xres,
         video_frame.yres,
-        unsafe { video_frame.line_stride_or_size.line_stride_in_bytes }
+        unsafe { video_frame.line_stride_or_size.data_size_in_bytes }
     );
 
     // Ensure the data is not empty
