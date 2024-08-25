@@ -18,5 +18,5 @@ png = "0.17.13"
 thiserror = "1.0.61"
 
 [build-dependencies]
-bindgen = "0.69.4"
+bindgen = "0.70.1"
 lodepng = "3.10.2"
