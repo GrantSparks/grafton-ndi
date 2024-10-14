@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 fn main() {
     // Base path to the NDI SDK from the environment variable or default to /usr/local/'NDI SDK for Linux'
-    let ndi_sdk_path = env::var("NDI_SDK_DIR").unwrap_or_else(|_| "/usr/local/'NDI SDK for Linux'".to_string());
+    let ndi_sdk_path = env::var("NDI_SDK_DIR").unwrap_or_else(|_| "/usr/share/'NDI SDK for Linux'".to_string());
 
     // Paths to the include and main header file
     let ndi_include_path = format!("{}/include", ndi_sdk_path);

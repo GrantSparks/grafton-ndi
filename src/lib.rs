@@ -675,8 +675,8 @@ pub enum AudioType {
     Max,
 }
 
-impl From<i32> for AudioType {
-    fn from(value: i32) -> Self {
+impl From<u32> for AudioType {
+    fn from(value: u32) -> Self {
         if value == NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP {
             AudioType::FLTP
         } else {
@@ -685,7 +685,7 @@ impl From<i32> for AudioType {
     }
 }
 
-impl From<AudioType> for i32 {
+impl From<AudioType> for u32 {
     fn from(audio_type: AudioType) -> Self {
         match audio_type {
             AudioType::FLTP => NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
@@ -741,7 +741,7 @@ pub enum RecvColorFormat {
     UYVY_RGBA,
     Fastest,
     Best,
-    BGRX_BGRA_Flipped,
+//    BGRX_BGRA_Flipped,
     Max,
 }
 
@@ -762,9 +762,9 @@ impl From<RecvColorFormat> for NDIlib_recv_color_format_e {
             }
             RecvColorFormat::Fastest => NDIlib_recv_color_format_e_NDIlib_recv_color_format_fastest,
             RecvColorFormat::Best => NDIlib_recv_color_format_e_NDIlib_recv_color_format_best,
-            RecvColorFormat::BGRX_BGRA_Flipped => {
-                NDIlib_recv_color_format_e_NDIlib_recv_color_format_BGRX_BGRA_flipped
-            }
+//            RecvColorFormat::BGRX_BGRA_Flipped => {
+//                NDIlib_recv_color_format_e_NDIlib_recv_color_format_BGRX_BGRA_flipped
+//            }
             RecvColorFormat::Max => NDIlib_recv_color_format_e_NDIlib_recv_color_format_max,
         }
     }
