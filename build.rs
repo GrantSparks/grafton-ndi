@@ -4,33 +4,58 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    // Base path to the NDI SDK from the environment variable or default to /usr/local/'NDI SDK for Linux'
-    let ndi_sdk_path = env::var("NDI_SDK_DIR").unwrap_or_else(|_| "/usr/share/'NDI SDK for Linux'".to_string());
+    // Base path to the NDI SDK from the environment variable or default based on the platform
+    let ndi_sdk_path = env::var("NDI_SDK_DIR").unwrap_or_else(|_| {
+        if cfg!(unix) {
+            "/usr/share/NDI SDK for Linux".to_string()
+        } else if cfg!(windows) {
+            "C:\\Program Files\\NDI SDK for Windows".to_string()
+        } else {
+            panic!("Unsupported platform, please set NDI_SDK_DIR manually.");
+        }
+    });
 
     // Paths to the include and main header file
     let ndi_include_path = format!("{}/include", ndi_sdk_path);
     let main_header = format!("{}/Processing.NDI.Lib.h", ndi_include_path);
 
-    // Determine if we are targeting 64-bit or 32-bit
-    let target = env::var("TARGET").expect("TARGET environment variable not set");
-    let (lib_subdir, lib_name) = if target.contains("x86_64") {
-        ("x64", "Processing.NDI.Lib.x64")
+    // Determine the library name and linking type based on the platform
+    let (lib_name, link_type) = if cfg!(unix) {
+        // For Unix-like systems, use the shared library `libndi.so`
+        ("ndi", "dylib") // Use "dylib" for dynamic linking
+    } else if cfg!(windows) {
+        // For Windows systems, use the specific x86/x64 libraries with static linking
+        let target = env::var("TARGET").expect("TARGET environment variable not set");
+        if target.contains("x86_64") {
+            ("Processing.NDI.Lib.x64", "static")
+        } else {
+            ("Processing.NDI.Lib.x86", "static")
+        }
     } else {
-        ("x86", "Processing.NDI.Lib.x86")
+        panic!("Unsupported platform");
     };
 
-    // Path to the library directory
-    let lib_path = format!("{}\\lib\\{}", ndi_sdk_path, lib_subdir);
+    // On Windows, add the specific library directory path
+    if cfg!(windows) {
+        let target = env::var("TARGET").expect("TARGET environment variable not set");
+        let lib_subdir = if target.contains("x86_64") {
+            "x64"
+        } else {
+            "x86"
+        };
+        let lib_path = format!("{}\\lib\\{}", ndi_sdk_path, lib_subdir);
 
-    // Inform cargo about the search path for the linker and the library to link against
-    println!("cargo:rustc-link-search=native={}", lib_path);
-    println!("cargo:rustc-link-lib=static={}", lib_name);
+        // Inform cargo about the search path for the linker and the library to link against
+        println!("cargo:rustc-link-search=native={}", lib_path);
+    }
+
+    // Inform cargo about the library to link against
+    println!("cargo:rustc-link-lib={}={}", link_type, lib_name);
 
     // Generate the bindings
     let bindings = bindgen::Builder::default()
         .header(main_header)
         .clang_arg(format!("-I{}", ndi_include_path))
-        //.layout_tests(false)
         .derive_default(true)
         .generate()
         .expect("Unable to generate bindings");
