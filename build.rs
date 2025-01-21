@@ -6,9 +6,11 @@ use std::path::PathBuf;
 fn main() {
     // Base path to the NDI SDK from the environment variable or default based on the platform
     let ndi_sdk_path = env::var("NDI_SDK_DIR").unwrap_or_else(|_| {
-        if cfg!(unix) {
+        if cfg!(target_os = "macos") {
+            "/Library/NDI SDK for Apple".to_string()
+        } else if cfg!(target_os = "linux") {
             "/usr/share/NDI SDK for Linux".to_string()
-        } else if cfg!(windows) {
+        } else if cfg!(target_os = "windows") {
             "C:\\Program Files\\NDI SDK for Windows".to_string()
         } else {
             panic!("Unsupported platform, please set NDI_SDK_DIR manually.");
@@ -20,10 +22,13 @@ fn main() {
     let main_header = format!("{}/Processing.NDI.Lib.h", ndi_include_path);
 
     // Determine the library name and linking type based on the platform
-    let (lib_name, link_type) = if cfg!(unix) {
+    let (lib_name, link_type) = if cfg!(target_os = "macos") {
         // For Unix-like systems, use the shared library `libndi.so`
         ("ndi", "dylib") // Use "dylib" for dynamic linking
-    } else if cfg!(windows) {
+    } else if cfg!(target_os = "linux") {
+        // For Unix-like systems, use the shared library `libndi.so`
+        ("ndi", "dylib") // Use "dylib" for dynamic linking
+    } else if cfg!(target_os = "windows") {
         // For Windows systems, use the specific x86/x64 libraries with static linking
         let target = env::var("TARGET").expect("TARGET environment variable not set");
         if target.contains("x86_64") {
