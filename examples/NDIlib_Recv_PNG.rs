@@ -22,6 +22,7 @@ fn main() -> Result<(), Error> {
             let sources = ndi_find.get_sources(5000)?;
 
             for source in &sources {
+                print!("Found source: {} ", source.name);
                 if source.name.contains(source_name) {
                     found_source = Some(source.clone());
                     break;
