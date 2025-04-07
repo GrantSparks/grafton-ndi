@@ -114,6 +114,24 @@ impl<'a> Find<'a> {
         unsafe { NDIlib_find_wait_for_sources(self.instance, timeout) }
     }
 
+    pub fn get_current_sources(&self) -> Result<Vec<Source>, Error> {
+        let mut no_sources = 0;
+        let sources_ptr =
+            unsafe { NDIlib_find_get_current_sources(self.instance, &mut no_sources) };
+        if sources_ptr.is_null() {
+            return Ok(vec![]);
+        }
+        let sources = unsafe {
+            (0..no_sources)
+                .map(|i| {
+                    let source = &*sources_ptr.add(i as usize);
+                    Source::from_raw(source)
+                })
+                .collect()
+        };
+        Ok(sources)
+    }
+
     pub fn get_sources(&self, timeout: u32) -> Result<Vec<Source>, Error> {
         let mut no_sources = 0;
         let sources_ptr =
