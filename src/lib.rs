@@ -114,6 +114,24 @@ impl<'a> Find<'a> {
         unsafe { NDIlib_find_wait_for_sources(self.instance, timeout) }
     }
 
+    pub fn get_current_sources(&self) -> Result<Vec<Source>, Error> {
+        let mut no_sources = 0;
+        let sources_ptr =
+            unsafe { NDIlib_find_get_current_sources(self.instance, &mut no_sources) };
+        if sources_ptr.is_null() {
+            return Ok(vec![]);
+        }
+        let sources = unsafe {
+            (0..no_sources)
+                .map(|i| {
+                    let source = &*sources_ptr.add(i as usize);
+                    Source::from_raw(source)
+                })
+                .collect()
+        };
+        Ok(sources)
+    }
+
     pub fn get_sources(&self, timeout: u32) -> Result<Vec<Source>, Error> {
         let mut no_sources = 0;
         let sources_ptr =
@@ -677,7 +695,11 @@ pub enum AudioType {
 
 impl From<u32> for AudioType {
     fn from(value: u32) -> Self {
-        if value == NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP {
+        if value
+            == NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP
+                .try_into()
+                .unwrap()
+        {
             AudioType::FLTP
         } else {
             AudioType::Max
@@ -688,8 +710,31 @@ impl From<u32> for AudioType {
 impl From<AudioType> for u32 {
     fn from(audio_type: AudioType) -> Self {
         match audio_type {
-            AudioType::FLTP => NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
-            AudioType::Max => NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_max,
+            AudioType::FLTP => NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP
+                .try_into()
+                .unwrap(),
+            AudioType::Max => NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_max
+                .try_into()
+                .unwrap(),
+        }
+    }
+}
+
+impl From<i32> for AudioType {
+    fn from(value: i32) -> Self {
+        if value == NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP as i32 {
+            AudioType::FLTP
+        } else {
+            AudioType::Max
+        }
+    }
+}
+
+impl From<AudioType> for i32 {
+    fn from(audio_type: AudioType) -> Self {
+        match audio_type {
+            AudioType::FLTP => NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP as i32,
+            AudioType::Max => NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_max as i32,
         }
     }
 }
