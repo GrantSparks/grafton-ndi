@@ -146,6 +146,14 @@ pub struct Source {
     pub ip_address: Option<String>,
 }
 
+// This struct holds the CStrings to ensure they live as long as needed
+pub(crate) struct RawSource {
+    _name: CString,
+    _url_address: Option<CString>,
+    _ip_address: Option<CString>,
+    pub raw: NDIlib_source_t,
+}
+
 impl Source {
     fn from_raw(ndi_source: &NDIlib_source_t) -> Self {
         let name = unsafe {
@@ -183,23 +191,24 @@ impl Source {
         }
     }
 
-    fn to_raw(&self) -> Result<NDIlib_source_t, Error> {
-        let p_ndi_name = CString::new(self.name.clone()).map_err(Error::InvalidCString)?;
-        let p_url_address = self
+    fn to_raw(&self) -> Result<RawSource, Error> {
+        let name = CString::new(self.name.clone()).map_err(Error::InvalidCString)?;
+        let url_address = self
             .url_address
             .as_deref()
             .map(CString::new)
             .transpose()
-            .map_err(Error::InvalidCString)?
-            .map_or(ptr::null(), |s| s.into_raw());
-
-        let p_ip_address = self
+            .map_err(Error::InvalidCString)?;
+        let ip_address = self
             .ip_address
             .as_deref()
             .map(CString::new)
             .transpose()
-            .map_err(Error::InvalidCString)?
-            .map_or(ptr::null(), |s| s.into_raw());
+            .map_err(Error::InvalidCString)?;
+
+        let p_ndi_name = name.as_ptr();
+        let p_url_address = url_address.as_ref().map_or(ptr::null(), |s| s.as_ptr());
+        let p_ip_address = ip_address.as_ref().map_or(ptr::null(), |s| s.as_ptr());
 
         let __bindgen_anon_1 = if !p_url_address.is_null() {
             NDIlib_source_t__bindgen_ty_1 { p_url_address }
@@ -207,9 +216,14 @@ impl Source {
             NDIlib_source_t__bindgen_ty_1 { p_ip_address }
         };
 
-        Ok(NDIlib_source_t {
-            p_ndi_name: p_ndi_name.into_raw(),
-            __bindgen_anon_1,
+        Ok(RawSource {
+            _name: name,
+            _url_address: url_address,
+            _ip_address: ip_address,
+            raw: NDIlib_source_t {
+                p_ndi_name,
+                __bindgen_anon_1,
+            },
         })
     }
 }
@@ -479,8 +493,16 @@ impl VideoFrame {
     ///
     /// This function assumes the given `NDIlib_video_frame_v2_t` is valid and correctly allocated.
     pub unsafe fn from_raw(c_frame: &NDIlib_video_frame_v2_t) -> Self {
-        let data_size =
-            c_frame.__bindgen_anon_1.data_size_in_bytes as usize * c_frame.yres as usize;
+        // SAFETY: The union access is safe because NDI SDK guarantees that
+        // line_stride_in_bytes is set for standard video formats
+        let data_size = if c_frame.__bindgen_anon_1.line_stride_in_bytes > 0 {
+            // Standard video format: use line_stride * height
+            c_frame.__bindgen_anon_1.line_stride_in_bytes as usize * c_frame.yres as usize
+        } else {
+            // Compressed format or special case: use data_size_in_bytes
+            c_frame.__bindgen_anon_1.data_size_in_bytes as usize
+        };
+        
         if c_frame.p_data.is_null() || data_size == 0 {
             panic!("Invalid video frame data");
         }
@@ -659,15 +681,7 @@ impl Default for AudioFrame {
     }
 }
 
-impl Drop for AudioFrame {
-    fn drop(&mut self) {
-        if let Some(metadata) = self.metadata.take() {
-            unsafe {
-                let _ = CString::from_raw(metadata.into_raw());
-            }
-        }
-    }
-}
+// Drop implementation removed - CString handles its own memory management
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioType {
@@ -818,6 +832,12 @@ impl Default for Receiver {
     }
 }
 
+pub(crate) struct RawRecvCreateV3 {
+    _source: RawSource,
+    _name: Option<CString>,
+    pub raw: NDIlib_recv_create_v3_t,
+}
+
 impl Receiver {
     pub fn new(
         source_to_connect_to: Source,
@@ -835,24 +855,29 @@ impl Receiver {
         }
     }
 
-    pub(crate) fn to_raw(&self) -> Result<NDIlib_recv_create_v3_t, Error> {
-        let p_ndi_recv_name = match &self.ndi_recv_name {
-            Some(name) => CString::new(name.clone())
-                .map_err(Error::InvalidCString)?
-                .into_raw(),
-            None => ptr::null(),
-        };
+    pub(crate) fn to_raw(&self) -> Result<RawRecvCreateV3, Error> {
+        let source = self.source_to_connect_to.to_raw()?;
+        let name = self.ndi_recv_name
+            .as_ref()
+            .map(|n| CString::new(n.clone()))
+            .transpose()
+            .map_err(Error::InvalidCString)?;
+        
+        let p_ndi_recv_name = name.as_ref().map_or(ptr::null(), |n| n.as_ptr());
+        let source_raw = source.raw;
 
-        Ok(NDIlib_recv_create_v3_t {
-            source_to_connect_to: self.source_to_connect_to.to_raw()?,
-            color_format: self.color_format.into(),
-            bandwidth: self.bandwidth.into(),
-            allow_video_fields: self.allow_video_fields,
-            p_ndi_recv_name,
+        Ok(RawRecvCreateV3 {
+            raw: NDIlib_recv_create_v3_t {
+                source_to_connect_to: source_raw,
+                color_format: self.color_format.into(),
+                bandwidth: self.bandwidth.into(),
+                allow_video_fields: self.allow_video_fields,
+                p_ndi_recv_name,
+            },
+            _source: source,
+            _name: name,
         })
     }
-
-    // TODO: Does this need a drop impl since it made a CString in to_raw?
 }
 
 pub struct Recv<'a> {
@@ -862,14 +887,14 @@ pub struct Recv<'a> {
 
 impl<'a> Recv<'a> {
     pub fn new(_ndi: &'a NDI, create: Receiver) -> Result<Self, Error> {
-        let create_t = create.to_raw()?;
-        let instance = unsafe { NDIlib_recv_create_v3(&create_t) };
+        let create_raw = create.to_raw()?;
+        let instance = unsafe { NDIlib_recv_create_v3(&create_raw.raw) };
         if instance.is_null() {
             Err(Error::InitializationFailed(
                 "Failed to create NDI recv instance".into(),
             ))
         } else {
-            unsafe { NDIlib_recv_connect(instance, &create_t.source_to_connect_to) };
+            unsafe { NDIlib_recv_connect(instance, &create_raw.raw.source_to_connect_to) };
             Ok(Recv {
                 instance,
                 ndi: std::marker::PhantomData,
@@ -1149,7 +1174,7 @@ impl<'a> Send<'a> {
 
     pub fn set_failover(&self, source: &Source) -> Result<(), Error> {
         let raw_source = source.to_raw()?;
-        unsafe { NDIlib_send_set_failover(self.instance, &raw_source) }
+        unsafe { NDIlib_send_set_failover(self.instance, &raw_source.raw) }
         Ok(())
     }
 
