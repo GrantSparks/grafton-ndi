@@ -133,7 +133,7 @@ impl<'a> Find<'a> {
     }
 }
 
-impl<'a> Drop for Find<'a> {
+impl Drop for Find<'_> {
     fn drop(&mut self) {
         unsafe { NDIlib_find_destroy(self.instance) };
     }
@@ -1013,7 +1013,7 @@ impl<'a> Recv<'a> {
     }
 }
 
-impl<'a> Drop for Recv<'a> {
+impl Drop for Recv<'_> {
     fn drop(&mut self) {
         unsafe {
             NDIlib_recv_destroy(self.instance);
@@ -1159,7 +1159,7 @@ impl<'a> Send<'a> {
     }
 }
 
-impl<'a> Drop for Send<'a> {
+impl Drop for Send<'_> {
     fn drop(&mut self) {
         unsafe {
             NDIlib_send_destroy(self.instance);

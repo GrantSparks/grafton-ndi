@@ -14,9 +14,9 @@ readme = "README.md"
 exclude = ["target/", ".gitignore", ".github/", "NDI_6_SDK.zip"]
 
 [dependencies]
-png = "0.17.13"
-thiserror = "1.0.61"
+png = "0.17.16"
+thiserror = "2.0.12"
 
 [build-dependencies]
-bindgen = "0.70.1"
-lodepng = "3.10.2"
+bindgen = "0.71.1"
+lodepng = "3.11.0"
