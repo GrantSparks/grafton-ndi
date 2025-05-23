@@ -809,6 +809,8 @@ pub struct VideoFrame<'rx> {
     pub metadata: Option<CString>,
     pub timestamp: i64,
     recv_instance: Option<NDIlib_recv_instance_t>,
+    // Store original SDK data pointer for proper freeing
+    original_p_data: Option<*mut u8>,
     _origin: std::marker::PhantomData<&'rx Recv<'rx>>,
 }
 
@@ -917,7 +919,16 @@ impl<'rx> VideoFrame<'rx> {
             return Err(Error::InvalidFrame("Video frame has zero size".into()));
         }
 
-        let data = std::slice::from_raw_parts(c_frame.p_data, data_size).to_vec();
+        // For zero-copy: just borrow the data slice from the SDK
+        let (data, original_p_data) = if recv_instance.is_some() {
+            // We're receiving - don't copy, just borrow
+            let slice = std::slice::from_raw_parts(c_frame.p_data, data_size);
+            (Cow::Borrowed(slice), Some(c_frame.p_data))
+        } else {
+            // Not from receive - make a copy for ownership
+            let slice = std::slice::from_raw_parts(c_frame.p_data, data_size);
+            (Cow::Owned(slice.to_vec()), None)
+        };
 
         let metadata = if c_frame.p_metadata.is_null() {
             None
@@ -935,11 +946,12 @@ impl<'rx> VideoFrame<'rx> {
             frame_format_type: FrameFormatType::try_from(c_frame.frame_format_type)
                 .unwrap_or(FrameFormatType::Max),
             timecode: c_frame.timecode,
-            data: Cow::Owned(data),
+            data,
             line_stride_or_size,
             metadata,
             timestamp: c_frame.timestamp,
             recv_instance,
+            original_p_data,
             _origin: std::marker::PhantomData,
         })
     }
@@ -1072,6 +1084,7 @@ impl<'rx> VideoFrameBuilder<'rx> {
             metadata: None,
             timestamp: self.timestamp.unwrap_or(0),
             recv_instance: None,
+            original_p_data: None,
             _origin: std::marker::PhantomData,
         };
         
@@ -1091,14 +1104,28 @@ impl Default for VideoFrameBuilder<'_> {
 
 impl Drop for VideoFrame<'_> {
     fn drop(&mut self) {
-        // If this frame originated from a Recv instance, free it
-        if let Some(recv_instance) = self.recv_instance {
-            if !self.data.is_empty() {
-                // Create a raw frame for NDI to free
-                let raw_frame = self.to_raw();
-                unsafe {
-                    NDIlib_recv_free_video_v2(recv_instance, &raw_frame);
-                }
+        // If this frame originated from a Recv instance and we have the original SDK pointer, free it
+        if let (Some(recv_instance), Some(original_p_data)) = (self.recv_instance, self.original_p_data) {
+            // Create a raw frame with the original SDK pointer for NDI to free
+            let raw_frame = NDIlib_video_frame_v2_t {
+                xres: self.xres,
+                yres: self.yres,
+                FourCC: self.fourcc.into(),
+                frame_rate_N: self.frame_rate_n,
+                frame_rate_D: self.frame_rate_d,
+                picture_aspect_ratio: self.picture_aspect_ratio,
+                frame_format_type: self.frame_format_type.into(),
+                timecode: self.timecode,
+                p_data: original_p_data,
+                __bindgen_anon_1: self.line_stride_or_size.into(),
+                p_metadata: match &self.metadata {
+                    Some(meta) => meta.as_ptr(),
+                    None => ptr::null(),
+                },
+                timestamp: self.timestamp,
+            };
+            unsafe {
+                NDIlib_recv_free_video_v2(recv_instance, &raw_frame);
             }
         }
     }
@@ -1116,6 +1143,8 @@ pub struct AudioFrame<'rx> {
     pub metadata: Option<CString>,
     pub timestamp: i64,
     recv_instance: Option<NDIlib_recv_instance_t>,
+    // Store original SDK data pointer for proper freeing
+    original_p_data: Option<*mut u8>,
     _origin: std::marker::PhantomData<&'rx Recv<'rx>>,
 }
 
@@ -1173,8 +1202,15 @@ impl<'rx> AudioFrame<'rx> {
             ));
         }
 
-        let data = unsafe { 
-            std::slice::from_raw_parts(raw.p_data as *const f32, sample_count).to_vec() 
+        // For zero-copy: just borrow the data slice from the SDK
+        let (data, original_p_data) = if recv_instance.is_some() {
+            // We're receiving - don't copy, just borrow
+            let slice = unsafe { std::slice::from_raw_parts(raw.p_data as *const f32, sample_count) };
+            (Cow::Borrowed(slice), Some(raw.p_data))
+        } else {
+            // Not from receive - make a copy for ownership
+            let slice = unsafe { std::slice::from_raw_parts(raw.p_data as *const f32, sample_count) };
+            (Cow::Owned(slice.to_vec()), None)
         };
 
         let metadata = if raw.p_metadata.is_null() {
@@ -1193,11 +1229,12 @@ impl<'rx> AudioFrame<'rx> {
                 NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP => AudioType::FLTP,
                 _ => AudioType::Max,
             },
-            data: Cow::Owned(data),
+            data,
             channel_stride_in_bytes: unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes },
             metadata,
             timestamp: raw.timestamp,
             recv_instance,
+            original_p_data,
             _origin: std::marker::PhantomData,
         })
     }
@@ -1353,6 +1390,7 @@ impl<'rx> AudioFrameBuilder<'rx> {
             metadata: metadata_cstring,
             timestamp: self.timestamp.unwrap_or(0),
             recv_instance: None,
+            original_p_data: None,
             _origin: std::marker::PhantomData,
         })
     }
@@ -1374,14 +1412,24 @@ impl Default for AudioFrame<'_> {
 
 impl Drop for AudioFrame<'_> {
     fn drop(&mut self) {
-        // If this frame originated from a Recv instance, free it
-        if let Some(recv_instance) = self.recv_instance {
-            if !self.data.is_empty() {
-                // Create a raw frame for NDI to free
-                let raw_frame = self.to_raw();
-                unsafe {
-                    NDIlib_recv_free_audio_v3(recv_instance, &raw_frame);
-                }
+        // If this frame originated from a Recv instance and we have the original SDK pointer, free it
+        if let (Some(recv_instance), Some(original_p_data)) = (self.recv_instance, self.original_p_data) {
+            // Create a raw frame with the original SDK pointer for NDI to free
+            let raw_frame = NDIlib_audio_frame_v3_t {
+                sample_rate: self.sample_rate,
+                no_channels: self.no_channels,
+                no_samples: self.no_samples,
+                timecode: self.timecode,
+                FourCC: self.fourcc.into(),
+                p_data: original_p_data,
+                __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                    channel_stride_in_bytes: self.channel_stride_in_bytes,
+                },
+                p_metadata: self.metadata.as_ref().map_or(ptr::null(), |m| m.as_ptr()),
+                timestamp: self.timestamp,
+            };
+            unsafe {
+                NDIlib_recv_free_audio_v3(recv_instance, &raw_frame);
             }
         }
     }
@@ -1705,7 +1753,10 @@ impl<'a> Recv<'a> {
         if unsafe { NDIlib_recv_ptz_recall_preset(self.instance, preset as i32, speed) } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed("Failed to recall PTZ preset".into()))
+            Err(Error::PtzCommandFailed(format!(
+                "Failed to recall PTZ preset {} with speed {}", 
+                preset, speed
+            )))
         }
     }
 
@@ -1713,7 +1764,10 @@ impl<'a> Recv<'a> {
         if unsafe { NDIlib_recv_ptz_zoom(self.instance, zoom_value) } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed("Failed to set PTZ zoom".into()))
+            Err(Error::PtzCommandFailed(format!(
+                "Failed to set PTZ zoom to {}", 
+                zoom_value
+            )))
         }
     }
 
@@ -1721,7 +1775,10 @@ impl<'a> Recv<'a> {
         if unsafe { NDIlib_recv_ptz_zoom_speed(self.instance, zoom_speed) } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed("Failed to set PTZ zoom speed".into()))
+            Err(Error::PtzCommandFailed(format!(
+                "Failed to set PTZ zoom speed to {}", 
+                zoom_speed
+            )))
         }
     }
 
@@ -1729,7 +1786,10 @@ impl<'a> Recv<'a> {
         if unsafe { NDIlib_recv_ptz_pan_tilt(self.instance, pan_value, tilt_value) } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed("Failed to set PTZ pan/tilt".into()))
+            Err(Error::PtzCommandFailed(format!(
+                "Failed to set PTZ pan/tilt to ({}, {})", 
+                pan_value, tilt_value
+            )))
         }
     }
 
@@ -1737,7 +1797,10 @@ impl<'a> Recv<'a> {
         if unsafe { NDIlib_recv_ptz_pan_tilt_speed(self.instance, pan_speed, tilt_speed) } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed("Failed to set PTZ pan/tilt speed".into()))
+            Err(Error::PtzCommandFailed(format!(
+                "Failed to set PTZ pan/tilt speed to ({}, {})", 
+                pan_speed, tilt_speed
+            )))
         }
     }
 
@@ -1745,7 +1808,10 @@ impl<'a> Recv<'a> {
         if unsafe { NDIlib_recv_ptz_store_preset(self.instance, preset_no) } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed("Failed to store PTZ preset".into()))
+            Err(Error::PtzCommandFailed(format!(
+                "Failed to store PTZ preset {}", 
+                preset_no
+            )))
         }
     }
 
@@ -2081,7 +2147,8 @@ impl<'buf> From<&'buf VideoFrame<'_>> for VideoFrameBorrowed<'buf> {
 #[must_use = "AsyncVideoToken must be held until the next send operation"]
 pub struct AsyncVideoToken<'send, 'buf> {
     _send: &'send SendInstance<'send>,
-    _frame: std::marker::PhantomData<&'buf [u8]>,
+    // Use mutable borrow to prevent any access while NDI owns the buffer
+    _frame: std::marker::PhantomData<&'buf mut [u8]>,
 }
 
 /// A token that ensures the audio frame remains valid while NDI is using it.
@@ -2090,7 +2157,8 @@ pub struct AsyncVideoToken<'send, 'buf> {
 #[must_use = "AsyncAudioToken must be held until the next send operation"]
 pub struct AsyncAudioToken<'a, 'b> {
     _send: &'a SendInstance<'b>,
-    _frame: std::marker::PhantomData<&'a AudioFrame<'a>>,
+    // Use mutable borrow to prevent any access while NDI owns the buffer
+    _frame: std::marker::PhantomData<&'a mut AudioFrame<'a>>,
 }
 
 impl<'a> SendInstance<'a> {
@@ -2613,6 +2681,89 @@ mod tests {
         let null_frame = MetadataFrame::from_raw(&null_raw);
         assert_eq!(null_frame.data, "");
         assert_eq!(null_frame.timecode, 789);
+    }
+
+    #[test]
+    fn test_video_frame_zero_copy_behavior() {
+        // Create a test buffer
+        let test_data = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let data_ptr = test_data.as_ptr() as *mut u8;
+        
+        let mut c_frame: NDIlib_video_frame_v2_t = unsafe { std::mem::zeroed() };
+        c_frame.xres = 2;
+        c_frame.yres = 1;
+        c_frame.FourCC = FourCCVideoType::UYVY.into();
+        c_frame.p_data = data_ptr;
+        c_frame.__bindgen_anon_1.line_stride_in_bytes = 8;
+        
+        // Test with recv_instance (should borrow)
+        unsafe {
+            let frame = VideoFrame::from_raw(&c_frame, Some(ptr::null_mut())).unwrap();
+            // Verify we're borrowing the original data
+            match &frame.data {
+                Cow::Borrowed(slice) => {
+                    assert_eq!(slice.as_ptr(), data_ptr as *const u8);
+                    assert_eq!(slice.len(), 8);
+                },
+                Cow::Owned(_) => panic!("Expected borrowed data for recv instance"),
+            }
+            assert_eq!(frame.original_p_data, Some(data_ptr));
+        }
+        
+        // Test without recv_instance (should copy)
+        unsafe {
+            let frame = VideoFrame::from_raw(&c_frame, None).unwrap();
+            // Verify we made a copy
+            match &frame.data {
+                Cow::Owned(vec) => {
+                    assert_ne!(vec.as_ptr(), data_ptr as *const u8);
+                    assert_eq!(vec.len(), 8);
+                },
+                Cow::Borrowed(_) => panic!("Expected owned data for non-recv instance"),
+            }
+            assert_eq!(frame.original_p_data, None);
+        }
+    }
+
+    #[test]
+    fn test_audio_frame_zero_copy_behavior() {
+        // Create a test buffer
+        let test_data = [1.0f32, 2.0, 3.0, 4.0];
+        let data_ptr = test_data.as_ptr() as *mut u8;
+        
+        let raw = NDIlib_audio_frame_v3_t {
+            sample_rate: 48000,
+            no_channels: 2,
+            no_samples: 2,
+            timecode: 0,
+            FourCC: AudioType::FLTP.into(),
+            p_data: data_ptr,
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 { channel_stride_in_bytes: 0 },
+            p_metadata: ptr::null_mut(),
+            timestamp: 0,
+        };
+        
+        // Test with recv_instance (should borrow)
+        let frame = AudioFrame::from_raw(raw, Some(ptr::null_mut())).unwrap();
+        match &frame.data {
+            Cow::Borrowed(slice) => {
+                assert_eq!(slice.as_ptr() as *const u8, data_ptr as *const u8);
+                assert_eq!(slice.len(), 4);
+            },
+            Cow::Owned(_) => panic!("Expected borrowed data for recv instance"),
+        }
+        assert_eq!(frame.original_p_data, Some(data_ptr));
+        
+        // Test without recv_instance (should copy)
+        let frame = AudioFrame::from_raw(raw, None).unwrap();
+        match &frame.data {
+            Cow::Owned(vec) => {
+                assert_ne!(vec.as_ptr() as *const u8, data_ptr as *const u8);
+                assert_eq!(vec.len(), 4);
+            },
+            Cow::Borrowed(_) => panic!("Expected owned data for non-recv instance"),
+        }
+        assert_eq!(frame.original_p_data, None);
     }
 
     #[test]
