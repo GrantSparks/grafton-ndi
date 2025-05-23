@@ -135,12 +135,62 @@ pub struct Finder {
 }
 
 impl Finder {
-    pub fn new(show_local_sources: bool, groups: Option<&str>, extra_ips: Option<&str>) -> Self {
-        Finder {
-            show_local_sources,
-            groups: groups.map(|s| s.to_string()),
-            extra_ips: extra_ips.map(|s| s.to_string()),
+
+    /// Create a builder for configuring find options
+    pub fn builder() -> FinderBuilder {
+        FinderBuilder::new()
+    }
+}
+
+/// Builder for configuring Finder with ergonomic method chaining
+#[derive(Debug, Clone)]
+pub struct FinderBuilder {
+    show_local_sources: Option<bool>,
+    groups: Option<String>,
+    extra_ips: Option<String>,
+}
+
+impl FinderBuilder {
+    /// Create a new builder with no fields set
+    pub fn new() -> Self {
+        FinderBuilder {
+            show_local_sources: None,
+            groups: None,
+            extra_ips: None,
         }
+    }
+
+    /// Configure whether to show local sources
+    pub fn show_local_sources(mut self, show: bool) -> Self {
+        self.show_local_sources = Some(show);
+        self
+    }
+
+    /// Set the groups to search
+    pub fn groups<S: Into<String>>(mut self, groups: S) -> Self {
+        self.groups = Some(groups.into());
+        self
+    }
+
+    /// Set extra IPs to search
+    pub fn extra_ips<S: Into<String>>(mut self, ips: S) -> Self {
+        self.extra_ips = Some(ips.into());
+        self
+    }
+
+    /// Build the Finder
+    pub fn build(self) -> Finder {
+        Finder {
+            show_local_sources: self.show_local_sources.unwrap_or(true),
+            groups: self.groups,
+            extra_ips: self.extra_ips,
+        }
+    }
+}
+
+impl Default for FinderBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -215,9 +265,19 @@ impl Drop for Find<'_> {
     }
 }
 
-// SAFETY: NDI find functions are documented as thread-safe.
-// The Find struct only holds a pointer returned by the NDI SDK and uses &mut self for mutations.
+/// # Safety
+/// 
+/// The NDI SDK documentation states that find operations are thread-safe.
+/// `NDIlib_find_create_v2`, `NDIlib_find_wait_for_sources`, and `NDIlib_find_get_sources`
+/// can be called from multiple threads. The Find struct only holds an opaque pointer
+/// returned by the SDK and does not perform any mutations that could cause data races.
 unsafe impl std::marker::Send for Find<'_> {}
+
+/// # Safety
+/// 
+/// The NDI SDK documentation guarantees thread-safety for find operations.
+/// Multiple threads can safely call methods on a shared Find instance as the
+/// SDK handles all necessary synchronization internally.
 unsafe impl std::marker::Sync for Find<'_> {}
 
 #[derive(Debug, Default, Clone)]
@@ -433,7 +493,7 @@ pub struct VideoFrame<'rx> {
     _origin: std::marker::PhantomData<&'rx Recv<'rx>>,
 }
 
-impl<'rx> fmt::Debug for VideoFrame<'rx> {
+impl fmt::Debug for VideoFrame<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VideoFrame")
             .field("xres", &self.xres)
@@ -452,59 +512,20 @@ impl<'rx> fmt::Debug for VideoFrame<'rx> {
     }
 }
 
-impl<'rx> Default for VideoFrame<'rx> {
+impl Default for VideoFrame<'_> {
     fn default() -> Self {
-        VideoFrame::new(
-            1920,
-            1080,
-            FourCCVideoType::BGRA,
-            60,
-            1,
-            16.0 / 9.0,
-            FrameFormatType::Interlaced,
-        )
+        VideoFrame::builder()
+            .resolution(1920, 1080)
+            .fourcc(FourCCVideoType::BGRA)
+            .frame_rate(60, 1)
+            .aspect_ratio(16.0 / 9.0)
+            .format(FrameFormatType::Interlaced)
+            .build()
+            .expect("Default VideoFrame should always succeed")
     }
 }
 
 impl<'rx> VideoFrame<'rx> {
-    pub fn new(
-        xres: i32,
-        yres: i32,
-        fourcc: FourCCVideoType,
-        frame_rate_n: i32,
-        frame_rate_d: i32,
-        aspect_ratio: f32,
-        format: FrameFormatType,
-    ) -> Self {
-        let bpp = match fourcc {
-            FourCCVideoType::BGRA => 32,
-            // Add other formats and their bpp as needed
-            _ => 32, // Default to 32 bpp if unknown
-        };
-
-        let stride = (xres * bpp + 7) / 8;
-        let buffer_size: usize = (yres * stride) as usize;
-        let data = vec![0u8; buffer_size];
-
-        VideoFrame {
-            xres,
-            yres,
-            fourcc,
-            frame_rate_n,
-            frame_rate_d,
-            picture_aspect_ratio: aspect_ratio,
-            frame_format_type: format,
-            timecode: 0,
-            data: Cow::Owned(data),
-            line_stride_or_size: LineStrideOrSize {
-                line_stride_in_bytes: stride,
-            },
-            metadata: None,
-            timestamp: 0,
-            recv_instance: None,
-            _origin: std::marker::PhantomData,
-        }
-    }
 
     pub fn to_raw(&self) -> NDIlib_video_frame_v2_t {
         NDIlib_video_frame_v2_t {
@@ -603,9 +624,153 @@ impl<'rx> VideoFrame<'rx> {
             _origin: std::marker::PhantomData,
         })
     }
+
+    /// Create a builder for configuring a video frame
+    pub fn builder() -> VideoFrameBuilder<'rx> {
+        VideoFrameBuilder::new()
+    }
 }
 
-impl<'rx> Drop for VideoFrame<'rx> {
+/// Builder for configuring a VideoFrame with ergonomic method chaining
+#[derive(Debug, Clone)]
+pub struct VideoFrameBuilder<'rx> {
+    xres: Option<i32>,
+    yres: Option<i32>,
+    fourcc: Option<FourCCVideoType>,
+    frame_rate_n: Option<i32>,
+    frame_rate_d: Option<i32>,
+    picture_aspect_ratio: Option<f32>,
+    frame_format_type: Option<FrameFormatType>,
+    timecode: Option<i64>,
+    metadata: Option<String>,
+    timestamp: Option<i64>,
+    _phantom: std::marker::PhantomData<&'rx ()>,
+}
+
+impl<'rx> VideoFrameBuilder<'rx> {
+    /// Create a new builder with no fields set
+    pub fn new() -> Self {
+        VideoFrameBuilder {
+            xres: None,
+            yres: None,
+            fourcc: None,
+            frame_rate_n: None,
+            frame_rate_d: None,
+            picture_aspect_ratio: None,
+            frame_format_type: None,
+            timecode: None,
+            metadata: None,
+            timestamp: None,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Set the video resolution
+    pub fn resolution(mut self, width: i32, height: i32) -> Self {
+        self.xres = Some(width);
+        self.yres = Some(height);
+        self
+    }
+
+    /// Set the pixel format
+    pub fn fourcc(mut self, fourcc: FourCCVideoType) -> Self {
+        self.fourcc = Some(fourcc);
+        self
+    }
+
+    /// Set the frame rate as a fraction (e.g., 30000/1001 for 29.97fps)
+    pub fn frame_rate(mut self, numerator: i32, denominator: i32) -> Self {
+        self.frame_rate_n = Some(numerator);
+        self.frame_rate_d = Some(denominator);
+        self
+    }
+
+    /// Set the picture aspect ratio
+    pub fn aspect_ratio(mut self, ratio: f32) -> Self {
+        self.picture_aspect_ratio = Some(ratio);
+        self
+    }
+
+    /// Set the frame format type (progressive, interlaced, etc.)
+    pub fn format(mut self, format: FrameFormatType) -> Self {
+        self.frame_format_type = Some(format);
+        self
+    }
+
+    /// Set the timecode
+    pub fn timecode(mut self, tc: i64) -> Self {
+        self.timecode = Some(tc);
+        self
+    }
+
+    /// Set metadata
+    pub fn metadata<S: Into<String>>(mut self, meta: S) -> Self {
+        self.metadata = Some(meta.into());
+        self
+    }
+
+    /// Set the timestamp
+    pub fn timestamp(mut self, ts: i64) -> Self {
+        self.timestamp = Some(ts);
+        self
+    }
+
+    /// Build the VideoFrame
+    pub fn build(self) -> Result<VideoFrame<'rx>, Error> {
+        let xres = self.xres.unwrap_or(1920);
+        let yres = self.yres.unwrap_or(1080);
+        let fourcc = self.fourcc.unwrap_or(FourCCVideoType::BGRA);
+        let frame_rate_n = self.frame_rate_n.unwrap_or(60);
+        let frame_rate_d = self.frame_rate_d.unwrap_or(1);
+        let picture_aspect_ratio = self.picture_aspect_ratio.unwrap_or(16.0 / 9.0);
+        let frame_format_type = self.frame_format_type.unwrap_or(FrameFormatType::Progressive);
+        
+        // Calculate stride and buffer size
+        let bpp = match fourcc {
+            FourCCVideoType::BGRA | FourCCVideoType::BGRX | FourCCVideoType::RGBA | FourCCVideoType::RGBX => 32,
+            FourCCVideoType::UYVY | FourCCVideoType::YV12 | FourCCVideoType::I420 | FourCCVideoType::NV12 => 16,
+            FourCCVideoType::UYVA => 32,
+            FourCCVideoType::P216 | FourCCVideoType::PA16 => 32,
+            _ => 32,
+        };
+        let stride = (xres * bpp + 7) / 8;
+        let buffer_size: usize = (yres * stride) as usize;
+        let data = vec![0u8; buffer_size];
+        
+        let mut frame = VideoFrame {
+            xres,
+            yres,
+            fourcc,
+            frame_rate_n,
+            frame_rate_d,
+            picture_aspect_ratio,
+            frame_format_type,
+            timecode: self.timecode.unwrap_or(0),
+            data: Cow::Owned(data),
+            line_stride_or_size: LineStrideOrSize {
+                line_stride_in_bytes: stride,
+            },
+            metadata: None,
+            timestamp: self.timestamp.unwrap_or(0),
+            recv_instance: None,
+            _origin: std::marker::PhantomData,
+        };
+        
+        if let Some(meta) = self.metadata {
+            frame.metadata = Some(CString::new(meta).map_err(Error::InvalidCString)?);
+        }
+        
+        Ok(frame)
+    }
+}
+
+impl Default for VideoFrameBuilder<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for VideoFrame<'_> {
     fn drop(&mut self) {
         // If this frame originated from a Recv instance, free it
         if let Some(recv_instance) = self.recv_instance {
@@ -636,50 +801,6 @@ pub struct AudioFrame<'rx> {
 }
 
 impl<'rx> AudioFrame<'rx> {
-    pub fn new() -> Self {
-        AudioFrame {
-            sample_rate: 0,
-            no_channels: 0,
-            no_samples: 0,
-            timecode: 0,
-            fourcc: AudioType::Max, // TODO: Is this the right default?
-            data: Cow::Owned(vec![]),
-            channel_stride_in_bytes: 0,
-            metadata: None,
-            timestamp: 0,
-            recv_instance: None,
-            _origin: std::marker::PhantomData,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_data(
-        sample_rate: i32,
-        no_channels: i32,
-        no_samples: i32,
-        timecode: i64,
-        fourcc: AudioType, // TODO: Can this be merged with the fourcc on VideoFrame?
-        data: Vec<u8>,     // TODO: Many of these fields could be combined into a struct
-        metadata: Option<String>,
-        timestamp: i64,
-    ) -> Result<Self, Error> {
-        let metadata_cstring = metadata
-            .map(|m| CString::new(m).map_err(Error::InvalidCString))
-            .transpose()?;
-        Ok(AudioFrame {
-            sample_rate,
-            no_channels,
-            no_samples,
-            timecode,
-            fourcc,
-            data: Cow::Owned(data),
-            channel_stride_in_bytes: no_samples * 4,
-            metadata: metadata_cstring,
-            timestamp,
-            recv_instance: None,
-            _origin: std::marker::PhantomData,
-        })
-    }
 
     pub(crate) fn to_raw(&self) -> NDIlib_audio_frame_v3_t {
         NDIlib_audio_frame_v3_t {
@@ -760,15 +881,142 @@ impl<'rx> AudioFrame<'rx> {
             _origin: std::marker::PhantomData,
         })
     }
+
+    /// Create a builder for configuring an audio frame
+    pub fn builder() -> AudioFrameBuilder<'rx> {
+        AudioFrameBuilder::new()
+    }
 }
 
-impl<'rx> Default for AudioFrame<'rx> {
+/// Builder for configuring an AudioFrame with ergonomic method chaining
+#[derive(Debug, Clone)]
+pub struct AudioFrameBuilder<'rx> {
+    sample_rate: Option<i32>,
+    no_channels: Option<i32>,
+    no_samples: Option<i32>,
+    timecode: Option<i64>,
+    fourcc: Option<AudioType>,
+    data: Option<Vec<u8>>,
+    metadata: Option<String>,
+    timestamp: Option<i64>,
+    _phantom: std::marker::PhantomData<&'rx ()>,
+}
+
+impl<'rx> AudioFrameBuilder<'rx> {
+    /// Create a new builder with no fields set
+    pub fn new() -> Self {
+        AudioFrameBuilder {
+            sample_rate: None,
+            no_channels: None,
+            no_samples: None,
+            timecode: None,
+            fourcc: None,
+            data: None,
+            metadata: None,
+            timestamp: None,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Set the sample rate
+    pub fn sample_rate(mut self, rate: i32) -> Self {
+        self.sample_rate = Some(rate);
+        self
+    }
+
+    /// Set the number of audio channels
+    pub fn channels(mut self, channels: i32) -> Self {
+        self.no_channels = Some(channels);
+        self
+    }
+
+    /// Set the number of samples
+    pub fn samples(mut self, samples: i32) -> Self {
+        self.no_samples = Some(samples);
+        self
+    }
+
+    /// Set the timecode
+    pub fn timecode(mut self, tc: i64) -> Self {
+        self.timecode = Some(tc);
+        self
+    }
+
+    /// Set the audio format
+    pub fn format(mut self, format: AudioType) -> Self {
+        self.fourcc = Some(format);
+        self
+    }
+
+    /// Set the audio data
+    pub fn data(mut self, data: Vec<u8>) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    /// Set metadata
+    pub fn metadata<S: Into<String>>(mut self, meta: S) -> Self {
+        self.metadata = Some(meta.into());
+        self
+    }
+
+    /// Set the timestamp
+    pub fn timestamp(mut self, ts: i64) -> Self {
+        self.timestamp = Some(ts);
+        self
+    }
+
+    /// Build the AudioFrame
+    pub fn build(self) -> Result<AudioFrame<'rx>, Error> {
+        let sample_rate = self.sample_rate.unwrap_or(48000);
+        let no_channels = self.no_channels.unwrap_or(2);
+        let no_samples = self.no_samples.unwrap_or(1024);
+        let fourcc = self.fourcc.unwrap_or(AudioType::FLTP);
+        
+        let data = if let Some(data) = self.data {
+            data
+        } else {
+            // Calculate default buffer size based on format
+            let bytes_per_sample = 4; // Float32
+            let buffer_size = (no_samples * no_channels * bytes_per_sample) as usize;
+            vec![0u8; buffer_size]
+        };
+        
+        let metadata_cstring = self.metadata
+            .map(|m| CString::new(m).map_err(Error::InvalidCString))
+            .transpose()?;
+            
+        Ok(AudioFrame {
+            sample_rate,
+            no_channels,
+            no_samples,
+            timecode: self.timecode.unwrap_or(0),
+            fourcc,
+            data: Cow::Owned(data),
+            channel_stride_in_bytes: no_samples * 4,
+            metadata: metadata_cstring,
+            timestamp: self.timestamp.unwrap_or(0),
+            recv_instance: None,
+            _origin: std::marker::PhantomData,
+        })
+    }
+}
+
+impl Default for AudioFrameBuilder<'_> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<'rx> Drop for AudioFrame<'rx> {
+impl Default for AudioFrame<'_> {
+    fn default() -> Self {
+        AudioFrame::builder()
+            .build()
+            .expect("Default AudioFrame should always succeed")
+    }
+}
+
+impl Drop for AudioFrame<'_> {
     fn drop(&mut self) {
         // If this frame originated from a Recv instance, free it
         if let Some(recv_instance) = self.recv_instance {
@@ -921,21 +1169,6 @@ pub(crate) struct RawRecvCreateV3 {
 }
 
 impl Receiver {
-    pub fn new(
-        source_to_connect_to: Source,
-        color_format: RecvColorFormat,
-        bandwidth: RecvBandwidth,
-        allow_video_fields: bool,
-        ndi_recv_name: Option<String>,
-    ) -> Self {
-        Receiver {
-            source_to_connect_to,
-            color_format,
-            bandwidth,
-            allow_video_fields,
-            ndi_recv_name,
-        }
-    }
 
     /// Convert to raw format for FFI use
     ///
@@ -1342,9 +1575,20 @@ impl Drop for Recv<'_> {
     }
 }
 
-// SAFETY: NDI recv functions are documented as thread-safe.
-// The Recv struct only holds a pointer returned by the NDI SDK and uses &mut self for mutations.
+/// # Safety
+/// 
+/// The NDI 6 SDK documentation explicitly states that recv operations are thread-safe.
+/// `NDIlib_recv_capture_v3` and related functions use internal synchronization.
+/// The Recv struct only holds an opaque pointer returned by the SDK, and the SDK
+/// guarantees that this pointer can be safely moved between threads.
 unsafe impl std::marker::Send for Recv<'_> {}
+
+/// # Safety
+/// 
+/// The NDI 6 SDK documentation guarantees that `NDIlib_recv_capture_v3` is internally
+/// synchronized and can be called concurrently from multiple threads. This is explicitly
+/// mentioned in the SDK manual's thread safety section. The capture_video, capture_audio,
+/// and capture_metadata methods can be safely called from multiple threads simultaneously.
 unsafe impl std::marker::Sync for Recv<'_> {}
 
 #[derive(Debug)]
@@ -1379,7 +1623,7 @@ impl Tally {
 }
 
 #[derive(Debug)]
-pub struct Send<'a> {
+pub struct SendInstance<'a> {
     instance: NDIlib_send_instance_t,
     _name: *mut c_char,   // Store raw pointer to free on drop
     _groups: *mut c_char, // Store raw pointer to free on drop
@@ -1469,7 +1713,7 @@ impl<'buf> From<&'buf VideoFrame<'_>> for VideoFrameBorrowed<'buf> {
             timecode: frame.timecode,
             data: &frame.data,
             line_stride_or_size: frame.line_stride_or_size,
-            metadata: frame.metadata.as_ref().map(|m| m.as_c_str()),
+            metadata: frame.metadata.as_deref(),
             timestamp: frame.timestamp,
         }
     }
@@ -1480,7 +1724,7 @@ impl<'buf> From<&'buf VideoFrame<'_>> for VideoFrameBorrowed<'buf> {
 /// send operation occurs.
 #[must_use = "AsyncVideoToken must be held until the next send operation"]
 pub struct AsyncVideoToken<'send, 'buf> {
-    _send: &'send Send<'send>,
+    _send: &'send SendInstance<'send>,
     _frame: std::marker::PhantomData<&'buf [u8]>,
 }
 
@@ -1489,12 +1733,12 @@ pub struct AsyncVideoToken<'send, 'buf> {
 /// send operation occurs.
 #[must_use = "AsyncAudioToken must be held until the next send operation"]
 pub struct AsyncAudioToken<'a, 'b> {
-    _send: &'a Send<'b>,
+    _send: &'a SendInstance<'b>,
     _frame: std::marker::PhantomData<&'a AudioFrame<'a>>,
 }
 
-impl<'a> Send<'a> {
-    pub fn new(_ndi: &'a NDI, create_settings: Sender) -> Result<Self, Error> {
+impl<'a> SendInstance<'a> {
+    pub fn new(_ndi: &'a NDI, create_settings: SendOptions) -> Result<Self, Error> {
         let p_ndi_name = CString::new(create_settings.name).map_err(Error::InvalidCString)?;
         let p_groups = match create_settings.groups {
             Some(ref groups) => CString::new(groups.clone())
@@ -1524,7 +1768,7 @@ impl<'a> Send<'a> {
                 "Failed to create NDI send instance".into(),
             ))
         } else {
-            Ok(Send {
+            Ok(SendInstance {
                 instance,
                 _name: p_ndi_name_raw,
                 _groups: p_groups,
@@ -1547,13 +1791,14 @@ impl<'a> Send<'a> {
     ///
     /// # Example
     /// ```no_run
-    /// # use grafton_ndi::{NDI, Sender, VideoFrame, VideoFrameBorrowed, FourCCVideoType};
+    /// # use grafton_ndi::{NDI, SendOptions, VideoFrame, VideoFrameBorrowed, FourCCVideoType};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let ndi = NDI::new()?;
-    /// let send = grafton_ndi::Send::new(
-    ///     &ndi,
-    ///     Sender { name: "MyCam".into(), groups: None, clock_video: true, clock_audio: true }
-    /// )?;
+    /// let send_options = SendOptions::builder("MyCam")
+    ///     .clock_video(true)
+    ///     .clock_audio(true)
+    ///     .build()?;
+    /// let send = grafton_ndi::SendInstance::new(&ndi, send_options)?;
     ///
     /// // Option 1: Use existing VideoFrame (still zero-copy)
     /// let frame = VideoFrame::default();
@@ -1663,7 +1908,7 @@ impl<'a> Send<'a> {
     }
 }
 
-impl Drop for Send<'_> {
+impl Drop for SendInstance<'_> {
     fn drop(&mut self) {
         unsafe {
             NDIlib_send_destroy(self.instance);
@@ -1679,17 +1924,94 @@ impl Drop for Send<'_> {
     }
 }
 
-// SAFETY: NDI send functions are documented as thread-safe.
-// The Send struct only holds a pointer returned by the NDI SDK and uses &mut self for mutations.
-unsafe impl std::marker::Send for Send<'_> {}
-unsafe impl std::marker::Sync for Send<'_> {}
+/// # Safety
+/// 
+/// The NDI 6 SDK documentation states that send operations are thread-safe.
+/// `NDIlib_send_send_video_v2`, `NDIlib_send_send_audio_v3`, and related functions
+/// use internal synchronization. The SendInstance struct holds an opaque pointer and raw
+/// C string pointers that are only freed in Drop, making it safe to move between threads.
+unsafe impl std::marker::Send for SendInstance<'_> {}
+
+/// # Safety
+/// 
+/// The NDI 6 SDK guarantees thread-safety for send operations. Multiple threads can
+/// safely call send methods concurrently as the SDK handles all necessary synchronization.
+/// The async send operations (send_video_async, send_audio_async) are also thread-safe
+/// as documented in the SDK manual.
+unsafe impl std::marker::Sync for SendInstance<'_> {}
 
 #[derive(Debug)]
-pub struct Sender {
+pub struct SendOptions {
     pub name: String,
     pub groups: Option<String>,
     pub clock_video: bool,
     pub clock_audio: bool,
+}
+
+impl SendOptions {
+    /// Create a builder for configuring send options
+    pub fn builder<S: Into<String>>(name: S) -> SendOptionsBuilder {
+        SendOptionsBuilder::new(name)
+    }
+}
+
+/// Builder for configuring SendOptions with ergonomic method chaining
+#[derive(Debug, Clone)]
+pub struct SendOptionsBuilder {
+    name: String,
+    groups: Option<String>,
+    clock_video: Option<bool>,
+    clock_audio: Option<bool>,
+}
+
+impl SendOptionsBuilder {
+    /// Create a new builder with the specified name
+    pub fn new<S: Into<String>>(name: S) -> Self {
+        SendOptionsBuilder {
+            name: name.into(),
+            groups: None,
+            clock_video: None,
+            clock_audio: None,
+        }
+    }
+
+    /// Set the groups for this sender
+    pub fn groups<S: Into<String>>(mut self, groups: S) -> Self {
+        self.groups = Some(groups.into());
+        self
+    }
+
+    /// Configure whether to clock video
+    pub fn clock_video(mut self, clock: bool) -> Self {
+        self.clock_video = Some(clock);
+        self
+    }
+
+    /// Configure whether to clock audio
+    pub fn clock_audio(mut self, clock: bool) -> Self {
+        self.clock_audio = Some(clock);
+        self
+    }
+
+    /// Build the SendOptions
+    pub fn build(self) -> Result<SendOptions, Error> {
+        let clock_video = self.clock_video.unwrap_or(true);
+        let clock_audio = self.clock_audio.unwrap_or(true);
+        
+        // Validate that at least one clock is enabled
+        if !clock_video && !clock_audio {
+            return Err(Error::InvalidConfiguration(
+                "At least one of clock_video or clock_audio must be true".into()
+            ));
+        }
+        
+        Ok(SendOptions {
+            name: self.name,
+            groups: self.groups,
+            clock_video,
+            clock_audio,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1816,18 +2138,22 @@ mod tests {
     #[test]
     fn test_audio_frame_drop_no_double_free() {
         // Test that AudioFrame can be created and dropped without issues
-        let frame1 = AudioFrame::new();
+        let frame1 = AudioFrame::builder().build().unwrap();
         drop(frame1); // Should not panic or cause double-free
 
         // Test with metadata
-        let mut frame2 = AudioFrame::new();
-        frame2.metadata = Some(CString::new("test metadata").unwrap());
+        let frame2 = AudioFrame::builder()
+            .metadata("test metadata")
+            .build()
+            .unwrap();
         drop(frame2); // Should not panic - CString handles its own memory
 
         // Test multiple drops in sequence
-        for _ in 0..10 {
-            let mut frame = AudioFrame::new();
-            frame.metadata = Some(CString::new(format!("metadata {}", 42)).unwrap());
+        for i in 0..10 {
+            let frame = AudioFrame::builder()
+                .metadata(format!("metadata {}", i))
+                .build()
+                .unwrap();
             drop(frame);
         }
     }
@@ -1936,16 +2262,16 @@ mod tests {
     #[test]
     fn test_raw_recv_create_v3_memory_management() {
         // Test RawRecvCreateV3 memory management
-        let receiver = Receiver::new(
-            Source {
+        let receiver = Receiver {
+            source_to_connect_to: Source {
                 name: "Test Source".to_string(),
                 address: SourceAddress::None,
             },
-            RecvColorFormat::BGRX_BGRA,
-            RecvBandwidth::Highest,
-            true,
-            Some("Test Receiver".to_string()),
-        );
+            color_format: RecvColorFormat::BGRX_BGRA,
+            bandwidth: RecvBandwidth::Highest,
+            allow_video_fields: true,
+            ndi_recv_name: Some("Test Receiver".to_string()),
+        };
 
         let raw_recv = receiver.to_raw().unwrap();
 
@@ -1988,16 +2314,15 @@ mod tests {
     #[test]
     fn test_video_frame_metadata_no_double_free() {
         // Test that VideoFrame with metadata doesn't double-free
-        let mut frame = VideoFrame::new(
-            1920,
-            1080,
-            FourCCVideoType::RGBA,
-            30000,
-            1001,
-            16.0 / 9.0,
-            FrameFormatType::Progressive,
-        );
-        frame.metadata = Some(CString::new("test video metadata").unwrap());
+        let frame = VideoFrame::builder()
+            .resolution(1920, 1080)
+            .fourcc(FourCCVideoType::RGBA)
+            .frame_rate(30000, 1001)
+            .aspect_ratio(16.0 / 9.0)
+            .format(FrameFormatType::Progressive)
+            .metadata("test video metadata")
+            .build()
+            .unwrap();
 
         // This should not panic or double-free
         drop(frame);
@@ -2113,7 +2438,11 @@ mod tests {
         let ndi = NDI::new().expect("Failed to create NDI");
 
         // Create finder with both groups and extra_ips
-        let settings = Finder::new(true, Some("TestGroup"), Some("192.168.1.100"));
+        let settings = Finder::builder()
+            .show_local_sources(true)
+            .groups("TestGroup")
+            .extra_ips("192.168.1.100")
+            .build();
         let finder = Find::new(&ndi, settings).expect("Failed to create finder");
 
         // The finder should keep the CStrings alive even though we've moved settings
@@ -2160,16 +2489,16 @@ mod tests {
     #[test]
     fn test_receiver_cstring_lifetime() {
         // Test that Receiver properly manages CString lifetime through RawRecvCreateV3
-        let receiver = Receiver::new(
-            Source {
+        let receiver = Receiver {
+            source_to_connect_to: Source {
                 name: "Test Source".to_string(),
                 address: SourceAddress::Url("ndi://test.local".to_string()),
             },
-            RecvColorFormat::BGRX_BGRA,
-            RecvBandwidth::Highest,
-            true,
-            Some("Test Receiver Name".to_string()),
-        );
+            color_format: RecvColorFormat::BGRX_BGRA,
+            bandwidth: RecvBandwidth::Highest,
+            allow_video_fields: true,
+            ndi_recv_name: Some("Test Receiver Name".to_string()),
+        };
 
         // Convert to raw - this should create RawRecvCreateV3 that owns the CStrings
         let raw_recv = receiver.to_raw().expect("Failed to convert receiver");

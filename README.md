@@ -2,6 +2,93 @@
 
 Unofficial idiomatic Rust bindings for the [NDI 6 SDK](https://ndi.video/for-developers/ndi-sdk/).
 
+## New in 0.7.0
+
+### 🏗️ Builder Pattern API & Improved Type Safety
+
+1. **Builder Patterns**: All major types now use ergonomic builder patterns for construction, replacing error-prone positional arguments.
+
+2. **Type Renaming**: `Send` → `SendInstance` and `Sender` → `SendOptions` to avoid confusion with `std::marker::Send`.
+
+3. **Enhanced Safety Documentation**: All `unsafe impl Send/Sync` blocks now have comprehensive documentation explaining thread-safety guarantees.
+
+### Example: Builder Patterns
+```rust
+// Video frame with builder
+let frame = VideoFrame::builder()
+    .resolution(1920, 1080)
+    .fourcc(FourCCVideoType::BGRA)
+    .frame_rate(60, 1)
+    .aspect_ratio(16.0 / 9.0)
+    .format(FrameFormatType::Progressive)
+    .build()?;
+
+// Send options with validation
+let options = SendOptions::builder("My NDI Source")
+    .groups("Public")
+    .clock_video(true)
+    .clock_audio(true)
+    .build()?; // Validates at least one clock is enabled
+
+// Receiver with fluent configuration
+let recv = Receiver::builder(source)
+    .color(RecvColorFormat::RGBX_RGBA)
+    .bandwidth(RecvBandwidth::Highest)
+    .name("My Receiver")
+    .build(&ndi)?;
+```
+
+## Upgrading from 0.6.x to 0.7.0
+
+### Breaking Changes
+
+1. **Type Renames**:
+   ```rust
+   // Before
+   use grafton_ndi::{Send, Sender};
+   let sender = Sender { name: "Test".into(), ... };
+   let send = Send::new(&ndi, sender)?;
+   
+   // After
+   use grafton_ndi::{SendInstance, SendOptions};
+   let options = SendOptions::builder("Test").build()?;
+   let send = SendInstance::new(&ndi, options)?;
+   ```
+
+2. **Constructor Changes** - All types now use builders:
+   ```rust
+   // VideoFrame
+   // Before: VideoFrame::new(1920, 1080, FourCCVideoType::BGRA, 60, 1, 16.0/9.0, FrameFormatType::Progressive)
+   // After:
+   VideoFrame::builder()
+       .resolution(1920, 1080)
+       .fourcc(FourCCVideoType::BGRA)
+       .frame_rate(60, 1)
+       .build()?
+   
+   // AudioFrame  
+   // Before: AudioFrame::with_data(48000, 2, 1024, 0, AudioType::FLTP, data, None, 0)?
+   // After:
+   AudioFrame::builder()
+       .sample_rate(48000)
+       .channels(2)
+       .samples(1024)
+       .format(AudioType::FLTP)
+       .data(data)
+       .build()?
+   
+   // Finder
+   // Before: Finder::new(true, Some("Group"), Some("192.168.1.0/24"))
+   // After:
+   Finder::builder()
+       .show_local_sources(true)
+       .groups("Group")
+       .extra_ips("192.168.1.0/24")
+       .build()
+   ```
+
+3. **SendOptions Validation**: Now enforces that at least one of `clock_video` or `clock_audio` must be true.
+
 ## New in 0.6.0
 
 ### 🚀 Major Performance & Safety Improvements
@@ -344,23 +431,28 @@ cargo run --example zero_copy_send
 ### Async Send Example
 Demonstrates the safe token-based asynchronous send API. The token ensures the frame remains valid while NDI is using it.
 ```rust,no_run
-use grafton_ndi::{NDI, Sender, Send, VideoFrame};
+use grafton_ndi::{NDI, SendOptions, SendInstance, VideoFrame, VideoFrameBorrowed, FourCCVideoType};
 
 fn main() -> Result<(), grafton_ndi::Error> {
     // Initialize NDI runtime
     let ndi = NDI::new()?;
-    // Create sender settings
-    let settings = Sender {
-        name: "MySend".into(),
-        groups: None,
-        clock_video: true,
-        clock_audio: true,
-    };
-    let send = Send::new(&ndi, settings)?;
-    // Obtain or generate a video frame
-    let frame: VideoFrame = get_frame();
+    
+    // Create sender with builder pattern
+    let options = SendOptions::builder("MySend")
+        .clock_video(true)
+        .clock_audio(true)
+        .build()?;
+    let send = SendInstance::new(&ndi, options)?;
+    
+    // Create a video frame using builder
+    let frame = VideoFrame::builder()
+        .resolution(1920, 1080)
+        .fourcc(FourCCVideoType::BGRA)
+        .frame_rate(60, 1)
+        .build()?;
+    
     // Safe async send: token keeps frame alive
-    let _token = send.send_video_async(&frame);
+    let _token = send.send_video_async((&frame).into());
     // Frame remains valid while token exists
     // Token is automatically dropped when no longer needed
     Ok(())

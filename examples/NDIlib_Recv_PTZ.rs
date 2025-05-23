@@ -5,7 +5,10 @@ use grafton_ndi::{Find, Finder, Receiver, RecvBandwidth, RecvColorFormat, NDI};
 fn main() {
     if let Ok(ndi) = NDI::new() {
         // Create an NDI finder to locate sources on the network
-        let finder = Finder::new(false, None, Some("192.168.0.110"));
+        let finder = Finder::builder()
+            .show_local_sources(false)
+            .extra_ips("192.168.0.110")
+            .build();
         let ndi_find = Find::new(&ndi, finder).expect("Failed to create NDI find instance");
 
         // Wait until there is at least one source on the network

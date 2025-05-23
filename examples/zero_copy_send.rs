@@ -1,4 +1,4 @@
-use grafton_ndi::{NDI, Sender, VideoFrameBorrowed, FourCCVideoType};
+use grafton_ndi::{NDI, SendOptions, VideoFrameBorrowed, FourCCVideoType};
 use std::time::{Duration, Instant};
 
 fn main() -> Result<(), grafton_ndi::Error> {
@@ -7,15 +7,11 @@ fn main() -> Result<(), grafton_ndi::Error> {
     println!("NDI version: {}", NDI::version()?);
 
     // Create sender
-    let send = grafton_ndi::Send::new(
-        &ndi,
-        Sender {
-            name: "Zero-Copy Sender Example".to_string(),
-            groups: None,
-            clock_video: true,
-            clock_audio: true,
-        },
-    )?;
+    let send_options = SendOptions::builder("Zero-Copy Sender Example")
+        .clock_video(true)
+        .clock_audio(true)
+        .build()?;
+    let send = grafton_ndi::SendInstance::new(&ndi, send_options)?;
 
     println!("Created NDI sender: {}", send.get_source_name());
 

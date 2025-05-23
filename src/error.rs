@@ -18,6 +18,8 @@ pub enum Error {
     InvalidFrame(String),
     #[error("PTZ command failed: {0}")]
     PtzCommandFailed(String),
+    #[error("Invalid configuration: {0}")]
+    InvalidConfiguration(String),
     #[error(transparent)]
     Io(#[from] io::Error),
 }

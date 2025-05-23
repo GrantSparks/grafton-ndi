@@ -8,7 +8,10 @@ fn main() -> Result<(), Error> {
     // Initialize the NDI library and ensure it's properly cleaned up
     if let Ok(ndi) = NDI::new() {
         // Create an NDI finder to locate sources on the network
-        let finder = Finder::new(false, None, Some("192.168.0.110"));
+        let finder = Finder::builder()
+            .show_local_sources(false)
+            .extra_ips("192.168.0.110")
+            .build();
         let ndi_find = Find::new(&ndi, finder)?;
 
         // Wait until we find a source named "CAMERA4"
