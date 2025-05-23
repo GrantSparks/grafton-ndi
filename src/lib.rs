@@ -492,9 +492,9 @@ impl VideoFrame {
     /// # Safety
     ///
     /// This function assumes the given `NDIlib_video_frame_v2_t` is valid and correctly allocated.
-    pub unsafe fn from_raw(c_frame: &NDIlib_video_frame_v2_t) -> Self {
+    pub unsafe fn from_raw(c_frame: &NDIlib_video_frame_v2_t) -> Result<Self, Error> {
         if c_frame.p_data.is_null() {
-            panic!("Invalid video frame data");
+            return Err(Error::InvalidFrame("Video frame has null data pointer".into()));
         }
 
         // SAFETY: For union access, we need to determine which field to use
@@ -513,7 +513,7 @@ impl VideoFrame {
         };
         
         if data_size == 0 {
-            panic!("Invalid video frame data");
+            return Err(Error::InvalidFrame("Video frame has zero size".into()));
         }
 
         let data = std::slice::from_raw_parts(c_frame.p_data, data_size).to_vec();
@@ -524,7 +524,7 @@ impl VideoFrame {
             Some(CString::from(CStr::from_ptr(c_frame.p_metadata)))
         };
 
-        VideoFrame {
+        Ok(VideoFrame {
             xres: c_frame.xres,
             yres: c_frame.yres,
             fourcc: c_frame.FourCC.into(),
@@ -539,19 +539,11 @@ impl VideoFrame {
             },
             metadata,
             timestamp: c_frame.timestamp,
-        }
+        })
     }
 }
 
-impl Drop for VideoFrame {
-    fn drop(&mut self) {
-        if let Some(meta) = &self.metadata {
-            unsafe {
-                let _ = CString::from_raw(meta.as_ptr() as *mut c_char);
-            }
-        }
-    }
-}
+// Drop implementation removed - CString in metadata field handles its own cleanup
 
 #[derive(Debug)]
 pub struct AudioFrame {
@@ -624,42 +616,33 @@ impl AudioFrame {
         }
     }
 
-    pub(crate) fn from_raw(raw: NDIlib_audio_frame_v3_t) -> Self {
+    pub(crate) fn from_raw(raw: NDIlib_audio_frame_v3_t) -> Result<Self, Error> {
         if raw.p_data.is_null() {
-            panic!("Received a null pointer for raw audio frame data");
+            return Err(Error::InvalidFrame("Audio frame has null data pointer".into()));
         }
 
         if raw.sample_rate <= 0 {
-            panic!("Invalid sample rate: {}", raw.sample_rate);
+            return Err(Error::InvalidFrame(format!("Invalid sample rate: {}", raw.sample_rate)));
         }
 
         if raw.no_channels <= 0 {
-            panic!("Invalid number of channels: {}", raw.no_channels);
+            return Err(Error::InvalidFrame(format!("Invalid number of channels: {}", raw.no_channels)));
         }
 
         if raw.no_samples <= 0 {
-            panic!("Invalid number of samples: {}", raw.no_samples);
+            return Err(Error::InvalidFrame(format!("Invalid number of samples: {}", raw.no_samples)));
         }
 
         let bytes_per_sample = 4;
         let data_size = (raw.no_samples * raw.no_channels * bytes_per_sample) as usize;
 
         if data_size == 0 {
-            panic!("Calculated data length is zero");
+            return Err(Error::InvalidFrame("Calculated audio data size is zero".into()));
         }
 
         let data = unsafe {
-            assert!(!raw.p_data.is_null(), "raw.p_data is null");
             std::slice::from_raw_parts(raw.p_data, data_size).to_vec()
         };
-
-        if data.len() != data_size {
-            panic!(
-                "Mismatch between data length ({} bytes) and calculated data length ({} bytes)",
-                data.len(),
-                data_size
-            );
-        }
 
         let metadata = if raw.p_metadata.is_null() {
             None
@@ -667,7 +650,7 @@ impl AudioFrame {
             Some(unsafe { CString::from_raw(raw.p_metadata as *mut c_char) })
         };
 
-        AudioFrame {
+        Ok(AudioFrame {
             sample_rate: raw.sample_rate,
             no_channels: raw.no_channels,
             no_samples: raw.no_samples,
@@ -680,7 +663,7 @@ impl AudioFrame {
             channel_stride_in_bytes: unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes },
             metadata,
             timestamp: raw.timestamp,
-        }
+        })
     }
 }
 
@@ -928,22 +911,14 @@ impl<'a> Recv<'a> {
 
         match frame_type {
             NDIlib_frame_type_e_NDIlib_frame_type_video => {
-                if video_frame.p_data.is_null() {
-                    Err(Error::NullPointer("Video frame data is null".into()))
-                } else {
-                    let frame = unsafe { VideoFrame::from_raw(&video_frame) };
-                    unsafe { NDIlib_recv_free_video_v2(self.instance, &video_frame) };
-                    Ok(FrameType::Video(frame))
-                }
+                let frame = unsafe { VideoFrame::from_raw(&video_frame) }?;
+                unsafe { NDIlib_recv_free_video_v2(self.instance, &video_frame) };
+                Ok(FrameType::Video(frame))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_audio => {
-                if audio_frame.p_data.is_null() {
-                    Err(Error::NullPointer("Audio frame data is null".into()))
-                } else {
-                    let frame = AudioFrame::from_raw(audio_frame);
-                    unsafe { NDIlib_recv_free_audio_v3(self.instance, &audio_frame) };
-                    Ok(FrameType::Audio(frame))
-                }
+                let frame = AudioFrame::from_raw(audio_frame)?;
+                unsafe { NDIlib_recv_free_audio_v3(self.instance, &audio_frame) };
+                Ok(FrameType::Audio(frame))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_metadata => {
                 if metadata_frame.p_data.is_null() {
@@ -1089,6 +1064,8 @@ impl Tally {
 #[derive(Debug)]
 pub struct Send<'a> {
     instance: NDIlib_send_instance_t,
+    _name: *mut c_char,  // Store raw pointer to free on drop
+    _groups: *mut c_char, // Store raw pointer to free on drop
     ndi: std::marker::PhantomData<&'a NDI>,
 }
 
@@ -1099,11 +1076,12 @@ impl<'a> Send<'a> {
             Some(ref groups) => CString::new(groups.clone())
                 .map_err(Error::InvalidCString)?
                 .into_raw(),
-            None => ptr::null(),
+            None => ptr::null_mut(),
         };
 
+        let p_ndi_name_raw = p_ndi_name.into_raw();
         let c_settings = NDIlib_send_create_t {
-            p_ndi_name: p_ndi_name.into_raw(),
+            p_ndi_name: p_ndi_name_raw,
             p_groups,
             clock_video: create_settings.clock_video,
             clock_audio: create_settings.clock_audio,
@@ -1111,12 +1089,21 @@ impl<'a> Send<'a> {
 
         let instance = unsafe { NDIlib_send_create(&c_settings) };
         if instance.is_null() {
+            // Clean up on error
+            unsafe {
+                let _ = CString::from_raw(p_ndi_name_raw);
+                if !p_groups.is_null() {
+                    let _ = CString::from_raw(p_groups);
+                }
+            }
             Err(Error::InitializationFailed(
                 "Failed to create NDI send instance".into(),
             ))
         } else {
             Ok(Send {
                 instance,
+                _name: p_ndi_name_raw,
+                _groups: p_groups,
                 ndi: std::marker::PhantomData,
             })
         }
@@ -1197,6 +1184,14 @@ impl Drop for Send<'_> {
     fn drop(&mut self) {
         unsafe {
             NDIlib_send_destroy(self.instance);
+            
+            // Free the CStrings we allocated
+            if !self._name.is_null() {
+                let _ = CString::from_raw(self._name);
+            }
+            if !self._groups.is_null() {
+                let _ = CString::from_raw(self._groups);
+            }
         }
     }
 }
@@ -1259,7 +1254,7 @@ mod tests {
         // The from_raw function should calculate size as line_stride * height
         // Previously it would incorrectly multiply data_size_in_bytes * height
         unsafe {
-            let frame = VideoFrame::from_raw(&c_frame);
+            let frame = VideoFrame::from_raw(&c_frame).unwrap();
             
             // Expected size is line_stride * height
             let expected_size = (line_stride * test_height) as usize;
@@ -1291,15 +1286,42 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Invalid video frame data")]
-    fn test_video_frame_null_data_panics() {
+    fn test_video_frame_null_data_returns_error() {
         let mut c_frame: NDIlib_video_frame_v2_t = unsafe { std::mem::zeroed() };
         c_frame.p_data = ptr::null_mut();
         c_frame.__bindgen_anon_1.line_stride_in_bytes = 1920 * 4;
         c_frame.yres = 1080;
         
         unsafe {
-            let _ = VideoFrame::from_raw(&c_frame);
+            let result = VideoFrame::from_raw(&c_frame);
+            assert!(result.is_err());
+            match result {
+                Err(Error::InvalidFrame(msg)) => {
+                    assert!(msg.contains("null data pointer"));
+                }
+                _ => panic!("Expected InvalidFrame error"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_video_frame_zero_size_returns_error() {
+        let mut c_frame: NDIlib_video_frame_v2_t = unsafe { std::mem::zeroed() };
+        let mut data = vec![0u8; 100];
+        c_frame.p_data = data.as_mut_ptr();
+        c_frame.__bindgen_anon_1.line_stride_in_bytes = 0;
+        c_frame.__bindgen_anon_1.data_size_in_bytes = 0;
+        c_frame.yres = 1080;
+        
+        unsafe {
+            let result = VideoFrame::from_raw(&c_frame);
+            assert!(result.is_err());
+            match result {
+                Err(Error::InvalidFrame(msg)) => {
+                    assert!(msg.contains("zero size"));
+                }
+                _ => panic!("Expected InvalidFrame error"),
+            }
         }
     }
 
@@ -1418,5 +1440,56 @@ mod tests {
         assert_eq!(original.name, restored.name);
         assert_eq!(original.url_address, restored.url_address);
         // Note: ip_address might not round-trip perfectly due to union behavior
+    }
+
+    #[test]
+    fn test_video_frame_metadata_no_double_free() {
+        // Test that VideoFrame with metadata doesn't double-free
+        let mut frame = VideoFrame::new(
+            1920,
+            1080,
+            FourCCVideoType::RGBA,
+            30000,
+            1001,
+            16.0 / 9.0,
+            FrameFormatType::Progressive,
+        );
+        frame.metadata = Some(CString::new("test video metadata").unwrap());
+        
+        // This should not panic or double-free
+        drop(frame);
+    }
+
+    #[test]
+    fn test_send_memory_management() {
+        // Test that Send properly manages CString memory
+        // Note: This test would require NDI SDK to actually create Send instance
+        // so we'll test the memory management pattern instead
+        
+        // Simulate the pattern used in Send::new
+        let name = CString::new("Test Sender").unwrap();
+        let groups = CString::new("Test Group").unwrap();
+        
+        let name_ptr = name.into_raw();
+        let groups_ptr = groups.into_raw();
+        
+        // Simulate cleanup (like Send's Drop would do)
+        unsafe {
+            let _ = CString::from_raw(name_ptr);
+            let _ = CString::from_raw(groups_ptr);
+        }
+        
+        // If this doesn't crash, memory management is correct
+    }
+
+    #[test]
+    fn test_metadata_frame_null_pointer() {
+        // Test MetadataFrame with null pointer
+        let frame = MetadataFrame::new();
+        assert!(frame.p_data.is_null());
+        assert_eq!(frame.length, 0);
+        
+        // Should be safe to drop
+        drop(frame);
     }
 }

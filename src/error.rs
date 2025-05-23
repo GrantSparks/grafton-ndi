@@ -13,4 +13,6 @@ pub enum Error {
     InvalidCString(#[from] NulError),
     #[error("Failed to capture frame: {0}")]
     CaptureFailed(String),
+    #[error("Invalid frame data: {0}")]
+    InvalidFrame(String),
 }
