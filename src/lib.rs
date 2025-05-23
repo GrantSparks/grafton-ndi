@@ -57,9 +57,26 @@
 //! as the underlying NDI SDK is thread-safe. However, for optimal performance,
 //! minimize cross-thread operations and maintain thread affinity where possible.
 //!
+//! ## Async Sending
+//!
+//! The library provides zero-copy async send methods that return tokens to ensure
+//! buffer lifetime safety:
+//!
+//! ```no_run
+//! # use grafton_ndi::{NDI, SendOptions, VideoFrameBorrowed, FourCCVideoType};
+//! # let ndi = NDI::new().unwrap();
+//! # let send = grafton_ndi::SendInstance::new(&ndi, &SendOptions::builder("Test").build().unwrap()).unwrap();
+//! let buffer = vec![0u8; 1920 * 1080 * 4];
+//! let frame = VideoFrameBorrowed::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
+//! let token = send.send_video_async(&frame);
+//! // Buffer is now owned by NDI - cannot be modified until token is dropped
+//! drop(token); // Releases the buffer
+//! ```
+//!
 //! # Performance
 //!
 //! - **Zero-copy**: Frame data directly references NDI's buffers when possible
+//! - **Lock-free async**: Atomic operations for minimal overhead in hot paths
 //! - **Bandwidth control**: Multiple quality levels for different use cases
 //! - **Hardware acceleration**: Automatically uses GPU acceleration when available
 //!
@@ -98,7 +115,8 @@ pub use receiver::{
 };
 pub use runtime::NDI;
 pub use sender::{
-    AsyncVideoToken, SendInstance, SendOptions, SendOptionsBuilder, VideoFrameBorrowed,
+    AsyncAudioToken, AsyncMetadataToken, AsyncVideoToken, AudioFrameBorrowed,
+    MetadataFrameBorrowed, SendInstance, SendOptions, SendOptionsBuilder, VideoFrameBorrowed,
 };
 
 // Tests
