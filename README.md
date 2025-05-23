@@ -2,6 +2,106 @@
 
 Unofficial idiomatic Rust bindings for the [NDI 6 SDK](https://ndi.video/for-developers/ndi-sdk/).
 
+## Upgrading from 0.4.x to 0.5.0
+
+Version 0.5.0 includes significant improvements for memory safety, ergonomics, and API consistency. While these are breaking changes, the migration is straightforward.
+
+### 🔧 Required Changes
+
+#### 1. Frame Data Access (Zero-Copy Support)
+**Before (0.4.x):**
+```rust
+let frame: VideoFrame = /* ... */;
+let data: &Vec<u8> = &frame.data;
+```
+
+**After (0.5.0):**
+```rust
+let frame: VideoFrame = /* ... */;
+let data: &[u8] = &frame.data; // Now Cow<[u8]> - works with both owned and borrowed data
+```
+
+#### 2. Receiver Creation (New Builder Pattern)
+**Before (0.4.x):**
+```rust
+let receiver = Receiver::new(
+    source,
+    RecvColorFormat::RGBX_RGBA,
+    RecvBandwidth::Highest,
+    false,
+    Some("My Receiver".to_string()),
+);
+let mut ndi_recv = Recv::new(&ndi, receiver)?;
+```
+
+**After (0.5.0):**
+```rust
+let mut ndi_recv = Receiver::builder(source)
+    .color(RecvColorFormat::RGBX_RGBA)
+    .bandwidth(RecvBandwidth::Highest)
+    .allow_video_fields(false)
+    .name("My Receiver")
+    .build(&ndi)?;
+```
+
+#### 3. NDI Initialization (Singleton Pattern)
+**Before (0.4.x):**
+```rust
+let ndi = NDI::new()?; // Could panic or fail inconsistently
+```
+
+**After (0.5.0):**
+```rust
+let ndi = NDI::new()?; // Safe singleton pattern - multiple calls return the same instance
+// OR use the more explicit:
+let ndi = NDI::acquire()?;
+```
+
+#### 4. Error Handling (IO Errors)
+**Before (0.4.x):**
+```rust
+let file = File::create(path)
+    .map_err(|e| Error::InitializationFailed(format!("Failed: {}", e)))?;
+```
+
+**After (0.5.0):**
+```rust
+let file = File::create(path)?; // IO errors now bubble up automatically
+```
+
+#### 5. MetadataFrame (Owned Data)
+**Before (0.4.x):**
+```rust
+// MetadataFrame held raw pointers - unsafe!
+let metadata = MetadataFrame { /* raw pointer fields */ };
+```
+
+**After (0.5.0):**
+```rust
+// MetadataFrame now owns its data - safe!
+let metadata = MetadataFrame::with_data("<metadata>content</metadata>".to_string(), timecode);
+```
+
+### ✨ New Features in 0.5.0
+
+- **Thread Safety**: `Recv`, `Send`, and `Find` are now `Send + Sync`
+- **Zero-Copy Access**: Frame data uses `Cow<[u8]>` for optional zero-copy processing
+- **Builder Patterns**: Ergonomic `.builder()` API for complex structures
+- **Memory Safety**: Eliminated all use-after-free and double-free vulnerabilities
+- **Better Error Handling**: Automatic IO error bubbling with `thiserror`
+- **FFI Safety**: All FFI structs use `#[repr(C)]` for guaranteed layout
+
+### 🔍 Migration Checklist
+
+- [ ] Update `Cargo.toml` to version `0.5.0`
+- [ ] Replace `Receiver::new()` calls with `Receiver::builder()` pattern
+- [ ] Update frame data access to work with `&[u8]` instead of `&Vec<u8>`
+- [ ] Remove manual IO error wrapping (use `?` operator instead)
+- [ ] Test thread safety improvements if using across threads
+- [ ] Verify that memory-intensive operations now use less memory (zero-copy)
+
+Most code will continue to work with minimal changes due to Rust's automatic dereferencing and the backward-compatible nature of `Cow<[u8]>`.
+
 ## Usage
 
 See our blog article on [how to use the NDI SDK with Rust](https://blog.grafton.ai/configuration-management-for-rust-applications-15b2a0346b80).
