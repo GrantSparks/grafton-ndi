@@ -92,4 +92,5 @@ The codebase follows a layered architecture:
 
 - No breaking changes after 1.0.0 release
 - Builder patterns allow extending APIs without breaks
-- Deprecate rather than remove when possible
+- Remove rather than deprecate when possible until 1.0.0
+- Use semantic versioning (MAJOR.MINOR.PATCH)

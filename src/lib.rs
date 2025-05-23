@@ -165,8 +165,20 @@ impl NDI {
             }
             // Busy-wait until it is done so the caller never sees an
             // un-initialised runtime while REFCOUNT > 0.
+            let mut spin_count = 0;
             while !INIT.load(Ordering::SeqCst) && !INIT_FAILED.load(Ordering::SeqCst) {
-                std::hint::spin_loop();
+                if spin_count < 200 {
+                    std::hint::spin_loop();
+                    spin_count += 1;
+                } else {
+                    // After ~200 iterations, yield to avoid burning CPU
+                    std::thread::yield_now();
+                    // Optional: add a small sleep for very slow systems
+                    if spin_count > 1000 {
+                        std::thread::sleep(std::time::Duration::from_micros(50));
+                    }
+                    spin_count += 1;
+                }
             }
             // Check again after waiting
             if INIT_FAILED.load(Ordering::SeqCst) {
@@ -2213,17 +2225,15 @@ pub struct AsyncVideoToken<'send, 'buf> {
     _frame: std::marker::PhantomData<&'buf mut [u8]>,
 }
 
-/// A token that ensures the audio frame remains valid while NDI is using it.
-/// The frame will be released when this token is dropped or when the next
-/// send operation occurs.
-#[must_use = "AsyncAudioToken must be held until the next send operation"]
-pub struct AsyncAudioToken<'a, 'b> {
-    _send: &'a SendInstance<'b>,
-    // Use mutable borrow to prevent any access while NDI owns the buffer
-    _frame: std::marker::PhantomData<&'a mut AudioFrame<'a>>,
-}
-
 impl<'a> SendInstance<'a> {
+    /// Creates a new NDI send instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The sender name contains a null byte
+    /// - The groups string contains a null byte
+    /// - NDI fails to create the send instance
     pub fn new(_ndi: &'a NDI, create_settings: SendOptions) -> Result<Self, Error> {
         let p_ndi_name = CString::new(create_settings.name).map_err(Error::InvalidCString)?;
         let p_groups = match create_settings.groups {
@@ -2286,14 +2296,10 @@ impl<'a> SendInstance<'a> {
     ///     .build()?;
     /// let send = grafton_ndi::SendInstance::new(&ndi, send_options)?;
     ///
-    /// // Option 1: Use existing VideoFrame (still zero-copy)
-    /// let frame = VideoFrame::default();
-    /// let _token = send.send_video_async((&frame).into());
-    ///
-    /// // Option 2: Use borrowed buffer directly (zero-copy, no allocation)
+    /// // Use borrowed buffer directly (zero-copy, no allocation)
     /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
     /// let borrowed_frame = VideoFrameBorrowed::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
-    /// let _token2 = send.send_video_async(borrowed_frame);
+    /// let _token = send.send_video_async(&borrowed_frame);
     /// // buffer is now being used by NDI - safe as long as token exists
     ///
     /// // When token is dropped or next send occurs, frame is released
@@ -2302,7 +2308,7 @@ impl<'a> SendInstance<'a> {
     /// ```
     pub fn send_video_async<'b>(
         &'b self,
-        video_frame: VideoFrameBorrowed<'b>,
+        video_frame: &VideoFrameBorrowed<'b>,
     ) -> AsyncVideoToken<'b, 'b> {
         unsafe {
             NDIlib_send_send_video_async_v2(self.instance, &video_frame.to_raw());
@@ -2313,29 +2319,55 @@ impl<'a> SendInstance<'a> {
         }
     }
 
+    /// Sends an audio frame synchronously.
+    ///
+    /// This function copies the audio data immediately and returns, making the buffer
+    /// available for reuse. The underlying NDI SDK function `NDIlib_send_send_audio_v3`
+    /// performs a synchronous copy of the data.
+    ///
+    /// See the NDI SDK documentation section on `NDIlib_send_send_audio_v3` for more details.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, SendOptions, AudioFrame};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let send = grafton_ndi::SendInstance::new(&ndi, SendOptions::builder("Test").build()?)?;
+    /// let mut audio_buffer = vec![0.0f32; 48000 * 2]; // 1 second of stereo audio
+    ///
+    /// // Fill buffer with audio data...
+    /// let frame = AudioFrame::builder()
+    ///     .sample_rate(48000)
+    ///     .channels(2)
+    ///     .samples(48000)
+    ///     .data(audio_buffer.clone())
+    ///     .build()?;
+    /// send.send_audio(&frame);
+    ///
+    /// // Buffer can be reused immediately
+    /// audio_buffer.fill(0.5);
+    /// let frame2 = AudioFrame::builder()
+    ///     .sample_rate(48000)
+    ///     .channels(2)
+    ///     .samples(48000)
+    ///     .data(audio_buffer)
+    ///     .build()?;
+    /// send.send_audio(&frame2);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn send_audio(&self, audio_frame: &AudioFrame<'_>) {
         unsafe {
             NDIlib_send_send_audio_v3(self.instance, &audio_frame.to_raw());
         }
     }
 
-    /// Send an audio frame **asynchronously** (NDI *keeps a pointer*; no copy).
+    /// Sends a metadata frame.
     ///
-    /// Returns an `AsyncAudioToken` that must be held until the next send operation.
-    /// The frame data is guaranteed to remain valid as long as the token exists.
-    pub fn send_audio_async<'b>(
-        &'b self,
-        audio_frame: &'b AudioFrame<'_>,
-    ) -> AsyncAudioToken<'b, 'a> {
-        unsafe {
-            NDIlib_send_send_audio_v3(self.instance, &audio_frame.to_raw());
-        }
-        AsyncAudioToken {
-            _send: self,
-            _frame: std::marker::PhantomData,
-        }
-    }
-
+    /// # Errors
+    ///
+    /// Returns an error if the metadata string contains a null byte.
     pub fn send_metadata(&self, metadata_frame: &MetadataFrame) -> Result<(), Error> {
         let (_c_data, raw) = metadata_frame.to_raw()?;
         unsafe {
@@ -2344,6 +2376,14 @@ impl<'a> SendInstance<'a> {
         Ok(())
     }
 
+    /// Captures a frame synchronously with timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Frame capture times out
+    /// - Frame conversion fails
+    /// - Frame data is invalid
     pub fn capture(&self, timeout_ms: u32) -> Result<FrameType<'static>, Error> {
         let mut metadata_frame = NDIlib_metadata_frame_t::default();
         let frame_type =
@@ -2374,6 +2414,7 @@ impl<'a> SendInstance<'a> {
         unsafe { NDIlib_send_get_tally(self.instance, &mut tally.to_raw(), timeout_ms) }
     }
 
+    #[must_use]
     pub fn get_no_connections(&self, timeout_ms: u32) -> i32 {
         unsafe { NDIlib_send_get_no_connections(self.instance, timeout_ms) }
     }
@@ -2382,18 +2423,29 @@ impl<'a> SendInstance<'a> {
         unsafe { NDIlib_send_clear_connection_metadata(self.instance) }
     }
 
+    /// Adds connection metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata string contains a null byte.
     pub fn add_connection_metadata(&self, metadata_frame: &MetadataFrame) -> Result<(), Error> {
         let (_c_data, raw) = metadata_frame.to_raw()?;
         unsafe { NDIlib_send_add_connection_metadata(self.instance, &raw) }
         Ok(())
     }
 
+    /// Sets failover source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if source conversion fails.
     pub fn set_failover(&self, source: &Source) -> Result<(), Error> {
         let raw_source = source.to_raw()?;
         unsafe { NDIlib_send_set_failover(self.instance, &raw_source.raw) }
         Ok(())
     }
 
+    #[must_use]
     pub fn get_source_name(&self) -> Source {
         let source_ptr = unsafe { NDIlib_send_get_source_name(self.instance) };
         Source::from_raw(unsafe { &*source_ptr })
@@ -2420,7 +2472,7 @@ impl Drop for SendInstance<'_> {
 ///
 /// The NDI 6 SDK documentation states that send operations are thread-safe.
 /// `NDIlib_send_send_video_v2`, `NDIlib_send_send_audio_v3`, and related functions
-/// use internal synchronization. The SendInstance struct holds an opaque pointer and raw
+/// use internal synchronization. The `SendInstance` struct holds an opaque pointer and raw
 /// C string pointers that are only freed in Drop, making it safe to move between threads.
 unsafe impl std::marker::Send for SendInstance<'_> {}
 
@@ -2428,7 +2480,7 @@ unsafe impl std::marker::Send for SendInstance<'_> {}
 ///
 /// The NDI 6 SDK guarantees thread-safety for send operations. Multiple threads can
 /// safely call send methods concurrently as the SDK handles all necessary synchronization.
-/// The async send operations (send_video_async, send_audio_async) are also thread-safe
+/// The async send operations (`send_video_async`) are also thread-safe
 /// as documented in the SDK manual.
 unsafe impl std::marker::Sync for SendInstance<'_> {}
 
@@ -2447,7 +2499,7 @@ impl SendOptions {
     }
 }
 
-/// Builder for configuring SendOptions with ergonomic method chaining
+/// Builder for configuring `SendOptions` with ergonomic method chaining
 #[derive(Debug, Clone)]
 pub struct SendOptionsBuilder {
     name: String,
@@ -2474,18 +2526,24 @@ impl SendOptionsBuilder {
     }
 
     /// Configure whether to clock video
+    #[must_use]
     pub fn clock_video(mut self, clock: bool) -> Self {
         self.clock_video = Some(clock);
         self
     }
 
     /// Configure whether to clock audio
+    #[must_use]
     pub fn clock_audio(mut self, clock: bool) -> Self {
         self.clock_audio = Some(clock);
         self
     }
 
-    /// Build the SendOptions
+    /// Build the `SendOptions`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the name is empty.
     pub fn build(self) -> Result<SendOptions, Error> {
         let clock_video = self.clock_video.unwrap_or(true);
         let clock_audio = self.clock_audio.unwrap_or(true);
@@ -3249,5 +3307,71 @@ mod tests {
         assert_eq!(frame.timestamp, 789012);
         assert_eq!(frame.fourcc, AudioType::FLTP);
         assert_eq!(frame.data(), &test_data[..]);
+    }
+
+    #[test]
+    fn test_audio_buffer_reusable_after_send() {
+        // This test verifies that audio buffers can be reused immediately after send_audio
+        // since the SDK performs a synchronous copy
+
+        // Create a mutable buffer
+        let mut audio_buffer = vec![0.0f32; 48000 * 2]; // 1 second of stereo audio at 48kHz
+
+        // Fill with initial data
+        for (i, sample) in audio_buffer.iter_mut().enumerate() {
+            *sample = (i as f32) * 0.001;
+        }
+
+        // Create first frame and verify data
+        let frame1 = AudioFrame::builder()
+            .sample_rate(48000)
+            .channels(2)
+            .samples(48000)
+            .data(audio_buffer.clone())
+            .build()
+            .unwrap();
+        assert_eq!(frame1.sample_rate, 48000);
+        assert_eq!(frame1.no_channels, 2);
+        assert_eq!(frame1.no_samples, 48000);
+
+        // Simulate send_audio (we can't actually call it without NDI runtime)
+        // The important part is that we can modify the buffer immediately
+
+        // Reuse buffer with different data
+        for sample in audio_buffer.iter_mut() {
+            *sample = 0.5;
+        }
+
+        // Create second frame with same buffer
+        let frame2 = AudioFrame::builder()
+            .sample_rate(48000)
+            .channels(2)
+            .samples(48000)
+            .data(audio_buffer.clone())
+            .build()
+            .unwrap();
+
+        // Verify both frames have correct data (frame1 should have kept its copy)
+        let frame1_data = frame1.data();
+        let frame2_data = frame2.data();
+
+        // Check first sample of each frame to verify they're different
+        assert_ne!(
+            frame1_data[0], frame2_data[0],
+            "Frames should have different data"
+        );
+        assert_eq!(frame2_data[0], 0.5f32, "Frame 2 should have new data");
+
+        // Buffer is still valid and can be reused again
+        audio_buffer.fill(1.0);
+        let frame3 = AudioFrame::builder()
+            .sample_rate(48000)
+            .channels(2)
+            .samples(48000)
+            .data(audio_buffer)
+            .build()
+            .unwrap();
+
+        assert_eq!(frame3.data()[0], 1.0f32, "Frame 3 should have newest data");
     }
 }

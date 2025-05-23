@@ -51,7 +51,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
             VideoFrameBorrowed::from_buffer(buffer, width, height, FourCCVideoType::BGRA, 60, 1);
 
         // Send asynchronously - no copy happens here!
-        let token = send.send_video_async(borrowed_frame);
+        let token = send.send_video_async(&borrowed_frame);
 
         // While NDI is using our buffer, we can switch to the other buffer
         current_buffer = 1 - current_buffer;

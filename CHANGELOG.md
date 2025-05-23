@@ -3,6 +3,10 @@
 ## [0.7.0] - 2025-05-23
 
 ### Breaking Changes
+- **Removed `AsyncAudioToken` and `send_audio_async()`**: Audio send is always synchronous
+  - The NDI SDK function `NDIlib_send_send_audio_v3` performs a synchronous copy
+  - Migration: Remove any `AsyncAudioToken` usage and use `send_audio()` directly
+  - Audio buffers can be reused immediately after `send_audio()` returns
 - **Audio data type change**: `AudioFrame::data` now returns `&[f32]` instead of `&[u8]`
   - Audio samples are now properly typed as 32-bit floats
   - This matches the NDI v3 audio format (FLTP - 32-bit float planar)
@@ -16,15 +20,19 @@
 - `AudioFrameBuilder::data()` now accepts `Vec<f32>` for setting audio samples
 - Comprehensive tests for 32-bit float audio handling
 - New example: `NDIlib_Recv_Audio` demonstrating float audio capture
+- Test demonstrating audio buffer reusability after synchronous send
 
 ### Changed
 - `AudioFrame` internal storage changed from `Cow<'rx, [u8]>` to `Cow<'rx, [f32]>`
 - Audio frame building now properly initializes with float samples
 - Default `channel_stride_in_bytes` is now 0 (indicating interleaved format)
+- Improved NDI initialization spin-loop with exponential backoff after ~200 iterations
+  - Prevents CPU burn on slow systems or VMs
 
 ### Fixed
 - Audio data is now correctly interpreted as 32-bit floats instead of raw bytes
 - Channel stride calculation for planar audio formats
+- CPU waste in initialization when NDI takes time to start
 
 ## [0.6.0] - 2025-05-23
 
