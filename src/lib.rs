@@ -1111,7 +1111,7 @@ pub struct AudioFrame<'rx> {
     pub no_samples: i32,
     pub timecode: i64,
     pub fourcc: AudioType,
-    pub data: Cow<'rx, [u8]>,
+    data: Cow<'rx, [f32]>,
     pub channel_stride_in_bytes: i32,
     pub metadata: Option<CString>,
     pub timestamp: i64,
@@ -1128,7 +1128,7 @@ impl<'rx> AudioFrame<'rx> {
             no_samples: self.no_samples,
             timecode: self.timecode,
             FourCC: self.fourcc.into(),
-            p_data: self.data.as_ptr() as *mut u8,
+            p_data: self.data.as_ptr() as *mut f32 as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: self.channel_stride_in_bytes,
             },
@@ -1165,16 +1165,17 @@ impl<'rx> AudioFrame<'rx> {
             )));
         }
 
-        let bytes_per_sample = 4;
-        let data_size = (raw.no_samples * raw.no_channels * bytes_per_sample) as usize;
+        let sample_count = (raw.no_samples * raw.no_channels) as usize;
 
-        if data_size == 0 {
+        if sample_count == 0 {
             return Err(Error::InvalidFrame(
-                "Calculated audio data size is zero".into(),
+                "Calculated audio sample count is zero".into(),
             ));
         }
 
-        let data = unsafe { std::slice::from_raw_parts(raw.p_data, data_size).to_vec() };
+        let data = unsafe { 
+            std::slice::from_raw_parts(raw.p_data as *const f32, sample_count).to_vec() 
+        };
 
         let metadata = if raw.p_metadata.is_null() {
             None
@@ -1205,6 +1206,43 @@ impl<'rx> AudioFrame<'rx> {
     pub fn builder() -> AudioFrameBuilder<'rx> {
         AudioFrameBuilder::new()
     }
+
+    /// Get audio data as 32-bit floats
+    pub fn data(&self) -> &[f32] {
+        &self.data
+    }
+
+    /// Get audio data for a specific channel (if planar format)
+    pub fn channel_data(&self, channel: usize) -> Option<Vec<f32>> {
+        if channel >= self.no_channels as usize {
+            return None;
+        }
+        
+        let samples_per_channel = self.no_samples as usize;
+        
+        if self.channel_stride_in_bytes == 0 {
+            // Interleaved format: extract samples for the requested channel
+            let channels = self.no_channels as usize;
+            let channel_data: Vec<f32> = self.data
+                .iter()
+                .skip(channel)
+                .step_by(channels)
+                .copied()
+                .collect();
+            Some(channel_data)
+        } else {
+            // Planar format: channel data is contiguous
+            let stride_in_samples = self.channel_stride_in_bytes as usize / 4; // f32 = 4 bytes
+            let start = channel * stride_in_samples;
+            let end = start + samples_per_channel;
+            
+            if end <= self.data.len() {
+                Some(self.data[start..end].to_vec())
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// Builder for configuring an AudioFrame with ergonomic method chaining
@@ -1215,7 +1253,7 @@ pub struct AudioFrameBuilder<'rx> {
     no_samples: Option<i32>,
     timecode: Option<i64>,
     fourcc: Option<AudioType>,
-    data: Option<Vec<u8>>,
+    data: Option<Vec<f32>>,
     metadata: Option<String>,
     timestamp: Option<i64>,
     _phantom: std::marker::PhantomData<&'rx ()>,
@@ -1267,8 +1305,8 @@ impl<'rx> AudioFrameBuilder<'rx> {
         self
     }
 
-    /// Set the audio data
-    pub fn data(mut self, data: Vec<u8>) -> Self {
+    /// Set the audio data as 32-bit floats
+    pub fn data(mut self, data: Vec<f32>) -> Self {
         self.data = Some(data);
         self
     }
@@ -1295,10 +1333,9 @@ impl<'rx> AudioFrameBuilder<'rx> {
         let data = if let Some(data) = self.data {
             data
         } else {
-            // Calculate default buffer size based on format
-            let bytes_per_sample = 4; // Float32
-            let buffer_size = (no_samples * no_channels * bytes_per_sample) as usize;
-            vec![0u8; buffer_size]
+            // Calculate default buffer size for f32 samples
+            let sample_count = (no_samples * no_channels) as usize;
+            vec![0.0f32; sample_count]
         };
         
         let metadata_cstring = self.metadata
@@ -1312,7 +1349,7 @@ impl<'rx> AudioFrameBuilder<'rx> {
             timecode: self.timecode.unwrap_or(0),
             fourcc,
             data: Cow::Owned(data),
-            channel_stride_in_bytes: no_samples * 4,
+            channel_stride_in_bytes: 0, // 0 indicates interleaved format
             metadata: metadata_cstring,
             timestamp: self.timestamp.unwrap_or(0),
             recv_instance: None,
@@ -2883,5 +2920,111 @@ mod tests {
         drop(metadata_str);
 
         // Note: In real NDI usage, NDIlib_recv_free_audio_v3 would free the metadata
+    }
+
+    #[test]
+    fn test_audio_frame_f32_data() {
+        // Test creating audio frame with f32 data
+        let sample_data: Vec<f32> = vec![0.0, 0.5, -0.5, 1.0, -1.0];
+        let frame = AudioFrame::builder()
+            .sample_rate(48000)
+            .channels(1)
+            .samples(5)
+            .data(sample_data.clone())
+            .build()
+            .unwrap();
+        
+        assert_eq!(frame.sample_rate, 48000);
+        assert_eq!(frame.no_channels, 1);
+        assert_eq!(frame.no_samples, 5);
+        assert_eq!(frame.data(), &sample_data[..]);
+    }
+
+    #[test]
+    fn test_audio_frame_channel_data_interleaved() {
+        // Test interleaved stereo audio
+        let stereo_data: Vec<f32> = vec![
+            0.1, 0.2,  // Sample 1: L=0.1, R=0.2
+            0.3, 0.4,  // Sample 2: L=0.3, R=0.4
+            0.5, 0.6,  // Sample 3: L=0.5, R=0.6
+        ];
+        
+        let frame = AudioFrame::builder()
+            .sample_rate(48000)
+            .channels(2)
+            .samples(3)
+            .data(stereo_data.clone())
+            .build()
+            .unwrap();
+        
+        // Channel 0 (left) should be [0.1, 0.3, 0.5]
+        let left_channel = frame.channel_data(0).unwrap();
+        assert_eq!(left_channel, vec![0.1, 0.3, 0.5]);
+        
+        // Channel 1 (right) should be [0.2, 0.4, 0.6]
+        let right_channel = frame.channel_data(1).unwrap();
+        assert_eq!(right_channel, vec![0.2, 0.4, 0.6]);
+        
+        // Out of bounds channel should return None
+        assert!(frame.channel_data(2).is_none());
+    }
+
+    #[test]
+    fn test_audio_frame_channel_data_planar() {
+        // Test planar audio format (channels stored separately)
+        let planar_data: Vec<f32> = vec![
+            // Channel 0 data
+            0.1, 0.2, 0.3, 0.0, 0.0,  // 3 samples + padding
+            // Channel 1 data
+            0.4, 0.5, 0.6, 0.0, 0.0,  // 3 samples + padding
+        ];
+        
+        let mut frame = AudioFrame::builder()
+            .sample_rate(48000)
+            .channels(2)
+            .samples(3)
+            .data(planar_data.clone())
+            .build()
+            .unwrap();
+        
+        // Set channel stride to indicate planar format
+        frame.channel_stride_in_bytes = 5 * 4; // 5 samples * 4 bytes per f32
+        
+        // Channel 0 should be [0.1, 0.2, 0.3]
+        let channel_0 = frame.channel_data(0).unwrap();
+        assert_eq!(channel_0, vec![0.1, 0.2, 0.3]);
+        
+        // Channel 1 should be [0.4, 0.5, 0.6]
+        let channel_1 = frame.channel_data(1).unwrap();
+        assert_eq!(channel_1, vec![0.4, 0.5, 0.6]);
+    }
+
+    #[test]
+    fn test_audio_frame_from_raw_v3() {
+        // Test creating AudioFrame from raw v3 data
+        let test_data: Vec<f32> = vec![0.1, -0.1, 0.2, -0.2];
+        let raw = NDIlib_audio_frame_v3_t {
+            sample_rate: 44100,
+            no_channels: 2,
+            no_samples: 2,
+            timecode: 123456,
+            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            p_data: test_data.as_ptr() as *mut u8,
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: 0,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 789012,
+        };
+        
+        let frame = AudioFrame::from_raw(raw, None).unwrap();
+        
+        assert_eq!(frame.sample_rate, 44100);
+        assert_eq!(frame.no_channels, 2);
+        assert_eq!(frame.no_samples, 2);
+        assert_eq!(frame.timecode, 123456);
+        assert_eq!(frame.timestamp, 789012);
+        assert_eq!(frame.fourcc, AudioType::FLTP);
+        assert_eq!(frame.data(), &test_data[..]);
     }
 }

@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.7.0] - 2025-05-23
+
+### Breaking Changes
+- **Audio data type change**: `AudioFrame::data` now returns `&[f32]` instead of `&[u8]`
+  - Audio samples are now properly typed as 32-bit floats
+  - This matches the NDI v3 audio format (FLTP - 32-bit float planar)
+  - Migration: Update code that accesses audio data to work with `f32` values
+
+### Added
+- `AudioFrame::data()` method returns audio samples as `&[f32]`
+- `AudioFrame::channel_data(channel)` method extracts samples for a specific channel
+  - Handles both interleaved and planar audio formats automatically
+  - Returns `Option<Vec<f32>>` with the channel's samples
+- `AudioFrameBuilder::data()` now accepts `Vec<f32>` for setting audio samples
+- Comprehensive tests for 32-bit float audio handling
+- New example: `NDIlib_Recv_Audio` demonstrating float audio capture
+
+### Changed
+- `AudioFrame` internal storage changed from `Cow<'rx, [u8]>` to `Cow<'rx, [f32]>`
+- Audio frame building now properly initializes with float samples
+- Default `channel_stride_in_bytes` is now 0 (indicating interleaved format)
+
+### Fixed
+- Audio data is now correctly interpreted as 32-bit floats instead of raw bytes
+- Channel stride calculation for planar audio formats
+
 ## [0.6.0] - 2025-05-23
 
 ### Added

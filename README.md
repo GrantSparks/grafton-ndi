@@ -121,6 +121,9 @@ match recv.capture(5000)? {
         println!("Audio: {} channels @ {} Hz", 
             audio.no_channels, audio.sample_rate
         );
+        // Access audio samples as f32
+        let samples: &[f32] = audio.data();
+        println!("First sample: {:.3}", samples[0]);
     }
     _ => {}
 }
@@ -156,6 +159,36 @@ let mut data = vec![0u8; frame.size()];
 
 frame.set_data(&data);
 send.send_video(&frame);
+```
+
+### Working with Audio
+
+```rust
+use grafton_ndi::{NDI, Receiver, RecvBandwidth};
+
+let recv = Receiver::builder(source)
+    .bandwidth(RecvBandwidth::AudioOnly)
+    .build(&ndi)?;
+
+// Capture audio frame
+if let Some(audio) = recv.capture_audio(5000)? {
+    // Audio samples are 32-bit floats
+    let samples: &[f32] = audio.data();
+    
+    // Calculate RMS level
+    let rms = (samples.iter()
+        .map(|&x| x * x)
+        .sum::<f32>() / samples.len() as f32)
+        .sqrt();
+    
+    // Access individual channels (stereo example)
+    if let Some(left) = audio.channel_data(0) {
+        println!("Left channel: {} samples", left.len());
+    }
+    if let Some(right) = audio.channel_data(1) {
+        println!("Right channel: {} samples", right.len());
+    }
+}
 ```
 
 ### PTZ Camera Control
@@ -216,7 +249,7 @@ let send = SendInstance::new(&ndi, SendOptions::builder("Source Name")
 
 ### Frame Types
 - `VideoFrame` - Video frame data with resolution, format, and timing
-- `AudioFrame` - Audio samples with channel configuration  
+- `AudioFrame` - 32-bit float audio samples with channel configuration  
 - `MetadataFrame` - XML metadata for tally, PTZ, and custom data
 
 ## Thread Safety
