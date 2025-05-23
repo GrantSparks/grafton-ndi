@@ -926,13 +926,13 @@ pub struct Recv<'a> {
 impl<'a> Recv<'a> {
     pub fn new(_ndi: &'a NDI, create: Receiver) -> Result<Self, Error> {
         let create_raw = create.to_raw()?;
+        // NDIlib_recv_create_v3 already connects to the source specified in source_to_connect_to
         let instance = unsafe { NDIlib_recv_create_v3(&create_raw.raw) };
         if instance.is_null() {
             Err(Error::InitializationFailed(
                 "Failed to create NDI recv instance".into(),
             ))
         } else {
-            unsafe { NDIlib_recv_connect(instance, &create_raw.raw.source_to_connect_to) };
             Ok(Recv {
                 instance,
                 ndi: std::marker::PhantomData,
