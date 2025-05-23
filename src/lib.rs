@@ -1,10 +1,12 @@
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
+use once_cell::sync::OnceCell;
 use std::{
     ffi::{CStr, CString},
     fmt::{self, Display, Formatter},
     os::raw::c_char,
     ptr,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 mod error;
@@ -13,17 +15,36 @@ pub use error::*;
 mod ndi_lib;
 use ndi_lib::*;
 
+// Global initialization state and reference count
+static INIT: OnceCell<bool> = OnceCell::new();
+static REFCOUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug)]
 pub struct NDI;
 
 impl NDI {
+    /// Acquire an NDI instance, initializing the runtime if necessary.
+    /// Multiple instances can be acquired safely - the runtime will only be initialized once.
+    pub fn acquire() -> Result<Self, Error> {
+        // Initialize NDI runtime only once
+        INIT.get_or_try_init(|| {
+            if unsafe { NDIlib_initialize() } {
+                Ok(true)
+            } else {
+                Err(Error::InitializationFailed(
+                    "NDIlib_initialize failed".into(),
+                ))
+            }
+        })?;
+
+        // Increment reference count
+        REFCOUNT.fetch_add(1, Ordering::Relaxed);
+        Ok(NDI)
+    }
+
+    /// Alias for acquire() to maintain backward compatibility
     pub fn new() -> Result<Self, Error> {
-        if Self::initialize() {
-            Ok(NDI)
-        } else {
-            Err(Error::InitializationFailed(
-                "NDIlib_initialize failed".into(),
-            ))
-        }
+        Self::acquire()
     }
 
     pub fn is_supported_cpu() -> bool {
@@ -43,15 +64,23 @@ impl NDI {
                 .map_err(|e| Error::InvalidUtf8(e.to_string()))
         }
     }
+}
 
-    fn initialize() -> bool {
-        unsafe { NDIlib_initialize() }
+impl Clone for NDI {
+    fn clone(&self) -> Self {
+        // Increment reference count for the clone
+        REFCOUNT.fetch_add(1, Ordering::Relaxed);
+        NDI
     }
 }
 
 impl Drop for NDI {
     fn drop(&mut self) {
-        unsafe { NDIlib_destroy() };
+        // Only destroy the runtime when the last reference is dropped
+        if REFCOUNT.fetch_sub(1, Ordering::Relaxed) == 1 {
+            unsafe { NDIlib_destroy() };
+            // Note: We don't reset INIT because NDI might not support re-initialization
+        }
     }
 }
 
@@ -1491,5 +1520,62 @@ mod tests {
         
         // Should be safe to drop
         drop(frame);
+    }
+
+    #[test]
+    fn test_ndi_singleton_initialization() {
+        use std::sync::atomic::Ordering;
+        
+        // Get initial reference count
+        let initial_count = REFCOUNT.load(Ordering::Relaxed);
+        
+        // Create first NDI instance
+        let ndi1 = NDI::new().expect("Failed to create first NDI instance");
+        assert_eq!(REFCOUNT.load(Ordering::Relaxed), initial_count + 1);
+        
+        // Create second NDI instance - should not reinitialize
+        let ndi2 = NDI::new().expect("Failed to create second NDI instance");
+        assert_eq!(REFCOUNT.load(Ordering::Relaxed), initial_count + 2);
+        
+        // Clone an instance
+        let ndi3 = ndi1.clone();
+        assert_eq!(REFCOUNT.load(Ordering::Relaxed), initial_count + 3);
+        
+        // Drop one instance
+        drop(ndi2);
+        assert_eq!(REFCOUNT.load(Ordering::Relaxed), initial_count + 2);
+        
+        // Drop remaining instances
+        drop(ndi1);
+        assert_eq!(REFCOUNT.load(Ordering::Relaxed), initial_count + 1);
+        drop(ndi3);
+        assert_eq!(REFCOUNT.load(Ordering::Relaxed), initial_count);
+    }
+
+    #[test]
+    fn test_ndi_thread_safety() {
+        use std::thread;
+        
+        // Create NDI instances from multiple threads
+        let handles: Vec<_> = (0..5)
+            .map(|i| {
+                thread::spawn(move || {
+                    let ndi = NDI::new().expect(&format!("Failed to create NDI in thread {}", i));
+                    // Use the NDI instance
+                    let _version = NDI::version();
+                    // Clone it a few times
+                    let _clone1 = ndi.clone();
+                    let _clone2 = ndi.clone();
+                    // Let them all drop at the end of the thread
+                })
+            })
+            .collect();
+        
+        // Wait for all threads to complete
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+        
+        // All instances should be cleaned up by now
     }
 }
