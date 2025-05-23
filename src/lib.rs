@@ -172,7 +172,7 @@ impl Drop for Find<'_> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct Source {
     pub name: String,
     pub url_address: Option<String>,
@@ -851,8 +851,9 @@ impl Default for MetadataFrame {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub enum RecvColorFormat {
+    #[default]
     BGRX_BGRA,
     UYVY_BGRA,
     RGBX_RGBA,
@@ -888,11 +889,12 @@ impl From<RecvColorFormat> for NDIlib_recv_color_format_e {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub enum RecvBandwidth {
     MetadataOnly,
     AudioOnly,
     Lowest,
+    #[default]
     Highest,
     Max,
 }
@@ -911,7 +913,7 @@ impl From<RecvBandwidth> for NDIlib_recv_bandwidth_e {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct Receiver {
     pub source_to_connect_to: Source,
     pub color_format: RecvColorFormat,
@@ -920,21 +922,6 @@ pub struct Receiver {
     pub ndi_recv_name: Option<String>,
 }
 
-impl Default for Receiver {
-    fn default() -> Self {
-        Receiver {
-            source_to_connect_to: Source {
-                name: String::new(),
-                url_address: None,
-                ip_address: None,
-            },
-            color_format: RecvColorFormat::BGRX_BGRA,
-            bandwidth: RecvBandwidth::Highest,
-            allow_video_fields: true,
-            ndi_recv_name: None,
-        }
-    }
-}
 
 #[repr(C)]
 pub(crate) struct RawRecvCreateV3 {
@@ -988,6 +975,70 @@ impl Receiver {
             _source: source,
             _name: name,
         })
+    }
+
+    /// Create a builder for configuring a receiver
+    pub fn builder(source: Source) -> ReceiverBuilder {
+        ReceiverBuilder::new(source)
+    }
+}
+
+/// Builder for configuring a Receiver with ergonomic method chaining
+#[derive(Debug, Clone)]
+pub struct ReceiverBuilder {
+    source_to_connect_to: Source,
+    color_format: Option<RecvColorFormat>,
+    bandwidth: Option<RecvBandwidth>,
+    allow_video_fields: Option<bool>,
+    ndi_recv_name: Option<String>,
+}
+
+impl ReceiverBuilder {
+    /// Create a new builder with the specified source
+    pub fn new(source: Source) -> Self {
+        ReceiverBuilder {
+            source_to_connect_to: source,
+            color_format: None,
+            bandwidth: None,
+            allow_video_fields: None,
+            ndi_recv_name: None,
+        }
+    }
+
+    /// Set the color format for received video
+    pub fn color(mut self, fmt: RecvColorFormat) -> Self {
+        self.color_format = Some(fmt);
+        self
+    }
+
+    /// Set the bandwidth mode for the receiver
+    pub fn bandwidth(mut self, bw: RecvBandwidth) -> Self {
+        self.bandwidth = Some(bw);
+        self
+    }
+
+    /// Configure whether to allow video fields
+    pub fn allow_video_fields(mut self, allow: bool) -> Self {
+        self.allow_video_fields = Some(allow);
+        self
+    }
+
+    /// Set the name for this receiver
+    pub fn name<S: Into<String>>(mut self, name: S) -> Self {
+        self.ndi_recv_name = Some(name.into());
+        self
+    }
+
+    /// Build the receiver and create a Recv instance
+    pub fn build(self, ndi: &NDI) -> Result<Recv<'_>, Error> {
+        let receiver = Receiver {
+            source_to_connect_to: self.source_to_connect_to,
+            color_format: self.color_format.unwrap_or(RecvColorFormat::BGRX_BGRA),
+            bandwidth: self.bandwidth.unwrap_or(RecvBandwidth::Highest),
+            allow_video_fields: self.allow_video_fields.unwrap_or(true),
+            ndi_recv_name: self.ndi_recv_name,
+        };
+        Recv::new(ndi, receiver)
     }
 }
 

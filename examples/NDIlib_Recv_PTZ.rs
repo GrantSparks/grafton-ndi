@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use grafton_ndi::{Find, Finder, FrameType, Receiver, Recv, RecvBandwidth, RecvColorFormat, NDI};
+use grafton_ndi::{Find, Finder, FrameType, Receiver, RecvBandwidth, RecvColorFormat, NDI};
 
 fn main() {
     if let Ok(ndi) = NDI::new() {
@@ -24,15 +24,12 @@ fn main() {
 
         // We now have at least one source, so we create a receiver to look at it.
         let source_to_connect_to = sources[0].clone();
-        let receiver = Receiver::new(
-            source_to_connect_to,
-            RecvColorFormat::UYVY_BGRA,
-            RecvBandwidth::Highest,
-            true,
-            Some("Example PTZ Receiver".to_string()),
-        );
-
-        let mut ndi_recv = Recv::new(&ndi, receiver).expect("Failed to create NDI recv instance");
+        let mut ndi_recv = Receiver::builder(source_to_connect_to)
+            .color(RecvColorFormat::UYVY_BGRA)
+            .bandwidth(RecvBandwidth::Highest)
+            .name("My PTZ Receiver")
+            .build(&ndi)
+            .expect("Failed to create NDI recv instance");
 
         // Run for 30 seconds
         let start = Instant::now();

@@ -1,7 +1,7 @@
 use std::fs::File;
 
 use grafton_ndi::{
-    Error, Find, Finder, FrameType, Receiver, Recv, RecvBandwidth, RecvColorFormat, VideoFrame, NDI,
+    Error, Find, Finder, FrameType, Receiver, RecvBandwidth, RecvColorFormat, VideoFrame, NDI,
 };
 
 fn main() -> Result<(), Error> {
@@ -36,14 +36,11 @@ fn main() -> Result<(), Error> {
         println!("Found source: {:?}", source);
 
         // We now have the desired source, so we create a receiver to look at it.
-        let receiver = Receiver::new(
-            source,
-            RecvColorFormat::RGBX_RGBA,
-            RecvBandwidth::Highest,
-            false,
-            None,
-        );
-        let mut ndi_recv = Recv::new(&ndi, receiver)?;
+        let mut ndi_recv = Receiver::builder(source)
+            .color(RecvColorFormat::RGBX_RGBA)
+            .bandwidth(RecvBandwidth::Highest)
+            .allow_video_fields(false)
+            .build(&ndi)?;
 
         // Wait until we have a video frame
         let mut video_frame: Option<VideoFrame> = None;
