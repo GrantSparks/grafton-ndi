@@ -2,6 +2,7 @@
 #![allow(non_camel_case_types)]
 use once_cell::sync::OnceCell;
 use std::{
+    borrow::Cow,
     ffi::{CStr, CString},
     fmt::{self, Display, Formatter},
     os::raw::c_char,
@@ -413,7 +414,7 @@ impl From<NDIlib_video_frame_v2_t__bindgen_ty_1> for LineStrideOrSize {
     }
 }
 
-pub struct VideoFrame {
+pub struct VideoFrame<'a> {
     pub xres: i32,
     pub yres: i32,
     pub fourcc: FourCCVideoType,
@@ -422,13 +423,13 @@ pub struct VideoFrame {
     pub picture_aspect_ratio: f32,
     pub frame_format_type: FrameFormatType,
     pub timecode: i64,
-    pub data: Vec<u8>,
+    pub data: Cow<'a, [u8]>,
     pub line_stride_or_size: LineStrideOrSize,
     pub metadata: Option<CString>,
     pub timestamp: i64,
 }
 
-impl fmt::Debug for VideoFrame {
+impl fmt::Debug for VideoFrame<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VideoFrame")
             .field("xres", &self.xres)
@@ -447,7 +448,7 @@ impl fmt::Debug for VideoFrame {
     }
 }
 
-impl Default for VideoFrame {
+impl Default for VideoFrame<'_> {
     fn default() -> Self {
         VideoFrame::new(
             1920,
@@ -461,7 +462,7 @@ impl Default for VideoFrame {
     }
 }
 
-impl VideoFrame {
+impl<'a> VideoFrame<'a> {
     pub fn new(
         xres: i32,
         yres: i32,
@@ -490,7 +491,7 @@ impl VideoFrame {
             picture_aspect_ratio: aspect_ratio,
             frame_format_type: format,
             timecode: 0,
-            data,
+            data: Cow::Owned(data),
             line_stride_or_size: LineStrideOrSize {
                 line_stride_in_bytes: stride,
             },
@@ -519,12 +520,70 @@ impl VideoFrame {
         }
     }
 
-    /// Creates a `VideoFrame` from a raw NDI video frame.
+    /// Creates a `VideoFrame` from a raw NDI video frame with borrowed data.
     ///
     /// # Safety
     ///
     /// This function assumes the given `NDIlib_video_frame_v2_t` is valid and correctly allocated.
-    pub unsafe fn from_raw(c_frame: &NDIlib_video_frame_v2_t) -> Result<Self, Error> {
+    /// The returned VideoFrame borrows the data, so the caller must ensure the data remains valid
+    /// for the lifetime of the VideoFrame.
+    pub unsafe fn from_raw_borrowed(c_frame: &'a NDIlib_video_frame_v2_t) -> Result<Self, Error> {
+        if c_frame.p_data.is_null() {
+            return Err(Error::InvalidFrame("Video frame has null data pointer".into()));
+        }
+
+        // SAFETY: For union access, we need to determine which field to use
+        // based on the video format. Since we don't have format info here,
+        // we'll use a heuristic: if line_stride would give us a reasonable size,
+        // use it; otherwise use data_size_in_bytes
+        let line_stride = c_frame.__bindgen_anon_1.line_stride_in_bytes;
+        let potential_stride_size = line_stride as usize * c_frame.yres as usize;
+        
+        let data_size = if line_stride > 0 && potential_stride_size > 0 && potential_stride_size < (100 * 1024 * 1024) {
+            // Reasonable size for uncompressed video (< 100MB per frame)
+            potential_stride_size
+        } else {
+            // Use data_size_in_bytes for compressed formats
+            c_frame.__bindgen_anon_1.data_size_in_bytes as usize
+        };
+        
+        if data_size == 0 {
+            return Err(Error::InvalidFrame("Video frame has zero size".into()));
+        }
+
+        let data = std::slice::from_raw_parts(c_frame.p_data, data_size);
+
+        let metadata = if c_frame.p_metadata.is_null() {
+            None
+        } else {
+            Some(CString::from(CStr::from_ptr(c_frame.p_metadata)))
+        };
+
+        Ok(VideoFrame {
+            xres: c_frame.xres,
+            yres: c_frame.yres,
+            fourcc: c_frame.FourCC.into(),
+            frame_rate_n: c_frame.frame_rate_N,
+            frame_rate_d: c_frame.frame_rate_D,
+            picture_aspect_ratio: c_frame.picture_aspect_ratio,
+            frame_format_type: c_frame.frame_format_type.into(),
+            timecode: c_frame.timecode,
+            data: Cow::Borrowed(data),
+            line_stride_or_size: LineStrideOrSize {
+                data_size_in_bytes: data_size as i32,
+            },
+            metadata,
+            timestamp: c_frame.timestamp,
+        })
+    }
+
+    /// Creates a `VideoFrame` from a raw NDI video frame with owned data.
+    ///
+    /// # Safety
+    ///
+    /// This function assumes the given `NDIlib_video_frame_v2_t` is valid and correctly allocated.
+    /// This method copies the data, so the VideoFrame owns its data and can outlive the source.
+    pub unsafe fn from_raw(c_frame: &NDIlib_video_frame_v2_t) -> Result<VideoFrame<'static>, Error> {
         if c_frame.p_data.is_null() {
             return Err(Error::InvalidFrame("Video frame has null data pointer".into()));
         }
@@ -565,7 +624,7 @@ impl VideoFrame {
             picture_aspect_ratio: c_frame.picture_aspect_ratio,
             frame_format_type: c_frame.frame_format_type.into(),
             timecode: c_frame.timecode,
-            data,
+            data: Cow::Owned(data),
             line_stride_or_size: LineStrideOrSize {
                 data_size_in_bytes: data_size as i32,
             },
@@ -578,19 +637,19 @@ impl VideoFrame {
 // Drop implementation removed - CString in metadata field handles its own cleanup
 
 #[derive(Debug)]
-pub struct AudioFrame {
+pub struct AudioFrame<'a> {
     pub sample_rate: i32,
     pub no_channels: i32,
     pub no_samples: i32,
     pub timecode: i64,
     pub fourcc: AudioType,
-    pub data: Vec<u8>,
+    pub data: Cow<'a, [u8]>,
     pub channel_stride_in_bytes: i32,
     pub metadata: Option<CString>,
     pub timestamp: i64,
 }
 
-impl AudioFrame {
+impl AudioFrame<'_> {
     pub fn new() -> Self {
         AudioFrame {
             sample_rate: 0,
@@ -598,7 +657,7 @@ impl AudioFrame {
             no_samples: 0,
             timecode: 0,
             fourcc: AudioType::Max, // TODO: Is this the right default?
-            data: vec![],
+            data: Cow::Owned(vec![]),
             channel_stride_in_bytes: 0,
             metadata: None,
             timestamp: 0,
@@ -625,7 +684,7 @@ impl AudioFrame {
             no_samples,
             timecode,
             fourcc,
-            data,
+            data: Cow::Owned(data),
             channel_stride_in_bytes: no_samples * 4,
             metadata: metadata_cstring,
             timestamp,
@@ -648,7 +707,7 @@ impl AudioFrame {
         }
     }
 
-    pub(crate) fn from_raw(raw: NDIlib_audio_frame_v3_t) -> Result<Self, Error> {
+    pub(crate) fn from_raw(raw: NDIlib_audio_frame_v3_t) -> Result<AudioFrame<'static>, Error> {
         if raw.p_data.is_null() {
             return Err(Error::InvalidFrame("Audio frame has null data pointer".into()));
         }
@@ -692,7 +751,7 @@ impl AudioFrame {
                 NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP => AudioType::FLTP,
                 _ => AudioType::Max,
             },
-            data,
+            data: Cow::Owned(data),
             channel_stride_in_bytes: unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes },
             metadata,
             timestamp: raw.timestamp,
@@ -700,7 +759,7 @@ impl AudioFrame {
     }
 }
 
-impl Default for AudioFrame {
+impl Default for AudioFrame<'_> {
     fn default() -> Self {
         Self::new()
     }
@@ -940,7 +999,8 @@ impl<'a> Recv<'a> {
         }
     }
 
-    pub fn capture(&mut self, timeout_ms: u32) -> Result<FrameType, Error> {
+    /// Capture a frame with owned data (copies the frame data)
+    pub fn capture(&mut self, timeout_ms: u32) -> Result<FrameType<'static>, Error> {
         let mut video_frame = NDIlib_video_frame_v2_t::default();
         let mut audio_frame = NDIlib_audio_frame_v3_t::default();
         let mut metadata_frame = NDIlib_metadata_frame_t::default();
@@ -982,6 +1042,7 @@ impl<'a> Recv<'a> {
             ))),
         }
     }
+
 
     #[allow(dead_code)]
     pub fn free_string(&self, string: &str) {
@@ -1073,9 +1134,9 @@ impl Drop for Recv<'_> {
 }
 
 #[derive(Debug)]
-pub enum FrameType {
-    Video(VideoFrame),
-    Audio(AudioFrame),
+pub enum FrameType<'a> {
+    Video(VideoFrame<'a>),
+    Audio(AudioFrame<'a>),
     Metadata(MetadataFrame),
     None,
     StatusChange,
@@ -1151,19 +1212,19 @@ impl<'a> Send<'a> {
         }
     }
 
-    pub fn send_video(&self, video_frame: &VideoFrame) {
+    pub fn send_video(&self, video_frame: &VideoFrame<'_>) {
         unsafe {
             NDIlib_send_send_video_v2(self.instance, &video_frame.to_raw());
         }
     }
 
-    pub fn send_video_async(&self, video_frame: &VideoFrame) {
+    pub fn send_video_async(&self, video_frame: &VideoFrame<'_>) {
         unsafe {
             NDIlib_send_send_video_async_v2(self.instance, &video_frame.to_raw());
         }
     }
 
-    pub fn send_audio(&self, audio_frame: &AudioFrame) {
+    pub fn send_audio(&self, audio_frame: &AudioFrame<'_>) {
         unsafe {
             NDIlib_send_send_audio_v3(self.instance, &audio_frame.to_raw());
         }
@@ -1177,7 +1238,7 @@ impl<'a> Send<'a> {
         Ok(())
     }
 
-    pub fn capture(&self, timeout_ms: u32) -> Result<FrameType, Error> {
+    pub fn capture(&self, timeout_ms: u32) -> Result<FrameType<'static>, Error> {
         let mut metadata_frame = NDIlib_metadata_frame_t::default();
         let frame_type =
             unsafe { NDIlib_send_capture(self.instance, &mut metadata_frame, timeout_ms) };
