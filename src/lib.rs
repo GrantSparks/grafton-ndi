@@ -180,6 +180,7 @@ pub struct Source {
 }
 
 // This struct holds the CStrings to ensure they live as long as needed
+#[repr(C)]
 pub(crate) struct RawSource {
     _name: CString,
     _url_address: Option<CString>,
@@ -224,6 +225,12 @@ impl Source {
         }
     }
 
+    /// Convert to raw format for FFI use
+    /// 
+    /// # Safety
+    /// 
+    /// The returned RawSource struct uses #[repr(C)] to guarantee C-compatible layout
+    /// for safe FFI interop with the NDI SDK.
     fn to_raw(&self) -> Result<RawSource, Error> {
         let name = CString::new(self.name.clone()).map_err(Error::InvalidCString)?;
         let url_address = self
@@ -929,6 +936,7 @@ impl Default for Receiver {
     }
 }
 
+#[repr(C)]
 pub(crate) struct RawRecvCreateV3 {
     _source: RawSource,
     _name: Option<CString>,
@@ -952,6 +960,12 @@ impl Receiver {
         }
     }
 
+    /// Convert to raw format for FFI use
+    /// 
+    /// # Safety
+    /// 
+    /// The returned RawRecvCreateV3 struct uses #[repr(C)] to guarantee C-compatible layout
+    /// for safe FFI interop with the NDI SDK.
     pub(crate) fn to_raw(&self) -> Result<RawRecvCreateV3, Error> {
         let source = self.source_to_connect_to.to_raw()?;
         let name = self.ndi_recv_name
