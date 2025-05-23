@@ -4,7 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-grafton-ndi provides idiomatic Rust bindings for the NDI 6 SDK (Network Device Interface), a protocol for real-time video/audio streaming over IP networks. The library wraps unsafe C FFI calls in safe Rust interfaces.
+grafton-ndi provides high-performance, idiomatic Rust bindings for the NDI® 6 SDK (Network Device Interface), a protocol for real-time video/audio streaming over IP networks. The library wraps unsafe C FFI calls in safe Rust interfaces.
+
+## Current Version
+
+Version 0.7.0 - Preparing for 1.0.0 release with comprehensive documentation, builder patterns, and API stability.
 
 ## Build Commands
 
@@ -52,13 +56,14 @@ The codebase follows a layered architecture:
 2. **src/ndi_lib.rs**: Auto-generated unsafe FFI bindings (included via `include!` macro).
 
 3. **src/lib.rs**: Safe Rust wrappers around FFI calls. Key types:
-   - `NDI`: Main entry point, manages library initialization
-   - `Find`/`Finder`: Network discovery for NDI sources
-   - `Recv`/`Receiver`: Receive video/audio/metadata
-   - `Send`/`Sender`: Transmit as NDI source
-   - Frame types: `VideoFrame`, `AudioFrame`, `MetadataFrame`
+   - `NDI`: Main entry point, manages library initialization (reference-counted)
+   - `Find`/`Finder`/`FinderBuilder`: Network discovery for NDI sources
+   - `Receiver`/`ReceiverBuilder`: Receive video/audio/metadata
+   - `SendInstance`/`SendOptions`/`SendOptionsBuilder`: Transmit as NDI source
+   - Frame types: `VideoFrame`, `AudioFrame`, `MetadataFrame` (all with builders)
+   - Enums: `FourCCVideoType`, `RecvColorFormat`, `RecvBandwidth`, etc.
 
-4. **src/error.rs**: Custom error types using thiserror.
+4. **src/error.rs**: Custom error types using thiserror with detailed messages.
 
 ## Key Design Patterns
 
@@ -72,3 +77,19 @@ The codebase follows a layered architecture:
 - Tests require NDI SDK runtime
 - Examples serve as integration tests
 - Network tests may require actual NDI sources on the network
+- Run `cargo test` and `cargo clippy` before commits
+- Ensure examples compile with `cargo build --examples`
+
+## Documentation Standards
+
+- All public APIs must have rustdoc comments
+- Include examples in documentation where helpful
+- Document safety considerations for unsafe code
+- Keep README focused on current usage, not migration
+- Migration guides go in `docs/migration/`
+
+## API Stability Goals (1.0.0)
+
+- No breaking changes after 1.0.0 release
+- Builder patterns allow extending APIs without breaks
+- Deprecate rather than remove when possible

@@ -1,49 +1,86 @@
-use std::fs::File;
+//! Example: Receiving NDI video and saving frames as PNG images.
+//!
+//! This example demonstrates:
+//! - Finding a specific NDI source by name
+//! - Setting up a receiver with specific color format
+//! - Capturing video frames
+//! - Saving frames as PNG files
+//!
+//! Run with: `cargo run --example NDIlib_Recv_PNG`
 
+use std::fs::File;
 use grafton_ndi::{
     Error, Find, Finder, Receiver, RecvBandwidth, RecvColorFormat, VideoFrame, NDI,
 };
 
 fn main() -> Result<(), Error> {
-    // Initialize the NDI library and ensure it's properly cleaned up
-    if let Ok(ndi) = NDI::new() {
-        // Create an NDI finder to locate sources on the network
-        let finder = Finder::builder()
-            .show_local_sources(false)
-            .extra_ips("192.168.0.110")
-            .build();
-        let ndi_find = Find::new(&ndi, finder)?;
+    println!("NDI Video Capture to PNG Example");
+    println!("=================================\n");
+    
+    // Initialize the NDI runtime
+    let ndi = NDI::new()?;
+    println!("NDI initialized successfully\n");
+    
+    // Configure the finder to search for sources
+    // We exclude local sources and add a specific IP to search
+    let finder = Finder::builder()
+        .show_local_sources(false)
+        .extra_ips("192.168.0.110")
+        .build();
+        
+    let ndi_find = Find::new(&ndi, finder)?;
 
-        // Wait until we find a source named "CAMERA4"
-        let source_name = "CAMERA4";
-        let mut found_source = None;
-
-        while found_source.is_none() {
-            // Wait until the sources on the network have changed
-            println!("Looking for source {}...", source_name);
-            ndi_find.wait_for_sources(5000);
-            let sources = ndi_find.get_sources(5000)?;
-
-            for source in &sources {
-                print!("Found source: {} ", source.name);
+    // Search for a specific source by name
+    let source_name = "CAMERA4";
+    println!("Searching for source: {}\n", source_name);
+    
+    let mut found_source = None;
+    let mut search_attempts = 0;
+    
+    while found_source.is_none() {
+        search_attempts += 1;
+        
+        // Wait for sources to appear or change (timeout: 5 seconds)
+        if search_attempts > 1 {
+            println!("Still searching... (attempt {})", search_attempts);
+        }
+        
+        ndi_find.wait_for_sources(5000);
+        let sources = ndi_find.get_sources(5000)?;
+        
+        // Display all found sources
+        if !sources.is_empty() {
+            println!("Available sources:");
+            for (i, source) in sources.iter().enumerate() {
+                println!("  {}. {}", i + 1, source);
+                
+                // Check if this is the source we're looking for
                 if source.name.contains(source_name) {
                     found_source = Some(source.clone());
+                    println!("\n✓ Target source found!");
                     break;
                 }
             }
+            println!();
+        } else {
+            println!("No sources found yet...");
         }
+    }
 
-        let source = found_source.ok_or_else(|| {
-            Error::InitializationFailed(format!("Failed to find source {}", source_name))
-        })?;
-        println!("Found source: {:?}", source);
-
-        // We now have the desired source, so we create a receiver to look at it.
-        let ndi_recv = Receiver::builder(source)
-            .color(RecvColorFormat::RGBX_RGBA)
-            .bandwidth(RecvBandwidth::Highest)
-            .allow_video_fields(false)
-            .build(&ndi)?;
+    let source = found_source.unwrap();
+    
+    // Create a receiver for the found source
+    println!("Creating receiver for: {}\n", source);
+    
+    let ndi_recv = Receiver::builder(source)
+        .color(RecvColorFormat::RGBX_RGBA)  // Request RGBA format for PNG
+        .bandwidth(RecvBandwidth::Highest)   // Maximum quality
+        .allow_video_fields(false)           // Progressive frames only
+        .name("PNG Capture Example")         // Identify our receiver
+        .build(&ndi)?;
+    
+    println!("Receiver created successfully");
+    println!("Waiting for video frames...\n");
 
         // Wait until we have a video frame
         let video_frame = loop {

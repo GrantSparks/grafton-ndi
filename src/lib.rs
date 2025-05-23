@@ -1,15 +1,73 @@
-//! Rust bindings for the NDI 6 SDK (Network Device Interface)
+//! High-performance Rust bindings for the NDI® 6 SDK (Network Device Interface).
 //!
-//! This crate provides safe, idiomatic Rust bindings for NewTek's NDI SDK,
-//! enabling real-time video/audio streaming over IP networks.
+//! This crate provides safe, idiomatic Rust bindings for the NDI SDK, enabling
+//! real-time, low-latency video/audio streaming over IP networks. NDI is widely
+//! used in broadcast, live production, and video conferencing applications.
 //!
-//! ## Thread Safety
+//! # Quick Start
 //!
-//! `Recv`, `Send` and `Find` are `Send + Sync` because NDI's underlying C API
-//! is documented as thread-safe. These types only hold pointers returned by
-//! the NDI SDK and use `&mut self` for mutations. If you create an `NDI` context
-//! in one thread and move it to another, you must still honour NDI's general
-//! performance advice about minimizing cross-thread operations.
+//! ```no_run
+//! use grafton_ndi::{NDI, Finder, Find};
+//!
+//! # fn main() -> Result<(), grafton_ndi::Error> {
+//! // Initialize the NDI runtime
+//! let ndi = NDI::new()?;
+//!
+//! // Find sources on the network
+//! let finder = Finder::builder().show_local_sources(true).build();
+//! let find = Find::new(&ndi, finder)?;
+//!
+//! // Discover sources
+//! find.wait_for_sources(5000);
+//! let sources = find.get_sources(0)?;
+//!
+//! for source in sources {
+//!     println!("Found: {}", source);
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Core Concepts
+//!
+//! ## Runtime Management
+//!
+//! The [`NDI`] struct manages the NDI runtime lifecycle. It must be created before
+//! any other NDI operations and should be kept alive for the duration of your
+//! application's NDI usage.
+//!
+//! ## Source Discovery
+//!
+//! Use [`Find`] to discover NDI sources on the network. Sources can be filtered
+//! by groups and additional IP addresses can be specified for discovery.
+//!
+//! ## Receiving
+//!
+//! The [`Receiver`] type handles receiving video, audio, and metadata from NDI
+//! sources. It supports various color formats and bandwidth modes.
+//!
+//! ## Sending
+//!
+//! Use [`SendInstance`] to transmit video, audio, and metadata as an NDI source.
+//! Senders can be configured with clock settings and group assignments.
+//!
+//! # Thread Safety
+//!
+//! All primary types ([`Find`], [`Receiver`], [`SendInstance`]) implement `Send + Sync`
+//! as the underlying NDI SDK is thread-safe. However, for optimal performance,
+//! minimize cross-thread operations and maintain thread affinity where possible.
+//!
+//! # Performance
+//!
+//! - **Zero-copy**: Frame data directly references NDI's buffers when possible
+//! - **Bandwidth control**: Multiple quality levels for different use cases
+//! - **Hardware acceleration**: Automatically uses GPU acceleration when available
+//!
+//! # Platform Support
+//!
+//! - **Windows**: Full support, tested on Windows 10/11
+//! - **Linux**: Full support, tested on Ubuntu 20.04+
+//! - **macOS**: Experimental support with limited testing
 
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
@@ -35,12 +93,52 @@ static INIT: AtomicBool = AtomicBool::new(false);
 static INIT_FAILED: AtomicBool = AtomicBool::new(false);
 static REFCOUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Manages the NDI runtime lifecycle.
+///
+/// The `NDI` struct is the entry point for all NDI operations. It ensures the NDI
+/// runtime is properly initialized and cleaned up. Multiple instances can exist
+/// simultaneously - they share the same underlying runtime through reference counting.
+///
+/// # Examples
+///
+/// ```no_run
+/// use grafton_ndi::NDI;
+///
+/// # fn main() -> Result<(), grafton_ndi::Error> {
+/// // Create an NDI instance
+/// let ndi = NDI::new()?;
+///
+/// // The runtime stays alive as long as any NDI instance exists
+/// let ndi2 = ndi.clone(); // Cheap reference-counted clone
+///
+/// // Runtime is automatically cleaned up when all instances are dropped
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct NDI;
 
 impl NDI {
-    /// Acquire an NDI instance, initializing the runtime if necessary.
-    /// Multiple instances can be acquired safely - the runtime will only be initialized once.
+    /// Creates a new NDI instance, initializing the runtime if necessary.
+    ///
+    /// This method is thread-safe and can be called from multiple threads. The first
+    /// call initializes the NDI runtime, subsequent calls increment a reference count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InitializationFailed`] if the NDI runtime cannot be initialized.
+    /// This typically happens when the NDI SDK is not properly installed.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::NDI;
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::acquire()?;
+    /// // Use NDI operations...
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn acquire() -> Result<Self, Error> {
         // 1. Bump the counter immediately.
         let prev = REFCOUNT.fetch_add(1, Ordering::SeqCst);
@@ -82,14 +180,49 @@ impl NDI {
         Ok(NDI)
     }
 
+    /// Creates a new NDI instance.
+    ///
+    /// Alias for [`NDI::acquire()`].
     pub fn new() -> Result<Self, Error> {
         Self::acquire()
     }
 
+    /// Checks if the current CPU is supported by the NDI SDK.
+    ///
+    /// The NDI SDK requires certain CPU features (e.g., SSE4.2 on x86_64).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// if grafton_ndi::NDI::is_supported_cpu() {
+    ///     println!("CPU is supported by NDI");
+    /// } else {
+    ///     eprintln!("CPU lacks required features for NDI");
+    /// }
+    /// ```
     pub fn is_supported_cpu() -> bool {
         unsafe { NDIlib_is_supported_CPU() }
     }
 
+    /// Returns the version string of the NDI runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the version string cannot be retrieved or contains
+    /// invalid UTF-8.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::NDI;
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// match NDI::version() {
+    ///     Ok(version) => println!("NDI version: {}", version),
+    ///     Err(e) => eprintln!("Failed to get version: {}", e),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn version() -> Result<String, Error> {
         unsafe {
             let version_ptr = NDIlib_version();
@@ -103,7 +236,17 @@ impl NDI {
                 .map_err(|e| Error::InvalidUtf8(e.to_string()))
         }
     }
-    /// Returns true if the NDI runtime is currently initialized.
+    /// Checks if the NDI runtime is currently initialized.
+    ///
+    /// This can be useful for diagnostic purposes or conditional initialization.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// if grafton_ndi::NDI::is_running() {
+    ///     println!("NDI runtime is active");
+    /// }
+    /// ```
     pub fn is_running() -> bool {
         INIT.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -127,10 +270,37 @@ impl Drop for NDI {
     }
 }
 
+/// Configuration for NDI source discovery.
+///
+/// Use the builder pattern to create instances with specific settings.
+///
+/// # Examples
+///
+/// ```
+/// use grafton_ndi::Finder;
+///
+/// // Find all sources including local ones
+/// let finder = Finder::builder()
+///     .show_local_sources(true)
+///     .build();
+///
+/// // Find sources in specific groups
+/// let finder = Finder::builder()
+///     .groups("Public,Studio")
+///     .build();
+///
+/// // Find sources on specific network segments
+/// let finder = Finder::builder()
+///     .extra_ips("192.168.1.0/24,10.0.0.0/24")
+///     .build();
+/// ```
 #[derive(Debug, Default)]
 pub struct Finder {
+    /// Whether to include local sources in discovery.
     pub show_local_sources: bool,
+    /// Comma-separated list of groups to search (e.g., "Public,Private").
     pub groups: Option<String>,
+    /// Additional IP addresses or ranges to search.
     pub extra_ips: Option<String>,
 }
 
@@ -151,7 +321,12 @@ pub struct FinderBuilder {
 }
 
 impl FinderBuilder {
-    /// Create a new builder with no fields set
+    /// Creates a new builder with default settings.
+    ///
+    /// Default settings:
+    /// - `show_local_sources`: `true`
+    /// - `groups`: `None` (search all groups)
+    /// - `extra_ips`: `None` (no additional IPs)
     pub fn new() -> Self {
         FinderBuilder {
             show_local_sources: None,
@@ -194,6 +369,30 @@ impl Default for FinderBuilder {
     }
 }
 
+/// Discovers NDI sources on the network.
+///
+/// `Find` provides methods to discover and monitor NDI sources. It maintains
+/// a background thread that continuously updates the list of available sources.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use grafton_ndi::{NDI, Finder, Find};
+/// # fn main() -> Result<(), grafton_ndi::Error> {
+/// let ndi = NDI::new()?;
+/// let finder = Finder::builder().show_local_sources(true).build();
+/// let find = Find::new(&ndi, finder)?;
+///
+/// // Wait for initial discovery
+/// if find.wait_for_sources(5000) {
+///     let sources = find.get_sources(0)?;
+///     for source in sources {
+///         println!("Found: {}", source);
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub struct Find<'a> {
     instance: NDIlib_find_instance_t,
     _groups: Option<CString>,    // Hold ownership of CStrings
@@ -202,6 +401,17 @@ pub struct Find<'a> {
 }
 
 impl<'a> Find<'a> {
+    /// Creates a new source finder with the specified settings.
+    ///
+    /// # Arguments
+    ///
+    /// * `ndi` - The NDI instance (must outlive this `Find`)
+    /// * `settings` - Configuration for source discovery
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the finder cannot be created, typically due to
+    /// invalid settings or network issues.
     pub fn new(_ndi: &'a NDI, settings: Finder) -> Result<Self, Error> {
         let groups_cstr = settings
             .groups
@@ -236,10 +446,66 @@ impl<'a> Find<'a> {
         })
     }
 
+    /// Waits for the source list to change.
+    ///
+    /// This method blocks until the list of discovered sources changes or the
+    /// timeout expires. Use this to efficiently monitor for source changes.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum time to wait in milliseconds (0 = no wait)
+    ///
+    /// # Returns
+    ///
+    /// `true` if the source list changed, `false` if the timeout expired.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, Finder, Find};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let find = Find::new(&ndi, Finder::default())?;
+    /// // Wait up to 5 seconds for changes
+    /// if find.wait_for_sources(5000) {
+    ///     println!("Source list changed!");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn wait_for_sources(&self, timeout: u32) -> bool {
         unsafe { NDIlib_find_wait_for_sources(self.instance, timeout) }
     }
 
+    /// Gets the current list of discovered sources.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Time to wait for sources in milliseconds (0 = immediate)
+    ///
+    /// # Returns
+    ///
+    /// A vector of discovered sources. May be empty if no sources are found.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, Finder, Find};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let find = Find::new(&ndi, Finder::default())?;
+    /// // Get sources immediately
+    /// let sources = find.get_sources(0)?;
+    ///
+    /// // Get sources with 1 second timeout
+    /// let sources = find.get_sources(1000)?;
+    ///
+    /// for source in sources {
+    ///     println!("{} at {}", source.name, source.address);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn get_sources(&self, timeout: u32) -> Result<Vec<Source>, Error> {
         let mut no_sources = 0;
         let sources_ptr =
@@ -280,17 +546,43 @@ unsafe impl std::marker::Send for Find<'_> {}
 /// SDK handles all necessary synchronization internally.
 unsafe impl std::marker::Sync for Find<'_> {}
 
+/// Network address of an NDI source.
+///
+/// NDI sources can be addressed via URL (for NDI HX sources) or IP address
+/// (for standard NDI sources).
 #[derive(Debug, Default, Clone)]
 pub enum SourceAddress {
+    /// No address available.
     #[default]
     None,
+    /// URL address (typically for NDI HX sources).
     Url(String),
+    /// IP address (for standard NDI sources).
     Ip(String),
 }
 
+/// Represents an NDI source discovered on the network.
+///
+/// Sources contain a human-readable name and network address. The name
+/// typically includes the machine name and source name (e.g., "MACHINE (Source)").
+///
+/// # Examples
+///
+/// ```
+/// use grafton_ndi::{Source, SourceAddress};
+///
+/// let source = Source {
+///     name: "LAPTOP (Camera 1)".to_string(),
+///     address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
+/// };
+///
+/// println!("Source: {}", source); // Displays: LAPTOP (Camera 1)@192.168.1.100:5960
+/// ```
 #[derive(Debug, Default, Clone)]
 pub struct Source {
+    /// The NDI source name (e.g., "MACHINE (Source Name)").
     pub name: String,
+    /// The network address for connecting to this source.
     pub address: SourceAddress,
 }
 
@@ -397,19 +689,46 @@ impl Display for Source {
     }
 }
 
+/// Video pixel format identifiers (FourCC codes).
+///
+/// These represent the various pixel formats supported by NDI for video frames.
+/// The most common formats are BGRA/RGBA for full quality and UYVY for bandwidth-efficient streaming.
+///
+/// # Examples
+///
+/// ```
+/// use grafton_ndi::FourCCVideoType;
+///
+/// // For maximum compatibility and quality
+/// let format = FourCCVideoType::BGRA;
+///
+/// // For bandwidth-efficient streaming
+/// let format = FourCCVideoType::UYVY;
+/// ```
 #[derive(Debug, TryFromPrimitive, IntoPrimitive, Clone, Copy)]
 #[repr(u32)]
 pub enum FourCCVideoType {
+    /// YCbCr 4:2:2 format (16 bits per pixel) - bandwidth efficient.
     UYVY = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY,
+    /// YCbCr 4:2:2 with alpha channel (24 bits per pixel).
     UYVA = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVA,
+    /// 16-bit YCbCr 4:2:2 format.
     P216 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_P216,
+    /// 16-bit YCbCr 4:2:2 with alpha.
     PA16 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_PA16,
+    /// Planar YCbCr 4:2:0 format (12 bits per pixel).
     YV12 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_YV12,
+    /// Planar YCbCr 4:2:0 format (12 bits per pixel).
     I420 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_I420,
+    /// Semi-planar YCbCr 4:2:0 format (12 bits per pixel).
     NV12 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NV12,
+    /// Blue-Green-Red-Alpha format (32 bits per pixel) - full quality.
     BGRA = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA,
+    /// Blue-Green-Red with padding (32 bits per pixel).
     BGRX = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRX,
+    /// Red-Green-Blue-Alpha format (32 bits per pixel) - full quality.
     RGBA = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBA,
+    /// Red-Green-Blue with padding (32 bits per pixel).
     RGBX = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBX,
     Max = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_max,
 }

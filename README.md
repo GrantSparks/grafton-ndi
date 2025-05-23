@@ -1,468 +1,273 @@
 # grafton-ndi
 
-Unofficial idiomatic Rust bindings for the [NDI 6 SDK](https://ndi.video/for-developers/ndi-sdk/).
+[![Crates.io](https://img.shields.io/crates/v/grafton-ndi.svg)](https://crates.io/crates/grafton-ndi)
+[![Documentation](https://docs.rs/grafton-ndi/badge.svg)](https://docs.rs/grafton-ndi)
+[![License](https://img.shields.io/crates/l/grafton-ndi.svg)](https://github.com/GrantSparks/grafton-ndi/blob/main/LICENSE)
+[![Minimum Rust Version](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
-## New in 0.7.0
+High-performance, idiomatic Rust bindings for the [NDI® 6 SDK](https://ndi.video/), enabling real-time, low-latency IP video streaming.
 
-### 🏗️ Builder Pattern API & Improved Type Safety
+## Features
 
-1. **Builder Patterns**: All major types now use ergonomic builder patterns for construction, replacing error-prone positional arguments.
+- **Zero-copy frame handling** - Minimal overhead for high-performance video processing
+- **Thread-safe by design** - Safe concurrent access with Rust's ownership model  
+- **Ergonomic API** - Builder patterns and idiomatic Rust interfaces
+- **Comprehensive type safety** - Strongly-typed color formats and frame types
+- **Cross-platform** - Windows, Linux, and macOS support
+- **Battle-tested** - Used in production video streaming applications
 
-2. **Type Renaming**: `Send` → `SendInstance` and `Sender` → `SendOptions` to avoid confusion with `std::marker::Send`.
+## Quick Start
 
-3. **Enhanced Safety Documentation**: All `unsafe impl Send/Sync` blocks now have comprehensive documentation explaining thread-safety guarantees.
-
-### Example: Builder Patterns
 ```rust
-// Video frame with builder
-let frame = VideoFrame::builder()
-    .resolution(1920, 1080)
-    .fourcc(FourCCVideoType::BGRA)
-    .frame_rate(60, 1)
-    .aspect_ratio(16.0 / 9.0)
-    .format(FrameFormatType::Progressive)
-    .build()?;
+use grafton_ndi::{NDI, Finder, Find};
 
-// Send options with validation
-let options = SendOptions::builder("My NDI Source")
+fn main() -> Result<(), grafton_ndi::Error> {
+    // Initialize NDI
+    let ndi = NDI::new()?;
+    
+    // Find sources on the network
+    let finder = Finder::builder().show_local_sources(true).build();
+    let find = Find::new(&ndi, finder)?;
+    
+    // Wait for sources
+    find.wait_for_sources(5000);
+    let sources = find.get_sources(5000)?;
+    
+    for source in sources {
+        println!("Found source: {}", source);
+    }
+    
+    Ok(())
+}
+```
+
+## Installation
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+grafton-ndi = "0.7"
+```
+
+### Prerequisites
+
+1. **NDI SDK**: Download and install the [NDI SDK](https://ndi.video/type/developer/) for your platform.
+   - Windows: Installs to `C:\Program Files\NDI\SDK` by default
+   - Linux: Extract to `/usr/share/NDI SDK for Linux` or set `NDI_SDK_DIR`
+   - macOS: Install and set `NDI_SDK_DIR` environment variable
+
+2. **Rust**: Requires Rust 1.75 or later
+
+3. **Platform Requirements**:
+   - Windows: Visual Studio 2019+ or Build Tools
+   - Linux: GCC/Clang, pkg-config
+   - macOS: Xcode Command Line Tools
+
+## Usage Examples
+
+### Finding NDI Sources
+
+```rust
+use grafton_ndi::{NDI, Finder, Find};
+
+let ndi = NDI::new()?;
+
+// Configure the finder
+let finder = Finder::builder()
+    .show_local_sources(false)
     .groups("Public")
-    .clock_video(true)
-    .clock_audio(true)
-    .build()?; // Validates at least one clock is enabled
+    .extra_ips("192.168.1.100")
+    .build();
 
-// Receiver with fluent configuration
+let find = Find::new(&ndi, finder)?;
+
+// Discover sources
+if find.wait_for_sources(5000) {
+    let sources = find.get_sources(0)?;
+    for source in &sources {
+        println!("Found: {} at {}", source.name, source.address);
+    }
+}
+```
+
+### Receiving Video
+
+```rust
+use grafton_ndi::{NDI, Receiver, RecvColorFormat, RecvBandwidth};
+
+let ndi = NDI::new()?;
+
+// Create receiver
 let recv = Receiver::builder(source)
     .color(RecvColorFormat::RGBX_RGBA)
     .bandwidth(RecvBandwidth::Highest)
     .name("My Receiver")
     .build(&ndi)?;
-```
 
-## Upgrading from 0.6.x to 0.7.0
+// Start receiving
+recv.connect()?;
 
-### Breaking Changes
-
-1. **Type Renames**:
-   ```rust
-   // Before
-   use grafton_ndi::{Send, Sender};
-   let sender = Sender { name: "Test".into(), ... };
-   let send = Send::new(&ndi, sender)?;
-   
-   // After
-   use grafton_ndi::{SendInstance, SendOptions};
-   let options = SendOptions::builder("Test").build()?;
-   let send = SendInstance::new(&ndi, options)?;
-   ```
-
-2. **Constructor Changes** - All types now use builders:
-   ```rust
-   // VideoFrame
-   // Before: VideoFrame::new(1920, 1080, FourCCVideoType::BGRA, 60, 1, 16.0/9.0, FrameFormatType::Progressive)
-   // After:
-   VideoFrame::builder()
-       .resolution(1920, 1080)
-       .fourcc(FourCCVideoType::BGRA)
-       .frame_rate(60, 1)
-       .build()?
-   
-   // AudioFrame  
-   // Before: AudioFrame::with_data(48000, 2, 1024, 0, AudioType::FLTP, data, None, 0)?
-   // After:
-   AudioFrame::builder()
-       .sample_rate(48000)
-       .channels(2)
-       .samples(1024)
-       .format(AudioType::FLTP)
-       .data(data)
-       .build()?
-   
-   // Finder
-   // Before: Finder::new(true, Some("Group"), Some("192.168.1.0/24"))
-   // After:
-   Finder::builder()
-       .show_local_sources(true)
-       .groups("Group")
-       .extra_ips("192.168.1.0/24")
-       .build()
-   ```
-
-3. **SendOptions Validation**: Now enforces that at least one of `clock_video` or `clock_audio` must be true.
-
-## New in 0.6.0
-
-### 🚀 Major Performance & Safety Improvements
-
-1. **Lifetime-bound Frames**: Video and audio frames are now lifetime-bound to their originating `Recv` instance, preventing use-after-free bugs at compile time.
-
-2. **Zero-Copy Async Send**: New `VideoFrameBorrowed` type enables true zero-copy async send operations, eliminating frame cloning overhead.
-
-3. **Concurrent Capture**: New thread-safe capture methods (`capture_video`, `capture_audio`, `capture_metadata`) allow concurrent frame capture from multiple threads without locking.
-
-### Example: Zero-Copy Send
-```rust
-let mut buffer = vec![0u8; 1920 * 1080 * 4];
-let frame = VideoFrameBorrowed::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
-let _token = send.send_video_async(frame); // No copy!
-```
-
-### Example: Concurrent Capture
-```rust
-let recv = Arc::new(recv);
-
-// Video thread
-let recv_video = Arc::clone(&recv);
-thread::spawn(move || {
-    while let Ok(Some(frame)) = recv_video.capture_video(5000) {
-        // Process video frame
+// Capture frames
+match recv.capture(5000)? {
+    Some(CapturedFrame::Video(video)) => {
+        println!("Video: {}x{} @ {}/{} fps", 
+            video.width, video.height,
+            video.frame_rate_n, video.frame_rate_d
+        );
+        // Process video data...
     }
-});
-
-// Audio thread - runs concurrently!
-let recv_audio = Arc::clone(&recv);
-thread::spawn(move || {
-    while let Ok(Some(frame)) = recv_audio.capture_audio(5000) {
-        // Process audio frame
+    Some(CapturedFrame::Audio(audio)) => {
+        println!("Audio: {} channels @ {} Hz", 
+            audio.no_channels, audio.sample_rate
+        );
     }
-});
+    _ => {}
+}
 ```
 
-## Upgrading from 0.5.x to 0.6.0
+### Sending Video
 
-### Breaking Changes
-
-1. **Frame Lifetimes**: Frames are now lifetime-bound to their receiver:
-   ```rust
-   // Before: frames could outlive receiver (unsafe!)
-   let frame: VideoFrame<'static> = recv.capture(timeout)?;
-   
-   // After: frames tied to receiver lifetime (safe!)
-   let frame: VideoFrame<'_> = recv.capture(timeout)?;
-   ```
-
-2. **Async Send API**: Now accepts `VideoFrameBorrowed` for zero-copy:
-   ```rust
-   // Before: accepts reference
-   send.send_video_async(&frame)
-   
-   // After: accepts borrowed frame (can be created from &VideoFrame)
-   send.send_video_async((&frame).into())
-   ```
-
-## Upgrading from 0.4.x to 0.5.0
-
-Version 0.5.0 includes significant improvements for memory safety, ergonomics, and API consistency. While these are breaking changes, the migration is straightforward.
-
-### 🔧 Required Changes
-
-#### 1. Frame Data Access (Zero-Copy Support)
-**Before (0.4.x):**
 ```rust
-let frame: VideoFrame = /* ... */;
-let data: &Vec<u8> = &frame.data;
+use grafton_ndi::{NDI, SendInstance, SendOptions, VideoFrame, FourCCVideoType};
+
+let ndi = NDI::new()?;
+
+// Configure sender
+let options = SendOptions::builder("My NDI Source")
+    .groups("Public")
+    .clock_video(true)
+    .clock_audio(false)
+    .build()?;
+
+let send = SendInstance::new(&ndi, options)?;
+
+// Create and send a frame
+let frame = VideoFrame::builder()
+    .resolution(1920, 1080)
+    .fourcc(FourCCVideoType::BGRA)
+    .frame_rate(60, 1)
+    .aspect_ratio(16.0 / 9.0)
+    .build()?;
+
+// Allocate and fill frame data
+let mut data = vec![0u8; frame.size()];
+// ... fill data with your video content ...
+
+frame.set_data(&data);
+send.send_video(&frame);
 ```
 
-**After (0.5.0):**
+### PTZ Camera Control
+
 ```rust
-let frame: VideoFrame = /* ... */;
-let data: &[u8] = &frame.data; // Now Cow<[u8]> - works with both owned and borrowed data
+use grafton_ndi::{NDI, Receiver};
+
+let recv = Receiver::builder(source).build(&ndi)?;
+recv.connect()?;
+
+// Check PTZ support
+if recv.ptz_is_supported()? {
+    // Control camera
+    recv.ptz_zoom(0.5)?;         // Zoom to 50%
+    recv.ptz_pan_tilt(0.0, 0.25)?; // Pan center, tilt up 25%
+    recv.ptz_auto_focus()?;       // Enable auto-focus
+}
 ```
 
-#### 2. Receiver Creation (New Builder Pattern)
-**Before (0.4.x):**
+## Core Types
+
+### `NDI` - Runtime Management
+The main entry point that manages NDI library initialization and lifecycle.
+
 ```rust
-let receiver = Receiver::new(
-    source,
-    RecvColorFormat::RGBX_RGBA,
-    RecvBandwidth::Highest,
-    false,
-    Some("My Receiver".to_string()),
-);
-let mut ndi_recv = Recv::new(&ndi, receiver)?;
+let ndi = NDI::new()?; // Reference-counted, thread-safe
 ```
 
-**After (0.5.0):**
+### `Find` - Source Discovery
+Discovers NDI sources on the network.
+
 ```rust
-let mut ndi_recv = Receiver::builder(source)
-    .color(RecvColorFormat::RGBX_RGBA)
+let finder = Finder::builder()
+    .show_local_sources(true)
+    .groups("Public,Private")
+    .build();
+let find = Find::new(&ndi, finder)?;
+```
+
+### `Receiver` - Video/Audio Reception
+Receives video, audio, and metadata from NDI sources.
+
+```rust
+let recv = Receiver::builder(source)
+    .color(RecvColorFormat::UYVY_BGRA)
     .bandwidth(RecvBandwidth::Highest)
-    .allow_video_fields(false)
-    .name("My Receiver")
     .build(&ndi)?;
 ```
 
-#### 3. NDI Initialization (Singleton Pattern)
-**Before (0.4.x):**
+### `SendInstance` - Video/Audio Transmission
+Sends video, audio, and metadata as an NDI source.
+
 ```rust
-let ndi = NDI::new()?; // Could panic or fail inconsistently
+let send = SendInstance::new(&ndi, SendOptions::builder("Source Name")
+    .clock_video(true)
+    .build()?)?;
 ```
 
-**After (0.5.0):**
-```rust
-let ndi = NDI::new()?; // Safe singleton pattern - multiple calls return the same instance
-// OR use the more explicit:
-let ndi = NDI::acquire()?;
-```
+### Frame Types
+- `VideoFrame` - Video frame data with resolution, format, and timing
+- `AudioFrame` - Audio samples with channel configuration  
+- `MetadataFrame` - XML metadata for tally, PTZ, and custom data
 
-#### 4. Error Handling (IO Errors)
-**Before (0.4.x):**
-```rust
-let file = File::create(path)
-    .map_err(|e| Error::InitializationFailed(format!("Failed: {}", e)))?;
-```
+## Thread Safety
 
-**After (0.5.0):**
-```rust
-let file = File::create(path)?; // IO errors now bubble up automatically
-```
+All primary types (`Find`, `Receiver`, `SendInstance`) are `Send + Sync` as the underlying NDI SDK is thread-safe. You can safely share instances across threads, though performance is best when keeping instances thread-local.
 
-#### 5. MetadataFrame (Owned Data)
-**Before (0.4.x):**
-```rust
-// MetadataFrame held raw pointers - unsafe!
-let metadata = MetadataFrame { /* raw pointer fields */ };
-```
+## Performance Considerations
 
-**After (0.5.0):**
-```rust
-// MetadataFrame now owns its data - safe!
-let metadata = MetadataFrame::with_data("<metadata>content</metadata>".to_string(), timecode);
-```
-
-#### 6. Runtime Initialization Reset
-Version 0.5.0 now allows the NDI runtime to be safely torn down and re-initialized. The global singleton flag resets when the last `NDI` handle is dropped.
-```rust
-let ndi1 = NDI::new()?;
-// ... use ndi1
-drop(ndi1);                   // destroys runtime
-assert!(!NDI::is_running());  // runtime no longer active
-
-let ndi2 = NDI::acquire()?;   // re-initializes runtime
-assert!(NDI::is_running());   // runtime active again
-```
-
-#### 7. Async Send API
-The async send API has been redesigned with a safer token-based approach to prevent use-after-free errors:
-**Before (0.4.x):**
-```rust
-unsafe { send.send_video_async(&frame); }
-// Developer must manually ensure frame outlives the send operation
-```
-
-**After (0.5.0):**
-```rust
-// Safe token-based API - frame remains valid while token exists
-let _token = send.send_video_async(&frame);
-// Frame is automatically protected from being dropped
-
-// Also available for audio
-let _audio_token = send.send_audio_async(&audio_frame);
-```
-
-#### 8. Frame Creation Error Handling
-**Before (0.4.x):**
-```rust
-let video_frame = VideoFrame::from_raw(raw_frame);
-let audio_frame = AudioFrame::from_raw(raw_frame);
-```
-
-**After (0.5.0):**
-```rust
-let video_frame = VideoFrame::from_raw(raw_frame)?; // Now returns Result
-let audio_frame = AudioFrame::from_raw(raw_frame)?; // Now returns Result
-```
-
-#### 9. Metadata Send Methods Return Results
-**Before (0.4.x):**
-```rust
-send.send_metadata(&metadata);
-send.add_connection_metadata(&metadata);
-```
-
-**After (0.5.0):**
-```rust
-send.send_metadata(&metadata)?; // Now returns Result<(), Error>
-send.add_connection_metadata(&metadata)?; // Now returns Result<(), Error>
-```
-
-#### 10. Removed APIs
-- `Send::free_metadata()` method has been removed (no longer needed with owned data)
-- `VideoFrame::from_raw_borrowed` constructor is now `pub(crate)` to prevent accidental misuse
-
-#### 11. FrameType Lifetime Parameter
-**Before (0.4.x):**
-```rust
-let frame_type: FrameType = recv.capture(timeout);
-```
-
-**After (0.5.0):**
-```rust
-let frame_type: FrameType<'_> = recv.capture(timeout); // Now has lifetime parameter
-```
-
-#### 12. Source Address Changes
-**Before (0.4.x):**
-```rust
-let source = Source {
-    name: "My Source".to_string(),
-    url_address: Some("ndi://192.168.1.100:5960".to_string()),
-    ip_address: Some("192.168.1.100".to_string()),
-};
-```
-
-**After (0.5.0):**
-```rust
-let source = Source {
-    name: "My Source".to_string(),
-    address: SourceAddress::Url("ndi://192.168.1.100:5960".to_string()),
-    // OR
-    // address: SourceAddress::Ip("192.168.1.100".to_string()),
-    // address: SourceAddress::None,
-};
-```
-
-#### 13. PTZ Methods Return Results
-**Before (0.4.x):**
-```rust
-if recv.ptz_recall_preset(3, 1.0) {
-    println!("Preset recalled");
-}
-```
-
-**After (0.5.0):**
-```rust
-if let Err(e) = recv.ptz_recall_preset(3, 1.0) {
-    eprintln!("Failed to recall preset: {}", e);
-}
-// All PTZ methods now return Result<(), Error>
-```
-
-#### 14. Async Send API with Tokens
-**Before (0.4.x):**
-```rust
-unsafe { send.send_video_async(&frame); }
-// Must manually ensure frame outlives send
-```
-
-**After (0.5.0):**
-```rust
-// Safe token-based API
-let _token = send.send_video_async(&frame);
-// Frame automatically remains valid while token exists
-
-// Also available for audio
-let _audio_token = send.send_audio_async(&audio_frame);
-```
-
-### ✨ New Features in 0.5.0
-
-- **Thread Safety**: `Recv`, `Send`, and `Find` are now `Send + Sync`
-- **Zero-Copy Access**: Frame data uses `Cow<[u8]>` for optional zero-copy processing
-- **Builder Patterns**: Ergonomic `.builder()` API for complex structures
-- **Memory Safety**: Eliminated all use-after-free and double-free vulnerabilities
-- **Better Error Handling**: Automatic IO error bubbling with `thiserror`
-- **FFI Safety**: All FFI structs use `#[repr(C)]` for guaranteed layout
-- **New Error Types**: Added `Error::InvalidFrame` and `Error::PtzCommandFailed` for better error handling
-- **Default Implementations**: `RecvColorFormat` and `RecvBandwidth` now have sensible defaults
-- **Safer Async Send**: New token-based API for async send operations prevents use-after-free
-- **Improved Source Management**: New `SourceAddress` enum provides type-safe address handling
-- **Better PTZ Error Handling**: All PTZ methods now return `Result` for proper error propagation
-- **Robust Initialization**: Improved NDI runtime initialization with better failure tracking
-
-### 🔍 Migration Checklist for 0.6.0
-
-- [ ] Update `Cargo.toml` to version `0.6.0`
-- [ ] Replace `capture(&mut self)` with type-specific methods for concurrent access
-- [ ] Update async send calls to use `VideoFrameBorrowed` for zero-copy
-- [ ] Add lifetime annotations to frame types where stored
-- [ ] Test concurrent capture if using multiple threads
-
-### 🔍 Migration Checklist for 0.5.0
-
-- [ ] Update `Cargo.toml` to version `0.5.0`
-- [ ] Replace `Receiver::new()` calls with `Receiver::builder()` pattern
-- [ ] Update frame data access to work with `&[u8]` instead of `&Vec<u8>`
-- [ ] Add `?` to `VideoFrame::from_raw()` and `AudioFrame::from_raw()` calls
-- [ ] Add `?` to `send_metadata()` and `add_connection_metadata()` calls
-- [ ] Remove any calls to `Send::free_metadata()` (no longer needed)
-- [ ] Update `FrameType` usage to include lifetime parameter
-- [ ] Remove manual IO error wrapping (use `?` operator instead)
-- [ ] Update `Source` structs to use new `SourceAddress` enum instead of separate `url_address`/`ip_address` fields
-- [ ] Add error handling for PTZ methods (they now return `Result` instead of `bool`)
-- [ ] Update async send calls to use the new token-based API if safety is desired
-- [ ] Test thread safety improvements if using across threads
-- [ ] Verify that memory-intensive operations now use less memory (zero-copy)
-
-Most code will continue to work with minimal changes due to Rust's automatic dereferencing and the backward-compatible nature of `Cow<[u8]>`.
-
-## Usage
-
-See our blog article on [how to use the NDI SDK with Rust](https://blog.grafton.ai/configuration-management-for-rust-applications-15b2a0346b80).
-
-## Requirements
-
-This library has been developed and tested on Windows 10, but it should work on other platforms easily enough (please contribute!). You need to have the [NDI 6 SDK](https://ndi.video/for-developers/ndi-sdk/) installed for your platform. After installation, make sure your library path (or system PATH on Windows) includes the NDI library binaries location, (e.g., `%NDI_SDK_DIR%\Bin\x64` for Windows PATH).
-
-You also need to install Rust bindgen [according to the instructions here](https://rust-lang.github.io/rust-bindgen/requirements.html).
-
-## Installation
-
-Add this to your `Cargo.toml`:
-
-```toml
-[dependencies]
-grafton-ndi = "*"
-```
-
-Ensure that you have set up the environment variables correctly for your NDI SDK installation.
+- **Zero-copy**: Frame data directly references NDI's internal buffers when possible
+- **Bandwidth modes**: Use `RecvBandwidth::Lowest` for preview quality
+- **Frame recycling**: Reuse frame allocations in tight loops
+- **Thread affinity**: Keep NDI operations on consistent threads for best performance
 
 ## Examples
 
-Examples inspired by the official NDI 6 SDK examples can be found in the `examples` directory. To run them, you will need to have the NDI SDK installed and in your PATH.
+See the `examples/` directory for complete applications:
 
-To run an example, use the following command:
+- `NDIlib_Find.rs` - Discover NDI sources on the network
+- `NDIlib_Recv_PNG.rs` - Receive video and save as PNG images
+- `NDIlib_Recv_PTZ.rs` - Control PTZ cameras
 
-```sh
+Run examples with:
+```bash
 cargo run --example NDIlib_Find
-cargo run --example concurrent_capture
-cargo run --example zero_copy_send
 ```
 
-### Async Send Example
-Demonstrates the safe token-based asynchronous send API. The token ensures the frame remains valid while NDI is using it.
-```rust,no_run
-use grafton_ndi::{NDI, SendOptions, SendInstance, VideoFrame, VideoFrameBorrowed, FourCCVideoType};
+## Platform Support
 
-fn main() -> Result<(), grafton_ndi::Error> {
-    // Initialize NDI runtime
-    let ndi = NDI::new()?;
-    
-    // Create sender with builder pattern
-    let options = SendOptions::builder("MySend")
-        .clock_video(true)
-        .clock_audio(true)
-        .build()?;
-    let send = SendInstance::new(&ndi, options)?;
-    
-    // Create a video frame using builder
-    let frame = VideoFrame::builder()
-        .resolution(1920, 1080)
-        .fourcc(FourCCVideoType::BGRA)
-        .frame_rate(60, 1)
-        .build()?;
-    
-    // Safe async send: token keeps frame alive
-    let _token = send.send_video_async((&frame).into());
-    // Frame remains valid while token exists
-    // Token is automatically dropped when no longer needed
-    Ok(())
-}
-```  
+| Platform | Status | Notes |
+|----------|--------|-------|
+| Windows | ✅ Fully supported | Tested on Windows 10/11 |
+| Linux | ✅ Fully supported | Tested on Ubuntu 20.04+ |
+| macOS | ⚠️ Experimental | Limited testing |
 
 ## Contributing
 
-Contributions are welcome! Please submit a pull request or open an issue to discuss what you would like to change.
+Contributions are welcome! Please see our [Contributing Guidelines](CONTRIBUTING.md).
 
 ## License
 
-This project is licensed under the Apache License, Version 2.0. See the [LICENSE](LICENSE) file for more details.
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+
+## Disclaimer
+
+This is an unofficial community project and is not affiliated with NewTek or Vizrt.
+
+NDI® is a registered trademark of Vizrt NDI AB. 
+
+## Migration Guides
+
+For upgrading from previous versions:
+- [0.6.x to 0.7.x](docs/migration/0.6-to-0.7.md)
+- [0.5.x to 0.6.x](docs/migration/0.5-to-0.6.md)
+- [0.4.x to 0.5.x](docs/migration/0.4-to-0.5.md)

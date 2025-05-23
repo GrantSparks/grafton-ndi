@@ -2,16 +2,18 @@
 name = "grafton-ndi"
 version = "0.7.0"
 edition = "2021"
+rust-version = "1.75"
 build = "build.rs"
 authors = ["Grant Sparks <grant@grafton.ai>"]
-description = "Unofficial idiomatic Rust bindings for the NDI 6 SDK"
+description = "High-performance Rust bindings for the NDI® 6 SDK - real-time IP video streaming"
 license = "Apache-2.0"
 repository = "https://github.com/GrantSparks/grafton-ndi"
 homepage = "https://www.grafton.ai"
-categories = ["api-bindings"]
-keywords = ["ndi", "video", "audio", "network"]
+documentation = "https://docs.rs/grafton-ndi"
+categories = ["api-bindings", "multimedia::video", "network-programming"]
+keywords = ["ndi", "video", "streaming", "broadcast", "realtime"]
 readme = "README.md"
-exclude = ["target/", ".gitignore", ".github/", "NDI_6_SDK.zip"]
+exclude = ["target/", ".gitignore", ".github/", "NDI_6_SDK.zip", "docs/"]
 
 [dependencies]
 num_enum = "0.7"

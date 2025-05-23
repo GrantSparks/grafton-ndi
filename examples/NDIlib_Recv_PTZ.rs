@@ -1,43 +1,101 @@
-use std::time::{Duration, Instant};
+//! Example: Controlling PTZ (Pan-Tilt-Zoom) cameras via NDI.
+//!
+//! This example demonstrates:
+//! - Discovering NDI sources with PTZ support
+//! - Connecting to a PTZ-enabled source
+//! - Sending PTZ control commands
+//! - Monitoring PTZ status
+//!
+//! PTZ support requires an NDI-enabled camera that supports PTZ commands.
+//!
+//! Run with: `cargo run --example NDIlib_Recv_PTZ`
 
+use std::time::{Duration, Instant};
 use grafton_ndi::{Find, Finder, Receiver, RecvBandwidth, RecvColorFormat, NDI};
 
 fn main() {
-    if let Ok(ndi) = NDI::new() {
-        // Create an NDI finder to locate sources on the network
-        let finder = Finder::builder()
-            .show_local_sources(false)
-            .extra_ips("192.168.0.110")
-            .build();
-        let ndi_find = Find::new(&ndi, finder).expect("Failed to create NDI find instance");
-
-        // Wait until there is at least one source on the network
-        let mut sources = vec![];
-        while sources.is_empty() {
-            if ndi_find.wait_for_sources(1000) {
-                sources = ndi_find.get_sources(1000).expect("Failed to get sources");
-            }
-        }
-
-        // We need at least one source
-        if sources.is_empty() {
-            println!("No sources found.");
+    println!("NDI PTZ Camera Control Example");
+    println!("==============================\n");
+    
+    // Initialize NDI
+    let ndi = match NDI::new() {
+        Ok(ndi) => ndi,
+        Err(e) => {
+            eprintln!("Failed to initialize NDI: {}", e);
             return;
         }
+    };
+    
+    // Configure source discovery
+    let finder = Finder::builder()
+        .show_local_sources(false)
+        .extra_ips("192.168.0.110")
+        .build();
+        
+    let ndi_find = Find::new(&ndi, finder).expect("Failed to create NDI find instance");
+    
+    println!("Searching for NDI sources...");
 
-        // We now have at least one source, so we create a receiver to look at it.
-        let source_to_connect_to = sources[0].clone();
-        let ndi_recv = Receiver::builder(source_to_connect_to)
-            .color(RecvColorFormat::UYVY_BGRA)
-            .bandwidth(RecvBandwidth::Highest)
-            .name("My PTZ Receiver")
-            .build(&ndi)
-            .expect("Failed to create NDI recv instance");
+    // Wait for sources to appear
+    let mut sources = vec![];
+    let mut attempts = 0;
+    
+    while sources.is_empty() {
+        attempts += 1;
+        if attempts > 1 {
+            print!(".");
+            use std::io::{stdout, Write};
+            stdout().flush().ok();
+        }
+        
+        if ndi_find.wait_for_sources(1000) {
+            sources = ndi_find.get_sources(0).expect("Failed to get sources");
+        }
+        
+        if attempts > 10 {
+            println!("\nNo sources found after 10 seconds.");
+            return;
+        }
+    }
+    
+    println!("\n\nFound {} source(s):", sources.len());
+    for (i, source) in sources.iter().enumerate() {
+        println!("  {}. {}", i + 1, source);
+    }
 
-        // Run for 30 seconds
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(30) {
-            // Check for metadata changes that might indicate PTZ support
+    // Connect to the first source
+    let source = sources[0].clone();
+    println!("\nConnecting to: {}\n", source);
+    
+    let ndi_recv = Receiver::builder(source)
+        .color(RecvColorFormat::UYVY_BGRA)
+        .bandwidth(RecvBandwidth::Highest)
+        .name("PTZ Control Example")
+        .build(&ndi)
+        .expect("Failed to create receiver");
+    
+    // Check if the source supports PTZ
+    println!("Checking PTZ support...");
+    match ndi_recv.ptz_is_supported() {
+        Ok(true) => println!("✓ PTZ is supported!"),
+        Ok(false) => {
+            println!("✗ PTZ is NOT supported by this source.");
+            println!("  Note: PTZ requires an NDI-enabled camera with PTZ capabilities.");
+            return;
+        }
+        Err(e) => {
+            println!("Failed to check PTZ support: {}", e);
+            return;
+        }
+    }
+    
+    println!("\nDemonstrating PTZ control for 30 seconds...\n");
+    
+    // Run PTZ demonstrations for 30 seconds
+    let start = Instant::now();
+    let mut command_index = 0;
+    
+    while start.elapsed() < Duration::from_secs(30) {
             match ndi_recv.capture_metadata(1000) {
                 Ok(_) => {
                     if ndi_recv.ptz_is_supported() {
