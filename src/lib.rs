@@ -680,7 +680,8 @@ impl AudioFrame {
         let metadata = if raw.p_metadata.is_null() {
             None
         } else {
-            Some(unsafe { CString::from_raw(raw.p_metadata as *mut c_char) })
+            // Copy the string, don't take ownership - SDK will free the original
+            Some(unsafe { CString::from(CStr::from_ptr(raw.p_metadata)) })
         };
 
         Ok(AudioFrame {
@@ -1668,5 +1669,47 @@ mod tests {
         
         // Drop raw_recv - all CStrings should be properly freed
         drop(raw_recv);
+    }
+
+    #[test]
+    fn test_audio_frame_metadata_no_double_free() {
+        // Test that AudioFrame::from_raw correctly copies metadata instead of taking ownership
+        let metadata_str = CString::new("test audio metadata").unwrap();
+        let metadata_ptr = metadata_str.as_ptr();
+        
+        // Allocate data that will persist for the test
+        let mut data = vec![0u8; 1024 * 2 * 4];
+        
+        let raw_frame = NDIlib_audio_frame_v3_t {
+            sample_rate: 48000,
+            no_channels: 2,
+            no_samples: 1024,
+            timecode: 0,
+            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            p_data: data.as_mut_ptr(),
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: 1024 * 4,
+            },
+            p_metadata: metadata_ptr,
+            timestamp: 0,
+        };
+        
+        // from_raw should copy the metadata, not take ownership
+        let frame = AudioFrame::from_raw(raw_frame).expect("Failed to create AudioFrame");
+        
+        // The original metadata should still be valid
+        unsafe {
+            let original_still_valid = CStr::from_ptr(metadata_ptr);
+            assert_eq!(original_still_valid.to_string_lossy(), "test audio metadata");
+        }
+        
+        // The frame should have its own copy
+        assert!(frame.metadata.is_some());
+        assert_eq!(frame.metadata.as_ref().unwrap().to_string_lossy(), "test audio metadata");
+        
+        // Clean up the original metadata
+        drop(metadata_str);
+        
+        // Note: In real NDI usage, NDIlib_recv_free_audio_v3 would free the metadata
     }
 }
