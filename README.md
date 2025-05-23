@@ -2,6 +2,66 @@
 
 Unofficial idiomatic Rust bindings for the [NDI 6 SDK](https://ndi.video/for-developers/ndi-sdk/).
 
+## New in 0.6.0
+
+### 🚀 Major Performance & Safety Improvements
+
+1. **Lifetime-bound Frames**: Video and audio frames are now lifetime-bound to their originating `Recv` instance, preventing use-after-free bugs at compile time.
+
+2. **Zero-Copy Async Send**: New `VideoFrameBorrowed` type enables true zero-copy async send operations, eliminating frame cloning overhead.
+
+3. **Concurrent Capture**: New thread-safe capture methods (`capture_video`, `capture_audio`, `capture_metadata`) allow concurrent frame capture from multiple threads without locking.
+
+### Example: Zero-Copy Send
+```rust
+let mut buffer = vec![0u8; 1920 * 1080 * 4];
+let frame = VideoFrameBorrowed::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
+let _token = send.send_video_async(frame); // No copy!
+```
+
+### Example: Concurrent Capture
+```rust
+let recv = Arc::new(recv);
+
+// Video thread
+let recv_video = Arc::clone(&recv);
+thread::spawn(move || {
+    while let Ok(Some(frame)) = recv_video.capture_video(5000) {
+        // Process video frame
+    }
+});
+
+// Audio thread - runs concurrently!
+let recv_audio = Arc::clone(&recv);
+thread::spawn(move || {
+    while let Ok(Some(frame)) = recv_audio.capture_audio(5000) {
+        // Process audio frame
+    }
+});
+```
+
+## Upgrading from 0.5.x to 0.6.0
+
+### Breaking Changes
+
+1. **Frame Lifetimes**: Frames are now lifetime-bound to their receiver:
+   ```rust
+   // Before: frames could outlive receiver (unsafe!)
+   let frame: VideoFrame<'static> = recv.capture(timeout)?;
+   
+   // After: frames tied to receiver lifetime (safe!)
+   let frame: VideoFrame<'_> = recv.capture(timeout)?;
+   ```
+
+2. **Async Send API**: Now accepts `VideoFrameBorrowed` for zero-copy:
+   ```rust
+   // Before: accepts reference
+   send.send_video_async(&frame)
+   
+   // After: accepts borrowed frame (can be created from &VideoFrame)
+   send.send_video_async((&frame).into())
+   ```
+
 ## Upgrading from 0.4.x to 0.5.0
 
 Version 0.5.0 includes significant improvements for memory safety, ergonomics, and API consistency. While these are breaking changes, the migration is straightforward.
@@ -222,7 +282,15 @@ let _audio_token = send.send_audio_async(&audio_frame);
 - **Better PTZ Error Handling**: All PTZ methods now return `Result` for proper error propagation
 - **Robust Initialization**: Improved NDI runtime initialization with better failure tracking
 
-### 🔍 Migration Checklist
+### 🔍 Migration Checklist for 0.6.0
+
+- [ ] Update `Cargo.toml` to version `0.6.0`
+- [ ] Replace `capture(&mut self)` with type-specific methods for concurrent access
+- [ ] Update async send calls to use `VideoFrameBorrowed` for zero-copy
+- [ ] Add lifetime annotations to frame types where stored
+- [ ] Test concurrent capture if using multiple threads
+
+### 🔍 Migration Checklist for 0.5.0
 
 - [ ] Update `Cargo.toml` to version `0.5.0`
 - [ ] Replace `Receiver::new()` calls with `Receiver::builder()` pattern
@@ -269,6 +337,8 @@ To run an example, use the following command:
 
 ```sh
 cargo run --example NDIlib_Find
+cargo run --example concurrent_capture
+cargo run --example zero_copy_send
 ```
 
 ### Async Send Example

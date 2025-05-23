@@ -416,7 +416,7 @@ impl From<NDIlib_video_frame_v2_t__bindgen_ty_1> for LineStrideOrSize {
     }
 }
 
-pub struct VideoFrame<'a> {
+pub struct VideoFrame<'rx> {
     pub xres: i32,
     pub yres: i32,
     pub fourcc: FourCCVideoType,
@@ -425,13 +425,15 @@ pub struct VideoFrame<'a> {
     pub picture_aspect_ratio: f32,
     pub frame_format_type: FrameFormatType,
     pub timecode: i64,
-    pub data: Cow<'a, [u8]>,
+    pub data: Cow<'rx, [u8]>,
     pub line_stride_or_size: LineStrideOrSize,
     pub metadata: Option<CString>,
     pub timestamp: i64,
+    recv_instance: Option<NDIlib_recv_instance_t>,
+    _origin: std::marker::PhantomData<&'rx Recv<'rx>>,
 }
 
-impl fmt::Debug for VideoFrame<'_> {
+impl<'rx> fmt::Debug for VideoFrame<'rx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VideoFrame")
             .field("xres", &self.xres)
@@ -450,7 +452,7 @@ impl fmt::Debug for VideoFrame<'_> {
     }
 }
 
-impl Default for VideoFrame<'_> {
+impl<'rx> Default for VideoFrame<'rx> {
     fn default() -> Self {
         VideoFrame::new(
             1920,
@@ -464,7 +466,7 @@ impl Default for VideoFrame<'_> {
     }
 }
 
-impl VideoFrame<'_> {
+impl<'rx> VideoFrame<'rx> {
     pub fn new(
         xres: i32,
         yres: i32,
@@ -499,6 +501,8 @@ impl VideoFrame<'_> {
             },
             metadata: None,
             timestamp: 0,
+            recv_instance: None,
+            _origin: std::marker::PhantomData,
         }
     }
 
@@ -530,6 +534,7 @@ impl VideoFrame<'_> {
     /// This method copies the data, so the VideoFrame owns its data and can outlive the source.
     pub unsafe fn from_raw(
         c_frame: &NDIlib_video_frame_v2_t,
+        recv_instance: Option<NDIlib_recv_instance_t>,
     ) -> Result<VideoFrame<'static>, Error> {
         if c_frame.p_data.is_null() {
             return Err(Error::InvalidFrame(
@@ -594,26 +599,43 @@ impl VideoFrame<'_> {
             line_stride_or_size,
             metadata,
             timestamp: c_frame.timestamp,
+            recv_instance,
+            _origin: std::marker::PhantomData,
         })
     }
 }
 
-// Drop implementation removed - CString in metadata field handles its own cleanup
+impl<'rx> Drop for VideoFrame<'rx> {
+    fn drop(&mut self) {
+        // If this frame originated from a Recv instance, free it
+        if let Some(recv_instance) = self.recv_instance {
+            if !self.data.is_empty() {
+                // Create a raw frame for NDI to free
+                let raw_frame = self.to_raw();
+                unsafe {
+                    NDIlib_recv_free_video_v2(recv_instance, &raw_frame);
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
-pub struct AudioFrame<'a> {
+pub struct AudioFrame<'rx> {
     pub sample_rate: i32,
     pub no_channels: i32,
     pub no_samples: i32,
     pub timecode: i64,
     pub fourcc: AudioType,
-    pub data: Cow<'a, [u8]>,
+    pub data: Cow<'rx, [u8]>,
     pub channel_stride_in_bytes: i32,
     pub metadata: Option<CString>,
     pub timestamp: i64,
+    recv_instance: Option<NDIlib_recv_instance_t>,
+    _origin: std::marker::PhantomData<&'rx Recv<'rx>>,
 }
 
-impl AudioFrame<'_> {
+impl<'rx> AudioFrame<'rx> {
     pub fn new() -> Self {
         AudioFrame {
             sample_rate: 0,
@@ -625,6 +647,8 @@ impl AudioFrame<'_> {
             channel_stride_in_bytes: 0,
             metadata: None,
             timestamp: 0,
+            recv_instance: None,
+            _origin: std::marker::PhantomData,
         }
     }
 
@@ -652,6 +676,8 @@ impl AudioFrame<'_> {
             channel_stride_in_bytes: no_samples * 4,
             metadata: metadata_cstring,
             timestamp,
+            recv_instance: None,
+            _origin: std::marker::PhantomData,
         })
     }
 
@@ -671,7 +697,7 @@ impl AudioFrame<'_> {
         }
     }
 
-    pub(crate) fn from_raw(raw: NDIlib_audio_frame_v3_t) -> Result<AudioFrame<'static>, Error> {
+    pub(crate) fn from_raw(raw: NDIlib_audio_frame_v3_t, recv_instance: Option<NDIlib_recv_instance_t>) -> Result<AudioFrame<'static>, Error> {
         if raw.p_data.is_null() {
             return Err(Error::InvalidFrame(
                 "Audio frame has null data pointer".into(),
@@ -730,17 +756,32 @@ impl AudioFrame<'_> {
             channel_stride_in_bytes: unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes },
             metadata,
             timestamp: raw.timestamp,
+            recv_instance,
+            _origin: std::marker::PhantomData,
         })
     }
 }
 
-impl Default for AudioFrame<'_> {
+impl<'rx> Default for AudioFrame<'rx> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-// Drop implementation removed - CString handles its own memory management
+impl<'rx> Drop for AudioFrame<'rx> {
+    fn drop(&mut self) {
+        // If this frame originated from a Recv instance, free it
+        if let Some(recv_instance) = self.recv_instance {
+            if !self.data.is_empty() {
+                // Create a raw frame for NDI to free
+                let raw_frame = self.to_raw();
+                unsafe {
+                    NDIlib_recv_free_audio_v3(recv_instance, &raw_frame);
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug, TryFromPrimitive, IntoPrimitive, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -1015,7 +1056,8 @@ impl<'a> Recv<'a> {
     }
 
     /// Capture a frame with owned data (copies the frame data)
-    pub fn capture(&mut self, timeout_ms: u32) -> Result<FrameType<'static>, Error> {
+    #[deprecated(note = "Use capture_video, capture_audio, or capture_metadata for concurrent access")]
+    pub fn capture(&mut self, timeout_ms: u32) -> Result<FrameType<'_>, Error> {
         let mut video_frame = NDIlib_video_frame_v2_t::default();
         let mut audio_frame = NDIlib_audio_frame_v3_t::default();
         let mut metadata_frame = NDIlib_metadata_frame_t::default();
@@ -1032,13 +1074,13 @@ impl<'a> Recv<'a> {
 
         match frame_type {
             NDIlib_frame_type_e_NDIlib_frame_type_video => {
-                let frame = unsafe { VideoFrame::from_raw(&video_frame) }?;
-                unsafe { NDIlib_recv_free_video_v2(self.instance, &video_frame) };
+                let frame = unsafe { VideoFrame::from_raw(&video_frame, Some(self.instance)) }?;
+                // Note: Drop impl will call NDIlib_recv_free_video_v2 when frame is dropped
                 Ok(FrameType::Video(frame))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_audio => {
-                let frame = AudioFrame::from_raw(audio_frame)?;
-                unsafe { NDIlib_recv_free_audio_v3(self.instance, &audio_frame) };
+                let frame = AudioFrame::from_raw(audio_frame, Some(self.instance))?;
+                // Note: Drop impl will call NDIlib_recv_free_audio_v3 when frame is dropped
                 Ok(FrameType::Audio(frame))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_metadata => {
@@ -1205,6 +1247,91 @@ impl<'a> Recv<'a> {
             Err(Error::PtzCommandFailed("Failed to set PTZ manual exposure v2".into()))
         }
     }
+
+    /// Capture only video frames - safe to call from multiple threads concurrently
+    pub fn capture_video(&self, timeout_ms: u32) -> Result<Option<VideoFrame<'_>>, Error> {
+        let mut video_frame = NDIlib_video_frame_v2_t::default();
+        
+        // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
+        let frame_type = unsafe {
+            NDIlib_recv_capture_v3(
+                self.instance,
+                &mut video_frame,
+                ptr::null_mut(), // no audio
+                ptr::null_mut(), // no metadata
+                timeout_ms,
+            )
+        };
+
+        match frame_type {
+            NDIlib_frame_type_e_NDIlib_frame_type_video => {
+                let frame = unsafe { VideoFrame::from_raw(&video_frame, Some(self.instance)) }?;
+                Ok(Some(frame))
+            }
+            NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(None),
+            NDIlib_frame_type_e_NDIlib_frame_type_error => {
+                Err(Error::CaptureFailed("Received an error frame".into()))
+            }
+            _ => Ok(None), // Other frame types are ignored when capturing video only
+        }
+    }
+
+    /// Capture only audio frames - safe to call from multiple threads concurrently
+    pub fn capture_audio(&self, timeout_ms: u32) -> Result<Option<AudioFrame<'_>>, Error> {
+        let mut audio_frame = NDIlib_audio_frame_v3_t::default();
+        
+        // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
+        let frame_type = unsafe {
+            NDIlib_recv_capture_v3(
+                self.instance,
+                ptr::null_mut(), // no video
+                &mut audio_frame,
+                ptr::null_mut(), // no metadata
+                timeout_ms,
+            )
+        };
+
+        match frame_type {
+            NDIlib_frame_type_e_NDIlib_frame_type_audio => {
+                let frame = AudioFrame::from_raw(audio_frame, Some(self.instance))?;
+                Ok(Some(frame))
+            }
+            NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(None),
+            NDIlib_frame_type_e_NDIlib_frame_type_error => {
+                Err(Error::CaptureFailed("Received an error frame".into()))
+            }
+            _ => Ok(None), // Other frame types are ignored when capturing audio only
+        }
+    }
+
+    /// Capture only metadata frames - safe to call from multiple threads concurrently
+    pub fn capture_metadata(&self, timeout_ms: u32) -> Result<Option<MetadataFrame>, Error> {
+        let mut metadata_frame = NDIlib_metadata_frame_t::default();
+        
+        // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
+        let frame_type = unsafe {
+            NDIlib_recv_capture_v3(
+                self.instance,
+                ptr::null_mut(), // no video
+                ptr::null_mut(), // no audio
+                &mut metadata_frame,
+                timeout_ms,
+            )
+        };
+
+        match frame_type {
+            NDIlib_frame_type_e_NDIlib_frame_type_metadata => {
+                let frame = MetadataFrame::from_raw(&metadata_frame);
+                unsafe { NDIlib_recv_free_metadata(self.instance, &metadata_frame) };
+                Ok(Some(frame))
+            }
+            NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(None),
+            NDIlib_frame_type_e_NDIlib_frame_type_error => {
+                Err(Error::CaptureFailed("Received an error frame".into()))
+            }
+            _ => Ok(None), // Other frame types are ignored when capturing metadata only
+        }
+    }
 }
 
 impl Drop for Recv<'_> {
@@ -1221,9 +1348,9 @@ unsafe impl std::marker::Send for Recv<'_> {}
 unsafe impl std::marker::Sync for Recv<'_> {}
 
 #[derive(Debug)]
-pub enum FrameType<'a> {
-    Video(VideoFrame<'a>),
-    Audio(AudioFrame<'a>),
+pub enum FrameType<'rx> {
+    Video(VideoFrame<'rx>),
+    Audio(AudioFrame<'rx>),
     Metadata(MetadataFrame),
     None,
     StatusChange,
@@ -1259,13 +1386,102 @@ pub struct Send<'a> {
     ndi: std::marker::PhantomData<&'a NDI>,
 }
 
+/// A borrowed video frame that references external pixel data.
+/// Used for zero-copy async send operations.
+pub struct VideoFrameBorrowed<'buf> {
+    pub xres: i32,
+    pub yres: i32,
+    pub fourcc: FourCCVideoType,
+    pub frame_rate_n: i32,
+    pub frame_rate_d: i32,
+    pub picture_aspect_ratio: f32,
+    pub frame_format_type: FrameFormatType,
+    pub timecode: i64,
+    pub data: &'buf [u8],
+    pub line_stride_or_size: LineStrideOrSize,
+    pub metadata: Option<&'buf CStr>,
+    pub timestamp: i64,
+}
+
+impl<'buf> VideoFrameBorrowed<'buf> {
+    /// Create a borrowed frame from a mutable buffer
+    pub fn from_buffer(
+        data: &'buf [u8],
+        xres: i32,
+        yres: i32,
+        fourcc: FourCCVideoType,
+        frame_rate_n: i32,
+        frame_rate_d: i32,
+    ) -> Self {
+        let bpp = match fourcc {
+            FourCCVideoType::BGRA | FourCCVideoType::BGRX | FourCCVideoType::RGBA | FourCCVideoType::RGBX => 32,
+            FourCCVideoType::UYVY | FourCCVideoType::YV12 | FourCCVideoType::I420 | FourCCVideoType::NV12 => 16,
+            FourCCVideoType::UYVA => 32,
+            FourCCVideoType::P216 | FourCCVideoType::PA16 => 32,
+            _ => 32,
+        };
+        let stride = (xres * bpp + 7) / 8;
+        
+        VideoFrameBorrowed {
+            xres,
+            yres,
+            fourcc,
+            frame_rate_n,
+            frame_rate_d,
+            picture_aspect_ratio: 16.0 / 9.0,
+            frame_format_type: FrameFormatType::Progressive,
+            timecode: 0,
+            data,
+            line_stride_or_size: LineStrideOrSize { line_stride_in_bytes: stride },
+            metadata: None,
+            timestamp: 0,
+        }
+    }
+
+    fn to_raw(&self) -> NDIlib_video_frame_v2_t {
+        NDIlib_video_frame_v2_t {
+            xres: self.xres,
+            yres: self.yres,
+            FourCC: self.fourcc.into(),
+            frame_rate_N: self.frame_rate_n,
+            frame_rate_D: self.frame_rate_d,
+            picture_aspect_ratio: self.picture_aspect_ratio,
+            frame_format_type: self.frame_format_type.into(),
+            timecode: self.timecode,
+            p_data: self.data.as_ptr() as *mut u8,
+            __bindgen_anon_1: self.line_stride_or_size.into(),
+            p_metadata: self.metadata.map_or(ptr::null(), |m| m.as_ptr()),
+            timestamp: self.timestamp,
+        }
+    }
+}
+
+impl<'buf> From<&'buf VideoFrame<'_>> for VideoFrameBorrowed<'buf> {
+    fn from(frame: &'buf VideoFrame<'_>) -> Self {
+        VideoFrameBorrowed {
+            xres: frame.xres,
+            yres: frame.yres,
+            fourcc: frame.fourcc,
+            frame_rate_n: frame.frame_rate_n,
+            frame_rate_d: frame.frame_rate_d,
+            picture_aspect_ratio: frame.picture_aspect_ratio,
+            frame_format_type: frame.frame_format_type,
+            timecode: frame.timecode,
+            data: &frame.data,
+            line_stride_or_size: frame.line_stride_or_size,
+            metadata: frame.metadata.as_ref().map(|m| m.as_c_str()),
+            timestamp: frame.timestamp,
+        }
+    }
+}
+
 /// A token that ensures the video frame remains valid while NDI is using it.
 /// The frame will be released when this token is dropped or when the next
 /// send operation occurs.
 #[must_use = "AsyncVideoToken must be held until the next send operation"]
-pub struct AsyncVideoToken<'a, 'b> {
-    _send: &'a Send<'b>,
-    _frame: std::marker::PhantomData<&'a VideoFrame<'a>>,
+pub struct AsyncVideoToken<'send, 'buf> {
+    _send: &'send Send<'send>,
+    _frame: std::marker::PhantomData<&'buf [u8]>,
 }
 
 /// A token that ensures the audio frame remains valid while NDI is using it.
@@ -1331,7 +1547,7 @@ impl<'a> Send<'a> {
     ///
     /// # Example
     /// ```no_run
-    /// # use grafton_ndi::{NDI, Sender, VideoFrame};
+    /// # use grafton_ndi::{NDI, Sender, VideoFrame, VideoFrameBorrowed, FourCCVideoType};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let ndi = NDI::new()?;
     /// let send = grafton_ndi::Send::new(
@@ -1339,15 +1555,21 @@ impl<'a> Send<'a> {
     ///     Sender { name: "MyCam".into(), groups: None, clock_video: true, clock_audio: true }
     /// )?;
     ///
+    /// // Option 1: Use existing VideoFrame (still zero-copy)
     /// let frame = VideoFrame::default();
-    /// let _token = send.send_video_async(&frame);
-    /// // Frame is now being used by NDI - safe as long as token exists
+    /// let _token = send.send_video_async((&frame).into());
+    /// 
+    /// // Option 2: Use borrowed buffer directly (zero-copy, no allocation)
+    /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
+    /// let borrowed_frame = VideoFrameBorrowed::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
+    /// let _token2 = send.send_video_async(borrowed_frame);
+    /// // buffer is now being used by NDI - safe as long as token exists
     /// 
     /// // When token is dropped or next send occurs, frame is released
     /// # Ok(())
     /// # }
     /// ```
-    pub fn send_video_async<'b>(&'b self, video_frame: &'b VideoFrame<'_>) -> AsyncVideoToken<'b, 'a> {
+    pub fn send_video_async<'b>(&'b self, video_frame: VideoFrameBorrowed<'b>) -> AsyncVideoToken<'b, 'b> {
         unsafe {
             NDIlib_send_send_video_async_v2(self.instance, &video_frame.to_raw());
         }
@@ -1520,7 +1742,7 @@ mod tests {
         // The from_raw function should calculate size as line_stride * height
         // Previously it would incorrectly multiply data_size_in_bytes * height
         unsafe {
-            let frame = VideoFrame::from_raw(&c_frame).unwrap();
+            let frame = VideoFrame::from_raw(&c_frame, None).unwrap();
 
             // Expected size is line_stride * height
             let expected_size = (line_stride * test_height) as usize;
@@ -1559,7 +1781,7 @@ mod tests {
         c_frame.yres = 1080;
 
         unsafe {
-            let result = VideoFrame::from_raw(&c_frame);
+            let result = VideoFrame::from_raw(&c_frame, None);
             assert!(result.is_err());
             match result {
                 Err(Error::InvalidFrame(msg)) => {
@@ -1580,7 +1802,7 @@ mod tests {
         c_frame.yres = 1080;
 
         unsafe {
-            let result = VideoFrame::from_raw(&c_frame);
+            let result = VideoFrame::from_raw(&c_frame, None);
             assert!(result.is_err());
             match result {
                 Err(Error::InvalidFrame(msg)) => {
@@ -1991,7 +2213,7 @@ mod tests {
         };
 
         // from_raw should copy the metadata, not take ownership
-        let frame = AudioFrame::from_raw(raw_frame).expect("Failed to create AudioFrame");
+        let frame = AudioFrame::from_raw(raw_frame, None).expect("Failed to create AudioFrame");
 
         // The original metadata should still be valid
         unsafe {

@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use grafton_ndi::{Find, Finder, FrameType, Receiver, RecvBandwidth, RecvColorFormat, NDI};
+use grafton_ndi::{Find, Finder, Receiver, RecvBandwidth, RecvColorFormat, NDI};
 
 fn main() {
     if let Ok(ndi) = NDI::new() {
@@ -24,7 +24,7 @@ fn main() {
 
         // We now have at least one source, so we create a receiver to look at it.
         let source_to_connect_to = sources[0].clone();
-        let mut ndi_recv = Receiver::builder(source_to_connect_to)
+        let ndi_recv = Receiver::builder(source_to_connect_to)
             .color(RecvColorFormat::UYVY_BGRA)
             .bandwidth(RecvBandwidth::Highest)
             .name("My PTZ Receiver")
@@ -34,13 +34,17 @@ fn main() {
         // Run for 30 seconds
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(30) {
-            if let Ok(FrameType::StatusChange) = ndi_recv.capture(1000) {
-                if ndi_recv.ptz_is_supported() {
-                    println!("This source supports PTZ functionality. Moving to preset #3.");
-                    if let Err(e) = ndi_recv.ptz_recall_preset(3, 1.0) {
-                        eprintln!("Failed to recall PTZ preset: {}", e);
+            // Check for metadata changes that might indicate PTZ support
+            match ndi_recv.capture_metadata(1000) {
+                Ok(_) => {
+                    if ndi_recv.ptz_is_supported() {
+                        println!("This source supports PTZ functionality. Moving to preset #3.");
+                        if let Err(e) = ndi_recv.ptz_recall_preset(3, 1.0) {
+                            eprintln!("Failed to recall PTZ preset: {}", e);
+                        }
                     }
                 }
+                Err(e) => eprintln!("Error during capture: {}", e),
             }
         }
 

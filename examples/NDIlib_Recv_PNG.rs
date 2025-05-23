@@ -1,7 +1,7 @@
 use std::fs::File;
 
 use grafton_ndi::{
-    Error, Find, Finder, FrameType, Receiver, RecvBandwidth, RecvColorFormat, VideoFrame, NDI,
+    Error, Find, Finder, Receiver, RecvBandwidth, RecvColorFormat, VideoFrame, NDI,
 };
 
 fn main() -> Result<(), Error> {
@@ -36,32 +36,28 @@ fn main() -> Result<(), Error> {
         println!("Found source: {:?}", source);
 
         // We now have the desired source, so we create a receiver to look at it.
-        let mut ndi_recv = Receiver::builder(source)
+        let ndi_recv = Receiver::builder(source)
             .color(RecvColorFormat::RGBX_RGBA)
             .bandwidth(RecvBandwidth::Highest)
             .allow_video_fields(false)
             .build(&ndi)?;
 
         // Wait until we have a video frame
-        let mut video_frame: Option<VideoFrame> = None;
-        while video_frame.is_none() {
+        let video_frame = loop {
             // Sleep for 5 seconds
             std::thread::sleep(std::time::Duration::from_secs(5));
 
             println!("Waiting for video frame ...");
-            match ndi_recv.capture(60000) {
-                Ok(FrameType::Video(frame)) => {
-                    video_frame = Some(frame);
-                }
-                _ => println!("Failed to capture a video frame or no video frame available."),
+            match ndi_recv.capture_video(60000) {
+                Ok(Some(frame)) => break frame,
+                Ok(None) => println!("No video frame available yet."),
+                Err(e) => eprintln!("Error capturing video frame: {}", e),
             }
-        }
+        };
 
-        if let Some(frame) = video_frame {
-            // Save the frame as a PNG file
-            if let Err(e) = save_frame_as_png(&frame) {
-                eprintln!("Failed to save frame as PNG: {}", e);
-            }
+        // Save the frame as a PNG file
+        if let Err(e) = save_frame_as_png(&video_frame) {
+            eprintln!("Failed to save frame as PNG: {}", e);
         }
 
         // The NDI receiver will be destroyed automatically when it goes out of scope
