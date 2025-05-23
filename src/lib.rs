@@ -42,7 +42,6 @@ impl NDI {
         Ok(NDI)
     }
 
-    /// Alias for acquire() to maintain backward compatibility
     pub fn new() -> Result<Self, Error> {
         Self::acquire()
     }
@@ -734,35 +733,48 @@ impl From<AudioType> for u32 {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MetadataFrame {
-    pub length: i32,
+    pub data: String,  // Owned metadata (typically XML)
     pub timecode: i64,
-    pub p_data: *mut c_char,
 }
 
 impl MetadataFrame {
     pub fn new() -> Self {
         MetadataFrame {
-            length: 0,
+            data: String::new(),
             timecode: 0,
-            p_data: ptr::null_mut(),
         }
     }
 
-    pub(crate) fn to_raw(&self) -> NDIlib_metadata_frame_t {
-        NDIlib_metadata_frame_t {
-            length: self.length,
+    pub fn with_data(data: String, timecode: i64) -> Self {
+        MetadataFrame { data, timecode }
+    }
+
+    /// Convert to raw format for sending
+    pub(crate) fn to_raw(&self) -> Result<(CString, NDIlib_metadata_frame_t), Error> {
+        let c_data = CString::new(self.data.clone()).map_err(Error::InvalidCString)?;
+        let raw = NDIlib_metadata_frame_t {
+            length: c_data.as_bytes().len() as i32,
             timecode: self.timecode,
-            p_data: self.p_data,
-        }
+            p_data: c_data.as_ptr() as *mut c_char,
+        };
+        Ok((c_data, raw))
     }
 
-    pub(crate) fn from_raw(raw: NDIlib_metadata_frame_t) -> Self {
+    /// Create from raw NDI metadata frame (copies the data)
+    pub(crate) fn from_raw(raw: &NDIlib_metadata_frame_t) -> Self {
+        let data = if raw.p_data.is_null() {
+            String::new()
+        } else {
+            unsafe {
+                let c_str = CStr::from_ptr(raw.p_data);
+                c_str.to_string_lossy().into_owned()
+            }
+        };
         MetadataFrame {
-            length: raw.length,
+            data,
             timecode: raw.timecode,
-            p_data: raw.p_data,
         }
     }
 }
@@ -955,13 +967,9 @@ impl<'a> Recv<'a> {
                 Ok(FrameType::Audio(frame))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_metadata => {
-                if metadata_frame.p_data.is_null() {
-                    Err(Error::NullPointer("Metadata frame data is null".into()))
-                } else {
-                    let frame = MetadataFrame::from_raw(metadata_frame);
-                    unsafe { NDIlib_recv_free_metadata(self.instance, &metadata_frame) };
-                    Ok(FrameType::Metadata(frame))
-                }
+                let frame = MetadataFrame::from_raw(&metadata_frame);
+                unsafe { NDIlib_recv_free_metadata(self.instance, &metadata_frame) };
+                Ok(FrameType::Metadata(frame))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(FrameType::None),
             NDIlib_frame_type_e_NDIlib_frame_type_status_change => Ok(FrameType::StatusChange),
@@ -1161,30 +1169,39 @@ impl<'a> Send<'a> {
         }
     }
 
-    pub fn send_metadata(&self, metadata_frame: &MetadataFrame) {
+    pub fn send_metadata(&self, metadata_frame: &MetadataFrame) -> Result<(), Error> {
+        let (_c_data, raw) = metadata_frame.to_raw()?;
         unsafe {
-            NDIlib_send_send_metadata(self.instance, &metadata_frame.to_raw());
+            NDIlib_send_send_metadata(self.instance, &raw);
         }
+        Ok(())
     }
 
     pub fn capture(&self, timeout_ms: u32) -> Result<FrameType, Error> {
-        let metadata_frame = MetadataFrame::new();
+        let mut metadata_frame = NDIlib_metadata_frame_t::default();
         let frame_type =
-            unsafe { NDIlib_send_capture(self.instance, &mut metadata_frame.to_raw(), timeout_ms) };
+            unsafe { NDIlib_send_capture(self.instance, &mut metadata_frame, timeout_ms) };
 
         match frame_type {
-            NDIlib_frame_type_e_NDIlib_frame_type_metadata => Ok(FrameType::Metadata(
-                MetadataFrame::from_raw(metadata_frame.to_raw()),
-            )),
+            NDIlib_frame_type_e_NDIlib_frame_type_metadata => {
+                if metadata_frame.p_data.is_null() {
+                    Err(Error::NullPointer("Metadata frame data is null".into()))
+                } else {
+                    // Copy the metadata before it becomes invalid
+                    let data = unsafe {
+                        CStr::from_ptr(metadata_frame.p_data)
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    let frame = MetadataFrame::with_data(data, metadata_frame.timecode);
+                    Ok(FrameType::Metadata(frame))
+                }
+            }
             _ => Err(Error::CaptureFailed("Failed to capture frame".into())),
         }
     }
 
-    pub fn free_metadata(&self, metadata_frame: &MetadataFrame) {
-        unsafe {
-            NDIlib_send_free_metadata(self.instance, &metadata_frame.to_raw());
-        }
-    }
+    // Note: free_metadata is no longer needed since MetadataFrame owns its data
 
     pub fn get_tally(&self, tally: &mut Tally, timeout_ms: u32) -> bool {
         unsafe { NDIlib_send_get_tally(self.instance, &mut tally.to_raw(), timeout_ms) }
@@ -1198,8 +1215,10 @@ impl<'a> Send<'a> {
         unsafe { NDIlib_send_clear_connection_metadata(self.instance) }
     }
 
-    pub fn add_connection_metadata(&self, metadata_frame: &MetadataFrame) {
-        unsafe { NDIlib_send_add_connection_metadata(self.instance, &metadata_frame.to_raw()) }
+    pub fn add_connection_metadata(&self, metadata_frame: &MetadataFrame) -> Result<(), Error> {
+        let (_c_data, raw) = metadata_frame.to_raw()?;
+        unsafe { NDIlib_send_add_connection_metadata(self.instance, &raw) }
+        Ok(())
     }
 
     pub fn set_failover(&self, source: &Source) -> Result<(), Error> {
@@ -1427,6 +1446,60 @@ mod tests {
     }
 
     #[test]
+    fn test_metadata_frame_owns_data() {
+        // Test that MetadataFrame properly owns its data
+        let metadata = MetadataFrame {
+            data: "<metadata>test content</metadata>".to_string(),
+            timecode: 123456789,
+        };
+        
+        // Clone should create a new owned copy
+        let cloned = metadata.clone();
+        assert_eq!(metadata.data, cloned.data);
+        assert_eq!(metadata.timecode, cloned.timecode);
+        
+        // Test to_raw conversion
+        let (c_data, raw) = metadata.to_raw().unwrap();
+        unsafe {
+            assert!(!raw.p_data.is_null());
+            let raw_str = CStr::from_ptr(raw.p_data);
+            assert_eq!(raw_str.to_string_lossy(), "<metadata>test content</metadata>");
+            assert_eq!(raw.timecode, 123456789);
+        }
+        
+        // c_data keeps the CString alive
+        drop(c_data);
+    }
+
+    #[test]
+    fn test_metadata_frame_from_raw() {
+        // Test with valid data
+        let test_data = CString::new("<metadata>test</metadata>").unwrap();
+        let raw = NDIlib_metadata_frame_t {
+            length: test_data.as_bytes_with_nul().len() as i32,
+            timecode: 123456,
+            p_data: test_data.as_ptr() as *mut c_char,
+        };
+        
+        let frame = MetadataFrame::from_raw(&raw);
+        assert_eq!(frame.data, "<metadata>test</metadata>");
+        assert_eq!(frame.timecode, 123456);
+        
+        // Test with null pointer
+        let null_raw = NDIlib_metadata_frame_t {
+            length: 0,
+            timecode: 789,
+            p_data: ptr::null_mut(),
+        };
+        
+        let null_frame = MetadataFrame::from_raw(&null_raw);
+        assert_eq!(null_frame.data, "");
+        assert_eq!(null_frame.timecode, 789);
+    }
+
+
+
+    #[test]
     fn test_raw_recv_create_v3_memory_management() {
         // Test RawRecvCreateV3 memory management
         let receiver = Receiver::new(
@@ -1517,11 +1590,11 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_frame_null_pointer() {
-        // Test MetadataFrame with null pointer
+    fn test_metadata_frame_empty_data() {
+        // Test MetadataFrame with empty data
         let frame = MetadataFrame::new();
-        assert!(frame.p_data.is_null());
-        assert_eq!(frame.length, 0);
+        assert_eq!(frame.data, "");
+        assert_eq!(frame.timecode, 0);
         
         // MetadataFrame doesn't implement Drop, so it's automatically cleaned up
     }
