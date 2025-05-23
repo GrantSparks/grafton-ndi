@@ -14,7 +14,7 @@
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 use num_enum::{IntoPrimitive, TryFromPrimitive};
-use once_cell::sync::OnceCell;
+use std::sync::atomic::AtomicBool;
 use std::{
     borrow::Cow,
     ffi::{CStr, CString},
@@ -31,7 +31,7 @@ mod ndi_lib;
 use ndi_lib::*;
 
 // Global initialization state and reference count
-static INIT: OnceCell<bool> = OnceCell::new();
+static INIT: AtomicBool = AtomicBool::new(false);
 static REFCOUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
@@ -41,19 +41,28 @@ impl NDI {
     /// Acquire an NDI instance, initializing the runtime if necessary.
     /// Multiple instances can be acquired safely - the runtime will only be initialized once.
     pub fn acquire() -> Result<Self, Error> {
-        // Initialize NDI runtime only once
-        INIT.get_or_try_init(|| {
-            if unsafe { NDIlib_initialize() } {
-                Ok(true)
-            } else {
-                Err(Error::InitializationFailed(
-                    "NDIlib_initialize failed".into(),
-                ))
-            }
-        })?;
+        // 1. Bump the counter immediately.
+        let prev = REFCOUNT.fetch_add(1, Ordering::SeqCst);
 
-        // Increment reference count
-        REFCOUNT.fetch_add(1, Ordering::Relaxed);
+        if prev == 0 {
+            // We are the first handle → initialise the runtime.
+            if !unsafe { NDIlib_initialize() } {
+                // Roll the counter back and bubble the error up.
+                REFCOUNT.fetch_sub(1, Ordering::SeqCst);
+                return Err(Error::InitializationFailed(
+                    "NDIlib_initialize failed".into(),
+                ));
+            }
+            INIT.store(true, Ordering::SeqCst);
+        } else {
+            // Someone else is (or was) doing the initialisation.
+            // Busy-wait until it is done so the caller never sees an
+            // un-initialised runtime while REFCOUNT > 0.
+            while !INIT.load(Ordering::SeqCst) {
+                std::hint::spin_loop();
+            }
+        }
+
         Ok(NDI)
     }
 
@@ -78,22 +87,25 @@ impl NDI {
                 .map_err(|e| Error::InvalidUtf8(e.to_string()))
         }
     }
+    /// Returns true if the NDI runtime is currently initialized.
+    pub fn is_running() -> bool {
+        INIT.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl Clone for NDI {
     fn clone(&self) -> Self {
-        // Increment reference count for the clone
-        REFCOUNT.fetch_add(1, Ordering::Relaxed);
+        REFCOUNT.fetch_add(1, Ordering::SeqCst);
         NDI
     }
 }
 
 impl Drop for NDI {
     fn drop(&mut self) {
-        // Only destroy the runtime when the last reference is dropped
-        if REFCOUNT.fetch_sub(1, Ordering::Relaxed) == 1 {
+        // When the last handle vanishes, shut the runtime down.
+        if REFCOUNT.fetch_sub(1, Ordering::SeqCst) == 1 {
             unsafe { NDIlib_destroy() };
-            // Note: We don't reset INIT because NDI might not support re-initialization
+            INIT.store(false, Ordering::SeqCst);
         }
     }
 }
@@ -420,7 +432,7 @@ impl Default for VideoFrame<'_> {
     }
 }
 
-impl<'a> VideoFrame<'a> {
+impl VideoFrame<'_> {
     pub fn new(
         xres: i32,
         yres: i32,
@@ -476,69 +488,6 @@ impl<'a> VideoFrame<'a> {
             },
             timestamp: self.timestamp,
         }
-    }
-
-    /// Creates a `VideoFrame` from a raw NDI video frame with borrowed data.
-    ///
-    /// # Safety
-    ///
-    /// This function assumes the given `NDIlib_video_frame_v2_t` is valid and correctly allocated.
-    /// The returned VideoFrame borrows the data, so the caller must ensure the data remains valid
-    /// for the lifetime of the VideoFrame.
-    pub unsafe fn from_raw_borrowed(c_frame: &'a NDIlib_video_frame_v2_t) -> Result<Self, Error> {
-        if c_frame.p_data.is_null() {
-            return Err(Error::InvalidFrame(
-                "Video frame has null data pointer".into(),
-            ));
-        }
-
-        // SAFETY: For union access, we need to determine which field to use
-        // based on the video format. Since we don't have format info here,
-        // we'll use a heuristic: if line_stride would give us a reasonable size,
-        // use it; otherwise use data_size_in_bytes
-        let line_stride = c_frame.__bindgen_anon_1.line_stride_in_bytes;
-        let potential_stride_size = line_stride as usize * c_frame.yres as usize;
-
-        let data_size = if line_stride > 0
-            && potential_stride_size > 0
-            && potential_stride_size < (100 * 1024 * 1024)
-        {
-            // Reasonable size for uncompressed video (< 100MB per frame)
-            potential_stride_size
-        } else {
-            // Use data_size_in_bytes for compressed formats
-            c_frame.__bindgen_anon_1.data_size_in_bytes as usize
-        };
-
-        if data_size == 0 {
-            return Err(Error::InvalidFrame("Video frame has zero size".into()));
-        }
-
-        let data = std::slice::from_raw_parts(c_frame.p_data, data_size);
-
-        let metadata = if c_frame.p_metadata.is_null() {
-            None
-        } else {
-            Some(CString::from(CStr::from_ptr(c_frame.p_metadata)))
-        };
-
-        Ok(VideoFrame {
-            xres: c_frame.xres,
-            yres: c_frame.yres,
-            fourcc: FourCCVideoType::try_from(c_frame.FourCC).unwrap_or(FourCCVideoType::Max),
-            frame_rate_n: c_frame.frame_rate_N,
-            frame_rate_d: c_frame.frame_rate_D,
-            picture_aspect_ratio: c_frame.picture_aspect_ratio,
-            frame_format_type: FrameFormatType::try_from(c_frame.frame_format_type)
-                .unwrap_or(FrameFormatType::Max),
-            timecode: c_frame.timecode,
-            data: Cow::Borrowed(data),
-            line_stride_or_size: LineStrideOrSize {
-                data_size_in_bytes: data_size as i32,
-            },
-            metadata,
-            timestamp: c_frame.timestamp,
-        })
     }
 
     /// Creates a `VideoFrame` from a raw NDI video frame with owned data.
@@ -1239,16 +1188,40 @@ impl<'a> Send<'a> {
         }
     }
 
+    /// Send a video frame **synchronously** (NDI copies the buffer).
     pub fn send_video(&self, video_frame: &VideoFrame<'_>) {
         unsafe {
             NDIlib_send_send_video_v2(self.instance, &video_frame.to_raw());
         }
     }
 
-    pub fn send_video_async(&self, video_frame: &VideoFrame<'_>) {
-        unsafe {
-            NDIlib_send_send_video_async_v2(self.instance, &video_frame.to_raw());
-        }
+    /// Send a video frame **asynchronously** (NDI *keeps a pointer*; no copy).
+    ///
+    /// # Safety
+    /// The NDI SDK documentation states that the buffer you pass **must remain valid
+    /// until the next call to any `send_*` function** (sync or async) *or* until the
+    /// `Send` instance is dropped.  
+    /// Breaking this rule is immediate undefined behaviour in the C layer.
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, Sender, VideoFrame};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::new()?;
+    /// let send = grafton_ndi::Send::new(
+    ///     &ndi,
+    ///     Sender { name: "MyCam".into(), groups: None, clock_video: true, clock_audio: true }
+    /// )?;
+    ///
+    /// // allocate the frame somewhere that outlives the next send
+    /// let frame = VideoFrame::default();
+    ///
+    /// unsafe { send.send_video_async(&frame); }
+    /// // do NOT drop or mutate `frame` yet
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub unsafe fn send_video_async(&self, video_frame: &VideoFrame<'_>) {
+        NDIlib_send_send_video_async_v2(self.instance, &video_frame.to_raw());
     }
 
     pub fn send_audio(&self, audio_frame: &AudioFrame<'_>) {
@@ -1698,11 +1671,11 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         // Get initial reference count
-        let initial_count = REFCOUNT.load(Ordering::Relaxed);
+        let initial_count = REFCOUNT.load(Ordering::SeqCst);
 
         // Create first NDI instance
         let ndi1 = NDI::new().expect("Failed to create first NDI instance");
-        let count_after_first = REFCOUNT.load(Ordering::Relaxed);
+        let count_after_first = REFCOUNT.load(Ordering::SeqCst);
         assert!(
             count_after_first > initial_count,
             "Reference count should increase"
@@ -1710,19 +1683,19 @@ mod tests {
 
         // Create second NDI instance - should not reinitialize
         let ndi2 = NDI::new().expect("Failed to create second NDI instance");
-        assert_eq!(REFCOUNT.load(Ordering::Relaxed), count_after_first + 1);
+        assert_eq!(REFCOUNT.load(Ordering::SeqCst), count_after_first + 1);
 
         // Clone an instance
         let ndi3 = ndi1.clone();
-        assert_eq!(REFCOUNT.load(Ordering::Relaxed), count_after_first + 2);
+        assert_eq!(REFCOUNT.load(Ordering::SeqCst), count_after_first + 2);
 
         // Drop one instance
         drop(ndi2);
-        assert_eq!(REFCOUNT.load(Ordering::Relaxed), count_after_first + 1);
+        assert_eq!(REFCOUNT.load(Ordering::SeqCst), count_after_first + 1);
 
         // Drop another instance
         drop(ndi1);
-        let count_after_drop = REFCOUNT.load(Ordering::Relaxed);
+        let count_after_drop = REFCOUNT.load(Ordering::SeqCst);
         assert!(
             count_after_drop < count_after_first + 2,
             "Count should decrease after drop"
@@ -1730,7 +1703,7 @@ mod tests {
 
         // Drop final instance
         drop(ndi3);
-        let final_count = REFCOUNT.load(Ordering::Relaxed);
+        let final_count = REFCOUNT.load(Ordering::SeqCst);
         assert!(
             final_count < count_after_drop,
             "Count should decrease after final drop"

@@ -82,6 +82,71 @@ let metadata = MetadataFrame { /* raw pointer fields */ };
 let metadata = MetadataFrame::with_data("<metadata>content</metadata>".to_string(), timecode);
 ```
 
+#### 6. Runtime Initialization Reset
+Version 0.5.0 now allows the NDI runtime to be safely torn down and re-initialized. The global singleton flag resets when the last `NDI` handle is dropped.
+```rust
+let ndi1 = NDI::new()?;
+// ... use ndi1
+drop(ndi1);                   // destroys runtime
+assert!(!NDI::is_running());  // runtime no longer active
+
+let ndi2 = NDI::acquire()?;   // re-initializes runtime
+assert!(NDI::is_running());   // runtime active again
+```
+
+#### 7. Async Send API
+The old safe `send_video_async` is now deprecated because it could lead to use-after-free if the frame is dropped too soon. You must now choose one:
+  - Use the unsafe, zero-copy variant and ensure the frame outlives the call:
+    ```rust no_run
+    unsafe { send.send_video_async_unchecked(&frame) }
+    ```
+  - Or continue to use the deprecated helper (not recommended):
+    ```rust
+    #[deprecated]
+    send.send_video_async(&frame);
+    ```
+
+#### 8. Frame Creation Error Handling
+**Before (0.4.x):**
+```rust
+let video_frame = VideoFrame::from_raw(raw_frame);
+let audio_frame = AudioFrame::from_raw(raw_frame);
+```
+
+**After (0.5.0):**
+```rust
+let video_frame = VideoFrame::from_raw(raw_frame)?; // Now returns Result
+let audio_frame = AudioFrame::from_raw(raw_frame)?; // Now returns Result
+```
+
+#### 9. Metadata Send Methods Return Results
+**Before (0.4.x):**
+```rust
+send.send_metadata(&metadata);
+send.add_connection_metadata(&metadata);
+```
+
+**After (0.5.0):**
+```rust
+send.send_metadata(&metadata)?; // Now returns Result<(), Error>
+send.add_connection_metadata(&metadata)?; // Now returns Result<(), Error>
+```
+
+#### 10. Removed APIs
+- `Send::free_metadata()` method has been removed (no longer needed with owned data)
+- `VideoFrame::from_raw_borrowed` constructor is now `pub(crate)` to prevent accidental misuse
+
+#### 11. FrameType Lifetime Parameter
+**Before (0.4.x):**
+```rust
+let frame_type: FrameType = recv.capture(timeout);
+```
+
+**After (0.5.0):**
+```rust
+let frame_type: FrameType<'_> = recv.capture(timeout); // Now has lifetime parameter
+```
+
 ### ✨ New Features in 0.5.0
 
 - **Thread Safety**: `Recv`, `Send`, and `Find` are now `Send + Sync`
@@ -90,12 +155,18 @@ let metadata = MetadataFrame::with_data("<metadata>content</metadata>".to_string
 - **Memory Safety**: Eliminated all use-after-free and double-free vulnerabilities
 - **Better Error Handling**: Automatic IO error bubbling with `thiserror`
 - **FFI Safety**: All FFI structs use `#[repr(C)]` for guaranteed layout
+- **New Error Types**: Added `Error::InvalidFrame` for frame validation failures
+- **Default Implementations**: `RecvColorFormat` and `RecvBandwidth` now have sensible defaults
 
 ### 🔍 Migration Checklist
 
 - [ ] Update `Cargo.toml` to version `0.5.0`
 - [ ] Replace `Receiver::new()` calls with `Receiver::builder()` pattern
 - [ ] Update frame data access to work with `&[u8]` instead of `&Vec<u8>`
+- [ ] Add `?` to `VideoFrame::from_raw()` and `AudioFrame::from_raw()` calls
+- [ ] Add `?` to `send_metadata()` and `add_connection_metadata()` calls
+- [ ] Remove any calls to `Send::free_metadata()` (no longer needed)
+- [ ] Update `FrameType` usage to include lifetime parameter
 - [ ] Remove manual IO error wrapping (use `?` operator instead)
 - [ ] Test thread safety improvements if using across threads
 - [ ] Verify that memory-intensive operations now use less memory (zero-copy)
@@ -132,6 +203,27 @@ To run an example, use the following command:
 ```sh
 cargo run --example NDIlib_Find
 ```
+
+### Async Send Example
+Demonstrates the unsafe asynchronous send API. The provided `VideoFrame` must outlive the send call.
+```rust,no_run
+use grafton_ndi::{NDI, Sender, Send, VideoFrame};
+
+fn main() -> Result<(), grafton_ndi::Error> {
+    // Initialize NDI runtime
+    let ndi = NDI::new()?;
+    // Create sender settings and instance
+    let settings = Sender::builder("MySend").build(&ndi)?;
+    let send = Send::new(&ndi, settings)?;
+    // Obtain or generate a video frame
+    let frame: VideoFrame = get_frame();
+    // Unsafe async send: frame must remain alive until next send or sender drop
+    unsafe {
+        send.send_video_async_unchecked(&frame);
+    }
+    Ok(())
+}
+```  
 
 ## Contributing
 
