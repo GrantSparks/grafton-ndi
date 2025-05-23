@@ -1,3 +1,16 @@
+//! Rust bindings for the NDI 6 SDK (Network Device Interface)
+//! 
+//! This crate provides safe, idiomatic Rust bindings for NewTek's NDI SDK,
+//! enabling real-time video/audio streaming over IP networks.
+//! 
+//! ## Thread Safety
+//! 
+//! `Recv`, `Send` and `Find` are `Send + Sync` because NDI's underlying C API
+//! is documented as thread-safe. These types only hold pointers returned by
+//! the NDI SDK and use `&mut self` for mutations. If you create an `NDI` context
+//! in one thread and move it to another, you must still honour NDI's general
+//! performance advice about minimizing cross-thread operations.
+
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 use once_cell::sync::OnceCell;
@@ -171,6 +184,11 @@ impl Drop for Find<'_> {
         unsafe { NDIlib_find_destroy(self.instance) };
     }
 }
+
+// SAFETY: NDI find functions are documented as thread-safe.
+// The Find struct only holds a pointer returned by the NDI SDK and uses &mut self for mutations.
+unsafe impl std::marker::Send for Find<'_> {}
+unsafe impl std::marker::Sync for Find<'_> {}
 
 #[derive(Debug, Default, Clone)]
 pub struct Source {
@@ -1198,6 +1216,11 @@ impl Drop for Recv<'_> {
     }
 }
 
+// SAFETY: NDI recv functions are documented as thread-safe.
+// The Recv struct only holds a pointer returned by the NDI SDK and uses &mut self for mutations.
+unsafe impl std::marker::Send for Recv<'_> {}
+unsafe impl std::marker::Sync for Recv<'_> {}
+
 #[derive(Debug)]
 pub enum FrameType<'a> {
     Video(VideoFrame<'a>),
@@ -1374,6 +1397,11 @@ impl Drop for Send<'_> {
         }
     }
 }
+
+// SAFETY: NDI send functions are documented as thread-safe.
+// The Send struct only holds a pointer returned by the NDI SDK and uses &mut self for mutations.
+unsafe impl std::marker::Send for Send<'_> {}
+unsafe impl std::marker::Sync for Send<'_> {}
 
 #[derive(Debug)]
 pub struct Sender {
