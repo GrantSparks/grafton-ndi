@@ -76,42 +76,33 @@ fn main() {
     
     // Check if the source supports PTZ
     println!("Checking PTZ support...");
-    match ndi_recv.ptz_is_supported() {
-        Ok(true) => println!("✓ PTZ is supported!"),
-        Ok(false) => {
-            println!("✗ PTZ is NOT supported by this source.");
-            println!("  Note: PTZ requires an NDI-enabled camera with PTZ capabilities.");
-            return;
-        }
-        Err(e) => {
-            println!("Failed to check PTZ support: {}", e);
-            return;
-        }
+    if ndi_recv.ptz_is_supported() {
+        println!("✓ PTZ is supported!");
+    } else {
+        println!("✗ PTZ is NOT supported by this source.");
+        println!("  Note: PTZ requires an NDI-enabled camera with PTZ capabilities.");
+        return;
     }
     
     println!("\nDemonstrating PTZ control for 30 seconds...\n");
     
     // Run PTZ demonstrations for 30 seconds
     let start = Instant::now();
-    let mut command_index = 0;
     
     while start.elapsed() < Duration::from_secs(30) {
-            match ndi_recv.capture_metadata(1000) {
-                Ok(_) => {
-                    if ndi_recv.ptz_is_supported() {
-                        println!("This source supports PTZ functionality. Moving to preset #3.");
-                        if let Err(e) = ndi_recv.ptz_recall_preset(3, 1.0) {
-                            eprintln!("Failed to recall PTZ preset: {}", e);
-                        }
+        match ndi_recv.capture_metadata(1000) {
+            Ok(_) => {
+                if ndi_recv.ptz_is_supported() {
+                    println!("This source supports PTZ functionality. Moving to preset #3.");
+                    if let Err(e) = ndi_recv.ptz_recall_preset(3, 1.0) {
+                        eprintln!("Failed to recall PTZ preset: {}", e);
                     }
                 }
-                Err(e) => eprintln!("Error during capture: {}", e),
             }
+            Err(e) => eprintln!("Error during capture: {}", e),
         }
-
-        // The NDI receiver and finder will be destroyed automatically when they go out of scope
-    } else {
-        println!("Cannot run NDI. Most likely because the CPU is not sufficient (see SDK documentation).");
     }
+
+    // The NDI receiver and finder will be destroyed automatically when they go out of scope
     // The Drop trait for NDI will take care of calling NDIlib_destroy()
 }

@@ -501,7 +501,7 @@ impl<'a> Find<'a> {
     /// let sources = find.get_sources(1000)?;
     ///
     /// for source in sources {
-    ///     println!("{} at {}", source.name, source.address);
+    ///     println!("{}", source);
     /// }
     /// # Ok(())
     /// # }

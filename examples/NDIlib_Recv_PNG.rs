@@ -100,11 +100,8 @@ fn main() -> Result<(), Error> {
             eprintln!("Failed to save frame as PNG: {}", e);
         }
 
-        // The NDI receiver will be destroyed automatically when it goes out of scope
-        // The NDI library will be destroyed automatically when `ndi` goes out of scope
-    } else {
-        return Err(Error::InitializationFailed("Failed with error".into()));
-    }
+    // The NDI receiver will be destroyed automatically when it goes out of scope
+    // The NDI library will be destroyed automatically when `ndi` goes out of scope
 
     Ok(())
 }
