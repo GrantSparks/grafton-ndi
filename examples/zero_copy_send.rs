@@ -1,4 +1,4 @@
-use grafton_ndi::{NDI, SendOptions, VideoFrameBorrowed, FourCCVideoType};
+use grafton_ndi::{FourCCVideoType, SendOptions, VideoFrameBorrowed, NDI};
 use std::time::{Duration, Instant};
 
 fn main() -> Result<(), grafton_ndi::Error> {
@@ -19,7 +19,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
     let width = 1920;
     let height = 1080;
     let buffer_size = (width * height * 4) as usize; // BGRA format
-    
+
     let mut buffer1 = vec![0u8; buffer_size];
     let mut buffer2 = vec![0u8; buffer_size];
     let mut current_buffer = 0;
@@ -28,7 +28,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
     let frame_rate = 60.0;
     let frame_duration = Duration::from_secs_f64(1.0 / frame_rate);
     let mut next_frame_time = Instant::now();
-    
+
     println!("Sending video at {}x{} @ {} fps", width, height, frame_rate);
     println!("Press Ctrl+C to stop...");
 
@@ -47,21 +47,15 @@ fn main() -> Result<(), grafton_ndi::Error> {
         generate_test_pattern(buffer, width, height, frame_count);
 
         // Create a borrowed frame that references our buffer
-        let borrowed_frame = VideoFrameBorrowed::from_buffer(
-            buffer,
-            width,
-            height,
-            FourCCVideoType::BGRA,
-            60,
-            1,
-        );
+        let borrowed_frame =
+            VideoFrameBorrowed::from_buffer(buffer, width, height, FourCCVideoType::BGRA, 60, 1);
 
         // Send asynchronously - no copy happens here!
         let token = send.send_video_async(borrowed_frame);
 
         // While NDI is using our buffer, we can switch to the other buffer
         current_buffer = 1 - current_buffer;
-        
+
         // Simulate some work that can happen while NDI is sending
         std::thread::sleep(Duration::from_millis(5));
 
@@ -104,17 +98,17 @@ fn main() -> Result<(), grafton_ndi::Error> {
 fn generate_test_pattern(buffer: &mut [u8], width: i32, height: i32, frame_num: u32) {
     let width = width as usize;
     let height = height as usize;
-    
+
     for y in 0..height {
         for x in 0..width {
             let offset = (y * width + x) * 4;
-            
+
             // Create a moving gradient pattern
             let r = ((x + frame_num as usize) % 256) as u8;
             let g = ((y + frame_num as usize) % 256) as u8;
             let b = ((x + y + frame_num as usize) % 256) as u8;
-            
-            buffer[offset] = b;     // B
+
+            buffer[offset] = b; // B
             buffer[offset + 1] = g; // G
             buffer[offset + 2] = r; // R
             buffer[offset + 3] = 255; // A

@@ -305,7 +305,6 @@ pub struct Finder {
 }
 
 impl Finder {
-
     /// Create a builder for configuring find options
     pub fn builder() -> FinderBuilder {
         FinderBuilder::new()
@@ -532,7 +531,7 @@ impl Drop for Find<'_> {
 }
 
 /// # Safety
-/// 
+///
 /// The NDI SDK documentation states that find operations are thread-safe.
 /// `NDIlib_find_create_v2`, `NDIlib_find_wait_for_sources`, and `NDIlib_find_get_sources`
 /// can be called from multiple threads. The Find struct only holds an opaque pointer
@@ -540,7 +539,7 @@ impl Drop for Find<'_> {
 unsafe impl std::marker::Send for Find<'_> {}
 
 /// # Safety
-/// 
+///
 /// The NDI SDK documentation guarantees thread-safety for find operations.
 /// Multiple threads can safely call methods on a shared Find instance as the
 /// SDK handles all necessary synchronization internally.
@@ -602,7 +601,7 @@ impl Source {
                 .to_string_lossy()
                 .into_owned()
         };
-        
+
         // For unions, we need to determine which field is active.
         // NDI SDK convention: URL addresses are used for NDI HX sources,
         // IP addresses for regular sources. We check URL first as it's
@@ -636,7 +635,7 @@ impl Source {
     /// for safe FFI interop with the NDI SDK.
     fn to_raw(&self) -> Result<RawSource, Error> {
         let name = CString::new(self.name.clone()).map_err(Error::InvalidCString)?;
-        
+
         let (url_address, ip_address, __bindgen_anon_1) = match &self.address {
             SourceAddress::Url(url) => {
                 let url_cstr = CString::new(url.clone()).map_err(Error::InvalidCString)?;
@@ -644,7 +643,9 @@ impl Source {
                 (
                     Some(url_cstr),
                     None,
-                    NDIlib_source_t__bindgen_ty_1 { p_url_address: p_url }
+                    NDIlib_source_t__bindgen_ty_1 {
+                        p_url_address: p_url,
+                    },
                 )
             }
             SourceAddress::Ip(ip) => {
@@ -653,16 +654,16 @@ impl Source {
                 (
                     None,
                     Some(ip_cstr),
-                    NDIlib_source_t__bindgen_ty_1 { p_ip_address: p_ip }
+                    NDIlib_source_t__bindgen_ty_1 { p_ip_address: p_ip },
                 )
             }
-            SourceAddress::None => {
-                (
-                    None,
-                    None,
-                    NDIlib_source_t__bindgen_ty_1 { p_ip_address: ptr::null() }
-                )
-            }
+            SourceAddress::None => (
+                None,
+                None,
+                NDIlib_source_t__bindgen_ty_1 {
+                    p_ip_address: ptr::null(),
+                },
+            ),
         };
 
         let p_ndi_name = name.as_ptr();
@@ -847,7 +848,6 @@ impl Default for VideoFrame<'_> {
 }
 
 impl<'rx> VideoFrame<'rx> {
-
     pub fn to_raw(&self) -> NDIlib_video_frame_v2_t {
         NDIlib_video_frame_v2_t {
             xres: self.xres,
@@ -885,13 +885,13 @@ impl<'rx> VideoFrame<'rx> {
         }
 
         let fourcc = FourCCVideoType::try_from(c_frame.FourCC).unwrap_or(FourCCVideoType::Max);
-        
+
         // Determine data size based on whether we have line_stride or data_size_in_bytes
         // The NDI SDK uses a union here: line_stride_in_bytes for uncompressed formats,
         // data_size_in_bytes for compressed formats.
         let data_size_in_bytes = c_frame.__bindgen_anon_1.data_size_in_bytes;
         let line_stride = c_frame.__bindgen_anon_1.line_stride_in_bytes;
-        
+
         // Since this is a union, we need to determine which field is valid
         // For uncompressed formats, line_stride * height should equal a reasonable frame size
         let potential_stride_size = if line_stride > 0 && c_frame.yres > 0 {
@@ -899,19 +899,29 @@ impl<'rx> VideoFrame<'rx> {
         } else {
             0
         };
-        
-        let (data_size, line_stride_or_size) = if line_stride > 0 && potential_stride_size > 0 
-            && potential_stride_size <= (100 * 1024 * 1024) {
+
+        let (data_size, line_stride_or_size) = if line_stride > 0
+            && potential_stride_size > 0
+            && potential_stride_size <= (100 * 1024 * 1024)
+        {
             // Reasonable size for uncompressed video (< 100MB per frame)
             // Use line stride for calculation
-            (potential_stride_size, LineStrideOrSize { line_stride_in_bytes: line_stride })
+            (
+                potential_stride_size,
+                LineStrideOrSize {
+                    line_stride_in_bytes: line_stride,
+                },
+            )
         } else if data_size_in_bytes > 0 {
             // Use the explicit data size (likely compressed format)
-            (data_size_in_bytes as usize, LineStrideOrSize { data_size_in_bytes })
+            (
+                data_size_in_bytes as usize,
+                LineStrideOrSize { data_size_in_bytes },
+            )
         } else {
             // Neither field is valid - this is an error
             return Err(Error::InvalidFrame(
-                "Video frame has neither valid line_stride_in_bytes nor data_size_in_bytes".into()
+                "Video frame has neither valid line_stride_in_bytes nor data_size_in_bytes".into(),
             ));
         };
 
@@ -1054,12 +1064,20 @@ impl<'rx> VideoFrameBuilder<'rx> {
         let frame_rate_n = self.frame_rate_n.unwrap_or(60);
         let frame_rate_d = self.frame_rate_d.unwrap_or(1);
         let picture_aspect_ratio = self.picture_aspect_ratio.unwrap_or(16.0 / 9.0);
-        let frame_format_type = self.frame_format_type.unwrap_or(FrameFormatType::Progressive);
-        
+        let frame_format_type = self
+            .frame_format_type
+            .unwrap_or(FrameFormatType::Progressive);
+
         // Calculate stride and buffer size
         let bpp = match fourcc {
-            FourCCVideoType::BGRA | FourCCVideoType::BGRX | FourCCVideoType::RGBA | FourCCVideoType::RGBX => 32,
-            FourCCVideoType::UYVY | FourCCVideoType::YV12 | FourCCVideoType::I420 | FourCCVideoType::NV12 => 16,
+            FourCCVideoType::BGRA
+            | FourCCVideoType::BGRX
+            | FourCCVideoType::RGBA
+            | FourCCVideoType::RGBX => 32,
+            FourCCVideoType::UYVY
+            | FourCCVideoType::YV12
+            | FourCCVideoType::I420
+            | FourCCVideoType::NV12 => 16,
             FourCCVideoType::UYVA => 32,
             FourCCVideoType::P216 | FourCCVideoType::PA16 => 32,
             _ => 32,
@@ -1067,7 +1085,7 @@ impl<'rx> VideoFrameBuilder<'rx> {
         let stride = (xres * bpp + 7) / 8;
         let buffer_size: usize = (yres * stride) as usize;
         let data = vec![0u8; buffer_size];
-        
+
         let mut frame = VideoFrame {
             xres,
             yres,
@@ -1087,11 +1105,11 @@ impl<'rx> VideoFrameBuilder<'rx> {
             original_p_data: None,
             _origin: std::marker::PhantomData,
         };
-        
+
         if let Some(meta) = self.metadata {
             frame.metadata = Some(CString::new(meta).map_err(Error::InvalidCString)?);
         }
-        
+
         Ok(frame)
     }
 }
@@ -1105,7 +1123,9 @@ impl Default for VideoFrameBuilder<'_> {
 impl Drop for VideoFrame<'_> {
     fn drop(&mut self) {
         // If this frame originated from a Recv instance and we have the original SDK pointer, free it
-        if let (Some(recv_instance), Some(original_p_data)) = (self.recv_instance, self.original_p_data) {
+        if let (Some(recv_instance), Some(original_p_data)) =
+            (self.recv_instance, self.original_p_data)
+        {
             // Create a raw frame with the original SDK pointer for NDI to free
             let raw_frame = NDIlib_video_frame_v2_t {
                 xres: self.xres,
@@ -1149,7 +1169,6 @@ pub struct AudioFrame<'rx> {
 }
 
 impl<'rx> AudioFrame<'rx> {
-
     pub(crate) fn to_raw(&self) -> NDIlib_audio_frame_v3_t {
         NDIlib_audio_frame_v3_t {
             sample_rate: self.sample_rate,
@@ -1166,7 +1185,10 @@ impl<'rx> AudioFrame<'rx> {
         }
     }
 
-    pub(crate) fn from_raw(raw: NDIlib_audio_frame_v3_t, recv_instance: Option<NDIlib_recv_instance_t>) -> Result<AudioFrame<'static>, Error> {
+    pub(crate) fn from_raw(
+        raw: NDIlib_audio_frame_v3_t,
+        recv_instance: Option<NDIlib_recv_instance_t>,
+    ) -> Result<AudioFrame<'static>, Error> {
         if raw.p_data.is_null() {
             return Err(Error::InvalidFrame(
                 "Audio frame has null data pointer".into(),
@@ -1205,11 +1227,13 @@ impl<'rx> AudioFrame<'rx> {
         // For zero-copy: just borrow the data slice from the SDK
         let (data, original_p_data) = if recv_instance.is_some() {
             // We're receiving - don't copy, just borrow
-            let slice = unsafe { std::slice::from_raw_parts(raw.p_data as *const f32, sample_count) };
+            let slice =
+                unsafe { std::slice::from_raw_parts(raw.p_data as *const f32, sample_count) };
             (Cow::Borrowed(slice), Some(raw.p_data))
         } else {
             // Not from receive - make a copy for ownership
-            let slice = unsafe { std::slice::from_raw_parts(raw.p_data as *const f32, sample_count) };
+            let slice =
+                unsafe { std::slice::from_raw_parts(raw.p_data as *const f32, sample_count) };
             (Cow::Owned(slice.to_vec()), None)
         };
 
@@ -1254,13 +1278,14 @@ impl<'rx> AudioFrame<'rx> {
         if channel >= self.no_channels as usize {
             return None;
         }
-        
+
         let samples_per_channel = self.no_samples as usize;
-        
+
         if self.channel_stride_in_bytes == 0 {
             // Interleaved format: extract samples for the requested channel
             let channels = self.no_channels as usize;
-            let channel_data: Vec<f32> = self.data
+            let channel_data: Vec<f32> = self
+                .data
                 .iter()
                 .skip(channel)
                 .step_by(channels)
@@ -1272,7 +1297,7 @@ impl<'rx> AudioFrame<'rx> {
             let stride_in_samples = self.channel_stride_in_bytes as usize / 4; // f32 = 4 bytes
             let start = channel * stride_in_samples;
             let end = start + samples_per_channel;
-            
+
             if end <= self.data.len() {
                 Some(self.data[start..end].to_vec())
             } else {
@@ -1366,7 +1391,7 @@ impl<'rx> AudioFrameBuilder<'rx> {
         let no_channels = self.no_channels.unwrap_or(2);
         let no_samples = self.no_samples.unwrap_or(1024);
         let fourcc = self.fourcc.unwrap_or(AudioType::FLTP);
-        
+
         let data = if let Some(data) = self.data {
             data
         } else {
@@ -1374,11 +1399,12 @@ impl<'rx> AudioFrameBuilder<'rx> {
             let sample_count = (no_samples * no_channels) as usize;
             vec![0.0f32; sample_count]
         };
-        
-        let metadata_cstring = self.metadata
+
+        let metadata_cstring = self
+            .metadata
             .map(|m| CString::new(m).map_err(Error::InvalidCString))
             .transpose()?;
-            
+
         Ok(AudioFrame {
             sample_rate,
             no_channels,
@@ -1413,7 +1439,9 @@ impl Default for AudioFrame<'_> {
 impl Drop for AudioFrame<'_> {
     fn drop(&mut self) {
         // If this frame originated from a Recv instance and we have the original SDK pointer, free it
-        if let (Some(recv_instance), Some(original_p_data)) = (self.recv_instance, self.original_p_data) {
+        if let (Some(recv_instance), Some(original_p_data)) =
+            (self.recv_instance, self.original_p_data)
+        {
             // Create a raw frame with the original SDK pointer for NDI to free
             let raw_frame = NDIlib_audio_frame_v3_t {
                 sample_rate: self.sample_rate,
@@ -1573,7 +1601,6 @@ pub(crate) struct RawRecvCreateV3 {
 }
 
 impl Receiver {
-
     /// Convert to raw format for FFI use
     ///
     /// # Safety
@@ -1693,7 +1720,9 @@ impl<'a> Recv<'a> {
     }
 
     /// Capture a frame with owned data (copies the frame data)
-    #[deprecated(note = "Use capture_video, capture_audio, or capture_metadata for concurrent access")]
+    #[deprecated(
+        note = "Use capture_video, capture_audio, or capture_metadata for concurrent access"
+    )]
     pub fn capture(&mut self, timeout_ms: u32) -> Result<FrameType<'_>, Error> {
         let mut video_frame = NDIlib_video_frame_v2_t::default();
         let mut audio_frame = NDIlib_audio_frame_v3_t::default();
@@ -1754,7 +1783,7 @@ impl<'a> Recv<'a> {
             Ok(())
         } else {
             Err(Error::PtzCommandFailed(format!(
-                "Failed to recall PTZ preset {} with speed {}", 
+                "Failed to recall PTZ preset {} with speed {}",
                 preset, speed
             )))
         }
@@ -1765,7 +1794,7 @@ impl<'a> Recv<'a> {
             Ok(())
         } else {
             Err(Error::PtzCommandFailed(format!(
-                "Failed to set PTZ zoom to {}", 
+                "Failed to set PTZ zoom to {}",
                 zoom_value
             )))
         }
@@ -1776,7 +1805,7 @@ impl<'a> Recv<'a> {
             Ok(())
         } else {
             Err(Error::PtzCommandFailed(format!(
-                "Failed to set PTZ zoom speed to {}", 
+                "Failed to set PTZ zoom speed to {}",
                 zoom_speed
             )))
         }
@@ -1787,7 +1816,7 @@ impl<'a> Recv<'a> {
             Ok(())
         } else {
             Err(Error::PtzCommandFailed(format!(
-                "Failed to set PTZ pan/tilt to ({}, {})", 
+                "Failed to set PTZ pan/tilt to ({}, {})",
                 pan_value, tilt_value
             )))
         }
@@ -1798,7 +1827,7 @@ impl<'a> Recv<'a> {
             Ok(())
         } else {
             Err(Error::PtzCommandFailed(format!(
-                "Failed to set PTZ pan/tilt speed to ({}, {})", 
+                "Failed to set PTZ pan/tilt speed to ({}, {})",
                 pan_speed, tilt_speed
             )))
         }
@@ -1809,7 +1838,7 @@ impl<'a> Recv<'a> {
             Ok(())
         } else {
             Err(Error::PtzCommandFailed(format!(
-                "Failed to store PTZ preset {}", 
+                "Failed to store PTZ preset {}",
                 preset_no
             )))
         }
@@ -1819,7 +1848,9 @@ impl<'a> Recv<'a> {
         if unsafe { NDIlib_recv_ptz_auto_focus(self.instance) } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed("Failed to enable PTZ auto focus".into()))
+            Err(Error::PtzCommandFailed(
+                "Failed to enable PTZ auto focus".into(),
+            ))
         }
     }
 
@@ -1835,7 +1866,9 @@ impl<'a> Recv<'a> {
         if unsafe { NDIlib_recv_ptz_focus_speed(self.instance, focus_speed) } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed("Failed to set PTZ focus speed".into()))
+            Err(Error::PtzCommandFailed(
+                "Failed to set PTZ focus speed".into(),
+            ))
         }
     }
 
@@ -1843,7 +1876,9 @@ impl<'a> Recv<'a> {
         if unsafe { NDIlib_recv_ptz_white_balance_auto(self.instance) } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed("Failed to set PTZ auto white balance".into()))
+            Err(Error::PtzCommandFailed(
+                "Failed to set PTZ auto white balance".into(),
+            ))
         }
     }
 
@@ -1851,7 +1886,9 @@ impl<'a> Recv<'a> {
         if unsafe { NDIlib_recv_ptz_white_balance_indoor(self.instance) } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed("Failed to set PTZ indoor white balance".into()))
+            Err(Error::PtzCommandFailed(
+                "Failed to set PTZ indoor white balance".into(),
+            ))
         }
     }
 
@@ -1859,7 +1896,9 @@ impl<'a> Recv<'a> {
         if unsafe { NDIlib_recv_ptz_white_balance_outdoor(self.instance) } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed("Failed to set PTZ outdoor white balance".into()))
+            Err(Error::PtzCommandFailed(
+                "Failed to set PTZ outdoor white balance".into(),
+            ))
         }
     }
 
@@ -1867,7 +1906,9 @@ impl<'a> Recv<'a> {
         if unsafe { NDIlib_recv_ptz_white_balance_oneshot(self.instance) } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed("Failed to set PTZ oneshot white balance".into()))
+            Err(Error::PtzCommandFailed(
+                "Failed to set PTZ oneshot white balance".into(),
+            ))
         }
     }
 
@@ -1875,7 +1916,9 @@ impl<'a> Recv<'a> {
         if unsafe { NDIlib_recv_ptz_white_balance_manual(self.instance, red, blue) } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed("Failed to set PTZ manual white balance".into()))
+            Err(Error::PtzCommandFailed(
+                "Failed to set PTZ manual white balance".into(),
+            ))
         }
     }
 
@@ -1883,7 +1926,9 @@ impl<'a> Recv<'a> {
         if unsafe { NDIlib_recv_ptz_exposure_auto(self.instance) } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed("Failed to set PTZ auto exposure".into()))
+            Err(Error::PtzCommandFailed(
+                "Failed to set PTZ auto exposure".into(),
+            ))
         }
     }
 
@@ -1891,22 +1936,31 @@ impl<'a> Recv<'a> {
         if unsafe { NDIlib_recv_ptz_exposure_manual(self.instance, exposure_level) } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed("Failed to set PTZ manual exposure".into()))
+            Err(Error::PtzCommandFailed(
+                "Failed to set PTZ manual exposure".into(),
+            ))
         }
     }
 
-    pub fn ptz_exposure_manual_v2(&self, iris: f32, gain: f32, shutter_speed: f32) -> Result<(), Error> {
+    pub fn ptz_exposure_manual_v2(
+        &self,
+        iris: f32,
+        gain: f32,
+        shutter_speed: f32,
+    ) -> Result<(), Error> {
         if unsafe { NDIlib_recv_ptz_exposure_manual_v2(self.instance, iris, gain, shutter_speed) } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed("Failed to set PTZ manual exposure v2".into()))
+            Err(Error::PtzCommandFailed(
+                "Failed to set PTZ manual exposure v2".into(),
+            ))
         }
     }
 
     /// Capture only video frames - safe to call from multiple threads concurrently
     pub fn capture_video(&self, timeout_ms: u32) -> Result<Option<VideoFrame<'_>>, Error> {
         let mut video_frame = NDIlib_video_frame_v2_t::default();
-        
+
         // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
         let frame_type = unsafe {
             NDIlib_recv_capture_v3(
@@ -1934,7 +1988,7 @@ impl<'a> Recv<'a> {
     /// Capture only audio frames - safe to call from multiple threads concurrently
     pub fn capture_audio(&self, timeout_ms: u32) -> Result<Option<AudioFrame<'_>>, Error> {
         let mut audio_frame = NDIlib_audio_frame_v3_t::default();
-        
+
         // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
         let frame_type = unsafe {
             NDIlib_recv_capture_v3(
@@ -1962,7 +2016,7 @@ impl<'a> Recv<'a> {
     /// Capture only metadata frames - safe to call from multiple threads concurrently
     pub fn capture_metadata(&self, timeout_ms: u32) -> Result<Option<MetadataFrame>, Error> {
         let mut metadata_frame = NDIlib_metadata_frame_t::default();
-        
+
         // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
         let frame_type = unsafe {
             NDIlib_recv_capture_v3(
@@ -1998,7 +2052,7 @@ impl Drop for Recv<'_> {
 }
 
 /// # Safety
-/// 
+///
 /// The NDI 6 SDK documentation explicitly states that recv operations are thread-safe.
 /// `NDIlib_recv_capture_v3` and related functions use internal synchronization.
 /// The Recv struct only holds an opaque pointer returned by the SDK, and the SDK
@@ -2006,7 +2060,7 @@ impl Drop for Recv<'_> {
 unsafe impl std::marker::Send for Recv<'_> {}
 
 /// # Safety
-/// 
+///
 /// The NDI 6 SDK documentation guarantees that `NDIlib_recv_capture_v3` is internally
 /// synchronized and can be called concurrently from multiple threads. This is explicitly
 /// mentioned in the SDK manual's thread safety section. The capture_video, capture_audio,
@@ -2080,14 +2134,20 @@ impl<'buf> VideoFrameBorrowed<'buf> {
         frame_rate_d: i32,
     ) -> Self {
         let bpp = match fourcc {
-            FourCCVideoType::BGRA | FourCCVideoType::BGRX | FourCCVideoType::RGBA | FourCCVideoType::RGBX => 32,
-            FourCCVideoType::UYVY | FourCCVideoType::YV12 | FourCCVideoType::I420 | FourCCVideoType::NV12 => 16,
+            FourCCVideoType::BGRA
+            | FourCCVideoType::BGRX
+            | FourCCVideoType::RGBA
+            | FourCCVideoType::RGBX => 32,
+            FourCCVideoType::UYVY
+            | FourCCVideoType::YV12
+            | FourCCVideoType::I420
+            | FourCCVideoType::NV12 => 16,
             FourCCVideoType::UYVA => 32,
             FourCCVideoType::P216 | FourCCVideoType::PA16 => 32,
             _ => 32,
         };
         let stride = (xres * bpp + 7) / 8;
-        
+
         VideoFrameBorrowed {
             xres,
             yres,
@@ -2098,7 +2158,9 @@ impl<'buf> VideoFrameBorrowed<'buf> {
             frame_format_type: FrameFormatType::Progressive,
             timecode: 0,
             data,
-            line_stride_or_size: LineStrideOrSize { line_stride_in_bytes: stride },
+            line_stride_or_size: LineStrideOrSize {
+                line_stride_in_bytes: stride,
+            },
             metadata: None,
             timestamp: 0,
         }
@@ -2227,18 +2289,21 @@ impl<'a> SendInstance<'a> {
     /// // Option 1: Use existing VideoFrame (still zero-copy)
     /// let frame = VideoFrame::default();
     /// let _token = send.send_video_async((&frame).into());
-    /// 
+    ///
     /// // Option 2: Use borrowed buffer directly (zero-copy, no allocation)
     /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
     /// let borrowed_frame = VideoFrameBorrowed::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
     /// let _token2 = send.send_video_async(borrowed_frame);
     /// // buffer is now being used by NDI - safe as long as token exists
-    /// 
+    ///
     /// // When token is dropped or next send occurs, frame is released
     /// # Ok(())
     /// # }
     /// ```
-    pub fn send_video_async<'b>(&'b self, video_frame: VideoFrameBorrowed<'b>) -> AsyncVideoToken<'b, 'b> {
+    pub fn send_video_async<'b>(
+        &'b self,
+        video_frame: VideoFrameBorrowed<'b>,
+    ) -> AsyncVideoToken<'b, 'b> {
         unsafe {
             NDIlib_send_send_video_async_v2(self.instance, &video_frame.to_raw());
         }
@@ -2253,12 +2318,15 @@ impl<'a> SendInstance<'a> {
             NDIlib_send_send_audio_v3(self.instance, &audio_frame.to_raw());
         }
     }
-    
+
     /// Send an audio frame **asynchronously** (NDI *keeps a pointer*; no copy).
     ///
     /// Returns an `AsyncAudioToken` that must be held until the next send operation.
     /// The frame data is guaranteed to remain valid as long as the token exists.
-    pub fn send_audio_async<'b>(&'b self, audio_frame: &'b AudioFrame<'_>) -> AsyncAudioToken<'b, 'a> {
+    pub fn send_audio_async<'b>(
+        &'b self,
+        audio_frame: &'b AudioFrame<'_>,
+    ) -> AsyncAudioToken<'b, 'a> {
         unsafe {
             NDIlib_send_send_audio_v3(self.instance, &audio_frame.to_raw());
         }
@@ -2349,7 +2417,7 @@ impl Drop for SendInstance<'_> {
 }
 
 /// # Safety
-/// 
+///
 /// The NDI 6 SDK documentation states that send operations are thread-safe.
 /// `NDIlib_send_send_video_v2`, `NDIlib_send_send_audio_v3`, and related functions
 /// use internal synchronization. The SendInstance struct holds an opaque pointer and raw
@@ -2357,7 +2425,7 @@ impl Drop for SendInstance<'_> {
 unsafe impl std::marker::Send for SendInstance<'_> {}
 
 /// # Safety
-/// 
+///
 /// The NDI 6 SDK guarantees thread-safety for send operations. Multiple threads can
 /// safely call send methods concurrently as the SDK handles all necessary synchronization.
 /// The async send operations (send_video_async, send_audio_async) are also thread-safe
@@ -2421,14 +2489,14 @@ impl SendOptionsBuilder {
     pub fn build(self) -> Result<SendOptions, Error> {
         let clock_video = self.clock_video.unwrap_or(true);
         let clock_audio = self.clock_audio.unwrap_or(true);
-        
+
         // Validate that at least one clock is enabled
         if !clock_video && !clock_audio {
             return Err(Error::InvalidConfiguration(
-                "At least one of clock_video or clock_audio must be true".into()
+                "At least one of clock_video or clock_audio must be true".into(),
             ));
         }
-        
+
         Ok(SendOptions {
             name: self.name,
             groups: self.groups,
@@ -2552,7 +2620,9 @@ mod tests {
             assert!(result.is_err());
             match result {
                 Err(Error::InvalidFrame(msg)) => {
-                    assert!(msg.contains("neither valid line_stride_in_bytes nor data_size_in_bytes"));
+                    assert!(
+                        msg.contains("neither valid line_stride_in_bytes nor data_size_in_bytes")
+                    );
                 }
                 _ => panic!("Expected InvalidFrame error"),
             }
@@ -2688,14 +2758,14 @@ mod tests {
         // Create a test buffer
         let test_data = [1u8, 2, 3, 4, 5, 6, 7, 8];
         let data_ptr = test_data.as_ptr() as *mut u8;
-        
+
         let mut c_frame: NDIlib_video_frame_v2_t = unsafe { std::mem::zeroed() };
         c_frame.xres = 2;
         c_frame.yres = 1;
         c_frame.FourCC = FourCCVideoType::UYVY.into();
         c_frame.p_data = data_ptr;
         c_frame.__bindgen_anon_1.line_stride_in_bytes = 8;
-        
+
         // Test with recv_instance (should borrow)
         unsafe {
             let frame = VideoFrame::from_raw(&c_frame, Some(ptr::null_mut())).unwrap();
@@ -2704,12 +2774,12 @@ mod tests {
                 Cow::Borrowed(slice) => {
                     assert_eq!(slice.as_ptr(), data_ptr as *const u8);
                     assert_eq!(slice.len(), 8);
-                },
+                }
                 Cow::Owned(_) => panic!("Expected borrowed data for recv instance"),
             }
             assert_eq!(frame.original_p_data, Some(data_ptr));
         }
-        
+
         // Test without recv_instance (should copy)
         unsafe {
             let frame = VideoFrame::from_raw(&c_frame, None).unwrap();
@@ -2718,7 +2788,7 @@ mod tests {
                 Cow::Owned(vec) => {
                     assert_ne!(vec.as_ptr(), data_ptr as *const u8);
                     assert_eq!(vec.len(), 8);
-                },
+                }
                 Cow::Borrowed(_) => panic!("Expected owned data for non-recv instance"),
             }
             assert_eq!(frame.original_p_data, None);
@@ -2730,7 +2800,7 @@ mod tests {
         // Create a test buffer
         let test_data = [1.0f32, 2.0, 3.0, 4.0];
         let data_ptr = test_data.as_ptr() as *mut u8;
-        
+
         let raw = NDIlib_audio_frame_v3_t {
             sample_rate: 48000,
             no_channels: 2,
@@ -2738,29 +2808,31 @@ mod tests {
             timecode: 0,
             FourCC: AudioType::FLTP.into(),
             p_data: data_ptr,
-            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 { channel_stride_in_bytes: 0 },
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: 0,
+            },
             p_metadata: ptr::null_mut(),
             timestamp: 0,
         };
-        
+
         // Test with recv_instance (should borrow)
         let frame = AudioFrame::from_raw(raw, Some(ptr::null_mut())).unwrap();
         match &frame.data {
             Cow::Borrowed(slice) => {
                 assert_eq!(slice.as_ptr() as *const u8, data_ptr as *const u8);
                 assert_eq!(slice.len(), 4);
-            },
+            }
             Cow::Owned(_) => panic!("Expected borrowed data for recv instance"),
         }
         assert_eq!(frame.original_p_data, Some(data_ptr));
-        
+
         // Test without recv_instance (should copy)
         let frame = AudioFrame::from_raw(raw, None).unwrap();
         match &frame.data {
             Cow::Owned(vec) => {
                 assert_ne!(vec.as_ptr() as *const u8, data_ptr as *const u8);
                 assert_eq!(vec.len(), 4);
-            },
+            }
             Cow::Borrowed(_) => panic!("Expected owned data for non-recv instance"),
         }
         assert_eq!(frame.original_p_data, None);
@@ -3084,7 +3156,7 @@ mod tests {
             .data(sample_data.clone())
             .build()
             .unwrap();
-        
+
         assert_eq!(frame.sample_rate, 48000);
         assert_eq!(frame.no_channels, 1);
         assert_eq!(frame.no_samples, 5);
@@ -3095,11 +3167,11 @@ mod tests {
     fn test_audio_frame_channel_data_interleaved() {
         // Test interleaved stereo audio
         let stereo_data: Vec<f32> = vec![
-            0.1, 0.2,  // Sample 1: L=0.1, R=0.2
-            0.3, 0.4,  // Sample 2: L=0.3, R=0.4
-            0.5, 0.6,  // Sample 3: L=0.5, R=0.6
+            0.1, 0.2, // Sample 1: L=0.1, R=0.2
+            0.3, 0.4, // Sample 2: L=0.3, R=0.4
+            0.5, 0.6, // Sample 3: L=0.5, R=0.6
         ];
-        
+
         let frame = AudioFrame::builder()
             .sample_rate(48000)
             .channels(2)
@@ -3107,15 +3179,15 @@ mod tests {
             .data(stereo_data.clone())
             .build()
             .unwrap();
-        
+
         // Channel 0 (left) should be [0.1, 0.3, 0.5]
         let left_channel = frame.channel_data(0).unwrap();
         assert_eq!(left_channel, vec![0.1, 0.3, 0.5]);
-        
+
         // Channel 1 (right) should be [0.2, 0.4, 0.6]
         let right_channel = frame.channel_data(1).unwrap();
         assert_eq!(right_channel, vec![0.2, 0.4, 0.6]);
-        
+
         // Out of bounds channel should return None
         assert!(frame.channel_data(2).is_none());
     }
@@ -3125,11 +3197,11 @@ mod tests {
         // Test planar audio format (channels stored separately)
         let planar_data: Vec<f32> = vec![
             // Channel 0 data
-            0.1, 0.2, 0.3, 0.0, 0.0,  // 3 samples + padding
+            0.1, 0.2, 0.3, 0.0, 0.0, // 3 samples + padding
             // Channel 1 data
-            0.4, 0.5, 0.6, 0.0, 0.0,  // 3 samples + padding
+            0.4, 0.5, 0.6, 0.0, 0.0, // 3 samples + padding
         ];
-        
+
         let mut frame = AudioFrame::builder()
             .sample_rate(48000)
             .channels(2)
@@ -3137,14 +3209,14 @@ mod tests {
             .data(planar_data.clone())
             .build()
             .unwrap();
-        
+
         // Set channel stride to indicate planar format
         frame.channel_stride_in_bytes = 5 * 4; // 5 samples * 4 bytes per f32
-        
+
         // Channel 0 should be [0.1, 0.2, 0.3]
         let channel_0 = frame.channel_data(0).unwrap();
         assert_eq!(channel_0, vec![0.1, 0.2, 0.3]);
-        
+
         // Channel 1 should be [0.4, 0.5, 0.6]
         let channel_1 = frame.channel_data(1).unwrap();
         assert_eq!(channel_1, vec![0.4, 0.5, 0.6]);
@@ -3167,9 +3239,9 @@ mod tests {
             p_metadata: ptr::null(),
             timestamp: 789012,
         };
-        
+
         let frame = AudioFrame::from_raw(raw, None).unwrap();
-        
+
         assert_eq!(frame.sample_rate, 44100);
         assert_eq!(frame.no_channels, 2);
         assert_eq!(frame.no_samples, 2);

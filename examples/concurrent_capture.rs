@@ -1,4 +1,4 @@
-use grafton_ndi::{NDI, Receiver, RecvBandwidth, RecvColorFormat};
+use grafton_ndi::{Receiver, RecvBandwidth, RecvColorFormat, NDI};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -57,7 +57,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
         let video_handle = s.spawn(move || {
             println!("Video thread started");
             let mut frame_count = 0;
-            
+
             for _ in 0..10 {
                 match recv_video.capture_video(5000) {
                     Ok(Some(frame)) => {
@@ -81,7 +81,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
                 }
                 thread::sleep(Duration::from_millis(100));
             }
-            
+
             println!("Video thread finished - captured {} frames", frame_count);
         });
 
@@ -90,16 +90,14 @@ fn main() -> Result<(), grafton_ndi::Error> {
         let audio_handle = s.spawn(move || {
             println!("Audio thread started");
             let mut sample_count = 0;
-            
+
             for _ in 0..10 {
                 match recv_audio.capture_audio(5000) {
                     Ok(Some(frame)) => {
                         sample_count += frame.no_samples;
                         println!(
                             "[AUDIO] {} samples @ {} Hz, {} channels",
-                            frame.no_samples,
-                            frame.sample_rate,
-                            frame.no_channels
+                            frame.no_samples, frame.sample_rate, frame.no_channels
                         );
                     }
                     Ok(None) => {
@@ -112,7 +110,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
                 }
                 thread::sleep(Duration::from_millis(100));
             }
-            
+
             println!("Audio thread finished - captured {} samples", sample_count);
         });
 
@@ -121,7 +119,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
         let metadata_handle = s.spawn(move || {
             println!("Metadata thread started");
             let mut metadata_count = 0;
-            
+
             for _ in 0..20 {
                 match recv_metadata.capture_metadata(2500) {
                     Ok(Some(frame)) => {
@@ -146,8 +144,11 @@ fn main() -> Result<(), grafton_ndi::Error> {
                 }
                 thread::sleep(Duration::from_millis(50));
             }
-            
-            println!("Metadata thread finished - captured {} frames", metadata_count);
+
+            println!(
+                "Metadata thread finished - captured {} frames",
+                metadata_count
+            );
         });
 
         // Wait for all threads to complete
