@@ -54,7 +54,11 @@ fn main() {
     // For Windows, add the specific library directory path.
     if cfg!(windows) {
         let target = env::var("TARGET").expect("TARGET environment variable not set");
-        let lib_subdir = if target.contains("x86_64") { "x64" } else { "x86" };
+        let lib_subdir = if target.contains("x86_64") {
+            "x64"
+        } else {
+            "x86"
+        };
         let lib_path = format!("{}\\lib\\{}", ndi_sdk_path, lib_subdir);
         println!("cargo:rustc-link-search=native={}", lib_path);
     }
@@ -71,7 +75,8 @@ fn main() {
         .expect("Unable to generate bindings");
 
     // Write the bindings to the $OUT_DIR/ndi_lib.rs file.
-    let out_path = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR environment variable not set"));
+    let out_path =
+        PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR environment variable not set"));
     bindings
         .write_to_file(out_path.join("ndi_lib.rs"))
         .expect("Couldn't write bindings!");

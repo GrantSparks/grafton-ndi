@@ -76,8 +76,7 @@ fn main() -> Result<(), Error> {
 fn save_frame_as_png(video_frame: &VideoFrame) -> Result<(), Error> {
     let path = "CoolNDIImage.png";
 
-    let file = File::create(path)
-        .map_err(|e| Error::InitializationFailed(format!("Failed to create file: {}", e)))?;
+    let file = File::create(path)?;
 
     let mut encoder = png::Encoder::new(file, video_frame.xres as u32, video_frame.yres as u32);
     encoder.set_color(png::ColorType::Rgba);

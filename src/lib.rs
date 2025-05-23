@@ -1,10 +1,10 @@
 //! Rust bindings for the NDI 6 SDK (Network Device Interface)
-//! 
+//!
 //! This crate provides safe, idiomatic Rust bindings for NewTek's NDI SDK,
 //! enabling real-time video/audio streaming over IP networks.
-//! 
+//!
 //! ## Thread Safety
-//! 
+//!
 //! `Recv`, `Send` and `Find` are `Send + Sync` because NDI's underlying C API
 //! is documented as thread-safe. These types only hold pointers returned by
 //! the NDI SDK and use `&mut self` for mutations. If you create an `NDI` context
@@ -245,9 +245,9 @@ impl Source {
     }
 
     /// Convert to raw format for FFI use
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// The returned RawSource struct uses #[repr(C)] to guarantee C-compatible layout
     /// for safe FFI interop with the NDI SDK.
     fn to_raw(&self) -> Result<RawSource, Error> {
@@ -310,7 +310,6 @@ pub enum FourCCVideoType {
     Max = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_max,
 }
 
-
 #[derive(Debug, TryFromPrimitive, IntoPrimitive, Clone, Copy)]
 #[repr(u32)]
 pub enum FrameFormatType {
@@ -320,7 +319,6 @@ pub enum FrameFormatType {
     Field1 = NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_1,
     Max = NDIlib_frame_format_type_e_NDIlib_frame_format_type_max,
 }
-
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -489,7 +487,9 @@ impl<'a> VideoFrame<'a> {
     /// for the lifetime of the VideoFrame.
     pub unsafe fn from_raw_borrowed(c_frame: &'a NDIlib_video_frame_v2_t) -> Result<Self, Error> {
         if c_frame.p_data.is_null() {
-            return Err(Error::InvalidFrame("Video frame has null data pointer".into()));
+            return Err(Error::InvalidFrame(
+                "Video frame has null data pointer".into(),
+            ));
         }
 
         // SAFETY: For union access, we need to determine which field to use
@@ -498,15 +498,18 @@ impl<'a> VideoFrame<'a> {
         // use it; otherwise use data_size_in_bytes
         let line_stride = c_frame.__bindgen_anon_1.line_stride_in_bytes;
         let potential_stride_size = line_stride as usize * c_frame.yres as usize;
-        
-        let data_size = if line_stride > 0 && potential_stride_size > 0 && potential_stride_size < (100 * 1024 * 1024) {
+
+        let data_size = if line_stride > 0
+            && potential_stride_size > 0
+            && potential_stride_size < (100 * 1024 * 1024)
+        {
             // Reasonable size for uncompressed video (< 100MB per frame)
             potential_stride_size
         } else {
             // Use data_size_in_bytes for compressed formats
             c_frame.__bindgen_anon_1.data_size_in_bytes as usize
         };
-        
+
         if data_size == 0 {
             return Err(Error::InvalidFrame("Video frame has zero size".into()));
         }
@@ -526,7 +529,8 @@ impl<'a> VideoFrame<'a> {
             frame_rate_n: c_frame.frame_rate_N,
             frame_rate_d: c_frame.frame_rate_D,
             picture_aspect_ratio: c_frame.picture_aspect_ratio,
-            frame_format_type: FrameFormatType::try_from(c_frame.frame_format_type).unwrap_or(FrameFormatType::Max),
+            frame_format_type: FrameFormatType::try_from(c_frame.frame_format_type)
+                .unwrap_or(FrameFormatType::Max),
             timecode: c_frame.timecode,
             data: Cow::Borrowed(data),
             line_stride_or_size: LineStrideOrSize {
@@ -543,9 +547,13 @@ impl<'a> VideoFrame<'a> {
     ///
     /// This function assumes the given `NDIlib_video_frame_v2_t` is valid and correctly allocated.
     /// This method copies the data, so the VideoFrame owns its data and can outlive the source.
-    pub unsafe fn from_raw(c_frame: &NDIlib_video_frame_v2_t) -> Result<VideoFrame<'static>, Error> {
+    pub unsafe fn from_raw(
+        c_frame: &NDIlib_video_frame_v2_t,
+    ) -> Result<VideoFrame<'static>, Error> {
         if c_frame.p_data.is_null() {
-            return Err(Error::InvalidFrame("Video frame has null data pointer".into()));
+            return Err(Error::InvalidFrame(
+                "Video frame has null data pointer".into(),
+            ));
         }
 
         // SAFETY: For union access, we need to determine which field to use
@@ -554,15 +562,18 @@ impl<'a> VideoFrame<'a> {
         // use it; otherwise use data_size_in_bytes
         let line_stride = c_frame.__bindgen_anon_1.line_stride_in_bytes;
         let potential_stride_size = line_stride as usize * c_frame.yres as usize;
-        
-        let data_size = if line_stride > 0 && potential_stride_size > 0 && potential_stride_size < (100 * 1024 * 1024) {
+
+        let data_size = if line_stride > 0
+            && potential_stride_size > 0
+            && potential_stride_size < (100 * 1024 * 1024)
+        {
             // Reasonable size for uncompressed video (< 100MB per frame)
             potential_stride_size
         } else {
             // Use data_size_in_bytes for compressed formats
             c_frame.__bindgen_anon_1.data_size_in_bytes as usize
         };
-        
+
         if data_size == 0 {
             return Err(Error::InvalidFrame("Video frame has zero size".into()));
         }
@@ -582,7 +593,8 @@ impl<'a> VideoFrame<'a> {
             frame_rate_n: c_frame.frame_rate_N,
             frame_rate_d: c_frame.frame_rate_D,
             picture_aspect_ratio: c_frame.picture_aspect_ratio,
-            frame_format_type: FrameFormatType::try_from(c_frame.frame_format_type).unwrap_or(FrameFormatType::Max),
+            frame_format_type: FrameFormatType::try_from(c_frame.frame_format_type)
+                .unwrap_or(FrameFormatType::Max),
             timecode: c_frame.timecode,
             data: Cow::Owned(data),
             line_stride_or_size: LineStrideOrSize {
@@ -669,31 +681,42 @@ impl AudioFrame<'_> {
 
     pub(crate) fn from_raw(raw: NDIlib_audio_frame_v3_t) -> Result<AudioFrame<'static>, Error> {
         if raw.p_data.is_null() {
-            return Err(Error::InvalidFrame("Audio frame has null data pointer".into()));
+            return Err(Error::InvalidFrame(
+                "Audio frame has null data pointer".into(),
+            ));
         }
 
         if raw.sample_rate <= 0 {
-            return Err(Error::InvalidFrame(format!("Invalid sample rate: {}", raw.sample_rate)));
+            return Err(Error::InvalidFrame(format!(
+                "Invalid sample rate: {}",
+                raw.sample_rate
+            )));
         }
 
         if raw.no_channels <= 0 {
-            return Err(Error::InvalidFrame(format!("Invalid number of channels: {}", raw.no_channels)));
+            return Err(Error::InvalidFrame(format!(
+                "Invalid number of channels: {}",
+                raw.no_channels
+            )));
         }
 
         if raw.no_samples <= 0 {
-            return Err(Error::InvalidFrame(format!("Invalid number of samples: {}", raw.no_samples)));
+            return Err(Error::InvalidFrame(format!(
+                "Invalid number of samples: {}",
+                raw.no_samples
+            )));
         }
 
         let bytes_per_sample = 4;
         let data_size = (raw.no_samples * raw.no_channels * bytes_per_sample) as usize;
 
         if data_size == 0 {
-            return Err(Error::InvalidFrame("Calculated audio data size is zero".into()));
+            return Err(Error::InvalidFrame(
+                "Calculated audio data size is zero".into(),
+            ));
         }
 
-        let data = unsafe {
-            std::slice::from_raw_parts(raw.p_data, data_size).to_vec()
-        };
+        let data = unsafe { std::slice::from_raw_parts(raw.p_data, data_size).to_vec() };
 
         let metadata = if raw.p_metadata.is_null() {
             None
@@ -734,10 +757,9 @@ pub enum AudioType {
     Max = NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_max,
 }
 
-
 #[derive(Debug, Clone)]
 pub struct MetadataFrame {
-    pub data: String,  // Owned metadata (typically XML)
+    pub data: String, // Owned metadata (typically XML)
     pub timecode: i64,
 }
 
@@ -796,7 +818,7 @@ pub enum RecvColorFormat {
     UYVY_RGBA,
     Fastest,
     Best,
-//    BGRX_BGRA_Flipped,
+    //    BGRX_BGRA_Flipped,
     Max,
 }
 
@@ -817,9 +839,9 @@ impl From<RecvColorFormat> for NDIlib_recv_color_format_e {
             }
             RecvColorFormat::Fastest => NDIlib_recv_color_format_e_NDIlib_recv_color_format_fastest,
             RecvColorFormat::Best => NDIlib_recv_color_format_e_NDIlib_recv_color_format_best,
-//            RecvColorFormat::BGRX_BGRA_Flipped => {
-//                NDIlib_recv_color_format_e_NDIlib_recv_color_format_BGRX_BGRA_flipped
-//            }
+            //            RecvColorFormat::BGRX_BGRA_Flipped => {
+            //                NDIlib_recv_color_format_e_NDIlib_recv_color_format_BGRX_BGRA_flipped
+            //            }
             RecvColorFormat::Max => NDIlib_recv_color_format_e_NDIlib_recv_color_format_max,
         }
     }
@@ -858,7 +880,6 @@ pub struct Receiver {
     pub ndi_recv_name: Option<String>,
 }
 
-
 #[repr(C)]
 pub(crate) struct RawRecvCreateV3 {
     _source: RawSource,
@@ -884,19 +905,20 @@ impl Receiver {
     }
 
     /// Convert to raw format for FFI use
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// The returned RawRecvCreateV3 struct uses #[repr(C)] to guarantee C-compatible layout
     /// for safe FFI interop with the NDI SDK.
     pub(crate) fn to_raw(&self) -> Result<RawRecvCreateV3, Error> {
         let source = self.source_to_connect_to.to_raw()?;
-        let name = self.ndi_recv_name
+        let name = self
+            .ndi_recv_name
             .as_ref()
             .map(|n| CString::new(n.clone()))
             .transpose()
             .map_err(Error::InvalidCString)?;
-        
+
         let p_ndi_recv_name = name.as_ref().map_or(ptr::null(), |n| n.as_ptr());
         let source_raw = source.raw;
 
@@ -1044,7 +1066,6 @@ impl<'a> Recv<'a> {
         }
     }
 
-
     #[allow(dead_code)]
     pub fn free_string(&self, string: &str) {
         let c_string = CString::new(string).expect("Failed to create CString");
@@ -1173,7 +1194,7 @@ impl Tally {
 #[derive(Debug)]
 pub struct Send<'a> {
     instance: NDIlib_send_instance_t,
-    _name: *mut c_char,  // Store raw pointer to free on drop
+    _name: *mut c_char,   // Store raw pointer to free on drop
     _groups: *mut c_char, // Store raw pointer to free on drop
     ndi: std::marker::PhantomData<&'a NDI>,
 }
@@ -1304,7 +1325,7 @@ impl Drop for Send<'_> {
     fn drop(&mut self) {
         unsafe {
             NDIlib_send_destroy(self.instance);
-            
+
             // Free the CStrings we allocated
             if !self._name.is_null() {
                 let _ = CString::from_raw(self._name);
@@ -1345,14 +1366,14 @@ mod tests {
         let mut frame: NDIlib_video_frame_v2_t = unsafe { std::mem::zeroed() };
         frame.xres = width;
         frame.yres = height;
-        
+
         // Set the union field based on which value is provided
         if line_stride > 0 {
             frame.__bindgen_anon_1.line_stride_in_bytes = line_stride;
         } else {
             frame.__bindgen_anon_1.data_size_in_bytes = data_size;
         }
-        
+
         // Allocate dummy data
         let actual_size = if line_stride > 0 {
             (line_stride * height) as usize
@@ -1362,7 +1383,7 @@ mod tests {
         let mut data = vec![0u8; actual_size];
         frame.p_data = data.as_mut_ptr();
         std::mem::forget(data); // Prevent deallocation during test
-        
+
         frame
     }
 
@@ -1373,18 +1394,18 @@ mod tests {
         let test_height = 1080;
         let bytes_per_pixel = 4; // RGBA
         let line_stride = test_width * bytes_per_pixel;
-        
+
         let c_frame = create_test_video_frame(test_width, test_height, line_stride, 0);
-        
+
         // The from_raw function should calculate size as line_stride * height
         // Previously it would incorrectly multiply data_size_in_bytes * height
         unsafe {
             let frame = VideoFrame::from_raw(&c_frame).unwrap();
-            
+
             // Expected size is line_stride * height
             let expected_size = (line_stride * test_height) as usize;
             assert_eq!(frame.data.len(), expected_size);
-            
+
             // Clean up
             drop(frame);
             Vec::from_raw_parts(c_frame.p_data, expected_size, expected_size);
@@ -1395,17 +1416,17 @@ mod tests {
     fn test_video_frame_size_calculation_logic() {
         // Test the size calculation logic without relying on union behavior
         // This is a simplified test that verifies the fix prevents the original bug
-        
+
         // The original bug was: data_size = data_size_in_bytes * yres
         // This would cause massive over-allocation
-        
+
         // For a 1920x1080 RGBA frame:
         // Correct: line_stride (1920*4) * height (1080) = 8,294,400 bytes
         // Bug would calculate: some_value * 1080 (potentially huge)
-        
+
         let correct_size = 1920 * 4 * 1080; // 8,294,400 bytes
         assert!(correct_size < 10_000_000); // Should be under 10MB
-        
+
         // The fix ensures we use line_stride * height for standard formats
         // and data_size_in_bytes directly for compressed formats
     }
@@ -1416,7 +1437,7 @@ mod tests {
         c_frame.p_data = ptr::null_mut();
         c_frame.__bindgen_anon_1.line_stride_in_bytes = 1920 * 4;
         c_frame.yres = 1080;
-        
+
         unsafe {
             let result = VideoFrame::from_raw(&c_frame);
             assert!(result.is_err());
@@ -1437,7 +1458,7 @@ mod tests {
         c_frame.__bindgen_anon_1.line_stride_in_bytes = 0;
         c_frame.__bindgen_anon_1.data_size_in_bytes = 0;
         c_frame.yres = 1080;
-        
+
         unsafe {
             let result = VideoFrame::from_raw(&c_frame);
             assert!(result.is_err());
@@ -1455,12 +1476,12 @@ mod tests {
         // Test that AudioFrame can be created and dropped without issues
         let frame1 = AudioFrame::new();
         drop(frame1); // Should not panic or cause double-free
-        
+
         // Test with metadata
         let mut frame2 = AudioFrame::new();
         frame2.metadata = Some(CString::new("test metadata").unwrap());
         drop(frame2); // Should not panic - CString handles its own memory
-        
+
         // Test multiple drops in sequence
         for _ in 0..10 {
             let mut frame = AudioFrame::new();
@@ -1477,22 +1498,22 @@ mod tests {
             url_address: Some("ndi://192.168.1.100:5960".to_string()),
             ip_address: Some("192.168.1.100".to_string()),
         };
-        
+
         // Create RawSource
         let raw_source = source.to_raw().unwrap();
-        
+
         // Verify the raw pointers are valid
         unsafe {
             assert!(!raw_source.raw.p_ndi_name.is_null());
             let name = CStr::from_ptr(raw_source.raw.p_ndi_name);
             assert_eq!(name.to_string_lossy(), "Test NDI Source");
-            
+
             // Check union field
             assert!(!raw_source.raw.__bindgen_anon_1.p_url_address.is_null());
             let url = CStr::from_ptr(raw_source.raw.__bindgen_anon_1.p_url_address);
             assert_eq!(url.to_string_lossy(), "ndi://192.168.1.100:5960");
         }
-        
+
         // Drop should clean up all CStrings properly
         drop(raw_source);
     }
@@ -1505,15 +1526,15 @@ mod tests {
             url_address: None,
             ip_address: None,
         };
-        
+
         let raw_source = source.to_raw().unwrap();
-        
+
         unsafe {
             assert!(!raw_source.raw.p_ndi_name.is_null());
             assert!(raw_source.raw.__bindgen_anon_1.p_url_address.is_null());
             assert!(raw_source.raw.__bindgen_anon_1.p_ip_address.is_null());
         }
-        
+
         drop(raw_source);
     }
 
@@ -1524,21 +1545,24 @@ mod tests {
             data: "<metadata>test content</metadata>".to_string(),
             timecode: 123456789,
         };
-        
+
         // Clone should create a new owned copy
         let cloned = metadata.clone();
         assert_eq!(metadata.data, cloned.data);
         assert_eq!(metadata.timecode, cloned.timecode);
-        
+
         // Test to_raw conversion
         let (c_data, raw) = metadata.to_raw().unwrap();
         unsafe {
             assert!(!raw.p_data.is_null());
             let raw_str = CStr::from_ptr(raw.p_data);
-            assert_eq!(raw_str.to_string_lossy(), "<metadata>test content</metadata>");
+            assert_eq!(
+                raw_str.to_string_lossy(),
+                "<metadata>test content</metadata>"
+            );
             assert_eq!(raw.timecode, 123456789);
         }
-        
+
         // c_data keeps the CString alive
         drop(c_data);
     }
@@ -1552,24 +1576,22 @@ mod tests {
             timecode: 123456,
             p_data: test_data.as_ptr() as *mut c_char,
         };
-        
+
         let frame = MetadataFrame::from_raw(&raw);
         assert_eq!(frame.data, "<metadata>test</metadata>");
         assert_eq!(frame.timecode, 123456);
-        
+
         // Test with null pointer
         let null_raw = NDIlib_metadata_frame_t {
             length: 0,
             timecode: 789,
             p_data: ptr::null_mut(),
         };
-        
+
         let null_frame = MetadataFrame::from_raw(&null_raw);
         assert_eq!(null_frame.data, "");
         assert_eq!(null_frame.timecode, 789);
     }
-
-
 
     #[test]
     fn test_raw_recv_create_v3_memory_management() {
@@ -1585,21 +1607,21 @@ mod tests {
             true,
             Some("Test Receiver".to_string()),
         );
-        
+
         let raw_recv = receiver.to_raw().unwrap();
-        
+
         unsafe {
             // Verify receiver name
             assert!(!raw_recv.raw.p_ndi_recv_name.is_null());
             let name = CStr::from_ptr(raw_recv.raw.p_ndi_recv_name);
             assert_eq!(name.to_string_lossy(), "Test Receiver");
-            
+
             // Verify source name through the nested structure
             assert!(!raw_recv.raw.source_to_connect_to.p_ndi_name.is_null());
             let source_name = CStr::from_ptr(raw_recv.raw.source_to_connect_to.p_ndi_name);
             assert_eq!(source_name.to_string_lossy(), "Test Source");
         }
-        
+
         // Should properly clean up all nested CStrings
         drop(raw_recv);
     }
@@ -1612,10 +1634,10 @@ mod tests {
             url_address: Some("ndi://test.local".to_string()),
             ip_address: Some("10.0.0.1".to_string()),
         };
-        
+
         let raw = original.to_raw().unwrap();
         let restored = Source::from_raw(&raw.raw);
-        
+
         assert_eq!(original.name, restored.name);
         assert_eq!(original.url_address, restored.url_address);
         // Note: ip_address might not round-trip perfectly due to union behavior
@@ -1634,7 +1656,7 @@ mod tests {
             FrameFormatType::Progressive,
         );
         frame.metadata = Some(CString::new("test video metadata").unwrap());
-        
+
         // This should not panic or double-free
         drop(frame);
     }
@@ -1644,20 +1666,20 @@ mod tests {
         // Test that Send properly manages CString memory
         // Note: This test would require NDI SDK to actually create Send instance
         // so we'll test the memory management pattern instead
-        
+
         // Simulate the pattern used in Send::new
         let name = CString::new("Test Sender").unwrap();
         let groups = CString::new("Test Group").unwrap();
-        
+
         let name_ptr = name.into_raw();
         let groups_ptr = groups.into_raw();
-        
+
         // Simulate cleanup (like Send's Drop would do)
         unsafe {
             let _ = CString::from_raw(name_ptr);
             let _ = CString::from_raw(groups_ptr);
         }
-        
+
         // If this doesn't crash, memory management is correct
     }
 
@@ -1667,54 +1689,64 @@ mod tests {
         let frame = MetadataFrame::new();
         assert_eq!(frame.data, "");
         assert_eq!(frame.timecode, 0);
-        
+
         // MetadataFrame doesn't implement Drop, so it's automatically cleaned up
     }
 
     #[test]
     fn test_ndi_singleton_initialization() {
         use std::sync::atomic::Ordering;
-        
+
         // Get initial reference count
         let initial_count = REFCOUNT.load(Ordering::Relaxed);
-        
+
         // Create first NDI instance
         let ndi1 = NDI::new().expect("Failed to create first NDI instance");
         let count_after_first = REFCOUNT.load(Ordering::Relaxed);
-        assert!(count_after_first > initial_count, "Reference count should increase");
-        
+        assert!(
+            count_after_first > initial_count,
+            "Reference count should increase"
+        );
+
         // Create second NDI instance - should not reinitialize
         let ndi2 = NDI::new().expect("Failed to create second NDI instance");
         assert_eq!(REFCOUNT.load(Ordering::Relaxed), count_after_first + 1);
-        
+
         // Clone an instance
         let ndi3 = ndi1.clone();
         assert_eq!(REFCOUNT.load(Ordering::Relaxed), count_after_first + 2);
-        
+
         // Drop one instance
         drop(ndi2);
         assert_eq!(REFCOUNT.load(Ordering::Relaxed), count_after_first + 1);
-        
+
         // Drop another instance
         drop(ndi1);
         let count_after_drop = REFCOUNT.load(Ordering::Relaxed);
-        assert!(count_after_drop < count_after_first + 2, "Count should decrease after drop");
-        
+        assert!(
+            count_after_drop < count_after_first + 2,
+            "Count should decrease after drop"
+        );
+
         // Drop final instance
         drop(ndi3);
         let final_count = REFCOUNT.load(Ordering::Relaxed);
-        assert!(final_count < count_after_drop, "Count should decrease after final drop");
+        assert!(
+            final_count < count_after_drop,
+            "Count should decrease after final drop"
+        );
     }
 
     #[test]
     fn test_ndi_thread_safety() {
         use std::thread;
-        
+
         // Create NDI instances from multiple threads
         let handles: Vec<_> = (0..5)
             .map(|i| {
                 thread::spawn(move || {
-                    let ndi = NDI::new().unwrap_or_else(|_| panic!("Failed to create NDI in thread {}", i));
+                    let ndi = NDI::new()
+                        .unwrap_or_else(|_| panic!("Failed to create NDI in thread {}", i));
                     // Use the NDI instance
                     let _version = NDI::version();
                     // Clone it a few times
@@ -1724,12 +1756,12 @@ mod tests {
                 })
             })
             .collect();
-        
+
         // Wait for all threads to complete
         for handle in handles {
             handle.join().expect("Thread panicked");
         }
-        
+
         // All instances should be cleaned up by now
     }
 
@@ -1737,15 +1769,15 @@ mod tests {
     fn test_find_cstring_lifetime() {
         // Test that Find keeps CStrings alive for its lifetime
         let ndi = NDI::new().expect("Failed to create NDI");
-        
+
         // Create finder with both groups and extra_ips
         let settings = Finder::new(true, Some("TestGroup"), Some("192.168.1.100"));
         let finder = Find::new(&ndi, settings).expect("Failed to create finder");
-        
+
         // The finder should keep the CStrings alive even though we've moved settings
         // If CStrings were dropped early, this could cause undefined behavior
         let _sources = finder.get_sources(0);
-        
+
         // Drop finder - CStrings should be freed now
         drop(finder);
     }
@@ -1755,21 +1787,21 @@ mod tests {
         // Test that Send keeps CStrings alive for its lifetime
         // Note: This test verifies the memory management pattern
         // without actually creating an NDI send instance
-        
+
         // Verify our Send struct has the fields to hold CStrings
         // The actual Send::new() would require NDI SDK runtime
-        
+
         // Test the pattern we use in Send
         let name = CString::new("Test Sender").unwrap();
         let groups = Some(CString::new("Test Group").unwrap());
-        
+
         let name_ptr = name.as_ptr();
         let groups_ptr = groups.as_ref().map(|g| g.as_ptr());
-        
+
         // Simulate keeping the CStrings alive
         let _name_holder = name;
         let _groups_holder = groups;
-        
+
         // Pointers should remain valid as long as holders exist
         unsafe {
             if !name_ptr.is_null() {
@@ -1797,21 +1829,21 @@ mod tests {
             true,
             Some("Test Receiver Name".to_string()),
         );
-        
+
         // Convert to raw - this should create RawRecvCreateV3 that owns the CStrings
         let raw_recv = receiver.to_raw().expect("Failed to convert receiver");
-        
+
         // The raw_recv should keep all CStrings alive
         // Verify the pointers are still valid
         unsafe {
             assert!(!raw_recv.raw.source_to_connect_to.p_ndi_name.is_null());
             assert!(!raw_recv.raw.p_ndi_recv_name.is_null());
-            
+
             // These should not cause segfault
             let _source_name = CStr::from_ptr(raw_recv.raw.source_to_connect_to.p_ndi_name);
             let _recv_name = CStr::from_ptr(raw_recv.raw.p_ndi_recv_name);
         }
-        
+
         // Drop raw_recv - all CStrings should be properly freed
         drop(raw_recv);
     }
@@ -1821,10 +1853,10 @@ mod tests {
         // Test that AudioFrame::from_raw correctly copies metadata instead of taking ownership
         let metadata_str = CString::new("test audio metadata").unwrap();
         let metadata_ptr = metadata_str.as_ptr();
-        
+
         // Allocate data that will persist for the test
         let mut data = vec![0u8; 1024 * 2 * 4];
-        
+
         let raw_frame = NDIlib_audio_frame_v3_t {
             sample_rate: 48000,
             no_channels: 2,
@@ -1838,23 +1870,29 @@ mod tests {
             p_metadata: metadata_ptr,
             timestamp: 0,
         };
-        
+
         // from_raw should copy the metadata, not take ownership
         let frame = AudioFrame::from_raw(raw_frame).expect("Failed to create AudioFrame");
-        
+
         // The original metadata should still be valid
         unsafe {
             let original_still_valid = CStr::from_ptr(metadata_ptr);
-            assert_eq!(original_still_valid.to_string_lossy(), "test audio metadata");
+            assert_eq!(
+                original_still_valid.to_string_lossy(),
+                "test audio metadata"
+            );
         }
-        
+
         // The frame should have its own copy
         assert!(frame.metadata.is_some());
-        assert_eq!(frame.metadata.as_ref().unwrap().to_string_lossy(), "test audio metadata");
-        
+        assert_eq!(
+            frame.metadata.as_ref().unwrap().to_string_lossy(),
+            "test audio metadata"
+        );
+
         // Clean up the original metadata
         drop(metadata_str);
-        
+
         // Note: In real NDI usage, NDIlib_recv_free_audio_v3 would free the metadata
     }
 }

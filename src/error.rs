@@ -1,4 +1,5 @@
 use std::ffi::NulError;
+use std::io;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -15,4 +16,6 @@ pub enum Error {
     CaptureFailed(String),
     #[error("Invalid frame data: {0}")]
     InvalidFrame(String),
+    #[error(transparent)]
+    Io(#[from] io::Error),
 }
