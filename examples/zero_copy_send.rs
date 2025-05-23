@@ -1,4 +1,5 @@
 use grafton_ndi::{FourCCVideoType, SendOptions, VideoFrameBorrowed, NDI};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 fn main() -> Result<(), grafton_ndi::Error> {
@@ -15,14 +16,21 @@ fn main() -> Result<(), grafton_ndi::Error> {
 
     println!("Created NDI sender: {}", send.get_source_name());
 
-    // Pre-allocate buffers for double-buffering
+    // Pre-allocate a single buffer (demonstrating single-buffer with callback)
     let width = 1920;
     let height = 1080;
     let buffer_size = (width * height * 4) as usize; // BGRA format
 
-    let mut buffer1 = vec![0u8; buffer_size];
-    let mut buffer2 = vec![0u8; buffer_size];
-    let mut current_buffer = 0;
+    let mut buffer = vec![0u8; buffer_size];
+
+    // Channel to signal when buffer is available again
+    let (tx, rx) = mpsc::channel();
+
+    // Register completion callback
+    send.on_async_video_done(move |_slice| {
+        // Buffer is now available for reuse
+        let _ = tx.send(());
+    });
 
     // Frame timing
     let frame_rate = 60.0;
@@ -34,33 +42,34 @@ fn main() -> Result<(), grafton_ndi::Error> {
 
     let mut frame_count = 0;
     let start_time = Instant::now();
+    let mut buffer_available = true;
 
     loop {
-        // Get the current buffer to work with
-        let buffer = if current_buffer == 0 {
-            &mut buffer1
-        } else {
-            &mut buffer2
-        };
+        // Wait for buffer to be available if needed
+        if !buffer_available {
+            if rx.recv_timeout(Duration::from_millis(100)).is_ok() {
+                #[allow(unused_assignments)]
+                {
+                    buffer_available = true;
+                }
+            } else {
+                println!("Warning: Buffer not released in time");
+                continue;
+            }
+        }
 
-        // Simulate frame generation (in real app, this would be encoding/rendering)
-        generate_test_pattern(buffer, width, height, frame_count);
+        // Generate frame data
+        generate_test_pattern(&mut buffer, width, height, frame_count);
 
         // Create a borrowed frame that references our buffer
         let borrowed_frame =
-            VideoFrameBorrowed::from_buffer(buffer, width, height, FourCCVideoType::BGRA, 60, 1);
+            VideoFrameBorrowed::from_buffer(&buffer, width, height, FourCCVideoType::BGRA, 60, 1);
 
         // Send asynchronously - no copy happens here!
-        let token = send.send_video_async(&borrowed_frame);
+        let _token = send.send_video_async(&borrowed_frame);
+        buffer_available = false;
 
-        // While NDI is using our buffer, we can switch to the other buffer
-        current_buffer = 1 - current_buffer;
-
-        // Simulate some work that can happen while NDI is sending
-        std::thread::sleep(Duration::from_millis(5));
-
-        // Token is dropped here, indicating we're done with the previous buffer
-        drop(token);
+        // The buffer is now owned by NDI until the callback fires
 
         frame_count += 1;
 

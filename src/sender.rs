@@ -14,6 +14,7 @@ use std::{
     ffi::{CStr, CString},
     os::raw::c_char,
     ptr,
+    sync::{Arc, Mutex},
 };
 
 #[derive(Debug)]
@@ -22,6 +23,7 @@ pub struct SendInstance<'a> {
     _name: *mut c_char,   // Store raw pointer to free on drop
     _groups: *mut c_char, // Store raw pointer to free on drop
     ndi: std::marker::PhantomData<&'a NDI>,
+    async_handler: Arc<Mutex<Option<AsyncCompletionHandler>>>,
 }
 
 /// A borrowed video frame that references external pixel data.
@@ -121,14 +123,46 @@ impl<'buf> From<&'buf VideoFrame<'_>> for VideoFrameBorrowed<'buf> {
     }
 }
 
+/// Type alias for async completion callback
+type AsyncCompletionCallback = Box<dyn FnMut(&mut [u8]) + Send + 'static>;
+
+/// Internal type to handle async completion callbacks
+struct AsyncCompletionHandler {
+    callback: AsyncCompletionCallback,
+    buffer_ptr: *mut u8,
+    buffer_len: usize,
+}
+
+impl std::fmt::Debug for AsyncCompletionHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncCompletionHandler")
+            .field("buffer_ptr", &self.buffer_ptr)
+            .field("buffer_len", &self.buffer_len)
+            .finish()
+    }
+}
+
+// SAFETY: We ensure the handler is only called once and the buffer is valid
+unsafe impl Send for AsyncCompletionHandler {}
+
 /// A token that ensures the video frame remains valid while NDI is using it.
 /// The frame will be released when this token is dropped or when the next
 /// send operation occurs.
 #[must_use = "AsyncVideoToken must be held until the next send operation"]
+#[repr(transparent)]
 pub struct AsyncVideoToken<'send, 'buf> {
-    _send: &'send SendInstance<'send>,
+    sender: &'send SendInstance<'send>,
     // Use mutable borrow to prevent any access while NDI owns the buffer
     _frame: std::marker::PhantomData<&'buf mut [u8]>,
+}
+
+// Note: AsyncVideoToken does not implement Send, ensuring it stays on the producing thread
+
+impl Drop for AsyncVideoToken<'_, '_> {
+    fn drop(&mut self) {
+        // When token is dropped, trigger the completion callback
+        self.sender.trigger_async_completion();
+    }
 }
 
 impl<'a> SendInstance<'a> {
@@ -176,12 +210,16 @@ impl<'a> SendInstance<'a> {
                 _name: p_ndi_name_raw,
                 _groups: p_groups,
                 ndi: std::marker::PhantomData,
+                async_handler: Arc::new(Mutex::new(None)),
             })
         }
     }
 
     /// Send a video frame **synchronously** (NDI copies the buffer).
     pub fn send_video(&self, video_frame: &VideoFrame<'_>) {
+        // Trigger any pending async completion callback before new send
+        self.trigger_async_completion();
+
         unsafe {
             NDIlib_send_send_video_v2(self.instance, &video_frame.to_raw());
         }
@@ -217,11 +255,20 @@ impl<'a> SendInstance<'a> {
         &'b self,
         video_frame: &VideoFrameBorrowed<'b>,
     ) -> AsyncVideoToken<'b, 'b> {
+        // Trigger any pending async completion callback before new send
+        self.trigger_async_completion();
+
+        // Store buffer info for async completion callback
+        if let Some(handler) = &mut *self.async_handler.lock().unwrap() {
+            handler.buffer_ptr = video_frame.data.as_ptr() as *mut u8;
+            handler.buffer_len = video_frame.data.len();
+        }
+
         unsafe {
             NDIlib_send_send_video_async_v2(self.instance, &video_frame.to_raw());
         }
         AsyncVideoToken {
-            _send: self,
+            sender: self,
             _frame: std::marker::PhantomData,
         }
     }
@@ -357,10 +404,48 @@ impl<'a> SendInstance<'a> {
         let source_ptr = unsafe { NDIlib_send_get_source_name(self.instance) };
         Source::from_raw(unsafe { &*source_ptr })
     }
+
+    /// Register a handler that will be called once the SDK has released
+    /// the last buffer passed to `send_video_async`.
+    /// The slice is **only valid for the duration of the callback**.
+    pub fn on_async_video_done<F>(&self, handler: F)
+    where
+        F: FnMut(&mut [u8]) + Send + 'static,
+    {
+        let mut async_handler = self.async_handler.lock().unwrap();
+        *async_handler = Some(AsyncCompletionHandler {
+            callback: Box::new(handler),
+            buffer_ptr: ptr::null_mut(),
+            buffer_len: 0,
+        });
+    }
+
+    /// Internal method to trigger async completion callback
+    fn trigger_async_completion(&self) {
+        let mut async_handler = self.async_handler.lock().unwrap();
+        if let Some(mut handler) = async_handler.take() {
+            if !handler.buffer_ptr.is_null() && handler.buffer_len > 0 {
+                // SAFETY: The buffer was valid when async send was called,
+                // and NDI is done with it now
+                let slice = unsafe {
+                    std::slice::from_raw_parts_mut(handler.buffer_ptr, handler.buffer_len)
+                };
+                (handler.callback)(slice);
+
+                // Put the handler back without buffer info
+                handler.buffer_ptr = ptr::null_mut();
+                handler.buffer_len = 0;
+                *async_handler = Some(handler);
+            }
+        }
+    }
 }
 
 impl Drop for SendInstance<'_> {
     fn drop(&mut self) {
+        // Trigger any pending async completion callback before destruction
+        self.trigger_async_completion();
+
         unsafe {
             NDIlib_send_destroy(self.instance);
 

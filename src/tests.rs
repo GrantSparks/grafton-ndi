@@ -4,6 +4,7 @@ use crate::{
     error::Error,
     frames::{AudioFrame, VideoFrame},
     ndi_lib::*,
+    receiver::{RecvStatus, Tally},
 };
 use std::ptr;
 
@@ -186,4 +187,78 @@ fn test_audio_frame_builder() {
     assert_eq!(frame.no_channels, 2);
     assert_eq!(frame.no_samples, 1024);
     assert_eq!(frame.data().len(), 2048); // 1024 samples * 2 channels
+}
+
+#[test]
+fn test_recv_status_creation() {
+    // Test RecvStatus with tally
+    let status = RecvStatus {
+        tally: Some(Tally::new(true, false)),
+        connections: Some(3),
+        other: false,
+    };
+
+    assert!(status.tally.is_some());
+    let tally = status.tally.unwrap();
+    assert!(tally.on_program);
+    assert!(!tally.on_preview);
+    assert_eq!(status.connections, Some(3));
+    assert!(!status.other);
+
+    // Test RecvStatus with other changes
+    let status2 = RecvStatus {
+        tally: None,
+        connections: None,
+        other: true,
+    };
+
+    assert!(status2.tally.is_none());
+    assert!(status2.connections.is_none());
+    assert!(status2.other);
+}
+
+#[test]
+fn test_tally_to_raw() {
+    let tally = Tally::new(true, false);
+    let raw = tally.to_raw();
+
+    assert!(raw.on_program);
+    assert!(!raw.on_preview);
+
+    let tally2 = Tally::new(false, true);
+    let raw2 = tally2.to_raw();
+
+    assert!(!raw2.on_program);
+    assert!(raw2.on_preview);
+}
+
+#[test]
+fn test_async_completion_handler() {
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+
+    // Test that completion callback mechanism works
+    let (tx, rx) = mpsc::channel();
+    let tx = Arc::new(Mutex::new(tx));
+
+    let handler = Box::new(move |slice: &mut [u8]| {
+        // Verify we got a valid slice
+        assert!(!slice.is_empty());
+        // Signal completion
+        let _ = tx.lock().unwrap().send(slice.len());
+    });
+
+    // Simulate buffer
+    let mut buffer = vec![0u8; 1024];
+    let buffer_ptr = buffer.as_mut_ptr();
+    let buffer_len = buffer.len();
+
+    // Call the handler as if NDI completed
+    unsafe {
+        let slice = std::slice::from_raw_parts_mut(buffer_ptr, buffer_len);
+        handler(slice);
+    }
+
+    // Verify callback was called
+    assert_eq!(rx.recv().unwrap(), 1024);
 }

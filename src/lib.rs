@@ -94,7 +94,7 @@ pub use frames::{
     MetadataFrame, VideoFrame, VideoFrameBuilder,
 };
 pub use receiver::{
-    FrameType, Receiver, ReceiverBuilder, Recv, RecvBandwidth, RecvColorFormat, Tally,
+    FrameType, Receiver, ReceiverBuilder, Recv, RecvBandwidth, RecvColorFormat, RecvStatus, Tally,
 };
 pub use runtime::NDI;
 pub use sender::{

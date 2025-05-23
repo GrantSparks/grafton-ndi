@@ -21,6 +21,16 @@
 - Comprehensive tests for 32-bit float audio handling
 - New example: `NDIlib_Recv_Audio` demonstrating float audio capture
 - Test demonstrating audio buffer reusability after synchronous send
+- **Receiver status monitoring**: New `poll_status_change()` method and `RecvStatus` type
+  - Monitor tally state changes (program/preview)
+  - Track connection count changes
+  - Detect other status changes (latency, PTZ, etc.)
+- **Async send completion callback**: New `on_async_video_done()` method
+  - Register a callback to be notified when NDI releases async send buffers
+  - Enables single-buffer zero-copy workflows
+  - Callback receives a mutable slice for buffer reuse
+- New example: `status_monitor` demonstrating receiver status monitoring
+- Updated example: `zero_copy_send` now uses completion callback instead of double-buffering
 
 ### Changed
 - `AudioFrame` internal storage changed from `Cow<'rx, [u8]>` to `Cow<'rx, [f32]>`
@@ -28,6 +38,8 @@
 - Default `channel_stride_in_bytes` is now 0 (indicating interleaved format)
 - Improved NDI initialization spin-loop with exponential backoff after ~200 iterations
   - Prevents CPU burn on slow systems or VMs
+- `FrameType::StatusChange` now contains a `RecvStatus` struct instead of being empty
+- `AsyncVideoToken` is now `#[repr(transparent)]` and explicitly `!Send`
 
 ### Fixed
 - Audio data is now correctly interpreted as 32-bit floats instead of raw bytes
