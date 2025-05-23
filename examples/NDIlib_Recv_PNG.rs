@@ -26,7 +26,7 @@ fn main() -> Result<(), Error> {
         .extra_ips("192.168.0.110")
         .build();
 
-    let ndi_find = Find::new(&ndi, finder)?;
+    let ndi_find = Find::new(&ndi, &finder)?;
 
     // Search for a specific source by name
     let source_name = "CAMERA4";

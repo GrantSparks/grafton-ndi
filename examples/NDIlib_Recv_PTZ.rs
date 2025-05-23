@@ -32,7 +32,7 @@ fn main() {
         .extra_ips("192.168.0.110")
         .build();
 
-    let ndi_find = Find::new(&ndi, finder).expect("Failed to create NDI find instance");
+    let ndi_find = Find::new(&ndi, &finder).expect("Failed to create NDI find instance");
 
     println!("Searching for NDI sources...");
 

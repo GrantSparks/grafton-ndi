@@ -23,7 +23,7 @@ fn main() -> Result<(), Error> {
     // Configure the finder
     let finder = Finder::builder().show_local_sources(true).build();
 
-    let ndi_find = Find::new(&ndi, finder)?;
+    let ndi_find = Find::new(&ndi, &finder)?;
 
     // Wait for sources to appear
     println!("Searching for NDI sources...\n");

@@ -25,7 +25,7 @@ fn main() -> Result<(), Error> {
         .build();
 
     // Create the finder instance
-    let ndi_find = Find::new(&ndi, finder)?;
+    let ndi_find = Find::new(&ndi, &finder)?;
 
     // Monitor sources for 15 seconds
     let start = Instant::now();

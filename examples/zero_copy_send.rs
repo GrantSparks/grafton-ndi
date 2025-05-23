@@ -11,7 +11,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
         .clock_video(true)
         .clock_audio(true)
         .build()?;
-    let send = grafton_ndi::SendInstance::new(&ndi, send_options)?;
+    let send = grafton_ndi::SendInstance::new(&ndi, &send_options)?;
 
     println!("Created NDI sender: {}", send.get_source_name());
 

@@ -10,7 +10,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
 
     // Create a finder to discover sources
     let finder = grafton_ndi::Finder::default();
-    let find = grafton_ndi::Find::new(&ndi, finder)?;
+    let find = grafton_ndi::Find::new(&ndi, &finder)?;
 
     // Wait for sources
     println!("Looking for NDI sources...");
@@ -38,7 +38,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
     // Create receiver
     let recv = grafton_ndi::Recv::new(
         &ndi,
-        Receiver {
+        &Receiver {
             source_to_connect_to: source,
             color_format: RecvColorFormat::BGRX_BGRA,
             bandwidth: RecvBandwidth::Highest,
