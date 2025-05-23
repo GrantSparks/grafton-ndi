@@ -41,10 +41,13 @@ fn main() -> Result<(), Error> {
         // This is more efficient than polling as it only returns when
         // sources are added or removed
         if !ndi_find.wait_for_sources(5000) {
-            println!(
-                "No changes detected ({}s remaining)",
-                (run_duration - start.elapsed()).as_secs()
-            );
+            let elapsed = start.elapsed();
+            let remaining = if elapsed < run_duration {
+                run_duration - elapsed
+            } else {
+                Duration::ZERO
+            };
+            println!("No changes detected ({}s remaining)", remaining.as_secs());
             continue;
         }
 

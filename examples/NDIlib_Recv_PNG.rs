@@ -35,7 +35,7 @@ fn main() -> Result<(), Error> {
     let mut found_source = None;
     let mut search_attempts = 0;
 
-    while found_source.is_none() {
+    while found_source.is_none() && search_attempts < 6 {
         search_attempts += 1;
 
         // Wait for sources to appear or change (timeout: 5 seconds)
@@ -63,6 +63,15 @@ fn main() -> Result<(), Error> {
         } else {
             println!("No sources found yet...");
         }
+    }
+
+    if found_source.is_none() {
+        println!(
+            "\n❌ Source '{}' not found after {} attempts.",
+            source_name, search_attempts
+        );
+        println!("Make sure the NDI source is running and accessible on the network.");
+        return Ok(());
     }
 
     let source = found_source.unwrap();

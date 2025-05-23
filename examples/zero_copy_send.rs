@@ -100,6 +100,10 @@ fn main() -> Result<(), grafton_ndi::Error> {
     }
 
     println!("\nFinished sending {} frames", frame_count);
+
+    // Wait a bit to ensure all callbacks complete before dropping the sender
+    std::thread::sleep(Duration::from_millis(100));
+
     Ok(())
 }
 
