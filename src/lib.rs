@@ -32,6 +32,7 @@ use ndi_lib::*;
 
 // Global initialization state and reference count
 static INIT: AtomicBool = AtomicBool::new(false);
+static INIT_FAILED: AtomicBool = AtomicBool::new(false);
 static REFCOUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
@@ -47,8 +48,9 @@ impl NDI {
         if prev == 0 {
             // We are the first handle → initialise the runtime.
             if !unsafe { NDIlib_initialize() } {
-                // Roll the counter back and bubble the error up.
+                // Roll the counter back and mark init as failed
                 REFCOUNT.fetch_sub(1, Ordering::SeqCst);
+                INIT_FAILED.store(true, Ordering::SeqCst);
                 return Err(Error::InitializationFailed(
                     "NDIlib_initialize failed".into(),
                 ));
@@ -56,10 +58,24 @@ impl NDI {
             INIT.store(true, Ordering::SeqCst);
         } else {
             // Someone else is (or was) doing the initialisation.
+            // Check if it failed first
+            if INIT_FAILED.load(Ordering::SeqCst) {
+                REFCOUNT.fetch_sub(1, Ordering::SeqCst);
+                return Err(Error::InitializationFailed(
+                    "NDI initialization failed previously".into(),
+                ));
+            }
             // Busy-wait until it is done so the caller never sees an
             // un-initialised runtime while REFCOUNT > 0.
-            while !INIT.load(Ordering::SeqCst) {
+            while !INIT.load(Ordering::SeqCst) && !INIT_FAILED.load(Ordering::SeqCst) {
                 std::hint::spin_loop();
+            }
+            // Check again after waiting
+            if INIT_FAILED.load(Ordering::SeqCst) {
+                REFCOUNT.fetch_sub(1, Ordering::SeqCst);
+                return Err(Error::InitializationFailed(
+                    "NDI initialization failed previously".into(),
+                ));
             }
         }
 
@@ -106,6 +122,7 @@ impl Drop for NDI {
         if REFCOUNT.fetch_sub(1, Ordering::SeqCst) == 1 {
             unsafe { NDIlib_destroy() };
             INIT.store(false, Ordering::SeqCst);
+            INIT_FAILED.store(false, Ordering::SeqCst);
         }
     }
 }
@@ -204,10 +221,17 @@ unsafe impl std::marker::Send for Find<'_> {}
 unsafe impl std::marker::Sync for Find<'_> {}
 
 #[derive(Debug, Default, Clone)]
+pub enum SourceAddress {
+    #[default]
+    None,
+    Url(String),
+    Ip(String),
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct Source {
     pub name: String,
-    pub url_address: Option<String>,
-    pub ip_address: Option<String>,
+    pub address: SourceAddress,
 }
 
 // This struct holds the CStrings to ensure they live as long as needed
@@ -226,34 +250,30 @@ impl Source {
                 .to_string_lossy()
                 .into_owned()
         };
-        let url_address = unsafe {
+        
+        // For unions, we need to determine which field is active.
+        // NDI SDK convention: URL addresses are used for NDI HX sources,
+        // IP addresses for regular sources. We check URL first as it's
+        // typically used for newer/HX sources.
+        let address = unsafe {
+            // Try URL address first
             if !ndi_source.__bindgen_anon_1.p_url_address.is_null() {
-                Some(
-                    CStr::from_ptr(ndi_source.__bindgen_anon_1.p_url_address)
-                        .to_string_lossy()
-                        .into_owned(),
-                )
+                let url_str = CStr::from_ptr(ndi_source.__bindgen_anon_1.p_url_address)
+                    .to_string_lossy()
+                    .into_owned();
+                // Validate it looks like a URL (contains ://)
+                if url_str.contains("://") {
+                    SourceAddress::Url(url_str)
+                } else {
+                    // If it doesn't look like a URL, treat as IP
+                    SourceAddress::Ip(url_str)
+                }
             } else {
-                None
-            }
-        };
-        let ip_address = unsafe {
-            if !ndi_source.__bindgen_anon_1.p_ip_address.is_null() {
-                Some(
-                    CStr::from_ptr(ndi_source.__bindgen_anon_1.p_ip_address)
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-            } else {
-                None
+                SourceAddress::None
             }
         };
 
-        Source {
-            name,
-            url_address,
-            ip_address,
-        }
+        Source { name, address }
     }
 
     /// Convert to raw format for FFI use
@@ -264,28 +284,36 @@ impl Source {
     /// for safe FFI interop with the NDI SDK.
     fn to_raw(&self) -> Result<RawSource, Error> {
         let name = CString::new(self.name.clone()).map_err(Error::InvalidCString)?;
-        let url_address = self
-            .url_address
-            .as_deref()
-            .map(CString::new)
-            .transpose()
-            .map_err(Error::InvalidCString)?;
-        let ip_address = self
-            .ip_address
-            .as_deref()
-            .map(CString::new)
-            .transpose()
-            .map_err(Error::InvalidCString)?;
+        
+        let (url_address, ip_address, __bindgen_anon_1) = match &self.address {
+            SourceAddress::Url(url) => {
+                let url_cstr = CString::new(url.clone()).map_err(Error::InvalidCString)?;
+                let p_url = url_cstr.as_ptr();
+                (
+                    Some(url_cstr),
+                    None,
+                    NDIlib_source_t__bindgen_ty_1 { p_url_address: p_url }
+                )
+            }
+            SourceAddress::Ip(ip) => {
+                let ip_cstr = CString::new(ip.clone()).map_err(Error::InvalidCString)?;
+                let p_ip = ip_cstr.as_ptr();
+                (
+                    None,
+                    Some(ip_cstr),
+                    NDIlib_source_t__bindgen_ty_1 { p_ip_address: p_ip }
+                )
+            }
+            SourceAddress::None => {
+                (
+                    None,
+                    None,
+                    NDIlib_source_t__bindgen_ty_1 { p_ip_address: ptr::null() }
+                )
+            }
+        };
 
         let p_ndi_name = name.as_ptr();
-        let p_url_address = url_address.as_ref().map_or(ptr::null(), |s| s.as_ptr());
-        let p_ip_address = ip_address.as_ref().map_or(ptr::null(), |s| s.as_ptr());
-
-        let __bindgen_anon_1 = if !p_url_address.is_null() {
-            NDIlib_source_t__bindgen_ty_1 { p_url_address }
-        } else {
-            NDIlib_source_t__bindgen_ty_1 { p_ip_address }
-        };
 
         Ok(RawSource {
             _name: name,
@@ -301,7 +329,11 @@ impl Source {
 
 impl Display for Source {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.name)
+        match &self.address {
+            SourceAddress::Url(url) => write!(f, "{}@{}", self.name, url),
+            SourceAddress::Ip(ip) => write!(f, "{}@{}", self.name, ip),
+            SourceAddress::None => write!(f, "{}", self.name),
+        }
     }
 }
 
@@ -505,22 +537,35 @@ impl VideoFrame<'_> {
             ));
         }
 
-        // SAFETY: For union access, we need to determine which field to use
-        // based on the video format. Since we don't have format info here,
-        // we'll use a heuristic: if line_stride would give us a reasonable size,
-        // use it; otherwise use data_size_in_bytes
+        let fourcc = FourCCVideoType::try_from(c_frame.FourCC).unwrap_or(FourCCVideoType::Max);
+        
+        // Determine data size based on whether we have line_stride or data_size_in_bytes
+        // The NDI SDK uses a union here: line_stride_in_bytes for uncompressed formats,
+        // data_size_in_bytes for compressed formats.
+        let data_size_in_bytes = c_frame.__bindgen_anon_1.data_size_in_bytes;
         let line_stride = c_frame.__bindgen_anon_1.line_stride_in_bytes;
-        let potential_stride_size = line_stride as usize * c_frame.yres as usize;
-
-        let data_size = if line_stride > 0
-            && potential_stride_size > 0
-            && potential_stride_size < (100 * 1024 * 1024)
-        {
-            // Reasonable size for uncompressed video (< 100MB per frame)
-            potential_stride_size
+        
+        // Since this is a union, we need to determine which field is valid
+        // For uncompressed formats, line_stride * height should equal a reasonable frame size
+        let potential_stride_size = if line_stride > 0 && c_frame.yres > 0 {
+            (line_stride as usize) * (c_frame.yres as usize)
         } else {
-            // Use data_size_in_bytes for compressed formats
-            c_frame.__bindgen_anon_1.data_size_in_bytes as usize
+            0
+        };
+        
+        let (data_size, line_stride_or_size) = if line_stride > 0 && potential_stride_size > 0 
+            && potential_stride_size <= (100 * 1024 * 1024) {
+            // Reasonable size for uncompressed video (< 100MB per frame)
+            // Use line stride for calculation
+            (potential_stride_size, LineStrideOrSize { line_stride_in_bytes: line_stride })
+        } else if data_size_in_bytes > 0 {
+            // Use the explicit data size (likely compressed format)
+            (data_size_in_bytes as usize, LineStrideOrSize { data_size_in_bytes })
+        } else {
+            // Neither field is valid - this is an error
+            return Err(Error::InvalidFrame(
+                "Video frame has neither valid line_stride_in_bytes nor data_size_in_bytes".into()
+            ));
         };
 
         if data_size == 0 {
@@ -538,7 +583,7 @@ impl VideoFrame<'_> {
         Ok(VideoFrame {
             xres: c_frame.xres,
             yres: c_frame.yres,
-            fourcc: FourCCVideoType::try_from(c_frame.FourCC).unwrap_or(FourCCVideoType::Max),
+            fourcc,
             frame_rate_n: c_frame.frame_rate_N,
             frame_rate_d: c_frame.frame_rate_D,
             picture_aspect_ratio: c_frame.picture_aspect_ratio,
@@ -546,9 +591,7 @@ impl VideoFrame<'_> {
                 .unwrap_or(FrameFormatType::Max),
             timecode: c_frame.timecode,
             data: Cow::Owned(data),
-            line_stride_or_size: LineStrideOrSize {
-                data_size_in_bytes: data_size as i32,
-            },
+            line_stride_or_size,
             metadata,
             timestamp: c_frame.timestamp,
         })
@@ -1027,72 +1070,140 @@ impl<'a> Recv<'a> {
         unsafe { NDIlib_recv_ptz_is_supported(self.instance) }
     }
 
-    pub fn ptz_recall_preset(&self, preset: u32, speed: f32) -> bool {
-        unsafe { NDIlib_recv_ptz_recall_preset(self.instance, preset as i32, speed) }
+    pub fn ptz_recall_preset(&self, preset: u32, speed: f32) -> Result<(), Error> {
+        if unsafe { NDIlib_recv_ptz_recall_preset(self.instance, preset as i32, speed) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed("Failed to recall PTZ preset".into()))
+        }
     }
 
-    pub fn ptz_zoom(&self, zoom_value: f32) -> bool {
-        unsafe { NDIlib_recv_ptz_zoom(self.instance, zoom_value) }
+    pub fn ptz_zoom(&self, zoom_value: f32) -> Result<(), Error> {
+        if unsafe { NDIlib_recv_ptz_zoom(self.instance, zoom_value) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed("Failed to set PTZ zoom".into()))
+        }
     }
 
-    pub fn ptz_zoom_speed(&self, zoom_speed: f32) -> bool {
-        unsafe { NDIlib_recv_ptz_zoom_speed(self.instance, zoom_speed) }
+    pub fn ptz_zoom_speed(&self, zoom_speed: f32) -> Result<(), Error> {
+        if unsafe { NDIlib_recv_ptz_zoom_speed(self.instance, zoom_speed) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed("Failed to set PTZ zoom speed".into()))
+        }
     }
 
-    pub fn ptz_pan_tilt(&self, pan_value: f32, tilt_value: f32) -> bool {
-        unsafe { NDIlib_recv_ptz_pan_tilt(self.instance, pan_value, tilt_value) }
+    pub fn ptz_pan_tilt(&self, pan_value: f32, tilt_value: f32) -> Result<(), Error> {
+        if unsafe { NDIlib_recv_ptz_pan_tilt(self.instance, pan_value, tilt_value) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed("Failed to set PTZ pan/tilt".into()))
+        }
     }
 
-    pub fn ptz_pan_tilt_speed(&self, pan_speed: f32, tilt_speed: f32) -> bool {
-        unsafe { NDIlib_recv_ptz_pan_tilt_speed(self.instance, pan_speed, tilt_speed) }
+    pub fn ptz_pan_tilt_speed(&self, pan_speed: f32, tilt_speed: f32) -> Result<(), Error> {
+        if unsafe { NDIlib_recv_ptz_pan_tilt_speed(self.instance, pan_speed, tilt_speed) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed("Failed to set PTZ pan/tilt speed".into()))
+        }
     }
 
-    pub fn ptz_store_preset(&self, preset_no: i32) -> bool {
-        unsafe { NDIlib_recv_ptz_store_preset(self.instance, preset_no) }
+    pub fn ptz_store_preset(&self, preset_no: i32) -> Result<(), Error> {
+        if unsafe { NDIlib_recv_ptz_store_preset(self.instance, preset_no) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed("Failed to store PTZ preset".into()))
+        }
     }
 
-    pub fn ptz_auto_focus(&self) -> bool {
-        unsafe { NDIlib_recv_ptz_auto_focus(self.instance) }
+    pub fn ptz_auto_focus(&self) -> Result<(), Error> {
+        if unsafe { NDIlib_recv_ptz_auto_focus(self.instance) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed("Failed to enable PTZ auto focus".into()))
+        }
     }
 
-    pub fn ptz_focus(&self, focus_value: f32) -> bool {
-        unsafe { NDIlib_recv_ptz_focus(self.instance, focus_value) }
+    pub fn ptz_focus(&self, focus_value: f32) -> Result<(), Error> {
+        if unsafe { NDIlib_recv_ptz_focus(self.instance, focus_value) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed("Failed to set PTZ focus".into()))
+        }
     }
 
-    pub fn ptz_focus_speed(&self, focus_speed: f32) -> bool {
-        unsafe { NDIlib_recv_ptz_focus_speed(self.instance, focus_speed) }
+    pub fn ptz_focus_speed(&self, focus_speed: f32) -> Result<(), Error> {
+        if unsafe { NDIlib_recv_ptz_focus_speed(self.instance, focus_speed) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed("Failed to set PTZ focus speed".into()))
+        }
     }
 
-    pub fn ptz_white_balance_auto(&self) -> bool {
-        unsafe { NDIlib_recv_ptz_white_balance_auto(self.instance) }
+    pub fn ptz_white_balance_auto(&self) -> Result<(), Error> {
+        if unsafe { NDIlib_recv_ptz_white_balance_auto(self.instance) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed("Failed to set PTZ auto white balance".into()))
+        }
     }
 
-    pub fn ptz_white_balance_indoor(&self) -> bool {
-        unsafe { NDIlib_recv_ptz_white_balance_indoor(self.instance) }
+    pub fn ptz_white_balance_indoor(&self) -> Result<(), Error> {
+        if unsafe { NDIlib_recv_ptz_white_balance_indoor(self.instance) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed("Failed to set PTZ indoor white balance".into()))
+        }
     }
 
-    pub fn ptz_white_balance_outdoor(&self) -> bool {
-        unsafe { NDIlib_recv_ptz_white_balance_outdoor(self.instance) }
+    pub fn ptz_white_balance_outdoor(&self) -> Result<(), Error> {
+        if unsafe { NDIlib_recv_ptz_white_balance_outdoor(self.instance) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed("Failed to set PTZ outdoor white balance".into()))
+        }
     }
 
-    pub fn ptz_white_balance_oneshot(&self) -> bool {
-        unsafe { NDIlib_recv_ptz_white_balance_oneshot(self.instance) }
+    pub fn ptz_white_balance_oneshot(&self) -> Result<(), Error> {
+        if unsafe { NDIlib_recv_ptz_white_balance_oneshot(self.instance) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed("Failed to set PTZ oneshot white balance".into()))
+        }
     }
 
-    pub fn ptz_white_balance_manual(&self, red: f32, blue: f32) -> bool {
-        unsafe { NDIlib_recv_ptz_white_balance_manual(self.instance, red, blue) }
+    pub fn ptz_white_balance_manual(&self, red: f32, blue: f32) -> Result<(), Error> {
+        if unsafe { NDIlib_recv_ptz_white_balance_manual(self.instance, red, blue) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed("Failed to set PTZ manual white balance".into()))
+        }
     }
 
-    pub fn ptz_exposure_auto(&self) -> bool {
-        unsafe { NDIlib_recv_ptz_exposure_auto(self.instance) }
+    pub fn ptz_exposure_auto(&self) -> Result<(), Error> {
+        if unsafe { NDIlib_recv_ptz_exposure_auto(self.instance) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed("Failed to set PTZ auto exposure".into()))
+        }
     }
 
-    pub fn ptz_exposure_manual(&self, exposure_level: f32) -> bool {
-        unsafe { NDIlib_recv_ptz_exposure_manual(self.instance, exposure_level) }
+    pub fn ptz_exposure_manual(&self, exposure_level: f32) -> Result<(), Error> {
+        if unsafe { NDIlib_recv_ptz_exposure_manual(self.instance, exposure_level) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed("Failed to set PTZ manual exposure".into()))
+        }
     }
 
-    pub fn ptz_exposure_manual_v2(&self, iris: f32, gain: f32, shutter_speed: f32) -> bool {
-        unsafe { NDIlib_recv_ptz_exposure_manual_v2(self.instance, iris, gain, shutter_speed) }
+    pub fn ptz_exposure_manual_v2(&self, iris: f32, gain: f32, shutter_speed: f32) -> Result<(), Error> {
+        if unsafe { NDIlib_recv_ptz_exposure_manual_v2(self.instance, iris, gain, shutter_speed) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed("Failed to set PTZ manual exposure v2".into()))
+        }
     }
 }
 
@@ -1148,6 +1259,24 @@ pub struct Send<'a> {
     ndi: std::marker::PhantomData<&'a NDI>,
 }
 
+/// A token that ensures the video frame remains valid while NDI is using it.
+/// The frame will be released when this token is dropped or when the next
+/// send operation occurs.
+#[must_use = "AsyncVideoToken must be held until the next send operation"]
+pub struct AsyncVideoToken<'a, 'b> {
+    _send: &'a Send<'b>,
+    _frame: std::marker::PhantomData<&'a VideoFrame<'a>>,
+}
+
+/// A token that ensures the audio frame remains valid while NDI is using it.
+/// The frame will be released when this token is dropped or when the next
+/// send operation occurs.
+#[must_use = "AsyncAudioToken must be held until the next send operation"]
+pub struct AsyncAudioToken<'a, 'b> {
+    _send: &'a Send<'b>,
+    _frame: std::marker::PhantomData<&'a AudioFrame<'a>>,
+}
+
 impl<'a> Send<'a> {
     pub fn new(_ndi: &'a NDI, create_settings: Sender) -> Result<Self, Error> {
         let p_ndi_name = CString::new(create_settings.name).map_err(Error::InvalidCString)?;
@@ -1197,12 +1326,10 @@ impl<'a> Send<'a> {
 
     /// Send a video frame **asynchronously** (NDI *keeps a pointer*; no copy).
     ///
-    /// # Safety
-    /// The NDI SDK documentation states that the buffer you pass **must remain valid
-    /// until the next call to any `send_*` function** (sync or async) *or* until the
-    /// `Send` instance is dropped.  
-    /// Breaking this rule is immediate undefined behaviour in the C layer.
+    /// Returns an `AsyncVideoToken` that must be held until the next send operation.
+    /// The frame data is guaranteed to remain valid as long as the token exists.
     ///
+    /// # Example
     /// ```no_run
     /// # use grafton_ndi::{NDI, Sender, VideoFrame};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
@@ -1212,21 +1339,41 @@ impl<'a> Send<'a> {
     ///     Sender { name: "MyCam".into(), groups: None, clock_video: true, clock_audio: true }
     /// )?;
     ///
-    /// // allocate the frame somewhere that outlives the next send
     /// let frame = VideoFrame::default();
-    ///
-    /// unsafe { send.send_video_async(&frame); }
-    /// // do NOT drop or mutate `frame` yet
+    /// let _token = send.send_video_async(&frame);
+    /// // Frame is now being used by NDI - safe as long as token exists
+    /// 
+    /// // When token is dropped or next send occurs, frame is released
     /// # Ok(())
     /// # }
     /// ```
-    pub unsafe fn send_video_async(&self, video_frame: &VideoFrame<'_>) {
-        NDIlib_send_send_video_async_v2(self.instance, &video_frame.to_raw());
+    pub fn send_video_async<'b>(&'b self, video_frame: &'b VideoFrame<'_>) -> AsyncVideoToken<'b, 'a> {
+        unsafe {
+            NDIlib_send_send_video_async_v2(self.instance, &video_frame.to_raw());
+        }
+        AsyncVideoToken {
+            _send: self,
+            _frame: std::marker::PhantomData,
+        }
     }
 
     pub fn send_audio(&self, audio_frame: &AudioFrame<'_>) {
         unsafe {
             NDIlib_send_send_audio_v3(self.instance, &audio_frame.to_raw());
+        }
+    }
+    
+    /// Send an audio frame **asynchronously** (NDI *keeps a pointer*; no copy).
+    ///
+    /// Returns an `AsyncAudioToken` that must be held until the next send operation.
+    /// The frame data is guaranteed to remain valid as long as the token exists.
+    pub fn send_audio_async<'b>(&'b self, audio_frame: &'b AudioFrame<'_>) -> AsyncAudioToken<'b, 'a> {
+        unsafe {
+            NDIlib_send_send_audio_v3(self.instance, &audio_frame.to_raw());
+        }
+        AsyncAudioToken {
+            _send: self,
+            _frame: std::marker::PhantomData,
         }
     }
 
@@ -1437,7 +1584,7 @@ mod tests {
             assert!(result.is_err());
             match result {
                 Err(Error::InvalidFrame(msg)) => {
-                    assert!(msg.contains("zero size"));
+                    assert!(msg.contains("neither valid line_stride_in_bytes nor data_size_in_bytes"));
                 }
                 _ => panic!("Expected InvalidFrame error"),
             }
@@ -1468,8 +1615,7 @@ mod tests {
         // Test that RawSource properly manages CString memory
         let source = Source {
             name: "Test NDI Source".to_string(),
-            url_address: Some("ndi://192.168.1.100:5960".to_string()),
-            ip_address: Some("192.168.1.100".to_string()),
+            address: SourceAddress::Url("ndi://192.168.1.100:5960".to_string()),
         };
 
         // Create RawSource
@@ -1496,8 +1642,7 @@ mod tests {
         // Test with None values for optional fields
         let source = Source {
             name: "Minimal Source".to_string(),
-            url_address: None,
-            ip_address: None,
+            address: SourceAddress::None,
         };
 
         let raw_source = source.to_raw().unwrap();
@@ -1572,8 +1717,7 @@ mod tests {
         let receiver = Receiver::new(
             Source {
                 name: "Test Source".to_string(),
-                url_address: None,
-                ip_address: None,
+                address: SourceAddress::None,
             },
             RecvColorFormat::BGRX_BGRA,
             RecvBandwidth::Highest,
@@ -1604,16 +1748,19 @@ mod tests {
         // Test converting Source to raw and back
         let original = Source {
             name: "Roundtrip Test".to_string(),
-            url_address: Some("ndi://test.local".to_string()),
-            ip_address: Some("10.0.0.1".to_string()),
+            address: SourceAddress::Url("ndi://test.local".to_string()),
         };
 
         let raw = original.to_raw().unwrap();
         let restored = Source::from_raw(&raw.raw);
 
         assert_eq!(original.name, restored.name);
-        assert_eq!(original.url_address, restored.url_address);
-        // Note: ip_address might not round-trip perfectly due to union behavior
+        match (&original.address, &restored.address) {
+            (SourceAddress::Url(orig_url), SourceAddress::Url(rest_url)) => {
+                assert_eq!(orig_url, rest_url);
+            }
+            _ => panic!("Address types don't match"),
+        }
     }
 
     #[test]
@@ -1794,8 +1941,7 @@ mod tests {
         let receiver = Receiver::new(
             Source {
                 name: "Test Source".to_string(),
-                url_address: Some("ndi://test.local".to_string()),
-                ip_address: None,
+                address: SourceAddress::Url("ndi://test.local".to_string()),
             },
             RecvColorFormat::BGRX_BGRA,
             RecvBandwidth::Highest,

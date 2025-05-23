@@ -37,7 +37,9 @@ fn main() {
             if let Ok(FrameType::StatusChange) = ndi_recv.capture(1000) {
                 if ndi_recv.ptz_is_supported() {
                     println!("This source supports PTZ functionality. Moving to preset #3.");
-                    ndi_recv.ptz_recall_preset(3, 1.0);
+                    if let Err(e) = ndi_recv.ptz_recall_preset(3, 1.0) {
+                        eprintln!("Failed to recall PTZ preset: {}", e);
+                    }
                 }
             }
         }

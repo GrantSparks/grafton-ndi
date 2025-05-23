@@ -95,16 +95,22 @@ assert!(NDI::is_running());   // runtime active again
 ```
 
 #### 7. Async Send API
-The old safe `send_video_async` is now deprecated because it could lead to use-after-free if the frame is dropped too soon. You must now choose one:
-  - Use the unsafe, zero-copy variant and ensure the frame outlives the call:
-    ```rust no_run
-    unsafe { send.send_video_async_unchecked(&frame) }
-    ```
-  - Or continue to use the deprecated helper (not recommended):
-    ```rust
-    #[deprecated]
-    send.send_video_async(&frame);
-    ```
+The async send API has been redesigned with a safer token-based approach to prevent use-after-free errors:
+**Before (0.4.x):**
+```rust
+unsafe { send.send_video_async(&frame); }
+// Developer must manually ensure frame outlives the send operation
+```
+
+**After (0.5.0):**
+```rust
+// Safe token-based API - frame remains valid while token exists
+let _token = send.send_video_async(&frame);
+// Frame is automatically protected from being dropped
+
+// Also available for audio
+let _audio_token = send.send_audio_async(&audio_frame);
+```
 
 #### 8. Frame Creation Error Handling
 **Before (0.4.x):**
@@ -147,6 +153,60 @@ let frame_type: FrameType = recv.capture(timeout);
 let frame_type: FrameType<'_> = recv.capture(timeout); // Now has lifetime parameter
 ```
 
+#### 12. Source Address Changes
+**Before (0.4.x):**
+```rust
+let source = Source {
+    name: "My Source".to_string(),
+    url_address: Some("ndi://192.168.1.100:5960".to_string()),
+    ip_address: Some("192.168.1.100".to_string()),
+};
+```
+
+**After (0.5.0):**
+```rust
+let source = Source {
+    name: "My Source".to_string(),
+    address: SourceAddress::Url("ndi://192.168.1.100:5960".to_string()),
+    // OR
+    // address: SourceAddress::Ip("192.168.1.100".to_string()),
+    // address: SourceAddress::None,
+};
+```
+
+#### 13. PTZ Methods Return Results
+**Before (0.4.x):**
+```rust
+if recv.ptz_recall_preset(3, 1.0) {
+    println!("Preset recalled");
+}
+```
+
+**After (0.5.0):**
+```rust
+if let Err(e) = recv.ptz_recall_preset(3, 1.0) {
+    eprintln!("Failed to recall preset: {}", e);
+}
+// All PTZ methods now return Result<(), Error>
+```
+
+#### 14. Async Send API with Tokens
+**Before (0.4.x):**
+```rust
+unsafe { send.send_video_async(&frame); }
+// Must manually ensure frame outlives send
+```
+
+**After (0.5.0):**
+```rust
+// Safe token-based API
+let _token = send.send_video_async(&frame);
+// Frame automatically remains valid while token exists
+
+// Also available for audio
+let _audio_token = send.send_audio_async(&audio_frame);
+```
+
 ### ✨ New Features in 0.5.0
 
 - **Thread Safety**: `Recv`, `Send`, and `Find` are now `Send + Sync`
@@ -155,8 +215,12 @@ let frame_type: FrameType<'_> = recv.capture(timeout); // Now has lifetime param
 - **Memory Safety**: Eliminated all use-after-free and double-free vulnerabilities
 - **Better Error Handling**: Automatic IO error bubbling with `thiserror`
 - **FFI Safety**: All FFI structs use `#[repr(C)]` for guaranteed layout
-- **New Error Types**: Added `Error::InvalidFrame` for frame validation failures
+- **New Error Types**: Added `Error::InvalidFrame` and `Error::PtzCommandFailed` for better error handling
 - **Default Implementations**: `RecvColorFormat` and `RecvBandwidth` now have sensible defaults
+- **Safer Async Send**: New token-based API for async send operations prevents use-after-free
+- **Improved Source Management**: New `SourceAddress` enum provides type-safe address handling
+- **Better PTZ Error Handling**: All PTZ methods now return `Result` for proper error propagation
+- **Robust Initialization**: Improved NDI runtime initialization with better failure tracking
 
 ### 🔍 Migration Checklist
 
@@ -168,6 +232,9 @@ let frame_type: FrameType<'_> = recv.capture(timeout); // Now has lifetime param
 - [ ] Remove any calls to `Send::free_metadata()` (no longer needed)
 - [ ] Update `FrameType` usage to include lifetime parameter
 - [ ] Remove manual IO error wrapping (use `?` operator instead)
+- [ ] Update `Source` structs to use new `SourceAddress` enum instead of separate `url_address`/`ip_address` fields
+- [ ] Add error handling for PTZ methods (they now return `Result` instead of `bool`)
+- [ ] Update async send calls to use the new token-based API if safety is desired
 - [ ] Test thread safety improvements if using across threads
 - [ ] Verify that memory-intensive operations now use less memory (zero-copy)
 
@@ -205,22 +272,27 @@ cargo run --example NDIlib_Find
 ```
 
 ### Async Send Example
-Demonstrates the unsafe asynchronous send API. The provided `VideoFrame` must outlive the send call.
+Demonstrates the safe token-based asynchronous send API. The token ensures the frame remains valid while NDI is using it.
 ```rust,no_run
 use grafton_ndi::{NDI, Sender, Send, VideoFrame};
 
 fn main() -> Result<(), grafton_ndi::Error> {
     // Initialize NDI runtime
     let ndi = NDI::new()?;
-    // Create sender settings and instance
-    let settings = Sender::builder("MySend").build(&ndi)?;
+    // Create sender settings
+    let settings = Sender {
+        name: "MySend".into(),
+        groups: None,
+        clock_video: true,
+        clock_audio: true,
+    };
     let send = Send::new(&ndi, settings)?;
     // Obtain or generate a video frame
     let frame: VideoFrame = get_frame();
-    // Unsafe async send: frame must remain alive until next send or sender drop
-    unsafe {
-        send.send_video_async_unchecked(&frame);
-    }
+    // Safe async send: token keeps frame alive
+    let _token = send.send_video_async(&frame);
+    // Frame remains valid while token exists
+    // Token is automatically dropped when no longer needed
     Ok(())
 }
 ```  

@@ -16,6 +16,8 @@ pub enum Error {
     CaptureFailed(String),
     #[error("Invalid frame data: {0}")]
     InvalidFrame(String),
+    #[error("PTZ command failed: {0}")]
+    PtzCommandFailed(String),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
