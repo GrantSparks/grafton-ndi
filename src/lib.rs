@@ -13,6 +13,7 @@
 
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
+use num_enum::{IntoPrimitive, TryFromPrimitive};
 use once_cell::sync::OnceCell;
 use std::{
     borrow::Cow,
@@ -292,100 +293,34 @@ impl Display for Source {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, TryFromPrimitive, IntoPrimitive, Clone, Copy)]
+#[repr(u32)]
 pub enum FourCCVideoType {
-    UYVY,
-    UYVA,
-    P216,
-    PA16,
-    YV12,
-    I420,
-    NV12,
-    BGRA,
-    BGRX,
-    RGBA,
-    RGBX,
-    Max,
+    UYVY = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY,
+    UYVA = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVA,
+    P216 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_P216,
+    PA16 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_PA16,
+    YV12 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_YV12,
+    I420 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_I420,
+    NV12 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NV12,
+    BGRA = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA,
+    BGRX = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRX,
+    RGBA = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBA,
+    RGBX = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBX,
+    Max = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_max,
 }
 
-impl From<FourCCVideoType> for NDIlib_FourCC_video_type_e {
-    fn from(fourcc: FourCCVideoType) -> Self {
-        match fourcc {
-            FourCCVideoType::UYVY => NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY,
-            FourCCVideoType::UYVA => NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVA,
-            FourCCVideoType::P216 => NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_P216,
-            FourCCVideoType::PA16 => NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_PA16,
-            FourCCVideoType::YV12 => NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_YV12,
-            FourCCVideoType::I420 => NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_I420,
-            FourCCVideoType::NV12 => NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NV12,
-            FourCCVideoType::BGRA => NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA,
-            FourCCVideoType::BGRX => NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRX,
-            FourCCVideoType::RGBA => NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBA,
-            FourCCVideoType::RGBX => NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBX,
-            FourCCVideoType::Max => NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_max,
-        }
-    }
-}
 
-impl From<NDIlib_FourCC_video_type_e> for FourCCVideoType {
-    fn from(fourcc: NDIlib_FourCC_video_type_e) -> Self {
-        match fourcc {
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY => FourCCVideoType::UYVY,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVA => FourCCVideoType::UYVA,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_P216 => FourCCVideoType::P216,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_PA16 => FourCCVideoType::PA16,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_YV12 => FourCCVideoType::YV12,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_I420 => FourCCVideoType::I420,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NV12 => FourCCVideoType::NV12,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA => FourCCVideoType::BGRA,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRX => FourCCVideoType::BGRX,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBA => FourCCVideoType::RGBA,
-            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBX => FourCCVideoType::RGBX,
-            _ => FourCCVideoType::Max,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, TryFromPrimitive, IntoPrimitive, Clone, Copy)]
+#[repr(u32)]
 pub enum FrameFormatType {
-    Progressive,
-    Interlaced,
-    Field0,
-    Field1,
-    Max,
+    Progressive = NDIlib_frame_format_type_e_NDIlib_frame_format_type_progressive,
+    Interlaced = NDIlib_frame_format_type_e_NDIlib_frame_format_type_interleaved,
+    Field0 = NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_0,
+    Field1 = NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_1,
+    Max = NDIlib_frame_format_type_e_NDIlib_frame_format_type_max,
 }
 
-impl From<FrameFormatType> for NDIlib_frame_format_type_e {
-    fn from(format: FrameFormatType) -> Self {
-        match format {
-            FrameFormatType::Progressive => {
-                NDIlib_frame_format_type_e_NDIlib_frame_format_type_progressive
-            }
-            FrameFormatType::Interlaced => {
-                NDIlib_frame_format_type_e_NDIlib_frame_format_type_interleaved
-            }
-            FrameFormatType::Field0 => NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_0,
-            FrameFormatType::Field1 => NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_1,
-            FrameFormatType::Max => NDIlib_frame_format_type_e_NDIlib_frame_format_type_max,
-        }
-    }
-}
-
-impl From<NDIlib_frame_format_type_e> for FrameFormatType {
-    fn from(format: NDIlib_frame_format_type_e) -> Self {
-        match format {
-            NDIlib_frame_format_type_e_NDIlib_frame_format_type_progressive => {
-                FrameFormatType::Progressive
-            }
-            NDIlib_frame_format_type_e_NDIlib_frame_format_type_interleaved => {
-                FrameFormatType::Interlaced
-            }
-            NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_0 => FrameFormatType::Field0,
-            NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_1 => FrameFormatType::Field1,
-            _ => FrameFormatType::Max,
-        }
-    }
-}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -587,11 +522,11 @@ impl<'a> VideoFrame<'a> {
         Ok(VideoFrame {
             xres: c_frame.xres,
             yres: c_frame.yres,
-            fourcc: c_frame.FourCC.into(),
+            fourcc: FourCCVideoType::try_from(c_frame.FourCC).unwrap_or(FourCCVideoType::Max),
             frame_rate_n: c_frame.frame_rate_N,
             frame_rate_d: c_frame.frame_rate_D,
             picture_aspect_ratio: c_frame.picture_aspect_ratio,
-            frame_format_type: c_frame.frame_format_type.into(),
+            frame_format_type: FrameFormatType::try_from(c_frame.frame_format_type).unwrap_or(FrameFormatType::Max),
             timecode: c_frame.timecode,
             data: Cow::Borrowed(data),
             line_stride_or_size: LineStrideOrSize {
@@ -643,11 +578,11 @@ impl<'a> VideoFrame<'a> {
         Ok(VideoFrame {
             xres: c_frame.xres,
             yres: c_frame.yres,
-            fourcc: c_frame.FourCC.into(),
+            fourcc: FourCCVideoType::try_from(c_frame.FourCC).unwrap_or(FourCCVideoType::Max),
             frame_rate_n: c_frame.frame_rate_N,
             frame_rate_d: c_frame.frame_rate_D,
             picture_aspect_ratio: c_frame.picture_aspect_ratio,
-            frame_format_type: c_frame.frame_format_type.into(),
+            frame_format_type: FrameFormatType::try_from(c_frame.frame_format_type).unwrap_or(FrameFormatType::Max),
             timecode: c_frame.timecode,
             data: Cow::Owned(data),
             line_stride_or_size: LineStrideOrSize {
@@ -792,30 +727,13 @@ impl Default for AudioFrame<'_> {
 
 // Drop implementation removed - CString handles its own memory management
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, TryFromPrimitive, IntoPrimitive, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 pub enum AudioType {
-    FLTP,
-    Max,
+    FLTP = NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+    Max = NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_max,
 }
 
-impl From<u32> for AudioType {
-    fn from(value: u32) -> Self {
-        if value == NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP {
-            AudioType::FLTP
-        } else {
-            AudioType::Max
-        }
-    }
-}
-
-impl From<AudioType> for u32 {
-    fn from(audio_type: AudioType) -> Self {
-        match audio_type {
-            AudioType::FLTP => NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
-            AudioType::Max => NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_max,
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct MetadataFrame {
