@@ -54,6 +54,14 @@ pub enum FourCCVideoType {
     Max = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_max as _,
 }
 
+// Platform-specific conversions for Windows compatibility
+impl From<FourCCVideoType> for i32 {
+    fn from(value: FourCCVideoType) -> Self {
+        let u32_value: u32 = value.into();
+        u32_value as i32
+    }
+}
+
 #[derive(Debug, TryFromPrimitive, IntoPrimitive, Clone, Copy)]
 #[repr(u32)]
 pub enum FrameFormatType {
@@ -62,6 +70,13 @@ pub enum FrameFormatType {
     Field0 = NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_0 as _,
     Field1 = NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_1 as _,
     Max = NDIlib_frame_format_type_e_NDIlib_frame_format_type_max as _,
+}
+
+impl From<FrameFormatType> for i32 {
+    fn from(value: FrameFormatType) -> Self {
+        let u32_value: u32 = value.into();
+        u32_value as i32
+    }
 }
 
 #[repr(C)]
@@ -205,7 +220,8 @@ impl<'rx> VideoFrame<'rx> {
         }
 
         #[allow(clippy::unnecessary_cast)] // Required for Windows where FourCC is i32
-        let fourcc = FourCCVideoType::try_from(c_frame.FourCC as u32).unwrap_or(FourCCVideoType::Max);
+        let fourcc =
+            FourCCVideoType::try_from(c_frame.FourCC as u32).unwrap_or(FourCCVideoType::Max);
 
         // Determine data size based on whether we have line_stride or data_size_in_bytes
         // The NDI SDK uses a union here: line_stride_in_bytes for uncompressed formats,
@@ -830,6 +846,13 @@ impl Drop for AudioFrame<'_> {
 pub enum AudioType {
     FLTP = NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP as _,
     Max = NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_max as _,
+}
+
+impl From<AudioType> for i32 {
+    fn from(value: AudioType) -> Self {
+        let u32_value: u32 = value.into();
+        u32_value as i32
+    }
 }
 
 #[derive(Debug, Clone)]
