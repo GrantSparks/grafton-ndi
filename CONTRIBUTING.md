@@ -78,6 +78,24 @@ docs(api): improve VideoFrame builder documentation
 - Include integration tests for complex features
 - Test on multiple platforms if possible
 
+### CI/CD Configuration
+
+#### GitHub Actions NDI SDK
+
+The CI/CD pipeline requires the NDI SDK to build and test the project. You can configure the SDK version in two ways:
+
+1. **Default**: Uses the hardcoded NDI 6 SDK URL in the workflow
+2. **Custom**: Set the `NDI_SDK_URL` repository secret to use a different SDK version
+
+To update the NDI SDK version for CI/CD:
+1. Go to Settings → Secrets and variables → Actions in your GitHub repository
+2. Create or update the `NDI_SDK_URL` secret with the new SDK download URL
+3. The cache will automatically invalidate when the URL changes
+
+Example URLs:
+- NDI 6: `https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe`
+- NDI 5: `https://downloads.ndi.tv/SDK/NDI_SDK/NDI%205%20SDK.exe`
+
 ### Documentation
 
 - Update relevant documentation for any API changes

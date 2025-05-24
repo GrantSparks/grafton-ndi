@@ -12,22 +12,30 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
   NDI_SDK_DIR: C:\Program Files\NDI\NDI 6 SDK
-  NDI_SDK_URL: "https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe"
+  # Set NDI_SDK_URL as a repository secret to use a different SDK version
+  # Default: NDI 6 SDK from official download site
+  NDI_SDK_URL: ${{ secrets.NDI_SDK_URL || 'https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe' }}
   NDI_SDK_INSTALLER: NDI_SDK_Installer.exe
-  # Update this when changing NDI_SDK_URL to invalidate cache
-  NDI_SDK_CACHE_KEY: "ndi-6.1-sdk"
 
 jobs:
   setup:
     name: Setup NDI SDK
     runs-on: windows-latest
     steps:
+      - name: Generate cache key from URL
+        id: cache-key
+        run: |
+          $url = "${{ env.NDI_SDK_URL }}"
+          $hash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($url))).Replace("-", "").Substring(0, 16)
+          echo "key=ndi-sdk-$hash-windows" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
       - name: Cache NDI SDK
         id: cache-ndi
         uses: actions/cache@v4
         with:
           path: ${{ env.NDI_SDK_DIR }}
-          key: ${{ env.NDI_SDK_CACHE_KEY }}-windows
+          key: ${{ steps.cache-key.outputs.key }}
 
       - name: Download and Install NDI SDK (if not cached)
         if: steps.cache-ndi.outputs.cache-hit != 'true'
@@ -52,20 +60,20 @@ jobs:
       - name: Install LLVM for bindgen (Windows)
         run: choco install llvm
 
-      - name: Cache NDI SDK
-        id: cache-ndi
+      - name: Generate cache key from URL
+        id: cache-key
+        run: |
+          $url = "${{ env.NDI_SDK_URL }}"
+          $hash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($url))).Replace("-", "").Substring(0, 16)
+          echo "key=ndi-sdk-$hash-windows" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+      - name: Restore NDI SDK from cache
         uses: actions/cache@v4
         with:
           path: ${{ env.NDI_SDK_DIR }}
-          key: ${{ env.NDI_SDK_CACHE_KEY }}-windows
-
-      - name: Download and Install NDI SDK (if not cached)
-        if: steps.cache-ndi.outputs.cache-hit != 'true'
-        run: |
-          curl -L -o ${{ env.NDI_SDK_INSTALLER }} "${{ env.NDI_SDK_URL }}"
-          Start-Process -FilePath "${{ env.NDI_SDK_INSTALLER }}" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$env:NDI_SDK_DIR" -Wait
-          Remove-Item ${{ env.NDI_SDK_INSTALLER }}
-        shell: pwsh
+          key: ${{ steps.cache-key.outputs.key }}
+          fail-on-cache-miss: true
 
       - name: Set Environment Variables (Windows)
         run: |
@@ -94,20 +102,20 @@ jobs:
       - name: Install LLVM for bindgen (Windows)
         run: choco install llvm
 
-      - name: Cache NDI SDK
-        id: cache-ndi
+      - name: Generate cache key from URL
+        id: cache-key
+        run: |
+          $url = "${{ env.NDI_SDK_URL }}"
+          $hash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($url))).Replace("-", "").Substring(0, 16)
+          echo "key=ndi-sdk-$hash-windows" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+      - name: Restore NDI SDK from cache
         uses: actions/cache@v4
         with:
           path: ${{ env.NDI_SDK_DIR }}
-          key: ${{ env.NDI_SDK_CACHE_KEY }}-windows
-
-      - name: Download and Install NDI SDK (if not cached)
-        if: steps.cache-ndi.outputs.cache-hit != 'true'
-        run: |
-          curl -L -o ${{ env.NDI_SDK_INSTALLER }} "${{ env.NDI_SDK_URL }}"
-          Start-Process -FilePath "${{ env.NDI_SDK_INSTALLER }}" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$env:NDI_SDK_DIR" -Wait
-          Remove-Item ${{ env.NDI_SDK_INSTALLER }}
-        shell: pwsh
+          key: ${{ steps.cache-key.outputs.key }}
+          fail-on-cache-miss: true
 
       - name: Set Environment Variables (Windows)
         run: |
@@ -132,20 +140,20 @@ jobs:
       - name: Install LLVM for bindgen (Windows)
         run: choco install llvm
 
-      - name: Cache NDI SDK
-        id: cache-ndi
+      - name: Generate cache key from URL
+        id: cache-key
+        run: |
+          $url = "${{ env.NDI_SDK_URL }}"
+          $hash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($url))).Replace("-", "").Substring(0, 16)
+          echo "key=ndi-sdk-$hash-windows" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+      - name: Restore NDI SDK from cache
         uses: actions/cache@v4
         with:
           path: ${{ env.NDI_SDK_DIR }}
-          key: ${{ env.NDI_SDK_CACHE_KEY }}-windows
-
-      - name: Download and Install NDI SDK (if not cached)
-        if: steps.cache-ndi.outputs.cache-hit != 'true'
-        run: |
-          curl -L -o ${{ env.NDI_SDK_INSTALLER }} "${{ env.NDI_SDK_URL }}"
-          Start-Process -FilePath "${{ env.NDI_SDK_INSTALLER }}" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$env:NDI_SDK_DIR" -Wait
-          Remove-Item ${{ env.NDI_SDK_INSTALLER }}
-        shell: pwsh
+          key: ${{ steps.cache-key.outputs.key }}
+          fail-on-cache-miss: true
 
       - name: Set Environment Variables (Windows)
         run: |
@@ -168,20 +176,20 @@ jobs:
       - name: Install LLVM for bindgen (Windows)
         run: choco install llvm
 
-      - name: Cache NDI SDK
-        id: cache-ndi
+      - name: Generate cache key from URL
+        id: cache-key
+        run: |
+          $url = "${{ env.NDI_SDK_URL }}"
+          $hash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($url))).Replace("-", "").Substring(0, 16)
+          echo "key=ndi-sdk-$hash-windows" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+      - name: Restore NDI SDK from cache
         uses: actions/cache@v4
         with:
           path: ${{ env.NDI_SDK_DIR }}
-          key: ${{ env.NDI_SDK_CACHE_KEY }}-windows
-
-      - name: Download and Install NDI SDK (if not cached)
-        if: steps.cache-ndi.outputs.cache-hit != 'true'
-        run: |
-          curl -L -o ${{ env.NDI_SDK_INSTALLER }} "${{ env.NDI_SDK_URL }}"
-          Start-Process -FilePath "${{ env.NDI_SDK_INSTALLER }}" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$env:NDI_SDK_DIR" -Wait
-          Remove-Item ${{ env.NDI_SDK_INSTALLER }}
-        shell: pwsh
+          key: ${{ steps.cache-key.outputs.key }}
+          fail-on-cache-miss: true
 
       - name: Set Environment Variables (Windows)
         run: |
@@ -204,20 +212,20 @@ jobs:
       - name: Install LLVM for bindgen (Windows)
         run: choco install llvm
 
-      - name: Cache NDI SDK
-        id: cache-ndi
+      - name: Generate cache key from URL
+        id: cache-key
+        run: |
+          $url = "${{ env.NDI_SDK_URL }}"
+          $hash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($url))).Replace("-", "").Substring(0, 16)
+          echo "key=ndi-sdk-$hash-windows" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+      - name: Restore NDI SDK from cache
         uses: actions/cache@v4
         with:
           path: ${{ env.NDI_SDK_DIR }}
-          key: ${{ env.NDI_SDK_CACHE_KEY }}-windows
-
-      - name: Download and Install NDI SDK (if not cached)
-        if: steps.cache-ndi.outputs.cache-hit != 'true'
-        run: |
-          curl -L -o ${{ env.NDI_SDK_INSTALLER }} "${{ env.NDI_SDK_URL }}"
-          Start-Process -FilePath "${{ env.NDI_SDK_INSTALLER }}" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$env:NDI_SDK_DIR" -Wait
-          Remove-Item ${{ env.NDI_SDK_INSTALLER }}
-        shell: pwsh
+          key: ${{ steps.cache-key.outputs.key }}
+          fail-on-cache-miss: true
 
       - name: Set Environment Variables (Windows)
         run: |
