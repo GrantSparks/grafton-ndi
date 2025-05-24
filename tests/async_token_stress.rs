@@ -1,4 +1,4 @@
-use grafton_ndi::{FourCCVideoType, SenderOptions, BorrowedVideoFrame, NDI};
+use grafton_ndi::{BorrowedVideoFrame, FourCCVideoType, SenderOptions, NDI};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;

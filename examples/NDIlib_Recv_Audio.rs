@@ -8,7 +8,7 @@
 //!
 //! Run with: `cargo run --example NDIlib_Recv_Audio`
 
-use grafton_ndi::{Error, Finder, FinderOptions, ReceiverOptions, ReceiverBandwidth, NDI};
+use grafton_ndi::{Error, Finder, FinderOptions, ReceiverBandwidth, ReceiverOptions, NDI};
 use std::thread;
 use std::time::Duration;
 

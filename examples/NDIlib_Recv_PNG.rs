@@ -5,7 +5,9 @@
 //!
 //! Run with: `cargo run --example NDIlib_Recv_PNG`
 
-use grafton_ndi::{Error, Finder, FinderOptions, ReceiverOptions, ReceiverColorFormat, VideoFrame, NDI};
+use grafton_ndi::{
+    Error, Finder, FinderOptions, ReceiverColorFormat, ReceiverOptions, VideoFrame, NDI,
+};
 use std::fs::File;
 
 // Optional: Configure for specific test environments

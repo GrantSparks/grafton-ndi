@@ -1,4 +1,4 @@
-use grafton_ndi::{FinderOptions, Finder, ReceiverOptions, ReceiverBandwidth, NDI};
+use grafton_ndi::{Finder, FinderOptions, ReceiverBandwidth, ReceiverOptions, NDI};
 use std::env;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

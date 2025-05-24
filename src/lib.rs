@@ -116,11 +116,12 @@ pub use frames::{
     MetadataFrame, VideoFrame, VideoFrameBuilder,
 };
 pub use receiver::{
-    FrameType, ReceiverOptions, ReceiverOptionsBuilder, Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverStatus, Tally,
+    FrameType, Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions,
+    ReceiverOptionsBuilder, ReceiverStatus, Tally,
 };
 pub use runtime::NDI;
 pub use sender::{
-    AsyncVideoToken, Sender, SenderOptions, SenderOptionsBuilder, BorrowedVideoFrame,
+    AsyncVideoToken, BorrowedVideoFrame, Sender, SenderOptions, SenderOptionsBuilder,
 };
 
 // Tests

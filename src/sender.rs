@@ -132,7 +132,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
             FourCCVideoType::YV12 | FourCCVideoType::I420 | FourCCVideoType::NV12 => width, // Y plane stride for planar formats
             FourCCVideoType::UYVA => width * 3, // 24 bpp = 3 bytes per pixel
             FourCCVideoType::P216 | FourCCVideoType::PA16 => width * 4, // 32 bpp = 4 bytes per pixel
-            _ => width * 4,                     // Default to 32 bpp
+            _ => width * 4,                                             // Default to 32 bpp
         };
 
         BorrowedVideoFrame {

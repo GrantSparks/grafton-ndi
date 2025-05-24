@@ -1,4 +1,4 @@
-use grafton_ndi::{ReceiverOptions, ReceiverBandwidth, ReceiverColorFormat, NDI};
+use grafton_ndi::{ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions, NDI};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;

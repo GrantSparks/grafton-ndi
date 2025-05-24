@@ -65,7 +65,9 @@ impl From<ReceiverColorFormat> for NDIlib_recv_color_format_e {
             ReceiverColorFormat::UYVY_RGBA => {
                 NDIlib_recv_color_format_e_NDIlib_recv_color_format_UYVY_RGBA
             }
-            ReceiverColorFormat::Fastest => NDIlib_recv_color_format_e_NDIlib_recv_color_format_fastest,
+            ReceiverColorFormat::Fastest => {
+                NDIlib_recv_color_format_e_NDIlib_recv_color_format_fastest
+            }
             ReceiverColorFormat::Best => NDIlib_recv_color_format_e_NDIlib_recv_color_format_best,
             //            ReceiverColorFormat::BGRX_BGRA_Flipped => {
             //                NDIlib_recv_color_format_e_NDIlib_recv_color_format_BGRX_BGRA_flipped
@@ -91,7 +93,9 @@ impl From<ReceiverBandwidth> for NDIlib_recv_bandwidth_e {
             ReceiverBandwidth::MetadataOnly => {
                 NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_metadata_only
             }
-            ReceiverBandwidth::AudioOnly => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_audio_only,
+            ReceiverBandwidth::AudioOnly => {
+                NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_audio_only
+            }
             ReceiverBandwidth::Lowest => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest,
             ReceiverBandwidth::Highest => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
             ReceiverBandwidth::Max => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_max,
