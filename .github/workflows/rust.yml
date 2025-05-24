@@ -11,11 +11,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  NDI_SDK_DIR: C:\Program Files\NDI\NDI 6 SDK
+  # Use runner temp directory for reliable caching (no spaces, no permission issues)
+  NDI_SDK_DIR: ${{ runner.temp }}\ndi-sdk
   # Set NDI_SDK_URL as a repository secret to use a different SDK version
   # Default: NDI 6 SDK from official download site
   NDI_SDK_URL: ${{ secrets.NDI_SDK_URL || 'https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe' }}
-  NDI_SDK_INSTALLER: NDI_SDK_Installer.exe
+  NDI_SDK_INSTALLER: ${{ runner.temp }}\NDI_SDK_Installer.exe
 
 jobs:
   setup:
@@ -37,12 +38,29 @@ jobs:
           path: ${{ env.NDI_SDK_DIR }}
           key: ${{ steps.cache-key.outputs.key }}
 
+      - name: Display cache status
+        run: |
+          Write-Host "Cache key: ${{ steps.cache-key.outputs.key }}"
+          Write-Host "Cache hit: ${{ steps.cache-ndi.outputs.cache-hit }}"
+        shell: pwsh
+
       - name: Download and Install NDI SDK (if not cached)
         if: steps.cache-ndi.outputs.cache-hit != 'true'
         run: |
-          curl -L -o ${{ env.NDI_SDK_INSTALLER }} "${{ env.NDI_SDK_URL }}"
+          Write-Host "Installing NDI SDK to: $env:NDI_SDK_DIR"
+          curl -L -o "${{ env.NDI_SDK_INSTALLER }}" "${{ env.NDI_SDK_URL }}"
           Start-Process -FilePath "${{ env.NDI_SDK_INSTALLER }}" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$env:NDI_SDK_DIR" -Wait
-          Remove-Item ${{ env.NDI_SDK_INSTALLER }}
+          Remove-Item "${{ env.NDI_SDK_INSTALLER }}"
+          
+          # Verify installation
+          if (Test-Path "$env:NDI_SDK_DIR\include\Processing.NDI.Lib.h") {
+            Write-Host "✓ NDI SDK installed successfully"
+            Write-Host "Contents of NDI SDK directory:"
+            Get-ChildItem -Path $env:NDI_SDK_DIR -Recurse -Directory | Select-Object -First 10
+          } else {
+            Write-Error "NDI SDK installation failed - header file not found"
+            exit 1
+          }
         shell: pwsh
 
   test:
@@ -74,6 +92,15 @@ jobs:
           path: ${{ env.NDI_SDK_DIR }}
           key: ${{ steps.cache-key.outputs.key }}
           fail-on-cache-miss: true
+
+      - name: Verify NDI SDK
+        run: |
+          if (-not (Test-Path "$env:NDI_SDK_DIR\include\Processing.NDI.Lib.h")) {
+            Write-Error "NDI SDK cache corrupted - header file not found"
+            exit 1
+          }
+          Write-Host "✓ NDI SDK restored from cache successfully"
+        shell: pwsh
 
       - name: Set Environment Variables (Windows)
         run: |
@@ -117,6 +144,15 @@ jobs:
           key: ${{ steps.cache-key.outputs.key }}
           fail-on-cache-miss: true
 
+      - name: Verify NDI SDK
+        run: |
+          if (-not (Test-Path "$env:NDI_SDK_DIR\include\Processing.NDI.Lib.h")) {
+            Write-Error "NDI SDK cache corrupted - header file not found"
+            exit 1
+          }
+          Write-Host "✓ NDI SDK restored from cache successfully"
+        shell: pwsh
+
       - name: Set Environment Variables (Windows)
         run: |
           echo "$env:NDI_SDK_DIR\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
@@ -155,6 +191,15 @@ jobs:
           key: ${{ steps.cache-key.outputs.key }}
           fail-on-cache-miss: true
 
+      - name: Verify NDI SDK
+        run: |
+          if (-not (Test-Path "$env:NDI_SDK_DIR\include\Processing.NDI.Lib.h")) {
+            Write-Error "NDI SDK cache corrupted - header file not found"
+            exit 1
+          }
+          Write-Host "✓ NDI SDK restored from cache successfully"
+        shell: pwsh
+
       - name: Set Environment Variables (Windows)
         run: |
           echo "$env:NDI_SDK_DIR\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
@@ -191,6 +236,15 @@ jobs:
           key: ${{ steps.cache-key.outputs.key }}
           fail-on-cache-miss: true
 
+      - name: Verify NDI SDK
+        run: |
+          if (-not (Test-Path "$env:NDI_SDK_DIR\include\Processing.NDI.Lib.h")) {
+            Write-Error "NDI SDK cache corrupted - header file not found"
+            exit 1
+          }
+          Write-Host "✓ NDI SDK restored from cache successfully"
+        shell: pwsh
+
       - name: Set Environment Variables (Windows)
         run: |
           echo "$env:NDI_SDK_DIR\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
@@ -226,6 +280,15 @@ jobs:
           path: ${{ env.NDI_SDK_DIR }}
           key: ${{ steps.cache-key.outputs.key }}
           fail-on-cache-miss: true
+
+      - name: Verify NDI SDK
+        run: |
+          if (-not (Test-Path "$env:NDI_SDK_DIR\include\Processing.NDI.Lib.h")) {
+            Write-Error "NDI SDK cache corrupted - header file not found"
+            exit 1
+          }
+          Write-Host "✓ NDI SDK restored from cache successfully"
+        shell: pwsh
 
       - name: Set Environment Variables (Windows)
         run: |
