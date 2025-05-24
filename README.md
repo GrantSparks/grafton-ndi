@@ -104,12 +104,18 @@ if finder.wait_for_sources(5000) {
 ### Receiving Video
 
 ```rust
-use grafton_ndi::{NDI, ReceiverOptions, Receiver, ReceiverColorFormat, ReceiverBandwidth};
+use grafton_ndi::{NDI, ReceiverOptions, Receiver, ReceiverColorFormat, ReceiverBandwidth, FrameType, Finder};
 
 let ndi = NDI::new()?;
 
+// First, find a source
+let finder = Finder::new(&ndi, &Default::default())?;
+finder.wait_for_sources(5000);
+let sources = finder.get_sources(0)?;
+let source = sources.first().ok_or("No sources found")?;
+
 // Create receiver
-let receiver = ReceiverOptions::builder(source)
+let receiver = ReceiverOptions::builder(source.clone())
     .color(ReceiverColorFormat::RGBX_RGBA)
     .bandwidth(ReceiverBandwidth::Highest)
     .name("My Receiver")
@@ -117,14 +123,14 @@ let receiver = ReceiverOptions::builder(source)
 
 // Capture frames
 match receiver.capture(5000)? {
-    Some(CapturedFrame::Video(video)) => {
+    FrameType::Video(video) => {
         println!("Video: {}x{} @ {}/{} fps", 
             video.width, video.height,
             video.frame_rate_n, video.frame_rate_d
         );
         // Process video data...
     }
-    Some(CapturedFrame::Audio(audio)) => {
+    FrameType::Audio(audio) => {
         println!("Audio: {} channels @ {} Hz", 
             audio.num_channels, audio.sample_rate
         );
@@ -152,7 +158,7 @@ let options = SenderOptions::builder("My NDI Source")
 
 let sender = Sender::new(&ndi, &options)?;
 
-// Create and send a frame
+// Create frame using builder
 let frame = VideoFrame::builder()
     .resolution(1920, 1080)
     .fourcc(FourCCVideoType::BGRA)
@@ -160,11 +166,11 @@ let frame = VideoFrame::builder()
     .aspect_ratio(16.0 / 9.0)
     .build()?;
 
-// Allocate and fill frame data
-let mut data = vec![0u8; frame.size()];
+// Frame is created with zero-initialized data
+// You can access the data to fill it:
+// let data = frame.data_mut();
 // ... fill data with your video content ...
 
-frame.set_data(&data);
 sender.send_video(&frame);
 ```
 
@@ -204,6 +210,7 @@ sender.flush_async(std::time::Duration::from_secs(5))?;
 ```rust
 use grafton_ndi::{NDI, ReceiverOptions, ReceiverBandwidth};
 
+// Assuming you already have a source from discovery
 let receiver = ReceiverOptions::builder(source)
     .bandwidth(ReceiverBandwidth::AudioOnly)
     .build(&ndi)?;
@@ -234,6 +241,7 @@ if let Some(audio) = receiver.capture_audio(5000)? {
 ```rust
 use grafton_ndi::{NDI, ReceiverOptions};
 
+// Assuming you already have a source from discovery
 let receiver = ReceiverOptions::builder(source).build(&ndi)?;
 
 // Check PTZ support
@@ -269,6 +277,7 @@ let finder = Finder::new(&ndi, &finder_options)?;
 Receives video, audio, and metadata from NDI sources.
 
 ```rust
+// Assuming source is from Finder::get_sources()
 let receiver = ReceiverOptions::builder(source)
     .color(ReceiverColorFormat::UYVY_BGRA)
     .bandwidth(ReceiverBandwidth::Highest)
@@ -305,6 +314,7 @@ All primary types (`Finder`, `Receiver`, `Sender`) are `Send + Sync` as the unde
 ```rust
 use grafton_ndi::{NDI, ReceiverOptions, RecvStatus};
 
+// Assuming you already have a source from discovery
 let receiver = ReceiverOptions::builder(source).build(&ndi)?;
 
 // Get current connection status
@@ -326,12 +336,22 @@ if status.total_frames > 0 {
 
 See the `examples/` directory for complete applications:
 
+### Discovery & Monitoring
 - `NDIlib_Find.rs` - Discover NDI sources on the network
+- `status_monitor.rs` - Monitor receiver status and performance
+
+### Receiving
+- `NDIlib_Recv_Audio.rs` - Receive and process audio streams
+- `NDIlib_Recv_Audio_16bpp.rs` - Receive 16-bit audio samples
 - `NDIlib_Recv_PNG.rs` - Receive video and save as PNG images
 - `NDIlib_Recv_PTZ.rs` - Control PTZ cameras
-- `async_send.rs` - Demonstrates async video sending
-- `status_monitor.rs` - Shows receiver status monitoring
-- `zero_copy_send.rs` - Zero-copy video transmission example
+- `concurrent_capture.rs` - Capture from multiple sources simultaneously
+
+### Sending
+- `NDIlib_Send_Audio.rs` - Send audio streams
+- `NDIlib_Send_Video.rs` - Send video streams
+- `async_send.rs` - Async video sending with completion callbacks
+- `zero_copy_send.rs` - Zero-copy video transmission
 
 Run examples with:
 ```bash

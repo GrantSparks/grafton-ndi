@@ -8,7 +8,7 @@ grafton-ndi provides high-performance, idiomatic Rust bindings for the NDI® 6 S
 
 ## Current Version
 
-Version 0.7.0 - Major API improvements with comprehensive documentation, builder patterns, and enhanced API consistency.
+Version 0.8.0 - Async video sending, receiver status monitoring, and improved Windows compatibility.
 
 ## Build Commands
 
@@ -25,10 +25,12 @@ cargo test
 # Check code without building
 cargo check
 
-# Run examples (requires NDI SDK installed and in PATH)
+# Run examples (requires NDI SDK installed and runtime in PATH)
 cargo run --example NDIlib_Find
 cargo run --example NDIlib_Recv_PNG
 cargo run --example NDIlib_Recv_PTZ
+cargo run --example async_send
+cargo run --example status_monitor
 
 # Format code (if rustfmt is installed)
 cargo fmt
@@ -93,11 +95,13 @@ The codebase follows a layered architecture:
 
 3. **src/lib.rs**: Safe Rust wrappers around FFI calls. Key types:
    - `NDI`: Main entry point, manages library initialization (reference-counted)
-   - `Find`/`Finder`/`FinderBuilder`: Network discovery for NDI sources
-   - `Receiver`/`ReceiverBuilder`: Receive video/audio/metadata
-   - `SendInstance`/`SendOptions`/`SendOptionsBuilder`: Transmit as NDI source
-   - Frame types: `VideoFrame`, `AudioFrame`, `MetadataFrame` (all with builders)
-   - Enums: `FourCCVideoType`, `RecvColorFormat`, `RecvBandwidth`, etc.
+   - `Finder`/`FinderOptions`/`FinderOptionsBuilder`: Network discovery for NDI sources
+   - `Receiver`/`ReceiverOptions`/`ReceiverOptionsBuilder`: Receive video/audio/metadata
+   - `Sender`/`SenderOptions`/`SenderOptionsBuilder`: Transmit as NDI source
+   - Frame types: `VideoFrame`, `AudioFrame`, `MetadataFrame`, `BorrowedVideoFrame` (all with builders)
+   - Async types: `AsyncVideoToken`, `AsyncCompletionHandler`
+   - Status types: `RecvStatus`, `TallyState`
+   - Enums: `FourCCVideoType`, `ReceiverColorFormat`, `ReceiverBandwidth`, `FrameType`, etc.
 
 4. **src/error.rs**: Custom error types using thiserror with detailed messages.
 
@@ -105,8 +109,10 @@ The codebase follows a layered architecture:
 
 - **Lifetime Management**: Uses PhantomData to ensure NDI instance outlives dependent objects (Finder, Receiver, Sender)
 - **RAII**: All NDI objects implement Drop for automatic cleanup
-- **Builder Pattern**: Configuration structs for Find, Recv, Send with defaults
-- **Zero-Copy**: Frame data references NDI's internal buffers when possible
+- **Builder Pattern**: Configuration structs for FinderOptions, ReceiverOptions, SenderOptions with defaults
+- **Zero-Copy**: Frame data references NDI's internal buffers when possible (especially with BorrowedVideoFrame)
+- **Async Safety**: AsyncVideoToken uses Arc<Inner> to prevent use-after-free in async operations
+- **Thread Safety**: Arc + Mutex for shared state, all main types are Send + Sync
 
 ## Testing Considerations
 
