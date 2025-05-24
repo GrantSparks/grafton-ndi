@@ -3,24 +3,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-// Helper macro to skip tests when NDI runtime is not available
-macro_rules! require_ndi_runtime {
-    () => {
-        match NDI::new() {
-            Ok(ndi) => ndi,
-            Err(e) => {
-                eprintln!("Skipping test - NDI runtime not available: {}", e);
-                return Ok(());
-            }
-        }
-    };
-}
-
 #[test]
 fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
-    // Initialize NDI - skip test if runtime not available
-    let ndi = require_ndi_runtime!();
-    let ndi = Arc::new(ndi);
+    // Initialize NDI
+    let ndi = Arc::new(NDI::new()?);
 
     // Shared counter for completed operations
     let completed = Arc::new(Mutex::new(0));
@@ -107,7 +93,7 @@ fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
 #[test]
 fn test_immediate_sender_drop() -> Result<(), grafton_ndi::Error> {
     // This test specifically targets the original bug
-    let ndi = require_ndi_runtime!();
+    let ndi = NDI::new()?;
 
     for _ in 0..100 {
         let send_options = SenderOptions::builder("Immediate Drop Test")
@@ -142,7 +128,7 @@ fn test_immediate_sender_drop() -> Result<(), grafton_ndi::Error> {
 
 #[test]
 fn test_flush_async() -> Result<(), grafton_ndi::Error> {
-    let ndi = require_ndi_runtime!();
+    let ndi = NDI::new()?;
     let send_options = SenderOptions::builder("Flush Test")
         .clock_video(true)
         .clock_audio(false)
