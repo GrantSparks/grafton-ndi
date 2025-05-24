@@ -82,12 +82,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Rust caching with optimizations
+      # Rust caching - read-only, don't save
       - uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
           shared-key: "rust-cache-windows"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: false  # Let test-and-lint job handle saving
 
       - uses: obi1kenobi/cargo-semver-checks-action@v2
 
