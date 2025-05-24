@@ -41,7 +41,7 @@ cargo clippy
 
 The build requires the NDI SDK to be installed:
 
-- **Windows**: Default path is `C:\Program Files\NDI SDK for Windows`
+- **Windows**: Default path is `C:\Program Files\NDI\NDI 6 SDK`
 - **Linux**: `/usr/share/NDI SDK for Linux` or `/usr/share/NDI Advanced SDK for Linux`
 - **Custom**: Set `NDI_SDK_DIR` environment variable
 

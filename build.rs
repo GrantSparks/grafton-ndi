@@ -16,7 +16,8 @@ fn main() {
                 standard.to_string()
             }
         } else if cfg!(windows) {
-            "C:\\Program Files\\NDI SDK for Windows".to_string()
+            // NDI 6 SDK default installation path
+            "C:\\Program Files\\NDI\\NDI 6 SDK".to_string()
         } else {
             panic!("Unsupported platform, please set NDI_SDK_DIR manually.");
         }
