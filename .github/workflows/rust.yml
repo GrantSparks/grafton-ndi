@@ -19,10 +19,14 @@ jobs:
   setup:
     name: Setup NDI SDK
     runs-on: windows-latest
-    env:
-      NDI_SDK_DIR: ${{ runner.temp }}\ndi-sdk
-      NDI_SDK_INSTALLER: ${{ runner.temp }}\NDI_SDK_Installer.exe
     steps:
+      - name: Set NDI paths
+        id: ndi-paths
+        run: |
+          echo "NDI_SDK_DIR=${{ runner.temp }}\ndi-sdk" >> $env:GITHUB_ENV
+          echo "NDI_SDK_INSTALLER=${{ runner.temp }}\NDI_SDK_Installer.exe" >> $env:GITHUB_ENV
+        shell: pwsh
+
       - name: Generate cache key from URL
         id: cache-key
         run: |
@@ -67,10 +71,12 @@ jobs:
     name: Test
     needs: setup
     runs-on: windows-latest
-    env:
-      NDI_SDK_DIR: ${{ runner.temp }}\ndi-sdk
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set NDI paths
+        run: echo "NDI_SDK_DIR=${{ runner.temp }}\ndi-sdk" >> $env:GITHUB_ENV
+        shell: pwsh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -120,10 +126,12 @@ jobs:
     name: Format
     needs: setup
     runs-on: windows-latest
-    env:
-      NDI_SDK_DIR: ${{ runner.temp }}\ndi-sdk
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set NDI paths
+        run: echo "NDI_SDK_DIR=${{ runner.temp }}\ndi-sdk" >> $env:GITHUB_ENV
+        shell: pwsh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -169,10 +177,12 @@ jobs:
     name: Lint
     needs: setup
     runs-on: windows-latest
-    env:
-      NDI_SDK_DIR: ${{ runner.temp }}\ndi-sdk
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set NDI paths
+        run: echo "NDI_SDK_DIR=${{ runner.temp }}\ndi-sdk" >> $env:GITHUB_ENV
+        shell: pwsh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -218,10 +228,12 @@ jobs:
     name: Check semver
     needs: setup
     runs-on: windows-latest
-    env:
-      NDI_SDK_DIR: ${{ runner.temp }}\ndi-sdk
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set NDI paths
+        run: echo "NDI_SDK_DIR=${{ runner.temp }}\ndi-sdk" >> $env:GITHUB_ENV
+        shell: pwsh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -265,10 +277,12 @@ jobs:
     needs: [test, format, lint, semver]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: windows-latest
-    env:
-      NDI_SDK_DIR: ${{ runner.temp }}\ndi-sdk
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set NDI paths
+        run: echo "NDI_SDK_DIR=${{ runner.temp }}\ndi-sdk" >> $env:GITHUB_ENV
+        shell: pwsh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
