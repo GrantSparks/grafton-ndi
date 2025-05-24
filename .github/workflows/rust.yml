@@ -12,10 +12,32 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
   NDI_SDK_DIR: C:\Program Files\NDI\NDI 6 SDK
+  NDI_SDK_VERSION: "6.1"
+  NDI_SDK_INSTALLER: NDI_6_SDK.exe
 
 jobs:
+  setup:
+    name: Setup NDI SDK
+    runs-on: windows-latest
+    steps:
+      - name: Cache NDI SDK
+        id: cache-ndi
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NDI_SDK_DIR }}
+          key: ndi-sdk-${{ env.NDI_SDK_VERSION }}-windows
+
+      - name: Download and Install NDI SDK (if not cached)
+        if: steps.cache-ndi.outputs.cache-hit != 'true'
+        run: |
+          curl -L -o ${{ env.NDI_SDK_INSTALLER }} "https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe"
+          Start-Process -FilePath "${{ env.NDI_SDK_INSTALLER }}" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$env:NDI_SDK_DIR" -Wait
+          Remove-Item ${{ env.NDI_SDK_INSTALLER }}
+        shell: pwsh
+
   test:
     name: Test
+    needs: setup
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,14 +50,19 @@ jobs:
       - name: Install LLVM for bindgen (Windows)
         run: choco install llvm
 
-      - name: Download NDI SDK Library Installer (Windows - Currently NDI SDK 6.1)
-        run: curl -L -o NDI_6_SDK.exe "https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe"
+      - name: Cache NDI SDK
+        id: cache-ndi
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NDI_SDK_DIR }}
+          key: ndi-sdk-${{ env.NDI_SDK_VERSION }}-windows
 
-      - name: Install NDI SDK Library (Windows)
+      - name: Download and Install NDI SDK (if not cached)
+        if: steps.cache-ndi.outputs.cache-hit != 'true'
         run: |
-          # Run the NDI SDK installer in silent mode
-          # /VERYSILENT = No UI, /SUPPRESSMSGBOXES = No message boxes, /DIR = Installation directory
-          Start-Process -FilePath "NDI_6_SDK.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$env:NDI_SDK_DIR" -Wait
+          curl -L -o ${{ env.NDI_SDK_INSTALLER }} "https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe"
+          Start-Process -FilePath "${{ env.NDI_SDK_INSTALLER }}" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$env:NDI_SDK_DIR" -Wait
+          Remove-Item ${{ env.NDI_SDK_INSTALLER }}
         shell: pwsh
 
       - name: Set Environment Variables (Windows)
@@ -52,6 +79,7 @@ jobs:
 
   format:
     name: Format
+    needs: setup
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -64,13 +92,19 @@ jobs:
       - name: Install LLVM for bindgen (Windows)
         run: choco install llvm
 
-      - name: Download NDI SDK Library Installer (Windows)
-        run: curl -L -o NDI_6_SDK.exe "https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe"
+      - name: Cache NDI SDK
+        id: cache-ndi
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NDI_SDK_DIR }}
+          key: ndi-sdk-${{ env.NDI_SDK_VERSION }}-windows
 
-      - name: Install NDI SDK Library (Windows)
+      - name: Download and Install NDI SDK (if not cached)
+        if: steps.cache-ndi.outputs.cache-hit != 'true'
         run: |
-          # Run the NDI SDK installer in silent mode
-          Start-Process -FilePath "NDI_6_SDK.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$env:NDI_SDK_DIR" -Wait
+          curl -L -o ${{ env.NDI_SDK_INSTALLER }} "https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe"
+          Start-Process -FilePath "${{ env.NDI_SDK_INSTALLER }}" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$env:NDI_SDK_DIR" -Wait
+          Remove-Item ${{ env.NDI_SDK_INSTALLER }}
         shell: pwsh
 
       - name: Set Environment Variables (Windows)
@@ -83,6 +117,7 @@ jobs:
 
   lint:
     name: Lint
+    needs: setup
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -95,13 +130,19 @@ jobs:
       - name: Install LLVM for bindgen (Windows)
         run: choco install llvm
 
-      - name: Download NDI SDK Library Installer (Windows)
-        run: curl -L -o NDI_6_SDK.exe "https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe"
+      - name: Cache NDI SDK
+        id: cache-ndi
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NDI_SDK_DIR }}
+          key: ndi-sdk-${{ env.NDI_SDK_VERSION }}-windows
 
-      - name: Install NDI SDK Library (Windows)
+      - name: Download and Install NDI SDK (if not cached)
+        if: steps.cache-ndi.outputs.cache-hit != 'true'
         run: |
-          # Run the NDI SDK installer in silent mode
-          Start-Process -FilePath "NDI_6_SDK.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$env:NDI_SDK_DIR" -Wait
+          curl -L -o ${{ env.NDI_SDK_INSTALLER }} "https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe"
+          Start-Process -FilePath "${{ env.NDI_SDK_INSTALLER }}" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$env:NDI_SDK_DIR" -Wait
+          Remove-Item ${{ env.NDI_SDK_INSTALLER }}
         shell: pwsh
 
       - name: Set Environment Variables (Windows)
@@ -114,6 +155,7 @@ jobs:
 
   semver:
     name: Check semver
+    needs: setup
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -124,13 +166,19 @@ jobs:
       - name: Install LLVM for bindgen (Windows)
         run: choco install llvm
 
-      - name: Download NDI SDK Library Installer (Windows)
-        run: curl -L -o NDI_6_SDK.exe "https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe"
+      - name: Cache NDI SDK
+        id: cache-ndi
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NDI_SDK_DIR }}
+          key: ndi-sdk-${{ env.NDI_SDK_VERSION }}-windows
 
-      - name: Install NDI SDK Library (Windows)
+      - name: Download and Install NDI SDK (if not cached)
+        if: steps.cache-ndi.outputs.cache-hit != 'true'
         run: |
-          # Run the NDI SDK installer in silent mode
-          Start-Process -FilePath "NDI_6_SDK.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$env:NDI_SDK_DIR" -Wait
+          curl -L -o ${{ env.NDI_SDK_INSTALLER }} "https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe"
+          Start-Process -FilePath "${{ env.NDI_SDK_INSTALLER }}" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$env:NDI_SDK_DIR" -Wait
+          Remove-Item ${{ env.NDI_SDK_INSTALLER }}
         shell: pwsh
 
       - name: Set Environment Variables (Windows)
@@ -154,13 +202,19 @@ jobs:
       - name: Install LLVM for bindgen (Windows)
         run: choco install llvm
 
-      - name: Download NDI SDK Library Installer (Windows)
-        run: curl -L -o NDI_6_SDK.exe "https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe"
+      - name: Cache NDI SDK
+        id: cache-ndi
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NDI_SDK_DIR }}
+          key: ndi-sdk-${{ env.NDI_SDK_VERSION }}-windows
 
-      - name: Install NDI SDK Library (Windows)
+      - name: Download and Install NDI SDK (if not cached)
+        if: steps.cache-ndi.outputs.cache-hit != 'true'
         run: |
-          # Run the NDI SDK installer in silent mode
-          Start-Process -FilePath "NDI_6_SDK.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$env:NDI_SDK_DIR" -Wait
+          curl -L -o ${{ env.NDI_SDK_INSTALLER }} "https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe"
+          Start-Process -FilePath "${{ env.NDI_SDK_INSTALLER }}" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$env:NDI_SDK_DIR" -Wait
+          Remove-Item ${{ env.NDI_SDK_INSTALLER }}
         shell: pwsh
 
       - name: Set Environment Variables (Windows)
