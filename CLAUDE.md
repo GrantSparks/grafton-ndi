@@ -116,11 +116,14 @@ The codebase follows a layered architecture:
 
 ## Testing Considerations
 
-- Tests require NDI SDK runtime
-- Examples serve as integration tests
+- Unit tests run without NDI runtime
+- Integration tests (in tests/) require NDI runtime to be available
+- CI runs only unit tests and doc tests due to runtime limitations
+- Examples serve as integration tests when runtime is available
 - Network tests may require actual NDI sources on the network
 - Run `cargo test` and `cargo clippy` before commits
 - Ensure examples compile with `cargo build --examples`
+- Use `cargo test --lib --doc` to run only tests that don't require runtime
 
 ## Documentation Standards
 
@@ -136,3 +139,13 @@ The codebase follows a layered architecture:
 - Builder patterns allow extending APIs without breaks
 - Remove rather than deprecate when possible until 1.0.0
 - Use semantic versioning (MAJOR.MINOR.PATCH)
+
+## Key Features Added in 0.8
+
+- **Async Video Sending**: `send_video_async()` with completion callbacks
+- **BorrowedVideoFrame**: Zero-copy frame type for async operations
+- **AsyncVideoToken**: RAII token for safe async frame lifetime management
+- **Receiver Status API**: `get_status()` for monitoring connection health
+- **RecvStatus struct**: Detailed metrics including frame counts, dropped frames
+- **Windows Compatibility**: Fixed enum conversions for cross-platform support
+- **CI Improvements**: Separated runtime-dependent tests from unit tests
