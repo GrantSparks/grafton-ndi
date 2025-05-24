@@ -11,17 +11,17 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # Use runner temp directory for reliable caching (no spaces, no permission issues)
-  NDI_SDK_DIR: ${{ runner.temp }}\ndi-sdk
   # Set NDI_SDK_URL as a repository secret to use a different SDK version
   # Default: NDI 6 SDK from official download site
   NDI_SDK_URL: ${{ secrets.NDI_SDK_URL || 'https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe' }}
-  NDI_SDK_INSTALLER: ${{ runner.temp }}\NDI_SDK_Installer.exe
 
 jobs:
   setup:
     name: Setup NDI SDK
     runs-on: windows-latest
+    env:
+      NDI_SDK_DIR: ${{ runner.temp }}\ndi-sdk
+      NDI_SDK_INSTALLER: ${{ runner.temp }}\NDI_SDK_Installer.exe
     steps:
       - name: Generate cache key from URL
         id: cache-key
@@ -67,6 +67,8 @@ jobs:
     name: Test
     needs: setup
     runs-on: windows-latest
+    env:
+      NDI_SDK_DIR: ${{ runner.temp }}\ndi-sdk
     steps:
       - uses: actions/checkout@v4
 
@@ -118,6 +120,8 @@ jobs:
     name: Format
     needs: setup
     runs-on: windows-latest
+    env:
+      NDI_SDK_DIR: ${{ runner.temp }}\ndi-sdk
     steps:
       - uses: actions/checkout@v4
 
@@ -165,6 +169,8 @@ jobs:
     name: Lint
     needs: setup
     runs-on: windows-latest
+    env:
+      NDI_SDK_DIR: ${{ runner.temp }}\ndi-sdk
     steps:
       - uses: actions/checkout@v4
 
@@ -212,6 +218,8 @@ jobs:
     name: Check semver
     needs: setup
     runs-on: windows-latest
+    env:
+      NDI_SDK_DIR: ${{ runner.temp }}\ndi-sdk
     steps:
       - uses: actions/checkout@v4
 
@@ -257,6 +265,8 @@ jobs:
     needs: [test, format, lint, semver]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: windows-latest
+    env:
+      NDI_SDK_DIR: ${{ runner.temp }}\ndi-sdk
     steps:
       - uses: actions/checkout@v4
 
