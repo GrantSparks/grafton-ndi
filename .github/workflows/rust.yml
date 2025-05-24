@@ -149,6 +149,9 @@ jobs:
       - name: Run tests
         run: |
           # Run unit tests and doc tests, but exclude integration tests that require NDI runtime
+          # Integration tests (tests/*.rs) require NDI runtime DLLs which aren't available in CI
+          # The NDI SDK provides headers/libs for building but not the runtime DLLs
+          # TODO: Consider adding NDI runtime to CI or mocking it for integration tests
           cargo test --lib --verbose
           cargo test --doc --verbose
         env:
