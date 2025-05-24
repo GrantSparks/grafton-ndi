@@ -30,38 +30,38 @@ use std::{
 #[repr(u32)]
 pub enum FourCCVideoType {
     /// YCbCr 4:2:2 format (16 bits per pixel) - bandwidth efficient.
-    UYVY = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY,
+    UYVY = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY as u32,
     /// YCbCr 4:2:2 with alpha channel (24 bits per pixel).
-    UYVA = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVA,
+    UYVA = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVA as u32,
     /// 16-bit YCbCr 4:2:2 format.
-    P216 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_P216,
+    P216 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_P216 as u32,
     /// 16-bit YCbCr 4:2:2 with alpha.
-    PA16 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_PA16,
+    PA16 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_PA16 as u32,
     /// Planar YCbCr 4:2:0 format (12 bits per pixel).
-    YV12 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_YV12,
+    YV12 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_YV12 as u32,
     /// Planar YCbCr 4:2:0 format (12 bits per pixel).
-    I420 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_I420,
+    I420 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_I420 as u32,
     /// Semi-planar YCbCr 4:2:0 format (12 bits per pixel).
-    NV12 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NV12,
+    NV12 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NV12 as u32,
     /// Blue-Green-Red-Alpha format (32 bits per pixel) - full quality.
-    BGRA = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA,
+    BGRA = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA as u32,
     /// Blue-Green-Red with padding (32 bits per pixel).
-    BGRX = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRX,
+    BGRX = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRX as u32,
     /// Red-Green-Blue-Alpha format (32 bits per pixel) - full quality.
-    RGBA = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBA,
+    RGBA = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBA as u32,
     /// Red-Green-Blue with padding (32 bits per pixel).
-    RGBX = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBX,
-    Max = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_max,
+    RGBX = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBX as u32,
+    Max = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_max as u32,
 }
 
 #[derive(Debug, TryFromPrimitive, IntoPrimitive, Clone, Copy)]
 #[repr(u32)]
 pub enum FrameFormatType {
-    Progressive = NDIlib_frame_format_type_e_NDIlib_frame_format_type_progressive,
-    Interlaced = NDIlib_frame_format_type_e_NDIlib_frame_format_type_interleaved,
-    Field0 = NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_0,
-    Field1 = NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_1,
-    Max = NDIlib_frame_format_type_e_NDIlib_frame_format_type_max,
+    Progressive = NDIlib_frame_format_type_e_NDIlib_frame_format_type_progressive as u32,
+    Interlaced = NDIlib_frame_format_type_e_NDIlib_frame_format_type_interleaved as u32,
+    Field0 = NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_0 as u32,
+    Field1 = NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_1 as u32,
+    Max = NDIlib_frame_format_type_e_NDIlib_frame_format_type_max as u32,
 }
 
 #[repr(C)]
@@ -172,11 +172,11 @@ impl<'rx> VideoFrame<'rx> {
         NDIlib_video_frame_v2_t {
             xres: self.width,
             yres: self.height,
-            FourCC: self.fourcc.into(),
+            FourCC: self.fourcc.into::<u32>() as i32,
             frame_rate_N: self.frame_rate_n,
             frame_rate_D: self.frame_rate_d,
             picture_aspect_ratio: self.picture_aspect_ratio,
-            frame_format_type: self.frame_format_type.into(),
+            frame_format_type: self.frame_format_type.into::<u32>() as i32,
             timecode: self.timecode,
             p_data: self.data.as_ptr() as *mut u8,
             __bindgen_anon_1: self.line_stride_or_size.into(),
@@ -204,7 +204,7 @@ impl<'rx> VideoFrame<'rx> {
             ));
         }
 
-        let fourcc = FourCCVideoType::try_from(c_frame.FourCC).unwrap_or(FourCCVideoType::Max);
+        let fourcc = FourCCVideoType::try_from(c_frame.FourCC as u32).unwrap_or(FourCCVideoType::Max);
 
         // Determine data size based on whether we have line_stride or data_size_in_bytes
         // The NDI SDK uses a union here: line_stride_in_bytes for uncompressed formats,
@@ -294,7 +294,7 @@ impl<'rx> VideoFrame<'rx> {
             frame_rate_n: c_frame.frame_rate_N,
             frame_rate_d: c_frame.frame_rate_D,
             picture_aspect_ratio: c_frame.picture_aspect_ratio,
-            frame_format_type: FrameFormatType::try_from(c_frame.frame_format_type)
+            frame_format_type: FrameFormatType::try_from(c_frame.frame_format_type as u32)
                 .unwrap_or(FrameFormatType::Max),
             timecode: c_frame.timecode,
             data,
@@ -490,11 +490,11 @@ impl Drop for VideoFrame<'_> {
             let raw_frame = NDIlib_video_frame_v2_t {
                 xres: self.width,
                 yres: self.height,
-                FourCC: self.fourcc.into(),
+                FourCC: self.fourcc.into::<u32>() as i32,
                 frame_rate_N: self.frame_rate_n,
                 frame_rate_D: self.frame_rate_d,
                 picture_aspect_ratio: self.picture_aspect_ratio,
-                frame_format_type: self.frame_format_type.into(),
+                frame_format_type: self.frame_format_type.into::<u32>() as i32,
                 timecode: self.timecode,
                 p_data: original_p_data,
                 __bindgen_anon_1: self.line_stride_or_size.into(),
@@ -535,7 +535,7 @@ impl<'rx> AudioFrame<'rx> {
             no_channels: self.num_channels,
             no_samples: self.num_samples,
             timecode: self.timecode,
-            FourCC: self.fourcc.into(),
+            FourCC: self.fourcc.into::<u32>() as i32,
             p_data: self.data.as_ptr() as *mut f32 as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: self.channel_stride_in_bytes,
@@ -808,7 +808,7 @@ impl Drop for AudioFrame<'_> {
                 no_channels: self.num_channels,
                 no_samples: self.num_samples,
                 timecode: self.timecode,
-                FourCC: self.fourcc.into(),
+                FourCC: self.fourcc.into::<u32>() as i32,
                 p_data: original_p_data,
                 __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                     channel_stride_in_bytes: self.channel_stride_in_bytes,
@@ -826,8 +826,8 @@ impl Drop for AudioFrame<'_> {
 #[derive(Debug, TryFromPrimitive, IntoPrimitive, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum AudioType {
-    FLTP = NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
-    Max = NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_max,
+    FLTP = NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP as u32,
+    Max = NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_max as u32,
 }
 
 #[derive(Debug, Clone)]

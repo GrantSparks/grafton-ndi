@@ -157,11 +157,11 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         NDIlib_video_frame_v2_t {
             xres: self.width,
             yres: self.height,
-            FourCC: self.fourcc.into(),
+            FourCC: self.fourcc.into::<u32>() as i32,
             frame_rate_N: self.frame_rate_n,
             frame_rate_D: self.frame_rate_d,
             picture_aspect_ratio: self.picture_aspect_ratio,
-            frame_format_type: self.frame_format_type.into(),
+            frame_format_type: self.frame_format_type.into::<u32>() as i32,
             timecode: self.timecode,
             p_data: self.data.as_ptr() as *mut u8,
             __bindgen_anon_1: self.line_stride_or_size.into(),
