@@ -5,13 +5,13 @@
 //! The receiver can monitor status changes including tally state and connection count:
 //!
 //! ```ignore
-//! # use grafton_ndi::{NDI, Receiver, RecvBandwidth, Source};
+//! # use grafton_ndi::{NDI, ReceiverOptions, ReceiverBandwidth, Source};
 //! # fn main() -> Result<(), grafton_ndi::Error> {
 //! # let ndi = NDI::new()?;
-//! // In real usage, you'd get the source from Find::get_sources()
-//! // let source = /* obtained from Find */;
-//! let receiver = Receiver::builder(source)
-//!     .bandwidth(RecvBandwidth::MetadataOnly)
+//! // In real usage, you'd get the source from Finder::get_sources()
+//! // let source = /* obtained from Finder */;
+//! let receiver = ReceiverOptions::builder(source)
+//!     .bandwidth(ReceiverBandwidth::MetadataOnly)
 //!     .build(&ndi)?;
 //!
 //! // Poll for status changes
@@ -38,7 +38,7 @@ use crate::{
 use std::{ffi::CString, ptr};
 
 #[derive(Debug, Default, Clone, Copy)]
-pub enum RecvColorFormat {
+pub enum ReceiverColorFormat {
     #[default]
     BGRX_BGRA,
     UYVY_BGRA,
@@ -50,33 +50,33 @@ pub enum RecvColorFormat {
     Max,
 }
 
-impl From<RecvColorFormat> for NDIlib_recv_color_format_e {
-    fn from(format: RecvColorFormat) -> Self {
+impl From<ReceiverColorFormat> for NDIlib_recv_color_format_e {
+    fn from(format: ReceiverColorFormat) -> Self {
         match format {
-            RecvColorFormat::BGRX_BGRA => {
+            ReceiverColorFormat::BGRX_BGRA => {
                 NDIlib_recv_color_format_e_NDIlib_recv_color_format_BGRX_BGRA
             }
-            RecvColorFormat::UYVY_BGRA => {
+            ReceiverColorFormat::UYVY_BGRA => {
                 NDIlib_recv_color_format_e_NDIlib_recv_color_format_UYVY_BGRA
             }
-            RecvColorFormat::RGBX_RGBA => {
+            ReceiverColorFormat::RGBX_RGBA => {
                 NDIlib_recv_color_format_e_NDIlib_recv_color_format_RGBX_RGBA
             }
-            RecvColorFormat::UYVY_RGBA => {
+            ReceiverColorFormat::UYVY_RGBA => {
                 NDIlib_recv_color_format_e_NDIlib_recv_color_format_UYVY_RGBA
             }
-            RecvColorFormat::Fastest => NDIlib_recv_color_format_e_NDIlib_recv_color_format_fastest,
-            RecvColorFormat::Best => NDIlib_recv_color_format_e_NDIlib_recv_color_format_best,
-            //            RecvColorFormat::BGRX_BGRA_Flipped => {
+            ReceiverColorFormat::Fastest => NDIlib_recv_color_format_e_NDIlib_recv_color_format_fastest,
+            ReceiverColorFormat::Best => NDIlib_recv_color_format_e_NDIlib_recv_color_format_best,
+            //            ReceiverColorFormat::BGRX_BGRA_Flipped => {
             //                NDIlib_recv_color_format_e_NDIlib_recv_color_format_BGRX_BGRA_flipped
             //            }
-            RecvColorFormat::Max => NDIlib_recv_color_format_e_NDIlib_recv_color_format_max,
+            ReceiverColorFormat::Max => NDIlib_recv_color_format_e_NDIlib_recv_color_format_max,
         }
     }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-pub enum RecvBandwidth {
+pub enum ReceiverBandwidth {
     MetadataOnly,
     AudioOnly,
     Lowest,
@@ -85,25 +85,25 @@ pub enum RecvBandwidth {
     Max,
 }
 
-impl From<RecvBandwidth> for NDIlib_recv_bandwidth_e {
-    fn from(bandwidth: RecvBandwidth) -> Self {
+impl From<ReceiverBandwidth> for NDIlib_recv_bandwidth_e {
+    fn from(bandwidth: ReceiverBandwidth) -> Self {
         match bandwidth {
-            RecvBandwidth::MetadataOnly => {
+            ReceiverBandwidth::MetadataOnly => {
                 NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_metadata_only
             }
-            RecvBandwidth::AudioOnly => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_audio_only,
-            RecvBandwidth::Lowest => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest,
-            RecvBandwidth::Highest => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
-            RecvBandwidth::Max => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_max,
+            ReceiverBandwidth::AudioOnly => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_audio_only,
+            ReceiverBandwidth::Lowest => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest,
+            ReceiverBandwidth::Highest => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
+            ReceiverBandwidth::Max => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_max,
         }
     }
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct Receiver {
+pub struct ReceiverOptions {
     pub source_to_connect_to: Source,
-    pub color_format: RecvColorFormat,
-    pub bandwidth: RecvBandwidth,
+    pub color_format: ReceiverColorFormat,
+    pub bandwidth: ReceiverBandwidth,
     pub allow_video_fields: bool,
     pub ndi_recv_name: Option<String>,
 }
@@ -115,7 +115,7 @@ pub(crate) struct RawRecvCreateV3 {
     pub raw: NDIlib_recv_create_v3_t,
 }
 
-impl Receiver {
+impl ReceiverOptions {
     /// Convert to raw format for FFI use
     ///
     /// # Safety
@@ -148,25 +148,25 @@ impl Receiver {
     }
 
     /// Create a builder for configuring a receiver
-    pub fn builder(source: Source) -> ReceiverBuilder {
-        ReceiverBuilder::new(source)
+    pub fn builder(source: Source) -> ReceiverOptionsBuilder {
+        ReceiverOptionsBuilder::new(source)
     }
 }
 
-/// Builder for configuring a Receiver with ergonomic method chaining
+/// Builder for configuring a ReceiverOptions with ergonomic method chaining
 #[derive(Debug, Clone)]
-pub struct ReceiverBuilder {
+pub struct ReceiverOptionsBuilder {
     source_to_connect_to: Source,
-    color_format: Option<RecvColorFormat>,
-    bandwidth: Option<RecvBandwidth>,
+    color_format: Option<ReceiverColorFormat>,
+    bandwidth: Option<ReceiverBandwidth>,
     allow_video_fields: Option<bool>,
     ndi_recv_name: Option<String>,
 }
 
-impl ReceiverBuilder {
+impl ReceiverOptionsBuilder {
     /// Create a new builder with the specified source
     pub fn new(source: Source) -> Self {
-        ReceiverBuilder {
+        ReceiverOptionsBuilder {
             source_to_connect_to: source,
             color_format: None,
             bandwidth: None,
@@ -176,13 +176,13 @@ impl ReceiverBuilder {
     }
 
     /// Set the color format for received video
-    pub fn color(mut self, fmt: RecvColorFormat) -> Self {
+    pub fn color(mut self, fmt: ReceiverColorFormat) -> Self {
         self.color_format = Some(fmt);
         self
     }
 
     /// Set the bandwidth mode for the receiver
-    pub fn bandwidth(mut self, bw: RecvBandwidth) -> Self {
+    pub fn bandwidth(mut self, bw: ReceiverBandwidth) -> Self {
         self.bandwidth = Some(bw);
         self
     }
@@ -199,26 +199,26 @@ impl ReceiverBuilder {
         self
     }
 
-    /// Build the receiver and create a Recv instance
-    pub fn build(self, ndi: &NDI) -> Result<Recv<'_>, Error> {
-        let receiver = Receiver {
+    /// Build the receiver and create a Receiver instance
+    pub fn build(self, ndi: &NDI) -> Result<Receiver<'_>, Error> {
+        let receiver = ReceiverOptions {
             source_to_connect_to: self.source_to_connect_to,
-            color_format: self.color_format.unwrap_or(RecvColorFormat::BGRX_BGRA),
-            bandwidth: self.bandwidth.unwrap_or(RecvBandwidth::Highest),
+            color_format: self.color_format.unwrap_or(ReceiverColorFormat::BGRX_BGRA),
+            bandwidth: self.bandwidth.unwrap_or(ReceiverBandwidth::Highest),
             allow_video_fields: self.allow_video_fields.unwrap_or(true),
             ndi_recv_name: self.ndi_recv_name,
         };
-        Recv::new(ndi, &receiver)
+        Receiver::new(ndi, &receiver)
     }
 }
 
-pub struct Recv<'a> {
+pub struct Receiver<'a> {
     pub(crate) instance: NDIlib_recv_instance_t,
     ndi: std::marker::PhantomData<&'a NDI>,
 }
 
-impl<'a> Recv<'a> {
-    pub fn new(_ndi: &'a NDI, create: &Receiver) -> Result<Self, Error> {
+impl<'a> Receiver<'a> {
+    pub fn new(_ndi: &'a NDI, create: &ReceiverOptions) -> Result<Self, Error> {
         let create_raw = create.to_raw()?;
         // NDIlib_recv_create_v3 already connects to the source specified in source_to_connect_to
         let instance = unsafe { NDIlib_recv_create_v3(&create_raw.raw) };
@@ -227,7 +227,7 @@ impl<'a> Recv<'a> {
                 "Failed to create NDI recv instance".into(),
             ))
         } else {
-            Ok(Recv {
+            Ok(Receiver {
                 instance,
                 ndi: std::marker::PhantomData,
             })
@@ -272,7 +272,7 @@ impl<'a> Recv<'a> {
             NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(FrameType::None),
             NDIlib_frame_type_e_NDIlib_frame_type_status_change => {
                 // For the deprecated capture() method, we'll return a simple status with minimal info
-                let status = RecvStatus {
+                let status = ReceiverStatus {
                     tally: None,
                     connections: None,
                     other: true,
@@ -568,7 +568,7 @@ impl<'a> Recv<'a> {
     /// Poll for status changes (tally, connections, etc.)
     ///
     /// Returns None on timeout, Some(RecvStatus) when status has changed
-    pub fn poll_status_change(&self, timeout_ms: u32) -> Option<RecvStatus> {
+    pub fn poll_status_change(&self, timeout_ms: u32) -> Option<ReceiverStatus> {
         // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
         let frame_type = unsafe {
             NDIlib_recv_capture_v3(
@@ -599,7 +599,7 @@ impl<'a> Recv<'a> {
                 let has_tally = tally.is_some();
                 let has_connections = connections.is_some();
 
-                Some(RecvStatus {
+                Some(ReceiverStatus {
                     tally,
                     connections,
                     other: !has_tally && !has_connections,
@@ -610,7 +610,7 @@ impl<'a> Recv<'a> {
     }
 }
 
-impl Drop for Recv<'_> {
+impl Drop for Receiver<'_> {
     fn drop(&mut self) {
         unsafe {
             NDIlib_recv_destroy(self.instance);
@@ -622,9 +622,9 @@ impl Drop for Recv<'_> {
 ///
 /// The NDI 6 SDK documentation explicitly states that recv operations are thread-safe.
 /// `NDIlib_recv_capture_v3` and related functions use internal synchronization.
-/// The Recv struct only holds an opaque pointer returned by the SDK, and the SDK
+/// The Receiver struct only holds an opaque pointer returned by the SDK, and the SDK
 /// guarantees that this pointer can be safely moved between threads.
-unsafe impl std::marker::Send for Recv<'_> {}
+unsafe impl std::marker::Send for Receiver<'_> {}
 
 /// # Safety
 ///
@@ -632,7 +632,7 @@ unsafe impl std::marker::Send for Recv<'_> {}
 /// synchronized and can be called concurrently from multiple threads. This is explicitly
 /// mentioned in the SDK manual's thread safety section. The capture_video, capture_audio,
 /// and capture_metadata methods can be safely called from multiple threads simultaneously.
-unsafe impl std::marker::Sync for Recv<'_> {}
+unsafe impl std::marker::Sync for Receiver<'_> {}
 
 #[derive(Debug)]
 pub enum FrameType<'rx> {
@@ -640,11 +640,11 @@ pub enum FrameType<'rx> {
     Audio(AudioFrame<'rx>),
     Metadata(MetadataFrame),
     None,
-    StatusChange(RecvStatus),
+    StatusChange(ReceiverStatus),
 }
 
 #[derive(Debug, Clone)]
-pub struct RecvStatus {
+pub struct ReceiverStatus {
     /// Current Tally (program/preview) if known
     pub tally: Option<Tally>,
     /// Number of active connections (None if unknown)

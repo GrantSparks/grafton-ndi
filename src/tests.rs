@@ -4,7 +4,7 @@ use crate::{
     error::Error,
     frames::{AudioFrame, VideoFrame},
     ndi_lib::*,
-    receiver::{RecvStatus, Tally},
+    receiver::{ReceiverStatus, Tally},
 };
 use std::ptr;
 
@@ -169,8 +169,8 @@ fn test_video_frame_builder() {
         .build()
         .unwrap();
 
-    assert_eq!(frame.xres, 1920);
-    assert_eq!(frame.yres, 1080);
+    assert_eq!(frame.width, 1920);
+    assert_eq!(frame.height, 1080);
     assert_eq!(frame.frame_rate_n, 30);
     assert_eq!(frame.frame_rate_d, 1);
 }
@@ -185,15 +185,15 @@ fn test_audio_frame_builder() {
         .unwrap();
 
     assert_eq!(frame.sample_rate, 48000);
-    assert_eq!(frame.no_channels, 2);
-    assert_eq!(frame.no_samples, 1024);
+    assert_eq!(frame.num_channels, 2);
+    assert_eq!(frame.num_samples, 1024);
     assert_eq!(frame.data().len(), 2048); // 1024 samples * 2 channels
 }
 
 #[test]
 fn test_recv_status_creation() {
-    // Test RecvStatus with tally
-    let status = RecvStatus {
+    // Test ReceiverStatus with tally
+    let status = ReceiverStatus {
         tally: Some(Tally::new(true, false)),
         connections: Some(3),
         other: false,
@@ -206,8 +206,8 @@ fn test_recv_status_creation() {
     assert_eq!(status.connections, Some(3));
     assert!(!status.other);
 
-    // Test RecvStatus with other changes
-    let status2 = RecvStatus {
+    // Test ReceiverStatus with other changes
+    let status2 = ReceiverStatus {
         tally: None,
         connections: None,
         other: true,

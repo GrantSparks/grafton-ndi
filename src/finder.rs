@@ -14,25 +14,25 @@ use std::{
 /// # Examples
 ///
 /// ```
-/// use grafton_ndi::Finder;
+/// use grafton_ndi::FinderOptions;
 ///
 /// // Find all sources including local ones
-/// let finder = Finder::builder()
+/// let finder = FinderOptions::builder()
 ///     .show_local_sources(true)
 ///     .build();
 ///
 /// // Find sources in specific groups
-/// let finder = Finder::builder()
+/// let finder = FinderOptions::builder()
 ///     .groups("Public,Studio")
 ///     .build();
 ///
 /// // Find sources on specific network segments
-/// let finder = Finder::builder()
+/// let finder = FinderOptions::builder()
 ///     .extra_ips("192.168.1.0/24,10.0.0.0/24")
 ///     .build();
 /// ```
 #[derive(Debug, Default)]
-pub struct Finder {
+pub struct FinderOptions {
     /// Whether to include local sources in discovery.
     pub show_local_sources: bool,
     /// Comma-separated list of groups to search (e.g., "Public,Private").
@@ -41,22 +41,22 @@ pub struct Finder {
     pub extra_ips: Option<String>,
 }
 
-impl Finder {
+impl FinderOptions {
     /// Create a builder for configuring find options
-    pub fn builder() -> FinderBuilder {
-        FinderBuilder::new()
+    pub fn builder() -> FinderOptionsBuilder {
+        FinderOptionsBuilder::new()
     }
 }
 
-/// Builder for configuring Finder with ergonomic method chaining
+/// Builder for configuring FinderOptions with ergonomic method chaining
 #[derive(Debug, Clone)]
-pub struct FinderBuilder {
+pub struct FinderOptionsBuilder {
     show_local_sources: Option<bool>,
     groups: Option<String>,
     extra_ips: Option<String>,
 }
 
-impl FinderBuilder {
+impl FinderOptionsBuilder {
     /// Creates a new builder with default settings.
     ///
     /// Default settings:
@@ -64,7 +64,7 @@ impl FinderBuilder {
     /// - `groups`: `None` (search all groups)
     /// - `extra_ips`: `None` (no additional IPs)
     pub fn new() -> Self {
-        FinderBuilder {
+        FinderOptionsBuilder {
             show_local_sources: None,
             groups: None,
             extra_ips: None,
@@ -89,9 +89,9 @@ impl FinderBuilder {
         self
     }
 
-    /// Build the Finder
-    pub fn build(self) -> Finder {
-        Finder {
+    /// Build the FinderOptions
+    pub fn build(self) -> FinderOptions {
+        FinderOptions {
             show_local_sources: self.show_local_sources.unwrap_or(true),
             groups: self.groups,
             extra_ips: self.extra_ips,
@@ -99,7 +99,7 @@ impl FinderBuilder {
     }
 }
 
-impl Default for FinderBuilder {
+impl Default for FinderOptionsBuilder {
     fn default() -> Self {
         Self::new()
     }
@@ -107,21 +107,21 @@ impl Default for FinderBuilder {
 
 /// Discovers NDI sources on the network.
 ///
-/// `Find` provides methods to discover and monitor NDI sources. It maintains
+/// `Finder` provides methods to discover and monitor NDI sources. It maintains
 /// a background thread that continuously updates the list of available sources.
 ///
 /// # Examples
 ///
 /// ```no_run
-/// # use grafton_ndi::{NDI, Finder, Find};
+/// # use grafton_ndi::{NDI, FinderOptions, Finder};
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// let ndi = NDI::new()?;
-/// let finder = Finder::builder().show_local_sources(true).build();
-/// let find = Find::new(&ndi, &finder)?;
+/// let options = FinderOptions::builder().show_local_sources(true).build();
+/// let finder = Finder::new(&ndi, &options)?;
 ///
 /// // Wait for initial discovery
-/// if find.wait_for_sources(5000) {
-///     let sources = find.get_sources(0)?;
+/// if finder.wait_for_sources(5000) {
+///     let sources = finder.get_sources(0)?;
 ///     for source in sources {
 ///         println!("Found: {}", source);
 ///     }
@@ -129,26 +129,26 @@ impl Default for FinderBuilder {
 /// # Ok(())
 /// # }
 /// ```
-pub struct Find<'a> {
+pub struct Finder<'a> {
     instance: NDIlib_find_instance_t,
     _groups: Option<CString>,    // Hold ownership of CStrings
     _extra_ips: Option<CString>, // to ensure they outlive SDK usage
     ndi: std::marker::PhantomData<&'a NDI>,
 }
 
-impl<'a> Find<'a> {
+impl<'a> Finder<'a> {
     /// Creates a new source finder with the specified settings.
     ///
     /// # Arguments
     ///
-    /// * `ndi` - The NDI instance (must outlive this `Find`)
+    /// * `ndi` - The NDI instance (must outlive this `Finder`)
     /// * `settings` - Configuration for source discovery
     ///
     /// # Errors
     ///
     /// Returns an error if the finder cannot be created, typically due to
     /// invalid settings or network issues.
-    pub fn new(_ndi: &'a NDI, settings: &Finder) -> Result<Self, Error> {
+    pub fn new(_ndi: &'a NDI, settings: &FinderOptions) -> Result<Self, Error> {
         let groups_cstr = settings
             .groups
             .as_deref()
@@ -174,7 +174,7 @@ impl<'a> Find<'a> {
                 "NDIlib_find_create_v2 failed".into(),
             ));
         }
-        Ok(Find {
+        Ok(Finder {
             instance,
             _groups: groups_cstr,
             _extra_ips: extra_ips_cstr,
@@ -198,12 +198,12 @@ impl<'a> Find<'a> {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, Finder, Find};
+    /// # use grafton_ndi::{NDI, FinderOptions, Finder};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
-    /// # let find = Find::new(&ndi, &Finder::default())?;
+    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// // Wait up to 5 seconds for changes
-    /// if find.wait_for_sources(5000) {
+    /// if finder.wait_for_sources(5000) {
     ///     println!("Source list changed!");
     /// }
     /// # Ok(())
@@ -226,15 +226,15 @@ impl<'a> Find<'a> {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, Finder, Find};
+    /// # use grafton_ndi::{NDI, FinderOptions, Finder};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
-    /// # let find = Find::new(&ndi, &Finder::default())?;
+    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// // Get sources immediately
-    /// let sources = find.get_sources(0)?;
+    /// let sources = finder.get_sources(0)?;
     ///
     /// // Get sources with 1 second timeout
-    /// let sources = find.get_sources(1000)?;
+    /// let sources = finder.get_sources(1000)?;
     ///
     /// for source in sources {
     ///     println!("{}", source);
@@ -243,14 +243,14 @@ impl<'a> Find<'a> {
     /// # }
     /// ```
     pub fn get_sources(&self, timeout: u32) -> Result<Vec<Source>, Error> {
-        let mut no_sources = 0;
+        let mut num_sources = 0;
         let sources_ptr =
-            unsafe { NDIlib_find_get_sources(self.instance, &mut no_sources, timeout) };
+            unsafe { NDIlib_find_get_sources(self.instance, &mut num_sources, timeout) };
         if sources_ptr.is_null() {
             return Ok(vec![]);
         }
         let sources = unsafe {
-            (0..no_sources)
+            (0..num_sources)
                 .map(|i| {
                     let source = &*sources_ptr.add(i as usize);
                     Source::from_raw(source)
@@ -261,7 +261,7 @@ impl<'a> Find<'a> {
     }
 }
 
-impl Drop for Find<'_> {
+impl Drop for Finder<'_> {
     fn drop(&mut self) {
         unsafe { NDIlib_find_destroy(self.instance) };
     }
@@ -271,16 +271,16 @@ impl Drop for Find<'_> {
 ///
 /// The NDI SDK documentation states that find operations are thread-safe.
 /// `NDIlib_find_create_v2`, `NDIlib_find_wait_for_sources`, and `NDIlib_find_get_sources`
-/// can be called from multiple threads. The Find struct only holds an opaque pointer
+/// can be called from multiple threads. The Finder struct only holds an opaque pointer
 /// returned by the SDK and does not perform any mutations that could cause data races.
-unsafe impl std::marker::Send for Find<'_> {}
+unsafe impl std::marker::Send for Finder<'_> {}
 
 /// # Safety
 ///
 /// The NDI SDK documentation guarantees thread-safety for find operations.
-/// Multiple threads can safely call methods on a shared Find instance as the
+/// Multiple threads can safely call methods on a shared Finder instance as the
 /// SDK handles all necessary synchronization internally.
-unsafe impl std::marker::Sync for Find<'_> {}
+unsafe impl std::marker::Sync for Finder<'_> {}
 
 /// Network address of an NDI source.
 ///

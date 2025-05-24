@@ -1,4 +1,4 @@
-use grafton_ndi::{Receiver, RecvBandwidth, RecvColorFormat, NDI};
+use grafton_ndi::{ReceiverOptions, ReceiverBandwidth, ReceiverColorFormat, NDI};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -9,18 +9,18 @@ fn main() -> Result<(), grafton_ndi::Error> {
     println!("NDI version: {}", NDI::version()?);
 
     // Create a finder to discover sources
-    let finder = grafton_ndi::Finder::default();
-    let find = grafton_ndi::Find::new(&ndi, &finder)?;
+    let finder_options = grafton_ndi::FinderOptions::default();
+    let finder = grafton_ndi::Finder::new(&ndi, &finder_options)?;
 
     // Wait for sources
     println!("Looking for NDI sources...");
-    if !find.wait_for_sources(5000) {
+    if !finder.wait_for_sources(5000) {
         println!("No sources found after 5 seconds");
         return Ok(());
     }
 
     // Get available sources
-    let sources = find.get_sources(0)?;
+    let sources = finder.get_sources(0)?;
     if sources.is_empty() {
         println!("No NDI sources found on the network");
         return Ok(());
@@ -36,24 +36,24 @@ fn main() -> Result<(), grafton_ndi::Error> {
     println!("\nConnecting to: {}", source);
 
     // Create receiver
-    let recv = grafton_ndi::Recv::new(
+    let receiver = grafton_ndi::Receiver::new(
         &ndi,
-        &Receiver {
+        &ReceiverOptions {
             source_to_connect_to: source,
-            color_format: RecvColorFormat::BGRX_BGRA,
-            bandwidth: RecvBandwidth::Highest,
+            color_format: ReceiverColorFormat::BGRX_BGRA,
+            bandwidth: ReceiverBandwidth::Highest,
             allow_video_fields: true,
             ndi_recv_name: Some("Concurrent Capture Example".to_string()),
         },
     )?;
 
     // Wrap receiver in Arc for sharing between threads
-    let recv = Arc::new(recv);
+    let receiver = Arc::new(receiver);
 
     // Use scoped threads to ensure proper lifetimes
     thread::scope(|s| {
         // Spawn video capture thread
-        let recv_video = Arc::clone(&recv);
+        let recv_video = Arc::clone(&receiver);
         let video_handle = s.spawn(move || {
             println!("Video thread started");
             let mut frame_count = 0;
@@ -65,8 +65,8 @@ fn main() -> Result<(), grafton_ndi::Error> {
                         println!(
                             "[VIDEO] Frame {}: {}x{} @ {}/{} fps",
                             frame_count,
-                            frame.xres,
-                            frame.yres,
+                            frame.width,
+                            frame.height,
                             frame.frame_rate_n,
                             frame.frame_rate_d
                         );
@@ -86,7 +86,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
         });
 
         // Spawn audio capture thread
-        let recv_audio = Arc::clone(&recv);
+        let recv_audio = Arc::clone(&receiver);
         let audio_handle = s.spawn(move || {
             println!("Audio thread started");
             let mut sample_count = 0;
@@ -94,10 +94,10 @@ fn main() -> Result<(), grafton_ndi::Error> {
             for _ in 0..10 {
                 match recv_audio.capture_audio(5000) {
                     Ok(Some(frame)) => {
-                        sample_count += frame.no_samples;
+                        sample_count += frame.num_samples;
                         println!(
                             "[AUDIO] {} samples @ {} Hz, {} channels",
-                            frame.no_samples, frame.sample_rate, frame.no_channels
+                            frame.num_samples, frame.sample_rate, frame.num_channels
                         );
                     }
                     Ok(None) => {
@@ -115,7 +115,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
         });
 
         // Spawn metadata capture thread
-        let recv_metadata = Arc::clone(&recv);
+        let recv_metadata = Arc::clone(&receiver);
         let metadata_handle = s.spawn(move || {
             println!("Metadata thread started");
             let mut metadata_count = 0;

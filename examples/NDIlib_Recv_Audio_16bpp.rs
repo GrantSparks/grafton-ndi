@@ -5,7 +5,7 @@
 //!
 //! Run with: `cargo run --example NDIlib_Recv_Audio_16bpp`
 
-use grafton_ndi::{Error, Find, Finder, Receiver, NDI};
+use grafton_ndi::{Error, Finder, FinderOptions, ReceiverOptions, NDI};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,23 +23,23 @@ fn main() -> Result<(), Error> {
     let ndi = NDI::new()?;
 
     // Create finder
-    let finder = Finder::builder().build();
-    let ndi_find = Find::new(&ndi, &finder)?;
+    let finder_options = FinderOptions::builder().build();
+    let finder = Finder::new(&ndi, &finder_options)?;
 
     // Wait until there is at least one source
     let sources = loop {
         if exit_loop.load(Ordering::Relaxed) {
             return Ok(());
         }
-        ndi_find.wait_for_sources(1000);
-        let sources = ndi_find.get_sources(0)?;
+        finder.wait_for_sources(1000);
+        let sources = finder.get_sources(0)?;
         if !sources.is_empty() {
             break sources;
         }
     };
 
     // Create a receiver for the first source
-    let ndi_recv = Receiver::builder(sources[0].clone())
+    let receiver = ReceiverOptions::builder(sources[0].clone())
         .name("Example Audio Converter Receiver")
         .build(&ndi)?;
 
@@ -47,16 +47,16 @@ fn main() -> Result<(), Error> {
     let start = Instant::now();
     while !exit_loop.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(60) {
         // Check for video frames
-        if let Some(video_frame) = ndi_recv.capture_video(0)? {
+        if let Some(video_frame) = receiver.capture_video(0)? {
             println!(
                 "Video data received ({}x{}).",
-                video_frame.xres, video_frame.yres
+                video_frame.width, video_frame.height
             );
         }
 
         // Check for audio frames
-        if let Some(audio_frame) = ndi_recv.capture_audio(0)? {
-            println!("Audio data received ({} samples).", audio_frame.no_samples);
+        if let Some(audio_frame) = receiver.capture_audio(0)? {
+            println!("Audio data received ({} samples).", audio_frame.num_samples);
 
             // Convert to 16-bit interleaved format
             let audio_16bit = convert_to_16bit_interleaved(&audio_frame, 20); // 20dB headroom
@@ -64,17 +64,17 @@ fn main() -> Result<(), Error> {
             // Here you would process the 16-bit audio data
             println!(
                 "  Converted to 16-bit: {} samples",
-                audio_16bit.len() / audio_frame.no_channels as usize
+                audio_16bit.len() / audio_frame.num_channels as usize
             );
         }
 
         // Check for metadata
-        if let Some(_metadata) = ndi_recv.capture_metadata(0)? {
+        if let Some(_metadata) = receiver.capture_metadata(0)? {
             println!("Meta data received.");
         }
 
         // Check for status changes
-        if let Some(_status) = ndi_recv.poll_status_change(0) {
+        if let Some(_status) = receiver.poll_status_change(0) {
             println!("Receiver connection status changed.");
         }
 
@@ -89,7 +89,7 @@ fn convert_to_16bit_interleaved(
     audio_frame: &grafton_ndi::AudioFrame,
     reference_level_db: i32,
 ) -> Vec<i16> {
-    let num_samples = (audio_frame.no_samples * audio_frame.no_channels) as usize;
+    let num_samples = (audio_frame.num_samples * audio_frame.num_channels) as usize;
     let mut output = vec![0i16; num_samples];
 
     // Calculate scaling factor based on reference level

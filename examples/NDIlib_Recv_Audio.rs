@@ -8,7 +8,7 @@
 //!
 //! Run with: `cargo run --example NDIlib_Recv_Audio`
 
-use grafton_ndi::{Error, Find, Finder, Receiver, RecvBandwidth, NDI};
+use grafton_ndi::{Error, Finder, FinderOptions, ReceiverOptions, ReceiverBandwidth, NDI};
 use std::thread;
 use std::time::Duration;
 
@@ -21,14 +21,14 @@ fn main() -> Result<(), Error> {
     println!("NDI initialized successfully\n");
 
     // Configure the finder
-    let finder = Finder::builder().show_local_sources(true).build();
+    let finder_options = FinderOptions::builder().show_local_sources(true).build();
 
-    let ndi_find = Find::new(&ndi, &finder)?;
+    let finder = Finder::new(&ndi, &finder_options)?;
 
     // Wait for sources to appear
     println!("Searching for NDI sources...\n");
-    ndi_find.wait_for_sources(5000);
-    let sources = ndi_find.get_sources(5000)?;
+    finder.wait_for_sources(5000);
+    let sources = finder.get_sources(5000)?;
 
     if sources.is_empty() {
         println!("No NDI sources found!");
@@ -47,8 +47,8 @@ fn main() -> Result<(), Error> {
     println!("Connecting to: {}\n", source);
 
     // Create a receiver for audio
-    let ndi_recv = Receiver::builder(source)
-        .bandwidth(RecvBandwidth::AudioOnly)
+    let receiver = ReceiverOptions::builder(source)
+        .bandwidth(ReceiverBandwidth::AudioOnly)
         .name("Audio Capture Example")
         .build(&ndi)?;
 
@@ -57,12 +57,12 @@ fn main() -> Result<(), Error> {
 
     // Capture a few audio frames
     for i in 0..5 {
-        match ndi_recv.capture_audio(5000)? {
+        match receiver.capture_audio(5000)? {
             Some(audio_frame) => {
                 println!("Frame {}: ", i + 1);
                 println!("  Sample rate: {} Hz", audio_frame.sample_rate);
-                println!("  Channels: {}", audio_frame.no_channels);
-                println!("  Samples: {}", audio_frame.no_samples);
+                println!("  Channels: {}", audio_frame.num_channels);
+                println!("  Samples: {}", audio_frame.num_samples);
                 println!("  Timestamp: {}", audio_frame.timestamp);
                 println!("  Format: {:?}", audio_frame.fourcc);
 
@@ -79,8 +79,8 @@ fn main() -> Result<(), Error> {
                 }
 
                 // Show per-channel data if stereo or more
-                if audio_frame.no_channels > 1 {
-                    for ch in 0..audio_frame.no_channels.min(2) as usize {
+                if audio_frame.num_channels > 1 {
+                    for ch in 0..audio_frame.num_channels.min(2) as usize {
                         if let Some(channel_data) = audio_frame.channel_data(ch) {
                             let ch_sample_count = channel_data.len().min(10);
                             print!("  Channel {}: [", ch);

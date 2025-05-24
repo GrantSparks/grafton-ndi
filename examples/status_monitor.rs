@@ -1,4 +1,4 @@
-use grafton_ndi::{Finder, Receiver, RecvBandwidth, NDI};
+use grafton_ndi::{FinderOptions, Finder, ReceiverOptions, ReceiverBandwidth, NDI};
 use std::env;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,12 +15,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("NDI initialized successfully");
 
     // Find sources
-    let finder = Finder::builder().show_local_sources(true).build();
-    let find = grafton_ndi::Find::new(&ndi, &finder)?;
+    let finder_options = FinderOptions::builder().show_local_sources(true).build();
+    let finder = Finder::new(&ndi, &finder_options)?;
 
     println!("Looking for NDI sources...");
-    find.wait_for_sources(5000);
-    let sources = find.get_sources(0)?;
+    finder.wait_for_sources(5000);
+    let sources = finder.get_sources(0)?;
 
     if sources.is_empty() {
         println!("No NDI sources found on the network");
@@ -43,8 +43,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create receiver with metadata-only bandwidth to focus on status changes
-    let receiver = Receiver::builder(source.clone())
-        .bandwidth(RecvBandwidth::MetadataOnly)
+    let receiver = ReceiverOptions::builder(source.clone())
+        .bandwidth(ReceiverBandwidth::MetadataOnly)
         .build(&ndi)?;
 
     println!("\nMonitoring status changes for: {}", source);

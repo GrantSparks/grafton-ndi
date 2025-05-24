@@ -1,6 +1,6 @@
 //! Frame types for video, audio, and metadata.
 
-use crate::{error::Error, ndi_lib::*, receiver::Recv};
+use crate::{error::Error, ndi_lib::*, receiver::Receiver};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use std::{
     borrow::Cow,
@@ -117,8 +117,8 @@ impl From<NDIlib_video_frame_v2_t__bindgen_ty_1> for LineStrideOrSize {
 }
 
 pub struct VideoFrame<'rx> {
-    pub xres: i32,
-    pub yres: i32,
+    pub width: i32,
+    pub height: i32,
     pub fourcc: FourCCVideoType,
     pub frame_rate_n: i32,
     pub frame_rate_d: i32,
@@ -132,14 +132,14 @@ pub struct VideoFrame<'rx> {
     pub(crate) recv_instance: Option<NDIlib_recv_instance_t>,
     // Store original SDK data pointer for proper freeing
     pub(crate) original_p_data: Option<*mut u8>,
-    pub(crate) _origin: std::marker::PhantomData<&'rx Recv<'rx>>,
+    pub(crate) _origin: std::marker::PhantomData<&'rx Receiver<'rx>>,
 }
 
 impl fmt::Debug for VideoFrame<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VideoFrame")
-            .field("xres", &self.xres)
-            .field("yres", &self.yres)
+            .field("width", &self.width)
+            .field("height", &self.height)
             .field("fourcc", &self.fourcc)
             .field("frame_rate_n", &self.frame_rate_n)
             .field("frame_rate_d", &self.frame_rate_d)
@@ -170,8 +170,8 @@ impl Default for VideoFrame<'_> {
 impl<'rx> VideoFrame<'rx> {
     pub fn to_raw(&self) -> NDIlib_video_frame_v2_t {
         NDIlib_video_frame_v2_t {
-            xres: self.xres,
-            yres: self.yres,
+            xres: self.width,
+            yres: self.height,
             FourCC: self.fourcc.into(),
             frame_rate_N: self.frame_rate_n,
             frame_rate_D: self.frame_rate_d,
@@ -288,8 +288,8 @@ impl<'rx> VideoFrame<'rx> {
         };
 
         Ok(VideoFrame {
-            xres: c_frame.xres,
-            yres: c_frame.yres,
+            width: c_frame.xres,
+            height: c_frame.yres,
             fourcc,
             frame_rate_n: c_frame.frame_rate_N,
             frame_rate_d: c_frame.frame_rate_D,
@@ -316,8 +316,8 @@ impl<'rx> VideoFrame<'rx> {
 /// Builder for configuring a VideoFrame with ergonomic method chaining
 #[derive(Debug, Clone)]
 pub struct VideoFrameBuilder<'rx> {
-    xres: Option<i32>,
-    yres: Option<i32>,
+    width: Option<i32>,
+    height: Option<i32>,
     fourcc: Option<FourCCVideoType>,
     frame_rate_n: Option<i32>,
     frame_rate_d: Option<i32>,
@@ -333,8 +333,8 @@ impl<'rx> VideoFrameBuilder<'rx> {
     /// Create a new builder with no fields set
     pub fn new() -> Self {
         VideoFrameBuilder {
-            xres: None,
-            yres: None,
+            width: None,
+            height: None,
             fourcc: None,
             frame_rate_n: None,
             frame_rate_d: None,
@@ -349,8 +349,8 @@ impl<'rx> VideoFrameBuilder<'rx> {
 
     /// Set the video resolution
     pub fn resolution(mut self, width: i32, height: i32) -> Self {
-        self.xres = Some(width);
-        self.yres = Some(height);
+        self.width = Some(width);
+        self.height = Some(height);
         self
     }
 
@@ -399,8 +399,8 @@ impl<'rx> VideoFrameBuilder<'rx> {
 
     /// Build the VideoFrame
     pub fn build(self) -> Result<VideoFrame<'rx>, Error> {
-        let xres = self.xres.unwrap_or(1920);
-        let yres = self.yres.unwrap_or(1080);
+        let width = self.width.unwrap_or(1920);
+        let height = self.height.unwrap_or(1080);
         let fourcc = self.fourcc.unwrap_or(FourCCVideoType::BGRA);
         let frame_rate_n = self.frame_rate_n.unwrap_or(60);
         let frame_rate_d = self.frame_rate_d.unwrap_or(1);
@@ -415,40 +415,40 @@ impl<'rx> VideoFrameBuilder<'rx> {
             | FourCCVideoType::BGRX
             | FourCCVideoType::RGBA
             | FourCCVideoType::RGBX => {
-                let stride = xres * 4; // 32 bpp = 4 bytes per pixel
-                (stride, (yres * stride) as usize)
+                let stride = width * 4; // 32 bpp = 4 bytes per pixel
+                (stride, (height * stride) as usize)
             }
             FourCCVideoType::UYVY => {
-                let stride = xres * 2; // 16 bpp = 2 bytes per pixel
-                (stride, (yres * stride) as usize)
+                let stride = width * 2; // 16 bpp = 2 bytes per pixel
+                (stride, (height * stride) as usize)
             }
             FourCCVideoType::YV12 | FourCCVideoType::I420 | FourCCVideoType::NV12 => {
                 // Planar 4:2:0 formats: Y plane is full res, U/V planes are quarter size
                 // Total size = Y plane (width * height) + U plane (width/2 * height/2) + V plane (width/2 * height/2)
                 // = width * height * 1.5 = width * height * 3/2
-                let stride = xres; // Y plane stride
-                let y_size = (xres * yres) as usize;
-                let uv_size = ((xres / 2) * (yres / 2)) as usize;
+                let stride = width; // Y plane stride
+                let y_size = (width * height) as usize;
+                let uv_size = ((width / 2) * (height / 2)) as usize;
                 (stride, y_size + 2 * uv_size)
             }
             FourCCVideoType::UYVA => {
-                let stride = xres * 3; // 24 bpp = 3 bytes per pixel
-                (stride, (yres * stride) as usize)
+                let stride = width * 3; // 24 bpp = 3 bytes per pixel
+                (stride, (height * stride) as usize)
             }
             FourCCVideoType::P216 | FourCCVideoType::PA16 => {
-                let stride = xres * 4; // 32 bpp = 4 bytes per pixel
-                (stride, (yres * stride) as usize)
+                let stride = width * 4; // 32 bpp = 4 bytes per pixel
+                (stride, (height * stride) as usize)
             }
             _ => {
-                let stride = xres * 4; // Default to 32 bpp
-                (stride, (yres * stride) as usize)
+                let stride = width * 4; // Default to 32 bpp
+                (stride, (height * stride) as usize)
             }
         };
         let data = vec![0u8; buffer_size];
 
         let mut frame = VideoFrame {
-            xres,
-            yres,
+            width,
+            height,
             fourcc,
             frame_rate_n,
             frame_rate_d,
@@ -488,8 +488,8 @@ impl Drop for VideoFrame<'_> {
         {
             // Create a raw frame with the original SDK pointer for NDI to free
             let raw_frame = NDIlib_video_frame_v2_t {
-                xres: self.xres,
-                yres: self.yres,
+                xres: self.width,
+                yres: self.height,
                 FourCC: self.fourcc.into(),
                 frame_rate_N: self.frame_rate_n,
                 frame_rate_D: self.frame_rate_d,
@@ -514,8 +514,8 @@ impl Drop for VideoFrame<'_> {
 #[derive(Debug)]
 pub struct AudioFrame<'rx> {
     pub sample_rate: i32,
-    pub no_channels: i32,
-    pub no_samples: i32,
+    pub num_channels: i32,
+    pub num_samples: i32,
     pub timecode: i64,
     pub fourcc: AudioType,
     data: Cow<'rx, [f32]>,
@@ -525,15 +525,15 @@ pub struct AudioFrame<'rx> {
     pub(crate) recv_instance: Option<NDIlib_recv_instance_t>,
     // Store original SDK data pointer for proper freeing
     pub(crate) original_p_data: Option<*mut u8>,
-    pub(crate) _origin: std::marker::PhantomData<&'rx Recv<'rx>>,
+    pub(crate) _origin: std::marker::PhantomData<&'rx Receiver<'rx>>,
 }
 
 impl<'rx> AudioFrame<'rx> {
     pub(crate) fn to_raw(&self) -> NDIlib_audio_frame_v3_t {
         NDIlib_audio_frame_v3_t {
             sample_rate: self.sample_rate,
-            no_channels: self.no_channels,
-            no_samples: self.no_samples,
+            no_channels: self.num_channels,
+            no_samples: self.num_samples,
             timecode: self.timecode,
             FourCC: self.fourcc.into(),
             p_data: self.data.as_ptr() as *mut f32 as *mut u8,
@@ -606,8 +606,8 @@ impl<'rx> AudioFrame<'rx> {
 
         Ok(AudioFrame {
             sample_rate: raw.sample_rate,
-            no_channels: raw.no_channels,
-            no_samples: raw.no_samples,
+            num_channels: raw.no_channels,
+            num_samples: raw.no_samples,
             timecode: raw.timecode,
             fourcc: match raw.FourCC {
                 NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP => AudioType::FLTP,
@@ -635,15 +635,15 @@ impl<'rx> AudioFrame<'rx> {
 
     /// Get audio data for a specific channel (if planar format)
     pub fn channel_data(&self, channel: usize) -> Option<Vec<f32>> {
-        if channel >= self.no_channels as usize {
+        if channel >= self.num_channels as usize {
             return None;
         }
 
-        let samples_per_channel = self.no_samples as usize;
+        let samples_per_channel = self.num_samples as usize;
 
         if self.channel_stride_in_bytes == 0 {
             // Interleaved format: extract samples for the requested channel
-            let channels = self.no_channels as usize;
+            let channels = self.num_channels as usize;
             let channel_data: Vec<f32> = self
                 .data
                 .iter()
@@ -671,8 +671,8 @@ impl<'rx> AudioFrame<'rx> {
 #[derive(Debug, Clone)]
 pub struct AudioFrameBuilder<'rx> {
     sample_rate: Option<i32>,
-    no_channels: Option<i32>,
-    no_samples: Option<i32>,
+    num_channels: Option<i32>,
+    num_samples: Option<i32>,
     timecode: Option<i64>,
     fourcc: Option<AudioType>,
     data: Option<Vec<f32>>,
@@ -686,8 +686,8 @@ impl<'rx> AudioFrameBuilder<'rx> {
     pub fn new() -> Self {
         AudioFrameBuilder {
             sample_rate: None,
-            no_channels: None,
-            no_samples: None,
+            num_channels: None,
+            num_samples: None,
             timecode: None,
             fourcc: None,
             data: None,
@@ -705,13 +705,13 @@ impl<'rx> AudioFrameBuilder<'rx> {
 
     /// Set the number of audio channels
     pub fn channels(mut self, channels: i32) -> Self {
-        self.no_channels = Some(channels);
+        self.num_channels = Some(channels);
         self
     }
 
     /// Set the number of samples
     pub fn samples(mut self, samples: i32) -> Self {
-        self.no_samples = Some(samples);
+        self.num_samples = Some(samples);
         self
     }
 
@@ -748,15 +748,15 @@ impl<'rx> AudioFrameBuilder<'rx> {
     /// Build the AudioFrame
     pub fn build(self) -> Result<AudioFrame<'rx>, Error> {
         let sample_rate = self.sample_rate.unwrap_or(48000);
-        let no_channels = self.no_channels.unwrap_or(2);
-        let no_samples = self.no_samples.unwrap_or(1024);
+        let num_channels = self.num_channels.unwrap_or(2);
+        let num_samples = self.num_samples.unwrap_or(1024);
         let fourcc = self.fourcc.unwrap_or(AudioType::FLTP);
 
         let data = if let Some(data) = self.data {
             data
         } else {
             // Calculate default buffer size for f32 samples
-            let sample_count = (no_samples * no_channels) as usize;
+            let sample_count = (num_samples * num_channels) as usize;
             vec![0.0f32; sample_count]
         };
 
@@ -767,8 +767,8 @@ impl<'rx> AudioFrameBuilder<'rx> {
 
         Ok(AudioFrame {
             sample_rate,
-            no_channels,
-            no_samples,
+            num_channels,
+            num_samples,
             timecode: self.timecode.unwrap_or(0),
             fourcc,
             data: Cow::Owned(data),
@@ -805,8 +805,8 @@ impl Drop for AudioFrame<'_> {
             // Create a raw frame with the original SDK pointer for NDI to free
             let raw_frame = NDIlib_audio_frame_v3_t {
                 sample_rate: self.sample_rate,
-                no_channels: self.no_channels,
-                no_samples: self.no_samples,
+                no_channels: self.num_channels,
+                no_samples: self.num_samples,
                 timecode: self.timecode,
                 FourCC: self.fourcc.into(),
                 p_data: original_p_data,

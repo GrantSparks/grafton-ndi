@@ -38,7 +38,7 @@ struct Inner {
 }
 
 #[derive(Debug)]
-pub struct SendInstance<'a> {
+pub struct Sender<'a> {
     inner: Arc<Inner>,
     ndi: std::marker::PhantomData<&'a NDI>,
 }
@@ -98,9 +98,9 @@ unsafe impl Sync for Inner {}
 
 /// A borrowed video frame that references external pixel data.
 /// Used for zero-copy async send operations.
-pub struct VideoFrameBorrowed<'buf> {
-    pub xres: i32,
-    pub yres: i32,
+pub struct BorrowedVideoFrame<'buf> {
+    pub width: i32,
+    pub height: i32,
     pub fourcc: FourCCVideoType,
     pub frame_rate_n: i32,
     pub frame_rate_d: i32,
@@ -113,12 +113,12 @@ pub struct VideoFrameBorrowed<'buf> {
     pub timestamp: i64,
 }
 
-impl<'buf> VideoFrameBorrowed<'buf> {
+impl<'buf> BorrowedVideoFrame<'buf> {
     /// Create a borrowed frame from a mutable buffer
     pub fn from_buffer(
         data: &'buf [u8],
-        xres: i32,
-        yres: i32,
+        width: i32,
+        height: i32,
         fourcc: FourCCVideoType,
         frame_rate_n: i32,
         frame_rate_d: i32,
@@ -127,17 +127,17 @@ impl<'buf> VideoFrameBorrowed<'buf> {
             FourCCVideoType::BGRA
             | FourCCVideoType::BGRX
             | FourCCVideoType::RGBA
-            | FourCCVideoType::RGBX => xres * 4, // 32 bpp = 4 bytes per pixel
-            FourCCVideoType::UYVY => xres * 2, // 16 bpp = 2 bytes per pixel
-            FourCCVideoType::YV12 | FourCCVideoType::I420 | FourCCVideoType::NV12 => xres, // Y plane stride for planar formats
-            FourCCVideoType::UYVA => xres * 3, // 24 bpp = 3 bytes per pixel
-            FourCCVideoType::P216 | FourCCVideoType::PA16 => xres * 4, // 32 bpp = 4 bytes per pixel
-            _ => xres * 4,                     // Default to 32 bpp
+            | FourCCVideoType::RGBX => width * 4, // 32 bpp = 4 bytes per pixel
+            FourCCVideoType::UYVY => width * 2, // 16 bpp = 2 bytes per pixel
+            FourCCVideoType::YV12 | FourCCVideoType::I420 | FourCCVideoType::NV12 => width, // Y plane stride for planar formats
+            FourCCVideoType::UYVA => width * 3, // 24 bpp = 3 bytes per pixel
+            FourCCVideoType::P216 | FourCCVideoType::PA16 => width * 4, // 32 bpp = 4 bytes per pixel
+            _ => width * 4,                     // Default to 32 bpp
         };
 
-        VideoFrameBorrowed {
-            xres,
-            yres,
+        BorrowedVideoFrame {
+            width,
+            height,
             fourcc,
             frame_rate_n,
             frame_rate_d,
@@ -155,8 +155,8 @@ impl<'buf> VideoFrameBorrowed<'buf> {
 
     fn to_raw(&self) -> NDIlib_video_frame_v2_t {
         NDIlib_video_frame_v2_t {
-            xres: self.xres,
-            yres: self.yres,
+            xres: self.width,
+            yres: self.height,
             FourCC: self.fourcc.into(),
             frame_rate_N: self.frame_rate_n,
             frame_rate_D: self.frame_rate_d,
@@ -171,11 +171,11 @@ impl<'buf> VideoFrameBorrowed<'buf> {
     }
 }
 
-impl<'buf> From<&'buf VideoFrame<'_>> for VideoFrameBorrowed<'buf> {
+impl<'buf> From<&'buf VideoFrame<'_>> for BorrowedVideoFrame<'buf> {
     fn from(frame: &'buf VideoFrame<'_>) -> Self {
-        VideoFrameBorrowed {
-            xres: frame.xres,
-            yres: frame.yres,
+        BorrowedVideoFrame {
+            width: frame.width,
+            height: frame.height,
             fourcc: frame.fourcc,
             frame_rate_n: frame.frame_rate_n,
             frame_rate_d: frame.frame_rate_d,
@@ -255,7 +255,7 @@ impl Drop for AsyncVideoToken<'_> {
     }
 }
 
-impl<'a> SendInstance<'a> {
+impl<'a> Sender<'a> {
     /// Creates a new NDI send instance.
     ///
     /// # Errors
@@ -264,7 +264,7 @@ impl<'a> SendInstance<'a> {
     /// - The sender name contains a null byte
     /// - The groups string contains a null byte
     /// - NDI fails to create the send instance
-    pub fn new(_ndi: &'a NDI, create_settings: &SendOptions) -> Result<Self, Error> {
+    pub fn new(_ndi: &'a NDI, create_settings: &SenderOptions) -> Result<Self, Error> {
         let p_ndi_name =
             CString::new(create_settings.name.clone()).map_err(Error::InvalidCString)?;
         let p_groups = match &create_settings.groups {
@@ -362,7 +362,7 @@ impl<'a> SendInstance<'a> {
                 inner.callback_ptr.store(ptr::null_mut(), Ordering::Release);
             }
 
-            Ok(SendInstance {
+            Ok(Sender {
                 inner,
                 ndi: std::marker::PhantomData,
             })
@@ -394,22 +394,22 @@ impl<'a> SendInstance<'a> {
     ///
     /// # Example
     /// ```no_run
-    /// # use grafton_ndi::{NDI, SendOptions, VideoFrame, VideoFrameBorrowed, FourCCVideoType};
+    /// # use grafton_ndi::{NDI, SenderOptions, VideoFrame, BorrowedVideoFrame, FourCCVideoType};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let ndi = NDI::new()?;
-    /// let send_options = SendOptions::builder("MyCam")
+    /// let send_options = SenderOptions::builder("MyCam")
     ///     .clock_video(true)
     ///     .clock_audio(true)
     ///     .build()?;
-    /// let send = grafton_ndi::SendInstance::new(&ndi, &send_options)?;
+    /// let sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
     ///
     /// // Register callback to know when buffer is released
-    /// send.on_async_video_done(|len| println!("Buffer released: {} bytes", len));
+    /// sender.on_async_video_done(|len| println!("Buffer released: {} bytes", len));
     ///
     /// // Use borrowed buffer directly (zero-copy, no allocation)
     /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
-    /// let borrowed_frame = VideoFrameBorrowed::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
-    /// let token = send.send_video_async(&borrowed_frame);
+    /// let borrowed_frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
+    /// let token = sender.send_video_async(&borrowed_frame);
     ///
     /// // Buffer is owned by SDK until token is dropped or explicit flush
     /// drop(token); // This triggers automatic flush if last token
@@ -420,7 +420,7 @@ impl<'a> SendInstance<'a> {
     /// ```
     pub fn send_video_async<'b>(
         &'b self,
-        video_frame: &VideoFrameBorrowed<'b>,
+        video_frame: &BorrowedVideoFrame<'b>,
     ) -> AsyncVideoToken<'b> {
         // Increment the in-flight counter
         self.inner.in_flight.fetch_add(1, Ordering::AcqRel);
@@ -450,10 +450,10 @@ impl<'a> SendInstance<'a> {
     /// # Example
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, SendOptions, AudioFrame};
+    /// # use grafton_ndi::{NDI, SenderOptions, AudioFrame};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
-    /// # let send = grafton_ndi::SendInstance::new(&ndi, &SendOptions::builder("Test").build()?)?;
+    /// # let sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build()?)?;
     /// let mut audio_buffer = vec![0.0f32; 48000 * 2]; // 1 second of stereo audio
     ///
     /// // Fill buffer with audio data...
@@ -463,7 +463,7 @@ impl<'a> SendInstance<'a> {
     ///     .samples(48000)
     ///     .data(audio_buffer.clone())
     ///     .build()?;
-    /// send.send_audio(&frame);
+    /// sender.send_audio(&frame);
     ///
     /// // Buffer can be reused immediately
     /// audio_buffer.fill(0.5);
@@ -473,7 +473,7 @@ impl<'a> SendInstance<'a> {
     ///     .samples(48000)
     ///     .data(audio_buffer)
     ///     .build()?;
-    /// send.send_audio(&frame2);
+    /// sender.send_audio(&frame2);
     /// # Ok(())
     /// # }
     /// ```
@@ -569,17 +569,17 @@ impl<'a> SendInstance<'a> {
     /// # Example
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, SendOptions, VideoFrameBorrowed, FourCCVideoType};
+    /// # use grafton_ndi::{NDI, SenderOptions, BorrowedVideoFrame, FourCCVideoType};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let ndi = NDI::new()?;
-    /// let send = grafton_ndi::SendInstance::new(&ndi, &SendOptions::builder("Test").build()?)?;
+    /// let sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build()?)?;
     ///
     /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
-    /// let frame = VideoFrameBorrowed::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
-    /// let token = send.send_video_async(&frame);
+    /// let frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
+    /// let token = sender.send_video_async(&frame);
     ///
     /// // Flush to ensure buffer is released
-    /// send.flush_async_blocking();
+    /// sender.flush_async_blocking();
     /// drop(token); // Now safe to drop token
     ///
     /// // Buffer can now be safely reused
@@ -626,16 +626,16 @@ impl<'a> SendInstance<'a> {
     /// # Example
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, SendOptions};
+    /// # use grafton_ndi::{NDI, SenderOptions};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let ndi = NDI::new()?;
-    /// let send = grafton_ndi::SendInstance::new(&ndi, &SendOptions::builder("Test").build()?)?;
+    /// let sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build()?)?;
     ///
     /// // ... send some async frames ...
     ///
     /// // Optional: wait with timeout before drop
-    /// send.flush_async(Duration::from_secs(1))?;
+    /// sender.flush_async(Duration::from_secs(1))?;
     /// # Ok(())
     /// # }
     /// ```
@@ -750,7 +750,7 @@ impl Drop for Inner {
     }
 }
 
-impl Drop for SendInstance<'_> {
+impl Drop for Sender<'_> {
     fn drop(&mut self) {
         // SendInstance drop doesn't need to do anything special
         // The Inner will be dropped when all Arc references are gone
@@ -774,7 +774,7 @@ impl Drop for SendInstance<'_> {
 ///
 /// Functions like `NDIlib_send_create` and `NDIlib_send_destroy` should be called
 /// from a single thread.
-unsafe impl std::marker::Send for SendInstance<'_> {}
+unsafe impl std::marker::Send for Sender<'_> {}
 
 /// # Safety
 ///
@@ -787,36 +787,36 @@ unsafe impl std::marker::Send for SendInstance<'_> {}
 ///
 /// Note: Creation and destruction (`NDIlib_send_create`/`NDIlib_send_destroy`)
 /// are handled in our Rust wrapper to ensure single-threaded access.
-unsafe impl std::marker::Sync for SendInstance<'_> {}
+unsafe impl std::marker::Sync for Sender<'_> {}
 
 #[derive(Debug)]
-pub struct SendOptions {
+pub struct SenderOptions {
     pub name: String,
     pub groups: Option<String>,
     pub clock_video: bool,
     pub clock_audio: bool,
 }
 
-impl SendOptions {
+impl SenderOptions {
     /// Create a builder for configuring send options
-    pub fn builder<S: Into<String>>(name: S) -> SendOptionsBuilder {
-        SendOptionsBuilder::new(name)
+    pub fn builder<S: Into<String>>(name: S) -> SenderOptionsBuilder {
+        SenderOptionsBuilder::new(name)
     }
 }
 
 /// Builder for configuring `SendOptions` with ergonomic method chaining
 #[derive(Debug, Clone)]
-pub struct SendOptionsBuilder {
+pub struct SenderOptionsBuilder {
     name: String,
     groups: Option<String>,
     clock_video: Option<bool>,
     clock_audio: Option<bool>,
 }
 
-impl SendOptionsBuilder {
+impl SenderOptionsBuilder {
     /// Create a new builder with the specified name
     pub fn new<S: Into<String>>(name: S) -> Self {
-        SendOptionsBuilder {
+        SenderOptionsBuilder {
             name: name.into(),
             groups: None,
             clock_video: None,
@@ -851,7 +851,7 @@ impl SendOptionsBuilder {
     /// Returns an error if:
     /// - The name is empty or contains only whitespace
     /// - Both clock_video and clock_audio are false
-    pub fn build(self) -> Result<SendOptions, Error> {
+    pub fn build(self) -> Result<SenderOptions, Error> {
         // Validate sender name
         if self.name.trim().is_empty() {
             return Err(Error::InvalidConfiguration(
@@ -869,7 +869,7 @@ impl SendOptionsBuilder {
             ));
         }
 
-        Ok(SendOptions {
+        Ok(SenderOptions {
             name: self.name,
             groups: self.groups,
             clock_video,

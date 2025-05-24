@@ -5,7 +5,7 @@
 //!
 //! Run with: `cargo run --example NDIlib_Send_Audio`
 
-use grafton_ndi::{AudioFrame, Error, SendInstance, SendOptions, NDI};
+use grafton_ndi::{AudioFrame, Error, Sender, SenderOptions, NDI};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -22,9 +22,9 @@ fn main() -> Result<(), Error> {
     let ndi = NDI::new()?;
 
     // Create an NDI source that is clocked to audio
-    let send_options = SendOptions::builder("My Audio").clock_audio(true).build()?;
+    let send_options = SenderOptions::builder("My Audio").clock_audio(true).build()?;
 
-    let ndi_send = SendInstance::new(&ndi, &send_options)?;
+    let ndi_send = Sender::new(&ndi, &send_options)?;
 
     // Audio parameters
     let sample_rate = 48000;

@@ -7,19 +7,19 @@
 //! # Quick Start
 //!
 //! ```no_run
-//! use grafton_ndi::{NDI, Finder, Find};
+//! use grafton_ndi::{NDI, FinderOptions, Finder};
 //!
 //! # fn main() -> Result<(), grafton_ndi::Error> {
 //! // Initialize the NDI runtime
 //! let ndi = NDI::new()?;
 //!
 //! // Find sources on the network
-//! let finder = Finder::builder().show_local_sources(true).build();
-//! let find = Find::new(&ndi, &finder)?;
+//! let options = FinderOptions::builder().show_local_sources(true).build();
+//! let finder = Finder::new(&ndi, &options)?;
 //!
 //! // Discover sources
-//! find.wait_for_sources(5000);
-//! let sources = find.get_sources(0)?;
+//! finder.wait_for_sources(5000);
+//! let sources = finder.get_sources(0)?;
 //!
 //! for source in sources {
 //!     println!("Found: {}", source);
@@ -38,7 +38,7 @@
 //!
 //! ## Source Discovery
 //!
-//! Use [`Find`] to discover NDI sources on the network. Sources can be filtered
+//! Use [`Finder`] to discover NDI sources on the network. Sources can be filtered
 //! by groups and additional IP addresses can be specified for discovery.
 //!
 //! ## Receiving
@@ -48,12 +48,12 @@
 //!
 //! ## Sending
 //!
-//! Use [`SendInstance`] to transmit video, audio, and metadata as an NDI source.
+//! Use [`Sender`] to transmit video, audio, and metadata as an NDI source.
 //! Senders can be configured with clock settings and group assignments.
 //!
 //! # Thread Safety
 //!
-//! All primary types ([`Find`], [`Receiver`], [`SendInstance`]) implement `Send + Sync`
+//! All primary types ([`Finder`], [`Receiver`], [`Sender`]) implement `Send + Sync`
 //! as the underlying NDI SDK is thread-safe. However, for optimal performance,
 //! minimize cross-thread operations and maintain thread affinity where possible.
 //!
@@ -63,15 +63,15 @@
 //! The completion callback notifies when the buffer can be reused:
 //!
 //! ```no_run
-//! # use grafton_ndi::{NDI, SendOptions, VideoFrameBorrowed, FourCCVideoType};
+//! # use grafton_ndi::{NDI, SenderOptions, BorrowedVideoFrame, FourCCVideoType};
 //! # let ndi = NDI::new().unwrap();
-//! # let send = grafton_ndi::SendInstance::new(&ndi, &SendOptions::builder("Test").build().unwrap()).unwrap();
+//! # let sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build().unwrap()).unwrap();
 //! // Register callback to know when buffer is released
-//! send.on_async_video_done(|len| println!("Buffer released: {} bytes", len));
+//! sender.on_async_video_done(|len| println!("Buffer released: {} bytes", len));
 //!
 //! let buffer = vec![0u8; 1920 * 1080 * 4];
-//! let frame = VideoFrameBorrowed::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
-//! let token = send.send_video_async(&frame);
+//! let frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
+//! let token = sender.send_video_async(&frame);
 //! // Buffer is now owned by NDI - cannot be modified until callback fires
 //! // The AsyncVideoToken must be kept alive to track the operation
 //! ```
@@ -110,17 +110,17 @@ pub mod sender;
 
 // Re-export main types from modules
 pub use error::*;
-pub use finder::{Find, Finder, FinderBuilder, Source, SourceAddress};
+pub use finder::{Finder, FinderOptions, FinderOptionsBuilder, Source, SourceAddress};
 pub use frames::{
     AudioFrame, AudioFrameBuilder, AudioType, FourCCVideoType, FrameFormatType, LineStrideOrSize,
     MetadataFrame, VideoFrame, VideoFrameBuilder,
 };
 pub use receiver::{
-    FrameType, Receiver, ReceiverBuilder, Recv, RecvBandwidth, RecvColorFormat, RecvStatus, Tally,
+    FrameType, ReceiverOptions, ReceiverOptionsBuilder, Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverStatus, Tally,
 };
 pub use runtime::NDI;
 pub use sender::{
-    AsyncVideoToken, SendInstance, SendOptions, SendOptionsBuilder, VideoFrameBorrowed,
+    AsyncVideoToken, Sender, SenderOptions, SenderOptionsBuilder, BorrowedVideoFrame,
 };
 
 // Tests

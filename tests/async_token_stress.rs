@@ -1,4 +1,4 @@
-use grafton_ndi::{FourCCVideoType, SendOptions, VideoFrameBorrowed, NDI};
+use grafton_ndi::{FourCCVideoType, SenderOptions, BorrowedVideoFrame, NDI};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -19,14 +19,14 @@ fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
         let completed_clone = completed.clone();
         let handle = thread::spawn(move || -> Result<(), grafton_ndi::Error> {
             // Create per-thread sender
-            let send_options = SendOptions::builder(format!("Stress Test Sender {}", thread_id))
+            let send_options = SenderOptions::builder(format!("Stress Test Sender {}", thread_id))
                 .clock_video(true)
                 .clock_audio(false)
                 .build()?;
-            let send = grafton_ndi::SendInstance::new(&ndi_clone, &send_options)?;
+            let sender = grafton_ndi::Sender::new(&ndi_clone, &send_options)?;
 
             // Register completion callback
-            send.on_async_video_done(move |_len| {
+            sender.on_async_video_done(move |_len| {
                 let mut count = completed_clone.lock().unwrap();
                 *count += 1;
             });
@@ -40,7 +40,7 @@ fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
                 }
 
                 // Create borrowed frame
-                let borrowed_frame = VideoFrameBorrowed::from_buffer(
+                let borrowed_frame = BorrowedVideoFrame::from_buffer(
                     &buffer,
                     1920,
                     1080,
@@ -50,7 +50,7 @@ fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
                 );
 
                 // Send asynchronously
-                let token = send.send_video_async(&borrowed_frame);
+                let token = sender.send_video_async(&borrowed_frame);
 
                 // Randomly drop the token early or hold it
                 if (frame_num + thread_id) % 3 == 0 {
@@ -96,31 +96,31 @@ fn test_immediate_sender_drop() -> Result<(), grafton_ndi::Error> {
     let ndi = NDI::new()?;
 
     for _ in 0..100 {
-        let send_options = SendOptions::builder("Immediate Drop Test")
+        let send_options = SenderOptions::builder("Immediate Drop Test")
             .clock_video(true)
             .clock_audio(false)
             .build()?;
-        let send = grafton_ndi::SendInstance::new(&ndi, &send_options)?;
+        let sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
 
         // Create a scope to control lifetimes
         {
             let buffer = vec![0u8; 1920 * 1080 * 4];
             let borrowed_frame =
-                VideoFrameBorrowed::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
+                BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
 
             // Send async - the token now holds Arc<Inner>
-            let _token = send.send_video_async(&borrowed_frame);
+            let _token = sender.send_video_async(&borrowed_frame);
 
             // The token and buffer must be dropped before sender
             // This simulates the original race condition
         }
 
         // Flush any pending operations
-        send.flush_async(Duration::from_secs(1))?;
+        sender.flush_async(Duration::from_secs(1))?;
 
         // Now drop sender - this will block until the token is dropped
         // The fix ensures this is safe by using Arc<Inner>
-        drop(send);
+        drop(sender);
     }
 
     Ok(())
@@ -129,11 +129,11 @@ fn test_immediate_sender_drop() -> Result<(), grafton_ndi::Error> {
 #[test]
 fn test_flush_async() -> Result<(), grafton_ndi::Error> {
     let ndi = NDI::new()?;
-    let send_options = SendOptions::builder("Flush Test")
+    let send_options = SenderOptions::builder("Flush Test")
         .clock_video(true)
         .clock_audio(false)
         .build()?;
-    let send = grafton_ndi::SendInstance::new(&ndi, &send_options)?;
+    let sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
 
     // Use a scope to control buffer lifetimes
     {
@@ -148,8 +148,8 @@ fn test_flush_async() -> Result<(), grafton_ndi::Error> {
         // Then create tokens that borrow from buffers
         for buffer in buffers.iter() {
             let borrowed_frame =
-                VideoFrameBorrowed::from_buffer(buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
-            tokens.push(send.send_video_async(&borrowed_frame));
+                BorrowedVideoFrame::from_buffer(buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
+            tokens.push(sender.send_video_async(&borrowed_frame));
         }
 
         // Drop tokens before buffers go out of scope
@@ -157,7 +157,7 @@ fn test_flush_async() -> Result<(), grafton_ndi::Error> {
     }
 
     // Flush should succeed
-    send.flush_async(Duration::from_secs(1))?;
+    sender.flush_async(Duration::from_secs(1))?;
 
     Ok(())
 }

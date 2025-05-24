@@ -19,19 +19,19 @@ High-performance, idiomatic Rust bindings for the [NDI® 6 SDK](https://ndi.vide
 ## Quick Start
 
 ```rust
-use grafton_ndi::{NDI, Finder, Find};
+use grafton_ndi::{NDI, FinderOptions, Finder};
 
 fn main() -> Result<(), grafton_ndi::Error> {
     // Initialize NDI
     let ndi = NDI::new()?;
     
     // Find sources on the network
-    let finder = Finder::builder().show_local_sources(true).build();
-    let find = Find::new(&ndi, finder)?;
+    let finder_options = FinderOptions::builder().show_local_sources(true).build();
+    let finder = Finder::new(&ndi, &finder_options)?;
     
     // Wait for sources
-    find.wait_for_sources(5000);
-    let sources = find.get_sources(5000)?;
+    finder.wait_for_sources(5000);
+    let sources = finder.get_sources(5000)?;
     
     for source in sources {
         println!("Found source: {}", source);
@@ -69,22 +69,22 @@ grafton-ndi = "0.7"
 ### Finding NDI Sources
 
 ```rust
-use grafton_ndi::{NDI, Finder, Find};
+use grafton_ndi::{NDI, FinderOptions, Finder};
 
 let ndi = NDI::new()?;
 
 // Configure the finder
-let finder = Finder::builder()
+let finder_options = FinderOptions::builder()
     .show_local_sources(false)
     .groups("Public")
     .extra_ips("192.168.1.100")
     .build();
 
-let find = Find::new(&ndi, finder)?;
+let finder = Finder::new(&ndi, &finder_options)?;
 
 // Discover sources
-if find.wait_for_sources(5000) {
-    let sources = find.get_sources(0)?;
+if finder.wait_for_sources(5000) {
+    let sources = finder.get_sources(0)?;
     for source in &sources {
         println!("Found: {} at {}", source.name, source.address);
     }
@@ -94,22 +94,19 @@ if find.wait_for_sources(5000) {
 ### Receiving Video
 
 ```rust
-use grafton_ndi::{NDI, Receiver, RecvColorFormat, RecvBandwidth};
+use grafton_ndi::{NDI, ReceiverOptions, Receiver, ReceiverColorFormat, ReceiverBandwidth};
 
 let ndi = NDI::new()?;
 
 // Create receiver
-let recv = Receiver::builder(source)
-    .color(RecvColorFormat::RGBX_RGBA)
-    .bandwidth(RecvBandwidth::Highest)
+let receiver = ReceiverOptions::builder(source)
+    .color(ReceiverColorFormat::RGBX_RGBA)
+    .bandwidth(ReceiverBandwidth::Highest)
     .name("My Receiver")
     .build(&ndi)?;
 
-// Start receiving
-recv.connect()?;
-
 // Capture frames
-match recv.capture(5000)? {
+match receiver.capture(5000)? {
     Some(CapturedFrame::Video(video)) => {
         println!("Video: {}x{} @ {}/{} fps", 
             video.width, video.height,
@@ -119,7 +116,7 @@ match recv.capture(5000)? {
     }
     Some(CapturedFrame::Audio(audio)) => {
         println!("Audio: {} channels @ {} Hz", 
-            audio.no_channels, audio.sample_rate
+            audio.num_channels, audio.sample_rate
         );
         // Access audio samples as f32
         let samples: &[f32] = audio.data();
@@ -132,18 +129,18 @@ match recv.capture(5000)? {
 ### Sending Video
 
 ```rust
-use grafton_ndi::{NDI, SendInstance, SendOptions, VideoFrame, FourCCVideoType};
+use grafton_ndi::{NDI, Sender, SenderOptions, VideoFrame, FourCCVideoType};
 
 let ndi = NDI::new()?;
 
 // Configure sender
-let options = SendOptions::builder("My NDI Source")
+let options = SenderOptions::builder("My NDI Source")
     .groups("Public")
     .clock_video(true)
     .clock_audio(false)
     .build()?;
 
-let send = SendInstance::new(&ndi, options)?;
+let sender = Sender::new(&ndi, &options)?;
 
 // Create and send a frame
 let frame = VideoFrame::builder()
@@ -158,20 +155,20 @@ let mut data = vec![0u8; frame.size()];
 // ... fill data with your video content ...
 
 frame.set_data(&data);
-send.send_video(&frame);
+sender.send_video(&frame);
 ```
 
 ### Working with Audio
 
 ```rust
-use grafton_ndi::{NDI, Receiver, RecvBandwidth};
+use grafton_ndi::{NDI, ReceiverOptions, ReceiverBandwidth};
 
-let recv = Receiver::builder(source)
-    .bandwidth(RecvBandwidth::AudioOnly)
+let receiver = ReceiverOptions::builder(source)
+    .bandwidth(ReceiverBandwidth::AudioOnly)
     .build(&ndi)?;
 
 // Capture audio frame
-if let Some(audio) = recv.capture_audio(5000)? {
+if let Some(audio) = receiver.capture_audio(5000)? {
     // Audio samples are 32-bit floats
     let samples: &[f32] = audio.data();
     
@@ -194,17 +191,16 @@ if let Some(audio) = recv.capture_audio(5000)? {
 ### PTZ Camera Control
 
 ```rust
-use grafton_ndi::{NDI, Receiver};
+use grafton_ndi::{NDI, ReceiverOptions};
 
-let recv = Receiver::builder(source).build(&ndi)?;
-recv.connect()?;
+let receiver = ReceiverOptions::builder(source).build(&ndi)?;
 
 // Check PTZ support
-if recv.ptz_is_supported()? {
+if receiver.ptz_is_supported()? {
     // Control camera
-    recv.ptz_zoom(0.5)?;         // Zoom to 50%
-    recv.ptz_pan_tilt(0.0, 0.25)?; // Pan center, tilt up 25%
-    recv.ptz_auto_focus()?;       // Enable auto-focus
+    receiver.ptz_zoom(0.5)?;         // Zoom to 50%
+    receiver.ptz_pan_tilt(0.0, 0.25)?; // Pan center, tilt up 25%
+    receiver.ptz_auto_focus()?;       // Enable auto-focus
 }
 ```
 
@@ -217,34 +213,34 @@ The main entry point that manages NDI library initialization and lifecycle.
 let ndi = NDI::new()?; // Reference-counted, thread-safe
 ```
 
-### `Find` - Source Discovery
+### `Finder` - Source Discovery
 Discovers NDI sources on the network.
 
 ```rust
-let finder = Finder::builder()
+let finder_options = FinderOptions::builder()
     .show_local_sources(true)
     .groups("Public,Private")
     .build();
-let find = Find::new(&ndi, finder)?;
+let finder = Finder::new(&ndi, &finder_options)?;
 ```
 
 ### `Receiver` - Video/Audio Reception
 Receives video, audio, and metadata from NDI sources.
 
 ```rust
-let recv = Receiver::builder(source)
-    .color(RecvColorFormat::UYVY_BGRA)
-    .bandwidth(RecvBandwidth::Highest)
+let receiver = ReceiverOptions::builder(source)
+    .color(ReceiverColorFormat::UYVY_BGRA)
+    .bandwidth(ReceiverBandwidth::Highest)
     .build(&ndi)?;
 ```
 
-### `SendInstance` - Video/Audio Transmission
+### `Sender` - Video/Audio Transmission
 Sends video, audio, and metadata as an NDI source.
 
 ```rust
-let send = SendInstance::new(&ndi, SendOptions::builder("Source Name")
+let sender = Sender::new(&ndi, &SenderOptions::builder("Source Name")
     .clock_video(true)
-    .build()?)?;
+    .build()?)?);
 ```
 
 ### Frame Types
@@ -254,12 +250,12 @@ let send = SendInstance::new(&ndi, SendOptions::builder("Source Name")
 
 ## Thread Safety
 
-All primary types (`Find`, `Receiver`, `SendInstance`) are `Send + Sync` as the underlying NDI SDK is thread-safe. You can safely share instances across threads, though performance is best when keeping instances thread-local.
+All primary types (`Finder`, `Receiver`, `Sender`) are `Send + Sync` as the underlying NDI SDK is thread-safe. You can safely share instances across threads, though performance is best when keeping instances thread-local.
 
 ## Performance Considerations
 
 - **Zero-copy**: Frame data directly references NDI's internal buffers when possible
-- **Bandwidth modes**: Use `RecvBandwidth::Lowest` for preview quality
+- **Bandwidth modes**: Use `ReceiverBandwidth::Lowest` for preview quality
 - **Frame recycling**: Reuse frame allocations in tight loops
 - **Thread affinity**: Keep NDI operations on consistent threads for best performance
 

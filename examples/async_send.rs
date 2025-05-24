@@ -1,6 +1,6 @@
 //! Example demonstrating zero-copy async video sending with tokens
 
-use grafton_ndi::{FourCCVideoType, SendOptions, VideoFrameBorrowed, NDI};
+use grafton_ndi::{FourCCVideoType, SenderOptions, BorrowedVideoFrame, NDI};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -10,11 +10,11 @@ fn main() -> Result<(), grafton_ndi::Error> {
     let ndi = NDI::new()?;
 
     // Create sender
-    let send_options = SendOptions::builder("AsyncExample")
+    let send_options = SenderOptions::builder("AsyncExample")
         .clock_video(true)
         .clock_audio(true)
         .build()?;
-    let send = grafton_ndi::SendInstance::new(&ndi, &send_options)?;
+    let sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
 
     println!("Created NDI sender: AsyncExample");
     println!("Demonstrating zero-copy async video sending with tokens...\n");
@@ -23,7 +23,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
     let (tx, rx) = mpsc::channel();
 
     // Set up callback for video completion
-    send.on_async_video_done(move |len| {
+    sender.on_async_video_done(move |len| {
         println!("Video buffer released: {} bytes", len);
         let _ = tx.send(len);
     });
@@ -40,7 +40,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
             pixel[3] = 255; // A
         }
 
-        let frame = VideoFrameBorrowed::from_buffer(
+        let frame = BorrowedVideoFrame::from_buffer(
             &video_buffer,
             1920,
             1080,
@@ -51,7 +51,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
 
         println!("Sending video frame...");
         let start = Instant::now();
-        let _token = send.send_video_async(&frame);
+        let _token = sender.send_video_async(&frame);
         println!("Send completed in {:?}", start.elapsed());
 
         // Buffer is now in use by NDI
@@ -86,11 +86,10 @@ fn main() -> Result<(), grafton_ndi::Error> {
 
         println!("Sending 3 video frames sequentially...");
         for (idx, buffer) in buffers.iter().enumerate() {
-            let frame =
-                VideoFrameBorrowed::from_buffer(buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
+            let frame = BorrowedVideoFrame::from_buffer(buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
 
             println!("Sending frame {}...", idx + 1);
-            let _token = send.send_video_async(&frame);
+            let _token = sender.send_video_async(&frame);
 
             // Simulate some processing time
             thread::sleep(Duration::from_millis(33)); // ~30fps

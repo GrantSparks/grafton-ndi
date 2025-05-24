@@ -1,4 +1,4 @@
-use grafton_ndi::{FourCCVideoType, SendOptions, VideoFrameBorrowed, NDI};
+use grafton_ndi::{FourCCVideoType, SenderOptions, BorrowedVideoFrame, NDI};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -8,13 +8,13 @@ fn main() -> Result<(), grafton_ndi::Error> {
     println!("NDI version: {}", NDI::version()?);
 
     // Create sender
-    let send_options = SendOptions::builder("Zero-Copy Sender Example")
+    let send_options = SenderOptions::builder("Zero-Copy Sender Example")
         .clock_video(true)
         .clock_audio(true)
         .build()?;
-    let send = grafton_ndi::SendInstance::new(&ndi, &send_options)?;
+    let sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
 
-    println!("Created NDI sender: {}", send.get_source_name());
+    println!("Created NDI sender: {}", sender.get_source_name());
 
     // Pre-allocate a single buffer (demonstrating single-buffer with callback)
     let width = 1920;
@@ -27,7 +27,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
     let (tx, rx) = mpsc::channel();
 
     // Register completion callback
-    send.on_async_video_done(move |_len| {
+    sender.on_async_video_done(move |_len| {
         // Buffer is now available for reuse
         let _ = tx.send(());
     });
@@ -63,10 +63,10 @@ fn main() -> Result<(), grafton_ndi::Error> {
 
         // Create a borrowed frame that references our buffer
         let borrowed_frame =
-            VideoFrameBorrowed::from_buffer(&buffer, width, height, FourCCVideoType::BGRA, 60, 1);
+            BorrowedVideoFrame::from_buffer(&buffer, width, height, FourCCVideoType::BGRA, 60, 1);
 
         // Send asynchronously - no copy happens here!
-        let _token = send.send_video_async(&borrowed_frame);
+        let _token = sender.send_video_async(&borrowed_frame);
         buffer_available = false;
 
         // The buffer is now owned by NDI until the callback fires

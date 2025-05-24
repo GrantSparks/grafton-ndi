@@ -8,7 +8,7 @@ grafton-ndi provides high-performance, idiomatic Rust bindings for the NDI® 6 S
 
 ## Current Version
 
-Version 0.7.0 - Preparing for 1.0.0 release with comprehensive documentation, builder patterns, and API stability.
+Version 0.7.0 - Major API improvements with comprehensive documentation, builder patterns, and enhanced API consistency.
 
 ## Build Commands
 

@@ -6,7 +6,7 @@
 //!
 //! Run with: `cargo run --example NDIlib_Send_Video`
 
-use grafton_ndi::{Error, FourCCVideoType, SendInstance, SendOptions, VideoFrame, NDI};
+use grafton_ndi::{Error, FourCCVideoType, Sender, SenderOptions, VideoFrame, NDI};
 use std::time::Instant;
 
 fn main() -> Result<(), Error> {
@@ -14,8 +14,8 @@ fn main() -> Result<(), Error> {
     let ndi = NDI::new()?;
 
     // Create the NDI sender
-    let send_options = SendOptions::builder("My Video").build()?;
-    let ndi_send = SendInstance::new(&ndi, &send_options)?;
+    let send_options = SenderOptions::builder("My Video").build()?;
+    let ndi_send = Sender::new(&ndi, &send_options)?;
 
     // We are going to create a 1920x1080 frame at 29.97Hz
     let xres = 1920i32;
