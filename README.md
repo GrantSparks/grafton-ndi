@@ -379,6 +379,4 @@ NDI® is a registered trademark of Vizrt NDI AB.
 
 For upgrading from previous versions:
 - [0.7.x to 0.8.x](docs/migration/0.7-to-0.8.md) - Async API additions
-- [0.6.x to 0.7.x](docs/migration/0.6-to-0.7.md)
-- [0.5.x to 0.6.x](docs/migration/0.5-to-0.6.md)
-- [0.4.x to 0.5.x](docs/migration/0.4-to-0.5.md)
+- [0.6.x to 0.7.x](docs/migration/0.6-to-0.7.md) - Major API improvements
