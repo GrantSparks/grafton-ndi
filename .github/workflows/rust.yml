@@ -34,8 +34,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Setup NDI SDK and LLVM
+      # Setup NDI SDK and LLVM (only this job saves cache)
       - uses: ./.github/actions/setup-ndi-windows
+        with:
+          save-cache: 'true'
 
       # Setup Rust
       - uses: dtolnay/rust-toolchain@stable
@@ -79,6 +81,8 @@ jobs:
 
       # Setup NDI SDK and LLVM
       - uses: ./.github/actions/setup-ndi-windows
+        with:
+          save-cache: 'false'
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -102,6 +106,8 @@ jobs:
 
       # Setup NDI SDK and LLVM
       - uses: ./.github/actions/setup-ndi-windows
+        with:
+          save-cache: 'false'
 
       - uses: dtolnay/rust-toolchain@stable
       
