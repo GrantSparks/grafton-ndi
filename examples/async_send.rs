@@ -1,8 +1,7 @@
 //! Example demonstrating zero-copy async video sending with tokens
 
 use grafton_ndi::{FourCCVideoType, SendOptions, VideoFrameBorrowed, NDI};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,14 +19,13 @@ fn main() -> Result<(), grafton_ndi::Error> {
     println!("Created NDI sender: AsyncExample");
     println!("Demonstrating zero-copy async video sending with tokens...\n");
 
-    // Track when video buffer is released
-    let video_released = Arc::new(AtomicBool::new(false));
+    // Channel to track when video buffer is released
+    let (tx, rx) = mpsc::channel();
 
     // Set up callback for video completion
-    let video_released_clone = video_released.clone();
     send.on_async_video_done(move |len| {
         println!("Video buffer released: {} bytes", len);
-        video_released_clone.store(true, Ordering::Release);
+        let _ = tx.send(len);
     });
 
     // Example 1: Video async send
@@ -57,18 +55,14 @@ fn main() -> Result<(), grafton_ndi::Error> {
         println!("Send completed in {:?}", start.elapsed());
 
         // Buffer is now in use by NDI
-        println!("Token held - buffer cannot be modified");
+        println!("Token held - buffer in use by NDI");
         thread::sleep(Duration::from_millis(100));
 
-        // Drop token to release buffer
-        drop(_token);
-        println!("Token dropped");
-
-        // Wait for callback
-        while !video_released.load(Ordering::Acquire) {
-            thread::sleep(Duration::from_millis(10));
+        // Wait for SDK callback to indicate buffer is released
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(_) => println!("SDK callback fired - buffer can now be reused\n"),
+            Err(_) => println!("Warning: No callback received within timeout\n"),
         }
-        println!("Buffer can now be reused\n");
     }
 
     // Example 2: Multiple video frames
@@ -101,7 +95,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
             // Simulate some processing time
             thread::sleep(Duration::from_millis(33)); // ~30fps
 
-            // Token drops here, releasing the buffer
+            // SDK will notify via callback when buffer is released
         }
         println!("All frames sent\n");
     }

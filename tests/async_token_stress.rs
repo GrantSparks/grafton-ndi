@@ -115,6 +115,9 @@ fn test_immediate_sender_drop() -> Result<(), grafton_ndi::Error> {
             // This simulates the original race condition
         }
 
+        // Flush any pending operations
+        send.flush_async(Duration::from_secs(1))?;
+
         // Now drop sender - this will block until the token is dropped
         // The fix ensures this is safe by using Arc<Inner>
         drop(send);

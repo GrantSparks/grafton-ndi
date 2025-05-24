@@ -57,21 +57,26 @@
 //! as the underlying NDI SDK is thread-safe. However, for optimal performance,
 //! minimize cross-thread operations and maintain thread affinity where possible.
 //!
-//! ## Async Sending
+//! ## Zero-Copy Async Sending
 //!
-//! The library provides zero-copy async send methods that return tokens to ensure
-//! buffer lifetime safety:
+//! The library provides zero-copy async video sending using `NDIlib_send_send_video_async_v2`.
+//! The completion callback notifies when the buffer can be reused:
 //!
 //! ```no_run
 //! # use grafton_ndi::{NDI, SendOptions, VideoFrameBorrowed, FourCCVideoType};
 //! # let ndi = NDI::new().unwrap();
 //! # let send = grafton_ndi::SendInstance::new(&ndi, &SendOptions::builder("Test").build().unwrap()).unwrap();
+//! // Register callback to know when buffer is released
+//! send.on_async_video_done(|len| println!("Buffer released: {} bytes", len));
+//!
 //! let buffer = vec![0u8; 1920 * 1080 * 4];
 //! let frame = VideoFrameBorrowed::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
 //! let token = send.send_video_async(&frame);
-//! // Buffer is now owned by NDI - cannot be modified until token is dropped
-//! drop(token); // Releases the buffer
+//! // Buffer is now owned by NDI - cannot be modified until callback fires
+//! // The AsyncVideoToken must be kept alive to track the operation
 //! ```
+//!
+//! Note: Only video supports async sending in the NDI SDK. Audio and metadata are always synchronous.
 //!
 //! # Performance
 //!

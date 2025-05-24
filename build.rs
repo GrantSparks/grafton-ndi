@@ -31,7 +31,24 @@ fn main() {
 
     // Construct the include path and header file location.
     let ndi_include_path = format!("{}/include", ndi_sdk_path);
-    let main_header = format!("{}/Processing.NDI.Lib.h", ndi_include_path);
+
+    // Create wrapper.h in OUT_DIR for bindgen
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR environment variable not set");
+    let wrapper_path = Path::new(&out_dir).join("wrapper.h");
+
+    // Write wrapper.h content
+    let wrapper_content = r#"// wrapper.h - Include file for bindgen to properly generate NDI bindings
+
+// DO NOT define NDI_NO_PROTOTYPES or NDILIB_NO_PROTOTYPES here!
+// We need full prototypes so bindgen can generate bindings for all functions,
+// including NDIlib_send_set_video_async_completion (available in NDI Advanced SDK)
+
+// Include the main NDI header
+#include <Processing.NDI.Lib.h>
+"#;
+    std::fs::write(&wrapper_path, wrapper_content).expect("Failed to create wrapper.h");
+
+    let main_header = wrapper_path.to_str().unwrap().to_string();
 
     // Determine the library name and linking type based on the platform.
     let (lib_name, link_type) = if cfg!(unix) {

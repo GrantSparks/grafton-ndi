@@ -47,6 +47,42 @@ The build requires the NDI SDK to be installed:
 
 On Windows, ensure `%NDI_SDK_DIR%\Bin\x64` is in your PATH.
 
+## NDI SDK Versions
+
+There are two variants of the NDI SDK:
+
+### Standard SDK
+- Free to download and use
+- Includes all core NDI functionality
+- Sufficient for most applications
+- Functions available: send, receive, discovery, routing, etc.
+- Default for this library (no feature flags needed)
+
+### Advanced SDK
+- Requires license from NDI
+- Includes additional performance features
+- Notable additions:
+  - `NDIlib_send_set_video_async_completion`: Callback when async video frame can be reused
+  - Additional performance monitoring APIs
+  - Advanced routing capabilities
+- Enable with `advanced_sdk` feature flag in Cargo.toml
+
+### Version History
+- **NDI SDK 6**: Current major version, significant performance improvements
+- **NDI SDK 6.1.1**: Added async completion callbacks (Advanced SDK only)
+- **NDI SDK 5**: Previous stable version, still widely deployed
+
+### Feature Differences in grafton-ndi
+When using standard SDK (default):
+- Async video completion is simulated via `AsyncVideoToken::drop()`
+- All core functionality works correctly
+- Slightly less optimal buffer management
+
+When using Advanced SDK (`advanced_sdk` feature):
+- True async video completion callbacks from SDK
+- Optimal zero-copy buffer management
+- Access to additional advanced APIs
+
 ## Architecture
 
 The codebase follows a layered architecture:

@@ -8,18 +8,18 @@ fn main() {
     
     // Create a frame that outlives its receiver - this should fail to compile
     let frame = {
-        let recv = grafton_ndi::Recv::new(
+        let recv = grafton_ndi::ReceiverInstance::new(
             &ndi,
-            Receiver {
-                source_to_connect_to: Source {
+            &Receiver::builder()
+                .source_to_connect_to(Source {
                     name: "Test".to_string(),
                     address: SourceAddress::None,
-                },
-                color_format: RecvColorFormat::BGRX_BGRA,
-                bandwidth: RecvBandwidth::Highest,
-                allow_video_fields: true,
-                ndi_recv_name: None,
-            },
+                })
+                .color_format(RecvColorFormat::BGRX_BGRA)
+                .bandwidth(RecvBandwidth::Highest)
+                .allow_video_fields(true)
+                .build()
+                .unwrap(),
         )
         .unwrap();
         

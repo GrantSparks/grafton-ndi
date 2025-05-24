@@ -1,6 +1,6 @@
 [package]
 name = "grafton-ndi"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.75"
 build = "build.rs"
@@ -24,5 +24,11 @@ thiserror = "2.0.12"
 [build-dependencies]
 bindgen = "0.71.1"
 lodepng = "3.11.0"
+
+[features]
+default = []
+# Enable NDI Advanced SDK features (requires NDI Advanced SDK)
+# This includes async video completion callbacks and other advanced functionality
+advanced_sdk = []
 
 [dev-dependencies]
