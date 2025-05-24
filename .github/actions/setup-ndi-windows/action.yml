@@ -76,9 +76,9 @@ runs:
         echo "${{ runner.temp }}\ndi-sdk\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       shell: pwsh
 
-    # Save cache if installation happened and save-cache is enabled
+    # Save cache only from test-and-lint job on main branch
     - name: Save cache
-      if: inputs.save-cache == 'true' && steps.cache-restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+      if: inputs.save-cache == 'true' && steps.cache-restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.job == 'test-and-lint'
       uses: actions/cache/save@v4
       with:
         path: |
