@@ -32,3 +32,4 @@ default = []
 advanced_sdk = []
 
 [dev-dependencies]
+ctrlc = "3.4"

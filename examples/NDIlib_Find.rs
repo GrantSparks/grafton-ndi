@@ -1,90 +1,47 @@
 //! Example: Discovering NDI sources on the network.
 //!
 //! This example demonstrates how to use the Find API to discover NDI sources.
-//! It continuously monitors for changes and displays all available sources.
+//! It waits for source changes and displays all available sources for 1 minute.
 //!
 //! Run with: `cargo run --example NDIlib_Find`
 
 use grafton_ndi::{Error, Find, Finder, NDI};
 use std::time::{Duration, Instant};
 
-fn main() -> Result<(), Error> {
-    println!("NDI Source Discovery Example");
-    println!("============================\n");
+// Optional: Configure for specific environments
+fn create_finder() -> Finder {
+    // For testing in specific network environments, you can customize:
+    // - show_local_sources(false) to hide sources on this machine
+    // - extra_ips("192.168.0.110") to search specific subnets
+    Finder::builder().build()
+}
 
+fn main() -> Result<(), Error> {
     // Initialize the NDI library
     let ndi = NDI::new()?;
-    println!("NDI version: {}\n", NDI::version()?);
-
-    // Configure the finder
-    // - Don't show local sources (sources on this machine)
-    // - Add a specific IP to search (useful for sources on different subnets)
-    let finder = Finder::builder()
-        .show_local_sources(false)
-        .extra_ips("192.168.0.110")
-        .build();
 
     // Create the finder instance
+    let finder = create_finder();
     let ndi_find = Find::new(&ndi, &finder)?;
 
-    // Monitor sources for 15 seconds
+    // Run for one minute
     let start = Instant::now();
-    let run_duration = Duration::from_secs(15);
-
-    println!(
-        "Monitoring for NDI sources for {} seconds...\n",
-        run_duration.as_secs()
-    );
-
-    while start.elapsed() < run_duration {
-        // Wait for the source list to change (timeout: 5 seconds)
-        // This is more efficient than polling as it only returns when
-        // sources are added or removed
+    while start.elapsed() < Duration::from_secs(60) {
+        // Wait up to 5 seconds for sources to be added or removed
         if !ndi_find.wait_for_sources(5000) {
-            let elapsed = start.elapsed();
-            let remaining = if elapsed < run_duration {
-                run_duration - elapsed
-            } else {
-                Duration::ZERO
-            };
-            println!("No changes detected ({}s remaining)", remaining.as_secs());
+            println!("No change to the sources found.");
             continue;
         }
 
-        // Source list changed - get the updated list
+        // Get the updated list of sources
         let sources = ndi_find.get_sources(0)?;
 
-        // Display all discovered sources
-        println!("\n📡 Network sources ({} found):", sources.len());
-        println!("{:-<50}", "");
-
-        if sources.is_empty() {
-            println!("No sources found. Make sure NDI sources are running on the network.");
-        } else {
-            for (i, source) in sources.iter().enumerate() {
-                println!("{}. {}", i + 1, source);
-
-                // Show additional details about the source
-                match &source.address {
-                    grafton_ndi::SourceAddress::Url(url) => {
-                        println!("   Type: NDI HX (URL: {})", url);
-                    }
-                    grafton_ndi::SourceAddress::Ip(ip) => {
-                        println!("   Type: Standard NDI (IP: {})", ip);
-                    }
-                    grafton_ndi::SourceAddress::None => {
-                        println!("   Type: Unknown");
-                    }
-                }
-            }
+        // Display all the sources
+        println!("Network sources ({} found).", sources.len());
+        for (i, source) in sources.iter().enumerate() {
+            println!("{}. {}", i + 1, source.name);
         }
-        println!("{:-<50}\n", "");
     }
-
-    println!("\nDiscovery complete. Shutting down...");
-
-    // The Find instance is automatically cleaned up when dropped
-    // The NDI runtime is automatically cleaned up when the last NDI instance is dropped
 
     Ok(())
 }
