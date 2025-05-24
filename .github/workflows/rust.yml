@@ -53,8 +53,37 @@ jobs:
         run: |
           Write-Host "Installing NDI SDK to: $env:NDI_SDK_DIR"
           curl -L -o "${{ env.NDI_SDK_INSTALLER }}" "${{ env.NDI_SDK_URL }}"
-          Start-Process -FilePath "${{ env.NDI_SDK_INSTALLER }}" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$env:NDI_SDK_DIR" -Wait
-          Remove-Item "${{ env.NDI_SDK_INSTALLER }}"
+          
+          # Try running the installer with a timeout and additional flags
+          Write-Host "Starting installer..."
+          $proc = Start-Process -FilePath "${{ env.NDI_SDK_INSTALLER }}" `
+            -ArgumentList "/VERYSILENT", "/SP-", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL", "/DIR=$env:NDI_SDK_DIR", "/LOG=$env:TEMP\ndi_install.log" `
+            -PassThru
+          
+          # Wait up to 5 minutes for installation
+          $timeout = 300  # 5 minutes in seconds
+          if (!$proc.WaitForExit($timeout * 1000)) {
+            Write-Warning "Installer timed out after $timeout seconds, terminating..."
+            $proc | Stop-Process -Force
+            
+            # Check if it installed anyway
+            if (Test-Path "$env:NDI_SDK_DIR\include\Processing.NDI.Lib.h") {
+              Write-Host "✓ NDI SDK appears to have installed despite timeout"
+            } else {
+              Write-Error "NDI SDK installation failed - timed out"
+              
+              # Try to show install log if it exists
+              $logPath = "$env:TEMP\ndi_install.log"
+              if (Test-Path $logPath) {
+                Write-Host "=== Install Log ==="
+                Get-Content $logPath | Select-Object -Last 50
+              }
+              
+              exit 1
+            }
+          }
+          
+          Remove-Item "${{ env.NDI_SDK_INSTALLER }}" -ErrorAction SilentlyContinue
           
           # Verify installation
           if (Test-Path "$env:NDI_SDK_DIR\include\Processing.NDI.Lib.h") {
