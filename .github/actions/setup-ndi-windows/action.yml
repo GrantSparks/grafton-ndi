@@ -56,13 +56,21 @@ runs:
         Write-Host "✓ NDI SDK hash verified"
         
         Write-Host "Installing NDI SDK to: $NDI_SDK_DIR"
-        Start-Process "$NDI_SDK_INSTALLER" `
-          -ArgumentList '/VERYSILENT','/SP-','/SUPPRESSMSGBOXES','/NORESTART',"/DIR=$NDI_SDK_DIR" `
-          -Wait
+        $proc = Start-Process -FilePath "$NDI_SDK_INSTALLER" `
+          -ArgumentList "/VERYSILENT", "/SP-", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL", "/DIR=$NDI_SDK_DIR", "/LOG=$env:TEMP\ndi_install.log" `
+          -PassThru
         
-        # Check exit code
-        if ($LASTEXITCODE -ne 0) {
-          Write-Error "NDI installer failed with code $LASTEXITCODE"
+        # Wait up to 5 minutes for installation
+        if (!$proc.WaitForExit(300000)) {
+          $proc | Stop-Process -Force
+          if (Test-Path "$NDI_SDK_DIR\include\Processing.NDI.Lib.h") {
+            Write-Host "✓ NDI SDK installed (process timed out but files exist)"
+          } else {
+            Write-Error "NDI SDK installation timed out"
+            exit 1
+          }
+        } elseif ($proc.ExitCode -ne 0) {
+          Write-Error "NDI installer failed with code $($proc.ExitCode)"
           exit 1
         }
         
