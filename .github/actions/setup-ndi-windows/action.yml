@@ -1,0 +1,72 @@
+name: 'Setup NDI SDK on Windows'
+description: 'Install NDI SDK and LLVM for building grafton-ndi on Windows'
+runs:
+  using: "composite"
+  steps:
+    # Generate cache key for all dependencies
+    - name: Generate cache key
+      id: cache-key
+      run: |
+        $ndiHash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes("${{ env.NDI_SDK_URL }}"))).Replace("-", "").Substring(0, 16)
+        echo "key=deps-${{ env.CACHE_VERSION }}-$ndiHash-${{ env.LLVM_VERSION }}-${{ runner.os }}" >> $env:GITHUB_OUTPUT
+      shell: pwsh
+
+    # Cache both LLVM and NDI SDK together
+    - name: Cache dependencies
+      id: cache-deps
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ runner.temp }}\ndi-sdk
+          C:\Program Files\LLVM
+        key: ${{ steps.cache-key.outputs.key }}
+
+    # Install LLVM if not cached
+    - name: Install LLVM
+      if: steps.cache-deps.outputs.cache-hit != 'true'
+      run: choco install llvm --version=${{ env.LLVM_VERSION }} -y
+      shell: pwsh
+
+    # Install NDI SDK if not cached
+    - name: Download and Install NDI SDK
+      if: steps.cache-deps.outputs.cache-hit != 'true'
+      run: |
+        $NDI_SDK_DIR = "${{ runner.temp }}\ndi-sdk"
+        $NDI_SDK_INSTALLER = "${{ runner.temp }}\NDI_SDK_Installer.exe"
+        
+        Write-Host "Downloading NDI SDK..."
+        curl -L -o "$NDI_SDK_INSTALLER" "${{ env.NDI_SDK_URL }}"
+        
+        Write-Host "Installing NDI SDK to: $NDI_SDK_DIR"
+        $proc = Start-Process -FilePath "$NDI_SDK_INSTALLER" `
+          -ArgumentList "/VERYSILENT", "/SP-", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL", "/DIR=$NDI_SDK_DIR", "/LOG=$env:TEMP\ndi_install.log" `
+          -PassThru
+        
+        # Wait up to 5 minutes for installation
+        if (!$proc.WaitForExit(300000)) {
+          $proc | Stop-Process -Force
+          if (Test-Path "$NDI_SDK_DIR\include\Processing.NDI.Lib.h") {
+            Write-Host "✓ NDI SDK installed (process timed out but files exist)"
+          } else {
+            Write-Error "NDI SDK installation failed"
+            exit 1
+          }
+        }
+        
+        Remove-Item "$NDI_SDK_INSTALLER" -ErrorAction SilentlyContinue
+        
+        # Verify installation
+        if (Test-Path "$NDI_SDK_DIR\include\Processing.NDI.Lib.h") {
+          Write-Host "✓ NDI SDK installed successfully"
+        } else {
+          Write-Error "NDI SDK installation failed - header file not found"
+          exit 1
+        }
+      shell: pwsh
+
+    # Setup environment
+    - name: Setup environment
+      run: |
+        echo "NDI_SDK_DIR=${{ runner.temp }}\ndi-sdk" >> $env:GITHUB_ENV
+        echo "${{ runner.temp }}\ndi-sdk\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      shell: pwsh
