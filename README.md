@@ -5,16 +5,18 @@
 [![License](https://img.shields.io/crates/l/grafton-ndi.svg)](https://github.com/GrantSparks/grafton-ndi/blob/main/LICENSE)
 [![Minimum Rust Version](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
-High-performance, idiomatic Rust bindings for the [NDI® 6 SDK](https://ndi.video/), enabling real-time, low-latency IP video streaming. Requires NDI SDK 6.1.1 or later.
+High-performance, idiomatic Rust bindings for the [NDI® 6 SDK](https://ndi.video/), enabling real-time, low-latency IP video streaming. Built for production use with zero-copy performance and comprehensive async support.
 
 ## Features
 
 - **Zero-copy frame handling** - Minimal overhead for high-performance video processing
+- **Async video sending** - Non-blocking video transmission with completion callbacks
 - **Thread-safe by design** - Safe concurrent access with Rust's ownership model  
 - **Ergonomic API** - Builder patterns and idiomatic Rust interfaces
 - **Comprehensive type safety** - Strongly-typed color formats and frame types
 - **Cross-platform** - Windows, Linux, and macOS support
 - **Battle-tested** - Used in production video streaming applications
+- **Advanced SDK support** - Optional features for NDI Advanced SDK users
 
 ## Quick Start
 
@@ -47,22 +49,30 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-grafton-ndi = "0.7"
+grafton-ndi = "0.8"
+
+# For NDI Advanced SDK features (optional)
+# grafton-ndi = { version = "0.8", features = ["advanced_sdk"] }
 ```
 
 ### Prerequisites
 
 1. **NDI SDK**: Download and install the [NDI SDK](https://ndi.video/type/developer/) for your platform.
-   - Windows: Installs to `C:\Program Files\NDI\SDK` by default
+   - Windows: Installs to `C:\Program Files\NDI\NDI 6 SDK` by default
    - Linux: Extract to `/usr/share/NDI SDK for Linux` or set `NDI_SDK_DIR`
    - macOS: Install and set `NDI_SDK_DIR` environment variable
 
 2. **Rust**: Requires Rust 1.75 or later
 
-3. **Platform Requirements**:
-   - Windows: Visual Studio 2019+ or Build Tools
-   - Linux: GCC/Clang, pkg-config
+3. **Build Dependencies**:
+   - Windows: Visual Studio 2019+ or Build Tools, LLVM/Clang for bindgen
+   - Linux: GCC/Clang, pkg-config, LLVM
    - macOS: Xcode Command Line Tools
+
+4. **Runtime**: NDI runtime libraries must be available:
+   - Windows: Ensure `%NDI_SDK_DIR%\Bin\x64` is in your PATH
+   - Linux: Install NDI Tools or add library path to LD_LIBRARY_PATH
+   - macOS: Install NDI Tools or configure DYLD_LIBRARY_PATH
 
 ## Usage Examples
 
@@ -156,6 +166,37 @@ let mut data = vec![0u8; frame.size()];
 
 frame.set_data(&data);
 sender.send_video(&frame);
+```
+
+### Async Video Sending (New in 0.8)
+
+```rust
+use grafton_ndi::{NDI, Sender, SenderOptions, BorrowedVideoFrame, FourCCVideoType};
+use std::sync::Arc;
+
+let ndi = NDI::new()?;
+let sender = Sender::new(&ndi, &SenderOptions::builder("Async Source").build()?)?;
+
+// Register completion callback
+let completed = Arc::new(std::sync::atomic::AtomicU32::new(0));
+let completed_clone = completed.clone();
+sender.on_async_video_done(move |frame_id| {
+    completed_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    println!("Frame {} can be reused", frame_id);
+});
+
+// Send frame asynchronously
+let buffer = vec![0u8; 1920 * 1080 * 4];
+let frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
+
+// Token automatically manages frame lifetime
+let token = sender.send_video_async(&frame);
+
+// Buffer can be safely reused when token is dropped or completion callback fires
+drop(token);
+
+// Flush all pending frames with timeout
+sender.flush_async(std::time::Duration::from_secs(5))?;
 ```
 
 ### Working with Audio
@@ -259,6 +300,28 @@ All primary types (`Finder`, `Receiver`, `Sender`) are `Send + Sync` as the unde
 - **Frame recycling**: Reuse frame allocations in tight loops
 - **Thread affinity**: Keep NDI operations on consistent threads for best performance
 
+### Receiver Status Monitoring
+
+```rust
+use grafton_ndi::{NDI, ReceiverOptions, RecvStatus};
+
+let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+
+// Get current connection status
+let status: RecvStatus = receiver.get_status();
+println!("Connected: {}", status.is_connected);
+println!("Video frames: {}", status.video_frames);
+println!("Audio frames: {}", status.audio_frames);
+
+// Monitor receiver performance
+if status.total_frames > 0 {
+    let drop_rate = status.dropped_frames as f32 / status.total_frames as f32;
+    if drop_rate > 0.01 {
+        eprintln!("High drop rate: {:.1}%", drop_rate * 100.0);
+    }
+}
+```
+
 ## Examples
 
 See the `examples/` directory for complete applications:
@@ -266,6 +329,9 @@ See the `examples/` directory for complete applications:
 - `NDIlib_Find.rs` - Discover NDI sources on the network
 - `NDIlib_Recv_PNG.rs` - Receive video and save as PNG images
 - `NDIlib_Recv_PTZ.rs` - Control PTZ cameras
+- `async_send.rs` - Demonstrates async video sending
+- `status_monitor.rs` - Shows receiver status monitoring
+- `zero_copy_send.rs` - Zero-copy video transmission example
 
 Run examples with:
 ```bash
@@ -294,9 +360,25 @@ This is an unofficial community project and is not affiliated with NewTek or Viz
 
 NDI® is a registered trademark of Vizrt NDI AB. 
 
+## What's New in 0.8
+
+### Major Features
+- **Async Video Sending**: Non-blocking video transmission with completion callbacks
+- **Receiver Status API**: Monitor connection health and performance metrics
+- **BorrowedVideoFrame**: Zero-copy frame type for optimal performance
+- **AsyncVideoToken**: RAII tokens for safe async frame lifetime management
+- **Advanced SDK Support**: Optional features for NDI Advanced SDK users
+
+### Improvements
+- Enhanced Windows compatibility with proper enum conversions
+- Better error messages and documentation
+- Improved CI/CD pipeline with automated testing
+- Fixed potential race conditions in async operations
+
 ## Migration Guides
 
 For upgrading from previous versions:
+- [0.7.x to 0.8.x](docs/migration/0.7-to-0.8.md) - Async API additions
 - [0.6.x to 0.7.x](docs/migration/0.6-to-0.7.md)
 - [0.5.x to 0.6.x](docs/migration/0.5-to-0.6.md)
 - [0.4.x to 0.5.x](docs/migration/0.4-to-0.5.md)
