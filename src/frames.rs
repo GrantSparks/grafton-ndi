@@ -212,38 +212,59 @@ impl<'rx> VideoFrame<'rx> {
         let data_size_in_bytes = c_frame.__bindgen_anon_1.data_size_in_bytes;
         let line_stride = c_frame.__bindgen_anon_1.line_stride_in_bytes;
 
-        // Since this is a union, we need to determine which field is valid
-        // For uncompressed formats, line_stride * height should equal a reasonable frame size
-        let potential_stride_size = if line_stride > 0 && c_frame.yres > 0 {
-            (line_stride as usize) * (c_frame.yres as usize)
-        } else {
-            0
-        };
+        // Determine if this is an uncompressed format using a whitelist
+        let is_uncompressed = matches!(
+            fourcc,
+            FourCCVideoType::BGRA
+                | FourCCVideoType::BGRX
+                | FourCCVideoType::RGBA
+                | FourCCVideoType::RGBX
+                | FourCCVideoType::UYVY
+                | FourCCVideoType::UYVA
+                | FourCCVideoType::YV12
+                | FourCCVideoType::I420
+                | FourCCVideoType::NV12
+                | FourCCVideoType::P216
+                | FourCCVideoType::PA16
+        );
 
-        let (data_size, line_stride_or_size) = if line_stride > 0
-            && potential_stride_size > 0
-            && potential_stride_size <= (100 * 1024 * 1024)
-        {
-            // Reasonable size for uncompressed video (< 100MB per frame)
-            // Use line stride for calculation
-            (
-                potential_stride_size,
-                LineStrideOrSize {
-                    line_stride_in_bytes: line_stride,
-                },
-            )
-        } else if data_size_in_bytes > 0 {
-            // Use the explicit data size (likely compressed format)
-            (
-                data_size_in_bytes as usize,
-                LineStrideOrSize { data_size_in_bytes },
-            )
-        } else {
-            // Neither field is valid - this is an error
-            return Err(Error::InvalidFrame(
-                "Video frame has neither valid line_stride_in_bytes nor data_size_in_bytes".into(),
-            ));
-        };
+        let (data_size, line_stride_or_size) =
+            if is_uncompressed && line_stride > 0 && c_frame.yres > 0 {
+                // Uncompressed format: use line_stride * height
+                let calculated_size = (line_stride as usize) * (c_frame.yres as usize);
+                if calculated_size > 0 && calculated_size <= (100 * 1024 * 1024) {
+                    // Reasonable size for uncompressed video (< 100MB per frame)
+                    (
+                        calculated_size,
+                        LineStrideOrSize {
+                            line_stride_in_bytes: line_stride,
+                        },
+                    )
+                } else {
+                    return Err(Error::InvalidFrame(format!(
+                        "Invalid calculated size {} for uncompressed format",
+                        calculated_size
+                    )));
+                }
+            } else if !is_uncompressed && data_size_in_bytes > 0 {
+                // Compressed format: use the explicit data size
+                (
+                    data_size_in_bytes as usize,
+                    LineStrideOrSize { data_size_in_bytes },
+                )
+            } else if data_size_in_bytes > 0 {
+                // Fallback: use data_size_in_bytes if available
+                (
+                    data_size_in_bytes as usize,
+                    LineStrideOrSize { data_size_in_bytes },
+                )
+            } else {
+                // Neither field is valid - this is an error
+                return Err(Error::InvalidFrame(
+                    "Video frame has neither valid line_stride_in_bytes nor data_size_in_bytes"
+                        .into(),
+                ));
+            };
 
         if data_size == 0 {
             return Err(Error::InvalidFrame("Video frame has zero size".into()));
@@ -389,21 +410,40 @@ impl<'rx> VideoFrameBuilder<'rx> {
             .unwrap_or(FrameFormatType::Progressive);
 
         // Calculate stride and buffer size
-        let bpp = match fourcc {
+        let (stride, buffer_size) = match fourcc {
             FourCCVideoType::BGRA
             | FourCCVideoType::BGRX
             | FourCCVideoType::RGBA
-            | FourCCVideoType::RGBX => 32,
-            FourCCVideoType::UYVY
-            | FourCCVideoType::YV12
-            | FourCCVideoType::I420
-            | FourCCVideoType::NV12 => 16,
-            FourCCVideoType::UYVA => 32,
-            FourCCVideoType::P216 | FourCCVideoType::PA16 => 32,
-            _ => 32,
+            | FourCCVideoType::RGBX => {
+                let stride = xres * 4; // 32 bpp = 4 bytes per pixel
+                (stride, (yres * stride) as usize)
+            }
+            FourCCVideoType::UYVY => {
+                let stride = xres * 2; // 16 bpp = 2 bytes per pixel
+                (stride, (yres * stride) as usize)
+            }
+            FourCCVideoType::YV12 | FourCCVideoType::I420 | FourCCVideoType::NV12 => {
+                // Planar 4:2:0 formats: Y plane is full res, U/V planes are quarter size
+                // Total size = Y plane (width * height) + U plane (width/2 * height/2) + V plane (width/2 * height/2)
+                // = width * height * 1.5 = width * height * 3/2
+                let stride = xres; // Y plane stride
+                let y_size = (xres * yres) as usize;
+                let uv_size = ((xres / 2) * (yres / 2)) as usize;
+                (stride, y_size + 2 * uv_size)
+            }
+            FourCCVideoType::UYVA => {
+                let stride = xres * 3; // 24 bpp = 3 bytes per pixel
+                (stride, (yres * stride) as usize)
+            }
+            FourCCVideoType::P216 | FourCCVideoType::PA16 => {
+                let stride = xres * 4; // 32 bpp = 4 bytes per pixel
+                (stride, (yres * stride) as usize)
+            }
+            _ => {
+                let stride = xres * 4; // Default to 32 bpp
+                (stride, (yres * stride) as usize)
+            }
         };
-        let stride = (xres * bpp + 7) / 8;
-        let buffer_size: usize = (yres * stride) as usize;
         let data = vec![0u8; buffer_size];
 
         let mut frame = VideoFrame {

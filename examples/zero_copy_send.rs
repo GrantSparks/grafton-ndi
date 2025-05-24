@@ -27,7 +27,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
     let (tx, rx) = mpsc::channel();
 
     // Register completion callback
-    send.on_async_video_done(move |_slice| {
+    send.on_async_video_done(move |_len| {
         // Buffer is now available for reuse
         let _ = tx.send(());
     });
@@ -101,8 +101,11 @@ fn main() -> Result<(), grafton_ndi::Error> {
 
     println!("\nFinished sending {} frames", frame_count);
 
-    // Wait a bit to ensure all callbacks complete before dropping the sender
-    std::thread::sleep(Duration::from_millis(100));
+    // The sender will now automatically wait for all async operations to complete
+    // when it's dropped, so no manual sleep is needed.
+    //
+    // Alternatively, you can explicitly wait with:
+    // send.flush_async(Duration::from_secs(1))?;
 
     Ok(())
 }

@@ -52,4 +52,8 @@ pub enum Error {
     /// I/O operation failed.
     #[error(transparent)]
     Io(#[from] io::Error),
+
+    /// Operation timed out.
+    #[error("Operation timed out: {0}")]
+    Timeout(String),
 }

@@ -18,6 +18,7 @@ fn create_test_video_frame(
     let mut frame: NDIlib_video_frame_v2_t = unsafe { std::mem::zeroed() };
     frame.xres = width;
     frame.yres = height;
+    frame.FourCC = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA; // Set to BGRA
 
     // Set the union field based on which value is provided
     if line_stride > 0 {

@@ -4,11 +4,12 @@
 //!
 //! The receiver can monitor status changes including tally state and connection count:
 //!
-//! ```no_run
-//! # use grafton_ndi::{NDI, Receiver, RecvBandwidth};
+//! ```ignore
+//! # use grafton_ndi::{NDI, Receiver, RecvBandwidth, Source};
 //! # fn main() -> Result<(), grafton_ndi::Error> {
 //! # let ndi = NDI::new()?;
-//! # let source = grafton_ndi::Source::new("Test", None)?;
+//! // In real usage, you'd get the source from Find::get_sources()
+//! // let source = /* obtained from Find */;
 //! let receiver = Receiver::builder(source)
 //!     .bandwidth(RecvBandwidth::MetadataOnly)
 //!     .build(&ndi)?;

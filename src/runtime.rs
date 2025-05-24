@@ -78,21 +78,22 @@ impl NDI {
                     "NDI initialization failed previously".into(),
                 ));
             }
-            // Busy-wait until it is done so the caller never sees an
+            // Wait until initialization is done so the caller never sees an
             // un-initialised runtime while REFCOUNT > 0.
             let mut spin_count = 0;
+            let mut sleep_us = 1;
+            const MAX_SPIN: u32 = 100;
+            const MAX_SLEEP_US: u64 = 1000; // 1ms max
+
             while !INIT.load(Ordering::SeqCst) && !INIT_FAILED.load(Ordering::SeqCst) {
-                if spin_count < 200 {
+                if spin_count < MAX_SPIN {
+                    // First, spin briefly for fast initialization
                     std::hint::spin_loop();
                     spin_count += 1;
                 } else {
-                    // After ~200 iterations, yield to avoid burning CPU
-                    std::thread::yield_now();
-                    // Optional: add a small sleep for very slow systems
-                    if spin_count > 1000 {
-                        std::thread::sleep(std::time::Duration::from_micros(50));
-                    }
-                    spin_count += 1;
+                    // Then use exponential backoff with sleep
+                    std::thread::sleep(std::time::Duration::from_micros(sleep_us));
+                    sleep_us = (sleep_us * 2).min(MAX_SLEEP_US);
                 }
             }
             // Check again after waiting

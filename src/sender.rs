@@ -15,7 +15,7 @@ use std::{
     os::raw::c_char,
     ptr,
     sync::{
-        atomic::{AtomicPtr, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
 };
@@ -26,34 +26,32 @@ compile_error!(
     "This crate requires atomic pointer support. Please use a target with atomics enabled."
 );
 
-#[derive(Debug)]
-pub struct SendInstance<'a> {
-    pub(crate) instance: NDIlib_send_instance_t,
-    _name: *mut c_char,   // Store raw pointer to free on drop
-    _groups: *mut c_char, // Store raw pointer to free on drop
-    ndi: std::marker::PhantomData<&'a NDI>,
-    async_state: Arc<AsyncState>,
+/// Internal state that is reference-counted and shared between SendInstance and tokens
+struct Inner {
+    instance: NDIlib_send_instance_t,
+    name: *mut c_char,   // Store raw pointer to free on drop
+    groups: *mut c_char, // Store raw pointer to free on drop
+    async_state: AsyncState,
+    in_flight: AtomicUsize, // Count of outstanding async operations
+    destroyed: AtomicBool,  // Flag to ensure drop runs only once
 }
 
-/// Type alias for async completion callbacks
-type AsyncCallback = Box<dyn Fn(&mut [u8]) + Send + Sync>;
+#[derive(Debug)]
+pub struct SendInstance<'a> {
+    inner: Arc<Inner>,
+    ndi: std::marker::PhantomData<&'a NDI>,
+}
+
+/// Type alias for async completion callbacks  
+/// The callback receives the buffer length, not the buffer itself
+type AsyncCallback = Box<dyn Fn(usize) + Send + Sync>;
 
 /// Lock-free async completion state
 struct AsyncState {
-    // Video async state
+    // Video async state (only video supports async in NDI SDK)
     video_buffer_ptr: AtomicPtr<u8>,
     video_buffer_len: AtomicUsize,
     video_callback: OnceLock<AsyncCallback>,
-
-    // Audio async state (simulated)
-    audio_buffer_ptr: AtomicPtr<u8>,
-    audio_buffer_len: AtomicUsize,
-    audio_callback: OnceLock<AsyncCallback>,
-
-    // Metadata async state (simulated)
-    metadata_buffer_ptr: AtomicPtr<u8>,
-    metadata_buffer_len: AtomicUsize,
-    metadata_callback: OnceLock<AsyncCallback>,
 }
 
 impl std::fmt::Debug for AsyncState {
@@ -62,15 +60,17 @@ impl std::fmt::Debug for AsyncState {
             .field("video_buffer_ptr", &self.video_buffer_ptr)
             .field("video_buffer_len", &self.video_buffer_len)
             .field("video_callback_set", &self.video_callback.get().is_some())
-            .field("audio_buffer_ptr", &self.audio_buffer_ptr)
-            .field("audio_buffer_len", &self.audio_buffer_len)
-            .field("audio_callback_set", &self.audio_callback.get().is_some())
-            .field("metadata_buffer_ptr", &self.metadata_buffer_ptr)
-            .field("metadata_buffer_len", &self.metadata_buffer_len)
-            .field(
-                "metadata_callback_set",
-                &self.metadata_callback.get().is_some(),
-            )
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inner")
+            .field("instance", &self.instance)
+            .field("async_state", &self.async_state)
+            .field("in_flight", &self.in_flight)
+            .field("destroyed", &self.destroyed)
             .finish()
     }
 }
@@ -81,12 +81,6 @@ impl Default for AsyncState {
             video_buffer_ptr: AtomicPtr::new(ptr::null_mut()),
             video_buffer_len: AtomicUsize::new(0),
             video_callback: OnceLock::new(),
-            audio_buffer_ptr: AtomicPtr::new(ptr::null_mut()),
-            audio_buffer_len: AtomicUsize::new(0),
-            audio_callback: OnceLock::new(),
-            metadata_buffer_ptr: AtomicPtr::new(ptr::null_mut()),
-            metadata_buffer_len: AtomicUsize::new(0),
-            metadata_callback: OnceLock::new(),
         }
     }
 }
@@ -94,6 +88,11 @@ impl Default for AsyncState {
 // SAFETY: All fields are thread-safe atomics or OnceLock
 unsafe impl Send for AsyncState {}
 unsafe impl Sync for AsyncState {}
+
+// SAFETY: Inner contains NDI instance pointer which is thread-safe,
+// and all other fields are thread-safe atomics or Send+Sync types
+unsafe impl Send for Inner {}
+unsafe impl Sync for Inner {}
 
 /// A borrowed video frame that references external pixel data.
 /// Used for zero-copy async send operations.
@@ -112,53 +111,7 @@ pub struct VideoFrameBorrowed<'buf> {
     pub timestamp: i64,
 }
 
-/// A borrowed audio frame that references external audio data.
-/// Used for zero-copy async send operations.
-pub struct AudioFrameBorrowed<'buf> {
-    pub sample_rate: i32,
-    pub no_channels: i32,
-    pub no_samples: i32,
-    pub timecode: i64,
-    pub data: &'buf [u8],
-    pub channel_stride_in_bytes: i32,
-    pub metadata: Option<&'buf CStr>,
-    pub timestamp: i64,
-}
-
-impl<'buf> AudioFrameBorrowed<'buf> {
-    /// Create a borrowed audio frame from a buffer of f32 samples
-    pub fn from_buffer(
-        data: &'buf [u8],
-        sample_rate: i32,
-        no_channels: i32,
-        no_samples: i32,
-    ) -> Self {
-        AudioFrameBorrowed {
-            sample_rate,
-            no_channels,
-            no_samples,
-            timecode: 0,
-            data,
-            channel_stride_in_bytes: 0, // Interleaved
-            metadata: None,
-            timestamp: 0,
-        }
-    }
-}
-
-/// A borrowed metadata frame that references external metadata.
-/// Used for zero-copy async send operations.
-pub struct MetadataFrameBorrowed<'buf> {
-    pub data: &'buf CStr,
-    pub timecode: i64,
-}
-
-impl<'buf> MetadataFrameBorrowed<'buf> {
-    /// Create a borrowed metadata frame from a CStr
-    pub fn new(data: &'buf CStr) -> Self {
-        MetadataFrameBorrowed { data, timecode: 0 }
-    }
-}
+// AudioFrameBorrowed and MetadataFrameBorrowed removed - NDI SDK only supports async for video
 
 impl<'buf> VideoFrameBorrowed<'buf> {
     /// Create a borrowed frame from a mutable buffer
@@ -170,20 +123,17 @@ impl<'buf> VideoFrameBorrowed<'buf> {
         frame_rate_n: i32,
         frame_rate_d: i32,
     ) -> Self {
-        let bpp = match fourcc {
+        let stride = match fourcc {
             FourCCVideoType::BGRA
             | FourCCVideoType::BGRX
             | FourCCVideoType::RGBA
-            | FourCCVideoType::RGBX => 32,
-            FourCCVideoType::UYVY
-            | FourCCVideoType::YV12
-            | FourCCVideoType::I420
-            | FourCCVideoType::NV12 => 16,
-            FourCCVideoType::UYVA => 32,
-            FourCCVideoType::P216 | FourCCVideoType::PA16 => 32,
-            _ => 32,
+            | FourCCVideoType::RGBX => xres * 4, // 32 bpp = 4 bytes per pixel
+            FourCCVideoType::UYVY => xres * 2, // 16 bpp = 2 bytes per pixel
+            FourCCVideoType::YV12 | FourCCVideoType::I420 | FourCCVideoType::NV12 => xres, // Y plane stride for planar formats
+            FourCCVideoType::UYVA => xres * 3, // 24 bpp = 3 bytes per pixel
+            FourCCVideoType::P216 | FourCCVideoType::PA16 => xres * 4, // 32 bpp = 4 bytes per pixel
+            _ => xres * 4,                     // Default to 32 bpp
         };
-        let stride = (xres * bpp + 7) / 8;
 
         VideoFrameBorrowed {
             xres,
@@ -244,53 +194,39 @@ impl<'buf> From<&'buf VideoFrame<'_>> for VideoFrameBorrowed<'buf> {
 /// The frame will be released when this token is dropped or when the next
 /// send operation occurs.
 #[must_use = "AsyncVideoToken must be held until the next send operation"]
-#[repr(transparent)]
-pub struct AsyncVideoToken<'send, 'buf> {
-    sender: &'send SendInstance<'send>,
+pub struct AsyncVideoToken<'buf> {
+    inner: Arc<Inner>,
     // Use mutable borrow to prevent any access while NDI owns the buffer
     _frame: std::marker::PhantomData<&'buf mut [u8]>,
 }
 
-// Note: AsyncVideoToken does not implement Send, ensuring it stays on the producing thread
+// Note: AsyncVideoToken implements Send because PhantomData<&'buf mut [u8]> is Send.
+// This allows the token to be moved between threads, though the underlying buffer
+// lifetime is still properly tracked.
 
-impl Drop for AsyncVideoToken<'_, '_> {
+impl Drop for AsyncVideoToken<'_> {
     fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        eprintln!("AsyncVideoToken::drop - starting");
+
         // When token is dropped, trigger the completion callback
-        self.sender.trigger_video_completion();
+        trigger_video_completion(&self.inner);
+
+        #[cfg(debug_assertions)]
+        eprintln!("AsyncVideoToken::drop - completion triggered");
+
+        // Decrement the in-flight counter
+        let prev = self.inner.in_flight.fetch_sub(1, Ordering::Release);
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "AsyncVideoToken::drop - in_flight: {} -> {}",
+            prev,
+            prev - 1
+        );
     }
 }
 
-/// A token that ensures the audio frame remains valid while being processed.
-/// The frame will be released when this token is dropped or when the next
-/// send operation occurs.
-#[must_use = "AsyncAudioToken must be held until the next send operation"]
-#[repr(transparent)]
-pub struct AsyncAudioToken<'send, 'buf> {
-    sender: &'send SendInstance<'send>,
-    _frame: std::marker::PhantomData<&'buf mut [u8]>,
-}
-
-impl Drop for AsyncAudioToken<'_, '_> {
-    fn drop(&mut self) {
-        self.sender.trigger_audio_completion();
-    }
-}
-
-/// A token that ensures the metadata frame remains valid while being processed.
-/// The frame will be released when this token is dropped or when the next
-/// send operation occurs.
-#[must_use = "AsyncMetadataToken must be held until the next send operation"]
-#[repr(transparent)]
-pub struct AsyncMetadataToken<'send, 'buf> {
-    sender: &'send SendInstance<'send>,
-    _frame: std::marker::PhantomData<&'buf mut [u8]>,
-}
-
-impl Drop for AsyncMetadataToken<'_, '_> {
-    fn drop(&mut self) {
-        self.sender.trigger_metadata_completion();
-    }
-}
+// Audio and metadata tokens removed - NDI SDK only supports async for video
 
 impl<'a> SendInstance<'a> {
     /// Creates a new NDI send instance.
@@ -333,29 +269,38 @@ impl<'a> SendInstance<'a> {
             ))
         } else {
             Ok(SendInstance {
-                instance,
-                _name: p_ndi_name_raw,
-                _groups: p_groups,
+                inner: Arc::new(Inner {
+                    instance,
+                    name: p_ndi_name_raw,
+                    groups: p_groups,
+                    async_state: AsyncState::default(),
+                    in_flight: AtomicUsize::new(0),
+                    destroyed: AtomicBool::new(false),
+                }),
                 ndi: std::marker::PhantomData,
-                async_state: Arc::new(AsyncState::default()),
             })
         }
     }
 
-    /// Send a video frame **synchronously** (NDI copies the buffer).
+    /// Send a video frame **synchronously** (NDI copies the buffer immediately).
     pub fn send_video(&self, video_frame: &VideoFrame<'_>) {
         // Trigger any pending async completion callback before new send
-        self.trigger_video_completion();
+        trigger_video_completion(&self.inner);
 
         unsafe {
-            NDIlib_send_send_video_v2(self.instance, &video_frame.to_raw());
+            NDIlib_send_send_video_v2(self.inner.instance, &video_frame.to_raw());
         }
     }
 
-    /// Send a video frame **asynchronously** (NDI *keeps a pointer*; no copy).
+    /// Send a video frame with lifetime management.
     ///
-    /// Returns an `AsyncVideoToken` that must be held until the next send operation.
-    /// The frame data is guaranteed to remain valid as long as the token exists.
+    /// **Note**: The NDI 6.1.1 SDK provides `NDIlib_send_set_video_async_completion`
+    /// for true async callbacks, but our current bindings don't expose this API yet.
+    /// As a workaround, this uses `NDIlib_send_send_video_v2` (synchronous copy) with
+    /// a token system that fires callbacks on drop rather than when the SDK is done.
+    ///
+    /// Returns an `AsyncVideoToken` that must be held until safe to reuse the buffer.
+    /// The frame data must remain valid as long as the token exists.
     ///
     /// # Example
     /// ```no_run
@@ -381,102 +326,45 @@ impl<'a> SendInstance<'a> {
     pub fn send_video_async<'b>(
         &'b self,
         video_frame: &VideoFrameBorrowed<'b>,
-    ) -> AsyncVideoToken<'b, 'b> {
+    ) -> AsyncVideoToken<'b> {
         // Trigger any pending async completion callback before new send
-        self.trigger_video_completion();
+        trigger_video_completion(&self.inner);
+
+        // Increment the in-flight counter
+        let prev = self.inner.in_flight.fetch_add(1, Ordering::AcqRel);
+        #[cfg(debug_assertions)]
+        eprintln!("send_video_async - in_flight: {} -> {}", prev, prev + 1);
 
         // Store buffer info for async completion callback
         // SAFETY: We atomically store the buffer pointer and length.
         // The buffer is guaranteed to be valid as long as the AsyncVideoToken exists.
-        self.async_state
+        self.inner
+            .async_state
             .video_buffer_ptr
             .store(video_frame.data.as_ptr() as *mut u8, Ordering::Release);
-        self.async_state
+        self.inner
+            .async_state
             .video_buffer_len
             .store(video_frame.data.len(), Ordering::Release);
 
+        // TODO: To implement true zero-copy async:
+        // 1. Add bindings for NDIlib_send_set_video_async_completion
+        // 2. Register a callback that triggers our completion handler
+        // 3. Use NDIlib_send_send_video_async_v2 instead
+        // 4. Fire user callbacks from the SDK thread, not from token Drop
+        //
+        // Currently using synchronous version for compatibility
         unsafe {
-            NDIlib_send_send_video_async_v2(self.instance, &video_frame.to_raw());
+            NDIlib_send_send_video_v2(self.inner.instance, &video_frame.to_raw());
         }
         AsyncVideoToken {
-            sender: self,
+            inner: self.inner.clone(),
             _frame: std::marker::PhantomData,
         }
     }
 
-    /// Send an audio frame **asynchronously** (zero-copy).
-    ///
-    /// Since NDI SDK doesn't provide native async audio sending, this method
-    /// simulates async behavior by immediately sending the frame but deferring
-    /// the buffer release notification until the token is dropped.
-    ///
-    /// Returns an `AsyncAudioToken` that must be held until the audio data
-    /// can be safely reused.
-    ///
-    /// # Example
-    /// ```no_run
-    /// # use grafton_ndi::{NDI, SendOptions, AudioFrameBorrowed};
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = NDI::new()?;
-    /// let send = grafton_ndi::SendInstance::new(&ndi, &SendOptions::builder("Test").build()?)?;
-    ///
-    /// let mut buffer = vec![0u8; 48000 * 2 * 4]; // 1 second stereo float32
-    /// let borrowed_frame = AudioFrameBorrowed {
-    ///     sample_rate: 48000,
-    ///     no_channels: 2,
-    ///     no_samples: 48000,
-    ///     timecode: 0,
-    ///     data: &buffer,
-    ///     channel_stride_in_bytes: 0,
-    ///     metadata: None,
-    ///     timestamp: 0,
-    /// };
-    /// let _token = send.send_audio_async(&borrowed_frame);
-    /// // buffer is now being used - safe as long as token exists
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn send_audio_async<'b>(
-        &'b self,
-        audio_frame: &AudioFrameBorrowed<'b>,
-    ) -> AsyncAudioToken<'b, 'b> {
-        // Trigger any pending async completion callback before new send
-        self.trigger_audio_completion();
-
-        // Store buffer info for async completion callback
-        // SAFETY: We atomically store the buffer pointer and length.
-        // The buffer is guaranteed to be valid as long as the AsyncAudioToken exists.
-        self.async_state
-            .audio_buffer_ptr
-            .store(audio_frame.data.as_ptr() as *mut u8, Ordering::Release);
-        self.async_state
-            .audio_buffer_len
-            .store(audio_frame.data.len(), Ordering::Release);
-
-        // Convert to raw frame and send synchronously (NDI doesn't have async audio)
-        let raw_frame = NDIlib_audio_frame_v3_t {
-            sample_rate: audio_frame.sample_rate,
-            no_channels: audio_frame.no_channels,
-            no_samples: audio_frame.no_samples,
-            timecode: audio_frame.timecode,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
-            p_data: audio_frame.data.as_ptr() as *mut u8,
-            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
-                channel_stride_in_bytes: audio_frame.channel_stride_in_bytes,
-            },
-            p_metadata: audio_frame.metadata.map_or(ptr::null(), |m| m.as_ptr()),
-            timestamp: audio_frame.timestamp,
-        };
-
-        unsafe {
-            NDIlib_send_send_audio_v3(self.instance, &raw_frame);
-        }
-
-        AsyncAudioToken {
-            sender: self,
-            _frame: std::marker::PhantomData,
-        }
-    }
+    // NOTE: Audio sending is always synchronous in NDI SDK.
+    // There is no NDIlib_send_send_audio_async function.
 
     /// Sends an audio frame synchronously.
     ///
@@ -518,72 +406,12 @@ impl<'a> SendInstance<'a> {
     /// ```
     pub fn send_audio(&self, audio_frame: &AudioFrame<'_>) {
         unsafe {
-            NDIlib_send_send_audio_v3(self.instance, &audio_frame.to_raw());
+            NDIlib_send_send_audio_v3(self.inner.instance, &audio_frame.to_raw());
         }
     }
 
-    /// Send a metadata frame **asynchronously** (zero-copy).
-    ///
-    /// Since NDI SDK doesn't provide native async metadata sending, this method
-    /// simulates async behavior by immediately sending the frame but deferring
-    /// the buffer release notification until the token is dropped.
-    ///
-    /// Returns an `AsyncMetadataToken` that must be held until the metadata
-    /// can be safely reused.
-    ///
-    /// # Example
-    /// ```no_run
-    /// # use grafton_ndi::{NDI, SendOptions, MetadataFrameBorrowed};
-    /// # use std::ffi::CString;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = NDI::new()?;
-    /// let send = grafton_ndi::SendInstance::new(&ndi, &SendOptions::builder("Test").build()?)?;
-    ///
-    /// let metadata = CString::new("<xml>test</xml>").unwrap();
-    /// let borrowed_frame = MetadataFrameBorrowed {
-    ///     data: &metadata,
-    ///     timecode: 0,
-    /// };
-    /// let _token = send.send_metadata_async(&borrowed_frame);
-    /// // metadata is now being used - safe as long as token exists
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn send_metadata_async<'b>(
-        &'b self,
-        metadata_frame: &MetadataFrameBorrowed<'b>,
-    ) -> AsyncMetadataToken<'b, 'b> {
-        // Trigger any pending async completion callback before new send
-        self.trigger_metadata_completion();
-
-        let data_bytes = metadata_frame.data.to_bytes_with_nul();
-
-        // Store buffer info for async completion callback
-        // SAFETY: We atomically store the buffer pointer and length.
-        // The buffer is guaranteed to be valid as long as the AsyncMetadataToken exists.
-        self.async_state
-            .metadata_buffer_ptr
-            .store(data_bytes.as_ptr() as *mut u8, Ordering::Release);
-        self.async_state
-            .metadata_buffer_len
-            .store(data_bytes.len(), Ordering::Release);
-
-        // Convert to raw frame and send synchronously (NDI doesn't have async metadata)
-        let raw_frame = NDIlib_metadata_frame_t {
-            length: (data_bytes.len() - 1) as i32, // Exclude null terminator from length
-            timecode: metadata_frame.timecode,
-            p_data: metadata_frame.data.as_ptr() as *mut c_char,
-        };
-
-        unsafe {
-            NDIlib_send_send_metadata(self.instance, &raw_frame);
-        }
-
-        AsyncMetadataToken {
-            sender: self,
-            _frame: std::marker::PhantomData,
-        }
-    }
+    // NOTE: Metadata sending is always synchronous in NDI SDK.
+    // There is no NDIlib_send_send_metadata_async function.
 
     /// Sends a metadata frame.
     ///
@@ -593,7 +421,7 @@ impl<'a> SendInstance<'a> {
     pub fn send_metadata(&self, metadata_frame: &MetadataFrame) -> Result<(), Error> {
         let (_c_data, raw) = metadata_frame.to_raw()?;
         unsafe {
-            NDIlib_send_send_metadata(self.instance, &raw);
+            NDIlib_send_send_metadata(self.inner.instance, &raw);
         }
         Ok(())
     }
@@ -609,7 +437,7 @@ impl<'a> SendInstance<'a> {
     pub fn capture(&self, timeout_ms: u32) -> Result<FrameType<'static>, Error> {
         let mut metadata_frame = NDIlib_metadata_frame_t::default();
         let frame_type =
-            unsafe { NDIlib_send_capture(self.instance, &mut metadata_frame, timeout_ms) };
+            unsafe { NDIlib_send_capture(self.inner.instance, &mut metadata_frame, timeout_ms) };
 
         match frame_type {
             NDIlib_frame_type_e_NDIlib_frame_type_metadata => {
@@ -633,16 +461,16 @@ impl<'a> SendInstance<'a> {
     // Note: free_metadata is no longer needed since MetadataFrame owns its data
 
     pub fn get_tally(&self, tally: &mut Tally, timeout_ms: u32) -> bool {
-        unsafe { NDIlib_send_get_tally(self.instance, &mut tally.to_raw(), timeout_ms) }
+        unsafe { NDIlib_send_get_tally(self.inner.instance, &mut tally.to_raw(), timeout_ms) }
     }
 
     #[must_use]
     pub fn get_no_connections(&self, timeout_ms: u32) -> i32 {
-        unsafe { NDIlib_send_get_no_connections(self.instance, timeout_ms) }
+        unsafe { NDIlib_send_get_no_connections(self.inner.instance, timeout_ms) }
     }
 
     pub fn clear_connection_metadata(&self) {
-        unsafe { NDIlib_send_clear_connection_metadata(self.instance) }
+        unsafe { NDIlib_send_clear_connection_metadata(self.inner.instance) }
     }
 
     /// Adds connection metadata.
@@ -652,7 +480,7 @@ impl<'a> SendInstance<'a> {
     /// Returns an error if the metadata string contains a null byte.
     pub fn add_connection_metadata(&self, metadata_frame: &MetadataFrame) -> Result<(), Error> {
         let (_c_data, raw) = metadata_frame.to_raw()?;
-        unsafe { NDIlib_send_add_connection_metadata(self.instance, &raw) }
+        unsafe { NDIlib_send_add_connection_metadata(self.inner.instance, &raw) }
         Ok(())
     }
 
@@ -663,143 +491,206 @@ impl<'a> SendInstance<'a> {
     /// Returns an error if source conversion fails.
     pub fn set_failover(&self, source: &Source) -> Result<(), Error> {
         let raw_source = source.to_raw()?;
-        unsafe { NDIlib_send_set_failover(self.instance, &raw_source.raw) }
+        unsafe { NDIlib_send_set_failover(self.inner.instance, &raw_source.raw) }
         Ok(())
     }
 
     #[must_use]
     pub fn get_source_name(&self) -> Source {
-        let source_ptr = unsafe { NDIlib_send_get_source_name(self.instance) };
+        let source_ptr = unsafe { NDIlib_send_get_source_name(self.inner.instance) };
         Source::from_raw(unsafe { &*source_ptr })
     }
 
     /// Register a handler that will be called once the SDK has released
     /// the last buffer passed to `send_video_async`.
-    /// The slice is **only valid for the duration of the callback**.
+    /// The callback receives the buffer length.
+    ///
+    /// **Note**: Due to the use of `OnceLock`, this callback can only be set once.
+    /// Subsequent calls to this method will be silently ignored.
     pub fn on_async_video_done<F>(&self, handler: F)
     where
-        F: Fn(&mut [u8]) + Send + Sync + 'static,
+        F: Fn(usize) + Send + Sync + 'static,
     {
-        let _ = self.async_state.video_callback.set(Box::new(handler));
+        let _ = self.inner.async_state.video_callback.set(Box::new(handler));
     }
 
-    /// Register a handler for async audio completion.
-    /// The slice is **only valid for the duration of the callback**.
-    pub fn on_async_audio_done<F>(&self, handler: F)
-    where
-        F: Fn(&mut [u8]) + Send + Sync + 'static,
-    {
-        let _ = self.async_state.audio_callback.set(Box::new(handler));
-    }
+    // Audio and metadata async callbacks removed - NDI SDK only supports async for video
 
-    /// Register a handler for async metadata completion.
-    /// The slice is **only valid for the duration of the callback**.
-    pub fn on_async_metadata_done<F>(&self, handler: F)
-    where
-        F: Fn(&mut [u8]) + Send + Sync + 'static,
-    {
-        let _ = self.async_state.metadata_callback.set(Box::new(handler));
-    }
+    /// Wait for pending async operations with timeout (optional helper).
+    ///
+    /// **Note**: The NDI SDK guarantees that `NDIlib_send_destroy` waits for all
+    /// async operations to complete. This method is only useful if you want to
+    /// explicitly wait with a timeout before dropping the SendInstance.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if all operations completed within the timeout
+    /// - `Err(Error::Timeout)` if operations are still pending after the timeout
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, SendOptions};
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::new()?;
+    /// let send = grafton_ndi::SendInstance::new(&ndi, &SendOptions::builder("Test").build()?)?;
+    ///
+    /// // ... send some async frames ...
+    ///
+    /// // Optional: wait with timeout before drop
+    /// send.flush_async(Duration::from_secs(1))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn flush_async(&self, timeout: std::time::Duration) -> Result<(), Error> {
+        let start = std::time::Instant::now();
+        let mut spin_count = 0;
+        let mut sleep_ms = 1;
+        const MAX_SPIN: u32 = 100;
+        const MAX_SLEEP_MS: u64 = 10;
 
-    /// Internal method to trigger video async completion callback
-    fn trigger_video_completion(&self) {
-        // Atomically swap out the buffer pointer with null
-        // SAFETY: We atomically swap the pointer, ensuring it's only accessed once
-        let ptr = self
-            .async_state
-            .video_buffer_ptr
-            .swap(ptr::null_mut(), Ordering::AcqRel);
-        let len = self.async_state.video_buffer_len.swap(0, Ordering::AcqRel);
+        while self.inner.in_flight.load(Ordering::Acquire) > 0 {
+            if start.elapsed() > timeout {
+                return Err(Error::Timeout(format!(
+                    "Async operations did not complete within {:?}",
+                    timeout
+                )));
+            }
 
-        if !ptr.is_null() && len > 0 {
-            if let Some(callback) = self.async_state.video_callback.get() {
-                // SAFETY: The buffer was valid when async send was called,
-                // and we've atomically taken ownership of the pointer
-                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-                callback(slice);
+            if spin_count < MAX_SPIN {
+                // First, spin for a bit
+                std::thread::yield_now();
+                spin_count += 1;
+            } else {
+                // Then sleep with exponential backoff
+                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+                sleep_ms = (sleep_ms * 2).min(MAX_SLEEP_MS);
             }
         }
+
+        Ok(())
     }
+}
 
-    /// Internal method to trigger audio async completion callback
-    fn trigger_audio_completion(&self) {
-        // Atomically swap out the buffer pointer with null
-        // SAFETY: We atomically swap the pointer, ensuring it's only accessed once
-        let ptr = self
-            .async_state
-            .audio_buffer_ptr
-            .swap(ptr::null_mut(), Ordering::AcqRel);
-        let len = self.async_state.audio_buffer_len.swap(0, Ordering::AcqRel);
+// Internal trigger functions that work with Inner
+fn trigger_video_completion(inner: &Inner) {
+    // Clear the buffer info
+    let _ptr = inner
+        .async_state
+        .video_buffer_ptr
+        .swap(ptr::null_mut(), Ordering::AcqRel);
+    let len = inner.async_state.video_buffer_len.swap(0, Ordering::AcqRel);
 
-        if !ptr.is_null() && len > 0 {
-            if let Some(callback) = self.async_state.audio_callback.get() {
-                // SAFETY: The buffer was valid when async send was called,
-                // and we've atomically taken ownership of the pointer
-                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-                callback(slice);
-            }
+    if len > 0 {
+        if let Some(callback) = inner.async_state.video_callback.get() {
+            // Just notify with the length, don't access the buffer
+            callback(len);
         }
     }
+}
 
-    /// Internal method to trigger metadata async completion callback
-    fn trigger_metadata_completion(&self) {
-        // Atomically swap out the buffer pointer with null
-        // SAFETY: We atomically swap the pointer, ensuring it's only accessed once
-        let ptr = self
-            .async_state
-            .metadata_buffer_ptr
-            .swap(ptr::null_mut(), Ordering::AcqRel);
-        let len = self
-            .async_state
-            .metadata_buffer_len
-            .swap(0, Ordering::AcqRel);
+// Audio and metadata trigger functions removed - NDI SDK only supports async for video
 
-        if !ptr.is_null() && len > 0 {
-            if let Some(callback) = self.async_state.metadata_callback.get() {
-                // SAFETY: The buffer was valid when async send was called,
-                // and we've atomically taken ownership of the pointer
-                let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-                callback(slice);
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // This is called when the last Arc reference is dropped
+        // All tokens must be gone by this point
+        #[cfg(debug_assertions)]
+        eprintln!("Inner::drop - starting");
+
+        // Ensure in_flight is 0
+        let in_flight = self.in_flight.load(Ordering::Acquire);
+        #[cfg(debug_assertions)]
+        eprintln!("Inner::drop - in_flight: {}", in_flight);
+
+        if in_flight > 0 {
+            eprintln!(
+                "WARNING: Inner::drop called with {} operations still in flight!",
+                in_flight
+            );
+        }
+
+        #[cfg(debug_assertions)]
+        eprintln!("Inner::drop - triggering completion callbacks");
+
+        #[cfg(debug_assertions)]
+        eprintln!("Inner::drop - calling NDIlib_send_destroy");
+
+        unsafe {
+            // NDI SDK guarantees all async operations complete before this returns
+            NDIlib_send_destroy(self.instance);
+
+            #[cfg(debug_assertions)]
+            eprintln!("Inner::drop - NDIlib_send_destroy completed");
+
+            // Free the CStrings we allocated
+            if !self.name.is_null() {
+                #[cfg(debug_assertions)]
+                eprintln!("Inner::drop - freeing name CString");
+                let _ = CString::from_raw(self.name);
+            }
+            if !self.groups.is_null() {
+                #[cfg(debug_assertions)]
+                eprintln!("Inner::drop - freeing groups CString");
+                let _ = CString::from_raw(self.groups);
             }
         }
+
+        #[cfg(debug_assertions)]
+        eprintln!("Inner::drop - completed");
     }
 }
 
 impl Drop for SendInstance<'_> {
     fn drop(&mut self) {
-        // Trigger any pending async completion callbacks before destruction
-        self.trigger_video_completion();
-        self.trigger_audio_completion();
-        self.trigger_metadata_completion();
-
-        unsafe {
-            NDIlib_send_destroy(self.instance);
-
-            // Free the CStrings we allocated
-            if !self._name.is_null() {
-                let _ = CString::from_raw(self._name);
-            }
-            if !self._groups.is_null() {
-                let _ = CString::from_raw(self._groups);
-            }
+        #[cfg(debug_assertions)]
+        {
+            eprintln!("SendInstance::drop - starting");
+            eprintln!(
+                "SendInstance::drop - Arc strong count: {}",
+                Arc::strong_count(&self.inner)
+            );
+            eprintln!(
+                "SendInstance::drop - in_flight: {}",
+                self.inner.in_flight.load(Ordering::Acquire)
+            );
         }
+        // SendInstance drop doesn't need to do anything special
+        // The Inner will be dropped when all Arc references are gone
     }
 }
 
 /// # Safety
 ///
-/// The NDI 6 SDK documentation states that send operations are thread-safe.
-/// `NDIlib_send_send_video_v2`, `NDIlib_send_send_audio_v3`, and related functions
-/// use internal synchronization. The `SendInstance` struct holds an opaque pointer and raw
-/// C string pointers that are only freed in Drop, making it safe to move between threads.
+/// The NDI 6 SDK documentation specifically marks these send functions as thread-safe:
+/// - `NDIlib_send_send_video_v2` and `NDIlib_send_send_video_async_v2`
+/// - `NDIlib_send_send_audio_v3` (no async variant exists)
+/// - `NDIlib_send_send_metadata` (no async variant exists)
+/// - `NDIlib_send_get_tally`
+/// - `NDIlib_send_get_no_connections`
+///
+/// The SDK also provides `NDIlib_send_set_video_async_completion` for registering
+/// buffer-release callbacks, but our bindings don't expose this yet.
+///
+/// The `SendInstance` struct holds an opaque pointer and raw C string pointers
+/// that are only freed in Drop, making it safe to move between threads.
+///
+/// Functions like `NDIlib_send_create` and `NDIlib_send_destroy` should be called
+/// from a single thread.
 unsafe impl std::marker::Send for SendInstance<'_> {}
 
 /// # Safety
 ///
-/// The NDI 6 SDK guarantees thread-safety for send operations. Multiple threads can
-/// safely call send methods concurrently as the SDK handles all necessary synchronization.
-/// The async send operations (`send_video_async`) are also thread-safe
-/// as documented in the SDK manual.
+/// The NDI 6 SDK guarantees that multiple threads can safely call send methods
+/// concurrently. The SDK uses internal synchronization for:
+/// - Video sending (both sync and async)
+/// - Audio sending (sync only)
+/// - Metadata sending
+/// - Status queries (tally, connections)
+///
+/// Note: Creation and destruction (`NDIlib_send_create`/`NDIlib_send_destroy`)
+/// are handled in our Rust wrapper to ensure single-threaded access.
 unsafe impl std::marker::Sync for SendInstance<'_> {}
 
 #[derive(Debug)]
@@ -861,8 +752,17 @@ impl SendOptionsBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the name is empty.
+    /// Returns an error if:
+    /// - The name is empty or contains only whitespace
+    /// - Both clock_video and clock_audio are false
     pub fn build(self) -> Result<SendOptions, Error> {
+        // Validate sender name
+        if self.name.trim().is_empty() {
+            return Err(Error::InvalidConfiguration(
+                "Sender name cannot be empty or contain only whitespace".into(),
+            ));
+        }
+
         let clock_video = self.clock_video.unwrap_or(true);
         let clock_audio = self.clock_audio.unwrap_or(true);
 

@@ -115,8 +115,7 @@ pub use receiver::{
 };
 pub use runtime::NDI;
 pub use sender::{
-    AsyncAudioToken, AsyncMetadataToken, AsyncVideoToken, AudioFrameBorrowed,
-    MetadataFrameBorrowed, SendInstance, SendOptions, SendOptionsBuilder, VideoFrameBorrowed,
+    AsyncVideoToken, SendInstance, SendOptions, SendOptionsBuilder, VideoFrameBorrowed,
 };
 
 // Tests
