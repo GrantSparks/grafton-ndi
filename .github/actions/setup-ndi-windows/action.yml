@@ -1,5 +1,10 @@
 name: 'Setup NDI SDK on Windows'
 description: 'Install NDI SDK and LLVM for building grafton-ndi on Windows'
+inputs:
+  save-cache:
+    description: 'Whether to save the cache after installation'
+    required: false
+    default: 'true'
 runs:
   using: "composite"
   steps:
@@ -20,6 +25,8 @@ runs:
           ${{ runner.temp }}\ndi-sdk
           C:\Program Files\LLVM
         key: ${{ steps.cache-key.outputs.key }}
+        # Only save cache if explicitly enabled (avoid concurrent saves)
+        save: ${{ inputs.save-cache }}
 
     # Install LLVM if not cached
     - name: Install LLVM
