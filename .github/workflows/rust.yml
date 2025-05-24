@@ -11,141 +11,105 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # Set NDI_SDK_URL as a repository secret to use a different SDK version
-  # Default: NDI 6 SDK from official download site
   NDI_SDK_URL: ${{ secrets.NDI_SDK_URL || 'https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe' }}
+  LLVM_VERSION: "18.1.8"
+  CACHE_VERSION: v1
 
 jobs:
-  setup:
-    name: Setup NDI SDK
+  # Quick format check (no dependencies needed)
+  format:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # Combined setup and test job
+  test-and-lint:
+    name: Test & Lint
     runs-on: windows-latest
     steps:
-      - name: Set NDI paths
-        id: ndi-paths
-        run: |
-          echo "NDI_SDK_DIR=${{ runner.temp }}\ndi-sdk" >> $env:GITHUB_ENV
-          echo "NDI_SDK_INSTALLER=${{ runner.temp }}\NDI_SDK_Installer.exe" >> $env:GITHUB_ENV
-        shell: pwsh
+      - uses: actions/checkout@v4
 
-      - name: Generate cache key from URL
+      # Generate cache key for all dependencies
+      - name: Generate cache key
         id: cache-key
         run: |
-          $url = "${{ env.NDI_SDK_URL }}"
-          $hash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($url))).Replace("-", "").Substring(0, 16)
-          echo "key=ndi-sdk-$hash-windows" >> $env:GITHUB_OUTPUT
+          $ndiHash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes("${{ env.NDI_SDK_URL }}"))).Replace("-", "").Substring(0, 16)
+          echo "key=deps-${{ env.CACHE_VERSION }}-$ndiHash-${{ env.LLVM_VERSION }}-${{ runner.os }}" >> $env:GITHUB_OUTPUT
         shell: pwsh
 
-      - name: Cache NDI SDK
-        id: cache-ndi
+      # Cache both LLVM and NDI SDK together
+      - name: Cache dependencies
+        id: cache-deps
         uses: actions/cache@v4
         with:
-          path: ${{ env.NDI_SDK_DIR }}
+          path: |
+            ${{ runner.temp }}\ndi-sdk
+            C:\Program Files\LLVM
           key: ${{ steps.cache-key.outputs.key }}
 
-      - name: Display cache status
-        run: |
-          Write-Host "Cache key: ${{ steps.cache-key.outputs.key }}"
-          Write-Host "Cache hit: ${{ steps.cache-ndi.outputs.cache-hit }}"
-        shell: pwsh
+      # Install LLVM if not cached
+      - name: Install LLVM
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: choco install llvm --version=${{ env.LLVM_VERSION }} -y
 
-      - name: Download and Install NDI SDK (if not cached)
-        if: steps.cache-ndi.outputs.cache-hit != 'true'
+      # Install NDI SDK if not cached
+      - name: Download and Install NDI SDK
+        if: steps.cache-deps.outputs.cache-hit != 'true'
         run: |
-          Write-Host "Installing NDI SDK to: $env:NDI_SDK_DIR"
-          curl -L -o "${{ env.NDI_SDK_INSTALLER }}" "${{ env.NDI_SDK_URL }}"
+          $NDI_SDK_DIR = "${{ runner.temp }}\ndi-sdk"
+          $NDI_SDK_INSTALLER = "${{ runner.temp }}\NDI_SDK_Installer.exe"
           
-          # Try running the installer with a timeout and additional flags
-          Write-Host "Starting installer..."
-          $proc = Start-Process -FilePath "${{ env.NDI_SDK_INSTALLER }}" `
-            -ArgumentList "/VERYSILENT", "/SP-", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL", "/DIR=$env:NDI_SDK_DIR", "/LOG=$env:TEMP\ndi_install.log" `
+          Write-Host "Downloading NDI SDK..."
+          curl -L -o "$NDI_SDK_INSTALLER" "${{ env.NDI_SDK_URL }}"
+          
+          Write-Host "Installing NDI SDK to: $NDI_SDK_DIR"
+          $proc = Start-Process -FilePath "$NDI_SDK_INSTALLER" `
+            -ArgumentList "/VERYSILENT", "/SP-", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL", "/DIR=$NDI_SDK_DIR", "/LOG=$env:TEMP\ndi_install.log" `
             -PassThru
           
           # Wait up to 5 minutes for installation
-          $timeout = 300  # 5 minutes in seconds
-          if (!$proc.WaitForExit($timeout * 1000)) {
-            Write-Warning "Installer timed out after $timeout seconds, terminating..."
+          if (!$proc.WaitForExit(300000)) {
             $proc | Stop-Process -Force
-            
-            # Check if it installed anyway
-            if (Test-Path "$env:NDI_SDK_DIR\include\Processing.NDI.Lib.h") {
-              Write-Host "✓ NDI SDK appears to have installed despite timeout"
+            if (Test-Path "$NDI_SDK_DIR\include\Processing.NDI.Lib.h") {
+              Write-Host "✓ NDI SDK installed (process timed out but files exist)"
             } else {
-              Write-Error "NDI SDK installation failed - timed out"
-              
-              # Try to show install log if it exists
-              $logPath = "$env:TEMP\ndi_install.log"
-              if (Test-Path $logPath) {
-                Write-Host "=== Install Log ==="
-                Get-Content $logPath | Select-Object -Last 50
-              }
-              
+              Write-Error "NDI SDK installation failed"
               exit 1
             }
           }
           
-          Remove-Item "${{ env.NDI_SDK_INSTALLER }}" -ErrorAction SilentlyContinue
+          Remove-Item "$NDI_SDK_INSTALLER" -ErrorAction SilentlyContinue
           
           # Verify installation
-          if (Test-Path "$env:NDI_SDK_DIR\include\Processing.NDI.Lib.h") {
+          if (Test-Path "$NDI_SDK_DIR\include\Processing.NDI.Lib.h") {
             Write-Host "✓ NDI SDK installed successfully"
-            Write-Host "Contents of NDI SDK directory:"
-            Get-ChildItem -Path $env:NDI_SDK_DIR -Recurse -Directory | Select-Object -First 10
           } else {
             Write-Error "NDI SDK installation failed - header file not found"
             exit 1
           }
         shell: pwsh
 
-  test:
-    name: Test
-    needs: setup
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set NDI paths
-        run: echo "NDI_SDK_DIR=${{ runner.temp }}\ndi-sdk" >> $env:GITHUB_ENV
-        shell: pwsh
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # Setup Rust
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          components: clippy
 
-      - name: Install LLVM for bindgen (Windows)
-        run: choco install llvm
-
-      - name: Generate cache key from URL
-        id: cache-key
-        run: |
-          $url = "${{ env.NDI_SDK_URL }}"
-          $hash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($url))).Replace("-", "").Substring(0, 16)
-          echo "key=ndi-sdk-$hash-windows" >> $env:GITHUB_OUTPUT
-        shell: pwsh
-
-      - name: Restore NDI SDK from cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.NDI_SDK_DIR }}
-          key: ${{ steps.cache-key.outputs.key }}
-          fail-on-cache-miss: true
-
-      - name: Verify NDI SDK
-        run: |
-          if (-not (Test-Path "$env:NDI_SDK_DIR\include\Processing.NDI.Lib.h")) {
-            Write-Error "NDI SDK cache corrupted - header file not found"
-            exit 1
-          }
-          Write-Host "✓ NDI SDK restored from cache successfully"
-        shell: pwsh
-
-      - name: Set Environment Variables (Windows)
-        run: |
-          echo "$env:NDI_SDK_DIR\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        shell: pwsh
-
+      # Rust caching
       - uses: Swatinem/rust-cache@v2
 
+      # Setup environment
+      - name: Setup environment
+        run: |
+          echo "NDI_SDK_DIR=${{ runner.temp }}\ndi-sdk" >> $env:GITHUB_ENV
+          echo "${{ runner.temp }}\ndi-sdk\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        shell: pwsh
+
+      # Run all checks
       - name: Run tests
         run: |
           # Run unit tests and doc tests, but exclude integration tests that require NDI runtime
@@ -157,204 +121,55 @@ jobs:
         env:
           TMPDIR: ${{ runner.temp }}
 
-  format:
-    name: Format
-    needs: setup
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set NDI paths
-        run: echo "NDI_SDK_DIR=${{ runner.temp }}\ndi-sdk" >> $env:GITHUB_ENV
-        shell: pwsh
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt
-
-      - name: Install LLVM for bindgen (Windows)
-        run: choco install llvm
-
-      - name: Generate cache key from URL
-        id: cache-key
-        run: |
-          $url = "${{ env.NDI_SDK_URL }}"
-          $hash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($url))).Replace("-", "").Substring(0, 16)
-          echo "key=ndi-sdk-$hash-windows" >> $env:GITHUB_OUTPUT
-        shell: pwsh
-
-      - name: Restore NDI SDK from cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.NDI_SDK_DIR }}
-          key: ${{ steps.cache-key.outputs.key }}
-          fail-on-cache-miss: true
-
-      - name: Verify NDI SDK
-        run: |
-          if (-not (Test-Path "$env:NDI_SDK_DIR\include\Processing.NDI.Lib.h")) {
-            Write-Error "NDI SDK cache corrupted - header file not found"
-            exit 1
-          }
-          Write-Host "✓ NDI SDK restored from cache successfully"
-        shell: pwsh
-
-      - name: Set Environment Variables (Windows)
-        run: |
-          echo "$env:NDI_SDK_DIR\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        shell: pwsh
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-  lint:
-    name: Lint
-    needs: setup
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set NDI paths
-        run: echo "NDI_SDK_DIR=${{ runner.temp }}\ndi-sdk" >> $env:GITHUB_ENV
-        shell: pwsh
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Install LLVM for bindgen (Windows)
-        run: choco install llvm
-
-      - name: Generate cache key from URL
-        id: cache-key
-        run: |
-          $url = "${{ env.NDI_SDK_URL }}"
-          $hash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($url))).Replace("-", "").Substring(0, 16)
-          echo "key=ndi-sdk-$hash-windows" >> $env:GITHUB_OUTPUT
-        shell: pwsh
-
-      - name: Restore NDI SDK from cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.NDI_SDK_DIR }}
-          key: ${{ steps.cache-key.outputs.key }}
-          fail-on-cache-miss: true
-
-      - name: Verify NDI SDK
-        run: |
-          if (-not (Test-Path "$env:NDI_SDK_DIR\include\Processing.NDI.Lib.h")) {
-            Write-Error "NDI SDK cache corrupted - header file not found"
-            exit 1
-          }
-          Write-Host "✓ NDI SDK restored from cache successfully"
-        shell: pwsh
-
-      - name: Set Environment Variables (Windows)
-        run: |
-          echo "$env:NDI_SDK_DIR\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        shell: pwsh
-
       - name: Run Clippy
         run: cargo clippy -- -D warnings
 
+      - name: Build examples
+        run: cargo build --examples
+
+  # Semver check (can run on Linux, no NDI needed)
   semver:
     name: Check semver
-    needs: setup
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set NDI paths
-        run: echo "NDI_SDK_DIR=${{ runner.temp }}\ndi-sdk" >> $env:GITHUB_ENV
-        shell: pwsh
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install LLVM for bindgen (Windows)
-        run: choco install llvm
-
-      - name: Generate cache key from URL
-        id: cache-key
-        run: |
-          $url = "${{ env.NDI_SDK_URL }}"
-          $hash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($url))).Replace("-", "").Substring(0, 16)
-          echo "key=ndi-sdk-$hash-windows" >> $env:GITHUB_OUTPUT
-        shell: pwsh
-
-      - name: Restore NDI SDK from cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.NDI_SDK_DIR }}
-          key: ${{ steps.cache-key.outputs.key }}
-          fail-on-cache-miss: true
-
-      - name: Verify NDI SDK
-        run: |
-          if (-not (Test-Path "$env:NDI_SDK_DIR\include\Processing.NDI.Lib.h")) {
-            Write-Error "NDI SDK cache corrupted - header file not found"
-            exit 1
-          }
-          Write-Host "✓ NDI SDK restored from cache successfully"
-        shell: pwsh
-
-      - name: Set Environment Variables (Windows)
-        run: |
-          echo "$env:NDI_SDK_DIR\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        shell: pwsh
-
       - uses: obi1kenobi/cargo-semver-checks-action@v2
 
+  # Publish job
   publish:
     name: Publish
-    needs: [test, format, lint, semver]
+    needs: [format, test-and-lint, semver]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set NDI paths
-        run: echo "NDI_SDK_DIR=${{ runner.temp }}\ndi-sdk" >> $env:GITHUB_ENV
-        shell: pwsh
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install LLVM for bindgen (Windows)
-        run: choco install llvm
-
-      - name: Generate cache key from URL
+      # Generate the same cache key
+      - name: Generate cache key
         id: cache-key
         run: |
-          $url = "${{ env.NDI_SDK_URL }}"
-          $hash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($url))).Replace("-", "").Substring(0, 16)
-          echo "key=ndi-sdk-$hash-windows" >> $env:GITHUB_OUTPUT
+          $ndiHash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes("${{ env.NDI_SDK_URL }}"))).Replace("-", "").Substring(0, 16)
+          echo "key=deps-${{ env.CACHE_VERSION }}-$ndiHash-${{ env.LLVM_VERSION }}-${{ runner.os }}" >> $env:GITHUB_OUTPUT
         shell: pwsh
 
-      - name: Restore NDI SDK from cache
+      # Restore dependencies from cache
+      - name: Restore dependencies
         uses: actions/cache@v4
         with:
-          path: ${{ env.NDI_SDK_DIR }}
+          path: |
+            ${{ runner.temp }}\ndi-sdk
+            C:\Program Files\LLVM
           key: ${{ steps.cache-key.outputs.key }}
           fail-on-cache-miss: true
 
-      - name: Verify NDI SDK
-        run: |
-          if (-not (Test-Path "$env:NDI_SDK_DIR\include\Processing.NDI.Lib.h")) {
-            Write-Error "NDI SDK cache corrupted - header file not found"
-            exit 1
-          }
-          Write-Host "✓ NDI SDK restored from cache successfully"
-        shell: pwsh
-
-      - name: Set Environment Variables (Windows)
-        run: |
-          echo "$env:NDI_SDK_DIR\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        shell: pwsh
-
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      - name: Setup environment
+        run: |
+          echo "NDI_SDK_DIR=${{ runner.temp }}\ndi-sdk" >> $env:GITHUB_ENV
+          echo "${{ runner.temp }}\ndi-sdk\Bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        shell: pwsh
 
       - name: Publish to crates.io
         run: cargo publish
