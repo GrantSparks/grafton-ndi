@@ -147,7 +147,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --verbose
+        run: |
+          # Run unit tests and doc tests, but exclude integration tests that require NDI runtime
+          cargo test --lib --verbose
+          cargo test --doc --verbose
         env:
           TMPDIR: ${{ runner.temp }}
 
