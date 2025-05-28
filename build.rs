@@ -69,7 +69,7 @@ fn main() {
         panic!("Unsupported platform");
     };
 
-    // For Windows, add the specific library directory path.
+    // Add library directory path for both platforms.
     if cfg!(windows) {
         let target = env::var("TARGET").expect("TARGET environment variable not set");
         let lib_subdir = if target.contains("x86_64") {
@@ -78,6 +78,10 @@ fn main() {
             "x86"
         };
         let lib_path = format!("{}\\lib\\{}", ndi_sdk_path, lib_subdir);
+        println!("cargo:rustc-link-search=native={}", lib_path);
+    } else if cfg!(unix) {
+        // For Linux, add the library search path
+        let lib_path = format!("{}/lib/x86_64-linux-gnu", ndi_sdk_path);
         println!("cargo:rustc-link-search=native={}", lib_path);
     }
 
