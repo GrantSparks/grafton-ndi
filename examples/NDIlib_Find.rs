@@ -6,7 +6,7 @@
 //! This is based on the NDIlib_Find example from the NDI SDK.
 //!
 //! Run with: `cargo run --example NDIlib_Find`
-//! 
+//!
 //! Optional arguments:
 //! - IP address or subnet to search: `cargo run --example NDIlib_Find -- 192.168.0.100`
 //! - Multiple IPs: `cargo run --example NDIlib_Find -- 192.168.0.100 10.0.0.0/24`
@@ -32,9 +32,8 @@ fn main() -> Result<(), Error> {
     println!("NDI initialized successfully\n");
 
     // Create finder options
-    let mut builder = FinderOptions::builder()
-        .show_local_sources(true);  // Include sources on this machine
-    
+    let mut builder = FinderOptions::builder().show_local_sources(true); // Include sources on this machine
+
     // Add any command line IPs
     if !extra_ips.is_empty() {
         println!("Searching additional IPs/subnets:");
@@ -44,7 +43,7 @@ fn main() -> Result<(), Error> {
         }
         println!();
     }
-    
+
     let finder_options = builder.build();
 
     // Create the finder instance
@@ -65,14 +64,18 @@ fn main() -> Result<(), Error> {
     // Run for one minute
     let start = Instant::now();
     let mut last_count = initial_sources.len();
-    
+
     while start.elapsed() < Duration::from_secs(60) {
         // Wait up to 5 seconds for sources to be added or removed
         if !finder.wait_for_sources(5000) {
             // No changes detected
             let elapsed = start.elapsed().as_secs();
-            if elapsed % 10 == 0 {  // Print status every 10 seconds
-                println!("[{:02}s] No change to sources (still {} found)", elapsed, last_count);
+            if elapsed % 10 == 0 {
+                // Print status every 10 seconds
+                println!(
+                    "[{:02}s] No change to sources (still {} found)",
+                    elapsed, last_count
+                );
             }
             continue;
         }
@@ -85,13 +88,13 @@ fn main() -> Result<(), Error> {
         if sources.len() != last_count {
             println!("\n[{:02}s] Source list changed!", elapsed);
         }
-        
+
         println!("Network sources ({} found):", sources.len());
         for (i, source) in sources.iter().enumerate() {
             println!("  {}. {}", i + 1, source);
         }
         println!();
-        
+
         last_count = sources.len();
     }
 

@@ -7,8 +7,8 @@
 //!
 //! IMPORTANT: This example includes critical error handling that is
 //! necessary for reliable NDI reception:
-//! 
-//! 1. Retry loop for frame capture - NDI SDK's capture_video doesn't 
+//!
+//! 1. Retry loop for frame capture - NDI SDK's capture_video doesn't
 //!    actually block for the full timeout duration, so we need to retry
 //! 2. Stride validation - Prevents corrupted images when stride != width * 4
 //! 3. Format verification - Ensures we actually get RGBA/RGBX format
@@ -22,7 +22,9 @@
 //! - Custom output file: `cargo run --example NDIlib_Recv_PNG -- --output MyImage.png`
 //! - Both: `cargo run --example NDIlib_Recv_PNG -- 192.168.0.100 --output MyImage.png`
 
-use grafton_ndi::{Error, Finder, FinderOptions, ReceiverColorFormat, ReceiverOptions, FourCCVideoType, NDI};
+use grafton_ndi::{
+    Error, Finder, FinderOptions, FourCCVideoType, ReceiverColorFormat, ReceiverOptions, NDI,
+};
 use std::env;
 use std::fs::File;
 use std::time::{Duration, Instant};
@@ -32,7 +34,7 @@ fn main() -> Result<(), Error> {
     let args: Vec<String> = env::args().collect();
     let mut extra_ips = Vec::new();
     let mut output_file = "CoolNDIImage.png";
-    
+
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--output" && i + 1 < args.len() {
@@ -52,16 +54,15 @@ fn main() -> Result<(), Error> {
     // Initialize NDI
     let ndi = NDI::new()?;
     println!("NDI initialized successfully");
-    
+
     if output_file != "CoolNDIImage.png" {
         println!("Output file: {}", output_file);
     }
     println!();
 
     // Create a finder
-    let mut builder = FinderOptions::builder()
-        .show_local_sources(true);
-    
+    let mut builder = FinderOptions::builder().show_local_sources(true);
+
     // Add any command line IPs
     if !extra_ips.is_empty() {
         println!("Searching additional IPs/subnets:");
@@ -71,7 +72,7 @@ fn main() -> Result<(), Error> {
         }
         println!();
     }
-    
+
     let finder = Finder::new(&ndi, &builder.build())?;
 
     // Wait until there is one source
@@ -105,11 +106,11 @@ fn main() -> Result<(), Error> {
 
     let video_frame = loop {
         attempts += 1;
-        
+
         // Check if we've exceeded our total timeout
         if start_time.elapsed() > timeout {
             return Err(Error::InitializationFailed(
-                "Timeout waiting for video frame after 60 seconds".to_string()
+                "Timeout waiting for video frame after 60 seconds".to_string(),
             ));
         }
 
@@ -118,14 +119,19 @@ fn main() -> Result<(), Error> {
         match receiver.capture_video(100)? {
             Some(frame) => {
                 println!("Frame received after {} attempts", attempts);
-                
+
                 // Debug information about the frame
                 println!("Frame details:");
                 println!("  Resolution: {}x{}", frame.width, frame.height);
                 println!("  Format: {:?}", frame.fourcc);
-                println!("  Line stride: {} bytes", unsafe { frame.line_stride_or_size.line_stride_in_bytes });
+                println!("  Line stride: {} bytes", unsafe {
+                    frame.line_stride_or_size.line_stride_in_bytes
+                });
                 println!("  Data size: {} bytes", frame.data.len());
-                println!("  Frame rate: {}/{}", frame.frame_rate_n, frame.frame_rate_d);
+                println!(
+                    "  Frame rate: {}/{}",
+                    frame.frame_rate_n, frame.frame_rate_d
+                );
                 println!("  Timecode: {:016x}", frame.timecode);
 
                 // Verify we got the format we requested
@@ -134,14 +140,17 @@ fn main() -> Result<(), Error> {
                         println!("  ✓ Got requested RGBA/RGBX format");
                     }
                     _ => {
-                        eprintln!("  ⚠ Warning: Got unexpected format {:?}, PNG may fail", frame.fourcc);
+                        eprintln!(
+                            "  ⚠ Warning: Got unexpected format {:?}, PNG may fail",
+                            frame.fourcc
+                        );
                     }
                 }
 
                 // CRITICAL: Verify stride matches width to prevent corrupted images
                 let expected_stride = frame.width * 4; // 4 bytes per pixel for RGBA
                 let actual_stride = unsafe { frame.line_stride_or_size.line_stride_in_bytes };
-                
+
                 if actual_stride != expected_stride {
                     // This is a common issue with some NDI sources
                     // If stride != width * 4, we would need to handle row padding
@@ -155,8 +164,14 @@ fn main() -> Result<(), Error> {
                 // Check data size to detect if we might have a compressed format
                 let expected_uncompressed_size = (frame.width * frame.height * 4) as usize;
                 if frame.data.len() < expected_uncompressed_size / 2 {
-                    eprintln!("  ⚠ Warning: Frame data size ({} bytes) is much smaller than expected", frame.data.len());
-                    eprintln!("            uncompressed size ({} bytes). This might be a compressed", expected_uncompressed_size);
+                    eprintln!(
+                        "  ⚠ Warning: Frame data size ({} bytes) is much smaller than expected",
+                        frame.data.len()
+                    );
+                    eprintln!(
+                        "            uncompressed size ({} bytes). This might be a compressed",
+                        expected_uncompressed_size
+                    );
                     eprintln!("            format that needs decoding before saving as PNG.");
                 }
 
