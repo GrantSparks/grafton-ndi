@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.8.0] - 2025-05-28
+
+### Added
+- **Async video sending**: Non-blocking video transmission with completion callbacks
+  - `send_video_async()` method returns `AsyncVideoToken` for safe buffer management
+  - `on_async_video_done()` callback for buffer reuse notification
+  - `flush_async()` and `flush_async_blocking()` for flushing pending frames
+- **BorrowedVideoFrame**: Zero-copy frame type for optimal async performance
+  - Enables true zero-copy workflows with external buffers
+  - Designed specifically for async send operations
+- **AsyncVideoToken**: RAII token for safe async frame lifetime management
+  - Prevents use-after-free in async operations
+  - Automatically manages frame reference counting
+- **Receiver Status API**: Monitor connection health and performance
+  - `get_status()` returns detailed `RecvStatus` struct
+  - Track frame counts, dropped frames, and connection state
+  - Monitor metadata, audio, and video frame statistics
+- **Advanced SDK Support**: Optional `advanced_sdk` feature flag
+  - Enables `NDIlib_send_set_video_async_completion` for true async callbacks
+  - Falls back to simulated completion via `Drop` for standard SDK
+- New examples:
+  - `async_send.rs`: Demonstrates async video sending
+  - `concurrent_capture.rs`: Shows multi-threaded capture
+  - `status_monitor.rs`: Receiver status monitoring
+  - `zero_copy_send.rs`: Zero-copy async transmission
+
+### Changed
+- Enhanced Windows compatibility with proper enum conversions
+- Improved error messages with more context
+- Better documentation with more examples
+- CI/CD improvements:
+  - Separated runtime-dependent tests from unit tests
+  - Added Windows CI support
+  - Improved caching and performance
+
+### Fixed
+- Enum conversion issues on Windows platforms
+- Potential race conditions in async operations
+- CI test failures due to missing NDI runtime
+- Documentation inconsistencies
+
 ## [0.7.0] - 2025-05-23
 
 ### Breaking Changes
