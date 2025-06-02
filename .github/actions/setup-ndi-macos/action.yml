@@ -28,12 +28,21 @@ runs:
           ${{ runner.temp }}/ndi-sdk
         key: ${{ steps.cache-key.outputs.key }}
 
-    # Install NDI SDK if not cached
-    - name: Download and Install NDI SDK
+    # Install NDI SDK if not cached or not found
+    - name: Download and Install NDI SDK  
       if: steps.cache-restore.outputs.cache-hit != 'true'
       run: |
         NDI_SDK_DIR="${{ runner.temp }}/ndi-sdk"
         NDI_SDK_INSTALLER="${{ runner.temp }}/NDI_SDK_Installer.pkg"
+        
+        # Check if NDI is already installed at system location
+        if [ -d "/Library/NDI SDK for Apple" ] && [ -f "/Library/NDI SDK for Apple/include/Processing.NDI.Lib.h" ]; then
+          echo "NDI SDK already installed at /Library/NDI SDK for Apple"
+          echo "Copying to cache location..."
+          mkdir -p "$NDI_SDK_DIR"
+          cp -R "/Library/NDI SDK for Apple"/* "$NDI_SDK_DIR/"
+          exit 0
+        fi
         
         # Use macOS-specific NDI SDK URL with fallback
         NDI_SDK_URL="${{ env.NDI_SDK_URL_MACOS }}"
@@ -298,6 +307,33 @@ runs:
             ls -la "$NDI_SDK_DIR/lib/macOS/" || true
           fi
         fi
+      shell: bash
+    
+    # Verify SDK is available (whether from cache or fresh install)
+    - name: Verify NDI SDK
+      run: |
+        NDI_SDK_DIR="${{ runner.temp }}/ndi-sdk"
+        echo "Verifying NDI SDK at: $NDI_SDK_DIR"
+        
+        if [ ! -d "$NDI_SDK_DIR" ] || [ ! -f "$NDI_SDK_DIR/include/Processing.NDI.Lib.h" ]; then
+          echo "Error: NDI SDK not found at expected location after installation/cache restore"
+          echo "Contents of runner.temp:"
+          ls -la "${{ runner.temp }}" || true
+          
+          # If it's at the system location, copy it
+          if [ -d "/Library/NDI SDK for Apple" ] && [ -f "/Library/NDI SDK for Apple/include/Processing.NDI.Lib.h" ]; then
+            echo "Found NDI SDK at system location, copying..."
+            mkdir -p "$NDI_SDK_DIR"
+            cp -R "/Library/NDI SDK for Apple"/* "$NDI_SDK_DIR/"
+          else
+            echo "NDI SDK not found anywhere!"
+            exit 1
+          fi
+        fi
+        
+        echo "NDI SDK verified at: $NDI_SDK_DIR"
+        echo "Contents:"
+        ls -la "$NDI_SDK_DIR" | head -10
       shell: bash
 
     # Setup environment
