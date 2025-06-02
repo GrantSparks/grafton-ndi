@@ -64,7 +64,7 @@ impl NDI {
             // On Windows CI, add diagnostic output
             #[cfg(all(target_os = "windows", debug_assertions))]
             {
-                if let Ok(_) = std::env::var("CI") {
+                if std::env::var("CI").is_ok() {
                     eprintln!("[NDI] Initializing NDI runtime in CI environment...");
                     if let Ok(sdk_dir) = std::env::var("NDI_SDK_DIR") {
                         eprintln!("[NDI] NDI_SDK_DIR: {}", sdk_dir);
