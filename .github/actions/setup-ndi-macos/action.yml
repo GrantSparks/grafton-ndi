@@ -55,62 +55,32 @@ runs:
         fi
         echo "✓ NDI SDK hash verified"
         
-        echo "Installing NDI SDK to: $NDI_SDK_DIR"
-        mkdir -p "$NDI_SDK_DIR"
-        
-        # Extract the pkg installer
-        # First, try using pkgutil (standard on macOS)
-        if command -v pkgutil >/dev/null 2>&1; then
-          echo "Using pkgutil to expand package..."
-          pkgutil --expand "$NDI_SDK_INSTALLER" "${{ runner.temp }}/ndi-expanded"
-          
-          # Find and extract all Payload files
-          if [ -d "${{ runner.temp }}/ndi-expanded" ]; then
-            # Look for Payload files and extract them
-            find "${{ runner.temp }}/ndi-expanded" -name "Payload" -type f | while read payload; do
-              echo "Extracting payload: $payload"
-              cd "$NDI_SDK_DIR"
-              if command -v cpio >/dev/null 2>&1; then
-                cpio -idm < "$payload" 2>/dev/null || true
-              else
-                # Fallback to tar if cpio is not available
-                tar -xf "$payload" 2>/dev/null || true
-              fi
-            done
-          fi
-          
-          rm -rf "${{ runner.temp }}/ndi-expanded"
-        else
-          # Fallback: try using xar if available
-          if command -v xar >/dev/null 2>&1; then
-            echo "Using xar to extract package..."
-            cd "${{ runner.temp }}"
-            xar -xf "$NDI_SDK_INSTALLER"
-            
-            # Extract the main package
-            if [ -f "ndisdk.pkg/Payload" ]; then
-              cd "$NDI_SDK_DIR"
-              gunzip -c "${{ runner.temp }}/ndisdk.pkg/Payload" | cpio -idm 2>/dev/null || true
-            fi
-            
-            # Clean up
-            rm -rf "${{ runner.temp }}"/*.pkg
-          else
-            echo "Warning: Neither pkgutil nor xar found, attempting direct installation..."
-            # As last resort, try direct installation (requires sudo on runners)
-            sudo installer -pkg "$NDI_SDK_INSTALLER" -target / -allowUntrusted || true
-          fi
-        fi
+        echo "Installing NDI SDK..."
+        # Use the standard macOS installer command
+        # This will install to the default system location
+        sudo installer -pkg "$NDI_SDK_INSTALLER" -target / -allowUntrusted || {
+          echo "Error: Failed to install NDI SDK package"
+          exit 1
+        }
         
         rm -f "$NDI_SDK_INSTALLER"
         
+        # Debug: List common installation directories
+        echo "Checking common NDI installation paths:"
+        ls -la /Library/ | grep -i ndi || true
+        ls -la /Applications/ | grep -i ndi || true
+        ls -la /usr/local/ | grep -i ndi || true
+        
         # Look for NDI SDK in multiple possible locations
         NDI_LOCATIONS=(
-          "$NDI_SDK_DIR"
           "/Library/NDI SDK for Apple"
+          "/Library/NDI SDK for macOS"
+          "/Library/Application Support/NDI SDK for Apple"
           "/Applications/NDI SDK for Apple"
           "/usr/local/ndi"
+          "/usr/local/lib/ndi"
           "$HOME/Library/NDI SDK for Apple"
+          "$NDI_SDK_DIR"
         )
         
         FOUND_SDK=false
@@ -132,8 +102,25 @@ runs:
           echo "Searched locations:"
           for location in "${NDI_LOCATIONS[@]}"; do
             echo "  - $location"
-            ls -la "$location" 2>/dev/null || echo "    (not found)"
+            if [ -d "$location" ]; then
+              echo "    Directory exists. Contents:"
+              ls -la "$location" | head -10
+              if [ -d "$location/include" ]; then
+                echo "    Include directory contents:"
+                ls -la "$location/include" | head -10
+              fi
+            else
+              echo "    (directory not found)"
+            fi
           done
+          
+          # Additional debugging
+          echo ""
+          echo "Searching for NDI files system-wide:"
+          find /Library -name "*NDI*" -type d 2>/dev/null | head -20 || true
+          find /Applications -name "*NDI*" -type d 2>/dev/null | head -20 || true
+          find /usr/local -name "*NDI*" -type d 2>/dev/null | head -20 || true
+          
           exit 1
         fi
         
