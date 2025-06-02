@@ -11,8 +11,12 @@ fn main() {
             let possible_paths = vec![
                 "/Library/NDI SDK for macOS",
                 "/Library/NDI SDK for Apple",
+                "/Library/NDI 6 SDK",
+                "/Library/NDI SDK",
                 "/Library/NewTek/NDI SDK",
                 "/Library/Application Support/NDI SDK for Apple",
+                "/Applications/NDI SDK for Apple",
+                "/Applications/NDI 6 SDK",
             ];
 
             for path in &possible_paths {

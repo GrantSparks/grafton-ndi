@@ -126,13 +126,21 @@ runs:
         find /Applications -maxdepth 2 -name "*NDI*" -type d 2>/dev/null || true
         
         # Look for NDI SDK in multiple possible locations
+        # First, try to find it dynamically
+        echo "Searching for NDI SDK dynamically..."
+        FOUND_DIRS=$(find /Library /Applications -maxdepth 3 -type d -name "*NDI*SDK*" 2>/dev/null || true)
+        
         NDI_LOCATIONS=(
           "/Library/NDI SDK for Apple"
           "/Library/NDI SDK for macOS"
+          "/Library/NDI 6 SDK"  # Versioned directory
+          "/Library/NDI SDK"     # Generic name
           "/Library/Application Support/NDI SDK for Apple"
           "/Library/NewTek"
           "/Library/NewTek/NDI SDK"
           "/Applications/NDI SDK for Apple"
+          "/Applications/NDI 6 SDK"
+          "/Applications/NDI.app"  # Might be an app bundle
           "/Applications/NewTek"
           "/Applications/NewTek/NDI SDK"
           "/usr/local/ndi"
@@ -141,6 +149,15 @@ runs:
           "$HOME/Library/NDI SDK for Apple"
           "$NDI_SDK_DIR"
         )
+        
+        # Add any dynamically found directories
+        if [ -n "$FOUND_DIRS" ]; then
+          echo "Found potential NDI directories:"
+          echo "$FOUND_DIRS"
+          while IFS= read -r dir; do
+            NDI_LOCATIONS+=("$dir")
+          done <<< "$FOUND_DIRS"
+        fi
         
         FOUND_SDK=false
         for location in "${NDI_LOCATIONS[@]}"; do
@@ -176,6 +193,31 @@ runs:
             fi
           fi
         done
+        
+        if [ "$FOUND_SDK" = false ]; then
+          echo "NDI SDK not found in expected locations. Trying pkgutil method..."
+          
+          # Last resort: use pkgutil to find where NDI was installed
+          for pkg in $(pkgutil --pkgs | grep -i ndi); do
+            echo "Checking package: $pkg"
+            # Get the install location from the package
+            INSTALL_LOC=$(pkgutil --pkg-info "$pkg" 2>/dev/null | grep -i "location:" | cut -d: -f2 | xargs)
+            if [ -n "$INSTALL_LOC" ]; then
+              echo "Package installed to: $INSTALL_LOC"
+              if [ -d "$INSTALL_LOC" ] && [ -d "$INSTALL_LOC/include" ]; then
+                echo "Found NDI SDK via pkgutil at: $INSTALL_LOC"
+                mkdir -p "$NDI_SDK_DIR"
+                cp -R "$INSTALL_LOC"/* "$NDI_SDK_DIR/"
+                FOUND_SDK=true
+                break
+              fi
+            fi
+            
+            # Also try to find files from this package
+            echo "Looking for include files in package $pkg:"
+            pkgutil --files "$pkg" 2>/dev/null | grep -E "(include|\.h$)" | head -10
+          done
+        fi
         
         if [ "$FOUND_SDK" = false ]; then
           echo "NDI SDK installation failed - header file not found in any expected location"
