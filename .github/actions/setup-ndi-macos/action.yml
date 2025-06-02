@@ -56,9 +56,14 @@ runs:
         echo "✓ NDI SDK hash verified"
         
         echo "Installing NDI SDK..."
-        # Use the standard macOS installer command
+        
+        # First, let's see what's in the package
+        echo "Package info:"
+        pkgutil --payload-files "$NDI_SDK_INSTALLER" 2>/dev/null | head -20 || echo "Could not list package contents"
+        
+        # Use the standard macOS installer command with verbose output
         # This will install to the default system location
-        sudo installer -pkg "$NDI_SDK_INSTALLER" -target / -allowUntrusted || {
+        sudo installer -pkg "$NDI_SDK_INSTALLER" -target / -allowUntrusted -verbose || {
           echo "Error: Failed to install NDI SDK package"
           exit 1
         }
@@ -71,6 +76,11 @@ runs:
         ls -la /Applications/ | grep -i ndi || true
         ls -la /usr/local/ | grep -i ndi || true
         
+        # Also check for NewTek directories (NDI's parent company)
+        echo "Checking for NewTek directories:"
+        ls -la /Library/ | grep -i newtek || true
+        find /Library -name "*NewTek*" -type d 2>/dev/null | head -10 || true
+        
         # More specific search for NDI SDK directory
         echo ""
         echo "Searching for NDI SDK directories:"
@@ -82,7 +92,11 @@ runs:
           "/Library/NDI SDK for Apple"
           "/Library/NDI SDK for macOS"
           "/Library/Application Support/NDI SDK for Apple"
+          "/Library/NewTek"
+          "/Library/NewTek/NDI SDK"
           "/Applications/NDI SDK for Apple"
+          "/Applications/NewTek"
+          "/Applications/NewTek/NDI SDK"
           "/usr/local/ndi"
           "/usr/local/lib/ndi"
           "$HOME/Library/NDI SDK for Apple"
@@ -91,10 +105,22 @@ runs:
         
         FOUND_SDK=false
         for location in "${NDI_LOCATIONS[@]}"; do
-          if [ -f "$location/include/Processing.NDI.Lib.h" ]; then
+          # Check for various possible header file names
+          if [ -f "$location/include/Processing.NDI.Lib.h" ] || \
+             [ -f "$location/include/Processing.NDI.lib.h" ] || \
+             [ -f "$location/include/ndi.h" ] || \
+             [ -f "$location/include/NDI.h" ] || \
+             [ -d "$location/include" ]; then
             echo "Found NDI SDK at: $location"
+            
+            # List what's actually in the include directory
+            if [ -d "$location/include" ]; then
+              echo "Include directory contents:"
+              ls -la "$location/include/" | head -10
+            fi
+            
             if [ "$location" != "$NDI_SDK_DIR" ]; then
-              echo "Creating symlinks from $location to $NDI_SDK_DIR"
+              echo "Copying from $location to $NDI_SDK_DIR"
               mkdir -p "$NDI_SDK_DIR"
               cp -R "$location"/* "$NDI_SDK_DIR/"
             fi
@@ -126,6 +152,19 @@ runs:
           find /Library -name "*NDI*" -type d 2>/dev/null | head -20 || true
           find /Applications -name "*NDI*" -type d 2>/dev/null | head -20 || true
           find /usr/local -name "*NDI*" -type d 2>/dev/null | head -20 || true
+          
+          echo ""
+          echo "Searching for any header files with NDI in the name:"
+          find /Library -name "*NDI*.h" -type f 2>/dev/null | head -20 || true
+          find /Applications -name "*NDI*.h" -type f 2>/dev/null | head -20 || true
+          
+          echo ""
+          echo "Checking installed packages:"
+          pkgutil --pkgs | grep -i ndi || echo "No NDI packages found"
+          
+          echo ""
+          echo "Package install location (if any):"
+          pkgutil --pkg-info com.newtek.ndi.sdk 2>/dev/null || echo "Package info not found"
           
           exit 1
         fi
