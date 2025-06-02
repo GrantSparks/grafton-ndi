@@ -99,33 +99,43 @@ runs:
           "/Applications/NewTek/NDI SDK"
           "/usr/local/ndi"
           "/usr/local/lib/ndi"
+          "/usr/local/opt/ndi"  # Homebrew location
           "$HOME/Library/NDI SDK for Apple"
           "$NDI_SDK_DIR"
         )
         
         FOUND_SDK=false
         for location in "${NDI_LOCATIONS[@]}"; do
-          # Check for various possible header file names
-          if [ -f "$location/include/Processing.NDI.Lib.h" ] || \
-             [ -f "$location/include/Processing.NDI.lib.h" ] || \
-             [ -f "$location/include/ndi.h" ] || \
-             [ -f "$location/include/NDI.h" ] || \
-             [ -d "$location/include" ]; then
-            echo "Found NDI SDK at: $location"
+          # First check if the directory exists at all
+          if [ -d "$location" ]; then
+            echo "Checking directory: $location"
             
-            # List what's actually in the include directory
-            if [ -d "$location/include" ]; then
-              echo "Include directory contents:"
-              ls -la "$location/include/" | head -10
+            # Check for various possible header file names or just the include directory
+            if [ -f "$location/include/Processing.NDI.Lib.h" ] || \
+               [ -f "$location/include/Processing.NDI.lib.h" ] || \
+               [ -f "$location/include/ndi.h" ] || \
+               [ -f "$location/include/NDI.h" ] || \
+               [ -d "$location/include" ]; then
+              echo "Found NDI SDK at: $location"
+              
+              # List what's actually in the directory
+              echo "Directory contents:"
+              ls -la "$location/" | head -10
+              
+              # List what's actually in the include directory
+              if [ -d "$location/include" ]; then
+                echo "Include directory contents:"
+                ls -la "$location/include/" | head -10
+              fi
+              
+              if [ "$location" != "$NDI_SDK_DIR" ]; then
+                echo "Copying from $location to $NDI_SDK_DIR"
+                mkdir -p "$NDI_SDK_DIR"
+                cp -R "$location"/* "$NDI_SDK_DIR/"
+              fi
+              FOUND_SDK=true
+              break
             fi
-            
-            if [ "$location" != "$NDI_SDK_DIR" ]; then
-              echo "Copying from $location to $NDI_SDK_DIR"
-              mkdir -p "$NDI_SDK_DIR"
-              cp -R "$location"/* "$NDI_SDK_DIR/"
-            fi
-            FOUND_SDK=true
-            break
           fi
         done
         
