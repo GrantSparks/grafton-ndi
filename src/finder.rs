@@ -221,6 +221,49 @@ impl<'a> Finder<'a> {
         unsafe { NDIlib_find_wait_for_sources(self.instance, timeout) }
     }
 
+    /// Gets the current list of discovered sources (snapshot).
+    ///
+    /// This method uses `NDIlib_find_get_current_sources` which provides a snapshot
+    /// of the current source list without any additional network discovery.
+    ///
+    /// # Returns
+    ///
+    /// A vector of currently known sources. May be empty if no sources are found.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, FinderOptions, Finder};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
+    /// // Get current snapshot of sources
+    /// let sources = finder.get_current_sources()?;
+    ///
+    /// for source in sources {
+    ///     println!("Current source: {}", source);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_current_sources(&self) -> Result<Vec<Source>, Error> {
+        let mut num_sources = 0;
+        let sources_ptr =
+            unsafe { NDIlib_find_get_current_sources(self.instance, &mut num_sources) };
+        if sources_ptr.is_null() {
+            return Ok(vec![]);
+        }
+        let sources = unsafe {
+            (0..num_sources)
+                .map(|i| {
+                    let source = &*sources_ptr.add(i as usize);
+                    Source::from_raw(source)
+                })
+                .collect()
+        };
+        Ok(sources)
+    }
+
     /// Gets the current list of discovered sources.
     ///
     /// # Arguments
