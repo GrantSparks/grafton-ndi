@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.8.1] - 2025-01-06
+
 ### Added
 - **Full macOS Support**: Complete CI/CD pipeline for macOS platform
   - Automated NDI SDK installation for macOS in GitHub Actions
@@ -13,6 +15,11 @@
 - macOS CI workflow to properly detect and use NDI SDK
 - Build script to handle macOS-specific SDK locations
 - Library path detection for macOS platform
+- Windows-specific deadlocks in async token stress tests
+- Windows deadlock in concurrent async flush operations
+- Clippy warning about redundant pattern matching
+- Windows DLL check test compilation errors
+- Code formatting issues
 
 ## [0.8.0] - 2025-05-28
 
