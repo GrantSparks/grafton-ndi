@@ -18,3 +18,4 @@ CLAUDE.local.md
 # IDE directories
 .idea/
 .vscode/
+.claude_config
