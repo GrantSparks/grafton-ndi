@@ -60,6 +60,18 @@ impl NDI {
 
         if prev == 0 {
             // We are the first handle → initialise the runtime.
+
+            // On Windows CI, add diagnostic output
+            #[cfg(all(target_os = "windows", debug_assertions))]
+            {
+                if let Ok(_) = std::env::var("CI") {
+                    eprintln!("[NDI] Initializing NDI runtime in CI environment...");
+                    if let Ok(sdk_dir) = std::env::var("NDI_SDK_DIR") {
+                        eprintln!("[NDI] NDI_SDK_DIR: {}", sdk_dir);
+                    }
+                }
+            }
+
             if !unsafe { NDIlib_initialize() } {
                 // Roll the counter back and mark init as failed
                 REFCOUNT.fetch_sub(1, Ordering::SeqCst);
@@ -85,7 +97,18 @@ impl NDI {
             const MAX_SPIN: u32 = 100;
             const MAX_SLEEP_US: u64 = 1000; // 1ms max
 
+            let start = std::time::Instant::now();
+            const INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
             while !INIT.load(Ordering::SeqCst) && !INIT_FAILED.load(Ordering::SeqCst) {
+                // Check for timeout
+                if start.elapsed() > INIT_TIMEOUT {
+                    REFCOUNT.fetch_sub(1, Ordering::SeqCst);
+                    return Err(Error::InitializationFailed(
+                        "NDI initialization timed out after 30 seconds".into(),
+                    ));
+                }
+
                 if spin_count < MAX_SPIN {
                     // First, spin briefly for fast initialization
                     std::hint::spin_loop();

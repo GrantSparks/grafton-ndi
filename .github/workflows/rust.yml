@@ -72,9 +72,17 @@ jobs:
       # Run all checks
       - name: Run tests
         run: |
+          # First run diagnostic tests on Windows
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            echo "Running Windows DLL diagnostics..."
+            cargo test --test windows_dll_check -- --nocapture
+            cargo test --test diagnose_windows_ci test_ndi_environment -- --nocapture
+          fi
+          
           # Run all tests including integration tests
           # The NDI runtime libraries are now available via the setup actions
           cargo test --verbose
+        shell: bash
         env:
           TMPDIR: ${{ runner.temp }}
 
