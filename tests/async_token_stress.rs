@@ -116,7 +116,7 @@ fn test_immediate_sender_drop() -> Result<(), grafton_ndi::Error> {
         }
 
         // Flush any pending operations
-        sender.flush_async(Duration::from_secs(1))?;
+        sender.flush_async_blocking();
 
         // Now drop sender - this will block until the token is dropped
         // The fix ensures this is safe by using Arc<Inner>
@@ -157,7 +157,7 @@ fn test_flush_async() -> Result<(), grafton_ndi::Error> {
     }
 
     // Flush should succeed
-    sender.flush_async(Duration::from_secs(1))?;
+    sender.flush_async_blocking();
 
     Ok(())
 }

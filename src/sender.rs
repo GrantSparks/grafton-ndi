@@ -26,6 +26,11 @@ compile_error!(
     "This crate requires atomic pointer support. Please use a target with atomics enabled."
 );
 
+// Global mutex to serialize flush operations on Windows
+// This prevents deadlocks when multiple threads flush simultaneously
+#[cfg(target_os = "windows")]
+static FLUSH_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Internal state that is reference-counted and shared between SendInstance and tokens
 struct Inner {
     instance: NDIlib_send_instance_t,
@@ -247,6 +252,17 @@ impl Drop for AsyncVideoToken<'_> {
                         timestamp: 0,
                     };
 
+                    // On Windows, serialize flush operations to prevent deadlock
+                    #[cfg(target_os = "windows")]
+                    {
+                        let _lock = FLUSH_MUTEX.lock().unwrap();
+                        unsafe {
+                            // This blocks until all pending async operations complete
+                            NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
+                        }
+                    }
+
+                    #[cfg(not(target_os = "windows"))]
                     unsafe {
                         // This blocks until all pending async operations complete
                         NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
@@ -621,6 +637,17 @@ impl<'a> Sender<'a> {
             timestamp: 0,
         };
 
+        // On Windows, serialize flush operations to prevent deadlock
+        #[cfg(target_os = "windows")]
+        {
+            let _lock = FLUSH_MUTEX.lock().unwrap();
+            unsafe {
+                // This blocks until all pending async operations complete
+                NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
         unsafe {
             // This blocks until all pending async operations complete
             NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
@@ -763,6 +790,17 @@ impl Drop for Inner {
                     timestamp: 0,
                 };
 
+                // On Windows, serialize flush operations to prevent deadlock
+                #[cfg(target_os = "windows")]
+                {
+                    let _lock = FLUSH_MUTEX.lock().unwrap();
+                    unsafe {
+                        // This blocks until all pending async operations complete
+                        NDIlib_send_send_video_async_v2(self.instance, &null_frame);
+                    }
+                }
+
+                #[cfg(not(target_os = "windows"))]
                 unsafe {
                     // This blocks until all pending async operations complete
                     NDIlib_send_send_video_async_v2(self.instance, &null_frame);
