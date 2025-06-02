@@ -5,11 +5,6 @@ use std::time::Duration;
 
 #[test]
 fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
-    // Skip this test on Windows CI if NDI runtime is not available
-    if cfg!(target_os = "windows") && std::env::var("CI").is_ok() {
-        println!("Skipping test on Windows CI due to NDI runtime issues");
-        return Ok(());
-    }
     // Initialize NDI - do this once before spawning threads to avoid race conditions
     let ndi = Arc::new(NDI::new()?);
 
@@ -97,12 +92,6 @@ fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
 
 #[test]
 fn test_immediate_sender_drop() -> Result<(), grafton_ndi::Error> {
-    // Skip this test on Windows CI if NDI runtime is not available
-    if cfg!(target_os = "windows") && std::env::var("CI").is_ok() {
-        println!("Skipping test on Windows CI due to NDI runtime issues");
-        return Ok(());
-    }
-
     // This test specifically targets the original bug
     let ndi = NDI::new()?;
 
@@ -139,12 +128,6 @@ fn test_immediate_sender_drop() -> Result<(), grafton_ndi::Error> {
 
 #[test]
 fn test_flush_async() -> Result<(), grafton_ndi::Error> {
-    // Skip this test on Windows CI if NDI runtime is not available
-    if cfg!(target_os = "windows") && std::env::var("CI").is_ok() {
-        println!("Skipping test on Windows CI due to NDI runtime issues");
-        return Ok(());
-    }
-
     let ndi = NDI::new()?;
     let send_options = SenderOptions::builder("Flush Test")
         .clock_video(true)

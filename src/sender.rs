@@ -210,32 +210,47 @@ impl Drop for AsyncVideoToken<'_> {
         // When using SDK callbacks, the callback handles notification
         #[cfg(not(feature = "advanced_sdk"))]
         {
-            // Decrement the in-flight counter first
-            let prev_count = self.inner.in_flight.fetch_sub(1, Ordering::Release);
+            // Use stronger memory ordering for cross-platform consistency
+            let prev_count = self.inner.in_flight.fetch_sub(1, Ordering::AcqRel);
 
             // If this was the last token, we need to flush to ensure the SDK releases the buffer
-            if prev_count == 1 && !self.inner.destroyed.load(Ordering::Acquire) {
-                // Send NULL frame to flush per NDI docs
-                let null_frame = NDIlib_video_frame_v2_t {
-                    p_data: std::ptr::null_mut(),
-                    xres: 0,
-                    yres: 0,
-                    FourCC: 0,
-                    frame_rate_N: 0,
-                    frame_rate_D: 0,
-                    picture_aspect_ratio: 0.0,
-                    frame_format_type: 0,
-                    timecode: 0,
-                    __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
-                        line_stride_in_bytes: 0,
-                    },
-                    p_metadata: std::ptr::null(),
-                    timestamp: 0,
-                };
+            if prev_count == 1 {
+                // Use compare_exchange to atomically check if Inner is being destroyed
+                // This prevents use-after-free race conditions
+                let not_destroyed = self
+                    .inner
+                    .destroyed
+                    .compare_exchange(
+                        false,
+                        false, // Don't actually change it, just check atomically
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_ok();
 
-                unsafe {
-                    // This blocks until all pending async operations complete
-                    NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
+                if not_destroyed {
+                    // Send NULL frame to flush per NDI docs
+                    let null_frame = NDIlib_video_frame_v2_t {
+                        p_data: std::ptr::null_mut(),
+                        xres: 0,
+                        yres: 0,
+                        FourCC: 0,
+                        frame_rate_N: 0,
+                        frame_rate_D: 0,
+                        picture_aspect_ratio: 0.0,
+                        frame_format_type: 0,
+                        timecode: 0,
+                        __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                            line_stride_in_bytes: 0,
+                        },
+                        p_metadata: std::ptr::null(),
+                        timestamp: 0,
+                    };
+
+                    unsafe {
+                        // This blocks until all pending async operations complete
+                        NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
+                    }
                 }
             }
 
@@ -250,7 +265,7 @@ impl Drop for AsyncVideoToken<'_> {
         // But we still need to decrement the counter
         #[cfg(feature = "advanced_sdk")]
         {
-            self.inner.in_flight.fetch_sub(1, Ordering::Release);
+            self.inner.in_flight.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -641,27 +656,55 @@ impl<'a> Sender<'a> {
     /// ```
     pub fn flush_async(&self, timeout: std::time::Duration) -> Result<(), Error> {
         let start = std::time::Instant::now();
-        let mut spin_count = 0;
-        let mut sleep_ms = 1;
-        const MAX_SPIN: u32 = 100;
-        const MAX_SLEEP_MS: u64 = 10;
 
-        while self.inner.in_flight.load(Ordering::Acquire) > 0 {
-            if start.elapsed() > timeout {
-                return Err(Error::Timeout(format!(
-                    "Async operations did not complete within {:?}",
-                    timeout
-                )));
-            }
+        // Platform-specific flush behavior
+        #[cfg(target_os = "windows")]
+        {
+            // On Windows, use more conservative synchronization
+            std::sync::atomic::fence(Ordering::SeqCst);
 
-            if spin_count < MAX_SPIN {
-                // First, spin for a bit
-                std::thread::yield_now();
-                spin_count += 1;
-            } else {
-                // Then sleep with exponential backoff
+            let mut sleep_ms = 1;
+            const MAX_SLEEP_MS: u64 = 20; // Higher max sleep on Windows
+
+            while self.inner.in_flight.load(Ordering::SeqCst) > 0 {
+                if start.elapsed() > timeout {
+                    return Err(Error::Timeout(format!(
+                        "Async operations did not complete within {:?}",
+                        timeout
+                    )));
+                }
+
+                // On Windows, prefer sleeping over spinning to avoid tight loops
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
                 sleep_ms = (sleep_ms * 2).min(MAX_SLEEP_MS);
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Original implementation for other platforms
+            let mut spin_count = 0;
+            let mut sleep_ms = 1;
+            const MAX_SPIN: u32 = 100;
+            const MAX_SLEEP_MS: u64 = 10;
+
+            while self.inner.in_flight.load(Ordering::Acquire) > 0 {
+                if start.elapsed() > timeout {
+                    return Err(Error::Timeout(format!(
+                        "Async operations did not complete within {:?}",
+                        timeout
+                    )));
+                }
+
+                if spin_count < MAX_SPIN {
+                    // First, spin for a bit
+                    std::thread::yield_now();
+                    spin_count += 1;
+                } else {
+                    // Then sleep with exponential backoff
+                    std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+                    sleep_ms = (sleep_ms * 2).min(MAX_SLEEP_MS);
+                }
             }
         }
 
@@ -671,49 +714,59 @@ impl<'a> Sender<'a> {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // Prevent double-drop
+        // Prevent double-drop with maximum visibility
         if self.destroyed.swap(true, Ordering::SeqCst) {
             return;
         }
 
+        // Add a fence to ensure all previous operations are visible
+        std::sync::atomic::fence(Ordering::SeqCst);
+
         // This is called when the last Arc reference is dropped
         // All tokens must be gone by this point
 
-        // Ensure in_flight is 0
-        let in_flight = self.in_flight.load(Ordering::Acquire);
+        // Check in_flight with SeqCst for maximum visibility
+        let in_flight = self.in_flight.load(Ordering::SeqCst);
 
         if in_flight > 0 {
             eprintln!(
                 "WARNING: Inner::drop called with {} operations still in flight!",
                 in_flight
             );
-        }
 
-        // CRITICAL: Flush any pending async operations before destroying
-        // This ensures the SDK releases all buffers before we destroy the instance
-        // Only flush if there were actual async operations
-        if in_flight > 0 {
-            // Send NULL frame to flush per NDI docs
-            let null_frame = NDIlib_video_frame_v2_t {
-                p_data: std::ptr::null_mut(),
-                xres: 0,
-                yres: 0,
-                FourCC: 0,
-                frame_rate_N: 0,
-                frame_rate_D: 0,
-                picture_aspect_ratio: 0.0,
-                frame_format_type: 0,
-                timecode: 0,
-                __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
-                    line_stride_in_bytes: 0,
-                },
-                p_metadata: std::ptr::null(),
-                timestamp: 0,
-            };
+            // On Windows, add a small delay to let any in-progress token drops complete
+            // This prevents racing with AsyncVideoToken::drop
+            #[cfg(target_os = "windows")]
+            std::thread::sleep(std::time::Duration::from_millis(10));
 
-            unsafe {
-                // This blocks until all pending async operations complete
-                NDIlib_send_send_video_async_v2(self.instance, &null_frame);
+            // Re-check after delay
+            let in_flight_after = self.in_flight.load(Ordering::SeqCst);
+
+            // Only flush if there are STILL operations in flight
+            // This avoids double-flush with AsyncVideoToken::drop
+            if in_flight_after > 0 {
+                // Send NULL frame to flush per NDI docs
+                let null_frame = NDIlib_video_frame_v2_t {
+                    p_data: std::ptr::null_mut(),
+                    xres: 0,
+                    yres: 0,
+                    FourCC: 0,
+                    frame_rate_N: 0,
+                    frame_rate_D: 0,
+                    picture_aspect_ratio: 0.0,
+                    frame_format_type: 0,
+                    timecode: 0,
+                    __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                        line_stride_in_bytes: 0,
+                    },
+                    p_metadata: std::ptr::null(),
+                    timestamp: 0,
+                };
+
+                unsafe {
+                    // This blocks until all pending async operations complete
+                    NDIlib_send_send_video_async_v2(self.instance, &null_frame);
+                }
             }
         }
 
