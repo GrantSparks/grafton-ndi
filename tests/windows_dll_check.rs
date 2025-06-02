@@ -1,9 +1,7 @@
 #[cfg(target_os = "windows")]
 #[test]
 fn test_ndi_dll_availability() {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-    use std::ptr;
+    use std::os::windows::ffi::OsStrExt;
 
     // Windows API bindings
     #[link(name = "kernel32")]
@@ -14,7 +12,8 @@ fn test_ndi_dll_availability() {
     }
 
     fn to_wide_string(s: &str) -> Vec<u16> {
-        OsString::from(s).encode_wide().chain(Some(0)).collect()
+        use std::ffi::OsStr;
+        OsStr::new(s).encode_wide().chain(Some(0)).collect()
     }
 
     println!("=== Windows DLL Availability Check ===");
