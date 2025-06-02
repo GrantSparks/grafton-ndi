@@ -2,6 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/grafton-ndi.svg)](https://crates.io/crates/grafton-ndi)
 [![Documentation](https://docs.rs/grafton-ndi/badge.svg)](https://docs.rs/grafton-ndi)
+[![CI](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml/badge.svg)](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml)
 [![License](https://img.shields.io/crates/l/grafton-ndi.svg)](https://github.com/GrantSparks/grafton-ndi/blob/main/LICENSE)
 [![Minimum Rust Version](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
@@ -14,7 +15,7 @@ High-performance, idiomatic Rust bindings for the [NDI® 6 SDK](https://ndi.vide
 - **Thread-safe by design** - Safe concurrent access with Rust's ownership model  
 - **Ergonomic API** - Builder patterns and idiomatic Rust interfaces
 - **Comprehensive type safety** - Strongly-typed color formats and frame types
-- **Cross-platform** - Windows, Linux, and macOS support
+- **Cross-platform** - Full support for Windows, Linux, and macOS
 - **Battle-tested** - Used in production video streaming applications
 - **Advanced SDK support** - Optional features for NDI Advanced SDK users
 
@@ -60,7 +61,7 @@ grafton-ndi = "0.8"
 1. **NDI SDK**: Download and install the [NDI SDK](https://ndi.video/type/developer/) for your platform.
    - Windows: Installs to `C:\Program Files\NDI\NDI 6 SDK` by default
    - Linux: Extract to `/usr/share/NDI SDK for Linux` or set `NDI_SDK_DIR`
-   - macOS: Install and set `NDI_SDK_DIR` environment variable
+   - macOS: Installs to `/Library/NDI SDK for Apple` by default
 
 2. **Rust**: Requires Rust 1.75 or later
 

@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Full macOS Support**: Complete CI/CD pipeline for macOS platform
+  - Automated NDI SDK installation for macOS in GitHub Actions
+  - Support for NDI SDK installed at `/Library/NDI SDK for Apple`
+  - Platform-specific library paths (`lib/macOS`)
+  - Comprehensive testing on macOS runners
+
+### Fixed
+- macOS CI workflow to properly detect and use NDI SDK
+- Build script to handle macOS-specific SDK locations
+- Library path detection for macOS platform
+
 ## [0.8.0] - 2025-05-28
 
 ### Added
