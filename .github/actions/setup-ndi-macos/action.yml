@@ -15,7 +15,8 @@ runs:
         # Expected SHA256 hash of NDI SDK installer for macOS
         expected='701609952EE081720DDF6E812C50EDE0F606C20F17F81B632608D7CC3579F5C0'
         ndiHash=$(echo $expected | cut -c1-8)  # Use first 8 chars for cache key
-        echo "key=deps-${{ env.CACHE_VERSION }}-${ndiHash}-${{ runner.os }}" >> $GITHUB_OUTPUT
+        # Bump cache version to invalidate old empty cache
+        echo "key=deps-v2-${ndiHash}-${{ runner.os }}" >> $GITHUB_OUTPUT
         echo "expected_hash=$expected" >> $GITHUB_OUTPUT
       shell: bash
 
@@ -315,10 +316,20 @@ runs:
         NDI_SDK_DIR="${{ runner.temp }}/ndi-sdk"
         echo "Verifying NDI SDK at: $NDI_SDK_DIR"
         
+        # Check if the directory exists and has the expected files
+        if [ -d "$NDI_SDK_DIR" ]; then
+          echo "NDI SDK directory exists. Contents:"
+          ls -la "$NDI_SDK_DIR" | head -10 || true
+          
+          # Check if it actually contains the SDK
+          if [ ! -f "$NDI_SDK_DIR/include/Processing.NDI.Lib.h" ]; then
+            echo "Warning: NDI SDK directory exists but is missing expected files"
+            rm -rf "$NDI_SDK_DIR"
+          fi
+        fi
+        
         if [ ! -d "$NDI_SDK_DIR" ] || [ ! -f "$NDI_SDK_DIR/include/Processing.NDI.Lib.h" ]; then
-          echo "Error: NDI SDK not found at expected location after installation/cache restore"
-          echo "Contents of runner.temp:"
-          ls -la "${{ runner.temp }}" || true
+          echo "NDI SDK not found or incomplete at expected location"
           
           # If it's at the system location, copy it
           if [ -d "/Library/NDI SDK for Apple" ] && [ -f "/Library/NDI SDK for Apple/include/Processing.NDI.Lib.h" ]; then
@@ -326,13 +337,36 @@ runs:
             mkdir -p "$NDI_SDK_DIR"
             cp -R "/Library/NDI SDK for Apple"/* "$NDI_SDK_DIR/"
           else
-            echo "NDI SDK not found anywhere!"
-            exit 1
+            echo "NDI SDK not found at system location either"
+            echo "Need to install NDI SDK..."
+            
+            # Install it
+            NDI_SDK_INSTALLER="${{ runner.temp }}/NDI_SDK_Installer.pkg"
+            NDI_SDK_URL="${{ env.NDI_SDK_URL_MACOS }}"
+            if [ -z "$NDI_SDK_URL" ]; then
+              NDI_SDK_URL="https://downloads.ndi.tv/SDK/NDI_SDK_Mac/Install_NDI_SDK_v6_Apple.pkg"
+            fi
+            
+            echo "Downloading NDI SDK from: $NDI_SDK_URL"
+            curl -L -o "$NDI_SDK_INSTALLER" "$NDI_SDK_URL" || exit 1
+            
+            echo "Installing NDI SDK..."
+            sudo installer -pkg "$NDI_SDK_INSTALLER" -target / -allowUntrusted || exit 1
+            rm -f "$NDI_SDK_INSTALLER"
+            
+            # Now copy it
+            if [ -d "/Library/NDI SDK for Apple" ]; then
+              echo "Copying installed SDK to cache location..."
+              cp -R "/Library/NDI SDK for Apple"/* "$NDI_SDK_DIR/"
+            else
+              echo "Error: SDK installation failed"
+              exit 1
+            fi
           fi
         fi
         
         echo "NDI SDK verified at: $NDI_SDK_DIR"
-        echo "Contents:"
+        echo "Final contents:"
         ls -la "$NDI_SDK_DIR" | head -10
       shell: bash
 
