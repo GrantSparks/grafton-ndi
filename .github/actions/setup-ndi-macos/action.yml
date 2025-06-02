@@ -59,7 +59,22 @@ runs:
         
         # First, let's see what's in the package
         echo "Package info:"
-        pkgutil --payload-files "$NDI_SDK_INSTALLER" 2>/dev/null | head -20 || echo "Could not list package contents"
+        echo "Checking package structure..."
+        # Try to expand the package temporarily to see its structure
+        mkdir -p "${{ runner.temp }}/pkg-check"
+        pkgutil --expand "$NDI_SDK_INSTALLER" "${{ runner.temp }}/pkg-check" 2>/dev/null || echo "Could not expand package"
+        
+        if [ -d "${{ runner.temp }}/pkg-check" ]; then
+          echo "Package structure:"
+          find "${{ runner.temp }}/pkg-check" -type f -name "*.plist" | while read plist; do
+            echo "Found plist: $plist"
+            cat "$plist" | grep -A2 -B2 "identifier\|InstallPrefix" || true
+          done
+          rm -rf "${{ runner.temp }}/pkg-check"
+        fi
+        
+        echo "Package payload files (first 30):"
+        pkgutil --payload-files "$NDI_SDK_INSTALLER" 2>/dev/null | head -30 || echo "Could not list package contents"
         
         # Use the standard macOS installer command with verbose output
         # This will install to the default system location
@@ -171,10 +186,25 @@ runs:
           echo ""
           echo "Checking installed packages:"
           pkgutil --pkgs | grep -i ndi || echo "No NDI packages found"
+          pkgutil --pkgs | grep -i newtek || echo "No NewTek packages found"
           
           echo ""
-          echo "Package install location (if any):"
-          pkgutil --pkg-info com.newtek.ndi.sdk 2>/dev/null || echo "Package info not found"
+          echo "Package install locations:"
+          for pkg in $(pkgutil --pkgs | grep -i ndi); do
+            echo "Package: $pkg"
+            pkgutil --pkg-info "$pkg" 2>/dev/null || echo "  Could not get info"
+            echo "  Files:"
+            pkgutil --files "$pkg" 2>/dev/null | head -20 || echo "  Could not list files"
+            echo ""
+          done
+          
+          for pkg in $(pkgutil --pkgs | grep -i newtek); do
+            echo "Package: $pkg"
+            pkgutil --pkg-info "$pkg" 2>/dev/null || echo "  Could not get info"
+            echo "  Files:"
+            pkgutil --files "$pkg" 2>/dev/null | head -20 || echo "  Could not list files"
+            echo ""
+          done
           
           exit 1
         fi
