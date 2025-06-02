@@ -16,6 +16,7 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
   NDI_SDK_URL: ${{ secrets.NDI_SDK_URL || 'https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe' }}
+  NDI_SDK_URL_MACOS: ${{ secrets.NDI_SDK_URL_MACOS || 'https://downloads.ndi.tv/SDK/NDI_SDK_Mac/Install_NDI_SDK_v6_Apple.pkg' }}
   LLVM_VERSION: "18.1.8"
   CACHE_VERSION: v1
 
@@ -34,12 +35,22 @@ jobs:
   # Combined setup and test job
   test-and-lint:
     name: Test & Lint
-    runs-on: windows-latest
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      # Setup NDI SDK and LLVM (only this job saves cache)
+      # Setup NDI SDK (Windows)
       - uses: ./.github/actions/setup-ndi-windows
+        if: runner.os == 'Windows'
+        with:
+          save-cache: 'true'
+
+      # Setup NDI SDK (macOS)
+      - uses: ./.github/actions/setup-ndi-macos
+        if: runner.os == 'macOS'
         with:
           save-cache: 'true'
 
@@ -54,7 +65,7 @@ jobs:
           # Don't cache the entire target directory, just dependencies
           cache-targets: false
           # Use a shared cache key to avoid saving the same dependencies multiple times
-          shared-key: "rust-cache-windows"
+          shared-key: "rust-cache-${{ matrix.os }}"
           # Only save cache on main branch to avoid cache thrashing
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -76,15 +87,25 @@ jobs:
       - name: Build examples
         run: cargo build --examples
 
-  # Semver check runs on Windows with same NDI SDK setup
+  # Semver check runs on both Windows and macOS
   semver:
     name: Check semver
-    runs-on: windows-latest
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      # Setup NDI SDK and LLVM
+      # Setup NDI SDK (Windows)
       - uses: ./.github/actions/setup-ndi-windows
+        if: runner.os == 'Windows'
+        with:
+          save-cache: 'false'
+
+      # Setup NDI SDK (macOS)
+      - uses: ./.github/actions/setup-ndi-macos
+        if: runner.os == 'macOS'
         with:
           save-cache: 'false'
 
@@ -94,7 +115,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
-          shared-key: "rust-cache-windows"
+          shared-key: "rust-cache-${{ matrix.os }}"
           save-if: false  # Let test-and-lint job handle saving
 
       - uses: obi1kenobi/cargo-semver-checks-action@v2

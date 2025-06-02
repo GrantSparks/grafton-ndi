@@ -1,0 +1,173 @@
+name: 'Setup NDI SDK on macOS'
+description: 'Install NDI SDK for building grafton-ndi on macOS'
+inputs:
+  save-cache:
+    description: 'Whether to save the cache after installation'
+    required: false
+    default: 'true'
+runs:
+  using: "composite"
+  steps:
+    # Generate cache key for all dependencies
+    - name: Generate cache key
+      id: cache-key
+      run: |
+        # Expected SHA256 hash of NDI SDK installer for macOS
+        expected='701609952EE081720DDF6E812C50EDE0F606C20F17F81B632608D7CC3579F5C0'
+        ndiHash=$(echo $expected | cut -c1-8)  # Use first 8 chars for cache key
+        echo "key=deps-${{ env.CACHE_VERSION }}-${ndiHash}-${{ runner.os }}" >> $GITHUB_OUTPUT
+        echo "expected_hash=$expected" >> $GITHUB_OUTPUT
+      shell: bash
+
+    # Restore cache if available
+    - name: Restore cache
+      id: cache-restore
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ${{ runner.temp }}/ndi-sdk
+        key: ${{ steps.cache-key.outputs.key }}
+
+    # Install NDI SDK if not cached
+    - name: Download and Install NDI SDK
+      if: steps.cache-restore.outputs.cache-hit != 'true'
+      run: |
+        NDI_SDK_DIR="${{ runner.temp }}/ndi-sdk"
+        NDI_SDK_INSTALLER="${{ runner.temp }}/NDI_SDK_Installer.pkg"
+        
+        # Use macOS-specific NDI SDK URL
+        NDI_SDK_URL="${{ env.NDI_SDK_URL_MACOS }}"
+        
+        echo "Downloading NDI SDK..."
+        curl -L -o "$NDI_SDK_INSTALLER" "$NDI_SDK_URL"
+        
+        # Verify SHA256 hash
+        echo "Verifying NDI SDK integrity..."
+        expected='${{ steps.cache-key.outputs.expected_hash }}'
+        actual=$(shasum -a 256 "$NDI_SDK_INSTALLER" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')
+        expected_upper=$(echo "$expected" | tr '[:lower:]' '[:upper:]')
+        if [ "$actual" != "$expected_upper" ]; then
+          echo "NDI SDK hash mismatch! Expected: $expected_upper, Got: $actual"
+          exit 1
+        fi
+        echo "✓ NDI SDK hash verified"
+        
+        echo "Installing NDI SDK to: $NDI_SDK_DIR"
+        mkdir -p "$NDI_SDK_DIR"
+        
+        # Extract the pkg installer
+        # First, try using pkgutil (standard on macOS)
+        if command -v pkgutil >/dev/null 2>&1; then
+          echo "Using pkgutil to expand package..."
+          pkgutil --expand "$NDI_SDK_INSTALLER" "${{ runner.temp }}/ndi-expanded"
+          
+          # Find and extract all Payload files
+          if [ -d "${{ runner.temp }}/ndi-expanded" ]; then
+            # Look for Payload files and extract them
+            find "${{ runner.temp }}/ndi-expanded" -name "Payload" -type f | while read payload; do
+              echo "Extracting payload: $payload"
+              cd "$NDI_SDK_DIR"
+              if command -v cpio >/dev/null 2>&1; then
+                cpio -idm < "$payload" 2>/dev/null || true
+              else
+                # Fallback to tar if cpio is not available
+                tar -xf "$payload" 2>/dev/null || true
+              fi
+            done
+          fi
+          
+          rm -rf "${{ runner.temp }}/ndi-expanded"
+        else
+          # Fallback: try using xar if available
+          if command -v xar >/dev/null 2>&1; then
+            echo "Using xar to extract package..."
+            cd "${{ runner.temp }}"
+            xar -xf "$NDI_SDK_INSTALLER"
+            
+            # Extract the main package
+            if [ -f "ndisdk.pkg/Payload" ]; then
+              cd "$NDI_SDK_DIR"
+              gunzip -c "${{ runner.temp }}/ndisdk.pkg/Payload" | cpio -idm 2>/dev/null || true
+            fi
+            
+            # Clean up
+            rm -rf "${{ runner.temp }}"/*.pkg
+          else
+            echo "Warning: Neither pkgutil nor xar found, attempting direct installation..."
+            # As last resort, try direct installation (requires sudo on runners)
+            sudo installer -pkg "$NDI_SDK_INSTALLER" -target / -allowUntrusted || true
+          fi
+        fi
+        
+        rm -f "$NDI_SDK_INSTALLER"
+        
+        # Look for NDI SDK in multiple possible locations
+        NDI_LOCATIONS=(
+          "$NDI_SDK_DIR"
+          "/Library/NDI SDK for Apple"
+          "/Applications/NDI SDK for Apple"
+          "/usr/local/ndi"
+          "$HOME/Library/NDI SDK for Apple"
+        )
+        
+        FOUND_SDK=false
+        for location in "${NDI_LOCATIONS[@]}"; do
+          if [ -f "$location/include/Processing.NDI.Lib.h" ] || [ -f "$location/include/Processing.NDI.Lib.h" ]; then
+            echo "Found NDI SDK at: $location"
+            if [ "$location" != "$NDI_SDK_DIR" ]; then
+              echo "Creating symlinks from $location to $NDI_SDK_DIR"
+              mkdir -p "$NDI_SDK_DIR"
+              ln -sf "$location"/* "$NDI_SDK_DIR/" 2>/dev/null || cp -R "$location"/* "$NDI_SDK_DIR/"
+            fi
+            FOUND_SDK=true
+            break
+          fi
+        done
+        
+        if [ "$FOUND_SDK" = false ]; then
+          echo "NDI SDK installation failed - header file not found in any expected location"
+          echo "Searched locations:"
+          for location in "${NDI_LOCATIONS[@]}"; do
+            echo "  - $location"
+            ls -la "$location" 2>/dev/null || echo "    (not found)"
+          done
+          exit 1
+        fi
+        
+        echo "✓ NDI SDK installed successfully"
+      shell: bash
+
+    # Setup environment
+    - name: Setup environment
+      run: |
+        NDI_SDK_DIR="${{ runner.temp }}/ndi-sdk"
+        echo "NDI_SDK_DIR=$NDI_SDK_DIR" >> $GITHUB_ENV
+        
+        # Add binary paths if they exist
+        [ -d "$NDI_SDK_DIR/bin" ] && echo "$NDI_SDK_DIR/bin" >> $GITHUB_PATH
+        [ -d "$NDI_SDK_DIR/Bin" ] && echo "$NDI_SDK_DIR/Bin" >> $GITHUB_PATH
+        
+        # Set up library paths for macOS
+        LIB_PATHS=""
+        [ -d "$NDI_SDK_DIR/lib" ] && LIB_PATHS="$NDI_SDK_DIR/lib:$LIB_PATHS"
+        [ -d "$NDI_SDK_DIR/Lib" ] && LIB_PATHS="$NDI_SDK_DIR/Lib:$LIB_PATHS"
+        
+        if [ -n "$LIB_PATHS" ]; then
+          echo "DYLD_LIBRARY_PATH=${LIB_PATHS}${DYLD_LIBRARY_PATH}" >> $GITHUB_ENV
+        fi
+        
+        # Log the setup for debugging
+        echo "NDI SDK setup complete. Environment:"
+        echo "  NDI_SDK_DIR: $NDI_SDK_DIR"
+        echo "  Binary paths added: $([ -d "$NDI_SDK_DIR/bin" ] && echo "$NDI_SDK_DIR/bin") $([ -d "$NDI_SDK_DIR/Bin" ] && echo "$NDI_SDK_DIR/Bin")"
+        echo "  Library paths: $LIB_PATHS"
+      shell: bash
+
+    # Save cache only from test-and-lint job on main branch
+    - name: Save cache
+      if: inputs.save-cache == 'true' && steps.cache-restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.job == 'test-and-lint'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ${{ runner.temp }}/ndi-sdk
+        key: ${{ steps.cache-key.outputs.key }}
