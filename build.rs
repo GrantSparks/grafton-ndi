@@ -6,8 +6,10 @@ use std::path::{Path, PathBuf};
 fn main() {
     // Determine the base NDI SDK directory.
     let ndi_sdk_path = env::var("NDI_SDK_DIR").unwrap_or_else(|_| {
-        if cfg!(unix) {
-            // For Unix, try the Advanced SDK directory first.
+        if cfg!(target_os = "macos") {
+            "/Library/NDI SDK for Apple".to_string()
+        } else if cfg!(target_os = "linux") {
+            // For Linux, try the Advanced SDK directory first.
             let advanced = "/usr/share/NDI Advanced SDK for Linux";
             let standard = "/usr/share/NDI SDK for Linux";
             if Path::new(advanced).exists() {
@@ -15,7 +17,7 @@ fn main() {
             } else {
                 standard.to_string()
             }
-        } else if cfg!(windows) {
+        } else if cfg!(target_os = "windows") {
             // NDI 6 SDK default installation path
             "C:\\Program Files\\NDI\\NDI 6 SDK".to_string()
         } else {
@@ -23,8 +25,8 @@ fn main() {
         }
     });
 
-    // Determine if we're using the Advanced SDK (only relevant on Unix).
-    let is_advanced = if cfg!(unix) {
+    // Determine if we're using the Advanced SDK (only relevant on Linux).
+    let is_advanced = if cfg!(target_os = "linux") {
         ndi_sdk_path.to_lowercase().contains("advanced")
     } else {
         false
@@ -52,13 +54,15 @@ fn main() {
     let main_header = wrapper_path.to_str().unwrap().to_string();
 
     // Determine the library name and linking type based on the platform.
-    let (lib_name, link_type) = if cfg!(unix) {
+    let (lib_name, link_type) = if cfg!(target_os = "macos") {
+        ("ndi", "dylib")
+    } else if cfg!(target_os = "linux") {
         if is_advanced {
             ("ndi_advanced", "dylib")
         } else {
             ("ndi", "dylib")
         }
-    } else if cfg!(windows) {
+    } else if cfg!(target_os = "windows") {
         let target = env::var("TARGET").expect("TARGET environment variable not set");
         if target.contains("x86_64") {
             ("Processing.NDI.Lib.x64", "static")
@@ -69,8 +73,8 @@ fn main() {
         panic!("Unsupported platform");
     };
 
-    // Add library directory path for both platforms.
-    if cfg!(windows) {
+    // Add library directory path for all platforms.
+    if cfg!(target_os = "windows") {
         let target = env::var("TARGET").expect("TARGET environment variable not set");
         let lib_subdir = if target.contains("x86_64") {
             "x64"
@@ -79,9 +83,13 @@ fn main() {
         };
         let lib_path = format!("{}\\lib\\{}", ndi_sdk_path, lib_subdir);
         println!("cargo:rustc-link-search=native={}", lib_path);
-    } else if cfg!(unix) {
+    } else if cfg!(target_os = "linux") {
         // For Linux, add the library search path
         let lib_path = format!("{}/lib/x86_64-linux-gnu", ndi_sdk_path);
+        println!("cargo:rustc-link-search=native={}", lib_path);
+    } else if cfg!(target_os = "macos") {
+        // For macOS, add the library search path
+        let lib_path = format!("{}/lib", ndi_sdk_path);
         println!("cargo:rustc-link-search=native={}", lib_path);
     }
 
