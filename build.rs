@@ -89,8 +89,15 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", lib_path);
     } else if cfg!(target_os = "macos") {
         // For macOS, add the library search path
-        let lib_path = format!("{}/lib", ndi_sdk_path);
-        println!("cargo:rustc-link-search=native={}", lib_path);
+        // NDI SDK on macOS often has libraries in lib/macOS subdirectory
+        let lib_macos = format!("{}/lib/macOS", ndi_sdk_path);
+        let lib_base = format!("{}/lib", ndi_sdk_path);
+
+        if Path::new(&lib_macos).exists() {
+            println!("cargo:rustc-link-search=native={}", lib_macos);
+        } else {
+            println!("cargo:rustc-link-search=native={}", lib_base);
+        }
     }
 
     // Inform Cargo about the library to link against.

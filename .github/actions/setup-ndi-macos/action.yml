@@ -71,6 +71,12 @@ runs:
         ls -la /Applications/ | grep -i ndi || true
         ls -la /usr/local/ | grep -i ndi || true
         
+        # More specific search for NDI SDK directory
+        echo ""
+        echo "Searching for NDI SDK directories:"
+        find /Library -maxdepth 2 -name "*NDI*" -type d 2>/dev/null || true
+        find /Applications -maxdepth 2 -name "*NDI*" -type d 2>/dev/null || true
+        
         # Look for NDI SDK in multiple possible locations
         NDI_LOCATIONS=(
           "/Library/NDI SDK for Apple"
@@ -90,7 +96,7 @@ runs:
             if [ "$location" != "$NDI_SDK_DIR" ]; then
               echo "Creating symlinks from $location to $NDI_SDK_DIR"
               mkdir -p "$NDI_SDK_DIR"
-              ln -sf "$location"/* "$NDI_SDK_DIR/" 2>/dev/null || cp -R "$location"/* "$NDI_SDK_DIR/"
+              cp -R "$location"/* "$NDI_SDK_DIR/"
             fi
             FOUND_SDK=true
             break
@@ -125,6 +131,21 @@ runs:
         fi
         
         echo "✓ NDI SDK installed successfully"
+        
+        # Debug: Show what was actually installed
+        echo ""
+        echo "NDI SDK contents at $NDI_SDK_DIR:"
+        ls -la "$NDI_SDK_DIR" || true
+        if [ -d "$NDI_SDK_DIR/lib" ]; then
+          echo ""
+          echo "Library directory contents:"
+          ls -la "$NDI_SDK_DIR/lib/" || true
+          if [ -d "$NDI_SDK_DIR/lib/macOS" ]; then
+            echo ""
+            echo "macOS library directory contents:"
+            ls -la "$NDI_SDK_DIR/lib/macOS/" || true
+          fi
+        fi
       shell: bash
 
     # Setup environment
@@ -139,8 +160,16 @@ runs:
         
         # Set up library paths for macOS
         LIB_PATHS=""
-        [ -d "$NDI_SDK_DIR/lib" ] && LIB_PATHS="$NDI_SDK_DIR/lib:$LIB_PATHS"
-        [ -d "$NDI_SDK_DIR/Lib" ] && LIB_PATHS="$NDI_SDK_DIR/Lib:$LIB_PATHS"
+        # Check for macOS-specific library subdirectory
+        if [ -d "$NDI_SDK_DIR/lib/macOS" ]; then
+          LIB_PATHS="$NDI_SDK_DIR/lib/macOS:$LIB_PATHS"
+          echo "Found macOS library directory: $NDI_SDK_DIR/lib/macOS"
+          ls -la "$NDI_SDK_DIR/lib/macOS/" | grep -E "\.(dylib|a)$" || true
+        elif [ -d "$NDI_SDK_DIR/lib" ]; then
+          LIB_PATHS="$NDI_SDK_DIR/lib:$LIB_PATHS"
+          echo "Found library directory: $NDI_SDK_DIR/lib"
+          ls -la "$NDI_SDK_DIR/lib/" | grep -E "\.(dylib|a)$" || true
+        fi
         
         if [ -n "$LIB_PATHS" ]; then
           echo "DYLD_LIBRARY_PATH=${LIB_PATHS}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" >> $GITHUB_ENV
@@ -151,6 +180,19 @@ runs:
         echo "  NDI_SDK_DIR: $NDI_SDK_DIR"
         echo "  Binary paths added: $([ -d "$NDI_SDK_DIR/bin" ] && echo "$NDI_SDK_DIR/bin") $([ -d "$NDI_SDK_DIR/Bin" ] && echo "$NDI_SDK_DIR/Bin")"
         echo "  Library paths: $LIB_PATHS"
+        
+        # Verify NDI library can be found
+        if [ -n "$LIB_PATHS" ]; then
+          echo ""
+          echo "Verifying NDI library files:"
+          for path in $(echo $LIB_PATHS | tr ':' ' '); do
+            if [ -d "$path" ]; then
+              echo "  Checking $path:"
+              ls -la "$path"/*.dylib 2>/dev/null || echo "    No .dylib files found"
+              ls -la "$path"/*.a 2>/dev/null || echo "    No .a files found"
+            fi
+          done
+        fi
       shell: bash
 
     # Save cache only from test-and-lint job on main branch
