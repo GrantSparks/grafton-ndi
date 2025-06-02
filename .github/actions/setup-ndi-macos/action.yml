@@ -41,8 +41,20 @@ runs:
           NDI_SDK_URL="https://downloads.ndi.tv/SDK/NDI_SDK_Mac/Install_NDI_SDK_v6_Apple.pkg"
         fi
         
-        echo "Downloading NDI SDK..."
-        curl -L -o "$NDI_SDK_INSTALLER" "$NDI_SDK_URL"
+        echo "Downloading NDI SDK from: $NDI_SDK_URL"
+        curl -L -o "$NDI_SDK_INSTALLER" "$NDI_SDK_URL" || {
+          echo "Error: Failed to download NDI SDK"
+          exit 1
+        }
+        
+        # Verify the download
+        if [ ! -f "$NDI_SDK_INSTALLER" ]; then
+          echo "Error: NDI SDK installer not found after download"
+          exit 1
+        fi
+        
+        echo "Download complete. File size:"
+        ls -lh "$NDI_SDK_INSTALLER"
         
         # Verify SHA256 hash
         echo "Verifying NDI SDK integrity..."
@@ -76,12 +88,23 @@ runs:
         echo "Package payload files (first 30):"
         pkgutil --payload-files "$NDI_SDK_INSTALLER" 2>/dev/null | head -30 || echo "Could not list package contents"
         
+        # Check what volumes are available
+        echo "Available volumes:"
+        ls -la /Volumes/ || true
+        
         # Use the standard macOS installer command with verbose output
         # This will install to the default system location
+        echo "Installing package..."
         sudo installer -pkg "$NDI_SDK_INSTALLER" -target / -allowUntrusted -verbose || {
           echo "Error: Failed to install NDI SDK package"
+          # Try to get more info about the failure
+          echo "Checking installer logs:"
+          tail -50 /var/log/install.log 2>/dev/null || true
           exit 1
         }
+        
+        echo "Installation complete. Waiting a moment for filesystem to settle..."
+        sleep 2
         
         rm -f "$NDI_SDK_INSTALLER"
         
@@ -182,6 +205,14 @@ runs:
           echo "Searching for any header files with NDI in the name:"
           find /Library -name "*NDI*.h" -type f 2>/dev/null | head -20 || true
           find /Applications -name "*NDI*.h" -type f 2>/dev/null | head -20 || true
+          
+          echo ""
+          echo "Trying broader search for Processing.NDI files:"
+          find / -name "Processing.NDI*" -type f 2>/dev/null | grep -v "Permission denied" | head -20 || true
+          
+          echo ""
+          echo "Looking for any directory with 'NDI' and 'SDK' in the name:"
+          find / -type d -name "*NDI*SDK*" -o -name "*SDK*NDI*" 2>/dev/null | grep -v "Permission denied" | head -20 || true
           
           echo ""
           echo "Checking installed packages:"
