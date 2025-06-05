@@ -93,9 +93,9 @@
 
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
-#![allow(clippy::wildcard_imports)] // We use wildcard imports for FFI bindings
-#![allow(clippy::must_use_candidate)] // Too many false positives
-#![allow(clippy::missing_errors_doc)] // Error types are self-documenting
+#![allow(clippy::wildcard_imports)]
+#![allow(clippy::must_use_candidate)]
+#![allow(clippy::missing_errors_doc)]
 
 // Internal modules
 mod error;
@@ -108,21 +108,24 @@ pub mod receiver;
 pub mod runtime;
 pub mod sender;
 
-// Re-export main types from modules
-pub use error::*;
-pub use finder::{Finder, FinderOptions, FinderOptionsBuilder, Source, SourceAddress};
-pub use frames::{
-    AudioFrame, AudioFrameBuilder, AudioType, FourCCVideoType, FrameFormatType, LineStrideOrSize,
-    MetadataFrame, VideoFrame, VideoFrameBuilder,
+// Re-exports
+pub use {
+    error::*,
+    finder::{Finder, FinderOptions, FinderOptionsBuilder, Source, SourceAddress},
+    frames::{
+        AudioFrame, AudioFrameBuilder, AudioType, FourCCVideoType, FrameFormatType,
+        LineStrideOrSize, MetadataFrame, VideoFrame, VideoFrameBuilder,
+    },
+    receiver::{
+        FrameType, Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions,
+        ReceiverOptionsBuilder, ReceiverStatus, Tally,
+    },
+    runtime::NDI,
+    sender::{AsyncVideoToken, BorrowedVideoFrame, Sender, SenderOptions, SenderOptionsBuilder},
 };
-pub use receiver::{
-    FrameType, Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions,
-    ReceiverOptionsBuilder, ReceiverStatus, Tally,
-};
-pub use runtime::NDI;
-pub use sender::{
-    AsyncVideoToken, BorrowedVideoFrame, Sender, SenderOptions, SenderOptionsBuilder,
-};
+
+/// Alias for Result with our Error type
+pub type Result<T> = std::result::Result<T, crate::error::Error>;
 
 // Tests
 #[cfg(test)]

@@ -1,14 +1,14 @@
 //! Unit tests for the grafton-ndi library.
 
+use std::ptr;
+
 use crate::{
     error::Error,
     frames::{AudioFrame, VideoFrame},
     ndi_lib::*,
     receiver::{ReceiverStatus, Tally},
 };
-use std::ptr;
 
-// Helper function to create a test video frame
 fn create_test_video_frame(
     width: i32,
     height: i32,

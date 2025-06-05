@@ -8,9 +8,10 @@
 //!
 //! Run with: `cargo run --example NDIlib_Recv_Audio`
 
-use grafton_ndi::{Error, Finder, FinderOptions, ReceiverBandwidth, ReceiverOptions, NDI};
 use std::thread;
 use std::time::Duration;
+
+use grafton_ndi::{Error, Finder, FinderOptions, ReceiverBandwidth, ReceiverOptions, NDI};
 
 fn main() -> Result<(), Error> {
     println!("NDI Audio Receiver Example (32-bit float)");

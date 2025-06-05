@@ -1,14 +1,17 @@
 //! Frame types for video, audio, and metadata.
 
-use crate::{error::Error, ndi_lib::*, receiver::Receiver};
-use num_enum::{IntoPrimitive, TryFromPrimitive};
 use std::{
     borrow::Cow,
     ffi::{CStr, CString},
     fmt,
+    marker::PhantomData,
     os::raw::c_char,
-    ptr,
+    ptr, slice,
 };
+
+use num_enum::{IntoPrimitive, TryFromPrimitive};
+
+use crate::{ndi_lib::*, receiver::Receiver, Error, Result};
 
 /// Video pixel format identifiers (FourCC codes).
 ///
@@ -54,7 +57,6 @@ pub enum FourCCVideoType {
     Max = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_max as _,
 }
 
-// Platform-specific conversions for Windows compatibility
 impl From<FourCCVideoType> for i32 {
     fn from(value: FourCCVideoType) -> Self {
         let u32_value: u32 = value.into();
@@ -147,7 +149,7 @@ pub struct VideoFrame<'rx> {
     pub(crate) recv_instance: Option<NDIlib_recv_instance_t>,
     // Store original SDK data pointer for proper freeing
     pub(crate) original_p_data: Option<*mut u8>,
-    pub(crate) _origin: std::marker::PhantomData<&'rx Receiver<'rx>>,
+    pub(crate) _origin: PhantomData<&'rx Receiver<'rx>>,
 }
 
 impl fmt::Debug for VideoFrame<'_> {
@@ -212,7 +214,7 @@ impl<'rx> VideoFrame<'rx> {
     pub unsafe fn from_raw(
         c_frame: &NDIlib_video_frame_v2_t,
         recv_instance: Option<NDIlib_recv_instance_t>,
-    ) -> Result<VideoFrame<'static>, Error> {
+    ) -> Result<VideoFrame<'static>> {
         if c_frame.p_data.is_null() {
             return Err(Error::InvalidFrame(
                 "Video frame has null data pointer".into(),
@@ -229,21 +231,8 @@ impl<'rx> VideoFrame<'rx> {
         let data_size_in_bytes = c_frame.__bindgen_anon_1.data_size_in_bytes;
         let line_stride = c_frame.__bindgen_anon_1.line_stride_in_bytes;
 
-        // Determine if this is an uncompressed format using a whitelist
-        let is_uncompressed = matches!(
-            fourcc,
-            FourCCVideoType::BGRA
-                | FourCCVideoType::BGRX
-                | FourCCVideoType::RGBA
-                | FourCCVideoType::RGBX
-                | FourCCVideoType::UYVY
-                | FourCCVideoType::UYVA
-                | FourCCVideoType::YV12
-                | FourCCVideoType::I420
-                | FourCCVideoType::NV12
-                | FourCCVideoType::P216
-                | FourCCVideoType::PA16
-        );
+        // Determine if this is an uncompressed format
+        let is_uncompressed = is_uncompressed_format(fourcc);
 
         let (data_size, line_stride_or_size) =
             if is_uncompressed && line_stride > 0 && c_frame.yres > 0 {
@@ -290,11 +279,11 @@ impl<'rx> VideoFrame<'rx> {
         // For zero-copy: just borrow the data slice from the SDK
         let (data, original_p_data) = if recv_instance.is_some() {
             // We're receiving - don't copy, just borrow
-            let slice = std::slice::from_raw_parts(c_frame.p_data, data_size);
+            let slice = slice::from_raw_parts(c_frame.p_data, data_size);
             (Cow::Borrowed(slice), Some(c_frame.p_data))
         } else {
             // Not from receive - make a copy for ownership
-            let slice = std::slice::from_raw_parts(c_frame.p_data, data_size);
+            let slice = slice::from_raw_parts(c_frame.p_data, data_size);
             (Cow::Owned(slice.to_vec()), None)
         };
 
@@ -321,7 +310,7 @@ impl<'rx> VideoFrame<'rx> {
             timestamp: c_frame.timestamp,
             recv_instance,
             original_p_data,
-            _origin: std::marker::PhantomData,
+            _origin: PhantomData,
         })
     }
 
@@ -344,13 +333,13 @@ pub struct VideoFrameBuilder<'rx> {
     timecode: Option<i64>,
     metadata: Option<String>,
     timestamp: Option<i64>,
-    _phantom: std::marker::PhantomData<&'rx ()>,
+    _phantom: PhantomData<&'rx ()>,
 }
 
 impl<'rx> VideoFrameBuilder<'rx> {
     /// Create a new builder with no fields set
     pub fn new() -> Self {
-        VideoFrameBuilder {
+        Self {
             width: None,
             height: None,
             fourcc: None,
@@ -361,11 +350,12 @@ impl<'rx> VideoFrameBuilder<'rx> {
             timecode: None,
             metadata: None,
             timestamp: None,
-            _phantom: std::marker::PhantomData,
+            _phantom: PhantomData,
         }
     }
 
     /// Set the video resolution
+    #[must_use]
     pub fn resolution(mut self, width: i32, height: i32) -> Self {
         self.width = Some(width);
         self.height = Some(height);
@@ -373,12 +363,14 @@ impl<'rx> VideoFrameBuilder<'rx> {
     }
 
     /// Set the pixel format
+    #[must_use]
     pub fn fourcc(mut self, fourcc: FourCCVideoType) -> Self {
         self.fourcc = Some(fourcc);
         self
     }
 
     /// Set the frame rate as a fraction (e.g., 30000/1001 for 29.97fps)
+    #[must_use]
     pub fn frame_rate(mut self, numerator: i32, denominator: i32) -> Self {
         self.frame_rate_n = Some(numerator);
         self.frame_rate_d = Some(denominator);
@@ -386,37 +378,42 @@ impl<'rx> VideoFrameBuilder<'rx> {
     }
 
     /// Set the picture aspect ratio
+    #[must_use]
     pub fn aspect_ratio(mut self, ratio: f32) -> Self {
         self.picture_aspect_ratio = Some(ratio);
         self
     }
 
     /// Set the frame format type (progressive, interlaced, etc.)
+    #[must_use]
     pub fn format(mut self, format: FrameFormatType) -> Self {
         self.frame_format_type = Some(format);
         self
     }
 
     /// Set the timecode
+    #[must_use]
     pub fn timecode(mut self, tc: i64) -> Self {
         self.timecode = Some(tc);
         self
     }
 
     /// Set metadata
+    #[must_use]
     pub fn metadata<S: Into<String>>(mut self, meta: S) -> Self {
         self.metadata = Some(meta.into());
         self
     }
 
     /// Set the timestamp
+    #[must_use]
     pub fn timestamp(mut self, ts: i64) -> Self {
         self.timestamp = Some(ts);
         self
     }
 
     /// Build the VideoFrame
-    pub fn build(self) -> Result<VideoFrame<'rx>, Error> {
+    pub fn build(self) -> Result<VideoFrame<'rx>> {
         let width = self.width.unwrap_or(1920);
         let height = self.height.unwrap_or(1080);
         let fourcc = self.fourcc.unwrap_or(FourCCVideoType::BGRA);
@@ -428,40 +425,8 @@ impl<'rx> VideoFrameBuilder<'rx> {
             .unwrap_or(FrameFormatType::Progressive);
 
         // Calculate stride and buffer size
-        let (stride, buffer_size) = match fourcc {
-            FourCCVideoType::BGRA
-            | FourCCVideoType::BGRX
-            | FourCCVideoType::RGBA
-            | FourCCVideoType::RGBX => {
-                let stride = width * 4; // 32 bpp = 4 bytes per pixel
-                (stride, (height * stride) as usize)
-            }
-            FourCCVideoType::UYVY => {
-                let stride = width * 2; // 16 bpp = 2 bytes per pixel
-                (stride, (height * stride) as usize)
-            }
-            FourCCVideoType::YV12 | FourCCVideoType::I420 | FourCCVideoType::NV12 => {
-                // Planar 4:2:0 formats: Y plane is full res, U/V planes are quarter size
-                // Total size = Y plane (width * height) + U plane (width/2 * height/2) + V plane (width/2 * height/2)
-                // = width * height * 1.5 = width * height * 3/2
-                let stride = width; // Y plane stride
-                let y_size = (width * height) as usize;
-                let uv_size = ((width / 2) * (height / 2)) as usize;
-                (stride, y_size + 2 * uv_size)
-            }
-            FourCCVideoType::UYVA => {
-                let stride = width * 3; // 24 bpp = 3 bytes per pixel
-                (stride, (height * stride) as usize)
-            }
-            FourCCVideoType::P216 | FourCCVideoType::PA16 => {
-                let stride = width * 4; // 32 bpp = 4 bytes per pixel
-                (stride, (height * stride) as usize)
-            }
-            _ => {
-                let stride = width * 4; // Default to 32 bpp
-                (stride, (height * stride) as usize)
-            }
-        };
+        let stride = calculate_line_stride(fourcc, width);
+        let buffer_size = calculate_buffer_size(fourcc, width, height);
         let data = vec![0u8; buffer_size];
 
         let mut frame = VideoFrame {
@@ -481,7 +446,7 @@ impl<'rx> VideoFrameBuilder<'rx> {
             timestamp: self.timestamp.unwrap_or(0),
             recv_instance: None,
             original_p_data: None,
-            _origin: std::marker::PhantomData,
+            _origin: PhantomData,
         };
 
         if let Some(meta) = self.metadata {
@@ -543,7 +508,7 @@ pub struct AudioFrame<'rx> {
     pub(crate) recv_instance: Option<NDIlib_recv_instance_t>,
     // Store original SDK data pointer for proper freeing
     pub(crate) original_p_data: Option<*mut u8>,
-    pub(crate) _origin: std::marker::PhantomData<&'rx Receiver<'rx>>,
+    pub(crate) _origin: PhantomData<&'rx Receiver<'rx>>,
 }
 
 impl<'rx> AudioFrame<'rx> {
@@ -566,7 +531,7 @@ impl<'rx> AudioFrame<'rx> {
     pub(crate) fn from_raw(
         raw: NDIlib_audio_frame_v3_t,
         recv_instance: Option<NDIlib_recv_instance_t>,
-    ) -> Result<AudioFrame<'static>, Error> {
+    ) -> Result<AudioFrame<'static>> {
         if raw.p_data.is_null() {
             return Err(Error::InvalidFrame(
                 "Audio frame has null data pointer".into(),
@@ -605,13 +570,11 @@ impl<'rx> AudioFrame<'rx> {
         // For zero-copy: just borrow the data slice from the SDK
         let (data, original_p_data) = if recv_instance.is_some() {
             // We're receiving - don't copy, just borrow
-            let slice =
-                unsafe { std::slice::from_raw_parts(raw.p_data as *const f32, sample_count) };
+            let slice = unsafe { slice::from_raw_parts(raw.p_data as *const f32, sample_count) };
             (Cow::Borrowed(slice), Some(raw.p_data))
         } else {
             // Not from receive - make a copy for ownership
-            let slice =
-                unsafe { std::slice::from_raw_parts(raw.p_data as *const f32, sample_count) };
+            let slice = unsafe { slice::from_raw_parts(raw.p_data as *const f32, sample_count) };
             (Cow::Owned(slice.to_vec()), None)
         };
 
@@ -637,7 +600,7 @@ impl<'rx> AudioFrame<'rx> {
             timestamp: raw.timestamp,
             recv_instance,
             original_p_data,
-            _origin: std::marker::PhantomData,
+            _origin: PhantomData,
         })
     }
 
@@ -696,13 +659,13 @@ pub struct AudioFrameBuilder<'rx> {
     data: Option<Vec<f32>>,
     metadata: Option<String>,
     timestamp: Option<i64>,
-    _phantom: std::marker::PhantomData<&'rx ()>,
+    _phantom: PhantomData<&'rx ()>,
 }
 
 impl<'rx> AudioFrameBuilder<'rx> {
     /// Create a new builder with no fields set
     pub fn new() -> Self {
-        AudioFrameBuilder {
+        Self {
             sample_rate: None,
             num_channels: None,
             num_samples: None,
@@ -711,60 +674,68 @@ impl<'rx> AudioFrameBuilder<'rx> {
             data: None,
             metadata: None,
             timestamp: None,
-            _phantom: std::marker::PhantomData,
+            _phantom: PhantomData,
         }
     }
 
     /// Set the sample rate
+    #[must_use]
     pub fn sample_rate(mut self, rate: i32) -> Self {
         self.sample_rate = Some(rate);
         self
     }
 
     /// Set the number of audio channels
+    #[must_use]
     pub fn channels(mut self, channels: i32) -> Self {
         self.num_channels = Some(channels);
         self
     }
 
     /// Set the number of samples
+    #[must_use]
     pub fn samples(mut self, samples: i32) -> Self {
         self.num_samples = Some(samples);
         self
     }
 
     /// Set the timecode
+    #[must_use]
     pub fn timecode(mut self, tc: i64) -> Self {
         self.timecode = Some(tc);
         self
     }
 
     /// Set the audio format
+    #[must_use]
     pub fn format(mut self, format: AudioType) -> Self {
         self.fourcc = Some(format);
         self
     }
 
     /// Set the audio data as 32-bit floats
+    #[must_use]
     pub fn data(mut self, data: Vec<f32>) -> Self {
         self.data = Some(data);
         self
     }
 
     /// Set metadata
+    #[must_use]
     pub fn metadata<S: Into<String>>(mut self, meta: S) -> Self {
         self.metadata = Some(meta.into());
         self
     }
 
     /// Set the timestamp
+    #[must_use]
     pub fn timestamp(mut self, ts: i64) -> Self {
         self.timestamp = Some(ts);
         self
     }
 
     /// Build the AudioFrame
-    pub fn build(self) -> Result<AudioFrame<'rx>, Error> {
+    pub fn build(self) -> Result<AudioFrame<'rx>> {
         let sample_rate = self.sample_rate.unwrap_or(48000);
         let num_channels = self.num_channels.unwrap_or(2);
         let num_samples = self.num_samples.unwrap_or(1024);
@@ -795,7 +766,7 @@ impl<'rx> AudioFrameBuilder<'rx> {
             timestamp: self.timestamp.unwrap_or(0),
             recv_instance: None,
             original_p_data: None,
-            _origin: std::marker::PhantomData,
+            _origin: PhantomData,
         })
     }
 }
@@ -855,6 +826,59 @@ impl From<AudioType> for i32 {
     }
 }
 
+/// Calculate the line stride (bytes per row) for a given video format
+pub(crate) fn calculate_line_stride(fourcc: FourCCVideoType, width: i32) -> i32 {
+    match fourcc {
+        FourCCVideoType::BGRA
+        | FourCCVideoType::BGRX
+        | FourCCVideoType::RGBA
+        | FourCCVideoType::RGBX => width * 4, // 32 bpp = 4 bytes per pixel
+        FourCCVideoType::UYVY => width * 2, // 16 bpp = 2 bytes per pixel
+        FourCCVideoType::YV12 | FourCCVideoType::I420 | FourCCVideoType::NV12 => width, // Y plane stride for planar formats
+        FourCCVideoType::UYVA => width * 3, // 24 bpp = 3 bytes per pixel
+        FourCCVideoType::P216 | FourCCVideoType::PA16 => width * 4, // 32 bpp = 4 bytes per pixel
+        _ => width * 4,                     // Default to 32 bpp
+    }
+}
+
+/// Calculate the total buffer size needed for a video frame
+fn calculate_buffer_size(fourcc: FourCCVideoType, width: i32, height: i32) -> usize {
+    match fourcc {
+        FourCCVideoType::BGRA
+        | FourCCVideoType::BGRX
+        | FourCCVideoType::RGBA
+        | FourCCVideoType::RGBX => (height * width * 4) as usize, // 32 bpp
+        FourCCVideoType::UYVY => (height * width * 2) as usize, // 16 bpp
+        FourCCVideoType::YV12 | FourCCVideoType::I420 | FourCCVideoType::NV12 => {
+            // Planar 4:2:0 formats: Y plane is full res, U/V planes are quarter size
+            let y_size = (width * height) as usize;
+            let uv_size = ((width / 2) * (height / 2)) as usize;
+            y_size + 2 * uv_size
+        }
+        FourCCVideoType::UYVA => (height * width * 3) as usize, // 24 bpp
+        FourCCVideoType::P216 | FourCCVideoType::PA16 => (height * width * 4) as usize, // 32 bpp
+        _ => (height * width * 4) as usize,                     // Default to 32 bpp
+    }
+}
+
+/// Check if a video format is uncompressed
+fn is_uncompressed_format(fourcc: FourCCVideoType) -> bool {
+    matches!(
+        fourcc,
+        FourCCVideoType::BGRA
+            | FourCCVideoType::BGRX
+            | FourCCVideoType::RGBA
+            | FourCCVideoType::RGBX
+            | FourCCVideoType::UYVY
+            | FourCCVideoType::UYVA
+            | FourCCVideoType::YV12
+            | FourCCVideoType::I420
+            | FourCCVideoType::NV12
+            | FourCCVideoType::P216
+            | FourCCVideoType::PA16
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct MetadataFrame {
     pub data: String, // Owned metadata (typically XML)
@@ -874,7 +898,7 @@ impl MetadataFrame {
     }
 
     /// Convert to raw format for sending
-    pub(crate) fn to_raw(&self) -> Result<(CString, NDIlib_metadata_frame_t), Error> {
+    pub(crate) fn to_raw(&self) -> Result<(CString, NDIlib_metadata_frame_t)> {
         let c_data = CString::new(self.data.clone()).map_err(Error::InvalidCString)?;
         let raw = NDIlib_metadata_frame_t {
             length: c_data.as_bytes().len() as i32,

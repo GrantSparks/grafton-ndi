@@ -22,12 +22,13 @@
 //! - Custom output file: `cargo run --example NDIlib_Recv_PNG -- --output MyImage.png`
 //! - Both: `cargo run --example NDIlib_Recv_PNG -- 192.168.0.100 --output MyImage.png`
 
-use grafton_ndi::{
-    Error, Finder, FinderOptions, FourCCVideoType, ReceiverColorFormat, ReceiverOptions, NDI,
-};
 use std::env;
 use std::fs::File;
 use std::time::{Duration, Instant};
+
+use grafton_ndi::{
+    Error, Finder, FinderOptions, FourCCVideoType, ReceiverColorFormat, ReceiverOptions, NDI,
+};
 
 fn main() -> Result<(), Error> {
     // Parse command line arguments

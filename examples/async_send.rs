@@ -1,9 +1,10 @@
 //! Example demonstrating zero-copy async video sending with tokens
 
-use grafton_ndi::{BorrowedVideoFrame, FourCCVideoType, SenderOptions, NDI};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use grafton_ndi::{BorrowedVideoFrame, FourCCVideoType, SenderOptions, NDI};
 
 fn main() -> Result<(), grafton_ndi::Error> {
     // Initialize NDI

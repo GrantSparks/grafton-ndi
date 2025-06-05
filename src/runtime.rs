@@ -1,9 +1,9 @@
 //! NDI runtime management and initialization.
 
-use crate::{error::Error, ndi_lib::*};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-// Global initialization state and reference count
+use crate::{ndi_lib::*, Error, Result};
+
 static INIT: AtomicBool = AtomicBool::new(false);
 static INIT_FAILED: AtomicBool = AtomicBool::new(false);
 static REFCOUNT: AtomicUsize = AtomicUsize::new(0);
@@ -54,14 +54,13 @@ impl NDI {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn acquire() -> Result<Self, Error> {
+    pub fn acquire() -> Result<Self> {
         // 1. Bump the counter immediately.
         let prev = REFCOUNT.fetch_add(1, Ordering::SeqCst);
 
         if prev == 0 {
             // We are the first handle → initialise the runtime.
 
-            // On Windows CI, add diagnostic output
             #[cfg(all(target_os = "windows", debug_assertions))]
             {
                 if std::env::var("CI").is_ok() {
@@ -128,13 +127,13 @@ impl NDI {
             }
         }
 
-        Ok(NDI)
+        Ok(Self)
     }
 
     /// Creates a new NDI instance.
     ///
     /// Alias for [`NDI::acquire()`].
-    pub fn new() -> Result<Self, Error> {
+    pub fn new() -> Result<Self> {
         Self::acquire()
     }
 
@@ -174,7 +173,7 @@ impl NDI {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn version() -> Result<String, Error> {
+    pub fn version() -> Result<String> {
         unsafe {
             let version_ptr = NDIlib_version();
             if version_ptr.is_null() {
@@ -206,7 +205,7 @@ impl NDI {
 impl Clone for NDI {
     fn clone(&self) -> Self {
         REFCOUNT.fetch_add(1, Ordering::SeqCst);
-        NDI
+        Self
     }
 }
 

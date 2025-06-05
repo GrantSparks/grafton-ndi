@@ -1,6 +1,7 @@
-use grafton_ndi::{BorrowedVideoFrame, FourCCVideoType, SenderOptions, NDI};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+use grafton_ndi::{BorrowedVideoFrame, FourCCVideoType, SenderOptions, NDI};
 
 fn main() -> Result<(), grafton_ndi::Error> {
     // Initialize NDI
@@ -110,7 +111,13 @@ fn main() -> Result<(), grafton_ndi::Error> {
     Ok(())
 }
 
-// Generate a simple test pattern
+/// Generate a simple test pattern with moving gradients
+///
+/// # Arguments
+/// * `buffer` - The buffer to fill with BGRA pixel data
+/// * `width` - Frame width in pixels
+/// * `height` - Frame height in pixels  
+/// * `frame_num` - Current frame number for animation
 fn generate_test_pattern(buffer: &mut [u8], width: i32, height: i32, frame_num: u32) {
     let width = width as usize;
     let height = height as usize;

@@ -28,14 +28,45 @@
 //! # }
 //! ```
 
+use std::{ffi::CString, marker::PhantomData, ptr};
+
 use crate::{
-    error::Error,
     finder::{RawSource, Source},
     frames::{AudioFrame, MetadataFrame, VideoFrame},
     ndi_lib::*,
-    NDI,
+    Error, Result, NDI,
 };
-use std::{ffi::CString, ptr};
+
+macro_rules! ptz_command {
+    ($self:expr, $func:ident, $err_msg:expr) => {
+        if unsafe { $func($self.instance) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed($err_msg.into()))
+        }
+    };
+    ($self:expr, $func:ident, $param:expr, $err_msg:expr) => {
+        if unsafe { $func($self.instance, $param) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed($err_msg))
+        }
+    };
+    ($self:expr, $func:ident, $param1:expr, $param2:expr, $err_msg:expr) => {
+        if unsafe { $func($self.instance, $param1, $param2) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed($err_msg))
+        }
+    };
+    ($self:expr, $func:ident, $param1:expr, $param2:expr, $param3:expr, $err_msg:expr) => {
+        if unsafe { $func($self.instance, $param1, $param2, $param3) } {
+            Ok(())
+        } else {
+            Err(Error::PtzCommandFailed($err_msg))
+        }
+    };
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub enum ReceiverColorFormat {
@@ -126,7 +157,7 @@ impl ReceiverOptions {
     ///
     /// The returned RawRecvCreateV3 struct uses #[repr(C)] to guarantee C-compatible layout
     /// for safe FFI interop with the NDI SDK.
-    pub(crate) fn to_raw(&self) -> Result<RawRecvCreateV3, Error> {
+    pub(crate) fn to_raw(&self) -> Result<RawRecvCreateV3> {
         let source = self.source_to_connect_to.to_raw()?;
         let name = self
             .ndi_recv_name
@@ -170,7 +201,7 @@ pub struct ReceiverOptionsBuilder {
 impl ReceiverOptionsBuilder {
     /// Create a new builder with the specified source
     pub fn new(source: Source) -> Self {
-        ReceiverOptionsBuilder {
+        Self {
             source_to_connect_to: source,
             color_format: None,
             bandwidth: None,
@@ -180,31 +211,35 @@ impl ReceiverOptionsBuilder {
     }
 
     /// Set the color format for received video
+    #[must_use]
     pub fn color(mut self, fmt: ReceiverColorFormat) -> Self {
         self.color_format = Some(fmt);
         self
     }
 
     /// Set the bandwidth mode for the receiver
+    #[must_use]
     pub fn bandwidth(mut self, bw: ReceiverBandwidth) -> Self {
         self.bandwidth = Some(bw);
         self
     }
 
     /// Configure whether to allow video fields
+    #[must_use]
     pub fn allow_video_fields(mut self, allow: bool) -> Self {
         self.allow_video_fields = Some(allow);
         self
     }
 
     /// Set the name for this receiver
+    #[must_use]
     pub fn name<S: Into<String>>(mut self, name: S) -> Self {
         self.ndi_recv_name = Some(name.into());
         self
     }
 
     /// Build the receiver and create a Receiver instance
-    pub fn build(self, ndi: &NDI) -> Result<Receiver<'_>, Error> {
+    pub fn build(self, ndi: &NDI) -> Result<Receiver<'_>> {
         let receiver = ReceiverOptions {
             source_to_connect_to: self.source_to_connect_to,
             color_format: self.color_format.unwrap_or(ReceiverColorFormat::BGRX_BGRA),
@@ -218,11 +253,11 @@ impl ReceiverOptionsBuilder {
 
 pub struct Receiver<'a> {
     pub(crate) instance: NDIlib_recv_instance_t,
-    ndi: std::marker::PhantomData<&'a NDI>,
+    ndi: PhantomData<&'a NDI>,
 }
 
 impl<'a> Receiver<'a> {
-    pub fn new(_ndi: &'a NDI, create: &ReceiverOptions) -> Result<Self, Error> {
+    pub fn new(_ndi: &'a NDI, create: &ReceiverOptions) -> Result<Self> {
         let create_raw = create.to_raw()?;
         // NDIlib_recv_create_v3 already connects to the source specified in source_to_connect_to
         let instance = unsafe { NDIlib_recv_create_v3(&create_raw.raw) };
@@ -231,9 +266,9 @@ impl<'a> Receiver<'a> {
                 "Failed to create NDI recv instance".into(),
             ))
         } else {
-            Ok(Receiver {
+            Ok(Self {
                 instance,
-                ndi: std::marker::PhantomData,
+                ndi: PhantomData,
             })
         }
     }
@@ -242,7 +277,7 @@ impl<'a> Receiver<'a> {
     #[deprecated(
         note = "Use capture_video, capture_audio, or capture_metadata for concurrent access"
     )]
-    pub fn capture(&mut self, timeout_ms: u32) -> Result<FrameType<'_>, Error> {
+    pub fn capture(&mut self, timeout_ms: u32) -> Result<FrameType<'_>> {
         let mut video_frame = NDIlib_video_frame_v2_t::default();
         let mut audio_frame = NDIlib_audio_frame_v3_t::default();
         let mut metadata_frame = NDIlib_metadata_frame_t::default();
@@ -305,187 +340,176 @@ impl<'a> Receiver<'a> {
         unsafe { NDIlib_recv_ptz_is_supported(self.instance) }
     }
 
-    pub fn ptz_recall_preset(&self, preset: u32, speed: f32) -> Result<(), Error> {
-        if unsafe { NDIlib_recv_ptz_recall_preset(self.instance, preset as i32, speed) } {
-            Ok(())
-        } else {
-            Err(Error::PtzCommandFailed(format!(
+    pub fn ptz_recall_preset(&self, preset: u32, speed: f32) -> Result<()> {
+        ptz_command!(
+            self,
+            NDIlib_recv_ptz_recall_preset,
+            preset as i32,
+            speed,
+            format!(
                 "Failed to recall PTZ preset {} with speed {}",
                 preset, speed
-            )))
-        }
+            )
+        )
     }
 
-    pub fn ptz_zoom(&self, zoom_value: f32) -> Result<(), Error> {
-        if unsafe { NDIlib_recv_ptz_zoom(self.instance, zoom_value) } {
-            Ok(())
-        } else {
-            Err(Error::PtzCommandFailed(format!(
-                "Failed to set PTZ zoom to {}",
-                zoom_value
-            )))
-        }
+    pub fn ptz_zoom(&self, zoom_value: f32) -> Result<()> {
+        ptz_command!(
+            self,
+            NDIlib_recv_ptz_zoom,
+            zoom_value,
+            format!("Failed to set PTZ zoom to {}", zoom_value)
+        )
     }
 
-    pub fn ptz_zoom_speed(&self, zoom_speed: f32) -> Result<(), Error> {
-        if unsafe { NDIlib_recv_ptz_zoom_speed(self.instance, zoom_speed) } {
-            Ok(())
-        } else {
-            Err(Error::PtzCommandFailed(format!(
-                "Failed to set PTZ zoom speed to {}",
-                zoom_speed
-            )))
-        }
+    pub fn ptz_zoom_speed(&self, zoom_speed: f32) -> Result<()> {
+        ptz_command!(
+            self,
+            NDIlib_recv_ptz_zoom_speed,
+            zoom_speed,
+            format!("Failed to set PTZ zoom speed to {}", zoom_speed)
+        )
     }
 
-    pub fn ptz_pan_tilt(&self, pan_value: f32, tilt_value: f32) -> Result<(), Error> {
-        if unsafe { NDIlib_recv_ptz_pan_tilt(self.instance, pan_value, tilt_value) } {
-            Ok(())
-        } else {
-            Err(Error::PtzCommandFailed(format!(
+    pub fn ptz_pan_tilt(&self, pan_value: f32, tilt_value: f32) -> Result<()> {
+        ptz_command!(
+            self,
+            NDIlib_recv_ptz_pan_tilt,
+            pan_value,
+            tilt_value,
+            format!(
                 "Failed to set PTZ pan/tilt to ({}, {})",
                 pan_value, tilt_value
-            )))
-        }
+            )
+        )
     }
 
-    pub fn ptz_pan_tilt_speed(&self, pan_speed: f32, tilt_speed: f32) -> Result<(), Error> {
-        if unsafe { NDIlib_recv_ptz_pan_tilt_speed(self.instance, pan_speed, tilt_speed) } {
-            Ok(())
-        } else {
-            Err(Error::PtzCommandFailed(format!(
+    pub fn ptz_pan_tilt_speed(&self, pan_speed: f32, tilt_speed: f32) -> Result<()> {
+        ptz_command!(
+            self,
+            NDIlib_recv_ptz_pan_tilt_speed,
+            pan_speed,
+            tilt_speed,
+            format!(
                 "Failed to set PTZ pan/tilt speed to ({}, {})",
                 pan_speed, tilt_speed
-            )))
-        }
+            )
+        )
     }
 
-    pub fn ptz_store_preset(&self, preset_no: i32) -> Result<(), Error> {
-        if unsafe { NDIlib_recv_ptz_store_preset(self.instance, preset_no) } {
-            Ok(())
-        } else {
-            Err(Error::PtzCommandFailed(format!(
-                "Failed to store PTZ preset {}",
-                preset_no
-            )))
-        }
+    pub fn ptz_store_preset(&self, preset_no: i32) -> Result<()> {
+        ptz_command!(
+            self,
+            NDIlib_recv_ptz_store_preset,
+            preset_no,
+            format!("Failed to store PTZ preset {}", preset_no)
+        )
     }
 
-    pub fn ptz_auto_focus(&self) -> Result<(), Error> {
-        if unsafe { NDIlib_recv_ptz_auto_focus(self.instance) } {
-            Ok(())
-        } else {
-            Err(Error::PtzCommandFailed(
-                "Failed to enable PTZ auto focus".into(),
-            ))
-        }
+    pub fn ptz_auto_focus(&self) -> Result<()> {
+        ptz_command!(
+            self,
+            NDIlib_recv_ptz_auto_focus,
+            "Failed to enable PTZ auto focus"
+        )
     }
 
-    pub fn ptz_focus(&self, focus_value: f32) -> Result<(), Error> {
-        if unsafe { NDIlib_recv_ptz_focus(self.instance, focus_value) } {
-            Ok(())
-        } else {
-            Err(Error::PtzCommandFailed("Failed to set PTZ focus".into()))
-        }
+    pub fn ptz_focus(&self, focus_value: f32) -> Result<()> {
+        ptz_command!(
+            self,
+            NDIlib_recv_ptz_focus,
+            focus_value,
+            format!("Failed to set PTZ focus to {}", focus_value)
+        )
     }
 
-    pub fn ptz_focus_speed(&self, focus_speed: f32) -> Result<(), Error> {
-        if unsafe { NDIlib_recv_ptz_focus_speed(self.instance, focus_speed) } {
-            Ok(())
-        } else {
-            Err(Error::PtzCommandFailed(
-                "Failed to set PTZ focus speed".into(),
-            ))
-        }
+    pub fn ptz_focus_speed(&self, focus_speed: f32) -> Result<()> {
+        ptz_command!(
+            self,
+            NDIlib_recv_ptz_focus_speed,
+            focus_speed,
+            format!("Failed to set PTZ focus speed to {}", focus_speed)
+        )
     }
 
-    pub fn ptz_white_balance_auto(&self) -> Result<(), Error> {
-        if unsafe { NDIlib_recv_ptz_white_balance_auto(self.instance) } {
-            Ok(())
-        } else {
-            Err(Error::PtzCommandFailed(
-                "Failed to set PTZ auto white balance".into(),
-            ))
-        }
+    pub fn ptz_white_balance_auto(&self) -> Result<()> {
+        ptz_command!(
+            self,
+            NDIlib_recv_ptz_white_balance_auto,
+            "Failed to set PTZ auto white balance"
+        )
     }
 
-    pub fn ptz_white_balance_indoor(&self) -> Result<(), Error> {
-        if unsafe { NDIlib_recv_ptz_white_balance_indoor(self.instance) } {
-            Ok(())
-        } else {
-            Err(Error::PtzCommandFailed(
-                "Failed to set PTZ indoor white balance".into(),
-            ))
-        }
+    pub fn ptz_white_balance_indoor(&self) -> Result<()> {
+        ptz_command!(
+            self,
+            NDIlib_recv_ptz_white_balance_indoor,
+            "Failed to set PTZ indoor white balance"
+        )
     }
 
-    pub fn ptz_white_balance_outdoor(&self) -> Result<(), Error> {
-        if unsafe { NDIlib_recv_ptz_white_balance_outdoor(self.instance) } {
-            Ok(())
-        } else {
-            Err(Error::PtzCommandFailed(
-                "Failed to set PTZ outdoor white balance".into(),
-            ))
-        }
+    pub fn ptz_white_balance_outdoor(&self) -> Result<()> {
+        ptz_command!(
+            self,
+            NDIlib_recv_ptz_white_balance_outdoor,
+            "Failed to set PTZ outdoor white balance"
+        )
     }
 
-    pub fn ptz_white_balance_oneshot(&self) -> Result<(), Error> {
-        if unsafe { NDIlib_recv_ptz_white_balance_oneshot(self.instance) } {
-            Ok(())
-        } else {
-            Err(Error::PtzCommandFailed(
-                "Failed to set PTZ oneshot white balance".into(),
-            ))
-        }
+    pub fn ptz_white_balance_oneshot(&self) -> Result<()> {
+        ptz_command!(
+            self,
+            NDIlib_recv_ptz_white_balance_oneshot,
+            "Failed to set PTZ oneshot white balance"
+        )
     }
 
-    pub fn ptz_white_balance_manual(&self, red: f32, blue: f32) -> Result<(), Error> {
-        if unsafe { NDIlib_recv_ptz_white_balance_manual(self.instance, red, blue) } {
-            Ok(())
-        } else {
-            Err(Error::PtzCommandFailed(
-                "Failed to set PTZ manual white balance".into(),
-            ))
-        }
+    pub fn ptz_white_balance_manual(&self, red: f32, blue: f32) -> Result<()> {
+        ptz_command!(
+            self,
+            NDIlib_recv_ptz_white_balance_manual,
+            red,
+            blue,
+            format!(
+                "Failed to set PTZ manual white balance (red: {}, blue: {})",
+                red, blue
+            )
+        )
     }
 
-    pub fn ptz_exposure_auto(&self) -> Result<(), Error> {
-        if unsafe { NDIlib_recv_ptz_exposure_auto(self.instance) } {
-            Ok(())
-        } else {
-            Err(Error::PtzCommandFailed(
-                "Failed to set PTZ auto exposure".into(),
-            ))
-        }
+    pub fn ptz_exposure_auto(&self) -> Result<()> {
+        ptz_command!(
+            self,
+            NDIlib_recv_ptz_exposure_auto,
+            "Failed to set PTZ auto exposure"
+        )
     }
 
-    pub fn ptz_exposure_manual(&self, exposure_level: f32) -> Result<(), Error> {
-        if unsafe { NDIlib_recv_ptz_exposure_manual(self.instance, exposure_level) } {
-            Ok(())
-        } else {
-            Err(Error::PtzCommandFailed(
-                "Failed to set PTZ manual exposure".into(),
-            ))
-        }
+    pub fn ptz_exposure_manual(&self, exposure_level: f32) -> Result<()> {
+        ptz_command!(
+            self,
+            NDIlib_recv_ptz_exposure_manual,
+            exposure_level,
+            format!("Failed to set PTZ manual exposure to {}", exposure_level)
+        )
     }
 
-    pub fn ptz_exposure_manual_v2(
-        &self,
-        iris: f32,
-        gain: f32,
-        shutter_speed: f32,
-    ) -> Result<(), Error> {
-        if unsafe { NDIlib_recv_ptz_exposure_manual_v2(self.instance, iris, gain, shutter_speed) } {
-            Ok(())
-        } else {
-            Err(Error::PtzCommandFailed(
-                "Failed to set PTZ manual exposure v2".into(),
-            ))
-        }
+    pub fn ptz_exposure_manual_v2(&self, iris: f32, gain: f32, shutter_speed: f32) -> Result<()> {
+        ptz_command!(
+            self,
+            NDIlib_recv_ptz_exposure_manual_v2,
+            iris,
+            gain,
+            shutter_speed,
+            format!(
+                "Failed to set PTZ manual exposure v2 (iris: {}, gain: {}, shutter: {})",
+                iris, gain, shutter_speed
+            )
+        )
     }
 
     /// Capture only video frames - safe to call from multiple threads concurrently
-    pub fn capture_video(&self, timeout_ms: u32) -> Result<Option<VideoFrame<'_>>, Error> {
+    pub fn capture_video(&self, timeout_ms: u32) -> Result<Option<VideoFrame<'_>>> {
         let mut video_frame = NDIlib_video_frame_v2_t::default();
 
         // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
@@ -513,7 +537,7 @@ impl<'a> Receiver<'a> {
     }
 
     /// Capture only audio frames - safe to call from multiple threads concurrently
-    pub fn capture_audio(&self, timeout_ms: u32) -> Result<Option<AudioFrame<'_>>, Error> {
+    pub fn capture_audio(&self, timeout_ms: u32) -> Result<Option<AudioFrame<'_>>> {
         let mut audio_frame = NDIlib_audio_frame_v3_t::default();
 
         // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
@@ -541,7 +565,7 @@ impl<'a> Receiver<'a> {
     }
 
     /// Capture only metadata frames - safe to call from multiple threads concurrently
-    pub fn capture_metadata(&self, timeout_ms: u32) -> Result<Option<MetadataFrame>, Error> {
+    pub fn capture_metadata(&self, timeout_ms: u32) -> Result<Option<MetadataFrame>> {
         let mut metadata_frame = NDIlib_metadata_frame_t::default();
 
         // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
@@ -628,7 +652,7 @@ impl Drop for Receiver<'_> {
 /// `NDIlib_recv_capture_v3` and related functions use internal synchronization.
 /// The Receiver struct only holds an opaque pointer returned by the SDK, and the SDK
 /// guarantees that this pointer can be safely moved between threads.
-unsafe impl std::marker::Send for Receiver<'_> {}
+unsafe impl Send for Receiver<'_> {}
 
 /// # Safety
 ///
@@ -636,7 +660,7 @@ unsafe impl std::marker::Send for Receiver<'_> {}
 /// synchronized and can be called concurrently from multiple threads. This is explicitly
 /// mentioned in the SDK manual's thread safety section. The capture_video, capture_audio,
 /// and capture_metadata methods can be safely called from multiple threads simultaneously.
-unsafe impl std::marker::Sync for Receiver<'_> {}
+unsafe impl Sync for Receiver<'_> {}
 
 #[derive(Debug)]
 pub enum FrameType<'rx> {

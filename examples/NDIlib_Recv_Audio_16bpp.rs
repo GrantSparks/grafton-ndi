@@ -5,10 +5,11 @@
 //!
 //! Run with: `cargo run --example NDIlib_Recv_Audio_16bpp`
 
-use grafton_ndi::{Error, Finder, FinderOptions, ReceiverOptions, NDI};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use grafton_ndi::{Error, Finder, FinderOptions, ReceiverOptions, NDI};
 
 fn main() -> Result<(), Error> {
     // Set up signal handler for graceful shutdown
@@ -79,12 +80,17 @@ fn main() -> Result<(), Error> {
         }
 
         // Small delay to avoid busy-waiting
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(10));
     }
 
     Ok(())
 }
 
+/// Convert audio frame from float to 16-bit signed integer format
+///
+/// # Arguments
+/// * `audio_frame` - The input audio frame with float samples
+/// * `reference_level_db` - The reference level in dB for scaling
 fn convert_to_16bit_interleaved(
     audio_frame: &grafton_ndi::AudioFrame,
     reference_level_db: i32,

@@ -1,7 +1,7 @@
 //! Error types for the grafton-ndi library.
 
-use std::ffi::NulError;
-use std::io;
+use std::{ffi::NulError, io};
+
 use thiserror::Error;
 
 /// The main error type for NDI operations.

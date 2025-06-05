@@ -16,9 +16,10 @@
 //! - Ensure NDI sources are running on your network
 //! - Check firewall settings (NDI uses TCP port 5353 for discovery)
 
-use grafton_ndi::{Error, Finder, FinderOptions, NDI};
 use std::env;
 use std::time::{Duration, Instant};
+
+use grafton_ndi::{Error, Finder, FinderOptions, NDI};
 
 fn main() -> Result<(), Error> {
     // Parse command line arguments for extra IPs

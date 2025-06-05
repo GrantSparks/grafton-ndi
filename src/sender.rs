@@ -1,35 +1,40 @@
 //! NDI sending functionality for video, audio, and metadata.
 
-use crate::{
-    error::Error,
-    finder::Source,
-    frames::{
-        AudioFrame, FourCCVideoType, FrameFormatType, LineStrideOrSize, MetadataFrame, VideoFrame,
-    },
-    ndi_lib::*,
-    receiver::Tally,
-    NDI,
-};
 use std::{
     ffi::{CStr, CString},
+    fmt,
+    marker::PhantomData,
     os::raw::{c_char, c_void},
     ptr,
     sync::{
         atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
+    thread,
+    time::{Duration, Instant},
 };
 
-// Compile-time check for atomic pointer support
+#[cfg(target_os = "windows")]
+use std::sync::Mutex;
+
+use crate::{
+    finder::Source,
+    frames::{
+        calculate_line_stride, AudioFrame, FourCCVideoType, FrameFormatType, LineStrideOrSize,
+        MetadataFrame, VideoFrame,
+    },
+    ndi_lib::*,
+    receiver::Tally,
+    Error, Result, NDI,
+};
+
 #[cfg(not(target_has_atomic = "ptr"))]
 compile_error!(
     "This crate requires atomic pointer support. Please use a target with atomics enabled."
 );
 
-// Global mutex to serialize flush operations on Windows
-// This prevents deadlocks when multiple threads flush simultaneously
 #[cfg(target_os = "windows")]
-static FLUSH_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static FLUSH_MUTEX: Mutex<()> = Mutex::new(());
 
 /// Internal state that is reference-counted and shared between SendInstance and tokens
 struct Inner {
@@ -45,11 +50,9 @@ struct Inner {
 #[derive(Debug)]
 pub struct Sender<'a> {
     inner: Arc<Inner>,
-    ndi: std::marker::PhantomData<&'a NDI>,
+    ndi: PhantomData<&'a NDI>,
 }
 
-/// Type alias for async completion callbacks  
-/// The callback receives the buffer length, not the buffer itself
 type AsyncCallback = Box<dyn Fn(usize) + Send + Sync>;
 
 /// Lock-free async completion state
@@ -60,8 +63,8 @@ struct AsyncState {
     video_callback: OnceLock<AsyncCallback>,
 }
 
-impl std::fmt::Debug for AsyncState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for AsyncState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AsyncState")
             .field("video_buffer_ptr", &self.video_buffer_ptr)
             .field("video_buffer_len", &self.video_buffer_len)
@@ -70,8 +73,8 @@ impl std::fmt::Debug for AsyncState {
     }
 }
 
-impl std::fmt::Debug for Inner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for Inner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Inner")
             .field("instance", &self.instance)
             .field("async_state", &self.async_state)
@@ -128,17 +131,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         frame_rate_n: i32,
         frame_rate_d: i32,
     ) -> Self {
-        let stride = match fourcc {
-            FourCCVideoType::BGRA
-            | FourCCVideoType::BGRX
-            | FourCCVideoType::RGBA
-            | FourCCVideoType::RGBX => width * 4, // 32 bpp = 4 bytes per pixel
-            FourCCVideoType::UYVY => width * 2, // 16 bpp = 2 bytes per pixel
-            FourCCVideoType::YV12 | FourCCVideoType::I420 | FourCCVideoType::NV12 => width, // Y plane stride for planar formats
-            FourCCVideoType::UYVA => width * 3, // 24 bpp = 3 bytes per pixel
-            FourCCVideoType::P216 | FourCCVideoType::PA16 => width * 4, // 32 bpp = 4 bytes per pixel
-            _ => width * 4,                                             // Default to 32 bpp
-        };
+        let stride = calculate_line_stride(fourcc, width);
 
         BorrowedVideoFrame {
             width,
@@ -203,7 +196,7 @@ impl<'buf> From<&'buf VideoFrame<'_>> for BorrowedVideoFrame<'buf> {
 pub struct AsyncVideoToken<'buf> {
     inner: Arc<Inner>,
     // Use mutable borrow to prevent any access while NDI owns the buffer
-    _frame: std::marker::PhantomData<&'buf mut [u8]>,
+    _frame: PhantomData<&'buf mut [u8]>,
 }
 
 // Note: AsyncVideoToken implements Send because PhantomData<&'buf mut [u8]> is Send.
@@ -295,7 +288,7 @@ impl<'a> Sender<'a> {
     /// - The sender name contains a null byte
     /// - The groups string contains a null byte
     /// - NDI fails to create the send instance
-    pub fn new(_ndi: &'a NDI, create_settings: &SenderOptions) -> Result<Self, Error> {
+    pub fn new(_ndi: &'a NDI, create_settings: &SenderOptions) -> Result<Self> {
         let p_ndi_name =
             CString::new(create_settings.name.clone()).map_err(Error::InvalidCString)?;
         let p_groups = match &create_settings.groups {
@@ -373,7 +366,7 @@ impl<'a> Sender<'a> {
 
                         // Re-leak the Arc since we're not done with it yet
                         // It will be properly dropped in Inner::drop
-                        std::mem::forget(inner);
+                        ::std::mem::forget(inner);
                     }
                 }
 
@@ -393,9 +386,9 @@ impl<'a> Sender<'a> {
                 inner.callback_ptr.store(ptr::null_mut(), Ordering::Release);
             }
 
-            Ok(Sender {
+            Ok(Self {
                 inner,
-                ndi: std::marker::PhantomData,
+                ndi: PhantomData,
             })
         }
     }
@@ -463,12 +456,9 @@ impl<'a> Sender<'a> {
 
         AsyncVideoToken {
             inner: self.inner.clone(),
-            _frame: std::marker::PhantomData,
+            _frame: PhantomData,
         }
     }
-
-    // NOTE: Audio sending is always synchronous in NDI SDK.
-    // There is no NDIlib_send_send_audio_async function.
 
     /// Sends an audio frame synchronously.
     ///
@@ -514,23 +504,18 @@ impl<'a> Sender<'a> {
         }
     }
 
-    // NOTE: Metadata sending is always synchronous in NDI SDK.
-    // There is no NDIlib_send_send_metadata_async function.
-
     /// Sends a metadata frame.
     ///
     /// # Errors
     ///
     /// Returns an error if the metadata string contains a null byte.
-    pub fn send_metadata(&self, metadata_frame: &MetadataFrame) -> Result<(), Error> {
+    pub fn send_metadata(&self, metadata_frame: &MetadataFrame) -> Result<()> {
         let (_c_data, raw) = metadata_frame.to_raw()?;
         unsafe {
             NDIlib_send_send_metadata(self.inner.instance, &raw);
         }
         Ok(())
     }
-
-    // Note: free_metadata is no longer needed since MetadataFrame owns its data
 
     pub fn get_tally(&self, tally: &mut Tally, timeout_ms: u32) -> bool {
         unsafe { NDIlib_send_get_tally(self.inner.instance, &mut tally.to_raw(), timeout_ms) }
@@ -550,7 +535,7 @@ impl<'a> Sender<'a> {
     /// # Errors
     ///
     /// Returns an error if the metadata string contains a null byte.
-    pub fn add_connection_metadata(&self, metadata_frame: &MetadataFrame) -> Result<(), Error> {
+    pub fn add_connection_metadata(&self, metadata_frame: &MetadataFrame) -> Result<()> {
         let (_c_data, raw) = metadata_frame.to_raw()?;
         unsafe { NDIlib_send_add_connection_metadata(self.inner.instance, &raw) }
         Ok(())
@@ -561,7 +546,7 @@ impl<'a> Sender<'a> {
     /// # Errors
     ///
     /// Returns an error if source conversion fails.
-    pub fn set_failover(&self, source: &Source) -> Result<(), Error> {
+    pub fn set_failover(&self, source: &Source) -> Result<()> {
         let raw_source = source.to_raw()?;
         unsafe { NDIlib_send_set_failover(self.inner.instance, &raw_source.raw) }
         Ok(())
@@ -681,8 +666,8 @@ impl<'a> Sender<'a> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn flush_async(&self, timeout: std::time::Duration) -> Result<(), Error> {
-        let start = std::time::Instant::now();
+    pub fn flush_async(&self, timeout: Duration) -> Result<()> {
+        let start = Instant::now();
 
         // Platform-specific flush behavior
         #[cfg(target_os = "windows")]
@@ -702,7 +687,7 @@ impl<'a> Sender<'a> {
                 }
 
                 // On Windows, prefer sleeping over spinning to avoid tight loops
-                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+                thread::sleep(Duration::from_millis(sleep_ms));
                 sleep_ms = (sleep_ms * 2).min(MAX_SLEEP_MS);
             }
         }
@@ -725,11 +710,11 @@ impl<'a> Sender<'a> {
 
                 if spin_count < MAX_SPIN {
                     // First, spin for a bit
-                    std::thread::yield_now();
+                    thread::yield_now();
                     spin_count += 1;
                 } else {
                     // Then sleep with exponential backoff
-                    std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+                    thread::sleep(Duration::from_millis(sleep_ms));
                     sleep_ms = (sleep_ms * 2).min(MAX_SLEEP_MS);
                 }
             }
@@ -764,7 +749,7 @@ impl Drop for Inner {
             // On Windows, add a small delay to let any in-progress token drops complete
             // This prevents racing with AsyncVideoToken::drop
             #[cfg(target_os = "windows")]
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(10));
 
             // Re-check after delay
             let in_flight_after = self.in_flight.load(Ordering::SeqCst);
@@ -865,7 +850,7 @@ impl Drop for Sender<'_> {
 ///
 /// Functions like `NDIlib_send_create` and `NDIlib_send_destroy` should be called
 /// from a single thread.
-unsafe impl std::marker::Send for Sender<'_> {}
+unsafe impl Send for Sender<'_> {}
 
 /// # Safety
 ///
@@ -878,7 +863,7 @@ unsafe impl std::marker::Send for Sender<'_> {}
 ///
 /// Note: Creation and destruction (`NDIlib_send_create`/`NDIlib_send_destroy`)
 /// are handled in our Rust wrapper to ensure single-threaded access.
-unsafe impl std::marker::Sync for Sender<'_> {}
+unsafe impl Sync for Sender<'_> {}
 
 #[derive(Debug)]
 pub struct SenderOptions {
@@ -907,7 +892,7 @@ pub struct SenderOptionsBuilder {
 impl SenderOptionsBuilder {
     /// Create a new builder with the specified name
     pub fn new<S: Into<String>>(name: S) -> Self {
-        SenderOptionsBuilder {
+        Self {
             name: name.into(),
             groups: None,
             clock_video: None,
@@ -916,6 +901,7 @@ impl SenderOptionsBuilder {
     }
 
     /// Set the groups for this sender
+    #[must_use]
     pub fn groups<S: Into<String>>(mut self, groups: S) -> Self {
         self.groups = Some(groups.into());
         self
@@ -942,7 +928,7 @@ impl SenderOptionsBuilder {
     /// Returns an error if:
     /// - The name is empty or contains only whitespace
     /// - Both clock_video and clock_audio are false
-    pub fn build(self) -> Result<SenderOptions, Error> {
+    pub fn build(self) -> Result<SenderOptions> {
         // Validate sender name
         if self.name.trim().is_empty() {
             return Err(Error::InvalidConfiguration(

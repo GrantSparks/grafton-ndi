@@ -5,12 +5,13 @@
 //!
 //! Run with: `cargo run --example NDIlib_Recv_PTZ`
 
-use grafton_ndi::{Error, Finder, FinderOptions, ReceiverOptions, NDI};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-// Optional: Configure for specific test environments
+use grafton_ndi::{Error, Finder, FinderOptions, ReceiverOptions, NDI};
+
+/// Configure finder options for specific test environments
 fn create_finder_options() -> FinderOptions {
     // Uncomment to customize:
     // FinderOptions::builder()

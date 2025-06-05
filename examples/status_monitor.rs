@@ -1,5 +1,7 @@
-use grafton_ndi::{Finder, FinderOptions, ReceiverBandwidth, ReceiverOptions, NDI};
 use std::env;
+use std::io::{self, Write};
+
+use grafton_ndi::{Finder, FinderOptions, ReceiverBandwidth, ReceiverOptions, NDI};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
@@ -80,7 +82,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             // Timeout - could show a heartbeat here
             print!(".");
-            use std::io::{self, Write};
             io::stdout().flush()?;
         }
     }

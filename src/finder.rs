@@ -1,11 +1,13 @@
 //! NDI source discovery and network browsing.
 
-use crate::{error::Error, ndi_lib::*, NDI};
 use std::{
     ffi::{CStr, CString},
     fmt::{self, Display, Formatter},
+    marker::PhantomData,
     ptr,
 };
+
+use crate::{ndi_lib::*, Error, Result, NDI};
 
 /// Configuration for NDI source discovery.
 ///
@@ -64,7 +66,7 @@ impl FinderOptionsBuilder {
     /// - `groups`: `None` (search all groups)
     /// - `extra_ips`: `None` (no additional IPs)
     pub fn new() -> Self {
-        FinderOptionsBuilder {
+        Self {
             show_local_sources: None,
             groups: None,
             extra_ips: None,
@@ -72,24 +74,28 @@ impl FinderOptionsBuilder {
     }
 
     /// Configure whether to show local sources
+    #[must_use]
     pub fn show_local_sources(mut self, show: bool) -> Self {
         self.show_local_sources = Some(show);
         self
     }
 
     /// Set the groups to search
+    #[must_use]
     pub fn groups<S: Into<String>>(mut self, groups: S) -> Self {
         self.groups = Some(groups.into());
         self
     }
 
     /// Set extra IPs to search
+    #[must_use]
     pub fn extra_ips<S: Into<String>>(mut self, ips: S) -> Self {
         self.extra_ips = Some(ips.into());
         self
     }
 
     /// Build the FinderOptions
+    #[must_use]
     pub fn build(self) -> FinderOptions {
         FinderOptions {
             show_local_sources: self.show_local_sources.unwrap_or(true),
@@ -133,7 +139,7 @@ pub struct Finder<'a> {
     instance: NDIlib_find_instance_t,
     _groups: Option<CString>,    // Hold ownership of CStrings
     _extra_ips: Option<CString>, // to ensure they outlive SDK usage
-    ndi: std::marker::PhantomData<&'a NDI>,
+    ndi: PhantomData<&'a NDI>,
 }
 
 impl<'a> Finder<'a> {
@@ -148,7 +154,7 @@ impl<'a> Finder<'a> {
     ///
     /// Returns an error if the finder cannot be created, typically due to
     /// invalid settings or network issues.
-    pub fn new(_ndi: &'a NDI, settings: &FinderOptions) -> Result<Self, Error> {
+    pub fn new(_ndi: &'a NDI, settings: &FinderOptions) -> Result<Self> {
         let groups_cstr = settings
             .groups
             .as_deref()
@@ -174,11 +180,11 @@ impl<'a> Finder<'a> {
                 "NDIlib_find_create_v2 failed".into(),
             ));
         }
-        Ok(Finder {
+        Ok(Self {
             instance,
             _groups: groups_cstr,
             _extra_ips: extra_ips_cstr,
-            ndi: std::marker::PhantomData,
+            ndi: PhantomData,
         })
     }
 
@@ -242,7 +248,7 @@ impl<'a> Finder<'a> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn get_sources(&self, timeout: u32) -> Result<Vec<Source>, Error> {
+    pub fn get_sources(&self, timeout: u32) -> Result<Vec<Source>> {
         let mut num_sources = 0;
         let sources_ptr =
             unsafe { NDIlib_find_get_sources(self.instance, &mut num_sources, timeout) };
@@ -370,7 +376,7 @@ impl Source {
     ///
     /// The returned RawSource struct uses #[repr(C)] to guarantee C-compatible layout
     /// for safe FFI interop with the NDI SDK.
-    pub(crate) fn to_raw(&self) -> Result<RawSource, Error> {
+    pub(crate) fn to_raw(&self) -> Result<RawSource> {
         let name = CString::new(self.name.clone()).map_err(Error::InvalidCString)?;
 
         let (url_address, ip_address, __bindgen_anon_1) = match &self.address {
