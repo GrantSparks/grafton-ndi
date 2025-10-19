@@ -11,9 +11,13 @@ High-performance, idiomatic Rust bindings for the [NDI® 6 SDK](https://ndi.vide
 ## Features
 
 - **Zero-copy frame handling** - Minimal overhead for high-performance video processing
+- **Source caching & discovery** - Thread-safe caching eliminates repetitive discovery code
+- **Image encoding** - One-line PNG/JPEG encoding and base64 data URLs (optional feature)
+- **Retry logic** - Reliable frame capture with automatic retry and blocking variants
+- **Async runtime support** - Native integration with Tokio and async-std (optional features)
 - **Async video sending** - Non-blocking video transmission with completion callbacks
-- **Thread-safe by design** - Safe concurrent access with Rust's ownership model  
-- **Ergonomic API** - Builder patterns and idiomatic Rust interfaces
+- **Thread-safe by design** - Safe concurrent access with Rust's ownership model
+- **Ergonomic API** - Builder patterns, presets, and idiomatic Rust interfaces
 - **Comprehensive type safety** - Strongly-typed color formats and frame types
 - **Cross-platform** - Full support for Windows, Linux, and macOS
 - **Battle-tested** - Used in production video streaming applications
@@ -50,10 +54,17 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-grafton-ndi = "0.8"
+grafton-ndi = "0.9"
 
 # For NDI Advanced SDK features (optional)
-# grafton-ndi = { version = "0.8", features = ["advanced_sdk"] }
+# grafton-ndi = { version = "0.9", features = ["advanced_sdk"] }
+
+# For image encoding support (PNG/JPEG)
+# grafton-ndi = { version = "0.9", features = ["image-encoding"] }
+
+# For async runtime integration
+# grafton-ndi = { version = "0.9", features = ["tokio"] }
+# grafton-ndi = { version = "0.9", features = ["async-std"] }
 ```
 
 ### Prerequisites
@@ -175,7 +186,7 @@ let frame = VideoFrame::builder()
 sender.send_video(&frame);
 ```
 
-### Async Video Sending (New in 0.8)
+### Async Video Sending
 
 ```rust
 use grafton_ndi::{NDI, Sender, SenderOptions, BorrowedVideoFrame, FourCCVideoType};
@@ -251,6 +262,129 @@ if receiver.ptz_is_supported()? {
     receiver.ptz_zoom(0.5)?;         // Zoom to 50%
     receiver.ptz_pan_tilt(0.0, 0.25)?; // Pan center, tilt up 25%
     receiver.ptz_auto_focus()?;       // Enable auto-focus
+}
+```
+
+### Source Caching (New in 0.9)
+
+```rust
+use grafton_ndi::SourceCache;
+
+// Create a shared cache instance
+let cache = SourceCache::new();
+
+// Find sources by hostname or IP - automatically cached
+let sources = cache.find_by_host("192.168.1.100", 5000)?;
+
+for source in &sources {
+    println!("Found: {} ({})", source.name, source.ip_address().unwrap_or_default());
+}
+
+// Cache automatically reuses NDI instances and discovered sources
+// Eliminates ~150 lines of manual caching code per application
+
+// Invalidate cache when a source goes offline
+cache.invalidate("192.168.1.100");
+
+// Check cache state
+println!("Cached hosts: {}", cache.len());
+```
+
+### Reliable Frame Capture with Retry Logic (New in 0.9)
+
+```rust
+use grafton_ndi::{NDI, ReceiverOptions, ReceiverColorFormat};
+
+let ndi = NDI::new()?;
+let receiver = ReceiverOptions::builder(source)
+    .color(ReceiverColorFormat::RGBX_RGBA)
+    .build(&ndi)?;
+
+// Recommended: Block until frame arrives or timeout (handles NDI SDK timing quirks)
+match receiver.capture_video_blocking(5000)? {
+    Some(video) => {
+        println!("Got video: {}x{}", video.width, video.height);
+    }
+    None => {
+        println!("No video frame within 5 seconds");
+    }
+}
+
+// Or use fine-grained retry control
+match receiver.capture_video_with_retry(100, 50)? {
+    Some(video) => println!("Frame captured"),
+    None => println!("Timeout after 50 attempts"),
+}
+```
+
+### Image Encoding (New in 0.9, requires `image-encoding` feature)
+
+```rust
+use grafton_ndi::{NDI, ReceiverOptions, ImageFormat};
+
+let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+
+if let Some(video) = receiver.capture_video_blocking(5000)? {
+    // One-line PNG encoding
+    let png_bytes = video.encode_png()?;
+    std::fs::write("frame.png", png_bytes)?;
+
+    // JPEG with quality control
+    let jpeg_bytes = video.encode_jpeg(85)?;
+
+    // Base64 data URL for HTML/JSON
+    let data_url = video.encode_data_url(ImageFormat::Jpeg(90))?;
+    println!("data:image/jpeg;base64,..."); // Ready for HTML <img> tags
+}
+```
+
+### Receiver Presets (New in 0.9)
+
+```rust
+use grafton_ndi::{NDI, ReceiverOptionsBuilder};
+
+let ndi = NDI::new()?;
+
+// Optimized for AI/image processing (low bandwidth, RGBA)
+let snapshot_receiver = ReceiverOptionsBuilder::snapshot_preset(source.clone())?
+    .build(&ndi)?;
+
+// Full resolution, highest bandwidth for production
+let hq_receiver = ReceiverOptionsBuilder::high_quality_preset(source.clone())?
+    .build(&ndi)?;
+
+// Metadata-only for tally/status monitoring
+let monitoring_receiver = ReceiverOptionsBuilder::monitoring_preset(source)?
+    .build(&ndi)?;
+```
+
+### Async Runtime Integration (New in 0.9, requires `tokio` or `async-std` feature)
+
+```rust
+use grafton_ndi::{AsyncReceiver, ReceiverOptionsBuilder};
+
+#[tokio::main]
+async fn main() -> Result<(), grafton_ndi::Error> {
+    let source = /* ... discover source ... */;
+
+    // Create async receiver (uses Arc internally for sharing)
+    let receiver = AsyncReceiver::new(
+        ReceiverOptionsBuilder::snapshot_preset(source)?.build_async()?
+    );
+
+    // All capture methods are async
+    if let Some(video) = receiver.capture_video_blocking(5000).await? {
+        println!("Async frame: {}x{}", video.width, video.height);
+
+        // Image encoding works seamlessly
+        #[cfg(feature = "image-encoding")]
+        {
+            let png = video.encode_png()?;
+            tokio::fs::write("async_frame.png", png).await?;
+        }
+    }
+
+    Ok(())
 }
 ```
 
@@ -381,24 +515,64 @@ This is an unofficial community project and is not affiliated with NewTek or Viz
 
 NDI® is a registered trademark of Vizrt NDI AB. 
 
-## What's New in 0.8
+## What's New in 0.9
+
+This release dramatically improves ergonomics and reduces boilerplate for common NDI workflows. Based on production usage feedback, we've eliminated hundreds of lines of repetitive code that users were implementing in every application.
 
 ### Major Features
-- **Async Video Sending**: Non-blocking video transmission with completion callbacks
-- **Receiver Status API**: Monitor connection health and performance metrics
-- **BorrowedVideoFrame**: Zero-copy frame type for optimal performance
-- **AsyncVideoToken**: RAII tokens for safe async frame lifetime management
-- **Advanced SDK Support**: Optional features for NDI Advanced SDK users
 
-### Improvements
-- Enhanced Windows compatibility with proper enum conversions
-- Better error messages and documentation
-- Improved CI/CD pipeline with automated testing
-- Fixed potential race conditions in async operations
+#### Source Caching & Discovery Helpers
+- **`SourceCache`**: Thread-safe caching for NDI instances and discovered sources
+  - Eliminates ~150 lines of manual caching code per application
+  - Handles expensive NDI initialization and discovery internally
+  - Methods: `new()`, `find_by_host()`, `invalidate()`, `clear()`, `len()`, `is_empty()`
+- **Source matching helpers**: `matches_host()`, `ip_address()`, `host()` methods on `Source`
+- **Address parsing**: `contains_host()`, `port()` methods on `SourceAddress`
+
+#### Image Encoding Support (Feature: `image-encoding`)
+- **One-line image export**: `encode_png()`, `encode_jpeg(quality)`, `encode_data_url(format)`
+- Automatic BGRA ↔ RGBA color conversion
+- Eliminates ~30 lines of encoding logic + 2 dependencies per application
+- Ready for HTML/JSON integration with base64 data URLs
+
+#### Reliable Frame Capture with Retry Logic
+- **Blocking capture methods**: `capture_video_blocking()`, `capture_audio_blocking()`, `capture_metadata_blocking()`
+- **Fine-grained retry**: `capture_video_with_retry()`, `capture_audio_with_retry()`, `capture_metadata_with_retry()`
+- Handles NDI SDK timing quirks automatically
+- Eliminates ~40 lines of retry loop code per application
+- Detailed timeout errors with attempt count and elapsed time
+
+#### Async Runtime Integration (Features: `tokio`, `async-std`)
+- **`AsyncReceiver`**: Full async/await support for Tokio and async-std
+- All 9 capture methods (video/audio/metadata × 3 variants)
+- Proper `spawn_blocking` usage prevents runtime blocking
+- Arc-based sharing for async contexts
+
+#### Receiver Configuration Presets
+- **Optimized presets**: `snapshot_preset()`, `high_quality_preset()`, `monitoring_preset()`
+- Self-documenting API guides users to optimal settings
+- Reduces configuration boilerplate
+
+#### Enhanced Error Handling
+- **Specific error variants**: `FrameTimeout`, `NoSourcesFound`, `SourceUnavailable`, `Disconnected`
+- Rich error context for better debugging
+- Pattern matching friendly
+
+### Fixed
+- **Audio sending now works correctly** (was completely broken in 0.8)
+  - New `AudioLayout` enum for explicit planar/interleaved control
+  - `channel_stride_in_bytes` now properly calculated
+  - Default changed to planar layout (matching FLTP semantics)
+
+### Added
+- **`Finder::get_current_sources()`**: Instant source list without blocking
+- Comprehensive documentation with real-world examples
+- 28 tests (up from 13 in v0.8)
 
 ## Migration Guides
 
 For upgrading from previous versions:
+- [0.8.x to 0.9.x](docs/migration/0.8-to-0.9.md) - Ergonomic improvements, source caching, and audio fixes
 - [0.7.x to 0.8.x](docs/migration/0.7-to-0.8.md) - Async API additions
 - [0.6.x to 0.7.x](docs/migration/0.6-to-0.7.md) - Major API improvements
 - [0.5.x to 0.6.x](docs/migration/0.5-to-0.6.md) - Builder patterns and zero-copy operations
