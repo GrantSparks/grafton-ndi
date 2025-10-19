@@ -21,3 +21,4 @@ CLAUDE.local.md
 .vscode/
 .claude_config
 .tidy-rust-cache
+all_source.txt

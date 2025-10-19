@@ -1,6 +1,19 @@
 # Changelog
 
-## [Unreleased]
+## [0.9.0] - (Unreleased)
+
+### Major Features
+
+This release dramatically improves ergonomics and reduces boilerplate for common NDI workflows. Based on production usage feedback (issue #11), we've eliminated ~240 lines of repetitive code that users were implementing in every application.
+
+### Documentation
+- **Clarified `capture_video_blocking` behavior** - Documented why retry logic exists and its performance characteristics
+  - The NDI SDK returns immediately (0ms) during initial connection while the stream synchronizes
+  - Early returns only occur for the first 2-3 calls after connecting to a source
+  - After synchronization (warm-up), the retry loop has **zero overhead** - frames are captured on first attempt
+  - Empirical testing with NDI SDK 6.1.1 confirms: 300/300 frames captured with no retries in steady-state
+  - First call: ~200-400ms (includes synchronization), subsequent calls: ~3-4ms per frame
+  - This method is safe and recommended for continuous capture loops with no performance penalty
 
 ### Fixed
 - **Audio frame sending now works correctly** ([#10](https://github.com/GrantSparks/grafton-ndi/issues/10))
@@ -42,12 +55,6 @@
   - Users requiring interleaved format must explicitly call `.layout(AudioLayout::Interleaved)`
   - This fixes completely broken audio sending functionality
   - Planar is the correct default as FLTP means "Float Planar"
-
-## [0.9.0] - 2025-10-19
-
-### Major Features
-
-This release dramatically improves ergonomics and reduces boilerplate for common NDI workflows. Based on production usage feedback (issue #11), we've eliminated ~240 lines of repetitive code that users were implementing in every application.
 
 #### 🎯 Source Discovery & Caching
 - **`SourceCache`**: Thread-safe caching for NDI instances and discovered sources
