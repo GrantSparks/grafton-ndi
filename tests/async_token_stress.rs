@@ -8,10 +8,6 @@ use grafton_ndi::{BorrowedVideoFrame, FourCCVideoType, SenderOptions, NDI};
 
 #[test]
 #[ignore = "Slow stress test - run with --ignored"]
-#[cfg_attr(
-    all(target_os = "windows", target_env = "msvc"),
-    ignore = "Skipping on Windows CI due to NDI runtime issues"
-)]
 fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
     // Initialize NDI - do this once before spawning threads to avoid race conditions
     let ndi = Arc::new(NDI::new()?);
@@ -95,10 +91,6 @@ fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
 
 #[test]
 #[ignore = "Slow stress test - run with --ignored"]
-#[cfg_attr(
-    all(target_os = "windows", target_env = "msvc"),
-    ignore = "Skipping on Windows CI due to NDI runtime issues"
-)]
 fn test_immediate_sender_drop() -> Result<(), grafton_ndi::Error> {
     // This test verifies that the single-flight API prevents UB
     let ndi = NDI::new()?;
@@ -134,10 +126,6 @@ fn test_immediate_sender_drop() -> Result<(), grafton_ndi::Error> {
 
 #[test]
 #[ignore = "Slow stress test - run with --ignored"]
-#[cfg_attr(
-    all(target_os = "windows", target_env = "msvc"),
-    ignore = "Skipping on Windows CI due to NDI runtime issues"
-)]
 fn test_flush_async() -> Result<(), grafton_ndi::Error> {
     let ndi = NDI::new()?;
     let send_options = SenderOptions::builder("Flush Test")
