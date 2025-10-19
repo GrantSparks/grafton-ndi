@@ -139,16 +139,21 @@ fn test_audio_frame_drop_no_double_free() {
 }
 
 #[test]
-fn test_audio_frame_channel_data() {
+fn test_audio_frame_channel_data_interleaved() {
+    use crate::AudioLayout;
+
     // Test with interleaved stereo data
-    let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 3 samples, 2 channels
+    let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 3 samples, 2 channels interleaved
     let frame = AudioFrame::builder()
         .sample_rate(48000)
         .channels(2)
         .samples(3)
         .data(data)
+        .layout(AudioLayout::Interleaved)
         .build()
         .unwrap();
+
+    assert_eq!(frame.channel_stride_in_bytes, 0);
 
     let ch0 = frame.channel_data(0).unwrap();
     assert_eq!(ch0, vec![1.0, 3.0, 5.0]);
@@ -158,6 +163,48 @@ fn test_audio_frame_channel_data() {
 
     // Out of bounds should return None
     assert!(frame.channel_data(2).is_none());
+}
+
+#[test]
+fn test_audio_frame_channel_data_planar() {
+    use crate::AudioLayout;
+
+    // Test with planar stereo data
+    let data = vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0]; // 3 samples, 2 channels planar
+    let frame = AudioFrame::builder()
+        .sample_rate(48000)
+        .channels(2)
+        .samples(3)
+        .data(data)
+        .layout(AudioLayout::Planar)
+        .build()
+        .unwrap();
+
+    // Verify channel_stride_in_bytes is set correctly (3 samples * 4 bytes/sample = 12)
+    assert_eq!(frame.channel_stride_in_bytes, 12);
+
+    let ch0 = frame.channel_data(0).unwrap();
+    assert_eq!(ch0, vec![1.0, 3.0, 5.0]);
+
+    let ch1 = frame.channel_data(1).unwrap();
+    assert_eq!(ch1, vec![2.0, 4.0, 6.0]);
+
+    // Out of bounds should return None
+    assert!(frame.channel_data(2).is_none());
+}
+
+#[test]
+fn test_audio_frame_default_layout() {
+    // Test that default layout is Planar
+    let frame = AudioFrame::builder()
+        .sample_rate(48000)
+        .channels(2)
+        .samples(100)
+        .build()
+        .unwrap();
+
+    // Default should be planar: 100 samples * 4 bytes = 400
+    assert_eq!(frame.channel_stride_in_bytes, 400);
 }
 
 #[test]
@@ -188,6 +235,8 @@ fn test_audio_frame_builder() {
     assert_eq!(frame.num_channels, 2);
     assert_eq!(frame.num_samples, 1024);
     assert_eq!(frame.data().len(), 2048); // 1024 samples * 2 channels
+                                          // Default layout is planar: 1024 samples * 4 bytes = 4096
+    assert_eq!(frame.channel_stride_in_bytes, 4096);
 }
 
 #[test]

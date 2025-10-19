@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Audio frame sending now works correctly** ([#10](https://github.com/GrantSparks/grafton-ndi/issues/10))
+  - `AudioFrameBuilder` now properly calculates `channel_stride_in_bytes` based on audio layout
+  - Default layout changed to **Planar** (matching FLTP format semantics)
+  - Previously hardcoded to 0 (interleaved), causing NDI SDK to reject audio samples entirely
+  - `NDIlib_Send_Audio` example now functional
+
+### Added
+- **`AudioLayout` enum**: Explicit control over audio data layout
+  - `AudioLayout::Planar` - All samples for channel 0, then channel 1, etc. (new default)
+  - `AudioLayout::Interleaved` - Samples from all channels interleaved
+- **`AudioFrameBuilder::layout()`**: Method to specify planar or interleaved audio format
+- Comprehensive documentation with memory layout diagrams for both formats
+- Test coverage for both planar and interleaved audio formats (4 new tests)
+
+### Changed
+- **BREAKING**: `AudioFrameBuilder` now defaults to planar layout
+  - `channel_stride_in_bytes` now correctly set to `num_samples * 4` (was 0)
+  - Users requiring interleaved format must explicitly call `.layout(AudioLayout::Interleaved)`
+  - This fixes completely broken audio sending functionality
+  - Planar is the correct default as FLTP means "Float Planar"
+
 ## [0.9.0] - 2025-10-19
 
 ### Major Features
