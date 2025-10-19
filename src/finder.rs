@@ -303,6 +303,93 @@ pub enum SourceAddress {
     Ip(String),
 }
 
+impl SourceAddress {
+    /// Check if this address contains the given host or IP.
+    ///
+    /// This performs a substring match against the address string, useful for
+    /// finding sources by hostname or IP address.
+    ///
+    /// # Arguments
+    ///
+    /// * `host` - The hostname or IP address to search for
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use grafton_ndi::SourceAddress;
+    ///
+    /// let addr = SourceAddress::Ip("192.168.1.100:5960".to_string());
+    /// assert!(addr.contains_host("192.168.1.100"));
+    /// assert!(addr.contains_host("192.168.1"));
+    ///
+    /// let url = SourceAddress::Url("http://camera.local:8080".to_string());
+    /// assert!(url.contains_host("camera.local"));
+    /// ```
+    pub fn contains_host(&self, host: &str) -> bool {
+        match self {
+            SourceAddress::Ip(ip) => ip.contains(host),
+            SourceAddress::Url(url) => url.contains(host),
+            SourceAddress::None => false,
+        }
+    }
+
+    /// Extract the port number from this address if present.
+    ///
+    /// Parses the port from addresses in the format `host:port`.
+    ///
+    /// # Returns
+    ///
+    /// `Some(port)` if a valid port is found, `None` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use grafton_ndi::SourceAddress;
+    ///
+    /// let addr = SourceAddress::Ip("192.168.1.100:5960".to_string());
+    /// assert_eq!(addr.port(), Some(5960));
+    ///
+    /// let no_port = SourceAddress::Ip("192.168.1.100".to_string());
+    /// assert_eq!(no_port.port(), None);
+    ///
+    /// let url = SourceAddress::Url("http://camera.local:8080".to_string());
+    /// assert_eq!(url.port(), Some(8080));
+    /// ```
+    pub fn port(&self) -> Option<u16> {
+        let addr_str = match self {
+            SourceAddress::Ip(ip) => ip.as_str(),
+            SourceAddress::Url(url) => url.as_str(),
+            SourceAddress::None => return None,
+        };
+
+        // For URLs, we need to parse more carefully
+        // For IPs, it's just host:port
+        if let SourceAddress::Url(_) = self {
+            // Try to parse as URL to extract port
+            // Format might be http://host:port or similar
+            if let Some(port_start) = addr_str.rfind(':') {
+                // Make sure this isn't the :// in the scheme
+                let before_colon = &addr_str[..port_start];
+                if !before_colon.ends_with('/') {
+                    // Try to parse what comes after the colon
+                    let port_str = &addr_str[port_start + 1..];
+                    // Remove any trailing path
+                    let port_str = port_str.split('/').next().unwrap_or(port_str);
+                    return port_str.parse::<u16>().ok();
+                }
+            }
+        } else {
+            // Simple host:port format for IP addresses
+            if let Some(colon_pos) = addr_str.rfind(':') {
+                let port_str = &addr_str[colon_pos + 1..];
+                return port_str.parse::<u16>().ok();
+            }
+        }
+
+        None
+    }
+}
+
 /// Represents an NDI source discovered on the network.
 ///
 /// Sources contain a human-readable name and network address. The name
@@ -338,6 +425,107 @@ pub(crate) struct RawSource {
 }
 
 impl Source {
+    /// Check if this source matches a given host or IP address.
+    ///
+    /// This method checks both the source name and address for a match,
+    /// making it easy to find sources by hostname or IP.
+    ///
+    /// # Arguments
+    ///
+    /// * `host` - The hostname or IP address to match against
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use grafton_ndi::{Source, SourceAddress};
+    ///
+    /// let source = Source {
+    ///     name: "CAMERA1 (Chan1, 192.168.0.107)".to_string(),
+    ///     address: SourceAddress::Ip("192.168.0.107:5960".to_string()),
+    /// };
+    ///
+    /// assert!(source.matches_host("192.168.0.107"));
+    /// assert!(source.matches_host("CAMERA1"));
+    /// assert!(!source.matches_host("192.168.1.1"));
+    /// ```
+    pub fn matches_host(&self, host: &str) -> bool {
+        self.name.contains(host) || self.address.contains_host(host)
+    }
+
+    /// Extract the IP address from this source if available.
+    ///
+    /// For IP-based sources, this returns the IP portion without the port.
+    /// For URL-based sources, this extracts the hostname portion.
+    ///
+    /// # Returns
+    ///
+    /// `Some(ip)` if an IP or hostname is found, `None` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use grafton_ndi::{Source, SourceAddress};
+    ///
+    /// let source = Source {
+    ///     name: "CAMERA1".to_string(),
+    ///     address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
+    /// };
+    ///
+    /// assert_eq!(source.ip_address(), Some("192.168.1.100"));
+    /// ```
+    pub fn ip_address(&self) -> Option<&str> {
+        match &self.address {
+            SourceAddress::Ip(ip) => {
+                // Split on colon to remove port
+                Some(ip.split(':').next().unwrap_or(ip))
+            }
+            SourceAddress::Url(url) => {
+                // Extract hostname from URL
+                // Format: scheme://host:port/path
+                // Remove scheme if present
+                let without_scheme = if let Some(idx) = url.find("://") {
+                    &url[idx + 3..]
+                } else {
+                    url.as_str()
+                };
+                // Split on : or / to get just the host
+                let host = without_scheme
+                    .split(':')
+                    .next()
+                    .unwrap_or(without_scheme)
+                    .split('/')
+                    .next()
+                    .unwrap_or(without_scheme);
+                if host.is_empty() {
+                    None
+                } else {
+                    Some(host)
+                }
+            }
+            SourceAddress::None => None,
+        }
+    }
+
+    /// Extract the hostname or IP without port.
+    ///
+    /// This is an alias for `ip_address()` for better API discoverability.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use grafton_ndi::{Source, SourceAddress};
+    ///
+    /// let source = Source {
+    ///     name: "CAMERA1".to_string(),
+    ///     address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
+    /// };
+    ///
+    /// assert_eq!(source.host(), Some("192.168.1.100"));
+    /// ```
+    pub fn host(&self) -> Option<&str> {
+        self.ip_address()
+    }
+
     pub(crate) fn from_raw(ndi_source: &NDIlib_source_t) -> Self {
         let name = unsafe {
             CStr::from_ptr(ndi_source.p_ndi_name)

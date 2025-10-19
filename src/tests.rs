@@ -297,3 +297,197 @@ fn test_timeout_duration_calculation() {
     let long_duration = std::time::Duration::from_millis(long_timeout_ms.into());
     assert_eq!(long_duration.as_millis(), 60_000);
 }
+
+#[test]
+fn test_source_address_contains_host() {
+    use crate::finder::SourceAddress;
+
+    // Test IP address matching
+    let ip_addr = SourceAddress::Ip("192.168.1.100:5960".to_string());
+    assert!(ip_addr.contains_host("192.168.1.100"));
+    assert!(ip_addr.contains_host("192.168.1"));
+    assert!(ip_addr.contains_host("5960"));
+    assert!(!ip_addr.contains_host("192.168.2"));
+
+    // Test URL matching
+    let url_addr = SourceAddress::Url("http://camera.local:8080".to_string());
+    assert!(url_addr.contains_host("camera.local"));
+    assert!(url_addr.contains_host("camera"));
+    assert!(url_addr.contains_host("8080"));
+    assert!(!url_addr.contains_host("other.local"));
+
+    // Test None variant
+    let none_addr = SourceAddress::None;
+    assert!(!none_addr.contains_host("anything"));
+}
+
+#[test]
+fn test_source_address_port() {
+    use crate::finder::SourceAddress;
+
+    // Test IP address with port
+    let ip_with_port = SourceAddress::Ip("192.168.1.100:5960".to_string());
+    assert_eq!(ip_with_port.port(), Some(5960));
+
+    // Test IP address without port
+    let ip_no_port = SourceAddress::Ip("192.168.1.100".to_string());
+    assert_eq!(ip_no_port.port(), None);
+
+    // Test URL with port
+    let url_with_port = SourceAddress::Url("http://camera.local:8080".to_string());
+    assert_eq!(url_with_port.port(), Some(8080));
+
+    // Test URL with port and path
+    let url_with_path = SourceAddress::Url("http://camera.local:8080/stream".to_string());
+    assert_eq!(url_with_path.port(), Some(8080));
+
+    // Test URL without port
+    let url_no_port = SourceAddress::Url("http://camera.local".to_string());
+    assert_eq!(url_no_port.port(), None);
+
+    // Test URL with scheme but no port
+    let url_scheme_only = SourceAddress::Url("http://camera.local/stream".to_string());
+    assert_eq!(url_scheme_only.port(), None);
+
+    // Test None variant
+    let none_addr = SourceAddress::None;
+    assert_eq!(none_addr.port(), None);
+
+    // Test edge case: IPv6-style address (just ensure it doesn't panic)
+    let ipv6_style = SourceAddress::Ip("fe80::1:5960".to_string());
+    // This will parse the last segment after colon as port
+    assert_eq!(ipv6_style.port(), Some(5960));
+}
+
+#[test]
+fn test_source_matches_host() {
+    use crate::finder::{Source, SourceAddress};
+
+    // Test matching by IP address
+    let source = Source {
+        name: "CAMERA1 (Chan1)".to_string(),
+        address: SourceAddress::Ip("192.168.0.107:5960".to_string()),
+    };
+    assert!(source.matches_host("192.168.0.107"));
+    assert!(source.matches_host("192.168.0"));
+    assert!(!source.matches_host("192.168.1"));
+
+    // Test matching by name
+    assert!(source.matches_host("CAMERA1"));
+    assert!(source.matches_host("Chan1"));
+    assert!(!source.matches_host("CAMERA2"));
+
+    // Test matching with URL address
+    let url_source = Source {
+        name: "Studio Camera".to_string(),
+        address: SourceAddress::Url("http://studio.local:8080".to_string()),
+    };
+    assert!(url_source.matches_host("studio.local"));
+    assert!(url_source.matches_host("Studio"));
+    assert!(!url_source.matches_host("other"));
+
+    // Test with None address
+    let no_addr_source = Source {
+        name: "Local Source".to_string(),
+        address: SourceAddress::None,
+    };
+    assert!(no_addr_source.matches_host("Local"));
+    assert!(!no_addr_source.matches_host("192.168.1.1"));
+}
+
+#[test]
+fn test_source_ip_address() {
+    use crate::finder::{Source, SourceAddress};
+
+    // Test IP address extraction from IP variant
+    let ip_source = Source {
+        name: "CAMERA1".to_string(),
+        address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
+    };
+    assert_eq!(ip_source.ip_address(), Some("192.168.1.100"));
+
+    // Test IP without port
+    let ip_no_port = Source {
+        name: "CAMERA2".to_string(),
+        address: SourceAddress::Ip("192.168.1.101".to_string()),
+    };
+    assert_eq!(ip_no_port.ip_address(), Some("192.168.1.101"));
+
+    // Test hostname extraction from URL variant
+    let url_source = Source {
+        name: "Studio".to_string(),
+        address: SourceAddress::Url("http://camera.local:8080".to_string()),
+    };
+    assert_eq!(url_source.ip_address(), Some("camera.local"));
+
+    // Test URL with path
+    let url_with_path = Source {
+        name: "Studio2".to_string(),
+        address: SourceAddress::Url("http://camera.local:8080/stream".to_string()),
+    };
+    assert_eq!(url_with_path.ip_address(), Some("camera.local"));
+
+    // Test URL without scheme
+    let url_no_scheme = Source {
+        name: "Studio3".to_string(),
+        address: SourceAddress::Url("camera.local:8080".to_string()),
+    };
+    assert_eq!(url_no_scheme.ip_address(), Some("camera.local"));
+
+    // Test None variant
+    let none_source = Source {
+        name: "None".to_string(),
+        address: SourceAddress::None,
+    };
+    assert_eq!(none_source.ip_address(), None);
+}
+
+#[test]
+fn test_source_host() {
+    use crate::finder::{Source, SourceAddress};
+
+    // Test that host() is an alias for ip_address()
+    let source = Source {
+        name: "CAMERA1".to_string(),
+        address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
+    };
+    assert_eq!(source.host(), source.ip_address());
+    assert_eq!(source.host(), Some("192.168.1.100"));
+
+    let url_source = Source {
+        name: "Studio".to_string(),
+        address: SourceAddress::Url("http://camera.local:8080".to_string()),
+    };
+    assert_eq!(url_source.host(), url_source.ip_address());
+    assert_eq!(url_source.host(), Some("camera.local"));
+}
+
+#[test]
+fn test_source_matching_real_world_example() {
+    use crate::finder::{Source, SourceAddress};
+
+    // Real-world example from the issue description
+    let source = Source {
+        name: "CAMERA1 (Chan1, 192.168.0.107)".to_string(),
+        address: SourceAddress::Ip("192.168.0.107:5960".to_string()),
+    };
+
+    // Should match by IP in address
+    assert!(source.matches_host("192.168.0.107"));
+
+    // Should match by partial IP
+    assert!(source.matches_host("192.168.0"));
+
+    // Should match by name
+    assert!(source.matches_host("CAMERA1"));
+
+    // Should match by IP in name
+    assert!(source.matches_host("192.168.0.107"));
+
+    // Should extract IP correctly
+    assert_eq!(source.ip_address(), Some("192.168.0.107"));
+    assert_eq!(source.host(), Some("192.168.0.107"));
+
+    // Should extract port correctly
+    assert_eq!(source.address.port(), Some(5960));
+}
