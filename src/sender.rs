@@ -13,7 +13,11 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "advanced_sdk")]
+use std::sync::{Condvar, Mutex};
+
 #[cfg(target_os = "windows")]
+#[cfg(not(feature = "advanced_sdk"))]
 use std::sync::Mutex;
 
 use crate::{
@@ -56,21 +60,33 @@ pub struct Sender<'a> {
 
 type AsyncCallback = Box<dyn Fn(usize) + Send + Sync>;
 
-/// Lock-free async completion state
+/// Async completion state for video frames
 struct AsyncState {
     // Video async state (only video supports async in NDI SDK)
     video_buffer_ptr: AtomicPtr<u8>,
     video_buffer_len: AtomicUsize,
     video_callback: OnceLock<AsyncCallback>,
+
+    // Completion signaling for advanced_sdk callback-based completion
+    #[cfg(feature = "advanced_sdk")]
+    completed: AtomicBool,
+    #[cfg(feature = "advanced_sdk")]
+    completion_lock: Mutex<()>,
+    #[cfg(feature = "advanced_sdk")]
+    completion_cv: Condvar,
 }
 
 impl fmt::Debug for AsyncState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AsyncState")
-            .field("video_buffer_ptr", &self.video_buffer_ptr)
+        let mut dbg = f.debug_struct("AsyncState");
+        dbg.field("video_buffer_ptr", &self.video_buffer_ptr)
             .field("video_buffer_len", &self.video_buffer_len)
-            .field("video_callback_set", &self.video_callback.get().is_some())
-            .finish()
+            .field("video_callback_set", &self.video_callback.get().is_some());
+
+        #[cfg(feature = "advanced_sdk")]
+        dbg.field("completed", &self.completed);
+
+        dbg.finish()
     }
 }
 
@@ -91,6 +107,13 @@ impl Default for AsyncState {
             video_buffer_ptr: AtomicPtr::new(ptr::null_mut()),
             video_buffer_len: AtomicUsize::new(0),
             video_callback: OnceLock::new(),
+
+            #[cfg(feature = "advanced_sdk")]
+            completed: AtomicBool::new(true), // Start as completed (no frame in flight)
+            #[cfg(feature = "advanced_sdk")]
+            completion_lock: Mutex::new(()),
+            #[cfg(feature = "advanced_sdk")]
+            completion_cv: Condvar::new(),
         }
     }
 }
@@ -270,11 +293,48 @@ impl Drop for AsyncVideoToken<'_, '_> {
             }
         }
 
-        // When advanced_sdk is enabled, the SDK callback handles everything
+        // When advanced_sdk is enabled, wait for the callback to signal completion
         #[cfg(feature = "advanced_sdk")]
         {
-            // In the future when advanced SDK is properly enabled,
-            // the callback will handle buffer release notification
+            // Wait for completion with a timeout to prevent indefinite hangs
+            // Use a reasonable timeout (e.g., 5 seconds for a single frame)
+            let timeout = Duration::from_secs(5);
+
+            let mut guard = self.inner.async_state.completion_lock.lock().unwrap();
+            let start = std::time::Instant::now();
+
+            while !self.inner.async_state.completed.load(Ordering::Acquire) {
+                let elapsed = start.elapsed();
+                if elapsed >= timeout {
+                    // Timeout occurred - log warning but don't panic
+                    // The buffer may still be in use by NDI, which is a correctness issue
+                    eprintln!(
+                        "Warning: AsyncVideoToken dropped after timeout waiting for NDI completion callback"
+                    );
+                    break;
+                }
+
+                let remaining = timeout - elapsed;
+                let (new_guard, timeout_result) = self
+                    .inner
+                    .async_state
+                    .completion_cv
+                    .wait_timeout(guard, remaining)
+                    .unwrap();
+                guard = new_guard;
+
+                if timeout_result.timed_out() {
+                    eprintln!(
+                        "Warning: AsyncVideoToken dropped after timeout waiting for NDI completion callback"
+                    );
+                    break;
+                }
+            }
+
+            // Call user callback after completion
+            if let Some(callback) = self.inner.async_state.video_callback.get() {
+                callback(self._buffer.len());
+            }
         }
     }
 }
@@ -368,6 +428,13 @@ impl<'a> Sender<'a> {
                             0
                         };
 
+                        // Signal completion by setting the atomic flag and notifying waiters
+                        inner.async_state.completed.store(true, Ordering::Release);
+                        {
+                            let _lock = inner.async_state.completion_lock.lock().unwrap();
+                            inner.async_state.completion_cv.notify_all();
+                        }
+
                         // Call the user's completion callback if set
                         if let Some(cb) = inner.async_state.video_callback.get() {
                             (cb)(len);
@@ -379,8 +446,8 @@ impl<'a> Sender<'a> {
                     }
                 }
 
-                // NOTE: Uncomment when NDIlib_send_set_video_async_completion is available in bindings
-                /*
+                // Register the callback if the function is available in the SDK
+                #[cfg(has_async_completion_callback)]
                 unsafe {
                     NDIlib_send_set_video_async_completion(
                         instance,
@@ -388,10 +455,13 @@ impl<'a> Sender<'a> {
                         Some(video_done_cb),
                     );
                 }
-                */
 
-                let _ = unsafe { Arc::from_raw(raw_inner as *const Inner) };
-                inner.callback_ptr.store(ptr::null_mut(), Ordering::Release);
+                // If the callback is not available, clean up the Arc we created
+                #[cfg(not(has_async_completion_callback))]
+                {
+                    let _ = unsafe { Arc::from_raw(raw_inner as *const Inner) };
+                    inner.callback_ptr.store(ptr::null_mut(), Ordering::Release);
+                }
             }
 
             Ok(Self {
@@ -459,6 +529,15 @@ impl<'a> Sender<'a> {
         &'b mut self,
         video_frame: &BorrowedVideoFrame<'b>,
     ) -> AsyncVideoToken<'b, 'b> {
+        // Clear completion flag before sending (advanced_sdk only)
+        #[cfg(feature = "advanced_sdk")]
+        {
+            self.inner
+                .async_state
+                .completed
+                .store(false, Ordering::Release);
+        }
+
         unsafe {
             NDIlib_send_send_video_async_v2(self.inner.instance, &video_frame.to_raw());
         }
@@ -648,17 +727,16 @@ impl<'a> Sender<'a> {
         }
     }
 
-    /// Wait for pending async operations with timeout (optional helper).
+    /// Wait for pending async operations with timeout.
     ///
-    /// **Note**: With the single-flight async API, this method is no longer needed
-    /// since the AsyncVideoToken ensures completion when dropped. This method is
-    /// kept for backwards compatibility but immediately returns Ok(()) since there
-    /// can only be one async operation in-flight at a time, and it's tied to a
-    /// token lifetime.
+    /// With `advanced_sdk`, this waits up to the specified timeout for the
+    /// in-flight frame's completion callback. Without `advanced_sdk`, this
+    /// calls `flush_async_blocking` to drain pending operations.
     ///
     /// # Returns
     ///
-    /// - Always returns `Ok(())` in the current single-flight implementation
+    /// - `Ok(())` if the operation completed within the timeout
+    /// - `Err(Error::Timeout)` if the timeout elapsed (advanced_sdk only)
     ///
     /// # Example
     ///
@@ -671,15 +749,54 @@ impl<'a> Sender<'a> {
     ///
     /// // ... send some async frames ...
     ///
-    /// // Optional: wait with timeout before drop (now a no-op)
+    /// // Wait with timeout for completion
     /// sender.flush_async(Duration::from_secs(1))?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn flush_async(&self, _timeout: Duration) -> Result<()> {
-        // With single-flight semantics, there's nothing to wait for
-        // The token's borrow ensures the operation completes before reuse
-        Ok(())
+    pub fn flush_async(&self, timeout: Duration) -> Result<()> {
+        #[cfg(feature = "advanced_sdk")]
+        {
+            // Wait for completion with timeout
+            let mut guard = self.inner.async_state.completion_lock.lock().unwrap();
+            let start = std::time::Instant::now();
+
+            while !self.inner.async_state.completed.load(Ordering::Acquire) {
+                let elapsed = start.elapsed();
+                if elapsed >= timeout {
+                    return Err(Error::Timeout(format!(
+                        "Async video frame did not complete within {:?}",
+                        timeout
+                    )));
+                }
+
+                let remaining = timeout - elapsed;
+                let (new_guard, timeout_result) = self
+                    .inner
+                    .async_state
+                    .completion_cv
+                    .wait_timeout(guard, remaining)
+                    .unwrap();
+                guard = new_guard;
+
+                if timeout_result.timed_out() {
+                    return Err(Error::Timeout(format!(
+                        "Async video frame did not complete within {:?}",
+                        timeout
+                    )));
+                }
+            }
+
+            Ok(())
+        }
+
+        #[cfg(not(feature = "advanced_sdk"))]
+        {
+            // Without advanced SDK, use the null-frame flush
+            let _ = timeout; // Suppress unused warning
+            self.flush_async_blocking();
+            Ok(())
+        }
     }
 }
 
