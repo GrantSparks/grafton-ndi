@@ -27,7 +27,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
 
     // Set up callback for video completion
     sender.on_async_video_done(move |len| {
-        println!("Video buffer released: {} bytes", len);
+        println!("Video buffer released: {len} bytes");
         let _ = tx.send(len);
     });
 
@@ -90,7 +90,8 @@ fn main() -> Result<(), grafton_ndi::Error> {
             let frame =
                 BorrowedVideoFrame::from_buffer(buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
 
-            println!("Sending frame {}...", idx + 1);
+            let frame_num = idx + 1;
+            println!("Sending frame {frame_num}...");
             let _token = sender.send_video_async(&frame);
 
             // Simulate some processing time

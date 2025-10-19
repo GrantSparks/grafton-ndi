@@ -1,7 +1,9 @@
 extern crate bindgen;
 
-use std::env;
-use std::path::{Path, PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 fn main() {
     // Register custom cfg for conditional compilation based on SDK capabilities
