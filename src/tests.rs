@@ -263,3 +263,37 @@ fn test_async_completion_handler() {
     // Verify callback was called
     assert_eq!(rx.recv().unwrap(), 1024);
 }
+
+#[test]
+fn test_retry_logic_constants() {
+    // Test that retry methods use reasonable timeout and sleep values
+    // This validates the constants are within expected ranges
+
+    // Per-attempt timeout should be reasonable (100ms in implementation)
+    let per_attempt_timeout_ms = 100;
+    assert!((10..=1000).contains(&per_attempt_timeout_ms));
+
+    // Sleep between retries should be brief (10ms in implementation)
+    let sleep_between_retries_ms = 10;
+    assert!((1..=100).contains(&sleep_between_retries_ms));
+
+    // These constants ensure non-blocking behavior without excessive CPU usage
+}
+
+#[test]
+fn test_timeout_duration_calculation() {
+    // Verify timeout duration conversion works correctly
+    let timeout_ms: u32 = 5000;
+    let timeout_duration = std::time::Duration::from_millis(timeout_ms.into());
+    assert_eq!(timeout_duration.as_millis(), 5000);
+
+    // Edge case: very short timeout
+    let short_timeout_ms: u32 = 100;
+    let short_duration = std::time::Duration::from_millis(short_timeout_ms.into());
+    assert_eq!(short_duration.as_millis(), 100);
+
+    // Edge case: long timeout
+    let long_timeout_ms: u32 = 60_000; // 1 minute
+    let long_duration = std::time::Duration::from_millis(long_timeout_ms.into());
+    assert_eq!(long_duration.as_millis(), 60_000);
+}

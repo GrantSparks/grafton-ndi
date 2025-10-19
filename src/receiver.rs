@@ -536,6 +536,116 @@ impl<'a> Receiver<'a> {
         }
     }
 
+    /// Capture video with automatic retry logic.
+    ///
+    /// The NDI SDK's `capture_video` may return `None` immediately even when frames
+    /// are available, rather than blocking for the full timeout duration. This method
+    /// handles that SDK behavior by retrying up to `max_attempts` times.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout_ms` - Timeout for each individual capture attempt in milliseconds
+    /// * `max_attempts` - Maximum number of retry attempts before giving up
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(frame))` - Successfully captured a video frame
+    /// * `Ok(None)` - No frame available after all retry attempts
+    /// * `Err(_)` - An error occurred during capture
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
+    /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+    /// // Try up to 10 times with 100ms timeout per attempt
+    /// if let Some(frame) = receiver.capture_video_with_retry(100, 10)? {
+    ///     println!("Captured {}x{} frame", frame.width, frame.height);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn capture_video_with_retry(
+        &self,
+        timeout_ms: u32,
+        max_attempts: usize,
+    ) -> Result<Option<VideoFrame<'_>>> {
+        for attempt in 1..=max_attempts {
+            match self.capture_video(timeout_ms)? {
+                Some(frame) => return Ok(Some(frame)),
+                None => {
+                    // Don't sleep on the last attempt
+                    if attempt < max_attempts {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Capture video, blocking until a frame is received or timeout expires.
+    ///
+    /// This is the recommended method for reliable video frame capture. It handles
+    /// the NDI SDK's quirk where `capture_video` may return immediately rather than
+    /// blocking for the full timeout duration.
+    ///
+    /// # Arguments
+    ///
+    /// * `total_timeout_ms` - Total time to wait for a frame in milliseconds
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(frame)` - Successfully captured a video frame
+    /// * `Err(Error::Timeout)` - No frame received within the timeout period
+    /// * `Err(_)` - Another error occurred during capture
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
+    /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+    /// // Wait up to 5 seconds for a frame
+    /// let frame = receiver.capture_video_blocking(5000)?;
+    /// println!("Captured {}x{} frame", frame.width, frame.height);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn capture_video_blocking(&self, total_timeout_ms: u32) -> Result<VideoFrame<'_>> {
+        let start_time = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(total_timeout_ms.into());
+        let mut attempts = 0;
+
+        loop {
+            attempts += 1;
+
+            // Check if we've exceeded our total timeout
+            if start_time.elapsed() > timeout {
+                return Err(Error::Timeout(format!(
+                    "No video frame received after {} attempts ({:?})",
+                    attempts,
+                    start_time.elapsed()
+                )));
+            }
+
+            // Try to capture with a short per-attempt timeout (100ms)
+            // The NDI SDK may return immediately even with a longer timeout
+            match self.capture_video(100)? {
+                Some(frame) => return Ok(frame),
+                None => {
+                    // Brief sleep before retry to avoid busy-waiting
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
     /// Capture only audio frames - safe to call from multiple threads concurrently
     pub fn capture_audio(&self, timeout_ms: u32) -> Result<Option<AudioFrame<'_>>> {
         let mut audio_frame = NDIlib_audio_frame_v3_t::default();
@@ -561,6 +671,81 @@ impl<'a> Receiver<'a> {
                 Err(Error::CaptureFailed("Received an error frame".into()))
             }
             _ => Ok(None), // Other frame types are ignored when capturing audio only
+        }
+    }
+
+    /// Capture audio with automatic retry logic.
+    ///
+    /// Similar to `capture_video_with_retry`, this handles the NDI SDK's behavior
+    /// where capture may return `None` immediately rather than blocking.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout_ms` - Timeout for each individual capture attempt in milliseconds
+    /// * `max_attempts` - Maximum number of retry attempts before giving up
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(frame))` - Successfully captured an audio frame
+    /// * `Ok(None)` - No frame available after all retry attempts
+    /// * `Err(_)` - An error occurred during capture
+    pub fn capture_audio_with_retry(
+        &self,
+        timeout_ms: u32,
+        max_attempts: usize,
+    ) -> Result<Option<AudioFrame<'_>>> {
+        for attempt in 1..=max_attempts {
+            match self.capture_audio(timeout_ms)? {
+                Some(frame) => return Ok(Some(frame)),
+                None => {
+                    // Don't sleep on the last attempt
+                    if attempt < max_attempts {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Capture audio, blocking until a frame is received or timeout expires.
+    ///
+    /// This is the recommended method for reliable audio frame capture.
+    ///
+    /// # Arguments
+    ///
+    /// * `total_timeout_ms` - Total time to wait for a frame in milliseconds
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(frame)` - Successfully captured an audio frame
+    /// * `Err(Error::Timeout)` - No frame received within the timeout period
+    /// * `Err(_)` - Another error occurred during capture
+    pub fn capture_audio_blocking(&self, total_timeout_ms: u32) -> Result<AudioFrame<'_>> {
+        let start_time = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(total_timeout_ms.into());
+        let mut attempts = 0;
+
+        loop {
+            attempts += 1;
+
+            // Check if we've exceeded our total timeout
+            if start_time.elapsed() > timeout {
+                return Err(Error::Timeout(format!(
+                    "No audio frame received after {} attempts ({:?})",
+                    attempts,
+                    start_time.elapsed()
+                )));
+            }
+
+            // Try to capture with a short per-attempt timeout (100ms)
+            match self.capture_audio(100)? {
+                Some(frame) => return Ok(frame),
+                None => {
+                    // Brief sleep before retry to avoid busy-waiting
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
         }
     }
 
@@ -590,6 +775,81 @@ impl<'a> Receiver<'a> {
                 Err(Error::CaptureFailed("Received an error frame".into()))
             }
             _ => Ok(None), // Other frame types are ignored when capturing metadata only
+        }
+    }
+
+    /// Capture metadata with automatic retry logic.
+    ///
+    /// Similar to `capture_video_with_retry`, this handles the NDI SDK's behavior
+    /// where capture may return `None` immediately rather than blocking.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout_ms` - Timeout for each individual capture attempt in milliseconds
+    /// * `max_attempts` - Maximum number of retry attempts before giving up
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(frame))` - Successfully captured a metadata frame
+    /// * `Ok(None)` - No frame available after all retry attempts
+    /// * `Err(_)` - An error occurred during capture
+    pub fn capture_metadata_with_retry(
+        &self,
+        timeout_ms: u32,
+        max_attempts: usize,
+    ) -> Result<Option<MetadataFrame>> {
+        for attempt in 1..=max_attempts {
+            match self.capture_metadata(timeout_ms)? {
+                Some(frame) => return Ok(Some(frame)),
+                None => {
+                    // Don't sleep on the last attempt
+                    if attempt < max_attempts {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Capture metadata, blocking until a frame is received or timeout expires.
+    ///
+    /// This is the recommended method for reliable metadata frame capture.
+    ///
+    /// # Arguments
+    ///
+    /// * `total_timeout_ms` - Total time to wait for a frame in milliseconds
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(frame)` - Successfully captured a metadata frame
+    /// * `Err(Error::Timeout)` - No frame received within the timeout period
+    /// * `Err(_)` - Another error occurred during capture
+    pub fn capture_metadata_blocking(&self, total_timeout_ms: u32) -> Result<MetadataFrame> {
+        let start_time = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(total_timeout_ms.into());
+        let mut attempts = 0;
+
+        loop {
+            attempts += 1;
+
+            // Check if we've exceeded our total timeout
+            if start_time.elapsed() > timeout {
+                return Err(Error::Timeout(format!(
+                    "No metadata frame received after {} attempts ({:?})",
+                    attempts,
+                    start_time.elapsed()
+                )));
+            }
+
+            // Try to capture with a short per-attempt timeout (100ms)
+            match self.capture_metadata(100)? {
+                Some(frame) => return Ok(frame),
+                None => {
+                    // Brief sleep before retry to avoid busy-waiting
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
         }
     }
 
