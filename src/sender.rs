@@ -1,5 +1,9 @@
 //! NDI sending functionality for video, audio, and metadata.
 
+#[cfg(all(target_os = "windows", not(feature = "advanced_sdk")))]
+use std::sync::Mutex;
+#[cfg(feature = "advanced_sdk")]
+use std::sync::{Condvar, Mutex};
 use std::{
     ffi::{CStr, CString},
     fmt,
@@ -14,12 +18,7 @@ use std::{
 };
 
 #[cfg(feature = "advanced_sdk")]
-use std::sync::{Condvar, Mutex};
-
-#[cfg(target_os = "windows")]
-#[cfg(not(feature = "advanced_sdk"))]
-use std::sync::Mutex;
-
+use crate::frames::is_uncompressed_format;
 use crate::{
     finder::Source,
     frames::{
@@ -30,9 +29,6 @@ use crate::{
     receiver::Tally,
     Error, Result, NDI,
 };
-
-#[cfg(feature = "advanced_sdk")]
-use crate::frames::is_uncompressed_format;
 
 #[cfg(not(target_has_atomic = "ptr"))]
 compile_error!(
@@ -511,7 +507,7 @@ impl<'a> Sender<'a> {
     /// let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
     ///
     /// // Register callback to know when buffer is released
-    /// sender.on_async_video_done(|len| println!("Buffer released: {} bytes", len));
+    /// sender.on_async_video_done(|len| println!("Buffer released: {len} bytes"));
     ///
     /// // Use borrowed buffer directly (zero-copy, no allocation)
     /// let buffer = vec![0u8; 1920 * 1080 * 4];
@@ -640,10 +636,28 @@ impl<'a> Sender<'a> {
         Ok(())
     }
 
-    #[must_use]
-    pub fn get_source_name(&self) -> Source {
+    /// Get the source name for this sender.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NullPointer` if the NDI SDK returns a null pointer or
+    /// if the source data contains null pointers.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, SenderOptions};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::new()?;
+    /// let sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build()?)?;
+    /// let source = sender.get_source_name()?;
+    /// println!("Sender source: {source}");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_source_name(&self) -> Result<Source> {
         let source_ptr = unsafe { NDIlib_send_get_source_name(self.inner.instance) };
-        Source::from_raw(unsafe { &*source_ptr })
+        Source::try_from_raw(source_ptr)
     }
 
     /// Register a handler that will be called once the SDK has released

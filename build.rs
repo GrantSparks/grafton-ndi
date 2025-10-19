@@ -1,7 +1,5 @@
-extern crate bindgen;
-
 use std::{
-    env,
+    env, fs,
     path::{Path, PathBuf},
 };
 
@@ -100,7 +98,7 @@ fn main() {
 #include <{header_file}>
 "#
     );
-    std::fs::write(&wrapper_path, wrapper_content).expect("Failed to create wrapper.h");
+    fs::write(&wrapper_path, wrapper_content).expect("Failed to create wrapper.h");
 
     let main_header = wrapper_path.to_str().unwrap().to_string();
 
@@ -220,7 +218,7 @@ fn main() {
     // Check if NDIlib_send_set_video_async_completion is available in the bindings
     // This function is only available in NDI Advanced SDK 6.1.1+
     let bindings_content =
-        std::fs::read_to_string(&bindings_path).expect("Failed to read generated bindings");
+        fs::read_to_string(&bindings_path).expect("Failed to read generated bindings");
 
     if bindings_content.contains("NDIlib_send_set_video_async_completion") {
         println!("cargo:rustc-cfg=has_async_completion_callback");
