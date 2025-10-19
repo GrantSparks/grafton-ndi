@@ -63,6 +63,13 @@ This release dramatically improves ergonomics and reduces boilerplate for common
 
 ### Added
 
+#### 📡 Source Discovery Enhancement
+- **`Finder::get_current_sources()`**: Get immediate snapshot of discovered sources
+  - Uses `NDIlib_find_get_current_sources` for instant source list retrieval
+  - No additional network discovery unlike `get_sources(timeout)`
+  - Available since NDI SDK 6.0
+  - Useful for polling current state without blocking
+
 #### 🚀 Async Runtime Integration (Features: `tokio`, `async-std`)
 - **`AsyncReceiver`**: Full async/await support for Tokio and async-std runtimes
   - All 9 capture methods (video/audio/metadata × 3 retry variants)
