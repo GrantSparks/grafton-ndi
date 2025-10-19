@@ -676,15 +676,15 @@ impl<'a> Sender<'a> {
     /// # use grafton_ndi::{NDI, SenderOptions, BorrowedVideoFrame, FourCCVideoType};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let ndi = NDI::new()?;
-    /// let sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build()?)?;
+    /// let mut sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build()?)?;
     ///
     /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
     /// let frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
     /// let token = sender.send_video_async(&frame);
     ///
-    /// // Flush to ensure buffer is released
+    /// // Drop token to release the mutable borrow, then flush
+    /// drop(token);
     /// sender.flush_async_blocking();
-    /// drop(token); // Now safe to drop token
     ///
     /// // Buffer can now be safely reused
     /// buffer.fill(0);
@@ -765,8 +765,7 @@ impl<'a> Sender<'a> {
                 let elapsed = start.elapsed();
                 if elapsed >= timeout {
                     return Err(Error::Timeout(format!(
-                        "Async video frame did not complete within {:?}",
-                        timeout
+                        "Async video frame did not complete within {timeout:?}"
                     )));
                 }
 
@@ -781,8 +780,7 @@ impl<'a> Sender<'a> {
 
                 if timeout_result.timed_out() {
                     return Err(Error::Timeout(format!(
-                        "Async video frame did not complete within {:?}",
-                        timeout
+                        "Async video frame did not complete within {timeout:?}"
                     )));
                 }
             }

@@ -65,7 +65,7 @@
 //! ```no_run
 //! # use grafton_ndi::{NDI, SenderOptions, BorrowedVideoFrame, FourCCVideoType};
 //! # let ndi = NDI::new().unwrap();
-//! # let sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build().unwrap()).unwrap();
+//! # let mut sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build().unwrap()).unwrap();
 //! // Register callback to know when buffer is released
 //! sender.on_async_video_done(|len| println!("Buffer released: {} bytes", len));
 //!
