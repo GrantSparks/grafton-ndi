@@ -28,7 +28,7 @@
 //! # }
 //! ```
 
-use std::{ffi::CString, marker::PhantomData, ptr};
+use std::{ffi::CString, ptr};
 
 use crate::{
     finder::{RawSource, Source},
@@ -68,7 +68,7 @@ macro_rules! ptz_command {
     };
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiverColorFormat {
     #[default]
     BGRX_BGRA,
@@ -108,7 +108,7 @@ impl From<ReceiverColorFormat> for NDIlib_recv_color_format_e {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiverBandwidth {
     MetadataOnly,
     AudioOnly,
@@ -210,6 +210,133 @@ impl ReceiverOptionsBuilder {
         }
     }
 
+    /// Preset for capturing snapshots (low resolution, RGBA, lowest bandwidth).
+    ///
+    /// This preset is optimized for:
+    /// - Image export and snapshot capture
+    /// - AI/ML processing pipelines
+    /// - Thumbnail generation
+    /// - Low bandwidth environments
+    ///
+    /// Configuration:
+    /// - Color format: `RGBX_RGBA` (compatible with image encoding)
+    /// - Bandwidth: `Lowest` (reduces resolution and bitrate)
+    /// - Video fields: Disabled (progressive frames only)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptionsBuilder};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
+    /// # finder.wait_for_sources(1000);
+    /// # let sources = finder.get_sources(0)?;
+    /// let receiver = ReceiverOptionsBuilder::snapshot_preset(sources[0].clone())
+    ///     .name("Snapshot Receiver")
+    ///     .build(&ndi)?;
+    ///
+    /// // Capture and encode in one line (requires image-encoding feature)
+    /// #[cfg(feature = "image-encoding")]
+    /// {
+    ///     let frame = receiver.capture_video_blocking(5000)?;
+    ///     let png_bytes = frame.encode_png()?;
+    ///     std::fs::write("snapshot.png", &png_bytes)?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn snapshot_preset(source: Source) -> Self {
+        Self::new(source)
+            .color(ReceiverColorFormat::RGBX_RGBA)
+            .bandwidth(ReceiverBandwidth::Lowest)
+            .allow_video_fields(false)
+    }
+
+    /// Preset for high-quality video processing (full resolution, highest bandwidth).
+    ///
+    /// This preset is optimized for:
+    /// - Professional video processing workflows
+    /// - Recording and archival
+    /// - Real-time video analysis requiring full quality
+    /// - Broadcasting and production
+    ///
+    /// Configuration:
+    /// - Color format: `RGBX_RGBA` (uncompressed, compatible with most tools)
+    /// - Bandwidth: `Highest` (full resolution and bitrate)
+    /// - Video fields: Enabled (supports interlaced sources)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptionsBuilder};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
+    /// # finder.wait_for_sources(1000);
+    /// # let sources = finder.get_sources(0)?;
+    /// let receiver = ReceiverOptionsBuilder::high_quality_preset(sources[0].clone())
+    ///     .name("High Quality Receiver")
+    ///     .build(&ndi)?;
+    ///
+    /// // Capture full quality frames
+    /// let frame = receiver.capture_video_blocking(5000)?;
+    /// println!("Captured {}x{} frame", frame.width, frame.height);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn high_quality_preset(source: Source) -> Self {
+        Self::new(source)
+            .color(ReceiverColorFormat::RGBX_RGBA)
+            .bandwidth(ReceiverBandwidth::Highest)
+            .allow_video_fields(true)
+    }
+
+    /// Preset for metadata and tally monitoring only (no video/audio).
+    ///
+    /// This preset is optimized for:
+    /// - Tally light monitoring
+    /// - Connection status tracking
+    /// - PTZ control applications
+    /// - Minimal bandwidth overhead
+    ///
+    /// Configuration:
+    /// - Bandwidth: `MetadataOnly` (no video or audio data)
+    /// - Color format: Default (not used for metadata-only)
+    /// - Video fields: Disabled (not applicable)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptionsBuilder};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
+    /// # finder.wait_for_sources(1000);
+    /// # let sources = finder.get_sources(0)?;
+    /// let receiver = ReceiverOptionsBuilder::monitoring_preset(sources[0].clone())
+    ///     .name("Tally Monitor")
+    ///     .build(&ndi)?;
+    ///
+    /// // Poll for status changes
+    /// if let Some(status) = receiver.poll_status_change(1000) {
+    ///     if let Some(tally) = status.tally {
+    ///         println!("Tally: program={}, preview={}",
+    ///                  tally.on_program, tally.on_preview);
+    ///     }
+    ///     if let Some(connections) = status.connections {
+    ///         println!("Active connections: {}", connections);
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn monitoring_preset(source: Source) -> Self {
+        Self::new(source)
+            .bandwidth(ReceiverBandwidth::MetadataOnly)
+            .allow_video_fields(false)
+    }
+
     /// Set the color format for received video
     #[must_use]
     pub fn color(mut self, fmt: ReceiverColorFormat) -> Self {
@@ -239,7 +366,7 @@ impl ReceiverOptionsBuilder {
     }
 
     /// Build the receiver and create a Receiver instance
-    pub fn build(self, ndi: &NDI) -> Result<Receiver<'_>> {
+    pub fn build(self, ndi: &NDI) -> Result<Receiver> {
         let receiver = ReceiverOptions {
             source_to_connect_to: self.source_to_connect_to,
             color_format: self.color_format.unwrap_or(ReceiverColorFormat::BGRX_BGRA),
@@ -251,13 +378,14 @@ impl ReceiverOptionsBuilder {
     }
 }
 
-pub struct Receiver<'a> {
+pub struct Receiver {
     pub(crate) instance: NDIlib_recv_instance_t,
-    ndi: PhantomData<&'a NDI>,
+    _ndi: NDI,
+    source: Source,
 }
 
-impl<'a> Receiver<'a> {
-    pub fn new(_ndi: &'a NDI, create: &ReceiverOptions) -> Result<Self> {
+impl Receiver {
+    pub fn new(ndi: &NDI, create: &ReceiverOptions) -> Result<Self> {
         let create_raw = create.to_raw()?;
         // NDIlib_recv_create_v3 already connects to the source specified in source_to_connect_to
         let instance = unsafe { NDIlib_recv_create_v3(&create_raw.raw) };
@@ -268,7 +396,8 @@ impl<'a> Receiver<'a> {
         } else {
             Ok(Self {
                 instance,
-                ndi: PhantomData,
+                _ndi: ndi.clone(),
+                source: create.source_to_connect_to.clone(),
             })
         }
     }
@@ -277,7 +406,7 @@ impl<'a> Receiver<'a> {
     #[deprecated(
         note = "Use capture_video, capture_audio, or capture_metadata for concurrent access"
     )]
-    pub fn capture(&mut self, timeout_ms: u32) -> Result<FrameType<'_>> {
+    pub fn capture(&mut self, timeout_ms: u32) -> Result<FrameType> {
         let mut video_frame = NDIlib_video_frame_v2_t::default();
         let mut audio_frame = NDIlib_audio_frame_v3_t::default();
         let mut metadata_frame = NDIlib_metadata_frame_t::default();
@@ -294,12 +423,12 @@ impl<'a> Receiver<'a> {
 
         match frame_type {
             NDIlib_frame_type_e_NDIlib_frame_type_video => {
-                let frame = unsafe { VideoFrame::from_raw(&video_frame, Some(self.instance)) }?;
+                let frame = unsafe { VideoFrame::from_raw(&video_frame) }?;
                 // Note: Drop impl will call NDIlib_recv_free_video_v2 when frame is dropped
                 Ok(FrameType::Video(frame))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_audio => {
-                let frame = AudioFrame::from_raw(audio_frame, Some(self.instance))?;
+                let frame = AudioFrame::from_raw(audio_frame)?;
                 // Note: Drop impl will call NDIlib_recv_free_audio_v3 when frame is dropped
                 Ok(FrameType::Audio(frame))
             }
@@ -509,7 +638,7 @@ impl<'a> Receiver<'a> {
     }
 
     /// Capture only video frames - safe to call from multiple threads concurrently
-    pub fn capture_video(&self, timeout_ms: u32) -> Result<Option<VideoFrame<'_>>> {
+    pub fn capture_video(&self, timeout_ms: u32) -> Result<Option<VideoFrame>> {
         let mut video_frame = NDIlib_video_frame_v2_t::default();
 
         // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
@@ -525,7 +654,7 @@ impl<'a> Receiver<'a> {
 
         match frame_type {
             NDIlib_frame_type_e_NDIlib_frame_type_video => {
-                let frame = unsafe { VideoFrame::from_raw(&video_frame, Some(self.instance)) }?;
+                let frame = unsafe { VideoFrame::from_raw(&video_frame) }?;
                 Ok(Some(frame))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(None),
@@ -536,8 +665,115 @@ impl<'a> Receiver<'a> {
         }
     }
 
+    /// Capture video with automatic retry logic.
+    ///
+    /// The NDI SDK's `capture_video` may return `None` immediately even when frames
+    /// are available, rather than blocking for the full timeout duration. This method
+    /// handles that SDK behavior by retrying up to `max_attempts` times.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout_ms` - Timeout for each individual capture attempt in milliseconds
+    /// * `max_attempts` - Maximum number of retry attempts before giving up
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(frame))` - Successfully captured a video frame
+    /// * `Ok(None)` - No frame available after all retry attempts
+    /// * `Err(_)` - An error occurred during capture
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
+    /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+    /// // Try up to 10 times with 100ms timeout per attempt
+    /// if let Some(frame) = receiver.capture_video_with_retry(100, 10)? {
+    ///     println!("Captured {}x{} frame", frame.width, frame.height);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn capture_video_with_retry(
+        &self,
+        timeout_ms: u32,
+        max_attempts: usize,
+    ) -> Result<Option<VideoFrame>> {
+        for attempt in 1..=max_attempts {
+            match self.capture_video(timeout_ms)? {
+                Some(frame) => return Ok(Some(frame)),
+                None => {
+                    // Don't sleep on the last attempt
+                    if attempt < max_attempts {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Capture video, blocking until a frame is received or timeout expires.
+    ///
+    /// This is the recommended method for reliable video frame capture. It handles
+    /// the NDI SDK's quirk where `capture_video` may return immediately rather than
+    /// blocking for the full timeout duration.
+    ///
+    /// # Arguments
+    ///
+    /// * `total_timeout_ms` - Total time to wait for a frame in milliseconds
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(frame)` - Successfully captured a video frame
+    /// * `Err(Error::FrameTimeout)` - No frame received within the timeout period (includes retry details)
+    /// * `Err(_)` - Another error occurred during capture
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
+    /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+    /// // Wait up to 5 seconds for a frame
+    /// let frame = receiver.capture_video_blocking(5000)?;
+    /// println!("Captured {}x{} frame", frame.width, frame.height);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn capture_video_blocking(&self, total_timeout_ms: u32) -> Result<VideoFrame> {
+        let start_time = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(total_timeout_ms.into());
+        let mut attempts = 0;
+
+        loop {
+            attempts += 1;
+
+            // Check if we've exceeded our total timeout
+            let elapsed = start_time.elapsed();
+            if elapsed > timeout {
+                return Err(Error::FrameTimeout { attempts, elapsed });
+            }
+
+            // Try to capture with a short per-attempt timeout (100ms)
+            // The NDI SDK may return immediately even with a longer timeout
+            match self.capture_video(100)? {
+                Some(frame) => return Ok(frame),
+                None => {
+                    // Brief sleep before retry to avoid busy-waiting
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
     /// Capture only audio frames - safe to call from multiple threads concurrently
-    pub fn capture_audio(&self, timeout_ms: u32) -> Result<Option<AudioFrame<'_>>> {
+    pub fn capture_audio(&self, timeout_ms: u32) -> Result<Option<AudioFrame>> {
         let mut audio_frame = NDIlib_audio_frame_v3_t::default();
 
         // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
@@ -553,7 +789,7 @@ impl<'a> Receiver<'a> {
 
         match frame_type {
             NDIlib_frame_type_e_NDIlib_frame_type_audio => {
-                let frame = AudioFrame::from_raw(audio_frame, Some(self.instance))?;
+                let frame = AudioFrame::from_raw(audio_frame)?;
                 Ok(Some(frame))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(None),
@@ -561,6 +797,78 @@ impl<'a> Receiver<'a> {
                 Err(Error::CaptureFailed("Received an error frame".into()))
             }
             _ => Ok(None), // Other frame types are ignored when capturing audio only
+        }
+    }
+
+    /// Capture audio with automatic retry logic.
+    ///
+    /// Similar to `capture_video_with_retry`, this handles the NDI SDK's behavior
+    /// where capture may return `None` immediately rather than blocking.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout_ms` - Timeout for each individual capture attempt in milliseconds
+    /// * `max_attempts` - Maximum number of retry attempts before giving up
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(frame))` - Successfully captured an audio frame
+    /// * `Ok(None)` - No frame available after all retry attempts
+    /// * `Err(_)` - An error occurred during capture
+    pub fn capture_audio_with_retry(
+        &self,
+        timeout_ms: u32,
+        max_attempts: usize,
+    ) -> Result<Option<AudioFrame>> {
+        for attempt in 1..=max_attempts {
+            match self.capture_audio(timeout_ms)? {
+                Some(frame) => return Ok(Some(frame)),
+                None => {
+                    // Don't sleep on the last attempt
+                    if attempt < max_attempts {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Capture audio, blocking until a frame is received or timeout expires.
+    ///
+    /// This is the recommended method for reliable audio frame capture.
+    ///
+    /// # Arguments
+    ///
+    /// * `total_timeout_ms` - Total time to wait for a frame in milliseconds
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(frame)` - Successfully captured an audio frame
+    /// * `Err(Error::FrameTimeout)` - No frame received within the timeout period (includes retry details)
+    /// * `Err(_)` - Another error occurred during capture
+    pub fn capture_audio_blocking(&self, total_timeout_ms: u32) -> Result<AudioFrame> {
+        let start_time = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(total_timeout_ms.into());
+        let mut attempts = 0;
+
+        loop {
+            attempts += 1;
+
+            // Check if we've exceeded our total timeout
+            let elapsed = start_time.elapsed();
+            if elapsed > timeout {
+                return Err(Error::FrameTimeout { attempts, elapsed });
+            }
+
+            // Try to capture with a short per-attempt timeout (100ms)
+            match self.capture_audio(100)? {
+                Some(frame) => return Ok(frame),
+                None => {
+                    // Brief sleep before retry to avoid busy-waiting
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
         }
     }
 
@@ -590,6 +898,187 @@ impl<'a> Receiver<'a> {
                 Err(Error::CaptureFailed("Received an error frame".into()))
             }
             _ => Ok(None), // Other frame types are ignored when capturing metadata only
+        }
+    }
+
+    /// Capture metadata with automatic retry logic.
+    ///
+    /// Similar to `capture_video_with_retry`, this handles the NDI SDK's behavior
+    /// where capture may return `None` immediately rather than blocking.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout_ms` - Timeout for each individual capture attempt in milliseconds
+    /// * `max_attempts` - Maximum number of retry attempts before giving up
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(frame))` - Successfully captured a metadata frame
+    /// * `Ok(None)` - No frame available after all retry attempts
+    /// * `Err(_)` - An error occurred during capture
+    pub fn capture_metadata_with_retry(
+        &self,
+        timeout_ms: u32,
+        max_attempts: usize,
+    ) -> Result<Option<MetadataFrame>> {
+        for attempt in 1..=max_attempts {
+            match self.capture_metadata(timeout_ms)? {
+                Some(frame) => return Ok(Some(frame)),
+                None => {
+                    // Don't sleep on the last attempt
+                    if attempt < max_attempts {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Capture metadata, blocking until a frame is received or timeout expires.
+    ///
+    /// This is the recommended method for reliable metadata frame capture.
+    ///
+    /// # Arguments
+    ///
+    /// * `total_timeout_ms` - Total time to wait for a frame in milliseconds
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(frame)` - Successfully captured a metadata frame
+    /// * `Err(Error::FrameTimeout)` - No frame received within the timeout period (includes retry details)
+    /// * `Err(_)` - Another error occurred during capture
+    pub fn capture_metadata_blocking(&self, total_timeout_ms: u32) -> Result<MetadataFrame> {
+        let start_time = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(total_timeout_ms.into());
+        let mut attempts = 0;
+
+        loop {
+            attempts += 1;
+
+            // Check if we've exceeded our total timeout
+            let elapsed = start_time.elapsed();
+            if elapsed > timeout {
+                return Err(Error::FrameTimeout { attempts, elapsed });
+            }
+
+            // Try to capture with a short per-attempt timeout (100ms)
+            match self.capture_metadata(100)? {
+                Some(frame) => return Ok(frame),
+                None => {
+                    // Brief sleep before retry to avoid busy-waiting
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    /// Check if the receiver is still connected to its source.
+    ///
+    /// Returns `true` if there is at least one active connection to the source,
+    /// `false` otherwise. This can be used to detect when a source goes offline
+    /// or becomes unavailable.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
+    /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+    /// if receiver.is_connected() {
+    ///     println!("Still connected to source");
+    /// } else {
+    ///     println!("Lost connection to source");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn is_connected(&self) -> bool {
+        unsafe { NDIlib_recv_get_no_connections(self.instance) > 0 }
+    }
+
+    /// Get the source this receiver is connected to.
+    ///
+    /// Returns a reference to the [`Source`] that was specified when creating
+    /// this receiver. This is useful for identifying which source a receiver
+    /// is associated with when managing multiple receivers.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
+    /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+    /// let source = receiver.source();
+    /// println!("Connected to: {}", source.name);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn source(&self) -> &Source {
+        &self.source
+    }
+
+    /// Get connection and performance statistics for this receiver.
+    ///
+    /// Provides detailed statistics including:
+    /// - Number of active connections
+    /// - Total frames received (video, audio, metadata)
+    /// - Dropped frames (video, audio, metadata)
+    /// - Queued frames waiting to be processed
+    ///
+    /// This is useful for monitoring receiver health and diagnosing
+    /// performance issues in production applications.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
+    /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+    /// let stats = receiver.connection_stats();
+    /// println!("Connections: {}", stats.connections);
+    /// println!("Video frames: {} (dropped: {})",
+    ///          stats.video_frames_received,
+    ///          stats.video_frames_dropped);
+    /// println!("Frame drop rate: {:.2}%",
+    ///          stats.video_drop_percentage());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn connection_stats(&self) -> ConnectionStats {
+        // Get number of active connections
+        let connections = unsafe { NDIlib_recv_get_no_connections(self.instance) };
+
+        // Get performance statistics (total and dropped frames)
+        let mut total = NDIlib_recv_performance_t::default();
+        let mut dropped = NDIlib_recv_performance_t::default();
+        unsafe {
+            NDIlib_recv_get_performance(self.instance, &mut total, &mut dropped);
+        }
+
+        // Get queue depth
+        let mut queue = NDIlib_recv_queue_t::default();
+        unsafe {
+            NDIlib_recv_get_queue(self.instance, &mut queue);
+        }
+
+        ConnectionStats {
+            connections: connections.max(0) as u32,
+            video_frames_received: total.video_frames.max(0) as u64,
+            audio_frames_received: total.audio_frames.max(0) as u64,
+            metadata_frames_received: total.metadata_frames.max(0) as u64,
+            video_frames_dropped: dropped.video_frames.max(0) as u64,
+            audio_frames_dropped: dropped.audio_frames.max(0) as u64,
+            metadata_frames_dropped: dropped.metadata_frames.max(0) as u64,
+            video_frames_queued: queue.video_frames.max(0) as u32,
+            audio_frames_queued: queue.audio_frames.max(0) as u32,
+            metadata_frames_queued: queue.metadata_frames.max(0) as u32,
         }
     }
 
@@ -638,7 +1127,7 @@ impl<'a> Receiver<'a> {
     }
 }
 
-impl Drop for Receiver<'_> {
+impl Drop for Receiver {
     fn drop(&mut self) {
         unsafe {
             NDIlib_recv_destroy(self.instance);
@@ -652,7 +1141,7 @@ impl Drop for Receiver<'_> {
 /// `NDIlib_recv_capture_v3` and related functions use internal synchronization.
 /// The Receiver struct only holds an opaque pointer returned by the SDK, and the SDK
 /// guarantees that this pointer can be safely moved between threads.
-unsafe impl Send for Receiver<'_> {}
+unsafe impl Send for Receiver {}
 
 /// # Safety
 ///
@@ -660,12 +1149,12 @@ unsafe impl Send for Receiver<'_> {}
 /// synchronized and can be called concurrently from multiple threads. This is explicitly
 /// mentioned in the SDK manual's thread safety section. The capture_video, capture_audio,
 /// and capture_metadata methods can be safely called from multiple threads simultaneously.
-unsafe impl Sync for Receiver<'_> {}
+unsafe impl Sync for Receiver {}
 
 #[derive(Debug)]
-pub enum FrameType<'rx> {
-    Video(VideoFrame<'rx>),
-    Audio(AudioFrame<'rx>),
+pub enum FrameType {
+    Video(VideoFrame),
+    Audio(AudioFrame),
     Metadata(MetadataFrame),
     None,
     StatusChange(ReceiverStatus),
@@ -700,5 +1189,109 @@ impl Tally {
             on_program: self.on_program,
             on_preview: self.on_preview,
         }
+    }
+}
+
+/// Connection and performance statistics for a receiver.
+///
+/// Provides detailed metrics about receiver health including connection count,
+/// frame counts, and drop rates. Useful for monitoring and diagnostics.
+#[derive(Debug, Clone)]
+pub struct ConnectionStats {
+    /// Number of active connections to this receiver
+    pub connections: u32,
+
+    /// Total number of video frames received
+    pub video_frames_received: u64,
+
+    /// Total number of audio frames received
+    pub audio_frames_received: u64,
+
+    /// Total number of metadata frames received
+    pub metadata_frames_received: u64,
+
+    /// Number of video frames dropped due to buffer overflow or processing delays
+    pub video_frames_dropped: u64,
+
+    /// Number of audio frames dropped
+    pub audio_frames_dropped: u64,
+
+    /// Number of metadata frames dropped
+    pub metadata_frames_dropped: u64,
+
+    /// Number of video frames currently queued for processing
+    pub video_frames_queued: u32,
+
+    /// Number of audio frames currently queued
+    pub audio_frames_queued: u32,
+
+    /// Number of metadata frames currently queued
+    pub metadata_frames_queued: u32,
+}
+
+impl ConnectionStats {
+    /// Calculate video frame drop percentage.
+    ///
+    /// Returns the percentage of video frames that were dropped out of the total
+    /// received + dropped. Returns 0.0 if no frames have been received.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use grafton_ndi::ConnectionStats;
+    /// let stats = ConnectionStats {
+    ///     connections: 1,
+    ///     video_frames_received: 900,
+    ///     video_frames_dropped: 100,
+    ///     audio_frames_received: 0,
+    ///     audio_frames_dropped: 0,
+    ///     metadata_frames_received: 0,
+    ///     metadata_frames_dropped: 0,
+    ///     video_frames_queued: 5,
+    ///     audio_frames_queued: 0,
+    ///     metadata_frames_queued: 0,
+    /// };
+    /// assert_eq!(stats.video_drop_percentage(), 10.0);
+    /// ```
+    pub fn video_drop_percentage(&self) -> f64 {
+        let total = self.video_frames_received + self.video_frames_dropped;
+        if total == 0 {
+            0.0
+        } else {
+            (self.video_frames_dropped as f64 / total as f64) * 100.0
+        }
+    }
+
+    /// Calculate audio frame drop percentage.
+    ///
+    /// Returns the percentage of audio frames that were dropped out of the total
+    /// received + dropped. Returns 0.0 if no frames have been received.
+    pub fn audio_drop_percentage(&self) -> f64 {
+        let total = self.audio_frames_received + self.audio_frames_dropped;
+        if total == 0 {
+            0.0
+        } else {
+            (self.audio_frames_dropped as f64 / total as f64) * 100.0
+        }
+    }
+
+    /// Calculate metadata frame drop percentage.
+    ///
+    /// Returns the percentage of metadata frames that were dropped out of the total
+    /// received + dropped. Returns 0.0 if no frames have been received.
+    pub fn metadata_drop_percentage(&self) -> f64 {
+        let total = self.metadata_frames_received + self.metadata_frames_dropped;
+        if total == 0 {
+            0.0
+        } else {
+            (self.metadata_frames_dropped as f64 / total as f64) * 100.0
+        }
+    }
+
+    /// Check if the receiver is currently connected.
+    ///
+    /// Returns `true` if there is at least one active connection.
+    pub fn is_connected(&self) -> bool {
+        self.connections > 0
     }
 }

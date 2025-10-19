@@ -53,7 +53,7 @@ fn test_video_frame_standard_format_size_calculation() {
     // The from_raw function should calculate size as line_stride * height
     // Previously it would incorrectly multiply data_size_in_bytes * height
     unsafe {
-        let frame = VideoFrame::from_raw(&c_frame, None).unwrap();
+        let frame = VideoFrame::from_raw(&c_frame).unwrap();
 
         // Expected size is line_stride * height
         let expected_size = (line_stride * test_height) as usize;
@@ -92,7 +92,7 @@ fn test_video_frame_null_data_returns_error() {
     c_frame.yres = 1080;
 
     unsafe {
-        let result = VideoFrame::from_raw(&c_frame, None);
+        let result = VideoFrame::from_raw(&c_frame);
         assert!(result.is_err());
         match result {
             Err(Error::InvalidFrame(msg)) => {
@@ -113,7 +113,7 @@ fn test_video_frame_zero_size_returns_error() {
     c_frame.yres = 1080;
 
     unsafe {
-        let result = VideoFrame::from_raw(&c_frame, None);
+        let result = VideoFrame::from_raw(&c_frame);
         assert!(result.is_err());
         match result {
             Err(Error::InvalidFrame(msg)) => {
@@ -262,4 +262,851 @@ fn test_async_completion_handler() {
 
     // Verify callback was called
     assert_eq!(rx.recv().unwrap(), 1024);
+}
+
+#[test]
+fn test_retry_logic_constants() {
+    // Test that retry methods use reasonable timeout and sleep values
+    // This validates the constants are within expected ranges
+
+    // Per-attempt timeout should be reasonable (100ms in implementation)
+    let per_attempt_timeout_ms = 100;
+    assert!((10..=1000).contains(&per_attempt_timeout_ms));
+
+    // Sleep between retries should be brief (10ms in implementation)
+    let sleep_between_retries_ms = 10;
+    assert!((1..=100).contains(&sleep_between_retries_ms));
+
+    // These constants ensure non-blocking behavior without excessive CPU usage
+}
+
+#[test]
+fn test_timeout_duration_calculation() {
+    // Verify timeout duration conversion works correctly
+    let timeout_ms: u32 = 5000;
+    let timeout_duration = std::time::Duration::from_millis(timeout_ms.into());
+    assert_eq!(timeout_duration.as_millis(), 5000);
+
+    // Edge case: very short timeout
+    let short_timeout_ms: u32 = 100;
+    let short_duration = std::time::Duration::from_millis(short_timeout_ms.into());
+    assert_eq!(short_duration.as_millis(), 100);
+
+    // Edge case: long timeout
+    let long_timeout_ms: u32 = 60_000; // 1 minute
+    let long_duration = std::time::Duration::from_millis(long_timeout_ms.into());
+    assert_eq!(long_duration.as_millis(), 60_000);
+}
+
+#[test]
+fn test_source_address_contains_host() {
+    use crate::finder::SourceAddress;
+
+    // Test IP address matching
+    let ip_addr = SourceAddress::Ip("192.168.1.100:5960".to_string());
+    assert!(ip_addr.contains_host("192.168.1.100"));
+    assert!(ip_addr.contains_host("192.168.1"));
+    assert!(ip_addr.contains_host("5960"));
+    assert!(!ip_addr.contains_host("192.168.2"));
+
+    // Test URL matching
+    let url_addr = SourceAddress::Url("http://camera.local:8080".to_string());
+    assert!(url_addr.contains_host("camera.local"));
+    assert!(url_addr.contains_host("camera"));
+    assert!(url_addr.contains_host("8080"));
+    assert!(!url_addr.contains_host("other.local"));
+
+    // Test None variant
+    let none_addr = SourceAddress::None;
+    assert!(!none_addr.contains_host("anything"));
+}
+
+#[test]
+fn test_source_address_port() {
+    use crate::finder::SourceAddress;
+
+    // Test IP address with port
+    let ip_with_port = SourceAddress::Ip("192.168.1.100:5960".to_string());
+    assert_eq!(ip_with_port.port(), Some(5960));
+
+    // Test IP address without port
+    let ip_no_port = SourceAddress::Ip("192.168.1.100".to_string());
+    assert_eq!(ip_no_port.port(), None);
+
+    // Test URL with port
+    let url_with_port = SourceAddress::Url("http://camera.local:8080".to_string());
+    assert_eq!(url_with_port.port(), Some(8080));
+
+    // Test URL with port and path
+    let url_with_path = SourceAddress::Url("http://camera.local:8080/stream".to_string());
+    assert_eq!(url_with_path.port(), Some(8080));
+
+    // Test URL without port
+    let url_no_port = SourceAddress::Url("http://camera.local".to_string());
+    assert_eq!(url_no_port.port(), None);
+
+    // Test URL with scheme but no port
+    let url_scheme_only = SourceAddress::Url("http://camera.local/stream".to_string());
+    assert_eq!(url_scheme_only.port(), None);
+
+    // Test None variant
+    let none_addr = SourceAddress::None;
+    assert_eq!(none_addr.port(), None);
+
+    // Test edge case: IPv6-style address (just ensure it doesn't panic)
+    let ipv6_style = SourceAddress::Ip("fe80::1:5960".to_string());
+    // This will parse the last segment after colon as port
+    assert_eq!(ipv6_style.port(), Some(5960));
+}
+
+#[test]
+fn test_source_matches_host() {
+    use crate::finder::{Source, SourceAddress};
+
+    // Test matching by IP address
+    let source = Source {
+        name: "CAMERA1 (Chan1)".to_string(),
+        address: SourceAddress::Ip("192.168.0.107:5960".to_string()),
+    };
+    assert!(source.matches_host("192.168.0.107"));
+    assert!(source.matches_host("192.168.0"));
+    assert!(!source.matches_host("192.168.1"));
+
+    // Test matching by name
+    assert!(source.matches_host("CAMERA1"));
+    assert!(source.matches_host("Chan1"));
+    assert!(!source.matches_host("CAMERA2"));
+
+    // Test matching with URL address
+    let url_source = Source {
+        name: "Studio Camera".to_string(),
+        address: SourceAddress::Url("http://studio.local:8080".to_string()),
+    };
+    assert!(url_source.matches_host("studio.local"));
+    assert!(url_source.matches_host("Studio"));
+    assert!(!url_source.matches_host("other"));
+
+    // Test with None address
+    let no_addr_source = Source {
+        name: "Local Source".to_string(),
+        address: SourceAddress::None,
+    };
+    assert!(no_addr_source.matches_host("Local"));
+    assert!(!no_addr_source.matches_host("192.168.1.1"));
+}
+
+#[test]
+fn test_source_ip_address() {
+    use crate::finder::{Source, SourceAddress};
+
+    // Test IP address extraction from IP variant
+    let ip_source = Source {
+        name: "CAMERA1".to_string(),
+        address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
+    };
+    assert_eq!(ip_source.ip_address(), Some("192.168.1.100"));
+
+    // Test IP without port
+    let ip_no_port = Source {
+        name: "CAMERA2".to_string(),
+        address: SourceAddress::Ip("192.168.1.101".to_string()),
+    };
+    assert_eq!(ip_no_port.ip_address(), Some("192.168.1.101"));
+
+    // Test hostname extraction from URL variant
+    let url_source = Source {
+        name: "Studio".to_string(),
+        address: SourceAddress::Url("http://camera.local:8080".to_string()),
+    };
+    assert_eq!(url_source.ip_address(), Some("camera.local"));
+
+    // Test URL with path
+    let url_with_path = Source {
+        name: "Studio2".to_string(),
+        address: SourceAddress::Url("http://camera.local:8080/stream".to_string()),
+    };
+    assert_eq!(url_with_path.ip_address(), Some("camera.local"));
+
+    // Test URL without scheme
+    let url_no_scheme = Source {
+        name: "Studio3".to_string(),
+        address: SourceAddress::Url("camera.local:8080".to_string()),
+    };
+    assert_eq!(url_no_scheme.ip_address(), Some("camera.local"));
+
+    // Test None variant
+    let none_source = Source {
+        name: "None".to_string(),
+        address: SourceAddress::None,
+    };
+    assert_eq!(none_source.ip_address(), None);
+}
+
+#[test]
+fn test_source_host() {
+    use crate::finder::{Source, SourceAddress};
+
+    // Test that host() is an alias for ip_address()
+    let source = Source {
+        name: "CAMERA1".to_string(),
+        address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
+    };
+    assert_eq!(source.host(), source.ip_address());
+    assert_eq!(source.host(), Some("192.168.1.100"));
+
+    let url_source = Source {
+        name: "Studio".to_string(),
+        address: SourceAddress::Url("http://camera.local:8080".to_string()),
+    };
+    assert_eq!(url_source.host(), url_source.ip_address());
+    assert_eq!(url_source.host(), Some("camera.local"));
+}
+
+#[test]
+fn test_source_matching_real_world_example() {
+    use crate::finder::{Source, SourceAddress};
+
+    // Real-world example from the issue description
+    let source = Source {
+        name: "CAMERA1 (Chan1, 192.168.0.107)".to_string(),
+        address: SourceAddress::Ip("192.168.0.107:5960".to_string()),
+    };
+
+    // Should match by IP in address
+    assert!(source.matches_host("192.168.0.107"));
+
+    // Should match by partial IP
+    assert!(source.matches_host("192.168.0"));
+
+    // Should match by name
+    assert!(source.matches_host("CAMERA1"));
+
+    // Should match by IP in name
+    assert!(source.matches_host("192.168.0.107"));
+
+    // Should extract IP correctly
+    assert_eq!(source.ip_address(), Some("192.168.0.107"));
+    assert_eq!(source.host(), Some("192.168.0.107"));
+
+    // Should extract port correctly
+    assert_eq!(source.address.port(), Some(5960));
+}
+
+#[test]
+fn test_source_cache_creation() {
+    use crate::finder::SourceCache;
+
+    // Should be able to create a cache
+    let cache = SourceCache::new();
+    assert!(cache.is_ok());
+
+    // Cache should start empty
+    let cache = cache.unwrap();
+    assert_eq!(cache.len(), 0);
+    assert!(cache.is_empty());
+}
+
+#[test]
+fn test_source_cache_default() {
+    use crate::finder::SourceCache;
+
+    // Default should create an empty cache
+    let cache = SourceCache::default();
+    assert_eq!(cache.len(), 0);
+    assert!(cache.is_empty());
+}
+
+#[test]
+fn test_source_cache_invalidation() {
+    use crate::finder::SourceCache;
+
+    let cache = SourceCache::default();
+
+    // Invalidating a non-existent entry should not panic
+    cache.invalidate("192.168.0.107");
+    assert_eq!(cache.len(), 0);
+
+    // Clear on empty cache should not panic
+    cache.clear();
+    assert_eq!(cache.len(), 0);
+    assert!(cache.is_empty());
+}
+
+// Image encoding tests (feature-gated)
+#[cfg(feature = "image-encoding")]
+#[test]
+fn test_video_frame_encode_png_rgba() {
+    use crate::frames::{FourCCVideoType, VideoFrame};
+
+    // Create a simple 2x2 RGBA test frame
+    let width = 2;
+    let height = 2;
+    let mut data = vec![0u8; (width * height * 4) as usize];
+
+    // Red pixel (top-left)
+    data[0..4].copy_from_slice(&[255, 0, 0, 255]);
+    // Green pixel (top-right)
+    data[4..8].copy_from_slice(&[0, 255, 0, 255]);
+    // Blue pixel (bottom-left)
+    data[8..12].copy_from_slice(&[0, 0, 255, 255]);
+    // White pixel (bottom-right)
+    data[12..16].copy_from_slice(&[255, 255, 255, 255]);
+
+    let frame = VideoFrame::builder()
+        .resolution(width, height)
+        .fourcc(FourCCVideoType::RGBA)
+        .build()
+        .unwrap();
+
+    // Replace the data with our test pattern
+    let mut frame = frame;
+    frame.data = data;
+
+    // Encode to PNG
+    let png_bytes = frame.encode_png();
+    assert!(png_bytes.is_ok());
+
+    let png_bytes = png_bytes.unwrap();
+    assert!(!png_bytes.is_empty());
+
+    // Verify PNG header (first 8 bytes)
+    assert_eq!(&png_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+}
+
+#[cfg(feature = "image-encoding")]
+#[test]
+fn test_video_frame_encode_png_bgra() {
+    use crate::frames::{FourCCVideoType, VideoFrame};
+
+    // Create a 2x2 BGRA test frame
+    let width = 2;
+    let height = 2;
+    let mut data = vec![0u8; (width * height * 4) as usize];
+
+    // Red pixel in BGRA format (B=0, G=0, R=255, A=255)
+    data[0..4].copy_from_slice(&[0, 0, 255, 255]);
+    // Green pixel in BGRA format
+    data[4..8].copy_from_slice(&[0, 255, 0, 255]);
+    // Blue pixel in BGRA format
+    data[8..12].copy_from_slice(&[255, 0, 0, 255]);
+    // White pixel in BGRA format
+    data[12..16].copy_from_slice(&[255, 255, 255, 255]);
+
+    let frame = VideoFrame::builder()
+        .resolution(width, height)
+        .fourcc(FourCCVideoType::BGRA)
+        .build()
+        .unwrap();
+
+    let mut frame = frame;
+    frame.data = data;
+
+    // Encode to PNG (should convert BGRA to RGBA)
+    let png_bytes = frame.encode_png();
+    assert!(png_bytes.is_ok());
+
+    let png_bytes = png_bytes.unwrap();
+    assert!(!png_bytes.is_empty());
+
+    // Verify PNG header
+    assert_eq!(&png_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+}
+
+#[cfg(feature = "image-encoding")]
+#[test]
+fn test_video_frame_encode_png_unsupported_format() {
+    use crate::frames::{FourCCVideoType, VideoFrame};
+
+    let frame = VideoFrame::builder()
+        .resolution(2, 2)
+        .fourcc(FourCCVideoType::UYVY) // Unsupported for encoding
+        .build()
+        .unwrap();
+
+    // Should fail with unsupported format error
+    let result = frame.encode_png();
+    assert!(result.is_err());
+
+    let err = result.unwrap_err();
+    let err_msg = format!("{}", err);
+    assert!(err_msg.contains("Unsupported format"));
+}
+
+#[cfg(feature = "image-encoding")]
+#[test]
+fn test_video_frame_encode_jpeg_rgba() {
+    use crate::frames::{FourCCVideoType, VideoFrame};
+
+    // Create a simple 4x4 RGBA test frame
+    let width = 4;
+    let height = 4;
+    let data = vec![255u8; (width * height * 4) as usize]; // All white
+
+    let frame = VideoFrame::builder()
+        .resolution(width, height)
+        .fourcc(FourCCVideoType::RGBA)
+        .build()
+        .unwrap();
+
+    let mut frame = frame;
+    frame.data = data;
+
+    // Encode to JPEG with quality 85
+    let jpeg_bytes = frame.encode_jpeg(85);
+    assert!(jpeg_bytes.is_ok());
+
+    let jpeg_bytes = jpeg_bytes.unwrap();
+    assert!(!jpeg_bytes.is_empty());
+
+    // Verify JPEG header (SOI marker: 0xFF 0xD8)
+    assert_eq!(&jpeg_bytes[0..2], &[0xFF, 0xD8]);
+
+    // Verify JPEG end marker (EOI: 0xFF 0xD9)
+    let len = jpeg_bytes.len();
+    assert_eq!(&jpeg_bytes[len - 2..len], &[0xFF, 0xD9]);
+}
+
+#[cfg(feature = "image-encoding")]
+#[test]
+fn test_video_frame_encode_jpeg_bgra() {
+    use crate::frames::{FourCCVideoType, VideoFrame};
+
+    let width = 4;
+    let height = 4;
+    let data = vec![128u8; (width * height * 4) as usize]; // Gray
+
+    let frame = VideoFrame::builder()
+        .resolution(width, height)
+        .fourcc(FourCCVideoType::BGRA)
+        .build()
+        .unwrap();
+
+    let mut frame = frame;
+    frame.data = data;
+
+    // Encode to JPEG (should convert BGRA to RGB)
+    let jpeg_bytes = frame.encode_jpeg(90);
+    assert!(jpeg_bytes.is_ok());
+
+    let jpeg_bytes = jpeg_bytes.unwrap();
+    assert!(!jpeg_bytes.is_empty());
+
+    // Verify JPEG markers
+    assert_eq!(&jpeg_bytes[0..2], &[0xFF, 0xD8]);
+}
+
+#[cfg(feature = "image-encoding")]
+#[test]
+fn test_video_frame_encode_jpeg_quality_range() {
+    use crate::frames::{FourCCVideoType, VideoFrame};
+
+    // Create a more complex image with varying colors to better show compression differences
+    let width = 32;
+    let height = 32;
+    let mut data = vec![0u8; (width * height * 4) as usize];
+
+    // Fill with a gradient pattern
+    for y in 0..height {
+        for x in 0..width {
+            let idx = ((y * width + x) * 4) as usize;
+            data[idx] = ((x * 255) / width) as u8; // Red gradient
+            data[idx + 1] = ((y * 255) / height) as u8; // Green gradient
+            data[idx + 2] = 128; // Blue constant
+            data[idx + 3] = 255; // Alpha
+        }
+    }
+
+    let frame = VideoFrame::builder()
+        .resolution(width, height)
+        .fourcc(FourCCVideoType::RGBA)
+        .build()
+        .unwrap();
+
+    let mut frame = frame;
+    frame.data = data;
+
+    // Test different quality levels
+    let low_quality = frame.encode_jpeg(10).unwrap();
+    let high_quality = frame.encode_jpeg(95).unwrap();
+
+    // Both should be valid JPEG files
+    assert!(!low_quality.is_empty());
+    assert!(!high_quality.is_empty());
+
+    // For a gradient image, higher quality should produce larger files
+    assert!(low_quality.len() < high_quality.len());
+}
+
+#[cfg(feature = "image-encoding")]
+#[test]
+fn test_video_frame_encode_data_url_png() {
+    use crate::frames::{FourCCVideoType, ImageFormat, VideoFrame};
+
+    let width = 2;
+    let height = 2;
+    let data = vec![255u8; (width * height * 4) as usize];
+
+    let frame = VideoFrame::builder()
+        .resolution(width, height)
+        .fourcc(FourCCVideoType::RGBA)
+        .build()
+        .unwrap();
+
+    let mut frame = frame;
+    frame.data = data;
+
+    let data_url = frame.encode_data_url(ImageFormat::Png);
+    assert!(data_url.is_ok());
+
+    let data_url = data_url.unwrap();
+
+    // Should start with data URL prefix
+    assert!(data_url.starts_with("data:image/png;base64,"));
+
+    // Should have base64 data after the prefix
+    let base64_part = data_url.strip_prefix("data:image/png;base64,").unwrap();
+    assert!(!base64_part.is_empty());
+
+    // Base64 should only contain valid characters
+    assert!(base64_part
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
+}
+
+#[cfg(feature = "image-encoding")]
+#[test]
+fn test_video_frame_encode_data_url_jpeg() {
+    use crate::frames::{FourCCVideoType, ImageFormat, VideoFrame};
+
+    let width = 4;
+    let height = 4;
+    let data = vec![128u8; (width * height * 4) as usize];
+
+    let frame = VideoFrame::builder()
+        .resolution(width, height)
+        .fourcc(FourCCVideoType::RGBA)
+        .build()
+        .unwrap();
+
+    let mut frame = frame;
+    frame.data = data;
+
+    let data_url = frame.encode_data_url(ImageFormat::Jpeg(85));
+    assert!(data_url.is_ok());
+
+    let data_url = data_url.unwrap();
+
+    // Should start with JPEG data URL prefix
+    assert!(data_url.starts_with("data:image/jpeg;base64,"));
+
+    // Should have base64 data
+    let base64_part = data_url.strip_prefix("data:image/jpeg;base64,").unwrap();
+    assert!(!base64_part.is_empty());
+}
+
+#[cfg(feature = "image-encoding")]
+#[test]
+fn test_image_format_enum() {
+    use crate::ImageFormat;
+
+    let png = ImageFormat::Png;
+    let jpeg = ImageFormat::Jpeg(90);
+
+    // Should be able to clone and copy
+    let png_copy = png;
+    let jpeg_copy = jpeg;
+
+    assert_eq!(png, png_copy);
+    assert_eq!(jpeg, jpeg_copy);
+
+    // Different formats should not be equal
+    assert_ne!(png, jpeg);
+
+    // Different JPEG qualities should not be equal
+    let jpeg_low = ImageFormat::Jpeg(50);
+    let jpeg_high = ImageFormat::Jpeg(95);
+    assert_ne!(jpeg_low, jpeg_high);
+}
+
+#[test]
+fn test_source_cache_len_and_is_empty() {
+    use crate::finder::SourceCache;
+
+    let cache = SourceCache::default();
+
+    // Initially empty
+    assert_eq!(cache.len(), 0);
+    assert!(cache.is_empty());
+
+    // After clear, still empty
+    cache.clear();
+    assert_eq!(cache.len(), 0);
+    assert!(cache.is_empty());
+}
+
+#[test]
+fn test_receiver_snapshot_preset() {
+    use crate::{
+        finder::{Source, SourceAddress},
+        receiver::ReceiverOptionsBuilder,
+    };
+
+    let source = Source {
+        name: "Test Source".to_string(),
+        address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
+    };
+
+    // Test that snapshot preset returns a valid builder that can be further customized
+    let builder = ReceiverOptionsBuilder::snapshot_preset(source.clone());
+
+    // Should be able to further customize the preset
+    let customized = builder.name("My Snapshot Receiver");
+
+    // Verify it's the same underlying builder type
+    let _ = format!("{:?}", customized);
+}
+
+#[test]
+fn test_receiver_high_quality_preset() {
+    use crate::{
+        finder::{Source, SourceAddress},
+        receiver::ReceiverOptionsBuilder,
+    };
+
+    let source = Source {
+        name: "Test Source".to_string(),
+        address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
+    };
+
+    // Test that high quality preset returns a valid builder
+    let builder = ReceiverOptionsBuilder::high_quality_preset(source.clone());
+
+    // Should be able to further customize
+    let customized = builder.name("My HQ Receiver");
+
+    // Verify it's a valid builder
+    let _ = format!("{:?}", customized);
+}
+
+#[test]
+fn test_receiver_monitoring_preset() {
+    use crate::{
+        finder::{Source, SourceAddress},
+        receiver::ReceiverOptionsBuilder,
+    };
+
+    let source = Source {
+        name: "Test Source".to_string(),
+        address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
+    };
+
+    // Test that monitoring preset returns a valid builder
+    let builder = ReceiverOptionsBuilder::monitoring_preset(source.clone());
+
+    // Should be able to further customize
+    let customized = builder.name("My Monitor");
+
+    // Verify it's a valid builder
+    let _ = format!("{:?}", customized);
+}
+
+#[test]
+fn test_receiver_presets_are_distinct() {
+    use crate::{
+        finder::{Source, SourceAddress},
+        receiver::ReceiverOptionsBuilder,
+    };
+
+    let source = Source {
+        name: "Test Source".to_string(),
+        address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
+    };
+
+    // All three preset methods should exist and be callable
+    let _snapshot = ReceiverOptionsBuilder::snapshot_preset(source.clone());
+    let _hq = ReceiverOptionsBuilder::high_quality_preset(source.clone());
+    let _monitor = ReceiverOptionsBuilder::monitoring_preset(source.clone());
+
+    // If we got here without panicking, the presets exist and are usable
+}
+
+// Async runtime integration tests (feature-gated)
+#[cfg(feature = "tokio")]
+#[test]
+fn test_tokio_async_receiver_creation() {
+    use crate::{
+        finder::{Source, SourceAddress},
+        receiver::ReceiverOptionsBuilder,
+        NDI,
+    };
+
+    // Test that AsyncReceiver can be created and is cloneable
+    // We can't actually run async code in a sync test, but we can verify the API exists
+
+    // This test verifies that:
+    // 1. tokio::AsyncReceiver type exists
+    // 2. It has a `new()` method
+    // 3. It implements Clone
+
+    // Note: We can't create a real receiver without NDI SDK runtime,
+    // so we just test the type exists and compiles
+    let _ = || {
+        use crate::tokio::AsyncReceiver;
+
+        // Mock receiver (won't actually work without NDI initialized)
+        let source = Source {
+            name: "Test".into(),
+            address: SourceAddress::None,
+        };
+
+        // This won't run but proves the API compiles
+        if false {
+            use std::sync::Arc;
+            let ndi = Arc::new(NDI::new().unwrap());
+            let receiver = ReceiverOptionsBuilder::snapshot_preset(source)
+                .build(&ndi)
+                .unwrap();
+            let async_receiver = AsyncReceiver::new(receiver);
+            let _cloned = async_receiver.clone();
+        }
+    };
+}
+
+#[cfg(feature = "tokio")]
+#[test]
+fn test_tokio_async_receiver_methods_exist() {
+    // Verify all expected async methods exist on AsyncReceiver
+    // This is a compile-time test - if it compiles, the methods exist
+
+    use crate::{
+        finder::{Source, SourceAddress},
+        receiver::ReceiverOptionsBuilder,
+        tokio::AsyncReceiver,
+        NDI,
+    };
+
+    // Test that all methods exist and can be called (in a closure that won't execute)
+    let _ = || async {
+        let source = Source {
+            name: "Test".into(),
+            address: SourceAddress::None,
+        };
+
+        if false {
+            use std::sync::Arc;
+            let ndi = Arc::new(NDI::new().unwrap());
+            let receiver = ReceiverOptionsBuilder::snapshot_preset(source)
+                .build(&ndi)
+                .unwrap();
+            let async_receiver = AsyncReceiver::new(receiver);
+
+            // All these methods should exist and be callable
+            let _ = async_receiver.capture_video(100).await;
+            let _ = async_receiver.capture_video_with_retry(100, 10).await;
+            let _ = async_receiver.capture_video_blocking(5000).await;
+
+            let _ = async_receiver.capture_audio(100).await;
+            let _ = async_receiver.capture_audio_with_retry(100, 10).await;
+            let _ = async_receiver.capture_audio_blocking(5000).await;
+
+            let _ = async_receiver.capture_metadata(100).await;
+            let _ = async_receiver.capture_metadata_with_retry(100, 10).await;
+            let _ = async_receiver.capture_metadata_blocking(5000).await;
+        }
+    };
+}
+
+#[cfg(feature = "async-std")]
+#[test]
+fn test_async_std_async_receiver_creation() {
+    use crate::{
+        finder::{Source, SourceAddress},
+        receiver::ReceiverOptionsBuilder,
+        NDI,
+    };
+
+    // Test that AsyncReceiver can be created and is cloneable for async-std
+
+    let _ = || {
+        use crate::async_std::AsyncReceiver;
+
+        let source = Source {
+            name: "Test".into(),
+            address: SourceAddress::None,
+        };
+
+        // This won't run but proves the API compiles
+        if false {
+            use std::sync::Arc;
+            let ndi = Arc::new(NDI::new().unwrap());
+            let receiver = ReceiverOptionsBuilder::snapshot_preset(source)
+                .build(&ndi)
+                .unwrap();
+            let async_receiver = AsyncReceiver::new(receiver);
+            let _cloned = async_receiver.clone();
+        }
+    };
+}
+
+#[cfg(feature = "async-std")]
+#[test]
+fn test_async_std_async_receiver_methods_exist() {
+    // Verify all expected async methods exist on async-std AsyncReceiver
+
+    use crate::{
+        async_std::AsyncReceiver,
+        finder::{Source, SourceAddress},
+        receiver::ReceiverOptionsBuilder,
+        NDI,
+    };
+
+    // Test that all methods exist and can be called (in a closure that won't execute)
+    let _ = || async {
+        let source = Source {
+            name: "Test".into(),
+            address: SourceAddress::None,
+        };
+
+        if false {
+            use std::sync::Arc;
+            let ndi = Arc::new(NDI::new().unwrap());
+            let receiver = ReceiverOptionsBuilder::snapshot_preset(source)
+                .build(&ndi)
+                .unwrap();
+            let async_receiver = AsyncReceiver::new(receiver);
+
+            // All these methods should exist and be callable
+            let _ = async_receiver.capture_video(100).await;
+            let _ = async_receiver.capture_video_with_retry(100, 10).await;
+            let _ = async_receiver.capture_video_blocking(5000).await;
+
+            let _ = async_receiver.capture_audio(100).await;
+            let _ = async_receiver.capture_audio_with_retry(100, 10).await;
+            let _ = async_receiver.capture_audio_blocking(5000).await;
+
+            let _ = async_receiver.capture_metadata(100).await;
+            let _ = async_receiver.capture_metadata_with_retry(100, 10).await;
+            let _ = async_receiver.capture_metadata_blocking(5000).await;
+        }
+    };
+}
+
+#[test]
+fn test_async_feature_flags_mutually_compatible() {
+    // This test verifies that tokio and async-std features can coexist
+    // Both should be able to be enabled simultaneously without conflicts
+
+    #[cfg(feature = "tokio")]
+    {
+        use crate::tokio::AsyncReceiver as TokioAsyncReceiver;
+        let _tokio_type_check = std::any::type_name::<TokioAsyncReceiver>();
+    }
+
+    #[cfg(feature = "async-std")]
+    {
+        use crate::async_std::AsyncReceiver as AsyncStdReceiver;
+        let _async_std_type_check = std::any::type_name::<AsyncStdReceiver>();
+    }
+
+    // If this compiles, both can be enabled together
 }

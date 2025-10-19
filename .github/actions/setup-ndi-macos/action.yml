@@ -13,10 +13,10 @@ runs:
       id: cache-key
       run: |
         # Expected SHA256 hash of NDI SDK installer for macOS
-        expected='701609952EE081720DDF6E812C50EDE0F606C20F17F81B632608D7CC3579F5C0'
+        expected='6A14EBC569310411DA34AE5570A3E8243951DCD4B9C33BACF390990D68560A17'
         ndiHash=$(echo $expected | cut -c1-8)  # Use first 8 chars for cache key
         # Bump cache version to invalidate old empty cache
-        echo "key=deps-v2-${ndiHash}-${{ runner.os }}" >> $GITHUB_OUTPUT
+        echo "key=deps-v3-${ndiHash}-${{ runner.os }}" >> $GITHUB_OUTPUT
         echo "expected_hash=$expected" >> $GITHUB_OUTPUT
       shell: bash
 

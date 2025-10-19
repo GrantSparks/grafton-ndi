@@ -108,21 +108,36 @@ pub mod receiver;
 pub mod runtime;
 pub mod sender;
 
+// Async runtime integration (feature-gated)
+#[cfg(any(feature = "tokio", feature = "async-std"))]
+mod async_runtime;
+
+// Re-export async modules based on feature flags
+#[cfg(feature = "tokio")]
+pub use async_runtime::tokio;
+
+#[cfg(feature = "async-std")]
+pub use async_runtime::async_std;
+
 // Re-exports
 pub use {
     error::*,
-    finder::{Finder, FinderOptions, FinderOptionsBuilder, Source, SourceAddress},
+    finder::{Finder, FinderOptions, FinderOptionsBuilder, Source, SourceAddress, SourceCache},
     frames::{
         AudioFrame, AudioFrameBuilder, AudioType, FourCCVideoType, FrameFormatType,
         LineStrideOrSize, MetadataFrame, VideoFrame, VideoFrameBuilder,
     },
     receiver::{
-        FrameType, Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions,
-        ReceiverOptionsBuilder, ReceiverStatus, Tally,
+        ConnectionStats, FrameType, Receiver, ReceiverBandwidth, ReceiverColorFormat,
+        ReceiverOptions, ReceiverOptionsBuilder, ReceiverStatus, Tally,
     },
     runtime::NDI,
     sender::{AsyncVideoToken, BorrowedVideoFrame, Sender, SenderOptions, SenderOptionsBuilder},
 };
+
+// Conditional re-exports for image-encoding feature
+#[cfg(feature = "image-encoding")]
+pub use frames::ImageFormat;
 
 /// Alias for Result with our Error type
 pub type Result<T> = std::result::Result<T, crate::error::Error>;

@@ -13,9 +13,9 @@ runs:
       id: cache-key
       run: |
         # Expected SHA256 hash of NDI SDK installer
-        $expected = 'B8A200835CC0894242D8012B1C31C625B0582A561D15CE0E5A3987BD68566A32'
+        $expected = '97E8993C6B94213A950E6ACBE9AA4D35831D137324D762F7C74851D3FEEF80D9'
         $ndiHash = $expected.Substring(0, 8)  # Use first 8 chars for cache key
-        echo "key=deps-${{ env.CACHE_VERSION }}-$ndiHash-${{ env.LLVM_VERSION }}-${{ runner.os }}" >> $env:GITHUB_OUTPUT
+        echo "key=deps-v2-$ndiHash-${{ env.LLVM_VERSION }}-${{ runner.os }}" >> $env:GITHUB_OUTPUT
         echo "expected_hash=$expected" >> $env:GITHUB_OUTPUT
       shell: pwsh
 
@@ -29,10 +29,15 @@ runs:
           C:\Program Files\LLVM
         key: ${{ steps.cache-key.outputs.key }}
 
-    # Install LLVM if not cached
+    # Install LLVM if not cached and not already installed
     - name: Install LLVM
       if: steps.cache-restore.outputs.cache-hit != 'true'
-      run: choco install llvm --version=${{ env.LLVM_VERSION }} -y
+      run: |
+        if (Test-Path "C:\Program Files\LLVM\bin\clang.exe") {
+          Write-Host "LLVM already installed, skipping installation"
+        } else {
+          choco install llvm --version=${{ env.LLVM_VERSION }} -y
+        }
       shell: pwsh
 
     # Install NDI SDK if not cached

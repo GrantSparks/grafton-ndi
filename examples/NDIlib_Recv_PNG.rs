@@ -5,11 +5,10 @@
 //!
 //! This is based on the NDIlib_Recv_PNG example from the NDI SDK.
 //!
-//! IMPORTANT: This example includes critical error handling that is
-//! necessary for reliable NDI reception:
+//! IMPORTANT: This example demonstrates:
 //!
-//! 1. Retry loop for frame capture - NDI SDK's capture_video doesn't
-//!    actually block for the full timeout duration, so we need to retry
+//! 1. Using `capture_video_blocking()` for reliable frame capture with
+//!    automatic retry logic (handles NDI SDK timeout quirks internally)
 //! 2. Stride validation - Prevents corrupted images when stride != width * 4
 //! 3. Format verification - Ensures we actually get RGBA/RGBX format
 //! 4. Compressed format detection - Warns about unsupported formats
@@ -24,7 +23,7 @@
 
 use std::env;
 use std::fs::File;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use grafton_ndi::{
     Error, Finder, FinderOptions, FourCCVideoType, ReceiverColorFormat, ReceiverOptions, NDI,
@@ -99,94 +98,67 @@ fn main() -> Result<(), Error> {
     println!("Receiver created successfully");
     println!("Waiting for video frames...\n");
 
-    // IMPORTANT: NDI SDK's capture_video doesn't block for the full timeout!
-    // We need to implement our own retry loop with proper timing
+    // Use the new blocking capture method that handles retry logic internally
+    // This is much simpler than manually implementing the retry loop
     let start_time = Instant::now();
-    let timeout = Duration::from_secs(60);
-    let mut attempts = 0;
+    let video_frame = receiver.capture_video_blocking(60_000)?;
 
-    let video_frame = loop {
-        attempts += 1;
+    println!("Frame received after {:?}", start_time.elapsed());
 
-        // Check if we've exceeded our total timeout
-        if start_time.elapsed() > timeout {
-            return Err(Error::InitializationFailed(
-                "Timeout waiting for video frame after 60 seconds".to_string(),
-            ));
+    // Debug information about the frame
+    println!("Frame details:");
+    println!("  Resolution: {}x{}", video_frame.width, video_frame.height);
+    println!("  Format: {:?}", video_frame.fourcc);
+    println!("  Line stride: {} bytes", unsafe {
+        video_frame.line_stride_or_size.line_stride_in_bytes
+    });
+    println!("  Data size: {} bytes", video_frame.data.len());
+    println!(
+        "  Frame rate: {}/{}",
+        video_frame.frame_rate_n, video_frame.frame_rate_d
+    );
+    println!("  Timecode: {:016x}", video_frame.timecode);
+
+    // Verify we got the format we requested
+    match video_frame.fourcc {
+        FourCCVideoType::RGBA | FourCCVideoType::RGBX => {
+            println!("  ✓ Got requested RGBA/RGBX format");
         }
-
-        // Try to capture a frame with a short timeout (100ms)
-        // The NDI SDK may return immediately even with a longer timeout
-        match receiver.capture_video(100)? {
-            Some(frame) => {
-                println!("Frame received after {} attempts", attempts);
-
-                // Debug information about the frame
-                println!("Frame details:");
-                println!("  Resolution: {}x{}", frame.width, frame.height);
-                println!("  Format: {:?}", frame.fourcc);
-                println!("  Line stride: {} bytes", unsafe {
-                    frame.line_stride_or_size.line_stride_in_bytes
-                });
-                println!("  Data size: {} bytes", frame.data.len());
-                println!(
-                    "  Frame rate: {}/{}",
-                    frame.frame_rate_n, frame.frame_rate_d
-                );
-                println!("  Timecode: {:016x}", frame.timecode);
-
-                // Verify we got the format we requested
-                match frame.fourcc {
-                    FourCCVideoType::RGBA | FourCCVideoType::RGBX => {
-                        println!("  ✓ Got requested RGBA/RGBX format");
-                    }
-                    _ => {
-                        eprintln!(
-                            "  ⚠ Warning: Got unexpected format {:?}, PNG may fail",
-                            frame.fourcc
-                        );
-                    }
-                }
-
-                // CRITICAL: Verify stride matches width to prevent corrupted images
-                let expected_stride = frame.width * 4; // 4 bytes per pixel for RGBA
-                let actual_stride = unsafe { frame.line_stride_or_size.line_stride_in_bytes };
-
-                if actual_stride != expected_stride {
-                    // This is a common issue with some NDI sources
-                    // If stride != width * 4, we would need to handle row padding
-                    return Err(Error::InitializationFailed(format!(
-                        "Line stride ({}) doesn't match width * 4 ({}). \
-                         This would require handling row padding which this example doesn't implement.",
-                        actual_stride, expected_stride
-                    )));
-                }
-
-                // Check data size to detect if we might have a compressed format
-                let expected_uncompressed_size = (frame.width * frame.height * 4) as usize;
-                if frame.data.len() < expected_uncompressed_size / 2 {
-                    eprintln!(
-                        "  ⚠ Warning: Frame data size ({} bytes) is much smaller than expected",
-                        frame.data.len()
-                    );
-                    eprintln!(
-                        "            uncompressed size ({} bytes). This might be a compressed",
-                        expected_uncompressed_size
-                    );
-                    eprintln!("            format that needs decoding before saving as PNG.");
-                }
-
-                break frame;
-            }
-            None => {
-                // No frame available yet, wait a bit before retrying
-                if attempts % 10 == 0 {
-                    println!("Still waiting for video frame... (attempt {})", attempts);
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
+        _ => {
+            eprintln!(
+                "  ⚠ Warning: Got unexpected format {:?}, PNG may fail",
+                video_frame.fourcc
+            );
         }
-    };
+    }
+
+    // CRITICAL: Verify stride matches width to prevent corrupted images
+    let expected_stride = video_frame.width * 4; // 4 bytes per pixel for RGBA
+    let actual_stride = unsafe { video_frame.line_stride_or_size.line_stride_in_bytes };
+
+    if actual_stride != expected_stride {
+        // This is a common issue with some NDI sources
+        // If stride != width * 4, we would need to handle row padding
+        return Err(Error::InitializationFailed(format!(
+            "Line stride ({}) doesn't match width * 4 ({}). \
+             This would require handling row padding which this example doesn't implement.",
+            actual_stride, expected_stride
+        )));
+    }
+
+    // Check data size to detect if we might have a compressed format
+    let expected_uncompressed_size = (video_frame.width * video_frame.height * 4) as usize;
+    if video_frame.data.len() < expected_uncompressed_size / 2 {
+        eprintln!(
+            "  ⚠ Warning: Frame data size ({} bytes) is much smaller than expected",
+            video_frame.data.len()
+        );
+        eprintln!(
+            "            uncompressed size ({} bytes). This might be a compressed",
+            expected_uncompressed_size
+        );
+        eprintln!("            format that needs decoding before saving as PNG.");
+    }
 
     // Save as PNG
     println!("\nSaving frame as PNG...");

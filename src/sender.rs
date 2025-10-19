@@ -169,8 +169,8 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     }
 }
 
-impl<'buf> From<&'buf VideoFrame<'_>> for BorrowedVideoFrame<'buf> {
-    fn from(frame: &'buf VideoFrame<'_>) -> Self {
+impl<'buf> From<&'buf VideoFrame> for BorrowedVideoFrame<'buf> {
+    fn from(frame: &'buf VideoFrame) -> Self {
         BorrowedVideoFrame {
             width: frame.width,
             height: frame.height,
@@ -394,7 +394,7 @@ impl<'a> Sender<'a> {
     }
 
     /// Send a video frame **synchronously** (NDI copies the buffer immediately).
-    pub fn send_video(&self, video_frame: &VideoFrame<'_>) {
+    pub fn send_video(&self, video_frame: &VideoFrame) {
         unsafe {
             NDIlib_send_send_video_v2(self.inner.instance, &video_frame.to_raw());
         }
@@ -498,7 +498,7 @@ impl<'a> Sender<'a> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn send_audio(&self, audio_frame: &AudioFrame<'_>) {
+    pub fn send_audio(&self, audio_frame: &AudioFrame) {
         unsafe {
             NDIlib_send_send_audio_v3(self.inner.instance, &audio_frame.to_raw());
         }
