@@ -29,10 +29,15 @@ runs:
           C:\Program Files\LLVM
         key: ${{ steps.cache-key.outputs.key }}
 
-    # Install LLVM if not cached
+    # Install LLVM if not cached and not already installed
     - name: Install LLVM
       if: steps.cache-restore.outputs.cache-hit != 'true'
-      run: choco install llvm --version=${{ env.LLVM_VERSION }} -y
+      run: |
+        if (Test-Path "C:\Program Files\LLVM\bin\clang.exe") {
+          Write-Host "LLVM already installed, skipping installation"
+        } else {
+          choco install llvm --version=${{ env.LLVM_VERSION }} -y
+        }
       shell: pwsh
 
     # Install NDI SDK if not cached

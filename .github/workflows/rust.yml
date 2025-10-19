@@ -17,7 +17,7 @@ env:
   RUSTFLAGS: "-D warnings"
   NDI_SDK_URL: ${{ secrets.NDI_SDK_URL || 'https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe' }}
   NDI_SDK_URL_MACOS: ${{ secrets.NDI_SDK_URL_MACOS || 'https://downloads.ndi.tv/SDK/NDI_SDK_Mac/Install_NDI_SDK_v6_Apple.pkg' }}
-  LLVM_VERSION: "18.1.8"
+  LLVM_VERSION: "20.1.8"
   CACHE_VERSION: v1
 
 jobs:
