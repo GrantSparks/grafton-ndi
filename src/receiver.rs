@@ -68,7 +68,7 @@ macro_rules! ptz_command {
     };
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiverColorFormat {
     #[default]
     BGRX_BGRA,
@@ -108,7 +108,7 @@ impl From<ReceiverColorFormat> for NDIlib_recv_color_format_e {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiverBandwidth {
     MetadataOnly,
     AudioOnly,
@@ -208,6 +208,133 @@ impl ReceiverOptionsBuilder {
             allow_video_fields: None,
             ndi_recv_name: None,
         }
+    }
+
+    /// Preset for capturing snapshots (low resolution, RGBA, lowest bandwidth).
+    ///
+    /// This preset is optimized for:
+    /// - Image export and snapshot capture
+    /// - AI/ML processing pipelines
+    /// - Thumbnail generation
+    /// - Low bandwidth environments
+    ///
+    /// Configuration:
+    /// - Color format: `RGBX_RGBA` (compatible with image encoding)
+    /// - Bandwidth: `Lowest` (reduces resolution and bitrate)
+    /// - Video fields: Disabled (progressive frames only)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptionsBuilder};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
+    /// # finder.wait_for_sources(1000);
+    /// # let sources = finder.get_sources(0)?;
+    /// let receiver = ReceiverOptionsBuilder::snapshot_preset(sources[0].clone())
+    ///     .name("Snapshot Receiver")
+    ///     .build(&ndi)?;
+    ///
+    /// // Capture and encode in one line (requires image-encoding feature)
+    /// #[cfg(feature = "image-encoding")]
+    /// {
+    ///     let frame = receiver.capture_video_blocking(5000)?;
+    ///     let png_bytes = frame.encode_png()?;
+    ///     std::fs::write("snapshot.png", &png_bytes)?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn snapshot_preset(source: Source) -> Self {
+        Self::new(source)
+            .color(ReceiverColorFormat::RGBX_RGBA)
+            .bandwidth(ReceiverBandwidth::Lowest)
+            .allow_video_fields(false)
+    }
+
+    /// Preset for high-quality video processing (full resolution, highest bandwidth).
+    ///
+    /// This preset is optimized for:
+    /// - Professional video processing workflows
+    /// - Recording and archival
+    /// - Real-time video analysis requiring full quality
+    /// - Broadcasting and production
+    ///
+    /// Configuration:
+    /// - Color format: `RGBX_RGBA` (uncompressed, compatible with most tools)
+    /// - Bandwidth: `Highest` (full resolution and bitrate)
+    /// - Video fields: Enabled (supports interlaced sources)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptionsBuilder};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
+    /// # finder.wait_for_sources(1000);
+    /// # let sources = finder.get_sources(0)?;
+    /// let receiver = ReceiverOptionsBuilder::high_quality_preset(sources[0].clone())
+    ///     .name("High Quality Receiver")
+    ///     .build(&ndi)?;
+    ///
+    /// // Capture full quality frames
+    /// let frame = receiver.capture_video_blocking(5000)?;
+    /// println!("Captured {}x{} frame", frame.width, frame.height);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn high_quality_preset(source: Source) -> Self {
+        Self::new(source)
+            .color(ReceiverColorFormat::RGBX_RGBA)
+            .bandwidth(ReceiverBandwidth::Highest)
+            .allow_video_fields(true)
+    }
+
+    /// Preset for metadata and tally monitoring only (no video/audio).
+    ///
+    /// This preset is optimized for:
+    /// - Tally light monitoring
+    /// - Connection status tracking
+    /// - PTZ control applications
+    /// - Minimal bandwidth overhead
+    ///
+    /// Configuration:
+    /// - Bandwidth: `MetadataOnly` (no video or audio data)
+    /// - Color format: Default (not used for metadata-only)
+    /// - Video fields: Disabled (not applicable)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptionsBuilder};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
+    /// # finder.wait_for_sources(1000);
+    /// # let sources = finder.get_sources(0)?;
+    /// let receiver = ReceiverOptionsBuilder::monitoring_preset(sources[0].clone())
+    ///     .name("Tally Monitor")
+    ///     .build(&ndi)?;
+    ///
+    /// // Poll for status changes
+    /// if let Some(status) = receiver.poll_status_change(1000) {
+    ///     if let Some(tally) = status.tally {
+    ///         println!("Tally: program={}, preview={}",
+    ///                  tally.on_program, tally.on_preview);
+    ///     }
+    ///     if let Some(connections) = status.connections {
+    ///         println!("Active connections: {}", connections);
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn monitoring_preset(source: Source) -> Self {
+        Self::new(source)
+            .bandwidth(ReceiverBandwidth::MetadataOnly)
+            .allow_video_fields(false)
     }
 
     /// Set the color format for received video
