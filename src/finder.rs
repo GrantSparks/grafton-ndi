@@ -248,7 +248,7 @@ impl<'a> Finder<'a> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn get_current_sources(&self) -> Result<Vec<Source>, Error> {
+    pub fn get_current_sources(&self) -> Result<Vec<Source>> {
         let mut num_sources = 0;
         let sources_ptr =
             unsafe { NDIlib_find_get_current_sources(self.instance, &mut num_sources) };
