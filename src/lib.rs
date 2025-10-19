@@ -100,6 +100,7 @@
 // Internal modules
 mod error;
 mod ndi_lib;
+mod recv_guard;
 
 // Public modules
 pub mod finder;

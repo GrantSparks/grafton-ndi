@@ -34,6 +34,7 @@ use crate::{
     finder::{RawSource, Source},
     frames::{AudioFrame, MetadataFrame, VideoFrame},
     ndi_lib::*,
+    recv_guard::{RecvAudioGuard, RecvMetadataGuard, RecvVideoGuard},
     Error, Result, NDI,
 };
 
@@ -423,18 +424,24 @@ impl Receiver {
 
         match frame_type {
             NDIlib_frame_type_e_NDIlib_frame_type_video => {
-                let frame = unsafe { VideoFrame::from_raw(&video_frame) }?;
-                // Note: Drop impl will call NDIlib_recv_free_video_v2 when frame is dropped
+                // Create RAII guard to ensure the frame is freed
+                let guard = unsafe { RecvVideoGuard::new(self.instance, video_frame) };
+                let frame = unsafe { VideoFrame::from_raw(guard.frame()) }?;
+                // Guard is dropped here, freeing the NDI frame
                 Ok(FrameType::Video(frame))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_audio => {
-                let frame = AudioFrame::from_raw(audio_frame)?;
-                // Note: Drop impl will call NDIlib_recv_free_audio_v3 when frame is dropped
+                // Create RAII guard to ensure the frame is freed
+                let guard = unsafe { RecvAudioGuard::new(self.instance, audio_frame) };
+                let frame = AudioFrame::from_raw(*guard.frame())?;
+                // Guard is dropped here, freeing the NDI frame
                 Ok(FrameType::Audio(frame))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_metadata => {
-                let frame = MetadataFrame::from_raw(&metadata_frame);
-                unsafe { NDIlib_recv_free_metadata(self.instance, &metadata_frame) };
+                // Create RAII guard to ensure the frame is freed
+                let guard = unsafe { RecvMetadataGuard::new(self.instance, metadata_frame) };
+                let frame = MetadataFrame::from_raw(guard.frame());
+                // Guard is dropped here, freeing the NDI frame
                 Ok(FrameType::Metadata(frame))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(FrameType::None),
@@ -454,14 +461,6 @@ impl Receiver {
                 "Unknown frame type: {}",
                 frame_type
             ))),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn free_string(&self, string: &str) {
-        let c_string = CString::new(string).expect("Failed to create CString");
-        unsafe {
-            NDIlib_recv_free_string(self.instance, c_string.into_raw());
         }
     }
 
@@ -654,7 +653,10 @@ impl Receiver {
 
         match frame_type {
             NDIlib_frame_type_e_NDIlib_frame_type_video => {
-                let frame = unsafe { VideoFrame::from_raw(&video_frame) }?;
+                // Create RAII guard to ensure the frame is freed
+                let guard = unsafe { RecvVideoGuard::new(self.instance, video_frame) };
+                let frame = unsafe { VideoFrame::from_raw(guard.frame()) }?;
+                // Guard is dropped here, freeing the NDI frame
                 Ok(Some(frame))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(None),
@@ -789,7 +791,10 @@ impl Receiver {
 
         match frame_type {
             NDIlib_frame_type_e_NDIlib_frame_type_audio => {
-                let frame = AudioFrame::from_raw(audio_frame)?;
+                // Create RAII guard to ensure the frame is freed
+                let guard = unsafe { RecvAudioGuard::new(self.instance, audio_frame) };
+                let frame = AudioFrame::from_raw(*guard.frame())?;
+                // Guard is dropped here, freeing the NDI frame
                 Ok(Some(frame))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(None),
@@ -889,8 +894,10 @@ impl Receiver {
 
         match frame_type {
             NDIlib_frame_type_e_NDIlib_frame_type_metadata => {
-                let frame = MetadataFrame::from_raw(&metadata_frame);
-                unsafe { NDIlib_recv_free_metadata(self.instance, &metadata_frame) };
+                // Create RAII guard to ensure the frame is freed
+                let guard = unsafe { RecvMetadataGuard::new(self.instance, metadata_frame) };
+                let frame = MetadataFrame::from_raw(guard.frame());
+                // Guard is dropped here, freeing the NDI frame
                 Ok(Some(frame))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(None),
