@@ -27,7 +27,7 @@ use crate::{ndi_lib::*, Error, Result};
 /// // For bandwidth-efficient streaming
 /// let format = FourCCVideoType::UYVY;
 /// ```
-#[derive(Debug, TryFromPrimitive, IntoPrimitive, Clone, Copy)]
+#[derive(Debug, TryFromPrimitive, IntoPrimitive, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum FourCCVideoType {
     /// YCbCr 4:2:2 format (16 bits per pixel) - bandwidth efficient.
@@ -79,53 +79,35 @@ impl From<FrameFormatType> for i32 {
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub union LineStrideOrSize {
-    pub line_stride_in_bytes: i32,
-    pub data_size_in_bytes: i32,
-}
-
-impl fmt::Debug for LineStrideOrSize {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        unsafe {
-            let line_stride_in_bytes = self.line_stride_in_bytes;
-            write!(
-                f,
-                "LineStrideOrSize {{ line_stride_in_bytes: {line_stride_in_bytes} }}"
-            )
-        }
-    }
+/// Line stride or data size for video frames.
+///
+/// This enum represents the choice between line stride (for uncompressed formats)
+/// and total data size (for compressed or opaque formats). The discriminant is
+/// determined by the video format (FourCC).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineStrideOrSize {
+    /// Line stride in bytes for uncompressed formats.
+    /// This is the number of bytes per row of video data.
+    LineStrideBytes(i32),
+    /// Total data size in bytes for compressed or opaque formats.
+    DataSizeBytes(i32),
 }
 
 impl From<LineStrideOrSize> for NDIlib_video_frame_v2_t__bindgen_ty_1 {
     fn from(value: LineStrideOrSize) -> Self {
-        unsafe {
-            if value.line_stride_in_bytes != 0 {
+        // Writing to a union field is safe when the field type implements Copy.
+        // We write exactly one field of the union based on the enum variant.
+        match value {
+            LineStrideOrSize::LineStrideBytes(stride) =>
+            {
+                #[allow(clippy::field_reassign_with_default)]
                 NDIlib_video_frame_v2_t__bindgen_ty_1 {
-                    line_stride_in_bytes: value.line_stride_in_bytes,
-                }
-            } else {
-                NDIlib_video_frame_v2_t__bindgen_ty_1 {
-                    data_size_in_bytes: value.data_size_in_bytes,
+                    line_stride_in_bytes: stride,
                 }
             }
-        }
-    }
-}
-
-impl From<NDIlib_video_frame_v2_t__bindgen_ty_1> for LineStrideOrSize {
-    fn from(value: NDIlib_video_frame_v2_t__bindgen_ty_1) -> Self {
-        unsafe {
-            if value.line_stride_in_bytes != 0 {
-                LineStrideOrSize {
-                    line_stride_in_bytes: value.line_stride_in_bytes,
-                }
-            } else {
-                LineStrideOrSize {
-                    data_size_in_bytes: value.data_size_in_bytes,
-                }
-            }
+            LineStrideOrSize::DataSizeBytes(size) => NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                data_size_in_bytes: size,
+            },
         }
     }
 }
@@ -258,7 +240,15 @@ impl VideoFrame {
 
         // Validate stride
         let expected_stride = self.width * bytes_per_pixel;
-        let actual_stride = unsafe { self.line_stride_or_size.line_stride_in_bytes };
+        let actual_stride = match self.line_stride_or_size {
+            LineStrideOrSize::LineStrideBytes(stride) => stride,
+            LineStrideOrSize::DataSizeBytes(_) => {
+                return Err(Error::InvalidFrame(
+                    "Cannot encode image from compressed/data-size format. Use LineStrideBytes."
+                        .into(),
+                ));
+            }
+        };
 
         if actual_stride != expected_stride {
             return Err(Error::InvalidFrame(format!(
@@ -356,7 +346,15 @@ impl VideoFrame {
 
         // Validate stride
         let expected_stride = self.width * bytes_per_pixel;
-        let actual_stride = unsafe { self.line_stride_or_size.line_stride_in_bytes };
+        let actual_stride = match self.line_stride_or_size {
+            LineStrideOrSize::LineStrideBytes(stride) => stride,
+            LineStrideOrSize::DataSizeBytes(_) => {
+                return Err(Error::InvalidFrame(
+                    "Cannot encode image from compressed/data-size format. Use LineStrideBytes."
+                        .into(),
+                ));
+            }
+        };
 
         if actual_stride != expected_stride {
             return Err(Error::InvalidFrame(format!(
@@ -462,51 +460,49 @@ impl VideoFrame {
         let fourcc =
             FourCCVideoType::try_from(c_frame.FourCC as u32).unwrap_or(FourCCVideoType::Max);
 
-        // Determine data size based on whether we have line_stride or data_size_in_bytes
+        // Determine data size and LineStrideOrSize based on format.
         // The NDI SDK uses a union here: line_stride_in_bytes for uncompressed formats,
         // data_size_in_bytes for compressed formats.
-        let data_size_in_bytes = c_frame.__bindgen_anon_1.data_size_in_bytes;
-        let line_stride = c_frame.__bindgen_anon_1.line_stride_in_bytes;
-
-        // Determine if this is an uncompressed format
+        // We read ONLY the appropriate field based on the format to avoid UB.
         let is_uncompressed = is_uncompressed_format(fourcc);
 
-        let (data_size, line_stride_or_size) =
-            if is_uncompressed && line_stride > 0 && c_frame.yres > 0 {
-                // Uncompressed format: use line_stride * height
+        let (data_size, line_stride_or_size) = if is_uncompressed {
+            // Uncompressed format: read ONLY line_stride_in_bytes
+            let line_stride = c_frame.__bindgen_anon_1.line_stride_in_bytes;
+
+            if line_stride > 0 && c_frame.yres > 0 {
                 let calculated_size = (line_stride as usize) * (c_frame.yres as usize);
                 if calculated_size > 0 && calculated_size <= (100 * 1024 * 1024) {
                     // Reasonable size for uncompressed video (< 100MB per frame)
                     (
                         calculated_size,
-                        LineStrideOrSize {
-                            line_stride_in_bytes: line_stride,
-                        },
+                        LineStrideOrSize::LineStrideBytes(line_stride),
                     )
                 } else {
                     return Err(Error::InvalidFrame(format!(
                         "Invalid calculated size {calculated_size} for uncompressed format"
                     )));
                 }
-            } else if !is_uncompressed && data_size_in_bytes > 0 {
-                // Compressed format: use the explicit data size
+            } else {
+                return Err(Error::InvalidFrame(
+                    "Uncompressed video frame has invalid line_stride_in_bytes".into(),
+                ));
+            }
+        } else {
+            // Compressed/unknown format: read ONLY data_size_in_bytes
+            let data_size_in_bytes = c_frame.__bindgen_anon_1.data_size_in_bytes;
+
+            if data_size_in_bytes > 0 {
                 (
                     data_size_in_bytes as usize,
-                    LineStrideOrSize { data_size_in_bytes },
-                )
-            } else if data_size_in_bytes > 0 {
-                // Fallback: use data_size_in_bytes if available
-                (
-                    data_size_in_bytes as usize,
-                    LineStrideOrSize { data_size_in_bytes },
+                    LineStrideOrSize::DataSizeBytes(data_size_in_bytes),
                 )
             } else {
-                // Neither field is valid - this is an error
                 return Err(Error::InvalidFrame(
-                    "Video frame has neither valid line_stride_in_bytes nor data_size_in_bytes"
-                        .into(),
+                    "Compressed video frame has invalid data_size_in_bytes".into(),
                 ));
-            };
+            }
+        };
 
         if data_size == 0 {
             return Err(Error::InvalidFrame("Video frame has zero size".into()));
@@ -663,9 +659,7 @@ impl VideoFrameBuilder {
             frame_format_type,
             timecode: self.timecode.unwrap_or(0),
             data: (data),
-            line_stride_or_size: LineStrideOrSize {
-                line_stride_in_bytes: stride,
-            },
+            line_stride_or_size: LineStrideOrSize::LineStrideBytes(stride),
             metadata: None,
             timestamp: self.timestamp.unwrap_or(0),
         };
@@ -1083,7 +1077,7 @@ fn calculate_buffer_size(fourcc: FourCCVideoType, width: i32, height: i32) -> us
 }
 
 /// Check if a video format is uncompressed
-fn is_uncompressed_format(fourcc: FourCCVideoType) -> bool {
+pub(crate) fn is_uncompressed_format(fourcc: FourCCVideoType) -> bool {
     matches!(
         fourcc,
         FourCCVideoType::BGRA

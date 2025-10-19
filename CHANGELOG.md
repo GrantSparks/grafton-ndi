@@ -18,6 +18,12 @@
 - Test coverage for both planar and interleaved audio formats (4 new tests)
 
 ### Changed
+- **BREAKING**: `LineStrideOrSize` is now a typed enum instead of a union ([#15](https://github.com/GrantSparks/grafton-ndi/issues/15))
+  - Eliminates undefined behavior from reading inactive union fields
+  - Two variants: `LineStrideBytes(i32)` for uncompressed formats, `DataSizeBytes(i32)` for compressed
+  - Direct field access replaced with pattern matching: `match line_stride_or_size { LineStrideBytes(s) => ... }`
+  - All union reads in `VideoFrame::from_raw` and `video_done_cb` now discriminate based on format
+  - Added comprehensive test coverage (8 new tests)
 - **BREAKING**: `AudioFrameBuilder` now defaults to planar layout
   - `channel_stride_in_bytes` now correctly set to `num_samples * 4` (was 0)
   - Users requiring interleaved format must explicitly call `.layout(AudioLayout::Interleaved)`

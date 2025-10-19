@@ -28,6 +28,9 @@ use crate::{
     Error, Result, NDI,
 };
 
+#[cfg(feature = "advanced_sdk")]
+use crate::frames::is_uncompressed_format;
+
 #[cfg(not(target_has_atomic = "ptr"))]
 compile_error!(
     "This crate requires atomic pointer support. Please use a target with atomics enabled."
@@ -143,9 +146,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
             frame_format_type: FrameFormatType::Progressive,
             timecode: 0,
             data,
-            line_stride_or_size: LineStrideOrSize {
-                line_stride_in_bytes: stride,
-            },
+            line_stride_or_size: LineStrideOrSize::LineStrideBytes(stride),
             metadata: None,
             timestamp: 0,
         }
@@ -348,9 +349,23 @@ impl<'a> Sender<'a> {
                         // We clone the Arc here to access the Inner without consuming the original
                         let inner = Arc::from_raw(opaque as *const Inner);
 
-                        // The frame has data_size_in_bytes for async frames
+                        // Determine the data size by reading the correct union field based on format.
+                        // We must avoid UB by reading ONLY the active union field.
                         let len = if !frame.is_null() {
-                            (*frame).__bindgen_anon_1.data_size_in_bytes as usize
+                            #[allow(clippy::unnecessary_cast)]
+                            // Required for Windows where FourCC is i32
+                            let fourcc = FourCCVideoType::try_from((*frame).FourCC as u32)
+                                .unwrap_or(FourCCVideoType::Max);
+
+                            if is_uncompressed_format(fourcc) {
+                                // Uncompressed format: read ONLY line_stride_in_bytes
+                                let line_stride = (*frame).__bindgen_anon_1.line_stride_in_bytes;
+                                let height = (*frame).yres;
+                                (line_stride as usize) * (height as usize)
+                            } else {
+                                // Compressed/unknown format: read ONLY data_size_in_bytes
+                                (*frame).__bindgen_anon_1.data_size_in_bytes as usize
+                            }
                         } else {
                             0
                         };

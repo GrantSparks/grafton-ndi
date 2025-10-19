@@ -114,7 +114,15 @@ fn main() -> Result<(), Error> {
     println!("  Resolution: {width}x{height}");
     let fourcc = video_frame.fourcc;
     println!("  Format: {fourcc:?}");
-    let line_stride = unsafe { video_frame.line_stride_or_size.line_stride_in_bytes };
+    let line_stride = match video_frame.line_stride_or_size {
+        grafton_ndi::LineStrideOrSize::LineStrideBytes(stride) => stride,
+        grafton_ndi::LineStrideOrSize::DataSizeBytes(_) => {
+            eprintln!("ERROR: Expected line stride but got data size");
+            return Err(Error::InvalidFrame(
+                "Frame has data size instead of line stride".into(),
+            ));
+        }
+    };
     println!("  Line stride: {line_stride} bytes");
     let data_size = video_frame.data.len();
     println!("  Data size: {data_size} bytes");
@@ -137,7 +145,7 @@ fn main() -> Result<(), Error> {
 
     // CRITICAL: Verify stride matches width to prevent corrupted images
     let expected_stride = video_frame.width * 4; // 4 bytes per pixel for RGBA
-    let actual_stride = unsafe { video_frame.line_stride_or_size.line_stride_in_bytes };
+    let actual_stride = line_stride;
 
     if actual_stride != expected_stride {
         // This is a common issue with some NDI sources

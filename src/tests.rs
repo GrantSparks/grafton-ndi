@@ -92,8 +92,8 @@ fn test_video_frame_zero_size_returns_error() {
     let mut c_frame: NDIlib_video_frame_v2_t = unsafe { std::mem::zeroed() };
     let mut data = vec![0u8; 100];
     c_frame.p_data = data.as_mut_ptr();
+    c_frame.FourCC = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA;
     c_frame.__bindgen_anon_1.line_stride_in_bytes = 0;
-    c_frame.__bindgen_anon_1.data_size_in_bytes = 0;
     c_frame.yres = 1080;
 
     unsafe {
@@ -101,7 +101,7 @@ fn test_video_frame_zero_size_returns_error() {
         assert!(result.is_err());
         match result {
             Err(Error::InvalidFrame(msg)) => {
-                assert!(msg.contains("neither valid line_stride_in_bytes nor data_size_in_bytes"));
+                assert!(msg.contains("invalid line_stride_in_bytes"));
             }
             _ => panic!("Expected InvalidFrame error"),
         }
@@ -1052,4 +1052,202 @@ fn test_async_feature_flags_mutually_compatible() {
     }
 
     // If this compiles, both can be enabled together
+}
+
+// LineStrideOrSize enum tests (issue #15)
+
+#[test]
+fn test_line_stride_or_size_to_raw_uncompressed() {
+    use crate::frames::LineStrideOrSize;
+
+    // Test conversion from enum to C union for uncompressed format
+    let stride = LineStrideOrSize::LineStrideBytes(7680); // 1920 * 4
+    let c_union: NDIlib_video_frame_v2_t__bindgen_ty_1 = stride.into();
+
+    // Should write only line_stride_in_bytes
+    unsafe {
+        assert_eq!(c_union.line_stride_in_bytes, 7680);
+    }
+}
+
+#[test]
+fn test_line_stride_or_size_to_raw_compressed() {
+    use crate::frames::LineStrideOrSize;
+
+    // Test conversion from enum to C union for compressed format
+    let data_size = LineStrideOrSize::DataSizeBytes(1024000);
+    let c_union: NDIlib_video_frame_v2_t__bindgen_ty_1 = data_size.into();
+
+    // Should write only data_size_in_bytes
+    unsafe {
+        assert_eq!(c_union.data_size_in_bytes, 1024000);
+    }
+}
+
+#[test]
+fn test_video_frame_from_raw_uncompressed_bgra() {
+    use crate::frames::{FourCCVideoType, LineStrideOrSize};
+
+    // Test that from_raw reads ONLY line_stride_in_bytes for uncompressed formats
+    let test_width = 1920;
+    let test_height = 1080;
+    let bytes_per_pixel = 4;
+    let line_stride = test_width * bytes_per_pixel;
+
+    let c_frame = create_test_video_frame(test_width, test_height, line_stride, 0);
+
+    unsafe {
+        let frame = VideoFrame::from_raw(&c_frame).unwrap();
+
+        // Should have LineStrideBytes variant
+        match frame.line_stride_or_size {
+            LineStrideOrSize::LineStrideBytes(stride) => {
+                assert_eq!(stride, line_stride);
+            }
+            LineStrideOrSize::DataSizeBytes(_) => {
+                panic!("Expected LineStrideBytes for uncompressed format");
+            }
+        }
+
+        // Verify data size calculation
+        let expected_size = (line_stride * test_height) as usize;
+        assert_eq!(frame.data.len(), expected_size);
+        assert_eq!(frame.fourcc, FourCCVideoType::BGRA);
+
+        drop(frame);
+        Vec::from_raw_parts(c_frame.p_data, expected_size, expected_size);
+    }
+}
+
+#[test]
+fn test_video_frame_from_raw_compressed() {
+    use crate::frames::{FourCCVideoType, LineStrideOrSize};
+
+    // Test that from_raw reads ONLY data_size_in_bytes for compressed/unknown formats
+    let test_width = 1920;
+    let test_height = 1080;
+    let data_size = 512000; // Compressed size
+
+    // Create a frame with Max FourCC (compressed/unknown format)
+    let mut c_frame: NDIlib_video_frame_v2_t = unsafe { std::mem::zeroed() };
+    c_frame.xres = test_width;
+    c_frame.yres = test_height;
+    c_frame.FourCC = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_max;
+    c_frame.__bindgen_anon_1.data_size_in_bytes = data_size;
+
+    let mut data = vec![0u8; data_size as usize];
+    c_frame.p_data = data.as_mut_ptr();
+    std::mem::forget(data);
+
+    unsafe {
+        let frame = VideoFrame::from_raw(&c_frame).unwrap();
+
+        // Should have DataSizeBytes variant
+        match frame.line_stride_or_size {
+            LineStrideOrSize::DataSizeBytes(size) => {
+                assert_eq!(size, data_size);
+            }
+            LineStrideOrSize::LineStrideBytes(_) => {
+                panic!("Expected DataSizeBytes for compressed format");
+            }
+        }
+
+        // Verify data size
+        assert_eq!(frame.data.len(), data_size as usize);
+        assert_eq!(frame.fourcc, FourCCVideoType::Max);
+
+        drop(frame);
+        Vec::from_raw_parts(c_frame.p_data, data_size as usize, data_size as usize);
+    }
+}
+
+#[test]
+fn test_video_frame_to_raw_roundtrip_uncompressed() {
+    use crate::frames::{FourCCVideoType, LineStrideOrSize, VideoFrame};
+
+    // Build a video frame with LineStrideBytes
+    let frame = VideoFrame::builder()
+        .resolution(1920, 1080)
+        .fourcc(FourCCVideoType::BGRA)
+        .build()
+        .unwrap();
+
+    // Verify it has LineStrideBytes
+    match frame.line_stride_or_size {
+        LineStrideOrSize::LineStrideBytes(stride) => {
+            assert_eq!(stride, 1920 * 4);
+        }
+        LineStrideOrSize::DataSizeBytes(_) => {
+            panic!("Builder should create LineStrideBytes");
+        }
+    }
+
+    // Convert to raw
+    let raw = frame.to_raw();
+
+    // Verify the C union has the correct field set
+    unsafe {
+        assert_eq!(raw.__bindgen_anon_1.line_stride_in_bytes, 1920 * 4);
+    }
+}
+
+#[test]
+fn test_video_frame_builder_creates_line_stride_bytes() {
+    use crate::frames::{FourCCVideoType, LineStrideOrSize, VideoFrame};
+
+    // All builder-created frames should use LineStrideBytes
+    let frame = VideoFrame::builder()
+        .resolution(640, 480)
+        .fourcc(FourCCVideoType::RGBA)
+        .build()
+        .unwrap();
+
+    match frame.line_stride_or_size {
+        LineStrideOrSize::LineStrideBytes(stride) => {
+            assert_eq!(stride, 640 * 4);
+        }
+        LineStrideOrSize::DataSizeBytes(_) => {
+            panic!("Builder should always create LineStrideBytes");
+        }
+    }
+}
+
+#[test]
+fn test_line_stride_or_size_debug() {
+    use crate::frames::LineStrideOrSize;
+
+    // Test Debug implementation (should not use unsafe)
+    let stride = LineStrideOrSize::LineStrideBytes(7680);
+    let debug_str = format!("{:?}", stride);
+    assert!(debug_str.contains("LineStrideBytes"));
+    assert!(debug_str.contains("7680"));
+
+    let size = LineStrideOrSize::DataSizeBytes(1024000);
+    let debug_str = format!("{:?}", size);
+    assert!(debug_str.contains("DataSizeBytes"));
+    assert!(debug_str.contains("1024000"));
+}
+
+#[test]
+fn test_line_stride_or_size_equality() {
+    use crate::frames::LineStrideOrSize;
+
+    let stride1 = LineStrideOrSize::LineStrideBytes(7680);
+    let stride2 = LineStrideOrSize::LineStrideBytes(7680);
+    let stride3 = LineStrideOrSize::LineStrideBytes(3840);
+
+    assert_eq!(stride1, stride2);
+    assert_ne!(stride1, stride3);
+
+    let size1 = LineStrideOrSize::DataSizeBytes(1024);
+    let size2 = LineStrideOrSize::DataSizeBytes(1024);
+    let size3 = LineStrideOrSize::DataSizeBytes(2048);
+
+    assert_eq!(size1, size2);
+    assert_ne!(size1, size3);
+
+    // Different variants should not be equal
+    let stride = LineStrideOrSize::LineStrideBytes(1024);
+    let size = LineStrideOrSize::DataSizeBytes(1024);
+    assert_ne!(stride, size);
 }
