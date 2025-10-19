@@ -741,7 +741,12 @@ impl SourceCache {
 
         // Not in cache, perform discovery
         let ndi = Arc::new(NDI::new()?);
-        let options = FinderOptions::builder().show_local_sources(true).build();
+        // Use extra_ips to hint NDI to look at the specific host IP/network segment
+        // This significantly improves discovery speed and reliability
+        let options = FinderOptions::builder()
+            .show_local_sources(true)
+            .extra_ips(host)
+            .build();
         let finder = Finder::new(&ndi, &options)?;
 
         // Wait for sources to be discovered
