@@ -124,6 +124,10 @@ pub use {
     sender::{AsyncVideoToken, BorrowedVideoFrame, Sender, SenderOptions, SenderOptionsBuilder},
 };
 
+// Conditional re-exports for image-encoding feature
+#[cfg(feature = "image-encoding")]
+pub use frames::ImageFormat;
+
 /// Alias for Result with our Error type
 pub type Result<T> = std::result::Result<T, crate::error::Error>;
 

@@ -532,6 +532,302 @@ fn test_source_cache_invalidation() {
     assert!(cache.is_empty());
 }
 
+// Image encoding tests (feature-gated)
+#[cfg(feature = "image-encoding")]
+#[test]
+fn test_video_frame_encode_png_rgba() {
+    use crate::frames::{FourCCVideoType, VideoFrame};
+
+    // Create a simple 2x2 RGBA test frame
+    let width = 2;
+    let height = 2;
+    let mut data = vec![0u8; (width * height * 4) as usize];
+
+    // Red pixel (top-left)
+    data[0..4].copy_from_slice(&[255, 0, 0, 255]);
+    // Green pixel (top-right)
+    data[4..8].copy_from_slice(&[0, 255, 0, 255]);
+    // Blue pixel (bottom-left)
+    data[8..12].copy_from_slice(&[0, 0, 255, 255]);
+    // White pixel (bottom-right)
+    data[12..16].copy_from_slice(&[255, 255, 255, 255]);
+
+    let frame = VideoFrame::builder()
+        .resolution(width, height)
+        .fourcc(FourCCVideoType::RGBA)
+        .build()
+        .unwrap();
+
+    // Replace the data with our test pattern
+    let mut frame = frame;
+    frame.data = std::borrow::Cow::Owned(data);
+
+    // Encode to PNG
+    let png_bytes = frame.encode_png();
+    assert!(png_bytes.is_ok());
+
+    let png_bytes = png_bytes.unwrap();
+    assert!(!png_bytes.is_empty());
+
+    // Verify PNG header (first 8 bytes)
+    assert_eq!(&png_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+}
+
+#[cfg(feature = "image-encoding")]
+#[test]
+fn test_video_frame_encode_png_bgra() {
+    use crate::frames::{FourCCVideoType, VideoFrame};
+
+    // Create a 2x2 BGRA test frame
+    let width = 2;
+    let height = 2;
+    let mut data = vec![0u8; (width * height * 4) as usize];
+
+    // Red pixel in BGRA format (B=0, G=0, R=255, A=255)
+    data[0..4].copy_from_slice(&[0, 0, 255, 255]);
+    // Green pixel in BGRA format
+    data[4..8].copy_from_slice(&[0, 255, 0, 255]);
+    // Blue pixel in BGRA format
+    data[8..12].copy_from_slice(&[255, 0, 0, 255]);
+    // White pixel in BGRA format
+    data[12..16].copy_from_slice(&[255, 255, 255, 255]);
+
+    let frame = VideoFrame::builder()
+        .resolution(width, height)
+        .fourcc(FourCCVideoType::BGRA)
+        .build()
+        .unwrap();
+
+    let mut frame = frame;
+    frame.data = std::borrow::Cow::Owned(data);
+
+    // Encode to PNG (should convert BGRA to RGBA)
+    let png_bytes = frame.encode_png();
+    assert!(png_bytes.is_ok());
+
+    let png_bytes = png_bytes.unwrap();
+    assert!(!png_bytes.is_empty());
+
+    // Verify PNG header
+    assert_eq!(&png_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+}
+
+#[cfg(feature = "image-encoding")]
+#[test]
+fn test_video_frame_encode_png_unsupported_format() {
+    use crate::frames::{FourCCVideoType, VideoFrame};
+
+    let frame = VideoFrame::builder()
+        .resolution(2, 2)
+        .fourcc(FourCCVideoType::UYVY) // Unsupported for encoding
+        .build()
+        .unwrap();
+
+    // Should fail with unsupported format error
+    let result = frame.encode_png();
+    assert!(result.is_err());
+
+    let err = result.unwrap_err();
+    let err_msg = format!("{}", err);
+    assert!(err_msg.contains("Unsupported format"));
+}
+
+#[cfg(feature = "image-encoding")]
+#[test]
+fn test_video_frame_encode_jpeg_rgba() {
+    use crate::frames::{FourCCVideoType, VideoFrame};
+
+    // Create a simple 4x4 RGBA test frame
+    let width = 4;
+    let height = 4;
+    let data = vec![255u8; (width * height * 4) as usize]; // All white
+
+    let frame = VideoFrame::builder()
+        .resolution(width, height)
+        .fourcc(FourCCVideoType::RGBA)
+        .build()
+        .unwrap();
+
+    let mut frame = frame;
+    frame.data = std::borrow::Cow::Owned(data);
+
+    // Encode to JPEG with quality 85
+    let jpeg_bytes = frame.encode_jpeg(85);
+    assert!(jpeg_bytes.is_ok());
+
+    let jpeg_bytes = jpeg_bytes.unwrap();
+    assert!(!jpeg_bytes.is_empty());
+
+    // Verify JPEG header (SOI marker: 0xFF 0xD8)
+    assert_eq!(&jpeg_bytes[0..2], &[0xFF, 0xD8]);
+
+    // Verify JPEG end marker (EOI: 0xFF 0xD9)
+    let len = jpeg_bytes.len();
+    assert_eq!(&jpeg_bytes[len - 2..len], &[0xFF, 0xD9]);
+}
+
+#[cfg(feature = "image-encoding")]
+#[test]
+fn test_video_frame_encode_jpeg_bgra() {
+    use crate::frames::{FourCCVideoType, VideoFrame};
+
+    let width = 4;
+    let height = 4;
+    let data = vec![128u8; (width * height * 4) as usize]; // Gray
+
+    let frame = VideoFrame::builder()
+        .resolution(width, height)
+        .fourcc(FourCCVideoType::BGRA)
+        .build()
+        .unwrap();
+
+    let mut frame = frame;
+    frame.data = std::borrow::Cow::Owned(data);
+
+    // Encode to JPEG (should convert BGRA to RGB)
+    let jpeg_bytes = frame.encode_jpeg(90);
+    assert!(jpeg_bytes.is_ok());
+
+    let jpeg_bytes = jpeg_bytes.unwrap();
+    assert!(!jpeg_bytes.is_empty());
+
+    // Verify JPEG markers
+    assert_eq!(&jpeg_bytes[0..2], &[0xFF, 0xD8]);
+}
+
+#[cfg(feature = "image-encoding")]
+#[test]
+fn test_video_frame_encode_jpeg_quality_range() {
+    use crate::frames::{FourCCVideoType, VideoFrame};
+
+    // Create a more complex image with varying colors to better show compression differences
+    let width = 32;
+    let height = 32;
+    let mut data = vec![0u8; (width * height * 4) as usize];
+
+    // Fill with a gradient pattern
+    for y in 0..height {
+        for x in 0..width {
+            let idx = ((y * width + x) * 4) as usize;
+            data[idx] = ((x * 255) / width) as u8; // Red gradient
+            data[idx + 1] = ((y * 255) / height) as u8; // Green gradient
+            data[idx + 2] = 128; // Blue constant
+            data[idx + 3] = 255; // Alpha
+        }
+    }
+
+    let frame = VideoFrame::builder()
+        .resolution(width, height)
+        .fourcc(FourCCVideoType::RGBA)
+        .build()
+        .unwrap();
+
+    let mut frame = frame;
+    frame.data = std::borrow::Cow::Owned(data);
+
+    // Test different quality levels
+    let low_quality = frame.encode_jpeg(10).unwrap();
+    let high_quality = frame.encode_jpeg(95).unwrap();
+
+    // Both should be valid JPEG files
+    assert!(!low_quality.is_empty());
+    assert!(!high_quality.is_empty());
+
+    // For a gradient image, higher quality should produce larger files
+    assert!(low_quality.len() < high_quality.len());
+}
+
+#[cfg(feature = "image-encoding")]
+#[test]
+fn test_video_frame_encode_data_url_png() {
+    use crate::frames::{FourCCVideoType, ImageFormat, VideoFrame};
+
+    let width = 2;
+    let height = 2;
+    let data = vec![255u8; (width * height * 4) as usize];
+
+    let frame = VideoFrame::builder()
+        .resolution(width, height)
+        .fourcc(FourCCVideoType::RGBA)
+        .build()
+        .unwrap();
+
+    let mut frame = frame;
+    frame.data = std::borrow::Cow::Owned(data);
+
+    let data_url = frame.encode_data_url(ImageFormat::Png);
+    assert!(data_url.is_ok());
+
+    let data_url = data_url.unwrap();
+
+    // Should start with data URL prefix
+    assert!(data_url.starts_with("data:image/png;base64,"));
+
+    // Should have base64 data after the prefix
+    let base64_part = data_url.strip_prefix("data:image/png;base64,").unwrap();
+    assert!(!base64_part.is_empty());
+
+    // Base64 should only contain valid characters
+    assert!(base64_part
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
+}
+
+#[cfg(feature = "image-encoding")]
+#[test]
+fn test_video_frame_encode_data_url_jpeg() {
+    use crate::frames::{FourCCVideoType, ImageFormat, VideoFrame};
+
+    let width = 4;
+    let height = 4;
+    let data = vec![128u8; (width * height * 4) as usize];
+
+    let frame = VideoFrame::builder()
+        .resolution(width, height)
+        .fourcc(FourCCVideoType::RGBA)
+        .build()
+        .unwrap();
+
+    let mut frame = frame;
+    frame.data = std::borrow::Cow::Owned(data);
+
+    let data_url = frame.encode_data_url(ImageFormat::Jpeg(85));
+    assert!(data_url.is_ok());
+
+    let data_url = data_url.unwrap();
+
+    // Should start with JPEG data URL prefix
+    assert!(data_url.starts_with("data:image/jpeg;base64,"));
+
+    // Should have base64 data
+    let base64_part = data_url.strip_prefix("data:image/jpeg;base64,").unwrap();
+    assert!(!base64_part.is_empty());
+}
+
+#[cfg(feature = "image-encoding")]
+#[test]
+fn test_image_format_enum() {
+    use crate::ImageFormat;
+
+    let png = ImageFormat::Png;
+    let jpeg = ImageFormat::Jpeg(90);
+
+    // Should be able to clone and copy
+    let png_copy = png;
+    let jpeg_copy = jpeg;
+
+    assert_eq!(png, png_copy);
+    assert_eq!(jpeg, jpeg_copy);
+
+    // Different formats should not be equal
+    assert_ne!(png, jpeg);
+
+    // Different JPEG qualities should not be equal
+    let jpeg_low = ImageFormat::Jpeg(50);
+    let jpeg_high = ImageFormat::Jpeg(95);
+    assert_ne!(jpeg_low, jpeg_high);
+}
+
 #[test]
 fn test_source_cache_len_and_is_empty() {
     use crate::finder::SourceCache;
