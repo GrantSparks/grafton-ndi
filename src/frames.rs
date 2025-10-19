@@ -841,6 +841,7 @@ pub struct AudioFrameBuilder {
     timecode: Option<i64>,
     fourcc: Option<AudioType>,
     data: Option<Vec<f32>>,
+    layout: Option<AudioLayout>,
     metadata: Option<String>,
     timestamp: Option<i64>,
 }
@@ -855,6 +856,7 @@ impl AudioFrameBuilder {
             timecode: None,
             fourcc: None,
             data: None,
+            layout: None,
             metadata: None,
             timestamp: None,
         }
@@ -895,7 +897,36 @@ impl AudioFrameBuilder {
         self
     }
 
+    /// Set the audio data layout (planar or interleaved)
+    ///
+    /// - **Planar**: All samples for channel 0, then all for channel 1, etc.
+    /// - **Interleaved**: Samples from all channels are interleaved.
+    ///
+    /// Defaults to `AudioLayout::Planar` which is the native format for FLTP.
+    ///
+    /// # Example
+    /// ```
+    /// use grafton_ndi::{AudioFrame, AudioLayout};
+    ///
+    /// // Planar layout (default)
+    /// let frame = AudioFrame::builder()
+    ///     .channels(2)
+    ///     .samples(100)
+    ///     .layout(AudioLayout::Planar)
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    #[must_use]
+    pub fn layout(mut self, layout: AudioLayout) -> Self {
+        self.layout = Some(layout);
+        self
+    }
+
     /// Set the audio data as 32-bit floats
+    ///
+    /// The data layout must match the configured `AudioLayout`:
+    /// - **Planar**: `[C0S0, C0S1, ..., C1S0, C1S1, ...]`
+    /// - **Interleaved**: `[C0S0, C1S0, C0S1, C1S1, ...]`
     #[must_use]
     pub fn data(mut self, data: Vec<f32>) -> Self {
         self.data = Some(data);
@@ -917,11 +948,16 @@ impl AudioFrameBuilder {
     }
 
     /// Build the AudioFrame
+    ///
+    /// Calculates the appropriate `channel_stride_in_bytes` based on the configured layout:
+    /// - **Planar** (default): stride = num_samples * 4 (4 bytes per f32 sample)
+    /// - **Interleaved**: stride = 0
     pub fn build(self) -> Result<AudioFrame> {
         let sample_rate = self.sample_rate.unwrap_or(48000);
         let num_channels = self.num_channels.unwrap_or(2);
         let num_samples = self.num_samples.unwrap_or(1024);
         let fourcc = self.fourcc.unwrap_or(AudioType::FLTP);
+        let layout = self.layout.unwrap_or(AudioLayout::Planar);
 
         let data = if let Some(data) = self.data {
             data
@@ -936,14 +972,22 @@ impl AudioFrameBuilder {
             .map(|m| CString::new(m).map_err(Error::InvalidCString))
             .transpose()?;
 
+        // Calculate channel_stride_in_bytes based on layout
+        // Planar: Each channel has num_samples * sizeof(f32) bytes
+        // Interleaved: 0 indicates interleaved format
+        let channel_stride_in_bytes = match layout {
+            AudioLayout::Planar => num_samples * 4, // 4 bytes per f32
+            AudioLayout::Interleaved => 0,
+        };
+
         Ok(AudioFrame {
             sample_rate,
             num_channels,
             num_samples,
             timecode: self.timecode.unwrap_or(0),
             fourcc,
-            data: (data),
-            channel_stride_in_bytes: 0, // 0 indicates interleaved format
+            data,
+            channel_stride_in_bytes,
             metadata: metadata_cstring,
             timestamp: self.timestamp.unwrap_or(0),
         })
@@ -976,6 +1020,28 @@ impl Drop for AudioFrame {
 pub enum AudioType {
     FLTP = NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP as _,
     Max = NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_max as _,
+}
+
+/// Audio data layout format
+///
+/// Determines how multi-channel audio samples are arranged in memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioLayout {
+    /// Planar format: All samples for channel 0, then all for channel 1, etc.
+    ///
+    /// Memory layout for 2 channels, 3 samples:
+    /// `[C0S0, C0S1, C0S2, C1S0, C1S1, C1S2]`
+    ///
+    /// This is the native format for FLTP and is efficient for per-channel processing.
+    Planar,
+
+    /// Interleaved format: Samples from all channels are interleaved.
+    ///
+    /// Memory layout for 2 channels, 3 samples:
+    /// `[C0S0, C1S0, C0S1, C1S1, C0S2, C1S2]`
+    ///
+    /// This format alternates between channels for each sample.
+    Interleaved,
 }
 
 impl From<AudioType> for i32 {

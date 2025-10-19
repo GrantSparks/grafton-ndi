@@ -124,7 +124,7 @@ pub use {
     error::*,
     finder::{Finder, FinderOptions, FinderOptionsBuilder, Source, SourceAddress, SourceCache},
     frames::{
-        AudioFrame, AudioFrameBuilder, AudioType, FourCCVideoType, FrameFormatType,
+        AudioFrame, AudioFrameBuilder, AudioLayout, AudioType, FourCCVideoType, FrameFormatType,
         LineStrideOrSize, MetadataFrame, VideoFrame, VideoFrameBuilder,
     },
     receiver::{
