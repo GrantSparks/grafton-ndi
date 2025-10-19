@@ -132,8 +132,57 @@ fn main() {
         let lib_path = format!("{}\\lib\\{}", ndi_sdk_path, lib_subdir);
         println!("cargo:rustc-link-search=native={}", lib_path);
     } else if cfg!(target_os = "linux") {
-        // For Linux, add the library search path
-        let lib_path = format!("{}/lib/x86_64-linux-gnu", ndi_sdk_path);
+        // For Linux, detect the architecture and find the appropriate library directory
+        let target = env::var("TARGET").expect("TARGET environment variable not set");
+
+        // Determine possible architecture-specific library directories
+        let arch_dirs: Vec<String> = if target.contains("x86_64") {
+            vec!["x86_64-linux-gnu".to_string()]
+        } else if target.contains("i686") || target.contains("i586") {
+            vec!["i686-linux-gnu".to_string()]
+        } else if target.contains("aarch64") {
+            // For ARM64, try generic first, then Raspberry Pi specific
+            vec![
+                "aarch64-linux-gnu".to_string(),
+                "aarch64-rpi4-linux-gnueabihf".to_string(),
+            ]
+        } else if target.contains("armv7") {
+            // For ARMv7, try Raspberry Pi 4, 3, then 2
+            vec![
+                "arm-rpi4-linux-gnueabihf".to_string(),
+                "arm-rpi3-linux-gnueabihf".to_string(),
+                "arm-rpi2-linux-gnueabihf".to_string(),
+            ]
+        } else if target.contains("arm") {
+            // For other ARM variants, try all Raspberry Pi variants
+            vec![
+                "arm-rpi4-linux-gnueabihf".to_string(),
+                "arm-rpi3-linux-gnueabihf".to_string(),
+                "arm-rpi2-linux-gnueabihf".to_string(),
+                "arm-rpi1-linux-gnueabihf".to_string(),
+            ]
+        } else {
+            panic!(
+                "Unsupported Linux architecture: {}. Please set NDI_SDK_DIR to point to your NDI SDK installation and ensure the architecture-specific library directory exists.",
+                target
+            );
+        };
+
+        // Find the first architecture directory that exists
+        let lib_base = format!("{}/lib", ndi_sdk_path);
+        let lib_path = arch_dirs
+            .iter()
+            .map(|arch| format!("{}/{}", lib_base, arch))
+            .find(|path| Path::new(path).exists())
+            .unwrap_or_else(|| {
+                panic!(
+                    "NDI SDK library directory not found for architecture: {}. Searched in: {:?}. \
+                    Please ensure the NDI SDK is installed correctly or set NDI_SDK_DIR to the correct location.",
+                    target,
+                    arch_dirs.iter().map(|arch| format!("{}/{}", lib_base, arch)).collect::<Vec<_>>()
+                )
+            });
+
         println!("cargo:rustc-link-search=native={}", lib_path);
     } else if cfg!(target_os = "macos") {
         // For macOS, add the library search path
