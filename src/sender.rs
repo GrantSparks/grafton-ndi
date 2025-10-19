@@ -392,9 +392,11 @@ impl<'a> Sender<'a> {
             // NOTE: This function is only available in the Advanced SDK, not the standard SDK
             #[cfg(feature = "advanced_sdk")]
             {
-                // Convert Arc to raw pointer for the callback
-                // The Arc reference count is incremented here and will be decremented in Inner::drop
-                let raw_inner = Arc::into_raw(inner.clone()) as *mut c_void;
+                // Store a non-owning pointer for the callback (no refcount increment)
+                // SAFETY: The pointer remains valid as long as the Arc<Inner> exists,
+                // which is guaranteed by our design: the callback is unregistered in Sender::drop
+                // before the last Arc reference is dropped.
+                let raw_inner = Arc::as_ptr(&inner) as *mut c_void;
                 inner.callback_ptr.store(raw_inner, Ordering::Release);
 
                 #[allow(dead_code)] // Will be used when NDIlib_send_set_video_async_completion is available
@@ -403,9 +405,11 @@ impl<'a> Sender<'a> {
                     frame: *const NDIlib_video_frame_v2_t,
                 ) {
                     unsafe {
-                        // SAFETY: This pointer was created from Arc::into_raw and is still valid
-                        // We clone the Arc here to access the Inner without consuming the original
-                        let inner = Arc::from_raw(opaque as *const Inner);
+                        // SAFETY: opaque is a non-owning pointer to Inner, created via Arc::as_ptr.
+                        // The pointer remains valid because:
+                        // 1. The callback is unregistered in Sender::drop before Inner is destroyed
+                        // 2. The Arc<Inner> is kept alive by the Sender that registered this callback
+                        let inner: &Inner = &*(opaque as *const Inner);
 
                         // Determine the data size by reading the correct union field based on format.
                         // We must avoid UB by reading ONLY the active union field.
@@ -439,10 +443,6 @@ impl<'a> Sender<'a> {
                         if let Some(cb) = inner.async_state.video_callback.get() {
                             (cb)(len);
                         }
-
-                        // Re-leak the Arc since we're not done with it yet
-                        // It will be properly dropped in Inner::drop
-                        ::std::mem::forget(inner);
                     }
                 }
 
@@ -456,10 +456,10 @@ impl<'a> Sender<'a> {
                     );
                 }
 
-                // If the callback is not available, clean up the Arc we created
+                // If the callback is not available, clear the pointer
+                // (no Arc cleanup needed since we didn't create an owning pointer)
                 #[cfg(not(has_async_completion_callback))]
                 {
-                    let _ = unsafe { Arc::from_raw(raw_inner as *const Inner) };
                     inner.callback_ptr.store(ptr::null_mut(), Ordering::Release);
                 }
             }
@@ -819,18 +819,9 @@ impl Drop for Inner {
 
         // Then handle other cleanup
         unsafe {
-            // Balance the Arc::into_raw from SendInstance::new when async callback is enabled
-            // NOTE: This is only needed if the callback was actually registered
-            #[cfg(feature = "advanced_sdk")]
-            {
-                let callback_ptr = self.callback_ptr.load(Ordering::Acquire);
-                if !callback_ptr.is_null() {
-                    // SAFETY: This pointer was created from Arc::into_raw in SendInstance::new
-                    // In the current implementation where the SDK function is not available,
-                    // this Arc was already cleaned up in SendInstance::new, so callback_ptr is null
-                    let _ = Arc::from_raw(callback_ptr as *const Inner);
-                }
-            }
+            // No Arc cleanup needed anymore - we use non-owning pointers for callbacks.
+            // The callback is unregistered in Sender::drop before Inner::drop runs,
+            // so callback_ptr is just a raw pointer with no ownership semantics.
 
             // Free the CStrings we allocated
             // These must be freed after NDIlib_send_destroy to ensure the SDK is done with them
@@ -846,6 +837,59 @@ impl Drop for Inner {
 
 impl Drop for Sender<'_> {
     fn drop(&mut self) {
+        // Unregister callback before Inner is destroyed (advanced_sdk only)
+        #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
+        {
+            let callback_ptr = self.inner.callback_ptr.load(Ordering::Acquire);
+            if !callback_ptr.is_null() {
+                unsafe {
+                    // Unregister the callback to ensure no further invocations
+                    NDIlib_send_set_video_async_completion(
+                        self.inner.instance,
+                        ptr::null_mut(),
+                        None,
+                    );
+                }
+
+                // Wait for any in-flight callback to complete using existing completion mechanism
+                // Use a bounded timeout to prevent indefinite hangs
+                let timeout = Duration::from_secs(5);
+                let mut guard = self.inner.async_state.completion_lock.lock().unwrap();
+                let start = std::time::Instant::now();
+
+                while !self.inner.async_state.completed.load(Ordering::Acquire) {
+                    let elapsed = start.elapsed();
+                    if elapsed >= timeout {
+                        eprintln!(
+                            "Warning: Sender dropped after timeout waiting for callback completion"
+                        );
+                        break;
+                    }
+
+                    let remaining = timeout - elapsed;
+                    let (new_guard, timeout_result) = self
+                        .inner
+                        .async_state
+                        .completion_cv
+                        .wait_timeout(guard, remaining)
+                        .unwrap();
+                    guard = new_guard;
+
+                    if timeout_result.timed_out() {
+                        eprintln!(
+                            "Warning: Sender dropped after timeout waiting for callback completion"
+                        );
+                        break;
+                    }
+                }
+
+                // Clear the callback pointer after unregistration and wait
+                self.inner
+                    .callback_ptr
+                    .store(ptr::null_mut(), Ordering::Release);
+            }
+        }
+
         // The Inner will be dropped when all Arc references are gone
     }
 }

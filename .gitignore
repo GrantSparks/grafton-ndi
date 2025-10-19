@@ -22,3 +22,7 @@ CLAUDE.local.md
 .claude_config
 .tidy-rust-cache
 all_source.txt
+
+# Pre-commit hooks (personal dev tool, CI runs same checks)
+.pre-commit-config.yaml
+.git-hooks/
