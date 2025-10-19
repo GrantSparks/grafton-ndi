@@ -7,6 +7,7 @@ use std::{
 use grafton_ndi::{BorrowedVideoFrame, FourCCVideoType, SenderOptions, NDI};
 
 #[test]
+#[ignore = "Slow stress test - run with --ignored"]
 #[cfg_attr(
     all(target_os = "windows", target_env = "msvc"),
     ignore = "Skipping on Windows CI due to NDI runtime issues"
@@ -93,6 +94,7 @@ fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
 }
 
 #[test]
+#[ignore = "Slow stress test - run with --ignored"]
 #[cfg_attr(
     all(target_os = "windows", target_env = "msvc"),
     ignore = "Skipping on Windows CI due to NDI runtime issues"
@@ -131,6 +133,7 @@ fn test_immediate_sender_drop() -> Result<(), grafton_ndi::Error> {
 }
 
 #[test]
+#[ignore = "Slow stress test - run with --ignored"]
 #[cfg_attr(
     all(target_os = "windows", target_env = "msvc"),
     ignore = "Skipping on Windows CI due to NDI runtime issues"
