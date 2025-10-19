@@ -1,17 +1,15 @@
 //! Frame types for video, audio, and metadata.
 
 use std::{
-    borrow::Cow,
     ffi::{CStr, CString},
     fmt,
-    marker::PhantomData,
     os::raw::c_char,
     ptr, slice,
 };
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
-use crate::{ndi_lib::*, receiver::Receiver, Error, Result};
+use crate::{ndi_lib::*, Error, Result};
 
 /// Video pixel format identifiers (FourCC codes).
 ///
@@ -133,7 +131,7 @@ impl From<NDIlib_video_frame_v2_t__bindgen_ty_1> for LineStrideOrSize {
     }
 }
 
-pub struct VideoFrame<'rx> {
+pub struct VideoFrame {
     pub width: i32,
     pub height: i32,
     pub fourcc: FourCCVideoType,
@@ -142,17 +140,13 @@ pub struct VideoFrame<'rx> {
     pub picture_aspect_ratio: f32,
     pub frame_format_type: FrameFormatType,
     pub timecode: i64,
-    pub data: Cow<'rx, [u8]>,
+    pub data: Vec<u8>,
     pub line_stride_or_size: LineStrideOrSize,
     pub metadata: Option<CString>,
     pub timestamp: i64,
-    pub(crate) recv_instance: Option<NDIlib_recv_instance_t>,
-    // Store original SDK data pointer for proper freeing
-    pub(crate) original_p_data: Option<*mut u8>,
-    pub(crate) _origin: PhantomData<&'rx Receiver<'rx>>,
 }
 
-impl fmt::Debug for VideoFrame<'_> {
+impl fmt::Debug for VideoFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VideoFrame")
             .field("width", &self.width)
@@ -171,7 +165,7 @@ impl fmt::Debug for VideoFrame<'_> {
     }
 }
 
-impl Default for VideoFrame<'_> {
+impl Default for VideoFrame {
     fn default() -> Self {
         VideoFrame::builder()
             .resolution(1920, 1080)
@@ -184,7 +178,7 @@ impl Default for VideoFrame<'_> {
     }
 }
 
-impl<'rx> VideoFrame<'rx> {
+impl VideoFrame {
     pub fn to_raw(&self) -> NDIlib_video_frame_v2_t {
         NDIlib_video_frame_v2_t {
             xres: self.width,
@@ -460,10 +454,7 @@ impl<'rx> VideoFrame<'rx> {
     ///
     /// This function assumes the given `NDIlib_video_frame_v2_t` is valid and correctly allocated.
     /// This method copies the data, so the VideoFrame owns its data and can outlive the source.
-    pub unsafe fn from_raw(
-        c_frame: &NDIlib_video_frame_v2_t,
-        recv_instance: Option<NDIlib_recv_instance_t>,
-    ) -> Result<VideoFrame<'static>> {
+    pub unsafe fn from_raw(c_frame: &NDIlib_video_frame_v2_t) -> Result<VideoFrame> {
         if c_frame.p_data.is_null() {
             return Err(Error::InvalidFrame(
                 "Video frame has null data pointer".into(),
@@ -525,16 +516,9 @@ impl<'rx> VideoFrame<'rx> {
             return Err(Error::InvalidFrame("Video frame has zero size".into()));
         }
 
-        // For zero-copy: just borrow the data slice from the SDK
-        let (data, original_p_data) = if recv_instance.is_some() {
-            // We're receiving - don't copy, just borrow
-            let slice = slice::from_raw_parts(c_frame.p_data, data_size);
-            (Cow::Borrowed(slice), Some(c_frame.p_data))
-        } else {
-            // Not from receive - make a copy for ownership
-            let slice = slice::from_raw_parts(c_frame.p_data, data_size);
-            (Cow::Owned(slice.to_vec()), None)
-        };
+        // Always copy data for ownership - we're no longer zero-copy
+        let slice = slice::from_raw_parts(c_frame.p_data, data_size);
+        let data = slice.to_vec();
 
         let metadata = if c_frame.p_metadata.is_null() {
             None
@@ -557,21 +541,18 @@ impl<'rx> VideoFrame<'rx> {
             line_stride_or_size,
             metadata,
             timestamp: c_frame.timestamp,
-            recv_instance,
-            original_p_data,
-            _origin: PhantomData,
         })
     }
 
     /// Create a builder for configuring a video frame
-    pub fn builder() -> VideoFrameBuilder<'rx> {
+    pub fn builder() -> VideoFrameBuilder {
         VideoFrameBuilder::new()
     }
 }
 
 /// Builder for configuring a VideoFrame with ergonomic method chaining
 #[derive(Debug, Clone)]
-pub struct VideoFrameBuilder<'rx> {
+pub struct VideoFrameBuilder {
     width: Option<i32>,
     height: Option<i32>,
     fourcc: Option<FourCCVideoType>,
@@ -582,10 +563,9 @@ pub struct VideoFrameBuilder<'rx> {
     timecode: Option<i64>,
     metadata: Option<String>,
     timestamp: Option<i64>,
-    _phantom: PhantomData<&'rx ()>,
 }
 
-impl<'rx> VideoFrameBuilder<'rx> {
+impl VideoFrameBuilder {
     /// Create a new builder with no fields set
     pub fn new() -> Self {
         Self {
@@ -599,7 +579,6 @@ impl<'rx> VideoFrameBuilder<'rx> {
             timecode: None,
             metadata: None,
             timestamp: None,
-            _phantom: PhantomData,
         }
     }
 
@@ -662,7 +641,7 @@ impl<'rx> VideoFrameBuilder<'rx> {
     }
 
     /// Build the VideoFrame
-    pub fn build(self) -> Result<VideoFrame<'rx>> {
+    pub fn build(self) -> Result<VideoFrame> {
         let width = self.width.unwrap_or(1920);
         let height = self.height.unwrap_or(1080);
         let fourcc = self.fourcc.unwrap_or(FourCCVideoType::BGRA);
@@ -687,15 +666,12 @@ impl<'rx> VideoFrameBuilder<'rx> {
             picture_aspect_ratio,
             frame_format_type,
             timecode: self.timecode.unwrap_or(0),
-            data: Cow::Owned(data),
+            data: (data),
             line_stride_or_size: LineStrideOrSize {
                 line_stride_in_bytes: stride,
             },
             metadata: None,
             timestamp: self.timestamp.unwrap_or(0),
-            recv_instance: None,
-            original_p_data: None,
-            _origin: PhantomData,
         };
 
         if let Some(meta) = self.metadata {
@@ -706,61 +682,33 @@ impl<'rx> VideoFrameBuilder<'rx> {
     }
 }
 
-impl Default for VideoFrameBuilder<'_> {
+impl Default for VideoFrameBuilder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Drop for VideoFrame<'_> {
+impl Drop for VideoFrame {
     fn drop(&mut self) {
-        // If this frame originated from a Recv instance and we have the original SDK pointer, free it
-        if let (Some(recv_instance), Some(original_p_data)) =
-            (self.recv_instance, self.original_p_data)
-        {
-            // Create a raw frame with the original SDK pointer for NDI to free
-            let raw_frame = NDIlib_video_frame_v2_t {
-                xres: self.width,
-                yres: self.height,
-                FourCC: self.fourcc.into(),
-                frame_rate_N: self.frame_rate_n,
-                frame_rate_D: self.frame_rate_d,
-                picture_aspect_ratio: self.picture_aspect_ratio,
-                frame_format_type: self.frame_format_type.into(),
-                timecode: self.timecode,
-                p_data: original_p_data,
-                __bindgen_anon_1: self.line_stride_or_size.into(),
-                p_metadata: match &self.metadata {
-                    Some(meta) => meta.as_ptr(),
-                    None => ptr::null(),
-                },
-                timestamp: self.timestamp,
-            };
-            unsafe {
-                NDIlib_recv_free_video_v2(recv_instance, &raw_frame);
-            }
-        }
+        // With owned data, we don't need to free SDK pointers anymore
+        // The Vec<u8> handles memory cleanup automatically
     }
 }
 
 #[derive(Debug)]
-pub struct AudioFrame<'rx> {
+pub struct AudioFrame {
     pub sample_rate: i32,
     pub num_channels: i32,
     pub num_samples: i32,
     pub timecode: i64,
     pub fourcc: AudioType,
-    data: Cow<'rx, [f32]>,
+    data: Vec<f32>,
     pub channel_stride_in_bytes: i32,
     pub metadata: Option<CString>,
     pub timestamp: i64,
-    pub(crate) recv_instance: Option<NDIlib_recv_instance_t>,
-    // Store original SDK data pointer for proper freeing
-    pub(crate) original_p_data: Option<*mut u8>,
-    pub(crate) _origin: PhantomData<&'rx Receiver<'rx>>,
 }
 
-impl<'rx> AudioFrame<'rx> {
+impl AudioFrame {
     pub(crate) fn to_raw(&self) -> NDIlib_audio_frame_v3_t {
         NDIlib_audio_frame_v3_t {
             sample_rate: self.sample_rate,
@@ -777,10 +725,7 @@ impl<'rx> AudioFrame<'rx> {
         }
     }
 
-    pub(crate) fn from_raw(
-        raw: NDIlib_audio_frame_v3_t,
-        recv_instance: Option<NDIlib_recv_instance_t>,
-    ) -> Result<AudioFrame<'static>> {
+    pub(crate) fn from_raw(raw: NDIlib_audio_frame_v3_t) -> Result<AudioFrame> {
         if raw.p_data.is_null() {
             return Err(Error::InvalidFrame(
                 "Audio frame has null data pointer".into(),
@@ -816,16 +761,9 @@ impl<'rx> AudioFrame<'rx> {
             ));
         }
 
-        // For zero-copy: just borrow the data slice from the SDK
-        let (data, original_p_data) = if recv_instance.is_some() {
-            // We're receiving - don't copy, just borrow
-            let slice = unsafe { slice::from_raw_parts(raw.p_data as *const f32, sample_count) };
-            (Cow::Borrowed(slice), Some(raw.p_data))
-        } else {
-            // Not from receive - make a copy for ownership
-            let slice = unsafe { slice::from_raw_parts(raw.p_data as *const f32, sample_count) };
-            (Cow::Owned(slice.to_vec()), None)
-        };
+        // Always copy data for ownership - we're no longer zero-copy
+        let slice = unsafe { slice::from_raw_parts(raw.p_data as *const f32, sample_count) };
+        let data = slice.to_vec();
 
         let metadata = if raw.p_metadata.is_null() {
             None
@@ -847,14 +785,11 @@ impl<'rx> AudioFrame<'rx> {
             channel_stride_in_bytes: unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes },
             metadata,
             timestamp: raw.timestamp,
-            recv_instance,
-            original_p_data,
-            _origin: PhantomData,
         })
     }
 
     /// Create a builder for configuring an audio frame
-    pub fn builder() -> AudioFrameBuilder<'rx> {
+    pub fn builder() -> AudioFrameBuilder {
         AudioFrameBuilder::new()
     }
 
@@ -899,7 +834,7 @@ impl<'rx> AudioFrame<'rx> {
 
 /// Builder for configuring an AudioFrame with ergonomic method chaining
 #[derive(Debug, Clone)]
-pub struct AudioFrameBuilder<'rx> {
+pub struct AudioFrameBuilder {
     sample_rate: Option<i32>,
     num_channels: Option<i32>,
     num_samples: Option<i32>,
@@ -908,10 +843,9 @@ pub struct AudioFrameBuilder<'rx> {
     data: Option<Vec<f32>>,
     metadata: Option<String>,
     timestamp: Option<i64>,
-    _phantom: PhantomData<&'rx ()>,
 }
 
-impl<'rx> AudioFrameBuilder<'rx> {
+impl AudioFrameBuilder {
     /// Create a new builder with no fields set
     pub fn new() -> Self {
         Self {
@@ -923,7 +857,6 @@ impl<'rx> AudioFrameBuilder<'rx> {
             data: None,
             metadata: None,
             timestamp: None,
-            _phantom: PhantomData,
         }
     }
 
@@ -984,7 +917,7 @@ impl<'rx> AudioFrameBuilder<'rx> {
     }
 
     /// Build the AudioFrame
-    pub fn build(self) -> Result<AudioFrame<'rx>> {
+    pub fn build(self) -> Result<AudioFrame> {
         let sample_rate = self.sample_rate.unwrap_or(48000);
         let num_channels = self.num_channels.unwrap_or(2);
         let num_samples = self.num_samples.unwrap_or(1024);
@@ -1009,24 +942,21 @@ impl<'rx> AudioFrameBuilder<'rx> {
             num_samples,
             timecode: self.timecode.unwrap_or(0),
             fourcc,
-            data: Cow::Owned(data),
+            data: (data),
             channel_stride_in_bytes: 0, // 0 indicates interleaved format
             metadata: metadata_cstring,
             timestamp: self.timestamp.unwrap_or(0),
-            recv_instance: None,
-            original_p_data: None,
-            _origin: PhantomData,
         })
     }
 }
 
-impl Default for AudioFrameBuilder<'_> {
+impl Default for AudioFrameBuilder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Default for AudioFrame<'_> {
+impl Default for AudioFrame {
     fn default() -> Self {
         AudioFrame::builder()
             .build()
@@ -1034,30 +964,10 @@ impl Default for AudioFrame<'_> {
     }
 }
 
-impl Drop for AudioFrame<'_> {
+impl Drop for AudioFrame {
     fn drop(&mut self) {
-        // If this frame originated from a Recv instance and we have the original SDK pointer, free it
-        if let (Some(recv_instance), Some(original_p_data)) =
-            (self.recv_instance, self.original_p_data)
-        {
-            // Create a raw frame with the original SDK pointer for NDI to free
-            let raw_frame = NDIlib_audio_frame_v3_t {
-                sample_rate: self.sample_rate,
-                no_channels: self.num_channels,
-                no_samples: self.num_samples,
-                timecode: self.timecode,
-                FourCC: self.fourcc.into(),
-                p_data: original_p_data,
-                __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
-                    channel_stride_in_bytes: self.channel_stride_in_bytes,
-                },
-                p_metadata: self.metadata.as_ref().map_or(ptr::null(), |m| m.as_ptr()),
-                timestamp: self.timestamp,
-            };
-            unsafe {
-                NDIlib_recv_free_audio_v3(recv_instance, &raw_frame);
-            }
-        }
+        // With owned data, we don't need to free SDK pointers anymore
+        // The Vec<f32> handles memory cleanup automatically
     }
 }
 

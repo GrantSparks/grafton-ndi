@@ -754,8 +754,8 @@ impl SourceCache {
         let source = sources
             .into_iter()
             .find(|s| s.matches_host(host))
-            .ok_or_else(|| {
-                Error::NoSourcesFound(format!("No source found matching host: {}", host))
+            .ok_or_else(|| Error::NoSourcesFound {
+                criteria: format!("host: {}", host),
             })?;
 
         // Cache the result

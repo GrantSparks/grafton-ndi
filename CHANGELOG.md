@@ -2,6 +2,104 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2025-10-19
+
+### Major Features
+
+This release dramatically improves ergonomics and reduces boilerplate for common NDI workflows. Based on production usage feedback (issue #11), we've eliminated ~240 lines of repetitive code that users were implementing in every application.
+
+#### 🎯 Source Discovery & Caching
+- **`SourceCache`**: Thread-safe caching for NDI instances and discovered sources
+  - `new()` - Create a new cache instance
+  - `find_by_host(host, timeout_ms)` - Find sources by IP/hostname with automatic caching
+  - `invalidate(host)` - Remove specific cache entry when sources go offline
+  - `clear()` - Clear all cached sources
+  - `len()` / `is_empty()` - Cache introspection helpers
+- Eliminates ~150 lines of manual caching code per application
+- Handles expensive NDI initialization and discovery internally
+- Thread-safe with interior mutability
+
+#### 🔍 Source Matching Helpers
+- **`Source` methods**: Simplified source discovery and matching
+  - `matches_host(&str)` - Check if source matches hostname/IP
+  - `ip_address()` - Extract IP address from source
+  - `host()` - Extract hostname/IP without port
+- **`SourceAddress` methods**: Network address parsing utilities
+  - `contains_host(&str)` - Check if address contains host/IP
+  - `port()` - Parse port number from address
+- Handles both IP and URL address types intelligently
+- Eliminates ~20 lines of verbose pattern matching per lookup
+
+#### 🖼️ Image Encoding Support (Feature: `image-encoding`)
+- **`VideoFrame` encoding methods**: One-line image export
+  - `encode_png()` - Encode frame as PNG bytes
+  - `encode_jpeg(quality)` - Encode frame as JPEG with quality control
+  - `encode_data_url(ImageFormat)` - Encode as base64 data URL for HTML/JSON
+- **`ImageFormat` enum**: PNG or JPEG(quality) selection
+- Automatic color format conversion (BGRA ↔ RGBA)
+- Stride validation prevents corrupted images
+- Eliminates ~30 lines of encoding logic + 2 dependencies per application
+- Optional feature flag keeps core library lean
+
+#### ⏱️ Frame Capture with Retry Logic
+- **Reliable frame capture**: Handles NDI SDK timing quirks automatically
+  - `capture_video_with_retry(timeout_ms, max_attempts)` - Fine-grained retry control
+  - `capture_video_blocking(total_timeout_ms)` - Recommended: blocks until frame or timeout
+  - `capture_audio_with_retry()` / `capture_audio_blocking()` - Audio variants
+  - `capture_metadata_with_retry()` / `capture_metadata_blocking()` - Metadata variants
+- 6 new methods total (2 per frame type)
+- 100ms per-attempt timeout with 10ms sleep between retries
+- Detailed timeout errors with attempt count and elapsed time
+- Eliminates ~40 lines of retry loop code per application
+- Fixes common mistake of trusting `capture_video()` timeout behavior
+
+#### 🎛️ Receiver Configuration Presets
+- **`ReceiverOptionsBuilder` presets**: Optimized configurations for common use cases
+  - `snapshot_preset(source)` - Low bandwidth, RGBA, optimized for AI/image processing
+  - `high_quality_preset(source)` - Full resolution, highest bandwidth for production
+  - `monitoring_preset(source)` - Metadata-only for tally/status monitoring
+- Self-documenting API guides users to optimal settings
+- Easy to extend with more presets as patterns emerge
+
+### Added
+
+#### 🚀 Async Runtime Integration (Features: `tokio`, `async-std`)
+- **`AsyncReceiver`**: Full async/await support for Tokio and async-std runtimes
+  - All 9 capture methods (video/audio/metadata × 3 retry variants)
+  - Proper `spawn_blocking` usage prevents runtime blocking
+  - Arc-based sharing for async contexts
+  - Clone support for multi-task usage
+- **Feature flags**: `tokio` and `async-std` for optional runtime support
+- Eliminates boilerplate `spawn_blocking` wrappers in every async application
+- Production-ready with comprehensive documentation and examples
+
+#### 🎯 Enhanced Error Types
+- **Specific error variants** for common failure scenarios:
+  - `Error::FrameTimeout { attempts, elapsed }` - Detailed frame timeout with retry info
+  - `Error::NoSourcesFound { criteria }` - Source discovery failure with search criteria
+  - `Error::SourceUnavailable { source_name }` - Source went offline during operation
+  - `Error::Disconnected { reason }` - Receiver disconnected with context
+- Rich error context enables better debugging and targeted error recovery
+- Pattern matching friendly for handling specific failure modes
+- Doc examples show proper error handling patterns
+
+#### 📚 Documentation & Testing
+- Comprehensive rustdoc examples for all new APIs
+- 28 tests passing (up from 13), including:
+  - Source cache validation (4 tests)
+  - Source matching helpers (3 tests)
+  - Receiver presets (4 tests)
+  - Retry logic validation (2 tests)
+- Real-world usage examples in doc comments
+- Feature flag documentation
+
+### Changed
+- `png` dependency moved from dev-dependencies to optional dependency
+- Added optional dependencies: `base64`, `jpeg-encoder`, `tokio`, `async-std`
+
+### Fixed
+- Example `NDIlib_Recv_PNG` simplified using new retry logic (189 → 165 lines)
+
 ## [0.8.1] - 2025-01-06
 
 ### Added

@@ -1,6 +1,6 @@
 //! Error types for the grafton-ndi library.
 
-use std::{ffi::NulError, io};
+use std::{ffi::NulError, io, time::Duration};
 
 use thiserror::Error;
 
@@ -53,11 +53,114 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] io::Error),
 
-    /// Operation timed out.
+    /// Operation timed out with generic context.
+    ///
+    /// This is a general timeout error. For frame capture timeouts with retry information,
+    /// see [`Error::FrameTimeout`].
     #[error("Operation timed out: {0}")]
     Timeout(String),
 
+    /// Frame capture timed out after multiple retry attempts.
+    ///
+    /// This error includes detailed information about the retry attempts and total elapsed time,
+    /// making it easier to diagnose frame capture issues and distinguish them from other timeout scenarios.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use grafton_ndi::Error;
+    /// # use std::time::Duration;
+    /// match some_operation() {
+    ///     Err(Error::FrameTimeout { attempts, elapsed }) => {
+    ///         eprintln!("Frame timeout after {} attempts in {:?}", attempts, elapsed);
+    ///         // Could implement retry logic based on attempts count
+    ///     }
+    ///     Err(e) => eprintln!("Other error: {}", e),
+    ///     Ok(_) => println!("Success"),
+    /// }
+    /// # fn some_operation() -> Result<(), Error> { Ok(()) }
+    /// ```
+    #[error("Frame capture timed out after {attempts} attempts ({elapsed:?})")]
+    FrameTimeout {
+        /// Number of capture attempts made before timing out
+        attempts: usize,
+        /// Total elapsed time during capture attempts
+        elapsed: Duration,
+    },
+
+    /// NDI source became unavailable during operation.
+    ///
+    /// This error indicates that an NDI source that was previously available has gone offline
+    /// or become unreachable. This is different from [`Error::NoSourcesFound`] which indicates
+    /// that no matching sources were ever discovered.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use grafton_ndi::Error;
+    /// match some_operation() {
+    ///     Err(Error::SourceUnavailable { source_name }) => {
+    ///         eprintln!("Lost connection to source: {}", source_name);
+    ///         // Could attempt to reconnect or switch to backup source
+    ///     }
+    ///     Err(e) => eprintln!("Other error: {}", e),
+    ///     Ok(_) => println!("Success"),
+    /// }
+    /// # fn some_operation() -> Result<(), Error> { Ok(()) }
+    /// ```
+    #[error("NDI source became unavailable: {source_name}")]
+    SourceUnavailable {
+        /// Name or identifier of the source that became unavailable
+        source_name: String,
+    },
+
+    /// Receiver disconnected from its NDI source.
+    ///
+    /// This error indicates that an active receiver lost its connection to the source.
+    /// The reason field provides additional context about why the disconnection occurred.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use grafton_ndi::Error;
+    /// match some_operation() {
+    ///     Err(Error::Disconnected { reason }) => {
+    ///         eprintln!("Receiver disconnected: {}", reason);
+    ///         // Could implement automatic reconnection logic
+    ///     }
+    ///     Err(e) => eprintln!("Other error: {}", e),
+    ///     Ok(_) => println!("Success"),
+    /// }
+    /// # fn some_operation() -> Result<(), Error> { Ok(()) }
+    /// ```
+    #[error("Receiver disconnected from source: {reason}")]
+    Disconnected {
+        /// Reason for the disconnection
+        reason: String,
+    },
+
     /// No NDI sources found matching the specified criteria.
-    #[error("No NDI sources found: {0}")]
-    NoSourcesFound(String),
+    ///
+    /// This error is returned when source discovery completes but no sources match
+    /// the requested criteria (e.g., host/IP filter, group filter).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use grafton_ndi::Error;
+    /// match some_operation() {
+    ///     Err(Error::NoSourcesFound { criteria }) => {
+    ///         eprintln!("No sources found matching: {}", criteria);
+    ///         // Could widen search criteria or wait longer
+    ///     }
+    ///     Err(e) => eprintln!("Other error: {}", e),
+    ///     Ok(_) => println!("Success"),
+    /// }
+    /// # fn some_operation() -> Result<(), Error> { Ok(()) }
+    /// ```
+    #[error("No NDI sources found matching: {criteria}")]
+    NoSourcesFound {
+        /// The search criteria that yielded no results
+        criteria: String,
+    },
 }

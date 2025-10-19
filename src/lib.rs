@@ -108,6 +108,17 @@ pub mod receiver;
 pub mod runtime;
 pub mod sender;
 
+// Async runtime integration (feature-gated)
+#[cfg(any(feature = "tokio", feature = "async-std"))]
+mod async_runtime;
+
+// Re-export async modules based on feature flags
+#[cfg(feature = "tokio")]
+pub use async_runtime::tokio;
+
+#[cfg(feature = "async-std")]
+pub use async_runtime::async_std;
+
 // Re-exports
 pub use {
     error::*,
@@ -117,8 +128,8 @@ pub use {
         LineStrideOrSize, MetadataFrame, VideoFrame, VideoFrameBuilder,
     },
     receiver::{
-        FrameType, Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions,
-        ReceiverOptionsBuilder, ReceiverStatus, Tally,
+        ConnectionStats, FrameType, Receiver, ReceiverBandwidth, ReceiverColorFormat,
+        ReceiverOptions, ReceiverOptionsBuilder, ReceiverStatus, Tally,
     },
     runtime::NDI,
     sender::{AsyncVideoToken, BorrowedVideoFrame, Sender, SenderOptions, SenderOptionsBuilder},

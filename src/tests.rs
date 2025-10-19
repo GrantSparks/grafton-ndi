@@ -53,7 +53,7 @@ fn test_video_frame_standard_format_size_calculation() {
     // The from_raw function should calculate size as line_stride * height
     // Previously it would incorrectly multiply data_size_in_bytes * height
     unsafe {
-        let frame = VideoFrame::from_raw(&c_frame, None).unwrap();
+        let frame = VideoFrame::from_raw(&c_frame).unwrap();
 
         // Expected size is line_stride * height
         let expected_size = (line_stride * test_height) as usize;
@@ -92,7 +92,7 @@ fn test_video_frame_null_data_returns_error() {
     c_frame.yres = 1080;
 
     unsafe {
-        let result = VideoFrame::from_raw(&c_frame, None);
+        let result = VideoFrame::from_raw(&c_frame);
         assert!(result.is_err());
         match result {
             Err(Error::InvalidFrame(msg)) => {
@@ -113,7 +113,7 @@ fn test_video_frame_zero_size_returns_error() {
     c_frame.yres = 1080;
 
     unsafe {
-        let result = VideoFrame::from_raw(&c_frame, None);
+        let result = VideoFrame::from_raw(&c_frame);
         assert!(result.is_err());
         match result {
             Err(Error::InvalidFrame(msg)) => {
@@ -560,7 +560,7 @@ fn test_video_frame_encode_png_rgba() {
 
     // Replace the data with our test pattern
     let mut frame = frame;
-    frame.data = std::borrow::Cow::Owned(data);
+    frame.data = data;
 
     // Encode to PNG
     let png_bytes = frame.encode_png();
@@ -599,7 +599,7 @@ fn test_video_frame_encode_png_bgra() {
         .unwrap();
 
     let mut frame = frame;
-    frame.data = std::borrow::Cow::Owned(data);
+    frame.data = data;
 
     // Encode to PNG (should convert BGRA to RGBA)
     let png_bytes = frame.encode_png();
@@ -649,7 +649,7 @@ fn test_video_frame_encode_jpeg_rgba() {
         .unwrap();
 
     let mut frame = frame;
-    frame.data = std::borrow::Cow::Owned(data);
+    frame.data = data;
 
     // Encode to JPEG with quality 85
     let jpeg_bytes = frame.encode_jpeg(85);
@@ -682,7 +682,7 @@ fn test_video_frame_encode_jpeg_bgra() {
         .unwrap();
 
     let mut frame = frame;
-    frame.data = std::borrow::Cow::Owned(data);
+    frame.data = data;
 
     // Encode to JPEG (should convert BGRA to RGB)
     let jpeg_bytes = frame.encode_jpeg(90);
@@ -723,7 +723,7 @@ fn test_video_frame_encode_jpeg_quality_range() {
         .unwrap();
 
     let mut frame = frame;
-    frame.data = std::borrow::Cow::Owned(data);
+    frame.data = data;
 
     // Test different quality levels
     let low_quality = frame.encode_jpeg(10).unwrap();
@@ -753,7 +753,7 @@ fn test_video_frame_encode_data_url_png() {
         .unwrap();
 
     let mut frame = frame;
-    frame.data = std::borrow::Cow::Owned(data);
+    frame.data = data;
 
     let data_url = frame.encode_data_url(ImageFormat::Png);
     assert!(data_url.is_ok());
@@ -789,7 +789,7 @@ fn test_video_frame_encode_data_url_jpeg() {
         .unwrap();
 
     let mut frame = frame;
-    frame.data = std::borrow::Cow::Owned(data);
+    frame.data = data;
 
     let data_url = frame.encode_data_url(ImageFormat::Jpeg(85));
     assert!(data_url.is_ok());
@@ -928,4 +928,185 @@ fn test_receiver_presets_are_distinct() {
     let _monitor = ReceiverOptionsBuilder::monitoring_preset(source.clone());
 
     // If we got here without panicking, the presets exist and are usable
+}
+
+// Async runtime integration tests (feature-gated)
+#[cfg(feature = "tokio")]
+#[test]
+fn test_tokio_async_receiver_creation() {
+    use crate::{
+        finder::{Source, SourceAddress},
+        receiver::ReceiverOptionsBuilder,
+        NDI,
+    };
+
+    // Test that AsyncReceiver can be created and is cloneable
+    // We can't actually run async code in a sync test, but we can verify the API exists
+
+    // This test verifies that:
+    // 1. tokio::AsyncReceiver type exists
+    // 2. It has a `new()` method
+    // 3. It implements Clone
+
+    // Note: We can't create a real receiver without NDI SDK runtime,
+    // so we just test the type exists and compiles
+    let _ = || {
+        use crate::tokio::AsyncReceiver;
+
+        // Mock receiver (won't actually work without NDI initialized)
+        let source = Source {
+            name: "Test".into(),
+            address: SourceAddress::None,
+        };
+
+        // This won't run but proves the API compiles
+        if false {
+            use std::sync::Arc;
+            let ndi = Arc::new(NDI::new().unwrap());
+            let receiver = ReceiverOptionsBuilder::snapshot_preset(source)
+                .build(&ndi)
+                .unwrap();
+            let async_receiver = AsyncReceiver::new(receiver);
+            let _cloned = async_receiver.clone();
+        }
+    };
+}
+
+#[cfg(feature = "tokio")]
+#[test]
+fn test_tokio_async_receiver_methods_exist() {
+    // Verify all expected async methods exist on AsyncReceiver
+    // This is a compile-time test - if it compiles, the methods exist
+
+    use crate::{
+        finder::{Source, SourceAddress},
+        receiver::ReceiverOptionsBuilder,
+        tokio::AsyncReceiver,
+        NDI,
+    };
+
+    // Test that all methods exist and can be called (in a closure that won't execute)
+    let _ = || async {
+        let source = Source {
+            name: "Test".into(),
+            address: SourceAddress::None,
+        };
+
+        if false {
+            use std::sync::Arc;
+            let ndi = Arc::new(NDI::new().unwrap());
+            let receiver = ReceiverOptionsBuilder::snapshot_preset(source)
+                .build(&ndi)
+                .unwrap();
+            let async_receiver = AsyncReceiver::new(receiver);
+
+            // All these methods should exist and be callable
+            let _ = async_receiver.capture_video(100).await;
+            let _ = async_receiver.capture_video_with_retry(100, 10).await;
+            let _ = async_receiver.capture_video_blocking(5000).await;
+
+            let _ = async_receiver.capture_audio(100).await;
+            let _ = async_receiver.capture_audio_with_retry(100, 10).await;
+            let _ = async_receiver.capture_audio_blocking(5000).await;
+
+            let _ = async_receiver.capture_metadata(100).await;
+            let _ = async_receiver.capture_metadata_with_retry(100, 10).await;
+            let _ = async_receiver.capture_metadata_blocking(5000).await;
+        }
+    };
+}
+
+#[cfg(feature = "async-std")]
+#[test]
+fn test_async_std_async_receiver_creation() {
+    use crate::{
+        finder::{Source, SourceAddress},
+        receiver::ReceiverOptionsBuilder,
+        NDI,
+    };
+
+    // Test that AsyncReceiver can be created and is cloneable for async-std
+
+    let _ = || {
+        use crate::async_std::AsyncReceiver;
+
+        let source = Source {
+            name: "Test".into(),
+            address: SourceAddress::None,
+        };
+
+        // This won't run but proves the API compiles
+        if false {
+            use std::sync::Arc;
+            let ndi = Arc::new(NDI::new().unwrap());
+            let receiver = ReceiverOptionsBuilder::snapshot_preset(source)
+                .build(&ndi)
+                .unwrap();
+            let async_receiver = AsyncReceiver::new(receiver);
+            let _cloned = async_receiver.clone();
+        }
+    };
+}
+
+#[cfg(feature = "async-std")]
+#[test]
+fn test_async_std_async_receiver_methods_exist() {
+    // Verify all expected async methods exist on async-std AsyncReceiver
+
+    use crate::{
+        async_std::AsyncReceiver,
+        finder::{Source, SourceAddress},
+        receiver::ReceiverOptionsBuilder,
+        NDI,
+    };
+
+    // Test that all methods exist and can be called (in a closure that won't execute)
+    let _ = || async {
+        let source = Source {
+            name: "Test".into(),
+            address: SourceAddress::None,
+        };
+
+        if false {
+            use std::sync::Arc;
+            let ndi = Arc::new(NDI::new().unwrap());
+            let receiver = ReceiverOptionsBuilder::snapshot_preset(source)
+                .build(&ndi)
+                .unwrap();
+            let async_receiver = AsyncReceiver::new(receiver);
+
+            // All these methods should exist and be callable
+            let _ = async_receiver.capture_video(100).await;
+            let _ = async_receiver.capture_video_with_retry(100, 10).await;
+            let _ = async_receiver.capture_video_blocking(5000).await;
+
+            let _ = async_receiver.capture_audio(100).await;
+            let _ = async_receiver.capture_audio_with_retry(100, 10).await;
+            let _ = async_receiver.capture_audio_blocking(5000).await;
+
+            let _ = async_receiver.capture_metadata(100).await;
+            let _ = async_receiver.capture_metadata_with_retry(100, 10).await;
+            let _ = async_receiver.capture_metadata_blocking(5000).await;
+        }
+    };
+}
+
+#[test]
+fn test_async_feature_flags_mutually_compatible() {
+    // This test verifies that tokio and async-std features can coexist
+    // Both should be able to be enabled simultaneously without conflicts
+
+    #[cfg(feature = "tokio")]
+    {
+        use crate::tokio::AsyncReceiver as TokioAsyncReceiver;
+        let _tokio_type_check = std::any::type_name::<TokioAsyncReceiver>();
+    }
+
+    #[cfg(feature = "async-std")]
+    {
+        use crate::async_std::AsyncReceiver as AsyncStdReceiver;
+        let _async_std_type_check = std::any::type_name::<AsyncStdReceiver>();
+    }
+
+    // If this compiles, both can be enabled together
 }

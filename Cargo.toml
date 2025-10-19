@@ -25,6 +25,10 @@ thiserror = "2.0.12"
 base64 = { version = "0.22", optional = true }
 jpeg-encoder = { version = "0.6", optional = true }
 
+# Optional dependencies for async runtime integration
+tokio = { version = "1.42", optional = true, features = ["rt", "sync"] }
+async-std = { version = "1.13", optional = true }
+
 [build-dependencies]
 bindgen = "0.71.1"
 lodepng = "3.11.0"
@@ -37,6 +41,12 @@ advanced_sdk = []
 # Enable image encoding support (PNG, JPEG, data URLs)
 # Adds dependencies: base64, jpeg-encoder
 image-encoding = ["dep:base64", "dep:jpeg-encoder"]
+# Enable async runtime integration for Tokio
+# Adds dependency: tokio
+tokio = ["dep:tokio"]
+# Enable async runtime integration for async-std
+# Adds dependency: async-std
+async-std = ["dep:async-std"]
 
 [dev-dependencies]
 ctrlc = "3.4"
