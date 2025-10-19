@@ -1,10 +1,12 @@
 //! NDI source discovery and network browsing.
 
 use std::{
+    collections::HashMap,
     ffi::{CStr, CString},
     fmt::{self, Display, Formatter},
     marker::PhantomData,
     ptr,
+    sync::{Arc, Mutex},
 };
 
 use crate::{ndi_lib::*, Error, Result, NDI};
@@ -617,6 +619,264 @@ impl Display for Source {
             SourceAddress::Url(url) => write!(f, "{}@{}", self.name, url),
             SourceAddress::Ip(ip) => write!(f, "{}@{}", self.name, ip),
             SourceAddress::None => write!(f, "{}", self.name),
+        }
+    }
+}
+
+/// Cached NDI source with associated NDI runtime instance.
+///
+/// The `_ndi` field keeps the NDI runtime alive for as long as the source is cached,
+/// ensuring the runtime doesn't get destroyed while sources are still in use.
+#[derive(Clone)]
+struct CachedSource {
+    _ndi: Arc<NDI>,
+    source: Source,
+}
+
+/// Thread-safe cache for NDI source discovery.
+///
+/// `SourceCache` eliminates the need for applications to manually cache NDI instances
+/// and discovered sources. It handles expensive NDI initialization and source discovery
+/// operations internally with built-in caching.
+///
+/// # Thread Safety
+///
+/// `SourceCache` is thread-safe and can be shared across threads using `Arc<SourceCache>`.
+/// Interior mutability is handled internally with proper synchronization.
+///
+/// # Examples
+///
+/// ```no_run
+/// use grafton_ndi::SourceCache;
+///
+/// # fn main() -> Result<(), grafton_ndi::Error> {
+/// // Create a cache instance
+/// let cache = SourceCache::new()?;
+///
+/// // Find a source by hostname or IP with automatic caching
+/// let source = cache.find_by_host("192.168.0.107", 5000)?;
+/// println!("Found source: {}", source);
+///
+/// // Subsequent lookups use the cache
+/// let same_source = cache.find_by_host("192.168.0.107", 5000)?;
+///
+/// # Ok(())
+/// # }
+/// ```
+pub struct SourceCache {
+    cache: Mutex<HashMap<String, CachedSource>>,
+}
+
+impl SourceCache {
+    /// Create a new source cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the NDI runtime cannot be initialized.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use grafton_ndi::SourceCache;
+    ///
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let cache = SourceCache::new()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            cache: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Find a source by IP address or hostname with built-in caching.
+    ///
+    /// This method handles NDI initialization and source discovery internally.
+    /// If a source matching the host has been previously found, it returns the
+    /// cached result. Otherwise, it performs NDI discovery and caches the result.
+    ///
+    /// # Arguments
+    ///
+    /// * `host` - The hostname or IP address to search for
+    /// * `timeout_ms` - Maximum time to wait for source discovery in milliseconds
+    ///
+    /// # Returns
+    ///
+    /// The discovered source, or an error if no matching source is found or
+    /// the timeout expires.
+    ///
+    /// # Errors
+    ///
+    /// - `Error::NoSourcesFound` if no source matching the host is discovered
+    /// - Other errors if NDI initialization or discovery fails
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use grafton_ndi::SourceCache;
+    ///
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let cache = SourceCache::new()?;
+    ///
+    /// // Find by IP address
+    /// let source = cache.find_by_host("192.168.0.107", 5000)?;
+    ///
+    /// // Find by partial IP
+    /// let source = cache.find_by_host("192.168.0", 5000)?;
+    ///
+    /// // Find by name
+    /// let source = cache.find_by_host("CAMERA1", 5000)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn find_by_host(&self, host: &str, timeout_ms: u32) -> Result<Source> {
+        // Check cache first
+        {
+            let cache = self.cache.lock().unwrap();
+            if let Some(cached) = cache.get(host) {
+                return Ok(cached.source.clone());
+            }
+        }
+
+        // Not in cache, perform discovery
+        let ndi = Arc::new(NDI::new()?);
+        let options = FinderOptions::builder().show_local_sources(true).build();
+        let finder = Finder::new(&ndi, &options)?;
+
+        // Wait for sources to be discovered
+        finder.wait_for_sources(timeout_ms);
+
+        // Get the current list of sources
+        let sources = finder.get_sources(0)?;
+
+        // Find a matching source using the helper method we added in Enhancement #2
+        let source = sources
+            .into_iter()
+            .find(|s| s.matches_host(host))
+            .ok_or_else(|| {
+                Error::NoSourcesFound(format!("No source found matching host: {}", host))
+            })?;
+
+        // Cache the result
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.insert(
+                host.to_string(),
+                CachedSource {
+                    _ndi: ndi.clone(),
+                    source: source.clone(),
+                },
+            );
+        }
+
+        Ok(source)
+    }
+
+    /// Invalidate the cache entry for a specific host.
+    ///
+    /// This is useful when a source goes offline or when you want to force
+    /// a fresh discovery on the next lookup.
+    ///
+    /// # Arguments
+    ///
+    /// * `host` - The hostname or IP address to remove from the cache
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use grafton_ndi::SourceCache;
+    ///
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let cache = SourceCache::new()?;
+    /// let source = cache.find_by_host("192.168.0.107", 5000)?;
+    ///
+    /// // Later, if the source goes offline
+    /// cache.invalidate("192.168.0.107");
+    ///
+    /// // Next lookup will perform fresh discovery
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn invalidate(&self, host: &str) {
+        let mut cache = self.cache.lock().unwrap();
+        cache.remove(host);
+    }
+
+    /// Clear all cached sources.
+    ///
+    /// This removes all entries from the cache, forcing fresh discovery
+    /// for all subsequent lookups.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use grafton_ndi::SourceCache;
+    ///
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let cache = SourceCache::new()?;
+    /// cache.find_by_host("192.168.0.107", 5000)?;
+    /// cache.find_by_host("192.168.0.108", 5000)?;
+    ///
+    /// // Clear all cached sources
+    /// cache.clear();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn clear(&self) {
+        let mut cache = self.cache.lock().unwrap();
+        cache.clear();
+    }
+
+    /// Get the number of cached sources.
+    ///
+    /// This can be useful for monitoring cache usage and debugging.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use grafton_ndi::SourceCache;
+    ///
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let cache = SourceCache::new()?;
+    /// assert_eq!(cache.len(), 0);
+    ///
+    /// cache.find_by_host("192.168.0.107", 5000)?;
+    /// assert_eq!(cache.len(), 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn len(&self) -> usize {
+        let cache = self.cache.lock().unwrap();
+        cache.len()
+    }
+
+    /// Check if the cache is empty.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use grafton_ndi::SourceCache;
+    ///
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let cache = SourceCache::new()?;
+    /// assert!(cache.is_empty());
+    ///
+    /// cache.find_by_host("192.168.0.107", 5000)?;
+    /// assert!(!cache.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn is_empty(&self) -> bool {
+        let cache = self.cache.lock().unwrap();
+        cache.is_empty()
+    }
+}
+
+impl Default for SourceCache {
+    fn default() -> Self {
+        Self {
+            cache: Mutex::new(HashMap::new()),
         }
     }
 }

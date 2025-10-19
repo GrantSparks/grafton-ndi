@@ -491,3 +491,59 @@ fn test_source_matching_real_world_example() {
     // Should extract port correctly
     assert_eq!(source.address.port(), Some(5960));
 }
+
+#[test]
+fn test_source_cache_creation() {
+    use crate::finder::SourceCache;
+
+    // Should be able to create a cache
+    let cache = SourceCache::new();
+    assert!(cache.is_ok());
+
+    // Cache should start empty
+    let cache = cache.unwrap();
+    assert_eq!(cache.len(), 0);
+    assert!(cache.is_empty());
+}
+
+#[test]
+fn test_source_cache_default() {
+    use crate::finder::SourceCache;
+
+    // Default should create an empty cache
+    let cache = SourceCache::default();
+    assert_eq!(cache.len(), 0);
+    assert!(cache.is_empty());
+}
+
+#[test]
+fn test_source_cache_invalidation() {
+    use crate::finder::SourceCache;
+
+    let cache = SourceCache::default();
+
+    // Invalidating a non-existent entry should not panic
+    cache.invalidate("192.168.0.107");
+    assert_eq!(cache.len(), 0);
+
+    // Clear on empty cache should not panic
+    cache.clear();
+    assert_eq!(cache.len(), 0);
+    assert!(cache.is_empty());
+}
+
+#[test]
+fn test_source_cache_len_and_is_empty() {
+    use crate::finder::SourceCache;
+
+    let cache = SourceCache::default();
+
+    // Initially empty
+    assert_eq!(cache.len(), 0);
+    assert!(cache.is_empty());
+
+    // After clear, still empty
+    cache.clear();
+    assert_eq!(cache.len(), 0);
+    assert!(cache.is_empty());
+}

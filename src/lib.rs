@@ -111,7 +111,7 @@ pub mod sender;
 // Re-exports
 pub use {
     error::*,
-    finder::{Finder, FinderOptions, FinderOptionsBuilder, Source, SourceAddress},
+    finder::{Finder, FinderOptions, FinderOptionsBuilder, Source, SourceAddress, SourceCache},
     frames::{
         AudioFrame, AudioFrameBuilder, AudioType, FourCCVideoType, FrameFormatType,
         LineStrideOrSize, MetadataFrame, VideoFrame, VideoFrameBuilder,

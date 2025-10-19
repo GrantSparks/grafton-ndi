@@ -56,4 +56,8 @@ pub enum Error {
     /// Operation timed out.
     #[error("Operation timed out: {0}")]
     Timeout(String),
+
+    /// No NDI sources found matching the specified criteria.
+    #[error("No NDI sources found: {0}")]
+    NoSourcesFound(String),
 }
