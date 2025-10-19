@@ -8,7 +8,8 @@ use grafton_ndi::{BorrowedVideoFrame, FourCCVideoType, SenderOptions, NDI};
 fn main() -> Result<(), grafton_ndi::Error> {
     // Initialize NDI
     let ndi = NDI::new()?;
-    println!("NDI version: {}", NDI::version()?);
+    let version = NDI::version()?;
+    println!("NDI version: {version}");
 
     // Create sender (must be mutable for async sending)
     let send_options = SenderOptions::builder("Zero-Copy Sender Example")
@@ -17,7 +18,8 @@ fn main() -> Result<(), grafton_ndi::Error> {
         .build()?;
     let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
 
-    println!("Created NDI sender: {}", sender.get_source_name());
+    let source_name = sender.get_source_name()?;
+    println!("Created NDI sender: {source_name}");
 
     // Pre-allocate a single buffer (demonstrating single-buffer with callback)
     let width = 1920;
@@ -40,7 +42,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
     let frame_duration = Duration::from_secs_f64(1.0 / frame_rate);
     let mut next_frame_time = Instant::now();
 
-    println!("Sending video at {}x{} @ {} fps", width, height, frame_rate);
+    println!("Sending video at {width}x{height} @ {frame_rate} fps");
     println!("Press Ctrl+C to stop...");
 
     let mut frame_count = 0;
@@ -80,12 +82,9 @@ fn main() -> Result<(), grafton_ndi::Error> {
         if frame_count % 60 == 0 {
             let elapsed = start_time.elapsed();
             let actual_fps = frame_count as f64 / elapsed.as_secs_f64();
+            let elapsed_secs = elapsed.as_secs_f64();
             println!(
-                "Sent {} frames in {:.1}s - {:.1} fps (target: {} fps)",
-                frame_count,
-                elapsed.as_secs_f64(),
-                actual_fps,
-                frame_rate
+                "Sent {frame_count} frames in {elapsed_secs:.1}s - {actual_fps:.1} fps (target: {frame_rate} fps)"
             );
         }
 
@@ -102,7 +101,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
         }
     }
 
-    println!("\nFinished sending {} frames", frame_count);
+    println!("\nFinished sending {frame_count} frames");
 
     // The sender will now automatically wait for all async operations to complete
     // when it's dropped, so no manual sleep is needed.
@@ -118,7 +117,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
 /// # Arguments
 /// * `buffer` - The buffer to fill with BGRA pixel data
 /// * `width` - Frame width in pixels
-/// * `height` - Frame height in pixels  
+/// * `height` - Frame height in pixels
 /// * `frame_num` - Current frame number for animation
 fn generate_test_pattern(buffer: &mut [u8], width: i32, height: i32, frame_num: u32) {
     let width = width as usize;

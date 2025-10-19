@@ -255,14 +255,22 @@ impl<'a> Finder<'a> {
         if sources_ptr.is_null() {
             return Ok(vec![]);
         }
-        let sources = unsafe {
-            (0..num_sources)
-                .map(|i| {
-                    let source = &*sources_ptr.add(i as usize);
-                    Source::from_raw(source)
-                })
-                .collect()
-        };
+
+        // Convert each source, skipping any that fail null checks
+        let mut sources = Vec::with_capacity(num_sources as usize);
+        for i in 0..num_sources {
+            let source_ptr = unsafe { sources_ptr.add(i as usize) };
+            match Source::try_from_raw(source_ptr) {
+                Ok(source) => sources.push(source),
+                Err(_e) => {
+                    // Skip invalid sources (null pointers from SDK)
+                    // This is a defensive measure - the SDK should not return null entries,
+                    // but we handle it gracefully if it does
+                    #[cfg(debug_assertions)]
+                    eprintln!("Warning: Skipping invalid source at index {i}: {_e}");
+                }
+            }
+        }
         Ok(sources)
     }
 
@@ -302,14 +310,22 @@ impl<'a> Finder<'a> {
         if sources_ptr.is_null() {
             return Ok(vec![]);
         }
-        let sources = unsafe {
-            (0..num_sources)
-                .map(|i| {
-                    let source = &*sources_ptr.add(i as usize);
-                    Source::from_raw(source)
-                })
-                .collect()
-        };
+
+        // Convert each source, skipping any that fail null checks
+        let mut sources = Vec::with_capacity(num_sources as usize);
+        for i in 0..num_sources {
+            let source_ptr = unsafe { sources_ptr.add(i as usize) };
+            match Source::try_from_raw(source_ptr) {
+                Ok(source) => sources.push(source),
+                Err(_e) => {
+                    // Skip invalid sources (null pointers from SDK)
+                    // This is a defensive measure - the SDK should not return null entries,
+                    // but we handle it gracefully if it does
+                    #[cfg(debug_assertions)]
+                    eprintln!("Warning: Skipping invalid source at index {i}: {_e}");
+                }
+            }
+        }
         Ok(sources)
     }
 }
@@ -409,8 +425,6 @@ impl SourceAddress {
             SourceAddress::None => return None,
         };
 
-        // For URLs, we need to parse more carefully
-        // For IPs, it's just host:port
         if let SourceAddress::Url(_) = self {
             // Try to parse as URL to extract port
             // Format might be http://host:port or similar
@@ -425,12 +439,9 @@ impl SourceAddress {
                     return port_str.parse::<u16>().ok();
                 }
             }
-        } else {
-            // Simple host:port format for IP addresses
-            if let Some(colon_pos) = addr_str.rfind(':') {
-                let port_str = &addr_str[colon_pos + 1..];
-                return port_str.parse::<u16>().ok();
-            }
+        } else if let Some(colon_pos) = addr_str.rfind(':') {
+            let port_str = &addr_str[colon_pos + 1..];
+            return port_str.parse::<u16>().ok();
         }
 
         None
@@ -462,7 +473,6 @@ pub struct Source {
     pub address: SourceAddress,
 }
 
-// This struct holds the CStrings to ensure they live as long as needed
 #[repr(C)]
 pub(crate) struct RawSource {
     _name: CString,
@@ -522,20 +532,13 @@ impl Source {
     /// ```
     pub fn ip_address(&self) -> Option<&str> {
         match &self.address {
-            SourceAddress::Ip(ip) => {
-                // Split on colon to remove port
-                Some(ip.split(':').next().unwrap_or(ip))
-            }
+            SourceAddress::Ip(ip) => Some(ip.split(':').next().unwrap_or(ip)),
             SourceAddress::Url(url) => {
-                // Extract hostname from URL
-                // Format: scheme://host:port/path
-                // Remove scheme if present
                 let without_scheme = if let Some(idx) = url.find("://") {
                     &url[idx + 3..]
                 } else {
                     url.as_str()
                 };
-                // Split on : or / to get just the host
                 let host = without_scheme
                     .split(':')
                     .next()
@@ -573,7 +576,34 @@ impl Source {
         self.ip_address()
     }
 
-    pub(crate) fn from_raw(ndi_source: &NDIlib_source_t) -> Self {
+    /// Safely convert from raw NDI source pointer with null checks.
+    ///
+    /// This performs defensive checks at the FFI boundary to prevent undefined behavior
+    /// from null or invalid pointers returned by the NDI SDK.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NullPointer` if:
+    /// - The source pointer itself is null
+    /// - The `p_ndi_name` field is null
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that if `source_ptr` is non-null, it points to a valid
+    /// `NDIlib_source_t` with proper lifetime.
+    pub(crate) fn try_from_raw(source_ptr: *const NDIlib_source_t) -> Result<Self> {
+        // Check top-level pointer
+        if source_ptr.is_null() {
+            return Err(Error::NullPointer("NDIlib_source_t pointer".into()));
+        }
+
+        let ndi_source = unsafe { &*source_ptr };
+
+        // Check p_ndi_name field
+        if ndi_source.p_ndi_name.is_null() {
+            return Err(Error::NullPointer("NDIlib_source_t::p_ndi_name".into()));
+        }
+
         let name = unsafe {
             CStr::from_ptr(ndi_source.p_ndi_name)
                 .to_string_lossy()
@@ -585,16 +615,13 @@ impl Source {
         // IP addresses for regular sources. We check URL first as it's
         // typically used for newer/HX sources.
         let address = unsafe {
-            // Try URL address first
             if !ndi_source.__bindgen_anon_1.p_url_address.is_null() {
                 let url_str = CStr::from_ptr(ndi_source.__bindgen_anon_1.p_url_address)
                     .to_string_lossy()
                     .into_owned();
-                // Validate it looks like a URL (contains ://)
                 if url_str.contains("://") {
                     SourceAddress::Url(url_str)
                 } else {
-                    // If it doesn't look like a URL, treat as IP
                     SourceAddress::Ip(url_str)
                 }
             } else {
@@ -602,7 +629,7 @@ impl Source {
             }
         };
 
-        Source { name, address }
+        Ok(Source { name, address })
     }
 
     /// Convert to raw format for FFI use
@@ -661,9 +688,9 @@ impl Source {
 impl Display for Source {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match &self.address {
-            SourceAddress::Url(url) => write!(f, "{}@{}", self.name, url),
-            SourceAddress::Ip(ip) => write!(f, "{}@{}", self.name, ip),
-            SourceAddress::None => write!(f, "{}", self.name),
+            SourceAddress::Url(url) => write!(f, "{name}@{url}", name = self.name),
+            SourceAddress::Ip(ip) => write!(f, "{name}@{ip}", name = self.name),
+            SourceAddress::None => write!(f, "{name}", name = self.name),
         }
     }
 }
@@ -776,7 +803,6 @@ impl SourceCache {
     /// # }
     /// ```
     pub fn find_by_host(&self, host: &str, timeout_ms: u32) -> Result<Source> {
-        // Check cache first
         {
             let cache = self.cache.lock().unwrap();
             if let Some(cached) = cache.get(host) {
@@ -784,7 +810,6 @@ impl SourceCache {
             }
         }
 
-        // Not in cache, perform discovery
         let ndi = Arc::new(NDI::new()?);
         // Use extra_ips to hint NDI to look at the specific host IP/network segment
         // This significantly improves discovery speed and reliability
@@ -794,21 +819,16 @@ impl SourceCache {
             .build();
         let finder = Finder::new(&ndi, &options)?;
 
-        // Wait for sources to be discovered
         finder.wait_for_sources(timeout_ms);
-
-        // Get the current list of sources
         let sources = finder.get_sources(0)?;
 
-        // Find a matching source using the helper method we added in Enhancement #2
         let source = sources
             .into_iter()
             .find(|s| s.matches_host(host))
             .ok_or_else(|| Error::NoSourcesFound {
-                criteria: format!("host: {}", host),
+                criteria: format!("host: {host}"),
             })?;
 
-        // Cache the result
         {
             let mut cache = self.cache.lock().unwrap();
             cache.insert(
@@ -927,6 +947,120 @@ impl Default for SourceCache {
     fn default() -> Self {
         Self {
             cache: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    #[test]
+    fn test_try_from_raw_null_pointer() {
+        // Test that null pointer is rejected
+        let result = Source::try_from_raw(ptr::null());
+        assert!(result.is_err());
+        match result {
+            Err(Error::NullPointer(msg)) => {
+                assert!(msg.contains("NDIlib_source_t pointer"));
+            }
+            _ => panic!("Expected NullPointer error"),
+        }
+    }
+
+    #[test]
+    fn test_try_from_raw_null_name() {
+        // Create a source with null p_ndi_name
+        let source = NDIlib_source_t {
+            p_ndi_name: ptr::null(),
+            __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
+                p_ip_address: ptr::null(),
+            },
+        };
+
+        let result = Source::try_from_raw(&source as *const _);
+        assert!(result.is_err());
+        match result {
+            Err(Error::NullPointer(msg)) => {
+                assert!(msg.contains("p_ndi_name"));
+            }
+            _ => panic!("Expected NullPointer error for null name"),
+        }
+    }
+
+    #[test]
+    fn test_try_from_raw_valid_source_with_ip() {
+        // Create valid C strings
+        let name = CString::new("Test Source").unwrap();
+        let ip = CString::new("192.168.1.100:5960").unwrap();
+
+        let source = NDIlib_source_t {
+            p_ndi_name: name.as_ptr(),
+            __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
+                p_ip_address: ip.as_ptr(),
+            },
+        };
+
+        let result = Source::try_from_raw(&source as *const _);
+        assert!(result.is_ok());
+
+        let source = result.unwrap();
+        assert_eq!(source.name, "Test Source");
+        match source.address {
+            SourceAddress::Ip(ip_str) => {
+                assert_eq!(ip_str, "192.168.1.100:5960");
+            }
+            _ => panic!("Expected IP address"),
+        }
+    }
+
+    #[test]
+    fn test_try_from_raw_valid_source_with_url() {
+        // Create valid C strings
+        let name = CString::new("HX Source").unwrap();
+        let url = CString::new("http://camera.local:8080/ndi").unwrap();
+
+        let source = NDIlib_source_t {
+            p_ndi_name: name.as_ptr(),
+            __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
+                p_url_address: url.as_ptr(),
+            },
+        };
+
+        let result = Source::try_from_raw(&source as *const _);
+        assert!(result.is_ok());
+
+        let source = result.unwrap();
+        assert_eq!(source.name, "HX Source");
+        match source.address {
+            SourceAddress::Url(url_str) => {
+                assert_eq!(url_str, "http://camera.local:8080/ndi");
+            }
+            _ => panic!("Expected URL address"),
+        }
+    }
+
+    #[test]
+    fn test_try_from_raw_valid_source_no_address() {
+        // Create valid C string for name, null for address
+        let name = CString::new("Source No Addr").unwrap();
+
+        let source = NDIlib_source_t {
+            p_ndi_name: name.as_ptr(),
+            __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
+                p_ip_address: ptr::null(),
+            },
+        };
+
+        let result = Source::try_from_raw(&source as *const _);
+        assert!(result.is_ok());
+
+        let source = result.unwrap();
+        assert_eq!(source.name, "Source No Addr");
+        match source.address {
+            SourceAddress::None => {}
+            _ => panic!("Expected None address"),
         }
     }
 }
