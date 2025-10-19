@@ -226,6 +226,8 @@ impl<'a> Finder<'a> {
     /// This method uses `NDIlib_find_get_current_sources` which provides a snapshot
     /// of the current source list without any additional network discovery.
     ///
+    /// Available since NDI SDK 6.0.
+    ///
     /// # Returns
     ///
     /// A vector of currently known sources. May be empty if no sources are found.
