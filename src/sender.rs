@@ -459,10 +459,8 @@ impl<'a> Sender<'a> {
         &'b self,
         video_frame: &BorrowedVideoFrame<'b>,
     ) -> AsyncVideoToken<'b> {
-        // Increment the in-flight counter
         self.inner.in_flight.fetch_add(1, Ordering::AcqRel);
 
-        // Use the real async send function
         unsafe {
             NDIlib_send_send_video_async_v2(self.inner.instance, &video_frame.to_raw());
         }
@@ -841,7 +839,6 @@ impl Drop for Inner {
 
 impl Drop for Sender<'_> {
     fn drop(&mut self) {
-        // SendInstance drop doesn't need to do anything special
         // The Inner will be dropped when all Arc references are gone
     }
 }
@@ -942,7 +939,6 @@ impl SenderOptionsBuilder {
     /// - The name is empty or contains only whitespace
     /// - Both clock_video and clock_audio are false
     pub fn build(self) -> Result<SenderOptions> {
-        // Validate sender name
         if self.name.trim().is_empty() {
             return Err(Error::InvalidConfiguration(
                 "Sender name cannot be empty or contain only whitespace".into(),
@@ -952,7 +948,6 @@ impl SenderOptionsBuilder {
         let clock_video = self.clock_video.unwrap_or(true);
         let clock_audio = self.clock_audio.unwrap_or(true);
 
-        // Validate that at least one clock is enabled
         if !clock_video && !clock_audio {
             return Err(Error::InvalidConfiguration(
                 "At least one of clock_video or clock_audio must be true".into(),

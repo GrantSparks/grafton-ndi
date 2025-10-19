@@ -28,7 +28,6 @@ use grafton_ndi::{
 use std::{env, fs::File, time::Instant};
 
 fn main() -> Result<(), Error> {
-    // Parse command line arguments
     let args: Vec<String> = env::args().collect();
     let mut extra_ips = Vec::new();
     let mut output_file = "CoolNDIImage.png";
@@ -49,7 +48,6 @@ fn main() -> Result<(), Error> {
     println!("NDI Video Capture to PNG Example");
     println!("=================================\n");
 
-    // Initialize NDI
     let ndi = NDI::new()?;
     println!("NDI initialized successfully");
 
@@ -58,10 +56,8 @@ fn main() -> Result<(), Error> {
     }
     println!();
 
-    // Create a finder
     let mut builder = FinderOptions::builder().show_local_sources(true);
 
-    // Add any command line IPs
     if !extra_ips.is_empty() {
         println!("Searching additional IPs/subnets:");
         for ip in &extra_ips {
@@ -73,7 +69,6 @@ fn main() -> Result<(), Error> {
 
     let finder = Finder::new(&ndi, &builder.build())?;
 
-    // Wait until there is one source
     println!("Looking for sources ...");
     let sources = loop {
         finder.wait_for_sources(1000);
@@ -89,7 +84,6 @@ fn main() -> Result<(), Error> {
         }
     };
 
-    // Create a receiver for the first source
     let first_source = &sources[0];
     println!("\nCreating receiver for: {first_source}");
     let receiver = ReceiverOptions::builder(sources[0].clone())
@@ -99,15 +93,12 @@ fn main() -> Result<(), Error> {
     println!("Receiver created successfully");
     println!("Waiting for video frames...\n");
 
-    // Use the new blocking capture method that handles retry logic internally
-    // This is much simpler than manually implementing the retry loop
     let start_time = Instant::now();
     let video_frame = receiver.capture_video_blocking(60_000)?;
 
     let elapsed = start_time.elapsed();
     println!("Frame received after {elapsed:?}");
 
-    // Debug information about the frame
     println!("Frame details:");
     let width = video_frame.width;
     let height = video_frame.height;
@@ -132,7 +123,6 @@ fn main() -> Result<(), Error> {
     let timecode = video_frame.timecode;
     println!("  Timecode: {timecode:016x}");
 
-    // Verify we got the format we requested
     match video_frame.fourcc {
         FourCCVideoType::RGBA | FourCCVideoType::RGBX => {
             println!("  ✓ Got requested RGBA/RGBX format");
@@ -144,11 +134,10 @@ fn main() -> Result<(), Error> {
     }
 
     // CRITICAL: Verify stride matches width to prevent corrupted images
-    let expected_stride = video_frame.width * 4; // 4 bytes per pixel for RGBA
+    let expected_stride = video_frame.width * 4;
     let actual_stride = line_stride;
 
     if actual_stride != expected_stride {
-        // This is a common issue with some NDI sources
         // If stride != width * 4, we would need to handle row padding
         return Err(Error::InitializationFailed(format!(
             "Line stride ({actual_stride}) doesn't match width * 4 ({expected_stride}). \
@@ -156,7 +145,6 @@ fn main() -> Result<(), Error> {
         )));
     }
 
-    // Check data size to detect if we might have a compressed format
     let expected_uncompressed_size = (video_frame.width * video_frame.height * 4) as usize;
     if video_frame.data.len() < expected_uncompressed_size / 2 {
         let actual_size = video_frame.data.len();
@@ -167,7 +155,6 @@ fn main() -> Result<(), Error> {
         eprintln!("            format that needs decoding before saving as PNG.");
     }
 
-    // Save as PNG
     println!("\nSaving frame as PNG...");
     let file = File::create(output_file)?;
     let mut encoder = png::Encoder::new(file, video_frame.width as u32, video_frame.height as u32);

@@ -97,30 +97,25 @@
 #![allow(clippy::must_use_candidate)]
 #![allow(clippy::missing_errors_doc)]
 
-// Internal modules
 mod error;
 mod ndi_lib;
 mod recv_guard;
 
-// Public modules
 pub mod finder;
 pub mod frames;
 pub mod receiver;
 pub mod runtime;
 pub mod sender;
 
-// Async runtime integration (feature-gated)
 #[cfg(any(feature = "tokio", feature = "async-std"))]
 mod async_runtime;
 
-// Re-export async modules based on feature flags
 #[cfg(feature = "tokio")]
 pub use async_runtime::tokio;
 
 #[cfg(feature = "async-std")]
 pub use async_runtime::async_std;
 
-// Re-exports
 pub use {
     error::*,
     finder::{Finder, FinderOptions, FinderOptionsBuilder, Source, SourceAddress, SourceCache},
@@ -136,14 +131,12 @@ pub use {
     sender::{AsyncVideoToken, BorrowedVideoFrame, Sender, SenderOptions, SenderOptionsBuilder},
 };
 
-// Conditional re-exports for image-encoding feature
 #[cfg(feature = "image-encoding")]
 pub use frames::ImageFormat;
 
 /// Alias for Result with our Error type
 pub type Result<T> = std::result::Result<T, crate::error::Error>;
 
-// Tests
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;

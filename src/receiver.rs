@@ -17,11 +17,11 @@
 //! // Poll for status changes
 //! if let Some(status) = receiver.poll_status_change(1000) {
 //!     if let Some(tally) = status.tally {
-//!         println!("Tally: program={}, preview={}",
-//!                  tally.on_program, tally.on_preview);
+//!         println!("Tally: program={program}, preview={preview}",
+//!                  program = tally.on_program, preview = tally.on_preview);
 //!     }
 //!     if let Some(connections) = status.connections {
-//!         println!("Active connections: {}", connections);
+//!         println!("Active connections: {connections}");
 //!     }
 //! }
 //! # Ok(())
@@ -78,7 +78,6 @@ pub enum ReceiverColorFormat {
     UYVY_RGBA,
     Fastest,
     Best,
-    //    BGRX_BGRA_Flipped,
     Max,
 }
 
@@ -101,9 +100,6 @@ impl From<ReceiverColorFormat> for NDIlib_recv_color_format_e {
                 NDIlib_recv_color_format_e_NDIlib_recv_color_format_fastest
             }
             ReceiverColorFormat::Best => NDIlib_recv_color_format_e_NDIlib_recv_color_format_best,
-            //            ReceiverColorFormat::BGRX_BGRA_Flipped => {
-            //                NDIlib_recv_color_format_e_NDIlib_recv_color_format_BGRX_BGRA_flipped
-            //            }
             ReceiverColorFormat::Max => NDIlib_recv_color_format_e_NDIlib_recv_color_format_max,
         }
     }
@@ -282,7 +278,7 @@ impl ReceiverOptionsBuilder {
     ///
     /// // Capture full quality frames
     /// let frame = receiver.capture_video_blocking(5000)?;
-    /// println!("Captured {}x{} frame", frame.width, frame.height);
+    /// println!("Captured {width}x{height} frame", width = frame.width, height = frame.height);
     /// # Ok(())
     /// # }
     /// ```
@@ -322,11 +318,11 @@ impl ReceiverOptionsBuilder {
     /// // Poll for status changes
     /// if let Some(status) = receiver.poll_status_change(1000) {
     ///     if let Some(tally) = status.tally {
-    ///         println!("Tally: program={}, preview={}",
-    ///                  tally.on_program, tally.on_preview);
+    ///         println!("Tally: program={program}, preview={preview}",
+    ///                  program = tally.on_program, preview = tally.on_preview);
     ///     }
     ///     if let Some(connections) = status.connections {
-    ///         println!("Active connections: {}", connections);
+    ///         println!("Active connections: {connections}");
     ///     }
     /// }
     /// # Ok(())
@@ -388,7 +384,6 @@ pub struct Receiver {
 impl Receiver {
     pub fn new(ndi: &NDI, create: &ReceiverOptions) -> Result<Self> {
         let create_raw = create.to_raw()?;
-        // NDIlib_recv_create_v3 already connects to the source specified in source_to_connect_to
         let instance = unsafe { NDIlib_recv_create_v3(&create_raw.raw) };
         if instance.is_null() {
             Err(Error::InitializationFailed(
@@ -424,29 +419,22 @@ impl Receiver {
 
         match frame_type {
             NDIlib_frame_type_e_NDIlib_frame_type_video => {
-                // Create RAII guard to ensure the frame is freed
                 let guard = unsafe { RecvVideoGuard::new(self.instance, video_frame) };
                 let frame = unsafe { VideoFrame::from_raw(guard.frame()) }?;
-                // Guard is dropped here, freeing the NDI frame
                 Ok(FrameType::Video(frame))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_audio => {
-                // Create RAII guard to ensure the frame is freed
                 let guard = unsafe { RecvAudioGuard::new(self.instance, audio_frame) };
                 let frame = AudioFrame::from_raw(*guard.frame())?;
-                // Guard is dropped here, freeing the NDI frame
                 Ok(FrameType::Audio(frame))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_metadata => {
-                // Create RAII guard to ensure the frame is freed
                 let guard = unsafe { RecvMetadataGuard::new(self.instance, metadata_frame) };
                 let frame = MetadataFrame::from_raw(guard.frame());
-                // Guard is dropped here, freeing the NDI frame
                 Ok(FrameType::Metadata(frame))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(FrameType::None),
             NDIlib_frame_type_e_NDIlib_frame_type_status_change => {
-                // For the deprecated capture() method, we'll return a simple status with minimal info
                 let status = ReceiverStatus {
                     tally: None,
                     connections: None,
@@ -458,8 +446,7 @@ impl Receiver {
                 Err(Error::CaptureFailed("Received an error frame".into()))
             }
             _ => Err(Error::CaptureFailed(format!(
-                "Unknown frame type: {}",
-                frame_type
+                "Unknown frame type: {frame_type}"
             ))),
         }
     }
@@ -474,10 +461,7 @@ impl Receiver {
             NDIlib_recv_ptz_recall_preset,
             preset as i32,
             speed,
-            format!(
-                "Failed to recall PTZ preset {} with speed {}",
-                preset, speed
-            )
+            format!("Failed to recall PTZ preset {preset} with speed {speed}")
         )
     }
 
@@ -486,7 +470,7 @@ impl Receiver {
             self,
             NDIlib_recv_ptz_zoom,
             zoom_value,
-            format!("Failed to set PTZ zoom to {}", zoom_value)
+            format!("Failed to set PTZ zoom to {zoom_value}")
         )
     }
 
@@ -495,7 +479,7 @@ impl Receiver {
             self,
             NDIlib_recv_ptz_zoom_speed,
             zoom_speed,
-            format!("Failed to set PTZ zoom speed to {}", zoom_speed)
+            format!("Failed to set PTZ zoom speed to {zoom_speed}")
         )
     }
 
@@ -505,10 +489,7 @@ impl Receiver {
             NDIlib_recv_ptz_pan_tilt,
             pan_value,
             tilt_value,
-            format!(
-                "Failed to set PTZ pan/tilt to ({}, {})",
-                pan_value, tilt_value
-            )
+            format!("Failed to set PTZ pan/tilt to ({pan_value}, {tilt_value})")
         )
     }
 
@@ -518,10 +499,7 @@ impl Receiver {
             NDIlib_recv_ptz_pan_tilt_speed,
             pan_speed,
             tilt_speed,
-            format!(
-                "Failed to set PTZ pan/tilt speed to ({}, {})",
-                pan_speed, tilt_speed
-            )
+            format!("Failed to set PTZ pan/tilt speed to ({pan_speed}, {tilt_speed})")
         )
     }
 
@@ -530,7 +508,7 @@ impl Receiver {
             self,
             NDIlib_recv_ptz_store_preset,
             preset_no,
-            format!("Failed to store PTZ preset {}", preset_no)
+            format!("Failed to store PTZ preset {preset_no}")
         )
     }
 
@@ -547,7 +525,7 @@ impl Receiver {
             self,
             NDIlib_recv_ptz_focus,
             focus_value,
-            format!("Failed to set PTZ focus to {}", focus_value)
+            format!("Failed to set PTZ focus to {focus_value}")
         )
     }
 
@@ -556,7 +534,7 @@ impl Receiver {
             self,
             NDIlib_recv_ptz_focus_speed,
             focus_speed,
-            format!("Failed to set PTZ focus speed to {}", focus_speed)
+            format!("Failed to set PTZ focus speed to {focus_speed}")
         )
     }
 
@@ -598,10 +576,7 @@ impl Receiver {
             NDIlib_recv_ptz_white_balance_manual,
             red,
             blue,
-            format!(
-                "Failed to set PTZ manual white balance (red: {}, blue: {})",
-                red, blue
-            )
+            format!("Failed to set PTZ manual white balance (red: {red}, blue: {blue})")
         )
     }
 
@@ -618,7 +593,7 @@ impl Receiver {
             self,
             NDIlib_recv_ptz_exposure_manual,
             exposure_level,
-            format!("Failed to set PTZ manual exposure to {}", exposure_level)
+            format!("Failed to set PTZ manual exposure to {exposure_level}")
         )
     }
 
@@ -629,10 +604,7 @@ impl Receiver {
             iris,
             gain,
             shutter_speed,
-            format!(
-                "Failed to set PTZ manual exposure v2 (iris: {}, gain: {}, shutter: {})",
-                iris, gain, shutter_speed
-            )
+            format!("Failed to set PTZ manual exposure v2 (iris: {iris}, gain: {gain}, shutter: {shutter_speed})")
         )
     }
 
@@ -694,7 +666,7 @@ impl Receiver {
     /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
     /// // Try up to 10 times with 100ms timeout per attempt
     /// if let Some(frame) = receiver.capture_video_with_retry(100, 10)? {
-    ///     println!("Captured {}x{} frame", frame.width, frame.height);
+    ///     println!("Captured {width}x{height} frame", width = frame.width, height = frame.height);
     /// }
     /// # Ok(())
     /// # }
@@ -744,7 +716,7 @@ impl Receiver {
     /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
     /// // Wait up to 5 seconds for a frame
     /// let frame = receiver.capture_video_blocking(5000)?;
-    /// println!("Captured {}x{} frame", frame.width, frame.height);
+    /// println!("Captured {width}x{height} frame", width = frame.width, height = frame.height);
     /// # Ok(())
     /// # }
     /// ```
@@ -1021,7 +993,7 @@ impl Receiver {
     /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
     /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
     /// let source = receiver.source();
-    /// println!("Connected to: {}", source.name);
+    /// println!("Connected to: {name}", name = source.name);
     /// # Ok(())
     /// # }
     /// ```
@@ -1049,27 +1021,24 @@ impl Receiver {
     /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
     /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
     /// let stats = receiver.connection_stats();
-    /// println!("Connections: {}", stats.connections);
-    /// println!("Video frames: {} (dropped: {})",
-    ///          stats.video_frames_received,
-    ///          stats.video_frames_dropped);
-    /// println!("Frame drop rate: {:.2}%",
-    ///          stats.video_drop_percentage());
+    /// println!("Connections: {connections}", connections = stats.connections);
+    /// println!("Video frames: {received} (dropped: {dropped})",
+    ///          received = stats.video_frames_received,
+    ///          dropped = stats.video_frames_dropped);
+    /// println!("Frame drop rate: {rate:.2}%",
+    ///          rate = stats.video_drop_percentage());
     /// # Ok(())
     /// # }
     /// ```
     pub fn connection_stats(&self) -> ConnectionStats {
-        // Get number of active connections
         let connections = unsafe { NDIlib_recv_get_no_connections(self.instance) };
 
-        // Get performance statistics (total and dropped frames)
         let mut total = NDIlib_recv_performance_t::default();
         let mut dropped = NDIlib_recv_performance_t::default();
         unsafe {
             NDIlib_recv_get_performance(self.instance, &mut total, &mut dropped);
         }
 
-        // Get queue depth
         let mut queue = NDIlib_recv_queue_t::default();
         unsafe {
             NDIlib_recv_get_queue(self.instance, &mut queue);
