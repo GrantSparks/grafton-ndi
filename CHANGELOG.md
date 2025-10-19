@@ -8,6 +8,11 @@
   - Default layout changed to **Planar** (matching FLTP format semantics)
   - Previously hardcoded to 0 (interleaved), causing NDI SDK to reject audio samples entirely
   - `NDIlib_Send_Audio` example now functional
+- **Async video send API is now sound and prevents use-after-free** ([#16](https://github.com/GrantSparks/grafton-ndi/issues/16))
+  - Eliminates FFI use-after-free hazard where buffers could be dropped while NDI still reads them
+  - `AsyncVideoToken` now holds real borrows of the buffer (not `PhantomData`)
+  - Compile-time enforcement prevents buffer from being dropped while token exists
+  - Single-flight semantics enforced: only one async send can be in-flight at a time
 
 ### Added
 - **`AudioLayout` enum**: Explicit control over audio data layout
@@ -18,6 +23,14 @@
 - Test coverage for both planar and interleaved audio formats (4 new tests)
 
 ### Changed
+- **BREAKING**: `send_video_async` now requires `&mut self` and enforces single-flight semantics ([#16](https://github.com/GrantSparks/grafton-ndi/issues/16))
+  - API signature changed from `&self` to `&mut self` to prevent multiple concurrent async sends
+  - `AsyncVideoToken` structure redesigned: holds `&'a Arc<Inner>` and `&'buf [u8]` (real borrows)
+  - Removed `in_flight: AtomicUsize` counter - no longer needed with single-flight enforcement
+  - Token drop now always flushes (simplified from conditional logic)
+  - Migration: declare `Sender` as `mut` and send frames sequentially
+  - Example: `let mut sender = Sender::new(...)` and `let token = sender.send_video_async(&frame)`
+  - Breaking but mechanical change that eliminates soundness bugs
 - **BREAKING**: `LineStrideOrSize` is now a typed enum instead of a union ([#15](https://github.com/GrantSparks/grafton-ndi/issues/15))
   - Eliminates undefined behavior from reading inactive union fields
   - Two variants: `LineStrideBytes(i32)` for uncompressed formats, `DataSizeBytes(i32)` for compressed

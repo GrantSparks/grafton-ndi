@@ -10,12 +10,12 @@ fn main() -> Result<(), grafton_ndi::Error> {
     let ndi = NDI::new()?;
     println!("NDI version: {}", NDI::version()?);
 
-    // Create sender
+    // Create sender (must be mutable for async sending)
     let send_options = SenderOptions::builder("Zero-Copy Sender Example")
         .clock_video(true)
         .clock_audio(true)
         .build()?;
-    let sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
+    let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
 
     println!("Created NDI sender: {}", sender.get_source_name());
 

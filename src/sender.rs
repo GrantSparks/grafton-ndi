@@ -10,8 +10,7 @@ use std::{
         atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[cfg(target_os = "windows")]
@@ -45,7 +44,6 @@ struct Inner {
     name: *mut c_char,   // Store raw pointer to free on drop
     groups: *mut c_char, // Store raw pointer to free on drop
     async_state: AsyncState,
-    in_flight: AtomicUsize,          // Count of outstanding async operations
     destroyed: AtomicBool,           // Flag to ensure drop runs only once
     callback_ptr: AtomicPtr<c_void>, // Store the raw pointer passed to NDI SDK
 }
@@ -81,7 +79,6 @@ impl fmt::Debug for Inner {
         f.debug_struct("Inner")
             .field("instance", &self.instance)
             .field("async_state", &self.async_state)
-            .field("in_flight", &self.in_flight)
             .field("destroyed", &self.destroyed)
             .field("callback_ptr", &self.callback_ptr)
             .finish()
@@ -191,91 +188,93 @@ impl<'buf> From<&'buf VideoFrame> for BorrowedVideoFrame<'buf> {
 
 /// A token that tracks an async video send operation.
 ///
-/// The token must be kept alive to track the operation. The actual buffer
-/// release is handled by the SDK callback registered with `on_async_video_done`.
+/// The token holds exclusive access to the sender and a borrow of the frame buffer,
+/// ensuring memory safety at compile time. Only one async send can be in-flight
+/// at a time in the non-advanced SDK build.
+///
+/// When the token is dropped, a flush is automatically performed to ensure the
+/// NDI SDK releases the buffer before the token's borrows expire.
 #[must_use = "AsyncVideoToken must be held to track the async operation"]
-pub struct AsyncVideoToken<'buf> {
-    inner: Arc<Inner>,
-    // Use mutable borrow to prevent any access while NDI owns the buffer
-    _frame: PhantomData<&'buf mut [u8]>,
+pub struct AsyncVideoToken<'a, 'buf> {
+    // False positive: this field IS read in Drop impl (self.inner.destroyed, self.inner.instance, etc.)
+    // The compiler doesn't track field access through references in Drop
+    #[allow(dead_code)]
+    inner: &'a Arc<Inner>,
+    // Hold a real borrow of the buffer to prevent it from being dropped
+    _buffer: &'buf [u8],
 }
 
 // Note: AsyncVideoToken implements Send because PhantomData<&'buf mut [u8]> is Send.
 // This allows the token to be moved between threads, though the underlying buffer
 // lifetime is still properly tracked.
 
-impl Drop for AsyncVideoToken<'_> {
+impl Drop for AsyncVideoToken<'_, '_> {
     fn drop(&mut self) {
         // When using SDK callbacks, the callback handles notification
         #[cfg(not(feature = "advanced_sdk"))]
         {
-            // Use stronger memory ordering for cross-platform consistency
-            let prev_count = self.inner.in_flight.fetch_sub(1, Ordering::AcqRel);
+            // With the single-flight API, we always flush when the token drops
+            // Use compare_exchange to atomically check if Inner is being destroyed
+            // This prevents use-after-free race conditions
+            let not_destroyed = self
+                .inner
+                .destroyed
+                .compare_exchange(
+                    false,
+                    false, // Don't actually change it, just check atomically
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok();
 
-            // If this was the last token, we need to flush to ensure the SDK releases the buffer
-            if prev_count == 1 {
-                // Use compare_exchange to atomically check if Inner is being destroyed
-                // This prevents use-after-free race conditions
-                let not_destroyed = self
-                    .inner
-                    .destroyed
-                    .compare_exchange(
-                        false,
-                        false, // Don't actually change it, just check atomically
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    )
-                    .is_ok();
+            if not_destroyed {
+                // Send NULL frame to flush per NDI docs
+                let null_frame = NDIlib_video_frame_v2_t {
+                    p_data: std::ptr::null_mut(),
+                    xres: 0,
+                    yres: 0,
+                    FourCC: 0,
+                    frame_rate_N: 0,
+                    frame_rate_D: 0,
+                    picture_aspect_ratio: 0.0,
+                    frame_format_type: 0,
+                    timecode: 0,
+                    __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                        line_stride_in_bytes: 0,
+                    },
+                    p_metadata: std::ptr::null(),
+                    timestamp: 0,
+                };
 
-                if not_destroyed {
-                    // Send NULL frame to flush per NDI docs
-                    let null_frame = NDIlib_video_frame_v2_t {
-                        p_data: std::ptr::null_mut(),
-                        xres: 0,
-                        yres: 0,
-                        FourCC: 0,
-                        frame_rate_N: 0,
-                        frame_rate_D: 0,
-                        picture_aspect_ratio: 0.0,
-                        frame_format_type: 0,
-                        timecode: 0,
-                        __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
-                            line_stride_in_bytes: 0,
-                        },
-                        p_metadata: std::ptr::null(),
-                        timestamp: 0,
-                    };
-
-                    // On Windows, serialize flush operations to prevent deadlock
-                    #[cfg(target_os = "windows")]
-                    {
-                        let _lock = FLUSH_MUTEX.lock().unwrap();
-                        unsafe {
-                            // This blocks until all pending async operations complete
-                            NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
-                        }
-                    }
-
-                    #[cfg(not(target_os = "windows"))]
+                // On Windows, serialize flush operations to prevent deadlock
+                #[cfg(target_os = "windows")]
+                {
+                    let _lock = FLUSH_MUTEX.lock().unwrap();
                     unsafe {
                         // This blocks until all pending async operations complete
                         NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
                     }
                 }
+
+                #[cfg(not(target_os = "windows"))]
+                unsafe {
+                    // This blocks until all pending async operations complete
+                    NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
+                }
             }
 
             // Notify callback after flush
             if let Some(callback) = self.inner.async_state.video_callback.get() {
-                // Notify with a dummy length since we don't have the actual buffer info
-                callback(0);
+                // Notify with the buffer length
+                callback(self._buffer.len());
             }
         }
 
         // When advanced_sdk is enabled, the SDK callback handles everything
-        // But we still need to decrement the counter
         #[cfg(feature = "advanced_sdk")]
         {
-            self.inner.in_flight.fetch_sub(1, Ordering::AcqRel);
+            // In the future when advanced SDK is properly enabled,
+            // the callback will handle buffer release notification
         }
     }
 }
@@ -324,7 +323,6 @@ impl<'a> Sender<'a> {
                 name: p_ndi_name_raw,
                 groups: p_groups,
                 async_state: AsyncState::default(),
-                in_flight: AtomicUsize::new(0),
                 destroyed: AtomicBool::new(false),
                 callback_ptr: AtomicPtr::new(ptr::null_mut()),
             });
@@ -375,9 +373,6 @@ impl<'a> Sender<'a> {
                             (cb)(len);
                         }
 
-                        // Decrement the in-flight counter
-                        inner.in_flight.fetch_sub(1, Ordering::Release);
-
                         // Re-leak the Arc since we're not done with it yet
                         // It will be properly dropped in Inner::drop
                         ::std::mem::forget(inner);
@@ -417,17 +412,22 @@ impl<'a> Sender<'a> {
     ///
     /// Uses `NDIlib_send_send_video_async_v2` for zero-copy transmission.
     ///
-    /// **IMPORTANT**: The buffer remains owned by the SDK until a flush occurs.
-    /// With the standard SDK, the library automatically flushes when the last
-    /// AsyncVideoToken is dropped to ensure memory safety.
+    /// **IMPORTANT**: This method requires a mutable borrow of the sender, which
+    /// enforces single-flight semantics at compile time. Only one async send can
+    /// be in-flight at a time.
     ///
-    /// Returns an `AsyncVideoToken` that must be held to track the operation.
-    /// The frame data must remain valid until the token is dropped.
+    /// Returns an `AsyncVideoToken` that holds borrows of both the sender and the
+    /// frame buffer. The token must be kept alive until the frame has been transmitted.
+    /// When the token is dropped, a flush is automatically performed to ensure the
+    /// NDI SDK releases the buffer.
     ///
-    /// # Safety
+    /// # Type Safety
     ///
-    /// The library ensures that when the last AsyncVideoToken is dropped, a flush
-    /// is performed to release all buffers before the sender can be destroyed.
+    /// The returned token holds:
+    /// - A borrow of the sender (preventing multiple concurrent async sends)
+    /// - A borrow of the frame buffer (preventing the buffer from being dropped)
+    ///
+    /// This ensures memory safety at compile time without runtime overhead.
     ///
     /// # Example
     /// ```no_run
@@ -438,36 +438,34 @@ impl<'a> Sender<'a> {
     ///     .clock_video(true)
     ///     .clock_audio(true)
     ///     .build()?;
-    /// let sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
+    /// let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
     ///
     /// // Register callback to know when buffer is released
     /// sender.on_async_video_done(|len| println!("Buffer released: {} bytes", len));
     ///
     /// // Use borrowed buffer directly (zero-copy, no allocation)
-    /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
+    /// let buffer = vec![0u8; 1920 * 1080 * 4];
     /// let borrowed_frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
     /// let token = sender.send_video_async(&borrowed_frame);
     ///
-    /// // Buffer is owned by SDK until token is dropped or explicit flush
-    /// drop(token); // This triggers automatic flush if last token
+    /// // Buffer is owned by SDK until token is dropped
+    /// drop(token); // This triggers automatic flush
     /// // Now safe to reuse buffer
     ///
     /// # Ok(())
     /// # }
     /// ```
     pub fn send_video_async<'b>(
-        &'b self,
+        &'b mut self,
         video_frame: &BorrowedVideoFrame<'b>,
-    ) -> AsyncVideoToken<'b> {
-        self.inner.in_flight.fetch_add(1, Ordering::AcqRel);
-
+    ) -> AsyncVideoToken<'b, 'b> {
         unsafe {
             NDIlib_send_send_video_async_v2(self.inner.instance, &video_frame.to_raw());
         }
 
         AsyncVideoToken {
-            inner: self.inner.clone(),
-            _frame: PhantomData,
+            inner: &self.inner,
+            _buffer: video_frame.data,
         }
     }
 
@@ -652,14 +650,15 @@ impl<'a> Sender<'a> {
 
     /// Wait for pending async operations with timeout (optional helper).
     ///
-    /// **Note**: The NDI SDK guarantees that `NDIlib_send_destroy` waits for all
-    /// async operations to complete. This method is only useful if you want to
-    /// explicitly wait with a timeout before dropping the SendInstance.
+    /// **Note**: With the single-flight async API, this method is no longer needed
+    /// since the AsyncVideoToken ensures completion when dropped. This method is
+    /// kept for backwards compatibility but immediately returns Ok(()) since there
+    /// can only be one async operation in-flight at a time, and it's tied to a
+    /// token lifetime.
     ///
     /// # Returns
     ///
-    /// - `Ok(())` if all operations completed within the timeout
-    /// - `Err(Error::Timeout)` if operations are still pending after the timeout
+    /// - Always returns `Ok(())` in the current single-flight implementation
     ///
     /// # Example
     ///
@@ -672,65 +671,14 @@ impl<'a> Sender<'a> {
     ///
     /// // ... send some async frames ...
     ///
-    /// // Optional: wait with timeout before drop
+    /// // Optional: wait with timeout before drop (now a no-op)
     /// sender.flush_async(Duration::from_secs(1))?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn flush_async(&self, timeout: Duration) -> Result<()> {
-        let start = Instant::now();
-
-        // Platform-specific flush behavior
-        #[cfg(target_os = "windows")]
-        {
-            // On Windows, use more conservative synchronization
-            std::sync::atomic::fence(Ordering::SeqCst);
-
-            let mut sleep_ms = 1;
-            const MAX_SLEEP_MS: u64 = 20; // Higher max sleep on Windows
-
-            while self.inner.in_flight.load(Ordering::SeqCst) > 0 {
-                if start.elapsed() > timeout {
-                    return Err(Error::Timeout(format!(
-                        "Async operations did not complete within {:?}",
-                        timeout
-                    )));
-                }
-
-                // On Windows, prefer sleeping over spinning to avoid tight loops
-                thread::sleep(Duration::from_millis(sleep_ms));
-                sleep_ms = (sleep_ms * 2).min(MAX_SLEEP_MS);
-            }
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            // Original implementation for other platforms
-            let mut spin_count = 0;
-            let mut sleep_ms = 1;
-            const MAX_SPIN: u32 = 100;
-            const MAX_SLEEP_MS: u64 = 10;
-
-            while self.inner.in_flight.load(Ordering::Acquire) > 0 {
-                if start.elapsed() > timeout {
-                    return Err(Error::Timeout(format!(
-                        "Async operations did not complete within {:?}",
-                        timeout
-                    )));
-                }
-
-                if spin_count < MAX_SPIN {
-                    // First, spin for a bit
-                    thread::yield_now();
-                    spin_count += 1;
-                } else {
-                    // Then sleep with exponential backoff
-                    thread::sleep(Duration::from_millis(sleep_ms));
-                    sleep_ms = (sleep_ms * 2).min(MAX_SLEEP_MS);
-                }
-            }
-        }
-
+    pub fn flush_async(&self, _timeout: Duration) -> Result<()> {
+        // With single-flight semantics, there's nothing to wait for
+        // The token's borrow ensures the operation completes before reuse
         Ok(())
     }
 }
@@ -745,64 +693,8 @@ impl Drop for Inner {
         // Add a fence to ensure all previous operations are visible
         std::sync::atomic::fence(Ordering::SeqCst);
 
-        // This is called when the last Arc reference is dropped
-        // All tokens must be gone by this point
-
-        // Check in_flight with SeqCst for maximum visibility
-        let in_flight = self.in_flight.load(Ordering::SeqCst);
-
-        if in_flight > 0 {
-            eprintln!(
-                "WARNING: Inner::drop called with {} operations still in flight!",
-                in_flight
-            );
-
-            // On Windows, add a small delay to let any in-progress token drops complete
-            // This prevents racing with AsyncVideoToken::drop
-            #[cfg(target_os = "windows")]
-            thread::sleep(Duration::from_millis(10));
-
-            // Re-check after delay
-            let in_flight_after = self.in_flight.load(Ordering::SeqCst);
-
-            // Only flush if there are STILL operations in flight
-            // This avoids double-flush with AsyncVideoToken::drop
-            if in_flight_after > 0 {
-                // Send NULL frame to flush per NDI docs
-                let null_frame = NDIlib_video_frame_v2_t {
-                    p_data: std::ptr::null_mut(),
-                    xres: 0,
-                    yres: 0,
-                    FourCC: 0,
-                    frame_rate_N: 0,
-                    frame_rate_D: 0,
-                    picture_aspect_ratio: 0.0,
-                    frame_format_type: 0,
-                    timecode: 0,
-                    __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
-                        line_stride_in_bytes: 0,
-                    },
-                    p_metadata: std::ptr::null(),
-                    timestamp: 0,
-                };
-
-                // On Windows, serialize flush operations to prevent deadlock
-                #[cfg(target_os = "windows")]
-                {
-                    let _lock = FLUSH_MUTEX.lock().unwrap();
-                    unsafe {
-                        // This blocks until all pending async operations complete
-                        NDIlib_send_send_video_async_v2(self.instance, &null_frame);
-                    }
-                }
-
-                #[cfg(not(target_os = "windows"))]
-                unsafe {
-                    // This blocks until all pending async operations complete
-                    NDIlib_send_send_video_async_v2(self.instance, &null_frame);
-                }
-            }
-        }
+        // With the single-flight API, all tokens must be gone by this point
+        // since tokens hold a borrow of the Arc<Inner>
 
         // Now destroy the NDI instance
         unsafe {

@@ -12,12 +12,12 @@ fn main() -> Result<(), grafton_ndi::Error> {
     // Initialize NDI
     let ndi = NDI::new()?;
 
-    // Create sender
+    // Create sender (must be mutable for async sending)
     let send_options = SenderOptions::builder("AsyncExample")
         .clock_video(true)
         .clock_audio(true)
         .build()?;
-    let sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
+    let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
 
     println!("Created NDI sender: AsyncExample");
     println!("Demonstrating zero-copy async video sending with tokens...\n");

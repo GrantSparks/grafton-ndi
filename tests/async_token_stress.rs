@@ -16,7 +16,7 @@ fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
     // Shared counter for completed operations
     let completed = Arc::new(Mutex::new(0));
 
-    // Create multiple threads that send frames and drop tokens at random times
+    // Create multiple threads that send frames sequentially (single-flight API)
     let mut handles = vec![];
 
     for thread_id in 0..4 {
@@ -27,7 +27,7 @@ fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
                 .clock_video(true)
                 .clock_audio(false)
                 .build()?;
-            let sender = grafton_ndi::Sender::new(&ndi_clone, &send_options)?;
+            let mut sender = grafton_ndi::Sender::new(&ndi_clone, &send_options)?;
 
             sender.on_async_video_done(move |_len| {
                 let mut count = completed_clone.lock().unwrap();
@@ -51,11 +51,12 @@ fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
                     1,
                 );
 
+                // With the new API, we send one frame at a time
                 let token = sender.send_video_async(&borrowed_frame);
 
                 // Randomly drop the token early or hold it
                 if (frame_num + thread_id) % 3 == 0 {
-                    // Drop token immediately - this tests the race condition
+                    // Drop token immediately - this tests flush behavior
                     drop(token);
                 } else {
                     // Hold token for a bit
@@ -63,7 +64,7 @@ fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
                     drop(token);
                 }
 
-                // Occasionally yield to increase chance of race conditions
+                // Occasionally yield
                 if frame_num % 10 == 0 {
                     thread::yield_now();
                 }
@@ -95,7 +96,7 @@ fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
     ignore = "Skipping on Windows CI due to NDI runtime issues"
 )]
 fn test_immediate_sender_drop() -> Result<(), grafton_ndi::Error> {
-    // This test specifically targets the original bug
+    // This test verifies that the single-flight API prevents UB
     let ndi = NDI::new()?;
 
     for _ in 0..100 {
@@ -103,7 +104,7 @@ fn test_immediate_sender_drop() -> Result<(), grafton_ndi::Error> {
             .clock_video(true)
             .clock_audio(false)
             .build()?;
-        let sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
+        let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
 
         // Create a scope to control lifetimes
         {
@@ -111,17 +112,16 @@ fn test_immediate_sender_drop() -> Result<(), grafton_ndi::Error> {
             let borrowed_frame =
                 BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
 
-            // Send async - the token now holds Arc<Inner>
+            // Send async - the token holds borrows ensuring safety
             let _token = sender.send_video_async(&borrowed_frame);
 
             // The token and buffer must be dropped before sender
-            // This simulates the original race condition
+            // The new API prevents the buffer from being freed while the token exists
         }
 
         sender.flush_async_blocking();
 
-        // Now drop sender - this will block until the token is dropped
-        // The fix ensures this is safe by using Arc<Inner>
+        // Now drop sender - this is safe because tokens enforce proper ordering
         drop(sender);
     }
 
@@ -139,26 +139,18 @@ fn test_flush_async() -> Result<(), grafton_ndi::Error> {
         .clock_video(true)
         .clock_audio(false)
         .build()?;
-    let sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
+    let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
 
-    // Use a scope to control buffer lifetimes
-    {
-        let mut buffers = vec![];
-        let mut tokens = vec![];
+    // With single-flight API, we send frames sequentially
+    let buffers: Vec<Vec<u8>> = (0..10).map(|i| vec![i as u8; 1920 * 1080 * 4]).collect();
 
-        for i in 0..10 {
-            buffers.push(vec![i as u8; 1920 * 1080 * 4]);
-        }
-
-        // Then create tokens that borrow from buffers
-        for buffer in buffers.iter() {
-            let borrowed_frame =
-                BorrowedVideoFrame::from_buffer(buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
-            tokens.push(sender.send_video_async(&borrowed_frame));
-        }
-
-        // Drop tokens before buffers go out of scope
-        drop(tokens);
+    // Send each frame sequentially
+    for buffer in buffers.iter() {
+        let borrowed_frame =
+            BorrowedVideoFrame::from_buffer(buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
+        let token = sender.send_video_async(&borrowed_frame);
+        // Token automatically flushes on drop
+        drop(token);
     }
 
     sender.flush_async_blocking();
