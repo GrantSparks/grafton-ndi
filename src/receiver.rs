@@ -32,7 +32,9 @@ use std::{ffi::CString, ptr};
 
 use crate::{
     finder::{RawSource, Source},
-    frames::{AudioFrame, MetadataFrame, VideoFrame},
+    frames::{
+        AudioFrame, AudioFrameRef, MetadataFrame, MetadataFrameRef, VideoFrame, VideoFrameRef,
+    },
     ndi_lib::*,
     recv_guard::{RecvAudioGuard, RecvMetadataGuard, RecvVideoGuard},
     Error, Result, NDI,
@@ -608,8 +610,50 @@ impl Receiver {
         )
     }
 
-    /// Capture only video frames - safe to call from multiple threads concurrently
-    pub fn capture_video(&self, timeout_ms: u32) -> Result<Option<VideoFrame>> {
+    /// Capture a zero-copy borrowed video frame - safe to call from multiple threads concurrently.
+    ///
+    /// This returns a `VideoFrameRef` that borrows the NDI SDK's buffer directly,
+    /// avoiding any allocation or memcpy. The frame is automatically freed when dropped.
+    ///
+    /// **This is the recommended API for performance-critical applications** that can
+    /// process frames in-place. For applications that need to store frames or send them
+    /// across threads, use [`Self::capture_video`] which returns an owned `VideoFrame`.
+    ///
+    /// # Performance
+    ///
+    /// For a 1920×1080 BGRA frame:
+    /// - `capture_video_ref`: ~0 allocations, ~0 MB copied
+    /// - `capture_video`: 1-2 allocations, ~8.3 MB copied
+    ///
+    /// At 60 fps, this saves ~475 MB/s of memory bandwidth.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(frame))` - Successfully captured a zero-copy borrowed frame
+    /// * `Ok(None)` - No frame available (timeout)
+    /// * `Err(_)` - An error occurred during capture
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
+    /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+    /// // Zero-copy capture
+    /// if let Some(frame) = receiver.capture_video_ref(1000)? {
+    ///     // Process in place - no copy needed
+    ///     let pixels = frame.data();
+    ///     println!("{}×{} frame, {} bytes", frame.width(), frame.height(), pixels.len());
+    ///
+    ///     // Convert to owned if needed
+    ///     let owned = frame.to_owned()?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn capture_video_ref(&self, timeout_ms: u32) -> Result<Option<VideoFrameRef>> {
         let mut video_frame = NDIlib_video_frame_v2_t::default();
 
         // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
@@ -627,15 +671,35 @@ impl Receiver {
             NDIlib_frame_type_e_NDIlib_frame_type_video => {
                 // Create RAII guard to ensure the frame is freed
                 let guard = unsafe { RecvVideoGuard::new(self.instance, video_frame) };
-                let frame = unsafe { VideoFrame::from_raw(guard.frame()) }?;
-                // Guard is dropped here, freeing the NDI frame
-                Ok(Some(frame))
+                let frame_ref = unsafe { VideoFrameRef::new(guard) };
+                // Guard is moved into VideoFrameRef; will be freed when VideoFrameRef drops
+                Ok(Some(frame_ref))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(None),
             NDIlib_frame_type_e_NDIlib_frame_type_error => {
                 Err(Error::CaptureFailed("Received an error frame".into()))
             }
             _ => Ok(None), // Other frame types are ignored when capturing video only
+        }
+    }
+
+    /// Capture a video frame with owned data - safe to call from multiple threads concurrently.
+    ///
+    /// This returns a `VideoFrame` that owns its pixel data, allowing it to be stored
+    /// or sent across threads. The frame data is copied from the NDI SDK's buffer.
+    ///
+    /// For zero-copy capture that avoids memory allocation and copying, use
+    /// [`Self::capture_video_ref`] instead.
+    ///
+    /// # Implementation
+    ///
+    /// This method internally calls [`Self::capture_video_ref`] and converts the borrowed
+    /// frame to an owned frame via `to_owned()`, ensuring all frame handling logic is
+    /// centralized in the borrowed path.
+    pub fn capture_video(&self, timeout_ms: u32) -> Result<Option<VideoFrame>> {
+        match self.capture_video_ref(timeout_ms)? {
+            Some(frame_ref) => Ok(Some(frame_ref.to_owned()?)),
+            None => Ok(None),
         }
     }
 
@@ -767,8 +831,39 @@ impl Receiver {
         }
     }
 
-    /// Capture only audio frames - safe to call from multiple threads concurrently
-    pub fn capture_audio(&self, timeout_ms: u32) -> Result<Option<AudioFrame>> {
+    /// Capture a zero-copy borrowed audio frame - safe to call from multiple threads concurrently.
+    ///
+    /// This returns an `AudioFrameRef` that borrows the NDI SDK's buffer directly,
+    /// avoiding any allocation or memcpy. The frame is automatically freed when dropped.
+    ///
+    /// **This is the recommended API for performance-critical applications** that can
+    /// process audio in-place. For applications that need to store frames or send them
+    /// across threads, use [`Self::capture_audio`] which returns an owned `AudioFrame`.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(frame))` - Successfully captured a zero-copy borrowed frame
+    /// * `Ok(None)` - No frame available (timeout)
+    /// * `Err(_)` - An error occurred during capture
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
+    /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+    /// // Zero-copy capture
+    /// if let Some(frame) = receiver.capture_audio_ref(1000)? {
+    ///     // Process in place - no copy needed
+    ///     let samples = frame.data();
+    ///     println!("{} channels, {} samples", frame.num_channels(), frame.num_samples());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn capture_audio_ref(&self, timeout_ms: u32) -> Result<Option<AudioFrameRef>> {
         let mut audio_frame = NDIlib_audio_frame_v3_t::default();
 
         // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
@@ -786,15 +881,35 @@ impl Receiver {
             NDIlib_frame_type_e_NDIlib_frame_type_audio => {
                 // Create RAII guard to ensure the frame is freed
                 let guard = unsafe { RecvAudioGuard::new(self.instance, audio_frame) };
-                let frame = AudioFrame::from_raw(*guard.frame())?;
-                // Guard is dropped here, freeing the NDI frame
-                Ok(Some(frame))
+                let frame_ref = unsafe { AudioFrameRef::new(guard) };
+                // Guard is moved into AudioFrameRef; will be freed when AudioFrameRef drops
+                Ok(Some(frame_ref))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(None),
             NDIlib_frame_type_e_NDIlib_frame_type_error => {
                 Err(Error::CaptureFailed("Received an error frame".into()))
             }
             _ => Ok(None), // Other frame types are ignored when capturing audio only
+        }
+    }
+
+    /// Capture an audio frame with owned data - safe to call from multiple threads concurrently.
+    ///
+    /// This returns an `AudioFrame` that owns its audio data, allowing it to be stored
+    /// or sent across threads. The frame data is copied from the NDI SDK's buffer.
+    ///
+    /// For zero-copy capture that avoids memory allocation and copying, use
+    /// [`Self::capture_audio_ref`] instead.
+    ///
+    /// # Implementation
+    ///
+    /// This method internally calls [`Self::capture_audio_ref`] and converts the borrowed
+    /// frame to an owned frame via `to_owned()`, ensuring all frame handling logic is
+    /// centralized in the borrowed path.
+    pub fn capture_audio(&self, timeout_ms: u32) -> Result<Option<AudioFrame>> {
+        match self.capture_audio_ref(timeout_ms)? {
+            Some(frame_ref) => Ok(Some(frame_ref.to_owned()?)),
+            None => Ok(None),
         }
     }
 
@@ -870,8 +985,39 @@ impl Receiver {
         }
     }
 
-    /// Capture only metadata frames - safe to call from multiple threads concurrently
-    pub fn capture_metadata(&self, timeout_ms: u32) -> Result<Option<MetadataFrame>> {
+    /// Capture a zero-copy borrowed metadata frame - safe to call from multiple threads concurrently.
+    ///
+    /// This returns a `MetadataFrameRef` that borrows the NDI SDK's buffer directly,
+    /// avoiding any allocation or string copying. The frame is automatically freed when dropped.
+    ///
+    /// **This is the recommended API for performance-critical applications** that can
+    /// process metadata in-place. For applications that need to store metadata or send it
+    /// across threads, use [`Self::capture_metadata`] which returns an owned `MetadataFrame`.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(frame))` - Successfully captured a zero-copy borrowed frame
+    /// * `Ok(None)` - No frame available (timeout)
+    /// * `Err(_)` - An error occurred during capture
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
+    /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+    /// // Zero-copy capture
+    /// if let Some(frame) = receiver.capture_metadata_ref(1000)? {
+    ///     // Process in place - no copy needed
+    ///     let metadata_str = frame.data().to_string_lossy();
+    ///     println!("Metadata: {}", metadata_str);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn capture_metadata_ref(&self, timeout_ms: u32) -> Result<Option<MetadataFrameRef>> {
         let mut metadata_frame = NDIlib_metadata_frame_t::default();
 
         // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
@@ -889,15 +1035,35 @@ impl Receiver {
             NDIlib_frame_type_e_NDIlib_frame_type_metadata => {
                 // Create RAII guard to ensure the frame is freed
                 let guard = unsafe { RecvMetadataGuard::new(self.instance, metadata_frame) };
-                let frame = MetadataFrame::from_raw(guard.frame());
-                // Guard is dropped here, freeing the NDI frame
-                Ok(Some(frame))
+                let frame_ref = unsafe { MetadataFrameRef::new(guard) };
+                // Guard is moved into MetadataFrameRef; will be freed when MetadataFrameRef drops
+                Ok(Some(frame_ref))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(None),
             NDIlib_frame_type_e_NDIlib_frame_type_error => {
                 Err(Error::CaptureFailed("Received an error frame".into()))
             }
             _ => Ok(None), // Other frame types are ignored when capturing metadata only
+        }
+    }
+
+    /// Capture a metadata frame with owned data - safe to call from multiple threads concurrently.
+    ///
+    /// This returns a `MetadataFrame` that owns its string data, allowing it to be stored
+    /// or sent across threads. The frame data is copied from the NDI SDK's buffer.
+    ///
+    /// For zero-copy capture that avoids memory allocation and string copying, use
+    /// [`Self::capture_metadata_ref`] instead.
+    ///
+    /// # Implementation
+    ///
+    /// This method internally calls [`Self::capture_metadata_ref`] and converts the borrowed
+    /// frame to an owned frame via `to_owned()`, ensuring all frame handling logic is
+    /// centralized in the borrowed path.
+    pub fn capture_metadata(&self, timeout_ms: u32) -> Result<Option<MetadataFrame>> {
+        match self.capture_metadata_ref(timeout_ms)? {
+            Some(frame_ref) => Ok(Some(frame_ref.to_owned())),
+            None => Ok(None),
         }
     }
 

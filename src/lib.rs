@@ -120,8 +120,9 @@ pub use {
     error::*,
     finder::{Finder, FinderOptions, FinderOptionsBuilder, Source, SourceAddress, SourceCache},
     frames::{
-        AudioFrame, AudioFrameBuilder, AudioLayout, AudioType, FourCCVideoType, FrameFormatType,
-        LineStrideOrSize, MetadataFrame, VideoFrame, VideoFrameBuilder,
+        AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout, AudioType, FourCCVideoType,
+        FrameFormatType, LineStrideOrSize, MetadataFrame, MetadataFrameRef, VideoFrame,
+        VideoFrameBuilder, VideoFrameRef,
     },
     receiver::{
         ConnectionStats, FrameType, Receiver, ReceiverBandwidth, ReceiverColorFormat,

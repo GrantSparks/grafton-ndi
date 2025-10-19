@@ -1169,3 +1169,442 @@ pub enum ImageFormat {
     /// JPEG format with quality setting (1-100, where 100 is highest quality)
     Jpeg(u8),
 }
+
+// ============================================================================
+// Zero-copy borrowed receive frames
+// ============================================================================
+
+use crate::recv_guard::{RecvAudioGuard, RecvMetadataGuard, RecvVideoGuard};
+
+/// A zero-copy borrowed video frame.
+///
+/// This type wraps an RAII guard that owns the NDI frame buffer lifetime,
+/// exposing a safe, zero-copy view of the video data. The frame is automatically
+/// freed when dropped via `NDIlib_recv_free_video_v2`.
+///
+/// **Key characteristics:**
+/// - Zero allocations: References NDI SDK buffers directly
+/// - Zero copies: No memcpy of pixel data
+/// - RAII lifetime: Exactly one free per frame, enforced at compile time
+/// - Not `Send`: Prevents accidental cross-thread use of FFI buffers
+///
+/// # Lifetime
+///
+/// The borrowed frame's lifetime is tied to the scope in which it's captured.
+/// The underlying NDI buffer is freed when `VideoFrameRef` is dropped.
+///
+/// # Performance
+///
+/// For a 1920×1080 BGRA frame, this eliminates ~8.3 MB of memcpy compared to
+/// the owned [`VideoFrame`]. At 60 fps, this saves ~475 MB/s of memory bandwidth.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+/// # fn main() -> Result<(), grafton_ndi::Error> {
+/// # let ndi = NDI::new()?;
+/// # let source = Source { name: "Test".into(), address: SourceAddress::None };
+/// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+/// // Zero-copy capture (no allocation, no memcpy)
+/// if let Some(frame) = receiver.capture_video_ref(1000)? {
+///     println!("{}×{} frame, {} bytes", frame.width(), frame.height(), frame.data().len());
+///
+///     // Process in place - no copy needed
+///     let pixels = frame.data();
+///
+///     // Frame is freed here when `frame` goes out of scope
+/// }
+/// # Ok(())
+/// # }
+/// ```
+///
+/// To convert to an owned frame:
+///
+/// ```no_run
+/// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+/// # fn main() -> Result<(), grafton_ndi::Error> {
+/// # let ndi = NDI::new()?;
+/// # let source = Source { name: "Test".into(), address: SourceAddress::None };
+/// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+/// if let Some(frame_ref) = receiver.capture_video_ref(1000)? {
+///     // Convert to owned for storage or cross-thread use
+///     let owned = frame_ref.to_owned()?;
+///     // owned is now a VideoFrame that can be sent across threads
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub struct VideoFrameRef {
+    guard: RecvVideoGuard,
+}
+
+impl VideoFrameRef {
+    /// Create a borrowed video frame from an RAII guard.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the guard was created from a valid NDI receiver
+    /// and contains a frame populated by `NDIlib_recv_capture_v3`.
+    pub(crate) unsafe fn new(guard: RecvVideoGuard) -> Self {
+        Self { guard }
+    }
+
+    /// Get the frame width in pixels.
+    pub fn width(&self) -> i32 {
+        self.guard.frame().xres
+    }
+
+    /// Get the frame height in pixels.
+    pub fn height(&self) -> i32 {
+        self.guard.frame().yres
+    }
+
+    /// Get the pixel format (FourCC code).
+    pub fn fourcc(&self) -> FourCCVideoType {
+        #[allow(clippy::unnecessary_cast)]
+        FourCCVideoType::try_from(self.guard.frame().FourCC as u32).unwrap_or(FourCCVideoType::Max)
+    }
+
+    /// Get the frame rate numerator.
+    pub fn frame_rate_n(&self) -> i32 {
+        self.guard.frame().frame_rate_N
+    }
+
+    /// Get the frame rate denominator.
+    pub fn frame_rate_d(&self) -> i32 {
+        self.guard.frame().frame_rate_D
+    }
+
+    /// Get the picture aspect ratio.
+    pub fn picture_aspect_ratio(&self) -> f32 {
+        self.guard.frame().picture_aspect_ratio
+    }
+
+    /// Get the frame format type (progressive, interlaced, etc.).
+    pub fn frame_format_type(&self) -> FrameFormatType {
+        #[allow(clippy::unnecessary_cast)]
+        FrameFormatType::try_from(self.guard.frame().frame_format_type as u32)
+            .unwrap_or(FrameFormatType::Max)
+    }
+
+    /// Get the timecode.
+    pub fn timecode(&self) -> i64 {
+        self.guard.frame().timecode
+    }
+
+    /// Get the timestamp.
+    pub fn timestamp(&self) -> i64 {
+        self.guard.frame().timestamp
+    }
+
+    /// Get the line stride or data size.
+    pub fn line_stride_or_size(&self) -> LineStrideOrSize {
+        let fourcc = self.fourcc();
+        let is_uncompressed = is_uncompressed_format(fourcc);
+
+        if is_uncompressed {
+            let line_stride = unsafe { self.guard.frame().__bindgen_anon_1.line_stride_in_bytes };
+            LineStrideOrSize::LineStrideBytes(line_stride)
+        } else {
+            let data_size = unsafe { self.guard.frame().__bindgen_anon_1.data_size_in_bytes };
+            LineStrideOrSize::DataSizeBytes(data_size)
+        }
+    }
+
+    /// Get the metadata as a `CStr`, if present.
+    pub fn metadata(&self) -> Option<&CStr> {
+        let p_metadata = self.guard.frame().p_metadata;
+        if p_metadata.is_null() {
+            None
+        } else {
+            Some(unsafe { CStr::from_ptr(p_metadata) })
+        }
+    }
+
+    /// Get a zero-copy view of the frame data.
+    ///
+    /// This returns a slice directly into the NDI SDK's buffer.
+    /// No allocation or memcpy is performed.
+    pub fn data(&self) -> &[u8] {
+        let frame = self.guard.frame();
+
+        if frame.p_data.is_null() {
+            return &[];
+        }
+
+        let fourcc = self.fourcc();
+        let is_uncompressed = is_uncompressed_format(fourcc);
+
+        let data_size = if is_uncompressed {
+            let line_stride = unsafe { frame.__bindgen_anon_1.line_stride_in_bytes };
+            if line_stride > 0 && frame.yres > 0 {
+                (line_stride as usize) * (frame.yres as usize)
+            } else {
+                0
+            }
+        } else {
+            let size = unsafe { frame.__bindgen_anon_1.data_size_in_bytes };
+            if size > 0 {
+                size as usize
+            } else {
+                0
+            }
+        };
+
+        if data_size == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(frame.p_data, data_size) }
+        }
+    }
+
+    /// Convert this borrowed frame to an owned `VideoFrame`.
+    ///
+    /// This performs a single memcpy of the frame data and metadata,
+    /// allowing the frame to outlive the NDI buffer and be sent across threads.
+    pub fn to_owned(&self) -> Result<VideoFrame> {
+        unsafe { VideoFrame::from_raw(self.guard.frame()) }
+    }
+}
+
+impl fmt::Debug for VideoFrameRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VideoFrameRef")
+            .field("width", &self.width())
+            .field("height", &self.height())
+            .field("fourcc", &self.fourcc())
+            .field("frame_rate_n", &self.frame_rate_n())
+            .field("frame_rate_d", &self.frame_rate_d())
+            .field("picture_aspect_ratio", &self.picture_aspect_ratio())
+            .field("frame_format_type", &self.frame_format_type())
+            .field("timecode", &self.timecode())
+            .field("data (bytes)", &self.data().len())
+            .field("line_stride_or_size", &self.line_stride_or_size())
+            .field("metadata", &self.metadata())
+            .field("timestamp", &self.timestamp())
+            .finish()
+    }
+}
+
+/// A zero-copy borrowed audio frame.
+///
+/// This type wraps an RAII guard that owns the NDI frame buffer lifetime,
+/// exposing a safe, zero-copy view of the audio data. The frame is automatically
+/// freed when dropped via `NDIlib_recv_free_audio_v3`.
+///
+/// **Key characteristics:**
+/// - Zero allocations: References NDI SDK buffers directly
+/// - Zero copies: No memcpy of audio samples
+/// - RAII lifetime: Exactly one free per frame, enforced at compile time
+/// - Not `Send`: Prevents accidental cross-thread use of FFI buffers
+///
+/// # Examples
+///
+/// ```no_run
+/// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+/// # fn main() -> Result<(), grafton_ndi::Error> {
+/// # let ndi = NDI::new()?;
+/// # let source = Source { name: "Test".into(), address: SourceAddress::None };
+/// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+/// // Zero-copy capture
+/// if let Some(frame) = receiver.capture_audio_ref(1000)? {
+///     println!("{} channels, {} samples", frame.num_channels(), frame.num_samples());
+///
+///     // Process in place - no copy needed
+///     let samples = frame.data();
+///
+///     // Frame is freed here when `frame` goes out of scope
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub struct AudioFrameRef {
+    guard: RecvAudioGuard,
+}
+
+impl AudioFrameRef {
+    /// Create a borrowed audio frame from an RAII guard.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the guard was created from a valid NDI receiver
+    /// and contains a frame populated by `NDIlib_recv_capture_v3`.
+    pub(crate) unsafe fn new(guard: RecvAudioGuard) -> Self {
+        Self { guard }
+    }
+
+    /// Get the sample rate in Hz.
+    pub fn sample_rate(&self) -> i32 {
+        self.guard.frame().sample_rate
+    }
+
+    /// Get the number of audio channels.
+    pub fn num_channels(&self) -> i32 {
+        self.guard.frame().no_channels
+    }
+
+    /// Get the number of samples per channel.
+    pub fn num_samples(&self) -> i32 {
+        self.guard.frame().no_samples
+    }
+
+    /// Get the timecode.
+    pub fn timecode(&self) -> i64 {
+        self.guard.frame().timecode
+    }
+
+    /// Get the timestamp.
+    pub fn timestamp(&self) -> i64 {
+        self.guard.frame().timestamp
+    }
+
+    /// Get the audio format (FourCC code).
+    pub fn fourcc(&self) -> AudioType {
+        match self.guard.frame().FourCC {
+            NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP => AudioType::FLTP,
+            _ => AudioType::Max,
+        }
+    }
+
+    /// Get the channel stride in bytes.
+    pub fn channel_stride_in_bytes(&self) -> i32 {
+        unsafe { self.guard.frame().__bindgen_anon_1.channel_stride_in_bytes }
+    }
+
+    /// Get the metadata as a `CStr`, if present.
+    pub fn metadata(&self) -> Option<&CStr> {
+        let p_metadata = self.guard.frame().p_metadata;
+        if p_metadata.is_null() {
+            None
+        } else {
+            Some(unsafe { CStr::from_ptr(p_metadata) })
+        }
+    }
+
+    /// Get a zero-copy view of the audio data as 32-bit floats.
+    ///
+    /// This returns a slice directly into the NDI SDK's buffer.
+    /// No allocation or memcpy is performed.
+    pub fn data(&self) -> &[f32] {
+        let frame = self.guard.frame();
+
+        if frame.p_data.is_null() {
+            return &[];
+        }
+
+        let sample_count = (frame.no_samples * frame.no_channels) as usize;
+        if sample_count == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(frame.p_data as *const f32, sample_count) }
+        }
+    }
+
+    /// Convert this borrowed frame to an owned `AudioFrame`.
+    ///
+    /// This performs a single memcpy of the audio data and metadata,
+    /// allowing the frame to outlive the NDI buffer and be sent across threads.
+    pub fn to_owned(&self) -> Result<AudioFrame> {
+        AudioFrame::from_raw(*self.guard.frame())
+    }
+}
+
+impl fmt::Debug for AudioFrameRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AudioFrameRef")
+            .field("sample_rate", &self.sample_rate())
+            .field("num_channels", &self.num_channels())
+            .field("num_samples", &self.num_samples())
+            .field("timecode", &self.timecode())
+            .field("fourcc", &self.fourcc())
+            .field("data (samples)", &self.data().len())
+            .field("channel_stride_in_bytes", &self.channel_stride_in_bytes())
+            .field("metadata", &self.metadata())
+            .field("timestamp", &self.timestamp())
+            .finish()
+    }
+}
+
+/// A zero-copy borrowed metadata frame.
+///
+/// This type wraps an RAII guard that owns the NDI frame buffer lifetime,
+/// exposing a safe, zero-copy view of the metadata string. The frame is automatically
+/// freed when dropped via `NDIlib_recv_free_metadata`.
+///
+/// **Key characteristics:**
+/// - Zero allocations: References NDI SDK buffers directly
+/// - Zero copies: No string duplication
+/// - RAII lifetime: Exactly one free per frame, enforced at compile time
+/// - Not `Send`: Prevents accidental cross-thread use of FFI buffers
+///
+/// # Examples
+///
+/// ```no_run
+/// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+/// # fn main() -> Result<(), grafton_ndi::Error> {
+/// # let ndi = NDI::new()?;
+/// # let source = Source { name: "Test".into(), address: SourceAddress::None };
+/// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+/// // Zero-copy capture
+/// if let Some(frame) = receiver.capture_metadata_ref(1000)? {
+///     println!("Metadata: {}", frame.data().to_string_lossy());
+///
+///     // Frame is freed here when `frame` goes out of scope
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub struct MetadataFrameRef {
+    guard: RecvMetadataGuard,
+}
+
+impl MetadataFrameRef {
+    /// Create a borrowed metadata frame from an RAII guard.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the guard was created from a valid NDI receiver
+    /// and contains a frame populated by `NDIlib_recv_capture_v3`.
+    pub(crate) unsafe fn new(guard: RecvMetadataGuard) -> Self {
+        Self { guard }
+    }
+
+    /// Get the timecode.
+    pub fn timecode(&self) -> i64 {
+        self.guard.frame().timecode
+    }
+
+    /// Get a zero-copy view of the metadata as a `CStr`.
+    ///
+    /// This returns a reference directly into the NDI SDK's buffer.
+    /// No allocation or string copying is performed.
+    ///
+    /// Returns an empty `CStr` if the metadata pointer is null.
+    pub fn data(&self) -> &CStr {
+        let p_data = self.guard.frame().p_data;
+        if p_data.is_null() {
+            // Return empty CStr for null pointer
+            unsafe { CStr::from_bytes_with_nul_unchecked(b"\0") }
+        } else {
+            unsafe { CStr::from_ptr(p_data) }
+        }
+    }
+
+    /// Convert this borrowed frame to an owned `MetadataFrame`.
+    ///
+    /// This performs a string copy, allowing the frame to outlive
+    /// the NDI buffer and be sent across threads.
+    pub fn to_owned(&self) -> MetadataFrame {
+        MetadataFrame::from_raw(self.guard.frame())
+    }
+}
+
+impl fmt::Debug for MetadataFrameRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MetadataFrameRef")
+            .field("data", &self.data())
+            .field("timecode", &self.timecode())
+            .finish()
+    }
+}
