@@ -1,10 +1,12 @@
 //! Example demonstrating zero-copy async video sending with tokens
 
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
-
 use grafton_ndi::{BorrowedVideoFrame, FourCCVideoType, SenderOptions, NDI};
+
+use std::{
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
 fn main() -> Result<(), grafton_ndi::Error> {
     // Initialize NDI
@@ -29,7 +31,6 @@ fn main() -> Result<(), grafton_ndi::Error> {
         let _ = tx.send(len);
     });
 
-    // Example 1: Video async send
     println!("=== Video Async Send ===");
     {
         let mut video_buffer = vec![0u8; 1920 * 1080 * 4];
@@ -66,7 +67,6 @@ fn main() -> Result<(), grafton_ndi::Error> {
         }
     }
 
-    // Example 2: Multiple video frames
     println!("=== Multiple Video Frames ===");
     {
         let mut buffers = vec![vec![0u8; 1920 * 1080 * 4]; 3];

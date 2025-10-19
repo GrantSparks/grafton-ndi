@@ -5,8 +5,10 @@
 //!
 //! Run with: `cargo run --example NDIlib_Send_Audio`
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use grafton_ndi::{AudioFrame, Error, Sender, SenderOptions, NDI};
 
@@ -58,7 +60,7 @@ fn main() -> Result<(), Error> {
         sender.send_audio(&audio_frame);
 
         // Display progress
-        println!("Frame number {} sent.", idx);
+        println!("Frame number {idx} sent.");
     }
 
     Ok(())

@@ -308,7 +308,6 @@ impl<'a> Sender<'a> {
 
         let instance = unsafe { NDIlib_send_create(&c_settings) };
         if instance.is_null() {
-            // Clean up on error
             unsafe {
                 let _ = CString::from_raw(p_ndi_name_raw);
                 if !p_groups.is_null() {
@@ -381,7 +380,6 @@ impl<'a> Sender<'a> {
                 }
                 */
 
-                // For now, clean up the Arc since we can't register the callback
                 let _ = unsafe { Arc::from_raw(raw_inner as *const Inner) };
                 inner.callback_ptr.store(ptr::null_mut(), Ordering::Release);
             }

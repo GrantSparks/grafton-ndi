@@ -61,7 +61,6 @@ fn test_ndi_dll_availability() {
             }
         } else {
             println!("✅ OK");
-            // Clean up
             unsafe { FreeLibrary(handle) };
         }
     }

@@ -52,7 +52,7 @@ fn main() {
     };
 
     // Construct the include path and header file location.
-    let ndi_include_path = format!("{}/include", ndi_sdk_path);
+    let ndi_include_path = format!("{ndi_sdk_path}/include");
 
     // Create wrapper.h in OUT_DIR for bindgen
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR environment variable not set");
@@ -69,7 +69,7 @@ fn main() {
 
         let mut found_header = None;
         for header in &possible_headers {
-            let header_path = format!("{}/{}", ndi_include_path, header);
+            let header_path = format!("{ndi_include_path}/{header}");
             if Path::new(&header_path).exists() {
                 found_header = Some(header.to_string());
                 break;
@@ -78,8 +78,7 @@ fn main() {
 
         found_header.unwrap_or_else(|| {
             panic!(
-                "NDI header file not found in {}. Searched for: {:?}",
-                ndi_include_path, possible_headers
+                "NDI header file not found in {ndi_include_path}. Searched for: {possible_headers:?}"
             )
         })
     };
@@ -93,9 +92,8 @@ fn main() {
 // including NDIlib_send_set_video_async_completion (available in NDI Advanced SDK)
 
 // Include the main NDI header
-#include <{}>
-"#,
-        header_file
+#include <{header_file}>
+"#
     );
     std::fs::write(&wrapper_path, wrapper_content).expect("Failed to create wrapper.h");
 
@@ -129,8 +127,8 @@ fn main() {
         } else {
             "x86"
         };
-        let lib_path = format!("{}\\lib\\{}", ndi_sdk_path, lib_subdir);
-        println!("cargo:rustc-link-search=native={}", lib_path);
+        let lib_path = format!("{ndi_sdk_path}\\lib\\{lib_subdir}");
+        println!("cargo:rustc-link-search=native={lib_path}");
     } else if cfg!(target_os = "linux") {
         // For Linux, detect the architecture and find the appropriate library directory
         let target = env::var("TARGET").expect("TARGET environment variable not set");
@@ -163,47 +161,45 @@ fn main() {
             ]
         } else {
             panic!(
-                "Unsupported Linux architecture: {}. Please set NDI_SDK_DIR to point to your NDI SDK installation and ensure the architecture-specific library directory exists.",
-                target
+                "Unsupported Linux architecture: {target}. Please set NDI_SDK_DIR to point to your NDI SDK installation and ensure the architecture-specific library directory exists."
             );
         };
 
         // Find the first architecture directory that exists
-        let lib_base = format!("{}/lib", ndi_sdk_path);
+        let lib_base = format!("{ndi_sdk_path}/lib");
         let lib_path = arch_dirs
             .iter()
-            .map(|arch| format!("{}/{}", lib_base, arch))
+            .map(|arch| format!("{lib_base}/{arch}"))
             .find(|path| Path::new(path).exists())
             .unwrap_or_else(|| {
+                let searched = arch_dirs.iter().map(|arch| format!("{lib_base}/{arch}")).collect::<Vec<_>>();
                 panic!(
-                    "NDI SDK library directory not found for architecture: {}. Searched in: {:?}. \
-                    Please ensure the NDI SDK is installed correctly or set NDI_SDK_DIR to the correct location.",
-                    target,
-                    arch_dirs.iter().map(|arch| format!("{}/{}", lib_base, arch)).collect::<Vec<_>>()
+                    "NDI SDK library directory not found for architecture: {target}. Searched in: {searched:?}. \
+                    Please ensure the NDI SDK is installed correctly or set NDI_SDK_DIR to the correct location."
                 )
             });
 
-        println!("cargo:rustc-link-search=native={}", lib_path);
+        println!("cargo:rustc-link-search=native={lib_path}");
     } else if cfg!(target_os = "macos") {
         // For macOS, add the library search path
         // NDI SDK on macOS often has libraries in lib/macOS subdirectory
-        let lib_macos = format!("{}/lib/macOS", ndi_sdk_path);
-        let lib_base = format!("{}/lib", ndi_sdk_path);
+        let lib_macos = format!("{ndi_sdk_path}/lib/macOS");
+        let lib_base = format!("{ndi_sdk_path}/lib");
 
         if Path::new(&lib_macos).exists() {
-            println!("cargo:rustc-link-search=native={}", lib_macos);
+            println!("cargo:rustc-link-search=native={lib_macos}");
         } else {
-            println!("cargo:rustc-link-search=native={}", lib_base);
+            println!("cargo:rustc-link-search=native={lib_base}");
         }
     }
 
     // Inform Cargo about the library to link against.
-    println!("cargo:rustc-link-lib={}={}", link_type, lib_name);
+    println!("cargo:rustc-link-lib={link_type}={lib_name}");
 
     // Generate the bindings using bindgen.
     let bindings = bindgen::Builder::default()
         .header(main_header)
-        .clang_arg(format!("-I{}", ndi_include_path))
+        .clang_arg(format!("-I{ndi_include_path}"))
         .derive_default(true)
         .generate()
         .expect("Unable to generate bindings");

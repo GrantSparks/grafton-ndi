@@ -42,11 +42,12 @@
 //! # }
 //! ```
 
+use std::sync::Arc;
+
 use crate::{
     frames::{AudioFrame, MetadataFrame, VideoFrame},
     Receiver, Result,
 };
-use std::sync::Arc;
 
 #[cfg(feature = "tokio")]
 pub mod tokio {

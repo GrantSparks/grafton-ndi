@@ -1,13 +1,13 @@
 //! Frame types for video, audio, and metadata.
 
+use num_enum::{IntoPrimitive, TryFromPrimitive};
+
 use std::{
     ffi::{CStr, CString},
     fmt,
     os::raw::c_char,
     ptr, slice,
 };
-
-use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 use crate::{ndi_lib::*, Error, Result};
 
@@ -88,12 +88,11 @@ pub union LineStrideOrSize {
 
 impl fmt::Debug for LineStrideOrSize {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // For debugging purposes, we'll assume that we're interested in `line_stride_in_bytes`
         unsafe {
+            let line_stride_in_bytes = self.line_stride_in_bytes;
             write!(
                 f,
-                "LineStrideOrSize {{ line_stride_in_bytes: {} }}",
-                self.line_stride_in_bytes
+                "LineStrideOrSize {{ line_stride_in_bytes: {line_stride_in_bytes} }}"
             )
         }
     }
@@ -250,9 +249,9 @@ impl VideoFrame {
             FourCCVideoType::RGBA | FourCCVideoType::RGBX => 4,
             FourCCVideoType::BGRA | FourCCVideoType::BGRX => 4,
             _ => {
+                let fourcc = self.fourcc;
                 return Err(Error::InvalidFrame(format!(
-                    "Unsupported format for PNG encoding: {:?}. Only RGBA/RGBX/BGRA/BGRX are supported.",
-                    self.fourcc
+                    "Unsupported format for PNG encoding: {fourcc:?}. Only RGBA/RGBX/BGRA/BGRX are supported."
                 )));
             }
         };
@@ -263,9 +262,8 @@ impl VideoFrame {
 
         if actual_stride != expected_stride {
             return Err(Error::InvalidFrame(format!(
-                "Line stride ({}) doesn't match width * {} ({}). \
-                 Row padding is not supported for image encoding.",
-                actual_stride, bytes_per_pixel, expected_stride
+                "Line stride ({actual_stride}) doesn't match width * {bytes_per_pixel} ({expected_stride}). \
+                 Row padding is not supported for image encoding."
             )));
         }
 
@@ -295,7 +293,7 @@ impl VideoFrame {
         encoder
             .write_header()
             .and_then(|mut writer| writer.write_image_data(&rgba_data))
-            .map_err(|e| Error::InvalidFrame(format!("PNG encoding failed: {}", e)))?;
+            .map_err(|e| Error::InvalidFrame(format!("PNG encoding failed: {e}")))?;
 
         Ok(png_data)
     }
@@ -349,9 +347,9 @@ impl VideoFrame {
             FourCCVideoType::RGBA | FourCCVideoType::RGBX => 4,
             FourCCVideoType::BGRA | FourCCVideoType::BGRX => 4,
             _ => {
+                let fourcc = self.fourcc;
                 return Err(Error::InvalidFrame(format!(
-                    "Unsupported format for JPEG encoding: {:?}. Only RGBA/RGBX/BGRA/BGRX are supported.",
-                    self.fourcc
+                    "Unsupported format for JPEG encoding: {fourcc:?}. Only RGBA/RGBX/BGRA/BGRX are supported."
                 )));
             }
         };
@@ -362,9 +360,8 @@ impl VideoFrame {
 
         if actual_stride != expected_stride {
             return Err(Error::InvalidFrame(format!(
-                "Line stride ({}) doesn't match width * {} ({}). \
-                 Row padding is not supported for image encoding.",
-                actual_stride, bytes_per_pixel, expected_stride
+                "Line stride ({actual_stride}) doesn't match width * {bytes_per_pixel} ({expected_stride}). \
+                 Row padding is not supported for image encoding."
             )));
         }
 
@@ -397,7 +394,7 @@ impl VideoFrame {
                 self.height as u16,
                 JpegColorType::Rgb,
             )
-            .map_err(|e| Error::InvalidFrame(format!("JPEG encoding failed: {}", e)))?;
+            .map_err(|e| Error::InvalidFrame(format!("JPEG encoding failed: {e}")))?;
 
         Ok(jpeg_data)
     }
@@ -445,7 +442,7 @@ impl VideoFrame {
         };
 
         let base64_data = STANDARD.encode(&image_bytes);
-        Ok(format!("data:{};base64,{}", mime_type, base64_data))
+        Ok(format!("data:{mime_type};base64,{base64_data}"))
     }
 
     /// Creates a `VideoFrame` from a raw NDI video frame with owned data.
@@ -488,8 +485,7 @@ impl VideoFrame {
                     )
                 } else {
                     return Err(Error::InvalidFrame(format!(
-                        "Invalid calculated size {} for uncompressed format",
-                        calculated_size
+                        "Invalid calculated size {calculated_size} for uncompressed format"
                     )));
                 }
             } else if !is_uncompressed && data_size_in_bytes > 0 {
@@ -733,23 +729,23 @@ impl AudioFrame {
         }
 
         if raw.sample_rate <= 0 {
+            let sample_rate = raw.sample_rate;
             return Err(Error::InvalidFrame(format!(
-                "Invalid sample rate: {}",
-                raw.sample_rate
+                "Invalid sample rate: {sample_rate}"
             )));
         }
 
         if raw.no_channels <= 0 {
+            let no_channels = raw.no_channels;
             return Err(Error::InvalidFrame(format!(
-                "Invalid number of channels: {}",
-                raw.no_channels
+                "Invalid number of channels: {no_channels}"
             )));
         }
 
         if raw.no_samples <= 0 {
+            let no_samples = raw.no_samples;
             return Err(Error::InvalidFrame(format!(
-                "Invalid number of samples: {}",
-                raw.no_samples
+                "Invalid number of samples: {no_samples}"
             )));
         }
 

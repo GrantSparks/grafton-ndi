@@ -4,11 +4,11 @@ fn test_ndi_environment() {
 
     // Print environment variables
     if let Ok(sdk_dir) = std::env::var("NDI_SDK_DIR") {
-        println!("NDI_SDK_DIR: {}", sdk_dir);
+        println!("NDI_SDK_DIR: {sdk_dir}");
 
         // Check if DLL directory exists
-        let dll_path = format!("{}\\Bin\\x64", sdk_dir);
-        println!("Checking DLL path: {}", dll_path);
+        let dll_path = format!("{sdk_dir}\\Bin\\x64");
+        println!("Checking DLL path: {dll_path}");
 
         if std::path::Path::new(&dll_path).exists() {
             println!("✓ DLL directory exists");
@@ -19,7 +19,7 @@ fn test_ndi_environment() {
                 for entry in entries.flatten() {
                     if let Some(name) = entry.file_name().to_str() {
                         if name.ends_with(".dll") {
-                            println!("  - {}", name);
+                            println!("  - {name}");
                         }
                     }
                 }
@@ -36,7 +36,7 @@ fn test_ndi_environment() {
         println!("\nPATH contains NDI references:");
         for p in path.split(';') {
             if p.to_lowercase().contains("ndi") {
-                println!("  - {}", p);
+                println!("  - {p}");
             }
         }
     }
@@ -47,8 +47,8 @@ fn test_ndi_environment() {
     // Try to get version without initializing
     println!("\nAttempting to get NDI version...");
     match grafton_ndi::NDI::version() {
-        Ok(v) => println!("NDI Version: {}", v),
-        Err(e) => println!("Failed to get version: {}", e),
+        Ok(v) => println!("NDI Version: {v}"),
+        Err(e) => println!("Failed to get version: {e}"),
     }
 
     println!("=== End Diagnostics ===");
@@ -73,7 +73,7 @@ fn test_ndi_init_with_timeout() {
                 tx.send(Ok(())).unwrap();
             }
             Err(e) => {
-                println!("Thread: NDI initialization failed: {}", e);
+                println!("Thread: NDI initialization failed: {e}");
                 tx.send(Err(e)).unwrap();
             }
         }
@@ -82,7 +82,7 @@ fn test_ndi_init_with_timeout() {
     // Wait for up to 10 seconds
     match rx.recv_timeout(Duration::from_secs(10)) {
         Ok(Ok(())) => println!("Main: NDI initialized successfully"),
-        Ok(Err(e)) => println!("Main: NDI initialization failed: {}", e),
+        Ok(Err(e)) => println!("Main: NDI initialization failed: {e}"),
         Err(_) => {
             println!("Main: NDI initialization timed out after 10 seconds!");
             println!("This suggests NDIlib_initialize() is hanging.");

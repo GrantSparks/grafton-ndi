@@ -18,7 +18,7 @@ fn create_test_video_frame(
     let mut frame: NDIlib_video_frame_v2_t = unsafe { std::mem::zeroed() };
     frame.xres = width;
     frame.yres = height;
-    frame.FourCC = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA; // Set to BGRA
+    frame.FourCC = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA;
 
     // Set the union field based on which value is provided
     if line_stride > 0 {
@@ -27,7 +27,6 @@ fn create_test_video_frame(
         frame.__bindgen_anon_1.data_size_in_bytes = data_size;
     }
 
-    // Allocate dummy data
     let actual_size = if line_stride > 0 {
         (line_stride * height) as usize
     } else {
@@ -35,31 +34,26 @@ fn create_test_video_frame(
     };
     let mut data = vec![0u8; actual_size];
     frame.p_data = data.as_mut_ptr();
-    std::mem::forget(data); // Prevent deallocation during test
+    std::mem::forget(data);
 
     frame
 }
 
 #[test]
 fn test_video_frame_standard_format_size_calculation() {
-    // Test standard video format with line stride
     let test_width = 1920;
     let test_height = 1080;
-    let bytes_per_pixel = 4; // RGBA
+    let bytes_per_pixel = 4;
     let line_stride = test_width * bytes_per_pixel;
 
     let c_frame = create_test_video_frame(test_width, test_height, line_stride, 0);
 
-    // The from_raw function should calculate size as line_stride * height
-    // Previously it would incorrectly multiply data_size_in_bytes * height
     unsafe {
         let frame = VideoFrame::from_raw(&c_frame).unwrap();
 
-        // Expected size is line_stride * height
         let expected_size = (line_stride * test_height) as usize;
         assert_eq!(frame.data.len(), expected_size);
 
-        // Clean up
         drop(frame);
         Vec::from_raw_parts(c_frame.p_data, expected_size, expected_size);
     }
@@ -67,21 +61,11 @@ fn test_video_frame_standard_format_size_calculation() {
 
 #[test]
 fn test_video_frame_size_calculation_logic() {
-    // Test the size calculation logic without relying on union behavior
-    // This is a simplified test that verifies the fix prevents the original bug
+    // CORRECTNESS: Verify size calculation uses line_stride * height for standard formats
+    // and data_size_in_bytes directly for compressed formats, preventing over-allocation
 
-    // The original bug was: data_size = data_size_in_bytes * yres
-    // This would cause massive over-allocation
-
-    // For a 1920x1080 RGBA frame:
-    // Correct: line_stride (1920*4) * height (1080) = 8,294,400 bytes
-    // Bug would calculate: some_value * 1080 (potentially huge)
-
-    let correct_size = 1920 * 4 * 1080; // 8,294,400 bytes
-    assert!(correct_size < 10_000_000); // Should be under 10MB
-
-    // The fix ensures we use line_stride * height for standard formats
-    // and data_size_in_bytes directly for compressed formats
+    let correct_size = 1920 * 4 * 1080;
+    assert!(correct_size < 10_000_000);
 }
 
 #[test]
@@ -126,24 +110,21 @@ fn test_video_frame_zero_size_returns_error() {
 
 #[test]
 fn test_audio_frame_drop_no_double_free() {
-    // Test that AudioFrame can be created and dropped without issues
     let frame1 = AudioFrame::builder().build().unwrap();
-    drop(frame1); // Should not panic or cause double-free
+    drop(frame1);
 
-    // Test with metadata
     let frame2 = AudioFrame::builder()
         .metadata("test metadata")
         .build()
         .unwrap();
-    drop(frame2); // Should not panic
+    drop(frame2);
 }
 
 #[test]
 fn test_audio_frame_channel_data_interleaved() {
     use crate::AudioLayout;
 
-    // Test with interleaved stereo data
-    let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 3 samples, 2 channels interleaved
+    let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
     let frame = AudioFrame::builder()
         .sample_rate(48000)
         .channels(2)
@@ -161,7 +142,6 @@ fn test_audio_frame_channel_data_interleaved() {
     let ch1 = frame.channel_data(1).unwrap();
     assert_eq!(ch1, vec![2.0, 4.0, 6.0]);
 
-    // Out of bounds should return None
     assert!(frame.channel_data(2).is_none());
 }
 
@@ -169,8 +149,7 @@ fn test_audio_frame_channel_data_interleaved() {
 fn test_audio_frame_channel_data_planar() {
     use crate::AudioLayout;
 
-    // Test with planar stereo data
-    let data = vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0]; // 3 samples, 2 channels planar
+    let data = vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0];
     let frame = AudioFrame::builder()
         .sample_rate(48000)
         .channels(2)
@@ -180,7 +159,6 @@ fn test_audio_frame_channel_data_planar() {
         .build()
         .unwrap();
 
-    // Verify channel_stride_in_bytes is set correctly (3 samples * 4 bytes/sample = 12)
     assert_eq!(frame.channel_stride_in_bytes, 12);
 
     let ch0 = frame.channel_data(0).unwrap();
@@ -189,13 +167,11 @@ fn test_audio_frame_channel_data_planar() {
     let ch1 = frame.channel_data(1).unwrap();
     assert_eq!(ch1, vec![2.0, 4.0, 6.0]);
 
-    // Out of bounds should return None
     assert!(frame.channel_data(2).is_none());
 }
 
 #[test]
 fn test_audio_frame_default_layout() {
-    // Test that default layout is Planar
     let frame = AudioFrame::builder()
         .sample_rate(48000)
         .channels(2)
@@ -203,7 +179,6 @@ fn test_audio_frame_default_layout() {
         .build()
         .unwrap();
 
-    // Default should be planar: 100 samples * 4 bytes = 400
     assert_eq!(frame.channel_stride_in_bytes, 400);
 }
 
@@ -234,14 +209,12 @@ fn test_audio_frame_builder() {
     assert_eq!(frame.sample_rate, 48000);
     assert_eq!(frame.num_channels, 2);
     assert_eq!(frame.num_samples, 1024);
-    assert_eq!(frame.data().len(), 2048); // 1024 samples * 2 channels
-                                          // Default layout is planar: 1024 samples * 4 bytes = 4096
+    assert_eq!(frame.data().len(), 2048);
     assert_eq!(frame.channel_stride_in_bytes, 4096);
 }
 
 #[test]
 fn test_recv_status_creation() {
-    // Test ReceiverStatus with tally
     let status = ReceiverStatus {
         tally: Some(Tally::new(true, false)),
         connections: Some(3),
@@ -255,7 +228,6 @@ fn test_recv_status_creation() {
     assert_eq!(status.connections, Some(3));
     assert!(!status.other);
 
-    // Test ReceiverStatus with other changes
     let status2 = ReceiverStatus {
         tally: None,
         connections: None,
@@ -284,65 +256,50 @@ fn test_tally_to_raw() {
 
 #[test]
 fn test_async_completion_handler() {
-    use std::sync::mpsc;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
 
-    // Test that completion callback mechanism works
     let (tx, rx) = mpsc::channel();
     let tx = Arc::new(Mutex::new(tx));
 
     let handler = Box::new(move |slice: &mut [u8]| {
-        // Verify we got a valid slice
         assert!(!slice.is_empty());
-        // Signal completion
         let _ = tx.lock().unwrap().send(slice.len());
     });
 
-    // Simulate buffer
     let mut buffer = vec![0u8; 1024];
     let buffer_ptr = buffer.as_mut_ptr();
     let buffer_len = buffer.len();
 
-    // Call the handler as if NDI completed
     unsafe {
         let slice = std::slice::from_raw_parts_mut(buffer_ptr, buffer_len);
         handler(slice);
     }
 
-    // Verify callback was called
     assert_eq!(rx.recv().unwrap(), 1024);
 }
 
 #[test]
 fn test_retry_logic_constants() {
-    // Test that retry methods use reasonable timeout and sleep values
-    // This validates the constants are within expected ranges
+    // PERF: Validate retry timeout and sleep values for non-blocking behavior
 
-    // Per-attempt timeout should be reasonable (100ms in implementation)
     let per_attempt_timeout_ms = 100;
     assert!((10..=1000).contains(&per_attempt_timeout_ms));
 
-    // Sleep between retries should be brief (10ms in implementation)
     let sleep_between_retries_ms = 10;
     assert!((1..=100).contains(&sleep_between_retries_ms));
-
-    // These constants ensure non-blocking behavior without excessive CPU usage
 }
 
 #[test]
 fn test_timeout_duration_calculation() {
-    // Verify timeout duration conversion works correctly
     let timeout_ms: u32 = 5000;
     let timeout_duration = std::time::Duration::from_millis(timeout_ms.into());
     assert_eq!(timeout_duration.as_millis(), 5000);
 
-    // Edge case: very short timeout
     let short_timeout_ms: u32 = 100;
     let short_duration = std::time::Duration::from_millis(short_timeout_ms.into());
     assert_eq!(short_duration.as_millis(), 100);
 
-    // Edge case: long timeout
-    let long_timeout_ms: u32 = 60_000; // 1 minute
+    let long_timeout_ms: u32 = 60_000;
     let long_duration = std::time::Duration::from_millis(long_timeout_ms.into());
     assert_eq!(long_duration.as_millis(), 60_000);
 }
@@ -351,21 +308,18 @@ fn test_timeout_duration_calculation() {
 fn test_source_address_contains_host() {
     use crate::finder::SourceAddress;
 
-    // Test IP address matching
     let ip_addr = SourceAddress::Ip("192.168.1.100:5960".to_string());
     assert!(ip_addr.contains_host("192.168.1.100"));
     assert!(ip_addr.contains_host("192.168.1"));
     assert!(ip_addr.contains_host("5960"));
     assert!(!ip_addr.contains_host("192.168.2"));
 
-    // Test URL matching
     let url_addr = SourceAddress::Url("http://camera.local:8080".to_string());
     assert!(url_addr.contains_host("camera.local"));
     assert!(url_addr.contains_host("camera"));
     assert!(url_addr.contains_host("8080"));
     assert!(!url_addr.contains_host("other.local"));
 
-    // Test None variant
     let none_addr = SourceAddress::None;
     assert!(!none_addr.contains_host("anything"));
 }
@@ -374,37 +328,28 @@ fn test_source_address_contains_host() {
 fn test_source_address_port() {
     use crate::finder::SourceAddress;
 
-    // Test IP address with port
     let ip_with_port = SourceAddress::Ip("192.168.1.100:5960".to_string());
     assert_eq!(ip_with_port.port(), Some(5960));
 
-    // Test IP address without port
     let ip_no_port = SourceAddress::Ip("192.168.1.100".to_string());
     assert_eq!(ip_no_port.port(), None);
 
-    // Test URL with port
     let url_with_port = SourceAddress::Url("http://camera.local:8080".to_string());
     assert_eq!(url_with_port.port(), Some(8080));
 
-    // Test URL with port and path
     let url_with_path = SourceAddress::Url("http://camera.local:8080/stream".to_string());
     assert_eq!(url_with_path.port(), Some(8080));
 
-    // Test URL without port
     let url_no_port = SourceAddress::Url("http://camera.local".to_string());
     assert_eq!(url_no_port.port(), None);
 
-    // Test URL with scheme but no port
     let url_scheme_only = SourceAddress::Url("http://camera.local/stream".to_string());
     assert_eq!(url_scheme_only.port(), None);
 
-    // Test None variant
     let none_addr = SourceAddress::None;
     assert_eq!(none_addr.port(), None);
 
-    // Test edge case: IPv6-style address (just ensure it doesn't panic)
     let ipv6_style = SourceAddress::Ip("fe80::1:5960".to_string());
-    // This will parse the last segment after colon as port
     assert_eq!(ipv6_style.port(), Some(5960));
 }
 
@@ -412,7 +357,6 @@ fn test_source_address_port() {
 fn test_source_matches_host() {
     use crate::finder::{Source, SourceAddress};
 
-    // Test matching by IP address
     let source = Source {
         name: "CAMERA1 (Chan1)".to_string(),
         address: SourceAddress::Ip("192.168.0.107:5960".to_string()),
@@ -421,12 +365,10 @@ fn test_source_matches_host() {
     assert!(source.matches_host("192.168.0"));
     assert!(!source.matches_host("192.168.1"));
 
-    // Test matching by name
     assert!(source.matches_host("CAMERA1"));
     assert!(source.matches_host("Chan1"));
     assert!(!source.matches_host("CAMERA2"));
 
-    // Test matching with URL address
     let url_source = Source {
         name: "Studio Camera".to_string(),
         address: SourceAddress::Url("http://studio.local:8080".to_string()),
@@ -435,7 +377,6 @@ fn test_source_matches_host() {
     assert!(url_source.matches_host("Studio"));
     assert!(!url_source.matches_host("other"));
 
-    // Test with None address
     let no_addr_source = Source {
         name: "Local Source".to_string(),
         address: SourceAddress::None,
@@ -448,42 +389,36 @@ fn test_source_matches_host() {
 fn test_source_ip_address() {
     use crate::finder::{Source, SourceAddress};
 
-    // Test IP address extraction from IP variant
     let ip_source = Source {
         name: "CAMERA1".to_string(),
         address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
     };
     assert_eq!(ip_source.ip_address(), Some("192.168.1.100"));
 
-    // Test IP without port
     let ip_no_port = Source {
         name: "CAMERA2".to_string(),
         address: SourceAddress::Ip("192.168.1.101".to_string()),
     };
     assert_eq!(ip_no_port.ip_address(), Some("192.168.1.101"));
 
-    // Test hostname extraction from URL variant
     let url_source = Source {
         name: "Studio".to_string(),
         address: SourceAddress::Url("http://camera.local:8080".to_string()),
     };
     assert_eq!(url_source.ip_address(), Some("camera.local"));
 
-    // Test URL with path
     let url_with_path = Source {
         name: "Studio2".to_string(),
         address: SourceAddress::Url("http://camera.local:8080/stream".to_string()),
     };
     assert_eq!(url_with_path.ip_address(), Some("camera.local"));
 
-    // Test URL without scheme
     let url_no_scheme = Source {
         name: "Studio3".to_string(),
         address: SourceAddress::Url("camera.local:8080".to_string()),
     };
     assert_eq!(url_no_scheme.ip_address(), Some("camera.local"));
 
-    // Test None variant
     let none_source = Source {
         name: "None".to_string(),
         address: SourceAddress::None,
@@ -495,7 +430,6 @@ fn test_source_ip_address() {
 fn test_source_host() {
     use crate::finder::{Source, SourceAddress};
 
-    // Test that host() is an alias for ip_address()
     let source = Source {
         name: "CAMERA1".to_string(),
         address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
@@ -515,29 +449,17 @@ fn test_source_host() {
 fn test_source_matching_real_world_example() {
     use crate::finder::{Source, SourceAddress};
 
-    // Real-world example from the issue description
     let source = Source {
         name: "CAMERA1 (Chan1, 192.168.0.107)".to_string(),
         address: SourceAddress::Ip("192.168.0.107:5960".to_string()),
     };
 
-    // Should match by IP in address
     assert!(source.matches_host("192.168.0.107"));
-
-    // Should match by partial IP
     assert!(source.matches_host("192.168.0"));
-
-    // Should match by name
     assert!(source.matches_host("CAMERA1"));
-
-    // Should match by IP in name
     assert!(source.matches_host("192.168.0.107"));
-
-    // Should extract IP correctly
     assert_eq!(source.ip_address(), Some("192.168.0.107"));
     assert_eq!(source.host(), Some("192.168.0.107"));
-
-    // Should extract port correctly
     assert_eq!(source.address.port(), Some(5960));
 }
 
@@ -545,11 +467,9 @@ fn test_source_matching_real_world_example() {
 fn test_source_cache_creation() {
     use crate::finder::SourceCache;
 
-    // Should be able to create a cache
     let cache = SourceCache::new();
     assert!(cache.is_ok());
 
-    // Cache should start empty
     let cache = cache.unwrap();
     assert_eq!(cache.len(), 0);
     assert!(cache.is_empty());
@@ -559,7 +479,6 @@ fn test_source_cache_creation() {
 fn test_source_cache_default() {
     use crate::finder::SourceCache;
 
-    // Default should create an empty cache
     let cache = SourceCache::default();
     assert_eq!(cache.len(), 0);
     assert!(cache.is_empty());
@@ -571,34 +490,26 @@ fn test_source_cache_invalidation() {
 
     let cache = SourceCache::default();
 
-    // Invalidating a non-existent entry should not panic
     cache.invalidate("192.168.0.107");
     assert_eq!(cache.len(), 0);
 
-    // Clear on empty cache should not panic
     cache.clear();
     assert_eq!(cache.len(), 0);
     assert!(cache.is_empty());
 }
 
-// Image encoding tests (feature-gated)
 #[cfg(feature = "image-encoding")]
 #[test]
 fn test_video_frame_encode_png_rgba() {
     use crate::frames::{FourCCVideoType, VideoFrame};
 
-    // Create a simple 2x2 RGBA test frame
     let width = 2;
     let height = 2;
     let mut data = vec![0u8; (width * height * 4) as usize];
 
-    // Red pixel (top-left)
     data[0..4].copy_from_slice(&[255, 0, 0, 255]);
-    // Green pixel (top-right)
     data[4..8].copy_from_slice(&[0, 255, 0, 255]);
-    // Blue pixel (bottom-left)
     data[8..12].copy_from_slice(&[0, 0, 255, 255]);
-    // White pixel (bottom-right)
     data[12..16].copy_from_slice(&[255, 255, 255, 255]);
 
     let frame = VideoFrame::builder()
@@ -607,18 +518,15 @@ fn test_video_frame_encode_png_rgba() {
         .build()
         .unwrap();
 
-    // Replace the data with our test pattern
     let mut frame = frame;
     frame.data = data;
 
-    // Encode to PNG
     let png_bytes = frame.encode_png();
     assert!(png_bytes.is_ok());
 
     let png_bytes = png_bytes.unwrap();
     assert!(!png_bytes.is_empty());
 
-    // Verify PNG header (first 8 bytes)
     assert_eq!(&png_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
 }
 
@@ -627,18 +535,13 @@ fn test_video_frame_encode_png_rgba() {
 fn test_video_frame_encode_png_bgra() {
     use crate::frames::{FourCCVideoType, VideoFrame};
 
-    // Create a 2x2 BGRA test frame
     let width = 2;
     let height = 2;
     let mut data = vec![0u8; (width * height * 4) as usize];
 
-    // Red pixel in BGRA format (B=0, G=0, R=255, A=255)
     data[0..4].copy_from_slice(&[0, 0, 255, 255]);
-    // Green pixel in BGRA format
     data[4..8].copy_from_slice(&[0, 255, 0, 255]);
-    // Blue pixel in BGRA format
     data[8..12].copy_from_slice(&[255, 0, 0, 255]);
-    // White pixel in BGRA format
     data[12..16].copy_from_slice(&[255, 255, 255, 255]);
 
     let frame = VideoFrame::builder()
@@ -650,14 +553,12 @@ fn test_video_frame_encode_png_bgra() {
     let mut frame = frame;
     frame.data = data;
 
-    // Encode to PNG (should convert BGRA to RGBA)
     let png_bytes = frame.encode_png();
     assert!(png_bytes.is_ok());
 
     let png_bytes = png_bytes.unwrap();
     assert!(!png_bytes.is_empty());
 
-    // Verify PNG header
     assert_eq!(&png_bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
 }
 
@@ -668,16 +569,15 @@ fn test_video_frame_encode_png_unsupported_format() {
 
     let frame = VideoFrame::builder()
         .resolution(2, 2)
-        .fourcc(FourCCVideoType::UYVY) // Unsupported for encoding
+        .fourcc(FourCCVideoType::UYVY)
         .build()
         .unwrap();
 
-    // Should fail with unsupported format error
     let result = frame.encode_png();
     assert!(result.is_err());
 
     let err = result.unwrap_err();
-    let err_msg = format!("{}", err);
+    let err_msg = format!("{err}");
     assert!(err_msg.contains("Unsupported format"));
 }
 
@@ -686,10 +586,9 @@ fn test_video_frame_encode_png_unsupported_format() {
 fn test_video_frame_encode_jpeg_rgba() {
     use crate::frames::{FourCCVideoType, VideoFrame};
 
-    // Create a simple 4x4 RGBA test frame
     let width = 4;
     let height = 4;
-    let data = vec![255u8; (width * height * 4) as usize]; // All white
+    let data = vec![255u8; (width * height * 4) as usize];
 
     let frame = VideoFrame::builder()
         .resolution(width, height)
@@ -700,17 +599,14 @@ fn test_video_frame_encode_jpeg_rgba() {
     let mut frame = frame;
     frame.data = data;
 
-    // Encode to JPEG with quality 85
     let jpeg_bytes = frame.encode_jpeg(85);
     assert!(jpeg_bytes.is_ok());
 
     let jpeg_bytes = jpeg_bytes.unwrap();
     assert!(!jpeg_bytes.is_empty());
 
-    // Verify JPEG header (SOI marker: 0xFF 0xD8)
     assert_eq!(&jpeg_bytes[0..2], &[0xFF, 0xD8]);
 
-    // Verify JPEG end marker (EOI: 0xFF 0xD9)
     let len = jpeg_bytes.len();
     assert_eq!(&jpeg_bytes[len - 2..len], &[0xFF, 0xD9]);
 }
@@ -722,7 +618,7 @@ fn test_video_frame_encode_jpeg_bgra() {
 
     let width = 4;
     let height = 4;
-    let data = vec![128u8; (width * height * 4) as usize]; // Gray
+    let data = vec![128u8; (width * height * 4) as usize];
 
     let frame = VideoFrame::builder()
         .resolution(width, height)
@@ -733,14 +629,12 @@ fn test_video_frame_encode_jpeg_bgra() {
     let mut frame = frame;
     frame.data = data;
 
-    // Encode to JPEG (should convert BGRA to RGB)
     let jpeg_bytes = frame.encode_jpeg(90);
     assert!(jpeg_bytes.is_ok());
 
     let jpeg_bytes = jpeg_bytes.unwrap();
     assert!(!jpeg_bytes.is_empty());
 
-    // Verify JPEG markers
     assert_eq!(&jpeg_bytes[0..2], &[0xFF, 0xD8]);
 }
 

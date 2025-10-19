@@ -1,7 +1,8 @@
-use grafton_ndi::{BorrowedVideoFrame, FourCCVideoType, SenderOptions, NDI};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+use grafton_ndi::{BorrowedVideoFrame, FourCCVideoType, SenderOptions, NDI};
 
 #[test]
 #[cfg_attr(
@@ -22,14 +23,12 @@ fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
         let ndi_clone = ndi.clone();
         let completed_clone = completed.clone();
         let handle = thread::spawn(move || -> Result<(), grafton_ndi::Error> {
-            // Create per-thread sender
-            let send_options = SenderOptions::builder(format!("Stress Test Sender {}", thread_id))
+            let send_options = SenderOptions::builder(format!("Stress Test Sender {thread_id}"))
                 .clock_video(true)
                 .clock_audio(false)
                 .build()?;
             let sender = grafton_ndi::Sender::new(&ndi_clone, &send_options)?;
 
-            // Register completion callback
             sender.on_async_video_done(move |_len| {
                 let mut count = completed_clone.lock().unwrap();
                 *count += 1;
@@ -43,7 +42,6 @@ fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
                     *byte = ((i + frame_num + thread_id * 1000) % 256) as u8;
                 }
 
-                // Create borrowed frame
                 let borrowed_frame = BorrowedVideoFrame::from_buffer(
                     &buffer,
                     1920,
@@ -53,7 +51,6 @@ fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
                     1,
                 );
 
-                // Send asynchronously
                 let token = sender.send_video_async(&borrowed_frame);
 
                 // Randomly drop the token early or hold it
@@ -76,7 +73,6 @@ fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
         handles.push(handle);
     }
 
-    // Wait for all threads to complete
     for handle in handles {
         handle.join().unwrap()?;
     }
@@ -84,9 +80,8 @@ fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
     // Wait a bit for all callbacks to complete
     thread::sleep(Duration::from_millis(100));
 
-    // Verify that all callbacks were called
     let final_count = *completed.lock().unwrap();
-    println!("Completed {} async operations", final_count);
+    println!("Completed {final_count} async operations");
 
     // We sent 4 threads * 250 frames = 1000 frames
     assert_eq!(final_count, 1000, "Not all async callbacks were called");
@@ -123,7 +118,6 @@ fn test_immediate_sender_drop() -> Result<(), grafton_ndi::Error> {
             // This simulates the original race condition
         }
 
-        // Flush any pending operations
         sender.flush_async_blocking();
 
         // Now drop sender - this will block until the token is dropped
@@ -152,7 +146,6 @@ fn test_flush_async() -> Result<(), grafton_ndi::Error> {
         let mut buffers = vec![];
         let mut tokens = vec![];
 
-        // Create buffers first
         for i in 0..10 {
             buffers.push(vec![i as u8; 1920 * 1080 * 4]);
         }
@@ -168,7 +161,6 @@ fn test_flush_async() -> Result<(), grafton_ndi::Error> {
         drop(tokens);
     }
 
-    // Flush should succeed
     sender.flush_async_blocking();
 
     Ok(())

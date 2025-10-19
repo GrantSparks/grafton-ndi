@@ -1,7 +1,9 @@
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
-
 use grafton_ndi::{BorrowedVideoFrame, FourCCVideoType, SenderOptions, NDI};
+
+use std::{
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 
 fn main() -> Result<(), grafton_ndi::Error> {
     // Initialize NDI

@@ -5,11 +5,11 @@
 //!
 //! Run with: `cargo run --example NDIlib_Recv_Audio_16bpp`
 
+use grafton_ndi::{Error, Finder, FinderOptions, ReceiverOptions, NDI};
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-use grafton_ndi::{Error, Finder, FinderOptions, ReceiverOptions, NDI};
 
 fn main() -> Result<(), Error> {
     // Set up signal handler for graceful shutdown
@@ -50,22 +50,26 @@ fn main() -> Result<(), Error> {
         // Check for video frames
         if let Some(video_frame) = receiver.capture_video(0)? {
             println!(
-                "Video data received ({}x{}).",
-                video_frame.width, video_frame.height
+                "Video data received ({width}x{height}).",
+                width = video_frame.width,
+                height = video_frame.height
             );
         }
 
         // Check for audio frames
         if let Some(audio_frame) = receiver.capture_audio(0)? {
-            println!("Audio data received ({} samples).", audio_frame.num_samples);
+            println!(
+                "Audio data received ({num_samples} samples).",
+                num_samples = audio_frame.num_samples
+            );
 
             // Convert to 16-bit interleaved format
             let audio_16bit = convert_to_16bit_interleaved(&audio_frame, 20); // 20dB headroom
 
             // Here you would process the 16-bit audio data
             println!(
-                "  Converted to 16-bit: {} samples",
-                audio_16bit.len() / audio_frame.num_channels as usize
+                "  Converted to 16-bit: {samples} samples",
+                samples = audio_16bit.len() / audio_frame.num_channels as usize
             );
         }
 

@@ -21,13 +21,11 @@
 //! - Custom output file: `cargo run --example NDIlib_Recv_PNG -- --output MyImage.png`
 //! - Both: `cargo run --example NDIlib_Recv_PNG -- 192.168.0.100 --output MyImage.png`
 
-use std::env;
-use std::fs::File;
-use std::time::Instant;
-
 use grafton_ndi::{
     Error, Finder, FinderOptions, FourCCVideoType, ReceiverColorFormat, ReceiverOptions, NDI,
 };
+
+use std::{env, fs::File, time::Instant};
 
 fn main() -> Result<(), Error> {
     // Parse command line arguments
@@ -44,7 +42,7 @@ fn main() -> Result<(), Error> {
             extra_ips.push(args[i].as_str());
             i += 1;
         } else {
-            eprintln!("Unknown argument: {}", args[i]);
+            eprintln!("Unknown argument: {arg}", arg = args[i]);
             i += 1;
         }
     }
@@ -56,7 +54,7 @@ fn main() -> Result<(), Error> {
     println!("NDI initialized successfully");
 
     if output_file != "CoolNDIImage.png" {
-        println!("Output file: {}", output_file);
+        println!("Output file: {output_file}");
     }
     println!();
 
@@ -67,7 +65,7 @@ fn main() -> Result<(), Error> {
     if !extra_ips.is_empty() {
         println!("Searching additional IPs/subnets:");
         for ip in &extra_ips {
-            println!("  - {}", ip);
+            println!("  - {ip}");
             builder = builder.extra_ips(*ip);
         }
         println!();
@@ -81,16 +79,19 @@ fn main() -> Result<(), Error> {
         finder.wait_for_sources(1000);
         let sources = finder.get_sources(0)?;
         if !sources.is_empty() {
-            println!("Found {} source(s):", sources.len());
+            let count = sources.len();
+            println!("Found {count} source(s):");
             for (i, source) in sources.iter().enumerate() {
-                println!("  {}. {}", i + 1, source);
+                let num = i + 1;
+                println!("  {num}. {source}");
             }
             break sources;
         }
     };
 
     // Create a receiver for the first source
-    println!("\nCreating receiver for: {}", sources[0]);
+    let first_source = &sources[0];
+    println!("\nCreating receiver for: {first_source}");
     let receiver = ReceiverOptions::builder(sources[0].clone())
         .color(ReceiverColorFormat::RGBX_RGBA)
         .build(&ndi)?;
@@ -103,21 +104,25 @@ fn main() -> Result<(), Error> {
     let start_time = Instant::now();
     let video_frame = receiver.capture_video_blocking(60_000)?;
 
-    println!("Frame received after {:?}", start_time.elapsed());
+    let elapsed = start_time.elapsed();
+    println!("Frame received after {elapsed:?}");
 
     // Debug information about the frame
     println!("Frame details:");
-    println!("  Resolution: {}x{}", video_frame.width, video_frame.height);
-    println!("  Format: {:?}", video_frame.fourcc);
-    println!("  Line stride: {} bytes", unsafe {
-        video_frame.line_stride_or_size.line_stride_in_bytes
-    });
-    println!("  Data size: {} bytes", video_frame.data.len());
-    println!(
-        "  Frame rate: {}/{}",
-        video_frame.frame_rate_n, video_frame.frame_rate_d
-    );
-    println!("  Timecode: {:016x}", video_frame.timecode);
+    let width = video_frame.width;
+    let height = video_frame.height;
+    println!("  Resolution: {width}x{height}");
+    let fourcc = video_frame.fourcc;
+    println!("  Format: {fourcc:?}");
+    let line_stride = unsafe { video_frame.line_stride_or_size.line_stride_in_bytes };
+    println!("  Line stride: {line_stride} bytes");
+    let data_size = video_frame.data.len();
+    println!("  Data size: {data_size} bytes");
+    let frame_rate_n = video_frame.frame_rate_n;
+    let frame_rate_d = video_frame.frame_rate_d;
+    println!("  Frame rate: {frame_rate_n}/{frame_rate_d}");
+    let timecode = video_frame.timecode;
+    println!("  Timecode: {timecode:016x}");
 
     // Verify we got the format we requested
     match video_frame.fourcc {
@@ -125,10 +130,8 @@ fn main() -> Result<(), Error> {
             println!("  ✓ Got requested RGBA/RGBX format");
         }
         _ => {
-            eprintln!(
-                "  ⚠ Warning: Got unexpected format {:?}, PNG may fail",
-                video_frame.fourcc
-            );
+            let format = video_frame.fourcc;
+            eprintln!("  ⚠ Warning: Got unexpected format {format:?}, PNG may fail");
         }
     }
 
@@ -140,23 +143,19 @@ fn main() -> Result<(), Error> {
         // This is a common issue with some NDI sources
         // If stride != width * 4, we would need to handle row padding
         return Err(Error::InitializationFailed(format!(
-            "Line stride ({}) doesn't match width * 4 ({}). \
-             This would require handling row padding which this example doesn't implement.",
-            actual_stride, expected_stride
+            "Line stride ({actual_stride}) doesn't match width * 4 ({expected_stride}). \
+             This would require handling row padding which this example doesn't implement."
         )));
     }
 
     // Check data size to detect if we might have a compressed format
     let expected_uncompressed_size = (video_frame.width * video_frame.height * 4) as usize;
     if video_frame.data.len() < expected_uncompressed_size / 2 {
+        let actual_size = video_frame.data.len();
         eprintln!(
-            "  ⚠ Warning: Frame data size ({} bytes) is much smaller than expected",
-            video_frame.data.len()
+            "  ⚠ Warning: Frame data size ({actual_size} bytes) is much smaller than expected"
         );
-        eprintln!(
-            "            uncompressed size ({} bytes). This might be a compressed",
-            expected_uncompressed_size
-        );
+        eprintln!("            uncompressed size ({expected_uncompressed_size} bytes). This might be a compressed");
         eprintln!("            format that needs decoding before saving as PNG.");
     }
 
@@ -170,9 +169,9 @@ fn main() -> Result<(), Error> {
     encoder
         .write_header()
         .and_then(|mut writer| writer.write_image_data(&video_frame.data))
-        .map_err(|e| Error::InitializationFailed(format!("PNG encoding failed: {}", e)))?;
+        .map_err(|e| Error::InitializationFailed(format!("PNG encoding failed: {e}")))?;
 
-    println!("✓ Saved frame as {}", output_file);
+    println!("✓ Saved frame as {output_file}");
     println!("\nExample completed successfully!");
 
     Ok(())

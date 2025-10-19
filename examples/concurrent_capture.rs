@@ -1,13 +1,12 @@
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+use std::{sync::Arc, thread, time::Duration};
 
 use grafton_ndi::{ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions, NDI};
 
 fn main() -> Result<(), grafton_ndi::Error> {
     // Initialize NDI
     let ndi = NDI::new()?;
-    println!("NDI version: {}", NDI::version()?);
+    let version = NDI::version()?;
+    println!("NDI version: {version}");
 
     // Create a finder to discover sources
     let finder_options = grafton_ndi::FinderOptions::default();
@@ -27,14 +26,15 @@ fn main() -> Result<(), grafton_ndi::Error> {
         return Ok(());
     }
 
-    println!("Found {} sources:", sources.len());
+    let sources_len = sources.len();
+    println!("Found {sources_len} sources:");
     for (i, source) in sources.iter().enumerate() {
-        println!("  [{}] {}", i, source);
+        println!("  [{i}] {source}");
     }
 
     // Connect to the first source
     let source = sources[0].clone();
-    println!("\nConnecting to: {}", source);
+    println!("\nConnecting to: {source}");
 
     // Create receiver
     let receiver = ReceiverOptions::builder(source)
@@ -59,27 +59,26 @@ fn main() -> Result<(), grafton_ndi::Error> {
                 match recv_video.capture_video(5000) {
                     Ok(Some(frame)) => {
                         frame_count += 1;
+                        let width = frame.width;
+                        let height = frame.height;
+                        let frame_rate_n = frame.frame_rate_n;
+                        let frame_rate_d = frame.frame_rate_d;
                         println!(
-                            "[VIDEO] Frame {}: {}x{} @ {}/{} fps",
-                            frame_count,
-                            frame.width,
-                            frame.height,
-                            frame.frame_rate_n,
-                            frame.frame_rate_d
+                            "[VIDEO] Frame {frame_count}: {width}x{height} @ {frame_rate_n}/{frame_rate_d} fps"
                         );
                     }
                     Ok(None) => {
                         println!("[VIDEO] Timeout waiting for frame");
                     }
                     Err(e) => {
-                        eprintln!("[VIDEO] Error capturing frame: {}", e);
+                        eprintln!("[VIDEO] Error capturing frame: {e}");
                         break;
                     }
                 }
                 thread::sleep(Duration::from_millis(100));
             }
 
-            println!("Video thread finished - captured {} frames", frame_count);
+            println!("Video thread finished - captured {frame_count} frames");
         });
 
         // Spawn audio capture thread
@@ -92,23 +91,25 @@ fn main() -> Result<(), grafton_ndi::Error> {
                 match recv_audio.capture_audio(5000) {
                     Ok(Some(frame)) => {
                         sample_count += frame.num_samples;
+                        let num_samples = frame.num_samples;
+                        let sample_rate = frame.sample_rate;
+                        let num_channels = frame.num_channels;
                         println!(
-                            "[AUDIO] {} samples @ {} Hz, {} channels",
-                            frame.num_samples, frame.sample_rate, frame.num_channels
+                            "[AUDIO] {num_samples} samples @ {sample_rate} Hz, {num_channels} channels"
                         );
                     }
                     Ok(None) => {
                         println!("[AUDIO] Timeout waiting for frame");
                     }
                     Err(e) => {
-                        eprintln!("[AUDIO] Error capturing frame: {}", e);
+                        eprintln!("[AUDIO] Error capturing frame: {e}");
                         break;
                     }
                 }
                 thread::sleep(Duration::from_millis(100));
             }
 
-            println!("Audio thread finished - captured {} samples", sample_count);
+            println!("Audio thread finished - captured {sample_count} samples");
         });
 
         // Spawn metadata capture thread
@@ -121,31 +122,27 @@ fn main() -> Result<(), grafton_ndi::Error> {
                 match recv_metadata.capture_metadata(2500) {
                     Ok(Some(frame)) => {
                         metadata_count += 1;
-                        println!(
-                            "[METADATA] Received {} bytes: {}",
-                            frame.data.len(),
-                            if frame.data.len() > 50 {
-                                format!("{}...", &frame.data[..50])
-                            } else {
-                                frame.data.clone()
-                            }
-                        );
+                        let data_len = frame.data.len();
+                        let preview = if frame.data.len() > 50 {
+                            let preview_data = &frame.data[..50];
+                            format!("{preview_data}...")
+                        } else {
+                            frame.data.clone()
+                        };
+                        println!("[METADATA] Received {data_len} bytes: {preview}");
                     }
                     Ok(None) => {
                         // Metadata is less frequent, timeouts are normal
                     }
                     Err(e) => {
-                        eprintln!("[METADATA] Error capturing frame: {}", e);
+                        eprintln!("[METADATA] Error capturing frame: {e}");
                         break;
                     }
                 }
                 thread::sleep(Duration::from_millis(50));
             }
 
-            println!(
-                "Metadata thread finished - captured {} frames",
-                metadata_count
-            );
+            println!("Metadata thread finished - captured {metadata_count} frames");
         });
 
         // Wait for all threads to complete
