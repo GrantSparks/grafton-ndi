@@ -166,6 +166,28 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     }
 
     fn to_raw(&self) -> NDIlib_video_frame_v2_t {
+        // Debug-only validation: Ensure user-provided buffer is correctly sized for the format
+        #[cfg(debug_assertions)]
+        {
+            use crate::frames::uncompressed_buffer_len;
+
+            if let LineStrideOrSize::LineStrideBytes(stride) = self.line_stride_or_size {
+                let expected_len =
+                    uncompressed_buffer_len(self.pixel_format, stride, self.width, self.height);
+                debug_assert!(
+                    self.data.len() >= expected_len,
+                    "Buffer too small for format {:?}: got {} bytes, expected at least {} bytes \
+                     (width={}, height={}, stride={})",
+                    self.pixel_format,
+                    self.data.len(),
+                    expected_len,
+                    self.width,
+                    self.height,
+                    stride
+                );
+            }
+        }
+
         NDIlib_video_frame_v2_t {
             xres: self.width,
             yres: self.height,

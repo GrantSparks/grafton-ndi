@@ -520,8 +520,10 @@ impl VideoFrame {
             // Uncompressed format: read ONLY line_stride_in_bytes
             let line_stride = c_frame.__bindgen_anon_1.line_stride_in_bytes;
 
-            if line_stride > 0 && c_frame.yres > 0 {
-                let calculated_size = (line_stride as usize) * (c_frame.yres as usize);
+            if line_stride > 0 && c_frame.yres > 0 && c_frame.xres > 0 {
+                // Use the new helper that correctly handles planar 4:2:0 formats
+                let calculated_size =
+                    uncompressed_buffer_len(pixel_format, line_stride, c_frame.xres, c_frame.yres);
                 if calculated_size > 0 && calculated_size <= (100 * 1024 * 1024) {
                     // Reasonable size for uncompressed video (< 100MB per frame)
                     (
@@ -1123,6 +1125,82 @@ impl From<AudioFormat> for i32 {
     }
 }
 
+/// Check if a pixel format is planar 4:2:0 (YV12, I420, NV12).
+fn is_planar_420(fmt: PixelFormat) -> bool {
+    matches!(
+        fmt,
+        PixelFormat::YV12 | PixelFormat::I420 | PixelFormat::NV12
+    )
+}
+
+/// Ceiling division by 2 for computing subsampled plane dimensions.
+/// For odd values, rounds up (e.g., 1920/2 = 960, 1921/2 = 961).
+#[inline]
+fn ceil_div2(x: i32) -> i32 {
+    (x + 1) / 2
+}
+
+/// Calculate the total buffer length for an uncompressed video frame.
+///
+/// This function computes the correct buffer size based on the pixel format,
+/// accounting for planar 4:2:0 formats (YV12/I420/NV12) which require Y + UV planes.
+///
+/// # Arguments
+///
+/// * `fmt` - The pixel format
+/// * `y_stride` - The Y-plane line stride in bytes (for planar formats) or total line stride (for packed formats)
+/// * `width` - Frame width in pixels
+/// * `height` - Frame height in pixels
+///
+/// # Returns
+///
+/// Total buffer size in bytes needed to hold the frame data.
+///
+/// # Format-specific calculations
+///
+/// - **Packed RGB/YUV** (BGRA/BGRX/RGBA/RGBX/UYVY/UYVA/P216/PA16): `y_stride * height`
+/// - **Planar 4:2:0 YV12/I420**: `Y + U + V` where:
+///   - Y plane: `y_stride * height`
+///   - U plane: `(y_stride/2) * ceil(height/2)`
+///   - V plane: `(y_stride/2) * ceil(height/2)`
+/// - **Semi-planar 4:2:0 NV12**: `Y + UV` where:
+///   - Y plane: `y_stride * height`
+///   - UV plane: `y_stride * ceil(height/2)`
+pub(crate) fn uncompressed_buffer_len(
+    fmt: PixelFormat,
+    y_stride: i32,
+    _width: i32,
+    height: i32,
+) -> usize {
+    if !is_planar_420(fmt) {
+        // Packed formats: simple stride * height
+        return (y_stride as usize) * (height as usize);
+    }
+
+    // Planar 4:2:0 formats need Y + UV planes
+    let y_size = (y_stride as usize) * (height as usize);
+    let chroma_height = ceil_div2(height) as usize;
+
+    match fmt {
+        PixelFormat::YV12 | PixelFormat::I420 => {
+            // Planar 4:2:0: Y + U + V
+            // U and V planes each have half width and half height (with ceiling for odd dimensions)
+            let u_stride = (y_stride / 2) as usize;
+            let v_stride = (y_stride / 2) as usize;
+            let u_size = u_stride * chroma_height;
+            let v_size = v_stride * chroma_height;
+            y_size + u_size + v_size
+        }
+        PixelFormat::NV12 => {
+            // Semi-planar 4:2:0: Y + interleaved UV
+            // UV plane has full width (contains both U and V interleaved) and half height
+            let uv_size = (y_stride as usize) * chroma_height;
+            y_size + uv_size
+        }
+        _ => unreachable!("is_planar_420 check above ensures only YV12/I420/NV12 reach here"),
+    }
+}
+
 /// Calculate the line stride (bytes per row) for a given video format
 pub(crate) fn calculate_line_stride(fourcc: PixelFormat, width: i32) -> i32 {
     match fourcc {
@@ -1134,22 +1212,15 @@ pub(crate) fn calculate_line_stride(fourcc: PixelFormat, width: i32) -> i32 {
     }
 }
 
-/// Calculate the total buffer size needed for a video frame
+/// Calculate the total buffer size needed for a video frame.
+///
+/// This uses the same logic as `uncompressed_buffer_len`, but assumes
+/// the stride equals the width (for packed formats) or the Y-plane width
+/// (for planar formats), which is appropriate for builder allocation.
 fn calculate_buffer_size(fourcc: PixelFormat, width: i32, height: i32) -> usize {
-    match fourcc {
-        PixelFormat::BGRA | PixelFormat::BGRX | PixelFormat::RGBA | PixelFormat::RGBX => {
-            (height * width * 4) as usize
-        } // 32 bpp
-        PixelFormat::UYVY => (height * width * 2) as usize, // 16 bpp
-        PixelFormat::YV12 | PixelFormat::I420 | PixelFormat::NV12 => {
-            // Planar 4:2:0 formats: Y plane is full res, U/V planes are quarter size
-            let y_size = (width * height) as usize;
-            let uv_size = ((width / 2) * (height / 2)) as usize;
-            y_size + 2 * uv_size
-        }
-        PixelFormat::UYVA => (height * width * 3) as usize, // 24 bpp
-        PixelFormat::P216 | PixelFormat::PA16 => (height * width * 4) as usize, // 32 bpp
-    }
+    // For builders, stride is computed from width using calculate_line_stride
+    let stride = calculate_line_stride(fourcc, width);
+    uncompressed_buffer_len(fourcc, stride, width, height)
 }
 
 /// Check if a video format is uncompressed
@@ -1410,6 +1481,9 @@ impl<'rx> VideoFrameRef<'rx> {
     ///
     /// This returns a slice directly into the NDI SDK's buffer.
     /// No allocation or memcpy is performed.
+    ///
+    /// For planar 4:2:0 formats (YV12/I420/NV12), this returns the full
+    /// buffer including Y and UV planes.
     pub fn data(&self) -> &[u8] {
         let frame = self.guard.frame();
 
@@ -1422,8 +1496,9 @@ impl<'rx> VideoFrameRef<'rx> {
 
         let data_size = if is_uncompressed {
             let line_stride = unsafe { frame.__bindgen_anon_1.line_stride_in_bytes };
-            if line_stride > 0 && frame.yres > 0 {
-                (line_stride as usize) * (frame.yres as usize)
+            if line_stride > 0 && frame.yres > 0 && frame.xres > 0 {
+                // Use the new helper that correctly handles planar 4:2:0 formats
+                uncompressed_buffer_len(pixel_format, line_stride, frame.xres, frame.yres)
             } else {
                 0
             }
@@ -1696,5 +1771,306 @@ impl<'rx> fmt::Debug for MetadataFrameRef<'rx> {
             .field("data", &self.data())
             .field("timecode", &self.timecode())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test uncompressed_buffer_len for packed RGB formats (32 bpp)
+    #[test]
+    fn test_uncompressed_buffer_len_packed_rgb() {
+        let formats = [
+            PixelFormat::BGRA,
+            PixelFormat::BGRX,
+            PixelFormat::RGBA,
+            PixelFormat::RGBX,
+        ];
+
+        for fmt in formats {
+            // 1920x1080, stride = 1920 * 4 = 7680
+            let len = uncompressed_buffer_len(fmt, 7680, 1920, 1080);
+            assert_eq!(len, 7680 * 1080, "Format {:?} even dimensions", fmt);
+
+            // Odd dimensions: 1921x1081
+            let len = uncompressed_buffer_len(fmt, 7684, 1921, 1081);
+            assert_eq!(len, 7684 * 1081, "Format {:?} odd dimensions", fmt);
+        }
+    }
+
+    /// Test uncompressed_buffer_len for packed YUV formats
+    #[test]
+    fn test_uncompressed_buffer_len_packed_yuv() {
+        // UYVY: 16 bpp = 2 bytes per pixel
+        let len = uncompressed_buffer_len(PixelFormat::UYVY, 3840, 1920, 1080);
+        assert_eq!(len, 3840 * 1080);
+
+        // UYVA: 24 bpp = 3 bytes per pixel
+        let len = uncompressed_buffer_len(PixelFormat::UYVA, 5760, 1920, 1080);
+        assert_eq!(len, 5760 * 1080);
+
+        // P216/PA16: 32 bpp = 4 bytes per pixel
+        let len = uncompressed_buffer_len(PixelFormat::P216, 7680, 1920, 1080);
+        assert_eq!(len, 7680 * 1080);
+
+        let len = uncompressed_buffer_len(PixelFormat::PA16, 7680, 1920, 1080);
+        assert_eq!(len, 7680 * 1080);
+    }
+
+    /// Test uncompressed_buffer_len for planar YV12/I420 with even dimensions
+    #[test]
+    fn test_uncompressed_buffer_len_planar_420_even() {
+        // 1920x1080 YV12/I420
+        // Y: 1920 * 1080 = 2,073,600
+        // U: (1920/2) * (1080/2) = 960 * 540 = 518,400
+        // V: (1920/2) * (1080/2) = 960 * 540 = 518,400
+        // Total: 2,073,600 + 518,400 + 518,400 = 3,110,400
+        let y_stride = 1920;
+        let len = uncompressed_buffer_len(PixelFormat::YV12, y_stride, 1920, 1080);
+        assert_eq!(len, 3_110_400, "YV12 1920x1080");
+
+        let len = uncompressed_buffer_len(PixelFormat::I420, y_stride, 1920, 1080);
+        assert_eq!(len, 3_110_400, "I420 1920x1080");
+    }
+
+    /// Test uncompressed_buffer_len for planar YV12/I420 with odd dimensions
+    #[test]
+    fn test_uncompressed_buffer_len_planar_420_odd() {
+        // 1921x1081 YV12/I420 (odd width and height)
+        // Y: 1921 * 1081 = 2,076,601
+        // U: (1921/2) * ceil(1081/2) = 960 * 541 = 519,360 (using ceil_div2)
+        // V: (1921/2) * ceil(1081/2) = 960 * 541 = 519,360
+        // Total: 2,076,601 + 519,360 + 519,360 = 3,115,321
+        let y_stride = 1921;
+        let len = uncompressed_buffer_len(PixelFormat::YV12, y_stride, 1921, 1081);
+        assert_eq!(len, 3_115_321, "YV12 1921x1081 (odd dimensions)");
+
+        let len = uncompressed_buffer_len(PixelFormat::I420, y_stride, 1921, 1081);
+        assert_eq!(len, 3_115_321, "I420 1921x1081 (odd dimensions)");
+    }
+
+    /// Test uncompressed_buffer_len for semi-planar NV12 with even dimensions
+    #[test]
+    fn test_uncompressed_buffer_len_nv12_even() {
+        // 1920x1080 NV12
+        // Y: 1920 * 1080 = 2,073,600
+        // UV: 1920 * (1080/2) = 1920 * 540 = 1,036,800
+        // Total: 2,073,600 + 1,036,800 = 3,110,400
+        let y_stride = 1920;
+        let len = uncompressed_buffer_len(PixelFormat::NV12, y_stride, 1920, 1080);
+        assert_eq!(len, 3_110_400, "NV12 1920x1080");
+    }
+
+    /// Test uncompressed_buffer_len for semi-planar NV12 with odd dimensions
+    #[test]
+    fn test_uncompressed_buffer_len_nv12_odd() {
+        // 1921x1081 NV12 (odd width and height)
+        // Y: 1921 * 1081 = 2,076,601
+        // UV: 1921 * ceil(1081/2) = 1921 * 541 = 1,039,261
+        // Total: 2,076,601 + 1,039,261 = 3,115,862
+        let y_stride = 1921;
+        let len = uncompressed_buffer_len(PixelFormat::NV12, y_stride, 1921, 1081);
+        assert_eq!(len, 3_115_862, "NV12 1921x1081 (odd dimensions)");
+    }
+
+    /// Test ceil_div2 helper
+    #[test]
+    fn test_ceil_div2() {
+        assert_eq!(ceil_div2(0), 0);
+        assert_eq!(ceil_div2(1), 1);
+        assert_eq!(ceil_div2(2), 1);
+        assert_eq!(ceil_div2(3), 2);
+        assert_eq!(ceil_div2(4), 2);
+        assert_eq!(ceil_div2(1920), 960);
+        assert_eq!(ceil_div2(1921), 961);
+        assert_eq!(ceil_div2(1080), 540);
+        assert_eq!(ceil_div2(1081), 541);
+    }
+
+    /// Test is_planar_420 helper
+    #[test]
+    fn test_is_planar_420() {
+        assert!(is_planar_420(PixelFormat::YV12));
+        assert!(is_planar_420(PixelFormat::I420));
+        assert!(is_planar_420(PixelFormat::NV12));
+
+        assert!(!is_planar_420(PixelFormat::BGRA));
+        assert!(!is_planar_420(PixelFormat::RGBA));
+        assert!(!is_planar_420(PixelFormat::UYVY));
+        assert!(!is_planar_420(PixelFormat::UYVA));
+    }
+
+    /// Test VideoFrame builder with planar formats produces correct buffer sizes
+    #[test]
+    fn test_videoframe_builder_planar_even() {
+        let frame = VideoFrame::builder()
+            .resolution(1920, 1080)
+            .pixel_format(PixelFormat::NV12)
+            .build()
+            .expect("Builder should succeed");
+
+        assert_eq!(frame.width, 1920);
+        assert_eq!(frame.height, 1080);
+        assert_eq!(frame.pixel_format, PixelFormat::NV12);
+        assert_eq!(frame.data.len(), 3_110_400, "NV12 1920x1080 buffer size");
+    }
+
+    /// Test VideoFrame builder with planar formats and odd dimensions
+    #[test]
+    fn test_videoframe_builder_planar_odd() {
+        let frame = VideoFrame::builder()
+            .resolution(1921, 1081)
+            .pixel_format(PixelFormat::I420)
+            .build()
+            .expect("Builder should succeed");
+
+        assert_eq!(frame.width, 1921);
+        assert_eq!(frame.height, 1081);
+        assert_eq!(frame.pixel_format, PixelFormat::I420);
+        assert_eq!(
+            frame.data.len(),
+            3_115_321,
+            "I420 1921x1081 buffer size with ceiling division"
+        );
+    }
+
+    /// Test VideoFrame builder with packed format (regression test)
+    #[test]
+    fn test_videoframe_builder_packed() {
+        let frame = VideoFrame::builder()
+            .resolution(1920, 1080)
+            .pixel_format(PixelFormat::BGRA)
+            .build()
+            .expect("Builder should succeed");
+
+        assert_eq!(frame.width, 1920);
+        assert_eq!(frame.height, 1080);
+        assert_eq!(frame.pixel_format, PixelFormat::BGRA);
+        assert_eq!(
+            frame.data.len(),
+            1920 * 1080 * 4,
+            "BGRA buffer size unchanged"
+        );
+    }
+
+    /// Test VideoFrame::from_raw with synthetic NV12 frame
+    #[test]
+    fn test_videoframe_from_raw_nv12() {
+        // Create a synthetic NV12 frame
+        let width = 1920;
+        let height = 1080;
+        let y_stride = 1920;
+        let expected_size = 3_110_400; // Y + UV for NV12
+
+        let mut data = vec![0u8; expected_size];
+        // Mark the last byte to verify it's copied
+        data[expected_size - 1] = 0xFF;
+
+        let c_frame = NDIlib_video_frame_v2_t {
+            xres: width,
+            yres: height,
+            FourCC: PixelFormat::NV12.into(),
+            frame_rate_N: 60,
+            frame_rate_D: 1,
+            picture_aspect_ratio: 16.0 / 9.0,
+            frame_format_type: ScanType::Progressive.into(),
+            timecode: 0,
+            p_data: data.as_mut_ptr(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: y_stride,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 0,
+        };
+
+        let frame = unsafe { VideoFrame::from_raw(&c_frame) }.expect("from_raw should succeed");
+
+        assert_eq!(frame.width, width);
+        assert_eq!(frame.height, height);
+        assert_eq!(frame.pixel_format, PixelFormat::NV12);
+        assert_eq!(
+            frame.data.len(),
+            expected_size,
+            "Should copy full Y+UV buffer"
+        );
+        assert_eq!(
+            frame.data[expected_size - 1],
+            0xFF,
+            "Last byte should be copied"
+        );
+    }
+
+    /// Test VideoFrame::from_raw with synthetic I420 frame (odd dimensions)
+    #[test]
+    fn test_videoframe_from_raw_i420_odd() {
+        let width = 1921;
+        let height = 1081;
+        let y_stride = 1921;
+        let expected_size = 3_115_321; // Y + U + V with ceiling division
+
+        let mut data = vec![0u8; expected_size];
+        data[expected_size - 1] = 0xAA;
+
+        let c_frame = NDIlib_video_frame_v2_t {
+            xres: width,
+            yres: height,
+            FourCC: PixelFormat::I420.into(),
+            frame_rate_N: 30,
+            frame_rate_D: 1,
+            picture_aspect_ratio: 16.0 / 9.0,
+            frame_format_type: ScanType::Progressive.into(),
+            timecode: 0,
+            p_data: data.as_mut_ptr(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: y_stride,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 0,
+        };
+
+        let frame = unsafe { VideoFrame::from_raw(&c_frame) }.expect("from_raw should succeed");
+
+        assert_eq!(
+            frame.data.len(),
+            expected_size,
+            "I420 odd dimensions: full buffer copied"
+        );
+        assert_eq!(frame.data[expected_size - 1], 0xAA, "Last byte copied");
+    }
+
+    /// Regression test: VideoFrame::from_raw with packed format should be unchanged
+    #[test]
+    fn test_videoframe_from_raw_packed_regression() {
+        let width = 1920;
+        let height = 1080;
+        let stride = 1920 * 4; // BGRA
+        let expected_size = (stride * height) as usize;
+
+        let mut data = vec![0u8; expected_size];
+
+        let c_frame = NDIlib_video_frame_v2_t {
+            xres: width,
+            yres: height,
+            FourCC: PixelFormat::BGRA.into(),
+            frame_rate_N: 60,
+            frame_rate_D: 1,
+            picture_aspect_ratio: 16.0 / 9.0,
+            frame_format_type: ScanType::Progressive.into(),
+            timecode: 0,
+            p_data: data.as_mut_ptr(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: stride,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 0,
+        };
+
+        let frame = unsafe { VideoFrame::from_raw(&c_frame) }.expect("from_raw should succeed");
+        assert_eq!(
+            frame.data.len(),
+            expected_size,
+            "BGRA buffer size unchanged"
+        );
     }
 }
