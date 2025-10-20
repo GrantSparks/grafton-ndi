@@ -1388,17 +1388,31 @@ pub enum ImageFormat {
 /// ```
 pub struct VideoFrameRef<'rx> {
     guard: RecvVideoGuard<'rx>,
+    pixel_format: PixelFormat,
 }
 
 impl<'rx> VideoFrameRef<'rx> {
     /// Create a borrowed video frame from an RAII guard.
     ///
+    /// Validates the FourCC and returns an error if it's unknown.
+    ///
     /// # Safety
     ///
     /// The caller must ensure the guard was created from a valid NDI receiver
     /// and contains a frame populated by `NDIlib_recv_capture_v3`.
-    pub(crate) unsafe fn new(guard: RecvVideoGuard<'rx>) -> Self {
-        Self { guard }
+    pub(crate) unsafe fn new(guard: RecvVideoGuard<'rx>) -> Result<Self> {
+        #[allow(clippy::unnecessary_cast)]
+        let pixel_format = PixelFormat::try_from(guard.frame().FourCC as u32).map_err(|_| {
+            Error::InvalidFrame(format!(
+                "Unknown pixel format FourCC: 0x{:08X}",
+                guard.frame().FourCC
+            ))
+        })?;
+
+        Ok(Self {
+            guard,
+            pixel_format,
+        })
     }
 
     /// Get the frame width in pixels.
@@ -1413,10 +1427,9 @@ impl<'rx> VideoFrameRef<'rx> {
 
     /// Get the pixel format (FourCC code).
     ///
-    /// Returns `PixelFormat::BGRA` as a fallback if the SDK returns an unknown format code.
+    /// This is guaranteed to be a valid, supported format since it's validated during construction.
     pub fn pixel_format(&self) -> PixelFormat {
-        #[allow(clippy::unnecessary_cast)]
-        PixelFormat::try_from(self.guard.frame().FourCC as u32).unwrap_or(PixelFormat::BGRA)
+        self.pixel_format
     }
 
     /// Get the frame rate numerator.
@@ -1455,8 +1468,7 @@ impl<'rx> VideoFrameRef<'rx> {
 
     /// Get the line stride or data size.
     pub fn line_stride_or_size(&self) -> LineStrideOrSize {
-        let pixel_format = self.pixel_format();
-        let is_uncompressed = is_uncompressed_format(pixel_format);
+        let is_uncompressed = is_uncompressed_format(self.pixel_format);
 
         if is_uncompressed {
             let line_stride = unsafe { self.guard.frame().__bindgen_anon_1.line_stride_in_bytes };
@@ -1491,14 +1503,13 @@ impl<'rx> VideoFrameRef<'rx> {
             return &[];
         }
 
-        let pixel_format = self.pixel_format();
-        let is_uncompressed = is_uncompressed_format(pixel_format);
+        let is_uncompressed = is_uncompressed_format(self.pixel_format);
 
         let data_size = if is_uncompressed {
             let line_stride = unsafe { frame.__bindgen_anon_1.line_stride_in_bytes };
             if line_stride > 0 && frame.yres > 0 && frame.xres > 0 {
                 // Use the new helper that correctly handles planar 4:2:0 formats
-                uncompressed_buffer_len(pixel_format, line_stride, frame.xres, frame.yres)
+                uncompressed_buffer_len(self.pixel_format, line_stride, frame.xres, frame.yres)
             } else {
                 0
             }
@@ -1582,17 +1593,30 @@ impl<'rx> fmt::Debug for VideoFrameRef<'rx> {
 /// ```
 pub struct AudioFrameRef<'rx> {
     guard: RecvAudioGuard<'rx>,
+    format: AudioFormat,
 }
 
 impl<'rx> AudioFrameRef<'rx> {
     /// Create a borrowed audio frame from an RAII guard.
     ///
+    /// Validates the FourCC and returns an error if it's unknown.
+    ///
     /// # Safety
     ///
     /// The caller must ensure the guard was created from a valid NDI receiver
     /// and contains a frame populated by `NDIlib_recv_capture_v3`.
-    pub(crate) unsafe fn new(guard: RecvAudioGuard<'rx>) -> Self {
-        Self { guard }
+    pub(crate) unsafe fn new(guard: RecvAudioGuard<'rx>) -> Result<Self> {
+        let format = match guard.frame().FourCC {
+            NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP => AudioFormat::FLTP,
+            _ => {
+                return Err(Error::InvalidFrame(format!(
+                    "Unknown audio format FourCC: 0x{:08X}",
+                    guard.frame().FourCC
+                )))
+            }
+        };
+
+        Ok(Self { guard, format })
     }
 
     /// Get the sample rate in Hz.
@@ -1622,12 +1646,9 @@ impl<'rx> AudioFrameRef<'rx> {
 
     /// Get the audio format (FourCC code).
     ///
-    /// Returns `AudioFormat::FLTP` as a fallback if the SDK returns an unknown format code.
+    /// This is guaranteed to be a valid, supported format since it's validated during construction.
     pub fn format(&self) -> AudioFormat {
-        match self.guard.frame().FourCC {
-            NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP => AudioFormat::FLTP,
-            _ => AudioFormat::FLTP,
-        }
+        self.format
     }
 
     /// Get the channel stride in bytes.
@@ -2072,5 +2093,230 @@ mod tests {
             expected_size,
             "BGRA buffer size unchanged"
         );
+    }
+
+    /// Test that VideoFrameRef::new rejects unknown FourCC
+    #[test]
+    fn test_videoframeref_unknown_fourcc() {
+        use crate::recv_guard::RecvVideoGuard;
+
+        let width = 1920;
+        let height = 1080;
+        let stride = 1920 * 4;
+        let expected_size = (stride * height) as usize;
+        let mut data = vec![0u8; expected_size];
+
+        // Use an unknown FourCC value (0xDEADBEEF)
+        #[allow(clippy::unnecessary_cast)]
+        let c_frame = NDIlib_video_frame_v2_t {
+            xres: width,
+            yres: height,
+            FourCC: 0xDEADBEEF as u32, // Unknown FourCC
+            frame_rate_N: 60,
+            frame_rate_D: 1,
+            picture_aspect_ratio: 16.0 / 9.0,
+            frame_format_type: ScanType::Progressive.into(),
+            timecode: 0,
+            p_data: data.as_mut_ptr(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: stride,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 0,
+        };
+
+        // Create a mock receiver instance (null is fine for this test since we don't free)
+        let mock_instance = ptr::null_mut();
+        let guard = unsafe { RecvVideoGuard::new(mock_instance, c_frame) };
+
+        // VideoFrameRef::new should return an error for unknown FourCC
+        let result = unsafe { VideoFrameRef::new(guard) };
+        assert!(result.is_err(), "Should reject unknown FourCC");
+
+        if let Err(Error::InvalidFrame(ref msg)) = result {
+            assert!(
+                msg.contains("0xDEADBEEF"),
+                "Error message should include FourCC: {}",
+                msg
+            );
+        } else {
+            panic!("Expected InvalidFrame error");
+        }
+
+        // Manually free to prevent guard from calling NDI free on null instance
+        std::mem::forget(result);
+    }
+
+    /// Test that VideoFrameRef::new accepts known FourCC and stores validated format
+    #[test]
+    fn test_videoframeref_known_fourcc() {
+        use crate::recv_guard::RecvVideoGuard;
+
+        let width = 1920;
+        let height = 1080;
+        let stride = 1920 * 4;
+        let expected_size = (stride * height) as usize;
+        let mut data = vec![0u8; expected_size];
+
+        let c_frame = NDIlib_video_frame_v2_t {
+            xres: width,
+            yres: height,
+            FourCC: PixelFormat::BGRA.into(),
+            frame_rate_N: 60,
+            frame_rate_D: 1,
+            picture_aspect_ratio: 16.0 / 9.0,
+            frame_format_type: ScanType::Progressive.into(),
+            timecode: 0,
+            p_data: data.as_mut_ptr(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: stride,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 0,
+        };
+
+        let mock_instance = ptr::null_mut();
+        let guard = unsafe { RecvVideoGuard::new(mock_instance, c_frame) };
+
+        let frame_ref = unsafe { VideoFrameRef::new(guard) }.expect("Should accept BGRA FourCC");
+        assert_eq!(
+            frame_ref.pixel_format(),
+            PixelFormat::BGRA,
+            "Should store validated pixel format"
+        );
+
+        // Manually free to prevent guard from calling NDI free on null instance
+        std::mem::forget(frame_ref);
+    }
+
+    /// Test that AudioFrameRef::new rejects unknown FourCC
+    #[test]
+    fn test_audioframeref_unknown_fourcc() {
+        use crate::recv_guard::RecvAudioGuard;
+
+        let num_samples = 1024;
+        let num_channels = 2;
+        let sample_count = (num_samples * num_channels) as usize;
+        let mut data = vec![0.0f32; sample_count];
+
+        // Use an unknown FourCC value (0xBADC0DE)
+        let c_frame = NDIlib_audio_frame_v3_t {
+            sample_rate: 48000,
+            no_channels: num_channels,
+            no_samples: num_samples,
+            timecode: 0,
+            FourCC: 0xBADC0DE, // Unknown audio FourCC
+            p_data: data.as_mut_ptr() as *mut u8,
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: num_samples * 4,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 0,
+        };
+
+        let mock_instance = ptr::null_mut();
+        let guard = unsafe { RecvAudioGuard::new(mock_instance, c_frame) };
+
+        let result = unsafe { AudioFrameRef::new(guard) };
+        assert!(result.is_err(), "Should reject unknown audio FourCC");
+
+        if let Err(Error::InvalidFrame(ref msg)) = result {
+            assert!(
+                msg.contains("0x0BADC0DE"),
+                "Error message should include FourCC: {}",
+                msg
+            );
+        } else {
+            panic!("Expected InvalidFrame error");
+        }
+
+        std::mem::forget(result);
+    }
+
+    /// Test that AudioFrameRef::new accepts known FourCC and stores validated format
+    #[test]
+    fn test_audioframeref_known_fourcc() {
+        use crate::recv_guard::RecvAudioGuard;
+
+        let num_samples = 1024;
+        let num_channels = 2;
+        let sample_count = (num_samples * num_channels) as usize;
+        let mut data = vec![0.0f32; sample_count];
+
+        let c_frame = NDIlib_audio_frame_v3_t {
+            sample_rate: 48000,
+            no_channels: num_channels,
+            no_samples: num_samples,
+            timecode: 0,
+            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            p_data: data.as_mut_ptr() as *mut u8,
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: num_samples * 4,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 0,
+        };
+
+        let mock_instance = ptr::null_mut();
+        let guard = unsafe { RecvAudioGuard::new(mock_instance, c_frame) };
+
+        let frame_ref = unsafe { AudioFrameRef::new(guard) }.expect("Should accept FLTP FourCC");
+        assert_eq!(
+            frame_ref.format(),
+            AudioFormat::FLTP,
+            "Should store validated audio format"
+        );
+
+        std::mem::forget(frame_ref);
+    }
+
+    /// Test that VideoFrameRef correctly uses validated format for data size calculation
+    #[test]
+    fn test_videoframeref_data_uses_validated_format() {
+        use crate::recv_guard::RecvVideoGuard;
+
+        // Test with uncompressed format (BGRA)
+        let width = 1920;
+        let height = 1080;
+        let stride = 1920 * 4;
+        let expected_size = (stride * height) as usize;
+        let mut data = vec![0xAB_u8; expected_size];
+
+        let c_frame = NDIlib_video_frame_v2_t {
+            xres: width,
+            yres: height,
+            FourCC: PixelFormat::BGRA.into(),
+            frame_rate_N: 60,
+            frame_rate_D: 1,
+            picture_aspect_ratio: 16.0 / 9.0,
+            frame_format_type: ScanType::Progressive.into(),
+            timecode: 0,
+            p_data: data.as_mut_ptr(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: stride,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 0,
+        };
+
+        let mock_instance = ptr::null_mut();
+        let guard = unsafe { RecvVideoGuard::new(mock_instance, c_frame) };
+        let frame_ref = unsafe { VideoFrameRef::new(guard) }.expect("Should create frame ref");
+
+        // Verify data() returns correct size based on validated format
+        assert_eq!(
+            frame_ref.data().len(),
+            expected_size,
+            "data() should use validated pixel format for size calculation"
+        );
+
+        // Verify line_stride_or_size() uses validated format
+        assert_eq!(
+            frame_ref.line_stride_or_size(),
+            LineStrideOrSize::LineStrideBytes(stride),
+            "line_stride_or_size() should use validated format"
+        );
+
+        std::mem::forget(frame_ref);
     }
 }

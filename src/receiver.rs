@@ -647,7 +647,8 @@ impl Receiver {
             NDIlib_frame_type_e_NDIlib_frame_type_video => {
                 // Create RAII guard to ensure the frame is freed
                 let guard = unsafe { RecvVideoGuard::new(self.instance, video_frame) };
-                let frame_ref = unsafe { VideoFrameRef::new(guard) };
+                // Validate FourCC during construction - this may return an error
+                let frame_ref = unsafe { VideoFrameRef::new(guard)? };
                 // Guard is moved into VideoFrameRef; will be freed when VideoFrameRef drops
                 Ok(Some(frame_ref))
             }
@@ -838,7 +839,8 @@ impl Receiver {
             NDIlib_frame_type_e_NDIlib_frame_type_audio => {
                 // Create RAII guard to ensure the frame is freed
                 let guard = unsafe { RecvAudioGuard::new(self.instance, audio_frame) };
-                let frame_ref = unsafe { AudioFrameRef::new(guard) };
+                // Validate FourCC during construction - this may return an error
+                let frame_ref = unsafe { AudioFrameRef::new(guard)? };
                 // Guard is moved into AudioFrameRef; will be freed when AudioFrameRef drops
                 Ok(Some(frame_ref))
             }
