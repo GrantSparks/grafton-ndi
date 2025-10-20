@@ -239,6 +239,7 @@ pub struct AsyncVideoToken<'a, 'buf> {
     #[allow(dead_code)]
     inner: &'a Arc<Inner>,
     _buffer: &'buf [u8],
+    _metadata: Option<&'buf CStr>,
 }
 
 impl Drop for AsyncVideoToken<'_, '_> {
@@ -621,6 +622,7 @@ impl<'a> Sender<'a> {
         AsyncVideoToken {
             inner: &self.inner,
             _buffer: video_frame.data,
+            _metadata: video_frame.metadata,
         }
     }
 

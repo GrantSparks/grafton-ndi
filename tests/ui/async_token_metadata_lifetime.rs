@@ -1,0 +1,30 @@
+// This test verifies that metadata cannot be dropped while an async token is held
+// It should fail to compile with a lifetime error
+
+use grafton_ndi::{BorrowedVideoFrame, PixelFormat, Sender, SenderOptions, NDI};
+use std::ffi::CString;
+
+fn main() {
+    let ndi = NDI::new().unwrap();
+    let send_options = SenderOptions::builder("Test").clock_video(true).build();
+    let mut sender = Sender::new(&ndi, &send_options).unwrap();
+
+    // Test: Metadata cannot be dropped while token is held
+    let mut video_buffer = vec![0u8; 1920 * 1080 * 4];
+
+    let _token = {
+        // Create metadata with a short lifetime
+        let metadata_string = CString::new("test metadata").unwrap();
+        let mut frame =
+            BorrowedVideoFrame::from_buffer(&video_buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
+        frame.metadata = Some(&metadata_string);
+
+        sender.send_video_async(&frame)
+        // metadata_string is dropped here
+    };
+
+    // This should fail to compile because _token holds a borrow to metadata
+    // which was dropped when metadata_string went out of scope
+    // Error: `metadata_string` does not live long enough
+    drop(_token);
+}
