@@ -18,7 +18,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
         .build();
     let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
 
-    let source_name = sender.get_source_name()?;
+    let source_name = sender.source()?;
     println!("Created NDI sender: {source_name}");
 
     // Pre-allocate a single buffer (demonstrating single-buffer with callback)

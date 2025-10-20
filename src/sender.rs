@@ -335,6 +335,89 @@ impl Drop for AsyncVideoToken<'_, '_> {
     }
 }
 
+impl<'a, 'buf> AsyncVideoToken<'a, 'buf> {
+    /// Explicitly wait for the async video operation to complete.
+    ///
+    /// This method provides an explicit way to wait for completion instead of relying on `Drop`.
+    /// It consumes the token, ensuring the buffer is safe to reuse after this call returns.
+    ///
+    /// # Behavior by SDK Version
+    ///
+    /// - **Standard SDK**: Sends a NULL frame to flush the pipeline, blocking until all pending
+    ///   async video operations complete. This is the same behavior as dropping the token.
+    /// - **Advanced SDK** (with `advanced_sdk` feature): Waits for the SDK completion callback to signal
+    ///   that the buffer has been released, with a 5-second timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Timeout`] if waiting for completion times out (advanced SDK only).
+    /// With the standard SDK, this method always succeeds but may block.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, SenderOptions, PixelFormat};
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::new()?;
+    /// let options = SenderOptions::builder("Test Sender").build();
+    /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
+    ///
+    /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
+    /// let token = sender.send_video_async(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1)?;
+    ///
+    /// // Explicitly wait for completion instead of relying on Drop
+    /// token.wait()?;
+    ///
+    /// // Now safe to reuse or drop the buffer
+    /// buffer.clear();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn wait(self) -> Result<()> {
+        // Drop impl handles the wait logic
+        drop(self);
+        Ok(())
+    }
+
+    /// Check if the async video operation has completed (advanced SDK only).
+    ///
+    /// This method is only available when the `advanced_sdk` feature is enabled, as it requires
+    /// SDK completion callbacks to track the completion state.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the NDI SDK has called the completion callback, indicating the buffer is no longer
+    /// in use. `false` if the operation is still pending.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "advanced_sdk")]
+    /// # {
+    /// # use grafton_ndi::{NDI, SenderOptions, PixelFormat};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::new()?;
+    /// let options = SenderOptions::builder("Test Sender").build();
+    /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
+    ///
+    /// let buffer = vec![0u8; 1920 * 1080 * 4];
+    /// let token = sender.send_video_async(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1)?;
+    ///
+    /// // Poll for completion
+    /// while !token.is_complete() {
+    ///     std::thread::sleep(std::time::Duration::from_millis(1));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    #[cfg(feature = "advanced_sdk")]
+    pub fn is_complete(&self) -> bool {
+        self.inner.async_state.completed.load(Ordering::Acquire)
+    }
+}
+
 impl<'a> Sender<'a> {
     /// Creates a new NDI send instance.
     ///
@@ -617,24 +700,54 @@ impl<'a> Sender<'a> {
         Ok(())
     }
 
-    /// Get tally information (program/preview state).
+    /// Get the current tally state for this sender.
     ///
     /// # Arguments
     ///
-    /// * `tally` - Mutable reference to Tally struct to be populated
     /// * `timeout` - Maximum time to wait for tally information.
     ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
     ///
     /// # Returns
     ///
-    /// `true` if tally was successfully retrieved, `false` on timeout
+    /// `Ok(Some(tally))` if tally was successfully retrieved, `Ok(None)` on timeout.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
-    pub fn get_tally(&self, tally: &mut Tally, timeout: Duration) -> Result<bool> {
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, SenderOptions};
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::new()?;
+    /// let options = SenderOptions::builder("Test Sender").build();
+    /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
+    ///
+    /// // Try to get tally with 1 second timeout
+    /// if let Some(tally) = sender.tally(Duration::from_secs(1))? {
+    ///     println!("On program: {}, On preview: {}", tally.on_program, tally.on_preview);
+    /// } else {
+    ///     println!("Tally request timed out");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn tally(&self, timeout: Duration) -> Result<Option<Tally>> {
         let timeout_ms = to_ms_checked(timeout)?;
-        Ok(unsafe { NDIlib_send_get_tally(self.inner.instance, &mut tally.to_raw(), timeout_ms) })
+        let mut raw_tally = Tally::new(false, false).to_raw();
+        let success =
+            unsafe { NDIlib_send_get_tally(self.inner.instance, &mut raw_tally, timeout_ms) };
+
+        if success {
+            Ok(Some(Tally {
+                on_program: raw_tally.on_program,
+                on_preview: raw_tally.on_preview,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Get the number of active connections to this sender.
@@ -646,14 +759,38 @@ impl<'a> Sender<'a> {
     ///
     /// # Returns
     ///
-    /// Number of connections, or a negative value on error/timeout.
+    /// Number of active connections as a `u32`.
     ///
     /// # Errors
     ///
+    /// Returns [`Error::Timeout`] if the SDK returns a negative value (indicating timeout or error).
     /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
-    pub fn get_no_connections(&self, timeout: Duration) -> Result<i32> {
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, SenderOptions};
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::new()?;
+    /// let options = SenderOptions::builder("Test Sender").build();
+    /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
+    ///
+    /// // Get connection count with 1 second timeout
+    /// let count = sender.connection_count(Duration::from_secs(1))?;
+    /// println!("Active connections: {}", count);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn connection_count(&self, timeout: Duration) -> Result<u32> {
         let timeout_ms = to_ms_checked(timeout)?;
-        Ok(unsafe { NDIlib_send_get_no_connections(self.inner.instance, timeout_ms) })
+        let count = unsafe { NDIlib_send_get_no_connections(self.inner.instance, timeout_ms) };
+
+        if count < 0 {
+            Err(Error::Timeout("Failed to obtain connection count".into()))
+        } else {
+            Ok(count as u32)
+        }
     }
 
     pub fn clear_connection_metadata(&self) {
@@ -682,7 +819,7 @@ impl<'a> Sender<'a> {
         Ok(())
     }
 
-    /// Get the source name for this sender.
+    /// Get the source information for this sender.
     ///
     /// # Errors
     ///
@@ -695,13 +832,14 @@ impl<'a> Sender<'a> {
     /// # use grafton_ndi::{NDI, SenderOptions};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let ndi = NDI::new()?;
-    /// let sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build()?)?;
-    /// let source = sender.get_source_name()?;
+    /// let options = SenderOptions::builder("Test Sender").build();
+    /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
+    /// let source = sender.source()?;
     /// println!("Sender source: {source}");
     /// # Ok(())
     /// # }
     /// ```
-    pub fn get_source_name(&self) -> Result<Source> {
+    pub fn source(&self) -> Result<Source> {
         let source_ptr = unsafe { NDIlib_send_get_source_name(self.inner.instance) };
         Source::try_from_raw(source_ptr)
     }
