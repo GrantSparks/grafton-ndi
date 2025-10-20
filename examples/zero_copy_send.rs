@@ -1,9 +1,9 @@
+use grafton_ndi::{BorrowedVideoFrame, PixelFormat, SenderOptions, NDI};
+
 use std::{
     sync::mpsc,
     time::{Duration, Instant},
 };
-
-use grafton_ndi::{BorrowedVideoFrame, PixelFormat, SenderOptions, NDI};
 
 fn main() -> Result<(), grafton_ndi::Error> {
     // Initialize NDI

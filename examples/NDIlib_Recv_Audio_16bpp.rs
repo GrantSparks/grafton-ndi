@@ -7,9 +7,13 @@
 
 use grafton_ndi::{Error, Finder, FinderOptions, Receiver, ReceiverOptions, NDI};
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 fn main() -> Result<(), Error> {
     // Set up signal handler for graceful shutdown
@@ -20,10 +24,8 @@ fn main() -> Result<(), Error> {
     })
     .expect("Error setting Ctrl-C handler");
 
-    // Initialize NDI
     let ndi = NDI::new()?;
 
-    // Create finder
     let finder_options = FinderOptions::builder().build();
     let finder = Finder::new(&ndi, &finder_options)?;
 
@@ -48,7 +50,6 @@ fn main() -> Result<(), Error> {
     // Run for one minute
     let start = Instant::now();
     while !exit_loop.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(60) {
-        // Check for video frames
         if let Some(video_frame) = receiver.capture_video_timeout(Duration::ZERO)? {
             println!(
                 "Video data received ({width}x{height}).",
@@ -57,14 +58,12 @@ fn main() -> Result<(), Error> {
             );
         }
 
-        // Check for audio frames
         if let Some(audio_frame) = receiver.capture_audio_timeout(Duration::ZERO)? {
             println!(
                 "Audio data received ({num_samples} samples).",
                 num_samples = audio_frame.num_samples
             );
 
-            // Convert to 16-bit interleaved format
             let audio_16bit = convert_to_16bit_interleaved(&audio_frame, 20); // 20dB headroom
 
             // Here you would process the 16-bit audio data
@@ -74,12 +73,10 @@ fn main() -> Result<(), Error> {
             );
         }
 
-        // Check for metadata
         if let Some(_metadata) = receiver.capture_metadata_timeout(Duration::ZERO)? {
             println!("Meta data received.");
         }
 
-        // Check for status changes
         if let Some(_status) = receiver.poll_status_change(Duration::ZERO)? {
             println!("Receiver connection status changed.");
         }
@@ -106,10 +103,8 @@ fn convert_to_16bit_interleaved(
     // Calculate scaling factor based on reference level
     let scale = 10.0_f32.powf(-reference_level_db as f32 / 20.0) * 32767.0;
 
-    // Get the float audio data
     let float_data = audio_frame.data();
 
-    // Convert and clip
     for (i, &sample) in float_data.iter().enumerate() {
         let scaled = sample * scale;
         output[i] = if scaled > 32767.0 {

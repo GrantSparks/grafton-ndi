@@ -1,10 +1,10 @@
+use grafton_ndi::{Finder, FinderOptions, Receiver, ReceiverBandwidth, ReceiverOptions, NDI};
+
 use std::{
     env,
     io::{self, Write},
     time::Duration,
 };
-
-use grafton_ndi::{Finder, FinderOptions, Receiver, ReceiverBandwidth, ReceiverOptions, NDI};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
@@ -37,11 +37,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sources
             .into_iter()
             .find(|s| s.name.contains(&name))
-            .ok_or_else(|| format!("Source '{}' not found", name))?
+            .ok_or_else(|| format!("Source '{name}' not found"))?
     } else {
         println!("\nAvailable sources:");
         for (i, source) in sources.iter().enumerate() {
-            println!("  {}: {}", i, source);
+            println!("  {i}: {source}");
         }
         println!("\nUsing first source: {}", sources[0]);
         sources[0].clone()
@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
     let receiver = Receiver::new(&ndi, &options)?;
 
-    println!("\nMonitoring status changes for: {}", source);
+    println!("\nMonitoring status changes for: {source}");
     println!("Press Ctrl+C to exit\n");
 
     // Monitor status changes
@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if let Some(connections) = status.connections {
-                print!("| Connections: {} ", connections);
+                print!("| Connections: {connections} ");
             }
 
             if status.other {

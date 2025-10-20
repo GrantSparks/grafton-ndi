@@ -41,11 +41,11 @@ static FLUSH_MUTEX: Mutex<()> = Mutex::new(());
 /// Internal state that is reference-counted and shared between SendInstance and tokens
 struct Inner {
     instance: NDIlib_send_instance_t,
-    name: *mut c_char,   // Store raw pointer to free on drop
-    groups: *mut c_char, // Store raw pointer to free on drop
+    name: *mut c_char,
+    groups: *mut c_char,
     async_state: AsyncState,
-    destroyed: AtomicBool,           // Flag to ensure drop runs only once
-    callback_ptr: AtomicPtr<c_void>, // Store the raw pointer passed to NDI SDK
+    destroyed: AtomicBool,
+    callback_ptr: AtomicPtr<c_void>,
 }
 
 #[derive(Debug)]
@@ -58,12 +58,10 @@ type AsyncCallback = Box<dyn Fn(usize) + Send + Sync>;
 
 /// Async completion state for video frames
 struct AsyncState {
-    // Video async state (only video supports async in NDI SDK)
     video_buffer_ptr: AtomicPtr<u8>,
     video_buffer_len: AtomicUsize,
     video_callback: OnceLock<AsyncCallback>,
 
-    // Completion signaling for advanced_sdk callback-based completion
     #[cfg(feature = "advanced_sdk")]
     completed: AtomicBool,
     #[cfg(feature = "advanced_sdk")]
@@ -105,7 +103,7 @@ impl Default for AsyncState {
             video_callback: OnceLock::new(),
 
             #[cfg(feature = "advanced_sdk")]
-            completed: AtomicBool::new(true), // Start as completed (no frame in flight)
+            completed: AtomicBool::new(true),
             #[cfg(feature = "advanced_sdk")]
             completion_lock: Mutex::new(()),
             #[cfg(feature = "advanced_sdk")]
@@ -141,7 +139,6 @@ pub struct BorrowedVideoFrame<'buf> {
 }
 
 impl<'buf> BorrowedVideoFrame<'buf> {
-    /// Create a borrowed frame from a mutable buffer
     pub fn from_buffer(
         data: &'buf [u8],
         width: i32,
@@ -219,35 +216,21 @@ pub struct AsyncVideoToken<'a, 'buf> {
     // The compiler doesn't track field access through references in Drop
     #[allow(dead_code)]
     inner: &'a Arc<Inner>,
-    // Hold a real borrow of the buffer to prevent it from being dropped
     _buffer: &'buf [u8],
 }
 
-// Note: AsyncVideoToken implements Send because PhantomData<&'buf mut [u8]> is Send.
-// This allows the token to be moved between threads, though the underlying buffer
-// lifetime is still properly tracked.
-
 impl Drop for AsyncVideoToken<'_, '_> {
     fn drop(&mut self) {
-        // When using SDK callbacks, the callback handles notification
         #[cfg(not(feature = "advanced_sdk"))]
         {
-            // With the single-flight API, we always flush when the token drops
             // Use compare_exchange to atomically check if Inner is being destroyed
-            // This prevents use-after-free race conditions
             let not_destroyed = self
                 .inner
                 .destroyed
-                .compare_exchange(
-                    false,
-                    false, // Don't actually change it, just check atomically
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                )
+                .compare_exchange(false, false, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok();
 
             if not_destroyed {
-                // Send NULL frame to flush per NDI docs
                 let null_frame = NDIlib_video_frame_v2_t {
                     p_data: std::ptr::null_mut(),
                     xres: 0,
@@ -265,35 +248,27 @@ impl Drop for AsyncVideoToken<'_, '_> {
                     timestamp: 0,
                 };
 
-                // On Windows, serialize flush operations to prevent deadlock
                 #[cfg(target_os = "windows")]
                 {
                     let _lock = FLUSH_MUTEX.lock().unwrap();
                     unsafe {
-                        // This blocks until all pending async operations complete
                         NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
                     }
                 }
 
                 #[cfg(not(target_os = "windows"))]
                 unsafe {
-                    // This blocks until all pending async operations complete
                     NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
                 }
             }
 
-            // Notify callback after flush
             if let Some(callback) = self.inner.async_state.video_callback.get() {
-                // Notify with the buffer length
                 callback(self._buffer.len());
             }
         }
 
-        // When advanced_sdk is enabled, wait for the callback to signal completion
         #[cfg(feature = "advanced_sdk")]
         {
-            // Wait for completion with a timeout to prevent indefinite hangs
-            // Use a reasonable timeout (e.g., 5 seconds for a single frame)
             let timeout = Duration::from_secs(5);
 
             let mut guard = self.inner.async_state.completion_lock.lock().unwrap();
@@ -302,8 +277,6 @@ impl Drop for AsyncVideoToken<'_, '_> {
             while !self.inner.async_state.completed.load(Ordering::Acquire) {
                 let elapsed = start.elapsed();
                 if elapsed >= timeout {
-                    // Timeout occurred - log warning but don't panic
-                    // The buffer may still be in use by NDI, which is a correctness issue
                     eprintln!(
                         "Warning: AsyncVideoToken dropped after timeout waiting for NDI completion callback"
                     );
@@ -327,7 +300,6 @@ impl Drop for AsyncVideoToken<'_, '_> {
                 }
             }
 
-            // Call user callback after completion
             if let Some(callback) = self.inner.async_state.video_callback.get() {
                 callback(self._buffer.len());
             }
@@ -376,7 +348,6 @@ impl<'a, 'buf> AsyncVideoToken<'a, 'buf> {
     /// # }
     /// ```
     pub fn wait(self) -> Result<()> {
-        // Drop impl handles the wait logic
         drop(self);
         Ok(())
     }
@@ -484,9 +455,6 @@ impl<'a> Sender<'a> {
                 callback_ptr: AtomicPtr::new(ptr::null_mut()),
             });
 
-            // Register SDK callback for async video completion if available
-            // This requires NDI Advanced SDK 6.1.1+ which exports NDIlib_send_set_video_async_completion
-            // NOTE: This function is only available in the Advanced SDK, not the standard SDK
             #[cfg(feature = "advanced_sdk")]
             {
                 // Store a non-owning pointer for the callback (no refcount increment)
@@ -496,7 +464,7 @@ impl<'a> Sender<'a> {
                 let raw_inner = Arc::as_ptr(&inner) as *mut c_void;
                 inner.callback_ptr.store(raw_inner, Ordering::Release);
 
-                #[allow(dead_code)] // Will be used when NDIlib_send_set_video_async_completion is available
+                #[allow(dead_code)]
                 extern "C" fn video_done_cb(
                     opaque: *mut c_void,
                     frame: *const NDIlib_video_frame_v2_t,
@@ -508,42 +476,34 @@ impl<'a> Sender<'a> {
                         // 2. The Arc<Inner> is kept alive by the Sender that registered this callback
                         let inner: &Inner = &*(opaque as *const Inner);
 
-                        // Determine the data size by reading the correct union field based on format.
-                        // We must avoid UB by reading ONLY the active union field.
                         let len = if !frame.is_null() {
                             #[allow(clippy::unnecessary_cast)]
-                            // Required for Windows where FourCC is i32
                             let fourcc = PixelFormat::try_from((*frame).FourCC as u32)
                                 .unwrap_or(PixelFormat::BGRA);
 
                             if is_uncompressed_format(fourcc) {
-                                // Uncompressed format: read ONLY line_stride_in_bytes
                                 let line_stride = (*frame).__bindgen_anon_1.line_stride_in_bytes;
                                 let height = (*frame).yres;
                                 (line_stride as usize) * (height as usize)
                             } else {
-                                // Compressed/unknown format: read ONLY data_size_in_bytes
                                 (*frame).__bindgen_anon_1.data_size_in_bytes as usize
                             }
                         } else {
                             0
                         };
 
-                        // Signal completion by setting the atomic flag and notifying waiters
                         inner.async_state.completed.store(true, Ordering::Release);
                         {
                             let _lock = inner.async_state.completion_lock.lock().unwrap();
                             inner.async_state.completion_cv.notify_all();
                         }
 
-                        // Call the user's completion callback if set
                         if let Some(cb) = inner.async_state.video_callback.get() {
                             (cb)(len);
                         }
                     }
                 }
 
-                // Register the callback if the function is available in the SDK
                 #[cfg(has_async_completion_callback)]
                 unsafe {
                     NDIlib_send_set_video_async_completion(
@@ -553,8 +513,6 @@ impl<'a> Sender<'a> {
                     );
                 }
 
-                // If the callback is not available, clear the pointer
-                // (no Arc cleanup needed since we didn't create an owning pointer)
                 #[cfg(not(has_async_completion_callback))]
                 {
                     inner.callback_ptr.store(ptr::null_mut(), Ordering::Release);
@@ -626,7 +584,6 @@ impl<'a> Sender<'a> {
         &'b mut self,
         video_frame: &BorrowedVideoFrame<'b>,
     ) -> AsyncVideoToken<'b, 'b> {
-        // Clear completion flag before sending (advanced_sdk only)
         #[cfg(feature = "advanced_sdk")]
         {
             self.inner
@@ -894,7 +851,6 @@ impl<'a> Sender<'a> {
     /// # }
     /// ```
     pub fn flush_async_blocking(&self) {
-        // Send NULL frame per NDI docs to wait for all async operations
         let null_frame = NDIlib_video_frame_v2_t {
             p_data: std::ptr::null_mut(),
             xres: 0,
@@ -912,19 +868,16 @@ impl<'a> Sender<'a> {
             timestamp: 0,
         };
 
-        // On Windows, serialize flush operations to prevent deadlock
         #[cfg(target_os = "windows")]
         {
             let _lock = FLUSH_MUTEX.lock().unwrap();
             unsafe {
-                // This blocks until all pending async operations complete
                 NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
             }
         }
 
         #[cfg(not(target_os = "windows"))]
         unsafe {
-            // This blocks until all pending async operations complete
             NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
         }
     }
@@ -960,7 +913,6 @@ impl<'a> Sender<'a> {
     pub fn flush_async(&self, timeout: Duration) -> Result<()> {
         #[cfg(feature = "advanced_sdk")]
         {
-            // Wait for completion with timeout
             let mut guard = self.inner.async_state.completion_lock.lock().unwrap();
             let start = std::time::Instant::now();
 
@@ -993,8 +945,7 @@ impl<'a> Sender<'a> {
 
         #[cfg(not(feature = "advanced_sdk"))]
         {
-            // Without advanced SDK, use the null-frame flush
-            let _ = timeout; // Suppress unused warning
+            let _ = timeout;
             self.flush_async_blocking();
             Ok(())
         }
@@ -1003,31 +954,17 @@ impl<'a> Sender<'a> {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // Prevent double-drop with maximum visibility
         if self.destroyed.swap(true, Ordering::SeqCst) {
             return;
         }
 
-        // Add a fence to ensure all previous operations are visible
         std::sync::atomic::fence(Ordering::SeqCst);
 
-        // With the single-flight API, all tokens must be gone by this point
-        // since tokens hold a borrow of the Arc<Inner>
-
-        // Now destroy the NDI instance
         unsafe {
-            // NDI SDK guarantees all async operations complete before this returns
             NDIlib_send_destroy(self.instance);
         }
 
-        // Then handle other cleanup
         unsafe {
-            // No Arc cleanup needed anymore - we use non-owning pointers for callbacks.
-            // The callback is unregistered in Sender::drop before Inner::drop runs,
-            // so callback_ptr is just a raw pointer with no ownership semantics.
-
-            // Free the CStrings we allocated
-            // These must be freed after NDIlib_send_destroy to ensure the SDK is done with them
             if !self.name.is_null() {
                 let _ = CString::from_raw(self.name);
             }
@@ -1040,13 +977,11 @@ impl Drop for Inner {
 
 impl Drop for Sender<'_> {
     fn drop(&mut self) {
-        // Unregister callback before Inner is destroyed (advanced_sdk only)
         #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
         {
             let callback_ptr = self.inner.callback_ptr.load(Ordering::Acquire);
             if !callback_ptr.is_null() {
                 unsafe {
-                    // Unregister the callback to ensure no further invocations
                     NDIlib_send_set_video_async_completion(
                         self.inner.instance,
                         ptr::null_mut(),
@@ -1054,8 +989,6 @@ impl Drop for Sender<'_> {
                     );
                 }
 
-                // Wait for any in-flight callback to complete using existing completion mechanism
-                // Use a bounded timeout to prevent indefinite hangs
                 let timeout = Duration::from_secs(5);
                 let mut guard = self.inner.async_state.completion_lock.lock().unwrap();
                 let start = std::time::Instant::now();
@@ -1086,14 +1019,11 @@ impl Drop for Sender<'_> {
                     }
                 }
 
-                // Clear the callback pointer after unregistration and wait
                 self.inner
                     .callback_ptr
                     .store(ptr::null_mut(), Ordering::Release);
             }
         }
-
-        // The Inner will be dropped when all Arc references are gone
     }
 }
 

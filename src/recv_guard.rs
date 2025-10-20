@@ -5,8 +5,9 @@
 //! These guards are private implementation details that prevent frame leaks
 //! in the receive path.
 
-use crate::ndi_lib::*;
 use std::marker::PhantomData;
+
+use crate::ndi_lib::*;
 
 /// RAII guard for a captured video frame.
 ///

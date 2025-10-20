@@ -9,7 +9,11 @@ use std::{
     ptr, slice,
 };
 
-use crate::{ndi_lib::*, Error, Result};
+use crate::{
+    ndi_lib::*,
+    recv_guard::{RecvAudioGuard, RecvMetadataGuard, RecvVideoGuard},
+    Error, Result,
+};
 
 /// Video pixel format identifiers (FourCC codes).
 ///
@@ -1245,8 +1249,6 @@ pub enum ImageFormat {
 // ============================================================================
 // Zero-copy borrowed receive frames
 // ============================================================================
-
-use crate::recv_guard::{RecvAudioGuard, RecvMetadataGuard, RecvVideoGuard};
 
 /// A zero-copy borrowed video frame.
 ///

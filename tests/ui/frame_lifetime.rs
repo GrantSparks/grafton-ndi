@@ -1,8 +1,9 @@
 // This test demonstrates that frames cannot outlive their receivers
 // It should fail to compile with a lifetime error
 
-use grafton_ndi::{Receiver, ReceiverOptions, Source, SourceAddress, NDI};
 use std::time::Duration;
+
+use grafton_ndi::{Receiver, ReceiverOptions, Source, SourceAddress, NDI};
 
 fn main() {
     let ndi = NDI::new().unwrap();

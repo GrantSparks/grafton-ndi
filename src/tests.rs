@@ -755,17 +755,14 @@ fn test_image_format_enum() {
     let png = ImageFormat::Png;
     let jpeg = ImageFormat::Jpeg(90);
 
-    // Should be able to clone and copy
     let png_copy = png;
     let jpeg_copy = jpeg;
 
     assert_eq!(png, png_copy);
     assert_eq!(jpeg, jpeg_copy);
 
-    // Different formats should not be equal
     assert_ne!(png, jpeg);
 
-    // Different JPEG qualities should not be equal
     let jpeg_low = ImageFormat::Jpeg(50);
     let jpeg_high = ImageFormat::Jpeg(95);
     assert_ne!(jpeg_low, jpeg_high);
@@ -777,11 +774,9 @@ fn test_source_cache_len_and_is_empty() {
 
     let cache = SourceCache::default();
 
-    // Initially empty
     assert_eq!(cache.len(), 0);
     assert!(cache.is_empty());
 
-    // After clear, still empty
     cache.clear();
     assert_eq!(cache.len(), 0);
     assert!(cache.is_empty());
@@ -799,14 +794,9 @@ fn test_receiver_snapshot_preset() {
         address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
     };
 
-    // Test that snapshot preset returns a valid builder that can be further customized
     let builder = ReceiverOptionsBuilder::snapshot_preset(source.clone());
-
-    // Should be able to further customize the preset
     let customized = builder.name("My Snapshot Receiver");
-
-    // Verify it's the same underlying builder type
-    let _ = format!("{:?}", customized);
+    let _ = format!("{customized:?}");
 }
 
 #[test]
@@ -821,14 +811,9 @@ fn test_receiver_high_quality_preset() {
         address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
     };
 
-    // Test that high quality preset returns a valid builder
     let builder = ReceiverOptionsBuilder::high_quality_preset(source.clone());
-
-    // Should be able to further customize
     let customized = builder.name("My HQ Receiver");
-
-    // Verify it's a valid builder
-    let _ = format!("{:?}", customized);
+    let _ = format!("{customized:?}");
 }
 
 #[test]
@@ -843,14 +828,9 @@ fn test_receiver_monitoring_preset() {
         address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
     };
 
-    // Test that monitoring preset returns a valid builder
     let builder = ReceiverOptionsBuilder::monitoring_preset(source.clone());
-
-    // Should be able to further customize
     let customized = builder.name("My Monitor");
-
-    // Verify it's a valid builder
-    let _ = format!("{:?}", customized);
+    let _ = format!("{customized:?}");
 }
 
 #[test]
@@ -865,12 +845,9 @@ fn test_receiver_presets_are_distinct() {
         address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
     };
 
-    // All three preset methods should exist and be callable
     let _snapshot = ReceiverOptionsBuilder::snapshot_preset(source.clone());
     let _hq = ReceiverOptionsBuilder::high_quality_preset(source.clone());
     let _monitor = ReceiverOptionsBuilder::monitoring_preset(source.clone());
-
-    // If we got here without panicking, the presets exist and are usable
 }
 
 // Async runtime integration tests (feature-gated)
