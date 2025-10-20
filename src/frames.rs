@@ -1202,7 +1202,7 @@ pub(crate) fn uncompressed_buffer_len(
 }
 
 /// Calculate the line stride (bytes per row) for a given video format
-pub(crate) fn calculate_line_stride(fourcc: PixelFormat, width: i32) -> i32 {
+pub fn calculate_line_stride(fourcc: PixelFormat, width: i32) -> i32 {
     match fourcc {
         PixelFormat::BGRA | PixelFormat::BGRX | PixelFormat::RGBA | PixelFormat::RGBX => width * 4, // 32 bpp = 4 bytes per pixel
         PixelFormat::UYVY => width * 2, // 16 bpp = 2 bytes per pixel

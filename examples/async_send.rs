@@ -42,8 +42,14 @@ fn main() -> Result<(), grafton_ndi::Error> {
             pixel[3] = 255; // A
         }
 
-        let frame =
-            BorrowedVideoFrame::from_buffer(&video_buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
+        let frame = BorrowedVideoFrame::try_from_uncompressed(
+            &video_buffer,
+            1920,
+            1080,
+            PixelFormat::BGRA,
+            30,
+            1,
+        )?;
 
         println!("Sending video frame...");
         let start = Instant::now();
@@ -81,8 +87,14 @@ fn main() -> Result<(), grafton_ndi::Error> {
 
         println!("Sending 3 video frames sequentially...");
         for (idx, buffer) in buffers.iter().enumerate() {
-            let frame =
-                BorrowedVideoFrame::from_buffer(buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
+            let frame = BorrowedVideoFrame::try_from_uncompressed(
+                buffer,
+                1920,
+                1080,
+                PixelFormat::BGRA,
+                30,
+                1,
+            )?;
 
             let frame_num = idx + 1;
             println!("Sending frame {frame_num}...");

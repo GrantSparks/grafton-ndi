@@ -49,8 +49,14 @@ fn test_rapid_sender_lifecycle() -> Result<(), grafton_ndi::Error> {
 
         let buffer = vec![0u8; 640 * 480 * 4];
         for _ in 0..2 {
-            let borrowed_frame =
-                BorrowedVideoFrame::from_buffer(&buffer, 640, 480, PixelFormat::BGRA, 30, 1);
+            let borrowed_frame = BorrowedVideoFrame::try_from_uncompressed(
+                &buffer,
+                640,
+                480,
+                PixelFormat::BGRA,
+                30,
+                1,
+            )?;
             let _token = sender.send_video_async(&borrowed_frame);
         }
 
@@ -114,14 +120,14 @@ fn test_concurrent_sender_lifecycle() -> Result<(), grafton_ndi::Error> {
 
                 let buffer = vec![0u8; 640 * 480 * 4];
                 for _ in 0..2 {
-                    let borrowed_frame = BorrowedVideoFrame::from_buffer(
+                    let borrowed_frame = BorrowedVideoFrame::try_from_uncompressed(
                         &buffer,
                         640,
                         480,
                         PixelFormat::BGRA,
                         30,
                         1,
-                    );
+                    )?;
                     let _token = sender.send_video_async(&borrowed_frame);
                 }
 
@@ -180,8 +186,14 @@ fn test_no_callbacks_after_drop() -> Result<(), grafton_ndi::Error> {
 
         let buffer = vec![0u8; 640 * 480 * 4];
         for _ in 0..3 {
-            let borrowed_frame =
-                BorrowedVideoFrame::from_buffer(&buffer, 640, 480, PixelFormat::BGRA, 30, 1);
+            let borrowed_frame = BorrowedVideoFrame::try_from_uncompressed(
+                &buffer,
+                640,
+                480,
+                PixelFormat::BGRA,
+                30,
+                1,
+            )?;
             let _token = sender.send_video_async(&borrowed_frame);
         }
 
@@ -230,7 +242,7 @@ fn test_flush_waits_for_callback() -> Result<(), grafton_ndi::Error> {
     let buffer = vec![0u8; 640 * 480 * 4];
     for _ in 0..3 {
         let borrowed_frame =
-            BorrowedVideoFrame::from_buffer(&buffer, 640, 480, PixelFormat::BGRA, 30, 1);
+            BorrowedVideoFrame::try_from_uncompressed(&buffer, 640, 480, PixelFormat::BGRA, 30, 1)?;
         let _token = sender.send_video_async(&borrowed_frame);
     }
 

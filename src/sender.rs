@@ -123,33 +123,87 @@ unsafe impl Sync for Inner {}
 
 /// A borrowed video frame that references external pixel data.
 /// Used for zero-copy async send operations.
+///
+/// Fields are private to enforce safety invariants - use `try_from_uncompressed`,
+/// `try_from_compressed`, or `from_parts_unchecked` to construct.
 pub struct BorrowedVideoFrame<'buf> {
-    pub width: i32,
-    pub height: i32,
-    pub pixel_format: PixelFormat,
-    pub frame_rate_n: i32,
-    pub frame_rate_d: i32,
-    pub picture_aspect_ratio: f32,
-    pub scan_type: ScanType,
-    pub timecode: i64,
-    pub data: &'buf [u8],
-    pub line_stride_or_size: LineStrideOrSize,
-    pub metadata: Option<&'buf CStr>,
-    pub timestamp: i64,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+    pub(crate) pixel_format: PixelFormat,
+    pub(crate) frame_rate_n: i32,
+    pub(crate) frame_rate_d: i32,
+    pub(crate) picture_aspect_ratio: f32,
+    pub(crate) scan_type: ScanType,
+    pub(crate) timecode: i64,
+    pub(crate) data: &'buf [u8],
+    pub(crate) line_stride_or_size: LineStrideOrSize,
+    pub(crate) metadata: Option<&'buf CStr>,
+    pub(crate) timestamp: i64,
 }
 
 impl<'buf> BorrowedVideoFrame<'buf> {
-    pub fn from_buffer(
+    /// Create a borrowed video frame from an uncompressed pixel buffer.
+    ///
+    /// This constructor validates that the buffer is large enough for the specified
+    /// dimensions and pixel format, returning an error if validation fails.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - Borrowed slice containing pixel data
+    /// * `width` - Frame width in pixels
+    /// * `height` - Frame height in pixels
+    /// * `pixel_format` - Uncompressed pixel format (BGRA, UYVY, etc.)
+    /// * `frame_rate_n` - Frame rate numerator (e.g., 60 for 60fps, 30000 for 29.97fps)
+    /// * `frame_rate_d` - Frame rate denominator (e.g., 1 for 60fps, 1001 for 29.97fps)
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidFrame` if the buffer is too small for the specified format.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{BorrowedVideoFrame, PixelFormat};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let buffer = vec![0u8; 1920 * 1080 * 4]; // BGRA buffer
+    /// let frame = BorrowedVideoFrame::try_from_uncompressed(
+    ///     &buffer,
+    ///     1920,
+    ///     1080,
+    ///     PixelFormat::BGRA,
+    ///     30,
+    ///     1
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn try_from_uncompressed(
         data: &'buf [u8],
         width: i32,
         height: i32,
         pixel_format: PixelFormat,
         frame_rate_n: i32,
         frame_rate_d: i32,
-    ) -> Self {
-        let stride = calculate_line_stride(pixel_format, width);
+    ) -> Result<Self> {
+        use crate::frames::uncompressed_buffer_len;
 
-        BorrowedVideoFrame {
+        let stride = calculate_line_stride(pixel_format, width);
+        let expected_len = uncompressed_buffer_len(pixel_format, stride, width, height);
+
+        if data.len() < expected_len {
+            return Err(Error::InvalidFrame(format!(
+                "Buffer too small for format {:?}: got {} bytes, expected at least {} bytes \
+                 (width={}, height={}, stride={})",
+                pixel_format,
+                data.len(),
+                expected_len,
+                width,
+                height,
+                stride
+            )));
+        }
+
+        Ok(BorrowedVideoFrame {
             width,
             height,
             pixel_format,
@@ -162,32 +216,214 @@ impl<'buf> BorrowedVideoFrame<'buf> {
             line_stride_or_size: LineStrideOrSize::LineStrideBytes(stride),
             metadata: None,
             timestamp: 0,
+        })
+    }
+
+    /// Create a borrowed video frame from a compressed payload.
+    ///
+    /// This constructor validates that the buffer is large enough for the specified
+    /// data size, returning an error if validation fails.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - Borrowed slice containing compressed data
+    /// * `data_size_bytes` - Size of compressed data in bytes
+    /// * `width` - Frame width in pixels
+    /// * `height` - Frame height in pixels
+    /// * `pixel_format` - Compressed pixel format
+    /// * `frame_rate_n` - Frame rate numerator
+    /// * `frame_rate_d` - Frame rate denominator
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidFrame` if the buffer is too small for `data_size_bytes`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{BorrowedVideoFrame, PixelFormat};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let compressed_data = vec![0u8; 100000]; // Compressed payload
+    /// let frame = BorrowedVideoFrame::try_from_compressed(
+    ///     &compressed_data,
+    ///     100000,
+    ///     1920,
+    ///     1080,
+    ///     PixelFormat::UYVY,
+    ///     30,
+    ///     1
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn try_from_compressed(
+        data: &'buf [u8],
+        data_size_bytes: i32,
+        width: i32,
+        height: i32,
+        pixel_format: PixelFormat,
+        frame_rate_n: i32,
+        frame_rate_d: i32,
+    ) -> Result<Self> {
+        let expected_len = data_size_bytes as usize;
+
+        if data.len() < expected_len {
+            return Err(Error::InvalidFrame(format!(
+                "Buffer too small for compressed format {:?}: got {} bytes, expected at least {} bytes",
+                pixel_format,
+                data.len(),
+                expected_len
+            )));
+        }
+
+        Ok(BorrowedVideoFrame {
+            width,
+            height,
+            pixel_format,
+            frame_rate_n,
+            frame_rate_d,
+            picture_aspect_ratio: 16.0 / 9.0,
+            scan_type: ScanType::Progressive,
+            timecode: 0,
+            data,
+            line_stride_or_size: LineStrideOrSize::DataSizeBytes(data_size_bytes),
+            metadata: None,
+            timestamp: 0,
+        })
+    }
+
+    /// Create a borrowed video frame without validation (unsafe).
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    /// - For uncompressed formats: `data.len() >= uncompressed_buffer_len(pixel_format, line_stride, width, height)`
+    /// - For compressed formats: `data.len() >= data_size_bytes`
+    /// - `width`, `height`, `frame_rate_n`, and `frame_rate_d` are valid (non-negative, non-zero where appropriate)
+    /// - The stride/size in `line_stride_or_size` matches the actual data layout
+    ///
+    /// Violating these invariants will cause the NDI SDK to read out of bounds through FFI,
+    /// leading to undefined behavior.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{BorrowedVideoFrame, PixelFormat, LineStrideOrSize};
+    /// # use grafton_ndi::frames::calculate_line_stride;
+    /// let buffer = vec![0u8; 1920 * 1080 * 4];
+    /// let stride = calculate_line_stride(PixelFormat::BGRA, 1920);
+    ///
+    /// // SAFETY: Buffer is correctly sized for 1920x1080 BGRA
+    /// let frame = unsafe {
+    ///     BorrowedVideoFrame::from_parts_unchecked(
+    ///         &buffer,
+    ///         1920,
+    ///         1080,
+    ///         PixelFormat::BGRA,
+    ///         30,
+    ///         1,
+    ///         16.0 / 9.0,
+    ///         grafton_ndi::ScanType::Progressive,
+    ///         0,
+    ///         LineStrideOrSize::LineStrideBytes(stride),
+    ///         None,
+    ///         0,
+    ///     )
+    /// };
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn from_parts_unchecked(
+        data: &'buf [u8],
+        width: i32,
+        height: i32,
+        pixel_format: PixelFormat,
+        frame_rate_n: i32,
+        frame_rate_d: i32,
+        picture_aspect_ratio: f32,
+        scan_type: ScanType,
+        timecode: i64,
+        line_stride_or_size: LineStrideOrSize,
+        metadata: Option<&'buf CStr>,
+        timestamp: i64,
+    ) -> Self {
+        BorrowedVideoFrame {
+            width,
+            height,
+            pixel_format,
+            frame_rate_n,
+            frame_rate_d,
+            picture_aspect_ratio,
+            scan_type,
+            timecode,
+            data,
+            line_stride_or_size,
+            metadata,
+            timestamp,
         }
     }
 
+    /// Get the frame width in pixels.
+    pub fn width(&self) -> i32 {
+        self.width
+    }
+
+    /// Get the frame height in pixels.
+    pub fn height(&self) -> i32 {
+        self.height
+    }
+
+    /// Get the pixel format.
+    pub fn pixel_format(&self) -> PixelFormat {
+        self.pixel_format
+    }
+
+    /// Get the frame rate numerator.
+    pub fn frame_rate_n(&self) -> i32 {
+        self.frame_rate_n
+    }
+
+    /// Get the frame rate denominator.
+    pub fn frame_rate_d(&self) -> i32 {
+        self.frame_rate_d
+    }
+
+    /// Get the picture aspect ratio.
+    pub fn picture_aspect_ratio(&self) -> f32 {
+        self.picture_aspect_ratio
+    }
+
+    /// Get the scan type.
+    pub fn scan_type(&self) -> ScanType {
+        self.scan_type
+    }
+
+    /// Get the timecode.
+    pub fn timecode(&self) -> i64 {
+        self.timecode
+    }
+
+    /// Get a reference to the pixel data.
+    pub fn data(&self) -> &[u8] {
+        self.data
+    }
+
+    /// Get the line stride or data size.
+    pub fn line_stride_or_size(&self) -> LineStrideOrSize {
+        self.line_stride_or_size
+    }
+
+    /// Get the metadata, if any.
+    pub fn metadata(&self) -> Option<&CStr> {
+        self.metadata
+    }
+
+    /// Get the timestamp.
+    pub fn timestamp(&self) -> i64 {
+        self.timestamp
+    }
+
     fn to_raw(&self) -> NDIlib_video_frame_v2_t {
-        // Debug-only validation: Ensure user-provided buffer is correctly sized for the format
-        #[cfg(debug_assertions)]
-        {
-            use crate::frames::uncompressed_buffer_len;
-
-            if let LineStrideOrSize::LineStrideBytes(stride) = self.line_stride_or_size {
-                let expected_len =
-                    uncompressed_buffer_len(self.pixel_format, stride, self.width, self.height);
-                debug_assert!(
-                    self.data.len() >= expected_len,
-                    "Buffer too small for format {:?}: got {} bytes, expected at least {} bytes \
-                     (width={}, height={}, stride={})",
-                    self.pixel_format,
-                    self.data.len(),
-                    expected_len,
-                    self.width,
-                    self.height,
-                    stride
-                );
-            }
-        }
-
+        // Validation is now performed at construction time, so no runtime checks needed here
         NDIlib_video_frame_v2_t {
             xres: self.width,
             yres: self.height,
@@ -359,7 +595,7 @@ impl<'a, 'buf> AsyncVideoToken<'a, 'buf> {
     /// let mut sender = grafton_ndi::Sender::new(&ndi, &options)?;
     ///
     /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
-    /// let borrowed_frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
+    /// let borrowed_frame = BorrowedVideoFrame::try_from_uncompressed(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1)?;
     /// let token = sender.send_video_async(&borrowed_frame);
     ///
     /// // Explicitly wait for completion instead of relying on Drop
@@ -397,7 +633,7 @@ impl<'a, 'buf> AsyncVideoToken<'a, 'buf> {
     /// let mut sender = grafton_ndi::Sender::new(&ndi, &options)?;
     ///
     /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
-    /// let borrowed_frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
+    /// let borrowed_frame = BorrowedVideoFrame::try_from_uncompressed(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1)?;
     /// let token = sender.send_video_async(&borrowed_frame);
     ///
     /// // Poll for completion
@@ -593,7 +829,7 @@ impl<'a> Sender<'a> {
     ///
     /// // Use borrowed buffer directly (zero-copy, no allocation)
     /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
-    /// let borrowed_frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
+    /// let borrowed_frame = BorrowedVideoFrame::try_from_uncompressed(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1)?;
     /// let token = sender.send_video_async(&borrowed_frame);
     ///
     /// // Buffer is owned by SDK until token is dropped
@@ -862,7 +1098,7 @@ impl<'a> Sender<'a> {
     /// let mut sender = grafton_ndi::Sender::new(&ndi, &options)?;
     ///
     /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
-    /// let frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
+    /// let frame = BorrowedVideoFrame::try_from_uncompressed(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1)?;
     /// let token = sender.send_video_async(&frame);
     ///
     /// // Drop token to release the mutable borrow, then flush
@@ -1164,6 +1400,263 @@ impl SenderOptionsBuilder {
             groups: self.groups,
             clock_video,
             clock_audio,
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frames::{calculate_line_stride, uncompressed_buffer_len};
+
+    #[test]
+    fn test_try_from_uncompressed_exact_size() {
+        // BGRA format: 1920x1080x4 bytes
+        let buffer = vec![0u8; 1920 * 1080 * 4];
+        let result = BorrowedVideoFrame::try_from_uncompressed(
+            &buffer,
+            1920,
+            1080,
+            PixelFormat::BGRA,
+            30,
+            1,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_try_from_uncompressed_oversized_buffer() {
+        // Buffer larger than needed should succeed
+        let buffer = vec![0u8; 1920 * 1080 * 4 + 1000];
+        let result = BorrowedVideoFrame::try_from_uncompressed(
+            &buffer,
+            1920,
+            1080,
+            PixelFormat::BGRA,
+            30,
+            1,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_try_from_uncompressed_undersized_buffer() {
+        // Buffer too small should fail
+        let buffer = vec![0u8; 1920 * 1080 * 4 - 1];
+        let result = BorrowedVideoFrame::try_from_uncompressed(
+            &buffer,
+            1920,
+            1080,
+            PixelFormat::BGRA,
+            30,
+            1,
+        );
+        assert!(result.is_err());
+        if let Err(Error::InvalidFrame(msg)) = result {
+            assert!(msg.contains("Buffer too small"));
+            assert!(msg.contains("BGRA"));
+        }
+    }
+
+    #[test]
+    fn test_try_from_uncompressed_uyvy() {
+        // UYVY format: 1920x1080x2 bytes
+        let expected_size = 1920 * 1080 * 2;
+        let buffer = vec![0u8; expected_size];
+        let result = BorrowedVideoFrame::try_from_uncompressed(
+            &buffer,
+            1920,
+            1080,
+            PixelFormat::UYVY,
+            60,
+            1,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_try_from_uncompressed_nv12() {
+        // NV12 planar format: Y plane + UV plane
+        let width = 1920;
+        let height = 1080;
+        let stride = calculate_line_stride(PixelFormat::NV12, width);
+        let expected_size = uncompressed_buffer_len(PixelFormat::NV12, stride, width, height);
+        let buffer = vec![0u8; expected_size];
+
+        let result = BorrowedVideoFrame::try_from_uncompressed(
+            &buffer,
+            width,
+            height,
+            PixelFormat::NV12,
+            30,
+            1,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_try_from_uncompressed_i420() {
+        // I420 planar format
+        let width = 640;
+        let height = 480;
+        let stride = calculate_line_stride(PixelFormat::I420, width);
+        let expected_size = uncompressed_buffer_len(PixelFormat::I420, stride, width, height);
+        let buffer = vec![0u8; expected_size];
+
+        let result = BorrowedVideoFrame::try_from_uncompressed(
+            &buffer,
+            width,
+            height,
+            PixelFormat::I420,
+            30,
+            1,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_try_from_compressed_exact_size() {
+        let data_size = 100000;
+        let buffer = vec![0u8; data_size];
+        let result = BorrowedVideoFrame::try_from_compressed(
+            &buffer,
+            data_size as i32,
+            1920,
+            1080,
+            PixelFormat::UYVY,
+            30,
+            1,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_try_from_compressed_undersized() {
+        let data_size = 100000;
+        let buffer = vec![0u8; data_size - 1];
+        let result = BorrowedVideoFrame::try_from_compressed(
+            &buffer,
+            data_size as i32,
+            1920,
+            1080,
+            PixelFormat::UYVY,
+            30,
+            1,
+        );
+        assert!(result.is_err());
+        if let Err(Error::InvalidFrame(msg)) = result {
+            assert!(msg.contains("Buffer too small"));
+        }
+    }
+
+    #[test]
+    fn test_from_parts_unchecked() {
+        let buffer = vec![0u8; 1920 * 1080 * 4];
+        let stride = calculate_line_stride(PixelFormat::BGRA, 1920);
+
+        // SAFETY: Buffer is correctly sized for 1920x1080 BGRA
+        let frame = unsafe {
+            BorrowedVideoFrame::from_parts_unchecked(
+                &buffer,
+                1920,
+                1080,
+                PixelFormat::BGRA,
+                30,
+                1,
+                16.0 / 9.0,
+                ScanType::Progressive,
+                0,
+                LineStrideOrSize::LineStrideBytes(stride),
+                None,
+                0,
+            )
+        };
+
+        assert_eq!(frame.width(), 1920);
+        assert_eq!(frame.height(), 1080);
+        assert_eq!(frame.pixel_format(), PixelFormat::BGRA);
+    }
+
+    #[test]
+    fn test_getters() {
+        let buffer = vec![0u8; 1920 * 1080 * 4];
+        let frame = BorrowedVideoFrame::try_from_uncompressed(
+            &buffer,
+            1920,
+            1080,
+            PixelFormat::BGRA,
+            60,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(frame.width(), 1920);
+        assert_eq!(frame.height(), 1080);
+        assert_eq!(frame.pixel_format(), PixelFormat::BGRA);
+        assert_eq!(frame.frame_rate_n(), 60);
+        assert_eq!(frame.frame_rate_d(), 1);
+        assert_eq!(frame.picture_aspect_ratio(), 16.0 / 9.0);
+        assert_eq!(frame.scan_type(), ScanType::Progressive);
+        assert_eq!(frame.timecode(), 0);
+        assert_eq!(frame.data().len(), buffer.len());
+        assert!(frame.metadata().is_none());
+        assert_eq!(frame.timestamp(), 0);
+    }
+
+    #[test]
+    fn test_all_pixel_formats_validation() {
+        // Test that validation works correctly for all pixel formats
+        let test_cases = vec![
+            (PixelFormat::BGRA, 1920, 1080, 1920 * 1080 * 4),
+            (PixelFormat::RGBA, 1920, 1080, 1920 * 1080 * 4),
+            (PixelFormat::BGRX, 1920, 1080, 1920 * 1080 * 4),
+            (PixelFormat::RGBX, 1920, 1080, 1920 * 1080 * 4),
+            (PixelFormat::UYVY, 1920, 1080, 1920 * 1080 * 2),
+            (PixelFormat::UYVA, 1920, 1080, 1920 * 1080 * 3),
+            (PixelFormat::P216, 1920, 1080, 1920 * 1080 * 4),
+            (PixelFormat::PA16, 1920, 1080, 1920 * 1080 * 4),
+        ];
+
+        for (format, width, height, expected_min_size) in test_cases {
+            // Exact size should work
+            let buffer = vec![0u8; expected_min_size];
+            let result =
+                BorrowedVideoFrame::try_from_uncompressed(&buffer, width, height, format, 30, 1);
+            assert!(result.is_ok(), "Failed for format {:?}", format);
+
+            // One byte too small should fail
+            if expected_min_size > 0 {
+                let buffer = vec![0u8; expected_min_size - 1];
+                let result = BorrowedVideoFrame::try_from_uncompressed(
+                    &buffer, width, height, format, 30, 1,
+                );
+                assert!(result.is_err(), "Should fail for undersized {:?}", format);
+            }
+        }
+    }
+
+    #[test]
+    fn test_planar_formats() {
+        // Test planar 4:2:0 formats (NV12, I420, YV12)
+        let width = 1920;
+        let height = 1080;
+
+        for format in [PixelFormat::NV12, PixelFormat::I420, PixelFormat::YV12] {
+            let stride = calculate_line_stride(format, width);
+            let expected_size = uncompressed_buffer_len(format, stride, width, height);
+
+            let buffer = vec![0u8; expected_size];
+            let result =
+                BorrowedVideoFrame::try_from_uncompressed(&buffer, width, height, format, 30, 1);
+            assert!(result.is_ok(), "Failed for planar format {:?}", format);
+
+            // One byte too small should fail
+            if expected_size > 0 {
+                let buffer = vec![0u8; expected_size - 1];
+                let result = BorrowedVideoFrame::try_from_uncompressed(
+                    &buffer, width, height, format, 30, 1,
+                );
+                assert!(result.is_err(), "Should fail for undersized {:?}", format);
+            }
         }
     }
 }

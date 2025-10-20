@@ -37,8 +37,14 @@ fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
                     *byte = ((i + frame_num + thread_id * 1000) % 256) as u8;
                 }
 
-                let borrowed_frame =
-                    BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
+                let borrowed_frame = BorrowedVideoFrame::try_from_uncompressed(
+                    &buffer,
+                    1920,
+                    1080,
+                    PixelFormat::BGRA,
+                    30,
+                    1,
+                )?;
 
                 let token = sender.send_video_async(&borrowed_frame);
 
@@ -86,8 +92,14 @@ fn test_immediate_sender_drop() -> Result<(), grafton_ndi::Error> {
 
         {
             let buffer = vec![0u8; 1920 * 1080 * 4];
-            let borrowed_frame =
-                BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
+            let borrowed_frame = BorrowedVideoFrame::try_from_uncompressed(
+                &buffer,
+                1920,
+                1080,
+                PixelFormat::BGRA,
+                30,
+                1,
+            )?;
 
             let _token = sender.send_video_async(&borrowed_frame);
         }
@@ -112,8 +124,14 @@ fn test_flush_async() -> Result<(), grafton_ndi::Error> {
     let buffers: Vec<Vec<u8>> = (0..10).map(|i| vec![i as u8; 1920 * 1080 * 4]).collect();
 
     for buffer in buffers.iter() {
-        let borrowed_frame =
-            BorrowedVideoFrame::from_buffer(buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
+        let borrowed_frame = BorrowedVideoFrame::try_from_uncompressed(
+            buffer,
+            1920,
+            1080,
+            PixelFormat::BGRA,
+            30,
+            1,
+        )?;
         let token = sender.send_video_async(&borrowed_frame);
         drop(token);
     }

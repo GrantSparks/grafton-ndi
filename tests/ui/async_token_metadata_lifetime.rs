@@ -15,9 +15,26 @@ fn main() {
     let _token = {
         // Create metadata with a short lifetime
         let metadata_string = CString::new("test metadata").unwrap();
-        let mut frame =
-            BorrowedVideoFrame::from_buffer(&video_buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
-        frame.metadata = Some(&metadata_string);
+
+        // SAFETY: This is intentionally unsafe to test lifetime bounds
+        // The buffer is properly sized, but metadata lifetime is intentionally incorrect for the test
+        let frame = unsafe {
+            use grafton_ndi::{LineStrideOrSize, ScanType};
+            BorrowedVideoFrame::from_parts_unchecked(
+                &video_buffer,
+                1920,
+                1080,
+                PixelFormat::BGRA,
+                30,
+                1,
+                16.0 / 9.0,
+                ScanType::Progressive,
+                0,
+                LineStrideOrSize::LineStrideBytes(1920 * 4),
+                Some(&metadata_string),
+                0,
+            )
+        };
 
         sender.send_video_async(&frame)
         // metadata_string is dropped here

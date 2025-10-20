@@ -64,16 +64,19 @@
 //!
 //! ```no_run
 //! # use grafton_ndi::{NDI, SenderOptions, BorrowedVideoFrame, PixelFormat};
-//! # let ndi = NDI::new().unwrap();
-//! # let mut sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build()).unwrap();
+//! # fn main() -> Result<(), grafton_ndi::Error> {
+//! # let ndi = NDI::new()?;
+//! # let mut sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build())?;
 //! // Register callback to know when buffer is released
 //! sender.on_async_video_done(|len| println!("Buffer released: {} bytes", len));
 //!
 //! let buffer = vec![0u8; 1920 * 1080 * 4];
-//! let frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
+//! let frame = BorrowedVideoFrame::try_from_uncompressed(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1)?;
 //! let token = sender.send_video_async(&frame);
 //! // Buffer is now owned by NDI - cannot be modified until callback fires
 //! // The AsyncVideoToken must be kept alive to track the operation
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! Note: Only video supports async sending in the NDI SDK. Audio and metadata are always synchronous.
@@ -134,6 +137,8 @@ pub use {
 
 #[cfg(feature = "image-encoding")]
 pub use frames::ImageFormat;
+
+pub use frames::calculate_line_stride;
 
 /// Alias for Result with our Error type
 pub type Result<T> = std::result::Result<T, crate::error::Error>;

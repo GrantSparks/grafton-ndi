@@ -67,8 +67,14 @@ fn main() -> Result<(), grafton_ndi::Error> {
         generate_test_pattern(&mut buffer, width, height, frame_count);
 
         // Create a borrowed frame that references our buffer
-        let borrowed_frame =
-            BorrowedVideoFrame::from_buffer(&buffer, width, height, PixelFormat::BGRA, 60, 1);
+        let borrowed_frame = BorrowedVideoFrame::try_from_uncompressed(
+            &buffer,
+            width,
+            height,
+            PixelFormat::BGRA,
+            60,
+            1,
+        )?;
 
         // Send asynchronously - no copy happens here!
         let _token = sender.send_video_async(&borrowed_frame);
