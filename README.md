@@ -10,15 +10,15 @@ High-performance, idiomatic Rust bindings for the [NDI® 6 SDK](https://ndi.vide
 
 ## Features
 
-- **Zero-copy frame handling** - Minimal overhead for high-performance video processing
-- **Source caching & discovery** - Thread-safe caching eliminates repetitive discovery code
+- **Zero-copy receive** - Eliminates ~475 MB/s of memcpy at 1080p@60fps with borrowed frames
+- **Zero-copy send** - Async video transmission with completion callbacks
+- **Memory safe** - Eliminated 5+ classes of UB through compile-time enforcement
+- **Source caching** - Thread-safe `SourceCache` eliminates ~150 lines of boilerplate
 - **Image encoding** - One-line PNG/JPEG encoding and base64 data URLs (optional feature)
-- **Retry logic** - Reliable frame capture with automatic retry and blocking variants
 - **Async runtime support** - Native integration with Tokio and async-std (optional features)
-- **Async video sending** - Non-blocking video transmission with completion callbacks
 - **Thread-safe by design** - Safe concurrent access with Rust's ownership model
-- **Ergonomic API** - Builder patterns, presets, and idiomatic Rust interfaces
-- **Comprehensive type safety** - Strongly-typed color formats and frame types
+- **Ergonomic API** - Consistent, idiomatic Rust interface ready for 1.0
+- **Comprehensive type safety** - Strongly-typed with forward-compatible `#[non_exhaustive]` enums
 - **Cross-platform** - Full support for Windows, Linux, and macOS
 - **Battle-tested** - Used in production video streaming applications
 - **Advanced SDK support** - Optional features for NDI Advanced SDK users
@@ -120,15 +120,19 @@ Receives video, audio, and metadata from NDI sources.
 ```rust
 use std::time::Duration;
 
-// Assuming source is from finder.find_sources()
+// Assuming source is from finder.find_sources() or finder.sources()
 let options = ReceiverOptions::builder(source)
-    .color(ReceiverColorFormat::UYVY_BGRA)
+    .color(ReceiverColorFormat::RGBX_RGBA)
     .bandwidth(ReceiverBandwidth::Highest)
-    .build();
+    .build();  // Infallible
 let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
 
 // Capture a video frame (blocks until success or timeout)
 let frame = receiver.capture_video(Duration::from_secs(5))?;
+
+// Or use zero-copy for maximum performance
+let frame_ref = receiver.capture_video_ref(Duration::from_secs(5))?;
+let data = frame_ref.data();  // Direct reference, no copy!
 ```
 
 ### `Sender` - Video/Audio Transmission
@@ -137,14 +141,27 @@ Sends video, audio, and metadata as an NDI source.
 ```rust
 let options = SenderOptions::builder("Source Name")
     .clock_video(true)
-    .build();
-let sender = grafton_ndi::Sender::new(&ndi, &options)?;
+    .build();  // Infallible
+let mut sender = grafton_ndi::Sender::new(&ndi, &options)?;  // Must be mut for async send
+
+// Synchronous send
+sender.send_video(&video_frame)?;
+
+// Or async zero-copy send
+let token = sender.send_video_async(&borrowed_frame);
 ```
 
 ### Frame Types
-- `VideoFrame` - Video frame data with resolution, format, and timing
-- `AudioFrame` - 32-bit float audio samples with channel configuration
-- `MetadataFrame` - XML metadata for tally, PTZ, and custom data
+- **Owned Frames:**
+  - `VideoFrame` - Owned video frame data with resolution, pixel format, and timing
+  - `AudioFrame` - Owned 32-bit float audio samples with channel configuration
+  - `MetadataFrame` - Owned XML metadata for tally, PTZ, and custom data
+
+- **Borrowed Frames (Zero-Copy):**
+  - `VideoFrameRef<'rx>` - Zero-copy video frame reference (eliminates ~475 MB/s memcpy @ 1080p60)
+  - `AudioFrameRef<'rx>` - Zero-copy audio frame reference
+  - `MetadataFrameRef<'rx>` - Zero-copy metadata frame reference
+  - `BorrowedVideoFrame<'buf>` - Zero-copy send frame (for async transmission)
 
 ## Thread Safety
 
@@ -233,23 +250,48 @@ NDI® is a registered trademark of Vizrt NDI AB.
 
 ## What's New in 0.9
 
-Major ergonomic improvements based on production usage:
+Version 0.9.0 is a **major milestone** toward 1.0, with comprehensive API stabilization and significant improvements:
 
-- **Source Caching** - Thread-safe `SourceCache` eliminates ~150 lines of boilerplate per app
-- **Image Encoding** - One-line PNG/JPEG export with `encode_png()` and `encode_data_url()` (optional `image-encoding` feature)
-- **Reliable Frame Capture** - Built-in retry logic with `capture_video_blocking()` and friends
-- **Async Runtime Support** - Native Tokio and async-std integration (optional features)
-- **Audio Fix** - Audio sending now works correctly with new `AudioLayout` enum
+### 🎯 API Stabilization for 1.0
+- **Duration-based timeouts** - All timeout parameters now use `std::time::Duration` instead of `u32` milliseconds
+- **Consistent builders** - Both `Receiver` and `Sender` have symmetric, infallible builders
+- **Simplified capture** - 2 clear variants instead of 3 confusing ones (`capture_*` and `capture_*_timeout`)
+- **Type renames** - `FourCCVideoType` → `PixelFormat`, `FrameFormatType` → `ScanType`, `AudioType` → `AudioFormat`
+- **Forward compatibility** - All enums marked `#[non_exhaustive]` for future SDK versions
+- **Cleaner naming** - Removed `get_` prefixes per Rust API guidelines
+
+### 🚀 Zero-Copy Performance
+- **Zero-copy receive** - New `VideoFrameRef`, `AudioFrameRef`, `MetadataFrameRef` types
+- **Performance gain** - Eliminates ~475 MB/s of memcpy at 1080p@60fps
+- **Lifetime-safe** - Frame refs bound to `Receiver` lifetime, preventing use-after-free at compile-time
+
+### 🔒 Memory Safety & Correctness
+- **Sound async send** - Fixed critical use-after-free in `send_video_async`
+- **Typed stride/size** - Eliminated UB from union field access with typed `LineStrideOrSize` enum
+- **Non-null FFI** - All source pointers validated at FFI boundary
+- **Safe callbacks** - Fixed memory leaks and races in async completion callbacks
+
+### 🛠️ Ergonomics & Features
+- **Source caching** - Thread-safe `SourceCache` eliminates ~150 lines of boilerplate
+- **Image encoding** - One-line PNG/JPEG export (optional `image-encoding` feature)
+- **Async runtimes** - Native Tokio and async-std integration (optional features)
+- **Audio fixed** - Audio sending now actually works with proper `AudioLayout` support
+
+### ⚠️ Breaking Changes
+This release contains extensive breaking changes necessary for API stabilization. See [CHANGELOG.md](CHANGELOG.md) for the comprehensive migration guide with before/after examples.
+
+**Quick migration:**
+```rust
+// 0.8.1
+finder.wait_for_sources(5000);
+let sources = finder.get_sources(0)?;
+let frame = receiver.capture_video_blocking(5000)?;
+
+// 0.9.0
+use std::time::Duration;
+finder.wait_for_sources(Duration::from_secs(5))?;
+let sources = finder.sources(Duration::ZERO)?;
+let frame = receiver.capture_video(Duration::from_secs(5))?;
+```
 
 See [CHANGELOG.md](CHANGELOG.md) for complete details and migration guide.
-
-## Migration Guides
-
-For upgrading from previous versions:
-- [0.8.x to 0.9.x](docs/migration/0.8-to-0.9.md) - Ergonomic improvements, source caching, and audio fixes
-- [0.7.x to 0.8.x](docs/migration/0.7-to-0.8.md) - Async API additions
-- [0.6.x to 0.7.x](docs/migration/0.6-to-0.7.md) - Major API improvements
-- [0.5.x to 0.6.x](docs/migration/0.5-to-0.6.md) - Builder patterns and zero-copy operations
-- [0.4.x to 0.5.x](docs/migration/0.4-to-0.5.md) - Critical safety fixes and error handling
-- [0.3.x to 0.4.x](docs/migration/0.3-to-0.4.md) - Memory management improvements
-- [0.2.x to 0.3.x](docs/migration/0.2-to-0.3.md) - Lifetime changes and better validation
