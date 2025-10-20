@@ -1,12 +1,128 @@
 //! NDI runtime management and initialization.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
+
+use once_cell::sync::Lazy;
 
 use crate::{ndi_lib::*, Error, Result};
 
-static INIT: AtomicBool = AtomicBool::new(false);
-static INIT_FAILED: AtomicBool = AtomicBool::new(false);
-static REFCOUNT: AtomicUsize = AtomicUsize::new(0);
+/// State of the NDI runtime lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    /// Runtime has not been initialized yet.
+    Uninitialized,
+    /// Runtime is currently being initialized by another thread.
+    Initializing,
+    /// Runtime is initialized and active with the given reference count.
+    Initialized { refcount: usize },
+    /// Runtime is currently being destroyed.
+    Destroying,
+}
+
+/// Process-global runtime manager for NDI.
+struct RuntimeManager {
+    state: Mutex<State>,
+    cv: Condvar,
+}
+
+impl RuntimeManager {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(State::Uninitialized),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+
+        loop {
+            match *state {
+                State::Uninitialized => {
+                    // We'll be the initializer
+                    *state = State::Initializing;
+                    drop(state); // Release lock before calling FFI
+
+                    #[cfg(all(target_os = "windows", debug_assertions))]
+                    {
+                        if std::env::var("CI").is_ok() {
+                            eprintln!("[NDI] Initializing NDI runtime in CI environment...");
+                            if let Ok(sdk_dir) = std::env::var("NDI_SDK_DIR") {
+                                eprintln!("[NDI] NDI_SDK_DIR: {}", sdk_dir);
+                            }
+                        }
+                    }
+
+                    let init_succeeded = unsafe { NDIlib_initialize() };
+
+                    // Reacquire lock to update state
+                    state = self.state.lock().unwrap();
+
+                    if init_succeeded {
+                        *state = State::Initialized { refcount: 1 };
+                        self.cv.notify_all();
+                        return Ok(());
+                    } else {
+                        *state = State::Uninitialized;
+                        self.cv.notify_all();
+                        return Err(Error::InitializationFailed(
+                            "NDIlib_initialize failed".into(),
+                        ));
+                    }
+                }
+                State::Initializing | State::Destroying => {
+                    // Wait for the state to change
+                    state = self.cv.wait(state).unwrap();
+                }
+                State::Initialized { refcount } => {
+                    // Increment refcount and return
+                    *state = State::Initialized {
+                        refcount: refcount + 1,
+                    };
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+
+        match *state {
+            State::Initialized { refcount } => {
+                if refcount == 1 {
+                    // We're the last reference, destroy the runtime
+                    *state = State::Destroying;
+                    drop(state); // Release lock before calling FFI
+
+                    unsafe { NDIlib_destroy() };
+
+                    // Reacquire lock to update state
+                    state = self.state.lock().unwrap();
+                    *state = State::Uninitialized;
+                    self.cv.notify_all();
+                } else {
+                    // Decrement refcount
+                    *state = State::Initialized {
+                        refcount: refcount - 1,
+                    };
+                }
+            }
+            _ => {
+                // This should never happen in correct usage
+                #[cfg(debug_assertions)]
+                panic!("release() called in invalid state: {:?}", *state);
+            }
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        matches!(*state, State::Initialized { .. })
+    }
+}
+
+static RUNTIME: Lazy<RuntimeManager> = Lazy::new(RuntimeManager::new);
 
 /// Manages the NDI runtime lifecycle.
 ///
@@ -34,86 +150,6 @@ static REFCOUNT: AtomicUsize = AtomicUsize::new(0);
 pub struct NDI;
 
 impl NDI {
-    /// Internal method that performs the actual initialization.
-    ///
-    /// This method increments the reference counter and initializes the NDI SDK
-    /// if this is the first instance. It is called by `new()`.
-    fn acquire() -> Result<Self> {
-        // 1. Bump the counter immediately.
-        let prev = REFCOUNT.fetch_add(1, Ordering::SeqCst);
-
-        if prev == 0 {
-            // We are the first handle → initialise the runtime.
-
-            #[cfg(all(target_os = "windows", debug_assertions))]
-            {
-                if std::env::var("CI").is_ok() {
-                    eprintln!("[NDI] Initializing NDI runtime in CI environment...");
-                    if let Ok(sdk_dir) = std::env::var("NDI_SDK_DIR") {
-                        eprintln!("[NDI] NDI_SDK_DIR: {}", sdk_dir);
-                    }
-                }
-            }
-
-            if !unsafe { NDIlib_initialize() } {
-                // Roll the counter back and mark init as failed
-                REFCOUNT.fetch_sub(1, Ordering::SeqCst);
-                INIT_FAILED.store(true, Ordering::SeqCst);
-                return Err(Error::InitializationFailed(
-                    "NDIlib_initialize failed".into(),
-                ));
-            }
-            INIT.store(true, Ordering::SeqCst);
-        } else {
-            // Someone else is (or was) doing the initialisation.
-            // Check if it failed first
-            if INIT_FAILED.load(Ordering::SeqCst) {
-                REFCOUNT.fetch_sub(1, Ordering::SeqCst);
-                return Err(Error::InitializationFailed(
-                    "NDI initialization failed previously".into(),
-                ));
-            }
-            // Wait until initialization is done so the caller never sees an
-            // un-initialised runtime while REFCOUNT > 0.
-            let mut spin_count = 0;
-            let mut sleep_us = 1;
-            const MAX_SPIN: u32 = 100;
-            const MAX_SLEEP_US: u64 = 1000; // 1ms max
-
-            let start = std::time::Instant::now();
-            const INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-            while !INIT.load(Ordering::SeqCst) && !INIT_FAILED.load(Ordering::SeqCst) {
-                // Check for timeout
-                if start.elapsed() > INIT_TIMEOUT {
-                    REFCOUNT.fetch_sub(1, Ordering::SeqCst);
-                    return Err(Error::InitializationFailed(
-                        "NDI initialization timed out after 30 seconds".into(),
-                    ));
-                }
-
-                if spin_count < MAX_SPIN {
-                    // First, spin briefly for fast initialization
-                    std::hint::spin_loop();
-                    spin_count += 1;
-                } else {
-                    // Then use exponential backoff with sleep
-                    std::thread::sleep(std::time::Duration::from_micros(sleep_us));
-                    sleep_us = (sleep_us * 2).min(MAX_SLEEP_US);
-                }
-            }
-            // Check again after waiting
-            if INIT_FAILED.load(Ordering::SeqCst) {
-                REFCOUNT.fetch_sub(1, Ordering::SeqCst);
-                return Err(Error::InitializationFailed(
-                    "NDI initialization failed previously".into(),
-                ));
-            }
-        }
-
-        Ok(Self)
-    }
-
     /// Creates a new NDI instance.
     ///
     /// This method is the single entry point for creating NDI instances. It is thread-safe
@@ -123,10 +159,7 @@ impl NDI {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InitializationFailed`] if:
-    /// - The NDI SDK fails to initialize
-    /// - A previous initialization attempt failed
-    /// - Initialization times out (after 30 seconds)
+    /// Returns [`Error::InitializationFailed`] if the NDI SDK fails to initialize.
     ///
     /// # Examples
     ///
@@ -139,7 +172,8 @@ impl NDI {
     /// # }
     /// ```
     pub fn new() -> Result<Self> {
-        Self::acquire()
+        RUNTIME.acquire()?;
+        Ok(Self)
     }
 
     /// Checks if the current CPU is supported by the NDI SDK.
@@ -203,24 +237,21 @@ impl NDI {
     /// }
     /// ```
     pub fn is_running() -> bool {
-        INIT.load(std::sync::atomic::Ordering::SeqCst)
+        RUNTIME.is_running()
     }
 }
 
 impl Clone for NDI {
     fn clone(&self) -> Self {
-        REFCOUNT.fetch_add(1, Ordering::SeqCst);
+        RUNTIME
+            .acquire()
+            .expect("Runtime should be initialized when cloning existing NDI handle");
         Self
     }
 }
 
 impl Drop for NDI {
     fn drop(&mut self) {
-        // When the last handle vanishes, shut the runtime down.
-        if REFCOUNT.fetch_sub(1, Ordering::SeqCst) == 1 {
-            unsafe { NDIlib_destroy() };
-            INIT.store(false, Ordering::SeqCst);
-            INIT_FAILED.store(false, Ordering::SeqCst);
-        }
+        RUNTIME.release();
     }
 }
