@@ -2107,11 +2107,15 @@ mod tests {
         let mut data = vec![0u8; expected_size];
 
         // Use an unknown FourCC value (0xDEADBEEF)
+        // On Windows FourCC is i32, on Linux it's u32
         #[allow(clippy::unnecessary_cast)]
         let c_frame = NDIlib_video_frame_v2_t {
             xres: width,
             yres: height,
-            FourCC: 0xDEADBEEF as u32, // Unknown FourCC
+            #[cfg(target_os = "windows")]
+            FourCC: 0xDEADBEEFu32 as i32, // Unknown FourCC
+            #[cfg(not(target_os = "windows"))]
+            FourCC: 0xDEADBEEF, // Unknown FourCC
             frame_rate_N: 60,
             frame_rate_D: 1,
             picture_aspect_ratio: 16.0 / 9.0,
