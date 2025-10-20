@@ -1262,7 +1262,9 @@ use crate::recv_guard::{RecvAudioGuard, RecvMetadataGuard, RecvVideoGuard};
 ///
 /// # Lifetime
 ///
-/// The borrowed frame's lifetime is tied to the scope in which it's captured.
+/// The lifetime parameter `'rx` ties this frame to the `Receiver` that created it.
+/// The borrow checker ensures the receiver cannot be dropped while any frame
+/// references are alive, preventing use-after-free at compile time with zero runtime cost.
 /// The underlying NDI buffer is freed when `VideoFrameRef` is dropped.
 ///
 /// # Performance
@@ -1311,18 +1313,18 @@ use crate::recv_guard::{RecvAudioGuard, RecvMetadataGuard, RecvVideoGuard};
 /// # Ok(())
 /// # }
 /// ```
-pub struct VideoFrameRef {
-    guard: RecvVideoGuard,
+pub struct VideoFrameRef<'rx> {
+    guard: RecvVideoGuard<'rx>,
 }
 
-impl VideoFrameRef {
+impl<'rx> VideoFrameRef<'rx> {
     /// Create a borrowed video frame from an RAII guard.
     ///
     /// # Safety
     ///
     /// The caller must ensure the guard was created from a valid NDI receiver
     /// and contains a frame populated by `NDIlib_recv_capture_v3`.
-    pub(crate) unsafe fn new(guard: RecvVideoGuard) -> Self {
+    pub(crate) unsafe fn new(guard: RecvVideoGuard<'rx>) -> Self {
         Self { guard }
     }
 
@@ -1448,7 +1450,7 @@ impl VideoFrameRef {
     }
 }
 
-impl fmt::Debug for VideoFrameRef {
+impl<'rx> fmt::Debug for VideoFrameRef<'rx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VideoFrameRef")
             .field("width", &self.width())
@@ -1501,18 +1503,18 @@ impl fmt::Debug for VideoFrameRef {
 /// # Ok(())
 /// # }
 /// ```
-pub struct AudioFrameRef {
-    guard: RecvAudioGuard,
+pub struct AudioFrameRef<'rx> {
+    guard: RecvAudioGuard<'rx>,
 }
 
-impl AudioFrameRef {
+impl<'rx> AudioFrameRef<'rx> {
     /// Create a borrowed audio frame from an RAII guard.
     ///
     /// # Safety
     ///
     /// The caller must ensure the guard was created from a valid NDI receiver
     /// and contains a frame populated by `NDIlib_recv_capture_v3`.
-    pub(crate) unsafe fn new(guard: RecvAudioGuard) -> Self {
+    pub(crate) unsafe fn new(guard: RecvAudioGuard<'rx>) -> Self {
         Self { guard }
     }
 
@@ -1594,7 +1596,7 @@ impl AudioFrameRef {
     }
 }
 
-impl fmt::Debug for AudioFrameRef {
+impl<'rx> fmt::Debug for AudioFrameRef<'rx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AudioFrameRef")
             .field("sample_rate", &self.sample_rate())
@@ -1641,18 +1643,18 @@ impl fmt::Debug for AudioFrameRef {
 /// # Ok(())
 /// # }
 /// ```
-pub struct MetadataFrameRef {
-    guard: RecvMetadataGuard,
+pub struct MetadataFrameRef<'rx> {
+    guard: RecvMetadataGuard<'rx>,
 }
 
-impl MetadataFrameRef {
+impl<'rx> MetadataFrameRef<'rx> {
     /// Create a borrowed metadata frame from an RAII guard.
     ///
     /// # Safety
     ///
     /// The caller must ensure the guard was created from a valid NDI receiver
     /// and contains a frame populated by `NDIlib_recv_capture_v3`.
-    pub(crate) unsafe fn new(guard: RecvMetadataGuard) -> Self {
+    pub(crate) unsafe fn new(guard: RecvMetadataGuard<'rx>) -> Self {
         Self { guard }
     }
 
@@ -1686,7 +1688,7 @@ impl MetadataFrameRef {
     }
 }
 
-impl fmt::Debug for MetadataFrameRef {
+impl<'rx> fmt::Debug for MetadataFrameRef<'rx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MetadataFrameRef")
             .field("data", &self.data())

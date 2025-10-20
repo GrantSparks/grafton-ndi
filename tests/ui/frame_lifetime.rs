@@ -1,33 +1,31 @@
 // This test demonstrates that frames cannot outlive their receivers
-// It should fail to compile
+// It should fail to compile with a lifetime error
 
-use grafton_ndi::{NDI, Receiver, RecvBandwidth, RecvColorFormat, Source, SourceAddress};
+use grafton_ndi::{Receiver, ReceiverOptions, Source, SourceAddress, NDI};
+use std::time::Duration;
 
 fn main() {
     let ndi = NDI::new().unwrap();
-    
-    // Create a frame that outlives its receiver - this should fail to compile
-    let frame = {
-        let recv = grafton_ndi::ReceiverInstance::new(
-            &ndi,
-            &Receiver::builder()
-                .source_to_connect_to(Source {
-                    name: "Test".to_string(),
-                    address: SourceAddress::None,
-                })
-                .color_format(RecvColorFormat::BGRX_BGRA)
-                .bandwidth(RecvBandwidth::Highest)
-                .allow_video_fields(true)
-                .build()
-                .unwrap(),
-        )
-        .unwrap();
-        
-        // Capture a frame
-        recv.capture_video(1000).unwrap()
-        // recv is dropped here
+    let source = Source {
+        name: "Test".to_string(),
+        address: SourceAddress::None,
     };
-    
-    // This should fail because frame cannot outlive recv
-    println!("{:?}", frame);
+    let options = ReceiverOptions::builder(source).build();
+
+    // Create a frame that outlives its receiver - this should fail to compile
+    let frame_ref = {
+        let receiver = Receiver::new(&ndi, &options).unwrap();
+
+        // Capture a borrowed frame
+        // This should work fine within the scope
+        match receiver.capture_video_ref(Duration::from_millis(100)) {
+            Ok(Some(f)) => f,
+            _ => panic!("Test expects a frame"),
+        }
+        // receiver is dropped here
+    };
+
+    // This should fail to compile because frame_ref cannot outlive receiver
+    // Error: `receiver` does not live long enough
+    println!("{:?}", frame_ref);
 }

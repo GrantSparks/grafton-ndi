@@ -625,7 +625,10 @@ impl Receiver {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn capture_video_ref(&self, timeout: Duration) -> Result<Option<VideoFrameRef>> {
+    pub fn capture_video_ref<'rx>(
+        &'rx self,
+        timeout: Duration,
+    ) -> Result<Option<VideoFrameRef<'rx>>> {
         let timeout_ms = to_ms_checked(timeout)?;
         let mut video_frame = NDIlib_video_frame_v2_t::default();
 
@@ -813,7 +816,10 @@ impl Receiver {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn capture_audio_ref(&self, timeout: Duration) -> Result<Option<AudioFrameRef>> {
+    pub fn capture_audio_ref<'rx>(
+        &'rx self,
+        timeout: Duration,
+    ) -> Result<Option<AudioFrameRef<'rx>>> {
         let timeout_ms = to_ms_checked(timeout)?;
         let mut audio_frame = NDIlib_audio_frame_v3_t::default();
 
@@ -981,7 +987,10 @@ impl Receiver {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn capture_metadata_ref(&self, timeout: Duration) -> Result<Option<MetadataFrameRef>> {
+    pub fn capture_metadata_ref<'rx>(
+        &'rx self,
+        timeout: Duration,
+    ) -> Result<Option<MetadataFrameRef<'rx>>> {
         let timeout_ms = to_ms_checked(timeout)?;
         let mut metadata_frame = NDIlib_metadata_frame_t::default();
 

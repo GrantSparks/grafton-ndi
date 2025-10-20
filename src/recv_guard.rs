@@ -6,17 +6,23 @@
 //! in the receive path.
 
 use crate::ndi_lib::*;
+use std::marker::PhantomData;
 
 /// RAII guard for a captured video frame.
 ///
 /// Automatically calls `NDIlib_recv_free_video_v2` when dropped,
 /// ensuring the NDI SDK can reclaim the buffer.
-pub(crate) struct RecvVideoGuard {
+///
+/// The lifetime parameter `'rx` ties this guard to the `Receiver` that created it,
+/// preventing use-after-free by ensuring the receiver cannot be dropped while
+/// this guard is alive.
+pub(crate) struct RecvVideoGuard<'rx> {
     instance: NDIlib_recv_instance_t,
     frame: NDIlib_video_frame_v2_t,
+    _owner: PhantomData<&'rx crate::Receiver>,
 }
 
-impl RecvVideoGuard {
+impl<'rx> RecvVideoGuard<'rx> {
     /// Create a new video frame guard.
     ///
     /// # Safety
@@ -29,7 +35,11 @@ impl RecvVideoGuard {
         instance: NDIlib_recv_instance_t,
         frame: NDIlib_video_frame_v2_t,
     ) -> Self {
-        Self { instance, frame }
+        Self {
+            instance,
+            frame,
+            _owner: PhantomData,
+        }
     }
 
     /// Get a reference to the underlying frame for conversion to owned data.
@@ -38,7 +48,7 @@ impl RecvVideoGuard {
     }
 }
 
-impl Drop for RecvVideoGuard {
+impl<'rx> Drop for RecvVideoGuard<'rx> {
     fn drop(&mut self) {
         unsafe {
             NDIlib_recv_free_video_v2(self.instance, &self.frame);
@@ -50,12 +60,17 @@ impl Drop for RecvVideoGuard {
 ///
 /// Automatically calls `NDIlib_recv_free_audio_v3` when dropped,
 /// ensuring the NDI SDK can reclaim the buffer.
-pub(crate) struct RecvAudioGuard {
+///
+/// The lifetime parameter `'rx` ties this guard to the `Receiver` that created it,
+/// preventing use-after-free by ensuring the receiver cannot be dropped while
+/// this guard is alive.
+pub(crate) struct RecvAudioGuard<'rx> {
     instance: NDIlib_recv_instance_t,
     frame: NDIlib_audio_frame_v3_t,
+    _owner: PhantomData<&'rx crate::Receiver>,
 }
 
-impl RecvAudioGuard {
+impl<'rx> RecvAudioGuard<'rx> {
     /// Create a new audio frame guard.
     ///
     /// # Safety
@@ -68,7 +83,11 @@ impl RecvAudioGuard {
         instance: NDIlib_recv_instance_t,
         frame: NDIlib_audio_frame_v3_t,
     ) -> Self {
-        Self { instance, frame }
+        Self {
+            instance,
+            frame,
+            _owner: PhantomData,
+        }
     }
 
     /// Get a reference to the underlying frame for conversion to owned data.
@@ -77,7 +96,7 @@ impl RecvAudioGuard {
     }
 }
 
-impl Drop for RecvAudioGuard {
+impl<'rx> Drop for RecvAudioGuard<'rx> {
     fn drop(&mut self) {
         unsafe {
             NDIlib_recv_free_audio_v3(self.instance, &self.frame);
@@ -89,12 +108,17 @@ impl Drop for RecvAudioGuard {
 ///
 /// Automatically calls `NDIlib_recv_free_metadata` when dropped,
 /// ensuring the NDI SDK can reclaim the buffer.
-pub(crate) struct RecvMetadataGuard {
+///
+/// The lifetime parameter `'rx` ties this guard to the `Receiver` that created it,
+/// preventing use-after-free by ensuring the receiver cannot be dropped while
+/// this guard is alive.
+pub(crate) struct RecvMetadataGuard<'rx> {
     instance: NDIlib_recv_instance_t,
     frame: NDIlib_metadata_frame_t,
+    _owner: PhantomData<&'rx crate::Receiver>,
 }
 
-impl RecvMetadataGuard {
+impl<'rx> RecvMetadataGuard<'rx> {
     /// Create a new metadata frame guard.
     ///
     /// # Safety
@@ -107,7 +131,11 @@ impl RecvMetadataGuard {
         instance: NDIlib_recv_instance_t,
         frame: NDIlib_metadata_frame_t,
     ) -> Self {
-        Self { instance, frame }
+        Self {
+            instance,
+            frame,
+            _owner: PhantomData,
+        }
     }
 
     /// Get a reference to the underlying frame for conversion to owned data.
@@ -116,7 +144,7 @@ impl RecvMetadataGuard {
     }
 }
 
-impl Drop for RecvMetadataGuard {
+impl<'rx> Drop for RecvMetadataGuard<'rx> {
     fn drop(&mut self) {
         unsafe {
             NDIlib_recv_free_metadata(self.instance, &self.frame);
