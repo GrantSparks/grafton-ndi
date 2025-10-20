@@ -22,8 +22,8 @@ use crate::frames::is_uncompressed_format;
 use crate::{
     finder::Source,
     frames::{
-        calculate_line_stride, AudioFrame, FourCCVideoType, FrameFormatType, LineStrideOrSize,
-        MetadataFrame, VideoFrame,
+        calculate_line_stride, AudioFrame, LineStrideOrSize, MetadataFrame, PixelFormat, ScanType,
+        VideoFrame,
     },
     ndi_lib::*,
     receiver::Tally,
@@ -128,11 +128,11 @@ unsafe impl Sync for Inner {}
 pub struct BorrowedVideoFrame<'buf> {
     pub width: i32,
     pub height: i32,
-    pub fourcc: FourCCVideoType,
+    pub pixel_format: PixelFormat,
     pub frame_rate_n: i32,
     pub frame_rate_d: i32,
     pub picture_aspect_ratio: f32,
-    pub frame_format_type: FrameFormatType,
+    pub scan_type: ScanType,
     pub timecode: i64,
     pub data: &'buf [u8],
     pub line_stride_or_size: LineStrideOrSize,
@@ -146,20 +146,20 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         data: &'buf [u8],
         width: i32,
         height: i32,
-        fourcc: FourCCVideoType,
+        pixel_format: PixelFormat,
         frame_rate_n: i32,
         frame_rate_d: i32,
     ) -> Self {
-        let stride = calculate_line_stride(fourcc, width);
+        let stride = calculate_line_stride(pixel_format, width);
 
         BorrowedVideoFrame {
             width,
             height,
-            fourcc,
+            pixel_format,
             frame_rate_n,
             frame_rate_d,
             picture_aspect_ratio: 16.0 / 9.0,
-            frame_format_type: FrameFormatType::Progressive,
+            scan_type: ScanType::Progressive,
             timecode: 0,
             data,
             line_stride_or_size: LineStrideOrSize::LineStrideBytes(stride),
@@ -172,11 +172,11 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         NDIlib_video_frame_v2_t {
             xres: self.width,
             yres: self.height,
-            FourCC: self.fourcc.into(),
+            FourCC: self.pixel_format.into(),
             frame_rate_N: self.frame_rate_n,
             frame_rate_D: self.frame_rate_d,
             picture_aspect_ratio: self.picture_aspect_ratio,
-            frame_format_type: self.frame_format_type.into(),
+            frame_format_type: self.scan_type.into(),
             timecode: self.timecode,
             p_data: self.data.as_ptr() as *mut u8,
             __bindgen_anon_1: self.line_stride_or_size.into(),
@@ -191,11 +191,11 @@ impl<'buf> From<&'buf VideoFrame> for BorrowedVideoFrame<'buf> {
         BorrowedVideoFrame {
             width: frame.width,
             height: frame.height,
-            fourcc: frame.fourcc,
+            pixel_format: frame.pixel_format,
             frame_rate_n: frame.frame_rate_n,
             frame_rate_d: frame.frame_rate_d,
             picture_aspect_ratio: frame.picture_aspect_ratio,
-            frame_format_type: frame.frame_format_type,
+            scan_type: frame.scan_type,
             timecode: frame.timecode,
             data: &frame.data,
             line_stride_or_size: frame.line_stride_or_size,
@@ -428,8 +428,8 @@ impl<'a> Sender<'a> {
                         let len = if !frame.is_null() {
                             #[allow(clippy::unnecessary_cast)]
                             // Required for Windows where FourCC is i32
-                            let fourcc = FourCCVideoType::try_from((*frame).FourCC as u32)
-                                .unwrap_or(FourCCVideoType::Max);
+                            let fourcc = PixelFormat::try_from((*frame).FourCC as u32)
+                                .unwrap_or(PixelFormat::BGRA);
 
                             if is_uncompressed_format(fourcc) {
                                 // Uncompressed format: read ONLY line_stride_in_bytes
@@ -513,7 +513,7 @@ impl<'a> Sender<'a> {
     ///
     /// # Example
     /// ```no_run
-    /// # use grafton_ndi::{NDI, SenderOptions, VideoFrame, BorrowedVideoFrame, FourCCVideoType};
+    /// # use grafton_ndi::{NDI, SenderOptions, VideoFrame, BorrowedVideoFrame, PixelFormat};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let ndi = NDI::new()?;
     /// let send_options = SenderOptions::builder("MyCam")
@@ -527,7 +527,7 @@ impl<'a> Sender<'a> {
     ///
     /// // Use borrowed buffer directly (zero-copy, no allocation)
     /// let buffer = vec![0u8; 1920 * 1080 * 4];
-    /// let borrowed_frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
+    /// let borrowed_frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
     /// let token = sender.send_video_async(&borrowed_frame);
     ///
     /// // Buffer is owned by SDK until token is dropped
@@ -733,13 +733,13 @@ impl<'a> Sender<'a> {
     /// # Example
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, SenderOptions, BorrowedVideoFrame, FourCCVideoType};
+    /// # use grafton_ndi::{NDI, SenderOptions, BorrowedVideoFrame, PixelFormat};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let ndi = NDI::new()?;
     /// let mut sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build()?)?;
     ///
     /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
-    /// let frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
+    /// let frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
     /// let token = sender.send_video_async(&frame);
     ///
     /// // Drop token to release the mutable borrow, then flush

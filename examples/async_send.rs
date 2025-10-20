@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use grafton_ndi::{BorrowedVideoFrame, FourCCVideoType, SenderOptions, NDI};
+use grafton_ndi::{BorrowedVideoFrame, PixelFormat, SenderOptions, NDI};
 
 fn main() -> Result<(), grafton_ndi::Error> {
     // Initialize NDI
@@ -42,14 +42,8 @@ fn main() -> Result<(), grafton_ndi::Error> {
             pixel[3] = 255; // A
         }
 
-        let frame = BorrowedVideoFrame::from_buffer(
-            &video_buffer,
-            1920,
-            1080,
-            FourCCVideoType::BGRA,
-            30,
-            1,
-        );
+        let frame =
+            BorrowedVideoFrame::from_buffer(&video_buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
 
         println!("Sending video frame...");
         let start = Instant::now();
@@ -88,7 +82,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
         println!("Sending 3 video frames sequentially...");
         for (idx, buffer) in buffers.iter().enumerate() {
             let frame =
-                BorrowedVideoFrame::from_buffer(buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
+                BorrowedVideoFrame::from_buffer(buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
 
             let frame_num = idx + 1;
             println!("Sending frame {frame_num}...");

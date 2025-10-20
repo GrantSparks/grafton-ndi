@@ -49,7 +49,7 @@ fn main() -> Result<(), Error> {
     let start = Instant::now();
     while !exit_loop.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(60) {
         // Check for video frames
-        if let Some(video_frame) = receiver.capture_video(Duration::ZERO)? {
+        if let Some(video_frame) = receiver.capture_video_timeout(Duration::ZERO)? {
             println!(
                 "Video data received ({width}x{height}).",
                 width = video_frame.width,
@@ -58,7 +58,7 @@ fn main() -> Result<(), Error> {
         }
 
         // Check for audio frames
-        if let Some(audio_frame) = receiver.capture_audio(Duration::ZERO)? {
+        if let Some(audio_frame) = receiver.capture_audio_timeout(Duration::ZERO)? {
             println!(
                 "Audio data received ({num_samples} samples).",
                 num_samples = audio_frame.num_samples
@@ -75,7 +75,7 @@ fn main() -> Result<(), Error> {
         }
 
         // Check for metadata
-        if let Some(_metadata) = receiver.capture_metadata(Duration::ZERO)? {
+        if let Some(_metadata) = receiver.capture_metadata_timeout(Duration::ZERO)? {
             println!("Meta data received.");
         }
 

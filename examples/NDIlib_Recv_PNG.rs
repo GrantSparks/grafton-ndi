@@ -7,7 +7,7 @@
 //!
 //! IMPORTANT: This example demonstrates:
 //!
-//! 1. Using `capture_video_blocking()` for reliable frame capture with
+//! 1. Using `capture_video()` for reliable frame capture with
 //!    automatic retry logic (handles NDI SDK timeout quirks internally)
 //! 2. Stride validation - Prevents corrupted images when stride != width * 4
 //! 3. Format verification - Ensures we actually get RGBA/RGBX format
@@ -22,8 +22,7 @@
 //! - Both: `cargo run --example NDIlib_Recv_PNG -- 192.168.0.100 --output MyImage.png`
 
 use grafton_ndi::{
-    Error, Finder, FinderOptions, FourCCVideoType, Receiver, ReceiverColorFormat, ReceiverOptions,
-    NDI,
+    Error, Finder, FinderOptions, PixelFormat, Receiver, ReceiverColorFormat, ReceiverOptions, NDI,
 };
 
 use std::{
@@ -100,7 +99,7 @@ fn main() -> Result<(), Error> {
     println!("Waiting for video frames...\n");
 
     let start_time = Instant::now();
-    let video_frame = receiver.capture_video_blocking(Duration::from_secs(60))?;
+    let video_frame = receiver.capture_video(Duration::from_secs(60))?;
 
     let elapsed = start_time.elapsed();
     println!("Frame received after {elapsed:?}");
@@ -109,7 +108,7 @@ fn main() -> Result<(), Error> {
     let width = video_frame.width;
     let height = video_frame.height;
     println!("  Resolution: {width}x{height}");
-    let fourcc = video_frame.fourcc;
+    let fourcc = video_frame.pixel_format;
     println!("  Format: {fourcc:?}");
     let line_stride = match video_frame.line_stride_or_size {
         grafton_ndi::LineStrideOrSize::LineStrideBytes(stride) => stride,
@@ -129,12 +128,12 @@ fn main() -> Result<(), Error> {
     let timecode = video_frame.timecode;
     println!("  Timecode: {timecode:016x}");
 
-    match video_frame.fourcc {
-        FourCCVideoType::RGBA | FourCCVideoType::RGBX => {
+    match video_frame.pixel_format {
+        PixelFormat::RGBA | PixelFormat::RGBX => {
             println!("  ✓ Got requested RGBA/RGBX format");
         }
         _ => {
-            let format = video_frame.fourcc;
+            let format = video_frame.pixel_format;
             eprintln!("  ⚠ Warning: Got unexpected format {format:?}, PNG may fail");
         }
     }

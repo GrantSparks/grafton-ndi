@@ -113,61 +113,15 @@ pub mod tokio {
 
         /// Async version of `Receiver::capture_video`.
         ///
-        /// Attempts to capture a video frame without blocking the async runtime.
-        /// Uses `tokio::task::spawn_blocking` internally.
+        /// Captures a video frame, blocking until received or timeout expires, without blocking
+        /// the async runtime. Uses `tokio::task::spawn_blocking` internally.
+        ///
+        /// This is the **primary method** for reliable video frame capture in async contexts.
+        /// It handles retries automatically to work around NDI SDK synchronization behavior.
         ///
         /// # Arguments
         ///
-        /// * `timeout` - Timeout duration for the capture attempt.
-        ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-        ///
-        /// # Returns
-        ///
-        /// * `Ok(Some(frame))` - Successfully captured a video frame
-        /// * `Ok(None)` - No frame available within timeout
-        /// * `Err(_)` - An error occurred during capture
-        pub async fn capture_video(&self, timeout: Duration) -> Result<Option<VideoFrame>> {
-            let receiver = Arc::clone(&self.inner);
-            ::tokio::task::spawn_blocking(move || receiver.capture_video(timeout))
-                .await
-                .expect("Blocking task panicked")
-        }
-
-        /// Async version of `Receiver::capture_video_with_retry`.
-        ///
-        /// Captures video with automatic retry logic without blocking the async runtime.
-        ///
-        /// # Arguments
-        ///
-        /// * `timeout` - Timeout for each capture attempt. Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-        /// * `max_attempts` - Maximum number of retry attempts
-        ///
-        /// # Returns
-        ///
-        /// * `Ok(Some(frame))` - Successfully captured a video frame
-        /// * `Ok(None)` - No frame available after all retry attempts
-        /// * `Err(_)` - An error occurred during capture
-        pub async fn capture_video_with_retry(
-            &self,
-            timeout: Duration,
-            max_attempts: usize,
-        ) -> Result<Option<VideoFrame>> {
-            let receiver = Arc::clone(&self.inner);
-            ::tokio::task::spawn_blocking(move || {
-                receiver.capture_video_with_retry(timeout, max_attempts)
-            })
-            .await
-            .expect("Blocking task panicked")
-        }
-
-        /// Async version of `Receiver::capture_video_blocking`.
-        ///
-        /// Blocks until a frame is received or timeout expires, without blocking
-        /// the async runtime. This is the recommended method for reliable frame capture.
-        ///
-        /// # Arguments
-        ///
-        /// * `total_timeout` - Total time to wait for a frame.
+        /// * `timeout` - Total time to wait for a frame.
         ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
         ///
         /// # Returns
@@ -181,7 +135,8 @@ pub mod tokio {
         /// ```no_run
         /// # #[cfg(feature = "tokio")]
         /// # {
-        /// # use grafton_ndi::{NDI, ReceiverOptionsBuilder, tokio::AsyncReceiver};
+        /// # use grafton_ndi::{NDI, ReceiverOptions, tokio::AsyncReceiver};
+        /// # use std::time::Duration;
         /// # #[tokio::main]
         /// # async fn main() -> Result<(), grafton_ndi::Error> {
         /// # let ndi = NDI::new()?;
@@ -189,158 +144,132 @@ pub mod tokio {
         /// #     name: "Test".into(),
         /// #     address: grafton_ndi::SourceAddress::None
         /// # };
-        /// # let receiver = ReceiverOptionsBuilder::snapshot_preset(source).build(&ndi)?;
+        /// # let options = ReceiverOptions::builder(source).build();
+        /// # let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
         /// let async_receiver = AsyncReceiver::new(receiver);
-        /// let frame = async_receiver.capture_video_blocking(5000).await?;
+        /// let frame = async_receiver.capture_video(Duration::from_secs(5)).await?;
         /// println!("Captured {}x{} frame", frame.width, frame.height);
         /// # Ok(())
         /// # }
         /// # }
         /// ```
-        pub async fn capture_video_blocking(&self, total_timeout: Duration) -> Result<VideoFrame> {
+        pub async fn capture_video(&self, timeout: Duration) -> Result<VideoFrame> {
             let receiver = Arc::clone(&self.inner);
-            ::tokio::task::spawn_blocking(move || receiver.capture_video_blocking(total_timeout))
+            ::tokio::task::spawn_blocking(move || receiver.capture_video(timeout))
+                .await
+                .expect("Blocking task panicked")
+        }
+
+        /// Async version of `Receiver::capture_video_timeout`.
+        ///
+        /// Attempts to capture a video frame with a timeout (polling variant).
+        /// May return `None` if no frame is available within the timeout.
+        ///
+        /// **For most use cases, prefer [`Self::capture_video`]** which handles retries
+        /// automatically and provides reliable frame capture.
+        ///
+        /// # Arguments
+        ///
+        /// * `timeout` - Maximum time to wait for a frame.
+        ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+        ///
+        /// # Returns
+        ///
+        /// * `Ok(Some(frame))` - Successfully captured a video frame
+        /// * `Ok(None)` - No frame available within timeout
+        /// * `Err(_)` - An error occurred during capture
+        pub async fn capture_video_timeout(&self, timeout: Duration) -> Result<Option<VideoFrame>> {
+            let receiver = Arc::clone(&self.inner);
+            ::tokio::task::spawn_blocking(move || receiver.capture_video_timeout(timeout))
                 .await
                 .expect("Blocking task panicked")
         }
 
         /// Async version of `Receiver::capture_audio`.
         ///
-        /// Attempts to capture an audio frame without blocking the async runtime.
-        ///
-        /// # Arguments
-        ///
-        /// * `timeout_ms` - Timeout in milliseconds for the capture attempt
-        ///
-        /// # Returns
-        ///
-        /// * `Ok(Some(frame))` - Successfully captured an audio frame
-        /// * `Ok(None)` - No frame available within timeout
-        /// * `Err(_)` - An error occurred during capture
-        pub async fn capture_audio(&self, timeout: Duration) -> Result<Option<AudioFrame>> {
-            let receiver = Arc::clone(&self.inner);
-            ::tokio::task::spawn_blocking(move || receiver.capture_audio(timeout))
-                .await
-                .expect("Blocking task panicked")
-        }
-
-        /// Async version of `Receiver::capture_audio_with_retry`.
-        ///
-        /// Captures audio with automatic retry logic without blocking the async runtime.
-        ///
-        /// # Arguments
-        ///
-        /// * `timeout` - Timeout for each capture attempt. Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-        /// * `max_attempts` - Maximum number of retry attempts
-        ///
-        /// # Returns
-        ///
-        /// * `Ok(Some(frame))` - Successfully captured an audio frame
-        /// * `Ok(None)` - No frame available after all retry attempts
-        /// * `Err(_)` - An error occurred during capture
-        pub async fn capture_audio_with_retry(
-            &self,
-            timeout: Duration,
-            max_attempts: usize,
-        ) -> Result<Option<AudioFrame>> {
-            let receiver = Arc::clone(&self.inner);
-            ::tokio::task::spawn_blocking(move || {
-                receiver.capture_audio_with_retry(timeout, max_attempts)
-            })
-            .await
-            .expect("Blocking task panicked")
-        }
-
-        /// Async version of `Receiver::capture_audio_blocking`.
-        ///
-        /// Blocks until an audio frame is received or timeout expires, without blocking
+        /// Captures an audio frame, blocking until received or timeout expires, without blocking
         /// the async runtime.
         ///
         /// # Arguments
         ///
-        /// * `total_timeout` - Total time to wait for a frame.
+        /// * `timeout` - Total time to wait for a frame.
         ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
         ///
         /// # Returns
         ///
         /// * `Ok(frame)` - Successfully captured an audio frame
         /// * `Err(Error::FrameTimeout)` - No frame received within timeout (includes retry details)
-        /// * `Err(_)` - Another error occurred during capture
-        pub async fn capture_audio_blocking(&self, total_timeout: Duration) -> Result<AudioFrame> {
+        /// * `Err(_)` - An error occurred during capture
+        pub async fn capture_audio(&self, timeout: Duration) -> Result<AudioFrame> {
             let receiver = Arc::clone(&self.inner);
-            ::tokio::task::spawn_blocking(move || receiver.capture_audio_blocking(total_timeout))
+            ::tokio::task::spawn_blocking(move || receiver.capture_audio(timeout))
+                .await
+                .expect("Blocking task panicked")
+        }
+
+        /// Async version of `Receiver::capture_audio_timeout`.
+        ///
+        /// Attempts to capture an audio frame with a timeout (polling variant).
+        ///
+        /// # Arguments
+        ///
+        /// * `timeout` - Maximum time to wait for a frame.
+        ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+        ///
+        /// # Returns
+        ///
+        /// * `Ok(Some(frame))` - Successfully captured an audio frame
+        /// * `Ok(None)` - No frame available within timeout
+        /// * `Err(_)` - An error occurred during capture
+        pub async fn capture_audio_timeout(&self, timeout: Duration) -> Result<Option<AudioFrame>> {
+            let receiver = Arc::clone(&self.inner);
+            ::tokio::task::spawn_blocking(move || receiver.capture_audio_timeout(timeout))
                 .await
                 .expect("Blocking task panicked")
         }
 
         /// Async version of `Receiver::capture_metadata`.
         ///
-        /// Attempts to capture a metadata frame without blocking the async runtime.
-        ///
-        /// # Arguments
-        ///
-        /// * `timeout_ms` - Timeout in milliseconds for the capture attempt
-        ///
-        /// # Returns
-        ///
-        /// * `Ok(Some(frame))` - Successfully captured a metadata frame
-        /// * `Ok(None)` - No frame available within timeout
-        /// * `Err(_)` - An error occurred during capture
-        pub async fn capture_metadata(&self, timeout: Duration) -> Result<Option<MetadataFrame>> {
-            let receiver = Arc::clone(&self.inner);
-            ::tokio::task::spawn_blocking(move || receiver.capture_metadata(timeout))
-                .await
-                .expect("Blocking task panicked")
-        }
-
-        /// Async version of `Receiver::capture_metadata_with_retry`.
-        ///
-        /// Captures metadata with automatic retry logic without blocking the async runtime.
-        ///
-        /// # Arguments
-        ///
-        /// * `timeout` - Timeout for each capture attempt. Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-        /// * `max_attempts` - Maximum number of retry attempts
-        ///
-        /// # Returns
-        ///
-        /// * `Ok(Some(frame))` - Successfully captured a metadata frame
-        /// * `Ok(None)` - No frame available after all retry attempts
-        /// * `Err(_)` - An error occurred during capture
-        pub async fn capture_metadata_with_retry(
-            &self,
-            timeout: Duration,
-            max_attempts: usize,
-        ) -> Result<Option<MetadataFrame>> {
-            let receiver = Arc::clone(&self.inner);
-            ::tokio::task::spawn_blocking(move || {
-                receiver.capture_metadata_with_retry(timeout, max_attempts)
-            })
-            .await
-            .expect("Blocking task panicked")
-        }
-
-        /// Async version of `Receiver::capture_metadata_blocking`.
-        ///
-        /// Blocks until a metadata frame is received or timeout expires, without blocking
+        /// Captures a metadata frame, blocking until received or timeout expires, without blocking
         /// the async runtime.
         ///
         /// # Arguments
         ///
-        /// * `total_timeout` - Total time to wait for a frame.
+        /// * `timeout` - Total time to wait for a frame.
         ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
         ///
         /// # Returns
         ///
         /// * `Ok(frame)` - Successfully captured a metadata frame
         /// * `Err(Error::FrameTimeout)` - No frame received within timeout (includes retry details)
-        /// * `Err(_)` - Another error occurred during capture
-        pub async fn capture_metadata_blocking(
-            &self,
-            total_timeout: Duration,
-        ) -> Result<MetadataFrame> {
+        /// * `Err(_)` - An error occurred during capture
+        pub async fn capture_metadata(&self, timeout: Duration) -> Result<MetadataFrame> {
             let receiver = Arc::clone(&self.inner);
-            ::tokio::task::spawn_blocking(move || receiver.capture_metadata_blocking(total_timeout))
+            ::tokio::task::spawn_blocking(move || receiver.capture_metadata(timeout))
+                .await
+                .expect("Blocking task panicked")
+        }
+
+        /// Async version of `Receiver::capture_metadata_timeout`.
+        ///
+        /// Attempts to capture a metadata frame with a timeout (polling variant).
+        ///
+        /// # Arguments
+        ///
+        /// * `timeout` - Maximum time to wait for a frame.
+        ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+        ///
+        /// # Returns
+        ///
+        /// * `Ok(Some(frame))` - Successfully captured a metadata frame
+        /// * `Ok(None)` - No frame available within timeout
+        /// * `Err(_)` - An error occurred during capture
+        pub async fn capture_metadata_timeout(
+            &self,
+            timeout: Duration,
+        ) -> Result<Option<MetadataFrame>> {
+            let receiver = Arc::clone(&self.inner);
+            ::tokio::task::spawn_blocking(move || receiver.capture_metadata_timeout(timeout))
                 .await
                 .expect("Blocking task panicked")
         }
@@ -419,229 +348,125 @@ pub mod async_std {
 
         /// Async version of `Receiver::capture_video`.
         ///
-        /// Attempts to capture a video frame without blocking the async runtime.
-        /// Uses `async_std::task::spawn_blocking` internally.
+        /// Captures a video frame, blocking until received or timeout expires, without blocking
+        /// the async runtime. Uses `async_std::task::spawn_blocking` internally.
+        ///
+        /// This is the **primary method** for reliable video frame capture in async contexts.
         ///
         /// # Arguments
         ///
-        /// * `timeout_ms` - Timeout in milliseconds for the capture attempt
-        ///
-        /// # Returns
-        ///
-        /// * `Ok(Some(frame))` - Successfully captured a video frame
-        /// * `Ok(None)` - No frame available within timeout
-        /// * `Err(_)` - An error occurred during capture
-        pub async fn capture_video(&self, timeout: Duration) -> Result<Option<VideoFrame>> {
-            let receiver = Arc::clone(&self.inner);
-            ::async_std::task::spawn_blocking(move || receiver.capture_video(timeout)).await
-        }
-
-        /// Async version of `Receiver::capture_video_with_retry`.
-        ///
-        /// Captures video with automatic retry logic without blocking the async runtime.
-        ///
-        /// # Arguments
-        ///
-        /// * `timeout` - Timeout for each capture attempt. Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-        /// * `max_attempts` - Maximum number of retry attempts
-        ///
-        /// # Returns
-        ///
-        /// * `Ok(Some(frame))` - Successfully captured a video frame
-        /// * `Ok(None)` - No frame available after all retry attempts
-        /// * `Err(_)` - An error occurred during capture
-        pub async fn capture_video_with_retry(
-            &self,
-            timeout: Duration,
-            max_attempts: usize,
-        ) -> Result<Option<VideoFrame>> {
-            let receiver = Arc::clone(&self.inner);
-            ::async_std::task::spawn_blocking(move || {
-                receiver.capture_video_with_retry(timeout, max_attempts)
-            })
-            .await
-        }
-
-        /// Async version of `Receiver::capture_video_blocking`.
-        ///
-        /// Blocks until a frame is received or timeout expires, without blocking
-        /// the async runtime. This is the recommended method for reliable frame capture.
-        ///
-        /// # Arguments
-        ///
-        /// * `total_timeout` - Total time to wait for a frame.
+        /// * `timeout` - Total time to wait for a frame.
         ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
         ///
         /// # Returns
         ///
         /// * `Ok(frame)` - Successfully captured a video frame
         /// * `Err(Error::FrameTimeout)` - No frame received within timeout (includes retry details)
-        /// * `Err(_)` - Another error occurred during capture
-        ///
-        /// # Example
-        ///
-        /// ```no_run
-        /// # #[cfg(feature = "async-std")]
-        /// # {
-        /// # use grafton_ndi::{NDI, ReceiverOptionsBuilder, async_std::AsyncReceiver};
-        /// # #[async_std::main]
-        /// # async fn main() -> Result<(), grafton_ndi::Error> {
-        /// # let ndi = NDI::new()?;
-        /// # let source = grafton_ndi::Source {
-        /// #     name: "Test".into(),
-        /// #     address: grafton_ndi::SourceAddress::None
-        /// # };
-        /// # let receiver = ReceiverOptionsBuilder::snapshot_preset(source).build(&ndi)?;
-        /// let async_receiver = AsyncReceiver::new(receiver);
-        /// let frame = async_receiver.capture_video_blocking(5000).await?;
-        /// println!("Captured {}x{} frame", frame.width, frame.height);
-        /// # Ok(())
-        /// # }
-        /// # }
-        /// ```
-        pub async fn capture_video_blocking(&self, total_timeout: Duration) -> Result<VideoFrame> {
+        /// * `Err(_)` - An error occurred during capture
+        pub async fn capture_video(&self, timeout: Duration) -> Result<VideoFrame> {
             let receiver = Arc::clone(&self.inner);
-            ::async_std::task::spawn_blocking(move || {
-                receiver.capture_video_blocking(total_timeout)
-            })
-            .await
+            ::async_std::task::spawn_blocking(move || receiver.capture_video(timeout)).await
+        }
+
+        /// Async version of `Receiver::capture_video_timeout`.
+        ///
+        /// Attempts to capture a video frame with a timeout (polling variant).
+        ///
+        /// # Arguments
+        ///
+        /// * `timeout` - Maximum time to wait for a frame.
+        ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+        ///
+        /// # Returns
+        ///
+        /// * `Ok(Some(frame))` - Successfully captured a video frame
+        /// * `Ok(None)` - No frame available within timeout
+        /// * `Err(_)` - An error occurred during capture
+        pub async fn capture_video_timeout(&self, timeout: Duration) -> Result<Option<VideoFrame>> {
+            let receiver = Arc::clone(&self.inner);
+            ::async_std::task::spawn_blocking(move || receiver.capture_video_timeout(timeout)).await
         }
 
         /// Async version of `Receiver::capture_audio`.
         ///
-        /// Attempts to capture an audio frame without blocking the async runtime.
-        ///
-        /// # Arguments
-        ///
-        /// * `timeout_ms` - Timeout in milliseconds for the capture attempt
-        ///
-        /// # Returns
-        ///
-        /// * `Ok(Some(frame))` - Successfully captured an audio frame
-        /// * `Ok(None)` - No frame available within timeout
-        /// * `Err(_)` - An error occurred during capture
-        pub async fn capture_audio(&self, timeout: Duration) -> Result<Option<AudioFrame>> {
-            let receiver = Arc::clone(&self.inner);
-            ::async_std::task::spawn_blocking(move || receiver.capture_audio(timeout)).await
-        }
-
-        /// Async version of `Receiver::capture_audio_with_retry`.
-        ///
-        /// Captures audio with automatic retry logic without blocking the async runtime.
-        ///
-        /// # Arguments
-        ///
-        /// * `timeout` - Timeout for each capture attempt. Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-        /// * `max_attempts` - Maximum number of retry attempts
-        ///
-        /// # Returns
-        ///
-        /// * `Ok(Some(frame))` - Successfully captured an audio frame
-        /// * `Ok(None)` - No frame available after all retry attempts
-        /// * `Err(_)` - An error occurred during capture
-        pub async fn capture_audio_with_retry(
-            &self,
-            timeout: Duration,
-            max_attempts: usize,
-        ) -> Result<Option<AudioFrame>> {
-            let receiver = Arc::clone(&self.inner);
-            ::async_std::task::spawn_blocking(move || {
-                receiver.capture_audio_with_retry(timeout, max_attempts)
-            })
-            .await
-        }
-
-        /// Async version of `Receiver::capture_audio_blocking`.
-        ///
-        /// Blocks until an audio frame is received or timeout expires, without blocking
+        /// Captures an audio frame, blocking until received or timeout expires, without blocking
         /// the async runtime.
         ///
         /// # Arguments
         ///
-        /// * `total_timeout` - Total time to wait for a frame.
+        /// * `timeout` - Total time to wait for a frame.
         ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
         ///
         /// # Returns
         ///
         /// * `Ok(frame)` - Successfully captured an audio frame
         /// * `Err(Error::FrameTimeout)` - No frame received within timeout (includes retry details)
-        /// * `Err(_)` - Another error occurred during capture
-        pub async fn capture_audio_blocking(&self, total_timeout: Duration) -> Result<AudioFrame> {
+        /// * `Err(_)` - An error occurred during capture
+        pub async fn capture_audio(&self, timeout: Duration) -> Result<AudioFrame> {
             let receiver = Arc::clone(&self.inner);
-            ::async_std::task::spawn_blocking(move || {
-                receiver.capture_audio_blocking(total_timeout)
-            })
-            .await
+            ::async_std::task::spawn_blocking(move || receiver.capture_audio(timeout)).await
+        }
+
+        /// Async version of `Receiver::capture_audio_timeout`.
+        ///
+        /// Attempts to capture an audio frame with a timeout (polling variant).
+        ///
+        /// # Arguments
+        ///
+        /// * `timeout` - Maximum time to wait for a frame.
+        ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+        ///
+        /// # Returns
+        ///
+        /// * `Ok(Some(frame))` - Successfully captured an audio frame
+        /// * `Ok(None)` - No frame available within timeout
+        /// * `Err(_)` - An error occurred during capture
+        pub async fn capture_audio_timeout(&self, timeout: Duration) -> Result<Option<AudioFrame>> {
+            let receiver = Arc::clone(&self.inner);
+            ::async_std::task::spawn_blocking(move || receiver.capture_audio_timeout(timeout)).await
         }
 
         /// Async version of `Receiver::capture_metadata`.
         ///
-        /// Attempts to capture a metadata frame without blocking the async runtime.
-        ///
-        /// # Arguments
-        ///
-        /// * `timeout_ms` - Timeout in milliseconds for the capture attempt
-        ///
-        /// # Returns
-        ///
-        /// * `Ok(Some(frame))` - Successfully captured a metadata frame
-        /// * `Ok(None)` - No frame available within timeout
-        /// * `Err(_)` - An error occurred during capture
-        pub async fn capture_metadata(&self, timeout: Duration) -> Result<Option<MetadataFrame>> {
-            let receiver = Arc::clone(&self.inner);
-            ::async_std::task::spawn_blocking(move || receiver.capture_metadata(timeout)).await
-        }
-
-        /// Async version of `Receiver::capture_metadata_with_retry`.
-        ///
-        /// Captures metadata with automatic retry logic without blocking the async runtime.
-        ///
-        /// # Arguments
-        ///
-        /// * `timeout` - Timeout for each capture attempt. Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-        /// * `max_attempts` - Maximum number of retry attempts
-        ///
-        /// # Returns
-        ///
-        /// * `Ok(Some(frame))` - Successfully captured a metadata frame
-        /// * `Ok(None)` - No frame available after all retry attempts
-        /// * `Err(_)` - An error occurred during capture
-        pub async fn capture_metadata_with_retry(
-            &self,
-            timeout: Duration,
-            max_attempts: usize,
-        ) -> Result<Option<MetadataFrame>> {
-            let receiver = Arc::clone(&self.inner);
-            ::async_std::task::spawn_blocking(move || {
-                receiver.capture_metadata_with_retry(timeout, max_attempts)
-            })
-            .await
-        }
-
-        /// Async version of `Receiver::capture_metadata_blocking`.
-        ///
-        /// Blocks until a metadata frame is received or timeout expires, without blocking
+        /// Captures a metadata frame, blocking until received or timeout expires, without blocking
         /// the async runtime.
         ///
         /// # Arguments
         ///
-        /// * `total_timeout` - Total time to wait for a frame.
+        /// * `timeout` - Total time to wait for a frame.
         ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
         ///
         /// # Returns
         ///
         /// * `Ok(frame)` - Successfully captured a metadata frame
         /// * `Err(Error::FrameTimeout)` - No frame received within timeout (includes retry details)
-        /// * `Err(_)` - Another error occurred during capture
-        pub async fn capture_metadata_blocking(
-            &self,
-            total_timeout: Duration,
-        ) -> Result<MetadataFrame> {
+        /// * `Err(_)` - An error occurred during capture
+        pub async fn capture_metadata(&self, timeout: Duration) -> Result<MetadataFrame> {
             let receiver = Arc::clone(&self.inner);
-            ::async_std::task::spawn_blocking(move || {
-                receiver.capture_metadata_blocking(total_timeout)
-            })
-            .await
+            ::async_std::task::spawn_blocking(move || receiver.capture_metadata(timeout)).await
+        }
+
+        /// Async version of `Receiver::capture_metadata_timeout`.
+        ///
+        /// Attempts to capture a metadata frame with a timeout (polling variant).
+        ///
+        /// # Arguments
+        ///
+        /// * `timeout` - Maximum time to wait for a frame.
+        ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+        ///
+        /// # Returns
+        ///
+        /// * `Ok(Some(frame))` - Successfully captured a metadata frame
+        /// * `Ok(None)` - No frame available within timeout
+        /// * `Err(_)` - An error occurred during capture
+        pub async fn capture_metadata_timeout(
+            &self,
+            timeout: Duration,
+        ) -> Result<Option<MetadataFrame>> {
+            let receiver = Arc::clone(&self.inner);
+            ::async_std::task::spawn_blocking(move || receiver.capture_metadata_timeout(timeout))
+                .await
         }
     }
 

@@ -63,14 +63,14 @@
 //! The completion callback notifies when the buffer can be reused:
 //!
 //! ```no_run
-//! # use grafton_ndi::{NDI, SenderOptions, BorrowedVideoFrame, FourCCVideoType};
+//! # use grafton_ndi::{NDI, SenderOptions, BorrowedVideoFrame, PixelFormat};
 //! # let ndi = NDI::new().unwrap();
 //! # let mut sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build().unwrap()).unwrap();
 //! // Register callback to know when buffer is released
 //! sender.on_async_video_done(|len| println!("Buffer released: {} bytes", len));
 //!
 //! let buffer = vec![0u8; 1920 * 1080 * 4];
-//! let frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
+//! let frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
 //! let token = sender.send_video_async(&frame);
 //! // Buffer is now owned by NDI - cannot be modified until callback fires
 //! // The AsyncVideoToken must be kept alive to track the operation
@@ -120,9 +120,9 @@ pub use {
     error::*,
     finder::{Finder, FinderOptions, FinderOptionsBuilder, Source, SourceAddress, SourceCache},
     frames::{
-        AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout, AudioType, FourCCVideoType,
-        FrameFormatType, LineStrideOrSize, MetadataFrame, MetadataFrameRef, VideoFrame,
-        VideoFrameBuilder, VideoFrameRef,
+        AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout, LineStrideOrSize,
+        MetadataFrame, MetadataFrameRef, PixelFormat, ScanType, VideoFrame, VideoFrameBuilder,
+        VideoFrameRef,
     },
     receiver::{
         ConnectionStats, FrameType, Receiver, ReceiverBandwidth, ReceiverColorFormat,

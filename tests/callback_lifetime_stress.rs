@@ -6,7 +6,7 @@
 /// These tests are ignored by default because they take ~100 seconds to run.
 /// Run them explicitly with: cargo test --features advanced_sdk --test callback_lifetime_stress -- --ignored
 #[cfg(feature = "advanced_sdk")]
-use grafton_ndi::{BorrowedVideoFrame, FourCCVideoType, SenderOptions, NDI};
+use grafton_ndi::{BorrowedVideoFrame, PixelFormat, SenderOptions, NDI};
 
 #[cfg(feature = "advanced_sdk")]
 use std::{
@@ -50,7 +50,7 @@ fn test_rapid_sender_lifecycle() -> Result<(), grafton_ndi::Error> {
         let buffer = vec![0u8; 640 * 480 * 4];
         for _ in 0..2 {
             let borrowed_frame =
-                BorrowedVideoFrame::from_buffer(&buffer, 640, 480, FourCCVideoType::BGRA, 30, 1);
+                BorrowedVideoFrame::from_buffer(&buffer, 640, 480, PixelFormat::BGRA, 30, 1);
             let _token = sender.send_video_async(&borrowed_frame);
         }
 
@@ -118,7 +118,7 @@ fn test_concurrent_sender_lifecycle() -> Result<(), grafton_ndi::Error> {
                         &buffer,
                         640,
                         480,
-                        FourCCVideoType::BGRA,
+                        PixelFormat::BGRA,
                         30,
                         1,
                     );
@@ -181,7 +181,7 @@ fn test_no_callbacks_after_drop() -> Result<(), grafton_ndi::Error> {
         let buffer = vec![0u8; 640 * 480 * 4];
         for _ in 0..3 {
             let borrowed_frame =
-                BorrowedVideoFrame::from_buffer(&buffer, 640, 480, FourCCVideoType::BGRA, 30, 1);
+                BorrowedVideoFrame::from_buffer(&buffer, 640, 480, PixelFormat::BGRA, 30, 1);
             let _token = sender.send_video_async(&borrowed_frame);
         }
 
@@ -230,7 +230,7 @@ fn test_flush_waits_for_callback() -> Result<(), grafton_ndi::Error> {
     let buffer = vec![0u8; 640 * 480 * 4];
     for _ in 0..3 {
         let borrowed_frame =
-            BorrowedVideoFrame::from_buffer(&buffer, 640, 480, FourCCVideoType::BGRA, 30, 1);
+            BorrowedVideoFrame::from_buffer(&buffer, 640, 480, PixelFormat::BGRA, 30, 1);
         let _token = sender.send_video_async(&borrowed_frame);
     }
 

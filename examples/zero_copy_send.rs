@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use grafton_ndi::{BorrowedVideoFrame, FourCCVideoType, SenderOptions, NDI};
+use grafton_ndi::{BorrowedVideoFrame, PixelFormat, SenderOptions, NDI};
 
 fn main() -> Result<(), grafton_ndi::Error> {
     // Initialize NDI
@@ -68,7 +68,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
 
         // Create a borrowed frame that references our buffer
         let borrowed_frame =
-            BorrowedVideoFrame::from_buffer(&buffer, width, height, FourCCVideoType::BGRA, 60, 1);
+            BorrowedVideoFrame::from_buffer(&buffer, width, height, PixelFormat::BGRA, 60, 1);
 
         // Send asynchronously - no copy happens here!
         let _token = sender.send_video_async(&borrowed_frame);

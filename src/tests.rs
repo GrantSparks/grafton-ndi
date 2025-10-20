@@ -501,7 +501,7 @@ fn test_source_cache_invalidation() {
 #[cfg(feature = "image-encoding")]
 #[test]
 fn test_video_frame_encode_png_rgba() {
-    use crate::frames::{FourCCVideoType, VideoFrame};
+    use crate::frames::{PixelFormat, VideoFrame};
 
     let width = 2;
     let height = 2;
@@ -514,7 +514,7 @@ fn test_video_frame_encode_png_rgba() {
 
     let frame = VideoFrame::builder()
         .resolution(width, height)
-        .fourcc(FourCCVideoType::RGBA)
+        .pixel_format(PixelFormat::RGBA)
         .build()
         .unwrap();
 
@@ -533,7 +533,7 @@ fn test_video_frame_encode_png_rgba() {
 #[cfg(feature = "image-encoding")]
 #[test]
 fn test_video_frame_encode_png_bgra() {
-    use crate::frames::{FourCCVideoType, VideoFrame};
+    use crate::frames::{PixelFormat, VideoFrame};
 
     let width = 2;
     let height = 2;
@@ -546,7 +546,7 @@ fn test_video_frame_encode_png_bgra() {
 
     let frame = VideoFrame::builder()
         .resolution(width, height)
-        .fourcc(FourCCVideoType::BGRA)
+        .pixel_format(PixelFormat::BGRA)
         .build()
         .unwrap();
 
@@ -565,11 +565,11 @@ fn test_video_frame_encode_png_bgra() {
 #[cfg(feature = "image-encoding")]
 #[test]
 fn test_video_frame_encode_png_unsupported_format() {
-    use crate::frames::{FourCCVideoType, VideoFrame};
+    use crate::frames::{PixelFormat, VideoFrame};
 
     let frame = VideoFrame::builder()
         .resolution(2, 2)
-        .fourcc(FourCCVideoType::UYVY)
+        .pixel_format(PixelFormat::UYVY)
         .build()
         .unwrap();
 
@@ -584,7 +584,7 @@ fn test_video_frame_encode_png_unsupported_format() {
 #[cfg(feature = "image-encoding")]
 #[test]
 fn test_video_frame_encode_jpeg_rgba() {
-    use crate::frames::{FourCCVideoType, VideoFrame};
+    use crate::frames::{PixelFormat, VideoFrame};
 
     let width = 4;
     let height = 4;
@@ -592,7 +592,7 @@ fn test_video_frame_encode_jpeg_rgba() {
 
     let frame = VideoFrame::builder()
         .resolution(width, height)
-        .fourcc(FourCCVideoType::RGBA)
+        .pixel_format(PixelFormat::RGBA)
         .build()
         .unwrap();
 
@@ -614,7 +614,7 @@ fn test_video_frame_encode_jpeg_rgba() {
 #[cfg(feature = "image-encoding")]
 #[test]
 fn test_video_frame_encode_jpeg_bgra() {
-    use crate::frames::{FourCCVideoType, VideoFrame};
+    use crate::frames::{PixelFormat, VideoFrame};
 
     let width = 4;
     let height = 4;
@@ -622,7 +622,7 @@ fn test_video_frame_encode_jpeg_bgra() {
 
     let frame = VideoFrame::builder()
         .resolution(width, height)
-        .fourcc(FourCCVideoType::BGRA)
+        .pixel_format(PixelFormat::BGRA)
         .build()
         .unwrap();
 
@@ -641,7 +641,7 @@ fn test_video_frame_encode_jpeg_bgra() {
 #[cfg(feature = "image-encoding")]
 #[test]
 fn test_video_frame_encode_jpeg_quality_range() {
-    use crate::frames::{FourCCVideoType, VideoFrame};
+    use crate::frames::{PixelFormat, VideoFrame};
 
     // Create a more complex image with varying colors to better show compression differences
     let width = 32;
@@ -661,7 +661,7 @@ fn test_video_frame_encode_jpeg_quality_range() {
 
     let frame = VideoFrame::builder()
         .resolution(width, height)
-        .fourcc(FourCCVideoType::RGBA)
+        .pixel_format(PixelFormat::RGBA)
         .build()
         .unwrap();
 
@@ -683,7 +683,7 @@ fn test_video_frame_encode_jpeg_quality_range() {
 #[cfg(feature = "image-encoding")]
 #[test]
 fn test_video_frame_encode_data_url_png() {
-    use crate::frames::{FourCCVideoType, ImageFormat, VideoFrame};
+    use crate::frames::{ImageFormat, PixelFormat, VideoFrame};
 
     let width = 2;
     let height = 2;
@@ -691,7 +691,7 @@ fn test_video_frame_encode_data_url_png() {
 
     let frame = VideoFrame::builder()
         .resolution(width, height)
-        .fourcc(FourCCVideoType::RGBA)
+        .pixel_format(PixelFormat::RGBA)
         .build()
         .unwrap();
 
@@ -719,7 +719,7 @@ fn test_video_frame_encode_data_url_png() {
 #[cfg(feature = "image-encoding")]
 #[test]
 fn test_video_frame_encode_data_url_jpeg() {
-    use crate::frames::{FourCCVideoType, ImageFormat, VideoFrame};
+    use crate::frames::{ImageFormat, PixelFormat, VideoFrame};
 
     let width = 4;
     let height = 4;
@@ -727,7 +727,7 @@ fn test_video_frame_encode_data_url_jpeg() {
 
     let frame = VideoFrame::builder()
         .resolution(width, height)
-        .fourcc(FourCCVideoType::RGBA)
+        .pixel_format(PixelFormat::RGBA)
         .build()
         .unwrap();
 
@@ -943,33 +943,24 @@ fn test_tokio_async_receiver_methods_exist() {
 
             // All these methods should exist and be callable
             let _ = async_receiver
-                .capture_video(std::time::Duration::from_millis(100))
+                .capture_video(std::time::Duration::from_secs(5))
                 .await;
             let _ = async_receiver
-                .capture_video_with_retry(std::time::Duration::from_millis(100), 10)
-                .await;
-            let _ = async_receiver
-                .capture_video_blocking(std::time::Duration::from_secs(5))
+                .capture_video_timeout(std::time::Duration::from_millis(100))
                 .await;
 
             let _ = async_receiver
-                .capture_audio(std::time::Duration::from_millis(100))
+                .capture_audio(std::time::Duration::from_secs(5))
                 .await;
             let _ = async_receiver
-                .capture_audio_with_retry(std::time::Duration::from_millis(100), 10)
-                .await;
-            let _ = async_receiver
-                .capture_audio_blocking(std::time::Duration::from_secs(5))
+                .capture_audio_timeout(std::time::Duration::from_millis(100))
                 .await;
 
             let _ = async_receiver
-                .capture_metadata(std::time::Duration::from_millis(100))
+                .capture_metadata(std::time::Duration::from_secs(5))
                 .await;
             let _ = async_receiver
-                .capture_metadata_with_retry(std::time::Duration::from_millis(100), 10)
-                .await;
-            let _ = async_receiver
-                .capture_metadata_blocking(std::time::Duration::from_secs(5))
+                .capture_metadata_timeout(std::time::Duration::from_millis(100))
                 .await;
         }
     };
@@ -1034,33 +1025,24 @@ fn test_async_std_async_receiver_methods_exist() {
 
             // All these methods should exist and be callable
             let _ = async_receiver
-                .capture_video(std::time::Duration::from_millis(100))
+                .capture_video(std::time::Duration::from_secs(5))
                 .await;
             let _ = async_receiver
-                .capture_video_with_retry(std::time::Duration::from_millis(100), 10)
-                .await;
-            let _ = async_receiver
-                .capture_video_blocking(std::time::Duration::from_secs(5))
+                .capture_video_timeout(std::time::Duration::from_millis(100))
                 .await;
 
             let _ = async_receiver
-                .capture_audio(std::time::Duration::from_millis(100))
+                .capture_audio(std::time::Duration::from_secs(5))
                 .await;
             let _ = async_receiver
-                .capture_audio_with_retry(std::time::Duration::from_millis(100), 10)
-                .await;
-            let _ = async_receiver
-                .capture_audio_blocking(std::time::Duration::from_secs(5))
+                .capture_audio_timeout(std::time::Duration::from_millis(100))
                 .await;
 
             let _ = async_receiver
-                .capture_metadata(std::time::Duration::from_millis(100))
+                .capture_metadata(std::time::Duration::from_secs(5))
                 .await;
             let _ = async_receiver
-                .capture_metadata_with_retry(std::time::Duration::from_millis(100), 10)
-                .await;
-            let _ = async_receiver
-                .capture_metadata_blocking(std::time::Duration::from_secs(5))
+                .capture_metadata_timeout(std::time::Duration::from_millis(100))
                 .await;
         }
     };
@@ -1118,7 +1100,7 @@ fn test_line_stride_or_size_to_raw_compressed() {
 
 #[test]
 fn test_video_frame_from_raw_uncompressed_bgra() {
-    use crate::frames::{FourCCVideoType, LineStrideOrSize};
+    use crate::frames::{LineStrideOrSize, PixelFormat};
 
     // Test that from_raw reads ONLY line_stride_in_bytes for uncompressed formats
     let test_width = 1920;
@@ -1144,7 +1126,7 @@ fn test_video_frame_from_raw_uncompressed_bgra() {
         // Verify data size calculation
         let expected_size = (line_stride * test_height) as usize;
         assert_eq!(frame.data.len(), expected_size);
-        assert_eq!(frame.fourcc, FourCCVideoType::BGRA);
+        assert_eq!(frame.pixel_format, PixelFormat::BGRA);
 
         drop(frame);
         Vec::from_raw_parts(c_frame.p_data, expected_size, expected_size);
@@ -1152,19 +1134,17 @@ fn test_video_frame_from_raw_uncompressed_bgra() {
 }
 
 #[test]
-fn test_video_frame_from_raw_compressed() {
-    use crate::frames::{FourCCVideoType, LineStrideOrSize};
-
-    // Test that from_raw reads ONLY data_size_in_bytes for compressed/unknown formats
+fn test_video_frame_from_raw_unknown_format_returns_error() {
+    // Test that from_raw returns an error for unknown pixel formats
     let test_width = 1920;
     let test_height = 1080;
-    let data_size = 512000; // Compressed size
+    let data_size = 512000;
 
-    // Create a frame with Max FourCC (compressed/unknown format)
+    // Create a frame with an invalid/unknown FourCC
     let mut c_frame: NDIlib_video_frame_v2_t = unsafe { std::mem::zeroed() };
     c_frame.xres = test_width;
     c_frame.yres = test_height;
-    c_frame.FourCC = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_max;
+    c_frame.FourCC = 0xFFFFFFFF; // Invalid FourCC code
     c_frame.__bindgen_anon_1.data_size_in_bytes = data_size;
 
     let mut data = vec![0u8; data_size as usize];
@@ -1172,35 +1152,27 @@ fn test_video_frame_from_raw_compressed() {
     std::mem::forget(data);
 
     unsafe {
-        let frame = VideoFrame::from_raw(&c_frame).unwrap();
+        let result = VideoFrame::from_raw(&c_frame);
+        assert!(result.is_err());
 
-        // Should have DataSizeBytes variant
-        match frame.line_stride_or_size {
-            LineStrideOrSize::DataSizeBytes(size) => {
-                assert_eq!(size, data_size);
-            }
-            LineStrideOrSize::LineStrideBytes(_) => {
-                panic!("Expected DataSizeBytes for compressed format");
-            }
+        if let Err(Error::InvalidFrame(msg)) = result {
+            assert!(msg.contains("Unknown pixel format FourCC"));
+        } else {
+            panic!("Expected InvalidFrame error for unknown pixel format");
         }
 
-        // Verify data size
-        assert_eq!(frame.data.len(), data_size as usize);
-        assert_eq!(frame.fourcc, FourCCVideoType::Max);
-
-        drop(frame);
         Vec::from_raw_parts(c_frame.p_data, data_size as usize, data_size as usize);
     }
 }
 
 #[test]
 fn test_video_frame_to_raw_roundtrip_uncompressed() {
-    use crate::frames::{FourCCVideoType, LineStrideOrSize, VideoFrame};
+    use crate::frames::{LineStrideOrSize, PixelFormat, VideoFrame};
 
     // Build a video frame with LineStrideBytes
     let frame = VideoFrame::builder()
         .resolution(1920, 1080)
-        .fourcc(FourCCVideoType::BGRA)
+        .pixel_format(PixelFormat::BGRA)
         .build()
         .unwrap();
 
@@ -1225,12 +1197,12 @@ fn test_video_frame_to_raw_roundtrip_uncompressed() {
 
 #[test]
 fn test_video_frame_builder_creates_line_stride_bytes() {
-    use crate::frames::{FourCCVideoType, LineStrideOrSize, VideoFrame};
+    use crate::frames::{LineStrideOrSize, PixelFormat, VideoFrame};
 
     // All builder-created frames should use LineStrideBytes
     let frame = VideoFrame::builder()
         .resolution(640, 480)
-        .fourcc(FourCCVideoType::RGBA)
+        .pixel_format(PixelFormat::RGBA)
         .build()
         .unwrap();
 
