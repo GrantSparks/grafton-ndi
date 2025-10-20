@@ -145,7 +145,7 @@ let options = SenderOptions::builder("Source Name")
 let mut sender = grafton_ndi::Sender::new(&ndi, &options)?;  // Must be mut for async send
 
 // Synchronous send
-sender.send_video(&video_frame)?;
+sender.send_video(&video_frame);
 
 // Or async zero-copy send
 let token = sender.send_video_async(&borrowed_frame);
@@ -184,18 +184,28 @@ use std::time::Duration;
 let options = ReceiverOptions::builder(source).build();
 let receiver = Receiver::new(&ndi, &options)?;
 
-// Poll for status changes
-if let Some(status) = receiver.poll_status_change(Duration::from_millis(100)) {
-    println!("Connected: {}", status.is_connected);
-    println!("Video frames: {}", status.video_frames);
-    println!("Audio frames: {}", status.audio_frames);
+// Check connection status
+if receiver.is_connected() {
+    // Get performance statistics
+    let stats = receiver.connection_stats();
+    println!("Connections: {}", stats.connections);
+    println!("Video frames received: {}", stats.video_frames_received);
+    println!("Video frames dropped: {}", stats.video_frames_dropped);
 
-    // Monitor receiver performance
-    if status.total_frames > 0 {
-        let drop_rate = status.dropped_frames as f32 / status.total_frames as f32;
-        if drop_rate > 0.01 {
-            eprintln!("High drop rate: {:.1}%", drop_rate * 100.0);
-        }
+    // Monitor receiver performance using built-in helper
+    let drop_rate = stats.video_drop_percentage();
+    if drop_rate > 1.0 {
+        eprintln!("High drop rate: {:.1}%", drop_rate);
+    }
+}
+
+// Poll for status changes (tally, connections, etc.)
+if let Some(status) = receiver.poll_status_change(Duration::from_millis(100))? {
+    if let Some(connections) = status.connections {
+        println!("Connection count changed: {}", connections);
+    }
+    if let Some(tally) = status.tally {
+        println!("Tally: program={}, preview={}", tally.on_program, tally.on_preview);
     }
 }
 ```
