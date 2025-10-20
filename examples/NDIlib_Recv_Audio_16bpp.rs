@@ -32,8 +32,8 @@ fn main() -> Result<(), Error> {
         if exit_loop.load(Ordering::Relaxed) {
             return Ok(());
         }
-        finder.wait_for_sources(1000);
-        let sources = finder.get_sources(0)?;
+        finder.wait_for_sources(Duration::from_secs(1))?;
+        let sources = finder.sources(Duration::ZERO)?;
         if !sources.is_empty() {
             break sources;
         }
@@ -48,7 +48,7 @@ fn main() -> Result<(), Error> {
     let start = Instant::now();
     while !exit_loop.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(60) {
         // Check for video frames
-        if let Some(video_frame) = receiver.capture_video(0)? {
+        if let Some(video_frame) = receiver.capture_video(Duration::ZERO)? {
             println!(
                 "Video data received ({width}x{height}).",
                 width = video_frame.width,
@@ -57,7 +57,7 @@ fn main() -> Result<(), Error> {
         }
 
         // Check for audio frames
-        if let Some(audio_frame) = receiver.capture_audio(0)? {
+        if let Some(audio_frame) = receiver.capture_audio(Duration::ZERO)? {
             println!(
                 "Audio data received ({num_samples} samples).",
                 num_samples = audio_frame.num_samples
@@ -74,12 +74,12 @@ fn main() -> Result<(), Error> {
         }
 
         // Check for metadata
-        if let Some(_metadata) = receiver.capture_metadata(0)? {
+        if let Some(_metadata) = receiver.capture_metadata(Duration::ZERO)? {
             println!("Meta data received.");
         }
 
         // Check for status changes
-        if let Some(_status) = receiver.poll_status_change(0) {
+        if let Some(_status) = receiver.poll_status_change(Duration::ZERO)? {
             println!("Receiver connection status changed.");
         }
 

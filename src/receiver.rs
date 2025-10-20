@@ -28,7 +28,7 @@
 //! # }
 //! ```
 
-use std::{ffi::CString, ptr};
+use std::{ffi::CString, ptr, time::Duration};
 
 use crate::{
     finder::{RawSource, Source},
@@ -37,7 +37,7 @@ use crate::{
     },
     ndi_lib::*,
     recv_guard::{RecvAudioGuard, RecvMetadataGuard, RecvVideoGuard},
-    Error, Result, NDI,
+    to_ms_checked, Error, Result, NDI,
 };
 
 macro_rules! ptz_command {
@@ -637,12 +637,13 @@ impl Receiver {
     ///
     /// ```no_run
     /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
     /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
     /// // Zero-copy capture
-    /// if let Some(frame) = receiver.capture_video_ref(1000)? {
+    /// if let Some(frame) = receiver.capture_video_ref(Duration::from_secs(1))? {
     ///     // Process in place - no copy needed
     ///     let pixels = frame.data();
     ///     println!("{}×{} frame, {} bytes", frame.width(), frame.height(), pixels.len());
@@ -653,7 +654,8 @@ impl Receiver {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn capture_video_ref(&self, timeout_ms: u32) -> Result<Option<VideoFrameRef>> {
+    pub fn capture_video_ref(&self, timeout: Duration) -> Result<Option<VideoFrameRef>> {
+        let timeout_ms = to_ms_checked(timeout)?;
         let mut video_frame = NDIlib_video_frame_v2_t::default();
 
         // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
@@ -696,8 +698,8 @@ impl Receiver {
     /// This method internally calls [`Self::capture_video_ref`] and converts the borrowed
     /// frame to an owned frame via `to_owned()`, ensuring all frame handling logic is
     /// centralized in the borrowed path.
-    pub fn capture_video(&self, timeout_ms: u32) -> Result<Option<VideoFrame>> {
-        match self.capture_video_ref(timeout_ms)? {
+    pub fn capture_video(&self, timeout: Duration) -> Result<Option<VideoFrame>> {
+        match self.capture_video_ref(timeout)? {
             Some(frame_ref) => Ok(Some(frame_ref.to_owned()?)),
             None => Ok(None),
         }
@@ -715,7 +717,8 @@ impl Receiver {
     ///
     /// # Arguments
     ///
-    /// * `timeout_ms` - Timeout for each individual capture attempt in milliseconds
+    /// * `timeout` - Timeout for each individual capture attempt.
+    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
     /// * `max_attempts` - Maximum number of retry attempts before giving up
     ///
     /// # Returns
@@ -728,12 +731,13 @@ impl Receiver {
     ///
     /// ```no_run
     /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
     /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
     /// // Try up to 10 times with 100ms timeout per attempt
-    /// if let Some(frame) = receiver.capture_video_with_retry(100, 10)? {
+    /// if let Some(frame) = receiver.capture_video_with_retry(Duration::from_millis(100), 10)? {
     ///     println!("Captured {width}x{height} frame", width = frame.width, height = frame.height);
     /// }
     /// # Ok(())
@@ -741,16 +745,16 @@ impl Receiver {
     /// ```
     pub fn capture_video_with_retry(
         &self,
-        timeout_ms: u32,
+        timeout: Duration,
         max_attempts: usize,
     ) -> Result<Option<VideoFrame>> {
         for attempt in 1..=max_attempts {
-            match self.capture_video(timeout_ms)? {
+            match self.capture_video(timeout)? {
                 Some(frame) => return Ok(Some(frame)),
                 None => {
                     // Don't sleep on the last attempt
                     if attempt < max_attempts {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        std::thread::sleep(Duration::from_millis(10));
                     }
                 }
             }
@@ -782,7 +786,8 @@ impl Receiver {
     ///
     /// # Arguments
     ///
-    /// * `total_timeout_ms` - Total time to wait for a frame in milliseconds
+    /// * `total_timeout` - Total time to wait for a frame.
+    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
     ///
     /// # Returns
     ///
@@ -794,19 +799,19 @@ impl Receiver {
     ///
     /// ```no_run
     /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
     /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
     /// // Wait up to 5 seconds for a frame
-    /// let frame = receiver.capture_video_blocking(5000)?;
+    /// let frame = receiver.capture_video_blocking(Duration::from_secs(5))?;
     /// println!("Captured {width}x{height} frame", width = frame.width, height = frame.height);
     /// # Ok(())
     /// # }
     /// ```
-    pub fn capture_video_blocking(&self, total_timeout_ms: u32) -> Result<VideoFrame> {
+    pub fn capture_video_blocking(&self, total_timeout: Duration) -> Result<VideoFrame> {
         let start_time = std::time::Instant::now();
-        let timeout = std::time::Duration::from_millis(total_timeout_ms.into());
         let mut attempts = 0;
 
         loop {
@@ -814,18 +819,18 @@ impl Receiver {
 
             // Check if we've exceeded our total timeout
             let elapsed = start_time.elapsed();
-            if elapsed > timeout {
+            if elapsed > total_timeout {
                 return Err(Error::FrameTimeout { attempts, elapsed });
             }
 
             // Try to capture with a short per-attempt timeout (100ms)
             // During initial connection, the NDI SDK returns immediately while synchronizing.
             // After synchronization, this succeeds on first attempt (zero overhead).
-            match self.capture_video(100)? {
+            match self.capture_video(Duration::from_millis(100))? {
                 Some(frame) => return Ok(frame),
                 None => {
                     // Brief sleep before retry to avoid busy-waiting
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    std::thread::sleep(Duration::from_millis(10));
                 }
             }
         }
@@ -850,12 +855,13 @@ impl Receiver {
     ///
     /// ```no_run
     /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
     /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
     /// // Zero-copy capture
-    /// if let Some(frame) = receiver.capture_audio_ref(1000)? {
+    /// if let Some(frame) = receiver.capture_audio_ref(Duration::from_secs(1))? {
     ///     // Process in place - no copy needed
     ///     let samples = frame.data();
     ///     println!("{} channels, {} samples", frame.num_channels(), frame.num_samples());
@@ -863,7 +869,8 @@ impl Receiver {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn capture_audio_ref(&self, timeout_ms: u32) -> Result<Option<AudioFrameRef>> {
+    pub fn capture_audio_ref(&self, timeout: Duration) -> Result<Option<AudioFrameRef>> {
+        let timeout_ms = to_ms_checked(timeout)?;
         let mut audio_frame = NDIlib_audio_frame_v3_t::default();
 
         // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
@@ -906,8 +913,8 @@ impl Receiver {
     /// This method internally calls [`Self::capture_audio_ref`] and converts the borrowed
     /// frame to an owned frame via `to_owned()`, ensuring all frame handling logic is
     /// centralized in the borrowed path.
-    pub fn capture_audio(&self, timeout_ms: u32) -> Result<Option<AudioFrame>> {
-        match self.capture_audio_ref(timeout_ms)? {
+    pub fn capture_audio(&self, timeout: Duration) -> Result<Option<AudioFrame>> {
+        match self.capture_audio_ref(timeout)? {
             Some(frame_ref) => Ok(Some(frame_ref.to_owned()?)),
             None => Ok(None),
         }
@@ -920,7 +927,8 @@ impl Receiver {
     ///
     /// # Arguments
     ///
-    /// * `timeout_ms` - Timeout for each individual capture attempt in milliseconds
+    /// * `timeout` - Timeout for each individual capture attempt.
+    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
     /// * `max_attempts` - Maximum number of retry attempts before giving up
     ///
     /// # Returns
@@ -930,16 +938,16 @@ impl Receiver {
     /// * `Err(_)` - An error occurred during capture
     pub fn capture_audio_with_retry(
         &self,
-        timeout_ms: u32,
+        timeout: Duration,
         max_attempts: usize,
     ) -> Result<Option<AudioFrame>> {
         for attempt in 1..=max_attempts {
-            match self.capture_audio(timeout_ms)? {
+            match self.capture_audio(timeout)? {
                 Some(frame) => return Ok(Some(frame)),
                 None => {
                     // Don't sleep on the last attempt
                     if attempt < max_attempts {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        std::thread::sleep(Duration::from_millis(10));
                     }
                 }
             }
@@ -953,16 +961,16 @@ impl Receiver {
     ///
     /// # Arguments
     ///
-    /// * `total_timeout_ms` - Total time to wait for a frame in milliseconds
+    /// * `total_timeout` - Total time to wait for a frame.
+    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
     ///
     /// # Returns
     ///
     /// * `Ok(frame)` - Successfully captured an audio frame
     /// * `Err(Error::FrameTimeout)` - No frame received within the timeout period (includes retry details)
     /// * `Err(_)` - Another error occurred during capture
-    pub fn capture_audio_blocking(&self, total_timeout_ms: u32) -> Result<AudioFrame> {
+    pub fn capture_audio_blocking(&self, total_timeout: Duration) -> Result<AudioFrame> {
         let start_time = std::time::Instant::now();
-        let timeout = std::time::Duration::from_millis(total_timeout_ms.into());
         let mut attempts = 0;
 
         loop {
@@ -970,16 +978,16 @@ impl Receiver {
 
             // Check if we've exceeded our total timeout
             let elapsed = start_time.elapsed();
-            if elapsed > timeout {
+            if elapsed > total_timeout {
                 return Err(Error::FrameTimeout { attempts, elapsed });
             }
 
             // Try to capture with a short per-attempt timeout (100ms)
-            match self.capture_audio(100)? {
+            match self.capture_audio(Duration::from_millis(100))? {
                 Some(frame) => return Ok(frame),
                 None => {
                     // Brief sleep before retry to avoid busy-waiting
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    std::thread::sleep(Duration::from_millis(10));
                 }
             }
         }
@@ -1004,12 +1012,13 @@ impl Receiver {
     ///
     /// ```no_run
     /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
     /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
     /// // Zero-copy capture
-    /// if let Some(frame) = receiver.capture_metadata_ref(1000)? {
+    /// if let Some(frame) = receiver.capture_metadata_ref(Duration::from_secs(1))? {
     ///     // Process in place - no copy needed
     ///     let metadata_str = frame.data().to_string_lossy();
     ///     println!("Metadata: {}", metadata_str);
@@ -1017,7 +1026,8 @@ impl Receiver {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn capture_metadata_ref(&self, timeout_ms: u32) -> Result<Option<MetadataFrameRef>> {
+    pub fn capture_metadata_ref(&self, timeout: Duration) -> Result<Option<MetadataFrameRef>> {
+        let timeout_ms = to_ms_checked(timeout)?;
         let mut metadata_frame = NDIlib_metadata_frame_t::default();
 
         // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
@@ -1060,8 +1070,8 @@ impl Receiver {
     /// This method internally calls [`Self::capture_metadata_ref`] and converts the borrowed
     /// frame to an owned frame via `to_owned()`, ensuring all frame handling logic is
     /// centralized in the borrowed path.
-    pub fn capture_metadata(&self, timeout_ms: u32) -> Result<Option<MetadataFrame>> {
-        match self.capture_metadata_ref(timeout_ms)? {
+    pub fn capture_metadata(&self, timeout: Duration) -> Result<Option<MetadataFrame>> {
+        match self.capture_metadata_ref(timeout)? {
             Some(frame_ref) => Ok(Some(frame_ref.to_owned())),
             None => Ok(None),
         }
@@ -1074,7 +1084,8 @@ impl Receiver {
     ///
     /// # Arguments
     ///
-    /// * `timeout_ms` - Timeout for each individual capture attempt in milliseconds
+    /// * `timeout` - Timeout for each individual capture attempt.
+    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
     /// * `max_attempts` - Maximum number of retry attempts before giving up
     ///
     /// # Returns
@@ -1084,16 +1095,16 @@ impl Receiver {
     /// * `Err(_)` - An error occurred during capture
     pub fn capture_metadata_with_retry(
         &self,
-        timeout_ms: u32,
+        timeout: Duration,
         max_attempts: usize,
     ) -> Result<Option<MetadataFrame>> {
         for attempt in 1..=max_attempts {
-            match self.capture_metadata(timeout_ms)? {
+            match self.capture_metadata(timeout)? {
                 Some(frame) => return Ok(Some(frame)),
                 None => {
                     // Don't sleep on the last attempt
                     if attempt < max_attempts {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        std::thread::sleep(Duration::from_millis(10));
                     }
                 }
             }
@@ -1107,16 +1118,16 @@ impl Receiver {
     ///
     /// # Arguments
     ///
-    /// * `total_timeout_ms` - Total time to wait for a frame in milliseconds
+    /// * `total_timeout` - Total time to wait for a frame.
+    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
     ///
     /// # Returns
     ///
     /// * `Ok(frame)` - Successfully captured a metadata frame
     /// * `Err(Error::FrameTimeout)` - No frame received within the timeout period (includes retry details)
     /// * `Err(_)` - Another error occurred during capture
-    pub fn capture_metadata_blocking(&self, total_timeout_ms: u32) -> Result<MetadataFrame> {
+    pub fn capture_metadata_blocking(&self, total_timeout: Duration) -> Result<MetadataFrame> {
         let start_time = std::time::Instant::now();
-        let timeout = std::time::Duration::from_millis(total_timeout_ms.into());
         let mut attempts = 0;
 
         loop {
@@ -1124,16 +1135,16 @@ impl Receiver {
 
             // Check if we've exceeded our total timeout
             let elapsed = start_time.elapsed();
-            if elapsed > timeout {
+            if elapsed > total_timeout {
                 return Err(Error::FrameTimeout { attempts, elapsed });
             }
 
             // Try to capture with a short per-attempt timeout (100ms)
-            match self.capture_metadata(100)? {
+            match self.capture_metadata(Duration::from_millis(100))? {
                 Some(frame) => return Ok(frame),
                 None => {
                     // Brief sleep before retry to avoid busy-waiting
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    std::thread::sleep(Duration::from_millis(10));
                 }
             }
         }
@@ -1247,8 +1258,21 @@ impl Receiver {
 
     /// Poll for status changes (tally, connections, etc.)
     ///
-    /// Returns None on timeout, Some(RecvStatus) when status has changed
-    pub fn poll_status_change(&self, timeout_ms: u32) -> Option<ReceiverStatus> {
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum time to wait for status change.
+    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+    ///
+    /// # Returns
+    ///
+    /// * `Some(ReceiverStatus)` - Status has changed
+    /// * `None` - Timeout occurred with no status change
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    pub fn poll_status_change(&self, timeout: Duration) -> Result<Option<ReceiverStatus>> {
+        let timeout_ms = to_ms_checked(timeout)?;
         // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
         let frame_type = unsafe {
             NDIlib_recv_capture_v3(
@@ -1279,13 +1303,13 @@ impl Receiver {
                 let has_tally = tally.is_some();
                 let has_connections = connections.is_some();
 
-                Some(ReceiverStatus {
+                Ok(Some(ReceiverStatus {
                     tally,
                     connections,
                     other: !has_tally && !has_connections,
-                })
+                }))
             }
-            _ => None,
+            _ => Ok(None),
         }
     }
 }

@@ -46,8 +46,8 @@ fn main() -> Result<(), Error> {
         if exit_loop.load(Ordering::Relaxed) {
             return Ok(());
         }
-        finder.wait_for_sources(1000);
-        let sources = finder.get_sources(0)?;
+        finder.wait_for_sources(Duration::from_secs(1))?;
+        let sources = finder.sources(Duration::ZERO)?;
         if !sources.is_empty() {
             break sources;
         }
@@ -62,7 +62,7 @@ fn main() -> Result<(), Error> {
     let start = Instant::now();
     while !exit_loop.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(30) {
         // Use poll_status_change to check for status changes
-        if let Some(_status) = receiver.poll_status_change(1000) {
+        if let Some(_status) = receiver.poll_status_change(Duration::from_secs(1))? {
             // Check PTZ support on status change
             if receiver.ptz_is_supported() {
                 println!("This source supports PTZ functionality. Moving to preset #3.");

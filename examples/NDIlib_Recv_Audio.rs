@@ -27,8 +27,8 @@ fn main() -> Result<(), Error> {
 
     // Wait for sources to appear
     println!("Searching for NDI sources...\n");
-    finder.wait_for_sources(5000);
-    let sources = finder.get_sources(5000)?;
+    finder.wait_for_sources(Duration::from_secs(5))?;
+    let sources = finder.sources(Duration::from_secs(5))?;
 
     if sources.is_empty() {
         println!("No NDI sources found!");
@@ -57,7 +57,7 @@ fn main() -> Result<(), Error> {
 
     // Capture a few audio frames
     for i in 0..5 {
-        match receiver.capture_audio(5000)? {
+        match receiver.capture_audio(Duration::from_secs(5))? {
             Some(audio_frame) => {
                 println!("Frame {}: ", i + 1);
                 println!("  Sample rate: {} Hz", audio_frame.sample_rate);

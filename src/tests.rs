@@ -944,17 +944,35 @@ fn test_tokio_async_receiver_methods_exist() {
             let async_receiver = AsyncReceiver::new(receiver);
 
             // All these methods should exist and be callable
-            let _ = async_receiver.capture_video(100).await;
-            let _ = async_receiver.capture_video_with_retry(100, 10).await;
-            let _ = async_receiver.capture_video_blocking(5000).await;
+            let _ = async_receiver
+                .capture_video(std::time::Duration::from_millis(100))
+                .await;
+            let _ = async_receiver
+                .capture_video_with_retry(std::time::Duration::from_millis(100), 10)
+                .await;
+            let _ = async_receiver
+                .capture_video_blocking(std::time::Duration::from_secs(5))
+                .await;
 
-            let _ = async_receiver.capture_audio(100).await;
-            let _ = async_receiver.capture_audio_with_retry(100, 10).await;
-            let _ = async_receiver.capture_audio_blocking(5000).await;
+            let _ = async_receiver
+                .capture_audio(std::time::Duration::from_millis(100))
+                .await;
+            let _ = async_receiver
+                .capture_audio_with_retry(std::time::Duration::from_millis(100), 10)
+                .await;
+            let _ = async_receiver
+                .capture_audio_blocking(std::time::Duration::from_secs(5))
+                .await;
 
-            let _ = async_receiver.capture_metadata(100).await;
-            let _ = async_receiver.capture_metadata_with_retry(100, 10).await;
-            let _ = async_receiver.capture_metadata_blocking(5000).await;
+            let _ = async_receiver
+                .capture_metadata(std::time::Duration::from_millis(100))
+                .await;
+            let _ = async_receiver
+                .capture_metadata_with_retry(std::time::Duration::from_millis(100), 10)
+                .await;
+            let _ = async_receiver
+                .capture_metadata_blocking(std::time::Duration::from_secs(5))
+                .await;
         }
     };
 }
@@ -1019,17 +1037,35 @@ fn test_async_std_async_receiver_methods_exist() {
             let async_receiver = AsyncReceiver::new(receiver);
 
             // All these methods should exist and be callable
-            let _ = async_receiver.capture_video(100).await;
-            let _ = async_receiver.capture_video_with_retry(100, 10).await;
-            let _ = async_receiver.capture_video_blocking(5000).await;
+            let _ = async_receiver
+                .capture_video(std::time::Duration::from_millis(100))
+                .await;
+            let _ = async_receiver
+                .capture_video_with_retry(std::time::Duration::from_millis(100), 10)
+                .await;
+            let _ = async_receiver
+                .capture_video_blocking(std::time::Duration::from_secs(5))
+                .await;
 
-            let _ = async_receiver.capture_audio(100).await;
-            let _ = async_receiver.capture_audio_with_retry(100, 10).await;
-            let _ = async_receiver.capture_audio_blocking(5000).await;
+            let _ = async_receiver
+                .capture_audio(std::time::Duration::from_millis(100))
+                .await;
+            let _ = async_receiver
+                .capture_audio_with_retry(std::time::Duration::from_millis(100), 10)
+                .await;
+            let _ = async_receiver
+                .capture_audio_blocking(std::time::Duration::from_secs(5))
+                .await;
 
-            let _ = async_receiver.capture_metadata(100).await;
-            let _ = async_receiver.capture_metadata_with_retry(100, 10).await;
-            let _ = async_receiver.capture_metadata_blocking(5000).await;
+            let _ = async_receiver
+                .capture_metadata(std::time::Duration::from_millis(100))
+                .await;
+            let _ = async_receiver
+                .capture_metadata_with_retry(std::time::Duration::from_millis(100), 10)
+                .await;
+            let _ = async_receiver
+                .capture_metadata_blocking(std::time::Duration::from_secs(5))
+                .await;
         }
     };
 }

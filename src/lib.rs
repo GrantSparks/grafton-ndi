@@ -138,6 +138,45 @@ pub use frames::ImageFormat;
 /// Alias for Result with our Error type
 pub type Result<T> = std::result::Result<T, crate::error::Error>;
 
+/// Maximum timeout duration supported by the NDI SDK (~49.7 days).
+///
+/// The NDI SDK uses `u32` milliseconds for timeout values, which limits the maximum
+/// timeout to approximately 49.7 days. Attempting to use a larger `Duration` will
+/// result in an error.
+pub const MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(u32::MAX as u64);
+
+/// Converts a `Duration` to milliseconds for FFI, checking for overflow.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidConfiguration`] if the duration exceeds [`MAX_TIMEOUT`].
+///
+/// # Examples
+///
+/// ```ignore
+/// use std::time::Duration;
+/// use grafton_ndi::to_ms_checked;
+///
+/// // Valid timeout
+/// let ms = to_ms_checked(Duration::from_secs(5))?;
+/// assert_eq!(ms, 5000);
+///
+/// // Overflow error
+/// let result = to_ms_checked(Duration::from_secs(u64::MAX));
+/// assert!(result.is_err());
+/// ```
+pub(crate) fn to_ms_checked(d: std::time::Duration) -> Result<u32> {
+    let ms = d.as_millis();
+    if ms > u32::MAX as u128 {
+        Err(Error::InvalidConfiguration(format!(
+            "timeout {:?} exceeds MAX_TIMEOUT (~49.7 days)",
+            d
+        )))
+    } else {
+        Ok(ms as u32)
+    }
+}
+
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;

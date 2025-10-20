@@ -1,6 +1,7 @@
 use std::{
     env,
     io::{self, Write},
+    time::Duration,
 };
 
 use grafton_ndi::{Finder, FinderOptions, ReceiverBandwidth, ReceiverOptions, NDI};
@@ -23,8 +24,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let finder = Finder::new(&ndi, &finder_options)?;
 
     println!("Looking for NDI sources...");
-    finder.wait_for_sources(5000);
-    let sources = finder.get_sources(0)?;
+    finder.wait_for_sources(Duration::from_secs(5))?;
+    let sources = finder.sources(Duration::ZERO)?;
 
     if sources.is_empty() {
         println!("No NDI sources found on the network");
@@ -56,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Monitor status changes
     loop {
-        if let Some(status) = receiver.poll_status_change(1000) {
+        if let Some(status) = receiver.poll_status_change(Duration::from_secs(1))? {
             print!("[Status Change] ");
 
             if let Some(tally) = status.tally {

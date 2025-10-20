@@ -25,7 +25,11 @@ use grafton_ndi::{
     Error, Finder, FinderOptions, FourCCVideoType, ReceiverColorFormat, ReceiverOptions, NDI,
 };
 
-use std::{env, fs::File, time::Instant};
+use std::{
+    env,
+    fs::File,
+    time::{Duration, Instant},
+};
 
 fn main() -> Result<(), Error> {
     let args: Vec<String> = env::args().collect();
@@ -71,8 +75,8 @@ fn main() -> Result<(), Error> {
 
     println!("Looking for sources ...");
     let sources = loop {
-        finder.wait_for_sources(1000);
-        let sources = finder.get_sources(0)?;
+        finder.wait_for_sources(Duration::from_secs(1))?;
+        let sources = finder.sources(Duration::ZERO)?;
         if !sources.is_empty() {
             let count = sources.len();
             println!("Found {count} source(s):");
@@ -94,7 +98,7 @@ fn main() -> Result<(), Error> {
     println!("Waiting for video frames...\n");
 
     let start_time = Instant::now();
-    let video_frame = receiver.capture_video_blocking(60_000)?;
+    let video_frame = receiver.capture_video_blocking(Duration::from_secs(60))?;
 
     let elapsed = start_time.elapsed();
     println!("Frame received after {elapsed:?}");

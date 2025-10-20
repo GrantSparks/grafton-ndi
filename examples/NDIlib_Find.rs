@@ -55,7 +55,7 @@ fn main() -> Result<(), Error> {
     println!("(Will run for 60 seconds)\n");
 
     // Check for initial sources immediately
-    let initial_sources = finder.get_sources(0)?;
+    let initial_sources = finder.sources(Duration::ZERO)?;
     if !initial_sources.is_empty() {
         println!("Initial sources found ({}):", initial_sources.len());
         for (i, source) in initial_sources.iter().enumerate() {
@@ -70,7 +70,7 @@ fn main() -> Result<(), Error> {
 
     while start.elapsed() < Duration::from_secs(60) {
         // Wait up to 5 seconds for sources to be added or removed
-        if !finder.wait_for_sources(5000) {
+        if !finder.wait_for_sources(Duration::from_secs(5))? {
             // No changes detected
             let elapsed = start.elapsed().as_secs();
             if elapsed % 10 == 0 {
@@ -84,7 +84,7 @@ fn main() -> Result<(), Error> {
         }
 
         // Get the updated list of sources
-        let sources = finder.get_sources(0)?;
+        let sources = finder.sources(Duration::ZERO)?;
         let elapsed = start.elapsed().as_secs();
 
         // Display changes

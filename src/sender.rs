@@ -27,7 +27,7 @@ use crate::{
     },
     ndi_lib::*,
     receiver::Tally,
-    Error, Result, NDI,
+    to_ms_checked, Error, Result, NDI,
 };
 
 #[cfg(not(target_has_atomic = "ptr"))]
@@ -601,13 +601,43 @@ impl<'a> Sender<'a> {
         Ok(())
     }
 
-    pub fn get_tally(&self, tally: &mut Tally, timeout_ms: u32) -> bool {
-        unsafe { NDIlib_send_get_tally(self.inner.instance, &mut tally.to_raw(), timeout_ms) }
+    /// Get tally information (program/preview state).
+    ///
+    /// # Arguments
+    ///
+    /// * `tally` - Mutable reference to Tally struct to be populated
+    /// * `timeout` - Maximum time to wait for tally information.
+    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+    ///
+    /// # Returns
+    ///
+    /// `true` if tally was successfully retrieved, `false` on timeout
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    pub fn get_tally(&self, tally: &mut Tally, timeout: Duration) -> Result<bool> {
+        let timeout_ms = to_ms_checked(timeout)?;
+        Ok(unsafe { NDIlib_send_get_tally(self.inner.instance, &mut tally.to_raw(), timeout_ms) })
     }
 
-    #[must_use]
-    pub fn get_no_connections(&self, timeout_ms: u32) -> i32 {
-        unsafe { NDIlib_send_get_no_connections(self.inner.instance, timeout_ms) }
+    /// Get the number of active connections to this sender.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum time to wait for connection count.
+    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+    ///
+    /// # Returns
+    ///
+    /// Number of connections, or a negative value on error/timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    pub fn get_no_connections(&self, timeout: Duration) -> Result<i32> {
+        let timeout_ms = to_ms_checked(timeout)?;
+        Ok(unsafe { NDIlib_send_get_no_connections(self.inner.instance, timeout_ms) })
     }
 
     pub fn clear_connection_metadata(&self) {
