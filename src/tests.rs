@@ -1144,7 +1144,7 @@ fn test_video_frame_from_raw_unknown_format_returns_error() {
     let mut c_frame: NDIlib_video_frame_v2_t = unsafe { std::mem::zeroed() };
     c_frame.xres = test_width;
     c_frame.yres = test_height;
-    c_frame.FourCC = 0xFFFFFFFF; // Invalid FourCC code
+    c_frame.FourCC = -1i32 as _; // Invalid FourCC code (0xFFFFFFFF)
     c_frame.__bindgen_anon_1.data_size_in_bytes = data_size;
 
     let mut data = vec![0u8; data_size as usize];
