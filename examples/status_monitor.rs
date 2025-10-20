@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use grafton_ndi::{Finder, FinderOptions, ReceiverBandwidth, ReceiverOptions, NDI};
+use grafton_ndi::{Finder, FinderOptions, Receiver, ReceiverBandwidth, ReceiverOptions, NDI};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
@@ -48,9 +48,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create receiver with metadata-only bandwidth to focus on status changes
-    let receiver = ReceiverOptions::builder(source.clone())
+    let options = ReceiverOptions::builder(source.clone())
         .bandwidth(ReceiverBandwidth::MetadataOnly)
-        .build(&ndi)?;
+        .build();
+    let receiver = Receiver::new(&ndi, &options)?;
 
     println!("\nMonitoring status changes for: {}", source);
     println!("Press Ctrl+C to exit\n");

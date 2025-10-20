@@ -5,7 +5,7 @@
 //!
 //! Run with: `cargo run --example NDIlib_Recv_Audio_16bpp`
 
-use grafton_ndi::{Error, Finder, FinderOptions, ReceiverOptions, NDI};
+use grafton_ndi::{Error, Finder, FinderOptions, Receiver, ReceiverOptions, NDI};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -40,9 +40,10 @@ fn main() -> Result<(), Error> {
     };
 
     // Create a receiver for the first source
-    let receiver = ReceiverOptions::builder(sources[0].clone())
+    let options = ReceiverOptions::builder(sources[0].clone())
         .name("Example Audio Converter Receiver")
-        .build(&ndi)?;
+        .build();
+    let receiver = Receiver::new(&ndi, &options)?;
 
     // Run for one minute
     let start = Instant::now();

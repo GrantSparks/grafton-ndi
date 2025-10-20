@@ -879,7 +879,7 @@ fn test_receiver_presets_are_distinct() {
 fn test_tokio_async_receiver_creation() {
     use crate::{
         finder::{Source, SourceAddress},
-        receiver::ReceiverOptionsBuilder,
+        receiver::{Receiver, ReceiverOptionsBuilder},
         NDI,
     };
 
@@ -906,9 +906,8 @@ fn test_tokio_async_receiver_creation() {
         if false {
             use std::sync::Arc;
             let ndi = Arc::new(NDI::new().unwrap());
-            let receiver = ReceiverOptionsBuilder::snapshot_preset(source)
-                .build(&ndi)
-                .unwrap();
+            let options = ReceiverOptionsBuilder::snapshot_preset(source).build();
+            let receiver = Receiver::new(&ndi, &options).unwrap();
             let async_receiver = AsyncReceiver::new(receiver);
             let _cloned = async_receiver.clone();
         }
@@ -923,7 +922,7 @@ fn test_tokio_async_receiver_methods_exist() {
 
     use crate::{
         finder::{Source, SourceAddress},
-        receiver::ReceiverOptionsBuilder,
+        receiver::{Receiver, ReceiverOptionsBuilder},
         tokio::AsyncReceiver,
         NDI,
     };
@@ -938,9 +937,8 @@ fn test_tokio_async_receiver_methods_exist() {
         if false {
             use std::sync::Arc;
             let ndi = Arc::new(NDI::new().unwrap());
-            let receiver = ReceiverOptionsBuilder::snapshot_preset(source)
-                .build(&ndi)
-                .unwrap();
+            let options = ReceiverOptionsBuilder::snapshot_preset(source).build();
+            let receiver = Receiver::new(&ndi, &options).unwrap();
             let async_receiver = AsyncReceiver::new(receiver);
 
             // All these methods should exist and be callable
@@ -982,7 +980,7 @@ fn test_tokio_async_receiver_methods_exist() {
 fn test_async_std_async_receiver_creation() {
     use crate::{
         finder::{Source, SourceAddress},
-        receiver::ReceiverOptionsBuilder,
+        receiver::{Receiver, ReceiverOptionsBuilder},
         NDI,
     };
 
@@ -1000,9 +998,8 @@ fn test_async_std_async_receiver_creation() {
         if false {
             use std::sync::Arc;
             let ndi = Arc::new(NDI::new().unwrap());
-            let receiver = ReceiverOptionsBuilder::snapshot_preset(source)
-                .build(&ndi)
-                .unwrap();
+            let options = ReceiverOptionsBuilder::snapshot_preset(source).build();
+            let receiver = Receiver::new(&ndi, &options).unwrap();
             let async_receiver = AsyncReceiver::new(receiver);
             let _cloned = async_receiver.clone();
         }
@@ -1017,7 +1014,7 @@ fn test_async_std_async_receiver_methods_exist() {
     use crate::{
         async_std::AsyncReceiver,
         finder::{Source, SourceAddress},
-        receiver::ReceiverOptionsBuilder,
+        receiver::{Receiver, ReceiverOptionsBuilder},
         NDI,
     };
 
@@ -1031,9 +1028,8 @@ fn test_async_std_async_receiver_methods_exist() {
         if false {
             use std::sync::Arc;
             let ndi = Arc::new(NDI::new().unwrap());
-            let receiver = ReceiverOptionsBuilder::snapshot_preset(source)
-                .build(&ndi)
-                .unwrap();
+            let options = ReceiverOptionsBuilder::snapshot_preset(source).build();
+            let receiver = Receiver::new(&ndi, &options).unwrap();
             let async_receiver = AsyncReceiver::new(receiver);
 
             // All these methods should exist and be callable

@@ -5,7 +5,7 @@
 //!
 //! Run with: `cargo run --example NDIlib_Recv_PTZ`
 
-use grafton_ndi::{Error, Finder, FinderOptions, ReceiverOptions, NDI};
+use grafton_ndi::{Error, Finder, FinderOptions, Receiver, ReceiverOptions, NDI};
 
 use std::{
     sync::{
@@ -54,9 +54,10 @@ fn main() -> Result<(), Error> {
     };
 
     // Create a receiver for the first source
-    let receiver = ReceiverOptions::builder(sources[0].clone())
+    let options = ReceiverOptions::builder(sources[0].clone())
         .name("Example PTZ Receiver")
-        .build(&ndi)?;
+        .build();
+    let receiver = Receiver::new(&ndi, &options)?;
 
     // Run for 30 seconds
     let start = Instant::now();

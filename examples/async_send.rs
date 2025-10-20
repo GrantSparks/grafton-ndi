@@ -16,7 +16,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
     let send_options = SenderOptions::builder("AsyncExample")
         .clock_video(true)
         .clock_audio(true)
-        .build()?;
+        .build();
     let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
 
     println!("Created NDI sender: AsyncExample");

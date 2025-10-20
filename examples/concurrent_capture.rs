@@ -1,6 +1,6 @@
 use std::{sync::Arc, thread, time::Duration};
 
-use grafton_ndi::{ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions, NDI};
+use grafton_ndi::{Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions, NDI};
 
 fn main() -> Result<(), grafton_ndi::Error> {
     // Initialize NDI
@@ -37,12 +37,13 @@ fn main() -> Result<(), grafton_ndi::Error> {
     println!("\nConnecting to: {source}");
 
     // Create receiver
-    let receiver = ReceiverOptions::builder(source)
+    let options = ReceiverOptions::builder(source)
         .color(ReceiverColorFormat::BGRX_BGRA)
         .bandwidth(ReceiverBandwidth::Highest)
         .allow_video_fields(true)
         .name("Concurrent Capture Example")
-        .build(&ndi)?;
+        .build();
+    let receiver = Receiver::new(&ndi, &options)?;
 
     // Wrap receiver in Arc for sharing between threads
     let receiver = Arc::new(receiver);

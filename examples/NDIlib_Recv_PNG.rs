@@ -22,7 +22,8 @@
 //! - Both: `cargo run --example NDIlib_Recv_PNG -- 192.168.0.100 --output MyImage.png`
 
 use grafton_ndi::{
-    Error, Finder, FinderOptions, FourCCVideoType, ReceiverColorFormat, ReceiverOptions, NDI,
+    Error, Finder, FinderOptions, FourCCVideoType, Receiver, ReceiverColorFormat, ReceiverOptions,
+    NDI,
 };
 
 use std::{
@@ -90,9 +91,10 @@ fn main() -> Result<(), Error> {
 
     let first_source = &sources[0];
     println!("\nCreating receiver for: {first_source}");
-    let receiver = ReceiverOptions::builder(sources[0].clone())
+    let options = ReceiverOptions::builder(sources[0].clone())
         .color(ReceiverColorFormat::RGBX_RGBA)
-        .build(&ndi)?;
+        .build();
+    let receiver = Receiver::new(&ndi, &options)?;
 
     println!("Receiver created successfully");
     println!("Waiting for video frames...\n");

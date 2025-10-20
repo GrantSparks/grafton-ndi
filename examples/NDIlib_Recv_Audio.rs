@@ -10,7 +10,9 @@
 
 use std::{thread, time::Duration};
 
-use grafton_ndi::{Error, Finder, FinderOptions, ReceiverBandwidth, ReceiverOptions, NDI};
+use grafton_ndi::{
+    Error, Finder, FinderOptions, Receiver, ReceiverBandwidth, ReceiverOptions, NDI,
+};
 
 fn main() -> Result<(), Error> {
     println!("NDI Audio Receiver Example (32-bit float)");
@@ -47,10 +49,11 @@ fn main() -> Result<(), Error> {
     println!("Connecting to: {}\n", source);
 
     // Create a receiver for audio
-    let receiver = ReceiverOptions::builder(source)
+    let options = ReceiverOptions::builder(source)
         .bandwidth(ReceiverBandwidth::AudioOnly)
         .name("Audio Capture Example")
-        .build(&ndi)?;
+        .build();
+    let receiver = Receiver::new(&ndi, &options)?;
 
     println!("Receiver created successfully");
     println!("Waiting for audio frames...\n");

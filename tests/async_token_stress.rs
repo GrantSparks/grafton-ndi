@@ -22,7 +22,7 @@ fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
             let send_options = SenderOptions::builder(format!("Stress Test Sender {thread_id}"))
                 .clock_video(true)
                 .clock_audio(false)
-                .build()?;
+                .build();
             let mut sender = grafton_ndi::Sender::new(&ndi_clone, &send_options)?;
 
             sender.on_async_video_done(move |_len| {
@@ -87,7 +87,7 @@ fn test_immediate_sender_drop() -> Result<(), grafton_ndi::Error> {
         let send_options = SenderOptions::builder("Immediate Drop Test")
             .clock_video(true)
             .clock_audio(false)
-            .build()?;
+            .build();
         let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
 
         {
@@ -112,7 +112,7 @@ fn test_flush_async() -> Result<(), grafton_ndi::Error> {
     let send_options = SenderOptions::builder("Flush Test")
         .clock_video(true)
         .clock_audio(false)
-        .build()?;
+        .build();
     let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
 
     let buffers: Vec<Vec<u8>> = (0..10).map(|i| vec![i as u8; 1920 * 1080 * 4]).collect();

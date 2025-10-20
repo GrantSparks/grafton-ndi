@@ -225,15 +225,16 @@ impl ReceiverOptionsBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptionsBuilder};
+    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptionsBuilder, Receiver};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.wait_for_sources(1000);
-    /// # let sources = finder.get_sources(0)?;
-    /// let receiver = ReceiverOptionsBuilder::snapshot_preset(sources[0].clone())
+    /// # finder.wait_for_sources(Duration::from_secs(1));
+    /// # let sources = finder.sources(Duration::ZERO)?;
+    /// let options = ReceiverOptionsBuilder::snapshot_preset(sources[0].clone())
     ///     .name("Snapshot Receiver")
-    ///     .build(&ndi)?;
+    ///     .build();
+    /// let receiver = Receiver::new(&ndi, &options)?;
     ///
     /// // Capture and encode in one line (requires image-encoding feature)
     /// #[cfg(feature = "image-encoding")]
@@ -268,15 +269,16 @@ impl ReceiverOptionsBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptionsBuilder};
+    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptionsBuilder, Receiver};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.wait_for_sources(1000);
-    /// # let sources = finder.get_sources(0)?;
-    /// let receiver = ReceiverOptionsBuilder::high_quality_preset(sources[0].clone())
+    /// # finder.wait_for_sources(Duration::from_secs(1));
+    /// # let sources = finder.sources(Duration::ZERO)?;
+    /// let options = ReceiverOptionsBuilder::high_quality_preset(sources[0].clone())
     ///     .name("High Quality Receiver")
-    ///     .build(&ndi)?;
+    ///     .build();
+    /// let receiver = Receiver::new(&ndi, &options)?;
     ///
     /// // Capture full quality frames
     /// let frame = receiver.capture_video_blocking(5000)?;
@@ -307,15 +309,17 @@ impl ReceiverOptionsBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptionsBuilder};
+    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptionsBuilder, Receiver};
+    /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.wait_for_sources(1000);
-    /// # let sources = finder.get_sources(0)?;
-    /// let receiver = ReceiverOptionsBuilder::monitoring_preset(sources[0].clone())
+    /// # finder.wait_for_sources(Duration::from_secs(1));
+    /// # let sources = finder.sources(Duration::ZERO)?;
+    /// let options = ReceiverOptionsBuilder::monitoring_preset(sources[0].clone())
     ///     .name("Tally Monitor")
-    ///     .build(&ndi)?;
+    ///     .build();
+    /// let receiver = Receiver::new(&ndi, &options)?;
     ///
     /// // Poll for status changes
     /// if let Some(status) = receiver.poll_status_change(1000) {
@@ -364,16 +368,31 @@ impl ReceiverOptionsBuilder {
         self
     }
 
-    /// Build the receiver and create a Receiver instance
-    pub fn build(self, ndi: &NDI) -> Result<Receiver> {
-        let receiver = ReceiverOptions {
+    /// Build the receiver options
+    ///
+    /// This method is infallible and simply applies defaults for any unset options.
+    /// To create a `Receiver`, pass the resulting `ReceiverOptions` to `Receiver::new()`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, ReceiverOptions, Receiver, Source};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let source = Source::default();
+    /// let options = ReceiverOptions::builder(source).build();
+    /// let receiver = Receiver::new(&ndi, &options)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn build(self) -> ReceiverOptions {
+        ReceiverOptions {
             source_to_connect_to: self.source_to_connect_to,
             color_format: self.color_format.unwrap_or(ReceiverColorFormat::BGRX_BGRA),
             bandwidth: self.bandwidth.unwrap_or(ReceiverBandwidth::Highest),
             allow_video_fields: self.allow_video_fields.unwrap_or(true),
             ndi_recv_name: self.ndi_recv_name,
-        };
-        Receiver::new(ndi, &receiver)
+        }
     }
 }
 

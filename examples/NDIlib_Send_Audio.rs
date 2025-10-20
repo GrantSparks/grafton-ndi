@@ -25,9 +25,7 @@ fn main() -> Result<(), Error> {
     let ndi = NDI::new()?;
 
     // Create an NDI source that is clocked to audio
-    let send_options = SenderOptions::builder("My Audio")
-        .clock_audio(true)
-        .build()?;
+    let send_options = SenderOptions::builder("My Audio").clock_audio(true).build();
 
     let sender = Sender::new(&ndi, &send_options)?;
 

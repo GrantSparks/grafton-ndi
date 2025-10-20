@@ -15,7 +15,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
     let send_options = SenderOptions::builder("Zero-Copy Sender Example")
         .clock_video(true)
         .clock_audio(true)
-        .build()?;
+        .build();
     let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
 
     let source_name = sender.get_source_name()?;

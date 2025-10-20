@@ -39,7 +39,7 @@ fn test_rapid_sender_lifecycle() -> Result<(), grafton_ndi::Error> {
         let send_options = SenderOptions::builder(format!("Lifecycle Test {iteration}"))
             .clock_video(true)
             .clock_audio(false)
-            .build()?;
+            .build();
         let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
 
         let counter = callback_count.clone();
@@ -104,7 +104,7 @@ fn test_concurrent_sender_lifecycle() -> Result<(), grafton_ndi::Error> {
                     SenderOptions::builder(format!("Thread {thread_id} Iter {iteration}"))
                         .clock_video(true)
                         .clock_audio(false)
-                        .build()?;
+                        .build();
                 let mut sender = grafton_ndi::Sender::new(&ndi_clone, &send_options)?;
 
                 let counter = callback_count.clone();
@@ -170,7 +170,7 @@ fn test_no_callbacks_after_drop() -> Result<(), grafton_ndi::Error> {
         let send_options = SenderOptions::builder("Post-Drop Test")
             .clock_video(true)
             .clock_audio(false)
-            .build()?;
+            .build();
         let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
 
         let counter = callback_count.clone();
@@ -219,7 +219,7 @@ fn test_flush_waits_for_callback() -> Result<(), grafton_ndi::Error> {
     let send_options = SenderOptions::builder("Flush Wait Test")
         .clock_video(true)
         .clock_audio(false)
-        .build()?;
+        .build();
     let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
 
     let counter = callback_count.clone();

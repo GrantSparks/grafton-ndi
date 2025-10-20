@@ -341,10 +341,26 @@ impl<'a> Sender<'a> {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The sender name is empty or contains only whitespace
+    /// - Both `clock_video` and `clock_audio` are false (at least one must be true)
     /// - The sender name contains a null byte
     /// - The groups string contains a null byte
     /// - NDI fails to create the send instance
     pub fn new(_ndi: &'a NDI, create_settings: &SenderOptions) -> Result<Self> {
+        // Validate sender name
+        if create_settings.name.trim().is_empty() {
+            return Err(Error::InvalidConfiguration(
+                "Sender name cannot be empty or contain only whitespace".into(),
+            ));
+        }
+
+        // Validate that at least one clock is enabled
+        if !create_settings.clock_video && !create_settings.clock_audio {
+            return Err(Error::InvalidConfiguration(
+                "At least one of clock_video or clock_audio must be true".into(),
+            ));
+        }
+
         let p_ndi_name =
             CString::new(create_settings.name.clone()).map_err(Error::InvalidCString)?;
         let p_groups = match &create_settings.groups {
@@ -1026,34 +1042,31 @@ impl SenderOptionsBuilder {
         self
     }
 
-    /// Build the `SendOptions`
+    /// Build the sender options
     ///
-    /// # Errors
+    /// This method is infallible and simply applies defaults for any unset options.
+    /// Validation is performed when creating a `Sender` via `Sender::new()`.
     ///
-    /// Returns an error if:
-    /// - The name is empty or contains only whitespace
-    /// - Both clock_video and clock_audio are false
-    pub fn build(self) -> Result<SenderOptions> {
-        if self.name.trim().is_empty() {
-            return Err(Error::InvalidConfiguration(
-                "Sender name cannot be empty or contain only whitespace".into(),
-            ));
-        }
-
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, SenderOptions, Sender};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// let options = SenderOptions::builder("My Sender").build();
+    /// let sender = Sender::new(&ndi, &options)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn build(self) -> SenderOptions {
         let clock_video = self.clock_video.unwrap_or(true);
         let clock_audio = self.clock_audio.unwrap_or(true);
 
-        if !clock_video && !clock_audio {
-            return Err(Error::InvalidConfiguration(
-                "At least one of clock_video or clock_audio must be true".into(),
-            ));
-        }
-
-        Ok(SenderOptions {
+        SenderOptions {
             name: self.name,
             groups: self.groups,
             clock_video,
             clock_audio,
-        })
+        }
     }
 }
