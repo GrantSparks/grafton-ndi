@@ -4,10 +4,14 @@
 //! converting it to 16-bit signed integer format, similar to the C++ example.
 //!
 //! Run with: `cargo run --example NDIlib_Recv_Audio_16bpp`
+//!
+//! Optional arguments:
+//! - IP address to search: `cargo run --example NDIlib_Recv_Audio_16bpp -- 192.168.0.110`
 
 use grafton_ndi::{Error, Finder, FinderOptions, Receiver, ReceiverOptions, NDI};
 
 use std::{
+    env,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -16,6 +20,10 @@ use std::{
 };
 
 fn main() -> Result<(), Error> {
+    // Parse command line arguments for extra IPs
+    let args: Vec<String> = env::args().collect();
+    let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
+
     // Set up signal handler for graceful shutdown
     let exit_loop = Arc::new(AtomicBool::new(false));
     let exit_loop_clone = exit_loop.clone();
@@ -26,7 +34,19 @@ fn main() -> Result<(), Error> {
 
     let ndi = NDI::new()?;
 
-    let finder_options = FinderOptions::builder().build();
+    let mut builder = FinderOptions::builder();
+
+    // Add any command line IPs
+    if !extra_ips.is_empty() {
+        println!("Searching additional IPs/subnets:");
+        for ip in &extra_ips {
+            println!("  - {}", ip);
+            builder = builder.extra_ips(*ip);
+        }
+        println!();
+    }
+
+    let finder_options = builder.build();
     let finder = Finder::new(&ndi, &finder_options)?;
 
     // Wait until there is at least one source

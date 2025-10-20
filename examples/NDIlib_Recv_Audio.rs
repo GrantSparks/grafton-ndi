@@ -7,14 +7,21 @@
 //! - Accessing audio data by channel
 //!
 //! Run with: `cargo run --example NDIlib_Recv_Audio`
+//!
+//! Optional arguments:
+//! - IP address to search: `cargo run --example NDIlib_Recv_Audio -- 192.168.0.110`
 
-use std::{thread, time::Duration};
+use std::{env, thread, time::Duration};
 
 use grafton_ndi::{
     Error, Finder, FinderOptions, Receiver, ReceiverBandwidth, ReceiverOptions, NDI,
 };
 
 fn main() -> Result<(), Error> {
+    // Parse command line arguments for extra IPs
+    let args: Vec<String> = env::args().collect();
+    let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
+
     println!("NDI Audio Receiver Example (32-bit float)");
     println!("=========================================\n");
 
@@ -23,7 +30,19 @@ fn main() -> Result<(), Error> {
     println!("NDI initialized successfully\n");
 
     // Configure the finder
-    let finder_options = FinderOptions::builder().show_local_sources(true).build();
+    let mut builder = FinderOptions::builder().show_local_sources(true);
+
+    // Add any command line IPs
+    if !extra_ips.is_empty() {
+        println!("Searching additional IPs/subnets:");
+        for ip in &extra_ips {
+            println!("  - {}", ip);
+            builder = builder.extra_ips(*ip);
+        }
+        println!();
+    }
+
+    let finder_options = builder.build();
 
     let finder = Finder::new(&ndi, &finder_options)?;
 

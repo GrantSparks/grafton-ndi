@@ -9,18 +9,38 @@ use std::{
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let args: Vec<String> = env::args().collect();
-    let source_name = if args.len() > 2 && args[1] == "--source" {
-        Some(args[2].clone())
-    } else {
-        None
-    };
+    let mut source_name = None;
+    let mut extra_ips = Vec::new();
+
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--source" && i + 1 < args.len() {
+            source_name = Some(args[i + 1].clone());
+            i += 2;
+        } else if !args[i].starts_with("--") {
+            extra_ips.push(args[i].as_str());
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
 
     // Initialize NDI
     let ndi = NDI::new()?;
     println!("NDI initialized successfully");
 
     // Find sources
-    let finder_options = FinderOptions::builder().show_local_sources(true).build();
+    let mut builder = FinderOptions::builder().show_local_sources(true);
+
+    if !extra_ips.is_empty() {
+        println!("\nSearching additional IPs/subnets:");
+        for ip in &extra_ips {
+            println!("  - {}", ip);
+            builder = builder.extra_ips(*ip);
+        }
+    }
+
+    let finder_options = builder.build();
     let finder = Finder::new(&ndi, &finder_options)?;
 
     println!("Looking for NDI sources...");

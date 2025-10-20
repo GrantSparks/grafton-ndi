@@ -22,9 +22,9 @@ fn main() -> Result<(), Error> {
     let xres = 1920i32;
     let yres = 1080i32;
 
-    // Run for 5 minutes
+    // Run for 10 seconds (enough to test functionality)
     let start = Instant::now();
-    while start.elapsed().as_secs() < 300 {
+    while start.elapsed().as_secs() < 10 {
         let batch_start = Instant::now();
 
         // Send 200 frames

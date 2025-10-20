@@ -36,7 +36,7 @@ fn main() -> Result<(), Error> {
     // Create audio buffer (planar format)
     let mut audio_data = vec![0.0f32; (no_samples * no_channels) as usize];
 
-    for idx in 0..1000 {
+    for idx in 0..50 {
         if exit_loop.load(Ordering::Relaxed) {
             break;
         }

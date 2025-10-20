@@ -1,15 +1,30 @@
 use grafton_ndi::{Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions, NDI};
 
-use std::{sync::Arc, thread, time::Duration};
+use std::{env, sync::Arc, thread, time::Duration};
 
 fn main() -> Result<(), grafton_ndi::Error> {
+    // Parse command line arguments for extra IPs
+    let args: Vec<String> = env::args().collect();
+    let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
+
     // Initialize NDI
     let ndi = NDI::new()?;
     let version = NDI::version()?;
     println!("NDI version: {version}");
 
     // Create a finder to discover sources
-    let finder_options = grafton_ndi::FinderOptions::default();
+    let mut builder = grafton_ndi::FinderOptions::builder();
+
+    if !extra_ips.is_empty() {
+        println!("Searching additional IPs/subnets:");
+        for ip in &extra_ips {
+            println!("  - {}", ip);
+            builder = builder.extra_ips(*ip);
+        }
+        println!();
+    }
+
+    let finder_options = builder.build();
     let finder = grafton_ndi::Finder::new(&ndi, &finder_options)?;
 
     // Wait for sources

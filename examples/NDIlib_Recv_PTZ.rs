@@ -4,8 +4,12 @@
 //! when the receiver status changes.
 //!
 //! Run with: `cargo run --example NDIlib_Recv_PTZ`
+//!
+//! Optional arguments:
+//! - IP address to search: `cargo run --example NDIlib_Recv_PTZ -- 192.168.0.110`
 
 use std::{
+    env,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -16,16 +20,26 @@ use std::{
 use grafton_ndi::{Error, Finder, FinderOptions, Receiver, ReceiverOptions, NDI};
 
 /// Configure finder options for specific test environments
-fn create_finder_options() -> FinderOptions {
-    // Uncomment to customize:
-    // FinderOptions::builder()
-    //     .show_local_sources(false)
-    //     .extra_ips("192.168.0.110")
-    //     .build()
-    FinderOptions::builder().build()
+fn create_finder_options(extra_ips: Vec<&str>) -> FinderOptions {
+    let mut builder = FinderOptions::builder();
+
+    if !extra_ips.is_empty() {
+        println!("Searching additional IPs/subnets:");
+        for ip in &extra_ips {
+            println!("  - {}", ip);
+            builder = builder.extra_ips(*ip);
+        }
+        println!();
+    }
+
+    builder.build()
 }
 
 fn main() -> Result<(), Error> {
+    // Parse command line arguments for extra IPs
+    let args: Vec<String> = env::args().collect();
+    let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
+
     // Set up signal handler for graceful shutdown
     let exit_loop = Arc::new(AtomicBool::new(false));
     let exit_loop_clone = exit_loop.clone();
@@ -38,7 +52,7 @@ fn main() -> Result<(), Error> {
     let ndi = NDI::new()?;
 
     // Create finder
-    let finder_options = create_finder_options();
+    let finder_options = create_finder_options(extra_ips);
     let finder = Finder::new(&ndi, &finder_options)?;
 
     // Wait until there is at least one source
