@@ -1,8 +1,9 @@
 // This test verifies that metadata cannot be dropped while an async token is held
 // It should fail to compile with a lifetime error
 
-use grafton_ndi::{BorrowedVideoFrame, PixelFormat, Sender, SenderOptions, NDI};
 use std::ffi::CString;
+
+use grafton_ndi::{BorrowedVideoFrame, PixelFormat, Sender, SenderOptions, NDI};
 
 fn main() {
     let ndi = NDI::new().unwrap();

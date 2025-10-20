@@ -192,14 +192,9 @@ impl<'buf> BorrowedVideoFrame<'buf> {
 
         if data.len() < expected_len {
             return Err(Error::InvalidFrame(format!(
-                "Buffer too small for format {:?}: got {} bytes, expected at least {} bytes \
-                 (width={}, height={}, stride={})",
-                pixel_format,
-                data.len(),
-                expected_len,
-                width,
-                height,
-                stride
+                "Buffer too small for format {pixel_format:?}: got {actual} bytes, expected at least {expected_len} bytes \
+                 (width={width}, height={height}, stride={stride})",
+                actual = data.len()
             )));
         }
 
@@ -269,10 +264,8 @@ impl<'buf> BorrowedVideoFrame<'buf> {
 
         if data.len() < expected_len {
             return Err(Error::InvalidFrame(format!(
-                "Buffer too small for compressed format {:?}: got {} bytes, expected at least {} bytes",
-                pixel_format,
-                data.len(),
-                expected_len
+                "Buffer too small for compressed format {pixel_format:?}: got {actual} bytes, expected at least {expected_len} bytes",
+                actual = data.len()
             )));
         }
 
@@ -723,6 +716,7 @@ impl<'a> Sender<'a> {
                 let raw_inner = Arc::as_ptr(&inner) as *mut c_void;
                 inner.callback_ptr.store(raw_inner, Ordering::Release);
 
+                // Only called via FFI callback when has_async_completion_callback cfg is enabled
                 #[allow(dead_code)]
                 extern "C" fn video_done_cb(
                     opaque: *mut c_void,

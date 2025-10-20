@@ -6,6 +6,9 @@
 /// These tests are ignored by default because they take ~100 seconds to run.
 /// Run them explicitly with: cargo test --features advanced_sdk --test callback_lifetime_stress -- --ignored
 #[cfg(feature = "advanced_sdk")]
+use grafton_ndi::{BorrowedVideoFrame, PixelFormat, SenderOptions, NDI};
+
+#[cfg(feature = "advanced_sdk")]
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -14,9 +17,6 @@ use std::{
     thread,
     time::Duration,
 };
-
-#[cfg(feature = "advanced_sdk")]
-use grafton_ndi::{BorrowedVideoFrame, PixelFormat, SenderOptions, NDI};
 
 /// Test rapid create → send → drop loop to verify callback unregistration
 ///

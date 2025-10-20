@@ -1,8 +1,8 @@
 //! NDI runtime management and initialization.
 
-use std::sync::{Condvar, Mutex};
-
 use once_cell::sync::Lazy;
+
+use std::sync::{Condvar, Mutex};
 
 use crate::{ndi_lib::*, Error, Result};
 
@@ -75,7 +75,6 @@ impl RuntimeManager {
                     state = self.cv.wait(state).unwrap();
                 }
                 State::Initialized { refcount } => {
-                    // Increment refcount and return
                     *state = State::Initialized {
                         refcount: refcount + 1,
                     };
@@ -102,7 +101,6 @@ impl RuntimeManager {
                     *state = State::Uninitialized;
                     self.cv.notify_all();
                 } else {
-                    // Decrement refcount
                     *state = State::Initialized {
                         refcount: refcount - 1,
                     };

@@ -1,10 +1,10 @@
+use grafton_ndi::{BorrowedVideoFrame, PixelFormat, SenderOptions, NDI};
+
 use std::{
     sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
-
-use grafton_ndi::{BorrowedVideoFrame, PixelFormat, SenderOptions, NDI};
 
 #[test]
 #[ignore = "Slow stress test - run with --ignored"]
