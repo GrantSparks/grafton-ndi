@@ -8,6 +8,7 @@
 //!
 //! ```no_run
 //! use grafton_ndi::{NDI, FinderOptions, Finder};
+//! use std::time::Duration;
 //!
 //! # fn main() -> Result<(), grafton_ndi::Error> {
 //! // Initialize the NDI runtime
@@ -18,8 +19,7 @@
 //! let finder = Finder::new(&ndi, &options)?;
 //!
 //! // Discover sources
-//! finder.wait_for_sources(5000);
-//! let sources = finder.get_sources(0)?;
+//! let sources = finder.find_sources(Duration::from_secs(5))?;
 //!
 //! for source in sources {
 //!     println!("Found: {}", source);
@@ -65,7 +65,7 @@
 //! ```no_run
 //! # use grafton_ndi::{NDI, SenderOptions, BorrowedVideoFrame, PixelFormat};
 //! # let ndi = NDI::new().unwrap();
-//! # let mut sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build().unwrap()).unwrap();
+//! # let mut sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build()).unwrap();
 //! // Register callback to know when buffer is released
 //! sender.on_async_video_done(|len| println!("Buffer released: {} bytes", len));
 //!

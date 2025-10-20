@@ -6,16 +6,18 @@
 //!
 //! ```ignore
 //! # use grafton_ndi::{NDI, ReceiverOptions, ReceiverBandwidth, Source};
+//! # use std::time::Duration;
 //! # fn main() -> Result<(), grafton_ndi::Error> {
 //! # let ndi = NDI::new()?;
-//! // In real usage, you'd get the source from Finder::get_sources()
+//! // In real usage, you'd get the source from Finder::sources()
 //! // let source = /* obtained from Finder */;
-//! let receiver = ReceiverOptions::builder(source)
+//! let options = ReceiverOptions::builder(source)
 //!     .bandwidth(ReceiverBandwidth::MetadataOnly)
-//!     .build(&ndi)?;
+//!     .build();
+//! let receiver = Receiver::new(&ndi, &options)?;
 //!
 //! // Poll for status changes
-//! if let Some(status) = receiver.poll_status_change(1000) {
+//! if let Some(status) = receiver.poll_status_change(Duration::from_millis(1000))? {
 //!     if let Some(tally) = status.tally {
 //!         println!("Tally: program={program}, preview={preview}",
 //!                  program = tally.on_program, preview = tally.on_preview);
@@ -226,10 +228,11 @@ impl ReceiverOptionsBuilder {
     ///
     /// ```no_run
     /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptionsBuilder, Receiver};
+    /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.wait_for_sources(Duration::from_secs(1));
+    /// # finder.wait_for_sources(Duration::from_secs(1))?;
     /// # let sources = finder.sources(Duration::ZERO)?;
     /// let options = ReceiverOptionsBuilder::snapshot_preset(sources[0].clone())
     ///     .name("Snapshot Receiver")
@@ -239,7 +242,7 @@ impl ReceiverOptionsBuilder {
     /// // Capture and encode in one line (requires image-encoding feature)
     /// #[cfg(feature = "image-encoding")]
     /// {
-    ///     let frame = receiver.capture_video_blocking(5000)?;
+    ///     let frame = receiver.capture_video(Duration::from_secs(5))?;
     ///     let png_bytes = frame.encode_png()?;
     ///     std::fs::write("snapshot.png", &png_bytes)?;
     /// }
@@ -270,10 +273,11 @@ impl ReceiverOptionsBuilder {
     ///
     /// ```no_run
     /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptionsBuilder, Receiver};
+    /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.wait_for_sources(Duration::from_secs(1));
+    /// # finder.wait_for_sources(Duration::from_secs(1))?;
     /// # let sources = finder.sources(Duration::ZERO)?;
     /// let options = ReceiverOptionsBuilder::high_quality_preset(sources[0].clone())
     ///     .name("High Quality Receiver")
@@ -281,7 +285,7 @@ impl ReceiverOptionsBuilder {
     /// let receiver = Receiver::new(&ndi, &options)?;
     ///
     /// // Capture full quality frames
-    /// let frame = receiver.capture_video_blocking(5000)?;
+    /// let frame = receiver.capture_video(Duration::from_secs(5))?;
     /// println!("Captured {width}x{height} frame", width = frame.width, height = frame.height);
     /// # Ok(())
     /// # }
@@ -314,7 +318,7 @@ impl ReceiverOptionsBuilder {
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.wait_for_sources(Duration::from_secs(1));
+    /// # finder.wait_for_sources(Duration::from_secs(1))?;
     /// # let sources = finder.sources(Duration::ZERO)?;
     /// let options = ReceiverOptionsBuilder::monitoring_preset(sources[0].clone())
     ///     .name("Tally Monitor")
@@ -322,7 +326,7 @@ impl ReceiverOptionsBuilder {
     /// let receiver = Receiver::new(&ndi, &options)?;
     ///
     /// // Poll for status changes
-    /// if let Some(status) = receiver.poll_status_change(1000) {
+    /// if let Some(status) = receiver.poll_status_change(Duration::from_millis(1000))? {
     ///     if let Some(tally) = status.tally {
     ///         println!("Tally: program={program}, preview={preview}",
     ///                  program = tally.on_program, preview = tally.on_preview);
@@ -602,12 +606,13 @@ impl Receiver {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+    /// # let options = ReceiverOptions::builder(source).build();
+    /// # let receiver = Receiver::new(&ndi, &options)?;
     /// // Zero-copy capture
     /// if let Some(frame) = receiver.capture_video_ref(Duration::from_secs(1))? {
     ///     // Process in place - no copy needed
@@ -690,7 +695,7 @@ impl Receiver {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
@@ -752,7 +757,7 @@ impl Receiver {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
@@ -792,12 +797,13 @@ impl Receiver {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+    /// # let options = ReceiverOptions::builder(source).build();
+    /// # let receiver = Receiver::new(&ndi, &options)?;
     /// // Zero-copy capture
     /// if let Some(frame) = receiver.capture_audio_ref(Duration::from_secs(1))? {
     ///     // Process in place - no copy needed
@@ -861,7 +867,7 @@ impl Receiver {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
@@ -920,7 +926,7 @@ impl Receiver {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
@@ -959,12 +965,13 @@ impl Receiver {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+    /// # let options = ReceiverOptions::builder(source).build();
+    /// # let receiver = Receiver::new(&ndi, &options)?;
     /// // Zero-copy capture
     /// if let Some(frame) = receiver.capture_metadata_ref(Duration::from_secs(1))? {
     ///     // Process in place - no copy needed
@@ -1028,7 +1035,7 @@ impl Receiver {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
@@ -1087,7 +1094,7 @@ impl Receiver {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
@@ -1117,11 +1124,12 @@ impl Receiver {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+    /// # let options = ReceiverOptions::builder(source).build();
+    /// # let receiver = Receiver::new(&ndi, &options)?;
     /// if receiver.is_connected() {
     ///     println!("Still connected to source");
     /// } else {
@@ -1143,11 +1151,12 @@ impl Receiver {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+    /// # let options = ReceiverOptions::builder(source).build();
+    /// # let receiver = Receiver::new(&ndi, &options)?;
     /// let source = receiver.source();
     /// println!("Connected to: {name}", name = source.name);
     /// # Ok(())
@@ -1171,11 +1180,12 @@ impl Receiver {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+    /// # let options = ReceiverOptions::builder(source).build();
+    /// # let receiver = Receiver::new(&ndi, &options)?;
     /// let stats = receiver.connection_stats();
     /// println!("Connections: {connections}", connections = stats.connections);
     /// println!("Video frames: {received} (dropped: {dropped})",

@@ -123,14 +123,15 @@ impl Default for FinderOptionsBuilder {
 ///
 /// ```no_run
 /// # use grafton_ndi::{NDI, FinderOptions, Finder};
+/// # use std::time::Duration;
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// let ndi = NDI::new()?;
 /// let options = FinderOptions::builder().show_local_sources(true).build();
 /// let finder = Finder::new(&ndi, &options)?;
 ///
 /// // Wait for initial discovery
-/// if finder.wait_for_sources(5000) {
-///     let sources = finder.get_sources(0)?;
+/// if finder.wait_for_sources(Duration::from_secs(5))? {
+///     let sources = finder.sources(Duration::ZERO)?;
 ///     for source in sources {
 ///         println!("Found: {}", source);
 ///     }
@@ -776,17 +777,18 @@ struct CachedSource {
 ///
 /// ```no_run
 /// use grafton_ndi::SourceCache;
+/// use std::time::Duration;
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// // Create a cache instance
 /// let cache = SourceCache::new()?;
 ///
 /// // Find a source by hostname or IP with automatic caching
-/// let source = cache.find_by_host("192.168.0.107", 5000)?;
+/// let source = cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
 /// println!("Found source: {}", source);
 ///
 /// // Subsequent lookups use the cache
-/// let same_source = cache.find_by_host("192.168.0.107", 5000)?;
+/// let same_source = cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
 ///
 /// # Ok(())
 /// # }
@@ -915,10 +917,11 @@ impl SourceCache {
     ///
     /// ```no_run
     /// use grafton_ndi::SourceCache;
+    /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let cache = SourceCache::new()?;
-    /// let source = cache.find_by_host("192.168.0.107", 5000)?;
+    /// let source = cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
     ///
     /// // Later, if the source goes offline
     /// cache.invalidate("192.168.0.107");
@@ -941,11 +944,12 @@ impl SourceCache {
     ///
     /// ```no_run
     /// use grafton_ndi::SourceCache;
+    /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let cache = SourceCache::new()?;
-    /// cache.find_by_host("192.168.0.107", 5000)?;
-    /// cache.find_by_host("192.168.0.108", 5000)?;
+    /// cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
+    /// cache.find_by_host("192.168.0.108", Duration::from_secs(5))?;
     ///
     /// // Clear all cached sources
     /// cache.clear();
@@ -965,12 +969,13 @@ impl SourceCache {
     ///
     /// ```no_run
     /// use grafton_ndi::SourceCache;
+    /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let cache = SourceCache::new()?;
     /// assert_eq!(cache.len(), 0);
     ///
-    /// cache.find_by_host("192.168.0.107", 5000)?;
+    /// cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
     /// assert_eq!(cache.len(), 1);
     /// # Ok(())
     /// # }
@@ -986,12 +991,13 @@ impl SourceCache {
     ///
     /// ```no_run
     /// use grafton_ndi::SourceCache;
+    /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let cache = SourceCache::new()?;
     /// assert!(cache.is_empty());
     ///
-    /// cache.find_by_host("192.168.0.107", 5000)?;
+    /// cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
     /// assert!(!cache.is_empty());
     /// # Ok(())
     /// # }

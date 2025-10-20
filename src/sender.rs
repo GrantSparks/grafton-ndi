@@ -356,15 +356,16 @@ impl<'a, 'buf> AsyncVideoToken<'a, 'buf> {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, SenderOptions, PixelFormat};
+    /// # use grafton_ndi::{NDI, SenderOptions, PixelFormat, BorrowedVideoFrame};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let ndi = NDI::new()?;
     /// let options = SenderOptions::builder("Test Sender").build();
-    /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
+    /// let mut sender = grafton_ndi::Sender::new(&ndi, &options)?;
     ///
     /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
-    /// let token = sender.send_video_async(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1)?;
+    /// let borrowed_frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
+    /// let token = sender.send_video_async(&borrowed_frame);
     ///
     /// // Explicitly wait for completion instead of relying on Drop
     /// token.wait()?;
@@ -395,14 +396,15 @@ impl<'a, 'buf> AsyncVideoToken<'a, 'buf> {
     /// ```no_run
     /// # #[cfg(feature = "advanced_sdk")]
     /// # {
-    /// # use grafton_ndi::{NDI, SenderOptions, PixelFormat};
+    /// # use grafton_ndi::{NDI, SenderOptions, PixelFormat, BorrowedVideoFrame};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let ndi = NDI::new()?;
     /// let options = SenderOptions::builder("Test Sender").build();
-    /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
+    /// let mut sender = grafton_ndi::Sender::new(&ndi, &options)?;
     ///
-    /// let buffer = vec![0u8; 1920 * 1080 * 4];
-    /// let token = sender.send_video_async(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1)?;
+    /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
+    /// let borrowed_frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
+    /// let token = sender.send_video_async(&borrowed_frame);
     ///
     /// // Poll for completion
     /// while !token.is_complete() {
@@ -602,14 +604,14 @@ impl<'a> Sender<'a> {
     /// let send_options = SenderOptions::builder("MyCam")
     ///     .clock_video(true)
     ///     .clock_audio(true)
-    ///     .build()?;
+    ///     .build();
     /// let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
     ///
     /// // Register callback to know when buffer is released
     /// sender.on_async_video_done(|len| println!("Buffer released: {len} bytes"));
     ///
     /// // Use borrowed buffer directly (zero-copy, no allocation)
-    /// let buffer = vec![0u8; 1920 * 1080 * 4];
+    /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
     /// let borrowed_frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
     /// let token = sender.send_video_async(&borrowed_frame);
     ///
@@ -657,7 +659,8 @@ impl<'a> Sender<'a> {
     /// # use grafton_ndi::{NDI, SenderOptions, AudioFrame};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
-    /// # let sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build()?)?;
+    /// # let options = SenderOptions::builder("Test").build();
+    /// # let sender = grafton_ndi::Sender::new(&ndi, &options)?;
     /// let mut audio_buffer = vec![0.0f32; 48000 * 2]; // 1 second of stereo audio
     ///
     /// // Fill buffer with audio data...
@@ -874,7 +877,8 @@ impl<'a> Sender<'a> {
     /// # use grafton_ndi::{NDI, SenderOptions, BorrowedVideoFrame, PixelFormat};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let ndi = NDI::new()?;
-    /// let mut sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build()?)?;
+    /// let options = SenderOptions::builder("Test").build();
+    /// let mut sender = grafton_ndi::Sender::new(&ndi, &options)?;
     ///
     /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
     /// let frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
@@ -943,7 +947,8 @@ impl<'a> Sender<'a> {
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let ndi = NDI::new()?;
-    /// let sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build()?)?;
+    /// let options = SenderOptions::builder("Test").build();
+    /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
     ///
     /// // ... send some async frames ...
     ///

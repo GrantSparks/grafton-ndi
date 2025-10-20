@@ -28,13 +28,13 @@
 //!     #     address: grafton_ndi::SourceAddress::None
 //!     # };
 //!
-//!     let receiver = ReceiverOptionsBuilder::snapshot_preset(source)
-//!         .build(&ndi)?;
+//!     let options = ReceiverOptionsBuilder::snapshot_preset(source).build();
+//!     let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
 //!
 //!     let async_receiver = AsyncReceiver::new(receiver);
 //!
 //!     // Capture frame asynchronously without blocking the runtime
-//!     let frame = async_receiver.capture_video_blocking(5000).await?;
+//!     let frame = async_receiver.capture_video(std::time::Duration::from_secs(5)).await?;
 //!     println!("Captured {}x{} frame", frame.width, frame.height);
 //!
 //!     Ok(())
@@ -84,11 +84,12 @@ pub mod tokio {
     ///     #     address: grafton_ndi::SourceAddress::None
     ///     # };
     ///
-    ///     let receiver = ReceiverOptionsBuilder::snapshot_preset(source).build(&ndi)?;
+    ///     let options = ReceiverOptionsBuilder::snapshot_preset(source).build();
+    ///     let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
     ///     let async_receiver = AsyncReceiver::new(receiver);
     ///
     ///     // Non-blocking async capture
-    ///     match async_receiver.capture_video(100).await? {
+    ///     match async_receiver.capture_video_timeout(std::time::Duration::from_millis(100)).await? {
     ///         Some(frame) => println!("Got frame: {}x{}", frame.width, frame.height),
     ///         None => println!("No frame available"),
     ///     }
@@ -319,11 +320,12 @@ pub mod async_std {
     ///     #     address: grafton_ndi::SourceAddress::None
     ///     # };
     ///
-    ///     let receiver = ReceiverOptionsBuilder::snapshot_preset(source).build(&ndi)?;
+    ///     let options = ReceiverOptionsBuilder::snapshot_preset(source).build();
+    ///     let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
     ///     let async_receiver = AsyncReceiver::new(receiver);
     ///
     ///     // Non-blocking async capture
-    ///     match async_receiver.capture_video(100).await? {
+    ///     match async_receiver.capture_video_timeout(std::time::Duration::from_millis(100)).await? {
     ///         Some(frame) => println!("Got frame: {}x{}", frame.width, frame.height),
     ///         None => println!("No frame available"),
     ///     }

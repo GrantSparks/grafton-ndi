@@ -56,6 +56,249 @@ This release dramatically improves ergonomics and reduces boilerplate for common
   - This fixes completely broken audio sending functionality
   - Planar is the correct default as FLTP means "Float Planar"
 
+### API Stabilization ([#24](https://github.com/GrantSparks/grafton-ndi/issues/24))
+
+Major API cleanup for 1.0 readiness with focus on consistency, type safety, and forward compatibility.
+
+#### **BREAKING**: Duration-based Timeouts (Step 1)
+All timeout parameters now use `std::time::Duration` instead of `u32` milliseconds:
+
+**Before:**
+```rust
+finder.wait_for_sources(5000);  // u32 milliseconds
+let sources = finder.get_sources(0)?;
+receiver.capture_video_blocking(5000)?;
+```
+
+**After:**
+```rust
+use std::time::Duration;
+
+finder.wait_for_sources(Duration::from_secs(5));
+let sources = finder.sources(Duration::ZERO)?;
+receiver.capture_video(Duration::from_secs(5))?;
+```
+
+- Introduced `MAX_TIMEOUT` constant (~49.7 days, the u32::MAX milliseconds limit)
+- Added internal `to_ms_checked()` helper that returns `Error::InvalidConfiguration` on overflow
+- No silent truncation or saturation - errors are explicit
+- Updated all public APIs: Finder, Receiver, Sender, and async adapters
+
+#### **BREAKING**: Builder Pattern Consistency (Step 2)
+Both builders are now infallible with validation moved to constructors:
+
+**Before:**
+```rust
+// Asymmetric and confusing
+let receiver = ReceiverOptions::builder(source).build(&ndi)?;  // Takes NDI, returns Receiver
+let options = SenderOptions::builder("Name").build()?;         // Returns Result<Options>
+let sender = Sender::new(&ndi, &options)?;
+```
+
+**After:**
+```rust
+// Symmetric and clear
+let options = ReceiverOptions::builder(source).build();  // Infallible
+let receiver = Receiver::new(&ndi, &options)?;           // Validation here
+
+let options = SenderOptions::builder("Name").build();    // Infallible
+let sender = Sender::new(&ndi, &options)?;              // Validation here
+```
+
+- `ReceiverOptionsBuilder::build()` and `SenderOptionsBuilder::build()` are now infallible
+- All validation errors occur in `::new()` constructors
+- Builders are just data containers - no I/O or validation
+- Clear separation of concerns
+
+#### **BREAKING**: Simplified Capture API (Step 3)
+Reduced from 3 confusing variants to 2 clear variants per frame type:
+
+**Before:**
+```rust
+// Three variants - which one to use?
+receiver.capture_video(timeout)?;                    // Returns Option, may timeout
+receiver.capture_video_with_retry(timeout, max)?;    // Returns Option, custom retry
+receiver.capture_video_blocking(total_timeout)?;     // Returns Result, blocks until success
+```
+
+**After:**
+```rust
+// Two clear variants
+receiver.capture_video(timeout)?;              // Result<VideoFrame> - primary, reliable
+receiver.capture_video_timeout(timeout)?;      // Result<Option<VideoFrame>> - polling
+```
+
+- **Primary method** `capture_*()`: Blocks and retries internally until success or timeout
+- **Polling variant** `capture_*_timeout()`: Returns `Ok(None)` on timeout for manual polling
+- Applies to all frame types: video, audio, metadata
+- Removed deprecated `Receiver::capture()` composite API
+- Async wrappers updated to match (tokio, async-std features)
+
+#### **BREAKING**: Frame Type Renames & Forward Compatibility (Step 4)
+Renamed enums for clarity and made them forward-compatible with `#[non_exhaustive]`:
+
+**Type Renames:**
+```rust
+FourCCVideoType → PixelFormat
+FrameFormatType → ScanType
+AudioType       → AudioFormat
+```
+
+**Field Renames:**
+```rust
+// VideoFrame and BorrowedVideoFrame
+frame.fourcc              → frame.pixel_format
+frame.frame_format_type   → frame.scan_type
+
+// AudioFrame
+frame.fourcc              → frame.format
+```
+
+**Builder Method Updates:**
+```rust
+// VideoFrameBuilder
+.fourcc(...)       → .pixel_format(...)
+.format(...)       → .scan_type(...)
+
+// AudioFrameBuilder
+.format(...)       // Still .format(), but now sets the .format field
+```
+
+**Forward Compatibility:**
+- All three enums marked `#[non_exhaustive]`
+- Removed `Max` sentinel variants
+- Unknown format codes from NDI SDK now return proper errors
+- FFI conversions use `try_from().map_err()` instead of `unwrap_or(Max)`
+- Match expressions now require wildcard arms: `_ => /* handle unknown */`
+
+#### **BREAKING**: Sender API Polish (Step 6)
+Eliminated magic bool/negative integer returns in favor of explicit types:
+
+**1. `get_tally()` → `tally()`**
+
+**Before:**
+```rust
+let mut tally = Tally::new(false, false);
+if sender.get_tally(&mut tally, Duration::from_secs(1))? {
+    println!("On program: {}", tally.on_program);
+}
+```
+
+**After:**
+```rust
+if let Some(tally) = sender.tally(Duration::from_secs(1))? {
+    println!("On program: {}", tally.on_program);
+}
+```
+
+- No mutable reference parameter
+- Returns `Result<Option<Tally>>` - timeout is explicit as `Ok(None)`
+
+**2. `get_no_connections()` → `connection_count()`**
+
+**Before:**
+```rust
+let count = sender.get_no_connections(Duration::from_secs(1))?;  // i32, negative on error
+if count >= 0 {
+    println!("Connections: {}", count);
+}
+```
+
+**After:**
+```rust
+let count = sender.connection_count(Duration::from_secs(1))?;  // Result<u32>
+println!("Connections: {}", count);
+```
+
+- Returns `Result<u32>` with proper error instead of negative sentinel
+- Type system enforces error handling
+
+**3. `get_source_name()` → `source()`**
+
+**Before:**
+```rust
+let source = sender.get_source_name()?;
+```
+
+**After:**
+```rust
+let source = sender.source()?;
+```
+
+- Removed `get_` prefix per Rust API guidelines
+- Still returns owned `Source` (no lifetime complexity)
+
+**4. Added `AsyncVideoToken` explicit methods**
+
+```rust
+/// Explicitly wait for completion (consumes token)
+pub fn wait(self) -> Result<()>
+
+/// Check completion status (advanced_sdk only)
+#[cfg(feature = "advanced_sdk")]
+pub fn is_complete(&self) -> bool
+```
+
+- Makes async video completion explicit instead of relying solely on `Drop`
+
+#### **BREAKING**: Single Runtime Constructor (Step 7)
+Removed `NDI::acquire()` from public API:
+
+**Before:**
+```rust
+let ndi = NDI::acquire()?;  // Public method
+let ndi = NDI::new()?;      // Just forwarded to acquire()
+```
+
+**After:**
+```rust
+let ndi = NDI::new()?;      // Single entry point
+// NDI::acquire() is now private
+```
+
+- Single obvious way to initialize NDI
+- Clearer API with one constructor
+- Internal implementation details hidden
+
+#### **BREAKING**: Receiver Status Changes
+Receiver status polling now uses `Duration`:
+
+**Before:**
+```rust
+receiver.poll_status_change(1000)  // u32 milliseconds
+```
+
+**After:**
+```rust
+receiver.poll_status_change(Duration::from_secs(1))
+```
+
+### Migration Summary
+
+Quick reference for common patterns:
+
+| Old API | New API |
+|---------|---------|
+| `finder.get_sources(5000)` | `finder.sources(Duration::from_secs(5))` |
+| `finder.get_current_sources()` | `finder.current_sources()` |
+| `finder.wait_for_sources(1000)` | `finder.wait_for_sources(Duration::from_secs(1))` |
+| `receiver.capture_video_blocking(5000)` | `receiver.capture_video(Duration::from_secs(5))` |
+| `receiver.capture_video(100)` (polling) | `receiver.capture_video_timeout(Duration::from_millis(100))` |
+| `FourCCVideoType::BGRA` | `PixelFormat::BGRA` |
+| `FrameFormatType::Progressive` | `ScanType::Progressive` |
+| `frame.fourcc` | `frame.pixel_format` |
+| `frame.frame_format_type` | `frame.scan_type` |
+| `ReceiverOptions::builder(src).build(&ndi)` | `ReceiverOptions::builder(src).build()` + `Receiver::new(&ndi, &opts)` |
+| `sender.get_no_connections(1000)` | `sender.connection_count(Duration::from_secs(1))` |
+| `sender.get_tally(&mut t, 1000)` | `sender.tally(Duration::from_secs(1))` |
+| `sender.get_source_name()` | `sender.source()` |
+| `NDI::acquire()` | `NDI::new()` |
+
+**Important Notes:**
+- Matching on `PixelFormat`, `ScanType`, `AudioFormat` now requires wildcard arms due to `#[non_exhaustive]`
+- Large `Duration` values (>49.7 days) now error instead of silently saturating
+- All builders are infallible - error handling moved to `::new()` constructors
+
 #### 🎯 Source Discovery & Caching
 - **`SourceCache`**: Thread-safe caching for NDI instances and discovered sources
   - `new()` - Create a new cache instance
