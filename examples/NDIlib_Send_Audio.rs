@@ -5,12 +5,12 @@
 //!
 //! Run with: `cargo run --example NDIlib_Send_Audio`
 
+use grafton_ndi::{AudioFrame, Error, Sender, SenderOptions, NDI};
+
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-
-use grafton_ndi::{AudioFrame, Error, Sender, SenderOptions, NDI};
 
 fn main() -> Result<(), Error> {
     // Set up signal handler for graceful shutdown
@@ -21,7 +21,6 @@ fn main() -> Result<(), Error> {
     })
     .expect("Error setting Ctrl-C handler");
 
-    // Initialize NDI
     let ndi = NDI::new()?;
 
     // Create an NDI source that is clocked to audio
@@ -37,7 +36,6 @@ fn main() -> Result<(), Error> {
     // Create audio buffer (planar format)
     let mut audio_data = vec![0.0f32; (no_samples * no_channels) as usize];
 
-    // Send 1000 frames
     for idx in 0..1000 {
         if exit_loop.load(Ordering::Relaxed) {
             break;
@@ -46,7 +44,6 @@ fn main() -> Result<(), Error> {
         // Fill with silence (in real usage, you'd generate actual audio)
         audio_data.fill(0.0);
 
-        // Create audio frame
         let audio_frame = AudioFrame::builder()
             .sample_rate(sample_rate)
             .channels(no_channels)
@@ -57,7 +54,6 @@ fn main() -> Result<(), Error> {
         // Send the frame (clocked to 48kHz)
         sender.send_audio(&audio_frame);
 
-        // Display progress
         println!("Frame number {idx} sent.");
     }
 

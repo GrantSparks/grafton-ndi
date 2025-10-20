@@ -1,6 +1,6 @@
-use std::{sync::Arc, thread, time::Duration};
-
 use grafton_ndi::{Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions, NDI};
+
+use std::{sync::Arc, thread, time::Duration};
 
 fn main() -> Result<(), grafton_ndi::Error> {
     // Initialize NDI
