@@ -67,7 +67,7 @@ fn main() -> Result<(), Error> {
                 println!("  Channels: {}", audio_frame.num_channels);
                 println!("  Samples: {}", audio_frame.num_samples);
                 println!("  Timestamp: {}", audio_frame.timestamp);
-                println!("  Format: {:?}", audio_frame.fourcc);
+                println!("  Format: {:?}", audio_frame.format);
 
                 // Get the audio data as f32
                 let audio_data = audio_frame.data();

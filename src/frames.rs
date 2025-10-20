@@ -735,7 +735,7 @@ pub struct AudioFrame {
     pub num_channels: i32,
     pub num_samples: i32,
     pub timecode: i64,
-    pub fourcc: AudioFormat,
+    pub format: AudioFormat,
     data: Vec<f32>,
     pub channel_stride_in_bytes: i32,
     pub metadata: Option<CString>,
@@ -749,7 +749,7 @@ impl AudioFrame {
             no_channels: self.num_channels,
             no_samples: self.num_samples,
             timecode: self.timecode,
-            FourCC: self.fourcc.into(),
+            FourCC: self.format.into(),
             p_data: self.data.as_ptr() as *mut f32 as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: self.channel_stride_in_bytes,
@@ -806,7 +806,7 @@ impl AudioFrame {
             Some(unsafe { CString::from(CStr::from_ptr(raw.p_metadata)) })
         };
 
-        let fourcc = match raw.FourCC {
+        let format = match raw.FourCC {
             NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP => AudioFormat::FLTP,
             _ => {
                 return Err(Error::InvalidFrame(format!(
@@ -821,7 +821,7 @@ impl AudioFrame {
             num_channels: raw.no_channels,
             num_samples: raw.no_samples,
             timecode: raw.timecode,
-            fourcc,
+            format,
             data,
             channel_stride_in_bytes: unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes },
             metadata,
@@ -880,7 +880,7 @@ pub struct AudioFrameBuilder {
     num_channels: Option<i32>,
     num_samples: Option<i32>,
     timecode: Option<i64>,
-    fourcc: Option<AudioFormat>,
+    format: Option<AudioFormat>,
     data: Option<Vec<f32>>,
     layout: Option<AudioLayout>,
     metadata: Option<String>,
@@ -895,7 +895,7 @@ impl AudioFrameBuilder {
             num_channels: None,
             num_samples: None,
             timecode: None,
-            fourcc: None,
+            format: None,
             data: None,
             layout: None,
             metadata: None,
@@ -934,7 +934,7 @@ impl AudioFrameBuilder {
     /// Set the audio format
     #[must_use]
     pub fn format(mut self, format: AudioFormat) -> Self {
-        self.fourcc = Some(format);
+        self.format = Some(format);
         self
     }
 
@@ -997,7 +997,7 @@ impl AudioFrameBuilder {
         let sample_rate = self.sample_rate.unwrap_or(48000);
         let num_channels = self.num_channels.unwrap_or(2);
         let num_samples = self.num_samples.unwrap_or(1024);
-        let fourcc = self.fourcc.unwrap_or(AudioFormat::FLTP);
+        let format = self.format.unwrap_or(AudioFormat::FLTP);
         let layout = self.layout.unwrap_or(AudioLayout::Planar);
 
         let data = if let Some(data) = self.data {
@@ -1026,7 +1026,7 @@ impl AudioFrameBuilder {
             num_channels,
             num_samples,
             timecode: self.timecode.unwrap_or(0),
-            fourcc,
+            format,
             data,
             channel_stride_in_bytes,
             metadata: metadata_cstring,
