@@ -524,15 +524,15 @@ impl VideoFrame {
                 // Use the new helper that correctly handles planar 4:2:0 formats
                 let calculated_size =
                     uncompressed_buffer_len(pixel_format, line_stride, c_frame.xres, c_frame.yres);
-                if calculated_size > 0 && calculated_size <= (100 * 1024 * 1024) {
-                    // Reasonable size for uncompressed video (< 100MB per frame)
+                if calculated_size > 0 && calculated_size <= MAX_VIDEO_BYTES {
                     (
                         calculated_size,
                         LineStrideOrSize::LineStrideBytes(line_stride),
                     )
                 } else {
                     return Err(Error::InvalidFrame(format!(
-                        "Invalid calculated size {calculated_size} for uncompressed format"
+                        "Uncompressed video frame exceeds maximum size: {} bytes > {} bytes",
+                        calculated_size, MAX_VIDEO_BYTES
                     )));
                 }
             } else {
@@ -544,16 +544,30 @@ impl VideoFrame {
             // Compressed/unknown format: read ONLY data_size_in_bytes
             let data_size_in_bytes = c_frame.__bindgen_anon_1.data_size_in_bytes;
 
-            if data_size_in_bytes > 0 {
-                (
-                    data_size_in_bytes as usize,
-                    LineStrideOrSize::DataSizeBytes(data_size_in_bytes),
-                )
-            } else {
+            if data_size_in_bytes <= 0 {
                 return Err(Error::InvalidFrame(
                     "Compressed video frame has invalid data_size_in_bytes".into(),
                 ));
             }
+
+            let data_size_usize = usize::try_from(data_size_in_bytes).map_err(|_| {
+                Error::InvalidFrame(format!(
+                    "Invalid data_size_in_bytes value: {}",
+                    data_size_in_bytes
+                ))
+            })?;
+
+            if data_size_usize > MAX_VIDEO_BYTES {
+                return Err(Error::InvalidFrame(format!(
+                    "Compressed video frame exceeds maximum size: {} bytes > {} bytes",
+                    data_size_usize, MAX_VIDEO_BYTES
+                )));
+            }
+
+            (
+                data_size_usize,
+                LineStrideOrSize::DataSizeBytes(data_size_in_bytes),
+            )
         };
 
         if data_size == 0 {
@@ -799,12 +813,38 @@ impl AudioFrame {
             )));
         }
 
-        let sample_count = (raw.no_samples * raw.no_channels) as usize;
+        // Use checked math to prevent overflow when computing sample count
+        let no_samples = usize::try_from(raw.no_samples).map_err(|_| {
+            Error::InvalidFrame(format!("Invalid no_samples value: {}", raw.no_samples))
+        })?;
 
-        if sample_count == 0 {
-            return Err(Error::InvalidFrame(
-                "Calculated audio sample count is zero".into(),
-            ));
+        let no_channels = usize::try_from(raw.no_channels).map_err(|_| {
+            Error::InvalidFrame(format!("Invalid no_channels value: {}", raw.no_channels))
+        })?;
+
+        let sample_count = no_samples.checked_mul(no_channels).ok_or_else(|| {
+            Error::InvalidFrame(format!(
+                "Audio sample count overflow: {} samples × {} channels",
+                no_samples, no_channels
+            ))
+        })?;
+
+        // Check total byte size against limit
+        let byte_size = sample_count
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                Error::InvalidFrame(format!(
+                    "Audio byte size overflow: {} samples × {} bytes",
+                    sample_count,
+                    std::mem::size_of::<f32>()
+                ))
+            })?;
+
+        if byte_size > MAX_AUDIO_BYTES {
+            return Err(Error::InvalidFrame(format!(
+                "Audio frame exceeds maximum size: {} bytes > {} bytes",
+                byte_size, MAX_AUDIO_BYTES
+            )));
         }
 
         // Always copy data for ownership - we're no longer zero-copy
@@ -1124,6 +1164,14 @@ impl From<AudioFormat> for i32 {
         u32_value as i32
     }
 }
+
+/// Maximum allowed size for video frame data (100 MiB).
+/// Applies to both compressed and uncompressed video frames.
+const MAX_VIDEO_BYTES: usize = 100 * 1024 * 1024;
+
+/// Maximum allowed size for audio frame data (64 MiB).
+/// Comfortably above typical NDI audio frames while preventing unbounded allocations.
+const MAX_AUDIO_BYTES: usize = 64 * 1024 * 1024;
 
 /// Check if a pixel format is planar 4:2:0 (YV12, I420, NV12).
 fn is_planar_420(fmt: PixelFormat) -> bool {
@@ -2322,5 +2370,140 @@ mod tests {
         );
 
         std::mem::forget(frame_ref);
+    }
+
+    /// Test that MAX_VIDEO_BYTES constant is properly defined
+    #[test]
+    fn test_max_video_bytes_constant() {
+        // Verify the constant is set to 100 MiB as specified
+        assert_eq!(MAX_VIDEO_BYTES, 100 * 1024 * 1024);
+    }
+
+    /// Test that MAX_AUDIO_BYTES constant is properly defined
+    #[test]
+    fn test_max_audio_bytes_constant() {
+        // Verify the constant is set to 64 MiB as specified
+        assert_eq!(MAX_AUDIO_BYTES, 64 * 1024 * 1024);
+    }
+
+    /// Test that audio frames with overflow in checked_mul are rejected
+    #[test]
+    fn test_audio_overflow_checked_mul() {
+        // Use no_samples = i32::MAX and no_channels = 2 to trigger overflow
+        // When multiplying i32::MAX * 2, the result overflows usize::checked_mul
+        let no_samples = i32::MAX;
+        let no_channels = 2;
+        let mut dummy_data = vec![0f32; 1024]; // Small buffer, won't be used due to guard
+
+        let raw = NDIlib_audio_frame_v3_t {
+            sample_rate: 48000,
+            no_channels,
+            no_samples,
+            timecode: 0,
+            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            p_data: dummy_data.as_mut_ptr() as *mut u8,
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: 0,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 0,
+        };
+
+        let result = AudioFrame::from_raw(raw);
+        assert!(
+            result.is_err(),
+            "Should reject audio frame with sample count overflow or exceeding size limit"
+        );
+
+        if let Err(Error::InvalidFrame(msg)) = result {
+            // Accept either overflow or size limit error - both are correct guards
+            assert!(
+                msg.contains("overflow") || msg.contains("exceeds maximum size"),
+                "Error message should mention overflow or size limit, got: {msg}"
+            );
+        } else {
+            panic!("Expected InvalidFrame error");
+        }
+    }
+
+    /// Test that normal audio frames within bounds succeed
+    #[test]
+    fn test_audio_within_bounds_succeeds() {
+        // Typical audio frame: 48kHz, 2 channels, 1024 samples
+        let sample_rate = 48000;
+        let no_channels = 2;
+        let no_samples = 1024;
+        let sample_count = (no_samples * no_channels) as usize;
+        let mut data = vec![0.5f32; sample_count];
+
+        let raw = NDIlib_audio_frame_v3_t {
+            sample_rate,
+            no_channels,
+            no_samples,
+            timecode: 12345,
+            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            p_data: data.as_mut_ptr() as *mut u8,
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: 0,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 67890,
+        };
+
+        let result = AudioFrame::from_raw(raw);
+        assert!(
+            result.is_ok(),
+            "Should accept normal audio frame within bounds"
+        );
+
+        let frame = result.unwrap();
+        assert_eq!(frame.data().len(), sample_count);
+        assert_eq!(frame.num_samples, no_samples);
+        assert_eq!(frame.num_channels, no_channels);
+    }
+
+    /// Test that uncompressed video uses MAX_VIDEO_BYTES constant for bounds check
+    #[test]
+    fn test_video_uncompressed_uses_constant_cap() {
+        // Create an uncompressed frame that would exceed MAX_VIDEO_BYTES
+        // 8K resolution: 7680 x 4320, BGRA = 4 bytes per pixel
+        // Total: 7680 * 4320 * 4 = 132,710,400 bytes > 100 MiB
+        let width = 7680;
+        let height = 4320;
+        let stride = width * 4;
+        let expected_size = (stride * height) as usize;
+        let mut data = vec![0u8; expected_size];
+
+        let c_frame = NDIlib_video_frame_v2_t {
+            xres: width,
+            yres: height,
+            FourCC: PixelFormat::BGRA.into(),
+            frame_rate_N: 60,
+            frame_rate_D: 1,
+            picture_aspect_ratio: 16.0 / 9.0,
+            frame_format_type: ScanType::Progressive.into(),
+            timecode: 0,
+            p_data: data.as_mut_ptr(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: stride,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 0,
+        };
+
+        let result = unsafe { VideoFrame::from_raw(&c_frame) };
+        assert!(
+            result.is_err(),
+            "Should reject uncompressed video frame exceeding MAX_VIDEO_BYTES"
+        );
+
+        if let Err(Error::InvalidFrame(msg)) = result {
+            assert!(
+                msg.contains("exceeds maximum size"),
+                "Error message should mention size limit, got: {msg}"
+            );
+        } else {
+            panic!("Expected InvalidFrame error");
+        }
     }
 }
