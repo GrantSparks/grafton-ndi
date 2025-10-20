@@ -22,12 +22,12 @@ use crate::frames::is_uncompressed_format;
 use crate::{
     finder::Source,
     frames::{
-        calculate_line_stride, AudioFrame, FourCCVideoType, FrameFormatType, LineStrideOrSize,
-        MetadataFrame, VideoFrame,
+        calculate_line_stride, AudioFrame, LineStrideOrSize, MetadataFrame, PixelFormat, ScanType,
+        VideoFrame,
     },
     ndi_lib::*,
     receiver::Tally,
-    Error, Result, NDI,
+    to_ms_checked, Error, Result, NDI,
 };
 
 #[cfg(not(target_has_atomic = "ptr"))]
@@ -128,11 +128,11 @@ unsafe impl Sync for Inner {}
 pub struct BorrowedVideoFrame<'buf> {
     pub width: i32,
     pub height: i32,
-    pub fourcc: FourCCVideoType,
+    pub pixel_format: PixelFormat,
     pub frame_rate_n: i32,
     pub frame_rate_d: i32,
     pub picture_aspect_ratio: f32,
-    pub frame_format_type: FrameFormatType,
+    pub scan_type: ScanType,
     pub timecode: i64,
     pub data: &'buf [u8],
     pub line_stride_or_size: LineStrideOrSize,
@@ -146,20 +146,20 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         data: &'buf [u8],
         width: i32,
         height: i32,
-        fourcc: FourCCVideoType,
+        pixel_format: PixelFormat,
         frame_rate_n: i32,
         frame_rate_d: i32,
     ) -> Self {
-        let stride = calculate_line_stride(fourcc, width);
+        let stride = calculate_line_stride(pixel_format, width);
 
         BorrowedVideoFrame {
             width,
             height,
-            fourcc,
+            pixel_format,
             frame_rate_n,
             frame_rate_d,
             picture_aspect_ratio: 16.0 / 9.0,
-            frame_format_type: FrameFormatType::Progressive,
+            scan_type: ScanType::Progressive,
             timecode: 0,
             data,
             line_stride_or_size: LineStrideOrSize::LineStrideBytes(stride),
@@ -172,11 +172,11 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         NDIlib_video_frame_v2_t {
             xres: self.width,
             yres: self.height,
-            FourCC: self.fourcc.into(),
+            FourCC: self.pixel_format.into(),
             frame_rate_N: self.frame_rate_n,
             frame_rate_D: self.frame_rate_d,
             picture_aspect_ratio: self.picture_aspect_ratio,
-            frame_format_type: self.frame_format_type.into(),
+            frame_format_type: self.scan_type.into(),
             timecode: self.timecode,
             p_data: self.data.as_ptr() as *mut u8,
             __bindgen_anon_1: self.line_stride_or_size.into(),
@@ -191,11 +191,11 @@ impl<'buf> From<&'buf VideoFrame> for BorrowedVideoFrame<'buf> {
         BorrowedVideoFrame {
             width: frame.width,
             height: frame.height,
-            fourcc: frame.fourcc,
+            pixel_format: frame.pixel_format,
             frame_rate_n: frame.frame_rate_n,
             frame_rate_d: frame.frame_rate_d,
             picture_aspect_ratio: frame.picture_aspect_ratio,
-            frame_format_type: frame.frame_format_type,
+            scan_type: frame.scan_type,
             timecode: frame.timecode,
             data: &frame.data,
             line_stride_or_size: frame.line_stride_or_size,
@@ -335,16 +335,117 @@ impl Drop for AsyncVideoToken<'_, '_> {
     }
 }
 
+impl<'a, 'buf> AsyncVideoToken<'a, 'buf> {
+    /// Explicitly wait for the async video operation to complete.
+    ///
+    /// This method provides an explicit way to wait for completion instead of relying on `Drop`.
+    /// It consumes the token, ensuring the buffer is safe to reuse after this call returns.
+    ///
+    /// # Behavior by SDK Version
+    ///
+    /// - **Standard SDK**: Sends a NULL frame to flush the pipeline, blocking until all pending
+    ///   async video operations complete. This is the same behavior as dropping the token.
+    /// - **Advanced SDK** (with `advanced_sdk` feature): Waits for the SDK completion callback to signal
+    ///   that the buffer has been released, with a 5-second timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Timeout`] if waiting for completion times out (advanced SDK only).
+    /// With the standard SDK, this method always succeeds but may block.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, SenderOptions, PixelFormat, BorrowedVideoFrame};
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::new()?;
+    /// let options = SenderOptions::builder("Test Sender").build();
+    /// let mut sender = grafton_ndi::Sender::new(&ndi, &options)?;
+    ///
+    /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
+    /// let borrowed_frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
+    /// let token = sender.send_video_async(&borrowed_frame);
+    ///
+    /// // Explicitly wait for completion instead of relying on Drop
+    /// token.wait()?;
+    ///
+    /// // Now safe to reuse or drop the buffer
+    /// buffer.clear();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn wait(self) -> Result<()> {
+        // Drop impl handles the wait logic
+        drop(self);
+        Ok(())
+    }
+
+    /// Check if the async video operation has completed (advanced SDK only).
+    ///
+    /// This method is only available when the `advanced_sdk` feature is enabled, as it requires
+    /// SDK completion callbacks to track the completion state.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the NDI SDK has called the completion callback, indicating the buffer is no longer
+    /// in use. `false` if the operation is still pending.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "advanced_sdk")]
+    /// # {
+    /// # use grafton_ndi::{NDI, SenderOptions, PixelFormat, BorrowedVideoFrame};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::new()?;
+    /// let options = SenderOptions::builder("Test Sender").build();
+    /// let mut sender = grafton_ndi::Sender::new(&ndi, &options)?;
+    ///
+    /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
+    /// let borrowed_frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
+    /// let token = sender.send_video_async(&borrowed_frame);
+    ///
+    /// // Poll for completion
+    /// while !token.is_complete() {
+    ///     std::thread::sleep(std::time::Duration::from_millis(1));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    #[cfg(feature = "advanced_sdk")]
+    pub fn is_complete(&self) -> bool {
+        self.inner.async_state.completed.load(Ordering::Acquire)
+    }
+}
+
 impl<'a> Sender<'a> {
     /// Creates a new NDI send instance.
     ///
     /// # Errors
     ///
     /// Returns an error if:
+    /// - The sender name is empty or contains only whitespace
+    /// - Both `clock_video` and `clock_audio` are false (at least one must be true)
     /// - The sender name contains a null byte
     /// - The groups string contains a null byte
     /// - NDI fails to create the send instance
     pub fn new(_ndi: &'a NDI, create_settings: &SenderOptions) -> Result<Self> {
+        // Validate sender name
+        if create_settings.name.trim().is_empty() {
+            return Err(Error::InvalidConfiguration(
+                "Sender name cannot be empty or contain only whitespace".into(),
+            ));
+        }
+
+        // Validate that at least one clock is enabled
+        if !create_settings.clock_video && !create_settings.clock_audio {
+            return Err(Error::InvalidConfiguration(
+                "At least one of clock_video or clock_audio must be true".into(),
+            ));
+        }
+
         let p_ndi_name =
             CString::new(create_settings.name.clone()).map_err(Error::InvalidCString)?;
         let p_groups = match &create_settings.groups {
@@ -412,8 +513,8 @@ impl<'a> Sender<'a> {
                         let len = if !frame.is_null() {
                             #[allow(clippy::unnecessary_cast)]
                             // Required for Windows where FourCC is i32
-                            let fourcc = FourCCVideoType::try_from((*frame).FourCC as u32)
-                                .unwrap_or(FourCCVideoType::Max);
+                            let fourcc = PixelFormat::try_from((*frame).FourCC as u32)
+                                .unwrap_or(PixelFormat::BGRA);
 
                             if is_uncompressed_format(fourcc) {
                                 // Uncompressed format: read ONLY line_stride_in_bytes
@@ -497,21 +598,21 @@ impl<'a> Sender<'a> {
     ///
     /// # Example
     /// ```no_run
-    /// # use grafton_ndi::{NDI, SenderOptions, VideoFrame, BorrowedVideoFrame, FourCCVideoType};
+    /// # use grafton_ndi::{NDI, SenderOptions, VideoFrame, BorrowedVideoFrame, PixelFormat};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let ndi = NDI::new()?;
     /// let send_options = SenderOptions::builder("MyCam")
     ///     .clock_video(true)
     ///     .clock_audio(true)
-    ///     .build()?;
+    ///     .build();
     /// let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
     ///
     /// // Register callback to know when buffer is released
     /// sender.on_async_video_done(|len| println!("Buffer released: {len} bytes"));
     ///
     /// // Use borrowed buffer directly (zero-copy, no allocation)
-    /// let buffer = vec![0u8; 1920 * 1080 * 4];
-    /// let borrowed_frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
+    /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
+    /// let borrowed_frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
     /// let token = sender.send_video_async(&borrowed_frame);
     ///
     /// // Buffer is owned by SDK until token is dropped
@@ -558,7 +659,8 @@ impl<'a> Sender<'a> {
     /// # use grafton_ndi::{NDI, SenderOptions, AudioFrame};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
-    /// # let sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build()?)?;
+    /// # let options = SenderOptions::builder("Test").build();
+    /// # let sender = grafton_ndi::Sender::new(&ndi, &options)?;
     /// let mut audio_buffer = vec![0.0f32; 48000 * 2]; // 1 second of stereo audio
     ///
     /// // Fill buffer with audio data...
@@ -601,13 +703,97 @@ impl<'a> Sender<'a> {
         Ok(())
     }
 
-    pub fn get_tally(&self, tally: &mut Tally, timeout_ms: u32) -> bool {
-        unsafe { NDIlib_send_get_tally(self.inner.instance, &mut tally.to_raw(), timeout_ms) }
+    /// Get the current tally state for this sender.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum time to wait for tally information.
+    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Some(tally))` if tally was successfully retrieved, `Ok(None)` on timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, SenderOptions};
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::new()?;
+    /// let options = SenderOptions::builder("Test Sender").build();
+    /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
+    ///
+    /// // Try to get tally with 1 second timeout
+    /// if let Some(tally) = sender.tally(Duration::from_secs(1))? {
+    ///     println!("On program: {}, On preview: {}", tally.on_program, tally.on_preview);
+    /// } else {
+    ///     println!("Tally request timed out");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn tally(&self, timeout: Duration) -> Result<Option<Tally>> {
+        let timeout_ms = to_ms_checked(timeout)?;
+        let mut raw_tally = Tally::new(false, false).to_raw();
+        let success =
+            unsafe { NDIlib_send_get_tally(self.inner.instance, &mut raw_tally, timeout_ms) };
+
+        if success {
+            Ok(Some(Tally {
+                on_program: raw_tally.on_program,
+                on_preview: raw_tally.on_preview,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
-    #[must_use]
-    pub fn get_no_connections(&self, timeout_ms: u32) -> i32 {
-        unsafe { NDIlib_send_get_no_connections(self.inner.instance, timeout_ms) }
+    /// Get the number of active connections to this sender.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum time to wait for connection count.
+    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+    ///
+    /// # Returns
+    ///
+    /// Number of active connections as a `u32`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Timeout`] if the SDK returns a negative value (indicating timeout or error).
+    /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, SenderOptions};
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::new()?;
+    /// let options = SenderOptions::builder("Test Sender").build();
+    /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
+    ///
+    /// // Get connection count with 1 second timeout
+    /// let count = sender.connection_count(Duration::from_secs(1))?;
+    /// println!("Active connections: {}", count);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn connection_count(&self, timeout: Duration) -> Result<u32> {
+        let timeout_ms = to_ms_checked(timeout)?;
+        let count = unsafe { NDIlib_send_get_no_connections(self.inner.instance, timeout_ms) };
+
+        if count < 0 {
+            Err(Error::Timeout("Failed to obtain connection count".into()))
+        } else {
+            Ok(count as u32)
+        }
     }
 
     pub fn clear_connection_metadata(&self) {
@@ -636,7 +822,7 @@ impl<'a> Sender<'a> {
         Ok(())
     }
 
-    /// Get the source name for this sender.
+    /// Get the source information for this sender.
     ///
     /// # Errors
     ///
@@ -649,13 +835,14 @@ impl<'a> Sender<'a> {
     /// # use grafton_ndi::{NDI, SenderOptions};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let ndi = NDI::new()?;
-    /// let sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build()?)?;
-    /// let source = sender.get_source_name()?;
+    /// let options = SenderOptions::builder("Test Sender").build();
+    /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
+    /// let source = sender.source()?;
     /// println!("Sender source: {source}");
     /// # Ok(())
     /// # }
     /// ```
-    pub fn get_source_name(&self) -> Result<Source> {
+    pub fn source(&self) -> Result<Source> {
         let source_ptr = unsafe { NDIlib_send_get_source_name(self.inner.instance) };
         Source::try_from_raw(source_ptr)
     }
@@ -687,13 +874,14 @@ impl<'a> Sender<'a> {
     /// # Example
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, SenderOptions, BorrowedVideoFrame, FourCCVideoType};
+    /// # use grafton_ndi::{NDI, SenderOptions, BorrowedVideoFrame, PixelFormat};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let ndi = NDI::new()?;
-    /// let mut sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build()?)?;
+    /// let options = SenderOptions::builder("Test").build();
+    /// let mut sender = grafton_ndi::Sender::new(&ndi, &options)?;
     ///
     /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
-    /// let frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
+    /// let frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
     /// let token = sender.send_video_async(&frame);
     ///
     /// // Drop token to release the mutable borrow, then flush
@@ -759,7 +947,8 @@ impl<'a> Sender<'a> {
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let ndi = NDI::new()?;
-    /// let sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build()?)?;
+    /// let options = SenderOptions::builder("Test").build();
+    /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
     ///
     /// // ... send some async frames ...
     ///
@@ -996,34 +1185,31 @@ impl SenderOptionsBuilder {
         self
     }
 
-    /// Build the `SendOptions`
+    /// Build the sender options
     ///
-    /// # Errors
+    /// This method is infallible and simply applies defaults for any unset options.
+    /// Validation is performed when creating a `Sender` via `Sender::new()`.
     ///
-    /// Returns an error if:
-    /// - The name is empty or contains only whitespace
-    /// - Both clock_video and clock_audio are false
-    pub fn build(self) -> Result<SenderOptions> {
-        if self.name.trim().is_empty() {
-            return Err(Error::InvalidConfiguration(
-                "Sender name cannot be empty or contain only whitespace".into(),
-            ));
-        }
-
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, SenderOptions, Sender};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// let options = SenderOptions::builder("My Sender").build();
+    /// let sender = Sender::new(&ndi, &options)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn build(self) -> SenderOptions {
         let clock_video = self.clock_video.unwrap_or(true);
         let clock_audio = self.clock_audio.unwrap_or(true);
 
-        if !clock_video && !clock_audio {
-            return Err(Error::InvalidConfiguration(
-                "At least one of clock_video or clock_audio must be true".into(),
-            ));
-        }
-
-        Ok(SenderOptions {
+        SenderOptions {
             name: self.name,
             groups: self.groups,
             clock_video,
             clock_audio,
-        })
+        }
     }
 }

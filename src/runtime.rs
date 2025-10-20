@@ -34,27 +34,11 @@ static REFCOUNT: AtomicUsize = AtomicUsize::new(0);
 pub struct NDI;
 
 impl NDI {
-    /// Creates a new NDI instance, initializing the runtime if necessary.
+    /// Internal method that performs the actual initialization.
     ///
-    /// This method is thread-safe and can be called from multiple threads. The first
-    /// call initializes the NDI runtime, subsequent calls increment a reference count.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InitializationFailed`] if the NDI runtime cannot be initialized.
-    /// This typically happens when the NDI SDK is not properly installed.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::NDI;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = NDI::acquire()?;
-    /// // Use NDI operations...
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn acquire() -> Result<Self> {
+    /// This method increments the reference counter and initializes the NDI SDK
+    /// if this is the first instance. It is called by `new()`.
+    fn acquire() -> Result<Self> {
         // 1. Bump the counter immediately.
         let prev = REFCOUNT.fetch_add(1, Ordering::SeqCst);
 
@@ -132,7 +116,28 @@ impl NDI {
 
     /// Creates a new NDI instance.
     ///
-    /// Alias for [`NDI::acquire()`].
+    /// This method is the single entry point for creating NDI instances. It is thread-safe
+    /// and can be called from multiple threads. The first call initializes the NDI runtime,
+    /// subsequent calls increment a reference count. When the last instance is dropped, the
+    /// runtime is automatically destroyed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InitializationFailed`] if:
+    /// - The NDI SDK fails to initialize
+    /// - A previous initialization attempt failed
+    /// - Initialization times out (after 30 seconds)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use grafton_ndi::NDI;
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::new()?;
+    /// // Use NDI operations...
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new() -> Result<Self> {
         Self::acquire()
     }

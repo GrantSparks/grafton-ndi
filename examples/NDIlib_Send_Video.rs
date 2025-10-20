@@ -8,14 +8,14 @@
 
 use std::time::Instant;
 
-use grafton_ndi::{Error, FourCCVideoType, Sender, SenderOptions, VideoFrame, NDI};
+use grafton_ndi::{Error, PixelFormat, Sender, SenderOptions, VideoFrame, NDI};
 
 fn main() -> Result<(), Error> {
     // Initialize NDI
     let ndi = NDI::new()?;
 
     // Create the NDI sender
-    let send_options = SenderOptions::builder("My Video").build()?;
+    let send_options = SenderOptions::builder("My Video").build();
     let sender = Sender::new(&ndi, &send_options)?;
 
     // We are going to create a 1920x1080 frame at 29.97Hz
@@ -32,7 +32,7 @@ fn main() -> Result<(), Error> {
             // Create video frame with test pattern
             let video_frame = VideoFrame::builder()
                 .resolution(xres, yres)
-                .fourcc(FourCCVideoType::BGRX)
+                .pixel_format(PixelFormat::BGRX)
                 .build()?;
 
             // The frame is created with zero-initialized data

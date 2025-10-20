@@ -10,7 +10,9 @@
 
 use std::{thread, time::Duration};
 
-use grafton_ndi::{Error, Finder, FinderOptions, ReceiverBandwidth, ReceiverOptions, NDI};
+use grafton_ndi::{
+    Error, Finder, FinderOptions, Receiver, ReceiverBandwidth, ReceiverOptions, NDI,
+};
 
 fn main() -> Result<(), Error> {
     println!("NDI Audio Receiver Example (32-bit float)");
@@ -27,8 +29,8 @@ fn main() -> Result<(), Error> {
 
     // Wait for sources to appear
     println!("Searching for NDI sources...\n");
-    finder.wait_for_sources(5000);
-    let sources = finder.get_sources(5000)?;
+    finder.wait_for_sources(Duration::from_secs(5))?;
+    let sources = finder.sources(Duration::from_secs(5))?;
 
     if sources.is_empty() {
         println!("No NDI sources found!");
@@ -47,24 +49,25 @@ fn main() -> Result<(), Error> {
     println!("Connecting to: {}\n", source);
 
     // Create a receiver for audio
-    let receiver = ReceiverOptions::builder(source)
+    let options = ReceiverOptions::builder(source)
         .bandwidth(ReceiverBandwidth::AudioOnly)
         .name("Audio Capture Example")
-        .build(&ndi)?;
+        .build();
+    let receiver = Receiver::new(&ndi, &options)?;
 
     println!("Receiver created successfully");
     println!("Waiting for audio frames...\n");
 
     // Capture a few audio frames
     for i in 0..5 {
-        match receiver.capture_audio(5000)? {
+        match receiver.capture_audio_timeout(Duration::from_secs(5))? {
             Some(audio_frame) => {
                 println!("Frame {}: ", i + 1);
                 println!("  Sample rate: {} Hz", audio_frame.sample_rate);
                 println!("  Channels: {}", audio_frame.num_channels);
                 println!("  Samples: {}", audio_frame.num_samples);
                 println!("  Timestamp: {}", audio_frame.timestamp);
-                println!("  Format: {:?}", audio_frame.fourcc);
+                println!("  Format: {:?}", audio_frame.format);
 
                 // Get the audio data as f32
                 let audio_data = audio_frame.data();

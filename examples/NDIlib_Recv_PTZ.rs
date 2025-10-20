@@ -5,7 +5,7 @@
 //!
 //! Run with: `cargo run --example NDIlib_Recv_PTZ`
 
-use grafton_ndi::{Error, Finder, FinderOptions, ReceiverOptions, NDI};
+use grafton_ndi::{Error, Finder, FinderOptions, Receiver, ReceiverOptions, NDI};
 
 use std::{
     sync::{
@@ -46,23 +46,24 @@ fn main() -> Result<(), Error> {
         if exit_loop.load(Ordering::Relaxed) {
             return Ok(());
         }
-        finder.wait_for_sources(1000);
-        let sources = finder.get_sources(0)?;
+        finder.wait_for_sources(Duration::from_secs(1))?;
+        let sources = finder.sources(Duration::ZERO)?;
         if !sources.is_empty() {
             break sources;
         }
     };
 
     // Create a receiver for the first source
-    let receiver = ReceiverOptions::builder(sources[0].clone())
+    let options = ReceiverOptions::builder(sources[0].clone())
         .name("Example PTZ Receiver")
-        .build(&ndi)?;
+        .build();
+    let receiver = Receiver::new(&ndi, &options)?;
 
     // Run for 30 seconds
     let start = Instant::now();
     while !exit_loop.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(30) {
         // Use poll_status_change to check for status changes
-        if let Some(_status) = receiver.poll_status_change(1000) {
+        if let Some(_status) = receiver.poll_status_change(Duration::from_secs(1))? {
             // Check PTZ support on status change
             if receiver.ptz_is_supported() {
                 println!("This source supports PTZ functionality. Moving to preset #3.");

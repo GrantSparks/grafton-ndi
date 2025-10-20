@@ -7,9 +7,10 @@ use std::{
     marker::PhantomData,
     ptr,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
-use crate::{ndi_lib::*, Error, Result, NDI};
+use crate::{ndi_lib::*, to_ms_checked, Error, Result, NDI};
 
 /// Configuration for NDI source discovery.
 ///
@@ -122,14 +123,15 @@ impl Default for FinderOptionsBuilder {
 ///
 /// ```no_run
 /// # use grafton_ndi::{NDI, FinderOptions, Finder};
+/// # use std::time::Duration;
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// let ndi = NDI::new()?;
 /// let options = FinderOptions::builder().show_local_sources(true).build();
 /// let finder = Finder::new(&ndi, &options)?;
 ///
 /// // Wait for initial discovery
-/// if finder.wait_for_sources(5000) {
-///     let sources = finder.get_sources(0)?;
+/// if finder.wait_for_sources(Duration::from_secs(5))? {
+///     let sources = finder.sources(Duration::ZERO)?;
 ///     for source in sources {
 ///         println!("Found: {}", source);
 ///     }
@@ -197,31 +199,38 @@ impl<'a> Finder<'a> {
     ///
     /// # Arguments
     ///
-    /// * `timeout` - Maximum time to wait in milliseconds (0 = no wait)
+    /// * `timeout` - Maximum time to wait ([`Duration::ZERO`] = no wait).
+    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
     ///
     /// # Returns
     ///
     /// `true` if the source list changed, `false` if the timeout expired.
     ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    ///
     /// # Examples
     ///
     /// ```no_run
     /// # use grafton_ndi::{NDI, FinderOptions, Finder};
+    /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// // Wait up to 5 seconds for changes
-    /// if finder.wait_for_sources(5000) {
+    /// if finder.wait_for_sources(Duration::from_secs(5))? {
     ///     println!("Source list changed!");
     /// }
     /// # Ok(())
     /// # }
     /// ```
-    pub fn wait_for_sources(&self, timeout: u32) -> bool {
-        unsafe { NDIlib_find_wait_for_sources(self.instance, timeout) }
+    pub fn wait_for_sources(&self, timeout: Duration) -> Result<bool> {
+        let timeout_ms = to_ms_checked(timeout)?;
+        Ok(unsafe { NDIlib_find_wait_for_sources(self.instance, timeout_ms) })
     }
 
-    /// Gets the current list of discovered sources (snapshot).
+    /// Returns the current list of discovered sources (snapshot).
     ///
     /// This method uses `NDIlib_find_get_current_sources` which provides a snapshot
     /// of the current source list without any additional network discovery.
@@ -240,7 +249,7 @@ impl<'a> Finder<'a> {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// // Get current snapshot of sources
-    /// let sources = finder.get_current_sources()?;
+    /// let sources = finder.current_sources()?;
     ///
     /// for source in sources {
     ///     println!("Current source: {}", source);
@@ -248,7 +257,7 @@ impl<'a> Finder<'a> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn get_current_sources(&self) -> Result<Vec<Source>> {
+    pub fn current_sources(&self) -> Result<Vec<Source>> {
         let mut num_sources = 0;
         let sources_ptr =
             unsafe { NDIlib_find_get_current_sources(self.instance, &mut num_sources) };
@@ -274,28 +283,34 @@ impl<'a> Finder<'a> {
         Ok(sources)
     }
 
-    /// Gets the current list of discovered sources.
+    /// Returns the current list of discovered sources.
     ///
     /// # Arguments
     ///
-    /// * `timeout` - Time to wait for sources in milliseconds (0 = immediate)
+    /// * `timeout` - Time to wait for sources ([`Duration::ZERO`] = immediate).
+    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
     ///
     /// # Returns
     ///
     /// A vector of discovered sources. May be empty if no sources are found.
     ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    ///
     /// # Examples
     ///
     /// ```no_run
     /// # use grafton_ndi::{NDI, FinderOptions, Finder};
+    /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// // Get sources immediately
-    /// let sources = finder.get_sources(0)?;
+    /// let sources = finder.sources(Duration::ZERO)?;
     ///
     /// // Get sources with 1 second timeout
-    /// let sources = finder.get_sources(1000)?;
+    /// let sources = finder.sources(Duration::from_secs(1))?;
     ///
     /// for source in sources {
     ///     println!("{}", source);
@@ -303,10 +318,11 @@ impl<'a> Finder<'a> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn get_sources(&self, timeout: u32) -> Result<Vec<Source>> {
+    pub fn sources(&self, timeout: Duration) -> Result<Vec<Source>> {
+        let timeout_ms = to_ms_checked(timeout)?;
         let mut num_sources = 0;
         let sources_ptr =
-            unsafe { NDIlib_find_get_sources(self.instance, &mut num_sources, timeout) };
+            unsafe { NDIlib_find_get_sources(self.instance, &mut num_sources, timeout_ms) };
         if sources_ptr.is_null() {
             return Ok(vec![]);
         }
@@ -327,6 +343,47 @@ impl<'a> Finder<'a> {
             }
         }
         Ok(sources)
+    }
+
+    /// Waits for sources and then returns the current list.
+    ///
+    /// This is a convenience method that combines [`wait_for_sources`](Self::wait_for_sources)
+    /// followed by [`sources`](Self::sources) with a zero timeout. Even if no "change" is signaled,
+    /// cached sources may exist and will be returned.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum time to wait for source changes.
+    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+    ///
+    /// # Returns
+    ///
+    /// A vector of discovered sources. May be empty if no sources are found.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, FinderOptions, Finder};
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
+    /// // Wait up to 5 seconds and get sources
+    /// let sources = finder.find_sources(Duration::from_secs(5))?;
+    ///
+    /// for source in sources {
+    ///     println!("Found: {}", source);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn find_sources(&self, timeout: Duration) -> Result<Vec<Source>> {
+        let _changed = self.wait_for_sources(timeout)?; // intentionally ignored
+        self.sources(Duration::ZERO)
     }
 }
 
@@ -720,17 +777,18 @@ struct CachedSource {
 ///
 /// ```no_run
 /// use grafton_ndi::SourceCache;
+/// use std::time::Duration;
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// // Create a cache instance
 /// let cache = SourceCache::new()?;
 ///
 /// // Find a source by hostname or IP with automatic caching
-/// let source = cache.find_by_host("192.168.0.107", 5000)?;
+/// let source = cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
 /// println!("Found source: {}", source);
 ///
 /// // Subsequent lookups use the cache
-/// let same_source = cache.find_by_host("192.168.0.107", 5000)?;
+/// let same_source = cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
 ///
 /// # Ok(())
 /// # }
@@ -771,7 +829,8 @@ impl SourceCache {
     /// # Arguments
     ///
     /// * `host` - The hostname or IP address to search for
-    /// * `timeout_ms` - Maximum time to wait for source discovery in milliseconds
+    /// * `timeout` - Maximum time to wait for source discovery.
+    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
     ///
     /// # Returns
     ///
@@ -780,29 +839,31 @@ impl SourceCache {
     ///
     /// # Errors
     ///
-    /// - `Error::NoSourcesFound` if no source matching the host is discovered
+    /// - [`Error::NoSourcesFound`] if no source matching the host is discovered
+    /// - [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`]
     /// - Other errors if NDI initialization or discovery fails
     ///
     /// # Examples
     ///
     /// ```no_run
     /// use grafton_ndi::SourceCache;
+    /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let cache = SourceCache::new()?;
     ///
     /// // Find by IP address
-    /// let source = cache.find_by_host("192.168.0.107", 5000)?;
+    /// let source = cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
     ///
     /// // Find by partial IP
-    /// let source = cache.find_by_host("192.168.0", 5000)?;
+    /// let source = cache.find_by_host("192.168.0", Duration::from_secs(5))?;
     ///
     /// // Find by name
-    /// let source = cache.find_by_host("CAMERA1", 5000)?;
+    /// let source = cache.find_by_host("CAMERA1", Duration::from_secs(5))?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn find_by_host(&self, host: &str, timeout_ms: u32) -> Result<Source> {
+    pub fn find_by_host(&self, host: &str, timeout: Duration) -> Result<Source> {
         {
             let cache = self.cache.lock().unwrap();
             if let Some(cached) = cache.get(host) {
@@ -819,8 +880,8 @@ impl SourceCache {
             .build();
         let finder = Finder::new(&ndi, &options)?;
 
-        finder.wait_for_sources(timeout_ms);
-        let sources = finder.get_sources(0)?;
+        finder.wait_for_sources(timeout)?;
+        let sources = finder.sources(Duration::ZERO)?;
 
         let source = sources
             .into_iter()
@@ -856,10 +917,11 @@ impl SourceCache {
     ///
     /// ```no_run
     /// use grafton_ndi::SourceCache;
+    /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let cache = SourceCache::new()?;
-    /// let source = cache.find_by_host("192.168.0.107", 5000)?;
+    /// let source = cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
     ///
     /// // Later, if the source goes offline
     /// cache.invalidate("192.168.0.107");
@@ -882,11 +944,12 @@ impl SourceCache {
     ///
     /// ```no_run
     /// use grafton_ndi::SourceCache;
+    /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let cache = SourceCache::new()?;
-    /// cache.find_by_host("192.168.0.107", 5000)?;
-    /// cache.find_by_host("192.168.0.108", 5000)?;
+    /// cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
+    /// cache.find_by_host("192.168.0.108", Duration::from_secs(5))?;
     ///
     /// // Clear all cached sources
     /// cache.clear();
@@ -906,12 +969,13 @@ impl SourceCache {
     ///
     /// ```no_run
     /// use grafton_ndi::SourceCache;
+    /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let cache = SourceCache::new()?;
     /// assert_eq!(cache.len(), 0);
     ///
-    /// cache.find_by_host("192.168.0.107", 5000)?;
+    /// cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
     /// assert_eq!(cache.len(), 1);
     /// # Ok(())
     /// # }
@@ -927,12 +991,13 @@ impl SourceCache {
     ///
     /// ```no_run
     /// use grafton_ndi::SourceCache;
+    /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let cache = SourceCache::new()?;
     /// assert!(cache.is_empty());
     ///
-    /// cache.find_by_host("192.168.0.107", 5000)?;
+    /// cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
     /// assert!(!cache.is_empty());
     /// # Ok(())
     /// # }

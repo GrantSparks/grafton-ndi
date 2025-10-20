@@ -7,7 +7,7 @@
 //!
 //! IMPORTANT: This example demonstrates:
 //!
-//! 1. Using `capture_video_blocking()` for reliable frame capture with
+//! 1. Using `capture_video()` for reliable frame capture with
 //!    automatic retry logic (handles NDI SDK timeout quirks internally)
 //! 2. Stride validation - Prevents corrupted images when stride != width * 4
 //! 3. Format verification - Ensures we actually get RGBA/RGBX format
@@ -22,10 +22,14 @@
 //! - Both: `cargo run --example NDIlib_Recv_PNG -- 192.168.0.100 --output MyImage.png`
 
 use grafton_ndi::{
-    Error, Finder, FinderOptions, FourCCVideoType, ReceiverColorFormat, ReceiverOptions, NDI,
+    Error, Finder, FinderOptions, PixelFormat, Receiver, ReceiverColorFormat, ReceiverOptions, NDI,
 };
 
-use std::{env, fs::File, time::Instant};
+use std::{
+    env,
+    fs::File,
+    time::{Duration, Instant},
+};
 
 fn main() -> Result<(), Error> {
     let args: Vec<String> = env::args().collect();
@@ -71,8 +75,8 @@ fn main() -> Result<(), Error> {
 
     println!("Looking for sources ...");
     let sources = loop {
-        finder.wait_for_sources(1000);
-        let sources = finder.get_sources(0)?;
+        finder.wait_for_sources(Duration::from_secs(1))?;
+        let sources = finder.sources(Duration::ZERO)?;
         if !sources.is_empty() {
             let count = sources.len();
             println!("Found {count} source(s):");
@@ -86,15 +90,16 @@ fn main() -> Result<(), Error> {
 
     let first_source = &sources[0];
     println!("\nCreating receiver for: {first_source}");
-    let receiver = ReceiverOptions::builder(sources[0].clone())
+    let options = ReceiverOptions::builder(sources[0].clone())
         .color(ReceiverColorFormat::RGBX_RGBA)
-        .build(&ndi)?;
+        .build();
+    let receiver = Receiver::new(&ndi, &options)?;
 
     println!("Receiver created successfully");
     println!("Waiting for video frames...\n");
 
     let start_time = Instant::now();
-    let video_frame = receiver.capture_video_blocking(60_000)?;
+    let video_frame = receiver.capture_video(Duration::from_secs(60))?;
 
     let elapsed = start_time.elapsed();
     println!("Frame received after {elapsed:?}");
@@ -103,7 +108,7 @@ fn main() -> Result<(), Error> {
     let width = video_frame.width;
     let height = video_frame.height;
     println!("  Resolution: {width}x{height}");
-    let fourcc = video_frame.fourcc;
+    let fourcc = video_frame.pixel_format;
     println!("  Format: {fourcc:?}");
     let line_stride = match video_frame.line_stride_or_size {
         grafton_ndi::LineStrideOrSize::LineStrideBytes(stride) => stride,
@@ -123,12 +128,12 @@ fn main() -> Result<(), Error> {
     let timecode = video_frame.timecode;
     println!("  Timecode: {timecode:016x}");
 
-    match video_frame.fourcc {
-        FourCCVideoType::RGBA | FourCCVideoType::RGBX => {
+    match video_frame.pixel_format {
+        PixelFormat::RGBA | PixelFormat::RGBX => {
             println!("  ✓ Got requested RGBA/RGBX format");
         }
         _ => {
-            let format = video_frame.fourcc;
+            let format = video_frame.pixel_format;
             eprintln!("  ⚠ Warning: Got unexpected format {format:?}, PNG may fail");
         }
     }

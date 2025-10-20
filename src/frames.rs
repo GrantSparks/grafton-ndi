@@ -16,20 +16,31 @@ use crate::{ndi_lib::*, Error, Result};
 /// These represent the various pixel formats supported by NDI for video frames.
 /// The most common formats are BGRA/RGBA for full quality and UYVY for bandwidth-efficient streaming.
 ///
+/// This enum is marked `#[non_exhaustive]` to allow future NDI SDK versions to add new formats
+/// without breaking existing code. Always use a wildcard pattern when matching.
+///
 /// # Examples
 ///
 /// ```
-/// use grafton_ndi::FourCCVideoType;
+/// use grafton_ndi::PixelFormat;
 ///
 /// // For maximum compatibility and quality
-/// let format = FourCCVideoType::BGRA;
+/// let format = PixelFormat::BGRA;
 ///
 /// // For bandwidth-efficient streaming
-/// let format = FourCCVideoType::UYVY;
+/// let format = PixelFormat::UYVY;
+///
+/// // When matching, always include a wildcard for forward compatibility
+/// match format {
+///     PixelFormat::BGRA | PixelFormat::RGBA => println!("Full quality RGB"),
+///     PixelFormat::UYVY => println!("Compressed YUV"),
+///     _ => println!("Other format"),
+/// }
 /// ```
 #[derive(Debug, TryFromPrimitive, IntoPrimitive, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 #[repr(u32)]
-pub enum FourCCVideoType {
+pub enum PixelFormat {
     /// YCbCr 4:2:2 format (16 bits per pixel) - bandwidth efficient.
     UYVY = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY as _,
     /// YCbCr 4:2:2 with alpha channel (24 bits per pixel).
@@ -52,28 +63,53 @@ pub enum FourCCVideoType {
     RGBA = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBA as _,
     /// Red-Green-Blue with padding (32 bits per pixel).
     RGBX = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBX as _,
-    Max = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_max as _,
 }
 
-impl From<FourCCVideoType> for i32 {
-    fn from(value: FourCCVideoType) -> Self {
+impl From<PixelFormat> for i32 {
+    fn from(value: PixelFormat) -> Self {
         let u32_value: u32 = value.into();
         u32_value as i32
     }
 }
 
-#[derive(Debug, TryFromPrimitive, IntoPrimitive, Clone, Copy)]
+/// Video scan type (progressive, interlaced, or field-based).
+///
+/// This enum describes how video frames are scanned/displayed.
+/// Most modern content uses Progressive, while legacy broadcast may use Interlaced or field-based formats.
+///
+/// This enum is marked `#[non_exhaustive]` to allow future NDI SDK versions to add new scan types
+/// without breaking existing code. Always use a wildcard pattern when matching.
+///
+/// # Examples
+///
+/// ```
+/// use grafton_ndi::ScanType;
+///
+/// let scan = ScanType::Progressive;
+///
+/// // When matching, always include a wildcard for forward compatibility
+/// match scan {
+///     ScanType::Progressive => println!("Progressive scan"),
+///     ScanType::Interlaced => println!("Interlaced"),
+///     _ => println!("Field-based or other"),
+/// }
+/// ```
+#[derive(Debug, TryFromPrimitive, IntoPrimitive, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 #[repr(u32)]
-pub enum FrameFormatType {
+pub enum ScanType {
+    /// Progressive scan - full frames rendered sequentially.
     Progressive = NDIlib_frame_format_type_e_NDIlib_frame_format_type_progressive as _,
+    /// Interlaced scan - alternating even/odd lines.
     Interlaced = NDIlib_frame_format_type_e_NDIlib_frame_format_type_interleaved as _,
+    /// Field 0 only (first field of interlaced content).
     Field0 = NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_0 as _,
+    /// Field 1 only (second field of interlaced content).
     Field1 = NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_1 as _,
-    Max = NDIlib_frame_format_type_e_NDIlib_frame_format_type_max as _,
 }
 
-impl From<FrameFormatType> for i32 {
-    fn from(value: FrameFormatType) -> Self {
+impl From<ScanType> for i32 {
+    fn from(value: ScanType) -> Self {
         let u32_value: u32 = value.into();
         u32_value as i32
     }
@@ -115,11 +151,11 @@ impl From<LineStrideOrSize> for NDIlib_video_frame_v2_t__bindgen_ty_1 {
 pub struct VideoFrame {
     pub width: i32,
     pub height: i32,
-    pub fourcc: FourCCVideoType,
+    pub pixel_format: PixelFormat,
     pub frame_rate_n: i32,
     pub frame_rate_d: i32,
     pub picture_aspect_ratio: f32,
-    pub frame_format_type: FrameFormatType,
+    pub scan_type: ScanType,
     pub timecode: i64,
     pub data: Vec<u8>,
     pub line_stride_or_size: LineStrideOrSize,
@@ -132,11 +168,11 @@ impl fmt::Debug for VideoFrame {
         f.debug_struct("VideoFrame")
             .field("width", &self.width)
             .field("height", &self.height)
-            .field("fourcc", &self.fourcc)
+            .field("pixel_format", &self.pixel_format)
             .field("frame_rate_n", &self.frame_rate_n)
             .field("frame_rate_d", &self.frame_rate_d)
             .field("picture_aspect_ratio", &self.picture_aspect_ratio)
-            .field("frame_format_type", &self.frame_format_type)
+            .field("scan_type", &self.scan_type)
             .field("timecode", &self.timecode)
             .field("data (bytes)", &self.data.len())
             .field("line_stride_or_size", &self.line_stride_or_size)
@@ -150,10 +186,10 @@ impl Default for VideoFrame {
     fn default() -> Self {
         VideoFrame::builder()
             .resolution(1920, 1080)
-            .fourcc(FourCCVideoType::BGRA)
+            .pixel_format(PixelFormat::BGRA)
             .frame_rate(60, 1)
             .aspect_ratio(16.0 / 9.0)
-            .format(FrameFormatType::Interlaced)
+            .scan_type(ScanType::Interlaced)
             .build()
             .expect("Default VideoFrame should always succeed")
     }
@@ -164,11 +200,11 @@ impl VideoFrame {
         NDIlib_video_frame_v2_t {
             xres: self.width,
             yres: self.height,
-            FourCC: self.fourcc.into(),
+            FourCC: self.pixel_format.into(),
             frame_rate_N: self.frame_rate_n,
             frame_rate_D: self.frame_rate_d,
             picture_aspect_ratio: self.picture_aspect_ratio,
-            frame_format_type: self.frame_format_type.into(),
+            frame_format_type: self.scan_type.into(),
             timecode: self.timecode,
             p_data: self.data.as_ptr() as *mut u8,
             __bindgen_anon_1: self.line_stride_or_size.into(),
@@ -207,16 +243,18 @@ impl VideoFrame {
     /// # Example
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptions, ReceiverColorFormat};
+    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptions, Receiver, ReceiverColorFormat};
+    /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.wait_for_sources(1000);
-    /// # let sources = finder.get_sources(0)?;
-    /// # let receiver = ReceiverOptions::builder(sources[0].clone())
+    /// # finder.wait_for_sources(Duration::from_millis(1000))?;
+    /// # let sources = finder.sources(Duration::ZERO)?;
+    /// # let options = ReceiverOptions::builder(sources[0].clone())
     /// #     .color(ReceiverColorFormat::RGBX_RGBA)
-    /// #     .build(&ndi)?;
-    /// let video_frame = receiver.capture_video_blocking(5000)?;
+    /// #     .build();
+    /// # let receiver = Receiver::new(&ndi, &options)?;
+    /// let video_frame = receiver.capture_video(Duration::from_secs(5))?;
     /// let png_bytes = video_frame.encode_png()?;
     /// std::fs::write("frame.png", &png_bytes)?;
     /// # Ok(())
@@ -227,13 +265,13 @@ impl VideoFrame {
         use png::{BitDepth, ColorType, Encoder};
 
         // Validate format
-        let bytes_per_pixel = match self.fourcc {
-            FourCCVideoType::RGBA | FourCCVideoType::RGBX => 4,
-            FourCCVideoType::BGRA | FourCCVideoType::BGRX => 4,
+        let bytes_per_pixel = match self.pixel_format {
+            PixelFormat::RGBA | PixelFormat::RGBX => 4,
+            PixelFormat::BGRA | PixelFormat::BGRX => 4,
             _ => {
-                let fourcc = self.fourcc;
+                let pixel_format = self.pixel_format;
                 return Err(Error::InvalidFrame(format!(
-                    "Unsupported format for PNG encoding: {fourcc:?}. Only RGBA/RGBX/BGRA/BGRX are supported."
+                    "Unsupported format for PNG encoding: {pixel_format:?}. Only RGBA/RGBX/BGRA/BGRX are supported."
                 )));
             }
         };
@@ -258,12 +296,12 @@ impl VideoFrame {
         }
 
         // Handle color format conversion if needed
-        let rgba_data: Vec<u8> = match self.fourcc {
-            FourCCVideoType::RGBA | FourCCVideoType::RGBX => {
+        let rgba_data: Vec<u8> = match self.pixel_format {
+            PixelFormat::RGBA | PixelFormat::RGBX => {
                 // Already in correct format, use as-is
                 self.data.to_vec()
             }
-            FourCCVideoType::BGRA | FourCCVideoType::BGRX => {
+            PixelFormat::BGRA | PixelFormat::BGRX => {
                 // Swap R and B channels (BGRA -> RGBA)
                 let mut rgba = self.data.to_vec();
                 for chunk in rgba.chunks_exact_mut(4) {
@@ -313,16 +351,18 @@ impl VideoFrame {
     /// # Example
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptions, ReceiverColorFormat};
+    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptions, Receiver, ReceiverColorFormat};
+    /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.wait_for_sources(1000);
-    /// # let sources = finder.get_sources(0)?;
-    /// # let receiver = ReceiverOptions::builder(sources[0].clone())
+    /// # finder.wait_for_sources(Duration::from_millis(1000))?;
+    /// # let sources = finder.sources(Duration::ZERO)?;
+    /// # let options = ReceiverOptions::builder(sources[0].clone())
     /// #     .color(ReceiverColorFormat::RGBX_RGBA)
-    /// #     .build(&ndi)?;
-    /// let video_frame = receiver.capture_video_blocking(5000)?;
+    /// #     .build();
+    /// # let receiver = Receiver::new(&ndi, &options)?;
+    /// let video_frame = receiver.capture_video(Duration::from_secs(5))?;
     /// let jpeg_bytes = video_frame.encode_jpeg(85)?;
     /// std::fs::write("frame.jpg", &jpeg_bytes)?;
     /// # Ok(())
@@ -333,13 +373,13 @@ impl VideoFrame {
         use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
 
         // Validate format
-        let bytes_per_pixel = match self.fourcc {
-            FourCCVideoType::RGBA | FourCCVideoType::RGBX => 4,
-            FourCCVideoType::BGRA | FourCCVideoType::BGRX => 4,
+        let bytes_per_pixel = match self.pixel_format {
+            PixelFormat::RGBA | PixelFormat::RGBX => 4,
+            PixelFormat::BGRA | PixelFormat::BGRX => 4,
             _ => {
-                let fourcc = self.fourcc;
+                let pixel_format = self.pixel_format;
                 return Err(Error::InvalidFrame(format!(
-                    "Unsupported format for JPEG encoding: {fourcc:?}. Only RGBA/RGBX/BGRA/BGRX are supported."
+                    "Unsupported format for JPEG encoding: {pixel_format:?}. Only RGBA/RGBX/BGRA/BGRX are supported."
                 )));
             }
         };
@@ -364,15 +404,15 @@ impl VideoFrame {
         }
 
         // Convert to RGB (JPEG doesn't support alpha channel)
-        let rgb_data: Vec<u8> = match self.fourcc {
-            FourCCVideoType::RGBA | FourCCVideoType::RGBX => {
+        let rgb_data: Vec<u8> = match self.pixel_format {
+            PixelFormat::RGBA | PixelFormat::RGBX => {
                 // Strip alpha channel: RGBA -> RGB
                 self.data
                     .chunks_exact(4)
                     .flat_map(|chunk| [chunk[0], chunk[1], chunk[2]])
                     .collect()
             }
-            FourCCVideoType::BGRA | FourCCVideoType::BGRX => {
+            PixelFormat::BGRA | PixelFormat::BGRX => {
                 // Swap R/B and strip alpha: BGRA -> RGB
                 self.data
                     .chunks_exact(4)
@@ -410,16 +450,18 @@ impl VideoFrame {
     /// # Example
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptions, ReceiverColorFormat, ImageFormat};
+    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptions, Receiver, ReceiverColorFormat, ImageFormat};
+    /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.wait_for_sources(1000);
-    /// # let sources = finder.get_sources(0)?;
-    /// # let receiver = ReceiverOptions::builder(sources[0].clone())
+    /// # finder.wait_for_sources(Duration::from_millis(1000))?;
+    /// # let sources = finder.sources(Duration::ZERO)?;
+    /// # let options = ReceiverOptions::builder(sources[0].clone())
     /// #     .color(ReceiverColorFormat::RGBX_RGBA)
-    /// #     .build(&ndi)?;
-    /// let video_frame = receiver.capture_video_blocking(5000)?;
+    /// #     .build();
+    /// # let receiver = Receiver::new(&ndi, &options)?;
+    /// let video_frame = receiver.capture_video(Duration::from_secs(5))?;
     ///
     /// // As PNG
     /// let data_url = video_frame.encode_data_url(ImageFormat::Png)?;
@@ -457,14 +499,18 @@ impl VideoFrame {
         }
 
         #[allow(clippy::unnecessary_cast)] // Required for Windows where FourCC is i32
-        let fourcc =
-            FourCCVideoType::try_from(c_frame.FourCC as u32).unwrap_or(FourCCVideoType::Max);
+        let pixel_format = PixelFormat::try_from(c_frame.FourCC as u32).map_err(|_| {
+            Error::InvalidFrame(format!(
+                "Unknown pixel format FourCC: 0x{:08X}",
+                c_frame.FourCC
+            ))
+        })?;
 
         // Determine data size and LineStrideOrSize based on format.
         // The NDI SDK uses a union here: line_stride_in_bytes for uncompressed formats,
         // data_size_in_bytes for compressed formats.
         // We read ONLY the appropriate field based on the format to avoid UB.
-        let is_uncompressed = is_uncompressed_format(fourcc);
+        let is_uncompressed = is_uncompressed_format(pixel_format);
 
         let (data_size, line_stride_or_size) = if is_uncompressed {
             // Uncompressed format: read ONLY line_stride_in_bytes
@@ -518,16 +564,22 @@ impl VideoFrame {
             Some(CString::from(CStr::from_ptr(c_frame.p_metadata)))
         };
 
+        #[allow(clippy::unnecessary_cast)] // Required for Windows where frame_format_type is i32
+        let scan_type = ScanType::try_from(c_frame.frame_format_type as u32).map_err(|_| {
+            Error::InvalidFrame(format!(
+                "Unknown scan type: 0x{:08X}",
+                c_frame.frame_format_type
+            ))
+        })?;
+
         Ok(VideoFrame {
             width: c_frame.xres,
             height: c_frame.yres,
-            fourcc,
+            pixel_format,
             frame_rate_n: c_frame.frame_rate_N,
             frame_rate_d: c_frame.frame_rate_D,
             picture_aspect_ratio: c_frame.picture_aspect_ratio,
-            #[allow(clippy::unnecessary_cast)] // Required for Windows where frame_format_type is i32
-            frame_format_type: FrameFormatType::try_from(c_frame.frame_format_type as u32)
-                .unwrap_or(FrameFormatType::Max),
+            scan_type,
             timecode: c_frame.timecode,
             data,
             line_stride_or_size,
@@ -547,11 +599,11 @@ impl VideoFrame {
 pub struct VideoFrameBuilder {
     width: Option<i32>,
     height: Option<i32>,
-    fourcc: Option<FourCCVideoType>,
+    pixel_format: Option<PixelFormat>,
     frame_rate_n: Option<i32>,
     frame_rate_d: Option<i32>,
     picture_aspect_ratio: Option<f32>,
-    frame_format_type: Option<FrameFormatType>,
+    scan_type: Option<ScanType>,
     timecode: Option<i64>,
     metadata: Option<String>,
     timestamp: Option<i64>,
@@ -563,11 +615,11 @@ impl VideoFrameBuilder {
         Self {
             width: None,
             height: None,
-            fourcc: None,
+            pixel_format: None,
             frame_rate_n: None,
             frame_rate_d: None,
             picture_aspect_ratio: None,
-            frame_format_type: None,
+            scan_type: None,
             timecode: None,
             metadata: None,
             timestamp: None,
@@ -584,8 +636,8 @@ impl VideoFrameBuilder {
 
     /// Set the pixel format
     #[must_use]
-    pub fn fourcc(mut self, fourcc: FourCCVideoType) -> Self {
-        self.fourcc = Some(fourcc);
+    pub fn pixel_format(mut self, pixel_format: PixelFormat) -> Self {
+        self.pixel_format = Some(pixel_format);
         self
     }
 
@@ -604,10 +656,10 @@ impl VideoFrameBuilder {
         self
     }
 
-    /// Set the frame format type (progressive, interlaced, etc.)
+    /// Set the scan type (progressive, interlaced, etc.)
     #[must_use]
-    pub fn format(mut self, format: FrameFormatType) -> Self {
-        self.frame_format_type = Some(format);
+    pub fn scan_type(mut self, scan_type: ScanType) -> Self {
+        self.scan_type = Some(scan_type);
         self
     }
 
@@ -636,27 +688,25 @@ impl VideoFrameBuilder {
     pub fn build(self) -> Result<VideoFrame> {
         let width = self.width.unwrap_or(1920);
         let height = self.height.unwrap_or(1080);
-        let fourcc = self.fourcc.unwrap_or(FourCCVideoType::BGRA);
+        let pixel_format = self.pixel_format.unwrap_or(PixelFormat::BGRA);
         let frame_rate_n = self.frame_rate_n.unwrap_or(60);
         let frame_rate_d = self.frame_rate_d.unwrap_or(1);
         let picture_aspect_ratio = self.picture_aspect_ratio.unwrap_or(16.0 / 9.0);
-        let frame_format_type = self
-            .frame_format_type
-            .unwrap_or(FrameFormatType::Progressive);
+        let scan_type = self.scan_type.unwrap_or(ScanType::Progressive);
 
         // Calculate stride and buffer size
-        let stride = calculate_line_stride(fourcc, width);
-        let buffer_size = calculate_buffer_size(fourcc, width, height);
+        let stride = calculate_line_stride(pixel_format, width);
+        let buffer_size = calculate_buffer_size(pixel_format, width, height);
         let data = vec![0u8; buffer_size];
 
         let mut frame = VideoFrame {
             width,
             height,
-            fourcc,
+            pixel_format,
             frame_rate_n,
             frame_rate_d,
             picture_aspect_ratio,
-            frame_format_type,
+            scan_type,
             timecode: self.timecode.unwrap_or(0),
             data: (data),
             line_stride_or_size: LineStrideOrSize::LineStrideBytes(stride),
@@ -691,7 +741,7 @@ pub struct AudioFrame {
     pub num_channels: i32,
     pub num_samples: i32,
     pub timecode: i64,
-    pub fourcc: AudioType,
+    pub format: AudioFormat,
     data: Vec<f32>,
     pub channel_stride_in_bytes: i32,
     pub metadata: Option<CString>,
@@ -705,7 +755,7 @@ impl AudioFrame {
             no_channels: self.num_channels,
             no_samples: self.num_samples,
             timecode: self.timecode,
-            FourCC: self.fourcc.into(),
+            FourCC: self.format.into(),
             p_data: self.data.as_ptr() as *mut f32 as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: self.channel_stride_in_bytes,
@@ -762,15 +812,22 @@ impl AudioFrame {
             Some(unsafe { CString::from(CStr::from_ptr(raw.p_metadata)) })
         };
 
+        let format = match raw.FourCC {
+            NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP => AudioFormat::FLTP,
+            _ => {
+                return Err(Error::InvalidFrame(format!(
+                    "Unknown audio format FourCC: 0x{:08X}",
+                    raw.FourCC
+                )))
+            }
+        };
+
         Ok(AudioFrame {
             sample_rate: raw.sample_rate,
             num_channels: raw.no_channels,
             num_samples: raw.no_samples,
             timecode: raw.timecode,
-            fourcc: match raw.FourCC {
-                NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP => AudioType::FLTP,
-                _ => AudioType::Max,
-            },
+            format,
             data,
             channel_stride_in_bytes: unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes },
             metadata,
@@ -829,7 +886,7 @@ pub struct AudioFrameBuilder {
     num_channels: Option<i32>,
     num_samples: Option<i32>,
     timecode: Option<i64>,
-    fourcc: Option<AudioType>,
+    format: Option<AudioFormat>,
     data: Option<Vec<f32>>,
     layout: Option<AudioLayout>,
     metadata: Option<String>,
@@ -844,7 +901,7 @@ impl AudioFrameBuilder {
             num_channels: None,
             num_samples: None,
             timecode: None,
-            fourcc: None,
+            format: None,
             data: None,
             layout: None,
             metadata: None,
@@ -882,8 +939,8 @@ impl AudioFrameBuilder {
 
     /// Set the audio format
     #[must_use]
-    pub fn format(mut self, format: AudioType) -> Self {
-        self.fourcc = Some(format);
+    pub fn format(mut self, format: AudioFormat) -> Self {
+        self.format = Some(format);
         self
     }
 
@@ -946,7 +1003,7 @@ impl AudioFrameBuilder {
         let sample_rate = self.sample_rate.unwrap_or(48000);
         let num_channels = self.num_channels.unwrap_or(2);
         let num_samples = self.num_samples.unwrap_or(1024);
-        let fourcc = self.fourcc.unwrap_or(AudioType::FLTP);
+        let format = self.format.unwrap_or(AudioFormat::FLTP);
         let layout = self.layout.unwrap_or(AudioLayout::Planar);
 
         let data = if let Some(data) = self.data {
@@ -975,7 +1032,7 @@ impl AudioFrameBuilder {
             num_channels,
             num_samples,
             timecode: self.timecode.unwrap_or(0),
-            fourcc,
+            format,
             data,
             channel_stride_in_bytes,
             metadata: metadata_cstring,
@@ -1005,11 +1062,32 @@ impl Drop for AudioFrame {
     }
 }
 
+/// Audio format identifiers (FourCC codes).
+///
+/// Currently NDI primarily uses `FLTP` (32-bit floating point planar format).
+///
+/// This enum is marked `#[non_exhaustive]` to allow future NDI SDK versions to add new audio formats
+/// without breaking existing code. Always use a wildcard pattern when matching.
+///
+/// # Examples
+///
+/// ```
+/// use grafton_ndi::AudioFormat;
+///
+/// let format = AudioFormat::FLTP;
+///
+/// // When matching, always include a wildcard for forward compatibility
+/// match format {
+///     AudioFormat::FLTP => println!("32-bit float planar"),
+///     _ => println!("Other format"),
+/// }
+/// ```
 #[derive(Debug, TryFromPrimitive, IntoPrimitive, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 #[repr(u32)]
-pub enum AudioType {
+pub enum AudioFormat {
+    /// 32-bit floating point planar audio (FLTP).
     FLTP = NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP as _,
-    Max = NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_max as _,
 }
 
 /// Audio data layout format
@@ -1034,63 +1112,57 @@ pub enum AudioLayout {
     Interleaved,
 }
 
-impl From<AudioType> for i32 {
-    fn from(value: AudioType) -> Self {
+impl From<AudioFormat> for i32 {
+    fn from(value: AudioFormat) -> Self {
         let u32_value: u32 = value.into();
         u32_value as i32
     }
 }
 
 /// Calculate the line stride (bytes per row) for a given video format
-pub(crate) fn calculate_line_stride(fourcc: FourCCVideoType, width: i32) -> i32 {
+pub(crate) fn calculate_line_stride(fourcc: PixelFormat, width: i32) -> i32 {
     match fourcc {
-        FourCCVideoType::BGRA
-        | FourCCVideoType::BGRX
-        | FourCCVideoType::RGBA
-        | FourCCVideoType::RGBX => width * 4, // 32 bpp = 4 bytes per pixel
-        FourCCVideoType::UYVY => width * 2, // 16 bpp = 2 bytes per pixel
-        FourCCVideoType::YV12 | FourCCVideoType::I420 | FourCCVideoType::NV12 => width, // Y plane stride for planar formats
-        FourCCVideoType::UYVA => width * 3, // 24 bpp = 3 bytes per pixel
-        FourCCVideoType::P216 | FourCCVideoType::PA16 => width * 4, // 32 bpp = 4 bytes per pixel
-        _ => width * 4,                     // Default to 32 bpp
+        PixelFormat::BGRA | PixelFormat::BGRX | PixelFormat::RGBA | PixelFormat::RGBX => width * 4, // 32 bpp = 4 bytes per pixel
+        PixelFormat::UYVY => width * 2, // 16 bpp = 2 bytes per pixel
+        PixelFormat::YV12 | PixelFormat::I420 | PixelFormat::NV12 => width, // Y plane stride for planar formats
+        PixelFormat::UYVA => width * 3, // 24 bpp = 3 bytes per pixel
+        PixelFormat::P216 | PixelFormat::PA16 => width * 4, // 32 bpp = 4 bytes per pixel
     }
 }
 
 /// Calculate the total buffer size needed for a video frame
-fn calculate_buffer_size(fourcc: FourCCVideoType, width: i32, height: i32) -> usize {
+fn calculate_buffer_size(fourcc: PixelFormat, width: i32, height: i32) -> usize {
     match fourcc {
-        FourCCVideoType::BGRA
-        | FourCCVideoType::BGRX
-        | FourCCVideoType::RGBA
-        | FourCCVideoType::RGBX => (height * width * 4) as usize, // 32 bpp
-        FourCCVideoType::UYVY => (height * width * 2) as usize, // 16 bpp
-        FourCCVideoType::YV12 | FourCCVideoType::I420 | FourCCVideoType::NV12 => {
+        PixelFormat::BGRA | PixelFormat::BGRX | PixelFormat::RGBA | PixelFormat::RGBX => {
+            (height * width * 4) as usize
+        } // 32 bpp
+        PixelFormat::UYVY => (height * width * 2) as usize, // 16 bpp
+        PixelFormat::YV12 | PixelFormat::I420 | PixelFormat::NV12 => {
             // Planar 4:2:0 formats: Y plane is full res, U/V planes are quarter size
             let y_size = (width * height) as usize;
             let uv_size = ((width / 2) * (height / 2)) as usize;
             y_size + 2 * uv_size
         }
-        FourCCVideoType::UYVA => (height * width * 3) as usize, // 24 bpp
-        FourCCVideoType::P216 | FourCCVideoType::PA16 => (height * width * 4) as usize, // 32 bpp
-        _ => (height * width * 4) as usize,                     // Default to 32 bpp
+        PixelFormat::UYVA => (height * width * 3) as usize, // 24 bpp
+        PixelFormat::P216 | PixelFormat::PA16 => (height * width * 4) as usize, // 32 bpp
     }
 }
 
 /// Check if a video format is uncompressed
-pub(crate) fn is_uncompressed_format(fourcc: FourCCVideoType) -> bool {
+pub(crate) fn is_uncompressed_format(fourcc: PixelFormat) -> bool {
     matches!(
         fourcc,
-        FourCCVideoType::BGRA
-            | FourCCVideoType::BGRX
-            | FourCCVideoType::RGBA
-            | FourCCVideoType::RGBX
-            | FourCCVideoType::UYVY
-            | FourCCVideoType::UYVA
-            | FourCCVideoType::YV12
-            | FourCCVideoType::I420
-            | FourCCVideoType::NV12
-            | FourCCVideoType::P216
-            | FourCCVideoType::PA16
+        PixelFormat::BGRA
+            | PixelFormat::BGRX
+            | PixelFormat::RGBA
+            | PixelFormat::RGBX
+            | PixelFormat::UYVY
+            | PixelFormat::UYVA
+            | PixelFormat::YV12
+            | PixelFormat::I420
+            | PixelFormat::NV12
+            | PixelFormat::P216
+            | PixelFormat::PA16
     )
 }
 
@@ -1201,13 +1273,15 @@ use crate::recv_guard::{RecvAudioGuard, RecvMetadataGuard, RecvVideoGuard};
 /// # Examples
 ///
 /// ```no_run
-/// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+/// # use grafton_ndi::{NDI, ReceiverOptions, Receiver, Source, SourceAddress};
+/// # use std::time::Duration;
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// # let ndi = NDI::new()?;
 /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-/// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+/// # let options = ReceiverOptions::builder(source).build();
+/// # let receiver = Receiver::new(&ndi, &options)?;
 /// // Zero-copy capture (no allocation, no memcpy)
-/// if let Some(frame) = receiver.capture_video_ref(1000)? {
+/// if let Some(frame) = receiver.capture_video_ref(Duration::from_millis(1000))? {
 ///     println!("{}×{} frame, {} bytes", frame.width(), frame.height(), frame.data().len());
 ///
 ///     // Process in place - no copy needed
@@ -1222,12 +1296,14 @@ use crate::recv_guard::{RecvAudioGuard, RecvMetadataGuard, RecvVideoGuard};
 /// To convert to an owned frame:
 ///
 /// ```no_run
-/// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+/// # use grafton_ndi::{NDI, ReceiverOptions, Receiver, Source, SourceAddress};
+/// # use std::time::Duration;
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// # let ndi = NDI::new()?;
 /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-/// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
-/// if let Some(frame_ref) = receiver.capture_video_ref(1000)? {
+/// # let options = ReceiverOptions::builder(source).build();
+/// # let receiver = Receiver::new(&ndi, &options)?;
+/// if let Some(frame_ref) = receiver.capture_video_ref(Duration::from_millis(1000))? {
 ///     // Convert to owned for storage or cross-thread use
 ///     let owned = frame_ref.to_owned()?;
 ///     // owned is now a VideoFrame that can be sent across threads
@@ -1261,9 +1337,11 @@ impl VideoFrameRef {
     }
 
     /// Get the pixel format (FourCC code).
-    pub fn fourcc(&self) -> FourCCVideoType {
+    ///
+    /// Returns `PixelFormat::BGRA` as a fallback if the SDK returns an unknown format code.
+    pub fn pixel_format(&self) -> PixelFormat {
         #[allow(clippy::unnecessary_cast)]
-        FourCCVideoType::try_from(self.guard.frame().FourCC as u32).unwrap_or(FourCCVideoType::Max)
+        PixelFormat::try_from(self.guard.frame().FourCC as u32).unwrap_or(PixelFormat::BGRA)
     }
 
     /// Get the frame rate numerator.
@@ -1281,11 +1359,13 @@ impl VideoFrameRef {
         self.guard.frame().picture_aspect_ratio
     }
 
-    /// Get the frame format type (progressive, interlaced, etc.).
-    pub fn frame_format_type(&self) -> FrameFormatType {
+    /// Get the scan type (progressive, interlaced, etc.).
+    ///
+    /// Returns `ScanType::Progressive` as a fallback if the SDK returns an unknown scan type code.
+    pub fn scan_type(&self) -> ScanType {
         #[allow(clippy::unnecessary_cast)]
-        FrameFormatType::try_from(self.guard.frame().frame_format_type as u32)
-            .unwrap_or(FrameFormatType::Max)
+        ScanType::try_from(self.guard.frame().frame_format_type as u32)
+            .unwrap_or(ScanType::Progressive)
     }
 
     /// Get the timecode.
@@ -1300,8 +1380,8 @@ impl VideoFrameRef {
 
     /// Get the line stride or data size.
     pub fn line_stride_or_size(&self) -> LineStrideOrSize {
-        let fourcc = self.fourcc();
-        let is_uncompressed = is_uncompressed_format(fourcc);
+        let pixel_format = self.pixel_format();
+        let is_uncompressed = is_uncompressed_format(pixel_format);
 
         if is_uncompressed {
             let line_stride = unsafe { self.guard.frame().__bindgen_anon_1.line_stride_in_bytes };
@@ -1333,8 +1413,8 @@ impl VideoFrameRef {
             return &[];
         }
 
-        let fourcc = self.fourcc();
-        let is_uncompressed = is_uncompressed_format(fourcc);
+        let pixel_format = self.pixel_format();
+        let is_uncompressed = is_uncompressed_format(pixel_format);
 
         let data_size = if is_uncompressed {
             let line_stride = unsafe { frame.__bindgen_anon_1.line_stride_in_bytes };
@@ -1373,11 +1453,11 @@ impl fmt::Debug for VideoFrameRef {
         f.debug_struct("VideoFrameRef")
             .field("width", &self.width())
             .field("height", &self.height())
-            .field("fourcc", &self.fourcc())
+            .field("pixel_format", &self.pixel_format())
             .field("frame_rate_n", &self.frame_rate_n())
             .field("frame_rate_d", &self.frame_rate_d())
             .field("picture_aspect_ratio", &self.picture_aspect_ratio())
-            .field("frame_format_type", &self.frame_format_type())
+            .field("scan_type", &self.scan_type())
             .field("timecode", &self.timecode())
             .field("data (bytes)", &self.data().len())
             .field("line_stride_or_size", &self.line_stride_or_size())
@@ -1402,13 +1482,15 @@ impl fmt::Debug for VideoFrameRef {
 /// # Examples
 ///
 /// ```no_run
-/// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+/// # use grafton_ndi::{NDI, ReceiverOptions, Receiver, Source, SourceAddress};
+/// # use std::time::Duration;
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// # let ndi = NDI::new()?;
 /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-/// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+/// # let options = ReceiverOptions::builder(source).build();
+/// # let receiver = Receiver::new(&ndi, &options)?;
 /// // Zero-copy capture
-/// if let Some(frame) = receiver.capture_audio_ref(1000)? {
+/// if let Some(frame) = receiver.capture_audio_ref(Duration::from_millis(1000))? {
 ///     println!("{} channels, {} samples", frame.num_channels(), frame.num_samples());
 ///
 ///     // Process in place - no copy needed
@@ -1460,10 +1542,12 @@ impl AudioFrameRef {
     }
 
     /// Get the audio format (FourCC code).
-    pub fn fourcc(&self) -> AudioType {
+    ///
+    /// Returns `AudioFormat::FLTP` as a fallback if the SDK returns an unknown format code.
+    pub fn format(&self) -> AudioFormat {
         match self.guard.frame().FourCC {
-            NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP => AudioType::FLTP,
-            _ => AudioType::Max,
+            NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP => AudioFormat::FLTP,
+            _ => AudioFormat::FLTP,
         }
     }
 
@@ -1517,7 +1601,7 @@ impl fmt::Debug for AudioFrameRef {
             .field("num_channels", &self.num_channels())
             .field("num_samples", &self.num_samples())
             .field("timecode", &self.timecode())
-            .field("fourcc", &self.fourcc())
+            .field("format", &self.format())
             .field("data (samples)", &self.data().len())
             .field("channel_stride_in_bytes", &self.channel_stride_in_bytes())
             .field("metadata", &self.metadata())
@@ -1541,13 +1625,15 @@ impl fmt::Debug for AudioFrameRef {
 /// # Examples
 ///
 /// ```no_run
-/// # use grafton_ndi::{NDI, ReceiverOptions, Source, SourceAddress};
+/// # use grafton_ndi::{NDI, ReceiverOptions, Receiver, Source, SourceAddress};
+/// # use std::time::Duration;
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// # let ndi = NDI::new()?;
 /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-/// # let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+/// # let options = ReceiverOptions::builder(source).build();
+/// # let receiver = Receiver::new(&ndi, &options)?;
 /// // Zero-copy capture
-/// if let Some(frame) = receiver.capture_metadata_ref(1000)? {
+/// if let Some(frame) = receiver.capture_metadata_ref(Duration::from_millis(1000))? {
 ///     println!("Metadata: {}", frame.data().to_string_lossy());
 ///
 ///     // Frame is freed here when `frame` goes out of scope

@@ -1,6 +1,6 @@
 use std::{sync::Arc, thread, time::Duration};
 
-use grafton_ndi::{ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions, NDI};
+use grafton_ndi::{Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions, NDI};
 
 fn main() -> Result<(), grafton_ndi::Error> {
     // Initialize NDI
@@ -14,13 +14,13 @@ fn main() -> Result<(), grafton_ndi::Error> {
 
     // Wait for sources
     println!("Looking for NDI sources...");
-    if !finder.wait_for_sources(5000) {
+    if !finder.wait_for_sources(Duration::from_secs(5))? {
         println!("No sources found after 5 seconds");
         return Ok(());
     }
 
     // Get available sources
-    let sources = finder.get_sources(0)?;
+    let sources = finder.sources(Duration::ZERO)?;
     if sources.is_empty() {
         println!("No NDI sources found on the network");
         return Ok(());
@@ -37,12 +37,13 @@ fn main() -> Result<(), grafton_ndi::Error> {
     println!("\nConnecting to: {source}");
 
     // Create receiver
-    let receiver = ReceiverOptions::builder(source)
+    let options = ReceiverOptions::builder(source)
         .color(ReceiverColorFormat::BGRX_BGRA)
         .bandwidth(ReceiverBandwidth::Highest)
         .allow_video_fields(true)
         .name("Concurrent Capture Example")
-        .build(&ndi)?;
+        .build();
+    let receiver = Receiver::new(&ndi, &options)?;
 
     // Wrap receiver in Arc for sharing between threads
     let receiver = Arc::new(receiver);
@@ -56,7 +57,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
             let mut frame_count = 0;
 
             for _ in 0..10 {
-                match recv_video.capture_video(5000) {
+                match recv_video.capture_video_timeout(Duration::from_secs(5)) {
                     Ok(Some(frame)) => {
                         frame_count += 1;
                         let width = frame.width;
@@ -88,7 +89,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
             let mut sample_count = 0;
 
             for _ in 0..10 {
-                match recv_audio.capture_audio(5000) {
+                match recv_audio.capture_audio_timeout(Duration::from_secs(5)) {
                     Ok(Some(frame)) => {
                         sample_count += frame.num_samples;
                         let num_samples = frame.num_samples;
@@ -119,7 +120,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
             let mut metadata_count = 0;
 
             for _ in 0..20 {
-                match recv_metadata.capture_metadata(2500) {
+                match recv_metadata.capture_metadata_timeout(Duration::from_millis(2500)) {
                     Ok(Some(frame)) => {
                         metadata_count += 1;
                         let data_len = frame.data.len();

@@ -27,23 +27,23 @@ High-performance, idiomatic Rust bindings for the [NDI® 6 SDK](https://ndi.vide
 
 ```rust
 use grafton_ndi::{NDI, FinderOptions, Finder};
+use std::time::Duration;
 
 fn main() -> Result<(), grafton_ndi::Error> {
     // Initialize NDI
     let ndi = NDI::new()?;
-    
+
     // Find sources on the network
     let finder_options = FinderOptions::builder().show_local_sources(true).build();
     let finder = Finder::new(&ndi, &finder_options)?;
-    
-    // Wait for sources
-    finder.wait_for_sources(5000);
-    let sources = finder.get_sources(5000)?;
-    
+
+    // Discover sources
+    let sources = finder.find_sources(Duration::from_secs(5))?;
+
     for source in sources {
         println!("Found source: {}", source);
     }
-    
+
     Ok(())
 }
 ```
@@ -118,25 +118,32 @@ let finder = Finder::new(&ndi, &finder_options)?;
 Receives video, audio, and metadata from NDI sources.
 
 ```rust
-// Assuming source is from Finder::get_sources()
-let receiver = ReceiverOptions::builder(source)
+use std::time::Duration;
+
+// Assuming source is from finder.find_sources()
+let options = ReceiverOptions::builder(source)
     .color(ReceiverColorFormat::UYVY_BGRA)
     .bandwidth(ReceiverBandwidth::Highest)
-    .build(&ndi)?;
+    .build();
+let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
+
+// Capture a video frame (blocks until success or timeout)
+let frame = receiver.capture_video(Duration::from_secs(5))?;
 ```
 
 ### `Sender` - Video/Audio Transmission
 Sends video, audio, and metadata as an NDI source.
 
 ```rust
-let sender = Sender::new(&ndi, &SenderOptions::builder("Source Name")
+let options = SenderOptions::builder("Source Name")
     .clock_video(true)
-    .build()?)?);
+    .build();
+let sender = grafton_ndi::Sender::new(&ndi, &options)?;
 ```
 
 ### Frame Types
 - `VideoFrame` - Video frame data with resolution, format, and timing
-- `AudioFrame` - 32-bit float audio samples with channel configuration  
+- `AudioFrame` - 32-bit float audio samples with channel configuration
 - `MetadataFrame` - XML metadata for tally, PTZ, and custom data
 
 ## Thread Safety
@@ -153,22 +160,25 @@ All primary types (`Finder`, `Receiver`, `Sender`) are `Send + Sync` as the unde
 ### Receiver Status Monitoring
 
 ```rust
-use grafton_ndi::{NDI, ReceiverOptions, RecvStatus};
+use grafton_ndi::{NDI, ReceiverOptions, Receiver};
+use std::time::Duration;
 
 // Assuming you already have a source from discovery
-let receiver = ReceiverOptions::builder(source).build(&ndi)?;
+let options = ReceiverOptions::builder(source).build();
+let receiver = Receiver::new(&ndi, &options)?;
 
-// Get current connection status
-let status: RecvStatus = receiver.get_status();
-println!("Connected: {}", status.is_connected);
-println!("Video frames: {}", status.video_frames);
-println!("Audio frames: {}", status.audio_frames);
+// Poll for status changes
+if let Some(status) = receiver.poll_status_change(Duration::from_millis(100)) {
+    println!("Connected: {}", status.is_connected);
+    println!("Video frames: {}", status.video_frames);
+    println!("Audio frames: {}", status.audio_frames);
 
-// Monitor receiver performance
-if status.total_frames > 0 {
-    let drop_rate = status.dropped_frames as f32 / status.total_frames as f32;
-    if drop_rate > 0.01 {
-        eprintln!("High drop rate: {:.1}%", drop_rate * 100.0);
+    // Monitor receiver performance
+    if status.total_frames > 0 {
+        let drop_rate = status.dropped_frames as f32 / status.total_frames as f32;
+        if drop_rate > 0.01 {
+            eprintln!("High drop rate: {:.1}%", drop_rate * 100.0);
+        }
     }
 }
 ```
@@ -219,7 +229,7 @@ Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for detai
 
 This is an unofficial community project and is not affiliated with NewTek or Vizrt.
 
-NDI® is a registered trademark of Vizrt NDI AB. 
+NDI® is a registered trademark of Vizrt NDI AB.
 
 ## What's New in 0.9
 

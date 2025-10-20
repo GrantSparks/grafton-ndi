@@ -8,6 +8,7 @@
 //!
 //! ```no_run
 //! use grafton_ndi::{NDI, FinderOptions, Finder};
+//! use std::time::Duration;
 //!
 //! # fn main() -> Result<(), grafton_ndi::Error> {
 //! // Initialize the NDI runtime
@@ -18,8 +19,7 @@
 //! let finder = Finder::new(&ndi, &options)?;
 //!
 //! // Discover sources
-//! finder.wait_for_sources(5000);
-//! let sources = finder.get_sources(0)?;
+//! let sources = finder.find_sources(Duration::from_secs(5))?;
 //!
 //! for source in sources {
 //!     println!("Found: {}", source);
@@ -63,14 +63,14 @@
 //! The completion callback notifies when the buffer can be reused:
 //!
 //! ```no_run
-//! # use grafton_ndi::{NDI, SenderOptions, BorrowedVideoFrame, FourCCVideoType};
+//! # use grafton_ndi::{NDI, SenderOptions, BorrowedVideoFrame, PixelFormat};
 //! # let ndi = NDI::new().unwrap();
-//! # let mut sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build().unwrap()).unwrap();
+//! # let mut sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build()).unwrap();
 //! // Register callback to know when buffer is released
 //! sender.on_async_video_done(|len| println!("Buffer released: {} bytes", len));
 //!
 //! let buffer = vec![0u8; 1920 * 1080 * 4];
-//! let frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, FourCCVideoType::BGRA, 30, 1);
+//! let frame = BorrowedVideoFrame::from_buffer(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1);
 //! let token = sender.send_video_async(&frame);
 //! // Buffer is now owned by NDI - cannot be modified until callback fires
 //! // The AsyncVideoToken must be kept alive to track the operation
@@ -120,9 +120,9 @@ pub use {
     error::*,
     finder::{Finder, FinderOptions, FinderOptionsBuilder, Source, SourceAddress, SourceCache},
     frames::{
-        AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout, AudioType, FourCCVideoType,
-        FrameFormatType, LineStrideOrSize, MetadataFrame, MetadataFrameRef, VideoFrame,
-        VideoFrameBuilder, VideoFrameRef,
+        AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout, LineStrideOrSize,
+        MetadataFrame, MetadataFrameRef, PixelFormat, ScanType, VideoFrame, VideoFrameBuilder,
+        VideoFrameRef,
     },
     receiver::{
         ConnectionStats, FrameType, Receiver, ReceiverBandwidth, ReceiverColorFormat,
@@ -137,6 +137,45 @@ pub use frames::ImageFormat;
 
 /// Alias for Result with our Error type
 pub type Result<T> = std::result::Result<T, crate::error::Error>;
+
+/// Maximum timeout duration supported by the NDI SDK (~49.7 days).
+///
+/// The NDI SDK uses `u32` milliseconds for timeout values, which limits the maximum
+/// timeout to approximately 49.7 days. Attempting to use a larger `Duration` will
+/// result in an error.
+pub const MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(u32::MAX as u64);
+
+/// Converts a `Duration` to milliseconds for FFI, checking for overflow.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidConfiguration`] if the duration exceeds [`MAX_TIMEOUT`].
+///
+/// # Examples
+///
+/// ```ignore
+/// use std::time::Duration;
+/// use grafton_ndi::to_ms_checked;
+///
+/// // Valid timeout
+/// let ms = to_ms_checked(Duration::from_secs(5))?;
+/// assert_eq!(ms, 5000);
+///
+/// // Overflow error
+/// let result = to_ms_checked(Duration::from_secs(u64::MAX));
+/// assert!(result.is_err());
+/// ```
+pub(crate) fn to_ms_checked(d: std::time::Duration) -> Result<u32> {
+    let ms = d.as_millis();
+    if ms > u32::MAX as u128 {
+        Err(Error::InvalidConfiguration(format!(
+            "timeout {:?} exceeds MAX_TIMEOUT (~49.7 days)",
+            d
+        )))
+    } else {
+        Ok(ms as u32)
+    }
+}
 
 #[cfg(test)]
 #[path = "tests.rs"]
