@@ -17,6 +17,7 @@ env:
   RUSTFLAGS: "-D warnings"
   NDI_SDK_URL: ${{ secrets.NDI_SDK_URL || 'https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe' }}
   NDI_SDK_URL_MACOS: ${{ secrets.NDI_SDK_URL_MACOS || 'https://downloads.ndi.tv/SDK/NDI_SDK_Mac/Install_NDI_SDK_v6_Apple.pkg' }}
+  NDI_SDK_URL_LINUX: ${{ secrets.NDI_SDK_URL_LINUX || 'https://downloads.ndi.tv/SDK/NDI_SDK_Linux/Install_NDI_SDK_v6_Linux.tar.gz' }}
   LLVM_VERSION: "20.1.8"
   CACHE_VERSION: v1
 
@@ -37,7 +38,7 @@ jobs:
     name: Test & Lint
     strategy:
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -51,6 +52,12 @@ jobs:
       # Setup NDI SDK (macOS)
       - uses: ./.github/actions/setup-ndi-macos
         if: runner.os == 'macOS'
+        with:
+          save-cache: 'true'
+
+      # Setup NDI SDK (Linux)
+      - uses: ./.github/actions/setup-ndi-linux
+        if: runner.os == 'Linux'
         with:
           save-cache: 'true'
 
@@ -78,7 +85,7 @@ jobs:
             cargo test --test windows_dll_check -- --nocapture
             cargo test --test diagnose_windows_ci test_ndi_environment -- --nocapture
           fi
-          
+
           # Run all tests including integration tests
           # The NDI runtime libraries are now available via the setup actions
           cargo test --verbose
@@ -92,12 +99,12 @@ jobs:
       - name: Build examples
         run: cargo build --examples
 
-  # Semver check runs on both Windows and macOS
+  # Semver check runs on all platforms
   semver:
     name: Check semver
     strategy:
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -111,6 +118,12 @@ jobs:
       # Setup NDI SDK (macOS)
       - uses: ./.github/actions/setup-ndi-macos
         if: runner.os == 'macOS'
+        with:
+          save-cache: 'false'
+
+      # Setup NDI SDK (Linux)
+      - uses: ./.github/actions/setup-ndi-linux
+        if: runner.os == 'Linux'
         with:
           save-cache: 'false'
 
@@ -140,7 +153,7 @@ jobs:
           save-cache: 'false'
 
       - uses: dtolnay/rust-toolchain@stable
-      
+
       # Rust caching - read-only for publish job
       - uses: Swatinem/rust-cache@v2
         with:

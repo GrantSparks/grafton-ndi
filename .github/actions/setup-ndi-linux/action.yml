@@ -1,0 +1,191 @@
+name: 'Setup NDI SDK on Linux'
+description: 'Install NDI SDK for building grafton-ndi on Linux'
+inputs:
+  save-cache:
+    description: 'Whether to save the cache after installation'
+    required: false
+    default: 'true'
+runs:
+  using: "composite"
+  steps:
+    # Generate cache key for all dependencies
+    - name: Generate cache key
+      id: cache-key
+      run: |
+        # Expected SHA256 hash of NDI SDK installer for Linux
+        expected='0BDF66264527F8BE37FA22EDDD2B8514B9868A58A4D83F80A07DBEB479EE14D4'
+        ndiHash=$(echo $expected | cut -c1-8)  # Use first 8 chars for cache key
+        echo "key=deps-v1-${ndiHash}-${{ runner.os }}" >> $GITHUB_OUTPUT
+        echo "expected_hash=$expected" >> $GITHUB_OUTPUT
+      shell: bash
+
+    # Restore cache if available
+    - name: Restore cache
+      id: cache-restore
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ${{ runner.temp }}/ndi-sdk
+        key: ${{ steps.cache-key.outputs.key }}
+
+    # Install NDI SDK if not cached
+    - name: Download and Install NDI SDK
+      if: steps.cache-restore.outputs.cache-hit != 'true'
+      run: |
+        NDI_SDK_DIR="${{ runner.temp }}/ndi-sdk"
+        NDI_INSTALLER_TAR="${{ runner.temp }}/ndi_sdk_installer.tar.gz"
+        NDI_INSTALLER_DIR="${{ runner.temp }}/ndi_installer"
+
+        # Use Linux-specific NDI SDK URL
+        NDI_SDK_URL="${{ env.NDI_SDK_URL_LINUX }}"
+        if [ -z "$NDI_SDK_URL" ]; then
+          NDI_SDK_URL="https://downloads.ndi.tv/SDK/NDI_SDK_Linux/Install_NDI_SDK_v6_Linux.tar.gz"
+        fi
+
+        echo "Downloading NDI SDK from: $NDI_SDK_URL"
+        curl -L -o "$NDI_INSTALLER_TAR" "$NDI_SDK_URL" || {
+          echo "Error: Failed to download NDI SDK"
+          exit 1
+        }
+
+        # Verify the download
+        if [ ! -f "$NDI_INSTALLER_TAR" ]; then
+          echo "Error: NDI SDK installer not found after download"
+          exit 1
+        fi
+
+        echo "Download complete. File size:"
+        ls -lh "$NDI_INSTALLER_TAR"
+
+        # Verify SHA256 hash
+        echo "Verifying NDI SDK integrity..."
+        expected='${{ steps.cache-key.outputs.expected_hash }}'
+        actual=$(sha256sum "$NDI_INSTALLER_TAR" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')
+        expected_upper=$(echo "$expected" | tr '[:lower:]' '[:upper:]')
+        if [ "$actual" != "$expected_upper" ]; then
+          echo "NDI SDK hash mismatch! Expected: $expected_upper, Got: $actual"
+          exit 1
+        fi
+        echo "✓ NDI SDK hash verified"
+
+        echo "Extracting installer..."
+        mkdir -p "$NDI_INSTALLER_DIR"
+        tar -xzf "$NDI_INSTALLER_TAR" -C "$NDI_INSTALLER_DIR"
+        rm -f "$NDI_INSTALLER_TAR"
+
+        # Find the installer script
+        INSTALLER_SCRIPT=$(find "$NDI_INSTALLER_DIR" -name "Install_NDI_SDK_*.sh" -type f | head -1)
+        if [ -z "$INSTALLER_SCRIPT" ]; then
+          echo "Error: Could not find installer script"
+          ls -la "$NDI_INSTALLER_DIR"
+          exit 1
+        fi
+        echo "Found installer script: $INSTALLER_SCRIPT"
+
+        # The installer script has an embedded tar.gz after __NDI_ARCHIVE_BEGIN__
+        # Extract it non-interactively
+        echo "Extracting SDK from installer..."
+        ARCHIVE_LINE=$(awk '/^__NDI_ARCHIVE_BEGIN__/ { print NR+1; exit 0; }' "$INSTALLER_SCRIPT")
+        if [ -z "$ARCHIVE_LINE" ]; then
+          echo "Error: Could not find archive marker in installer"
+          exit 1
+        fi
+        echo "Archive starts at line: $ARCHIVE_LINE"
+
+        mkdir -p "$NDI_INSTALLER_DIR/extracted"
+        tail -n+$ARCHIVE_LINE "$INSTALLER_SCRIPT" | tar -xz -C "$NDI_INSTALLER_DIR/extracted"
+
+        # Find the extracted SDK directory
+        SDK_EXTRACTED=$(find "$NDI_INSTALLER_DIR/extracted" -maxdepth 1 -type d -name "*NDI*" | head -1)
+        if [ -z "$SDK_EXTRACTED" ]; then
+          echo "Looking for SDK in extracted contents..."
+          ls -la "$NDI_INSTALLER_DIR/extracted"
+          # Maybe the files are directly in extracted/
+          if [ -d "$NDI_INSTALLER_DIR/extracted/include" ]; then
+            SDK_EXTRACTED="$NDI_INSTALLER_DIR/extracted"
+          else
+            echo "Error: Could not find extracted SDK"
+            exit 1
+          fi
+        fi
+        echo "Found extracted SDK at: $SDK_EXTRACTED"
+
+        # Move to final location
+        mkdir -p "$NDI_SDK_DIR"
+        cp -R "$SDK_EXTRACTED"/* "$NDI_SDK_DIR/"
+
+        # Cleanup
+        rm -rf "$NDI_INSTALLER_DIR"
+
+        # Verify installation
+        if [ -f "$NDI_SDK_DIR/include/Processing.NDI.Lib.h" ]; then
+          echo "✓ NDI SDK installed successfully"
+        else
+          echo "Error: NDI SDK installation failed - header file not found"
+          echo "Contents of $NDI_SDK_DIR:"
+          ls -la "$NDI_SDK_DIR" || true
+          exit 1
+        fi
+
+        # Show what was installed
+        echo ""
+        echo "NDI SDK contents:"
+        ls -la "$NDI_SDK_DIR"
+        if [ -d "$NDI_SDK_DIR/lib" ]; then
+          echo ""
+          echo "Library directory contents:"
+          ls -la "$NDI_SDK_DIR/lib/"
+        fi
+      shell: bash
+
+    # Verify SDK is available (whether from cache or fresh install)
+    - name: Verify NDI SDK
+      run: |
+        NDI_SDK_DIR="${{ runner.temp }}/ndi-sdk"
+        echo "Verifying NDI SDK at: $NDI_SDK_DIR"
+
+        if [ ! -f "$NDI_SDK_DIR/include/Processing.NDI.Lib.h" ]; then
+          echo "Error: NDI SDK not found or incomplete"
+          exit 1
+        fi
+
+        echo "✓ NDI SDK verified"
+        ls -la "$NDI_SDK_DIR"
+      shell: bash
+
+    # Setup environment
+    - name: Setup environment
+      run: |
+        NDI_SDK_DIR="${{ runner.temp }}/ndi-sdk"
+        echo "NDI_SDK_DIR=$NDI_SDK_DIR" >> $GITHUB_ENV
+
+        # Add binary paths if they exist
+        [ -d "$NDI_SDK_DIR/bin" ] && echo "$NDI_SDK_DIR/bin" >> $GITHUB_PATH
+        [ -d "$NDI_SDK_DIR/bin/x86_64-linux-gnu" ] && echo "$NDI_SDK_DIR/bin/x86_64-linux-gnu" >> $GITHUB_PATH
+
+        # Set up library paths for Linux
+        LIB_PATHS=""
+        if [ -d "$NDI_SDK_DIR/lib/x86_64-linux-gnu" ]; then
+          LIB_PATHS="$NDI_SDK_DIR/lib/x86_64-linux-gnu"
+          echo "Found x86_64 library directory"
+        elif [ -d "$NDI_SDK_DIR/lib" ]; then
+          LIB_PATHS="$NDI_SDK_DIR/lib"
+          echo "Found library directory"
+        fi
+
+        if [ -n "$LIB_PATHS" ]; then
+          echo "LD_LIBRARY_PATH=${LIB_PATHS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> $GITHUB_ENV
+          echo "NDI_RUNTIME_DIR_V6=$LIB_PATHS" >> $GITHUB_ENV
+        fi
+
+        echo "NDI SDK setup complete."
+      shell: bash
+
+    # Save cache only from test-and-lint job on main branch
+    - name: Save cache
+      if: inputs.save-cache == 'true' && steps.cache-restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.job == 'test-and-lint'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ${{ runner.temp }}/ndi-sdk
+        key: ${{ steps.cache-key.outputs.key }}
