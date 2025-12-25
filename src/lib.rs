@@ -123,9 +123,9 @@ pub use {
     error::*,
     finder::{Finder, FinderOptions, FinderOptionsBuilder, Source, SourceAddress, SourceCache},
     frames::{
-        AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout, LineStrideOrSize,
-        MetadataFrame, MetadataFrameRef, PixelFormat, ScanType, VideoFrame, VideoFrameBuilder,
-        VideoFrameRef,
+        AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout, FormatCategory,
+        LineStrideOrSize, MetadataFrame, MetadataFrameRef, PixelFormat, PixelFormatInfo, ScanType,
+        VideoFrame, VideoFrameBuilder, VideoFrameRef,
     },
     receiver::{
         ConnectionStats, FrameType, Receiver, ReceiverBandwidth, ReceiverColorFormat,
@@ -138,6 +138,8 @@ pub use {
 #[cfg(feature = "image-encoding")]
 pub use frames::ImageFormat;
 
+// Deprecated: Use PixelFormat::line_stride() instead
+#[allow(deprecated)]
 pub use frames::calculate_line_stride;
 
 /// Alias for Result with our Error type

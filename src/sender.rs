@@ -17,14 +17,9 @@ use std::{
     time::Duration,
 };
 
-#[cfg(feature = "advanced_sdk")]
-use crate::frames::is_uncompressed_format;
 use crate::{
     finder::Source,
-    frames::{
-        calculate_line_stride, AudioFrame, LineStrideOrSize, MetadataFrame, PixelFormat, ScanType,
-        VideoFrame,
-    },
+    frames::{AudioFrame, LineStrideOrSize, MetadataFrame, PixelFormat, ScanType, VideoFrame},
     ndi_lib::*,
     receiver::Tally,
     to_ms_checked, Error, Result, NDI,
@@ -185,10 +180,8 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         frame_rate_n: i32,
         frame_rate_d: i32,
     ) -> Result<Self> {
-        use crate::frames::uncompressed_buffer_len;
-
-        let stride = calculate_line_stride(pixel_format, width);
-        let expected_len = uncompressed_buffer_len(pixel_format, stride, width, height);
+        let stride = pixel_format.line_stride(width);
+        let expected_len = pixel_format.info().buffer_len(stride, height);
 
         if data.len() < expected_len {
             return Err(Error::InvalidFrame(format!(
@@ -290,7 +283,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// # Safety
     ///
     /// The caller must ensure:
-    /// - For uncompressed formats: `data.len() >= uncompressed_buffer_len(pixel_format, line_stride, width, height)`
+    /// - For uncompressed formats: `data.len() >= pixel_format.info().buffer_len(line_stride, height)`
     /// - For compressed formats: `data.len() >= data_size_bytes`
     /// - `width`, `height`, `frame_rate_n`, and `frame_rate_d` are valid (non-negative, non-zero where appropriate)
     /// - The stride/size in `line_stride_or_size` matches the actual data layout
@@ -302,9 +295,8 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     ///
     /// ```no_run
     /// # use grafton_ndi::{BorrowedVideoFrame, PixelFormat, LineStrideOrSize};
-    /// # use grafton_ndi::frames::calculate_line_stride;
     /// let buffer = vec![0u8; 1920 * 1080 * 4];
-    /// let stride = calculate_line_stride(PixelFormat::BGRA, 1920);
+    /// let stride = PixelFormat::BGRA.line_stride(1920);
     ///
     /// // SAFETY: Buffer is correctly sized for 1920x1080 BGRA
     /// let frame = unsafe {
@@ -734,10 +726,10 @@ impl<'a> Sender<'a> {
                             let fourcc = PixelFormat::try_from((*frame).FourCC as u32)
                                 .unwrap_or(PixelFormat::BGRA);
 
-                            if is_uncompressed_format(fourcc) {
+                            if fourcc.is_uncompressed() {
                                 let line_stride = (*frame).__bindgen_anon_1.line_stride_in_bytes;
                                 let height = (*frame).yres;
-                                (line_stride as usize) * (height as usize)
+                                fourcc.info().buffer_len(line_stride, height)
                             } else {
                                 (*frame).__bindgen_anon_1.data_size_in_bytes as usize
                             }
@@ -1400,7 +1392,6 @@ impl SenderOptionsBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frames::{calculate_line_stride, uncompressed_buffer_len};
 
     #[test]
     fn test_try_from_uncompressed_exact_size() {
@@ -1472,8 +1463,7 @@ mod tests {
         // NV12 planar format: Y plane + UV plane
         let width = 1920;
         let height = 1080;
-        let stride = calculate_line_stride(PixelFormat::NV12, width);
-        let expected_size = uncompressed_buffer_len(PixelFormat::NV12, stride, width, height);
+        let expected_size = PixelFormat::NV12.buffer_size(width, height);
         let buffer = vec![0u8; expected_size];
 
         let result = BorrowedVideoFrame::try_from_uncompressed(
@@ -1492,8 +1482,7 @@ mod tests {
         // I420 planar format
         let width = 640;
         let height = 480;
-        let stride = calculate_line_stride(PixelFormat::I420, width);
-        let expected_size = uncompressed_buffer_len(PixelFormat::I420, stride, width, height);
+        let expected_size = PixelFormat::I420.buffer_size(width, height);
         let buffer = vec![0u8; expected_size];
 
         let result = BorrowedVideoFrame::try_from_uncompressed(
@@ -1545,7 +1534,7 @@ mod tests {
     #[test]
     fn test_from_parts_unchecked() {
         let buffer = vec![0u8; 1920 * 1080 * 4];
-        let stride = calculate_line_stride(PixelFormat::BGRA, 1920);
+        let stride = PixelFormat::BGRA.line_stride(1920);
 
         // SAFETY: Buffer is correctly sized for 1920x1080 BGRA
         let frame = unsafe {
@@ -1635,8 +1624,7 @@ mod tests {
         let height = 1080;
 
         for format in [PixelFormat::NV12, PixelFormat::I420, PixelFormat::YV12] {
-            let stride = calculate_line_stride(format, width);
-            let expected_size = uncompressed_buffer_len(format, stride, width, height);
+            let expected_size = format.buffer_size(width, height);
 
             let buffer = vec![0u8; expected_size];
             let result =
