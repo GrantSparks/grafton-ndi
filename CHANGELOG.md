@@ -5,6 +5,185 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2025-12-25
+
+### Overview
+
+Version 0.10.0 continues the API refinement journey toward 1.0, focusing on internal architecture improvements and better abstractions. This release includes breaking changes to support more robust async operations and unified pixel format handling.
+
+**Key Improvements:**
+- 🏗️ **Unified Async Architecture**: Single generic `AsyncReceiverGeneric<R>` replaces duplicate implementations
+- 📐 **Pixel Format API**: New `PixelFormatInfo` provides compile-time format properties
+- 🔄 **Completion Waiting**: New `WaitableCompletion` abstraction for async operations
+- 🛡️ **Robustness**: Lock-free atomics eliminate mutex poisoning hazards
+
+---
+
+### Breaking Changes
+
+#### 1. Async Runtime Unification
+
+The async receiver types have been refactored from separate struct implementations to type aliases over a generic implementation:
+
+**Before (0.9.0):**
+```rust
+// Separate struct definitions
+pub struct AsyncReceiver { /* tokio-specific */ }  // in tokio module
+pub struct AsyncReceiver { /* async-std-specific */ }  // in async_std module
+```
+
+**After (0.10.0):**
+```rust
+// Type aliases over generic implementation
+pub type AsyncReceiver = AsyncReceiverGeneric<TokioRuntime>;  // in tokio module
+pub type AsyncReceiver = AsyncReceiverGeneric<AsyncStdRuntime>;  // in async_std module
+```
+
+**Impact:** Code using the type aliases (`grafton_ndi::tokio::AsyncReceiver`) continues to work. Code that relied on the concrete struct type may need adjustment.
+
+#### 2. New Error Variant: `SpawnFailed`
+
+A new error variant has been added to handle async task spawn failures:
+
+```rust
+Error::SpawnFailed(String)
+```
+
+**Impact:** If you have exhaustive `match` statements on `Error`, you'll need to add a case for `SpawnFailed`. This replaces panics on Tokio `JoinError` with proper error propagation.
+
+---
+
+### New Features
+
+#### 1. Pixel Format Information API ([#34](https://github.com/GrantSparks/grafton-ndi/issues/34))
+
+New unified API for pixel format properties with compile-time computation:
+
+```rust
+use grafton_ndi::{PixelFormat, FormatCategory};
+
+let format = PixelFormat::BGRA;
+
+// Get format info (const fn)
+let info = format.info();
+println!("Bytes per pixel: {}", info.bytes_per_pixel());
+println!("Category: {:?}", info.category());
+
+// Calculate sizes (const fn)
+let stride = format.line_stride(1920);
+let size = format.buffer_size(1920, 1080);
+
+// Check format type
+if format.is_uncompressed() {
+    println!("Uncompressed format");
+}
+```
+
+**New Types:**
+- `FormatCategory` enum: `Packed`, `Planar420`, `SemiPlanar420`
+- `PixelFormatInfo` struct with `bytes_per_pixel()` and `category()` methods
+
+**New Methods on `PixelFormat`:**
+- `info()` - Get compile-time format properties
+- `line_stride(width)` - Calculate line stride in bytes
+- `buffer_size(width, height)` - Calculate total buffer size
+- `is_uncompressed()` - Check if format is uncompressed
+
+#### 2. WaitableCompletion Abstraction ([#39](https://github.com/GrantSparks/grafton-ndi/issues/39))
+
+New public module for async completion signaling (requires `advanced_sdk` feature):
+
+```rust
+use grafton_ndi::waitable_completion::{WaitableCompletion, TryWaitResult};
+use std::time::Duration;
+
+let completion = WaitableCompletion::new();
+
+// Signal completion from another thread
+completion.signal();
+
+// Wait with timeout
+match completion.try_wait_timeout(Duration::from_secs(5), "operation") {
+    TryWaitResult::Completed => println!("Done"),
+    TryWaitResult::Timeout => println!("Timed out"),
+    TryWaitResult::LockUnavailable => println!("Lock contention"),
+}
+```
+
+---
+
+### Deprecated
+
+- `calculate_line_stride()` function - Use `PixelFormat::line_stride()` instead
+
+---
+
+### Internal Improvements
+
+#### Unified Async Runtime Architecture ([#35](https://github.com/GrantSparks/grafton-ndi/issues/35))
+
+- Introduced sealed `SpawnBlocking` trait abstracting spawn_blocking mechanism
+- Single `AsyncReceiverGeneric<R>` implementation replaces ~200 lines of duplicate code
+- `TokioRuntime` and `AsyncStdRuntime` marker types implement the trait
+- All runtimes now return `Result` on spawn failure instead of panicking
+
+#### Unified Capture Retry Logic ([#36](https://github.com/GrantSparks/grafton-ndi/issues/36))
+
+- Generic retry policy via `RetryPolicy` trait
+- Unified `CaptureKind` trait for video/audio/metadata frame handling
+- Eliminated duplicate retry loops across capture methods
+
+#### Lock-Free Async Completion ([#38](https://github.com/GrantSparks/grafton-ndi/issues/38))
+
+- Replaced mutex-based completion tracking with lock-free atomics
+- Eliminates mutex poisoning hazard in async video callbacks
+- Zero runtime overhead compared to previous implementation
+
+#### Consolidated Completion Waiting ([#39](https://github.com/GrantSparks/grafton-ndi/issues/39))
+
+- New `WaitableCompletion` struct encapsulates atomic flag, mutex, and condvar
+- Eliminated ~100 lines of duplicated wait-for-completion logic
+- Single point of maintenance for poison recovery logic
+
+---
+
+### Migration Guide
+
+#### Update Error Handling
+
+If you have exhaustive matches on `Error`:
+
+```rust
+// Before
+match err {
+    Error::NdiNotFound => { /* ... */ },
+    Error::Timeout(_) => { /* ... */ },
+    // ... other variants
+}
+
+// After - add SpawnFailed
+match err {
+    Error::NdiNotFound => { /* ... */ },
+    Error::Timeout(_) => { /* ... */ },
+    Error::SpawnFailed(reason) => {
+        eprintln!("Async spawn failed: {}", reason);
+    },
+    // ... other variants
+}
+```
+
+#### Update Deprecated Function Calls
+
+```rust
+// Before
+let stride = calculate_line_stride(PixelFormat::BGRA, 1920);
+
+// After
+let stride = PixelFormat::BGRA.line_stride(1920);
+```
+
+---
+
 ## [0.9.0] - 2025-10-20
 
 ### Overview
