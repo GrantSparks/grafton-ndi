@@ -865,7 +865,10 @@ impl SourceCache {
     /// ```
     pub fn find_by_host(&self, host: &str, timeout: Duration) -> Result<Source> {
         {
-            let cache = self.cache.lock().unwrap();
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(cached) = cache.get(host) {
                 return Ok(cached.source.clone());
             }
@@ -891,7 +894,10 @@ impl SourceCache {
             })?;
 
         {
-            let mut cache = self.cache.lock().unwrap();
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             cache.insert(
                 host.to_string(),
                 CachedSource {
@@ -931,7 +937,10 @@ impl SourceCache {
     /// # }
     /// ```
     pub fn invalidate(&self, host: &str) {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.remove(host);
     }
 
@@ -957,7 +966,10 @@ impl SourceCache {
     /// # }
     /// ```
     pub fn clear(&self) {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.clear();
     }
 
@@ -981,7 +993,10 @@ impl SourceCache {
     /// # }
     /// ```
     pub fn len(&self) -> usize {
-        let cache = self.cache.lock().unwrap();
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.len()
     }
 
@@ -1003,7 +1018,10 @@ impl SourceCache {
     /// # }
     /// ```
     pub fn is_empty(&self) -> bool {
-        let cache = self.cache.lock().unwrap();
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.is_empty()
     }
 }
@@ -1127,5 +1145,32 @@ mod tests {
             SourceAddress::None => {}
             _ => panic!("Expected None address"),
         }
+    }
+
+    #[test]
+    fn test_source_cache_poison_recovery() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let cache = Arc::new(SourceCache::default());
+        let cache_clone = Arc::clone(&cache);
+
+        // Spawn a thread that acquires the lock and panics
+        let handle = thread::spawn(move || {
+            let _lock = cache_clone
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            panic!("intentional panic while holding lock");
+        });
+
+        // Wait for the thread to panic
+        let _ = handle.join();
+
+        // Verify all cache methods still work after poison
+        assert!(cache.is_empty(), "is_empty should work after poison");
+        assert_eq!(cache.len(), 0, "len should work after poison");
+        cache.invalidate("test");
+        cache.clear();
     }
 }
