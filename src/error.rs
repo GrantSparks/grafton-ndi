@@ -163,4 +163,29 @@ pub enum Error {
         /// The search criteria that yielded no results
         criteria: String,
     },
+
+    /// Failed to spawn a blocking task on the async runtime.
+    ///
+    /// This error occurs when the async runtime fails to spawn a blocking task,
+    /// typically due to task cancellation or runtime shutdown. Unlike the previous
+    /// behavior which panicked on tokio `JoinError`, this error allows callers to
+    /// handle the failure gracefully.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use grafton_ndi::Error;
+    ///
+    /// fn handle_error(err: Error) {
+    ///     match err {
+    ///         Error::SpawnFailed(reason) => {
+    ///             eprintln!("Async spawn failed: {}", reason);
+    ///             // Could retry or gracefully shutdown
+    ///         }
+    ///         e => eprintln!("Other error: {}", e),
+    ///     }
+    /// }
+    /// ```
+    #[error("Failed to spawn blocking task: {0}")]
+    SpawnFailed(String),
 }
