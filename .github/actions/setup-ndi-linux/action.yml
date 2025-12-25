@@ -15,7 +15,8 @@ runs:
         # Expected SHA256 hash of NDI SDK installer for Linux
         expected='0BDF66264527F8BE37FA22EDDD2B8514B9868A58A4D83F80A07DBEB479EE14D4'
         ndiHash=$(echo $expected | cut -c1-8)  # Use first 8 chars for cache key
-        echo "key=deps-v1-${ndiHash}-${{ runner.os }}" >> $GITHUB_OUTPUT
+        # v2: added symlink creation for linker compatibility
+        echo "key=deps-v2-${ndiHash}-${{ runner.os }}" >> $GITHUB_OUTPUT
         echo "expected_hash=$expected" >> $GITHUB_OUTPUT
       shell: bash
 
@@ -114,6 +115,35 @@ runs:
         mkdir -p "$NDI_SDK_DIR"
         cp -R "$SDK_EXTRACTED"/* "$NDI_SDK_DIR/"
 
+        # Create library symlinks for linker compatibility
+        # The SDK ships versioned libraries (e.g., libndi.so.6.1.1) but the linker needs libndi.so
+        echo "Creating library symlinks..."
+        for libdir in "$NDI_SDK_DIR/lib" "$NDI_SDK_DIR/lib/x86_64-linux-gnu"; do
+          if [ -d "$libdir" ]; then
+            cd "$libdir"
+            for lib in lib*.so.*.*.*; do
+              if [ -f "$lib" ]; then
+                # Extract base name (e.g., libndi from libndi.so.6.1.1)
+                base=$(echo "$lib" | sed 's/\.so\..*/.so/')
+                major=$(echo "$lib" | sed 's/.*\.so\.\([0-9]*\)\..*/\1/')
+
+                # Create libndi.so.6 -> libndi.so.6.1.1
+                if [ ! -e "${base}.${major}" ]; then
+                  ln -sf "$lib" "${base}.${major}"
+                  echo "  Created ${base}.${major} -> $lib"
+                fi
+
+                # Create libndi.so -> libndi.so.6.1.1
+                if [ ! -e "$base" ]; then
+                  ln -sf "$lib" "$base"
+                  echo "  Created $base -> $lib"
+                fi
+              fi
+            done
+            cd - > /dev/null
+          fi
+        done
+
         # Cleanup
         rm -rf "$NDI_INSTALLER_DIR"
 
@@ -131,7 +161,11 @@ runs:
         echo ""
         echo "NDI SDK contents:"
         ls -la "$NDI_SDK_DIR"
-        if [ -d "$NDI_SDK_DIR/lib" ]; then
+        if [ -d "$NDI_SDK_DIR/lib/x86_64-linux-gnu" ]; then
+          echo ""
+          echo "Library directory contents (x86_64-linux-gnu):"
+          ls -la "$NDI_SDK_DIR/lib/x86_64-linux-gnu/"
+        elif [ -d "$NDI_SDK_DIR/lib" ]; then
           echo ""
           echo "Library directory contents:"
           ls -la "$NDI_SDK_DIR/lib/"
