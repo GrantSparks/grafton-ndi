@@ -100,6 +100,7 @@
 #![allow(clippy::must_use_candidate)]
 #![allow(clippy::missing_errors_doc)]
 
+mod capture;
 mod error;
 mod ndi_lib;
 mod recv_guard;

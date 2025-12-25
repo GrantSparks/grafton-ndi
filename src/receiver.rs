@@ -33,12 +33,12 @@
 use std::{ffi::CString, ptr, time::Duration};
 
 use crate::{
+    capture::{capture_audio_raw, capture_metadata_raw, capture_video_raw, CaptureResult},
     finder::{RawSource, Source},
     frames::{
         AudioFrame, AudioFrameRef, MetadataFrame, MetadataFrameRef, VideoFrame, VideoFrameRef,
     },
     ndi_lib::*,
-    recv_guard::{RecvAudioGuard, RecvMetadataGuard, RecvVideoGuard},
     to_ms_checked, Error, Result, NDI,
 };
 
@@ -690,33 +690,16 @@ impl Receiver {
         timeout: Duration,
     ) -> Result<Option<VideoFrameRef<'rx>>> {
         let timeout_ms = to_ms_checked(timeout)?;
-        let mut video_frame = NDIlib_video_frame_v2_t::default();
 
-        // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
-        let frame_type = unsafe {
-            NDIlib_recv_capture_v3(
-                self.instance,
-                &mut video_frame,
-                ptr::null_mut(), // no audio
-                ptr::null_mut(), // no metadata
-                timeout_ms,
-            )
-        };
-
-        match frame_type {
-            NDIlib_frame_type_e_NDIlib_frame_type_video => {
-                // Create RAII guard to ensure the frame is freed
-                let guard = unsafe { RecvVideoGuard::new(self.instance, video_frame) };
+        // SAFETY: self.instance is a valid NDI receiver instance
+        match unsafe { capture_video_raw(self.instance, timeout_ms) } {
+            CaptureResult::Frame(guard) => {
                 // Validate FourCC during construction - this may return an error
                 let frame_ref = unsafe { VideoFrameRef::new(guard)? };
-                // Guard is moved into VideoFrameRef; will be freed when VideoFrameRef drops
                 Ok(Some(frame_ref))
             }
-            NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(None),
-            NDIlib_frame_type_e_NDIlib_frame_type_error => {
-                Err(Error::CaptureFailed("Received an error frame".into()))
-            }
-            _ => Ok(None), // Other frame types are ignored when capturing video only
+            CaptureResult::None => Ok(None),
+            CaptureResult::Error => Err(Error::CaptureFailed("Received an error frame".into())),
         }
     }
 
@@ -862,33 +845,16 @@ impl Receiver {
         timeout: Duration,
     ) -> Result<Option<AudioFrameRef<'rx>>> {
         let timeout_ms = to_ms_checked(timeout)?;
-        let mut audio_frame = NDIlib_audio_frame_v3_t::default();
 
-        // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
-        let frame_type = unsafe {
-            NDIlib_recv_capture_v3(
-                self.instance,
-                ptr::null_mut(), // no video
-                &mut audio_frame,
-                ptr::null_mut(), // no metadata
-                timeout_ms,
-            )
-        };
-
-        match frame_type {
-            NDIlib_frame_type_e_NDIlib_frame_type_audio => {
-                // Create RAII guard to ensure the frame is freed
-                let guard = unsafe { RecvAudioGuard::new(self.instance, audio_frame) };
+        // SAFETY: self.instance is a valid NDI receiver instance
+        match unsafe { capture_audio_raw(self.instance, timeout_ms) } {
+            CaptureResult::Frame(guard) => {
                 // Validate FourCC during construction - this may return an error
                 let frame_ref = unsafe { AudioFrameRef::new(guard)? };
-                // Guard is moved into AudioFrameRef; will be freed when AudioFrameRef drops
                 Ok(Some(frame_ref))
             }
-            NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(None),
-            NDIlib_frame_type_e_NDIlib_frame_type_error => {
-                Err(Error::CaptureFailed("Received an error frame".into()))
-            }
-            _ => Ok(None), // Other frame types are ignored when capturing audio only
+            CaptureResult::None => Ok(None),
+            CaptureResult::Error => Err(Error::CaptureFailed("Received an error frame".into())),
         }
     }
 
@@ -1016,32 +982,15 @@ impl Receiver {
         timeout: Duration,
     ) -> Result<Option<MetadataFrameRef<'rx>>> {
         let timeout_ms = to_ms_checked(timeout)?;
-        let mut metadata_frame = NDIlib_metadata_frame_t::default();
 
-        // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
-        let frame_type = unsafe {
-            NDIlib_recv_capture_v3(
-                self.instance,
-                ptr::null_mut(), // no video
-                ptr::null_mut(), // no audio
-                &mut metadata_frame,
-                timeout_ms,
-            )
-        };
-
-        match frame_type {
-            NDIlib_frame_type_e_NDIlib_frame_type_metadata => {
-                // Create RAII guard to ensure the frame is freed
-                let guard = unsafe { RecvMetadataGuard::new(self.instance, metadata_frame) };
+        // SAFETY: self.instance is a valid NDI receiver instance
+        match unsafe { capture_metadata_raw(self.instance, timeout_ms) } {
+            CaptureResult::Frame(guard) => {
                 let frame_ref = unsafe { MetadataFrameRef::new(guard) };
-                // Guard is moved into MetadataFrameRef; will be freed when MetadataFrameRef drops
                 Ok(Some(frame_ref))
             }
-            NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(None),
-            NDIlib_frame_type_e_NDIlib_frame_type_error => {
-                Err(Error::CaptureFailed("Received an error frame".into()))
-            }
-            _ => Ok(None), // Other frame types are ignored when capturing metadata only
+            CaptureResult::None => Ok(None),
+            CaptureResult::Error => Err(Error::CaptureFailed("Received an error frame".into())),
         }
     }
 
