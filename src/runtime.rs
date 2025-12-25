@@ -2,121 +2,115 @@
 
 use once_cell::sync::Lazy;
 
-use std::sync::{Condvar, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Once,
+};
 
 use crate::{ndi_lib::*, Error, Result};
 
-/// State of the NDI runtime lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum State {
-    /// Runtime has not been initialized yet.
-    Uninitialized,
-    /// Runtime is currently being initialized by another thread.
-    Initializing,
-    /// Runtime is initialized and active with the given reference count.
-    Initialized { refcount: usize },
-    /// Runtime is currently being destroyed.
-    Destroying,
-}
-
-/// Process-global runtime manager for NDI.
+/// Process-global runtime manager for NDI using lock-free atomics.
+///
+/// This implementation avoids mutex poisoning hazards by using:
+/// - `AtomicUsize` for reference counting (0 = uninitialized, >0 = refcount)
+/// - `std::sync::Once` for exactly-once initialization
+/// - `AtomicBool` for destruction-in-progress signaling
 struct RuntimeManager {
-    state: Mutex<State>,
-    cv: Condvar,
+    /// One-shot initialization guard.
+    init: Once,
+    /// Reference count: 0 means uninitialized, positive values are live refcount.
+    refcount: AtomicUsize,
+    /// True while destruction is in progress (rare path).
+    destroying: AtomicBool,
+    /// Initialization result: true if NDIlib_initialize succeeded.
+    init_succeeded: AtomicBool,
 }
 
 impl RuntimeManager {
     const fn new() -> Self {
         Self {
-            state: Mutex::new(State::Uninitialized),
-            cv: Condvar::new(),
+            init: Once::new(),
+            refcount: AtomicUsize::new(0),
+            destroying: AtomicBool::new(false),
+            init_succeeded: AtomicBool::new(false),
         }
     }
 
     fn acquire(&self) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        // Spin-wait if destruction is in progress (rare path, only during final
+        // release concurrent with new acquire)
+        while self.destroying.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
 
-        loop {
-            match *state {
-                State::Uninitialized => {
-                    // We'll be the initializer
-                    *state = State::Initializing;
-                    drop(state); // Release lock before calling FFI
+        // Increment refcount atomically
+        let prev = self.refcount.fetch_add(1, Ordering::AcqRel);
 
-                    #[cfg(all(target_os = "windows", debug_assertions))]
-                    {
-                        if std::env::var("CI").is_ok() {
-                            eprintln!("[NDI] Initializing NDI runtime in CI environment...");
-                            if let Ok(sdk_dir) = std::env::var("NDI_SDK_DIR") {
-                                eprintln!("[NDI] NDI_SDK_DIR: {}", sdk_dir);
-                            }
+        if prev == 0 {
+            // We're the first acquirer - need to initialize
+            self.init.call_once(|| {
+                #[cfg(all(target_os = "windows", debug_assertions))]
+                {
+                    if std::env::var("CI").is_ok() {
+                        eprintln!("[NDI] Initializing NDI runtime in CI environment...");
+                        if let Ok(sdk_dir) = std::env::var("NDI_SDK_DIR") {
+                            eprintln!("[NDI] NDI_SDK_DIR: {}", sdk_dir);
                         }
                     }
-
-                    let init_succeeded = unsafe { NDIlib_initialize() };
-
-                    // Reacquire lock to update state
-                    state = self.state.lock().unwrap();
-
-                    if init_succeeded {
-                        *state = State::Initialized { refcount: 1 };
-                        self.cv.notify_all();
-                        return Ok(());
-                    } else {
-                        *state = State::Uninitialized;
-                        self.cv.notify_all();
-                        return Err(Error::InitializationFailed(
-                            "NDIlib_initialize failed".into(),
-                        ));
-                    }
                 }
-                State::Initializing | State::Destroying => {
-                    // Wait for the state to change
-                    state = self.cv.wait(state).unwrap();
-                }
-                State::Initialized { refcount } => {
-                    *state = State::Initialized {
-                        refcount: refcount + 1,
-                    };
-                    return Ok(());
-                }
+
+                let succeeded = unsafe { NDIlib_initialize() };
+                self.init_succeeded.store(succeeded, Ordering::Release);
+            });
+
+            // Check if initialization succeeded
+            if !self.init_succeeded.load(Ordering::Acquire) {
+                // Initialization failed - decrement refcount and return error
+                self.refcount.fetch_sub(1, Ordering::Release);
+                return Err(Error::InitializationFailed(
+                    "NDIlib_initialize failed".into(),
+                ));
+            }
+        } else {
+            // Not the first acquirer - wait for initialization to complete
+            // This is necessary because another thread might be in call_once
+            while !self.init.is_completed() {
+                std::hint::spin_loop();
+            }
+
+            // Check if initialization succeeded
+            if !self.init_succeeded.load(Ordering::Acquire) {
+                // Initialization failed - decrement refcount and return error
+                self.refcount.fetch_sub(1, Ordering::Release);
+                return Err(Error::InitializationFailed(
+                    "NDIlib_initialize failed".into(),
+                ));
             }
         }
+
+        Ok(())
     }
 
     fn release(&self) {
-        let mut state = self.state.lock().unwrap();
+        let prev = self.refcount.fetch_sub(1, Ordering::AcqRel);
 
-        match *state {
-            State::Initialized { refcount } => {
-                if refcount == 1 {
-                    // We're the last reference, destroy the runtime
-                    *state = State::Destroying;
-                    drop(state); // Release lock before calling FFI
+        debug_assert!(
+            prev > 0,
+            "release() called when refcount was already 0 (double-free or unbalanced release)"
+        );
 
-                    unsafe { NDIlib_destroy() };
+        if prev == 1 {
+            // We were the last reference - destroy the runtime
+            self.destroying.store(true, Ordering::Release);
 
-                    // Reacquire lock to update state
-                    state = self.state.lock().unwrap();
-                    *state = State::Uninitialized;
-                    self.cv.notify_all();
-                } else {
-                    *state = State::Initialized {
-                        refcount: refcount - 1,
-                    };
-                }
-            }
-            _ => {
-                // This should never happen in correct usage
-                #[cfg(debug_assertions)]
-                panic!("release() called in invalid state: {:?}", *state);
-            }
+            unsafe { NDIlib_destroy() };
+
+            self.destroying.store(false, Ordering::Release);
         }
     }
 
     fn is_running(&self) -> bool {
-        let state = self.state.lock().unwrap();
-        matches!(*state, State::Initialized { .. })
+        self.refcount.load(Ordering::Acquire) > 0
     }
 }
 

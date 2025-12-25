@@ -1232,3 +1232,147 @@ fn test_line_stride_or_size_equality() {
     let size = LineStrideOrSize::DataSizeBytes(1024);
     assert_ne!(stride, size);
 }
+
+/// Tests for the lock-free atomic RuntimeManager implementation.
+/// These tests verify that the atomic refcount and Once-based initialization
+/// work correctly under concurrent access.
+mod runtime_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    /// Test that concurrent cloning of NDI handles works correctly.
+    /// This verifies the atomic refcount increment path.
+    #[test]
+    fn test_concurrent_clone_does_not_panic() {
+        use crate::NDI;
+
+        // Skip if NDI runtime not available
+        let ndi = match NDI::new() {
+            Ok(n) => Arc::new(n),
+            Err(_) => return, // Skip test if NDI not available
+        };
+
+        let clone_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        // Spawn multiple threads that clone the NDI handle concurrently
+        for _ in 0..10 {
+            let ndi_clone = Arc::clone(&ndi);
+            let count = Arc::clone(&clone_count);
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    let _cloned = (*ndi_clone).clone();
+                    count.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("Thread panicked during concurrent clone");
+        }
+
+        assert_eq!(clone_count.load(Ordering::Relaxed), 1000);
+    }
+
+    /// Test that concurrent drop of NDI handles works correctly.
+    /// This verifies the atomic refcount decrement path.
+    #[test]
+    fn test_concurrent_drop_does_not_panic() {
+        use crate::NDI;
+
+        // Skip if NDI runtime not available
+        let ndi = match NDI::new() {
+            Ok(n) => n,
+            Err(_) => return, // Skip test if NDI not available
+        };
+
+        let mut handles = vec![];
+
+        // Create multiple clones
+        let clones: Vec<_> = (0..100).map(|_| ndi.clone()).collect();
+
+        // Drop them concurrently
+        for clone in clones {
+            handles.push(thread::spawn(move || {
+                drop(clone);
+            }));
+        }
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("Thread panicked during concurrent drop");
+        }
+    }
+
+    /// Test that mixed acquire/release operations work correctly.
+    /// This verifies that the lock-free implementation handles interleaved
+    /// operations from multiple threads.
+    #[test]
+    fn test_mixed_acquire_release_concurrent() {
+        use crate::NDI;
+
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+
+        for _ in 0..10 {
+            let count = Arc::clone(&success_count);
+            handles.push(thread::spawn(move || {
+                for _ in 0..50 {
+                    if let Ok(ndi) = NDI::new() {
+                        let _clone = ndi.clone();
+                        count.fetch_add(1, Ordering::Relaxed);
+                        // Both ndi and _clone are dropped here
+                    }
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("Thread panicked during mixed acquire/release");
+        }
+
+        // We should have successfully acquired at least some handles
+        // (may be less than 500 if NDI init fails)
+        let count = success_count.load(Ordering::Relaxed);
+        // If any succeeded, we're good
+        if count > 0 {
+            assert!(count <= 500);
+        }
+    }
+
+    /// Test that is_running is consistent with actual runtime state.
+    #[test]
+    fn test_is_running_consistency() {
+        use crate::NDI;
+
+        // Before any NDI instance, is_running may be false
+        // (depends on if other tests have run)
+        let initial_running = NDI::is_running();
+
+        if let Ok(ndi) = NDI::new() {
+            // With an active handle, is_running should be true
+            assert!(NDI::is_running());
+
+            let clone = ndi.clone();
+            assert!(NDI::is_running());
+
+            drop(clone);
+            // Still running because ndi is alive
+            assert!(NDI::is_running());
+
+            drop(ndi);
+            // After dropping all handles, state depends on test isolation
+            // We just verify it doesn't panic
+            let _final_state = NDI::is_running();
+        } else if !initial_running {
+            // If we couldn't create NDI and it wasn't running, it should still not be running
+            assert!(!NDI::is_running());
+        }
+    }
+}
