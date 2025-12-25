@@ -105,6 +105,9 @@ mod error;
 mod ndi_lib;
 mod recv_guard;
 
+#[cfg(feature = "advanced_sdk")]
+pub mod waitable_completion;
+
 pub mod finder;
 pub mod frames;
 pub mod receiver;

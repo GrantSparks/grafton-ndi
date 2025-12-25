@@ -1,9 +1,7 @@
 //! NDI sending functionality for video, audio, and metadata.
 
-#[cfg(all(target_os = "windows", not(feature = "advanced_sdk")))]
+#[cfg(target_os = "windows")]
 use std::sync::Mutex;
-#[cfg(feature = "advanced_sdk")]
-use std::sync::{Condvar, Mutex};
 use std::{
     ffi::{CStr, CString},
     fmt,
@@ -16,6 +14,9 @@ use std::{
     },
     time::Duration,
 };
+
+#[cfg(feature = "advanced_sdk")]
+use crate::waitable_completion::WaitableCompletion;
 
 use crate::{
     finder::Source,
@@ -58,11 +59,7 @@ struct AsyncState {
     video_callback: OnceLock<AsyncCallback>,
 
     #[cfg(feature = "advanced_sdk")]
-    completed: AtomicBool,
-    #[cfg(feature = "advanced_sdk")]
-    completion_lock: Mutex<()>,
-    #[cfg(feature = "advanced_sdk")]
-    completion_cv: Condvar,
+    completion: WaitableCompletion,
 }
 
 impl fmt::Debug for AsyncState {
@@ -73,7 +70,7 @@ impl fmt::Debug for AsyncState {
             .field("video_callback_set", &self.video_callback.get().is_some());
 
         #[cfg(feature = "advanced_sdk")]
-        dbg.field("completed", &self.completed);
+        dbg.field("completed", &self.completion.is_complete());
 
         dbg.finish()
     }
@@ -98,11 +95,7 @@ impl Default for AsyncState {
             video_callback: OnceLock::new(),
 
             #[cfg(feature = "advanced_sdk")]
-            completed: AtomicBool::new(true),
-            #[cfg(feature = "advanced_sdk")]
-            completion_lock: Mutex::new(()),
-            #[cfg(feature = "advanced_sdk")]
-            completion_cv: Condvar::new(),
+            completion: WaitableCompletion::new_completed(),
         }
     }
 }
@@ -517,61 +510,11 @@ impl Drop for AsyncVideoToken<'_, '_> {
         #[cfg(feature = "advanced_sdk")]
         {
             let timeout = Duration::from_secs(5);
-
-            // Use try_lock to avoid panic/abort on poisoned mutex in Drop
-            // If the lock is poisoned, we skip the wait (accepting potential resource leak
-            // is better than process abort)
-            let guard_result = self.inner.async_state.completion_lock.try_lock();
-            match guard_result {
-                Ok(mut guard) => {
-                    let start = std::time::Instant::now();
-
-                    while !self.inner.async_state.completed.load(Ordering::Acquire) {
-                        let elapsed = start.elapsed();
-                        if elapsed >= timeout {
-                            eprintln!(
-                                "Warning: AsyncVideoToken dropped after timeout waiting for NDI completion callback"
-                            );
-                            break;
-                        }
-
-                        let remaining = timeout - elapsed;
-                        // Use unwrap_or_else to handle poisoned mutex gracefully
-                        let wait_result = self
-                            .inner
-                            .async_state
-                            .completion_cv
-                            .wait_timeout(guard, remaining);
-                        match wait_result {
-                            Ok((new_guard, timeout_result)) => {
-                                guard = new_guard;
-                                if timeout_result.timed_out() {
-                                    eprintln!(
-                                        "Warning: AsyncVideoToken dropped after timeout waiting for NDI completion callback"
-                                    );
-                                    break;
-                                }
-                            }
-                            Err(poisoned) => {
-                                // Recover from poisoned mutex - the wait may have been interrupted
-                                // by a panic in another thread, but we can still proceed safely
-                                // PoisonError from wait_timeout contains (MutexGuard, WaitTimeoutResult)
-                                let (new_guard, _) = poisoned.into_inner();
-                                guard = new_guard;
-                                eprintln!(
-                                    "Warning: AsyncVideoToken recovered from poisoned mutex during wait"
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(_) => {
-                    // Lock is held by another thread or poisoned - skip the wait
-                    eprintln!(
-                        "Warning: AsyncVideoToken skipping wait due to lock contention or poison"
-                    );
-                }
-            }
+            let _ = self
+                .inner
+                .async_state
+                .completion
+                .try_wait_timeout(timeout, "AsyncVideoToken");
 
             if let Some(callback) = self.inner.async_state.video_callback.get() {
                 callback(self._buffer.len());
@@ -660,7 +603,7 @@ impl<'a, 'buf> AsyncVideoToken<'a, 'buf> {
     /// ```
     #[cfg(feature = "advanced_sdk")]
     pub fn is_complete(&self) -> bool {
-        self.inner.async_state.completed.load(Ordering::Acquire)
+        self.inner.async_state.completion.is_complete()
     }
 }
 
@@ -766,16 +709,7 @@ impl<'a> Sender<'a> {
                             0
                         };
 
-                        inner.async_state.completed.store(true, Ordering::Release);
-                        {
-                            // Use unwrap_or_else to handle poisoned mutex gracefully
-                            let _lock = inner
-                                .async_state
-                                .completion_lock
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            inner.async_state.completion_cv.notify_all();
-                        }
+                        inner.async_state.completion.signal();
 
                         if let Some(cb) = inner.async_state.video_callback.get() {
                             (cb)(len);
@@ -865,10 +799,7 @@ impl<'a> Sender<'a> {
     ) -> AsyncVideoToken<'b, 'b> {
         #[cfg(feature = "advanced_sdk")]
         {
-            self.inner
-                .async_state
-                .completed
-                .store(false, Ordering::Release);
+            self.inner.async_state.completion.reset();
         }
 
         unsafe {
@@ -1196,49 +1127,11 @@ impl<'a> Sender<'a> {
     pub fn flush_async(&self, timeout: Duration) -> Result<()> {
         #[cfg(feature = "advanced_sdk")]
         {
-            // Handle poisoned mutex gracefully - recover the inner data
-            let mut guard = self
-                .inner
+            self.inner
                 .async_state
-                .completion_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let start = std::time::Instant::now();
-
-            while !self.inner.async_state.completed.load(Ordering::Acquire) {
-                let elapsed = start.elapsed();
-                if elapsed >= timeout {
-                    return Err(Error::Timeout(format!(
-                        "Async video frame did not complete within {timeout:?}"
-                    )));
-                }
-
-                let remaining = timeout - elapsed;
-                // Handle poisoned mutex gracefully during wait
-                let wait_result = self
-                    .inner
-                    .async_state
-                    .completion_cv
-                    .wait_timeout(guard, remaining);
-                match wait_result {
-                    Ok((new_guard, timeout_result)) => {
-                        guard = new_guard;
-                        if timeout_result.timed_out() {
-                            return Err(Error::Timeout(format!(
-                                "Async video frame did not complete within {timeout:?}"
-                            )));
-                        }
-                    }
-                    Err(poisoned) => {
-                        // Recover from poisoned mutex
-                        // PoisonError from wait_timeout contains (MutexGuard, WaitTimeoutResult)
-                        let (new_guard, _) = poisoned.into_inner();
-                        guard = new_guard;
-                    }
-                }
-            }
-
-            Ok(())
+                .completion
+                .wait_timeout(timeout)
+                .map_err(Error::Timeout)
         }
 
         #[cfg(not(feature = "advanced_sdk"))]
@@ -1288,53 +1181,11 @@ impl Drop for Sender<'_> {
                 }
 
                 let timeout = Duration::from_secs(5);
-                // Use try_lock to avoid panic/abort on poisoned mutex in Drop
-                // If the lock is poisoned, we skip the wait (resource leak is better than abort)
-                let guard_result = self.inner.async_state.completion_lock.try_lock();
-                if let Ok(mut guard) = guard_result {
-                    let start = std::time::Instant::now();
-
-                    while !self.inner.async_state.completed.load(Ordering::Acquire) {
-                        let elapsed = start.elapsed();
-                        if elapsed >= timeout {
-                            eprintln!(
-                                "Warning: Sender dropped after timeout waiting for callback completion"
-                            );
-                            break;
-                        }
-
-                        let remaining = timeout - elapsed;
-                        // Handle poisoned mutex gracefully
-                        let wait_result = self
-                            .inner
-                            .async_state
-                            .completion_cv
-                            .wait_timeout(guard, remaining);
-                        match wait_result {
-                            Ok((new_guard, timeout_result)) => {
-                                guard = new_guard;
-                                if timeout_result.timed_out() {
-                                    eprintln!(
-                                        "Warning: Sender dropped after timeout waiting for callback completion"
-                                    );
-                                    break;
-                                }
-                            }
-                            Err(poisoned) => {
-                                // Recover from poisoned mutex gracefully
-                                // PoisonError from wait_timeout contains (MutexGuard, WaitTimeoutResult)
-                                let (new_guard, _) = poisoned.into_inner();
-                                guard = new_guard;
-                                eprintln!(
-                                    "Warning: Sender recovered from poisoned mutex during wait"
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    // Lock is held or poisoned - skip the wait
-                    eprintln!("Warning: Sender skipping wait due to lock contention or poison");
-                }
+                let _ = self
+                    .inner
+                    .async_state
+                    .completion
+                    .try_wait_timeout(timeout, "Sender");
 
                 self.inner
                     .callback_ptr
