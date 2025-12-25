@@ -42,6 +42,66 @@ use crate::{
     to_ms_checked, Error, Result, NDI,
 };
 
+/// Retry policy configuration for frame capture operations.
+///
+/// This struct encapsulates the timing parameters for the retry loop used in
+/// blocking capture methods (`capture_video`, `capture_audio`, `capture_metadata`).
+struct RetryPolicy {
+    /// Timeout per individual capture attempt.
+    poll_interval: Duration,
+    /// Sleep duration between retry attempts to avoid busy-waiting.
+    sleep_between: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_millis(100),
+            sleep_between: Duration::from_millis(10),
+        }
+    }
+}
+
+/// Generic retry helper for frame capture operations.
+///
+/// This function encapsulates the retry logic that handles NDI SDK synchronization
+/// behavior during initial connection. The first few capture calls may return
+/// immediately while the stream synchronizes.
+///
+/// # Parameters
+///
+/// - `timeout`: Total time allowed for the operation to succeed.
+/// - `policy`: Retry timing configuration.
+/// - `capture_fn`: A closure that attempts to capture a frame with a given timeout.
+///
+/// # Returns
+///
+/// - `Ok(T)`: The captured frame on success.
+/// - `Err(Error::FrameTimeout)`: If no frame is captured within the total timeout.
+fn retry_capture<T, F>(timeout: Duration, policy: &RetryPolicy, mut capture_fn: F) -> Result<T>
+where
+    F: FnMut(Duration) -> Result<Option<T>>,
+{
+    let start_time = std::time::Instant::now();
+    let mut attempts = 0;
+
+    loop {
+        attempts += 1;
+
+        let elapsed = start_time.elapsed();
+        if elapsed > timeout {
+            return Err(Error::FrameTimeout { attempts, elapsed });
+        }
+
+        match capture_fn(policy.poll_interval)? {
+            Some(frame) => return Ok(frame),
+            None => {
+                std::thread::sleep(policy.sleep_between);
+            }
+        }
+    }
+}
+
 macro_rules! ptz_command {
     ($self:expr, $func:ident, $err_msg:expr) => {
         if unsafe { $func($self.instance) } {
@@ -713,29 +773,9 @@ impl Receiver {
     /// # }
     /// ```
     pub fn capture_video(&self, timeout: Duration) -> Result<VideoFrame> {
-        let start_time = std::time::Instant::now();
-        let mut attempts = 0;
-
-        loop {
-            attempts += 1;
-
-            // Check if we've exceeded our total timeout
-            let elapsed = start_time.elapsed();
-            if elapsed > timeout {
-                return Err(Error::FrameTimeout { attempts, elapsed });
-            }
-
-            // Try to capture with a short per-attempt timeout (100ms)
-            // During initial connection, the NDI SDK returns immediately while synchronizing.
-            // After synchronization, this succeeds on first attempt (zero overhead).
-            match self.capture_video_timeout(Duration::from_millis(100))? {
-                Some(frame) => return Ok(frame),
-                None => {
-                    // Brief sleep before retry to avoid busy-waiting
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
-        }
+        retry_capture(timeout, &RetryPolicy::default(), |poll| {
+            self.capture_video_timeout(poll)
+        })
     }
 
     /// Capture a video frame with a timeout (polling variant).
@@ -888,27 +928,9 @@ impl Receiver {
     /// # }
     /// ```
     pub fn capture_audio(&self, timeout: Duration) -> Result<AudioFrame> {
-        let start_time = std::time::Instant::now();
-        let mut attempts = 0;
-
-        loop {
-            attempts += 1;
-
-            // Check if we've exceeded our total timeout
-            let elapsed = start_time.elapsed();
-            if elapsed > timeout {
-                return Err(Error::FrameTimeout { attempts, elapsed });
-            }
-
-            // Try to capture with a short per-attempt timeout (100ms)
-            match self.capture_audio_timeout(Duration::from_millis(100))? {
-                Some(frame) => return Ok(frame),
-                None => {
-                    // Brief sleep before retry to avoid busy-waiting
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
-        }
+        retry_capture(timeout, &RetryPolicy::default(), |poll| {
+            self.capture_audio_timeout(poll)
+        })
     }
 
     /// Capture an audio frame with a timeout (polling variant).
@@ -1059,27 +1081,9 @@ impl Receiver {
     /// # }
     /// ```
     pub fn capture_metadata(&self, timeout: Duration) -> Result<MetadataFrame> {
-        let start_time = std::time::Instant::now();
-        let mut attempts = 0;
-
-        loop {
-            attempts += 1;
-
-            // Check if we've exceeded our total timeout
-            let elapsed = start_time.elapsed();
-            if elapsed > timeout {
-                return Err(Error::FrameTimeout { attempts, elapsed });
-            }
-
-            // Try to capture with a short per-attempt timeout (100ms)
-            match self.capture_metadata_timeout(Duration::from_millis(100))? {
-                Some(frame) => return Ok(frame),
-                None => {
-                    // Brief sleep before retry to avoid busy-waiting
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
-        }
+        retry_capture(timeout, &RetryPolicy::default(), |poll| {
+            self.capture_metadata_timeout(poll)
+        })
     }
 
     /// Capture a metadata frame with a timeout (polling variant).
@@ -1459,5 +1463,64 @@ impl ConnectionStats {
     /// Returns `true` if there is at least one active connection.
     pub fn is_connected(&self) -> bool {
         self.connections > 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_succeeds_first_attempt() {
+        let result = retry_capture(Duration::from_secs(1), &RetryPolicy::default(), |_| {
+            Ok(Some(42))
+        });
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[test]
+    fn retry_succeeds_after_n_attempts() {
+        let attempts = std::cell::Cell::new(0);
+        let result = retry_capture(Duration::from_secs(1), &RetryPolicy::default(), |_| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < 3 {
+                Ok(None)
+            } else {
+                Ok(Some(42))
+            }
+        });
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[test]
+    fn retry_times_out() {
+        let policy = RetryPolicy {
+            poll_interval: Duration::from_millis(20),
+            sleep_between: Duration::from_millis(5),
+        };
+        let result: Result<i32> = retry_capture(Duration::from_millis(50), &policy, |_| Ok(None));
+        match result {
+            Err(Error::FrameTimeout { attempts, elapsed }) => {
+                assert!(attempts > 0, "Should have made at least one attempt");
+                assert!(
+                    elapsed >= Duration::from_millis(50),
+                    "Elapsed time should be at least the timeout"
+                );
+            }
+            _ => panic!("Expected FrameTimeout error"),
+        }
+    }
+
+    #[test]
+    fn retry_propagates_error() {
+        let result: Result<i32> =
+            retry_capture(Duration::from_secs(1), &RetryPolicy::default(), |_| {
+                Err(Error::CaptureFailed("test error".into()))
+            });
+        assert!(
+            matches!(result, Err(Error::CaptureFailed(_))),
+            "Should propagate CaptureFailed error"
+        );
     }
 }
