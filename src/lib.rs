@@ -105,6 +105,8 @@ mod error;
 mod ndi_lib;
 mod recv_guard;
 
+pub mod framesync;
+
 #[cfg(feature = "advanced_sdk")]
 pub mod waitable_completion;
 
@@ -131,6 +133,7 @@ pub use {
         LineStrideOrSize, MetadataFrame, MetadataFrameRef, PixelFormat, PixelFormatInfo, ScanType,
         VideoFrame, VideoFrameBuilder, VideoFrameRef,
     },
+    framesync::{FrameSync, FrameSyncAudioRef, FrameSyncVideoRef},
     receiver::{
         ConnectionStats, FrameType, Receiver, ReceiverBandwidth, ReceiverColorFormat,
         ReceiverOptions, ReceiverOptionsBuilder, ReceiverStatus, Tally,
