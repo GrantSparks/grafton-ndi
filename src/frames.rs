@@ -990,28 +990,15 @@ impl AudioFrame {
 
         let samples_per_channel = self.num_samples as usize;
 
-        if self.channel_stride_in_bytes == 0 {
-            // Interleaved format: extract samples for the requested channel
-            let channels = self.num_channels as usize;
-            let channel_data: Vec<f32> = self
-                .data
-                .iter()
-                .skip(channel)
-                .step_by(channels)
-                .copied()
-                .collect();
-            Some(channel_data)
-        } else {
-            // Planar format: channel data is contiguous
-            let stride_in_samples = self.channel_stride_in_bytes as usize / 4; // f32 = 4 bytes
-            let start = channel * stride_in_samples;
-            let end = start + samples_per_channel;
+        // Planar format: channel data is contiguous
+        let stride_in_samples = self.channel_stride_in_bytes as usize / 4; // f32 = 4 bytes
+        let start = channel * stride_in_samples;
+        let end = start + samples_per_channel;
 
-            if end <= self.data.len() {
-                Some(self.data[start..end].to_vec())
-            } else {
-                None
-            }
+        if end <= self.data.len() {
+            Some(self.data[start..end].to_vec())
+        } else {
+            None
         }
     }
 }
@@ -1133,21 +1120,68 @@ impl AudioFrameBuilder {
 
     /// Build the AudioFrame
     ///
-    /// Calculates the appropriate `channel_stride_in_bytes` based on the configured layout:
-    /// - **Planar** (default): stride = num_samples * 4 (4 bytes per f32 sample)
-    /// - **Interleaved**: stride = 0
+    /// If interleaved data is provided, convert it to planar using the SDK provided utility
+    /// functions. Interleaved is just an addition in the NDI SDK, planar is the expected default.
     pub fn build(self) -> Result<AudioFrame> {
         let sample_rate = self.sample_rate.unwrap_or(48000);
         let num_channels = self.num_channels.unwrap_or(2);
         let num_samples = self.num_samples.unwrap_or(1024);
         let format = self.format.unwrap_or(AudioFormat::FLTP);
         let layout = self.layout.unwrap_or(AudioLayout::Planar);
+        let timecode = self.timecode.unwrap_or(0);
 
-        let data = if let Some(data) = self.data {
-            data
+        let sample_count = (num_samples * num_channels) as usize;
+
+        let data = if let Some(mut input_data) = self.data {
+            match layout {
+                AudioLayout::Planar => input_data,
+                AudioLayout::Interleaved_f32 => {
+                    // Allocate output buffer for planar data
+                    let mut planar_data = vec![0.0f32; sample_count];
+
+                    // Create the interleaved source frame
+                    let src_frame = NDIlib_audio_frame_interleaved_32f_t {
+                        sample_rate,
+                        no_channels: num_channels,
+                        no_samples: num_samples,
+                        timecode,
+                        p_data: input_data.as_mut_ptr(),
+                    };
+
+                    // Create the destination v3 frame with our buffer
+                    // The stride for planar format is num_samples * sizeof(f32)
+                    // This is just a placeholder that will be dropped after the converison call
+                    let channel_stride = num_samples * 4;
+                    let mut dst_frame = NDIlib_audio_frame_v3_t {
+                        sample_rate,
+                        no_channels: num_channels,
+                        no_samples: num_samples,
+                        timecode,
+                        FourCC: format.into(),
+                        p_data: planar_data.as_mut_ptr() as *mut u8,
+                        __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                            channel_stride_in_bytes: channel_stride,
+                        },
+                        p_metadata: ptr::null(),
+                        timestamp: 0,
+                    };
+
+                    // Convert interleaved -> planar
+                    let success = unsafe {
+                        NDIlib_util_audio_from_interleaved_32f_v3(&src_frame, &mut dst_frame)
+                    };
+
+                    if !success {
+                        return Err(Error::InvalidFrame(
+                            "Failed to convert interleaved audio to planar format".to_string(),
+                        ));
+                    }
+
+                    planar_data
+                }
+            }
         } else {
-            // Calculate default buffer size for f32 samples
-            let sample_count = (num_samples * num_channels) as usize;
+            // No data provided, create zeroed buffer
             vec![0.0f32; sample_count]
         };
 
@@ -1156,19 +1190,14 @@ impl AudioFrameBuilder {
             .map(|m| CString::new(m).map_err(Error::InvalidCString))
             .transpose()?;
 
-        // Calculate channel_stride_in_bytes based on layout
-        // Planar: Each channel has num_samples * sizeof(f32) bytes
-        // Interleaved: 0 indicates interleaved format
-        let channel_stride_in_bytes = match layout {
-            AudioLayout::Planar => num_samples * 4, // 4 bytes per f32
-            AudioLayout::Interleaved => 0,
-        };
+        // Planar format always uses stride = num_samples * 4
+        let channel_stride_in_bytes = num_samples * 4; // 4 bytes per f32
 
         Ok(AudioFrame {
             sample_rate,
             num_channels,
             num_samples,
-            timecode: self.timecode.unwrap_or(0),
+            timecode,
             format,
             data,
             channel_stride_in_bytes,
@@ -1246,7 +1275,7 @@ pub enum AudioLayout {
     /// `[C0S0, C1S0, C0S1, C1S1, C0S2, C1S2]`
     ///
     /// This format alternates between channels for each sample.
-    Interleaved,
+    Interleaved_f32,
 }
 
 impl From<AudioFormat> for i32 {

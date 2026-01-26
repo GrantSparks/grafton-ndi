@@ -125,16 +125,18 @@ fn test_audio_frame_channel_data_interleaved() {
     use crate::AudioLayout;
 
     let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let samples = 3;
     let frame = AudioFrame::builder()
         .sample_rate(48000)
         .channels(2)
-        .samples(3)
+        .samples(samples)
         .data(data)
-        .layout(AudioLayout::Interleaved)
+        .layout(AudioLayout::Interleaved_f32)
         .build()
         .unwrap();
 
-    assert_eq!(frame.channel_stride_in_bytes, 0);
+    // 4 bytes per f32 sample
+    assert_eq!(frame.channel_stride_in_bytes, 4i32 * samples as i32);
 
     let ch0 = frame.channel_data(0).unwrap();
     assert_eq!(ch0, vec![1.0, 3.0, 5.0]);
