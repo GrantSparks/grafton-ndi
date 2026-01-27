@@ -982,36 +982,24 @@ impl AudioFrame {
         &self.data
     }
 
-    /// Get audio data for a specific channel (if planar format)
+    /// Get audio data for a specific channel
+    ///
+    /// Data is always stored in planar format internally. If `AudioLayout::Interleaved`
+    /// was specified at build time, the data was converted to planar during construction.
     pub fn channel_data(&self, channel: usize) -> Option<Vec<f32>> {
         if channel >= self.num_channels as usize {
             return None;
         }
 
         let samples_per_channel = self.num_samples as usize;
+        let stride_in_samples = self.channel_stride_in_bytes as usize / 4; // f32 = 4 bytes
+        let start = channel * stride_in_samples;
+        let end = start + samples_per_channel;
 
-        if self.channel_stride_in_bytes == 0 {
-            // Interleaved format: extract samples for the requested channel
-            let channels = self.num_channels as usize;
-            let channel_data: Vec<f32> = self
-                .data
-                .iter()
-                .skip(channel)
-                .step_by(channels)
-                .copied()
-                .collect();
-            Some(channel_data)
+        if end <= self.data.len() {
+            Some(self.data[start..end].to_vec())
         } else {
-            // Planar format: channel data is contiguous
-            let stride_in_samples = self.channel_stride_in_bytes as usize / 4; // f32 = 4 bytes
-            let start = channel * stride_in_samples;
-            let end = start + samples_per_channel;
-
-            if end <= self.data.len() {
-                Some(self.data[start..end].to_vec())
-            } else {
-                None
-            }
+            None
         }
     }
 }
@@ -1108,9 +1096,10 @@ impl AudioFrameBuilder {
 
     /// Set the audio data as 32-bit floats
     ///
-    /// The data layout must match the configured `AudioLayout`:
+    /// The data length must equal `num_channels * num_samples`. The layout must match
+    /// the configured `AudioLayout`:
     /// - **Planar**: `[C0S0, C0S1, ..., C1S0, C1S1, ...]`
-    /// - **Interleaved**: `[C0S0, C1S0, C0S1, C1S1, ...]`
+    /// - **Interleaved**: `[C0S0, C1S0, C0S1, C1S1, ...]` (converted to planar at build time)
     #[must_use]
     pub fn data(mut self, data: Vec<f32>) -> Self {
         self.data = Some(data);
@@ -1133,21 +1122,44 @@ impl AudioFrameBuilder {
 
     /// Build the AudioFrame
     ///
-    /// Calculates the appropriate `channel_stride_in_bytes` based on the configured layout:
-    /// - **Planar** (default): stride = num_samples * 4 (4 bytes per f32 sample)
-    /// - **Interleaved**: stride = 0
+    /// When `AudioLayout::Interleaved` is set, the input data is converted to planar
+    /// format using the NDI SDK utility function. The resulting frame always stores
+    /// planar data with `channel_stride_in_bytes = num_samples * 4`.
     pub fn build(self) -> Result<AudioFrame> {
         let sample_rate = self.sample_rate.unwrap_or(48000);
         let num_channels = self.num_channels.unwrap_or(2);
         let num_samples = self.num_samples.unwrap_or(1024);
         let format = self.format.unwrap_or(AudioFormat::FLTP);
         let layout = self.layout.unwrap_or(AudioLayout::Planar);
+        let timecode = self.timecode.unwrap_or(0);
+        let sample_count = (num_samples as usize) * (num_channels as usize);
 
-        let data = if let Some(data) = self.data {
-            data
+        let data = if let Some(input_data) = self.data {
+            if input_data.len() != sample_count {
+                return Err(Error::InvalidFrame(format!(
+                    "Audio data length {}, expected {} ({}ch x {}samples)",
+                    input_data.len(),
+                    sample_count,
+                    num_channels,
+                    num_samples
+                )));
+            }
+
+            match layout {
+                AudioLayout::Planar => input_data,
+                AudioLayout::Interleaved => {
+                    let nc = num_channels as usize;
+                    let ns = num_samples as usize;
+                    let mut planar = vec![0.0f32; sample_count];
+                    for ch in 0..nc {
+                        for s in 0..ns {
+                            planar[ch * ns + s] = input_data[s * nc + ch];
+                        }
+                    }
+                    planar
+                }
+            }
         } else {
-            // Calculate default buffer size for f32 samples
-            let sample_count = (num_samples * num_channels) as usize;
             vec![0.0f32; sample_count]
         };
 
@@ -1156,19 +1168,14 @@ impl AudioFrameBuilder {
             .map(|m| CString::new(m).map_err(Error::InvalidCString))
             .transpose()?;
 
-        // Calculate channel_stride_in_bytes based on layout
-        // Planar: Each channel has num_samples * sizeof(f32) bytes
-        // Interleaved: 0 indicates interleaved format
-        let channel_stride_in_bytes = match layout {
-            AudioLayout::Planar => num_samples * 4, // 4 bytes per f32
-            AudioLayout::Interleaved => 0,
-        };
+        // Data is always planar: stride = num_samples * sizeof(f32)
+        let channel_stride_in_bytes = num_samples * 4;
 
         Ok(AudioFrame {
             sample_rate,
             num_channels,
             num_samples,
-            timecode: self.timecode.unwrap_or(0),
+            timecode,
             format,
             data,
             channel_stride_in_bytes,
@@ -1242,10 +1249,11 @@ pub enum AudioLayout {
 
     /// Interleaved format: Samples from all channels are interleaved.
     ///
-    /// Memory layout for 2 channels, 3 samples:
+    /// Input memory layout for 2 channels, 3 samples:
     /// `[C0S0, C1S0, C0S1, C1S1, C0S2, C1S2]`
     ///
-    /// This format alternates between channels for each sample.
+    /// Interleaved data is converted to planar format at build time using the NDI SDK
+    /// utility function, so the resulting `AudioFrame` always stores planar data.
     Interleaved,
 }
 
