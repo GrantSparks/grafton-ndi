@@ -5,17 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.10.0] - 2025-12-25
+## [0.10.0] - 2026-01-27
 
 ### Overview
 
-Version 0.10.0 continues the API refinement journey toward 1.0, focusing on internal architecture improvements and better abstractions. This release includes breaking changes to support more robust async operations and unified pixel format handling.
+Version 0.10.0 continues the API refinement journey toward 1.0, with significant new features, safety improvements, and architecture refinements. This release includes breaking changes to support more robust async operations, unified pixel format handling, and new APIs for frame synchronization and interleaved audio.
 
 **Key Improvements:**
-- 🏗️ **Unified Async Architecture**: Single generic `AsyncReceiverGeneric<R>` replaces duplicate implementations
-- 📐 **Pixel Format API**: New `PixelFormatInfo` provides compile-time format properties
-- 🔄 **Completion Waiting**: New `WaitableCompletion` abstraction for async operations
-- 🛡️ **Robustness**: Lock-free atomics eliminate mutex poisoning hazards
+- **FrameSync API**: Clock-corrected video/audio capture with automatic resampling
+- **Memory-Safe FrameRef**: Validated zero-copy frame APIs with checked arithmetic
+- **Interleaved Audio Fix**: Pure Rust deinterleave replaces broken stride=0 handling ([#45](https://github.com/GrantSparks/grafton-ndi/issues/45))
+- **Runtime Lifecycle**: Proper state machine supports re-initialization and retry after failure
+- **Unified Async Architecture**: Single generic `AsyncReceiverGeneric<R>` replaces duplicate implementations
+- **Pixel Format API**: New `PixelFormatInfo` provides compile-time format properties
+- **Robustness**: Lock-free atomics and poison recovery eliminate mutex hazards
+- **Linux CI**: Full Linux support in CI workflow
 
 ---
 
@@ -110,6 +114,56 @@ match completion.try_wait_timeout(Duration::from_secs(5), "operation") {
 }
 ```
 
+#### 3. FrameSync API ([#42](https://github.com/GrantSparks/grafton-ndi/issues/42))
+
+New `FrameSync` type wraps the NDI FrameSync API, transforming push-based NDI streams into pull-based capture with automatic time-base correction and dynamic audio resampling.
+
+```rust
+use grafton_ndi::FrameSync;
+
+let frame_sync = FrameSync::new(&receiver)?;
+
+// Capture clock-corrected video (returns immediately)
+let video = frame_sync.capture_video();
+
+// Capture resampled audio at requested rate/channels
+let audio = frame_sync.capture_audio(48000, 2);
+
+// Check queue depth
+let depth = frame_sync.audio_queue_depth();
+```
+
+**New Types:**
+- `FrameSync<'rx>` - Frame synchronizer tied to receiver lifetime
+- `FrameSyncVideoRef<'fs>` - Zero-copy borrowed video with RAII cleanup
+- `FrameSyncAudioRef<'fs>` - Zero-copy borrowed audio with RAII cleanup
+
+#### 4. Memory-Safe Zero-Copy FrameRef APIs ([#43](https://github.com/GrantSparks/grafton-ndi/issues/43))
+
+`VideoFrameRef` and `AudioFrameRef` now validate frame metadata at construction time using checked arithmetic, preventing undefined behavior from corrupted SDK data.
+
+- Null `p_data` pointer checks
+- Pixel/audio format validation
+- Checked arithmetic (`usize::try_from`, `checked_mul`, `checked_add`)
+- Maximum buffer caps: 100 MiB (video), 64 MiB (audio)
+- Layout cached at construction for O(1) `data()` access
+
+---
+
+### Bug Fixes
+
+#### 1. Interleaved Audio Not Working ([#45](https://github.com/GrantSparks/grafton-ndi/issues/45))
+
+Interleaved audio was silently broken — the previous implementation set stride to 0, producing no audio output on NDI receivers. The fix converts interleaved input to planar format at build time using a pure Rust index transpose, so `AudioFrameBuilder` now correctly handles `AudioLayout::Interleaved`. Thanks to [@adaichendt-appear](https://github.com/adaichendt-appear) for reporting and the initial fix approach in [#46](https://github.com/GrantSparks/grafton-ndi/pull/46).
+
+#### 2. Runtime Lifecycle ([#41](https://github.com/GrantSparks/grafton-ndi/issues/41))
+
+Replaced `std::sync::Once` + atomics with a proper `Mutex`+`Condvar` state machine that supports re-initialization after teardown, retry after initialization failure, and condvar waits instead of spin loops.
+
+#### 3. SourceCache Mutex Poisoning ([#40](https://github.com/GrantSparks/grafton-ndi/issues/40))
+
+Applied poison recovery pattern to all 6 mutex access points in `SourceCache`, preventing cascading panics when a thread panics while holding the cache lock.
+
 ---
 
 ### Deprecated
@@ -144,6 +198,12 @@ match completion.try_wait_timeout(Duration::from_secs(5), "operation") {
 - New `WaitableCompletion` struct encapsulates atomic flag, mutex, and condvar
 - Eliminated ~100 lines of duplicated wait-for-completion logic
 - Single point of maintenance for poison recovery logic
+
+#### Linux CI Support
+
+- Added `ubuntu-latest` to CI test and semver job matrices
+- Created `setup-ndi-linux` composite action for NDI SDK installation
+- Added library symlink creation for versioned NDI shared libraries
 
 ---
 
