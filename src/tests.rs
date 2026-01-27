@@ -124,6 +124,7 @@ fn test_audio_frame_drop_no_double_free() {
 fn test_audio_frame_channel_data_interleaved() {
     use crate::AudioLayout;
 
+    // Interleaved input: [C0S0, C1S0, C0S1, C1S1, C0S2, C1S2]
     let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
     let frame = AudioFrame::builder()
         .sample_rate(48000)
@@ -134,8 +135,10 @@ fn test_audio_frame_channel_data_interleaved() {
         .build()
         .unwrap();
 
-    assert_eq!(frame.channel_stride_in_bytes, 0);
+    // Data is converted to planar at build time, stride is always set
+    assert_eq!(frame.channel_stride_in_bytes, 12); // 3 samples * 4 bytes
 
+    // After conversion, channel_data should return the de-interleaved samples
     let ch0 = frame.channel_data(0).unwrap();
     assert_eq!(ch0, vec![1.0, 3.0, 5.0]);
 
@@ -143,6 +146,45 @@ fn test_audio_frame_channel_data_interleaved() {
     assert_eq!(ch1, vec![2.0, 4.0, 6.0]);
 
     assert!(frame.channel_data(2).is_none());
+}
+
+#[test]
+fn test_audio_frame_builder_data_length_validation() {
+    use crate::AudioLayout;
+
+    // Too few samples
+    let result = AudioFrame::builder()
+        .channels(2)
+        .samples(3)
+        .data(vec![1.0, 2.0, 3.0]) // 3 instead of 6
+        .layout(AudioLayout::Planar)
+        .build();
+
+    assert!(result.is_err());
+    match result {
+        Err(Error::InvalidFrame(msg)) => {
+            assert!(msg.contains("Audio data length 3"));
+            assert!(msg.contains("expected 6"));
+        }
+        _ => panic!("Expected InvalidFrame error"),
+    }
+
+    // Too many samples
+    let result = AudioFrame::builder()
+        .channels(2)
+        .samples(3)
+        .data(vec![1.0; 10])
+        .layout(AudioLayout::Interleaved)
+        .build();
+
+    assert!(result.is_err());
+    match result {
+        Err(Error::InvalidFrame(msg)) => {
+            assert!(msg.contains("Audio data length 10"));
+            assert!(msg.contains("expected 6"));
+        }
+        _ => panic!("Expected InvalidFrame error"),
+    }
 }
 
 #[test]
