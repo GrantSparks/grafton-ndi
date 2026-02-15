@@ -4,20 +4,18 @@
 use std::sync::Mutex;
 use std::{
     ffi::{CStr, CString},
-    fmt,
-    os::raw::c_void,
-    ptr,
-    sync::{
-        atomic::{AtomicPtr, AtomicUsize},
-        Arc, OnceLock,
-    },
+    fmt, ptr,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
-#[cfg(feature = "advanced_sdk")]
-use std::sync::atomic::Ordering;
+#[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
+use std::os::raw::c_void;
 
-#[cfg(feature = "advanced_sdk")]
+#[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
+use std::sync::atomic::{AtomicPtr, Ordering};
+
+#[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
 use crate::waitable_completion::WaitableCompletion;
 
 use crate::{
@@ -36,12 +34,50 @@ compile_error!(
 #[cfg(target_os = "windows")]
 static FLUSH_MUTEX: Mutex<()> = Mutex::new(());
 
+/// Send a null frame to flush the async video pipeline.
+///
+/// This blocks until the NDI SDK releases any in-flight buffer.
+fn flush_null_frame(instance: NDIlib_send_instance_t) {
+    let null_frame = NDIlib_video_frame_v2_t {
+        p_data: ptr::null_mut(),
+        xres: 0,
+        yres: 0,
+        FourCC: 0,
+        frame_rate_N: 0,
+        frame_rate_D: 0,
+        picture_aspect_ratio: 0.0,
+        frame_format_type: 0,
+        timecode: 0,
+        __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+            line_stride_in_bytes: 0,
+        },
+        p_metadata: ptr::null(),
+        timestamp: 0,
+    };
+
+    #[cfg(target_os = "windows")]
+    {
+        let _lock = FLUSH_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            NDIlib_send_send_video_async_v2(instance, &null_frame);
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    unsafe {
+        NDIlib_send_send_video_async_v2(instance, &null_frame);
+    }
+}
+
 /// Internal state that is reference-counted and shared between SendInstance and tokens
 struct Inner {
     instance: NDIlib_send_instance_t,
     _name: CString,
     _groups: Option<CString>,
     async_state: AsyncState,
+    #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
     callback_ptr: AtomicPtr<c_void>,
 }
 
@@ -55,22 +91,18 @@ type AsyncCallback = Box<dyn Fn(usize) + Send + Sync>;
 
 /// Async completion state for video frames
 struct AsyncState {
-    video_buffer_ptr: AtomicPtr<u8>,
-    video_buffer_len: AtomicUsize,
     video_callback: OnceLock<AsyncCallback>,
 
-    #[cfg(feature = "advanced_sdk")]
+    #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
     completion: WaitableCompletion,
 }
 
 impl fmt::Debug for AsyncState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut dbg = f.debug_struct("AsyncState");
-        dbg.field("video_buffer_ptr", &self.video_buffer_ptr)
-            .field("video_buffer_len", &self.video_buffer_len)
-            .field("video_callback_set", &self.video_callback.get().is_some());
+        dbg.field("video_callback_set", &self.video_callback.get().is_some());
 
-        #[cfg(feature = "advanced_sdk")]
+        #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
         dbg.field("completed", &self.completion.is_complete());
 
         dbg.finish()
@@ -79,22 +111,23 @@ impl fmt::Debug for AsyncState {
 
 impl fmt::Debug for Inner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Inner")
-            .field("instance", &self.instance)
-            .field("async_state", &self.async_state)
-            .field("callback_ptr", &self.callback_ptr)
-            .finish()
+        let mut dbg = f.debug_struct("Inner");
+        dbg.field("instance", &self.instance)
+            .field("async_state", &self.async_state);
+
+        #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
+        dbg.field("callback_ptr", &self.callback_ptr);
+
+        dbg.finish()
     }
 }
 
 impl Default for AsyncState {
     fn default() -> Self {
         Self {
-            video_buffer_ptr: AtomicPtr::new(ptr::null_mut()),
-            video_buffer_len: AtomicUsize::new(0),
             video_callback: OnceLock::new(),
 
-            #[cfg(feature = "advanced_sdk")]
+            #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
             completion: WaitableCompletion::new_completed(),
         }
     }
@@ -455,61 +488,29 @@ pub struct AsyncVideoToken<'a, 'buf> {
 
 impl Drop for AsyncVideoToken<'_, '_> {
     fn drop(&mut self) {
-        #[cfg(not(feature = "advanced_sdk"))]
+        // Callback-capable: try signal-based completion, fall back to null-frame flush
+        #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
         {
-            // SAFETY: The borrow checker guarantees that no AsyncVideoToken can outlive its
-            // Sender (the token holds &'a Arc<Inner> where 'a borrows &mut Sender), so
-            // Inner is always alive when this runs. We can safely flush without a guard.
-            let null_frame = NDIlib_video_frame_v2_t {
-                p_data: std::ptr::null_mut(),
-                xres: 0,
-                yres: 0,
-                FourCC: 0,
-                frame_rate_N: 0,
-                frame_rate_D: 0,
-                picture_aspect_ratio: 0.0,
-                frame_format_type: 0,
-                timecode: 0,
-                __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
-                    line_stride_in_bytes: 0,
-                },
-                p_metadata: std::ptr::null(),
-                timestamp: 0,
-            };
-
-            #[cfg(target_os = "windows")]
-            {
-                // Use unwrap_or_else to handle poisoned mutex gracefully in Drop
-                let _lock = FLUSH_MUTEX
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                unsafe {
-                    NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
-                }
-            }
-
-            #[cfg(not(target_os = "windows"))]
-            unsafe {
-                NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
-            }
-
-            if let Some(callback) = self.inner.async_state.video_callback.get() {
-                callback(self._buffer.len());
-            }
-        }
-
-        #[cfg(feature = "advanced_sdk")]
-        {
-            let timeout = Duration::from_secs(5);
-            let _ = self
+            if self
                 .inner
                 .async_state
                 .completion
-                .try_wait_timeout(timeout, "AsyncVideoToken");
-
-            if let Some(callback) = self.inner.async_state.video_callback.get() {
-                callback(self._buffer.len());
+                .wait_timeout(Duration::from_secs(5))
+                .is_err()
+            {
+                flush_null_frame(self.inner.instance);
             }
+        }
+
+        // Non-callback: always null-frame flush (guaranteed completion)
+        #[cfg(not(all(feature = "advanced_sdk", has_async_completion_callback)))]
+        {
+            flush_null_frame(self.inner.instance);
+        }
+
+        // User callback: exactly once, after completion is guaranteed
+        if let Some(callback) = self.inner.async_state.video_callback.get() {
+            callback(self._buffer.len());
         }
     }
 }
@@ -524,13 +525,14 @@ impl<'a, 'buf> AsyncVideoToken<'a, 'buf> {
     ///
     /// - **Standard SDK**: Sends a NULL frame to flush the pipeline, blocking until all pending
     ///   async video operations complete. This is the same behavior as dropping the token.
-    /// - **Advanced SDK** (with `advanced_sdk` feature): Waits for the SDK completion callback to signal
-    ///   that the buffer has been released, with a 5-second timeout.
+    /// - **Advanced SDK** (with `advanced_sdk` and `has_async_completion_callback`): Waits for the
+    ///   SDK completion callback to signal that the buffer has been released, with a 5-second
+    ///   timeout. Falls back to null-frame flush if the timeout elapses.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Timeout`] if waiting for completion times out (advanced SDK only).
-    /// With the standard SDK, this method always succeeds but may block.
+    /// Currently always returns `Ok(())`. The `Result` return type is preserved for forward
+    /// compatibility.
     ///
     /// # Examples
     ///
@@ -559,10 +561,10 @@ impl<'a, 'buf> AsyncVideoToken<'a, 'buf> {
         Ok(())
     }
 
-    /// Check if the async video operation has completed (advanced SDK only).
+    /// Check if the async video operation has completed (advanced SDK with callback support only).
     ///
-    /// This method is only available when the `advanced_sdk` feature is enabled, as it requires
-    /// SDK completion callbacks to track the completion state.
+    /// This method is only available when the `advanced_sdk` feature is enabled and the SDK
+    /// provides async completion callbacks (`has_async_completion_callback` cfg).
     ///
     /// # Returns
     ///
@@ -592,7 +594,7 @@ impl<'a, 'buf> AsyncVideoToken<'a, 'buf> {
     /// # }
     /// # }
     /// ```
-    #[cfg(feature = "advanced_sdk")]
+    #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
     pub fn is_complete(&self) -> bool {
         self.inner.async_state.completion.is_complete()
     }
@@ -649,10 +651,11 @@ impl Sender {
                 _name: name_cstr,
                 _groups: groups_cstr,
                 async_state: AsyncState::default(),
+                #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
                 callback_ptr: AtomicPtr::new(ptr::null_mut()),
             });
 
-            #[cfg(feature = "advanced_sdk")]
+            #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
             {
                 // Store a non-owning pointer for the callback (no refcount increment)
                 // SAFETY: The pointer remains valid as long as the Arc<Inner> exists,
@@ -661,55 +664,24 @@ impl Sender {
                 let raw_inner = Arc::as_ptr(&inner) as *mut c_void;
                 inner.callback_ptr.store(raw_inner, Ordering::Release);
 
-                // Only called via FFI callback when has_async_completion_callback cfg is enabled
-                #[allow(dead_code)]
                 extern "C" fn video_done_cb(
                     opaque: *mut c_void,
-                    frame: *const NDIlib_video_frame_v2_t,
+                    _frame: *const NDIlib_video_frame_v2_t,
                 ) {
-                    unsafe {
-                        // SAFETY: opaque is a non-owning pointer to Inner, created via Arc::as_ptr.
-                        // The pointer remains valid because:
-                        // 1. The callback is unregistered in Inner::drop before Inner is destroyed
-                        // 2. The Arc<Inner> is kept alive by the Sender that registered this callback
-                        let inner: &Inner = &*(opaque as *const Inner);
-
-                        let len = if !frame.is_null() {
-                            #[allow(clippy::unnecessary_cast)]
-                            let fourcc = PixelFormat::try_from((*frame).FourCC as u32)
-                                .unwrap_or(PixelFormat::BGRA);
-
-                            if fourcc.is_uncompressed() {
-                                let line_stride = (*frame).__bindgen_anon_1.line_stride_in_bytes;
-                                let height = (*frame).yres;
-                                fourcc.info().buffer_len(line_stride, height)
-                            } else {
-                                (*frame).__bindgen_anon_1.data_size_in_bytes as usize
-                            }
-                        } else {
-                            0
-                        };
-
-                        inner.async_state.completion.signal();
-
-                        if let Some(cb) = inner.async_state.video_callback.get() {
-                            (cb)(len);
-                        }
-                    }
+                    // SAFETY: opaque is a non-owning pointer to Inner, created via Arc::as_ptr.
+                    // The pointer remains valid because:
+                    // 1. Inner::drop flushes in-flight frames before unregistering the callback
+                    // 2. The Arc<Inner> is kept alive by the Sender that registered this callback
+                    let inner: &Inner = unsafe { &*(opaque as *const Inner) };
+                    inner.async_state.completion.signal();
                 }
 
-                #[cfg(has_async_completion_callback)]
                 unsafe {
                     NDIlib_send_set_video_async_completion(
                         instance,
                         raw_inner,
                         Some(video_done_cb),
                     );
-                }
-
-                #[cfg(not(has_async_completion_callback))]
-                {
-                    inner.callback_ptr.store(ptr::null_mut(), Ordering::Release);
                 }
             }
 
@@ -778,7 +750,7 @@ impl Sender {
         &'b mut self,
         video_frame: &BorrowedVideoFrame<'b>,
     ) -> AsyncVideoToken<'b, 'b> {
-        #[cfg(feature = "advanced_sdk")]
+        #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
         {
             self.inner.async_state.completion.reset();
         }
@@ -1043,38 +1015,7 @@ impl Sender {
     /// # }
     /// ```
     pub fn flush_async_blocking(&self) {
-        let null_frame = NDIlib_video_frame_v2_t {
-            p_data: std::ptr::null_mut(),
-            xres: 0,
-            yres: 0,
-            FourCC: 0,
-            frame_rate_N: 0,
-            frame_rate_D: 0,
-            picture_aspect_ratio: 0.0,
-            frame_format_type: 0,
-            timecode: 0,
-            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
-                line_stride_in_bytes: 0,
-            },
-            p_metadata: std::ptr::null(),
-            timestamp: 0,
-        };
-
-        #[cfg(target_os = "windows")]
-        {
-            // Use unwrap_or_else to handle poisoned mutex gracefully
-            let _lock = FLUSH_MUTEX
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            unsafe {
-                NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
-            }
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        unsafe {
-            NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
-        }
+        flush_null_frame(self.inner.instance);
     }
 
     /// Wait for pending async operations with timeout.
@@ -1106,7 +1047,7 @@ impl Sender {
     /// # }
     /// ```
     pub fn flush_async(&self, timeout: Duration) -> Result<()> {
-        #[cfg(feature = "advanced_sdk")]
+        #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
         {
             self.inner
                 .async_state
@@ -1115,7 +1056,7 @@ impl Sender {
                 .map_err(Error::Timeout)
         }
 
-        #[cfg(not(feature = "advanced_sdk"))]
+        #[cfg(not(all(feature = "advanced_sdk", has_async_completion_callback)))]
         {
             let _ = timeout;
             self.flush_async_blocking();
@@ -1126,26 +1067,16 @@ impl Sender {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // Unregister the async completion callback before destroying the instance,
-        // ensuring no callbacks fire after the instance is gone.
+        // 1. Flush any in-flight async video (guaranteed completion)
+        flush_null_frame(self.instance);
+
+        // 2. Now safe to unregister the callback (no in-flight frame can trigger it)
         #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
-        {
-            let callback_ptr = self.callback_ptr.load(Ordering::Acquire);
-            if !callback_ptr.is_null() {
-                unsafe {
-                    NDIlib_send_set_video_async_completion(self.instance, ptr::null_mut(), None);
-                }
-
-                let timeout = Duration::from_secs(5);
-                let _ = self
-                    .async_state
-                    .completion
-                    .try_wait_timeout(timeout, "Sender");
-
-                self.callback_ptr.store(ptr::null_mut(), Ordering::Release);
-            }
+        unsafe {
+            NDIlib_send_set_video_async_completion(self.instance, ptr::null_mut(), None);
         }
 
+        // 3. Destroy the instance
         unsafe {
             NDIlib_send_destroy(self.instance);
         }
