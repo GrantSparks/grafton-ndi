@@ -5,7 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.11.0] - 2026-02-15
+
+### Overview
+
+Version 0.11.0 focuses on ergonomics and async video safety. Lifetime parameters have been removed from `Finder`, `Sender`, and `FrameSync`, making these types much easier to store in structs and use across async boundaries. The async video send lifecycle has been hardened to eliminate double-callbacks and guarantee safe completion in all configurations.
+
+**Key Improvements:**
+- **Lifetime-free types**: `Finder`, `Sender`, and `FrameSync` no longer carry lifetime parameters
+- **Safe async video lifecycle**: Hardened callback, teardown, and drop ordering ([#44](https://github.com/GrantSparks/grafton-ndi/issues/44))
+- **Owned CString resources**: Sender internals use owned types, eliminating manual cleanup
+- **Simplified completion API**: `WaitableCompletion::wait_timeout` replaces `try_wait_timeout`/`TryWaitResult`
+
+---
 
 ### Breaking Changes
 
@@ -17,12 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`AsyncVideoToken::is_complete` now requires `has_async_completion_callback` cfg**: Previously gated on `advanced_sdk` alone, it is now gated on `all(feature = "advanced_sdk", has_async_completion_callback)` since the completion signal is only available when the callback is registered.
 - **`Sender::flush_async` fallback behavior changed**: Without `has_async_completion_callback`, `flush_async` now falls back to `flush_async_blocking` (null-frame flush) regardless of the `advanced_sdk` feature, since there is no completion signal to wait on.
 
+---
+
 ### Fixed
 
 - **Double callback in async video lifecycle** ([#44](https://github.com/GrantSparks/grafton-ndi/issues/44)): The user-provided `on_async_video_done` callback previously fired twice — once from the NDI SDK's `video_done_cb` on the SDK thread and once from `AsyncVideoToken::drop` on the caller thread. The callback now fires exactly once from the RAII `Drop` boundary, after buffer release is guaranteed.
 - **Unsafe teardown order in `Inner::drop`** ([#44](https://github.com/GrantSparks/grafton-ndi/issues/44)): Previously unregistered the completion callback before flushing in-flight frames, which suppressed the signal needed for completion. Now flushes first (guaranteed completion via null frame), then unregisters the callback, then destroys the instance.
 - **Best-effort drop could skip waiting** ([#44](https://github.com/GrantSparks/grafton-ndi/issues/44)): `AsyncVideoToken::drop` previously used `try_lock` via `try_wait_timeout`, which could skip waiting entirely under lock contention. Now uses `wait_timeout` (blocking) with a 5-second timeout, falling back to a deterministic null-frame flush if the timeout elapses.
 - **Uncompletable state in `advanced_sdk` without callback** ([#44](https://github.com/GrantSparks/grafton-ndi/issues/44)): When `advanced_sdk` was enabled but `has_async_completion_callback` was not available, the completion signal was reset but never signaled, leading to timeout-only "safety". The completion field and all related logic are now gated on `all(feature = "advanced_sdk", has_async_completion_callback)`.
+
+---
 
 ### Changed
 
@@ -31,12 +47,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Extracted `flush_null_frame` helper**: The null-frame flush pattern (previously duplicated in `AsyncVideoToken::drop`, `flush_async_blocking`, and `Inner::drop`) is now a single private function, reducing code duplication and ensuring consistent behavior across all flush sites.
 - **`callback_ptr` field on `Inner` is now gated**: Only present when `all(feature = "advanced_sdk", has_async_completion_callback)` is active, reducing struct size in non-callback builds.
 
+---
+
 ### Removed
 
 - **`TryWaitResult` enum**: No longer needed; replaced by `Result<(), String>` from `wait_timeout`.
 - **`WaitableCompletion::try_wait_timeout` method**: Replaced by `wait_timeout` which provides deterministic blocking behavior without `try_lock` or stderr output.
 - **`AsyncState::video_buffer_ptr` and `AsyncState::video_buffer_len` fields**: These were never read and served no purpose.
 - **`eprintln!` warnings from library code**: All stderr output has been removed from `waitable_completion.rs` and `sender.rs`.
+
+---
+
+### Migration Guide
+
+#### Removing Lifetime Parameters
+
+Types that previously borrowed their dependencies now own them:
+
+```rust
+// Before (0.10.0) — lifetime parameters required
+let finder: Finder<'_> = Finder::new(&ndi, &options)?;
+let sender: Sender<'_> = Sender::new(&ndi, &options)?;
+let frame_sync: FrameSync<'_> = FrameSync::new(&receiver)?;
+
+// After (0.11.0) — no lifetime parameters
+let finder = Finder::new(&ndi, &options)?;   // clones NDI handle internally
+let sender = Sender::new(&ndi, &options)?;   // clones NDI handle internally
+let frame_sync = FrameSync::new(receiver)?;  // takes ownership of Receiver
+```
+
+For `FrameSync`, use `receiver()` to borrow the underlying `Receiver` or `into_receiver()` to recover ownership.
+
+#### Replacing TryWaitResult (advanced_sdk only)
+
+```rust
+// Before (0.10.0)
+use grafton_ndi::waitable_completion::{WaitableCompletion, TryWaitResult};
+
+match completion.try_wait_timeout(Duration::from_secs(5), "operation") {
+    TryWaitResult::Completed => { /* done */ },
+    TryWaitResult::Timeout => { /* timed out */ },
+    TryWaitResult::LockUnavailable => { /* contention */ },
+}
+
+// After (0.11.0)
+use grafton_ndi::waitable_completion::WaitableCompletion;
+
+match completion.wait_timeout(Duration::from_secs(5), "operation") {
+    Ok(()) => { /* done */ },
+    Err(reason) => { /* timed out: reason */ },
+}
+```
 
 ## [0.10.0] - 2026-01-27
 
@@ -152,15 +213,17 @@ match completion.try_wait_timeout(Duration::from_secs(5), "operation") {
 New `FrameSync` type wraps the NDI FrameSync API, transforming push-based NDI streams into pull-based capture with automatic time-base correction and dynamic audio resampling.
 
 ```rust
-use grafton_ndi::FrameSync;
+use grafton_ndi::{FrameSync, ScanType};
 
 let frame_sync = FrameSync::new(&receiver)?;
 
 // Capture clock-corrected video (returns immediately)
-let video = frame_sync.capture_video();
+if let Some(video) = frame_sync.capture_video(ScanType::Progressive) {
+    println!("{}x{}", video.width(), video.height());
+}
 
-// Capture resampled audio at requested rate/channels
-let audio = frame_sync.capture_audio(48000, 2);
+// Capture resampled audio at requested rate/channels/samples
+let audio = frame_sync.capture_audio(48000, 2, 1024);
 
 // Check queue depth
 let depth = frame_sync.audio_queue_depth();
