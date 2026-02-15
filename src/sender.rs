@@ -5,7 +5,6 @@ use std::sync::Mutex;
 use std::{
     ffi::{CStr, CString},
     fmt,
-    marker::PhantomData,
     os::raw::{c_char, c_void},
     ptr,
     sync::{
@@ -45,9 +44,9 @@ struct Inner {
 }
 
 #[derive(Debug)]
-pub struct Sender<'a> {
+pub struct Sender {
     inner: Arc<Inner>,
-    ndi: PhantomData<&'a NDI>,
+    _ndi: NDI,
 }
 
 type AsyncCallback = Box<dyn Fn(usize) + Send + Sync>;
@@ -607,7 +606,7 @@ impl<'a, 'buf> AsyncVideoToken<'a, 'buf> {
     }
 }
 
-impl<'a> Sender<'a> {
+impl Sender {
     /// Creates a new NDI send instance.
     ///
     /// # Errors
@@ -618,7 +617,7 @@ impl<'a> Sender<'a> {
     /// - The sender name contains a null byte
     /// - The groups string contains a null byte
     /// - NDI fails to create the send instance
-    pub fn new(_ndi: &'a NDI, create_settings: &SenderOptions) -> Result<Self> {
+    pub fn new(ndi: &NDI, create_settings: &SenderOptions) -> Result<Self> {
         // Validate sender name
         if create_settings.name.trim().is_empty() {
             return Err(Error::InvalidConfiguration(
@@ -734,7 +733,7 @@ impl<'a> Sender<'a> {
 
             Ok(Self {
                 inner,
-                ndi: PhantomData,
+                _ndi: ndi.clone(),
             })
         }
     }
@@ -1166,7 +1165,7 @@ impl Drop for Inner {
     }
 }
 
-impl Drop for Sender<'_> {
+impl Drop for Sender {
     fn drop(&mut self) {
         #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
         {
@@ -1212,7 +1211,7 @@ impl Drop for Sender<'_> {
 ///
 /// Functions like `NDIlib_send_create` and `NDIlib_send_destroy` should be called
 /// from a single thread.
-unsafe impl Send for Sender<'_> {}
+unsafe impl Send for Sender {}
 
 /// # Safety
 ///
@@ -1225,7 +1224,7 @@ unsafe impl Send for Sender<'_> {}
 ///
 /// Note: Creation and destruction (`NDIlib_send_create`/`NDIlib_send_destroy`)
 /// are handled in our Rust wrapper to ensure single-threaded access.
-unsafe impl Sync for Sender<'_> {}
+unsafe impl Sync for Sender {}
 
 #[derive(Debug)]
 pub struct SenderOptions {

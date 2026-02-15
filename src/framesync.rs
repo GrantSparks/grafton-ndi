@@ -54,7 +54,7 @@
 //!     let receiver = Receiver::new(&ndi, &options)?;
 //!
 //!     // Create frame-sync from receiver
-//!     let framesync = FrameSync::new(&receiver)?;
+//!     let framesync = FrameSync::new(receiver)?;
 //!
 //!     // Capture video synced to your output timing
 //!     if let Some(frame) = framesync.capture_video(ScanType::Progressive) {
@@ -69,7 +69,7 @@
 //! }
 //! ```
 
-use std::{ffi::CStr, fmt, marker::PhantomData, slice};
+use std::{ffi::CStr, fmt, mem::ManuallyDrop, ptr, slice};
 
 use crate::{
     frames::{AudioFormat, AudioFrame, LineStrideOrSize, PixelFormat, ScanType, VideoFrame},
@@ -83,11 +83,12 @@ use crate::{
 /// Converts push-based NDI streams into pull-based capture with automatic
 /// time-base correction and dynamic audio resampling.
 ///
-/// # Lifetime
+/// # Ownership
 ///
-/// The `'rx` lifetime ties this `FrameSync` to the [`Receiver`] that created it.
-/// This ensures the receiver cannot be dropped while the FrameSync is alive,
-/// preventing use-after-free.
+/// `FrameSync` takes ownership of the [`Receiver`] (similar to how `BufWriter`
+/// wraps a `Write`). Use [`receiver()`](Self::receiver) to access the underlying
+/// receiver for tally, PTZ, or status operations. Use
+/// [`into_receiver()`](Self::into_receiver) to recover the receiver when done.
 ///
 /// # Thread Safety
 ///
@@ -104,7 +105,7 @@ use crate::{
 /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
 /// # let options = ReceiverOptions::builder(source).build();
 /// # let receiver = Receiver::new(&ndi, &options)?;
-/// let framesync = FrameSync::new(&receiver)?;
+/// let framesync = FrameSync::new(receiver)?;
 ///
 /// // FrameSync captures always return immediately
 /// if let Some(video) = framesync.capture_video(ScanType::Progressive) {
@@ -117,17 +118,17 @@ use crate::{
 /// # Ok(())
 /// # }
 /// ```
-pub struct FrameSync<'rx> {
+pub struct FrameSync {
     instance: NDIlib_framesync_instance_t,
-    _receiver: PhantomData<&'rx Receiver>,
+    receiver: Receiver,
 }
 
-impl<'rx> FrameSync<'rx> {
+impl FrameSync {
     /// Create a frame synchronizer from a receiver.
     ///
-    /// Once created, use the `FrameSync` for video/audio capture instead of
-    /// the receiver's capture methods. The receiver can still be used for
-    /// other operations (tally, PTZ, status, etc.).
+    /// Takes ownership of the receiver. Use [`receiver()`](Self::receiver)
+    /// to access the underlying receiver for tally, PTZ, or status operations.
+    /// Use [`into_receiver()`](Self::into_receiver) to recover the receiver.
     ///
     /// # Errors
     ///
@@ -142,11 +143,11 @@ impl<'rx> FrameSync<'rx> {
     /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
     /// # let options = ReceiverOptions::builder(source).build();
     /// let receiver = Receiver::new(&ndi, &options)?;
-    /// let framesync = FrameSync::new(&receiver)?;
+    /// let framesync = FrameSync::new(receiver)?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new(receiver: &'rx Receiver) -> Result<Self> {
+    pub fn new(receiver: Receiver) -> Result<Self> {
         let instance = unsafe { NDIlib_framesync_create(receiver.instance) };
 
         if instance.is_null() {
@@ -155,10 +156,31 @@ impl<'rx> FrameSync<'rx> {
             ));
         }
 
-        Ok(Self {
-            instance,
-            _receiver: PhantomData,
-        })
+        Ok(Self { instance, receiver })
+    }
+
+    /// Access the underlying receiver.
+    ///
+    /// Use this to access receiver functionality like tally, PTZ, or status
+    /// queries while the FrameSync is active.
+    pub fn receiver(&self) -> &Receiver {
+        &self.receiver
+    }
+
+    /// Consume the FrameSync and recover the underlying Receiver.
+    ///
+    /// This destroys the frame synchronizer and returns the receiver for
+    /// continued use with raw capture or for creating a new FrameSync.
+    pub fn into_receiver(self) -> Receiver {
+        // Destroy the framesync instance first, then extract the receiver
+        // without running Drop (which would double-destroy the framesync).
+        let this = ManuallyDrop::new(self);
+        unsafe {
+            NDIlib_framesync_destroy(this.instance);
+        }
+        // SAFETY: We will not use `this` again after reading the receiver field,
+        // and ManuallyDrop prevents the Drop impl from running.
+        unsafe { ptr::read(&this.receiver) }
     }
 
     /// Capture video with time-base correction.
@@ -188,7 +210,7 @@ impl<'rx> FrameSync<'rx> {
     /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
     /// # let options = ReceiverOptions::builder(source).build();
     /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// let framesync = FrameSync::new(&receiver)?;
+    /// let framesync = FrameSync::new(receiver)?;
     ///
     /// // Capture loop - call at your output frame rate
     /// loop {
@@ -280,7 +302,7 @@ impl<'rx> FrameSync<'rx> {
     /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
     /// # let options = ReceiverOptions::builder(source).build();
     /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// let framesync = FrameSync::new(&receiver)?;
+    /// let framesync = FrameSync::new(receiver)?;
     ///
     /// // Audio callback - called by sound card at its rate
     /// loop {
@@ -366,7 +388,7 @@ impl<'rx> FrameSync<'rx> {
     /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
     /// # let options = ReceiverOptions::builder(source).build();
     /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// let framesync = FrameSync::new(&receiver)?;
+    /// let framesync = FrameSync::new(receiver)?;
     ///
     /// // Check available samples before capture
     /// let available = framesync.audio_queue_depth();
@@ -379,7 +401,7 @@ impl<'rx> FrameSync<'rx> {
     }
 }
 
-impl Drop for FrameSync<'_> {
+impl Drop for FrameSync {
     fn drop(&mut self) {
         unsafe {
             NDIlib_framesync_destroy(self.instance);
@@ -391,15 +413,15 @@ impl Drop for FrameSync<'_> {
 ///
 /// The NDI SDK documentation states that framesync operations are thread-safe.
 /// The FrameSync struct only holds an opaque pointer returned by the SDK.
-unsafe impl Send for FrameSync<'_> {}
+unsafe impl Send for FrameSync {}
 
 /// # Safety
 ///
 /// The NDI SDK guarantees that framesync capture functions are internally
 /// synchronized and can be called concurrently from multiple threads.
-unsafe impl Sync for FrameSync<'_> {}
+unsafe impl Sync for FrameSync {}
 
-impl fmt::Debug for FrameSync<'_> {
+impl fmt::Debug for FrameSync {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FrameSync")
             .field("instance", &self.instance)
@@ -431,7 +453,7 @@ impl fmt::Debug for FrameSync<'_> {
 /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
 /// # let options = ReceiverOptions::builder(source).build();
 /// # let receiver = Receiver::new(&ndi, &options)?;
-/// let framesync = FrameSync::new(&receiver)?;
+/// let framesync = FrameSync::new(receiver)?;
 ///
 /// if let Some(frame_ref) = framesync.capture_video(ScanType::Progressive) {
 ///     let owned = frame_ref.to_owned()?;
@@ -441,7 +463,7 @@ impl fmt::Debug for FrameSync<'_> {
 /// # }
 /// ```
 pub struct FrameSyncVideoRef<'fs> {
-    framesync: &'fs FrameSync<'fs>,
+    framesync: &'fs FrameSync,
     frame: NDIlib_video_frame_v2_t,
     pixel_format: PixelFormat,
 }
@@ -601,7 +623,7 @@ impl fmt::Debug for FrameSyncVideoRef<'_> {
 /// If no audio is available, the SDK inserts silence. Check `sample_rate() == 0`
 /// to detect when no source audio has been received yet.
 pub struct FrameSyncAudioRef<'fs> {
-    framesync: &'fs FrameSync<'fs>,
+    framesync: &'fs FrameSync,
     frame: NDIlib_audio_frame_v3_t,
 }
 
@@ -716,10 +738,10 @@ mod tests {
 
     #[test]
     fn test_framesync_size() {
-        // FrameSync should be a small struct - just a pointer + PhantomData
+        // FrameSync contains an opaque pointer + the owned Receiver
         assert_eq!(
             std::mem::size_of::<FrameSync>(),
-            std::mem::size_of::<*mut ()>()
+            std::mem::size_of::<NDIlib_framesync_instance_t>() + std::mem::size_of::<Receiver>()
         );
     }
 

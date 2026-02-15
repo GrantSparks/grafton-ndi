@@ -4,7 +4,6 @@ use std::{
     collections::HashMap,
     ffi::{CStr, CString},
     fmt::{self, Display, Formatter},
-    marker::PhantomData,
     ptr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -139,26 +138,26 @@ impl Default for FinderOptionsBuilder {
 /// # Ok(())
 /// # }
 /// ```
-pub struct Finder<'a> {
+pub struct Finder {
     instance: NDIlib_find_instance_t,
     _groups: Option<CString>,    // Hold ownership of CStrings
     _extra_ips: Option<CString>, // to ensure they outlive SDK usage
-    ndi: PhantomData<&'a NDI>,
+    _ndi: NDI,
 }
 
-impl<'a> Finder<'a> {
+impl Finder {
     /// Creates a new source finder with the specified settings.
     ///
     /// # Arguments
     ///
-    /// * `ndi` - The NDI instance (must outlive this `Finder`)
+    /// * `ndi` - The NDI instance (cloned internally to keep the runtime alive)
     /// * `settings` - Configuration for source discovery
     ///
     /// # Errors
     ///
     /// Returns an error if the finder cannot be created, typically due to
     /// invalid settings or network issues.
-    pub fn new(_ndi: &'a NDI, settings: &FinderOptions) -> Result<Self> {
+    pub fn new(ndi: &NDI, settings: &FinderOptions) -> Result<Self> {
         let groups_cstr = settings
             .groups
             .as_deref()
@@ -188,7 +187,7 @@ impl<'a> Finder<'a> {
             instance,
             _groups: groups_cstr,
             _extra_ips: extra_ips_cstr,
-            ndi: PhantomData,
+            _ndi: ndi.clone(),
         })
     }
 
@@ -387,7 +386,7 @@ impl<'a> Finder<'a> {
     }
 }
 
-impl Drop for Finder<'_> {
+impl Drop for Finder {
     fn drop(&mut self) {
         unsafe { NDIlib_find_destroy(self.instance) };
     }
@@ -399,14 +398,14 @@ impl Drop for Finder<'_> {
 /// `NDIlib_find_create_v2`, `NDIlib_find_wait_for_sources`, and `NDIlib_find_get_sources`
 /// can be called from multiple threads. The Finder struct only holds an opaque pointer
 /// returned by the SDK and does not perform any mutations that could cause data races.
-unsafe impl std::marker::Send for Finder<'_> {}
+unsafe impl std::marker::Send for Finder {}
 
 /// # Safety
 ///
 /// The NDI SDK documentation guarantees thread-safety for find operations.
 /// Multiple threads can safely call methods on a shared Finder instance as the
 /// SDK handles all necessary synchronization internally.
-unsafe impl std::marker::Sync for Finder<'_> {}
+unsafe impl std::marker::Sync for Finder {}
 
 /// Network address of an NDI source.
 ///

@@ -121,7 +121,7 @@ New `FrameSync` type wraps the NDI FrameSync API, transforming push-based NDI st
 ```rust
 use grafton_ndi::FrameSync;
 
-let frame_sync = FrameSync::new(&receiver)?;
+let frame_sync = FrameSync::new(receiver)?;
 
 // Capture clock-corrected video (returns immediately)
 let video = frame_sync.capture_video();
@@ -134,7 +134,7 @@ let depth = frame_sync.audio_queue_depth();
 ```
 
 **New Types:**
-- `FrameSync<'rx>` - Frame synchronizer tied to receiver lifetime
+- `FrameSync` - Frame synchronizer that owns the receiver
 - `FrameSyncVideoRef<'fs>` - Zero-copy borrowed video with RAII cleanup
 - `FrameSyncAudioRef<'fs>` - Zero-copy borrowed audio with RAII cleanup
 

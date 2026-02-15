@@ -113,7 +113,7 @@ fn main() -> Result<(), Error> {
     let receiver = Receiver::new(&ndi, &options)?;
 
     println!("Creating FrameSync for clock-corrected capture...");
-    let framesync = FrameSync::new(&receiver)?;
+    let framesync = FrameSync::new(receiver)?;
 
     println!("FrameSync created successfully");
     println!("\nCapturing {frame_count} frames with FrameSync...\n");
