@@ -17,6 +17,7 @@ High-performance, idiomatic Rust bindings for the [NDI® 6 SDK](https://ndi.vide
 - **Image encoding** - One-line PNG/JPEG encoding and base64 data URLs (optional feature)
 - **Async runtime support** - Native integration with Tokio and async-std (optional features)
 - **Thread-safe by design** - Safe concurrent access with Rust's ownership model
+- **Frame synchronization** - Clock-corrected capture with automatic audio resampling via `FrameSync`
 - **Ergonomic API** - Consistent, idiomatic Rust interface ready for 1.0
 - **Comprehensive type safety** - Strongly-typed with forward-compatible `#[non_exhaustive]` enums
 - **Cross-platform** - Full support for Windows, Linux, and macOS
@@ -54,17 +55,17 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-grafton-ndi = "0.9"
+grafton-ndi = "0.11"
 
 # For NDI Advanced SDK features (optional)
-# grafton-ndi = { version = "0.9", features = ["advanced_sdk"] }
+# grafton-ndi = { version = "0.11", features = ["advanced_sdk"] }
 
 # For image encoding support (PNG/JPEG)
-# grafton-ndi = { version = "0.9", features = ["image-encoding"] }
+# grafton-ndi = { version = "0.11", features = ["image-encoding"] }
 
 # For async runtime integration
-# grafton-ndi = { version = "0.9", features = ["tokio"] }
-# grafton-ndi = { version = "0.9", features = ["async-std"] }
+# grafton-ndi = { version = "0.11", features = ["tokio"] }
+# grafton-ndi = { version = "0.11", features = ["async-std"] }
 ```
 
 ### Prerequisites
@@ -142,13 +143,49 @@ Sends video, audio, and metadata as an NDI source.
 let options = SenderOptions::builder("Source Name")
     .clock_video(true)
     .build();  // Infallible
-let mut sender = grafton_ndi::Sender::new(&ndi, &options)?;  // Must be mut for async send
+let sender = grafton_ndi::Sender::new(&ndi, &options)?;
 
 // Synchronous send
 sender.send_video(&video_frame);
 
-// Or async zero-copy send
+// Or async zero-copy send (requires &mut self)
+let mut sender = grafton_ndi::Sender::new(&ndi, &options)?;
 let token = sender.send_video_async(&borrowed_frame);
+```
+
+### `FrameSync` - Clock-Corrected Capture
+Wraps a `Receiver` to provide pull-based capture with automatic time-base correction and dynamic audio resampling. Captures always return immediately.
+
+```rust
+use grafton_ndi::FrameSync;
+
+// FrameSync takes ownership of the receiver
+let frame_sync = FrameSync::new(receiver)?;
+
+// Capture clock-corrected video (returns immediately)
+if let Some(video) = frame_sync.capture_video(ScanType::Progressive) {
+    println!("Video: {}x{}", video.width(), video.height());
+}
+
+// Capture resampled audio at requested rate/channels/samples
+let audio = frame_sync.capture_audio(48000, 2, 1024);
+
+// Access the underlying receiver for tally, PTZ, or status
+let recv = frame_sync.receiver();
+
+// Recover the receiver when done
+let receiver = frame_sync.into_receiver();
+```
+
+### `PixelFormat` - Format Utilities
+Pixel format information with compile-time computation for stride and buffer sizes.
+
+```rust
+use grafton_ndi::PixelFormat;
+
+let stride = PixelFormat::BGRA.line_stride(1920);
+let size = PixelFormat::BGRA.buffer_size(1920, 1080);
+let info = PixelFormat::BGRA.info();  // PixelFormatInfo with bytes_per_pixel, category
 ```
 
 ### Frame Types
@@ -162,10 +199,11 @@ let token = sender.send_video_async(&borrowed_frame);
   - `AudioFrameRef<'rx>` - Zero-copy audio frame reference
   - `MetadataFrameRef<'rx>` - Zero-copy metadata frame reference
   - `BorrowedVideoFrame<'buf>` - Zero-copy send frame (for async transmission)
+  - `FrameSyncVideoRef<'fs>` / `FrameSyncAudioRef<'fs>` - Zero-copy frames from `FrameSync`
 
 ## Thread Safety
 
-All primary types (`Finder`, `Receiver`, `Sender`) are `Send + Sync` as the underlying NDI SDK is thread-safe. You can safely share instances across threads, though performance is best when keeping instances thread-local.
+All primary types (`Finder`, `Receiver`, `Sender`, `FrameSync`) are `Send + Sync` as the underlying NDI SDK is thread-safe. You can safely share instances across threads, though performance is best when keeping instances thread-local. Note that borrowed frame references (`*FrameRef`, `FrameSyncVideoRef`, `FrameSyncAudioRef`) are not `Send`, as they hold references to SDK-internal buffers.
 
 ## Performance Considerations
 
@@ -221,6 +259,7 @@ See the `examples/` directory for complete applications:
 ### Receiving
 - `NDIlib_Recv_Audio.rs` - Receive and process audio streams
 - `NDIlib_Recv_Audio_16bpp.rs` - Receive 16-bit audio samples
+- `NDIlib_Recv_FrameSync.rs` - Clock-corrected capture with FrameSync
 - `NDIlib_Recv_PNG.rs` - Receive video and save as PNG images
 - `NDIlib_Recv_PTZ.rs` - Control PTZ cameras
 - `concurrent_capture.rs` - Capture from multiple sources simultaneously
@@ -257,51 +296,3 @@ Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for detai
 This is an unofficial community project and is not affiliated with NewTek or Vizrt.
 
 NDI® is a registered trademark of Vizrt NDI AB.
-
-## What's New in 0.9
-
-Version 0.9.0 is a **major milestone** toward 1.0, with comprehensive API stabilization and significant improvements:
-
-### 🎯 API Stabilization for 1.0
-- **Duration-based timeouts** - All timeout parameters now use `std::time::Duration` instead of `u32` milliseconds
-- **Consistent builders** - Both `Receiver` and `Sender` have symmetric, infallible builders
-- **Simplified capture** - 2 clear variants instead of 3 confusing ones (`capture_*` and `capture_*_timeout`)
-- **Type renames** - `FourCCVideoType` → `PixelFormat`, `FrameFormatType` → `ScanType`, `AudioType` → `AudioFormat`
-- **Forward compatibility** - All enums marked `#[non_exhaustive]` for future SDK versions
-- **Cleaner naming** - Removed `get_` prefixes per Rust API guidelines
-
-### 🚀 Zero-Copy Performance
-- **Zero-copy receive** - New `VideoFrameRef`, `AudioFrameRef`, `MetadataFrameRef` types
-- **Performance gain** - Eliminates ~475 MB/s of memcpy at 1080p@60fps
-- **Lifetime-safe** - Frame refs bound to `Receiver` lifetime, preventing use-after-free at compile-time
-
-### 🔒 Memory Safety & Correctness
-- **Sound async send** - Fixed critical use-after-free in `send_video_async`
-- **Typed stride/size** - Eliminated UB from union field access with typed `LineStrideOrSize` enum
-- **Non-null FFI** - All source pointers validated at FFI boundary
-- **Safe callbacks** - Fixed memory leaks and races in async completion callbacks
-
-### 🛠️ Ergonomics & Features
-- **Source caching** - Thread-safe `SourceCache` eliminates ~150 lines of boilerplate
-- **Image encoding** - One-line PNG/JPEG export (optional `image-encoding` feature)
-- **Async runtimes** - Native Tokio and async-std integration (optional features)
-- **Audio fixed** - Audio sending now actually works with proper `AudioLayout` support
-
-### ⚠️ Breaking Changes
-This release contains extensive breaking changes necessary for API stabilization. See [CHANGELOG.md](CHANGELOG.md) for the comprehensive migration guide with before/after examples.
-
-**Quick migration:**
-```rust
-// 0.8.1
-finder.wait_for_sources(5000);
-let sources = finder.get_sources(0)?;
-let frame = receiver.capture_video_blocking(5000)?;
-
-// 0.9.0
-use std::time::Duration;
-finder.wait_for_sources(Duration::from_secs(5))?;
-let sources = finder.sources(Duration::ZERO)?;
-let frame = receiver.capture_video(Duration::from_secs(5))?;
-```
-
-See [CHANGELOG.md](CHANGELOG.md) for complete details and migration guide.
