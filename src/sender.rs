@@ -5,14 +5,17 @@ use std::sync::Mutex;
 use std::{
     ffi::{CStr, CString},
     fmt,
-    os::raw::{c_char, c_void},
+    os::raw::c_void,
     ptr,
     sync::{
-        atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
+        atomic::{AtomicPtr, AtomicUsize},
         Arc, OnceLock,
     },
     time::Duration,
 };
+
+#[cfg(feature = "advanced_sdk")]
+use std::sync::atomic::Ordering;
 
 #[cfg(feature = "advanced_sdk")]
 use crate::waitable_completion::WaitableCompletion;
@@ -36,10 +39,9 @@ static FLUSH_MUTEX: Mutex<()> = Mutex::new(());
 /// Internal state that is reference-counted and shared between SendInstance and tokens
 struct Inner {
     instance: NDIlib_send_instance_t,
-    name: *mut c_char,
-    groups: *mut c_char,
+    _name: CString,
+    _groups: Option<CString>,
     async_state: AsyncState,
-    destroyed: AtomicBool,
     callback_ptr: AtomicPtr<c_void>,
 }
 
@@ -80,7 +82,6 @@ impl fmt::Debug for Inner {
         f.debug_struct("Inner")
             .field("instance", &self.instance)
             .field("async_state", &self.async_state)
-            .field("destroyed", &self.destroyed)
             .field("callback_ptr", &self.callback_ptr)
             .finish()
     }
@@ -103,8 +104,8 @@ impl Default for AsyncState {
 unsafe impl Send for AsyncState {}
 unsafe impl Sync for AsyncState {}
 
-// SAFETY: Inner contains NDI instance pointer which is thread-safe,
-// and all other fields are thread-safe atomics or Send+Sync types
+// SAFETY: Inner contains an NDI instance pointer which is thread-safe,
+// owned CStrings (Send+Sync), and thread-safe atomics.
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
@@ -447,9 +448,6 @@ impl<'buf> From<&'buf VideoFrame> for BorrowedVideoFrame<'buf> {
 /// NDI SDK releases the buffer before the token's borrows expire.
 #[must_use = "AsyncVideoToken must be held to track the async operation"]
 pub struct AsyncVideoToken<'a, 'buf> {
-    // False positive: this field IS read in Drop impl (self.inner.destroyed, self.inner.instance, etc.)
-    // The compiler doesn't track field access through references in Drop
-    #[allow(dead_code)]
     inner: &'a Arc<Inner>,
     _buffer: &'buf [u8],
     _metadata: Option<&'buf CStr>,
@@ -459,46 +457,40 @@ impl Drop for AsyncVideoToken<'_, '_> {
     fn drop(&mut self) {
         #[cfg(not(feature = "advanced_sdk"))]
         {
-            // Use compare_exchange to atomically check if Inner is being destroyed
-            let not_destroyed = self
-                .inner
-                .destroyed
-                .compare_exchange(false, false, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok();
+            // SAFETY: The borrow checker guarantees that no AsyncVideoToken can outlive its
+            // Sender (the token holds &'a Arc<Inner> where 'a borrows &mut Sender), so
+            // Inner is always alive when this runs. We can safely flush without a guard.
+            let null_frame = NDIlib_video_frame_v2_t {
+                p_data: std::ptr::null_mut(),
+                xres: 0,
+                yres: 0,
+                FourCC: 0,
+                frame_rate_N: 0,
+                frame_rate_D: 0,
+                picture_aspect_ratio: 0.0,
+                frame_format_type: 0,
+                timecode: 0,
+                __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                    line_stride_in_bytes: 0,
+                },
+                p_metadata: std::ptr::null(),
+                timestamp: 0,
+            };
 
-            if not_destroyed {
-                let null_frame = NDIlib_video_frame_v2_t {
-                    p_data: std::ptr::null_mut(),
-                    xres: 0,
-                    yres: 0,
-                    FourCC: 0,
-                    frame_rate_N: 0,
-                    frame_rate_D: 0,
-                    picture_aspect_ratio: 0.0,
-                    frame_format_type: 0,
-                    timecode: 0,
-                    __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
-                        line_stride_in_bytes: 0,
-                    },
-                    p_metadata: std::ptr::null(),
-                    timestamp: 0,
-                };
-
-                #[cfg(target_os = "windows")]
-                {
-                    // Use unwrap_or_else to handle poisoned mutex gracefully in Drop
-                    let _lock = FLUSH_MUTEX
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    unsafe {
-                        NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
-                    }
-                }
-
-                #[cfg(not(target_os = "windows"))]
+            #[cfg(target_os = "windows")]
+            {
+                // Use unwrap_or_else to handle poisoned mutex gracefully in Drop
+                let _lock = FLUSH_MUTEX
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 unsafe {
                     NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
                 }
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            unsafe {
+                NDIlib_send_send_video_async_v2(self.inner.instance, &null_frame);
             }
 
             if let Some(callback) = self.inner.async_state.video_callback.get() {
@@ -632,41 +624,31 @@ impl Sender {
             ));
         }
 
-        let p_ndi_name =
+        let name_cstr =
             CString::new(create_settings.name.clone()).map_err(Error::InvalidCString)?;
-        let p_groups = match &create_settings.groups {
-            Some(groups) => CString::new(groups.clone())
-                .map_err(Error::InvalidCString)?
-                .into_raw(),
-            None => ptr::null_mut(),
+        let groups_cstr = match &create_settings.groups {
+            Some(groups) => Some(CString::new(groups.clone()).map_err(Error::InvalidCString)?),
+            None => None,
         };
 
-        let p_ndi_name_raw = p_ndi_name.into_raw();
         let c_settings = NDIlib_send_create_t {
-            p_ndi_name: p_ndi_name_raw,
-            p_groups,
+            p_ndi_name: name_cstr.as_ptr(),
+            p_groups: groups_cstr.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
             clock_video: create_settings.clock_video,
             clock_audio: create_settings.clock_audio,
         };
 
         let instance = unsafe { NDIlib_send_create(&c_settings) };
         if instance.is_null() {
-            unsafe {
-                let _ = CString::from_raw(p_ndi_name_raw);
-                if !p_groups.is_null() {
-                    let _ = CString::from_raw(p_groups);
-                }
-            }
             Err(Error::InitializationFailed(
                 "Failed to create NDI send instance".into(),
             ))
         } else {
             let inner = Arc::new(Inner {
                 instance,
-                name: p_ndi_name_raw,
-                groups: p_groups,
+                _name: name_cstr,
+                _groups: groups_cstr,
                 async_state: AsyncState::default(),
-                destroyed: AtomicBool::new(false),
                 callback_ptr: AtomicPtr::new(ptr::null_mut()),
             });
 
@@ -674,7 +656,7 @@ impl Sender {
             {
                 // Store a non-owning pointer for the callback (no refcount increment)
                 // SAFETY: The pointer remains valid as long as the Arc<Inner> exists,
-                // which is guaranteed by our design: the callback is unregistered in Sender::drop
+                // which is guaranteed by our design: the callback is unregistered in Inner::drop
                 // before the last Arc reference is dropped.
                 let raw_inner = Arc::as_ptr(&inner) as *mut c_void;
                 inner.callback_ptr.store(raw_inner, Ordering::Release);
@@ -688,7 +670,7 @@ impl Sender {
                     unsafe {
                         // SAFETY: opaque is a non-owning pointer to Inner, created via Arc::as_ptr.
                         // The pointer remains valid because:
-                        // 1. The callback is unregistered in Sender::drop before Inner is destroyed
+                        // 1. The callback is unregistered in Inner::drop before Inner is destroyed
                         // 2. The Arc<Inner> is kept alive by the Sender that registered this callback
                         let inner: &Inner = &*(opaque as *const Inner);
 
@@ -1144,53 +1126,33 @@ impl Sender {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        if self.destroyed.swap(true, Ordering::SeqCst) {
-            return;
-        }
+        // Unregister the async completion callback before destroying the instance,
+        // ensuring no callbacks fire after the instance is gone.
+        #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
+        {
+            let callback_ptr = self.callback_ptr.load(Ordering::Acquire);
+            if !callback_ptr.is_null() {
+                unsafe {
+                    NDIlib_send_set_video_async_completion(self.instance, ptr::null_mut(), None);
+                }
 
-        std::sync::atomic::fence(Ordering::SeqCst);
+                let timeout = Duration::from_secs(5);
+                let _ = self
+                    .async_state
+                    .completion
+                    .try_wait_timeout(timeout, "Sender");
+
+                self.callback_ptr.store(ptr::null_mut(), Ordering::Release);
+            }
+        }
 
         unsafe {
             NDIlib_send_destroy(self.instance);
         }
 
-        unsafe {
-            if !self.name.is_null() {
-                let _ = CString::from_raw(self.name);
-            }
-            if !self.groups.is_null() {
-                let _ = CString::from_raw(self.groups);
-            }
-        }
-    }
-}
-
-impl Drop for Sender {
-    fn drop(&mut self) {
-        #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
-        {
-            let callback_ptr = self.inner.callback_ptr.load(Ordering::Acquire);
-            if !callback_ptr.is_null() {
-                unsafe {
-                    NDIlib_send_set_video_async_completion(
-                        self.inner.instance,
-                        ptr::null_mut(),
-                        None,
-                    );
-                }
-
-                let timeout = Duration::from_secs(5);
-                let _ = self
-                    .inner
-                    .async_state
-                    .completion
-                    .try_wait_timeout(timeout, "Sender");
-
-                self.inner
-                    .callback_ptr
-                    .store(ptr::null_mut(), Ordering::Release);
-            }
-        }
+        // _name (CString) and _groups (Option<CString>) are dropped automatically
+        // after this point, which is correct: the CStrings must outlive the NDI
+        // instance but can be freed once it is destroyed.
     }
 }
 
@@ -1206,8 +1168,8 @@ impl Drop for Sender {
 /// The Advanced SDK provides `NDIlib_send_set_video_async_completion` for registering
 /// buffer-release callbacks (not available in the standard SDK).
 ///
-/// The `SendInstance` struct holds an opaque pointer and raw C string pointers
-/// that are only freed in Drop, making it safe to move between threads.
+/// `Inner` holds an opaque NDI pointer and owned CStrings that are automatically
+/// freed in Drop, making it safe to move between threads.
 ///
 /// Functions like `NDIlib_send_create` and `NDIlib_send_destroy` should be called
 /// from a single thread.

@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `Finder<'a>` → `Finder` — clones the ref-counted `NDI` handle internally
   - `Sender<'a>` → `Sender` — clones the ref-counted `NDI` handle internally
 
+### Changed
+
+- **Replaced raw CString pointers in `Sender::Inner` with owned types**: `Inner` now stores `_name: CString` and `_groups: Option<CString>` instead of `*mut c_char`, matching the pattern already used by `Finder`. This eliminates manual `CString::from_raw()` cleanup, removes the redundant `destroyed: AtomicBool` guard, and consolidates all resource cleanup into a single `Drop` impl on `Inner`.
+
 ## [0.10.0] - 2026-01-27
 
 ### Overview
