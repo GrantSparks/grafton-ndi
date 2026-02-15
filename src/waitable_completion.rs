@@ -12,17 +12,6 @@ use std::{
     time::Duration,
 };
 
-/// Result of a non-blocking wait attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TryWaitResult {
-    /// The operation completed successfully.
-    Completed,
-    /// The timeout elapsed before completion.
-    Timeout,
-    /// The lock was unavailable (held by another thread or poisoned).
-    LockUnavailable,
-}
-
 /// A completion signal for synchronizing async operations.
 ///
 /// This struct provides a thread-safe mechanism for one thread to signal completion
@@ -41,7 +30,7 @@ pub enum TryWaitResult {
 /// ```
 /// use std::time::Duration;
 /// use std::thread;
-/// # use grafton_ndi::waitable_completion::{WaitableCompletion, TryWaitResult};
+/// # use grafton_ndi::waitable_completion::WaitableCompletion;
 ///
 /// let completion = WaitableCompletion::new();
 ///
@@ -53,10 +42,9 @@ pub enum TryWaitResult {
 /// });
 ///
 /// // Wait for completion with timeout
-/// match completion.try_wait_timeout(Duration::from_secs(1), "example") {
-///     TryWaitResult::Completed => println!("Operation completed"),
-///     TryWaitResult::Timeout => println!("Timed out"),
-///     TryWaitResult::LockUnavailable => println!("Lock contention"),
+/// match completion.wait_timeout(Duration::from_secs(1)) {
+///     Ok(()) => println!("Operation completed"),
+///     Err(e) => println!("Timed out: {e}"),
 /// }
 /// ```
 #[derive(Debug)]
@@ -181,72 +169,6 @@ impl WaitableCompletion {
 
         Ok(())
     }
-
-    /// Attempts to wait for completion with timeout, suitable for Drop contexts.
-    ///
-    /// This method is designed for use in `Drop` implementations where panicking
-    /// must be avoided. It uses `try_lock` to avoid blocking indefinitely if
-    /// another thread holds the lock.
-    ///
-    /// # Returns
-    ///
-    /// - `TryWaitResult::Completed` if the operation completed within the timeout
-    /// - `TryWaitResult::Timeout` if the timeout elapsed
-    /// - `TryWaitResult::LockUnavailable` if the lock could not be acquired
-    ///
-    /// # Warning Messages
-    ///
-    /// This method prints warnings to stderr in exceptional cases:
-    /// - Timeout waiting for completion
-    /// - Mutex poison recovery during wait
-    /// - Lock contention or poison on initial try_lock
-    pub fn try_wait_timeout(&self, timeout: Duration, context: &str) -> TryWaitResult {
-        let guard_result = self.lock.try_lock();
-        match guard_result {
-            Ok(mut guard) => {
-                let start = std::time::Instant::now();
-
-                while !self.completed.load(Ordering::Acquire) {
-                    let elapsed = start.elapsed();
-                    if elapsed >= timeout {
-                        eprintln!(
-                            "Warning: {context} dropped after timeout waiting for NDI completion callback"
-                        );
-                        return TryWaitResult::Timeout;
-                    }
-
-                    let remaining = timeout - elapsed;
-                    let wait_result = self.cv.wait_timeout(guard, remaining);
-                    match wait_result {
-                        Ok((new_guard, timeout_result)) => {
-                            guard = new_guard;
-                            if timeout_result.timed_out() {
-                                if self.completed.load(Ordering::Acquire) {
-                                    return TryWaitResult::Completed;
-                                }
-                                eprintln!(
-                                    "Warning: {context} dropped after timeout waiting for NDI completion callback"
-                                );
-                                return TryWaitResult::Timeout;
-                            }
-                        }
-                        Err(poisoned) => {
-                            let (new_guard, _) = poisoned.into_inner();
-                            guard = new_guard;
-                            eprintln!(
-                                "Warning: {context} recovered from poisoned mutex during wait"
-                            );
-                        }
-                    }
-                }
-                TryWaitResult::Completed
-            }
-            Err(_) => {
-                eprintln!("Warning: {context} skipping wait due to lock contention or poison");
-                TryWaitResult::LockUnavailable
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -315,36 +237,6 @@ mod tests {
     }
 
     #[test]
-    fn test_try_wait_completed() {
-        let wc = WaitableCompletion::new();
-        wc.signal();
-        let result = wc.try_wait_timeout(Duration::from_millis(100), "test");
-        assert_eq!(result, TryWaitResult::Completed);
-    }
-
-    #[test]
-    fn test_try_wait_timeout() {
-        let wc = WaitableCompletion::new();
-        let result = wc.try_wait_timeout(Duration::from_millis(10), "test");
-        assert_eq!(result, TryWaitResult::Timeout);
-    }
-
-    #[test]
-    fn test_try_wait_with_delayed_signal() {
-        let wc = Arc::new(WaitableCompletion::new());
-        let wc_clone = Arc::clone(&wc);
-
-        let handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(10));
-            wc_clone.signal();
-        });
-
-        let result = wc.try_wait_timeout(Duration::from_secs(1), "test");
-        assert_eq!(result, TryWaitResult::Completed);
-        handle.join().unwrap();
-    }
-
-    #[test]
     fn test_clone_preserves_state() {
         let wc1 = WaitableCompletion::new();
         wc1.signal();
@@ -382,11 +274,11 @@ mod tests {
                 wc_clone.signal();
             });
 
-            let result = wc.try_wait_timeout(Duration::from_secs(1), "test");
+            let result = wc.wait_timeout(Duration::from_secs(1));
             signaler.join().unwrap();
 
             assert!(
-                result == TryWaitResult::Completed || wc.is_complete(),
+                result.is_ok() || wc.is_complete(),
                 "Expected completion but got {:?}",
                 result
             );

@@ -13,10 +13,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `FrameSync<'rx>` → `FrameSync` — takes ownership of the `Receiver`; use `receiver()` to access it or `into_receiver()` to recover it
   - `Finder<'a>` → `Finder` — clones the ref-counted `NDI` handle internally
   - `Sender<'a>` → `Sender` — clones the ref-counted `NDI` handle internally
+- **Removed `TryWaitResult` enum and `WaitableCompletion::try_wait_timeout` method**: These are replaced by `WaitableCompletion::wait_timeout` which returns `Result<(), String>`. Code using `TryWaitResult` should switch to matching on `Ok`/`Err`.
+- **`AsyncVideoToken::is_complete` now requires `has_async_completion_callback` cfg**: Previously gated on `advanced_sdk` alone, it is now gated on `all(feature = "advanced_sdk", has_async_completion_callback)` since the completion signal is only available when the callback is registered.
+- **`Sender::flush_async` fallback behavior changed**: Without `has_async_completion_callback`, `flush_async` now falls back to `flush_async_blocking` (null-frame flush) regardless of the `advanced_sdk` feature, since there is no completion signal to wait on.
+
+### Fixed
+
+- **Double callback in async video lifecycle** ([#44](https://github.com/GrantSparks/grafton-ndi/issues/44)): The user-provided `on_async_video_done` callback previously fired twice — once from the NDI SDK's `video_done_cb` on the SDK thread and once from `AsyncVideoToken::drop` on the caller thread. The callback now fires exactly once from the RAII `Drop` boundary, after buffer release is guaranteed.
+- **Unsafe teardown order in `Inner::drop`** ([#44](https://github.com/GrantSparks/grafton-ndi/issues/44)): Previously unregistered the completion callback before flushing in-flight frames, which suppressed the signal needed for completion. Now flushes first (guaranteed completion via null frame), then unregisters the callback, then destroys the instance.
+- **Best-effort drop could skip waiting** ([#44](https://github.com/GrantSparks/grafton-ndi/issues/44)): `AsyncVideoToken::drop` previously used `try_lock` via `try_wait_timeout`, which could skip waiting entirely under lock contention. Now uses `wait_timeout` (blocking) with a 5-second timeout, falling back to a deterministic null-frame flush if the timeout elapses.
+- **Uncompletable state in `advanced_sdk` without callback** ([#44](https://github.com/GrantSparks/grafton-ndi/issues/44)): When `advanced_sdk` was enabled but `has_async_completion_callback` was not available, the completion signal was reset but never signaled, leading to timeout-only "safety". The completion field and all related logic are now gated on `all(feature = "advanced_sdk", has_async_completion_callback)`.
 
 ### Changed
 
 - **Replaced raw CString pointers in `Sender::Inner` with owned types**: `Inner` now stores `_name: CString` and `_groups: Option<CString>` instead of `*mut c_char`, matching the pattern already used by `Finder`. This eliminates manual `CString::from_raw()` cleanup, removes the redundant `destroyed: AtomicBool` guard, and consolidates all resource cleanup into a single `Drop` impl on `Inner`.
+- **Simplified `video_done_cb` to pure signal**: The NDI completion callback no longer parses FourCC format codes, computes buffer lengths, or invokes the user callback. It now simply signals the `WaitableCompletion`, eliminating runtime FFI pointer arithmetic from the hot path.
+- **Extracted `flush_null_frame` helper**: The null-frame flush pattern (previously duplicated in `AsyncVideoToken::drop`, `flush_async_blocking`, and `Inner::drop`) is now a single private function, reducing code duplication and ensuring consistent behavior across all flush sites.
+- **`callback_ptr` field on `Inner` is now gated**: Only present when `all(feature = "advanced_sdk", has_async_completion_callback)` is active, reducing struct size in non-callback builds.
+
+### Removed
+
+- **`TryWaitResult` enum**: No longer needed; replaced by `Result<(), String>` from `wait_timeout`.
+- **`WaitableCompletion::try_wait_timeout` method**: Replaced by `wait_timeout` which provides deterministic blocking behavior without `try_lock` or stderr output.
+- **`AsyncState::video_buffer_ptr` and `AsyncState::video_buffer_len` fields**: These were never read and served no purpose.
+- **`eprintln!` warnings from library code**: All stderr output has been removed from `waitable_completion.rs` and `sender.rs`.
 
 ## [0.10.0] - 2026-01-27
 
