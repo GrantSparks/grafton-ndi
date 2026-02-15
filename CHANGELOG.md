@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Breaking Changes
+
+- **Removed lifetime parameters from `Finder`, `Sender`, and `FrameSync`**: These types now own their dependencies instead of borrowing them, making them much easier to store in structs and use across async boundaries.
+  - `FrameSync<'rx>` → `FrameSync` — takes ownership of the `Receiver`; use `receiver()` to access it or `into_receiver()` to recover it
+  - `Finder<'a>` → `Finder` — clones the ref-counted `NDI` handle internally
+  - `Sender<'a>` → `Sender` — clones the ref-counted `NDI` handle internally
+
 ## [0.10.0] - 2026-01-27
 
 ### Overview
@@ -121,7 +130,7 @@ New `FrameSync` type wraps the NDI FrameSync API, transforming push-based NDI st
 ```rust
 use grafton_ndi::FrameSync;
 
-let frame_sync = FrameSync::new(receiver)?;
+let frame_sync = FrameSync::new(&receiver)?;
 
 // Capture clock-corrected video (returns immediately)
 let video = frame_sync.capture_video();
@@ -134,7 +143,7 @@ let depth = frame_sync.audio_queue_depth();
 ```
 
 **New Types:**
-- `FrameSync` - Frame synchronizer that owns the receiver
+- `FrameSync<'rx>` - Frame synchronizer tied to receiver lifetime
 - `FrameSyncVideoRef<'fs>` - Zero-copy borrowed video with RAII cleanup
 - `FrameSyncAudioRef<'fs>` - Zero-copy borrowed audio with RAII cleanup
 
