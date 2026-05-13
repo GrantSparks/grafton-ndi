@@ -34,40 +34,26 @@ compile_error!(
 #[cfg(target_os = "windows")]
 static FLUSH_MUTEX: Mutex<()> = Mutex::new(());
 
-/// Send a null frame to flush the async video pipeline.
+/// Flush the async video pipeline by passing a true NULL pointer.
 ///
-/// This blocks until the NDI SDK releases any in-flight buffer.
+/// The NDI SDK documentation specifies that calling
+/// `NDIlib_send_send_video_async_v2(instance, NULL)` (where the *frame pointer*
+/// is NULL, not merely a frame whose `p_data` is NULL) waits for any in-flight
+/// async buffer to be released and then returns.
 fn flush_null_frame(instance: NDIlib_send_instance_t) {
-    let null_frame = NDIlib_video_frame_v2_t {
-        p_data: ptr::null_mut(),
-        xres: 0,
-        yres: 0,
-        FourCC: 0,
-        frame_rate_N: 0,
-        frame_rate_D: 0,
-        picture_aspect_ratio: 0.0,
-        frame_format_type: 0,
-        timecode: 0,
-        __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
-            line_stride_in_bytes: 0,
-        },
-        p_metadata: ptr::null(),
-        timestamp: 0,
-    };
-
     #[cfg(target_os = "windows")]
     {
         let _lock = FLUSH_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         unsafe {
-            NDIlib_send_send_video_async_v2(instance, &null_frame);
+            NDIlib_send_send_video_async_v2(instance, ptr::null());
         }
     }
 
     #[cfg(not(target_os = "windows"))]
     unsafe {
-        NDIlib_send_send_video_async_v2(instance, &null_frame);
+        NDIlib_send_send_video_async_v2(instance, ptr::null());
     }
 }
 
