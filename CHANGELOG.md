@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Regression coverage for async flush pointer semantics**: Added focused test coverage proving async flush uses a true null frame pointer when flushing the NDI async video pipeline.
+
+### Fixed
+
+- **Async sender flush now passes a true NULL frame pointer**: `flush_null_frame` now calls `NDIlib_send_send_video_async_v2` with `ptr::null()` instead of passing a pointer to a zeroed `NDIlib_video_frame_v2_t`, matching the NDI SDK's async flush contract. Thanks to [@FlowingSPDG](https://github.com/FlowingSPDG) for identifying and fixing this in [#51](https://github.com/GrantSparks/grafton-ndi/pull/51).
+- **CI handles rotated NDI SDK downloads**: Linux, macOS, and Windows NDI setup actions now accept a small allowlist of known-good installer hashes and use current hash-based cache keys, so CI can recover when NDI rotates installer payloads behind stable download URLs.
+
+### Changed
+
+- **GitHub Actions are Node 24-ready**: Updated GitHub-maintained checkout/cache actions to Node 24-compatible major versions ahead of GitHub's Node 20 runner deprecation.
+- **CI matrix failures are no longer hidden by fail-fast cancellation**: Rust test/lint and semver matrices now keep running after one platform fails, making platform-specific SDK setup failures visible.
+
 ## [0.11.0] - 2026-02-15
 
 ### Overview
