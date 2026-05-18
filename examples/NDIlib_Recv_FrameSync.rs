@@ -24,12 +24,14 @@
 //! - Audio sample rate: `cargo run --example NDIlib_Recv_FrameSync -- --audio-rate 44100`
 
 use grafton_ndi::{
-    Error, Finder, FinderOptions, FrameSync, Receiver, ReceiverColorFormat, ReceiverOptions,
-    ScanType, NDI,
+    Error, Finder, FinderOptions, FrameSync, FrameSyncAudioRequest, Receiver, ReceiverColorFormat,
+    ReceiverOptions, ScanType, NDI,
 };
 
 use std::{
-    env, thread,
+    env,
+    num::NonZeroI32,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -114,6 +116,11 @@ fn main() -> Result<(), Error> {
 
     println!("Creating FrameSync for clock-corrected capture...");
     let framesync = FrameSync::new(receiver)?;
+    let audio_request = FrameSyncAudioRequest::Capture {
+        sample_rate: Some(positive_nonzero("audio sample rate", audio_sample_rate)?),
+        channels: Some(positive_nonzero("audio channels", audio_channels)?),
+        samples: positive_nonzero("audio samples", audio_samples)?,
+    };
 
     println!("FrameSync created successfully");
     println!("\nCapturing {frame_count} frames with FrameSync...\n");
@@ -131,7 +138,7 @@ fn main() -> Result<(), Error> {
         let loop_start = Instant::now();
 
         // Capture video - always returns immediately
-        if let Some(video) = framesync.capture_video(ScanType::Progressive) {
+        if let Some(video) = framesync.capture_video(ScanType::Progressive)? {
             // Check if this is the same frame as last time (FrameSync may repeat frames)
             if video.timecode() == last_video_timecode && video_frames > 0 {
                 duplicate_frames += 1;
@@ -160,12 +167,12 @@ fn main() -> Result<(), Error> {
         }
 
         // Capture audio - always returns immediately (with silence if needed)
-        let audio = framesync.capture_audio(audio_sample_rate, audio_channels, audio_samples);
+        let audio = framesync.capture_audio(audio_request)?;
         audio_samples_total += audio.num_samples() as usize;
 
         if video_frames == 1 {
             // Print audio info on first video frame
-            if audio.sample_rate() > 0 {
+            if !audio.is_empty() {
                 println!("Audio stream info:");
                 println!("  Sample rate: {} Hz", audio.sample_rate());
                 println!("  Channels: {}", audio.num_channels());
@@ -220,4 +227,14 @@ fn main() -> Result<(), Error> {
     println!("\nExample completed successfully!");
 
     Ok(())
+}
+
+fn positive_nonzero(name: &str, value: i32) -> Result<NonZeroI32, Error> {
+    if value > 0 {
+        Ok(NonZeroI32::new(value).expect("positive values are non-zero"))
+    } else {
+        Err(Error::InvalidConfiguration(format!(
+            "{name} must be positive, got {value}"
+        )))
+    }
 }
