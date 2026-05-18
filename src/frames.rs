@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::{
     ffi::{CStr, CString},
     fmt,
+    num::NonZeroUsize,
     os::raw::c_char,
     ptr, slice, str,
 };
@@ -393,7 +394,7 @@ pub struct VideoFrame {
     scan_type: ScanType,
     timecode: i64,
     data: Vec<u8>,
-    metadata: Option<CString>,
+    metadata: Option<FrameMetadata>,
     timestamp: i64,
 }
 
@@ -410,7 +411,7 @@ impl fmt::Debug for VideoFrame {
             .field("timecode", &self.timecode)
             .field("data (bytes)", &self.data.len())
             .field("line_stride_or_size", &self.line_stride_or_size())
-            .field("metadata", &self.metadata)
+            .field("metadata", &self.metadata())
             .field("timestamp", &self.timestamp)
             .finish()
     }
@@ -442,10 +443,10 @@ impl VideoFrame {
             timecode: self.timecode,
             p_data: self.data.as_ptr() as *mut u8,
             __bindgen_anon_1: self.layout.line_stride_or_size.into(),
-            p_metadata: match &self.metadata {
-                Some(meta) => meta.as_ptr(),
-                None => ptr::null(),
-            },
+            p_metadata: self
+                .metadata
+                .as_ref()
+                .map_or(ptr::null(), FrameMetadata::as_ptr),
             timestamp: self.timestamp,
         }
     }
@@ -540,9 +541,13 @@ impl VideoFrame {
         Ok(())
     }
 
-    /// Get metadata, if present.
-    pub fn metadata(&self) -> Option<&CStr> {
-        self.metadata.as_deref()
+    /// Get frame metadata as UTF-8 text, if present.
+    pub fn metadata(&self) -> Option<&str> {
+        self.metadata.as_ref().map(FrameMetadata::as_str)
+    }
+
+    pub(crate) fn metadata_cstr(&self) -> Option<&CStr> {
+        self.metadata.as_ref().map(FrameMetadata::as_cstr)
     }
 
     /// Replace frame metadata.
@@ -550,11 +555,10 @@ impl VideoFrame {
     /// # Errors
     ///
     /// Returns [`Error::InvalidCString`] if `metadata` contains an interior NUL
-    /// byte.
+    /// byte, or [`Error::InvalidFrame`] if the emitted C string would exceed
+    /// the metadata size cap.
     pub fn set_metadata<S: Into<String>>(&mut self, metadata: Option<S>) -> Result<()> {
-        self.metadata = metadata
-            .map(|m| CString::new(m.into()).map_err(Error::InvalidCString))
-            .transpose()?;
+        self.metadata = metadata.map(FrameMetadata::new).transpose()?;
         Ok(())
     }
 
@@ -768,19 +772,22 @@ impl VideoFrame {
     pub unsafe fn from_raw(c_frame: &NDIlib_video_frame_v2_t) -> Result<VideoFrame> {
         // Use the shared validation helper to validate and compute layout
         let layout = validate_video_layout(c_frame)?;
+        let metadata_layout = unsafe { validate_frame_metadata(c_frame.p_metadata)? };
 
-        Self::from_raw_validated(c_frame, layout)
+        Self::from_raw_validated(c_frame, layout, metadata_layout)
     }
 
     pub(crate) unsafe fn from_raw_validated(
         c_frame: &NDIlib_video_frame_v2_t,
         layout: ValidatedVideoLayout,
+        metadata_layout: ValidatedFrameMetadata,
     ) -> Result<VideoFrame> {
         // Copy data for ownership
         let slice = slice::from_raw_parts(c_frame.p_data, layout.data_len_bytes);
         let data = slice.to_vec();
 
-        let metadata = unsafe { copy_frame_metadata_cstring(c_frame.p_metadata) };
+        let metadata =
+            unsafe { FrameMetadata::copy_from_raw_validated(c_frame.p_metadata, metadata_layout) };
 
         #[allow(clippy::unnecessary_cast)] // Required for Windows where frame_format_type is i32
         let scan_type = ScanType::try_from(c_frame.frame_format_type as u32).map_err(|_| {
@@ -914,10 +921,7 @@ impl VideoFrameBuilder {
         let buffer_size = layout.data_len_bytes;
         let data = vec![0u8; buffer_size];
 
-        let metadata = self
-            .metadata
-            .map(|m| CString::new(m).map_err(Error::InvalidCString))
-            .transpose()?;
+        let metadata = self.metadata.map(FrameMetadata::new).transpose()?;
 
         Ok(VideoFrame {
             layout,
@@ -951,7 +955,7 @@ pub struct AudioFrame {
     layout: ValidatedAudioLayout,
     timecode: i64,
     data: Vec<f32>,
-    metadata: Option<CString>,
+    metadata: Option<FrameMetadata>,
     timestamp: i64,
 }
 
@@ -967,7 +971,10 @@ impl AudioFrame {
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: self.layout.channel_stride_in_bytes,
             },
-            p_metadata: self.metadata.as_ref().map_or(ptr::null(), |m| m.as_ptr()),
+            p_metadata: self
+                .metadata
+                .as_ref()
+                .map_or(ptr::null(), FrameMetadata::as_ptr),
             timestamp: self.timestamp,
         }
     }
@@ -976,13 +983,15 @@ impl AudioFrame {
     pub(crate) fn from_raw(raw: NDIlib_audio_frame_v3_t) -> Result<AudioFrame> {
         // Use the shared validation helper to validate and compute layout
         let layout = validate_audio_layout(&raw)?;
+        let metadata_layout = unsafe { validate_frame_metadata(raw.p_metadata)? };
 
-        Self::from_raw_validated(raw, layout)
+        Self::from_raw_validated(raw, layout, metadata_layout)
     }
 
     pub(crate) fn from_raw_validated(
         raw: NDIlib_audio_frame_v3_t,
         layout: ValidatedAudioLayout,
+        metadata_layout: ValidatedFrameMetadata,
     ) -> Result<AudioFrame> {
         if layout.is_empty() {
             return Err(Error::InvalidFrame(
@@ -995,7 +1004,8 @@ impl AudioFrame {
         let data = slice.to_vec();
 
         // Copy the string, don't take ownership - SDK will free the original.
-        let metadata = unsafe { copy_frame_metadata_cstring(raw.p_metadata) };
+        let metadata =
+            unsafe { FrameMetadata::copy_from_raw_validated(raw.p_metadata, metadata_layout) };
 
         Ok(AudioFrame {
             layout,
@@ -1083,9 +1093,9 @@ impl AudioFrame {
         Ok(())
     }
 
-    /// Get metadata, if present.
-    pub fn metadata(&self) -> Option<&CStr> {
-        self.metadata.as_deref()
+    /// Get frame metadata as UTF-8 text, if present.
+    pub fn metadata(&self) -> Option<&str> {
+        self.metadata.as_ref().map(FrameMetadata::as_str)
     }
 
     /// Replace frame metadata.
@@ -1093,11 +1103,10 @@ impl AudioFrame {
     /// # Errors
     ///
     /// Returns [`Error::InvalidCString`] if `metadata` contains an interior NUL
-    /// byte.
+    /// byte, or [`Error::InvalidFrame`] if the emitted C string would exceed
+    /// the metadata size cap.
     pub fn set_metadata<S: Into<String>>(&mut self, metadata: Option<S>) -> Result<()> {
-        self.metadata = metadata
-            .map(|m| CString::new(m.into()).map_err(Error::InvalidCString))
-            .transpose()?;
+        self.metadata = metadata.map(FrameMetadata::new).transpose()?;
         Ok(())
     }
 
@@ -1288,16 +1297,13 @@ impl AudioFrameBuilder {
             vec![0.0f32; sample_count]
         };
 
-        let metadata_cstring = self
-            .metadata
-            .map(|m| CString::new(m).map_err(Error::InvalidCString))
-            .transpose()?;
+        let metadata = self.metadata.map(FrameMetadata::new).transpose()?;
 
         Ok(AudioFrame {
             layout: audio_layout,
             timecode,
             data,
-            metadata: metadata_cstring,
+            metadata,
             timestamp: self.timestamp.unwrap_or(0),
         })
     }
@@ -1389,9 +1395,9 @@ const MAX_VIDEO_BYTES: usize = 100 * 1024 * 1024;
 /// Comfortably above typical NDI audio frames while preventing unbounded allocations.
 const MAX_AUDIO_BYTES: usize = 64 * 1024 * 1024;
 
-/// Maximum allowed size for standalone metadata frames (4 MiB), including the
-/// SDK-required trailing NUL terminator.
-const MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum allowed size for SDK metadata C strings (4 MiB), including the
+/// trailing NUL terminator.
+pub(crate) const MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct MetadataFrame {
@@ -1601,13 +1607,13 @@ fn validate_metadata_text(data: &str) -> Result<()> {
 fn validate_metadata_len_with_nul(len_with_nul: usize) -> Result<i32> {
     if len_with_nul == 0 {
         return Err(Error::InvalidFrame(
-            "Metadata frame length must include a trailing NUL terminator".into(),
+            "Metadata length must include a trailing NUL terminator".into(),
         ));
     }
 
     if len_with_nul > MAX_METADATA_BYTES {
         return Err(Error::InvalidFrame(format!(
-            "Metadata frame exceeds maximum size: {} bytes > {} bytes",
+            "Metadata exceeds maximum size: {} bytes > {} bytes",
             len_with_nul, MAX_METADATA_BYTES
         )));
     }
@@ -1618,7 +1624,7 @@ fn validate_metadata_len_with_nul(len_with_nul: usize) -> Result<i32> {
 fn metadata_len_to_i32(len_with_nul: usize) -> Result<i32> {
     i32::try_from(len_with_nul).map_err(|_| {
         Error::InvalidFrame(format!(
-            "Metadata frame length {len_with_nul} exceeds SDK i32 range"
+            "Metadata length {len_with_nul} exceeds SDK i32 range"
         ))
     })
 }
@@ -1633,34 +1639,155 @@ fn metadata_payload_bytes(raw: &NDIlib_metadata_frame_t, layout: ValidatedMetada
     }
 }
 
-/// Audit note: this helper is only for video/audio per-frame `p_metadata`
-/// fields, not standalone `NDIlib_metadata_frame_t::p_data`. The SDK exposes
-/// those per-frame metadata pointers as lengthless C strings, so hardening them
-/// without `CStr::from_ptr` requires a separate API design from issue #60's
-/// bounded standalone metadata layout.
+/// Owned video/audio per-frame metadata.
 ///
-/// # Safety
-///
-/// When non-null, `p_metadata` must point to a valid NUL-terminated C string
-/// that remains alive for the returned reference lifetime.
-pub(crate) unsafe fn borrowed_frame_metadata_cstr<'a>(
-    p_metadata: *const c_char,
-) -> Option<&'a CStr> {
-    if p_metadata.is_null() {
-        None
-    } else {
-        Some(unsafe { CStr::from_ptr(p_metadata) })
+/// The wrapped C string is guaranteed to be valid UTF-8, contain no interior
+/// NUL bytes, and fit within the crate metadata size cap including its trailing
+/// terminator. `None` on a frame means a null SDK `p_metadata`; `Some("")`
+/// means an explicit non-null empty C string.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct FrameMetadata {
+    inner: CString,
+}
+
+impl FrameMetadata {
+    pub(crate) fn new<S: Into<String>>(metadata: S) -> Result<Self> {
+        let metadata = metadata.into();
+        let len_with_nul = metadata.len().checked_add(1).ok_or_else(|| {
+            Error::InvalidFrame("Frame metadata length overflow while adding terminator".into())
+        })?;
+        validate_metadata_len_with_nul(len_with_nul)?;
+
+        Ok(Self {
+            inner: CString::new(metadata).map_err(Error::InvalidCString)?,
+        })
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        self.inner
+            .to_str()
+            .expect("FrameMetadata validates UTF-8 at construction")
+    }
+
+    pub(crate) fn as_cstr(&self) -> &CStr {
+        self.inner.as_c_str()
+    }
+
+    pub(crate) fn as_ptr(&self) -> *const c_char {
+        self.inner.as_ptr()
+    }
+
+    /// Copy per-frame metadata from a pointer that has already been validated
+    /// with [`validate_frame_metadata`].
+    ///
+    /// # Safety
+    ///
+    /// `metadata_layout` must have been produced for this exact `p_metadata`
+    /// pointer while the pointed-to SDK allocation is still valid.
+    pub(crate) unsafe fn copy_from_raw_validated(
+        p_metadata: *const c_char,
+        metadata_layout: ValidatedFrameMetadata,
+    ) -> Option<Self> {
+        metadata_layout.len_with_nul?;
+        debug_assert!(!p_metadata.is_null());
+
+        let mut bytes = if metadata_layout.text_len == 0 {
+            Vec::with_capacity(1)
+        } else {
+            unsafe {
+                slice::from_raw_parts(p_metadata.cast::<u8>(), metadata_layout.text_len).to_vec()
+            }
+        };
+        bytes.push(0);
+
+        let inner = unsafe { CString::from_vec_with_nul_unchecked(bytes) };
+        Some(Self { inner })
     }
 }
 
-/// Copy a video/audio per-frame `p_metadata` C string without taking ownership
-/// of the SDK pointer.
+impl fmt::Debug for FrameMetadata {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("FrameMetadata")
+            .field(&self.as_str())
+            .finish()
+    }
+}
+
+/// Cached layout for video/audio per-frame `p_metadata`.
+///
+/// The SDK exposes these pointers as optional lengthless C strings. This type
+/// records the first terminator found by a bounded scan so later accessors can
+/// expose UTF-8 text without rescanning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ValidatedFrameMetadata {
+    /// `None` means the SDK pointer was null. `Some` includes the first trailing
+    /// NUL terminator found within `MAX_METADATA_BYTES`.
+    pub(crate) len_with_nul: Option<NonZeroUsize>,
+    /// UTF-8 text payload length excluding the trailing NUL terminator.
+    pub(crate) text_len: usize,
+}
+
+/// Validate a video/audio per-frame `p_metadata` pointer with a bounded scan.
+///
+/// This continues to trust the NDI SDK that a non-null pointer is readable. The
+/// validation does not make dangling or otherwise invalid pointers safe; it
+/// only limits the scan to `MAX_METADATA_BYTES`, requires a terminator within
+/// that cap, and validates UTF-8 before exposing safe text access.
 ///
 /// # Safety
 ///
-/// When non-null, `p_metadata` must point to a valid NUL-terminated C string.
-pub(crate) unsafe fn copy_frame_metadata_cstring(p_metadata: *const c_char) -> Option<CString> {
-    unsafe { borrowed_frame_metadata_cstr(p_metadata) }.map(CString::from)
+/// When non-null, `p_metadata` must be readable byte-by-byte until either the
+/// first NUL terminator or `MAX_METADATA_BYTES` bytes have been read.
+pub(crate) unsafe fn validate_frame_metadata(
+    p_metadata: *const c_char,
+) -> Result<ValidatedFrameMetadata> {
+    if p_metadata.is_null() {
+        return Ok(ValidatedFrameMetadata {
+            len_with_nul: None,
+            text_len: 0,
+        });
+    }
+
+    let metadata = p_metadata.cast::<u8>();
+    for text_len in 0..MAX_METADATA_BYTES {
+        let byte = unsafe { metadata.add(text_len).read() };
+        if byte == 0 {
+            if text_len > 0 {
+                let payload = unsafe { slice::from_raw_parts(metadata, text_len) };
+                str::from_utf8(payload).map_err(|err| Error::InvalidUtf8(err.to_string()))?;
+            }
+
+            return Ok(ValidatedFrameMetadata {
+                len_with_nul: NonZeroUsize::new(text_len + 1),
+                text_len,
+            });
+        }
+    }
+
+    Err(Error::InvalidFrame(format!(
+        "Frame metadata is missing a NUL terminator within {MAX_METADATA_BYTES} bytes"
+    )))
+}
+
+/// Expose validated per-frame metadata as borrowed UTF-8 text.
+///
+/// # Safety
+///
+/// `metadata_layout` must have been produced for this exact `p_metadata`
+/// pointer while the pointed-to SDK allocation is still valid.
+pub(crate) unsafe fn frame_metadata_str<'a>(
+    p_metadata: *const c_char,
+    metadata_layout: ValidatedFrameMetadata,
+) -> Option<&'a str> {
+    metadata_layout.len_with_nul?;
+    debug_assert!(!p_metadata.is_null());
+
+    if metadata_layout.text_len == 0 {
+        return Some("");
+    }
+
+    let bytes = unsafe { slice::from_raw_parts(p_metadata.cast::<u8>(), metadata_layout.text_len) };
+    Some(unsafe { str::from_utf8_unchecked(bytes) })
 }
 
 /// Image format specification for encoding video frames.
@@ -2681,6 +2808,7 @@ pub struct VideoFrameRef<'rx> {
     /// Cached validated layout information (pixel format, data length, stride/size).
     /// Computed once at construction time; `data()` uses this cached value.
     layout: ValidatedVideoLayout,
+    metadata: ValidatedFrameMetadata,
 }
 
 impl<'rx> VideoFrameRef<'rx> {
@@ -2701,8 +2829,13 @@ impl<'rx> VideoFrameRef<'rx> {
     /// and contains a frame populated by `NDIlib_recv_capture_v3`.
     pub(crate) unsafe fn new(guard: RecvVideoGuard<'rx>) -> Result<Self> {
         let layout = validate_video_layout(guard.frame())?;
+        let metadata = unsafe { validate_frame_metadata(guard.frame().p_metadata)? };
 
-        Ok(Self { guard, layout })
+        Ok(Self {
+            guard,
+            layout,
+            metadata,
+        })
     }
 
     /// Get the frame width in pixels.
@@ -2763,9 +2896,9 @@ impl<'rx> VideoFrameRef<'rx> {
         self.layout.line_stride_or_size
     }
 
-    /// Get the metadata as a `CStr`, if present.
-    pub fn metadata(&self) -> Option<&CStr> {
-        unsafe { borrowed_frame_metadata_cstr(self.guard.frame().p_metadata) }
+    /// Get frame metadata as UTF-8 text, if present.
+    pub fn metadata(&self) -> Option<&str> {
+        unsafe { frame_metadata_str(self.guard.frame().p_metadata, self.metadata) }
     }
 
     /// Get a zero-copy view of the frame data.
@@ -2794,7 +2927,7 @@ impl<'rx> VideoFrameRef<'rx> {
     /// This performs a single memcpy of the frame data and metadata,
     /// allowing the frame to outlive the NDI buffer and be sent across threads.
     pub fn to_owned(&self) -> Result<VideoFrame> {
-        unsafe { VideoFrame::from_raw_validated(self.guard.frame(), self.layout) }
+        unsafe { VideoFrame::from_raw_validated(self.guard.frame(), self.layout, self.metadata) }
     }
 }
 
@@ -2856,6 +2989,7 @@ pub struct AudioFrameRef<'rx> {
     /// Cached validated layout information (format, sample count).
     /// Computed once at construction time; `data()` uses this cached value.
     layout: ValidatedAudioLayout,
+    metadata: ValidatedFrameMetadata,
 }
 
 impl<'rx> AudioFrameRef<'rx> {
@@ -2876,8 +3010,13 @@ impl<'rx> AudioFrameRef<'rx> {
     /// and contains a frame populated by `NDIlib_recv_capture_v3`.
     pub(crate) unsafe fn new(guard: RecvAudioGuard<'rx>) -> Result<Self> {
         let layout = validate_audio_layout(guard.frame())?;
+        let metadata = unsafe { validate_frame_metadata(guard.frame().p_metadata)? };
 
-        Ok(Self { guard, layout })
+        Ok(Self {
+            guard,
+            layout,
+            metadata,
+        })
     }
 
     /// Get the sample rate in Hz.
@@ -2919,9 +3058,9 @@ impl<'rx> AudioFrameRef<'rx> {
         self.layout.channel_stride_in_bytes
     }
 
-    /// Get the metadata as a `CStr`, if present.
-    pub fn metadata(&self) -> Option<&CStr> {
-        unsafe { borrowed_frame_metadata_cstr(self.guard.frame().p_metadata) }
+    /// Get frame metadata as UTF-8 text, if present.
+    pub fn metadata(&self) -> Option<&str> {
+        unsafe { frame_metadata_str(self.guard.frame().p_metadata, self.metadata) }
     }
 
     /// Get a zero-copy view of the audio data as 32-bit floats.
@@ -2961,7 +3100,7 @@ impl<'rx> AudioFrameRef<'rx> {
     /// This performs a single memcpy of the audio data and metadata,
     /// allowing the frame to outlive the NDI buffer and be sent across threads.
     pub fn to_owned(&self) -> Result<AudioFrame> {
-        AudioFrame::from_raw_validated(*self.guard.frame(), self.layout)
+        AudioFrame::from_raw_validated(*self.guard.frame(), self.layout, self.metadata)
     }
 }
 
@@ -4179,6 +4318,260 @@ mod tests {
         assert_eq!(owned.timecode(), 12345);
 
         std::mem::forget(frame_ref);
+    }
+
+    #[test]
+    fn test_validate_frame_metadata_accepts_null_without_allocation_state() {
+        let layout = unsafe { validate_frame_metadata(ptr::null()) }.expect("null is valid");
+
+        assert_eq!(
+            layout,
+            ValidatedFrameMetadata {
+                len_with_nul: None,
+                text_len: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_validate_frame_metadata_accepts_explicit_empty() {
+        let mut data = b"\0".to_vec();
+        let layout = unsafe { validate_frame_metadata(data.as_mut_ptr().cast::<c_char>()) }
+            .expect("explicit empty metadata is valid");
+
+        assert_eq!(layout.len_with_nul.unwrap().get(), 1);
+        assert_eq!(layout.text_len, 0);
+        assert_eq!(
+            unsafe { frame_metadata_str(data.as_ptr().cast::<c_char>(), layout) },
+            Some("")
+        );
+    }
+
+    #[test]
+    fn test_validate_frame_metadata_accepts_utf8_and_ignores_after_first_nul() {
+        let mut data = b"hello metadata\0\0\xFF".to_vec();
+        let layout = unsafe { validate_frame_metadata(data.as_mut_ptr().cast::<c_char>()) }
+            .expect("valid UTF-8 metadata");
+
+        assert_eq!(layout.text_len, "hello metadata".len());
+        assert_eq!(
+            unsafe { frame_metadata_str(data.as_ptr().cast::<c_char>(), layout) },
+            Some("hello metadata")
+        );
+    }
+
+    #[test]
+    fn test_validate_frame_metadata_accepts_max_boundary() {
+        let mut data = vec![b'x'; MAX_METADATA_BYTES];
+        data[MAX_METADATA_BYTES - 1] = 0;
+
+        let layout = unsafe { validate_frame_metadata(data.as_mut_ptr().cast::<c_char>()) }
+            .expect("metadata exactly at cap including terminator is valid");
+
+        assert_eq!(layout.len_with_nul.unwrap().get(), MAX_METADATA_BYTES);
+        assert_eq!(layout.text_len, MAX_METADATA_BYTES - 1);
+    }
+
+    #[test]
+    fn test_validate_frame_metadata_rejects_missing_nul_within_cap() {
+        let mut data = vec![b'x'; MAX_METADATA_BYTES];
+
+        assert!(matches!(
+            unsafe { validate_frame_metadata(data.as_mut_ptr().cast::<c_char>()) },
+            Err(Error::InvalidFrame(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_frame_metadata_rejects_invalid_utf8_before_nul() {
+        let mut data = vec![0xFF, 0];
+
+        assert!(matches!(
+            unsafe { validate_frame_metadata(data.as_mut_ptr().cast::<c_char>()) },
+            Err(Error::InvalidUtf8(_))
+        ));
+    }
+
+    #[test]
+    fn test_video_frame_ref_metadata_is_cached_and_owned_conversion_appends_nul() {
+        use crate::capture::RecvVideoGuard;
+
+        let width = 16;
+        let height = 8;
+        let stride = width * 4;
+        let expected_len = (stride * height) as usize;
+        let data = vec![0u8; expected_len];
+        let mut metadata = b"cached\0\xFF".to_vec();
+
+        let raw = NDIlib_video_frame_v2_t {
+            xres: width,
+            yres: height,
+            FourCC: PixelFormat::BGRA.into(),
+            frame_rate_N: 60,
+            frame_rate_D: 1,
+            picture_aspect_ratio: 16.0 / 9.0,
+            frame_format_type: ScanType::Progressive.into(),
+            timecode: 123,
+            p_data: data.as_ptr() as *mut u8,
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: stride,
+            },
+            p_metadata: metadata.as_mut_ptr().cast::<c_char>(),
+            timestamp: 456,
+        };
+
+        let guard = unsafe { RecvVideoGuard::new(ptr::null_mut(), raw) };
+        let frame_ref = unsafe { VideoFrameRef::new(guard) }.expect("valid video ref");
+
+        assert_eq!(frame_ref.metadata(), Some("cached"));
+        metadata[6] = b'!';
+        assert_eq!(frame_ref.metadata(), Some("cached"));
+        assert!(format!("{frame_ref:?}").contains("metadata: Some(\"cached\")"));
+
+        let owned = frame_ref.to_owned().expect("owned conversion");
+        assert_eq!(owned.metadata(), Some("cached"));
+        assert_eq!(owned.data().len(), expected_len);
+
+        std::mem::forget(frame_ref);
+    }
+
+    #[test]
+    fn test_audio_frame_ref_metadata_is_text_and_owned_conversion_preserves_it() {
+        use crate::capture::RecvAudioGuard;
+
+        let no_samples = 4;
+        let no_channels = 2;
+        let sample_count = (no_samples * no_channels) as usize;
+        let data = vec![0.25f32; sample_count];
+        let mut metadata = b"audio meta\0".to_vec();
+
+        let raw = NDIlib_audio_frame_v3_t {
+            sample_rate: 48000,
+            no_channels,
+            no_samples,
+            timecode: 123,
+            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            p_data: data.as_ptr() as *mut u8,
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: no_samples * 4,
+            },
+            p_metadata: metadata.as_mut_ptr().cast::<c_char>(),
+            timestamp: 456,
+        };
+
+        let guard = unsafe { RecvAudioGuard::new(ptr::null_mut(), raw) };
+        let frame_ref = unsafe { AudioFrameRef::new(guard) }.expect("valid audio ref");
+
+        assert_eq!(frame_ref.metadata(), Some("audio meta"));
+        let owned = frame_ref.to_owned().expect("owned conversion");
+        assert_eq!(owned.metadata(), Some("audio meta"));
+        assert_eq!(owned.data().len(), sample_count);
+
+        std::mem::forget(frame_ref);
+    }
+
+    #[test]
+    fn test_owned_video_from_raw_rejects_malformed_frame_metadata() {
+        let width = 16;
+        let height = 8;
+        let stride = width * 4;
+        let expected_len = (stride * height) as usize;
+        let mut data = vec![0u8; expected_len];
+        let mut metadata = vec![b'x'; MAX_METADATA_BYTES];
+
+        let raw = NDIlib_video_frame_v2_t {
+            xres: width,
+            yres: height,
+            FourCC: PixelFormat::BGRA.into(),
+            frame_rate_N: 60,
+            frame_rate_D: 1,
+            picture_aspect_ratio: 16.0 / 9.0,
+            frame_format_type: ScanType::Progressive.into(),
+            timecode: 0,
+            p_data: data.as_mut_ptr(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: stride,
+            },
+            p_metadata: metadata.as_mut_ptr().cast::<c_char>(),
+            timestamp: 0,
+        };
+
+        assert!(matches!(
+            unsafe { VideoFrame::from_raw(&raw) },
+            Err(Error::InvalidFrame(_))
+        ));
+
+        metadata[0] = 0xFF;
+        metadata[1] = 0;
+        assert!(matches!(
+            unsafe { VideoFrame::from_raw(&raw) },
+            Err(Error::InvalidUtf8(_))
+        ));
+    }
+
+    #[test]
+    fn test_owned_frame_metadata_builders_setters_and_raw_conversion() {
+        let mut video = VideoFrame::builder().metadata("").build().unwrap();
+        assert_eq!(video.metadata(), Some(""));
+        let raw = video.to_raw();
+        assert!(!raw.p_metadata.is_null());
+        assert_eq!(
+            unsafe { slice::from_raw_parts(raw.p_metadata.cast::<u8>(), 1) },
+            b"\0"
+        );
+
+        video.set_metadata(Some("video meta")).unwrap();
+        assert_eq!(video.metadata(), Some("video meta"));
+        let raw = video.to_raw();
+        assert_eq!(
+            unsafe { slice::from_raw_parts(raw.p_metadata.cast::<u8>(), 11) },
+            b"video meta\0"
+        );
+
+        video.set_metadata(Option::<String>::None).unwrap();
+        assert!(video.metadata().is_none());
+        assert!(video.to_raw().p_metadata.is_null());
+
+        let mut audio = AudioFrame::builder().metadata("").build().unwrap();
+        assert_eq!(audio.metadata(), Some(""));
+        assert!(!audio.to_raw().p_metadata.is_null());
+        audio.set_metadata(Some("audio meta")).unwrap();
+        assert_eq!(audio.metadata(), Some("audio meta"));
+
+        assert!(matches!(
+            VideoFrame::builder().metadata("bad\0metadata").build(),
+            Err(Error::InvalidCString(_))
+        ));
+        assert!(matches!(
+            AudioFrame::builder().metadata("bad\0metadata").build(),
+            Err(Error::InvalidCString(_))
+        ));
+        assert!(matches!(
+            video.set_metadata(Some("bad\0metadata")),
+            Err(Error::InvalidCString(_))
+        ));
+        assert!(matches!(
+            audio.set_metadata(Some("bad\0metadata")),
+            Err(Error::InvalidCString(_))
+        ));
+
+        let oversized = "x".repeat(MAX_METADATA_BYTES);
+        assert!(matches!(
+            VideoFrame::builder().metadata(oversized.clone()).build(),
+            Err(Error::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            AudioFrame::builder().metadata(oversized.clone()).build(),
+            Err(Error::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            video.set_metadata(Some(oversized.clone())),
+            Err(Error::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            audio.set_metadata(Some(oversized)),
+            Err(Error::InvalidFrame(_))
+        ));
     }
 
     /// Test that audio frames with overflow in checked_mul are rejected

@@ -253,8 +253,8 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// - `frame_rate_n` and `frame_rate_d` are positive, `picture_aspect_ratio`
     ///   is finite and positive, and `scan_type` matches a supported SDK scan
     ///   type.
-    /// - `metadata`, when present, remains valid and NUL-terminated for the full
-    ///   send lifetime.
+    /// - `metadata`, when present, remains valid, NUL-terminated, UTF-8, and
+    ///   within the crate metadata size cap for the full send lifetime.
     ///
     /// Zero/default `timecode` and `timestamp` values are passed through to the
     /// SDK as default timing values.
@@ -386,9 +386,13 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         self.layout.map(|layout| layout.data_len_bytes)
     }
 
-    /// Get the metadata, if any.
-    pub fn metadata(&self) -> Option<&CStr> {
-        self.metadata
+    /// Get the metadata as UTF-8 text, if any.
+    pub fn metadata(&self) -> Option<&str> {
+        self.metadata.map(|metadata| {
+            metadata
+                .to_str()
+                .expect("from_parts_unchecked requires UTF-8 metadata")
+        })
     }
 
     /// Get the timestamp.
@@ -431,7 +435,7 @@ impl<'buf> From<&'buf VideoFrame> for BorrowedVideoFrame<'buf> {
             data: frame.data(),
             line_stride_or_size: layout.line_stride_or_size,
             layout: Some(layout),
-            metadata: frame.metadata(),
+            metadata: frame.metadata_cstr(),
             timestamp: frame.timestamp(),
         }
     }
