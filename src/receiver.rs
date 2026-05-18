@@ -30,7 +30,11 @@
 //! # }
 //! ```
 
-use std::{ffi::CString, ptr, time::Duration};
+use std::{
+    ffi::CString,
+    ptr,
+    time::{Duration, Instant},
+};
 
 use crate::{
     capture::{capture_audio_raw, capture_metadata_raw, capture_video_raw, CaptureResult},
@@ -78,25 +82,88 @@ impl Default for RetryPolicy {
 ///
 /// - `Ok(T)`: The captured frame on success.
 /// - `Err(Error::FrameTimeout)`: If no frame is captured within the total timeout.
-fn retry_capture<T, F>(timeout: Duration, policy: &RetryPolicy, mut capture_fn: F) -> Result<T>
+fn retry_capture<T, F>(timeout: Duration, policy: &RetryPolicy, capture_fn: F) -> Result<T>
 where
     F: FnMut(Duration) -> Result<Option<T>>,
 {
-    let start_time = std::time::Instant::now();
+    let start_time = Instant::now();
+    retry_capture_with_clock(
+        timeout,
+        policy,
+        capture_fn,
+        || start_time.elapsed(),
+        std::thread::sleep,
+    )
+}
+
+fn retry_capture_with_clock<T, F, E, S>(
+    timeout: Duration,
+    policy: &RetryPolicy,
+    mut capture_fn: F,
+    mut elapsed: E,
+    mut sleep: S,
+) -> Result<T>
+where
+    F: FnMut(Duration) -> Result<Option<T>>,
+    E: FnMut() -> Duration,
+    S: FnMut(Duration),
+{
+    to_ms_checked(timeout)?;
+
     let mut attempts = 0;
 
-    loop {
+    if timeout.is_zero() {
         attempts += 1;
+        return match capture_fn(Duration::ZERO)? {
+            Some(frame) => Ok(frame),
+            None => Err(Error::FrameTimeout {
+                attempts,
+                elapsed: elapsed(),
+            }),
+        };
+    }
 
-        let elapsed = start_time.elapsed();
-        if elapsed > timeout {
-            return Err(Error::FrameTimeout { attempts, elapsed });
+    loop {
+        let elapsed_before_attempt = elapsed();
+        let Some(remaining) = timeout.checked_sub(elapsed_before_attempt) else {
+            return Err(Error::FrameTimeout {
+                attempts,
+                elapsed: elapsed_before_attempt,
+            });
+        };
+
+        if remaining.is_zero() {
+            return Err(Error::FrameTimeout {
+                attempts,
+                elapsed: elapsed_before_attempt,
+            });
         }
 
-        match capture_fn(policy.poll_interval)? {
+        let poll_timeout = policy.poll_interval.min(remaining);
+        attempts += 1;
+
+        match capture_fn(poll_timeout)? {
             Some(frame) => return Ok(frame),
             None => {
-                std::thread::sleep(policy.sleep_between);
+                let elapsed_after_attempt = elapsed();
+                let Some(remaining) = timeout.checked_sub(elapsed_after_attempt) else {
+                    return Err(Error::FrameTimeout {
+                        attempts,
+                        elapsed: elapsed_after_attempt,
+                    });
+                };
+
+                if remaining.is_zero() {
+                    return Err(Error::FrameTimeout {
+                        attempts,
+                        elapsed: elapsed_after_attempt,
+                    });
+                }
+
+                let sleep_duration = policy.sleep_between.min(remaining);
+                if !sleep_duration.is_zero() {
+                    sleep(sleep_duration);
+                }
             }
         }
     }
@@ -666,14 +733,17 @@ impl Receiver {
         )
     }
 
-    /// Capture a zero-copy borrowed video frame - safe to call from multiple threads concurrently.
+    /// Poll for a zero-copy borrowed video frame - safe to call from multiple threads concurrently.
     ///
     /// This returns a `VideoFrameRef` that borrows the NDI SDK's buffer directly,
     /// avoiding any allocation or memcpy. The frame is automatically freed when dropped.
+    /// This is a single polling attempt: it may return `None` when no frame is
+    /// available and does not retry NDI SDK initial synchronization misses.
     ///
     /// **This is the recommended API for performance-critical applications** that can
-    /// process frames in-place. For applications that need to store frames or send them
-    /// across threads, use [`Self::capture_video`] which returns an owned `VideoFrame`.
+    /// process frames in-place and handle polling themselves. For applications that need
+    /// reliable retrying, or need to store frames or send them across threads, use
+    /// [`Self::capture_video`] which returns an owned `VideoFrame`.
     ///
     /// # Performance
     ///
@@ -734,6 +804,10 @@ impl Receiver {
     /// This is the **primary method** for reliable video frame capture. It works around
     /// an NDI SDK behavior where the SDK may return immediately (0ms) during initial
     /// connection instead of blocking for the full timeout duration.
+    ///
+    /// The `timeout` is a total retry budget. Each individual SDK poll is capped to
+    /// the remaining budget, and `Duration::ZERO` performs exactly one nonblocking
+    /// capture attempt.
     ///
     /// ## Why This Method Exists
     ///
@@ -832,14 +906,17 @@ impl Receiver {
         }
     }
 
-    /// Capture a zero-copy borrowed audio frame - safe to call from multiple threads concurrently.
+    /// Poll for a zero-copy borrowed audio frame - safe to call from multiple threads concurrently.
     ///
     /// This returns an `AudioFrameRef` that borrows the NDI SDK's buffer directly,
     /// avoiding any allocation or memcpy. The frame is automatically freed when dropped.
+    /// This is a single polling attempt: it may return `None` when no frame is
+    /// available and does not retry NDI SDK initial synchronization misses.
     ///
     /// **This is the recommended API for performance-critical applications** that can
-    /// process audio in-place. For applications that need to store frames or send them
-    /// across threads, use [`Self::capture_audio`] which returns an owned `AudioFrame`.
+    /// process audio in-place and handle polling themselves. For applications that need
+    /// reliable retrying, or need to store frames or send them across threads, use
+    /// [`Self::capture_audio`] which returns an owned `AudioFrame`.
     ///
     /// # Returns
     ///
@@ -888,6 +965,10 @@ impl Receiver {
     ///
     /// This is the **primary method** for reliable audio frame capture. It automatically
     /// retries internally to handle NDI SDK synchronization behavior.
+    ///
+    /// The `timeout` is a total retry budget. Each individual SDK poll is capped to
+    /// the remaining budget, and `Duration::ZERO` performs exactly one nonblocking
+    /// capture attempt.
     ///
     /// For zero-copy capture that avoids memory allocation and copying, use
     /// [`Self::capture_audio_ref`] instead. For manual polling where you want to handle
@@ -969,14 +1050,17 @@ impl Receiver {
         }
     }
 
-    /// Capture a zero-copy borrowed metadata frame - safe to call from multiple threads concurrently.
+    /// Poll for a zero-copy borrowed metadata frame - safe to call from multiple threads concurrently.
     ///
     /// This returns a `MetadataFrameRef` that borrows the NDI SDK's buffer directly,
     /// avoiding any allocation or string copying. The frame is automatically freed when dropped.
+    /// This is a single polling attempt: it may return `None` when no frame is
+    /// available and does not retry NDI SDK initial synchronization misses.
     ///
     /// **This is the recommended API for performance-critical applications** that can
-    /// process metadata in-place. For applications that need to store metadata or send it
-    /// across threads, use [`Self::capture_metadata`] which returns an owned `MetadataFrame`.
+    /// process metadata in-place and handle polling themselves. For applications that
+    /// need reliable retrying, or need to store metadata or send it across threads, use
+    /// [`Self::capture_metadata`] which returns an owned `MetadataFrame`.
     ///
     /// # Returns
     ///
@@ -1024,6 +1108,10 @@ impl Receiver {
     ///
     /// This is the **primary method** for reliable metadata frame capture. It automatically
     /// retries internally to handle NDI SDK synchronization behavior.
+    ///
+    /// The `timeout` is a total retry budget. Each individual SDK poll is capped to
+    /// the remaining budget, and `Duration::ZERO` performs exactly one nonblocking
+    /// capture attempt.
     ///
     /// For zero-copy capture that avoids memory allocation and string copying, use
     /// [`Self::capture_metadata_ref`] instead. For manual polling where you want to handle
@@ -1445,8 +1533,25 @@ impl ConnectionStats {
 mod tests {
     use super::*;
 
+    use std::cell::Cell;
+
     fn test_source() -> Source {
         Source::default()
+    }
+
+    #[derive(Default)]
+    struct FakeClock {
+        elapsed: Cell<Duration>,
+    }
+
+    impl FakeClock {
+        fn elapsed(&self) -> Duration {
+            self.elapsed.get()
+        }
+
+        fn advance(&self, duration: Duration) {
+            self.elapsed.set(self.elapsed.get() + duration);
+        }
     }
 
     fn assert_raw_receiver_modes(
@@ -1575,56 +1680,240 @@ mod tests {
     }
 
     #[test]
-    fn retry_succeeds_first_attempt() {
-        let result = retry_capture(Duration::from_secs(1), &RetryPolicy::default(), |_| {
-            Ok(Some(42))
-        });
-        assert_eq!(result.unwrap(), 42);
-    }
-
-    #[test]
-    fn retry_succeeds_after_n_attempts() {
-        let attempts = std::cell::Cell::new(0);
-        let result = retry_capture(Duration::from_secs(1), &RetryPolicy::default(), |_| {
-            attempts.set(attempts.get() + 1);
-            if attempts.get() < 3 {
-                Ok(None)
-            } else {
-                Ok(Some(42))
-            }
-        });
-        assert_eq!(result.unwrap(), 42);
-        assert_eq!(attempts.get(), 3);
-    }
-
-    #[test]
-    fn retry_times_out() {
+    fn retry_caps_sub_poll_timeout_to_total_budget() {
+        let clock = FakeClock::default();
         let policy = RetryPolicy {
-            poll_interval: Duration::from_millis(20),
-            sleep_between: Duration::from_millis(5),
+            poll_interval: Duration::from_millis(100),
+            sleep_between: Duration::from_millis(10),
         };
-        let result: Result<i32> = retry_capture(Duration::from_millis(50), &policy, |_| Ok(None));
+        let mut polls = Vec::new();
+
+        let result = retry_capture_with_clock(
+            Duration::from_millis(25),
+            &policy,
+            |poll| {
+                polls.push(poll);
+                Ok(Some(42))
+            },
+            || clock.elapsed(),
+            |_| {},
+        );
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(polls, [Duration::from_millis(25)]);
+    }
+
+    #[test]
+    fn retry_shrinks_later_poll_to_remaining_budget() {
+        let clock = FakeClock::default();
+        let policy = RetryPolicy {
+            poll_interval: Duration::from_millis(40),
+            sleep_between: Duration::from_millis(10),
+        };
+        let mut polls = Vec::new();
+        let mut sleeps = Vec::new();
+
+        let result: Result<i32> = retry_capture_with_clock(
+            Duration::from_millis(50),
+            &policy,
+            |poll| {
+                polls.push(poll);
+                if polls.len() == 1 {
+                    clock.advance(Duration::from_millis(5));
+                } else {
+                    clock.advance(poll);
+                }
+                Ok(None)
+            },
+            || clock.elapsed(),
+            |sleep| {
+                sleeps.push(sleep);
+                clock.advance(sleep);
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(Error::FrameTimeout { attempts: 2, .. })
+        ));
+        assert_eq!(
+            polls,
+            [Duration::from_millis(40), Duration::from_millis(35)]
+        );
+        assert_eq!(sleeps, [Duration::from_millis(10)]);
+    }
+
+    #[test]
+    fn retry_zero_timeout_success_makes_one_nonblocking_attempt() {
+        let clock = FakeClock::default();
+        let mut polls = Vec::new();
+
+        let result = retry_capture_with_clock(
+            Duration::ZERO,
+            &RetryPolicy::default(),
+            |poll| {
+                polls.push(poll);
+                Ok(Some(42))
+            },
+            || clock.elapsed(),
+            |_| panic!("zero-timeout success should not sleep"),
+        );
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(polls, [Duration::ZERO]);
+    }
+
+    #[test]
+    fn retry_zero_timeout_miss_times_out_after_one_attempt() {
+        let clock = FakeClock::default();
+        let mut polls = Vec::new();
+
+        let result: Result<i32> = retry_capture_with_clock(
+            Duration::ZERO,
+            &RetryPolicy::default(),
+            |poll| {
+                polls.push(poll);
+                Ok(None)
+            },
+            || clock.elapsed(),
+            |_| panic!("zero-timeout miss should not sleep"),
+        );
+
         match result {
             Err(Error::FrameTimeout { attempts, elapsed }) => {
-                assert!(attempts > 0, "Should have made at least one attempt");
-                assert!(
-                    elapsed >= Duration::from_millis(50),
-                    "Elapsed time should be at least the timeout"
-                );
+                assert_eq!(attempts, 1);
+                assert_eq!(elapsed, Duration::ZERO);
             }
             _ => panic!("Expected FrameTimeout error"),
         }
+        assert_eq!(polls, [Duration::ZERO]);
+    }
+
+    #[test]
+    fn retry_timeout_counts_only_actual_capture_attempts() {
+        let clock = FakeClock::default();
+        let policy = RetryPolicy {
+            poll_interval: Duration::from_millis(8),
+            sleep_between: Duration::from_millis(5),
+        };
+        let mut polls = Vec::new();
+
+        let result: Result<i32> = retry_capture_with_clock(
+            Duration::from_millis(10),
+            &policy,
+            |poll| {
+                polls.push(poll);
+                clock.advance(Duration::from_millis(10));
+                Ok(None)
+            },
+            || clock.elapsed(),
+            |_| panic!("expired timeout should not sleep"),
+        );
+
+        match result {
+            Err(Error::FrameTimeout { attempts, elapsed }) => {
+                assert_eq!(attempts, 1);
+                assert_eq!(elapsed, Duration::from_millis(10));
+            }
+            _ => panic!("Expected FrameTimeout error"),
+        }
+        assert_eq!(polls, [Duration::from_millis(8)]);
+    }
+
+    #[test]
+    fn retry_caps_sleep_to_remaining_budget() {
+        let clock = FakeClock::default();
+        let policy = RetryPolicy {
+            poll_interval: Duration::from_millis(8),
+            sleep_between: Duration::from_millis(5),
+        };
+        let mut sleeps = Vec::new();
+
+        let result: Result<i32> = retry_capture_with_clock(
+            Duration::from_millis(10),
+            &policy,
+            |poll| {
+                assert_eq!(poll, Duration::from_millis(8));
+                clock.advance(Duration::from_millis(8));
+                Ok(None)
+            },
+            || clock.elapsed(),
+            |sleep| {
+                sleeps.push(sleep);
+                clock.advance(sleep);
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(Error::FrameTimeout { attempts: 1, .. })
+        ));
+        assert_eq!(sleeps, [Duration::from_millis(2)]);
+    }
+
+    #[test]
+    fn retry_validates_total_timeout_before_attempts() {
+        let attempts = Cell::new(0);
+
+        let result: Result<i32> = retry_capture(
+            crate::MAX_TIMEOUT + Duration::from_nanos(1),
+            &RetryPolicy::default(),
+            |_| {
+                attempts.set(attempts.get() + 1);
+                Ok(Some(42))
+            },
+        );
+
+        assert!(matches!(result, Err(Error::InvalidConfiguration(_))));
+        assert_eq!(attempts.get(), 0);
+    }
+
+    #[test]
+    fn retry_succeeds_after_retry_before_timeout() {
+        let clock = FakeClock::default();
+        let attempts = Cell::new(0);
+
+        let result = retry_capture_with_clock(
+            Duration::from_millis(50),
+            &RetryPolicy::default(),
+            |_| {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Ok(None)
+                } else {
+                    Ok(Some(42))
+                }
+            },
+            || clock.elapsed(),
+            |sleep| clock.advance(sleep),
+        );
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(attempts.get(), 2);
     }
 
     #[test]
     fn retry_propagates_error() {
-        let result: Result<i32> =
-            retry_capture(Duration::from_secs(1), &RetryPolicy::default(), |_| {
+        let clock = FakeClock::default();
+        let attempts = Cell::new(0);
+        let mut sleeps = Vec::new();
+
+        let result: Result<i32> = retry_capture_with_clock(
+            Duration::from_secs(1),
+            &RetryPolicy::default(),
+            |_| {
+                attempts.set(attempts.get() + 1);
                 Err(Error::CaptureFailed("test error".into()))
-            });
+            },
+            || clock.elapsed(),
+            |sleep| sleeps.push(sleep),
+        );
+
         assert!(
             matches!(result, Err(Error::CaptureFailed(_))),
             "Should propagate CaptureFailed error"
         );
+        assert_eq!(attempts.get(), 1);
+        assert!(sleeps.is_empty());
     }
 }

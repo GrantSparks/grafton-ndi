@@ -7,6 +7,13 @@
 //! use `spawn_blocking` internally to run NDI operations on a thread pool without
 //! blocking the async runtime.
 //!
+//! For reliable `capture_*` methods, the timeout budget starts when the async
+//! method is called. The blocking task receives only the remaining budget when it
+//! begins, so `spawn_blocking` queue delay does not expand the SDK wait budget.
+//! Runtime scheduling can still make the awaited future complete after the timeout;
+//! these wrappers do not use runtime-level cancellation because that would not stop
+//! a queued or running blocking NDI call.
+//!
 //! # Features
 //!
 //! - `tokio` - Enable Tokio runtime support
@@ -42,11 +49,16 @@
 //! # }
 //! ```
 
-use std::{future::Future, marker::PhantomData, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    marker::PhantomData,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::{
     frames::{AudioFrame, MetadataFrame, VideoFrame},
-    Receiver, Result,
+    to_ms_checked, Receiver, Result,
 };
 
 #[cfg(feature = "tokio")]
@@ -179,6 +191,15 @@ pub struct AsyncReceiverGeneric<R: SpawnBlocking> {
     _runtime: PhantomData<R>,
 }
 
+fn validated_timeout_start(timeout: Duration) -> Result<Instant> {
+    to_ms_checked(timeout)?;
+    Ok(Instant::now())
+}
+
+fn remaining_timeout(timeout: Duration, start_time: Instant) -> Duration {
+    timeout.saturating_sub(start_time.elapsed())
+}
+
 impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
     /// Create a new async receiver wrapper.
     ///
@@ -200,8 +221,10 @@ impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
     ///
     /// # Arguments
     ///
-    /// * `timeout` - Total time to wait for a frame.
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+    /// * `timeout` - Total budget to wait for a frame, starting when this async
+    ///   method is called. Blocking task queue delay is subtracted before the
+    ///   synchronous receiver starts waiting. Must not exceed
+    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
     ///
     /// # Returns
     ///
@@ -234,8 +257,10 @@ impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
     /// # }
     /// ```
     pub async fn capture_video(&self, timeout: Duration) -> Result<VideoFrame> {
+        let start_time = validated_timeout_start(timeout)?;
         let receiver = Arc::clone(&self.inner);
-        R::spawn_blocking(move || receiver.capture_video(timeout)).await?
+        R::spawn_blocking(move || receiver.capture_video(remaining_timeout(timeout, start_time)))
+            .await?
     }
 
     /// Async version of [`Receiver::capture_video_timeout`].
@@ -269,8 +294,10 @@ impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
     ///
     /// # Arguments
     ///
-    /// * `timeout` - Total time to wait for a frame.
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+    /// * `timeout` - Total budget to wait for a frame, starting when this async
+    ///   method is called. Blocking task queue delay is subtracted before the
+    ///   synchronous receiver starts waiting. Must not exceed
+    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
     ///
     /// # Returns
     ///
@@ -279,8 +306,10 @@ impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
     /// * `Err(Error::SpawnFailed)` - The blocking task panicked or was cancelled
     /// * `Err(_)` - An error occurred during capture
     pub async fn capture_audio(&self, timeout: Duration) -> Result<AudioFrame> {
+        let start_time = validated_timeout_start(timeout)?;
         let receiver = Arc::clone(&self.inner);
-        R::spawn_blocking(move || receiver.capture_audio(timeout)).await?
+        R::spawn_blocking(move || receiver.capture_audio(remaining_timeout(timeout, start_time)))
+            .await?
     }
 
     /// Async version of [`Receiver::capture_audio_timeout`].
@@ -310,8 +339,10 @@ impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
     ///
     /// # Arguments
     ///
-    /// * `timeout` - Total time to wait for a frame.
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+    /// * `timeout` - Total budget to wait for a frame, starting when this async
+    ///   method is called. Blocking task queue delay is subtracted before the
+    ///   synchronous receiver starts waiting. Must not exceed
+    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
     ///
     /// # Returns
     ///
@@ -320,8 +351,10 @@ impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
     /// * `Err(Error::SpawnFailed)` - The blocking task panicked or was cancelled
     /// * `Err(_)` - An error occurred during capture
     pub async fn capture_metadata(&self, timeout: Duration) -> Result<MetadataFrame> {
+        let start_time = validated_timeout_start(timeout)?;
         let receiver = Arc::clone(&self.inner);
-        R::spawn_blocking(move || receiver.capture_metadata(timeout)).await?
+        R::spawn_blocking(move || receiver.capture_metadata(remaining_timeout(timeout, start_time)))
+            .await?
     }
 
     /// Async version of [`Receiver::capture_metadata_timeout`].
