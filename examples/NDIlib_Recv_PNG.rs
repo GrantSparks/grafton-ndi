@@ -9,25 +9,23 @@
 //!
 //! 1. Using `capture_video()` for reliable frame capture with
 //!    automatic retry logic (handles NDI SDK timeout quirks internally)
-//! 2. Stride validation - Prevents corrupted images when stride != width * 4
-//! 3. Format verification - Ensures we actually get RGBA/RGBX format
-//! 4. Compressed format detection - Warns about unsupported formats
+//! 2. `VideoFrame::encode_png()` for crate-provided image conversion
+//! 3. Correct handling for RGBX/BGRX padding bytes and padded rows
 //!
-//! Run with: `cargo run --example NDIlib_Recv_PNG`
+//! Run with: `cargo run --features image-encoding --example NDIlib_Recv_PNG`
 //!
 //! Optional arguments:
-//! - IP address to search: `cargo run --example NDIlib_Recv_PNG -- 192.168.0.100`
-//! - Multiple IPs: `cargo run --example NDIlib_Recv_PNG -- 192.168.0.100 10.0.0.0/24`
-//! - Custom output file: `cargo run --example NDIlib_Recv_PNG -- --output MyImage.png`
-//! - Both: `cargo run --example NDIlib_Recv_PNG -- 192.168.0.100 --output MyImage.png`
+//! - IP address to search: `cargo run --features image-encoding --example NDIlib_Recv_PNG -- 192.168.0.100`
+//! - Multiple IPs: `cargo run --features image-encoding --example NDIlib_Recv_PNG -- 192.168.0.100 10.0.0.0/24`
+//! - Custom output file: `cargo run --features image-encoding --example NDIlib_Recv_PNG -- --output MyImage.png`
+//! - Both: `cargo run --features image-encoding --example NDIlib_Recv_PNG -- 192.168.0.100 --output MyImage.png`
 
 use grafton_ndi::{
-    Error, Finder, FinderOptions, PixelFormat, Receiver, ReceiverColorFormat, ReceiverOptions, NDI,
+    Error, Finder, FinderOptions, Receiver, ReceiverColorFormat, ReceiverOptions, NDI,
 };
 
 use std::{
-    env,
-    fs::File,
+    env, fs,
     time::{Duration, Instant},
 };
 
@@ -110,16 +108,14 @@ fn main() -> Result<(), Error> {
     println!("  Resolution: {width}x{height}");
     let fourcc = video_frame.pixel_format();
     println!("  Format: {fourcc:?}");
-    let line_stride = match video_frame.line_stride_or_size() {
-        grafton_ndi::LineStrideOrSize::LineStrideBytes(stride) => stride,
-        grafton_ndi::LineStrideOrSize::DataSizeBytes(_) => {
-            eprintln!("ERROR: Expected line stride but got data size");
-            return Err(Error::InvalidFrame(
-                "Frame has data size instead of line stride".into(),
-            ));
+    match video_frame.line_stride_or_size() {
+        grafton_ndi::LineStrideOrSize::LineStrideBytes(stride) => {
+            println!("  Line stride: {stride} bytes");
         }
-    };
-    println!("  Line stride: {line_stride} bytes");
+        grafton_ndi::LineStrideOrSize::DataSizeBytes(size) => {
+            println!("  Data size layout: {size} bytes");
+        }
+    }
     let data_size = video_frame.data().len();
     println!("  Data size: {data_size} bytes");
     let frame_rate_n = video_frame.frame_rate_n();
@@ -128,52 +124,9 @@ fn main() -> Result<(), Error> {
     let timecode = video_frame.timecode();
     println!("  Timecode: {timecode:016x}");
 
-    match video_frame.pixel_format() {
-        PixelFormat::RGBA | PixelFormat::RGBX => {
-            println!("  ✓ Got requested RGBA/RGBX format");
-        }
-        _ => {
-            let format = video_frame.pixel_format();
-            eprintln!("  ⚠ Warning: Got unexpected format {format:?}, PNG may fail");
-        }
-    }
-
-    // CRITICAL: Verify stride matches width to prevent corrupted images
-    let expected_stride = video_frame.width() * 4;
-    let actual_stride = line_stride;
-
-    if actual_stride != expected_stride {
-        // If stride != width * 4, we would need to handle row padding
-        return Err(Error::InitializationFailed(format!(
-            "Line stride ({actual_stride}) doesn't match width * 4 ({expected_stride}). \
-             This would require handling row padding which this example doesn't implement."
-        )));
-    }
-
-    let expected_uncompressed_size = (video_frame.width() * video_frame.height() * 4) as usize;
-    if video_frame.data().len() < expected_uncompressed_size / 2 {
-        let actual_size = video_frame.data().len();
-        eprintln!(
-            "  ⚠ Warning: Frame data size ({actual_size} bytes) is much smaller than expected"
-        );
-        eprintln!("            uncompressed size ({expected_uncompressed_size} bytes). This might be a compressed");
-        eprintln!("            format that needs decoding before saving as PNG.");
-    }
-
     println!("\nSaving frame as PNG...");
-    let file = File::create(output_file)?;
-    let mut encoder = png::Encoder::new(
-        file,
-        video_frame.width() as u32,
-        video_frame.height() as u32,
-    );
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-
-    encoder
-        .write_header()
-        .and_then(|mut writer| writer.write_image_data(video_frame.data()))
-        .map_err(|e| Error::InitializationFailed(format!("PNG encoding failed: {e}")))?;
+    let png_bytes = video_frame.encode_png()?;
+    fs::write(output_file, png_bytes)?;
 
     println!("✓ Saved frame as {output_file}");
     println!("\nExample completed successfully!");
