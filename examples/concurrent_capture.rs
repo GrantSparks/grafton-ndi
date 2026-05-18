@@ -75,10 +75,10 @@ fn main() -> Result<(), grafton_ndi::Error> {
                 match recv_video.capture_video_timeout(Duration::from_secs(5)) {
                     Ok(Some(frame)) => {
                         frame_count += 1;
-                        let width = frame.width;
-                        let height = frame.height;
-                        let frame_rate_n = frame.frame_rate_n;
-                        let frame_rate_d = frame.frame_rate_d;
+                        let width = frame.width();
+                        let height = frame.height();
+                        let frame_rate_n = frame.frame_rate_n();
+                        let frame_rate_d = frame.frame_rate_d();
                         println!(
                             "[VIDEO] Frame {frame_count}: {width}x{height} @ {frame_rate_n}/{frame_rate_d} fps"
                         );
@@ -106,10 +106,10 @@ fn main() -> Result<(), grafton_ndi::Error> {
             for _ in 0..10 {
                 match recv_audio.capture_audio_timeout(Duration::from_secs(5)) {
                     Ok(Some(frame)) => {
-                        sample_count += frame.num_samples;
-                        let num_samples = frame.num_samples;
-                        let sample_rate = frame.sample_rate;
-                        let num_channels = frame.num_channels;
+                        sample_count += frame.num_samples();
+                        let num_samples = frame.num_samples();
+                        let sample_rate = frame.sample_rate();
+                        let num_channels = frame.num_channels();
                         println!(
                             "[AUDIO] {num_samples} samples @ {sample_rate} Hz, {num_channels} channels"
                         );

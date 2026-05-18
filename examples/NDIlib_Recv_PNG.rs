@@ -105,12 +105,12 @@ fn main() -> Result<(), Error> {
     println!("Frame received after {elapsed:?}");
 
     println!("Frame details:");
-    let width = video_frame.width;
-    let height = video_frame.height;
+    let width = video_frame.width();
+    let height = video_frame.height();
     println!("  Resolution: {width}x{height}");
-    let fourcc = video_frame.pixel_format;
+    let fourcc = video_frame.pixel_format();
     println!("  Format: {fourcc:?}");
-    let line_stride = match video_frame.line_stride_or_size {
+    let line_stride = match video_frame.line_stride_or_size() {
         grafton_ndi::LineStrideOrSize::LineStrideBytes(stride) => stride,
         grafton_ndi::LineStrideOrSize::DataSizeBytes(_) => {
             eprintln!("ERROR: Expected line stride but got data size");
@@ -120,26 +120,26 @@ fn main() -> Result<(), Error> {
         }
     };
     println!("  Line stride: {line_stride} bytes");
-    let data_size = video_frame.data.len();
+    let data_size = video_frame.data().len();
     println!("  Data size: {data_size} bytes");
-    let frame_rate_n = video_frame.frame_rate_n;
-    let frame_rate_d = video_frame.frame_rate_d;
+    let frame_rate_n = video_frame.frame_rate_n();
+    let frame_rate_d = video_frame.frame_rate_d();
     println!("  Frame rate: {frame_rate_n}/{frame_rate_d}");
-    let timecode = video_frame.timecode;
+    let timecode = video_frame.timecode();
     println!("  Timecode: {timecode:016x}");
 
-    match video_frame.pixel_format {
+    match video_frame.pixel_format() {
         PixelFormat::RGBA | PixelFormat::RGBX => {
             println!("  ✓ Got requested RGBA/RGBX format");
         }
         _ => {
-            let format = video_frame.pixel_format;
+            let format = video_frame.pixel_format();
             eprintln!("  ⚠ Warning: Got unexpected format {format:?}, PNG may fail");
         }
     }
 
     // CRITICAL: Verify stride matches width to prevent corrupted images
-    let expected_stride = video_frame.width * 4;
+    let expected_stride = video_frame.width() * 4;
     let actual_stride = line_stride;
 
     if actual_stride != expected_stride {
@@ -150,9 +150,9 @@ fn main() -> Result<(), Error> {
         )));
     }
 
-    let expected_uncompressed_size = (video_frame.width * video_frame.height * 4) as usize;
-    if video_frame.data.len() < expected_uncompressed_size / 2 {
-        let actual_size = video_frame.data.len();
+    let expected_uncompressed_size = (video_frame.width() * video_frame.height() * 4) as usize;
+    if video_frame.data().len() < expected_uncompressed_size / 2 {
+        let actual_size = video_frame.data().len();
         eprintln!(
             "  ⚠ Warning: Frame data size ({actual_size} bytes) is much smaller than expected"
         );
@@ -162,13 +162,17 @@ fn main() -> Result<(), Error> {
 
     println!("\nSaving frame as PNG...");
     let file = File::create(output_file)?;
-    let mut encoder = png::Encoder::new(file, video_frame.width as u32, video_frame.height as u32);
+    let mut encoder = png::Encoder::new(
+        file,
+        video_frame.width() as u32,
+        video_frame.height() as u32,
+    );
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
 
     encoder
         .write_header()
-        .and_then(|mut writer| writer.write_image_data(&video_frame.data))
+        .and_then(|mut writer| writer.write_image_data(video_frame.data()))
         .map_err(|e| Error::InitializationFailed(format!("PNG encoding failed: {e}")))?;
 
     println!("✓ Saved frame as {output_file}");

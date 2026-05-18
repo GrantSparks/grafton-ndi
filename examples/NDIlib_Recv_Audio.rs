@@ -82,11 +82,11 @@ fn main() -> Result<(), Error> {
         match receiver.capture_audio_timeout(Duration::from_secs(5))? {
             Some(audio_frame) => {
                 println!("Frame {}: ", i + 1);
-                println!("  Sample rate: {} Hz", audio_frame.sample_rate);
-                println!("  Channels: {}", audio_frame.num_channels);
-                println!("  Samples: {}", audio_frame.num_samples);
-                println!("  Timestamp: {}", audio_frame.timestamp);
-                println!("  Format: {:?}", audio_frame.format);
+                println!("  Sample rate: {} Hz", audio_frame.sample_rate());
+                println!("  Channels: {}", audio_frame.num_channels());
+                println!("  Samples: {}", audio_frame.num_samples());
+                println!("  Timestamp: {}", audio_frame.timestamp());
+                println!("  Format: {:?}", audio_frame.format());
 
                 // Get the audio data as f32
                 let audio_data = audio_frame.data();
@@ -101,8 +101,8 @@ fn main() -> Result<(), Error> {
                 }
 
                 // Show per-channel data if stereo or more
-                if audio_frame.num_channels > 1 {
-                    for ch in 0..audio_frame.num_channels.min(2) as usize {
+                if audio_frame.num_channels() > 1 {
+                    for ch in 0..audio_frame.num_channels().min(2) as usize {
                         if let Some(channel_data) = audio_frame.channel_data(ch) {
                             let ch_sample_count = channel_data.len().min(10);
                             print!("  Channel {}: [", ch);

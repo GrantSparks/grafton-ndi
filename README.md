@@ -189,13 +189,13 @@ let receiver = frame_sync.into_receiver();
 ```
 
 ### `PixelFormat` - Format Utilities
-Pixel format information with compile-time computation for stride and buffer sizes.
+Pixel format information with checked stride and buffer-size helpers.
 
 ```rust
 use grafton_ndi::PixelFormat;
 
-let stride = PixelFormat::BGRA.line_stride(1920);
-let size = PixelFormat::BGRA.buffer_size(1920, 1080);
+let stride = PixelFormat::BGRA.try_line_stride(1920).unwrap();
+let size = PixelFormat::BGRA.try_buffer_size(1920, 1080).unwrap();
 let info = PixelFormat::BGRA.info();  // PixelFormatInfo with bytes_per_pixel, category
 ```
 

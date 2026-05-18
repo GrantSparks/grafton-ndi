@@ -73,15 +73,15 @@ fn main() -> Result<(), Error> {
         if let Some(video_frame) = receiver.capture_video_timeout(Duration::ZERO)? {
             println!(
                 "Video data received ({width}x{height}).",
-                width = video_frame.width,
-                height = video_frame.height
+                width = video_frame.width(),
+                height = video_frame.height()
             );
         }
 
         if let Some(audio_frame) = receiver.capture_audio_timeout(Duration::ZERO)? {
             println!(
                 "Audio data received ({num_samples} samples).",
-                num_samples = audio_frame.num_samples
+                num_samples = audio_frame.num_samples()
             );
 
             let audio_16bit = convert_to_16bit_interleaved(&audio_frame, 20); // 20dB headroom
@@ -89,7 +89,7 @@ fn main() -> Result<(), Error> {
             // Here you would process the 16-bit audio data
             println!(
                 "  Converted to 16-bit: {samples} samples",
-                samples = audio_16bit.len() / audio_frame.num_channels as usize
+                samples = audio_16bit.len() / audio_frame.num_channels() as usize
             );
         }
 
@@ -117,7 +117,7 @@ fn convert_to_16bit_interleaved(
     audio_frame: &grafton_ndi::AudioFrame,
     reference_level_db: i32,
 ) -> Vec<i16> {
-    let num_samples = (audio_frame.num_samples * audio_frame.num_channels) as usize;
+    let num_samples = (audio_frame.num_samples() * audio_frame.num_channels()) as usize;
     let mut output = vec![0i16; num_samples];
 
     // Calculate scaling factor based on reference level

@@ -35,7 +35,7 @@
 //!
 //!     // Capture frame asynchronously without blocking the runtime
 //!     let frame = async_receiver.capture_video(std::time::Duration::from_secs(5)).await?;
-//!     println!("Captured {}x{} frame", frame.width, frame.height);
+//!     println!("Captured {}x{} frame", frame.width(), frame.height());
 //!
 //!     Ok(())
 //! }
@@ -166,7 +166,7 @@ impl SpawnBlocking for AsyncStdRuntime {
 ///
 ///     // Non-blocking async capture
 ///     match async_receiver.capture_video_timeout(std::time::Duration::from_millis(100)).await? {
-///         Some(frame) => println!("Got frame: {}x{}", frame.width, frame.height),
+///         Some(frame) => println!("Got frame: {}x{}", frame.width(), frame.height()),
 ///         None => println!("No frame available"),
 ///     }
 ///
@@ -228,7 +228,7 @@ impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
     /// # let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
     /// let async_receiver = AsyncReceiver::new(receiver);
     /// let frame = async_receiver.capture_video(Duration::from_secs(5)).await?;
-    /// println!("Captured {}x{} frame", frame.width, frame.height);
+    /// println!("Captured {}x{} frame", frame.width(), frame.height());
     /// # Ok(())
     /// # }
     /// # }
@@ -388,7 +388,7 @@ pub mod tokio {
     //!
     //!     // Non-blocking async capture
     //!     match async_receiver.capture_video_timeout(std::time::Duration::from_millis(100)).await? {
-    //!         Some(frame) => println!("Got frame: {}x{}", frame.width, frame.height),
+    //!         Some(frame) => println!("Got frame: {}x{}", frame.width(), frame.height()),
     //!         None => println!("No frame available"),
     //!     }
     //!
@@ -447,7 +447,7 @@ pub mod async_std {
     //!
     //!     // Non-blocking async capture
     //!     match async_receiver.capture_video_timeout(std::time::Duration::from_millis(100)).await? {
-    //!         Some(frame) => println!("Got frame: {}x{}", frame.width, frame.height),
+    //!         Some(frame) => println!("Got frame: {}x{}", frame.width(), frame.height()),
     //!         None => println!("No frame available"),
     //!     }
     //!
