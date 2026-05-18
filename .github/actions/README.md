@@ -20,6 +20,15 @@ Sets up the NDI SDK on macOS runners.
 - Caches installations for faster subsequent runs
 - Sets up library paths for dynamic linking
 
+## setup-ndi-linux
+
+Sets up the NDI SDK on Linux runners.
+
+- Downloads and extracts NDI SDK 6 for Linux
+- Verifies SDK integrity via SHA256 hash allowlist
+- Caches installations for faster subsequent runs
+- Creates the library symlinks expected by the Rust linker
+
 ## Configuration
 
 The NDI SDK URLs can be overridden using GitHub secrets:
@@ -30,5 +39,5 @@ The NDI SDK URLs can be overridden using GitHub secrets:
 ## Notes
 
 - The setup actions verify NDI SDK installers against a small allowlist of known-good SHA256 hashes because NDI can rotate installer payloads behind the same download URL
-- Both actions cache their installations to speed up CI runs
+- All setup actions cache their installations to speed up CI runs
 - The Windows action also installs LLVM which is required for building on Windows

@@ -145,10 +145,6 @@ pub use {
 #[cfg(feature = "image-encoding")]
 pub use frames::ImageFormat;
 
-// Deprecated: Use PixelFormat::line_stride() instead
-#[allow(deprecated)]
-pub use frames::calculate_line_stride;
-
 /// Alias for Result with our Error type
 pub type Result<T> = std::result::Result<T, crate::error::Error>;
 

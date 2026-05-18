@@ -73,7 +73,7 @@ fn main() -> Result<(), Error> {
         if !finder.wait_for_sources(Duration::from_secs(5))? {
             // No changes detected
             let elapsed = start.elapsed().as_secs();
-            if elapsed % 10 == 0 {
+            if elapsed.is_multiple_of(10) {
                 // Print status every 10 seconds
                 println!(
                     "[{:02}s] No change to sources (still {} found)",

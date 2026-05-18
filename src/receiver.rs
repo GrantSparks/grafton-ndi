@@ -346,7 +346,7 @@ impl ReceiverOptionsBuilder {
     ///
     /// // Capture full quality frames
     /// let frame = receiver.capture_video(Duration::from_secs(5))?;
-    /// println!("Captured {width}x{height} frame", width = frame.width, height = frame.height);
+    /// println!("Captured {width}x{height} frame", width = frame.width(), height = frame.height());
     /// # Ok(())
     /// # }
     /// ```
@@ -751,7 +751,7 @@ impl Receiver {
     /// # let receiver = Receiver::new(&ndi, &options)?;
     /// // Wait up to 5 seconds for a frame
     /// let frame = receiver.capture_video(Duration::from_secs(5))?;
-    /// println!("Captured {width}x{height} frame", width = frame.width, height = frame.height);
+    /// println!("Captured {width}x{height} frame", width = frame.width(), height = frame.height());
     /// # Ok(())
     /// # }
     /// ```
@@ -793,7 +793,7 @@ impl Receiver {
     /// # let receiver = Receiver::new(&ndi, &options)?;
     /// // Poll with a short timeout
     /// match receiver.capture_video_timeout(Duration::from_millis(100))? {
-    ///     Some(frame) => println!("Got frame: {width}x{height}", width = frame.width, height = frame.height),
+    ///     Some(frame) => println!("Got frame: {width}x{height}", width = frame.width(), height = frame.height()),
     ///     None => println!("No frame available"),
     /// }
     /// # Ok(())
@@ -889,7 +889,7 @@ impl Receiver {
     /// # let options = ReceiverOptions::builder(source).build();
     /// # let receiver = Receiver::new(&ndi, &options)?;
     /// let frame = receiver.capture_audio(Duration::from_secs(5))?;
-    /// println!("Captured audio: {} channels, {} samples", frame.num_channels, frame.num_samples);
+    /// println!("Captured audio: {} channels, {} samples", frame.num_channels(), frame.num_samples());
     /// # Ok(())
     /// # }
     /// ```

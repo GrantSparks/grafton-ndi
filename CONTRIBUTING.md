@@ -19,7 +19,7 @@ By participating in this project, you agree to abide by our code of conduct: be 
 
 ### Prerequisites
 
-- Rust 1.75 or later
+- Rust 1.87 or later
 - NDI SDK 6.x installed (see README for platform-specific instructions)
 - Git
 

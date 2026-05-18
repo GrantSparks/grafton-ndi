@@ -134,52 +134,52 @@ impl PixelFormatInfo {
         )
     }
 
-    /// Calculate total buffer size for given dimensions and stride.
+    /// Calculate total buffer size for given dimensions and stride using
+    /// checked arithmetic.
     ///
     /// # Arguments
     ///
     /// * `y_stride` - The Y-plane line stride in bytes (for planar formats) or total line stride (for packed formats)
     /// * `height` - Frame height in pixels
     ///
-    /// # Returns
+    /// # Errors
     ///
-    /// Total buffer size in bytes needed to hold the frame data.
+    /// Returns [`Error::InvalidFrame`] if `y_stride` or `height` is not
+    /// positive, if planar 4:2:0 stride/height requirements are not met, if
+    /// arithmetic overflows, or if the result exceeds the crate's maximum video
+    /// frame size.
     ///
     /// # Format-specific calculations
     ///
     /// - **Packed RGB/YUV** (BGRA/BGRX/RGBA/RGBX/UYVY/UYVA/P216/PA16): `y_stride * height`
-    /// - **Planar 4:2:0 YV12/I420**: `Y + U + V` where:
+    /// - **Planar 4:2:0 YV12/I420**: requires even stride and height,
+    ///   then `Y + U + V` where:
     ///   - Y plane: `y_stride * height`
-    ///   - U plane: `ceil(y_stride/2) * ceil(height/2)`
-    ///   - V plane: `ceil(y_stride/2) * ceil(height/2)`
-    /// - **Semi-planar 4:2:0 NV12**: `Y + UV` where:
+    ///   - U plane: `(y_stride/2) * (height/2)`
+    ///   - V plane: `(y_stride/2) * (height/2)`
+    /// - **Semi-planar 4:2:0 NV12**: requires even height, then `Y + UV` where:
     ///   - Y plane: `y_stride * height`
-    ///   - UV plane: `y_stride * ceil(height/2)`
-    #[must_use]
-    pub const fn buffer_len(&self, y_stride: i32, height: i32) -> usize {
-        let y_stride = y_stride as usize;
-        let height = height as usize;
-        let y_size = y_stride * height;
-        let chroma_height = (height / 2) + (height % 2);
-
-        match self.category {
-            FormatCategory::Packed => y_size,
-            FormatCategory::Planar420 => {
-                // Planar 4:2:0: Y + U + V
-                // U and V planes each have half width and half height
-                let u_stride = (y_stride / 2) + (y_stride % 2);
-                let v_stride = (y_stride / 2) + (y_stride % 2);
-                let u_size = u_stride * chroma_height;
-                let v_size = v_stride * chroma_height;
-                y_size + u_size + v_size
-            }
-            FormatCategory::SemiPlanar420 => {
-                // Semi-planar 4:2:0: Y + interleaved UV
-                // UV plane has full width and half height
-                let uv_size = y_stride * chroma_height;
-                y_size + uv_size
-            }
+    ///   - UV plane: `y_stride * (height/2)`
+    pub fn try_buffer_len(&self, y_stride: i32, height: i32) -> Result<usize> {
+        if y_stride <= 0 {
+            return Err(Error::InvalidFrame(format!(
+                "Video line stride must be positive, got {y_stride}"
+            )));
         }
+        if height <= 0 {
+            return Err(Error::InvalidFrame(format!(
+                "Video frame height must be positive, got {height}"
+            )));
+        }
+
+        let y_stride = usize::try_from(y_stride)
+            .map_err(|_| Error::InvalidFrame(format!("Invalid y_stride value: {y_stride}")))?;
+        let height = usize::try_from(height)
+            .map_err(|_| Error::InvalidFrame(format!("Invalid height value: {height}")))?;
+
+        let len = calculate_buffer_len_for_info_checked(*self, y_stride, height)?;
+        validate_video_data_len(len)?;
+        Ok(len)
     }
 }
 
@@ -234,7 +234,8 @@ impl PixelFormat {
         }
     }
 
-    /// Calculate line stride in bytes for a given width.
+    /// Calculate line stride in bytes for a given width using checked
+    /// arithmetic.
     ///
     /// For packed formats, this returns the total bytes per row.
     /// For planar formats, this returns the Y-plane stride.
@@ -245,23 +246,35 @@ impl PixelFormat {
     /// use grafton_ndi::PixelFormat;
     ///
     /// // BGRA: 4 bytes per pixel
-    /// assert_eq!(PixelFormat::BGRA.line_stride(1920), 7680);
+    /// assert_eq!(PixelFormat::BGRA.try_line_stride(1920)?, 7680);
     ///
     /// // UYVY: 2 bytes per pixel
-    /// assert_eq!(PixelFormat::UYVY.line_stride(1920), 3840);
+    /// assert_eq!(PixelFormat::UYVY.try_line_stride(1920)?, 3840);
     ///
     /// // NV12: Y-plane has 1 byte per pixel
-    /// assert_eq!(PixelFormat::NV12.line_stride(1920), 1920);
+    /// assert_eq!(PixelFormat::NV12.try_line_stride(1920)?, 1920);
+    /// # Ok::<(), grafton_ndi::Error>(())
     /// ```
-    #[must_use]
-    pub const fn line_stride(self, width: i32) -> i32 {
-        (self.info().bytes_per_pixel as i32) * width
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidFrame`] if the width is invalid for this format
+    /// or if the stride does not fit in `i32`.
+    pub fn try_line_stride(self, width: i32) -> Result<i32> {
+        validate_video_width_for_format(self, width)?;
+        let width_usize = usize::try_from(width)
+            .map_err(|_| Error::InvalidFrame(format!("Invalid width value: {width}")))?;
+        let stride = min_video_line_stride_checked(self, width_usize)?;
+        i32::try_from(stride).map_err(|_| {
+            Error::InvalidFrame(format!("Video line stride {stride} exceeds i32 range"))
+        })
     }
 
-    /// Calculate the total buffer size needed for a frame with given dimensions.
+    /// Calculate the total buffer size needed for a frame with given dimensions
+    /// using checked arithmetic.
     ///
-    /// This computes the stride from the width and delegates to
-    /// [`PixelFormatInfo::buffer_len`] for the actual calculation.
+    /// This computes the validated minimum stride from the width and delegates
+    /// to the shared video layout validator.
     ///
     /// # Examples
     ///
@@ -269,39 +282,21 @@ impl PixelFormat {
     /// use grafton_ndi::PixelFormat;
     ///
     /// // BGRA 1920x1080: 1920 * 4 * 1080 = 8,294,400 bytes
-    /// assert_eq!(PixelFormat::BGRA.buffer_size(1920, 1080), 8_294_400);
+    /// assert_eq!(PixelFormat::BGRA.try_buffer_size(1920, 1080)?, 8_294_400);
     ///
     /// // NV12 1920x1080: Y (1920*1080) + UV (1920*540) = 3,110,400 bytes
-    /// assert_eq!(PixelFormat::NV12.buffer_size(1920, 1080), 3_110_400);
+    /// assert_eq!(PixelFormat::NV12.try_buffer_size(1920, 1080)?, 3_110_400);
+    /// # Ok::<(), grafton_ndi::Error>(())
     /// ```
-    #[must_use]
-    pub const fn buffer_size(self, width: i32, height: i32) -> usize {
-        let stride = self.line_stride(width);
-        self.info().buffer_len(stride, height)
-    }
-
-    /// Returns true if this is an uncompressed pixel format.
     ///
-    /// All currently defined pixel formats are uncompressed. This method
-    /// exists for forward compatibility with potential future compressed formats.
-    #[must_use]
-    pub const fn is_uncompressed(self) -> bool {
-        // All currently defined formats are uncompressed
-        // This match is exhaustive for the current enum variants
-        matches!(
-            self,
-            Self::BGRA
-                | Self::BGRX
-                | Self::RGBA
-                | Self::RGBX
-                | Self::UYVY
-                | Self::UYVA
-                | Self::YV12
-                | Self::I420
-                | Self::NV12
-                | Self::P216
-                | Self::PA16
-        )
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidFrame`] if dimensions are invalid for this
+    /// format, if arithmetic overflows, or if the result exceeds the crate's
+    /// maximum video frame size.
+    pub fn try_buffer_size(self, width: i32, height: i32) -> Result<usize> {
+        let layout = ValidatedVideoLayout::new_uncompressed(self, width, height, None)?;
+        Ok(layout.data_len_bytes)
     }
 }
 
@@ -389,33 +384,30 @@ impl From<LineStrideOrSize> for NDIlib_video_frame_v2_t__bindgen_ty_1 {
 }
 
 pub struct VideoFrame {
-    pub width: i32,
-    pub height: i32,
-    pub pixel_format: PixelFormat,
-    pub frame_rate_n: i32,
-    pub frame_rate_d: i32,
-    pub picture_aspect_ratio: f32,
-    pub scan_type: ScanType,
-    pub timecode: i64,
-    pub data: Vec<u8>,
-    pub line_stride_or_size: LineStrideOrSize,
-    pub metadata: Option<CString>,
-    pub timestamp: i64,
+    layout: ValidatedVideoLayout,
+    frame_rate_n: i32,
+    frame_rate_d: i32,
+    picture_aspect_ratio: f32,
+    scan_type: ScanType,
+    timecode: i64,
+    data: Vec<u8>,
+    metadata: Option<CString>,
+    timestamp: i64,
 }
 
 impl fmt::Debug for VideoFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VideoFrame")
-            .field("width", &self.width)
-            .field("height", &self.height)
-            .field("pixel_format", &self.pixel_format)
+            .field("width", &self.width())
+            .field("height", &self.height())
+            .field("pixel_format", &self.pixel_format())
             .field("frame_rate_n", &self.frame_rate_n)
             .field("frame_rate_d", &self.frame_rate_d)
             .field("picture_aspect_ratio", &self.picture_aspect_ratio)
             .field("scan_type", &self.scan_type)
             .field("timecode", &self.timecode)
             .field("data (bytes)", &self.data.len())
-            .field("line_stride_or_size", &self.line_stride_or_size)
+            .field("line_stride_or_size", &self.line_stride_or_size())
             .field("metadata", &self.metadata)
             .field("timestamp", &self.timestamp)
             .finish()
@@ -436,24 +428,156 @@ impl Default for VideoFrame {
 }
 
 impl VideoFrame {
-    pub fn to_raw(&self) -> NDIlib_video_frame_v2_t {
+    pub(crate) fn to_raw(&self) -> NDIlib_video_frame_v2_t {
         NDIlib_video_frame_v2_t {
-            xres: self.width,
-            yres: self.height,
-            FourCC: self.pixel_format.into(),
+            xres: self.layout.width,
+            yres: self.layout.height,
+            FourCC: self.layout.pixel_format.into(),
             frame_rate_N: self.frame_rate_n,
             frame_rate_D: self.frame_rate_d,
             picture_aspect_ratio: self.picture_aspect_ratio,
             frame_format_type: self.scan_type.into(),
             timecode: self.timecode,
             p_data: self.data.as_ptr() as *mut u8,
-            __bindgen_anon_1: self.line_stride_or_size.into(),
+            __bindgen_anon_1: self.layout.line_stride_or_size.into(),
             p_metadata: match &self.metadata {
                 Some(meta) => meta.as_ptr(),
                 None => ptr::null(),
             },
             timestamp: self.timestamp,
         }
+    }
+
+    /// Get the frame width in pixels.
+    pub fn width(&self) -> i32 {
+        self.layout.width
+    }
+
+    /// Get the frame height in pixels.
+    pub fn height(&self) -> i32 {
+        self.layout.height
+    }
+
+    /// Get the supported pixel format.
+    pub fn pixel_format(&self) -> PixelFormat {
+        self.layout.pixel_format
+    }
+
+    /// Get the frame rate numerator.
+    pub fn frame_rate_n(&self) -> i32 {
+        self.frame_rate_n
+    }
+
+    /// Get the frame rate denominator.
+    pub fn frame_rate_d(&self) -> i32 {
+        self.frame_rate_d
+    }
+
+    /// Get the picture aspect ratio.
+    pub fn picture_aspect_ratio(&self) -> f32 {
+        self.picture_aspect_ratio
+    }
+
+    /// Get the scan type.
+    pub fn scan_type(&self) -> ScanType {
+        self.scan_type
+    }
+
+    /// Get the timecode.
+    ///
+    /// A value of zero is passed through to the SDK as its default timestamp
+    /// behavior.
+    pub fn timecode(&self) -> i64 {
+        self.timecode
+    }
+
+    /// Get the timestamp.
+    ///
+    /// A value of zero is passed through to the SDK as its default timestamp
+    /// behavior.
+    pub fn timestamp(&self) -> i64 {
+        self.timestamp
+    }
+
+    /// Get the validated line stride or data size union field.
+    pub fn line_stride_or_size(&self) -> LineStrideOrSize {
+        self.layout.line_stride_or_size
+    }
+
+    pub(crate) fn validated_layout(&self) -> ValidatedVideoLayout {
+        self.layout
+    }
+
+    /// Get the frame data.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Get mutable access to the frame data without changing the validated
+    /// layout.
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
+    /// Replace the owned frame data while preserving the validated layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidFrame`] if `data` is not exactly the validated
+    /// layout size.
+    pub fn replace_data(&mut self, data: Vec<u8>) -> Result<()> {
+        if data.len() != self.layout.data_len_bytes {
+            return Err(Error::InvalidFrame(format!(
+                "Video data length {}, expected {} bytes for validated layout",
+                data.len(),
+                self.layout.data_len_bytes
+            )));
+        }
+
+        self.data = data;
+        Ok(())
+    }
+
+    /// Get metadata, if present.
+    pub fn metadata(&self) -> Option<&CStr> {
+        self.metadata.as_deref()
+    }
+
+    /// Replace frame metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidCString`] if `metadata` contains an interior NUL
+    /// byte.
+    pub fn set_metadata<S: Into<String>>(&mut self, metadata: Option<S>) -> Result<()> {
+        self.metadata = metadata
+            .map(|m| CString::new(m.into()).map_err(Error::InvalidCString))
+            .transpose()?;
+        Ok(())
+    }
+
+    /// Set the frame rate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidFrame`] if the numerator or denominator is not
+    /// positive.
+    pub fn set_frame_rate(&mut self, numerator: i32, denominator: i32) -> Result<()> {
+        validate_video_frame_metadata(numerator, denominator, self.picture_aspect_ratio)?;
+        self.frame_rate_n = numerator;
+        self.frame_rate_d = denominator;
+        Ok(())
+    }
+
+    /// Set the picture aspect ratio.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidFrame`] if `ratio` is not finite and positive.
+    pub fn set_picture_aspect_ratio(&mut self, ratio: f32) -> Result<()> {
+        validate_video_frame_metadata(self.frame_rate_n, self.frame_rate_d, ratio)?;
+        self.picture_aspect_ratio = ratio;
+        Ok(())
     }
 
     /// Encode the video frame as PNG bytes.
@@ -505,11 +629,11 @@ impl VideoFrame {
         use png::{BitDepth, ColorType, Encoder};
 
         // Validate format
-        let bytes_per_pixel = match self.pixel_format {
+        let bytes_per_pixel = match self.pixel_format() {
             PixelFormat::RGBA | PixelFormat::RGBX => 4,
             PixelFormat::BGRA | PixelFormat::BGRX => 4,
             _ => {
-                let pixel_format = self.pixel_format;
+                let pixel_format = self.pixel_format();
                 return Err(Error::InvalidFrame(format!(
                     "Unsupported format for PNG encoding: {pixel_format:?}. Only RGBA/RGBX/BGRA/BGRX are supported."
                 )));
@@ -517,8 +641,8 @@ impl VideoFrame {
         };
 
         // Validate stride
-        let expected_stride = self.width * bytes_per_pixel;
-        let actual_stride = match self.line_stride_or_size {
+        let expected_stride = self.width() * bytes_per_pixel;
+        let actual_stride = match self.line_stride_or_size() {
             LineStrideOrSize::LineStrideBytes(stride) => stride,
             LineStrideOrSize::DataSizeBytes(_) => {
                 return Err(Error::InvalidFrame(
@@ -536,7 +660,7 @@ impl VideoFrame {
         }
 
         // Handle color format conversion if needed
-        let rgba_data: Vec<u8> = match self.pixel_format {
+        let rgba_data: Vec<u8> = match self.pixel_format() {
             PixelFormat::RGBA | PixelFormat::RGBX => {
                 // Already in correct format, use as-is
                 self.data.to_vec()
@@ -554,7 +678,7 @@ impl VideoFrame {
 
         // Encode to PNG
         let mut png_data = Vec::new();
-        let mut encoder = Encoder::new(&mut png_data, self.width as u32, self.height as u32);
+        let mut encoder = Encoder::new(&mut png_data, self.width() as u32, self.height() as u32);
         encoder.set_color(ColorType::Rgba);
         encoder.set_depth(BitDepth::Eight);
 
@@ -613,11 +737,11 @@ impl VideoFrame {
         use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
 
         // Validate format
-        let bytes_per_pixel = match self.pixel_format {
+        let bytes_per_pixel = match self.pixel_format() {
             PixelFormat::RGBA | PixelFormat::RGBX => 4,
             PixelFormat::BGRA | PixelFormat::BGRX => 4,
             _ => {
-                let pixel_format = self.pixel_format;
+                let pixel_format = self.pixel_format();
                 return Err(Error::InvalidFrame(format!(
                     "Unsupported format for JPEG encoding: {pixel_format:?}. Only RGBA/RGBX/BGRA/BGRX are supported."
                 )));
@@ -625,8 +749,8 @@ impl VideoFrame {
         };
 
         // Validate stride
-        let expected_stride = self.width * bytes_per_pixel;
-        let actual_stride = match self.line_stride_or_size {
+        let expected_stride = self.width() * bytes_per_pixel;
+        let actual_stride = match self.line_stride_or_size() {
             LineStrideOrSize::LineStrideBytes(stride) => stride,
             LineStrideOrSize::DataSizeBytes(_) => {
                 return Err(Error::InvalidFrame(
@@ -644,7 +768,7 @@ impl VideoFrame {
         }
 
         // Convert to RGB (JPEG doesn't support alpha channel)
-        let rgb_data: Vec<u8> = match self.pixel_format {
+        let rgb_data: Vec<u8> = match self.pixel_format() {
             PixelFormat::RGBA | PixelFormat::RGBX => {
                 // Strip alpha channel: RGBA -> RGB
                 self.data
@@ -668,8 +792,8 @@ impl VideoFrame {
         encoder
             .encode(
                 &rgb_data,
-                self.width as u16,
-                self.height as u16,
+                self.width() as u16,
+                self.height() as u16,
                 JpegColorType::Rgb,
             )
             .map_err(|e| Error::InvalidFrame(format!("JPEG encoding failed: {e}")))?;
@@ -761,16 +885,13 @@ impl VideoFrame {
         })?;
 
         Ok(VideoFrame {
-            width: c_frame.xres,
-            height: c_frame.yres,
-            pixel_format: layout.pixel_format,
+            layout,
             frame_rate_n: c_frame.frame_rate_N,
             frame_rate_d: c_frame.frame_rate_D,
             picture_aspect_ratio: c_frame.picture_aspect_ratio,
             scan_type,
             timecode: c_frame.timecode,
             data,
-            line_stride_or_size: layout.line_stride_or_size,
             metadata,
             timestamp: c_frame.timestamp,
         })
@@ -882,63 +1003,27 @@ impl VideoFrameBuilder {
         let picture_aspect_ratio = self.picture_aspect_ratio.unwrap_or(16.0 / 9.0);
         let scan_type = self.scan_type.unwrap_or(ScanType::Progressive);
 
-        if width <= 0 {
-            return Err(Error::InvalidFrame(format!(
-                "Video frame has invalid width: {}",
-                width
-            )));
-        }
-        if height <= 0 {
-            return Err(Error::InvalidFrame(format!(
-                "Video frame has invalid height: {}",
-                height
-            )));
-        }
-        validate_video_dimensions_for_format(pixel_format, width, height)?;
-
-        let width_usize = usize::try_from(width)
-            .map_err(|_| Error::InvalidFrame(format!("Invalid width value: {}", width)))?;
-        let height_usize = usize::try_from(height)
-            .map_err(|_| Error::InvalidFrame(format!("Invalid height value: {}", height)))?;
-
-        // Calculate stride and buffer size using the same checked layout math
-        // as borrowed/owned raw conversion.
-        let stride_usize = min_video_line_stride_checked(pixel_format, width_usize)?;
-        let stride = i32::try_from(stride_usize).map_err(|_| {
-            Error::InvalidFrame(format!(
-                "Video line stride {} exceeds i32 range",
-                stride_usize
-            ))
-        })?;
-        let buffer_size = calculate_buffer_len_checked(pixel_format, stride_usize, height_usize)?;
-        if buffer_size > MAX_VIDEO_BYTES {
-            return Err(Error::InvalidFrame(format!(
-                "Video frame exceeds maximum size: {} bytes > {} bytes",
-                buffer_size, MAX_VIDEO_BYTES
-            )));
-        }
+        validate_video_frame_metadata(frame_rate_n, frame_rate_d, picture_aspect_ratio)?;
+        let layout = ValidatedVideoLayout::new_uncompressed(pixel_format, width, height, None)?;
+        let buffer_size = layout.data_len_bytes;
         let data = vec![0u8; buffer_size];
 
-        let mut frame = VideoFrame {
-            width,
-            height,
-            pixel_format,
+        let metadata = self
+            .metadata
+            .map(|m| CString::new(m).map_err(Error::InvalidCString))
+            .transpose()?;
+
+        Ok(VideoFrame {
+            layout,
             frame_rate_n,
             frame_rate_d,
             picture_aspect_ratio,
             scan_type,
             timecode: self.timecode.unwrap_or(0),
-            data: (data),
-            line_stride_or_size: LineStrideOrSize::LineStrideBytes(stride),
-            metadata: None,
+            data,
+            metadata,
             timestamp: self.timestamp.unwrap_or(0),
-        };
-
-        if let Some(meta) = self.metadata {
-            frame.metadata = Some(CString::new(meta).map_err(Error::InvalidCString)?);
-        }
-
-        Ok(frame)
+        })
     }
 }
 
@@ -957,28 +1042,24 @@ impl Drop for VideoFrame {
 
 #[derive(Debug)]
 pub struct AudioFrame {
-    pub sample_rate: i32,
-    pub num_channels: i32,
-    pub num_samples: i32,
-    pub timecode: i64,
-    pub format: AudioFormat,
+    layout: ValidatedAudioLayout,
+    timecode: i64,
     data: Vec<f32>,
-    pub channel_stride_in_bytes: i32,
-    pub metadata: Option<CString>,
-    pub timestamp: i64,
+    metadata: Option<CString>,
+    timestamp: i64,
 }
 
 impl AudioFrame {
     pub(crate) fn to_raw(&self) -> NDIlib_audio_frame_v3_t {
         NDIlib_audio_frame_v3_t {
-            sample_rate: self.sample_rate,
-            no_channels: self.num_channels,
-            no_samples: self.num_samples,
+            sample_rate: self.layout.sample_rate,
+            no_channels: self.num_channels(),
+            no_samples: self.num_samples(),
             timecode: self.timecode,
-            FourCC: self.format.into(),
+            FourCC: self.format().into(),
             p_data: self.data.as_ptr() as *mut f32 as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
-                channel_stride_in_bytes: self.channel_stride_in_bytes,
+                channel_stride_in_bytes: self.layout.channel_stride_in_bytes,
             },
             p_metadata: self.metadata.as_ref().map_or(ptr::null(), |m| m.as_ptr()),
             timestamp: self.timestamp,
@@ -1015,15 +1096,9 @@ impl AudioFrame {
         };
 
         Ok(AudioFrame {
-            sample_rate: raw.sample_rate,
-            num_channels: raw.no_channels,
-            num_samples: raw.no_samples,
+            layout,
             timecode: raw.timecode,
-            format: layout
-                .format()
-                .expect("validate_audio_layout requires a concrete audio format"),
             data,
-            channel_stride_in_bytes: layout.channel_stride_in_bytes,
             metadata,
             timestamp: raw.timestamp,
         })
@@ -1034,9 +1109,94 @@ impl AudioFrame {
         AudioFrameBuilder::new()
     }
 
+    /// Get the sample rate in Hz.
+    pub fn sample_rate(&self) -> i32 {
+        self.layout.sample_rate
+    }
+
+    /// Get the number of audio channels.
+    pub fn num_channels(&self) -> i32 {
+        self.layout.no_channels as i32
+    }
+
+    /// Get the number of samples per channel.
+    pub fn num_samples(&self) -> i32 {
+        self.layout.no_samples as i32
+    }
+
+    /// Get the timecode.
+    ///
+    /// A value of zero is passed through to the SDK as its default timestamp
+    /// behavior.
+    pub fn timecode(&self) -> i64 {
+        self.timecode
+    }
+
+    /// Get the timestamp.
+    ///
+    /// A value of zero is passed through to the SDK as its default timestamp
+    /// behavior.
+    pub fn timestamp(&self) -> i64 {
+        self.timestamp
+    }
+
+    /// Get the audio format.
+    pub fn format(&self) -> AudioFormat {
+        self.layout
+            .format()
+            .expect("owned AudioFrame always has a concrete audio format")
+    }
+
+    /// Get the channel stride in bytes.
+    pub fn channel_stride_in_bytes(&self) -> i32 {
+        self.layout.channel_stride_in_bytes
+    }
+
     /// Get audio data as 32-bit floats
     pub fn data(&self) -> &[f32] {
         &self.data
+    }
+
+    /// Get mutable audio sample data without changing the validated layout.
+    pub fn data_mut(&mut self) -> &mut [f32] {
+        &mut self.data
+    }
+
+    /// Replace the owned audio data while preserving the validated layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidFrame`] if `data` is not exactly the validated
+    /// sample count.
+    pub fn replace_data(&mut self, data: Vec<f32>) -> Result<()> {
+        if data.len() != self.layout.sample_count {
+            return Err(Error::InvalidFrame(format!(
+                "Audio data length {}, expected {} samples for validated layout",
+                data.len(),
+                self.layout.sample_count
+            )));
+        }
+
+        self.data = data;
+        Ok(())
+    }
+
+    /// Get metadata, if present.
+    pub fn metadata(&self) -> Option<&CStr> {
+        self.metadata.as_deref()
+    }
+
+    /// Replace frame metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidCString`] if `metadata` contains an interior NUL
+    /// byte.
+    pub fn set_metadata<S: Into<String>>(&mut self, metadata: Option<S>) -> Result<()> {
+        self.metadata = metadata
+            .map(|m| CString::new(m.into()).map_err(Error::InvalidCString))
+            .transpose()?;
+        Ok(())
     }
 
     /// Get audio data for a specific channel
@@ -1044,23 +1204,8 @@ impl AudioFrame {
     /// Data is always stored in planar format internally. If `AudioLayout::Interleaved`
     /// was specified at build time, the data was converted to planar during construction.
     pub fn channel_data(&self, channel: usize) -> Option<Vec<f32>> {
-        let num_channels = usize::try_from(self.num_channels).ok()?;
-        let samples_per_channel = usize::try_from(self.num_samples).ok()?;
-        let channel_stride_bytes = usize::try_from(self.channel_stride_in_bytes).ok()?;
-
-        if channel >= num_channels || channel_stride_bytes % std::mem::size_of::<f32>() != 0 {
-            return None;
-        }
-
-        let stride_in_samples = channel_stride_bytes / std::mem::size_of::<f32>();
-        let start = channel.checked_mul(stride_in_samples)?;
-        let end = start.checked_add(samples_per_channel)?;
-
-        if end <= self.data.len() {
-            Some(self.data[start..end].to_vec())
-        } else {
-            None
-        }
+        let range = self.layout.channel_range(channel)?;
+        Some(self.data[range].to_vec())
     }
 }
 
@@ -1192,7 +1337,9 @@ impl AudioFrameBuilder {
         let format = self.format.unwrap_or(AudioFormat::FLTP);
         let layout = self.layout.unwrap_or(AudioLayout::Planar);
         let timecode = self.timecode.unwrap_or(0);
-        let sample_count = (num_samples as usize) * (num_channels as usize);
+        let audio_layout =
+            validate_outbound_audio_layout(sample_rate, num_channels, num_samples, format)?;
+        let sample_count = audio_layout.sample_count;
 
         let data = if let Some(input_data) = self.data {
             if input_data.len() != sample_count {
@@ -1208,12 +1355,28 @@ impl AudioFrameBuilder {
             match layout {
                 AudioLayout::Planar => input_data,
                 AudioLayout::Interleaved => {
-                    let nc = num_channels as usize;
-                    let ns = num_samples as usize;
+                    let nc = audio_layout.no_channels;
+                    let ns = audio_layout.no_samples;
                     let mut planar = vec![0.0f32; sample_count];
                     for ch in 0..nc {
                         for s in 0..ns {
-                            planar[ch * ns + s] = input_data[s * nc + ch];
+                            let dst = ch
+                                .checked_mul(ns)
+                                .and_then(|idx| idx.checked_add(s))
+                                .ok_or_else(|| {
+                                    Error::InvalidFrame(
+                                        "Audio planar conversion index overflow".into(),
+                                    )
+                                })?;
+                            let src = s
+                                .checked_mul(nc)
+                                .and_then(|idx| idx.checked_add(ch))
+                                .ok_or_else(|| {
+                                    Error::InvalidFrame(
+                                        "Audio interleaved conversion index overflow".into(),
+                                    )
+                                })?;
+                            planar[dst] = input_data[src];
                         }
                     }
                     planar
@@ -1228,17 +1391,10 @@ impl AudioFrameBuilder {
             .map(|m| CString::new(m).map_err(Error::InvalidCString))
             .transpose()?;
 
-        // Data is always planar: stride = num_samples * sizeof(f32)
-        let channel_stride_in_bytes = num_samples * 4;
-
         Ok(AudioFrame {
-            sample_rate,
-            num_channels,
-            num_samples,
+            layout: audio_layout,
             timecode,
-            format,
             data,
-            channel_stride_in_bytes,
             metadata: metadata_cstring,
             timestamp: self.timestamp.unwrap_or(0),
         })
@@ -1324,27 +1480,12 @@ impl From<AudioFormat> for i32 {
     }
 }
 
-/// Maximum allowed size for video frame data (100 MiB).
-/// Applies to both compressed and uncompressed video frames.
+/// Maximum allowed size for supported video frame data (100 MiB).
 const MAX_VIDEO_BYTES: usize = 100 * 1024 * 1024;
 
 /// Maximum allowed size for audio frame data (64 MiB).
 /// Comfortably above typical NDI audio frames while preventing unbounded allocations.
 const MAX_AUDIO_BYTES: usize = 64 * 1024 * 1024;
-
-/// Calculate the line stride (bytes per row) for a given video format.
-///
-/// # Deprecated
-///
-/// Use [`PixelFormat::line_stride`] instead for a cleaner API:
-/// ```
-/// use grafton_ndi::PixelFormat;
-/// let stride = PixelFormat::BGRA.line_stride(1920);
-/// ```
-#[deprecated(since = "0.10.0", note = "Use PixelFormat::line_stride() instead")]
-pub fn calculate_line_stride(fourcc: PixelFormat, width: i32) -> i32 {
-    fourcc.line_stride(width)
-}
 
 #[derive(Debug, Clone)]
 pub struct MetadataFrame {
@@ -1434,12 +1575,82 @@ pub enum ImageFormat {
 /// consumers can safely use the cached values without re-validation.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ValidatedVideoLayout {
+    /// The validated width in pixels.
+    pub width: i32,
+    /// The validated height in pixels.
+    pub height: i32,
     /// The validated pixel format.
     pub pixel_format: PixelFormat,
     /// The validated data buffer length in bytes.
     pub data_len_bytes: usize,
-    /// The validated line stride or compressed data size.
+    /// The validated SDK union field. Supported safe video layouts always use
+    /// line stride; the data-size variant is reserved for the unsafe escape
+    /// hatch.
     pub line_stride_or_size: LineStrideOrSize,
+}
+
+impl ValidatedVideoLayout {
+    pub(crate) fn new_uncompressed(
+        pixel_format: PixelFormat,
+        width: i32,
+        height: i32,
+        line_stride: Option<i32>,
+    ) -> Result<Self> {
+        validate_video_dimensions_for_format(pixel_format, width, height)?;
+
+        let width_usize = usize::try_from(width)
+            .map_err(|_| Error::InvalidFrame(format!("Invalid width value: {width}")))?;
+        let height_usize = usize::try_from(height)
+            .map_err(|_| Error::InvalidFrame(format!("Invalid height value: {height}")))?;
+
+        let min_stride = min_video_line_stride_checked(pixel_format, width_usize)?;
+        let line_stride_usize = match line_stride {
+            Some(stride) => {
+                if stride <= 0 {
+                    return Err(Error::InvalidFrame(format!(
+                        "Uncompressed video frame has invalid line_stride_in_bytes: {stride}"
+                    )));
+                }
+
+                let stride_usize = usize::try_from(stride).map_err(|_| {
+                    Error::InvalidFrame(format!("Invalid line_stride_in_bytes value: {stride}"))
+                })?;
+
+                if stride_usize < min_stride {
+                    return Err(Error::InvalidFrame(format!(
+                        "Video line_stride_in_bytes {stride} is smaller than minimum row size {min_stride} for {pixel_format:?} width {width}"
+                    )));
+                }
+
+                stride_usize
+            }
+            None => min_stride,
+        };
+
+        if pixel_format.info().is_planar_420() && !line_stride_usize.is_multiple_of(2) {
+            return Err(Error::InvalidFrame(format!(
+                "Planar 4:2:0 video frame has odd line_stride_in_bytes: {line_stride_usize}"
+            )));
+        }
+
+        let data_len_bytes =
+            calculate_buffer_len_checked(pixel_format, line_stride_usize, height_usize)?;
+        validate_video_data_len(data_len_bytes)?;
+
+        let line_stride_i32 = i32::try_from(line_stride_usize).map_err(|_| {
+            Error::InvalidFrame(format!(
+                "Video line stride {line_stride_usize} exceeds i32 range"
+            ))
+        })?;
+
+        Ok(Self {
+            width,
+            height,
+            pixel_format,
+            data_len_bytes,
+            line_stride_or_size: LineStrideOrSize::LineStrideBytes(line_stride_i32),
+        })
+    }
 }
 
 /// Validate video frame layout from raw FFI fields.
@@ -1464,127 +1675,23 @@ pub(crate) fn validate_video_layout(raw: &NDIlib_video_frame_v2_t) -> Result<Val
         ));
     }
 
+    validate_video_frame_metadata(raw.frame_rate_N, raw.frame_rate_D, raw.picture_aspect_ratio)?;
+
+    #[allow(clippy::unnecessary_cast)]
+    ScanType::try_from(raw.frame_format_type as u32).map_err(|_| {
+        Error::InvalidFrame(format!(
+            "Unknown scan type: 0x{:08X}",
+            raw.frame_format_type
+        ))
+    })?;
+
     #[allow(clippy::unnecessary_cast)] // Required for Windows where FourCC is i32
     let pixel_format = PixelFormat::try_from(raw.FourCC as u32).map_err(|_| {
         Error::InvalidFrame(format!("Unknown pixel format FourCC: 0x{:08X}", raw.FourCC))
     })?;
 
-    // Determine data size and LineStrideOrSize based on format.
-    // The NDI SDK uses a union here: line_stride_in_bytes for uncompressed formats,
-    // data_size_in_bytes for compressed formats.
-    let is_uncompressed = pixel_format.is_uncompressed();
-
-    let (data_len_bytes, line_stride_or_size) = if is_uncompressed {
-        // Uncompressed format: read ONLY line_stride_in_bytes
-        let line_stride = unsafe { raw.__bindgen_anon_1.line_stride_in_bytes };
-
-        // Validate dimensions are positive before converting to usize.
-        if line_stride <= 0 {
-            return Err(Error::InvalidFrame(format!(
-                "Uncompressed video frame has invalid line_stride_in_bytes: {}",
-                line_stride
-            )));
-        }
-        if raw.yres <= 0 {
-            return Err(Error::InvalidFrame(format!(
-                "Video frame has invalid height (yres): {}",
-                raw.yres
-            )));
-        }
-        if raw.xres <= 0 {
-            return Err(Error::InvalidFrame(format!(
-                "Video frame has invalid width (xres): {}",
-                raw.xres
-            )));
-        }
-
-        validate_video_dimensions_for_format(pixel_format, raw.xres, raw.yres)?;
-
-        // Use checked arithmetic to prevent overflow.
-        let line_stride_usize = usize::try_from(line_stride).map_err(|_| {
-            Error::InvalidFrame(format!(
-                "Invalid line_stride_in_bytes value: {}",
-                line_stride
-            ))
-        })?;
-        let xres_usize = usize::try_from(raw.xres)
-            .map_err(|_| Error::InvalidFrame(format!("Invalid xres value: {}", raw.xres)))?;
-        let yres_usize = usize::try_from(raw.yres)
-            .map_err(|_| Error::InvalidFrame(format!("Invalid yres value: {}", raw.yres)))?;
-
-        let min_stride = min_video_line_stride_checked(pixel_format, xres_usize)?;
-        if line_stride_usize < min_stride {
-            return Err(Error::InvalidFrame(format!(
-                "Video line_stride_in_bytes {} is smaller than minimum row size {} for {:?} width {}",
-                line_stride, min_stride, pixel_format, raw.xres
-            )));
-        }
-
-        if pixel_format.info().is_planar_420() && line_stride_usize % 2 != 0 {
-            return Err(Error::InvalidFrame(format!(
-                "Planar 4:2:0 video frame has odd line_stride_in_bytes: {}",
-                line_stride
-            )));
-        }
-
-        // For planar formats, calculate the full buffer size with checked
-        // arithmetic instead of PixelFormatInfo::buffer_len's unchecked casts.
-        let calculated_size =
-            calculate_buffer_len_checked(pixel_format, line_stride_usize, yres_usize)?;
-
-        if calculated_size == 0 {
-            return Err(Error::InvalidFrame(
-                "Video frame has zero calculated size".into(),
-            ));
-        }
-
-        if calculated_size > MAX_VIDEO_BYTES {
-            return Err(Error::InvalidFrame(format!(
-                "Uncompressed video frame exceeds maximum size: {} bytes > {} bytes",
-                calculated_size, MAX_VIDEO_BYTES
-            )));
-        }
-
-        (
-            calculated_size,
-            LineStrideOrSize::LineStrideBytes(line_stride),
-        )
-    } else {
-        // Compressed/unknown format: read ONLY data_size_in_bytes
-        let data_size_in_bytes = unsafe { raw.__bindgen_anon_1.data_size_in_bytes };
-
-        if data_size_in_bytes <= 0 {
-            return Err(Error::InvalidFrame(format!(
-                "Compressed video frame has invalid data_size_in_bytes: {}",
-                data_size_in_bytes
-            )));
-        }
-
-        let data_size_usize = usize::try_from(data_size_in_bytes).map_err(|_| {
-            Error::InvalidFrame(format!(
-                "Invalid data_size_in_bytes value: {}",
-                data_size_in_bytes
-            ))
-        })?;
-
-        if data_size_usize > MAX_VIDEO_BYTES {
-            return Err(Error::InvalidFrame(format!(
-                "Compressed video frame exceeds maximum size: {} bytes > {} bytes",
-                data_size_usize, MAX_VIDEO_BYTES
-            )));
-        }
-
-        (
-            data_size_usize,
-            LineStrideOrSize::DataSizeBytes(data_size_in_bytes),
-        )
-    };
-
-    Ok(ValidatedVideoLayout {
-        pixel_format,
-        data_len_bytes,
-        line_stride_or_size,
-    })
+    let line_stride = unsafe { raw.__bindgen_anon_1.line_stride_in_bytes };
+    ValidatedVideoLayout::new_uncompressed(pixel_format, raw.xres, raw.yres, Some(line_stride))
 }
 
 fn validate_video_dimensions_for_format(
@@ -1592,10 +1699,74 @@ fn validate_video_dimensions_for_format(
     width: i32,
     height: i32,
 ) -> Result<()> {
+    validate_video_width_for_format(pixel_format, width)?;
+    if height <= 0 {
+        return Err(Error::InvalidFrame(format!(
+            "Video frame has invalid height: {height}"
+        )));
+    }
+
     if pixel_format.info().is_planar_420() && (width % 2 != 0 || height % 2 != 0) {
         return Err(Error::InvalidFrame(format!(
             "Planar 4:2:0 video frames require even dimensions, got {}x{}",
             width, height
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_video_width_for_format(pixel_format: PixelFormat, width: i32) -> Result<()> {
+    if width <= 0 {
+        return Err(Error::InvalidFrame(format!(
+            "Video frame has invalid width: {width}"
+        )));
+    }
+
+    if pixel_format.info().is_planar_420() && width % 2 != 0 {
+        return Err(Error::InvalidFrame(format!(
+            "Planar 4:2:0 video frames require even width, got {width}"
+        )));
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_video_frame_metadata(
+    frame_rate_n: i32,
+    frame_rate_d: i32,
+    picture_aspect_ratio: f32,
+) -> Result<()> {
+    if frame_rate_n <= 0 {
+        return Err(Error::InvalidFrame(format!(
+            "Video frame has invalid frame rate numerator: {frame_rate_n}"
+        )));
+    }
+    if frame_rate_d <= 0 {
+        return Err(Error::InvalidFrame(format!(
+            "Video frame has invalid frame rate denominator: {frame_rate_d}"
+        )));
+    }
+    if !picture_aspect_ratio.is_finite() || picture_aspect_ratio <= 0.0 {
+        return Err(Error::InvalidFrame(format!(
+            "Video frame has invalid picture aspect ratio: {picture_aspect_ratio}"
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_video_data_len(data_len_bytes: usize) -> Result<()> {
+    if data_len_bytes == 0 {
+        return Err(Error::InvalidFrame(
+            "Video frame has zero calculated size".into(),
+        ));
+    }
+
+    if data_len_bytes > MAX_VIDEO_BYTES {
+        return Err(Error::InvalidFrame(format!(
+            "Video frame exceeds maximum size: {} bytes > {} bytes",
+            data_len_bytes, MAX_VIDEO_BYTES
         )));
     }
 
@@ -1614,16 +1785,19 @@ fn min_video_line_stride_checked(pixel_format: PixelFormat, width: usize) -> Res
 }
 
 /// Calculate buffer length with checked arithmetic.
-///
-/// This is the checked version of `PixelFormatInfo::buffer_len`, which uses
-/// unchecked casts. This version returns an error on overflow.
 fn calculate_buffer_len_checked(
     pixel_format: PixelFormat,
     y_stride: usize,
     height: usize,
 ) -> Result<usize> {
-    let info = pixel_format.info();
+    calculate_buffer_len_for_info_checked(pixel_format.info(), y_stride, height)
+}
 
+fn calculate_buffer_len_for_info_checked(
+    info: PixelFormatInfo,
+    y_stride: usize,
+    height: usize,
+) -> Result<usize> {
     // Y plane size = y_stride * height
     let y_size = y_stride.checked_mul(height).ok_or_else(|| {
         Error::InvalidFrame(format!(
@@ -1635,7 +1809,7 @@ fn calculate_buffer_len_checked(
     match info.category() {
         FormatCategory::Packed => Ok(y_size),
         FormatCategory::Planar420 => {
-            if height % 2 != 0 || y_stride % 2 != 0 {
+            if !height.is_multiple_of(2) || !y_stride.is_multiple_of(2) {
                 return Err(Error::InvalidFrame(
                     "Planar 4:2:0 video frames require even height and stride".into(),
                 ));
@@ -1661,7 +1835,7 @@ fn calculate_buffer_len_checked(
             Ok(total)
         }
         FormatCategory::SemiPlanar420 => {
-            if height % 2 != 0 {
+            if !height.is_multiple_of(2) {
                 return Err(Error::InvalidFrame(
                     "Semi-planar 4:2:0 video frames require even height".into(),
                 ));
@@ -1727,6 +1901,83 @@ impl ValidatedAudioLayout {
 
         (end <= self.sample_count).then_some(start..end)
     }
+}
+
+fn validate_outbound_audio_layout(
+    sample_rate: i32,
+    no_channels: i32,
+    no_samples: i32,
+    format: AudioFormat,
+) -> Result<ValidatedAudioLayout> {
+    if sample_rate <= 0 {
+        return Err(Error::InvalidFrame(format!(
+            "Invalid sample rate: {sample_rate}"
+        )));
+    }
+    if no_channels <= 0 {
+        return Err(Error::InvalidFrame(format!(
+            "Invalid number of channels: {no_channels}"
+        )));
+    }
+    if no_samples <= 0 {
+        return Err(Error::InvalidFrame(format!(
+            "Invalid number of samples: {no_samples}"
+        )));
+    }
+
+    validate_audio_format(format.into())?;
+
+    let no_channels = usize::try_from(no_channels)
+        .map_err(|_| Error::InvalidFrame(format!("Invalid no_channels value: {no_channels}")))?;
+    let no_samples = usize::try_from(no_samples)
+        .map_err(|_| Error::InvalidFrame(format!("Invalid no_samples value: {no_samples}")))?;
+
+    let channel_stride_bytes = no_samples
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            Error::InvalidFrame(format!(
+                "Audio channel stride overflow: {} samples × {} bytes",
+                no_samples,
+                std::mem::size_of::<f32>()
+            ))
+        })?;
+    let channel_stride_in_bytes = i32::try_from(channel_stride_bytes).map_err(|_| {
+        Error::InvalidFrame(format!(
+            "Audio channel stride {channel_stride_bytes} exceeds i32 range"
+        ))
+    })?;
+
+    let sample_count = no_channels.checked_mul(no_samples).ok_or_else(|| {
+        Error::InvalidFrame(format!(
+            "Audio sample count overflow: {no_channels} channels × {no_samples} samples"
+        ))
+    })?;
+    let byte_size = sample_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            Error::InvalidFrame(format!(
+                "Audio byte size overflow: {} samples × {} bytes",
+                sample_count,
+                std::mem::size_of::<f32>()
+            ))
+        })?;
+
+    if byte_size > MAX_AUDIO_BYTES {
+        return Err(Error::InvalidFrame(format!(
+            "Audio frame exceeds maximum size: {} bytes > {} bytes",
+            byte_size, MAX_AUDIO_BYTES
+        )));
+    }
+
+    Ok(ValidatedAudioLayout {
+        format: Some(format),
+        sample_rate,
+        no_channels,
+        no_samples,
+        channel_stride_in_bytes,
+        channel_stride_samples: no_samples,
+        sample_count,
+    })
 }
 
 /// Validate audio frame layout from raw FFI fields.
@@ -2094,11 +2345,11 @@ impl<'rx> VideoFrameRef<'rx> {
 
     /// Get the scan type (progressive, interlaced, etc.).
     ///
-    /// Returns `ScanType::Progressive` as a fallback if the SDK returns an unknown scan type code.
+    /// This is guaranteed to be valid since it is checked during construction.
     pub fn scan_type(&self) -> ScanType {
         #[allow(clippy::unnecessary_cast)]
         ScanType::try_from(self.guard.frame().frame_format_type as u32)
-            .unwrap_or(ScanType::Progressive)
+            .expect("VideoFrameRef validates scan type during construction")
     }
 
     /// Get the timecode.
@@ -2407,7 +2658,7 @@ impl<'rx> MetadataFrameRef<'rx> {
         let p_data = self.guard.frame().p_data;
         if p_data.is_null() {
             // Return empty CStr for null pointer
-            unsafe { CStr::from_bytes_with_nul_unchecked(b"\0") }
+            c""
         } else {
             unsafe { CStr::from_ptr(p_data) }
         }
@@ -2466,11 +2717,11 @@ mod tests {
             );
 
             // 1920x1080, stride = 1920 * 4 = 7680
-            let len = info.buffer_len(7680, 1080);
+            let len = info.try_buffer_len(7680, 1080).unwrap();
             assert_eq!(len, 7680 * 1080, "Format {:?} even dimensions", fmt);
 
             // Odd dimensions: 1921x1081
-            let len = info.buffer_len(7684, 1081);
+            let len = info.try_buffer_len(7684, 1081).unwrap();
             assert_eq!(len, 7684 * 1081, "Format {:?} odd dimensions", fmt);
         }
     }
@@ -2482,26 +2733,26 @@ mod tests {
         let info = PixelFormat::UYVY.info();
         assert_eq!(info.bytes_per_pixel(), 2);
         assert_eq!(info.category(), FormatCategory::Packed);
-        let len = info.buffer_len(3840, 1080);
+        let len = info.try_buffer_len(3840, 1080).unwrap();
         assert_eq!(len, 3840 * 1080);
 
         // UYVA: 24 bpp = 3 bytes per pixel
         let info = PixelFormat::UYVA.info();
         assert_eq!(info.bytes_per_pixel(), 3);
         assert_eq!(info.category(), FormatCategory::Packed);
-        let len = info.buffer_len(5760, 1080);
+        let len = info.try_buffer_len(5760, 1080).unwrap();
         assert_eq!(len, 5760 * 1080);
 
         // P216/PA16: 32 bpp = 4 bytes per pixel
         let info = PixelFormat::P216.info();
         assert_eq!(info.bytes_per_pixel(), 4);
         assert_eq!(info.category(), FormatCategory::Packed);
-        let len = info.buffer_len(7680, 1080);
+        let len = info.try_buffer_len(7680, 1080).unwrap();
         assert_eq!(len, 7680 * 1080);
 
         let info = PixelFormat::PA16.info();
         assert_eq!(info.bytes_per_pixel(), 4);
-        let len = info.buffer_len(7680, 1080);
+        let len = info.try_buffer_len(7680, 1080).unwrap();
         assert_eq!(len, 7680 * 1080);
     }
 
@@ -2519,30 +2770,28 @@ mod tests {
         assert_eq!(info.bytes_per_pixel(), 1);
         assert_eq!(info.category(), FormatCategory::Planar420);
         assert!(info.is_planar_420());
-        let len = info.buffer_len(y_stride, 1080);
+        let len = info.try_buffer_len(y_stride, 1080).unwrap();
         assert_eq!(len, 3_110_400, "YV12 1920x1080");
 
         let info = PixelFormat::I420.info();
         assert_eq!(info.category(), FormatCategory::Planar420);
-        let len = info.buffer_len(y_stride, 1080);
+        let len = info.try_buffer_len(y_stride, 1080).unwrap();
         assert_eq!(len, 3_110_400, "I420 1920x1080");
     }
 
-    /// Test PixelFormatInfo for planar YV12/I420 with odd dimensions
+    /// Test PixelFormatInfo rejects planar YV12/I420 with odd layout inputs
     #[test]
     fn test_pixel_format_info_planar_420_odd() {
-        // 1921x1081 YV12/I420 (odd width and height)
-        // Y: 1921 * 1081 = 2,076,601
-        // U: ceil(1921/2) * ceil(1081/2) = 961 * 541 = 519,901
-        // V: ceil(1921/2) * ceil(1081/2) = 961 * 541 = 519,901
-        // Total: 2,076,601 + 519,901 + 519,901 = 3,116,403
         let y_stride = 1921;
 
-        let len = PixelFormat::YV12.info().buffer_len(y_stride, 1081);
-        assert_eq!(len, 3_116_403, "YV12 1921x1081 (odd dimensions)");
-
-        let len = PixelFormat::I420.info().buffer_len(y_stride, 1081);
-        assert_eq!(len, 3_116_403, "I420 1921x1081 (odd dimensions)");
+        assert!(PixelFormat::YV12
+            .info()
+            .try_buffer_len(y_stride, 1081)
+            .is_err());
+        assert!(PixelFormat::I420
+            .info()
+            .try_buffer_len(y_stride, 1081)
+            .is_err());
     }
 
     /// Test PixelFormatInfo for semi-planar NV12 with even dimensions
@@ -2558,77 +2807,73 @@ mod tests {
         assert_eq!(info.bytes_per_pixel(), 1);
         assert_eq!(info.category(), FormatCategory::SemiPlanar420);
         assert!(info.is_planar_420());
-        let len = info.buffer_len(y_stride, 1080);
+        let len = info.try_buffer_len(y_stride, 1080).unwrap();
         assert_eq!(len, 3_110_400, "NV12 1920x1080");
     }
 
-    /// Test PixelFormatInfo for semi-planar NV12 with odd dimensions
+    /// Test PixelFormatInfo rejects semi-planar NV12 with odd layout inputs
     #[test]
     fn test_pixel_format_info_nv12_odd() {
-        // 1921x1081 NV12 (odd width and height)
-        // Y: 1921 * 1081 = 2,076,601
-        // UV: 1921 * ceil(1081/2) = 1921 * 541 = 1,039,261
-        // Total: 2,076,601 + 1,039,261 = 3,115,862
         let y_stride = 1921;
-        let len = PixelFormat::NV12.info().buffer_len(y_stride, 1081);
-        assert_eq!(len, 3_115_862, "NV12 1921x1081 (odd dimensions)");
+        assert!(PixelFormat::NV12
+            .info()
+            .try_buffer_len(y_stride, 1081)
+            .is_err());
     }
 
     /// Test PixelFormat::line_stride for all formats
     #[test]
     fn test_pixel_format_line_stride() {
         // Packed RGB: 4 bytes per pixel
-        assert_eq!(PixelFormat::BGRA.line_stride(1920), 7680);
-        assert_eq!(PixelFormat::BGRX.line_stride(1920), 7680);
-        assert_eq!(PixelFormat::RGBA.line_stride(1920), 7680);
-        assert_eq!(PixelFormat::RGBX.line_stride(1920), 7680);
+        assert_eq!(PixelFormat::BGRA.try_line_stride(1920).unwrap(), 7680);
+        assert_eq!(PixelFormat::BGRX.try_line_stride(1920).unwrap(), 7680);
+        assert_eq!(PixelFormat::RGBA.try_line_stride(1920).unwrap(), 7680);
+        assert_eq!(PixelFormat::RGBX.try_line_stride(1920).unwrap(), 7680);
 
         // UYVY: 2 bytes per pixel
-        assert_eq!(PixelFormat::UYVY.line_stride(1920), 3840);
+        assert_eq!(PixelFormat::UYVY.try_line_stride(1920).unwrap(), 3840);
 
         // UYVA: 3 bytes per pixel
-        assert_eq!(PixelFormat::UYVA.line_stride(1920), 5760);
+        assert_eq!(PixelFormat::UYVA.try_line_stride(1920).unwrap(), 5760);
 
         // P216/PA16: 4 bytes per pixel
-        assert_eq!(PixelFormat::P216.line_stride(1920), 7680);
-        assert_eq!(PixelFormat::PA16.line_stride(1920), 7680);
+        assert_eq!(PixelFormat::P216.try_line_stride(1920).unwrap(), 7680);
+        assert_eq!(PixelFormat::PA16.try_line_stride(1920).unwrap(), 7680);
 
         // Planar 4:2:0: Y-plane stride = 1 byte per pixel
-        assert_eq!(PixelFormat::YV12.line_stride(1920), 1920);
-        assert_eq!(PixelFormat::I420.line_stride(1920), 1920);
-        assert_eq!(PixelFormat::NV12.line_stride(1920), 1920);
+        assert_eq!(PixelFormat::YV12.try_line_stride(1920).unwrap(), 1920);
+        assert_eq!(PixelFormat::I420.try_line_stride(1920).unwrap(), 1920);
+        assert_eq!(PixelFormat::NV12.try_line_stride(1920).unwrap(), 1920);
     }
 
     /// Test PixelFormat::buffer_size for all formats
     #[test]
     fn test_pixel_format_buffer_size() {
         // Packed RGB: width * 4 * height
-        assert_eq!(PixelFormat::BGRA.buffer_size(1920, 1080), 8_294_400);
-        assert_eq!(PixelFormat::RGBA.buffer_size(1920, 1080), 8_294_400);
+        assert_eq!(
+            PixelFormat::BGRA.try_buffer_size(1920, 1080).unwrap(),
+            8_294_400
+        );
+        assert_eq!(
+            PixelFormat::RGBA.try_buffer_size(1920, 1080).unwrap(),
+            8_294_400
+        );
 
         // Planar 4:2:0: Y + U + V = 1.5 * width * height
-        assert_eq!(PixelFormat::YV12.buffer_size(1920, 1080), 3_110_400);
-        assert_eq!(PixelFormat::I420.buffer_size(1920, 1080), 3_110_400);
+        assert_eq!(
+            PixelFormat::YV12.try_buffer_size(1920, 1080).unwrap(),
+            3_110_400
+        );
+        assert_eq!(
+            PixelFormat::I420.try_buffer_size(1920, 1080).unwrap(),
+            3_110_400
+        );
 
         // Semi-planar 4:2:0: Y + UV = 1.5 * width * height
-        assert_eq!(PixelFormat::NV12.buffer_size(1920, 1080), 3_110_400);
-    }
-
-    /// Test PixelFormat::is_uncompressed
-    #[test]
-    fn test_pixel_format_is_uncompressed() {
-        // All currently defined formats are uncompressed
-        assert!(PixelFormat::BGRA.is_uncompressed());
-        assert!(PixelFormat::BGRX.is_uncompressed());
-        assert!(PixelFormat::RGBA.is_uncompressed());
-        assert!(PixelFormat::RGBX.is_uncompressed());
-        assert!(PixelFormat::UYVY.is_uncompressed());
-        assert!(PixelFormat::UYVA.is_uncompressed());
-        assert!(PixelFormat::P216.is_uncompressed());
-        assert!(PixelFormat::PA16.is_uncompressed());
-        assert!(PixelFormat::YV12.is_uncompressed());
-        assert!(PixelFormat::I420.is_uncompressed());
-        assert!(PixelFormat::NV12.is_uncompressed());
+        assert_eq!(
+            PixelFormat::NV12.try_buffer_size(1920, 1080).unwrap(),
+            3_110_400
+        );
     }
 
     /// Test PixelFormatInfo::is_planar_420 helper
@@ -2653,10 +2898,10 @@ mod tests {
             .build()
             .expect("Builder should succeed");
 
-        assert_eq!(frame.width, 1920);
-        assert_eq!(frame.height, 1080);
-        assert_eq!(frame.pixel_format, PixelFormat::NV12);
-        assert_eq!(frame.data.len(), 3_110_400, "NV12 1920x1080 buffer size");
+        assert_eq!(frame.width(), 1920);
+        assert_eq!(frame.height(), 1080);
+        assert_eq!(frame.pixel_format(), PixelFormat::NV12);
+        assert_eq!(frame.data().len(), 3_110_400, "NV12 1920x1080 buffer size");
     }
 
     /// Test VideoFrame builder rejects planar formats with odd dimensions
@@ -2682,11 +2927,11 @@ mod tests {
             .build()
             .expect("Builder should succeed");
 
-        assert_eq!(frame.width, 1920);
-        assert_eq!(frame.height, 1080);
-        assert_eq!(frame.pixel_format, PixelFormat::BGRA);
+        assert_eq!(frame.width(), 1920);
+        assert_eq!(frame.height(), 1080);
+        assert_eq!(frame.pixel_format(), PixelFormat::BGRA);
         assert_eq!(
-            frame.data.len(),
+            frame.data().len(),
             1920 * 1080 * 4,
             "BGRA buffer size unchanged"
         );
@@ -2724,16 +2969,16 @@ mod tests {
 
         let frame = unsafe { VideoFrame::from_raw(&c_frame) }.expect("from_raw should succeed");
 
-        assert_eq!(frame.width, width);
-        assert_eq!(frame.height, height);
-        assert_eq!(frame.pixel_format, PixelFormat::NV12);
+        assert_eq!(frame.width(), width);
+        assert_eq!(frame.height(), height);
+        assert_eq!(frame.pixel_format(), PixelFormat::NV12);
         assert_eq!(
-            frame.data.len(),
+            frame.data().len(),
             expected_size,
             "Should copy full Y+UV buffer"
         );
         assert_eq!(
-            frame.data[expected_size - 1],
+            frame.data()[expected_size - 1],
             0xFF,
             "Last byte should be copied"
         );
@@ -2802,7 +3047,7 @@ mod tests {
 
         let frame = unsafe { VideoFrame::from_raw(&c_frame) }.expect("from_raw should succeed");
         assert_eq!(
-            frame.data.len(),
+            frame.data().len(),
             expected_size,
             "BGRA buffer size unchanged"
         );
@@ -3122,8 +3367,75 @@ mod tests {
 
         let frame = result.unwrap();
         assert_eq!(frame.data().len(), sample_count);
-        assert_eq!(frame.num_samples, no_samples);
-        assert_eq!(frame.num_channels, no_channels);
+        assert_eq!(frame.num_samples(), no_samples);
+        assert_eq!(frame.num_channels(), no_channels);
+    }
+
+    #[test]
+    fn test_audio_builder_rejects_invalid_dimensions() {
+        assert!(matches!(
+            AudioFrame::builder().sample_rate(0).build(),
+            Err(Error::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            AudioFrame::builder().channels(0).build(),
+            Err(Error::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            AudioFrame::builder().samples(0).build(),
+            Err(Error::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            AudioFrame::builder().samples(-1).build(),
+            Err(Error::InvalidFrame(_))
+        ));
+    }
+
+    #[test]
+    fn test_audio_builder_rejects_oversized_layout() {
+        let samples = (MAX_AUDIO_BYTES / std::mem::size_of::<f32>()) as i32 + 1;
+        let result = AudioFrame::builder().channels(1).samples(samples).build();
+
+        assert!(matches!(result, Err(Error::InvalidFrame(_))));
+    }
+
+    #[test]
+    fn test_video_builder_rejects_invalid_send_metadata() {
+        assert!(matches!(
+            VideoFrame::builder().frame_rate(0, 1).build(),
+            Err(Error::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            VideoFrame::builder().frame_rate(30, 0).build(),
+            Err(Error::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            VideoFrame::builder().aspect_ratio(f32::NAN).build(),
+            Err(Error::InvalidFrame(_))
+        ));
+        assert!(matches!(
+            VideoFrame::builder().aspect_ratio(0.0).build(),
+            Err(Error::InvalidFrame(_))
+        ));
+    }
+
+    #[test]
+    fn test_owned_frame_data_replacement_preserves_layout_size() {
+        let mut video = VideoFrame::builder()
+            .resolution(16, 16)
+            .pixel_format(PixelFormat::BGRA)
+            .build()
+            .unwrap();
+        assert!(video.replace_data(vec![0; video.data().len() - 1]).is_err());
+
+        let mut audio = AudioFrame::builder()
+            .channels(2)
+            .samples(16)
+            .build()
+            .unwrap();
+        assert!(audio
+            .replace_data(vec![0.0; audio.data().len() + 1])
+            .is_err());
     }
 
     /// Test that uncompressed video uses MAX_VIDEO_BYTES constant for bounds check
@@ -3646,9 +3958,9 @@ mod tests {
         }
     }
 
-    /// Test calculate_buffer_len_checked matches PixelFormatInfo::buffer_len for valid inputs
+    /// Test calculate_buffer_len_checked matches PixelFormatInfo::try_buffer_len for valid inputs
     #[test]
-    fn test_calculate_buffer_len_checked_matches_unchecked() {
+    fn test_calculate_buffer_len_checked_matches_public_helper() {
         let test_cases = [
             (PixelFormat::BGRA, 7680usize, 1080usize),
             (PixelFormat::UYVY, 3840usize, 1080usize),
@@ -3658,7 +3970,10 @@ mod tests {
         ];
 
         for (format, stride, height) in test_cases {
-            let expected = format.info().buffer_len(stride as i32, height as i32);
+            let expected = format
+                .info()
+                .try_buffer_len(stride as i32, height as i32)
+                .unwrap();
             let result = calculate_buffer_len_checked(format, stride, height);
 
             assert!(

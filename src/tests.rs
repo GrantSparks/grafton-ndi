@@ -19,6 +19,10 @@ fn create_test_video_frame(
     frame.xres = width;
     frame.yres = height;
     frame.FourCC = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA;
+    frame.frame_rate_N = 60;
+    frame.frame_rate_D = 1;
+    frame.picture_aspect_ratio = 16.0 / 9.0;
+    frame.frame_format_type = NDIlib_frame_format_type_e_NDIlib_frame_format_type_progressive;
 
     // Set the union field based on which value is provided
     if line_stride > 0 {
@@ -52,7 +56,7 @@ fn test_video_frame_standard_format_size_calculation() {
         let frame = VideoFrame::from_raw(&c_frame).unwrap();
 
         let expected_size = (line_stride * test_height) as usize;
-        assert_eq!(frame.data.len(), expected_size);
+        assert_eq!(frame.data().len(), expected_size);
 
         drop(frame);
         Vec::from_raw_parts(c_frame.p_data, expected_size, expected_size);
@@ -93,8 +97,13 @@ fn test_video_frame_zero_size_returns_error() {
     let mut data = vec![0u8; 100];
     c_frame.p_data = data.as_mut_ptr();
     c_frame.FourCC = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA;
+    c_frame.xres = 1920;
     c_frame.__bindgen_anon_1.line_stride_in_bytes = 0;
     c_frame.yres = 1080;
+    c_frame.frame_rate_N = 60;
+    c_frame.frame_rate_D = 1;
+    c_frame.picture_aspect_ratio = 16.0 / 9.0;
+    c_frame.frame_format_type = NDIlib_frame_format_type_e_NDIlib_frame_format_type_progressive;
 
     unsafe {
         let result = VideoFrame::from_raw(&c_frame);
@@ -136,7 +145,7 @@ fn test_audio_frame_channel_data_interleaved() {
         .unwrap();
 
     // Data is converted to planar at build time, stride is always set
-    assert_eq!(frame.channel_stride_in_bytes, 12); // 3 samples * 4 bytes
+    assert_eq!(frame.channel_stride_in_bytes(), 12); // 3 samples * 4 bytes
 
     // After conversion, channel_data should return the de-interleaved samples
     let ch0 = frame.channel_data(0).unwrap();
@@ -201,7 +210,7 @@ fn test_audio_frame_channel_data_planar() {
         .build()
         .unwrap();
 
-    assert_eq!(frame.channel_stride_in_bytes, 12);
+    assert_eq!(frame.channel_stride_in_bytes(), 12);
 
     let ch0 = frame.channel_data(0).unwrap();
     assert_eq!(ch0, vec![1.0, 3.0, 5.0]);
@@ -221,7 +230,7 @@ fn test_audio_frame_default_layout() {
         .build()
         .unwrap();
 
-    assert_eq!(frame.channel_stride_in_bytes, 400);
+    assert_eq!(frame.channel_stride_in_bytes(), 400);
 }
 
 #[test]
@@ -233,10 +242,10 @@ fn test_video_frame_builder() {
         .build()
         .unwrap();
 
-    assert_eq!(frame.width, 1920);
-    assert_eq!(frame.height, 1080);
-    assert_eq!(frame.frame_rate_n, 30);
-    assert_eq!(frame.frame_rate_d, 1);
+    assert_eq!(frame.width(), 1920);
+    assert_eq!(frame.height(), 1080);
+    assert_eq!(frame.frame_rate_n(), 30);
+    assert_eq!(frame.frame_rate_d(), 1);
 }
 
 #[test]
@@ -248,11 +257,11 @@ fn test_audio_frame_builder() {
         .build()
         .unwrap();
 
-    assert_eq!(frame.sample_rate, 48000);
-    assert_eq!(frame.num_channels, 2);
-    assert_eq!(frame.num_samples, 1024);
+    assert_eq!(frame.sample_rate(), 48000);
+    assert_eq!(frame.num_channels(), 2);
+    assert_eq!(frame.num_samples(), 1024);
     assert_eq!(frame.data().len(), 2048);
-    assert_eq!(frame.channel_stride_in_bytes, 4096);
+    assert_eq!(frame.channel_stride_in_bytes(), 4096);
 }
 
 #[test]
@@ -561,7 +570,7 @@ fn test_video_frame_encode_png_rgba() {
         .unwrap();
 
     let mut frame = frame;
-    frame.data = data;
+    frame.replace_data(data).unwrap();
 
     let png_bytes = frame.encode_png();
     assert!(png_bytes.is_ok());
@@ -593,7 +602,7 @@ fn test_video_frame_encode_png_bgra() {
         .unwrap();
 
     let mut frame = frame;
-    frame.data = data;
+    frame.replace_data(data).unwrap();
 
     let png_bytes = frame.encode_png();
     assert!(png_bytes.is_ok());
@@ -639,7 +648,7 @@ fn test_video_frame_encode_jpeg_rgba() {
         .unwrap();
 
     let mut frame = frame;
-    frame.data = data;
+    frame.replace_data(data).unwrap();
 
     let jpeg_bytes = frame.encode_jpeg(85);
     assert!(jpeg_bytes.is_ok());
@@ -669,7 +678,7 @@ fn test_video_frame_encode_jpeg_bgra() {
         .unwrap();
 
     let mut frame = frame;
-    frame.data = data;
+    frame.replace_data(data).unwrap();
 
     let jpeg_bytes = frame.encode_jpeg(90);
     assert!(jpeg_bytes.is_ok());
@@ -708,7 +717,7 @@ fn test_video_frame_encode_jpeg_quality_range() {
         .unwrap();
 
     let mut frame = frame;
-    frame.data = data;
+    frame.replace_data(data).unwrap();
 
     // Test different quality levels
     let low_quality = frame.encode_jpeg(10).unwrap();
@@ -738,7 +747,7 @@ fn test_video_frame_encode_data_url_png() {
         .unwrap();
 
     let mut frame = frame;
-    frame.data = data;
+    frame.replace_data(data).unwrap();
 
     let data_url = frame.encode_data_url(ImageFormat::Png);
     assert!(data_url.is_ok());
@@ -774,7 +783,7 @@ fn test_video_frame_encode_data_url_jpeg() {
         .unwrap();
 
     let mut frame = frame;
-    frame.data = data;
+    frame.replace_data(data).unwrap();
 
     let data_url = frame.encode_data_url(ImageFormat::Jpeg(85));
     assert!(data_url.is_ok());
@@ -1133,7 +1142,7 @@ fn test_video_frame_from_raw_uncompressed_bgra() {
         let frame = VideoFrame::from_raw(&c_frame).unwrap();
 
         // Should have LineStrideBytes variant
-        match frame.line_stride_or_size {
+        match frame.line_stride_or_size() {
             LineStrideOrSize::LineStrideBytes(stride) => {
                 assert_eq!(stride, line_stride);
             }
@@ -1144,8 +1153,8 @@ fn test_video_frame_from_raw_uncompressed_bgra() {
 
         // Verify data size calculation
         let expected_size = (line_stride * test_height) as usize;
-        assert_eq!(frame.data.len(), expected_size);
-        assert_eq!(frame.pixel_format, PixelFormat::BGRA);
+        assert_eq!(frame.data().len(), expected_size);
+        assert_eq!(frame.pixel_format(), PixelFormat::BGRA);
 
         drop(frame);
         Vec::from_raw_parts(c_frame.p_data, expected_size, expected_size);
@@ -1165,6 +1174,10 @@ fn test_video_frame_from_raw_unknown_format_returns_error() {
     c_frame.yres = test_height;
     c_frame.FourCC = -1i32 as _; // Invalid FourCC code (0xFFFFFFFF)
     c_frame.__bindgen_anon_1.data_size_in_bytes = data_size;
+    c_frame.frame_rate_N = 60;
+    c_frame.frame_rate_D = 1;
+    c_frame.picture_aspect_ratio = 16.0 / 9.0;
+    c_frame.frame_format_type = NDIlib_frame_format_type_e_NDIlib_frame_format_type_progressive;
 
     let mut data = vec![0u8; data_size as usize];
     c_frame.p_data = data.as_mut_ptr();
@@ -1196,7 +1209,7 @@ fn test_video_frame_to_raw_roundtrip_uncompressed() {
         .unwrap();
 
     // Verify it has LineStrideBytes
-    match frame.line_stride_or_size {
+    match frame.line_stride_or_size() {
         LineStrideOrSize::LineStrideBytes(stride) => {
             assert_eq!(stride, 1920 * 4);
         }
@@ -1225,7 +1238,7 @@ fn test_video_frame_builder_creates_line_stride_bytes() {
         .build()
         .unwrap();
 
-    match frame.line_stride_or_size {
+    match frame.line_stride_or_size() {
         LineStrideOrSize::LineStrideBytes(stride) => {
             assert_eq!(stride, 640 * 4);
         }
