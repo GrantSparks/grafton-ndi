@@ -12,13 +12,15 @@
 //! 2. `VideoFrame::encode_png()` for crate-provided image conversion
 //! 3. Correct handling for RGBX/BGRX padding bytes and padded rows
 //!
-//! Run with: `cargo run --features image-encoding --example NDIlib_Recv_PNG`
+//! Run with: `cargo run --example NDIlib_Recv_PNG`
+//!
+//! If default features are disabled, add `--features image-encoding`.
 //!
 //! Optional arguments:
-//! - IP address to search: `cargo run --features image-encoding --example NDIlib_Recv_PNG -- 192.168.0.100`
-//! - Multiple IPs: `cargo run --features image-encoding --example NDIlib_Recv_PNG -- 192.168.0.100 10.0.0.0/24`
-//! - Custom output file: `cargo run --features image-encoding --example NDIlib_Recv_PNG -- --output MyImage.png`
-//! - Both: `cargo run --features image-encoding --example NDIlib_Recv_PNG -- 192.168.0.100 --output MyImage.png`
+//! - IP address to search: `cargo run --example NDIlib_Recv_PNG -- 192.168.0.100`
+//! - Multiple IPs: `cargo run --example NDIlib_Recv_PNG -- 192.168.0.100 10.0.0.0/24`
+//! - Custom output file: `cargo run --example NDIlib_Recv_PNG -- --output MyImage.png`
+//! - Both: `cargo run --example NDIlib_Recv_PNG -- 192.168.0.100 --output MyImage.png`
 
 use grafton_ndi::{
     Error, Finder, FinderOptions, Receiver, ReceiverColorFormat, ReceiverOptions, NDI,

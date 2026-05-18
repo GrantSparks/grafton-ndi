@@ -57,10 +57,13 @@ Add to your `Cargo.toml`:
 [dependencies]
 grafton-ndi = "0.12"
 
+# For a minimal build without PNG/JPEG/data URL helpers
+# grafton-ndi = { version = "0.12", default-features = false }
+
 # For NDI Advanced SDK features (optional)
 # grafton-ndi = { version = "0.12", features = ["advanced_sdk"] }
 
-# For image encoding support (PNG/JPEG)
+# Image encoding support (PNG/JPEG/data URLs) is enabled by default
 # grafton-ndi = { version = "0.12", features = ["image-encoding"] }
 
 # For async runtime integration

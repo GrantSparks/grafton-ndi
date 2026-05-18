@@ -31,15 +31,14 @@ async-std = { version = "1.13", optional = true, features = ["attributes"] }
 
 [build-dependencies]
 bindgen = "0.72.1"
-lodepng = "3.12.2"
 
 [features]
-default = []
+default = ["image-encoding"]
 # Enable NDI Advanced SDK features (requires NDI Advanced SDK)
 # This includes async video completion callbacks and other advanced functionality
 advanced_sdk = []
-# Enable image encoding support (PNG, JPEG, data URLs)
-# Adds dependencies: base64, jpeg-encoder, png
+# Enable image encoding support (PNG, JPEG, data URLs).
+# Enabled by default. Use `default-features = false` for a minimal build.
 image-encoding = ["dep:base64", "dep:jpeg-encoder", "dep:png"]
 # Enable async runtime integration for Tokio
 # Adds dependency: tokio
