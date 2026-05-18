@@ -203,12 +203,12 @@ let info = PixelFormat::BGRA.info();  // PixelFormatInfo with bytes_per_pixel, c
 - **Owned Frames:**
   - `VideoFrame` - Owned video frame data with resolution, pixel format, and timing
   - `AudioFrame` - Owned 32-bit float audio samples with channel configuration
-  - `MetadataFrame` - Owned XML metadata for tally, PTZ, and custom data
+  - `MetadataFrame` - Invariant-preserving owned UTF-8 metadata for tally, PTZ, and custom data
 
 - **Borrowed Frames (Zero-Copy):**
   - `VideoFrameRef<'rx>` - Zero-copy video frame reference (eliminates ~475 MB/s memcpy @ 1080p60)
   - `AudioFrameRef<'rx>` - Zero-copy audio frame reference
-  - `MetadataFrameRef<'rx>` - Zero-copy metadata frame reference
+  - `MetadataFrameRef<'rx>` - Validated zero-copy metadata frame reference
   - `BorrowedVideoFrame<'buf>` - Zero-copy send frame (for async transmission)
   - `FrameSyncVideoRef<'fs>` / `FrameSyncAudioRef<'fs>` - Zero-copy frames from `FrameSync`
 

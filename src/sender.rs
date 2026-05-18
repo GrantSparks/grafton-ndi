@@ -781,7 +781,8 @@ impl Sender {
     ///
     /// # Errors
     ///
-    /// Returns an error if the metadata string contains a null byte.
+    /// Returns an error if the metadata contains an interior NUL byte, exceeds
+    /// the metadata size limit, or cannot fit the SDK length field.
     pub fn send_metadata(&self, metadata_frame: &MetadataFrame) -> Result<()> {
         let (_c_data, raw) = metadata_frame.to_raw()?;
         unsafe {
@@ -891,7 +892,8 @@ impl Sender {
     ///
     /// # Errors
     ///
-    /// Returns an error if the metadata string contains a null byte.
+    /// Returns an error if the metadata contains an interior NUL byte, exceeds
+    /// the metadata size limit, or cannot fit the SDK length field.
     pub fn add_connection_metadata(&self, metadata_frame: &MetadataFrame) -> Result<()> {
         let (_c_data, raw) = metadata_frame.to_raw()?;
         unsafe { NDIlib_send_add_connection_metadata(self.inner.instance, &raw) }

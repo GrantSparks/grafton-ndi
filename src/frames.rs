@@ -6,7 +6,7 @@ use std::{
     ffi::{CStr, CString},
     fmt,
     os::raw::c_char,
-    ptr, slice,
+    ptr, slice, str,
 };
 
 use crate::{
@@ -870,11 +870,7 @@ impl VideoFrame {
         let slice = slice::from_raw_parts(c_frame.p_data, layout.data_len_bytes);
         let data = slice.to_vec();
 
-        let metadata = if c_frame.p_metadata.is_null() {
-            None
-        } else {
-            Some(CString::from(CStr::from_ptr(c_frame.p_metadata)))
-        };
+        let metadata = unsafe { copy_frame_metadata_cstring(c_frame.p_metadata) };
 
         #[allow(clippy::unnecessary_cast)] // Required for Windows where frame_format_type is i32
         let scan_type = ScanType::try_from(c_frame.frame_format_type as u32).map_err(|_| {
@@ -1088,12 +1084,8 @@ impl AudioFrame {
         let slice = unsafe { slice::from_raw_parts(raw.p_data as *const f32, layout.sample_count) };
         let data = slice.to_vec();
 
-        let metadata = if raw.p_metadata.is_null() {
-            None
-        } else {
-            // Copy the string, don't take ownership - SDK will free the original
-            Some(unsafe { CString::from(CStr::from_ptr(raw.p_metadata)) })
-        };
+        // Copy the string, don't take ownership - SDK will free the original.
+        let metadata = unsafe { copy_frame_metadata_cstring(raw.p_metadata) };
 
         Ok(AudioFrame {
             layout,
@@ -1487,13 +1479,18 @@ const MAX_VIDEO_BYTES: usize = 100 * 1024 * 1024;
 /// Comfortably above typical NDI audio frames while preventing unbounded allocations.
 const MAX_AUDIO_BYTES: usize = 64 * 1024 * 1024;
 
+/// Maximum allowed size for standalone metadata frames (4 MiB), including the
+/// SDK-required trailing NUL terminator.
+const MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct MetadataFrame {
-    pub data: String, // Owned metadata (typically XML)
-    pub timecode: i64,
+    data: String, // Owned metadata (typically XML)
+    timecode: i64,
 }
 
 impl MetadataFrame {
+    /// Create an empty metadata frame with default SDK timecode behavior.
     pub fn new() -> Self {
         MetadataFrame {
             data: String::new(),
@@ -1501,15 +1498,68 @@ impl MetadataFrame {
         }
     }
 
-    pub fn with_data(data: String, timecode: i64) -> Self {
-        MetadataFrame { data, timecode }
+    /// Create a metadata frame from UTF-8 text and a timecode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidCString`] if `data` contains an interior NUL byte
+    /// or [`Error::InvalidFrame`] if the SDK metadata length would exceed the
+    /// crate's metadata size limit.
+    pub fn with_data(data: impl Into<String>, timecode: i64) -> Result<Self> {
+        let data = data.into();
+        validate_metadata_text(&data)?;
+        Ok(MetadataFrame { data, timecode })
+    }
+
+    /// Get the metadata text.
+    pub fn data(&self) -> &str {
+        &self.data
+    }
+
+    /// Consume the frame and return the owned metadata text.
+    pub fn into_data(self) -> String {
+        self.data
+    }
+
+    /// Get the timecode.
+    ///
+    /// A value of zero is passed through to the SDK as its default timestamp
+    /// behavior.
+    pub fn timecode(&self) -> i64 {
+        self.timecode
+    }
+
+    /// Replace the metadata text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidCString`] if `data` contains an interior NUL byte
+    /// or [`Error::InvalidFrame`] if the SDK metadata length would exceed the
+    /// crate's metadata size limit.
+    pub fn set_data(&mut self, data: impl Into<String>) -> Result<()> {
+        let data = data.into();
+        validate_metadata_text(&data)?;
+        self.data = data;
+        Ok(())
+    }
+
+    /// Set the timecode.
+    pub fn set_timecode(&mut self, timecode: i64) {
+        self.timecode = timecode;
+    }
+
+    /// Return this frame with an updated timecode.
+    pub fn with_timecode(mut self, timecode: i64) -> Self {
+        self.timecode = timecode;
+        self
     }
 
     /// Convert to raw format for sending
     pub(crate) fn to_raw(&self) -> Result<(CString, NDIlib_metadata_frame_t)> {
-        let c_data = CString::new(self.data.clone()).map_err(Error::InvalidCString)?;
+        let c_data = CString::new(self.data.as_bytes()).map_err(Error::InvalidCString)?;
+        let length = validate_metadata_len_with_nul(c_data.as_bytes_with_nul().len())?;
         let raw = NDIlib_metadata_frame_t {
-            length: c_data.as_bytes().len() as i32,
+            length,
             timecode: self.timecode,
             p_data: c_data.as_ptr() as *mut c_char,
         };
@@ -1517,16 +1567,31 @@ impl MetadataFrame {
     }
 
     /// Create from raw NDI metadata frame (copies the data)
-    pub(crate) fn from_raw(raw: &NDIlib_metadata_frame_t) -> Self {
-        let data = if raw.p_data.is_null() {
-            String::new()
-        } else {
-            unsafe {
-                let c_str = CStr::from_ptr(raw.p_data);
-                c_str.to_string_lossy().into_owned()
-            }
-        };
-        MetadataFrame {
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be an SDK-populated metadata frame whose `p_data` pointer is
+    /// valid for `raw.length` bytes when `length > 0`.
+    #[cfg(test)]
+    pub(crate) unsafe fn from_raw(raw: &NDIlib_metadata_frame_t) -> Result<Self> {
+        let layout = validate_metadata_layout(raw)?;
+        Ok(Self::from_raw_validated(raw, layout))
+    }
+
+    /// Create from a raw NDI metadata frame after its layout has been validated.
+    ///
+    /// # Safety
+    ///
+    /// `layout` must have been produced by `validate_metadata_layout(raw)` while
+    /// the same `raw.p_data` allocation is still valid.
+    pub(crate) unsafe fn from_raw_validated(
+        raw: &NDIlib_metadata_frame_t,
+        layout: ValidatedMetadataLayout,
+    ) -> Self {
+        let bytes = metadata_payload_bytes(raw, layout);
+        let data = str::from_utf8_unchecked(bytes).to_owned();
+
+        Self {
             data,
             timecode: raw.timecode,
         }
@@ -1537,6 +1602,155 @@ impl Default for MetadataFrame {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Validated standalone metadata frame layout information.
+///
+/// The SDK `length` field includes the trailing NUL terminator. A
+/// `len_with_nul` of zero represents the accepted empty null frame
+/// (`length == 0 && p_data == NULL`) and never requires reading from `p_data`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ValidatedMetadataLayout {
+    /// Total SDK metadata length including trailing NUL, or zero for the valid
+    /// empty null frame.
+    pub len_with_nul: usize,
+    /// Public UTF-8 text payload length excluding the trailing NUL.
+    pub text_len: usize,
+}
+
+/// Validate standalone metadata frame layout from raw FFI fields.
+///
+/// This validates only memory layout and UTF-8. XML well-formedness is
+/// intentionally not checked because NDI receivers are expected to tolerate
+/// badly formed XML metadata.
+pub(crate) fn validate_metadata_layout(
+    raw: &NDIlib_metadata_frame_t,
+) -> Result<ValidatedMetadataLayout> {
+    if raw.length < 0 {
+        return Err(Error::InvalidFrame(format!(
+            "Metadata frame has negative length: {}",
+            raw.length
+        )));
+    }
+
+    if raw.length == 0 {
+        if raw.p_data.is_null() {
+            return Ok(ValidatedMetadataLayout {
+                len_with_nul: 0,
+                text_len: 0,
+            });
+        }
+
+        return Err(Error::InvalidFrame(
+            "Metadata frame uses lengthless non-null C-string data".into(),
+        ));
+    }
+
+    if raw.p_data.is_null() {
+        return Err(Error::InvalidFrame(
+            "Metadata frame has non-zero length with null data pointer".into(),
+        ));
+    }
+
+    let len_with_nul = usize::try_from(raw.length).map_err(|_| {
+        Error::InvalidFrame(format!("Invalid metadata length value: {}", raw.length))
+    })?;
+    validate_metadata_len_with_nul(len_with_nul)?;
+
+    let bytes = unsafe { slice::from_raw_parts(raw.p_data.cast::<u8>(), len_with_nul) };
+    if bytes[len_with_nul - 1] != 0 {
+        return Err(Error::InvalidFrame(
+            "Metadata frame length does not include a trailing NUL terminator".into(),
+        ));
+    }
+
+    let payload = &bytes[..len_with_nul - 1];
+    if payload.contains(&0) {
+        return Err(Error::InvalidFrame(
+            "Metadata frame contains an interior NUL byte".into(),
+        ));
+    }
+
+    str::from_utf8(payload).map_err(|err| Error::InvalidUtf8(err.to_string()))?;
+
+    Ok(ValidatedMetadataLayout {
+        len_with_nul,
+        text_len: payload.len(),
+    })
+}
+
+fn validate_metadata_text(data: &str) -> Result<()> {
+    let len_with_nul = data.len().checked_add(1).ok_or_else(|| {
+        Error::InvalidFrame("Metadata length overflow while adding terminator".into())
+    })?;
+    validate_metadata_len_with_nul(len_with_nul)?;
+    CString::new(data.as_bytes()).map_err(Error::InvalidCString)?;
+    Ok(())
+}
+
+fn validate_metadata_len_with_nul(len_with_nul: usize) -> Result<i32> {
+    if len_with_nul == 0 {
+        return Err(Error::InvalidFrame(
+            "Metadata frame length must include a trailing NUL terminator".into(),
+        ));
+    }
+
+    if len_with_nul > MAX_METADATA_BYTES {
+        return Err(Error::InvalidFrame(format!(
+            "Metadata frame exceeds maximum size: {} bytes > {} bytes",
+            len_with_nul, MAX_METADATA_BYTES
+        )));
+    }
+
+    metadata_len_to_i32(len_with_nul)
+}
+
+fn metadata_len_to_i32(len_with_nul: usize) -> Result<i32> {
+    i32::try_from(len_with_nul).map_err(|_| {
+        Error::InvalidFrame(format!(
+            "Metadata frame length {len_with_nul} exceeds SDK i32 range"
+        ))
+    })
+}
+
+fn metadata_payload_bytes(raw: &NDIlib_metadata_frame_t, layout: ValidatedMetadataLayout) -> &[u8] {
+    if layout.text_len == 0 {
+        &[]
+    } else {
+        // SAFETY: `validate_metadata_layout` checked that `p_data` is non-null
+        // for non-empty payloads and that `text_len` is bounded by `length`.
+        unsafe { slice::from_raw_parts(raw.p_data.cast::<u8>(), layout.text_len) }
+    }
+}
+
+/// Audit note: this helper is only for video/audio per-frame `p_metadata`
+/// fields, not standalone `NDIlib_metadata_frame_t::p_data`. The SDK exposes
+/// those per-frame metadata pointers as lengthless C strings, so hardening them
+/// without `CStr::from_ptr` requires a separate API design from issue #60's
+/// bounded standalone metadata layout.
+///
+/// # Safety
+///
+/// When non-null, `p_metadata` must point to a valid NUL-terminated C string
+/// that remains alive for the returned reference lifetime.
+pub(crate) unsafe fn borrowed_frame_metadata_cstr<'a>(
+    p_metadata: *const c_char,
+) -> Option<&'a CStr> {
+    if p_metadata.is_null() {
+        None
+    } else {
+        Some(unsafe { CStr::from_ptr(p_metadata) })
+    }
+}
+
+/// Copy a video/audio per-frame `p_metadata` C string without taking ownership
+/// of the SDK pointer.
+///
+/// # Safety
+///
+/// When non-null, `p_metadata` must point to a valid NUL-terminated C string.
+pub(crate) unsafe fn copy_frame_metadata_cstring(p_metadata: *const c_char) -> Option<CString> {
+    unsafe { borrowed_frame_metadata_cstr(p_metadata) }.map(CString::from)
 }
 
 /// Image format specification for encoding video frames.
@@ -2371,12 +2585,7 @@ impl<'rx> VideoFrameRef<'rx> {
 
     /// Get the metadata as a `CStr`, if present.
     pub fn metadata(&self) -> Option<&CStr> {
-        let p_metadata = self.guard.frame().p_metadata;
-        if p_metadata.is_null() {
-            None
-        } else {
-            Some(unsafe { CStr::from_ptr(p_metadata) })
-        }
+        unsafe { borrowed_frame_metadata_cstr(self.guard.frame().p_metadata) }
     }
 
     /// Get a zero-copy view of the frame data.
@@ -2532,12 +2741,7 @@ impl<'rx> AudioFrameRef<'rx> {
 
     /// Get the metadata as a `CStr`, if present.
     pub fn metadata(&self) -> Option<&CStr> {
-        let p_metadata = self.guard.frame().p_metadata;
-        if p_metadata.is_null() {
-            None
-        } else {
-            Some(unsafe { CStr::from_ptr(p_metadata) })
-        }
+        unsafe { borrowed_frame_metadata_cstr(self.guard.frame().p_metadata) }
     }
 
     /// Get a zero-copy view of the audio data as 32-bit floats.
@@ -2621,7 +2825,7 @@ impl<'rx> fmt::Debug for AudioFrameRef<'rx> {
 /// # let receiver = Receiver::new(&ndi, &options)?;
 /// // Zero-copy capture
 /// if let Some(frame) = receiver.capture_metadata_ref(Duration::from_millis(1000))? {
-///     println!("Metadata: {}", frame.data().to_string_lossy());
+///     println!("Metadata: {}", frame.data());
 ///
 ///     // Frame is freed here when `frame` goes out of scope
 /// }
@@ -2630,6 +2834,9 @@ impl<'rx> fmt::Debug for AudioFrameRef<'rx> {
 /// ```
 pub struct MetadataFrameRef<'rx> {
     guard: RecvMetadataGuard<'rx>,
+    /// Cached validated layout information. Computed once at construction time;
+    /// `data()` and `as_bytes()` use this cached value.
+    layout: ValidatedMetadataLayout,
 }
 
 impl<'rx> MetadataFrameRef<'rx> {
@@ -2639,8 +2846,10 @@ impl<'rx> MetadataFrameRef<'rx> {
     ///
     /// The caller must ensure the guard was created from a valid NDI receiver
     /// and contains a frame populated by `NDIlib_recv_capture_v3`.
-    pub(crate) unsafe fn new(guard: RecvMetadataGuard<'rx>) -> Self {
-        Self { guard }
+    pub(crate) unsafe fn new(guard: RecvMetadataGuard<'rx>) -> Result<Self> {
+        let layout = validate_metadata_layout(guard.frame())?;
+
+        Ok(Self { guard, layout })
     }
 
     /// Get the timecode.
@@ -2648,20 +2857,21 @@ impl<'rx> MetadataFrameRef<'rx> {
         self.guard.frame().timecode
     }
 
-    /// Get a zero-copy view of the metadata as a `CStr`.
+    /// Get a zero-copy view of the metadata text.
     ///
     /// This returns a reference directly into the NDI SDK's buffer.
     /// No allocation or string copying is performed.
-    ///
-    /// Returns an empty `CStr` if the metadata pointer is null.
-    pub fn data(&self) -> &CStr {
-        let p_data = self.guard.frame().p_data;
-        if p_data.is_null() {
-            // Return empty CStr for null pointer
-            c""
-        } else {
-            unsafe { CStr::from_ptr(p_data) }
-        }
+    pub fn data(&self) -> &str {
+        let bytes = self.as_bytes();
+        // SAFETY: `validate_metadata_layout` checked UTF-8 before this
+        // borrowed frame was constructed.
+        unsafe { str::from_utf8_unchecked(bytes) }
+    }
+
+    /// Get a zero-copy view of the metadata UTF-8 payload bytes, excluding the
+    /// SDK trailing NUL terminator.
+    pub fn as_bytes(&self) -> &[u8] {
+        metadata_payload_bytes(self.guard.frame(), self.layout)
     }
 
     /// Convert this borrowed frame to an owned `MetadataFrame`.
@@ -2669,7 +2879,7 @@ impl<'rx> MetadataFrameRef<'rx> {
     /// This performs a string copy, allowing the frame to outlive
     /// the NDI buffer and be sent across threads.
     pub fn to_owned(&self) -> MetadataFrame {
-        MetadataFrame::from_raw(self.guard.frame())
+        unsafe { MetadataFrame::from_raw_validated(self.guard.frame(), self.layout) }
     }
 }
 
@@ -2677,6 +2887,7 @@ impl<'rx> fmt::Debug for MetadataFrameRef<'rx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MetadataFrameRef")
             .field("data", &self.data())
+            .field("data (bytes)", &self.as_bytes().len())
             .field("timecode", &self.timecode())
             .finish()
     }
@@ -3294,6 +3505,268 @@ mod tests {
     fn test_max_audio_bytes_constant() {
         // Verify the constant is set to 64 MiB as specified
         assert_eq!(MAX_AUDIO_BYTES, 64 * 1024 * 1024);
+    }
+
+    /// Test that MAX_METADATA_BYTES constant is properly defined.
+    #[test]
+    fn test_max_metadata_bytes_constant() {
+        assert_eq!(MAX_METADATA_BYTES, 4 * 1024 * 1024);
+    }
+
+    fn metadata_raw_from_bytes(data: &mut [u8], length: i32) -> NDIlib_metadata_frame_t {
+        NDIlib_metadata_frame_t {
+            length,
+            timecode: 12345,
+            p_data: data.as_mut_ptr().cast::<c_char>(),
+        }
+    }
+
+    fn null_metadata_raw(length: i32) -> NDIlib_metadata_frame_t {
+        NDIlib_metadata_frame_t {
+            length,
+            timecode: 12345,
+            p_data: ptr::null_mut(),
+        }
+    }
+
+    #[test]
+    fn test_validate_metadata_layout_accepts_empty_null_frame() {
+        let raw = null_metadata_raw(0);
+        let layout = validate_metadata_layout(&raw).expect("empty null frame is valid");
+
+        assert_eq!(
+            layout,
+            ValidatedMetadataLayout {
+                len_with_nul: 0,
+                text_len: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_validate_metadata_layout_accepts_one_byte_empty_payload() {
+        let mut data = vec![0u8];
+        let raw = metadata_raw_from_bytes(&mut data, 1);
+        let layout = validate_metadata_layout(&raw).expect("explicit empty payload is valid");
+
+        assert_eq!(layout.len_with_nul, 1);
+        assert_eq!(layout.text_len, 0);
+    }
+
+    #[test]
+    fn test_validate_metadata_layout_accepts_utf8_with_bounded_length() {
+        let mut data = "<ndi tally=\"preview\"/>".as_bytes().to_vec();
+        data.push(0);
+        let length = data.len() as i32;
+        let raw = metadata_raw_from_bytes(&mut data, length);
+        let layout = validate_metadata_layout(&raw).expect("valid UTF-8 metadata");
+
+        assert_eq!(layout.len_with_nul, data.len());
+        assert_eq!(layout.text_len, data.len() - 1);
+    }
+
+    #[test]
+    fn test_validate_metadata_layout_ignores_bytes_after_length() {
+        let mut data = b"ok\0\0\xFF".to_vec();
+        let raw = metadata_raw_from_bytes(&mut data, 3);
+        let layout = validate_metadata_layout(&raw).expect("extra bytes after length ignored");
+
+        assert_eq!(layout.text_len, 2);
+        let owned = unsafe { MetadataFrame::from_raw_validated(&raw, layout) };
+        assert_eq!(owned.data(), "ok");
+    }
+
+    #[test]
+    fn test_validate_metadata_layout_rejects_negative_length() {
+        let raw = null_metadata_raw(-1);
+
+        assert!(matches!(
+            validate_metadata_layout(&raw),
+            Err(Error::InvalidFrame(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_metadata_layout_rejects_lengthless_non_null_data() {
+        let mut data = vec![0u8];
+        let raw = metadata_raw_from_bytes(&mut data, 0);
+
+        assert!(matches!(
+            validate_metadata_layout(&raw),
+            Err(Error::InvalidFrame(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_metadata_layout_rejects_nonzero_length_null_data() {
+        let raw = null_metadata_raw(1);
+
+        assert!(matches!(
+            validate_metadata_layout(&raw),
+            Err(Error::InvalidFrame(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_metadata_layout_rejects_missing_trailing_nul() {
+        let mut data = b"abc".to_vec();
+        let length = data.len() as i32;
+        let raw = metadata_raw_from_bytes(&mut data, length);
+
+        assert!(matches!(
+            validate_metadata_layout(&raw),
+            Err(Error::InvalidFrame(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_metadata_layout_rejects_interior_nul() {
+        let mut data = b"a\0b\0".to_vec();
+        let length = data.len() as i32;
+        let raw = metadata_raw_from_bytes(&mut data, length);
+
+        assert!(matches!(
+            validate_metadata_layout(&raw),
+            Err(Error::InvalidFrame(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_metadata_layout_rejects_oversized_length_before_reading() {
+        let mut data = vec![0u8];
+        let raw = metadata_raw_from_bytes(&mut data, (MAX_METADATA_BYTES + 1) as i32);
+
+        assert!(matches!(
+            validate_metadata_layout(&raw),
+            Err(Error::InvalidFrame(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_metadata_layout_rejects_invalid_utf8() {
+        let mut data = vec![0xFF, 0];
+        let length = data.len() as i32;
+        let raw = metadata_raw_from_bytes(&mut data, length);
+
+        assert!(matches!(
+            validate_metadata_layout(&raw),
+            Err(Error::InvalidUtf8(_))
+        ));
+    }
+
+    #[test]
+    fn test_metadata_frame_constructor_and_accessors_preserve_text() {
+        let frame = MetadataFrame::with_data("<ndi_product/>", 9876).unwrap();
+
+        assert_eq!(frame.data(), "<ndi_product/>");
+        assert_eq!(frame.timecode(), 9876);
+        assert_eq!(frame.clone().into_data(), "<ndi_product/>");
+    }
+
+    #[test]
+    fn test_metadata_frame_rejects_interior_nul_input() {
+        assert!(matches!(
+            MetadataFrame::with_data("bad\0metadata", 0),
+            Err(Error::InvalidCString(_))
+        ));
+
+        let mut frame = MetadataFrame::new();
+        assert!(matches!(
+            frame.set_data("bad\0metadata"),
+            Err(Error::InvalidCString(_))
+        ));
+    }
+
+    #[test]
+    fn test_metadata_frame_rejects_oversized_input() {
+        let oversized = "x".repeat(MAX_METADATA_BYTES);
+
+        assert!(matches!(
+            MetadataFrame::with_data(oversized, 0),
+            Err(Error::InvalidFrame(_))
+        ));
+    }
+
+    #[test]
+    fn test_metadata_frame_setters_preserve_invariants() {
+        let mut frame = MetadataFrame::new();
+
+        frame.set_data("updated").unwrap();
+        frame.set_timecode(42);
+
+        assert_eq!(frame.data(), "updated");
+        assert_eq!(frame.timecode(), 42);
+        assert_eq!(MetadataFrame::new().with_timecode(7).timecode(), 7);
+    }
+
+    #[test]
+    fn test_metadata_frame_from_raw_validated_copies_only_payload() {
+        let mut data = b"copy-me\0\0\xFF".to_vec();
+        let raw = metadata_raw_from_bytes(&mut data, 8);
+        let layout = validate_metadata_layout(&raw).unwrap();
+        let frame = unsafe { MetadataFrame::from_raw_validated(&raw, layout) };
+
+        assert_eq!(frame.data(), "copy-me");
+        assert_eq!(frame.timecode(), 12345);
+    }
+
+    #[test]
+    fn test_metadata_frame_from_raw_reports_invalid_utf8() {
+        let mut data = vec![0xFF, 0];
+        let raw = metadata_raw_from_bytes(&mut data, 2);
+
+        assert!(matches!(
+            unsafe { MetadataFrame::from_raw(&raw) },
+            Err(Error::InvalidUtf8(_))
+        ));
+    }
+
+    #[test]
+    fn test_metadata_frame_to_raw_includes_trailing_nul() {
+        let frame = MetadataFrame::with_data("abc", 101).unwrap();
+        let (c_data, raw) = frame.to_raw().unwrap();
+
+        assert_eq!(raw.length, 4);
+        assert_eq!(raw.timecode, 101);
+        assert_eq!(c_data.as_bytes_with_nul(), b"abc\0");
+    }
+
+    #[test]
+    fn test_empty_metadata_frame_to_raw_sends_explicit_nul() {
+        let frame = MetadataFrame::new();
+        let (c_data, raw) = frame.to_raw().unwrap();
+
+        assert_eq!(raw.length, 1);
+        assert_eq!(c_data.as_bytes_with_nul(), b"\0");
+    }
+
+    #[test]
+    fn test_metadata_raw_length_conversion_is_checked() {
+        assert!(metadata_len_to_i32(i32::MAX as usize).is_ok());
+        assert!(matches!(
+            metadata_len_to_i32(i32::MAX as usize + 1),
+            Err(Error::InvalidFrame(_))
+        ));
+    }
+
+    #[test]
+    fn test_metadata_frame_ref_uses_cached_layout() {
+        use crate::capture::RecvMetadataGuard;
+
+        let mut data = b"zero-copy\0\0\xFF".to_vec();
+        let raw = metadata_raw_from_bytes(&mut data, 10);
+        let guard = unsafe { RecvMetadataGuard::new(ptr::null_mut(), raw) };
+        let frame_ref = unsafe { MetadataFrameRef::new(guard) }.expect("valid metadata ref");
+
+        assert_eq!(frame_ref.data(), "zero-copy");
+        assert_eq!(frame_ref.as_bytes(), b"zero-copy");
+        assert_eq!(frame_ref.layout.text_len, 9);
+
+        let owned = frame_ref.to_owned();
+        assert_eq!(owned.data(), "zero-copy");
+        assert_eq!(owned.timecode(), 12345);
+
+        std::mem::forget(frame_ref);
     }
 
     /// Test that audio frames with overflow in checked_mul are rejected
