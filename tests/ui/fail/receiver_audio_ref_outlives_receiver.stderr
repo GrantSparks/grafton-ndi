@@ -1,0 +1,12 @@
+error[E0597]: `receiver` does not live long enough
+  --> tests/ui/fail/receiver_audio_ref_outlives_receiver.rs:21:9
+   |
+19 |     let frame_ref = {
+   |         --------- borrow later stored here
+20 |         let receiver = receiver(&ndi);
+   |             -------- binding `receiver` declared here
+21 |         receiver
+   |         ^^^^^^^^ borrowed value does not live long enough
+...
+25 |     };
+   |     - `receiver` dropped here while still borrowed

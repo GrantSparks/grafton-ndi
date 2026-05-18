@@ -1,0 +1,11 @@
+error[E0499]: cannot borrow `sender` as mutable more than once at a time
+  --> tests/ui/fail/async_token_prevents_second_send.rs:20:19
+   |
+14 |     let token_a = sender.send_video_async(&frame_a);
+   |                   ------ first mutable borrow occurs here
+...
+20 |     let token_b = sender.send_video_async(&frame_b);
+   |                   ^^^^^^ second mutable borrow occurs here
+21 |
+22 |     drop((token_a, token_b));
+   |           ------- first borrow later used here

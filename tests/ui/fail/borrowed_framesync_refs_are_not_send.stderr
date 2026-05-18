@@ -1,0 +1,213 @@
+error[E0277]: `*mut grafton_ndi::ndi_lib::NDIlib_framesync_instance_type` cannot be sent between threads safely
+ --> tests/ui/fail/borrowed_framesync_refs_are_not_send.rs:8:19
+  |
+8 |     assert_send::<FrameSyncVideoRef<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^ `*mut grafton_ndi::ndi_lib::NDIlib_framesync_instance_type` cannot be sent between threads safely
+  |
+  = help: within `FrameSyncVideoRef<'static>`, the trait `Send` is not implemented for `*mut grafton_ndi::ndi_lib::NDIlib_framesync_instance_type`
+note: required because it appears within the type `framesync::FrameSyncVideoGuard<'static>`
+ --> src/framesync.rs
+  |
+  | struct FrameSyncVideoGuard<'fs> {
+  |        ^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `FrameSyncVideoRef<'static>`
+ --> src/framesync.rs
+  |
+  | pub struct FrameSyncVideoRef<'fs> {
+  |            ^^^^^^^^^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/ui/fail/borrowed_framesync_refs_are_not_send.rs:5:19
+  |
+5 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*mut u8` cannot be sent between threads safely
+ --> tests/ui/fail/borrowed_framesync_refs_are_not_send.rs:8:19
+  |
+8 |     assert_send::<FrameSyncVideoRef<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^ `*mut u8` cannot be sent between threads safely
+  |
+  = help: within `FrameSyncVideoRef<'static>`, the trait `Send` is not implemented for `*mut u8`
+note: required because it appears within the type `grafton_ndi::ndi_lib::NDIlib_video_frame_v2_t`
+ --> $OUT_DIR[grafton-ndi]/ndi_lib.rs
+  |
+  | pub struct NDIlib_video_frame_v2_t {
+  |            ^^^^^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `framesync::FrameSyncVideoGuard<'static>`
+ --> src/framesync.rs
+  |
+  | struct FrameSyncVideoGuard<'fs> {
+  |        ^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `FrameSyncVideoRef<'static>`
+ --> src/framesync.rs
+  |
+  | pub struct FrameSyncVideoRef<'fs> {
+  |            ^^^^^^^^^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/ui/fail/borrowed_framesync_refs_are_not_send.rs:5:19
+  |
+5 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*const i8` cannot be sent between threads safely
+ --> tests/ui/fail/borrowed_framesync_refs_are_not_send.rs:8:19
+  |
+8 |     assert_send::<FrameSyncVideoRef<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^ `*const i8` cannot be sent between threads safely
+  |
+  = help: within `FrameSyncVideoRef<'static>`, the trait `Send` is not implemented for `*const i8`
+note: required because it appears within the type `grafton_ndi::ndi_lib::NDIlib_video_frame_v2_t`
+ --> $OUT_DIR[grafton-ndi]/ndi_lib.rs
+  |
+  | pub struct NDIlib_video_frame_v2_t {
+  |            ^^^^^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `framesync::FrameSyncVideoGuard<'static>`
+ --> src/framesync.rs
+  |
+  | struct FrameSyncVideoGuard<'fs> {
+  |        ^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `FrameSyncVideoRef<'static>`
+ --> src/framesync.rs
+  |
+  | pub struct FrameSyncVideoRef<'fs> {
+  |            ^^^^^^^^^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/ui/fail/borrowed_framesync_refs_are_not_send.rs:5:19
+  |
+5 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `Rc<()>` cannot be sent between threads safely
+ --> tests/ui/fail/borrowed_framesync_refs_are_not_send.rs:8:19
+  |
+8 |     assert_send::<FrameSyncVideoRef<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<()>` cannot be sent between threads safely
+  |
+  = help: within `FrameSyncVideoRef<'static>`, the trait `Send` is not implemented for `Rc<()>`
+note: required because it appears within the type `PhantomData<Rc<()>>`
+ --> $RUST/core/src/marker.rs
+  |
+  | pub struct PhantomData<T: PointeeSized>;
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `framesync::FrameSyncVideoGuard<'static>`
+ --> src/framesync.rs
+  |
+  | struct FrameSyncVideoGuard<'fs> {
+  |        ^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `FrameSyncVideoRef<'static>`
+ --> src/framesync.rs
+  |
+  | pub struct FrameSyncVideoRef<'fs> {
+  |            ^^^^^^^^^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/ui/fail/borrowed_framesync_refs_are_not_send.rs:5:19
+  |
+5 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*mut grafton_ndi::ndi_lib::NDIlib_framesync_instance_type` cannot be sent between threads safely
+ --> tests/ui/fail/borrowed_framesync_refs_are_not_send.rs:9:19
+  |
+9 |     assert_send::<FrameSyncAudioRef<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^ `*mut grafton_ndi::ndi_lib::NDIlib_framesync_instance_type` cannot be sent between threads safely
+  |
+  = help: within `FrameSyncAudioRef<'static>`, the trait `Send` is not implemented for `*mut grafton_ndi::ndi_lib::NDIlib_framesync_instance_type`
+note: required because it appears within the type `framesync::FrameSyncAudioGuard<'static>`
+ --> src/framesync.rs
+  |
+  | struct FrameSyncAudioGuard<'fs> {
+  |        ^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `FrameSyncAudioRef<'static>`
+ --> src/framesync.rs
+  |
+  | pub struct FrameSyncAudioRef<'fs> {
+  |            ^^^^^^^^^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/ui/fail/borrowed_framesync_refs_are_not_send.rs:5:19
+  |
+5 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*mut u8` cannot be sent between threads safely
+ --> tests/ui/fail/borrowed_framesync_refs_are_not_send.rs:9:19
+  |
+9 |     assert_send::<FrameSyncAudioRef<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^ `*mut u8` cannot be sent between threads safely
+  |
+  = help: within `FrameSyncAudioRef<'static>`, the trait `Send` is not implemented for `*mut u8`
+note: required because it appears within the type `grafton_ndi::ndi_lib::NDIlib_audio_frame_v3_t`
+ --> $OUT_DIR[grafton-ndi]/ndi_lib.rs
+  |
+  | pub struct NDIlib_audio_frame_v3_t {
+  |            ^^^^^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `framesync::FrameSyncAudioGuard<'static>`
+ --> src/framesync.rs
+  |
+  | struct FrameSyncAudioGuard<'fs> {
+  |        ^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `FrameSyncAudioRef<'static>`
+ --> src/framesync.rs
+  |
+  | pub struct FrameSyncAudioRef<'fs> {
+  |            ^^^^^^^^^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/ui/fail/borrowed_framesync_refs_are_not_send.rs:5:19
+  |
+5 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*const i8` cannot be sent between threads safely
+ --> tests/ui/fail/borrowed_framesync_refs_are_not_send.rs:9:19
+  |
+9 |     assert_send::<FrameSyncAudioRef<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^ `*const i8` cannot be sent between threads safely
+  |
+  = help: within `FrameSyncAudioRef<'static>`, the trait `Send` is not implemented for `*const i8`
+note: required because it appears within the type `grafton_ndi::ndi_lib::NDIlib_audio_frame_v3_t`
+ --> $OUT_DIR[grafton-ndi]/ndi_lib.rs
+  |
+  | pub struct NDIlib_audio_frame_v3_t {
+  |            ^^^^^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `framesync::FrameSyncAudioGuard<'static>`
+ --> src/framesync.rs
+  |
+  | struct FrameSyncAudioGuard<'fs> {
+  |        ^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `FrameSyncAudioRef<'static>`
+ --> src/framesync.rs
+  |
+  | pub struct FrameSyncAudioRef<'fs> {
+  |            ^^^^^^^^^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/ui/fail/borrowed_framesync_refs_are_not_send.rs:5:19
+  |
+5 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `Rc<()>` cannot be sent between threads safely
+ --> tests/ui/fail/borrowed_framesync_refs_are_not_send.rs:9:19
+  |
+9 |     assert_send::<FrameSyncAudioRef<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<()>` cannot be sent between threads safely
+  |
+  = help: within `FrameSyncAudioRef<'static>`, the trait `Send` is not implemented for `Rc<()>`
+note: required because it appears within the type `PhantomData<Rc<()>>`
+ --> $RUST/core/src/marker.rs
+  |
+  | pub struct PhantomData<T: PointeeSized>;
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `framesync::FrameSyncAudioGuard<'static>`
+ --> src/framesync.rs
+  |
+  | struct FrameSyncAudioGuard<'fs> {
+  |        ^^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `FrameSyncAudioRef<'static>`
+ --> src/framesync.rs
+  |
+  | pub struct FrameSyncAudioRef<'fs> {
+  |            ^^^^^^^^^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/ui/fail/borrowed_framesync_refs_are_not_send.rs:5:19
+  |
+5 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`

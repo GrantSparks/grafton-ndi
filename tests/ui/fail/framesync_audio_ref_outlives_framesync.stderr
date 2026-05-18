@@ -1,0 +1,12 @@
+error[E0597]: `framesync` does not live long enough
+  --> tests/ui/fail/framesync_audio_ref_outlives_framesync.rs:21:9
+   |
+19 |     let frame_ref = {
+   |         --------- borrow later stored here
+20 |         let framesync = FrameSync::new(receiver(&ndi)).unwrap();
+   |             --------- binding `framesync` declared here
+21 |         framesync
+   |         ^^^^^^^^^ borrowed value does not live long enough
+...
+24 |     };
+   |     - `framesync` dropped here while still borrowed

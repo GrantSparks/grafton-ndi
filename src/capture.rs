@@ -22,7 +22,7 @@
 //! // Guard automatically calls the correct free function when dropped
 //! ```
 
-use std::marker::PhantomData;
+use std::{marker::PhantomData, rc::Rc};
 
 use crate::ndi_lib::*;
 
@@ -123,6 +123,10 @@ pub struct RecvGuard<'rx, K: CaptureKind> {
     instance: NDIlib_recv_instance_t,
     frame: K::RawFrame,
     _owner: PhantomData<&'rx crate::Receiver>,
+    // SDK-owned receive buffers must be freed through the originating receiver.
+    // Keep the borrowed frame refs deliberately !Send/!Sync rather than relying
+    // on raw-pointer auto-traits from generated bindings.
+    _thread_affine: PhantomData<Rc<()>>,
 }
 
 impl<'rx, K: CaptureKind> RecvGuard<'rx, K> {
@@ -139,6 +143,7 @@ impl<'rx, K: CaptureKind> RecvGuard<'rx, K> {
             instance,
             frame,
             _owner: PhantomData,
+            _thread_affine: PhantomData,
         }
     }
 

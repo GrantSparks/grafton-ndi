@@ -76,7 +76,7 @@
 //! }
 //! ```
 
-use std::{fmt, marker::PhantomData, mem::ManuallyDrop, num::NonZeroI32, ptr, slice};
+use std::{fmt, marker::PhantomData, mem::ManuallyDrop, num::NonZeroI32, ptr, rc::Rc, slice};
 
 use crate::{
     frames::{
@@ -562,6 +562,10 @@ struct FrameSyncVideoGuard<'fs> {
     instance: NDIlib_framesync_instance_t,
     frame: NDIlib_video_frame_v2_t,
     _owner: PhantomData<&'fs FrameSync>,
+    // FrameSync-owned SDK buffers are released through this FrameSync handle.
+    // Keep borrowed refs deliberately !Send/!Sync rather than depending on
+    // generated raw-pointer fields to supply that auto-trait behavior.
+    _thread_affine: PhantomData<Rc<()>>,
 }
 
 impl<'fs> FrameSyncVideoGuard<'fs> {
@@ -570,6 +574,7 @@ impl<'fs> FrameSyncVideoGuard<'fs> {
             instance,
             frame,
             _owner: PhantomData,
+            _thread_affine: PhantomData,
         }
     }
 
@@ -594,6 +599,8 @@ struct FrameSyncAudioGuard<'fs> {
     instance: NDIlib_framesync_instance_t,
     frame: NDIlib_audio_frame_v3_t,
     _owner: PhantomData<&'fs FrameSync>,
+    // See FrameSyncVideoGuard: borrowed FrameSync buffers are handle-affine.
+    _thread_affine: PhantomData<Rc<()>>,
 }
 
 impl<'fs> FrameSyncAudioGuard<'fs> {
@@ -602,6 +609,7 @@ impl<'fs> FrameSyncAudioGuard<'fs> {
             instance,
             frame,
             _owner: PhantomData,
+            _thread_affine: PhantomData,
         }
     }
 
