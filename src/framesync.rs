@@ -76,13 +76,14 @@
 //! }
 //! ```
 
-use std::{ffi::CStr, fmt, marker::PhantomData, mem::ManuallyDrop, num::NonZeroI32, ptr, slice};
+use std::{fmt, marker::PhantomData, mem::ManuallyDrop, num::NonZeroI32, ptr, slice};
 
 use crate::{
     frames::{
-        borrowed_frame_metadata_cstr, validate_audio_layout, validate_audio_layout_allow_empty,
-        validate_video_layout, AudioFormat, AudioFrame, LineStrideOrSize, PixelFormat, ScanType,
-        ValidatedAudioLayout, ValidatedVideoLayout, VideoFrame,
+        frame_metadata_str, validate_audio_layout, validate_audio_layout_allow_empty,
+        validate_frame_metadata, validate_video_layout, AudioFormat, AudioFrame, LineStrideOrSize,
+        PixelFormat, ScanType, ValidatedAudioLayout, ValidatedFrameMetadata, ValidatedVideoLayout,
+        VideoFrame,
     },
     ndi_lib::*,
     receiver::Receiver,
@@ -656,13 +657,19 @@ impl Drop for FrameSyncAudioGuard<'_> {
 pub struct FrameSyncVideoRef<'fs> {
     guard: FrameSyncVideoGuard<'fs>,
     layout: ValidatedVideoLayout,
+    metadata: ValidatedFrameMetadata,
 }
 
 impl<'fs> FrameSyncVideoRef<'fs> {
     unsafe fn new(guard: FrameSyncVideoGuard<'fs>) -> Result<Self> {
         let layout = validate_video_layout(guard.frame())?;
+        let metadata = unsafe { validate_frame_metadata(guard.frame().p_metadata)? };
 
-        Ok(Self { guard, layout })
+        Ok(Self {
+            guard,
+            layout,
+            metadata,
+        })
     }
 
     /// Get the frame width in pixels.
@@ -717,9 +724,9 @@ impl<'fs> FrameSyncVideoRef<'fs> {
         self.layout.line_stride_or_size
     }
 
-    /// Get the metadata as a `CStr`, if present.
-    pub fn metadata(&self) -> Option<&CStr> {
-        unsafe { borrowed_frame_metadata_cstr(self.guard.frame().p_metadata) }
+    /// Get frame metadata as UTF-8 text, if present.
+    pub fn metadata(&self) -> Option<&str> {
+        unsafe { frame_metadata_str(self.guard.frame().p_metadata, self.metadata) }
     }
 
     /// Get a zero-copy view of the frame data.
@@ -735,7 +742,7 @@ impl<'fs> FrameSyncVideoRef<'fs> {
     /// This performs a single memcpy of the frame data and metadata,
     /// allowing the frame to outlive the NDI buffer and be sent across threads.
     pub fn to_owned(&self) -> Result<VideoFrame> {
-        unsafe { VideoFrame::from_raw_validated(self.guard.frame(), self.layout) }
+        unsafe { VideoFrame::from_raw_validated(self.guard.frame(), self.layout, self.metadata) }
     }
 }
 
@@ -779,6 +786,7 @@ impl fmt::Debug for FrameSyncVideoRef<'_> {
 pub struct FrameSyncAudioRef<'fs> {
     guard: FrameSyncAudioGuard<'fs>,
     layout: ValidatedAudioLayout,
+    metadata: ValidatedFrameMetadata,
 }
 
 impl<'fs> FrameSyncAudioRef<'fs> {
@@ -794,8 +802,13 @@ impl<'fs> FrameSyncAudioRef<'fs> {
         } else {
             validate_audio_layout(guard.frame())?
         };
+        let metadata = unsafe { validate_frame_metadata(guard.frame().p_metadata)? };
 
-        Ok(Self { guard, layout })
+        Ok(Self {
+            guard,
+            layout,
+            metadata,
+        })
     }
 
     /// Get the sample rate in Hz.
@@ -842,9 +855,9 @@ impl<'fs> FrameSyncAudioRef<'fs> {
         self.layout.channel_stride_in_bytes
     }
 
-    /// Get the metadata as a `CStr`, if present.
-    pub fn metadata(&self) -> Option<&CStr> {
-        unsafe { borrowed_frame_metadata_cstr(self.guard.frame().p_metadata) }
+    /// Get frame metadata as UTF-8 text, if present.
+    pub fn metadata(&self) -> Option<&str> {
+        unsafe { frame_metadata_str(self.guard.frame().p_metadata, self.metadata) }
     }
 
     /// Get a zero-copy view of the audio data as 32-bit floats.
@@ -888,7 +901,8 @@ impl<'fs> FrameSyncAudioRef<'fs> {
         if self.layout.is_empty() {
             Ok(None)
         } else {
-            AudioFrame::from_raw_validated(*self.guard.frame(), self.layout).map(Some)
+            AudioFrame::from_raw_validated(*self.guard.frame(), self.layout, self.metadata)
+                .map(Some)
         }
     }
 }
@@ -963,6 +977,7 @@ mod tests {
         let stride = width * 4;
         let expected_len = (stride * height) as usize;
         let mut data = vec![0u8; expected_len];
+        let mut metadata = b"framesync video\0".to_vec();
 
         let raw = NDIlib_video_frame_v2_t {
             xres: width,
@@ -977,19 +992,55 @@ mod tests {
             __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
                 line_stride_in_bytes: stride,
             },
-            p_metadata: ptr::null(),
+            p_metadata: metadata.as_mut_ptr().cast(),
             timestamp: 0,
         };
 
         let guard = unsafe { FrameSyncVideoGuard::new(ptr::null_mut(), raw) };
         let frame = unsafe { FrameSyncVideoRef::new(guard) }.expect("valid video frame");
 
+        assert_eq!(frame.metadata(), Some("framesync video"));
         assert_eq!(frame.data().len(), expected_len);
         assert_eq!(
             frame.line_stride_or_size(),
             LineStrideOrSize::LineStrideBytes(stride)
         );
+        let owned = frame.to_owned().expect("owned conversion");
+        assert_eq!(owned.metadata(), Some("framesync video"));
         assert!(format!("{frame:?}").contains("FrameSyncVideoRef"));
+    }
+
+    #[test]
+    fn test_framesync_video_ref_rejects_malformed_metadata() {
+        let width = 16;
+        let height = 8;
+        let stride = width * 4;
+        let expected_len = (stride * height) as usize;
+        let mut data = vec![0u8; expected_len];
+        let mut metadata = vec![b'x'; crate::frames::MAX_METADATA_BYTES];
+
+        let raw = NDIlib_video_frame_v2_t {
+            xres: width,
+            yres: height,
+            FourCC: PixelFormat::BGRA.into(),
+            frame_rate_N: 60,
+            frame_rate_D: 1,
+            picture_aspect_ratio: 16.0 / 9.0,
+            frame_format_type: ScanType::Progressive.into(),
+            timecode: 0,
+            p_data: data.as_mut_ptr(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: stride,
+            },
+            p_metadata: metadata.as_mut_ptr().cast(),
+            timestamp: 0,
+        };
+
+        let guard = unsafe { FrameSyncVideoGuard::new(ptr::null_mut(), raw) };
+        assert!(matches!(
+            unsafe { FrameSyncVideoRef::new(guard) },
+            Err(Error::InvalidFrame(_))
+        ));
     }
 
     #[test]
@@ -1037,6 +1088,7 @@ mod tests {
         let frame = unsafe { FrameSyncAudioRef::new(guard, true) }.expect("empty query frame");
 
         assert!(frame.is_empty());
+        assert_eq!(frame.metadata(), None);
         assert!(frame.data().is_empty());
         assert_eq!(frame.format(), None);
         assert!(frame.to_owned().expect("owned conversion").is_none());
@@ -1083,6 +1135,7 @@ mod tests {
         let no_channels = 2;
         let stride_samples = 6;
         let mut data = vec![0.0f32; 10];
+        let mut metadata = b"framesync audio\0".to_vec();
         data[0..4].copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
         data[6..10].copy_from_slice(&[10.0, 20.0, 30.0, 40.0]);
 
@@ -1096,13 +1149,14 @@ mod tests {
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
                 channel_stride_in_bytes: stride_samples * 4,
             },
-            p_metadata: ptr::null(),
+            p_metadata: metadata.as_mut_ptr().cast(),
             timestamp: 0,
         };
 
         let guard = unsafe { FrameSyncAudioGuard::new(ptr::null_mut(), raw) };
         let frame = unsafe { FrameSyncAudioRef::new(guard, false) }.expect("strided audio frame");
 
+        assert_eq!(frame.metadata(), Some("framesync audio"));
         assert_eq!(frame.data().len(), 10);
         assert_eq!(frame.channel_data(0), Some(&[1.0, 2.0, 3.0, 4.0][..]));
         assert_eq!(frame.channel_data(1), Some(&[10.0, 20.0, 30.0, 40.0][..]));
@@ -1112,7 +1166,36 @@ mod tests {
             .to_owned()
             .expect("owned conversion")
             .expect("samples");
+        assert_eq!(owned.metadata(), Some("framesync audio"));
         assert_eq!(owned.data().len(), 10);
         assert_eq!(owned.channel_data(1), Some(vec![10.0, 20.0, 30.0, 40.0]));
+    }
+
+    #[test]
+    fn test_framesync_audio_ref_rejects_invalid_utf8_metadata() {
+        let no_samples = 4;
+        let no_channels = 2;
+        let mut data = vec![0.0f32; (no_samples * no_channels) as usize];
+        let mut metadata = vec![0xFF, 0];
+
+        let raw = NDIlib_audio_frame_v3_t {
+            sample_rate: 48000,
+            no_channels,
+            no_samples,
+            timecode: 0,
+            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            p_data: data.as_mut_ptr() as *mut u8,
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: no_samples * 4,
+            },
+            p_metadata: metadata.as_mut_ptr().cast(),
+            timestamp: 0,
+        };
+
+        let guard = unsafe { FrameSyncAudioGuard::new(ptr::null_mut(), raw) };
+        assert!(matches!(
+            unsafe { FrameSyncAudioRef::new(guard, false) },
+            Err(Error::InvalidUtf8(_))
+        ));
     }
 }
