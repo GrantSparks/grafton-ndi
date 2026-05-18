@@ -80,9 +80,9 @@ use std::{ffi::CStr, fmt, marker::PhantomData, mem::ManuallyDrop, num::NonZeroI3
 
 use crate::{
     frames::{
-        validate_audio_layout, validate_audio_layout_allow_empty, validate_video_layout,
-        AudioFormat, AudioFrame, LineStrideOrSize, PixelFormat, ScanType, ValidatedAudioLayout,
-        ValidatedVideoLayout, VideoFrame,
+        borrowed_frame_metadata_cstr, validate_audio_layout, validate_audio_layout_allow_empty,
+        validate_video_layout, AudioFormat, AudioFrame, LineStrideOrSize, PixelFormat, ScanType,
+        ValidatedAudioLayout, ValidatedVideoLayout, VideoFrame,
     },
     ndi_lib::*,
     receiver::Receiver,
@@ -719,11 +719,7 @@ impl<'fs> FrameSyncVideoRef<'fs> {
 
     /// Get the metadata as a `CStr`, if present.
     pub fn metadata(&self) -> Option<&CStr> {
-        if self.guard.frame().p_metadata.is_null() {
-            None
-        } else {
-            Some(unsafe { CStr::from_ptr(self.guard.frame().p_metadata) })
-        }
+        unsafe { borrowed_frame_metadata_cstr(self.guard.frame().p_metadata) }
     }
 
     /// Get a zero-copy view of the frame data.
@@ -848,11 +844,7 @@ impl<'fs> FrameSyncAudioRef<'fs> {
 
     /// Get the metadata as a `CStr`, if present.
     pub fn metadata(&self) -> Option<&CStr> {
-        if self.guard.frame().p_metadata.is_null() {
-            None
-        } else {
-            Some(unsafe { CStr::from_ptr(self.guard.frame().p_metadata) })
-        }
+        unsafe { borrowed_frame_metadata_cstr(self.guard.frame().p_metadata) }
     }
 
     /// Get a zero-copy view of the audio data as 32-bit floats.

@@ -1081,8 +1081,7 @@ impl Receiver {
     /// // Zero-copy capture
     /// if let Some(frame) = receiver.capture_metadata_ref(Duration::from_secs(1))? {
     ///     // Process in place - no copy needed
-    ///     let metadata_str = frame.data().to_string_lossy();
-    ///     println!("Metadata: {}", metadata_str);
+    ///     println!("Metadata: {}", frame.data());
     /// }
     /// # Ok(())
     /// # }
@@ -1096,7 +1095,7 @@ impl Receiver {
         // SAFETY: self.instance is a valid NDI receiver instance
         match unsafe { capture_metadata_raw(self.instance, timeout_ms) } {
             CaptureResult::Frame(guard) => {
-                let frame_ref = unsafe { MetadataFrameRef::new(guard) };
+                let frame_ref = unsafe { MetadataFrameRef::new(guard)? };
                 Ok(Some(frame_ref))
             }
             CaptureResult::None => Ok(None),
@@ -1139,7 +1138,7 @@ impl Receiver {
     /// # let options = ReceiverOptions::builder(source).build();
     /// # let receiver = Receiver::new(&ndi, &options)?;
     /// let frame = receiver.capture_metadata(Duration::from_secs(5))?;
-    /// println!("Metadata: {}", frame.data);
+    /// println!("Metadata: {}", frame.data());
     /// # Ok(())
     /// # }
     /// ```

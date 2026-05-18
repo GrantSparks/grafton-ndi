@@ -138,12 +138,13 @@ fn main() -> Result<(), grafton_ndi::Error> {
                 match recv_metadata.capture_metadata_timeout(Duration::from_millis(2500)) {
                     Ok(Some(frame)) => {
                         metadata_count += 1;
-                        let data_len = frame.data.len();
-                        let preview = if frame.data.len() > 50 {
-                            let preview_data = &frame.data[..50];
+                        let data = frame.data();
+                        let data_len = data.len();
+                        let preview = if data.len() > 50 {
+                            let preview_data = &data[..50];
                             format!("{preview_data}...")
                         } else {
-                            frame.data.clone()
+                            data.to_owned()
                         };
                         println!("[METADATA] Received {data_len} bytes: {preview}");
                     }

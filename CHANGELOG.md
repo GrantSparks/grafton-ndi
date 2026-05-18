@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Breaking Changes
 
 - **Video and audio frame layout fields are now private**: `VideoFrame` and `AudioFrame` now preserve validated SDK layout invariants after construction. Use getters such as `width()`, `pixel_format()`, `sample_rate()`, `data()`, and controlled mutation methods such as `data_mut()` or `replace_data()` instead of mutating SDK-facing fields directly.
+- **Metadata frame fields are now private and validated**: `MetadataFrame` now preserves UTF-8, interior-NUL, and size invariants with `MetadataFrame::with_data(...) -> Result<_>`, `data()`, `timecode()`, `set_data(...)`, and `set_timecode(...)` instead of public field access.
 - **Unchecked public video layout helpers were removed**: `calculate_line_stride`, `PixelFormat::line_stride`, `PixelFormat::buffer_size`, and `PixelFormatInfo::buffer_len` have been replaced by checked APIs: `try_line_stride`, `try_buffer_size`, and `try_buffer_len`.
 - **Safe compressed-video construction was removed**: `BorrowedVideoFrame::try_from_compressed` is gone because the crate does not yet expose a typed compressed FourCC model. Unsupported compressed or opaque SDK layouts now require the explicit unsafe `BorrowedVideoFrame::from_parts_unchecked` escape hatch.
 - **Receiver `Max` sentinel variants were removed**: `ReceiverColorFormat` and `ReceiverBandwidth` now expose only operational receiver modes and are marked `#[non_exhaustive]`. Code that used `ReceiverColorFormat::Max` or `ReceiverBandwidth::Max` should choose an explicit mode such as `Fastest`, `Best`, `RGBX_RGBA`, `BGRX_BGRA`, `Highest`, `Lowest`, `AudioOnly`, or `MetadataOnly`.
@@ -17,12 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Send-side video and audio construction now share checked layout validation**: `VideoFrameBuilder`, `BorrowedVideoFrame::try_from_uncompressed`, receive/raw conversion, and owned-to-borrowed conversion now use one cached validation model for dimensions, stride, buffer length, metadata, and SDK union-field selection.
+- **Standalone metadata frames now use checked bounded layout validation**: `MetadataFrameRef` validates `NDIlib_metadata_frame_t::length` and `p_data` once at construction, caches the checked layout, returns zero-copy `&str`/`&[u8]` views, rejects invalid UTF-8 explicitly, and no longer scans lengthless receive-side C strings. Send-side metadata now emits an explicit length including the trailing NUL using checked conversion.
 - **Audio builder layout math is checked before allocation**: `AudioFrameBuilder` now rejects non-positive sample rate, channel count, and sample count before converting to `usize`, and uses checked arithmetic for stride, sample count, and total byte size.
 - **Examples and docs use invariant-preserving accessors**: Example programs and doctests now use getters and checked format helpers instead of public layout fields or unchecked size helpers.
 
 ### Added
 
-- **Focused frame-layout validation coverage**: Added tests for invalid borrowed video dimensions, planar layout rejection, oversized audio layouts, invalid send metadata, owned data replacement, and the unsafe raw-FourCC escape hatch.
+- **Focused frame-layout validation coverage**: Added tests for invalid borrowed video dimensions, planar layout rejection, oversized audio layouts, invalid send metadata, owned data replacement, standalone metadata layout validation, and the unsafe raw-FourCC escape hatch.
 
 ## [0.12.0] - 2026-05-18
 
