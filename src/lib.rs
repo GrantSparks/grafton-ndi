@@ -176,14 +176,13 @@ pub const MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(u3
 /// assert!(result.is_err());
 /// ```
 pub(crate) fn to_ms_checked(d: std::time::Duration) -> Result<u32> {
-    let ms = d.as_millis();
-    if ms > u32::MAX as u128 {
+    if d > MAX_TIMEOUT {
         Err(Error::InvalidConfiguration(format!(
             "timeout {:?} exceeds MAX_TIMEOUT (~49.7 days)",
             d
         )))
     } else {
-        Ok(ms as u32)
+        Ok(d.as_millis() as u32)
     }
 }
 
