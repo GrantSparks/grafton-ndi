@@ -2,6 +2,8 @@
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
+#[cfg(feature = "image-encoding")]
+use std::borrow::Cow;
 use std::{
     ffi::{CStr, CString},
     fmt,
@@ -587,21 +589,23 @@ impl VideoFrame {
     ///
     /// # Supported Formats
     ///
-    /// - `RGBA` / `RGBX`: Direct encoding (fastest)
-    /// - `BGRA` / `BGRX`: Swaps red and blue channels
+    /// - `RGBA`: Direct encoding when rows are tightly packed
+    /// - `BGRA`: Swaps red and blue channels and preserves alpha
+    /// - `RGBX`: Treats the fourth byte as padding and writes opaque alpha
+    /// - `BGRX`: Swaps red/blue and writes opaque alpha
     /// - Other formats: Returns an error (unsupported for now)
     ///
     /// # Stride Handling
     ///
-    /// This method validates that the frame's line stride matches the expected stride for
-    /// the pixel format. If the stride doesn't match (indicating row padding), an error
-    /// is returned. This prevents corrupted image output.
+    /// This method consumes active pixels row-by-row according to the frame's
+    /// validated line stride. Valid row padding is skipped.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The frame format is not RGBA/RGBX/BGRA/BGRX
-    /// - The line stride doesn't match the expected value (has padding)
+    /// - The frame uses data-size layout instead of line-stride layout
+    /// - The backing data length does not match the validated layout
     /// - PNG encoding fails
     ///
     /// # Example
@@ -628,63 +632,18 @@ impl VideoFrame {
     pub fn encode_png(&self) -> Result<Vec<u8>> {
         use png::{BitDepth, ColorType, Encoder};
 
-        // Validate format
-        let bytes_per_pixel = match self.pixel_format() {
-            PixelFormat::RGBA | PixelFormat::RGBX => 4,
-            PixelFormat::BGRA | PixelFormat::BGRX => 4,
-            _ => {
-                let pixel_format = self.pixel_format();
-                return Err(Error::InvalidFrame(format!(
-                    "Unsupported format for PNG encoding: {pixel_format:?}. Only RGBA/RGBX/BGRA/BGRX are supported."
-                )));
-            }
-        };
-
-        // Validate stride
-        let expected_stride = self.width() * bytes_per_pixel;
-        let actual_stride = match self.line_stride_or_size() {
-            LineStrideOrSize::LineStrideBytes(stride) => stride,
-            LineStrideOrSize::DataSizeBytes(_) => {
-                return Err(Error::InvalidFrame(
-                    "Cannot encode image from compressed/data-size format. Use LineStrideBytes."
-                        .into(),
-                ));
-            }
-        };
-
-        if actual_stride != expected_stride {
-            return Err(Error::InvalidFrame(format!(
-                "Line stride ({actual_stride}) doesn't match width * {bytes_per_pixel} ({expected_stride}). \
-                 Row padding is not supported for image encoding."
-            )));
-        }
-
-        // Handle color format conversion if needed
-        let rgba_data: Vec<u8> = match self.pixel_format() {
-            PixelFormat::RGBA | PixelFormat::RGBX => {
-                // Already in correct format, use as-is
-                self.data.to_vec()
-            }
-            PixelFormat::BGRA | PixelFormat::BGRX => {
-                // Swap R and B channels (BGRA -> RGBA)
-                let mut rgba = self.data.to_vec();
-                for chunk in rgba.chunks_exact_mut(4) {
-                    chunk.swap(0, 2); // Swap B and R
-                }
-                rgba
-            }
-            _ => unreachable!("Format already validated above"),
-        };
+        let image = ImagePixelSource::new(self.layout, &self.data)?;
+        let (rgba_data, width, height) = image.png_rgba_input()?;
 
         // Encode to PNG
         let mut png_data = Vec::new();
-        let mut encoder = Encoder::new(&mut png_data, self.width() as u32, self.height() as u32);
+        let mut encoder = Encoder::new(&mut png_data, width, height);
         encoder.set_color(ColorType::Rgba);
         encoder.set_depth(BitDepth::Eight);
 
         encoder
             .write_header()
-            .and_then(|mut writer| writer.write_image_data(&rgba_data))
+            .and_then(|mut writer| writer.write_image_data(rgba_data.as_ref()))
             .map_err(|e| Error::InvalidFrame(format!("PNG encoding failed: {e}")))?;
 
         Ok(png_data)
@@ -701,15 +660,18 @@ impl VideoFrame {
     ///
     /// # Supported Formats
     ///
-    /// - `RGBA` / `RGBX`: Strips alpha channel
-    /// - `BGRA` / `BGRX`: Swaps red/blue and strips alpha
+    /// - `RGBA` / `RGBX`: Emits RGB
+    /// - `BGRA` / `BGRX`: Swaps red/blue and emits RGB
     /// - Other formats: Returns an error (unsupported for now)
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The frame format is not RGBA/RGBX/BGRA/BGRX
-    /// - The line stride doesn't match the expected value (has padding)
+    /// - The frame uses data-size layout instead of line-stride layout
+    /// - The backing data length does not match the validated layout
+    /// - The quality is outside `1..=100`
+    /// - The dimensions exceed JPEG's `u16` width/height range
     /// - JPEG encoding fails
     ///
     /// # Example
@@ -736,66 +698,14 @@ impl VideoFrame {
     pub fn encode_jpeg(&self, quality: u8) -> Result<Vec<u8>> {
         use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
 
-        // Validate format
-        let bytes_per_pixel = match self.pixel_format() {
-            PixelFormat::RGBA | PixelFormat::RGBX => 4,
-            PixelFormat::BGRA | PixelFormat::BGRX => 4,
-            _ => {
-                let pixel_format = self.pixel_format();
-                return Err(Error::InvalidFrame(format!(
-                    "Unsupported format for JPEG encoding: {pixel_format:?}. Only RGBA/RGBX/BGRA/BGRX are supported."
-                )));
-            }
-        };
-
-        // Validate stride
-        let expected_stride = self.width() * bytes_per_pixel;
-        let actual_stride = match self.line_stride_or_size() {
-            LineStrideOrSize::LineStrideBytes(stride) => stride,
-            LineStrideOrSize::DataSizeBytes(_) => {
-                return Err(Error::InvalidFrame(
-                    "Cannot encode image from compressed/data-size format. Use LineStrideBytes."
-                        .into(),
-                ));
-            }
-        };
-
-        if actual_stride != expected_stride {
-            return Err(Error::InvalidFrame(format!(
-                "Line stride ({actual_stride}) doesn't match width * {bytes_per_pixel} ({expected_stride}). \
-                 Row padding is not supported for image encoding."
-            )));
-        }
-
-        // Convert to RGB (JPEG doesn't support alpha channel)
-        let rgb_data: Vec<u8> = match self.pixel_format() {
-            PixelFormat::RGBA | PixelFormat::RGBX => {
-                // Strip alpha channel: RGBA -> RGB
-                self.data
-                    .chunks_exact(4)
-                    .flat_map(|chunk| [chunk[0], chunk[1], chunk[2]])
-                    .collect()
-            }
-            PixelFormat::BGRA | PixelFormat::BGRX => {
-                // Swap R/B and strip alpha: BGRA -> RGB
-                self.data
-                    .chunks_exact(4)
-                    .flat_map(|chunk| [chunk[2], chunk[1], chunk[0]])
-                    .collect()
-            }
-            _ => unreachable!("Format already validated above"),
-        };
+        let image = ImagePixelSource::new(self.layout, &self.data)?;
+        let (rgb_data, width, height) = image.jpeg_rgb_input(quality)?;
 
         // Encode to JPEG
         let mut jpeg_data = Vec::new();
         let encoder = JpegEncoder::new(&mut jpeg_data, quality);
         encoder
-            .encode(
-                &rgb_data,
-                self.width() as u16,
-                self.height() as u16,
-                JpegColorType::Rgb,
-            )
+            .encode(&rgb_data, width, height, JpegColorType::Rgb)
             .map_err(|e| Error::InvalidFrame(format!("JPEG encoding failed: {e}")))?;
 
         Ok(jpeg_data)
@@ -1775,6 +1685,276 @@ pub enum ImageFormat {
     Png,
     /// JPEG format with quality setting (1-100, where 100 is highest quality)
     Jpeg(u8),
+}
+
+#[cfg(feature = "image-encoding")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageChannelOrder {
+    Rgba,
+    Bgra,
+}
+
+#[cfg(feature = "image-encoding")]
+impl ImageChannelOrder {
+    fn red_index(self) -> usize {
+        match self {
+            Self::Rgba => 0,
+            Self::Bgra => 2,
+        }
+    }
+
+    fn blue_index(self) -> usize {
+        match self {
+            Self::Rgba => 2,
+            Self::Bgra => 0,
+        }
+    }
+}
+
+#[cfg(feature = "image-encoding")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageAlphaPolicy {
+    Preserve,
+    Opaque,
+}
+
+#[cfg(feature = "image-encoding")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ImagePixelFormat {
+    channel_order: ImageChannelOrder,
+    alpha_policy: ImageAlphaPolicy,
+}
+
+#[cfg(feature = "image-encoding")]
+impl ImagePixelFormat {
+    const BYTES_PER_PIXEL: usize = 4;
+
+    fn from_pixel_format(pixel_format: PixelFormat) -> Result<Self> {
+        match pixel_format {
+            PixelFormat::RGBA => Ok(Self {
+                channel_order: ImageChannelOrder::Rgba,
+                alpha_policy: ImageAlphaPolicy::Preserve,
+            }),
+            PixelFormat::BGRA => Ok(Self {
+                channel_order: ImageChannelOrder::Bgra,
+                alpha_policy: ImageAlphaPolicy::Preserve,
+            }),
+            PixelFormat::RGBX => Ok(Self {
+                channel_order: ImageChannelOrder::Rgba,
+                alpha_policy: ImageAlphaPolicy::Opaque,
+            }),
+            PixelFormat::BGRX => Ok(Self {
+                channel_order: ImageChannelOrder::Bgra,
+                alpha_policy: ImageAlphaPolicy::Opaque,
+            }),
+            _ => Err(Error::InvalidFrame(format!(
+                "Unsupported format for image encoding: {pixel_format:?}. Only RGBA/RGBX/BGRA/BGRX are supported."
+            ))),
+        }
+    }
+
+    fn can_borrow_tightly_packed_png(self) -> bool {
+        self.channel_order == ImageChannelOrder::Rgba
+            && self.alpha_policy == ImageAlphaPolicy::Preserve
+    }
+
+    fn rgba_pixel(self, pixel: &[u8]) -> [u8; 4] {
+        [
+            pixel[self.channel_order.red_index()],
+            pixel[1],
+            pixel[self.channel_order.blue_index()],
+            match self.alpha_policy {
+                ImageAlphaPolicy::Preserve => pixel[3],
+                ImageAlphaPolicy::Opaque => 255,
+            },
+        ]
+    }
+
+    fn rgb_pixel(self, pixel: &[u8]) -> [u8; 3] {
+        [
+            pixel[self.channel_order.red_index()],
+            pixel[1],
+            pixel[self.channel_order.blue_index()],
+        ]
+    }
+}
+
+#[cfg(feature = "image-encoding")]
+#[derive(Debug)]
+struct ImagePixelSource<'a> {
+    data: &'a [u8],
+    width: usize,
+    height: usize,
+    line_stride: usize,
+    active_row_bytes: usize,
+    pixel_format: ImagePixelFormat,
+}
+
+#[cfg(feature = "image-encoding")]
+impl<'a> ImagePixelSource<'a> {
+    fn new(layout: ValidatedVideoLayout, data: &'a [u8]) -> Result<Self> {
+        let pixel_format = ImagePixelFormat::from_pixel_format(layout.pixel_format)?;
+
+        if data.len() != layout.data_len_bytes {
+            return Err(Error::InvalidFrame(format!(
+                "Video data length {}, expected {} bytes for validated layout",
+                data.len(),
+                layout.data_len_bytes
+            )));
+        }
+
+        let line_stride = match layout.line_stride_or_size {
+            LineStrideOrSize::LineStrideBytes(stride) => {
+                if stride <= 0 {
+                    return Err(Error::InvalidFrame(format!(
+                        "Image line stride must be positive, got {stride}"
+                    )));
+                }
+
+                usize::try_from(stride).map_err(|_| {
+                    Error::InvalidFrame(format!("Invalid image line stride value: {stride}"))
+                })?
+            }
+            LineStrideOrSize::DataSizeBytes(size) => {
+                return Err(Error::InvalidFrame(format!(
+                    "Cannot encode image from data-size frame ({size} bytes). Image encoding requires line_stride_in_bytes."
+                )));
+            }
+        };
+
+        let width = usize::try_from(layout.width)
+            .map_err(|_| Error::InvalidFrame(format!("Invalid image width: {}", layout.width)))?;
+        let height = usize::try_from(layout.height)
+            .map_err(|_| Error::InvalidFrame(format!("Invalid image height: {}", layout.height)))?;
+
+        if width == 0 || height == 0 {
+            return Err(Error::InvalidFrame(format!(
+                "Image dimensions must be positive, got {}x{}",
+                layout.width, layout.height
+            )));
+        }
+
+        let active_row_bytes = width
+            .checked_mul(ImagePixelFormat::BYTES_PER_PIXEL)
+            .ok_or_else(|| {
+                Error::InvalidFrame(format!(
+                    "Image row size overflow for width {} and {} bytes per pixel",
+                    width,
+                    ImagePixelFormat::BYTES_PER_PIXEL
+                ))
+            })?;
+
+        if line_stride < active_row_bytes {
+            return Err(Error::InvalidFrame(format!(
+                "Image line stride {line_stride} is smaller than active row size {active_row_bytes}"
+            )));
+        }
+
+        let expected_data_len = line_stride.checked_mul(height).ok_or_else(|| {
+            Error::InvalidFrame(format!(
+                "Image data length overflow: {line_stride} stride x {height} height"
+            ))
+        })?;
+
+        if expected_data_len != layout.data_len_bytes {
+            return Err(Error::InvalidFrame(format!(
+                "Image layout data length {} does not match line stride x height ({expected_data_len})",
+                layout.data_len_bytes
+            )));
+        }
+
+        Ok(Self {
+            data,
+            width,
+            height,
+            line_stride,
+            active_row_bytes,
+            pixel_format,
+        })
+    }
+
+    fn png_rgba_input(&self) -> Result<(Cow<'a, [u8]>, u32, u32)> {
+        let width = u32::try_from(self.width).map_err(|_| {
+            Error::InvalidFrame(format!("PNG width {} exceeds u32 range", self.width))
+        })?;
+        let height = u32::try_from(self.height).map_err(|_| {
+            Error::InvalidFrame(format!("PNG height {} exceeds u32 range", self.height))
+        })?;
+
+        if self.pixel_format.can_borrow_tightly_packed_png()
+            && self.line_stride == self.active_row_bytes
+        {
+            return Ok((Cow::Borrowed(self.data), width, height));
+        }
+
+        let mut rgba = Vec::with_capacity(self.output_len(4)?);
+
+        if self.pixel_format.can_borrow_tightly_packed_png() {
+            for row in self.active_rows() {
+                rgba.extend_from_slice(row);
+            }
+        } else {
+            for row in self.active_rows() {
+                for pixel in row.chunks_exact(ImagePixelFormat::BYTES_PER_PIXEL) {
+                    rgba.extend_from_slice(&self.pixel_format.rgba_pixel(pixel));
+                }
+            }
+        }
+
+        Ok((Cow::Owned(rgba), width, height))
+    }
+
+    fn jpeg_rgb_input(&self, quality: u8) -> Result<(Vec<u8>, u16, u16)> {
+        if !(1..=100).contains(&quality) {
+            return Err(Error::InvalidFrame(format!(
+                "JPEG quality must be in 1..=100, got {quality}"
+            )));
+        }
+
+        let width = u16::try_from(self.width).map_err(|_| {
+            Error::InvalidFrame(format!(
+                "JPEG width {} exceeds maximum supported value {}",
+                self.width,
+                u16::MAX
+            ))
+        })?;
+        let height = u16::try_from(self.height).map_err(|_| {
+            Error::InvalidFrame(format!(
+                "JPEG height {} exceeds maximum supported value {}",
+                self.height,
+                u16::MAX
+            ))
+        })?;
+
+        let mut rgb = Vec::with_capacity(self.output_len(3)?);
+        for row in self.active_rows() {
+            for pixel in row.chunks_exact(ImagePixelFormat::BYTES_PER_PIXEL) {
+                rgb.extend_from_slice(&self.pixel_format.rgb_pixel(pixel));
+            }
+        }
+
+        Ok((rgb, width, height))
+    }
+
+    fn output_len(&self, channels: usize) -> Result<usize> {
+        self.width
+            .checked_mul(self.height)
+            .and_then(|pixels| pixels.checked_mul(channels))
+            .ok_or_else(|| {
+                Error::InvalidFrame(format!(
+                    "Image output buffer size overflow: {}x{}x{}",
+                    self.width, self.height, channels
+                ))
+            })
+    }
+
+    fn active_rows(&self) -> impl Iterator<Item = &'a [u8]> + '_ {
+        (0..self.height).map(move |row| {
+            let start = row * self.line_stride;
+            let end = start + self.active_row_bytes;
+            &self.data[start..end]
+        })
+    }
 }
 
 // ============================================================================
@@ -2896,6 +3076,238 @@ impl<'rx> fmt::Debug for MetadataFrameRef<'rx> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "image-encoding")]
+    fn image_test_frame(
+        pixel_format: PixelFormat,
+        width: i32,
+        height: i32,
+        line_stride: Option<i32>,
+        data: Vec<u8>,
+    ) -> VideoFrame {
+        let layout =
+            ValidatedVideoLayout::new_uncompressed(pixel_format, width, height, line_stride)
+                .unwrap();
+        assert_eq!(data.len(), layout.data_len_bytes);
+
+        VideoFrame {
+            layout,
+            frame_rate_n: 60,
+            frame_rate_d: 1,
+            picture_aspect_ratio: 16.0 / 9.0,
+            scan_type: ScanType::Progressive,
+            timecode: 0,
+            data,
+            metadata: None,
+            timestamp: 0,
+        }
+    }
+
+    #[cfg(feature = "image-encoding")]
+    fn decode_png_rgba(png_bytes: &[u8]) -> (u32, u32, Vec<u8>) {
+        let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+        let mut reader = decoder.read_info().unwrap();
+        let output_size = reader.output_buffer_size().unwrap();
+        let mut output = vec![0; output_size];
+        let info = reader.next_frame(&mut output).unwrap();
+        output.truncate(info.buffer_size());
+
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+        assert_eq!(info.bit_depth, png::BitDepth::Eight);
+
+        (info.width, info.height, output)
+    }
+
+    #[cfg(feature = "image-encoding")]
+    fn assert_jpeg_markers(jpeg_bytes: &[u8]) {
+        assert!(jpeg_bytes.len() >= 4);
+        assert_eq!(&jpeg_bytes[..2], &[0xFF, 0xD8]);
+        assert_eq!(&jpeg_bytes[jpeg_bytes.len() - 2..], &[0xFF, 0xD9]);
+    }
+
+    #[cfg(feature = "image-encoding")]
+    #[test]
+    fn test_encode_png_decodes_exact_supported_pixels() {
+        let cases = [
+            (
+                PixelFormat::RGBA,
+                vec![10, 20, 30, 40, 50, 60, 70, 80],
+                vec![10, 20, 30, 40, 50, 60, 70, 80],
+            ),
+            (
+                PixelFormat::BGRA,
+                vec![30, 20, 10, 40, 70, 60, 50, 80],
+                vec![10, 20, 30, 40, 50, 60, 70, 80],
+            ),
+            (
+                PixelFormat::RGBX,
+                vec![10, 20, 30, 0, 50, 60, 70, 99],
+                vec![10, 20, 30, 255, 50, 60, 70, 255],
+            ),
+            (
+                PixelFormat::BGRX,
+                vec![30, 20, 10, 0, 70, 60, 50, 99],
+                vec![10, 20, 30, 255, 50, 60, 70, 255],
+            ),
+        ];
+
+        for (pixel_format, data, expected) in cases {
+            let frame = image_test_frame(pixel_format, 2, 1, None, data);
+            let png = frame.encode_png().unwrap();
+            let (width, height, decoded) = decode_png_rgba(&png);
+
+            assert_eq!((width, height), (2, 1), "{pixel_format:?}");
+            assert_eq!(decoded, expected, "{pixel_format:?}");
+        }
+    }
+
+    #[cfg(feature = "image-encoding")]
+    #[test]
+    fn test_encode_png_skips_padded_rows() {
+        let data = vec![
+            1, 2, 3, 0, 4, 5, 6, 0, 200, 201, 202, 203, 7, 8, 9, 0, 10, 11, 12, 0, 204, 205, 206,
+            207,
+        ];
+        let frame = image_test_frame(PixelFormat::RGBX, 2, 2, Some(12), data);
+
+        let png = frame.encode_png().unwrap();
+        let (width, height, decoded) = decode_png_rgba(&png);
+
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(
+            decoded,
+            vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255,]
+        );
+    }
+
+    #[cfg(feature = "image-encoding")]
+    #[test]
+    fn test_encode_jpeg_accepts_supported_image_formats() {
+        let cases = [
+            (PixelFormat::RGBA, vec![10, 20, 30, 40]),
+            (PixelFormat::BGRA, vec![30, 20, 10, 40]),
+            (PixelFormat::RGBX, vec![10, 20, 30, 0]),
+            (PixelFormat::BGRX, vec![30, 20, 10, 0]),
+        ];
+
+        for (pixel_format, pixel) in cases {
+            let data = pixel.repeat(16);
+            let frame = image_test_frame(pixel_format, 4, 4, None, data);
+            let jpeg = frame.encode_jpeg(90).unwrap();
+            assert_jpeg_markers(&jpeg);
+        }
+    }
+
+    #[cfg(feature = "image-encoding")]
+    #[test]
+    fn test_encode_jpeg_skips_padded_rows() {
+        let data = vec![
+            3, 2, 1, 0, 6, 5, 4, 0, 250, 251, 252, 253, 9, 8, 7, 0, 12, 11, 10, 0, 254, 255, 0, 1,
+        ];
+        let frame = image_test_frame(PixelFormat::BGRX, 2, 2, Some(12), data);
+
+        let jpeg = frame.encode_jpeg(85).unwrap();
+        assert_jpeg_markers(&jpeg);
+    }
+
+    #[cfg(feature = "image-encoding")]
+    #[test]
+    fn test_encode_jpeg_rejects_invalid_quality() {
+        let frame = image_test_frame(PixelFormat::RGBA, 2, 2, None, vec![0; 16]);
+
+        for quality in [0, 101, 255] {
+            let err = frame.encode_jpeg(quality).unwrap_err();
+            let err_msg = err.to_string();
+            assert!(
+                matches!(&err, Error::InvalidFrame(message) if message.contains("quality")),
+                "unexpected error for quality {quality}: {err_msg}"
+            );
+        }
+    }
+
+    #[cfg(feature = "image-encoding")]
+    #[test]
+    fn test_encode_jpeg_rejects_oversized_dimensions_before_casting() {
+        let wide = image_test_frame(PixelFormat::RGBA, 65_536, 1, None, vec![0; 65_536 * 4]);
+        let err = wide.encode_jpeg(85).unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            matches!(&err, Error::InvalidFrame(message) if message.contains("JPEG width")),
+            "unexpected error: {err_msg}"
+        );
+
+        let tall = image_test_frame(PixelFormat::RGBA, 1, 65_536, None, vec![0; 65_536 * 4]);
+        let err = tall.encode_jpeg(85).unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            matches!(&err, Error::InvalidFrame(message) if message.contains("JPEG height")),
+            "unexpected error: {err_msg}"
+        );
+    }
+
+    #[cfg(feature = "image-encoding")]
+    #[test]
+    fn test_encode_jpeg_rejects_unsupported_format() {
+        let frame = image_test_frame(PixelFormat::UYVY, 2, 2, None, vec![0; 8]);
+
+        let err = frame.encode_jpeg(85).unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            matches!(&err, Error::InvalidFrame(message) if message.contains("Unsupported format")),
+            "unexpected error: {err_msg}"
+        );
+    }
+
+    #[cfg(feature = "image-encoding")]
+    #[test]
+    fn test_png_input_borrows_only_tightly_packed_rgba() {
+        let rgba = image_test_frame(PixelFormat::RGBA, 2, 1, None, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let source = ImagePixelSource::new(rgba.layout, rgba.data()).unwrap();
+        let (pixels, _, _) = source.png_rgba_input().unwrap();
+        assert!(matches!(pixels, Cow::Borrowed(_)));
+
+        let padded_rgba = image_test_frame(
+            PixelFormat::RGBA,
+            2,
+            1,
+            Some(12),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 200, 201, 202, 203],
+        );
+        let source = ImagePixelSource::new(padded_rgba.layout, padded_rgba.data()).unwrap();
+        let (pixels, _, _) = source.png_rgba_input().unwrap();
+        assert!(matches!(pixels, Cow::Owned(_)));
+
+        let rgbx = image_test_frame(PixelFormat::RGBX, 2, 1, None, vec![1, 2, 3, 0, 5, 6, 7, 0]);
+        let source = ImagePixelSource::new(rgbx.layout, rgbx.data()).unwrap();
+        let (pixels, _, _) = source.png_rgba_input().unwrap();
+        assert!(matches!(pixels, Cow::Owned(_)));
+    }
+
+    #[cfg(feature = "image-encoding")]
+    #[test]
+    fn test_image_pixel_source_rejects_data_size_layout_and_bad_data_len() {
+        let data_size_layout = ValidatedVideoLayout {
+            width: 2,
+            height: 1,
+            pixel_format: PixelFormat::RGBA,
+            data_len_bytes: 8,
+            line_stride_or_size: LineStrideOrSize::DataSizeBytes(8),
+        };
+        let err = ImagePixelSource::new(data_size_layout, &[0; 8]).unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            matches!(&err, Error::InvalidFrame(message) if message.contains("data-size frame")),
+            "unexpected error: {err_msg}"
+        );
+
+        let layout = ValidatedVideoLayout::new_uncompressed(PixelFormat::RGBA, 2, 1, None).unwrap();
+        let err = ImagePixelSource::new(layout, &[0; 7]).unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            matches!(&err, Error::InvalidFrame(message) if message.contains("Video data length")),
+            "unexpected error: {err_msg}"
+        );
+    }
 
     /// Test PixelFormatInfo for packed RGB formats (32 bpp)
     #[test]

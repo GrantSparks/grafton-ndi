@@ -21,10 +21,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Standalone metadata frames now use checked bounded layout validation**: `MetadataFrameRef` validates `NDIlib_metadata_frame_t::length` and `p_data` once at construction, caches the checked layout, returns zero-copy `&str`/`&[u8]` views, rejects invalid UTF-8 explicitly, and no longer scans lengthless receive-side C strings. Send-side metadata now emits an explicit length including the trailing NUL using checked conversion.
 - **Audio builder layout math is checked before allocation**: `AudioFrameBuilder` now rejects non-positive sample rate, channel count, and sample count before converting to `usize`, and uses checked arithmetic for stride, sample count, and total byte size.
 - **Examples and docs use invariant-preserving accessors**: Example programs and doctests now use getters and checked format helpers instead of public layout fields or unchecked size helpers.
+- **Image encoding is now enabled by default**: PNG/JPEG/data URL helpers are included in the default feature set because they are mature crate capabilities. Size-sensitive users can still opt out with `default-features = false`; codec dependencies remain scoped to the `image-encoding` feature.
+- **PNG and JPEG encoding share one image conversion path**: Image encoders now use a private row-stride-aware conversion helper, and the PNG receive example delegates to `VideoFrame::encode_png()` instead of duplicating pixel-format policy.
+- **Removed unused image build dependency**: Removed the unconditional `lodepng` build dependency so minimal builds do not compile an unused codec crate.
 
 ### Added
 
 - **Focused frame-layout validation coverage**: Added tests for invalid borrowed video dimensions, planar layout rejection, oversized audio layouts, invalid send metadata, owned data replacement, standalone metadata layout validation, and the unsafe raw-FourCC escape hatch.
+- **Exact image encoding coverage**: Added feature-gated tests that decode PNG output for exact RGBA pixels, cover RGBX/BGRX opaque alpha behavior, padded rows, JPEG quality validation, and oversized JPEG dimensions.
+
+### Fixed
+
+- **RGBX/BGRX PNG output now treats X bytes as padding**: PNG snapshots from padding formats now force alpha to 255 instead of exposing padding bytes as alpha, while RGBA/BGRA preserve real alpha.
+- **Image encoding accepts valid padded rows**: PNG and JPEG encoding now consume only active pixels from each line according to the validated line stride instead of rejecting valid row padding.
 
 ## [0.12.0] - 2026-05-18
 

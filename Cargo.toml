@@ -18,12 +18,12 @@ exclude = ["target/", ".gitignore", ".github/", "NDI_6_SDK.zip", "docs/"]
 [dependencies]
 num_enum = "0.7.6"
 once_cell = "1.21"
-png = "0.18"
 thiserror = "2.0.18"
 
 # Optional dependencies for image-encoding feature
 base64 = { version = "0.22", optional = true }
 jpeg-encoder = { version = "0.7", optional = true }
+png = { version = "0.18", optional = true }
 
 # Optional dependencies for async runtime integration
 tokio = { version = "1.52", optional = true, features = ["rt", "rt-multi-thread", "sync", "macros"] }
@@ -31,16 +31,15 @@ async-std = { version = "1.13", optional = true, features = ["attributes"] }
 
 [build-dependencies]
 bindgen = "0.72.1"
-lodepng = "3.12.2"
 
 [features]
-default = []
+default = ["image-encoding"]
 # Enable NDI Advanced SDK features (requires NDI Advanced SDK)
 # This includes async video completion callbacks and other advanced functionality
 advanced_sdk = []
-# Enable image encoding support (PNG, JPEG, data URLs)
-# Adds dependencies: base64, jpeg-encoder
-image-encoding = ["dep:base64", "dep:jpeg-encoder"]
+# Enable image encoding support (PNG, JPEG, data URLs).
+# Enabled by default. Use `default-features = false` for a minimal build.
+image-encoding = ["dep:base64", "dep:jpeg-encoder", "dep:png"]
 # Enable async runtime integration for Tokio
 # Adds dependency: tokio
 tokio = ["dep:tokio"]
@@ -50,3 +49,7 @@ async-std = ["dep:async-std"]
 
 [dev-dependencies]
 ctrlc = "3.5"
+
+[[example]]
+name = "NDIlib_Recv_PNG"
+required-features = ["image-encoding"]
