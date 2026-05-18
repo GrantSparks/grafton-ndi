@@ -5,7 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.12.0] - 2026-05-18
+
+### Overview
+
+Version 0.12.0 hardens `FrameSync` zero-copy validation, fixes async sender flushing, refreshes CI and publishing, and updates Cargo dependencies to the current registry versions. This is a minor-version pre-1.0 release, which Cargo treats as a breaking compatibility boundary, because the `FrameSync` API changed and the MSRV increased.
+
+### Breaking Changes
+
+- **FrameSync capture methods now return validation errors**: `FrameSync::capture_video()` now returns `Result<Option<FrameSyncVideoRef>>`, `capture_video_owned()` now returns `Result<Option<VideoFrame>>`, `capture_audio()` takes `FrameSyncAudioRequest` and returns `Result<FrameSyncAudioRef>`, and `capture_audio_owned()` returns `Result<Option<AudioFrame>>` for query/no-source states without sample buffers.
+- **MSRV increased to Rust 1.87**: The crate now requires Rust 1.87 or later so the release can use the current dependency set, including `jpeg-encoder` 0.7.
 
 ### Added
 
@@ -20,10 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking FrameSync API cleanup**: `FrameSync::capture_video()` now returns `Result<Option<FrameSyncVideoRef>>`, `capture_video_owned()` now returns `Result<Option<VideoFrame>>`, `capture_audio()` takes `FrameSyncAudioRequest` and returns `Result<FrameSyncAudioRef>`, and `capture_audio_owned()` returns `Result<Option<AudioFrame>>` for query/no-source states without sample buffers.
 - **FrameSync audio exposes validated empty/query state**: `FrameSyncAudioRef::is_empty()` identifies the documented zero-length query/no-source state, and `data()`/channel accessors use cached validated stride information.
 - **GitHub Actions are Node 24-ready**: Updated GitHub-maintained checkout/cache actions to Node 24-compatible major versions ahead of GitHub's Node 20 runner deprecation.
 - **CI matrix failures are no longer hidden by fail-fast cancellation**: Rust test/lint and semver matrices now keep running after one platform fails, making platform-specific SDK setup failures visible.
+- **Cargo dependencies are current**: Updated root requirements and the lockfile to the latest available crates.io versions, including `num_enum` 0.7.6, `once_cell` 1.21, `thiserror` 2.0.18, `jpeg-encoder` 0.7, `tokio` 1.52, and `lodepng` 3.12.2.
 
 ## [0.11.0] - 2026-02-15
 
@@ -233,30 +242,24 @@ match completion.try_wait_timeout(Duration::from_secs(5), "operation") {
 New `FrameSync` type wraps the NDI FrameSync API, transforming push-based NDI streams into pull-based capture with automatic time-base correction and dynamic audio resampling.
 
 ```rust
-use grafton_ndi::{FrameSync, FrameSyncAudioRequest, ScanType};
-use std::num::NonZeroI32;
+use grafton_ndi::{FrameSync, ScanType};
 
-let frame_sync = FrameSync::new(receiver)?;
+let frame_sync = FrameSync::new(&receiver)?;
 
 // Capture clock-corrected video (returns immediately)
-if let Some(video) = frame_sync.capture_video(ScanType::Progressive)? {
+if let Some(video) = frame_sync.capture_video(ScanType::Progressive) {
     println!("{}x{}", video.width(), video.height());
 }
 
 // Capture resampled audio at requested rate/channels/samples
-let audio = frame_sync.capture_audio(FrameSyncAudioRequest::Capture {
-    sample_rate: Some(NonZeroI32::new(48_000).unwrap()),
-    channels: Some(NonZeroI32::new(2).unwrap()),
-    samples: NonZeroI32::new(1_024).unwrap(),
-})?;
+let audio = frame_sync.capture_audio(48000, 2, 1024);
 
 // Check queue depth
 let depth = frame_sync.audio_queue_depth();
 ```
 
 **New Types:**
-- `FrameSync` - Frame synchronizer that owns its receiver
-- `FrameSyncAudioRequest` - Explicit audio capture/query request
+- `FrameSync<'rx>` - Frame synchronizer tied to receiver lifetime
 - `FrameSyncVideoRef<'fs>` - Zero-copy borrowed video with RAII cleanup
 - `FrameSyncAudioRef<'fs>` - Zero-copy borrowed audio with RAII cleanup
 

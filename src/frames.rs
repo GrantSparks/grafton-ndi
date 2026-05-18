@@ -1635,7 +1635,7 @@ fn calculate_buffer_len_checked(
     match info.category() {
         FormatCategory::Packed => Ok(y_size),
         FormatCategory::Planar420 => {
-            if height % 2 != 0 || y_stride % 2 != 0 {
+            if !height.is_multiple_of(2) || !y_stride.is_multiple_of(2) {
                 return Err(Error::InvalidFrame(
                     "Planar 4:2:0 video frames require even height and stride".into(),
                 ));
@@ -1661,7 +1661,7 @@ fn calculate_buffer_len_checked(
             Ok(total)
         }
         FormatCategory::SemiPlanar420 => {
-            if height % 2 != 0 {
+            if !height.is_multiple_of(2) {
                 return Err(Error::InvalidFrame(
                     "Semi-planar 4:2:0 video frames require even height".into(),
                 ));
@@ -2407,7 +2407,7 @@ impl<'rx> MetadataFrameRef<'rx> {
         let p_data = self.guard.frame().p_data;
         if p_data.is_null() {
             // Return empty CStr for null pointer
-            unsafe { CStr::from_bytes_with_nul_unchecked(b"\0") }
+            c""
         } else {
             unsafe { CStr::from_ptr(p_data) }
         }

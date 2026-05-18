@@ -1,8 +1,8 @@
 [package]
 name = "grafton-ndi"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.87"
 build = "build.rs"
 authors = ["Grant Sparks <grant@grafton.ai>"]
 description = "High-performance Rust bindings for the NDI® 6 SDK - real-time IP video streaming"
@@ -16,22 +16,22 @@ readme = "README.md"
 exclude = ["target/", ".gitignore", ".github/", "NDI_6_SDK.zip", "docs/"]
 
 [dependencies]
-num_enum = "0.7.5"
-once_cell = "1.20"
+num_enum = "0.7.6"
+once_cell = "1.21"
 png = "0.18"
-thiserror = "2.0.17"
+thiserror = "2.0.18"
 
 # Optional dependencies for image-encoding feature
 base64 = { version = "0.22", optional = true }
-jpeg-encoder = { version = "0.6", optional = true }
+jpeg-encoder = { version = "0.7", optional = true }
 
 # Optional dependencies for async runtime integration
-tokio = { version = "1.42", optional = true, features = ["rt", "rt-multi-thread", "sync", "macros"] }
+tokio = { version = "1.52", optional = true, features = ["rt", "rt-multi-thread", "sync", "macros"] }
 async-std = { version = "1.13", optional = true, features = ["attributes"] }
 
 [build-dependencies]
 bindgen = "0.72.1"
-lodepng = "3.12.1"
+lodepng = "3.12.2"
 
 [features]
 default = []

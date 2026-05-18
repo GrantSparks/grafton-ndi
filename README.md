@@ -4,7 +4,7 @@
 [![Documentation](https://docs.rs/grafton-ndi/badge.svg)](https://docs.rs/grafton-ndi)
 [![CI](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml/badge.svg)](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml)
 [![License](https://img.shields.io/crates/l/grafton-ndi.svg)](https://github.com/GrantSparks/grafton-ndi/blob/main/LICENSE)
-[![Minimum Rust Version](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
+[![Minimum Rust Version](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](https://www.rust-lang.org)
 
 High-performance, idiomatic Rust bindings for the [NDI® 6 SDK](https://ndi.video/), enabling real-time, low-latency IP video streaming. Built for production use with zero-copy performance and comprehensive async support.
 
@@ -55,17 +55,17 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-grafton-ndi = "0.11"
+grafton-ndi = "0.12"
 
 # For NDI Advanced SDK features (optional)
-# grafton-ndi = { version = "0.11", features = ["advanced_sdk"] }
+# grafton-ndi = { version = "0.12", features = ["advanced_sdk"] }
 
 # For image encoding support (PNG/JPEG)
-# grafton-ndi = { version = "0.11", features = ["image-encoding"] }
+# grafton-ndi = { version = "0.12", features = ["image-encoding"] }
 
 # For async runtime integration
-# grafton-ndi = { version = "0.11", features = ["tokio"] }
-# grafton-ndi = { version = "0.11", features = ["async-std"] }
+# grafton-ndi = { version = "0.12", features = ["tokio"] }
+# grafton-ndi = { version = "0.12", features = ["async-std"] }
 ```
 
 ### Prerequisites
@@ -75,7 +75,7 @@ grafton-ndi = "0.11"
    - Linux: Extract to `/usr/share/NDI SDK for Linux` or set `NDI_SDK_DIR`
    - macOS: Installs to `/Library/NDI SDK for Apple` by default
 
-2. **Rust**: Requires Rust 1.75 or later
+2. **Rust**: Requires Rust 1.87 or later
 
 3. **Build Dependencies**:
    - Windows: Visual Studio 2019+ or Build Tools, LLVM/Clang for bindgen
