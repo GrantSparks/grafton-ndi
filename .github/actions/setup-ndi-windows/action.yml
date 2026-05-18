@@ -12,11 +12,14 @@ runs:
     - name: Generate cache key
       id: cache-key
       run: |
-        # Expected SHA256 hash of NDI SDK installer
-        $expected = '97E8993C6B94213A950E6ACBE9AA4D35831D137324D762F7C74851D3FEEF80D9'
-        $ndiHash = $expected.Substring(0, 8)  # Use first 8 chars for cache key
+        # Accepted SHA256 hashes of NDI SDK installers for Windows.
+        # downloads.ndi.tv can rotate the installer payload for the same URL, so
+        # keep the current hash first for cache keys and retain prior known-good
+        # hashes as an allowlist.
+        $primary = '97E8993C6B94213A950E6ACBE9AA4D35831D137324D762F7C74851D3FEEF80D9'
+        $ndiHash = $primary.Substring(0, 8)  # Use first 8 chars for cache key
         echo "key=deps-v2-$ndiHash-${{ env.LLVM_VERSION }}-${{ runner.os }}" >> $env:GITHUB_OUTPUT
-        echo "expected_hash=$expected" >> $env:GITHUB_OUTPUT
+        echo "accepted_hashes=$primary" >> $env:GITHUB_OUTPUT
       shell: pwsh
 
     # Restore cache if available
@@ -46,25 +49,25 @@ runs:
       run: |
         $NDI_SDK_DIR = "${{ runner.temp }}\ndi-sdk"
         $NDI_SDK_INSTALLER = "${{ runner.temp }}\NDI_SDK_Installer.exe"
-        
+
         Write-Host "Downloading NDI SDK..."
         curl -L -o "$NDI_SDK_INSTALLER" "${{ env.NDI_SDK_URL }}"
-        
+
         # Verify SHA256 hash
         Write-Host "Verifying NDI SDK integrity..."
-        $expected = '${{ steps.cache-key.outputs.expected_hash }}'
+        $accepted = '${{ steps.cache-key.outputs.accepted_hashes }}' -split ',' | ForEach-Object { $_.Trim().ToUpperInvariant() } | Where-Object { $_ }
         $actual = (Get-FileHash "$NDI_SDK_INSTALLER" -Algorithm SHA256).Hash
-        if ($actual -ne $expected) {
-          Write-Error "NDI SDK hash mismatch! Expected: $expected, Got: $actual"
+        if ($accepted -notcontains $actual) {
+          Write-Error "NDI SDK hash mismatch! Got: $actual. Accepted: $($accepted -join ', ')"
           exit 1
         }
-        Write-Host "✓ NDI SDK hash verified"
-        
+        Write-Host "✓ NDI SDK hash verified: $actual"
+
         Write-Host "Installing NDI SDK to: $NDI_SDK_DIR"
         $proc = Start-Process -FilePath "$NDI_SDK_INSTALLER" `
           -ArgumentList "/VERYSILENT", "/SP-", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL", "/DIR=$NDI_SDK_DIR", "/LOG=$env:TEMP\ndi_install.log" `
           -PassThru
-        
+
         # Wait up to 5 minutes for installation
         if (!$proc.WaitForExit(300000)) {
           $proc | Stop-Process -Force
@@ -78,9 +81,9 @@ runs:
           Write-Error "NDI installer failed with code $($proc.ExitCode)"
           exit 1
         }
-        
+
         Remove-Item "$NDI_SDK_INSTALLER" -ErrorAction SilentlyContinue
-        
+
         # Verify installation
         if (Test-Path "$NDI_SDK_DIR\include\Processing.NDI.Lib.h") {
           Write-Host "✓ NDI SDK installed successfully"

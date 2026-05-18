@@ -12,12 +12,18 @@ runs:
     - name: Generate cache key
       id: cache-key
       run: |
-        # Expected SHA256 hash of NDI SDK installer for macOS
-        expected='6A14EBC569310411DA34AE5570A3E8243951DCD4B9C33BACF390990D68560A17'
-        ndiHash=$(echo $expected | cut -c1-8)  # Use first 8 chars for cache key
-        # Bump cache version to invalidate old empty cache
-        echo "key=deps-v3-${ndiHash}-${{ runner.os }}" >> $GITHUB_OUTPUT
-        echo "expected_hash=$expected" >> $GITHUB_OUTPUT
+        # Accepted SHA256 hashes of NDI SDK installers for macOS.
+        # downloads.ndi.tv can rotate the installer payload for the same URL, so
+        # keep the current hash first for cache keys and retain prior known-good
+        # hashes as an allowlist.
+        primary='5AA101A01B00494724C60B7E1E15B5D1743BF9C68B61739C22AC54932DDE95FB'
+        previous='6A14EBC569310411DA34AE5570A3E8243951DCD4B9C33BACF390990D68560A17'
+        ndiHash=$(echo $primary | cut -c1-8)  # Use first 8 chars for cache key
+        echo "key=deps-v4-${ndiHash}-${{ runner.os }}" >> $GITHUB_OUTPUT
+        echo "accepted_hashes<<EOF" >> $GITHUB_OUTPUT
+        echo "$primary" >> $GITHUB_OUTPUT
+        echo "$previous" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
       shell: bash
 
     # Restore cache if available
@@ -30,12 +36,12 @@ runs:
         key: ${{ steps.cache-key.outputs.key }}
 
     # Install NDI SDK if not cached or not found
-    - name: Download and Install NDI SDK  
+    - name: Download and Install NDI SDK
       if: steps.cache-restore.outputs.cache-hit != 'true'
       run: |
         NDI_SDK_DIR="${{ runner.temp }}/ndi-sdk"
         NDI_SDK_INSTALLER="${{ runner.temp }}/NDI_SDK_Installer.pkg"
-        
+
         # Check if NDI is already installed at system location
         if [ -d "/Library/NDI SDK for Apple" ] && [ -f "/Library/NDI SDK for Apple/include/Processing.NDI.Lib.h" ]; then
           echo "NDI SDK already installed at /Library/NDI SDK for Apple"
@@ -44,48 +50,49 @@ runs:
           cp -R "/Library/NDI SDK for Apple"/* "$NDI_SDK_DIR/"
           exit 0
         fi
-        
+
         # Use macOS-specific NDI SDK URL with fallback
         NDI_SDK_URL="${{ env.NDI_SDK_URL_MACOS }}"
         if [ -z "$NDI_SDK_URL" ]; then
           NDI_SDK_URL="https://downloads.ndi.tv/SDK/NDI_SDK_Mac/Install_NDI_SDK_v6_Apple.pkg"
         fi
-        
+
         echo "Downloading NDI SDK from: $NDI_SDK_URL"
         curl -L -o "$NDI_SDK_INSTALLER" "$NDI_SDK_URL" || {
           echo "Error: Failed to download NDI SDK"
           exit 1
         }
-        
+
         # Verify the download
         if [ ! -f "$NDI_SDK_INSTALLER" ]; then
           echo "Error: NDI SDK installer not found after download"
           exit 1
         fi
-        
+
         echo "Download complete. File size:"
         ls -lh "$NDI_SDK_INSTALLER"
-        
+
         # Verify SHA256 hash
         echo "Verifying NDI SDK integrity..."
-        expected='${{ steps.cache-key.outputs.expected_hash }}'
+        accepted_hashes='${{ steps.cache-key.outputs.accepted_hashes }}'
         actual=$(shasum -a 256 "$NDI_SDK_INSTALLER" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')
-        expected_upper=$(echo "$expected" | tr '[:lower:]' '[:upper:]')
-        if [ "$actual" != "$expected_upper" ]; then
-          echo "NDI SDK hash mismatch! Expected: $expected_upper, Got: $actual"
+        if ! printf '%s\n' "$accepted_hashes" | tr '[:lower:]' '[:upper:]' | grep -Fx "$actual" >/dev/null; then
+          echo "NDI SDK hash mismatch! Got: $actual"
+          echo "Accepted hashes:"
+          printf '%s\n' "$accepted_hashes"
           exit 1
         fi
-        echo "✓ NDI SDK hash verified"
-        
+        echo "✓ NDI SDK hash verified: $actual"
+
         echo "Installing NDI SDK..."
-        
+
         # First, let's see what's in the package
         echo "Package info:"
         echo "Checking package structure..."
         # Try to expand the package temporarily to see its structure
         mkdir -p "${{ runner.temp }}/pkg-check"
         pkgutil --expand "$NDI_SDK_INSTALLER" "${{ runner.temp }}/pkg-check" 2>/dev/null || echo "Could not expand package"
-        
+
         if [ -d "${{ runner.temp }}/pkg-check" ]; then
           echo "Package structure:"
           find "${{ runner.temp }}/pkg-check" -type f -name "*.plist" | while read plist; do
@@ -94,14 +101,14 @@ runs:
           done
           rm -rf "${{ runner.temp }}/pkg-check"
         fi
-        
+
         echo "Package payload files (first 30):"
         pkgutil --payload-files "$NDI_SDK_INSTALLER" 2>/dev/null | head -30 || echo "Could not list package contents"
-        
+
         # Check what volumes are available
         echo "Available volumes:"
         ls -la /Volumes/ || true
-        
+
         # Use the standard macOS installer command with verbose output
         # This will install to the default system location
         echo "Installing package..."
@@ -112,34 +119,34 @@ runs:
           tail -50 /var/log/install.log 2>/dev/null || true
           exit 1
         }
-        
+
         echo "Installation complete. Waiting a moment for filesystem to settle..."
         sleep 2
-        
+
         rm -f "$NDI_SDK_INSTALLER"
-        
+
         # Debug: List common installation directories
         echo "Checking common NDI installation paths:"
         ls -la /Library/ | grep -i ndi || true
         ls -la /Applications/ | grep -i ndi || true
         ls -la /usr/local/ | grep -i ndi || true
-        
+
         # Also check for NewTek directories (NDI's parent company)
         echo "Checking for NewTek directories:"
         ls -la /Library/ | grep -i newtek || true
         find /Library -name "*NewTek*" -type d 2>/dev/null | head -10 || true
-        
+
         # More specific search for NDI SDK directory
         echo ""
         echo "Searching for NDI SDK directories:"
         find /Library -maxdepth 2 -name "*NDI*" -type d 2>/dev/null || true
         find /Applications -maxdepth 2 -name "*NDI*" -type d 2>/dev/null || true
-        
+
         # Look for NDI SDK in multiple possible locations
         # First, try to find it dynamically
         echo "Searching for NDI SDK dynamically..."
         FOUND_DIRS=$(find /Library /Applications -maxdepth 3 -type d -name "*NDI*SDK*" 2>/dev/null || true)
-        
+
         NDI_LOCATIONS=(
           "/Library/NDI SDK for Apple"
           "/Library/NDI SDK for macOS"
@@ -159,7 +166,7 @@ runs:
           "$HOME/Library/NDI SDK for Apple"
           "$NDI_SDK_DIR"
         )
-        
+
         # Add any dynamically found directories
         if [ -n "$FOUND_DIRS" ]; then
           echo "Found potential NDI directories:"
@@ -168,13 +175,13 @@ runs:
             NDI_LOCATIONS+=("$dir")
           done <<< "$FOUND_DIRS"
         fi
-        
+
         FOUND_SDK=false
         for location in "${NDI_LOCATIONS[@]}"; do
           # First check if the directory exists at all
           if [ -d "$location" ]; then
             echo "Checking directory: $location"
-            
+
             # Check for various possible header file names or just the include directory
             if [ -f "$location/include/Processing.NDI.Lib.h" ] || \
                [ -f "$location/include/Processing.NDI.lib.h" ] || \
@@ -182,17 +189,17 @@ runs:
                [ -f "$location/include/NDI.h" ] || \
                [ -d "$location/include" ]; then
               echo "Found NDI SDK at: $location"
-              
+
               # List what's actually in the directory
               echo "Directory contents:"
               ls -la "$location/" | head -10
-              
+
               # List what's actually in the include directory
               if [ -d "$location/include" ]; then
                 echo "Include directory contents:"
                 ls -la "$location/include/" | head -10
               fi
-              
+
               if [ "$location" != "$NDI_SDK_DIR" ]; then
                 echo "Copying from $location to $NDI_SDK_DIR"
                 mkdir -p "$NDI_SDK_DIR"
@@ -203,10 +210,10 @@ runs:
             fi
           fi
         done
-        
+
         if [ "$FOUND_SDK" = false ]; then
           echo "NDI SDK not found in expected locations. Trying pkgutil method..."
-          
+
           # Last resort: use pkgutil to find where NDI was installed
           for pkg in $(pkgutil --pkgs | grep -i ndi); do
             echo "Checking package: $pkg"
@@ -222,13 +229,13 @@ runs:
                 break
               fi
             fi
-            
+
             # Also try to find files from this package
             echo "Looking for include files in package $pkg:"
             pkgutil --files "$pkg" 2>/dev/null | grep -E "(include|\.h$)" | head -10
           done
         fi
-        
+
         if [ "$FOUND_SDK" = false ]; then
           echo "NDI SDK installation failed - header file not found in any expected location"
           echo "Searched locations:"
@@ -245,32 +252,32 @@ runs:
               echo "    (directory not found)"
             fi
           done
-          
+
           # Additional debugging
           echo ""
           echo "Searching for NDI files system-wide:"
           find /Library -name "*NDI*" -type d 2>/dev/null | head -20 || true
           find /Applications -name "*NDI*" -type d 2>/dev/null | head -20 || true
           find /usr/local -name "*NDI*" -type d 2>/dev/null | head -20 || true
-          
+
           echo ""
           echo "Searching for any header files with NDI in the name:"
           find /Library -name "*NDI*.h" -type f 2>/dev/null | head -20 || true
           find /Applications -name "*NDI*.h" -type f 2>/dev/null | head -20 || true
-          
+
           echo ""
           echo "Trying broader search for Processing.NDI files:"
           find / -name "Processing.NDI*" -type f 2>/dev/null | grep -v "Permission denied" | head -20 || true
-          
+
           echo ""
           echo "Looking for any directory with 'NDI' and 'SDK' in the name:"
           find / -type d -name "*NDI*SDK*" -o -name "*SDK*NDI*" 2>/dev/null | grep -v "Permission denied" | head -20 || true
-          
+
           echo ""
           echo "Checking installed packages:"
           pkgutil --pkgs | grep -i ndi || echo "No NDI packages found"
           pkgutil --pkgs | grep -i newtek || echo "No NewTek packages found"
-          
+
           echo ""
           echo "Package install locations:"
           for pkg in $(pkgutil --pkgs | grep -i ndi); do
@@ -280,7 +287,7 @@ runs:
             pkgutil --files "$pkg" 2>/dev/null | head -20 || echo "  Could not list files"
             echo ""
           done
-          
+
           for pkg in $(pkgutil --pkgs | grep -i newtek); do
             echo "Package: $pkg"
             pkgutil --pkg-info "$pkg" 2>/dev/null || echo "  Could not get info"
@@ -288,12 +295,12 @@ runs:
             pkgutil --files "$pkg" 2>/dev/null | head -20 || echo "  Could not list files"
             echo ""
           done
-          
+
           exit 1
         fi
-        
+
         echo "✓ NDI SDK installed successfully"
-        
+
         # Debug: Show what was actually installed
         echo ""
         echo "NDI SDK contents at $NDI_SDK_DIR:"
@@ -309,28 +316,28 @@ runs:
           fi
         fi
       shell: bash
-    
+
     # Verify SDK is available (whether from cache or fresh install)
     - name: Verify NDI SDK
       run: |
         NDI_SDK_DIR="${{ runner.temp }}/ndi-sdk"
         echo "Verifying NDI SDK at: $NDI_SDK_DIR"
-        
+
         # Check if the directory exists and has the expected files
         if [ -d "$NDI_SDK_DIR" ]; then
           echo "NDI SDK directory exists. Contents:"
           ls -la "$NDI_SDK_DIR" | head -10 || true
-          
+
           # Check if it actually contains the SDK
           if [ ! -f "$NDI_SDK_DIR/include/Processing.NDI.Lib.h" ]; then
             echo "Warning: NDI SDK directory exists but is missing expected files"
             rm -rf "$NDI_SDK_DIR"
           fi
         fi
-        
+
         if [ ! -d "$NDI_SDK_DIR" ] || [ ! -f "$NDI_SDK_DIR/include/Processing.NDI.Lib.h" ]; then
           echo "NDI SDK not found or incomplete at expected location"
-          
+
           # If it's at the system location, copy it
           if [ -d "/Library/NDI SDK for Apple" ] && [ -f "/Library/NDI SDK for Apple/include/Processing.NDI.Lib.h" ]; then
             echo "Found NDI SDK at system location, copying..."
@@ -339,21 +346,21 @@ runs:
           else
             echo "NDI SDK not found at system location either"
             echo "Need to install NDI SDK..."
-            
+
             # Install it
             NDI_SDK_INSTALLER="${{ runner.temp }}/NDI_SDK_Installer.pkg"
             NDI_SDK_URL="${{ env.NDI_SDK_URL_MACOS }}"
             if [ -z "$NDI_SDK_URL" ]; then
               NDI_SDK_URL="https://downloads.ndi.tv/SDK/NDI_SDK_Mac/Install_NDI_SDK_v6_Apple.pkg"
             fi
-            
+
             echo "Downloading NDI SDK from: $NDI_SDK_URL"
             curl -L -o "$NDI_SDK_INSTALLER" "$NDI_SDK_URL" || exit 1
-            
+
             echo "Installing NDI SDK..."
             sudo installer -pkg "$NDI_SDK_INSTALLER" -target / -allowUntrusted || exit 1
             rm -f "$NDI_SDK_INSTALLER"
-            
+
             # Now copy it
             if [ -d "/Library/NDI SDK for Apple" ]; then
               echo "Copying installed SDK to cache location..."
@@ -364,7 +371,7 @@ runs:
             fi
           fi
         fi
-        
+
         echo "NDI SDK verified at: $NDI_SDK_DIR"
         echo "Final contents:"
         ls -la "$NDI_SDK_DIR" | head -10
@@ -375,11 +382,11 @@ runs:
       run: |
         NDI_SDK_DIR="${{ runner.temp }}/ndi-sdk"
         echo "NDI_SDK_DIR=$NDI_SDK_DIR" >> $GITHUB_ENV
-        
+
         # Add binary paths if they exist
         [ -d "$NDI_SDK_DIR/bin" ] && echo "$NDI_SDK_DIR/bin" >> $GITHUB_PATH
         [ -d "$NDI_SDK_DIR/Bin" ] && echo "$NDI_SDK_DIR/Bin" >> $GITHUB_PATH
-        
+
         # Set up library paths for macOS
         LIB_PATHS=""
         # Check for macOS-specific library subdirectory
@@ -392,17 +399,17 @@ runs:
           echo "Found library directory: $NDI_SDK_DIR/lib"
           ls -la "$NDI_SDK_DIR/lib/" | grep -E "\.(dylib|a)$" || true
         fi
-        
+
         if [ -n "$LIB_PATHS" ]; then
           echo "DYLD_LIBRARY_PATH=${LIB_PATHS}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" >> $GITHUB_ENV
         fi
-        
+
         # Log the setup for debugging
         echo "NDI SDK setup complete. Environment:"
         echo "  NDI_SDK_DIR: $NDI_SDK_DIR"
         echo "  Binary paths added: $([ -d "$NDI_SDK_DIR/bin" ] && echo "$NDI_SDK_DIR/bin") $([ -d "$NDI_SDK_DIR/Bin" ] && echo "$NDI_SDK_DIR/Bin")"
         echo "  Library paths: $LIB_PATHS"
-        
+
         # Verify NDI library can be found
         if [ -n "$LIB_PATHS" ]; then
           echo ""

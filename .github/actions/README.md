@@ -25,9 +25,10 @@ Sets up the NDI SDK on macOS runners.
 The NDI SDK URLs can be overridden using GitHub secrets:
 - `NDI_SDK_URL` - Windows NDI SDK installer URL
 - `NDI_SDK_URL_MACOS` - macOS NDI SDK installer URL
+- `NDI_SDK_URL_LINUX` - Linux NDI SDK installer URL
 
 ## Notes
 
-- The macOS action needs the correct SHA256 hash for the NDI SDK installer to be updated
+- The setup actions verify NDI SDK installers against a small allowlist of known-good SHA256 hashes because NDI can rotate installer payloads behind the same download URL
 - Both actions cache their installations to speed up CI runs
 - The Windows action also installs LLVM which is required for building on Windows

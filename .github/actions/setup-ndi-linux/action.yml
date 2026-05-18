@@ -12,12 +12,18 @@ runs:
     - name: Generate cache key
       id: cache-key
       run: |
-        # Expected SHA256 hash of NDI SDK installer for Linux
-        expected='0BDF66264527F8BE37FA22EDDD2B8514B9868A58A4D83F80A07DBEB479EE14D4'
-        ndiHash=$(echo $expected | cut -c1-8)  # Use first 8 chars for cache key
-        # v2: added symlink creation for linker compatibility
-        echo "key=deps-v2-${ndiHash}-${{ runner.os }}" >> $GITHUB_OUTPUT
-        echo "expected_hash=$expected" >> $GITHUB_OUTPUT
+        # Accepted SHA256 hashes of NDI SDK installers for Linux.
+        # downloads.ndi.tv can rotate the installer payload for the same URL, so
+        # keep the current hash first for cache keys and retain prior known-good
+        # hashes as an allowlist.
+        primary='F0314F245446DEFC488B63CEB4689ACF1A965AEEFDADACB70571BB216A8CC183'
+        previous='0BDF66264527F8BE37FA22EDDD2B8514B9868A58A4D83F80A07DBEB479EE14D4'
+        ndiHash=$(echo $primary | cut -c1-8)  # Use first 8 chars for cache key
+        echo "key=deps-v3-${ndiHash}-${{ runner.os }}" >> $GITHUB_OUTPUT
+        echo "accepted_hashes<<EOF" >> $GITHUB_OUTPUT
+        echo "$primary" >> $GITHUB_OUTPUT
+        echo "$previous" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
       shell: bash
 
     # Restore cache if available
@@ -60,14 +66,15 @@ runs:
 
         # Verify SHA256 hash
         echo "Verifying NDI SDK integrity..."
-        expected='${{ steps.cache-key.outputs.expected_hash }}'
+        accepted_hashes='${{ steps.cache-key.outputs.accepted_hashes }}'
         actual=$(sha256sum "$NDI_INSTALLER_TAR" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')
-        expected_upper=$(echo "$expected" | tr '[:lower:]' '[:upper:]')
-        if [ "$actual" != "$expected_upper" ]; then
-          echo "NDI SDK hash mismatch! Expected: $expected_upper, Got: $actual"
+        if ! printf '%s\n' "$accepted_hashes" | tr '[:lower:]' '[:upper:]' | grep -Fx "$actual" >/dev/null; then
+          echo "NDI SDK hash mismatch! Got: $actual"
+          echo "Accepted hashes:"
+          printf '%s\n' "$accepted_hashes"
           exit 1
         fi
-        echo "✓ NDI SDK hash verified"
+        echo "✓ NDI SDK hash verified: $actual"
 
         echo "Extracting installer..."
         mkdir -p "$NDI_INSTALLER_DIR"
