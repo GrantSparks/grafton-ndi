@@ -40,6 +40,10 @@ static FLUSH_MUTEX: Mutex<()> = Mutex::new(());
 /// `NDIlib_send_send_video_async_v2(instance, NULL)` (where the *frame pointer*
 /// is NULL, not merely a frame whose `p_data` is NULL) waits for any in-flight
 /// async buffer to be released and then returns.
+fn async_flush_frame_ptr() -> *const NDIlib_video_frame_v2_t {
+    ptr::null()
+}
+
 fn flush_null_frame(instance: NDIlib_send_instance_t) {
     #[cfg(target_os = "windows")]
     {
@@ -47,13 +51,13 @@ fn flush_null_frame(instance: NDIlib_send_instance_t) {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         unsafe {
-            NDIlib_send_send_video_async_v2(instance, ptr::null());
+            NDIlib_send_send_video_async_v2(instance, async_flush_frame_ptr());
         }
     }
 
     #[cfg(not(target_os = "windows"))]
     unsafe {
-        NDIlib_send_send_video_async_v2(instance, ptr::null());
+        NDIlib_send_send_video_async_v2(instance, async_flush_frame_ptr());
     }
 }
 
@@ -969,11 +973,15 @@ impl Sender {
 
     /// Flush pending async video operations synchronously.
     ///
-    /// Sends a NULL video frame to the SDK which blocks until all pending
-    /// async video operations are complete. This is necessary when using the
-    /// standard SDK to ensure buffers are released before reuse.
+    /// Sends a true NULL video frame pointer to the SDK, blocking until all
+    /// pending async video operations are complete.
     ///
-    /// # Safety
+    /// `AsyncVideoToken::drop` and [`AsyncVideoToken::wait`] already perform
+    /// this drain for ordinary safe `send_video_async` calls. Prefer waiting the
+    /// token when you hold one; use this method when you need an explicit
+    /// sender-level drain.
+    ///
+    /// # Buffer Lifetime
     ///
     /// After this function returns, all previously sent async video buffers
     /// can be safely reused or freed.
@@ -991,9 +999,8 @@ impl Sender {
     /// let frame = BorrowedVideoFrame::try_from_uncompressed(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1)?;
     /// let token = sender.send_video_async(&frame);
     ///
-    /// // Drop token to release the mutable borrow, then flush
-    /// drop(token);
-    /// sender.flush_async_blocking();
+    /// // Prefer waiting the token for ordinary borrowed async sends.
+    /// token.wait()?;
     ///
     /// // Buffer can now be safely reused
     /// buffer.fill(0);
@@ -1192,6 +1199,11 @@ impl SenderOptionsBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_async_flush_uses_null_frame_pointer() {
+        assert!(async_flush_frame_ptr().is_null());
+    }
 
     #[test]
     fn test_try_from_uncompressed_exact_size() {
