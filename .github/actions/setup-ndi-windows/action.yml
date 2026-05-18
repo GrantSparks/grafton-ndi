@@ -16,16 +16,17 @@ runs:
         # downloads.ndi.tv can rotate the installer payload for the same URL, so
         # keep the current hash first for cache keys and retain prior known-good
         # hashes as an allowlist.
-        $primary = '97E8993C6B94213A950E6ACBE9AA4D35831D137324D762F7C74851D3FEEF80D9'
+        $primary = '4D5DD36A1C7C7634F408BF459B068787CCE6F5310A3EFE832D76B1DDEB54E499'
+        $previous = '97E8993C6B94213A950E6ACBE9AA4D35831D137324D762F7C74851D3FEEF80D9'
         $ndiHash = $primary.Substring(0, 8)  # Use first 8 chars for cache key
-        echo "key=deps-v2-$ndiHash-${{ env.LLVM_VERSION }}-${{ runner.os }}" >> $env:GITHUB_OUTPUT
-        echo "accepted_hashes=$primary" >> $env:GITHUB_OUTPUT
+        echo "key=deps-v3-$ndiHash-${{ env.LLVM_VERSION }}-${{ runner.os }}" >> $env:GITHUB_OUTPUT
+        echo "accepted_hashes=$primary,$previous" >> $env:GITHUB_OUTPUT
       shell: pwsh
 
     # Restore cache if available
     - name: Restore cache
       id: cache-restore
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v5
       with:
         path: |
           ${{ runner.temp }}\ndi-sdk\**\*
@@ -103,7 +104,7 @@ runs:
     # Save cache only from test-and-lint job on main branch
     - name: Save cache
       if: inputs.save-cache == 'true' && steps.cache-restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.job == 'test-and-lint'
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@v5
       with:
         path: |
           ${{ runner.temp }}\ndi-sdk\**\*

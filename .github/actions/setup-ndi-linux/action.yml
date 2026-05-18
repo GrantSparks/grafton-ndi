@@ -29,7 +29,7 @@ runs:
     # Restore cache if available
     - name: Restore cache
       id: cache-restore
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v5
       with:
         path: |
           ${{ runner.temp }}/ndi-sdk
@@ -225,7 +225,7 @@ runs:
     # Save cache only from test-and-lint job on main branch
     - name: Save cache
       if: inputs.save-cache == 'true' && steps.cache-restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.job == 'test-and-lint'
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@v5
       with:
         path: |
           ${{ runner.temp }}/ndi-sdk
