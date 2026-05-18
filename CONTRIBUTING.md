@@ -96,9 +96,12 @@ contract fixtures or after stable rustc diagnostic wording changes:
 TRYBUILD=overwrite cargo test --test compile_contracts
 ```
 
-The project does not pin a Rust toolchain. Treat `.stderr` snapshot updates as
-part of normal compiler-upgrade maintenance, and review them to confirm they
-still fail for the intended lifetime or auto-trait reason.
+The project uses the stable Rust toolchain with `clippy`, `rustfmt`, and
+`rust-src` components via `rust-toolchain.toml`. The `rust-src` component keeps
+standard-library diagnostics consistent in local and CI runs. Treat `.stderr`
+snapshot updates as part of normal stable-compiler-upgrade maintenance, and
+review them to confirm they still fail for the intended lifetime or auto-trait
+reason.
 
 ### CI/CD Configuration
 
