@@ -49,6 +49,7 @@ async-std = ["dep:async-std"]
 
 [dev-dependencies]
 ctrlc = "3.5"
+trybuild = "1.0"
 
 [[example]]
 name = "NDIlib_Recv_PNG"

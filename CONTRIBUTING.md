@@ -78,6 +78,31 @@ docs(api): improve VideoFrame builder documentation
 - Include integration tests for complex features
 - Test on multiple platforms if possible
 
+#### Compile Contract Tests
+
+Zero-copy receive and async-send lifetime guarantees are enforced with
+`trybuild` compile tests in `tests/compile_contracts.rs`.
+
+Run the compile contracts directly:
+
+```bash
+cargo test --test compile_contracts
+```
+
+Refresh expected compiler diagnostics after intentionally changing the
+contract fixtures or after stable rustc diagnostic wording changes:
+
+```bash
+TRYBUILD=overwrite cargo test --test compile_contracts
+```
+
+The project uses the stable Rust toolchain with `clippy`, `rustfmt`, and
+`rust-src` components via `rust-toolchain.toml`. The `rust-src` component keeps
+standard-library diagnostics consistent in local and CI runs. Treat `.stderr`
+snapshot updates as part of normal stable-compiler-upgrade maintenance, and
+review them to confirm they still fail for the intended lifetime or auto-trait
+reason.
+
 ### CI/CD Configuration
 
 #### GitHub Actions NDI SDK

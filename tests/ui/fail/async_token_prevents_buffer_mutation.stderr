@@ -1,0 +1,10 @@
+error[E0502]: cannot borrow `buffer` as mutable because it is also borrowed as immutable
+  --> tests/ui/fail/async_token_prevents_buffer_mutation.rs:16:5
+   |
+12 |         BorrowedVideoFrame::try_from_uncompressed(&buffer, 16, 16, PixelFormat::BGRA, 30, 1)
+   |                                                   ------- immutable borrow occurs here
+...
+16 |     buffer[0] = 1;
+   |     ^^^^^^ mutable borrow occurs here
+17 |     drop(token);
+   |          ----- immutable borrow later used here

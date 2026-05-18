@@ -1,0 +1,13 @@
+error[E0597]: `metadata` does not live long enough
+  --> tests/ui/fail/async_token_prevents_drop_metadata.rs:29:22
+   |
+15 |     let token = {
+   |         ----- borrow later stored here
+16 |         let metadata = CString::new("compile contract metadata").unwrap();
+   |             -------- binding `metadata` declared here
+...
+29 |                 Some(&metadata),
+   |                      ^^^^^^^^^ borrowed value does not live long enough
+...
+35 |     };
+   |     - `metadata` dropped here while still borrowed

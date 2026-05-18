@@ -1,0 +1,18 @@
+error[E0505]: cannot move out of `buffer` because it is borrowed
+  --> tests/ui/fail/async_token_prevents_buffer_drop.rs:16:10
+   |
+10 |     let buffer = vec![0u8; 16 * 16 * 4];
+   |         ------ binding `buffer` declared here
+11 |     let frame =
+12 |         BorrowedVideoFrame::try_from_uncompressed(&buffer, 16, 16, PixelFormat::BGRA, 30, 1)
+   |                                                   ------- borrow of `buffer` occurs here
+...
+16 |     drop(buffer);
+   |          ^^^^^^ move out of `buffer` occurs here
+17 |     drop(token);
+   |          ----- borrow later used here
+   |
+help: consider cloning the value if the performance cost is acceptable
+   |
+12 |         BorrowedVideoFrame::try_from_uncompressed(&buffer.clone(), 16, 16, PixelFormat::BGRA, 30, 1)
+   |                                                          ++++++++

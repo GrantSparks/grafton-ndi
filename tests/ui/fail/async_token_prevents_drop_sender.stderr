@@ -1,0 +1,13 @@
+error[E0505]: cannot move out of `sender` because it is borrowed
+  --> tests/ui/fail/async_token_prevents_drop_sender.rs:16:10
+   |
+ 8 |     let mut sender = Sender::new(&ndi, &options).unwrap();
+   |         ---------- binding `sender` declared here
+...
+14 |     let token = sender.send_video_async(&frame);
+   |                 ------ borrow of `sender` occurs here
+15 |
+16 |     drop(sender);
+   |          ^^^^^^ move out of `sender` occurs here
+17 |     drop(token);
+   |          ----- borrow later used here
