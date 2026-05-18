@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Video and audio frame layout fields are now private**: `VideoFrame` and `AudioFrame` now preserve validated SDK layout invariants after construction. Use getters such as `width()`, `pixel_format()`, `sample_rate()`, `data()`, and controlled mutation methods such as `data_mut()` or `replace_data()` instead of mutating SDK-facing fields directly.
 - **Unchecked public video layout helpers were removed**: `calculate_line_stride`, `PixelFormat::line_stride`, `PixelFormat::buffer_size`, and `PixelFormatInfo::buffer_len` have been replaced by checked APIs: `try_line_stride`, `try_buffer_size`, and `try_buffer_len`.
 - **Safe compressed-video construction was removed**: `BorrowedVideoFrame::try_from_compressed` is gone because the crate does not yet expose a typed compressed FourCC model. Unsupported compressed or opaque SDK layouts now require the explicit unsafe `BorrowedVideoFrame::from_parts_unchecked` escape hatch.
+- **Receiver `Max` sentinel variants were removed**: `ReceiverColorFormat` and `ReceiverBandwidth` now expose only operational receiver modes and are marked `#[non_exhaustive]`. Code that used `ReceiverColorFormat::Max` or `ReceiverBandwidth::Max` should choose an explicit mode such as `Fastest`, `Best`, `RGBX_RGBA`, `BGRX_BGRA`, `Highest`, `Lowest`, `AudioOnly`, or `MetadataOnly`.
 
 ### Changed
 

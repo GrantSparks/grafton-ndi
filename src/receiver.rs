@@ -133,7 +133,22 @@ macro_rules! ptz_command {
     };
 }
 
+/// Operational color formats for received video frames.
+///
+/// These values are receiver configuration modes that the NDI SDK can use for
+/// normal receive operation. SDK `Max` sentinel values are intentionally not
+/// exposed in safe Rust because they are placeholders, not valid receiver
+/// modes.
+///
+/// This enum is marked `#[non_exhaustive]` so future SDK receiver modes can be
+/// added without another avoidable public enum break. Downstream `match`
+/// expressions should include a wildcard arm.
+///
+/// Choose an explicit operational value such as [`ReceiverColorFormat::Fastest`],
+/// [`ReceiverColorFormat::Best`], [`ReceiverColorFormat::RGBX_RGBA`], or
+/// [`ReceiverColorFormat::BGRX_BGRA`] for receiver configuration.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReceiverColorFormat {
     #[default]
     BGRX_BGRA,
@@ -142,7 +157,6 @@ pub enum ReceiverColorFormat {
     UYVY_RGBA,
     Fastest,
     Best,
-    Max,
 }
 
 impl From<ReceiverColorFormat> for NDIlib_recv_color_format_e {
@@ -164,19 +178,32 @@ impl From<ReceiverColorFormat> for NDIlib_recv_color_format_e {
                 NDIlib_recv_color_format_e_NDIlib_recv_color_format_fastest
             }
             ReceiverColorFormat::Best => NDIlib_recv_color_format_e_NDIlib_recv_color_format_best,
-            ReceiverColorFormat::Max => NDIlib_recv_color_format_e_NDIlib_recv_color_format_max,
         }
     }
 }
 
+/// Operational bandwidth modes for receivers.
+///
+/// These values are receiver configuration modes that the NDI SDK can use for
+/// normal receive operation. SDK `Max` sentinel values are intentionally not
+/// exposed in safe Rust because they are placeholders, not valid receiver
+/// modes.
+///
+/// This enum is marked `#[non_exhaustive]` so future SDK receiver modes can be
+/// added without another avoidable public enum break. Downstream `match`
+/// expressions should include a wildcard arm.
+///
+/// Choose an explicit operational value such as [`ReceiverBandwidth::Highest`],
+/// [`ReceiverBandwidth::Lowest`], [`ReceiverBandwidth::AudioOnly`], or
+/// [`ReceiverBandwidth::MetadataOnly`] for receiver configuration.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReceiverBandwidth {
     MetadataOnly,
     AudioOnly,
     Lowest,
     #[default]
     Highest,
-    Max,
 }
 
 impl From<ReceiverBandwidth> for NDIlib_recv_bandwidth_e {
@@ -190,7 +217,6 @@ impl From<ReceiverBandwidth> for NDIlib_recv_bandwidth_e {
             }
             ReceiverBandwidth::Lowest => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest,
             ReceiverBandwidth::Highest => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
-            ReceiverBandwidth::Max => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_max,
         }
     }
 }
@@ -1418,6 +1444,135 @@ impl ConnectionStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_source() -> Source {
+        Source::default()
+    }
+
+    fn assert_raw_receiver_modes(
+        raw: &RawRecvCreateV3,
+        expected_color_format: NDIlib_recv_color_format_e,
+        expected_bandwidth: NDIlib_recv_bandwidth_e,
+    ) {
+        assert_eq!(raw.raw.color_format, expected_color_format);
+        assert_eq!(raw.raw.bandwidth, expected_bandwidth);
+        assert_ne!(
+            raw.raw.color_format,
+            NDIlib_recv_color_format_e_NDIlib_recv_color_format_max
+        );
+        assert_ne!(
+            raw.raw.bandwidth,
+            NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_max
+        );
+    }
+
+    #[test]
+    fn receiver_color_format_maps_to_exact_sdk_values() {
+        assert_eq!(
+            NDIlib_recv_color_format_e::from(ReceiverColorFormat::BGRX_BGRA),
+            NDIlib_recv_color_format_e_NDIlib_recv_color_format_BGRX_BGRA
+        );
+        assert_eq!(
+            NDIlib_recv_color_format_e::from(ReceiverColorFormat::UYVY_BGRA),
+            NDIlib_recv_color_format_e_NDIlib_recv_color_format_UYVY_BGRA
+        );
+        assert_eq!(
+            NDIlib_recv_color_format_e::from(ReceiverColorFormat::RGBX_RGBA),
+            NDIlib_recv_color_format_e_NDIlib_recv_color_format_RGBX_RGBA
+        );
+        assert_eq!(
+            NDIlib_recv_color_format_e::from(ReceiverColorFormat::UYVY_RGBA),
+            NDIlib_recv_color_format_e_NDIlib_recv_color_format_UYVY_RGBA
+        );
+        assert_eq!(
+            NDIlib_recv_color_format_e::from(ReceiverColorFormat::Fastest),
+            NDIlib_recv_color_format_e_NDIlib_recv_color_format_fastest
+        );
+        assert_eq!(
+            NDIlib_recv_color_format_e::from(ReceiverColorFormat::Best),
+            NDIlib_recv_color_format_e_NDIlib_recv_color_format_best
+        );
+    }
+
+    #[test]
+    fn receiver_bandwidth_maps_to_exact_sdk_values() {
+        assert_eq!(
+            NDIlib_recv_bandwidth_e::from(ReceiverBandwidth::MetadataOnly),
+            NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_metadata_only
+        );
+        assert_eq!(
+            NDIlib_recv_bandwidth_e::from(ReceiverBandwidth::AudioOnly),
+            NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_audio_only
+        );
+        assert_eq!(
+            NDIlib_recv_bandwidth_e::from(ReceiverBandwidth::Lowest),
+            NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest
+        );
+        assert_eq!(
+            NDIlib_recv_bandwidth_e::from(ReceiverBandwidth::Highest),
+            NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest
+        );
+    }
+
+    #[test]
+    fn receiver_options_defaults_emit_operational_raw_modes() {
+        let raw = ReceiverOptions::builder(test_source())
+            .build()
+            .to_raw()
+            .unwrap();
+
+        assert_raw_receiver_modes(
+            &raw,
+            NDIlib_recv_color_format_e_NDIlib_recv_color_format_BGRX_BGRA,
+            NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
+        );
+        assert!(raw.raw.allow_video_fields);
+    }
+
+    #[test]
+    fn snapshot_preset_emits_operational_raw_modes() {
+        let raw = ReceiverOptionsBuilder::snapshot_preset(test_source())
+            .build()
+            .to_raw()
+            .unwrap();
+
+        assert_raw_receiver_modes(
+            &raw,
+            NDIlib_recv_color_format_e_NDIlib_recv_color_format_RGBX_RGBA,
+            NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest,
+        );
+        assert!(!raw.raw.allow_video_fields);
+    }
+
+    #[test]
+    fn high_quality_preset_emits_operational_raw_modes() {
+        let raw = ReceiverOptionsBuilder::high_quality_preset(test_source())
+            .build()
+            .to_raw()
+            .unwrap();
+
+        assert_raw_receiver_modes(
+            &raw,
+            NDIlib_recv_color_format_e_NDIlib_recv_color_format_RGBX_RGBA,
+            NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
+        );
+        assert!(raw.raw.allow_video_fields);
+    }
+
+    #[test]
+    fn monitoring_preset_emits_operational_raw_modes() {
+        let raw = ReceiverOptionsBuilder::monitoring_preset(test_source())
+            .build()
+            .to_raw()
+            .unwrap();
+
+        assert_raw_receiver_modes(
+            &raw,
+            NDIlib_recv_color_format_e_NDIlib_recv_color_format_BGRX_BGRA,
+            NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_metadata_only,
+        );
+        assert!(!raw.raw.allow_video_fields);
+    }
 
     #[test]
     fn retry_succeeds_first_attempt() {
