@@ -10,14 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Regression coverage for async flush pointer semantics**: Added focused test coverage proving async flush uses a true null frame pointer when flushing the NDI async video pipeline.
+- **Explicit FrameSync audio requests**: Added `FrameSyncAudioRequest` so audio capture and query modes no longer rely on magic zero integer triples.
 
 ### Fixed
 
 - **Async sender flush now passes a true NULL frame pointer**: `flush_null_frame` now calls `NDIlib_send_send_video_async_v2` with `ptr::null()` instead of passing a pointer to a zeroed `NDIlib_video_frame_v2_t`, matching the NDI SDK's async flush contract. Thanks to [@FlowingSPDG](https://github.com/FlowingSPDG) for identifying and fixing this in [#51](https://github.com/GrantSparks/grafton-ndi/pull/51).
 - **CI handles rotated NDI SDK downloads**: Linux, macOS, and Windows NDI setup actions now accept a small allowlist of known-good installer hashes and use current hash-based cache keys, so CI can recover when NDI rotates installer payloads behind stable download URLs.
+- **FrameSync borrowed frames validate SDK layouts before exposing buffers**: FrameSync video and audio refs now use the shared cached layout validators, checked arithmetic, channel-stride validation, and RAII cleanup on validation errors. Malformed SDK metadata is reported as `Error::InvalidFrame(_)` instead of `None`, empty slices, panics, or unchecked slice lengths.
 
 ### Changed
 
+- **Breaking FrameSync API cleanup**: `FrameSync::capture_video()` now returns `Result<Option<FrameSyncVideoRef>>`, `capture_video_owned()` now returns `Result<Option<VideoFrame>>`, `capture_audio()` takes `FrameSyncAudioRequest` and returns `Result<FrameSyncAudioRef>`, and `capture_audio_owned()` returns `Result<Option<AudioFrame>>` for query/no-source states without sample buffers.
+- **FrameSync audio exposes validated empty/query state**: `FrameSyncAudioRef::is_empty()` identifies the documented zero-length query/no-source state, and `data()`/channel accessors use cached validated stride information.
 - **GitHub Actions are Node 24-ready**: Updated GitHub-maintained checkout/cache actions to Node 24-compatible major versions ahead of GitHub's Node 20 runner deprecation.
 - **CI matrix failures are no longer hidden by fail-fast cancellation**: Rust test/lint and semver matrices now keep running after one platform fails, making platform-specific SDK setup failures visible.
 
@@ -229,24 +233,30 @@ match completion.try_wait_timeout(Duration::from_secs(5), "operation") {
 New `FrameSync` type wraps the NDI FrameSync API, transforming push-based NDI streams into pull-based capture with automatic time-base correction and dynamic audio resampling.
 
 ```rust
-use grafton_ndi::{FrameSync, ScanType};
+use grafton_ndi::{FrameSync, FrameSyncAudioRequest, ScanType};
+use std::num::NonZeroI32;
 
-let frame_sync = FrameSync::new(&receiver)?;
+let frame_sync = FrameSync::new(receiver)?;
 
 // Capture clock-corrected video (returns immediately)
-if let Some(video) = frame_sync.capture_video(ScanType::Progressive) {
+if let Some(video) = frame_sync.capture_video(ScanType::Progressive)? {
     println!("{}x{}", video.width(), video.height());
 }
 
 // Capture resampled audio at requested rate/channels/samples
-let audio = frame_sync.capture_audio(48000, 2, 1024);
+let audio = frame_sync.capture_audio(FrameSyncAudioRequest::Capture {
+    sample_rate: Some(NonZeroI32::new(48_000).unwrap()),
+    channels: Some(NonZeroI32::new(2).unwrap()),
+    samples: NonZeroI32::new(1_024).unwrap(),
+})?;
 
 // Check queue depth
 let depth = frame_sync.audio_queue_depth();
 ```
 
 **New Types:**
-- `FrameSync<'rx>` - Frame synchronizer tied to receiver lifetime
+- `FrameSync` - Frame synchronizer that owns its receiver
+- `FrameSyncAudioRequest` - Explicit audio capture/query request
 - `FrameSyncVideoRef<'fs>` - Zero-copy borrowed video with RAII cleanup
 - `FrameSyncAudioRef<'fs>` - Zero-copy borrowed audio with RAII cleanup
 

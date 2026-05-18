@@ -133,7 +133,7 @@ pub use {
         LineStrideOrSize, MetadataFrame, MetadataFrameRef, PixelFormat, PixelFormatInfo, ScanType,
         VideoFrame, VideoFrameBuilder, VideoFrameRef,
     },
-    framesync::{FrameSync, FrameSyncAudioRef, FrameSyncVideoRef},
+    framesync::{FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncVideoRef},
     receiver::{
         ConnectionStats, FrameType, Receiver, ReceiverBandwidth, ReceiverColorFormat,
         ReceiverOptions, ReceiverOptionsBuilder, ReceiverStatus, Tally,

@@ -157,18 +157,29 @@ let token = sender.send_video_async(&borrowed_frame);
 Wraps a `Receiver` to provide pull-based capture with automatic time-base correction and dynamic audio resampling. Captures always return immediately.
 
 ```rust
-use grafton_ndi::FrameSync;
+use grafton_ndi::{FrameSync, FrameSyncAudioRequest, ScanType};
+use std::num::NonZeroI32;
 
 // FrameSync takes ownership of the receiver
 let frame_sync = FrameSync::new(receiver)?;
 
 // Capture clock-corrected video (returns immediately)
-if let Some(video) = frame_sync.capture_video(ScanType::Progressive) {
+if let Some(video) = frame_sync.capture_video(ScanType::Progressive)? {
     println!("Video: {}x{}", video.width(), video.height());
 }
 
-// Capture resampled audio at requested rate/channels/samples
-let audio = frame_sync.capture_audio(48000, 2, 1024);
+// Capture resampled audio at requested rate/channels/samples.
+let audio = frame_sync.capture_audio(FrameSyncAudioRequest::Capture {
+    sample_rate: Some(NonZeroI32::new(48_000).unwrap()),
+    channels: Some(NonZeroI32::new(2).unwrap()),
+    samples: NonZeroI32::new(1_024).unwrap(),
+})?;
+
+// Query the current source audio format without requesting samples.
+let input = frame_sync.capture_audio(FrameSyncAudioRequest::QueryInput)?;
+if input.is_empty() {
+    println!("No source audio format yet");
+}
 
 // Access the underlying receiver for tally, PTZ, or status
 let recv = frame_sync.receiver();

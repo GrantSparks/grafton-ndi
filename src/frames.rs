@@ -150,23 +150,25 @@ impl PixelFormatInfo {
     /// - **Packed RGB/YUV** (BGRA/BGRX/RGBA/RGBX/UYVY/UYVA/P216/PA16): `y_stride * height`
     /// - **Planar 4:2:0 YV12/I420**: `Y + U + V` where:
     ///   - Y plane: `y_stride * height`
-    ///   - U plane: `(y_stride/2) * ceil(height/2)`
-    ///   - V plane: `(y_stride/2) * ceil(height/2)`
+    ///   - U plane: `ceil(y_stride/2) * ceil(height/2)`
+    ///   - V plane: `ceil(y_stride/2) * ceil(height/2)`
     /// - **Semi-planar 4:2:0 NV12**: `Y + UV` where:
     ///   - Y plane: `y_stride * height`
     ///   - UV plane: `y_stride * ceil(height/2)`
     #[must_use]
     pub const fn buffer_len(&self, y_stride: i32, height: i32) -> usize {
-        let y_size = (y_stride as usize) * (height as usize);
-        let chroma_height = ((height + 1) / 2) as usize;
+        let y_stride = y_stride as usize;
+        let height = height as usize;
+        let y_size = y_stride * height;
+        let chroma_height = (height / 2) + (height % 2);
 
         match self.category {
             FormatCategory::Packed => y_size,
             FormatCategory::Planar420 => {
                 // Planar 4:2:0: Y + U + V
                 // U and V planes each have half width and half height
-                let u_stride = (y_stride / 2) as usize;
-                let v_stride = (y_stride / 2) as usize;
+                let u_stride = (y_stride / 2) + (y_stride % 2);
+                let v_stride = (y_stride / 2) + (y_stride % 2);
                 let u_size = u_stride * chroma_height;
                 let v_size = v_stride * chroma_height;
                 y_size + u_size + v_size
@@ -174,7 +176,7 @@ impl PixelFormatInfo {
             FormatCategory::SemiPlanar420 => {
                 // Semi-planar 4:2:0: Y + interleaved UV
                 // UV plane has full width and half height
-                let uv_size = (y_stride as usize) * chroma_height;
+                let uv_size = y_stride * chroma_height;
                 y_size + uv_size
             }
         }
@@ -733,6 +735,13 @@ impl VideoFrame {
         // Use the shared validation helper to validate and compute layout
         let layout = validate_video_layout(c_frame)?;
 
+        Self::from_raw_validated(c_frame, layout)
+    }
+
+    pub(crate) unsafe fn from_raw_validated(
+        c_frame: &NDIlib_video_frame_v2_t,
+        layout: ValidatedVideoLayout,
+    ) -> Result<VideoFrame> {
         // Copy data for ownership
         let slice = slice::from_raw_parts(c_frame.p_data, layout.data_len_bytes);
         let data = slice.to_vec();
@@ -873,9 +882,41 @@ impl VideoFrameBuilder {
         let picture_aspect_ratio = self.picture_aspect_ratio.unwrap_or(16.0 / 9.0);
         let scan_type = self.scan_type.unwrap_or(ScanType::Progressive);
 
-        // Calculate stride and buffer size using the new unified API
-        let stride = pixel_format.line_stride(width);
-        let buffer_size = pixel_format.buffer_size(width, height);
+        if width <= 0 {
+            return Err(Error::InvalidFrame(format!(
+                "Video frame has invalid width: {}",
+                width
+            )));
+        }
+        if height <= 0 {
+            return Err(Error::InvalidFrame(format!(
+                "Video frame has invalid height: {}",
+                height
+            )));
+        }
+        validate_video_dimensions_for_format(pixel_format, width, height)?;
+
+        let width_usize = usize::try_from(width)
+            .map_err(|_| Error::InvalidFrame(format!("Invalid width value: {}", width)))?;
+        let height_usize = usize::try_from(height)
+            .map_err(|_| Error::InvalidFrame(format!("Invalid height value: {}", height)))?;
+
+        // Calculate stride and buffer size using the same checked layout math
+        // as borrowed/owned raw conversion.
+        let stride_usize = min_video_line_stride_checked(pixel_format, width_usize)?;
+        let stride = i32::try_from(stride_usize).map_err(|_| {
+            Error::InvalidFrame(format!(
+                "Video line stride {} exceeds i32 range",
+                stride_usize
+            ))
+        })?;
+        let buffer_size = calculate_buffer_len_checked(pixel_format, stride_usize, height_usize)?;
+        if buffer_size > MAX_VIDEO_BYTES {
+            return Err(Error::InvalidFrame(format!(
+                "Video frame exceeds maximum size: {} bytes > {} bytes",
+                buffer_size, MAX_VIDEO_BYTES
+            )));
+        }
         let data = vec![0u8; buffer_size];
 
         let mut frame = VideoFrame {
@@ -944,9 +985,23 @@ impl AudioFrame {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_raw(raw: NDIlib_audio_frame_v3_t) -> Result<AudioFrame> {
         // Use the shared validation helper to validate and compute layout
         let layout = validate_audio_layout(&raw)?;
+
+        Self::from_raw_validated(raw, layout)
+    }
+
+    pub(crate) fn from_raw_validated(
+        raw: NDIlib_audio_frame_v3_t,
+        layout: ValidatedAudioLayout,
+    ) -> Result<AudioFrame> {
+        if layout.is_empty() {
+            return Err(Error::InvalidFrame(
+                "Cannot create owned AudioFrame from an empty audio layout".into(),
+            ));
+        }
 
         // Copy data for ownership
         let slice = unsafe { slice::from_raw_parts(raw.p_data as *const f32, layout.sample_count) };
@@ -964,9 +1019,11 @@ impl AudioFrame {
             num_channels: raw.no_channels,
             num_samples: raw.no_samples,
             timecode: raw.timecode,
-            format: layout.format,
+            format: layout
+                .format()
+                .expect("validate_audio_layout requires a concrete audio format"),
             data,
-            channel_stride_in_bytes: unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes },
+            channel_stride_in_bytes: layout.channel_stride_in_bytes,
             metadata,
             timestamp: raw.timestamp,
         })
@@ -987,14 +1044,17 @@ impl AudioFrame {
     /// Data is always stored in planar format internally. If `AudioLayout::Interleaved`
     /// was specified at build time, the data was converted to planar during construction.
     pub fn channel_data(&self, channel: usize) -> Option<Vec<f32>> {
-        if channel >= self.num_channels as usize {
+        let num_channels = usize::try_from(self.num_channels).ok()?;
+        let samples_per_channel = usize::try_from(self.num_samples).ok()?;
+        let channel_stride_bytes = usize::try_from(self.channel_stride_in_bytes).ok()?;
+
+        if channel >= num_channels || channel_stride_bytes % std::mem::size_of::<f32>() != 0 {
             return None;
         }
 
-        let samples_per_channel = self.num_samples as usize;
-        let stride_in_samples = self.channel_stride_in_bytes as usize / 4; // f32 = 4 bytes
-        let start = channel * stride_in_samples;
-        let end = start + samples_per_channel;
+        let stride_in_samples = channel_stride_bytes / std::mem::size_of::<f32>();
+        let start = channel.checked_mul(stride_in_samples)?;
+        let end = start.checked_add(samples_per_channel)?;
 
         if end <= self.data.len() {
             Some(self.data[start..end].to_vec())
@@ -1418,7 +1478,7 @@ pub(crate) fn validate_video_layout(raw: &NDIlib_video_frame_v2_t) -> Result<Val
         // Uncompressed format: read ONLY line_stride_in_bytes
         let line_stride = unsafe { raw.__bindgen_anon_1.line_stride_in_bytes };
 
-        // Validate dimensions are positive
+        // Validate dimensions are positive before converting to usize.
         if line_stride <= 0 {
             return Err(Error::InvalidFrame(format!(
                 "Uncompressed video frame has invalid line_stride_in_bytes: {}",
@@ -1438,19 +1498,37 @@ pub(crate) fn validate_video_layout(raw: &NDIlib_video_frame_v2_t) -> Result<Val
             )));
         }
 
-        // Use checked arithmetic to prevent overflow
+        validate_video_dimensions_for_format(pixel_format, raw.xres, raw.yres)?;
+
+        // Use checked arithmetic to prevent overflow.
         let line_stride_usize = usize::try_from(line_stride).map_err(|_| {
             Error::InvalidFrame(format!(
                 "Invalid line_stride_in_bytes value: {}",
                 line_stride
             ))
         })?;
+        let xres_usize = usize::try_from(raw.xres)
+            .map_err(|_| Error::InvalidFrame(format!("Invalid xres value: {}", raw.xres)))?;
         let yres_usize = usize::try_from(raw.yres)
             .map_err(|_| Error::InvalidFrame(format!("Invalid yres value: {}", raw.yres)))?;
 
-        // For planar formats, we need to calculate the full buffer size
-        // buffer_len performs: y_stride * height + chroma planes
-        // We need to do this with checked arithmetic
+        let min_stride = min_video_line_stride_checked(pixel_format, xres_usize)?;
+        if line_stride_usize < min_stride {
+            return Err(Error::InvalidFrame(format!(
+                "Video line_stride_in_bytes {} is smaller than minimum row size {} for {:?} width {}",
+                line_stride, min_stride, pixel_format, raw.xres
+            )));
+        }
+
+        if pixel_format.info().is_planar_420() && line_stride_usize % 2 != 0 {
+            return Err(Error::InvalidFrame(format!(
+                "Planar 4:2:0 video frame has odd line_stride_in_bytes: {}",
+                line_stride
+            )));
+        }
+
+        // For planar formats, calculate the full buffer size with checked
+        // arithmetic instead of PixelFormatInfo::buffer_len's unchecked casts.
         let calculated_size =
             calculate_buffer_len_checked(pixel_format, line_stride_usize, yres_usize)?;
 
@@ -1509,6 +1587,32 @@ pub(crate) fn validate_video_layout(raw: &NDIlib_video_frame_v2_t) -> Result<Val
     })
 }
 
+fn validate_video_dimensions_for_format(
+    pixel_format: PixelFormat,
+    width: i32,
+    height: i32,
+) -> Result<()> {
+    if pixel_format.info().is_planar_420() && (width % 2 != 0 || height % 2 != 0) {
+        return Err(Error::InvalidFrame(format!(
+            "Planar 4:2:0 video frames require even dimensions, got {}x{}",
+            width, height
+        )));
+    }
+
+    Ok(())
+}
+
+fn min_video_line_stride_checked(pixel_format: PixelFormat, width: usize) -> Result<usize> {
+    width
+        .checked_mul(pixel_format.info().bytes_per_pixel() as usize)
+        .ok_or_else(|| {
+            Error::InvalidFrame(format!(
+                "Video line stride overflow for {:?} width {}",
+                pixel_format, width
+            ))
+        })
+}
+
 /// Calculate buffer length with checked arithmetic.
 ///
 /// This is the checked version of `PixelFormatInfo::buffer_len`, which uses
@@ -1531,9 +1635,14 @@ fn calculate_buffer_len_checked(
     match info.category() {
         FormatCategory::Packed => Ok(y_size),
         FormatCategory::Planar420 => {
+            if height % 2 != 0 || y_stride % 2 != 0 {
+                return Err(Error::InvalidFrame(
+                    "Planar 4:2:0 video frames require even height and stride".into(),
+                ));
+            }
             // Planar 4:2:0: Y + U + V
             // U and V planes each have half width and half height
-            let chroma_height = height.div_ceil(2);
+            let chroma_height = height / 2;
             let u_stride = y_stride / 2;
             let v_stride = y_stride / 2;
 
@@ -1552,9 +1661,14 @@ fn calculate_buffer_len_checked(
             Ok(total)
         }
         FormatCategory::SemiPlanar420 => {
+            if height % 2 != 0 {
+                return Err(Error::InvalidFrame(
+                    "Semi-planar 4:2:0 video frames require even height".into(),
+                ));
+            }
             // Semi-planar 4:2:0: Y + interleaved UV
             // UV plane has full width and half height
-            let chroma_height = height.div_ceil(2);
+            let chroma_height = height / 2;
             let uv_size = y_stride
                 .checked_mul(chroma_height)
                 .ok_or_else(|| Error::InvalidFrame("Video UV-plane size overflow".into()))?;
@@ -1571,15 +1685,48 @@ fn calculate_buffer_len_checked(
 /// Validated audio frame layout information.
 ///
 /// This struct holds pre-validated layout information for an audio frame,
-/// including the computed sample count. Creating this struct performs all
-/// necessary bounds checking, so consumers can safely use the cached values
-/// without re-validation.
+/// including the channel stride and computed backing sample count. Creating
+/// this struct performs all necessary bounds checking, so consumers can safely
+/// use the cached values without re-validation.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ValidatedAudioLayout {
-    /// The validated audio format.
-    pub format: AudioFormat,
-    /// The validated total sample count (samples × channels).
+    /// The validated audio format, or `None` for a query/no-source empty state.
+    pub format: Option<AudioFormat>,
+    /// The validated sample rate.
+    pub sample_rate: i32,
+    /// The validated channel count.
+    pub no_channels: usize,
+    /// The validated samples per channel.
+    pub no_samples: usize,
+    /// The validated channel stride in bytes.
+    pub channel_stride_in_bytes: i32,
+    /// The validated channel stride in `f32` samples.
+    pub channel_stride_samples: usize,
+    /// The validated backing sample count. For strided planar audio this may be
+    /// larger than `no_channels * no_samples` because it includes inter-channel
+    /// padding up to the last channel's final sample.
     pub sample_count: usize,
+}
+
+impl ValidatedAudioLayout {
+    pub(crate) fn is_empty(self) -> bool {
+        self.sample_count == 0
+    }
+
+    pub(crate) fn format(self) -> Option<AudioFormat> {
+        self.format
+    }
+
+    pub(crate) fn channel_range(self, channel: usize) -> Option<std::ops::Range<usize>> {
+        if self.is_empty() || channel >= self.no_channels {
+            return None;
+        }
+
+        let start = channel.checked_mul(self.channel_stride_samples)?;
+        let end = start.checked_add(self.no_samples)?;
+
+        (end <= self.sample_count).then_some(start..end)
+    }
 }
 
 /// Validate audio frame layout from raw FFI fields.
@@ -1599,6 +1746,29 @@ pub(crate) struct ValidatedAudioLayout {
 ///
 /// `Ok(ValidatedAudioLayout)` if the frame is valid, or `Err(Error::InvalidFrame(...))` otherwise.
 pub(crate) fn validate_audio_layout(raw: &NDIlib_audio_frame_v3_t) -> Result<ValidatedAudioLayout> {
+    validate_audio_layout_inner(raw, false)
+}
+
+/// Validate a FrameSync audio frame that is allowed to be a documented
+/// query/no-source zero-length state.
+pub(crate) fn validate_audio_layout_allow_empty(
+    raw: &NDIlib_audio_frame_v3_t,
+) -> Result<ValidatedAudioLayout> {
+    validate_audio_layout_inner(raw, true)
+}
+
+fn validate_audio_layout_inner(
+    raw: &NDIlib_audio_frame_v3_t,
+    allow_empty: bool,
+) -> Result<ValidatedAudioLayout> {
+    if raw.no_samples == 0 {
+        if allow_empty {
+            return validate_empty_audio_layout(raw);
+        }
+
+        return Err(Error::InvalidFrame("Invalid number of samples: 0".into()));
+    }
+
     if raw.p_data.is_null() {
         return Err(Error::InvalidFrame(
             "Audio frame has null data pointer".into(),
@@ -1626,6 +1796,15 @@ pub(crate) fn validate_audio_layout(raw: &NDIlib_audio_frame_v3_t) -> Result<Val
         )));
     }
 
+    let format = validate_audio_format(raw.FourCC)?;
+    let channel_stride_in_bytes = unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes };
+    if channel_stride_in_bytes <= 0 {
+        return Err(Error::InvalidFrame(format!(
+            "Invalid channel_stride_in_bytes: {}",
+            channel_stride_in_bytes
+        )));
+    }
+
     // Use checked math to prevent overflow when computing sample count
     let no_samples = usize::try_from(raw.no_samples).map_err(|_| {
         Error::InvalidFrame(format!("Invalid no_samples value: {}", raw.no_samples))
@@ -1635,10 +1814,53 @@ pub(crate) fn validate_audio_layout(raw: &NDIlib_audio_frame_v3_t) -> Result<Val
         Error::InvalidFrame(format!("Invalid no_channels value: {}", raw.no_channels))
     })?;
 
-    let sample_count = no_samples.checked_mul(no_channels).ok_or_else(|| {
+    let channel_stride_bytes = usize::try_from(channel_stride_in_bytes).map_err(|_| {
         Error::InvalidFrame(format!(
-            "Audio sample count overflow: {} samples × {} channels",
-            no_samples, no_channels
+            "Invalid channel_stride_in_bytes value: {}",
+            channel_stride_in_bytes
+        ))
+    })?;
+
+    if channel_stride_bytes % std::mem::size_of::<f32>() != 0 {
+        return Err(Error::InvalidFrame(format!(
+            "channel_stride_in_bytes must be a multiple of {}, got {}",
+            std::mem::size_of::<f32>(),
+            channel_stride_in_bytes
+        )));
+    }
+
+    let minimum_channel_stride = no_samples
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            Error::InvalidFrame(format!(
+                "Audio channel stride overflow: {} samples × {} bytes",
+                no_samples,
+                std::mem::size_of::<f32>()
+            ))
+        })?;
+
+    if channel_stride_bytes < minimum_channel_stride {
+        return Err(Error::InvalidFrame(format!(
+            "channel_stride_in_bytes {} is smaller than one channel of audio samples {}",
+            channel_stride_in_bytes, minimum_channel_stride
+        )));
+    }
+
+    let channel_stride_samples = channel_stride_bytes / std::mem::size_of::<f32>();
+    let last_channel_offset = no_channels
+        .checked_sub(1)
+        .and_then(|last| last.checked_mul(channel_stride_samples))
+        .ok_or_else(|| {
+            Error::InvalidFrame(format!(
+                "Audio channel offset overflow: {} channels × {} stride samples",
+                no_channels, channel_stride_samples
+            ))
+        })?;
+
+    let sample_count = last_channel_offset.checked_add(no_samples).ok_or_else(|| {
+        Error::InvalidFrame(format!(
+            "Audio backing sample count overflow: channel offset {} + {} samples",
+            last_channel_offset, no_samples
         ))
     })?;
 
@@ -1660,20 +1882,84 @@ pub(crate) fn validate_audio_layout(raw: &NDIlib_audio_frame_v3_t) -> Result<Val
         )));
     }
 
-    let format = match raw.FourCC {
-        NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP => AudioFormat::FLTP,
-        _ => {
-            return Err(Error::InvalidFrame(format!(
-                "Unknown audio format FourCC: 0x{:08X}",
-                raw.FourCC
-            )))
-        }
+    Ok(ValidatedAudioLayout {
+        format: Some(format),
+        sample_rate: raw.sample_rate,
+        no_channels,
+        no_samples,
+        channel_stride_in_bytes,
+        channel_stride_samples,
+        sample_count,
+    })
+}
+
+fn validate_empty_audio_layout(raw: &NDIlib_audio_frame_v3_t) -> Result<ValidatedAudioLayout> {
+    if !raw.p_data.is_null() {
+        return Err(Error::InvalidFrame(
+            "Zero-length audio frame has non-null data pointer".into(),
+        ));
+    }
+
+    if raw.sample_rate < 0 {
+        return Err(Error::InvalidFrame(format!(
+            "Invalid sample rate: {}",
+            raw.sample_rate
+        )));
+    }
+
+    if raw.no_channels < 0 {
+        return Err(Error::InvalidFrame(format!(
+            "Invalid number of channels: {}",
+            raw.no_channels
+        )));
+    }
+
+    let channel_stride_in_bytes = unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes };
+    if channel_stride_in_bytes != 0 {
+        return Err(Error::InvalidFrame(format!(
+            "Zero-length audio frame has non-zero channel_stride_in_bytes: {}",
+            channel_stride_in_bytes
+        )));
+    }
+
+    let no_source = raw.sample_rate == 0 && raw.no_channels == 0;
+    let query_format = raw.sample_rate > 0 && raw.no_channels > 0;
+    if !no_source && !query_format {
+        return Err(Error::InvalidFrame(format!(
+            "Invalid zero-length audio query state: sample_rate={}, no_channels={}",
+            raw.sample_rate, raw.no_channels
+        )));
+    }
+
+    let format = if no_source && raw.FourCC == 0 {
+        None
+    } else {
+        Some(validate_audio_format(raw.FourCC)?)
     };
+
+    let no_channels = usize::try_from(raw.no_channels).map_err(|_| {
+        Error::InvalidFrame(format!("Invalid no_channels value: {}", raw.no_channels))
+    })?;
 
     Ok(ValidatedAudioLayout {
         format,
-        sample_count,
+        sample_rate: raw.sample_rate,
+        no_channels,
+        no_samples: 0,
+        channel_stride_in_bytes: 0,
+        channel_stride_samples: 0,
+        sample_count: 0,
     })
+}
+
+fn validate_audio_format(fourcc: NDIlib_FourCC_audio_type_e) -> Result<AudioFormat> {
+    match fourcc {
+        NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP => Ok(AudioFormat::FLTP),
+        _ => Err(Error::InvalidFrame(format!(
+            "Unknown audio format FourCC: 0x{:08X}",
+            fourcc
+        ))),
+    }
 }
 
 // ============================================================================
@@ -1868,7 +2154,7 @@ impl<'rx> VideoFrameRef<'rx> {
     /// This performs a single memcpy of the frame data and metadata,
     /// allowing the frame to outlive the NDI buffer and be sent across threads.
     pub fn to_owned(&self) -> Result<VideoFrame> {
-        unsafe { VideoFrame::from_raw(self.guard.frame()) }
+        unsafe { VideoFrame::from_raw_validated(self.guard.frame(), self.layout) }
     }
 }
 
@@ -1956,17 +2242,17 @@ impl<'rx> AudioFrameRef<'rx> {
 
     /// Get the sample rate in Hz.
     pub fn sample_rate(&self) -> i32 {
-        self.guard.frame().sample_rate
+        self.layout.sample_rate
     }
 
     /// Get the number of audio channels.
     pub fn num_channels(&self) -> i32 {
-        self.guard.frame().no_channels
+        self.layout.no_channels as i32
     }
 
     /// Get the number of samples per channel.
     pub fn num_samples(&self) -> i32 {
-        self.guard.frame().no_samples
+        self.layout.no_samples as i32
     }
 
     /// Get the timecode.
@@ -1983,12 +2269,14 @@ impl<'rx> AudioFrameRef<'rx> {
     ///
     /// This is guaranteed to be a valid, supported format since it's validated during construction.
     pub fn format(&self) -> AudioFormat {
-        self.layout.format
+        self.layout
+            .format()
+            .expect("validate_audio_layout requires a concrete audio format")
     }
 
     /// Get the channel stride in bytes.
     pub fn channel_stride_in_bytes(&self) -> i32 {
-        unsafe { self.guard.frame().__bindgen_anon_1.channel_stride_in_bytes }
+        self.layout.channel_stride_in_bytes
     }
 
     /// Get the metadata as a `CStr`, if present.
@@ -2024,12 +2312,21 @@ impl<'rx> AudioFrameRef<'rx> {
         }
     }
 
+    /// Get the zero-copy samples for a single channel.
+    ///
+    /// This respects `channel_stride_in_bytes`, so it works for tightly packed
+    /// and strided planar FLTP audio.
+    pub fn channel_data(&self, channel: usize) -> Option<&[f32]> {
+        let range = self.layout.channel_range(channel)?;
+        Some(&self.data()[range])
+    }
+
     /// Convert this borrowed frame to an owned `AudioFrame`.
     ///
     /// This performs a single memcpy of the audio data and metadata,
     /// allowing the frame to outlive the NDI buffer and be sent across threads.
     pub fn to_owned(&self) -> Result<AudioFrame> {
-        AudioFrame::from_raw(*self.guard.frame())
+        AudioFrame::from_raw_validated(*self.guard.frame(), self.layout)
     }
 }
 
@@ -2236,16 +2533,16 @@ mod tests {
     fn test_pixel_format_info_planar_420_odd() {
         // 1921x1081 YV12/I420 (odd width and height)
         // Y: 1921 * 1081 = 2,076,601
-        // U: (1921/2) * ceil(1081/2) = 960 * 541 = 519,360
-        // V: (1921/2) * ceil(1081/2) = 960 * 541 = 519,360
-        // Total: 2,076,601 + 519,360 + 519,360 = 3,115,321
+        // U: ceil(1921/2) * ceil(1081/2) = 961 * 541 = 519,901
+        // V: ceil(1921/2) * ceil(1081/2) = 961 * 541 = 519,901
+        // Total: 2,076,601 + 519,901 + 519,901 = 3,116,403
         let y_stride = 1921;
 
         let len = PixelFormat::YV12.info().buffer_len(y_stride, 1081);
-        assert_eq!(len, 3_115_321, "YV12 1921x1081 (odd dimensions)");
+        assert_eq!(len, 3_116_403, "YV12 1921x1081 (odd dimensions)");
 
         let len = PixelFormat::I420.info().buffer_len(y_stride, 1081);
-        assert_eq!(len, 3_115_321, "I420 1921x1081 (odd dimensions)");
+        assert_eq!(len, 3_116_403, "I420 1921x1081 (odd dimensions)");
     }
 
     /// Test PixelFormatInfo for semi-planar NV12 with even dimensions
@@ -2362,22 +2659,17 @@ mod tests {
         assert_eq!(frame.data.len(), 3_110_400, "NV12 1920x1080 buffer size");
     }
 
-    /// Test VideoFrame builder with planar formats and odd dimensions
+    /// Test VideoFrame builder rejects planar formats with odd dimensions
     #[test]
     fn test_videoframe_builder_planar_odd() {
-        let frame = VideoFrame::builder()
+        let result = VideoFrame::builder()
             .resolution(1921, 1081)
             .pixel_format(PixelFormat::I420)
-            .build()
-            .expect("Builder should succeed");
+            .build();
 
-        assert_eq!(frame.width, 1921);
-        assert_eq!(frame.height, 1081);
-        assert_eq!(frame.pixel_format, PixelFormat::I420);
-        assert_eq!(
-            frame.data.len(),
-            3_115_321,
-            "I420 1921x1081 buffer size with ceiling division"
+        assert!(
+            matches!(result, Err(Error::InvalidFrame(_))),
+            "Planar 4:2:0 odd dimensions should be rejected"
         );
     }
 
@@ -2447,16 +2739,15 @@ mod tests {
         );
     }
 
-    /// Test VideoFrame::from_raw with synthetic I420 frame (odd dimensions)
+    /// Test VideoFrame::from_raw rejects synthetic I420 frame with odd dimensions
     #[test]
     fn test_videoframe_from_raw_i420_odd() {
         let width = 1921;
         let height = 1081;
         let y_stride = 1921;
-        let expected_size = 3_115_321; // Y + U + V with ceiling division
+        let expected_size = 3_116_403; // Y + U + V with ceiling division
 
         let mut data = vec![0u8; expected_size];
-        data[expected_size - 1] = 0xAA;
 
         let c_frame = NDIlib_video_frame_v2_t {
             xres: width,
@@ -2475,14 +2766,11 @@ mod tests {
             timestamp: 0,
         };
 
-        let frame = unsafe { VideoFrame::from_raw(&c_frame) }.expect("from_raw should succeed");
-
-        assert_eq!(
-            frame.data.len(),
-            expected_size,
-            "I420 odd dimensions: full buffer copied"
+        let result = unsafe { VideoFrame::from_raw(&c_frame) };
+        assert!(
+            matches!(result, Err(Error::InvalidFrame(_))),
+            "Planar 4:2:0 odd dimensions should be rejected"
         );
-        assert_eq!(frame.data[expected_size - 1], 0xAA, "Last byte copied");
     }
 
     /// Regression test: VideoFrame::from_raw with packed format should be unchanged
@@ -2766,10 +3054,9 @@ mod tests {
     /// Test that audio frames with overflow in checked_mul are rejected
     #[test]
     fn test_audio_overflow_checked_mul() {
-        // Use no_samples = i32::MAX and no_channels = 2 to trigger overflow
-        // When multiplying i32::MAX * 2, the result overflows usize::checked_mul
-        let no_samples = i32::MAX;
-        let no_channels = 2;
+        // Use an extreme channel count to exceed the maximum backing buffer size.
+        let no_samples = 1024;
+        let no_channels = i32::MAX;
         let mut dummy_data = vec![0f32; 1024]; // Small buffer, won't be used due to guard
 
         let raw = NDIlib_audio_frame_v3_t {
@@ -2780,7 +3067,7 @@ mod tests {
             FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
             p_data: dummy_data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
-                channel_stride_in_bytes: 0,
+                channel_stride_in_bytes: no_samples * 4,
             },
             p_metadata: ptr::null(),
             timestamp: 0,
@@ -2821,7 +3108,7 @@ mod tests {
             FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
-                channel_stride_in_bytes: 0,
+                channel_stride_in_bytes: no_samples * 4,
             },
             p_metadata: ptr::null(),
             timestamp: 67890,
@@ -2994,6 +3281,58 @@ mod tests {
         }
     }
 
+    /// Test validate_video_layout rejects strides smaller than one row.
+    #[test]
+    fn test_validate_video_layout_rejects_short_stride() {
+        let mut data = vec![0u8; 1024];
+
+        let raw = NDIlib_video_frame_v2_t {
+            xres: 1920,
+            yres: 1080,
+            FourCC: PixelFormat::BGRA.into(),
+            frame_rate_N: 60,
+            frame_rate_D: 1,
+            picture_aspect_ratio: 16.0 / 9.0,
+            frame_format_type: ScanType::Progressive.into(),
+            timecode: 0,
+            p_data: data.as_mut_ptr(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: 1919 * 4,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 0,
+        };
+
+        let result = validate_video_layout(&raw);
+        assert!(matches!(result, Err(Error::InvalidFrame(_))));
+    }
+
+    /// Test validate_video_layout rejects odd dimensions for planar 4:2:0.
+    #[test]
+    fn test_validate_video_layout_rejects_planar_odd_dimensions() {
+        let mut data = vec![0u8; 4096];
+
+        let raw = NDIlib_video_frame_v2_t {
+            xres: 641,
+            yres: 480,
+            FourCC: PixelFormat::I420.into(),
+            frame_rate_N: 60,
+            frame_rate_D: 1,
+            picture_aspect_ratio: 4.0 / 3.0,
+            frame_format_type: ScanType::Progressive.into(),
+            timecode: 0,
+            p_data: data.as_mut_ptr(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: 642,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 0,
+        };
+
+        let result = validate_video_layout(&raw);
+        assert!(matches!(result, Err(Error::InvalidFrame(_))));
+    }
+
     /// Test validate_video_layout rejects negative dimensions
     #[test]
     fn test_validate_video_layout_negative_dimensions() {
@@ -3086,7 +3425,7 @@ mod tests {
             FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
-                channel_stride_in_bytes: 0,
+                channel_stride_in_bytes: no_samples * 4,
             },
             p_metadata: ptr::null(),
             timestamp: 0,
@@ -3096,8 +3435,118 @@ mod tests {
         assert!(result.is_ok(), "Should validate valid audio frame");
 
         let layout = result.unwrap();
-        assert_eq!(layout.format, AudioFormat::FLTP);
+        assert_eq!(layout.format, Some(AudioFormat::FLTP));
         assert_eq!(layout.sample_count, sample_count);
+    }
+
+    /// Test validate_audio_layout supports strided planar FLTP audio.
+    #[test]
+    fn test_validate_audio_layout_strided_planar() {
+        let no_samples = 4;
+        let no_channels = 2;
+        let stride_samples = 6;
+        let backing_samples = (stride_samples + no_samples) as usize;
+        let mut data = vec![0.0f32; backing_samples];
+
+        let raw = NDIlib_audio_frame_v3_t {
+            sample_rate: 48000,
+            no_channels,
+            no_samples,
+            timecode: 0,
+            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            p_data: data.as_mut_ptr() as *mut u8,
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: stride_samples * 4,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 0,
+        };
+
+        let layout = validate_audio_layout(&raw).expect("strided FLTP should validate");
+        assert_eq!(layout.sample_count, backing_samples);
+        assert_eq!(layout.channel_stride_samples, stride_samples as usize);
+        assert_eq!(layout.channel_range(1), Some(6..10));
+    }
+
+    /// Test validate_audio_layout_allow_empty accepts the documented no-source query state.
+    #[test]
+    fn test_validate_audio_layout_empty_query_no_source() {
+        let raw = NDIlib_audio_frame_v3_t::default();
+
+        let layout =
+            validate_audio_layout_allow_empty(&raw).expect("all-zero query state should validate");
+        assert!(layout.is_empty());
+        assert_eq!(layout.format(), None);
+        assert_eq!(layout.sample_count, 0);
+    }
+
+    /// Test validate_audio_layout_allow_empty accepts source-format query without samples.
+    #[test]
+    fn test_validate_audio_layout_empty_query_with_source_format() {
+        let raw = NDIlib_audio_frame_v3_t {
+            sample_rate: 48000,
+            no_channels: 2,
+            no_samples: 0,
+            timecode: 0,
+            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            p_data: ptr::null_mut(),
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: 0,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 0,
+        };
+
+        let layout = validate_audio_layout_allow_empty(&raw)
+            .expect("query source format should validate without samples");
+        assert!(layout.is_empty());
+        assert_eq!(layout.format(), Some(AudioFormat::FLTP));
+        assert_eq!(layout.sample_rate, 48000);
+        assert_eq!(layout.no_channels, 2);
+    }
+
+    /// Test empty audio validation rejects partial query/no-source states.
+    #[test]
+    fn test_validate_audio_layout_rejects_partial_empty_query() {
+        let raw = NDIlib_audio_frame_v3_t {
+            sample_rate: 48000,
+            no_channels: 0,
+            no_samples: 0,
+            timecode: 0,
+            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            p_data: ptr::null_mut(),
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: 0,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 0,
+        };
+
+        let result = validate_audio_layout_allow_empty(&raw);
+        assert!(matches!(result, Err(Error::InvalidFrame(_))));
+    }
+
+    /// Test validate_audio_layout rejects invalid channel stride.
+    #[test]
+    fn test_validate_audio_layout_rejects_invalid_channel_stride() {
+        let mut data = vec![0.0f32; 2048];
+
+        let raw = NDIlib_audio_frame_v3_t {
+            sample_rate: 48000,
+            no_channels: 2,
+            no_samples: 1024,
+            timecode: 0,
+            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            p_data: data.as_mut_ptr() as *mut u8,
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: 1024 * 4 - 4,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 0,
+        };
+
+        let result = validate_audio_layout(&raw);
+        assert!(matches!(result, Err(Error::InvalidFrame(_))));
     }
 
     /// Test validate_audio_layout rejects null data pointer
@@ -3111,7 +3560,7 @@ mod tests {
             FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
             p_data: ptr::null_mut(),
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
-                channel_stride_in_bytes: 0,
+                channel_stride_in_bytes: 1024 * 4,
             },
             p_metadata: ptr::null(),
             timestamp: 0,
@@ -3143,7 +3592,7 @@ mod tests {
             FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
-                channel_stride_in_bytes: 0,
+                channel_stride_in_bytes: 1024 * 4,
             },
             p_metadata: ptr::null(),
             timestamp: 0,
@@ -3169,13 +3618,13 @@ mod tests {
 
         let raw = NDIlib_audio_frame_v3_t {
             sample_rate: 48000,
-            no_channels: 2,
-            no_samples: i32::MAX, // Will overflow when multiplied by channels
+            no_channels: i32::MAX,
+            no_samples: 1024,
             timecode: 0,
             FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
             p_data: data.as_mut_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
-                channel_stride_in_bytes: 0,
+                channel_stride_in_bytes: 1024 * 4,
             },
             p_metadata: ptr::null(),
             timestamp: 0,
@@ -3298,7 +3747,7 @@ mod tests {
             FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
             p_data: data.as_ptr() as *mut u8,
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
-                channel_stride_in_bytes: 0,
+                channel_stride_in_bytes: no_samples * 4,
             },
             p_metadata: ptr::null(),
             timestamp: 67890,
