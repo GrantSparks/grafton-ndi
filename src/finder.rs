@@ -6,7 +6,7 @@ use std::{
     fmt::{self, Display, Formatter},
     ptr,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{ndi_lib::*, to_ms_checked, Error, Result, NDI};
@@ -882,15 +882,34 @@ impl SourceCache {
             .build();
         let finder = Finder::new(&ndi, &options)?;
 
-        finder.wait_for_sources(timeout)?;
-        let sources = finder.sources(Duration::ZERO)?;
-
-        let source = sources
-            .into_iter()
-            .find(|s| s.matches_host(host))
-            .ok_or_else(|| Error::NoSourcesFound {
-                criteria: format!("host: {host}"),
-            })?;
+        // Poll until the deadline, short-circuiting as soon as a source
+        // matching the host appears. A single `wait_for_sources` returns
+        // on the *first* source-list change, which yields only a partial
+        // snapshot when discovery is staggered (e.g. unicast / IP-hint-only
+        // networks where responders trickle in across several change
+        // notifications). A matching source advertised in a later
+        // notification would be missed, surfacing as a spurious
+        // `NoSourcesFound`. Looping until the deadline makes resolution
+        // robust against staggered discovery while still returning the
+        // instant a match is observed.
+        let deadline = Instant::now() + timeout;
+        let source = loop {
+            let sources = finder.current_sources()?;
+            if let Some(found) = sources.into_iter().find(|s| s.matches_host(host)) {
+                break found;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::NoSourcesFound {
+                    criteria: format!("host: {host}"),
+                });
+            }
+            // Block until the source list changes or the remaining window
+            // expires. `false` means the window expired with no further
+            // change; the next loop's `current_sources` check + zero
+            // `remaining` then returns `NoSourcesFound`.
+            finder.wait_for_sources(remaining)?;
+        };
 
         {
             let mut cache = self
