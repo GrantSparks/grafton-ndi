@@ -58,7 +58,7 @@ use std::{
 
 use crate::{
     frames::{AudioFrame, MetadataFrame, VideoFrame},
-    to_ms_checked, Receiver, Result,
+    to_ms_checked, ConnectionStats, Receiver, Result,
 };
 
 #[cfg(feature = "tokio")]
@@ -378,6 +378,36 @@ impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
     ) -> Result<Option<MetadataFrame>> {
         let receiver = Arc::clone(&self.inner);
         R::spawn_blocking(move || receiver.capture_metadata_timeout(timeout)).await?
+    }
+
+    /// Whether the underlying receiver currently has at least one active
+    /// connection to its source. See [`Receiver::is_connected`].
+    ///
+    /// A cheap, non-blocking SDK query, so it runs inline rather than on
+    /// the blocking pool.
+    pub fn is_connected(&self) -> bool {
+        self.inner.is_connected()
+    }
+
+    /// Connection and frame-throughput statistics for the underlying
+    /// receiver. See [`Receiver::connection_stats`].
+    ///
+    /// A cheap, non-blocking SDK query, so it runs inline rather than on
+    /// the blocking pool. `connection_stats().video_frames_received` is
+    /// the canonical liveness signal: it advances as the receiver pulls
+    /// frames off the network, independent of how often the caller
+    /// captures, so a frozen counter means the feed itself has stalled.
+    pub fn connection_stats(&self) -> ConnectionStats {
+        self.inner.connection_stats()
+    }
+
+    /// Re-establish the underlying receiver's connection to its source
+    /// in place. See [`Receiver::reconnect`].
+    ///
+    /// A cheap, non-blocking SDK call, so it runs inline. Must not race
+    /// with an in-flight capture on this receiver.
+    pub fn reconnect(&self) -> Result<()> {
+        self.inner.reconnect()
     }
 }
 

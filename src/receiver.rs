@@ -1219,6 +1219,44 @@ impl Receiver {
         unsafe { NDIlib_recv_get_no_connections(self.instance) > 0 }
     }
 
+    /// Re-establish this receiver's connection to its original source,
+    /// in place.
+    ///
+    /// Re-points the existing NDI receiver instance at the [`Source`] it
+    /// was created for **without** destroying and recreating the
+    /// receiver. This is intended for mid-session recovery: when a
+    /// source's feed has gone silent (for example an encoder-bound
+    /// NDI|HX camera that dropped its proxy stream under load), a
+    /// reconnect forces a fresh connection attempt while avoiding the
+    /// source-rediscovery round trip — and the discovery race — that
+    /// tearing down and rebuilding the receiver would incur.
+    ///
+    /// Liveness can be observed via [`Self::is_connected`] and
+    /// [`Self::connection_stats`] (`video_frames_received` resuming its
+    /// climb indicates frames are flowing again).
+    ///
+    /// # Thread safety
+    ///
+    /// This calls the NDI SDK's thread-safe receive API, but a reconnect
+    /// tears down and re-establishes the underlying connection. Callers
+    /// must not invoke it concurrently with an in-flight capture on the
+    /// **same** receiver.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the stored [`Source`] cannot be
+    /// re-marshalled to its FFI representation; `NDIlib_recv_connect`
+    /// itself reports no status.
+    pub fn reconnect(&self) -> Result<()> {
+        let raw = self.source.to_raw()?;
+        // SAFETY: `self.instance` is a valid receiver instance for the
+        // lifetime of `self`, and `raw` (which owns the backing
+        // CStrings) outlives the call, so the pointers inside `raw.raw`
+        // stay valid while the SDK copies the source descriptor.
+        unsafe { NDIlib_recv_connect(self.instance, &raw.raw) };
+        Ok(())
+    }
+
     /// Get the source this receiver is connected to.
     ///
     /// Returns a reference to the [`Source`] that was specified when creating
