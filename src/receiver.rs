@@ -9,7 +9,7 @@
 //! # use std::time::Duration;
 //! # fn main() -> Result<(), grafton_ndi::Error> {
 //! # let ndi = NDI::new()?;
-//! // In real usage, you'd get the source from Finder::sources()
+//! // In real usage, you'd get the source from Finder::find_sources()
 //! // let source = /* obtained from Finder */;
 //! let options = ReceiverOptions::builder(source)
 //!     .bandwidth(ReceiverBandwidth::MetadataOnly)
@@ -33,6 +33,7 @@
 use std::{
     ffi::CString,
     ptr,
+    sync::{PoisonError, RwLock, RwLockReadGuard},
     time::{Duration, Instant},
 };
 
@@ -386,7 +387,7 @@ impl ReceiverOptionsBuilder {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// # finder.wait_for_sources(Duration::from_secs(1))?;
-    /// # let sources = finder.sources(Duration::ZERO)?;
+    /// # let sources = finder.current_sources()?;
     /// let options = ReceiverOptionsBuilder::snapshot_preset(sources[0].clone())
     ///     .name("Snapshot Receiver")
     ///     .build();
@@ -431,7 +432,7 @@ impl ReceiverOptionsBuilder {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// # finder.wait_for_sources(Duration::from_secs(1))?;
-    /// # let sources = finder.sources(Duration::ZERO)?;
+    /// # let sources = finder.current_sources()?;
     /// let options = ReceiverOptionsBuilder::high_quality_preset(sources[0].clone())
     ///     .name("High Quality Receiver")
     ///     .build();
@@ -472,7 +473,7 @@ impl ReceiverOptionsBuilder {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// # finder.wait_for_sources(Duration::from_secs(1))?;
-    /// # let sources = finder.sources(Duration::ZERO)?;
+    /// # let sources = finder.current_sources()?;
     /// let options = ReceiverOptionsBuilder::monitoring_preset(sources[0].clone())
     ///     .name("Tally Monitor")
     ///     .build();
@@ -557,6 +558,14 @@ pub struct Receiver {
     pub(crate) instance: NDIlib_recv_instance_t,
     _ndi: NDI,
     source: Source,
+    /// Serializes connection changes against in-flight captures.
+    ///
+    /// Capture calls take this lock *shared* (so video, audio, and metadata
+    /// captures still run concurrently), while [`Receiver::reconnect`] takes it
+    /// *exclusively*. This guarantees `NDIlib_recv_connect` never overlaps a
+    /// `NDIlib_recv_capture_v3` on the same instance — the one combination the
+    /// SDK does not make safe — without otherwise serializing capture.
+    capture_guard: RwLock<()>,
 }
 
 impl Receiver {
@@ -572,8 +581,19 @@ impl Receiver {
                 instance,
                 _ndi: ndi.clone(),
                 source: create.source_to_connect_to.clone(),
+                capture_guard: RwLock::new(()),
             })
         }
+    }
+
+    /// Acquire the shared capture guard, held for the duration of a single
+    /// `NDIlib_recv_capture_v3` call. Multiple captures proceed concurrently;
+    /// only [`Self::reconnect`] takes the guard exclusively. The guarded data
+    /// is `()`, so a poisoned lock carries no invalid state and is recovered.
+    fn capture_lock(&self) -> RwLockReadGuard<'_, ()> {
+        self.capture_guard
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn ptz_is_supported(&self) -> bool {
@@ -787,6 +807,8 @@ impl Receiver {
     ) -> Result<Option<VideoFrameRef<'rx>>> {
         let timeout_ms = to_ms_checked(timeout)?;
 
+        // Shared guard: excludes a concurrent `reconnect`, not other captures.
+        let _capture = self.capture_lock();
         // SAFETY: self.instance is a valid NDI receiver instance
         match unsafe { capture_video_raw(self.instance, timeout_ms) } {
             CaptureResult::Frame(guard) => {
@@ -949,6 +971,8 @@ impl Receiver {
     ) -> Result<Option<AudioFrameRef<'rx>>> {
         let timeout_ms = to_ms_checked(timeout)?;
 
+        // Shared guard: excludes a concurrent `reconnect`, not other captures.
+        let _capture = self.capture_lock();
         // SAFETY: self.instance is a valid NDI receiver instance
         match unsafe { capture_audio_raw(self.instance, timeout_ms) } {
             CaptureResult::Frame(guard) => {
@@ -1092,6 +1116,8 @@ impl Receiver {
     ) -> Result<Option<MetadataFrameRef<'rx>>> {
         let timeout_ms = to_ms_checked(timeout)?;
 
+        // Shared guard: excludes a concurrent `reconnect`, not other captures.
+        let _capture = self.capture_lock();
         // SAFETY: self.instance is a valid NDI receiver instance
         match unsafe { capture_metadata_raw(self.instance, timeout_ms) } {
             CaptureResult::Frame(guard) => {
@@ -1237,18 +1263,34 @@ impl Receiver {
     ///
     /// # Thread safety
     ///
-    /// This calls the NDI SDK's thread-safe receive API, but a reconnect
-    /// tears down and re-establishes the underlying connection. Callers
-    /// must not invoke it concurrently with an in-flight capture on the
-    /// **same** receiver.
+    /// `NDIlib_recv_connect` is the one receive call the SDK does *not* make
+    /// safe to run concurrently with `NDIlib_recv_capture_v3` on the same
+    /// instance. This method therefore takes the receiver's capture guard
+    /// exclusively: it **blocks until every in-flight capture on this receiver
+    /// returns**, and holds off any capture that starts while it runs. Captures
+    /// on the same receiver still run concurrently with each other; only a
+    /// reconnect is exclusive. Because it can block for as long as a capture's
+    /// timeout, prefer short capture timeouts on receivers you intend to
+    /// recover, and call it off the async runtime — `AsyncReceiver::reconnect`
+    /// does this for you.
     ///
     /// # Errors
     ///
     /// Returns an error only if the stored [`Source`] cannot be
     /// re-marshalled to its FFI representation; `NDIlib_recv_connect`
-    /// itself reports no status.
+    /// itself reports no status, so a returned `Ok` means the reconnect was
+    /// *issued*, not that the feed has recovered — confirm recovery via
+    /// [`Self::connection_stats`].
     pub fn reconnect(&self) -> Result<()> {
+        // Marshal before locking; this touches only `self.source`, not the
+        // instance, so it need not hold off captures.
         let raw = self.source.to_raw()?;
+        // Exclusive guard: waits for in-flight captures to drain and blocks new
+        // ones, so `NDIlib_recv_connect` never overlaps `NDIlib_recv_capture_v3`.
+        let _exclusive = self
+            .capture_guard
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         // SAFETY: `self.instance` is a valid receiver instance for the
         // lifetime of `self`, and `raw` (which owns the backing
         // CStrings) outlives the call, so the pointers inside `raw.raw`
@@ -1356,6 +1398,8 @@ impl Receiver {
     /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
     pub fn poll_status_change(&self, timeout: Duration) -> Result<Option<ReceiverStatus>> {
         let timeout_ms = to_ms_checked(timeout)?;
+        // Shared guard: excludes a concurrent `reconnect`, not other captures.
+        let _capture = self.capture_lock();
         // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
         let frame_type = unsafe {
             NDIlib_recv_capture_v3(

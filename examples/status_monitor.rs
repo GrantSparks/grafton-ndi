@@ -44,8 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let finder = Finder::new(&ndi, &finder_options)?;
 
     println!("Looking for NDI sources...");
-    finder.wait_for_sources(Duration::from_secs(5))?;
-    let sources = finder.sources(Duration::ZERO)?;
+    let sources = finder.find_sources(Duration::from_secs(5))?;
 
     if sources.is_empty() {
         println!("No NDI sources found on the network");

@@ -621,7 +621,7 @@ impl VideoFrame {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// # finder.wait_for_sources(Duration::from_millis(1000))?;
-    /// # let sources = finder.sources(Duration::ZERO)?;
+    /// # let sources = finder.current_sources()?;
     /// # let options = ReceiverOptions::builder(sources[0].clone())
     /// #     .color(ReceiverColorFormat::RGBX_RGBA)
     /// #     .build();
@@ -687,7 +687,7 @@ impl VideoFrame {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// # finder.wait_for_sources(Duration::from_millis(1000))?;
-    /// # let sources = finder.sources(Duration::ZERO)?;
+    /// # let sources = finder.current_sources()?;
     /// # let options = ReceiverOptions::builder(sources[0].clone())
     /// #     .color(ReceiverColorFormat::RGBX_RGBA)
     /// #     .build();
@@ -734,7 +734,7 @@ impl VideoFrame {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// # finder.wait_for_sources(Duration::from_millis(1000))?;
-    /// # let sources = finder.sources(Duration::ZERO)?;
+    /// # let sources = finder.current_sources()?;
     /// # let options = ReceiverOptions::builder(sources[0].clone())
     /// #     .color(ReceiverColorFormat::RGBX_RGBA)
     /// #     .build();

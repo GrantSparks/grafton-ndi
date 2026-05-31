@@ -995,7 +995,7 @@ fn test_tokio_async_receiver_methods_exist() {
             let _: bool = async_receiver.is_connected();
             let _stats = async_receiver.connection_stats();
             let _: u64 = async_receiver.connection_stats().video_frames_received;
-            let _: crate::Result<()> = async_receiver.reconnect();
+            let _: crate::Result<()> = async_receiver.reconnect().await;
         }
     };
 }
@@ -1083,7 +1083,7 @@ fn test_async_std_async_receiver_methods_exist() {
             let _: bool = async_receiver.is_connected();
             let _stats = async_receiver.connection_stats();
             let _: u64 = async_receiver.connection_stats().video_frames_received;
-            let _: crate::Result<()> = async_receiver.reconnect();
+            let _: crate::Result<()> = async_receiver.reconnect().await;
         }
     };
 }

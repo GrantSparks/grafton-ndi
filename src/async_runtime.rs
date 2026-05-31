@@ -404,10 +404,15 @@ impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
     /// Re-establish the underlying receiver's connection to its source
     /// in place. See [`Receiver::reconnect`].
     ///
-    /// A cheap, non-blocking SDK call, so it runs inline. Must not race
-    /// with an in-flight capture on this receiver.
-    pub fn reconnect(&self) -> Result<()> {
-        self.inner.reconnect()
+    /// Unlike the liveness probes above, a reconnect takes the receiver's
+    /// capture guard exclusively, so it can block until in-flight captures
+    /// (which run on the blocking pool) drain. It therefore runs on the
+    /// blocking pool too, never on the async runtime's threads, and is safe to
+    /// call while captures on this receiver are in flight — they serialize
+    /// instead of racing. Confirm recovery via [`Self::connection_stats`].
+    pub async fn reconnect(&self) -> Result<()> {
+        let receiver = Arc::clone(&self.inner);
+        R::spawn_blocking(move || receiver.reconnect()).await?
     }
 }
 

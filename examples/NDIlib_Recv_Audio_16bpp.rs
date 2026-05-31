@@ -55,7 +55,7 @@ fn main() -> Result<(), Error> {
             return Ok(());
         }
         finder.wait_for_sources(Duration::from_secs(1))?;
-        let sources = finder.sources(Duration::ZERO)?;
+        let sources = finder.current_sources()?;
         if !sources.is_empty() {
             break sources;
         }

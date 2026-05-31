@@ -95,7 +95,7 @@ fn main() -> Result<(), Error> {
     println!("Looking for sources ...");
     let sources = loop {
         finder.wait_for_sources(Duration::from_secs(1))?;
-        let sources = finder.sources(Duration::ZERO)?;
+        let sources = finder.current_sources()?;
         if !sources.is_empty() {
             let count = sources.len();
             println!("Found {count} source(s):");

@@ -130,7 +130,7 @@ impl Default for FinderOptionsBuilder {
 ///
 /// // Wait for initial discovery
 /// if finder.wait_for_sources(Duration::from_secs(5))? {
-///     let sources = finder.sources(Duration::ZERO)?;
+///     let sources = finder.current_sources()?;
 ///     for source in sources {
 ///         println!("Found: {}", source);
 ///     }
@@ -282,82 +282,63 @@ impl Finder {
         Ok(sources)
     }
 
-    /// Returns the current list of discovered sources.
+    /// Poll discovery until `accept` selects a value or `timeout` elapses.
     ///
-    /// # Arguments
+    /// After each source-list snapshot, `accept` is handed the current sources
+    /// and may return `Some` to stop immediately; otherwise this blocks on the
+    /// next source-list change and retries until the deadline. A single
+    /// [`wait_for_sources`](Self::wait_for_sources) returns on the *first*
+    /// change, yielding only a partial snapshot when discovery is staggered
+    /// (unicast / IP-hint-only networks where responders trickle in across
+    /// several notifications); polling to the deadline makes resolution robust
+    /// against that while still returning the instant `accept` is satisfied.
     ///
-    /// * `timeout` - Time to wait for sources ([`Duration::ZERO`] = immediate).
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Returns
-    ///
-    /// A vector of discovered sources. May be empty if no sources are found.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{NDI, FinderOptions, Finder};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// // Get sources immediately
-    /// let sources = finder.sources(Duration::ZERO)?;
-    ///
-    /// // Get sources with 1 second timeout
-    /// let sources = finder.sources(Duration::from_secs(1))?;
-    ///
-    /// for source in sources {
-    ///     println!("{}", source);
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn sources(&self, timeout: Duration) -> Result<Vec<Source>> {
-        let timeout_ms = to_ms_checked(timeout)?;
-        let mut num_sources = 0;
-        let sources_ptr =
-            unsafe { NDIlib_find_get_sources(self.instance, &mut num_sources, timeout_ms) };
-        if sources_ptr.is_null() {
-            return Ok(vec![]);
-        }
-
-        // Convert each source, skipping any that fail null checks
-        let mut sources = Vec::with_capacity(num_sources as usize);
-        for i in 0..num_sources {
-            let source_ptr = unsafe { sources_ptr.add(i as usize) };
-            match Source::try_from_raw(source_ptr) {
-                Ok(source) => sources.push(source),
-                Err(_e) => {
-                    // Skip invalid sources (null pointers from SDK)
-                    // This is a defensive measure - the SDK should not return null entries,
-                    // but we handle it gracefully if it does
-                    #[cfg(debug_assertions)]
-                    eprintln!("Warning: Skipping invalid source at index {i}: {_e}");
-                }
+    /// Returns `Ok(None)` if the deadline passes without `accept` selecting a
+    /// value.
+    fn poll_until_deadline<T>(
+        &self,
+        timeout: Duration,
+        mut accept: impl FnMut(Vec<Source>) -> Option<T>,
+    ) -> Result<Option<T>> {
+        // Validate up front so an over-long timeout is rejected even when the
+        // first snapshot already satisfies `accept`.
+        to_ms_checked(timeout)?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(selected) = accept(self.current_sources()?) {
+                return Ok(Some(selected));
             }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            // Block until the source list changes or the remaining window
+            // expires; either way the next iteration re-snapshots and the
+            // zero-`remaining` check then terminates the loop.
+            self.wait_for_sources(remaining)?;
         }
-        Ok(sources)
     }
 
-    /// Waits for sources and then returns the current list.
+    /// Discovers sources for up to `timeout`, returning the complete set.
     ///
-    /// This is a convenience method that combines [`wait_for_sources`](Self::wait_for_sources)
-    /// followed by [`sources`](Self::sources) with a zero timeout. Even if no "change" is signaled,
-    /// cached sources may exist and will be returned.
+    /// This honors the full `timeout` window and returns every source observed
+    /// within it. Unlike a single [`wait_for_sources`](Self::wait_for_sources)
+    /// followed by a snapshot — which returns on the *first* source-list change
+    /// and so can miss responders that announce late on staggered or unicast
+    /// (IP-hint-only) networks — enumeration here is complete and deterministic.
+    ///
+    /// For an immediate, non-blocking snapshot of already-known sources use
+    /// [`current_sources`](Self::current_sources); to resolve a single specific
+    /// host use [`SourceCache::find_by_host`].
     ///
     /// # Arguments
     ///
-    /// * `timeout` - Maximum time to wait for source changes.
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+    /// * `timeout` - Discovery window. [`Duration::ZERO`] returns an immediate
+    ///   snapshot. Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
     ///
     /// # Returns
     ///
-    /// A vector of discovered sources. May be empty if no sources are found.
+    /// Every source discovered within the window. May be empty if none appear.
     ///
     /// # Errors
     ///
@@ -371,7 +352,7 @@ impl Finder {
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// // Wait up to 5 seconds and get sources
+    /// // Discover for up to 5 seconds, then list everything found
     /// let sources = finder.find_sources(Duration::from_secs(5))?;
     ///
     /// for source in sources {
@@ -381,8 +362,14 @@ impl Finder {
     /// # }
     /// ```
     pub fn find_sources(&self, timeout: Duration) -> Result<Vec<Source>> {
-        let _changed = self.wait_for_sources(timeout)?; // intentionally ignored
-        self.sources(Duration::ZERO)
+        // `accept` never short-circuits, so the loop runs to the deadline and
+        // we keep the freshest snapshot, which is the complete set.
+        let mut discovered = Vec::new();
+        self.poll_until_deadline(timeout, |sources| {
+            discovered = sources;
+            None::<()>
+        })?;
+        Ok(discovered)
     }
 }
 
@@ -882,34 +869,16 @@ impl SourceCache {
             .build();
         let finder = Finder::new(&ndi, &options)?;
 
-        // Poll until the deadline, short-circuiting as soon as a source
-        // matching the host appears. A single `wait_for_sources` returns
-        // on the *first* source-list change, which yields only a partial
-        // snapshot when discovery is staggered (e.g. unicast / IP-hint-only
-        // networks where responders trickle in across several change
-        // notifications). A matching source advertised in a later
-        // notification would be missed, surfacing as a spurious
-        // `NoSourcesFound`. Looping until the deadline makes resolution
-        // robust against staggered discovery while still returning the
-        // instant a match is observed.
-        let deadline = Instant::now() + timeout;
-        let source = loop {
-            let sources = finder.current_sources()?;
-            if let Some(found) = sources.into_iter().find(|s| s.matches_host(host)) {
-                break found;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(Error::NoSourcesFound {
-                    criteria: format!("host: {host}"),
-                });
-            }
-            // Block until the source list changes or the remaining window
-            // expires. `false` means the window expired with no further
-            // change; the next loop's `current_sources` check + zero
-            // `remaining` then returns `NoSourcesFound`.
-            finder.wait_for_sources(remaining)?;
-        };
+        // Resolve the host by polling discovery to the deadline, returning the
+        // instant a matching source appears. See `Finder::poll_until_deadline`
+        // for why this beats a single `wait_for_sources` on staggered networks.
+        let source = finder
+            .poll_until_deadline(timeout, |sources| {
+                sources.into_iter().find(|s| s.matches_host(host))
+            })?
+            .ok_or_else(|| Error::NoSourcesFound {
+                criteria: format!("host: {host}"),
+            })?;
 
         {
             let mut cache = self

@@ -27,15 +27,10 @@ fn main() -> Result<(), grafton_ndi::Error> {
     let finder_options = builder.build();
     let finder = grafton_ndi::Finder::new(&ndi, &finder_options)?;
 
-    // Wait for sources
+    // Discover sources across the full 5s window so late responders on
+    // staggered/unicast networks are not missed.
     println!("Looking for NDI sources...");
-    if !finder.wait_for_sources(Duration::from_secs(5))? {
-        println!("No sources found after 5 seconds");
-        return Ok(());
-    }
-
-    // Get available sources
-    let sources = finder.sources(Duration::ZERO)?;
+    let sources = finder.find_sources(Duration::from_secs(5))?;
     if sources.is_empty() {
         println!("No NDI sources found on the network");
         return Ok(());
