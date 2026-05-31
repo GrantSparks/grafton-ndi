@@ -168,7 +168,7 @@ jobs:
 
       - name: Authenticate with crates.io
         id: auth
-        uses: rust-lang/crates-io-auth-action@v1
+        uses: rust-lang/crates-io-auth-action@v1.0.4
 
       - name: Publish to crates.io
         run: cargo publish
