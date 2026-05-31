@@ -55,7 +55,7 @@ fn main() -> Result<(), Error> {
     // Run for one minute
     let start = Instant::now();
     while !exit_loop.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(60) {
-        if let Some(video_frame) = receiver.capture_video_timeout(Duration::ZERO)? {
+        if let Some(video_frame) = receiver.video().try_capture(Duration::ZERO)? {
             println!(
                 "Video data received ({width}x{height}).",
                 width = video_frame.width(),
@@ -63,7 +63,7 @@ fn main() -> Result<(), Error> {
             );
         }
 
-        if let Some(audio_frame) = receiver.capture_audio_timeout(Duration::ZERO)? {
+        if let Some(audio_frame) = receiver.audio().try_capture(Duration::ZERO)? {
             println!(
                 "Audio data received ({num_samples} samples).",
                 num_samples = audio_frame.num_samples()
@@ -78,7 +78,7 @@ fn main() -> Result<(), Error> {
             );
         }
 
-        if let Some(_metadata) = receiver.capture_metadata_timeout(Duration::ZERO)? {
+        if let Some(_metadata) = receiver.metadata().try_capture(Duration::ZERO)? {
             println!("Meta data received.");
         }
 

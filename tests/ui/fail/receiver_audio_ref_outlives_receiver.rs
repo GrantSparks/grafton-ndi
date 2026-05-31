@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
+use grafton_ndi::{Receiver, ReceiverOptions, Source, SourceAddress, NDI};
 
 fn receiver(ndi: &NDI) -> Receiver {
     let source = Source {
@@ -19,7 +19,8 @@ fn main() {
     let frame_ref = {
         let receiver = receiver(&ndi);
         receiver
-            .capture_audio_ref(Duration::from_millis(1))
+            .audio()
+            .try_capture_ref(Duration::from_millis(1))
             .unwrap()
             .unwrap()
     };

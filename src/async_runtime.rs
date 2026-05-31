@@ -41,7 +41,7 @@
 //!     let async_receiver = AsyncReceiver::new(receiver);
 //!
 //!     // Capture frame asynchronously without blocking the runtime
-//!     let frame = async_receiver.capture_video(std::time::Duration::from_secs(5)).await?;
+//!     let frame = async_receiver.video().capture(std::time::Duration::from_secs(5)).await?;
 //!     println!("Captured {}x{} frame", frame.width(), frame.height());
 //!
 //!     Ok(())
@@ -57,7 +57,7 @@ use std::{
 };
 
 use crate::{
-    frames::{AudioFrame, MetadataFrame, VideoFrame},
+    capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
     to_ms_checked, ConnectionStats, Receiver, Result,
 };
 
@@ -177,7 +177,7 @@ impl SpawnBlocking for AsyncStdRuntime {
 ///     let async_receiver = AsyncReceiver::new(receiver);
 ///
 ///     // Non-blocking async capture
-///     match async_receiver.capture_video_timeout(std::time::Duration::from_millis(100)).await? {
+///     match async_receiver.video().try_capture(std::time::Duration::from_millis(100)).await? {
 ///         Some(frame) => println!("Got frame: {}x{}", frame.width(), frame.height()),
 ///         None => println!("No frame available"),
 ///     }
@@ -211,27 +211,12 @@ impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
         }
     }
 
-    /// Async version of [`Receiver::capture_video`].
+    /// Capture **video** frames without blocking the async runtime.
     ///
-    /// Captures a video frame, blocking until received or timeout expires, without blocking
-    /// the async runtime. Uses the runtime's `spawn_blocking` internally.
-    ///
-    /// This is the **primary method** for reliable video frame capture in async contexts.
-    /// It handles retries automatically to work around NDI SDK synchronization behavior.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Total budget to wait for a frame, starting when this async
-    ///   method is called. Blocking task queue delay is subtracted before the
-    ///   synchronous receiver starts waiting. Must not exceed
-    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(frame)` - Successfully captured a video frame
-    /// * `Err(Error::FrameTimeout)` - No frame received within timeout (includes retry details)
-    /// * `Err(Error::SpawnFailed)` - The blocking task panicked or was cancelled
-    /// * `Err(_)` - Another error occurred during capture
+    /// Returns an [`AsyncCapture`] view; see [`AsyncCapture`] for its verbs
+    /// ([`capture`](AsyncCapture::capture),
+    /// [`try_capture`](AsyncCapture::try_capture)). Mirrors
+    /// [`Receiver::video`], running each capture on the blocking pool.
     ///
     /// # Example
     ///
@@ -250,134 +235,33 @@ impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
     /// # let options = ReceiverOptions::builder(source).build();
     /// # let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
     /// let async_receiver = AsyncReceiver::new(receiver);
-    /// let frame = async_receiver.capture_video(Duration::from_secs(5)).await?;
+    /// let frame = async_receiver.video().capture(Duration::from_secs(5)).await?;
     /// println!("Captured {}x{} frame", frame.width(), frame.height());
     /// # Ok(())
     /// # }
     /// # }
     /// ```
-    pub async fn capture_video(&self, timeout: Duration) -> Result<VideoFrame> {
-        let start_time = validated_timeout_start(timeout)?;
-        let receiver = Arc::clone(&self.inner);
-        R::spawn_blocking(move || receiver.capture_video(remaining_timeout(timeout, start_time)))
-            .await?
+    #[must_use = "the AsyncCapture view does nothing until a capture verb is awaited"]
+    pub fn video(&self) -> AsyncCapture<'_, R, VideoKind> {
+        AsyncCapture::new(self)
     }
 
-    /// Async version of [`Receiver::capture_video_timeout`].
+    /// Capture **audio** frames without blocking the async runtime.
     ///
-    /// Attempts to capture a video frame with a timeout (polling variant).
-    /// May return `None` if no frame is available within the timeout.
-    ///
-    /// **For most use cases, prefer [`Self::capture_video`]** which handles retries
-    /// automatically and provides reliable frame capture.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Maximum time to wait for a frame.
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Some(frame))` - Successfully captured a video frame
-    /// * `Ok(None)` - No frame available within timeout
-    /// * `Err(Error::SpawnFailed)` - The blocking task panicked or was cancelled
-    /// * `Err(_)` - An error occurred during capture
-    pub async fn capture_video_timeout(&self, timeout: Duration) -> Result<Option<VideoFrame>> {
-        let receiver = Arc::clone(&self.inner);
-        R::spawn_blocking(move || receiver.capture_video_timeout(timeout)).await?
+    /// Returns an [`AsyncCapture`] view; see [`video`](Self::video) for usage.
+    /// Mirrors [`Receiver::audio`].
+    #[must_use = "the AsyncCapture view does nothing until a capture verb is awaited"]
+    pub fn audio(&self) -> AsyncCapture<'_, R, AudioKind> {
+        AsyncCapture::new(self)
     }
 
-    /// Async version of [`Receiver::capture_audio`].
+    /// Capture **metadata** frames without blocking the async runtime.
     ///
-    /// Captures an audio frame, blocking until received or timeout expires, without blocking
-    /// the async runtime.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Total budget to wait for a frame, starting when this async
-    ///   method is called. Blocking task queue delay is subtracted before the
-    ///   synchronous receiver starts waiting. Must not exceed
-    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(frame)` - Successfully captured an audio frame
-    /// * `Err(Error::FrameTimeout)` - No frame received within timeout (includes retry details)
-    /// * `Err(Error::SpawnFailed)` - The blocking task panicked or was cancelled
-    /// * `Err(_)` - An error occurred during capture
-    pub async fn capture_audio(&self, timeout: Duration) -> Result<AudioFrame> {
-        let start_time = validated_timeout_start(timeout)?;
-        let receiver = Arc::clone(&self.inner);
-        R::spawn_blocking(move || receiver.capture_audio(remaining_timeout(timeout, start_time)))
-            .await?
-    }
-
-    /// Async version of [`Receiver::capture_audio_timeout`].
-    ///
-    /// Attempts to capture an audio frame with a timeout (polling variant).
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Maximum time to wait for a frame.
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Some(frame))` - Successfully captured an audio frame
-    /// * `Ok(None)` - No frame available within timeout
-    /// * `Err(Error::SpawnFailed)` - The blocking task panicked or was cancelled
-    /// * `Err(_)` - An error occurred during capture
-    pub async fn capture_audio_timeout(&self, timeout: Duration) -> Result<Option<AudioFrame>> {
-        let receiver = Arc::clone(&self.inner);
-        R::spawn_blocking(move || receiver.capture_audio_timeout(timeout)).await?
-    }
-
-    /// Async version of [`Receiver::capture_metadata`].
-    ///
-    /// Captures a metadata frame, blocking until received or timeout expires, without blocking
-    /// the async runtime.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Total budget to wait for a frame, starting when this async
-    ///   method is called. Blocking task queue delay is subtracted before the
-    ///   synchronous receiver starts waiting. Must not exceed
-    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(frame)` - Successfully captured a metadata frame
-    /// * `Err(Error::FrameTimeout)` - No frame received within timeout (includes retry details)
-    /// * `Err(Error::SpawnFailed)` - The blocking task panicked or was cancelled
-    /// * `Err(_)` - An error occurred during capture
-    pub async fn capture_metadata(&self, timeout: Duration) -> Result<MetadataFrame> {
-        let start_time = validated_timeout_start(timeout)?;
-        let receiver = Arc::clone(&self.inner);
-        R::spawn_blocking(move || receiver.capture_metadata(remaining_timeout(timeout, start_time)))
-            .await?
-    }
-
-    /// Async version of [`Receiver::capture_metadata_timeout`].
-    ///
-    /// Attempts to capture a metadata frame with a timeout (polling variant).
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Maximum time to wait for a frame.
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Some(frame))` - Successfully captured a metadata frame
-    /// * `Ok(None)` - No frame available within timeout
-    /// * `Err(Error::SpawnFailed)` - The blocking task panicked or was cancelled
-    /// * `Err(_)` - An error occurred during capture
-    pub async fn capture_metadata_timeout(
-        &self,
-        timeout: Duration,
-    ) -> Result<Option<MetadataFrame>> {
-        let receiver = Arc::clone(&self.inner);
-        R::spawn_blocking(move || receiver.capture_metadata_timeout(timeout)).await?
+    /// Returns an [`AsyncCapture`] view; see [`video`](Self::video) for usage.
+    /// Mirrors [`Receiver::metadata`].
+    #[must_use = "the AsyncCapture view does nothing until a capture verb is awaited"]
+    pub fn metadata(&self) -> AsyncCapture<'_, R, MetadataKind> {
+        AsyncCapture::new(self)
     }
 
     /// Whether the underlying receiver currently has at least one active
@@ -413,6 +297,86 @@ impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
     pub async fn reconnect(&self) -> Result<()> {
         let receiver = Arc::clone(&self.inner);
         R::spawn_blocking(move || receiver.reconnect()).await?
+    }
+}
+
+/// A typed view over an async receiver for capturing frames of one kind,
+/// without blocking the async runtime.
+///
+/// Created by [`AsyncReceiverGeneric::video`], [`audio`](AsyncReceiverGeneric::audio),
+/// and [`metadata`](AsyncReceiverGeneric::metadata). Each verb runs the
+/// underlying synchronous capture on the runtime's blocking pool:
+///
+/// - [`capture`](Self::capture) — reliable owned capture with built-in retry.
+///   The timeout budget starts when the future is created; `spawn_blocking`
+///   queue delay is subtracted before the SDK begins waiting.
+/// - [`try_capture`](Self::try_capture) — a single owned poll; `Ok(None)` when
+///   no frame is ready.
+///
+/// There is no zero-copy `try_capture_ref` here: a borrowed frame is tied to
+/// the receiver and cannot cross the `spawn_blocking` boundary. Use
+/// [`Receiver::video`]'s [`Capture::try_capture_ref`](crate::Capture::try_capture_ref)
+/// on the synchronous receiver for in-place processing.
+pub struct AsyncCapture<'rx, R: SpawnBlocking, K: CaptureKind> {
+    recv: &'rx AsyncReceiverGeneric<R>,
+    _kind: PhantomData<K>,
+}
+
+impl<'rx, R: SpawnBlocking, K: CaptureKind> AsyncCapture<'rx, R, K>
+where
+    K::Owned: Send + 'static,
+{
+    fn new(recv: &'rx AsyncReceiverGeneric<R>) -> Self {
+        Self {
+            recv,
+            _kind: PhantomData,
+        }
+    }
+
+    /// Async version of [`Capture::capture`](crate::Capture::capture):
+    /// reliable owned capture that retries across the SDK's initial-sync
+    /// warm-up, run on the blocking pool.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Total budget to wait for a frame, starting when this async
+    ///   method is called. Blocking task queue delay is subtracted before the
+    ///   synchronous receiver starts waiting. Must not exceed
+    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(frame)` - Successfully captured a frame
+    /// * `Err(Error::FrameTimeout)` - No frame received within timeout (includes retry details)
+    /// * `Err(Error::SpawnFailed)` - The blocking task panicked or was cancelled
+    /// * `Err(_)` - Another error occurred during capture
+    pub async fn capture(&self, timeout: Duration) -> Result<K::Owned> {
+        let start_time = validated_timeout_start(timeout)?;
+        let receiver = Arc::clone(&self.recv.inner);
+        R::spawn_blocking(move || {
+            receiver.capture_kind::<K>(remaining_timeout(timeout, start_time))
+        })
+        .await?
+    }
+
+    /// Async version of
+    /// [`Capture::try_capture`](crate::Capture::try_capture): a single owned
+    /// poll, run on the blocking pool.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum time to wait for a frame. Must not exceed
+    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(frame))` - Successfully captured a frame
+    /// * `Ok(None)` - No frame available within timeout
+    /// * `Err(Error::SpawnFailed)` - The blocking task panicked or was cancelled
+    /// * `Err(_)` - An error occurred during capture
+    pub async fn try_capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
+        let receiver = Arc::clone(&self.recv.inner);
+        R::spawn_blocking(move || receiver.try_capture_kind::<K>(timeout)).await?
     }
 }
 
@@ -455,7 +419,7 @@ pub mod tokio {
     //!     let async_receiver = AsyncReceiver::new(receiver);
     //!
     //!     // Non-blocking async capture
-    //!     match async_receiver.capture_video_timeout(std::time::Duration::from_millis(100)).await? {
+    //!     match async_receiver.video().try_capture(std::time::Duration::from_millis(100)).await? {
     //!         Some(frame) => println!("Got frame: {}x{}", frame.width(), frame.height()),
     //!         None => println!("No frame available"),
     //!     }
@@ -514,7 +478,7 @@ pub mod async_std {
     //!     let async_receiver = AsyncReceiver::new(receiver);
     //!
     //!     // Non-blocking async capture
-    //!     match async_receiver.capture_video_timeout(std::time::Duration::from_millis(100)).await? {
+    //!     match async_receiver.video().try_capture(std::time::Duration::from_millis(100)).await? {
     //!         Some(frame) => println!("Got frame: {}x{}", frame.width(), frame.height()),
     //!         None => println!("No frame available"),
     //!     }

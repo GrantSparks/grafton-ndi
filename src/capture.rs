@@ -24,7 +24,13 @@
 
 use std::{marker::PhantomData, rc::Rc};
 
-use crate::ndi_lib::*;
+use crate::{
+    frames::{
+        AudioFrame, AudioFrameRef, MetadataFrame, MetadataFrameRef, VideoFrame, VideoFrameRef,
+    },
+    ndi_lib::*,
+    Result,
+};
 
 /// Sealed trait module to prevent external implementations of `CaptureKind`.
 mod sealed {
@@ -35,25 +41,52 @@ mod sealed {
     impl Sealed for super::MetadataKind {}
 }
 
-/// Trait that encapsulates frame-type-specific behavior for capture operations.
+/// Single source of truth describing one NDI frame kind (video, audio, or
+/// metadata).
 ///
-/// This is a sealed trait - it cannot be implemented outside this crate.
+/// Each implementor wires together the FFI frame struct, the borrowed and owned
+/// Rust frame types, and the four SDK calls those entail — capture, the
+/// frame-type discriminant, freeing, and the borrowed/owned conversions. Every
+/// generic capture path (`capture_raw`, [`Receiver`](crate::Receiver)'s
+/// [`Capture`](crate::Capture) view, and the async views) is written once
+/// against this trait, so adding or changing a kind happens in exactly one
+/// place.
+///
+/// This is a sealed trait — it cannot be implemented outside this crate.
 /// Implementations exist for [`VideoKind`], [`AudioKind`], and [`MetadataKind`].
-///
-/// # Associated Types
-///
-/// - `RawFrame`: The FFI frame type from the NDI SDK (e.g., `NDIlib_video_frame_v2_t`)
 ///
 /// # Safety
 ///
-/// Implementors must ensure that `free_frame` correctly frees frames of type `RawFrame`
-/// that were populated by `NDIlib_recv_capture_v3`.
-pub trait CaptureKind: sealed::Sealed {
+/// Implementors must ensure that the four `unsafe` members agree on the same
+/// `RawFrame`: `capture_into` populates it via `NDIlib_recv_capture_v3`,
+/// `free_frame` frees frames so populated, and `make_ref` wraps one that
+/// `capture_into` reported as [`FRAME_TYPE`](Self::FRAME_TYPE).
+pub trait CaptureKind: sealed::Sealed + Sized + 'static {
     /// The raw FFI frame type from the NDI SDK.
     type RawFrame: Default + Copy;
 
-    /// The expected frame type constant returned by `NDIlib_recv_capture_v3`.
+    /// The borrowed, zero-copy view of a captured frame, tied to the receiver
+    /// that produced it.
+    type Ref<'rx>;
+
+    /// The owned, `'static` frame produced by copying a borrowed view.
+    type Owned;
+
+    /// The frame-type discriminant `NDIlib_recv_capture_v3` returns for this kind.
     const FRAME_TYPE: NDIlib_frame_type_e;
+
+    /// Run a capture for this kind, routing `frame` into the matching
+    /// `NDIlib_recv_capture_v3` slot and ignoring the others.
+    ///
+    /// # Safety
+    ///
+    /// - `instance` must be a valid NDI receiver instance.
+    /// - `frame` must point to a writable [`RawFrame`](Self::RawFrame).
+    unsafe fn capture_into(
+        instance: NDIlib_recv_instance_t,
+        frame: *mut Self::RawFrame,
+        timeout_ms: u32,
+    ) -> NDIlib_frame_type_e;
 
     /// Free a captured frame.
     ///
@@ -62,6 +95,18 @@ pub trait CaptureKind: sealed::Sealed {
     /// - `instance` must be a valid NDI receiver instance
     /// - `frame` must have been populated by a successful capture that returned `FRAME_TYPE`
     unsafe fn free_frame(instance: NDIlib_recv_instance_t, frame: &Self::RawFrame);
+
+    /// Wrap a freshly captured frame guard in its borrowed view, validating any
+    /// kind-specific invariants (e.g. FourCC) during construction.
+    ///
+    /// # Safety
+    ///
+    /// `guard` must own a frame that `capture_into` reported as
+    /// [`FRAME_TYPE`](Self::FRAME_TYPE).
+    unsafe fn make_ref<'rx>(guard: RecvGuard<'rx, Self>) -> Result<Self::Ref<'rx>>;
+
+    /// Copy a borrowed view into an owned, `'static` frame.
+    fn ref_to_owned(frame: &Self::Ref<'_>) -> Result<Self::Owned>;
 }
 
 /// Marker type for video frame capture operations.
@@ -69,10 +114,34 @@ pub struct VideoKind;
 
 impl CaptureKind for VideoKind {
     type RawFrame = NDIlib_video_frame_v2_t;
+    type Ref<'rx> = VideoFrameRef<'rx>;
+    type Owned = VideoFrame;
     const FRAME_TYPE: NDIlib_frame_type_e = NDIlib_frame_type_e_NDIlib_frame_type_video;
+
+    unsafe fn capture_into(
+        instance: NDIlib_recv_instance_t,
+        frame: *mut Self::RawFrame,
+        timeout_ms: u32,
+    ) -> NDIlib_frame_type_e {
+        NDIlib_recv_capture_v3(
+            instance,
+            frame,
+            std::ptr::null_mut(), // no audio
+            std::ptr::null_mut(), // no metadata
+            timeout_ms,
+        )
+    }
 
     unsafe fn free_frame(instance: NDIlib_recv_instance_t, frame: &Self::RawFrame) {
         NDIlib_recv_free_video_v2(instance, frame);
+    }
+
+    unsafe fn make_ref<'rx>(guard: RecvGuard<'rx, Self>) -> Result<Self::Ref<'rx>> {
+        VideoFrameRef::new(guard)
+    }
+
+    fn ref_to_owned(frame: &Self::Ref<'_>) -> Result<Self::Owned> {
+        frame.to_owned()
     }
 }
 
@@ -81,10 +150,34 @@ pub struct AudioKind;
 
 impl CaptureKind for AudioKind {
     type RawFrame = NDIlib_audio_frame_v3_t;
+    type Ref<'rx> = AudioFrameRef<'rx>;
+    type Owned = AudioFrame;
     const FRAME_TYPE: NDIlib_frame_type_e = NDIlib_frame_type_e_NDIlib_frame_type_audio;
+
+    unsafe fn capture_into(
+        instance: NDIlib_recv_instance_t,
+        frame: *mut Self::RawFrame,
+        timeout_ms: u32,
+    ) -> NDIlib_frame_type_e {
+        NDIlib_recv_capture_v3(
+            instance,
+            std::ptr::null_mut(), // no video
+            frame,
+            std::ptr::null_mut(), // no metadata
+            timeout_ms,
+        )
+    }
 
     unsafe fn free_frame(instance: NDIlib_recv_instance_t, frame: &Self::RawFrame) {
         NDIlib_recv_free_audio_v3(instance, frame);
+    }
+
+    unsafe fn make_ref<'rx>(guard: RecvGuard<'rx, Self>) -> Result<Self::Ref<'rx>> {
+        AudioFrameRef::new(guard)
+    }
+
+    fn ref_to_owned(frame: &Self::Ref<'_>) -> Result<Self::Owned> {
+        frame.to_owned()
     }
 }
 
@@ -93,10 +186,35 @@ pub struct MetadataKind;
 
 impl CaptureKind for MetadataKind {
     type RawFrame = NDIlib_metadata_frame_t;
+    type Ref<'rx> = MetadataFrameRef<'rx>;
+    type Owned = MetadataFrame;
     const FRAME_TYPE: NDIlib_frame_type_e = NDIlib_frame_type_e_NDIlib_frame_type_metadata;
+
+    unsafe fn capture_into(
+        instance: NDIlib_recv_instance_t,
+        frame: *mut Self::RawFrame,
+        timeout_ms: u32,
+    ) -> NDIlib_frame_type_e {
+        NDIlib_recv_capture_v3(
+            instance,
+            std::ptr::null_mut(), // no video
+            std::ptr::null_mut(), // no audio
+            frame,
+            timeout_ms,
+        )
+    }
 
     unsafe fn free_frame(instance: NDIlib_recv_instance_t, frame: &Self::RawFrame) {
         NDIlib_recv_free_metadata(instance, frame);
+    }
+
+    unsafe fn make_ref<'rx>(guard: RecvGuard<'rx, Self>) -> Result<Self::Ref<'rx>> {
+        MetadataFrameRef::new(guard)
+    }
+
+    fn ref_to_owned(frame: &Self::Ref<'_>) -> Result<Self::Owned> {
+        // Metadata `to_owned` is infallible; lift it into the shared `Result` shape.
+        Ok(frame.to_owned())
     }
 }
 
@@ -177,93 +295,24 @@ pub(crate) enum CaptureResult<'rx, K: CaptureKind> {
     Error,
 }
 
-/// Capture a video frame from an NDI receiver.
+/// Capture a frame of kind `K` from an NDI receiver.
+///
+/// Routes the frame into the matching `NDIlib_recv_capture_v3` slot via
+/// [`CaptureKind::capture_into`] and classifies the result. Other frame types
+/// (e.g. status-change) are treated as [`CaptureResult::None`].
 ///
 /// # Safety
 ///
 /// `instance` must be a valid NDI receiver instance.
-pub(crate) unsafe fn capture_video_raw<'rx>(
+pub(crate) unsafe fn capture_raw<'rx, K: CaptureKind>(
     instance: NDIlib_recv_instance_t,
     timeout_ms: u32,
-) -> CaptureResult<'rx, VideoKind> {
-    use std::ptr;
-
-    let mut frame = NDIlib_video_frame_v2_t::default();
-
-    let frame_type = NDIlib_recv_capture_v3(
-        instance,
-        &mut frame,
-        ptr::null_mut(), // no audio
-        ptr::null_mut(), // no metadata
-        timeout_ms,
-    );
+) -> CaptureResult<'rx, K> {
+    let mut frame = K::RawFrame::default();
+    let frame_type = K::capture_into(instance, &mut frame, timeout_ms);
 
     match frame_type {
-        t if t == VideoKind::FRAME_TYPE => {
-            CaptureResult::Frame(RecvGuard::<VideoKind>::new(instance, frame))
-        }
-        NDIlib_frame_type_e_NDIlib_frame_type_none => CaptureResult::None,
-        NDIlib_frame_type_e_NDIlib_frame_type_error => CaptureResult::Error,
-        _ => CaptureResult::None, // Other frame types are ignored
-    }
-}
-
-/// Capture an audio frame from an NDI receiver.
-///
-/// # Safety
-///
-/// `instance` must be a valid NDI receiver instance.
-pub(crate) unsafe fn capture_audio_raw<'rx>(
-    instance: NDIlib_recv_instance_t,
-    timeout_ms: u32,
-) -> CaptureResult<'rx, AudioKind> {
-    use std::ptr;
-
-    let mut frame = NDIlib_audio_frame_v3_t::default();
-
-    let frame_type = NDIlib_recv_capture_v3(
-        instance,
-        ptr::null_mut(), // no video
-        &mut frame,
-        ptr::null_mut(), // no metadata
-        timeout_ms,
-    );
-
-    match frame_type {
-        t if t == AudioKind::FRAME_TYPE => {
-            CaptureResult::Frame(RecvGuard::<AudioKind>::new(instance, frame))
-        }
-        NDIlib_frame_type_e_NDIlib_frame_type_none => CaptureResult::None,
-        NDIlib_frame_type_e_NDIlib_frame_type_error => CaptureResult::Error,
-        _ => CaptureResult::None, // Other frame types are ignored
-    }
-}
-
-/// Capture a metadata frame from an NDI receiver.
-///
-/// # Safety
-///
-/// `instance` must be a valid NDI receiver instance.
-pub(crate) unsafe fn capture_metadata_raw<'rx>(
-    instance: NDIlib_recv_instance_t,
-    timeout_ms: u32,
-) -> CaptureResult<'rx, MetadataKind> {
-    use std::ptr;
-
-    let mut frame = NDIlib_metadata_frame_t::default();
-
-    let frame_type = NDIlib_recv_capture_v3(
-        instance,
-        ptr::null_mut(), // no video
-        ptr::null_mut(), // no audio
-        &mut frame,
-        timeout_ms,
-    );
-
-    match frame_type {
-        t if t == MetadataKind::FRAME_TYPE => {
-            CaptureResult::Frame(RecvGuard::<MetadataKind>::new(instance, frame))
-        }
+        t if t == K::FRAME_TYPE => CaptureResult::Frame(RecvGuard::<K>::new(instance, frame)),
         NDIlib_frame_type_e_NDIlib_frame_type_none => CaptureResult::None,
         NDIlib_frame_type_e_NDIlib_frame_type_error => CaptureResult::Error,
         _ => CaptureResult::None, // Other frame types are ignored

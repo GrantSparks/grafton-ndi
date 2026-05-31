@@ -32,25 +32,24 @@
 
 use std::{
     ffi::CString,
+    marker::PhantomData,
     ptr,
     sync::{PoisonError, RwLock, RwLockReadGuard},
     time::{Duration, Instant},
 };
 
 use crate::{
-    capture::{capture_audio_raw, capture_metadata_raw, capture_video_raw, CaptureResult},
+    capture::{capture_raw, AudioKind, CaptureKind, CaptureResult, MetadataKind, VideoKind},
     finder::{RawSource, Source},
-    frames::{
-        AudioFrame, AudioFrameRef, MetadataFrame, MetadataFrameRef, VideoFrame, VideoFrameRef,
-    },
+    frames::{AudioFrame, MetadataFrame, VideoFrame},
     ndi_lib::*,
     to_ms_checked, Error, Result, NDI,
 };
 
 /// Retry policy configuration for frame capture operations.
 ///
-/// This struct encapsulates the timing parameters for the retry loop used in
-/// blocking capture methods (`capture_video`, `capture_audio`, `capture_metadata`).
+/// This struct encapsulates the timing parameters for the retry loop used by
+/// the reliable [`Capture::capture`] verb across all frame kinds.
 struct RetryPolicy {
     /// Timeout per individual capture attempt.
     poll_interval: Duration,
@@ -396,7 +395,7 @@ impl ReceiverOptionsBuilder {
     /// // Capture and encode in one line (requires image-encoding feature)
     /// #[cfg(feature = "image-encoding")]
     /// {
-    ///     let frame = receiver.capture_video(Duration::from_secs(5))?;
+    ///     let frame = receiver.video().capture(Duration::from_secs(5))?;
     ///     let png_bytes = frame.encode_png()?;
     ///     std::fs::write("snapshot.png", &png_bytes)?;
     /// }
@@ -439,7 +438,7 @@ impl ReceiverOptionsBuilder {
     /// let receiver = Receiver::new(&ndi, &options)?;
     ///
     /// // Capture full quality frames
-    /// let frame = receiver.capture_video(Duration::from_secs(5))?;
+    /// let frame = receiver.video().capture(Duration::from_secs(5))?;
     /// println!("Captured {width}x{height} frame", width = frame.width(), height = frame.height());
     /// # Ok(())
     /// # }
@@ -753,31 +752,19 @@ impl Receiver {
         )
     }
 
-    /// Poll for a zero-copy borrowed video frame - safe to call from multiple threads concurrently.
+    /// Capture **video** frames from this receiver.
     ///
-    /// This returns a `VideoFrameRef` that borrows the NDI SDK's buffer directly,
-    /// avoiding any allocation or memcpy. The frame is automatically freed when dropped.
-    /// This is a single polling attempt: it may return `None` when no frame is
-    /// available and does not retry NDI SDK initial synchronization misses.
+    /// Returns a [`Capture`] view whose verbs cover the three capture styles:
     ///
-    /// **This is the recommended API for performance-critical applications** that can
-    /// process frames in-place and handle polling themselves. For applications that need
-    /// reliable retrying, or need to store frames or send them across threads, use
-    /// [`Self::capture_video`] which returns an owned `VideoFrame`.
+    /// - [`capture`](Capture::capture) — reliable owned capture that retries
+    ///   across the NDI SDK's initial-sync warm-up.
+    /// - [`try_capture`](Capture::try_capture) — a single owned poll, `Ok(None)`
+    ///   when no frame is ready.
+    /// - [`try_capture_ref`](Capture::try_capture_ref) — a single zero-copy poll
+    ///   borrowing the SDK buffer in place.
     ///
-    /// # Performance
-    ///
-    /// For a 1920×1080 BGRA frame:
-    /// - `capture_video_ref`: ~0 allocations, ~0 MB copied
-    /// - `capture_video`: 1-2 allocations, ~8.3 MB copied
-    ///
-    /// At 60 fps, this saves ~475 MB/s of memory bandwidth.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Some(frame))` - Successfully captured a zero-copy borrowed frame
-    /// * `Ok(None)` - No frame available (timeout)
-    /// * `Err(_)` - An error occurred during capture
+    /// Video frames may carry per-row padding (e.g. RGBX/BGRX); see
+    /// [`VideoFrame`] for how to read them correctly.
     ///
     /// # Examples
     ///
@@ -789,31 +776,94 @@ impl Receiver {
     /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
     /// # let options = ReceiverOptions::builder(source).build();
     /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// // Zero-copy capture
-    /// if let Some(frame) = receiver.capture_video_ref(Duration::from_secs(1))? {
-    ///     // Process in place - no copy needed
+    /// // Reliable owned capture
+    /// let frame = receiver.video().capture(Duration::from_secs(5))?;
+    /// println!("{}x{}", frame.width(), frame.height());
+    ///
+    /// // Zero-copy borrow
+    /// if let Some(frame) = receiver.video().try_capture_ref(Duration::from_secs(1))? {
     ///     let pixels = frame.data();
-    ///     println!("{}×{} frame, {} bytes", frame.width(), frame.height(), pixels.len());
-    ///
-    ///     // Convert to owned if needed
-    ///     let owned = frame.to_owned()?;
+    ///     println!("{} bytes in place", pixels.len());
     /// }
     /// # Ok(())
     /// # }
     /// ```
-    pub fn capture_video_ref<'rx>(
-        &'rx self,
-        timeout: Duration,
-    ) -> Result<Option<VideoFrameRef<'rx>>> {
+    #[must_use = "the Capture view does nothing until a capture verb is called"]
+    pub fn video(&self) -> Capture<'_, VideoKind> {
+        Capture::new(self)
+    }
+
+    /// Capture **audio** frames from this receiver.
+    ///
+    /// Returns a [`Capture`] view; see [`video`](Self::video) for the three
+    /// capture verbs it exposes ([`capture`](Capture::capture),
+    /// [`try_capture`](Capture::try_capture),
+    /// [`try_capture_ref`](Capture::try_capture_ref)).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
+    /// # let options = ReceiverOptions::builder(source).build();
+    /// # let receiver = Receiver::new(&ndi, &options)?;
+    /// if let Some(audio) = receiver.audio().try_capture_ref(Duration::from_secs(1))? {
+    ///     println!("{} channels, {} samples", audio.num_channels(), audio.num_samples());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use = "the Capture view does nothing until a capture verb is called"]
+    pub fn audio(&self) -> Capture<'_, AudioKind> {
+        Capture::new(self)
+    }
+
+    /// Capture **metadata** frames from this receiver.
+    ///
+    /// Returns a [`Capture`] view; see [`video`](Self::video) for the three
+    /// capture verbs it exposes ([`capture`](Capture::capture),
+    /// [`try_capture`](Capture::try_capture),
+    /// [`try_capture_ref`](Capture::try_capture_ref)).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = NDI::new()?;
+    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
+    /// # let options = ReceiverOptions::builder(source).build();
+    /// # let receiver = Receiver::new(&ndi, &options)?;
+    /// if let Some(meta) = receiver.metadata().try_capture(Duration::from_millis(100))? {
+    ///     println!("metadata: {}", meta.data());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use = "the Capture view does nothing until a capture verb is called"]
+    pub fn metadata(&self) -> Capture<'_, MetadataKind> {
+        Capture::new(self)
+    }
+
+    /// Single zero-copy poll backing every [`Capture::try_capture_ref`].
+    ///
+    /// Holds the shared capture guard for the duration of one
+    /// `NDIlib_recv_capture_v3` call, so it runs concurrently with other
+    /// captures but never overlaps a [`reconnect`](Self::reconnect).
+    fn capture_ref_kind<K: CaptureKind>(&self, timeout: Duration) -> Result<Option<K::Ref<'_>>> {
         let timeout_ms = to_ms_checked(timeout)?;
 
         // Shared guard: excludes a concurrent `reconnect`, not other captures.
         let _capture = self.capture_lock();
-        // SAFETY: self.instance is a valid NDI receiver instance
-        match unsafe { capture_video_raw(self.instance, timeout_ms) } {
+        // SAFETY: self.instance is a valid NDI receiver instance.
+        match unsafe { capture_raw::<K>(self.instance, timeout_ms) } {
             CaptureResult::Frame(guard) => {
-                // Validate FourCC during construction - this may return an error
-                let frame_ref = unsafe { VideoFrameRef::new(guard)? };
+                // Validation (e.g. FourCC) happens during ref construction.
+                let frame_ref = unsafe { K::make_ref(guard)? };
                 Ok(Some(frame_ref))
             }
             CaptureResult::None => Ok(None),
@@ -821,401 +871,26 @@ impl Receiver {
         }
     }
 
-    /// Capture a video frame, blocking until a frame is received or timeout expires.
-    ///
-    /// This is the **primary method** for reliable video frame capture. It works around
-    /// an NDI SDK behavior where the SDK may return immediately (0ms) during initial
-    /// connection instead of blocking for the full timeout duration.
-    ///
-    /// The `timeout` is a total retry budget. Each individual SDK poll is capped to
-    /// the remaining budget, and `Duration::ZERO` performs exactly one nonblocking
-    /// capture attempt.
-    ///
-    /// ## Why This Method Exists
-    ///
-    /// During the first 2-3 calls after connecting to a source, the NDI SDK returns
-    /// `NDIlib_frame_type_none` immediately while the stream is synchronizing, rather than
-    /// waiting for the timeout. This method automatically retries until the stream is
-    /// synchronized or the total timeout expires.
-    ///
-    /// **After initial synchronization (warm-up), this method has zero overhead** - it gets
-    /// frames on the first attempt, making it safe to use in continuous capture loops.
-    ///
-    /// Empirical testing (NDI SDK 6.1.1, Linux) shows:
-    /// - First call: ~200-400ms (includes stream synchronization)
-    /// - Subsequent calls: ~3-4ms per frame (zero retry overhead)
-    /// - Steady-state: 100% frame reception, no performance penalty
-    ///
-    /// For zero-copy capture that avoids memory allocation and copying, use
-    /// [`Self::capture_video_ref`] instead. For manual polling where you want to handle
-    /// timeouts yourself, use [`Self::capture_video_timeout`].
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Total time to wait for a frame.
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(frame)` - Successfully captured a video frame
-    /// * `Err(Error::FrameTimeout)` - No frame received within the timeout period (includes retry details)
-    /// * `Err(_)` - Another error occurred during capture
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let options = ReceiverOptions::builder(source).build();
-    /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// // Wait up to 5 seconds for a frame
-    /// let frame = receiver.capture_video(Duration::from_secs(5))?;
-    /// println!("Captured {width}x{height} frame", width = frame.width(), height = frame.height());
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn capture_video(&self, timeout: Duration) -> Result<VideoFrame> {
-        retry_capture(timeout, &RetryPolicy::default(), |poll| {
-            self.capture_video_timeout(poll)
-        })
-    }
-
-    /// Capture a video frame with a timeout (polling variant).
-    ///
-    /// This method attempts to capture a video frame but may return `None` if no frame
-    /// is available within the timeout. This is useful for manual polling where you want
-    /// to handle timeouts yourself.
-    ///
-    /// **For most use cases, prefer [`Self::capture_video`]** which handles retries
-    /// automatically and provides reliable frame capture.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Maximum time to wait for a frame.
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Some(frame))` - Successfully captured a video frame
-    /// * `Ok(None)` - No frame available within timeout
-    /// * `Err(_)` - An error occurred during capture
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let options = ReceiverOptions::builder(source).build();
-    /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// // Poll with a short timeout
-    /// match receiver.capture_video_timeout(Duration::from_millis(100))? {
-    ///     Some(frame) => println!("Got frame: {width}x{height}", width = frame.width(), height = frame.height()),
-    ///     None => println!("No frame available"),
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn capture_video_timeout(&self, timeout: Duration) -> Result<Option<VideoFrame>> {
-        match self.capture_video_ref(timeout)? {
-            Some(frame_ref) => Ok(Some(frame_ref.to_owned()?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Poll for a zero-copy borrowed audio frame - safe to call from multiple threads concurrently.
-    ///
-    /// This returns an `AudioFrameRef` that borrows the NDI SDK's buffer directly,
-    /// avoiding any allocation or memcpy. The frame is automatically freed when dropped.
-    /// This is a single polling attempt: it may return `None` when no frame is
-    /// available and does not retry NDI SDK initial synchronization misses.
-    ///
-    /// **This is the recommended API for performance-critical applications** that can
-    /// process audio in-place and handle polling themselves. For applications that need
-    /// reliable retrying, or need to store frames or send them across threads, use
-    /// [`Self::capture_audio`] which returns an owned `AudioFrame`.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Some(frame))` - Successfully captured a zero-copy borrowed frame
-    /// * `Ok(None)` - No frame available (timeout)
-    /// * `Err(_)` - An error occurred during capture
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let options = ReceiverOptions::builder(source).build();
-    /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// // Zero-copy capture
-    /// if let Some(frame) = receiver.capture_audio_ref(Duration::from_secs(1))? {
-    ///     // Process in place - no copy needed
-    ///     let samples = frame.data();
-    ///     println!("{} channels, {} samples", frame.num_channels(), frame.num_samples());
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn capture_audio_ref<'rx>(
-        &'rx self,
+    /// Single owned poll backing every [`Capture::try_capture`].
+    pub(crate) fn try_capture_kind<K: CaptureKind>(
+        &self,
         timeout: Duration,
-    ) -> Result<Option<AudioFrameRef<'rx>>> {
-        let timeout_ms = to_ms_checked(timeout)?;
-
-        // Shared guard: excludes a concurrent `reconnect`, not other captures.
-        let _capture = self.capture_lock();
-        // SAFETY: self.instance is a valid NDI receiver instance
-        match unsafe { capture_audio_raw(self.instance, timeout_ms) } {
-            CaptureResult::Frame(guard) => {
-                // Validate FourCC during construction - this may return an error
-                let frame_ref = unsafe { AudioFrameRef::new(guard)? };
-                Ok(Some(frame_ref))
-            }
-            CaptureResult::None => Ok(None),
-            CaptureResult::Error => Err(Error::CaptureFailed("Received an error frame".into())),
-        }
-    }
-
-    /// Capture an audio frame, blocking until a frame is received or timeout expires.
-    ///
-    /// This is the **primary method** for reliable audio frame capture. It automatically
-    /// retries internally to handle NDI SDK synchronization behavior.
-    ///
-    /// The `timeout` is a total retry budget. Each individual SDK poll is capped to
-    /// the remaining budget, and `Duration::ZERO` performs exactly one nonblocking
-    /// capture attempt.
-    ///
-    /// For zero-copy capture that avoids memory allocation and copying, use
-    /// [`Self::capture_audio_ref`] instead. For manual polling where you want to handle
-    /// timeouts yourself, use [`Self::capture_audio_timeout`].
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Total time to wait for a frame.
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(frame)` - Successfully captured an audio frame
-    /// * `Err(Error::FrameTimeout)` - No frame received within the timeout period (includes retry details)
-    /// * `Err(_)` - Another error occurred during capture
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let options = ReceiverOptions::builder(source).build();
-    /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// let frame = receiver.capture_audio(Duration::from_secs(5))?;
-    /// println!("Captured audio: {} channels, {} samples", frame.num_channels(), frame.num_samples());
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn capture_audio(&self, timeout: Duration) -> Result<AudioFrame> {
-        retry_capture(timeout, &RetryPolicy::default(), |poll| {
-            self.capture_audio_timeout(poll)
-        })
-    }
-
-    /// Capture an audio frame with a timeout (polling variant).
-    ///
-    /// This method attempts to capture an audio frame but may return `None` if no frame
-    /// is available within the timeout. This is useful for manual polling where you want
-    /// to handle timeouts yourself.
-    ///
-    /// **For most use cases, prefer [`Self::capture_audio`]** which handles retries
-    /// automatically and provides reliable frame capture.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Maximum time to wait for a frame.
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Some(frame))` - Successfully captured an audio frame
-    /// * `Ok(None)` - No frame available within timeout
-    /// * `Err(_)` - An error occurred during capture
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let options = ReceiverOptions::builder(source).build();
-    /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// match receiver.capture_audio_timeout(Duration::from_millis(100))? {
-    ///     Some(frame) => println!("Got audio frame"),
-    ///     None => println!("No frame available"),
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn capture_audio_timeout(&self, timeout: Duration) -> Result<Option<AudioFrame>> {
-        match self.capture_audio_ref(timeout)? {
-            Some(frame_ref) => Ok(Some(frame_ref.to_owned()?)),
+    ) -> Result<Option<K::Owned>> {
+        match self.capture_ref_kind::<K>(timeout)? {
+            Some(frame_ref) => Ok(Some(K::ref_to_owned(&frame_ref)?)),
             None => Ok(None),
         }
     }
 
-    /// Poll for a zero-copy borrowed metadata frame - safe to call from multiple threads concurrently.
+    /// Retried owned capture backing every [`Capture::capture`].
     ///
-    /// This returns a `MetadataFrameRef` that borrows the NDI SDK's buffer directly,
-    /// avoiding any allocation or string copying. The frame is automatically freed when dropped.
-    /// This is a single polling attempt: it may return `None` when no frame is
-    /// available and does not retry NDI SDK initial synchronization misses.
-    ///
-    /// **This is the recommended API for performance-critical applications** that can
-    /// process metadata in-place and handle polling themselves. For applications that
-    /// need reliable retrying, or need to store metadata or send it across threads, use
-    /// [`Self::capture_metadata`] which returns an owned `MetadataFrame`.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Some(frame))` - Successfully captured a zero-copy borrowed frame
-    /// * `Ok(None)` - No frame available (timeout)
-    /// * `Err(_)` - An error occurred during capture
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let options = ReceiverOptions::builder(source).build();
-    /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// // Zero-copy capture
-    /// if let Some(frame) = receiver.capture_metadata_ref(Duration::from_secs(1))? {
-    ///     // Process in place - no copy needed
-    ///     println!("Metadata: {}", frame.data());
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn capture_metadata_ref<'rx>(
-        &'rx self,
-        timeout: Duration,
-    ) -> Result<Option<MetadataFrameRef<'rx>>> {
-        let timeout_ms = to_ms_checked(timeout)?;
-
-        // Shared guard: excludes a concurrent `reconnect`, not other captures.
-        let _capture = self.capture_lock();
-        // SAFETY: self.instance is a valid NDI receiver instance
-        match unsafe { capture_metadata_raw(self.instance, timeout_ms) } {
-            CaptureResult::Frame(guard) => {
-                let frame_ref = unsafe { MetadataFrameRef::new(guard)? };
-                Ok(Some(frame_ref))
-            }
-            CaptureResult::None => Ok(None),
-            CaptureResult::Error => Err(Error::CaptureFailed("Received an error frame".into())),
-        }
-    }
-
-    /// Capture a metadata frame, blocking until a frame is received or timeout expires.
-    ///
-    /// This is the **primary method** for reliable metadata frame capture. It automatically
-    /// retries internally to handle NDI SDK synchronization behavior.
-    ///
-    /// The `timeout` is a total retry budget. Each individual SDK poll is capped to
-    /// the remaining budget, and `Duration::ZERO` performs exactly one nonblocking
-    /// capture attempt.
-    ///
-    /// For zero-copy capture that avoids memory allocation and string copying, use
-    /// [`Self::capture_metadata_ref`] instead. For manual polling where you want to handle
-    /// timeouts yourself, use [`Self::capture_metadata_timeout`].
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Total time to wait for a frame.
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(frame)` - Successfully captured a metadata frame
-    /// * `Err(Error::FrameTimeout)` - No frame received within the timeout period (includes retry details)
-    /// * `Err(_)` - Another error occurred during capture
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let options = ReceiverOptions::builder(source).build();
-    /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// let frame = receiver.capture_metadata(Duration::from_secs(5))?;
-    /// println!("Metadata: {}", frame.data());
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn capture_metadata(&self, timeout: Duration) -> Result<MetadataFrame> {
+    /// Polls [`try_capture_kind`](Self::try_capture_kind) under the default
+    /// [`RetryPolicy`], absorbing the SDK's initial-sync misses where it returns
+    /// `none` immediately instead of blocking for the full timeout.
+    pub(crate) fn capture_kind<K: CaptureKind>(&self, timeout: Duration) -> Result<K::Owned> {
         retry_capture(timeout, &RetryPolicy::default(), |poll| {
-            self.capture_metadata_timeout(poll)
+            self.try_capture_kind::<K>(poll)
         })
-    }
-
-    /// Capture a metadata frame with a timeout (polling variant).
-    ///
-    /// This method attempts to capture a metadata frame but may return `None` if no frame
-    /// is available within the timeout. This is useful for manual polling where you want
-    /// to handle timeouts yourself.
-    ///
-    /// **For most use cases, prefer [`Self::capture_metadata`]** which handles retries
-    /// automatically and provides reliable frame capture.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Maximum time to wait for a frame.
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Some(frame))` - Successfully captured a metadata frame
-    /// * `Ok(None)` - No frame available within timeout
-    /// * `Err(_)` - An error occurred during capture
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let options = ReceiverOptions::builder(source).build();
-    /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// match receiver.capture_metadata_timeout(Duration::from_millis(100))? {
-    ///     Some(frame) => println!("Got metadata"),
-    ///     None => println!("No frame available"),
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn capture_metadata_timeout(&self, timeout: Duration) -> Result<Option<MetadataFrame>> {
-        match self.capture_metadata_ref(timeout)? {
-            Some(frame_ref) => Ok(Some(frame_ref.to_owned())),
-            None => Ok(None),
-        }
     }
 
     /// Check if the receiver is still connected to its source.
@@ -1441,6 +1116,95 @@ impl Receiver {
     }
 }
 
+/// A typed view over a [`Receiver`] for capturing frames of one kind.
+///
+/// Created by [`Receiver::video`], [`Receiver::audio`], and
+/// [`Receiver::metadata`]. The view is a cheap borrow of the receiver and does
+/// nothing on its own — call one of its verbs to capture:
+///
+/// - [`capture`](Self::capture) — reliable owned capture with built-in retry.
+///   **The primary method.** It absorbs the NDI SDK's initial-sync warm-up (the
+///   first few polls after connecting return `none` immediately instead of
+///   blocking), then runs with zero overhead in steady state, so it is safe in
+///   a continuous capture loop.
+/// - [`try_capture`](Self::try_capture) — a single owned poll; `Ok(None)` when
+///   no frame is ready. For manual polling where you handle timing yourself.
+/// - [`try_capture_ref`](Self::try_capture_ref) — a single zero-copy poll that
+///   borrows the SDK's buffer in place (no allocation, no memcpy). The
+///   recommended API for performance-critical, in-place processing: for a
+///   1920×1080 BGRA frame it avoids ~8.3 MB of copying per frame (~475 MB/s at
+///   60 fps). Convert to an owned frame with `to_owned` when you need to keep or
+///   send it.
+///
+/// Every verb holds a shared capture guard for the duration of a single SDK
+/// call, so captures of different kinds run concurrently with each other but
+/// never overlap a [`Receiver::reconnect`].
+pub struct Capture<'rx, K: CaptureKind> {
+    rx: &'rx Receiver,
+    _kind: PhantomData<K>,
+}
+
+impl<'rx, K: CaptureKind> Capture<'rx, K> {
+    fn new(rx: &'rx Receiver) -> Self {
+        Self {
+            rx,
+            _kind: PhantomData,
+        }
+    }
+
+    /// Reliable owned capture: blocks up to `timeout`, retrying across the NDI
+    /// SDK's initial-sync warm-up.
+    ///
+    /// `timeout` is a total retry budget; each individual SDK poll is capped to
+    /// the remaining budget, and [`Duration::ZERO`] performs exactly one
+    /// non-blocking attempt.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Total time to wait for a frame. Must not exceed
+    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::FrameTimeout`] if no frame arrives within `timeout`;
+    /// other errors propagate from the capture itself.
+    pub fn capture(&self, timeout: Duration) -> Result<K::Owned> {
+        self.rx.capture_kind::<K>(timeout)
+    }
+
+    /// Single owned poll: returns `Ok(None)` if no frame is available within
+    /// `timeout`.
+    ///
+    /// Prefer [`capture`](Self::capture) for reliable capture; this variant does
+    /// not retry the SDK's warm-up misses.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum time to wait for a frame. Must not exceed
+    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
+    pub fn try_capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
+        self.rx.try_capture_kind::<K>(timeout)
+    }
+
+    /// Single zero-copy poll: returns a borrowed view of the SDK's buffer, or
+    /// `Ok(None)` if no frame is available within `timeout`.
+    ///
+    /// The returned reference borrows the [`Receiver`] (not this temporary
+    /// view), so it may outlive the `Capture` while keeping the receiver
+    /// borrowed.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum time to wait for a frame. Must not exceed
+    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
+    pub fn try_capture_ref(&self, timeout: Duration) -> Result<Option<K::Ref<'rx>>> {
+        // Bind through `'rx` so the returned borrow is tied to the receiver, not
+        // to this short-lived view.
+        let rx: &'rx Receiver = self.rx;
+        rx.capture_ref_kind::<K>(timeout)
+    }
+}
+
 impl Drop for Receiver {
     fn drop(&mut self) {
         unsafe {
@@ -1461,8 +1225,9 @@ unsafe impl Send for Receiver {}
 ///
 /// The NDI 6 SDK documentation guarantees that `NDIlib_recv_capture_v3` is internally
 /// synchronized and can be called concurrently from multiple threads. This is explicitly
-/// mentioned in the SDK manual's thread safety section. The capture_video, capture_audio,
-/// and capture_metadata methods can be safely called from multiple threads simultaneously.
+/// mentioned in the SDK manual's thread safety section. The capture verbs (via
+/// [`Receiver::video`], [`Receiver::audio`], and [`Receiver::metadata`]) can be
+/// safely called from multiple threads simultaneously.
 unsafe impl Sync for Receiver {}
 
 #[derive(Debug)]

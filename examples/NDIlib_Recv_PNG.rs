@@ -7,7 +7,7 @@
 //!
 //! IMPORTANT: This example demonstrates:
 //!
-//! 1. Using `capture_video()` for reliable frame capture with
+//! 1. Using `receiver.video().capture()` for reliable frame capture with
 //!    automatic retry logic (handles NDI SDK timeout quirks internally)
 //! 2. `VideoFrame::encode_png()` for crate-provided image conversion
 //! 3. Correct handling for RGBX/BGRX padding bytes and padded rows
@@ -84,7 +84,7 @@ fn main() -> Result<(), Error> {
     println!("Waiting for video frames...\n");
 
     let start_time = Instant::now();
-    let video_frame = receiver.capture_video(Duration::from_secs(60))?;
+    let video_frame = receiver.video().capture(Duration::from_secs(60))?;
 
     let elapsed = start_time.elapsed();
     println!("Frame received after {elapsed:?}");

@@ -626,7 +626,7 @@ impl VideoFrame {
     /// #     .color(ReceiverColorFormat::RGBX_RGBA)
     /// #     .build();
     /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// let video_frame = receiver.capture_video(Duration::from_secs(5))?;
+    /// let video_frame = receiver.video().capture(Duration::from_secs(5))?;
     /// let png_bytes = video_frame.encode_png()?;
     /// std::fs::write("frame.png", &png_bytes)?;
     /// # Ok(())
@@ -692,7 +692,7 @@ impl VideoFrame {
     /// #     .color(ReceiverColorFormat::RGBX_RGBA)
     /// #     .build();
     /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// let video_frame = receiver.capture_video(Duration::from_secs(5))?;
+    /// let video_frame = receiver.video().capture(Duration::from_secs(5))?;
     /// let jpeg_bytes = video_frame.encode_jpeg(85)?;
     /// std::fs::write("frame.jpg", &jpeg_bytes)?;
     /// # Ok(())
@@ -739,7 +739,7 @@ impl VideoFrame {
     /// #     .color(ReceiverColorFormat::RGBX_RGBA)
     /// #     .build();
     /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// let video_frame = receiver.capture_video(Duration::from_secs(5))?;
+    /// let video_frame = receiver.video().capture(Duration::from_secs(5))?;
     ///
     /// // As PNG
     /// let data_url = video_frame.encode_data_url(ImageFormat::Png)?;
@@ -2773,7 +2773,7 @@ fn validate_audio_format(fourcc: NDIlib_FourCC_audio_type_e) -> Result<AudioForm
 /// # let options = ReceiverOptions::builder(source).build();
 /// # let receiver = Receiver::new(&ndi, &options)?;
 /// // Zero-copy capture (no allocation, no memcpy)
-/// if let Some(frame) = receiver.capture_video_ref(Duration::from_millis(1000))? {
+/// if let Some(frame) = receiver.video().try_capture_ref(Duration::from_millis(1000))? {
 ///     println!("{}×{} frame, {} bytes", frame.width(), frame.height(), frame.data().len());
 ///
 ///     // Process in place - no copy needed
@@ -2795,7 +2795,7 @@ fn validate_audio_format(fourcc: NDIlib_FourCC_audio_type_e) -> Result<AudioForm
 /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
 /// # let options = ReceiverOptions::builder(source).build();
 /// # let receiver = Receiver::new(&ndi, &options)?;
-/// if let Some(frame_ref) = receiver.capture_video_ref(Duration::from_millis(1000))? {
+/// if let Some(frame_ref) = receiver.video().try_capture_ref(Duration::from_millis(1000))? {
 ///     // Convert to owned for storage or cross-thread use
 ///     let owned = frame_ref.to_owned()?;
 ///     // owned is now a VideoFrame that can be sent across threads
@@ -2973,7 +2973,7 @@ impl<'rx> fmt::Debug for VideoFrameRef<'rx> {
 /// # let options = ReceiverOptions::builder(source).build();
 /// # let receiver = Receiver::new(&ndi, &options)?;
 /// // Zero-copy capture
-/// if let Some(frame) = receiver.capture_audio_ref(Duration::from_millis(1000))? {
+/// if let Some(frame) = receiver.audio().try_capture_ref(Duration::from_millis(1000))? {
 ///     println!("{} channels, {} samples", frame.num_channels(), frame.num_samples());
 ///
 ///     // Process in place - no copy needed
@@ -3143,7 +3143,7 @@ impl<'rx> fmt::Debug for AudioFrameRef<'rx> {
 /// # let options = ReceiverOptions::builder(source).build();
 /// # let receiver = Receiver::new(&ndi, &options)?;
 /// // Zero-copy capture
-/// if let Some(frame) = receiver.capture_metadata_ref(Duration::from_millis(1000))? {
+/// if let Some(frame) = receiver.metadata().try_capture_ref(Duration::from_millis(1000))? {
 ///     println!("Metadata: {}", frame.data());
 ///
 ///     // Frame is freed here when `frame` goes out of scope

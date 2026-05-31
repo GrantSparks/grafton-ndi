@@ -126,6 +126,7 @@ pub use async_runtime::tokio;
 pub use async_runtime::async_std;
 
 pub use {
+    capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
     error::*,
     finder::{Finder, FinderOptions, FinderOptionsBuilder, Source, SourceAddress, SourceCache},
     frames::{
@@ -135,7 +136,7 @@ pub use {
     },
     framesync::{FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncVideoRef},
     receiver::{
-        ConnectionStats, FrameType, Receiver, ReceiverBandwidth, ReceiverColorFormat,
+        Capture, ConnectionStats, FrameType, Receiver, ReceiverBandwidth, ReceiverColorFormat,
         ReceiverOptions, ReceiverOptionsBuilder, ReceiverStatus, Tally,
     },
     runtime::NDI,

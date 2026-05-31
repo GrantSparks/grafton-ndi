@@ -143,7 +143,7 @@ let options = ReceiverOptions::builder(camera)
     .build();
 let receiver = Receiver::new(&ndi, &options)?;
 
-let video = receiver.capture_video(Duration::from_secs(5))?;
+let video = receiver.video().capture(Duration::from_secs(5))?;
 println!(
     "{}x{} {:?}",
     video.width(),
@@ -151,8 +151,8 @@ println!(
     video.pixel_format()
 );
 
-let audio = receiver.capture_audio_timeout(Duration::from_millis(100))?;
-let metadata = receiver.capture_metadata_timeout(Duration::from_millis(100))?;
+let audio = receiver.audio().try_capture(Duration::from_millis(100))?;
+let metadata = receiver.metadata().try_capture(Duration::from_millis(100))?;
 ```
 
 ### Publish Sources
@@ -240,7 +240,7 @@ use grafton_ndi::tokio::AsyncReceiver;
 use std::time::Duration;
 
 let async_receiver = AsyncReceiver::new(receiver);
-let frame = async_receiver.capture_video(Duration::from_secs(5)).await?;
+let frame = async_receiver.video().capture(Duration::from_secs(5)).await?;
 ```
 
 ## API Model
@@ -254,7 +254,7 @@ The crate's public API is organized around a small set of resource types:
 - `FrameSync` wraps a receiver for clock-corrected pull capture.
 - `VideoFrame`, `AudioFrame`, and `MetadataFrame` represent application-owned frame data.
 
-Most applications can start with owned frame APIs such as `capture_video()` and `send_video()`. For hot paths, the crate also exposes borrowed receive refs and borrowed async-send video frames so data can stay in SDK or application buffers without an extra copy. Those zero-copy APIs use Rust lifetimes to make buffer reuse explicit.
+Most applications can start with owned frame APIs such as `receiver.video().capture()` and `sender.send_video()`. For hot paths, the crate also exposes borrowed receive refs and borrowed async-send video frames so data can stay in SDK or application buffers without an extra copy. Those zero-copy APIs use Rust lifetimes to make buffer reuse explicit.
 
 Frame layout fields that describe SDK-facing memory are private. Builders, accessors, checked mutation methods, and `PixelFormat` helpers keep dimensions, strides, metadata, and buffer sizes consistent before data crosses the FFI boundary.
 

@@ -58,7 +58,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
             let mut frame_count = 0;
 
             for _ in 0..10 {
-                match recv_video.capture_video_timeout(Duration::from_secs(5)) {
+                match recv_video.video().try_capture(Duration::from_secs(5)) {
                     Ok(Some(frame)) => {
                         frame_count += 1;
                         let width = frame.width();
@@ -90,7 +90,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
             let mut sample_count = 0;
 
             for _ in 0..10 {
-                match recv_audio.capture_audio_timeout(Duration::from_secs(5)) {
+                match recv_audio.audio().try_capture(Duration::from_secs(5)) {
                     Ok(Some(frame)) => {
                         sample_count += frame.num_samples();
                         let num_samples = frame.num_samples();
@@ -121,7 +121,10 @@ fn main() -> Result<(), grafton_ndi::Error> {
             let mut metadata_count = 0;
 
             for _ in 0..20 {
-                match recv_metadata.capture_metadata_timeout(Duration::from_millis(2500)) {
+                match recv_metadata
+                    .metadata()
+                    .try_capture(Duration::from_millis(2500))
+                {
                     Ok(Some(frame)) => {
                         metadata_count += 1;
                         let data = frame.data();

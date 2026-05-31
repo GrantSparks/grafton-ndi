@@ -971,24 +971,30 @@ fn test_tokio_async_receiver_methods_exist() {
 
             // All these methods should exist and be callable
             let _ = async_receiver
-                .capture_video(std::time::Duration::from_secs(5))
+                .video()
+                .capture(std::time::Duration::from_secs(5))
                 .await;
             let _ = async_receiver
-                .capture_video_timeout(std::time::Duration::from_millis(100))
-                .await;
-
-            let _ = async_receiver
-                .capture_audio(std::time::Duration::from_secs(5))
-                .await;
-            let _ = async_receiver
-                .capture_audio_timeout(std::time::Duration::from_millis(100))
+                .video()
+                .try_capture(std::time::Duration::from_millis(100))
                 .await;
 
             let _ = async_receiver
-                .capture_metadata(std::time::Duration::from_secs(5))
+                .audio()
+                .capture(std::time::Duration::from_secs(5))
                 .await;
             let _ = async_receiver
-                .capture_metadata_timeout(std::time::Duration::from_millis(100))
+                .audio()
+                .try_capture(std::time::Duration::from_millis(100))
+                .await;
+
+            let _ = async_receiver
+                .metadata()
+                .capture(std::time::Duration::from_secs(5))
+                .await;
+            let _ = async_receiver
+                .metadata()
+                .try_capture(std::time::Duration::from_millis(100))
                 .await;
 
             // Liveness / recovery primitives (Issue #997).
@@ -1059,24 +1065,30 @@ fn test_async_std_async_receiver_methods_exist() {
 
             // All these methods should exist and be callable
             let _ = async_receiver
-                .capture_video(std::time::Duration::from_secs(5))
+                .video()
+                .capture(std::time::Duration::from_secs(5))
                 .await;
             let _ = async_receiver
-                .capture_video_timeout(std::time::Duration::from_millis(100))
-                .await;
-
-            let _ = async_receiver
-                .capture_audio(std::time::Duration::from_secs(5))
-                .await;
-            let _ = async_receiver
-                .capture_audio_timeout(std::time::Duration::from_millis(100))
+                .video()
+                .try_capture(std::time::Duration::from_millis(100))
                 .await;
 
             let _ = async_receiver
-                .capture_metadata(std::time::Duration::from_secs(5))
+                .audio()
+                .capture(std::time::Duration::from_secs(5))
                 .await;
             let _ = async_receiver
-                .capture_metadata_timeout(std::time::Duration::from_millis(100))
+                .audio()
+                .try_capture(std::time::Duration::from_millis(100))
+                .await;
+
+            let _ = async_receiver
+                .metadata()
+                .capture(std::time::Duration::from_secs(5))
+                .await;
+            let _ = async_receiver
+                .metadata()
+                .try_capture(std::time::Duration::from_millis(100))
                 .await;
 
             // Liveness / recovery primitives (Issue #997).
