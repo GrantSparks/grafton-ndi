@@ -22,14 +22,15 @@
 //! - Custom output file: `cargo run --example NDIlib_Recv_PNG -- --output MyImage.png`
 //! - Both: `cargo run --example NDIlib_Recv_PNG -- 192.168.0.100 --output MyImage.png`
 
-use grafton_ndi::{
-    Error, Finder, FinderOptions, Receiver, ReceiverColorFormat, ReceiverOptions, NDI,
-};
+use grafton_ndi::{Error, Receiver, ReceiverColorFormat, ReceiverOptions, NDI};
 
 use std::{
     env, fs,
     time::{Duration, Instant},
 };
+
+#[path = "common/mod.rs"]
+mod common;
 
 fn main() -> Result<(), Error> {
     let args: Vec<String> = env::args().collect();
@@ -60,33 +61,17 @@ fn main() -> Result<(), Error> {
     }
     println!();
 
-    let mut builder = FinderOptions::builder().show_local_sources(true);
-
-    if !extra_ips.is_empty() {
-        println!("Searching additional IPs/subnets:");
-        for ip in &extra_ips {
-            println!("  - {ip}");
-            builder = builder.extra_ips(*ip);
-        }
-        println!();
-    }
-
-    let finder = Finder::new(&ndi, &builder.build())?;
+    let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
 
     println!("Looking for sources ...");
-    let sources = loop {
-        finder.wait_for_sources(Duration::from_secs(1))?;
-        let sources = finder.current_sources()?;
-        if !sources.is_empty() {
-            let count = sources.len();
-            println!("Found {count} source(s):");
-            for (i, source) in sources.iter().enumerate() {
-                let num = i + 1;
-                println!("  {num}. {source}");
-            }
-            break sources;
-        }
-    };
+    let sources = common::wait_for_first_source(&finder, || false)?
+        .expect("wait_for_first_source returns None only when the stop closure fires");
+    let count = sources.len();
+    println!("Found {count} source(s):");
+    for (i, source) in sources.iter().enumerate() {
+        let num = i + 1;
+        println!("  {num}. {source}");
+    }
 
     let first_source = &sources[0];
     println!("\nCreating receiver for: {first_source}");

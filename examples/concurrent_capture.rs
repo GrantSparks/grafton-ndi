@@ -2,6 +2,9 @@ use grafton_ndi::{Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverOpti
 
 use std::{env, sync::Arc, thread, time::Duration};
 
+#[path = "common/mod.rs"]
+mod common;
+
 fn main() -> Result<(), grafton_ndi::Error> {
     // Parse command line arguments for extra IPs
     let args: Vec<String> = env::args().collect();
@@ -13,19 +16,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
     println!("NDI version: {version}");
 
     // Create a finder to discover sources
-    let mut builder = grafton_ndi::FinderOptions::builder();
-
-    if !extra_ips.is_empty() {
-        println!("Searching additional IPs/subnets:");
-        for ip in &extra_ips {
-            println!("  - {}", ip);
-            builder = builder.extra_ips(*ip);
-        }
-        println!();
-    }
-
-    let finder_options = builder.build();
-    let finder = grafton_ndi::Finder::new(&ndi, &finder_options)?;
+    let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
 
     // Discover sources across the full 5s window so late responders on
     // staggered/unicast networks are not missed.

@@ -17,23 +17,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use grafton_ndi::{Error, Finder, FinderOptions, Receiver, ReceiverOptions, NDI};
+use grafton_ndi::{Error, Receiver, ReceiverOptions, NDI};
 
-/// Configure finder options for specific test environments
-fn create_finder_options(extra_ips: Vec<&str>) -> FinderOptions {
-    let mut builder = FinderOptions::builder();
-
-    if !extra_ips.is_empty() {
-        println!("Searching additional IPs/subnets:");
-        for ip in &extra_ips {
-            println!("  - {}", ip);
-            builder = builder.extra_ips(*ip);
-        }
-        println!();
-    }
-
-    builder.build()
-}
+#[path = "common/mod.rs"]
+mod common;
 
 fn main() -> Result<(), Error> {
     // Parse command line arguments for extra IPs
@@ -52,19 +39,13 @@ fn main() -> Result<(), Error> {
     let ndi = NDI::new()?;
 
     // Create finder
-    let finder_options = create_finder_options(extra_ips);
-    let finder = Finder::new(&ndi, &finder_options)?;
+    let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
 
-    // Wait until there is at least one source
-    let sources = loop {
-        if exit_loop.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        finder.wait_for_sources(Duration::from_secs(1))?;
-        let sources = finder.current_sources()?;
-        if !sources.is_empty() {
-            break sources;
-        }
+    // Wait until there is at least one source (or Ctrl-C)
+    let Some(sources) =
+        common::wait_for_first_source(&finder, || exit_loop.load(Ordering::Relaxed))?
+    else {
+        return Ok(());
     };
 
     // Create a receiver for the first source

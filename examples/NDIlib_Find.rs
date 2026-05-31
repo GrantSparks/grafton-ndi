@@ -16,12 +16,15 @@
 //! - Ensure NDI sources are running on your network
 //! - Check firewall settings (NDI uses TCP port 5353 for discovery)
 
-use grafton_ndi::{Error, Finder, FinderOptions, NDI};
+use grafton_ndi::{Error, NDI};
 
 use std::{
     env,
     time::{Duration, Instant},
 };
+
+#[path = "common/mod.rs"]
+mod common;
 
 fn main() -> Result<(), Error> {
     // Parse command line arguments for extra IPs
@@ -34,23 +37,8 @@ fn main() -> Result<(), Error> {
     let ndi = NDI::new()?;
     println!("NDI initialized successfully\n");
 
-    // Create finder options
-    let mut builder = FinderOptions::builder().show_local_sources(true); // Include sources on this machine
-
-    // Add any command line IPs
-    if !extra_ips.is_empty() {
-        println!("Searching additional IPs/subnets:");
-        for ip in &extra_ips {
-            println!("  - {}", ip);
-            builder = builder.extra_ips(*ip);
-        }
-        println!();
-    }
-
-    let finder_options = builder.build();
-
     // Create the finder instance
-    let finder = Finder::new(&ndi, &finder_options)?;
+    let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
     println!("Searching for NDI sources...");
     println!("(Will run for 60 seconds)\n");
 

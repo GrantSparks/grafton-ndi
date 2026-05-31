@@ -8,7 +8,7 @@
 //! Optional arguments:
 //! - IP address to search: `cargo run --example NDIlib_Recv_Audio_16bpp -- 192.168.0.110`
 
-use grafton_ndi::{Error, Finder, FinderOptions, Receiver, ReceiverOptions, NDI};
+use grafton_ndi::{Error, Receiver, ReceiverOptions, NDI};
 
 use std::{
     env,
@@ -18,6 +18,9 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+#[path = "common/mod.rs"]
+mod common;
 
 fn main() -> Result<(), Error> {
     // Parse command line arguments for extra IPs
@@ -34,31 +37,13 @@ fn main() -> Result<(), Error> {
 
     let ndi = NDI::new()?;
 
-    let mut builder = FinderOptions::builder();
+    let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
 
-    // Add any command line IPs
-    if !extra_ips.is_empty() {
-        println!("Searching additional IPs/subnets:");
-        for ip in &extra_ips {
-            println!("  - {}", ip);
-            builder = builder.extra_ips(*ip);
-        }
-        println!();
-    }
-
-    let finder_options = builder.build();
-    let finder = Finder::new(&ndi, &finder_options)?;
-
-    // Wait until there is at least one source
-    let sources = loop {
-        if exit_loop.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        finder.wait_for_sources(Duration::from_secs(1))?;
-        let sources = finder.current_sources()?;
-        if !sources.is_empty() {
-            break sources;
-        }
+    // Wait until there is at least one source (or Ctrl-C)
+    let Some(sources) =
+        common::wait_for_first_source(&finder, || exit_loop.load(Ordering::Relaxed))?
+    else {
+        return Ok(());
     };
 
     // Create a receiver for the first source

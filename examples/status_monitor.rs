@@ -1,10 +1,13 @@
-use grafton_ndi::{Finder, FinderOptions, Receiver, ReceiverBandwidth, ReceiverOptions, NDI};
+use grafton_ndi::{Receiver, ReceiverBandwidth, ReceiverOptions, NDI};
 
 use std::{
     env,
     io::{self, Write},
     time::Duration,
 };
+
+#[path = "common/mod.rs"]
+mod common;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
@@ -30,18 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("NDI initialized successfully");
 
     // Find sources
-    let mut builder = FinderOptions::builder().show_local_sources(true);
-
-    if !extra_ips.is_empty() {
-        println!("\nSearching additional IPs/subnets:");
-        for ip in &extra_ips {
-            println!("  - {}", ip);
-            builder = builder.extra_ips(*ip);
-        }
-    }
-
-    let finder_options = builder.build();
-    let finder = Finder::new(&ndi, &finder_options)?;
+    let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
 
     println!("Looking for NDI sources...");
     let sources = finder.find_sources(Duration::from_secs(5))?;
