@@ -13,8 +13,9 @@ use std::{
 };
 
 use crate::{
+    capture::{AudioKind, FrameFree, FrameSyncAudioFree, Guard, VideoKind},
     ndi_lib::*,
-    recv_guard::{RecvAudioGuard, RecvMetadataGuard, RecvVideoGuard},
+    recv_guard::{RecvAudioGuard, RecvMetadataGuard},
     Error, Result,
 };
 
@@ -2738,11 +2739,19 @@ fn validate_audio_format(fourcc: NDIlib_FourCC_audio_type_e) -> Result<AudioForm
 // Zero-copy borrowed receive frames
 // ============================================================================
 
-/// A zero-copy borrowed video frame.
+/// A zero-copy borrowed video frame, generic over its free strategy `S`.
 ///
-/// This type wraps an RAII guard that owns the NDI frame buffer lifetime,
+/// This type wraps an RAII [`Guard`] that owns the NDI frame buffer lifetime,
 /// exposing a safe, zero-copy view of the video data. The frame is automatically
-/// freed when dropped via `NDIlib_recv_free_video_v2`.
+/// freed when dropped, via whichever `NDIlib_*_free_video*` call the strategy `S`
+/// encodes.
+///
+/// The two public spellings are type aliases over this one core, so every
+/// accessor and the `Debug` impl are written exactly once:
+/// - [`VideoFrameRef<'rx>`] — frames captured from a [`Receiver`](crate::Receiver)
+///   (freed via `NDIlib_recv_free_video_v2`).
+/// - [`FrameSyncVideoRef<'fs>`](crate::FrameSyncVideoRef) — frames captured from a
+///   [`FrameSync`](crate::FrameSync) (freed via `NDIlib_framesync_free_video`).
 ///
 /// **Key characteristics:**
 /// - Zero allocations: References NDI SDK buffers directly
@@ -2752,66 +2761,33 @@ fn validate_audio_format(fourcc: NDIlib_FourCC_audio_type_e) -> Result<AudioForm
 ///
 /// # Lifetime
 ///
-/// The lifetime parameter `'rx` ties this frame to the `Receiver` that created it.
-/// The borrow checker ensures the receiver cannot be dropped while any frame
-/// references are alive, preventing use-after-free at compile time with zero runtime cost.
-/// The underlying NDI buffer is freed when `VideoFrameRef` is dropped.
+/// The lifetime parameter `'a` ties this frame to the owner (a `Receiver` or a
+/// `FrameSync`) that created it. The borrow checker ensures the owner cannot be
+/// dropped while any frame references are alive, preventing use-after-free at
+/// compile time with zero runtime cost. The underlying NDI buffer is freed when
+/// the frame ref is dropped.
 ///
 /// # Performance
 ///
 /// For a 1920×1080 BGRA frame, this eliminates ~8.3 MB of memcpy compared to
 /// the owned [`VideoFrame`]. At 60 fps, this saves ~475 MB/s of memory bandwidth.
-///
-/// # Examples
-///
-/// ```no_run
-/// # use grafton_ndi::{NDI, ReceiverOptions, Receiver, Source, SourceAddress};
-/// # use std::time::Duration;
-/// # fn main() -> Result<(), grafton_ndi::Error> {
-/// # let ndi = NDI::new()?;
-/// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-/// # let options = ReceiverOptions::builder(source).build();
-/// # let receiver = Receiver::new(&ndi, &options)?;
-/// // Zero-copy capture (no allocation, no memcpy)
-/// if let Some(frame) = receiver.video().try_capture_ref(Duration::from_millis(1000))? {
-///     println!("{}×{} frame, {} bytes", frame.width(), frame.height(), frame.data().len());
-///
-///     // Process in place - no copy needed
-///     let pixels = frame.data();
-///
-///     // Frame is freed here when `frame` goes out of scope
-/// }
-/// # Ok(())
-/// # }
-/// ```
-///
-/// To convert to an owned frame:
-///
-/// ```no_run
-/// # use grafton_ndi::{NDI, ReceiverOptions, Receiver, Source, SourceAddress};
-/// # use std::time::Duration;
-/// # fn main() -> Result<(), grafton_ndi::Error> {
-/// # let ndi = NDI::new()?;
-/// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-/// # let options = ReceiverOptions::builder(source).build();
-/// # let receiver = Receiver::new(&ndi, &options)?;
-/// if let Some(frame_ref) = receiver.video().try_capture_ref(Duration::from_millis(1000))? {
-///     // Convert to owned for storage or cross-thread use
-///     let owned = frame_ref.to_owned()?;
-///     // owned is now a VideoFrame that can be sent across threads
-/// }
-/// # Ok(())
-/// # }
-/// ```
-pub struct VideoFrameRef<'rx> {
-    guard: RecvVideoGuard<'rx>,
+pub struct VideoRef<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> {
+    guard: Guard<'a, S>,
     /// Cached validated layout information (pixel format, data length, stride/size).
     /// Computed once at construction time; `data()` uses this cached value.
     layout: ValidatedVideoLayout,
     metadata: ValidatedFrameMetadata,
 }
 
-impl<'rx> VideoFrameRef<'rx> {
+/// A zero-copy borrowed video frame from a [`Receiver`](crate::Receiver) capture.
+///
+/// This is the receiver spelling of the generic [`VideoRef`]; the
+/// [`FrameSync`](crate::FrameSync) spelling is
+/// [`FrameSyncVideoRef`](crate::FrameSyncVideoRef). Both share one accessor and
+/// `Debug` implementation.
+pub type VideoFrameRef<'rx> = VideoRef<'rx, VideoKind>;
+
+impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
     /// Create a borrowed video frame from an RAII guard.
     ///
     /// Validates the frame layout including:
@@ -2825,9 +2801,9 @@ impl<'rx> VideoFrameRef<'rx> {
     ///
     /// # Safety
     ///
-    /// The caller must ensure the guard was created from a valid NDI receiver
-    /// and contains a frame populated by `NDIlib_recv_capture_v3`.
-    pub(crate) unsafe fn new(guard: RecvVideoGuard<'rx>) -> Result<Self> {
+    /// The caller must ensure the guard was created from a valid NDI instance
+    /// and contains a frame populated by the matching SDK capture call.
+    pub(crate) unsafe fn new(guard: Guard<'a, S>) -> Result<Self> {
         let layout = validate_video_layout(guard.frame())?;
         let metadata = unsafe { validate_frame_metadata(guard.frame().p_metadata)? };
 
@@ -2931,9 +2907,9 @@ impl<'rx> VideoFrameRef<'rx> {
     }
 }
 
-impl<'rx> fmt::Debug for VideoFrameRef<'rx> {
+impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> fmt::Debug for VideoRef<'a, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("VideoFrameRef")
+        f.debug_struct(S::REF_DEBUG_NAME)
             .field("width", &self.width())
             .field("height", &self.height())
             .field("pixel_format", &self.pixel_format())
@@ -2950,66 +2926,58 @@ impl<'rx> fmt::Debug for VideoFrameRef<'rx> {
     }
 }
 
-/// A zero-copy borrowed audio frame.
+/// A zero-copy borrowed audio frame, generic over its free strategy `S`.
 ///
-/// This type wraps an RAII guard that owns the NDI frame buffer lifetime,
+/// This type wraps an RAII [`Guard`] that owns the NDI frame buffer lifetime,
 /// exposing a safe, zero-copy view of the audio data. The frame is automatically
-/// freed when dropped via `NDIlib_recv_free_audio_v3`.
+/// freed when dropped, via whichever `NDIlib_*_free_audio*` call the strategy `S`
+/// encodes.
+///
+/// The shared accessors and the `Debug` impl are written exactly once here; the
+/// two public spellings are aliases that layer their differing format/owned/empty
+/// policy on top:
+/// - [`AudioFrameRef<'rx>`] — frames captured from a [`Receiver`](crate::Receiver)
+///   (always concrete: `format() -> AudioFormat`, `to_owned() -> AudioFrame`).
+/// - [`FrameSyncAudioRef<'fs>`](crate::FrameSyncAudioRef) — frames captured from a
+///   [`FrameSync`](crate::FrameSync), which additionally model a validated empty
+///   query/no-source state (`is_empty`, `Option`-returning `format`/`to_owned`).
 ///
 /// **Key characteristics:**
 /// - Zero allocations: References NDI SDK buffers directly
 /// - Zero copies: No memcpy of audio samples
 /// - RAII lifetime: Exactly one free per frame, enforced at compile time
 /// - Not `Send`: Prevents accidental cross-thread use of FFI buffers
-///
-/// # Examples
-///
-/// ```no_run
-/// # use grafton_ndi::{NDI, ReceiverOptions, Receiver, Source, SourceAddress};
-/// # use std::time::Duration;
-/// # fn main() -> Result<(), grafton_ndi::Error> {
-/// # let ndi = NDI::new()?;
-/// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-/// # let options = ReceiverOptions::builder(source).build();
-/// # let receiver = Receiver::new(&ndi, &options)?;
-/// // Zero-copy capture
-/// if let Some(frame) = receiver.audio().try_capture_ref(Duration::from_millis(1000))? {
-///     println!("{} channels, {} samples", frame.num_channels(), frame.num_samples());
-///
-///     // Process in place - no copy needed
-///     let samples = frame.data();
-///
-///     // Frame is freed here when `frame` goes out of scope
-/// }
-/// # Ok(())
-/// # }
-/// ```
-pub struct AudioFrameRef<'rx> {
-    guard: RecvAudioGuard<'rx>,
+pub struct AudioRef<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> {
+    guard: Guard<'a, S>,
     /// Cached validated layout information (format, sample count).
     /// Computed once at construction time; `data()` uses this cached value.
     layout: ValidatedAudioLayout,
     metadata: ValidatedFrameMetadata,
 }
 
-impl<'rx> AudioFrameRef<'rx> {
-    /// Create a borrowed audio frame from an RAII guard.
-    ///
-    /// Validates the frame layout including:
-    /// - Valid audio format (FourCC)
-    /// - Non-null data pointer
-    /// - Valid sample rate, channel count, and sample count
-    /// - Buffer size within `MAX_AUDIO_BYTES` limit
-    ///
-    /// The validated layout is cached so that `data()` can return slices
-    /// without re-computation or unchecked arithmetic.
+/// A zero-copy borrowed audio frame from a [`Receiver`](crate::Receiver) capture.
+///
+/// This is the receiver spelling of the generic [`AudioRef`]; the
+/// [`FrameSync`](crate::FrameSync) spelling is
+/// [`FrameSyncAudioRef`](crate::FrameSyncAudioRef). The receiver path always
+/// yields a concrete audio frame, so [`format`](AudioRef::format) returns an
+/// [`AudioFormat`] and [`to_owned`](AudioRef::to_owned) an [`AudioFrame`]; the
+/// FrameSync path additionally models a validated empty query/no-source state.
+pub type AudioFrameRef<'rx> = AudioRef<'rx, AudioKind>;
+
+impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
+    /// Store a guard alongside an already-validated audio layout, validating and
+    /// caching the frame metadata. The per-family constructors compute `layout`
+    /// (concrete vs. empty-query) and funnel through here.
     ///
     /// # Safety
     ///
-    /// The caller must ensure the guard was created from a valid NDI receiver
-    /// and contains a frame populated by `NDIlib_recv_capture_v3`.
-    pub(crate) unsafe fn new(guard: RecvAudioGuard<'rx>) -> Result<Self> {
-        let layout = validate_audio_layout(guard.frame())?;
+    /// The caller must ensure the guard was created from a valid NDI instance
+    /// and that `layout` was validated from the same frame the guard owns.
+    pub(crate) unsafe fn from_validated_layout(
+        guard: Guard<'a, S>,
+        layout: ValidatedAudioLayout,
+    ) -> Result<Self> {
         let metadata = unsafe { validate_frame_metadata(guard.frame().p_metadata)? };
 
         Ok(Self {
@@ -3044,15 +3012,6 @@ impl<'rx> AudioFrameRef<'rx> {
         self.guard.frame().timestamp
     }
 
-    /// Get the audio format (FourCC code).
-    ///
-    /// This is guaranteed to be a valid, supported format since it's validated during construction.
-    pub fn format(&self) -> AudioFormat {
-        self.layout
-            .format()
-            .expect("validate_audio_layout requires a concrete audio format")
-    }
-
     /// Get the channel stride in bytes.
     pub fn channel_stride_in_bytes(&self) -> i32 {
         self.layout.channel_stride_in_bytes
@@ -3072,12 +3031,17 @@ impl<'rx> AudioFrameRef<'rx> {
     ///
     /// The slice length is computed once at construction time using checked
     /// arithmetic and validated against `MAX_AUDIO_BYTES`. This eliminates
-    /// the possibility of integer overflow or unbounded slice creation.
+    /// the possibility of integer overflow or unbounded slice creation. A
+    /// validated empty (query/no-source) layout yields an empty slice.
     pub fn data(&self) -> &[f32] {
-        // SAFETY: The data pointer was validated as non-null during construction
-        // (validate_audio_layout returns Err if p_data is null).
-        // The sample count was computed with checked arithmetic and validated
-        // against MAX_AUDIO_BYTES, so it's safe to create this slice.
+        if self.layout.is_empty() {
+            return &[];
+        }
+
+        // SAFETY: For a non-empty layout the data pointer was validated as
+        // non-null during construction (the audio validators return Err if
+        // p_data is null). The sample count was computed with checked arithmetic
+        // and validated against MAX_AUDIO_BYTES, so it's safe to create this slice.
         unsafe {
             slice::from_raw_parts(
                 self.guard.frame().p_data as *const f32,
@@ -3094,6 +3058,37 @@ impl<'rx> AudioFrameRef<'rx> {
         let range = self.layout.channel_range(channel)?;
         Some(&self.data()[range])
     }
+}
+
+impl<'rx> AudioRef<'rx, AudioKind> {
+    /// Create a borrowed audio frame from a receiver RAII guard.
+    ///
+    /// Validates the frame layout including:
+    /// - Valid audio format (FourCC)
+    /// - Non-null data pointer
+    /// - Valid sample rate, channel count, and sample count
+    /// - Buffer size within `MAX_AUDIO_BYTES` limit
+    ///
+    /// The validated layout is cached so that `data()` can return slices
+    /// without re-computation or unchecked arithmetic.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the guard was created from a valid NDI receiver
+    /// and contains a frame populated by `NDIlib_recv_capture_v3`.
+    pub(crate) unsafe fn new(guard: RecvAudioGuard<'rx>) -> Result<Self> {
+        let layout = validate_audio_layout(guard.frame())?;
+        unsafe { Self::from_validated_layout(guard, layout) }
+    }
+
+    /// Get the audio format (FourCC code).
+    ///
+    /// This is guaranteed to be a valid, supported format since it's validated during construction.
+    pub fn format(&self) -> AudioFormat {
+        self.layout
+            .format()
+            .expect("validate_audio_layout requires a concrete audio format")
+    }
 
     /// Convert this borrowed frame to an owned `AudioFrame`.
     ///
@@ -3104,14 +3099,73 @@ impl<'rx> AudioFrameRef<'rx> {
     }
 }
 
-impl<'rx> fmt::Debug for AudioFrameRef<'rx> {
+impl<'fs> AudioRef<'fs, FrameSyncAudioFree> {
+    /// Create a borrowed audio frame from a FrameSync RAII guard.
+    ///
+    /// When `query_input` is set, the SDK may report a validated empty
+    /// query/no-source state (no samples); otherwise a concrete frame is
+    /// required. A query that unexpectedly returns samples is rejected.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the guard was created from a valid FrameSync
+    /// instance and contains a frame populated by `NDIlib_framesync_capture_audio_v2`.
+    pub(crate) unsafe fn new(
+        guard: Guard<'fs, FrameSyncAudioFree>,
+        query_input: bool,
+    ) -> Result<Self> {
+        let layout = if query_input {
+            if guard.frame().no_samples != 0 {
+                return Err(Error::InvalidFrame(format!(
+                    "FrameSync audio query returned {} samples",
+                    guard.frame().no_samples
+                )));
+            }
+            validate_audio_layout_allow_empty(guard.frame())?
+        } else {
+            validate_audio_layout(guard.frame())?
+        };
+        unsafe { Self::from_validated_layout(guard, layout) }
+    }
+
+    /// Returns true for a valid query/no-source state with no sample buffer.
+    pub fn is_empty(&self) -> bool {
+        self.layout.is_empty()
+    }
+
+    /// Get the audio format (FourCC code), or `None` for an empty query/no-source state.
+    pub fn format(&self) -> Option<AudioFormat> {
+        self.layout.format()
+    }
+
+    /// Convert this borrowed frame to an owned `AudioFrame`.
+    ///
+    /// This performs a single memcpy of the audio data and metadata,
+    /// allowing the frame to outlive the NDI buffer and be sent across threads.
+    ///
+    /// Returns `Ok(None)` for a valid query/no-source state with no sample
+    /// buffer to own.
+    pub fn to_owned(&self) -> Result<Option<AudioFrame>> {
+        if self.layout.is_empty() {
+            Ok(None)
+        } else {
+            AudioFrame::from_raw_validated(*self.guard.frame(), self.layout, self.metadata)
+                .map(Some)
+        }
+    }
+}
+
+impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> fmt::Debug for AudioRef<'a, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AudioFrameRef")
+        f.debug_struct(S::REF_DEBUG_NAME)
             .field("sample_rate", &self.sample_rate())
             .field("num_channels", &self.num_channels())
             .field("num_samples", &self.num_samples())
             .field("timecode", &self.timecode())
-            .field("format", &self.format())
+            // Render the format from the cached layout (`Option<AudioFormat>`) so
+            // this single impl serves both the receiver and FrameSync spellings,
+            // whose public `format()` return types differ.
+            .field("format", &self.layout.format())
             .field("data (samples)", &self.data().len())
             .field("channel_stride_in_bytes", &self.channel_stride_in_bytes())
             .field("metadata", &self.metadata())
@@ -3818,7 +3872,7 @@ mod tests {
     /// Test that VideoFrameRef::new rejects unknown FourCC
     #[test]
     fn test_videoframeref_unknown_fourcc() {
-        use crate::recv_guard::RecvVideoGuard;
+        use crate::capture::{Guard, VideoKind};
 
         let width = 1920;
         let height = 1080;
@@ -3851,7 +3905,7 @@ mod tests {
 
         // Create a mock receiver instance (null is fine for this test since we don't free)
         let mock_instance = ptr::null_mut();
-        let guard = unsafe { RecvVideoGuard::new(mock_instance, c_frame) };
+        let guard = unsafe { Guard::<VideoKind>::new(mock_instance, c_frame) };
 
         // VideoFrameRef::new should return an error for unknown FourCC
         let result = unsafe { VideoFrameRef::new(guard) };
@@ -3874,7 +3928,7 @@ mod tests {
     /// Test that VideoFrameRef::new accepts known FourCC and stores validated format
     #[test]
     fn test_videoframeref_known_fourcc() {
-        use crate::recv_guard::RecvVideoGuard;
+        use crate::capture::{Guard, VideoKind};
 
         let width = 1920;
         let height = 1080;
@@ -3900,7 +3954,7 @@ mod tests {
         };
 
         let mock_instance = ptr::null_mut();
-        let guard = unsafe { RecvVideoGuard::new(mock_instance, c_frame) };
+        let guard = unsafe { Guard::<VideoKind>::new(mock_instance, c_frame) };
 
         let frame_ref = unsafe { VideoFrameRef::new(guard) }.expect("Should accept BGRA FourCC");
         assert_eq!(
@@ -3997,7 +4051,7 @@ mod tests {
     /// Test that VideoFrameRef correctly uses validated format for data size calculation
     #[test]
     fn test_videoframeref_data_uses_validated_format() {
-        use crate::recv_guard::RecvVideoGuard;
+        use crate::capture::{Guard, VideoKind};
 
         // Test with uncompressed format (BGRA)
         let width = 1920;
@@ -4024,7 +4078,7 @@ mod tests {
         };
 
         let mock_instance = ptr::null_mut();
-        let guard = unsafe { RecvVideoGuard::new(mock_instance, c_frame) };
+        let guard = unsafe { Guard::<VideoKind>::new(mock_instance, c_frame) };
         let frame_ref = unsafe { VideoFrameRef::new(guard) }.expect("Should create frame ref");
 
         // Verify data() returns correct size based on validated format
@@ -4042,6 +4096,126 @@ mod tests {
         );
 
         std::mem::forget(frame_ref);
+    }
+
+    /// Regression lock against the receiver and FrameSync video refs re-diverging:
+    /// given byte-identical raw frames, every shared accessor (including the
+    /// previously-divergent `scan_type`) must return identical results now that
+    /// both spellings share one [`VideoRef`] core.
+    #[test]
+    fn test_receiver_and_framesync_video_refs_agree() {
+        use crate::capture::{FrameSyncVideoFree, Guard, VideoKind};
+
+        let width = 16;
+        let height = 8;
+        let stride = width * 4;
+        let len = (stride * height) as usize;
+
+        // Two independent buffers with identical content, so each ref owns a
+        // distinct (non-aliasing) frame while still comparing equal.
+        let mut recv_data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let mut fs_data = recv_data.clone();
+        let mut recv_meta = b"shared frame\0".to_vec();
+        let mut fs_meta = recv_meta.clone();
+
+        let raw = |data: &mut [u8], meta: &mut [u8]| NDIlib_video_frame_v2_t {
+            xres: width,
+            yres: height,
+            FourCC: PixelFormat::BGRA.into(),
+            frame_rate_N: 30,
+            frame_rate_D: 1,
+            picture_aspect_ratio: 16.0 / 9.0,
+            // A non-default scan type: the old FrameSync copy used
+            // `unwrap_or(Progressive)`, so this also guards that divergence.
+            frame_format_type: ScanType::Interlaced.into(),
+            timecode: 123,
+            p_data: data.as_mut_ptr(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: stride,
+            },
+            p_metadata: meta.as_mut_ptr().cast(),
+            timestamp: 456,
+        };
+
+        let recv_raw = raw(&mut recv_data, &mut recv_meta);
+        let fs_raw = raw(&mut fs_data, &mut fs_meta);
+
+        let recv_guard = unsafe { Guard::<VideoKind>::new(ptr::null_mut(), recv_raw) };
+        let recv = unsafe { VideoFrameRef::new(recv_guard) }.expect("receiver video ref");
+        let fs_guard = unsafe { Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), fs_raw) };
+        let fs =
+            unsafe { VideoRef::<FrameSyncVideoFree>::new(fs_guard) }.expect("framesync video ref");
+
+        assert_eq!(recv.width(), fs.width());
+        assert_eq!(recv.height(), fs.height());
+        assert_eq!(recv.pixel_format(), fs.pixel_format());
+        assert_eq!(recv.frame_rate_n(), fs.frame_rate_n());
+        assert_eq!(recv.frame_rate_d(), fs.frame_rate_d());
+        assert_eq!(recv.picture_aspect_ratio(), fs.picture_aspect_ratio());
+        assert_eq!(recv.scan_type(), fs.scan_type());
+        assert_eq!(recv.scan_type(), ScanType::Interlaced);
+        assert_eq!(recv.timecode(), fs.timecode());
+        assert_eq!(recv.timestamp(), fs.timestamp());
+        assert_eq!(recv.line_stride_or_size(), fs.line_stride_or_size());
+        assert_eq!(recv.metadata(), fs.metadata());
+        assert_eq!(recv.data(), fs.data());
+
+        // The receiver guard would call the SDK free with a null instance; leak
+        // both refs to keep the unit test off the FFI free path.
+        std::mem::forget(recv);
+        std::mem::forget(fs);
+    }
+
+    /// An out-of-range `frame_format_type` must be rejected by `validate_video_layout`
+    /// before either video ref is constructed. This is what makes the unified
+    /// `scan_type()` `.expect(...)` policy sound: the unknown branch is unreachable.
+    #[test]
+    fn test_video_ref_rejects_out_of_range_scan_type() {
+        use crate::capture::{FrameSyncVideoFree, Guard, VideoKind};
+
+        let width = 16;
+        let height = 8;
+        let stride = width * 4;
+        let len = (stride * height) as usize;
+        let mut recv_data = vec![0u8; len];
+        let mut fs_data = vec![0u8; len];
+
+        let raw = |data: &mut [u8]| NDIlib_video_frame_v2_t {
+            xres: width,
+            yres: height,
+            FourCC: PixelFormat::BGRA.into(),
+            frame_rate_N: 30,
+            frame_rate_D: 1,
+            picture_aspect_ratio: 16.0 / 9.0,
+            frame_format_type: 0x0BAD_F00D, // not a valid NDIlib_frame_format_type_e
+            timecode: 0,
+            p_data: data.as_mut_ptr(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: stride,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 0,
+        };
+
+        // Layout validation rejects it directly...
+        assert!(matches!(
+            validate_video_layout(&raw(&mut recv_data)),
+            Err(Error::InvalidFrame(_))
+        ));
+
+        // ...and so both ref constructors fail before any `scan_type()` call.
+        let recv_guard = unsafe { Guard::<VideoKind>::new(ptr::null_mut(), raw(&mut recv_data)) };
+        assert!(matches!(
+            unsafe { VideoFrameRef::new(recv_guard) },
+            Err(Error::InvalidFrame(_))
+        ));
+
+        let fs_guard =
+            unsafe { Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw(&mut fs_data)) };
+        assert!(matches!(
+            unsafe { VideoRef::<FrameSyncVideoFree>::new(fs_guard) },
+            Err(Error::InvalidFrame(_))
+        ));
     }
 
     /// Test that MAX_VIDEO_BYTES constant is properly defined
@@ -4394,7 +4568,7 @@ mod tests {
 
     #[test]
     fn test_video_frame_ref_metadata_is_cached_and_owned_conversion_appends_nul() {
-        use crate::capture::RecvVideoGuard;
+        use crate::capture::{Guard, VideoKind};
 
         let width = 16;
         let height = 8;
@@ -4420,7 +4594,7 @@ mod tests {
             timestamp: 456,
         };
 
-        let guard = unsafe { RecvVideoGuard::new(ptr::null_mut(), raw) };
+        let guard = unsafe { Guard::<VideoKind>::new(ptr::null_mut(), raw) };
         let frame_ref = unsafe { VideoFrameRef::new(guard) }.expect("valid video ref");
 
         assert_eq!(frame_ref.metadata(), Some("cached"));
@@ -5271,7 +5445,7 @@ mod tests {
     /// Test that VideoFrameRef::data() uses cached length
     #[test]
     fn test_video_frame_ref_uses_cached_length() {
-        use crate::capture::RecvVideoGuard;
+        use crate::capture::{Guard, VideoKind};
 
         // Create a mock video frame for testing
         let width = 1920;
@@ -5299,7 +5473,7 @@ mod tests {
 
         // Create a guard with a null receiver instance (we won't use the free function)
         // This is safe because we'll forget the guard before it drops
-        let guard = unsafe { RecvVideoGuard::new(ptr::null_mut(), raw) };
+        let guard = unsafe { Guard::<VideoKind>::new(ptr::null_mut(), raw) };
 
         // Create the VideoFrameRef
         let frame_ref = unsafe { VideoFrameRef::new(guard) };

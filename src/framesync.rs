@@ -76,19 +76,36 @@
 //! }
 //! ```
 
-use std::{fmt, marker::PhantomData, mem::ManuallyDrop, num::NonZeroI32, ptr, rc::Rc, slice};
+use std::{fmt, mem::ManuallyDrop, num::NonZeroI32, ptr};
 
 use crate::{
-    frames::{
-        frame_metadata_str, validate_audio_layout, validate_audio_layout_allow_empty,
-        validate_frame_metadata, validate_video_layout, AudioFormat, AudioFrame, LineStrideOrSize,
-        PixelFormat, ScanType, ValidatedAudioLayout, ValidatedFrameMetadata, ValidatedVideoLayout,
-        VideoFrame,
-    },
+    capture::{FrameSyncAudioFree, FrameSyncVideoFree, Guard},
+    frames::{AudioFrame, AudioRef, ScanType, VideoFrame, VideoRef},
     ndi_lib::*,
     receiver::Receiver,
     Error, Result,
 };
+
+/// A zero-copy borrowed video frame from a [`FrameSync`] capture.
+///
+/// This is the FrameSync spelling of the generic
+/// [`VideoRef`](crate::frames::VideoRef); the [`Receiver`](crate::Receiver)
+/// spelling is [`VideoFrameRef`](crate::VideoFrameRef). Both share one accessor
+/// and `Debug` implementation. The frame is automatically freed when dropped via
+/// `NDIlib_framesync_free_video`.
+pub type FrameSyncVideoRef<'fs> = VideoRef<'fs, FrameSyncVideoFree>;
+
+/// A zero-copy borrowed audio frame from a [`FrameSync`] capture.
+///
+/// This is the FrameSync spelling of the generic
+/// [`AudioRef`](crate::frames::AudioRef); the [`Receiver`](crate::Receiver)
+/// spelling is [`AudioFrameRef`](crate::AudioFrameRef). The FrameSync path can
+/// produce a validated empty query/no-source state, so
+/// [`is_empty`](AudioRef::is_empty) and an `Option`-returning
+/// [`format`](AudioRef::format)/[`to_owned`](AudioRef::to_owned) are available.
+/// The frame is automatically freed when dropped via
+/// `NDIlib_framesync_free_audio_v2`.
+pub type FrameSyncAudioRef<'fs> = AudioRef<'fs, FrameSyncAudioFree>;
 
 /// Explicit audio operation for [`FrameSync::capture_audio`].
 ///
@@ -351,7 +368,7 @@ impl FrameSync {
             return Ok(None);
         }
 
-        let guard = unsafe { FrameSyncVideoGuard::new(self.instance, frame) };
+        let guard = unsafe { Guard::<FrameSyncVideoFree>::new(self.instance, frame) };
         let frame = unsafe { FrameSyncVideoRef::new(guard)? };
 
         Ok(Some(frame))
@@ -458,7 +475,7 @@ impl FrameSync {
             );
         }
 
-        let guard = unsafe { FrameSyncAudioGuard::new(self.instance, frame) };
+        let guard = unsafe { Guard::<FrameSyncAudioFree>::new(self.instance, frame) };
         unsafe { FrameSyncAudioRef::new(guard, request.query_input) }
     }
 
@@ -558,382 +575,10 @@ pub(crate) fn is_framesync_video_empty(frame: &NDIlib_video_frame_v2_t) -> bool 
         && frame.timestamp == 0
 }
 
-struct FrameSyncVideoGuard<'fs> {
-    instance: NDIlib_framesync_instance_t,
-    frame: NDIlib_video_frame_v2_t,
-    _owner: PhantomData<&'fs FrameSync>,
-    // FrameSync-owned SDK buffers are released through this FrameSync handle.
-    // Keep borrowed refs deliberately !Send/!Sync rather than depending on
-    // generated raw-pointer fields to supply that auto-trait behavior.
-    _thread_affine: PhantomData<Rc<()>>,
-}
-
-impl<'fs> FrameSyncVideoGuard<'fs> {
-    unsafe fn new(instance: NDIlib_framesync_instance_t, frame: NDIlib_video_frame_v2_t) -> Self {
-        Self {
-            instance,
-            frame,
-            _owner: PhantomData,
-            _thread_affine: PhantomData,
-        }
-    }
-
-    fn frame(&self) -> &NDIlib_video_frame_v2_t {
-        &self.frame
-    }
-}
-
-impl Drop for FrameSyncVideoGuard<'_> {
-    fn drop(&mut self) {
-        if self.instance.is_null() {
-            return;
-        }
-
-        unsafe {
-            NDIlib_framesync_free_video(self.instance, &mut self.frame);
-        }
-    }
-}
-
-struct FrameSyncAudioGuard<'fs> {
-    instance: NDIlib_framesync_instance_t,
-    frame: NDIlib_audio_frame_v3_t,
-    _owner: PhantomData<&'fs FrameSync>,
-    // See FrameSyncVideoGuard: borrowed FrameSync buffers are handle-affine.
-    _thread_affine: PhantomData<Rc<()>>,
-}
-
-impl<'fs> FrameSyncAudioGuard<'fs> {
-    unsafe fn new(instance: NDIlib_framesync_instance_t, frame: NDIlib_audio_frame_v3_t) -> Self {
-        Self {
-            instance,
-            frame,
-            _owner: PhantomData,
-            _thread_affine: PhantomData,
-        }
-    }
-
-    fn frame(&self) -> &NDIlib_audio_frame_v3_t {
-        &self.frame
-    }
-}
-
-impl Drop for FrameSyncAudioGuard<'_> {
-    fn drop(&mut self) {
-        if self.instance.is_null() {
-            return;
-        }
-
-        unsafe {
-            NDIlib_framesync_free_audio_v2(self.instance, &mut self.frame);
-        }
-    }
-}
-
-/// A zero-copy borrowed video frame from FrameSync capture.
-///
-/// This type wraps a frame captured via [`FrameSync::capture_video`], providing
-/// zero-copy access to the video data. The frame is automatically freed when
-/// dropped via `NDIlib_framesync_free_video`.
-///
-/// **Key characteristics:**
-/// - Zero allocations: References NDI SDK buffers directly
-/// - Zero copies: No memcpy of pixel data
-/// - RAII lifetime: Exactly one free per frame, enforced at compile time
-/// - Not `Send`: Prevents accidental cross-thread use of FFI buffers
-///
-/// # Converting to Owned
-///
-/// To store the frame or send it across threads, use [`to_owned()`](Self::to_owned):
-///
-/// ```no_run
-/// # use grafton_ndi::{NDI, ReceiverOptions, Receiver, FrameSync, Source, SourceAddress, ScanType};
-/// # fn main() -> Result<(), grafton_ndi::Error> {
-/// # let ndi = NDI::new()?;
-/// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-/// # let options = ReceiverOptions::builder(source).build();
-/// # let receiver = Receiver::new(&ndi, &options)?;
-/// let framesync = FrameSync::new(receiver)?;
-///
-/// if let Some(frame_ref) = framesync.capture_video(ScanType::Progressive)? {
-///     let owned = frame_ref.to_owned()?;
-///     // owned can now be sent across threads
-/// }
-/// # Ok(())
-/// # }
-/// ```
-pub struct FrameSyncVideoRef<'fs> {
-    guard: FrameSyncVideoGuard<'fs>,
-    layout: ValidatedVideoLayout,
-    metadata: ValidatedFrameMetadata,
-}
-
-impl<'fs> FrameSyncVideoRef<'fs> {
-    unsafe fn new(guard: FrameSyncVideoGuard<'fs>) -> Result<Self> {
-        let layout = validate_video_layout(guard.frame())?;
-        let metadata = unsafe { validate_frame_metadata(guard.frame().p_metadata)? };
-
-        Ok(Self {
-            guard,
-            layout,
-            metadata,
-        })
-    }
-
-    /// Get the frame width in pixels.
-    pub fn width(&self) -> i32 {
-        self.guard.frame().xres
-    }
-
-    /// Get the frame height in pixels.
-    pub fn height(&self) -> i32 {
-        self.guard.frame().yres
-    }
-
-    /// Get the pixel format (FourCC code).
-    pub fn pixel_format(&self) -> PixelFormat {
-        self.layout.pixel_format
-    }
-
-    /// Get the frame rate numerator.
-    pub fn frame_rate_n(&self) -> i32 {
-        self.guard.frame().frame_rate_N
-    }
-
-    /// Get the frame rate denominator.
-    pub fn frame_rate_d(&self) -> i32 {
-        self.guard.frame().frame_rate_D
-    }
-
-    /// Get the picture aspect ratio.
-    pub fn picture_aspect_ratio(&self) -> f32 {
-        self.guard.frame().picture_aspect_ratio
-    }
-
-    /// Get the scan type (progressive, interlaced, etc.).
-    pub fn scan_type(&self) -> ScanType {
-        #[allow(clippy::unnecessary_cast)]
-        ScanType::try_from(self.guard.frame().frame_format_type as u32)
-            .unwrap_or(ScanType::Progressive)
-    }
-
-    /// Get the timecode.
-    pub fn timecode(&self) -> i64 {
-        self.guard.frame().timecode
-    }
-
-    /// Get the timestamp.
-    pub fn timestamp(&self) -> i64 {
-        self.guard.frame().timestamp
-    }
-
-    /// Get the line stride or data size.
-    pub fn line_stride_or_size(&self) -> LineStrideOrSize {
-        self.layout.line_stride_or_size
-    }
-
-    /// Get frame metadata as UTF-8 text, if present.
-    pub fn metadata(&self) -> Option<&str> {
-        unsafe { frame_metadata_str(self.guard.frame().p_metadata, self.metadata) }
-    }
-
-    /// Get a zero-copy view of the frame data.
-    ///
-    /// This returns a slice directly into the NDI SDK's buffer.
-    /// No allocation or memcpy is performed.
-    pub fn data(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.guard.frame().p_data, self.layout.data_len_bytes) }
-    }
-
-    /// Convert this borrowed frame to an owned `VideoFrame`.
-    ///
-    /// This performs a single memcpy of the frame data and metadata,
-    /// allowing the frame to outlive the NDI buffer and be sent across threads.
-    pub fn to_owned(&self) -> Result<VideoFrame> {
-        unsafe { VideoFrame::from_raw_validated(self.guard.frame(), self.layout, self.metadata) }
-    }
-}
-
-impl fmt::Debug for FrameSyncVideoRef<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FrameSyncVideoRef")
-            .field("width", &self.width())
-            .field("height", &self.height())
-            .field("pixel_format", &self.pixel_format())
-            .field("frame_rate_n", &self.frame_rate_n())
-            .field("frame_rate_d", &self.frame_rate_d())
-            .field("picture_aspect_ratio", &self.picture_aspect_ratio())
-            .field("scan_type", &self.scan_type())
-            .field("timecode", &self.timecode())
-            .field("data (bytes)", &self.data().len())
-            .field("line_stride_or_size", &self.line_stride_or_size())
-            .field("metadata", &self.metadata())
-            .field("timestamp", &self.timestamp())
-            .finish()
-    }
-}
-
-/// A zero-copy borrowed audio frame from FrameSync capture.
-///
-/// This type wraps a frame captured via [`FrameSync::capture_audio`], providing
-/// zero-copy access to the audio samples. The frame is automatically freed when
-/// dropped via `NDIlib_framesync_free_audio_v2`.
-///
-/// **Key characteristics:**
-/// - Zero allocations: References NDI SDK buffers directly
-/// - Zero copies: No memcpy of audio samples
-/// - RAII lifetime: Exactly one free per frame, enforced at compile time
-/// - Not `Send`: Prevents accidental cross-thread use of FFI buffers
-///
-/// # Empty Query State
-///
-/// Query requests can produce a validated zero-length state when no source
-/// audio format is known or when the request did not ask for samples. In that
-/// state [`is_empty`](Self::is_empty) is true and [`data`](Self::data) returns
-/// an empty slice.
-pub struct FrameSyncAudioRef<'fs> {
-    guard: FrameSyncAudioGuard<'fs>,
-    layout: ValidatedAudioLayout,
-    metadata: ValidatedFrameMetadata,
-}
-
-impl<'fs> FrameSyncAudioRef<'fs> {
-    unsafe fn new(guard: FrameSyncAudioGuard<'fs>, query_input: bool) -> Result<Self> {
-        let layout = if query_input {
-            if guard.frame().no_samples != 0 {
-                return Err(Error::InvalidFrame(format!(
-                    "FrameSync audio query returned {} samples",
-                    guard.frame().no_samples
-                )));
-            }
-            validate_audio_layout_allow_empty(guard.frame())?
-        } else {
-            validate_audio_layout(guard.frame())?
-        };
-        let metadata = unsafe { validate_frame_metadata(guard.frame().p_metadata)? };
-
-        Ok(Self {
-            guard,
-            layout,
-            metadata,
-        })
-    }
-
-    /// Get the sample rate in Hz.
-    ///
-    /// Returns 0 if no audio source has been received yet.
-    pub fn sample_rate(&self) -> i32 {
-        self.layout.sample_rate
-    }
-
-    /// Get the number of audio channels.
-    ///
-    /// Returns 0 if no audio source has been received yet.
-    pub fn num_channels(&self) -> i32 {
-        self.layout.no_channels as i32
-    }
-
-    /// Get the number of samples per channel.
-    pub fn num_samples(&self) -> i32 {
-        self.layout.no_samples as i32
-    }
-
-    /// Returns true for a valid query/no-source state with no sample buffer.
-    pub fn is_empty(&self) -> bool {
-        self.layout.is_empty()
-    }
-
-    /// Get the timecode.
-    pub fn timecode(&self) -> i64 {
-        self.guard.frame().timecode
-    }
-
-    /// Get the timestamp.
-    pub fn timestamp(&self) -> i64 {
-        self.guard.frame().timestamp
-    }
-
-    /// Get the audio format (FourCC code).
-    pub fn format(&self) -> Option<AudioFormat> {
-        self.layout.format()
-    }
-
-    /// Get the channel stride in bytes.
-    pub fn channel_stride_in_bytes(&self) -> i32 {
-        self.layout.channel_stride_in_bytes
-    }
-
-    /// Get frame metadata as UTF-8 text, if present.
-    pub fn metadata(&self) -> Option<&str> {
-        unsafe { frame_metadata_str(self.guard.frame().p_metadata, self.metadata) }
-    }
-
-    /// Get a zero-copy view of the audio data as 32-bit floats.
-    ///
-    /// This returns a slice directly into the NDI SDK's buffer.
-    /// No allocation or memcpy is performed.
-    ///
-    /// The data is in planar format: all samples for channel 0, then all for
-    /// channel 1, etc. If the SDK returned strided planar audio, this slice is
-    /// the validated backing span and may include inter-channel padding.
-    pub fn data(&self) -> &[f32] {
-        if self.layout.is_empty() {
-            return &[];
-        }
-
-        unsafe {
-            slice::from_raw_parts(
-                self.guard.frame().p_data as *const f32,
-                self.layout.sample_count,
-            )
-        }
-    }
-
-    /// Get the zero-copy samples for a single channel.
-    ///
-    /// This respects `channel_stride_in_bytes`, so it works for tightly packed
-    /// and strided planar FLTP audio.
-    pub fn channel_data(&self, channel: usize) -> Option<&[f32]> {
-        let range = self.layout.channel_range(channel)?;
-        Some(&self.data()[range])
-    }
-
-    /// Convert this borrowed frame to an owned `AudioFrame`.
-    ///
-    /// This performs a single memcpy of the audio data and metadata,
-    /// allowing the frame to outlive the NDI buffer and be sent across threads.
-    ///
-    /// Returns `Ok(None)` for a valid query/no-source state with no sample
-    /// buffer to own.
-    pub fn to_owned(&self) -> Result<Option<AudioFrame>> {
-        if self.layout.is_empty() {
-            Ok(None)
-        } else {
-            AudioFrame::from_raw_validated(*self.guard.frame(), self.layout, self.metadata)
-                .map(Some)
-        }
-    }
-}
-
-impl fmt::Debug for FrameSyncAudioRef<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FrameSyncAudioRef")
-            .field("sample_rate", &self.sample_rate())
-            .field("num_channels", &self.num_channels())
-            .field("num_samples", &self.num_samples())
-            .field("timecode", &self.timecode())
-            .field("format", &self.format())
-            .field("data (samples)", &self.data().len())
-            .field("channel_stride_in_bytes", &self.channel_stride_in_bytes())
-            .field("metadata", &self.metadata())
-            .field("timestamp", &self.timestamp())
-            .finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frames::{AudioFormat, LineStrideOrSize, PixelFormat};
     use std::ptr;
 
     #[test]
@@ -1004,7 +649,7 @@ mod tests {
             timestamp: 0,
         };
 
-        let guard = unsafe { FrameSyncVideoGuard::new(ptr::null_mut(), raw) };
+        let guard = unsafe { Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw) };
         let frame = unsafe { FrameSyncVideoRef::new(guard) }.expect("valid video frame");
 
         assert_eq!(frame.metadata(), Some("framesync video"));
@@ -1044,7 +689,7 @@ mod tests {
             timestamp: 0,
         };
 
-        let guard = unsafe { FrameSyncVideoGuard::new(ptr::null_mut(), raw) };
+        let guard = unsafe { Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw) };
         assert!(matches!(
             unsafe { FrameSyncVideoRef::new(guard) },
             Err(Error::InvalidFrame(_))
@@ -1070,7 +715,7 @@ mod tests {
             timestamp: 0,
         };
 
-        let guard = unsafe { FrameSyncVideoGuard::new(ptr::null_mut(), raw) };
+        let guard = unsafe { Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw) };
         let result = unsafe { FrameSyncVideoRef::new(guard) };
         assert!(matches!(result, Err(Error::InvalidFrame(_))));
     }
@@ -1092,7 +737,7 @@ mod tests {
     #[test]
     fn test_framesync_audio_ref_query_no_source_empty() {
         let raw = NDIlib_audio_frame_v3_t::default();
-        let guard = unsafe { FrameSyncAudioGuard::new(ptr::null_mut(), raw) };
+        let guard = unsafe { Guard::<FrameSyncAudioFree>::new(ptr::null_mut(), raw) };
         let frame = unsafe { FrameSyncAudioRef::new(guard, true) }.expect("empty query frame");
 
         assert!(frame.is_empty());
@@ -1119,7 +764,7 @@ mod tests {
             timestamp: 0,
         };
 
-        let guard = unsafe { FrameSyncAudioGuard::new(ptr::null_mut(), raw) };
+        let guard = unsafe { Guard::<FrameSyncAudioFree>::new(ptr::null_mut(), raw) };
         let frame = unsafe { FrameSyncAudioRef::new(guard, true) }.expect("query source frame");
 
         assert!(frame.is_empty());
@@ -1131,7 +776,7 @@ mod tests {
     #[test]
     fn test_framesync_audio_ref_capture_rejects_empty() {
         let raw = NDIlib_audio_frame_v3_t::default();
-        let guard = unsafe { FrameSyncAudioGuard::new(ptr::null_mut(), raw) };
+        let guard = unsafe { Guard::<FrameSyncAudioFree>::new(ptr::null_mut(), raw) };
         let result = unsafe { FrameSyncAudioRef::new(guard, false) };
 
         assert!(matches!(result, Err(Error::InvalidFrame(_))));
@@ -1161,7 +806,7 @@ mod tests {
             timestamp: 0,
         };
 
-        let guard = unsafe { FrameSyncAudioGuard::new(ptr::null_mut(), raw) };
+        let guard = unsafe { Guard::<FrameSyncAudioFree>::new(ptr::null_mut(), raw) };
         let frame = unsafe { FrameSyncAudioRef::new(guard, false) }.expect("strided audio frame");
 
         assert_eq!(frame.metadata(), Some("framesync audio"));
@@ -1200,7 +845,7 @@ mod tests {
             timestamp: 0,
         };
 
-        let guard = unsafe { FrameSyncAudioGuard::new(ptr::null_mut(), raw) };
+        let guard = unsafe { Guard::<FrameSyncAudioFree>::new(ptr::null_mut(), raw) };
         assert!(matches!(
             unsafe { FrameSyncAudioRef::new(guard, false) },
             Err(Error::InvalidUtf8(_))

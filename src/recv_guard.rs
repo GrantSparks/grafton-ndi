@@ -6,12 +6,14 @@
 //! ## Architecture
 //!
 //! The actual implementation lives in `capture.rs`, which provides:
-//! - `CaptureKind` trait for frame-type-specific behavior
-//! - `RecvGuard<'rx, K>` generic RAII guard
+//! - `FrameFree` free-strategy trait and `CaptureKind` capture trait
+//! - `Guard<'owner, S>` generic RAII guard
 //!
-//! This module re-exports type aliases for backwards compatibility:
-//! - `RecvVideoGuard<'rx>` = `RecvGuard<'rx, VideoKind>`
-//! - `RecvAudioGuard<'rx>` = `RecvGuard<'rx, AudioKind>`
-//! - `RecvMetadataGuard<'rx>` = `RecvGuard<'rx, MetadataKind>`
+//! This module re-exports type aliases for the receiver guard kinds that have a
+//! kind-specific constructor:
+//! - `RecvAudioGuard<'rx>` = `Guard<'rx, AudioKind>`
+//! - `RecvMetadataGuard<'rx>` = `Guard<'rx, MetadataKind>`
+//!
+//! Video and the FrameSync families name `Guard<'_, Strategy>` directly.
 
-pub(crate) use crate::capture::{RecvAudioGuard, RecvMetadataGuard, RecvVideoGuard};
+pub(crate) use crate::capture::{RecvAudioGuard, RecvMetadataGuard};

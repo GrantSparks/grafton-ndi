@@ -5,20 +5,25 @@
 //!
 //! # Architecture
 //!
-//! The `CaptureKind` trait encapsulates frame-type-specific behavior:
-//! - Associated types for raw FFI frame, owned frame, and borrowed frame reference
-//! - Frame type constant for dispatch
-//! - Free function for RAII cleanup
+//! Two sealed traits split the abstraction along its two real axes:
 //!
-//! The `RecvGuard<'rx, K>` generic struct provides unified RAII management for all frame types.
+//! - [`FrameFree`] is the *free strategy*: the SDK instance handle type plus the
+//!   `free_*` call that releases one captured frame. The generic RAII guard
+//!   [`Guard<'owner, S>`](Guard) is written once against it, so every owning
+//!   surface — the [`Receiver`](crate::Receiver) capture path and
+//!   [`FrameSync`](crate::FrameSync) — shares one guard rather than hand-rolling
+//!   its own.
+//! - [`CaptureKind`] builds on `FrameFree` for the receiver capture path only,
+//!   adding the `NDIlib_recv_capture_v3` routing, the borrowed/owned frame
+//!   types, and the frame-type discriminant.
 //!
 //! # Example
 //!
 //! ```ignore
 //! // Internal use only - this module is not part of the public API
-//! use crate::capture::{RecvGuard, VideoKind};
+//! use crate::capture::{Guard, VideoKind};
 //!
-//! let guard = unsafe { RecvGuard::<VideoKind>::new(instance, frame) };
+//! let guard = unsafe { Guard::<VideoKind>::new(instance, frame) };
 //! // Guard automatically calls the correct free function when dropped
 //! ```
 
@@ -32,13 +37,56 @@ use crate::{
     Result,
 };
 
-/// Sealed trait module to prevent external implementations of `CaptureKind`.
+/// Sealed trait module to prevent external implementations of [`FrameFree`] and
+/// [`CaptureKind`].
 mod sealed {
     pub trait Sealed {}
 
     impl Sealed for super::VideoKind {}
     impl Sealed for super::AudioKind {}
     impl Sealed for super::MetadataKind {}
+    impl Sealed for super::FrameSyncVideoFree {}
+    impl Sealed for super::FrameSyncAudioFree {}
+}
+
+/// The *free strategy* for one captured-frame family: the SDK instance handle
+/// type plus the SDK call that releases a single frame.
+///
+/// This is the single axis along which the RAII [`Guard`] varies. The receiver
+/// kinds ([`VideoKind`], [`AudioKind`], [`MetadataKind`]) free through
+/// `NDIlib_recv_free_*`; the FrameSync strategies ([`FrameSyncVideoFree`],
+/// [`FrameSyncAudioFree`]) free through `NDIlib_framesync_free_*`. Factoring the
+/// free call out of [`CaptureKind`] lets both families reuse one guard and one
+/// borrowed-reference core instead of maintaining parallel copies.
+///
+/// This is a sealed trait — it cannot be implemented outside this crate.
+///
+/// # Safety
+///
+/// Implementors must ensure [`free`](Self::free) releases a frame that was
+/// populated by the matching SDK capture call through the same `instance`.
+pub trait FrameFree: sealed::Sealed + 'static {
+    /// The SDK instance handle that owns the frame buffers (and through which
+    /// they must be freed).
+    type Instance: Copy;
+
+    /// The raw FFI frame type from the NDI SDK.
+    type RawFrame: Default + Copy;
+
+    /// The `Debug` struct name of the borrowed reference that wraps this guard
+    /// (e.g. `"VideoFrameRef"` or `"FrameSyncVideoRef"`), so the shared generic
+    /// `Debug` impls render the historically-correct type name.
+    const REF_DEBUG_NAME: &'static str;
+
+    /// Free a single captured frame through its owning instance.
+    ///
+    /// # Safety
+    ///
+    /// - `instance` must be the instance that produced `frame` (the FrameSync
+    ///   strategies additionally tolerate a null `instance` by short-circuiting).
+    /// - `frame` must have been populated by a successful capture for this
+    ///   strategy and not already freed.
+    unsafe fn free(instance: Self::Instance, frame: &mut Self::RawFrame);
 }
 
 /// Single source of truth describing one NDI frame kind (video, audio, or
@@ -57,14 +105,12 @@ mod sealed {
 ///
 /// # Safety
 ///
-/// Implementors must ensure that the four `unsafe` members agree on the same
-/// `RawFrame`: `capture_into` populates it via `NDIlib_recv_capture_v3`,
-/// `free_frame` frees frames so populated, and `make_ref` wraps one that
-/// `capture_into` reported as [`FRAME_TYPE`](Self::FRAME_TYPE).
-pub trait CaptureKind: sealed::Sealed + Sized + 'static {
-    /// The raw FFI frame type from the NDI SDK.
-    type RawFrame: Default + Copy;
-
+/// Implementors must ensure the members agree on the same
+/// [`RawFrame`](FrameFree::RawFrame): `capture_into` populates it via
+/// `NDIlib_recv_capture_v3`, [`free`](FrameFree::free) frees frames so populated,
+/// and `make_ref` wraps one that `capture_into` reported as
+/// [`FRAME_TYPE`](Self::FRAME_TYPE).
+pub trait CaptureKind: FrameFree<Instance = NDIlib_recv_instance_t> + Sized {
     /// The borrowed, zero-copy view of a captured frame, tied to the receiver
     /// that produced it.
     type Ref<'rx>;
@@ -81,20 +127,12 @@ pub trait CaptureKind: sealed::Sealed + Sized + 'static {
     /// # Safety
     ///
     /// - `instance` must be a valid NDI receiver instance.
-    /// - `frame` must point to a writable [`RawFrame`](Self::RawFrame).
+    /// - `frame` must point to a writable [`RawFrame`](FrameFree::RawFrame).
     unsafe fn capture_into(
         instance: NDIlib_recv_instance_t,
         frame: *mut Self::RawFrame,
         timeout_ms: u32,
     ) -> NDIlib_frame_type_e;
-
-    /// Free a captured frame.
-    ///
-    /// # Safety
-    ///
-    /// - `instance` must be a valid NDI receiver instance
-    /// - `frame` must have been populated by a successful capture that returned `FRAME_TYPE`
-    unsafe fn free_frame(instance: NDIlib_recv_instance_t, frame: &Self::RawFrame);
 
     /// Wrap a freshly captured frame guard in its borrowed view, validating any
     /// kind-specific invariants (e.g. FourCC) during construction.
@@ -103,7 +141,7 @@ pub trait CaptureKind: sealed::Sealed + Sized + 'static {
     ///
     /// `guard` must own a frame that `capture_into` reported as
     /// [`FRAME_TYPE`](Self::FRAME_TYPE).
-    unsafe fn make_ref<'rx>(guard: RecvGuard<'rx, Self>) -> Result<Self::Ref<'rx>>;
+    unsafe fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<Self::Ref<'rx>>;
 
     /// Copy a borrowed view into an owned, `'static` frame.
     fn ref_to_owned(frame: &Self::Ref<'_>) -> Result<Self::Owned>;
@@ -112,8 +150,17 @@ pub trait CaptureKind: sealed::Sealed + Sized + 'static {
 /// Marker type for video frame capture operations.
 pub struct VideoKind;
 
-impl CaptureKind for VideoKind {
+impl FrameFree for VideoKind {
+    type Instance = NDIlib_recv_instance_t;
     type RawFrame = NDIlib_video_frame_v2_t;
+    const REF_DEBUG_NAME: &'static str = "VideoFrameRef";
+
+    unsafe fn free(instance: Self::Instance, frame: &mut Self::RawFrame) {
+        NDIlib_recv_free_video_v2(instance, frame);
+    }
+}
+
+impl CaptureKind for VideoKind {
     type Ref<'rx> = VideoFrameRef<'rx>;
     type Owned = VideoFrame;
     const FRAME_TYPE: NDIlib_frame_type_e = NDIlib_frame_type_e_NDIlib_frame_type_video;
@@ -132,11 +179,7 @@ impl CaptureKind for VideoKind {
         )
     }
 
-    unsafe fn free_frame(instance: NDIlib_recv_instance_t, frame: &Self::RawFrame) {
-        NDIlib_recv_free_video_v2(instance, frame);
-    }
-
-    unsafe fn make_ref<'rx>(guard: RecvGuard<'rx, Self>) -> Result<Self::Ref<'rx>> {
+    unsafe fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<Self::Ref<'rx>> {
         VideoFrameRef::new(guard)
     }
 
@@ -148,8 +191,17 @@ impl CaptureKind for VideoKind {
 /// Marker type for audio frame capture operations.
 pub struct AudioKind;
 
-impl CaptureKind for AudioKind {
+impl FrameFree for AudioKind {
+    type Instance = NDIlib_recv_instance_t;
     type RawFrame = NDIlib_audio_frame_v3_t;
+    const REF_DEBUG_NAME: &'static str = "AudioFrameRef";
+
+    unsafe fn free(instance: Self::Instance, frame: &mut Self::RawFrame) {
+        NDIlib_recv_free_audio_v3(instance, frame);
+    }
+}
+
+impl CaptureKind for AudioKind {
     type Ref<'rx> = AudioFrameRef<'rx>;
     type Owned = AudioFrame;
     const FRAME_TYPE: NDIlib_frame_type_e = NDIlib_frame_type_e_NDIlib_frame_type_audio;
@@ -168,11 +220,7 @@ impl CaptureKind for AudioKind {
         )
     }
 
-    unsafe fn free_frame(instance: NDIlib_recv_instance_t, frame: &Self::RawFrame) {
-        NDIlib_recv_free_audio_v3(instance, frame);
-    }
-
-    unsafe fn make_ref<'rx>(guard: RecvGuard<'rx, Self>) -> Result<Self::Ref<'rx>> {
+    unsafe fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<Self::Ref<'rx>> {
         AudioFrameRef::new(guard)
     }
 
@@ -184,8 +232,17 @@ impl CaptureKind for AudioKind {
 /// Marker type for metadata frame capture operations.
 pub struct MetadataKind;
 
-impl CaptureKind for MetadataKind {
+impl FrameFree for MetadataKind {
+    type Instance = NDIlib_recv_instance_t;
     type RawFrame = NDIlib_metadata_frame_t;
+    const REF_DEBUG_NAME: &'static str = "MetadataFrameRef";
+
+    unsafe fn free(instance: Self::Instance, frame: &mut Self::RawFrame) {
+        NDIlib_recv_free_metadata(instance, frame);
+    }
+}
+
+impl CaptureKind for MetadataKind {
     type Ref<'rx> = MetadataFrameRef<'rx>;
     type Owned = MetadataFrame;
     const FRAME_TYPE: NDIlib_frame_type_e = NDIlib_frame_type_e_NDIlib_frame_type_metadata;
@@ -204,11 +261,7 @@ impl CaptureKind for MetadataKind {
         )
     }
 
-    unsafe fn free_frame(instance: NDIlib_recv_instance_t, frame: &Self::RawFrame) {
-        NDIlib_recv_free_metadata(instance, frame);
-    }
-
-    unsafe fn make_ref<'rx>(guard: RecvGuard<'rx, Self>) -> Result<Self::Ref<'rx>> {
+    unsafe fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<Self::Ref<'rx>> {
         MetadataFrameRef::new(guard)
     }
 
@@ -218,45 +271,90 @@ impl CaptureKind for MetadataKind {
     }
 }
 
+/// Free strategy for video frames captured through [`FrameSync`](crate::FrameSync).
+///
+/// Frees via `NDIlib_framesync_free_video`. Unlike the receiver strategies this
+/// tolerates a null instance handle (the borrowed-frame tests construct guards
+/// with a null instance), short-circuiting the free in that case.
+pub struct FrameSyncVideoFree;
+
+impl FrameFree for FrameSyncVideoFree {
+    type Instance = NDIlib_framesync_instance_t;
+    type RawFrame = NDIlib_video_frame_v2_t;
+    const REF_DEBUG_NAME: &'static str = "FrameSyncVideoRef";
+
+    unsafe fn free(instance: Self::Instance, frame: &mut Self::RawFrame) {
+        if instance.is_null() {
+            return;
+        }
+        NDIlib_framesync_free_video(instance, frame);
+    }
+}
+
+/// Free strategy for audio frames captured through [`FrameSync`](crate::FrameSync).
+///
+/// Frees via `NDIlib_framesync_free_audio_v2`, tolerating a null instance handle
+/// the same way [`FrameSyncVideoFree`] does.
+pub struct FrameSyncAudioFree;
+
+impl FrameFree for FrameSyncAudioFree {
+    type Instance = NDIlib_framesync_instance_t;
+    type RawFrame = NDIlib_audio_frame_v3_t;
+    const REF_DEBUG_NAME: &'static str = "FrameSyncAudioRef";
+
+    unsafe fn free(instance: Self::Instance, frame: &mut Self::RawFrame) {
+        if instance.is_null() {
+            return;
+        }
+        NDIlib_framesync_free_audio_v2(instance, frame);
+    }
+}
+
 /// Generic RAII guard for captured NDI frames.
 ///
-/// This guard ensures that captured frames are freed exactly once via the appropriate
-/// `NDIlib_recv_free_*` function. The frame type is determined by the `K: CaptureKind`
-/// type parameter, enabling compile-time dispatch with zero runtime cost.
+/// This guard ensures that captured frames are freed exactly once via the free
+/// strategy `S`'s [`FrameFree::free`] call. The strategy is determined by the
+/// `S: FrameFree` type parameter, enabling compile-time dispatch with zero
+/// runtime cost — receiver captures use `NDIlib_recv_free_*`, FrameSync captures
+/// use `NDIlib_framesync_free_*`, all through the same guard.
 ///
-/// The lifetime parameter `'rx` ties this guard to the `Receiver` that created it,
-/// preventing use-after-free by ensuring the receiver cannot be dropped while
-/// this guard is alive.
+/// The lifetime parameter `'owner` ties this guard to the owner that created it
+/// (a `Receiver` or a `FrameSync`), preventing use-after-free by ensuring the
+/// owner cannot be dropped while this guard is alive.
 ///
 /// # Type Parameters
 ///
-/// - `'rx`: Lifetime of the receiver borrow
-/// - `K`: The kind of frame (video, audio, or metadata)
+/// - `'owner`: Lifetime of the owning instance's borrow
+/// - `S`: The free strategy (video/audio/metadata, receiver or FrameSync)
 ///
 /// # Safety
 ///
 /// This struct stores raw FFI types and must only be created through the `unsafe fn new()`
 /// constructor, which requires the caller to guarantee validity of the instance and frame.
-pub struct RecvGuard<'rx, K: CaptureKind> {
-    instance: NDIlib_recv_instance_t,
-    frame: K::RawFrame,
-    _owner: PhantomData<&'rx crate::Receiver>,
-    // SDK-owned receive buffers must be freed through the originating receiver.
-    // Keep the borrowed frame refs deliberately !Send/!Sync rather than relying
-    // on raw-pointer auto-traits from generated bindings.
+pub struct Guard<'owner, S: FrameFree> {
+    instance: S::Instance,
+    frame: S::RawFrame,
+    // Ties the guard (and the borrowed refs built on it) to the owning instance's
+    // borrow. The owner type is irrelevant to the borrow checker, so a unit
+    // reference is enough to carry `'owner` covariantly.
+    _owner: PhantomData<&'owner ()>,
+    // SDK-owned buffers must be freed through the originating instance, on the
+    // originating thread. Keep the guard (and borrowed frame refs) deliberately
+    // !Send/!Sync rather than relying on raw-pointer auto-traits from generated
+    // bindings.
     _thread_affine: PhantomData<Rc<()>>,
 }
 
-impl<'rx, K: CaptureKind> RecvGuard<'rx, K> {
+impl<'owner, S: FrameFree> Guard<'owner, S> {
     /// Create a new frame guard.
     ///
     /// # Safety
     ///
     /// The caller must ensure that:
-    /// - `instance` is a valid NDI receiver instance
-    /// - `frame` was populated by a successful call to `NDIlib_recv_capture_v3`
-    ///   that returned the frame type corresponding to `K`
-    pub(crate) unsafe fn new(instance: NDIlib_recv_instance_t, frame: K::RawFrame) -> Self {
+    /// - `instance` is a valid instance for the free strategy `S` (or null only
+    ///   for the FrameSync strategies, which short-circuit their free)
+    /// - `frame` was populated by a successful capture for `S` and not yet freed
+    pub(crate) unsafe fn new(instance: S::Instance, frame: S::RawFrame) -> Self {
         Self {
             instance,
             frame,
@@ -266,16 +364,16 @@ impl<'rx, K: CaptureKind> RecvGuard<'rx, K> {
     }
 
     /// Get a reference to the underlying raw frame.
-    pub(crate) fn frame(&self) -> &K::RawFrame {
+    pub(crate) fn frame(&self) -> &S::RawFrame {
         &self.frame
     }
 }
 
-impl<'rx, K: CaptureKind> Drop for RecvGuard<'rx, K> {
+impl<'owner, S: FrameFree> Drop for Guard<'owner, S> {
     fn drop(&mut self) {
         // SAFETY: The constructor guarantees that instance and frame are valid
         unsafe {
-            K::free_frame(self.instance, &self.frame);
+            S::free(self.instance, &mut self.frame);
         }
     }
 }
@@ -288,7 +386,7 @@ impl<'rx, K: CaptureKind> Drop for RecvGuard<'rx, K> {
 /// - `Error`: The SDK returned an error frame
 pub(crate) enum CaptureResult<'rx, K: CaptureKind> {
     /// Successfully captured a frame of the expected type.
-    Frame(RecvGuard<'rx, K>),
+    Frame(Guard<'rx, K>),
     /// No frame available within timeout, or a different frame type was returned.
     None,
     /// The SDK returned an error frame.
@@ -312,28 +410,25 @@ pub(crate) unsafe fn capture_raw<'rx, K: CaptureKind>(
     let frame_type = K::capture_into(instance, &mut frame, timeout_ms);
 
     match frame_type {
-        t if t == K::FRAME_TYPE => CaptureResult::Frame(RecvGuard::<K>::new(instance, frame)),
+        t if t == K::FRAME_TYPE => CaptureResult::Frame(Guard::<K>::new(instance, frame)),
         NDIlib_frame_type_e_NDIlib_frame_type_none => CaptureResult::None,
         NDIlib_frame_type_e_NDIlib_frame_type_error => CaptureResult::Error,
         _ => CaptureResult::None, // Other frame types are ignored
     }
 }
 
-// Type aliases for backwards compatibility with existing code
-/// RAII guard for a captured video frame.
-///
-/// Automatically calls `NDIlib_recv_free_video_v2` when dropped.
-pub type RecvVideoGuard<'rx> = RecvGuard<'rx, VideoKind>;
-
+// Convenience aliases for the receiver guard kinds that have a kind-specific
+// constructor (audio validates a concrete layout; metadata wraps its own ref).
+// Video and the FrameSync families name `Guard<'_, Strategy>` directly.
 /// RAII guard for a captured audio frame.
 ///
 /// Automatically calls `NDIlib_recv_free_audio_v3` when dropped.
-pub type RecvAudioGuard<'rx> = RecvGuard<'rx, AudioKind>;
+pub type RecvAudioGuard<'rx> = Guard<'rx, AudioKind>;
 
 /// RAII guard for a captured metadata frame.
 ///
 /// Automatically calls `NDIlib_recv_free_metadata` when dropped.
-pub type RecvMetadataGuard<'rx> = RecvGuard<'rx, MetadataKind>;
+pub type RecvMetadataGuard<'rx> = Guard<'rx, MetadataKind>;
 
 #[cfg(test)]
 mod tests {
@@ -344,15 +439,16 @@ mod tests {
         use std::mem::size_of;
 
         // Guards should be compact - instance pointer + frame struct + zero-sized PhantomData
-        assert!(size_of::<RecvVideoGuard>() > 0);
         assert!(size_of::<RecvAudioGuard>() > 0);
         assert!(size_of::<RecvMetadataGuard>() > 0);
 
         // Generic guard with different kinds should have same overhead per kind
         // (sizes differ only due to RawFrame size differences)
-        assert!(size_of::<RecvGuard<VideoKind>>() > 0);
-        assert!(size_of::<RecvGuard<AudioKind>>() > 0);
-        assert!(size_of::<RecvGuard<MetadataKind>>() > 0);
+        assert!(size_of::<Guard<VideoKind>>() > 0);
+        assert!(size_of::<Guard<AudioKind>>() > 0);
+        assert!(size_of::<Guard<MetadataKind>>() > 0);
+        assert!(size_of::<Guard<FrameSyncVideoFree>>() > 0);
+        assert!(size_of::<Guard<FrameSyncAudioFree>>() > 0);
     }
 
     #[test]
