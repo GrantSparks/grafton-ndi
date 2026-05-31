@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-05-31
+
+### Overview
+
+Version 0.13.0 reorganizes frame capture into typed sub-views and makes frame layout state private behind validated, invariant-preserving accessors. Per-kind capture methods are replaced by `Receiver::video()/audio()/metadata()` views, video/audio/metadata frame fields are now private with checked getters and mutators, unchecked layout helpers are replaced by checked `try_*` APIs, and image encoding is enabled by default. This is a minor-version pre-1.0 release, which Cargo treats as a breaking compatibility boundary, because of the capture API restructuring and the move to private frame fields.
+
 ### Breaking Changes
 
 - **Frame capture is now organized into typed sub-views**: the per-kind `Receiver` methods (`capture_video`, `capture_video_ref`, `capture_video_timeout`, and the `audio`/`metadata` equivalents) are replaced by kind accessors `Receiver::video()`, `audio()`, and `metadata()` that return a `Capture<'_, K>` view with three verbs: `capture()` (reliable owned capture with retry), `try_capture()` (single owned poll), and `try_capture_ref()` (single zero-copy borrow). For example, `receiver.capture_video(t)` becomes `receiver.video().capture(t)`, `receiver.capture_audio_timeout(t)` becomes `receiver.audio().try_capture(t)`, and `receiver.capture_video_ref(t)` becomes `receiver.video().try_capture_ref(t)`. The async wrappers follow the same shape via `AsyncReceiver::video()/audio()/metadata()` returning an `AsyncCapture` view with `capture()` and `try_capture()` (no borrowed variant, since a borrowed frame cannot cross the blocking-pool boundary). The capture logic is now written once over a single generic `CaptureKind` core instead of being duplicated per frame kind.

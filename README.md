@@ -53,24 +53,24 @@ Add the crate to `Cargo.toml`:
 
 ```toml
 [dependencies]
-grafton-ndi = "0.12"
+grafton-ndi = "0.13"
 ```
 
 Feature flags:
 
 ```toml
 # Minimal build without PNG/JPEG/data URL helpers
-# grafton-ndi = { version = "0.12", default-features = false }
+# grafton-ndi = { version = "0.13", default-features = false }
 
 # Image encoding support is enabled by default
-# grafton-ndi = { version = "0.12", features = ["image-encoding"] }
+# grafton-ndi = { version = "0.13", features = ["image-encoding"] }
 
 # Async receiver wrappers
-# grafton-ndi = { version = "0.12", features = ["tokio"] }
-# grafton-ndi = { version = "0.12", features = ["async-std"] }
+# grafton-ndi = { version = "0.13", features = ["tokio"] }
+# grafton-ndi = { version = "0.13", features = ["async-std"] }
 
 # Advanced SDK symbols, when available from the installed SDK
-# grafton-ndi = { version = "0.12", features = ["advanced_sdk"] }
+# grafton-ndi = { version = "0.13", features = ["advanced_sdk"] }
 ```
 
 ### Prerequisites
