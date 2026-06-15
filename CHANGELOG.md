@@ -31,11 +31,10 @@ it adds no new runtime features over 0.13.0.
 
 ### Breaking Changes
 
-- **Removed the unreachable `FrameType` enum**: `FrameType` was a vestige of the
-  pre-0.13 capture-any API and was never constructed by any code path after the
-  capture surface was reorganized into typed sub-views
-  (`Receiver::video()/audio()/metadata()`). Error frames continue to surface as
-  `Error::CaptureFailed`; receiver status is available via
+- **Removed the unused `FrameType` enum**: it was unreachable — no public API
+  returned a value of it, so nothing can break. Capture goes through the typed
+  sub-views (`Receiver::video()/audio()/metadata()`); error frames surface as
+  `Error::CaptureFailed`, and receiver status via
   `Receiver::poll_status_change()` returning `ReceiverStatus`.
 - **`Error`, `FormatCategory`, and `ImageFormat` are now `#[non_exhaustive]`**:
   downstream `match` expressions over these types must include a wildcard `_`
@@ -44,13 +43,11 @@ it adds no new runtime features over 0.13.0.
 
 ### Changed
 
-- **API documentation is now self-hosted**: the crate generates its FFI bindings
-  from the NDI SDK headers at build time, and the NDI SDK license does not permit
-  redistributing those headers or bindings derived from them, so docs.rs cannot
-  build the crate. Documentation is instead built in CI (which has a licensed SDK
-  installed) and published to GitHub Pages at
-  <https://grantsparks.github.io/grafton-ndi/grafton_ndi/>. The `documentation`
-  metadata and README links now point there.
+- **API documentation is self-hosted on GitHub Pages**: the crate builds its FFI
+  bindings from the NDI SDK headers, which the SDK license forbids redistributing,
+  so docs.rs cannot build it. Docs are built in CI and published at
+  <https://grantsparks.github.io/grafton-ndi/grafton_ndi/>; the `documentation`
+  metadata and README links point there.
 - **Platform-support documentation corrected**: the crate-level docs now reflect
   that Windows, Linux, and macOS are all exercised in CI (build, test, lint, and
   semver checks), matching the README support matrix.
