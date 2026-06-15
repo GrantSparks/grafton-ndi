@@ -1,6 +1,6 @@
 [package]
 name = "grafton-ndi"
-version = "0.13.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.87"
 build = "build.rs"
@@ -9,7 +9,9 @@ description = "High-performance Rust bindings for the NDI® 6 SDK - real-time IP
 license = "Apache-2.0"
 repository = "https://github.com/GrantSparks/grafton-ndi"
 homepage = "https://www.grafton.ai"
-documentation = "https://docs.rs/grafton-ndi"
+# Building this crate runs bindgen against the licensed NDI SDK headers, which
+# docs.rs cannot provide, so API docs are self-hosted from CI instead of docs.rs.
+documentation = "https://grantsparks.github.io/grafton-ndi/grafton_ndi/"
 categories = ["api-bindings", "multimedia::video", "network-programming"]
 keywords = ["ndi", "video", "streaming", "broadcast", "realtime"]
 readme = "README.md"

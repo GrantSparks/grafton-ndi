@@ -89,7 +89,7 @@ use crate::{
 /// A zero-copy borrowed video frame from a [`FrameSync`] capture.
 ///
 /// This is the FrameSync spelling of the generic
-/// [`VideoRef`](crate::frames::VideoRef); the [`Receiver`](crate::Receiver)
+/// [`VideoRef`]; the [`Receiver`]
 /// spelling is [`VideoFrameRef`](crate::VideoFrameRef). Both share one accessor
 /// and `Debug` implementation. The frame is automatically freed when dropped via
 /// `NDIlib_framesync_free_video`.
@@ -98,7 +98,7 @@ pub type FrameSyncVideoRef<'fs> = VideoRef<'fs, FrameSyncVideoFree>;
 /// A zero-copy borrowed audio frame from a [`FrameSync`] capture.
 ///
 /// This is the FrameSync spelling of the generic
-/// [`AudioRef`](crate::frames::AudioRef); the [`Receiver`](crate::Receiver)
+/// [`AudioRef`]; the [`Receiver`]
 /// spelling is [`AudioFrameRef`](crate::AudioFrameRef). The FrameSync path can
 /// produce a validated empty query/no-source state, so
 /// [`is_empty`](AudioRef::is_empty) and an `Option`-returning

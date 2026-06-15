@@ -9,7 +9,12 @@ use std::{ffi::NulError, io, time::Duration};
 /// This enum represents all possible errors that can occur when using the
 /// grafton-ndi library. It provides detailed error messages and automatic
 /// conversion from common error types.
+///
+/// This enum is marked `#[non_exhaustive]` so that new error variants can be
+/// added as the NDI SDK surface evolves without constituting a breaking change.
+/// Match arms should include a wildcard `_` pattern.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     /// NDI runtime initialization failed.
     ///

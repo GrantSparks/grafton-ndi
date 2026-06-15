@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-15
+
+### Overview
+
+Version 1.0.0 marks the first stable release of `grafton-ndi`. The public API
+reached in 0.13.0 has been frozen, audited for forward compatibility, and is now
+covered by a semantic-versioning stability guarantee: within the 1.x series,
+breaking changes will only ship in a new major version. This release contains
+the final pre-stabilization API adjustments plus documentation and tooling work;
+it adds no new runtime features over 0.13.0.
+
+### Stability Guarantee
+
+- The public API is now stable under [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+  Additive, backwards-compatible changes ship in minor releases; bug fixes ship
+  in patch releases; breaking changes require a new major version.
+- Enums that track the evolving NDI SDK surface (`PixelFormat`, `ScanType`,
+  `AudioFormat`, `ReceiverColorFormat`, `ReceiverBandwidth`, `FormatCategory`)
+  and the crate's `Error` and `ImageFormat` types are marked `#[non_exhaustive]`
+  so the SDK can grow without forcing a major bump. Match on these with a
+  wildcard `_` arm.
+
+### Breaking Changes
+
+- **Removed the unreachable `FrameType` enum**: `FrameType` was a vestige of the
+  pre-0.13 capture-any API and was never constructed by any code path after the
+  capture surface was reorganized into typed sub-views
+  (`Receiver::video()/audio()/metadata()`). Error frames continue to surface as
+  `Error::CaptureFailed`; receiver status is available via
+  `Receiver::poll_status_change()` returning `ReceiverStatus`.
+- **`Error`, `FormatCategory`, and `ImageFormat` are now `#[non_exhaustive]`**:
+  downstream `match` expressions over these types must include a wildcard `_`
+  arm. This preserves the ability to add error variants, pixel-format layout
+  categories, and image encoders in future minor releases without a major bump.
+
+### Changed
+
+- **API documentation is now self-hosted**: the crate generates its FFI bindings
+  from the NDI SDK headers at build time, and the NDI SDK license does not permit
+  redistributing those headers or bindings derived from them, so docs.rs cannot
+  build the crate. Documentation is instead built in CI (which has a licensed SDK
+  installed) and published to GitHub Pages at
+  <https://grantsparks.github.io/grafton-ndi/grafton_ndi/>. The `documentation`
+  metadata and README links now point there.
+- **Platform-support documentation corrected**: the crate-level docs now reflect
+  that Windows, Linux, and macOS are all exercised in CI (build, test, lint, and
+  semver checks), matching the README support matrix.
+
+### Fixed
+
+- **Documentation now builds clean under `-D warnings`**: removed redundant
+  explicit intra-doc link targets, replaced links to the private `Guard` type
+  with plain code spans, and fixed an unresolved `VideoFrame` link.
+
+### Internal
+
+- **CI now lints and publishes documentation**: added a documentation lint step
+  (`cargo doc --no-deps --all-features` with `RUSTDOCFLAGS=-D warnings`) so
+  rustdoc regressions fail the build, and a job that publishes the rendered docs
+  to GitHub Pages on pushes to `main`.
+
 ## [0.13.0] - 2026-05-31
 
 ### Overview

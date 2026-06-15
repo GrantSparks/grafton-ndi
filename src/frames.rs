@@ -79,7 +79,12 @@ pub enum PixelFormat {
 /// - **Packed**: All pixel components are interleaved in a single buffer
 /// - **Planar420**: Y, U, V planes stored separately with 4:2:0 chroma subsampling
 /// - **SemiPlanar420**: Y plane followed by interleaved UV plane (NV12)
+///
+/// This enum is marked `#[non_exhaustive]` because the NDI SDK's video FourCC
+/// namespace is open and grows across releases; future formats may introduce
+/// additional memory-layout categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FormatCategory {
     /// Packed formats: simple stride * height buffer.
     Packed,
@@ -1806,8 +1811,13 @@ pub(crate) unsafe fn frame_metadata_str<'a>(
 /// // JPEG with quality 85 (lossy, smaller file size)
 /// let jpeg = ImageFormat::Jpeg(85);
 /// ```
+///
+/// This enum is marked `#[non_exhaustive]` so that additional encoders can be
+/// added without a breaking change. Match arms should include a wildcard `_`
+/// pattern.
 #[cfg(feature = "image-encoding")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ImageFormat {
     /// PNG format (lossless compression)
     Png,
@@ -2741,7 +2751,7 @@ fn validate_audio_format(fourcc: NDIlib_FourCC_audio_type_e) -> Result<AudioForm
 
 /// A zero-copy borrowed video frame, generic over its free strategy `S`.
 ///
-/// This type wraps an RAII [`Guard`] that owns the NDI frame buffer lifetime,
+/// This type wraps an RAII `Guard` that owns the NDI frame buffer lifetime,
 /// exposing a safe, zero-copy view of the video data. The frame is automatically
 /// freed when dropped, via whichever `NDIlib_*_free_video*` call the strategy `S`
 /// encodes.
@@ -2928,7 +2938,7 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> fmt::Debug for VideoR
 
 /// A zero-copy borrowed audio frame, generic over its free strategy `S`.
 ///
-/// This type wraps an RAII [`Guard`] that owns the NDI frame buffer lifetime,
+/// This type wraps an RAII `Guard` that owns the NDI frame buffer lifetime,
 /// exposing a safe, zero-copy view of the audio data. The frame is automatically
 /// freed when dropped, via whichever `NDIlib_*_free_audio*` call the strategy `S`
 /// encodes.

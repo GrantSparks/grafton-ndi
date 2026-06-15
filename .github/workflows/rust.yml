@@ -100,6 +100,13 @@ jobs:
       - name: Build examples
         run: cargo build --examples
 
+      # Documentation lint runs once; rustdoc lints are platform-independent.
+      - name: Check documentation
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
   # Semver check runs on all platforms
   semver:
     name: Check semver
@@ -139,6 +146,58 @@ jobs:
           save-if: false  # Let test-and-lint job handle saving
 
       - uses: obi1kenobi/cargo-semver-checks-action@v2
+
+  # Build and publish API documentation to GitHub Pages.
+  #
+  # docs.rs cannot build this crate: bindgen generates the FFI bindings from the
+  # NDI SDK headers at build time, and the NDI SDK license forbids redistributing
+  # those headers (or bindings derived from them). Docs are therefore generated
+  # here, where a licensed SDK is installed, and self-hosted on GitHub Pages.
+  docs:
+    name: Publish docs
+    needs: [test-and-lint, semver]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-ndi-linux
+        with:
+          save-cache: 'false'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+          shared-key: "rust-cache-ubuntu-latest"
+          save-if: false
+
+      - name: Build documentation
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+      # docs.rs serves the crate root; replicate that with a redirect so the
+      # Pages root lands on the crate documentation.
+      - name: Add root redirect to crate docs
+        run: echo '<meta http-equiv="refresh" content="0; url=grafton_ndi/index.html">' > target/doc/index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
 
   # Publish job
   publish:

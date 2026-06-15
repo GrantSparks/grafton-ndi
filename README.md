@@ -1,7 +1,7 @@
 # grafton-ndi
 
 [![Crates.io](https://img.shields.io/crates/v/grafton-ndi.svg)](https://crates.io/crates/grafton-ndi)
-[![Documentation](https://docs.rs/grafton-ndi/badge.svg)](https://docs.rs/grafton-ndi)
+[![Documentation](https://img.shields.io/badge/docs-grantsparks.github.io-blue.svg)](https://grantsparks.github.io/grafton-ndi/grafton_ndi/)
 [![CI](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml/badge.svg)](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml)
 [![License](https://img.shields.io/crates/l/grafton-ndi.svg)](https://github.com/GrantSparks/grafton-ndi/blob/main/LICENSE)
 [![Minimum Rust Version](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](https://www.rust-lang.org)
@@ -53,24 +53,24 @@ Add the crate to `Cargo.toml`:
 
 ```toml
 [dependencies]
-grafton-ndi = "0.13"
+grafton-ndi = "1.0"
 ```
 
 Feature flags:
 
 ```toml
 # Minimal build without PNG/JPEG/data URL helpers
-# grafton-ndi = { version = "0.13", default-features = false }
+# grafton-ndi = { version = "1.0", default-features = false }
 
 # Image encoding support is enabled by default
-# grafton-ndi = { version = "0.13", features = ["image-encoding"] }
+# grafton-ndi = { version = "1.0", features = ["image-encoding"] }
 
 # Async receiver wrappers
-# grafton-ndi = { version = "0.13", features = ["tokio"] }
-# grafton-ndi = { version = "0.13", features = ["async-std"] }
+# grafton-ndi = { version = "1.0", features = ["tokio"] }
+# grafton-ndi = { version = "1.0", features = ["async-std"] }
 
 # Advanced SDK symbols, when available from the installed SDK
-# grafton-ndi = { version = "0.13", features = ["advanced_sdk"] }
+# grafton-ndi = { version = "1.0", features = ["advanced_sdk"] }
 ```
 
 ### Prerequisites
@@ -83,7 +83,8 @@ Feature flags:
 
 2. **Rust**: Rust 1.87 or later.
 
-3. **Build dependencies**:
+3. **Build dependencies**: bindgen generates the FFI bindings at build time from
+   your installed SDK headers, so it needs an LLVM/Clang toolchain:
    - Windows: Visual Studio 2019+ or Build Tools, plus LLVM/Clang for bindgen
    - Linux: a C toolchain and LLVM/Clang headers for bindgen
    - macOS: Xcode Command Line Tools
@@ -293,7 +294,7 @@ let data_url = video.encode_data_url(ImageFormat::Png)?;
 
 ## Documentation
 
-- [API documentation](https://docs.rs/grafton-ndi) - Full rustdoc reference.
+- [API documentation](https://grantsparks.github.io/grafton-ndi/grafton_ndi/) - Full rustdoc reference, built in CI and self-hosted (the NDI SDK license prevents distributing the generated bindings docs.rs would need).
 - [Examples](examples/) - Runnable examples for discovery, receiving, FrameSync, PTZ, monitoring, and sending.
 - [CHANGELOG.md](CHANGELOG.md) - Release notes and migration guidance.
 - [Migration notes](https://github.com/GrantSparks/grafton-ndi/tree/main/docs/migration) - Older version-to-version migration notes.

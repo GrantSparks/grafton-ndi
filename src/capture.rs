@@ -52,7 +52,7 @@ mod sealed {
 /// The *free strategy* for one captured-frame family: the SDK instance handle
 /// type plus the SDK call that releases a single frame.
 ///
-/// This is the single axis along which the RAII [`Guard`] varies. The receiver
+/// This is the single axis along which the RAII `Guard` varies. The receiver
 /// kinds ([`VideoKind`], [`AudioKind`], [`MetadataKind`]) free through
 /// `NDIlib_recv_free_*`; the FrameSync strategies ([`FrameSyncVideoFree`],
 /// [`FrameSyncAudioFree`]) free through `NDIlib_framesync_free_*`. Factoring the

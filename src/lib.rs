@@ -90,9 +90,15 @@
 //!
 //! # Platform Support
 //!
-//! - **Windows**: Full support, tested on Windows 10/11
-//! - **Linux**: Full support, tested on Ubuntu 20.04+
-//! - **macOS**: Experimental support with limited testing
+//! Windows, Linux, and macOS are all exercised in CI (build, test, lint, and
+//! semver checks) against the NDI SDK.
+//!
+//! - **Windows**: Links the NDI SDK import library at build time; requires the
+//!   NDI runtime DLLs at runtime.
+//! - **Linux**: Supports both standard and Advanced SDK install directories;
+//!   the runtime libraries must be discoverable by the dynamic linker.
+//! - **macOS**: Supports current NDI SDK package layouts used by the CI setup
+//!   action and common local install paths.
 
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
@@ -139,7 +145,7 @@ pub use {
     },
     framesync::{FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncVideoRef},
     receiver::{
-        Capture, ConnectionStats, FrameType, Receiver, ReceiverBandwidth, ReceiverColorFormat,
+        Capture, ConnectionStats, Receiver, ReceiverBandwidth, ReceiverColorFormat,
         ReceiverOptions, ReceiverOptionsBuilder, ReceiverStatus, Tally,
     },
     runtime::NDI,

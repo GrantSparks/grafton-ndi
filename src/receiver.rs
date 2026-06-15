@@ -41,7 +41,6 @@ use std::{
 use crate::{
     capture::{capture_raw, AudioKind, CaptureKind, CaptureResult, MetadataKind, VideoKind},
     finder::{RawSource, Source},
-    frames::{AudioFrame, MetadataFrame, VideoFrame},
     ndi_lib::*,
     to_ms_checked, Error, Result, NDI,
 };
@@ -764,7 +763,7 @@ impl Receiver {
     ///   borrowing the SDK buffer in place.
     ///
     /// Video frames may carry per-row padding (e.g. RGBX/BGRX); see
-    /// [`VideoFrame`] for how to read them correctly.
+    /// [`VideoFrame`](crate::VideoFrame) for how to read them correctly.
     ///
     /// # Examples
     ///
@@ -1229,15 +1228,6 @@ unsafe impl Send for Receiver {}
 /// [`Receiver::video`], [`Receiver::audio`], and [`Receiver::metadata`]) can be
 /// safely called from multiple threads simultaneously.
 unsafe impl Sync for Receiver {}
-
-#[derive(Debug)]
-pub enum FrameType {
-    Video(VideoFrame),
-    Audio(AudioFrame),
-    Metadata(MetadataFrame),
-    None,
-    StatusChange(ReceiverStatus),
-}
 
 #[derive(Debug, Clone)]
 pub struct ReceiverStatus {
