@@ -98,7 +98,7 @@ fn test_video_frame_zero_size_returns_error() {
     c_frame.p_data = data.as_mut_ptr();
     c_frame.FourCC = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA;
     c_frame.xres = 1920;
-    c_frame.__bindgen_anon_1.line_stride_in_bytes = 0;
+    c_frame.__bindgen_anon_1.line_stride_in_bytes = -1;
     c_frame.yres = 1080;
     c_frame.frame_rate_N = 60;
     c_frame.frame_rate_D = 1;
