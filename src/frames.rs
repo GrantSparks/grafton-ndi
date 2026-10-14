@@ -494,8 +494,8 @@ impl VideoFrame {
 
     /// Get the timecode.
     ///
-    /// A value of zero is passed through to the SDK as its default timestamp
-    /// behavior.
+    /// Defaults to the SDK's synthesized-timecode sentinel. An explicit zero
+    /// is passed through as a literal timecode.
     pub fn timecode(&self) -> i64 {
         self.timecode
     }
@@ -935,7 +935,7 @@ impl VideoFrameBuilder {
             frame_rate_d,
             picture_aspect_ratio,
             scan_type,
-            timecode: self.timecode.unwrap_or(0),
+            timecode: self.timecode.unwrap_or(NDIlib_send_timecode_synthesize),
             data,
             metadata,
             timestamp: self.timestamp.unwrap_or(0),
@@ -1044,8 +1044,8 @@ impl AudioFrame {
 
     /// Get the timecode.
     ///
-    /// A value of zero is passed through to the SDK as its default timestamp
-    /// behavior.
+    /// Defaults to the SDK's synthesized-timecode sentinel. An explicit zero
+    /// is passed through as a literal timecode.
     pub fn timecode(&self) -> i64 {
         self.timecode
     }
@@ -1253,7 +1253,7 @@ impl AudioFrameBuilder {
         let num_samples = self.num_samples.unwrap_or(1024);
         let format = self.format.unwrap_or(AudioFormat::FLTP);
         let layout = self.layout.unwrap_or(AudioLayout::Planar);
-        let timecode = self.timecode.unwrap_or(0);
+        let timecode = self.timecode.unwrap_or(NDIlib_send_timecode_synthesize);
         let audio_layout =
             validate_outbound_audio_layout(sample_rate, num_channels, num_samples, format)?;
         let sample_count = audio_layout.sample_count;
@@ -1416,7 +1416,7 @@ impl MetadataFrame {
     pub fn new() -> Self {
         MetadataFrame {
             data: String::new(),
-            timecode: 0,
+            timecode: NDIlib_send_timecode_synthesize,
         }
     }
 
@@ -1445,8 +1445,8 @@ impl MetadataFrame {
 
     /// Get the timecode.
     ///
-    /// A value of zero is passed through to the SDK as its default timestamp
-    /// behavior.
+    /// Defaults to the SDK's synthesized-timecode sentinel. An explicit zero
+    /// is passed through as a literal timecode.
     pub fn timecode(&self) -> i64 {
         self.timecode
     }
@@ -4859,6 +4859,45 @@ mod tests {
         let result = AudioFrame::builder().channels(1).samples(samples).build();
 
         assert!(matches!(result, Err(Error::InvalidFrame(_))));
+    }
+
+    #[test]
+    fn test_default_outbound_timecodes_are_synthesized() {
+        assert_eq!(
+            VideoFrame::builder()
+                .resolution(16, 16)
+                .build()
+                .unwrap()
+                .timecode(),
+            NDIlib_send_timecode_synthesize
+        );
+        assert_eq!(
+            AudioFrame::builder().samples(1).build().unwrap().timecode(),
+            NDIlib_send_timecode_synthesize
+        );
+        assert_eq!(
+            MetadataFrame::new().timecode(),
+            NDIlib_send_timecode_synthesize
+        );
+        assert_eq!(
+            VideoFrame::builder()
+                .resolution(16, 16)
+                .timecode(0)
+                .build()
+                .unwrap()
+                .timecode(),
+            0
+        );
+        assert_eq!(
+            AudioFrame::builder()
+                .samples(1)
+                .timecode(0)
+                .build()
+                .unwrap()
+                .timecode(),
+            0
+        );
+        assert_eq!(MetadataFrame::with_data("<x/>", 0).unwrap().timecode(), 0);
     }
 
     #[test]

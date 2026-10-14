@@ -225,7 +225,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
             frame_rate_d,
             picture_aspect_ratio: 16.0 / 9.0,
             scan_type: ScanType::Progressive,
-            timecode: 0,
+            timecode: NDIlib_send_timecode_synthesize,
             data,
             line_stride_or_size: layout.line_stride_or_size,
             layout: Some(layout),
@@ -256,8 +256,8 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// - `metadata`, when present, remains valid, NUL-terminated, UTF-8, and
     ///   within the crate metadata size cap for the full send lifetime.
     ///
-    /// Zero/default `timecode` and `timestamp` values are passed through to the
-    /// SDK as default timing values.
+    /// The default timecode requests SDK synthesis. Explicit `timecode` and
+    /// `timestamp` values, including zero, are passed through unchanged.
     ///
     /// Violating these invariants will cause the NDI SDK to read out of bounds through FFI,
     /// leading to undefined behavior.
@@ -1393,7 +1393,7 @@ mod tests {
         assert_eq!(frame.frame_rate_d(), 1);
         assert_eq!(frame.picture_aspect_ratio(), 16.0 / 9.0);
         assert_eq!(frame.scan_type(), ScanType::Progressive);
-        assert_eq!(frame.timecode(), 0);
+        assert_eq!(frame.timecode(), NDIlib_send_timecode_synthesize);
         assert_eq!(frame.data().len(), buffer.len());
         assert!(frame.metadata().is_none());
         assert_eq!(frame.timestamp(), 0);
