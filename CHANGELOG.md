@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-14
+
+### Fixed
+
+- Allow senders to disable both video and audio clocks for caller-managed pacing
+  ([#71](https://github.com/GrantSparks/grafton-ndi/pull/71)).
+- Allow empty or whitespace-only sender names so the SDK can generate a name
+  ([#78](https://github.com/GrantSparks/grafton-ndi/pull/78)).
+- Accept a zero picture aspect ratio as the SDK's square-pixel sentinel
+  ([#79](https://github.com/GrantSparks/grafton-ndi/pull/79)).
+- Interpret a zero SDK video stride as the minimum stride for the pixel format
+  ([#80](https://github.com/GrantSparks/grafton-ndi/pull/80)).
+- Use the SDK's synthesized-timecode sentinel for outbound video, audio, and
+  metadata frames by default; explicitly supplied zero remains a literal
+  timecode ([#81](https://github.com/GrantSparks/grafton-ndi/pull/81)).
+- Accept NDI source descriptors with an address and no name
+  ([#82](https://github.com/GrantSparks/grafton-ndi/pull/82)).
+- Raise the video frame size limit from 100 MiB to 256 MiB so 8K BGRA frames
+  are accepted ([#83](https://github.com/GrantSparks/grafton-ndi/pull/83)).
+
 ## [1.0.0] - 2026-06-15
 
 ### Overview
