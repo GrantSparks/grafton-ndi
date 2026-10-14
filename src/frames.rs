@@ -1394,8 +1394,8 @@ impl From<AudioFormat> for i32 {
     }
 }
 
-/// Maximum allowed size for supported video frame data (100 MiB).
-const MAX_VIDEO_BYTES: usize = 100 * 1024 * 1024;
+/// Maximum allowed size for supported video frame data (256 MiB).
+const MAX_VIDEO_BYTES: usize = 256 * 1024 * 1024;
 
 /// Maximum allowed size for audio frame data (64 MiB).
 /// Comfortably above typical NDI audio frames while preventing unbounded allocations.
@@ -4232,8 +4232,8 @@ mod tests {
     /// Test that MAX_VIDEO_BYTES constant is properly defined
     #[test]
     fn test_max_video_bytes_constant() {
-        // Verify the constant is set to 100 MiB as specified
-        assert_eq!(MAX_VIDEO_BYTES, 100 * 1024 * 1024);
+        // Verify the crate resource cap is set to 256 MiB
+        assert_eq!(MAX_VIDEO_BYTES, 256 * 1024 * 1024);
     }
 
     /// Test that MAX_AUDIO_BYTES constant is properly defined
@@ -4951,49 +4951,15 @@ mod tests {
             .is_err());
     }
 
-    /// Test that uncompressed video uses MAX_VIDEO_BYTES constant for bounds check
     #[test]
-    fn test_video_uncompressed_uses_constant_cap() {
-        // Create an uncompressed frame that would exceed MAX_VIDEO_BYTES
-        // 8K resolution: 7680 x 4320, BGRA = 4 bytes per pixel
-        // Total: 7680 * 4320 * 4 = 132,710,400 bytes > 100 MiB
-        let width = 7680;
-        let height = 4320;
-        let stride = width * 4;
-        let expected_size = (stride * height) as usize;
-        let mut data = vec![0u8; expected_size];
-
-        let c_frame = NDIlib_video_frame_v2_t {
-            xres: width,
-            yres: height,
-            FourCC: PixelFormat::BGRA.into(),
-            frame_rate_N: 60,
-            frame_rate_D: 1,
-            picture_aspect_ratio: 16.0 / 9.0,
-            frame_format_type: ScanType::Progressive.into(),
-            timecode: 0,
-            p_data: data.as_mut_ptr(),
-            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
-                line_stride_in_bytes: stride,
-            },
-            p_metadata: ptr::null(),
-            timestamp: 0,
-        };
-
-        let result = unsafe { VideoFrame::from_raw(&c_frame) };
-        assert!(
-            result.is_err(),
-            "Should reject uncompressed video frame exceeding MAX_VIDEO_BYTES"
-        );
-
-        if let Err(Error::InvalidFrame(msg)) = result {
-            assert!(
-                msg.contains("exceeds maximum size"),
-                "Error message should mention size limit, got: {msg}"
-            );
-        } else {
-            panic!("Expected InvalidFrame error");
-        }
+    fn test_video_cap_allows_8k_bgra_without_allocating() {
+        let layout =
+            ValidatedVideoLayout::new_uncompressed(PixelFormat::BGRA, 7680, 4320, None).unwrap();
+        assert_eq!(layout.data_len_bytes, 132_710_400);
+        assert!(matches!(
+            ValidatedVideoLayout::new_uncompressed(PixelFormat::BGRA, 16_384, 8_640, None),
+            Err(Error::InvalidFrame(_))
+        ));
     }
 
     // =========================================================================
@@ -5225,13 +5191,11 @@ mod tests {
     /// Test validate_video_layout rejects oversized frames
     #[test]
     fn test_validate_video_layout_exceeds_max() {
-        // 8K resolution: 7680 x 4320, BGRA = 4 bytes per pixel
-        // Total: 7680 * 4320 * 4 = 132,710,400 bytes > 100 MiB (MAX_VIDEO_BYTES)
-        let width = 7680;
-        let height = 4320;
+        // Validation rejects before reading data, so no large allocation is needed.
+        let width = 16_384;
+        let height = 8_640;
         let stride = width * 4;
-        let expected_size = (stride * height) as usize;
-        let mut data = vec![0u8; expected_size];
+        let mut data = [0u8; 1];
 
         let raw = NDIlib_video_frame_v2_t {
             xres: width,
