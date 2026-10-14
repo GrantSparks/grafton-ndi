@@ -628,7 +628,7 @@ impl Source {
     ///
     /// Returns `Error::NullPointer` if:
     /// - The source pointer itself is null
-    /// - The `p_ndi_name` field is null
+    /// - Both the `p_ndi_name` and source address fields are null
     ///
     /// # Safety
     ///
@@ -642,15 +642,18 @@ impl Source {
 
         let ndi_source = unsafe { &*source_ptr };
 
-        // Check p_ndi_name field
-        if ndi_source.p_ndi_name.is_null() {
-            return Err(Error::NullPointer("NDIlib_source_t::p_ndi_name".into()));
-        }
-
-        let name = unsafe {
-            CStr::from_ptr(ndi_source.p_ndi_name)
-                .to_string_lossy()
-                .into_owned()
+        let name = if ndi_source.p_ndi_name.is_null() {
+            // The SDK accepts an address-only descriptor with a null name.
+            if unsafe { ndi_source.__bindgen_anon_1.p_url_address }.is_null() {
+                return Err(Error::NullPointer("NDIlib_source_t::p_ndi_name".into()));
+            }
+            String::new()
+        } else {
+            unsafe {
+                CStr::from_ptr(ndi_source.p_ndi_name)
+                    .to_string_lossy()
+                    .into_owned()
+            }
         };
 
         // For unions, we need to determine which field is active.
@@ -1057,6 +1060,24 @@ mod tests {
             }
             _ => panic!("Expected NullPointer error for null name"),
         }
+    }
+
+    #[test]
+    fn test_try_from_raw_address_only_source() {
+        let url = CString::new("ndi://127.0.0.1:5960").unwrap();
+        let raw = NDIlib_source_t {
+            p_ndi_name: ptr::null(),
+            __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
+                p_url_address: url.as_ptr(),
+            },
+        };
+        let source = Source::try_from_raw(&raw).unwrap();
+        assert!(source.name.is_empty());
+        assert!(
+            matches!(source.address, SourceAddress::Url(ref address) if address == "ndi://127.0.0.1:5960")
+        );
+        let roundtrip = source.to_raw().unwrap();
+        assert!(!roundtrip.raw.p_ndi_name.is_null());
     }
 
     #[test]
