@@ -400,6 +400,45 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         self.timestamp
     }
 
+    /// Set the timecode, in 100 ns units.
+    ///
+    /// [`try_from_uncompressed`](Self::try_from_uncompressed) leaves it at
+    /// `NDIlib_send_timecode_synthesize`, which asks the SDK to make one up.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{BorrowedVideoFrame, PixelFormat};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let buffer = vec![0u8; 1920 * 1080 * 2];
+    /// let frame = BorrowedVideoFrame::try_from_uncompressed(
+    ///     &buffer, 1920, 1080, PixelFormat::UYVY, 25, 1,
+    /// )?
+    /// .with_timecode(10_000_000);
+    /// assert_eq!(frame.timecode(), 10_000_000);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_timecode(mut self, timecode: i64) -> Self {
+        self.timecode = timecode;
+        self
+    }
+
+    /// Set the picture aspect ratio, width over height as displayed; `0.0`
+    /// means square pixels, whatever the resolution.
+    ///
+    /// [`try_from_uncompressed`](Self::try_from_uncompressed) assumes 16:9.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidFrame`] if `ratio` is negative or not finite.
+    pub fn with_picture_aspect_ratio(mut self, ratio: f32) -> Result<Self> {
+        crate::frames::validate_video_frame_metadata(self.frame_rate_n, self.frame_rate_d, ratio)?;
+        self.picture_aspect_ratio = ratio;
+        Ok(self)
+    }
+
     fn to_raw(&self) -> NDIlib_video_frame_v2_t {
         // Validation is now performed at construction time, so no runtime checks needed here
         NDIlib_video_frame_v2_t {
@@ -1169,6 +1208,38 @@ mod tests {
     #[test]
     fn test_async_flush_uses_null_frame_pointer() {
         assert!(async_flush_frame_ptr().is_null());
+    }
+
+    #[test]
+    fn test_borrowed_frame_setters() {
+        let buffer = vec![0u8; 64 * 36 * 2];
+        let frame =
+            BorrowedVideoFrame::try_from_uncompressed(&buffer, 64, 36, PixelFormat::UYVY, 25, 1)
+                .unwrap();
+        assert_eq!(frame.timecode(), NDIlib_send_timecode_synthesize);
+        assert_eq!(frame.picture_aspect_ratio(), 16.0 / 9.0);
+
+        let frame = frame
+            .with_timecode(1234)
+            .with_picture_aspect_ratio(0.0)
+            .unwrap();
+        assert_eq!(frame.timecode(), 1234);
+        assert_eq!(frame.picture_aspect_ratio(), 0.0);
+        let raw = frame.to_raw();
+        assert_eq!((raw.timecode, raw.picture_aspect_ratio), (1234, 0.0));
+
+        for bad in [-1.0, f32::NAN, f32::INFINITY] {
+            let frame = BorrowedVideoFrame::try_from_uncompressed(
+                &buffer,
+                64,
+                36,
+                PixelFormat::UYVY,
+                25,
+                1,
+            )
+            .unwrap();
+            assert!(frame.with_picture_aspect_ratio(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
