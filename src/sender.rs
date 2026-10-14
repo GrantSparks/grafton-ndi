@@ -576,18 +576,10 @@ impl Sender {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Both `clock_video` and `clock_audio` are false (at least one must be true)
     /// - The sender name contains a null byte
     /// - The groups string contains a null byte
     /// - NDI fails to create the send instance
     pub fn new(ndi: &NDI, create_settings: &SenderOptions) -> Result<Self> {
-        // Validate that at least one clock is enabled
-        if !create_settings.clock_video && !create_settings.clock_audio {
-            return Err(Error::InvalidConfiguration(
-                "At least one of clock_video or clock_audio must be true".into(),
-            ));
-        }
-
         let name_cstr =
             CString::new(create_settings.name.clone()).map_err(Error::InvalidCString)?;
         let groups_cstr = match &create_settings.groups {
