@@ -634,6 +634,34 @@ fn test_video_frame_encode_png_unsupported_format() {
 
 #[cfg(feature = "image-encoding")]
 #[test]
+fn test_video_frame_encode_rejects_multi_plane_422_formats() {
+    use crate::frames::{ImageFormat, PixelFormat, VideoFrame};
+
+    for format in [PixelFormat::UYVA, PixelFormat::P216, PixelFormat::PA16] {
+        let frame = VideoFrame::builder()
+            .resolution(4, 2)
+            .pixel_format(format)
+            .build()
+            .unwrap();
+
+        for result in [
+            frame.encode_png(),
+            frame.encode_jpeg(90),
+            frame
+                .encode_data_url(ImageFormat::Png)
+                .map(String::into_bytes),
+        ] {
+            let err = result.expect_err("multi-plane 4:2:2 formats must not be encoded");
+            assert!(
+                format!("{err}").contains("Unsupported format"),
+                "{format:?}: {err}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "image-encoding")]
+#[test]
 fn test_video_frame_encode_jpeg_rgba() {
     use crate::frames::{PixelFormat, VideoFrame};
 

@@ -1394,7 +1394,7 @@ mod tests {
             (PixelFormat::UYVY, 1920, 1080, 1920 * 1080 * 2),
             (PixelFormat::UYVA, 1920, 1080, 1920 * 1080 * 3),
             (PixelFormat::P216, 1920, 1080, 1920 * 1080 * 4),
-            (PixelFormat::PA16, 1920, 1080, 1920 * 1080 * 4),
+            (PixelFormat::PA16, 1920, 1080, 1920 * 1080 * 6),
         ];
 
         for (format, width, height, expected_min_size) in test_cases {
