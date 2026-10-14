@@ -2137,6 +2137,7 @@ impl ValidatedVideoLayout {
 
         let min_stride = min_video_line_stride_checked(pixel_format, width_usize)?;
         let line_stride_usize = match line_stride {
+            Some(0) => min_stride,
             Some(stride) => {
                 if stride <= 0 {
                     return Err(Error::InvalidFrame(format!(
@@ -5036,14 +5037,14 @@ mod tests {
             timecode: 0,
             p_data: data.as_mut_ptr(),
             __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
-                line_stride_in_bytes: 0, // Invalid stride
+                line_stride_in_bytes: -1, // Invalid stride
             },
             p_metadata: ptr::null(),
             timestamp: 0,
         };
 
         let result = validate_video_layout(&raw);
-        assert!(result.is_err(), "Should reject zero line_stride");
+        assert!(result.is_err(), "Should reject negative line_stride");
 
         if let Err(Error::InvalidFrame(msg)) = result {
             assert!(
@@ -5053,6 +5054,35 @@ mod tests {
         } else {
             panic!("Expected InvalidFrame error");
         }
+    }
+
+    #[test]
+    fn test_validate_video_layout_accepts_default_zero_stride() {
+        let mut data = vec![0u8; 16 * 16 * 4];
+        let raw = NDIlib_video_frame_v2_t {
+            xres: 16,
+            yres: 16,
+            FourCC: PixelFormat::BGRA.into(),
+            frame_rate_N: 60,
+            frame_rate_D: 1,
+            picture_aspect_ratio: 1.0,
+            frame_format_type: ScanType::Progressive.into(),
+            timecode: 0,
+            p_data: data.as_mut_ptr(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: 0,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 0,
+        };
+        let layout = validate_video_layout(&raw).unwrap();
+        assert_eq!(layout.data_len_bytes, data.len());
+        assert_eq!(
+            layout.line_stride_or_size,
+            LineStrideOrSize::LineStrideBytes(64)
+        );
+        let owned = unsafe { VideoFrame::from_raw(&raw) }.unwrap();
+        assert_eq!(owned.data().len(), data.len());
     }
 
     /// Test validate_video_layout rejects strides smaller than one row.
