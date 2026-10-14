@@ -576,18 +576,10 @@ impl Sender {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The sender name is empty or contains only whitespace
     /// - The sender name contains a null byte
     /// - The groups string contains a null byte
     /// - NDI fails to create the send instance
     pub fn new(ndi: &NDI, create_settings: &SenderOptions) -> Result<Self> {
-        // Validate sender name
-        if create_settings.name.trim().is_empty() {
-            return Err(Error::InvalidConfiguration(
-                "Sender name cannot be empty or contain only whitespace".into(),
-            ));
-        }
-
         let name_cstr =
             CString::new(create_settings.name.clone()).map_err(Error::InvalidCString)?;
         let groups_cstr = match &create_settings.groups {
