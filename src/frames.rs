@@ -2279,7 +2279,7 @@ pub(crate) fn validate_video_frame_metadata(
             "Video frame has invalid frame rate denominator: {frame_rate_d}"
         )));
     }
-    if !picture_aspect_ratio.is_finite() || picture_aspect_ratio <= 0.0 {
+    if !picture_aspect_ratio.is_finite() || picture_aspect_ratio < 0.0 {
         return Err(Error::InvalidFrame(format!(
             "Video frame has invalid picture aspect ratio: {picture_aspect_ratio}"
         )));
@@ -4876,9 +4876,20 @@ mod tests {
             Err(Error::InvalidFrame(_))
         ));
         assert!(matches!(
-            VideoFrame::builder().aspect_ratio(0.0).build(),
+            VideoFrame::builder().aspect_ratio(-1.0).build(),
             Err(Error::InvalidFrame(_))
         ));
+    }
+
+    #[test]
+    fn test_zero_aspect_ratio_uses_sdk_square_pixel_sentinel() {
+        let frame = VideoFrame::builder()
+            .resolution(16, 16)
+            .aspect_ratio(0.0)
+            .build()
+            .unwrap();
+        assert_eq!(frame.picture_aspect_ratio(), 0.0);
+        assert_eq!(frame.to_raw().picture_aspect_ratio, 0.0);
     }
 
     #[test]
