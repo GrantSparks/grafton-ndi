@@ -577,7 +577,6 @@ impl Sender {
     ///
     /// Returns an error if:
     /// - The sender name is empty or contains only whitespace
-    /// - Both `clock_video` and `clock_audio` are false (at least one must be true)
     /// - The sender name contains a null byte
     /// - The groups string contains a null byte
     /// - NDI fails to create the send instance
@@ -586,13 +585,6 @@ impl Sender {
         if create_settings.name.trim().is_empty() {
             return Err(Error::InvalidConfiguration(
                 "Sender name cannot be empty or contain only whitespace".into(),
-            ));
-        }
-
-        // Validate that at least one clock is enabled
-        if !create_settings.clock_video && !create_settings.clock_audio {
-            return Err(Error::InvalidConfiguration(
-                "At least one of clock_video or clock_audio must be true".into(),
             ));
         }
 
