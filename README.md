@@ -120,7 +120,7 @@ if finder.wait_for_sources(Duration::from_secs(2))? {
 }
 ```
 
-For applications that repeatedly reconnect to known devices, `SourceCache` handles runtime initialization, discovery, exact host/IP matching, and cache invalidation. Pass a complete bare hostname or IP address. For searches by partial IP or source label, filter a `Finder` snapshot explicitly.
+For applications that repeatedly reconnect to known devices, `SourceCache` handles runtime initialization, discovery, exact host/IP matching, and cache invalidation. Pass a complete bare hostname or IP address. Hostname ASCII case, an optional final dot, and equivalent numeric IP spellings share one cache entry. `len()` counts distinct host identities; `invalidate()` accepts any equivalent spelling. For searches by partial IP or source label, filter a `Finder` snapshot explicitly.
 
 ```rust
 use grafton_ndi::SourceCache;
@@ -178,6 +178,16 @@ if let Some(frame) = receiver.video().try_capture_ref(Duration::from_secs(1))? {
 Owned capture and copied video sends pack planes tightly and can reduce the
 source stride. Format, plane order, metadata, timing, aspect ratio, and scan type
 are preserved. Borrowed PNG/JPEG encoding reads active rows directly.
+
+`VideoPlane`, `VideoRows`, and `VideoPlanes` implement `Send + Sync`. You can
+move preconstructed views into scoped workers or share them for immutable reads,
+including views from FrameSync. The frame stays borrowed until the workers
+finish; FrameSync frame references keep their capture-thread affinity.
+
+PNG/JPEG conversion uses active rows for owned and captured frames. PNG borrows
+RGBA rows directly and uses at most one `width * 4` conversion row for other
+supported formats. JPEG writes components into the codec's row buffers without
+an RGB staging frame. Codec storage and encoded output require additional memory.
 
 ### Publish Sources
 
@@ -318,6 +328,7 @@ let data_url = video.encode_data_url(ImageFormat::Png)?;
 - [API documentation](https://grantsparks.github.io/grafton-ndi/grafton_ndi/) - Full rustdoc reference, built in CI and self-hosted (the docs.rs build environment does not include the SDK installation required by this build script).
 - [Examples](examples/) - Runnable examples for discovery, receiving, FrameSync, PTZ, monitoring, and sending.
 - [CHANGELOG.md](CHANGELOG.md) - Release notes and migration guidance.
+- [Image encoding resources](docs/image-encoding-performance.md) - Conversion scratch bounds, codec/output peak memory, and reproducible timing comparisons.
 - [Upgrade from 1.x to 2.0](docs/migration/1.x-to-2.0.md) - Breaking changes, layout corrections, and async-send performance changes.
 - [Historical migration notes](https://github.com/GrantSparks/grafton-ndi/tree/main/docs/migration) - Earlier version-to-version migration notes.
 

@@ -92,6 +92,8 @@ use crate::{
 /// spelling is [`VideoFrameRef`](crate::VideoFrameRef). Both share one accessor
 /// and `Debug` implementation. The frame is automatically freed when dropped via
 /// `NDIlib_framesync_free_video`.
+/// This owning reference is neither `Send` nor `Sync`; its immutable plane/row
+/// views support scoped worker reads while it stays borrowed on this thread.
 pub type FrameSyncVideoRef<'fs> = VideoRef<'fs, FrameSyncVideoFree>;
 
 /// A zero-copy borrowed audio frame from a [`FrameSync`] capture.
@@ -192,7 +194,9 @@ impl FrameSyncAudioRequest {
 /// `FrameSync` is `Send + Sync` like `Receiver`, as the underlying NDI SDK
 /// frame-sync functions are thread-safe. Frames returned by capture methods
 /// borrow from the FrameSync and are neither `Send` nor `Sync`. Convert them
-/// to owned frames before transferring them to another thread.
+/// to owned frames to transfer ownership to another thread. Immutable video
+/// plane/row views can instead be moved or shared with scoped workers while
+/// the frame guard stays on its capture thread until those workers finish.
 ///
 /// Raw video capture through the underlying receiver is disabled while this
 /// FrameSync exists. [`Self::into_receiver`] destroys the synchronizer and

@@ -85,8 +85,10 @@ The important project invariants are:
 - Completion handlers run after state is consistent and outside internal locks.
   Callback panic or reentry must not free an in-flight buffer or notify twice.
 - Borrowed receive views remain tied to their receiver or FrameSync owner.
-  Receiver views permit scoped thread transfer; FrameSync views remain thread
-  restricted. Do not broaden auto traits without the SDK contract and a proof
+  Receiver frame references permit scoped thread transfer; FrameSync frame
+  references remain thread restricted. Immutable `VideoPlane`, `VideoRows`, and
+  `VideoPlanes` support scoped transfer/shared reads from either family without
+  SDK calls. Their borrows retain the frame, whose guard alone frees its storage. Do not broaden auto traits without the SDK contract and a proof
   covering both access and freeing.
 - Discovery snapshots keep the SDK buffer protected until descriptor strings
   have been copied. Reconnect/capture locking must preserve the original timeout
@@ -138,6 +140,7 @@ the broader checks used by [CI](.github/workflows/rust.yml):
 cargo test --all-features
 cargo build --examples
 cargo build --examples --all-features
+cargo test --examples
 cargo test --examples --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
@@ -152,12 +155,16 @@ that application workflows still compile.
 ```bash
 cargo test --no-default-features
 cargo build --examples --no-default-features
+cargo test --examples --no-default-features
 cargo test --no-default-features --features tokio
 cargo build --examples --no-default-features --features tokio
+cargo test --examples --no-default-features --features tokio
 cargo test --no-default-features --features smol
 cargo build --examples --no-default-features --features smol
+cargo test --examples --no-default-features --features smol
 cargo test --no-default-features --features tokio,smol
 cargo build --examples --no-default-features --features tokio,smol
+cargo test --examples --no-default-features --features tokio,smol
 cargo check --no-default-features --features advanced_sdk
 ```
 

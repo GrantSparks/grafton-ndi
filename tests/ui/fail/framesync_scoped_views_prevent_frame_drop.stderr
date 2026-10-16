@@ -1,0 +1,16 @@
+error[E0505]: cannot move out of `frame` because it is borrowed
+  --> tests/ui/fail/framesync_scoped_views_prevent_frame_drop.rs:8:24
+   |
+ 3 |     let frame = owner
+   |         ----- binding `frame` declared here
+...
+ 7 |     let planes = frame.planes();
+   |                  ----- borrow of `frame` occurs here
+ 8 |     std::thread::scope(|scope| {
+   |                        ^^^^^^^ move out of `frame` occurs here
+ 9 |         let worker = scope.spawn(move || {
+10 |             planes
+   |             ------ borrow later captured here by closure
+...
+16 |         drop(frame);
+   |              ----- move occurs due to use in closure

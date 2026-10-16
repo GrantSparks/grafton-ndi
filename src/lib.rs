@@ -57,6 +57,9 @@
 //! with internal synchronization where required by the SDK. Borrowed receiver
 //! frame references support scoped thread transfer; FrameSync references remain
 //! tied to their owner and cannot be shared or transferred across threads.
+//! Immutable [`VideoPlane`], [`VideoRows`], and [`VideoPlanes`] views are
+//! `Send + Sync` from either capture family. Scoped workers may read those
+//! borrowed pixels while the frame guard stays on its permitted freeing thread.
 //!
 //! ## Async Sending
 //!

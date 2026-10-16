@@ -6,7 +6,8 @@ mod common;
 
 use grafton_ndi::{
     BorrowedVideoFrame, FrameSync, LineStrideOrSize, PixelFormat, Receiver, ReceiverColorFormat,
-    ReceiverOptions, ScanType, Sender, SenderOptions, Source, VideoFrame, NDI,
+    ReceiverOptions, ScanType, Sender, SenderOptions, Source, SourceCache, VideoFrame, VideoPlanes,
+    NDI,
 };
 use std::{
     sync::{
@@ -44,6 +45,40 @@ fn verify_owned(frame: &VideoFrame) {
     }
 }
 
+fn scoped_reads(planes: VideoPlanes<'_>) {
+    let expected: u64 = planes
+        .clone()
+        .flat_map(|p| p.rows())
+        .flatten()
+        .map(|&b| u64::from(b))
+        .sum();
+    std::thread::scope(|scope| {
+        let shared = &planes;
+        let worker = scope.spawn(move || {
+            shared
+                .clone()
+                .flat_map(|p| p.rows().rev())
+                .flatten()
+                .map(|&b| u64::from(b))
+                .sum::<u64>()
+        });
+        assert_eq!(worker.join().unwrap(), expected);
+    });
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || {
+            let mut sum = 0;
+            for plane in planes {
+                for row in plane.rows() {
+                    sum += row.iter().map(|&b| u64::from(b)).sum::<u64>();
+                    std::fs::write("/dev/null", row).unwrap();
+                }
+            }
+            sum
+        });
+        assert_eq!(worker.join().unwrap(), expected);
+    });
+}
+
 #[test]
 #[ignore = "Requires NDI runtime and loopback networking; run alone"]
 fn live_receiver_framesync_and_owned_send_skip_padding() {
@@ -57,6 +92,24 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
     )
     .unwrap();
     let source = common::loopback_source(&ndi, &sender).unwrap();
+    // Resolve the advertised machine component through equivalent spellings.
+    let advertised = sender.source().unwrap();
+    let host = advertised.name.split_once(" (").unwrap().0;
+    let cache = SourceCache::new();
+    let first = cache
+        .find_by_host(&host.to_ascii_uppercase(), Duration::from_secs(15))
+        .unwrap();
+    assert_eq!(
+        cache
+            .find_by_host(&format!("{}.", host.to_ascii_lowercase()), Duration::ZERO)
+            .unwrap(),
+        first
+    );
+    assert_eq!(cache.len(), 1);
+    cache.invalidate(&host.to_ascii_lowercase());
+    assert!(cache.is_empty());
+    let rediscovered = cache.find_by_host(host, Duration::from_secs(15)).unwrap();
+    let _connected = receiver(&ndi, rediscovered);
     let stop = Arc::new(AtomicBool::new(false));
     std::thread::scope(|scope| {
         let worker_stop = stop.clone();
@@ -98,6 +151,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
         };
         eprintln!("receiver SDK stride: {:?}", borrowed.line_stride_or_size());
         assert!(borrowed.data().is_none(), "expected padded SDK output");
+        scoped_reads(borrowed.planes());
         let mut active = 0;
         for plane in borrowed.planes() {
             for row in plane.rows() {
@@ -147,6 +201,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
             );
             if let Some(frame) = framesync.capture_video(ScanType::Progressive).unwrap() {
                 eprintln!("FrameSync SDK stride: {:?}", frame.line_stride_or_size());
+                scoped_reads(frame.planes());
                 for plane in frame.planes() {
                     for row in plane.rows() {
                         std::fs::write("/dev/null", row).unwrap();

@@ -535,6 +535,57 @@ impl<'a> HostQuery<'a> {
     }
 }
 
+/// Canonical retained cache identity. IPs use their numeric display spelling;
+/// names use the parser's final-dot policy and ASCII lowercase. Those domains
+/// are disjoint: valid names cannot contain colons or dotted numeric IP text.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct HostKey(String);
+
+impl std::borrow::Borrow<str> for HostKey {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Bounded normalization keeps lookups and eviction free of key allocations.
+/// Only a published entry needs an owned string.
+struct HostKeyBuffer {
+    bytes: [u8; 253],
+    len: usize,
+}
+
+impl HostKeyBuffer {
+    fn new(query: HostQuery<'_>) -> Self {
+        let mut key = Self {
+            bytes: [0; 253],
+            len: 0,
+        };
+        match query {
+            HostQuery::Ip(ip) => {
+                use std::io::Write;
+                let mut cursor = std::io::Cursor::new(key.bytes.as_mut_slice());
+                // The longest numeric IP spelling is shorter than 253 bytes.
+                write!(cursor, "{ip}").expect("IP fits in host key buffer");
+                key.len = cursor.position() as usize;
+            }
+            HostQuery::Name(name) => {
+                key.len = name.len();
+                key.bytes[..key.len].copy_from_slice(name.as_bytes());
+                key.bytes[..key.len].make_ascii_lowercase();
+            }
+        }
+        key
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).expect("host keys are ASCII")
+    }
+
+    fn into_owned(self) -> HostKey {
+        HostKey(self.as_str().to_owned())
+    }
+}
+
 /// Network address of an NDI source.
 ///
 /// NDI sources can be addressed via URL (for NDI HX sources) or IP address
@@ -874,6 +925,8 @@ impl Display for Source {
 /// and discovered sources. Discovery initializes the runtime on a cache miss.
 /// Cached sources own their strings and need no live runtime. Entries remain
 /// cached until explicitly invalidated or cleared.
+/// Equivalent hostname case/final-dot and numeric IP spellings share one entry.
+/// Hostnames, IP addresses, and DNS aliases otherwise remain distinct identities.
 ///
 /// # Thread Safety
 ///
@@ -905,7 +958,7 @@ pub struct SourceCache {
 }
 
 struct CacheState {
-    entries: HashMap<String, Source>,
+    entries: HashMap<HostKey, Source>,
     generation: Option<u64>,
 }
 
@@ -1003,12 +1056,13 @@ impl SourceCache {
             Error::InvalidConfiguration("Host must be a bare hostname or IP address".into())
         })?;
         to_ms_checked(timeout)?;
+        let key = HostKeyBuffer::new(query);
         let generation = {
             let cache = self
                 .cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(cached) = cache.entries.get(host) {
+            if let Some(cached) = cache.entries.get(key.as_str()) {
                 return Ok(cached.clone());
             }
             cache.generation
@@ -1027,7 +1081,7 @@ impl SourceCache {
             if generation.is_some() && cache.generation == generation {
                 cache
                     .entries
-                    .entry(host.to_string())
+                    .entry(key.into_owned())
                     .or_insert_with(|| source.clone());
             }
         }
@@ -1039,6 +1093,8 @@ impl SourceCache {
     /// This is useful when a source goes offline or when you want to force
     /// a fresh discovery on the next lookup. Discovery started before this
     /// call may return to its caller, but cannot repopulate the cache afterward.
+    /// Any accepted equivalent spelling removes the same host identity.
+    /// Malformed input removes no entry but still invalidates pending discovery.
     ///
     /// # Arguments
     ///
@@ -1067,7 +1123,9 @@ impl SourceCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.invalidate_pending();
-        cache.entries.remove(host);
+        if let Some(query) = HostQuery::parse(host) {
+            cache.entries.remove(HostKeyBuffer::new(query).as_str());
+        }
     }
 
     /// Clear all cached sources.
@@ -1101,7 +1159,7 @@ impl SourceCache {
         cache.entries.clear();
     }
 
-    /// Get the number of cached sources.
+    /// Get the number of distinct cached host identities.
     ///
     /// This can be useful for monitoring cache usage and debugging.
     ///
@@ -1168,6 +1226,145 @@ impl Default for SourceCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn host_key(host: &str) -> HostKey {
+        HostKeyBuffer::new(HostQuery::parse(host).unwrap()).into_owned()
+    }
+
+    #[test]
+    fn canonical_host_keys_obey_identity_and_hash_laws() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let hash = |key: &HostKey| {
+            let mut state = DefaultHasher::new();
+            key.hash(&mut state);
+            let owned_hash = state.finish();
+            let mut borrowed_state = DefaultHasher::new();
+            std::borrow::Borrow::<str>::borrow(key).hash(&mut borrowed_state);
+            assert_eq!(owned_hash, borrowed_state.finish());
+            owned_hash
+        };
+        for variants in [
+            vec!["camera.local", "CAMERA.LOCAL", "Camera.Local."],
+            vec!["2001:db8::1", "[2001:0DB8:0:0:0:0:0:1]", "2001:db8:0::1"],
+            vec!["192.0.2.1", "[192.0.2.1]"],
+        ] {
+            for a in &variants {
+                for b in &variants {
+                    assert_eq!(host_key(a), host_key(b));
+                    assert_eq!(hash(&host_key(a)), hash(&host_key(b)));
+                }
+            }
+        }
+        for name in ["camera", "camera-1.local", "a.b.c", "123", &"a".repeat(63)] {
+            let expected = host_key(name);
+            // Vary each ASCII letter's case independently, then the final dot.
+            for i in 0..name.len() {
+                let mut bytes = name.as_bytes().to_vec();
+                bytes[i].make_ascii_uppercase();
+                let variant = String::from_utf8(bytes).unwrap();
+                for variant in [variant.clone(), format!("{variant}.")] {
+                    let key = host_key(&variant);
+                    assert_eq!(expected, key);
+                    assert_eq!(hash(&expected), hash(&key));
+                }
+            }
+        }
+        let maximum = [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61),
+        ]
+        .join(".");
+        assert_eq!(maximum.len(), 253);
+        assert_eq!(
+            host_key(&maximum),
+            host_key(&format!("{}.", maximum.to_uppercase()))
+        );
+        let distinct = [
+            "camera",
+            "camera1",
+            "camera.local",
+            "192.0.2.1",
+            "192.0.2.2",
+            "::1",
+            "::ffff:192.0.2.1",
+            "123",
+        ];
+        assert_eq!(
+            distinct
+                .iter()
+                .map(|host| host_key(host))
+                .collect::<HashSet<_>>()
+                .len(),
+            distinct.len()
+        );
+    }
+
+    #[test]
+    fn equivalent_cache_hits_and_invalidation_share_one_identity() {
+        for (a, b) in [
+            ("CAMERA.LOCAL", "camera.local"),
+            ("camera.local.", "camera.local"),
+            ("[2001:0db8:0:0:0:0:0:1]", "2001:db8::1"),
+        ] {
+            for (first, second) in [(a, b), (b, a)] {
+                let cache = SourceCache::new();
+                let old = Source {
+                    name: "camera".into(),
+                    address: SourceAddress::Ip("192.0.2.1:5960".into()),
+                };
+                let fresh = Source {
+                    address: SourceAddress::Ip("192.0.2.1:5961".into()),
+                    ..old.clone()
+                };
+                cache
+                    .find_by_host_with(first, Duration::ZERO, |_| Ok(Some(old.clone())))
+                    .unwrap();
+                let (identical, identical_allocs) = crate::test_alloc::allocation_count(|| {
+                    cache
+                        .find_by_host_with(first, Duration::ZERO, |_| panic!("cache hit"))
+                        .unwrap()
+                });
+                let (equivalent, equivalent_allocs) = crate::test_alloc::allocation_count(|| {
+                    cache
+                        .find_by_host_with(second, Duration::ZERO, |_| {
+                            panic!("equivalent cache hit")
+                        })
+                        .unwrap()
+                });
+                assert_eq!(identical, old);
+                assert_eq!(equivalent, old);
+                assert_eq!(identical_allocs, 2); // The two owned descriptor strings.
+                assert_eq!(equivalent_allocs, identical_allocs);
+                assert_eq!(cache.len(), 1);
+                assert!(cache
+                    .find_by_host_with(second, Duration::MAX, |_| panic!("invalid timeout"))
+                    .is_err());
+                cache.invalidate(second);
+                assert!(cache.is_empty());
+                assert_eq!(
+                    cache
+                        .find_by_host_with(first, Duration::ZERO, |_| Ok(Some(fresh.clone())))
+                        .unwrap(),
+                    fresh
+                );
+                assert_eq!(cache.len(), 1);
+                cache.invalidate("invalid:host:port");
+                assert_eq!(cache.len(), 1);
+                cache.clear();
+                assert!(cache
+                    .find_by_host_with(first, Duration::ZERO, |_| Err(Error::InvalidConfiguration(
+                        "discovery failed".into()
+                    )))
+                    .is_err());
+                assert!(cache
+                    .find_by_host_with(second, Duration::ZERO, |_| Ok(None))
+                    .is_err());
+                assert!(cache.is_empty());
+            }
+        }
+    }
 
     #[test]
     fn exact_host_matching_ignores_labels_ports_and_url_payloads() {
@@ -1268,7 +1465,7 @@ mod tests {
             let old_result = old.clone();
             let thread = std::thread::spawn(move || {
                 pending
-                    .find_by_host_with("192.0.2.1", Duration::ZERO, |_| {
+                    .find_by_host_with("CAMERA.LOCAL.", Duration::ZERO, |_| {
                         started_tx.send(()).unwrap();
                         resume_rx.recv().unwrap();
                         Ok(Some(old_result))
@@ -1279,18 +1476,18 @@ mod tests {
             if clear {
                 cache.clear();
             } else {
-                cache.invalidate("192.0.2.1");
+                cache.invalidate("camera.local");
             }
             assert_eq!(cache.len(), 0);
             let found = cache
-                .find_by_host_with("192.0.2.1", Duration::ZERO, |_| Ok(Some(fresh.clone())))
+                .find_by_host_with("camera.local", Duration::ZERO, |_| Ok(Some(fresh.clone())))
                 .unwrap();
             assert_eq!(found, fresh);
             resume_tx.send(()).unwrap();
             assert_eq!(thread.join().unwrap(), old);
             assert_eq!(
                 cache
-                    .find_by_host_with("192.0.2.1", Duration::ZERO, |_| panic!(
+                    .find_by_host_with("Camera.Local.", Duration::ZERO, |_| panic!(
                         "fresh entry was overwritten"
                     ))
                     .unwrap(),
@@ -1410,12 +1607,10 @@ mod tests {
     #[test]
     fn cache_validates_timeout_before_returning_cached_source() {
         let cache = SourceCache::new();
-        cache
-            .cache
-            .lock()
-            .unwrap()
-            .entries
-            .insert("camera".into(), Source::default());
+        cache.cache.lock().unwrap().entries.insert(
+            HostKeyBuffer::new(HostQuery::parse("camera").unwrap()).into_owned(),
+            Source::default(),
+        );
         for host in ["camera", "not_cached"] {
             assert!(matches!(
                 cache.find_by_host(host, Duration::MAX),

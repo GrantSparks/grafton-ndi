@@ -90,6 +90,16 @@ video data access are breaking API changes. See the [1.x to 2.0 migration guide]
 
 ### Changed
 
+- Canonicalize `SourceCache` host keys so case/final-dot hostname variants and
+  equivalent numeric IPs share one entry and invalidate together. Preserve
+  allocation-free key normalization on cache hits and invalidation (#117).
+- Stream PNG active rows using at most one conversion row; convert JPEG pixels
+  directly into codec component buffers. Eliminate full-frame conversion staging
+  across owned, receiver, FrameSync, and data-URL encoding (#118).
+- Allow `Send + Sync` immutable video planes and row/plane iterators for scoped
+  worker reads. Frame/owner lifetimes and FrameSync freeing affinity remain
+  enforced by compile contracts (#119).
+
 - Raise dependency floors to Tokio 1.53.3, jpeg-encoder 0.7.1, thiserror 2.0.21,
   and trybuild 1.0.122. Remove the direct once_cell dependency; the process-global
   runtime manager is const-initialized and SDK initialization still occurs on
@@ -143,7 +153,7 @@ video data access are breaking API changes. See the [1.x to 2.0 migration guide]
 - Upstream receiver tally/metadata controls, sender failover clearing, and
   cloneable sender/finder configuration.
 - CI coverage for all features, independent async configurations, and the
-  library's Rust 1.87 minimum.
+  library's Rust 1.88 minimum.
 
 ### Fixed
 

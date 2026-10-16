@@ -1,0 +1,16 @@
+error[E0505]: cannot move out of `owner` because it is borrowed
+  --> tests/ui/fail/receiver_scoped_views_prevent_owner_drop.rs:9:24
+   |
+ 2 | fn check(owner: Receiver) {
+   |          ----- binding `owner` declared here
+ 3 |     let frame = owner
+   |                 ----- borrow of `owner` occurs here
+...
+ 9 |     std::thread::scope(|scope| {
+   |                        ^^^^^^^ move out of `owner` occurs here
+...
+17 |         drop(owner);
+   |              ----- move occurs due to use in closure
+...
+20 | }
+   | - borrow might be used here, when `frame` is dropped and runs the destructor for type `VideoRef<'_, VideoKind>`

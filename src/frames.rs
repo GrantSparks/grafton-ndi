@@ -2,8 +2,6 @@
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
-#[cfg(feature = "image-encoding")]
-use std::borrow::Cow;
 use std::{
     ffi::{CStr, CString},
     fmt,
@@ -650,7 +648,7 @@ impl VideoFrame {
     ///
     /// # Supported Formats
     ///
-    /// - `RGBA`: Direct encoding when rows are tightly packed
+    /// - `RGBA`: Direct active-row encoding without a pixel copy
     /// - `BGRA`: Swaps red and blue channels and preserves alpha
     /// - `RGBX`: Treats the fourth byte as padding and writes opaque alpha
     /// - `BGRX`: Swaps red/blue and writes opaque alpha
@@ -659,7 +657,9 @@ impl VideoFrame {
     /// # Stride Handling
     ///
     /// This method consumes active pixels row-by-row according to the frame's
-    /// validated line stride. Valid row padding is skipped.
+    /// validated line stride. Valid row padding is skipped. RGBA rows borrow
+    /// directly; other supported formats reuse at most `width * 4` scratch bytes.
+    /// Codec buffers and encoded output require additional memory.
     ///
     /// # Errors
     ///
@@ -698,7 +698,8 @@ impl VideoFrame {
     /// Encode the video frame as JPEG bytes with the specified quality.
     ///
     /// This method encodes the frame to JPEG format, automatically handling color format
-    /// conversion from the NDI frame format to JPEG-compatible RGB.
+    /// conversion from the NDI frame format into codec component rows without
+    /// a full-frame RGB staging buffer. Codec/output storage is additional.
     ///
     /// # Arguments
     ///
@@ -2037,7 +2038,7 @@ impl ImagePixelFormat {
         }
     }
 
-    fn can_borrow_tightly_packed_png(self) -> bool {
+    fn can_borrow_png_rows(self) -> bool {
         self.channel_order == ImageChannelOrder::Rgba
             && self.alpha_policy == ImageAlphaPolicy::Preserve
     }
@@ -2077,7 +2078,15 @@ impl<'a> ImagePixelSource<'a> {
     fn encode_png(&self) -> Result<Vec<u8>> {
         use png::{BitDepth, ColorType, Encoder};
 
-        let (rgba_data, width, height) = self.png_rgba_input()?;
+        use std::io::Write;
+
+        let width = u32::try_from(self.width).map_err(|_| {
+            Error::InvalidFrame(format!("PNG width {} exceeds u32 range", self.width))
+        })?;
+        let height = u32::try_from(self.height).map_err(|_| {
+            Error::InvalidFrame(format!("PNG height {} exceeds u32 range", self.height))
+        })?;
+        let mut conversion = self.png_conversion_row()?;
 
         // Encode to PNG
         let mut png_data = Vec::new();
@@ -2085,24 +2094,49 @@ impl<'a> ImagePixelSource<'a> {
         encoder.set_color(ColorType::Rgba);
         encoder.set_depth(BitDepth::Eight);
 
-        encoder
-            .write_header()
-            .and_then(|mut writer| writer.write_image_data(rgba_data.as_ref()))
-            .map_err(|e| Error::InvalidFrame(format!("PNG encoding failed: {e}")))?;
+        let png_error = |e| Error::InvalidFrame(format!("PNG encoding failed: {e}"));
+        let mut writer = encoder.write_header().map_err(png_error)?;
+        {
+            let mut stream = writer.stream_writer().map_err(png_error)?;
+            for row in self.plane.rows() {
+                let rgba = if self.pixel_format.can_borrow_png_rows() {
+                    row
+                } else {
+                    for (out, pixel) in conversion
+                        .as_chunks_mut::<4>()
+                        .0
+                        .iter_mut()
+                        .zip(row.as_chunks::<{ ImagePixelFormat::BYTES_PER_PIXEL }>().0)
+                    {
+                        *out = self.pixel_format.rgba_pixel(pixel);
+                    }
+                    &conversion
+                };
+                stream
+                    .write_all(rgba)
+                    .map_err(|e| Error::InvalidFrame(format!("PNG encoding failed: {e}")))?;
+            }
+            stream.finish().map_err(png_error)?;
+        }
+        writer.finish().map_err(png_error)?;
 
         Ok(png_data)
     }
 
     fn encode_jpeg(&self, quality: u8) -> Result<Vec<u8>> {
-        use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
+        use jpeg_encoder::Encoder as JpegEncoder;
 
-        let (rgb_data, width, height) = self.jpeg_rgb_input(quality)?;
+        let (width, height) = self.jpeg_dimensions(quality)?;
 
         // Encode to JPEG
         let mut jpeg_data = Vec::new();
         let encoder = JpegEncoder::new(&mut jpeg_data, quality);
         encoder
-            .encode(&rgb_data, width, height, JpegColorType::Rgb)
+            .encode_image(JpegRows {
+                source: self,
+                width,
+                height,
+            })
             .map_err(|e| Error::InvalidFrame(format!("JPEG encoding failed: {e}")))?;
 
         Ok(jpeg_data)
@@ -2145,38 +2179,17 @@ impl<'a> ImagePixelSource<'a> {
         })
     }
 
-    fn png_rgba_input(&self) -> Result<(Cow<'a, [u8]>, u32, u32)> {
-        let width = u32::try_from(self.width).map_err(|_| {
-            Error::InvalidFrame(format!("PNG width {} exceeds u32 range", self.width))
-        })?;
-        let height = u32::try_from(self.height).map_err(|_| {
-            Error::InvalidFrame(format!("PNG height {} exceeds u32 range", self.height))
-        })?;
-
-        if self.pixel_format.can_borrow_tightly_packed_png() {
-            if let Some(data) = self.plane.data() {
-                return Ok((Cow::Borrowed(data), width, height));
-            }
+    fn png_conversion_row(&self) -> Result<Vec<u8>> {
+        if self.pixel_format.can_borrow_png_rows() {
+            return Ok(Vec::new());
         }
-
-        let mut rgba = Vec::with_capacity(self.output_len(4)?);
-
-        if self.pixel_format.can_borrow_tightly_packed_png() {
-            for row in self.plane.rows() {
-                rgba.extend_from_slice(row);
-            }
-        } else {
-            for row in self.plane.rows() {
-                for pixel in row.as_chunks::<{ ImagePixelFormat::BYTES_PER_PIXEL }>().0 {
-                    rgba.extend_from_slice(&self.pixel_format.rgba_pixel(pixel));
-                }
-            }
-        }
-
-        Ok((Cow::Owned(rgba), width, height))
+        let len = self.width.checked_mul(4).ok_or_else(|| {
+            Error::InvalidFrame(format!("PNG row size overflow: {}x4", self.width))
+        })?;
+        Ok(vec![0; len])
     }
 
-    fn jpeg_rgb_input(&self, quality: u8) -> Result<(Vec<u8>, u16, u16)> {
+    fn jpeg_dimensions(&self, quality: u8) -> Result<(u16, u16)> {
         if !(1..=100).contains(&quality) {
             return Err(Error::InvalidFrame(format!(
                 "JPEG quality must be in 1..=100, got {quality}"
@@ -2198,26 +2211,60 @@ impl<'a> ImagePixelSource<'a> {
             ))
         })?;
 
-        let mut rgb = Vec::with_capacity(self.output_len(3)?);
-        for row in self.plane.rows() {
-            for pixel in row.as_chunks::<{ ImagePixelFormat::BYTES_PER_PIXEL }>().0 {
-                rgb.extend_from_slice(&self.pixel_format.rgb_pixel(pixel));
-            }
-        }
+        Ok((width, height))
+    }
+}
 
-        Ok((rgb, width, height))
+/// Reads validated active rows directly into the codec's component buffers.
+/// No wrapper RGB staging allocation, including for padded captured frames.
+#[cfg(feature = "image-encoding")]
+struct JpegRows<'s, 'a> {
+    source: &'s ImagePixelSource<'a>,
+    width: u16,
+    height: u16,
+}
+
+#[cfg(feature = "image-encoding")]
+impl jpeg_encoder::ImageBuffer for JpegRows<'_, '_> {
+    fn get_jpeg_color_type(&self) -> jpeg_encoder::JpegColorType {
+        jpeg_encoder::JpegColorType::Ycbcr
     }
 
-    fn output_len(&self, channels: usize) -> Result<usize> {
+    fn width(&self) -> u16 {
         self.width
-            .checked_mul(self.height)
-            .and_then(|pixels| pixels.checked_mul(channels))
-            .ok_or_else(|| {
-                Error::InvalidFrame(format!(
-                    "Image output buffer size overflow: {}x{}x{}",
-                    self.width, self.height, channels
-                ))
-            })
+    }
+    fn height(&self) -> u16 {
+        self.height
+    }
+
+    fn fill_buffers(&self, row: u16, buffers: &mut [Vec<u8>; 4]) {
+        let row = self
+            .source
+            .plane
+            .row(usize::from(row))
+            .expect("codec row is in bounds");
+        // Like the codec's slice adapter, batch 16 pixels so LLVM can vectorize
+        // conversion and append components without per-pixel Vec growth checks.
+        for chunk in row.as_chunks::<64>().0 {
+            let mut components = [[0; 16]; 3];
+            for (i, pixel) in chunk.as_chunks::<4>().0.iter().enumerate() {
+                let [r, g, b] = self.source.pixel_format.rgb_pixel(pixel);
+                let (y, cb, cr) = jpeg_encoder::rgb_to_ycbcr(r, g, b);
+                components[0][i] = y;
+                components[1][i] = cb;
+                components[2][i] = cr;
+            }
+            for (buffer, values) in buffers.iter_mut().zip(components) {
+                buffer.extend_from_slice(&values);
+            }
+        }
+        for pixel in row.as_chunks::<64>().1.as_chunks::<4>().0 {
+            let [r, g, b] = self.source.pixel_format.rgb_pixel(pixel);
+            let (y, cb, cr) = jpeg_encoder::rgb_to_ycbcr(r, g, b);
+            buffers[0].push(y);
+            buffers[1].push(cb);
+            buffers[2].push(cr);
+        }
     }
 }
 
@@ -2954,12 +3001,43 @@ fn validate_audio_format(fourcc: NDIlib_FourCC_audio_type_e) -> Result<AudioForm
 /// Plane order follows the pixel format: packed pixels; UYVY/A for UYVA;
 /// Y/CbCr[/A] for P216/PA16; Y/V/U for YV12; Y/U/V for I420; Y/UV for NV12.
 /// The view borrows its captured frame, which keeps the SDK allocation alive.
+/// Immutable pixel views are `Send + Sync`, including views borrowed from
+/// FrameSync. Scoped workers must finish before the frame is freed. This does
+/// not transfer the SDK-owning frame reference or change its freeing thread.
+///
+/// ```no_run
+/// # fn read(frame: &grafton_ndi::FrameSyncVideoRef<'_>) {
+/// let plane = frame.plane(0).unwrap();
+/// let rows = plane.rows();
+/// std::thread::scope(|scope| {
+///     let worker = scope.spawn(move || {
+///         rows.flatten().map(|&byte| u64::from(byte)).sum::<u64>()
+///     });
+///     assert_eq!(worker.join().unwrap(),
+///         plane.rows().flatten().map(|&byte| u64::from(byte)).sum::<u64>());
+/// });
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub struct VideoPlane<'a> {
     data: *const u8,
     layout: VideoPlaneLayout,
     lifetime: PhantomData<&'a [u8]>,
 }
+
+// SAFETY: Every private construction site retains one allocation for 'a and
+// validates all offsets, strides, and active lengths before constructing views.
+// Active bytes are initialized and immutable for 'a; padding is never sliced.
+// Reads require only u8 alignment (1) and expose the same &'a [u8] already
+// returned by row/data. Copying or sharing a view grants no mutation or SDK
+// access. Views have no destructor/free operation. Their borrow retains the
+// captured guard until all workers finish, so FrameSync still frees its frame
+// on the capture thread. Owned-slice construction likewise retains its borrow.
+// SDK ownership/free boundary: Processing.NDI.Recv.h (capture_v3/free_video_v2)
+// and Processing.NDI.FrameSync.h (capture_video/free_video).
+unsafe impl Send for VideoPlane<'_> {}
+// SAFETY: Same immutable access and lifetime proof as Send above.
+unsafe impl Sync for VideoPlane<'_> {}
 
 impl<'a> VideoPlane<'a> {
     /// Caller must retain an allocation covering the validated layout for 'a,
@@ -3030,6 +3108,7 @@ impl<'a> VideoPlane<'a> {
 }
 
 /// Active video rows, borrowing the frame that owns the SDK allocation.
+/// `Send + Sync` through its immutable plane; iteration never calls the SDK.
 #[derive(Debug, Clone)]
 pub struct VideoRows<'a> {
     plane: VideoPlane<'a>,
@@ -3054,11 +3133,20 @@ impl ExactSizeIterator for VideoRows<'_> {}
 impl std::iter::FusedIterator for VideoRows<'_> {}
 
 /// Video planes in SDK memory order, with no allocation or pixel copies.
+/// `Send + Sync` for scoped reads; the owning frame's thread rules still apply.
 #[derive(Debug, Clone)]
 pub struct VideoPlanes<'a> {
     data: *const u8,
     layouts: slice::Iter<'a, VideoPlaneLayout>,
 }
+// SAFETY: Constructed only by VideoRef::planes from a validated live frame.
+// The shared layout slice and data borrow last for 'a; each yielded plane
+// satisfies VideoPlane's immutable, initialized, bounded u8 access proof above.
+// Iterator state is exclusively mutated, clones are independent, and neither
+// iteration nor dropping it accesses an SDK handle or frees the allocation.
+unsafe impl Send for VideoPlanes<'_> {}
+// SAFETY: Sharing the iterator exposes only immutable layouts and bytes.
+unsafe impl Sync for VideoPlanes<'_> {}
 impl<'a> Iterator for VideoPlanes<'a> {
     type Item = VideoPlane<'a>;
     fn next(&mut self) -> Option<Self::Item> {
@@ -3092,6 +3180,7 @@ impl std::iter::FusedIterator for VideoPlanes<'_> {}
 /// - Zero copies: No memcpy of pixel data
 /// - RAII lifetime: Exactly one free per frame, enforced at compile time
 /// - Receiver refs are `Send + Sync`; FrameSync refs stay on their capture thread
+/// - Immutable plane/row views support scoped worker reads from either family
 ///
 /// # Lifetime
 ///
@@ -3904,6 +3993,49 @@ mod tests {
                     assert_eq!(position, expected.len());
                 });
                 assert_eq!(allocations, 0);
+                // Preconstructed views and independent iterator clones can be
+                // moved/shared while this thread retains the FrameSync guard.
+                let planes = frame.planes();
+                let moved_planes = planes.clone();
+                let expected_sum: u64 = expected.iter().map(|&b| u64::from(b)).sum();
+                std::thread::scope(|scope| {
+                    let shared = &planes;
+                    let reader = scope.spawn(move || {
+                        shared
+                            .clone()
+                            .flat_map(|p| p.rows())
+                            .flatten()
+                            .map(|&b| u64::from(b))
+                            .sum::<u64>()
+                    });
+                    let moved = scope.spawn(move || {
+                        moved_planes
+                            .flat_map(|p| p.rows().rev())
+                            .flatten()
+                            .map(|&b| u64::from(b))
+                            .sum::<u64>()
+                    });
+                    assert_eq!(reader.join().unwrap(), expected_sum);
+                    assert_eq!(moved.join().unwrap(), expected_sum);
+                });
+                for plane in frame.planes() {
+                    let rows = plane.rows();
+                    let clone = rows.clone();
+                    let serial = rows.clone().flatten().copied().collect::<Vec<_>>();
+                    std::thread::scope(|scope| {
+                        let shared = &plane;
+                        let reader = scope
+                            .spawn(move || shared.rows().flatten().copied().collect::<Vec<_>>());
+                        let moved =
+                            scope.spawn(move || rows.flatten().copied().collect::<Vec<_>>());
+                        let reversed = scope.spawn(move || {
+                            clone.rev().rev().flatten().copied().collect::<Vec<_>>()
+                        });
+                        assert_eq!(reader.join().unwrap(), serial);
+                        assert_eq!(moved.join().unwrap(), serial);
+                        assert_eq!(reversed.join().unwrap(), serial);
+                    });
+                }
                 assert_eq!(frame.layout.data_len_bytes, offset);
                 assert_eq!(frame.layout.payload_len_bytes, expected.len());
                 let owned = frame.to_owned().unwrap();
@@ -4413,28 +4545,255 @@ mod tests {
 
     #[cfg(feature = "image-encoding")]
     #[test]
-    fn test_png_input_borrows_only_tightly_packed_rgba() {
-        let rgba = image_test_frame(PixelFormat::RGBA, 2, 1, None, vec![1, 2, 3, 4, 5, 6, 7, 8]);
-        let source = ImagePixelSource::new(rgba.layout, rgba.data()).unwrap();
-        let (pixels, _, _) = source.png_rgba_input().unwrap();
-        assert!(matches!(pixels, Cow::Borrowed(_)));
-
-        let padded_rgba = image_test_frame(
+    fn png_conversion_scratch_is_bounded_by_one_row() {
+        for format in [
             PixelFormat::RGBA,
-            2,
-            1,
-            Some(12),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 200, 201, 202, 203],
-        );
-        let source = ImagePixelSource::new(padded_rgba.layout, padded_rgba.data()).unwrap();
-        let (pixels, _, _) = source.png_rgba_input().unwrap();
-        assert!(matches!(pixels, Cow::Borrowed(_)));
-        assert_eq!(pixels.as_ref(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+            PixelFormat::BGRA,
+            PixelFormat::RGBX,
+            PixelFormat::BGRX,
+        ] {
+            for height in [1, 19, 257] {
+                let frame =
+                    image_test_frame(format, 18, height, Some(84), vec![42; 84 * height as usize]);
+                let source = ImagePixelSource::new(frame.layout, frame.data()).unwrap();
+                let (scratch, allocations) =
+                    crate::test_alloc::allocation_count(|| source.png_conversion_row().unwrap());
+                let expected = if format == PixelFormat::RGBA {
+                    0
+                } else {
+                    18 * 4
+                };
+                assert_eq!(scratch.len(), expected);
+                assert_eq!(scratch.capacity(), expected);
+                assert_eq!(allocations, usize::from(expected != 0));
+                // The JPEG adapter borrows only the source; all component buffers
+                // belong to the codec. Pre-reserving them proves conversion itself
+                // allocates nothing, independently of image height.
+                let mut buffers = std::array::from_fn(|_| Vec::with_capacity(18));
+                let adapter = JpegRows {
+                    source: &source,
+                    width: 18,
+                    height: height as u16,
+                };
+                let (_, allocations) = crate::test_alloc::allocation_count(|| {
+                    for row in 0..height as u16 {
+                        for buffer in &mut buffers {
+                            buffer.clear();
+                        }
+                        jpeg_encoder::ImageBuffer::fill_buffers(&adapter, row, &mut buffers);
+                    }
+                });
+                assert_eq!(allocations, 0);
+            }
+        }
+    }
 
-        let rgbx = image_test_frame(PixelFormat::RGBX, 2, 1, None, vec![1, 2, 3, 0, 5, 6, 7, 0]);
-        let source = ImagePixelSource::new(rgbx.layout, rgbx.data()).unwrap();
-        let (pixels, _, _) = source.png_rgba_input().unwrap();
-        assert!(matches!(pixels, Cow::Owned(_)));
+    /// Manual resource comparison with the pre-2.0 row-staging implementation.
+    /// `cargo test --release --lib image_encoding_resources -- --ignored --nocapture`
+    #[cfg(feature = "image-encoding")]
+    #[test]
+    #[ignore = "Manual optimized image time/peak-allocation comparison"]
+    fn image_encoding_resources() {
+        use std::{hint::black_box, time::Instant};
+        fn staged(source: &ImagePixelSource<'_>, format: ImageFormat) -> Vec<u8> {
+            match format {
+                ImageFormat::Png => {
+                    let mut pixels = Vec::with_capacity(source.width * source.height * 4);
+                    for row in source.plane.rows() {
+                        for pixel in row.as_chunks::<4>().0 {
+                            pixels.extend_from_slice(&source.pixel_format.rgba_pixel(pixel));
+                        }
+                    }
+                    let mut output = Vec::new();
+                    let mut encoder =
+                        png::Encoder::new(&mut output, source.width as u32, source.height as u32);
+                    encoder.set_color(png::ColorType::Rgba);
+                    encoder.set_depth(png::BitDepth::Eight);
+                    encoder
+                        .write_header()
+                        .unwrap()
+                        .write_image_data(&pixels)
+                        .unwrap();
+                    output
+                }
+                ImageFormat::Jpeg(quality) => {
+                    let mut pixels = Vec::with_capacity(source.width * source.height * 3);
+                    for row in source.plane.rows() {
+                        for pixel in row.as_chunks::<4>().0 {
+                            pixels.extend_from_slice(&source.pixel_format.rgb_pixel(pixel));
+                        }
+                    }
+                    let mut output = Vec::new();
+                    jpeg_encoder::Encoder::new(&mut output, quality)
+                        .encode(
+                            &pixels,
+                            source.width as u16,
+                            source.height as u16,
+                            jpeg_encoder::ColorType::Rgb,
+                        )
+                        .unwrap();
+                    output
+                }
+            }
+        }
+        eprintln!(
+            "width,height,padding,entropy,format,path,median_ms,peak_encode_bytes,output_bytes"
+        );
+        for (width, height) in [(1920, 1080), (3840, 2160), (7680, 4320)] {
+            for padding in [0, 64] {
+                for entropy in [false, true] {
+                    let stride = width * 4 + padding;
+                    let mut data = vec![42; stride * height];
+                    if entropy {
+                        let mut seed = 118u64;
+                        for row in data.chunks_exact_mut(stride) {
+                            for pixel in row[..width * 4].as_chunks_mut::<4>().0 {
+                                for byte in &mut pixel[..3] {
+                                    seed ^= seed << 13;
+                                    seed ^= seed >> 7;
+                                    seed ^= seed << 17;
+                                    *byte = seed as u8;
+                                }
+                                pixel[3] = 255;
+                            }
+                        }
+                    }
+                    let frame = image_test_frame(
+                        PixelFormat::BGRA,
+                        width as i32,
+                        height as i32,
+                        Some(stride as i32),
+                        data,
+                    );
+                    let source = ImagePixelSource::new(frame.layout, frame.data()).unwrap();
+                    for format in [
+                        ImageFormat::Png,
+                        ImageFormat::Jpeg(1),
+                        ImageFormat::Jpeg(85),
+                        ImageFormat::Jpeg(100),
+                    ] {
+                        for old in [true, false] {
+                            let mut times = [0.0f64; 3];
+                            let mut peak = 0;
+                            let mut output_bytes = 0;
+                            for time in &mut times {
+                                let start = Instant::now();
+                                let (output, bytes) = crate::test_alloc::peak_bytes(|| {
+                                    if old {
+                                        staged(black_box(&source), format)
+                                    } else {
+                                        match format {
+                                            ImageFormat::Png => source.encode_png().unwrap(),
+                                            ImageFormat::Jpeg(q) => source.encode_jpeg(q).unwrap(),
+                                        }
+                                    }
+                                });
+                                *time = start.elapsed().as_secs_f64() * 1000.0;
+                                peak = peak.max(bytes);
+                                output_bytes = output.len();
+                                black_box(output);
+                            }
+                            times.sort_by(f64::total_cmp);
+                            eprintln!("{width},{height},{padding},{entropy},{format:?},{},{:.3},{peak},{output_bytes}", if old { "staged" } else { "rows" }, times[1]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "image-encoding")]
+    #[test]
+    fn streamed_images_match_independently_packed_pixels() {
+        for format in [
+            PixelFormat::RGBA,
+            PixelFormat::BGRA,
+            PixelFormat::RGBX,
+            PixelFormat::BGRX,
+        ] {
+            for (width, height) in [(2, 1), (2, 2), (18, 19), (64, 33)] {
+                for padding in [0, 12] {
+                    let stride = width * 4 + padding;
+                    let mut data = vec![0xCD; stride * height];
+                    let mut rgba = Vec::new();
+                    let mut rgb = Vec::new();
+                    for y in 0..height {
+                        for x in 0..width {
+                            let r = (x * 17 + y * 7) as u8;
+                            let g = (x * 31 + y * 13) as u8;
+                            let b = (x * 43 + y * 19) as u8;
+                            let a = (x * 59 + y * 23) as u8;
+                            let pixel = if matches!(format, PixelFormat::BGRA | PixelFormat::BGRX) {
+                                [b, g, r, a]
+                            } else {
+                                [r, g, b, a]
+                            };
+                            data[y * stride + x * 4..y * stride + x * 4 + 4]
+                                .copy_from_slice(&pixel);
+                            rgba.extend_from_slice(&[
+                                r,
+                                g,
+                                b,
+                                if matches!(format, PixelFormat::RGBX | PixelFormat::BGRX) {
+                                    255
+                                } else {
+                                    a
+                                },
+                            ]);
+                            rgb.extend_from_slice(&[r, g, b]);
+                        }
+                    }
+                    let frame = image_test_frame(
+                        format,
+                        width as i32,
+                        height as i32,
+                        Some(stride as i32),
+                        data,
+                    );
+                    assert_eq!(
+                        decode_png_rgba(&frame.encode_png().unwrap()),
+                        (width as u32, height as u32, rgba)
+                    );
+                    for quality in [1, 85, 100] {
+                        let mut baseline = Vec::new();
+                        jpeg_encoder::Encoder::new(&mut baseline, quality)
+                            .encode(
+                                &rgb,
+                                width as u16,
+                                height as u16,
+                                jpeg_encoder::ColorType::Rgb,
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            frame.encode_jpeg(quality).unwrap(),
+                            baseline,
+                            "{format:?} {width}x{height} padding={padding} quality={quality}"
+                        );
+                    }
+                    // X and row padding have no effect on any encoded pixels.
+                    let mut changed = image_test_frame(
+                        format,
+                        width as i32,
+                        height as i32,
+                        Some(stride as i32),
+                        frame.data().to_vec(),
+                    );
+                    for y in 0..height {
+                        changed.data_mut()[y * stride + width * 4..(y + 1) * stride].fill(0x12);
+                        if matches!(format, PixelFormat::RGBX | PixelFormat::BGRX) {
+                            for x in 0..width {
+                                changed.data_mut()[y * stride + x * 4 + 3] ^= 0xFF;
+                            }
+                        }
+                    }
+                    assert_eq!(frame.encode_png().unwrap(), changed.encode_png().unwrap());
+                    assert_eq!(
+                        frame.encode_jpeg(85).unwrap(),
+                        changed.encode_jpeg(85).unwrap()
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(feature = "image-encoding")]
