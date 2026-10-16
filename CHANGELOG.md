@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Include blocking pool queue delay in async `try_capture` timeout budgets and
+  reject invalid timeouts before scheduling work, consistently with `capture`.
+  Clarify that async budgets begin on the future's first poll.
+
 ## [1.0.1] - 2026-10-14
 
 ### Fixed
