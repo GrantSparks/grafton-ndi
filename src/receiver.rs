@@ -606,14 +606,16 @@ impl Receiver {
 
     /// Publish this receiver's program/preview tally upstream.
     ///
-    /// Returns whether a source is currently connected. The SDK retains this
-    /// state and sends it when a connection becomes available, even if false.
+    /// Returns the SDK's status flag unchanged. SDK implementations may report
+    /// success while disconnected; use [`Self::is_connected`] to check the
+    /// connection. The SDK retains tally state for future connections.
     pub fn set_tally(&self, tally: &Tally) -> bool {
         unsafe { NDIlib_recv_set_tally(self.instance, &tally.to_raw()) }
     }
 
-    /// Send metadata upstream. Returns false if no source is connected.
+    /// Send metadata upstream and return the SDK's status flag unchanged.
     ///
+    /// This flag is not a connection query; use [`Self::is_connected`] for that.
     /// Returns an error for invalid metadata before calling the SDK.
     pub fn send_metadata(&self, metadata: &MetadataFrame) -> Result<bool> {
         let (_data, raw) = metadata.to_raw()?;
@@ -1533,11 +1535,13 @@ mod tests {
     }
 
     #[test]
-    fn outbound_controls_report_a_disconnected_receiver() {
+    fn outbound_controls_accept_invocation_without_a_source() {
         let ndi = NDI::new().unwrap();
         let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
-        assert!(!receiver.set_tally(&Tally::new(true, false)));
-        assert!(!receiver.send_metadata(&MetadataFrame::new()).unwrap());
+        // Runtime implementations differ in their status flags when no source
+        // is connected. These controls must remain callable in that state.
+        let _sdk_status = receiver.set_tally(&Tally::new(true, false));
+        receiver.send_metadata(&MetadataFrame::new()).unwrap();
     }
 
     #[test]
