@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Make `NDI` handles privately constructible so safe code cannot release an
+  unacquired runtime reference and shut down NDI while other handles are alive.
+  Direct unit construction (`NDI`) is no longer supported; use `NDI::new()?`
+  or clone an existing handle.
 - Reject odd video widths for every uncompressed pixel format, as required by
   the NDI SDK, consistently across sizing helpers, owned and borrowed frames,
   and received frame validation.

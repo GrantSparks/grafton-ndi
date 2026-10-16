@@ -1,0 +1,12 @@
+error[E0423]: cannot find value `NDI` in this scope
+ --> tests/ui/fail/ndi_unit_constructor.rs:4:10
+  |
+4 |     drop(NDI);
+  |          ^^^
+  |
+ ::: src/runtime.rs
+  |
+  | pub struct NDI {
+  | -------------- `NDI` defined here
+  |
+  = note: a struct named `NDI` exists in another namespace
