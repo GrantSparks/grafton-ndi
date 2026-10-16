@@ -80,8 +80,8 @@ docs(api): improve VideoFrame builder documentation
 
 #### Compile Contract Tests
 
-Zero-copy receive lifetimes, ownership transfer for async sends, and borrowed
-copying-send token contracts are enforced with
+Zero-copy receive lifetimes, ownership transfer for async sends, and immediate source reuse
+after copied submissions are enforced with
 `trybuild` compile tests in `tests/compile_contracts.rs`.
 
 Run the compile contracts directly:

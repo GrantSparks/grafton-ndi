@@ -30,9 +30,9 @@ use crate::{ndi_lib::*, to_ms_checked, Error, Result, NDI};
 ///     .groups("Public,Studio")
 ///     .build();
 ///
-/// // Find sources on specific network segments
+/// // Find sources on specific hosts
 /// let finder = FinderOptions::builder()
-///     .extra_ips("192.168.1.0/24,10.0.0.0/24")
+///     .extra_ips("192.168.1.100,10.0.0.100")
 ///     .build();
 /// ```
 #[derive(Debug, Clone)]
@@ -904,7 +904,7 @@ impl SourceCache {
         }
 
         let ndi = NDI::new()?;
-        // Use extra_ips to hint NDI to look at the specific host IP/network segment
+        // Use extra_ips to hint NDI to look at the specific host IP
         // This significantly improves discovery speed and reliability
         let options = FinderOptions::builder()
             .show_local_sources(true)

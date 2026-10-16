@@ -17,7 +17,7 @@ async video submissions are breaking API changes. See the [1.x to 2.0 migration 
 
 - `Sender::send_video_async` now accepts `VideoFrame` by value and returns
   `Option<VideoFrame>`. Rename borrowed calls to `send_video_async_copy` or use
-  two owned frames for allocation reuse. `AsyncVideoToken::is_complete`,
+  two owned frames for allocation reuse. `AsyncVideoToken`,
   `flush_async(timeout)`, and the public `waitable_completion` module are removed;
   use `flush_async_blocking()` or `finish_video_async()` for synchronization.
 - `NDI` can no longer be constructed as a public unit value. Use `NDI::new()?`
@@ -26,12 +26,26 @@ async video submissions are breaking API changes. See the [1.x to 2.0 migration 
   RGB formats, consistently in sizing helpers, frame construction, and receive
   validation (#88).
 
+- Borrowed audio `data()` returns `Option<&[f32]>` and exposes only packed
+  samples (or active mono samples). Use `channel_data`/`channels` for padded layouts. Owned audio channel
+  access borrows slices; copying received audio normalizes its stride.
+- `SourceCache::new()` is infallible. `FinderOptions::default()` includes local
+  sources, and `VideoFrame::default()` uses Progressive scanning.
+- `ReceiverStatus` exposes `connections: u32`; meaningless `tally`/`other` fields
+  are removed. Raw video capture is rejected while a receiver belongs to FrameSync.
+- Raw capture/free strategy exports are private. Use public `CaptureKind`
+  associations and named frame-reference aliases. Receiver references support
+  scoped thread transfer; FrameSync references retain thread restrictions.
+- Completion-handler registration takes mutable access and replaces the previous
+  handler; it can also be cleared.
+
 ### Changed
 
 - Async video sends take ownership of `VideoFrame` and return the previous
   completed frame for reuse without per-send pixel copies. `finish_video_async`
-  drains and returns the final owned frame. The borrowed copying/token path is
-  available explicitly as `send_video_async_copy` (supersedes #90).
+  drains and returns the final owned frame. The borrowed copying path is
+  available explicitly as fallible `send_video_async_copy`, returning the previous
+  frame and immediately releasing source borrows (supersedes #90 and #92).
 - SDK completion callbacks are no longer registered, including Advanced SDK
   builds. User completion handlers run once when completion is observed on the
   calling thread at SDK synchronization boundaries.
@@ -39,11 +53,28 @@ async video submissions are breaking API changes. See the [1.x to 2.0 migration 
   reports two bytes per first-plane pixel, and checked buffer sizing includes
   all planes. PA16 now allocates all three 16-bit planes (#85).
 
+- SDK linkage follows the Cargo target and actual installed artifacts. SDK
+  environment/header changes invalidate generated bindings; unsupported target
+  ABIs and missing cross-compilation prerequisites fail explicitly.
+- Async adapters map blocking-task panics and missing Tokio context to
+  `SpawnFailed`. Dropped futures suppress work before its cancellation gate; tasks beyond that
+  gate remain uninterruptible and can consume frames or reconnect.
+
 ### Added
 
 - `BorrowedVideoFrame::with_timecode` and fallible
   `with_picture_aspect_ratio` support safe send-side customization; a zero
   aspect ratio selects the SDK's square-pixel convention (#84).
+
+- Allocation-preserving video builder input and setters for recycled frame
+  timecode, timestamp, and scan type.
+- PNG/JPEG/data-URL encoding directly on borrowed receiver and FrameSync video,
+  sharing the owned-frame encoding implementation.
+- Borrowed audio channel iteration and mutable owned-channel access.
+- Upstream receiver tally/metadata controls, sender failover clearing, and
+  cloneable sender/finder configuration.
+- CI coverage for all features, independent async configurations, and the
+  library's Rust 1.87 minimum.
 
 ### Fixed
 
@@ -54,6 +85,17 @@ async video submissions are breaking API changes. See the [1.x to 2.0 migration 
   reject invalid timeouts before scheduling work, matching `capture`. Budgets
   start on the future's first poll and do not impose a wall-clock completion
   deadline (#87).
+
+- Avoid interpreting inter-channel audio padding as initialized floating-point
+  samples. Accept the SDK's zero-length null-terminated metadata convention.
+- Check runtime reference-count overflow before mutation. Lifecycle tests now
+  exercise the production state machine instead of a separate model.
+- Preserve the original capture deadline through blocking-pool queueing and
+  reconnect-lock contention, including nonblocking zero-timeout calls.
+- Propagate SDK status errors; validate PTZ ranges, presets, and finite values;
+  compute drop percentages without integer overflow.
+- Accumulate discovery observations using documented structural identity, parse
+  IPv6/URL authorities correctly, and validate cached lookup timeouts.
 
 ## [1.0.1] - 2026-10-14
 
