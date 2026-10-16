@@ -53,24 +53,24 @@ Add the crate to `Cargo.toml`:
 
 ```toml
 [dependencies]
-grafton-ndi = "1.0"
+grafton-ndi = "2.0"
 ```
 
 Feature flags:
 
 ```toml
 # Minimal build without PNG/JPEG/data URL helpers
-# grafton-ndi = { version = "1.0", default-features = false }
+# grafton-ndi = { version = "2.0", default-features = false }
 
 # Image encoding support is enabled by default
-# grafton-ndi = { version = "1.0", features = ["image-encoding"] }
+# grafton-ndi = { version = "2.0", features = ["image-encoding"] }
 
 # Async receiver wrappers
-# grafton-ndi = { version = "1.0", features = ["tokio"] }
-# grafton-ndi = { version = "1.0", features = ["async-std"] }
+# grafton-ndi = { version = "2.0", features = ["tokio"] }
+# grafton-ndi = { version = "2.0", features = ["async-std"] }
 
 # Advanced SDK symbols, when available from the installed SDK
-# grafton-ndi = { version = "1.0", features = ["advanced_sdk"] }
+# grafton-ndi = { version = "2.0", features = ["advanced_sdk"] }
 ```
 
 ### Prerequisites
@@ -273,7 +273,7 @@ Frame layout fields that describe SDK-facing memory are private. Builders, acces
 
 - Use owned frame APIs when clarity matters or when frame data must outlive the SDK capture buffer.
 - Use borrowed receive refs when you need direct access to SDK-owned buffers during a tight capture loop.
-- Use borrowed async-send video frames when you want NDI to send from an application buffer without copying.
+- Use borrowed async-send video frames to describe application buffers for asynchronous transmission; sending copies pixels and metadata into a sender-owned snapshot.
 - Use `FrameSync` when capture timing is driven by an external output clock.
 - Use lower bandwidth modes for previews and monitoring surfaces.
 - Keep image encoding off real-time paths unless the workload is sized for compression.
@@ -297,7 +297,8 @@ let data_url = video.encode_data_url(ImageFormat::Png)?;
 - [API documentation](https://grantsparks.github.io/grafton-ndi/grafton_ndi/) - Full rustdoc reference, built in CI and self-hosted (the NDI SDK license prevents distributing the generated bindings docs.rs would need).
 - [Examples](examples/) - Runnable examples for discovery, receiving, FrameSync, PTZ, monitoring, and sending.
 - [CHANGELOG.md](CHANGELOG.md) - Release notes and migration guidance.
-- [Migration notes](https://github.com/GrantSparks/grafton-ndi/tree/main/docs/migration) - Older version-to-version migration notes.
+- [Upgrade from 1.x to 2.0](docs/migration/1.x-to-2.0.md) - Breaking changes, layout corrections, and async-send performance changes.
+- [Historical migration notes](https://github.com/GrantSparks/grafton-ndi/tree/main/docs/migration) - Earlier version-to-version migration notes.
 
 ## Examples
 

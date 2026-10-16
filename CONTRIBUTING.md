@@ -179,3 +179,21 @@ grafton-ndi/
 ## License
 
 By contributing, you agree that your contributions will be licensed under the Apache License 2.0.
+
+## Preparing and publishing a release
+
+Prepare the version in `Cargo.toml`, dated release notes in `CHANGELOG.md`,
+current README dependency examples, and any migration guide in one reviewed
+release change. Run formatting, tests, Clippy, and rustdoc checks with the NDI SDK
+installed, and require the main branch CI checks to pass after merging.
+
+For 2.0.0, verify the package version is `2.0.0` and the release commit contains
+all intended fixes before creating the matching `v2.0.0` tag. **Pushing that tag
+triggers the publishing workflow and `cargo publish` to crates.io.** The current
+workflow runs on any pushed tag; it does not verify that the tag matches the
+package version. Treat tagging as the publication step, separate from preparing
+and merging release documentation. Do not push a tag during release preparation.
+
+Main branch CI publishes API documentation to GitHub Pages. After the authorized
+tag push, check the publish job and crates.io package, then publish GitHub release
+notes based on the matching changelog section.

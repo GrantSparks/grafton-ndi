@@ -7,23 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-16
+
+Version 2.0.0 closes runtime and async-send ownership safety gaps and corrects
+SDK frame layout and timeout handling. Making `NDI` privately constructible is
+a breaking API change. See the [1.x to 2.0 migration guide](docs/migration/1.x-to-2.0.md).
+
+### Breaking Changes
+
+- `NDI` can no longer be constructed as a public unit value. Use `NDI::new()?`
+  or clone a live handle so every handle owns a runtime reference (#86).
+- All supported uncompressed video formats now reject odd widths, including
+  RGB formats, consistently in sizing helpers, frame construction, and receive
+  validation (#88).
+
+### Changed
+
+- Async video sends now allocate and copy pixels and metadata into sender-owned
+  storage. A forgotten token cannot leave the SDK reading freed caller buffers.
+  Send signatures remain unchanged; one snapshot remains retained until the next
+  async send or sender destruction, and is drained before release. Forgetting a
+  token skips its user completion handler (#90).
+- UYVA, P216, and PA16 now use the SDK's first-plane stride. Their format info
+  reports two bytes per first-plane pixel, and checked buffer sizing includes
+  all planes. PA16 now allocates all three 16-bit planes (#85).
+
+### Added
+
+- `BorrowedVideoFrame::with_timecode` and fallible
+  `with_picture_aspect_ratio` support safe send-side customization; a zero
+  aspect ratio selects the SDK's square-pixel convention (#84).
+
 ### Fixed
 
-- Make `NDI` handles privately constructible so safe code cannot release an
-  unacquired runtime reference and shut down NDI while other handles are alive.
-  Direct unit construction (`NDI`) is no longer supported; use `NDI::new()?`
-  or clone an existing handle.
-- Reject odd video widths for every uncompressed pixel format, as required by
-  the NDI SDK, consistently across sizing helpers, owned and borrowed frames,
-  and received frame validation.
-- Include blocking pool queue delay in async `try_capture` timeout budgets and
-  reject invalid timeouts before scheduling work, consistently with `capture`.
-  Clarify that async budgets begin on the future's first poll.
-- Make borrowed async sends safe when their completion token is forgotten. The
-  sender now copies pixels and metadata into retained storage and drains the SDK
-  before replacing or destroying it. Existing call signatures remain unchanged;
-  async sends now incur a copy and retain one snapshot until the next send or
-  sender destruction, rather than providing zero-copy transmission.
+- Serialize source snapshot retrieval and conversion into owned `Source` values
+  per finder so another call cannot invalidate SDK pointers during conversion
+  (#89).
+- Include blocking-pool queue delay in async `try_capture` timeout budgets and
+  reject invalid timeouts before scheduling work, matching `capture`. Budgets
+  start on the future's first poll and do not impose a wall-clock completion
+  deadline (#87).
 
 ## [1.0.1] - 2026-10-14
 
