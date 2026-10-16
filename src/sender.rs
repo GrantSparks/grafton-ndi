@@ -317,7 +317,9 @@ impl<'buf> BorrowedVideoFrame<'buf> {
 
     /// Copy this borrowed frame into a validated owned frame.
     ///
-    /// Pixels and metadata are copied; no reference to the source is retained.
+    /// Active pixels are copied into tightly packed planes; row padding is
+    /// skipped and the owned stride can shrink. Metadata is copied separately;
+    /// no reference to the source is retained.
     /// Only the supported uncompressed [`PixelFormat`] layouts are representable.
     /// Unsupported opaque or compressed FourCC values return an error.
     pub fn try_to_owned(&self) -> Result<VideoFrame> {

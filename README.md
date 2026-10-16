@@ -157,6 +157,27 @@ let audio = receiver.audio().try_capture(Duration::from_millis(100))?;
 let metadata = receiver.metadata().try_capture(Duration::from_millis(100))?;
 ```
 
+Borrowed receiver and FrameSync video expose only initialized active pixels.
+`frame.data()` returns `Some(&[u8])` when all active pixels are contiguous, and
+`None` when row or plane padding separates them. Traverse padded frames without
+allocation or pixel copies:
+
+```rust
+if let Some(frame) = receiver.video().try_capture_ref(Duration::from_secs(1))? {
+    for plane in frame.planes() {
+        for row in plane.rows() {
+            // Each row contains active bytes only, with no SDK padding.
+            println!("{} active bytes", row.len());
+        }
+    }
+    let packed = frame.to_owned()?; // one pixel allocation; active rows only
+}
+```
+
+Owned capture and copied video sends pack planes tightly and can reduce the
+source stride. Format, plane order, metadata, timing, aspect ratio, and scan type
+are preserved. Borrowed PNG/JPEG encoding reads active rows directly.
+
 ### Publish Sources
 
 `Sender` publishes a named NDI source and sends video, audio, and metadata. It also exposes connection count, tally, failover, and connection metadata APIs.
@@ -260,6 +281,7 @@ Frame layout fields that describe SDK-facing memory are private. Builders, acces
 
 - **Small FFI boundary**: generated bindings live behind safe wrappers.
 - **RAII lifecycle**: NDI handles, senders, receivers, frames, and pending async sends clean up through ownership.
+- **Initialized receive views**: borrowed video rows and audio channels expose active payload only; `data()` is optional for padded layouts. Owned capture packs active payload without reading SDK padding.
 - **Checked frame descriptions**: frame dimensions, line strides, channel strides, metadata strings, and buffer sizes are validated before slices or strings are exposed.
 - **Explicit blocking behavior**: timeout-bearing calls validate their wait budgets; SDK sends and drains have no deadline. Async adapters run SDK work on a blocking pool.
 - **Forward-compatible SDK enums**: public SDK-mode enums that may grow are `#[non_exhaustive]`.

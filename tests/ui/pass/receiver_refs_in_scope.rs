@@ -18,7 +18,15 @@ fn main() -> Result<(), grafton_ndi::Error> {
     let receiver = receiver(&ndi)?;
 
     if let Some(video) = receiver.video().try_capture_ref(Duration::from_millis(1))? {
-        let _ = (video.width(), video.height(), video.data().len());
+        let _ = (
+            video.width(),
+            video.height(),
+            video
+                .planes()
+                .flat_map(|plane| plane.rows())
+                .map(|row| row.len())
+                .sum::<usize>(),
+        );
         let _owned = video.to_owned()?;
     }
 

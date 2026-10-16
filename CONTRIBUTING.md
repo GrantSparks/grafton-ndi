@@ -72,6 +72,9 @@ The important project invariants are:
   and metadata bounds must remain valid after every safe mutation. Follow the
   [SDK frame layouts](https://docs.ndi.video/all/developing-with-ndi/sdk/frame-types),
   including alpha planes and the zero-length metadata sentinel.
+- Borrowed video exposes initialized active rows, excluding SDK row padding.
+  Use plane/row views for padded layouts; video `data()` can return `None`.
+  SDK-to-owned video copies pack active planes tightly using the shared layout.
 - Borrowed audio exposes initialized samples, not inter-channel padding. Use
   channel slices for strided buffers; `data()` can return `None`.
 - Async video submissions retain owned pixels and metadata until the SDK's

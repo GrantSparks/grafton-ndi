@@ -1,0 +1,8 @@
+error[E0515]: cannot return value referencing function parameter `frame`
+ --> tests/ui/fail/framesync_video_rows_outlives_frame.rs:4:5
+  |
+4 |     frame.plane(0).unwrap().rows()
+  |     -----^^^^^^^^^^^^^^^^^^^^^^^^^
+  |     |
+  |     returns a value referencing data owned by the current function
+  |     `frame` is borrowed here

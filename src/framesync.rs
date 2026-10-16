@@ -673,7 +673,7 @@ mod tests {
         let frame = unsafe { FrameSyncVideoRef::new(guard) }.expect("valid video frame");
 
         assert_eq!(frame.metadata(), Some("framesync video"));
-        assert_eq!(frame.data().len(), expected_len);
+        assert_eq!(frame.data().unwrap().len(), expected_len);
         assert_eq!(
             frame.line_stride_or_size(),
             LineStrideOrSize::LineStrideBytes(stride)
