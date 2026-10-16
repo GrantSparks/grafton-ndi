@@ -232,24 +232,22 @@ pub struct AsyncReceiverGeneric<R: SpawnBlocking> {
     _runtime: PhantomData<R>,
 }
 
-fn validated_timeout_start(timeout: Duration) -> Result<Instant> {
+fn validated_deadline(timeout: Duration) -> Result<Instant> {
     to_ms_checked(timeout)?;
-    Ok(Instant::now())
-}
-
-fn remaining_timeout(timeout: Duration, start_time: Instant) -> Duration {
-    timeout.saturating_sub(start_time.elapsed())
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| Error::Timeout("Capture deadline cannot be represented".into()))
 }
 
 // Shared by both capture verbs so validation and queue accounting agree.
 async fn with_timeout_budget<R, F, T>(timeout: Duration, operation: F) -> Result<T>
 where
     R: SpawnBlocking,
-    F: FnOnce(Duration) -> Result<T> + Send + 'static,
+    F: FnOnce(Instant) -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    let start_time = validated_timeout_start(timeout)?;
-    R::spawn_blocking(move || operation(remaining_timeout(timeout, start_time))).await?
+    let deadline = validated_deadline(timeout)?;
+    R::spawn_blocking(move || operation(deadline)).await?
 }
 
 impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
@@ -415,8 +413,8 @@ where
     /// continues and can consume a frame whose result is discarded.
     pub async fn capture(&self, timeout: Duration) -> Result<K::Owned> {
         let receiver = Arc::clone(&self.recv.inner);
-        with_timeout_budget::<R, _, _>(timeout, move |remaining| {
-            receiver.capture_kind::<K>(remaining)
+        with_timeout_budget::<R, _, _>(timeout, move |deadline| {
+            receiver.capture_kind_until::<K>(deadline)
         })
         .await
     }
@@ -446,8 +444,8 @@ where
     /// continues and can consume a frame whose result is discarded.
     pub async fn try_capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
         let receiver = Arc::clone(&self.recv.inner);
-        with_timeout_budget::<R, _, _>(timeout, move |remaining| {
-            receiver.try_capture_kind::<K>(remaining)
+        with_timeout_budget::<R, _, _>(timeout, move |deadline| {
+            receiver.try_capture_kind_until::<K>(deadline)
         })
         .await
     }
@@ -610,7 +608,10 @@ mod timeout_tests {
             started_rx.recv().unwrap();
 
             let budget = Duration::from_millis(20);
-            let mut capture = Box::pin(with_timeout_budget::<TokioRuntime, _, _>(budget, Ok));
+            let mut capture = Box::pin(with_timeout_budget::<TokioRuntime, _, _>(
+                budget,
+                |deadline| Ok(deadline.saturating_duration_since(Instant::now())),
+            ));
             let mut context = Context::from_waker(Waker::noop());
             assert!(matches!(capture.as_mut().poll(&mut context), Poll::Pending));
             // Keep the sole worker occupied until the whole budget has elapsed.
