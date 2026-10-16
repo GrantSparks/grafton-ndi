@@ -1,3 +1,4 @@
+//! Historical filename: async sends now copy pixels and metadata into sender-owned storage.
 use grafton_ndi::{BorrowedVideoFrame, PixelFormat, SenderOptions, NDI};
 
 use std::{
@@ -12,7 +13,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
     println!("NDI version: {version}");
 
     // Create sender (must be mutable for async sending)
-    let send_options = SenderOptions::builder("Zero-Copy Sender Example")
+    let send_options = SenderOptions::builder("Borrowed Async Sender Example")
         .clock_video(true)
         .clock_audio(true)
         .build();

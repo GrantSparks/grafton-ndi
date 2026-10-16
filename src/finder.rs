@@ -140,6 +140,8 @@ impl Default for FinderOptionsBuilder {
 /// ```
 pub struct Finder {
     instance: NDIlib_find_instance_t,
+    // SDK snapshots and their strings expire on the next snapshot call.
+    sources_lock: Mutex<()>,
     _groups: Option<CString>,    // Hold ownership of CStrings
     _extra_ips: Option<CString>, // to ensure they outlive SDK usage
     _ndi: NDI,
@@ -185,6 +187,7 @@ impl Finder {
         }
         Ok(Self {
             instance,
+            sources_lock: Mutex::new(()),
             _groups: groups_cstr,
             _extra_ips: extra_ips_cstr,
             _ndi: ndi.clone(),
@@ -233,6 +236,8 @@ impl Finder {
     ///
     /// This method uses `NDIlib_find_get_current_sources` which provides a snapshot
     /// of the current source list without any additional network discovery.
+    /// Concurrent snapshots on this finder are serialized until all source names
+    /// and addresses have been copied into owned Rust values.
     ///
     /// Available since NDI SDK 6.0.
     ///
@@ -257,9 +262,25 @@ impl Finder {
     /// # }
     /// ```
     pub fn current_sources(&self) -> Result<Vec<Source>> {
+        self.current_sources_with(
+            |num_sources| unsafe { NDIlib_find_get_current_sources(self.instance, num_sources) },
+            Source::try_from_raw,
+        )
+    }
+
+    // Keep acquisition and conversion in one critical section: the SDK owns both
+    // the array and its strings, so locking only the SDK call is insufficient.
+    fn current_sources_with(
+        &self,
+        fetch: impl FnOnce(&mut u32) -> *const NDIlib_source_t,
+        mut copy: impl FnMut(*const NDIlib_source_t) -> Result<Source>,
+    ) -> Result<Vec<Source>> {
+        let _snapshot = self
+            .sources_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut num_sources = 0;
-        let sources_ptr =
-            unsafe { NDIlib_find_get_current_sources(self.instance, &mut num_sources) };
+        let sources_ptr = fetch(&mut num_sources);
         if sources_ptr.is_null() {
             return Ok(vec![]);
         }
@@ -268,7 +289,7 @@ impl Finder {
         let mut sources = Vec::with_capacity(num_sources as usize);
         for i in 0..num_sources {
             let source_ptr = unsafe { sources_ptr.add(i as usize) };
-            match Source::try_from_raw(source_ptr) {
+            match copy(source_ptr) {
                 Ok(source) => sources.push(source),
                 Err(_e) => {
                     // Skip invalid sources (null pointers from SDK)
@@ -381,17 +402,17 @@ impl Drop for Finder {
 
 /// # Safety
 ///
-/// The NDI SDK documentation states that find operations are thread-safe.
-/// `NDIlib_find_create_v2`, `NDIlib_find_wait_for_sources`, and `NDIlib_find_get_sources`
-/// can be called from multiple threads. The Finder struct only holds an opaque pointer
-/// returned by the SDK and does not perform any mutations that could cause data races.
+/// The SDK finder handle may be moved between threads. Its runtime and creation
+/// strings remain alive with it, and destruction requires exclusive ownership.
 unsafe impl std::marker::Send for Finder {}
 
 /// # Safety
 ///
-/// The NDI SDK documentation guarantees thread-safety for find operations.
-/// Multiple threads can safely call methods on a shared Finder instance as the
-/// SDK handles all necessary synchronization internally.
+/// The SDK forbids concurrent `NDIlib_find_get_current_sources` calls on one
+/// instance and invalidates its returned buffers on the next call. `sources_lock`
+/// serializes those calls through the complete deep copy into owned `Source`s.
+/// Waiting for source changes does not invalidate those buffers; destruction
+/// requires exclusive access through `Drop`.
 unsafe impl std::marker::Sync for Finder {}
 
 /// Network address of an NDI source.
@@ -1028,6 +1049,79 @@ impl Default for SourceCache {
 mod tests {
     use super::*;
     use std::ffi::CString;
+
+    #[test]
+    fn concurrent_snapshots_keep_sdk_buffers_exclusive_until_copied() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Barrier, TryLockError,
+        };
+
+        let ndi = NDI::new().unwrap();
+        let finder = Finder::new(&ndi, &FinderOptions::default()).unwrap();
+        let start = Barrier::new(8);
+        let active_snapshot = AtomicUsize::new(0);
+
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let finder = &finder;
+                let start = &start;
+                let active_snapshot = &active_snapshot;
+                scope.spawn(move || {
+                    let name = CString::new(format!("Camera {index}")).unwrap();
+                    let address = CString::new(format!("192.0.2.{index}:5960")).unwrap();
+                    let raw = NDIlib_source_t {
+                        p_ndi_name: name.as_ptr(),
+                        __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
+                            p_ip_address: address.as_ptr(),
+                        },
+                    };
+                    start.wait();
+                    let sources = finder.current_sources_with(
+                        |count| {
+                            // Model an SDK snapshot whose buffers remain borrowed
+                            // until conversion finishes, not just until fetch returns.
+                            assert_eq!(active_snapshot.fetch_add(1, Ordering::SeqCst), 0);
+                            assert!(matches!(finder.sources_lock.try_lock(), Err(TryLockError::WouldBlock)));
+                            *count = 1;
+                            std::thread::yield_now();
+                            &raw
+                        },
+                        |source| {
+                            // Deterministically catches releasing the lock before
+                            // copying, even if competing threads are not scheduled.
+                            assert!(matches!(finder.sources_lock.try_lock(), Err(TryLockError::WouldBlock)));
+                            std::thread::yield_now();
+                            let owned = Source::try_from_raw(source);
+                            assert_eq!(active_snapshot.fetch_sub(1, Ordering::SeqCst), 1);
+                            owned
+                        },
+                    ).unwrap();
+                    drop(name);
+                    drop(address);
+                    assert_eq!(sources[0].name, format!("Camera {index}"));
+                    assert!(matches!(&sources[0].address, SourceAddress::Ip(ip) if ip == &format!("192.0.2.{index}:5960")));
+                });
+            }
+        });
+        assert_eq!(active_snapshot.load(Ordering::SeqCst), 0);
+
+        // A panic while copying must not disable later snapshots. The mutex
+        // protects a lifetime window, not mutable Rust state needing repair.
+        std::thread::scope(|scope| {
+            assert!(scope
+                .spawn(|| {
+                    let _guard = finder.sources_lock.lock().unwrap();
+                    panic!("interrupted snapshot");
+                })
+                .join()
+                .is_err());
+        });
+        assert!(finder
+            .current_sources_with(|_| ptr::null(), |_| panic!("empty snapshot must not copy"),)
+            .unwrap()
+            .is_empty());
+    }
 
     #[test]
     fn test_try_from_raw_null_pointer() {
