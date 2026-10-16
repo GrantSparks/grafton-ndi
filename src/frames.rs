@@ -79,6 +79,10 @@ pub enum PixelFormat {
 /// - **Packed**: All pixel components are interleaved in a single buffer
 /// - **Planar420**: Y, U, V planes stored separately with 4:2:0 chroma subsampling
 /// - **SemiPlanar420**: Y plane followed by interleaved UV plane (NV12)
+/// - **PackedAlpha**: Packed 4:2:2 plane followed by an 8-bit alpha plane (UYVA)
+/// - **SemiPlanar422**: 16-bit Y plane followed by interleaved CbCr plane (P216)
+/// - **SemiPlanar422Alpha**: [`FormatCategory::SemiPlanar422`] followed by a
+///   16-bit alpha plane (PA16)
 ///
 /// This enum is marked `#[non_exhaustive]` because the NDI SDK's video FourCC
 /// namespace is open and grows across releases; future formats may introduce
@@ -92,6 +96,15 @@ pub enum FormatCategory {
     Planar420,
     /// Semi-planar 4:2:0 with interleaved UV plane (NV12).
     SemiPlanar420,
+    /// Packed UYVY plane followed by an 8-bit alpha plane whose stride is half
+    /// the line stride (UYVA).
+    PackedAlpha,
+    /// Semi-planar 4:2:2 with a 16-bit Y plane followed by an interleaved
+    /// 16-bit CbCr plane, both full height at the line stride (P216).
+    SemiPlanar422,
+    /// [`FormatCategory::SemiPlanar422`] followed by a 16-bit alpha plane at
+    /// the line stride (PA16).
+    SemiPlanar422Alpha,
 }
 
 /// Compile-time pixel format properties.
@@ -115,14 +128,17 @@ pub enum FormatCategory {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PixelFormatInfo {
-    /// Bytes per pixel for packed formats, or Y-plane bytes per pixel for planar formats.
+    /// Bytes per pixel for packed formats, or first-plane bytes per pixel for
+    /// planar and semi-planar formats.
     bytes_per_pixel: u8,
     /// Format category for union field access and buffer calculation.
     category: FormatCategory,
 }
 
 impl PixelFormatInfo {
-    /// Get bytes per pixel for packed formats, or Y-plane bytes per pixel for planar.
+    /// Get bytes per pixel for packed formats, or first-plane bytes per pixel
+    /// for planar and semi-planar formats (the Y plane, or the UYVY plane of
+    /// UYVA).
     #[must_use]
     pub const fn bytes_per_pixel(&self) -> u8 {
         self.bytes_per_pixel
@@ -148,7 +164,7 @@ impl PixelFormatInfo {
     ///
     /// # Arguments
     ///
-    /// * `y_stride` - The Y-plane line stride in bytes (for planar formats) or total line stride (for packed formats)
+    /// * `y_stride` - The first-plane line stride in bytes (for planar formats) or total line stride (for packed formats)
     /// * `height` - Frame height in pixels
     ///
     /// # Errors
@@ -160,7 +176,15 @@ impl PixelFormatInfo {
     ///
     /// # Format-specific calculations
     ///
-    /// - **Packed RGB/YUV** (BGRA/BGRX/RGBA/RGBX/UYVY/UYVA/P216/PA16): `y_stride * height`
+    /// - **Packed RGB/YUV** (BGRA/BGRX/RGBA/RGBX/UYVY): `y_stride * height`
+    /// - **Packed 4:2:2 with alpha UYVA**: requires even stride, then
+    ///   `UYVY + A` where:
+    ///   - UYVY plane: `y_stride * height`
+    ///   - Alpha plane: `(y_stride/2) * height`
+    /// - **Semi-planar 4:2:2 P216**: `Y + CbCr` where each plane is
+    ///   `y_stride * height`
+    /// - **Semi-planar 4:2:2 with alpha PA16**: `Y + CbCr + A` where each
+    ///   plane is `y_stride * height`
     /// - **Planar 4:2:0 YV12/I420**: requires even stride and height,
     ///   then `Y + U + V` where:
     ///   - Y plane: `y_stride * height`
@@ -225,12 +249,16 @@ impl PixelFormat {
                 category: FormatCategory::Packed,
             },
             Self::UYVA => PixelFormatInfo {
-                bytes_per_pixel: 3,
-                category: FormatCategory::Packed,
+                bytes_per_pixel: 2,
+                category: FormatCategory::PackedAlpha,
             },
-            Self::P216 | Self::PA16 => PixelFormatInfo {
-                bytes_per_pixel: 4,
-                category: FormatCategory::Packed,
+            Self::P216 => PixelFormatInfo {
+                bytes_per_pixel: 2,
+                category: FormatCategory::SemiPlanar422,
+            },
+            Self::PA16 => PixelFormatInfo {
+                bytes_per_pixel: 2,
+                category: FormatCategory::SemiPlanar422Alpha,
             },
             Self::YV12 | Self::I420 => PixelFormatInfo {
                 bytes_per_pixel: 1,
@@ -247,7 +275,8 @@ impl PixelFormat {
     /// arithmetic.
     ///
     /// For packed formats, this returns the total bytes per row.
-    /// For planar formats, this returns the Y-plane stride.
+    /// For planar and semi-planar formats, this returns the first-plane
+    /// stride, which is what the SDK expects in `line_stride_in_bytes`.
     ///
     /// # Examples
     ///
@@ -262,15 +291,18 @@ impl PixelFormat {
     ///
     /// // NV12: Y-plane has 1 byte per pixel
     /// assert_eq!(PixelFormat::NV12.try_line_stride(1920)?, 1920);
+    ///
+    /// // P216: Y-plane has 16 bits per pixel
+    /// assert_eq!(PixelFormat::P216.try_line_stride(1920)?, 3840);
     /// # Ok::<(), grafton_ndi::Error>(())
     /// ```
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidFrame`] if the width is invalid for this format
+    /// Returns [`Error::InvalidFrame`] if the width is nonpositive or odd
     /// or if the stride does not fit in `i32`.
     pub fn try_line_stride(self, width: i32) -> Result<i32> {
-        validate_video_width_for_format(self, width)?;
+        validate_video_width(width)?;
         let width_usize = usize::try_from(width)
             .map_err(|_| Error::InvalidFrame(format!("Invalid width value: {width}")))?;
         let stride = min_video_line_stride_checked(self, width_usize)?;
@@ -854,7 +886,8 @@ impl VideoFrameBuilder {
         }
     }
 
-    /// Set the video resolution
+    /// Set the video resolution. Width must be positive and even; height must
+    /// be positive (and even for 4:2:0 formats).
     #[must_use]
     pub fn resolution(mut self, width: i32, height: i32) -> Self {
         self.width = Some(width);
@@ -2232,14 +2265,14 @@ fn validate_video_dimensions_for_format(
     width: i32,
     height: i32,
 ) -> Result<()> {
-    validate_video_width_for_format(pixel_format, width)?;
+    validate_video_width(width)?;
     if height <= 0 {
         return Err(Error::InvalidFrame(format!(
             "Video frame has invalid height: {height}"
         )));
     }
 
-    if pixel_format.info().is_planar_420() && (width % 2 != 0 || height % 2 != 0) {
+    if pixel_format.info().is_planar_420() && height % 2 != 0 {
         return Err(Error::InvalidFrame(format!(
             "Planar 4:2:0 video frames require even dimensions, got {}x{}",
             width, height
@@ -2249,16 +2282,18 @@ fn validate_video_dimensions_for_format(
     Ok(())
 }
 
-fn validate_video_width_for_format(pixel_format: PixelFormat, width: i32) -> Result<()> {
+fn validate_video_width(width: i32) -> Result<()> {
     if width <= 0 {
         return Err(Error::InvalidFrame(format!(
             "Video frame has invalid width: {width}"
         )));
     }
 
-    if pixel_format.info().is_planar_420() && width % 2 != 0 {
+    // The SDK uses 4:2:2 internally, including for RGB input/output.
+    // https://docs.ndi.video/all/developing-with-ndi/sdk/frame-types
+    if width % 2 != 0 {
         return Err(Error::InvalidFrame(format!(
-            "Planar 4:2:0 video frames require even width, got {width}"
+            "NDI video frames require even width, got {width}"
         )));
     }
 
@@ -2385,6 +2420,38 @@ fn calculate_buffer_len_for_info_checked(
                 .ok_or_else(|| Error::InvalidFrame("Video total buffer size overflow".into()))?;
 
             Ok(total)
+        }
+        FormatCategory::PackedAlpha => {
+            if !y_stride.is_multiple_of(2) {
+                return Err(Error::InvalidFrame(
+                    "UYVA video frames require even stride".into(),
+                ));
+            }
+            // UYVY plane + 8-bit alpha plane
+            // Alpha plane has half the line stride and full height
+            let alpha_size = (y_stride / 2)
+                .checked_mul(height)
+                .ok_or_else(|| Error::InvalidFrame("Video alpha-plane size overflow".into()))?;
+
+            let total = y_size
+                .checked_add(alpha_size)
+                .ok_or_else(|| Error::InvalidFrame("Video total buffer size overflow".into()))?;
+
+            Ok(total)
+        }
+        FormatCategory::SemiPlanar422 => {
+            // Semi-planar 4:2:2: Y + interleaved CbCr
+            // CbCr plane has the line stride and full height
+            y_size
+                .checked_mul(2)
+                .ok_or_else(|| Error::InvalidFrame("Video total buffer size overflow".into()))
+        }
+        FormatCategory::SemiPlanar422Alpha => {
+            // Semi-planar 4:2:2 with alpha: Y + interleaved CbCr + alpha
+            // CbCr and alpha planes have the line stride and full height
+            y_size
+                .checked_mul(3)
+                .ok_or_else(|| Error::InvalidFrame("Video total buffer size overflow".into()))
         }
     }
 }
@@ -3440,7 +3507,7 @@ mod tests {
             "unexpected error: {err_msg}"
         );
 
-        let tall = image_test_frame(PixelFormat::RGBA, 1, 65_536, None, vec![0; 65_536 * 4]);
+        let tall = image_test_frame(PixelFormat::RGBA, 2, 65_536, None, vec![0; 65_536 * 8]);
         let err = tall.encode_jpeg(85).unwrap_err();
         let err_msg = err.to_string();
         assert!(
@@ -3563,24 +3630,33 @@ mod tests {
         let len = info.try_buffer_len(3840, 1080).unwrap();
         assert_eq!(len, 3840 * 1080);
 
-        // UYVA: 24 bpp = 3 bytes per pixel
+        // UYVA: UYVY plane (2 bytes per pixel) + alpha plane at half stride
         let info = PixelFormat::UYVA.info();
-        assert_eq!(info.bytes_per_pixel(), 3);
-        assert_eq!(info.category(), FormatCategory::Packed);
-        let len = info.try_buffer_len(5760, 1080).unwrap();
-        assert_eq!(len, 5760 * 1080);
+        assert_eq!(info.bytes_per_pixel(), 2);
+        assert_eq!(info.category(), FormatCategory::PackedAlpha);
+        assert!(!info.is_planar_420());
+        let len = info.try_buffer_len(3840, 1080).unwrap();
+        assert_eq!(len, 3840 * 1080 + 1920 * 1080);
+        // Padded stride: alpha plane follows at stride / 2
+        let len = info.try_buffer_len(4096, 1080).unwrap();
+        assert_eq!(len, 4096 * 1080 + 2048 * 1080);
+        assert!(info.try_buffer_len(3841, 1080).is_err());
 
-        // P216/PA16: 32 bpp = 4 bytes per pixel
+        // P216: 16-bit Y plane + 16-bit CbCr plane, both at the line stride
         let info = PixelFormat::P216.info();
-        assert_eq!(info.bytes_per_pixel(), 4);
-        assert_eq!(info.category(), FormatCategory::Packed);
-        let len = info.try_buffer_len(7680, 1080).unwrap();
-        assert_eq!(len, 7680 * 1080);
+        assert_eq!(info.bytes_per_pixel(), 2);
+        assert_eq!(info.category(), FormatCategory::SemiPlanar422);
+        assert!(!info.is_planar_420());
+        let len = info.try_buffer_len(3840, 1080).unwrap();
+        assert_eq!(len, 3840 * 1080 * 2);
 
+        // PA16: P216 + 16-bit alpha plane at the line stride
         let info = PixelFormat::PA16.info();
-        assert_eq!(info.bytes_per_pixel(), 4);
-        let len = info.try_buffer_len(7680, 1080).unwrap();
-        assert_eq!(len, 7680 * 1080);
+        assert_eq!(info.bytes_per_pixel(), 2);
+        assert_eq!(info.category(), FormatCategory::SemiPlanar422Alpha);
+        assert!(!info.is_planar_420());
+        let len = info.try_buffer_len(3840, 1080).unwrap();
+        assert_eq!(len, 3840 * 1080 * 3);
     }
 
     /// Test PixelFormatInfo for planar YV12/I420 with even dimensions
@@ -3660,12 +3736,12 @@ mod tests {
         // UYVY: 2 bytes per pixel
         assert_eq!(PixelFormat::UYVY.try_line_stride(1920).unwrap(), 3840);
 
-        // UYVA: 3 bytes per pixel
-        assert_eq!(PixelFormat::UYVA.try_line_stride(1920).unwrap(), 5760);
+        // UYVA: UYVY plane stride = 2 bytes per pixel
+        assert_eq!(PixelFormat::UYVA.try_line_stride(1920).unwrap(), 3840);
 
-        // P216/PA16: 4 bytes per pixel
-        assert_eq!(PixelFormat::P216.try_line_stride(1920).unwrap(), 7680);
-        assert_eq!(PixelFormat::PA16.try_line_stride(1920).unwrap(), 7680);
+        // P216/PA16: Y-plane stride = 2 bytes per pixel
+        assert_eq!(PixelFormat::P216.try_line_stride(1920).unwrap(), 3840);
+        assert_eq!(PixelFormat::PA16.try_line_stride(1920).unwrap(), 3840);
 
         // Planar 4:2:0: Y-plane stride = 1 byte per pixel
         assert_eq!(PixelFormat::YV12.try_line_stride(1920).unwrap(), 1920);
@@ -3701,6 +3777,24 @@ mod tests {
             PixelFormat::NV12.try_buffer_size(1920, 1080).unwrap(),
             3_110_400
         );
+
+        // UYVA: UYVY + alpha = 3 * width * height
+        assert_eq!(
+            PixelFormat::UYVA.try_buffer_size(1920, 1080).unwrap(),
+            6_220_800
+        );
+
+        // Semi-planar 4:2:2 16-bit: Y + CbCr = 4 * width * height
+        assert_eq!(
+            PixelFormat::P216.try_buffer_size(1920, 1080).unwrap(),
+            8_294_400
+        );
+
+        // Semi-planar 4:2:2 16-bit with alpha: Y + CbCr + A = 6 * width * height
+        assert_eq!(
+            PixelFormat::PA16.try_buffer_size(1920, 1080).unwrap(),
+            12_441_600
+        );
     }
 
     /// Test PixelFormatInfo::is_planar_420 helper
@@ -3729,6 +3823,93 @@ mod tests {
         assert_eq!(frame.height(), 1080);
         assert_eq!(frame.pixel_format(), PixelFormat::NV12);
         assert_eq!(frame.data().len(), 3_110_400, "NV12 1920x1080 buffer size");
+    }
+
+    #[test]
+    fn test_video_dimensions_across_all_formats() {
+        let formats = [
+            PixelFormat::BGRA,
+            PixelFormat::BGRX,
+            PixelFormat::RGBA,
+            PixelFormat::RGBX,
+            PixelFormat::UYVY,
+            PixelFormat::UYVA,
+            PixelFormat::P216,
+            PixelFormat::PA16,
+            PixelFormat::YV12,
+            PixelFormat::I420,
+            PixelFormat::NV12,
+        ];
+        let mut data = vec![0u8; 4096];
+        for format in formats {
+            for (width, height) in [(0, 2), (-2, 2), (1, 2), (3, 2), (2, 0), (2, -1)] {
+                assert!(
+                    format.try_buffer_size(width, height).is_err(),
+                    "{format:?} {width}x{height}"
+                );
+                assert!(VideoFrame::builder()
+                    .resolution(width, height)
+                    .pixel_format(format)
+                    .build()
+                    .is_err());
+                assert!(crate::BorrowedVideoFrame::try_from_uncompressed(
+                    &data, width, height, format, 30, 1
+                )
+                .is_err());
+                let raw = NDIlib_video_frame_v2_t {
+                    xres: width,
+                    yres: height,
+                    FourCC: format.into(),
+                    frame_rate_N: 30,
+                    frame_rate_D: 1,
+                    picture_aspect_ratio: 0.0,
+                    frame_format_type: ScanType::Progressive.into(),
+                    timecode: 0,
+                    p_data: data.as_mut_ptr(),
+                    __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                        line_stride_in_bytes: 128,
+                    },
+                    p_metadata: ptr::null(),
+                    timestamp: 0,
+                };
+                assert!(matches!(
+                    validate_video_layout(&raw),
+                    Err(Error::InvalidFrame(_))
+                ));
+                // Reject before forming a slice or copying received bytes.
+                assert!(unsafe { VideoFrame::from_raw(&raw) }.is_err());
+            }
+            for width in [0, -2, 1, 3] {
+                assert!(
+                    format.try_line_stride(width).is_err(),
+                    "{format:?} width={width}"
+                );
+            }
+            for height in [1, 2, 3] {
+                let valid = !format.info().is_planar_420() || height % 2 == 0;
+                assert_eq!(format.try_buffer_size(2, height).is_ok(), valid);
+                assert_eq!(
+                    VideoFrame::builder()
+                        .resolution(2, height)
+                        .pixel_format(format)
+                        .build()
+                        .is_ok(),
+                    valid
+                );
+                assert_eq!(
+                    crate::BorrowedVideoFrame::try_from_uncompressed(
+                        &data, 2, height, format, 30, 1
+                    )
+                    .is_ok(),
+                    valid
+                );
+            }
+            // Even width does not imply a larger alignment requirement.
+            assert!(format.try_line_stride(6).is_ok());
+            assert!(ValidatedVideoLayout::new_uncompressed(format, 6, 2, Some(128)).is_ok());
+        }
+        // RGB row padding need not be divisible by two or by a pixel size.
+        assert!(ValidatedVideoLayout::new_uncompressed(PixelFormat::BGRA, 2, 3, Some(9)).is_ok());
     }
 
     /// Test VideoFrame builder rejects planar formats with odd dimensions
@@ -3762,6 +3943,30 @@ mod tests {
             1920 * 1080 * 4,
             "BGRA buffer size unchanged"
         );
+    }
+
+    /// Test VideoFrame builder hands the SDK the first-plane stride for 4:2:2
+    /// formats with extra planes
+    #[test]
+    fn test_videoframe_builder_semi_planar_422_and_alpha() {
+        for (format, expected_len) in [
+            (PixelFormat::UYVA, 256 * 2 * 64 + 256 * 64),
+            (PixelFormat::P216, 256 * 2 * 64 * 2),
+            (PixelFormat::PA16, 256 * 2 * 64 * 3),
+        ] {
+            let frame = VideoFrame::builder()
+                .resolution(256, 64)
+                .pixel_format(format)
+                .build()
+                .expect("Builder should succeed");
+
+            assert_eq!(
+                frame.line_stride_or_size(),
+                LineStrideOrSize::LineStrideBytes(256 * 2),
+                "{format:?} line stride"
+            );
+            assert_eq!(frame.data().len(), expected_len, "{format:?} buffer size");
+        }
     }
 
     /// Test VideoFrame::from_raw with synthetic NV12 frame
@@ -5002,6 +5207,82 @@ mod tests {
             layout.line_stride_or_size,
             LineStrideOrSize::LineStrideBytes(stride)
         );
+    }
+
+    /// Test validate_video_layout accepts the first-plane strides the SDK
+    /// delivers for UYVA, P216 and PA16
+    #[test]
+    fn test_validate_video_layout_semi_planar_422_and_alpha() {
+        let width = 256;
+        let height = 64;
+        let stride = width * 2;
+        let plane = (stride * height) as usize;
+
+        for (format, expected_size) in [
+            (PixelFormat::UYVA, plane + plane / 2),
+            (PixelFormat::P216, plane * 2),
+            (PixelFormat::PA16, plane * 3),
+        ] {
+            let mut data = vec![0u8; expected_size];
+
+            let raw = NDIlib_video_frame_v2_t {
+                xres: width,
+                yres: height,
+                FourCC: format.into(),
+                frame_rate_N: 60,
+                frame_rate_D: 1,
+                picture_aspect_ratio: 16.0 / 9.0,
+                frame_format_type: ScanType::Progressive.into(),
+                timecode: 0,
+                p_data: data.as_mut_ptr(),
+                __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                    line_stride_in_bytes: stride,
+                },
+                p_metadata: ptr::null(),
+                timestamp: 0,
+            };
+
+            let layout = validate_video_layout(&raw)
+                .unwrap_or_else(|e| panic!("{format:?} stride {stride} rejected: {e}"));
+            assert_eq!(layout.pixel_format, format);
+            assert_eq!(layout.data_len_bytes, expected_size, "{format:?}");
+            assert_eq!(
+                layout.line_stride_or_size,
+                LineStrideOrSize::LineStrideBytes(stride)
+            );
+        }
+    }
+
+    /// Test validate_video_layout rejects an odd UYVA stride, since the alpha
+    /// plane stride is half the line stride
+    #[test]
+    fn test_validate_video_layout_rejects_odd_uyva_stride() {
+        let width = 256;
+        let height = 64;
+        let stride = width * 2 + 1;
+        let mut data = vec![0u8; (stride * height * 2) as usize];
+
+        let raw = NDIlib_video_frame_v2_t {
+            xres: width,
+            yres: height,
+            FourCC: PixelFormat::UYVA.into(),
+            frame_rate_N: 60,
+            frame_rate_D: 1,
+            picture_aspect_ratio: 16.0 / 9.0,
+            frame_format_type: ScanType::Progressive.into(),
+            timecode: 0,
+            p_data: data.as_mut_ptr(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: stride,
+            },
+            p_metadata: ptr::null(),
+            timestamp: 0,
+        };
+
+        assert!(matches!(
+            validate_video_layout(&raw),
+            Err(Error::InvalidFrame(_))
+        ));
     }
 
     /// Test validate_video_layout rejects null data pointer

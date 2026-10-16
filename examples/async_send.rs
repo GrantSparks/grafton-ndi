@@ -1,4 +1,4 @@
-//! Example demonstrating zero-copy async video sending with tokens
+//! Example demonstrating async video sending with sender-owned snapshots with tokens
 
 use grafton_ndi::{BorrowedVideoFrame, PixelFormat, SenderOptions, NDI};
 
@@ -20,7 +20,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
     let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
 
     println!("Created NDI sender: AsyncExample");
-    println!("Demonstrating zero-copy async video sending with tokens...\n");
+    println!("Demonstrating async video sending with sender-owned snapshots with tokens...\n");
 
     // Channel to track when video buffer is released
     let (tx, rx) = mpsc::channel();

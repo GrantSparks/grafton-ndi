@@ -1,11 +1,9 @@
 //! NDI sending functionality for video, audio, and metadata.
 
-#[cfg(target_os = "windows")]
-use std::sync::Mutex;
 use std::{
     ffi::{CStr, CString},
     fmt, ptr,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -70,6 +68,8 @@ struct Inner {
     _name: CString,
     _groups: Option<CString>,
     async_state: AsyncState,
+    // Kept in the sender, never the forgettable token. Dropped after Inner::drop drains.
+    pending_video: Mutex<Option<OwnedAsyncVideo>>,
     #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
     callback_ptr: AtomicPtr<c_void>,
 }
@@ -81,6 +81,28 @@ pub struct Sender {
 }
 
 type AsyncCallback = Box<dyn Fn(usize) + Send + Sync>;
+
+/// Storage whose allocation addresses remain stable while the SDK reads them.
+struct OwnedAsyncVideo {
+    data: Vec<u8>,
+    metadata: Option<CString>,
+}
+
+impl OwnedAsyncVideo {
+    fn snapshot(frame: &BorrowedVideoFrame<'_>) -> Self {
+        Self {
+            data: frame.data.to_vec(),
+            metadata: frame.metadata.map(CStr::to_owned),
+        }
+    }
+
+    fn to_raw(&self, frame: &BorrowedVideoFrame<'_>) -> NDIlib_video_frame_v2_t {
+        let mut raw = frame.to_raw();
+        raw.p_data = self.data.as_ptr() as *mut u8;
+        raw.p_metadata = self.metadata.as_ref().map_or(ptr::null(), |s| s.as_ptr());
+        raw
+    }
+}
 
 /// Async completion state for video frames
 struct AsyncState {
@@ -131,12 +153,12 @@ unsafe impl Send for AsyncState {}
 unsafe impl Sync for AsyncState {}
 
 // SAFETY: Inner contains an NDI instance pointer which is thread-safe,
-// owned CStrings (Send+Sync), and thread-safe atomics.
+// owned CStrings (Send+Sync), thread-safe atomics, and mutex-protected owned buffers.
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
 /// A borrowed video frame that references external pixel data.
-/// Used for zero-copy async send operations.
+/// Sending asynchronously snapshots this data into sender-owned storage.
 ///
 /// Fields are private to enforce safety invariants. Use
 /// `try_from_uncompressed` for supported typed formats or
@@ -164,6 +186,8 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     ///
     /// This constructor validates that the buffer is large enough for the specified
     /// dimensions and pixel format, returning an error if validation fails.
+    /// Width must be positive and even for every pixel format. Height must be
+    /// positive, and must also be even for 4:2:0 formats.
     ///
     /// # Arguments
     ///
@@ -255,6 +279,10 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     ///   type.
     /// - `metadata`, when present, remains valid, NUL-terminated, UTF-8, and
     ///   within the crate metadata size cap for the full send lifetime.
+    ///
+    /// Async sending copies the bytes of `data` and `metadata`, but does not
+    /// deep-copy pointers embedded in opaque payloads. Any such pointees must
+    /// remain valid until SDK completion, even if the send token is forgotten.
     ///
     /// The default timecode requests SDK synthesis. Explicit `timecode` and
     /// `timestamp` values, including zero, are passed through unchanged.
@@ -400,6 +428,45 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         self.timestamp
     }
 
+    /// Set the timecode, in 100 ns units.
+    ///
+    /// [`try_from_uncompressed`](Self::try_from_uncompressed) leaves it at
+    /// `NDIlib_send_timecode_synthesize`, which asks the SDK to make one up.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{BorrowedVideoFrame, PixelFormat};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let buffer = vec![0u8; 1920 * 1080 * 2];
+    /// let frame = BorrowedVideoFrame::try_from_uncompressed(
+    ///     &buffer, 1920, 1080, PixelFormat::UYVY, 25, 1,
+    /// )?
+    /// .with_timecode(10_000_000);
+    /// assert_eq!(frame.timecode(), 10_000_000);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_timecode(mut self, timecode: i64) -> Self {
+        self.timecode = timecode;
+        self
+    }
+
+    /// Set the picture aspect ratio, width over height as displayed; `0.0`
+    /// means square pixels, whatever the resolution.
+    ///
+    /// [`try_from_uncompressed`](Self::try_from_uncompressed) assumes 16:9.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidFrame`] if `ratio` is negative or not finite.
+    pub fn with_picture_aspect_ratio(mut self, ratio: f32) -> Result<Self> {
+        crate::frames::validate_video_frame_metadata(self.frame_rate_n, self.frame_rate_d, ratio)?;
+        self.picture_aspect_ratio = ratio;
+        Ok(self)
+    }
+
     fn to_raw(&self) -> NDIlib_video_frame_v2_t {
         // Validation is now performed at construction time, so no runtime checks needed here
         NDIlib_video_frame_v2_t {
@@ -443,12 +510,10 @@ impl<'buf> From<&'buf VideoFrame> for BorrowedVideoFrame<'buf> {
 
 /// A token that tracks an async video send operation.
 ///
-/// The token holds exclusive access to the sender and a borrow of the frame buffer,
-/// ensuring memory safety at compile time. Only one async send can be in-flight
-/// at a time in the non-advanced SDK build.
-///
-/// When the token is dropped, a flush is automatically performed to ensure the
-/// NDI SDK releases the buffer before the token's borrows expire.
+/// The token holds exclusive access to the sender and borrows the caller's frame
+/// buffer. Dropping or waiting the token completes the send. The sender retains
+/// its own copy of the pixel data and metadata, so forgetting the token is safe:
+/// SDK buffer validity does not depend on running this token's destructor.
 #[must_use = "AsyncVideoToken must be held to track the async operation"]
 pub struct AsyncVideoToken<'a, 'buf> {
     inner: &'a Arc<Inner>,
@@ -605,6 +670,7 @@ impl Sender {
                 _name: name_cstr,
                 _groups: groups_cstr,
                 async_state: AsyncState::default(),
+                pending_video: Mutex::new(None),
                 #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
                 callback_ptr: AtomicPtr::new(ptr::null_mut()),
             });
@@ -653,26 +719,17 @@ impl Sender {
         }
     }
 
-    /// Send a video frame asynchronously with zero-copy.
+    /// Send a video frame asynchronously using a sender-owned snapshot.
     ///
-    /// Uses `NDIlib_send_send_video_async_v2` for zero-copy transmission.
+    /// Pixel data and metadata are copied before submission to the NDI SDK. The
+    /// sender retains that snapshot until a subsequent async send or sender
+    /// destruction, draining the SDK before releasing it. This remains safe if
+    /// the returned token is forgotten with [`std::mem::forget`]. At most one
+    /// snapshot is retained between calls.
     ///
-    /// **IMPORTANT**: This method requires a mutable borrow of the sender, which
-    /// enforces single-flight semantics at compile time. Only one async send can
-    /// be in-flight at a time.
-    ///
-    /// Returns an `AsyncVideoToken` that holds borrows of both the sender and the
-    /// frame buffer. The token must be kept alive until the frame has been transmitted.
-    /// When the token is dropped, a flush is automatically performed to ensure the
-    /// NDI SDK releases the buffer.
-    ///
-    /// # Type Safety
-    ///
-    /// The returned token holds:
-    /// - A borrow of the sender (preventing multiple concurrent async sends)
-    /// - A borrow of the frame buffer (preventing the buffer from being dropped)
-    ///
-    /// This ensures memory safety at compile time without runtime overhead.
+    /// The token's mutable sender borrow preserves single-flight usage. Dropping
+    /// or waiting the token guarantees completion and invokes the registered
+    /// completion handler. Forgetting it skips that handler.
     ///
     /// # Example
     /// ```no_run
@@ -688,12 +745,12 @@ impl Sender {
     /// // Register callback to know when buffer is released
     /// sender.on_async_video_done(|len| println!("Buffer released: {len} bytes"));
     ///
-    /// // Use borrowed buffer directly (zero-copy, no allocation)
+    /// // Describe caller-owned data; sending takes a snapshot
     /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
     /// let borrowed_frame = BorrowedVideoFrame::try_from_uncompressed(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1)?;
     /// let token = sender.send_video_async(&borrowed_frame);
     ///
-    /// // Buffer is owned by SDK until token is dropped
+    /// // The SDK reads the sender-owned snapshot until completion
     /// drop(token); // This triggers automatic flush
     /// // Now safe to reuse buffer
     ///
@@ -704,13 +761,29 @@ impl Sender {
         &'b mut self,
         video_frame: &BorrowedVideoFrame<'b>,
     ) -> AsyncVideoToken<'b, 'b> {
+        // Allocate before changing SDK state. The old snapshot stays alive until
+        // the NULL-frame drain returns, including after a forgotten token.
+        let snapshot = OwnedAsyncVideo::snapshot(video_frame);
+        let mut pending = self
+            .inner
+            .pending_video
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.is_some() {
+            flush_null_frame(self.inner.instance);
+        }
+        *pending = Some(snapshot);
+        let raw = pending.as_ref().unwrap().to_raw(video_frame);
+
         #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
         {
             self.inner.async_state.completion.reset();
         }
 
+        // The sender owns every pointer in raw that the SDK may retain. Its
+        // destructor drains before pending_video is automatically dropped.
         unsafe {
-            NDIlib_send_send_video_async_v2(self.inner.instance, &video_frame.to_raw());
+            NDIlib_send_send_video_async_v2(self.inner.instance, &raw);
         }
 
         AsyncVideoToken {
@@ -1167,8 +1240,133 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::drop_non_drop)] // Match the original forget/drop use-after-free reproducer.
+    fn forgotten_async_token_retains_owned_pixels_and_metadata() {
+        let ndi = NDI::new().unwrap();
+        let options = SenderOptions::builder("Forgotten token ownership")
+            .clock_video(false)
+            .clock_audio(false)
+            .build();
+        let mut sender = Sender::new(&ndi, &options).unwrap();
+
+        for value in [17, 42] {
+            let data = vec![value; 16 * 16 * 4];
+            let metadata = CString::new(format!("<frame value='{value}'/>")).unwrap();
+            let mut frame =
+                BorrowedVideoFrame::try_from_uncompressed(&data, 16, 16, PixelFormat::BGRA, 30, 1)
+                    .unwrap();
+            frame.metadata = Some(&metadata);
+            // Verify the SDK descriptor points to independent allocations.
+            let snapshot = OwnedAsyncVideo::snapshot(&frame);
+            let raw = snapshot.to_raw(&frame);
+            assert_eq!(raw.p_data, snapshot.data.as_ptr() as *mut u8);
+            assert_ne!(raw.p_data, data.as_ptr() as *mut u8);
+            assert_eq!(raw.p_metadata, snapshot.metadata.as_ref().unwrap().as_ptr());
+            assert_ne!(raw.p_metadata, metadata.as_ptr());
+
+            let token = sender.send_video_async(&frame);
+            std::mem::forget(token);
+            drop(frame);
+            drop(data);
+            drop(metadata);
+
+            // No token destructor ran. Both SDK-referenced allocations must
+            // nevertheless remain valid, including across the next send.
+            let pending = sender.inner.pending_video.lock().unwrap();
+            let pending = pending.as_ref().unwrap();
+            assert_eq!(pending.data, vec![value; 16 * 16 * 4]);
+            assert_eq!(
+                pending.metadata.as_ref().unwrap().to_str().unwrap(),
+                format!("<frame value='{value}'/>")
+            );
+        }
+        sender.flush_async_blocking();
+        // Destruction must drain before releasing the last snapshot too.
+        drop(sender);
+    }
+
+    #[test]
+    #[allow(clippy::drop_non_drop)] // Explicitly end caller ownership before inspecting storage.
+    fn callback_panic_keeps_async_snapshot_owned() {
+        let ndi = NDI::new().unwrap();
+        let options = SenderOptions::builder("Panicking async callback")
+            .clock_video(false)
+            .clock_audio(false)
+            .build();
+        let mut sender = Sender::new(&ndi, &options).unwrap();
+        sender.on_async_video_done(|_| panic!("intentional callback panic"));
+        let data = vec![23; 16 * 16 * 4];
+        let frame =
+            BorrowedVideoFrame::try_from_uncompressed(&data, 16, 16, PixelFormat::BGRA, 30, 1)
+                .unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(sender.send_video_async(&frame));
+        }));
+        assert!(result.is_err());
+        drop(frame);
+        drop(data);
+        assert_eq!(
+            sender
+                .inner
+                .pending_video
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .data,
+            vec![23; 16 * 16 * 4]
+        );
+        let replacement = vec![45; 16 * 16 * 4];
+        let frame = BorrowedVideoFrame::try_from_uncompressed(
+            &replacement,
+            16,
+            16,
+            PixelFormat::BGRA,
+            30,
+            1,
+        )
+        .unwrap();
+        std::mem::forget(sender.send_video_async(&frame));
+        drop(frame);
+        drop(replacement);
+        drop(sender);
+    }
+
+    #[test]
     fn test_async_flush_uses_null_frame_pointer() {
         assert!(async_flush_frame_ptr().is_null());
+    }
+
+    #[test]
+    fn test_borrowed_frame_setters() {
+        let buffer = vec![0u8; 64 * 36 * 2];
+        let frame =
+            BorrowedVideoFrame::try_from_uncompressed(&buffer, 64, 36, PixelFormat::UYVY, 25, 1)
+                .unwrap();
+        assert_eq!(frame.timecode(), NDIlib_send_timecode_synthesize);
+        assert_eq!(frame.picture_aspect_ratio(), 16.0 / 9.0);
+
+        let frame = frame
+            .with_timecode(1234)
+            .with_picture_aspect_ratio(0.0)
+            .unwrap();
+        assert_eq!(frame.timecode(), 1234);
+        assert_eq!(frame.picture_aspect_ratio(), 0.0);
+        let raw = frame.to_raw();
+        assert_eq!((raw.timecode, raw.picture_aspect_ratio), (1234, 0.0));
+
+        for bad in [-1.0, f32::NAN, f32::INFINITY] {
+            let frame = BorrowedVideoFrame::try_from_uncompressed(
+                &buffer,
+                64,
+                36,
+                PixelFormat::UYVY,
+                25,
+                1,
+            )
+            .unwrap();
+            assert!(frame.with_picture_aspect_ratio(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -1394,7 +1592,7 @@ mod tests {
             (PixelFormat::UYVY, 1920, 1080, 1920 * 1080 * 2),
             (PixelFormat::UYVA, 1920, 1080, 1920 * 1080 * 3),
             (PixelFormat::P216, 1920, 1080, 1920 * 1080 * 4),
-            (PixelFormat::PA16, 1920, 1080, 1920 * 1080 * 4),
+            (PixelFormat::PA16, 1920, 1080, 1920 * 1080 * 6),
         ];
 
         for (format, width, height, expected_min_size) in test_cases {

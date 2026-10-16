@@ -7,9 +7,9 @@
 //! use `spawn_blocking` internally to run NDI operations on a thread pool without
 //! blocking the async runtime.
 //!
-//! For reliable `capture_*` methods, the timeout budget starts when the async
-//! method is called. The blocking task receives only the remaining budget when it
-//! begins, so `spawn_blocking` queue delay does not expand the SDK wait budget.
+//! For `capture` and `try_capture`, the timeout budget starts when the future
+//! is first polled, rather than when it is constructed. The blocking task receives
+//! only the remaining budget when it begins, so `spawn_blocking` queue delay does not expand the SDK wait budget.
 //! Runtime scheduling can still make the awaited future complete after the timeout;
 //! these wrappers do not use runtime-level cancellation because that would not stop
 //! a queued or running blocking NDI call.
@@ -200,6 +200,17 @@ fn remaining_timeout(timeout: Duration, start_time: Instant) -> Duration {
     timeout.saturating_sub(start_time.elapsed())
 }
 
+// Shared by both capture verbs so validation and queue accounting agree.
+async fn with_timeout_budget<R, F, T>(timeout: Duration, operation: F) -> Result<T>
+where
+    R: SpawnBlocking,
+    F: FnOnce(Duration) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let start_time = validated_timeout_start(timeout)?;
+    R::spawn_blocking(move || operation(remaining_timeout(timeout, start_time))).await?
+}
+
 impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
     /// Create a new async receiver wrapper.
     ///
@@ -308,10 +319,10 @@ impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
 /// underlying synchronous capture on the runtime's blocking pool:
 ///
 /// - [`capture`](Self::capture) — reliable owned capture with built-in retry.
-///   The timeout budget starts when the future is created; `spawn_blocking`
+///   The timeout budget starts when the future is first polled; `spawn_blocking`
 ///   queue delay is subtracted before the SDK begins waiting.
 /// - [`try_capture`](Self::try_capture) — a single owned poll; `Ok(None)` when
-///   no frame is ready.
+///   no frame is ready. Its budget also includes blocking task queue delay.
 ///
 /// There is no zero-copy `try_capture_ref` here: a borrowed frame is tied to
 /// the receiver and cannot cross the `spawn_blocking` boundary. Use
@@ -339,8 +350,8 @@ where
     ///
     /// # Arguments
     ///
-    /// * `timeout` - Total budget to wait for a frame, starting when this async
-    ///   method is called. Blocking task queue delay is subtracted before the
+    /// * `timeout` - Total budget to wait for a frame, starting when the future
+    ///   is first polled. Blocking task queue delay is subtracted before the
     ///   synchronous receiver starts waiting. Must not exceed
     ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
     ///
@@ -351,12 +362,11 @@ where
     /// * `Err(Error::SpawnFailed)` - The blocking task panicked or was cancelled
     /// * `Err(_)` - Another error occurred during capture
     pub async fn capture(&self, timeout: Duration) -> Result<K::Owned> {
-        let start_time = validated_timeout_start(timeout)?;
         let receiver = Arc::clone(&self.recv.inner);
-        R::spawn_blocking(move || {
-            receiver.capture_kind::<K>(remaining_timeout(timeout, start_time))
+        with_timeout_budget::<R, _, _>(timeout, move |remaining| {
+            receiver.capture_kind::<K>(remaining)
         })
-        .await?
+        .await
     }
 
     /// Async version of
@@ -365,7 +375,10 @@ where
     ///
     /// # Arguments
     ///
-    /// * `timeout` - Maximum time to wait for a frame. Must not exceed
+    /// * `timeout` - Total wait budget from the future's first poll. Blocking task
+    ///   queue delay is subtracted before the SDK waits; an exhausted budget
+    ///   performs a zero-timeout poll. Scheduling can delay completion beyond
+    ///   this budget. Must not exceed
     ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
     ///
     /// # Returns
@@ -376,7 +389,10 @@ where
     /// * `Err(_)` - An error occurred during capture
     pub async fn try_capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
         let receiver = Arc::clone(&self.recv.inner);
-        R::spawn_blocking(move || receiver.try_capture_kind::<K>(timeout)).await?
+        with_timeout_budget::<R, _, _>(timeout, move |remaining| {
+            receiver.try_capture_kind::<K>(remaining)
+        })
+        .await
     }
 }
 
@@ -508,4 +524,58 @@ pub mod async_std {
     /// does not return a `Result`, so spawn failures from this runtime are less
     /// common than with Tokio.
     pub type AsyncReceiver = AsyncReceiverGeneric<AsyncStdRuntime>;
+}
+
+#[cfg(all(test, feature = "tokio"))]
+mod timeout_tests {
+    use super::*;
+    use std::{
+        sync::mpsc,
+        task::{Context, Poll, Waker},
+    };
+
+    fn runtime() -> ::tokio::runtime::Runtime {
+        ::tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn queued_work_uses_remaining_budget() {
+        let runtime = runtime();
+        runtime.block_on(async {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let blocker = ::tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            started_rx.recv().unwrap();
+
+            let budget = Duration::from_millis(20);
+            let mut capture = Box::pin(with_timeout_budget::<TokioRuntime, _, _>(budget, Ok));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(matches!(capture.as_mut().poll(&mut context), Poll::Pending));
+            // Keep the sole worker occupied until the whole budget has elapsed.
+            std::thread::sleep(budget + Duration::from_millis(5));
+            release_tx.send(()).unwrap();
+            assert_eq!(capture.await.unwrap(), Duration::ZERO);
+            blocker.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn invalid_budget_is_rejected_before_spawning() {
+        // No entered runtime: trying to submit work would panic.
+        let mut capture = Box::pin(with_timeout_budget::<TokioRuntime, _, ()>(
+            crate::MAX_TIMEOUT + Duration::from_secs(1),
+            |_| panic!("invalid timeout must not execute blocking work"),
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            capture.as_mut().poll(&mut context),
+            Poll::Ready(Err(_))
+        ));
+    }
 }

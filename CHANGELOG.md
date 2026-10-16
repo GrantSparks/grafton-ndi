@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unacquired runtime reference and shut down NDI while other handles are alive.
   Direct unit construction (`NDI`) is no longer supported; use `NDI::new()?`
   or clone an existing handle.
+- Reject odd video widths for every uncompressed pixel format, as required by
+  the NDI SDK, consistently across sizing helpers, owned and borrowed frames,
+  and received frame validation.
+- Include blocking pool queue delay in async `try_capture` timeout budgets and
+  reject invalid timeouts before scheduling work, consistently with `capture`.
+  Clarify that async budgets begin on the future's first poll.
+- Make borrowed async sends safe when their completion token is forgotten. The
+  sender now copies pixels and metadata into retained storage and drains the SDK
+  before replacing or destroying it. Existing call signatures remain unchanged;
+  async sends now incur a copy and retain one snapshot until the next send or
+  sender destruction, rather than providing zero-copy transmission.
 
 ## [1.0.1] - 2026-10-14
 
