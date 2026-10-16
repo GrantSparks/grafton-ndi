@@ -153,9 +153,19 @@ jobs:
 
       # rust-cache v2 scans target/tests even with cache-targets disabled. Its
       # unawaited nested cleanup reports ENOENT for trybuild's absent
-      # target/tests/target. Discard these already-consumed, uncached outputs.
-      - name: Remove compile-contract scratch artifacts
-        run: cargo clean --target-dir target/tests
+      # target/tests/target. Keep consumed, uncached outputs outside its traversal.
+      - name: Move compile-contract scratch artifacts out of the workspace
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          import shutil
+          import tempfile
+
+          scratch = Path("target/tests")
+          if scratch.exists():
+              destination = tempfile.mkdtemp(prefix="grafton-contracts-", dir=os.environ["RUNNER_TEMP"])
+              shutil.move(str(scratch), destination)
 
   android:
     name: Android (${{ matrix.target }})
