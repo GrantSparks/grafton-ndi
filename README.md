@@ -21,7 +21,7 @@ The crate is intentionally a binding layer rather than a media framework. It kee
 - **PTZ control** - Drive supported pan, tilt, zoom, focus, exposure, and white-balance commands.
 - **Async integration** - Use optional Tokio or async-std wrappers for receive workflows without blocking the async runtime.
 - **Image snapshots** - Encode captured video frames as PNG, JPEG, or data URLs with the default `image-encoding` feature.
-- **Advanced SDK hooks** - Enable Advanced SDK-specific functionality when your installed SDK exposes those symbols.
+- **SDK compatibility** - Supports standard and Advanced SDK installation layouts; async send completion uses SDK synchronization boundaries in both.
 
 ## Quick Start
 
@@ -69,7 +69,7 @@ Feature flags:
 # grafton-ndi = { version = "2.0", features = ["tokio"] }
 # grafton-ndi = { version = "2.0", features = ["async-std"] }
 
-# Advanced SDK symbols, when available from the installed SDK
+# Retained compatibility flag; does not enable SDK completion callbacks
 # grafton-ndi = { version = "2.0", features = ["advanced_sdk"] }
 ```
 
