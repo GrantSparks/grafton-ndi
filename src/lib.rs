@@ -32,9 +32,10 @@
 //!
 //! ## Runtime Management
 //!
-//! The [`NDI`] struct manages the NDI runtime lifecycle. It must be created before
-//! any other NDI operations and should be kept alive for the duration of your
-//! application's NDI usage.
+//! The [`NDI`] struct manages the NDI runtime lifecycle. Create a handle before
+//! constructing SDK resources; those resources retain their own runtime
+//! references. [`SourceCache`] acquires the runtime on cache misses, while its
+//! cached owned source descriptors need no live runtime handle.
 //!
 //! ## Source Discovery
 //!
@@ -57,6 +58,9 @@
 //! with internal synchronization where required by the SDK. Borrowed receiver
 //! frame references support scoped thread transfer; FrameSync references remain
 //! tied to their owner and cannot be shared or transferred across threads.
+//! Immutable [`VideoPlane`], [`VideoRows`], and [`VideoPlanes`] views are
+//! `Send + Sync` from either capture family. Scoped workers may read those
+//! borrowed pixels while the frame guard stays on its permitted freeing thread.
 //!
 //! ## Async Sending
 //!

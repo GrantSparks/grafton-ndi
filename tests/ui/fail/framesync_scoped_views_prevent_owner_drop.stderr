@@ -1,0 +1,16 @@
+error[E0505]: cannot move out of `owner` because it is borrowed
+  --> tests/ui/fail/framesync_scoped_views_prevent_owner_drop.rs:8:24
+   |
+ 2 | fn check(owner: FrameSync) {
+   |          ----- binding `owner` declared here
+ 3 |     let frame = owner
+   |                 ----- borrow of `owner` occurs here
+...
+ 8 |     std::thread::scope(|scope| {
+   |                        ^^^^^^^ move out of `owner` occurs here
+...
+16 |         drop(owner);
+   |              ----- move occurs due to use in closure
+...
+19 | }
+   | - borrow might be used here, when `frame` is dropped and runs the destructor for type `VideoRef<'_, grafton_ndi::capture::FrameSyncVideoFree>`
