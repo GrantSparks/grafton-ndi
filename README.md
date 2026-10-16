@@ -255,7 +255,7 @@ The crate's public API is organized around a small set of resource types:
 - `FrameSync` wraps a receiver for clock-corrected pull capture.
 - `VideoFrame`, `AudioFrame`, and `MetadataFrame` represent application-owned frame data.
 
-Most applications can start with owned frame APIs such as `receiver.video().capture()` and `sender.send_video()`. For receive hot paths, borrowed receive refs keep data in SDK buffers without an extra copy. Async `sender.send_video_async(frame)` moves an owned `VideoFrame` into the sender without copying pixels and returns the previous completed frame for reuse. Use two frames and call `finish_video_async()` to recover the final frame. For borrowed buffers, `send_video_async_copy(&frame)` explicitly copies pixels and metadata into sender-owned storage and returns a completion token.
+Most applications can start with owned frame APIs such as `receiver.video().capture()` and `sender.send_video()`. For receive hot paths, borrowed receive refs keep data in SDK buffers without an extra copy. Async `sender.send_video_async(frame)` moves an owned `VideoFrame` into the sender without copying pixels and returns the previous completed frame for reuse. This avoids Rust wrapper pixel copies; SDK encoding and network processing may still copy data. Use two frames and call `finish_video_async()` to recover the final frame. For borrowed buffers, `send_video_async_copy(&frame)` explicitly copies pixels and metadata into sender-owned storage and returns a completion token.
 
 Frame layout fields that describe SDK-facing memory are private. Builders, accessors, checked mutation methods, and `PixelFormat` helpers keep dimensions, strides, metadata, and buffer sizes consistent before data crosses the FFI boundary.
 

@@ -1,4 +1,5 @@
-//! Move owned frames into NDI and reuse two pixel allocations without per-send copies.
+//! Move owned frames into NDI and reuse two pixel allocations without per-send wrapper copies.
+//! SDK encoding and network processing may still copy data.
 use grafton_ndi::{PixelFormat, SenderOptions, VideoFrameBuilder, NDI};
 
 fn main() -> Result<(), grafton_ndi::Error> {
