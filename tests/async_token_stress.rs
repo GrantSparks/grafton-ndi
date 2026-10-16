@@ -1,142 +1,172 @@
-use grafton_ndi::{BorrowedVideoFrame, PixelFormat, SenderOptions, NDI};
+use grafton_ndi::{BorrowedVideoFrame, PixelFormat, Sender, SenderOptions, VideoFrame, NDI};
 
-use std::{
-    sync::{Arc, Mutex},
-    thread,
-    time::Duration,
-};
-
-#[test]
-#[ignore = "Slow stress test - run with --ignored"]
-fn stress_test_async_token_drops() -> Result<(), grafton_ndi::Error> {
-    // Initialize NDI once before spawning threads to avoid race conditions
-    let ndi = Arc::new(NDI::new()?);
-
-    let completed = Arc::new(Mutex::new(0));
-    let mut handles = vec![];
-
-    for thread_id in 0..4 {
-        let ndi_clone = ndi.clone();
-        let completed_clone = completed.clone();
-        let handle = thread::spawn(move || -> Result<(), grafton_ndi::Error> {
-            let send_options = SenderOptions::builder(format!("Stress Test Sender {thread_id}"))
-                .clock_video(true)
-                .clock_audio(false)
-                .build();
-            let mut sender = grafton_ndi::Sender::new(&ndi_clone, &send_options)?;
-
-            sender.on_async_video_done(move |_len| {
-                let mut count = completed_clone.lock().unwrap();
-                *count += 1;
-            });
-
-            let mut buffer = vec![0u8; 1920 * 1080 * 4];
-
-            for frame_num in 0..250 {
-                for (i, byte) in buffer.iter_mut().enumerate() {
-                    *byte = ((i + frame_num + thread_id * 1000) % 256) as u8;
-                }
-
-                let borrowed_frame = BorrowedVideoFrame::try_from_uncompressed(
-                    &buffer,
-                    1920,
-                    1080,
-                    PixelFormat::BGRA,
-                    30,
-                    1,
-                )?;
-
-                let token = sender.send_video_async(&borrowed_frame);
-
-                if (frame_num + thread_id) % 3 == 0 {
-                    drop(token);
-                } else {
-                    thread::sleep(Duration::from_micros(100));
-                    drop(token);
-                }
-
-                if frame_num % 10 == 0 {
-                    thread::yield_now();
-                }
-            }
-            Ok(())
-        });
-        handles.push(handle);
-    }
-
-    for handle in handles {
-        handle.join().unwrap()?;
-    }
-
-    thread::sleep(Duration::from_millis(100));
-
-    let final_count = *completed.lock().unwrap();
-    println!("Completed {final_count} async operations");
-
-    assert_eq!(final_count, 1000, "Not all async callbacks were called");
-
-    Ok(())
+fn frame(value: u8) -> VideoFrame {
+    let mut frame = VideoFrame::builder()
+        .resolution(16, 16)
+        .pixel_format(PixelFormat::BGRA)
+        .metadata(format!("<frame value=\"{value}\"/>"))
+        .build()
+        .unwrap();
+    frame.data_mut().fill(value);
+    frame
 }
 
 #[test]
-#[ignore = "Slow stress test - run with --ignored"]
-fn test_immediate_sender_drop() -> Result<(), grafton_ndi::Error> {
+#[ignore = "Requires an installed NDI runtime"]
+fn owned_pipeline_returns_original_buffers_and_metadata() -> Result<(), grafton_ndi::Error> {
     let ndi = NDI::new()?;
-
-    for _ in 0..100 {
-        let send_options = SenderOptions::builder("Immediate Drop Test")
-            .clock_video(true)
-            .clock_audio(false)
-            .build();
-        let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
-
-        {
-            let buffer = vec![0u8; 1920 * 1080 * 4];
-            let borrowed_frame = BorrowedVideoFrame::try_from_uncompressed(
-                &buffer,
-                1920,
-                1080,
-                PixelFormat::BGRA,
-                30,
-                1,
-            )?;
-
-            let _token = sender.send_video_async(&borrowed_frame);
-        }
-
-        sender.flush_async_blocking();
-        drop(sender);
-    }
-
-    Ok(())
-}
-
-#[test]
-#[ignore = "Slow stress test - run with --ignored"]
-fn test_flush_async() -> Result<(), grafton_ndi::Error> {
-    let ndi = NDI::new()?;
-    let send_options = SenderOptions::builder("Flush Test")
-        .clock_video(true)
+    let options = SenderOptions::builder("owned pipeline regression")
+        .clock_video(false)
         .clock_audio(false)
         .build();
-    let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
+    let mut sender = Sender::new(&ndi, &options)?;
+    let first = frame(1);
+    let first_ptr = first.data().as_ptr();
+    assert!(sender.send_video_async(first).is_none());
+    let second = frame(2);
+    let second_ptr = second.data().as_ptr();
+    let recovered = sender.send_video_async(second).unwrap();
+    assert_eq!(recovered.data().as_ptr(), first_ptr);
+    assert!(recovered.data().iter().all(|byte| *byte == 1));
+    assert_eq!(recovered.metadata(), Some("<frame value=\"1\"/>"));
+    let recovered = sender.finish_video_async().unwrap();
+    assert_eq!(recovered.data().as_ptr(), second_ptr);
+    assert!(recovered.data().iter().all(|byte| *byte == 2));
+    assert_eq!(recovered.metadata(), Some("<frame value=\"2\"/>"));
+    assert!(sender.finish_video_async().is_none());
+    Ok(())
+}
 
-    let buffers: Vec<Vec<u8>> = (0..10).map(|i| vec![i as u8; 1920 * 1080 * 4]).collect();
+#[test]
+#[ignore = "Requires an installed NDI runtime"]
+fn copied_send_survives_forgotten_token_and_released_source() -> Result<(), grafton_ndi::Error> {
+    let ndi = NDI::new()?;
+    let options = SenderOptions::builder("forgotten copy token regression")
+        .clock_video(false)
+        .clock_audio(false)
+        .build();
+    let mut sender = Sender::new(&ndi, &options)?;
+    let mut buffer = vec![7; 16 * 16 * 4];
+    let borrowed =
+        BorrowedVideoFrame::try_from_uncompressed(&buffer, 16, 16, PixelFormat::BGRA, 30, 1)?;
+    std::mem::forget(sender.send_video_async_copy(&borrowed));
+    buffer.fill(9);
+    drop(buffer);
+    let _ = sender.finish_video_async();
+    Ok(())
+}
 
-    for buffer in buffers.iter() {
-        let borrowed_frame = BorrowedVideoFrame::try_from_uncompressed(
-            buffer,
-            1920,
-            1080,
-            PixelFormat::BGRA,
-            30,
-            1,
-        )?;
-        let token = sender.send_video_async(&borrowed_frame);
-        drop(token);
-    }
+#[test]
+#[ignore = "Requires an installed NDI runtime"]
+fn mixed_owned_and_copy_send_completes_each_frame_once() -> Result<(), grafton_ndi::Error> {
+    use std::sync::{Arc, Mutex};
+    let ndi = NDI::new()?;
+    let options = SenderOptions::builder("mixed async regression")
+        .clock_video(false)
+        .clock_audio(false)
+        .build();
+    let mut sender = Sender::new(&ndi, &options)?;
+    let completed = Arc::new(Mutex::new(Vec::new()));
+    let recorded = completed.clone();
+    sender.on_async_video_done(move |len| recorded.lock().unwrap().push(len));
+    let _ = sender.send_video_async(frame(3));
+    let source = vec![4; 16 * 16 * 4];
+    let borrowed =
+        BorrowedVideoFrame::try_from_uncompressed(&source, 16, 16, PixelFormat::BGRA, 30, 1)?;
+    sender.send_video_async_copy(&borrowed).wait()?;
+    assert_eq!(completed.lock().unwrap().as_slice(), &[1024, 1024]);
+    assert!(sender.finish_video_async().is_none());
+    let _ = sender.send_video_async(frame(5));
+    drop(sender);
+    assert_eq!(completed.lock().unwrap().as_slice(), &[1024, 1024, 1024]);
+    Ok(())
+}
 
-    sender.flush_async_blocking();
+#[test]
+#[ignore = "Requires an installed NDI runtime"]
+fn concurrent_sync_and_reentrant_flush_preserve_owned_frame() -> Result<(), grafton_ndi::Error> {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let ndi = NDI::new()?;
+    let options = SenderOptions::builder("sync and reentrant flush regression")
+        .clock_video(false)
+        .clock_audio(false)
+        .build();
+    let mut sender = Sender::new(&ndi, &options)?;
+    let submitted = frame(6);
+    let original_ptr = submitted.data().as_ptr();
+    let _ = sender.send_video_async(submitted);
+    let shared = Arc::new(sender);
+    let weak = Arc::downgrade(&shared);
+    let completions = Arc::new(AtomicUsize::new(0));
+    let counted = completions.clone();
+    shared.on_async_video_done(move |_| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        weak.upgrade().unwrap().flush_async_blocking();
+    });
+    std::thread::scope(|scope| {
+        scope.spawn(|| shared.flush_async_blocking());
+        scope.spawn(|| shared.send_video(&frame(7)));
+    });
+    assert_eq!(completions.load(Ordering::SeqCst), 1);
+    let mut sender = Arc::try_unwrap(shared).ok().unwrap();
+    let returned = sender.finish_video_async().unwrap();
+    assert_eq!(returned.data().as_ptr(), original_ptr);
+    assert_eq!(returned.metadata(), Some("<frame value=\"6\"/>"));
+    assert_eq!(completions.load(Ordering::SeqCst), 1);
+    Ok(())
+}
 
+#[test]
+#[ignore = "Requires an installed NDI runtime"]
+fn panicking_completion_keeps_new_owned_frame_pending() -> Result<(), grafton_ndi::Error> {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let ndi = NDI::new()?;
+    let options = SenderOptions::builder("panicking completion regression")
+        .clock_video(false)
+        .clock_audio(false)
+        .build();
+    let mut sender = Sender::new(&ndi, &options)?;
+    let callbacks = Arc::new(AtomicUsize::new(0));
+    let recorded = callbacks.clone();
+    sender.on_async_video_done(move |_| {
+        if recorded.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("intentional completion panic");
+        }
+    });
+    let _ = sender.send_video_async(frame(1));
+    let next = frame(2);
+    let next_ptr = next.data().as_ptr();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = sender.send_video_async(next);
+    }));
+    assert!(panic.is_err());
+    let recovered = sender.finish_video_async().unwrap();
+    assert_eq!(recovered.data().as_ptr(), next_ptr);
+    assert_eq!(recovered.metadata(), Some("<frame value=\"2\"/>"));
+    assert_eq!(callbacks.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires an installed NDI runtime"]
+fn copied_send_retains_metadata_after_source_drop() -> Result<(), grafton_ndi::Error> {
+    let ndi = NDI::new()?;
+    let options = SenderOptions::builder("copied metadata lifetime regression")
+        .clock_video(false)
+        .clock_audio(false)
+        .build();
+    let mut sender = Sender::new(&ndi, &options)?;
+    let source = frame(8);
+    let borrowed = BorrowedVideoFrame::from(&source);
+    std::mem::forget(sender.send_video_async_copy(&borrowed));
+    drop(source);
+    // Both source pixels and metadata have been released before the SDK drain.
+    let _ = sender.finish_video_async();
     Ok(())
 }

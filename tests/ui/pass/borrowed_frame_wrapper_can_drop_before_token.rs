@@ -31,7 +31,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
             )
         };
 
-        sender.send_video_async(&frame)
+        sender.send_video_async_copy(&frame)
     };
 
     token.wait()?;

@@ -11,7 +11,7 @@ fn main() {
     let frame =
         BorrowedVideoFrame::try_from_uncompressed(&buffer, 16, 16, PixelFormat::BGRA, 30, 1)
             .unwrap();
-    let token = sender.send_video_async(&frame);
+    let token = sender.send_video_async_copy(&frame);
 
     buffer = vec![1u8; 16 * 16 * 4];
     drop(token);

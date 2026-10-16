@@ -19,7 +19,7 @@ By participating in this project, you agree to abide by our code of conduct: be 
 
 ### Prerequisites
 
-- Rust 1.87 or later
+- Current stable Rust for the full test and lint suite. The library supports Rust 1.87; verify that separately with `cargo +1.87.0 check --all-features`. Development dependencies may require newer Rust.
 - NDI SDK 6.x installed (see README for platform-specific instructions)
 - Git
 
