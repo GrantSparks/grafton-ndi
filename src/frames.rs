@@ -299,10 +299,10 @@ impl PixelFormat {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidFrame`] if the width is invalid for this format
+    /// Returns [`Error::InvalidFrame`] if the width is nonpositive or odd
     /// or if the stride does not fit in `i32`.
     pub fn try_line_stride(self, width: i32) -> Result<i32> {
-        validate_video_width_for_format(self, width)?;
+        validate_video_width(width)?;
         let width_usize = usize::try_from(width)
             .map_err(|_| Error::InvalidFrame(format!("Invalid width value: {width}")))?;
         let stride = min_video_line_stride_checked(self, width_usize)?;
@@ -886,7 +886,8 @@ impl VideoFrameBuilder {
         }
     }
 
-    /// Set the video resolution
+    /// Set the video resolution. Width must be positive and even; height must
+    /// be positive (and even for 4:2:0 formats).
     #[must_use]
     pub fn resolution(mut self, width: i32, height: i32) -> Self {
         self.width = Some(width);
@@ -2264,14 +2265,14 @@ fn validate_video_dimensions_for_format(
     width: i32,
     height: i32,
 ) -> Result<()> {
-    validate_video_width_for_format(pixel_format, width)?;
+    validate_video_width(width)?;
     if height <= 0 {
         return Err(Error::InvalidFrame(format!(
             "Video frame has invalid height: {height}"
         )));
     }
 
-    if pixel_format.info().is_planar_420() && (width % 2 != 0 || height % 2 != 0) {
+    if pixel_format.info().is_planar_420() && height % 2 != 0 {
         return Err(Error::InvalidFrame(format!(
             "Planar 4:2:0 video frames require even dimensions, got {}x{}",
             width, height
@@ -2281,16 +2282,18 @@ fn validate_video_dimensions_for_format(
     Ok(())
 }
 
-fn validate_video_width_for_format(pixel_format: PixelFormat, width: i32) -> Result<()> {
+fn validate_video_width(width: i32) -> Result<()> {
     if width <= 0 {
         return Err(Error::InvalidFrame(format!(
             "Video frame has invalid width: {width}"
         )));
     }
 
-    if pixel_format.info().is_planar_420() && width % 2 != 0 {
+    // The SDK uses 4:2:2 internally, including for RGB input/output.
+    // https://docs.ndi.video/all/developing-with-ndi/sdk/frame-types
+    if width % 2 != 0 {
         return Err(Error::InvalidFrame(format!(
-            "Planar 4:2:0 video frames require even width, got {width}"
+            "NDI video frames require even width, got {width}"
         )));
     }
 
@@ -3504,7 +3507,7 @@ mod tests {
             "unexpected error: {err_msg}"
         );
 
-        let tall = image_test_frame(PixelFormat::RGBA, 1, 65_536, None, vec![0; 65_536 * 4]);
+        let tall = image_test_frame(PixelFormat::RGBA, 2, 65_536, None, vec![0; 65_536 * 8]);
         let err = tall.encode_jpeg(85).unwrap_err();
         let err_msg = err.to_string();
         assert!(
@@ -3820,6 +3823,93 @@ mod tests {
         assert_eq!(frame.height(), 1080);
         assert_eq!(frame.pixel_format(), PixelFormat::NV12);
         assert_eq!(frame.data().len(), 3_110_400, "NV12 1920x1080 buffer size");
+    }
+
+    #[test]
+    fn test_video_dimensions_across_all_formats() {
+        let formats = [
+            PixelFormat::BGRA,
+            PixelFormat::BGRX,
+            PixelFormat::RGBA,
+            PixelFormat::RGBX,
+            PixelFormat::UYVY,
+            PixelFormat::UYVA,
+            PixelFormat::P216,
+            PixelFormat::PA16,
+            PixelFormat::YV12,
+            PixelFormat::I420,
+            PixelFormat::NV12,
+        ];
+        let mut data = vec![0u8; 4096];
+        for format in formats {
+            for (width, height) in [(0, 2), (-2, 2), (1, 2), (3, 2), (2, 0), (2, -1)] {
+                assert!(
+                    format.try_buffer_size(width, height).is_err(),
+                    "{format:?} {width}x{height}"
+                );
+                assert!(VideoFrame::builder()
+                    .resolution(width, height)
+                    .pixel_format(format)
+                    .build()
+                    .is_err());
+                assert!(crate::BorrowedVideoFrame::try_from_uncompressed(
+                    &data, width, height, format, 30, 1
+                )
+                .is_err());
+                let raw = NDIlib_video_frame_v2_t {
+                    xres: width,
+                    yres: height,
+                    FourCC: format.into(),
+                    frame_rate_N: 30,
+                    frame_rate_D: 1,
+                    picture_aspect_ratio: 0.0,
+                    frame_format_type: ScanType::Progressive.into(),
+                    timecode: 0,
+                    p_data: data.as_mut_ptr(),
+                    __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                        line_stride_in_bytes: 128,
+                    },
+                    p_metadata: ptr::null(),
+                    timestamp: 0,
+                };
+                assert!(matches!(
+                    validate_video_layout(&raw),
+                    Err(Error::InvalidFrame(_))
+                ));
+                // Reject before forming a slice or copying received bytes.
+                assert!(unsafe { VideoFrame::from_raw(&raw) }.is_err());
+            }
+            for width in [0, -2, 1, 3] {
+                assert!(
+                    format.try_line_stride(width).is_err(),
+                    "{format:?} width={width}"
+                );
+            }
+            for height in [1, 2, 3] {
+                let valid = !format.info().is_planar_420() || height % 2 == 0;
+                assert_eq!(format.try_buffer_size(2, height).is_ok(), valid);
+                assert_eq!(
+                    VideoFrame::builder()
+                        .resolution(2, height)
+                        .pixel_format(format)
+                        .build()
+                        .is_ok(),
+                    valid
+                );
+                assert_eq!(
+                    crate::BorrowedVideoFrame::try_from_uncompressed(
+                        &data, 2, height, format, 30, 1
+                    )
+                    .is_ok(),
+                    valid
+                );
+            }
+            // Even width does not imply a larger alignment requirement.
+            assert!(format.try_line_stride(6).is_ok());
+            assert!(ValidatedVideoLayout::new_uncompressed(format, 6, 2, Some(128)).is_ok());
+        }
+        // RGB row padding need not be divisible by two or by a pixel size.
+        assert!(ValidatedVideoLayout::new_uncompressed(PixelFormat::BGRA, 2, 3, Some(9)).is_ok());
     }
 
     /// Test VideoFrame builder rejects planar formats with odd dimensions

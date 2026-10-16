@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reject odd video widths for every uncompressed pixel format, as required by
+  the NDI SDK, consistently across sizing helpers, owned and borrowed frames,
+  and received frame validation.
 - Include blocking pool queue delay in async `try_capture` timeout budgets and
   reject invalid timeouts before scheduling work, consistently with `capture`.
   Clarify that async budgets begin on the future's first poll.
