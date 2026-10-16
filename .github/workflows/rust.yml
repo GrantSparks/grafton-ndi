@@ -305,7 +305,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
-          shared-key: "rust-cache-windows"
+          shared-key: "rust-cache-windows-latest"
           save-if: false  # Don't save cache in publish job
 
       - name: Authenticate with crates.io

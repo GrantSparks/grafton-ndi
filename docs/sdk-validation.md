@@ -13,7 +13,7 @@ wrappers for every new NDI 6.3 discovery/advertiser API, or require 6.3.2 as a n
 minimum version. Bindings continue to be generated from the installed headers.
 The standard SDK was used; an actual Advanced SDK installation was not tested.
 
-## Coverage
+## SDK baseline coverage
 
 Every successful build below linked **all examples with all features**, rather
 than stopping at `cargo check` or an unlinked Rust library.
@@ -40,7 +40,7 @@ testing, including discovery and application packaging. The Windows-hosted
 Android installer was downloaded and hashed; its four `libndi.so` files match
 the Linux-hosted installer byte for byte. Builds used the Linux-hosted one.
 
-Native Linux checks passed: `cargo test --all-features`, all six build-selection
+Before the dependency/runtime migration in #114, native Linux checks passed: `cargo test --all-features`, all six build-selection
 tests, Clippy with warnings denied, examples with all features, Rust 1.87 library
 compatibility, and the normally ignored sender lifecycle, receiver status,
 FrameSync audio, and video-padding SDK regression suites. The full native run
@@ -50,6 +50,33 @@ CI retains native Linux, Windows, and macOS testing and adds cross-build jobs fo
 all four Android ABIs. Linux ARM/x86 and Windows x86 cross-build results above
 were validated locally; they are not additional CI runtime jobs. The macOS CI
 job covers the architecture of its hosted runner, not both Mac architectures.
+
+## Dependency/runtime migration validation
+
+Additional validation on 2026-10-16 uses the same standard NDI SDK 6.3.2.0 on
+Debian 12 x86_64, with the new Rust 1.88 minimum and optional smol adapter. These
+results validate the implementation of #114 separately from the SDK baseline
+above and its historical Rust 1.87 check.
+
+- Rust 1.88: all-target/all-feature check and 266 library tests passed; one test
+  remains intentionally ignored. Compiler-diagnostic fixtures use stable Rust.
+- Stable Rust 1.99: all-feature tests passed, including 266 library tests,
+  39 compile-contract cases, and 73 doctests. Clippy and rustdoc passed with
+  warnings denied. Default/all-feature examples built and example tests passed.
+- All 10 normally ignored SDK regressions passed across async-send lifecycle,
+  sender stress, receiver status, FrameSync audio, and padded video. Padded-video
+  coverage exercises both Tokio and smol owned capture.
+- The resolved graph passed `cargo audit --deny warnings` with zero
+  vulnerabilities and zero warnings. It contains event-listener 5.4.2 and no
+  async-std or once_cell. Direct dependency floors are recorded in `Cargo.toml`;
+  consuming applications still need to refresh affected lockfiles.
+
+The [release preparation PR](https://github.com/GrantSparks/grafton-ndi/pull/115)
+provides native Linux/Windows/macOS CI and four Android example-link checks.
+Those checks and the main-branch Pages deployment establish hosted coverage;
+local cross-linking from the SDK baseline is not native execution of this
+migration. Android device execution and an actual Advanced SDK installation
+remain untested.
 
 ## Installing and selecting the SDK
 

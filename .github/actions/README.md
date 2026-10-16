@@ -78,3 +78,19 @@ The allowlist is a compatibility mechanism: an accepted older payload can still
 be installed if the configured URL serves it. To require exactly one SDK
 version, remove its predecessors from the allowlist and use a version-pinned
 source under your control.
+
+## Release CI policy
+
+The 2.0 workflow pins Linux jobs to `ubuntu-24.04`. Validate Ubuntu 26.04
+separately before changing that release baseline. Linux-only checks use
+`runner.os == 'Linux'`, and Rust-cache shared keys follow the selected runner
+label. Native Windows and macOS coverage remains part of release acceptance.
+Hosted macOS ARM64 queue-capacity notices describe scheduling constraints; allow
+for queue time and verify the jobs' eventual results.
+
+The workflow generates a lockfile before `cargo audit --deny warnings` and gates
+publication on that audit. Checkout, SDK cache restore/save, Pages upload/deploy,
+and crates.io authentication use Node 24 action releases. The Pages uploader
+also uses a Node 24 nested artifact action; do not suppress deprecation warnings
+with runtime override variables. The default archive excludes hidden files;
+rustdoc's root redirect and API assets do not require hidden files.
