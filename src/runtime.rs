@@ -167,6 +167,8 @@ static RUNTIME: Lazy<RuntimeManager> = Lazy::new(RuntimeManager::new);
 /// The `NDI` struct is the entry point for all NDI operations. It ensures the NDI
 /// runtime is properly initialized and cleaned up. Multiple instances can exist
 /// simultaneously - they share the same underlying runtime through reference counting.
+/// Create handles with [`NDI::new`] or [`Clone::clone`]; direct construction is private
+/// so every handle owns a reference to the initialized runtime.
 ///
 /// # Examples
 ///
@@ -185,7 +187,9 @@ static RUNTIME: Lazy<RuntimeManager> = Lazy::new(RuntimeManager::new);
 /// # }
 /// ```
 #[derive(Debug)]
-pub struct NDI;
+pub struct NDI {
+    _private: (),
+}
 
 impl NDI {
     /// Creates a new NDI instance.
@@ -211,7 +215,7 @@ impl NDI {
     /// ```
     pub fn new() -> Result<Self> {
         RUNTIME.acquire()?;
-        Ok(Self)
+        Ok(Self { _private: () })
     }
 
     /// Checks if the current CPU is supported by the NDI SDK.
@@ -284,7 +288,7 @@ impl Clone for NDI {
         RUNTIME
             .acquire()
             .expect("Runtime should be initialized when cloning existing NDI handle");
-        Self
+        Self { _private: () }
     }
 }
 

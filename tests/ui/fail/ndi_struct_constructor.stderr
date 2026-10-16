@@ -1,0 +1,5 @@
+error[E0451]: field `_private` of struct `NDI` is private
+ --> tests/ui/fail/ndi_struct_constructor.rs:4:16
+  |
+4 |     drop(NDI { _private: () });
+  |                ^^^^^^^^ private field

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Make `NDI` handles privately constructible so safe code cannot release an
+  unacquired runtime reference and shut down NDI while other handles are alive.
+  Direct unit construction (`NDI`) is no longer supported; use `NDI::new()?`
+  or clone an existing handle.
+
 ## [1.0.1] - 2026-10-14
 
 ### Fixed
