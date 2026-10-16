@@ -68,7 +68,12 @@ fn main() {
     });
 
     // Construct the include path and header file location.
-    let ndi_include_path = format!("{ndi_sdk_path}/include");
+    let ndi_include_path =
+        if target_os == "windows" && Path::new(&ndi_sdk_path).join("Include").is_dir() {
+            format!("{ndi_sdk_path}/Include")
+        } else {
+            format!("{ndi_sdk_path}/include")
+        };
 
     // Create wrapper.h in OUT_DIR for bindgen
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR environment variable not set");

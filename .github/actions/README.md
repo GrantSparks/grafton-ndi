@@ -1,43 +1,80 @@
-# GitHub Actions for grafton-ndi
+# NDI SDK setup and updates
 
-This directory contains custom GitHub Actions for setting up the NDI SDK on different platforms.
+The setup actions download installers, verify their SHA256 hashes, and cache the
+installed SDK. Windows also installs LLVM; macOS installs the package and copies
+its SDK into the cache. The Linux action extracts either the Linux or Android
+SDK and creates Linux linker symlinks for every shipped architecture.
 
-## setup-ndi-windows
+## Current installers
 
-Sets up the NDI SDK and LLVM on Windows runners.
+Verified on 2026-10-16 against NDI SDK **6.3.2**. The desktop hashes were already
+the primary accepted hashes; no desktop URL-secret or hash update is needed for
+this version. Android uses the Linux-hosted installer in CI.
 
-- Downloads and installs NDI SDK 6
-- Installs LLVM via chocolatey
-- Caches installations for faster subsequent runs
-- Verifies SDK integrity via SHA256 hash
+| Installer | SHA256 |
+| --- | --- |
+| Windows | `4D5DD36A1C7C7634F408BF459B068787CCE6F5310A3EFE832D76B1DDEB54E499` |
+| Apple (macOS/iOS) | `5AA101A01B00494724C60B7E1E15B5D1743BF9C68B61739C22AC54932DDE95FB` |
+| Linux | `F0314F245446DEFC488B63CEB4689ACF1A965AEEFDADACB70571BB216A8CC183` |
+| Android, Linux installer | `895FE323F7329AF86DF5E0A8AD01F708D30362FF2771AE1179794DC1B4ED8668` |
+| Android, Windows installer (download inspected; not used by CI) | `426D1709C05188CFDD230AC4D0B93EB6791571187C78DAE37AA6721ECC1B1E92` |
 
-## setup-ndi-macos
+See [SDK validation](../../docs/sdk-validation.md) for the tested targets and
+cross-compilation instructions. Installer verification does not establish runtime
+coverage for every platform in that installer.
 
-Sets up the NDI SDK on macOS runners.
+## Keeping download links private
 
-- Downloads and installs NDI SDK 6 for macOS
-- Extracts SDK without requiring system-wide installation
-- Caches installations for faster subsequent runs
-- Sets up library paths for dynamic linking
+CI supports these **GitHub Actions repository secrets**, each containing a URL:
 
-## setup-ndi-linux
+| Secret | Installer |
+| --- | --- |
+| `NDI_SDK_URL` | Windows |
+| `NDI_SDK_URL_MACOS` | Apple |
+| `NDI_SDK_URL_LINUX` | Linux |
+| `NDI_SDK_URL_ANDROID` | Android for Linux |
 
-Sets up the NDI SDK on Linux runners.
+The workflow has vendor-hosted fallback URLs when these secrets are absent.
+Personalized links belong only in secrets, never in tracked files, issue/PR
+bodies, or release notes. Keep downloaded SDKs outside the working tree.
+The actions pass URL environment variables to the downloader without printing
+them or interpolating them into shell source.
 
-- Downloads and extracts NDI SDK 6 for Linux
-- Verifies SDK integrity via SHA256 hash allowlist
-- Caches installations for faster subsequent runs
-- Creates the library symlinks expected by the Rust linker
+There is no installer-archive upload step in this repository's current CI. You
+upload the **URL as a secret**, not the SDK binary. A private mirror must provide
+a URL the downloader can access; these actions do not authenticate to private
+GitHub release assets. Do not put SDK installers on public repository releases.
 
-## Configuration
+## Updating to a new SDK
 
-The NDI SDK URLs can be overridden using GitHub secrets:
-- `NDI_SDK_URL` - Windows NDI SDK installer URL
-- `NDI_SDK_URL_MACOS` - macOS NDI SDK installer URL
-- `NDI_SDK_URL_LINUX` - Linux NDI SDK installer URL
+1. Download the installers from NDI into a directory outside the repository.
+   Confirm the installed `Version.txt`/runtime version, not just the installer
+   filename: NDI updates payloads behind the same version-6 URLs.
+2. Compute SHA256 on each complete download (`sha256sum`, `shasum -a 256`, or
+   PowerShell `Get-FileHash -Algorithm SHA256`). Set the corresponding action's
+   `primary` hash to the verified value. Retain prior hashes only when those
+   older SDKs are intentionally still accepted. The first hash determines the
+   cache key, so a new primary hash refreshes the cache.
+3. If the URL changed, use **Settings → Secrets and variables → Actions →
+   Repository secrets**, or run the relevant command below and paste the URL at
+   the private prompt. A new SDK behind the same URL needs no secret change.
 
-## Notes
+   ```bash
+   gh secret set NDI_SDK_URL --repo GrantSparks/grafton-ndi
+   gh secret set NDI_SDK_URL_MACOS --repo GrantSparks/grafton-ndi
+   gh secret set NDI_SDK_URL_LINUX --repo GrantSparks/grafton-ndi
+   gh secret set NDI_SDK_URL_ANDROID --repo GrantSparks/grafton-ndi
+   ```
 
-- The setup actions verify NDI SDK installers against a small allowlist of known-good SHA256 hashes because NDI can rotate installer payloads behind the same download URL
-- All setup actions cache their installations to speed up CI runs
-- The Windows action also installs LLVM which is required for building on Windows
+4. Run the native checks and cross-builds in the validation guide. Update the
+   version/hash table above and describe coverage using platform names and
+   hashes; do not include personalized URLs in the change description.
+5. Run the `Rust CI/CD` workflow after merging. It checks native desktop
+   platforms and links examples for all four Android ABIs. Publishing waits for
+   Android, native tests, formatting, MSRV, and semver checks.
+
+A URL change alone does not invalidate a cache or accept a new installer hash.
+The allowlist is a compatibility mechanism: an accepted older payload can still
+be installed if the configured URL serves it. To require exactly one SDK
+version, remove its predecessors from the allowlist and use a version-pinned
+source under your control.

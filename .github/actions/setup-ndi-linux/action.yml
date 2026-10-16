@@ -1,6 +1,10 @@
-name: 'Setup NDI SDK on Linux'
-description: 'Install NDI SDK for building grafton-ndi on Linux'
+name: 'Setup NDI SDK on a Linux host'
+description: 'Install the Linux or Android NDI SDK for building grafton-ndi'
 inputs:
+  platform:
+    description: 'SDK target platform: linux or android'
+    required: false
+    default: 'linux'
   save-cache:
     description: 'Whether to save the cache after installation'
     required: false
@@ -16,15 +20,27 @@ runs:
         # downloads.ndi.tv can rotate the installer payload for the same URL, so
         # keep the current hash first for cache keys and retain prior known-good
         # hashes as an allowlist.
-        primary='F0314F245446DEFC488B63CEB4689ACF1A965AEEFDADACB70571BB216A8CC183'
-        previous='0BDF66264527F8BE37FA22EDDD2B8514B9868A58A4D83F80A07DBEB479EE14D4'
+        case "$NDI_PLATFORM" in
+          linux)
+            # NDI 6.3.2, verified 2026-10-16.
+            primary='F0314F245446DEFC488B63CEB4689ACF1A965AEEFDADACB70571BB216A8CC183'
+            previous='0BDF66264527F8BE37FA22EDDD2B8514B9868A58A4D83F80A07DBEB479EE14D4'
+            ;;
+          android)
+            primary='895FE323F7329AF86DF5E0A8AD01F708D30362FF2771AE1179794DC1B4ED8668'
+            previous=''
+            ;;
+          *) echo 'Unsupported SDK platform'; exit 1 ;;
+        esac
         ndiHash=$(echo $primary | cut -c1-8)  # Use first 8 chars for cache key
-        echo "key=deps-v3-${ndiHash}-${{ runner.os }}" >> $GITHUB_OUTPUT
+        echo "key=deps-v4-${NDI_PLATFORM}-${ndiHash}-${{ runner.os }}" >> $GITHUB_OUTPUT
         echo "accepted_hashes<<EOF" >> $GITHUB_OUTPUT
         echo "$primary" >> $GITHUB_OUTPUT
         echo "$previous" >> $GITHUB_OUTPUT
         echo "EOF" >> $GITHUB_OUTPUT
       shell: bash
+      env:
+        NDI_PLATFORM: ${{ inputs.platform }}
 
     # Restore cache if available
     - name: Restore cache
@@ -43,14 +59,14 @@ runs:
         NDI_INSTALLER_TAR="${{ runner.temp }}/ndi_sdk_installer.tar.gz"
         NDI_INSTALLER_DIR="${{ runner.temp }}/ndi_installer"
 
-        # Use Linux-specific NDI SDK URL
-        NDI_SDK_URL="${{ env.NDI_SDK_URL_LINUX }}"
-        if [ -z "$NDI_SDK_URL" ]; then
-          NDI_SDK_URL="https://downloads.ndi.tv/SDK/NDI_SDK_Linux/Install_NDI_SDK_v6_Linux.tar.gz"
+        if [ "$NDI_PLATFORM" = android ]; then
+          NDI_SDK_URL="${NDI_SDK_URL_ANDROID:-https://downloads.ndi.tv/SDK/NDI_SDK_Android/Install_NDI_SDK_v6_Android.tar.gz}"
+        else
+          NDI_SDK_URL="${NDI_SDK_URL_LINUX:-https://downloads.ndi.tv/SDK/NDI_SDK_Linux/Install_NDI_SDK_v6_Linux.tar.gz}"
         fi
 
-        echo "Downloading NDI SDK from: $NDI_SDK_URL"
-        curl -L -o "$NDI_INSTALLER_TAR" "$NDI_SDK_URL" || {
+        echo "Downloading NDI SDK..."
+        curl --fail --silent --show-error --location --retry 3 -A 'Mozilla/5.0' -o "$NDI_INSTALLER_TAR" "$NDI_SDK_URL" || {
           echo "Error: Failed to download NDI SDK"
           exit 1
         }
@@ -123,24 +139,24 @@ runs:
         cp -R "$SDK_EXTRACTED"/* "$NDI_SDK_DIR/"
 
         # Create library symlinks for linker compatibility
-        # The SDK ships versioned libraries (e.g., libndi.so.6.1.1) but the linker needs libndi.so
+        # The SDK ships versioned libraries (e.g., libndi.so.6.3.2) but the linker needs libndi.so
         echo "Creating library symlinks..."
-        for libdir in "$NDI_SDK_DIR/lib" "$NDI_SDK_DIR/lib/x86_64-linux-gnu"; do
+        for libdir in "$NDI_SDK_DIR/lib" "$NDI_SDK_DIR"/lib/*; do
           if [ -d "$libdir" ]; then
             cd "$libdir"
             for lib in lib*.so.*.*.*; do
               if [ -f "$lib" ]; then
-                # Extract base name (e.g., libndi from libndi.so.6.1.1)
+                # Extract base name (e.g., libndi.so from libndi.so.6.3.2)
                 base=$(echo "$lib" | sed 's/\.so\..*/.so/')
                 major=$(echo "$lib" | sed 's/.*\.so\.\([0-9]*\)\..*/\1/')
 
-                # Create libndi.so.6 -> libndi.so.6.1.1
+                # Create libndi.so.6 -> libndi.so.6.3.2
                 if [ ! -e "${base}.${major}" ]; then
                   ln -sf "$lib" "${base}.${major}"
                   echo "  Created ${base}.${major} -> $lib"
                 fi
 
-                # Create libndi.so -> libndi.so.6.1.1
+                # Create libndi.so -> libndi.so.6.3.2
                 if [ ! -e "$base" ]; then
                   ln -sf "$lib" "$base"
                   echo "  Created $base -> $lib"
@@ -178,6 +194,8 @@ runs:
           ls -la "$NDI_SDK_DIR/lib/"
         fi
       shell: bash
+      env:
+        NDI_PLATFORM: ${{ inputs.platform }}
 
     # Verify SDK is available (whether from cache or fresh install)
     - name: Verify NDI SDK
@@ -209,7 +227,7 @@ runs:
         if [ -d "$NDI_SDK_DIR/lib/x86_64-linux-gnu" ]; then
           LIB_PATHS="$NDI_SDK_DIR/lib/x86_64-linux-gnu"
           echo "Found x86_64 library directory"
-        elif [ -d "$NDI_SDK_DIR/lib" ]; then
+        elif [ "$NDI_PLATFORM" = linux ] && [ -d "$NDI_SDK_DIR/lib" ]; then
           LIB_PATHS="$NDI_SDK_DIR/lib"
           echo "Found library directory"
         fi
@@ -221,10 +239,12 @@ runs:
 
         echo "NDI SDK setup complete."
       shell: bash
+      env:
+        NDI_PLATFORM: ${{ inputs.platform }}
 
-    # Save cache only from test-and-lint job on main branch
+    # Save opted-in SDK caches only on the main branch.
     - name: Save cache
-      if: inputs.save-cache == 'true' && steps.cache-restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.job == 'test-and-lint'
+      if: inputs.save-cache == 'true' && steps.cache-restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
       uses: actions/cache/save@v5
       with:
         path: |

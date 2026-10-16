@@ -17,6 +17,17 @@ padding safety gaps and corrects SDK frame layout and timeout handling.
 Private `NDI` construction, owned async video submissions, and optional borrowed
 video data access are breaking API changes. See the [1.x to 2.0 migration guide](docs/migration/1.x-to-2.0.md).
 
+### SDK and platform compatibility
+
+- Validate the existing APIs against NDI SDK 6.3.2 and document installer hashes
+  and private URL-secret maintenance.
+- Add Android library selection for ARM64, ARMv7, x86, and x86_64, with NDK
+  example-linking CI coverage. Recognize Windows installer directory casing on
+  Linux cross-compilation hosts.
+- Prepare Linux linker symlinks for every SDK architecture. Prevent macOS setup
+  from bypassing installer hash verification through an existing system SDK or
+  an incomplete cache.
+
 ### Breaking Changes
 
 - Receivers have sealed `RawCapture` and `FrameSyncAttached` modes. FrameSync's

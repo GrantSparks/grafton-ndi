@@ -16,6 +16,7 @@ runs:
         # downloads.ndi.tv can rotate the installer payload for the same URL, so
         # keep the current hash first for cache keys and retain prior known-good
         # hashes as an allowlist.
+        # NDI 6.3.2, verified 2026-10-16.
         $primary = '4D5DD36A1C7C7634F408BF459B068787CCE6F5310A3EFE832D76B1DDEB54E499'
         $previous = '97E8993C6B94213A950E6ACBE9AA4D35831D137324D762F7C74851D3FEEF80D9'
         $ndiHash = $primary.Substring(0, 8)  # Use first 8 chars for cache key
@@ -52,7 +53,8 @@ runs:
         $NDI_SDK_INSTALLER = "${{ runner.temp }}\NDI_SDK_Installer.exe"
 
         Write-Host "Downloading NDI SDK..."
-        curl -L -o "$NDI_SDK_INSTALLER" "${{ env.NDI_SDK_URL }}"
+        curl.exe --fail --silent --show-error --location --retry 3 -A "Mozilla/5.0" -o "$NDI_SDK_INSTALLER" "$env:NDI_SDK_URL"
+        if ($LASTEXITCODE -ne 0) { throw "NDI SDK download failed" }
 
         # Verify SHA256 hash
         Write-Host "Verifying NDI SDK integrity..."

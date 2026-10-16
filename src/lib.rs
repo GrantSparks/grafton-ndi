@@ -101,11 +101,20 @@
 //! semver checks) against the NDI SDK.
 //!
 //! - **Windows**: Links the NDI SDK import library at build time; requires the
-//!   NDI runtime DLLs at runtime.
+//!   NDI runtime DLLs at runtime. Supports x86 and x86_64 MSVC targets.
 //! - **Linux**: Supports both standard and Advanced SDK install directories;
-//!   the runtime libraries must be discoverable by the dynamic linker.
+//!   the runtime libraries must be discoverable by the dynamic linker. Uses
+//!   GNU/glibc targets for x86, x86_64, ARMv6/ARMv7 hard-float, and ARM64.
 //! - **macOS**: Supports current NDI SDK package layouts used by the CI setup
 //!   action and common local install paths.
+//! - **Android**: Cross-build CI links examples for ARM64, ARMv7, x86, and x86_64.
+//!   Set `NDI_SDK_DIR` to the Android NDI SDK and configure the Android NDK
+//!   linker/sysroot. Device runtime testing is separate from build coverage.
+//!
+//! The current APIs are validated with NDI SDK 6.3.2. Apple mobile targets,
+//! including iOS, are not currently selected by the build script. See the
+//! [SDK validation guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/sdk-validation.md)
+//! for exact target coverage and cross-compilation commands.
 
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]

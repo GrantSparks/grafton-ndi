@@ -30,6 +30,10 @@ pub fn library_subdirs(os: &str, arch: &str, target: &str) -> Result<Vec<&'stati
         ("macos", "x86_64" | "aarch64") => Ok(vec!["macOS", ""]),
         ("windows", "x86_64") if target.ends_with("-msvc") => Ok(vec!["x64"]),
         ("windows", "x86") if target.ends_with("-msvc") => Ok(vec!["x86"]),
+        ("android", "aarch64") if target == "aarch64-linux-android" => Ok(vec!["arm64-v8a"]),
+        ("android", "arm") if target == "armv7-linux-androideabi" => Ok(vec!["armeabi-v7a"]),
+        ("android", "x86") if target == "i686-linux-android" => Ok(vec!["x86"]),
+        ("android", "x86_64") if target == "x86_64-linux-android" => Ok(vec!["x86_64"]),
         _ => Err(format!(
             "Unsupported NDI SDK target {target} (OS {os}, architecture {arch})"
         )),
@@ -44,7 +48,7 @@ pub fn select_library(
 ) -> Result<(PathBuf, &'static str, &'static str), String> {
     let subdirs = library_subdirs(os, arch, target)?;
     let candidates: &[(&str, &str, &str)] = match os {
-        "linux" => &[
+        "linux" | "android" => &[
             ("libndi_advanced.so", "ndi_advanced", "dylib"),
             ("libndi.so", "ndi", "dylib"),
         ],
@@ -62,8 +66,15 @@ pub fn select_library(
         _ => unreachable!("validated target"),
     };
     let mut searched = Vec::new();
+    // Windows installers use Lib/Include. Keep their casing usable when
+    // cross-compiling on a case-sensitive host, without modifying the SDK.
+    let lib_root = if os == "windows" && sdk.join("Lib").is_dir() {
+        sdk.join("Lib")
+    } else {
+        sdk.join("lib")
+    };
     for subdir in subdirs {
-        let directory = sdk.join("lib").join(subdir);
+        let directory = lib_root.join(subdir);
         for &(artifact, name, kind) in candidates {
             let path = directory.join(artifact);
             if path.is_file() {
@@ -187,6 +198,49 @@ mod tests {
         assert_eq!(
             select_library(&sdk, "linux", "aarch64", target).unwrap(),
             (generic, "ndi", "dylib")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selects_android_libraries_for_each_abi_without_linux_fallback() {
+        let root =
+            std::env::temp_dir().join(format!("grafton-android-build-test-{}", std::process::id()));
+        let linux = root.join("lib/x86_64-linux-gnu");
+        std::fs::create_dir_all(&linux).unwrap();
+        std::fs::write(linux.join("libndi.so"), []).unwrap();
+        for (arch, target, abi) in [
+            ("aarch64", "aarch64-linux-android", "arm64-v8a"),
+            ("arm", "armv7-linux-androideabi", "armeabi-v7a"),
+            ("x86", "i686-linux-android", "x86"),
+            ("x86_64", "x86_64-linux-android", "x86_64"),
+        ] {
+            assert!(select_library(&root, "android", arch, target).is_err());
+            let lib = root.join("lib").join(abi);
+            std::fs::create_dir_all(&lib).unwrap();
+            std::fs::write(lib.join("libndi.so"), []).unwrap();
+            assert_eq!(
+                select_library(&root, "android", arch, target).unwrap(),
+                (lib, "ndi", "dylib")
+            );
+        }
+        assert!(library_subdirs("android", "arm", "arm-linux-androideabi").is_err());
+        assert!(library_subdirs("android", "riscv64", "riscv64-linux-android").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selects_windows_installer_casing_on_case_sensitive_hosts() {
+        let root = std::env::temp_dir().join(format!(
+            "grafton-windows-casing-test-{}",
+            std::process::id()
+        ));
+        let lib = root.join("Lib/x64");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("Processing.NDI.Lib.x64.lib"), []).unwrap();
+        assert_eq!(
+            select_library(&root, "windows", "x86_64", "x86_64-pc-windows-msvc").unwrap(),
+            (lib, "Processing.NDI.Lib.x64", "static")
         );
         std::fs::remove_dir_all(root).unwrap();
     }

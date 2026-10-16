@@ -216,7 +216,9 @@ Contributions use the repository's [Apache-2.0 license](LICENSE).
 
 The platform setup actions and their configuration are documented in
 [.github/actions/README.md](.github/actions/README.md). Changes to CI installers
-should include the source URL, verified SHA256, and affected platform checks.
+should identify the SDK version, verified SHA256, and affected platform checks.
+Keep personalized source URLs in GitHub Actions secrets; never include them in
+tracked files, issues, pull requests, or release notes.
 Installer payloads are checked against allowlists; cache keys include the primary
 accepted hash. Changing a download URL alone neither refreshes an existing cache
 nor allows an unrecognized payload. These are maintainer configuration changes,

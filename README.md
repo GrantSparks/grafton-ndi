@@ -75,10 +75,11 @@ Feature flags:
 
 ### Prerequisites
 
-1. **NDI SDK 6.x**: Install the [NDI SDK](https://ndi.video/for-developers/ndi-sdk/) for your platform.
+1. **NDI SDK 6.x** (validated with 6.3.2): Install the [NDI SDK](https://ndi.video/for-developers/ndi-sdk/) for your platform.
    - Windows default: `C:\Program Files\NDI\NDI 6 SDK`
    - Linux defaults: `/usr/share/NDI Advanced SDK for Linux` or `/usr/share/NDI SDK for Linux`
    - macOS defaults include `/Library/NDI SDK for macOS`, `/Library/NDI SDK for Apple`, and `/Library/NDI 6 SDK`
+   - Android: set `NDI_SDK_DIR` to the Android SDK and use the Android NDK for cross-compilation.
    - Set `NDI_SDK_DIR` when the SDK is installed elsewhere.
 
 2. **Rust**: Rust 1.87 or later.
@@ -357,6 +358,12 @@ Sending:
 | Windows | CI-tested | Uses the NDI SDK import library at build time and NDI runtime DLLs at runtime. |
 | Linux | CI-tested | Supports standard and Advanced SDK install directories; runtime libraries must be discoverable by the dynamic linker. |
 | macOS | CI-tested | Supports current NDI SDK package layouts used by the CI setup action and common local install paths. |
+| Android | Cross-build CI | ARM64, ARMv7, x86, and x86_64; requires the Android NDI SDK and NDK. Device runtime testing is separate. |
+
+NDI 6.3.2 build and runtime coverage, target triples, and cross-compilation
+commands are recorded in the [SDK validation guide](docs/sdk-validation.md).
+Windows uses the MSVC ABI; Linux uses GNU/glibc. Apple mobile targets (including
+iOS) are not currently selected by the build script.
 
 ## Development
 
