@@ -255,7 +255,7 @@ The crate's public API is organized around a small set of resource types:
 - `FrameSync` wraps a receiver for clock-corrected pull capture.
 - `VideoFrame`, `AudioFrame`, and `MetadataFrame` represent application-owned frame data.
 
-Most applications can start with owned frame APIs such as `receiver.video().capture()` and `sender.send_video()`. For receive hot paths, borrowed receive refs keep data in SDK buffers without an extra copy. Borrowed async-send video frames describe application buffers; the sender copies pixels and metadata into its own retained snapshot so forgetting a completion token cannot invalidate SDK pointers.
+Most applications can start with owned frame APIs such as `receiver.video().capture()` and `sender.send_video()`. For receive hot paths, borrowed receive refs keep data in SDK buffers without an extra copy. Async `sender.send_video_async(frame)` moves an owned `VideoFrame` into the sender without copying pixels and returns the previous completed frame for reuse. Use two frames and call `finish_video_async()` to recover the final frame. For borrowed buffers, `send_video_async_copy(&frame)` explicitly copies pixels and metadata into sender-owned storage and returns a completion token.
 
 Frame layout fields that describe SDK-facing memory are private. Builders, accessors, checked mutation methods, and `PixelFormat` helpers keep dimensions, strides, metadata, and buffer sizes consistent before data crosses the FFI boundary.
 
@@ -264,7 +264,7 @@ Frame layout fields that describe SDK-facing memory are private. Builders, acces
 `grafton-ndi` aims to be a predictable Rust layer over NDI, not a replacement for the NDI SDK documentation.
 
 - **Small FFI boundary**: generated bindings live behind safe wrappers.
-- **RAII lifecycle**: NDI handles, senders, receivers, frames, and async send tokens clean up through ownership.
+- **RAII lifecycle**: NDI handles, senders, receivers, frames, and pending async sends clean up through ownership.
 - **Checked frame descriptions**: frame dimensions, line strides, channel strides, metadata strings, and buffer sizes are validated before slices or strings are exposed.
 - **Explicit blocking behavior**: synchronous methods block with checked timeouts; async adapters use `spawn_blocking`.
 - **Forward-compatible SDK enums**: public SDK-mode enums that may grow are `#[non_exhaustive]`.
@@ -273,12 +273,12 @@ Frame layout fields that describe SDK-facing memory are private. Builders, acces
 
 - Use owned frame APIs when clarity matters or when frame data must outlive the SDK capture buffer.
 - Use borrowed receive refs when you need direct access to SDK-owned buffers during a tight capture loop.
-- Use borrowed async-send video frames to describe application buffers for asynchronous transmission; sending copies pixels and metadata into a sender-owned snapshot.
+- Use two owned video frames with `send_video_async` to reuse pixel allocations without per-send copies; use `send_video_async_copy` when borrowing external buffers is more convenient.
 - Use `FrameSync` when capture timing is driven by an external output clock.
 - Use lower bandwidth modes for previews and monitoring surfaces.
 - Keep image encoding off real-time paths unless the workload is sized for compression.
 
-The compile-contract tests in `tests/ui` verify the important lifetime rules around borrowed receive refs and async send tokens.
+The compile-contract tests in `tests/ui` verify the important lifetime rules around borrowed receive refs and owned async submissions and copied-send tokens.
 
 ## Image Encoding
 
@@ -326,8 +326,9 @@ Sending:
 
 - `NDIlib_Send_Audio.rs` - Send audio.
 - `NDIlib_Send_Video.rs` - Send video.
-- `async_send.rs` - Demonstrate async video send tokens and completion callbacks.
-- `zero_copy_send.rs` - Send borrowed video buffers using a sender-owned async snapshot (historical filename).
+- `async_send.rs` - Reuse two owned frames for async sending and recover completed frames.
+- `async_send_copy.rs` - Explicitly copy borrowed pixels into an async-send snapshot.
+- `zero_copy_send.rs` - Render into two reusable owned frames without per-send pixel copies.
 
 ## Platform Support
 
