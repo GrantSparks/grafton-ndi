@@ -1,8 +1,8 @@
 //! NDI receiving functionality for video, audio, and metadata.
 //!
-//! # Monitoring Tally & Connection Count
+//! # Monitoring Connection Status
 //!
-//! The receiver can monitor status changes including tally state and connection count:
+//! The receiver can monitor connection status changes:
 //!
 //! ```ignore
 //! # use grafton_ndi::{NDI, ReceiverOptions, ReceiverBandwidth, Source};
@@ -18,13 +18,7 @@
 //!
 //! // Poll for status changes
 //! if let Some(status) = receiver.poll_status_change(Duration::from_millis(1000))? {
-//!     if let Some(tally) = status.tally {
-//!         println!("Tally: program={program}, preview={preview}",
-//!                  program = tally.on_program, preview = tally.on_preview);
-//!     }
-//!     if let Some(connections) = status.connections {
-//!         println!("Active connections: {connections}");
-//!     }
+//!     println!("Active connections: {}", status.connections);
 //! }
 //! # Ok(())
 //! # }
@@ -34,15 +28,17 @@ use std::{
     ffi::CString,
     marker::PhantomData,
     ptr,
-    sync::{PoisonError, RwLock, RwLockReadGuard},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
+
+use parking_lot::{RwLock, RwLockReadGuard};
 
 use crate::{
     capture::{capture_raw, AudioKind, CaptureKind, CaptureResult, MetadataKind, VideoKind},
     finder::{RawSource, Source},
     ndi_lib::*,
-    to_ms_checked, Error, Result, NDI,
+    to_ms_checked, Error, MetadataFrame, Result, NDI,
 };
 
 /// Retry policy configuration for frame capture operations.
@@ -165,6 +161,26 @@ where
                 }
             }
         }
+    }
+}
+
+fn validate_ptz_value(name: &str, value: f32, min: f32, max: f32) -> Result<()> {
+    if value.is_finite() && (min..=max).contains(&value) {
+        Ok(())
+    } else {
+        Err(Error::InvalidConfiguration(format!(
+            "{name} must be finite and within {min}..={max}"
+        )))
+    }
+}
+
+fn validate_ptz_preset(preset: i64) -> Result<i32> {
+    if (0..=99).contains(&preset) {
+        Ok(preset as i32)
+    } else {
+        Err(Error::InvalidConfiguration(
+            "PTZ preset must be within 0..=99".into(),
+        ))
     }
 }
 
@@ -449,10 +465,9 @@ impl ReceiverOptionsBuilder {
             .allow_video_fields(true)
     }
 
-    /// Preset for metadata and tally monitoring only (no video/audio).
+    /// Preset for metadata and connection monitoring only (no video/audio).
     ///
     /// This preset is optimized for:
-    /// - Tally light monitoring
     /// - Connection status tracking
     /// - PTZ control applications
     /// - Minimal bandwidth overhead
@@ -473,19 +488,13 @@ impl ReceiverOptionsBuilder {
     /// # finder.wait_for_sources(Duration::from_secs(1))?;
     /// # let sources = finder.current_sources()?;
     /// let options = ReceiverOptionsBuilder::monitoring_preset(sources[0].clone())
-    ///     .name("Tally Monitor")
+    ///     .name("Status Monitor")
     ///     .build();
     /// let receiver = Receiver::new(&ndi, &options)?;
     ///
     /// // Poll for status changes
     /// if let Some(status) = receiver.poll_status_change(Duration::from_millis(1000))? {
-    ///     if let Some(tally) = status.tally {
-    ///         println!("Tally: program={program}, preview={preview}",
-    ///                  program = tally.on_program, preview = tally.on_preview);
-    ///     }
-    ///     if let Some(connections) = status.connections {
-    ///         println!("Active connections: {connections}");
-    ///     }
+    ///     println!("Active connections: {}", status.connections);
     /// }
     /// # Ok(())
     /// # }
@@ -564,6 +573,7 @@ pub struct Receiver {
     /// `NDIlib_recv_capture_v3` on the same instance — the one combination the
     /// SDK does not make safe — without otherwise serializing capture.
     capture_guard: RwLock<()>,
+    framesync_attached: AtomicBool,
 }
 
 impl Receiver {
@@ -580,18 +590,36 @@ impl Receiver {
                 _ndi: ndi.clone(),
                 source: create.source_to_connect_to.clone(),
                 capture_guard: RwLock::new(()),
+                framesync_attached: AtomicBool::new(false),
             })
         }
     }
 
-    /// Acquire the shared capture guard, held for the duration of a single
-    /// `NDIlib_recv_capture_v3` call. Multiple captures proceed concurrently;
-    /// only [`Self::reconnect`] takes the guard exclusively. The guarded data
-    /// is `()`, so a poisoned lock carries no invalid state and is recovered.
-    fn capture_lock(&self) -> RwLockReadGuard<'_, ()> {
-        self.capture_guard
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
+    /// Acquire only within the caller's existing budget, including contention.
+    fn capture_lock_until(&self, deadline: Instant) -> Option<RwLockReadGuard<'_, ()>> {
+        self.capture_guard.try_read_until(deadline)
+    }
+
+    pub(crate) fn set_framesync_attached(&self, attached: bool) {
+        self.framesync_attached.store(attached, Ordering::Release);
+    }
+
+    /// Publish this receiver's program/preview tally upstream.
+    ///
+    /// Returns the SDK's status flag unchanged. SDK implementations may report
+    /// success while disconnected; use [`Self::is_connected`] to check the
+    /// connection. The SDK retains tally state for future connections.
+    pub fn set_tally(&self, tally: &Tally) -> bool {
+        unsafe { NDIlib_recv_set_tally(self.instance, &tally.to_raw()) }
+    }
+
+    /// Send metadata upstream and return the SDK's status flag unchanged.
+    ///
+    /// This flag is not a connection query; use [`Self::is_connected`] for that.
+    /// Returns an error for invalid metadata before calling the SDK.
+    pub fn send_metadata(&self, metadata: &MetadataFrame) -> Result<bool> {
+        let (_data, raw) = metadata.to_raw()?;
+        Ok(unsafe { NDIlib_recv_send_metadata(self.instance, &raw) })
     }
 
     pub fn ptz_is_supported(&self) -> bool {
@@ -599,16 +627,19 @@ impl Receiver {
     }
 
     pub fn ptz_recall_preset(&self, preset: u32, speed: f32) -> Result<()> {
+        let preset = validate_ptz_preset(i64::from(preset))?;
+        validate_ptz_value("speed", speed, 0.0, 1.0)?;
         ptz_command!(
             self,
             NDIlib_recv_ptz_recall_preset,
-            preset as i32,
+            preset,
             speed,
             format!("Failed to recall PTZ preset {preset} with speed {speed}")
         )
     }
 
     pub fn ptz_zoom(&self, zoom_value: f32) -> Result<()> {
+        validate_ptz_value("zoom_value", zoom_value, 0.0, 1.0)?;
         ptz_command!(
             self,
             NDIlib_recv_ptz_zoom,
@@ -618,6 +649,7 @@ impl Receiver {
     }
 
     pub fn ptz_zoom_speed(&self, zoom_speed: f32) -> Result<()> {
+        validate_ptz_value("zoom_speed", zoom_speed, -1.0, 1.0)?;
         ptz_command!(
             self,
             NDIlib_recv_ptz_zoom_speed,
@@ -627,6 +659,8 @@ impl Receiver {
     }
 
     pub fn ptz_pan_tilt(&self, pan_value: f32, tilt_value: f32) -> Result<()> {
+        validate_ptz_value("pan_value", pan_value, -1.0, 1.0)?;
+        validate_ptz_value("tilt_value", tilt_value, -1.0, 1.0)?;
         ptz_command!(
             self,
             NDIlib_recv_ptz_pan_tilt,
@@ -637,6 +671,8 @@ impl Receiver {
     }
 
     pub fn ptz_pan_tilt_speed(&self, pan_speed: f32, tilt_speed: f32) -> Result<()> {
+        validate_ptz_value("pan_speed", pan_speed, -1.0, 1.0)?;
+        validate_ptz_value("tilt_speed", tilt_speed, -1.0, 1.0)?;
         ptz_command!(
             self,
             NDIlib_recv_ptz_pan_tilt_speed,
@@ -647,6 +683,7 @@ impl Receiver {
     }
 
     pub fn ptz_store_preset(&self, preset_no: i32) -> Result<()> {
+        let preset_no = validate_ptz_preset(i64::from(preset_no))?;
         ptz_command!(
             self,
             NDIlib_recv_ptz_store_preset,
@@ -664,6 +701,7 @@ impl Receiver {
     }
 
     pub fn ptz_focus(&self, focus_value: f32) -> Result<()> {
+        validate_ptz_value("focus_value", focus_value, 0.0, 1.0)?;
         ptz_command!(
             self,
             NDIlib_recv_ptz_focus,
@@ -673,6 +711,7 @@ impl Receiver {
     }
 
     pub fn ptz_focus_speed(&self, focus_speed: f32) -> Result<()> {
+        validate_ptz_value("focus_speed", focus_speed, -1.0, 1.0)?;
         ptz_command!(
             self,
             NDIlib_recv_ptz_focus_speed,
@@ -714,6 +753,8 @@ impl Receiver {
     }
 
     pub fn ptz_white_balance_manual(&self, red: f32, blue: f32) -> Result<()> {
+        validate_ptz_value("red", red, 0.0, 1.0)?;
+        validate_ptz_value("blue", blue, 0.0, 1.0)?;
         ptz_command!(
             self,
             NDIlib_recv_ptz_white_balance_manual,
@@ -732,6 +773,7 @@ impl Receiver {
     }
 
     pub fn ptz_exposure_manual(&self, exposure_level: f32) -> Result<()> {
+        validate_ptz_value("exposure_level", exposure_level, 0.0, 1.0)?;
         ptz_command!(
             self,
             NDIlib_recv_ptz_exposure_manual,
@@ -741,6 +783,9 @@ impl Receiver {
     }
 
     pub fn ptz_exposure_manual_v2(&self, iris: f32, gain: f32, shutter_speed: f32) -> Result<()> {
+        validate_ptz_value("iris", iris, 0.0, 1.0)?;
+        validate_ptz_value("gain", gain, 0.0, 1.0)?;
+        validate_ptz_value("shutter_speed", shutter_speed, 0.0, 1.0)?;
         ptz_command!(
             self,
             NDIlib_recv_ptz_exposure_manual_v2,
@@ -854,10 +899,25 @@ impl Receiver {
     /// `NDIlib_recv_capture_v3` call, so it runs concurrently with other
     /// captures but never overlaps a [`reconnect`](Self::reconnect).
     fn capture_ref_kind<K: CaptureKind>(&self, timeout: Duration) -> Result<Option<K::Ref<'_>>> {
-        let timeout_ms = to_ms_checked(timeout)?;
+        to_ms_checked(timeout)?;
+        self.capture_ref_kind_until::<K>(Instant::now() + timeout)
+    }
 
-        // Shared guard: excludes a concurrent `reconnect`, not other captures.
-        let _capture = self.capture_lock();
+    fn capture_ref_kind_until<K: CaptureKind>(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<K::Ref<'_>>> {
+        if self.framesync_attached.load(Ordering::Acquire)
+            && std::any::TypeId::of::<K>() == std::any::TypeId::of::<VideoKind>()
+        {
+            return Err(Error::InvalidConfiguration(
+                "Raw video capture is unavailable while FrameSync is attached".into(),
+            ));
+        }
+        let Some(_capture) = self.capture_lock_until(deadline) else {
+            return Ok(None);
+        };
+        let timeout_ms = to_ms_checked(deadline.saturating_duration_since(Instant::now()))?;
         // SAFETY: self.instance is a valid NDI receiver instance.
         match unsafe { capture_raw::<K>(self.instance, timeout_ms) } {
             CaptureResult::Frame(guard) => {
@@ -881,15 +941,32 @@ impl Receiver {
         }
     }
 
+    pub(crate) fn try_capture_kind_until<K: CaptureKind>(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<K::Owned>> {
+        match self.capture_ref_kind_until::<K>(deadline)? {
+            Some(frame_ref) => Ok(Some(K::ref_to_owned(&frame_ref)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Retried owned capture backing every [`Capture::capture`].
     ///
     /// Polls [`try_capture_kind`](Self::try_capture_kind) under the default
     /// [`RetryPolicy`], absorbing the SDK's initial-sync misses where it returns
     /// `none` immediately instead of blocking for the full timeout.
     pub(crate) fn capture_kind<K: CaptureKind>(&self, timeout: Duration) -> Result<K::Owned> {
-        retry_capture(timeout, &RetryPolicy::default(), |poll| {
-            self.try_capture_kind::<K>(poll)
-        })
+        to_ms_checked(timeout)?;
+        self.capture_kind_until::<K>(Instant::now() + timeout)
+    }
+
+    pub(crate) fn capture_kind_until<K: CaptureKind>(&self, deadline: Instant) -> Result<K::Owned> {
+        retry_capture(
+            deadline.saturating_duration_since(Instant::now()),
+            &RetryPolicy::default(),
+            |poll| self.try_capture_kind_until::<K>(deadline.min(Instant::now() + poll)),
+        )
     }
 
     /// Check if the receiver is still connected to its source.
@@ -961,10 +1038,7 @@ impl Receiver {
         let raw = self.source.to_raw()?;
         // Exclusive guard: waits for in-flight captures to drain and blocks new
         // ones, so `NDIlib_recv_connect` never overlaps `NDIlib_recv_capture_v3`.
-        let _exclusive = self
-            .capture_guard
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
+        let _exclusive = self.capture_guard.write();
         // SAFETY: `self.instance` is a valid receiver instance for the
         // lifetime of `self`, and `raw` (which owns the backing
         // CStrings) outlives the call, so the pointers inside `raw.raw`
@@ -1055,7 +1129,7 @@ impl Receiver {
         }
     }
 
-    /// Poll for status changes (tally, connections, etc.)
+    /// Poll for SDK receiver status changes.
     ///
     /// # Arguments
     ///
@@ -1065,15 +1139,21 @@ impl Receiver {
     /// # Returns
     ///
     /// * `Some(ReceiverStatus)` - Status has changed
-    /// * `None` - Timeout occurred with no status change
+    /// * `None` - Timeout occurred with no status change, including when a
+    ///   reconnect holds the capture lock for the remaining budget.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`],
+    /// or [`Error::CaptureFailed`] if the SDK reports a lost connection.
+    /// The budget includes lock contention; SDK calls may overshoot it.
     pub fn poll_status_change(&self, timeout: Duration) -> Result<Option<ReceiverStatus>> {
-        let timeout_ms = to_ms_checked(timeout)?;
-        // Shared guard: excludes a concurrent `reconnect`, not other captures.
-        let _capture = self.capture_lock();
+        to_ms_checked(timeout)?;
+        let deadline = Instant::now() + timeout;
+        let Some(_capture) = self.capture_lock_until(deadline) else {
+            return Ok(None);
+        };
+        let timeout_ms = to_ms_checked(deadline.saturating_duration_since(Instant::now()))?;
         // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
         let frame_type = unsafe {
             NDIlib_recv_capture_v3(
@@ -1085,33 +1165,24 @@ impl Receiver {
             )
         };
 
-        match frame_type {
-            NDIlib_frame_type_e_NDIlib_frame_type_status_change => {
-                // Note: NDI SDK doesn't provide recv_get_tally, so we can't query current tally state
-                // We would need to track it from set_tally calls
-                let tally = None;
+        status_from_frame(frame_type, || unsafe {
+            NDIlib_recv_get_no_connections(self.instance).max(0) as u32
+        })
+    }
+}
 
-                // Get number of connections
-                let connections = {
-                    let conn_count = unsafe { NDIlib_recv_get_no_connections(self.instance) };
-                    if conn_count >= 0 {
-                        Some(conn_count)
-                    } else {
-                        None
-                    }
-                };
-
-                let has_tally = tally.is_some();
-                let has_connections = connections.is_some();
-
-                Ok(Some(ReceiverStatus {
-                    tally,
-                    connections,
-                    other: !has_tally && !has_connections,
-                }))
-            }
-            _ => Ok(None),
+fn status_from_frame(
+    frame_type: NDIlib_frame_type_e,
+    connections: impl FnOnce() -> u32,
+) -> Result<Option<ReceiverStatus>> {
+    match frame_type {
+        NDIlib_frame_type_e_NDIlib_frame_type_status_change => Ok(Some(ReceiverStatus {
+            connections: connections(),
+        })),
+        NDIlib_frame_type_e_NDIlib_frame_type_error => {
+            Err(Error::CaptureFailed("Received an error frame".into()))
         }
+        _ => Ok(None),
     }
 }
 
@@ -1156,7 +1227,9 @@ impl<'rx, K: CaptureKind> Capture<'rx, K> {
     ///
     /// `timeout` is a total retry budget; each individual SDK poll is capped to
     /// the remaining budget, and [`Duration::ZERO`] performs exactly one
-    /// non-blocking attempt.
+    /// non-blocking attempt. Waiting for a reconnect lock consumes the same
+    /// budget. The SDK itself may return after its requested timeout, so this
+    /// budget is not a strict wall-clock completion guarantee.
     ///
     /// # Arguments
     ///
@@ -1229,14 +1302,15 @@ unsafe impl Send for Receiver {}
 /// safely called from multiple threads simultaneously.
 unsafe impl Sync for Receiver {}
 
+/// An SDK status-change notification and the current connection count.
+///
+/// The event may also indicate changed source capabilities or web control;
+/// the SDK does not identify a specific changed field. Tally is published
+/// upstream through [`Receiver::set_tally`], rather than received here.
 #[derive(Debug, Clone)]
 pub struct ReceiverStatus {
-    /// Current Tally (program/preview) if known
-    pub tally: Option<Tally>,
-    /// Number of active connections (None if unknown)
-    pub connections: Option<i32>,
-    /// True when the receiver reports any other change (latency, PTZ, etc.)
-    pub other: bool,
+    /// Current number of connected sources (normally zero or one).
+    pub connections: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -1323,12 +1397,7 @@ impl ConnectionStats {
     /// assert_eq!(stats.video_drop_percentage(), 10.0);
     /// ```
     pub fn video_drop_percentage(&self) -> f64 {
-        let total = self.video_frames_received + self.video_frames_dropped;
-        if total == 0 {
-            0.0
-        } else {
-            (self.video_frames_dropped as f64 / total as f64) * 100.0
-        }
+        drop_percentage(self.video_frames_received, self.video_frames_dropped)
     }
 
     /// Calculate audio frame drop percentage.
@@ -1336,12 +1405,7 @@ impl ConnectionStats {
     /// Returns the percentage of audio frames that were dropped out of the total
     /// received + dropped. Returns 0.0 if no frames have been received.
     pub fn audio_drop_percentage(&self) -> f64 {
-        let total = self.audio_frames_received + self.audio_frames_dropped;
-        if total == 0 {
-            0.0
-        } else {
-            (self.audio_frames_dropped as f64 / total as f64) * 100.0
-        }
+        drop_percentage(self.audio_frames_received, self.audio_frames_dropped)
     }
 
     /// Calculate metadata frame drop percentage.
@@ -1349,12 +1413,7 @@ impl ConnectionStats {
     /// Returns the percentage of metadata frames that were dropped out of the total
     /// received + dropped. Returns 0.0 if no frames have been received.
     pub fn metadata_drop_percentage(&self) -> f64 {
-        let total = self.metadata_frames_received + self.metadata_frames_dropped;
-        if total == 0 {
-            0.0
-        } else {
-            (self.metadata_frames_dropped as f64 / total as f64) * 100.0
-        }
+        drop_percentage(self.metadata_frames_received, self.metadata_frames_dropped)
     }
 
     /// Check if the receiver is currently connected.
@@ -1362,6 +1421,15 @@ impl ConnectionStats {
     /// Returns `true` if there is at least one active connection.
     pub fn is_connected(&self) -> bool {
         self.connections > 0
+    }
+}
+
+fn drop_percentage(received: u64, dropped: u64) -> f64 {
+    let total = u128::from(received) + u128::from(dropped);
+    if total == 0 {
+        0.0
+    } else {
+        (dropped as f64 / total as f64) * 100.0
     }
 }
 
@@ -1405,6 +1473,127 @@ mod tests {
             raw.raw.bandwidth,
             NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_max
         );
+    }
+
+    #[test]
+    fn status_preserves_connection_errors_and_reports_connection_count() {
+        assert!(matches!(
+            status_from_frame(NDIlib_frame_type_e_NDIlib_frame_type_error, || panic!(
+                "must not query"
+            )),
+            Err(Error::CaptureFailed(_))
+        ));
+        assert!(
+            status_from_frame(NDIlib_frame_type_e_NDIlib_frame_type_none, || panic!(
+                "must not query"
+            ))
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            status_from_frame(NDIlib_frame_type_e_NDIlib_frame_type_status_change, || 1)
+                .unwrap()
+                .unwrap()
+                .connections,
+            1
+        );
+    }
+
+    #[test]
+    fn drop_rates_handle_extreme_public_counters() {
+        assert_eq!(drop_percentage(0, 0), 0.0);
+        assert_eq!(drop_percentage(900, 100), 10.0);
+        assert_eq!(drop_percentage(u64::MAX, u64::MAX), 50.0);
+        assert_eq!(drop_percentage(0, u64::MAX), 100.0);
+    }
+
+    #[test]
+    fn ptz_rejects_invalid_commands_before_calling_sdk() {
+        let ndi = NDI::new().unwrap();
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        for result in [
+            receiver.ptz_recall_preset(u32::MAX, 0.5),
+            receiver.ptz_recall_preset(100, 0.5),
+            receiver.ptz_recall_preset(0, f32::NAN),
+            receiver.ptz_store_preset(-1),
+            receiver.ptz_zoom(f32::INFINITY),
+            receiver.ptz_zoom_speed(-1.1),
+            receiver.ptz_pan_tilt(0.0, 1.1),
+            receiver.ptz_pan_tilt_speed(f32::NAN, 0.0),
+            receiver.ptz_focus(-0.1),
+            receiver.ptz_focus_speed(1.1),
+            receiver.ptz_white_balance_manual(0.0, 1.1),
+            receiver.ptz_exposure_manual(f32::NEG_INFINITY),
+            receiver.ptz_exposure_manual_v2(0.5, f32::NAN, 0.5),
+        ] {
+            assert!(matches!(result, Err(Error::InvalidConfiguration(_))));
+        }
+        assert_eq!(validate_ptz_preset(0).unwrap(), 0);
+        assert_eq!(validate_ptz_preset(99).unwrap(), 99);
+        assert!(validate_ptz_value("speed", -1.0, -1.0, 1.0).is_ok());
+        assert!(validate_ptz_value("speed", 1.0, -1.0, 1.0).is_ok());
+    }
+
+    #[test]
+    fn outbound_controls_accept_invocation_without_a_source() {
+        let ndi = NDI::new().unwrap();
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        // Runtime implementations differ in their status flags when no source
+        // is connected. These controls must remain callable in that state.
+        let _sdk_status = receiver.set_tally(&Tally::new(true, false));
+        receiver.send_metadata(&MetadataFrame::new()).unwrap();
+    }
+
+    #[test]
+    fn capture_contention_obeys_zero_and_bounded_budgets() {
+        let ndi = NDI::new().unwrap();
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let exclusive = receiver.capture_guard.write();
+        std::thread::scope(|scope| {
+            let (done, completed) = std::sync::mpsc::channel();
+            let receiver = &receiver;
+            let worker = scope.spawn(move || {
+                assert!(receiver
+                    .video()
+                    .try_capture(Duration::ZERO)
+                    .unwrap()
+                    .is_none());
+                assert!(receiver
+                    .poll_status_change(Duration::ZERO)
+                    .unwrap()
+                    .is_none());
+                assert!(receiver
+                    .audio()
+                    .try_capture(Duration::from_millis(5))
+                    .unwrap()
+                    .is_none());
+                assert!(matches!(
+                    receiver.video().capture(Duration::from_millis(5)),
+                    Err(Error::FrameTimeout { .. })
+                ));
+                done.send(()).unwrap();
+            });
+            // The writer remains held until the worker has returned: a stale
+            // unbounded read would deadlock instead of finishing within budget.
+            let result = completed.recv_timeout(Duration::from_secs(2));
+            drop(exclusive);
+            worker.join().unwrap();
+            result.unwrap();
+        });
+    }
+
+    #[test]
+    fn framesync_attachment_excludes_raw_video_but_can_be_released() {
+        let ndi = NDI::new().unwrap();
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        receiver.set_framesync_attached(true);
+        assert!(matches!(
+            receiver.video().try_capture(Duration::ZERO),
+            Err(Error::InvalidConfiguration(_))
+        ));
+        assert!(receiver.audio().try_capture(Duration::ZERO).is_ok());
+        receiver.set_framesync_attached(false);
+        assert!(receiver.video().try_capture(Duration::ZERO).is_ok());
     }
 
     #[test]

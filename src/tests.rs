@@ -6,7 +6,7 @@ use crate::{
     error::Error,
     frames::{AudioFrame, VideoFrame},
     ndi_lib::*,
-    receiver::{ReceiverStatus, Tally},
+    receiver::Tally,
 };
 
 fn create_test_video_frame(
@@ -262,32 +262,6 @@ fn test_audio_frame_builder() {
     assert_eq!(frame.num_samples(), 1024);
     assert_eq!(frame.data().len(), 2048);
     assert_eq!(frame.channel_stride_in_bytes(), 4096);
-}
-
-#[test]
-fn test_recv_status_creation() {
-    let status = ReceiverStatus {
-        tally: Some(Tally::new(true, false)),
-        connections: Some(3),
-        other: false,
-    };
-
-    assert!(status.tally.is_some());
-    let tally = status.tally.unwrap();
-    assert!(tally.on_program);
-    assert!(!tally.on_preview);
-    assert_eq!(status.connections, Some(3));
-    assert!(!status.other);
-
-    let status2 = ReceiverStatus {
-        tally: None,
-        connections: None,
-        other: true,
-    };
-
-    assert!(status2.tally.is_none());
-    assert!(status2.connections.is_none());
-    assert!(status2.other);
 }
 
 #[test]
