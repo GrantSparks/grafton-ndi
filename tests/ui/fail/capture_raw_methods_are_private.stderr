@@ -1,0 +1,10 @@
+error[E0624]: associated constant `FRAME_TYPE` is private
+ --> tests/ui/fail/capture_raw_methods_are_private.rs:3:16
+  |
+3 |     let _ = K::FRAME_TYPE;
+  |                ^^^^^^^^^^ private associated constant
+  |
+ ::: src/capture.rs
+  |
+  |     const FRAME_TYPE: NDIlib_frame_type_e;
+  |     ------------------------------------- private associated constant defined here
