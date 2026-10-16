@@ -79,9 +79,10 @@
 //! ```
 //!
 //! [`Sender::send_video_async_copy`] explicitly copies a borrowed buffer into
-//! retained sender storage and returns a wait/drop token. Forgetting that token
-//! is safe. Both paths use default SDK synchronization, with no SDK completion
-//! callback registration. Optional Rust completion handlers run on the calling
+//! an owned frame, then uses the same pipeline and returns the previous frame.
+//! Source buffers can be reused immediately. Both paths use default SDK
+//! synchronization, with no SDK completion callback registration. Optional Rust
+//! completion handlers run on the calling
 //! thread after synchronization, outside internal locks.
 //!
 //! Note: Only video supports async sending in the NDI SDK. Audio and metadata are always synchronous.
@@ -151,7 +152,7 @@ pub use {
         ReceiverOptions, ReceiverOptionsBuilder, ReceiverStatus, Tally,
     },
     runtime::NDI,
-    sender::{AsyncVideoToken, BorrowedVideoFrame, Sender, SenderOptions, SenderOptionsBuilder},
+    sender::{BorrowedVideoFrame, Sender, SenderOptions, SenderOptionsBuilder},
 };
 
 #[cfg(feature = "image-encoding")]

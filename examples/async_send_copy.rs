@@ -8,9 +8,10 @@ fn main() -> Result<(), grafton_ndi::Error> {
     let pixels = vec![0u8; 1920 * 1080 * 4];
     let frame =
         BorrowedVideoFrame::try_from_uncompressed(&pixels, 1920, 1080, PixelFormat::BGRA, 30, 1)?;
-    // Copies pixels and metadata into sender-owned storage; the token is optional
-    // for memory safety, but waiting observes completion and runs the user handler.
-    let token = sender.send_video_async_copy(&frame);
-    token.wait()?;
+    // The source can be reused as soon as this returns; the copy stays owned by
+    // the sender until the next submission or finish returns it.
+    let _ = sender.send_video_async_copy(&frame)?;
+    let copy = sender.finish_video_async().unwrap();
+    assert_eq!(copy.data().len(), pixels.len());
     Ok(())
 }
