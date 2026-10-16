@@ -1,226 +1,220 @@
 # Contributing to grafton-ndi
 
-Thank you for your interest in contributing to grafton-ndi! This document provides guidelines and information for contributors.
+`grafton-ndi` wraps the NDI SDK's runtime, discovery, capture, and sending APIs.
+A useful contribution explains the application behavior it changes and preserves
+the ownership and memory-layout guarantees around the SDK calls.
 
-## Code of Conduct
+## Local setup
 
-By participating in this project, you agree to abide by our code of conduct: be respectful, constructive, and professional.
+Install NDI SDK 6, its runtime libraries, and a C toolchain with a discoverable
+`libclang` shared library. See the [README prerequisites](README.md#prerequisites)
+for platform paths, `NDI_SDK_DIR`, `LIBCLANG_PATH`, and runtime library discovery.
+Building generates bindings from your installed SDK; the repository does not
+contain a standalone replacement for that installation.
 
-## Getting Started
+Use current stable Rust for development. [rust-toolchain.toml](rust-toolchain.toml)
+selects stable with `clippy`, `rustfmt`, and `rust-src`. The library's minimum Rust
+version is 1.87; development dependencies and compiler-diagnostic fixtures use
+current stable. CI separately checks the library with Rust 1.87 and uses nightly
+for its formatting job.
 
-1. Fork the repository on GitHub
-2. Clone your fork locally
-3. Create a new branch for your feature or fix
-4. Make your changes
-5. Run tests and ensure they pass
-6. Submit a pull request
-
-## Development Setup
-
-### Prerequisites
-
-- Current stable Rust for the full test and lint suite. The library supports Rust 1.87; verify that separately with `cargo +1.87.0 check --all-features`. Development dependencies may require newer Rust.
-- NDI SDK 6.x installed (see README for platform-specific instructions)
-- Git
-
-### Building
+Start with:
 
 ```bash
-# Clone the repository
-git clone https://github.com/GrantSparks/grafton-ndi.git
-cd grafton-ndi
-
-# Build the project
 cargo build
-
-# Run tests
-cargo test
-
-# Run examples
+cargo test --lib
 cargo run --example NDIlib_Find
 ```
 
-## Contribution Guidelines
+The discovery example needs a working NDI runtime and network environment. Tests
+that create SDK instances also need the runtime, even when no source is present.
+Do not assume that a machine without a camera can skip installing the SDK.
 
-### Code Style
+## Where changes belong
 
-- Follow Rust idioms and conventions
-- Use `cargo fmt` to format code
-- Run `cargo clippy` and address warnings
-- Add rustdoc comments for all public APIs
-- Include examples in documentation where helpful
+| Files | Responsibility |
+| --- | --- |
+| `src/runtime.rs` | Process-global SDK initialization, reference counting, and `NDI` handles |
+| `src/finder.rs` | Source discovery, owned descriptors, address parsing, and lookup cache |
+| `src/receiver.rs` | Receiver configuration, capture views, reconnect synchronization, status, and controls |
+| `src/capture.rs`, `src/recv_guard.rs` | Private SDK capture/free strategies and guards that keep buffers tied to their owners |
+| `src/frames.rs` | Owned and borrowed frames, layout/metadata validation, channel access, and image encoding |
+| `src/framesync.rs` | Clock-corrected pull capture and receiver ownership boundaries |
+| `src/sender.rs` | Synchronous sends, owned async video pipeline, copied submissions, and completion handlers |
+| `src/async_runtime.rs` | Tokio/async-std blocking adapters, deadlines, task errors, and cancellation |
+| `src/ndi_lib.rs` | Private include wrapper for bindings generated into Cargo's `OUT_DIR` |
+| `build.rs`, `build_support.rs` | Binding generation, SDK discovery, target ABI checks, and library selection |
+| `examples/`, `tests/` | Application workflows, SDK regressions, and public compile contracts |
 
-### Commit Messages
+Keep shared behavior in its existing implementation. For example, owned and
+borrowed image encoding share `ImagePixelSource`; receiver and FrameSync views
+share validated frame layouts. Fix layout arithmetic once rather than adding
+separate receive, send, and FrameSync calculations.
 
-- Use conventional commit format: `type(scope): description`
-- Types: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`
-- Keep the first line under 72 characters
-- Reference issues when applicable
+`CaptureKind` exposes public frame-type associations and owned conversion.
+SDK routing and free strategies are private. New generic APIs should not expose
+raw handles or SDK structures merely to reuse an internal implementation.
 
-Examples:
-```
-feat(recv): add support for compressed video formats
-fix(send): prevent panic on invalid frame dimensions
-docs(api): improve VideoFrame builder documentation
-```
+## Safety and SDK contracts
 
-### Pull Requests
+For changes touching FFI, cite the applicable installed SDK header or
+[NDI SDK documentation](https://docs.ndi.video/all/developing-with-ndi/sdk) in the
+PR and explain the specific contract the code relies on. Put the lasting safety
+argument beside the unsafe operation. State which allocation owns each pointer,
+how its length and alignment are established, and which synchronization or free
+operation ends SDK access.
 
-1. **Title**: Use a clear, descriptive title
-2. **Description**: Explain what changes you made and why
-3. **Testing**: Describe how you tested your changes
-4. **Breaking Changes**: Clearly mark any breaking API changes
+The important project invariants are:
 
-### Testing
+- A live SDK resource retains a live `NDI` handle. Initialization and destruction
+  must follow the production reference-counting state machine.
+- Frame layout fields stay private. Checked dimensions, plane sizes, strides,
+  and metadata bounds must remain valid after every safe mutation. Follow the
+  [SDK frame layouts](https://docs.ndi.video/all/developing-with-ndi/sdk/frame-types),
+  including alpha planes and the zero-length metadata sentinel.
+- Borrowed audio exposes initialized samples, not inter-channel padding. Use
+  channel slices for strided buffers; `data()` can return `None`.
+- Async video submissions retain owned pixels and metadata until the SDK's
+  [send synchronization boundary](https://docs.ndi.video/all/developing-with-ndi/sdk/ndi-send)
+  has completed. `send_video_async_copy` joins the same owned-frame pipeline.
+  Memory safety must not depend on a caller running a destructor: safe Rust can
+  forget values. There is no completion token in the current API.
+- Completion handlers run after state is consistent and outside internal locks.
+  Callback panic or reentry must not free an in-flight buffer or notify twice.
+- Borrowed receive views remain tied to their receiver or FrameSync owner.
+  Receiver views permit scoped thread transfer; FrameSync views remain thread
+  restricted. Do not broaden auto traits without the SDK contract and a proof
+  covering both access and freeing.
+- Discovery snapshots keep the SDK buffer protected until descriptor strings
+  have been copied. Reconnect/capture locking must preserve the original timeout
+  budget, including zero-timeout behavior.
+- Dropping an async future only suppresses work before its cancellation gate.
+  A task that passed the gate can still enter SDK code after the future is gone;
+  an SDK call cannot be interrupted by dropping the future.
 
-- Add tests for new functionality
-- Ensure all existing tests pass
-- Include integration tests for complex features
-- Test on multiple platforms if possible
+Do not test invalid pointers by dereferencing them. Construct malformed
+*descriptors* over allocations that satisfy the tested unsafe preconditions, or
+assert that validation rejects a descriptor before any access occurs.
 
-Before submitting a release change, run the same substantive checks as CI:
+## Tests that demonstrate the change
+
+Run the relevant existing tests while developing, and add a regression that
+would fail for the original behavior. Useful evidence depends on the change:
+
+- Layout changes: exact-size and undersized buffers, padded rows/channels,
+  planar offsets, alignment, and overflow boundaries.
+- Metadata changes: null and empty strings, explicit lengths and zero-length
+  scanning, terminator boundaries, invalid UTF-8, and owned-copy lifetimes.
+- Sending changes: original allocation identity through recovery, immediate
+  source reuse after copied submission, mixed send modes, callback panic/reentry,
+  and destruction with an outstanding frame. SDK tests without a receiver can
+  complete immediately, so pointer/ownership assertions matter too.
+- Capture changes: owner lifetimes, thread restrictions, FrameSync/raw-capture
+  boundaries, and matching SDK free operations.
+- Async changes: blocking-pool queue delay, reconnect-lock contention,
+  zero-timeout calls, cancellation before and after work starts, and task panics.
+- Build changes: target selection and artifact discovery tests in
+  `tests/build_configuration.rs`, including unsupported ABIs and cross-builds.
+
+For a focused Rust change, the usual starting checks are:
 
 ```bash
-cargo fmt --check
-cargo test --all-features
-cargo test --examples --all-features
+cargo test --lib
 cargo clippy --all-targets --all-features -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
-cargo test --all-features --test async_send_lifecycle --test sender_lifecycle_stress -- --ignored
+cargo fmt --all -- --check
+```
+
+CI's formatting job uses `cargo +nightly fmt --all -- --check`. Use that command
+when reproducing a formatting difference; the ordinary local command follows
+the checked-in stable toolchain.
+
+Before requesting review of changes spanning public APIs or feature gates, run
+the broader checks used by [CI](.github/workflows/rust.yml):
+
+```bash
+cargo test --all-features
 cargo build --examples
 cargo build --examples --all-features
+cargo test --examples --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+```
+
+The example test command also exercises the PCM conversion regressions in
+`NDIlib_Recv_Audio_16bpp.rs`.
+
+For optional-feature changes, also exercise the independent configurations.
+Building examples explicitly is important: library tests alone do not establish
+that application workflows still compile.
+
+```bash
+cargo test --no-default-features
 cargo build --examples --no-default-features
+cargo test --no-default-features --features tokio
 cargo build --examples --no-default-features --features tokio
+cargo test --no-default-features --features async-std
 cargo build --examples --no-default-features --features async-std
+cargo check --no-default-features --features advanced_sdk
+```
+
+The PNG example is skipped without `image-encoding`. `advanced_sdk` is a retained
+compatibility flag; selecting it does not enable SDK completion callbacks or
+choose the installed SDK library. Passing `--all-features` against the standard
+SDK does not establish coverage of an actual Advanced SDK installation.
+
+For sender lifetime/synchronization changes, run the normally ignored SDK suites:
+
+```bash
+cargo test --all-features --test async_send_lifecycle --test sender_lifecycle_stress -- --ignored
+```
+
+For dependency, build, or language-feature changes, check library compatibility
+separately from contributor tooling:
+
+```bash
 cargo +1.87.0 check --all-features
 ```
 
-The PNG example requires `image-encoding` and is intentionally skipped in minimal
-builds. CI also runs tests with minimal, Tokio-only, and async-std-only features.
-The explicit lifecycle suites require the installed NDI SDK runtime.
+Report the SDK/platform and checks actually exercised. Identify unavailable
+platform or Advanced SDK coverage rather than implying an untested matrix passed.
 
-#### Compile Contract Tests
+## Compile contracts
 
-Zero-copy receive lifetimes, ownership transfer for async sends, and immediate source reuse
-after copied submissions are enforced with
-`trybuild` compile tests in `tests/compile_contracts.rs`.
-
-Run the compile contracts directly:
+`tests/compile_contracts.rs` runs the public examples in `tests/ui/pass` and
+checks expected failures in `tests/ui/fail`. They cover owned async transfer,
+source reuse after copied sends, receive lifetimes, thread restrictions, and
+private capture machinery.
 
 ```bash
 cargo test --test compile_contracts
 ```
 
-Refresh expected compiler diagnostics after intentionally changing the
-contract fixtures or after stable rustc diagnostic wording changes:
+Use `TRYBUILD=overwrite cargo test --test compile_contracts` only when the
+contract intentionally changes or a stable compiler changes diagnostic wording.
+Review every changed `.stderr`: the fixture must still fail for the intended
+ownership, lifetime, visibility, or auto-trait reason. Do not accept a snapshot
+that passes merely because an unrelated missing method now causes an error.
+The `rust-src` toolchain component keeps standard-library source diagnostics
+consistent between local and CI runs.
 
-```bash
-TRYBUILD=overwrite cargo test --test compile_contracts
-```
+## Pull requests and documentation
 
-The project uses the stable Rust toolchain with `clippy`, `rustfmt`, and
-`rust-src` components via `rust-toolchain.toml`. The `rust-src` component keeps
-standard-library diagnostics consistent in local and CI runs. CI uses nightly
-for its formatting check; library tests and examples use stable, with a separate
-Rust 1.87 library compatibility job. Treat `.stderr`
-snapshot updates as part of normal stable-compiler-upgrade maintenance, and
-review them to confirm they still fail for the intended lifetime or auto-trait
-reason.
+Describe the concrete trigger, previous behavior, resulting behavior, and why
+the change belongs in the wrapper. Include test results and any relevant SDK
+contract. For public API changes, explain compatibility and allocation/blocking
+costs, update rustdoc and affected examples, and add an appropriate entry to
+[CHANGELOG.md](CHANGELOG.md). Update migration guidance when existing callers
+must change their code. Prefer shared helpers over parallel implementations.
 
-### CI/CD Configuration
+Use a concise title describing the resulting change; existing commits commonly
+use `fix:`, `feat:`, `docs:`, or a scoped form such as `fix(sender):`.
+Contributions use the repository's [Apache-2.0 license](LICENSE).
 
-#### GitHub Actions NDI SDK
+## SDK installer maintenance
 
-CI installs NDI SDK 6 using platform-specific workflow defaults. To override a
-download, set the matching repository Actions secret:
-
-| Platform | Secret |
-| --- | --- |
-| Windows | `NDI_SDK_URL` |
-| Linux | `NDI_SDK_URL_LINUX` |
-| macOS | `NDI_SDK_URL_MACOS` |
-
-When updating an installer, verify its provenance and SHA256, then update the
-accepted hashes in the corresponding `.github/actions/setup-ndi-*/action.yml`.
-The first accepted hash participates in the SDK cache key. Changing only a URL
-does not invalidate an existing cache, and a new payload not in the allowlist
-will fail verification on a cache miss. Review SDK updates on all supported
-platforms before merging.
-
-### Documentation
-
-- Update relevant documentation for any API changes
-- Add rustdoc comments for new public items
-- Update README if adding new features
-- Include code examples where appropriate
-
-## Areas for Contribution
-
-### High Priority
-
-- Platform coverage beyond the native Linux, macOS, and Windows CI matrix
-- Performance optimizations
-- Additional examples
-- Documentation improvements
-
-### Feature Ideas
-
-- Async adapter diagnostics and cancellation observability
-- Additional color format conversions
-- Enhanced metadata handling
-- Debugging and diagnostic tools
-
-### Known Issues
-
-Check the [issue tracker](https://github.com/GrantSparks/grafton-ndi/issues) for current bugs and feature requests.
-
-## Architecture Overview
-
-### Project Structure
-
-```
-grafton-ndi/
-├── src/
-│   ├── lib.rs          # Main library interface
-│   ├── error.rs        # Error types
-│   └── ndi_lib.rs      # Private include wrapper for OUT_DIR bindings
-├── build.rs            # Build script for bindgen
-├── build_support.rs    # Target/SDK selection helpers
-├── examples/           # Example applications
-└── tests/              # Integration tests
-```
-
-### Key Design Principles
-
-1. **Safety First**: Wrap all unsafe FFI in safe Rust APIs
-2. **Zero-Cost Abstractions**: Minimize overhead over raw NDI SDK
-3. **Idiomatic Rust**: Follow Rust conventions and patterns
-4. **Thread Safety**: Properly implement Send/Sync where appropriate
-
-## Questions?
-
-- Open an issue for bugs or feature requests
-- Start a discussion for design questions
-- Check existing issues before creating new ones
-
-## License
-
-By contributing, you agree that your contributions will be licensed under the Apache License 2.0.
-
-## Preparing and publishing a release
-
-Prepare the version in `Cargo.toml`, dated release notes in `CHANGELOG.md`,
-current README dependency examples, and any migration guide in one reviewed
-release change. Run formatting, tests, Clippy, and rustdoc checks with the NDI SDK
-installed, and require the main branch CI checks to pass after merging.
-
-For 2.0.0, verify the package version is `2.0.0` and the release commit contains
-all intended fixes before creating the matching `v2.0.0` tag. **Pushing that tag
-triggers the publishing workflow and `cargo publish` to crates.io.** The current
-workflow runs on any pushed tag; it does not verify that the tag matches the
-package version. Treat tagging as the publication step, separate from preparing
-and merging release documentation. Do not push a tag during release preparation.
-
-Main branch CI publishes API documentation to GitHub Pages. After the authorized
-tag push, check the publish job and crates.io package, then publish GitHub release
-notes based on the matching changelog section.
+The platform setup actions and their configuration are documented in
+[.github/actions/README.md](.github/actions/README.md). Changes to CI installers
+should include the source URL, verified SHA256, and affected platform checks.
+Installer payloads are checked against allowlists; cache keys include the primary
+accepted hash. Changing a download URL alone neither refreshes an existing cache
+nor allows an unrecognized payload. These are maintainer configuration changes,
+not a prerequisite for ordinary contributions.
