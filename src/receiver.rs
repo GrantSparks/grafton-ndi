@@ -941,8 +941,11 @@ impl Receiver {
     ///
     /// // Zero-copy borrow
     /// if let Some(frame) = receiver.video().try_capture_ref(Duration::from_secs(1))? {
-    ///     let pixels = frame.data();
-    ///     println!("{} bytes in place", pixels.len());
+    ///     for plane in frame.planes() {
+    ///         for row in plane.rows() {
+    ///             println!("{} active bytes in place", row.len());
+    ///         }
+    ///     }
     /// }
     /// # Ok(())
     /// # }

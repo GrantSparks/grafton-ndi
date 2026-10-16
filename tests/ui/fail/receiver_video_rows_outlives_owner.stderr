@@ -1,0 +1,17 @@
+error[E0515]: cannot return value referencing local variable `frame`
+ --> tests/ui/fail/receiver_video_rows_outlives_owner.rs:9:5
+  |
+9 |     frame.plane(0).unwrap().rows()
+  |     -----^^^^^^^^^^^^^^^^^^^^^^^^^
+  |     |
+  |     returns a value referencing data owned by the current function
+  |     `frame` is borrowed here
+
+error[E0515]: cannot return value referencing function parameter `owner`
+ --> tests/ui/fail/receiver_video_rows_outlives_owner.rs:9:5
+  |
+4 |     let frame = owner
+  |                 ----- `owner` is borrowed here
+...
+9 |     frame.plane(0).unwrap().rows()
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ returns a value referencing data owned by the current function

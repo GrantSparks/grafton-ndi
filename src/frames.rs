@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::{
     ffi::{CStr, CString},
     fmt,
+    marker::PhantomData,
     num::NonZeroUsize,
     os::raw::c_char,
     ptr, slice, str,
@@ -789,8 +790,12 @@ impl VideoFrame {
     ///
     /// # Safety
     ///
-    /// This function assumes the given `NDIlib_video_frame_v2_t` is valid and correctly allocated.
-    /// This method copies the data, so the VideoFrame owns its data and can outlive the source.
+    /// The descriptor must refer to one live allocation covering its SDK plane
+    /// layout. All active row bytes must be initialized and remain immutable
+    /// throughout this call; row padding may be uninitialized. Non-null metadata
+    /// must satisfy the SDK's readable, NUL-terminated string contract.
+    /// Only active pixels are copied, so the tightly packed result can outlive
+    /// the source allocation.
     pub unsafe fn from_raw(c_frame: &NDIlib_video_frame_v2_t) -> Result<VideoFrame> {
         // Use the shared validation helper to validate and compute layout
         let layout = validate_video_layout(c_frame)?;
@@ -804,9 +809,28 @@ impl VideoFrame {
         layout: ValidatedVideoLayout,
         metadata_layout: ValidatedFrameMetadata,
     ) -> Result<VideoFrame> {
-        // Copy data for ownership
-        let slice = slice::from_raw_parts(c_frame.p_data, layout.data_len_bytes);
-        let data = slice.to_vec();
+        let owned_layout = ValidatedVideoLayout::new_uncompressed(
+            layout.pixel_format,
+            layout.width,
+            layout.height,
+            None,
+        )?;
+        let mut data = Vec::with_capacity(layout.payload_len_bytes);
+        // SAFETY: The caller retains the source allocation through this copy.
+        // Only active rows are initialized by the SDK; never read stride padding.
+        if layout.is_contiguous() {
+            data.extend_from_slice(unsafe {
+                slice::from_raw_parts(c_frame.p_data, layout.payload_len_bytes)
+            });
+        } else {
+            for plane_layout in layout.planes() {
+                let plane = unsafe { VideoPlane::new(c_frame.p_data, *plane_layout) };
+                for row in plane.rows() {
+                    data.extend_from_slice(row);
+                }
+            }
+        }
+        let layout = owned_layout;
 
         let metadata =
             unsafe { FrameMetadata::copy_from_raw_validated(c_frame.p_metadata, metadata_layout) };
@@ -2002,11 +2026,9 @@ impl ImagePixelFormat {
 #[cfg(feature = "image-encoding")]
 #[derive(Debug)]
 struct ImagePixelSource<'a> {
-    data: &'a [u8],
+    plane: VideoPlane<'a>,
     width: usize,
     height: usize,
-    line_stride: usize,
-    active_row_bytes: usize,
     pixel_format: ImagePixelFormat,
 }
 
@@ -2059,8 +2081,6 @@ impl<'a> ImagePixelSource<'a> {
     }
 
     fn new(layout: ValidatedVideoLayout, data: &'a [u8]) -> Result<Self> {
-        let pixel_format = ImagePixelFormat::from_pixel_format(layout.pixel_format)?;
-
         if data.len() != layout.data_len_bytes {
             return Err(Error::InvalidFrame(format!(
                 "Video data length {}, expected {} bytes for validated layout",
@@ -2069,72 +2089,26 @@ impl<'a> ImagePixelSource<'a> {
             )));
         }
 
-        let line_stride = match layout.line_stride_or_size {
-            LineStrideOrSize::LineStrideBytes(stride) => {
-                if stride <= 0 {
-                    return Err(Error::InvalidFrame(format!(
-                        "Image line stride must be positive, got {stride}"
-                    )));
-                }
+        // SAFETY: The owned slice covers the validated storage extent and
+        // remains borrowed for 'a. Active rows are a subset of that slice.
+        let plane = unsafe { VideoPlane::new(data.as_ptr(), layout.plane_layouts[0]) };
+        Self::from_plane(layout, plane)
+    }
 
-                usize::try_from(stride).map_err(|_| {
-                    Error::InvalidFrame(format!("Invalid image line stride value: {stride}"))
-                })?
-            }
-            LineStrideOrSize::DataSizeBytes(size) => {
-                return Err(Error::InvalidFrame(format!(
-                    "Cannot encode image from data-size frame ({size} bytes). Image encoding requires line_stride_in_bytes."
-                )));
-            }
-        };
-
-        let width = usize::try_from(layout.width)
-            .map_err(|_| Error::InvalidFrame(format!("Invalid image width: {}", layout.width)))?;
-        let height = usize::try_from(layout.height)
-            .map_err(|_| Error::InvalidFrame(format!("Invalid image height: {}", layout.height)))?;
-
-        if width == 0 || height == 0 {
-            return Err(Error::InvalidFrame(format!(
-                "Image dimensions must be positive, got {}x{}",
-                layout.width, layout.height
-            )));
+    fn from_plane(layout: ValidatedVideoLayout, plane: VideoPlane<'a>) -> Result<Self> {
+        let pixel_format = ImagePixelFormat::from_pixel_format(layout.pixel_format)?;
+        if !matches!(
+            layout.line_stride_or_size,
+            LineStrideOrSize::LineStrideBytes(_)
+        ) {
+            return Err(Error::InvalidFrame(
+                "Cannot encode image from data-size frame; image encoding requires line_stride_in_bytes".into(),
+            ));
         }
-
-        let active_row_bytes = width
-            .checked_mul(ImagePixelFormat::BYTES_PER_PIXEL)
-            .ok_or_else(|| {
-                Error::InvalidFrame(format!(
-                    "Image row size overflow for width {} and {} bytes per pixel",
-                    width,
-                    ImagePixelFormat::BYTES_PER_PIXEL
-                ))
-            })?;
-
-        if line_stride < active_row_bytes {
-            return Err(Error::InvalidFrame(format!(
-                "Image line stride {line_stride} is smaller than active row size {active_row_bytes}"
-            )));
-        }
-
-        let expected_data_len = line_stride.checked_mul(height).ok_or_else(|| {
-            Error::InvalidFrame(format!(
-                "Image data length overflow: {line_stride} stride x {height} height"
-            ))
-        })?;
-
-        if expected_data_len != layout.data_len_bytes {
-            return Err(Error::InvalidFrame(format!(
-                "Image layout data length {} does not match line stride x height ({expected_data_len})",
-                layout.data_len_bytes
-            )));
-        }
-
         Ok(Self {
-            data,
-            width,
-            height,
-            line_stride,
-            active_row_bytes,
+            plane,
+            width: layout.width as usize,
+            height: layout.height as usize,
             pixel_format,
         })
     }
@@ -2147,20 +2121,20 @@ impl<'a> ImagePixelSource<'a> {
             Error::InvalidFrame(format!("PNG height {} exceeds u32 range", self.height))
         })?;
 
-        if self.pixel_format.can_borrow_tightly_packed_png()
-            && self.line_stride == self.active_row_bytes
-        {
-            return Ok((Cow::Borrowed(self.data), width, height));
+        if self.pixel_format.can_borrow_tightly_packed_png() {
+            if let Some(data) = self.plane.data() {
+                return Ok((Cow::Borrowed(data), width, height));
+            }
         }
 
         let mut rgba = Vec::with_capacity(self.output_len(4)?);
 
         if self.pixel_format.can_borrow_tightly_packed_png() {
-            for row in self.active_rows() {
+            for row in self.plane.rows() {
                 rgba.extend_from_slice(row);
             }
         } else {
-            for row in self.active_rows() {
+            for row in self.plane.rows() {
                 for pixel in row.chunks_exact(ImagePixelFormat::BYTES_PER_PIXEL) {
                     rgba.extend_from_slice(&self.pixel_format.rgba_pixel(pixel));
                 }
@@ -2193,7 +2167,7 @@ impl<'a> ImagePixelSource<'a> {
         })?;
 
         let mut rgb = Vec::with_capacity(self.output_len(3)?);
-        for row in self.active_rows() {
+        for row in self.plane.rows() {
             for pixel in row.chunks_exact(ImagePixelFormat::BYTES_PER_PIXEL) {
                 rgb.extend_from_slice(&self.pixel_format.rgb_pixel(pixel));
             }
@@ -2212,14 +2186,6 @@ impl<'a> ImagePixelSource<'a> {
                     self.width, self.height, channels
                 ))
             })
-    }
-
-    fn active_rows(&self) -> impl Iterator<Item = &'a [u8]> + '_ {
-        (0..self.height).map(move |row| {
-            let start = row * self.line_stride;
-            let end = start + self.active_row_bytes;
-            &self.data[start..end]
-        })
     }
 }
 
@@ -2241,8 +2207,12 @@ pub(crate) struct ValidatedVideoLayout {
     pub height: i32,
     /// The validated pixel format.
     pub pixel_format: PixelFormat,
-    /// The validated data buffer length in bytes.
+    /// Complete storage extent in bytes; SDK padding need not be initialized.
     pub data_len_bytes: usize,
+    /// Initialized active payload, excluding all row padding.
+    payload_len_bytes: usize,
+    plane_layouts: [VideoPlaneLayout; 3],
+    plane_count: usize,
     /// The validated SDK union field. Supported safe video layouts always use
     /// line stride; the data-size variant is reserved for the unsafe escape
     /// hatch.
@@ -2294,8 +2264,12 @@ impl ValidatedVideoLayout {
             )));
         }
 
-        let data_len_bytes =
-            calculate_buffer_len_checked(pixel_format, line_stride_usize, height_usize)?;
+        let (plane_layouts, plane_count, data_len_bytes, payload_len_bytes) = video_plane_layouts(
+            pixel_format.info(),
+            line_stride_usize,
+            min_stride,
+            height_usize,
+        )?;
         validate_video_data_len(data_len_bytes)?;
 
         let line_stride_i32 = i32::try_from(line_stride_usize).map_err(|_| {
@@ -2309,8 +2283,24 @@ impl ValidatedVideoLayout {
             height,
             pixel_format,
             data_len_bytes,
+            payload_len_bytes,
+            plane_layouts,
+            plane_count,
             line_stride_or_size: LineStrideOrSize::LineStrideBytes(line_stride_i32),
         })
+    }
+
+    fn planes(&self) -> &[VideoPlaneLayout] {
+        &self.plane_layouts[..self.plane_count]
+    }
+
+    fn is_contiguous(&self) -> bool {
+        // Validated planes are adjacent storage regions with active <= stride.
+        // Their last active endpoint equals payload length exactly when there
+        // are no intervening gaps. Trailing padding need not be included.
+        let last = self.planes().last().expect("validated video has a plane");
+        last.offset + (last.row_count - 1) * last.row_stride + last.active_row_bytes
+            == self.payload_len_bytes
     }
 }
 
@@ -2448,6 +2438,7 @@ fn min_video_line_stride_checked(pixel_format: PixelFormat, width: usize) -> Res
 }
 
 /// Calculate buffer length with checked arithmetic.
+#[cfg(test)]
 fn calculate_buffer_len_checked(
     pixel_format: PixelFormat,
     y_stride: usize,
@@ -2461,41 +2452,38 @@ fn calculate_buffer_len_for_info_checked(
     y_stride: usize,
     height: usize,
 ) -> Result<usize> {
-    // Y plane size = y_stride * height
-    let y_size = y_stride.checked_mul(height).ok_or_else(|| {
-        Error::InvalidFrame(format!(
-            "Video buffer size overflow: {} stride × {} height",
-            y_stride, height
-        ))
-    })?;
+    video_plane_layouts(info, y_stride, y_stride, height).map(|(_, _, storage, _)| storage)
+}
 
-    match info.category() {
-        FormatCategory::Packed => Ok(y_size),
+#[derive(Debug, Clone, Copy, Default)]
+struct VideoPlaneLayout {
+    offset: usize,
+    row_stride: usize,
+    active_row_bytes: usize,
+    row_count: usize,
+}
+
+/// Derive SDK plane offsets and active row sizes together. See
+/// https://docs.ndi.video/all/developing-with-ndi/sdk/frame-types .
+/// Plane offsets include preceding storage padding; payload lengths do not.
+fn video_plane_layouts(
+    info: PixelFormatInfo,
+    stride: usize,
+    active: usize,
+    height: usize,
+) -> Result<([VideoPlaneLayout; 3], usize, usize, usize)> {
+    let mut dimensions = [(stride, active, height); 3];
+    let count = match info.category() {
+        FormatCategory::Packed => 1,
         FormatCategory::Planar420 => {
-            if !height.is_multiple_of(2) || !y_stride.is_multiple_of(2) {
+            if !height.is_multiple_of(2) || !stride.is_multiple_of(2) {
                 return Err(Error::InvalidFrame(
                     "Planar 4:2:0 video frames require even height and stride".into(),
                 ));
             }
-            // Planar 4:2:0: Y + U + V
-            // U and V planes each have half width and half height
-            let chroma_height = height / 2;
-            let u_stride = y_stride / 2;
-            let v_stride = y_stride / 2;
-
-            let u_size = u_stride
-                .checked_mul(chroma_height)
-                .ok_or_else(|| Error::InvalidFrame("Video U-plane size overflow".into()))?;
-            let v_size = v_stride
-                .checked_mul(chroma_height)
-                .ok_or_else(|| Error::InvalidFrame("Video V-plane size overflow".into()))?;
-
-            let total = y_size
-                .checked_add(u_size)
-                .and_then(|s| s.checked_add(v_size))
-                .ok_or_else(|| Error::InvalidFrame("Video total buffer size overflow".into()))?;
-
-            Ok(total)
+            dimensions[1] = (stride / 2, active / 2, height / 2);
+            dimensions[2] = dimensions[1];
+            3
         }
         FormatCategory::SemiPlanar420 => {
             if !height.is_multiple_of(2) {
@@ -2503,52 +2491,43 @@ fn calculate_buffer_len_for_info_checked(
                     "Semi-planar 4:2:0 video frames require even height".into(),
                 ));
             }
-            // Semi-planar 4:2:0: Y + interleaved UV
-            // UV plane has full width and half height
-            let chroma_height = height / 2;
-            let uv_size = y_stride
-                .checked_mul(chroma_height)
-                .ok_or_else(|| Error::InvalidFrame("Video UV-plane size overflow".into()))?;
-
-            let total = y_size
-                .checked_add(uv_size)
-                .ok_or_else(|| Error::InvalidFrame("Video total buffer size overflow".into()))?;
-
-            Ok(total)
+            dimensions[1] = (stride, active, height / 2);
+            2
         }
         FormatCategory::PackedAlpha => {
-            if !y_stride.is_multiple_of(2) {
+            if !stride.is_multiple_of(2) {
                 return Err(Error::InvalidFrame(
                     "UYVA video frames require even stride".into(),
                 ));
             }
-            // UYVY plane + 8-bit alpha plane
-            // Alpha plane has half the line stride and full height
-            let alpha_size = (y_stride / 2)
-                .checked_mul(height)
-                .ok_or_else(|| Error::InvalidFrame("Video alpha-plane size overflow".into()))?;
-
-            let total = y_size
-                .checked_add(alpha_size)
-                .ok_or_else(|| Error::InvalidFrame("Video total buffer size overflow".into()))?;
-
-            Ok(total)
+            dimensions[1] = (stride / 2, active / 2, height);
+            2
         }
-        FormatCategory::SemiPlanar422 => {
-            // Semi-planar 4:2:2: Y + interleaved CbCr
-            // CbCr plane has the line stride and full height
-            y_size
-                .checked_mul(2)
-                .ok_or_else(|| Error::InvalidFrame("Video total buffer size overflow".into()))
-        }
-        FormatCategory::SemiPlanar422Alpha => {
-            // Semi-planar 4:2:2 with alpha: Y + interleaved CbCr + alpha
-            // CbCr and alpha planes have the line stride and full height
-            y_size
-                .checked_mul(3)
-                .ok_or_else(|| Error::InvalidFrame("Video total buffer size overflow".into()))
-        }
+        FormatCategory::SemiPlanar422 => 2,
+        FormatCategory::SemiPlanar422Alpha => 3,
+    };
+    let mut planes = [VideoPlaneLayout::default(); 3];
+    let mut storage = 0usize;
+    let mut payload = 0usize;
+    for (plane, &(row_stride, active_row_bytes, row_count)) in
+        planes.iter_mut().zip(&dimensions[..count])
+    {
+        *plane = VideoPlaneLayout {
+            offset: storage,
+            row_stride,
+            active_row_bytes,
+            row_count,
+        };
+        storage = row_stride
+            .checked_mul(row_count)
+            .and_then(|n| storage.checked_add(n))
+            .ok_or_else(|| Error::InvalidFrame("Video buffer size overflow".into()))?;
+        payload = active_row_bytes
+            .checked_mul(row_count)
+            .and_then(|n| payload.checked_add(n))
+            .ok_or_else(|| Error::InvalidFrame("Video payload size overflow".into()))?;
     }
+    Ok((planes, count, storage, payload))
 }
 
 /// Validated audio frame layout information.
@@ -2918,6 +2897,130 @@ fn validate_audio_format(fourcc: NDIlib_FourCC_audio_type_e) -> Result<AudioForm
 // Zero-copy borrowed receive frames
 // ============================================================================
 
+/// An allocation-free view of one video plane's initialized active bytes.
+///
+/// Plane order follows the pixel format: packed pixels; UYVY/A for UYVA;
+/// Y/CbCr[/A] for P216/PA16; Y/V/U for YV12; Y/U/V for I420; Y/UV for NV12.
+/// The view borrows its captured frame, which keeps the SDK allocation alive.
+#[derive(Debug, Clone, Copy)]
+pub struct VideoPlane<'a> {
+    data: *const u8,
+    layout: VideoPlaneLayout,
+    lifetime: PhantomData<&'a [u8]>,
+}
+
+impl<'a> VideoPlane<'a> {
+    /// Caller must retain an allocation covering the validated layout for 'a,
+    /// with every active row readable, initialized, and immutable for that lifetime.
+    unsafe fn new(data: *const u8, layout: VideoPlaneLayout) -> Self {
+        Self {
+            data,
+            layout,
+            lifetime: PhantomData,
+        }
+    }
+
+    /// Distance between row starts in bytes, including padding.
+    pub fn row_stride(&self) -> usize {
+        self.layout.row_stride
+    }
+
+    /// Number of initialized bytes in each row.
+    pub fn active_row_bytes(&self) -> usize {
+        self.layout.active_row_bytes
+    }
+
+    /// Number of rows in this plane.
+    pub fn row_count(&self) -> usize {
+        self.layout.row_count
+    }
+
+    /// Get an active row, excluding padding, or `None` for an invalid index.
+    pub fn row(&self, index: usize) -> Option<&'a [u8]> {
+        if index >= self.layout.row_count {
+            return None;
+        }
+        // SAFETY: Construction ties the allocation to 'a. Checked plane/row
+        // arithmetic bounds this range within storage. The SDK initializes the
+        // active bytes; padding is never included. The guard prevents freeing.
+        Some(unsafe {
+            slice::from_raw_parts(
+                self.data
+                    .add(self.layout.offset + index * self.layout.row_stride),
+                self.layout.active_row_bytes,
+            )
+        })
+    }
+
+    /// Iterate active rows without allocating or copying pixels.
+    pub fn rows(&self) -> VideoRows<'a> {
+        VideoRows {
+            plane: *self,
+            indices: 0..self.row_count(),
+        }
+    }
+
+    /// Borrow all active bytes when contiguous, excluding trailing padding.
+    /// Returns `None` when padding separates rows.
+    pub fn data(&self) -> Option<&'a [u8]> {
+        if self.row_count() != 1 && self.row_stride() != self.active_row_bytes() {
+            return None;
+        }
+        // SAFETY: All rows are adjacent initialized ranges in the retained
+        // allocation; the final row's padding is excluded.
+        Some(unsafe {
+            slice::from_raw_parts(
+                self.data.add(self.layout.offset),
+                self.row_count() * self.active_row_bytes(),
+            )
+        })
+    }
+}
+
+/// Active video rows, borrowing the frame that owns the SDK allocation.
+#[derive(Debug, Clone)]
+pub struct VideoRows<'a> {
+    plane: VideoPlane<'a>,
+    indices: std::ops::Range<usize>,
+}
+
+impl<'a> Iterator for VideoRows<'a> {
+    type Item = &'a [u8];
+    fn next(&mut self) -> Option<Self::Item> {
+        self.plane.row(self.indices.next()?)
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.indices.size_hint()
+    }
+}
+impl DoubleEndedIterator for VideoRows<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.plane.row(self.indices.next_back()?)
+    }
+}
+impl ExactSizeIterator for VideoRows<'_> {}
+impl std::iter::FusedIterator for VideoRows<'_> {}
+
+/// Video planes in SDK memory order, with no allocation or pixel copies.
+#[derive(Debug, Clone)]
+pub struct VideoPlanes<'a> {
+    data: *const u8,
+    layouts: slice::Iter<'a, VideoPlaneLayout>,
+}
+impl<'a> Iterator for VideoPlanes<'a> {
+    type Item = VideoPlane<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let layout = *self.layouts.next()?;
+        // SAFETY: Created only from a live frame with validated active rows.
+        Some(unsafe { VideoPlane::new(self.data, layout) })
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.layouts.size_hint()
+    }
+}
+impl ExactSizeIterator for VideoPlanes<'_> {}
+impl std::iter::FusedIterator for VideoPlanes<'_> {}
+
 /// A zero-copy borrowed video frame, generic over its free strategy `S`.
 ///
 /// This type wraps an RAII `Guard` that owns the NDI frame buffer lifetime,
@@ -3058,25 +3161,38 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
         unsafe { frame_metadata_str(self.guard.frame().p_metadata, self.metadata) }
     }
 
-    /// Get a zero-copy view of the frame data.
+    /// Borrow all active pixels when contiguous, in SDK plane order.
     ///
-    /// This returns a slice directly into the NDI SDK's buffer.
-    /// No allocation or memcpy is performed.
-    ///
-    /// For planar 4:2:0 formats (YV12/I420/NV12), this returns the full
-    /// buffer including Y and UV planes.
-    ///
-    /// # Safety Guarantee
-    ///
-    /// The slice length is computed once at construction time using checked
-    /// arithmetic and validated against `MAX_VIDEO_BYTES`. This eliminates
-    /// the possibility of integer overflow or unbounded slice creation.
-    pub fn data(&self) -> &[u8] {
-        // SAFETY: The data pointer was validated as non-null during construction
-        // (validate_video_layout returns Err if p_data is null).
-        // The data length was computed with checked arithmetic and validated
-        // against MAX_VIDEO_BYTES, so it's safe to create this slice.
-        unsafe { slice::from_raw_parts(self.guard.frame().p_data, self.layout.data_len_bytes) }
+    /// Returns `None` if padding separates active rows or planes. Use
+    /// [`Self::planes`] / [`Self::plane`] for zero-copy padded access, or
+    /// [`Self::to_owned`] for a tightly packed owned buffer. A single packed
+    /// row can be borrowed even when its stride includes trailing padding.
+    pub fn data(&self) -> Option<&[u8]> {
+        if !self.layout.is_contiguous() {
+            return None;
+        }
+        // SAFETY: The guard retains the SDK allocation for this borrow. Layout
+        // validation bounds the range; contiguity proves every byte is active,
+        // initialized payload, with no intervening or trailing padding.
+        Some(unsafe {
+            slice::from_raw_parts(self.guard.frame().p_data, self.layout.payload_len_bytes)
+        })
+    }
+
+    /// Get one plane in SDK memory order, or `None` for an invalid index.
+    pub fn plane(&self, index: usize) -> Option<VideoPlane<'_>> {
+        let layout = *self.layout.planes().get(index)?;
+        // SAFETY: The returned lifetime borrows this guard, which retains the
+        // allocation and its initialized, immutable active rows.
+        Some(unsafe { VideoPlane::new(self.guard.frame().p_data, layout) })
+    }
+
+    /// Iterate planes in SDK memory order without allocating or copying.
+    pub fn planes(&self) -> VideoPlanes<'_> {
+        VideoPlanes {
+            data: self.guard.frame().p_data,
+            layouts: self.layout.planes().iter(),
+        }
     }
 
     /// Encode PNG directly from the borrowed SDK pixels, without first
@@ -3084,27 +3200,31 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
     /// formats and padding handling as [`VideoFrame::encode_png`].
     #[cfg(feature = "image-encoding")]
     pub fn encode_png(&self) -> Result<Vec<u8>> {
-        ImagePixelSource::new(self.layout, self.data())?.encode_png()
+        ImagePixelSource::from_plane(self.layout, self.plane(0).expect("validated video plane"))?
+            .encode_png()
     }
 
     /// Encode JPEG directly from borrowed SDK pixels. Quality must be in
     /// `1..=100`; see [`VideoFrame::encode_jpeg`] for format restrictions.
     #[cfg(feature = "image-encoding")]
     pub fn encode_jpeg(&self, quality: u8) -> Result<Vec<u8>> {
-        ImagePixelSource::new(self.layout, self.data())?.encode_jpeg(quality)
+        ImagePixelSource::from_plane(self.layout, self.plane(0).expect("validated video plane"))?
+            .encode_jpeg(quality)
     }
 
     /// Encode borrowed SDK pixels as a PNG or JPEG base64 data URL without an
     /// intermediate owned frame. See [`VideoFrame::encode_data_url`].
     #[cfg(feature = "image-encoding")]
     pub fn encode_data_url(&self, format: ImageFormat) -> Result<String> {
-        ImagePixelSource::new(self.layout, self.data())?.encode_data_url(format)
+        ImagePixelSource::from_plane(self.layout, self.plane(0).expect("validated video plane"))?
+            .encode_data_url(format)
     }
 
     /// Convert this borrowed frame to an owned `VideoFrame`.
     ///
-    /// Copies pixel data and metadata into owned allocations, allowing the
-    /// frame to outlive the NDI buffer and be sent across threads.
+    /// Copies only active rows into one tightly packed pixel allocation and
+    /// copies metadata separately. The owned stride can be smaller than the
+    /// SDK stride. Preserves format, timing, aspect ratio, and scan type.
     pub fn to_owned(&self) -> Result<VideoFrame> {
         unsafe { VideoFrame::from_raw_validated(self.guard.frame(), self.layout, self.metadata) }
     }
@@ -3122,7 +3242,7 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> fmt::Debug for VideoR
             .field("picture_aspect_ratio", &self.picture_aspect_ratio())
             .field("scan_type", &self.scan_type())
             .field("timecode", &self.timecode())
-            .field("data (bytes)", &self.data().len())
+            .field("active data (bytes)", &self.layout.payload_len_bytes)
             .field("line_stride_or_size", &self.line_stride_or_size())
             .field("metadata", &self.metadata())
             .field("timestamp", &self.timestamp())
@@ -3487,6 +3607,441 @@ impl<'rx> fmt::Debug for MetadataFrameRef<'rx> {
 mod tests {
     use super::*;
 
+    /// Compare the old full-span copy with normalized active-row copies using
+    /// initialized storage. Run with `cargo test --release --lib
+    /// video_padding_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "Manual optimized video throughput comparison"]
+    fn video_padding_throughput() {
+        use crate::capture::{FrameSyncVideoFree, Guard};
+        use std::{hint::black_box, time::Instant};
+        for (width, height) in [(1920, 1080), (3840, 2160)] {
+            for padding in [0, 64] {
+                let stride = width * 4 + padding;
+                let mut storage = vec![17u8; (stride * height) as usize];
+                let raw = NDIlib_video_frame_v2_t {
+                    xres: width,
+                    yres: height,
+                    FourCC: PixelFormat::BGRA.into(),
+                    frame_rate_N: 60,
+                    frame_rate_D: 1,
+                    frame_format_type: ScanType::Progressive.into(),
+                    p_data: storage.as_mut_ptr(),
+                    __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                        line_stride_in_bytes: stride,
+                    },
+                    ..Default::default()
+                };
+                let frame = unsafe {
+                    VideoRef::new(Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw))
+                }
+                .unwrap();
+                let iterations = 100;
+                // Warm allocation and page caches for both implementations.
+                black_box(storage.clone());
+                black_box(frame.to_owned().unwrap());
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    black_box(black_box(&storage).clone());
+                }
+                let baseline = start.elapsed();
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    black_box(black_box(&frame).to_owned().unwrap());
+                }
+                let packed = start.elapsed();
+                let start = Instant::now();
+                for _ in 0..iterations * 100 {
+                    for plane in black_box(&frame).planes() {
+                        for row in plane.rows() {
+                            black_box(row);
+                        }
+                    }
+                }
+                let traversal = start.elapsed();
+                eprintln!("{width}x{height} padding={padding}: old storage copy {:.3} ms/frame, active copy {:.3} ms/frame, row traversal {:.3} us/frame, copied {} active bytes",
+                    baseline.as_secs_f64() * 1000.0 / f64::from(iterations),
+                    packed.as_secs_f64() * 1000.0 / f64::from(iterations),
+                    traversal.as_secs_f64() * 1_000_000.0 / f64::from(iterations * 100),
+                    frame.layout.payload_len_bytes);
+            }
+        }
+    }
+
+    // Thread-local accounting excludes allocations from concurrent test threads.
+    struct CountingAllocator;
+    std::thread_local! {
+        static VIDEO_ALLOCATIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+    fn record_video_allocation() {
+        let _ = VIDEO_ALLOCATIONS.try_with(|count| {
+            if let Some(n) = count.get() {
+                count.set(Some(n + 1));
+            }
+        });
+    }
+    unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            record_video_allocation();
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+            record_video_allocation();
+            unsafe { std::alloc::System.alloc_zeroed(layout) }
+        }
+        unsafe fn realloc(&self, p: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+            record_video_allocation();
+            unsafe { std::alloc::System.realloc(p, layout, size) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, layout: std::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(p, layout) }
+        }
+    }
+    #[global_allocator]
+    static VIDEO_TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    fn video_allocation_count<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                VIDEO_ALLOCATIONS.with(|count| count.set(None));
+            }
+        }
+        VIDEO_ALLOCATIONS.with(|count| count.set(Some(0)));
+        let reset = Reset;
+        let value = f();
+        let count = VIDEO_ALLOCATIONS.with(|count| count.get().unwrap());
+        drop(reset);
+        (value, count)
+    }
+
+    #[test]
+    fn video_padding_all_formats_expose_and_copy_only_initialized_rows() {
+        use crate::capture::{FrameSyncVideoFree, Guard};
+        use std::mem::MaybeUninit;
+        // Independently specified active plane dimensions for 4x4 images.
+        let cases: &[(PixelFormat, &[(usize, usize)])] = &[
+            (PixelFormat::BGRA, &[(16, 4)]),
+            (PixelFormat::BGRX, &[(16, 4)]),
+            (PixelFormat::RGBA, &[(16, 4)]),
+            (PixelFormat::RGBX, &[(16, 4)]),
+            (PixelFormat::UYVY, &[(8, 4)]),
+            (PixelFormat::UYVA, &[(8, 4), (4, 4)]),
+            (PixelFormat::P216, &[(8, 4), (8, 4)]),
+            (PixelFormat::PA16, &[(8, 4), (8, 4), (8, 4)]),
+            (PixelFormat::YV12, &[(4, 4), (2, 2), (2, 2)]),
+            (PixelFormat::I420, &[(4, 4), (2, 2), (2, 2)]),
+            (PixelFormat::NV12, &[(4, 4), (4, 2)]),
+        ];
+        for &(format, dimensions) in cases {
+            for padding in [0, 4, 8] {
+                let stride = dimensions[0].0 + padding;
+                let mut storage = vec![MaybeUninit::<u8>::uninit(); 512];
+                let mut expected = Vec::new();
+                let mut offsets = Vec::new();
+                let mut offset = 0;
+                for (i, &(active, rows)) in dimensions.iter().enumerate() {
+                    let plane_stride = stride * active / dimensions[0].0;
+                    offsets.push(offset);
+                    for row in 0..rows {
+                        for byte in 0..active {
+                            let value = (i * 71 + row * 17 + byte) as u8;
+                            storage[offset + row * plane_stride + byte].write(value);
+                            expected.push(value);
+                        }
+                    }
+                    offset += plane_stride * rows;
+                }
+                let metadata = CString::new("<video-padding/>").unwrap();
+                let raw = NDIlib_video_frame_v2_t {
+                    xres: 4,
+                    yres: 4,
+                    FourCC: format.into(),
+                    frame_rate_N: 30000,
+                    frame_rate_D: 1001,
+                    picture_aspect_ratio: 1.25,
+                    frame_format_type: ScanType::Interlaced.into(),
+                    timecode: 12345,
+                    timestamp: 67890,
+                    p_data: storage.as_mut_ptr().cast(),
+                    p_metadata: metadata.as_ptr(),
+                    __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                        line_stride_in_bytes: stride as i32,
+                    },
+                };
+                // Null FrameSync guards skip SDK calls; storage and metadata
+                // live until both independent guards and their views are gone.
+                let make = || unsafe {
+                    VideoRef::new(Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw)).unwrap()
+                };
+                let (frame, allocations) = video_allocation_count(make);
+                assert_eq!(allocations, 0);
+                let second = make();
+                let ((), allocations) = video_allocation_count(|| {
+                    assert_eq!(frame.planes().len(), dimensions.len());
+                    assert!(frame.plane(dimensions.len()).is_none());
+                    assert_eq!(frame.data().is_some(), padding == 0);
+                    if let Some(data) = frame.data() {
+                        assert_eq!(data, expected);
+                    }
+                    let mut position = 0;
+                    for (i, plane) in frame.planes().enumerate() {
+                        let (active, rows) = dimensions[i];
+                        assert_eq!(plane.row_count(), rows);
+                        assert_eq!(plane.active_row_bytes(), active);
+                        assert_eq!(plane.row_stride(), stride * active / dimensions[0].0);
+                        assert_eq!(plane.data().is_some(), padding == 0);
+                        assert!(plane.row(rows).is_none());
+                        let mut iterator = plane.rows();
+                        assert_eq!(iterator.len(), rows);
+                        assert_eq!(iterator.next_back(), plane.row(rows - 1));
+                        assert_eq!(iterator.len(), rows - 1);
+                        for (row_index, row) in plane.rows().enumerate() {
+                            assert_eq!(row.as_ptr(), unsafe {
+                                storage
+                                    .as_ptr()
+                                    .cast::<u8>()
+                                    .add(offsets[i] + row_index * plane.row_stride())
+                            });
+                            assert_eq!(row, &expected[position..position + active]);
+                            position += active;
+                        }
+                    }
+                    assert_eq!(position, expected.len());
+                });
+                assert_eq!(allocations, 0);
+                assert_eq!(frame.layout.data_len_bytes, offset);
+                assert_eq!(frame.layout.payload_len_bytes, expected.len());
+                let owned = frame.to_owned().unwrap();
+                let raw_owned = unsafe { VideoFrame::from_raw(&raw) }.unwrap();
+                assert_eq!(owned.data(), expected);
+                assert_eq!(raw_owned.data(), expected);
+                assert_eq!(owned.pixel_format(), format);
+                assert_eq!(
+                    owned.line_stride_or_size(),
+                    LineStrideOrSize::LineStrideBytes(dimensions[0].0 as i32)
+                );
+                assert_eq!(owned.metadata(), Some("<video-padding/>"));
+                assert_eq!((owned.frame_rate_n(), owned.frame_rate_d()), (30000, 1001));
+                assert_eq!(owned.picture_aspect_ratio(), 1.25);
+                assert_eq!(owned.scan_type(), ScanType::Interlaced);
+                assert_eq!((owned.timecode(), owned.timestamp()), (12345, 67890));
+                drop(frame);
+                assert_eq!(
+                    second.plane(0).unwrap().row(0).unwrap(),
+                    &expected[..dimensions[0].0]
+                );
+                // No metadata: exactly one allocation for active owned pixels.
+                let raw = NDIlib_video_frame_v2_t {
+                    p_metadata: ptr::null(),
+                    ..raw
+                };
+                let (copied, allocations) =
+                    video_allocation_count(|| unsafe { VideoFrame::from_raw(&raw) }.unwrap());
+                assert_eq!(allocations, 1);
+                assert_eq!(copied.data(), expected);
+                assert!(VideoFrame::builder()
+                    .resolution(4, 4)
+                    .pixel_format(format)
+                    .data(vec![0; expected.len() - 1])
+                    .build()
+                    .is_err());
+                assert!(crate::BorrowedVideoFrame::try_from_uncompressed(
+                    &vec![0; expected.len() - 1],
+                    4,
+                    4,
+                    format,
+                    30,
+                    1,
+                )
+                .is_err());
+                // Copied-send conversion must use the same normalization.
+                // This send-side fixture initializes padding too, because its
+                // constructor takes an already initialized application slice.
+                let mut initialized = vec![99; offset];
+                let mut position = 0;
+                for (i, &(active, rows)) in dimensions.iter().enumerate() {
+                    let plane_stride = stride * active / dimensions[0].0;
+                    for row in 0..rows {
+                        let start = offsets[i] + row * plane_stride;
+                        initialized[start..start + active]
+                            .copy_from_slice(&expected[position..position + active]);
+                        position += active;
+                    }
+                }
+                let send = unsafe {
+                    crate::BorrowedVideoFrame::from_parts_unchecked(
+                        &initialized,
+                        4,
+                        4,
+                        format.into(),
+                        30000,
+                        1001,
+                        1.25,
+                        ScanType::Interlaced,
+                        12345,
+                        LineStrideOrSize::LineStrideBytes(stride as i32),
+                        Some(&metadata),
+                        67890,
+                    )
+                };
+                let normalized = send.try_to_owned().unwrap();
+                assert_eq!(normalized.data(), expected);
+                assert_eq!(
+                    normalized.line_stride_or_size(),
+                    copied.line_stride_or_size()
+                );
+                assert_eq!(normalized.metadata(), Some("<video-padding/>"));
+            }
+        }
+    }
+
+    #[test]
+    fn video_padding_single_rows_and_zero_stride() {
+        use crate::capture::{FrameSyncVideoFree, Guard};
+        use std::mem::MaybeUninit;
+        for format in [
+            PixelFormat::BGRA,
+            PixelFormat::BGRX,
+            PixelFormat::RGBA,
+            PixelFormat::RGBX,
+            PixelFormat::UYVY,
+            PixelFormat::UYVA,
+            PixelFormat::P216,
+            PixelFormat::PA16,
+        ] {
+            let tight = ValidatedVideoLayout::new_uncompressed(format, 2, 1, Some(0)).unwrap();
+            assert!(tight.is_contiguous());
+            let active = format.try_line_stride(2).unwrap();
+            let padded =
+                ValidatedVideoLayout::new_uncompressed(format, 2, 1, Some(active + 4)).unwrap();
+            let mut storage = [MaybeUninit::<u8>::uninit(); 64];
+            for plane in padded.planes() {
+                for byte in &mut storage[plane.offset..plane.offset + plane.active_row_bytes] {
+                    byte.write(42);
+                }
+            }
+            let raw = NDIlib_video_frame_v2_t {
+                xres: 2,
+                yres: 1,
+                FourCC: format.into(),
+                frame_rate_N: 30,
+                frame_rate_D: 1,
+                p_data: storage.as_mut_ptr().cast(),
+                frame_format_type: ScanType::Progressive.into(),
+                __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                    line_stride_in_bytes: active + 4,
+                },
+                ..Default::default()
+            };
+            let frame =
+                unsafe { VideoRef::new(Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw)) }
+                    .unwrap();
+            assert_eq!(frame.data().is_some(), padded.plane_count == 1);
+            for plane in frame.planes() {
+                assert_eq!(plane.data().unwrap(), vec![42; plane.active_row_bytes()]);
+            }
+            assert_eq!(
+                frame.to_owned().unwrap().data(),
+                vec![42; tight.payload_len_bytes]
+            );
+        }
+        for format in [PixelFormat::YV12, PixelFormat::I420, PixelFormat::NV12] {
+            let tight = ValidatedVideoLayout::new_uncompressed(format, 4, 2, Some(0)).unwrap();
+            assert!(tight.is_contiguous());
+            let padded = ValidatedVideoLayout::new_uncompressed(format, 4, 2, Some(8)).unwrap();
+            assert!(!padded.is_contiguous()); // Chroma is one row, but plane gaps remain.
+        }
+    }
+
+    #[cfg(feature = "image-encoding")]
+    #[test]
+    fn video_padding_encoders_never_read_uninitialized_gaps() {
+        use crate::capture::{FrameSyncVideoFree, Guard};
+        use std::mem::MaybeUninit;
+        for format in [
+            PixelFormat::BGRA,
+            PixelFormat::BGRX,
+            PixelFormat::RGBA,
+            PixelFormat::RGBX,
+        ] {
+            let mut storage = [MaybeUninit::<u8>::uninit(); 24];
+            let pixels = [1, 2, 3, 255, 5, 6, 7, 255, 9, 10, 11, 255, 13, 14, 15, 255];
+            for row in 0..2 {
+                for byte in 0..8 {
+                    storage[row * 12 + byte].write(pixels[row * 8 + byte]);
+                }
+            }
+            let raw = NDIlib_video_frame_v2_t {
+                xres: 2,
+                yres: 2,
+                FourCC: format.into(),
+                frame_rate_N: 30,
+                frame_rate_D: 1,
+                frame_format_type: ScanType::Progressive.into(),
+                p_data: storage.as_mut_ptr().cast(),
+                __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                    line_stride_in_bytes: 12,
+                },
+                ..Default::default()
+            };
+            let borrowed =
+                unsafe { VideoRef::new(Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw)) }
+                    .unwrap();
+            let packed = image_test_frame(format, 2, 2, None, pixels.to_vec());
+            let png = borrowed.encode_png().unwrap();
+            assert_eq!(
+                decode_png_rgba(&png),
+                decode_png_rgba(&packed.encode_png().unwrap())
+            );
+            assert_eq!(
+                borrowed.encode_jpeg(85).unwrap(),
+                packed.encode_jpeg(85).unwrap()
+            );
+            assert_eq!(
+                borrowed.encode_data_url(ImageFormat::Png).unwrap(),
+                packed.encode_data_url(ImageFormat::Png).unwrap()
+            );
+            assert_eq!(borrowed.to_owned().unwrap().data(), pixels);
+        }
+    }
+
+    #[test]
+    fn video_padding_reported_642_pixel_reproduction() {
+        use crate::capture::{FrameSyncVideoFree, Guard};
+        use std::mem::MaybeUninit;
+        let mut storage = vec![MaybeUninit::<u8>::uninit(); 2592 * 32];
+        for row in 0..32 {
+            for byte in &mut storage[row * 2592..row * 2592 + 2568] {
+                byte.write(17);
+            }
+        }
+        let raw = NDIlib_video_frame_v2_t {
+            xres: 642,
+            yres: 32,
+            FourCC: PixelFormat::BGRA.into(),
+            frame_rate_N: 30,
+            frame_rate_D: 1,
+            frame_format_type: ScanType::Progressive.into(),
+            p_data: storage.as_mut_ptr().cast(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: 2592,
+            },
+            ..Default::default()
+        };
+        let frame =
+            unsafe { VideoRef::new(Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw)) }
+                .unwrap();
+        assert!(frame.data().is_none());
+        let owned = frame.to_owned().unwrap();
+        assert_eq!(owned.data().len(), 82_176);
+        assert_eq!(
+            owned.line_stride_or_size(),
+            LineStrideOrSize::LineStrideBytes(2568)
+        );
+        assert!(owned.data().iter().all(|&byte| byte == 17));
+    }
+
     #[test]
     fn video_default_matches_builder_and_reuse_updates_preserve_pixels() {
         let default = VideoFrame::default();
@@ -3545,7 +4100,11 @@ mod tests {
         // pixels. The owned source stays alive for the borrowed view's use.
         let guard = unsafe { Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), frame.to_raw()) };
         let borrowed = unsafe { VideoRef::new(guard) }.unwrap();
-        assert_eq!(borrowed.data().as_ptr(), frame.data().as_ptr());
+        assert!(borrowed.data().is_none());
+        assert_eq!(
+            borrowed.plane(0).unwrap().row(0).unwrap().as_ptr(),
+            frame.data().as_ptr()
+        );
         let png = borrowed.encode_png().unwrap();
         assert_eq!(
             decode_png_rgba(&png),
@@ -3780,7 +4339,8 @@ mod tests {
         );
         let source = ImagePixelSource::new(padded_rgba.layout, padded_rgba.data()).unwrap();
         let (pixels, _, _) = source.png_rgba_input().unwrap();
-        assert!(matches!(pixels, Cow::Owned(_)));
+        assert!(matches!(pixels, Cow::Borrowed(_)));
+        assert_eq!(pixels.as_ref(), &[1, 2, 3, 4, 5, 6, 7, 8]);
 
         let rgbx = image_test_frame(PixelFormat::RGBX, 2, 1, None, vec![1, 2, 3, 0, 5, 6, 7, 0]);
         let source = ImagePixelSource::new(rgbx.layout, rgbx.data()).unwrap();
@@ -3795,8 +4355,8 @@ mod tests {
             width: 2,
             height: 1,
             pixel_format: PixelFormat::RGBA,
-            data_len_bytes: 8,
             line_stride_or_size: LineStrideOrSize::DataSizeBytes(8),
+            ..ValidatedVideoLayout::new_uncompressed(PixelFormat::RGBA, 2, 1, None).unwrap()
         };
         let err = ImagePixelSource::new(data_size_layout, &[0; 8]).unwrap_err();
         let err_msg = err.to_string();
@@ -4533,7 +5093,7 @@ mod tests {
 
         // Verify data() returns correct size based on validated format
         assert_eq!(
-            frame_ref.data().len(),
+            frame_ref.data().unwrap().len(),
             expected_size,
             "data() should use validated pixel format for size calculation"
         );
@@ -6135,7 +6695,7 @@ mod tests {
 
         // Verify the cached length is used
         assert_eq!(
-            frame_ref.data().len(),
+            frame_ref.data().unwrap().len(),
             expected_size,
             "data() should return slice with cached length"
         );

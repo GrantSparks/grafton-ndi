@@ -8,6 +8,11 @@ fn handoff(video: VideoFrameRef<'_>, audio: AudioFrameRef<'_>, metadata: Metadat
     std::thread::scope(|scope| {
         scope.spawn(move || {
             let _ = video.data();
+            for plane in video.planes() {
+                for row in plane.rows() {
+                    let _ = row.len();
+                }
+            }
             let _ = audio.num_samples();
             let _ = metadata.data();
         });

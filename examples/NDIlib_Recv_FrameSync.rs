@@ -150,7 +150,13 @@ fn main() -> Result<(), Error> {
                     video.frame_rate_n(),
                     video.frame_rate_d()
                 );
-                println!("  Data size: {} bytes", video.data().len());
+                println!(
+                    "  Data size: {} bytes",
+                    video
+                        .planes()
+                        .map(|p| p.active_row_bytes() * p.row_count())
+                        .sum::<usize>()
+                );
                 println!();
             }
 

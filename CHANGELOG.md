@@ -12,9 +12,10 @@ API, see the [README](README.md) and [2.0 migration guide](docs/migration/1.x-to
 
 ## [2.0.0] - 2026-10-16
 
-Version 2.0.0 closes runtime and async-send ownership safety gaps and corrects
-SDK frame layout and timeout handling. Private `NDI` construction and owned
-async video submissions are breaking API changes. See the [1.x to 2.0 migration guide](docs/migration/1.x-to-2.0.md).
+Version 2.0.0 closes runtime, async-send ownership, and uninitialized video
+padding safety gaps and corrects SDK frame layout and timeout handling.
+Private `NDI` construction, owned async video submissions, and optional borrowed
+video data access are breaking API changes. See the [1.x to 2.0 migration guide](docs/migration/1.x-to-2.0.md).
 
 ### Breaking Changes
 
@@ -29,6 +30,11 @@ async video submissions are breaking API changes. See the [1.x to 2.0 migration 
   RGB formats, consistently in sizing helpers, frame construction, and receive
   validation (#88).
 
+- Borrowed receiver and FrameSync video `data()` returns `Option<&[u8]>`.
+  Padding between active rows/planes returns `None`; use `planes()`/`plane()`
+  and `VideoPlane::rows()` for allocation-free access. Owned capture and copied
+  sends normalize video into tightly packed planes, so their stride can shrink
+  (#100).
 - Borrowed audio `data()` returns `Option<&[f32]>` and exposes only packed
   samples (or active mono samples). Use `channel_data`/`channels` for padded layouts. Owned audio channel
   access borrows slices; copying received audio normalizes its stride.
@@ -73,6 +79,8 @@ async video submissions are breaking API changes. See the [1.x to 2.0 migration 
   timecode, timestamp, and scan type.
 - PNG/JPEG/data-URL encoding directly on borrowed receiver and FrameSync video,
   sharing the owned-frame encoding implementation.
+- Allocation-free borrowed video plane/row views for padded SDK layouts, with
+  indexed row access and concrete iterators tied to the captured frame (#100).
 - Borrowed audio channel iteration and mutable owned-channel access.
 - Upstream receiver tally/metadata controls, sender failover clearing, and
   cloneable sender/finder configuration.
@@ -81,6 +89,9 @@ async video submissions are breaking API changes. See the [1.x to 2.0 migration 
 
 ### Fixed
 
+- Never expose or copy uninitialized SDK video row padding through safe access,
+  owned conversion, PNG/JPEG encoding, or data URLs. All supported video formats
+  share checked plane offsets, strides, and active row descriptions (#100).
 - Serialize source snapshot retrieval and conversion into owned `Source` values
   per finder so another call cannot invalidate SDK pointers during conversion
   (#89).

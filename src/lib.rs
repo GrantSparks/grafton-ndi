@@ -142,7 +142,7 @@ pub use {
     frames::{
         AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout, FormatCategory,
         LineStrideOrSize, MetadataFrame, MetadataFrameRef, PixelFormat, PixelFormatInfo, ScanType,
-        VideoFrame, VideoFrameBuilder, VideoFrameRef,
+        VideoFrame, VideoFrameBuilder, VideoFrameRef, VideoPlane, VideoPlanes, VideoRows,
     },
     framesync::{FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncVideoRef},
     receiver::{
