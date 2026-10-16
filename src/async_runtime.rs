@@ -52,17 +52,51 @@
 use std::{
     future::Future,
     marker::PhantomData,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
 use crate::{
     capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
-    to_ms_checked, ConnectionStats, Receiver, Result,
+    to_ms_checked, ConnectionStats, Error, Receiver, Result,
 };
 
-#[cfg(feature = "tokio")]
-use crate::Error;
+// Dropping a future prevents its queued closure from starting SDK work. Work
+// that has already passed this gate cannot be interrupted safely.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+fn blocking_operation<F, T>(operation: F) -> (CancelOnDrop, impl FnOnce() -> Result<T> + Send)
+where
+    F: FnOnce() -> T + Send,
+{
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let guard = CancelOnDrop(Arc::clone(&cancelled));
+    let work = move || {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(Error::SpawnFailed(
+                "Blocking operation cancelled before starting".into(),
+            ));
+        }
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).map_err(|payload| {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload");
+            Error::SpawnFailed(format!("Blocking operation panicked: {message}"))
+        })
+    };
+    (guard, work)
+}
 
 /// Trait for async runtime spawn-blocking abstraction.
 ///
@@ -112,9 +146,13 @@ impl SpawnBlocking for TokioRuntime {
         R: Send + 'static,
     {
         async {
-            ::tokio::task::spawn_blocking(f)
+            let handle = ::tokio::runtime::Handle::try_current()
+                .map_err(|e| Error::SpawnFailed(e.to_string()))?;
+            let (_cancellation, work) = blocking_operation(f);
+            handle
+                .spawn_blocking(work)
                 .await
-                .map_err(|e| Error::SpawnFailed(e.to_string()))
+                .map_err(|e| Error::SpawnFailed(e.to_string()))?
         }
     }
 }
@@ -137,7 +175,10 @@ impl SpawnBlocking for AsyncStdRuntime {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        async { Ok(::async_std::task::spawn_blocking(f).await) }
+        async {
+            let (_cancellation, work) = blocking_operation(f);
+            ::async_std::task::spawn_blocking(work).await
+        }
     }
 }
 
@@ -305,6 +346,12 @@ impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
     /// blocking pool too, never on the async runtime's threads, and is safe to
     /// call while captures on this receiver are in flight — they serialize
     /// instead of racing. Confirm recovery via [`Self::connection_stats`].
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future skips queued work. A reconnect that has started
+    /// continues, including waiting for in-flight captures, and may reconnect
+    /// after this future is dropped.
     pub async fn reconnect(&self) -> Result<()> {
         let receiver = Arc::clone(&self.inner);
         R::spawn_blocking(move || receiver.reconnect()).await?
@@ -361,6 +408,11 @@ where
     /// * `Err(Error::FrameTimeout)` - No frame received within timeout (includes retry details)
     /// * `Err(Error::SpawnFailed)` - The blocking task panicked or was cancelled
     /// * `Err(_)` - Another error occurred during capture
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future skips queued work. An operation that has started
+    /// continues and can consume a frame whose result is discarded.
     pub async fn capture(&self, timeout: Duration) -> Result<K::Owned> {
         let receiver = Arc::clone(&self.recv.inner);
         with_timeout_budget::<R, _, _>(timeout, move |remaining| {
@@ -387,6 +439,11 @@ where
     /// * `Ok(None)` - No frame available within timeout
     /// * `Err(Error::SpawnFailed)` - The blocking task panicked or was cancelled
     /// * `Err(_)` - An error occurred during capture
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future skips queued work. An operation that has started
+    /// continues and can consume a frame whose result is discarded.
     pub async fn try_capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
         let receiver = Arc::clone(&self.recv.inner);
         with_timeout_budget::<R, _, _>(timeout, move |remaining| {
@@ -520,9 +577,8 @@ pub mod async_std {
     ///
     /// # Error Handling
     ///
-    /// All methods return [`crate::Result`]. Note that async-std's `spawn_blocking`
-    /// does not return a `Result`, so spawn failures from this runtime are less
-    /// common than with Tokio.
+    /// All methods return [`crate::Result`], converting blocking-operation
+    /// panics into [`crate::Error::SpawnFailed`].
     pub type AsyncReceiver = AsyncReceiverGeneric<AsyncStdRuntime>;
 }
 
@@ -577,5 +633,102 @@ mod timeout_tests {
             capture.as_mut().poll(&mut context),
             Poll::Ready(Err(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod executor_tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_skips_queued_operation() {
+        let (guard, work) = blocking_operation(|| panic!("cancelled work must not run"));
+        drop(guard);
+        assert!(matches!(work(), Err(Error::SpawnFailed(_))));
+    }
+
+    #[test]
+    fn cancellation_allows_started_operation_to_finish() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let (guard, work) = blocking_operation(move || {
+            started_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+            42
+        });
+        let worker = std::thread::spawn(work);
+        started_rx.recv().unwrap();
+        drop(guard);
+        finish_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap(), 42);
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn missing_tokio_context_returns_error() {
+        use std::task::{Context, Poll, Waker};
+        let mut operation = Box::pin(TokioRuntime::spawn_blocking(|| 42));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            operation.as_mut().poll(&mut context),
+            Poll::Ready(Err(Error::SpawnFailed(_)))
+        ));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_converts_blocking_panic() {
+        let runtime = ::tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(TokioRuntime::spawn_blocking(|| panic!("test panic")));
+        assert!(
+            matches!(result, Err(Error::SpawnFailed(message)) if message.contains("test panic"))
+        );
+    }
+
+    #[cfg(feature = "async-std")]
+    #[test]
+    fn async_std_converts_blocking_panic() {
+        let result =
+            ::async_std::task::block_on(AsyncStdRuntime::spawn_blocking(|| panic!("test panic")));
+        assert!(
+            matches!(result, Err(Error::SpawnFailed(message)) if message.contains("test panic"))
+        );
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn dropping_tokio_future_skips_queued_work() {
+        use std::task::{Context, Poll, Waker};
+        let runtime = ::tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = ::tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            started_rx.recv().unwrap();
+            let called = Arc::new(AtomicBool::new(false));
+            let worker_called = Arc::clone(&called);
+            let mut operation = Box::pin(TokioRuntime::spawn_blocking(move || {
+                worker_called.store(true, Ordering::Release)
+            }));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(matches!(
+                operation.as_mut().poll(&mut context),
+                Poll::Pending
+            ));
+            drop(operation);
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            // The single worker processes the cancelled closure before this sentinel.
+            ::tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(!called.load(Ordering::Acquire));
+        });
     }
 }
