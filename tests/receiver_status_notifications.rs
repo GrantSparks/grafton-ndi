@@ -84,7 +84,15 @@ fn media_capture_retains_capability_notifications() -> Result<(), Error> {
                 0 => assert!(media.video().try_capture(poll_timeout)?.is_none()),
                 1 => assert!(media.video().try_capture_ref(poll_timeout)?.is_none()),
                 2 => assert!(media.audio().try_capture(poll_timeout)?.is_none()),
-                3 => assert!(media.metadata().try_capture(poll_timeout)?.is_none()),
+                3 => {
+                    // SDK 6.3 can also deliver capability XML as ordinary
+                    // metadata. Consume those valid frames until the status/no-
+                    // frame result, rather than assuming a frameless stream.
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while media.metadata().try_capture(poll_timeout)?.is_some() {
+                        assert!(Instant::now() < deadline, "metadata queue did not drain");
+                    }
+                }
                 4 => assert!(matches!(
                     media.video().capture(retry_timeout),
                     Err(Error::FrameTimeout { .. })
