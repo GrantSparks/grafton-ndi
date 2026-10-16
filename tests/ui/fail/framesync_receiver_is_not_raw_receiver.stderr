@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+ --> tests/ui/fail/framesync_receiver_is_not_raw_receiver.rs:4:15
+  |
+4 |     needs_raw(fs.receiver());
+  |     --------- ^^^^^^^^^^^^^ expected `&Receiver`, found `&Receiver<FrameSyncAttached>`
+  |     |
+  |     arguments to this function are incorrect
+  |
+  = note: expected reference `&Receiver<RawCapture>`
+             found reference `&Receiver<FrameSyncAttached>`
+note: function defined here
+ --> tests/ui/fail/framesync_receiver_is_not_raw_receiver.rs:2:4
+  |
+2 | fn needs_raw(_: &Receiver) {}
+  |    ^^^^^^^^^ ------------

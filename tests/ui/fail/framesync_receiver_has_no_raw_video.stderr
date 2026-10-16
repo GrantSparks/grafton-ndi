@@ -1,0 +1,5 @@
+error[E0599]: no method named `video` found for reference `&grafton_ndi::Receiver<FrameSyncAttached>` in the current scope
+ --> tests/ui/fail/framesync_receiver_has_no_raw_video.rs:3:27
+  |
+3 |     let _ = fs.receiver().video();
+  |                           ^^^^^ method not found in `&grafton_ndi::Receiver<FrameSyncAttached>`

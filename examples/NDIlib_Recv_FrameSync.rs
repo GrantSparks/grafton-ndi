@@ -112,6 +112,9 @@ fn main() -> Result<(), Error> {
         audio_samples,
     )?;
 
+    // The attached receiver exposes controls, audio, metadata, and status.
+    // Raw video becomes available again after framesync.into_receiver().
+    println!("PTZ supported: {}", framesync.receiver().ptz_is_supported());
     println!("FrameSync created successfully");
     println!("\nCapturing {frame_count} frames with FrameSync...\n");
 

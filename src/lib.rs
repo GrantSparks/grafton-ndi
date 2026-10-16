@@ -146,8 +146,9 @@ pub use {
     },
     framesync::{FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncVideoRef},
     receiver::{
-        Capture, ConnectionStats, Receiver, ReceiverBandwidth, ReceiverColorFormat,
-        ReceiverOptions, ReceiverOptionsBuilder, ReceiverStatus, Tally,
+        Capture, ConnectionStats, FrameSyncAttached, RawCapture, Receiver, ReceiverBandwidth,
+        ReceiverColorFormat, ReceiverMode, ReceiverOptions, ReceiverOptionsBuilder, ReceiverStatus,
+        Tally,
     },
     runtime::NDI,
     sender::{

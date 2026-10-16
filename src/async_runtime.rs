@@ -423,7 +423,7 @@ where
     pub async fn capture(&self, timeout: Duration) -> Result<K::Owned> {
         let receiver = Arc::clone(&self.recv.inner);
         with_timeout_budget::<R, _, _>(timeout, move |deadline| {
-            receiver.capture_kind_until::<K>(deadline)
+            receiver.core.capture_kind_until::<K>(deadline)
         })
         .await
     }
@@ -458,7 +458,7 @@ where
     pub async fn try_capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
         let receiver = Arc::clone(&self.recv.inner);
         with_timeout_budget::<R, _, _>(timeout, move |deadline| {
-            receiver.try_capture_kind_until::<K>(deadline)
+            receiver.core.try_capture_kind_until::<K>(deadline)
         })
         .await
     }

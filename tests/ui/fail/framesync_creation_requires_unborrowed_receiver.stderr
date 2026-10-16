@@ -1,0 +1,11 @@
+error[E0505]: cannot move out of `receiver` because it is borrowed
+ --> tests/ui/fail/framesync_creation_requires_unborrowed_receiver.rs:5:28
+  |
+3 | fn attach(receiver: Receiver) {
+  |           -------- binding `receiver` declared here
+4 |     let frame = receiver.video().try_capture_ref(Duration::ZERO).unwrap();
+  |                 -------- borrow of `receiver` occurs here
+5 |     let _ = FrameSync::new(receiver);
+  |                            ^^^^^^^^ move out of `receiver` occurs here
+6 |     drop(frame);
+  |          ----- borrow later used here

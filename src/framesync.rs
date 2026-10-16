@@ -73,7 +73,7 @@
 //! }
 //! ```
 
-use std::{fmt, mem::ManuallyDrop, ptr};
+use std::fmt;
 
 use crate::{
     capture::{FrameSyncAudioFree, FrameSyncVideoFree, Guard},
@@ -81,7 +81,7 @@ use crate::{
         validate_packed_audio_dimensions, AudioFrame, AudioRef, ScanType, VideoFrame, VideoRef,
     },
     ndi_lib::*,
-    receiver::Receiver,
+    receiver::{FrameSyncAttached, Receiver},
     Error, Result,
 };
 
@@ -223,8 +223,26 @@ impl FrameSyncAudioRequest {
 /// # }
 /// ```
 pub struct FrameSync {
+    // Rust drops fields in declaration order. The SDK requires FrameSync to be
+    // destroyed before its receiver (Processing.NDI.FrameSync.h, create contract).
+    resource: FrameSyncResource,
+    receiver: Receiver<FrameSyncAttached>,
+}
+
+struct FrameSyncResource {
     instance: NDIlib_framesync_instance_t,
-    receiver: Receiver,
+    // Retain the runtime directly until after native destruction.
+    _ndi: crate::NDI,
+}
+
+impl Drop for FrameSyncResource {
+    fn drop(&mut self) {
+        // SAFETY: Creation checked for null; exclusive ownership and borrowed
+        // guards prevent destruction while capture buffers remain live.
+        unsafe { NDIlib_framesync_destroy(self.instance) };
+        #[cfg(test)]
+        crate::receiver::lifecycle_test_events::record("framesync");
+    }
 }
 
 impl FrameSync {
@@ -252,26 +270,42 @@ impl FrameSync {
     /// # }
     /// ```
     pub fn new(receiver: Receiver) -> Result<Self> {
-        let instance = unsafe { NDIlib_framesync_create(receiver.instance) };
+        // SAFETY: The owned receiver retains a live SDK resource through creation;
+        // successful creation transfers both resources into the ordered owners.
+        Self::new_with(receiver, |instance| unsafe {
+            NDIlib_framesync_create(instance)
+        })
+    }
 
+    fn new_with(
+        receiver: Receiver,
+        create: impl FnOnce(NDIlib_recv_instance_t) -> NDIlib_framesync_instance_t,
+    ) -> Result<Self> {
+        let instance = create(receiver.core.instance);
         if instance.is_null() {
+            // The untouched raw receiver drops normally on creation failure.
             return Err(Error::InitializationFailed(
                 "Failed to create NDI framesync instance".into(),
             ));
         }
-
-        receiver.set_framesync_attached(true);
-        Ok(Self { instance, receiver })
+        let resource = FrameSyncResource {
+            instance,
+            _ndi: receiver.core._ndi.clone(),
+        };
+        Ok(Self {
+            resource,
+            receiver: receiver.into_mode(),
+        })
     }
 
     /// Access the underlying receiver.
     ///
     /// Use this to access receiver functionality like tally, PTZ, or status
     /// queries while the FrameSync is active. Tally control publishes state
-    /// upstream; it does not query incoming tally. Raw video capture on this receiver
-    /// returns [`Error::InvalidConfiguration`]; use FrameSync capture methods or
+    /// upstream; it does not query incoming tally. This receiver mode has no
+    /// raw-video method; use FrameSync capture methods or
     /// recover the receiver with [`Self::into_receiver`] first.
-    pub fn receiver(&self) -> &Receiver {
+    pub fn receiver(&self) -> &Receiver<FrameSyncAttached> {
         &self.receiver
     }
 
@@ -280,16 +314,9 @@ impl FrameSync {
     /// This destroys the frame synchronizer and returns the receiver for
     /// continued use with raw capture or for creating a new FrameSync.
     pub fn into_receiver(self) -> Receiver {
-        // Destroy the framesync instance first, then extract the receiver
-        // without running Drop (which would double-destroy the framesync).
-        let this = ManuallyDrop::new(self);
-        unsafe {
-            NDIlib_framesync_destroy(this.instance);
-        }
-        this.receiver.set_framesync_attached(false);
-        // SAFETY: We will not use `this` again after reading the receiver field,
-        // and ManuallyDrop prevents the Drop impl from running.
-        unsafe { ptr::read(&this.receiver) }
+        let Self { resource, receiver } = self;
+        drop(resource);
+        receiver.into_mode()
     }
 
     /// Capture video with time-base correction.
@@ -343,7 +370,7 @@ impl FrameSync {
         let mut frame = NDIlib_video_frame_v2_t::default();
 
         unsafe {
-            NDIlib_framesync_capture_video(self.instance, &mut frame, field_type.into());
+            NDIlib_framesync_capture_video(self.resource.instance, &mut frame, field_type.into());
         }
 
         // Per SDK docs: Returns zeroed struct if no video received yet
@@ -351,7 +378,7 @@ impl FrameSync {
             return Ok(None);
         }
 
-        let guard = unsafe { Guard::<FrameSyncVideoFree>::new(self.instance, frame) };
+        let guard = unsafe { Guard::<FrameSyncVideoFree>::new(self.resource.instance, frame) };
         let frame = unsafe { FrameSyncVideoRef::new(guard)? };
 
         Ok(Some(frame))
@@ -456,7 +483,7 @@ impl FrameSync {
         // Guard frees it through this same instance, including validation errors.
         unsafe {
             NDIlib_framesync_capture_audio_v2(
-                self.instance,
+                self.resource.instance,
                 &mut frame,
                 request.sample_rate,
                 request.channels,
@@ -464,7 +491,7 @@ impl FrameSync {
             );
         }
 
-        let guard = unsafe { Guard::<FrameSyncAudioFree>::new(self.instance, frame) };
+        let guard = unsafe { Guard::<FrameSyncAudioFree>::new(self.resource.instance, frame) };
         unsafe { FrameSyncAudioRef::new(guard, request.samples == 0) }
     }
 
@@ -516,16 +543,7 @@ impl FrameSync {
     /// # }
     /// ```
     pub fn audio_queue_depth(&self) -> i32 {
-        unsafe { NDIlib_framesync_audio_queue_depth(self.instance) }
-    }
-}
-
-impl Drop for FrameSync {
-    fn drop(&mut self) {
-        unsafe {
-            NDIlib_framesync_destroy(self.instance);
-        }
-        self.receiver.set_framesync_attached(false);
+        unsafe { NDIlib_framesync_audio_queue_depth(self.resource.instance) }
     }
 }
 
@@ -548,7 +566,7 @@ unsafe impl Sync for FrameSync {}
 impl fmt::Debug for FrameSync {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FrameSync")
-            .field("instance", &self.instance)
+            .field("instance", &self.resource.instance)
             .field("audio_queue_depth", &self.audio_queue_depth())
             .finish()
     }
@@ -599,6 +617,55 @@ mod tests {
     use super::*;
     use crate::frames::{AudioFormat, LineStrideOrSize, PixelFormat};
     use std::ptr;
+
+    #[test]
+    fn receiver_modes_preserve_resource_order_and_exactly_once_destruction() {
+        use crate::receiver::lifecycle_test_events::track;
+        for recover in [false, true] {
+            let events = track(|| {
+                let ndi = crate::NDI::new().unwrap();
+                let mut receiver = Receiver::new(&ndi, &crate::ReceiverOptions::default()).unwrap();
+                let original = receiver.core.instance;
+                drop(ndi);
+                for _ in 0..3 {
+                    let fs = FrameSync::new(receiver).unwrap();
+                    assert_eq!(fs.receiver().core.instance, original);
+                    receiver = fs.into_receiver();
+                    assert_eq!(receiver.core.instance, original);
+                    assert!(receiver
+                        .video()
+                        .try_capture(std::time::Duration::ZERO)
+                        .is_ok());
+                }
+                let fs = FrameSync::new(receiver).unwrap();
+                if recover {
+                    drop(fs.into_receiver());
+                } else {
+                    drop(fs);
+                }
+            });
+            assert_eq!(
+                events,
+                [
+                    "framesync",
+                    "framesync",
+                    "framesync",
+                    "framesync",
+                    "receiver"
+                ]
+            );
+        }
+        let events = track(|| {
+            let ndi = crate::NDI::new().unwrap();
+            let receiver = Receiver::new(&ndi, &crate::ReceiverOptions::default()).unwrap();
+            drop(ndi);
+            assert!(matches!(
+                FrameSync::new_with(receiver, |_| ptr::null_mut()),
+                Err(Error::InitializationFailed(_))
+            ));
+        });
+        assert_eq!(events, ["receiver"]);
+    }
 
     #[test]
     fn audio_requests_reject_invalid_rates_and_dimensions_at_construction() {

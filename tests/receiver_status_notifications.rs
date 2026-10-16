@@ -1,6 +1,6 @@
-use grafton_ndi::{
-    Error, MetadataFrame, Receiver, ReceiverOptions, Sender, SenderOptions, SourceAddress, NDI,
-};
+mod common;
+
+use grafton_ndi::{Error, MetadataFrame, Receiver, ReceiverOptions, Sender, SenderOptions, NDI};
 use std::time::{Duration, Instant};
 
 fn wait_until(mut condition: impl FnMut() -> bool) {
@@ -18,17 +18,13 @@ fn wait_until(mut condition: impl FnMut() -> bool) {
 #[ignore = "Requires NDI runtime and loopback networking"]
 fn media_capture_retains_capability_notifications() -> Result<(), Error> {
     let ndi = NDI::new()?;
-    for kind in 0..5 {
+    eprintln!("SDK: {} on {}", NDI::version()?, std::env::consts::OS);
+    for kind in 0..6 {
         let sender = Sender::new(
             &ndi,
             &SenderOptions::builder(format!("status retention {kind}")).build(),
         )?;
-        let mut source = sender.source()?;
-        let port = match &source.address {
-            SourceAddress::Ip(address) => address.rsplit(':').next().unwrap(),
-            _ => "5961",
-        };
-        source.address = SourceAddress::Ip(format!("127.0.0.1:{port}"));
+        let source = common::loopback_source(&ndi, &sender)?;
         let options = ReceiverOptions::builder(source).build();
         let control = Receiver::new(&ndi, &options)?;
         let media = Receiver::new(&ndi, &options)?;
@@ -57,10 +53,26 @@ fn media_capture_retains_capability_notifications() -> Result<(), Error> {
                 1 => assert!(media.video().try_capture_ref(Duration::ZERO)?.is_none()),
                 2 => assert!(media.audio().try_capture(Duration::ZERO)?.is_none()),
                 3 => assert!(media.metadata().try_capture(Duration::ZERO)?.is_none()),
-                _ => assert!(matches!(
+                4 => assert!(matches!(
                     media.video().capture(Duration::from_millis(20)),
                     Err(Error::FrameTimeout { .. })
                 )),
+                _ => std::thread::scope(|scope| {
+                    let workers: Vec<_> = (0..3)
+                        .map(|_| {
+                            scope.spawn(|| {
+                                assert!(media
+                                    .video()
+                                    .try_capture(Duration::ZERO)
+                                    .unwrap()
+                                    .is_none());
+                            })
+                        })
+                        .collect();
+                    for worker in workers {
+                        worker.join().unwrap();
+                    }
+                }),
             }
             assert!(
                 media.poll_status_change(Duration::ZERO)?.is_some(),
