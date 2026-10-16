@@ -7,15 +7,6 @@ use std::{
     time::Duration,
 };
 
-#[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
-use std::os::raw::c_void;
-
-#[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
-use std::sync::atomic::{AtomicPtr, Ordering};
-
-#[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
-use crate::waitable_completion::WaitableCompletion;
-
 use crate::{
     finder::Source,
     frames::{
@@ -67,11 +58,9 @@ struct Inner {
     instance: NDIlib_send_instance_t,
     _name: CString,
     _groups: Option<CString>,
-    async_state: AsyncState,
+    video_callback: OnceLock<AsyncCallback>,
     // Kept in the sender, never the forgettable token. Dropped after Inner::drop drains.
-    pending_video: Mutex<Option<OwnedAsyncVideo>>,
-    #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
-    callback_ptr: AtomicPtr<c_void>,
+    video: Mutex<VideoState>,
 }
 
 #[derive(Debug)]
@@ -104,56 +93,75 @@ impl OwnedAsyncVideo {
     }
 }
 
-/// Async completion state for video frames
-struct AsyncState {
-    video_callback: OnceLock<AsyncCallback>,
-
-    #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
-    completion: WaitableCompletion,
+enum PendingVideo {
+    Owned(VideoFrame),
+    Copied(OwnedAsyncVideo),
 }
 
-impl fmt::Debug for AsyncState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut dbg = f.debug_struct("AsyncState");
-        dbg.field("video_callback_set", &self.video_callback.get().is_some());
+impl PendingVideo {
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(frame) => frame.data().len(),
+            Self::Copied(frame) => frame.data.len(),
+        }
+    }
 
-        #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
-        dbg.field("completed", &self.completion.is_complete());
+    fn into_owned(self) -> Option<VideoFrame> {
+        match self {
+            Self::Owned(frame) => Some(frame),
+            Self::Copied(_) => None,
+        }
+    }
+}
 
-        dbg.finish()
+#[derive(Default)]
+struct VideoState {
+    pending: Option<PendingVideo>,
+    in_flight: bool,
+}
+
+impl VideoState {
+    // Claim notification before invoking user code so panic/reentry cannot
+    // notify twice. The caller must first synchronize the SDK.
+    fn completed(&mut self) -> Option<usize> {
+        if std::mem::take(&mut self.in_flight) {
+            self.pending.as_ref().map(PendingVideo::len)
+        } else {
+            None
+        }
+    }
+}
+
+impl Inner {
+    fn notify(&self, len: Option<usize>) {
+        if let (Some(len), Some(callback)) = (len, self.video_callback.get()) {
+            callback(len);
+        }
+    }
+
+    fn complete(&self) {
+        let len = {
+            let mut video = self.video.lock().unwrap_or_else(|e| e.into_inner());
+            if video.in_flight {
+                flush_null_frame(self.instance);
+            }
+            video.completed()
+        };
+        self.notify(len);
     }
 }
 
 impl fmt::Debug for Inner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut dbg = f.debug_struct("Inner");
-        dbg.field("instance", &self.instance)
-            .field("async_state", &self.async_state);
-
-        #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
-        dbg.field("callback_ptr", &self.callback_ptr);
-
-        dbg.finish()
+        f.debug_struct("Inner")
+            .field("instance", &self.instance)
+            .field("video_callback_set", &self.video_callback.get().is_some())
+            .finish()
     }
 }
 
-impl Default for AsyncState {
-    fn default() -> Self {
-        Self {
-            video_callback: OnceLock::new(),
-
-            #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
-            completion: WaitableCompletion::new_completed(),
-        }
-    }
-}
-
-// SAFETY: All fields are thread-safe atomics or OnceLock
-unsafe impl Send for AsyncState {}
-unsafe impl Sync for AsyncState {}
-
-// SAFETY: Inner contains an NDI instance pointer which is thread-safe,
-// owned CStrings (Send+Sync), thread-safe atomics, and mutex-protected owned buffers.
+// SAFETY: SDK access is thread-safe; video ownership and synchronization are
+// serialized by the mutex. Other fields are owned strings and OnceLock.
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
@@ -523,29 +531,11 @@ pub struct AsyncVideoToken<'a, 'buf> {
 
 impl Drop for AsyncVideoToken<'_, '_> {
     fn drop(&mut self) {
-        // Callback-capable: try signal-based completion, fall back to null-frame flush
-        #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
-        {
-            if self
-                .inner
-                .async_state
-                .completion
-                .wait_timeout(Duration::from_secs(5))
-                .is_err()
-            {
-                flush_null_frame(self.inner.instance);
-            }
-        }
-
-        // Non-callback: always null-frame flush (guaranteed completion)
-        #[cfg(not(all(feature = "advanced_sdk", has_async_completion_callback)))]
-        {
-            flush_null_frame(self.inner.instance);
-        }
-
-        // User callback: exactly once, after completion is guaranteed
-        if let Some(callback) = self.inner.async_state.video_callback.get() {
-            callback(self._buffer.len());
+        if std::thread::panicking() {
+            let _ =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.inner.complete()));
+        } else {
+            self.inner.complete();
         }
     }
 }
@@ -556,13 +546,8 @@ impl<'a, 'buf> AsyncVideoToken<'a, 'buf> {
     /// This method provides an explicit way to wait for completion instead of relying on `Drop`.
     /// It consumes the token, ensuring the buffer is safe to reuse after this call returns.
     ///
-    /// # Behavior by SDK Version
-    ///
-    /// - **Standard SDK**: Sends a NULL frame to flush the pipeline, blocking until all pending
-    ///   async video operations complete. This is the same behavior as dropping the token.
-    /// - **Advanced SDK** (with `advanced_sdk` and `has_async_completion_callback`): Waits for the
-    ///   SDK completion callback to signal that the buffer has been released, with a 5-second
-    ///   timeout. Falls back to null-frame flush if the timeout elapses.
+    /// All SDK variants use the default NULL-frame synchronization contract.
+    /// No SDK completion callback is registered.
     ///
     /// # Errors
     ///
@@ -581,7 +566,7 @@ impl<'a, 'buf> AsyncVideoToken<'a, 'buf> {
     ///
     /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
     /// let borrowed_frame = BorrowedVideoFrame::try_from_uncompressed(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1)?;
-    /// let token = sender.send_video_async(&borrowed_frame);
+    /// let token = sender.send_video_async_copy(&borrowed_frame);
     ///
     /// // Explicitly wait for completion instead of relying on Drop
     /// token.wait()?;
@@ -594,44 +579,6 @@ impl<'a, 'buf> AsyncVideoToken<'a, 'buf> {
     pub fn wait(self) -> Result<()> {
         drop(self);
         Ok(())
-    }
-
-    /// Check if the async video operation has completed (advanced SDK with callback support only).
-    ///
-    /// This method is only available when the `advanced_sdk` feature is enabled and the SDK
-    /// provides async completion callbacks (`has_async_completion_callback` cfg).
-    ///
-    /// # Returns
-    ///
-    /// `true` if the NDI SDK has called the completion callback, indicating the buffer is no longer
-    /// in use. `false` if the operation is still pending.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # #[cfg(feature = "advanced_sdk")]
-    /// # {
-    /// # use grafton_ndi::{NDI, SenderOptions, PixelFormat, BorrowedVideoFrame};
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = NDI::new()?;
-    /// let options = SenderOptions::builder("Test Sender").build();
-    /// let mut sender = grafton_ndi::Sender::new(&ndi, &options)?;
-    ///
-    /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
-    /// let borrowed_frame = BorrowedVideoFrame::try_from_uncompressed(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1)?;
-    /// let token = sender.send_video_async(&borrowed_frame);
-    ///
-    /// // Poll for completion
-    /// while !token.is_complete() {
-    ///     std::thread::sleep(std::time::Duration::from_millis(1));
-    /// }
-    /// # Ok(())
-    /// # }
-    /// # }
-    /// ```
-    #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
-    pub fn is_complete(&self) -> bool {
-        self.inner.async_state.completion.is_complete()
     }
 }
 
@@ -669,41 +616,9 @@ impl Sender {
                 instance,
                 _name: name_cstr,
                 _groups: groups_cstr,
-                async_state: AsyncState::default(),
-                pending_video: Mutex::new(None),
-                #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
-                callback_ptr: AtomicPtr::new(ptr::null_mut()),
+                video_callback: OnceLock::new(),
+                video: Mutex::new(VideoState::default()),
             });
-
-            #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
-            {
-                // Store a non-owning pointer for the callback (no refcount increment)
-                // SAFETY: The pointer remains valid as long as the Arc<Inner> exists,
-                // which is guaranteed by our design: the callback is unregistered in Inner::drop
-                // before the last Arc reference is dropped.
-                let raw_inner = Arc::as_ptr(&inner) as *mut c_void;
-                inner.callback_ptr.store(raw_inner, Ordering::Release);
-
-                extern "C" fn video_done_cb(
-                    opaque: *mut c_void,
-                    _frame: *const NDIlib_video_frame_v2_t,
-                ) {
-                    // SAFETY: opaque is a non-owning pointer to Inner, created via Arc::as_ptr.
-                    // The pointer remains valid because:
-                    // 1. Inner::drop flushes in-flight frames before unregistering the callback
-                    // 2. The Arc<Inner> is kept alive by the Sender that registered this callback
-                    let inner: &Inner = unsafe { &*(opaque as *const Inner) };
-                    inner.async_state.completion.signal();
-                }
-
-                unsafe {
-                    NDIlib_send_set_video_async_completion(
-                        instance,
-                        raw_inner,
-                        Some(video_done_cb),
-                    );
-                }
-            }
 
             Ok(Self {
                 inner,
@@ -714,9 +629,74 @@ impl Sender {
 
     /// Send a video frame **synchronously** (NDI copies the buffer immediately).
     pub fn send_video(&self, video_frame: &VideoFrame) {
-        unsafe {
-            NDIlib_send_send_video_v2(self.inner.instance, &video_frame.to_raw());
-        }
+        let len = {
+            let mut video = self.inner.video.lock().unwrap_or_else(|e| e.into_inner());
+            // A synchronous video send also releases the previous async frame.
+            unsafe {
+                NDIlib_send_send_video_v2(self.inner.instance, &video_frame.to_raw());
+            }
+            video.completed()
+        };
+        self.inner.notify(len);
+    }
+
+    /// Submit an owned frame without copying its pixel or metadata allocations.
+    ///
+    /// The sender takes ownership before calling the SDK. The next async send
+    /// synchronizes the previous send and returns its owned frame for reuse.
+    /// The first send returns `None`. If the previous send used
+    /// [`Self::send_video_async_copy`], its snapshot is discarded and `None` is
+    /// returned. Call [`Self::finish_video_async`] to recover the final frame.
+    ///
+    /// Synchronous sends and explicit flushes complete the operation but retain
+    /// the owned frame for recovery by the next async send or finish call.
+    /// No SDK completion callback is registered, including with Advanced SDK.
+    /// If a Rust completion handler panics, the new frame remains retained and
+    /// the synchronized previous frame is dropped rather than returned.
+    pub fn send_video_async(&mut self, frame: VideoFrame) -> Option<VideoFrame> {
+        let raw = frame.to_raw();
+        self.submit_async(PendingVideo::Owned(frame), raw)
+    }
+
+    fn submit_async(
+        &mut self,
+        pending: PendingVideo,
+        raw: NDIlib_video_frame_v2_t,
+    ) -> Option<VideoFrame> {
+        let (previous, len) = {
+            let mut video = self.inner.video.lock().unwrap_or_else(|e| e.into_inner());
+            let len = video.completed();
+            // Store the new owner before FFI, retaining the old owner locally
+            // until this call synchronizes its SDK access. Moving a frame does
+            // not move its Vec/CString allocations.
+            let previous = video.pending.replace(pending);
+            video.in_flight = true;
+            unsafe {
+                NDIlib_send_send_video_async_v2(self.inner.instance, &raw);
+            }
+            (previous, len)
+        };
+        // State is consistent and the mutex unlocked before user code. If it
+        // panics, previous is safe to drop and the sender retains the new frame.
+        self.inner.notify(len);
+        previous.and_then(PendingVideo::into_owned)
+    }
+
+    /// Drain the SDK and return the final owned frame, if any.
+    ///
+    /// A pending copied snapshot is discarded and returns `None`. Repeated
+    /// calls return `None` and do not repeat completion notifications.
+    pub fn finish_video_async(&mut self) -> Option<VideoFrame> {
+        let (previous, len) = {
+            let mut video = self.inner.video.lock().unwrap_or_else(|e| e.into_inner());
+            if video.in_flight {
+                flush_null_frame(self.inner.instance);
+            }
+            let len = video.completed();
+            (video.pending.take(), len)
+        };
+        self.inner.notify(len);
+        previous.and_then(PendingVideo::into_owned)
     }
 
     /// Send a video frame asynchronously using a sender-owned snapshot.
@@ -724,12 +704,15 @@ impl Sender {
     /// Pixel data and metadata are copied before submission to the NDI SDK. The
     /// sender retains that snapshot until a subsequent async send or sender
     /// destruction, draining the SDK before releasing it. This remains safe if
-    /// the returned token is forgotten with [`std::mem::forget`]. At most one
-    /// snapshot is retained between calls.
+    /// the returned token is forgotten with [`std::mem::forget`]. A previous
+    /// owned frame is discarded after synchronization; call
+    /// [`Self::finish_video_async`] first to recover it. At most one snapshot
+    /// is retained between calls.
     ///
     /// The token's mutable sender borrow preserves single-flight usage. Dropping
     /// or waiting the token guarantees completion and invokes the registered
-    /// completion handler. Forgetting it skips that handler.
+    /// completion handler. Forgetting it defers notification until another video
+    /// send, flush, finish, or sender destruction.
     ///
     /// # Example
     /// ```no_run
@@ -748,7 +731,7 @@ impl Sender {
     /// // Describe caller-owned data; sending takes a snapshot
     /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
     /// let borrowed_frame = BorrowedVideoFrame::try_from_uncompressed(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1)?;
-    /// let token = sender.send_video_async(&borrowed_frame);
+    /// let token = sender.send_video_async_copy(&borrowed_frame);
     ///
     /// // The SDK reads the sender-owned snapshot until completion
     /// drop(token); // This triggers automatic flush
@@ -757,35 +740,13 @@ impl Sender {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn send_video_async<'b>(
+    pub fn send_video_async_copy<'b>(
         &'b mut self,
         video_frame: &BorrowedVideoFrame<'b>,
     ) -> AsyncVideoToken<'b, 'b> {
-        // Allocate before changing SDK state. The old snapshot stays alive until
-        // the NULL-frame drain returns, including after a forgotten token.
         let snapshot = OwnedAsyncVideo::snapshot(video_frame);
-        let mut pending = self
-            .inner
-            .pending_video
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if pending.is_some() {
-            flush_null_frame(self.inner.instance);
-        }
-        *pending = Some(snapshot);
-        let raw = pending.as_ref().unwrap().to_raw(video_frame);
-
-        #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
-        {
-            self.inner.async_state.completion.reset();
-        }
-
-        // The sender owns every pointer in raw that the SDK may retain. Its
-        // destructor drains before pending_video is automatically dropped.
-        unsafe {
-            NDIlib_send_send_video_async_v2(self.inner.instance, &raw);
-        }
-
+        let raw = snapshot.to_raw(video_frame);
+        self.submit_async(PendingVideo::Copied(snapshot), raw);
         AsyncVideoToken {
             inner: &self.inner,
             _buffer: video_frame.data,
@@ -997,17 +958,23 @@ impl Sender {
         Source::try_from_raw(source_ptr)
     }
 
-    /// Register a handler that will be called once the SDK has released
-    /// the last buffer passed to `send_video_async`.
-    /// The callback receives the buffer length.
+    /// Register a completion handler receiving the submitted pixel-buffer length.
     ///
-    /// **Note**: Due to the use of `OnceLock`, this callback can only be set once.
-    /// Subsequent calls to this method will be silently ignored.
+    /// It runs on the calling thread, after SDK synchronization, outside internal
+    /// locks, once per submitted async frame. Completion is observed by the next
+    /// video send, token wait/drop, flush, finish, or sender destruction. Owned and
+    /// copied sends share this handler. Forgetting a copy token defers notification
+    /// until another synchronization operation; it does not lose the notification.
+    /// State is updated before invocation, so panicking or reentering shared
+    /// sender methods cannot repeat the same notification. Destruction during
+    /// unwinding suppresses a handler panic to avoid a double panic.
+    ///
+    /// Only the first registered handler is used.
     pub fn on_async_video_done<F>(&self, handler: F)
     where
         F: Fn(usize) + Send + Sync + 'static,
     {
-        let _ = self.inner.async_state.video_callback.set(Box::new(handler));
+        let _ = self.inner.video_callback.set(Box::new(handler));
     }
 
     /// Flush pending async video operations synchronously.
@@ -1016,14 +983,15 @@ impl Sender {
     /// pending async video operations are complete.
     ///
     /// `AsyncVideoToken::drop` and [`AsyncVideoToken::wait`] already perform
-    /// this drain for ordinary safe `send_video_async` calls. Prefer waiting the
+    /// this drain for ordinary safe `send_video_async_copy` calls. Prefer waiting the
     /// token when you hold one; use this method when you need an explicit
     /// sender-level drain.
     ///
     /// # Buffer Lifetime
     ///
-    /// After this function returns, all previously sent async video buffers
-    /// can be safely reused or freed.
+    /// After this function returns, the SDK has released the pending buffer.
+    /// The sender retains its owned frame; use [`Self::finish_video_async`] or
+    /// the next owned async send to recover it without copying.
     ///
     /// # Example
     ///
@@ -1036,7 +1004,7 @@ impl Sender {
     ///
     /// let mut buffer = vec![0u8; 1920 * 1080 * 4];
     /// let frame = BorrowedVideoFrame::try_from_uncompressed(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1)?;
-    /// let token = sender.send_video_async(&frame);
+    /// let token = sender.send_video_async_copy(&frame);
     ///
     /// // Prefer waiting the token for ordinary borrowed async sends.
     /// token.wait()?;
@@ -1047,75 +1015,25 @@ impl Sender {
     /// # }
     /// ```
     pub fn flush_async_blocking(&self) {
-        flush_null_frame(self.inner.instance);
-    }
-
-    /// Wait for pending async operations with timeout.
-    ///
-    /// With `advanced_sdk`, this waits up to the specified timeout for the
-    /// in-flight frame's completion callback. Without `advanced_sdk`, this
-    /// calls `flush_async_blocking` to drain pending operations.
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(())` if the operation completed within the timeout
-    /// - `Err(Error::Timeout)` if the timeout elapsed (advanced_sdk only)
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{NDI, SenderOptions};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = NDI::new()?;
-    /// let options = SenderOptions::builder("Test").build();
-    /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
-    ///
-    /// // ... send some async frames ...
-    ///
-    /// // Wait with timeout for completion
-    /// sender.flush_async(Duration::from_secs(1))?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn flush_async(&self, timeout: Duration) -> Result<()> {
-        #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
-        {
-            self.inner
-                .async_state
-                .completion
-                .wait_timeout(timeout)
-                .map_err(Error::Timeout)
-        }
-
-        #[cfg(not(all(feature = "advanced_sdk", has_async_completion_callback)))]
-        {
-            let _ = timeout;
-            self.flush_async_blocking();
-            Ok(())
-        }
+        self.inner.complete();
     }
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // 1. Flush any in-flight async video (guaranteed completion)
-        flush_null_frame(self.instance);
-
-        // 2. Now safe to unregister the callback (no in-flight frame can trigger it)
-        #[cfg(all(feature = "advanced_sdk", has_async_completion_callback))]
-        unsafe {
-            NDIlib_send_set_video_async_completion(self.instance, ptr::null_mut(), None);
+        let video = self.video.get_mut().unwrap_or_else(|e| e.into_inner());
+        if video.in_flight {
+            flush_null_frame(self.instance);
         }
-
-        // 3. Destroy the instance
-        unsafe {
-            NDIlib_send_destroy(self.instance);
+        let len = video.completed();
+        // Destroy before running user code, so a callback panic cannot leak the
+        // SDK instance. Pending allocations remain alive through destruction.
+        unsafe { NDIlib_send_destroy(self.instance) };
+        if std::thread::panicking() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.notify(len)));
+        } else {
+            self.notify(len);
         }
-
-        // _name (CString) and _groups (Option<CString>) are dropped automatically
-        // after this point, which is correct: the CStrings must outlive the NDI
-        // instance but can be freed once it is destroyed.
     }
 }
 
@@ -1127,9 +1045,6 @@ impl Drop for Inner {
 /// - `NDIlib_send_send_metadata` (no async variant exists)
 /// - `NDIlib_send_get_tally`
 /// - `NDIlib_send_get_no_connections`
-///
-/// The Advanced SDK provides `NDIlib_send_set_video_async_completion` for registering
-/// buffer-release callbacks (not available in the standard SDK).
 ///
 /// `Inner` holds an opaque NDI pointer and owned CStrings that are automatically
 /// freed in Drop, making it safe to move between threads.
@@ -1239,97 +1154,191 @@ impl SenderOptionsBuilder {
 mod tests {
     use super::*;
 
-    #[test]
-    #[allow(clippy::drop_non_drop)] // Match the original forget/drop use-after-free reproducer.
-    fn forgotten_async_token_retains_owned_pixels_and_metadata() {
+    fn test_owned_frame(value: u8) -> VideoFrame {
+        let mut frame = VideoFrame::builder()
+            .resolution(16, 16)
+            .pixel_format(PixelFormat::BGRA)
+            .frame_rate(30, 1)
+            .metadata(format!("<frame value='{value}'/>"))
+            .build()
+            .unwrap();
+        frame.data_mut().fill(value);
+        frame
+    }
+
+    fn test_sender() -> Sender {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        let name = format!(
+            "Owned async regression {} {}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        );
         let ndi = NDI::new().unwrap();
-        let options = SenderOptions::builder("Forgotten token ownership")
-            .clock_video(false)
-            .clock_audio(false)
-            .build();
-        let mut sender = Sender::new(&ndi, &options).unwrap();
-
-        for value in [17, 42] {
-            let data = vec![value; 16 * 16 * 4];
-            let metadata = CString::new(format!("<frame value='{value}'/>")).unwrap();
-            let mut frame =
-                BorrowedVideoFrame::try_from_uncompressed(&data, 16, 16, PixelFormat::BGRA, 30, 1)
-                    .unwrap();
-            frame.metadata = Some(&metadata);
-            // Verify the SDK descriptor points to independent allocations.
-            let snapshot = OwnedAsyncVideo::snapshot(&frame);
-            let raw = snapshot.to_raw(&frame);
-            assert_eq!(raw.p_data, snapshot.data.as_ptr() as *mut u8);
-            assert_ne!(raw.p_data, data.as_ptr() as *mut u8);
-            assert_eq!(raw.p_metadata, snapshot.metadata.as_ref().unwrap().as_ptr());
-            assert_ne!(raw.p_metadata, metadata.as_ptr());
-
-            let token = sender.send_video_async(&frame);
-            std::mem::forget(token);
-            drop(frame);
-            drop(data);
-            drop(metadata);
-
-            // No token destructor ran. Both SDK-referenced allocations must
-            // nevertheless remain valid, including across the next send.
-            let pending = sender.inner.pending_video.lock().unwrap();
-            let pending = pending.as_ref().unwrap();
-            assert_eq!(pending.data, vec![value; 16 * 16 * 4]);
-            assert_eq!(
-                pending.metadata.as_ref().unwrap().to_str().unwrap(),
-                format!("<frame value='{value}'/>")
-            );
-        }
-        sender.flush_async_blocking();
-        // Destruction must drain before releasing the last snapshot too.
-        drop(sender);
+        Sender::new(
+            &ndi,
+            &SenderOptions::builder(name)
+                .clock_video(false)
+                .clock_audio(false)
+                .build(),
+        )
+        .unwrap()
     }
 
     #[test]
-    #[allow(clippy::drop_non_drop)] // Explicitly end caller ownership before inspecting storage.
-    fn callback_panic_keeps_async_snapshot_owned() {
-        let ndi = NDI::new().unwrap();
-        let options = SenderOptions::builder("Panicking async callback")
-            .clock_video(false)
-            .clock_audio(false)
-            .build();
-        let mut sender = Sender::new(&ndi, &options).unwrap();
-        sender.on_async_video_done(|_| panic!("intentional callback panic"));
-        let data = vec![23; 16 * 16 * 4];
-        let frame =
-            BorrowedVideoFrame::try_from_uncompressed(&data, 16, 16, PixelFormat::BGRA, 30, 1)
-                .unwrap();
+    fn owned_async_recycles_original_pixel_and_metadata_allocations() {
+        let mut sender = test_sender();
+        let first = test_owned_frame(11);
+        let pixels = first.data().as_ptr();
+        let metadata = first.metadata_cstr().unwrap().as_ptr();
+        assert!(sender.send_video_async(first).is_none());
+        {
+            let video = sender.inner.video.lock().unwrap();
+            let Some(PendingVideo::Owned(frame)) = &video.pending else {
+                panic!("missing owned frame")
+            };
+            assert_eq!(frame.to_raw().p_data, pixels as *mut u8);
+            assert_eq!(frame.to_raw().p_metadata, metadata);
+        }
+        let second = test_owned_frame(22);
+        let second_pixels = second.data().as_ptr();
+        let recycled = sender.send_video_async(second).unwrap();
+        assert_eq!(recycled.data().as_ptr(), pixels);
+        assert_eq!(recycled.metadata_cstr().unwrap().as_ptr(), metadata);
+        assert_eq!(recycled.metadata(), Some("<frame value='11'/>"));
+        let final_frame = sender.finish_video_async().unwrap();
+        assert_eq!(final_frame.data().as_ptr(), second_pixels);
+        assert!(sender.finish_video_async().is_none());
+    }
+
+    #[test]
+    fn mixed_sync_flush_and_copy_sends_notify_once_and_preserve_recovery() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = Arc::new(AtomicUsize::new(0));
+        let observed = count.clone();
+        let mut sender = test_sender();
+        sender.on_async_video_done(move |len| {
+            assert_eq!(len, 1024);
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+        let frame = test_owned_frame(1);
+        let pixels = frame.data().as_ptr();
+        sender.send_video_async(frame);
+        sender.send_video(&test_owned_frame(9));
+        sender.flush_async_blocking();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(sender.finish_video_async().unwrap().data().as_ptr(), pixels);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        // A copied send discards the previous owned frame after synchronization.
+        sender.send_video_async(test_owned_frame(2));
+        let data = vec![3; 1024];
+        let metadata = CString::new("<copy/>").unwrap();
+        {
+            let mut borrowed =
+                BorrowedVideoFrame::try_from_uncompressed(&data, 16, 16, PixelFormat::BGRA, 30, 1)
+                    .unwrap();
+            borrowed.metadata = Some(&metadata);
+            std::mem::forget(sender.send_video_async_copy(&borrowed));
+        }
+        {
+            let video = sender.inner.video.lock().unwrap();
+            let Some(PendingVideo::Copied(copy)) = &video.pending else {
+                panic!("missing copied snapshot")
+            };
+            assert_ne!(copy.data.as_ptr(), data.as_ptr());
+            assert_ne!(copy.metadata.as_ref().unwrap().as_ptr(), metadata.as_ptr());
+        }
+        drop(data);
+        drop(metadata);
+        {
+            let video = sender.inner.video.lock().unwrap();
+            let Some(PendingVideo::Copied(copy)) = &video.pending else {
+                panic!("missing copied snapshot")
+            };
+            assert_eq!(copy.data, vec![3; 1024]);
+            assert_eq!(copy.metadata.as_ref().unwrap().to_str().unwrap(), "<copy/>");
+        }
+        // Replacing a copied send returns no owned frame; forgotten token still
+        // gets its one notification when the next submission synchronizes it.
+        assert!(sender.send_video_async(test_owned_frame(4)).is_none());
+        sender.finish_video_async().unwrap();
+        sender.flush_async_blocking();
+        assert_eq!(count.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn callback_panic_after_submission_keeps_new_owned_frame_recoverable() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = Arc::new(AtomicUsize::new(0));
+        let observed = count.clone();
+        let mut sender = test_sender();
+        sender.on_async_video_done(move |_| {
+            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("intentional completion panic");
+            }
+        });
+        sender.send_video_async(test_owned_frame(1));
+        let second = test_owned_frame(2);
+        let pixels = second.data().as_ptr();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drop(sender.send_video_async(&frame));
+            sender.send_video_async(second);
         }));
         assert!(result.is_err());
-        drop(frame);
+        assert_eq!(sender.finish_video_async().unwrap().data().as_ptr(), pixels);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert!(sender.finish_video_async().is_none());
+    }
+
+    #[test]
+    fn completion_callback_can_reenter_shared_flush_without_deadlock() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Weak,
+        };
+        let reference = Arc::new(Mutex::new(Weak::<Sender>::new()));
+        let callback_reference = reference.clone();
+        let count = Arc::new(AtomicUsize::new(0));
+        let observed = count.clone();
+        let mut sender = test_sender();
+        sender.on_async_video_done(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            let sender = callback_reference.lock().unwrap().upgrade().unwrap();
+            sender.flush_async_blocking();
+            sender.send_video(&test_owned_frame(7));
+        });
+        sender.send_video_async(test_owned_frame(5));
+        let sender = Arc::new(sender);
+        *reference.lock().unwrap() = Arc::downgrade(&sender);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| sender.flush_async_blocking());
+            }
+        });
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let mut sender = Arc::try_unwrap(sender).unwrap();
+        assert_eq!(sender.finish_video_async().unwrap().data()[0], 5);
+    }
+
+    #[test]
+    fn sender_drop_notifies_once_for_forgotten_copy_token() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = Arc::new(AtomicUsize::new(0));
+        let observed = count.clone();
+        let mut sender = test_sender();
+        sender.on_async_video_done(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+        let data = vec![0; 1024];
+        {
+            let frame =
+                BorrowedVideoFrame::try_from_uncompressed(&data, 16, 16, PixelFormat::BGRA, 30, 1)
+                    .unwrap();
+            std::mem::forget(sender.send_video_async_copy(&frame));
+        }
         drop(data);
-        assert_eq!(
-            sender
-                .inner
-                .pending_video
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .data,
-            vec![23; 16 * 16 * 4]
-        );
-        let replacement = vec![45; 16 * 16 * 4];
-        let frame = BorrowedVideoFrame::try_from_uncompressed(
-            &replacement,
-            16,
-            16,
-            PixelFormat::BGRA,
-            30,
-            1,
-        )
-        .unwrap();
-        std::mem::forget(sender.send_video_async(&frame));
-        drop(frame);
-        drop(replacement);
         drop(sender);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[test]

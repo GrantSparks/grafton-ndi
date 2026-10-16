@@ -36,8 +36,8 @@ bindgen = "0.72.1"
 
 [features]
 default = ["image-encoding"]
-# Enable NDI Advanced SDK features (requires NDI Advanced SDK)
-# This includes async video completion callbacks and other advanced functionality
+# Retained compatibility flag; SDK linkage is selected by NDI_SDK_DIR.
+# Video sending uses default SDK synchronization with either SDK.
 advanced_sdk = []
 # Enable image encoding support (PNG, JPEG, data URLs).
 # Enabled by default. Use `default-features = false` for a minimal build.

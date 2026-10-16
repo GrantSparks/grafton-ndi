@@ -4,9 +4,6 @@ use std::{
 };
 
 fn main() {
-    // Register custom cfg for conditional compilation based on SDK capabilities
-    println!("cargo:rustc-check-cfg=cfg(has_async_completion_callback)");
-
     // Determine the base NDI SDK directory.
     let ndi_sdk_path = env::var("NDI_SDK_DIR").unwrap_or_else(|_| {
         if cfg!(target_os = "macos") {
@@ -91,8 +88,7 @@ fn main() {
         r#"// wrapper.h - Include file for bindgen to properly generate NDI bindings
 
 // DO NOT define NDI_NO_PROTOTYPES or NDILIB_NO_PROTOTYPES here!
-// We need full prototypes so bindgen can generate bindings for all functions,
-// including NDIlib_send_set_video_async_completion (available in NDI Advanced SDK)
+// We need full prototypes so bindgen can generate bindings for all functions.
 
 // Include the main NDI header
 #include <{header_file}>
@@ -214,13 +210,4 @@ fn main() {
     bindings
         .write_to_file(&bindings_path)
         .expect("Couldn't write bindings!");
-
-    // Check if NDIlib_send_set_video_async_completion is available in the bindings
-    // This function is only available in NDI Advanced SDK 6.1.1+
-    let bindings_content =
-        fs::read_to_string(&bindings_path).expect("Failed to read generated bindings");
-
-    if bindings_content.contains("NDIlib_send_set_video_async_completion") {
-        println!("cargo:rustc-cfg=has_async_completion_callback");
-    }
 }
