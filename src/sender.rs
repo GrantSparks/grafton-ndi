@@ -667,16 +667,12 @@ impl Sender {
 
     /// Sends a metadata frame.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the metadata contains an interior NUL byte, exceeds
-    /// the metadata size limit, or cannot fit the SDK length field.
-    pub fn send_metadata(&self, metadata_frame: &MetadataFrame) -> Result<()> {
-        let (_c_data, raw) = metadata_frame.to_raw()?;
+    pub fn send_metadata(&self, metadata_frame: &MetadataFrame) {
+        let raw = metadata_frame.to_raw();
+        // The borrowed C string remains live through this synchronous SDK call.
         unsafe {
             NDIlib_send_send_metadata(self.inner.instance, &raw);
         }
-        Ok(())
     }
 
     /// Get the current tally state for this sender.
@@ -778,14 +774,10 @@ impl Sender {
 
     /// Adds connection metadata.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the metadata contains an interior NUL byte, exceeds
-    /// the metadata size limit, or cannot fit the SDK length field.
-    pub fn add_connection_metadata(&self, metadata_frame: &MetadataFrame) -> Result<()> {
-        let (_c_data, raw) = metadata_frame.to_raw()?;
+    pub fn add_connection_metadata(&self, metadata_frame: &MetadataFrame) {
+        let raw = metadata_frame.to_raw();
+        // The borrowed C string remains live through this synchronous SDK call.
         unsafe { NDIlib_send_add_connection_metadata(self.inner.instance, &raw) }
-        Ok(())
     }
 
     /// Sets failover source.
@@ -826,7 +818,9 @@ impl Sender {
     /// ```
     pub fn source(&self) -> Result<Source> {
         let source_ptr = unsafe { NDIlib_send_get_source_name(self.inner.instance) };
-        Source::try_from_raw(source_ptr)
+        // SAFETY: the SDK sender owns this live descriptor and its strings
+        // through the synchronous copy performed here.
+        unsafe { Source::try_from_raw(source_ptr) }
     }
 
     /// Replace the completion handler receiving the submitted pixel-buffer length.
@@ -1031,6 +1025,19 @@ mod tests {
                 .build(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn metadata_send_methods_reuse_validated_text_with_sdk() {
+        let sender = test_sender();
+        let frame = MetadataFrame::with_data("<ndi_text>é</ndi_text>", 42).unwrap();
+        let expected_ptr = frame.to_raw().p_data;
+        for _ in 0..3 {
+            sender.send_metadata(&frame);
+            assert_eq!(frame.to_raw().p_data, expected_ptr);
+        }
+        sender.add_connection_metadata(&frame);
+        sender.clear_connection_metadata();
     }
 
     #[test]

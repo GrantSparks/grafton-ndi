@@ -4,6 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::{CStr, CString},
     fmt::{self, Display, Formatter},
+    net::IpAddr,
     ptr,
     sync::Mutex,
     time::{Duration, Instant},
@@ -268,15 +269,22 @@ impl Finder {
     /// # }
     /// ```
     pub fn current_sources(&self) -> Result<Vec<Source>> {
-        self.current_sources_with(
-            |num_sources| unsafe { NDIlib_find_get_current_sources(self.instance, num_sources) },
-            Source::try_from_raw,
-        )
+        // SAFETY: the SDK returns a live snapshot guarded by sources_lock until
+        // current_sources_with completes its deep copy.
+        unsafe {
+            self.current_sources_with(
+                |num_sources| NDIlib_find_get_current_sources(self.instance, num_sources),
+                |source| Source::try_from_raw(source),
+            )
+        }
     }
 
     // Keep acquisition and conversion in one critical section: the SDK owns both
     // the array and its strings, so locking only the SDK call is insufficient.
-    fn current_sources_with(
+    /// # Safety
+    /// `fetch` must return a live array of the reported count, with readable
+    /// source descriptors and C strings until all copies finish under the lock.
+    unsafe fn current_sources_with(
         &self,
         fetch: impl FnOnce(&mut u32) -> *const NDIlib_source_t,
         mut copy: impl FnMut(*const NDIlib_source_t) -> Result<Source>,
@@ -478,6 +486,55 @@ fn parse_authority(address: &str) -> Option<Authority<'_>> {
     Some(Authority { host, port })
 }
 
+#[derive(Clone, Copy)]
+enum HostQuery<'a> {
+    Ip(IpAddr),
+    Name(&'a str),
+}
+
+impl<'a> HostQuery<'a> {
+    fn parse(host: &'a str) -> Option<Self> {
+        let ip_text = if host.starts_with('[') {
+            host.strip_prefix('[')?.strip_suffix(']')?
+        } else {
+            host
+        };
+        if let Ok(ip) = ip_text.parse::<IpAddr>() {
+            return Some(Self::Ip(ip));
+        }
+        if host != ip_text || host.is_empty() || host.contains('\0') {
+            return None;
+        }
+        let name = host.strip_suffix('.').unwrap_or(host);
+        if name.is_empty()
+            || (name.contains('.') && name.bytes().all(|c| c.is_ascii_digit() || c == b'.'))
+            || !name.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label.as_bytes()[0].is_ascii_alphanumeric()
+                    && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                    && label
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+            })
+            || name.len() > 253
+        {
+            return None;
+        }
+        Some(Self::Name(name))
+    }
+
+    fn matches(self, candidate: &str) -> bool {
+        match self {
+            Self::Ip(ip) => candidate.parse::<IpAddr>() == Ok(ip),
+            Self::Name(name) => candidate
+                .strip_suffix('.')
+                .unwrap_or(candidate)
+                .eq_ignore_ascii_case(name),
+        }
+    }
+}
+
 /// Network address of an NDI source.
 ///
 /// NDI sources can be addressed via URL (for NDI HX sources) or IP address
@@ -494,10 +551,10 @@ pub enum SourceAddress {
 }
 
 impl SourceAddress {
-    /// Check if this address contains the given host or IP.
+    /// Check whether this address has the exact host or IP.
     ///
-    /// This performs a substring match against the address string, useful for
-    /// finding sources by hostname or IP address.
+    /// Hostnames compare without ASCII case or a final DNS dot. Invalid bare-host
+    /// queries return false.
     ///
     /// # Arguments
     ///
@@ -510,17 +567,18 @@ impl SourceAddress {
     ///
     /// let addr = SourceAddress::Ip("192.168.1.100:5960".to_string());
     /// assert!(addr.contains_host("192.168.1.100"));
-    /// assert!(addr.contains_host("192.168.1"));
+    /// assert!(!addr.contains_host("192.168.1"));
     ///
     /// let url = SourceAddress::Url("http://camera.local:8080".to_string());
     /// assert!(url.contains_host("camera.local"));
     /// ```
     pub fn contains_host(&self, host: &str) -> bool {
-        match self {
-            SourceAddress::Ip(ip) => ip.contains(host),
-            SourceAddress::Url(url) => url.contains(host),
-            SourceAddress::None => false,
-        }
+        HostQuery::parse(host).is_some_and(|query| self.matches_query(query))
+    }
+
+    fn matches_query(&self, query: HostQuery<'_>) -> bool {
+        self.authority()
+            .is_some_and(|authority| query.matches(authority.host))
     }
 
     /// Extract an explicit port from conventional host/port or URL syntax.
@@ -600,8 +658,8 @@ pub(crate) struct RawSource {
 impl Source {
     /// Check if this source matches a given host or IP address.
     ///
-    /// This method checks both the source name and address for a match,
-    /// making it easy to find sources by hostname or IP.
+    /// This checks the complete address host, or for hostname queries the
+    /// machine component of an SDK `MACHINE (Source Name)` label.
     ///
     /// # Arguments
     ///
@@ -622,7 +680,21 @@ impl Source {
     /// assert!(!source.matches_host("192.168.1.1"));
     /// ```
     pub fn matches_host(&self, host: &str) -> bool {
-        self.name.contains(host) || self.address.contains_host(host)
+        HostQuery::parse(host).is_some_and(|query| self.matches_query(query))
+    }
+
+    fn matches_query(&self, query: HostQuery<'_>) -> bool {
+        if self.address.matches_query(query) {
+            return true;
+        }
+        match query {
+            HostQuery::Ip(_) => false,
+            HostQuery::Name(_) => self
+                .name
+                .split_once(" (")
+                .filter(|(_, source)| source.ends_with(')'))
+                .is_some_and(|(machine, _)| query.matches(machine)),
+        }
     }
 
     /// Extract the host from conventional host/port or URL syntax.
@@ -689,7 +761,7 @@ impl Source {
     /// A non-null `source_ptr` must point to a live `NDIlib_source_t`. Its non-null
     /// string pointers must remain readable through their NUL terminators until
     /// copying finishes.
-    pub(crate) fn try_from_raw(source_ptr: *const NDIlib_source_t) -> Result<Self> {
+    pub(crate) unsafe fn try_from_raw(source_ptr: *const NDIlib_source_t) -> Result<Self> {
         // Check top-level pointer
         if source_ptr.is_null() {
             return Err(Error::NullPointer("NDIlib_source_t pointer".into()));
@@ -829,7 +901,18 @@ impl Display for Source {
 /// # }
 /// ```
 pub struct SourceCache {
-    cache: Mutex<HashMap<String, Source>>,
+    cache: Mutex<CacheState>,
+}
+
+struct CacheState {
+    entries: HashMap<String, Source>,
+    generation: Option<u64>,
+}
+
+impl CacheState {
+    fn invalidate_pending(&mut self) {
+        self.generation = self.generation.and_then(|value| value.checked_add(1));
+    }
 }
 
 impl SourceCache {
@@ -869,7 +952,8 @@ impl SourceCache {
     /// # Errors
     ///
     /// - [`Error::NoSourcesFound`] if no source matching the host is discovered
-    /// - [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`]
+    /// - [`Error::InvalidConfiguration`] if `host` is not a bare hostname or IP,
+    ///   or `timeout` exceeds [`crate::MAX_TIMEOUT`]
     /// - Other errors if NDI initialization or discovery fails
     ///
     /// # Examples
@@ -884,62 +968,77 @@ impl SourceCache {
     /// // Find by IP address
     /// let source = cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
     ///
-    /// // Find by partial IP
-    /// let source = cache.find_by_host("192.168.0", Duration::from_secs(5))?;
-    ///
-    /// // Find by name
+    /// // Find by the machine component of an SDK source name
     /// let source = cache.find_by_host("CAMERA1", Duration::from_secs(5))?;
     /// # Ok(())
     /// # }
     /// ```
     pub fn find_by_host(&self, host: &str, timeout: Duration) -> Result<Source> {
+        self.find_by_host_with(host, timeout, |query| {
+            let ndi = NDI::new()?;
+            let hint = host
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .unwrap_or(host);
+            let options = FinderOptions::builder()
+                .show_local_sources(true)
+                .extra_ips(hint)
+                .build();
+            let finder = Finder::new(&ndi, &options)?;
+            finder.poll_until_deadline(timeout, |sources| {
+                sources
+                    .into_iter()
+                    .find(|source| source.matches_query(query))
+            })
+        })
+    }
+
+    fn find_by_host_with(
+        &self,
+        host: &str,
+        timeout: Duration,
+        discover: impl FnOnce(HostQuery<'_>) -> Result<Option<Source>>,
+    ) -> Result<Source> {
+        let query = HostQuery::parse(host).ok_or_else(|| {
+            Error::InvalidConfiguration("Host must be a bare hostname or IP address".into())
+        })?;
         to_ms_checked(timeout)?;
-        {
+        let generation = {
             let cache = self
                 .cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(cached) = cache.get(host) {
+            if let Some(cached) = cache.entries.get(host) {
                 return Ok(cached.clone());
             }
-        }
+            cache.generation
+        };
 
-        let ndi = NDI::new()?;
-        // Use extra_ips to hint NDI to look at the specific host IP
-        // This significantly improves discovery speed and reliability
-        let options = FinderOptions::builder()
-            .show_local_sources(true)
-            .extra_ips(host)
-            .build();
-        let finder = Finder::new(&ndi, &options)?;
-
-        // Resolve the host by polling discovery to the deadline, returning the
-        // instant a matching source appears. See `Finder::poll_until_deadline`
-        // for why this beats a single `wait_for_sources` on staggered networks.
-        let source = finder
-            .poll_until_deadline(timeout, |sources| {
-                sources.into_iter().find(|s| s.matches_host(host))
-            })?
-            .ok_or_else(|| Error::NoSourcesFound {
-                criteria: format!("host: {host}"),
-            })?;
-
+        // Discovery may wait for the SDK. Leave the cache mutex available to
+        // invalidation and unrelated cache hits while this lookup is pending.
+        let source = discover(query)?.ok_or_else(|| Error::NoSourcesFound {
+            criteria: format!("host: {host}"),
+        })?;
         {
             let mut cache = self
                 .cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // Sources own their strings and do not retain SDK resources.
-            cache.insert(host.to_string(), source.clone());
+            if generation.is_some() && cache.generation == generation {
+                cache
+                    .entries
+                    .entry(host.to_string())
+                    .or_insert_with(|| source.clone());
+            }
         }
-
         Ok(source)
     }
 
     /// Invalidate the cache entry for a specific host.
     ///
     /// This is useful when a source goes offline or when you want to force
-    /// a fresh discovery on the next lookup.
+    /// a fresh discovery on the next lookup. Discovery started before this
+    /// call may return to its caller, but cannot repopulate the cache afterward.
     ///
     /// # Arguments
     ///
@@ -967,13 +1066,15 @@ impl SourceCache {
             .cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.remove(host);
+        cache.invalidate_pending();
+        cache.entries.remove(host);
     }
 
     /// Clear all cached sources.
     ///
     /// This removes all entries from the cache, forcing fresh discovery
-    /// for all subsequent lookups.
+    /// for all subsequent lookups. Pending discovery cannot repopulate the
+    /// cache after this call returns.
     ///
     /// # Examples
     ///
@@ -996,7 +1097,8 @@ impl SourceCache {
             .cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.clear();
+        cache.invalidate_pending();
+        cache.entries.clear();
     }
 
     /// Get the number of cached sources.
@@ -1023,7 +1125,7 @@ impl SourceCache {
             .cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.len()
+        cache.entries.len()
     }
 
     /// Check if the cache is empty.
@@ -1048,14 +1150,17 @@ impl SourceCache {
             .cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.is_empty()
+        cache.entries.is_empty()
     }
 }
 
 impl Default for SourceCache {
     fn default() -> Self {
         Self {
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(CacheState {
+                entries: HashMap::new(),
+                generation: Some(0),
+            }),
         }
     }
 }
@@ -1063,6 +1168,186 @@ impl Default for SourceCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_host_matching_ignores_labels_ports_and_url_payloads() {
+        let other = Source {
+            name: "CAMERA10 (192.168.1.1)".into(),
+            address: SourceAddress::Ip("192.168.1.100:5960".into()),
+        };
+        assert!(!other.matches_host("192.168.1.1"));
+        assert!(!other.matches_host("5960"));
+        assert!(!other.matches_host("CAMERA1"));
+        let exact = Source {
+            name: "CAMERA1 (Program)".into(),
+            address: SourceAddress::Url(
+                "http://user:pass@Camera.Local:8080/ndi?next=192.0.2.1".into(),
+            ),
+        };
+        assert!(exact.matches_host("camera.local."));
+        assert!(exact.matches_host("camera1"));
+        assert!(!exact.matches_host("192.0.2.1"));
+        assert!(!exact.matches_host("Program"));
+        let ipv6 = SourceAddress::Ip("[2001:0db8:0:0:0:0:0:1]:5960".into());
+        assert!(ipv6.contains_host("2001:db8::1"));
+        assert!(ipv6.contains_host("[2001:db8::1]"));
+        for invalid in [
+            "",
+            "camera:5960",
+            "http://camera.local",
+            "camera/local",
+            "192.168.1",
+            "foo\0bar",
+            "[bad]",
+        ] {
+            assert!(HostQuery::parse(invalid).is_none(), "{invalid:?}");
+        }
+        let (_, allocations) = crate::test_alloc::allocation_count(|| {
+            for _ in 0..100 {
+                assert!(exact.matches_host("CAMERA.LOCAL"));
+                assert!(ipv6.contains_host("2001:db8::1"));
+            }
+        });
+        assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn cache_selects_exact_host_and_rejects_invalid_queries_before_discovery() {
+        let cache = SourceCache::new();
+        let wrong = Source {
+            name: "CAMERA10 (Program)".into(),
+            address: SourceAddress::Ip("192.168.1.100:5960".into()),
+        };
+        let right = Source {
+            name: "CAMERA1 (Program)".into(),
+            address: SourceAddress::Ip("192.168.1.1:5961".into()),
+        };
+        let timeout = Duration::ZERO;
+        let selected = cache
+            .find_by_host_with("192.168.1.1", timeout, |query| {
+                Ok([wrong.clone(), right.clone()]
+                    .into_iter()
+                    .find(|s| s.matches_query(query)))
+            })
+            .unwrap();
+        assert_eq!(selected, right);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            cache
+                .find_by_host_with("192.168.1.1", timeout, |_| panic!("cache hit"))
+                .unwrap(),
+            right
+        );
+        for invalid in ["", "192.168.1.1:5961", "camera?query", "foo\0bar"] {
+            assert!(matches!(
+                cache.find_by_host_with(invalid, timeout, |_| panic!(
+                    "invalid query reached discovery"
+                )),
+                Err(Error::InvalidConfiguration(_))
+            ));
+        }
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn invalidation_prevents_pending_lookup_from_repopulating_cache() {
+        use std::sync::{mpsc, Arc};
+        for clear in [false, true] {
+            let cache = Arc::new(SourceCache::new());
+            let (started_tx, started_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let old = Source {
+                name: "old".into(),
+                address: SourceAddress::Ip("192.0.2.1:5960".into()),
+            };
+            let fresh = Source {
+                name: "fresh".into(),
+                address: SourceAddress::Ip("192.0.2.1:5961".into()),
+            };
+            let pending = Arc::clone(&cache);
+            let old_result = old.clone();
+            let thread = std::thread::spawn(move || {
+                pending
+                    .find_by_host_with("192.0.2.1", Duration::ZERO, |_| {
+                        started_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                        Ok(Some(old_result))
+                    })
+                    .unwrap()
+            });
+            started_rx.recv().unwrap();
+            if clear {
+                cache.clear();
+            } else {
+                cache.invalidate("192.0.2.1");
+            }
+            assert_eq!(cache.len(), 0);
+            let found = cache
+                .find_by_host_with("192.0.2.1", Duration::ZERO, |_| Ok(Some(fresh.clone())))
+                .unwrap();
+            assert_eq!(found, fresh);
+            resume_tx.send(()).unwrap();
+            assert_eq!(thread.join().unwrap(), old);
+            assert_eq!(
+                cache
+                    .find_by_host_with("192.0.2.1", Duration::ZERO, |_| panic!(
+                        "fresh entry was overwritten"
+                    ))
+                    .unwrap(),
+                fresh
+            );
+        }
+    }
+
+    #[test]
+    fn absent_invalidation_and_empty_clear_suppress_pending_fills() {
+        use std::sync::{mpsc, Arc};
+        for clear in [false, true] {
+            let cache = Arc::new(SourceCache::new());
+            let (started_tx, started_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let pending = Arc::clone(&cache);
+            let thread = std::thread::spawn(move || {
+                pending
+                    .find_by_host_with("camera.local", Duration::ZERO, |_| {
+                        started_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                        Ok(Some(Source {
+                            name: "CAMERA (Program)".into(),
+                            address: SourceAddress::None,
+                        }))
+                    })
+                    .unwrap()
+            });
+            started_rx.recv().unwrap();
+            if clear {
+                cache.clear();
+            } else {
+                cache.invalidate("absent.local");
+            }
+            resume_tx.send(()).unwrap();
+            thread.join().unwrap();
+            assert!(cache.is_empty());
+        }
+    }
+
+    #[test]
+    fn exhausted_generation_suppresses_publication() {
+        let cache = SourceCache::new();
+        cache.cache.lock().unwrap().generation = Some(u64::MAX);
+        cache.invalidate("absent");
+        let source = Source {
+            name: "camera".into(),
+            address: SourceAddress::Ip("192.0.2.1".into()),
+        };
+        assert_eq!(
+            cache
+                .find_by_host_with("192.0.2.1", Duration::ZERO, |_| Ok(Some(source.clone())))
+                .unwrap(),
+            source
+        );
+        assert!(cache.is_empty());
+    }
     use std::ffi::CString;
 
     #[test]
@@ -1129,6 +1414,7 @@ mod tests {
             .cache
             .lock()
             .unwrap()
+            .entries
             .insert("camera".into(), Source::default());
         for host in ["camera", "not_cached"] {
             assert!(matches!(
@@ -1169,7 +1455,9 @@ mod tests {
                         },
                     };
                     start.wait();
-                    let sources = finder.current_sources_with(
+                    // SAFETY: raw and both C strings stay live through copying;
+                    // this test's snapshot lock serializes their use.
+                    let sources = unsafe { finder.current_sources_with(
                         |count| {
                             // Model an SDK snapshot whose buffers remain borrowed
                             // until conversion finishes, not just until fetch returns.
@@ -1188,7 +1476,7 @@ mod tests {
                             assert_eq!(active_snapshot.fetch_sub(1, Ordering::SeqCst), 1);
                             owned
                         },
-                    ).unwrap();
+                    ) }.unwrap();
                     drop(name);
                     drop(address);
                     assert_eq!(sources[0].name, format!("Camera {index}"));
@@ -1209,16 +1497,17 @@ mod tests {
                 .join()
                 .is_err());
         });
-        assert!(finder
-            .current_sources_with(|_| ptr::null(), |_| panic!("empty snapshot must not copy"),)
-            .unwrap()
-            .is_empty());
+        assert!(unsafe {
+            finder.current_sources_with(|_| ptr::null(), |_| panic!("empty snapshot must not copy"))
+        }
+        .unwrap()
+        .is_empty());
     }
 
     #[test]
     fn test_try_from_raw_null_pointer() {
         // Test that null pointer is rejected
-        let result = Source::try_from_raw(ptr::null());
+        let result = unsafe { Source::try_from_raw(ptr::null()) };
         assert!(result.is_err());
         match result {
             Err(Error::NullPointer(msg)) => {
@@ -1238,7 +1527,7 @@ mod tests {
             },
         };
 
-        let result = Source::try_from_raw(&source as *const _);
+        let result = unsafe { Source::try_from_raw(&source as *const _) };
         assert!(result.is_err());
         match result {
             Err(Error::NullPointer(msg)) => {
@@ -1257,7 +1546,7 @@ mod tests {
                 p_url_address: url.as_ptr(),
             },
         };
-        let source = Source::try_from_raw(&raw).unwrap();
+        let source = unsafe { Source::try_from_raw(&raw) }.unwrap();
         assert!(source.name.is_empty());
         assert!(
             matches!(source.address, SourceAddress::Url(ref address) if address == "ndi://127.0.0.1:5960")
@@ -1279,7 +1568,7 @@ mod tests {
             },
         };
 
-        let result = Source::try_from_raw(&source as *const _);
+        let result = unsafe { Source::try_from_raw(&source as *const _) };
         assert!(result.is_ok());
 
         let source = result.unwrap();
@@ -1305,7 +1594,7 @@ mod tests {
             },
         };
 
-        let result = Source::try_from_raw(&source as *const _);
+        let result = unsafe { Source::try_from_raw(&source as *const _) };
         assert!(result.is_ok());
 
         let source = result.unwrap();
@@ -1330,7 +1619,7 @@ mod tests {
             },
         };
 
-        let result = Source::try_from_raw(&source as *const _);
+        let result = unsafe { Source::try_from_raw(&source as *const _) };
         assert!(result.is_ok());
 
         let source = result.unwrap();

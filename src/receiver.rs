@@ -616,10 +616,10 @@ impl Receiver {
     /// Send metadata upstream and return the SDK's status flag unchanged.
     ///
     /// This flag is not a connection query; use [`Self::is_connected`] for that.
-    /// Returns an error for invalid metadata before calling the SDK.
-    pub fn send_metadata(&self, metadata: &MetadataFrame) -> Result<bool> {
-        let (_data, raw) = metadata.to_raw()?;
-        Ok(unsafe { NDIlib_recv_send_metadata(self.instance, &raw) })
+    pub fn send_metadata(&self, metadata: &MetadataFrame) -> bool {
+        let raw = metadata.to_raw();
+        // The borrowed C string remains live through this synchronous SDK call.
+        unsafe { NDIlib_recv_send_metadata(self.instance, &raw) }
     }
 
     /// Return whether the connected source supports PTZ commands.
@@ -1685,7 +1685,12 @@ mod tests {
         // Runtime implementations differ in their status flags when no source
         // is connected. These controls must remain callable in that state.
         let _sdk_status = receiver.set_tally(&Tally::new(true, false));
-        receiver.send_metadata(&MetadataFrame::new()).unwrap();
+        let frame = MetadataFrame::with_data("<ndi_text>é</ndi_text>", 42).unwrap();
+        let pointer = frame.to_raw().p_data;
+        for _ in 0..3 {
+            let _sdk_status = receiver.send_metadata(&frame);
+            assert_eq!(frame.to_raw().p_data, pointer);
+        }
     }
 
     #[test]

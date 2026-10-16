@@ -119,7 +119,7 @@ if finder.wait_for_sources(Duration::from_secs(2))? {
 }
 ```
 
-For applications that repeatedly reconnect to known devices, `SourceCache` handles runtime initialization, discovery, host/IP matching, and cache invalidation.
+For applications that repeatedly reconnect to known devices, `SourceCache` handles runtime initialization, discovery, exact host/IP matching, and cache invalidation. Pass a complete bare hostname or IP address. For searches by partial IP or source label, filter a `Finder` snapshot explicitly.
 
 ```rust
 use grafton_ndi::SourceCache;

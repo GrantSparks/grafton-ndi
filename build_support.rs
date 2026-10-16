@@ -16,7 +16,7 @@ pub fn library_subdirs(os: &str, arch: &str, target: &str) -> Result<Vec<&'stati
         ),
         ("linux", "x86_64") => Ok(vec!["x86_64-linux-gnu"]),
         ("linux", "x86") => Ok(vec!["i686-linux-gnu"]),
-        ("linux", "aarch64") => Ok(vec!["aarch64-linux-gnu", "aarch64-rpi4-linux-gnueabihf"]),
+        ("linux", "aarch64") => Ok(vec!["aarch64-linux-gnu", "aarch64-rpi4-linux-gnueabi"]),
         ("linux", "arm") => Ok(if target.starts_with("armv7") {
             vec![
                 "arm-rpi4-linux-gnueabihf",
@@ -85,8 +85,8 @@ mod tests {
             ["x64"]
         );
         assert_eq!(
-            library_subdirs("linux", "aarch64", "aarch64-unknown-linux-gnu").unwrap()[0],
-            "aarch64-linux-gnu"
+            library_subdirs("linux", "aarch64", "aarch64-unknown-linux-gnu").unwrap(),
+            ["aarch64-linux-gnu", "aarch64-rpi4-linux-gnueabi"]
         );
         assert!(library_subdirs("linux", "x86_64", "x86_64-unknown-linux-musl").is_err());
         assert!(library_subdirs("windows", "aarch64", "aarch64-pc-windows-msvc").is_err());
@@ -152,6 +152,41 @@ mod tests {
             select_library(&sdk, "linux", "x86_64", "x86_64-unknown-linux-gnu")
                 .unwrap_err()
                 .contains("libndi.so")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selects_aarch64_artifacts_only_from_matching_sdk_directories() {
+        let root =
+            std::env::temp_dir().join(format!("grafton-aarch64-build-test-{}", std::process::id()));
+        let sdk = root.join("sdk");
+        let x86 = sdk.join("lib/x86_64-linux-gnu");
+        let fallback = sdk.join("lib/aarch64-rpi4-linux-gnueabi");
+        let generic = sdk.join("lib/aarch64-linux-gnu");
+        std::fs::create_dir_all(&x86).unwrap();
+        std::fs::create_dir_all(&fallback).unwrap();
+        std::fs::write(x86.join("libndi.so"), []).unwrap();
+        let target = "aarch64-unknown-linux-gnu";
+        assert!(select_library(&sdk, "linux", "aarch64", target).is_err());
+
+        std::fs::write(fallback.join("libndi.so"), []).unwrap();
+        assert_eq!(
+            select_library(&sdk, "linux", "aarch64", target).unwrap(),
+            (fallback.clone(), "ndi", "dylib")
+        );
+
+        std::fs::write(fallback.join("libndi_advanced.so"), []).unwrap();
+        assert_eq!(
+            select_library(&sdk, "linux", "aarch64", target).unwrap(),
+            (fallback, "ndi_advanced", "dylib")
+        );
+
+        std::fs::create_dir_all(&generic).unwrap();
+        std::fs::write(generic.join("libndi.so"), []).unwrap();
+        assert_eq!(
+            select_library(&sdk, "linux", "aarch64", target).unwrap(),
+            (generic, "ndi", "dylib")
         );
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -19,6 +19,15 @@ video data access are breaking API changes. See the [1.x to 2.0 migration guide]
 
 ### Breaking Changes
 
+- `SourceCache::find_by_host`, `Source::matches_host`, and
+  `SourceAddress::contains_host` now compare exact host identity. Cache queries
+  require a bare hostname or IP; partial IPs, ports, URL text, and source-label
+  fragments no longer match (#104).
+- `Sender::send_metadata` and `Sender::add_connection_metadata` now return unit;
+  `Receiver::send_metadata` returns the SDK boolean directly. Metadata text is
+  validated when frames are built or changed, so sends have no local error path
+  (#108).
+
 - `FrameSyncAudioRequest` is now opaque and copyable, with fallible
   `capture(channels, samples)` and `capture_with(sample_rate, channels, samples)`
   constructors taking `i32` dimensions and `Option<i32>` sample rate. Explicit
@@ -55,6 +64,12 @@ video data access are breaking API changes. See the [1.x to 2.0 migration guide]
   handler; it can also be cleared.
 
 ### Changed
+
+- Owned standalone and video/audio metadata share one validated C-string owner.
+  Repeated sends and text access reuse that storage without payload copies or
+  UTF-8 rescans (#108).
+- Private SDK pointer readers now require explicit unsafe call sites and owner
+  proofs; public owned and borrowed frame behavior is unchanged (#107).
 
 - Async video sends take ownership of `VideoFrame` and return the previous
   completed frame for reuse without per-send pixel copies. `finish_video_async`
@@ -94,6 +109,11 @@ video data access are breaking API changes. See the [1.x to 2.0 migration guide]
   library's Rust 1.87 minimum.
 
 ### Fixed
+
+- Prevent discovery started before `SourceCache::invalidate` or `clear` from
+  repopulating or overwriting the cache after invalidation (#105).
+- Select the `aarch64-rpi4-linux-gnueabi` library directory shipped by the
+  standard NDI 6 SDK for Linux AArch64 targets (#106).
 
 - Reject FrameSync audio requests exceeding the 64 MiB sample payload cap or
   the SDK's signed byte stride before native allocation/processing. Owned audio
