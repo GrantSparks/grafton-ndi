@@ -70,30 +70,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Monitor status changes
     loop {
         if let Some(status) = receiver.poll_status_change(Duration::from_secs(1))? {
-            print!("[Status Change] ");
-
-            if let Some(tally) = status.tally {
-                print!("Tally: ");
-                if tally.on_program {
-                    print!("ON-AIR ");
-                }
-                if tally.on_preview {
-                    print!("PREVIEW ");
-                }
-                if !tally.on_program && !tally.on_preview {
-                    print!("OFF ");
-                }
-            }
-
-            if let Some(connections) = status.connections {
-                print!("| Connections: {connections} ");
-            }
-
-            if status.other {
-                print!("| Other changes detected");
-            }
-
-            println!();
+            println!(
+                "[Status Change] Connections: {} (source capabilities may also have changed)",
+                status.connections
+            );
         } else {
             // Timeout - could show a heartbeat here
             print!(".");
