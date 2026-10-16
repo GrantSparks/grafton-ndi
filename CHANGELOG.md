@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Include blocking pool queue delay in async `try_capture` timeout budgets and
+  reject invalid timeouts before scheduling work, consistently with `capture`.
+  Clarify that async budgets begin on the future's first poll.
 - Make borrowed async sends safe when their completion token is forgotten. The
   sender now copies pixels and metadata into retained storage and drains the SDK
   before replacing or destroying it. Existing call signatures remain unchanged;

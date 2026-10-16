@@ -234,7 +234,7 @@ if receiver.ptz_is_supported() {
 
 ### Integrate With Async Runtimes
 
-NDI receive calls are fundamentally blocking SDK calls. The optional async wrappers make that explicit by running receive work on the runtime's blocking pool while preserving the timeout budget from the moment the async method is called.
+NDI receive calls are fundamentally blocking SDK calls. The optional async wrappers make that explicit by running receive work on the runtime's blocking pool while preserving the timeout budget from the future's first poll. Both `capture` and `try_capture` subtract blocking pool queue delay before the SDK waits. Queued work can still finish after the budget expires; these wrappers do not impose a wall-clock completion deadline.
 
 ```rust
 use grafton_ndi::tokio::AsyncReceiver;
