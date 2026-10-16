@@ -59,33 +59,37 @@
 //!
 //! ## Async Sending
 //!
-//! The library snapshots borrowed pixel data and metadata into sender-owned storage before
-//! calling `NDIlib_send_send_video_async_v2`, so forgetting a send token is safe.
-//! The completion callback notifies when the buffer can be reused:
+//! [`Sender::send_video_async`] takes ownership of a [`VideoFrame`] without
+//! copying its pixel or metadata allocations. The next submission returns the
+//! previous frame after SDK synchronization; finish recovers the final frame.
 //!
 //! ```no_run
-//! # use grafton_ndi::{NDI, SenderOptions, BorrowedVideoFrame, PixelFormat};
+//! # use grafton_ndi::{NDI, SenderOptions, VideoFrame, PixelFormat};
 //! # fn main() -> Result<(), grafton_ndi::Error> {
 //! # let ndi = NDI::new()?;
 //! # let mut sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build())?;
-//! // Register callback to know when buffer is released
-//! sender.on_async_video_done(|len| println!("Buffer released: {} bytes", len));
-//!
-//! let buffer = vec![0u8; 1920 * 1080 * 4];
-//! let frame = BorrowedVideoFrame::try_from_uncompressed(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1)?;
-//! let token = sender.send_video_async(&frame);
-//! // The SDK reads the sender-owned snapshot until completion
-//! // Drop or wait the token to complete the operation and invoke the callback
+//! let first = VideoFrame::builder().resolution(1920, 1080).pixel_format(PixelFormat::BGRA).build()?;
+//! let second = VideoFrame::builder().resolution(1920, 1080).pixel_format(PixelFormat::BGRA).build()?;
+//! assert!(sender.send_video_async(first).is_none());
+//! let mut reusable = sender.send_video_async(second).unwrap();
+//! reusable.data_mut().fill(0);
+//! let final_frame = sender.finish_video_async().unwrap();
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! [`Sender::send_video_async_copy`] explicitly copies a borrowed buffer into
+//! retained sender storage and returns a wait/drop token. Forgetting that token
+//! is safe. Both paths use default SDK synchronization, with no SDK completion
+//! callback registration. Optional Rust completion handlers run on the calling
+//! thread after synchronization, outside internal locks.
 //!
 //! Note: Only video supports async sending in the NDI SDK. Audio and metadata are always synchronous.
 //!
 //! # Performance
 //!
 //! - **Zero-copy**: Frame data directly references NDI's buffers when possible
-//! - **Async completion**: Tokens provide explicit waits and automatic draining
+//! - **Async completion**: Owned frames are recovered after SDK synchronization
 //! - **Bandwidth control**: Multiple quality levels for different use cases
 //! - **Hardware acceleration**: Automatically uses GPU acceleration when available
 //!
@@ -113,9 +117,6 @@ mod ndi_lib;
 mod recv_guard;
 
 pub mod framesync;
-
-#[cfg(feature = "advanced_sdk")]
-pub mod waitable_completion;
 
 pub mod finder;
 pub mod frames;

@@ -11,13 +11,13 @@ fn main() {
     let frame_a =
         BorrowedVideoFrame::try_from_uncompressed(&buffer_a, 16, 16, PixelFormat::BGRA, 30, 1)
             .unwrap();
-    let token_a = sender.send_video_async(&frame_a);
+    let token_a = sender.send_video_async_copy(&frame_a);
 
     let buffer_b = vec![1u8; 16 * 16 * 4];
     let frame_b =
         BorrowedVideoFrame::try_from_uncompressed(&buffer_b, 16, 16, PixelFormat::BGRA, 30, 1)
             .unwrap();
-    let token_b = sender.send_video_async(&frame_b);
+    let token_b = sender.send_video_async_copy(&frame_b);
 
     drop((token_a, token_b));
 }

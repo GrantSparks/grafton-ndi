@@ -1,0 +1,9 @@
+error[E0382]: use of moved value: `frame`
+ --> tests/ui/fail/owned_async_prevents_double_send.rs:5:29
+  |
+3 | fn resend(sender: &mut Sender, frame: VideoFrame) {
+  |                                ----- move occurs because `frame` has type `VideoFrame`, which does not implement the `Copy` trait
+4 |     sender.send_video_async(frame);
+  |                             ----- value moved here
+5 |     sender.send_video_async(frame);
+  |                             ^^^^^ value used here after move

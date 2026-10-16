@@ -1,121 +1,36 @@
-//! Historical filename: async sends now copy pixels and metadata into sender-owned storage.
-use grafton_ndi::{BorrowedVideoFrame, PixelFormat, SenderOptions, NDI};
-
-use std::{
-    sync::mpsc,
-    time::{Duration, Instant},
-};
+//! Move owned frames into NDI and reuse two pixel allocations without per-send wrapper copies.
+//! SDK encoding and network processing may still copy data.
+use grafton_ndi::{PixelFormat, SenderOptions, VideoFrameBuilder, NDI};
 
 fn main() -> Result<(), grafton_ndi::Error> {
-    // Initialize NDI
     let ndi = NDI::new()?;
-    let version = NDI::version()?;
-    println!("NDI version: {version}");
-
-    // Create sender (must be mutable for async sending)
-    let send_options = SenderOptions::builder("Borrowed Async Sender Example")
+    let options = SenderOptions::builder("Zero Copy Async Sender")
         .clock_video(true)
-        .clock_audio(true)
         .build();
-    let mut sender = grafton_ndi::Sender::new(&ndi, &send_options)?;
+    let mut sender = grafton_ndi::Sender::new(&ndi, &options)?;
+    let make_frame = || {
+        VideoFrameBuilder::new()
+            .resolution(1920, 1080)
+            .pixel_format(PixelFormat::BGRA)
+            .frame_rate(60, 1)
+            .build()
+    };
+    let first = make_frame()?;
+    let mut available = make_frame()?;
+    assert!(sender.send_video_async(first).is_none());
 
-    let source_name = sender.source()?;
-    println!("Created NDI sender: {source_name}");
-
-    // Pre-allocate a single buffer (demonstrating single-buffer with callback)
-    let width = 1920;
-    let height = 1080;
-    let buffer_size = (width * height * 4) as usize; // BGRA format
-
-    let mut buffer = vec![0u8; buffer_size];
-
-    // Channel to signal when buffer is available again
-    let (tx, rx) = mpsc::channel();
-
-    // Register completion callback
-    sender.on_async_video_done(move |_len| {
-        // Buffer is now available for reuse
-        let _ = tx.send(());
-    });
-
-    // Frame timing
-    let frame_rate = 60.0;
-    let frame_duration = Duration::from_secs_f64(1.0 / frame_rate);
-    let mut next_frame_time = Instant::now();
-
-    println!("Sending video at {width}x{height} @ {frame_rate} fps");
-    println!("Press Ctrl+C to stop...");
-
-    let mut frame_count = 0;
-    let start_time = Instant::now();
-    let mut buffer_available = true;
-
-    loop {
-        // Wait for buffer to be available if needed
-        if !buffer_available {
-            if rx.recv_timeout(Duration::from_millis(100)).is_ok() {
-                #[allow(unused_assignments)]
-                {
-                    buffer_available = true;
-                }
-            } else {
-                println!("Warning: Buffer not released in time");
-                continue;
-            }
-        }
-
-        // Generate frame data
-        generate_test_pattern(&mut buffer, width, height, frame_count);
-
-        // Create a borrowed frame that references our buffer
-        let borrowed_frame = BorrowedVideoFrame::try_from_uncompressed(
-            &buffer,
-            width,
-            height,
-            PixelFormat::BGRA,
-            60,
-            1,
-        )?;
-
-        // Send asynchronously - no copy happens here!
-        let _token = sender.send_video_async(&borrowed_frame);
-        buffer_available = false;
-
-        // The buffer is now owned by NDI until the callback fires
-
-        frame_count += 1;
-
-        // Print statistics every 60 frames
-        if frame_count % 60 == 0 {
-            let elapsed = start_time.elapsed();
-            let actual_fps = frame_count as f64 / elapsed.as_secs_f64();
-            let elapsed_secs = elapsed.as_secs_f64();
-            println!(
-                "Sent {frame_count} frames in {elapsed_secs:.1}s - {actual_fps:.1} fps (target: {frame_rate} fps)"
-            );
-        }
-
-        // Wait for next frame time
-        let now = Instant::now();
-        if now < next_frame_time {
-            std::thread::sleep(next_frame_time - now);
-        }
-        next_frame_time += frame_duration;
-
-        // Stop after 300 frames (5 seconds at 60fps)
-        if frame_count >= 300 {
-            break;
-        }
+    for frame_num in 1..300 {
+        generate_test_pattern(available.data_mut(), 1920, 1080, frame_num);
+        // The next submission completes the previous send before returning its frame.
+        // Moving VideoFrame transfers its allocation; it does not copy its pixels.
+        available = sender.send_video_async(available).expect("previous frame");
     }
-
-    println!("\nFinished sending {frame_count} frames");
-
-    // The sender will now automatically wait for all async operations to complete
-    // when it's dropped, so no manual sleep is needed.
-    //
-    // Alternatively, you can explicitly wait with:
-    // send.flush_async(Duration::from_secs(1))?;
-
+    let final_frame = sender.finish_video_async().expect("final pending frame");
+    println!(
+        "Recovered both allocations: {} and {} bytes",
+        available.data().len(),
+        final_frame.data().len()
+    );
     Ok(())
 }
 

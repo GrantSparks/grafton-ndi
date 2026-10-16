@@ -10,11 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [2.0.0] - 2026-10-16
 
 Version 2.0.0 closes runtime and async-send ownership safety gaps and corrects
-SDK frame layout and timeout handling. Making `NDI` privately constructible is
-a breaking API change. See the [1.x to 2.0 migration guide](docs/migration/1.x-to-2.0.md).
+SDK frame layout and timeout handling. Private `NDI` construction and owned
+async video submissions are breaking API changes. See the [1.x to 2.0 migration guide](docs/migration/1.x-to-2.0.md).
 
 ### Breaking Changes
 
+- `Sender::send_video_async` now accepts `VideoFrame` by value and returns
+  `Option<VideoFrame>`. Rename borrowed calls to `send_video_async_copy` or use
+  two owned frames for allocation reuse. `AsyncVideoToken::is_complete`,
+  `flush_async(timeout)`, and the public `waitable_completion` module are removed;
+  use `flush_async_blocking()` or `finish_video_async()` for synchronization.
 - `NDI` can no longer be constructed as a public unit value. Use `NDI::new()?`
   or clone a live handle so every handle owns a runtime reference (#86).
 - All supported uncompressed video formats now reject odd widths, including
@@ -23,11 +28,13 @@ a breaking API change. See the [1.x to 2.0 migration guide](docs/migration/1.x-t
 
 ### Changed
 
-- Async video sends now allocate and copy pixels and metadata into sender-owned
-  storage. A forgotten token cannot leave the SDK reading freed caller buffers.
-  Send signatures remain unchanged; one snapshot remains retained until the next
-  async send or sender destruction, and is drained before release. Forgetting a
-  token skips its user completion handler (#90).
+- Async video sends take ownership of `VideoFrame` and return the previous
+  completed frame for reuse without per-send pixel copies. `finish_video_async`
+  drains and returns the final owned frame. The borrowed copying/token path is
+  available explicitly as `send_video_async_copy` (supersedes #90).
+- SDK completion callbacks are no longer registered, including Advanced SDK
+  builds. User completion handlers run once when completion is observed on the
+  calling thread at SDK synchronization boundaries.
 - UYVA, P216, and PA16 now use the SDK's first-plane stride. Their format info
   reports two bytes per first-plane pixel, and checked buffer sizing includes
   all planes. PA16 now allocates all three 16-bit planes (#85).
