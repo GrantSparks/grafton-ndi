@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Reject odd video widths for every uncompressed pixel format, as required by
+  the NDI SDK, consistently across sizing helpers, owned and borrowed frames,
+  and received frame validation.
+
 ## [1.0.1] - 2026-10-14
 
 ### Fixed

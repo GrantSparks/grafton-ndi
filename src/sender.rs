@@ -164,6 +164,8 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     ///
     /// This constructor validates that the buffer is large enough for the specified
     /// dimensions and pixel format, returning an error if validation fails.
+    /// Width must be positive and even for every pixel format. Height must be
+    /// positive, and must also be even for 4:2:0 formats.
     ///
     /// # Arguments
     ///
