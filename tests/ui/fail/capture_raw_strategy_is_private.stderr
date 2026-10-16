@@ -1,0 +1,19 @@
+error[E0432]: unresolved imports `grafton_ndi::FrameFree`, `grafton_ndi::FrameSyncAudioFree`, `grafton_ndi::FrameSyncVideoFree`
+ --> tests/ui/fail/capture_raw_strategy_is_private.rs:1:19
+  |
+1 | use grafton_ndi::{FrameFree, FrameSyncAudioFree, FrameSyncVideoFree};
+  |                   ^^^^^^^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^ no `FrameSyncVideoFree` in the root
+  |                   |          |
+  |                   |          no `FrameSyncAudioFree` in the root
+  |                   no `FrameFree` in the root
+  |
+help: a similar name exists in the module
+  |
+1 - use grafton_ndi::{FrameFree, FrameSyncAudioFree, FrameSyncVideoFree};
+1 + use grafton_ndi::{FrameFree, FrameSyncAudioRef, FrameSyncVideoFree};
+  |
+help: a similar name exists in the module
+  |
+1 - use grafton_ndi::{FrameFree, FrameSyncAudioFree, FrameSyncVideoFree};
+1 + use grafton_ndi::{FrameFree, FrameSyncAudioFree, FrameSyncVideoRef};
+  |

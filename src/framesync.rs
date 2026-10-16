@@ -283,13 +283,16 @@ impl FrameSync {
             ));
         }
 
+        receiver.set_framesync_attached(true);
         Ok(Self { instance, receiver })
     }
 
     /// Access the underlying receiver.
     ///
     /// Use this to access receiver functionality like tally, PTZ, or status
-    /// queries while the FrameSync is active.
+    /// queries while the FrameSync is active. Raw video capture on this receiver
+    /// returns [`Error::InvalidConfiguration`]; use FrameSync capture methods or
+    /// recover the receiver with [`Self::into_receiver`] first.
     pub fn receiver(&self) -> &Receiver {
         &self.receiver
     }
@@ -305,6 +308,7 @@ impl FrameSync {
         unsafe {
             NDIlib_framesync_destroy(this.instance);
         }
+        this.receiver.set_framesync_attached(false);
         // SAFETY: We will not use `this` again after reading the receiver field,
         // and ManuallyDrop prevents the Drop impl from running.
         unsafe { ptr::read(&this.receiver) }
@@ -536,6 +540,7 @@ impl Drop for FrameSync {
         unsafe {
             NDIlib_framesync_destroy(self.instance);
         }
+        self.receiver.set_framesync_attached(false);
     }
 }
 

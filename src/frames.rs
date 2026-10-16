@@ -2835,7 +2835,7 @@ fn validate_audio_format(fourcc: NDIlib_FourCC_audio_type_e) -> Result<AudioForm
 /// - Zero allocations: References NDI SDK buffers directly
 /// - Zero copies: No memcpy of pixel data
 /// - RAII lifetime: Exactly one free per frame, enforced at compile time
-/// - Not `Send`: Prevents accidental cross-thread use of FFI buffers
+/// - Receiver refs are `Send + Sync`; FrameSync refs stay on their capture thread
 ///
 /// # Lifetime
 ///
@@ -2849,6 +2849,7 @@ fn validate_audio_format(fourcc: NDIlib_FourCC_audio_type_e) -> Result<AudioForm
 ///
 /// For a 1920×1080 BGRA frame, this eliminates ~8.3 MB of memcpy compared to
 /// the owned [`VideoFrame`]. At 60 fps, this saves ~475 MB/s of memory bandwidth.
+#[allow(private_bounds)]
 pub struct VideoRef<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> {
     guard: Guard<'a, S>,
     /// Cached validated layout information (pixel format, data length, stride/size).
@@ -2865,6 +2866,7 @@ pub struct VideoRef<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> {
 /// `Debug` implementation.
 pub type VideoFrameRef<'rx> = VideoRef<'rx, VideoKind>;
 
+#[allow(private_bounds)]
 impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
     /// Create a borrowed video frame from an RAII guard.
     ///
@@ -2985,6 +2987,7 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
     }
 }
 
+#[allow(private_bounds)]
 impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> fmt::Debug for VideoRef<'a, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct(S::REF_DEBUG_NAME)
@@ -3024,7 +3027,8 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> fmt::Debug for VideoR
 /// - Zero allocations: References NDI SDK buffers directly
 /// - Zero copies: No memcpy of audio samples
 /// - RAII lifetime: Exactly one free per frame, enforced at compile time
-/// - Not `Send`: Prevents accidental cross-thread use of FFI buffers
+/// - Receiver refs are `Send + Sync`; FrameSync refs stay on their capture thread
+#[allow(private_bounds)]
 pub struct AudioRef<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> {
     guard: Guard<'a, S>,
     /// Cached validated layout information (format, sample count).
@@ -3043,6 +3047,7 @@ pub struct AudioRef<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> {
 /// FrameSync path additionally models a validated empty query/no-source state.
 pub type AudioFrameRef<'rx> = AudioRef<'rx, AudioKind>;
 
+#[allow(private_bounds)]
 impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
     /// Store a guard alongside an already-validated audio layout, validating and
     /// caching the frame metadata. The per-family constructors compute `layout`
@@ -3233,6 +3238,7 @@ impl<'fs> AudioRef<'fs, FrameSyncAudioFree> {
     }
 }
 
+#[allow(private_bounds)]
 impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> fmt::Debug for AudioRef<'a, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct(S::REF_DEBUG_NAME)
@@ -3262,7 +3268,7 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> fmt::Debug for AudioR
 /// - Zero allocations: References NDI SDK buffers directly
 /// - Zero copies: No string duplication
 /// - RAII lifetime: Exactly one free per frame, enforced at compile time
-/// - Not `Send`: Prevents accidental cross-thread use of FFI buffers
+/// - `Send + Sync`: Captured metadata can be processed on a scoped worker thread
 ///
 /// # Examples
 ///
