@@ -335,14 +335,15 @@ fn test_source_address_contains_host() {
 
     let ip_addr = SourceAddress::Ip("192.168.1.100:5960".to_string());
     assert!(ip_addr.contains_host("192.168.1.100"));
-    assert!(ip_addr.contains_host("192.168.1"));
-    assert!(ip_addr.contains_host("5960"));
+    assert!(!ip_addr.contains_host("192.168.1"));
+    assert!(!ip_addr.contains_host("5960"));
     assert!(!ip_addr.contains_host("192.168.2"));
 
     let url_addr = SourceAddress::Url("http://camera.local:8080".to_string());
     assert!(url_addr.contains_host("camera.local"));
-    assert!(url_addr.contains_host("camera"));
-    assert!(url_addr.contains_host("8080"));
+    assert!(!url_addr.contains_host("camera"));
+    assert!(!url_addr.contains_host("8080"));
+    assert!(url_addr.contains_host("CAMERA.LOCAL."));
     assert!(!url_addr.contains_host("other.local"));
 
     let none_addr = SourceAddress::None;
@@ -391,11 +392,11 @@ fn test_source_matches_host() {
         address: SourceAddress::Ip("192.168.0.107:5960".to_string()),
     };
     assert!(source.matches_host("192.168.0.107"));
-    assert!(source.matches_host("192.168.0"));
+    assert!(!source.matches_host("192.168.0"));
     assert!(!source.matches_host("192.168.1"));
 
     assert!(source.matches_host("CAMERA1"));
-    assert!(source.matches_host("Chan1"));
+    assert!(!source.matches_host("Chan1"));
     assert!(!source.matches_host("CAMERA2"));
 
     let url_source = Source {
@@ -403,14 +404,14 @@ fn test_source_matches_host() {
         address: SourceAddress::Url("http://studio.local:8080".to_string()),
     };
     assert!(url_source.matches_host("studio.local"));
-    assert!(url_source.matches_host("Studio"));
+    assert!(!url_source.matches_host("Studio"));
     assert!(!url_source.matches_host("other"));
 
     let no_addr_source = Source {
         name: "Local Source".to_string(),
         address: SourceAddress::None,
     };
-    assert!(no_addr_source.matches_host("Local"));
+    assert!(!no_addr_source.matches_host("Local"));
     assert!(!no_addr_source.matches_host("192.168.1.1"));
 }
 
@@ -484,7 +485,7 @@ fn test_source_matching_real_world_example() {
     };
 
     assert!(source.matches_host("192.168.0.107"));
-    assert!(source.matches_host("192.168.0"));
+    assert!(!source.matches_host("192.168.0"));
     assert!(source.matches_host("CAMERA1"));
     assert!(source.matches_host("192.168.0.107"));
     assert_eq!(source.ip_address(), Some("192.168.0.107"));

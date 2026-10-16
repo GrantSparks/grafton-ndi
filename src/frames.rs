@@ -1056,15 +1056,22 @@ impl AudioFrame {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_raw(raw: NDIlib_audio_frame_v3_t) -> Result<AudioFrame> {
+    /// # Safety
+    /// `raw` must reference live SDK sample and metadata allocations with
+    /// initialized active samples through this ownership copy.
+    pub(crate) unsafe fn from_raw(raw: NDIlib_audio_frame_v3_t) -> Result<AudioFrame> {
         // Use the shared validation helper to validate and compute layout
         let layout = validate_audio_layout(&raw)?;
         let metadata_layout = unsafe { validate_frame_metadata(raw.p_metadata)? };
 
-        Self::from_raw_validated(raw, layout, metadata_layout)
+        unsafe { Self::from_raw_validated(raw, layout, metadata_layout) }
     }
 
-    pub(crate) fn from_raw_validated(
+    /// # Safety
+    /// `layout` must have been validated from this exact `raw` descriptor.
+    /// Its active samples must remain live, aligned, and initialized through
+    /// copying; `metadata_layout` must describe its live metadata pointer.
+    pub(crate) unsafe fn from_raw_validated(
         raw: NDIlib_audio_frame_v3_t,
         layout: ValidatedAudioLayout,
         metadata_layout: ValidatedFrameMetadata,
@@ -1507,7 +1514,7 @@ pub(crate) const MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
 /// cannot contain NUL bytes and is limited to 4 MiB including the SDK terminator.
 #[derive(Debug, Clone)]
 pub struct MetadataFrame {
-    data: String, // Owned metadata (typically XML)
+    data: FrameMetadata,
     timecode: i64,
 }
 
@@ -1515,7 +1522,7 @@ impl MetadataFrame {
     /// Create an empty metadata frame with default SDK timecode behavior.
     pub fn new() -> Self {
         MetadataFrame {
-            data: String::new(),
+            data: FrameMetadata::new("").expect("empty metadata is valid"),
             timecode: NDIlib_send_timecode_synthesize,
         }
     }
@@ -1528,19 +1535,18 @@ impl MetadataFrame {
     /// or [`Error::InvalidFrame`] if the SDK metadata length would exceed the
     /// crate's metadata size limit.
     pub fn with_data(data: impl Into<String>, timecode: i64) -> Result<Self> {
-        let data = data.into();
-        validate_metadata_text(&data)?;
+        let data = FrameMetadata::new(data)?;
         Ok(MetadataFrame { data, timecode })
     }
 
     /// Get the metadata text.
     pub fn data(&self) -> &str {
-        &self.data
+        self.data.as_str()
     }
 
     /// Consume the frame and return the owned metadata text.
     pub fn into_data(self) -> String {
-        self.data
+        self.data.into_string()
     }
 
     /// Get the timecode in 100 ns units.
@@ -1559,9 +1565,7 @@ impl MetadataFrame {
     /// or [`Error::InvalidFrame`] if the SDK metadata length would exceed the
     /// crate's metadata size limit.
     pub fn set_data(&mut self, data: impl Into<String>) -> Result<()> {
-        let data = data.into();
-        validate_metadata_text(&data)?;
-        self.data = data;
+        self.data = FrameMetadata::new(data)?;
         Ok(())
     }
 
@@ -1576,16 +1580,14 @@ impl MetadataFrame {
         self
     }
 
-    /// Convert to raw format for sending
-    pub(crate) fn to_raw(&self) -> Result<(CString, NDIlib_metadata_frame_t)> {
-        let c_data = CString::new(self.data.as_bytes()).map_err(Error::InvalidCString)?;
-        let length = validate_metadata_len_with_nul(c_data.as_bytes_with_nul().len())?;
-        let raw = NDIlib_metadata_frame_t {
-            length,
+    /// Borrow the retained C string for a synchronous SDK call. The caller
+    /// must keep this frame alive until the SDK call returns.
+    pub(crate) fn to_raw(&self) -> NDIlib_metadata_frame_t {
+        NDIlib_metadata_frame_t {
+            length: self.data.inner.as_bytes_with_nul().len() as i32,
             timecode: self.timecode,
-            p_data: c_data.as_ptr() as *mut c_char,
-        };
-        Ok((c_data, raw))
+            p_data: self.data.as_ptr() as *mut c_char,
+        }
     }
 
     /// Create from raw NDI metadata frame (copies the data)
@@ -1598,8 +1600,8 @@ impl MetadataFrame {
     /// or the crate's metadata cap, as required by `validate_frame_metadata`.
     #[cfg(test)]
     pub(crate) unsafe fn from_raw(raw: &NDIlib_metadata_frame_t) -> Result<Self> {
-        let layout = validate_metadata_layout(raw)?;
-        Ok(Self::from_raw_validated(raw, layout))
+        let layout = unsafe { validate_metadata_layout(raw)? };
+        Ok(unsafe { Self::from_raw_validated(raw, layout) })
     }
 
     /// Create from a raw NDI metadata frame after its layout has been validated.
@@ -1612,8 +1614,20 @@ impl MetadataFrame {
         raw: &NDIlib_metadata_frame_t,
         layout: ValidatedMetadataLayout,
     ) -> Self {
-        let bytes = metadata_payload_bytes(raw, layout);
-        let data = str::from_utf8_unchecked(bytes).to_owned();
+        let data = if layout.len_with_nul == 0 {
+            FrameMetadata::new("").expect("empty metadata is valid")
+        } else {
+            unsafe {
+                FrameMetadata::copy_from_raw_validated(
+                    raw.p_data,
+                    ValidatedFrameMetadata {
+                        len_with_nul: std::num::NonZeroUsize::new(layout.len_with_nul),
+                        text_len: layout.text_len,
+                    },
+                )
+                .expect("non-null metadata")
+            }
+        };
 
         Self {
             data,
@@ -1647,7 +1661,10 @@ pub(crate) struct ValidatedMetadataLayout {
 /// This validates only memory layout and UTF-8. XML well-formedness is
 /// intentionally not checked because NDI receivers are expected to tolerate
 /// badly formed XML metadata.
-pub(crate) fn validate_metadata_layout(
+/// # Safety
+/// `raw.p_data`, when non-null, must reference readable storage for the
+/// declared length or a NUL-terminated string within the metadata cap.
+pub(crate) unsafe fn validate_metadata_layout(
     raw: &NDIlib_metadata_frame_t,
 ) -> Result<ValidatedMetadataLayout> {
     if raw.length < 0 {
@@ -1707,15 +1724,6 @@ pub(crate) fn validate_metadata_layout(
     })
 }
 
-fn validate_metadata_text(data: &str) -> Result<()> {
-    let len_with_nul = data.len().checked_add(1).ok_or_else(|| {
-        Error::InvalidFrame("Metadata length overflow while adding terminator".into())
-    })?;
-    validate_metadata_len_with_nul(len_with_nul)?;
-    CString::new(data.as_bytes()).map_err(Error::InvalidCString)?;
-    Ok(())
-}
-
 fn validate_metadata_len_with_nul(len_with_nul: usize) -> Result<i32> {
     if len_with_nul == 0 {
         return Err(Error::InvalidFrame(
@@ -1741,7 +1749,13 @@ fn metadata_len_to_i32(len_with_nul: usize) -> Result<i32> {
     })
 }
 
-fn metadata_payload_bytes(raw: &NDIlib_metadata_frame_t, layout: ValidatedMetadataLayout) -> &[u8] {
+/// # Safety
+/// `layout` must describe this exact live `raw.p_data` allocation, which must
+/// remain immutable for the returned borrow.
+unsafe fn metadata_payload_bytes(
+    raw: &NDIlib_metadata_frame_t,
+    layout: ValidatedMetadataLayout,
+) -> &[u8] {
     if layout.text_len == 0 {
         &[]
     } else {
@@ -1776,8 +1790,13 @@ impl FrameMetadata {
     }
 
     pub(crate) fn as_str(&self) -> &str {
+        // SAFETY: construction accepts String and validated SDK UTF-8 only.
+        unsafe { str::from_utf8_unchecked(self.inner.as_bytes()) }
+    }
+
+    pub(crate) fn into_string(self) -> String {
         self.inner
-            .to_str()
+            .into_string()
             .expect("FrameMetadata validates UTF-8 at construction")
     }
 
@@ -1803,13 +1822,12 @@ impl FrameMetadata {
         metadata_layout.len_with_nul?;
         debug_assert!(!p_metadata.is_null());
 
-        let mut bytes = if metadata_layout.text_len == 0 {
-            Vec::with_capacity(1)
-        } else {
-            unsafe {
-                slice::from_raw_parts(p_metadata.cast::<u8>(), metadata_layout.text_len).to_vec()
-            }
-        };
+        let mut bytes = Vec::with_capacity(metadata_layout.text_len + 1);
+        if metadata_layout.text_len != 0 {
+            bytes.extend_from_slice(unsafe {
+                slice::from_raw_parts(p_metadata.cast::<u8>(), metadata_layout.text_len)
+            });
+        }
         bytes.push(0);
 
         let inner = unsafe { CString::from_vec_with_nul_unchecked(bytes) };
@@ -3453,7 +3471,8 @@ impl<'rx> AudioRef<'rx, AudioKind> {
     /// Copies channel samples into tightly packed planar storage and copies
     /// metadata, allowing the frame to outlive the SDK buffer. Padding is omitted.
     pub fn to_owned(&self) -> Result<AudioFrame> {
-        AudioFrame::from_raw_validated(*self.guard.frame(), self.layout, self.metadata)
+        // SAFETY: the receive guard owns the exact validated frame through copying.
+        unsafe { AudioFrame::from_raw_validated(*self.guard.frame(), self.layout, self.metadata) }
     }
 }
 
@@ -3507,8 +3526,11 @@ impl<'fs> AudioRef<'fs, FrameSyncAudioFree> {
         if self.layout.is_empty() {
             Ok(None)
         } else {
-            AudioFrame::from_raw_validated(*self.guard.frame(), self.layout, self.metadata)
-                .map(Some)
+            // SAFETY: the FrameSync guard owns the exact validated frame through copying.
+            unsafe {
+                AudioFrame::from_raw_validated(*self.guard.frame(), self.layout, self.metadata)
+            }
+            .map(Some)
         }
     }
 }
@@ -3579,7 +3601,8 @@ impl<'rx> MetadataFrameRef<'rx> {
     /// The caller must ensure the guard was created from a valid NDI receiver
     /// and contains a frame populated by `NDIlib_recv_capture_v3`.
     pub(crate) unsafe fn new(guard: RecvMetadataGuard<'rx>) -> Result<Self> {
-        let layout = validate_metadata_layout(guard.frame())?;
+        // SAFETY: the receive guard owns the SDK metadata buffer through validation.
+        let layout = unsafe { validate_metadata_layout(guard.frame())? };
 
         Ok(Self { guard, layout })
     }
@@ -3603,7 +3626,8 @@ impl<'rx> MetadataFrameRef<'rx> {
     /// Get a zero-copy view of the metadata UTF-8 payload bytes, excluding the
     /// SDK trailing NUL terminator.
     pub fn as_bytes(&self) -> &[u8] {
-        metadata_payload_bytes(self.guard.frame(), self.layout)
+        // SAFETY: the receive guard owns the exact validated buffer for this borrow.
+        unsafe { metadata_payload_bytes(self.guard.frame(), self.layout) }
     }
 
     /// Convert this borrowed frame to an owned `MetadataFrame`.
@@ -5326,7 +5350,7 @@ mod tests {
     #[test]
     fn test_validate_metadata_layout_accepts_empty_null_frame() {
         let raw = null_metadata_raw(0);
-        let layout = validate_metadata_layout(&raw).expect("empty null frame is valid");
+        let layout = unsafe { validate_metadata_layout(&raw) }.expect("empty null frame is valid");
 
         assert_eq!(
             layout,
@@ -5341,7 +5365,8 @@ mod tests {
     fn test_validate_metadata_layout_accepts_one_byte_empty_payload() {
         let mut data = vec![0u8];
         let raw = metadata_raw_from_bytes(&mut data, 1);
-        let layout = validate_metadata_layout(&raw).expect("explicit empty payload is valid");
+        let layout =
+            unsafe { validate_metadata_layout(&raw) }.expect("explicit empty payload is valid");
 
         assert_eq!(layout.len_with_nul, 1);
         assert_eq!(layout.text_len, 0);
@@ -5353,7 +5378,7 @@ mod tests {
         data.push(0);
         let length = data.len() as i32;
         let raw = metadata_raw_from_bytes(&mut data, length);
-        let layout = validate_metadata_layout(&raw).expect("valid UTF-8 metadata");
+        let layout = unsafe { validate_metadata_layout(&raw) }.expect("valid UTF-8 metadata");
 
         assert_eq!(layout.len_with_nul, data.len());
         assert_eq!(layout.text_len, data.len() - 1);
@@ -5363,7 +5388,8 @@ mod tests {
     fn test_validate_metadata_layout_ignores_bytes_after_length() {
         let mut data = b"ok\0\0\xFF".to_vec();
         let raw = metadata_raw_from_bytes(&mut data, 3);
-        let layout = validate_metadata_layout(&raw).expect("extra bytes after length ignored");
+        let layout =
+            unsafe { validate_metadata_layout(&raw) }.expect("extra bytes after length ignored");
 
         assert_eq!(layout.text_len, 2);
         let owned = unsafe { MetadataFrame::from_raw_validated(&raw, layout) };
@@ -5375,7 +5401,7 @@ mod tests {
         let raw = null_metadata_raw(-1);
 
         assert!(matches!(
-            validate_metadata_layout(&raw),
+            unsafe { validate_metadata_layout(&raw) },
             Err(Error::InvalidFrame(_))
         ));
     }
@@ -5384,7 +5410,7 @@ mod tests {
     fn test_validate_metadata_layout_accepts_lengthless_non_null_data() {
         let mut data = b"<ndi/>\0ignored".to_vec();
         let raw = metadata_raw_from_bytes(&mut data, 0);
-        let layout = validate_metadata_layout(&raw).expect("SDK C-string sentinel");
+        let layout = unsafe { validate_metadata_layout(&raw) }.expect("SDK C-string sentinel");
         assert_eq!(layout.text_len, 6);
         assert_eq!(layout.len_with_nul, 7);
         let owned = unsafe { MetadataFrame::from_raw_validated(&raw, layout) };
@@ -5395,11 +5421,14 @@ mod tests {
     fn test_lengthless_metadata_rejects_invalid_utf8_and_missing_nul() {
         let mut invalid = vec![0xff, 0];
         assert!(matches!(
-            validate_metadata_layout(&metadata_raw_from_bytes(&mut invalid, 0)),
+            unsafe { validate_metadata_layout(&metadata_raw_from_bytes(&mut invalid, 0)) },
             Err(Error::InvalidUtf8(_))
         ));
         let mut unterminated = vec![b'x'; MAX_METADATA_BYTES];
-        assert!(validate_metadata_layout(&metadata_raw_from_bytes(&mut unterminated, 0)).is_err());
+        assert!(unsafe {
+            validate_metadata_layout(&metadata_raw_from_bytes(&mut unterminated, 0))
+        }
+        .is_err());
     }
 
     #[test]
@@ -5407,7 +5436,7 @@ mod tests {
         let raw = null_metadata_raw(1);
 
         assert!(matches!(
-            validate_metadata_layout(&raw),
+            unsafe { validate_metadata_layout(&raw) },
             Err(Error::InvalidFrame(_))
         ));
     }
@@ -5419,7 +5448,7 @@ mod tests {
         let raw = metadata_raw_from_bytes(&mut data, length);
 
         assert!(matches!(
-            validate_metadata_layout(&raw),
+            unsafe { validate_metadata_layout(&raw) },
             Err(Error::InvalidFrame(_))
         ));
     }
@@ -5431,7 +5460,7 @@ mod tests {
         let raw = metadata_raw_from_bytes(&mut data, length);
 
         assert!(matches!(
-            validate_metadata_layout(&raw),
+            unsafe { validate_metadata_layout(&raw) },
             Err(Error::InvalidFrame(_))
         ));
     }
@@ -5442,7 +5471,7 @@ mod tests {
         let raw = metadata_raw_from_bytes(&mut data, (MAX_METADATA_BYTES + 1) as i32);
 
         assert!(matches!(
-            validate_metadata_layout(&raw),
+            unsafe { validate_metadata_layout(&raw) },
             Err(Error::InvalidFrame(_))
         ));
     }
@@ -5454,7 +5483,7 @@ mod tests {
         let raw = metadata_raw_from_bytes(&mut data, length);
 
         assert!(matches!(
-            validate_metadata_layout(&raw),
+            unsafe { validate_metadata_layout(&raw) },
             Err(Error::InvalidUtf8(_))
         ));
     }
@@ -5502,13 +5531,45 @@ mod tests {
         assert_eq!(frame.data(), "updated");
         assert_eq!(frame.timecode(), 42);
         assert_eq!(MetadataFrame::new().with_timecode(7).timecode(), 7);
+        assert!(frame.set_data("bad\0text").is_err());
+        assert_eq!(frame.data(), "updated");
+    }
+
+    #[test]
+    fn validated_metadata_reuses_storage_and_copies_once() {
+        let text = "é".repeat(550);
+        let frame = MetadataFrame::with_data(text, 9).unwrap();
+        let expected = frame.data.as_ptr() as *mut c_char;
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            for _ in 0..100 {
+                let raw = frame.to_raw();
+                assert_eq!(raw.p_data, expected);
+                assert_eq!(raw.length, 1101);
+                assert_eq!(frame.data().len(), 1100);
+            }
+        });
+        assert_eq!(allocations, 0);
+
+        let bytes = frame.data.inner.as_bytes_with_nul();
+        let layout = ValidatedFrameMetadata {
+            len_with_nul: NonZeroUsize::new(bytes.len()),
+            text_len: bytes.len() - 1,
+        };
+        let (copy, allocations) = crate::test_alloc::allocation_count(|| unsafe {
+            FrameMetadata::copy_from_raw_validated(bytes.as_ptr().cast(), layout).unwrap()
+        });
+        assert_eq!(allocations, 1);
+        assert_eq!(copy.as_str(), frame.data());
+        let (text, allocations) = crate::test_alloc::allocation_count(|| copy.into_string());
+        assert_eq!(allocations, 0);
+        assert_eq!(text, frame.data());
     }
 
     #[test]
     fn test_metadata_frame_from_raw_validated_copies_only_payload() {
         let mut data = b"copy-me\0\0\xFF".to_vec();
         let raw = metadata_raw_from_bytes(&mut data, 8);
-        let layout = validate_metadata_layout(&raw).unwrap();
+        let layout = unsafe { validate_metadata_layout(&raw) }.unwrap();
         let frame = unsafe { MetadataFrame::from_raw_validated(&raw, layout) };
 
         assert_eq!(frame.data(), "copy-me");
@@ -5529,20 +5590,21 @@ mod tests {
     #[test]
     fn test_metadata_frame_to_raw_includes_trailing_nul() {
         let frame = MetadataFrame::with_data("abc", 101).unwrap();
-        let (c_data, raw) = frame.to_raw().unwrap();
+        let raw = frame.to_raw();
 
         assert_eq!(raw.length, 4);
         assert_eq!(raw.timecode, 101);
-        assert_eq!(c_data.as_bytes_with_nul(), b"abc\0");
+        assert_eq!(raw.p_data, frame.data.as_ptr() as *mut c_char);
+        assert_eq!(frame.data.inner.as_bytes_with_nul(), b"abc\0");
     }
 
     #[test]
     fn test_empty_metadata_frame_to_raw_sends_explicit_nul() {
         let frame = MetadataFrame::new();
-        let (c_data, raw) = frame.to_raw().unwrap();
+        let raw = frame.to_raw();
 
         assert_eq!(raw.length, 1);
-        assert_eq!(c_data.as_bytes_with_nul(), b"\0");
+        assert_eq!(frame.data.inner.as_bytes_with_nul(), b"\0");
     }
 
     #[test]
@@ -5850,7 +5912,7 @@ mod tests {
             timestamp: 0,
         };
 
-        let result = AudioFrame::from_raw(raw);
+        let result = unsafe { AudioFrame::from_raw(raw) };
         assert!(
             result.is_err(),
             "Should reject audio frame with sample count overflow or exceeding size limit"
@@ -5891,7 +5953,7 @@ mod tests {
             timestamp: 67890,
         };
 
-        let result = AudioFrame::from_raw(raw);
+        let result = unsafe { AudioFrame::from_raw(raw) };
         assert!(
             result.is_ok(),
             "Should accept normal audio frame within bounds"
