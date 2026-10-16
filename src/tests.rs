@@ -1141,20 +1141,6 @@ fn test_line_stride_or_size_to_raw_uncompressed() {
 }
 
 #[test]
-fn test_line_stride_or_size_to_raw_compressed() {
-    use crate::frames::LineStrideOrSize;
-
-    // Test conversion from enum to C union for compressed format
-    let data_size = LineStrideOrSize::DataSizeBytes(1024000);
-    let c_union: NDIlib_video_frame_v2_t__bindgen_ty_1 = data_size.into();
-
-    // Should write only data_size_in_bytes
-    unsafe {
-        assert_eq!(c_union.data_size_in_bytes, 1024000);
-    }
-}
-
-#[test]
 fn test_video_frame_from_raw_uncompressed_bgra() {
     use crate::frames::{LineStrideOrSize, PixelFormat};
 
@@ -1173,9 +1159,6 @@ fn test_video_frame_from_raw_uncompressed_bgra() {
         match frame.line_stride_or_size() {
             LineStrideOrSize::LineStrideBytes(stride) => {
                 assert_eq!(stride, line_stride);
-            }
-            LineStrideOrSize::DataSizeBytes(_) => {
-                panic!("Expected LineStrideBytes for uncompressed format");
             }
         }
 
@@ -1241,9 +1224,6 @@ fn test_video_frame_to_raw_roundtrip_uncompressed() {
         LineStrideOrSize::LineStrideBytes(stride) => {
             assert_eq!(stride, 1920 * 4);
         }
-        LineStrideOrSize::DataSizeBytes(_) => {
-            panic!("Builder should create LineStrideBytes");
-        }
     }
 
     // Convert to raw
@@ -1270,9 +1250,6 @@ fn test_video_frame_builder_creates_line_stride_bytes() {
         LineStrideOrSize::LineStrideBytes(stride) => {
             assert_eq!(stride, 640 * 4);
         }
-        LineStrideOrSize::DataSizeBytes(_) => {
-            panic!("Builder should always create LineStrideBytes");
-        }
     }
 }
 
@@ -1285,11 +1262,6 @@ fn test_line_stride_or_size_debug() {
     let debug_str = format!("{:?}", stride);
     assert!(debug_str.contains("LineStrideBytes"));
     assert!(debug_str.contains("7680"));
-
-    let size = LineStrideOrSize::DataSizeBytes(1024000);
-    let debug_str = format!("{:?}", size);
-    assert!(debug_str.contains("DataSizeBytes"));
-    assert!(debug_str.contains("1024000"));
 }
 
 #[test]
@@ -1302,18 +1274,6 @@ fn test_line_stride_or_size_equality() {
 
     assert_eq!(stride1, stride2);
     assert_ne!(stride1, stride3);
-
-    let size1 = LineStrideOrSize::DataSizeBytes(1024);
-    let size2 = LineStrideOrSize::DataSizeBytes(1024);
-    let size3 = LineStrideOrSize::DataSizeBytes(2048);
-
-    assert_eq!(size1, size2);
-    assert_ne!(size1, size3);
-
-    // Different variants should not be equal
-    let stride = LineStrideOrSize::LineStrideBytes(1024);
-    let size = LineStrideOrSize::DataSizeBytes(1024);
-    assert_ne!(stride, size);
 }
 
 /// Tests for the lock-free atomic RuntimeManager implementation.

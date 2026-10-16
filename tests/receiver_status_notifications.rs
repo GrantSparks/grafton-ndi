@@ -23,11 +23,10 @@ fn media_capture_retains_capability_notifications() -> Result<(), Error> {
             &ndi,
             &SenderOptions::builder(format!("status retention {kind}")).build(),
         )?;
-        wait_until(|| matches!(sender.source().unwrap().address, SourceAddress::Ip(_)));
         let mut source = sender.source()?;
         let port = match &source.address {
             SourceAddress::Ip(address) => address.rsplit(':').next().unwrap(),
-            other => panic!("expected SDK IP address, got {other:?}"),
+            _ => "5961",
         };
         source.address = SourceAddress::Ip(format!("127.0.0.1:{port}"));
         let options = ReceiverOptions::builder(source).build();

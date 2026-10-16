@@ -392,18 +392,13 @@ impl From<ScanType> for i32 {
     }
 }
 
-/// Line stride or data size for video frames.
-///
-/// This enum represents the choice between line stride (for uncompressed formats)
-/// and total data size (for compressed or opaque formats). The discriminant is
-/// determined by the video format (FourCC).
+/// First-plane line stride for the supported uncompressed video formats.
+/// Compressed and opaque payloads are not represented by safe frame types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineStrideOrSize {
     /// Line stride in bytes for uncompressed formats.
     /// This is the number of bytes per row of video data.
     LineStrideBytes(i32),
-    /// Total data size in bytes for compressed or opaque formats.
-    DataSizeBytes(i32),
 }
 
 impl From<LineStrideOrSize> for NDIlib_video_frame_v2_t__bindgen_ty_1 {
@@ -418,9 +413,6 @@ impl From<LineStrideOrSize> for NDIlib_video_frame_v2_t__bindgen_ty_1 {
                     line_stride_in_bytes: stride,
                 }
             }
-            LineStrideOrSize::DataSizeBytes(size) => NDIlib_video_frame_v2_t__bindgen_ty_1 {
-                data_size_in_bytes: size,
-            },
         }
     }
 }
@@ -604,6 +596,15 @@ impl VideoFrame {
 
     pub(crate) fn metadata_cstr(&self) -> Option<&CStr> {
         self.metadata.as_ref().map(FrameMetadata::as_cstr)
+    }
+
+    pub(crate) fn validated_metadata(&self) -> ValidatedFrameMetadata {
+        ValidatedFrameMetadata {
+            len_with_nul: self
+                .metadata_cstr()
+                .and_then(|m| NonZeroUsize::new(m.to_bytes_with_nul().len())),
+            text_len: self.metadata().map_or(0, str::len),
+        }
     }
 
     /// Replace frame metadata.
@@ -1857,6 +1858,27 @@ pub(crate) struct ValidatedFrameMetadata {
     pub(crate) text_len: usize,
 }
 
+impl ValidatedFrameMetadata {
+    /// Bounded application CStr validation uses the known slice length, never a raw scan.
+    pub(crate) fn from_cstr(metadata: Option<&CStr>) -> Result<Self> {
+        let Some(metadata) = metadata else {
+            return Ok(Self {
+                len_with_nul: None,
+                text_len: 0,
+            });
+        };
+        let len = metadata.to_bytes_with_nul().len();
+        validate_metadata_len_with_nul(len)?;
+        metadata
+            .to_str()
+            .map_err(|e| Error::InvalidUtf8(e.to_string()))?;
+        Ok(Self {
+            len_with_nul: NonZeroUsize::new(len),
+            text_len: len - 1,
+        })
+    }
+}
+
 /// Validate a video/audio per-frame `p_metadata` pointer with a bounded scan.
 ///
 /// This continues to trust the NDI SDK that a non-null pointer is readable. The
@@ -2115,14 +2137,6 @@ impl<'a> ImagePixelSource<'a> {
 
     fn from_plane(layout: ValidatedVideoLayout, plane: VideoPlane<'a>) -> Result<Self> {
         let pixel_format = ImagePixelFormat::from_pixel_format(layout.pixel_format)?;
-        if !matches!(
-            layout.line_stride_or_size,
-            LineStrideOrSize::LineStrideBytes(_)
-        ) {
-            return Err(Error::InvalidFrame(
-                "Cannot encode image from data-size frame; image encoding requires line_stride_in_bytes".into(),
-            ));
-        }
         Ok(Self {
             plane,
             width: layout.width as usize,
@@ -2231,9 +2245,7 @@ pub(crate) struct ValidatedVideoLayout {
     payload_len_bytes: usize,
     plane_layouts: [VideoPlaneLayout; 3],
     plane_count: usize,
-    /// The validated SDK union field. Supported safe video layouts always use
-    /// line stride; the data-size variant is reserved for the unsafe escape
-    /// hatch.
+    /// The validated first-plane SDK line stride.
     pub line_stride_or_size: LineStrideOrSize,
 }
 
@@ -3952,22 +3964,16 @@ mod tests {
                         position += active;
                     }
                 }
-                let send = unsafe {
-                    crate::BorrowedVideoFrame::from_parts_unchecked(
-                        &initialized,
-                        4,
-                        4,
-                        format.into(),
-                        30000,
-                        1001,
-                        1.25,
-                        ScanType::Interlaced,
-                        12345,
-                        LineStrideOrSize::LineStrideBytes(stride as i32),
-                        Some(&metadata),
-                        67890,
-                    )
-                };
+                let send = crate::BorrowedVideoFrame::builder(&initialized, 4, 4, format)
+                    .frame_rate(30000, 1001)
+                    .picture_aspect_ratio(1.25)
+                    .scan_type(ScanType::Interlaced)
+                    .timecode(12345)
+                    .line_stride(stride as i32)
+                    .metadata(&metadata)
+                    .timestamp(67890)
+                    .build()
+                    .unwrap();
                 let normalized = send.try_to_owned().unwrap();
                 assert_eq!(normalized.data(), expected);
                 assert_eq!(
@@ -4433,21 +4439,7 @@ mod tests {
 
     #[cfg(feature = "image-encoding")]
     #[test]
-    fn test_image_pixel_source_rejects_data_size_layout_and_bad_data_len() {
-        let data_size_layout = ValidatedVideoLayout {
-            width: 2,
-            height: 1,
-            pixel_format: PixelFormat::RGBA,
-            line_stride_or_size: LineStrideOrSize::DataSizeBytes(8),
-            ..ValidatedVideoLayout::new_uncompressed(PixelFormat::RGBA, 2, 1, None).unwrap()
-        };
-        let err = ImagePixelSource::new(data_size_layout, &[0; 8]).unwrap_err();
-        let err_msg = err.to_string();
-        assert!(
-            matches!(&err, Error::InvalidFrame(message) if message.contains("data-size frame")),
-            "unexpected error: {err_msg}"
-        );
-
+    fn test_image_pixel_source_rejects_bad_data_len() {
         let layout = ValidatedVideoLayout::new_uncompressed(PixelFormat::RGBA, 2, 1, None).unwrap();
         let err = ImagePixelSource::new(layout, &[0; 7]).unwrap_err();
         let err_msg = err.to_string();

@@ -19,6 +19,11 @@ video data access are breaking API changes. See the [1.x to 2.0 migration guide]
 
 ### Breaking Changes
 
+- `BorrowedVideoFrame::builder` validates typed padded layouts, borrowed metadata,
+  and scan/timing options without allocation. The unchecked raw constructor and
+  unused `LineStrideOrSize::DataSizeBytes` are removed. Borrowed format and
+  validated-length getters now return concrete values; copies reuse source
+  validation and normalize active rows (#111).
 - `SourceCache::find_by_host`, `Source::matches_host`, and
   `SourceAddress::contains_host` now compare exact host identity. Cache queries
   require a bare hostname or IP; partial IPs, ports, URL text, and source-label

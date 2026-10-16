@@ -150,7 +150,9 @@ pub use {
         ReceiverOptions, ReceiverOptionsBuilder, ReceiverStatus, Tally,
     },
     runtime::NDI,
-    sender::{BorrowedVideoFrame, Sender, SenderOptions, SenderOptionsBuilder},
+    sender::{
+        BorrowedVideoFrame, BorrowedVideoFrameBuilder, Sender, SenderOptions, SenderOptionsBuilder,
+    },
 };
 
 #[cfg(feature = "image-encoding")]

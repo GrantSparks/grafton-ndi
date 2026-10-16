@@ -1,0 +1,9 @@
+error[E0502]: cannot borrow `pixels` as mutable because it is also borrowed as immutable
+ --> tests/ui/fail/borrowed_video_keeps_pixels_borrowed.rs:5:5
+  |
+4 |     let frame = BorrowedVideoFrame::builder(&pixels, 2, 2, PixelFormat::BGRA).build().unwrap();
+  |                                             ------- immutable borrow occurs here
+5 |     pixels.fill(1);
+  |     ^^^^^^ mutable borrow occurs here
+6 |     let _ = frame.try_to_owned();
+  |             ----- immutable borrow later used here
