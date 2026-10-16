@@ -407,6 +407,8 @@ pub(crate) enum CaptureResult<'rx, K: CaptureKind> {
     Frame(Guard<'rx, K>),
     /// No frame available within timeout, or a different frame type was returned.
     None,
+    /// A capability invalidation notification, without a frame buffer.
+    StatusChanged,
     /// The SDK returned an error frame.
     Error,
 }
@@ -415,7 +417,7 @@ pub(crate) enum CaptureResult<'rx, K: CaptureKind> {
 ///
 /// Routes the frame into the matching `NDIlib_recv_capture_v3` slot via
 /// [`CaptureStrategy::capture_into`] and classifies the result. Other frame types
-/// (e.g. status-change) are treated as [`CaptureResult::None`].
+/// are treated as [`CaptureResult::None`]; status changes are retained separately.
 ///
 /// # Safety
 ///
@@ -431,6 +433,7 @@ pub(crate) unsafe fn capture_raw<'rx, K: CaptureKind>(
     match frame_type {
         t if t == K::FRAME_TYPE => CaptureResult::Frame(Guard::<K>::new(instance, frame)),
         NDIlib_frame_type_e_NDIlib_frame_type_none => CaptureResult::None,
+        NDIlib_frame_type_e_NDIlib_frame_type_status_change => CaptureResult::StatusChanged,
         NDIlib_frame_type_e_NDIlib_frame_type_error => CaptureResult::Error,
         _ => CaptureResult::None, // Other frame types are ignored
     }

@@ -77,6 +77,9 @@ jobs:
           # Only save cache on main branch to avoid cache thrashing
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Run receiver status SDK regression
+        run: cargo test --all-features --test receiver_status_notifications -- --ignored --nocapture
+
       # Run all checks
       - name: Run tests
         run: |
@@ -106,6 +109,10 @@ jobs:
       - name: Run SDK lifecycle regressions
         if: matrix.os == 'ubuntu-latest'
         run: cargo test --all-features --test async_send_lifecycle --test sender_lifecycle_stress -- --ignored
+
+      - name: Run video padding and FrameSync recovery SDK regression
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --all-features --test video_padding_sdk -- --ignored --nocapture
 
       - name: Run FrameSync audio SDK regression
         run: cargo test --all-features --test framesync_audio_requests -- --ignored --nocapture

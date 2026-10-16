@@ -19,6 +19,16 @@ video data access are breaking API changes. See the [1.x to 2.0 migration guide]
 
 ### Breaking Changes
 
+- Receivers have sealed `RawCapture` and `FrameSyncAttached` modes. FrameSync's
+  receiver reference permits shared controls/audio/metadata but has no raw-video
+  method. Consuming recovery restores raw video. A private resource owner
+  preserves destruction order without an attachment flag or manual extraction
+  (#112).
+- `BorrowedVideoFrame::builder` validates typed padded layouts, borrowed metadata,
+  and scan/timing options without allocation. The unchecked raw constructor and
+  unused `LineStrideOrSize::DataSizeBytes` are removed. Borrowed format and
+  validated-length getters now return concrete values; copies reuse source
+  validation and normalize active rows (#111).
 - `SourceCache::find_by_host`, `Source::matches_host`, and
   `SourceAddress::contains_host` now compare exact host identity. Cache queries
   require a bare hostname or IP; partial IPs, ports, URL text, and source-label
@@ -56,7 +66,7 @@ video data access are breaking API changes. See the [1.x to 2.0 migration guide]
 - `SourceCache::new()` is infallible. `FinderOptions::default()` includes local
   sources, and `VideoFrame::default()` uses Progressive scanning.
 - `ReceiverStatus` exposes `connections: u32`; meaningless `tally`/`other` fields
-  are removed. Raw video capture is rejected while a receiver belongs to FrameSync.
+  are removed. Raw video capture is unavailable at compile time while a receiver belongs to FrameSync.
 - Raw capture/free strategy exports are private. Use public `CaptureKind`
   associations and named frame-reference aliases. Receiver references support
   scoped thread transfer; FrameSync references retain thread restrictions.
@@ -65,6 +75,8 @@ video data access are breaking API changes. See the [1.x to 2.0 migration guide]
 
 ### Changed
 
+- Media capture retains receiver status notifications for subsequent status polling;
+  notifications coalesce and competing pollers consume them once (#110).
 - Owned standalone and video/audio metadata share one validated C-string owner.
   Repeated sends and text access reuse that storage without payload copies or
   UTF-8 rescans (#108).

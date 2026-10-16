@@ -99,9 +99,6 @@ fn main() -> Result<(), Error> {
         grafton_ndi::LineStrideOrSize::LineStrideBytes(stride) => {
             println!("  Line stride: {stride} bytes");
         }
-        grafton_ndi::LineStrideOrSize::DataSizeBytes(size) => {
-            println!("  Data size layout: {size} bytes");
-        }
     }
     let data_size = video_frame.data().len();
     println!("  Data size: {data_size} bytes");

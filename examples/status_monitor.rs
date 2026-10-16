@@ -67,6 +67,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nMonitoring status changes for: {source}");
     println!("Press Ctrl+C to exit\n");
 
+    // Notifications consumed by concurrent media capture are retained here.
+    // Multiple changes may coalesce; refresh capabilities on each notification.
     // Monitor status changes
     loop {
         if let Some(status) = receiver.poll_status_change(Duration::from_secs(1))? {
@@ -74,6 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "[Status Change] Connections: {} (source capabilities may also have changed)",
                 status.connections
             );
+            println!("PTZ supported: {}", receiver.ptz_is_supported());
         } else {
             // Timeout - could show a heartbeat here
             print!(".");

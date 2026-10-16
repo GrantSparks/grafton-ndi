@@ -10,8 +10,8 @@ use std::{
 use crate::{
     finder::Source,
     frames::{
-        AudioFrame, LineStrideOrSize, MetadataFrame, PixelFormat, ScanType, ValidatedVideoLayout,
-        VideoFrame,
+        AudioFrame, LineStrideOrSize, MetadataFrame, PixelFormat, ScanType, ValidatedFrameMetadata,
+        ValidatedVideoLayout, VideoFrame,
     },
     ndi_lib::*,
     receiver::Tally,
@@ -127,24 +127,20 @@ unsafe impl Sync for Inner {}
 /// owned frame; source buffers can be reused immediately after submission.
 ///
 /// Fields are private to enforce safety invariants. Use
-/// [`Self::try_from_uncompressed`] for tightly packed typed formats or
-/// [`Self::from_parts_unchecked`] for caller-validated raw descriptions. Owned
-/// conversion and copied sending reject unsupported pixel formats.
+/// [`Self::try_from_uncompressed`] for packed pixels, or [`Self::builder`] for
+/// explicit stride, metadata, and header options. Construction borrows without
+/// allocation and validates the entire supported uncompressed layout once.
 pub struct BorrowedVideoFrame<'buf> {
-    pub(crate) width: i32,
-    pub(crate) height: i32,
-    pub(crate) fourcc: u32,
-    pub(crate) pixel_format: Option<PixelFormat>,
-    pub(crate) frame_rate_n: i32,
-    pub(crate) frame_rate_d: i32,
-    pub(crate) picture_aspect_ratio: f32,
-    pub(crate) scan_type: ScanType,
-    pub(crate) timecode: i64,
-    pub(crate) data: &'buf [u8],
-    pub(crate) line_stride_or_size: LineStrideOrSize,
-    pub(crate) layout: Option<ValidatedVideoLayout>,
-    pub(crate) metadata: Option<&'buf CStr>,
-    pub(crate) timestamp: i64,
+    layout: ValidatedVideoLayout,
+    frame_rate_n: i32,
+    frame_rate_d: i32,
+    picture_aspect_ratio: f32,
+    scan_type: ScanType,
+    timecode: i64,
+    data: &'buf [u8],
+    metadata: Option<&'buf CStr>,
+    metadata_layout: ValidatedFrameMetadata,
+    timestamp: i64,
 }
 
 impl<'buf> BorrowedVideoFrame<'buf> {
@@ -193,125 +189,33 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         frame_rate_n: i32,
         frame_rate_d: i32,
     ) -> Result<Self> {
-        crate::frames::validate_video_frame_metadata(frame_rate_n, frame_rate_d, 16.0 / 9.0)?;
-        let layout = ValidatedVideoLayout::new_uncompressed(pixel_format, width, height, None)?;
-        let expected_len = layout.data_len_bytes;
-
-        if data.len() < expected_len {
-            return Err(Error::InvalidFrame(format!(
-                "Buffer too small for format {pixel_format:?}: got {actual} bytes, expected at least {expected_len} bytes \
-                 (width={width}, height={height}, stride={stride:?})",
-                stride = layout.line_stride_or_size,
-                actual = data.len()
-            )));
-        }
-
-        Ok(BorrowedVideoFrame {
-            width,
-            height,
-            fourcc: pixel_format.into(),
-            pixel_format: Some(pixel_format),
-            frame_rate_n,
-            frame_rate_d,
-            picture_aspect_ratio: 16.0 / 9.0,
-            scan_type: ScanType::Progressive,
-            timecode: NDIlib_send_timecode_synthesize,
-            data,
-            line_stride_or_size: layout.line_stride_or_size,
-            layout: Some(layout),
-            metadata: None,
-            timestamp: 0,
-        })
+        Self::builder(data, width, height, pixel_format)
+            .frame_rate(frame_rate_n, frame_rate_d)
+            .build()
     }
 
-    /// Create a borrowed video frame without validation (unsafe).
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure all SDK-facing fields describe a valid frame:
-    /// - `fourcc` is a correct NDI video FourCC for the payload.
-    /// - The FourCC and `line_stride_or_size` union field are paired according
-    ///   to the SDK contract: uncompressed formats use
-    ///   [`LineStrideOrSize::LineStrideBytes`], compressed or opaque formats use
-    ///   [`LineStrideOrSize::DataSizeBytes`].
-    /// - Dimensions are positive where required by the SDK format, and any
-    ///   planar format dimension or stride requirements are satisfied.
-    /// - Line stride or data size is positive, fits the SDK field, and is
-    ///   sufficient for every byte the SDK may read.
-    /// - `data` is live and large enough for the final layout whenever the frame
-    ///   is inspected or converted to owned storage.
-    /// - `frame_rate_n` and `frame_rate_d` are positive, `picture_aspect_ratio`
-    ///   is finite and nonnegative (`0.0` selects square pixels), and `scan_type`
-    ///   matches a supported SDK scan type.
-    /// - `metadata`, when present, remains valid, NUL-terminated, UTF-8, and
-    ///   within the crate metadata size cap while the frame is inspected or copied.
-    ///
-    /// Conversion to an owned frame and copied async sending support only the
-    /// crate's typed uncompressed layouts. Opaque or compressed FourCC payloads
-    /// cannot be converted and return an error.
-    ///
-    /// This constructor passes `timecode` and `timestamp` through unchanged,
-    /// including literal zero. Use `NDIlib_send_timecode_synthesize` to request
-    /// SDK timecode synthesis, as the safe uncompressed constructor does by default.
-    ///
-    /// Violating these invariants can cause invalid reads while inspecting or
-    /// copying the frame, leading to undefined behavior.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{BorrowedVideoFrame, PixelFormat, LineStrideOrSize};
-    /// let buffer = vec![0u8; 1920 * 1080 * 4];
-    /// let stride = PixelFormat::BGRA.try_line_stride(1920).unwrap();
-    ///
-    /// // SAFETY: Buffer is correctly sized for 1920x1080 BGRA
-    /// let frame = unsafe {
-    ///     BorrowedVideoFrame::from_parts_unchecked(
-    ///         &buffer,
-    ///         1920,
-    ///         1080,
-    ///         PixelFormat::BGRA.into(),
-    ///         30,
-    ///         1,
-    ///         16.0 / 9.0,
-    ///         grafton_ndi::ScanType::Progressive,
-    ///         0,
-    ///         LineStrideOrSize::LineStrideBytes(stride),
-    ///         None,
-    ///         0,
-    ///     )
-    /// };
-    /// ```
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn from_parts_unchecked(
+    /// Configure a checked borrowed frame, including padded first-plane stride.
+    /// Defaults match `try_from_uncompressed`, with a frame rate of 30/1.
+    /// All validation occurs in [`BorrowedVideoFrameBuilder::build`].
+    pub fn builder(
         data: &'buf [u8],
         width: i32,
         height: i32,
-        fourcc: u32,
-        frame_rate_n: i32,
-        frame_rate_d: i32,
-        picture_aspect_ratio: f32,
-        scan_type: ScanType,
-        timecode: i64,
-        line_stride_or_size: LineStrideOrSize,
-        metadata: Option<&'buf CStr>,
-        timestamp: i64,
-    ) -> Self {
-        BorrowedVideoFrame {
+        pixel_format: PixelFormat,
+    ) -> BorrowedVideoFrameBuilder<'buf> {
+        BorrowedVideoFrameBuilder {
+            data,
             width,
             height,
-            fourcc,
-            pixel_format: PixelFormat::try_from(fourcc).ok(),
-            frame_rate_n,
-            frame_rate_d,
-            picture_aspect_ratio,
-            scan_type,
-            timecode,
-            data,
-            line_stride_or_size,
-            layout: None,
-            metadata,
-            timestamp,
+            pixel_format,
+            line_stride: None,
+            frame_rate_n: 30,
+            frame_rate_d: 1,
+            picture_aspect_ratio: 16.0 / 9.0,
+            scan_type: ScanType::Progressive,
+            timecode: NDIlib_send_timecode_synthesize,
+            metadata: None,
+            timestamp: 0,
         }
     }
 
@@ -320,34 +224,30 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// Active pixels are copied into tightly packed planes; row padding is
     /// skipped and the owned stride can shrink. Metadata is copied separately;
     /// no reference to the source is retained.
-    /// Only the supported uncompressed [`PixelFormat`] layouts are representable.
-    /// Unsupported opaque or compressed FourCC values return an error.
     pub fn try_to_owned(&self) -> Result<VideoFrame> {
-        // SAFETY: Safe constructors validate the slice and metadata, while the
-        // unsafe constructor requires a valid SDK layout and live backing data.
-        // from_raw validates supported layout details before copying the buffers.
-        unsafe { VideoFrame::from_raw(&self.to_raw()) }
+        // SAFETY: The immutable slices retain initialized pixels and bounded UTF-8
+        // metadata for these cached proofs throughout the active-row copy.
+        unsafe { VideoFrame::from_raw_validated(&self.to_raw(), self.layout, self.metadata_layout) }
     }
 
     /// Get the frame width in pixels.
     pub fn width(&self) -> i32 {
-        self.width
+        self.layout.width
     }
 
     /// Get the frame height in pixels.
     pub fn height(&self) -> i32 {
-        self.height
+        self.layout.height
     }
 
-    /// Get the supported typed pixel format, if the raw FourCC is one of the
-    /// crate's supported uncompressed formats.
-    pub fn pixel_format(&self) -> Option<PixelFormat> {
-        self.pixel_format
+    /// Get the validated uncompressed pixel format.
+    pub fn pixel_format(&self) -> PixelFormat {
+        self.layout.pixel_format
     }
 
     /// Get the raw SDK FourCC value.
     pub fn fourcc(&self) -> u32 {
-        self.fourcc
+        self.layout.pixel_format.into()
     }
 
     /// Get the frame rate numerator.
@@ -380,28 +280,25 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         self.data
     }
 
-    /// Get the line stride or data size.
+    /// Get the validated first-plane line stride.
     pub fn line_stride_or_size(&self) -> LineStrideOrSize {
-        self.line_stride_or_size
+        self.layout.line_stride_or_size
     }
 
-    /// Get the validated SDK data length for frames built through the safe
-    /// typed constructor.
-    ///
-    /// Returns `None` for frames created with [`Self::from_parts_unchecked`],
-    /// because those layouts are intentionally outside the crate's supported
-    /// typed model.
-    pub fn validated_data_len(&self) -> Option<usize> {
-        self.layout.map(|layout| layout.data_len_bytes)
+    /// Complete validated storage extent, including row padding.
+    pub fn validated_data_len(&self) -> usize {
+        self.layout.data_len_bytes
     }
 
-    /// Get the metadata as UTF-8 text, if any.
+    /// Get cached UTF-8 metadata text, preserving absent versus present-empty.
     pub fn metadata(&self) -> Option<&str> {
-        self.metadata.map(|metadata| {
-            metadata
-                .to_str()
-                .expect("from_parts_unchecked requires UTF-8 metadata")
-        })
+        // SAFETY: Construction validates UTF-8 and retains the same immutable CStr.
+        unsafe {
+            crate::frames::frame_metadata_str(
+                self.metadata.map_or(ptr::null(), |m| m.as_ptr()),
+                self.metadata_layout,
+            )
+        }
     }
 
     /// Get the timestamp.
@@ -451,19 +348,120 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     fn to_raw(&self) -> NDIlib_video_frame_v2_t {
         // Validation is now performed at construction time, so no runtime checks needed here
         NDIlib_video_frame_v2_t {
-            xres: self.width,
-            yres: self.height,
-            FourCC: self.fourcc as NDIlib_FourCC_video_type_e,
+            xres: self.layout.width,
+            yres: self.layout.height,
+            FourCC: self.layout.pixel_format.into(),
             frame_rate_N: self.frame_rate_n,
             frame_rate_D: self.frame_rate_d,
             picture_aspect_ratio: self.picture_aspect_ratio,
             frame_format_type: self.scan_type.into(),
             timecode: self.timecode,
             p_data: self.data.as_ptr() as *mut u8,
-            __bindgen_anon_1: self.line_stride_or_size.into(),
+            __bindgen_anon_1: self.layout.line_stride_or_size.into(),
             p_metadata: self.metadata.map_or(ptr::null(), |m| m.as_ptr()),
             timestamp: self.timestamp,
         }
+    }
+}
+
+/// Builder for a borrowed uncompressed video frame. No pixels or metadata are copied.
+pub struct BorrowedVideoFrameBuilder<'buf> {
+    data: &'buf [u8],
+    width: i32,
+    height: i32,
+    pixel_format: PixelFormat,
+    line_stride: Option<i32>,
+    frame_rate_n: i32,
+    frame_rate_d: i32,
+    picture_aspect_ratio: f32,
+    scan_type: ScanType,
+    timecode: i64,
+    metadata: Option<&'buf CStr>,
+    timestamp: i64,
+}
+
+impl<'buf> BorrowedVideoFrameBuilder<'buf> {
+    /// Set first-plane stride in bytes. Zero selects the packed stride.
+    #[must_use]
+    pub fn line_stride(mut self, stride: i32) -> Self {
+        self.line_stride = Some(stride);
+        self
+    }
+    /// Set the positive frame-rate numerator and denominator.
+    #[must_use]
+    pub fn frame_rate(mut self, numerator: i32, denominator: i32) -> Self {
+        self.frame_rate_n = numerator;
+        self.frame_rate_d = denominator;
+        self
+    }
+    /// Set a finite nonnegative aspect ratio; zero selects square pixels.
+    #[must_use]
+    pub fn picture_aspect_ratio(mut self, ratio: f32) -> Self {
+        self.picture_aspect_ratio = ratio;
+        self
+    }
+    /// Select progressive, interlaced, or field scanning.
+    #[must_use]
+    pub fn scan_type(mut self, scan_type: ScanType) -> Self {
+        self.scan_type = scan_type;
+        self
+    }
+    /// Set the timecode in 100 ns units, including literal zero.
+    #[must_use]
+    pub fn timecode(mut self, timecode: i64) -> Self {
+        self.timecode = timecode;
+        self
+    }
+    /// Borrow NUL-terminated UTF-8 metadata, validated when built.
+    #[must_use]
+    pub fn metadata(mut self, metadata: &'buf CStr) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+    /// Set the SDK timestamp, including literal zero.
+    #[must_use]
+    pub fn timestamp(mut self, timestamp: i64) -> Self {
+        self.timestamp = timestamp;
+        self
+    }
+
+    /// Validate dimensions, stride, initialized slice extent, headers, and metadata.
+    /// Successful construction allocates nothing. Invalid layout/header values or
+    /// metadata exceeding the 4 MiB cap return [`Error::InvalidFrame`]; invalid
+    /// metadata UTF-8 returns [`Error::InvalidUtf8`]. The input slices remain borrowed.
+    pub fn build(self) -> Result<BorrowedVideoFrame<'buf>> {
+        crate::frames::validate_video_frame_metadata(
+            self.frame_rate_n,
+            self.frame_rate_d,
+            self.picture_aspect_ratio,
+        )?;
+        let layout = ValidatedVideoLayout::new_uncompressed(
+            self.pixel_format,
+            self.width,
+            self.height,
+            self.line_stride,
+        )?;
+        if self.data.len() < layout.data_len_bytes {
+            return Err(Error::InvalidFrame(format!(
+                "Buffer too small for {:?}: got {} bytes, expected at least {}",
+                self.pixel_format,
+                self.data.len(),
+                layout.data_len_bytes,
+            )));
+        }
+        let metadata_layout = ValidatedFrameMetadata::from_cstr(self.metadata)?;
+        Ok(BorrowedVideoFrame {
+            layout,
+            data: self.data,
+            frame_rate_n: self.frame_rate_n,
+            frame_rate_d: self.frame_rate_d,
+            picture_aspect_ratio: self.picture_aspect_ratio,
+            scan_type: self.scan_type,
+            timecode: self.timecode,
+            metadata: self.metadata,
+            metadata_layout,
+            timestamp: self.timestamp,
+        })
     }
 }
 
@@ -471,19 +469,15 @@ impl<'buf> From<&'buf VideoFrame> for BorrowedVideoFrame<'buf> {
     fn from(frame: &'buf VideoFrame) -> Self {
         let layout = frame.validated_layout();
         BorrowedVideoFrame {
-            width: frame.width(),
-            height: frame.height(),
-            fourcc: frame.pixel_format().into(),
-            pixel_format: Some(frame.pixel_format()),
             frame_rate_n: frame.frame_rate_n(),
             frame_rate_d: frame.frame_rate_d(),
             picture_aspect_ratio: frame.picture_aspect_ratio(),
             scan_type: frame.scan_type(),
             timecode: frame.timecode(),
             data: frame.data(),
-            line_stride_or_size: layout.line_stride_or_size,
-            layout: Some(layout),
+            layout,
             metadata: frame.metadata_cstr(),
+            metadata_layout: frame.validated_metadata(),
             timestamp: frame.timestamp(),
         }
     }
@@ -1090,10 +1084,10 @@ mod tests {
         let data = vec![3; 1024];
         let metadata = CString::new("<copy/>").unwrap();
         {
-            let mut borrowed =
-                BorrowedVideoFrame::try_from_uncompressed(&data, 16, 16, PixelFormat::BGRA, 30, 1)
-                    .unwrap();
-            borrowed.metadata = Some(&metadata);
+            let borrowed = BorrowedVideoFrame::builder(&data, 16, 16, PixelFormat::BGRA)
+                .metadata(&metadata)
+                .build()
+                .unwrap();
             assert_eq!(
                 sender
                     .send_video_async_copy(&borrowed)
@@ -1223,37 +1217,116 @@ mod tests {
     }
 
     #[test]
-    fn invalid_copy_leaves_pending_owned_frame_unchanged() {
-        let mut sender = test_sender();
-        let owned = test_owned_frame(7);
-        let pixels = owned.data().as_ptr();
-        sender.send_video_async(owned);
-        let data = [0u8; 8];
-        // SAFETY: This valid opaque payload is never submitted to the SDK;
-        // copying rejects its unsupported FourCC before accessing its contents.
-        let opaque = unsafe {
-            BorrowedVideoFrame::from_parts_unchecked(
-                &data,
-                16,
-                16,
-                u32::from_le_bytes(*b"ABCD"),
-                30,
-                1,
-                1.0,
-                ScanType::Progressive,
-                0,
-                LineStrideOrSize::DataSizeBytes(8),
-                None,
-                0,
-            )
-        };
-        assert!(sender.send_video_async_copy(&opaque).is_err());
-        assert_eq!(sender.finish_video_async().unwrap().data().as_ptr(), pixels);
+    fn test_async_flush_uses_null_frame_pointer() {
+        assert!(async_flush_frame_ptr().is_null());
     }
 
     #[test]
-    fn test_async_flush_uses_null_frame_pointer() {
-        assert!(async_flush_frame_ptr().is_null());
+    fn borrowed_builder_validates_padded_layouts_and_preserves_headers_without_allocating() {
+        for format in [
+            PixelFormat::BGRA,
+            PixelFormat::BGRX,
+            PixelFormat::RGBA,
+            PixelFormat::RGBX,
+            PixelFormat::UYVY,
+            PixelFormat::UYVA,
+            PixelFormat::P216,
+            PixelFormat::PA16,
+            PixelFormat::I420,
+            PixelFormat::YV12,
+            PixelFormat::NV12,
+        ] {
+            for stride in [
+                0,
+                format.try_line_stride(4).unwrap(),
+                format.try_line_stride(4).unwrap() + 8,
+            ] {
+                let layout =
+                    ValidatedVideoLayout::new_uncompressed(format, 4, 4, Some(stride)).unwrap();
+                let data = vec![19; layout.data_len_bytes];
+                let metadata = c"<pixels>é</pixels>";
+                let (borrowed, allocations) = crate::test_alloc::allocation_count(|| {
+                    let frame = BorrowedVideoFrame::builder(&data, 4, 4, format)
+                        .line_stride(stride)
+                        .frame_rate(30000, 1001)
+                        .picture_aspect_ratio(1.25)
+                        .scan_type(ScanType::Interlaced)
+                        .timecode(0)
+                        .timestamp(67890)
+                        .metadata(metadata)
+                        .build()
+                        .unwrap();
+                    for _ in 0..3 {
+                        assert_eq!(frame.metadata(), Some("<pixels>é</pixels>"));
+                        assert_eq!(frame.validated_data_len(), data.len());
+                        assert_eq!(frame.pixel_format(), format);
+                    }
+                    frame
+                });
+                assert_eq!(allocations, 0);
+                let (owned, allocations) =
+                    crate::test_alloc::allocation_count(|| borrowed.try_to_owned().unwrap());
+                assert_eq!(allocations, 2);
+                assert_eq!((owned.frame_rate_n(), owned.frame_rate_d()), (30000, 1001));
+                assert_eq!(owned.picture_aspect_ratio(), 1.25);
+                assert_eq!(owned.scan_type(), ScanType::Interlaced);
+                assert_eq!((owned.timecode(), owned.timestamp()), (0, 67890));
+                assert_eq!(owned.metadata(), borrowed.metadata());
+                let (reborrowed, allocations) =
+                    crate::test_alloc::allocation_count(|| BorrowedVideoFrame::from(&owned));
+                assert_eq!(allocations, 0);
+                assert_eq!(reborrowed.metadata(), borrowed.metadata());
+                assert!(
+                    BorrowedVideoFrame::builder(&data[..data.len() - 1], 4, 4, format)
+                        .line_stride(stride)
+                        .build()
+                        .is_err()
+                );
+            }
+            for stride in [-1, 1, i32::MAX] {
+                let expected = ValidatedVideoLayout::new_uncompressed(format, 4, 4, Some(stride));
+                let result = BorrowedVideoFrame::builder(&[], 4, 4, format)
+                    .line_stride(stride)
+                    .build();
+                assert!(expected.is_err());
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_metadata_is_bounded_utf8_and_preserves_empty_presence() {
+        let data = [0; 16];
+        for metadata in [None, Some(c"")] {
+            let mut builder = BorrowedVideoFrame::builder(&data, 2, 2, PixelFormat::BGRA);
+            if let Some(metadata) = metadata {
+                builder = builder.metadata(metadata);
+            }
+            let frame = builder.build().unwrap();
+            let (owned, allocations) =
+                crate::test_alloc::allocation_count(|| frame.try_to_owned().unwrap());
+            assert_eq!(allocations, 1 + usize::from(metadata.is_some()));
+            assert_eq!(owned.metadata(), metadata.map(|_| ""));
+        }
+        let invalid = c"\xff";
+        assert!(matches!(
+            BorrowedVideoFrame::builder(&data, 2, 2, PixelFormat::BGRA)
+                .metadata(invalid)
+                .build(),
+            Err(Error::InvalidUtf8(_))
+        ));
+        for len in [
+            crate::frames::MAX_METADATA_BYTES,
+            crate::frames::MAX_METADATA_BYTES + 1,
+        ] {
+            let mut bytes = vec![b'x'; len];
+            bytes[len - 1] = 0;
+            let metadata = CStr::from_bytes_with_nul(&bytes).unwrap();
+            let result = BorrowedVideoFrame::builder(&data, 2, 2, PixelFormat::BGRA)
+                .metadata(metadata)
+                .build();
+            assert_eq!(result.is_ok(), len == crate::frames::MAX_METADATA_BYTES);
+        }
     }
 
     #[test]
@@ -1414,67 +1487,6 @@ mod tests {
     }
 
     #[test]
-    fn test_from_parts_unchecked() {
-        let buffer = vec![0u8; 1920 * 1080 * 4];
-        let stride = PixelFormat::BGRA.try_line_stride(1920).unwrap();
-
-        // SAFETY: Buffer is correctly sized for 1920x1080 BGRA
-        let frame = unsafe {
-            BorrowedVideoFrame::from_parts_unchecked(
-                &buffer,
-                1920,
-                1080,
-                PixelFormat::BGRA.into(),
-                30,
-                1,
-                16.0 / 9.0,
-                ScanType::Progressive,
-                0,
-                LineStrideOrSize::LineStrideBytes(stride),
-                None,
-                0,
-            )
-        };
-
-        assert_eq!(frame.width(), 1920);
-        assert_eq!(frame.height(), 1080);
-        assert_eq!(frame.pixel_format(), Some(PixelFormat::BGRA));
-    }
-
-    #[test]
-    fn test_from_parts_unchecked_allows_raw_fourcc_escape_hatch() {
-        let buffer = vec![0u8; 16];
-
-        // SAFETY: This test does not send the frame to the SDK; it only verifies
-        // that the unsafe escape hatch can carry an unsupported raw FourCC and
-        // data-size union field without exposing it through a safe constructor.
-        let frame = unsafe {
-            BorrowedVideoFrame::from_parts_unchecked(
-                &buffer,
-                1,
-                1,
-                0x1234_5678,
-                30,
-                1,
-                1.0,
-                ScanType::Progressive,
-                0,
-                LineStrideOrSize::DataSizeBytes(buffer.len() as i32),
-                None,
-                0,
-            )
-        };
-
-        assert_eq!(frame.fourcc(), 0x1234_5678);
-        assert_eq!(frame.pixel_format(), None);
-        assert_eq!(
-            frame.line_stride_or_size(),
-            LineStrideOrSize::DataSizeBytes(buffer.len() as i32)
-        );
-        assert_eq!(frame.validated_data_len(), None);
-    }
-
-    #[test]
     fn test_getters() {
         let buffer = vec![0u8; 1920 * 1080 * 4];
         let frame = BorrowedVideoFrame::try_from_uncompressed(
@@ -1489,7 +1501,7 @@ mod tests {
 
         assert_eq!(frame.width(), 1920);
         assert_eq!(frame.height(), 1080);
-        assert_eq!(frame.pixel_format(), Some(PixelFormat::BGRA));
+        assert_eq!(frame.pixel_format(), PixelFormat::BGRA);
         assert_eq!(frame.frame_rate_n(), 60);
         assert_eq!(frame.frame_rate_d(), 1);
         assert_eq!(frame.picture_aspect_ratio(), 16.0 / 9.0);

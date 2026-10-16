@@ -1,0 +1,11 @@
+error[E0505]: cannot move out of `fs` because it is borrowed
+ --> tests/ui/fail/framesync_recovery_requires_unborrowed_framesync.rs:4:13
+  |
+2 | fn recover(fs: FrameSync) {
+  |            -- binding `fs` declared here
+3 |     let frame = fs.capture_video(ScanType::Progressive).unwrap();
+  |                 -- borrow of `fs` occurs here
+4 |     let _ = fs.into_receiver();
+  |             ^^ move out of `fs` occurs here
+5 |     drop(frame);
+  |          ----- borrow later used here

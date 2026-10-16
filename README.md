@@ -225,6 +225,11 @@ if !audio.is_empty() {
 }
 ```
 
+`FrameSync` owns its receiver. `frame_sync.receiver()` provides controls, audio,
+metadata, and status through `Receiver<FrameSyncAttached>`. Use
+`frame_sync.into_receiver()` to recover an ordinary `Receiver` with raw video
+capture. The type system prevents raw-video capture while FrameSync owns it.
+
 ### Monitor and Control
 
 Receivers report connection health, frame-drop statistics, and PTZ support. Use `set_tally` to send program/preview state upstream; sender tally reports receiver state.

@@ -1,5 +1,6 @@
+mod common;
 use grafton_ndi::{
-    MetadataFrame, Receiver, ReceiverOptions, Sender, SenderOptions, SourceAddress, VideoFrame, NDI,
+    MetadataFrame, Receiver, ReceiverOptions, Sender, SenderOptions, VideoFrame, NDI,
 };
 use std::time::{Duration, Instant};
 
@@ -16,12 +17,7 @@ fn reused_metadata_reaches_receiver_with_its_timecode() -> Result<(), grafton_nd
     let connection = MetadataFrame::with_data("<connection/>", 17)?;
     sender.add_connection_metadata(&connection);
 
-    let mut source = sender.source()?;
-    let port = match &source.address {
-        SourceAddress::Ip(address) => address.rsplit(':').next().unwrap_or("5961"),
-        _ => "5961",
-    };
-    source.address = SourceAddress::Ip(format!("127.0.0.1:{port}"));
+    let source = common::loopback_source(&ndi, &sender)?;
     let receiver = Receiver::new(&ndi, &ReceiverOptions::builder(source).build())?;
     let video = VideoFrame::builder().resolution(16, 16).build()?;
     let metadata = MetadataFrame::with_data("<payload>é</payload>", 123_456)?;

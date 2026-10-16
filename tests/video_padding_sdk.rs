@@ -2,9 +2,11 @@
 //! Valgrind: `--tool=memcheck --track-origins=yes --error-exitcode=99`.
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use grafton_ndi::{
     BorrowedVideoFrame, FrameSync, LineStrideOrSize, PixelFormat, Receiver, ReceiverColorFormat,
-    ReceiverOptions, ScanType, Sender, SenderOptions, Source, SourceAddress, VideoFrame, NDI,
+    ReceiverOptions, ScanType, Sender, SenderOptions, Source, VideoFrame, NDI,
 };
 use std::{
     sync::{
@@ -54,14 +56,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
             .build(),
     )
     .unwrap();
-    let mut source = sender.source().unwrap();
-    // Use a direct loopback endpoint so discovery is unnecessary. NDI's first
-    // sender normally uses 5961; preserve the advertised port when available.
-    let port = match &source.address {
-        SourceAddress::Ip(address) => address.rsplit(':').next().unwrap_or("5961"),
-        _ => "5961",
-    };
-    source.address = SourceAddress::Ip(format!("127.0.0.1:{port}"));
+    let source = common::loopback_source(&ndi, &sender).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     std::thread::scope(|scope| {
         let worker_stop = stop.clone();
@@ -174,6 +169,17 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
                 .unwrap()
                 .unwrap(),
         );
+        let _ = framesync
+            .receiver()
+            .metadata()
+            .try_capture(Duration::ZERO)
+            .unwrap();
+        let _ = framesync
+            .receiver()
+            .poll_status_change(Duration::ZERO)
+            .unwrap();
+        let receiver = framesync.into_receiver();
+        verify_owned(&receiver.video().capture(Duration::from_secs(10)).unwrap());
         let mut resend = Sender::new(
             &ndi,
             &SenderOptions::builder("normalized padding resend")

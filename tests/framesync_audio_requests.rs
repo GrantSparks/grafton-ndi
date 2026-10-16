@@ -1,7 +1,9 @@
 //! SDK regression for query-to-request migration and changing source channels.
+mod common;
+
 use grafton_ndi::{
     AudioFrame, FrameSync, FrameSyncAudioRequest, Receiver, ReceiverOptions, Sender, SenderOptions,
-    SourceAddress, NDI,
+    NDI,
 };
 use std::{
     sync::{
@@ -46,12 +48,7 @@ fn queried_channels_remain_fixed_when_source_format_changes() {
             .build(),
     )
     .unwrap();
-    let mut source = sender.source().unwrap();
-    let port = match &source.address {
-        SourceAddress::Ip(address) => address.rsplit(':').next().unwrap_or("5961"),
-        _ => "5961",
-    };
-    source.address = SourceAddress::Ip(format!("127.0.0.1:{port}"));
+    let source = common::loopback_source(&ndi, &sender).unwrap();
     let receiver = Receiver::new(&ndi, &ReceiverOptions::builder(source).build()).unwrap();
     let fs = FrameSync::new(receiver).unwrap();
     let source_channels = Arc::new(AtomicI32::new(2));
