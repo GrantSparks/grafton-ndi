@@ -134,16 +134,13 @@ pub use async_runtime::tokio;
 pub use async_runtime::async_std;
 
 pub use {
-    capture::{
-        AudioKind, CaptureKind, FrameFree, FrameSyncAudioFree, FrameSyncVideoFree, MetadataKind,
-        VideoKind,
-    },
+    capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
     error::*,
     finder::{Finder, FinderOptions, FinderOptionsBuilder, Source, SourceAddress, SourceCache},
     frames::{
-        AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout, AudioRef,
-        FormatCategory, LineStrideOrSize, MetadataFrame, MetadataFrameRef, PixelFormat,
-        PixelFormatInfo, ScanType, VideoFrame, VideoFrameBuilder, VideoFrameRef, VideoRef,
+        AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout, FormatCategory,
+        LineStrideOrSize, MetadataFrame, MetadataFrameRef, PixelFormat, PixelFormatInfo, ScanType,
+        VideoFrame, VideoFrameBuilder, VideoFrameRef,
     },
     framesync::{FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncVideoRef},
     receiver::{

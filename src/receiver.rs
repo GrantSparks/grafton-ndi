@@ -18,10 +18,7 @@
 //!
 //! // Poll for status changes
 //! if let Some(status) = receiver.poll_status_change(Duration::from_millis(1000))? {
-//!     {
-//!         let connections = status.connections;
-//!         println!("Active connections: {connections}");
-//!     }
+//!     println!("Active connections: {}", status.connections);
 //! }
 //! # Ok(())
 //! # }
@@ -497,10 +494,7 @@ impl ReceiverOptionsBuilder {
     ///
     /// // Poll for status changes
     /// if let Some(status) = receiver.poll_status_change(Duration::from_millis(1000))? {
-    ///     {
-    ///         let connections = status.connections;
-    ///         println!("Active connections: {connections}");
-    ///     }
+    ///     println!("Active connections: {}", status.connections);
     /// }
     /// # Ok(())
     /// # }
@@ -1428,6 +1422,15 @@ impl ConnectionStats {
     }
 }
 
+fn drop_percentage(received: u64, dropped: u64) -> f64 {
+    let total = u128::from(received) + u128::from(dropped);
+    if total == 0 {
+        0.0
+    } else {
+        (dropped as f64 / total as f64) * 100.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1933,14 +1936,5 @@ mod tests {
         );
         assert_eq!(attempts.get(), 1);
         assert!(sleeps.is_empty());
-    }
-}
-
-fn drop_percentage(received: u64, dropped: u64) -> f64 {
-    let total = u128::from(received) + u128::from(dropped);
-    if total == 0 {
-        0.0
-    } else {
-        (dropped as f64 / total as f64) * 100.0
     }
 }
