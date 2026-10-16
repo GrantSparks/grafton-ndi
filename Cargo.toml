@@ -1,6 +1,6 @@
 [package]
 name = "grafton-ndi"
-version = "1.0.1"
+version = "2.0.0"
 edition = "2021"
 rust-version = "1.87"
 build = "build.rs"
