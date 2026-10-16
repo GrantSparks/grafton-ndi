@@ -1,11 +1,11 @@
 //! NDI source discovery and network browsing.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::{CStr, CString},
     fmt::{self, Display, Formatter},
     ptr,
-    sync::{Arc, Mutex},
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -35,7 +35,7 @@ use crate::{ndi_lib::*, to_ms_checked, Error, Result, NDI};
 ///     .extra_ips("192.168.1.0/24,10.0.0.0/24")
 ///     .build();
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct FinderOptions {
     /// Whether to include local sources in discovery.
     pub show_local_sources: bool,
@@ -43,6 +43,12 @@ pub struct FinderOptions {
     pub groups: Option<String>,
     /// Additional IP addresses or ranges to search.
     pub extra_ips: Option<String>,
+}
+
+impl Default for FinderOptions {
+    fn default() -> Self {
+        Self::builder().build()
+    }
 }
 
 impl FinderOptions {
@@ -346,7 +352,8 @@ impl Finder {
     /// within it. Unlike a single [`wait_for_sources`](Self::wait_for_sources)
     /// followed by a snapshot — which returns on the *first* source-list change
     /// and so can miss responders that announce late on staggered or unicast
-    /// (IP-hint-only) networks — enumeration here is complete and deterministic.
+    /// (IP-hint-only) networks — enumeration here retains each source observed
+    /// during the window.
     ///
     /// For an immediate, non-blocking snapshot of already-known sources use
     /// [`current_sources`](Self::current_sources); to resolve a single specific
@@ -359,7 +366,10 @@ impl Finder {
     ///
     /// # Returns
     ///
-    /// Every source discovered within the window. May be empty if none appear.
+    /// Every source observed within the window, in first-observed order.
+    /// Identity includes the name and the complete address (including its variant);
+    /// a changed descriptor is returned as a distinct source. Network discovery
+    /// cannot guarantee observation of every source. May be empty if none appear.
     ///
     /// # Errors
     ///
@@ -383,11 +393,11 @@ impl Finder {
     /// # }
     /// ```
     pub fn find_sources(&self, timeout: Duration) -> Result<Vec<Source>> {
-        // `accept` never short-circuits, so the loop runs to the deadline and
-        // we keep the freshest snapshot, which is the complete set.
+        // Preserve first-observed order and deduplicate by complete descriptor.
+        let mut seen = HashSet::new();
         let mut discovered = Vec::new();
         self.poll_until_deadline(timeout, |sources| {
-            discovered = sources;
+            accumulate_sources(&mut discovered, &mut seen, sources);
             None::<()>
         })?;
         Ok(discovered)
@@ -415,11 +425,64 @@ unsafe impl std::marker::Send for Finder {}
 /// requires exclusive access through `Drop`.
 unsafe impl std::marker::Sync for Finder {}
 
+fn accumulate_sources(
+    discovered: &mut Vec<Source>,
+    seen: &mut HashSet<Source>,
+    sources: Vec<Source>,
+) {
+    for source in sources {
+        if seen.insert(source.clone()) {
+            discovered.push(source);
+        }
+    }
+}
+
+struct Authority<'a> {
+    host: &'a str,
+    port: Option<u16>,
+}
+
+fn parse_authority(address: &str) -> Option<Authority<'_>> {
+    let address = address.split_once("://").map_or(address, |(_, rest)| rest);
+    let authority = address.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit('@').next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, suffix) = rest.split_once(']')?;
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return None;
+        }
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(suffix.strip_prefix(':')?.parse().ok()?)
+        };
+        return Some(Authority { host, port });
+    }
+    if authority.matches(':').count() > 1 {
+        authority.parse::<std::net::Ipv6Addr>().ok()?;
+        return Some(Authority {
+            host: authority,
+            port: None,
+        });
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port.parse().ok()?)),
+        None => (authority, None),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some(Authority { host, port })
+}
+
 /// Network address of an NDI source.
 ///
 /// NDI sources can be addressed via URL (for NDI HX sources) or IP address
 /// (for standard NDI sources).
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub enum SourceAddress {
     /// No address available.
     #[default]
@@ -460,7 +523,9 @@ impl SourceAddress {
         }
     }
 
-    /// Extract the port number from this address if present.
+    /// Extract an explicit port from conventional host/port or URL syntax.
+    ///
+    /// SDK address strings are opaque; unrecognized syntax returns `None`.
     ///
     /// Parses the port from addresses in the format `host:port`.
     ///
@@ -483,36 +548,23 @@ impl SourceAddress {
     /// assert_eq!(url.port(), Some(8080));
     /// ```
     pub fn port(&self) -> Option<u16> {
-        let addr_str = match self {
-            SourceAddress::Ip(ip) => ip.as_str(),
-            SourceAddress::Url(url) => url.as_str(),
-            SourceAddress::None => return None,
-        };
+        self.authority().and_then(|authority| authority.port)
+    }
 
-        if let SourceAddress::Url(_) = self {
-            // Try to parse as URL to extract port
-            // Format might be http://host:port or similar
-            if let Some(port_start) = addr_str.rfind(':') {
-                // Make sure this isn't the :// in the scheme
-                let before_colon = &addr_str[..port_start];
-                if !before_colon.ends_with('/') {
-                    // Try to parse what comes after the colon
-                    let port_str = &addr_str[port_start + 1..];
-                    // Remove any trailing path
-                    let port_str = port_str.split('/').next().unwrap_or(port_str);
-                    return port_str.parse::<u16>().ok();
-                }
-            }
-        } else if let Some(colon_pos) = addr_str.rfind(':') {
-            let port_str = &addr_str[colon_pos + 1..];
-            return port_str.parse::<u16>().ok();
+    // SDK addresses are opaque. Only interpret conventional URL authorities and
+    // host[:port] forms; never inspect their path, query, or fragment as a port.
+    fn authority(&self) -> Option<Authority<'_>> {
+        match self {
+            Self::None => None,
+            Self::Ip(address) | Self::Url(address) => parse_authority(address),
         }
-
-        None
     }
 }
 
 /// Represents an NDI source discovered on the network.
+///
+/// Equality and hashing compare the complete name and address, including the
+/// address variant; they do not imply persistent device identity.
 ///
 /// Sources contain a human-readable name and network address. The name
 /// typically includes the machine name and source name (e.g., "MACHINE (Source)").
@@ -529,7 +581,7 @@ impl SourceAddress {
 ///
 /// println!("Source: {}", source); // Displays: LAPTOP (Camera 1)@192.168.1.100:5960
 /// ```
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub struct Source {
     /// The NDI source name (e.g., "MACHINE (Source Name)").
     pub name: String,
@@ -573,7 +625,10 @@ impl Source {
         self.name.contains(host) || self.address.contains_host(host)
     }
 
-    /// Extract the IP address from this source if available.
+    /// Extract the host from conventional host/port or URL syntax.
+    ///
+    /// Brackets around IPv6 literals are removed. SDK addresses are opaque;
+    /// unrecognized syntax returns `None`.
     ///
     /// For IP-based sources, this returns the IP portion without the port.
     /// For URL-based sources, this extracts the hostname portion.
@@ -595,29 +650,7 @@ impl Source {
     /// assert_eq!(source.ip_address(), Some("192.168.1.100"));
     /// ```
     pub fn ip_address(&self) -> Option<&str> {
-        match &self.address {
-            SourceAddress::Ip(ip) => Some(ip.split(':').next().unwrap_or(ip)),
-            SourceAddress::Url(url) => {
-                let without_scheme = if let Some(idx) = url.find("://") {
-                    &url[idx + 3..]
-                } else {
-                    url.as_str()
-                };
-                let host = without_scheme
-                    .split(':')
-                    .next()
-                    .unwrap_or(without_scheme)
-                    .split('/')
-                    .next()
-                    .unwrap_or(without_scheme);
-                if host.is_empty() {
-                    None
-                } else {
-                    Some(host)
-                }
-            }
-            SourceAddress::None => None,
-        }
+        self.address.authority().map(|authority| authority.host)
     }
 
     /// Extract the hostname or IP without port.
@@ -762,21 +795,12 @@ impl Display for Source {
     }
 }
 
-/// Cached NDI source with associated NDI runtime instance.
-///
-/// The `_ndi` field keeps the NDI runtime alive for as long as the source is cached,
-/// ensuring the runtime doesn't get destroyed while sources are still in use.
-#[derive(Clone)]
-struct CachedSource {
-    _ndi: Arc<NDI>,
-    source: Source,
-}
-
 /// Thread-safe cache for NDI source discovery.
 ///
 /// `SourceCache` eliminates the need for applications to manually cache NDI instances
-/// and discovered sources. It handles expensive NDI initialization and source discovery
-/// operations internally with built-in caching.
+/// and discovered sources. Discovery initializes the runtime on a cache miss.
+/// Cached sources own their strings and need no live runtime. Entries remain
+/// cached until explicitly invalidated or cleared.
 ///
 /// # Thread Safety
 ///
@@ -791,7 +815,7 @@ struct CachedSource {
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
 /// // Create a cache instance
-/// let cache = SourceCache::new()?;
+/// let cache = SourceCache::new();
 ///
 /// // Find a source by hostname or IP with automatic caching
 /// let source = cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
@@ -804,15 +828,11 @@ struct CachedSource {
 /// # }
 /// ```
 pub struct SourceCache {
-    cache: Mutex<HashMap<String, CachedSource>>,
+    cache: Mutex<HashMap<String, Source>>,
 }
 
 impl SourceCache {
     /// Create a new source cache.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the NDI runtime cannot be initialized.
     ///
     /// # Examples
     ///
@@ -820,14 +840,12 @@ impl SourceCache {
     /// use grafton_ndi::SourceCache;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let cache = SourceCache::new()?;
+    /// let cache = SourceCache::new();
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            cache: Mutex::new(HashMap::new()),
-        })
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Find a source by IP address or hostname with built-in caching.
@@ -860,7 +878,7 @@ impl SourceCache {
     /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let cache = SourceCache::new()?;
+    /// let cache = SourceCache::new();
     ///
     /// // Find by IP address
     /// let source = cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
@@ -874,17 +892,18 @@ impl SourceCache {
     /// # }
     /// ```
     pub fn find_by_host(&self, host: &str, timeout: Duration) -> Result<Source> {
+        to_ms_checked(timeout)?;
         {
             let cache = self
                 .cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(cached) = cache.get(host) {
-                return Ok(cached.source.clone());
+                return Ok(cached.clone());
             }
         }
 
-        let ndi = Arc::new(NDI::new()?);
+        let ndi = NDI::new()?;
         // Use extra_ips to hint NDI to look at the specific host IP/network segment
         // This significantly improves discovery speed and reliability
         let options = FinderOptions::builder()
@@ -909,13 +928,8 @@ impl SourceCache {
                 .cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            cache.insert(
-                host.to_string(),
-                CachedSource {
-                    _ndi: ndi.clone(),
-                    source: source.clone(),
-                },
-            );
+            // Sources own their strings and do not retain SDK resources.
+            cache.insert(host.to_string(), source.clone());
         }
 
         Ok(source)
@@ -937,7 +951,7 @@ impl SourceCache {
     /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let cache = SourceCache::new()?;
+    /// let cache = SourceCache::new();
     /// let source = cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
     ///
     /// // Later, if the source goes offline
@@ -967,7 +981,7 @@ impl SourceCache {
     /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let cache = SourceCache::new()?;
+    /// let cache = SourceCache::new();
     /// cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
     /// cache.find_by_host("192.168.0.108", Duration::from_secs(5))?;
     ///
@@ -995,7 +1009,7 @@ impl SourceCache {
     /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let cache = SourceCache::new()?;
+    /// let cache = SourceCache::new();
     /// assert_eq!(cache.len(), 0);
     ///
     /// cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
@@ -1020,7 +1034,7 @@ impl SourceCache {
     /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let cache = SourceCache::new()?;
+    /// let cache = SourceCache::new();
     /// assert!(cache.is_empty());
     ///
     /// cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
@@ -1049,6 +1063,83 @@ impl Default for SourceCache {
 mod tests {
     use super::*;
     use std::ffi::CString;
+
+    #[test]
+    fn defaults_include_local_sources() {
+        assert!(FinderOptions::default().show_local_sources);
+        assert_eq!(
+            FinderOptions::default().show_local_sources,
+            FinderOptions::builder().build().show_local_sources
+        );
+    }
+
+    #[test]
+    fn authority_parsing_separates_hosts_ports_and_url_components() {
+        for (address, host, port) in [
+            ("192.0.2.1:5960", "192.0.2.1", Some(5960)),
+            ("2001:db8::1", "2001:db8::1", None),
+            ("[::1]:5960", "::1", Some(5960)),
+            (
+                "http://camera:8080/path:123?port=456#789",
+                "camera",
+                Some(8080),
+            ),
+            ("http://camera?x=:123", "camera", None),
+            ("http://user:pass@[::1]:8080/path", "::1", Some(8080)),
+        ] {
+            let source = Source {
+                name: String::new(),
+                address: SourceAddress::Url(address.into()),
+            };
+            assert_eq!(source.host(), Some(host), "{address}");
+            assert_eq!(source.address.port(), port, "{address}");
+        }
+        assert!(parse_authority("[::1").is_none());
+        assert!(parse_authority("camera:invalid").is_none());
+        assert!(parse_authority("").is_none());
+    }
+
+    #[test]
+    fn discovery_accumulates_structurally_distinct_sources_in_order() {
+        let first = Source {
+            name: "Camera".into(),
+            address: SourceAddress::Ip("192.0.2.1".into()),
+        };
+        let mut changed = first.clone();
+        changed.address = SourceAddress::Ip("192.0.2.2".into());
+        let mut distinct_variant = first.clone();
+        distinct_variant.address = SourceAddress::Url("192.0.2.1".into());
+        let mut seen = HashSet::new();
+        let mut discovered = Vec::new();
+        accumulate_sources(&mut discovered, &mut seen, vec![first.clone()]);
+        accumulate_sources(&mut discovered, &mut seen, Vec::new());
+        accumulate_sources(
+            &mut discovered,
+            &mut seen,
+            vec![first.clone(), changed.clone(), distinct_variant.clone()],
+        );
+        assert_eq!(discovered, vec![first, changed, distinct_variant]);
+    }
+
+    #[test]
+    fn cache_validates_timeout_before_returning_cached_source() {
+        let cache = SourceCache::new();
+        cache
+            .cache
+            .lock()
+            .unwrap()
+            .insert("camera".into(), Source::default());
+        for host in ["camera", "not_cached"] {
+            assert!(matches!(
+                cache.find_by_host(host, Duration::MAX),
+                Err(Error::InvalidConfiguration(_))
+            ));
+        }
+        assert_eq!(
+            cache.find_by_host("camera", Duration::ZERO).unwrap(),
+            Source::default()
+        );
+    }
 
     #[test]
     fn concurrent_snapshots_keep_sdk_buffers_exclusive_until_copied() {

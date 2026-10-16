@@ -519,9 +519,6 @@ fn test_source_cache_creation() {
     use crate::finder::SourceCache;
 
     let cache = SourceCache::new();
-    assert!(cache.is_ok());
-
-    let cache = cache.unwrap();
     assert_eq!(cache.len(), 0);
     assert!(cache.is_empty());
 }
