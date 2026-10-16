@@ -1,7 +1,7 @@
-//! Async runtime integration for Tokio and async-std.
+//! Async runtime integration for Tokio and smol.
 //!
 //! This module provides async wrappers around the synchronous NDI receiver API,
-//! allowing integration with async Rust applications using Tokio or async-std runtimes.
+//! allowing integration with async Rust applications using Tokio or smol runtimes.
 //!
 //! The NDI SDK operations are inherently synchronous and blocking, so these wrappers
 //! use `spawn_blocking` internally to run NDI operations on a thread pool without
@@ -21,7 +21,7 @@
 //! # Features
 //!
 //! - `tokio` - Enable Tokio runtime support
-//! - `async-std` - Enable async-std runtime support
+//! - `smol` - Enable smol runtime support
 //!
 //! # Example with Tokio
 //!
@@ -105,7 +105,7 @@ where
 /// Trait for async runtime spawn-blocking abstraction.
 ///
 /// This trait enables runtime-agnostic async code by abstracting the spawn-blocking
-/// mechanism. Each runtime (Tokio, async-std) provides its own implementation.
+/// mechanism. Each runtime (Tokio, smol) provides its own implementation.
 ///
 /// The trait is sealed to prevent external implementations and ensure consistent
 /// error handling across all supported runtimes.
@@ -127,8 +127,8 @@ mod sealed {
     #[cfg(feature = "tokio")]
     impl Sealed for super::TokioRuntime {}
 
-    #[cfg(feature = "async-std")]
-    impl Sealed for super::AsyncStdRuntime {}
+    #[cfg(feature = "smol")]
+    impl Sealed for super::SmolRuntime {}
 }
 
 /// Tokio async runtime marker type.
@@ -161,16 +161,16 @@ impl SpawnBlocking for TokioRuntime {
     }
 }
 
-/// async-std runtime marker type.
+/// smol runtime marker type.
 ///
-/// Used as a type parameter for [`AsyncReceiverGeneric`] to select async-std's
-/// `spawn_blocking` implementation.
-#[cfg(feature = "async-std")]
+/// Used as a type parameter for [`AsyncReceiverGeneric`] to select smol's
+/// `unblock` implementation.
+#[cfg(feature = "smol")]
 #[derive(Clone, Copy, Debug, Default)]
-pub struct AsyncStdRuntime;
+pub struct SmolRuntime;
 
-#[cfg(feature = "async-std")]
-impl SpawnBlocking for AsyncStdRuntime {
+#[cfg(feature = "smol")]
+impl SpawnBlocking for SmolRuntime {
     // Using `impl Future` instead of `async fn` in trait because we need explicit
     // Send bounds on the returned future. This pattern is intentional.
     #[allow(clippy::manual_async_fn)]
@@ -181,7 +181,7 @@ impl SpawnBlocking for AsyncStdRuntime {
     {
         async {
             let (_cancellation, work) = blocking_operation(f);
-            ::async_std::task::spawn_blocking(work).await
+            ::smol::unblock(work).await
         }
     }
 }
@@ -194,7 +194,7 @@ impl SpawnBlocking for AsyncStdRuntime {
 /// # Type Parameters
 ///
 /// - `R`: The async runtime type, implementing [`SpawnBlocking`]. Use
-///   [`TokioRuntime`] or [`AsyncStdRuntime`].
+///   [`TokioRuntime`] or [`SmolRuntime`].
 ///
 /// # Thread Safety
 ///
@@ -473,7 +473,7 @@ impl<R: SpawnBlocking> Clone for AsyncReceiverGeneric<R> {
     }
 }
 
-// Backward-compatible module re-exports
+// Runtime-specific receiver aliases
 
 #[cfg(feature = "tokio")]
 pub mod tokio {
@@ -534,52 +534,53 @@ pub mod tokio {
     pub type AsyncReceiver = AsyncReceiverGeneric<TokioRuntime>;
 }
 
-#[cfg(feature = "async-std")]
-pub mod async_std {
-    //! async-std runtime integration.
+#[cfg(feature = "smol")]
+pub mod smol {
+    //! smol runtime integration.
     //!
-    //! Provides [`AsyncReceiver`] wrapper that uses `async_std::task::spawn_blocking`
-    //! to run NDI operations without blocking the async-std runtime.
+    //! Provides [`AsyncReceiver`] wrapper that uses `::smol::unblock`
+    //! to run NDI operations without blocking the smol runtime.
     //!
     //! # Example
     //!
     //! ```no_run
-    //! # #[cfg(feature = "async-std")]
+    //! # #[cfg(feature = "smol")]
     //! # {
-    //! use grafton_ndi::{NDI, ReceiverOptionsBuilder, async_std::AsyncReceiver};
+    //! use grafton_ndi::{NDI, ReceiverOptionsBuilder, smol::AsyncReceiver};
     //!
-    //! #[async_std::main]
-    //! async fn main() -> Result<(), grafton_ndi::Error> {
-    //!     let ndi = NDI::new()?;
-    //!     // ... obtain source ...
-    //!     # let source = grafton_ndi::Source {
-    //!     #     name: "Test".into(),
-    //!     #     address: grafton_ndi::SourceAddress::None
-    //!     # };
+    //! fn main() -> Result<(), grafton_ndi::Error> {
+    //!     ::smol::block_on(async {
+    //!         let ndi = NDI::new()?;
+    //!         // ... obtain source ...
+    //!         # let source = grafton_ndi::Source {
+    //!         #     name: "Test".into(),
+    //!         #     address: grafton_ndi::SourceAddress::None
+    //!         # };
     //!
-    //!     let options = ReceiverOptionsBuilder::snapshot_preset(source).build();
-    //!     let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
-    //!     let async_receiver = AsyncReceiver::new(receiver);
+    //!         let options = ReceiverOptionsBuilder::snapshot_preset(source).build();
+    //!         let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
+    //!         let async_receiver = AsyncReceiver::new(receiver);
     //!
-    //!     // Non-blocking async capture
-    //!     match async_receiver.video().try_capture(std::time::Duration::from_millis(100)).await? {
-    //!         Some(frame) => println!("Got frame: {}x{}", frame.width(), frame.height()),
-    //!         None => println!("No frame available"),
-    //!     }
+    //!         // Non-blocking async capture
+    //!         match async_receiver.video().try_capture(std::time::Duration::from_millis(100)).await? {
+    //!             Some(frame) => println!("Got frame: {}x{}", frame.width(), frame.height()),
+    //!             None => println!("No frame available"),
+    //!         }
     //!
-    //!     Ok(())
+    //!         Ok(())
+    //!     })
     //! }
     //! # }
     //! ```
 
-    use super::{AsyncReceiverGeneric, AsyncStdRuntime};
+    use super::{AsyncReceiverGeneric, SmolRuntime};
 
-    /// Async receiver wrapper for async-std runtime.
+    /// Async receiver wrapper for smol runtime.
     ///
     /// This is a type alias for the generic async receiver parameterized with
-    /// the async-std runtime. It provides async versions of the [`crate::Receiver`]
-    /// methods by running blocking NDI operations on async-std's blocking thread
-    /// pool using `spawn_blocking`.
+    /// the smol runtime. It provides async versions of the [`crate::Receiver`]
+    /// methods by running blocking NDI operations on smol's blocking thread
+    /// pool using `::smol::unblock`.
     ///
     /// # Thread Safety
     ///
@@ -590,7 +591,7 @@ pub mod async_std {
     ///
     /// All methods return [`crate::Result`], converting blocking-operation
     /// panics into [`crate::Error::SpawnFailed`].
-    pub type AsyncReceiver = AsyncReceiverGeneric<AsyncStdRuntime>;
+    pub type AsyncReceiver = AsyncReceiverGeneric<SmolRuntime>;
 }
 
 #[cfg(all(test, feature = "tokio"))]
@@ -650,6 +651,96 @@ mod timeout_tests {
     }
 }
 
+#[cfg(all(test, feature = "smol"))]
+mod smol_tests {
+    use super::*;
+    use std::{
+        sync::mpsc,
+        task::{Context, Poll, Waker},
+    };
+
+    #[test]
+    fn dropping_unpolled_future_starts_no_work() {
+        let called = Arc::new(AtomicBool::new(false));
+        let worker_called = Arc::clone(&called);
+        let operation = SmolRuntime::spawn_blocking(move || {
+            worker_called.store(true, Ordering::Release);
+        });
+        drop(operation);
+        assert!(!called.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn dropping_started_future_allows_work_to_finish() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let mut operation = Box::pin(SmolRuntime::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            finished_tx.send(42).unwrap();
+        }));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            operation.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(operation);
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            finished_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn invalid_budget_does_not_start_work() {
+        let called = Arc::new(AtomicBool::new(false));
+        let worker_called = Arc::clone(&called);
+        let result = ::smol::block_on(with_timeout_budget::<SmolRuntime, _, _>(
+            crate::MAX_TIMEOUT + Duration::from_secs(1),
+            move |_| {
+                worker_called.store(true, Ordering::Release);
+                Ok(())
+            },
+        ));
+        assert!(result.is_err());
+        assert!(!called.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn budget_starts_on_first_poll_and_keeps_one_deadline() {
+        let budget = Duration::from_millis(20);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut operation = Box::pin(with_timeout_budget::<SmolRuntime, _, _>(
+            budget,
+            move |deadline| {
+                started_tx.send(deadline).unwrap();
+                release_rx.recv().unwrap();
+                Ok(deadline.saturating_duration_since(Instant::now()))
+            },
+        ));
+        // Construction must not consume the wait budget.
+        std::thread::sleep(budget);
+        let before_poll = Instant::now();
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            operation.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        let after_poll = Instant::now();
+        let deadline = started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(deadline >= before_poll + budget);
+        assert!(deadline <= after_poll + budget);
+        // A wait inside blocking work must not reset the shared capture deadline.
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        release_tx.send(()).unwrap();
+        assert_eq!(::smol::block_on(operation).unwrap(), Duration::ZERO);
+    }
+}
+
 #[cfg(test)]
 mod executor_tests {
     use super::*;
@@ -701,11 +792,10 @@ mod executor_tests {
         );
     }
 
-    #[cfg(feature = "async-std")]
+    #[cfg(feature = "smol")]
     #[test]
-    fn async_std_converts_blocking_panic() {
-        let result =
-            ::async_std::task::block_on(AsyncStdRuntime::spawn_blocking(|| panic!("test panic")));
+    fn smol_converts_blocking_panic() {
+        let result = ::smol::block_on(SmolRuntime::spawn_blocking(|| panic!("test panic")));
         assert!(
             matches!(result, Err(Error::SpawnFailed(message)) if message.contains("test panic"))
         );

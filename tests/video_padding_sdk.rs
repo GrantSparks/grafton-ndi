@@ -67,7 +67,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
                 .metadata("<padding-regression/>")
                 .build()
                 .unwrap();
-            for pixel in frame.data_mut().chunks_exact_mut(4) {
+            for pixel in frame.data_mut().as_chunks_mut::<4>().0 {
                 pixel.copy_from_slice(&[40, 80, 120, 255]);
             }
             while !worker_stop.load(Ordering::Relaxed) {
@@ -129,14 +129,13 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
             verify_owned(&frame);
             receiver
         };
-        #[cfg(feature = "async-std")]
+        #[cfg(feature = "smol")]
         {
-            use grafton_ndi::async_std::AsyncReceiver;
+            use grafton_ndi::smol::AsyncReceiver;
             let async_receiver =
                 AsyncReceiver::new(self::receiver(&ndi, receiver.source().clone()));
             let frame =
-                async_std::task::block_on(async_receiver.video().capture(Duration::from_secs(10)))
-                    .unwrap();
+                smol::block_on(async_receiver.video().capture(Duration::from_secs(10))).unwrap();
             verify_owned(&frame);
         }
         let framesync = FrameSync::new(receiver).unwrap();

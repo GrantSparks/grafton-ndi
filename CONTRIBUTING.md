@@ -14,9 +14,9 @@ contain a standalone replacement for that installation.
 
 Use current stable Rust for development. [rust-toolchain.toml](rust-toolchain.toml)
 selects stable with `clippy`, `rustfmt`, and `rust-src`. The library's minimum Rust
-version is 1.87; development dependencies and compiler-diagnostic fixtures use
-current stable. CI separately checks the library with Rust 1.87 and uses nightly
-for its formatting job.
+version is 1.88; development dependencies and compiler-diagnostic fixtures use
+current stable. CI separately checks all targets and library tests with Rust 1.88
+and uses nightly for its formatting job.
 
 Start with:
 
@@ -41,7 +41,7 @@ Do not assume that a machine without a camera can skip installing the SDK.
 | `src/frames.rs` | Owned and borrowed frames, layout/metadata validation, channel access, and image encoding |
 | `src/framesync.rs` | Clock-corrected pull capture and receiver ownership boundaries |
 | `src/sender.rs` | Synchronous sends, owned async video pipeline, copied submissions, and completion handlers |
-| `src/async_runtime.rs` | Tokio/async-std blocking adapters, deadlines, task errors, and cancellation |
+| `src/async_runtime.rs` | Tokio/smol blocking adapters, deadlines, task errors, and cancellation |
 | `src/ndi_lib.rs` | Private include wrapper for bindings generated into Cargo's `OUT_DIR` |
 | `build.rs`, `build_support.rs` | Binding generation, SDK discovery, target ABI checks, and library selection |
 | `examples/`, `tests/` | Application workflows, SDK regressions, and public compile contracts |
@@ -154,8 +154,10 @@ cargo test --no-default-features
 cargo build --examples --no-default-features
 cargo test --no-default-features --features tokio
 cargo build --examples --no-default-features --features tokio
-cargo test --no-default-features --features async-std
-cargo build --examples --no-default-features --features async-std
+cargo test --no-default-features --features smol
+cargo build --examples --no-default-features --features smol
+cargo test --no-default-features --features tokio,smol
+cargo build --examples --no-default-features --features tokio,smol
 cargo check --no-default-features --features advanced_sdk
 ```
 
@@ -174,8 +176,17 @@ For dependency, build, or language-feature changes, check library compatibility
 separately from contributor tooling:
 
 ```bash
-cargo +1.87.0 check --all-features
+cargo +1.88.0 check --all-targets --all-features
+cargo +1.88.0 test --lib --all-features
+cargo generate-lockfile
+cargo audit --deny warnings
 ```
+
+The library does not track `Cargo.lock`. Audit the freshly resolved graph across
+all optional and target dependencies. Keep bindgen at 0.72.1 until mixed
+`syn`/`prettyplease` consumer resolutions are validated; retain base64 0.22 until explicit SIMD-engine validation. See
+[the 2.0 migration guide](docs/migration/1.x-to-2.0.md#async-std-to-smol) for
+application lockfile updates.
 
 Report the SDK/platform and checks actually exercised. Identify unavailable
 platform or Advanced SDK coverage rather than implying an untested matrix passed.

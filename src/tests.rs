@@ -1010,19 +1010,19 @@ fn test_tokio_async_receiver_methods_exist() {
     };
 }
 
-#[cfg(feature = "async-std")]
+#[cfg(feature = "smol")]
 #[test]
-fn test_async_std_async_receiver_creation() {
+fn test_smol_async_receiver_creation() {
     use crate::{
         finder::{Source, SourceAddress},
         receiver::{Receiver, ReceiverOptionsBuilder},
         NDI,
     };
 
-    // Test that AsyncReceiver can be created and is cloneable for async-std
+    // Test that AsyncReceiver can be created and is cloneable for smol
 
     let _ = || {
-        use crate::async_std::AsyncReceiver;
+        use crate::smol::AsyncReceiver;
 
         let source = Source {
             name: "Test".into(),
@@ -1041,15 +1041,15 @@ fn test_async_std_async_receiver_creation() {
     };
 }
 
-#[cfg(feature = "async-std")]
+#[cfg(feature = "smol")]
 #[test]
-fn test_async_std_async_receiver_methods_exist() {
-    // Verify all expected async methods exist on async-std AsyncReceiver
+fn test_smol_async_receiver_methods_exist() {
+    // Verify all expected async methods exist on smol AsyncReceiver
 
     use crate::{
-        async_std::AsyncReceiver,
         finder::{Source, SourceAddress},
         receiver::{Receiver, ReceiverOptionsBuilder},
+        smol::AsyncReceiver,
         NDI,
     };
 
@@ -1106,7 +1106,7 @@ fn test_async_std_async_receiver_methods_exist() {
 
 #[test]
 fn test_async_feature_flags_mutually_compatible() {
-    // This test verifies that tokio and async-std features can coexist
+    // This test verifies that tokio and smol features can coexist
     // Both should be able to be enabled simultaneously without conflicts
 
     #[cfg(feature = "tokio")]
@@ -1115,10 +1115,10 @@ fn test_async_feature_flags_mutually_compatible() {
         let _tokio_type_check = std::any::type_name::<TokioAsyncReceiver>();
     }
 
-    #[cfg(feature = "async-std")]
+    #[cfg(feature = "smol")]
     {
-        use crate::async_std::AsyncReceiver as AsyncStdReceiver;
-        let _async_std_type_check = std::any::type_name::<AsyncStdReceiver>();
+        use crate::smol::AsyncReceiver as SmolReceiver;
+        let _smol_type_check = std::any::type_name::<SmolReceiver>();
     }
 
     // If this compiles, both can be enabled together

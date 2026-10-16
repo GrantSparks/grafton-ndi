@@ -45,7 +45,7 @@ runs:
     # Restore cache if available
     - name: Restore cache
       id: cache-restore
-      uses: actions/cache/restore@v5
+      uses: actions/cache/restore@v6.1.0
       with:
         path: |
           ${{ runner.temp }}/ndi-sdk
@@ -245,7 +245,7 @@ runs:
     # Save opted-in SDK caches only on the main branch.
     - name: Save cache
       if: inputs.save-cache == 'true' && steps.cache-restore.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
-      uses: actions/cache/save@v5
+      uses: actions/cache/save@v6.1.0
       with:
         path: |
           ${{ runner.temp }}/ndi-sdk

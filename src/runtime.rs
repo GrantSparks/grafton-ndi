@@ -1,7 +1,5 @@
 //! NDI runtime management and initialization.
 
-use once_cell::sync::Lazy;
-
 use std::sync::{Condvar, Mutex, MutexGuard};
 
 use crate::{ndi_lib::*, Error, Result};
@@ -188,7 +186,7 @@ impl<B: RuntimeBackend> RuntimeManager<B> {
     }
 }
 
-static RUNTIME: Lazy<RuntimeManager> = Lazy::new(RuntimeManager::new);
+static RUNTIME: RuntimeManager = RuntimeManager::new();
 
 /// Manages the NDI runtime lifecycle.
 ///

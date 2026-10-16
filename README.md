@@ -4,7 +4,7 @@
 [![Documentation](https://img.shields.io/badge/docs-grantsparks.github.io-blue.svg)](https://grantsparks.github.io/grafton-ndi/grafton_ndi/)
 [![CI](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml/badge.svg)](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml)
 [![License](https://img.shields.io/crates/l/grafton-ndi.svg)](https://github.com/GrantSparks/grafton-ndi/blob/main/LICENSE)
-[![Minimum Rust Version](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](https://www.rust-lang.org)
+[![Minimum Rust Version](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
 `grafton-ndi` is an idiomatic Rust interface to the NDI® 6 SDK. It gives Rust applications a practical way to discover NDI sources, receive and publish video/audio/metadata streams, monitor status and tally, control PTZ devices, and integrate NDI work into synchronous or async application architectures.
 
@@ -19,7 +19,7 @@ The crate is intentionally a binding layer rather than a media framework. It kee
 - **FrameSync** - Use NDI's clock-corrected pull API for playback, render loops, and audio-device driven workflows.
 - **Monitoring** - Query receiver connection status, frame-drop statistics, tally state, and sender connection counts.
 - **PTZ control** - Drive supported pan, tilt, zoom, focus, exposure, and white-balance commands.
-- **Async integration** - Use optional Tokio or async-std wrappers for receive workflows without blocking the async runtime.
+- **Async integration** - Use optional Tokio or smol wrappers for receive workflows without blocking the async runtime.
 - **Image snapshots** - Encode captured video frames as PNG, JPEG, or data URLs with the default `image-encoding` feature.
 - **SDK compatibility** - Supports standard and Advanced SDK installation layouts; async send completion uses SDK synchronization boundaries in both.
 
@@ -67,7 +67,7 @@ Feature flags:
 
 # Async receiver wrappers
 # grafton-ndi = { version = "2.0", features = ["tokio"] }
-# grafton-ndi = { version = "2.0", features = ["async-std"] }
+# grafton-ndi = { version = "2.0", features = ["smol"] }
 
 # Retained compatibility flag; does not enable SDK completion callbacks
 # grafton-ndi = { version = "2.0", features = ["advanced_sdk"] }
@@ -82,7 +82,7 @@ Feature flags:
    - Android: set `NDI_SDK_DIR` to the Android SDK and use the Android NDK for cross-compilation.
    - Set `NDI_SDK_DIR` when the SDK is installed elsewhere.
 
-2. **Rust**: Rust 1.87 or later.
+2. **Rust**: Rust 1.88 or later.
 
 3. **Build dependencies**: bindgen generates the FFI bindings at build time from
    your installed SDK headers, so it needs an LLVM/Clang installation including
