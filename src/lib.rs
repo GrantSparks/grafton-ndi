@@ -32,9 +32,10 @@
 //!
 //! ## Runtime Management
 //!
-//! The [`NDI`] struct manages the NDI runtime lifecycle. It must be created before
-//! any other NDI operations and should be kept alive for the duration of your
-//! application's NDI usage.
+//! The [`NDI`] struct manages the NDI runtime lifecycle. Create a handle before
+//! constructing SDK resources; those resources retain their own runtime
+//! references. [`SourceCache`] acquires the runtime on cache misses, while its
+//! cached owned source descriptors need no live runtime handle.
 //!
 //! ## Source Discovery
 //!

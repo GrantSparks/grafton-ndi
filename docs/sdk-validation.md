@@ -98,6 +98,8 @@ library and compile-contract coverage also ran against standard SDK 6.1.1.
   and FrameSync frames before freeing them on their permitted thread.
 - The same live regression passes under Valgrind Memcheck with zero errors.
   It observes a 2592-byte SDK stride for 642-pixel BGRA, versus 2568 active bytes.
+  The synthetic uninitialized-padding library tests also pass Memcheck with
+  zero errors, including scoped reads of packed and multiplane formats.
 - Release-mode encoding comparisons cover 1080p/4K/8K, padding, pixel entropy,
   PNG, and JPEG quality 1/85/100, with scalar and unified JPEG SIMD builds. See
   [image encoding resources](image-encoding-performance.md) for the measured
