@@ -3,13 +3,10 @@ mod common;
 use grafton_ndi::{Error, MetadataFrame, Receiver, ReceiverOptions, Sender, SenderOptions, NDI};
 use std::time::{Duration, Instant};
 
-fn wait_until(mut condition: impl FnMut() -> bool) {
+fn wait_until(stage: &str, mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !condition() {
-        assert!(
-            Instant::now() < deadline,
-            "loopback capability update timed out"
-        );
+        assert!(Instant::now() < deadline, "{stage} timed out");
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -25,10 +22,13 @@ fn media_capture_retains_capability_notifications() -> Result<(), Error> {
             &SenderOptions::builder(format!("status retention {kind}")).build(),
         )?;
         let source = common::loopback_source(&ndi, &sender)?;
+        eprintln!("capture case {kind}: connecting to {source:?}");
         let options = ReceiverOptions::builder(source).build();
         let control = Receiver::new(&ndi, &options)?;
         let media = Receiver::new(&ndi, &options)?;
-        wait_until(|| control.is_connected() && media.is_connected());
+        wait_until("initial receiver connections", || {
+            control.is_connected() && media.is_connected()
+        });
         for receiver in [&control, &media] {
             while receiver
                 .poll_status_change(Duration::from_millis(50))?
@@ -37,12 +37,13 @@ fn media_capture_retains_capability_notifications() -> Result<(), Error> {
             assert!(!receiver.ptz_is_supported());
         }
         for supported in [true, false] {
+            eprintln!("capture case {kind}: changing PTZ support to {supported}");
             sender.clear_connection_metadata();
             sender.add_connection_metadata(&MetadataFrame::with_data(
                 format!("<ndi_capabilities ntk_ptz=\"{supported}\"/>"),
                 0,
             )?);
-            wait_until(|| {
+            wait_until("PTZ capability update", || {
                 control.ptz_is_supported() == supported && media.ptz_is_supported() == supported
             });
             assert!(control
