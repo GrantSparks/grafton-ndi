@@ -458,11 +458,6 @@ impl fmt::Debug for VideoFrame {
 impl Default for VideoFrame {
     fn default() -> Self {
         VideoFrame::builder()
-            .resolution(1920, 1080)
-            .pixel_format(PixelFormat::BGRA)
-            .frame_rate(60, 1)
-            .aspect_ratio(16.0 / 9.0)
-            .scan_type(ScanType::Interlaced)
             .build()
             .expect("Default VideoFrame should always succeed")
     }
@@ -530,6 +525,23 @@ impl VideoFrame {
     /// is passed through as a literal timecode.
     pub fn timecode(&self) -> i64 {
         self.timecode
+    }
+
+    /// Set the frame timecode in 100 ns units without reallocating its pixels.
+    /// Use the SDK synthesized-timecode sentinel to request SDK clocking.
+    pub fn set_timecode(&mut self, timecode: i64) {
+        self.timecode = timecode;
+    }
+
+    /// Set the scan type without changing the frame's validated layout.
+    pub fn set_scan_type(&mut self, scan_type: ScanType) {
+        self.scan_type = scan_type;
+    }
+
+    /// Set the timestamp in 100 ns units. The SDK fills receive timestamps;
+    /// outgoing timestamp values are passed through unchanged.
+    pub fn set_timestamp(&mut self, timestamp: i64) {
+        self.timestamp = timestamp;
     }
 
     /// Get the timestamp.
@@ -672,23 +684,7 @@ impl VideoFrame {
     /// ```
     #[cfg(feature = "image-encoding")]
     pub fn encode_png(&self) -> Result<Vec<u8>> {
-        use png::{BitDepth, ColorType, Encoder};
-
-        let image = ImagePixelSource::new(self.layout, &self.data)?;
-        let (rgba_data, width, height) = image.png_rgba_input()?;
-
-        // Encode to PNG
-        let mut png_data = Vec::new();
-        let mut encoder = Encoder::new(&mut png_data, width, height);
-        encoder.set_color(ColorType::Rgba);
-        encoder.set_depth(BitDepth::Eight);
-
-        encoder
-            .write_header()
-            .and_then(|mut writer| writer.write_image_data(rgba_data.as_ref()))
-            .map_err(|e| Error::InvalidFrame(format!("PNG encoding failed: {e}")))?;
-
-        Ok(png_data)
+        ImagePixelSource::new(self.layout, &self.data)?.encode_png()
     }
 
     /// Encode the video frame as JPEG bytes with the specified quality.
@@ -738,19 +734,7 @@ impl VideoFrame {
     /// ```
     #[cfg(feature = "image-encoding")]
     pub fn encode_jpeg(&self, quality: u8) -> Result<Vec<u8>> {
-        use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
-
-        let image = ImagePixelSource::new(self.layout, &self.data)?;
-        let (rgb_data, width, height) = image.jpeg_rgb_input(quality)?;
-
-        // Encode to JPEG
-        let mut jpeg_data = Vec::new();
-        let encoder = JpegEncoder::new(&mut jpeg_data, quality);
-        encoder
-            .encode(&rgb_data, width, height, JpegColorType::Rgb)
-            .map_err(|e| Error::InvalidFrame(format!("JPEG encoding failed: {e}")))?;
-
-        Ok(jpeg_data)
+        ImagePixelSource::new(self.layout, &self.data)?.encode_jpeg(quality)
     }
 
     /// Encode the video frame as a base64 data URL for embedding in HTML/JSON.
@@ -790,15 +774,7 @@ impl VideoFrame {
     /// ```
     #[cfg(feature = "image-encoding")]
     pub fn encode_data_url(&self, format: ImageFormat) -> Result<String> {
-        use base64::{engine::general_purpose::STANDARD, Engine};
-
-        let (mime_type, image_bytes) = match format {
-            ImageFormat::Png => ("image/png", self.encode_png()?),
-            ImageFormat::Jpeg(quality) => ("image/jpeg", self.encode_jpeg(quality)?),
-        };
-
-        let base64_data = STANDARD.encode(&image_bytes);
-        Ok(format!("data:{mime_type};base64,{base64_data}"))
+        ImagePixelSource::new(self.layout, &self.data)?.encode_data_url(format)
     }
 
     /// Creates a `VideoFrame` from a raw NDI video frame with owned data.
@@ -867,6 +843,7 @@ pub struct VideoFrameBuilder {
     timecode: Option<i64>,
     metadata: Option<String>,
     timestamp: Option<i64>,
+    data: Option<Vec<u8>>,
 }
 
 impl VideoFrameBuilder {
@@ -883,6 +860,7 @@ impl VideoFrameBuilder {
             timecode: None,
             metadata: None,
             timestamp: None,
+            data: None,
         }
     }
 
@@ -945,6 +923,16 @@ impl VideoFrameBuilder {
         self
     }
 
+    /// Supply owned pixels without an intermediate zero-filled allocation.
+    ///
+    /// `build` requires exactly the validated layout size and retains this
+    /// allocation unchanged. Use `data_mut` on the resulting frame for reuse.
+    #[must_use]
+    pub fn data(mut self, data: Vec<u8>) -> Self {
+        self.data = Some(data);
+        self
+    }
+
     /// Build the VideoFrame
     pub fn build(self) -> Result<VideoFrame> {
         let width = self.width.unwrap_or(1920);
@@ -957,10 +945,20 @@ impl VideoFrameBuilder {
 
         validate_video_frame_metadata(frame_rate_n, frame_rate_d, picture_aspect_ratio)?;
         let layout = ValidatedVideoLayout::new_uncompressed(pixel_format, width, height, None)?;
-        let buffer_size = layout.data_len_bytes;
-        let data = vec![0u8; buffer_size];
-
         let metadata = self.metadata.map(FrameMetadata::new).transpose()?;
+        let data = match self.data {
+            Some(data) => {
+                if data.len() != layout.data_len_bytes {
+                    return Err(Error::InvalidFrame(format!(
+                        "Video data length {}, expected {} bytes for validated layout",
+                        data.len(),
+                        layout.data_len_bytes
+                    )));
+                }
+                data
+            }
+            None => vec![0u8; layout.data_len_bytes],
+        };
 
         Ok(VideoFrame {
             layout,
@@ -1038,16 +1036,31 @@ impl AudioFrame {
             ));
         }
 
-        // Copy data for ownership
-        let slice = unsafe { slice::from_raw_parts(raw.p_data as *const f32, layout.sample_count) };
-        let data = slice.to_vec();
+        // Only channel samples are initialized audio. Never form a typed slice
+        // over inter-channel padding supplied by the SDK.
+        let packed_layout = validate_outbound_audio_layout(
+            layout.sample_rate,
+            layout.no_channels as i32,
+            layout.no_samples as i32,
+            layout.format().expect("non-empty audio has a format"),
+        )?;
+        let mut data = Vec::with_capacity(packed_layout.sample_count);
+        for channel in 0..layout.no_channels {
+            let range = layout.channel_range(channel).expect("validated channel");
+            // SAFETY: the SDK owns an aligned FLTP buffer with no_samples
+            // initialized floats at each validated channel offset.
+            let samples = unsafe {
+                slice::from_raw_parts(raw.p_data.cast::<f32>().add(range.start), layout.no_samples)
+            };
+            data.extend_from_slice(samples);
+        }
 
         // Copy the string, don't take ownership - SDK will free the original.
         let metadata =
             unsafe { FrameMetadata::copy_from_raw_validated(raw.p_metadata, metadata_layout) };
 
         Ok(AudioFrame {
-            layout,
+            layout: packed_layout,
             timecode: raw.timecode,
             data,
             metadata,
@@ -1153,9 +1166,15 @@ impl AudioFrame {
     ///
     /// Data is always stored in planar format internally. If `AudioLayout::Interleaved`
     /// was specified at build time, the data was converted to planar during construction.
-    pub fn channel_data(&self, channel: usize) -> Option<Vec<f32>> {
+    pub fn channel_data(&self, channel: usize) -> Option<&[f32]> {
         let range = self.layout.channel_range(channel)?;
-        Some(self.data[range].to_vec())
+        Some(&self.data[range])
+    }
+
+    /// Get mutable samples for one channel without allocating.
+    pub fn channel_data_mut(&mut self, channel: usize) -> Option<&mut [f32]> {
+        let range = self.layout.channel_range(channel)?;
+        Some(&mut self.data[range])
     }
 }
 
@@ -1278,7 +1297,7 @@ impl AudioFrameBuilder {
     /// Build the AudioFrame
     ///
     /// When `AudioLayout::Interleaved` is set, the input data is converted to planar
-    /// format using the NDI SDK utility function. The resulting frame always stores
+    /// format in Rust. The resulting frame always stores
     /// planar data with `channel_stride_in_bytes = num_samples * 4`.
     pub fn build(self) -> Result<AudioFrame> {
         let sample_rate = self.sample_rate.unwrap_or(48000);
@@ -1415,8 +1434,8 @@ pub enum AudioLayout {
     /// Input memory layout for 2 channels, 3 samples:
     /// `[C0S0, C1S0, C0S1, C1S1, C0S2, C1S2]`
     ///
-    /// Interleaved data is converted to planar format at build time using the NDI SDK
-    /// utility function, so the resulting `AudioFrame` always stores planar data.
+    /// Interleaved data is converted to planar format in Rust at build time,
+    /// so the resulting `AudioFrame` always stores planar data.
     Interleaved,
 }
 
@@ -1596,9 +1615,13 @@ pub(crate) fn validate_metadata_layout(
             });
         }
 
-        return Err(Error::InvalidFrame(
-            "Metadata frame uses lengthless non-null C-string data".into(),
-        ));
+        // The SDK permits zero length as a C-string sentinel. Apply the same
+        // bounded scan and SDK pointer-validity contract as per-frame metadata.
+        let metadata = unsafe { validate_frame_metadata(raw.p_data)? };
+        return Ok(ValidatedMetadataLayout {
+            len_with_nul: metadata.len_with_nul.expect("non-null metadata").get(),
+            text_len: metadata.text_len,
+        });
     }
 
     if raw.p_data.is_null() {
@@ -1963,6 +1986,52 @@ struct ImagePixelSource<'a> {
 
 #[cfg(feature = "image-encoding")]
 impl<'a> ImagePixelSource<'a> {
+    fn encode_png(&self) -> Result<Vec<u8>> {
+        use png::{BitDepth, ColorType, Encoder};
+
+        let (rgba_data, width, height) = self.png_rgba_input()?;
+
+        // Encode to PNG
+        let mut png_data = Vec::new();
+        let mut encoder = Encoder::new(&mut png_data, width, height);
+        encoder.set_color(ColorType::Rgba);
+        encoder.set_depth(BitDepth::Eight);
+
+        encoder
+            .write_header()
+            .and_then(|mut writer| writer.write_image_data(rgba_data.as_ref()))
+            .map_err(|e| Error::InvalidFrame(format!("PNG encoding failed: {e}")))?;
+
+        Ok(png_data)
+    }
+
+    fn encode_jpeg(&self, quality: u8) -> Result<Vec<u8>> {
+        use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
+
+        let (rgb_data, width, height) = self.jpeg_rgb_input(quality)?;
+
+        // Encode to JPEG
+        let mut jpeg_data = Vec::new();
+        let encoder = JpegEncoder::new(&mut jpeg_data, quality);
+        encoder
+            .encode(&rgb_data, width, height, JpegColorType::Rgb)
+            .map_err(|e| Error::InvalidFrame(format!("JPEG encoding failed: {e}")))?;
+
+        Ok(jpeg_data)
+    }
+
+    fn encode_data_url(&self, format: ImageFormat) -> Result<String> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        let (mime_type, image_bytes) = match format {
+            ImageFormat::Png => ("image/png", self.encode_png()?),
+            ImageFormat::Jpeg(quality) => ("image/jpeg", self.encode_jpeg(quality)?),
+        };
+
+        let base64_data = STANDARD.encode(&image_bytes);
+        Ok(format!("data:{mime_type};base64,{base64_data}"))
+    }
+
     fn new(layout: ValidatedVideoLayout, data: &'a [u8]) -> Result<Self> {
         let pixel_format = ImagePixelFormat::from_pixel_format(layout.pixel_format)?;
 
@@ -2626,6 +2695,12 @@ fn validate_audio_layout_inner(
         ));
     }
 
+    if !raw.p_data.cast::<f32>().is_aligned() {
+        return Err(Error::InvalidFrame(
+            "Audio data pointer is not aligned for f32".into(),
+        ));
+    }
+
     if raw.sample_rate <= 0 {
         return Err(Error::InvalidFrame(format!(
             "Invalid sample rate: {}",
@@ -2976,6 +3051,28 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
         unsafe { slice::from_raw_parts(self.guard.frame().p_data, self.layout.data_len_bytes) }
     }
 
+    /// Encode PNG directly from the borrowed SDK pixels, without first
+    /// copying the frame into an owned `VideoFrame`. Uses the same supported
+    /// formats and padding handling as [`VideoFrame::encode_png`].
+    #[cfg(feature = "image-encoding")]
+    pub fn encode_png(&self) -> Result<Vec<u8>> {
+        ImagePixelSource::new(self.layout, self.data())?.encode_png()
+    }
+
+    /// Encode JPEG directly from borrowed SDK pixels. Quality must be in
+    /// `1..=100`; see [`VideoFrame::encode_jpeg`] for format restrictions.
+    #[cfg(feature = "image-encoding")]
+    pub fn encode_jpeg(&self, quality: u8) -> Result<Vec<u8>> {
+        ImagePixelSource::new(self.layout, self.data())?.encode_jpeg(quality)
+    }
+
+    /// Encode borrowed SDK pixels as a PNG or JPEG base64 data URL without an
+    /// intermediate owned frame. See [`VideoFrame::encode_data_url`].
+    #[cfg(feature = "image-encoding")]
+    pub fn encode_data_url(&self, format: ImageFormat) -> Result<String> {
+        ImagePixelSource::new(self.layout, self.data())?.encode_data_url(format)
+    }
+
     /// Convert this borrowed frame to an owned `VideoFrame`.
     ///
     /// This performs a single memcpy of the frame data and metadata,
@@ -3100,41 +3197,51 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
         unsafe { frame_metadata_str(self.guard.frame().p_metadata, self.metadata) }
     }
 
-    /// Get a zero-copy view of the audio data as 32-bit floats.
+    /// Get a zero-copy slice when channels are tightly packed.
     ///
-    /// This returns a slice directly into the NDI SDK's buffer.
-    /// No allocation or memcpy is performed.
-    ///
-    /// # Safety Guarantee
-    ///
-    /// The slice length is computed once at construction time using checked
-    /// arithmetic and validated against `MAX_AUDIO_BYTES`. This eliminates
-    /// the possibility of integer overflow or unbounded slice creation. A
-    /// validated empty (query/no-source) layout yields an empty slice.
-    pub fn data(&self) -> &[f32] {
+    /// Returns `None` for multi-channel buffers with padding between channels.
+    /// Use [`channel_data`](Self::channel_data) or [`channels`](Self::channels)
+    /// for those buffers. An empty query/no-source frame returns `Some(&[])`.
+    pub fn data(&self) -> Option<&[f32]> {
         if self.layout.is_empty() {
-            return &[];
+            return Some(&[]);
         }
-
-        // SAFETY: For a non-empty layout the data pointer was validated as
-        // non-null during construction (the audio validators return Err if
-        // p_data is null). The sample count was computed with checked arithmetic
-        // and validated against MAX_AUDIO_BYTES, so it's safe to create this slice.
-        unsafe {
+        if self.layout.no_channels > 1
+            && self.layout.channel_stride_samples != self.layout.no_samples
+        {
+            return None;
+        }
+        // SAFETY: a packed FLTP buffer contains only initialized samples;
+        // construction checked dimensions, byte bounds, and float alignment.
+        Some(unsafe {
             slice::from_raw_parts(
-                self.guard.frame().p_data as *const f32,
+                self.guard.frame().p_data.cast::<f32>(),
                 self.layout.sample_count,
             )
-        }
+        })
     }
 
-    /// Get the zero-copy samples for a single channel.
-    ///
-    /// This respects `channel_stride_in_bytes`, so it works for tightly packed
-    /// and strided planar FLTP audio.
+    /// Get the zero-copy samples for a single channel, excluding padding.
     pub fn channel_data(&self, channel: usize) -> Option<&[f32]> {
         let range = self.layout.channel_range(channel)?;
-        Some(&self.data()[range])
+        // SAFETY: only this channel's initialized sample region is borrowed.
+        Some(unsafe {
+            slice::from_raw_parts(
+                self.guard.frame().p_data.cast::<f32>().add(range.start),
+                self.layout.no_samples,
+            )
+        })
+    }
+
+    /// Iterate over channel slices without reading inter-channel padding.
+    /// Empty query/no-source frames yield no channels.
+    pub fn channels(&self) -> impl ExactSizeIterator<Item = &[f32]> + '_ {
+        let count = if self.layout.is_empty() {
+            0
+        } else {
+            self.layout.no_channels
+        };
+        (0..count).map(|channel| self.channel_data(channel).expect("validated channel"))
     }
 }
 
@@ -3170,8 +3277,8 @@ impl<'rx> AudioRef<'rx, AudioKind> {
 
     /// Convert this borrowed frame to an owned `AudioFrame`.
     ///
-    /// This performs a single memcpy of the audio data and metadata,
-    /// allowing the frame to outlive the NDI buffer and be sent across threads.
+    /// Copies channel samples into tightly packed planar storage and copies
+    /// metadata, allowing the frame to outlive the SDK buffer. Padding is omitted.
     pub fn to_owned(&self) -> Result<AudioFrame> {
         AudioFrame::from_raw_validated(*self.guard.frame(), self.layout, self.metadata)
     }
@@ -3218,8 +3325,8 @@ impl<'fs> AudioRef<'fs, FrameSyncAudioFree> {
 
     /// Convert this borrowed frame to an owned `AudioFrame`.
     ///
-    /// This performs a single memcpy of the audio data and metadata,
-    /// allowing the frame to outlive the NDI buffer and be sent across threads.
+    /// Copies channel samples into tightly packed planar storage and copies
+    /// metadata, allowing the frame to outlive the SDK buffer. Padding is omitted.
     ///
     /// Returns `Ok(None)` for a valid query/no-source state with no sample
     /// buffer to own.
@@ -3244,7 +3351,7 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> fmt::Debug for AudioR
             // this single impl serves both the receiver and FrameSync spellings,
             // whose public `format()` return types differ.
             .field("format", &self.layout.format())
-            .field("data (samples)", &self.data().len())
+            .field("samples per channel", &self.layout.no_samples)
             .field("channel_stride_in_bytes", &self.channel_stride_in_bytes())
             .field("metadata", &self.metadata())
             .field("timestamp", &self.timestamp())
@@ -3347,6 +3454,101 @@ impl<'rx> fmt::Debug for MetadataFrameRef<'rx> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_default_matches_builder_and_reuse_updates_preserve_pixels() {
+        let default = VideoFrame::default();
+        let built = VideoFrame::builder().build().unwrap();
+        assert_eq!(default.scan_type(), built.scan_type());
+        assert_eq!(default.scan_type(), ScanType::Progressive);
+        assert_eq!(default.frame_rate_n(), built.frame_rate_n());
+        assert_eq!(default.timecode(), built.timecode());
+        let mut frame = VideoFrame::builder().resolution(2, 2).build().unwrap();
+        let pixels = frame.data().as_ptr();
+        frame.set_timecode(123);
+        frame.set_timestamp(456);
+        frame.set_scan_type(ScanType::Field1);
+        let raw = frame.to_raw();
+        assert_eq!(raw.timecode, 123);
+        assert_eq!(raw.timestamp, 456);
+        assert_eq!(frame.scan_type(), ScanType::Field1);
+        assert_eq!(frame.data().as_ptr(), pixels);
+    }
+
+    #[test]
+    fn video_builder_retains_supplied_allocation_and_rejects_wrong_lengths() {
+        let data = vec![37; 16];
+        let pixels = data.as_ptr();
+        let frame = VideoFrame::builder()
+            .resolution(2, 2)
+            .data(data)
+            .build()
+            .unwrap();
+        assert_eq!(frame.data().as_ptr(), pixels);
+        assert_eq!(frame.data(), &[37; 16]);
+        for len in [0, 15, 17] {
+            assert!(VideoFrame::builder()
+                .resolution(2, 2)
+                .data(vec![0; len])
+                .build()
+                .is_err());
+        }
+    }
+
+    #[cfg(feature = "image-encoding")]
+    #[test]
+    fn borrowed_video_encoding_uses_padded_pixels_without_owned_conversion() {
+        use crate::capture::{FrameSyncVideoFree, Guard};
+        let frame = image_test_frame(
+            PixelFormat::BGRA,
+            2,
+            2,
+            Some(12),
+            vec![
+                0, 0, 255, 255, 0, 255, 0, 128, 99, 99, 99, 99, 255, 0, 0, 64, 255, 255, 255, 0,
+                99, 99, 99, 99,
+            ],
+        );
+        // The null-instance FrameSync strategy never frees these test-owned
+        // pixels. The owned source stays alive for the borrowed view's use.
+        let guard = unsafe { Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), frame.to_raw()) };
+        let borrowed = unsafe { VideoRef::new(guard) }.unwrap();
+        assert_eq!(borrowed.data().as_ptr(), frame.data().as_ptr());
+        let png = borrowed.encode_png().unwrap();
+        assert_eq!(
+            decode_png_rgba(&png),
+            (
+                2,
+                2,
+                vec![255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 64, 255, 255, 255, 0,]
+            )
+        );
+        assert_eq!(png, frame.encode_png().unwrap());
+        assert_eq!(
+            borrowed.encode_jpeg(85).unwrap(),
+            frame.encode_jpeg(85).unwrap()
+        );
+        assert_eq!(
+            borrowed.encode_data_url(ImageFormat::Png).unwrap(),
+            frame.encode_data_url(ImageFormat::Png).unwrap()
+        );
+        assert_eq!(
+            borrowed.encode_data_url(ImageFormat::Jpeg(85)).unwrap(),
+            frame.encode_data_url(ImageFormat::Jpeg(85)).unwrap()
+        );
+        assert!(borrowed.encode_jpeg(0).is_err());
+
+        let unsupported = VideoFrame::builder()
+            .resolution(2, 2)
+            .pixel_format(PixelFormat::UYVY)
+            .build()
+            .unwrap();
+        let guard =
+            unsafe { Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), unsupported.to_raw()) };
+        let borrowed = unsafe { VideoRef::new(guard) }.unwrap();
+        assert!(borrowed.encode_png().is_err());
+        assert!(borrowed.encode_jpeg(85).is_err());
+    }
 
     #[cfg(feature = "image-encoding")]
     fn image_test_frame(
@@ -4528,14 +4730,25 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_metadata_layout_rejects_lengthless_non_null_data() {
-        let mut data = vec![0u8];
+    fn test_validate_metadata_layout_accepts_lengthless_non_null_data() {
+        let mut data = b"<ndi/>\0ignored".to_vec();
         let raw = metadata_raw_from_bytes(&mut data, 0);
+        let layout = validate_metadata_layout(&raw).expect("SDK C-string sentinel");
+        assert_eq!(layout.text_len, 6);
+        assert_eq!(layout.len_with_nul, 7);
+        let owned = unsafe { MetadataFrame::from_raw_validated(&raw, layout) };
+        assert_eq!(owned.data(), "<ndi/>");
+    }
 
+    #[test]
+    fn test_lengthless_metadata_rejects_invalid_utf8_and_missing_nul() {
+        let mut invalid = vec![0xff, 0];
         assert!(matches!(
-            validate_metadata_layout(&raw),
-            Err(Error::InvalidFrame(_))
+            validate_metadata_layout(&metadata_raw_from_bytes(&mut invalid, 0)),
+            Err(Error::InvalidUtf8(_))
         ));
+        let mut unterminated = vec![b'x'; MAX_METADATA_BYTES];
+        assert!(validate_metadata_layout(&metadata_raw_from_bytes(&mut unterminated, 0)).is_err());
     }
 
     #[test]
@@ -5538,6 +5751,78 @@ mod tests {
         assert_eq!(layout.sample_count, sample_count);
     }
 
+    #[test]
+    fn test_audio_channel_views_and_owned_conversion_skip_padding() {
+        use crate::capture::FrameSyncAudioFree;
+        use std::mem::MaybeUninit;
+        // Only samples are initialized; gap slots are not audio data.
+        let mut storage = [MaybeUninit::<f32>::uninit(); 10];
+        for (index, value) in [(0, 1.0), (1, 2.0), (2, 3.0), (6, 4.0), (7, 5.0), (8, 6.0)] {
+            storage[index].write(value);
+        }
+        let raw = NDIlib_audio_frame_v3_t {
+            sample_rate: 48000,
+            no_channels: 2,
+            no_samples: 3,
+            FourCC: AudioFormat::FLTP.into(),
+            p_data: storage.as_mut_ptr().cast(),
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: 24,
+            },
+            timecode: 123,
+            timestamp: 456,
+            p_metadata: ptr::null(),
+        };
+        let guard = unsafe { Guard::<FrameSyncAudioFree>::new(ptr::null_mut(), raw) };
+        let frame = unsafe { AudioRef::<FrameSyncAudioFree>::new(guard, false) }.unwrap();
+        assert!(frame.data().is_none());
+        assert_eq!(frame.channel_data(0).unwrap(), &[1.0, 2.0, 3.0]);
+        assert_eq!(frame.channel_data(1).unwrap(), &[4.0, 5.0, 6.0]);
+        assert_eq!(frame.channel_data(1).unwrap().as_ptr(), unsafe {
+            storage.as_ptr().add(6).cast::<f32>()
+        });
+        assert!(frame.channel_data(2).is_none());
+        assert_eq!(frame.channels().len(), 2);
+        assert_eq!(
+            frame.channels().flatten().copied().collect::<Vec<_>>(),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
+        let mut owned = frame.to_owned().unwrap().unwrap();
+        assert_eq!(owned.channel_stride_in_bytes(), 12);
+        assert_eq!(owned.data(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(owned.timecode(), 123);
+        assert_eq!(owned.timestamp(), 456);
+        assert_eq!(owned.channel_data(1).unwrap().as_ptr(), unsafe {
+            owned.data().as_ptr().add(3)
+        });
+        owned.channel_data_mut(1).unwrap()[0] = 99.0;
+        assert_eq!(owned.data()[3], 99.0);
+        assert!(owned.channel_data_mut(2).is_none());
+        assert!(owned.replace_data(vec![0.0; 10]).is_err());
+    }
+
+    #[test]
+    fn test_audio_rejects_unaligned_float_pointer_before_access() {
+        let mut storage = [0.0f32; 4];
+        let raw = NDIlib_audio_frame_v3_t {
+            sample_rate: 48000,
+            no_channels: 1,
+            no_samples: 1,
+            FourCC: AudioFormat::FLTP.into(),
+            p_data: unsafe { storage.as_mut_ptr().cast::<u8>().add(1) },
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: 4,
+            },
+            timecode: 0,
+            timestamp: 0,
+            p_metadata: ptr::null(),
+        };
+        assert!(matches!(
+            validate_audio_layout(&raw),
+            Err(Error::InvalidFrame(_))
+        ));
+    }
+
     /// Test validate_audio_layout supports strided planar FLTP audio.
     #[test]
     fn test_validate_audio_layout_strided_planar() {
@@ -5866,7 +6151,7 @@ mod tests {
 
         // Verify the cached sample count is used
         assert_eq!(
-            frame_ref.data().len(),
+            frame_ref.data().unwrap().len(),
             sample_count,
             "data() should return slice with cached sample count"
         );

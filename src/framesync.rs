@@ -448,9 +448,10 @@ impl FrameSync {
     ///     // Request 1024 stereo samples at 48kHz
     ///     let audio = framesync.capture_audio(request)?;
     ///
-    ///     // Process audio samples
-    ///     let samples = audio.data();
-    ///     println!("Got {} samples", samples.len());
+    ///     // Process each channel without reading inter-channel padding.
+    ///     for samples in audio.channels() {
+    ///         println!("Got {} samples in a channel", samples.len());
+    ///     }
     ///
     ///     // Check for a validated query/no-source empty state
     ///     if audio.is_empty() {
@@ -742,7 +743,7 @@ mod tests {
 
         assert!(frame.is_empty());
         assert_eq!(frame.metadata(), None);
-        assert!(frame.data().is_empty());
+        assert!(frame.data().unwrap().is_empty());
         assert_eq!(frame.format(), None);
         assert!(frame.to_owned().expect("owned conversion").is_none());
         assert!(format!("{frame:?}").contains("FrameSyncAudioRef"));
@@ -810,7 +811,7 @@ mod tests {
         let frame = unsafe { FrameSyncAudioRef::new(guard, false) }.expect("strided audio frame");
 
         assert_eq!(frame.metadata(), Some("framesync audio"));
-        assert_eq!(frame.data().len(), 10);
+        assert!(frame.data().is_none());
         assert_eq!(frame.channel_data(0), Some(&[1.0, 2.0, 3.0, 4.0][..]));
         assert_eq!(frame.channel_data(1), Some(&[10.0, 20.0, 30.0, 40.0][..]));
         assert_eq!(frame.channel_stride_in_bytes(), stride_samples * 4);
@@ -820,8 +821,9 @@ mod tests {
             .expect("owned conversion")
             .expect("samples");
         assert_eq!(owned.metadata(), Some("framesync audio"));
-        assert_eq!(owned.data().len(), 10);
-        assert_eq!(owned.channel_data(1), Some(vec![10.0, 20.0, 30.0, 40.0]));
+        assert_eq!(owned.data().len(), 8);
+        assert_eq!(owned.channel_stride_in_bytes(), 16);
+        assert_eq!(owned.channel_data(1), Some(&[10.0, 20.0, 30.0, 40.0][..]));
     }
 
     #[test]

@@ -26,7 +26,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
         let _ = (
             audio.num_channels(),
             audio.num_samples(),
-            audio.data().len(),
+            audio.channels().len(),
         );
         let _owned = audio.to_owned()?;
     }
