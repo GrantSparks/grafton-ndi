@@ -124,7 +124,7 @@ For applications that repeatedly reconnect to known devices, `SourceCache` handl
 use grafton_ndi::SourceCache;
 use std::time::Duration;
 
-let cache = SourceCache::new()?;
+let cache = SourceCache::new();
 let camera = cache.find_by_host("192.168.1.100", Duration::from_secs(5))?;
 ```
 

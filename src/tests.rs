@@ -400,8 +400,12 @@ fn test_source_address_port() {
     let none_addr = SourceAddress::None;
     assert_eq!(none_addr.port(), None);
 
-    let ipv6_style = SourceAddress::Ip("fe80::1:5960".to_string());
-    assert_eq!(ipv6_style.port(), Some(5960));
+    // An unbracketed IPv6 literal has no explicit port delimiter.
+    let ipv6_literal = SourceAddress::Ip("fe80::1:5960".to_string());
+    assert_eq!(ipv6_literal.port(), None);
+
+    let ipv6_with_port = SourceAddress::Ip("[fe80::1]:5960".to_string());
+    assert_eq!(ipv6_with_port.port(), Some(5960));
 }
 
 #[test]
@@ -519,9 +523,6 @@ fn test_source_cache_creation() {
     use crate::finder::SourceCache;
 
     let cache = SourceCache::new();
-    assert!(cache.is_ok());
-
-    let cache = cache.unwrap();
     assert_eq!(cache.len(), 0);
     assert!(cache.is_empty());
 }
