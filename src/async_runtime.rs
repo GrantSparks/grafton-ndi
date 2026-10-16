@@ -8,11 +8,15 @@
 //! blocking the async runtime.
 //!
 //! For `capture` and `try_capture`, the timeout budget starts when the future
-//! is first polled, rather than when it is constructed. The blocking task receives
-//! only the remaining budget when it begins, so `spawn_blocking` queue delay does not expand the SDK wait budget.
-//! Runtime scheduling can still make the awaited future complete after the timeout;
-//! these wrappers do not use runtime-level cancellation because that would not stop
-//! a queued or running blocking NDI call.
+//! is first polled, rather than when it is constructed. The same deadline covers
+//! blocking-pool queue delay, receiver capture-gate contention, and SDK waits.
+//! This is a wait budget, not a hard completion deadline: scheduling, frame copying,
+//! and other processing can delay the result beyond it.
+//!
+//! Dropping a future sets a cancellation flag. Work is skipped if the blocking
+//! closure observes that flag at its entry gate. After passing that gate, work
+//! continues, including waiting for receiver access; it cannot be interrupted by
+//! dropping the future.
 //!
 //! # Features
 //!
@@ -347,7 +351,8 @@ impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
     ///
     /// # Cancellation
     ///
-    /// Dropping this future skips queued work. A reconnect that has started
+    /// Dropping this future skips work if the blocking closure observes the
+    /// cancellation flag at its entry gate. After passing that gate, reconnect
     /// continues, including waiting for in-flight captures, and may reconnect
     /// after this future is dropped.
     pub async fn reconnect(&self) -> Result<()> {
@@ -396,8 +401,10 @@ where
     /// # Arguments
     ///
     /// * `timeout` - Total budget to wait for a frame, starting when the future
-    ///   is first polled. Blocking task queue delay is subtracted before the
-    ///   synchronous receiver starts waiting. Must not exceed
+    ///   is first polled. Blocking-pool queue delay and capture-gate contention
+    ///   count against the same budget. Completion can occur after this budget
+    ///   because scheduling and frame processing are not bounded by it.
+    ///   Must not exceed
     ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
     ///
     /// # Returns
@@ -409,8 +416,10 @@ where
     ///
     /// # Cancellation
     ///
-    /// Dropping this future skips queued work. An operation that has started
-    /// continues and can consume a frame whose result is discarded.
+    /// Dropping this future skips work if the blocking closure observes the
+    /// cancellation flag at its entry gate. After passing that gate, work
+    /// continues, including waiting for receiver access, and can consume a frame
+    /// whose result is discarded.
     pub async fn capture(&self, timeout: Duration) -> Result<K::Owned> {
         let receiver = Arc::clone(&self.recv.inner);
         with_timeout_budget::<R, _, _>(timeout, move |deadline| {
@@ -425,10 +434,12 @@ where
     ///
     /// # Arguments
     ///
-    /// * `timeout` - Total wait budget from the future's first poll. Blocking task
-    ///   queue delay is subtracted before the SDK waits; an exhausted budget
-    ///   performs a zero-timeout poll. Scheduling can delay completion beyond
-    ///   this budget. Must not exceed
+    /// * `timeout` - Total wait budget from the future's first poll, including
+    ///   blocking-pool queue delay and capture-gate contention. With an exhausted
+    ///   budget, an immediately available gate permits a zero-timeout SDK poll;
+    ///   otherwise this returns `Ok(None)` without an SDK call. Scheduling and
+    ///   frame processing can delay completion beyond this budget.
+    ///   Must not exceed
     ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
     ///
     /// # Returns
@@ -440,8 +451,10 @@ where
     ///
     /// # Cancellation
     ///
-    /// Dropping this future skips queued work. An operation that has started
-    /// continues and can consume a frame whose result is discarded.
+    /// Dropping this future skips work if the blocking closure observes the
+    /// cancellation flag at its entry gate. After passing that gate, work
+    /// continues, including waiting for receiver access, and can consume a frame
+    /// whose result is discarded.
     pub async fn try_capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
         let receiver = Arc::clone(&self.recv.inner);
         with_timeout_budget::<R, _, _>(timeout, move |deadline| {

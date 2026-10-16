@@ -4,13 +4,13 @@
 //!
 //! The receiver can monitor connection status changes:
 //!
-//! ```ignore
-//! # use grafton_ndi::{NDI, ReceiverOptions, ReceiverBandwidth, Source};
+//! ```no_run
+//! # use grafton_ndi::{NDI, Receiver, ReceiverOptions, ReceiverBandwidth, Source};
 //! # use std::time::Duration;
 //! # fn main() -> Result<(), grafton_ndi::Error> {
 //! # let ndi = NDI::new()?;
-//! // In real usage, you'd get the source from Finder::find_sources()
-//! // let source = /* obtained from Finder */;
+//! # let source = Source::default();
+//! // In real usage, obtain the source from Finder::find_sources().
 //! let options = ReceiverOptions::builder(source)
 //!     .bandwidth(ReceiverBandwidth::MetadataOnly)
 //!     .build();
@@ -622,10 +622,18 @@ impl Receiver {
         Ok(unsafe { NDIlib_recv_send_metadata(self.instance, &raw) })
     }
 
+    /// Return whether the connected source supports PTZ commands.
     pub fn ptz_is_supported(&self) -> bool {
         unsafe { NDIlib_recv_ptz_is_supported(self.instance) }
     }
 
+    /// Recall preset `0..=99` at a finite speed within `0.0..=1.0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
+    /// parameters, before issuing an SDK command.
+    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
     pub fn ptz_recall_preset(&self, preset: u32, speed: f32) -> Result<()> {
         let preset = validate_ptz_preset(i64::from(preset))?;
         validate_ptz_value("speed", speed, 0.0, 1.0)?;
@@ -638,6 +646,14 @@ impl Receiver {
         )
     }
 
+    /// Set absolute zoom to a finite value within `0.0..=1.0`.
+    /// Zero is zoomed in; one is zoomed out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
+    /// parameters, before issuing an SDK command.
+    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
     pub fn ptz_zoom(&self, zoom_value: f32) -> Result<()> {
         validate_ptz_value("zoom_value", zoom_value, 0.0, 1.0)?;
         ptz_command!(
@@ -648,6 +664,14 @@ impl Receiver {
         )
     }
 
+    /// Set zoom speed within `-1.0..=1.0` (finite).
+    /// Negative moves outward; positive moves inward.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
+    /// parameters, before issuing an SDK command.
+    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
     pub fn ptz_zoom_speed(&self, zoom_speed: f32) -> Result<()> {
         validate_ptz_value("zoom_speed", zoom_speed, -1.0, 1.0)?;
         ptz_command!(
@@ -658,6 +682,14 @@ impl Receiver {
         )
     }
 
+    /// Set finite pan and tilt positions within `-1.0..=1.0`.
+    /// Pan increases from left to right; tilt increases from bottom to top.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
+    /// parameters, before issuing an SDK command.
+    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
     pub fn ptz_pan_tilt(&self, pan_value: f32, tilt_value: f32) -> Result<()> {
         validate_ptz_value("pan_value", pan_value, -1.0, 1.0)?;
         validate_ptz_value("tilt_value", tilt_value, -1.0, 1.0)?;
@@ -670,6 +702,14 @@ impl Receiver {
         )
     }
 
+    /// Set finite pan and tilt speeds within `-1.0..=1.0`.
+    /// Positive pan moves left; positive tilt moves up. Zero stops motion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
+    /// parameters, before issuing an SDK command.
+    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
     pub fn ptz_pan_tilt_speed(&self, pan_speed: f32, tilt_speed: f32) -> Result<()> {
         validate_ptz_value("pan_speed", pan_speed, -1.0, 1.0)?;
         validate_ptz_value("tilt_speed", tilt_speed, -1.0, 1.0)?;
@@ -682,6 +722,13 @@ impl Receiver {
         )
     }
 
+    /// Store the current camera settings as preset `0..=99`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
+    /// parameters, before issuing an SDK command.
+    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
     pub fn ptz_store_preset(&self, preset_no: i32) -> Result<()> {
         let preset_no = validate_ptz_preset(i64::from(preset_no))?;
         ptz_command!(
@@ -692,6 +739,11 @@ impl Receiver {
         )
     }
 
+    /// Enable automatic focus.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
     pub fn ptz_auto_focus(&self) -> Result<()> {
         ptz_command!(
             self,
@@ -700,6 +752,14 @@ impl Receiver {
         )
     }
 
+    /// Set finite absolute focus within `0.0..=1.0`.
+    /// Zero focuses at infinity; one focuses as close as possible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
+    /// parameters, before issuing an SDK command.
+    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
     pub fn ptz_focus(&self, focus_value: f32) -> Result<()> {
         validate_ptz_value("focus_value", focus_value, 0.0, 1.0)?;
         ptz_command!(
@@ -710,6 +770,14 @@ impl Receiver {
         )
     }
 
+    /// Set finite focus speed within `-1.0..=1.0`.
+    /// Negative focuses outward; positive focuses inward.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
+    /// parameters, before issuing an SDK command.
+    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
     pub fn ptz_focus_speed(&self, focus_speed: f32) -> Result<()> {
         validate_ptz_value("focus_speed", focus_speed, -1.0, 1.0)?;
         ptz_command!(
@@ -720,6 +788,11 @@ impl Receiver {
         )
     }
 
+    /// Enable automatic white balance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
     pub fn ptz_white_balance_auto(&self) -> Result<()> {
         ptz_command!(
             self,
@@ -728,6 +801,11 @@ impl Receiver {
         )
     }
 
+    /// Select the indoor white-balance preset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
     pub fn ptz_white_balance_indoor(&self) -> Result<()> {
         ptz_command!(
             self,
@@ -736,6 +814,11 @@ impl Receiver {
         )
     }
 
+    /// Select the outdoor white-balance preset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
     pub fn ptz_white_balance_outdoor(&self) -> Result<()> {
         ptz_command!(
             self,
@@ -744,6 +827,11 @@ impl Receiver {
         )
     }
 
+    /// Set white balance from the current image.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
     pub fn ptz_white_balance_oneshot(&self) -> Result<()> {
         ptz_command!(
             self,
@@ -752,6 +840,13 @@ impl Receiver {
         )
     }
 
+    /// Set finite red and blue white-balance levels within `0.0..=1.0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
+    /// parameters, before issuing an SDK command.
+    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
     pub fn ptz_white_balance_manual(&self, red: f32, blue: f32) -> Result<()> {
         validate_ptz_value("red", red, 0.0, 1.0)?;
         validate_ptz_value("blue", blue, 0.0, 1.0)?;
@@ -764,6 +859,11 @@ impl Receiver {
         )
     }
 
+    /// Enable automatic exposure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
     pub fn ptz_exposure_auto(&self) -> Result<()> {
         ptz_command!(
             self,
@@ -772,6 +872,13 @@ impl Receiver {
         )
     }
 
+    /// Set finite exposure within `0.0..=1.0`, from dark to light.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
+    /// parameters, before issuing an SDK command.
+    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
     pub fn ptz_exposure_manual(&self, exposure_level: f32) -> Result<()> {
         validate_ptz_value("exposure_level", exposure_level, 0.0, 1.0)?;
         ptz_command!(
@@ -782,6 +889,14 @@ impl Receiver {
         )
     }
 
+    /// Set finite iris, gain, and shutter-speed levels within `0.0..=1.0`.
+    /// Iris and gain increase from dark to light; shutter speed increases from slow to fast.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
+    /// parameters, before issuing an SDK command.
+    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
     pub fn ptz_exposure_manual_v2(&self, iris: f32, gain: f32, shutter_speed: f32) -> Result<()> {
         validate_ptz_value("iris", iris, 0.0, 1.0)?;
         validate_ptz_value("gain", gain, 0.0, 1.0)?;
@@ -1194,9 +1309,8 @@ fn status_from_frame(
 ///
 /// - [`capture`](Self::capture) — reliable owned capture with built-in retry.
 ///   **The primary method.** It absorbs the NDI SDK's initial-sync warm-up (the
-///   first few polls after connecting return `none` immediately instead of
-///   blocking), then runs with zero overhead in steady state, so it is safe in
-///   a continuous capture loop.
+///   first few polls after connecting may return `none` immediately instead of
+///   blocking). It can be used in a continuous capture loop.
 /// - [`try_capture`](Self::try_capture) — a single owned poll; `Ok(None)` when
 ///   no frame is ready. For manual polling where you handle timing yourself.
 /// - [`try_capture_ref`](Self::try_capture_ref) — a single zero-copy poll that
@@ -1208,7 +1322,15 @@ fn status_from_frame(
 ///
 /// Every verb holds a shared capture guard for the duration of a single SDK
 /// call, so captures of different kinds run concurrently with each other but
-/// never overlap a [`Receiver::reconnect`].
+/// never overlap a [`Receiver::reconnect`]. Each timeout budget starts when the
+/// verb is called and includes waiting for that guard. A zero timeout never
+/// waits for the guard; if it is unavailable, no SDK capture is attempted.
+/// SDK calls and owned-frame copying may finish after the budget expires, so
+/// the timeout is not a strict wall-clock completion guarantee.
+///
+/// While a [`crate::FrameSync`] owns this receiver, video capture returns
+/// [`Error::InvalidConfiguration`]. Use its video capture methods instead, or
+/// recover the receiver with [`crate::FrameSync::into_receiver`].
 pub struct Capture<'rx, K: CaptureKind> {
     rx: &'rx Receiver,
     _kind: PhantomData<K>,
@@ -1226,9 +1348,9 @@ impl<'rx, K: CaptureKind> Capture<'rx, K> {
     /// SDK's initial-sync warm-up.
     ///
     /// `timeout` is a total retry budget; each individual SDK poll is capped to
-    /// the remaining budget, and [`Duration::ZERO`] performs exactly one
-    /// non-blocking attempt. Waiting for a reconnect lock consumes the same
-    /// budget. The SDK itself may return after its requested timeout, so this
+    /// the remaining budget, and [`Duration::ZERO`] performs one non-blocking
+    /// attempt, skipping the SDK call if the capture guard is unavailable.
+    /// Waiting for a reconnect lock consumes the same budget. The SDK itself may return after its requested timeout, so this
     /// budget is not a strict wall-clock completion guarantee.
     ///
     /// # Arguments
@@ -1239,7 +1361,9 @@ impl<'rx, K: CaptureKind> Capture<'rx, K> {
     /// # Errors
     ///
     /// Returns [`Error::FrameTimeout`] if no frame arrives within `timeout`;
-    /// other errors propagate from the capture itself.
+    /// returns [`Error::InvalidConfiguration`] for an excessive timeout or video
+    /// capture while a FrameSync is attached. SDK and frame-validation errors
+    /// propagate from the capture itself.
     pub fn capture(&self, timeout: Duration) -> Result<K::Owned> {
         self.rx.capture_kind::<K>(timeout)
     }
@@ -1248,12 +1372,19 @@ impl<'rx, K: CaptureKind> Capture<'rx, K> {
     /// `timeout`.
     ///
     /// Prefer [`capture`](Self::capture) for reliable capture; this variant does
-    /// not retry the SDK's warm-up misses.
+    /// not retry the SDK's warm-up misses. The timeout includes waiting for a
+    /// reconnect lock; see [`Capture`] for the shared timeout contract.
     ///
     /// # Arguments
     ///
     /// * `timeout` - Maximum time to wait for a frame. Must not exceed
     ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] for an excessive timeout or video
+    /// capture while a FrameSync is attached. SDK connection errors return
+    /// [`Error::CaptureFailed`]; malformed frame descriptors also return errors.
     pub fn try_capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
         self.rx.try_capture_kind::<K>(timeout)
     }
@@ -1263,12 +1394,19 @@ impl<'rx, K: CaptureKind> Capture<'rx, K> {
     ///
     /// The returned reference borrows the [`Receiver`] (not this temporary
     /// view), so it may outlive the `Capture` while keeping the receiver
-    /// borrowed.
+    /// borrowed. The timeout includes waiting for a reconnect lock; see
+    /// [`Capture`] for the shared timeout contract.
     ///
     /// # Arguments
     ///
     /// * `timeout` - Maximum time to wait for a frame. Must not exceed
     ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] for an excessive timeout or video
+    /// capture while a FrameSync is attached. SDK connection errors return
+    /// [`Error::CaptureFailed`]; malformed frame descriptors also return errors.
     pub fn try_capture_ref(&self, timeout: Duration) -> Result<Option<K::Ref<'rx>>> {
         // Bind through `'rx` so the returned borrow is tied to the receiver, not
         // to this short-lived view.
@@ -1299,7 +1437,10 @@ unsafe impl Send for Receiver {}
 /// synchronized and can be called concurrently from multiple threads. This is explicitly
 /// mentioned in the SDK manual's thread safety section. The capture verbs (via
 /// [`Receiver::video`], [`Receiver::audio`], and [`Receiver::metadata`]) can be
-/// safely called from multiple threads simultaneously.
+/// safely called from multiple threads simultaneously. The wrapper's capture
+/// guard excludes reconnect calls from receiver capture calls, and the attachment
+/// flag prevents raw video capture while a FrameSync owns this receiver.
+/// Borrowed frame guards retain the receiver borrow until they free their buffers.
 unsafe impl Sync for Receiver {}
 
 /// An SDK status-change notification and the current connection count.
@@ -1376,7 +1517,7 @@ impl ConnectionStats {
     /// Calculate video frame drop percentage.
     ///
     /// Returns the percentage of video frames that were dropped out of the total
-    /// received + dropped. Returns 0.0 if no frames have been received.
+    /// received + dropped. Returns 0.0 if both counters are zero.
     ///
     /// # Examples
     ///
@@ -1403,7 +1544,7 @@ impl ConnectionStats {
     /// Calculate audio frame drop percentage.
     ///
     /// Returns the percentage of audio frames that were dropped out of the total
-    /// received + dropped. Returns 0.0 if no frames have been received.
+    /// received + dropped. Returns 0.0 if both counters are zero.
     pub fn audio_drop_percentage(&self) -> f64 {
         drop_percentage(self.audio_frames_received, self.audio_frames_dropped)
     }
@@ -1411,7 +1552,7 @@ impl ConnectionStats {
     /// Calculate metadata frame drop percentage.
     ///
     /// Returns the percentage of metadata frames that were dropped out of the total
-    /// received + dropped. Returns 0.0 if no frames have been received.
+    /// received + dropped. Returns 0.0 if both counters are zero.
     pub fn metadata_drop_percentage(&self) -> f64 {
         drop_percentage(self.metadata_frames_received, self.metadata_frames_dropped)
     }

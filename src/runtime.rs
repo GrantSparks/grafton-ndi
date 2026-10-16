@@ -222,10 +222,11 @@ pub struct NDI {
 impl NDI {
     /// Creates a new NDI instance.
     ///
-    /// This method is the single entry point for creating NDI instances. It is thread-safe
-    /// and can be called from multiple threads. The first call initializes the NDI runtime,
-    /// subsequent calls increment a reference count. When the last instance is dropped, the
-    /// runtime is automatically destroyed.
+    /// This checked constructor is thread-safe and can be called from multiple
+    /// threads. It initializes the runtime when necessary; otherwise it acquires
+    /// another runtime reference. Cloning a live handle also acquires a reference.
+    /// The runtime is destroyed when the last handle is dropped, including handles
+    /// retained internally by senders, receivers, and finders.
     ///
     /// # Errors
     ///

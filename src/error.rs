@@ -18,7 +18,9 @@ use std::{ffi::NulError, io, time::Duration};
 pub enum Error {
     /// NDI runtime initialization failed.
     ///
-    /// This typically occurs when the NDI SDK is not installed or cannot be loaded.
+    /// The SDK rejected initialization, a handle could not be created, or the
+    /// runtime handle reference count was exhausted. A missing shared library
+    /// can instead prevent the application from loading before Rust code runs.
     #[error("Failed to initialize the NDI runtime: {0}")]
     InitializationFailed(String),
 
@@ -65,10 +67,12 @@ pub enum Error {
     #[error("Operation timed out: {0}")]
     Timeout(String),
 
-    /// Frame capture timed out after multiple retry attempts.
+    /// The capture wait budget expired without a frame.
     ///
-    /// This error includes detailed information about the retry attempts and total elapsed time,
-    /// making it easier to diagnose frame capture issues and distinguish them from other timeout scenarios.
+    /// Includes the number of capture attempts and elapsed time in the retry
+    /// loop. The attempt count can be zero or one; retries are not guaranteed.
+    /// For async capture, `elapsed`
+    /// excludes time queued before that loop begins.
     ///
     /// # Example
     ///
@@ -169,12 +173,11 @@ pub enum Error {
         criteria: String,
     },
 
-    /// Failed to spawn a blocking task on the async runtime.
+    /// An async blocking operation could not run or finish normally.
     ///
-    /// This error occurs when the async runtime fails to spawn a blocking task,
-    /// typically due to task cancellation or runtime shutdown. Unlike the previous
-    /// behavior which panicked on tokio `JoinError`, this error allows callers to
-    /// handle the failure gracefully.
+    /// Covers a missing Tokio runtime context, task cancellation or join failure,
+    /// and a panic caught while executing a blocking operation. Dropping a future
+    /// discards its result; cancellation does not deliver an error to that caller.
     ///
     /// # Example
     ///

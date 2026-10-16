@@ -97,8 +97,11 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Build examples
-        run: cargo build --examples --all-features
+      - name: Build and test examples
+        run: |
+          cargo build --examples
+          cargo build --examples --all-features
+          cargo test --examples --all-features
 
       - name: Run SDK lifecycle regressions
         if: matrix.os == 'ubuntu-latest'
@@ -108,8 +111,11 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           cargo test --no-default-features
+          cargo build --examples --no-default-features
           cargo test --no-default-features --features tokio
+          cargo build --examples --no-default-features --features tokio
           cargo test --no-default-features --features async-std
+          cargo build --examples --no-default-features --features async-std
           cargo check --no-default-features --features advanced_sdk
 
       # Documentation lint runs once; rustdoc lints are platform-independent.
@@ -172,10 +178,9 @@ jobs:
 
   # Build and publish API documentation to GitHub Pages.
   #
-  # docs.rs cannot build this crate: bindgen generates the FFI bindings from the
-  # NDI SDK headers at build time, and the NDI SDK license forbids redistributing
-  # those headers (or bindings derived from them). Docs are therefore generated
-  # here, where a licensed SDK is installed, and self-hosted on GitHub Pages.
+  # Bindgen needs an installed NDI SDK. The docs.rs environment does not
+  # include that installation, so build and host documentation from CI,
+  # where the SDK is configured by the platform setup action.
   docs:
     name: Publish docs
     needs: [test-and-lint, semver, msrv]

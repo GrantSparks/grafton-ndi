@@ -424,6 +424,10 @@ impl From<LineStrideOrSize> for NDIlib_video_frame_v2_t__bindgen_ty_1 {
     }
 }
 
+/// An owned video frame with validated dimensions, format, stride, and buffer size.
+///
+/// Received frames retain their SDK stride and padding. Encoding processes only
+/// active pixels. Use [`Self::builder`] for tightly packed outbound storage.
 pub struct VideoFrame {
     layout: ValidatedVideoLayout,
     frame_rate_n: i32,
@@ -519,7 +523,7 @@ impl VideoFrame {
         self.scan_type
     }
 
-    /// Get the timecode.
+    /// Get the timecode in 100 ns units.
     ///
     /// Defaults to the SDK's synthesized-timecode sentinel. An explicit zero
     /// is passed through as a literal timecode.
@@ -544,10 +548,11 @@ impl VideoFrame {
         self.timestamp = timestamp;
     }
 
-    /// Get the timestamp.
+    /// Get the receive timestamp in 100 ns units since the Unix epoch.
     ///
-    /// A value of zero is passed through to the SDK as its default timestamp
-    /// behavior.
+    /// On receive the SDK supplies this value, or its undefined-timestamp
+    /// sentinel when unavailable. Outbound values are passed through unchanged;
+    /// the SDK defines this field for receiving.
     pub fn timestamp(&self) -> i64 {
         self.timestamp
     }
@@ -672,7 +677,8 @@ impl VideoFrame {
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// # finder.wait_for_sources(Duration::from_millis(1000))?;
     /// # let sources = finder.current_sources()?;
-    /// # let options = ReceiverOptions::builder(sources[0].clone())
+    /// # let Some(source) = sources.first() else { return Ok(()); };
+    /// # let options = ReceiverOptions::builder(source.clone())
     /// #     .color(ReceiverColorFormat::RGBX_RGBA)
     /// #     .build();
     /// # let receiver = Receiver::new(&ndi, &options)?;
@@ -722,7 +728,8 @@ impl VideoFrame {
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// # finder.wait_for_sources(Duration::from_millis(1000))?;
     /// # let sources = finder.current_sources()?;
-    /// # let options = ReceiverOptions::builder(sources[0].clone())
+    /// # let Some(source) = sources.first() else { return Ok(()); };
+    /// # let options = ReceiverOptions::builder(source.clone())
     /// #     .color(ReceiverColorFormat::RGBX_RGBA)
     /// #     .build();
     /// # let receiver = Receiver::new(&ndi, &options)?;
@@ -757,7 +764,8 @@ impl VideoFrame {
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// # finder.wait_for_sources(Duration::from_millis(1000))?;
     /// # let sources = finder.current_sources()?;
-    /// # let options = ReceiverOptions::builder(sources[0].clone())
+    /// # let Some(source) = sources.first() else { return Ok(()); };
+    /// # let options = ReceiverOptions::builder(source.clone())
     /// #     .color(ReceiverColorFormat::RGBX_RGBA)
     /// #     .build();
     /// # let receiver = Receiver::new(&ndi, &options)?;
@@ -902,7 +910,7 @@ impl VideoFrameBuilder {
         self
     }
 
-    /// Set the timecode
+    /// Set the timecode in 100 ns units (or the SDK synthesis sentinel).
     #[must_use]
     pub fn timecode(mut self, tc: i64) -> Self {
         self.timecode = Some(tc);
@@ -916,7 +924,7 @@ impl VideoFrameBuilder {
         self
     }
 
-    /// Set the timestamp
+    /// Set the timestamp field in 100 ns units. This field is filled by the SDK on receive.
     #[must_use]
     pub fn timestamp(mut self, ts: i64) -> Self {
         self.timestamp = Some(ts);
@@ -933,7 +941,10 @@ impl VideoFrameBuilder {
         self
     }
 
-    /// Build the VideoFrame
+    /// Build the video frame.
+    ///
+    /// Defaults to 1920x1080 BGRA, 60/1 fps, 16:9 picture aspect ratio,
+    /// progressive scan, synthesized timecode, and zero-filled pixels.
     pub fn build(self) -> Result<VideoFrame> {
         let width = self.width.unwrap_or(1920);
         let height = self.height.unwrap_or(1080);
@@ -987,6 +998,10 @@ impl Drop for VideoFrame {
     }
 }
 
+/// Owned, tightly packed planar floating-point audio with a validated layout.
+///
+/// Channel samples are contiguous, with channels stored one after another.
+/// Conversion from borrowed SDK audio omits inter-channel padding.
 #[derive(Debug)]
 pub struct AudioFrame {
     layout: ValidatedAudioLayout,
@@ -1088,7 +1103,7 @@ impl AudioFrame {
         self.layout.no_samples as i32
     }
 
-    /// Get the timecode.
+    /// Get the timecode in 100 ns units.
     ///
     /// Defaults to the SDK's synthesized-timecode sentinel. An explicit zero
     /// is passed through as a literal timecode.
@@ -1096,10 +1111,11 @@ impl AudioFrame {
         self.timecode
     }
 
-    /// Get the timestamp.
+    /// Get the receive timestamp in 100 ns units since the Unix epoch.
     ///
-    /// A value of zero is passed through to the SDK as its default timestamp
-    /// behavior.
+    /// On receive the SDK supplies this value, or its undefined-timestamp
+    /// sentinel when unavailable. Outbound values are passed through unchanged;
+    /// the SDK defines this field for receiving.
     pub fn timestamp(&self) -> i64 {
         self.timestamp
     }
@@ -1116,7 +1132,8 @@ impl AudioFrame {
         self.layout.channel_stride_in_bytes
     }
 
-    /// Get audio data as 32-bit floats
+    /// Get tightly packed planar audio as 32-bit floats.
+    /// Each channel's samples are contiguous; channels follow one another.
     pub fn data(&self) -> &[f32] {
         &self.data
     }
@@ -1229,7 +1246,7 @@ impl AudioFrameBuilder {
         self
     }
 
-    /// Set the timecode
+    /// Set the timecode in 100 ns units (or the SDK synthesis sentinel).
     #[must_use]
     pub fn timecode(mut self, tc: i64) -> Self {
         self.timecode = Some(tc);
@@ -1287,14 +1304,17 @@ impl AudioFrameBuilder {
         self
     }
 
-    /// Set the timestamp
+    /// Set the timestamp field in 100 ns units. This field is filled by the SDK on receive.
     #[must_use]
     pub fn timestamp(mut self, ts: i64) -> Self {
         self.timestamp = Some(ts);
         self
     }
 
-    /// Build the AudioFrame
+    /// Build the audio frame.
+    ///
+    /// Defaults to 48 kHz stereo FLTP, 1024 samples per channel, planar input,
+    /// synthesized timecode, and silent samples.
     ///
     /// When `AudioLayout::Interleaved` is set, the input data is converted to planar
     /// format in Rust. The resulting frame always stores
@@ -1457,6 +1477,10 @@ const MAX_AUDIO_BYTES: usize = 64 * 1024 * 1024;
 /// trailing NUL terminator.
 pub(crate) const MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
 
+/// Owned UTF-8 metadata text and its timecode.
+///
+/// NDI expects XML when sending; callers are responsible for XML syntax. Text
+/// cannot contain NUL bytes and is limited to 4 MiB including the SDK terminator.
 #[derive(Debug, Clone)]
 pub struct MetadataFrame {
     data: String, // Owned metadata (typically XML)
@@ -1495,7 +1519,7 @@ impl MetadataFrame {
         self.data
     }
 
-    /// Get the timecode.
+    /// Get the timecode in 100 ns units.
     ///
     /// Defaults to the SDK's synthesized-timecode sentinel. An explicit zero
     /// is passed through as a literal timecode.
@@ -1545,7 +1569,9 @@ impl MetadataFrame {
     /// # Safety
     ///
     /// `raw` must be an SDK-populated metadata frame whose `p_data` pointer is
-    /// valid for `raw.length` bytes when `length > 0`.
+    /// valid for `raw.length` bytes when `length > 0`. For zero length with a
+    /// non-null pointer, it must be readable through its first NUL terminator
+    /// or the crate's metadata cap, as required by `validate_frame_metadata`.
     #[cfg(test)]
     pub(crate) unsafe fn from_raw(raw: &NDIlib_metadata_frame_t) -> Result<Self> {
         let layout = validate_metadata_layout(raw)?;
@@ -3010,12 +3036,12 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
             .expect("VideoFrameRef validates scan type during construction")
     }
 
-    /// Get the timecode.
+    /// Get the timecode in 100 ns units.
     pub fn timecode(&self) -> i64 {
         self.guard.frame().timecode
     }
 
-    /// Get the timestamp.
+    /// Get the receive timestamp in 100 ns units since the Unix epoch.
     pub fn timestamp(&self) -> i64 {
         self.guard.frame().timestamp
     }
@@ -3077,8 +3103,8 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
 
     /// Convert this borrowed frame to an owned `VideoFrame`.
     ///
-    /// This performs a single memcpy of the frame data and metadata,
-    /// allowing the frame to outlive the NDI buffer and be sent across threads.
+    /// Copies pixel data and metadata into owned allocations, allowing the
+    /// frame to outlive the NDI buffer and be sent across threads.
     pub fn to_owned(&self) -> Result<VideoFrame> {
         unsafe { VideoFrame::from_raw_validated(self.guard.frame(), self.layout, self.metadata) }
     }
@@ -3182,12 +3208,12 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
         self.layout.no_samples as i32
     }
 
-    /// Get the timecode.
+    /// Get the timecode in 100 ns units.
     pub fn timecode(&self) -> i64 {
         self.guard.frame().timecode
     }
 
-    /// Get the timestamp.
+    /// Get the receive timestamp in 100 ns units since the Unix epoch.
     pub fn timestamp(&self) -> i64 {
         self.guard.frame().timestamp
     }
@@ -3416,7 +3442,7 @@ impl<'rx> MetadataFrameRef<'rx> {
         Ok(Self { guard, layout })
     }
 
-    /// Get the timecode.
+    /// Get the timecode in 100 ns units.
     pub fn timecode(&self) -> i64 {
         self.guard.frame().timecode
     }

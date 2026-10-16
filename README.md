@@ -75,7 +75,7 @@ Feature flags:
 
 ### Prerequisites
 
-1. **NDI SDK 6.x**: Install the [NDI SDK](https://ndi.video/type/developer/) for your platform.
+1. **NDI SDK 6.x**: Install the [NDI SDK](https://ndi.video/for-developers/ndi-sdk/) for your platform.
    - Windows default: `C:\Program Files\NDI\NDI 6 SDK`
    - Linux defaults: `/usr/share/NDI Advanced SDK for Linux` or `/usr/share/NDI SDK for Linux`
    - macOS defaults include `/Library/NDI SDK for macOS`, `/Library/NDI SDK for Apple`, and `/Library/NDI 6 SDK`
@@ -84,10 +84,11 @@ Feature flags:
 2. **Rust**: Rust 1.87 or later.
 
 3. **Build dependencies**: bindgen generates the FFI bindings at build time from
-   your installed SDK headers, so it needs an LLVM/Clang toolchain:
+   your installed SDK headers, so it needs an LLVM/Clang installation including
+   the `libclang` shared library. Set `LIBCLANG_PATH` if bindgen cannot locate it:
    - Windows: Visual Studio 2019+ or Build Tools, plus LLVM/Clang for bindgen
-   - Linux: a C toolchain and LLVM/Clang headers for bindgen
-   - macOS: Xcode Command Line Tools
+   - Linux: a C toolchain and a libclang development package for bindgen
+   - macOS: Xcode Command Line Tools and a discoverable libclang installation
 
 4. **Runtime libraries**:
    - Windows: ensure the NDI runtime DLL directory is on `PATH`
@@ -260,7 +261,7 @@ Frame layout fields that describe SDK-facing memory are private. Builders, acces
 - **Small FFI boundary**: generated bindings live behind safe wrappers.
 - **RAII lifecycle**: NDI handles, senders, receivers, frames, and pending async sends clean up through ownership.
 - **Checked frame descriptions**: frame dimensions, line strides, channel strides, metadata strings, and buffer sizes are validated before slices or strings are exposed.
-- **Explicit blocking behavior**: synchronous methods block with checked timeouts; async adapters use `spawn_blocking`.
+- **Explicit blocking behavior**: timeout-bearing calls validate their wait budgets; SDK sends and drains have no deadline. Async adapters run SDK work on a blocking pool.
 - **Forward-compatible SDK enums**: public SDK-mode enums that may grow are `#[non_exhaustive]`.
 
 ## Performance and Safety
@@ -288,7 +289,7 @@ let data_url = video.encode_data_url(ImageFormat::Png)?;
 
 ## Documentation
 
-- [API documentation](https://grantsparks.github.io/grafton-ndi/grafton_ndi/) - Full rustdoc reference, built in CI and self-hosted (the NDI SDK license prevents distributing the generated bindings docs.rs would need).
+- [API documentation](https://grantsparks.github.io/grafton-ndi/grafton_ndi/) - Full rustdoc reference, built in CI and self-hosted (the docs.rs build environment does not include the SDK installation required by this build script).
 - [Examples](examples/) - Runnable examples for discovery, receiving, FrameSync, PTZ, monitoring, and sending.
 - [CHANGELOG.md](CHANGELOG.md) - Release notes and migration guidance.
 - [Upgrade from 1.x to 2.0](docs/migration/1.x-to-2.0.md) - Breaking changes, layout corrections, and async-send performance changes.

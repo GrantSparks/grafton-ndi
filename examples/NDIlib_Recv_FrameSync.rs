@@ -11,10 +11,15 @@
 //!
 //! Key differences from raw Receiver capture:
 //!
-//! 1. **FrameSync captures always return immediately** - no blocking wait
+//! 1. **No network-frame wait** - the SDK uses available frames or audio silence
 //! 2. **Video uses time-base correction** - handles clock drift between sender/receiver
 //! 3. **Audio uses dynamic resampling** - matches your output sample rate automatically
-//! 4. **Same frame may be returned multiple times** - when capture rate > source rate
+//! 4. **Video may repeat or skip frames** - according to the output sampling cadence
+//!
+//! This example uses a software timer, not a hardware audio or display clock.
+//! The requested audio block duration sets the output tick; real playback should
+//! request samples according to the audio device clock. Capture and resampling
+//! still take processing time, and wrapper synchronization may briefly block.
 //!
 //! Run with: `cargo run --example NDIlib_Recv_FrameSync`
 //!
@@ -116,19 +121,23 @@ fn main() -> Result<(), Error> {
     let mut video_frames = 0;
     let mut audio_samples_total = 0;
     let mut last_video_timecode: i64 = 0;
-    let mut duplicate_frames = 0;
+    let mut repeated_timecodes = 0;
 
-    // Simulate a 30fps output loop
-    let frame_interval = Duration::from_millis(33); // ~30fps
+    // One audio block defines each software output tick. Video is sampled at
+    // this same cadence and may repeat or skip source frames as needed.
+    let frame_interval = Duration::from_secs_f64(audio_samples as f64 / audio_sample_rate as f64)
+        .max(Duration::from_nanos(1));
+    println!("Software output interval: {frame_interval:?}");
 
     while video_frames < frame_count {
         let loop_start = Instant::now();
 
-        // Capture video - always returns immediately
+        // Sample available video without waiting for the next network frame.
         if let Some(video) = framesync.capture_video(ScanType::Progressive)? {
-            // Check if this is the same frame as last time (FrameSync may repeat frames)
+            // A repeated timecode can indicate repeated video; senders may also
+            // assign identical timecodes to different frames.
             if video.timecode() == last_video_timecode && video_frames > 0 {
-                duplicate_frames += 1;
+                repeated_timecodes += 1;
             }
             last_video_timecode = video.timecode();
 
@@ -153,7 +162,7 @@ fn main() -> Result<(), Error> {
             std::io::stdout().flush().ok();
         }
 
-        // Capture audio - always returns immediately (with silence if needed)
+        // Request one output block; the SDK supplies silence if needed.
         let audio = framesync.capture_audio(audio_request)?;
         audio_samples_total += audio.num_samples() as usize;
 
@@ -179,7 +188,7 @@ fn main() -> Result<(), Error> {
             );
         }
 
-        // Simulate output timing - sleep to maintain frame rate
+        // Approximate the output clock; processing delays may make ticks late.
         let elapsed = loop_start.elapsed();
         if elapsed < frame_interval {
             thread::sleep(frame_interval - elapsed);
@@ -193,8 +202,8 @@ fn main() -> Result<(), Error> {
     println!("Results:");
     println!("  Total time: {total_time:.2?}");
     println!("  Video frames: {video_frames}");
-    println!("  Duplicate frames: {duplicate_frames} (FrameSync time-base correction)");
-    println!("  Actual capture rate: {actual_fps:.2} fps");
+    println!("  Repeated video timecodes: {repeated_timecodes}");
+    println!("  Video sampling rate: {actual_fps:.2} frames/s");
     println!("  Total audio samples: {audio_samples_total}");
 
     // Calculate audio time
@@ -202,13 +211,11 @@ fn main() -> Result<(), Error> {
     println!("  Audio duration: {audio_duration_secs:.2}s at {audio_sample_rate} Hz");
 
     println!("\nWhy FrameSync?");
-    println!("  - Video jitter is eliminated by time-base correction");
+    println!("  - Video is selected for the requested output cadence");
     println!("  - Audio clock drift is handled by dynamic resampling");
-    println!("  - Captures return immediately - ideal for real-time playback");
-    if duplicate_frames > 0 {
-        println!(
-            "  - {duplicate_frames} duplicate frames show TBC in action (source rate < capture rate)"
-        );
+    println!("  - SDK capture does not wait for a new network frame");
+    if repeated_timecodes > 0 {
+        println!("  - Observed {repeated_timecodes} consecutive repeated video timecodes");
     }
 
     println!("\nExample completed successfully!");

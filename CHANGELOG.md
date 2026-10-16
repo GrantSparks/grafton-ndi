@@ -5,6 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+Entries and examples describe the API of their named release. For the current
+API, see the [README](README.md) and [2.0 migration guide](docs/migration/1.x-to-2.0.md).
+
 ## [Unreleased]
 
 ## [2.0.0] - 2026-10-16
@@ -96,6 +99,12 @@ async video submissions are breaking API changes. See the [1.x to 2.0 migration 
   compute drop percentages without integer overflow.
 - Accumulate discovery observations using documented structural identity, parse
   IPv6/URL authorities correctly, and validate cached lookup timeouts.
+
+- Correct example PCM interleaving, UTF-8 metadata truncation, multiple discovery
+  IP hints, and FrameSync audio/video pacing. Build every applicable example
+  across supported feature configurations and test PCM conversion ordering.
+- Refresh API documentation, SDK setup instructions, and links; mark historical
+  migration examples with their release scope.
 
 ## [1.0.1] - 2026-10-14
 
@@ -587,7 +596,7 @@ Version 0.9.0 represents a **major milestone** toward our 1.0 release. This vers
 - 🛠️ **Ergonomics**: Simplified capture API, source caching, and image encoding
 - ⚡ **Performance**: Multiple performance improvements and zero-cost abstractions
 
-**Migration Effort**: Medium to High. Most changes are mechanical (find/replace), but the API surface has changed significantly. See the [Migration Guide](#migration-guide) below for detailed instructions.
+**Migration Effort**: Medium to High. Most changes are mechanical (find/replace), but the API surface has changed significantly. See the [0.8 to 0.9 migration guide](docs/migration/0.8-to-0.9.md) for detailed instructions.
 
 ---
 

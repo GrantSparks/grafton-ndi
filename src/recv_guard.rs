@@ -1,15 +1,17 @@
 //! RAII guards for NDI receive frames.
 //!
-//! This module re-exports the unified generic guards from [`crate::capture`],
-//! providing backwards-compatible type aliases for the frame-specific guard types.
+//! This private module imports the unified generic guards from [`crate::capture`]
+//! for internal frame-reference constructors. These guards and their raw SDK
+//! strategies are not part of the public capture API.
 //!
 //! ## Architecture
 //!
 //! The actual implementation lives in `capture.rs`, which provides:
-//! - `FrameFree` free-strategy trait and `CaptureKind` capture trait
+//! - Public `CaptureKind` with borrowed/owned frame types and conversion
+//! - Private `FrameFree` and `CaptureStrategy` SDK implementations
 //! - `Guard<'owner, S>` generic RAII guard
 //!
-//! This module re-exports type aliases for the receiver guard kinds that have a
+//! This module imports aliases for the receiver guard kinds that have a
 //! kind-specific constructor:
 //! - `RecvAudioGuard<'rx>` = `Guard<'rx, AudioKind>`
 //! - `RecvMetadataGuard<'rx>` = `Guard<'rx, MetadataKind>`

@@ -78,6 +78,27 @@ docs(api): improve VideoFrame builder documentation
 - Include integration tests for complex features
 - Test on multiple platforms if possible
 
+Before submitting a release change, run the same substantive checks as CI:
+
+```bash
+cargo fmt --check
+cargo test --all-features
+cargo test --examples --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
+cargo test --all-features --test async_send_lifecycle --test sender_lifecycle_stress -- --ignored
+cargo build --examples
+cargo build --examples --all-features
+cargo build --examples --no-default-features
+cargo build --examples --no-default-features --features tokio
+cargo build --examples --no-default-features --features async-std
+cargo +1.87.0 check --all-features
+```
+
+The PNG example requires `image-encoding` and is intentionally skipped in minimal
+builds. CI also runs tests with minimal, Tokio-only, and async-std-only features.
+The explicit lifecycle suites require the installed NDI SDK runtime.
+
 #### Compile Contract Tests
 
 Zero-copy receive lifetimes, ownership transfer for async sends, and immediate source reuse
@@ -99,7 +120,9 @@ TRYBUILD=overwrite cargo test --test compile_contracts
 
 The project uses the stable Rust toolchain with `clippy`, `rustfmt`, and
 `rust-src` components via `rust-toolchain.toml`. The `rust-src` component keeps
-standard-library diagnostics consistent in local and CI runs. Treat `.stderr`
+standard-library diagnostics consistent in local and CI runs. CI uses nightly
+for its formatting check; library tests and examples use stable, with a separate
+Rust 1.87 library compatibility job. Treat `.stderr`
 snapshot updates as part of normal stable-compiler-upgrade maintenance, and
 review them to confirm they still fail for the intended lifetime or auto-trait
 reason.
@@ -108,19 +131,21 @@ reason.
 
 #### GitHub Actions NDI SDK
 
-The CI/CD pipeline requires the NDI SDK to build and test the project. You can configure the SDK version in two ways:
+CI installs NDI SDK 6 using platform-specific workflow defaults. To override a
+download, set the matching repository Actions secret:
 
-1. **Default**: Uses the hardcoded NDI 6 SDK URL in the workflow
-2. **Custom**: Set the `NDI_SDK_URL` repository secret to use a different SDK version
+| Platform | Secret |
+| --- | --- |
+| Windows | `NDI_SDK_URL` |
+| Linux | `NDI_SDK_URL_LINUX` |
+| macOS | `NDI_SDK_URL_MACOS` |
 
-To update the NDI SDK version for CI/CD:
-1. Go to Settings → Secrets and variables → Actions in your GitHub repository
-2. Create or update the `NDI_SDK_URL` secret with the new SDK download URL
-3. The cache will automatically invalidate when the URL changes
-
-Example URLs:
-- NDI 6: `https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe`
-- NDI 5: `https://downloads.ndi.tv/SDK/NDI_SDK/NDI%205%20SDK.exe`
+When updating an installer, verify its provenance and SHA256, then update the
+accepted hashes in the corresponding `.github/actions/setup-ndi-*/action.yml`.
+The first accepted hash participates in the SDK cache key. Changing only a URL
+does not invalidate an existing cache, and a new payload not in the allowlist
+will fail verification on a cache miss. Review SDK updates on all supported
+platforms before merging.
 
 ### Documentation
 
@@ -133,14 +158,14 @@ Example URLs:
 
 ### High Priority
 
-- macOS platform testing and fixes
+- Platform coverage beyond the native Linux, macOS, and Windows CI matrix
 - Performance optimizations
 - Additional examples
 - Documentation improvements
 
 ### Feature Ideas
 
-- Async/await support
+- Async adapter diagnostics and cancellation observability
 - Additional color format conversions
 - Enhanced metadata handling
 - Debugging and diagnostic tools
@@ -158,8 +183,9 @@ grafton-ndi/
 ├── src/
 │   ├── lib.rs          # Main library interface
 │   ├── error.rs        # Error types
-│   └── ndi_lib.rs      # Generated FFI bindings
+│   └── ndi_lib.rs      # Private include wrapper for OUT_DIR bindings
 ├── build.rs            # Build script for bindgen
+├── build_support.rs    # Target/SDK selection helpers
 ├── examples/           # Example applications
 └── tests/              # Integration tests
 ```

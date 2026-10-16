@@ -54,8 +54,9 @@
 //! # Thread Safety
 //!
 //! All primary types ([`Finder`], [`Receiver`], [`Sender`]) implement `Send + Sync`
-//! as the underlying NDI SDK is thread-safe. However, for optimal performance,
-//! minimize cross-thread operations and maintain thread affinity where possible.
+//! with internal synchronization where required by the SDK. Borrowed receiver
+//! frame references support scoped thread transfer; FrameSync references remain
+//! tied to their owner and cannot be shared or transferred across threads.
 //!
 //! ## Async Sending
 //!
@@ -89,10 +90,10 @@
 //!
 //! # Performance
 //!
-//! - **Zero-copy**: Frame data directly references NDI's buffers when possible
+//! - **Borrowed receive buffers**: Read SDK-owned frames without wrapper pixel copies
 //! - **Async completion**: Owned frames are recovered after SDK synchronization
 //! - **Bandwidth control**: Multiple quality levels for different use cases
-//! - **Hardware acceleration**: Automatically uses GPU acceleration when available
+//! - **SDK processing**: Encoding and acceleration depend on the installed NDI SDK
 //!
 //! # Platform Support
 //!
@@ -171,20 +172,6 @@ pub const MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(u3
 ///
 /// Returns [`Error::InvalidConfiguration`] if the duration exceeds [`MAX_TIMEOUT`].
 ///
-/// # Examples
-///
-/// ```ignore
-/// use std::time::Duration;
-/// use grafton_ndi::to_ms_checked;
-///
-/// // Valid timeout
-/// let ms = to_ms_checked(Duration::from_secs(5))?;
-/// assert_eq!(ms, 5000);
-///
-/// // Overflow error
-/// let result = to_ms_checked(Duration::from_secs(u64::MAX));
-/// assert!(result.is_err());
-/// ```
 pub(crate) fn to_ms_checked(d: std::time::Duration) -> Result<u32> {
     if d > MAX_TIMEOUT {
         Err(Error::InvalidConfiguration(format!(

@@ -14,7 +14,7 @@
 //! Troubleshooting:
 //! - If no sources are found, try adding specific IP addresses with extra_ips()
 //! - Ensure NDI sources are running on your network
-//! - Check firewall settings (NDI uses TCP port 5353 for discovery)
+//! - Check firewall settings (NDI uses UDP port 5353 for discovery)
 
 use grafton_ndi::{Error, NDI};
 
