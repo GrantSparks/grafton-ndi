@@ -24,7 +24,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
     }
 
     let audio = framesync.capture_audio(FrameSyncAudioRequest::QueryInput)?;
-    let _ = (audio.sample_rate(), audio.num_channels(), audio.data().len());
+    let _ = (audio.sample_rate(), audio.num_channels(), audio.channels().len());
     let _owned = audio.to_owned()?;
 
     Ok(())
