@@ -39,9 +39,9 @@ fn owned_pipeline_returns_original_buffers_and_metadata() -> Result<(), grafton_
 
 #[test]
 #[ignore = "Requires an installed NDI runtime"]
-fn copied_send_survives_forgotten_token_and_released_source() -> Result<(), grafton_ndi::Error> {
+fn copied_send_survives_released_source() -> Result<(), grafton_ndi::Error> {
     let ndi = NDI::new()?;
-    let options = SenderOptions::builder("forgotten copy token regression")
+    let options = SenderOptions::builder("copied source release regression")
         .clock_video(false)
         .clock_audio(false)
         .build();
@@ -49,7 +49,7 @@ fn copied_send_survives_forgotten_token_and_released_source() -> Result<(), graf
     let mut buffer = vec![7; 16 * 16 * 4];
     let borrowed =
         BorrowedVideoFrame::try_from_uncompressed(&buffer, 16, 16, PixelFormat::BGRA, 30, 1)?;
-    std::mem::forget(sender.send_video_async_copy(&borrowed));
+    let _ = sender.send_video_async_copy(&borrowed)?;
     buffer.fill(9);
     drop(buffer);
     let _ = sender.finish_video_async();
@@ -73,9 +73,11 @@ fn mixed_owned_and_copy_send_completes_each_frame_once() -> Result<(), grafton_n
     let source = vec![4; 16 * 16 * 4];
     let borrowed =
         BorrowedVideoFrame::try_from_uncompressed(&source, 16, 16, PixelFormat::BGRA, 30, 1)?;
-    sender.send_video_async_copy(&borrowed).wait()?;
+    let recovered = sender.send_video_async_copy(&borrowed)?.unwrap();
+    assert_eq!(recovered.data()[0], 3);
+    sender.flush_async_blocking();
     assert_eq!(completed.lock().unwrap().as_slice(), &[1024, 1024]);
-    assert!(sender.finish_video_async().is_none());
+    assert_eq!(sender.finish_video_async().unwrap().data()[0], 4);
     let _ = sender.send_video_async(frame(5));
     drop(sender);
     assert_eq!(completed.lock().unwrap().as_slice(), &[1024, 1024, 1024]);
@@ -98,14 +100,21 @@ fn concurrent_sync_and_reentrant_flush_preserve_owned_frame() -> Result<(), graf
     let submitted = frame(6);
     let original_ptr = submitted.data().as_ptr();
     let _ = sender.send_video_async(submitted);
-    let shared = Arc::new(sender);
-    let weak = Arc::downgrade(&shared);
+    let reference = Arc::new(std::sync::Mutex::new(std::sync::Weak::<Sender>::new()));
+    let weak_reference = reference.clone();
     let completions = Arc::new(AtomicUsize::new(0));
     let counted = completions.clone();
-    shared.on_async_video_done(move |_| {
+    sender.on_async_video_done(move |_| {
         counted.fetch_add(1, Ordering::SeqCst);
-        weak.upgrade().unwrap().flush_async_blocking();
+        weak_reference
+            .lock()
+            .unwrap()
+            .upgrade()
+            .unwrap()
+            .flush_async_blocking();
     });
+    let shared = Arc::new(sender);
+    *reference.lock().unwrap() = Arc::downgrade(&shared);
     std::thread::scope(|scope| {
         scope.spawn(|| shared.flush_async_blocking());
         scope.spawn(|| shared.send_video(&frame(7)));
@@ -164,9 +173,11 @@ fn copied_send_retains_metadata_after_source_drop() -> Result<(), grafton_ndi::E
     let mut sender = Sender::new(&ndi, &options)?;
     let source = frame(8);
     let borrowed = BorrowedVideoFrame::from(&source);
-    std::mem::forget(sender.send_video_async_copy(&borrowed));
+    let _ = sender.send_video_async_copy(&borrowed)?;
     drop(source);
     // Both source pixels and metadata have been released before the SDK drain.
-    let _ = sender.finish_video_async();
+    let recovered = sender.finish_video_async().unwrap();
+    assert_eq!(recovered.data()[0], 8);
+    assert_eq!(recovered.metadata(), Some("<frame value=\"8\"/>"));
     Ok(())
 }
