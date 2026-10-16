@@ -57,9 +57,10 @@
 //! as the underlying NDI SDK is thread-safe. However, for optimal performance,
 //! minimize cross-thread operations and maintain thread affinity where possible.
 //!
-//! ## Zero-Copy Async Sending
+//! ## Async Sending
 //!
-//! The library provides zero-copy async video sending using `NDIlib_send_send_video_async_v2`.
+//! The library snapshots borrowed pixel data and metadata into sender-owned storage before
+//! calling `NDIlib_send_send_video_async_v2`, so forgetting a send token is safe.
 //! The completion callback notifies when the buffer can be reused:
 //!
 //! ```no_run
@@ -73,8 +74,8 @@
 //! let buffer = vec![0u8; 1920 * 1080 * 4];
 //! let frame = BorrowedVideoFrame::try_from_uncompressed(&buffer, 1920, 1080, PixelFormat::BGRA, 30, 1)?;
 //! let token = sender.send_video_async(&frame);
-//! // Buffer is now owned by NDI - cannot be modified until callback fires
-//! // The AsyncVideoToken must be kept alive to track the operation
+//! // The SDK reads the sender-owned snapshot until completion
+//! // Drop or wait the token to complete the operation and invoke the callback
 //! # Ok(())
 //! # }
 //! ```
@@ -84,7 +85,7 @@
 //! # Performance
 //!
 //! - **Zero-copy**: Frame data directly references NDI's buffers when possible
-//! - **Lock-free async**: Atomic operations for minimal overhead in hot paths
+//! - **Async completion**: Tokens provide explicit waits and automatic draining
 //! - **Bandwidth control**: Multiple quality levels for different use cases
 //! - **Hardware acceleration**: Automatically uses GPU acceleration when available
 //!

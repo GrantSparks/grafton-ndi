@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Make borrowed async sends safe when their completion token is forgotten. The
+  sender now copies pixels and metadata into retained storage and drains the SDK
+  before replacing or destroying it. Existing call signatures remain unchanged;
+  async sends now incur a copy and retain one snapshot until the next send or
+  sender destruction, rather than providing zero-copy transmission.
+
 ## [1.0.1] - 2026-10-14
 
 ### Fixed
