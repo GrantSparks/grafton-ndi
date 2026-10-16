@@ -30,6 +30,10 @@ video data access are breaking API changes. See the [1.x to 2.0 migration guide]
 
 ### Breaking Changes
 
+- Replace the discontinued `async-std` feature/module with `smol` and
+  `grafton_ndi::smol::AsyncReceiver`. Use `smol::block_on` for entry points.
+  Raise the minimum Rust version from 1.87 to 1.88 (#114).
+
 - Receivers have sealed `RawCapture` and `FrameSyncAttached` modes. FrameSync's
   receiver reference permits shared controls/audio/metadata but has no raw-video
   method. Consuming recovery restores raw video. A private resource owner
@@ -85,6 +89,16 @@ video data access are breaking API changes. See the [1.x to 2.0 migration guide]
   handler; it can also be cleared.
 
 ### Changed
+
+- Raise dependency floors to Tokio 1.53.3, jpeg-encoder 0.7.1, thiserror 2.0.21,
+  and trybuild 1.0.122. Remove the direct once_cell dependency; the process-global
+  runtime manager is const-initialized and SDK initialization still occurs on
+  acquisition. Retain bindgen 0.72.1 pending mixed syn/prettyplease resolution
+  validation, and base64 0.22 pending explicit SIMD-engine validation (#114).
+- Gate release publishing on `cargo audit --deny warnings` with a generated
+  lockfile, migrate JavaScript CI actions to Node 24 releases, and pin Linux
+  release runners to Ubuntu 24.04. Preserve Linux SDK regressions with
+  `runner.os` guards and add independent smol and Rust 1.88 coverage (#114).
 
 - Media capture retains receiver status notifications for subsequent status polling;
   notifications coalesce and competing pollers consume them once (#110).

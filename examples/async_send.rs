@@ -13,7 +13,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
     let mut next = VideoFrameBuilder::new().resolution(1920, 1080).build()?;
     assert!(sender.send_video_async(first).is_none());
     for index in 1..120 {
-        for pixel in next.data_mut().chunks_exact_mut(4) {
+        for pixel in next.data_mut().as_chunks_mut::<4>().0 {
             pixel.copy_from_slice(&[index as u8, 0, 128, 255]);
         }
         next = sender

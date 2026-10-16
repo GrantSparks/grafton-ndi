@@ -135,14 +135,14 @@ pub mod receiver;
 pub mod runtime;
 pub mod sender;
 
-#[cfg(any(feature = "tokio", feature = "async-std"))]
+#[cfg(any(feature = "tokio", feature = "smol"))]
 mod async_runtime;
 
 #[cfg(feature = "tokio")]
 pub use async_runtime::tokio;
 
-#[cfg(feature = "async-std")]
-pub use async_runtime::async_std;
+#[cfg(feature = "smol")]
+pub use async_runtime::smol;
 
 pub use {
     capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},

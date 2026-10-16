@@ -2167,7 +2167,7 @@ impl<'a> ImagePixelSource<'a> {
             }
         } else {
             for row in self.plane.rows() {
-                for pixel in row.chunks_exact(ImagePixelFormat::BYTES_PER_PIXEL) {
+                for pixel in row.as_chunks::<{ ImagePixelFormat::BYTES_PER_PIXEL }>().0 {
                     rgba.extend_from_slice(&self.pixel_format.rgba_pixel(pixel));
                 }
             }
@@ -2200,7 +2200,7 @@ impl<'a> ImagePixelSource<'a> {
 
         let mut rgb = Vec::with_capacity(self.output_len(3)?);
         for row in self.plane.rows() {
-            for pixel in row.chunks_exact(ImagePixelFormat::BYTES_PER_PIXEL) {
+            for pixel in row.as_chunks::<{ ImagePixelFormat::BYTES_PER_PIXEL }>().0 {
                 rgb.extend_from_slice(&self.pixel_format.rgb_pixel(pixel));
             }
         }
