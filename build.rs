@@ -3,10 +3,33 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod build_support;
+
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build_support.rs");
+    for name in [
+        "NDI_SDK_DIR",
+        "LIBCLANG_PATH",
+        "CLANG_PATH",
+        "BINDGEN_EXTRA_CLANG_ARGS",
+        "SDKROOT",
+    ] {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+    let target = env::var("TARGET").expect("Cargo TARGET missing");
+    let host = env::var("HOST").expect("Cargo HOST missing");
+    let target_os = env::var("CARGO_CFG_TARGET_OS").expect("Cargo target OS missing");
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("Cargo target architecture missing");
+    build_support::library_subdirs(&target_os, &target_arch, &target)
+        .unwrap_or_else(|error| panic!("{error}"));
+    if target != host && env::var_os("NDI_SDK_DIR").is_none() {
+        panic!("Cross-compiling {host} to {target} requires NDI_SDK_DIR pointing to the target SDK, plus target headers/sysroot configured through BINDGEN_EXTRA_CLANG_ARGS or the target C toolchain");
+    }
+
     // Determine the base NDI SDK directory.
     let ndi_sdk_path = env::var("NDI_SDK_DIR").unwrap_or_else(|_| {
-        if cfg!(target_os = "macos") {
+        if target_os == "macos" {
             // Try multiple possible NDI SDK locations on macOS
             let possible_paths = vec![
                 "/Library/NDI SDK for macOS",
@@ -27,7 +50,7 @@ fn main() {
 
             // Default to the most common location
             "/Library/NDI SDK for macOS".to_string()
-        } else if cfg!(target_os = "linux") {
+        } else if target_os == "linux" {
             // For Linux, try the Advanced SDK directory first.
             let advanced = "/usr/share/NDI Advanced SDK for Linux";
             let standard = "/usr/share/NDI SDK for Linux";
@@ -36,20 +59,13 @@ fn main() {
             } else {
                 standard.to_string()
             }
-        } else if cfg!(target_os = "windows") {
+        } else if target_os == "windows" {
             // NDI 6 SDK default installation path
             "C:\\Program Files\\NDI\\NDI 6 SDK".to_string()
         } else {
             panic!("Unsupported platform, please set NDI_SDK_DIR manually.");
         }
     });
-
-    // Determine if we're using the Advanced SDK (only relevant on Linux).
-    let is_advanced = if cfg!(target_os = "linux") {
-        ndi_sdk_path.to_lowercase().contains("advanced")
-    } else {
-        false
-    };
 
     // Construct the include path and header file location.
     let ndi_include_path = format!("{ndi_sdk_path}/include");
@@ -98,110 +114,22 @@ fn main() {
 
     let main_header = wrapper_path.to_str().unwrap().to_string();
 
-    // Determine the library name and linking type based on the platform.
-    let (lib_name, link_type) = if cfg!(target_os = "macos") {
-        ("ndi", "dylib")
-    } else if cfg!(target_os = "linux") {
-        if is_advanced {
-            ("ndi_advanced", "dylib")
-        } else {
-            ("ndi", "dylib")
-        }
-    } else if cfg!(target_os = "windows") {
-        let target = env::var("TARGET").expect("TARGET environment variable not set");
-        if target.contains("x86_64") {
-            ("Processing.NDI.Lib.x64", "static")
-        } else {
-            ("Processing.NDI.Lib.x86", "static")
-        }
-    } else {
-        panic!("Unsupported platform");
-    };
-
-    // Add library directory path for all platforms.
-    if cfg!(target_os = "windows") {
-        let target = env::var("TARGET").expect("TARGET environment variable not set");
-        let lib_subdir = if target.contains("x86_64") {
-            "x64"
-        } else {
-            "x86"
-        };
-        let lib_path = format!("{ndi_sdk_path}\\lib\\{lib_subdir}");
-        println!("cargo:rustc-link-search=native={lib_path}");
-    } else if cfg!(target_os = "linux") {
-        // For Linux, detect the architecture and find the appropriate library directory
-        let target = env::var("TARGET").expect("TARGET environment variable not set");
-
-        // Determine possible architecture-specific library directories
-        let arch_dirs: Vec<String> = if target.contains("x86_64") {
-            vec!["x86_64-linux-gnu".to_string()]
-        } else if target.contains("i686") || target.contains("i586") {
-            vec!["i686-linux-gnu".to_string()]
-        } else if target.contains("aarch64") {
-            // For ARM64, try generic first, then Raspberry Pi specific
-            vec![
-                "aarch64-linux-gnu".to_string(),
-                "aarch64-rpi4-linux-gnueabihf".to_string(),
-            ]
-        } else if target.contains("armv7") {
-            // For ARMv7, try Raspberry Pi 4, 3, then 2
-            vec![
-                "arm-rpi4-linux-gnueabihf".to_string(),
-                "arm-rpi3-linux-gnueabihf".to_string(),
-                "arm-rpi2-linux-gnueabihf".to_string(),
-            ]
-        } else if target.contains("arm") {
-            // For other ARM variants, try all Raspberry Pi variants
-            vec![
-                "arm-rpi4-linux-gnueabihf".to_string(),
-                "arm-rpi3-linux-gnueabihf".to_string(),
-                "arm-rpi2-linux-gnueabihf".to_string(),
-                "arm-rpi1-linux-gnueabihf".to_string(),
-            ]
-        } else {
-            panic!(
-                "Unsupported Linux architecture: {target}. Please set NDI_SDK_DIR to point to your NDI SDK installation and ensure the architecture-specific library directory exists."
-            );
-        };
-
-        // Find the first architecture directory that exists
-        let lib_base = format!("{ndi_sdk_path}/lib");
-        let lib_path = arch_dirs
-            .iter()
-            .map(|arch| format!("{lib_base}/{arch}"))
-            .find(|path| Path::new(path).exists())
-            .unwrap_or_else(|| {
-                let searched = arch_dirs.iter().map(|arch| format!("{lib_base}/{arch}")).collect::<Vec<_>>();
-                panic!(
-                    "NDI SDK library directory not found for architecture: {target}. Searched in: {searched:?}. \
-                    Please ensure the NDI SDK is installed correctly or set NDI_SDK_DIR to the correct location."
-                )
-            });
-
-        println!("cargo:rustc-link-search=native={lib_path}");
-    } else if cfg!(target_os = "macos") {
-        // For macOS, add the library search path
-        // NDI SDK on macOS often has libraries in lib/macOS subdirectory
-        let lib_macos = format!("{ndi_sdk_path}/lib/macOS");
-        let lib_base = format!("{ndi_sdk_path}/lib");
-
-        if Path::new(&lib_macos).exists() {
-            println!("cargo:rustc-link-search=native={lib_macos}");
-        } else {
-            println!("cargo:rustc-link-search=native={lib_base}");
-        }
-    }
-
-    // Inform Cargo about the library to link against.
-    println!("cargo:rustc-link-lib={link_type}={lib_name}");
+    let (library_dir, library_name, link_kind) =
+        build_support::select_library(Path::new(&ndi_sdk_path), &target_os, &target_arch, &target)
+            .unwrap_or_else(|error| panic!("{error}"));
+    println!("cargo:rustc-link-search=native={}", library_dir.display());
+    println!("cargo:rustc-link-lib={link_kind}={library_name}");
+    println!("cargo:rerun-if-changed={}", library_dir.display());
 
     // Generate the bindings using bindgen.
     let bindings = bindgen::Builder::default()
         .header(main_header)
         .clang_arg(format!("-I{ndi_include_path}"))
+        .clang_arg(format!("--target={target}"))
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .derive_default(true)
         .generate()
-        .expect("Unable to generate bindings");
+        .unwrap_or_else(|error| panic!("Unable to generate NDI bindings for {target}: {error}. For cross builds, configure target C headers and sysroot via BINDGEN_EXTRA_CLANG_ARGS."));
 
     // Write the bindings to the $OUT_DIR/ndi_lib.rs file.
     let out_path =
