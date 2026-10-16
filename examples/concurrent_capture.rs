@@ -129,12 +129,11 @@ fn main() -> Result<(), grafton_ndi::Error> {
                         metadata_count += 1;
                         let data = frame.data();
                         let data_len = data.len();
-                        let preview = if data.len() > 50 {
-                            let preview_data = &data[..50];
-                            format!("{preview_data}...")
-                        } else {
-                            data.to_owned()
-                        };
+                        let mut characters = data.chars();
+                        let mut preview: String = characters.by_ref().take(50).collect();
+                        if characters.next().is_some() {
+                            preview.push_str("...");
+                        }
                         println!("[METADATA] Received {data_len} bytes: {preview}");
                     }
                     Ok(None) => {
@@ -157,6 +156,6 @@ fn main() -> Result<(), grafton_ndi::Error> {
         metadata_handle.join().unwrap();
     });
 
-    println!("\nConcurrent capture example completed successfully!");
+    println!("\nConcurrent capture workers finished.");
     Ok(())
 }

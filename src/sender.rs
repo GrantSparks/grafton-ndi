@@ -123,12 +123,13 @@ unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
 /// A borrowed video frame that references external pixel data.
-/// Sending asynchronously snapshots this data into sender-owned storage.
+/// [`Sender::send_video_async_copy`] copies its pixels and metadata into an
+/// owned frame; source buffers can be reused immediately after submission.
 ///
 /// Fields are private to enforce safety invariants. Use
-/// `try_from_uncompressed` for supported typed formats or
-/// `from_parts_unchecked` as the explicit unsafe escape hatch for unsupported
-/// SDK layouts.
+/// [`Self::try_from_uncompressed`] for tightly packed typed formats or
+/// [`Self::from_parts_unchecked`] for caller-validated raw descriptions. Owned
+/// conversion and copied sending reject unsupported pixel formats.
 pub struct BorrowedVideoFrame<'buf> {
     pub(crate) width: i32,
     pub(crate) height: i32,
@@ -237,23 +238,24 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     ///   planar format dimension or stride requirements are satisfied.
     /// - Line stride or data size is positive, fits the SDK field, and is
     ///   sufficient for every byte the SDK may read.
-    /// - `data` is live and large enough for the final layout for the full send
-    ///   lifetime.
+    /// - `data` is live and large enough for the final layout whenever the frame
+    ///   is inspected or converted to owned storage.
     /// - `frame_rate_n` and `frame_rate_d` are positive, `picture_aspect_ratio`
-    ///   is finite and positive, and `scan_type` matches a supported SDK scan
-    ///   type.
+    ///   is finite and nonnegative (`0.0` selects square pixels), and `scan_type`
+    ///   matches a supported SDK scan type.
     /// - `metadata`, when present, remains valid, NUL-terminated, UTF-8, and
-    ///   within the crate metadata size cap for the full send lifetime.
+    ///   within the crate metadata size cap while the frame is inspected or copied.
     ///
     /// Conversion to an owned frame and copied async sending support only the
     /// crate's typed uncompressed layouts. Opaque or compressed FourCC payloads
     /// cannot be converted and return an error.
     ///
-    /// The default timecode requests SDK synthesis. Explicit `timecode` and
-    /// `timestamp` values, including zero, are passed through unchanged.
+    /// This constructor passes `timecode` and `timestamp` through unchanged,
+    /// including literal zero. Use `NDIlib_send_timecode_synthesize` to request
+    /// SDK timecode synthesis, as the safe uncompressed constructor does by default.
     ///
-    /// Violating these invariants will cause the NDI SDK to read out of bounds through FFI,
-    /// leading to undefined behavior.
+    /// Violating these invariants can cause invalid reads while inspecting or
+    /// copying the frame, leading to undefined behavior.
     ///
     /// # Example
     ///
@@ -530,7 +532,10 @@ impl Sender {
         }
     }
 
-    /// Send a video frame **synchronously** (NDI copies the buffer immediately).
+    /// Send a video frame synchronously.
+    ///
+    /// The SDK has released the input buffer when this returns; the caller may
+    /// then reuse or release it. This also completes a previous async video send.
     pub fn send_video(&self, video_frame: &VideoFrame) {
         let len = {
             let mut video = self.inner.video.lock().unwrap_or_else(|e| e.into_inner());
@@ -580,6 +585,8 @@ impl Sender {
     ///
     /// Frames submitted through either owned or copied sending are returned.
     /// Repeated calls return `None` and do not repeat completion notifications.
+    /// If the completion handler panics, the completed frame is dropped instead
+    /// of returned.
     pub fn finish_video_async(&mut self) -> Option<VideoFrame> {
         let (previous, len) = {
             let mut video = self.inner.video.lock().unwrap_or_else(|e| e.into_inner());
@@ -614,9 +621,8 @@ impl Sender {
 
     /// Sends an audio frame synchronously.
     ///
-    /// This function copies the audio data immediately and returns, making the buffer
-    /// available for reuse. The underlying NDI SDK function `NDIlib_send_send_audio_v3`
-    /// performs a synchronous copy of the data.
+    /// The SDK has released the input buffer when this returns, so the caller
+    /// may then reuse or release it. This calls `NDIlib_send_send_audio_v3`.
     ///
     /// See the NDI SDK documentation section on `NDIlib_send_send_audio_v3` for more details.
     ///
@@ -824,13 +830,15 @@ impl Sender {
     /// Replace the completion handler receiving the submitted pixel-buffer length.
     ///
     /// It runs on the calling thread after SDK synchronization, outside internal
-    /// locks, once per submitted frame. Completion is observed by the next video
-    /// send, flush, finish, or sender destruction. Owned and copied sends share
+    /// locks, at most once per submitted frame. Completion is observed by the
+    /// next video send, flush, finish, or sender destruction. Owned and copied sends share
     /// this handler. State is updated before invocation, so panic or reentry cannot
-    /// repeat a notification. During unwinding a handler panic is suppressed.
+    /// repeat a notification. If sender destruction runs during unwinding, a
+    /// handler panic is suppressed to avoid a second panic.
     ///
     /// Replaces the previous handler. The current handler observes completion of
-    /// any pending frame, including a frame submitted before registration.
+    /// a frame still in flight, including one submitted before registration.
+    /// Frames completed before registration are not notified retroactively.
     pub fn on_async_video_done<F>(&mut self, handler: F)
     where
         F: Fn(usize) + Send + Sync + 'static,
@@ -918,7 +926,7 @@ impl SenderOptions {
     }
 }
 
-/// Builder for configuring `SendOptions` with ergonomic method chaining
+/// Builder for configuring [`SenderOptions`] with method chaining.
 #[derive(Debug, Clone)]
 pub struct SenderOptionsBuilder {
     name: String,

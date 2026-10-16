@@ -215,8 +215,13 @@ fn positive_i32(field: &str, value: NonZeroI32) -> Result<i32> {
 /// # Thread Safety
 ///
 /// `FrameSync` is `Send + Sync` like `Receiver`, as the underlying NDI SDK
-/// frame-sync functions are thread-safe. However, frames returned by capture
-/// methods borrow from the FrameSync and are not `Send`.
+/// frame-sync functions are thread-safe. Frames returned by capture methods
+/// borrow from the FrameSync and are neither `Send` nor `Sync`. Convert them
+/// to owned frames before transferring them to another thread.
+///
+/// Raw video capture through the underlying receiver is disabled while this
+/// FrameSync exists. [`Self::into_receiver`] destroys the synchronizer and
+/// restores raw video capture before returning the receiver.
 ///
 /// # Example
 ///
@@ -230,7 +235,7 @@ fn positive_i32(field: &str, value: NonZeroI32) -> Result<i32> {
 /// # let receiver = Receiver::new(&ndi, &options)?;
 /// let framesync = FrameSync::new(receiver)?;
 ///
-/// // FrameSync captures always return immediately
+/// // Sample available data without waiting for a new network frame
 /// if let Some(video) = framesync.capture_video(ScanType::Progressive)? {
 ///     println!("Video: {}x{}", video.width(), video.height());
 /// }
@@ -290,7 +295,8 @@ impl FrameSync {
     /// Access the underlying receiver.
     ///
     /// Use this to access receiver functionality like tally, PTZ, or status
-    /// queries while the FrameSync is active. Raw video capture on this receiver
+    /// queries while the FrameSync is active. Tally control publishes state
+    /// upstream; it does not query incoming tally. Raw video capture on this receiver
     /// returns [`Error::InvalidConfiguration`]; use FrameSync capture methods or
     /// recover the receiver with [`Self::into_receiver`] first.
     pub fn receiver(&self) -> &Receiver {
@@ -316,10 +322,10 @@ impl FrameSync {
 
     /// Capture video with time-base correction.
     ///
-    /// This function always returns immediately. It returns the best frame for
+    /// This does not wait for a new network frame. It returns the best frame for
     /// the current output timing, handling clock drift and jitter automatically.
     /// The same frame may be returned multiple times when capture rate exceeds
-    /// source frame rate.
+    /// source frame rate. Wrapper synchronization and SDK processing still take time.
     ///
     /// # Arguments
     ///
@@ -331,7 +337,8 @@ impl FrameSync {
     ///
     /// * `Ok(Some(FrameSyncVideoRef))` - A validated zero-copy reference to the captured frame
     /// * `Ok(None)` - The SDK returned the documented all-zero "no video yet" state
-    /// * `Err(Error::InvalidFrame(_))` - The SDK returned non-empty malformed metadata
+    /// * `Err(_)` - The SDK returned an unsupported format or malformed frame
+    ///   descriptor, including invalid dimensions, stride, buffers, or metadata
     ///
     /// # Example
     ///
@@ -394,7 +401,8 @@ impl FrameSync {
     ///
     /// # Errors
     ///
-    /// Returns an error if the SDK returns non-empty malformed frame metadata.
+    /// Propagates format and frame-validation errors from [`Self::capture_video`]
+    /// or conversion to an owned frame.
     pub fn capture_video_owned(&self, field_type: ScanType) -> Result<Option<VideoFrame>> {
         self.capture_video(field_type)?
             .map(|frame| frame.to_owned())
@@ -403,10 +411,11 @@ impl FrameSync {
 
     /// Capture audio with dynamic resampling.
     ///
-    /// This function always returns immediately. Capture requests ask the NDI
+    /// This does not wait for new network audio. Capture requests ask the NDI
     /// SDK to resample incoming audio to match the requested sample rate,
     /// channel count, and sample count. Query requests return the current input
-    /// format without requesting samples.
+    /// format without requesting samples. Wrapper synchronization and resampling
+    /// still take time.
     ///
     /// Call this at the rate you need audio - the SDK will adapt the incoming
     /// signal to match your output timing using dynamic audio sampling.
@@ -425,8 +434,9 @@ impl FrameSync {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidFrame`] if the SDK returns malformed audio
-    /// metadata, or [`Error::InvalidConfiguration`] if the request contains a
+    /// Returns frame-validation errors if the SDK returns malformed audio
+    /// dimensions, sample layout, buffers, or metadata, or
+    /// [`Error::InvalidConfiguration`] if the request contains a
     /// negative `NonZeroI32` value.
     ///
     /// # Example
@@ -548,13 +558,17 @@ impl Drop for FrameSync {
 /// # Safety
 ///
 /// The NDI SDK documentation states that framesync operations are thread-safe.
-/// The FrameSync struct only holds an opaque pointer returned by the SDK.
+/// The FrameSync owns its receiver, keeping the SDK runtime alive. Borrowed
+/// frame guards cannot be moved between threads and keep this owner borrowed
+/// until their buffers are freed; destruction requires exclusive ownership.
 unsafe impl Send for FrameSync {}
 
 /// # Safety
 ///
 /// The NDI SDK guarantees that framesync capture functions are internally
-/// synchronized and can be called concurrently from multiple threads.
+/// synchronized and can be called concurrently from multiple threads. Receiver
+/// attachment disables raw video capture until the synchronizer is destroyed,
+/// including when the receiver is accessed through [`FrameSync::receiver`].
 unsafe impl Sync for FrameSync {}
 
 impl fmt::Debug for FrameSync {

@@ -30,9 +30,9 @@ use crate::{ndi_lib::*, to_ms_checked, Error, Result, NDI};
 ///     .groups("Public,Studio")
 ///     .build();
 ///
-/// // Find sources on specific network segments
+/// // Find sources on specific hosts
 /// let finder = FinderOptions::builder()
-///     .extra_ips("192.168.1.0/24,10.0.0.0/24")
+///     .extra_ips("192.168.1.100,10.0.0.100")
 ///     .build();
 /// ```
 #[derive(Debug, Clone)]
@@ -41,7 +41,7 @@ pub struct FinderOptions {
     pub show_local_sources: bool,
     /// Comma-separated list of groups to search (e.g., "Public,Private").
     pub groups: Option<String>,
-    /// Additional IP addresses or ranges to search.
+    /// Additional comma-separated IP addresses to query.
     pub extra_ips: Option<String>,
 }
 
@@ -71,7 +71,7 @@ impl FinderOptionsBuilder {
     ///
     /// Default settings:
     /// - `show_local_sources`: `true`
-    /// - `groups`: `None` (search all groups)
+    /// - `groups`: `None` (use SDK-configured default groups)
     /// - `extra_ips`: `None` (no additional IPs)
     pub fn new() -> Self {
         Self {
@@ -673,10 +673,10 @@ impl Source {
         self.ip_address()
     }
 
-    /// Safely convert from raw NDI source pointer with null checks.
+    /// Copy an SDK source descriptor into owned strings after null checks.
     ///
-    /// This performs defensive checks at the FFI boundary to prevent undefined behavior
-    /// from null or invalid pointers returned by the NDI SDK.
+    /// Null checks cannot validate dangling or otherwise invalid pointers. The
+    /// SDK must provide a live descriptor and readable NUL-terminated strings.
     ///
     /// # Errors
     ///
@@ -686,8 +686,9 @@ impl Source {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that if `source_ptr` is non-null, it points to a valid
-    /// `NDIlib_source_t` with proper lifetime.
+    /// A non-null `source_ptr` must point to a live `NDIlib_source_t`. Its non-null
+    /// string pointers must remain readable through their NUL terminators until
+    /// copying finishes.
     pub(crate) fn try_from_raw(source_ptr: *const NDIlib_source_t) -> Result<Self> {
         // Check top-level pointer
         if source_ptr.is_null() {
@@ -904,7 +905,7 @@ impl SourceCache {
         }
 
         let ndi = NDI::new()?;
-        // Use extra_ips to hint NDI to look at the specific host IP/network segment
+        // Use extra_ips to hint NDI to look at the specific host IP
         // This significantly improves discovery speed and reliability
         let options = FinderOptions::builder()
             .show_local_sources(true)

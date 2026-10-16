@@ -1,8 +1,7 @@
 //! Example: Sending video frames via NDI.
 //!
-//! This example demonstrates sending a 1920x1080 video stream with
-//! alternating black and white frames. The NDI SDK handles frame
-//! timing to maintain the correct frame rate.
+//! This example sends black 1920x1080 frames at the builder's default 60 fps.
+//! The NDI SDK clocks submission, and each batch reports its measured throughput.
 //!
 //! Run with: `cargo run --example NDIlib_Send_Video`
 
@@ -18,11 +17,11 @@ fn main() -> Result<(), Error> {
     let send_options = SenderOptions::builder("My Video").build();
     let sender = Sender::new(&ndi, &send_options)?;
 
-    // We are going to create a 1920x1080 frame at 29.97Hz
+    // Build 1920x1080 frames at the default 60 fps.
     let xres = 1920i32;
     let yres = 1080i32;
 
-    // Run for 10 seconds (enough to test functionality)
+    // Send full batches until at least 10 seconds have elapsed.
     let start = Instant::now();
     while start.elapsed().as_secs() < 10 {
         let batch_start = Instant::now();
@@ -35,9 +34,7 @@ fn main() -> Result<(), Error> {
                 .pixel_format(PixelFormat::BGRX)
                 .build()?;
 
-            // The frame is created with zero-initialized data
-            // In the C++ example they fill with alternating black/white
-            // but our frame is already black (zeros)
+            // Zero-initialized BGRX pixels produce a black frame.
 
             // Send the frame (SDK handles timing)
             sender.send_video(&video_frame);

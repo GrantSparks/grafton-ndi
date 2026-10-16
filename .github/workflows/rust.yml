@@ -89,16 +89,34 @@ jobs:
 
           # Run all tests including integration tests
           # The NDI runtime libraries are now available via the setup actions
-          cargo test --verbose
+          cargo test --all-features --verbose
         shell: bash
         env:
           TMPDIR: ${{ runner.temp }}
 
       - name: Run Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Build examples
-        run: cargo build --examples
+      - name: Build and test examples
+        run: |
+          cargo build --examples
+          cargo build --examples --all-features
+          cargo test --examples --all-features
+
+      - name: Run SDK lifecycle regressions
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --all-features --test async_send_lifecycle --test sender_lifecycle_stress -- --ignored
+
+      - name: Check independent feature configurations
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo test --no-default-features
+          cargo build --examples --no-default-features
+          cargo test --no-default-features --features tokio
+          cargo build --examples --no-default-features --features tokio
+          cargo test --no-default-features --features async-std
+          cargo build --examples --no-default-features --features async-std
+          cargo check --no-default-features --features advanced_sdk
 
       # Documentation lint runs once; rustdoc lints are platform-independent.
       - name: Check documentation
@@ -106,6 +124,17 @@ jobs:
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+  msrv:
+    name: Library MSRV (Rust 1.87)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-ndi-linux
+        with:
+          save-cache: 'false'
+      - uses: dtolnay/rust-toolchain@1.87.0
+      - run: cargo check --all-features
 
   # Semver check runs on all platforms
   semver:
@@ -149,13 +178,12 @@ jobs:
 
   # Build and publish API documentation to GitHub Pages.
   #
-  # docs.rs cannot build this crate: bindgen generates the FFI bindings from the
-  # NDI SDK headers at build time, and the NDI SDK license forbids redistributing
-  # those headers (or bindings derived from them). Docs are therefore generated
-  # here, where a licensed SDK is installed, and self-hosted on GitHub Pages.
+  # Bindgen needs an installed NDI SDK. The docs.rs environment does not
+  # include that installation, so build and host documentation from CI,
+  # where the SDK is configured by the platform setup action.
   docs:
     name: Publish docs
-    needs: [test-and-lint, semver]
+    needs: [test-and-lint, semver, msrv]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:

@@ -20,8 +20,8 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! // Internal use only - this module is not part of the public API
+//! ```text
+//! // Internal schematic; this module is not part of the public API
 //! use crate::capture::{Guard, VideoKind};
 //!
 //! let guard = unsafe { Guard::<VideoKind>::new(instance, frame) };
@@ -93,7 +93,13 @@ pub(crate) trait FrameFree: sealed::Sealed + 'static {
 /// A sealed receiver capture kind with its borrowed and owned frame types.
 ///
 /// Implemented for [`VideoKind`], [`AudioKind`], and [`MetadataKind`]. Raw SDK
-/// routing and freeing are private implementation details.
+/// routing and freeing are private implementation details. Generic callers can
+/// use [`crate::Capture`] with this trait and convert `K::Ref<'_>` into
+/// `K::Owned` through [`Self::ref_to_owned`].
+///
+/// Receiver frame references implement `Send + Sync` and can move to scoped
+/// worker threads while borrowing their receiver. FrameSync references use
+/// separate private strategies and remain thread-affine.
 #[allow(private_bounds)]
 pub trait CaptureKind: CaptureStrategy + Sized {
     /// A zero-copy captured frame borrowing the receiver.
@@ -406,7 +412,7 @@ pub(crate) enum CaptureResult<'rx, K: CaptureKind> {
 /// Capture a frame of kind `K` from an NDI receiver.
 ///
 /// Routes the frame into the matching `NDIlib_recv_capture_v3` slot via
-/// [`CaptureKind::capture_into`] and classifies the result. Other frame types
+/// [`CaptureStrategy::capture_into`] and classifies the result. Other frame types
 /// (e.g. status-change) are treated as [`CaptureResult::None`].
 ///
 /// # Safety

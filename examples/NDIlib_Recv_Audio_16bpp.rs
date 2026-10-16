@@ -102,24 +102,54 @@ fn convert_to_16bit_interleaved(
     audio_frame: &grafton_ndi::AudioFrame,
     reference_level_db: i32,
 ) -> Vec<i16> {
-    let num_samples = (audio_frame.num_samples() * audio_frame.num_channels()) as usize;
-    let mut output = vec![0i16; num_samples];
+    let samples_per_channel = audio_frame.num_samples() as usize;
+    let channels = audio_frame.num_channels() as usize;
+    let mut output = Vec::with_capacity(audio_frame.data().len());
 
-    // Calculate scaling factor based on reference level
+    // NDI samples are planar; PCM output orders channels within each sample.
     let scale = 10.0_f32.powf(-reference_level_db as f32 / 20.0) * 32767.0;
+    for sample in 0..samples_per_channel {
+        for channel in 0..channels {
+            let value = audio_frame
+                .channel_data(channel)
+                .expect("validated channel")[sample];
+            output.push((value * scale).clamp(-32768.0, 32767.0) as i16);
+        }
+    }
+    output
+}
 
-    let float_data = audio_frame.data();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use grafton_ndi::AudioFrame;
 
-    for (i, &sample) in float_data.iter().enumerate() {
-        let scaled = sample * scale;
-        output[i] = if scaled > 32767.0 {
-            32767
-        } else if scaled < -32768.0 {
-            -32768
-        } else {
-            scaled as i16
-        };
+    #[test]
+    fn converts_planar_stereo_into_scaled_interleaved_pcm() {
+        let frame = AudioFrame::builder()
+            .channels(2)
+            .samples(2)
+            .data(vec![0.25, -0.25, 0.5, -0.5])
+            .build()
+            .unwrap();
+        assert_eq!(
+            convert_to_16bit_interleaved(&frame, 0),
+            vec![8191, 16383, -8191, -16383]
+        );
+        assert_eq!(
+            convert_to_16bit_interleaved(&frame, 20),
+            vec![819, 1638, -819, -1638]
+        );
     }
 
-    output
+    #[test]
+    fn clamps_pcm_to_signed_16_bit_limits() {
+        let frame = AudioFrame::builder()
+            .channels(1)
+            .samples(2)
+            .data(vec![-2.0, 2.0])
+            .build()
+            .unwrap();
+        assert_eq!(convert_to_16bit_interleaved(&frame, 0), vec![-32768, 32767]);
+    }
 }

@@ -8,7 +8,7 @@
 //!
 //! Pulled into an example with:
 //!
-//! ```ignore
+//! ```text
 //! #[path = "common/mod.rs"]
 //! mod common;
 //! ```
@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use grafton_ndi::{Finder, FinderOptions, Result, Source, NDI};
 
-/// Build a [`Finder`] that discovers local sources plus any extra IPs/subnets
+/// Build a [`Finder`] that discovers local sources plus any extra IP addresses
 /// supplied on the command line.
 ///
 /// `extra_ips` are the positional, non-flag arguments each example collects
@@ -34,8 +34,8 @@ pub fn finder_with_extra_ips(ndi: &NDI, extra_ips: &[&str]) -> Result<Finder> {
         println!("Searching additional IPs/subnets:");
         for ip in extra_ips {
             println!("  - {ip}");
-            builder = builder.extra_ips(*ip);
         }
+        builder = builder.extra_ips(extra_ips.join(","));
         println!();
     }
 

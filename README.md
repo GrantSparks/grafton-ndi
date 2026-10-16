@@ -13,7 +13,7 @@ The crate is intentionally a binding layer rather than a media framework. It kee
 ## What It Covers
 
 - **Runtime lifecycle** - Initialize and tear down the process-global NDI runtime through cheap, reference-counted `NDI` handles.
-- **Network discovery** - Discover sources, wait for source-list changes, search groups or extra IP ranges, and cache host/IP lookups.
+- **Network discovery** - Discover sources, wait for source-list changes, search groups or extra IP addresses, and cache host/IP lookups.
 - **Receiving** - Capture video, audio, and metadata with configurable bandwidth and color-format choices.
 - **Sending** - Publish an NDI source and send video, audio, metadata, connection metadata, and failover information.
 - **FrameSync** - Use NDI's clock-corrected pull API for playback, render loops, and audio-device driven workflows.
@@ -75,7 +75,7 @@ Feature flags:
 
 ### Prerequisites
 
-1. **NDI SDK 6.x**: Install the [NDI SDK](https://ndi.video/type/developer/) for your platform.
+1. **NDI SDK 6.x**: Install the [NDI SDK](https://ndi.video/for-developers/ndi-sdk/) for your platform.
    - Windows default: `C:\Program Files\NDI\NDI 6 SDK`
    - Linux defaults: `/usr/share/NDI Advanced SDK for Linux` or `/usr/share/NDI SDK for Linux`
    - macOS defaults include `/Library/NDI SDK for macOS`, `/Library/NDI SDK for Apple`, and `/Library/NDI 6 SDK`
@@ -84,10 +84,11 @@ Feature flags:
 2. **Rust**: Rust 1.87 or later.
 
 3. **Build dependencies**: bindgen generates the FFI bindings at build time from
-   your installed SDK headers, so it needs an LLVM/Clang toolchain:
+   your installed SDK headers, so it needs an LLVM/Clang installation including
+   the `libclang` shared library. Set `LIBCLANG_PATH` if bindgen cannot locate it:
    - Windows: Visual Studio 2019+ or Build Tools, plus LLVM/Clang for bindgen
-   - Linux: a C toolchain and LLVM/Clang headers for bindgen
-   - macOS: Xcode Command Line Tools
+   - Linux: a C toolchain and a libclang development package for bindgen
+   - macOS: Xcode Command Line Tools and a discoverable libclang installation
 
 4. **Runtime libraries**:
    - Windows: ensure the NDI runtime DLL directory is on `PATH`
@@ -107,7 +108,7 @@ use std::time::Duration;
 let options = FinderOptions::builder()
     .show_local_sources(true)
     .groups("Public,Studio")
-    .extra_ips("192.168.1.0/24")
+    .extra_ips("192.168.1.100")
     .build();
 let finder = Finder::new(&ndi, &options)?;
 
@@ -207,7 +208,7 @@ if !audio.is_empty() {
 
 ### Monitor and Control
 
-Receivers can report connection health, frame-drop statistics, tally changes, and PTZ support.
+Receivers report connection health, frame-drop statistics, and PTZ support. Use `set_tally` to send program/preview state upstream; sender tally reports receiver state.
 
 ```rust
 use std::time::Duration;
@@ -218,13 +219,7 @@ if receiver.is_connected() {
 }
 
 if let Some(status) = receiver.poll_status_change(Duration::from_millis(100))? {
-    if let Some(tally) = status.tally {
-        println!(
-            "tally: program={}, preview={}",
-            tally.on_program,
-            tally.on_preview
-        );
-    }
+    println!("Active connections: {}", status.connections);
 }
 
 if receiver.ptz_is_supported() {
@@ -234,7 +229,7 @@ if receiver.ptz_is_supported() {
 
 ### Integrate With Async Runtimes
 
-NDI receive calls are fundamentally blocking SDK calls. The optional async wrappers make that explicit by running receive work on the runtime's blocking pool while preserving the timeout budget from the future's first poll. Both `capture` and `try_capture` subtract blocking pool queue delay before the SDK waits. Queued work can still finish after the budget expires; these wrappers do not impose a wall-clock completion deadline.
+NDI receive calls are fundamentally blocking SDK calls. The optional async wrappers make that explicit by running receive work on the runtime's blocking pool while preserving the timeout budget from the future's first poll. Both `capture` and `try_capture` include blocking-pool queue delay and reconnect-lock contention in the same deadline. Dropping a future suppresses work before its cancellation gate; a task that has passed that gate cannot be interrupted and may still consume a frame, even if it is waiting for the reconnect lock. Queued work can still finish after the budget expires; these wrappers do not impose a wall-clock completion deadline.
 
 ```rust
 use grafton_ndi::tokio::AsyncReceiver;
@@ -255,7 +250,7 @@ The crate's public API is organized around a small set of resource types:
 - `FrameSync` wraps a receiver for clock-corrected pull capture.
 - `VideoFrame`, `AudioFrame`, and `MetadataFrame` represent application-owned frame data.
 
-Most applications can start with owned frame APIs such as `receiver.video().capture()` and `sender.send_video()`. For receive hot paths, borrowed receive refs keep data in SDK buffers without an extra copy. Async `sender.send_video_async(frame)` moves an owned `VideoFrame` into the sender without copying pixels and returns the previous completed frame for reuse. This avoids Rust wrapper pixel copies; SDK encoding and network processing may still copy data. Use two frames and call `finish_video_async()` to recover the final frame. For borrowed buffers, `send_video_async_copy(&frame)` explicitly copies pixels and metadata into sender-owned storage and returns a completion token.
+Most applications can start with owned frame APIs such as `receiver.video().capture()` and `sender.send_video()`. For receive hot paths, borrowed receive refs keep data in SDK buffers without an extra copy. Async `sender.send_video_async(frame)` moves an owned `VideoFrame` into the sender without copying pixels and returns the previous completed frame for reuse. This avoids Rust wrapper pixel copies; SDK encoding and network processing may still copy data. Use two frames and call `finish_video_async()` to recover the final frame. For borrowed buffers, `send_video_async_copy(&frame)` explicitly copies pixels and metadata into sender-owned storage and returns the previous frame as `Result<Option<VideoFrame>>`; the source buffer can immediately be reused.
 
 Frame layout fields that describe SDK-facing memory are private. Builders, accessors, checked mutation methods, and `PixelFormat` helpers keep dimensions, strides, metadata, and buffer sizes consistent before data crosses the FFI boundary.
 
@@ -266,7 +261,7 @@ Frame layout fields that describe SDK-facing memory are private. Builders, acces
 - **Small FFI boundary**: generated bindings live behind safe wrappers.
 - **RAII lifecycle**: NDI handles, senders, receivers, frames, and pending async sends clean up through ownership.
 - **Checked frame descriptions**: frame dimensions, line strides, channel strides, metadata strings, and buffer sizes are validated before slices or strings are exposed.
-- **Explicit blocking behavior**: synchronous methods block with checked timeouts; async adapters use `spawn_blocking`.
+- **Explicit blocking behavior**: timeout-bearing calls validate their wait budgets; SDK sends and drains have no deadline. Async adapters run SDK work on a blocking pool.
 - **Forward-compatible SDK enums**: public SDK-mode enums that may grow are `#[non_exhaustive]`.
 
 ## Performance and Safety
@@ -278,7 +273,7 @@ Frame layout fields that describe SDK-facing memory are private. Builders, acces
 - Use lower bandwidth modes for previews and monitoring surfaces.
 - Keep image encoding off real-time paths unless the workload is sized for compression.
 
-The compile-contract tests in `tests/ui` verify the important lifetime rules around borrowed receive refs and owned async submissions and copied-send tokens.
+The compile-contract tests in `tests/ui` verify the important lifetime rules around borrowed receive refs and owned async submissions and immediate source reuse after copied sends.
 
 ## Image Encoding
 
@@ -294,7 +289,7 @@ let data_url = video.encode_data_url(ImageFormat::Png)?;
 
 ## Documentation
 
-- [API documentation](https://grantsparks.github.io/grafton-ndi/grafton_ndi/) - Full rustdoc reference, built in CI and self-hosted (the NDI SDK license prevents distributing the generated bindings docs.rs would need).
+- [API documentation](https://grantsparks.github.io/grafton-ndi/grafton_ndi/) - Full rustdoc reference, built in CI and self-hosted (the docs.rs build environment does not include the SDK installation required by this build script).
 - [Examples](examples/) - Runnable examples for discovery, receiving, FrameSync, PTZ, monitoring, and sending.
 - [CHANGELOG.md](CHANGELOG.md) - Release notes and migration guidance.
 - [Upgrade from 1.x to 2.0](docs/migration/1.x-to-2.0.md) - Breaking changes, layout corrections, and async-send performance changes.
@@ -311,7 +306,7 @@ cargo run --example NDIlib_Find
 Discovery and monitoring:
 
 - `NDIlib_Find.rs` - Discover NDI sources on the network.
-- `status_monitor.rs` - Monitor receiver connection status, tally, and frame drops.
+- `status_monitor.rs` - Monitor receiver connection status and frame drops.
 
 Receiving:
 
