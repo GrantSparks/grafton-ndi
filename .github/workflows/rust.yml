@@ -86,7 +86,7 @@ jobs:
           # Don't cache the entire target directory, just dependencies
           cache-targets: false
           # Use a shared cache key to avoid saving the same dependencies multiple times
-          shared-key: "rust-cache-${{ matrix.os }}"
+          shared-key: "rust-cache-2.0-${{ matrix.os }}"
           # Only save cache on main branch to avoid cache thrashing
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -150,6 +150,22 @@ jobs:
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+      # rust-cache v2 scans target/tests even with cache-targets disabled. Its
+      # unawaited nested cleanup reports ENOENT for trybuild's absent
+      # target/tests/target. Keep consumed, uncached outputs outside its traversal.
+      - name: Move compile-contract scratch artifacts out of the workspace
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          import shutil
+          import tempfile
+
+          scratch = Path("target/tests")
+          if scratch.exists():
+              destination = tempfile.mkdtemp(prefix="grafton-contracts-", dir=os.environ["RUNNER_TEMP"])
+              shutil.move(str(scratch), destination)
 
   android:
     name: Android (${{ matrix.target }})
@@ -226,7 +242,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
-          shared-key: "rust-cache-${{ matrix.os }}"
+          shared-key: "rust-cache-2.0-${{ matrix.os }}"
           save-if: false  # Let test-and-lint job handle saving
 
       - uses: obi1kenobi/cargo-semver-checks-action@v2
@@ -260,7 +276,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
-          shared-key: "rust-cache-ubuntu-24.04"
+          shared-key: "rust-cache-2.0-ubuntu-24.04"
           save-if: false
 
       - name: Build documentation
@@ -305,7 +321,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
-          shared-key: "rust-cache-windows-latest"
+          shared-key: "rust-cache-2.0-windows-latest"
           save-if: false  # Don't save cache in publish job
 
       - name: Authenticate with crates.io
