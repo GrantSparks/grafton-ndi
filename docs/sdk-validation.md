@@ -78,6 +78,46 @@ local cross-linking from the SDK baseline is not native execution of this
 migration. Android device execution and an actual Advanced SDK installation
 remain untested.
 
+## Final cache, snapshot, and pixel-view validation
+
+The final 2.0.0 fixes for #117–#119 add canonical cache identity, row-bounded
+image conversion, and scoped transfer of immutable video views. Their checks
+use stable Rust 1.99 on Debian 12 x86_64 with standard NDI SDK 6.3.2.0;
+library and compile-contract coverage also ran against standard SDK 6.1.1.
+
+- All-feature library tests: 269 passed, with two manual throughput comparisons
+  intentionally ignored in ordinary runs. The public compile suite contains 45
+  pass/fail cases, including owner lifetimes and both FrameSync auto traits.
+- All-feature rustdoc examples: 74 passed. Strict Clippy and rustdoc builds pass.
+- All 13 examples build with default and all features. Example tests include the
+  two PCM conversion regressions. Contributor checks also build and test each
+  independent optional-runtime configuration; PNG requires `image-encoding`.
+- The live padded-video regression resolves the advertised machine through
+  hostname case/final-dot variants, invalidates and rediscovers it, connects a
+  receiver, transfers pixel views to scoped workers, and encodes both receiver
+  and FrameSync frames before freeing them on their permitted thread.
+- The same live regression passes under Valgrind Memcheck with zero errors.
+  It observes a 2592-byte SDK stride for 642-pixel BGRA, versus 2568 active bytes.
+- Release-mode encoding comparisons cover 1080p/4K/8K, padding, pixel entropy,
+  PNG, and JPEG quality 1/85/100, with scalar and unified JPEG SIMD builds. See
+  [image encoding resources](image-encoding-performance.md) for the measured
+  conversion scratch, codec/output peak allocations, timings, and commands.
+
+The existing native desktop, Android example-link, MSRV, audit, and semver CI
+checks apply to these fixes. See the
+[final release PR](https://github.com/GrantSparks/grafton-ndi/pull/120) for their
+results. An `--all-features` standard-SDK build still does not validate an actual
+Advanced SDK installation. Android device execution and physical PTZ/camera
+behavior remain outside the local coverage.
+
+To repeat the live padding check on a configured Linux SDK installation:
+
+```bash
+cargo test --all-features --test video_padding_sdk -- --ignored --nocapture
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --tool=memcheck --track-origins=yes --error-exitcode=99" \
+  cargo test --all-features --test video_padding_sdk -- --ignored --nocapture
+```
+
 ## Installing and selecting the SDK
 
 Download installers outside the repository. The
