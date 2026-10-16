@@ -309,6 +309,8 @@ impl FrameFree for FrameSyncAudioFree {
         if instance.is_null() {
             return;
         }
+        #[cfg(test)]
+        crate::framesync::audio_test_calls::free();
         NDIlib_framesync_free_audio_v2(instance, frame);
     }
 }

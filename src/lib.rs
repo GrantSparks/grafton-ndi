@@ -186,3 +186,6 @@ pub(crate) fn to_ms_checked(d: std::time::Duration) -> Result<u32> {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod test_alloc;

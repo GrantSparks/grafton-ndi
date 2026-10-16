@@ -37,9 +37,7 @@ use grafton_ndi::{
 mod common;
 
 use std::{
-    env,
-    num::NonZeroI32,
-    thread,
+    env, thread,
     time::{Duration, Instant},
 };
 
@@ -108,11 +106,11 @@ fn main() -> Result<(), Error> {
 
     println!("Creating FrameSync for clock-corrected capture...");
     let framesync = FrameSync::new(receiver)?;
-    let audio_request = FrameSyncAudioRequest::Capture {
-        sample_rate: Some(positive_nonzero("audio sample rate", audio_sample_rate)?),
-        channels: Some(positive_nonzero("audio channels", audio_channels)?),
-        samples: positive_nonzero("audio samples", audio_samples)?,
-    };
+    let audio_request = FrameSyncAudioRequest::capture_with(
+        Some(audio_sample_rate),
+        audio_channels,
+        audio_samples,
+    )?;
 
     println!("FrameSync created successfully");
     println!("\nCapturing {frame_count} frames with FrameSync...\n");
@@ -227,14 +225,4 @@ fn main() -> Result<(), Error> {
     println!("\nExample completed successfully!");
 
     Ok(())
-}
-
-fn positive_nonzero(name: &str, value: i32) -> Result<NonZeroI32, Error> {
-    if value > 0 {
-        Ok(NonZeroI32::new(value).expect("positive values are non-zero"))
-    } else {
-        Err(Error::InvalidConfiguration(format!(
-            "{name} must be positive, got {value}"
-        )))
-    }
 }

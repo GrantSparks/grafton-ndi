@@ -211,7 +211,6 @@ println!("connected receivers: {connections}");
 
 ```rust
 use grafton_ndi::{FrameSync, FrameSyncAudioRequest, ScanType};
-use std::num::NonZeroI32;
 
 let frame_sync = FrameSync::new(receiver)?;
 
@@ -219,9 +218,8 @@ if let Some(video) = frame_sync.capture_video(ScanType::Progressive)? {
     println!("video: {}x{}", video.width(), video.height());
 }
 
-let audio = frame_sync.capture_audio(FrameSyncAudioRequest::capture(
-    NonZeroI32::new(1024).unwrap(),
-))?;
+let request = FrameSyncAudioRequest::capture_with(Some(48_000), 2, 1024)?;
+let audio = frame_sync.capture_audio(request)?;
 if !audio.is_empty() {
     println!("audio: {} channels at {} Hz", audio.num_channels(), audio.sample_rate());
 }

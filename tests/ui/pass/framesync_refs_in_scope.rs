@@ -31,7 +31,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
         let _owned = video.to_owned()?;
     }
 
-    let audio = framesync.capture_audio(FrameSyncAudioRequest::QueryInput)?;
+    let audio = framesync.capture_audio(FrameSyncAudioRequest::query_input())?;
     let _ = (
         audio.sample_rate(),
         audio.num_channels(),
