@@ -19,6 +19,12 @@ video data access are breaking API changes. See the [1.x to 2.0 migration guide]
 
 ### Breaking Changes
 
+- `FrameSyncAudioRequest` is now opaque and copyable, with fallible
+  `capture(channels, samples)` and `capture_with(sample_rate, channels, samples)`
+  constructors taking `i32` dimensions and `Option<i32>` sample rate. Explicit
+  positive output channels are required; `None` still selects the source sample
+  rate. Replace `QueryInput` with `query_input()` and raw `Capture` construction
+  with checked constructors. Query first to follow source channels (#102).
 - `Sender::send_video_async` now accepts `VideoFrame` by value and returns
   `Option<VideoFrame>`. Rename borrowed calls to `send_video_async_copy` or use
   two owned frames for allocation reuse. `AsyncVideoToken`,
@@ -89,6 +95,11 @@ video data access are breaking API changes. See the [1.x to 2.0 migration guide]
 
 ### Fixed
 
+- Reject FrameSync audio requests exceeding the 64 MiB sample payload cap or
+  the SDK's signed byte stride before native allocation/processing. Owned audio
+  and FrameSync requests share checked packed sizing. Valid requests are checked
+  once and can be reused without wrapper allocations, locks, or extra SDK queries;
+  returned descriptors and matching frees remain guarded (#102).
 - Never expose or copy uninitialized SDK video row padding through safe access,
   owned conversion, PNG/JPEG encoding, or data URLs. All supported video formats
   share checked plane offsets, strides, and active row descriptions (#100).

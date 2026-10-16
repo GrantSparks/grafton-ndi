@@ -1,0 +1,17 @@
+error[E0616]: field `sample_rate` of struct `FrameSyncAudioRequest` is private
+ --> tests/ui/fail/framesync_audio_request_mutation_private.rs:5:13
+  |
+5 |     request.sample_rate = -1;
+  |             ^^^^^^^^^^^ private field
+
+error[E0616]: field `channels` of struct `FrameSyncAudioRequest` is private
+ --> tests/ui/fail/framesync_audio_request_mutation_private.rs:6:13
+  |
+6 |     request.channels = i32::MAX;
+  |             ^^^^^^^^ private field
+
+error[E0616]: field `samples` of struct `FrameSyncAudioRequest` is private
+ --> tests/ui/fail/framesync_audio_request_mutation_private.rs:7:13
+  |
+7 |     request.samples = i32::MAX;
+  |             ^^^^^^^ private field

@@ -1,7 +1,7 @@
 #![allow(unused)]
 
 use grafton_ndi::{
-    FrameSync, FrameSyncAudioRequest, NDI, Receiver, ReceiverOptions, Source, SourceAddress,
+    FrameSync, FrameSyncAudioRequest, Receiver, ReceiverOptions, Source, SourceAddress, NDI,
 };
 
 fn receiver(ndi: &NDI) -> Receiver {
@@ -19,7 +19,7 @@ fn main() {
     let frame_ref = {
         let framesync = FrameSync::new(receiver(&ndi)).unwrap();
         framesync
-            .capture_audio(FrameSyncAudioRequest::QueryInput)
+            .capture_audio(FrameSyncAudioRequest::query_input())
             .unwrap()
     };
 

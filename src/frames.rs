@@ -2588,6 +2588,33 @@ fn validate_outbound_audio_layout(
             "Invalid sample rate: {sample_rate}"
         )));
     }
+    validate_audio_format(format.into())?;
+    let packed = validate_packed_audio_dimensions(no_channels, no_samples)?;
+
+    Ok(ValidatedAudioLayout {
+        format: Some(format),
+        sample_rate,
+        no_channels: packed.no_channels,
+        no_samples: packed.no_samples,
+        channel_stride_in_bytes: packed.channel_stride_in_bytes,
+        channel_stride_samples: packed.no_samples,
+        sample_count: packed.sample_count,
+    })
+}
+
+/// Packed FLTP dimensions shared by owned frames and FrameSync requests.
+/// Checking this layout allocates nothing on success and never allocates samples.
+pub(crate) struct PackedAudioDimensions {
+    no_channels: usize,
+    no_samples: usize,
+    channel_stride_in_bytes: i32,
+    sample_count: usize,
+}
+
+pub(crate) fn validate_packed_audio_dimensions(
+    no_channels: i32,
+    no_samples: i32,
+) -> Result<PackedAudioDimensions> {
     if no_channels <= 0 {
         return Err(Error::InvalidFrame(format!(
             "Invalid number of channels: {no_channels}"
@@ -2598,8 +2625,6 @@ fn validate_outbound_audio_layout(
             "Invalid number of samples: {no_samples}"
         )));
     }
-
-    validate_audio_format(format.into())?;
 
     let no_channels = usize::try_from(no_channels)
         .map_err(|_| Error::InvalidFrame(format!("Invalid no_channels value: {no_channels}")))?;
@@ -2643,13 +2668,10 @@ fn validate_outbound_audio_layout(
         )));
     }
 
-    Ok(ValidatedAudioLayout {
-        format: Some(format),
-        sample_rate,
+    Ok(PackedAudioDimensions {
         no_channels,
         no_samples,
         channel_stride_in_bytes,
-        channel_stride_samples: no_samples,
         sample_count,
     })
 }
@@ -3607,6 +3629,89 @@ impl<'rx> fmt::Debug for MetadataFrameRef<'rx> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn packed_audio_dimensions_match_wide_oracle_and_owned_validation() {
+        fn check(channels: i32, samples: i32) {
+            let bytes = i128::from(channels) * i128::from(samples) * 4;
+            let stride = i128::from(samples) * 4;
+            let valid = channels > 0
+                && samples > 0
+                && stride <= i128::from(i32::MAX)
+                && bytes <= MAX_AUDIO_BYTES as i128;
+            let packed = validate_packed_audio_dimensions(channels, samples);
+            let owned =
+                validate_outbound_audio_layout(48_000, channels, samples, AudioFormat::FLTP);
+            let request = crate::FrameSyncAudioRequest::capture(channels, samples);
+            assert_eq!(
+                packed.is_ok(),
+                valid,
+                "channels={channels}, samples={samples}"
+            );
+            assert_eq!(owned.is_ok(), valid);
+            assert_eq!(request.is_ok(), valid);
+            if let (Ok(packed), Ok(owned)) = (packed, owned) {
+                assert_eq!(packed.sample_count as i128 * 4, bytes);
+                assert_eq!(i128::from(packed.channel_stride_in_bytes), stride);
+                assert_eq!(packed.no_channels, owned.no_channels);
+                assert_eq!(packed.no_samples, owned.no_samples);
+                assert_eq!(
+                    packed.channel_stride_in_bytes,
+                    owned.channel_stride_in_bytes
+                );
+                assert_eq!(packed.sample_count, owned.sample_count);
+            }
+        }
+        let values = [
+            i32::MIN,
+            -1,
+            0,
+            1,
+            2,
+            3,
+            16,
+            1024,
+            8_388_608,
+            8_388_609,
+            16_777_216,
+            16_777_217,
+            i32::MAX / 4,
+            i32::MAX / 4 + 1,
+            1_073_741_825,
+            i32::MAX,
+        ];
+        for channels in values {
+            for samples in values {
+                check(channels, samples);
+            }
+        }
+        // Deterministic property coverage around the payload boundary, plus the
+        // full signed SDK input range. No sample buffers are allocated.
+        let mut seed = 102u64;
+        for _ in 0..4096 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let channels = (seed >> 32) as i32;
+            check(channels, seed as i32);
+            let channels = ((seed >> 32) % 4096 + 1) as i32;
+            let boundary = (MAX_AUDIO_BYTES / 4) as i32 / channels;
+            for samples in [boundary - 1, boundary, boundary + 1] {
+                check(channels, samples);
+            }
+        }
+        // The signed stride boundary is rejected independently of the cap.
+        let at_stride_limit = validate_packed_audio_dimensions(1, i32::MAX / 4);
+        assert!(at_stride_limit
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("maximum size"));
+        let over_stride_limit = validate_packed_audio_dimensions(1, i32::MAX / 4 + 1);
+        assert!(over_stride_limit
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("stride"));
+    }
+
     /// Compare the old full-span copy with normalized active-row copies using
     /// initialized storage. Run with `cargo test --release --lib
     /// video_padding_throughput -- --ignored --nocapture`.
@@ -3668,53 +3773,6 @@ mod tests {
         }
     }
 
-    // Thread-local accounting excludes allocations from concurrent test threads.
-    struct CountingAllocator;
-    std::thread_local! {
-        static VIDEO_ALLOCATIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-    }
-    fn record_video_allocation() {
-        let _ = VIDEO_ALLOCATIONS.try_with(|count| {
-            if let Some(n) = count.get() {
-                count.set(Some(n + 1));
-            }
-        });
-    }
-    unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
-        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-            record_video_allocation();
-            unsafe { std::alloc::System.alloc(layout) }
-        }
-        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
-            record_video_allocation();
-            unsafe { std::alloc::System.alloc_zeroed(layout) }
-        }
-        unsafe fn realloc(&self, p: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
-            record_video_allocation();
-            unsafe { std::alloc::System.realloc(p, layout, size) }
-        }
-        unsafe fn dealloc(&self, p: *mut u8, layout: std::alloc::Layout) {
-            unsafe { std::alloc::System.dealloc(p, layout) }
-        }
-    }
-    #[global_allocator]
-    static VIDEO_TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
-
-    fn video_allocation_count<T>(f: impl FnOnce() -> T) -> (T, usize) {
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                VIDEO_ALLOCATIONS.with(|count| count.set(None));
-            }
-        }
-        VIDEO_ALLOCATIONS.with(|count| count.set(Some(0)));
-        let reset = Reset;
-        let value = f();
-        let count = VIDEO_ALLOCATIONS.with(|count| count.get().unwrap());
-        drop(reset);
-        (value, count)
-    }
-
     #[test]
     fn video_padding_all_formats_expose_and_copy_only_initialized_rows() {
         use crate::capture::{FrameSyncVideoFree, Guard};
@@ -3774,10 +3832,10 @@ mod tests {
                 let make = || unsafe {
                     VideoRef::new(Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw)).unwrap()
                 };
-                let (frame, allocations) = video_allocation_count(make);
+                let (frame, allocations) = crate::test_alloc::allocation_count(make);
                 assert_eq!(allocations, 0);
                 let second = make();
-                let ((), allocations) = video_allocation_count(|| {
+                let ((), allocations) = crate::test_alloc::allocation_count(|| {
                     assert_eq!(frame.planes().len(), dimensions.len());
                     assert!(frame.plane(dimensions.len()).is_none());
                     assert_eq!(frame.data().is_some(), padding == 0);
@@ -3836,8 +3894,9 @@ mod tests {
                     p_metadata: ptr::null(),
                     ..raw
                 };
-                let (copied, allocations) =
-                    video_allocation_count(|| unsafe { VideoFrame::from_raw(&raw) }.unwrap());
+                let (copied, allocations) = crate::test_alloc::allocation_count(|| {
+                    unsafe { VideoFrame::from_raw(&raw) }.unwrap()
+                });
                 assert_eq!(allocations, 1);
                 assert_eq!(copied.data(), expected);
                 assert!(VideoFrame::builder()

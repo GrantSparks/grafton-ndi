@@ -107,6 +107,9 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo test --all-features --test async_send_lifecycle --test sender_lifecycle_stress -- --ignored
 
+      - name: Run FrameSync audio SDK regression
+        run: cargo test --all-features --test framesync_audio_requests -- --ignored --nocapture
+
       - name: Check independent feature configurations
         if: matrix.os == 'ubuntu-latest'
         run: |
