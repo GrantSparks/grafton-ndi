@@ -574,6 +574,7 @@ pub struct Receiver {
     /// SDK does not make safe — without otherwise serializing capture.
     capture_guard: RwLock<()>,
     framesync_attached: AtomicBool,
+    pending_status: AtomicBool,
 }
 
 impl Receiver {
@@ -591,6 +592,7 @@ impl Receiver {
                 source: create.source_to_connect_to.clone(),
                 capture_guard: RwLock::new(()),
                 framesync_attached: AtomicBool::new(false),
+                pending_status: AtomicBool::new(false),
             })
         }
     }
@@ -1037,11 +1039,22 @@ impl Receiver {
         };
         let timeout_ms = to_ms_checked(deadline.saturating_duration_since(Instant::now()))?;
         // SAFETY: self.instance is a valid NDI receiver instance.
-        match unsafe { capture_raw::<K>(self.instance, timeout_ms) } {
+        self.capture_result::<K>(unsafe { capture_raw::<K>(self.instance, timeout_ms) })
+    }
+
+    fn capture_result<'rx, K: CaptureKind>(
+        &'rx self,
+        result: CaptureResult<'rx, K>,
+    ) -> Result<Option<K::Ref<'rx>>> {
+        match result {
             CaptureResult::Frame(guard) => {
                 // Validation (e.g. FourCC) happens during ref construction.
                 let frame_ref = unsafe { K::make_ref(guard)? };
                 Ok(Some(frame_ref))
+            }
+            CaptureResult::StatusChanged => {
+                self.pending_status.store(true, Ordering::Release);
+                Ok(None)
             }
             CaptureResult::None => Ok(None),
             CaptureResult::Error => Err(Error::CaptureFailed("Received an error frame".into())),
@@ -1247,7 +1260,12 @@ impl Receiver {
         }
     }
 
-    /// Poll for SDK receiver status changes.
+    /// Poll for SDK receiver status changes, including notifications consumed by media capture.
+    ///
+    /// Multiple unobserved notifications can coalesce. Concurrent status pollers
+    /// compete to consume them; this is not a broadcast or event history. A pending
+    /// notification avoids waiting, but publication cannot interrupt an SDK wait
+    /// already in progress. Notifications are rechecked after lock/SDK waits.
     ///
     /// # Arguments
     ///
@@ -1266,41 +1284,58 @@ impl Receiver {
     /// or [`Error::CaptureFailed`] if the SDK reports a lost connection.
     /// The budget includes lock contention; SDK calls may overshoot it.
     pub fn poll_status_change(&self, timeout: Duration) -> Result<Option<ReceiverStatus>> {
-        to_ms_checked(timeout)?;
-        let deadline = Instant::now() + timeout;
-        let Some(_capture) = self.capture_lock_until(deadline) else {
-            return Ok(None);
-        };
-        let timeout_ms = to_ms_checked(deadline.saturating_duration_since(Instant::now()))?;
-        // SAFETY: NDI SDK documentation states that recv_capture_v3 is thread-safe
-        let frame_type = unsafe {
-            NDIlib_recv_capture_v3(
-                self.instance,
-                ptr::null_mut(), // no video
-                ptr::null_mut(), // no audio
-                ptr::null_mut(), // no metadata
-                timeout_ms,
-            )
-        };
-
-        status_from_frame(frame_type, || unsafe {
-            NDIlib_recv_get_no_connections(self.instance).max(0) as u32
+        self.poll_status_with(timeout, |deadline| {
+            let _capture = self.capture_lock_until(deadline)?;
+            let timeout_ms = to_ms_checked(deadline.saturating_duration_since(Instant::now()))
+                .expect("remaining validated timeout");
+            // SAFETY: The live receiver and shared guard exclude reconnect;
+            // null media slots request only notifications (Processing.NDI.Recv.h).
+            Some(unsafe {
+                NDIlib_recv_capture_v3(
+                    self.instance,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    timeout_ms,
+                )
+            })
         })
     }
-}
 
-fn status_from_frame(
-    frame_type: NDIlib_frame_type_e,
-    connections: impl FnOnce() -> u32,
-) -> Result<Option<ReceiverStatus>> {
-    match frame_type {
-        NDIlib_frame_type_e_NDIlib_frame_type_status_change => Ok(Some(ReceiverStatus {
-            connections: connections(),
-        })),
-        NDIlib_frame_type_e_NDIlib_frame_type_error => {
-            Err(Error::CaptureFailed("Received an error frame".into()))
+    fn take_pending_status(&self) -> Option<ReceiverStatus> {
+        // Atomic swap linearizes competing pollers with capture publication.
+        // A store after this take remains pending; no load/store pair can erase it.
+        self.pending_status
+            .swap(false, Ordering::AcqRel)
+            .then(|| self.current_status())
+    }
+
+    fn current_status(&self) -> ReceiverStatus {
+        ReceiverStatus {
+            connections: unsafe { NDIlib_recv_get_no_connections(self.instance).max(0) as u32 },
         }
-        _ => Ok(None),
+    }
+
+    fn poll_status_with(
+        &self,
+        timeout: Duration,
+        capture: impl FnOnce(Instant) -> Option<NDIlib_frame_type_e>,
+    ) -> Result<Option<ReceiverStatus>> {
+        to_ms_checked(timeout)?;
+        let deadline = Instant::now() + timeout;
+        if let Some(status) = self.take_pending_status() {
+            return Ok(Some(status));
+        }
+        match capture(deadline) {
+            Some(NDIlib_frame_type_e_NDIlib_frame_type_error) => {
+                // Errors must not consume notifications published during the wait.
+                Err(Error::CaptureFailed("Received an error frame".into()))
+            }
+            Some(NDIlib_frame_type_e_NDIlib_frame_type_status_change) => {
+                Ok(Some(self.current_status()))
+            }
+            _ => Ok(self.take_pending_status()),
+        }
     }
 }
 
@@ -1322,6 +1357,9 @@ fn status_from_frame(
 ///   1920×1080 BGRA frame it avoids ~8.3 MB of copying per frame (~475 MB/s at
 ///   60 fps). Convert to an owned frame with `to_owned` when you need to keep or
 ///   send it.
+///
+/// Media capture retains status notifications for [`Receiver::poll_status_change`],
+/// even when retries later time out.
 ///
 /// Every verb holds a shared capture guard for the duration of a single SDK
 /// call, so captures of different kinds run concurrently with each other but
@@ -1620,27 +1658,102 @@ mod tests {
     }
 
     #[test]
-    fn status_preserves_connection_errors_and_reports_connection_count() {
+    fn media_status_is_retained_coalesced_and_consumed_once() {
+        let ndi = NDI::new().unwrap();
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        fn check<K: CaptureKind>(receiver: &Receiver) {
+            let (_, allocations) = crate::test_alloc::allocation_count(|| {
+                for _ in 0..3 {
+                    assert!(receiver
+                        .capture_result::<K>(CaptureResult::StatusChanged)
+                        .unwrap()
+                        .is_none());
+                }
+                assert!(receiver
+                    .capture_result::<K>(CaptureResult::None)
+                    .unwrap()
+                    .is_none());
+                assert!(receiver
+                    .poll_status_with(Duration::ZERO, |_| panic!("pending skips SDK"))
+                    .unwrap()
+                    .is_some());
+                assert!(receiver
+                    .poll_status_with(Duration::ZERO, |_| Some(
+                        NDIlib_frame_type_e_NDIlib_frame_type_none
+                    ))
+                    .unwrap()
+                    .is_none());
+            });
+            assert_eq!(allocations, 0);
+        }
+        check::<VideoKind>(&receiver);
+        check::<AudioKind>(&receiver);
+        check::<MetadataKind>(&receiver);
+    }
+
+    #[test]
+    fn status_wait_rechecks_publication_and_preserves_it_on_errors() {
+        let ndi = NDI::new().unwrap();
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        for outcome in [None, Some(NDIlib_frame_type_e_NDIlib_frame_type_none)] {
+            assert!(receiver
+                .poll_status_with(Duration::ZERO, |_| {
+                    receiver.pending_status.store(true, Ordering::Release);
+                    outcome
+                })
+                .unwrap()
+                .is_some());
+            assert!(!receiver.pending_status.load(Ordering::Acquire));
+        }
         assert!(matches!(
-            status_from_frame(NDIlib_frame_type_e_NDIlib_frame_type_error, || panic!(
-                "must not query"
-            )),
+            receiver.poll_status_with(Duration::ZERO, |_| {
+                receiver.pending_status.store(true, Ordering::Release);
+                Some(NDIlib_frame_type_e_NDIlib_frame_type_error)
+            }),
             Err(Error::CaptureFailed(_))
         ));
-        assert!(
-            status_from_frame(NDIlib_frame_type_e_NDIlib_frame_type_none, || panic!(
-                "must not query"
+        assert!(receiver.poll_status_change(Duration::MAX).is_err());
+        assert!(receiver.pending_status.load(Ordering::Acquire));
+        assert!(receiver
+            .poll_status_change(Duration::ZERO)
+            .unwrap()
+            .is_some());
+        assert!(receiver
+            .poll_status_with(Duration::ZERO, |_| Some(
+                NDIlib_frame_type_e_NDIlib_frame_type_status_change
             ))
             .unwrap()
-            .is_none()
-        );
-        assert_eq!(
-            status_from_frame(NDIlib_frame_type_e_NDIlib_frame_type_status_change, || 1)
-                .unwrap()
-                .unwrap()
-                .connections,
-            1
-        );
+            .is_some());
+    }
+
+    #[test]
+    fn concurrent_status_pollers_take_once_and_later_publications_survive() {
+        let ndi = NDI::new().unwrap();
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        receiver.pending_status.store(true, Ordering::Release);
+        let barrier = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let receiver = &receiver;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        receiver.take_pending_status().is_some()
+                    })
+                })
+                .collect();
+            barrier.wait();
+            assert_eq!(
+                handles
+                    .into_iter()
+                    .map(|h| usize::from(h.join().unwrap()))
+                    .sum::<usize>(),
+                1
+            );
+        });
+        receiver.pending_status.store(true, Ordering::Release);
+        assert!(receiver.take_pending_status().is_some());
     }
 
     #[test]

@@ -65,6 +65,8 @@ video data access are breaking API changes. See the [1.x to 2.0 migration guide]
 
 ### Changed
 
+- Media capture retains receiver status notifications for subsequent status polling;
+  notifications coalesce and competing pollers consume them once (#110).
 - Owned standalone and video/audio metadata share one validated C-string owner.
   Repeated sends and text access reuse that storage without payload copies or
   UTF-8 rescans (#108).
