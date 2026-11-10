@@ -10,6 +10,15 @@ API, see the [README](README.md) and [2.0 migration guide](docs/migration/1.x-to
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-11-10
+
+### Fixed
+
+- Stop rebuilding grafton-ndi and dependent crates on unchanged Cargo invocations
+  by excluding the generated bindgen wrapper from build-script inputs. SDK headers
+  and `NDI_SDK_DIR` changes still trigger binding regeneration (#121).
+- Check repeated builds and test compilation in CI to catch unnecessary rebuilds.
+
 ## [2.0.0] - 2026-10-16
 
 Version 2.0.0 closes runtime, async-send ownership, and uninitialized video

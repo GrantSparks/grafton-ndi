@@ -90,6 +90,27 @@ jobs:
           # Only save cache on main branch to avoid cache thrashing
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Check unchanged builds stay fresh
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          cargo build
+          build_log=$(mktemp)
+          cargo build 2>&1 | tee "$build_log"
+          if grep -Eq '^[[:space:]]*Compiling grafton-ndi v' "$build_log"; then
+            echo "Unchanged cargo build recompiled grafton-ndi"
+            exit 1
+          fi
+
+          cargo test --no-run
+          cargo test --no-run 2>&1 | tee "$build_log"
+          if grep -Eq '^[[:space:]]*Compiling grafton-ndi v' "$build_log"; then
+            echo "Unchanged cargo test --no-run recompiled grafton-ndi"
+            exit 1
+          fi
+          rm "$build_log"
+
       - name: Run receiver status SDK regression
         run: cargo test --all-features --test receiver_status_notifications -- --ignored --nocapture
 
