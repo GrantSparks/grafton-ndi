@@ -1,110 +1,86 @@
 {
   "6.3.2-standard-android": {
-    "archive_format": "embedded-tar",
-    "artifact_id": "ndi-6.3.2-standard-android-895fe323f7329af86df5e0a8ad01f708d30362ff2771ae1179794dc1b4ed8668",
+    "version": "6.3.2",
     "edition": "standard",
     "platform": "android",
-    "sha256": "895fe323f7329af86df5e0a8ad01f708d30362ff2771ae1179794dc1b4ed8668",
-    "version": "6.3.2",
-    "version_evidence": "version-txt"
+    "size": 24060522,
+    "sha256": "895fe323f7329af86df5e0a8ad01f708d30362ff2771ae1179794dc1b4ed8668"
   },
   "6.3.2-standard-apple": {
-    "archive_format": "apple-pkg",
-    "artifact_id": "ndi-6.3.2-standard-apple-5aa101a01b00494724c60b7e1e15b5d1743bf9c68b61739c22ac54932dde95fb",
+    "version": "6.3.2",
     "edition": "standard",
     "platform": "apple",
-    "sha256": "5aa101a01b00494724c60b7e1e15b5d1743bf9c68b61739c22ac54932dde95fb",
-    "version": "6.3.2",
-    "version_evidence": "version-txt"
+    "size": 225463783,
+    "sha256": "5aa101a01b00494724c60b7e1e15b5d1743bf9c68b61739c22ac54932dde95fb"
   },
   "6.3.2-standard-linux": {
-    "archive_format": "embedded-tar",
-    "artifact_id": "ndi-6.3.2-standard-linux-f0314f245446defc488b63ceb4689acf1a965aeefdadacb70571bb216a8cc183",
+    "version": "6.3.2",
     "edition": "standard",
     "platform": "linux",
-    "sha256": "f0314f245446defc488b63ceb4689acf1a965aeefdadacb70571bb216a8cc183",
-    "version": "6.3.2",
-    "version_evidence": "version-txt"
+    "size": 61792217,
+    "sha256": "f0314f245446defc488b63ceb4689acf1a965aeefdadacb70571bb216a8cc183"
   },
   "6.3.2-standard-windows": {
-    "archive_format": "windows-installer",
-    "artifact_id": "ndi-6.3.2-standard-windows-4d5dd36a1c7c7634f408bf459b068787cce6f5310a3efe832d76b1ddeb54e499",
+    "version": "6.3.2",
     "edition": "standard",
     "platform": "windows",
-    "sha256": "4d5dd36a1c7c7634f408bf459b068787cce6f5310a3efe832d76b1ddeb54e499",
-    "version": "6.3.2",
-    "version_evidence": "archive-sha256"
+    "size": 41608832,
+    "sha256": "4d5dd36a1c7c7634f408bf459b068787cce6f5310a3efe832d76b1ddeb54e499"
   },
   "current-advanced-android": {
-    "archive_format": "embedded-tar",
-    "artifact_id": "ndi-6.4.0.2-advanced-android-47a88d29495ade40e5afdd3eb931ecbbe808f7a92efafc286ac55d4ec6be9cb6",
+    "version": "6.4.0.2",
     "edition": "advanced",
     "platform": "android",
-    "sha256": "47a88d29495ade40e5afdd3eb931ecbbe808f7a92efafc286ac55d4ec6be9cb6",
-    "version": "6.4.0.2",
-    "version_evidence": "version-txt"
+    "size": 111136785,
+    "sha256": "47a88d29495ade40e5afdd3eb931ecbbe808f7a92efafc286ac55d4ec6be9cb6"
   },
   "current-advanced-apple": {
-    "archive_format": "apple-pkg",
-    "artifact_id": "ndi-6.4.0.2-advanced-apple-9d84269501b101b734794c7584130e9db744da3b0927dd87948134d842cf5a21",
+    "version": "6.4.0.2",
     "edition": "advanced",
     "platform": "apple",
-    "sha256": "9d84269501b101b734794c7584130e9db744da3b0927dd87948134d842cf5a21",
-    "version": "6.4.0.2",
-    "version_evidence": "version-txt"
+    "size": 548170331,
+    "sha256": "9d84269501b101b734794c7584130e9db744da3b0927dd87948134d842cf5a21"
   },
   "current-advanced-linux": {
-    "archive_format": "embedded-tar",
-    "artifact_id": "ndi-6.4.0.2-advanced-linux-5f2ee43a5a4d91b0367c25a26c1b85c547d2635e0ac2243faa312b06b1f6278d",
+    "version": "6.4.0.2",
     "edition": "advanced",
     "platform": "linux",
-    "sha256": "5f2ee43a5a4d91b0367c25a26c1b85c547d2635e0ac2243faa312b06b1f6278d",
-    "version": "6.4.0.2",
-    "version_evidence": "version-txt"
+    "size": 421322095,
+    "sha256": "5f2ee43a5a4d91b0367c25a26c1b85c547d2635e0ac2243faa312b06b1f6278d"
   },
   "current-advanced-windows": {
-    "archive_format": "windows-installer",
-    "artifact_id": "ndi-6.4.0.2-advanced-windows-3630a0e28e4cb77933a151e5087dd4b6567e0f502bebcf6202ea9e8c6f7ae256",
+    "version": "6.4.0.2",
     "edition": "advanced",
     "platform": "windows",
-    "sha256": "3630a0e28e4cb77933a151e5087dd4b6567e0f502bebcf6202ea9e8c6f7ae256",
-    "version": "6.4.0.2",
-    "version_evidence": "archive-sha256"
+    "size": 149624072,
+    "sha256": "3630a0e28e4cb77933a151e5087dd4b6567e0f502bebcf6202ea9e8c6f7ae256"
   },
   "current-standard-android": {
-    "archive_format": "embedded-tar",
-    "artifact_id": "ndi-6.4.0.2-standard-android-795705638ef7730f09759dd53c61f57dbf8da57b6446994bd205626a227401cd",
+    "version": "6.4.0.2",
     "edition": "standard",
     "platform": "android",
-    "sha256": "795705638ef7730f09759dd53c61f57dbf8da57b6446994bd205626a227401cd",
-    "version": "6.4.0.2",
-    "version_evidence": "version-txt"
+    "size": 26499422,
+    "sha256": "795705638ef7730f09759dd53c61f57dbf8da57b6446994bd205626a227401cd"
   },
   "current-standard-apple": {
-    "archive_format": "apple-pkg",
-    "artifact_id": "ndi-6.4.0.2-standard-apple-ce161a7cbe0b80b1a936ea93d6139df6ea4fbd4ea28d6bf8309da1efd31d0367",
+    "version": "6.4.0.2",
     "edition": "standard",
     "platform": "apple",
-    "sha256": "ce161a7cbe0b80b1a936ea93d6139df6ea4fbd4ea28d6bf8309da1efd31d0367",
-    "version": "6.4.0.2",
-    "version_evidence": "version-txt"
+    "size": 468856607,
+    "sha256": "ce161a7cbe0b80b1a936ea93d6139df6ea4fbd4ea28d6bf8309da1efd31d0367"
   },
   "current-standard-linux": {
-    "archive_format": "embedded-tar",
-    "artifact_id": "ndi-6.4.0.2-standard-linux-d464f4ebb201366fd3bc283e374335fb5ae296d4336f4ce6006aba14e6b6df84",
+    "version": "6.4.0.2",
     "edition": "standard",
     "platform": "linux",
-    "sha256": "d464f4ebb201366fd3bc283e374335fb5ae296d4336f4ce6006aba14e6b6df84",
-    "version": "6.4.0.2",
-    "version_evidence": "version-txt"
+    "size": 67364407,
+    "sha256": "d464f4ebb201366fd3bc283e374335fb5ae296d4336f4ce6006aba14e6b6df84"
   },
   "current-standard-windows": {
-    "archive_format": "windows-installer",
-    "artifact_id": "ndi-6.4.0.2-standard-windows-b281644a0666bd0ddf066935574ce7904ed370a367eb03dab80a1f1b82391c0b",
+    "version": "6.4.0.2",
     "edition": "standard",
     "platform": "windows",
-    "sha256": "b281644a0666bd0ddf066935574ce7904ed370a367eb03dab80a1f1b82391c0b",
-    "version": "6.4.0.2",
-    "version_evidence": "archive-sha256"
+    "size": 43395912,
+    "sha256": "b281644a0666bd0ddf066935574ce7904ed370a367eb03dab80a1f1b82391c0b"
   }
 }

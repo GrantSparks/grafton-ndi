@@ -1,0 +1,3 @@
+# Workflows, the release path and CI scripts change only with the owner's review.
+/.github/ @GrantSparks
+/ci/ @GrantSparks

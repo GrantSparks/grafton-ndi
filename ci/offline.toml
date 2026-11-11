@@ -1,0 +1,20 @@
+# Cargo configuration for jobs that run tests against a real NDI runtime:
+#
+#   cargo test --config ci/offline.toml --all-features
+#
+# Every test executable is started through a wrapper that leaves it loopback
+# networking only, so SDK senders and finders created by tests never announce
+# on, or connect to, the network the machine is attached to.
+#
+# Relative runner paths resolve against the repository root, and the Windows
+# script path is an argument, resolved against the package root that Cargo
+# uses as each test's working directory.
+
+[target.'cfg(target_os = "linux")']
+runner = ["ci/offline/linux.sh"]
+
+[target.'cfg(target_os = "macos")']
+runner = ["ci/offline/macos.sh"]
+
+[target.'cfg(windows)']
+runner = ["pwsh", "-NoProfile", "-File", "ci/offline/windows.ps1"]

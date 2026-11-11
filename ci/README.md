@@ -1,438 +1,278 @@
-# Hosted SDK validation
+# Continuous integration
 
-All validation jobs use GitHub-hosted runners. Set the repository variable
-`NDI_CI_RELEASED=true` to enable SDK jobs in a trusted repository context.
-SDK archives, private source locators, credentials and restricted generated
-bindings stay private; jobs share only bounded result records and the public
-inputs described below. Pages deployment and crate publication have separate
-[publication gates](#publication-gates).
+Two workflows: [`rust.yml`](../.github/workflows/rust.yml) checks every push to
+`main` and every pull request, and [`publish.yml`](../.github/workflows/publish.yml)
+releases a version tag. Everything here is plain YAML, a few shell scripts and
+standard-library Python, tested by `python -m unittest discover -s ci/tests`.
 
-This guide defines CI operation and required coverage. Completed checks and their
-limits belong in the [SDK validation record](../docs/sdk-validation.md).
+The crate builds without an NDI SDK, so most of CI needs no secrets. Only the
+`sdk` job downloads the vendor's SDK packages, to run the tests against real
+runtimes.
 
-`build_profiles.tsv` describes the exact vendor artifact selections. `plan.py`
-joins those profiles with execution policy. `batch.py` executes a runner group,
-and `run.py` executes one check locally or on its declared hosted runner.
-`aggregate.py` requires every planned result for
-the same clean commit/tree, suite fingerprint, dependency lockfile, SDK archives
-and cross-toolchain package recipes. Missing, skipped, cancelled, stale or duplicate
-results fail. Local extracted-SDK overrides are useful for development but cannot
-satisfy the hosted release gate.
+## Jobs in `rust.yml`
 
-The required plan has **52 checks in 16 SDK runner jobs**, covering 20 supported
-profiles. Each check keeps its own SDK identity, compiler, coverage and result record;
-grouping related checks shares setup without turning several checks into one pass.
-Current Standard and Advanced artifacts for every supported profile receive
-independent C/Rust ABI checks and a final vendor link or application package.
-`SUPPORTED_PROFILES` in `plan.py` declares the supported set. The other 19 retained
-vendor profiles are unsupported candidates; archive presence alone does not add
-platform support.
+| Job | Runs for | What it checks |
+|---|---|---|
+| `lint` | every event | CI script tests, shellcheck, actionlint, rustfmt, clippy (`-D warnings`) for the workspace with all features and for the crate with no features and with each of `image-encoding`, `tokio`, `smol`, `advanced`, `file-io`, `advanced,file-io`; the bindings generator's tests; rustdoc (`-D warnings`); `cargo check` on Rust 1.88; `cargo package`; `cargo audit` |
+| `test` | every event | `cargo test` with all features and with default features on Linux, macOS and Windows. No NDI runtime is installed, so tests that need one print `skipped: <test> needs …` |
+| `cross` | every event | clippy (`-D warnings`, all features, all targets) for every dynamically loaded target: Linux aarch64, armv7 and i686; Android aarch64, armv7, i686 and x86_64; Windows x86_64 and i686; macOS aarch64 and x86_64. Then an Android link of the examples with the runner's NDK ([`scripts/build-android.sh`](../scripts/build-android.sh)) |
+| `sdk` | events that can read the secrets | the tests against real runtimes; see below |
+| `required-ci` | every event, `if: always()` | passes only if every job the event requires succeeded ([`gate.py`](gate.py)) |
 
-Full native suites run on Linux x64, Windows x64 and macOS ARM64, in both SDK
-editions. The same three representatives exercise Standard compatibility in both
-directions: baseline headers with the current runtime, and current headers with
-the baseline runtime. Linux x64 checks the minimum Rust version and optional
-features against baseline and current SDKs, plus public API compatibility. One
-Android ARM64 baseline check covers its minimum Rust toolchain. This samples the
-distinct loader, ABI and packaging families without repeating every SDK/toolchain
-combination on every architecture.
+`required-ci` is the one check branch protection should require. For pushes,
+manual runs, releases and pull requests from this repository, every job must
+succeed, and a skipped `sdk` job is a failure. A pull request from a fork cannot
+read the secrets: there the `sdk` job is skipped and the gate passes on `lint`,
+`test` and `cross`.
 
-| Required job groups | Jobs | Checks |
-| --- | ---: | ---: |
-| Native Linux x64, Windows x64 and macOS ARM64, Standard and Advanced | 6 | 6 |
-| Additional Linux, Windows, Apple and Android profile families, including Android MSRV | 6 | 35 |
-| Standard header/runtime compatibility on the three native representatives | 3 | 6 |
-| Linux MSRV, optional features and public API compatibility | 1 | 5 |
-| **Total** | **16** | **52** |
+A new push to a pull request cancels its running check. Runs for `main`, manual
+runs and releases are never cancelled. Every job has a timeout, the default
+token permission is `contents: read`, and every action is pinned to a commit.
 
-The default `required` scope gates pull requests and publication. An explicit
-`extended` scope retains the broader 82-check audit for SDK upgrades or targeted
-investigation. It is available on demand and does not replace the required release
-record. Select the `scope` input when manually dispatching **Rust CI** to run an
-extended audit. Neither scope removes checks when dependencies are missing or
-tests fail.
+## The `sdk` job
 
-Dynamic targets also link a C smoke program against the selected vendor library;
-compiling the Rust runtime loader alone does not exercise that link interface.
-Apple device/simulator checks link the real static archive through Cargo. Current
-headers additionally require independent production Discovery and File ABI probes.
+The job runs once per row of this matrix. The table is checked against the
+workflow by the script tests.
 
-## Coverage and qualification
+| Row | Runner | Target | Package | Promise, all features | Promise, no default features | Also runs |
+|---|---|---|---|---|---|---|
+| linux-x64 standard-6.3.2 | ubuntu-24.04 | x86_64-unknown-linux-gnu | 6.3.2-standard-linux | `1` | `1` | semver check |
+| linux-x64 standard-6.4 | ubuntu-24.04 | x86_64-unknown-linux-gnu | current-standard-linux | `1,discovery-server` | `1,discovery-server` | vendored bindings check |
+| linux-x64 advanced-6.4 | ubuntu-24.04 | x86_64-unknown-linux-gnu | current-advanced-linux | `advanced,file,discovery-server` | `1,discovery-server` | Advanced lint |
+| linux-x86 standard-6.4 | ubuntu-24.04 | i686-unknown-linux-gnu | current-standard-linux | `1,discovery-server` | `1,discovery-server` | |
+| linux-arm64 standard-6.4 | ubuntu-24.04-arm | aarch64-unknown-linux-gnu | current-standard-linux | `1,discovery-server` | `1,discovery-server` | |
+| windows-x64 standard-6.3.2 | windows-2025 | x86_64-pc-windows-msvc | 6.3.2-standard-windows | `1` | `1` | |
+| windows-x64 standard-6.4 | windows-2025 | x86_64-pc-windows-msvc | current-standard-windows | `1,file` | `1` | |
+| windows-x64 advanced-6.4 | windows-2025 | x86_64-pc-windows-msvc | current-advanced-windows | `advanced,file` | `1` | Advanced lint |
+| windows-x86 advanced-6.4 | windows-2025 | i686-pc-windows-msvc | current-advanced-windows | `advanced` | `1` | Advanced lint |
+| macos-arm64 standard-6.3.2 | macos-15 | aarch64-apple-darwin | 6.3.2-standard-apple | `1` | `1` | |
+| macos-arm64 standard-6.4 | macos-15 | aarch64-apple-darwin | current-standard-apple | `1` | `1` | Apple mobile builds |
+| macos-arm64 advanced-6.4 | macos-15 | aarch64-apple-darwin | current-advanced-apple | `advanced,file` | `1` | Advanced lint, Apple mobile builds |
+| macos-x64 standard-6.4 | macos-15-intel | x86_64-apple-darwin | current-standard-apple | `1` | `1` | |
 
-A successful `abi-link` cell is **not** native, simulator or emulated execution.
-Mobile cells first build the library with all features and prove its target ABI,
-then link the real application described below. Desktop CLI examples are built
-by the other cells; their `ctrlc`/`nix` process dependency requires APIs absent on
-tvOS and is not part of the library's mobile interface. No library features or
-required mobile package/runtime checks are omitted by this distinction.
-`mobile.py` packages real Rust JNI Android APKs for all four ABIs and checks
-signing/ZIP alignment. The required plan executes the Standard x64/API35 emulator
-as its Android runtime representative. Apple profiles link UIKit app bundles;
-the Standard Intel tvOS check boots, installs and runs on a matching simulator.
-Those runtime checks initialize the selected provider, send a synthetic frame and
-destroy the sender. Other mobile checks require package/link coverage and do not
-claim execution. The extended audit also runs the other declared emulator and
-simulator combinations.
-These fixed 16×16 synthetic-frame smoke tests run on disposable hosted virtual
-devices. They do not use the desktop confinement executor or prove that off-host
-networking is blocked. They establish the declared lifecycle/runtime behavior,
-not private-LAN isolation or physical-device networking behavior.
+Each row:
 
-Emulator page size and OS image identity are recorded; a 4KiB emulator pass is not
-a 16KiB runtime pass. Device profiles require package/link coverage without
-claiming device execution. QEMU execution is not implemented or claimed.
+1. installs what the row needs beyond the runner image: `bubblewrap`,
+   `libavahi-client3` and `libclang-dev` on Linux (plus the i386 linker and
+   libraries for the x86 row), LLVM on Windows;
+2. provisions the package with [`sdk.py`](sdk.py), which exports `NDI_SDK_DIR`
+   and `NDI_RUNTIME_DIR_V6` to the following steps. This is the only step that
+   sees the secrets;
+3. proves that the test runner isolates ([`offline/check.py`](offline/check.py)
+   outside and inside it);
+4. runs `cargo test --locked --config ci/offline.toml --target <target>` twice,
+   with `--all-features` and with `--no-default-features`;
+5. runs the row's extra steps:
+   - **vendored bindings check**: `cargo xtask bindgen --check --sdk "$NDI_SDK_DIR"`;
+   - **semver check**: `cargo semver-checks` against the last published release,
+     with no release-type override and no lint configuration. It lives in an
+     SDK row because the published baseline needs an installed SDK to build;
+   - **Advanced lint**: clippy (`-D warnings`) with all features, with
+     `advanced` and with `advanced,file-io`, and rustdoc (`-D warnings`).
+     Without the Advanced headers the `advanced` feature compiles to stubs, so
+     these rows are the only place the real implementation is linted;
+   - **Apple mobile builds**: [`apple-mobile.sh`](apple-mobile.sh) builds the
+     library for iOS, tvOS and visionOS, the statically linked targets that
+     need the SDK at build time.
 
-Every native and compatibility cell runs the 39 registered core SDK tests across
-six executables under confinement. The two feature cells run the same core tests
-for each of the nine existing feature selections, preserving `--no-default-features`
-and the exact selected features. Reports bind every execution to its feature
-selection; an all-features result cannot replace a smaller configuration. This
-adds execution coverage within the existing 16 jobs and 52 checks.
-The source inventory is [`core_tests.py`](core_tests.py). The native helper accepts
-`--mode core --feature-set all` for the normal all-features configuration, or
-`--feature-set 0` through `8` for the ordered `FEATURE_SETS` in
-[`common.py`](common.py). Adding an SDK-dependent test requires updating that
-registry and marking it for confined execution.
+The job uses no dependency cache and uploads nothing, so SDK files and the
+Advanced bindings generated into the target directory never leave the runner.
 
-SDK-dependent tests are explicitly ignored by ordinary `cargo test` and selected
-by the core registry. The core runner checks the complete compiled ignored-test
-inventory, accounting for known manual benchmarks, manual diagnostics and
-feature/platform-specific File tests without executing those as core tests.
-The non-Windows DLL diagnostic retains its existing no-op behavior; it is not
-evidence of a Windows DLL load. Pure tests and runnable doctests remain in ordinary
-Cargo execution, while examples that initialize SDK resources are `no_run`.
-Trybuild success fixtures check resource APIs in uncalled functions.
-CI points ordinary Cargo test commands at a fresh empty runtime directory. The
-default loader cannot fall back to the installed SDK, preventing accidental
-default-runtime loads. This is a loader guard, not an OS sandbox. Explicit fake-library loader
-fixtures still select their own modules. Native suites and runtime probes retain
-the exact selected real runtime.
+### What a row promises
 
-Advanced native cells require actual constructor/control/queue/allocator tests.
-File-capable native cells require probe/player, async owner and record/finalize
-roundtrips. Standard POSIX native checks run explicit rejection tests; the
-extended Windows x86 native checks verify platform rejection too. Each ignored
-test runs in a separate process and must report exactly one executed pass.
-Linux uses a network namespace; Windows uses process firewall rules. macOS uses
-the `macos-pf-offline` executor described below. The aggregate checks the exact
-core and Advanced/File mode reports as well as the main regression report; an exit code
-alone does not replace the required executed-test records.
+A test that needs native code runs where that code is available and prints a
+skip elsewhere. `GRAFTON_NDI_REQUIRE_RUNTIME` lists what the environment
+provides, which turns the matching skips into failures, so a provisioning
+mistake cannot pass as a skip:
 
-Native media regressions require ten tests across five suites on Linux and nine
-tests across four suites on macOS and Windows. The live padded-video regression
-is Linux-only: it checks Linux SDK output padding and supports Memcheck reads
-through `/dev/null`. Each platform checks its exact compiled ignored-test
-inventory before execution; unavailable, extra, skipped or duplicate tests fail
-the gate rather than counting as passes. `run.py` captures native helper failures
-privately and exports only bounded diagnostic summaries. Direct `native.py`
-output can contain SDK diagnostics and must remain private.
+| Entry | The row provides | A build can check it when |
+|---|---|---|
+| `1` | an NDI runtime (implied by every other entry) | always |
+| `advanced` | an Advanced runtime, compiled with its headers | the `advanced` feature is on |
+| `file` | a File library the selected runtime can drive: an Advanced runtime on Linux and macOS, any 6.4 runtime on 64-bit Windows | the `file-io` feature is on |
+| `discovery-server` | the SDK's Discovery Server program and a 6.4 runtime, whose advertisers and listeners can use it | the target is Linux |
 
-On disposable GitHub-hosted macOS runners, an independent root guardian briefly
-replaces the reviewed initial PF rules with a loopback-only, no-state policy for
-the whole VM. It verifies the installed rules, interface filtering and cleared
-states, then proves that established and fresh external IPv4 connections are
-blocked. IPv4/IPv6 loopback TCP/UDP and anonymous socket pairs must work. An
-external IPv6 canary is explicitly not claimed. Only then does the unprivileged
-worker execute the selected test under its process sandbox. The SDK worker has a
-30-second limit and the offline window has a 45-second ceiling; successful tests
-restore connectivity as soon as the checks complete.
+A promise that no test in a build can check is itself a failure, and a missing
+one lets a test skip, so each step promises exactly what its build can check:
+the all-features step everything the row's package provides, the
+no-default-features step only `1` and, on Linux with a 6.4 package,
+`discovery-server`. The script tests hold every row to this rule.
 
-Before restoring connectivity, the guardian must reap the SDK worker, canary and
-local commands. It restores the exact original filter, releases its own PF
-reference, checks the original disabled state, and verifies a fresh HTTPS
-connection. A short online interval separates windows. Failure to establish the
-boundary, stop the processes or restore the host fails the check, even if the SDK
-test itself passed. Unreviewed initial PF state and non-hosted machines are
-rejected; this helper is not a general local-machine firewall tool.
+## SDK packages
 
-Each macOS test, ignored-test listing and fixed runtime-identity probe exports a
-closed receipt binding its operation and executable hash to the boundary,
-loopback, cleanup, restoration and recovery checks. The aggregate requires those
-receipts for native and compatibility runtime probes and every applicable native
-SDK suite, including negative File tests. Global drop counters establish boundary
-activity; they do not identify SDK packets. Raw PF state, host addresses, source
-paths and SDK output remain in private scratch. Only bounded receipts and log
-hashes enter result artifacts. Runtime identity exports only four numeric version
-components, the selected edition and its verification flag; missing, duplicate or
-malformed probe markers fail validation. Runtime probes use the same platform
-confinement as the native SDK tests. Compilation, pure unit tests and pure runnable
-doctests retain their ordinary execution environment.
+[`sdk-packages.json`](sdk-packages.json) pins each SDK package by size and
+SHA-256. [`sdk.py`](sdk.py) installs one:
 
-After a native test failure, fixed socket diagnostics may run through the same
-executor. They cannot turn the original failure into a pass or substitute for
-the required native test evidence.
+```sh
+python ci/sdk.py list
+python ci/sdk.py install current-standard-linux --dest ~/ndi/standard-6.4 \
+    --archive ~/Downloads/Install_NDI_SDK_v6_Linux.tar.gz --target x86_64-unknown-linux-gnu
+```
 
-Physical codec, SoC and peripheral qualification is a separate manual private-LAN
-activity; it does not require a private GitHub runner. An unavailable SDK slice or
-Rust target is not converted into a successful skipped row.
+It checks the archive against the pin before opening it, unpacks it without
+running the vendor's installer script (the Windows installer is the exception:
+it is the package), and prints the `NDI_SDK_DIR` and `NDI_RUNTIME_DIR_V6` values
+that select the installation. Apple packages unpack on macOS only and Windows
+packages on Windows only.
 
-The declared Apple profiles cover supplied usable device/x86 simulator slices.
-No arm64 simulator slice is supplied, and the vendor x86 visionOS slice lacks a
-built-in Rust target. Those intersections are unavailable. Intel tvOS requires
-a qualified dated nightly with `build-std`; ARM64 tvOS/visionOS use Rust 1.98.0
-independently of the Rust 1.88 baseline.
-The four selected ARMv7 GNU Linux profiles use a reviewed public cross compiler
-and glibc 2.36 sysroot recipe. They prove ABI and linking only; they do not
-establish the oldest supported glibc or physical Raspberry Pi generation. The
-`rpi1` vendor artifact is ARMv7, so its directory name does not establish ARMv6
-hardware compatibility.
-
-The SDK matrix covers **6.3.2 Standard plus current 6.4 Standard and Advanced**.
-`COMPATIBILITY_BASELINES` declares this policy explicitly; catalog availability
-never shrinks the matrix. The catalog contains 12 complete platform bundles.
-The library's compatibility target is NDI 6.x; this matrix does not provide
-validation for SDKs 6.0 and 6.1.1.
-
-Required target toolchains come from public distribution repositories or the
-Rust/Xcode/Android SDK channels. SDK acquisition uses the private source and
-credential configuration described below. Every required artifact and toolchain
-must be available; missing inputs fail the release gate. Changes to vendor archive
-bytes require reviewed catalog digests. Aggregate acceptance requires every check
-in the selected, reviewed scope and all 12 exact package receipts. Policy tests and workflow syntax checks alone cannot
-satisfy it.
-
-| Selected profiles | Required hosted coverage |
-| --- | --- |
-| Linux x64; Windows x64; macOS ARM64 | Standard/Advanced native suites, ABI and vendor link; Standard compatibility in both header/runtime directions |
-| Linux x86/ARM64; Windows x86; macOS Intel | Standard/Advanced C/Rust ABI and final vendor link; no required native execution |
-| `arm-rpi1`/`arm-rpi2`/`arm-rpi3`/`arm-rpi4` GNU hard-float artifacts | Standard/Advanced C/Rust ABI and vendor executable link using public GNU tools |
-| Android ARM64/ARMv7/x86/x64 | Standard/Advanced APK packaging and ABI/link; Standard x64 emulator execution; Standard ARM64 baseline MSRV |
-| iOS ARM64 and x64 simulator | Standard/Advanced package/link; no required simulator execution |
-| tvOS ARM64 and x64 simulator | Standard/Advanced package/link; Standard x64 simulator execution |
-| visionOS ARM64 | Standard/Advanced device package/link |
-
-The Linux quality group runs Rust 1.88 and optional-feature checks with Standard
-6.3.2 and current SDKs. Public API compatibility is checked on Linux x64. The
-required plan does not claim an MSRV or runtime result for every target; additional
-native architectures and broader compiler/SDK permutations are in the extended
-audit. Physical devices require their own qualification.
-
-The unsupported candidates are the seven AArch64 HiMix/Mix/NewTek/Rockchip
-profiles and twelve ARM HiMix/HiSilicon/HiSTB/NewTek/Rockchip/SigmaStar profiles
-listed explicitly in `UNSUPPORTED_PROFILES`. They need a separately reviewed,
-obtainable and qualified compiler/sysroot before promotion. No proprietary BSP
-secrets are required for the selected release. A newly discovered artifact also
-fails policy review until it is explicitly classified; support never follows
-archive presence automatically.
-
-## Artifact sources and availability
-
-`ci/sdk-packages.json` is the shared authority for GitHub CI and the development
-store. Package IDs such as `current-standard-linux` are selection aliases. Each
-resolved package has an immutable `artifact_id` containing version, edition,
-platform and the complete archive SHA256. Known digests cannot be overridden by
-environment variables. Adding a future retained version requires an explicit
-catalog and validation-policy update; local archive availability cannot add or
-remove a supported validation row.
-
-Use a private schema1 source map outside either checkout. Local development can
-select an existing archive; GitHub CI can select a private release asset:
+Without `--archive`, the package comes from the source map in
+`NDI_SDK_SOURCES_JSON`:
 
 ```json
-{
-  "schema": 1,
-  "packages": {
-    "current-standard-linux": {
-      "archive": "/private/sdk-downloads/vendor-installer.tar.gz"
-    },
-    "current-advanced-linux": {
-      "github_release_asset": {
-        "repo": "OWNER/PRIVATE_REPOSITORY",
-        "asset_id": 123456,
-        "token_env": "NDI_SDK_ARCHIVE_TOKEN"
-      }
-    }
-  }
-}
+{"schema": 1, "packages": {"current-standard-linux": {"github_release_asset": {"repo": "owner/private-store", "asset_id": 1}}}}
 ```
 
-An entry can instead contain `{"url_env":"PRIVATE_SDK_URL"}` for a permitted
-HTTPS endpoint. It selects exactly one source. Never put raw tokens in a map, or
-commit a private map, SDK archive, receipt inventory or extracted SDK. Alias and
-immutable-artifact source entries cannot both select the same package.
+An entry is one of `github_release_asset` (read with the token in
+`NDI_SDK_ARCHIVE_TOKEN`, or in the variable named by `token_env`), `url_env`
+(the name of a variable holding an HTTPS URL) or `archive` (an absolute local
+path). The token is sent to `api.github.com` only, a transient HTTP failure is
+retried twice, and script output never includes a source location.
 
-For hosted jobs, configure two separate repository secrets:
+## Loopback-only test runs
 
-- `NDI_SDK_SOURCES_JSON` is a **credential-free locator manifest** containing
-  repository names, release asset IDs, or environment-variable names. Keep it
-  secret because it identifies private artifacts and storage locations. It
-  contains no authentication token and does not grant access by itself.
-- `NDI_SDK_ARCHIVE_TOKEN` is the **authentication credential**: a fine-grained PAT
-  restricted to the private archive repository with Contents: read. It is never
-  included in the locator manifest, retained archives or SDK store receipts.
+Tests against a real runtime create NDI senders and finders. `ci/offline.toml`
+makes Cargo start every test executable through a wrapper in
+[`offline/`](offline) that leaves it loopback networking only, so nothing is
+announced on, or reached over, the network the machine is attached to.
 
-Store the source manifest as compact, single-line JSON. GitHub masks individual
-lines of multiline secrets; a line containing only a JSON brace can obscure
-unrelated output. Matrix generation runs in a separate job without acquisition
-secrets, followed by a credentialed source check against the same frozen plan.
-Only that verified plan can start the grouped acquisition and validation jobs.
+| | Linux ([`linux.sh`](offline/linux.sh)) | macOS ([`macos.sh`](offline/macos.sh)) | Windows ([`windows.ps1`](offline/windows.ps1)) |
+|---|---|---|---|
+| Network | own network namespace (`bwrap --unshare-net`) holding only `lo` | Seatbelt profile allowing only binding, loopback connections and traffic arriving on a local address | Defender Firewall block rules for the test executable, both directions; the firewall never filters loopback |
+| Host daemons | `/run` replaced by an empty tmpfs: no D-Bus, no Avahi | mDNSResponder socket denied; the SDK is given a loopback discovery address through `NDI_CONFIG_DIR` | untouched |
+| Machine's own name | resolves to `127.0.0.1` through a private `/etc/hosts` | cannot be relied on to resolve | resolves as usual |
+| `TMPDIR` | private tmpfs (`/run/tmp`) | private directory, removed afterwards | untouched |
+| Needs | `bubblewrap`, unprivileged user namespaces | nothing | an elevated shell |
 
-GitHub requires Contents: read for release
-asset downloads; metadata access permits checking that the exact configured
-repository remains private. The configured workflow uses that narrowly scoped
-PAT. Do not duplicate a broad development/write credential.
-The provisioner authenticates only to `api.github.com`, requests octet-stream
-content, strips Authorization/Cookie on every redirect, requires HTTPS throughout,
-and verifies the archive hash. Private repository names, asset IDs and token
-values are not exported in result receipts. See the official
-[release asset API](https://docs.github.com/en/rest/releases/assets#get-a-release-asset).
+Two of these exist because of how the SDK behaves:
 
-Package sources can also use `NDI_SDK_<PACKAGE>_URL` secrets. Punctuation becomes
-underscores and letters become uppercase, for example
-`NDI_SDK_CURRENT_STANDARD_LINUX_URL`. Do not configure that URL and a source-map
-entry for the same package. All active package hashes are pinned in the catalog;
-`NDI_SDK_<PACKAGE>_SHA256` overrides cannot replace a reviewed catalog identity.
+- **The machine's own name.** A sender advertises itself as `<host name>
+  (<sender name>)`, and looking a source up by host name asks the SDK to resolve
+  that name. Only loopback exists in the namespace, so the name has to resolve
+  to `127.0.0.1`: with the machine's usual address, or with no answer, the
+  lookup fails with `NoSourcesFound { criteria: "host: …" }`. The wrapper
+  therefore binds a private `/etc/hosts` that maps the name, and the name with
+  a trailing dot, to loopback. One test depends on this,
+  `tests/video_padding_sdk.rs`, and it is compiled for Linux only; every other
+  test addresses its sender as `127.0.0.1:<port>`. The macOS and Windows
+  wrappers therefore do nothing about name resolution. A test that looks
+  sources up by host name on macOS would need more than that wrapper offers.
+- **`TMPDIR`.** The SDK reserves every sender and receiver name machine-wide
+  with a lock file, `$TMPDIR/NTK_SEND_<sender name>`. In a shared directory two
+  unrelated processes that use the same sender name fail each other with
+  "Failed to create NDI send instance", and the files are left behind. This was
+  observed on Linux; the macOS wrapper isolates `TMPDIR` as a precaution and
+  the Windows wrapper leaves it alone.
 
-The plan collects **all** missing source, digest and public-toolchain recipe
-prerequisites in one bounded configuration report without making network requests.
-After that gate, each SDK runner group fetches, hashes, extracts and inventories
-its packages before use. Checks in a group reuse only verified installations;
-there are no separate package-preflight runners. Each of the 12 packages has one
-designated availability receipt owner, and every check still records the exact
-headers and runtime it used. A successful configuration check is not a successful
-availability check. The final aggregate requires all exact package receipts and
-all individual check results.
+What the macOS wrapper does not do: Seatbelt filters the test process only. A
+listener bound to a wildcard address stays reachable from the runner's own
+network, because the profile language cannot restrict the peer of inbound
+traffic.
 
-Rust setup is also reused within a group. Each check compares the compiler's
-reported identity and locally installed component/target inventories before
-reuse, avoiding repeated toolchain downloads after successful setup. New targets
-or components still require installation; missing previously verified state
-fails the check. Per-check results retain that setup evidence and bounded SDK
-provisioning diagnostics, while detailed acquisition logs remain private.
-
-Only bounded reports cross jobs; SDK archives and extracted SDKs are not Actions
-artifacts or shared caches. Each runner group independently acquires and verifies
-its packages, so a stale or replaced remote asset cannot silently change a build.
-
-`provision.py --offline --sources /private/sources.json` forbids network access.
-Installation is transactional. Caller-owned archives are copied into private
-staging, hashed there, consumed from that snapshot and checked again after
-extraction; changing the original path cannot change verified input. Acquisition
-credentials, including custom names from an explicit private source-map file,
-are removed from installer and compiler environments. A completed receipt records hashes for the selected
-include/lib/bin trees and Version.txt; `--reuse` rehashes them before use. Version
-comparison is exact after padding trailing numeric zeros (6.3.2 equals 6.3.2.0),
-not substring matching. Windows installers lack Version.txt and explicitly use
-archive-bound version evidence instead of claiming a parsed installed version.
-The portable [development SDK store](sdk-store.md) retains original archives and
-side-by-side installations; GMS mounts that populated store read-only at runtime.
-
-The four supported GNU cross profiles use `public-toolchains.json` and
-`public_toolchain.py`. Every public compiler/sysroot dependency is pinned by
-SHA256. The prepared toolchain records its reviewed recipe, verified packages,
-profile-specific flags and configuration identity. The plan freezes that recipe
-identity, and the aggregate rejects mismatched toolchain evidence. Replacing an
-artifact profile with another one sharing the same Rust target is forbidden.
-
-The Intel tvOS compiler pin, `nightly-2026-11-10`, is part of the checked-in CI
-policy, independently of the desktop/Android Rust MSRV. Its checks require a target
-standard-library build and an Apple SDK link. The Standard check also requires
-matching simulator execution in the required scope; both editions execute in the
-extended scope.
-Cargo's JSON artifact messages identify generated bindings, libraries and rebuilt
-std metadata without assuming a particular Cargo output-directory layout.
-Compiler changes must pass the same checks before promotion.
-
-All CI jobs use the same generated `Cargo.lock`. The aggregate rejects evidence
-from a different dependency resolution. SDK archives, extracted libraries,
-generated bindings, target directories, linked SDK code, and raw diagnostics are
-not uploaded or cached. Only the plan, lockfile, bounded check results and package receipts cross
-job boundaries. On failures, raw diagnostic logs remain on the ephemeral runner;
-reproduce the cell locally to inspect vendor-containing diagnostics privately.
-
-Untrusted fork PRs receive SDK-free policy/tooling/format checks, with no SDK
-secrets. The full required gate deliberately remains unsatisfied until a reviewed
-commit runs in the trusted repository context. Do not use `pull_request_target`
-with an untrusted checkout. The obsolete setup actions are not used by this
-workflow; their SDK caches are not a confidentiality boundary.
-
-## Local reproduction
-
-Use Python 3.11+, LLVM tools, the selected Rust toolchain and appropriate sysroot.
-Keep outputs outside the checkout. For a local plan and verified archive extract:
+On Linux the same run works locally:
 
 ```sh
-python ci/plan.py --output /private/ci-plan.json
-python ci/provision.py --package current-standard-linux \
-  --archive /private/vendor-installer.tar.gz --output /private/sdk-extract
-python ci/run.py \
-  --cell x86_64-linux-gnu-standard-native-current-current-stable \
-  --header-sdk /private/sdk-extract/unpacked/NDI\ SDK\ for\ Linux \
-  --output /private/validation
+export NDI_RUNTIME_DIR_V6="$HOME/ndi/standard-6.4/NDI SDK for Linux/lib/x86_64-linux-gnu"
+GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --config ci/offline.toml --all-features
 ```
 
-To reproduce a whole runner group, use a clean checkout and the configured
-verified archive sources:
+## Releasing
+
+1. Merge the version bump to `main`.
+2. Tag that commit `v<version>` and push the tag.
+
+`publish.yml` runs for `v*` tags only, in four jobs that each need the one
+before:
+
+| Job | What it does |
+|---|---|
+| `release` | the tag is `v` plus the `Cargo.toml` version ([`release.py`](release.py)) and its commit is on `main` |
+| `ci` | the whole of `rust.yml`, including `required-ci` |
+| `verify` | `cargo package --locked`, which builds the packaged crate, then uploads the `.crate`, its SHA-256 and the toolchain version. No registry access |
+| `publish` | in the `crates-io` environment with `id-token: write`: re-creates the package with `--no-verify` on the same toolchain, requires its SHA-256 to equal the verified one, and runs `cargo publish --locked --no-verify` through crates.io trusted publishing |
+
+No crate or dependency is compiled in the job that can publish. docs.rs builds
+the documentation from the published crate; nothing is deployed to GitHub Pages.
+
+## Secrets, variables and repository settings
+
+Used as they exist today:
+
+| Setting | Purpose |
+|---|---|
+| Secret `NDI_SDK_SOURCES_JSON` | source map for the private SDK archives |
+| Secret `NDI_SDK_ARCHIVE_TOKEN` | read-only token for the archive repository |
+| Variable `NDI_CI_RELEASED` = `true` | switches the `sdk` job on. With any other value the job is skipped, which fails `required-ci` for everything except fork pull requests |
+
+To be created by the repository owner:
+
+| Setting | Purpose |
+|---|---|
+| Environment `crates-io`, with required reviewers | approval gate for the `publish` job |
+| crates.io trusted publisher for the crate | repository `GrantSparks/grafton-ndi`, workflow `publish.yml`, environment `crates-io` |
+| Branch protection for `main` | require the `required-ci` check |
+
+No longer read by the workflows: the per-package `NDI_SDK_*_URL` secrets and
+`NDI_SDK_*_SHA256` variables. Nothing deploys to the `github-pages` environment
+any more.
+
+## Running the checks locally
 
 ```sh
-cargo generate-lockfile
-python ci/plan.py --scope required --output /private/ci-plan.json
-python ci/batch.py --plan /private/ci-plan.json --group native-linux-standard \
-  --output /private/ndi-ci --install-toolchain
+python -m unittest discover -s ci/tests        # CI scripts and workflow guards
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
+cargo test --locked --all-features             # runtime tests skip without an NDI runtime
 ```
 
-The plan lists the available group IDs. For the broader audit, generate a plan
-with `--scope extended`; pass the same scope to `ci/run.py` when reproducing one
-of its individual checks. `batch.py` reads the scope from the frozen plan.
+To run the runtime tests, install a package with `ci/sdk.py`, export the printed
+`NDI_RUNTIME_DIR_V6`, and use the loopback-only command above. For the Advanced
+implementation also export the printed `NDI_SDK_DIR` of an Advanced package and
+have libclang installed.
 
-Batch output separates `evidence/cells/CELL/result.json` and
-`evidence/availability/PACKAGE/availability.json` from private `cells/` logs/builds
-and `sdks/` installations. Only the `evidence/` directory is eligible for the
-workflow's bounded result artifact. `--evidence DIR` can select a separate output
-directory; it does not make raw build or SDK directories uploadable.
+## Files
 
-A native suite initializes NDI and may advertise synthetic sources. `native.py`
-requires working unprivileged `bwrap` network namespaces on Linux or an elevated
-PowerShell session with Windows Defender Firewall control on Windows. Its macOS
-executor accepts only disposable GitHub-hosted runners; an ordinary local Mac or
-private LAN does not satisfy that executor's preconditions. Independent manual
-device testing belongs on an authorized isolated private LAN. Cross/link
-suites do not execute target programs. For local cross builds only,
-`NDI_LOCAL_TOOLCHAIN` can name an extracted toolchain bundle; this intentionally
-cannot produce release-grade archive evidence.
+| File | Purpose |
+|---|---|
+| `sdk.py`, `sdk-packages.json` | verify and install a pinned SDK package |
+| `offline.toml`, `offline/` | loopback-only test runner per operating system, and the check that it isolates |
+| `gate.py` | the `required-ci` decision |
+| `release.py` | the release tag check |
+| `apple-mobile.sh` | builds for the statically linked Apple targets |
+| `tests/` | tests for the scripts, and guards on the workflows that actionlint does not cover |
 
-```sh
-python -m unittest discover -s ci/tests -v
-python -m unittest discover -s tools/sdk -v
-python tools/sdk/audit.py emit-capabilities --check
-```
+## Not yet run on a hosted runner
 
-For the next SDK, inventory exact artifacts, update reviewed package digests and
-profile metadata, snapshot/classify API changes, update capability dispositions,
-then regenerate the plan. New profiles require an explicit support-policy classification. Promoting a
-candidate requires obtainable tools and mandatory ABI/link coverage, plus native,
-simulator or emulator checks where feasible; execution policy changes require
-explicit review. Never mark an API implemented
-or downgrade a cell's coverage merely to make the release gate pass.
+These workflows have not run on GitHub. On Linux x86_64 the commands of `lint`,
+`test` and `cross`, the three Linux x64 `sdk` rows and SDK provisioning from
+local archives have been run by hand; the rest is unproven until the first
+hosted run. Remove an item from this section once a hosted run has exercised it.
 
-Apple simulator execution does not test device privacy prompts or multicast
-entitlements. Device qualification must cover those separately; Apple documents
-that the simulator does not implement local-network privacy in
-[TN3179](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy).
+Carried over from the previous CI, which ran on hosted runners:
 
-Linux i686 uses explicit multilib libc/libstdc++ and Avahi dependencies. Required
-CI proves its ABI and final links. Native-on-x64 execution, compatibility and
-32-bit File behavior are available in the extended audit.
+- the source-map schema, the GitHub asset request and its headers (the code
+  around them is rewritten);
+- the installer invocations: `pkgutil --expand-full` on macOS and the silent
+  Windows installer flags;
+- the Seatbelt policy and the loopback discovery configuration;
+- the Windows firewall cmdlets;
+- the Linux network namespace with a private `/etc/hosts` (its other `bwrap`
+  options differ), the user-namespace `sysctl` and the i386 packages;
+- the Windows LLVM installation, the Apple mobile deployment targets and SDK
+  roots, and the nightly pin for the tvOS simulator;
+- the crates.io authentication action.
 
-## Publication gates
+New, and so unverified anywhere but Linux x86_64:
 
-`rust.yml` calls `publish.yml` only after `required-ci` passes for a trusted
-`main` push/manual run or version tag in the `required` scope, and only with
-`NDI_CI_RELEASED=true`. An extended audit cannot publish.
-Pages deploys from `main`; crate publication requires a version tag.
-Publication rechecks the same run's plan, aggregate evidence, clean commit/tree,
-suite fingerprint and dependency lockfile before provisioning its SDK. A tag
-must exactly match the Cargo package version (with an optional `v` prefix).
-A crate release requires an unpublished package version and reviewed release
-notes. Crates.io trusted publishing and GitHub Pages must be configured for the
-repository before their corresponding publication can succeed.
-For crates.io, verify the caller filename `rust.yml` in its trusted-publisher
-configuration: the current registry matches the token's `workflow_ref`, rather
-than automatically using the reusable `publish.yml` filename. See its
-[GitHub claim implementation](https://github.com/rust-lang/crates.io/blob/6cd78f2c7b09da12f6d7b3f70970b6d4d805a5b1/crates/crates_io_trustpub/src/github/claims.rs).
-
-Only the reviewed public API documentation and crate package may be published.
-Documentation omits source pages, and the publication helper checks generated
-output and package contents before upload. SDKs, generated private FFI, original
-archives, private source maps and raw diagnostics remain excluded. The narrowly
-scoped archive token is used for SDK acquisition, not for publication.
+- every macOS and Windows step as a whole, including the wrappers used as Cargo
+  runners (`pwsh -File` on Windows, `sandbox-exec` without a packet filter on
+  macOS) and the build against Xcode's libclang;
+- every promise of the Windows and macOS rows, in particular `file` beside a
+  Standard runtime in the Windows x64 Standard 6.4 row;
+- the Advanced lint on Windows and macOS;
+- the Linux x86 and Linux arm64 rows;
+- building tvOS and visionOS on the stable toolchain;
+- the Android example link in `cross`;
+- access to the secrets and the download from the private store;
+- the release path: the `crates-io` environment, trusted publishing and the
+  package reproduction across the `verify` and `publish` jobs.

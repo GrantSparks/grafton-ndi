@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-# Build and link every example; device/runtime testing is a separate step.
+# Build and link every example for an Android target with the NDK.
+#
+#   ANDROID_NDK_HOME=/path/to/ndk scripts/build-android.sh aarch64-linux-android
+#
+# The crate loads the NDI runtime when the application starts, so no NDI SDK is
+# needed to build. Set NDI_SDK_DIR to an NDI Advanced SDK for Android to compile
+# the Advanced implementation from its headers; device and runtime testing is a
+# separate step either way.
 set -euo pipefail
 
-: "${NDI_SDK_DIR:?Set NDI_SDK_DIR to the extracted NDI SDK for Android}"
 : "${ANDROID_NDK_HOME:?Set ANDROID_NDK_HOME to the Android NDK installation}"
 target="${1:?Usage: scripts/build-android.sh <Rust Android target>}"
 case "$target" in
@@ -29,9 +35,12 @@ if [ ! -x "$linker" ]; then
   exit 1
 fi
 linker_var="CARGO_TARGET_$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')_LINKER"
-bindgen_var="BINDGEN_EXTRA_CLANG_ARGS_${target//-/_}"
 export "$linker_var=$linker"
-# Target-specific args override host/global bindgen args. Keep paths quoted for
-# bindgen's shell-word parser when the SDK/NDK directory contains spaces.
-export "$bindgen_var=--sysroot=\"$toolchain/sysroot\" -isystem \"$toolchain/sysroot/usr/include/$header_target\" -D__ANDROID_API__=$api"
-cargo build --examples --all-features --target "$target"
+# Only the Advanced headers are parsed at build time. The API level is selected
+# through Clang's target, because redefining __ANDROID_API__ conflicts with the
+# Android driver's built-in macro. The paths stay quoted for bindgen's shell-word
+# parser: SDK and NDK directories may contain spaces.
+bindgen_var="BINDGEN_EXTRA_CLANG_ARGS_${target//-/_}"
+export "$bindgen_var=--target=${clang_target}${api} --sysroot=\"$toolchain/sysroot\" -isystem \"$toolchain/sysroot/usr/include/$header_target\""
+rustup target add "$target"
+cargo build --locked --examples --all-features --target "$target"
