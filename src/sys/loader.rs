@@ -116,7 +116,7 @@ impl Runtime {
 }
 
 /// The text of a loader error without its variant prefix.
-fn reason(error: Error) -> String {
+pub(in crate::sys) fn reason(error: Error) -> String {
     match error {
         Error::RuntimeLoadFailed(reason) => reason,
         other => other.to_string(),
@@ -125,9 +125,13 @@ fn reason(error: Error) -> String {
 
 #[cfg(not(ndi_link_static))]
 use shared::Module as Provider;
+#[cfg(all(not(ndi_link_static), feature = "file-io"))]
+pub(in crate::sys) use shared::{confirm_selected, Module, Search};
 
 #[cfg(ndi_link_static)]
 use linked::Linked as Provider;
+#[cfg(all(ndi_link_static, feature = "file-io"))]
+pub(in crate::sys) use linked::Linked;
 
 #[cfg(not(ndi_link_static))]
 mod shared {
@@ -137,6 +141,7 @@ mod shared {
         mem::ManuallyDrop,
         path::{Path, PathBuf},
         ptr::NonNull,
+        sync::{Mutex, PoisonError},
     };
 
     use super::{AdvancedEntryPoints, Resolver, Runtime};
@@ -197,6 +202,36 @@ mod shared {
             Some(self.path.clone())
         }
 
+        /// Where a lookup through this module's handle finds `name`, and the
+        /// load address of the module that defines it there.
+        ///
+        /// A handle lookup searches the module and then the libraries it
+        /// depends on, so the definition may lie outside this module.
+        fn lookup(
+            &self,
+            name: &CStr,
+        ) -> std::result::Result<Option<(NonNull<c_void>, usize)>, String> {
+            // SAFETY: the symbol is read only as an address; a caller that
+            // goes on to call it applies the function type.
+            let symbol = unsafe { self.library.get::<*mut c_void>(name.to_bytes_with_nul()) };
+            let Some(address) = symbol.ok().and_then(|symbol| NonNull::new(*symbol)) else {
+                return Ok(None);
+            };
+            let (base, _) = containing_module(address.as_ptr())?;
+            Ok(Some((address, base)))
+        }
+
+        /// The address this module is bound to for `name`: its own definition or,
+        /// where the platform's handle lookup reaches them, the one a library it
+        /// depends on supplies. `None` when the lookup finds neither.
+        #[cfg(feature = "file-io")]
+        pub(in crate::sys) fn binding(
+            &self,
+            name: &CStr,
+        ) -> std::result::Result<Option<NonNull<c_void>>, String> {
+            Ok(self.lookup(name)?.map(|(address, _)| address))
+        }
+
         pub(super) const LINKAGE: SdkLinkage = SdkLinkage::Shared;
 
         /// A module is an Advanced runtime when it exports both Advanced entry
@@ -212,16 +247,10 @@ mod shared {
 
     impl Resolver for Module {
         fn resolve(&self, name: &CStr) -> Result<Option<NonNull<c_void>>> {
-            // SAFETY: the symbol is read only as an address; the table that asked
-            // for it applies the function type.
-            let symbol = unsafe { self.library.get::<*mut c_void>(name.to_bytes_with_nul()) };
-            let Some(address) = symbol.ok().and_then(|symbol| NonNull::new(*symbol)) else {
+            let Some((address, base)) = self.lookup(name).map_err(Error::RuntimeLoadFailed)? else {
                 return Ok(None);
             };
-            // A handle lookup also searches the module's dependencies. Accept a
-            // symbol only when this module defines it.
-            let (base, _) =
-                containing_module(address.as_ptr()).map_err(Error::RuntimeLoadFailed)?;
+            // Accept a symbol only when this module itself defines it.
             if base != self.base {
                 return Err(Error::RuntimeLoadFailed(format!(
                     "{} resolves outside {}",
@@ -235,37 +264,15 @@ mod shared {
 
     impl Runtime {
         pub(in crate::sys) fn load(options: &RuntimeOptions) -> Result<Self> {
-            if options
-                .library_path
-                .as_ref()
-                .is_some_and(|path| !path.is_absolute())
-            {
-                return Err(Error::InvalidConfiguration(
-                    "an explicit NDI library path must be absolute".into(),
-                ));
-            }
             let requested = options.edition.unwrap_or_else(super::default_edition);
-            let executable = std::env::current_exe().ok();
-            let runtime_directory = std::env::var_os(RUNTIME_DIRECTORY)
-                .filter(|directory| !directory.is_empty())
-                .map(PathBuf::from);
-            let plan = search_plan(
-                options.library_path.as_deref(),
-                executable.as_deref().and_then(Path::parent),
-                runtime_directory.as_deref(),
-                library_name(requested),
-            );
-            let mut failures = Vec::with_capacity(plan.len());
-            for candidate in plan {
-                match candidate.load(requested) {
-                    Ok(runtime) => return Ok(runtime),
-                    Err(reason) => failures.push(format!("{candidate}: {reason}")),
-                }
+            Search {
+                explicit: options.library_path.as_deref(),
+                beside: None,
+                name: library_name(requested),
+                anchor: CORE_ANCHOR,
+                description: &format!("{requested:?} runtime"),
             }
-            Err(Error::RuntimeLoadFailed(format!(
-                "no usable {requested:?} runtime; tried {}",
-                failures.join("; ")
-            )))
+            .open(|module| Runtime::describe(module, requested))
         }
 
         pub(in crate::sys) fn accepts(&self, options: &RuntimeOptions) -> Result<()> {
@@ -276,31 +283,123 @@ mod shared {
                     "the selected NDI runtime is not an Advanced SDK runtime".into(),
                 ));
             }
-            let Some(requested) = &options.library_path else {
-                return Ok(());
-            };
-            if !requested.is_absolute() {
-                return Err(Error::InvalidConfiguration(
-                    "an explicit NDI library path must be absolute".into(),
-                ));
+            confirm_selected(&self.provider.path, options.library_path.as_deref())
+        }
+    }
+
+    /// Confirm that a request naming `requested` is met by the library at
+    /// `selected`, which is pinned for the process and cannot be replaced.
+    pub(in crate::sys) fn confirm_selected(
+        selected: &Path,
+        requested: Option<&Path>,
+    ) -> Result<()> {
+        let Some(requested) = requested else {
+            return Ok(());
+        };
+        require_absolute(requested)?;
+        if same_path(requested, selected) {
+            Ok(())
+        } else {
+            Err(Error::RuntimeConflict(format!(
+                "{} is already selected; it cannot be switched to {}",
+                selected.display(),
+                requested.display()
+            )))
+        }
+    }
+
+    /// A native library to locate and open.
+    pub(in crate::sys) struct Search<'a> {
+        /// The only acceptable location, when the caller named one.
+        pub(in crate::sys) explicit: Option<&'a Path>,
+        /// The file of an already selected library this one is installed
+        /// beside; its directory is searched first.
+        pub(in crate::sys) beside: Option<&'a Path>,
+        /// The library's file name on this target.
+        pub(in crate::sys) name: &'a str,
+        /// A symbol the library must define; it identifies the opened module.
+        pub(in crate::sys) anchor: &'a CStr,
+        /// What is being looked for, as the error names it.
+        pub(in crate::sys) description: &'a str,
+    }
+
+    impl Search<'_> {
+        /// Open the first location that loads and that `accept` can use.
+        ///
+        /// # Errors
+        ///
+        /// [`Error::InvalidConfiguration`] for a relative explicit path;
+        /// otherwise [`Error::RuntimeLoadFailed`] naming every location tried
+        /// and the reason each was rejected.
+        pub(in crate::sys) fn open<T>(
+            &self,
+            accept: impl Fn(Module) -> std::result::Result<T, String>,
+        ) -> Result<T> {
+            if let Some(explicit) = self.explicit {
+                require_absolute(explicit)?;
             }
-            if same_path(requested, &self.provider.path) {
-                Ok(())
-            } else {
-                Err(Error::RuntimeConflict(format!(
-                    "{} is already selected; the runtime cannot be switched to {}",
-                    self.provider.path.display(),
-                    requested.display()
-                )))
+            let executable = std::env::current_exe().ok();
+            let runtime_directory = std::env::var_os(RUNTIME_DIRECTORY)
+                .filter(|directory| !directory.is_empty())
+                .map(PathBuf::from);
+            let plan = search_plan(
+                self.explicit,
+                self.beside.and_then(Path::parent),
+                executable.as_deref().and_then(Path::parent),
+                runtime_directory.as_deref(),
+                self.name,
+            );
+            let mut failures = Vec::with_capacity(plan.len());
+            for candidate in plan {
+                let module = match candidate.open(self.anchor) {
+                    Ok(module) => module,
+                    Err(reason) => {
+                        failures.push(format!("{candidate}: {reason}"));
+                        continue;
+                    }
+                };
+                // `accept` consumes the module, so its identity is taken first.
+                let (base, path) = (module.base, module.path.clone());
+                match accept(module) {
+                    Ok(opened) => return Ok(opened),
+                    Err(reason) => failures.push(candidate.rejection(base, &path, &reason)),
+                }
             }
+            Err(Error::RuntimeLoadFailed(format!(
+                "no usable {}; tried {}",
+                self.description,
+                failures.join("; ")
+            )))
+        }
+    }
+
+    /// Load addresses of the modules that were opened and then rejected.
+    ///
+    /// A module is never closed, so a rejected one stays loaded. The platform
+    /// loader then answers a later request for a library by name with that
+    /// module whenever the name matches the one the module carries, instead of
+    /// searching for another file.
+    static REJECTED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    /// Reject an explicit library path the platform loader would search for
+    /// instead of opening as the named file.
+    fn require_absolute(path: &Path) -> Result<()> {
+        if path.is_absolute() {
+            Ok(())
+        } else {
+            Err(Error::InvalidConfiguration(
+                "an explicit NDI library path must be absolute".into(),
+            ))
         }
     }
 
     /// Where a candidate location came from.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Origin {
-        /// `RuntimeOptions::library_path`.
+        /// A path the caller named.
         Explicit,
+        /// The directory of the library this one is installed beside.
+        Companion,
         /// The directory containing the running executable.
         Executable,
         /// The directory named by `NDI_RUNTIME_DIR_V6`.
@@ -320,6 +419,7 @@ mod shared {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             let origin = match self.origin {
                 Origin::Explicit => "explicit library path",
+                Origin::Companion => "next to the NDI runtime",
                 Origin::Executable => "next to the executable",
                 Origin::RuntimeDirectory => RUNTIME_DIRECTORY,
                 Origin::LoaderSearch => "system library search",
@@ -329,26 +429,57 @@ mod shared {
     }
 
     impl Candidate {
-        fn load(&self, requested: SdkEdition) -> std::result::Result<Runtime, String> {
+        fn open(&self, anchor: &CStr) -> std::result::Result<Module, String> {
             // A directory candidate names one exact file. Skipping an absent
             // one keeps the loader from searching elsewhere for that path.
-            if matches!(self.origin, Origin::Executable | Origin::RuntimeDirectory)
-                && !self.location.is_file()
+            if matches!(
+                self.origin,
+                Origin::Companion | Origin::Executable | Origin::RuntimeDirectory
+            ) && !self.location.is_file()
             {
                 return Err("not found".into());
             }
-            let module = Module::open(self.location.as_os_str(), CORE_ANCHOR)?;
-            Runtime::describe(module, requested)
+            Module::open(self.location.as_os_str(), anchor)
+        }
+
+        /// Why the module at `base`, which this candidate opened from `path`,
+        /// cannot be used, given the `reason` it was just rejected for.
+        ///
+        /// A candidate that names a file reports that file's own defect. One
+        /// the platform loader resolved by name reports which file that was,
+        /// and whether it is a module rejected before: the loader keeps
+        /// returning such a module for its name, so the search cannot reach
+        /// any other library of that name.
+        fn rejection(&self, base: usize, path: &Path, reason: &str) -> String {
+            let mut rejected = REJECTED.lock().unwrap_or_else(PoisonError::into_inner);
+            let rejected_before = rejected.contains(&base);
+            if !rejected_before {
+                rejected.push(base);
+            }
+            if self.origin != Origin::LoaderSearch {
+                format!("{self}: {reason}")
+            } else if rejected_before {
+                format!(
+                    "{self}: the platform loader returned {}, which is already loaded and was \
+                     rejected ({reason}); no other library of that name can be found by name in \
+                     this process, so remove or fix that file or pass an explicit library path",
+                    path.display()
+                )
+            } else {
+                format!("{self} resolved to {}: {reason}", path.display())
+            }
         }
     }
 
     /// The ordered places to look for `name`.
     ///
-    /// An explicit path is exclusive. Otherwise a library shipped beside the
-    /// executable wins over an installed runtime, which wins over whatever the
-    /// platform loader finds on its own.
+    /// An explicit path is exclusive. Otherwise a library installed beside the
+    /// one it accompanies wins over one shipped beside the executable, which
+    /// wins over an installed runtime, which wins over whatever the platform
+    /// loader finds on its own.
     pub(super) fn search_plan(
         explicit: Option<&Path>,
+        companion_directory: Option<&Path>,
         executable_directory: Option<&Path>,
         runtime_directory: Option<&Path>,
         name: &str,
@@ -361,6 +492,7 @@ mod shared {
         }
         let mut plan: Vec<Candidate> = Vec::new();
         let directories = [
+            (companion_directory, Origin::Companion),
             (executable_directory, Origin::Executable),
             (runtime_directory, Origin::RuntimeDirectory),
         ];
@@ -547,6 +679,7 @@ mod shared {
         fn an_explicit_path_is_the_only_candidate() {
             let plan = search_plan(
                 Some(Path::new("/opt/ndi/libndi.so.6")),
+                Some(Path::new("/core")),
                 Some(Path::new("/app")),
                 Some(Path::new("/runtime")),
                 "libndi.so.6",
@@ -560,6 +693,7 @@ mod shared {
         #[test]
         fn a_bundled_library_precedes_the_installed_runtime_and_the_loader_search() {
             let plan = search_plan(
+                None,
                 None,
                 Some(Path::new("/app")),
                 Some(Path::new("/runtime")),
@@ -581,7 +715,7 @@ mod shared {
 
         #[test]
         fn the_loader_search_remains_when_no_directory_is_known() {
-            let plan = search_plan(None, None, None, "libndi.so.6");
+            let plan = search_plan(None, None, None, None, "libndi.so.6");
             assert_eq!(
                 plan.last().map(|candidate| candidate.origin),
                 Some(Origin::LoaderSearch)
@@ -595,6 +729,7 @@ mod shared {
         fn one_directory_named_twice_is_tried_once() {
             let plan = search_plan(
                 None,
+                None,
                 Some(Path::new("/app")),
                 Some(Path::new("/app")),
                 "libndi.so.6",
@@ -604,6 +739,32 @@ mod shared {
                 .filter(|candidate| candidate.location == Path::new("/app/libndi.so.6"))
                 .count();
             assert_eq!(bundled, 1);
+        }
+
+        #[test]
+        fn a_companion_library_is_sought_beside_its_runtime_first() {
+            let plan = search_plan(
+                None,
+                Some(Path::new("/core")),
+                Some(Path::new("/app")),
+                Some(Path::new("/runtime")),
+                "libndifile.so.6",
+            );
+            assert_eq!(
+                locations(&plan)[..3],
+                [
+                    (PathBuf::from("/core/libndifile.so.6"), Origin::Companion),
+                    (PathBuf::from("/app/libndifile.so.6"), Origin::Executable),
+                    (
+                        PathBuf::from("/runtime/libndifile.so.6"),
+                        Origin::RuntimeDirectory
+                    ),
+                ]
+            );
+            assert_eq!(
+                plan.last().map(|candidate| candidate.origin),
+                Some(Origin::LoaderSearch)
+            );
         }
 
         #[test]
@@ -639,7 +800,7 @@ mod linked {
     include!(concat!(env!("OUT_DIR"), "/ndi_static_symbols.rs"));
 
     /// The SDK archive linked into this program.
-    pub(super) struct Linked;
+    pub(in crate::sys) struct Linked;
 
     impl Linked {
         pub(super) const LINKAGE: SdkLinkage = SdkLinkage::Static;

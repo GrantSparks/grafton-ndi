@@ -17,6 +17,7 @@ pub struct FakeRuntime<'a> {
     cfgs: Vec<&'static str>,
     version: Option<&'a str>,
     dependency: Option<&'a Path>,
+    soname: Option<&'a str>,
 }
 
 impl<'a> FakeRuntime<'a> {
@@ -43,6 +44,12 @@ impl<'a> FakeRuntime<'a> {
         self
     }
 
+    /// Record `soname` in the library as the name the platform loader knows it by.
+    pub fn soname(mut self, soname: &'a str) -> Self {
+        self.soname = Some(soname);
+        self
+    }
+
     /// Compile the variant to `output`.
     pub fn build(self, output: &Path) -> PathBuf {
         let mut rustc = rustc("fake_runtime.rs", output);
@@ -58,6 +65,9 @@ impl<'a> FakeRuntime<'a> {
                 .arg(link_argument(dependency.as_os_str()))
                 .arg("-Clink-arg=-Wl,-rpath,$ORIGIN");
         }
+        if let Some(soname) = self.soname {
+            rustc.arg(format!("-Clink-arg=-Wl,-soname,{soname}"));
+        }
         run(rustc, output)
     }
 }
@@ -67,7 +77,9 @@ pub fn build_dependency(output: &Path) -> PathBuf {
     run(rustc("fake_dependency.rs", output), output)
 }
 
-fn rustc(source: &str, output: &Path) -> Command {
+/// A compiler invocation that builds `source`, a file in this directory, into
+/// the shared library `output` for the target under test.
+pub fn rustc(source: &str, output: &Path) -> Command {
     let mut rustc = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()));
     rustc
         .args(["--edition=2021", "--crate-type=cdylib", "-Cpanic=abort"])
@@ -78,13 +90,15 @@ fn rustc(source: &str, output: &Path) -> Command {
     rustc
 }
 
-fn link_argument(library: &OsStr) -> std::ffi::OsString {
+/// The compiler argument that links against `library`.
+pub fn link_argument(library: &OsStr) -> std::ffi::OsString {
     let mut argument = std::ffi::OsString::from("-Clink-arg=");
     argument.push(library);
     argument
 }
 
-fn run(mut rustc: Command, output: &Path) -> PathBuf {
+/// Run a compiler invocation that must succeed, and return its `output`.
+pub fn run(mut rustc: Command, output: &Path) -> PathBuf {
     let result = rustc.output().expect("run rustc for the fake NDI runtime");
     assert!(
         result.status.success(),

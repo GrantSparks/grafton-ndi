@@ -21,21 +21,12 @@ mod build_support;
 
 use build_support::{Edition, Sdk};
 
-// The File operation registry names the symbols a static File archive must define.
-macro_rules! file_functions {
-    ($( $field:ident => $symbol:ident ($($arg:ident: $ty:ty),*) -> $ret:ty; )*) => {
-        const FILE_SYMBOLS: &[&str] = &[$(stringify!($symbol),)*];
-    };
-}
-include!("src/file/functions.rs");
-
 fn main() {
     for path in [
         "build.rs",
         "build_support.rs",
         "build_apple.rs",
         "src/sys/declarations.rs",
-        "src/file/functions.rs",
     ] {
         println!("cargo:rerun-if-changed={path}");
     }
@@ -48,11 +39,7 @@ fn main() {
     ] {
         println!("cargo:rerun-if-env-changed={name}");
     }
-    for cfg in [
-        "ndi_link_static",
-        "ndi_file_static",
-        "ndi_has_advanced_header",
-    ] {
+    for cfg in ["ndi_link_static", "ndi_has_advanced_header"] {
         println!("cargo:rustc-check-cfg=cfg({cfg})");
     }
 
@@ -143,13 +130,6 @@ fn link_static(
     }
 
     println!("cargo:rustc-cfg=ndi_link_static");
-    if library.provides_file_api
-        && FILE_SYMBOLS
-            .iter()
-            .all(|symbol| archive.symbols.contains(*symbol))
-    {
-        println!("cargo:rustc-cfg=ndi_file_static");
-    }
 
     // Rust's static bundling accepts an ordinary archive, not a universal one.
     let thin_directory = out.join("ndi-static");

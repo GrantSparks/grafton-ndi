@@ -141,13 +141,11 @@ fn mobile_file_is_the_sole_archive_provider_and_old_sdk_remains_usable() {
     assert_eq!(selected.archive, core);
     assert_eq!(selected.link_name, "ndi_ios");
     assert_eq!(selected.edition, Edition::Standard);
-    assert!(!selected.provides_file_api);
 
     let file = sdk.artifact("lib/iOS/libndifile_ios.a");
     let selected = build_support::static_library(&sdk.located(), "ios", None, true).unwrap();
     assert_eq!(selected.archive, file);
     assert_eq!(selected.link_name, "ndifile_ios");
-    assert!(selected.provides_file_api);
     // Without the feature the File archive is never linked.
     let selected = build_support::static_library(&sdk.located(), "ios", None, false).unwrap();
     assert_eq!(selected.archive, core);

@@ -81,7 +81,14 @@ const TABLES: &[(&str, &[&CStr])] = &[
     ("VideoConversion", VideoConversion::SYMBOLS),
 ];
 
-/// The File library's functions, which the `file-io` feature owns.
+/// The File library's tables, which exist only with the `file-io` feature.
+#[cfg(feature = "file-io")]
+const FILE_TABLES: &[(&str, &[&CStr])] = &[
+    ("FilePlayback", super::FilePlayback::SYMBOLS),
+    ("FileRecording", super::FileRecording::SYMBOLS),
+];
+
+/// The File library's functions, which only the `file-io` feature classifies.
 fn is_file_function(name: &str) -> bool {
     name.starts_with("NDIlib_file_") && name != "NDIlib_file_v1_load"
 }
@@ -115,7 +122,11 @@ fn every_declared_function_is_in_one_table_or_explicitly_unwrapped() {
             panic!("{name} is classified twice: {earlier} and {owner}");
         }
     };
-    for (table, symbols) in TABLES {
+    #[cfg(feature = "file-io")]
+    let tables = TABLES.iter().chain(FILE_TABLES);
+    #[cfg(not(feature = "file-io"))]
+    let tables = TABLES.iter();
+    for (table, symbols) in tables {
         for symbol in *symbols {
             classify(
                 symbol.to_str().unwrap().to_owned(),
@@ -123,13 +134,13 @@ fn every_declared_function_is_in_one_table_or_explicitly_unwrapped() {
             );
         }
     }
-    for (name, reason) in UNWRAPPED {
+    #[cfg(feature = "file-io")]
+    let unwrapped = UNWRAPPED.iter().chain(super::file::UNWRAPPED);
+    #[cfg(not(feature = "file-io"))]
+    let unwrapped = UNWRAPPED.iter();
+    for (name, reason) in unwrapped {
         assert!(!reason.is_empty());
         classify((*name).to_owned(), "the unwrapped list".to_owned());
-    }
-    #[cfg(feature = "file-io")]
-    for symbol in crate::file::FUNCTION_NAMES {
-        classify((*symbol).to_owned(), "the File table".to_owned());
     }
 
     let declared = declared_functions();

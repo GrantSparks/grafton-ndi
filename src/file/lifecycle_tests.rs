@@ -1,188 +1,336 @@
-use super::*;
-use std::{cell::RefCell, collections::VecDeque, ffi::c_void};
+//! The recorder's and player's lifecycle against stand-in SDK entry points.
 
-#[derive(Default)]
-struct Mock {
-    events: VecDeque<ffi::RecorderEvent>,
-    stops: usize,
-    destroys: usize,
-    running: bool,
-    dropped: u64,
-    player_stops: usize,
-    player_destroys: usize,
+use super::{
+    mock::{self, Closing, FILE_CLOSED, ROLLOVER, TAKE},
+    *,
+};
+use crate::sys;
+use std::{
+    cell::Cell,
+    sync::{atomic::Ordering, Arc},
+    time::Instant,
+};
+
+/// A recorder with a session started on `device`.
+fn recording_on(device: &Arc<mock::Recorder>) -> FileRecorder {
+    recording_with(
+        device,
+        RecorderOptions::new(SourceSpec::new("mock source").unwrap()),
+    )
 }
-thread_local! { static MOCK: RefCell<Mock> = RefCell::new(Mock::default()); }
-fn raw_event(kind: i32) -> ffi::RecorderEvent {
-    let mut event = ffi::RecorderEvent {
-        kind,
-        ..Default::default()
-    };
-    for (dst, src) in event.path.iter_mut().zip(b"take.mkv") {
-        *dst = *src as _;
-    }
-    event
-}
-unsafe extern "C" fn create_recorder(_: *const ffi::RecorderOptions) -> ffi::Handle {
-    std::ptr::NonNull::<u8>::dangling()
-        .as_ptr()
-        .cast::<c_void>()
-}
-unsafe extern "C" fn start(_: ffi::Handle, _: *const std::ffi::c_char) -> bool {
-    MOCK.with(|state| {
-        let mut state = state.borrow_mut();
-        state.running = true;
-        state.events.push_back(raw_event(1));
-    });
-    true
-}
-unsafe extern "C" fn capture(_: ffi::Handle, out: *mut ffi::RecorderEvent, _: u32) -> i32 {
-    MOCK.with(|state| state.borrow_mut().events.pop_front())
-        .map_or(0, |event| {
-            let kind = event.kind;
-            unsafe { out.write(event) };
-            kind
-        })
-}
-unsafe extern "C" fn stop(_: ffi::Handle) {
-    MOCK.with(|state| {
-        let mut state = state.borrow_mut();
-        state.stops += 1;
-        state.running = false;
-    });
-}
-unsafe extern "C" fn destroy(_: ffi::Handle) {
-    MOCK.with(|state| state.borrow_mut().destroys += 1);
-}
-unsafe extern "C" fn running(_: ffi::Handle) -> bool {
-    MOCK.with(|state| state.borrow().running)
-}
-unsafe extern "C" fn dropped(_: ffi::Handle) -> u64 {
-    MOCK.with(|state| state.borrow().dropped)
-}
-unsafe extern "C" fn create_player(_: *const ffi::PlayerOptions) -> ffi::Handle {
-    std::ptr::NonNull::<u8>::dangling().as_ptr().cast()
-}
-unsafe extern "C" fn player_stop(_: ffi::Handle) {
-    MOCK.with(|state| state.borrow_mut().player_stops += 1);
-}
-unsafe extern "C" fn player_destroy(_: ffi::Handle) {
-    MOCK.with(|state| state.borrow_mut().player_destroys += 1);
-}
-fn api() -> FileApi {
-    MOCK.with(|state| *state.borrow_mut() = Mock::default());
-    let mut functions = ffi::Functions::mocked();
-    functions.recorder_create = create_recorder;
-    functions.recorder_start = start;
-    functions.recorder_capture = capture;
-    functions.recorder_stop = stop;
-    functions.recorder_destroy = destroy;
-    functions.recorder_running = running;
-    functions.recorder_dropped = dropped;
-    functions.player_create = create_player;
-    functions.player_stop = player_stop;
-    functions.player_destroy = player_destroy;
-    FileApi::mocked(functions)
-}
-fn recorder() -> FileRecorder {
-    let mut recorder = api()
-        .create_recorder(RecorderOptions::new(
-            SourceSpec::new("mock source").unwrap(),
-        ))
+
+fn recording_with(device: &Arc<mock::Recorder>, options: RecorderOptions) -> FileRecorder {
+    device.install();
+    let mut recorder = mock::recorder_api().create_recorder(options).unwrap();
+    recorder
+        .start(target("first"), RecordingTimecode::Preserve)
         .unwrap();
     recorder
-        .start(
-            RecordingTarget::new(std::env::temp_dir().join("mock-not-created")).unwrap(),
-            RecordingTimecode::Preserve,
-        )
-        .unwrap();
-    recorder
+}
+
+fn target(name: &str) -> RecordingTarget {
+    RecordingTarget::new(std::env::temp_dir().join(format!("mock-not-created-{name}"))).unwrap()
 }
 
 #[test]
-fn timeout_retains_owner_and_later_close_completes_without_double_stop() {
-    let mut recorder = recorder();
-    recorder.poll_event(Duration::ZERO).unwrap();
+fn a_timeout_keeps_the_recorder_and_a_later_close_completes_without_a_second_stop() {
+    let device = mock::Recorder::new(Closing::Never);
+    let mut recorder = recording_on(&device);
     assert!(matches!(
         recorder.finish(Duration::ZERO).unwrap(),
         FinishStatus::TimedOut(_)
     ));
-    MOCK.with(|state| {
-        assert_eq!(state.borrow().destroys, 0);
-        state.borrow_mut().events.push_back(raw_event(10));
-    });
     assert!(matches!(
-        recorder.wait_finished(Duration::from_millis(10)).unwrap(),
+        recorder.wait_finished(Duration::from_millis(30)).unwrap(),
+        FinishStatus::TimedOut(_)
+    ));
+    assert_eq!(device.destroys.load(Ordering::Acquire), 0);
+    device.push(FILE_CLOSED, TAKE);
+    assert!(matches!(
+        recorder.wait_finished(Duration::from_secs(1)).unwrap(),
         FinishStatus::Closed(_)
     ));
+    assert_eq!(recorder.request_stop(), StopRequest::AlreadyClosed);
     drop(recorder);
-    MOCK.with(|state| {
-        assert_eq!(state.borrow().stops, 1);
-        assert_eq!(state.borrow().destroys, 1);
-    });
+    assert_eq!(device.stops.load(Ordering::Acquire), 1);
+    assert_eq!(device.destroys.load(Ordering::Acquire), 1);
 }
+
 #[test]
-fn queued_started_event_is_not_mistaken_for_a_rollover_race() {
-    let mut recorder = recorder();
-    MOCK.with(|state| state.borrow_mut().events.push_back(raw_event(10)));
+fn finish_waits_for_a_close_that_follows_the_stop() {
+    let device = mock::Recorder::new(Closing::After(Duration::from_millis(100)));
+    let mut recorder = recording_on(&device);
+    let FinishStatus::Closed(report) = recorder.finish(Duration::from_secs(5)).unwrap() else {
+        panic!("the close arrived within the wait");
+    };
+    assert!(report.closure_confirmed());
+    assert_eq!(report.closed_files(), 1);
+    assert_eq!(
+        report.last_closed_path().unwrap().as_bytes(),
+        TAKE.as_bytes()
+    );
+}
+
+#[test]
+fn a_rollover_requested_just_before_the_stop_does_not_hold_the_session_open() {
+    // The SDK accepts the rollover, then the stop arrives before the cut: only
+    // the file that was open is reported closed.
+    let device = mock::Recorder::new(Closing::AtStop);
+    let mut recorder = recording_on(&device);
+    recorder.rollover(target("second")).unwrap();
+    let outcome = recorder.finish(Duration::from_secs(1)).unwrap();
+    assert!(
+        matches!(outcome, FinishStatus::Closed(_)),
+        "the session never reached a final state: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_source_switch_just_before_the_stop_does_not_hold_the_session_open() {
+    let device = mock::Recorder::new(Closing::AtStop);
+    let mut recorder = recording_on(&device);
+    recorder
+        .set_source(SourceSpec::new("another source").unwrap())
+        .unwrap();
     assert!(matches!(
-        recorder.finish(Duration::from_millis(10)).unwrap(),
+        recorder.finish(Duration::from_secs(1)).unwrap(),
         FinishStatus::Closed(_)
     ));
 }
+
 #[test]
-fn drop_stops_and_destroys_once_without_waiting_for_a_missing_close_event() {
-    let recorder = recorder();
-    drop(recorder);
-    MOCK.with(|state| {
-        assert_eq!(state.borrow().stops, 1);
-        assert_eq!(state.borrow().destroys, 1);
-    });
+fn a_completed_rollover_is_followed_in_the_order_the_sdk_reports_it() {
+    let device = mock::Recorder::new(Closing::Never);
+    let mut recorder = recording_on(&device);
+    recorder.rollover(target("second")).unwrap();
+    // The next file is reported open before the previous one is reported closed.
+    device.push(ROLLOVER, "second.mkv");
+    device.push(FILE_CLOSED, TAKE);
+    while recorder.poll_event(Duration::ZERO).unwrap().is_some() {}
+    assert_eq!(recorder.state(), RecorderState::Recording);
+    assert_eq!(
+        recorder.reported_current_file().unwrap().as_bytes(),
+        b"second.mkv"
+    );
+    recorder.request_stop();
+    device.push(FILE_CLOSED, "second.mkv");
+    let FinishStatus::Closed(report) = recorder.wait_finished(Duration::from_secs(1)).unwrap()
+    else {
+        panic!("both files were reported closed");
+    };
+    assert_eq!(report.closed_files(), 2);
 }
+
 #[test]
-fn dropped_sdk_event_never_claims_finalization() {
-    let mut recorder = recorder();
-    recorder.poll_event(Duration::ZERO).unwrap();
-    MOCK.with(|state| {
-        let mut state = state.borrow_mut();
-        state.dropped = 1;
-        state.events.push_back(raw_event(10));
-    });
-    let outcome = recorder.finish(Duration::from_millis(10)).unwrap();
-    assert!(matches!(outcome, FinishStatus::Indeterminate(_)));
+fn a_session_whose_close_is_never_reported_times_out_rather_than_claiming_closure() {
+    let device = mock::Recorder::new(Closing::Never);
+    let mut recorder = recording_on(&device);
+    let outcome = recorder.finish(Duration::from_millis(30)).unwrap();
+    assert!(matches!(outcome, FinishStatus::TimedOut(_)), "{outcome:?}");
+    assert!(!recorder.abandon().closure_confirmed());
+}
+
+#[test]
+fn lost_sdk_events_end_the_session_as_indeterminate() {
+    let device = mock::Recorder::new(Closing::AtStop);
+    let mut recorder = recording_on(&device);
+    device.dropped_events.store(1, Ordering::Release);
+    let outcome = recorder.finish(Duration::from_secs(1)).unwrap();
+    assert!(
+        matches!(outcome, FinishStatus::Indeterminate(_)),
+        "{outcome:?}"
+    );
     assert!(!recorder.report().closure_confirmed());
     assert_eq!(recorder.report().dropped_events(), 1);
+    assert_eq!(recorder.request_stop(), StopRequest::AlreadyEnded);
+    // The session is over, so another can begin.
+    device.dropped_events.store(1, Ordering::Release);
+    recorder
+        .start(target("again"), RecordingTimecode::Preserve)
+        .unwrap();
 }
+
 #[test]
-fn malformed_close_format_does_not_swallow_native_lifecycle_evidence() {
-    let mut recorder = recorder();
-    recorder.poll_event(Duration::ZERO).unwrap();
+fn a_malformed_close_event_still_closes_the_session() {
+    let device = mock::Recorder::new(Closing::Never);
+    let mut recorder = recording_on(&device);
     recorder.request_stop();
-    let mut event = raw_event(10);
+    let mut event = mock::recorder_event(FILE_CLOSED, TAKE);
     event.source_format_payload.video_track_count = 3;
-    MOCK.with(|state| state.borrow_mut().events.push_back(event));
+    device.push_event(event);
+    while recorder
+        .poll_event(Duration::ZERO)
+        .is_ok_and(|event| event.is_some())
+    {}
     assert!(matches!(
-        recorder.poll_event(Duration::ZERO),
-        Err(FileError::Protocol(_))
-    ));
-    assert!(matches!(
-        recorder.wait_finished(Duration::from_millis(10)).unwrap(),
+        recorder.wait_finished(Duration::from_millis(50)).unwrap(),
         FinishStatus::Closed(_)
     ));
 }
+
 #[test]
-fn player_drop_pairs_stop_and_destroy() {
-    let player = api()
+fn an_event_larger_than_this_crate_expects_is_rejected_and_taints_the_session() {
+    let device = mock::Recorder::new(Closing::AtStop);
+    let mut recorder = recording_on(&device);
+    device.oversize_next_event.store(true, Ordering::Release);
+    let error = recorder.poll_event(Duration::ZERO).unwrap_err();
+    assert!(matches!(error, FileError::Protocol(_)), "{error}");
+    let outcome = recorder.finish(Duration::from_secs(1)).unwrap();
+    assert!(
+        matches!(outcome, FinishStatus::Indeterminate(_)),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn dropping_a_recording_recorder_waits_for_its_file_to_be_closed() {
+    let device = mock::Recorder::new(Closing::After(Duration::from_millis(100)));
+    let recorder = recording_on(&device);
+    drop(recorder);
+    assert_eq!(device.stops.load(Ordering::Acquire), 1);
+    assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+    assert!(
+        device.closed_before_destroy.load(Ordering::Acquire),
+        "the recorder was destroyed before its file was reported closed"
+    );
+}
+
+#[test]
+fn the_drop_wait_is_bounded_when_the_close_never_comes() {
+    let device = mock::Recorder::new(Closing::Never);
+    let options = RecorderOptions::new(SourceSpec::new("mock source").unwrap())
+        .with_drop_wait(Duration::from_millis(60))
+        .unwrap();
+    let recorder = recording_with(&device, options);
+    let begun = Instant::now();
+    drop(recorder);
+    let waited = begun.elapsed();
+    assert!(waited >= Duration::from_millis(60), "{waited:?}");
+    assert!(waited < Duration::from_secs(2), "{waited:?}");
+    assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+    assert!(!device.closed_before_destroy.load(Ordering::Acquire));
+}
+
+#[test]
+fn abandoning_stops_and_destroys_without_waiting() {
+    let device = mock::Recorder::new(Closing::Never);
+    let recorder = recording_on(&device);
+    let begun = Instant::now();
+    let report = recorder.abandon();
+    assert!(begun.elapsed() < Duration::from_secs(1));
+    assert!(!report.closure_confirmed());
+    assert_eq!(device.stops.load(Ordering::Acquire), 1);
+    assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn a_recorder_that_never_started_is_destroyed_without_a_stop() {
+    let device = mock::Recorder::new(Closing::AtStop);
+    device.install();
+    let mut recorder = mock::recorder_api()
+        .create_recorder(RecorderOptions::new(
+            SourceSpec::new("mock source").unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(recorder.request_stop(), StopRequest::NotStarted);
+    assert!(matches!(
+        recorder.finish(Duration::ZERO),
+        Err(FileError::InvalidState(_))
+    ));
+    drop(recorder);
+    assert_eq!(device.stops.load(Ordering::Acquire), 0);
+    assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn storage_given_to_the_sdk_is_released_once_a_later_session_has_started() {
+    let device = mock::Recorder::new(Closing::AtStop);
+    let mut recorder = recording_on(&device);
+    for round in 0..4 {
+        recorder.rollover(target("rolled")).unwrap();
+        recorder
+            .set_source(SourceSpec::new(format!("source {round}")).unwrap())
+            .unwrap();
+        assert!(matches!(
+            recorder.finish(Duration::from_secs(1)).unwrap(),
+            FinishStatus::Closed(_)
+        ));
+        recorder
+            .start(target("next"), RecordingTimecode::Preserve)
+            .unwrap();
+        assert_eq!(recorder.retained_inputs(), (1, 1), "round {round}");
+    }
+    assert_eq!(
+        recorder.last_accepted_source().unwrap().name(),
+        Some("source 3")
+    );
+}
+
+thread_local! {
+    static PLAYER_STOPS: Cell<usize> = const { Cell::new(0) };
+    static PLAYER_DESTROYS: Cell<usize> = const { Cell::new(0) };
+}
+
+unsafe extern "C" fn create_player(
+    _: *const sys::bindings::NDIlib_file_player_create_t,
+) -> sys::bindings::NDIlib_file_player_instance_t {
+    std::ptr::NonNull::dangling().as_ptr()
+}
+unsafe extern "C" fn stop_player(_: sys::bindings::NDIlib_file_player_instance_t) {
+    PLAYER_STOPS.set(PLAYER_STOPS.get() + 1);
+}
+unsafe extern "C" fn destroy_player(_: sys::bindings::NDIlib_file_player_instance_t) {
+    PLAYER_DESTROYS.set(PLAYER_DESTROYS.get() + 1);
+}
+
+#[test]
+fn dropping_a_player_stops_then_destroys_it_once() {
+    let api = FileApi::with_tables(
+        sys::FilePlayback {
+            NDIlib_file_player_create: create_player,
+            NDIlib_file_player_stop: stop_player,
+            NDIlib_file_player_destroy: destroy_player,
+            ..mock::playback()
+        },
+        mock::recording(),
+    );
+    let player = api
         .create_player(PlayerOptions::new("mock player").unwrap())
         .unwrap();
     drop(player);
-    MOCK.with(|state| {
-        assert_eq!(state.borrow().player_stops, 1);
-        assert_eq!(state.borrow().player_destroys, 1);
-    });
+    assert_eq!(PLAYER_STOPS.get(), 1);
+    assert_eq!(PLAYER_DESTROYS.get(), 1);
 }
+
 #[test]
-fn timeout_rejects_infinity_and_rounds_fractional_milliseconds_up() {
+fn a_family_the_library_lacks_is_reported_by_the_entry_point_it_is_missing() {
+    let api = FileApi {
+        playback: Err(c"NDIlib_file_player_seek_to_frame"),
+        ..mock::recorder_api()
+    };
+    for error in [
+        api.probe("recording.mkv").unwrap_err(),
+        api.create_player(PlayerOptions::new("mock player").unwrap())
+            .unwrap_err(),
+    ] {
+        let FileError::Unavailable(reason) = error else {
+            panic!("expected the playback family to be unavailable: {error}");
+        };
+        assert!(
+            reason.contains("NDIlib_file_player_seek_to_frame"),
+            "{reason}"
+        );
+    }
+}
+
+#[test]
+fn waits_are_rounded_up_and_the_largest_is_refused() {
     assert_eq!(timeout_ms(Duration::from_nanos(1)).unwrap(), 1);
     assert_eq!(timeout_ms(Duration::ZERO).unwrap(), 0);
-    assert!(timeout_ms(Duration::from_millis(u32::MAX as u64)).is_err());
+    assert_eq!(
+        timeout_ms(Duration::from_millis(u64::from(u32::MAX) - 1)).unwrap(),
+        u32::MAX - 1
+    );
+    assert!(timeout_ms(Duration::from_millis(u32::MAX.into())).is_err());
+    assert!(timeout_ms(Duration::MAX).is_err());
 }

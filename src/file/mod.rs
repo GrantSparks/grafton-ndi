@@ -1,25 +1,97 @@
-//! Optional recording and playback through the NDI File API.
+//! Recording NDI sources to disk and playing recordings back, through the NDI
+//! File library.
 //!
-//! [`FileApi::probe`] inspects a recording without advertising a source.
-//! [`FileApi::create_player`] immediately advertises a source; stopping playback
-//! keeps that source alive until its player is dropped. Recorders subscribe to
-//! a source and preserve the SDK's encoded essence rather than accepting Rust
-//! video buffers.
+//! The File library is a separate native library that accompanies the NDI
+//! runtime. [`FileApi::open`] finds it when it is first needed; nothing else in
+//! this crate depends on it, so its absence never affects sending or receiving.
 //!
-//! Call [`FileRecorder::finish`] and inspect its result before treating a recording
-//! as finalized. Dropping a recorder releases native resources but does not prove
-//! that its output was finalized. Native operations, including destruction, may
-//! block; timeout arguments bound event waits, not all native processing.
+//! * [`FileApi::probe`] reads a recording's duration and track layout without
+//!   advertising anything on the network.
+//! * [`FileApi::create_player`] advertises an NDI source and plays recordings
+//!   through it; see [`FilePlayer`].
+//! * [`FileApi::create_recorder`] records a source's compressed essence exactly
+//!   as it arrives; see [`FileRecorder`]. The recorder is source-driven: it
+//!   subscribes to an NDI source and does not accept frames from Rust.
 //!
-//! Native owners are intentionally thread-affine until the SDK documents a wider
-//! concurrency contract. Owned snapshots can be transferred between threads.
-//! [`AsyncFilePlayer`] and [`AsyncFileRecorder`] keep each native owner on a
-//! dedicated thread and expose futures usable with any Rust executor.
+//! # Where the File library is loaded from
+//!
+//! Unless [`FileRuntimeOptions::library_path`] names an exact file, the first
+//! usable library in this order is selected:
+//!
+//! 1. the directory of the selected NDI runtime library, where the SDK installs it;
+//! 2. the directory containing the running executable;
+//! 3. the directory named by the `NDI_RUNTIME_DIR_V6` environment variable;
+//! 4. the platform loader's own search for the library name.
+//!
+//! When nothing is usable, [`FileError::Unavailable`] names every location tried
+//! and the operating system's reason for each. Like the NDI runtime, a loaded
+//! File library stays selected and loaded for the life of the process.
+//!
+//! On Linux, macOS and Android the File library imports the NDI runtime's entry
+//! points from the **Advanced** SDK runtime, so it can only be used when that is
+//! the selected runtime (see [`RuntimeOptions::edition`](crate::RuntimeOptions::edition)).
+//! Beside a Standard runtime it is refused before anything is loaded. The
+//! Windows File library imports nothing from the NDI runtime, so it is not tied
+//! to an edition; the SDK ships it for 64-bit Windows only. Apple mobile targets
+//! link the File archive at build time.
+//!
+//! A library that loads but cannot be used stays loaded. If the platform
+//! loader's own search then matches the library name to that module, it returns
+//! it again instead of looking further; the error names the file, and the remedy
+//! is to remove or fix it or to pass [`FileRuntimeOptions::library_path`].
+//!
+//! # Finishing a recording
+//!
+//! The SDK finalizes a file asynchronously after a stop request and reports it
+//! with a file-closed event. [`FileRecorder::finish`] requests the stop, waits
+//! for that event and returns a [`FinishStatus`]; treat a recording as complete
+//! only when it is [`FinishStatus::Closed`], and inspect the [`RecordingReport`]
+//! for errors during the session. Dropping a recorder whose session is still
+//! open performs the same stop and wait, bounded by
+//! [`RecorderOptions::with_drop_wait`], but cannot report the outcome.
+//!
+//! # Threads
+//!
+//! [`FilePlayer`] and [`FileRecorder`] are neither `Send` nor `Sync`: the SDK
+//! documents no threading contract for them, so each stays on the thread that
+//! created it. Every native call can block, including destruction; timeouts
+//! bound event waits only. The values they return are owned and can be sent
+//! anywhere. [`AsyncFilePlayer`] and [`AsyncFileRecorder`] keep each native
+//! object on a dedicated thread and expose futures that work with any executor.
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use std::time::Duration;
+//!
+//! use grafton_ndi::{
+//!     file::{
+//!         FileApi, FileRuntimeOptions, FinishStatus, RecorderOptions, RecordingTarget,
+//!         RecordingTimecode, SourceSpec,
+//!     },
+//!     NDI,
+//! };
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let ndi = NDI::new()?;
+//! let file = FileApi::open(&ndi, &FileRuntimeOptions::default())?;
+//!
+//! let mut recorder = file.create_recorder(RecorderOptions::new(SourceSpec::new("STUDIO (Camera 1)")?))?;
+//! recorder.start(RecordingTarget::new("take")?, RecordingTimecode::Preserve)?;
+//! std::thread::sleep(Duration::from_secs(10));
+//!
+//! match recorder.finish(Duration::from_secs(5))? {
+//!     FinishStatus::Closed(report) => println!("closed {} file(s)", report.closed_files()),
+//!     other => println!("not confirmed complete: {other:?}"),
+//! }
+//! # Ok(())
+//! # }
+//! ```
+
+#![warn(missing_docs)]
 
 mod asynchronous;
-mod ffi;
-#[cfg(test)]
-pub(crate) use ffi::FUNCTION_NAMES;
+mod out_param;
 mod player;
 mod recorder;
 mod types;
@@ -32,242 +104,193 @@ pub use recorder::{FileRecorder, FinishStatus, RecorderState, RecordingReport, S
 pub use types::*;
 
 use std::{
+    ffi::CStr,
     path::{Path, PathBuf},
-    sync::Arc,
     time::Duration,
 };
 
-use crate::NDI;
+use crate::{
+    sys::{self, bindings::NDIlib_file_player_file_info_t},
+    NDI,
+};
+use out_param::OutParam;
 
-/// Selection of the optional File runtime. No SDK object is created by this value.
+/// How the File library is located. Creating this value loads nothing.
 #[derive(Clone, Debug, Default)]
 pub struct FileRuntimeOptions {
     library_path: Option<PathBuf>,
 }
+
 impl FileRuntimeOptions {
-    /// Select an absolute File module path. Its dependencies must match the core runtime.
-    pub fn with_library_path(mut self, path: impl Into<PathBuf>) -> FileResult<Self> {
-        let path = path.into();
-        if !path.is_absolute() {
-            return Err(FileError::InvalidInput(
-                "File library path must be absolute".into(),
-            ));
-        }
-        self.library_path = Some(path);
-        Ok(self)
+    /// Load exactly this absolute File library path.
+    ///
+    /// No other location is tried, so a failure to load it is reported rather
+    /// than hidden by a fallback. A relative path is rejected by
+    /// [`FileApi::open`], as is any path on a target that links the SDK
+    /// statically.
+    pub fn library_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.library_path = Some(path.into());
+        self
     }
 }
 
-struct Backend {
-    functions: ffi::Functions,
-    // Native owners are destroyed before their Backend Arc. The module therefore
-    // outlives every function pointer and resource, including failed conversions.
-    #[cfg(not(ndi_link_static))]
-    _library: Option<libloading::Library>,
-    _ndi: Option<NDI>,
-    path: Option<PathBuf>,
-}
-
-/// An optional, validated File operation group retaining its runtime dependencies.
+/// The File library selected for this process.
+///
+/// Cloning is cheap. Every clone, and every player and recorder created from
+/// one, keeps the NDI runtime initialized.
 #[derive(Clone)]
 pub struct FileApi {
-    backend: Arc<Backend>,
+    playback: Result<&'static sys::FilePlayback, &'static CStr>,
+    recording: Result<&'static sys::FileRecording, &'static CStr>,
+    library_path: Option<&'static Path>,
+    // Absent only when the entry points are test doubles, which need no runtime.
+    _ndi: Option<NDI>,
 }
+
 impl std::fmt::Debug for FileApi {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileApi")
-            .field("library_path", &self.backend.path)
+            .field("library_path", &self.library_path)
             .finish_non_exhaustive()
     }
 }
+
 impl FileApi {
-    /// Resolve the complete File operation group without creating a player or recorder.
+    /// Find and load the File library that accompanies `ndi`'s runtime.
     ///
-    /// The current POSIX File distribution requires the matching Advanced core.
-    /// It is rejected before loading when the selected core is Standard. An absent
-    /// optional File library never prevents existing core operations from running.
+    /// The first successful call selects the library for the process; later
+    /// calls return the same one. No player or recorder is created and nothing
+    /// is advertised.
+    ///
+    /// # Errors
+    ///
+    /// * [`FileError::Unavailable`] when no usable File library can be loaded,
+    ///   or the selected NDI runtime is not one it can accompany. This is
+    ///   retryable, and the rest of the crate keeps working.
+    /// * [`FileError::Core`] with [`Error::RuntimeConflict`](crate::Error::RuntimeConflict)
+    ///   when `options` names a library other than the one already selected,
+    ///   or with [`Error::InvalidConfiguration`](crate::Error::InvalidConfiguration)
+    ///   when it names a relative path.
     pub fn open(ndi: &NDI, options: &FileRuntimeOptions) -> FileResult<Self> {
-        #[cfg(ndi_link_static)]
-        {
-            if options.library_path.is_some() {
-                return Err(FileError::InvalidInput(
-                    "a shared File library path cannot be selected for static linkage".into(),
-                ));
-            }
-            #[cfg(ndi_file_static)]
-            return Ok(Self {
-                backend: Arc::new(Backend {
-                    functions: ffi::Functions::linked(),
-                    _ndi: Some(ndi.clone()),
-                    path: None,
-                }),
-            });
-            #[cfg(not(ndi_file_static))]
-            {
-                let _ = ndi;
-                Err(unavailable(
-                    "file",
-                    "BuildArtifactUnavailable: this static SDK profile has no linked File artifact",
-                ))
-            }
-        }
-        #[cfg(not(ndi_link_static))]
-        {
-            #[cfg(not(target_os = "windows"))]
-            if ndi.info().edition() != crate::capabilities::SdkEdition::Advanced {
-                return Err(unavailable("file", "RuntimeEditionMismatch: the POSIX File artifact requires the selected Advanced core; loading it alongside Standard is unsupported"));
-            }
-            if cfg!(all(target_os = "windows", target_arch = "x86")) {
-                return Err(unavailable(
-                    "file",
-                    "TargetArtifactUnavailable: the SDK supplies no Windows x86 File library",
-                ));
-            }
-
-            let path = if let Some(path) = &options.library_path {
-                path.clone()
-            } else {
-                let info = ndi.info();
-                let core_path = info.library_path().ok_or_else(|| {
-                    FileError::Unavailable(
-                        "the selected core module's absolute path is unavailable".into(),
-                    )
-                })?;
-                let parent = core_path.parent().ok_or_else(|| {
-                    FileError::Unavailable(
-                        "the selected core module has no parent directory".into(),
-                    )
-                })?;
-                parent.join(file_library_name())
-            };
-            // Explicit path, no current-directory search or fallback to a second
-            // edition. libloading retains the exact handle used for all lookups.
-            let library = load_module(&path).map_err(|error| {
-                unavailable(
-                    "file",
-                    format!("ModuleLoadFailed: {}: {error}", path.display()),
-                )
+        let runtime = sys::select_file(&ndi.info(), ndi.api(), options.library_path.as_deref())
+            .map_err(|error| match error {
+                crate::Error::RuntimeLoadFailed(reason) => FileError::Unavailable(reason),
+                other => FileError::Core(other),
             })?;
-            #[cfg(not(target_os = "windows"))]
-            {
-                type Initialize = unsafe extern "C" fn() -> bool;
-                let from_file = unsafe { library.get::<Initialize>(b"NDIlib_initialize\0") }
-                    .map_err(|error| {
-                        unavailable("file", format!("DependencySymbolUnavailable: {error}"))
-                    })?;
-                let from_core = ndi.api().core.NDIlib_initialize;
-                if *from_file as usize != from_core as usize {
-                    return Err(unavailable("file", "RuntimeModuleConflict: File dependency resolves to a different NDI core module"));
-                }
-            }
-            let functions = unsafe { ffi::Functions::load(&library) }?;
-            Ok(Self {
-                backend: Arc::new(Backend {
-                    functions,
-                    _library: Some(library),
-                    _ndi: Some(ndi.clone()),
-                    path: Some(path),
-                }),
-            })
-        }
+        Ok(Self {
+            playback: runtime.playback(),
+            recording: runtime.recording(),
+            library_path: runtime.path(),
+            _ndi: Some(ndi.clone()),
+        })
     }
 
-    /// The exact requested File module path, or `None` for a static provider.
+    /// The file the library was loaded from, or `None` when the SDK is linked
+    /// statically.
     pub fn library_path(&self) -> Option<&Path> {
-        self.backend.path.as_deref()
+        self.library_path
     }
 
-    /// Read a file's track layout and duration without advertising an NDI sender.
+    /// Read a recording's duration and track layout.
+    ///
+    /// Nothing is played and no NDI source is advertised.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::Rejected`] when the SDK cannot read the file,
+    /// [`FileError::InvalidInput`] when the path is not UTF-8, and
+    /// [`FileError::Unavailable`] when the library provides no playback.
     pub fn probe(&self, path: impl AsRef<Path>) -> FileResult<FileInfo> {
+        let playback = self.playback()?;
         let path = types::path_string(path.as_ref())?;
-        let mut raw = ffi::FileInfo::default();
-        if !unsafe { (self.backend.functions.player_probe)(path.as_ptr(), &mut raw) } {
+        let mut info = OutParam::<NDIlib_file_player_file_info_t>::new();
+        // SAFETY: `path` is a NUL-terminated string that outlives the call and
+        // `info` is writable storage for the structure the SDK fills in.
+        let probed =
+            unsafe { playback.NDIlib_file_player_probe_file(path.as_ptr(), info.as_mut_ptr()) };
+        let info = info.read()?;
+        if !probed {
             return Err(FileError::Rejected("file probe"));
         }
-        FileInfo::try_from(&raw)
+        FileInfo::try_from(&info)
     }
 
-    /// Create and immediately advertise a player source with a fixed name/groups.
+    /// Create a player and advertise its NDI source.
+    ///
+    /// The source is advertised from this call until the player is dropped,
+    /// whether or not a file is playing.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::Rejected`] when the SDK cannot create the player and
+    /// [`FileError::Unavailable`] when the library provides no playback.
     pub fn create_player(&self, options: PlayerOptions) -> FileResult<FilePlayer> {
         FilePlayer::create(self.clone(), options)
     }
 
-    /// Prepare a source recorder. Writing starts only on an explicit `start` call.
+    /// Create a recorder for the source named in `options`.
+    ///
+    /// Nothing is written until [`FileRecorder::start`].
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::Rejected`] when the SDK cannot create the recorder and
+    /// [`FileError::Unavailable`] when the library provides no recording.
     pub fn create_recorder(&self, options: RecorderOptions) -> FileResult<FileRecorder> {
         FileRecorder::create(self.clone(), options)
     }
-}
 
-#[cfg(not(ndi_link_static))]
-fn file_library_name() -> &'static str {
-    if let Some(name) = option_env!("GRAFTON_NDI_FILE_LIBRARY_NAME") {
-        if !name.is_empty() {
-            return name;
-        }
+    /// The playback entry points, or why the library provides none.
+    fn playback(&self) -> FileResult<&'static sys::FilePlayback> {
+        self.playback
+            .map_err(|symbol| missing("file playback", symbol))
     }
-    if cfg!(target_os = "windows") {
-        "Processing.NDI.Lib.File.x64.dll"
-    } else if cfg!(target_os = "macos") {
-        "libndifile.dylib"
-    } else if cfg!(target_os = "android") {
-        "libndifile.so"
-    } else {
-        "libndifile.so.6"
+
+    /// The recording entry points, or why the library provides none.
+    fn recording(&self) -> FileResult<&'static sys::FileRecording> {
+        self.recording
+            .map_err(|symbol| missing("file recording", symbol))
     }
 }
 
+/// The error for a family of entry points the selected library lacks.
+fn missing(family: &str, symbol: &CStr) -> FileError {
+    FileError::Unavailable(format!(
+        "the selected NDI File library provides no {family}: it does not export {}",
+        symbol.to_string_lossy()
+    ))
+}
+
+/// A wait as the SDK's millisecond timeout, rounded up.
+///
+/// The largest value is refused rather than passed on, because the SDK may
+/// treat it as "wait forever".
 pub(super) fn timeout_ms(wait: Duration) -> FileResult<u32> {
-    // Reserve the maximum integer rather than accidentally passing a possible
-    // native infinity sentinel. Fractional milliseconds are rounded up.
     let millis = wait.as_millis() + u128::from(!wait.subsec_nanos().is_multiple_of(1_000_000));
-    if millis >= u128::from(u32::MAX) {
-        return Err(FileError::InvalidInput(
-            "event wait must be less than u32::MAX milliseconds".into(),
-        ));
-    }
-    Ok(millis as u32)
-}
-
-#[cfg(test)]
-mod abi_tests;
-
-#[cfg(all(not(ndi_link_static), unix))]
-fn load_module(path: &Path) -> Result<libloading::Library, libloading::Error> {
-    // Eager binding detects missing dependent exports before any File resource.
-    unsafe {
-        libloading::os::unix::Library::open(
-            Some(path),
-            libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_LOCAL,
-        )
-    }
-    .map(Into::into)
-}
-#[cfg(all(not(ndi_link_static), not(unix)))]
-fn load_module(path: &Path) -> Result<libloading::Library, libloading::Error> {
-    unsafe { libloading::Library::new(path) }
-}
-
-pub(super) fn unavailable(capability: &str, reason: impl Into<String>) -> FileError {
-    FileError::Core(crate::Error::UnsupportedCapability {
-        capability: capability.into(),
-        reason: reason.into(),
-    })
+    u32::try_from(millis)
+        .ok()
+        .filter(|&millis| millis != u32::MAX)
+        .ok_or_else(|| {
+            FileError::InvalidInput("a wait must be less than u32::MAX milliseconds".into())
+        })
 }
 
 #[cfg(test)]
 impl FileApi {
-    fn mocked(functions: ffi::Functions) -> Self {
+    /// An API whose entry points are the given test doubles.
+    fn with_tables(playback: sys::FilePlayback, recording: sys::FileRecording) -> Self {
         Self {
-            backend: Arc::new(Backend {
-                functions,
-                #[cfg(not(ndi_link_static))]
-                _library: None,
-                _ndi: None,
-                path: None,
-            }),
+            playback: Ok(Box::leak(Box::new(playback))),
+            recording: Ok(Box::leak(Box::new(recording))),
+            library_path: None,
+            _ndi: None,
         }
     }
 }
+
+#[cfg(test)]
+mod mock;
+
 #[cfg(test)]
 mod lifecycle_tests;
 

@@ -216,8 +216,6 @@ pub struct StaticLibrary {
     pub archive: PathBuf,
     pub link_name: String,
     pub edition: Edition,
-    /// The archive is the File library, which embeds the core implementation.
-    pub provides_file_api: bool,
 }
 
 /// Select the one archive to link for a static Apple target.
@@ -252,13 +250,15 @@ pub fn static_library(
         )
     })?;
     let file = format!("ndifile_{platform}");
-    let provides_file_api = file_io && archive(&file).is_file();
-    let link_name = if provides_file_api { file } else { core };
+    let link_name = if file_io && archive(&file).is_file() {
+        file
+    } else {
+        core
+    };
     Ok(StaticLibrary {
         archive: archive(&link_name),
         link_name,
         edition,
-        provides_file_api,
     })
 }
 

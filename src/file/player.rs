@@ -1,156 +1,263 @@
+//! Playing recordings back as an NDI source.
+
+use std::{ffi::CString, marker::PhantomData, path::Path, ptr::NonNull, rc::Rc, time::Duration};
+
 use super::{
-    ffi, timeout_ms, types, FileApi, FileDuration, FileError, FilePosition, FileResult,
-    PlayerEvent, PlayerOptions, PlayerStats, SourceFormat, SourceSpec, SourceTimecode,
+    out_param::OutParam, timeout_ms, types, FileApi, FileDuration, FileError, FilePosition,
+    FileResult, PlayerEvent, PlayerOptions, PlayerStats, SourceFormat, SourceTimecode,
 };
-use std::{
-    ffi::{c_void, CStr, CString},
-    marker::PhantomData,
-    path::Path,
-    ptr::NonNull,
-    rc::Rc,
-    time::Duration,
+use crate::{
+    sys::{self, bindings::*},
+    Source,
 };
 
-/// An advertised playback source. Native calls and destruction stay on this thread.
+/// An NDI source that plays recordings.
 ///
-/// Dropping this value stops playback and removes its advertised source. Calling
-/// [`stop`](Self::stop) alone keeps the advertised source alive between files.
+/// The source is advertised from creation until the player is dropped, whether
+/// or not a file is playing; [`stop`](Self::stop) ends the current file only,
+/// so receivers stay connected between files. Dropping the player stops
+/// playback and removes the source.
+///
+/// A player belongs to the thread that created it. Every method calls into the
+/// SDK and may block. [`AsyncFilePlayer`](super::AsyncFilePlayer) offers the
+/// same operations as futures.
 pub struct FilePlayer {
-    api: FileApi,
-    handle: NonNull<c_void>,
-    _options: PlayerOptions,
-    _raw_options: Box<ffi::PlayerOptions>,
-    // The input-copy contract is not specified. Keep all submitted paths until
-    // native destruction, including rejected starts, rather than guess a lifetime.
-    paths: Vec<CString>,
+    playback: &'static sys::FilePlayback,
+    handle: NonNull<NDIlib_file_player_instance_type>,
+    // The SDK does not say when it copies the strings it is given, so the
+    // creation strings live as long as the player, and the path of the file
+    // started last lives until a later start has replaced it.
+    options: PlayerOptions,
+    path: Option<CString>,
+    // Keeps the NDI runtime initialized.
+    _api: FileApi,
     _thread: PhantomData<Rc<()>>,
 }
+
 impl std::fmt::Debug for FilePlayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FilePlayer")
-            .field("name", &self._options.name())
+            .field("name", &self.options.name())
             .finish_non_exhaustive()
     }
 }
+
 impl FilePlayer {
     pub(super) fn create(api: FileApi, options: PlayerOptions) -> FileResult<Self> {
-        let raw = Box::new(ffi::PlayerOptions {
+        let playback = api.playback()?;
+        let settings = NDIlib_file_player_create_t {
             p_ndi_send_name: options.name.as_ptr(),
             p_groups: options
                 .groups
                 .as_ref()
-                .map_or(std::ptr::null(), |s| s.as_ptr()),
-        });
-        let handle = NonNull::new(unsafe { (api.backend.functions.player_create)(&*raw) })
+                .map_or(std::ptr::null(), |groups| groups.as_ptr()),
+        };
+        // SAFETY: `settings` and the strings it points to are valid for the call.
+        let handle = NonNull::new(unsafe { playback.NDIlib_file_player_create(&settings) })
             .ok_or(FileError::Rejected("player creation"))?;
         Ok(Self {
-            api,
+            playback,
             handle,
-            _options: options,
-            _raw_options: raw,
-            paths: Vec::new(),
+            options,
+            path: None,
+            _api: api,
             _thread: PhantomData,
         })
     }
 
-    /// Start a file, replacing any prior file and clearing pause. Loop setting persists.
+    /// Play a file through the advertised source.
     ///
-    /// The first GOP-compressed start may wait briefly for receiver registration.
+    /// A file already playing is closed first. Playback always begins unpaused
+    /// and uses the player's looping setting. The first start of a
+    /// GOP-compressed file may wait up to about half a second for a receiver
+    /// that has just connected, so that it gets the opening keyframe.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::Rejected`] when the SDK cannot open the file, and
+    /// [`FileError::InvalidInput`] when the path is not UTF-8.
     pub fn start(&mut self, path: impl AsRef<Path>) -> FileResult<()> {
         let path = types::path_string(path.as_ref())?;
-        let pointer = path.as_ptr();
-        self.paths.push(path);
-        if unsafe { (self.api.backend.functions.player_start)(self.handle.as_ptr(), pointer) } {
+        // SAFETY: the player is live and `path` is a NUL-terminated string
+        // that outlives the call.
+        let started = unsafe {
+            self.playback
+                .NDIlib_file_player_start(self.handle.as_ptr(), path.as_ptr())
+        };
+        // The file started before this one is closed by now, so its path can go.
+        self.path = Some(path);
+        if started {
             Ok(())
         } else {
             Err(FileError::Rejected("player start"))
         }
     }
 
-    /// Stop the current file while retaining the advertised sender.
+    /// Stop the current file. The source stays advertised.
     pub fn stop(&mut self) {
-        unsafe { (self.api.backend.functions.player_stop)(self.handle.as_ptr()) };
+        // SAFETY: the player is live for this borrow.
+        unsafe { self.playback.NDIlib_file_player_stop(self.handle.as_ptr()) };
     }
 
-    /// Whether the native playback session is active.
+    /// Whether a file is playing. False after [`stop`](Self::stop) and once
+    /// playback reaches the end of a file that does not loop.
     pub fn is_running(&self) -> bool {
-        unsafe { (self.api.backend.functions.player_running)(self.handle.as_ptr()) }
+        // SAFETY: the player is live for this borrow.
+        unsafe {
+            self.playback
+                .NDIlib_file_player_is_running(self.handle.as_ptr())
+        }
     }
 
-    /// Capture an owned event; timeout is a finite native wait budget.
+    /// Take the next queued event, waiting up to `wait` for one.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::InvalidInput`] when `wait` is `u32::MAX` milliseconds or
+    /// more, and [`FileError::Protocol`] when the SDK's event is malformed.
     pub fn poll_event(&mut self, wait: Duration) -> FileResult<Option<PlayerEvent>> {
         let wait = timeout_ms(wait)?;
-        let mut raw = ffi::PlayerEvent::default();
+        let mut event = OutParam::<NDIlib_file_player_event_t>::new();
+        // SAFETY: the player is live and `event` is writable storage for the
+        // structure the SDK fills in.
         let kind = unsafe {
-            (self.api.backend.functions.player_capture)(self.handle.as_ptr(), &mut raw, wait)
+            self.playback.NDIlib_file_player_capture_event(
+                self.handle.as_ptr(),
+                event.as_mut_ptr(),
+                wait,
+            )
         };
-        if kind == 0 {
+        let event = event.read()?;
+        if kind == NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_none {
             return Ok(None);
         }
-        if kind != raw.kind {
+        if kind != event.type_ {
             return Err(FileError::Protocol(
-                "player event discriminants disagree".into(),
+                "the player returned one event type and stored another".into(),
             ));
         }
-        Ok(Some(PlayerEvent::try_from(&raw)?))
+        Ok(Some(PlayerEvent::try_from(&event)?))
     }
 
-    /// Number of events lost by the native queue over this instance's lifetime.
+    /// How many events the SDK has discarded since the player was created
+    /// because they were not taken in time.
     pub fn dropped_event_count(&self) -> u64 {
-        unsafe { (self.api.backend.functions.player_dropped)(self.handle.as_ptr()) }
+        // SAFETY: the player is live for this borrow.
+        unsafe {
+            self.playback
+                .NDIlib_file_player_get_dropped_event_count(self.handle.as_ptr())
+        }
     }
 
-    /// Current or most recent file telemetry, if available.
-    pub fn stats(&self) -> Option<PlayerStats> {
-        let mut raw = ffi::PlayerStats::default();
-        unsafe { (self.api.backend.functions.player_stats)(self.handle.as_ptr(), &mut raw) }
-            .then(|| PlayerStats::from(&raw))
-    }
-
-    /// Seek relative to the file timeline.
+    /// Counters for the current or most recent file, when the SDK has any.
     ///
-    /// GOP codecs resume at an earlier/equal keyframe. Intra-only content resumes
-    /// at the first frame at/after the requested position; this is not exact seeking.
+    /// # Errors
+    ///
+    /// [`FileError::Protocol`] when the SDK's structure does not match this
+    /// crate's layout.
+    pub fn stats(&self) -> FileResult<Option<PlayerStats>> {
+        let mut stats = OutParam::<NDIlib_file_player_stats_t>::new();
+        // SAFETY: the player is live and `stats` is writable storage for the
+        // structure the SDK fills in.
+        let available = unsafe {
+            self.playback
+                .NDIlib_file_player_get_stats(self.handle.as_ptr(), stats.as_mut_ptr())
+        };
+        let stats = stats.read()?;
+        Ok(available.then(|| PlayerStats::from(&stats)))
+    }
+
+    /// Seek to a position on the file's timeline, where zero is its first frame.
+    ///
+    /// GOP-compressed video resumes at the keyframe at or before the position;
+    /// intra-only video resumes at the first frame at or after it.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::Rejected`] when the SDK refuses the seek.
     pub fn seek(&mut self, position: FilePosition) -> FileResult<()> {
-        if unsafe {
-            (self.api.backend.functions.player_seek_time)(self.handle.as_ptr(), position.ticks())
-        } {
+        // SAFETY: the player is live for this borrow.
+        let sought = unsafe {
+            self.playback
+                .NDIlib_file_player_seek_to_time(self.handle.as_ptr(), position.ticks())
+        };
+        if sought {
             Ok(())
         } else {
             Err(FileError::Rejected("time seek"))
         }
     }
 
-    /// Seek through a frame-rate conversion. Fractional rates make this approximate.
+    /// Seek to a frame index.
+    ///
+    /// The SDK converts the index to a time through the video frame rate, so
+    /// the result is approximate for fractional rates.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::Rejected`] when the SDK refuses the seek.
     pub fn seek_frame_approximate(&mut self, frame: u64) -> FileResult<()> {
-        if unsafe { (self.api.backend.functions.player_seek_frame)(self.handle.as_ptr(), frame) } {
+        // SAFETY: the player is live for this borrow.
+        let sought = unsafe {
+            self.playback
+                .NDIlib_file_player_seek_to_frame(self.handle.as_ptr(), frame)
+        };
+        if sought {
             Ok(())
         } else {
             Err(FileError::Rejected("frame seek"))
         }
     }
 
-    /// Pause/resume the current file; has no effect with no file open.
+    /// Pause or resume the current file. Has no effect when no file is open.
     pub fn set_paused(&mut self, paused: bool) {
-        unsafe { (self.api.backend.functions.player_set_paused)(self.handle.as_ptr(), paused) };
+        // SAFETY: the player is live for this borrow.
+        unsafe {
+            self.playback
+                .NDIlib_file_player_set_paused(self.handle.as_ptr(), paused)
+        };
     }
-    /// Current-file pause state. A new start resets it to false.
+
+    /// Whether the current file is paused. Every [`start`](Self::start) resets
+    /// this to false.
     pub fn is_paused(&self) -> bool {
-        unsafe { (self.api.backend.functions.player_get_paused)(self.handle.as_ptr()) }
+        // SAFETY: the player is live for this borrow.
+        unsafe {
+            self.playback
+                .NDIlib_file_player_get_paused(self.handle.as_ptr())
+        }
     }
-    /// Change instance looping, retained across start/stop. Looping suppresses ended.
+
+    /// Set whether playback restarts at the end of a file.
+    ///
+    /// Looping belongs to the player, not the file: it is kept across
+    /// [`start`](Self::start) and [`stop`](Self::stop). A looping file never
+    /// raises [`PlayerEventKind::Ended`](super::PlayerEventKind::Ended).
     pub fn set_looping(&mut self, looping: bool) {
-        unsafe { (self.api.backend.functions.player_set_loop)(self.handle.as_ptr(), looping) };
+        // SAFETY: the player is live for this borrow.
+        unsafe {
+            self.playback
+                .NDIlib_file_player_set_loop(self.handle.as_ptr(), looping)
+        };
     }
-    /// The persistent instance looping setting.
+
+    /// Whether playback restarts at the end of a file.
     pub fn is_looping(&self) -> bool {
-        unsafe { (self.api.backend.functions.player_get_loop)(self.handle.as_ptr()) }
+        // SAFETY: the player is live for this borrow.
+        unsafe {
+            self.playback
+                .NDIlib_file_player_get_loop(self.handle.as_ptr())
+        }
     }
-    /// Current duration and whether it is final. Growing files can report provisional values.
+
+    /// The current file's best-known duration, and whether it is final.
+    ///
+    /// A file that is still being recorded reports a provisional duration.
     pub fn duration(&self) -> Option<FileDuration> {
         let (mut ticks, mut is_final) = (0, false);
+        // SAFETY: the player is live and both pointers are writable.
         unsafe {
-            (self.api.backend.functions.player_duration)(
+            self.playback.NDIlib_file_player_get_current_duration(
                 self.handle.as_ptr(),
                 &mut ticks,
                 &mut is_final,
@@ -161,58 +268,84 @@ impl FilePlayer {
             is_final,
         })
     }
-    /// Position of the main video frame last sent (audio for an audio-only file).
+
+    /// The position of the frame sent last: the main video track's, or the
+    /// audio track's in a file without video.
     pub fn position(&self) -> Option<FilePosition> {
         let mut ticks = 0;
-        unsafe { (self.api.backend.functions.player_position)(self.handle.as_ptr(), &mut ticks) }
-            .then_some(FilePosition::from_ticks(ticks))
+        // SAFETY: the player is live and the pointer is writable.
+        unsafe {
+            self.playback
+                .NDIlib_file_player_get_current_position(self.handle.as_ptr(), &mut ticks)
+        }
+        .then_some(FilePosition::from_ticks(ticks))
     }
-    /// Preserved signed source timecode, distinct from file-relative position.
+
+    /// The recorded source timecode of the frame sent last. Unlike the
+    /// position it is editorial and need not increase.
     pub fn source_timecode(&self) -> Option<SourceTimecode> {
         let mut ticks = 0;
-        unsafe { (self.api.backend.functions.player_timecode)(self.handle.as_ptr(), &mut ticks) }
-            .then_some(SourceTimecode::from_ticks(ticks))
-    }
-    /// Owned current track format, once a file containing audio/video is open.
-    pub fn source_format(&self) -> FileResult<Option<SourceFormat>> {
-        let mut raw = ffi::SourceFormat::default();
-        if unsafe { (self.api.backend.functions.player_format)(self.handle.as_ptr(), &mut raw) } {
-            Ok(Some(SourceFormat::try_from(&raw)?))
-        } else {
-            Ok(None)
+        // SAFETY: the player is live and the pointer is writable.
+        unsafe {
+            self.playback
+                .NDIlib_file_player_get_current_source_timecode(self.handle.as_ptr(), &mut ticks)
         }
+        .then_some(SourceTimecode::from_ticks(ticks))
     }
-    /// Copy this player's advertised source. Its native strings live until destroy.
-    pub fn advertised_source(&self) -> FileResult<SourceSpec> {
-        let raw = unsafe { (self.api.backend.functions.player_source)(self.handle.as_ptr()) };
-        let raw = unsafe { raw.as_ref() }
-            .ok_or_else(|| FileError::Protocol("player returned no advertised source".into()))?;
-        // The SDK explicitly keeps these NUL-terminated strings valid until this
-        // owner is destroyed; this thread-affine borrow excludes destruction.
-        let copy = |pointer: *const std::ffi::c_char| -> FileResult<Option<CString>> {
-            if pointer.is_null() {
-                return Ok(None);
-            }
-            let text = unsafe { CStr::from_ptr(pointer) };
-            text.to_str()
-                .map_err(|error| FileError::Protocol(error.to_string()))?;
-            Ok(Some(text.to_owned()))
+
+    /// The track layout of the current file, once one with audio or video is open.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::Protocol`] when the SDK's structure is malformed.
+    pub fn source_format(&self) -> FileResult<Option<SourceFormat>> {
+        let mut format = OutParam::<NDIlib_file_source_format_t>::new();
+        // SAFETY: the player is live and `format` is writable storage for the
+        // structure the SDK fills in.
+        let known = unsafe {
+            self.playback
+                .NDIlib_file_player_get_source_format(self.handle.as_ptr(), format.as_mut_ptr())
         };
-        Ok(SourceSpec {
-            name: copy(raw.p_ndi_name)?,
-            url: copy(raw.p_url_address)?,
-        })
+        let format = format.read()?;
+        known.then(|| SourceFormat::try_from(&format)).transpose()
     }
-    /// Stop playback and release the native instance on the current thread.
+
+    /// The NDI source this player advertises, for example to connect a
+    /// [`Receiver`](crate::Receiver) to it.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::Core`] when the SDK returns no source or one whose name is
+    /// not UTF-8.
+    pub fn advertised_source(&self) -> FileResult<Source> {
+        // SAFETY: the player is live. The descriptor the SDK returns, and its
+        // strings, stay valid until the player is destroyed, which this borrow
+        // rules out while they are copied.
+        Ok(unsafe {
+            Source::try_from_raw(
+                self.playback
+                    .NDIlib_file_player_get_advertised_source(self.handle.as_ptr()),
+            )
+        }?)
+    }
+
+    /// Stop playback and remove the advertised source.
+    ///
+    /// Equivalent to dropping the player; provided so the intent is visible at
+    /// the call site.
     pub fn close(self) {
         drop(self);
     }
 }
+
 impl Drop for FilePlayer {
     fn drop(&mut self) {
+        // SAFETY: the player is live and is destroyed exactly once, on the
+        // thread that created it.
         unsafe {
-            (self.api.backend.functions.player_stop)(self.handle.as_ptr());
-            (self.api.backend.functions.player_destroy)(self.handle.as_ptr());
+            self.playback.NDIlib_file_player_stop(self.handle.as_ptr());
+            self.playback
+                .NDIlib_file_player_destroy(self.handle.as_ptr());
         }
     }
 }

@@ -8,13 +8,16 @@ use std::{
     time::Duration,
 };
 
-use super::ffi;
+use crate::sys::bindings::*;
 
 /// Errors from File API configuration, loading or native operations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum FileError {
-    /// The selected build/runtime does not provide this capability.
+    /// The File library, or the part of it an operation needs, cannot be used
+    /// in this process. The text says why: no library was found (with every
+    /// location tried), the selected NDI runtime is not one the File library
+    /// can accompany, or the library lacks an entry point.
     #[error("File API unavailable: {0}")]
     Unavailable(String),
     /// A value cannot be represented by the native API.
@@ -59,7 +62,11 @@ pub struct SourceSpec {
 }
 
 impl SourceSpec {
-    /// Select a source by its nonempty UTF-8 NDI display name.
+    /// Select a source by its NDI name, for example `"MACHINE (Camera 1)"`.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::InvalidInput`] when the name is empty or contains a NUL.
     pub fn new(name: impl AsRef<str>) -> FileResult<Self> {
         Ok(Self {
             name: Some(cstring(name.as_ref(), "source name", false)?),
@@ -67,7 +74,12 @@ impl SourceSpec {
         })
     }
 
-    /// Select a source by its direct nonempty UTF-8 URL/address.
+    /// Select a source by its address, for example `"192.168.1.20:5961"`,
+    /// without discovering it by name.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::InvalidInput`] when the address is empty or contains a NUL.
     pub fn from_url(url: impl AsRef<str>) -> FileResult<Self> {
         Ok(Self {
             name: None,
@@ -117,7 +129,11 @@ pub struct PlayerOptions {
 }
 
 impl PlayerOptions {
-    /// Choose the nonempty source name advertised when the player is created.
+    /// Choose the name of the NDI source the player advertises.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::InvalidInput`] when the name is empty or contains a NUL.
     pub fn new(name: impl AsRef<str>) -> FileResult<Self> {
         Ok(Self {
             name: cstring(name.as_ref(), "player name", false)?,
@@ -125,7 +141,11 @@ impl PlayerOptions {
         })
     }
 
-    /// Set the comma-separated groups advertised for the player's lifetime.
+    /// Set the comma-separated NDI groups the player's source is advertised in.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::InvalidInput`] when the text contains a NUL.
     pub fn with_groups(mut self, groups: impl AsRef<str>) -> FileResult<Self> {
         self.groups = Some(cstring(groups.as_ref(), "player groups", true)?);
         Ok(self)
@@ -152,17 +172,25 @@ pub struct TrackSelection(u32);
 
 impl TrackSelection {
     /// Record video.
-    pub const VIDEO: Self = Self(1);
+    pub const VIDEO: Self =
+        Self(NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_video);
     /// Record audio.
-    pub const AUDIO: Self = Self(2);
+    pub const AUDIO: Self =
+        Self(NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_audio);
     /// Record metadata.
-    pub const METADATA: Self = Self(4);
+    pub const METADATA: Self =
+        Self(NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_metadata);
     /// Record all three track types.
-    pub const ALL: Self = Self(7);
+    pub const ALL: Self =
+        Self(NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_all);
 
-    /// Validate a bitmask containing only VIDEO, AUDIO and METADATA.
+    /// A selection from the SDK's track flags.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::InvalidInput`] when no flag is set or an unknown one is.
     pub fn from_bits(bits: u32) -> FileResult<Self> {
-        if bits == 0 || bits & !7 != 0 {
+        if bits == 0 || bits & !Self::ALL.0 != 0 {
             Err(FileError::InvalidInput(
                 "track selection must contain one or more known track flags".into(),
             ))
@@ -201,6 +229,7 @@ pub struct RecorderOptions {
     pub(super) pattern: Option<CString>,
     pub(super) disable_proxy: bool,
     pub(super) rollover_bytes: u64,
+    pub(super) drop_wait: Duration,
 }
 
 impl RecorderOptions {
@@ -214,7 +243,31 @@ impl RecorderOptions {
             pattern: None,
             disable_proxy: false,
             rollover_bytes: 0,
+            drop_wait: Self::DEFAULT_DROP_WAIT,
         }
+    }
+
+    /// How long dropping a recorder waits for its open file to be finalized,
+    /// unless [`with_drop_wait`](Self::with_drop_wait) says otherwise.
+    pub const DEFAULT_DROP_WAIT: Duration = Duration::from_secs(5);
+
+    /// Set how long dropping the recorder waits for an unfinished session.
+    ///
+    /// The SDK finalizes a file between the stop request and its file-closed
+    /// event; destroying the recorder sooner may leave a truncated file. A
+    /// recorder dropped with a session still open therefore requests the stop
+    /// and waits up to `wait` for that event before it is destroyed. The wait
+    /// ends as soon as the file is closed, so the limit only matters when the
+    /// SDK does not report closure. `Duration::ZERO` destroys at once, like
+    /// [`FileRecorder::abandon`](super::FileRecorder::abandon).
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::InvalidInput`] when `wait` is `u32::MAX` milliseconds or more.
+    pub fn with_drop_wait(mut self, wait: Duration) -> FileResult<Self> {
+        super::timeout_ms(wait)?;
+        self.drop_wait = wait;
+        Ok(self)
     }
 
     /// Select which track types to record.
@@ -265,8 +318,12 @@ impl RecorderOptions {
 
     /// Set a filename pattern using `{prefix}`, `{index}` and `{index:N}` tokens.
     ///
-    /// Zero-padding widths are limited to 1..=1024. Unknown tokens, unbalanced
-    /// braces, empty strings and NUL bytes are rejected before calling the SDK.
+    /// `{index:N}` pads the index with zeros to `N` digits, from 1 through 1024.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::InvalidInput`] when the pattern is empty, has an unknown
+    /// token or unbalanced braces, or contains a NUL.
     pub fn with_pattern(mut self, pattern: impl AsRef<str>) -> FileResult<Self> {
         validate_pattern(pattern.as_ref())?;
         self.pattern = Some(cstring(pattern.as_ref(), "filename pattern", false)?);
@@ -288,6 +345,11 @@ impl RecorderOptions {
         self.pattern
             .as_ref()
             .map(|s| s.to_str().expect("validated UTF-8"))
+    }
+
+    /// How long dropping the recorder waits for an unfinished session.
+    pub fn drop_wait(&self) -> Duration {
+        self.drop_wait
     }
 }
 
@@ -334,7 +396,13 @@ pub struct RecordingTarget {
 }
 
 impl RecordingTarget {
-    /// Validate and own an output prefix or exact path.
+    /// Take an output prefix or exact path, making a relative one absolute.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::InvalidInput`] when the path is empty, is not UTF-8 or
+    /// contains a NUL, and [`FileError::Io`] when a relative path cannot be
+    /// resolved because the current directory is unavailable.
     pub fn new(path: impl AsRef<Path>) -> FileResult<Self> {
         let path = path.as_ref();
         if path.as_os_str().is_empty() {
@@ -447,7 +515,12 @@ impl FilePosition {
         Self(ticks)
     }
 
-    /// Convert duration, rounding down to a 100ns tick and checking overflow.
+    /// The position `duration` after the start of the file, rounded down to a
+    /// 100 ns tick.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::InvalidInput`] when the duration exceeds 64 bits of ticks.
     pub fn from_duration(duration: Duration) -> FileResult<Self> {
         let ticks = duration.as_nanos() / 100;
         u64::try_from(ticks)
@@ -531,10 +604,14 @@ pub enum FileScanType {
 impl FileScanType {
     pub(super) fn from_raw(value: u32) -> Self {
         match value {
-            0 => Self::Interleaved,
-            1 => Self::Progressive,
-            2 => Self::Field0,
-            3 => Self::Field1,
+            NDIlib_file_video_frame_format_e_NDIlib_file_video_frame_format_interleaved => {
+                Self::Interleaved
+            }
+            NDIlib_file_video_frame_format_e_NDIlib_file_video_frame_format_progressive => {
+                Self::Progressive
+            }
+            NDIlib_file_video_frame_format_e_NDIlib_file_video_frame_format_field_0 => Self::Field0,
+            NDIlib_file_video_frame_format_e_NDIlib_file_video_frame_format_field_1 => Self::Field1,
             value => Self::Unknown(value),
         }
     }
@@ -679,12 +756,18 @@ pub enum PlayerEventKind {
 impl PlayerEventKind {
     pub(super) fn from_raw(value: u32) -> Self {
         match value {
-            1 => Self::Ended,
-            2 => Self::Error,
-            3 => Self::FileOpened,
-            4 => Self::FirstFrame,
-            5 => Self::FileClosed,
-            6 => Self::Looped,
+            NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_ended => Self::Ended,
+            NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_error => Self::Error,
+            NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_file_opened => {
+                Self::FileOpened
+            }
+            NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_first_frame => {
+                Self::FirstFrame
+            }
+            NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_file_closed => {
+                Self::FileClosed
+            }
+            NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_looped => Self::Looped,
             value => Self::Unknown(value),
         }
     }
@@ -766,17 +849,37 @@ pub enum RecorderEventKind {
 impl RecorderEventKind {
     pub(super) fn from_raw(value: u32) -> Self {
         match value {
-            1 => Self::Started,
-            2 => Self::Rollover,
-            3 => Self::OpenFailed,
-            4 => Self::WriteFailed,
-            5 => Self::Error,
-            6 => Self::FormatChanged,
-            7 => Self::FirstFrame,
-            8 => Self::SourceLost,
-            9 => Self::SourceConnected,
-            10 => Self::FileClosed,
-            11 => Self::ProxyMissing,
+            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_started => {
+                Self::Started
+            }
+            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_rollover => {
+                Self::Rollover
+            }
+            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_open_failed => {
+                Self::OpenFailed
+            }
+            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_write_failed => {
+                Self::WriteFailed
+            }
+            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_error => Self::Error,
+            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_format_changed => {
+                Self::FormatChanged
+            }
+            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_first_frame => {
+                Self::FirstFrame
+            }
+            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_source_lost => {
+                Self::SourceLost
+            }
+            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_source_connected => {
+                Self::SourceConnected
+            }
+            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_file_closed => {
+                Self::FileClosed
+            }
+            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_proxy_missing => {
+                Self::ProxyMissing
+            }
             value => Self::Unknown(value),
         }
     }
@@ -921,8 +1024,8 @@ impl RecorderStats {
     }
 }
 
-impl From<&ffi::VideoTrack> for VideoTrack {
-    fn from(raw: &ffi::VideoTrack) -> Self {
+impl From<&NDIlib_file_video_track_format_t> for VideoTrack {
+    fn from(raw: &NDIlib_file_video_track_format_t) -> Self {
         Self {
             high_quality: raw.is_high_quality,
             width: raw.xres,
@@ -930,22 +1033,23 @@ impl From<&ffi::VideoTrack> for VideoTrack {
             frame_rate_n: raw.frame_rate_n,
             frame_rate_d: raw.frame_rate_d,
             fourcc: FourCc::from_raw(raw.fourcc),
-            scan_type: FileScanType::from_raw(raw.frame_format_type as u32),
+            scan_type: FileScanType::from_raw(raw.frame_format_type),
             aspect_ratio: raw.picture_aspect_ratio,
         }
     }
 }
 
-impl TryFrom<&ffi::SourceFormat> for SourceFormat {
+impl TryFrom<&NDIlib_file_source_format_t> for SourceFormat {
     type Error = FileError;
 
-    fn try_from(raw: &ffi::SourceFormat) -> FileResult<Self> {
+    fn try_from(raw: &NDIlib_file_source_format_t) -> FileResult<Self> {
         let count = usize::try_from(raw.video_track_count)
             .map_err(|_| FileError::Protocol("video track count does not fit usize".into()))?;
         let tracks = raw.video_tracks.get(..count).ok_or_else(|| {
             FileError::Protocol(format!(
-                "source format reports {} video tracks; the ABI holds two",
-                raw.video_track_count
+                "source format reports {} video tracks; the SDK layout holds {}",
+                raw.video_track_count,
+                raw.video_tracks.len()
             ))
         })?;
         Ok(Self {
@@ -959,10 +1063,10 @@ impl TryFrom<&ffi::SourceFormat> for SourceFormat {
     }
 }
 
-impl TryFrom<&ffi::FileInfo> for FileInfo {
+impl TryFrom<&NDIlib_file_player_file_info_t> for FileInfo {
     type Error = FileError;
 
-    fn try_from(raw: &ffi::FileInfo) -> FileResult<Self> {
+    fn try_from(raw: &NDIlib_file_player_file_info_t) -> FileResult<Self> {
         Ok(Self {
             duration: FileDuration {
                 position: FilePosition::from_ticks(raw.duration_100ns),
@@ -977,14 +1081,14 @@ impl TryFrom<&ffi::FileInfo> for FileInfo {
     }
 }
 
-impl TryFrom<&ffi::PlayerEvent> for PlayerEvent {
+impl TryFrom<&NDIlib_file_player_event_t> for PlayerEvent {
     type Error = FileError;
 
-    fn try_from(raw: &ffi::PlayerEvent) -> FileResult<Self> {
+    fn try_from(raw: &NDIlib_file_player_event_t) -> FileResult<Self> {
         Ok(Self {
-            kind: PlayerEventKind::from_raw(raw.kind as u32),
-            path: EventText::from_buffer(&raw.path),
-            message: EventText::from_buffer(&raw.message),
+            kind: PlayerEventKind::from_raw(raw.type_),
+            path: EventText::from_buffer(&raw.p_path),
+            message: EventText::from_buffer(&raw.p_message),
             first_pts: FilePosition::from_ticks(raw.first_pts_100ns),
             last_pts: FilePosition::from_ticks(raw.last_pts_100ns),
             source_timecode: raw
@@ -995,15 +1099,15 @@ impl TryFrom<&ffi::PlayerEvent> for PlayerEvent {
     }
 }
 
-impl TryFrom<&ffi::RecorderEvent> for RecorderEvent {
+impl TryFrom<&NDIlib_file_recorder_event_t> for RecorderEvent {
     type Error = FileError;
 
-    fn try_from(raw: &ffi::RecorderEvent) -> FileResult<Self> {
+    fn try_from(raw: &NDIlib_file_recorder_event_t) -> FileResult<Self> {
         Ok(Self {
-            kind: RecorderEventKind::from_raw(raw.kind as u32),
-            path: EventText::from_buffer(&raw.path),
-            message: EventText::from_buffer(&raw.message),
-            track_flags: raw.track_flags as u32,
+            kind: RecorderEventKind::from_raw(raw.type_),
+            path: EventText::from_buffer(&raw.p_path),
+            message: EventText::from_buffer(&raw.p_message),
+            track_flags: raw.track_flags,
             dropped_packet_count: raw.dropped_packet_count,
             first_pts: FilePosition::from_ticks(raw.first_pts_100ns),
             last_pts: FilePosition::from_ticks(raw.last_pts_100ns),
@@ -1013,8 +1117,8 @@ impl TryFrom<&ffi::RecorderEvent> for RecorderEvent {
     }
 }
 
-impl From<&ffi::PlayerStats> for PlayerStats {
-    fn from(raw: &ffi::PlayerStats) -> Self {
+impl From<&NDIlib_file_player_stats_t> for PlayerStats {
+    fn from(raw: &NDIlib_file_player_stats_t) -> Self {
         Self {
             video_frames: raw.video_frames_sent,
             audio_frames: raw.audio_frames_sent,
@@ -1024,8 +1128,8 @@ impl From<&ffi::PlayerStats> for PlayerStats {
     }
 }
 
-impl From<&ffi::RecorderStats> for RecorderStats {
-    fn from(raw: &ffi::RecorderStats) -> Self {
+impl From<&NDIlib_file_recorder_stats_t> for RecorderStats {
+    fn from(raw: &NDIlib_file_recorder_stats_t) -> Self {
         Self {
             bytes_written: raw.bytes_written,
             video_frames: raw.video_frames,
@@ -1145,7 +1249,7 @@ mod tests {
 
     #[test]
     fn raw_track_count_is_bounded_before_slicing() {
-        let mut raw = ffi::SourceFormat {
+        let mut raw = NDIlib_file_source_format_t {
             video_track_count: 3,
             ..Default::default()
         };
@@ -1163,11 +1267,11 @@ mod tests {
 
     #[test]
     fn malformed_event_text_does_not_hide_file_closed() {
-        let mut raw = ffi::RecorderEvent {
-            kind: 10,
+        let mut raw = NDIlib_file_recorder_event_t {
+            type_: NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_file_closed,
             ..Default::default()
         };
-        raw.path.fill(0xff_u8 as c_char);
+        raw.p_path.fill(0xff_u8 as c_char);
         let event = RecorderEvent::try_from(&raw).unwrap();
         assert_eq!(event.kind(), RecorderEventKind::FileClosed);
         assert!(!event.path().is_terminated());

@@ -1,292 +1,579 @@
-//! These tests require the explicit isolated-network opt-in and a real File SDK.
+//! The File API against a real File library.
+//!
+//! Every test starts with [`file_api`], which follows the crate's test policy:
+//! it runs wherever an NDI runtime and its File library are installed, is
+//! visibly skipped elsewhere, and fails instead when
+//! `GRAFTON_NDI_REQUIRE_RUNTIME` promises `file`. Each test records its own
+//! material from a sender on the loopback interface; none needs a prepared file.
+
 use super::*;
+use crate::test_support::{self, Requirement};
 use std::{
+    future::Future,
     path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    task::{Context, Poll, Wake, Waker},
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-fn api() -> FileApi {
-    assert_eq!(std::env::var("GRAFTON_NDI_ISOLATED_NETWORK").as_deref(), Ok("1"),
-        "run File integration tests in an isolated network namespace and set GRAFTON_NDI_ISOLATED_NETWORK=1");
-    let ndi = crate::NDI::new().expect("real selected runtime");
-    FileApi::open(&ndi, &FileRuntimeOptions::default()).expect("matching File runtime")
-}
+/// The longest any single SDK step is given before a test fails.
+const PATIENCE: Duration = Duration::from_secs(15);
 
-#[cfg(all(unix, not(ndi_link_static)))]
-#[test]
-#[ignore = "requires an explicit genuine Standard runtime; run in its own isolated process"]
-fn native_file_rejects_standard_posix_before_load() {
-    let path = PathBuf::from(
-        std::env::var_os("GRAFTON_NDI_TEST_STANDARD_RUNTIME")
-            .expect("absolute Standard core library path"),
-    );
-    let ndi = crate::NDI::with_options(
-        &crate::RuntimeOptions::default()
-            .library_path(path)
-            .edition(crate::SdkEdition::Standard),
-    )
-    .expect("Standard core runtime");
-    // A deliberately nonexistent File path proves that edition gating precedes
-    // any attempt to load a companion module or resolve its dependencies.
-    let options = FileRuntimeOptions::default()
-        .with_library_path(std::env::temp_dir().join("no-such-ndi-file-module"))
-        .unwrap();
-    assert!(matches!(
-        FileApi::open(&ndi, &options),
-        Err(FileError::Core(crate::Error::UnsupportedCapability { reason, .. }))
-            if reason.starts_with("RuntimeEditionMismatch:")
-    ));
-}
-
-#[cfg(all(target_os = "windows", target_arch = "x86", not(ndi_link_static)))]
-#[test]
-#[ignore = "requires a genuine Windows x86 core runtime"]
-fn native_file_rejects_windows_x86_before_load() {
-    let ndi = crate::NDI::new().expect("Windows x86 core runtime");
-    let options = FileRuntimeOptions::default()
-        .with_library_path(std::env::temp_dir().join("no-such-ndi-file-module.dll"))
-        .unwrap();
-    assert!(matches!(
-        FileApi::open(&ndi, &options),
-        Err(FileError::Core(crate::Error::UnsupportedCapability { reason, .. }))
-            if reason.starts_with("TargetArtifactUnavailable:")
-    ));
-}
-
-#[test]
-#[ignore = "requires a genuine File SDK, isolated network and GRAFTON_NDI_FILE_FIXTURE"]
-fn native_file_probe_and_player_controls() {
-    let api = api();
-    let fixture =
-        PathBuf::from(std::env::var_os("GRAFTON_NDI_FILE_FIXTURE").expect("fixture path"));
-    let info = api.probe(&fixture).expect("probe valid MKV");
-    assert!(info.video_track_count() > 0);
-    assert!(api.probe(fixture.with_extension("does-not-exist")).is_err());
-    let mut player = api
-        .create_player(PlayerOptions::new("isolated-file-player-test").unwrap())
-        .unwrap();
-    assert!(!player.is_running());
-    player.set_paused(true);
-    assert!(!player.is_paused(), "pause without a file has no effect");
-    player.set_looping(true);
-    let source = player.advertised_source().unwrap();
-    player.start(&fixture).expect("start playback");
-    assert!(player.is_looping());
-    player.set_paused(true);
-    assert!(player.is_paused());
-    assert!(player.source_format().unwrap().is_some());
-    player.seek(FilePosition::from_ticks(0)).expect("seek");
-    player.set_paused(false);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut opened = false;
-    while Instant::now() < deadline {
-        if let Some(event) = player.poll_event(Duration::from_millis(50)).unwrap() {
-            assert_ne!(
-                event.kind(),
-                PlayerEventKind::Error,
-                "{}",
-                event.message().to_string_lossy()
+/// The selected runtime and its File library, or `None` when either is absent.
+fn file_api() -> Option<(crate::NDI, FileApi)> {
+    let ndi = test_support::ndi()?;
+    match FileApi::open(&ndi, &FileRuntimeOptions::default()) {
+        Ok(api) => Some((ndi, api)),
+        Err(FileError::Unavailable(reason)) => {
+            test_support::skip(
+                Requirement::File,
+                &format!("the NDI File library is unavailable: {reason}"),
             );
-            if event.kind() == PlayerEventKind::FileOpened {
-                opened = true;
-                break;
-            }
+            None
         }
+        Err(error) => panic!("the NDI File library could not be selected: {error}"),
     }
-    assert!(opened, "expected file-opened event");
-    player.stop();
-    assert!(!player.is_running());
-    assert!(!player.is_paused());
-    assert!(player.is_looping(), "loop is instance state");
-    assert_eq!(
-        player.advertised_source().unwrap(),
-        source,
-        "stop retains advertised identity"
-    );
 }
 
-#[test]
-#[ignore = "requires a genuine File SDK, isolated network and GRAFTON_NDI_FILE_FIXTURE"]
-fn native_file_async_player_owner_thread() {
-    use std::{
-        future::Future,
-        sync::Arc,
-        task::{Context, Poll, Wake, Waker},
-    };
-    struct ThreadWake(std::thread::Thread);
-    impl Wake for ThreadWake {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
+/// A directory for one test's recordings, removed when the test ends.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(test: &str) -> Self {
+        let directory =
+            std::env::temp_dir().join(format!("grafton-ndi-file-{}-{test}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        Self(directory)
     }
-    fn wait<F: Future>(future: F) -> F::Output {
-        let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
-        let mut future = std::pin::pin!(future);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Poll::Ready(value) = future.as_mut().poll(&mut Context::from_waker(&waker)) {
-                return value;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "owner thread did not complete operation"
-            );
-            std::thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
-        }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.0.join(name)
     }
-    let api = api();
-    let fixture =
-        PathBuf::from(std::env::var_os("GRAFTON_NDI_FILE_FIXTURE").expect("fixture path"));
-    assert!(
-        wait(AsyncFilePlayer::probe(api.clone(), fixture.clone()))
-            .unwrap()
-            .video_track_count()
-            > 0
-    );
-    let player = wait(AsyncFilePlayer::create(
-        api,
-        PlayerOptions::new("isolated-async-file-player-test").unwrap(),
-    ))
-    .unwrap();
-    wait(player.set_looping(true)).unwrap();
-    wait(player.start(fixture)).unwrap();
-    assert!(wait(player.is_running()).unwrap());
-    assert!(wait(player.is_looping()).unwrap());
-    wait(player.set_paused(true)).unwrap();
-    assert!(wait(player.is_paused()).unwrap());
-    assert!(wait(player.source_format()).unwrap().is_some());
-    let retained = player.clone();
-    wait(player.close()).expect("owner destroyed before close completes");
-    assert!(
-        wait(retained.is_running()).is_err(),
-        "close invalidates all handles"
-    );
 }
 
-#[test]
-#[ignore = "requires a genuine File SDK and isolated-network writable scratch directory"]
-fn native_file_record_finalize_and_probe() {
-    let api = api();
-    let ndi = crate::NDI::new().unwrap();
-    let sender = crate::Sender::new(
-        &ndi,
-        &crate::SenderOptions::builder("isolated-file-recorder-test").build(),
-    )
-    .unwrap();
-    let mut source = sender.source().unwrap();
-    if matches!(source.address, crate::SourceAddress::None) {
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A sender that produces video until dropped, reachable over loopback.
+struct LiveSource {
+    spec: SourceSpec,
+    running: Arc<AtomicBool>,
+    producer: Option<JoinHandle<()>>,
+}
+
+impl LiveSource {
+    fn start(ndi: &crate::NDI, test: &str) -> Self {
+        let name = format!("grafton-file-{}-{test}", std::process::id());
+        let sender =
+            crate::Sender::new(ndi, &crate::SenderOptions::builder(name.as_str()).build()).unwrap();
+        let spec = Self::loopback(ndi, &sender);
+        let running = Arc::new(AtomicBool::new(true));
+        let keep_running = Arc::clone(&running);
+        let producer = thread::spawn(move || {
+            let frame = crate::VideoFrame::builder()
+                .resolution(320, 180)
+                .pixel_format(crate::PixelFormat::BGRA)
+                .build()
+                .unwrap();
+            while keep_running.load(Ordering::Acquire) {
+                sender.send_video(&frame);
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        Self {
+            spec,
+            running,
+            producer: Some(producer),
+        }
+    }
+
+    /// The sender's endpoint on the loopback interface, so that recording does
+    /// not depend on which other interfaces the machine has.
+    fn loopback(ndi: &crate::NDI, sender: &crate::Sender) -> SourceSpec {
+        let name = sender.source().unwrap().name;
         let finder = crate::Finder::new(
-            &ndi,
+            ndi,
             &crate::FinderOptions::builder()
                 .extra_ips("127.0.0.1")
                 .build(),
         )
         .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if let Some(found) = finder.current_sources().unwrap().into_iter().find(|found| {
-                found.name == source.name && !matches!(found.address, crate::SourceAddress::None)
-            }) {
-                source = found;
-                break;
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            for source in finder.current_sources().unwrap() {
+                if let (true, crate::SourceAddress::Ip(address)) =
+                    (source.name == name, &source.address)
+                {
+                    let port = address.rsplit(':').next().expect("an address with a port");
+                    return SourceSpec::from_url(format!("127.0.0.1:{port}")).unwrap();
+                }
             }
+            assert!(Instant::now() < deadline, "{name} was not discovered");
             finder.wait_for_sources(Duration::from_millis(50)).unwrap();
         }
     }
-    eprintln!("isolated recorder source: {source:?}");
-    let input = match source.address {
-        crate::SourceAddress::Ip(address) | crate::SourceAddress::Url(address) => {
-            // Keep the native port but use only the namespace's loopback interface.
-            let port = address
-                .rsplit(':')
-                .next()
-                .and_then(|port| port.parse::<u16>().ok())
-                .expect("sender address port");
-            SourceSpec::from_url(format!("127.0.0.1:{port}")).unwrap()
-        }
-        crate::SourceAddress::None => SourceSpec::new(&source.name).unwrap(),
-    };
-    let directory = PathBuf::from(
-        std::env::var_os("GRAFTON_NDI_FILE_SCRATCH").expect("private writable scratch"),
-    );
-    let filename = directory.join(format!("file-roundtrip-{}.mkv", std::process::id()));
-    assert!(!filename.exists(), "test output must be new");
-    let mut recorder = api
-        .create_recorder(
-            RecorderOptions::new(input)
-                .exact_filename()
-                .with_proxy(false)
-                .with_tracks(TrackSelection::VIDEO),
-        )
-        .unwrap();
-    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let flag = running.clone();
-    let producer = std::thread::spawn(move || {
-        let frame = crate::VideoFrame::builder()
-            .resolution(320, 180)
-            .pixel_format(crate::PixelFormat::BGRA)
-            .build()
-            .unwrap();
-        while flag.load(std::sync::atomic::Ordering::Acquire) {
-            sender.send_video(&frame);
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    });
-    // Always stop the producer even if a checked SDK result fails below.
-    struct Producer {
-        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        join: Option<std::thread::JoinHandle<()>>,
-    }
-    impl Drop for Producer {
-        fn drop(&mut self) {
-            self.flag.store(false, std::sync::atomic::Ordering::Release);
-            if let Some(join) = self.join.take() {
-                let _ = join.join();
-            }
+}
+
+impl Drop for LiveSource {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        if let Some(producer) = self.producer.take() {
+            let _ = producer.join();
         }
     }
-    let _producer = Producer {
-        flag: running,
-        join: Some(producer),
-    };
+}
+
+/// Options that record the live source's video to exactly the given file name.
+fn exact_video(source: &LiveSource) -> RecorderOptions {
+    RecorderOptions::new(source.spec.clone())
+        .exact_filename()
+        .with_proxy(false)
+        .with_tracks(TrackSelection::VIDEO)
+}
+
+/// Poll until an event of `kind` arrives, failing on a recorder error.
+fn await_event(recorder: &mut FileRecorder, kind: RecorderEventKind) -> RecorderEvent {
+    let deadline = Instant::now() + PATIENCE;
+    while Instant::now() < deadline {
+        let Some(event) = recorder.poll_event(Duration::from_millis(50)).unwrap() else {
+            continue;
+        };
+        assert!(
+            !matches!(
+                event.kind(),
+                RecorderEventKind::Error | RecorderEventKind::OpenFailed
+            ),
+            "{:?}: {}",
+            event.kind(),
+            event.message().to_string_lossy()
+        );
+        if event.kind() == kind {
+            return event;
+        }
+    }
+    panic!("no {kind:?} event arrived");
+}
+
+/// Record a short clip of `source` to `file` and return its report.
+fn record_clip(api: &FileApi, source: &LiveSource, file: &PathBuf) -> RecordingReport {
+    let mut recorder = api.create_recorder(exact_video(source)).unwrap();
     recorder
         .start(
-            RecordingTarget::new(&filename).unwrap(),
+            RecordingTarget::new(file).unwrap(),
             RecordingTimecode::Preserve,
         )
-        .expect("record start");
-    let deadline = Instant::now() + Duration::from_secs(8);
-    let mut first_frame = false;
-    while Instant::now() < deadline {
-        if let Some(event) = recorder.poll_event(Duration::from_millis(50)).unwrap() {
-            assert!(
-                !matches!(
-                    event.kind(),
-                    RecorderEventKind::Error | RecorderEventKind::OpenFailed
-                ),
-                "{}",
-                event.message().to_string_lossy()
-            );
-            if event.kind() == RecorderEventKind::FirstFrame {
-                first_frame = true;
-                break;
-            }
+        .unwrap();
+    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+    thread::sleep(Duration::from_millis(300));
+    match recorder.finish(PATIENCE).unwrap() {
+        FinishStatus::Closed(report) => report,
+        other => panic!("the recording was not confirmed closed: {other:?}"),
+    }
+}
+
+/// Drive a future to completion on the test thread.
+fn block_on<F: Future>(future: F) -> F::Output {
+    struct Unpark(thread::Thread);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
         }
     }
-    assert!(first_frame, "recorder did not capture loopback source");
-    for _ in 0..10 {
-        let _ = recorder.poll_event(Duration::from_millis(30)).unwrap();
+    let waker = Waker::from(Arc::new(Unpark(thread::current())));
+    let mut future = std::pin::pin!(future);
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut Context::from_waker(&waker)) {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "the operation did not complete");
+        thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
     }
-    let report = recorder.finish(Duration::from_secs(5)).unwrap();
-    let FinishStatus::Closed(report) = report else {
-        panic!("recording closure not confirmed: {report:?}")
+}
+
+#[test]
+fn a_recording_is_finalized_and_probes_with_its_video_track() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("record");
+    let source = LiveSource::start(&ndi, "record");
+    let file = scratch.path("take.mkv");
+
+    let mut recorder = api.create_recorder(exact_video(&source)).unwrap();
+    assert_eq!(recorder.state(), RecorderState::Idle);
+    assert_eq!(recorder.last_accepted_source(), Some(&source.spec));
+    let session = recorder
+        .start(
+            RecordingTarget::new(&file).unwrap(),
+            RecordingTimecode::Preserve,
+        )
+        .unwrap();
+    assert_eq!(session, 1);
+    let first = await_event(&mut recorder, RecorderEventKind::FirstFrame);
+    assert_eq!(first.source_format().video_tracks().len(), 1);
+    assert_eq!(
+        recorder.reported_current_file().unwrap().as_bytes(),
+        file.to_str().unwrap().as_bytes()
+    );
+    assert!(recorder.is_recording());
+    assert!(recorder.source_format().unwrap().is_some());
+    thread::sleep(Duration::from_millis(300));
+    let stats = recorder.stats().unwrap().expect("counters while recording");
+    assert!(stats.video_frames() > 0);
+
+    let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
+        panic!("the recording was not confirmed closed");
     };
     assert!(report.closure_confirmed());
+    assert_eq!(report.closed_files(), 1);
     assert_eq!(report.error_events(), 0);
-    let file = api
-        .probe(&filename)
-        .expect("completed recording probes successfully");
-    assert_eq!(file.video_track_count(), 1);
-    assert!(file.duration().value().ticks() > 0);
-    std::fs::remove_file(&filename).unwrap();
+    assert_eq!(recorder.state(), RecorderState::Closed);
+    assert!(!recorder.is_recording());
+
+    let info = api.probe(&file).unwrap();
+    assert_eq!(info.video_track_count(), 1);
+    assert!(info.duration().is_final());
+    assert!(info.duration().value().ticks() > 0);
+    assert!(matches!(
+        api.probe(scratch.path("absent.mkv")),
+        Err(FileError::Rejected(_))
+    ));
+}
+
+#[test]
+fn a_rollover_requested_just_before_the_stop_still_ends_in_a_confirmed_close() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("late-rollover");
+    let source = LiveSource::start(&ndi, "late-rollover");
+    let options = RecorderOptions::new(source.spec.clone())
+        .with_proxy(false)
+        .with_tracks(TrackSelection::VIDEO);
+    let mut recorder = api.create_recorder(options).unwrap();
+    recorder
+        .start(
+            RecordingTarget::new(scratch.path("first")).unwrap(),
+            RecordingTimecode::Preserve,
+        )
+        .unwrap();
+    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+    recorder
+        .rollover(RecordingTarget::new(scratch.path("second")).unwrap())
+        .unwrap();
+    let outcome = recorder.finish(PATIENCE).unwrap();
+    let FinishStatus::Closed(report) = outcome else {
+        panic!("the session did not reach a confirmed close: {outcome:?}");
+    };
+    assert!(report.closed_files() >= 1);
+}
+
+#[test]
+fn rollovers_and_a_source_switch_end_in_a_confirmed_close_of_every_file() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("rollovers");
+    let source = LiveSource::start(&ndi, "rollovers");
+    let options = RecorderOptions::new(source.spec.clone())
+        .with_proxy(false)
+        .with_tracks(TrackSelection::VIDEO);
+    let mut recorder = api.create_recorder(options).unwrap();
+    recorder
+        .start(
+            RecordingTarget::new(scratch.path("first")).unwrap(),
+            RecordingTimecode::Preserve,
+        )
+        .unwrap();
+    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+
+    recorder
+        .rollover(RecordingTarget::new(scratch.path("second")).unwrap())
+        .unwrap();
+    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+    recorder.set_source(source.spec.clone()).unwrap();
+    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+    assert_eq!(recorder.state(), RecorderState::Recording);
+
+    let outcome = recorder.finish(PATIENCE).unwrap();
+    let FinishStatus::Closed(report) = outcome else {
+        panic!("the session did not reach a confirmed close: {outcome:?}");
+    };
+    assert_eq!(report.closed_files(), 3);
+    for entry in std::fs::read_dir(&scratch.0).unwrap() {
+        let file = entry.unwrap().path();
+        assert!(api.probe(&file).unwrap().duration().is_final(), "{file:?}");
+    }
+}
+
+#[test]
+fn injected_metadata_is_recorded_on_the_metadata_track() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("metadata");
+    let source = LiveSource::start(&ndi, "metadata");
+    let file = scratch.path("marked.mkv");
+    let options = RecorderOptions::new(source.spec.clone())
+        .exact_filename()
+        .with_proxy(false)
+        .with_tracks(TrackSelection::VIDEO | TrackSelection::METADATA);
+    let mut recorder = api.create_recorder(options).unwrap();
+    let marker = crate::MetadataFrame::with_data("<marker cue=\"intro\"/>", 0).unwrap();
+    assert!(matches!(
+        recorder.inject_metadata(&marker),
+        Err(FileError::InvalidState(_))
+    ));
+    recorder
+        .start(
+            RecordingTarget::new(&file).unwrap(),
+            RecordingTimecode::GenerateFrom(SourceTimecode::from_ticks(36_000_000_000)),
+        )
+        .unwrap();
+    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+    recorder.inject_metadata(&marker).unwrap();
+    thread::sleep(Duration::from_millis(200));
+    assert!(matches!(
+        recorder.finish(PATIENCE).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+    assert_eq!(api.probe(&file).unwrap().metadata_track_count(), 1);
+}
+
+#[test]
+fn dropping_a_recorder_leaves_a_finalized_file() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("drop");
+    let source = LiveSource::start(&ndi, "drop");
+    let file = scratch.path("dropped.mkv");
+    let mut recorder = api.create_recorder(exact_video(&source)).unwrap();
+    recorder
+        .start(
+            RecordingTarget::new(&file).unwrap(),
+            RecordingTimecode::Preserve,
+        )
+        .unwrap();
+    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+    thread::sleep(Duration::from_millis(300));
+    drop(recorder);
+    let info = api.probe(&file).unwrap();
+    assert!(info.duration().is_final());
+    assert!(info.duration().value().ticks() > 0);
+}
+
+#[test]
+fn dropping_an_async_recorder_leaves_a_finalized_file() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("async-drop");
+    let source = LiveSource::start(&ndi, "async-drop");
+    let file = scratch.path("dropped.mkv");
+    let recorder = block_on(AsyncFileRecorder::create(api.clone(), exact_video(&source))).unwrap();
+    block_on(recorder.start(
+        RecordingTarget::new(&file).unwrap(),
+        RecordingTimecode::Preserve,
+    ))
+    .unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let event = block_on(recorder.next_event(Duration::from_millis(100))).unwrap();
+        if event.is_some_and(|event| event.kind() == RecorderEventKind::FirstFrame) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no first frame was recorded");
+    }
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        block_on(recorder.state()).unwrap(),
+        RecorderState::Recording
+    );
+    drop(recorder);
+    // No wait here: the drop itself returns only once the file is finalized.
+    let info = api.probe(&file).unwrap();
+    assert!(info.duration().is_final());
+    assert!(info.duration().value().ticks() > 0);
+}
+
+#[test]
+fn an_async_recorder_finishes_and_closes_without_blocking() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("async-finish");
+    let source = LiveSource::start(&ndi, "async-finish");
+    let file = scratch.path("finished.mkv");
+    let recorder = block_on(AsyncFileRecorder::create(api.clone(), exact_video(&source))).unwrap();
+    block_on(recorder.start(
+        RecordingTarget::new(&file).unwrap(),
+        RecordingTimecode::Preserve,
+    ))
+    .unwrap();
+    thread::sleep(Duration::from_millis(800));
+    let outcome = block_on(recorder.finish(PATIENCE)).unwrap();
+    let FinishStatus::Closed(report) = outcome else {
+        panic!("the recording was not confirmed closed: {outcome:?}");
+    };
+    assert_eq!(report.closed_files(), 1);
+    let retained = recorder.clone();
+    block_on(recorder.close()).unwrap();
+    assert!(
+        block_on(retained.state()).is_err(),
+        "a close ends every clone of the handle"
+    );
+    assert!(api.probe(&file).unwrap().duration().is_final());
+}
+
+#[test]
+fn a_player_plays_a_recording_and_keeps_its_source_between_files() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("player");
+    let clip = scratch.path("clip.mkv");
+    record_clip(&api, &LiveSource::start(&ndi, "player"), &clip);
+
+    let name = format!("grafton-file-player-{}", std::process::id());
+    let mut player = api
+        .create_player(PlayerOptions::new(&name).unwrap())
+        .unwrap();
+    let source = player.advertised_source().unwrap();
+    assert!(source.name.contains(&name), "{source:?}");
+    assert!(!player.is_running());
+    player.set_paused(true);
+    assert!(
+        !player.is_paused(),
+        "pausing has no effect with no file open"
+    );
+    player.set_looping(true);
+    assert!(matches!(
+        player.start(scratch.path("absent.mkv")),
+        Err(FileError::Rejected(_))
+    ));
+
+    player.start(&clip).unwrap();
+    assert!(player.is_running());
+    assert!(player.is_looping());
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        assert!(Instant::now() < deadline, "the file was not reported open");
+        let Some(event) = player.poll_event(Duration::from_millis(50)).unwrap() else {
+            continue;
+        };
+        assert_ne!(
+            event.kind(),
+            PlayerEventKind::Error,
+            "{}",
+            event.message().to_string_lossy()
+        );
+        if event.kind() == PlayerEventKind::FileOpened {
+            break;
+        }
+    }
+    player.set_paused(true);
+    assert!(player.is_paused());
+    assert_eq!(
+        player
+            .source_format()
+            .unwrap()
+            .unwrap()
+            .video_tracks()
+            .len(),
+        1
+    );
+    assert!(player
+        .duration()
+        .is_some_and(|duration| duration.is_final()));
+    player.seek(FilePosition::from_ticks(0)).unwrap();
+    player.set_paused(false);
+    assert!(player.stats().unwrap().is_some());
+
+    player.stop();
+    assert!(!player.is_running());
+    assert!(!player.is_paused());
+    assert!(player.is_looping(), "looping belongs to the player");
+    assert_eq!(
+        player.advertised_source().unwrap(),
+        source,
+        "a stop keeps the advertised source"
+    );
+    // A second file plays through the same source.
+    player.start(&clip).unwrap();
+    assert!(player.is_running());
+}
+
+#[test]
+fn an_async_player_runs_on_its_own_thread_and_closes_every_clone() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("async-player");
+    let clip = scratch.path("clip.mkv");
+    record_clip(&api, &LiveSource::start(&ndi, "async-player"), &clip);
+
+    assert_eq!(
+        block_on(AsyncFilePlayer::probe(api.clone(), clip.clone()))
+            .unwrap()
+            .video_track_count(),
+        1
+    );
+    let name = format!("grafton-file-async-player-{}", std::process::id());
+    let player = block_on(AsyncFilePlayer::create(
+        api,
+        PlayerOptions::new(&name).unwrap(),
+    ))
+    .unwrap();
+    assert!(block_on(player.advertised_source())
+        .unwrap()
+        .name
+        .contains(&name));
+    block_on(player.set_looping(true)).unwrap();
+    block_on(player.start(clip)).unwrap();
+    assert!(block_on(player.is_running()).unwrap());
+    assert!(block_on(player.is_looping()).unwrap());
+    block_on(player.set_paused(true)).unwrap();
+    assert!(block_on(player.is_paused()).unwrap());
+    assert!(block_on(player.source_format()).unwrap().is_some());
+    let retained = player.clone();
+    block_on(player.close()).unwrap();
+    assert!(
+        block_on(retained.is_running()).is_err(),
+        "a close ends every clone of the handle"
+    );
+}
+
+#[test]
+fn the_file_library_stays_selected_after_its_handles_are_dropped() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let selected = api.library_path().map(PathBuf::from);
+    drop(api);
+    let reopened = FileApi::open(&ndi, &FileRuntimeOptions::default()).unwrap();
+    assert_eq!(reopened.library_path().map(PathBuf::from), selected);
+    // Its entry points are still callable.
+    assert!(matches!(
+        reopened.probe(std::env::temp_dir().join("grafton-ndi-absent.mkv")),
+        Err(FileError::Rejected(_))
+    ));
+    if let Some(selected) = selected {
+        assert!(matches!(
+            FileApi::open(
+                &ndi,
+                &FileRuntimeOptions::default().library_path(selected.with_file_name("other"))
+            ),
+            Err(FileError::Core(crate::Error::RuntimeConflict(_)))
+        ));
+        FileApi::open(&ndi, &FileRuntimeOptions::default().library_path(selected)).unwrap();
+    }
 }

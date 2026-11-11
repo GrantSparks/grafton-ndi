@@ -53,6 +53,8 @@ pub(crate) mod advanced_declarations {
 #[cfg(feature = "advanced")]
 pub(crate) mod advanced;
 mod api;
+#[cfg(feature = "file-io")]
+mod file;
 mod loader;
 mod selection;
 pub(crate) mod table;
@@ -61,4 +63,6 @@ pub(crate) mod table;
 mod coverage_tests;
 
 pub(crate) use api::*;
+#[cfg(feature = "file-io")]
+pub(crate) use file::{select_file, FilePlayback, FileRecording};
 pub(crate) use loader::{select, AdvancedEntryPoints, Runtime};

@@ -115,3 +115,11 @@ required-features = ["advanced"]
 [[example]]
 name = "advanced_source_metadata"
 required-features = ["advanced"]
+
+[[example]]
+name = "file_play"
+required-features = ["file-io"]
+
+[[example]]
+name = "file_record"
+required-features = ["file-io"]
