@@ -5,6 +5,7 @@ use grafton_ndi::{
 use std::time::Duration;
 
 #[test]
+#[ignore = "Requires real NDI SDK and reviewed network confinement"]
 fn attached_receiver_permits_controls_audio_metadata_and_raw_capture_after_recovery(
 ) -> Result<(), Error> {
     let ndi = NDI::new()?;

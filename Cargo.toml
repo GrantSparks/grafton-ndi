@@ -21,6 +21,8 @@ exclude = ["target/", ".gitignore", ".github/", "NDI_6_SDK.zip", "docs/"]
 parking_lot = "0.12"
 num_enum = "0.7.6"
 thiserror = "2.0.21"
+libloading = "0.9.0"
+serde_json = { version = "1.0", optional = true }
 
 # Optional dependencies for image-encoding feature
 # Keep the scalar base64 0.22 engine; SIMD adoption needs separate validation.
@@ -32,15 +34,27 @@ png = { version = "0.18", optional = true }
 tokio = { version = "1.53.3", optional = true, features = ["rt", "rt-multi-thread", "sync", "macros"] }
 smol = { version = "2.0.2", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+
 [build-dependencies]
 # Defer 0.73 until mixed syn/prettyplease consumer resolutions are validated.
 bindgen = "0.72.1"
+# Inspect declarations structurally even when bindgen cannot run rustfmt.
+syn = { version = "2", features = ["full"] }
 
 [features]
 default = ["image-encoding"]
 # Retained compatibility flag; SDK linkage is selected by NDI_SDK_DIR.
 # Video sending uses default SDK synchronization with either SDK.
 advanced_sdk = []
+# Opt-in Advanced SDK wrappers; installation selects the native edition.
+advanced = ["dep:serde_json"]
+# Optional source recording and file-to-network playback API.
+file-io = []
 # Enable image encoding support (PNG, JPEG, data URLs).
 # Enabled by default. Use `default-features = false` for a minimal build.
 image-encoding = ["dep:base64", "dep:jpeg-encoder", "dep:png"]
@@ -54,6 +68,7 @@ smol = ["dep:smol"]
 [dev-dependencies]
 ctrlc = "3.5"
 trybuild = "1.0.122"
+syn = { version = "2", features = ["full"] }
 
 [[example]]
 name = "NDIlib_Recv_PNG"

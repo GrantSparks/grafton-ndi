@@ -3,8 +3,8 @@
 use std::{
     ffi::{CStr, CString},
     fmt, ptr,
-    sync::Mutex,
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -56,11 +56,31 @@ fn flush_null_frame(instance: NDIlib_send_instance_t) {
 /// SDK instance and the owned storage retained while it sends video.
 struct Inner {
     instance: NDIlib_send_instance_t,
-    _name: CString,
-    _groups: Option<CString>,
+    resource: Option<Arc<SenderResource>>,
+    metadata_capture: parking_lot::Mutex<()>,
     video_callback: Option<AsyncCallback>,
     // Dropped after Inner::drop drains the SDK.
     video: Mutex<VideoState>,
+}
+
+/// A private ownership token; advertisements retain this without access to sends.
+pub(crate) struct SenderResource {
+    pub(crate) instance: NDIlib_send_instance_t,
+    _name: CString,
+    _groups: Option<CString>,
+    _configuration: Option<CString>,
+    _ndi: NDI,
+}
+
+// SAFETY: Same documented native ownership/transfer contract as Sender. Tokens
+// expose no public operations and only destroy after the final owner is released.
+unsafe impl Send for SenderResource {}
+unsafe impl Sync for SenderResource {}
+
+impl Drop for SenderResource {
+    fn drop(&mut self) {
+        unsafe { NDIlib_send_destroy(self.instance) };
+    }
 }
 
 #[derive(Debug)]
@@ -141,6 +161,7 @@ pub struct BorrowedVideoFrame<'buf> {
     metadata: Option<&'buf CStr>,
     metadata_layout: ValidatedFrameMetadata,
     timestamp: i64,
+    runtime_proof: Option<NDI>,
 }
 
 impl<'buf> BorrowedVideoFrame<'buf> {
@@ -227,7 +248,14 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     pub fn try_to_owned(&self) -> Result<VideoFrame> {
         // SAFETY: The immutable slices retain initialized pixels and bounded UTF-8
         // metadata for these cached proofs throughout the active-row copy.
-        unsafe { VideoFrame::from_raw_validated(&self.to_raw(), self.layout, self.metadata_layout) }
+        unsafe {
+            VideoFrame::from_raw_validated_for(
+                &self.to_raw(),
+                self.layout,
+                self.metadata_layout,
+                self.runtime_proof.as_ref(),
+            )
+        }
     }
 
     /// Get the frame width in pixels.
@@ -430,6 +458,17 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
     /// metadata exceeding the 4 MiB cap return [`Error::InvalidFrame`]; invalid
     /// metadata UTF-8 returns [`Error::InvalidUtf8`]. The input slices remain borrowed.
     pub fn build(self) -> Result<BorrowedVideoFrame<'buf>> {
+        self.build_with_runtime(None)
+    }
+
+    /// Validate a frame against the selected runtime, retaining a runtime lease
+    /// for formats that require it. Existing formats retain their pure construction path.
+    pub fn build_for(self, ndi: &NDI) -> Result<BorrowedVideoFrame<'buf>> {
+        self.build_with_runtime(Some(ndi))
+    }
+
+    fn build_with_runtime(self, ndi: Option<&NDI>) -> Result<BorrowedVideoFrame<'buf>> {
+        let runtime_proof = crate::frames::validate_video_format_runtime(self.pixel_format, ndi)?;
         crate::frames::validate_video_frame_metadata(
             self.frame_rate_n,
             self.frame_rate_d,
@@ -461,6 +500,7 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
             metadata: self.metadata,
             metadata_layout,
             timestamp: self.timestamp,
+            runtime_proof,
         })
     }
 }
@@ -479,6 +519,7 @@ impl<'buf> From<&'buf VideoFrame> for BorrowedVideoFrame<'buf> {
             metadata: frame.metadata_cstr(),
             metadata_layout: frame.validated_metadata(),
             timestamp: frame.timestamp(),
+            runtime_proof: frame.runtime_proof().cloned(),
         }
     }
 }
@@ -513,18 +554,124 @@ impl Sender {
                 "Failed to create NDI send instance".into(),
             ))
         } else {
-            let inner = Inner {
+            // SAFETY: Creation returned a fresh native instance owned by this call.
+            Ok(unsafe { Self::from_native(ndi, instance, name_cstr, groups_cstr, None) })
+        }
+    }
+
+    /// Take exclusive ownership of a freshly created native sender.
+    pub(crate) unsafe fn from_native(
+        ndi: &NDI,
+        instance: NDIlib_send_instance_t,
+        name: CString,
+        groups: Option<CString>,
+        configuration: Option<CString>,
+    ) -> Self {
+        Self {
+            inner: Inner {
                 instance,
-                _name: name_cstr,
-                _groups: groups_cstr,
+                resource: Some(Arc::new(SenderResource {
+                    instance,
+                    _name: name,
+                    _groups: groups,
+                    _configuration: configuration,
+                    _ndi: ndi.clone(),
+                })),
+                metadata_capture: parking_lot::Mutex::new(()),
                 video_callback: None,
                 video: Mutex::new(VideoState::default()),
-            };
+            },
+            _ndi: ndi.clone(),
+        }
+    }
 
-            Ok(Self {
-                inner,
-                _ndi: ndi.clone(),
-            })
+    pub(crate) fn native_instance(&self) -> NDIlib_send_instance_t {
+        self.inner.instance
+    }
+
+    pub(crate) fn native_owner(&self) -> Arc<SenderResource> {
+        Arc::clone(
+            self.inner
+                .resource
+                .as_ref()
+                .expect("live sender owns its resource"),
+        )
+    }
+
+    #[cfg(feature = "advanced")]
+    pub(crate) fn has_exclusive_native_owner(&self) -> bool {
+        Arc::strong_count(
+            self.inner
+                .resource
+                .as_ref()
+                .expect("live sender owns its resource"),
+        ) == 1
+    }
+
+    pub(crate) fn runtime(&self) -> &NDI {
+        &self._ndi
+    }
+
+    /// Capture metadata sent back by connected receivers.
+    ///
+    /// The result owns its data. The wait budget includes contention with other
+    /// metadata captures and does not block the video-send synchronization lock.
+    pub fn capture_metadata(&self, timeout: Duration) -> Result<Option<MetadataFrame>> {
+        type Capture = unsafe extern "C" fn(
+            NDIlib_send_instance_t,
+            *mut NDIlib_metadata_frame_t,
+            u32,
+        ) -> NDIlib_frame_type_e;
+        type Free = unsafe extern "C" fn(NDIlib_send_instance_t, *const NDIlib_metadata_frame_t);
+        let _ = to_ms_checked(timeout)?;
+        let started = Instant::now();
+        let Some(_lock) = self.inner.metadata_capture.try_lock_for(timeout) else {
+            return Ok(None);
+        };
+        let capture: Capture = unsafe {
+            crate::dispatch::require_optional(b"NDIlib_send_capture\0", "sender metadata")?
+        };
+        let free: Free = unsafe {
+            crate::dispatch::require_optional(b"NDIlib_send_free_metadata\0", "sender metadata")?
+        };
+        let mut raw = NDIlib_metadata_frame_t {
+            length: 0,
+            timecode: 0,
+            p_data: ptr::null_mut(),
+        };
+        let kind = unsafe {
+            capture(
+                self.inner.instance,
+                &mut raw,
+                to_ms_checked(timeout.saturating_sub(started.elapsed()))?,
+            )
+        };
+        if kind == NDIlib_frame_type_e_NDIlib_frame_type_metadata {
+            struct Release {
+                instance: NDIlib_send_instance_t,
+                raw: NDIlib_metadata_frame_t,
+                free: Free,
+            }
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    unsafe { (self.free)(self.instance, &self.raw) };
+                }
+            }
+            let guard = Release {
+                instance: self.inner.instance,
+                raw,
+                free,
+            };
+            let layout = unsafe { crate::frames::validate_metadata_layout(&guard.raw)? };
+            Ok(Some(unsafe {
+                MetadataFrame::from_raw_validated(&guard.raw, layout)
+            }))
+        } else if kind == NDIlib_frame_type_e_NDIlib_frame_type_none {
+            Ok(None)
+        } else {
+            Err(Error::CaptureFailed(format!(
+                "sender metadata capture returned {kind}"
+            )))
         }
     }
 
@@ -863,7 +1010,9 @@ impl Drop for Inner {
         let len = video.completed();
         // Destroy before running user code, so a callback panic cannot leak the
         // SDK instance. Pending allocations remain alive through destruction.
-        unsafe { NDIlib_send_destroy(self.instance) };
+        // The native instance may intentionally outlive this facade when an
+        // advertiser owns a registration. Pixels have already been drained.
+        drop(self.resource.take());
         if std::thread::panicking() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.notify(len)));
         } else {
@@ -1022,6 +1171,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn metadata_send_methods_reuse_validated_text_with_sdk() {
         let sender = test_sender();
         let frame = MetadataFrame::with_data("<ndi_text>é</ndi_text>", 42).unwrap();
@@ -1035,6 +1185,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn owned_async_recycles_original_pixel_and_metadata_allocations() {
         let mut sender = test_sender();
         let first = test_owned_frame(11);
@@ -1061,6 +1212,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn mixed_sync_flush_and_copy_sends_notify_once_and_preserve_recovery() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let count = Arc::new(AtomicUsize::new(0));
@@ -1125,6 +1277,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn callback_panic_after_submission_keeps_new_owned_frame_recoverable() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let count = Arc::new(AtomicUsize::new(0));
@@ -1148,6 +1301,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn completion_callback_can_reenter_shared_flush_without_deadlock() {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
@@ -1178,6 +1332,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn sender_drop_notifies_once_for_copy() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let count = Arc::new(AtomicUsize::new(0));
@@ -1199,6 +1354,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn completion_handler_can_be_replaced_and_cleared() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let count = Arc::new(AtomicUsize::new(0));

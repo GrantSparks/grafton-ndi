@@ -90,6 +90,9 @@ pub(crate) trait FrameFree: sealed::Sealed + 'static {
     unsafe fn free(instance: Self::Instance, frame: &mut Self::RawFrame);
 }
 
+#[cfg(test)]
+type TestFrameFree<S> = unsafe fn(<S as FrameFree>::Instance, &mut <S as FrameFree>::RawFrame);
+
 /// A sealed receiver capture kind with its borrowed and owned frame types.
 ///
 /// Implemented for [`VideoKind`], [`AudioKind`], and [`MetadataKind`]. Raw SDK
@@ -339,6 +342,9 @@ impl FrameFree for FrameSyncAudioFree {
 pub struct Guard<'owner, S: FrameFree> {
     instance: S::Instance,
     frame: S::RawFrame,
+    runtime: Option<&'owner crate::NDI>,
+    #[cfg(test)]
+    test_free: Option<TestFrameFree<S>>,
     // Ties the guard (and the borrowed refs built on it) to the owning instance's
     // borrow. The owner type is irrelevant to the borrow checker, so a unit
     // reference is enough to carry `'owner` covariantly.
@@ -364,9 +370,48 @@ impl<'owner, S: FrameFree> Guard<'owner, S> {
         Self {
             instance,
             frame,
+            runtime: None,
+            #[cfg(test)]
+            test_free: None,
             _owner: PhantomData,
             _thread_affine: PhantomData,
         }
+    }
+
+    /// Wrap a synthetic unit-test frame with an explicit local release callback.
+    /// Real captures continue to use `new` and the native free strategy.
+    ///
+    /// # Safety
+    ///
+    /// All buffers referenced by `frame` must remain valid for `'owner`.
+    /// `free` must accept this synthetic instance and frame, including on
+    /// validation failure or panic, without releasing independently owned data.
+    /// It must also honor the strategy's threading guarantees: receiver guards
+    /// may be dropped from another thread.
+    #[cfg(test)]
+    pub(crate) unsafe fn with_test_free(
+        instance: S::Instance,
+        frame: S::RawFrame,
+        free: TestFrameFree<S>,
+    ) -> Self {
+        Self {
+            instance,
+            frame,
+            runtime: None,
+            test_free: Some(free),
+            _owner: PhantomData,
+            _thread_affine: PhantomData,
+        }
+    }
+
+    /// Retain the native owner's runtime identity for owned-frame conversion.
+    pub(crate) fn with_runtime(mut self, runtime: &'owner crate::NDI) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    pub(crate) fn runtime(&self) -> Option<&'owner crate::NDI> {
+        self.runtime
     }
 
     /// Get a reference to the underlying raw frame.
@@ -389,6 +434,13 @@ unsafe impl Sync for Guard<'_, MetadataKind> {}
 
 impl<'owner, S: FrameFree> Drop for Guard<'owner, S> {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(free) = self.test_free {
+            // SAFETY: with_test_free requires this callback to own release of
+            // the synthetic descriptor, including failed validation and unwind.
+            unsafe { free(self.instance, &mut self.frame) };
+            return;
+        }
         // SAFETY: The constructor guarantees that instance and frame are valid
         unsafe {
             S::free(self.instance, &mut self.frame);
@@ -409,6 +461,10 @@ pub(crate) enum CaptureResult<'rx, K: CaptureKind> {
     None,
     /// A capability invalidation notification, without a frame buffer.
     StatusChanged,
+    /// The native connection's source changed, without a frame buffer.
+    SourceChanged,
+    /// An unrecognized notification code, without exposing an unknown payload.
+    Unknown(u32),
     /// The SDK returned an error frame.
     Error,
 }
@@ -435,7 +491,12 @@ pub(crate) unsafe fn capture_raw<'rx, K: CaptureKind>(
         NDIlib_frame_type_e_NDIlib_frame_type_none => CaptureResult::None,
         NDIlib_frame_type_e_NDIlib_frame_type_status_change => CaptureResult::StatusChanged,
         NDIlib_frame_type_e_NDIlib_frame_type_error => CaptureResult::Error,
-        _ => CaptureResult::None, // Other frame types are ignored
+        101 => CaptureResult::SourceChanged,
+        NDIlib_frame_type_e_NDIlib_frame_type_video
+        | NDIlib_frame_type_e_NDIlib_frame_type_audio
+        | NDIlib_frame_type_e_NDIlib_frame_type_metadata => CaptureResult::None,
+        #[allow(clippy::unnecessary_cast)] // enum ABI is signed on Windows
+        value => CaptureResult::Unknown(value as u32),
     }
 }
 
@@ -455,6 +516,45 @@ pub type RecvMetadataGuard<'rx> = Guard<'rx, MetadataKind>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synthetic_frame_release_runs_once_on_drop_rejection_and_unwind() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        unsafe fn count_release(
+            instance: NDIlib_recv_instance_t,
+            _frame: &mut NDIlib_video_frame_v2_t,
+        ) {
+            // SAFETY: the test keeps this counter alive through every guard.
+            unsafe { &*instance.cast::<AtomicUsize>() }.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let releases = AtomicUsize::new(0);
+        let instance = (&releases as *const AtomicUsize).cast_mut().cast();
+        let make_guard = || unsafe {
+            Guard::<VideoKind>::with_test_free(
+                instance,
+                NDIlib_video_frame_v2_t::default(),
+                count_release,
+            )
+        };
+
+        drop(make_guard());
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+
+        let rejected = unsafe { VideoFrameRef::new(make_guard()) };
+        assert!(rejected.is_err());
+        assert_eq!(releases.load(Ordering::SeqCst), 2);
+        drop(rejected);
+        assert_eq!(releases.load(Ordering::SeqCst), 2);
+
+        let unwound = std::panic::catch_unwind(|| {
+            let _guard = make_guard();
+            panic!("synthetic fixture assertion failure");
+        });
+        assert!(unwound.is_err());
+        assert_eq!(releases.load(Ordering::SeqCst), 3);
+    }
 
     #[test]
     fn test_guard_sizes() {

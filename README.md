@@ -8,7 +8,7 @@
 
 `grafton-ndi` is an idiomatic Rust interface to the NDI® 6 SDK. It gives Rust applications a practical way to discover NDI sources, receive and publish video/audio/metadata streams, monitor status and tally, control PTZ devices, and integrate NDI work into synchronous or async application architectures.
 
-The crate is intentionally a binding layer rather than a media framework. It keeps the generated C bindings behind a narrow FFI boundary and exposes Rust types that are safe to compose with the rest of an application. You bring the renderer, mixer, encoder, storage layer, or UI; `grafton-ndi` handles the NDI-facing parts.
+The crate keeps generated C bindings behind typed runtime dispatch and Rust ownership wrappers. Applications supply their renderer, mixer, encoder, storage layer, or UI.
 
 ## What It Covers
 
@@ -21,7 +21,11 @@ The crate is intentionally a binding layer rather than a media framework. It kee
 - **PTZ control** - Drive supported pan, tilt, zoom, focus, exposure, and white-balance commands.
 - **Async integration** - Use optional Tokio or smol wrappers for receive workflows without blocking the async runtime.
 - **Image snapshots** - Encode captured video frames as PNG, JPEG, or data URLs with the default `image-encoding` feature.
-- **SDK compatibility** - Supports standard and Advanced SDK installation layouts; async send completion uses SDK synchronization boundaries in both.
+- **Routing and Discovery Server** - Route sources, manage advertisements, inspect owned listener snapshots/events, and explicitly request remote receiver connections.
+- **Media formats and controls** - Planar 4:4:4 formats, receiver color/bandwidth modes, delay controls, SDK timestamps, and checked audio/video conversions.
+- **Advanced SDK** - Optional compressed/scatter streams, native completion queues, custom receive allocation, JSON configuration, AVSync, Genlock, and KVM.
+- **File API** - Optional source recording and file-to-network playback, with owned events and explicit finalization state.
+- **Runtime capabilities** - Inspect the selected SDK implementation and check whether optional operations are available.
 
 ## Quick Start
 
@@ -49,38 +53,43 @@ fn main() -> grafton_ndi::Result<()> {
 
 ## Installation
 
-Add the crate to `Cargo.toml`:
+For the published core API, add the crate to `Cargo.toml`:
 
 ```toml
 [dependencies]
 grafton-ndi = "2.0"
 ```
 
-Feature flags:
+For the APIs and optional features in this checkout, use a local path dependency:
 
 ```toml
-# Minimal build without PNG/JPEG/data URL helpers
-# grafton-ndi = { version = "2.0", default-features = false }
-
-# Image encoding support is enabled by default
-# grafton-ndi = { version = "2.0", features = ["image-encoding"] }
-
-# Async receiver wrappers
-# grafton-ndi = { version = "2.0", features = ["tokio"] }
-# grafton-ndi = { version = "2.0", features = ["smol"] }
-
-# Retained compatibility flag; does not enable SDK completion callbacks
-# grafton-ndi = { version = "2.0", features = ["advanced_sdk"] }
+[dependencies]
+grafton-ndi = { path = "../grafton-ndi", features = ["advanced", "file-io"] }
 ```
+
+Feature flags:
+
+| Feature | Effect |
+| --- | --- |
+| `image-encoding` | PNG, JPEG and data URLs; enabled by default. |
+| `tokio`, `smol` | Receiver adapters for the selected async runtime; independently optional. |
+| `advanced` | Advanced Rust APIs; native calls require authorized Advanced headers and the selected Advanced runtime. |
+| `file-io` | File recording/playback and executor-independent async owners; requires a matching File artifact. |
+
+Use `default-features = false` for a minimal build. Cargo features select Rust
+APIs. `NDI_SDK_DIR`, `NDI_SDK_EDITION` and the installed artifacts select the build
+SDK; runtime selection is described below. SDK versions are detected without
+version-specific Cargo features.
 
 ### Prerequisites
 
-1. **NDI SDK 6.x** (validated with 6.3.2): Install the [NDI SDK](https://ndi.video/for-developers/ndi-sdk/) for your platform.
-   - Windows default: `C:\Program Files\NDI\NDI 6 SDK`
+1. **NDI SDK 6.x** (see the exact version/target evidence below): Install the [NDI SDK](https://ndi.video/for-developers/ndi-sdk/) for your platform.
+   - Windows defaults include `C:\Program Files\NDI\NDI 6 SDK` and `C:\Program Files\NDI\NDI 6 Advanced SDK`.
    - Linux defaults: `/usr/share/NDI Advanced SDK for Linux` or `/usr/share/NDI SDK for Linux`
    - macOS defaults include `/Library/NDI SDK for macOS`, `/Library/NDI SDK for Apple`, and `/Library/NDI 6 SDK`
    - Android: set `NDI_SDK_DIR` to the Android SDK and use the Android NDK for cross-compilation.
-   - Set `NDI_SDK_DIR` when the SDK is installed elsewhere.
+   - Set `NDI_SDK_DIR` when the SDK is installed elsewhere. Use `NDI_SDK_PROFILE` for a specific embedded/device artifact and `NDI_SDK_EDITION=standard|advanced` to resolve an installation containing both editions.
+   - Apple mobile builds require the corresponding Xcode SDK and an actual vendor device/simulator slice. A newer Rust toolchain is required only for targets unavailable in Rust 1.88.
 
 2. **Rust**: Rust 1.88 or later.
 
@@ -91,10 +100,17 @@ Feature flags:
    - Linux: a C toolchain and a libclang development package for bindgen
    - macOS: Xcode Command Line Tools and a discoverable libclang installation
 
-4. **Runtime libraries**:
-   - Windows: ensure the NDI runtime DLL directory is on `PATH`
-   - Linux: install the NDI runtime/tools or configure `LD_LIBRARY_PATH`
-   - macOS: install the NDI runtime/tools or configure `DYLD_LIBRARY_PATH` as needed
+4. **Runtime libraries**: shared-library builds need the vendor runtime and
+   its dependencies when NDI is used. Set `NDI_RUNTIME_DIR_V6` to its directory,
+   or select an absolute library path through `RuntimeOptions`.
+   - Windows also supports the native DLL search path, including `PATH`.
+   - Linux also supports the native loader search path, including `LD_LIBRARY_PATH`.
+   - macOS tries application `@rpath` and then native basename lookup; `DYLD_LIBRARY_PATH` can be used where the host permits it.
+   - Apple mobile profiles link the supplied static archive and required system frameworks into the application.
+
+Builds require a complete SDK installation for header and target-artifact
+validation. Shared core libraries load when selected at runtime; an unavailable
+library produces a Rust load error.
 
 ## Core Workflows
 
@@ -293,7 +309,7 @@ Frame layout fields that describe SDK-facing memory are private. Builders, acces
 
 `grafton-ndi` aims to be a predictable Rust layer over NDI, not a replacement for the NDI SDK documentation.
 
-- **Small FFI boundary**: generated bindings live behind safe wrappers.
+- **Typed dispatch**: all core calls use one selected native implementation. Shared modules remain loaded while ordinary `NDI` handles retain initialization separately.
 - **RAII lifecycle**: NDI handles, senders, receivers, frames, and pending async sends clean up through ownership.
 - **Initialized receive views**: borrowed video rows and audio channels expose active payload only; `data()` is optional for padded layouts. Owned capture packs active payload without reading SDK padding.
 - **Checked frame descriptions**: frame dimensions, line strides, channel strides, metadata strings, and buffer sizes are validated before slices or strings are exposed.
@@ -325,12 +341,16 @@ let data_url = video.encode_data_url(ImageFormat::Png)?;
 
 ## Documentation
 
-- [API documentation](https://grantsparks.github.io/grafton-ndi/grafton_ndi/) - Full rustdoc reference, built in CI and self-hosted (the docs.rs build environment does not include the SDK installation required by this build script).
+- [API documentation](https://grantsparks.github.io/grafton-ndi/grafton_ndi/) - Hosted reference. Generate documentation for your checkout with `cargo doc --no-deps --all-features`; docs.rs lacks the SDK installation required by the build script.
 - [Examples](examples/) - Runnable examples for discovery, receiving, FrameSync, PTZ, monitoring, and sending.
 - [CHANGELOG.md](CHANGELOG.md) - Release notes and migration guidance.
+- [SDK compatibility and validation](docs/sdk-validation.md) - Version coverage, platform qualifications, and cross-build requirements.
+- [Advanced SDK guide](docs/advanced.md) - Configuration, packet ownership, callbacks, allocators and synchronization.
+- [File API guide](docs/file-io.md) - Recording/playback, finalization, async ownership and current pointer-getter restrictions.
+- [SDK upgrade tools](tools/sdk/README.md) - Repeatable API review, capability metadata and independent ABI probes.
+- [Development SDK store](ci/sdk-store.md) - Verified local archives and side-by-side SDK installations.
 - [Image encoding resources](docs/image-encoding-performance.md) - Conversion scratch bounds, codec/output peak memory, and reproducible timing comparisons.
-- [Upgrade from 1.x to 2.0](docs/migration/1.x-to-2.0.md) - Breaking changes, layout corrections, and async-send performance changes.
-- [Historical migration notes](https://github.com/GrantSparks/grafton-ndi/tree/main/docs/migration) - Earlier version-to-version migration notes.
+- [Migration guides](docs/migration/) - Guidance for upgrading between crate versions.
 
 ## Examples
 
@@ -362,19 +382,93 @@ Sending:
 - `async_send_copy.rs` - Explicitly copy borrowed pixels into an async-send snapshot.
 - `zero_copy_send.rs` - Render into two reusable owned frames without per-send pixel copies.
 
+## Runtime capabilities and optional APIs
+
+`NDI::new()` initializes the selected runtime and releases initialization when its
+last handle is dropped. Desktop, Linux and Android builds load a shared library;
+Apple mobile profiles link a static provider. To select an absolute runtime path,
+use `NDI::with_options(&RuntimeOptions::default().library_path(path))`.
+`RuntimeOptions::edition` selects Standard or Advanced independently of Cargo
+features.
+
+A successfully selected module stays loaded for the process lifetime, and an
+incompatible later selection returns an error. Failed loads are retryable; failed
+native initialization retries the selected provider. Version and CPU queries can
+select the default module, so apply explicit options first when choosing an
+installation. `NDI::try_is_supported_cpu()` reports loading errors;
+`NDI::is_supported_cpu()` returns `false` when loading fails.
+
+Use `ndi.info()` for runtime identity and `ndi.capabilities()` for optional
+features. Availability depends on the compiled bindings, runtime symbols and
+semantics, and any hardware or licensing requirements. Unavailable operations
+return capability errors without disabling unrelated operations.
+`RuntimeInfo::edition_verified()` reports whether the runtime provides positive
+edition evidence; an edition label alone does not establish feature availability
+or a license.
+
+Planar `NA48`, `NB48`, `NA4G`, and `NB4G` frames require compatible NDI 6.4 runtime
+semantics. Construct them with
+`VideoFrame::builder().pixel_format(format).build_for(&ndi)` or the borrowed-frame
+equivalent. The frame retains the runtime capability proof, including when captured
+or copied. `build()` is runtime-independent for formats that do not require this
+proof. `Best444`, video-only receive modes, delay controls, and SDK timestamps also
+require compatible runtime capabilities. Delay setters accept at most 2000 ms,
+round positive fractional milliseconds upward, and report whether the native value
+changed. Standard encoding may convert 4:4:4 inputs to 4:2:2.
+
+The `routing` and `discovery` modules provide routing, Discovery Server monitoring,
+owned snapshots, subscriptions, and remote control. Advertisement guards retain
+their native resources while registered. `utilities` provides checked interleaved
+audio conversions with explicit integer reference levels; `video_conversion`
+provides V210/P216 conversions for complete six-pixel V210 groups.
+
+With `advanced`, `QueuedSender` retains submitted frames until native completion.
+Custom receive allocators require `ndi.process_lifetime()`, an explicit opt-in
+that keeps the initialized runtime alive until process exit. See the
+[Advanced SDK guide](docs/advanced.md) for packet ownership, callbacks,
+configuration, and synchronization.
+
+With `file-io`, `file::FileApi` loads recording/playback on demand. Shared POSIX
+File libraries require the matching verified Advanced core; Windows File is
+supplied for x64. Apple static File profiles use the File archive as the sole core
+provider. An unavailable File module leaves core operations usable. Recorder
+finalization, async ownership, and the restricted `native_source()` and
+`native_current_file()` getters are described in the [File API guide](docs/file-io.md).
+
 ## Platform Support
 
-| Platform | Status | Notes |
-|----------|--------|-------|
-| Windows | CI-tested | Uses the NDI SDK import library at build time and NDI runtime DLLs at runtime. |
-| Linux | CI-tested | Supports standard and Advanced SDK install directories; runtime libraries must be discoverable by the dynamic linker. |
-| macOS | CI-tested | Supports current NDI SDK package layouts used by the CI setup action and common local install paths. |
-| Android | Cross-build CI | ARM64, ARMv7, x86, and x86_64; requires the Android NDI SDK and NDK. Device runtime testing is separate. |
+The compatibility target is NDI 6.x. The validation matrix covers Standard 6.3.2
+and 6.4, and Advanced 6.4, including mixed Standard header/runtime versions.
+SDKs 6.0 and 6.1.1 do not have current validation results. See
+[SDK validation](docs/sdk-validation.md) for coverage requirements and validation records.
+For a specific revision, consult its [CI checks](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml)
+and `required-ci` aggregate. Required CI runs full native suites on Linux x64,
+Windows x64 and macOS ARM64 with both SDK editions. Other supported profiles keep
+ABI and final link/package checks, with representative Android and tvOS execution.
+The [CI guide](ci/README.md) describes the required checks and optional extended
+audit. Build/link, emulator/simulator and physical-device evidence are recorded
+separately.
 
-NDI 6.3.2 build and runtime coverage, target triples, and cross-compilation
-commands are recorded in the [SDK validation guide](docs/sdk-validation.md).
-Windows uses the MSVC ABI; Linux uses GNU/glibc. Apple mobile targets (including
-iOS) are not currently selected by the build script.
+| Target family | Integration and required CI coverage |
+| --- | --- |
+| Linux x86_64 GNU | Standard/Advanced shared runtime; full native suites. |
+| Linux x86/ARM64 and RPi GNU profiles | Matching ISA, libc, float ABI and sysroot; ABI and vendor link checks. |
+| Windows MSVC x86/x64 | Standard/Advanced DLLs; x64 native suites and x86 ABI/link checks. File is x64 only. |
+| macOS Intel/Apple Silicon | Standard/Advanced shared libraries and Xcode; ARM64 native suites and Intel ABI/link checks. |
+| Android | Four supplied ABIs with matching NDK and APK packaging; Standard x64 emulator execution. |
+| iOS/tvOS/visionOS | Supplied device or usable x86 simulator slice, matching Xcode SDK and static provider; package/link checks plus Standard tvOS x64 simulator execution. |
+
+[Build profiles](build_profiles.tsv) define artifact selection. Support is limited
+to profiles whose SDK and toolchain can be obtained and exercised on GitHub-hosted
+runners. Nineteen specialized vendor BSP profiles are inventoried candidates
+outside supported scope. [Hosted CI](ci/README.md) and the validation record
+distinguish native, build/link-only, emulator/simulator, and physical-device results.
+
+The SDK supplies no ARM64 Apple simulator slices, and its x86 visionOS slice has
+no built-in Rust target. Those combinations are unavailable. RPi1 artifacts declare
+ARMv7/VFPv3 attributes, so the directory name does not establish ARMv6 support.
+The four RPi GNU cross profiles use a Debian armhf glibc 2.36 build sysroot;
+build/link checks do not certify glibc 2.17 deployment or a particular board.
 
 ## Development
 
@@ -385,14 +479,19 @@ cargo fmt --all -- --check
 cargo test
 cargo clippy -- -D warnings
 cargo build --examples
-cargo test --test compile_contracts
+cargo test --all-features --test compile_contracts --test advanced_contracts
 ```
+
+Ordinary tests skip the 39 SDK-dependent core tests. Use the
+[confined native runner](CONTRIBUTING.md#tests-that-demonstrate-the-change) for runtime validation.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, CI notes, and contribution guidelines.
 
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+Private native ABI adapters retain their [upstream notices](src/native_abi_LICENSE.txt).
+The NDI SDK and runtime are supplied separately under their vendor terms.
 
 ## Disclaimer
 

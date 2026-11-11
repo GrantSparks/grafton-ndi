@@ -1,0 +1,310 @@
+# Selected common ABI boundaries, independently checked against target C headers.
+# Extend for every newly used private ABI record; this is not full SDK coverage.
+schema = 1
+
+[[record]]
+c = "NDIlib_source_t"
+rust = "NDIlib_source_t"
+fields = [
+  { c = "p_ndi_name" },
+  { c = "p_url_address", rust = "__bindgen_anon_1.p_url_address" },
+  { c = "p_ip_address", rust = "__bindgen_anon_1.p_ip_address" },
+]
+
+[[record]]
+c = "NDIlib_video_frame_v2_t"
+rust = "NDIlib_video_frame_v2_t"
+fields = [
+  { c = "xres" },
+  { c = "yres" },
+  { c = "FourCC" },
+  { c = "frame_rate_N" },
+  { c = "frame_rate_D" },
+  { c = "picture_aspect_ratio" },
+  { c = "frame_format_type" },
+  { c = "timecode" },
+  { c = "p_data" },
+  { c = "line_stride_in_bytes", rust = "__bindgen_anon_1.line_stride_in_bytes" },
+  { c = "data_size_in_bytes", rust = "__bindgen_anon_1.data_size_in_bytes" },
+  { c = "p_metadata" },
+  { c = "timestamp" },
+]
+
+[[record]]
+c = "NDIlib_audio_frame_v2_t"
+rust = "NDIlib_audio_frame_v2_t"
+fields = [
+  { c = "sample_rate" },
+  { c = "no_channels" },
+  { c = "no_samples" },
+  { c = "timecode" },
+  { c = "p_data" },
+  { c = "channel_stride_in_bytes" },
+  { c = "p_metadata" },
+  { c = "timestamp" },
+]
+
+[[record]]
+c = "NDIlib_audio_frame_v3_t"
+rust = "NDIlib_audio_frame_v3_t"
+fields = [
+  { c = "sample_rate" },
+  { c = "no_channels" },
+  { c = "no_samples" },
+  { c = "timecode" },
+  { c = "FourCC" },
+  { c = "p_data" },
+  { c = "channel_stride_in_bytes", rust = "__bindgen_anon_1.channel_stride_in_bytes" },
+  { c = "data_size_in_bytes", rust = "__bindgen_anon_1.data_size_in_bytes" },
+  { c = "p_metadata" },
+  { c = "timestamp" },
+]
+
+[[record]]
+c = "NDIlib_metadata_frame_t"
+rust = "NDIlib_metadata_frame_t"
+fields = [
+  { c = "length" },
+  { c = "timecode" },
+  { c = "p_data" },
+]
+
+[[record]]
+c = "NDIlib_recv_create_v3_t"
+rust = "NDIlib_recv_create_v3_t"
+fields = [
+  { c = "source_to_connect_to" },
+  { c = "color_format" },
+  { c = "bandwidth" },
+  { c = "allow_video_fields" },
+  { c = "p_ndi_recv_name" },
+]
+
+[[record]]
+c = "NDIlib_send_create_t"
+rust = "NDIlib_send_create_t"
+fields = [
+  { c = "p_ndi_name" },
+  { c = "p_groups" },
+  { c = "clock_video" },
+  { c = "clock_audio" },
+]
+
+[[record]]
+c = "NDIlib_find_create_t"
+rust = "NDIlib_find_create_t"
+fields = [
+  { c = "show_local_sources" },
+  { c = "p_groups" },
+  { c = "p_extra_ips" },
+]
+
+[[record]]
+c = "NDIlib_tally_t"
+rust = "NDIlib_tally_t"
+fields = [
+  { c = "on_program" },
+  { c = "on_preview" },
+]
+
+[[record]]
+c = "NDIlib_recv_performance_t"
+rust = "NDIlib_recv_performance_t"
+fields = [
+  { c = "video_frames" },
+  { c = "audio_frames" },
+  { c = "metadata_frames" },
+]
+
+[[record]]
+c = "NDIlib_recv_queue_t"
+rust = "NDIlib_recv_queue_t"
+fields = [
+  { c = "video_frames" },
+  { c = "audio_frames" },
+  { c = "metadata_frames" },
+]
+
+[[record]]
+c = "NDIlib_routing_create_t"
+rust = "NDIlib_routing_create_t"
+fields = [
+  { c = "p_ndi_name" },
+  { c = "p_groups" },
+]
+
+[[constant]]
+c = "NDIlib_frame_type_none"
+rust = "NDIlib_frame_type_e_NDIlib_frame_type_none"
+
+[[constant]]
+c = "NDIlib_frame_type_video"
+rust = "NDIlib_frame_type_e_NDIlib_frame_type_video"
+
+[[constant]]
+c = "NDIlib_frame_type_audio"
+rust = "NDIlib_frame_type_e_NDIlib_frame_type_audio"
+
+[[constant]]
+c = "NDIlib_frame_type_metadata"
+rust = "NDIlib_frame_type_e_NDIlib_frame_type_metadata"
+
+[[constant]]
+c = "NDIlib_frame_type_error"
+rust = "NDIlib_frame_type_e_NDIlib_frame_type_error"
+
+[[constant]]
+c = "NDIlib_frame_type_status_change"
+rust = "NDIlib_frame_type_e_NDIlib_frame_type_status_change"
+
+[[constant]]
+c = "NDIlib_frame_type_source_change"
+rust = "NDIlib_frame_type_e_NDIlib_frame_type_source_change"
+
+[[constant]]
+c = "NDIlib_frame_type_max"
+rust = "NDIlib_frame_type_e_NDIlib_frame_type_max"
+
+[[constant]]
+c = "NDIlib_frame_format_type_progressive"
+rust = "NDIlib_frame_format_type_e_NDIlib_frame_format_type_progressive"
+
+[[constant]]
+c = "NDIlib_frame_format_type_interleaved"
+rust = "NDIlib_frame_format_type_e_NDIlib_frame_format_type_interleaved"
+
+[[constant]]
+c = "NDIlib_frame_format_type_field_0"
+rust = "NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_0"
+
+[[constant]]
+c = "NDIlib_frame_format_type_field_1"
+rust = "NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_1"
+
+[[constant]]
+c = "NDIlib_frame_format_type_max"
+rust = "NDIlib_frame_format_type_e_NDIlib_frame_format_type_max"
+
+[[constant]]
+c = "NDIlib_recv_bandwidth_metadata_only"
+rust = "NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_metadata_only"
+
+[[constant]]
+c = "NDIlib_recv_bandwidth_audio_only"
+rust = "NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_audio_only"
+
+[[constant]]
+c = "NDIlib_recv_bandwidth_lowest"
+rust = "NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest"
+
+[[constant]]
+c = "NDIlib_recv_bandwidth_highest"
+rust = "NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest"
+
+[[constant]]
+c = "NDIlib_recv_bandwidth_max"
+rust = "NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_max"
+
+[[constant]]
+c = "NDIlib_FourCC_video_type_UYVY"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY"
+
+[[constant]]
+c = "NDIlib_FourCC_type_UYVY"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_type_UYVY"
+
+[[constant]]
+c = "NDIlib_FourCC_video_type_UYVA"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVA"
+
+[[constant]]
+c = "NDIlib_FourCC_type_UYVA"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_type_UYVA"
+
+[[constant]]
+c = "NDIlib_FourCC_video_type_P216"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_P216"
+
+[[constant]]
+c = "NDIlib_FourCC_type_P216"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_type_P216"
+
+[[constant]]
+c = "NDIlib_FourCC_video_type_PA16"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_PA16"
+
+[[constant]]
+c = "NDIlib_FourCC_type_PA16"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_type_PA16"
+
+[[constant]]
+c = "NDIlib_FourCC_video_type_YV12"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_YV12"
+
+[[constant]]
+c = "NDIlib_FourCC_type_YV12"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_type_YV12"
+
+[[constant]]
+c = "NDIlib_FourCC_video_type_I420"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_I420"
+
+[[constant]]
+c = "NDIlib_FourCC_type_I420"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_type_I420"
+
+[[constant]]
+c = "NDIlib_FourCC_video_type_NV12"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NV12"
+
+[[constant]]
+c = "NDIlib_FourCC_type_NV12"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_type_NV12"
+
+[[constant]]
+c = "NDIlib_FourCC_video_type_BGRA"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA"
+
+[[constant]]
+c = "NDIlib_FourCC_type_BGRA"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_type_BGRA"
+
+[[constant]]
+c = "NDIlib_FourCC_video_type_BGRX"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRX"
+
+[[constant]]
+c = "NDIlib_FourCC_type_BGRX"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_type_BGRX"
+
+[[constant]]
+c = "NDIlib_FourCC_video_type_RGBA"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBA"
+
+[[constant]]
+c = "NDIlib_FourCC_type_RGBA"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_type_RGBA"
+
+[[constant]]
+c = "NDIlib_FourCC_video_type_RGBX"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBX"
+
+[[constant]]
+c = "NDIlib_FourCC_type_RGBX"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_type_RGBX"
+
+[[constant]]
+c = "NDIlib_FourCC_video_type_max"
+rust = "NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_max"
+
+[[constant]]
+c = "NDIlib_FourCC_audio_type_FLTP"
+rust = "NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP"
+
+[[constant]]
+c = "NDIlib_FourCC_type_FLTP"
+rust = "NDIlib_FourCC_audio_type_e_NDIlib_FourCC_type_FLTP"
+
+[[constant]]
+c = "NDIlib_FourCC_audio_type_max"
+rust = "NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_max"

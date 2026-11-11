@@ -1,0 +1,39 @@
+{
+  "schema": 2,
+  "purpose": "Explicit active SDK archive retention: the public Standard 6.3.2 baseline and the authorized Standard/Advanced 6.4 preview. Historical collection is outside this policy.",
+  "editions": [
+    "standard",
+    "advanced"
+  ],
+  "platforms": [
+    "linux",
+    "windows",
+    "apple",
+    "android"
+  ],
+  "retention": "Preserve each exact original vendor archive, including every supplied architecture, headers, examples, documents and notices. Never reduce it to the host or CI runner slice.",
+  "architecture_evidence": "Archive retention preserves all vendor-supplied bytes. It does not prove that every architecture has been enumerated, built, linked or executed. Record actual per-release inventories separately; do not copy current profile assumptions onto the baseline release.",
+  "version_rule": "Require the configured full numeric SDK version, padding omitted trailing components with zero. Only the reviewed catalog's exact artifact identity and SHA256 satisfy a package requirement; another build or archive in the same release family cannot substitute.",
+  "future_additions": "Add release-specific editions and package prefixes here, review exact identities in sdk-packages.json, configure private sources and verify retained bytes before expanding coverage. Files already present in a store do not create requirements. There is no automatic historical acquisition.",
+  "releases": [
+    {
+      "family": "6.3.2",
+      "version": "6.3.2",
+      "package_prefix": "6.3.2",
+      "editions": [
+        "standard"
+      ],
+      "channel": "public"
+    },
+    {
+      "family": "6.4",
+      "version": "6.4.0.2",
+      "package_prefix": "current",
+      "editions": [
+        "standard",
+        "advanced"
+      ],
+      "channel": "private-preview"
+    }
+  ]
+}

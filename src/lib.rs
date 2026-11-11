@@ -1,3 +1,5 @@
+#![cfg_attr(ndi_public_docs, doc(html_no_source))]
+
 //! High-performance Rust bindings for the NDI® 6 SDK (Network Device Interface).
 //!
 //! This crate provides safe, idiomatic Rust bindings for the NDI SDK, enabling
@@ -89,6 +91,8 @@
 //! synchronization, with no SDK completion callback registration. Optional Rust
 //! completion handlers run on the calling
 //! thread after synchronization, outside internal locks.
+//! The optional `advanced::QueuedSender` API provides a separate bounded queue
+//! using native completion callbacks when the selected runtime supplies them.
 //!
 //! Note: Only video supports async sending in the NDI SDK. Audio and metadata are always synchronous.
 //!
@@ -99,26 +103,26 @@
 //! - **Bandwidth control**: Multiple quality levels for different use cases
 //! - **SDK processing**: Encoding and acceleration depend on the installed NDI SDK
 //!
-//! # Platform Support
+//! # Runtime and platform support
 //!
-//! Windows, Linux, and macOS are all exercised in CI (build, test, lint, and
-//! semver checks) against the NDI SDK.
+//! Desktop platforms and Android load one process-retained core module with typed
+//! dispatch; Windows does not require an NDI import library for this shared path.
+//! [`NDI::new`] preserves normal initialize/destroy cycles; an explicit
+//! [`RuntimeOptions`] path can select the implementation before its first load.
+//! [`NDI::capabilities`] reports optional features without assuming hardware or
+//! license availability.
 //!
-//! - **Windows**: Links the NDI SDK import library at build time; requires the
-//!   NDI runtime DLLs at runtime. Supports x86 and x86_64 MSVC targets.
-//! - **Linux**: Supports both standard and Advanced SDK install directories;
-//!   the runtime libraries must be discoverable by the dynamic linker. Uses
-//!   GNU/glibc targets for x86, x86_64, ARMv6/ARMv7 hard-float, and ARM64.
-//! - **macOS**: Supports current NDI SDK package layouts used by the CI setup
-//!   action and common local install paths.
-//! - **Android**: Cross-build CI links examples for ARM64, ARMv7, x86, and x86_64.
-//!   Set `NDI_SDK_DIR` to the Android NDI SDK and configure the Android NDK
-//!   linker/sysroot. Device runtime testing is separate from build coverage.
+//! The `advanced` and `file-io` features add optional APIs. `advanced_sdk` remains
+//! a no-op compatibility flag. Missing newer SDK functions do not prevent existing
+//! APIs from loading. Apple mobile selects a static provider through the target
+//! artifact profile, with the File archive as the sole provider when it embeds
+//! the NDI core. Available vendor slices determine the supported target profiles.
 //!
-//! The current APIs are validated with NDI SDK 6.3.2. Apple mobile targets,
-//! including iOS, are not currently selected by the build script. See the
-//! [SDK validation guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/sdk-validation.md)
-//! for exact target coverage and cross-compilation commands.
+//! Cross compilation requires the exact target SDK, ABI and sysroot. Build/link,
+//! emulator/simulator, and physical-device validation are separate coverage levels;
+//! see the repository SDK validation guide and CI plan for recorded results and
+//! outstanding platform validation. Artifact selection alone is not device
+//! qualification.
 
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
@@ -127,6 +131,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 mod capture;
+mod dispatch;
 mod error;
 mod ndi_lib;
 mod recv_guard;
@@ -138,6 +143,19 @@ pub mod frames;
 pub mod receiver;
 pub mod runtime;
 pub mod sender;
+mod timestamp;
+pub mod utilities;
+pub mod video_conversion;
+
+pub mod capabilities;
+pub mod discovery;
+pub mod routing;
+
+#[cfg(feature = "advanced")]
+pub mod advanced;
+
+#[cfg(feature = "file-io")]
+pub mod file;
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
 mod async_runtime;
@@ -149,6 +167,10 @@ pub use async_runtime::tokio;
 pub use async_runtime::smol;
 
 pub use {
+    capabilities::{
+        Capabilities, CapabilityStatus, CapabilityUnavailable, RuntimeFeature, RuntimeInfo,
+        SdkEdition, SdkLinkage, SdkVersion,
+    },
     capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
     error::*,
     finder::{Finder, FinderOptions, FinderOptionsBuilder, Source, SourceAddress, SourceCache},
@@ -160,14 +182,16 @@ pub use {
     framesync::{FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncVideoRef},
     receiver::{
         Capture, ConnectionStats, FrameSyncAttached, RawCapture, Receiver, ReceiverBandwidth,
-        ReceiverColorFormat, ReceiverMode, ReceiverOptions, ReceiverOptionsBuilder, ReceiverStatus,
-        Tally,
+        ReceiverColorFormat, ReceiverEvent, ReceiverMode, ReceiverOptions, ReceiverOptionsBuilder,
+        ReceiverStatus, SourceNameChange, Tally,
     },
-    runtime::NDI,
+    runtime::{ProcessLifetimeRuntime, RuntimeOptions, NDI},
     sender::{
         BorrowedVideoFrame, BorrowedVideoFrameBuilder, Sender, SenderOptions, SenderOptionsBuilder,
     },
 };
+
+pub use timestamp::SdkTimestamp;
 
 #[cfg(feature = "image-encoding")]
 pub use frames::ImageFormat;

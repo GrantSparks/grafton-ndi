@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/advanced/fail/clock_not_clone.rs:4:29
+  |
+4 |     let _: VideoClock<'_> = clock.clone();
+  |            --------------   ^^^^^^^^^^^^^ expected `VideoClock<'_>`, found `&VideoClock<'_>`
+  |            |
+  |            expected due to this
+  |
+note: `VideoClock<'_>` does not implement `Clone`, so `&VideoClock<'_>` was cloned instead
+ --> tests/ui/advanced/fail/clock_not_clone.rs:4:29
+  |
+4 |     let _: VideoClock<'_> = clock.clone();
+  |                             ^^^^^

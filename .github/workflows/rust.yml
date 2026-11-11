@@ -1,355 +1,328 @@
-name: Rust CI/CD
+name: Rust CI
 
 on:
   push:
-    branches: ["main"]
-    tags: ["*"]
+    branches: [main]
+    tags: ['*']
   pull_request:
-    branches: ["main"]
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      scope:
+        description: Required family checks or the extended SDK upgrade audit
+        type: choice
+        options: [required, extended]
+        default: required
+  workflow_call:
+    inputs:
+      scope:
+        type: string
+        default: required
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: rust-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
-  NDI_SDK_URL: ${{ secrets.NDI_SDK_URL || 'https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe' }}
-  NDI_SDK_URL_MACOS: ${{ secrets.NDI_SDK_URL_MACOS || 'https://downloads.ndi.tv/SDK/NDI_SDK_Mac/Install_NDI_SDK_v6_Apple.pkg' }}
-  NDI_SDK_URL_LINUX: ${{ secrets.NDI_SDK_URL_LINUX || 'https://downloads.ndi.tv/SDK/NDI_SDK_Linux/Install_NDI_SDK_v6_Linux.tar.gz' }}
-  NDI_SDK_URL_ANDROID: ${{ secrets.NDI_SDK_URL_ANDROID || 'https://downloads.ndi.tv/SDK/NDI_SDK_Android/Install_NDI_SDK_v6_Android.tar.gz' }}
-  LLVM_VERSION: "20.1.8"
-  CACHE_VERSION: v1
+  CARGO_TERM_COLOR: never
+  NDI_VALIDATION_SCOPE: ${{ inputs.scope || 'required' }}
 
 jobs:
-  # Quick format check (no dependencies needed)
-  format:
-    name: Format Check
+  policy:
+    name: CI policy and SDK tooling tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - run: sudo apt-get update && sudo apt-get install --yes clang llvm
+      - run: python -m unittest discover -s ci/tests -v
+      - run: python -m unittest discover -s tools/sdk -v
+      - run: python tools/sdk/audit.py emit-capabilities --check
+
+  format:
+    name: Format
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  audit:
-    name: Dependency audit
+  # Enable SDK validation explicitly. Publication independently requires a
+  # successful gate and a trusted main/tag event; pull requests cannot publish.
+  plan:
+    name: Exact SDK validation plan
+    if: >-
+      vars.NDI_CI_RELEASED == 'true' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-      # Libraries do not track Cargo.lock; resolve all optional/target dependencies.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - run: cargo generate-lockfile
-      - run: cargo audit --deny warnings
+      - id: plan
+        name: Generate the public matrix without acquisition secrets
+        run: python ci/plan.py --scope "$NDI_VALIDATION_SCOPE" --require-provisioning --output ci-plan.json --github-output "$GITHUB_OUTPUT"
+      - name: Audit the exact dependency resolution used by every cell
+        run: |
+          cargo install cargo-audit --version 0.23.0 --locked
+          cargo audit --deny warnings
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ci-plan
+          path: |
+            ci-plan.json
+            Cargo.lock
+          if-no-files-found: error
+          retention-days: 7
 
-  # Combined setup and test job
-  test-and-lint:
-    name: Test & Lint
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  sources:
+    name: Verify private SDK source configuration
+    needs: plan
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7.0.1
-
-      # Setup NDI SDK (Windows)
-      - uses: ./.github/actions/setup-ndi-windows
-        if: runner.os == 'Windows'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
-          save-cache: 'true'
-
-      # Setup NDI SDK (macOS)
-      - uses: ./.github/actions/setup-ndi-macos
-        if: runner.os == 'macOS'
+          python-version: '3.13'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          save-cache: 'true'
-
-      # Setup NDI SDK (Linux)
-      - uses: ./.github/actions/setup-ndi-linux
-        if: runner.os == 'Linux'
-        with:
-          save-cache: 'true'
-
-      # Setup Rust
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      # Rust caching with optimizations
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # Don't cache the entire target directory, just dependencies
-          cache-targets: false
-          # Use a shared cache key to avoid saving the same dependencies multiple times
-          shared-key: "rust-cache-2.0-${{ matrix.os }}"
-          # Only save cache on main branch to avoid cache thrashing
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Check unchanged builds stay fresh
-        shell: bash
+          name: ci-plan
+          path: .
+      # Credentialed jobs must not emit matrix outputs: multiline secrets can
+      # register common JSON fragments with GitHub's output secret masker.
+      - name: Check all SDK sources against the exact plan
         env:
-          CARGO_TERM_COLOR: never
+          NDI_SDK_SOURCES_JSON: ${{ secrets.NDI_SDK_SOURCES_JSON }}
+          NDI_SDK_ARCHIVE_TOKEN: ${{ secrets.NDI_SDK_ARCHIVE_TOKEN }}
+          NDI_SDK_6_3_2_STANDARD_ANDROID_URL: ${{ secrets.NDI_SDK_6_3_2_STANDARD_ANDROID_URL }}
+          NDI_SDK_6_3_2_STANDARD_ANDROID_SHA256: ${{ vars.NDI_SDK_6_3_2_STANDARD_ANDROID_SHA256 }}
+          NDI_SDK_6_3_2_STANDARD_APPLE_URL: ${{ secrets.NDI_SDK_6_3_2_STANDARD_APPLE_URL }}
+          NDI_SDK_6_3_2_STANDARD_APPLE_SHA256: ${{ vars.NDI_SDK_6_3_2_STANDARD_APPLE_SHA256 }}
+          NDI_SDK_6_3_2_STANDARD_LINUX_URL: ${{ secrets.NDI_SDK_6_3_2_STANDARD_LINUX_URL }}
+          NDI_SDK_6_3_2_STANDARD_LINUX_SHA256: ${{ vars.NDI_SDK_6_3_2_STANDARD_LINUX_SHA256 }}
+          NDI_SDK_6_3_2_STANDARD_WINDOWS_URL: ${{ secrets.NDI_SDK_6_3_2_STANDARD_WINDOWS_URL }}
+          NDI_SDK_6_3_2_STANDARD_WINDOWS_SHA256: ${{ vars.NDI_SDK_6_3_2_STANDARD_WINDOWS_SHA256 }}
+          NDI_SDK_CURRENT_ADVANCED_ANDROID_URL: ${{ secrets.NDI_SDK_CURRENT_ADVANCED_ANDROID_URL }}
+          NDI_SDK_CURRENT_ADVANCED_ANDROID_SHA256: ${{ vars.NDI_SDK_CURRENT_ADVANCED_ANDROID_SHA256 }}
+          NDI_SDK_CURRENT_ADVANCED_APPLE_URL: ${{ secrets.NDI_SDK_CURRENT_ADVANCED_APPLE_URL }}
+          NDI_SDK_CURRENT_ADVANCED_APPLE_SHA256: ${{ vars.NDI_SDK_CURRENT_ADVANCED_APPLE_SHA256 }}
+          NDI_SDK_CURRENT_ADVANCED_LINUX_URL: ${{ secrets.NDI_SDK_CURRENT_ADVANCED_LINUX_URL }}
+          NDI_SDK_CURRENT_ADVANCED_LINUX_SHA256: ${{ vars.NDI_SDK_CURRENT_ADVANCED_LINUX_SHA256 }}
+          NDI_SDK_CURRENT_ADVANCED_WINDOWS_URL: ${{ secrets.NDI_SDK_CURRENT_ADVANCED_WINDOWS_URL }}
+          NDI_SDK_CURRENT_ADVANCED_WINDOWS_SHA256: ${{ vars.NDI_SDK_CURRENT_ADVANCED_WINDOWS_SHA256 }}
+          NDI_SDK_CURRENT_STANDARD_ANDROID_URL: ${{ secrets.NDI_SDK_CURRENT_STANDARD_ANDROID_URL }}
+          NDI_SDK_CURRENT_STANDARD_ANDROID_SHA256: ${{ vars.NDI_SDK_CURRENT_STANDARD_ANDROID_SHA256 }}
+          NDI_SDK_CURRENT_STANDARD_APPLE_URL: ${{ secrets.NDI_SDK_CURRENT_STANDARD_APPLE_URL }}
+          NDI_SDK_CURRENT_STANDARD_APPLE_SHA256: ${{ vars.NDI_SDK_CURRENT_STANDARD_APPLE_SHA256 }}
+          NDI_SDK_CURRENT_STANDARD_LINUX_URL: ${{ secrets.NDI_SDK_CURRENT_STANDARD_LINUX_URL }}
+          NDI_SDK_CURRENT_STANDARD_LINUX_SHA256: ${{ vars.NDI_SDK_CURRENT_STANDARD_LINUX_SHA256 }}
+          NDI_SDK_CURRENT_STANDARD_WINDOWS_URL: ${{ secrets.NDI_SDK_CURRENT_STANDARD_WINDOWS_URL }}
+          NDI_SDK_CURRENT_STANDARD_WINDOWS_SHA256: ${{ vars.NDI_SDK_CURRENT_STANDARD_WINDOWS_SHA256 }}
         run: |
-          cargo build
-          build_log=$(mktemp)
-          cargo build 2>&1 | tee "$build_log"
-          if grep -Eq '^[[:space:]]*Compiling grafton-ndi v' "$build_log"; then
-            echo "Unchanged cargo build recompiled grafton-ndi"
-            exit 1
-          fi
-
-          cargo test --no-run
-          cargo test --no-run 2>&1 | tee "$build_log"
-          if grep -Eq '^[[:space:]]*Compiling grafton-ndi v' "$build_log"; then
-            echo "Unchanged cargo test --no-run recompiled grafton-ndi"
-            exit 1
-          fi
-          rm "$build_log"
-
-      - name: Run receiver status SDK regression
-        run: cargo test --all-features --test receiver_status_notifications -- --ignored --nocapture
-
-      # Run all checks
-      - name: Run tests
-        run: |
-          # First run diagnostic tests on Windows
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            echo "Running Windows DLL diagnostics..."
-            cargo test --test windows_dll_check -- --nocapture
-            cargo test --test diagnose_windows_ci test_ndi_environment -- --nocapture
-          fi
-
-          # Run all tests including integration tests
-          # The NDI runtime libraries are now available via the setup actions
-          cargo test --all-features --verbose
-        shell: bash
-        env:
-          TMPDIR: ${{ runner.temp }}
-
-      - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Build and test examples
-        run: |
-          cargo build --examples
-          cargo build --examples --all-features
-          cargo test --examples --all-features
-
-      - name: Run SDK lifecycle regressions
-        if: runner.os == 'Linux'
-        run: cargo test --all-features --test async_send_lifecycle --test sender_lifecycle_stress -- --ignored
-
-      - name: Run video padding and FrameSync recovery SDK regression
-        if: runner.os == 'Linux'
-        run: cargo test --all-features --test video_padding_sdk -- --ignored --nocapture
-
-      - name: Run FrameSync audio SDK regression
-        run: cargo test --all-features --test framesync_audio_requests -- --ignored --nocapture
-
-      - name: Check independent feature configurations
-        if: runner.os == 'Linux'
-        run: |
-          cargo test --no-default-features
-          cargo build --examples --no-default-features
-          cargo test --no-default-features --features tokio
-          cargo build --examples --no-default-features --features tokio
-          cargo test --no-default-features --features smol
-          cargo build --examples --no-default-features --features smol
-          cargo test --no-default-features --features tokio,smol
-          cargo build --examples --no-default-features --features tokio,smol
-          cargo test
-          cargo check --no-default-features --features advanced_sdk
-
-      # Documentation lint runs once; rustdoc lints are platform-independent.
-      - name: Check documentation
-        if: runner.os == 'Linux'
-        run: cargo doc --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-
-      # rust-cache v2 scans target/tests even with cache-targets disabled. Its
-      # unawaited nested cleanup reports ENOENT for trybuild's absent
-      # target/tests/target. Keep consumed, uncached outputs outside its traversal.
-      - name: Move compile-contract scratch artifacts out of the workspace
-        shell: python
-        run: |
-          import os
+          python ci/plan.py --scope "$NDI_VALIDATION_SCOPE" --require-provisioning --require-sources --preflight-output "$RUNNER_TEMP/sdk-configuration.json" --output "$RUNNER_TEMP/source-plan.json"
+          python - <<'PY_COMPARE'
+          import json, os
           from pathlib import Path
-          import shutil
-          import tempfile
+          original = json.loads(Path('ci-plan.json').read_text())
+          checked = json.loads((Path(os.environ['RUNNER_TEMP']) / 'source-plan.json').read_text())
+          if original != checked:
+              raise SystemExit('Credentialed source check differs from the frozen public plan')
+          PY_COMPARE
+      - name: Upload bounded configuration report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: sdk-configuration
+          path: ${{ runner.temp }}/sdk-configuration.json
+          if-no-files-found: error
+          retention-days: 7
 
-          scratch = Path("target/tests")
-          if scratch.exists():
-              destination = tempfile.mkdtemp(prefix="grafton-contracts-", dir=os.environ["RUNNER_TEMP"])
-              shutil.move(str(scratch), destination)
-
-  android:
-    name: Android (${{ matrix.target }})
-    runs-on: ubuntu-24.04
+  sdk:
+    name: ${{ matrix.id }}
+    needs: [plan, sources]
     strategy:
       fail-fast: false
-      matrix:
-        target: [aarch64-linux-android, armv7-linux-androideabi, i686-linux-android, x86_64-linux-android]
+      max-parallel: 8
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    env:
+      NDI_CI_RELEASED: ${{ vars.NDI_CI_RELEASED }}
+      NDI_SDK_SOURCES_JSON: ${{ secrets.NDI_SDK_SOURCES_JSON }}
+      NDI_SDK_ARCHIVE_TOKEN: ${{ secrets.NDI_SDK_ARCHIVE_TOKEN }}
+      NDI_SDK_6_3_2_STANDARD_ANDROID_URL: ${{ secrets.NDI_SDK_6_3_2_STANDARD_ANDROID_URL }}
+      NDI_SDK_6_3_2_STANDARD_ANDROID_SHA256: ${{ vars.NDI_SDK_6_3_2_STANDARD_ANDROID_SHA256 }}
+      NDI_SDK_6_3_2_STANDARD_APPLE_URL: ${{ secrets.NDI_SDK_6_3_2_STANDARD_APPLE_URL }}
+      NDI_SDK_6_3_2_STANDARD_APPLE_SHA256: ${{ vars.NDI_SDK_6_3_2_STANDARD_APPLE_SHA256 }}
+      NDI_SDK_6_3_2_STANDARD_LINUX_URL: ${{ secrets.NDI_SDK_6_3_2_STANDARD_LINUX_URL }}
+      NDI_SDK_6_3_2_STANDARD_LINUX_SHA256: ${{ vars.NDI_SDK_6_3_2_STANDARD_LINUX_SHA256 }}
+      NDI_SDK_6_3_2_STANDARD_WINDOWS_URL: ${{ secrets.NDI_SDK_6_3_2_STANDARD_WINDOWS_URL }}
+      NDI_SDK_6_3_2_STANDARD_WINDOWS_SHA256: ${{ vars.NDI_SDK_6_3_2_STANDARD_WINDOWS_SHA256 }}
+      NDI_SDK_CURRENT_ADVANCED_ANDROID_URL: ${{ secrets.NDI_SDK_CURRENT_ADVANCED_ANDROID_URL }}
+      NDI_SDK_CURRENT_ADVANCED_ANDROID_SHA256: ${{ vars.NDI_SDK_CURRENT_ADVANCED_ANDROID_SHA256 }}
+      NDI_SDK_CURRENT_ADVANCED_APPLE_URL: ${{ secrets.NDI_SDK_CURRENT_ADVANCED_APPLE_URL }}
+      NDI_SDK_CURRENT_ADVANCED_APPLE_SHA256: ${{ vars.NDI_SDK_CURRENT_ADVANCED_APPLE_SHA256 }}
+      NDI_SDK_CURRENT_ADVANCED_LINUX_URL: ${{ secrets.NDI_SDK_CURRENT_ADVANCED_LINUX_URL }}
+      NDI_SDK_CURRENT_ADVANCED_LINUX_SHA256: ${{ vars.NDI_SDK_CURRENT_ADVANCED_LINUX_SHA256 }}
+      NDI_SDK_CURRENT_ADVANCED_WINDOWS_URL: ${{ secrets.NDI_SDK_CURRENT_ADVANCED_WINDOWS_URL }}
+      NDI_SDK_CURRENT_ADVANCED_WINDOWS_SHA256: ${{ vars.NDI_SDK_CURRENT_ADVANCED_WINDOWS_SHA256 }}
+      NDI_SDK_CURRENT_STANDARD_ANDROID_URL: ${{ secrets.NDI_SDK_CURRENT_STANDARD_ANDROID_URL }}
+      NDI_SDK_CURRENT_STANDARD_ANDROID_SHA256: ${{ vars.NDI_SDK_CURRENT_STANDARD_ANDROID_SHA256 }}
+      NDI_SDK_CURRENT_STANDARD_APPLE_URL: ${{ secrets.NDI_SDK_CURRENT_STANDARD_APPLE_URL }}
+      NDI_SDK_CURRENT_STANDARD_APPLE_SHA256: ${{ vars.NDI_SDK_CURRENT_STANDARD_APPLE_SHA256 }}
+      NDI_SDK_CURRENT_STANDARD_LINUX_URL: ${{ secrets.NDI_SDK_CURRENT_STANDARD_LINUX_URL }}
+      NDI_SDK_CURRENT_STANDARD_LINUX_SHA256: ${{ vars.NDI_SDK_CURRENT_STANDARD_LINUX_SHA256 }}
+      NDI_SDK_CURRENT_STANDARD_WINDOWS_URL: ${{ secrets.NDI_SDK_CURRENT_STANDARD_WINDOWS_URL }}
+      NDI_SDK_CURRENT_STANDARD_WINDOWS_SHA256: ${{ vars.NDI_SDK_CURRENT_STANDARD_WINDOWS_SHA256 }}
+      GROUP_ID: ${{ matrix.id }}
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: ./.github/actions/setup-ndi-linux
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
-          platform: android
-      - uses: dtolnay/rust-toolchain@stable
+          python-version: '3.13'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          targets: ${{ matrix.target }}
-      - name: Install Android NDK
-        run: |
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'ndk;27.3.13750724'
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.3.13750724" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: android-${{ matrix.target }}
-      - name: Link examples with the Android SDK
-        run: scripts/build-android.sh "$NDI_TARGET"
-        env:
-          NDI_TARGET: ${{ matrix.target }}
-
-  msrv:
-    name: Library MSRV (Rust 1.88)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: ./.github/actions/setup-ndi-linux
-        with:
-          save-cache: 'false'
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - run: cargo check --all-targets --all-features
-      # Compile-diagnostic fixtures remain on stable in test-and-lint.
-      - run: cargo test --lib --all-features
-
-  # Semver check runs on all platforms
-  semver:
-    name: Check semver
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7.0.1
-
-      # Setup NDI SDK (Windows)
-      - uses: ./.github/actions/setup-ndi-windows
-        if: runner.os == 'Windows'
-        with:
-          save-cache: 'false'
-
-      # Setup NDI SDK (macOS)
-      - uses: ./.github/actions/setup-ndi-macos
-        if: runner.os == 'macOS'
-        with:
-          save-cache: 'false'
-
-      # Setup NDI SDK (Linux)
-      - uses: ./.github/actions/setup-ndi-linux
+          name: ci-plan
+          path: .
+      - name: Linux host tools
         if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang llvm libclang-dev pkg-config libavahi-client-dev bubblewrap dbus avahi-daemon ffmpeg
+      - name: Native Linux 32-bit runtime and linker
+        if: matrix.needs_multilib
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install --yes gcc-multilib g++-multilib libc6-dev:i386 libavahi-client-dev:i386
+      - name: Permit isolated Linux test namespaces
+        if: runner.os == 'Linux'
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Windows LLVM
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'C:\Program Files\LLVM\bin\clang.exe')) {
+            choco install llvm --version=20.1.8 -y
+          }
+          if (!(Get-Command ffmpeg -ErrorAction SilentlyContinue)) { choco install ffmpeg -y }
+          'C:\Program Files\LLVM\bin' | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+          'LIBCLANG_PATH=C:\Program Files\LLVM\bin' | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Apple LLVM object inspection tools
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install llvm ffmpeg
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+      - name: Android NDK
+        if: matrix.android
+        shell: bash
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'ndk;27.3.13750724' 'build-tools;35.0.0' 'platforms;android-35'
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.3.13750724" >> "$GITHUB_ENV"
+      - name: Enable Android emulator acceleration
+        if: matrix.emulator_api
+        run: |
+          sudo chmod 666 /dev/kvm
+      - name: Android emulator lifecycle and package validation
+        if: matrix.emulator_api
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         with:
-          save-cache: 'false'
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      # Rust caching - read-only, don't save
-      - uses: Swatinem/rust-cache@v2
+          api-level: ${{ matrix.emulator_api }}
+          arch: ${{ matrix.emulator_arch }}
+          target: google_apis
+          disable-animations: true
+          emulator-options: -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader_indirect
+          script: python ci/batch.py --plan ci-plan.json --group "$GROUP_ID" --output "$RUNNER_TEMP/ndi-ci" --install-toolchain
+      - name: Build, prove ABI, and execute the declared suite
+        if: ${{ !matrix.emulator_api }}
+        shell: bash
+        run: python ci/batch.py --plan ci-plan.json --group "$GROUP_ID" --output "$RUNNER_TEMP/ndi-ci" --install-toolchain
+      # Only individually verified bounded records enter evidence/. SDKs, generated
+      # bindings, build outputs and raw diagnostics stay in separate private paths.
+      - name: Upload result evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          cache-targets: false
-          shared-key: "rust-cache-2.0-${{ matrix.os }}"
-          save-if: false  # Let test-and-lint job handle saving
+          name: sdk-evidence-${{ matrix.id }}
+          path: ${{ runner.temp }}/ndi-ci/evidence/
+          if-no-files-found: error
+          retention-days: 7
 
-      - uses: obi1kenobi/cargo-semver-checks-action@v2
-
-  # Build and publish API documentation to GitHub Pages.
-  #
-  # Bindgen needs an installed NDI SDK. The docs.rs environment does not
-  # include that installation, so build and host documentation from CI,
-  # where the SDK is configured by the platform setup action.
-  docs:
-    name: Publish docs
-    needs: [format, audit, test-and-lint, android, semver, msrv]
-    if: github.ref == 'refs/heads/main'
+  required-ci:
+    name: Required hosted SDK gate
+    if: always()
+    needs: [policy, format, plan, sources, sdk]
     runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.13'
+      - name: Require every declared prerequisite
+        env:
+          POLICY: ${{ needs.policy.result }}
+          FORMAT: ${{ needs.format.result }}
+          PLAN: ${{ needs.plan.result }}
+          SOURCES: ${{ needs.sources.result }}
+          SDK: ${{ needs.sdk.result }}
+        run: |
+          python - <<'PY'
+          import os
+          failed = [name for name in ('POLICY', 'FORMAT', 'PLAN', 'SOURCES', 'SDK') if os.environ[name] != 'success']
+          if failed:
+              raise SystemExit('Required CI did not pass (disabled/skipped is not a release pass): ' + ', '.join(failed))
+          PY
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: ci-plan
+          path: ${{ runner.temp }}/ndi-aggregate/plan
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: sdk-evidence-*
+          path: ${{ runner.temp }}/ndi-aggregate/evidence
+      - run: python ci/aggregate.py --plan "$RUNNER_TEMP/ndi-aggregate/plan/ci-plan.json" --lockfile "$RUNNER_TEMP/ndi-aggregate/plan/Cargo.lock" --results "$RUNNER_TEMP/ndi-aggregate/evidence" --availability "$RUNNER_TEMP/ndi-aggregate/evidence" --output "$RUNNER_TEMP/ndi-aggregate/release-evidence.json"
+      - name: Upload exact aggregate evidence for publication
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-evidence
+          path: ${{ runner.temp }}/ndi-aggregate/release-evidence.json
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish only the validated release candidate
+    needs: required-ci
+    if: >-
+      vars.NDI_CI_RELEASED == 'true' && needs.required-ci.result == 'success' &&
+      (inputs.scope == '' || inputs.scope == 'required') &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
     permissions:
       contents: read
       pages: write
       id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - uses: actions/checkout@v7.0.1
-
-      - uses: ./.github/actions/setup-ndi-linux
-        with:
-          save-cache: 'false'
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: false
-          shared-key: "rust-cache-2.0-ubuntu-24.04"
-          save-if: false
-
-      - name: Build documentation
-        run: cargo doc --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-
-      # docs.rs serves the crate root; replicate that with a redirect so the
-      # Pages root lands on the crate documentation.
-      - name: Add root redirect to crate docs
-        run: echo '<meta http-equiv="refresh" content="0; url=grafton_ndi/index.html">' > target/doc/index.html
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v5.0.0
-        with:
-          path: target/doc
-
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v5.0.1
-
-  # Publish job
-  publish:
-    name: Publish
-    needs: [format, audit, test-and-lint, android, msrv, semver]
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: windows-latest
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v7.0.1
-
-      # Setup NDI SDK and LLVM
-      - uses: ./.github/actions/setup-ndi-windows
-        with:
-          save-cache: 'false'
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      # Rust caching - read-only for publish job
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: false
-          shared-key: "rust-cache-2.0-windows-latest"
-          save-if: false  # Don't save cache in publish job
-
-      - name: Authenticate with crates.io
-        id: auth
-        uses: rust-lang/crates-io-auth-action@v1.0.5
-
-      - name: Publish to crates.io
-        run: cargo publish
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+    uses: ./.github/workflows/publish.yml
+    with:
+      required-ci-passed: ${{ needs.required-ci.result == 'success' }}
+    secrets:
+      NDI_SDK_SOURCES_JSON: ${{ secrets.NDI_SDK_SOURCES_JSON }}
+      NDI_SDK_ARCHIVE_TOKEN: ${{ secrets.NDI_SDK_ARCHIVE_TOKEN }}
+      NDI_SDK_CURRENT_STANDARD_LINUX_URL: ${{ secrets.NDI_SDK_CURRENT_STANDARD_LINUX_URL }}

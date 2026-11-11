@@ -1,8 +1,70 @@
-//! NDI runtime management and initialization.
+//! Select an NDI implementation and manage its initialization lifetime.
+//!
+//! A successfully loaded shared core module remains pinned for the process even
+//! after the last [`NDI`] handle is dropped. Native initialization and teardown
+//! still follow handle ownership unless [`NDI::process_lifetime`] is selected.
+//! Static targets use the provider chosen at build time.
 
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::{
+    path::PathBuf,
+    sync::{Condvar, Mutex, MutexGuard, OnceLock},
+};
+
+use crate::{
+    capabilities::{Capabilities, CapabilityStatus, RuntimeFeature, RuntimeInfo, SdkEdition},
+    dispatch,
+};
 
 use crate::{ndi_lib::*, Error, Result};
+
+/// Selection options applied before the first successful runtime load.
+///
+/// Successful selection is process-wide and immutable. Failed loads can be retried.
+/// [`NDI::version`] and CPU queries also select the default module when none has
+/// been selected, even though they do not initialize it. Apply explicit options
+/// before those queries when selecting a particular installation.
+/// Loading a native library executes its native constructors; use trusted SDK files.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeOptions {
+    pub(crate) library_path: Option<PathBuf>,
+    pub(crate) edition: Option<SdkEdition>,
+}
+
+impl RuntimeOptions {
+    /// Select an exact absolute shared-library path instead of the loader search path.
+    /// Static providers reject an explicit shared-library path.
+    pub fn library_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.library_path = Some(path.into());
+        self
+    }
+
+    /// Require the given SDK edition. By default the selected build artifact sets it.
+    /// A static provider cannot switch away from its build-time edition.
+    pub fn edition(mut self, edition: SdkEdition) -> Self {
+        self.edition = Some(edition);
+        self
+    }
+}
+
+/// An explicit promise that the selected NDI runtime stays initialized until exit.
+///
+/// Created by [`NDI::process_lifetime`]. The first creation retains one runtime
+/// reference permanently. Dropping this token does not reverse that choice.
+/// This is intended for native callbacks whose completion cannot be bounded by a
+/// normal sender/receiver lifetime. It does not grant an SDK license entitlement.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessLifetimeRuntime {
+    ndi: &'static NDI,
+}
+
+impl ProcessLifetimeRuntime {
+    /// Borrow the permanently retained runtime handle.
+    pub fn ndi(&self) -> &NDI {
+        self.ndi
+    }
+}
+
+static PROCESS_LIFETIME: OnceLock<NDI> = OnceLock::new();
 
 /// Runtime lifecycle phase.
 ///
@@ -195,6 +257,9 @@ static RUNTIME: RuntimeManager = RuntimeManager::new();
 /// simultaneously - they share the same underlying runtime through reference counting.
 /// Create handles with [`NDI::new`] or [`Clone::clone`]; direct construction is private
 /// so every handle owns a reference to the initialized runtime.
+/// Releasing the final handle tears down native initialization, but does not unload
+/// or change the selected module. [`NDI::process_lifetime`] explicitly retains an
+/// initialized handle until process exit.
 ///
 /// # Examples
 ///
@@ -208,7 +273,7 @@ static RUNTIME: RuntimeManager = RuntimeManager::new();
 /// // The runtime stays alive as long as any NDI instance exists
 /// let ndi2 = ndi.clone(); // Cheap reference-counted clone
 ///
-/// // Runtime is automatically cleaned up when all instances are dropped
+/// // Without a process-lifetime opt-in, the last handle tears down initialization.
 /// # Ok(())
 /// # }
 /// ```
@@ -224,16 +289,19 @@ impl NDI {
     /// threads. It initializes the runtime when necessary; otherwise it acquires
     /// another runtime reference. Cloning a live handle also acquires a reference.
     /// The runtime is destroyed when the last handle is dropped, including handles
-    /// retained internally by senders, receivers, and finders.
+    /// retained internally by senders, receivers, and finders, unless a
+    /// [`ProcessLifetimeRuntime`] reference was retained. The loaded core module
+    /// remains selected and pinned after teardown.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InitializationFailed`] if the NDI SDK fails to initialize
-    /// or the process has exhausted the runtime handle reference count.
+    /// Returns [`Error::RuntimeLoadFailed`] if the SDK cannot be loaded or lacks
+    /// a required baseline symbol, and [`Error::InitializationFailed`] if native
+    /// initialization fails or the runtime handle reference count is exhausted.
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// # use grafton_ndi::NDI;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let ndi = NDI::new()?;
@@ -242,17 +310,69 @@ impl NDI {
     /// # }
     /// ```
     pub fn new() -> Result<Self> {
+        Self::with_options(&RuntimeOptions::default())
+    }
+
+    /// Load the selected implementation and acquire an initialized runtime handle.
+    ///
+    /// An explicit path or edition that conflicts with an already selected module
+    /// returns [`Error::RuntimeConflict`]. A failed load or initialization is retryable.
+    /// Once loading succeeds, initialization retries use that same selected module.
+    pub fn with_options(options: &RuntimeOptions) -> Result<Self> {
+        dispatch::select(options)?;
         RUNTIME.acquire()?;
         Ok(Self { _private: () })
     }
 
+    /// Facts about the selected implementation, including its actual loaded path.
+    pub fn info(&self) -> RuntimeInfo {
+        dispatch::selected().info.clone()
+    }
+
+    /// Capability evidence for the selected implementation.
+    pub fn capabilities(&self) -> Capabilities {
+        dispatch::selected().capabilities.clone()
+    }
+
+    /// Reject an unavailable operation before passing newer inputs to the SDK.
+    pub fn require_feature(&self, feature: RuntimeFeature) -> Result<()> {
+        match self.capabilities().status(feature) {
+            CapabilityStatus::Available => Ok(()),
+            CapabilityStatus::Unavailable(reason) => Err(Error::UnsupportedCapability {
+                capability: feature.name().into(),
+                reason: format!("{reason:?}"),
+            }),
+        }
+    }
+
+    /// Retain an initialized runtime reference until process exit.
+    ///
+    /// This is an irreversible, process-wide opt-in. It does not change ordinary
+    /// reference-counted teardown unless this method is explicitly called.
+    pub fn process_lifetime(&self) -> ProcessLifetimeRuntime {
+        ProcessLifetimeRuntime {
+            ndi: PROCESS_LIFETIME.get_or_init(|| self.clone()),
+        }
+    }
+
+    /// The caller must supply the exact native C function-pointer type for `name`.
+    pub(crate) unsafe fn resolve_optional<T: Copy>(
+        &self,
+        name: &'static [u8],
+    ) -> Result<Option<T>> {
+        dispatch::selected().optional(name)
+    }
+
     /// Checks if the current CPU is supported by the NDI SDK.
     ///
-    /// The NDI SDK requires certain CPU features (e.g., SSE4.2 on x86_64).
+    /// Requirements depend on the selected SDK artifact. This query selects the
+    /// default module when none has been selected; it does not initialize NDI.
+    /// A loading failure returns `false`; [`NDI::try_is_supported_cpu`] preserves
+    /// the loading error.
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// if grafton_ndi::NDI::is_supported_cpu() {
     ///     println!("CPU is supported by NDI");
     /// } else {
@@ -260,15 +380,26 @@ impl NDI {
     /// }
     /// ```
     pub fn is_supported_cpu() -> bool {
-        unsafe { NDIlib_is_supported_CPU() }
+        Self::try_is_supported_cpu().unwrap_or(false)
+    }
+
+    /// Check CPU support while preserving native-library loading diagnostics.
+    pub fn try_is_supported_cpu() -> Result<bool> {
+        dispatch::select(&RuntimeOptions::default())?;
+        Ok(unsafe { NDIlib_is_supported_CPU() })
     }
 
     /// Returns the version string of the NDI runtime.
     ///
+    /// This selects the default module if necessary without initializing NDI.
+    /// Apply explicit [`RuntimeOptions`] before this query to select another
+    /// installation. The result describes the selected implementation, not the
+    /// headers used to compile the crate.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the version string cannot be retrieved or contains
-    /// invalid UTF-8.
+    /// Returns an error if the module cannot be loaded, its version cannot be
+    /// retrieved, or its version text contains invalid UTF-8.
     ///
     /// # Examples
     ///
@@ -283,17 +414,10 @@ impl NDI {
     /// # }
     /// ```
     pub fn version() -> Result<String> {
-        unsafe {
-            let version_ptr = NDIlib_version();
-            if version_ptr.is_null() {
-                return Err(Error::NullPointer("NDIlib_version".into()));
-            }
-            let c_str = std::ffi::CStr::from_ptr(version_ptr);
-            c_str
-                .to_str()
-                .map(|s| s.to_owned())
-                .map_err(|e| Error::InvalidUtf8(e.to_string()))
-        }
+        Ok(dispatch::select(&RuntimeOptions::default())?
+            .info
+            .raw_version()
+            .to_owned())
     }
     /// Checks if the NDI runtime is currently initialized.
     ///

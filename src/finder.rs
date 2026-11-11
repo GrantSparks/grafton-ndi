@@ -152,6 +152,8 @@ pub struct Finder {
     _groups: Option<CString>,    // Hold ownership of CStrings
     _extra_ips: Option<CString>, // to ensure they outlive SDK usage
     _ndi: NDI,
+    #[cfg(feature = "advanced")]
+    _advanced_config: Option<crate::advanced::AdvancedConfig>,
 }
 
 impl Finder {
@@ -198,7 +200,101 @@ impl Finder {
             _groups: groups_cstr,
             _extra_ips: extra_ips_cstr,
             _ndi: ndi.clone(),
+            #[cfg(feature = "advanced")]
+            _advanced_config: None,
         })
+    }
+
+    /// Create a finder with an owned per-instance Advanced configuration.
+    #[cfg(feature = "advanced")]
+    pub fn new_with_config(
+        ndi: &NDI,
+        settings: &FinderOptions,
+        config: &crate::advanced::AdvancedConfig,
+    ) -> Result<Self> {
+        type Create = unsafe extern "C" fn(
+            *const NDIlib_find_create_t,
+            *const std::ffi::c_char,
+        ) -> NDIlib_find_instance_t;
+        #[cfg(ndi_has_advanced_header)]
+        let _: Create = crate::ndi_lib::raw::NDIlib_find_create_v3;
+        let create: Create =
+            unsafe { crate::advanced::ffi::required(ndi, b"NDIlib_find_create_v3\0")? };
+        let groups = settings.groups.as_deref().map(CString::new).transpose()?;
+        let extra_ips = settings
+            .extra_ips
+            .as_deref()
+            .map(CString::new)
+            .transpose()?;
+        let raw = NDIlib_find_create_t {
+            show_local_sources: settings.show_local_sources,
+            p_groups: groups.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+            p_extra_ips: extra_ips.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+        };
+        let instance = unsafe { create(&raw, config.as_ptr()) };
+        if instance.is_null() {
+            return Err(Error::InitializationFailed(
+                "Advanced finder creation failed".into(),
+            ));
+        }
+        Ok(Self {
+            instance,
+            sources_lock: Mutex::new(()),
+            _groups: groups,
+            _extra_ips: extra_ips,
+            _ndi: ndi.clone(),
+            _advanced_config: Some(config.clone()),
+        })
+    }
+
+    /// Copy a rich source snapshot before its SDK-owned strings can expire.
+    #[cfg(feature = "advanced")]
+    pub fn sources_with_metadata(&self) -> Result<Vec<crate::advanced::ExtendedSource>> {
+        #[cfg(not(ndi_has_advanced_header))]
+        {
+            Err(crate::advanced::ffi::build_unavailable())
+        }
+        #[cfg(ndi_has_advanced_header)]
+        {
+            type Get = unsafe extern "C" fn(
+                NDIlib_find_instance_t,
+                *mut u32,
+            ) -> *const crate::advanced::ffi::SourceV2;
+            #[cfg(ndi_has_advanced_header)]
+            let _: Get = crate::ndi_lib::raw::NDIlib_find_get_current_sources_v2;
+            let get: Get = unsafe {
+                crate::advanced::ffi::required(&self._ndi, b"NDIlib_find_get_current_sources_v2\0")?
+            };
+            let _lock = self.sources_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let mut count = 0;
+            let sources = unsafe { get(self.instance, &mut count) };
+            if sources.is_null() {
+                return Ok(Vec::new());
+            }
+            let mut result = Vec::with_capacity(count as usize);
+            for index in 0..count as usize {
+                let source = unsafe { &*sources.add(index) };
+                let mut raw = NDIlib_source_t {
+                    p_ndi_name: source.p_ndi_name,
+                    ..Default::default()
+                };
+                raw.__bindgen_anon_1.p_url_address = source.p_url_address;
+                let owned = unsafe { Source::try_from_raw(&raw)? };
+                let metadata = if source.p_metadata.is_null() {
+                    None
+                } else {
+                    let layout =
+                        unsafe { crate::frames::validate_frame_metadata(source.p_metadata)? };
+                    unsafe { crate::frames::frame_metadata_str(source.p_metadata, layout) }
+                        .map(str::to_owned)
+                };
+                result.push(crate::advanced::ExtendedSource {
+                    source: owned,
+                    metadata,
+                });
+            }
+            Ok(result)
+        }
     }
 
     /// Waits for the source list to change.
@@ -1624,6 +1720,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn concurrent_snapshots_keep_sdk_buffers_exclusive_until_copied() {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},

@@ -1,0 +1,20 @@
+error[E0277]: `Cell<()>` cannot be shared between threads safely
+ --> tests/ui/advanced/fail/clock_not_sync.rs:5:20
+  |
+5 |     require_sync::<VideoClock<'static>>();
+  |                    ^^^^^^^^^^^^^^^^^^^ `Cell<()>` cannot be shared between threads safely
+  |
+  = help: within `VideoClock<'static>`, the trait `Sync` is not implemented for `Cell<()>`
+  = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`
+note: required because it appears within the type `PhantomData<Cell<()>>`
+ --> $RUST/core/src/marker.rs
+note: required because it appears within the type `VideoClock<'static>`
+ --> src/advanced/sync.rs
+  |
+  | pub struct VideoClock<'a> {
+  |            ^^^^^^^^^^
+note: required by a bound in `require_sync`
+ --> tests/ui/advanced/fail/clock_not_sync.rs:3:20
+  |
+3 | fn require_sync<T: Sync>() {}
+  |                    ^^^^ required by this bound in `require_sync`

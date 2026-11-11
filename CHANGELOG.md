@@ -10,6 +10,97 @@ API, see the [README](README.md) and [2.0 migration guide](docs/migration/1.x-to
 
 ## [Unreleased]
 
+This SDK integration preserves existing 2.x APIs, defaults and the Rust 1.88
+minimum. The package remains 2.0.1 until a separate release-version decision.
+The compatibility target remains NDI 6.x; local assessment evidence includes
+Standard 6.3.2/6.4 and Advanced 6.4 on Linux x86_64. NDI 6.0 and 6.1.1 were not
+revalidated, and are not newly declared unsupported.
+
+### Added
+
+- NDI 6.4 planar `NA48`, `NB48`, `NA4G` and `NB4G` video, `Best444`, video-only
+  receive bandwidth, independent audio/video delay controls and SDK timestamps.
+  Extended-format frame builders retain proof from a compatible runtime through
+  `build_for(&ndi)`; existing formats keep their runtime-independent builders.
+- Standard source routing, Discovery Server advertisers/listeners, owned event
+  snapshots and subscriptions, explicit remote connection control, receiver
+  information/control helpers, and sender metadata capture with matching frees.
+- Checked interleaved audio conversion/sending and V210/P216 video conversion.
+- Optional `advanced` APIs for retained JSON configuration, compressed/packet and
+  scatter streams, bounded native completion queues, custom receive allocators,
+  AVSync, Genlock, encoder/keyframe controls and explicit KVM sessions.
+  Allocator callbacks require the irreversible `NDI::process_lifetime()` opt-in;
+  ordinary applications keep reference-counted native teardown.
+- Optional `file-io` recording and playback with owned events, finalization state,
+  and executor-independent async owners. Recorder timeouts retain state; drop
+  does not certify that a recording was finalized.
+- Explicit Apple mobile static profiles and a Linux artifact inventory. Supported
+  release profiles require SDK/toolchain inputs obtainable and testable on
+  GitHub-hosted runners; 19 vendor BSP profiles remain unsupported candidates.
+  Public Debian armhf build/link checks cover the four RPi GNU profiles at a
+  glibc 2.36 build floor, without claiming glibc 2.17 or board qualification.
+  File static archives supply the sole core provider when selected. Target
+  availability also requires a supplied SDK slice and usable Rust target; build,
+  emulation and physical-device evidence remain separate.
+- A reviewed SDK API registry, generated capability requirements, independent
+  C/Rust ABI probes and SDK comparison/classification tools for future upgrades.
+  The development store verifies retained archives and extracted installations;
+  future SDK retention is prospective and does not require historical collection.
+
+### Changed
+
+- Route existing and optional native calls through one selected implementation.
+  Shared runtimes load explicitly, remain pinned, and validate symbol provenance;
+  successful module selection is immutable while normal initialization can tear
+  down and restart. Load failures are retryable and missing optional APIs return
+  capability diagnostics without disabling existing calls.
+- Expose `RuntimeOptions`, runtime identity/version/capability queries and a
+  diagnostic-preserving CPU query. Runtime path/edition selection is independent
+  of Cargo API features. The legacy `advanced_sdk` feature remains a no-op.
+- Preserve existing API availability with older headers, including all-feature
+  builds with Standard headers. Advanced native calls require authorized local
+  Advanced ABI generation and matching runtime operations. A Cargo feature or
+  exported symbol does not establish hardware support or license entitlement.
+- Define representative hosted validation in 16 SDK jobs with 52 individual
+  checks: full runtime suites on Linux x64, Windows x64 and macOS ARM64; current
+  Standard/Advanced ABI/link or packaging for all 20 supported profiles; sampled
+  compatibility, MSRV and mobile execution. Related checks reuse verified SDK
+  installations within a job while retaining separate results. The broader
+  82-check audit remains available on demand. Workflow definitions alone do not
+  establish successful execution.
+- Run the 39 SDK-dependent core tests through explicit desktop confinement in
+  native, compatibility and feature checks. Ordinary CI tests use an unavailable
+  default runtime path; SDK resource compile contracts remain uncalled. macOS
+  native execution requires per-operation boundary, cleanup and recovery evidence,
+  and public runtime identities contain only validated structured fields.
+
+### Fixed
+
+- Recognize Advanced Windows/macOS artifacts and Windows-hosted Android installer
+  directory casing. Validate explicit target profiles and actual static archive
+  exports before generating linked symbol references.
+- Retain advertised sender/receiver resources through registration lifetimes,
+  preserve async-send storage until SDK completion, and keep callback generation
+  ownership through allocator replacement/reset and delayed native frees.
+- Preserve legacy owned `UnwindSafe` contracts after moving receiver ownership
+  behind shared internal state, with compile-time regression coverage.
+
+### Current limitations
+
+- `FileRecorder::native_source()` and `native_current_file()` remain unavailable
+  until their native pointer lifetimes have a safe copy boundary. The owned
+  request/event alternatives have explicitly different semantics; complete safe
+  File getter coverage is not claimed.
+- Required runtime coverage is representative; additional profiles have explicit
+  ABI/link or packaging coverage, and physical-device qualification remains
+  separate. Only the exact revision's completed aggregate establishes release
+  acceptance. Vendor BSP candidates lacking obtainable hosted toolchains are
+  outside the supported release matrix. Missing ARM64 Apple simulator
+  slices and the absent x86 visionOS Rust target are not claimed as supported
+  combinations. See [SDK validation](docs/sdk-validation.md),
+  [Advanced integration](docs/advanced.md) and [File I/O](docs/file-io.md).
+
+
 ## [2.0.1] - 2026-11-10
 
 ### Fixed

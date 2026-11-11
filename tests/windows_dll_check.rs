@@ -1,9 +1,9 @@
 #[cfg(target_os = "windows")]
 #[test]
+#[ignore = "Requires real NDI SDK and reviewed network confinement"]
 fn test_ndi_dll_availability() {
-    use std::os::windows::ffi::OsStrExt;
+    use std::{os::windows::ffi::OsStrExt, path::PathBuf};
 
-    // Windows API bindings
     #[link(name = "kernel32")]
     extern "system" {
         fn LoadLibraryW(lpFileName: *const u16) -> *mut std::ffi::c_void;
@@ -11,65 +11,34 @@ fn test_ndi_dll_availability() {
         fn FreeLibrary(hModule: *mut std::ffi::c_void) -> i32;
     }
 
-    fn to_wide_string(s: &str) -> Vec<u16> {
-        use std::ffi::OsStr;
-        OsStr::new(s).encode_wide().chain(Some(0)).collect()
+    // The confined runner supplies the exact edition/architecture selected by
+    // its verified SDK receipt. Manual runs must make that selection explicit.
+    let path = PathBuf::from(
+        std::env::var_os("NDI_EXPECTED_RUNTIME")
+            .expect("set NDI_EXPECTED_RUNTIME to the absolute selected NDI DLL path"),
+    );
+    assert!(path.is_absolute(), "selected NDI DLL path must be absolute");
+    assert!(path.is_file(), "selected NDI DLL must exist");
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+
+    // SAFETY: wide_path is a terminated UTF-16 path and stays alive for the call.
+    let handle = unsafe { LoadLibraryW(wide_path.as_ptr()) };
+    if handle.is_null() {
+        let error = unsafe { GetLastError() };
+        panic!("selected NDI DLL failed to load (Windows error {error})");
     }
-
-    println!("=== Windows DLL Availability Check ===");
-
-    // List of DLLs to check
-    let dlls = if cfg!(target_arch = "x86_64") {
-        vec!["Processing.NDI.Lib.x64.dll"]
-    } else {
-        vec!["Processing.NDI.Lib.x86.dll"]
-    };
-
-    for dll_name in dlls {
-        print!("Checking {}: ", dll_name);
-
-        let wide_name = to_wide_string(dll_name);
-        let handle = unsafe { LoadLibraryW(wide_name.as_ptr()) };
-
-        if handle.is_null() {
-            let error = unsafe { GetLastError() };
-            println!("❌ FAILED (Error code: {})", error);
-
-            // Common error codes:
-            // 126 = ERROR_MOD_NOT_FOUND - The specified module could not be found
-            // 127 = ERROR_PROC_NOT_FOUND - The specified procedure could not be found
-            match error {
-                126 => println!("  → DLL not found in PATH or application directory"),
-                127 => println!("  → DLL found but has missing dependencies"),
-                _ => println!("  → Unknown error"),
-            }
-
-            // Try to provide the full PATH for debugging
-            if let Ok(path) = std::env::var("PATH") {
-                println!("  → Current PATH entries with 'ndi':");
-                for p in path.split(';') {
-                    if p.to_lowercase().contains("ndi") {
-                        println!("    - {}", p);
-
-                        // Check if the DLL exists in this path
-                        let dll_path = std::path::Path::new(p).join(dll_name);
-                        if dll_path.exists() {
-                            println!("      ✓ {} exists here", dll_name);
-                        }
-                    }
-                }
-            }
-        } else {
-            println!("✅ OK");
-            unsafe { FreeLibrary(handle) };
-        }
+    // Release the successful load before any assertion or diagnostic can panic.
+    let released = unsafe { FreeLibrary(handle) };
+    if released == 0 {
+        let error = unsafe { GetLastError() };
+        panic!("selected NDI DLL failed to unload (Windows error {error})");
     }
-
-    println!("=== End DLL Check ===");
+    println!("Selected NDI DLL loaded and released successfully");
 }
 
 #[cfg(not(target_os = "windows"))]
 #[test]
+#[ignore = "Requires real NDI SDK and reviewed network confinement"]
 fn test_ndi_dll_availability() {
-    // Skip on non-Windows platforms
+    // Explicit no-op: the Windows loader API does not exist on this host.
 }

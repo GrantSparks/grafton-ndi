@@ -13,7 +13,8 @@ fn receiver(ndi: &NDI) -> Result<Receiver, grafton_ndi::Error> {
     Receiver::new(ndi, &options)
 }
 
-fn main() -> Result<(), grafton_ndi::Error> {
+// trybuild runs pass fixtures; type-check this contract without creating SDK objects.
+fn compile_contract() -> Result<(), grafton_ndi::Error> {
     let ndi = NDI::new()?;
     let receiver = receiver(&ndi)?;
 
@@ -49,3 +50,5 @@ fn main() -> Result<(), grafton_ndi::Error> {
 
     Ok(())
 }
+
+fn main() {}

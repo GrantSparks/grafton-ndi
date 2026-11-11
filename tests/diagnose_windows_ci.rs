@@ -1,4 +1,5 @@
 #[test]
+#[ignore = "Requires real NDI SDK and reviewed network confinement"]
 fn test_ndi_environment() {
     println!("=== NDI Environment Diagnostics ===");
 

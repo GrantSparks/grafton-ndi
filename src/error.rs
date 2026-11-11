@@ -16,6 +16,39 @@ use std::{ffi::NulError, io, time::Duration};
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// The selected native module could not be loaded or lacks required baseline functions.
+    #[error("Failed to load the NDI runtime: {0}")]
+    RuntimeLoadFailed(String),
+
+    /// An optional operation is unavailable in this build or selected runtime.
+    #[error("NDI capability {capability} is unavailable: {reason}")]
+    UnsupportedCapability {
+        /// Requested capability.
+        capability: String,
+        /// Build, module, target, or symbol evidence explaining unavailability.
+        reason: String,
+    },
+
+    /// A different native runtime has already been selected for this process.
+    #[error("Conflicting NDI runtime selection: {0}")]
+    RuntimeConflict(String),
+
+    /// Construction requires proof from an initialized compatible runtime.
+    #[error("{feature} requires an initialized compatible runtime; use {operation}")]
+    RuntimeRequired {
+        /// Functionality requiring runtime validation.
+        feature: &'static str,
+        /// Runtime-aware constructor to use.
+        operation: &'static str,
+    },
+
+    /// The native SDK rejected an operation after capability validation.
+    #[error("The NDI SDK rejected {operation}")]
+    NativeOperationFailed {
+        /// Native operation or public action that failed.
+        operation: &'static str,
+    },
+
     /// NDI runtime initialization failed.
     ///
     /// The SDK rejected initialization, a handle could not be created, or the

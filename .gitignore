@@ -23,6 +23,8 @@ CLAUDE.local.md
 .claude_config
 .tidy-rust-cache
 all_source.txt
+__pycache__/
+*.pyc
 
 # Pre-commit hooks (personal dev tool, CI runs same checks)
 .pre-commit-config.yaml

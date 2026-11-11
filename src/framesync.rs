@@ -383,7 +383,7 @@ impl FrameSync {
         }
 
         let guard = unsafe { Guard::<FrameSyncVideoFree>::new(self.resource.instance, frame) };
-        let frame = unsafe { FrameSyncVideoRef::new(guard)? };
+        let frame = unsafe { FrameSyncVideoRef::new(guard.with_runtime(&self.resource._ndi))? };
 
         Ok(Some(frame))
     }
@@ -623,6 +623,7 @@ mod tests {
     use std::ptr;
 
     #[test]
+    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn receiver_modes_preserve_resource_order_and_exactly_once_destruction() {
         use crate::receiver::lifecycle_test_events::track;
         for recover in [false, true] {
@@ -698,6 +699,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn audio_request_reuse_and_rejection_at_both_sdk_entry_points() {
         let ndi = crate::NDI::new().unwrap();
         let receiver = Receiver::new(

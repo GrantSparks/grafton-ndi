@@ -1,9 +1,130 @@
-# NDI SDK 6.3.2 validation for 2.0.0
+# SDK integration validation
+
+Use the revision’s [CI checks](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml)
+and their `required-ci` aggregate to determine qualification. The required scope
+contains 52 individually recorded checks in 16 SDK runner jobs across 20 supported
+profiles. Aggregate acceptance requires every check, all 12 package availability
+receipts, and matching tested commit/tree, dependency, SDK and toolchain identities.
+Results from different revisions or scopes cannot be combined into a passing
+aggregate. The optional 82-check extended audit is separate from release
+qualification.
+
+GitHub Actions can check out a generated PR merge commit. Record the PR head and
+the actual checked-out commit/tree separately; the head SHA alone does not identify
+the tested source. Native execution, ABI/link, application packaging,
+emulator/simulator and physical-device qualification are separate evidence levels.
+
+The compatibility contract targets NDI 6.x and Rust 1.88. SDK archives, restricted
+generated bindings, private source locators and credentials stay private; hosted
+CI shares bounded validation records. Build and runtime selection are documented
+in the [README](../README.md), and reproducible acquisition and execution in the
+[CI guide](../ci/README.md). The historical section records its named implementation
+and does not qualify the current source.
+
+Retained local assessment evidence includes 6.3.2 and 6.4 Linux x64 headers/runtimes, exact
+loaded-module identity, old-header/new-runtime feature tests, deterministic
+callback/ownership tests, and native File playback/recording tests in a network
+namespace with host D-Bus sockets hidden. Platform selection was checked against
+the actual extracted artifacts. Independent C/Rust ABI probes also run without
+executing target code. The existing native integration suites passed
+70 test executions across five SDK/header/runtime combinations, including both
+directions of Standard 6.3.2/6.4 runtime substitution. These local assessment
+results apply to Linux x64. Hosted qualification comes from the exact revision's
+required aggregate and the individual coverage levels in its result records.
+
+The maintained definitions are `build_profiles.tsv`, `api/ndi-api.toml`,
+`tools/sdk/`, and `ci/`. The profile file inventories vendor artifacts; it is not
+a blanket supported-platform claim. The supported set is explicitly declared in
+the CI policy and requires obtainable toolchains on GitHub-hosted runners. The
+19 specialized vendor profiles without those inputs remain unsupported candidates.
+The required plan runs full native suites on Linux x64, Windows x64 and macOS
+ARM64 with both current SDK editions. Every other supported profile retains
+current Standard/Advanced ABI and final link/package checks. Standard Android x64
+and tvOS x64 provide the required emulator and simulator runtime representatives;
+other mobile checks establish packaging only. Grouping checks in one job does not
+combine their individual evidence or turn build coverage into runtime coverage.
+A prepared workflow or local unit test is not proof that its hosted jobs have run.
+Required SDK packages or vendor toolchains that are absent make the gate fail.
+Mobile runtime representatives use a fixed sender and a generated 16×16 frame on
+disposable hosted virtual devices. Their emulator/simulator results do not
+establish desktop-style confinement or prove that off-host networking is blocked.
+
+Explicit native SDK execution has separate confinement evidence. Linux uses a
+network namespace and Windows uses process firewall rules. On disposable hosted
+macOS runners, `macos-pf-offline` combines the process sandbox with a bounded
+whole-VM loopback-only PF window. The guardian verifies the boundary before
+starting SDK code and reaps its processes before restoring the exact initial
+filter and confirming connectivity recovery. The aggregate requires a receipt
+for each test, ignored-test listing and runtime-identity probe, including
+Advanced/File suites and the compatibility probes. The 39 registered core tests
+run in native and compatibility cells and under each of the nine feature
+selections in the feature cells, with exact feature bindings in their reports.
+Missing or incomplete cleanup proof fails qualification. Builds, pure tests and
+pure runnable doctests keep their ordinary execution environment; SDK examples
+are compile-only doctests and resource contracts remain uncalled in trybuild.
+Ordinary CI tests select a fresh empty default-runtime directory, while explicit
+fake-library loader fixtures retain their own module selection. This loader guard
+does not replace native network confinement.
+These controls do not establish physical-device behavior;
+the [CI guide](../ci/README.md) defines the exact checks and limits.
+
+The required compatibility baseline is Standard 6.3.2, tested against current
+6.4 in both header/runtime directions on Linux x64, Windows x64 and macOS ARM64.
+Linux x64 checks minimum Rust and optional-feature combinations with both versions,
+and Android ARM64 checks minimum Rust with the baseline SDK. Public API
+compatibility is checked on Linux x64. Retention covers the four complete 6.3.2
+Standard platform bundles and all eight 6.4 Standard/Advanced platform bundles;
+future SDK releases are added explicitly. SDKs 6.0, 6.1.1 and Advanced versions
+other than 6.4 do not have current validation results.
+
+Raspberry Pi profile checks use a pinned public GNU cross-toolchain;
+their compiler/sysroot version defines the tested build environment, not proof
+of the vendor's oldest libc floor or of physical board compatibility. Apple
+profiles needing `build-std` use an explicitly pinned compiler. Build/link or
+emulator results do not imply device qualification.
+The development store passed isolated read-only mount and selected-runtime
+checks; a Docker image/container has not been rebuilt in this environment. Do not
+infer ARMv6 support from the RPi1 directory name: both inspected 6.3.2 and 6.4
+artifacts declare ARMv7/VFPv3 attributes, and the historical QEMU run below did not
+establish an ARMv6-only CPU contract. Absent SDK simulator slices and unsupported
+Rust-target intersections remain explicitly unavailable.
+
+V210/P216 conversions use checked, aligned storage and complete six-pixel V210
+groups. Independent pixel and memory checks passed with both tested Standard
+runtimes. File getters returning pointers invalidated by native background work
+are not exposed as borrowed Rust strings; the safe APIs use owned observations
+and explicit unavailable diagnostics where the SDK supplies no lifetime proof.
+
+## Reproducing current validation
+
+Use the exact cataloged archives through [CI provisioning](../ci/README.md) or
+the [local SDK store](../ci/sdk-store.md). The store selects header and runtime
+versions independently and verifies their contents before running a command.
+Keep SDKs and build outputs outside the source checkout. Both paths use the same
+package identities and hashes; the container's default SDK is Standard 6.3.2.
+
+`ci/plan.py --scope required` lists the required checks and runner groups.
+`ci/batch.py` executes a group while keeping individual results; `ci/run.py` runs
+a selected check. Both plan generation and individual execution accept
+`--scope extended` for the optional broader audit. `ci/aggregate.py` checks complete
+hosted evidence for the exact declared scope, commit, dependency resolution, SDK
+packages and target toolchains. A locally prepared workflow or a
+passing policy suite does not replace those runs. Publication requires the
+separate [publication gates](../ci/README.md#publication-gates).
+
+---
+
+# Historical record: NDI SDK 6.3.2 validation for 2.0.0
+
+The remainder of this document records the 2.0.0 implementation and its tooling
+at the time. References to unsupported mobile targets, legacy setup actions,
+URL secrets, and future Apple work below describe that revision. For the current
+implementation and workflow, use the guides linked above.
 
 Validated on 2026-10-16 using Rust 1.99.0 on an x86_64 Debian 12 host. NDI's
 [developer page](https://ndi.video/for-developers/) and
 [release notes](https://docs.ndi.video/all/developing-with-ndi/sdk/release-notes)
-identify 6.3.2 as the current SDK. The downloaded Linux, Android, and Apple
+identified 6.3.2 as the current SDK at that validation date. The downloaded Linux, Android, and Apple
 `Version.txt` files identify `v6.3.2.0`, dated 2026-04-13; the Linux x86_64
 runtime also reports `6.3.2.0` through `NDIlib_version()`. The Windows x86/x64
 DLL version resources identify 6.3.2.

@@ -16,33 +16,35 @@ fn wait_until(stage: &str, mut condition: impl FnMut() -> bool) {
 fn media_capture_retains_capability_notifications() -> Result<(), Error> {
     let ndi = NDI::new()?;
     eprintln!("SDK: {} on {}", NDI::version()?, std::env::consts::OS);
-    for kind in 0..6 {
-        let sender = Sender::new(
-            &ndi,
-            &SenderOptions::builder(format!("status retention {kind}")).build(),
-        )?;
-        let source = common::loopback_source(&ndi, &sender)?;
+    // Keep every source alive so each capture API uses a distinct live endpoint
+    // rather than immediately reusing a retired sender's address. Rapid sender
+    // teardown is covered by the separate lifecycle stress test.
+    let senders = (0..6)
+        .map(|kind| {
+            Sender::new(
+                &ndi,
+                &SenderOptions::builder(format!("status retention {kind}")).build(),
+            )
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    for (kind, sender) in senders.iter().enumerate() {
+        let source = common::loopback_source(&ndi, sender)?;
         eprintln!("capture case {kind}: connecting to {source:?}");
+        // Each capture API must retain this receiver's own capability event.
         let options = ReceiverOptions::builder(source).build();
-        let control = Receiver::new(&ndi, &options)?;
         let media = Receiver::new(&ndi, &options)?;
-        wait_until("initial receiver connections", || {
-            control.is_connected() && media.is_connected()
-        });
-        for receiver in [&control, &media] {
-            while receiver
-                .poll_status_change(Duration::from_millis(50))?
-                .is_some()
-            {}
-            assert!(!receiver.ptz_is_supported());
-        }
+        wait_until("initial receiver connection", || media.is_connected());
+        while media
+            .poll_status_change(Duration::from_millis(50))?
+            .is_some()
+        {}
+        assert!(!media.ptz_is_supported());
         // Exercise two distinct capability invalidations using the SDK's
         // Send_VirtualPTZ / Send_Capabilities XML conventions. Capability flag
         // reset behavior on idle receivers is not part of notification retention.
-        // Windows SDK 6.3.2 delivers PTZ enable but does not reliably publish the
-        // subsequent idle web-control change to both receivers. Cover the first
-        // event for every kind there; repeated publication/consumption is also
-        // covered by deterministic receiver unit tests on every platform.
+        // Retain the existing single-invalidation coverage on Windows.
+        // Repeated publication/consumption is also covered by deterministic
+        // receiver unit tests on every platform.
         let updates = if cfg!(target_os = "windows") { 1 } else { 2 };
         for (update, capabilities) in [
             "<ndi_capabilities ntk_ptz=\"true\"/>",
@@ -56,20 +58,15 @@ fn media_capture_retains_capability_notifications() -> Result<(), Error> {
             sender.clear_connection_metadata();
             sender.add_connection_metadata(&MetadataFrame::with_data(capabilities, 0)?);
             if update == 0 {
-                wait_until("PTZ capability enable", || {
-                    control.ptz_is_supported() && media.ptz_is_supported()
+                wait_until("PTZ capability enable", || media.ptz_is_supported());
+            } else {
+                wait_until("web-control capability update", || {
+                    media.web_control_url().unwrap().as_deref()
+                        == Some("http://127.0.0.1/status-control")
                 });
             }
-            wait_until("control status notification", || {
-                control
-                    .poll_status_change(Duration::from_millis(10))
-                    .unwrap()
-                    .is_some()
-            });
-            // PTZ enable has a public readiness probe above. The independent
-            // web-control change has no public getter here, so allow its SDK
-            // notification to reach the media receiver during capture. Recv.h permits
-            // web-control publication to take a second or two after connection.
+            // Both capability getters observe this receiver without consuming
+            // its status notification. Keep the existing SDK capture budgets.
             let poll_timeout = if update == 0 {
                 Duration::ZERO
             } else {

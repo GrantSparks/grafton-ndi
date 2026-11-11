@@ -2,6 +2,7 @@ use grafton_ndi::NDI;
 
 // Keep this in its own integration-test process: runtime state is process-global.
 #[test]
+#[ignore = "Requires real NDI SDK and reviewed network confinement"]
 fn handles_keep_runtime_alive_until_last_drop_and_allow_reinitialization(
 ) -> Result<(), grafton_ndi::Error> {
     assert!(!NDI::is_running());

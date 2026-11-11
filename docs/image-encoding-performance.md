@@ -1,5 +1,9 @@
 # Image encoding resources in 2.0.0
 
+These archived measurements describe the 2.0.0 implementation. They have not been
+rerun as part of the current SDK 6.4 integration and do not establish its runtime
+or platform coverage. See [SDK validation](sdk-validation.md) for current evidence.
+
 Measured on 2026-10-16, Debian 12 x86_64, Intel Xeon w7-2475X, Rust 1.99.0,
 `png` 0.18.1, and `jpeg-encoder` 0.7.1. These are local resource comparisons,
 not a throughput guarantee. No live capture is involved in this measurement.
