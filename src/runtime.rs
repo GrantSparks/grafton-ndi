@@ -28,7 +28,7 @@ use std::{
 };
 
 use crate::{
-    capabilities::{Capabilities, CapabilityStatus, RuntimeFeature, RuntimeInfo, SdkEdition},
+    capabilities::{Capabilities, RuntimeFeature, RuntimeInfo, SdkEdition},
     sys, Error, Result,
 };
 
@@ -363,14 +363,23 @@ impl NDI {
     }
 
     /// Reject an unavailable operation before passing newer inputs to the SDK.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedCapability`] naming the capability and why
+    /// the selected runtime or this build cannot provide it.
     pub fn require_feature(&self, feature: RuntimeFeature) -> Result<()> {
-        match self.runtime.capabilities.status(feature) {
-            CapabilityStatus::Available => Ok(()),
-            CapabilityStatus::Unavailable(reason) => Err(Error::UnsupportedCapability {
-                capability: feature.name().into(),
-                reason: format!("{reason:?}"),
-            }),
-        }
+        self.runtime.require(feature)
+    }
+
+    /// The table of entry points behind an optional capability, or the error
+    /// [`Self::require_feature`] reports for it.
+    pub(crate) fn capability<T>(
+        &self,
+        feature: RuntimeFeature,
+        table: &'static sys::Optional<T>,
+    ) -> Result<&'static T> {
+        self.runtime.capability(feature, table)
     }
 
     /// Retain an initialized runtime reference until process exit.

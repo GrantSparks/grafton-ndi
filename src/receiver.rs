@@ -39,6 +39,7 @@ use std::{
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 
 use crate::{
+    capabilities::RuntimeFeature,
     capture::{capture_raw, AudioKind, CaptureKind, CaptureResult, MetadataKind, VideoKind},
     finder::{RawSource, Source},
     sys::{self, bindings::*},
@@ -431,7 +432,6 @@ pub(crate) struct RawRecvCreateV3 {
 
 impl ReceiverOptions {
     pub(crate) fn validate_runtime(&self, ndi: &NDI) -> Result<()> {
-        use crate::capabilities::RuntimeFeature;
         if matches!(self.color_format, ReceiverColorFormat::Best444) {
             ndi.require_feature(RuntimeFeature::ReceiveBest444)?;
         }
@@ -906,10 +906,11 @@ impl<M: ReceiverMode> Receiver<M> {
 
     /// Copy the optional device web-control URL. This does not open the URL.
     pub fn web_control_url(&self) -> Result<Option<String>> {
-        let api = self.core._ndi.api();
+        let ndi = &self.core._ndi;
+        let feature = RuntimeFeature::ReceiverWebControl;
         // Hold the matching release function before requesting any allocation.
-        let strings = api.receiver_strings.require("receiver web control")?;
-        let web_control = api.receiver_web_control.require("receiver web control")?;
+        let strings = ndi.capability(feature, &ndi.api().receiver_strings)?;
+        let web_control = ndi.capability(feature, &ndi.api().receiver_web_control)?;
         let guard = RecvStringGuard {
             core: &self.core,
             // SAFETY: the receiver instance is live for this borrow.
@@ -927,9 +928,10 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn poll_source_name_change(&self, timeout: Duration) -> Result<Option<SourceNameChange>> {
         to_ms_checked(timeout)?;
         let deadline = Instant::now() + timeout;
-        let api = self.core._ndi.api();
-        let strings = api.receiver_strings.require("connected source name")?;
-        let source_name = api.receiver_source_name.require("connected source name")?;
+        let ndi = &self.core._ndi;
+        let feature = RuntimeFeature::ConnectedSourceName;
+        let strings = ndi.capability(feature, &ndi.api().receiver_strings)?;
+        let source_name = ndi.capability(feature, &ndi.api().receiver_source_name)?;
         let Some(_query) = self.core.source_query_guard.try_lock_until(deadline) else {
             return Ok(None);
         };
@@ -1599,16 +1601,14 @@ impl ReceiverCore {
 
     fn delay(&self) -> Result<&'static sys::ReceiveDelay> {
         self._ndi
-            .api()
-            .receive_delay
-            .require(crate::capabilities::RuntimeFeature::ReceiveDelay.name())
+            .capability(RuntimeFeature::ReceiveDelay, &self._ndi.api().receive_delay)
     }
 
     fn connection_metadata(&self) -> Result<&'static sys::ReceiverConnectionMetadata> {
-        self._ndi
-            .api()
-            .receiver_connection_metadata
-            .require("receiver connection metadata")
+        self._ndi.capability(
+            RuntimeFeature::ReceiverConnectionMetadata,
+            &self._ndi.api().receiver_connection_metadata,
+        )
     }
 
     /// Acquire only within the caller's existing budget, including contention.
@@ -2180,7 +2180,6 @@ mod tests {
 
     #[test]
     fn receive_64_modes_require_the_selected_runtime_before_native_creation() {
-        use crate::capabilities::RuntimeFeature;
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
@@ -2258,10 +2257,7 @@ mod tests {
             return;
         };
         let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
-        if ndi
-            .require_feature(crate::capabilities::RuntimeFeature::ReceiveDelay)
-            .is_ok()
-        {
+        if ndi.require_feature(RuntimeFeature::ReceiveDelay).is_ok() {
             assert_eq!(receiver.video_delay().unwrap(), Duration::ZERO);
             assert_eq!(receiver.audio_delay().unwrap(), Duration::ZERO);
             assert!(!receiver.set_video_delay(Duration::ZERO).unwrap());

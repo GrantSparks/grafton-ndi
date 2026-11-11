@@ -20,9 +20,10 @@ use std::{
     time::Duration,
 };
 
-/// Build a fake runtime whose senders, receivers and advertisers log their lifecycle.
+/// Build a fake runtime whose senders, receivers and advertisers log their
+/// lifecycle. It reports the first version whose advertisers are usable.
 fn fixture(directory: &Path, advanced: bool) -> PathBuf {
-    let runtime = FakeRuntime::new().with("fake_objects");
+    let runtime = FakeRuntime::new().with("fake_objects").version("6.4.0.0");
     if advanced {
         runtime
             .with("fake_advanced")
@@ -33,6 +34,12 @@ fn fixture(directory: &Path, advanced: bool) -> PathBuf {
 }
 fn log() -> String {
     fs::read_to_string(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).unwrap()
+}
+/// Where the fake runtime logged `event`.
+fn position(events: &str, event: &str) -> usize {
+    events
+        .find(&format!("{event}\n"))
+        .unwrap_or_else(|| panic!("`{event}` was not logged: {events}"))
 }
 fn frame() -> VideoFrame {
     VideoFrame::builder().resolution(2, 2).build().unwrap()
@@ -54,8 +61,10 @@ fn native_resource_ownership() {
     let advanced = fixture(&directory, true);
     let mut scenarios = vec![
         "sender_registration",
-        "forgotten_sender",
+        "dropped_sender_advertiser",
         "receiver_registration",
+        "dropped_receiver_advertiser",
+        "foreign_registration",
         "malformed_metadata",
     ];
     if cfg!(all(feature = "advanced", ndi_has_advanced_header)) {
@@ -114,7 +123,7 @@ fn child(case: &str) {
     match case {
         "sender_registration" => {
             let mut sender = sender(&ndi);
-            let advertiser = SendAdvertiser::new(&ndi, &AdvertiserOptions::default()).unwrap();
+            let mut advertiser = SendAdvertiser::new(&ndi, &AdvertiserOptions::default()).unwrap();
             let registration = advertiser
                 .register(&sender, SendAdvertisement::default())
                 .unwrap();
@@ -124,39 +133,50 @@ fn child(case: &str) {
             sender.send_video_async(frame());
             drop(sender);
             assert!(log().contains("sender-flush\n"));
+            // The registration, not the dropped handle, keeps the sender alive.
             assert!(!log().contains("sender-destroy\n"));
-            drop(advertiser);
-            assert!(!log().contains("send-advertiser-destroy\n"));
-            drop(registration);
+            assert!(advertiser.unregister(registration));
             let events = log();
             assert!(
-                events.find("send-advertiser-remove\n").unwrap()
-                    < events.find("sender-destroy\n").unwrap()
+                position(&events, "send-advertiser-remove") < position(&events, "sender-destroy")
             );
+            assert!(!events.contains("send-advertiser-destroy\n"));
+            drop(advertiser);
+            let events = log();
             assert_eq!(events.matches("send-advertiser-add\n").count(), 1);
+            assert_eq!(events.matches("send-advertiser-remove\n").count(), 1);
             assert_eq!(events.matches("sender-destroy\n").count(), 1);
             assert_eq!(events.matches("send-advertiser-destroy\n").count(), 1);
         }
-        "forgotten_sender" => {
+        "dropped_sender_advertiser" => {
             let sender = sender(&ndi);
-            let advertiser = SendAdvertiser::new(&ndi, &AdvertiserOptions::default()).unwrap();
-            let registration = advertiser
-                .register(&sender, SendAdvertisement::default())
+            let mut advertiser = SendAdvertiser::new(&ndi, &AdvertiserOptions::default()).unwrap();
+            // Discarding the registration leaves the sender advertised.
+            let _ = advertiser
+                .register(&sender, SendAdvertisement::default().allow_monitoring(true))
                 .unwrap();
-            std::mem::forget(registration);
             drop(sender);
-            drop(advertiser);
-            drop(ndi);
             let events = log();
+            assert!(events.contains("send-advertiser-add-monitoring\n"));
+            assert!(!events.contains("send-advertiser-remove\n"));
             assert!(!events.contains("sender-destroy\n"));
-            assert!(!events.contains("send-advertiser-destroy\n"));
-            assert!(NDI::is_running());
-            return;
+            drop(advertiser);
+            // The SDK's teardown order: stop advertising the sender, destroy
+            // the advertiser, and only then destroy the sender.
+            let events = log();
+            assert!(
+                position(&events, "send-advertiser-remove")
+                    < position(&events, "send-advertiser-destroy")
+            );
+            assert!(
+                position(&events, "send-advertiser-destroy") < position(&events, "sender-destroy")
+            );
+            assert_eq!(events.matches("sender-destroy\n").count(), 1);
         }
         "receiver_registration" => {
             let receiver =
                 Receiver::new(&ndi, &ReceiverOptions::builder(Source::default()).build()).unwrap();
-            let advertiser = RecvAdvertiser::new(&ndi, &AdvertiserOptions::default()).unwrap();
+            let mut advertiser = RecvAdvertiser::new(&ndi, &AdvertiserOptions::default()).unwrap();
             let registration = advertiser
                 .register(&receiver, RecvAdvertisement::default())
                 .unwrap();
@@ -165,9 +185,58 @@ fn child(case: &str) {
                 .is_err());
             drop(receiver);
             assert!(!log().contains("receiver-destroy\n"));
-            assert!(registration.unregister().unwrap());
-            assert_eq!(log().matches("receiver-destroy\n").count(), 1);
+            assert!(advertiser.unregister(registration));
+            let events = log();
+            assert!(
+                position(&events, "recv-advertiser-remove") < position(&events, "receiver-destroy")
+            );
+            assert_eq!(events.matches("receiver-destroy\n").count(), 1);
             drop(advertiser);
+        }
+        "dropped_receiver_advertiser" => {
+            let receiver =
+                Receiver::new(&ndi, &ReceiverOptions::builder(Source::default()).build()).unwrap();
+            let mut advertiser = RecvAdvertiser::new(&ndi, &AdvertiserOptions::default()).unwrap();
+            let _ = advertiser
+                .register(
+                    &receiver,
+                    RecvAdvertisement::default().input_group("Program"),
+                )
+                .unwrap();
+            drop(receiver);
+            assert!(!log().contains("receiver-destroy\n"));
+            drop(advertiser);
+            let events = log();
+            assert!(
+                position(&events, "recv-advertiser-remove")
+                    < position(&events, "recv-advertiser-destroy")
+            );
+            assert!(
+                position(&events, "recv-advertiser-destroy")
+                    < position(&events, "receiver-destroy")
+            );
+            assert_eq!(events.matches("receiver-destroy\n").count(), 1);
+        }
+        "foreign_registration" => {
+            let sender = sender(&ndi);
+            let mut advertiser = SendAdvertiser::new(&ndi, &AdvertiserOptions::default()).unwrap();
+            let mut other = SendAdvertiser::new(&ndi, &AdvertiserOptions::default()).unwrap();
+            let registration = advertiser
+                .register(&sender, SendAdvertisement::default())
+                .unwrap();
+            // Another advertiser neither removes the registration nor calls
+            // the SDK for it, and may advertise the same sender itself.
+            assert!(!other.unregister(registration));
+            assert!(!log().contains("send-advertiser-remove\n"));
+            let second = other
+                .register(&sender, SendAdvertisement::default())
+                .unwrap();
+            assert!(other.unregister(second));
+            drop(other);
+            drop(sender);
+            assert!(!log().contains("sender-destroy\n"));
+            drop(advertiser);
+            assert_eq!(log().matches("sender-destroy\n").count(), 1);
         }
         "malformed_metadata" => {
             let sender = sender(&ndi);
@@ -231,13 +300,13 @@ fn child(case: &str) {
         "queue_registered_sender" => {
             use grafton_ndi::advanced::{QueueOptions, QueuedSender};
             let sender = sender(&ndi);
-            let advertiser = SendAdvertiser::new(&ndi, &AdvertiserOptions::default()).unwrap();
+            let mut advertiser = SendAdvertiser::new(&ndi, &AdvertiserOptions::default()).unwrap();
             let registration = advertiser
                 .register(&sender, SendAdvertisement::default())
                 .unwrap();
             assert!(QueuedSender::from_sender(sender, QueueOptions::default()).is_err());
             assert!(!log().contains("sender-destroy\n"));
-            drop(registration);
+            assert!(advertiser.unregister(registration));
             drop(advertiser);
             assert_eq!(log().matches("sender-destroy\n").count(), 1);
         }

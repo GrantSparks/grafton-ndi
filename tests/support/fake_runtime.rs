@@ -7,9 +7,13 @@
 //!
 //! Variants are selected with `--cfg`:
 //!
-//! * `fake_objects` — senders, receivers and advertisers are real allocations
-//!   whose lifecycle is written to the file named by `GRAFTON_FAKE_NDI_LOG`,
-//!   and the optional sender-metadata and advertiser functions are exported;
+//! * `fake_objects` — senders, receivers, routers and advertisers are real
+//!   allocations whose lifecycle is written to the file named by
+//!   `GRAFTON_FAKE_NDI_LOG`, and the optional sender-metadata, routing and
+//!   advertiser functions are exported;
+//! * `fake_discovery` — export the sender and receiver listener functions over
+//!   a fixed membership whose identifiers and text are partly not UTF-8, and
+//!   log every identifier passed back, byte for byte;
 //! * `fake_advanced` — also export the Advanced SDK entry points;
 //! * `fake_receiver_v4` — also export only `NDIlib_recv_create_v4`, as a newer
 //!   Standard runtime might;
@@ -31,6 +35,8 @@ mod declarations;
 use bindings::*;
 #[cfg(fake_objects)]
 use std::ffi::c_void;
+#[cfg(any(fake_objects, fake_discovery))]
+use std::ffi::CStr;
 use std::{
     ffi::{c_char, CString},
     io::Write,
@@ -193,6 +199,12 @@ mod objects {
         }
     }
 
+    /// A routing source and the descriptor handed out for it.
+    struct Router {
+        name: CString,
+        source: NDIlib_source_t,
+    }
+
     /// Allocate a distinct non-null handle of pointer type `T`.
     fn handle<T>() -> *mut T {
         Box::into_raw(Box::new(0u8)).cast()
@@ -308,6 +320,277 @@ mod objects {
 
         fn NDIlib_recv_advertiser_del_receiver(p_instance: NDIlib_recv_advertiser_instance_t, p_receiver: NDIlib_recv_instance_t) -> bool {
             log("recv-advertiser-remove");
+            true
+        }
+
+        fn NDIlib_routing_create(p_create_settings: *const NDIlib_routing_create_t) -> NDIlib_routing_instance_t {
+            log("router-create");
+            let name = unsafe { CStr::from_ptr((*p_create_settings).p_ndi_name) }.to_owned();
+            // The name's heap buffer does not move when the router is boxed.
+            let source = NDIlib_source_t {
+                p_ndi_name: name.as_ptr(),
+                ..unsafe { std::mem::zeroed() }
+            };
+            Box::into_raw(Box::new(Router { name, source })).cast()
+        }
+
+        fn NDIlib_routing_destroy(p_instance: NDIlib_routing_instance_t) {
+            log("router-destroy");
+            drop(unsafe { Box::from_raw(p_instance.cast::<Router>()) });
+        }
+
+        fn NDIlib_routing_change(p_instance: NDIlib_routing_instance_t, p_source: *const NDIlib_source_t) -> bool {
+            let name = unsafe { CStr::from_ptr((*p_source).p_ndi_name) };
+            log(&format!("router-change {}", name.to_string_lossy()));
+            true
+        }
+
+        fn NDIlib_routing_clear(p_instance: NDIlib_routing_instance_t) -> bool {
+            log("router-clear");
+            true
+        }
+
+        fn NDIlib_routing_get_no_connections(p_instance: NDIlib_routing_instance_t, timeout_in_ms: u32) -> ::std::os::raw::c_int {
+            0
+        }
+
+        fn NDIlib_routing_get_source_name(p_instance: NDIlib_routing_instance_t) -> *const NDIlib_source_t {
+            let router = unsafe { &*p_instance.cast::<Router>() };
+            debug_assert_eq!(router.source.p_ndi_name, router.name.as_ptr());
+            &router.source
+        }
+    }
+}
+
+#[cfg(fake_discovery)]
+mod discovery {
+    use super::*;
+    use std::ptr;
+
+    // What the fixed membership advertises. Text marked malformed is not UTF-8,
+    // as a misbehaving peer might send it; the tests know these exact bytes.
+    const SENDER_ID: &CStr = c"sender-\xff\xfe";
+    const SENDER_NAME: &CStr = c"STUDIO (Caf\xe9)";
+    const SENDER_GROUP: &CStr = c"gro\xffup";
+    const RECEIVER_ID: &CStr = c"receiver-\xfe\xff";
+    const RECEIVER_NAME: &CStr = c"Monitor \xe9";
+    const INPUT_ID: &CStr = c"input-\xfd";
+    const EVENT_VALUE: &CStr = c"<tally on=\"\xff\"/>";
+
+    /// The number of events in every batch.
+    const EVENTS: usize = 2;
+
+    struct SendListener {
+        senders: [NDIlib_sender_t; 2],
+        _groups: Box<[*const c_char; 3]>,
+    }
+
+    struct RecvListener {
+        receivers: [NDIlib_receiver_t; 2],
+        _streams: Box<[NDIlib_receiver_type_e; 3]>,
+        _commands: Box<[NDIlib_receiver_command_e; 2]>,
+    }
+
+    /// A string argument as the bytes it holds, or `null`.
+    unsafe fn bytes(text: *const c_char) -> String {
+        if text.is_null() {
+            return "null".into();
+        }
+        unsafe { CStr::from_ptr(text) }
+            .to_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// A batch of events from `uuid`, or none when the caller does not wait.
+    unsafe fn events(
+        uuid: &'static CStr,
+        p_num_events: *mut u32,
+        timeout_in_ms: u32,
+    ) -> *const NDIlib_listener_event {
+        if timeout_in_ms == 0 {
+            return ptr::null();
+        }
+        let batch: Box<[NDIlib_listener_event; EVENTS]> = Box::new([
+            NDIlib_listener_event {
+                p_uuid: uuid.as_ptr(),
+                p_name: c"tally".as_ptr(),
+                p_value: EVENT_VALUE.as_ptr(),
+            },
+            NDIlib_listener_event {
+                p_uuid: ptr::null(),
+                p_name: ptr::null(),
+                p_value: ptr::null(),
+            },
+        ]);
+        unsafe { *p_num_events = EVENTS as u32 };
+        Box::into_raw(batch).cast()
+    }
+
+    unsafe fn free_events(p_events: *const NDIlib_listener_event) {
+        drop(unsafe {
+            Box::from_raw(
+                p_events
+                    .cast_mut()
+                    .cast::<[NDIlib_listener_event; EVENTS]>(),
+            )
+        });
+    }
+
+    export! {
+        fn NDIlib_send_listener_create(p_create_settings: *const NDIlib_send_listener_create_t) -> NDIlib_send_listener_instance_t {
+            log("send-listener-create");
+            let mut groups = Box::new([c"public".as_ptr(), SENDER_GROUP.as_ptr(), ptr::null()]);
+            let senders = [
+                NDIlib_sender_t {
+                    p_uuid: SENDER_ID.as_ptr(),
+                    p_name: SENDER_NAME.as_ptr(),
+                    p_metadata: c"<ndi_product/>".as_ptr(),
+                    p_address: c"192.0.2.10".as_ptr(),
+                    port: 5961,
+                    p_groups: groups.as_mut_ptr(),
+                    num_groups: 2,
+                    events_subscribed: false,
+                },
+                NDIlib_sender_t {
+                    p_uuid: c"sender-plain".as_ptr(),
+                    p_name: c"STUDIO (Camera 2)".as_ptr(),
+                    p_metadata: ptr::null(),
+                    p_address: ptr::null(),
+                    port: -1,
+                    p_groups: ptr::null_mut(),
+                    num_groups: 0,
+                    events_subscribed: true,
+                },
+            ];
+            Box::into_raw(Box::new(SendListener { senders, _groups: groups })).cast()
+        }
+
+        fn NDIlib_send_listener_destroy(p_instance: NDIlib_send_listener_instance_t) {
+            log("send-listener-destroy");
+            drop(unsafe { Box::from_raw(p_instance.cast::<SendListener>()) });
+        }
+
+        fn NDIlib_send_listener_is_connected(p_instance: NDIlib_send_listener_instance_t) -> bool {
+            true
+        }
+
+        fn NDIlib_send_listener_get_server_url(p_instance: NDIlib_send_listener_instance_t) -> *const c_char {
+            c"192.0.2.1:5959".as_ptr()
+        }
+
+        fn NDIlib_send_listener_get_senders(p_instance: NDIlib_send_listener_instance_t, p_num_senders: *mut u32) -> *const NDIlib_sender_t {
+            let listener = unsafe { &*p_instance.cast::<SendListener>() };
+            unsafe { *p_num_senders = listener.senders.len() as u32 };
+            listener.senders.as_ptr()
+        }
+
+        fn NDIlib_send_listener_wait_for_senders(p_instance: NDIlib_send_listener_instance_t, timeout_in_ms: u32) -> bool {
+            false
+        }
+
+        fn NDIlib_send_listener_subscribe_events(p_instance: NDIlib_send_listener_instance_t, p_sender_uuid: *const c_char) {
+            log(&format!("send-listener-subscribe {}", unsafe { bytes(p_sender_uuid) }));
+        }
+
+        fn NDIlib_send_listener_unsubscribe_events(p_instance: NDIlib_send_listener_instance_t, p_sender_uuid: *const c_char) {
+            log(&format!("send-listener-unsubscribe {}", unsafe { bytes(p_sender_uuid) }));
+        }
+
+        fn NDIlib_send_listener_get_events(p_instance: NDIlib_send_listener_instance_t, p_num_events: *mut u32, timeout_in_ms: u32) -> *const NDIlib_send_listener_event {
+            log(&format!("send-listener-events {timeout_in_ms}"));
+            unsafe { events(SENDER_ID, p_num_events, timeout_in_ms) }
+        }
+
+        fn NDIlib_send_listener_free_events(p_instance: NDIlib_send_listener_instance_t, p_events: *const NDIlib_send_listener_event) {
+            log("send-listener-free-events");
+            unsafe { free_events(p_events) };
+        }
+
+        fn NDIlib_recv_listener_create(p_create_settings: *const NDIlib_recv_listener_create_t) -> NDIlib_recv_listener_instance_t {
+            log("recv-listener-create");
+            let mut streams = Box::new([
+                NDIlib_receiver_type_e_NDIlib_receiver_type_video,
+                NDIlib_receiver_type_e_NDIlib_receiver_type_audio,
+                NDIlib_receiver_type_e_NDIlib_receiver_type_none,
+            ]);
+            let mut commands = Box::new([
+                NDIlib_receiver_command_e_NDIlib_receiver_command_connect,
+                NDIlib_receiver_command_e_NDIlib_receiver_command_none,
+            ]);
+            let receivers = [
+                NDIlib_receiver_t {
+                    p_uuid: RECEIVER_ID.as_ptr(),
+                    p_name: RECEIVER_NAME.as_ptr(),
+                    p_input_uuid: INPUT_ID.as_ptr(),
+                    p_input_name: c"Program".as_ptr(),
+                    p_address: c"192.0.2.20".as_ptr(),
+                    p_streams: streams.as_mut_ptr(),
+                    num_streams: 2,
+                    p_commands: commands.as_mut_ptr(),
+                    num_commands: 1,
+                    events_subscribed: false,
+                },
+                NDIlib_receiver_t {
+                    p_uuid: c"receiver-fixed".as_ptr(),
+                    p_name: c"Fixed".as_ptr(),
+                    p_input_uuid: ptr::null(),
+                    p_input_name: ptr::null(),
+                    p_address: ptr::null(),
+                    p_streams: ptr::null_mut(),
+                    num_streams: 0,
+                    p_commands: ptr::null_mut(),
+                    num_commands: 0,
+                    events_subscribed: false,
+                },
+            ];
+            Box::into_raw(Box::new(RecvListener { receivers, _streams: streams, _commands: commands })).cast()
+        }
+
+        fn NDIlib_recv_listener_destroy(p_instance: NDIlib_recv_listener_instance_t) {
+            log("recv-listener-destroy");
+            drop(unsafe { Box::from_raw(p_instance.cast::<RecvListener>()) });
+        }
+
+        fn NDIlib_recv_listener_is_connected(p_instance: NDIlib_recv_listener_instance_t) -> bool {
+            true
+        }
+
+        fn NDIlib_recv_listener_get_server_url(p_instance: NDIlib_recv_listener_instance_t) -> *const c_char {
+            c"192.0.2.1:5959".as_ptr()
+        }
+
+        fn NDIlib_recv_listener_get_receivers(p_instance: NDIlib_recv_listener_instance_t, p_num_receivers: *mut u32) -> *const NDIlib_receiver_t {
+            let listener = unsafe { &*p_instance.cast::<RecvListener>() };
+            unsafe { *p_num_receivers = listener.receivers.len() as u32 };
+            listener.receivers.as_ptr()
+        }
+
+        fn NDIlib_recv_listener_wait_for_receivers(p_instance: NDIlib_recv_listener_instance_t, timeout_in_ms: u32) -> bool {
+            false
+        }
+
+        fn NDIlib_recv_listener_subscribe_events(p_instance: NDIlib_recv_listener_instance_t, p_receiver_uuid: *const c_char) {
+            log(&format!("recv-listener-subscribe {}", unsafe { bytes(p_receiver_uuid) }));
+        }
+
+        fn NDIlib_recv_listener_unsubscribe_events(p_instance: NDIlib_recv_listener_instance_t, p_receiver_uuid: *const c_char) {
+            log(&format!("recv-listener-unsubscribe {}", unsafe { bytes(p_receiver_uuid) }));
+        }
+
+        fn NDIlib_recv_listener_get_events(p_instance: NDIlib_recv_listener_instance_t, p_num_events: *mut u32, timeout_in_ms: u32) -> *const NDIlib_recv_listener_event {
+            log(&format!("recv-listener-events {timeout_in_ms}"));
+            unsafe { events(RECEIVER_ID, p_num_events, timeout_in_ms) }
+        }
+
+        fn NDIlib_recv_listener_free_events(p_instance: NDIlib_recv_listener_instance_t, p_events: *const NDIlib_recv_listener_event) {
+            log("recv-listener-free-events");
+            unsafe { free_events(p_events) };
+        }
+
+        fn NDIlib_recv_listener_send_connect(p_instance: NDIlib_recv_listener_instance_t, p_receiver_uuid: *const c_char, p_source_name: *const c_char) -> bool {
+            log(&format!("recv-listener-connect {} {}", unsafe { bytes(p_receiver_uuid) }, unsafe { bytes(p_source_name) }));
             true
         }
     }

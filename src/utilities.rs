@@ -6,6 +6,7 @@
 //! descriptors, which have no metadata or timestamp fields.
 
 use crate::{
+    capabilities::RuntimeFeature,
     frames::validate_packed_audio_dimensions,
     sys::{self, bindings::*},
     AudioFormat, AudioFrame, Error, Result, Sender, NDI,
@@ -182,9 +183,6 @@ interleaved_input!(
     NDIlib_audio_frame_interleaved_32f_t
 );
 
-/// The capability name reported when the interleaved helpers are unavailable.
-const INTERLEAVED_AUDIO: &str = "interleaved audio utilities";
-
 /// Native audio conversion operations, resolved together from one live runtime.
 ///
 /// Construction fails if any current v3 conversion helper is missing. It does
@@ -249,7 +247,10 @@ impl AudioConverter {
     /// Resolve the complete current conversion group before exposing operations.
     pub fn new(ndi: &NDI) -> Result<Self> {
         Ok(Self {
-            audio: ndi.api().interleaved_audio.require(INTERLEAVED_AUDIO)?,
+            audio: ndi.capability(
+                RuntimeFeature::InterleavedAudioConversion,
+                &ndi.api().interleaved_audio,
+            )?,
             _ndi: ndi.clone(),
         })
     }
@@ -294,11 +295,11 @@ macro_rules! send_interleaved {
         /// Source samples may be reused when this method returns. The interleaved
         /// SDK descriptors do not carry metadata or receive timestamps.
         pub fn $method(&self, frame: &$input<'_>) -> Result<()> {
-            let send = self
-                .runtime()
-                .api()
-                .interleaved_send
-                .require(INTERLEAVED_AUDIO)?;
+            let ndi = self.runtime();
+            let send = ndi.capability(
+                RuntimeFeature::InterleavedAudioSend,
+                &ndi.api().interleaved_send,
+            )?;
             let raw = frame.raw();
             // SAFETY: the sender instance is live for this borrow and the
             // validated source slice outlives the synchronous call.

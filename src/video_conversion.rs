@@ -6,6 +6,7 @@
 //! These are sample-packing conversions, without color-space or HDR transforms.
 
 use crate::{
+    capabilities::RuntimeFeature,
     frames::{ValidatedVideoLayout, MAX_VIDEO_BYTES},
     sys, Error, PixelFormat, Result, VideoFrame, NDI,
 };
@@ -136,7 +137,8 @@ impl VideoConverter {
     /// Resolve both native utility functions from one initialized runtime.
     pub fn new(ndi: &NDI) -> Result<Self> {
         Ok(Self {
-            conversion: ndi.api().video_conversion.require("V210/P216 conversion")?,
+            conversion: ndi
+                .capability(RuntimeFeature::VideoConversion, &ndi.api().video_conversion)?,
             _ndi: ndi.clone(),
         })
     }

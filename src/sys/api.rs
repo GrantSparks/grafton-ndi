@@ -3,15 +3,20 @@
 //! [`Core`] is required: a module that lacks any of its functions cannot be
 //! selected. Every other table is one independently available capability and
 //! resolves all-or-nothing, so a wrapper holding a table can call everything in
-//! it without a further check.
+//! it without a further check. An optional table is handed out only by
+//! [`Runtime::capability`], which applies the capability's status with it.
 
 use std::ffi::CStr;
 
 use super::{
     bindings::*,
+    loader::Runtime,
     table::{native_table, Resolver},
 };
-use crate::{Error, Result};
+use crate::{
+    capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature},
+    Error, Result,
+};
 
 native_table! {
     /// Entry points every supported NDI 6 runtime exports. A module that lacks any
@@ -233,18 +238,69 @@ impl<T> Optional<T> {
     pub(crate) fn is_available(&self) -> bool {
         self.0.is_ok()
     }
+}
 
-    /// The table, or an error naming `capability` and the missing entry point.
-    pub(crate) fn require(&self, capability: &str) -> Result<&T> {
-        self.0
-            .as_ref()
-            .map_err(|symbol| Error::UnsupportedCapability {
-                capability: capability.into(),
+impl Runtime {
+    /// Reject a capability the selected implementation cannot provide.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedCapability`] under the capability's name.
+    pub(crate) fn require(&self, feature: RuntimeFeature) -> Result<()> {
+        match self.capabilities.status(feature) {
+            CapabilityStatus::Available => Ok(()),
+            CapabilityStatus::Unavailable(reason) => Err(self.unavailable(feature, reason)),
+        }
+    }
+
+    /// The table of entry points behind an optional capability.
+    ///
+    /// Nothing else hands out an optional table. A capability's status, which
+    /// includes any version gate its exported functions cannot express, is
+    /// therefore always applied together with the table, and both failures are
+    /// reported under the one name `feature` carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedCapability`] under the capability's name.
+    pub(crate) fn capability<T>(
+        &self,
+        feature: RuntimeFeature,
+        table: &'static Optional<T>,
+    ) -> Result<&'static T> {
+        match (self.capabilities.status(feature), &table.0) {
+            (CapabilityStatus::Available, Ok(table)) => Ok(table),
+            // The table knows which entry point is missing; the status only
+            // knows that one is.
+            (_, Err(symbol)) => Err(Error::UnsupportedCapability {
+                capability: feature.name().into(),
                 reason: format!(
-                    "the selected NDI runtime does not export {}",
+                    "the selected runtime does not export {}",
                     symbol.to_string_lossy()
                 ),
-            })
+            }),
+            (CapabilityStatus::Unavailable(reason), Ok(_)) => {
+                Err(self.unavailable(feature, reason))
+            }
+        }
+    }
+
+    /// The error for a capability whose status is `reason`.
+    fn unavailable(&self, feature: RuntimeFeature, reason: CapabilityUnavailable) -> Error {
+        let reason = match (reason, feature.minimum_version()) {
+            (
+                CapabilityUnavailable::RuntimeTooOld | CapabilityUnavailable::RuntimeVersionUnknown,
+                Some(minimum),
+            ) => format!(
+                "{reason}: it needs NDI {minimum} or later and the runtime reports {:?}",
+                self.info.raw_version
+            ),
+            _ => reason.to_string(),
+        };
+        Error::UnsupportedCapability {
+            capability: feature.name().into(),
+            reason,
+        }
     }
 }
 

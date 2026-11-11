@@ -1,24 +1,42 @@
+//! Registration of senders and receivers with a Discovery Server.
+
 use crate::{
+    capabilities::RuntimeFeature,
     receiver::{ReceiverCore, ReceiverMode},
     sender::SenderResource,
     sys::{self, bindings::*},
     Error, Receiver, Result, Sender, NDI,
 };
-use std::{cell::RefCell, collections::BTreeMap, ffi::CString, ptr, rc::Rc, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    ffi::CString,
+    fmt, ptr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
-/// Discovery Server endpoints. Comma-separated redundancy lists are accepted.
+/// The Discovery Server an advertiser registers with.
+///
+/// Without explicit servers the SDK uses the Discovery Server from its own
+/// configuration.
 #[derive(Debug, Clone, Default)]
 pub struct AdvertiserOptions {
     servers: Option<String>,
 }
 impl AdvertiserOptions {
     /// Use explicit endpoints instead of the SDK configuration.
+    ///
+    /// Each endpoint is a host name or IP address, optionally followed by a
+    /// colon and a port (5959 when omitted). Several endpoints separated by
+    /// commas register with redundant servers.
     pub fn servers(mut self, servers: impl Into<String>) -> Self {
         self.servers = Some(servers.into());
         self
     }
 }
-/// Sender monitoring is disabled unless explicitly enabled.
+/// How a sender is advertised. Monitoring is disabled unless explicitly enabled.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SendAdvertisement {
     monitoring: bool,
@@ -30,7 +48,8 @@ impl SendAdvertisement {
         self
     }
 }
-/// Receiver monitoring and remote source control default to disabled.
+/// How a receiver is advertised. Monitoring and remote source control are
+/// disabled unless explicitly enabled.
 #[derive(Debug, Clone, Default)]
 pub struct RecvAdvertisement {
     monitoring: bool,
@@ -48,129 +67,244 @@ impl RecvAdvertisement {
         self.controlling = enabled;
         self
     }
-    /// Name the receiver's input group.
+    /// Name the receiver's input group. Receivers that share a group name, such
+    /// as the video and audio receivers of one input, are presented together.
     pub fn input_group(mut self, group: impl Into<String>) -> Self {
         self.input_group = Some(group.into());
         self
     }
 }
 
-struct SendCore {
-    instance: NDIlib_send_advertiser_instance_t,
-    table: &'static sys::SenderAdvertising,
-    entries: BTreeMap<u64, Arc<SenderResource>>,
-    next: u64,
-    _url: Option<CString>,
-    _config: Option<CString>,
-    _ndi: NDI,
+/// What the sender and receiver advertiser tables have in common once a native
+/// advertiser exists.
+trait AdvertiserApi: Sync + 'static {
+    /// The native advertiser handle.
+    type Instance: Copy;
+    /// The native owner a registration keeps alive.
+    type Member;
+
+    /// Destroy the advertiser.
+    ///
+    /// # Safety
+    ///
+    /// `instance` must be a live advertiser created through this table, and it
+    /// must not be used again.
+    unsafe fn destroy(&self, instance: Self::Instance);
+
+    /// Stop advertising `member`. Returns false when the SDK did not know it.
+    ///
+    /// # Safety
+    ///
+    /// `instance` must be a live advertiser created through this table.
+    unsafe fn remove(&self, instance: Self::Instance, member: &Self::Member) -> bool;
 }
-struct RecvEntry {
-    resource: Arc<ReceiverCore>,
-    _input: Option<CString>,
-}
-struct RecvCore {
-    instance: NDIlib_recv_advertiser_instance_t,
-    table: &'static sys::ReceiverAdvertising,
-    entries: BTreeMap<u64, RecvEntry>,
-    next: u64,
-    _url: Option<CString>,
-    _config: Option<CString>,
-    _ndi: NDI,
-}
-impl SendCore {
-    fn remove(&mut self, id: u64) -> bool {
-        if let Some(owner) = self.entries.remove(&id) {
-            // False means already absent, not an unconfirmed removal.
-            // SAFETY: the advertiser and the retained sender are both live.
-            unsafe {
-                self.table
-                    .NDIlib_send_advertiser_del_sender(self.instance, owner.instance)
-            }
-        } else {
-            false
-        }
+
+impl AdvertiserApi for sys::SenderAdvertising {
+    type Instance = NDIlib_send_advertiser_instance_t;
+    type Member = Arc<SenderResource>;
+
+    unsafe fn destroy(&self, instance: Self::Instance) {
+        // SAFETY: forwarded to the caller's obligations.
+        unsafe { self.NDIlib_send_advertiser_destroy(instance) }
     }
-}
-impl RecvCore {
-    fn remove(&mut self, id: u64) -> bool {
-        if let Some(owner) = self.entries.remove(&id) {
-            // SAFETY: the advertiser and the retained receiver are both live.
-            unsafe {
-                self.table
-                    .NDIlib_recv_advertiser_del_receiver(self.instance, owner.resource.instance)
-            }
-        } else {
-            false
-        }
-    }
-}
-impl Drop for SendCore {
-    fn drop(&mut self) {
-        // SAFETY: this core is the advertiser's only owner.
-        unsafe { self.table.NDIlib_send_advertiser_destroy(self.instance) };
-    }
-}
-impl Drop for RecvCore {
-    fn drop(&mut self) {
-        // SAFETY: this core is the advertiser's only owner.
-        unsafe { self.table.NDIlib_recv_advertiser_destroy(self.instance) };
+    unsafe fn remove(&self, instance: Self::Instance, member: &Self::Member) -> bool {
+        // SAFETY: the caller supplies a live advertiser, and `member` owns a
+        // live sender.
+        unsafe { self.NDIlib_send_advertiser_del_sender(instance, member.instance) }
     }
 }
 
-/// A thread-affine sender monitor. Registrations retain native sender ownership.
+/// A registered receiver and the input-group name the SDK was given for it.
+struct ReceiverMember {
+    resource: Arc<ReceiverCore>,
+    _input_group: Option<CString>,
+}
+
+impl AdvertiserApi for sys::ReceiverAdvertising {
+    type Instance = NDIlib_recv_advertiser_instance_t;
+    type Member = ReceiverMember;
+
+    unsafe fn destroy(&self, instance: Self::Instance) {
+        // SAFETY: forwarded to the caller's obligations.
+        unsafe { self.NDIlib_recv_advertiser_destroy(instance) }
+    }
+    unsafe fn remove(&self, instance: Self::Instance, member: &Self::Member) -> bool {
+        // SAFETY: the caller supplies a live advertiser, and `member` owns a
+        // live receiver.
+        unsafe { self.NDIlib_recv_advertiser_del_receiver(instance, member.resource.instance) }
+    }
+}
+
+/// Source of registration identifiers. They are unique across advertisers, so
+/// a registration can only ever name an entry of the advertiser that issued it.
+static NEXT_REGISTRATION: AtomicU64 = AtomicU64::new(1);
+
+/// A native advertiser and the objects registered with it.
+///
+/// The advertiser is the single owner of its registrations: each one keeps its
+/// sender or receiver alive until it is removed or the advertiser is dropped.
+struct Advertiser<A: AdvertiserApi> {
+    instance: A::Instance,
+    api: &'static A,
+    members: BTreeMap<u64, A::Member>,
+    _url: Option<CString>,
+    _config: Option<CString>,
+    _ndi: NDI,
+}
+
+// SAFETY: the SDK attaches no advertiser to the thread that created it; its
+// objects may be used and destroyed from any thread as long as calls on one
+// object do not overlap. An advertiser has exactly one owner and is not `Sync`,
+// so its calls cannot overlap. The registered objects it may destroy are `Send`,
+// and everything else it holds is too.
+unsafe impl<A: AdvertiserApi> Send for Advertiser<A> where A::Member: Send {}
+
+impl<A: AdvertiserApi> Advertiser<A> {
+    /// Take ownership of the advertiser the SDK created, if it created one.
+    fn adopt(
+        instance: Option<A::Instance>,
+        api: &'static A,
+        url: Option<CString>,
+        config: Option<CString>,
+        ndi: &NDI,
+    ) -> Result<Self> {
+        let instance = instance.ok_or_else(|| {
+            Error::InitializationFailed(
+                "the SDK created no advertiser; it needs a reachable Discovery Server".into(),
+            )
+        })?;
+        Ok(Self {
+            instance,
+            api,
+            members: BTreeMap::new(),
+            _url: url,
+            _config: config,
+            _ndi: ndi.clone(),
+        })
+    }
+
+    /// Keep a newly registered `member` alive and return its identifier.
+    fn retain(&mut self, member: A::Member) -> u64 {
+        let id = NEXT_REGISTRATION.fetch_add(1, Ordering::Relaxed);
+        self.members.insert(id, member);
+        id
+    }
+
+    /// End the registration `id`. Returns whether this advertiser held it and
+    /// the SDK confirmed its removal.
+    fn release(&mut self, id: u64) -> bool {
+        let Some(member) = self.members.remove(&id) else {
+            return false;
+        };
+        // SAFETY: the advertiser is live for this borrow. `member` is released
+        // only after the SDK has forgotten it.
+        unsafe { self.api.remove(self.instance, &member) }
+    }
+}
+
+impl<A: AdvertiserApi> Drop for Advertiser<A> {
+    fn drop(&mut self) {
+        // The SDK's documented teardown order: stop advertising every object,
+        // destroy the advertiser, and only then release the objects, which
+        // happens when the fields drop after this body.
+        for member in self.members.values() {
+            // SAFETY: the advertiser is live until the call below.
+            unsafe { self.api.remove(self.instance, member) };
+        }
+        // SAFETY: this is the advertiser's only owner, and it is not used again.
+        unsafe { self.api.destroy(self.instance) };
+    }
+}
+
+/// Advertises senders to a Discovery Server so they can be monitored.
+///
+/// This is separate from the discovery every sender already performs: a
+/// registration here makes a sender visible to [`SendListener`]s, not to
+/// finders or receivers.
+///
+/// # Ownership
+///
+/// The advertiser owns its registrations. Registering a sender keeps the native
+/// sender alive until the registration is [removed](Self::unregister) or the
+/// advertiser is dropped, even if every [`Sender`] handle is dropped first.
+/// Dropping the advertiser removes every registration, destroys the native
+/// advertiser, and then releases the senders it was keeping alive.
+///
+/// # Threading
+///
+/// An advertiser is [`Send`] but not [`Sync`]: it may be moved to another
+/// thread, and is used by one thread at a time.
+///
+/// [`SendListener`]: super::SendListener
 pub struct SendAdvertiser {
-    core: Rc<RefCell<SendCore>>,
+    inner: Advertiser<sys::SenderAdvertising>,
 }
-/// A thread-affine receiver monitor/controller.
+/// Advertises receivers to a Discovery Server so they can be monitored and,
+/// when permitted, told which source to connect to.
+///
+/// # Ownership
+///
+/// The advertiser owns its registrations. Registering a receiver keeps the
+/// native receiver alive until the registration is [removed](Self::unregister)
+/// or the advertiser is dropped, even if every [`Receiver`] handle is dropped
+/// first. Dropping the advertiser removes every registration, destroys the
+/// native advertiser, and then releases the receivers it was keeping alive.
+///
+/// # Threading
+///
+/// An advertiser is [`Send`] but not [`Sync`]: it may be moved to another
+/// thread, and is used by one thread at a time.
 pub struct RecvAdvertiser {
-    core: Rc<RefCell<RecvCore>>,
+    inner: Advertiser<sys::ReceiverAdvertising>,
 }
-/// One registration; dropping removes it. Forgetting it may leak but cannot dangle.
-/// A registration intentionally keeps its sender alive after the Sender is dropped.
-pub struct SendRegistration {
-    core: Rc<RefCell<SendCore>>,
-    id: Option<u64>,
-}
-/// One receiver registration, retaining the receiver even after its facade is dropped.
-pub struct RecvRegistration {
-    core: Rc<RefCell<RecvCore>>,
-    id: Option<u64>,
-}
-impl SendRegistration {
-    /// Remove this registration; false means it was already absent in the SDK.
-    pub fn unregister(mut self) -> Result<bool> {
-        Ok(self
-            .core
-            .borrow_mut()
-            .remove(self.id.take().expect("live registration")))
+
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<SendAdvertiser>();
+    assert_send::<RecvAdvertiser>();
+};
+
+/// Names one sender registration for [`SendAdvertiser::unregister`].
+///
+/// The registration belongs to the advertiser that issued it. Dropping this
+/// value changes nothing: the sender stays advertised, and alive, until the
+/// registration is removed or the advertiser is dropped.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct SendRegistration(u64);
+/// Names one receiver registration for [`RecvAdvertiser::unregister`].
+///
+/// The registration belongs to the advertiser that issued it. Dropping this
+/// value changes nothing: the receiver stays advertised, and alive, until the
+/// registration is removed or the advertiser is dropped.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct RecvRegistration(u64);
+
+impl fmt::Debug for SendAdvertiser {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SendAdvertiser")
+            .field("registrations", &self.inner.members.len())
+            .finish_non_exhaustive()
     }
 }
-impl RecvRegistration {
-    /// Remove this registration; false means it was already absent in the SDK.
-    pub fn unregister(mut self) -> Result<bool> {
-        Ok(self
-            .core
-            .borrow_mut()
-            .remove(self.id.take().expect("live registration")))
-    }
-}
-impl Drop for SendRegistration {
-    fn drop(&mut self) {
-        if let Some(id) = self.id.take() {
-            self.core.borrow_mut().remove(id);
-        }
-    }
-}
-impl Drop for RecvRegistration {
-    fn drop(&mut self) {
-        if let Some(id) = self.id.take() {
-            self.core.borrow_mut().remove(id);
-        }
+impl fmt::Debug for RecvAdvertiser {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecvAdvertiser")
+            .field("registrations", &self.inner.members.len())
+            .finish_non_exhaustive()
     }
 }
 
 impl SendAdvertiser {
-    /// Connect to the configured Discovery Server without registering sources.
+    /// Connect to the Discovery Server without registering any sender.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedCapability`] when the selected runtime
+    /// cannot provide [sender advertising](RuntimeFeature::SenderAdvertising),
+    /// which needs NDI 6.4.0 or later; [`Error::InvalidCString`] when the server
+    /// list contains a NUL byte; and [`Error::InitializationFailed`] when the
+    /// SDK creates no advertiser, as it does when no Discovery Server is
+    /// configured or reachable.
     pub fn new(ndi: &NDI, options: &AdvertiserOptions) -> Result<Self> {
         Self::create(ndi, options, None)
     }
@@ -184,7 +318,10 @@ impl SendAdvertiser {
         Self::create(ndi, options, Some(CString::new(config.expose_json())?))
     }
     fn create(ndi: &NDI, options: &AdvertiserOptions, config: Option<CString>) -> Result<Self> {
-        let table = ndi.api().sender_advertising.require("sender advertising")?;
+        let table = ndi.capability(
+            RuntimeFeature::SenderAdvertising,
+            &ndi.api().sender_advertising,
+        )?;
         let url = options.servers.as_deref().map(CString::new).transpose()?;
         let raw = NDIlib_send_advertiser_create_t {
             p_url_address: url.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
@@ -209,50 +346,48 @@ impl SendAdvertiser {
         // SAFETY: `raw` borrows a C string that outlives the call.
         #[cfg(not(feature = "advanced"))]
         let instance = unsafe { table.NDIlib_send_advertiser_create(&raw) };
-        if instance.is_null() {
-            return Err(Error::InitializationFailed(
-                "sender advertiser creation failed".into(),
-            ));
-        }
         Ok(Self {
-            core: Rc::new(RefCell::new(SendCore {
-                instance,
+            inner: Advertiser::adopt(
+                (!instance.is_null()).then_some(instance),
                 table,
-                entries: BTreeMap::new(),
-                next: 1,
-                _url: url,
-                _config: config,
-                _ndi: ndi.clone(),
-            })),
+                url,
+                config,
+                ndi,
+            )?,
         })
     }
-    /// Register without borrowing the Sender for the registration lifetime.
-    /// Owned async sending remains available while monitoring is registered.
+    /// Advertise `sender`, keeping the native sender alive for as long as the
+    /// registration exists.
+    ///
+    /// The sender is not borrowed: it stays fully usable, and may even be
+    /// dropped, while it is registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] when this advertiser already
+    /// advertises the sender, and [`Error::NativeOperationFailed`] when the SDK
+    /// refuses the registration.
     pub fn register(
-        &self,
+        &mut self,
         sender: &Sender,
         options: SendAdvertisement,
     ) -> Result<SendRegistration> {
-        let mut core = self.core.borrow_mut();
         let owner = sender.native_owner();
-        if core
-            .entries
+        if self
+            .inner
+            .members
             .values()
-            .any(|entry| Arc::ptr_eq(entry, &owner))
+            .any(|member| Arc::ptr_eq(member, &owner))
         {
             return Err(Error::InvalidConfiguration(
                 "sender is already registered".into(),
             ));
         }
-        let id = core.next;
-        core.next = id.checked_add(1).ok_or_else(|| {
-            Error::InvalidConfiguration("advertisement identifiers exhausted".into())
-        })?;
-        // SAFETY: the advertiser is live and `owner` keeps the sender alive for
-        // as long as the registration exists.
+        // SAFETY: the advertiser is live for this borrow and `owner` keeps the
+        // sender alive for as long as the registration exists.
         if !unsafe {
-            core.table.NDIlib_send_advertiser_add_sender(
-                core.instance,
+            self.inner.api.NDIlib_send_advertiser_add_sender(
+                self.inner.instance,
                 owner.instance,
                 options.monitoring,
             )
@@ -261,15 +396,28 @@ impl SendAdvertiser {
                 operation: "register sender",
             });
         }
-        core.entries.insert(id, owner);
-        Ok(SendRegistration {
-            core: Rc::clone(&self.core),
-            id: Some(id),
-        })
+        Ok(SendRegistration(self.inner.retain(owner)))
+    }
+    /// Stop advertising a sender and release this advertiser's hold on it.
+    ///
+    /// Returns whether the SDK confirmed the removal. A registration issued by
+    /// another advertiser is left untouched and reports `false`.
+    pub fn unregister(&mut self, registration: SendRegistration) -> bool {
+        self.inner.release(registration.0)
     }
 }
 impl RecvAdvertiser {
-    /// Connect to the Discovery Server without enabling monitoring or control.
+    /// Connect to the Discovery Server without registering any receiver.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedCapability`] when the selected runtime
+    /// cannot provide
+    /// [receiver advertising](RuntimeFeature::ReceiverAdvertising), which needs
+    /// NDI 6.4.0 or later; [`Error::InvalidCString`] when the server list
+    /// contains a NUL byte; and [`Error::InitializationFailed`] when the SDK
+    /// creates no advertiser, as it does when no Discovery Server is configured
+    /// or reachable.
     pub fn new(ndi: &NDI, options: &AdvertiserOptions) -> Result<Self> {
         Self::create(ndi, options, None)
     }
@@ -283,10 +431,10 @@ impl RecvAdvertiser {
         Self::create(ndi, options, Some(CString::new(config.expose_json())?))
     }
     fn create(ndi: &NDI, options: &AdvertiserOptions, config: Option<CString>) -> Result<Self> {
-        let table = ndi
-            .api()
-            .receiver_advertising
-            .require("receiver advertising")?;
+        let table = ndi.capability(
+            RuntimeFeature::ReceiverAdvertising,
+            &ndi.api().receiver_advertising,
+        )?;
         let url = options.servers.as_deref().map(CString::new).transpose()?;
         let raw = NDIlib_recv_advertiser_create_t {
             p_url_address: url.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
@@ -311,74 +459,75 @@ impl RecvAdvertiser {
         // SAFETY: `raw` borrows a C string that outlives the call.
         #[cfg(not(feature = "advanced"))]
         let instance = unsafe { table.NDIlib_recv_advertiser_create(&raw) };
-        if instance.is_null() {
-            return Err(Error::InitializationFailed(
-                "receiver advertiser creation failed".into(),
-            ));
-        }
         Ok(Self {
-            core: Rc::new(RefCell::new(RecvCore {
-                instance,
+            inner: Advertiser::adopt(
+                (!instance.is_null()).then_some(instance),
                 table,
-                entries: BTreeMap::new(),
-                next: 1,
-                _url: url,
-                _config: config,
-                _ndi: ndi.clone(),
-            })),
+                url,
+                config,
+                ndi,
+            )?,
         })
     }
-    /// Register a receiver in any mode. This exposes no raw capture capability.
+    /// Advertise `receiver`, in any mode, keeping the native receiver alive for
+    /// as long as the registration exists.
+    ///
+    /// The receiver is not borrowed: it stays fully usable, and may even be
+    /// dropped, while it is registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidCString`] when the input-group name contains a
+    /// NUL byte, [`Error::InvalidConfiguration`] when this advertiser already
+    /// advertises the receiver, and [`Error::NativeOperationFailed`] when the
+    /// SDK refuses the registration.
     pub fn register<M: ReceiverMode>(
-        &self,
+        &mut self,
         receiver: &Receiver<M>,
         options: RecvAdvertisement,
     ) -> Result<RecvRegistration> {
-        let input = options
+        let input_group = options
             .input_group
             .as_deref()
             .map(CString::new)
             .transpose()?;
-        let mut core = self.core.borrow_mut();
         let resource = Arc::clone(&receiver.core);
-        if core
-            .entries
+        if self
+            .inner
+            .members
             .values()
-            .any(|entry| Arc::ptr_eq(&entry.resource, &resource))
+            .any(|member| Arc::ptr_eq(&member.resource, &resource))
         {
             return Err(Error::InvalidConfiguration(
                 "receiver is already registered".into(),
             ));
         }
-        let id = core.next;
-        core.next = id.checked_add(1).ok_or_else(|| {
-            Error::InvalidConfiguration("advertisement identifiers exhausted".into())
-        })?;
-        // SAFETY: the advertiser is live, `resource` keeps the receiver alive
-        // for as long as the registration exists, and `input` outlives the call.
+        // SAFETY: the advertiser is live for this borrow, `resource` keeps the
+        // receiver alive for as long as the registration exists, and the
+        // registration retains `input_group` for the same time.
         if !unsafe {
-            core.table.NDIlib_recv_advertiser_add_receiver(
-                core.instance,
+            self.inner.api.NDIlib_recv_advertiser_add_receiver(
+                self.inner.instance,
                 resource.instance,
                 options.controlling,
                 options.monitoring,
-                input.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
+                input_group.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
             )
         } {
             return Err(Error::NativeOperationFailed {
                 operation: "register receiver",
             });
         }
-        core.entries.insert(
-            id,
-            RecvEntry {
-                resource,
-                _input: input,
-            },
-        );
-        Ok(RecvRegistration {
-            core: Rc::clone(&self.core),
-            id: Some(id),
-        })
+        Ok(RecvRegistration(self.inner.retain(ReceiverMember {
+            resource,
+            _input_group: input_group,
+        })))
+    }
+    /// Stop advertising a receiver and release this advertiser's hold on it.
+    ///
+    /// Returns whether the SDK confirmed the removal. A registration issued by
+    /// another advertiser is left untouched and reports `false`.
+    pub fn unregister(&mut self, registration: RecvRegistration) -> bool {
+        self.inner.release(registration.0)
     }
 }

@@ -1,10 +1,35 @@
 //! Redirect source selection without receiving or forwarding media in Rust.
+//!
+//! A [`Router`] is an NDI source that carries no media of its own. Receivers
+//! connect to it by name and are redirected to whichever source it currently
+//! routes to, so one process can switch what many receivers see without
+//! touching a frame.
+//!
+//! ```no_run
+//! use grafton_ndi::{routing::{Router, RouterOptions}, Finder, FinderOptions, NDI};
+//! use std::time::Duration;
+//!
+//! # fn main() -> Result<(), grafton_ndi::Error> {
+//! let ndi = NDI::new()?;
+//! let mut router = Router::new(&ndi, &RouterOptions::new("Program"))?;
+//!
+//! let finder = Finder::new(&ndi, &FinderOptions::default())?;
+//! finder.wait_for_sources(Duration::from_secs(2))?;
+//! if let Some(camera) = finder.current_sources()?.first() {
+//!     router.change(camera)?;
+//! }
+//! # Ok(())
+//! # }
+//! ```
+
+#![warn(missing_docs)]
 
 use crate::{
+    capabilities::RuntimeFeature,
     sys::{self, bindings::*},
     to_ms_checked, Error, Result, Source, NDI,
 };
-use std::{ffi::CString, marker::PhantomData, ptr, rc::Rc, time::Duration};
+use std::{ffi::CString, fmt, ptr, time::Duration};
 
 /// A router's advertised name and optional discovery groups.
 #[derive(Debug, Clone)]
@@ -31,7 +56,12 @@ impl RouterOptions {
     }
 }
 
-/// A thread-affine native routing source. Destruction removes its advertisement.
+/// A native routing source. Dropping it removes its advertisement.
+///
+/// # Threading
+///
+/// A router is [`Send`] but not [`Sync`]: it may be moved to another thread,
+/// and is used by one thread at a time.
 pub struct Router {
     instance: NDIlib_routing_instance_t,
     routing: &'static sys::Routing,
@@ -39,10 +69,36 @@ pub struct Router {
     _groups: Option<CString>,
     _config: Option<CString>,
     _ndi: NDI,
-    _thread: PhantomData<Rc<()>>,
 }
+
+// SAFETY: the SDK attaches no routing instance to the thread that created it;
+// its objects may be used and destroyed from any thread as long as calls on one
+// object do not overlap. A router has exactly one owner and is not `Sync`, so
+// its calls cannot overlap, and everything else it holds is `Send`.
+unsafe impl Send for Router {}
+
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<Router>();
+};
+
+impl fmt::Debug for Router {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Router")
+            .field("name", &self._name)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Router {
-    /// Create and advertise a routing source after validating the complete API group.
+    /// Create and advertise a routing source that routes to nothing yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedCapability`] when the selected runtime has no
+    /// [routing support](RuntimeFeature::Routing), [`Error::InvalidCString`]
+    /// when the name or groups contain a NUL byte, and
+    /// [`Error::InitializationFailed`] when the SDK creates no source.
     pub fn new(ndi: &NDI, options: &RouterOptions) -> Result<Self> {
         Self::create(ndi, options, None)
     }
@@ -56,7 +112,7 @@ impl Router {
         Self::create(ndi, options, Some(CString::new(config.expose_json())?))
     }
     fn create(ndi: &NDI, options: &RouterOptions, config: Option<CString>) -> Result<Self> {
-        let routing = ndi.api().routing.require("source routing")?;
+        let routing = ndi.capability(RuntimeFeature::Routing, &ndi.api().routing)?;
         let name = CString::new(options.name.as_str())?;
         let groups = options.groups.as_deref().map(CString::new).transpose()?;
         let raw = NDIlib_routing_create_t {
@@ -93,10 +149,15 @@ impl Router {
             _groups: groups,
             _config: config,
             _ndi: ndi.clone(),
-            _thread: PhantomData,
         })
     }
-    /// Select a source for connected receivers.
+    /// Route connected and future receivers to `source`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidCString`] when the source name or address
+    /// contains a NUL byte, and [`Error::NativeOperationFailed`] when the SDK
+    /// rejects the change.
     pub fn change(&mut self, source: &Source) -> Result<()> {
         let raw = source.to_raw()?;
         // SAFETY: the router is live and `raw` owns the strings it points to.
@@ -108,7 +169,11 @@ impl Router {
             })
         }
     }
-    /// Disconnect the current route.
+    /// Stop routing to any source. Receivers stay connected to the router.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NativeOperationFailed`] when the SDK rejects the change.
     pub fn clear(&mut self) -> Result<()> {
         // SAFETY: the router instance is live for this borrow.
         if unsafe { self.routing.NDIlib_routing_clear(self.instance) } {
@@ -119,7 +184,16 @@ impl Router {
             })
         }
     }
-    /// Count receivers; a nonzero timeout waits for connections.
+    /// Count the receivers connected to this router.
+    ///
+    /// A zero `timeout` reads the current count; a longer one waits up to that
+    /// long for the first connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] when `timeout` exceeds
+    /// [`crate::MAX_TIMEOUT`], and [`Error::NativeOperationFailed`] when the SDK
+    /// reports a negative count.
     pub fn connection_count(&self, timeout: Duration) -> Result<u32> {
         let timeout = to_ms_checked(timeout)?;
         // SAFETY: the router instance is live for this borrow.
@@ -131,10 +205,15 @@ impl Router {
             operation: "routing connection count",
         })
     }
-    /// Copy the router's advertised source descriptor.
+    /// The source descriptor this router is advertised under, which receivers
+    /// connect to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NullPointer`] when the SDK supplies no descriptor.
     pub fn source(&self) -> Result<Source> {
         // SAFETY: the router is live, and the descriptor the SDK returns stays
-        // valid until the next call on it, after this copy completes.
+        // valid until the router is destroyed, after this copy completes.
         unsafe { Source::try_from_raw(self.routing.NDIlib_routing_get_source_name(self.instance)) }
     }
     /// Send metadata immediately and on each new downstream connection.

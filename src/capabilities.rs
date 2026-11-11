@@ -1,10 +1,17 @@
 //! Facts about the selected native SDK, separate from hardware and license availability.
 
-use std::path::{Path, PathBuf};
+#![warn(missing_docs)]
+
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use crate::sys::{AdvancedEntryPoints, Api};
 
-/// The first runtime version with the NDI 6.4 pixel formats and receiver modes.
+/// NDI 6.4.0: the first runtime with the planar 4:4:4 formats and newer
+/// receiver modes, and the first whose Discovery Server advertisers and
+/// listeners can be destroyed safely.
 const NDI_6_4: SdkVersion = SdkVersion {
     major: 6,
     minor: 4,
@@ -89,6 +96,19 @@ impl SdkVersion {
     }
 }
 
+impl fmt::Display for SdkVersion {
+    /// Formats all four components, for example `6.4.0.2`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            major,
+            minor,
+            patch,
+            build,
+        } = self;
+        write!(f, "{major}.{minor}.{patch}.{build}")
+    }
+}
+
 /// Identity of the implementation actually selected, rather than just build headers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeInfo {
@@ -137,17 +157,36 @@ pub enum RuntimeFeature {
     ReceiveVideoOnly,
     /// Independent native audio/video receiver delays.
     ReceiveDelay,
+    /// Metadata a receiver replays to every new connection.
+    ReceiverConnectionMetadata,
+    /// The connected source's web-control URL.
+    ReceiverWebControl,
+    /// Notifications of the connected source's actual name.
+    ConnectedSourceName,
+    /// Metadata a sender captures from its connected receivers.
+    SenderMetadata,
     /// The SDK current-timestamp operation.
     SdkTimestamp,
+    /// Conversion between planar and interleaved audio.
+    InterleavedAudioConversion,
+    /// Direct submission of interleaved audio to a sender.
+    InterleavedAudioSend,
+    /// Conversion between the V210 and P216 video layouts.
+    VideoConversion,
     /// Source routing, including its create/destroy and query operations.
     Routing,
-    /// Discovery Server sender registration and removal.
+    /// Discovery Server sender registration and removal. Needs NDI 6.4.0 or
+    /// later: earlier runtimes can crash when an advertiser is destroyed.
     SenderAdvertising,
-    /// Discovery Server receiver registration and removal.
+    /// Discovery Server receiver registration and removal. Needs NDI 6.4.0 or
+    /// later: earlier runtimes can crash when an advertiser is destroyed.
     ReceiverAdvertising,
-    /// Sender snapshots, subscriptions and owned event batches.
+    /// Sender snapshots, subscriptions and owned event batches. Needs NDI
+    /// 6.4.0 or later: earlier runtimes can crash when a listener is destroyed.
     SenderDiscovery,
     /// Receiver snapshots, subscriptions, event batches and connection control.
+    /// Needs NDI 6.4.0 or later: earlier runtimes can crash when a listener is
+    /// destroyed.
     ReceiverDiscovery,
     /// Creating a sender with Advanced JSON configuration.
     AdvancedSenderConfiguration,
@@ -156,13 +195,21 @@ pub enum RuntimeFeature {
 }
 
 impl RuntimeFeature {
+    /// The one name the capability is reported under.
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Planar444Video => "planar 4:4:4 video",
             Self::ReceiveBest444 => "Best444 receiver mode",
             Self::ReceiveVideoOnly => "video-only receiver bandwidth",
             Self::ReceiveDelay => "receiver audio/video delay",
+            Self::ReceiverConnectionMetadata => "receiver connection metadata",
+            Self::ReceiverWebControl => "receiver web control",
+            Self::ConnectedSourceName => "connected source name",
+            Self::SenderMetadata => "sender metadata",
             Self::SdkTimestamp => "SDK timestamp",
+            Self::InterleavedAudioConversion => "interleaved audio conversion",
+            Self::InterleavedAudioSend => "interleaved audio submission",
+            Self::VideoConversion => "V210/P216 conversion",
             Self::Routing => "source routing",
             Self::SenderAdvertising => "sender advertising",
             Self::ReceiverAdvertising => "receiver advertising",
@@ -170,6 +217,37 @@ impl RuntimeFeature {
             Self::ReceiverDiscovery => "receiver discovery",
             Self::AdvancedSenderConfiguration => "Advanced sender configuration",
             Self::AdvancedReceiverConfiguration => "Advanced receiver configuration",
+        }
+    }
+
+    /// The first runtime version the capability may be used with, when the
+    /// functions a runtime exports are not evidence enough.
+    ///
+    /// The 6.4 formats and receiver modes are enum values an older runtime
+    /// would misread. The advertiser and listener functions exist in older
+    /// runtimes, but the vendor's change log records crashes when destroying
+    /// those objects that were fixed in 6.3.2 and again in 6.4.0.
+    pub(crate) fn minimum_version(self) -> Option<SdkVersion> {
+        match self {
+            Self::Planar444Video
+            | Self::ReceiveBest444
+            | Self::ReceiveVideoOnly
+            | Self::SenderAdvertising
+            | Self::ReceiverAdvertising
+            | Self::SenderDiscovery
+            | Self::ReceiverDiscovery => Some(NDI_6_4),
+            Self::ReceiveDelay
+            | Self::ReceiverConnectionMetadata
+            | Self::ReceiverWebControl
+            | Self::ConnectedSourceName
+            | Self::SenderMetadata
+            | Self::SdkTimestamp
+            | Self::InterleavedAudioConversion
+            | Self::InterleavedAudioSend
+            | Self::VideoConversion
+            | Self::Routing
+            | Self::AdvancedSenderConfiguration
+            | Self::AdvancedReceiverConfiguration => None,
         }
     }
 }
@@ -190,6 +268,20 @@ pub enum CapabilityUnavailable {
     WrongEdition,
 }
 
+impl fmt::Display for CapabilityUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::RuntimeVersionUnknown => "the selected runtime's version is not recognized",
+            Self::RuntimeTooOld => "the selected runtime is too old",
+            Self::SymbolUnavailable => "the selected runtime does not export a required function",
+            Self::BuildAbiUnavailable => {
+                "this build was made without the Advanced SDK declarations"
+            }
+            Self::WrongEdition => "the selected runtime is not an Advanced SDK runtime",
+        })
+    }
+}
+
 /// Availability established from the selected implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -207,7 +299,14 @@ pub struct Capabilities {
     receive_best_444: CapabilityStatus,
     receive_video_only: CapabilityStatus,
     receive_delay: CapabilityStatus,
+    receiver_connection_metadata: CapabilityStatus,
+    receiver_web_control: CapabilityStatus,
+    connected_source_name: CapabilityStatus,
+    sender_metadata: CapabilityStatus,
     sdk_timestamp: CapabilityStatus,
+    interleaved_audio_conversion: CapabilityStatus,
+    interleaved_audio_send: CapabilityStatus,
+    video_conversion: CapabilityStatus,
     routing: CapabilityStatus,
     sender_advertising: CapabilityStatus,
     receiver_advertising: CapabilityStatus,
@@ -226,40 +325,99 @@ impl Capabilities {
         edition: SdkEdition,
         advanced: AdvancedEntryPoints,
     ) -> Self {
-        let exported = |available: bool| {
+        // The feature's version gate. A missing function is reported first: it
+        // is the more specific reason, and no version makes up for it.
+        let versioned = |feature: RuntimeFeature| match (feature.minimum_version(), version) {
+            (None, _) => CapabilityStatus::Available,
+            (Some(minimum), Some(version)) if version >= minimum => CapabilityStatus::Available,
+            (Some(_), Some(_)) => {
+                CapabilityStatus::Unavailable(CapabilityUnavailable::RuntimeTooOld)
+            }
+            (Some(_), None) => {
+                CapabilityStatus::Unavailable(CapabilityUnavailable::RuntimeVersionUnknown)
+            }
+        };
+        let exported = |feature: RuntimeFeature, available: bool| {
             if available {
-                CapabilityStatus::Available
+                versioned(feature)
             } else {
                 CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
             }
         };
-        let since = |minimum: SdkVersion| match version {
-            Some(version) if version >= minimum => CapabilityStatus::Available,
-            Some(_) => CapabilityStatus::Unavailable(CapabilityUnavailable::RuntimeTooOld),
-            None => CapabilityStatus::Unavailable(CapabilityUnavailable::RuntimeVersionUnknown),
-        };
-        let advanced_entry = |available: bool| {
+        let advanced_entry = |feature: RuntimeFeature, available: bool| {
             if !cfg!(all(feature = "advanced", ndi_has_advanced_header)) {
                 CapabilityStatus::Unavailable(CapabilityUnavailable::BuildAbiUnavailable)
             } else if edition != SdkEdition::Advanced {
                 CapabilityStatus::Unavailable(CapabilityUnavailable::WrongEdition)
             } else {
-                exported(available)
+                exported(feature, available)
             }
         };
+        // Strings the receiver API returns are released through a table of
+        // their own, which every capability returning one also needs.
+        let receiver_strings = api.receiver_strings.is_available();
         Self {
-            planar_444_video: since(NDI_6_4),
-            receive_best_444: since(NDI_6_4),
-            receive_video_only: since(NDI_6_4),
-            receive_delay: exported(api.receive_delay.is_available()),
-            sdk_timestamp: exported(api.timestamp.is_available()),
-            routing: exported(api.routing.is_available()),
-            sender_advertising: exported(api.sender_advertising.is_available()),
-            receiver_advertising: exported(api.receiver_advertising.is_available()),
-            sender_discovery: exported(api.sender_discovery.is_available()),
-            receiver_discovery: exported(api.receiver_discovery.is_available()),
-            advanced_sender_configuration: advanced_entry(advanced.sender_configuration),
-            advanced_receiver_configuration: advanced_entry(advanced.receiver_configuration),
+            planar_444_video: versioned(RuntimeFeature::Planar444Video),
+            receive_best_444: versioned(RuntimeFeature::ReceiveBest444),
+            receive_video_only: versioned(RuntimeFeature::ReceiveVideoOnly),
+            receive_delay: exported(
+                RuntimeFeature::ReceiveDelay,
+                api.receive_delay.is_available(),
+            ),
+            receiver_connection_metadata: exported(
+                RuntimeFeature::ReceiverConnectionMetadata,
+                api.receiver_connection_metadata.is_available(),
+            ),
+            receiver_web_control: exported(
+                RuntimeFeature::ReceiverWebControl,
+                receiver_strings && api.receiver_web_control.is_available(),
+            ),
+            connected_source_name: exported(
+                RuntimeFeature::ConnectedSourceName,
+                receiver_strings && api.receiver_source_name.is_available(),
+            ),
+            sender_metadata: exported(
+                RuntimeFeature::SenderMetadata,
+                api.sender_metadata.is_available(),
+            ),
+            sdk_timestamp: exported(RuntimeFeature::SdkTimestamp, api.timestamp.is_available()),
+            interleaved_audio_conversion: exported(
+                RuntimeFeature::InterleavedAudioConversion,
+                api.interleaved_audio.is_available(),
+            ),
+            interleaved_audio_send: exported(
+                RuntimeFeature::InterleavedAudioSend,
+                api.interleaved_send.is_available(),
+            ),
+            video_conversion: exported(
+                RuntimeFeature::VideoConversion,
+                api.video_conversion.is_available(),
+            ),
+            routing: exported(RuntimeFeature::Routing, api.routing.is_available()),
+            sender_advertising: exported(
+                RuntimeFeature::SenderAdvertising,
+                api.sender_advertising.is_available(),
+            ),
+            receiver_advertising: exported(
+                RuntimeFeature::ReceiverAdvertising,
+                api.receiver_advertising.is_available(),
+            ),
+            sender_discovery: exported(
+                RuntimeFeature::SenderDiscovery,
+                api.sender_discovery.is_available(),
+            ),
+            receiver_discovery: exported(
+                RuntimeFeature::ReceiverDiscovery,
+                api.receiver_discovery.is_available(),
+            ),
+            advanced_sender_configuration: advanced_entry(
+                RuntimeFeature::AdvancedSenderConfiguration,
+                advanced.sender_configuration,
+            ),
+            advanced_receiver_configuration: advanced_entry(
+                RuntimeFeature::AdvancedReceiverConfiguration,
+                advanced.receiver_configuration,
+            ),
         }
     }
 
@@ -270,7 +428,14 @@ impl Capabilities {
             RuntimeFeature::ReceiveBest444 => self.receive_best_444,
             RuntimeFeature::ReceiveVideoOnly => self.receive_video_only,
             RuntimeFeature::ReceiveDelay => self.receive_delay,
+            RuntimeFeature::ReceiverConnectionMetadata => self.receiver_connection_metadata,
+            RuntimeFeature::ReceiverWebControl => self.receiver_web_control,
+            RuntimeFeature::ConnectedSourceName => self.connected_source_name,
+            RuntimeFeature::SenderMetadata => self.sender_metadata,
             RuntimeFeature::SdkTimestamp => self.sdk_timestamp,
+            RuntimeFeature::InterleavedAudioConversion => self.interleaved_audio_conversion,
+            RuntimeFeature::InterleavedAudioSend => self.interleaved_audio_send,
+            RuntimeFeature::VideoConversion => self.video_conversion,
             RuntimeFeature::Routing => self.routing,
             RuntimeFeature::SenderAdvertising => self.sender_advertising,
             RuntimeFeature::ReceiverAdvertising => self.receiver_advertising,
@@ -358,12 +523,18 @@ mod tests {
             RuntimeFeature::ReceiveBest444,
             RuntimeFeature::ReceiveVideoOnly,
             RuntimeFeature::ReceiveDelay,
+            RuntimeFeature::ReceiverConnectionMetadata,
+            RuntimeFeature::ReceiverWebControl,
+            RuntimeFeature::ConnectedSourceName,
+            RuntimeFeature::SenderMetadata,
             RuntimeFeature::SdkTimestamp,
-            RuntimeFeature::SenderAdvertising,
-            RuntimeFeature::ReceiverAdvertising,
-            RuntimeFeature::SenderDiscovery,
-            RuntimeFeature::ReceiverDiscovery,
-        ] {
+            RuntimeFeature::InterleavedAudioConversion,
+            RuntimeFeature::InterleavedAudioSend,
+            RuntimeFeature::VideoConversion,
+        ]
+        .into_iter()
+        .chain(DISCOVERY_SERVER)
+        {
             assert!(capabilities.supports(feature), "{feature:?}");
         }
     }
@@ -374,6 +545,82 @@ mod tests {
         assert_eq!(
             capabilities.status(RuntimeFeature::Planar444Video),
             CapabilityStatus::Unavailable(CapabilityUnavailable::RuntimeTooOld)
+        );
+    }
+
+    /// The capabilities whose objects talk to a Discovery Server.
+    const DISCOVERY_SERVER: [RuntimeFeature; 4] = [
+        RuntimeFeature::SenderAdvertising,
+        RuntimeFeature::ReceiverAdvertising,
+        RuntimeFeature::SenderDiscovery,
+        RuntimeFeature::ReceiverDiscovery,
+    ];
+
+    #[test]
+    fn discovery_server_objects_need_their_functions_and_ndi_6_4() {
+        let unavailable = |reason| CapabilityStatus::Unavailable(reason);
+        let too_old = detect(|_| true, Some("6.3.2.0"), SdkEdition::Standard);
+        let unknown = detect(|_| true, None, SdkEdition::Standard);
+        let first_fixed = detect(|_| true, Some("6.4.0.0"), SdkEdition::Standard);
+        let without_functions = detect(
+            |name| !name.contains("_advertiser_") && !name.contains("_listener_"),
+            Some("6.3.2.0"),
+            SdkEdition::Standard,
+        );
+        for feature in DISCOVERY_SERVER {
+            assert_eq!(
+                too_old.status(feature),
+                unavailable(CapabilityUnavailable::RuntimeTooOld),
+                "{feature:?}"
+            );
+            assert_eq!(
+                unknown.status(feature),
+                unavailable(CapabilityUnavailable::RuntimeVersionUnknown),
+                "{feature:?}"
+            );
+            assert!(first_fixed.supports(feature), "{feature:?}");
+            // A missing function is the more specific reason, whatever the version.
+            assert_eq!(
+                without_functions.status(feature),
+                unavailable(CapabilityUnavailable::SymbolUnavailable),
+                "{feature:?}"
+            );
+        }
+        // Routing has no such defect: its functions are evidence enough.
+        assert!(too_old.supports(RuntimeFeature::Routing));
+        assert!(unknown.supports(RuntimeFeature::Routing));
+    }
+
+    #[test]
+    fn capabilities_returning_receiver_strings_need_the_release_function() {
+        let capabilities = detect(
+            |name| name != "NDIlib_recv_free_string",
+            Some("6.4.0.2"),
+            SdkEdition::Standard,
+        );
+        for feature in [
+            RuntimeFeature::ReceiverWebControl,
+            RuntimeFeature::ConnectedSourceName,
+        ] {
+            assert_eq!(
+                capabilities.status(feature),
+                CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable),
+                "{feature:?}"
+            );
+        }
+        assert!(capabilities.supports(RuntimeFeature::ReceiverConnectionMetadata));
+    }
+
+    #[test]
+    fn versions_and_reasons_have_readable_text() {
+        assert_eq!(NDI_6_4.to_string(), "6.4.0.0");
+        assert_eq!(
+            SdkVersion::parse("NDI SDK 6.4.0.2").unwrap().to_string(),
+            "6.4.0.2"
+        );
+        assert_eq!(
+            CapabilityUnavailable::RuntimeTooOld.to_string(),
+            "the selected runtime is too old"
         );
     }
 

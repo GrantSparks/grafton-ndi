@@ -8,6 +8,7 @@ use std::{
 };
 
 use crate::{
+    capabilities::RuntimeFeature,
     finder::Source,
     frames::{
         AudioFrame, LineStrideOrSize, MetadataFrame, PixelFormat, ScanType, ValidatedFrameMetadata,
@@ -619,7 +620,10 @@ impl Sender {
     /// The result owns its data. The wait budget includes contention with other
     /// metadata captures and does not block the video-send synchronization lock.
     pub fn capture_metadata(&self, timeout: Duration) -> Result<Option<MetadataFrame>> {
-        let metadata = self._ndi.api().sender_metadata.require("sender metadata")?;
+        let metadata = self._ndi.capability(
+            RuntimeFeature::SenderMetadata,
+            &self._ndi.api().sender_metadata,
+        )?;
         let _ = to_ms_checked(timeout)?;
         let started = Instant::now();
         let Some(_lock) = self.inner.metadata_capture.try_lock_for(timeout) else {

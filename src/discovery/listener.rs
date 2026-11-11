@@ -1,17 +1,20 @@
+//! Snapshots of, events from, and connection requests to what a Discovery
+//! Server advertises.
+
 use crate::{
+    capabilities::RuntimeFeature,
     sys::{self, bindings::*},
     to_ms_checked, Error, Result, NDI,
 };
 use std::{
-    ffi::{c_char, CString},
-    marker::PhantomData,
-    ptr,
-    rc::Rc,
+    borrow::Cow,
+    ffi::{c_char, CStr, CString},
+    fmt, ptr,
     time::Duration,
 };
 
 /// The operations the sender and receiver listener tables have in common.
-trait ListenerApi: Sized + 'static {
+trait ListenerApi: Sized + Sync + 'static {
     type Instance: Copy;
     /// One element of the native membership snapshot.
     type Entry;
@@ -55,7 +58,7 @@ trait ListenerApi: Sized + 'static {
 
 macro_rules! listener_api {
     (
-        $Table:ty, $field:ident, $capability:literal,
+        $Table:ty, $field:ident, $feature:ident,
         $Instance:ty, $Entry:ty, $Create:ident,
         $create:ident, $destroy:ident, $is_connected:ident, $server_url:ident, $entries:ident,
         $wait:ident, $subscribe:ident, $unsubscribe:ident, $events:ident, $free_events:ident
@@ -65,7 +68,7 @@ macro_rules! listener_api {
             type Entry = $Entry;
 
             fn table(ndi: &NDI) -> Result<&'static Self> {
-                ndi.api().$field.require($capability)
+                ndi.capability(RuntimeFeature::$feature, &ndi.api().$field)
             }
 
             unsafe fn create(
@@ -95,7 +98,7 @@ macro_rules! listener_api {
                     Some(_) => {
                         let _ = ndi;
                         return Err(Error::UnsupportedCapability {
-                            capability: $capability.into(),
+                            capability: RuntimeFeature::$feature.name().into(),
                             reason: "Advanced configuration needs the `advanced` feature".into(),
                         });
                     }
@@ -152,7 +155,7 @@ macro_rules! listener_api {
 listener_api!(
     sys::SenderDiscovery,
     sender_discovery,
-    "sender discovery",
+    SenderDiscovery,
     NDIlib_send_listener_instance_t,
     NDIlib_sender_t,
     NDIlib_send_listener_create_t,
@@ -170,7 +173,7 @@ listener_api!(
 listener_api!(
     sys::ReceiverDiscovery,
     receiver_discovery,
-    "receiver discovery",
+    ReceiverDiscovery,
     NDIlib_recv_listener_instance_t,
     NDIlib_receiver_t,
     NDIlib_recv_listener_create_t,
@@ -186,13 +189,23 @@ listener_api!(
     NDIlib_recv_listener_free_events
 );
 
-/// One Discovery Server endpoint. Redundancy lists belong to AdvertiserOptions.
+/// The Discovery Server a listener connects to.
+///
+/// Without an explicit server the SDK uses the Discovery Server from its own
+/// configuration.
 #[derive(Debug, Clone, Default)]
 pub struct ListenerOptions {
     server: Option<String>,
 }
 impl ListenerOptions {
-    /// Configure a single endpoint. A comma-separated list is rejected.
+    /// Connect to this endpoint: a host name or IP address, optionally followed
+    /// by a colon and a port (5959 when omitted).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfiguration`] for a comma-separated list, of
+    /// which a listener would use only the first entry, and
+    /// [`Error::InvalidCString`] when the endpoint contains a NUL byte.
     pub fn server(mut self, server: impl Into<String>) -> Result<Self> {
         let server = server.into();
         if server.contains(',') {
@@ -205,21 +218,43 @@ impl ListenerOptions {
         Ok(self)
     }
 }
-/// An opaque advertised identifier; no UUID spelling is assumed.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AdvertisedId(String);
+
+/// The identifier a Discovery Server gives a sender, a receiver or a receiver's
+/// input group.
+///
+/// An identifier is opaque: no UUID spelling is assumed, and it keeps exactly
+/// the bytes the server supplied. Passing it back in a subscription or a
+/// connection request therefore always names the same peer, even when those
+/// bytes are not valid UTF-8.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AdvertisedId(CString);
 impl AdvertisedId {
-    /// Validate an identifier for sending subscription or control requests.
-    pub fn new(value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
-        CString::new(value.as_str())?;
-        Ok(Self(value))
+    /// Make an identifier from bytes obtained elsewhere, such as a saved
+    /// selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidCString`] when the bytes contain a NUL.
+    pub fn new(value: impl Into<Vec<u8>>) -> Result<Self> {
+        Ok(Self(CString::new(value)?))
     }
-    /// Exact identifier returned by the server.
-    pub fn as_str(&self) -> &str {
-        &self.0
+    /// The exact bytes the server supplied.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+    /// The identifier as text for display, with any bytes that are not UTF-8
+    /// replaced by U+FFFD. Use the identifier itself, not this text, to name
+    /// the peer again.
+    pub fn to_string_lossy(&self) -> Cow<'_, str> {
+        self.0.to_string_lossy()
     }
 }
+impl fmt::Display for AdvertisedId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_string_lossy())
+    }
+}
+
 /// A finite event wait or an explicit indefinite wait.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
@@ -245,7 +280,11 @@ impl Wait {
         }
     }
 }
-/// An event's original identifier, name, and value. Unknown names are preserved.
+
+/// An event a subscribed sender or receiver reported.
+///
+/// Event names and values are defined by the peer and are preserved as sent,
+/// apart from the lossy decoding described on [`ListenerEvent::name`].
 #[derive(Debug, Clone)]
 pub struct ListenerEvent {
     id: Option<AdvertisedId>,
@@ -253,19 +292,20 @@ pub struct ListenerEvent {
     value: Option<String>,
 }
 impl ListenerEvent {
-    /// Originating endpoint, if supplied by the server.
+    /// The peer the event came from, when the server supplied it.
     pub fn id(&self) -> Option<&AdvertisedId> {
         self.id.as_ref()
     }
-    /// Exact event name.
+    /// The event's name. Bytes that are not UTF-8 are replaced by U+FFFD.
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
-    /// Exact event value.
+    /// The event's value. Bytes that are not UTF-8 are replaced by U+FFFD.
     pub fn value(&self) -> Option<&str> {
         self.value.as_deref()
     }
 }
+
 /// A receiver stream kind. These are individual values, not bit flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -312,15 +352,21 @@ impl From<u32> for ReceiverCommand {
         }
     }
 }
-/// An owned sender snapshot, independent of subsequent listener calls.
+
+/// An owned description of one advertised sender, independent of later
+/// listener calls.
+///
+/// Every string is whatever the sender advertised. Text that is not valid
+/// UTF-8 is decoded with U+FFFD in place of the offending bytes; only the
+/// [identifier](Self::id) keeps its exact bytes.
 #[derive(Debug, Clone)]
 pub struct AdvertisedSender {
     id: Option<AdvertisedId>,
     name: Option<String>,
     metadata: Option<String>,
     address: Option<String>,
-    port: i32,
-    groups: Vec<Option<String>>,
+    port: Option<u16>,
+    groups: Vec<String>,
     subscribed: bool,
 }
 impl AdvertisedSender {
@@ -340,12 +386,13 @@ impl AdvertisedSender {
     pub fn address(&self) -> Option<&str> {
         self.address.as_deref()
     }
-    /// The sender's network port.
-    pub fn port(&self) -> i32 {
+    /// The sender's network port, or `None` when the advertised value is not a
+    /// port number.
+    pub fn port(&self) -> Option<u16> {
         self.port
     }
     /// The discovery groups the sender belongs to.
-    pub fn groups(&self) -> &[Option<String>] {
+    pub fn groups(&self) -> &[String] {
         &self.groups
     }
     /// Whether this listener is subscribed to the sender's events.
@@ -353,7 +400,12 @@ impl AdvertisedSender {
         self.subscribed
     }
 }
-/// An owned receiver snapshot. Missing native strings remain None.
+/// An owned description of one advertised receiver, independent of later
+/// listener calls.
+///
+/// Every string is whatever the receiver advertised. Text that is not valid
+/// UTF-8 is decoded with U+FFFD in place of the offending bytes; only the
+/// identifiers keep their exact bytes.
 #[derive(Debug, Clone)]
 pub struct AdvertisedReceiver {
     id: Option<AdvertisedId>,
@@ -374,11 +426,11 @@ impl AdvertisedReceiver {
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
-    /// The identifier of the source the receiver is connected to.
+    /// The identifier of the input group the receiver belongs to.
     pub fn input_id(&self) -> Option<&AdvertisedId> {
         self.input_id.as_ref()
     }
-    /// The name of the source the receiver is connected to.
+    /// The name of the input group the receiver belongs to.
     pub fn input_name(&self) -> Option<&str> {
         self.input_name.as_deref()
     }
@@ -400,38 +452,75 @@ impl AdvertisedReceiver {
     }
 }
 
-// Bound copied snapshots as a whole, not merely each individual field.
+/// The most one snapshot or event batch copies out of the SDK.
+const COPY_LIMIT: usize = 16 * 1024 * 1024;
+/// The longest single string copied out of the SDK.
+const STRING_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Bounds what one snapshot or event batch copies, as a whole rather than field
+/// by field: how much there is to copy is decided by peers on the network.
 struct Budget(usize);
 impl Budget {
     fn new() -> Self {
-        Self(16 * 1024 * 1024)
+        Self(COPY_LIMIT)
     }
     fn take(&mut self, len: usize) -> Result<()> {
         self.0 = self.0.checked_sub(len).ok_or_else(|| {
-            Error::InvalidFrame("Discovery Server snapshot exceeds 16 MiB copy budget".into())
+            Error::InvalidFrame("Discovery Server data exceeds the 16 MiB copy limit".into())
         })?;
         Ok(())
     }
-    unsafe fn string(&mut self, value: *const c_char) -> Result<Option<String>> {
+    /// Borrow a string the SDK supplied, or `None` for a null pointer.
+    ///
+    /// # Safety
+    ///
+    /// A non-null `value` must be readable up to and including its NUL
+    /// terminator for `'a`.
+    unsafe fn c_str<'a>(&mut self, value: *const c_char) -> Result<Option<&'a CStr>> {
         if value.is_null() {
             return Ok(None);
         }
-        // SDK contract supplies a readable NUL-terminated string. Scan to the
-        // terminator without constructing a slice over bytes beyond it.
-        let limit = self.0.min(4 * 1024 * 1024);
-        for len in 0..limit {
-            if unsafe { *value.add(len) } == 0 {
-                self.take(len + 1)?;
-                let bytes = unsafe { std::slice::from_raw_parts(value.cast::<u8>(), len) };
-                return std::str::from_utf8(bytes)
-                    .map(|s| Some(s.to_owned()))
-                    .map_err(|e| Error::InvalidUtf8(e.to_string()));
-            }
-        }
-        Err(Error::InvalidFrame(
-            "Discovery Server string exceeds bounded copy limit".into(),
-        ))
+        // Find the terminator first, so that no reference ever covers bytes
+        // beyond the limit.
+        let limit = self.0.min(STRING_LIMIT);
+        // SAFETY: every byte before the terminator is readable.
+        let len = (0..limit)
+            .find(|&len| unsafe { *value.add(len) } == 0)
+            .ok_or_else(|| {
+                Error::InvalidFrame("Discovery Server string exceeds the copy limit".into())
+            })?;
+        self.take(len + 1)?;
+        // SAFETY: the terminator was found, and the caller keeps the string
+        // readable for `'a`.
+        Ok(Some(unsafe { CStr::from_ptr(value) }))
     }
+    /// Copy text for display. Bytes that are not UTF-8 become U+FFFD, so
+    /// nothing a peer advertises can make a snapshot or event undecodable.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::c_str`].
+    unsafe fn text(&mut self, value: *const c_char) -> Result<Option<String>> {
+        // SAFETY: forwarded to the caller's obligations.
+        let text = unsafe { self.c_str(value)? };
+        Ok(text.map(|text| text.to_string_lossy().into_owned()))
+    }
+    /// Copy an identifier byte for byte, so it can be passed back unchanged.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::c_str`].
+    unsafe fn id(&mut self, value: *const c_char) -> Result<Option<AdvertisedId>> {
+        // SAFETY: forwarded to the caller's obligations.
+        let id = unsafe { self.c_str(value)? };
+        Ok(id.map(|id| AdvertisedId(id.to_owned())))
+    }
+    /// Borrow an array the SDK supplied.
+    ///
+    /// # Safety
+    ///
+    /// A non-null `value` must point to `count` initialized elements that stay
+    /// readable for `'a`.
     unsafe fn slice<'a, T>(&mut self, value: *const T, count: u32) -> Result<&'a [T]> {
         let count = count as usize;
         if count == 0 {
@@ -447,18 +536,28 @@ impl Budget {
             .filter(|n| *n <= isize::MAX as usize)
             .ok_or_else(|| Error::InvalidFrame("Discovery Server array size overflow".into()))?;
         self.take(bytes)?;
+        // SAFETY: the pointer is non-null and the caller vouches for `count`
+        // elements, whose total size was just checked.
         Ok(unsafe { std::slice::from_raw_parts(value, count) })
     }
 }
 
+/// A native listener and the strings its creation settings point to.
 struct Listener<A: ListenerApi> {
     instance: A::Instance,
     api: &'static A,
     _url: Option<CString>,
     _config: Option<CString>,
     _ndi: NDI,
-    _thread: PhantomData<Rc<()>>,
 }
+
+// SAFETY: the SDK attaches no listener to the thread that created it; its
+// objects may be used and destroyed from any thread as long as calls on one
+// object do not overlap, which the SDK requires of membership queries in
+// particular. A listener has exactly one owner and is not `Sync`, so its calls
+// cannot overlap, and everything else it holds is `Send`.
+unsafe impl<A: ListenerApi> Send for Listener<A> {}
+
 impl<A: ListenerApi> Drop for Listener<A> {
     fn drop(&mut self) {
         // SAFETY: this listener is the instance's only owner.
@@ -480,7 +579,9 @@ impl<A: ListenerApi> Listener<A> {
             )?
         }
         .ok_or_else(|| {
-            Error::InitializationFailed("Discovery Server listener creation failed".into())
+            Error::InitializationFailed(
+                "the SDK created no listener; it needs a reachable Discovery Server".into(),
+            )
         })?;
         Ok(Self {
             instance,
@@ -488,16 +589,22 @@ impl<A: ListenerApi> Listener<A> {
             _url: url,
             _config: config,
             _ndi: ndi.clone(),
-            _thread: PhantomData,
         })
     }
     fn is_connected(&self) -> bool {
         // SAFETY: the listener instance is live for this borrow.
         unsafe { self.api.is_connected(self.instance) }
     }
-    fn server_url(&self) -> Result<Option<String>> {
-        // SAFETY: the SDK returns null or a NUL-terminated string it owns.
-        unsafe { Budget::new().string(self.api.server_url(self.instance)) }
+    fn server_url(&self) -> Option<String> {
+        // SAFETY: the listener instance is live for this borrow.
+        let url = unsafe { self.api.server_url(self.instance) };
+        if url.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null result is a NUL-terminated string the SDK keeps
+        // for the listener's lifetime.
+        let url = unsafe { CStr::from_ptr(url) };
+        Some(url.to_string_lossy().into_owned())
     }
     fn wait_for_changes(&mut self, timeout: Duration) -> Result<bool> {
         let timeout = to_ms_checked(timeout)?;
@@ -511,17 +618,15 @@ impl<A: ListenerApi> Listener<A> {
         // `'a`; the budget validates the pointer and count before use.
         unsafe { budget.slice(self.api.entries(self.instance, &mut count), count) }
     }
-    fn subscription(&mut self, id: &AdvertisedId, subscribe: bool) -> Result<()> {
-        let id = CString::new(id.as_str())?;
+    fn subscription(&mut self, id: &AdvertisedId, subscribe: bool) {
         // SAFETY: the listener instance is live and `id` outlives the call.
         unsafe {
             if subscribe {
-                self.api.subscribe(self.instance, id.as_ptr());
+                self.api.subscribe(self.instance, id.0.as_ptr());
             } else {
-                self.api.unsubscribe(self.instance, id.as_ptr());
+                self.api.unsubscribe(self.instance, id.0.as_ptr());
             }
         };
-        Ok(())
     }
     fn capture_events(&mut self, wait: Wait) -> Result<Vec<ListenerEvent>> {
         struct Batch<'a, A: ListenerApi> {
@@ -530,20 +635,22 @@ impl<A: ListenerApi> Listener<A> {
         }
         impl<A: ListenerApi> Drop for Batch<'_, A> {
             fn drop(&mut self) {
-                if !self.events.is_null() {
-                    // SAFETY: the batch came from this listener and is freed once.
-                    unsafe {
-                        self.listener
-                            .api
-                            .free_events(self.listener.instance, self.events)
-                    };
-                }
+                // SAFETY: the batch came from this listener and is freed once.
+                unsafe {
+                    self.listener
+                        .api
+                        .free_events(self.listener.instance, self.events)
+                };
             }
         }
         let timeout = wait.millis()?;
         let mut count = 0;
         // SAFETY: the listener instance is live for this borrow.
         let events = unsafe { self.api.events(self.instance, &mut count, timeout) };
+        if events.is_null() {
+            // No event arrived within the wait.
+            return Ok(Vec::new());
+        }
         let batch = Batch {
             listener: self,
             events,
@@ -552,57 +659,116 @@ impl<A: ListenerApi> Listener<A> {
         // SAFETY: the batch stays allocated until `batch` is dropped below.
         let raw = unsafe { budget.slice(batch.events, count)? };
         raw.iter()
-            .map(|event| unsafe {
-                Ok(ListenerEvent {
-                    id: budget.string(event.p_uuid)?.map(AdvertisedId),
-                    name: budget.string(event.p_name)?,
-                    value: budget.string(event.p_value)?,
-                })
+            .map(|event| {
+                // SAFETY: the strings belong to the batch, which is still
+                // allocated.
+                unsafe {
+                    Ok(ListenerEvent {
+                        id: budget.id(event.p_uuid)?,
+                        name: budget.text(event.p_name)?,
+                        value: budget.text(event.p_value)?,
+                    })
+                }
             })
             .collect()
     }
 }
 
-/// A thread-affine sender listener. Use owned snapshots across thread boundaries.
+/// Lists the senders registered with a Discovery Server and reports their
+/// events.
+///
+/// # Threading
+///
+/// A listener is [`Send`] but not [`Sync`]: it may be moved to another thread,
+/// and is used by one thread at a time. Snapshots and events are plain owned
+/// data and can be shared freely.
 pub struct SendListener {
     inner: Listener<sys::SenderDiscovery>,
 }
-/// A thread-affine receiver listener. Remote control is always explicit.
+/// Lists the receivers registered with a Discovery Server, reports their
+/// events, and asks them to change source. Remote control is always an
+/// explicit call.
+///
+/// # Threading
+///
+/// A listener is [`Send`] but not [`Sync`]: it may be moved to another thread,
+/// and is used by one thread at a time. Snapshots and events are plain owned
+/// data and can be shared freely.
 pub struct RecvListener {
     inner: Listener<sys::ReceiverDiscovery>,
-    latest: Vec<AdvertisedReceiver>,
+}
+
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<SendListener>();
+    assert_send::<RecvListener>();
+};
+
+impl fmt::Debug for SendListener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SendListener").finish_non_exhaustive()
+    }
+}
+impl fmt::Debug for RecvListener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecvListener").finish_non_exhaustive()
+    }
 }
 
 macro_rules! listener_methods {
     () => {
-        /// Whether the native listener is connected to its configured server.
+        /// Whether the listener is connected to its Discovery Server.
         pub fn is_connected(&self) -> bool {
             self.inner.is_connected()
         }
-        /// Copy the configured server endpoint.
-        pub fn server_url(&self) -> Result<Option<String>> {
+        /// The Discovery Server endpoint the listener uses, when the SDK
+        /// reports one.
+        pub fn server_url(&self) -> Option<String> {
             self.inner.server_url()
         }
-        /// Wait for a membership change; zero polls immediately.
+        /// Wait for the advertised membership to change; a zero timeout polls.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`Error::InvalidConfiguration`] when `timeout` exceeds
+        /// [`crate::MAX_TIMEOUT`].
         pub fn wait_for_changes(&mut self, timeout: Duration) -> Result<bool> {
             self.inner.wait_for_changes(timeout)
         }
-        /// Issue a subscription request. Snapshots report whether it is active.
-        pub fn subscribe(&mut self, id: &AdvertisedId) -> Result<()> {
+        /// Ask to receive the events of the peer `id` names. The next snapshot
+        /// reports whether the subscription is active.
+        pub fn subscribe(&mut self, id: &AdvertisedId) {
             self.inner.subscription(id, true)
         }
-        /// Issue an unsubscribe request; this does not acknowledge remote delivery.
-        pub fn unsubscribe(&mut self, id: &AdvertisedId) -> Result<()> {
+        /// Ask to stop receiving the events of the peer `id` names.
+        pub fn unsubscribe(&mut self, id: &AdvertisedId) {
             self.inner.subscription(id, false)
         }
-        /// Copy an event batch, freeing the native batch even if decoding fails.
+        /// Take the events that arrived since the last call, in arrival order,
+        /// waiting up to `wait` for the first one. An empty batch means none
+        /// arrived in time.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`Error::InvalidConfiguration`] for a finite wait the SDK
+        /// cannot express, and [`Error::InvalidFrame`] when the batch exceeds
+        /// the 16 MiB copy limit. The native batch is released either way.
         pub fn capture_events(&mut self, wait: Wait) -> Result<Vec<ListenerEvent>> {
             self.inner.capture_events(wait)
         }
     };
 }
 impl SendListener {
-    /// Create a listener; all required functions are checked before native creation.
+    /// Connect to the Discovery Server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedCapability`] when the selected runtime
+    /// cannot provide [sender discovery](RuntimeFeature::SenderDiscovery),
+    /// which needs NDI 6.4.0 or later; [`Error::InvalidCString`] when the
+    /// endpoint contains a NUL byte; and [`Error::InitializationFailed`] when
+    /// the SDK creates no listener, as it does when no Discovery Server is
+    /// configured or reachable.
     pub fn new(ndi: &NDI, options: &ListenerOptions) -> Result<Self> {
         Ok(Self {
             inner: Listener::create(ndi, options, None)?,
@@ -621,36 +787,54 @@ impl SendListener {
         })
     }
     listener_methods!();
-    /// Copy the complete current sender snapshot before native storage expires.
+    /// Copy the senders currently advertised.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidFrame`] when the SDK's snapshot is malformed or
+    /// exceeds the 16 MiB copy limit. Text that is not valid UTF-8 is decoded
+    /// lossily and never fails the snapshot.
     pub fn snapshot(&mut self) -> Result<Vec<AdvertisedSender>> {
         let mut budget = Budget::new();
         let raw = self.inner.entries(&mut budget)?;
         raw.iter()
-            .map(|s| unsafe {
-                let groups = budget
-                    .slice(s.p_groups.cast_const(), s.num_groups)?
-                    .iter()
-                    .map(|v| budget.string(*v))
-                    .collect::<Result<_>>()?;
-                Ok(AdvertisedSender {
-                    id: budget.string(s.p_uuid)?.map(AdvertisedId),
-                    name: budget.string(s.p_name)?,
-                    metadata: budget.string(s.p_metadata)?,
-                    address: budget.string(s.p_address)?,
-                    port: s.port,
-                    groups,
-                    subscribed: s.events_subscribed,
-                })
+            .map(|sender| {
+                // SAFETY: the snapshot and everything it points to stay valid
+                // until the next call on this listener, after this copy.
+                unsafe {
+                    let groups = budget
+                        .slice(sender.p_groups.cast_const(), sender.num_groups)?
+                        .iter()
+                        .filter_map(|group| budget.text(*group).transpose())
+                        .collect::<Result<_>>()?;
+                    Ok(AdvertisedSender {
+                        id: budget.id(sender.p_uuid)?,
+                        name: budget.text(sender.p_name)?,
+                        metadata: budget.text(sender.p_metadata)?,
+                        address: budget.text(sender.p_address)?,
+                        port: u16::try_from(sender.port).ok(),
+                        groups,
+                        subscribed: sender.events_subscribed,
+                    })
+                }
             })
             .collect()
     }
 }
 impl RecvListener {
-    /// Create a receiver listener with explicit remote-control methods.
+    /// Connect to the Discovery Server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedCapability`] when the selected runtime
+    /// cannot provide [receiver discovery](RuntimeFeature::ReceiverDiscovery),
+    /// which needs NDI 6.4.0 or later; [`Error::InvalidCString`] when the
+    /// endpoint contains a NUL byte; and [`Error::InitializationFailed`] when
+    /// the SDK creates no listener, as it does when no Discovery Server is
+    /// configured or reachable.
     pub fn new(ndi: &NDI, options: &ListenerOptions) -> Result<Self> {
         Ok(Self {
             inner: Listener::create(ndi, options, None)?,
-            latest: Vec::new(),
         })
     }
     /// Create with retained Advanced configuration.
@@ -663,72 +847,101 @@ impl RecvListener {
         let config = Some(CString::new(config.expose_json())?);
         Ok(Self {
             inner: Listener::create(ndi, options, config)?,
-            latest: Vec::new(),
         })
     }
     listener_methods!();
-    /// Copy the complete receiver snapshot, retaining command capabilities for checks.
+    /// Copy the receivers currently advertised.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidFrame`] when the SDK's snapshot is malformed or
+    /// exceeds the 16 MiB copy limit. Text that is not valid UTF-8 is decoded
+    /// lossily and never fails the snapshot.
     pub fn snapshot(&mut self) -> Result<Vec<AdvertisedReceiver>> {
         let mut budget = Budget::new();
         let raw = self.inner.entries(&mut budget)?;
-        let copied: Result<Vec<_>> = raw
-            .iter()
-            .map(|s| unsafe {
-                let streams = budget
-                    .slice(s.p_streams.cast_const(), s.num_streams)?
-                    .iter()
-                    .copied()
-                    .map(ReceiverStream::from)
-                    .collect();
-                let commands = budget
-                    .slice(s.p_commands.cast_const(), s.num_commands)?
-                    .iter()
-                    .copied()
-                    .map(ReceiverCommand::from)
-                    .collect();
-                Ok(AdvertisedReceiver {
-                    id: budget.string(s.p_uuid)?.map(AdvertisedId),
-                    name: budget.string(s.p_name)?,
-                    input_id: budget.string(s.p_input_uuid)?.map(AdvertisedId),
-                    input_name: budget.string(s.p_input_name)?,
-                    address: budget.string(s.p_address)?,
-                    streams,
-                    commands,
-                    subscribed: s.events_subscribed,
-                })
+        raw.iter()
+            .map(|receiver| {
+                // SAFETY: the snapshot and everything it points to stay valid
+                // until the next call on this listener, after this copy.
+                unsafe {
+                    let streams = budget
+                        .slice(receiver.p_streams.cast_const(), receiver.num_streams)?
+                        .iter()
+                        .copied()
+                        .map(ReceiverStream::from)
+                        .collect();
+                    let commands = budget
+                        .slice(receiver.p_commands.cast_const(), receiver.num_commands)?
+                        .iter()
+                        .copied()
+                        .map(ReceiverCommand::from)
+                        .collect();
+                    Ok(AdvertisedReceiver {
+                        id: budget.id(receiver.p_uuid)?,
+                        name: budget.text(receiver.p_name)?,
+                        input_id: budget.id(receiver.p_input_uuid)?,
+                        input_name: budget.text(receiver.p_input_name)?,
+                        address: budget.text(receiver.p_address)?,
+                        streams,
+                        commands,
+                        subscribed: receiver.events_subscribed,
+                    })
+                }
             })
-            .collect();
-        self.latest = copied?;
-        Ok(self.latest.clone())
+            .collect()
     }
-    /// Request a source change. The latest snapshot must advertise Connect support.
+    /// Ask the receiver `id` names to connect to the NDI source called
+    /// `source`.
+    ///
+    /// The request is sent only to a receiver that currently advertises
+    /// [`ReceiverCommand::Connect`]. Success means the request was sent, not
+    /// that the receiver acted on it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidCString`] when `source` contains a NUL byte,
+    /// [`Error::UnsupportedCapability`] when no advertised receiver has this
+    /// identifier or the receiver does not accept connection requests,
+    /// [`Error::NativeOperationFailed`] when the SDK cannot send the request,
+    /// and the errors of [`Self::snapshot`].
     pub fn request_connect(&mut self, id: &AdvertisedId, source: &str) -> Result<()> {
         self.request(id, Some(source))
     }
-    /// Explicitly request disconnection from the current source.
+    /// Ask the receiver `id` names to disconnect from its current source.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::request_connect`].
     pub fn request_disconnect(&mut self, id: &AdvertisedId) -> Result<()> {
         self.request(id, None)
     }
     fn request(&mut self, id: &AdvertisedId, source: Option<&str>) -> Result<()> {
-        // The SDK requires a receiver advertising this command. Refreshing also
-        // avoids using stale application data as an invented acknowledgement.
-        let snapshots = self.snapshot()?;
-        if !snapshots
+        let source = source.map(CString::new).transpose()?;
+        // The SDK accepts this command only for a receiver that advertises it.
+        // Check a fresh snapshot rather than trust what the caller last saw.
+        let refusal = match self
+            .snapshot()?
             .iter()
-            .any(|s| s.id.as_ref() == Some(id) && s.commands.contains(&ReceiverCommand::Connect))
+            .find(|receiver| receiver.id.as_ref() == Some(id))
         {
+            None => Some("no advertised receiver has this identifier"),
+            Some(receiver) if !receiver.commands.contains(&ReceiverCommand::Connect) => {
+                Some("the receiver does not accept connection requests")
+            }
+            Some(_) => None,
+        };
+        if let Some(reason) = refusal {
             return Err(Error::UnsupportedCapability {
-                capability: "receiver source control".into(),
-                reason: "receiver is absent or does not advertise the Connect command".into(),
+                capability: "remote receiver source control".into(),
+                reason: reason.into(),
             });
         }
-        let id = CString::new(id.as_str())?;
-        let source = source.map(CString::new).transpose()?;
         // SAFETY: the listener instance is live and both strings outlive the call.
         if unsafe {
             self.inner.api.NDIlib_recv_listener_send_connect(
                 self.inner.instance,
-                id.as_ptr(),
+                id.0.as_ptr(),
                 source.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
             )
         } {
@@ -763,18 +976,54 @@ mod tests {
     }
     #[test]
     fn bounded_copy_preserves_null_empty_and_unknown_values() {
-        let empty = CString::new("").unwrap();
-        let invalid = [0xffu8, 0];
         let mut budget = Budget::new();
+        // SAFETY: every non-null pointer is a live NUL-terminated string.
         unsafe {
-            assert_eq!(budget.string(ptr::null()).unwrap(), None);
-            assert_eq!(budget.string(empty.as_ptr()).unwrap(), Some(String::new()));
-            assert!(budget.string(invalid.as_ptr().cast()).is_err());
+            assert_eq!(budget.text(ptr::null()).unwrap(), None);
+            assert_eq!(budget.text(c"".as_ptr()).unwrap(), Some(String::new()));
+            assert_eq!(budget.id(ptr::null()).unwrap(), None);
             assert!(budget.slice::<u32>(ptr::null(), 1).is_err());
             assert!(budget.slice::<u32>(ptr::null(), 0).unwrap().is_empty());
         }
         assert_eq!(ReceiverStream::from(3), ReceiverStream::Audio);
         assert_eq!(ReceiverStream::from(999), ReceiverStream::Unknown(999));
         assert!(ListenerOptions::default().server("a,b").is_err());
+    }
+    #[test]
+    fn text_is_decoded_lossily_and_identifiers_keep_their_bytes() {
+        let malformed = c"caf\xe9 \xff";
+        let mut budget = Budget::new();
+        // SAFETY: the pointer is a live NUL-terminated string.
+        let (text, id) = unsafe {
+            (
+                budget.text(malformed.as_ptr()).unwrap().unwrap(),
+                budget.id(malformed.as_ptr()).unwrap().unwrap(),
+            )
+        };
+        assert_eq!(text, "caf\u{fffd} \u{fffd}");
+        assert_eq!(id.as_bytes(), malformed.to_bytes());
+        assert_eq!(id.to_string(), text);
+        assert_eq!(id, AdvertisedId::new(malformed.to_bytes()).unwrap());
+        assert_ne!(id, AdvertisedId::new(text).unwrap());
+        assert!(AdvertisedId::new("a\0b").is_err());
+    }
+    #[test]
+    fn copies_are_charged_to_one_budget() {
+        let mut budget = Budget(8);
+        // SAFETY: the pointer is a live NUL-terminated string.
+        unsafe {
+            assert_eq!(
+                budget.text(c"abc".as_ptr()).unwrap().as_deref(),
+                Some("abc")
+            );
+            assert_eq!(
+                budget.text(c"abc".as_ptr()).unwrap().as_deref(),
+                Some("abc")
+            );
+            assert!(matches!(
+                budget.text(c"a".as_ptr()),
+                Err(Error::InvalidFrame(_))
+            ));
+        }
     }
 }

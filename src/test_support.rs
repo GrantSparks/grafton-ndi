@@ -26,10 +26,19 @@ pub enum Requirement {
     Advanced,
     /// The NDI File library. Listed as `file`.
     File,
+    /// The vendor's Discovery Server program, installed with the SDK the
+    /// selected runtime belongs to, and a runtime whose advertisers and
+    /// listeners can use it. Listed as `discovery-server`.
+    DiscoveryServer,
 }
 
 impl Requirement {
-    const ALL: [Self; 3] = [Self::Runtime, Self::Advanced, Self::File];
+    const ALL: [Self; 4] = [
+        Self::Runtime,
+        Self::Advanced,
+        Self::File,
+        Self::DiscoveryServer,
+    ];
 
     /// Its spelling in `GRAFTON_NDI_REQUIRE_RUNTIME`.
     fn token(self) -> &'static str {
@@ -37,6 +46,7 @@ impl Requirement {
             Self::Runtime => "1",
             Self::Advanced => "advanced",
             Self::File => "file",
+            Self::DiscoveryServer => "discovery-server",
         }
     }
 
@@ -46,6 +56,7 @@ impl Requirement {
             Self::Runtime => "an NDI runtime",
             Self::Advanced => "the Advanced SDK",
             Self::File => "the NDI File library",
+            Self::DiscoveryServer => "the SDK's Discovery Server",
         }
     }
 
@@ -66,7 +77,10 @@ impl Requirement {
                 .into_iter()
                 .find(|requirement| requirement.token() == entry)
                 .unwrap_or_else(|| {
-                    panic!("{REQUIRE_RUNTIME} lists {entry:?}; expected 1, advanced or file")
+                    panic!(
+                        "{REQUIRE_RUNTIME} lists {entry:?}; expected 1, advanced, file or \
+                         discovery-server"
+                    )
                 });
             promised |= named == self || self == Self::Runtime;
         }
