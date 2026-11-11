@@ -243,27 +243,77 @@ fn a_recorder_that_never_started_is_destroyed_without_a_stop() {
 }
 
 #[test]
-fn storage_given_to_the_sdk_is_released_once_a_later_session_has_started() {
+fn a_target_in_a_directory_that_does_not_exist_is_refused_before_the_sdk_sees_it() {
     let device = mock::Recorder::new(Closing::AtStop);
-    let mut recorder = recording_on(&device);
-    for round in 0..4 {
-        recorder.rollover(target("rolled")).unwrap();
+    device.install();
+    let mut recorder = mock::recorder_api()
+        .create_recorder(RecorderOptions::new(
+            SourceSpec::new("mock source").unwrap(),
+        ))
+        .unwrap();
+    let missing = || {
+        RecordingTarget::new(std::env::temp_dir().join("grafton-ndi-no-such-directory/take"))
+            .unwrap()
+    };
+    let not_found = |result: FileResult<()>| match result {
+        Err(FileError::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+        other => panic!("expected the directory to be reported missing: {other:?}"),
+    };
+
+    not_found(
         recorder
-            .set_source(SourceSpec::new(format!("source {round}")).unwrap())
-            .unwrap();
-        assert!(matches!(
-            recorder.finish(Duration::from_secs(1)).unwrap(),
-            FinishStatus::Closed(_)
-        ));
-        recorder
-            .start(target("next"), RecordingTimecode::Preserve)
-            .unwrap();
-        assert_eq!(recorder.retained_inputs(), (1, 1), "round {round}");
-    }
-    assert_eq!(
-        recorder.last_accepted_source().unwrap().name(),
-        Some("source 3")
+            .start(missing(), RecordingTimecode::Preserve)
+            .map(drop),
     );
+    assert_eq!(recorder.state(), RecorderState::Idle);
+
+    recorder
+        .start(target("first"), RecordingTimecode::Preserve)
+        .unwrap();
+    // The SDK would accept this rollover and then end the session.
+    not_found(recorder.rollover(missing()));
+    assert_eq!(device.rollovers.load(Ordering::Acquire), 0);
+    assert_eq!(recorder.state(), RecorderState::Recording);
+    recorder.rollover(target("second")).unwrap();
+    assert_eq!(device.rollovers.load(Ordering::Acquire), 1);
+    assert!(matches!(
+        recorder.finish(Duration::from_secs(1)).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+}
+
+#[test]
+fn a_file_closed_before_its_first_frame_is_reported_as_empty() {
+    let device = mock::Recorder::new(Closing::Never);
+    let mut recorder = recording_on(&device);
+    // The first file gets a frame; the one rolled over to never does.
+    device.push(mock::FIRST_FRAME, TAKE);
+    device.push(ROLLOVER, "second.mkv");
+    device.push(FILE_CLOSED, TAKE);
+    take_events(&mut recorder);
+    assert_eq!(recorder.report().empty_files(), 0);
+    recorder.request_stop();
+    device.push(FILE_CLOSED, "second.mkv");
+    let FinishStatus::Closed(report) = recorder.wait_finished(Duration::from_secs(1)).unwrap()
+    else {
+        panic!("both files were reported closed");
+    };
+    assert_eq!(report.closed_files(), 2);
+    assert_eq!(report.empty_files(), 1);
+}
+
+#[test]
+fn a_metadata_only_recording_reports_no_empty_files() {
+    // The SDK reports no first frame for metadata, so its absence says nothing.
+    let device = mock::Recorder::new(Closing::AtStop);
+    let options = RecorderOptions::new(SourceSpec::new("mock source").unwrap())
+        .with_tracks(TrackSelection::METADATA);
+    let mut recorder = recording_with(&device, options);
+    let FinishStatus::Closed(report) = recorder.finish(Duration::from_secs(1)).unwrap() else {
+        panic!("the file was reported closed");
+    };
+    assert_eq!(report.closed_files(), 1);
+    assert_eq!(report.empty_files(), 0);
 }
 
 thread_local! {
@@ -333,4 +383,110 @@ fn waits_are_rounded_up_and_the_largest_is_refused() {
     );
     assert!(timeout_ms(Duration::from_millis(u32::MAX.into())).is_err());
     assert!(timeout_ms(Duration::MAX).is_err());
+}
+
+/// Take every queued event, so the session's state follows what the device did.
+fn take_events(recorder: &mut FileRecorder) {
+    while recorder.poll_event(Duration::ZERO).unwrap().is_some() {}
+}
+
+#[test]
+fn a_session_the_sdk_ended_itself_can_be_followed_by_another() {
+    let device = mock::Recorder::new(Closing::AtStop);
+    let mut recorder = recording_on(&device);
+    device.end_session_itself();
+    take_events(&mut recorder);
+    assert_eq!(recorder.state(), RecorderState::Closed);
+    assert_eq!(recorder.request_stop(), StopRequest::AlreadyClosed);
+    // The library starts again only once it has been told to stop, although
+    // the session it would stop is already over.
+    assert_eq!(
+        recorder
+            .start(target("second"), RecordingTimecode::Preserve)
+            .unwrap(),
+        2
+    );
+    assert_eq!(device.stops.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn finishing_a_session_the_sdk_is_ending_itself_still_tells_it_to_stop() {
+    let device = mock::Recorder::new(Closing::AtStop);
+    let mut recorder = recording_on(&device);
+    device.end_session_itself();
+    // Up to the error event: the session is stopping, by the library's choice.
+    for _ in 0..3 {
+        recorder.poll_event(Duration::ZERO).unwrap().unwrap();
+    }
+    assert_eq!(recorder.state(), RecorderState::Stopping);
+    assert_eq!(recorder.request_stop(), StopRequest::AlreadyStopping);
+    assert_eq!(device.stops.load(Ordering::Acquire), 1);
+    assert!(matches!(
+        recorder.finish(Duration::from_secs(1)).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+    recorder
+        .start(target("second"), RecordingTimecode::Preserve)
+        .unwrap();
+    assert_eq!(device.stops.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn a_refused_start_is_not_counted_in_any_session() {
+    let device = mock::Recorder::new(Closing::AtStop);
+    device.install();
+    let mut recorder = mock::recorder_api()
+        .create_recorder(RecorderOptions::new(
+            SourceSpec::new("mock source").unwrap(),
+        ))
+        .unwrap();
+    let refuse_start = |recorder: &mut FileRecorder| {
+        device.fail_next_start.store(true, Ordering::Release);
+        assert!(matches!(
+            recorder.start(target("unopenable"), RecordingTimecode::Preserve),
+            Err(FileError::Rejected(_))
+        ));
+        // The library's reason is still there to be read.
+        let event = recorder.poll_event(Duration::ZERO).unwrap().unwrap();
+        assert_eq!(event.kind(), RecorderEventKind::OpenFailed);
+    };
+
+    // Before any session there is no report to count it in.
+    refuse_start(&mut recorder);
+    assert_eq!(recorder.state(), RecorderState::Idle);
+    assert_eq!(recorder.report().error_events(), 0);
+
+    // After one, the finished session's report stays as it was.
+    recorder
+        .start(target("first"), RecordingTimecode::Preserve)
+        .unwrap();
+    assert!(matches!(
+        recorder.finish(Duration::from_secs(1)).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+    refuse_start(&mut recorder);
+    let report = recorder.report();
+    assert_eq!(report.session(), 1);
+    assert_eq!(report.error_events(), 0);
+    assert!(report.closure_confirmed());
+    assert_eq!(recorder.state(), RecorderState::Closed);
+}
+
+#[test]
+fn the_source_can_be_changed_after_a_session_that_ended_unconfirmed() {
+    let device = mock::Recorder::new(Closing::AtStop);
+    let mut recorder = recording_on(&device);
+    device.dropped_events.store(1, Ordering::Release);
+    assert!(matches!(
+        recorder.finish(Duration::from_secs(1)).unwrap(),
+        FinishStatus::Indeterminate(_)
+    ));
+    // The session is over, as it is for `start`.
+    recorder
+        .set_source(SourceSpec::new("another source").unwrap())
+        .unwrap();
+    assert_eq!(
+        recorder.last_accepted_source().unwrap().name(),
+        Some("another source")
+    );
 }

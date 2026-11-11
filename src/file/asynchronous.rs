@@ -17,8 +17,8 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender},
         Arc, Mutex, MutexGuard, Weak,
     },
     task::{Context, Poll, Waker},
@@ -58,7 +58,8 @@ impl Default for AsyncFileOptions {
 
 impl AsyncFileOptions {
     /// Set how many commands may wait for the owner thread, from 1 through
-    /// 4096. A command submitted to a full queue fails at once.
+    /// 4096. A command submitted to a full queue fails at once, except a
+    /// request to stop, which is always accepted so that it cannot be lost.
     ///
     /// # Errors
     ///
@@ -507,7 +508,11 @@ type Job<H> = Box<dyn FnOnce(&mut H) + Send + 'static>;
 
 /// The handle side of an owner thread, shared by every clone of an async handle.
 struct Worker<H: Owner> {
-    sender: SyncSender<Job<H>>,
+    sender: Sender<Job<H>>,
+    /// How many ordinary commands are waiting, and how many may. Requests to
+    /// stop are not counted: one must never be refused for want of room.
+    waiting: Arc<AtomicUsize>,
+    capacity: usize,
     control: Arc<Control>,
     events: Arc<EventQueue<H::Event>>,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -541,27 +546,31 @@ impl<H: Owner> Worker<H> {
         if self.control.shutdown.load(Ordering::Acquire) {
             return FileOperation::failed(FileError::InvalidState("File owner is closing"));
         }
+        let waiting = (!persistent).then(|| Arc::clone(&self.waiting));
+        if let Some(waiting) = &waiting {
+            if waiting.fetch_add(1, Ordering::AcqRel) >= self.capacity {
+                waiting.fetch_sub(1, Ordering::AcqRel);
+                return FileOperation::failed(FileError::InvalidState(
+                    "File command queue is full",
+                ));
+            }
+        }
         let (reply, future) = operation();
         let context = OperationContext {
             cancelled: Arc::clone(&reply.cancelled),
             control: Arc::clone(&self.control),
         };
         let job: Job<H> = Box::new(move |owner| {
+            if let Some(waiting) = waiting {
+                waiting.fetch_sub(1, Ordering::AcqRel);
+            }
             if !persistent && context.cancelled.load(Ordering::Acquire) {
                 return;
             }
             reply.complete(work(owner, &context));
         });
-        match self.sender.try_send(job) {
-            Ok(()) => {}
-            Err(TrySendError::Full(job)) => {
-                future.immediate_failure(FileError::InvalidState("File command queue is full"));
-                drop(job);
-            }
-            Err(TrySendError::Disconnected(job)) => {
-                future.immediate_failure(FileError::InvalidState("File owner has stopped"));
-                drop(job);
-            }
+        if self.sender.send(job).is_err() {
+            future.immediate_failure(FileError::InvalidState("File owner has stopped"));
         }
         future
     }
@@ -582,11 +591,13 @@ fn spawn_owner<H: Owner, T: Send + 'static>(
     options: AsyncFileOptions,
     wrap: impl FnOnce(Arc<Worker<H>>) -> T + Send + 'static,
 ) -> FileOperation<T> {
-    let (sender, receiver) = mpsc::sync_channel(options.command_capacity);
+    let (sender, receiver) = mpsc::channel();
     let control = Arc::new(Control::new());
     let events = Arc::new(EventQueue::new(options.event_capacity));
     let worker = Arc::new(Worker {
         sender,
+        waiting: Arc::new(AtomicUsize::new(0)),
+        capacity: options.command_capacity,
         control: Arc::clone(&control),
         events: Arc::clone(&events),
         thread: Mutex::new(None),
@@ -1189,6 +1200,16 @@ mod tests {
     }
 
     fn mock_recorder(closing: Closing) -> (Arc<mock::Recorder>, AsyncFileRecorder) {
+        mock_recorder_with(
+            closing,
+            AsyncFileOptions::default().with_event_capacity(1).unwrap(),
+        )
+    }
+
+    fn mock_recorder_with(
+        closing: Closing,
+        options: AsyncFileOptions,
+    ) -> (Arc<mock::Recorder>, AsyncFileRecorder) {
         let device = mock::Recorder::new(closing);
         let installed = Arc::clone(&device);
         let recorder = block_on(spawn_owner(
@@ -1198,7 +1219,7 @@ mod tests {
                 mock::recorder_api()
                     .create_recorder(RecorderOptions::new(SourceSpec::new("mock source")?))
             },
-            AsyncFileOptions::default().with_event_capacity(1).unwrap(),
+            options,
             |worker| AsyncFileRecorder { worker },
         ))
         .unwrap();
@@ -1247,6 +1268,63 @@ mod tests {
         assert_eq!(device.stops.load(Ordering::Acquire), 1);
         assert_eq!(device.destroys.load(Ordering::Acquire), 1);
         assert!(device.closed_before_destroy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_session_the_sdk_ended_itself_can_be_followed_by_another() {
+        let (device, recorder) = mock_recorder(Closing::AtStop);
+        device.end_session_itself();
+        // The owner thread takes events continuously, so the session closes
+        // without anyone asking it to stop.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while block_on(recorder.state()).unwrap() != RecorderState::Closed {
+            assert!(Instant::now() < deadline, "the session never closed");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let session = block_on(recorder.start(
+            RecordingTarget::new(std::env::temp_dir().join("mock-file-not-created")).unwrap(),
+            RecordingTimecode::Preserve,
+        ))
+        .unwrap();
+        assert_eq!(session, 2);
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        block_on(recorder.close()).unwrap();
+    }
+
+    #[test]
+    fn a_stop_is_carried_out_even_when_the_command_queue_is_full() {
+        let options = AsyncFileOptions::default()
+            .with_command_capacity(1)
+            .unwrap();
+        let (device, recorder) = mock_recorder_with(Closing::AtStop, options);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker = recorder.worker.call(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(())
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        // The one queue slot is taken, so an ordinary command is refused.
+        let queued = recorder.is_recording();
+        assert!(matches!(
+            block_on(recorder.is_recording()),
+            Err(FileError::InvalidState("File command queue is full"))
+        ));
+        // A stop is not: it must not be lost, even if nobody waits for it.
+        drop(recorder.request_stop());
+        let stopping = recorder.request_stop();
+        release_tx.send(()).unwrap();
+        block_on(blocker).unwrap();
+        assert!(block_on(queued).unwrap());
+        // The first request did the stopping; this one found it done, and
+        // possibly the file already reported closed.
+        assert!(matches!(
+            block_on(stopping).unwrap(),
+            StopRequest::AlreadyStopping | StopRequest::AlreadyClosed
+        ));
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        block_on(recorder.close()).unwrap();
     }
 
     #[test]

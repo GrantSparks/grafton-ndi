@@ -40,14 +40,29 @@ fn file_api() -> Option<(crate::NDI, FileApi)> {
 }
 
 /// A directory for one test's recordings, removed when the test ends.
+///
+/// Its name is taken exclusively, so runs that share a temporary directory,
+/// even with the same process identifier in different namespaces, cannot use
+/// or remove each other's recordings.
 struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(test: &str) -> Self {
-        let directory =
-            std::env::temp_dir().join(format!("grafton-ndi-file-{}-{test}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
-        Self(directory)
+        let mut attempt = 0u32;
+        loop {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.subsec_nanos());
+            let directory = std::env::temp_dir().join(format!(
+                "grafton-ndi-file-{test}-{}-{nanos:09}-{attempt}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&directory) {
+                Ok(()) => return Self(directory),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => attempt += 1,
+                Err(error) => panic!("cannot create {}: {error}", directory.display()),
+            }
+        }
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -65,6 +80,7 @@ impl Drop for Scratch {
 struct LiveSource {
     spec: SourceSpec,
     running: Arc<AtomicBool>,
+    larger_frames: Arc<AtomicBool>,
     producer: Option<JoinHandle<()>>,
 }
 
@@ -76,22 +92,38 @@ impl LiveSource {
         let spec = Self::loopback(ndi, &sender);
         let running = Arc::new(AtomicBool::new(true));
         let keep_running = Arc::clone(&running);
+        let larger_frames = Arc::new(AtomicBool::new(false));
+        let send_larger = Arc::clone(&larger_frames);
         let producer = thread::spawn(move || {
-            let frame = crate::VideoFrame::builder()
-                .resolution(320, 180)
-                .pixel_format(crate::PixelFormat::BGRA)
-                .build()
-                .unwrap();
+            let frame = |width, height| {
+                crate::VideoFrame::builder()
+                    .resolution(width, height)
+                    .pixel_format(crate::PixelFormat::BGRA)
+                    .build()
+                    .unwrap()
+            };
+            let (small, large) = (frame(320, 180), frame(640, 360));
             while keep_running.load(Ordering::Acquire) {
-                sender.send_video(&frame);
+                sender.send_video(if send_larger.load(Ordering::Acquire) {
+                    &large
+                } else {
+                    &small
+                });
                 thread::sleep(Duration::from_millis(10));
             }
         });
         Self {
             spec,
             running,
+            larger_frames,
             producer: Some(producer),
         }
+    }
+
+    /// Switch the source to another resolution, which a recorder sees as a
+    /// format change.
+    fn change_format(&self) {
+        self.larger_frames.store(true, Ordering::Release);
     }
 
     /// The sender's endpoint on the loopback interface, so that recording does
@@ -234,6 +266,7 @@ fn a_recording_is_finalized_and_probes_with_its_video_track() {
     };
     assert!(report.closure_confirmed());
     assert_eq!(report.closed_files(), 1);
+    assert_eq!(report.empty_files(), 0);
     assert_eq!(report.error_events(), 0);
     assert_eq!(recorder.state(), RecorderState::Closed);
     assert!(!recorder.is_recording());
@@ -348,6 +381,13 @@ fn injected_metadata_is_recorded_on_the_metadata_track() {
     assert_eq!(api.probe(&file).unwrap().metadata_track_count(), 1);
 }
 
+/// What a drop leaves behind with the real library.
+///
+/// This cannot show that the drop waited for the file to be closed: the 6.4
+/// library finalizes the file inside the stop call, so the file is final even
+/// when the recorder is destroyed straight after it, as `abandon` does. The
+/// wait is tested against the stand-in library, whose close can come late, in
+/// `dropping_a_recording_recorder_waits_for_its_file_to_be_closed`.
 #[test]
 fn dropping_a_recorder_leaves_a_finalized_file() {
     let Some((ndi, api)) = file_api() else {
@@ -575,5 +615,341 @@ fn the_file_library_stays_selected_after_its_handles_are_dropped() {
             Err(FileError::Core(crate::Error::RuntimeConflict(_)))
         ));
         FileApi::open(&ndi, &FileRuntimeOptions::default().library_path(selected)).unwrap();
+    }
+}
+
+/// Options under which a format change ends the session instead of rolling over.
+fn stop_on_format_change(source: &LiveSource) -> RecorderOptions {
+    RecorderOptions::new(source.spec.clone())
+        .with_proxy(false)
+        .with_tracks(TrackSelection::VIDEO)
+        .with_format_change_rollover(false)
+}
+
+#[test]
+fn a_session_the_library_ended_on_a_format_change_can_be_followed_by_another() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("format-stop");
+    let source = LiveSource::start(&ndi, "format-stop");
+    let mut recorder = api.create_recorder(stop_on_format_change(&source)).unwrap();
+    recorder
+        .start(
+            RecordingTarget::new(scratch.path("first")).unwrap(),
+            RecordingTimecode::Preserve,
+        )
+        .unwrap();
+    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+
+    source.change_format();
+    // The library closes the file and ends the session without being asked.
+    let deadline = Instant::now() + PATIENCE;
+    while recorder.state() != RecorderState::Closed {
+        assert!(Instant::now() < deadline, "{:?}", recorder.state());
+        recorder.poll_event(Duration::from_millis(50)).unwrap();
+    }
+    let report = recorder.report();
+    assert!(report.closure_confirmed());
+    assert_eq!(report.closed_files(), 1);
+    assert_eq!(report.error_events(), 1);
+    assert_eq!(recorder.request_stop(), StopRequest::AlreadyClosed);
+
+    let session = recorder
+        .start(
+            RecordingTarget::new(scratch.path("second")).unwrap(),
+            RecordingTimecode::Preserve,
+        )
+        .unwrap();
+    assert_eq!(session, 2);
+    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+    assert!(matches!(
+        recorder.finish(PATIENCE).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+}
+
+#[test]
+fn an_async_session_the_library_ended_on_a_format_change_can_be_followed_by_another() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("async-format-stop");
+    let source = LiveSource::start(&ndi, "async-format-stop");
+    let recorder = block_on(AsyncFileRecorder::create(
+        api.clone(),
+        stop_on_format_change(&source),
+    ))
+    .unwrap();
+    block_on(recorder.start(
+        RecordingTarget::new(scratch.path("first")).unwrap(),
+        RecordingTimecode::Preserve,
+    ))
+    .unwrap();
+    let state_becomes = |wanted: RecorderState| {
+        let deadline = Instant::now() + PATIENCE;
+        while block_on(recorder.state()).unwrap() != wanted {
+            assert!(
+                Instant::now() < deadline,
+                "the recorder never became {wanted:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    // Frames are being written once the library reports counters for them.
+    let deadline = Instant::now() + PATIENCE;
+    while block_on(recorder.stats())
+        .unwrap()
+        .is_none_or(|stats| stats.video_frames() == 0)
+    {
+        assert!(Instant::now() < deadline, "nothing was recorded");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    source.change_format();
+    state_becomes(RecorderState::Closed);
+    let session = block_on(recorder.start(
+        RecordingTarget::new(scratch.path("second")).unwrap(),
+        RecordingTimecode::Preserve,
+    ))
+    .unwrap();
+    assert_eq!(session, 2);
+    state_becomes(RecorderState::Recording);
+    assert!(matches!(
+        block_on(recorder.finish(PATIENCE)).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+    block_on(recorder.close()).unwrap();
+}
+
+#[test]
+fn a_rollover_into_a_missing_directory_is_refused_and_the_session_goes_on() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("missing-directory");
+    let source = LiveSource::start(&ndi, "missing-directory");
+    let missing = || RecordingTarget::new(scratch.path("absent/take")).unwrap();
+    let not_found = |result: FileResult<()>| match result {
+        Err(FileError::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+        other => panic!("expected the directory to be reported missing: {other:?}"),
+    };
+    let mut recorder = api.create_recorder(exact_video(&source)).unwrap();
+    not_found(
+        recorder
+            .start(missing(), RecordingTimecode::Preserve)
+            .map(drop),
+    );
+    recorder
+        .start(
+            RecordingTarget::new(scratch.path("take.mkv")).unwrap(),
+            RecordingTimecode::Preserve,
+        )
+        .unwrap();
+    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+
+    // Passed on, the library would accept this and then end the session.
+    not_found(recorder.rollover(missing()));
+    assert_eq!(recorder.state(), RecorderState::Recording);
+    assert!(recorder.is_recording());
+    thread::sleep(Duration::from_millis(200));
+    let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
+        panic!("the recording was not confirmed closed");
+    };
+    assert_eq!(report.closed_files(), 1);
+    assert_eq!(report.error_events(), 0);
+}
+
+#[test]
+fn a_file_that_received_nothing_is_reported_as_empty() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("empty-file");
+    let source = LiveSource::start(&ndi, "empty-file");
+    let options = RecorderOptions::new(source.spec.clone())
+        .with_proxy(false)
+        .with_tracks(TrackSelection::VIDEO);
+    let mut recorder = api.create_recorder(options).unwrap();
+    recorder
+        .start(
+            RecordingTarget::new(scratch.path("take")).unwrap(),
+            RecordingTimecode::Preserve,
+        )
+        .unwrap();
+    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+    // Nothing answers at this address, so the file rolled over to stays empty.
+    recorder
+        .set_source(SourceSpec::from_url("127.0.0.1:9").unwrap())
+        .unwrap();
+    await_event(&mut recorder, RecorderEventKind::Rollover);
+
+    // The library reports both files closed all the same.
+    let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
+        panic!("the recording was not confirmed closed");
+    };
+    assert_eq!(report.closed_files(), 2);
+    assert_eq!(report.empty_files(), 1);
+    let last = PathBuf::from(report.last_closed_path().unwrap().to_str().unwrap());
+    assert_eq!(std::fs::metadata(last).unwrap().len(), 0);
+}
+
+/// A NUL-terminated copy of `text` that a test can overwrite.
+fn c_buffer(text: &str) -> Vec<u8> {
+    std::ffi::CString::new(text).unwrap().into_bytes_with_nul()
+}
+
+/// Overwrite a string in place, keeping its length and terminator, the way
+/// freed and reused memory would look to anything still pointing at it.
+fn overwrite(buffer: &mut [u8]) {
+    let end = buffer.len() - 1;
+    buffer[..end].fill(b'Z');
+}
+
+#[test]
+fn the_library_copies_every_string_a_recorder_gives_it() {
+    use crate::sys::bindings::*;
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("recorder-strings");
+    let source = LiveSource::start(&ndi, "recorder-strings");
+    let recording = api.recording().unwrap();
+    let address = source.spec.url().unwrap().to_owned();
+    let file = |name: &str| scratch.path(name).to_str().unwrap().to_owned();
+
+    let mut url = c_buffer(&address);
+    let mut pattern = c_buffer("{prefix}_{index:03}.mkv");
+    let settings = NDIlib_file_recorder_create_t {
+        source_to_connect_to: NDIlib_file_recorder_source_t {
+            p_ndi_name: std::ptr::null(),
+            p_url_address: url.as_ptr().cast(),
+        },
+        track_flags: TrackSelection::VIDEO.bits(),
+        record_float_audio_planar_32f: false,
+        disable_auto_rollover_on_format_change: false,
+        p_output_filename_pattern: pattern.as_ptr().cast(),
+        disable_proxy_track: true,
+        rollover_max_file_size_bytes: 0,
+    };
+    // SAFETY: the settings and their strings are valid for the call.
+    let handle = unsafe { recording.NDIlib_file_recorder_create(&settings) };
+    assert!(!handle.is_null());
+    overwrite(&mut url);
+    overwrite(&mut pattern);
+
+    // The next event of `kind`, with the path it names.
+    let next = |kind: NDIlib_file_recorder_event_type_e| {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            assert!(Instant::now() < deadline, "no event of type {kind} arrived");
+            let mut event = OutParam::<NDIlib_file_recorder_event_t>::new();
+            // SAFETY: the recorder is live and `event` is storage for one event.
+            let got = unsafe {
+                recording.NDIlib_file_recorder_capture_event(handle, event.as_mut_ptr(), 50)
+            };
+            if got == kind {
+                let event = event.read().unwrap();
+                return EventText::from_buffer(&event.p_path)
+                    .to_string_lossy()
+                    .into_owned();
+            }
+        }
+    };
+    let started = NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_started;
+    let rolled = NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_rollover;
+    let first_frame = NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_first_frame;
+    let closed = NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_file_closed;
+
+    let mut prefix = c_buffer(&file("first"));
+    // SAFETY: the recorder is live and `prefix` is valid for the call.
+    assert!(unsafe { recording.NDIlib_file_recorder_start(handle, prefix.as_ptr().cast()) });
+    overwrite(&mut prefix);
+    // The pattern and the prefix made the name, and the address reached the
+    // source, although all three were overwritten as soon as their calls returned.
+    assert_eq!(next(started), file("first_001.mkv"));
+    assert_eq!(next(first_frame), file("first_001.mkv"));
+
+    // A rollover uses its prefix after the call has returned, at the cut.
+    let mut prefix = c_buffer(&file("second"));
+    // SAFETY: the recorder is live and `prefix` is valid for the call.
+    assert!(unsafe { recording.NDIlib_file_recorder_rollover(handle, prefix.as_ptr().cast()) });
+    overwrite(&mut prefix);
+    assert_eq!(next(rolled), file("second_001.mkv"));
+    assert_eq!(next(first_frame), file("second_001.mkv"));
+
+    let mut url = c_buffer(&address);
+    let descriptor = NDIlib_file_recorder_source_t {
+        p_ndi_name: std::ptr::null(),
+        p_url_address: url.as_ptr().cast(),
+    };
+    // SAFETY: the recorder is live; the descriptor and its string are valid
+    // for the call.
+    assert!(unsafe { recording.NDIlib_file_recorder_set_source(handle, &descriptor) });
+    overwrite(&mut url);
+    assert_eq!(next(rolled), file("second_002.mkv"));
+    assert_eq!(next(first_frame), file("second_002.mkv"));
+
+    // SAFETY: the recorder is live, and is destroyed once after its last use.
+    unsafe {
+        recording.NDIlib_file_recorder_stop(handle);
+        assert_eq!(next(closed), file("second_002.mkv"));
+        recording.NDIlib_file_recorder_destroy(handle);
+    }
+}
+
+#[test]
+fn the_library_copies_every_string_a_player_gives_it() {
+    use crate::sys::bindings::*;
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("player-strings");
+    let clip = scratch.path("clip.mkv");
+    record_clip(&api, &LiveSource::start(&ndi, "player-strings"), &clip);
+    let playback = api.playback().unwrap();
+
+    let advertised = format!("grafton-file-strings-{}", std::process::id());
+    let mut name = c_buffer(&advertised);
+    let settings = NDIlib_file_player_create_t {
+        p_ndi_send_name: name.as_ptr().cast(),
+        p_groups: std::ptr::null(),
+    };
+    // SAFETY: the settings and their string are valid for the call.
+    let handle = unsafe { playback.NDIlib_file_player_create(&settings) };
+    assert!(!handle.is_null());
+    overwrite(&mut name);
+    // SAFETY: the player is live, and the descriptor it returns stays valid
+    // until the player is destroyed.
+    let source = unsafe {
+        crate::Source::try_from_raw(playback.NDIlib_file_player_get_advertised_source(handle))
+    }
+    .unwrap();
+    assert!(source.name.contains(&advertised), "{source:?}");
+
+    let mut path = c_buffer(clip.to_str().unwrap());
+    // SAFETY: the player is live and `path` is valid for the call.
+    assert!(unsafe { playback.NDIlib_file_player_start(handle, path.as_ptr().cast()) });
+    overwrite(&mut path);
+    let opened = NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_file_opened;
+    let deadline = Instant::now() + PATIENCE;
+    let reported = loop {
+        assert!(Instant::now() < deadline, "the file was not reported open");
+        let mut event = OutParam::<NDIlib_file_player_event_t>::new();
+        // SAFETY: the player is live and `event` is storage for one event.
+        let got =
+            unsafe { playback.NDIlib_file_player_capture_event(handle, event.as_mut_ptr(), 50) };
+        if got == opened {
+            let event = event.read().unwrap();
+            break EventText::from_buffer(&event.p_path)
+                .to_string_lossy()
+                .into_owned();
+        }
+    };
+    assert_eq!(reported, clip.to_str().unwrap());
+    // SAFETY: the player is live, and is destroyed once after its last use.
+    unsafe {
+        playback.NDIlib_file_player_stop(handle);
+        playback.NDIlib_file_player_destroy(handle);
     }
 }

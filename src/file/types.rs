@@ -428,6 +428,49 @@ impl RecordingTarget {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Confirm that the directory the recording would be created in exists
+    /// and can be written to.
+    ///
+    /// The SDK accepts a rollover to a path it cannot open and then ends the
+    /// whole session, so the mistake is caught here, while the session can
+    /// still go on. Nothing is created.
+    pub(super) fn check_directory(&self) -> FileResult<()> {
+        let refuse = |kind, problem: &str, directory: &Path| {
+            FileError::Io(std::io::Error::new(
+                kind,
+                format!("the recording directory {} {problem}", directory.display()),
+            ))
+        };
+        let directory = self.path.parent().unwrap_or(&self.path);
+        match std::fs::metadata(directory) {
+            Err(error) => return Err(refuse(error.kind(), "cannot be used", directory)),
+            Ok(found) if !found.is_dir() => {
+                return Err(refuse(
+                    std::io::ErrorKind::NotADirectory,
+                    "is not a directory",
+                    directory,
+                ))
+            }
+            Ok(_) => {}
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let path = CString::new(directory.as_os_str().as_bytes()).map_err(|_| {
+                FileError::InvalidInput("the recording directory contains a NUL".into())
+            })?;
+            // SAFETY: `path` is a NUL-terminated string that outlives the call.
+            if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
+                return Err(refuse(
+                    std::io::ErrorKind::PermissionDenied,
+                    "cannot be written to",
+                    directory,
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn path_string(path: &Path) -> FileResult<CString> {

@@ -193,34 +193,73 @@ mod shared {
     /// caller, so unloading can never be proven safe.
     pub(crate) struct Module {
         library: ManuallyDrop<libloading::Library>,
+        /// The platform loader's handle, which it returns again whenever the
+        /// same module is opened, under any name.
+        handle: usize,
         base: usize,
         path: PathBuf,
+    }
+
+    /// Why a location cannot be used, and the module it left loaded when it
+    /// got as far as loading one.
+    pub(super) struct Refusal {
+        reason: String,
+        loaded: Option<Loaded>,
+    }
+
+    /// A module that stays loaded although it was refused.
+    struct Loaded {
+        handle: usize,
+        /// The file it was loaded from, when that could be established.
+        path: Option<PathBuf>,
+    }
+
+    impl Refusal {
+        /// A location that loaded nothing.
+        fn unloaded(reason: impl Into<String>) -> Self {
+            Self {
+                reason: reason.into(),
+                loaded: None,
+            }
+        }
     }
 
     impl Module {
         /// Open `location` and identify the module through `anchor`, a symbol
         /// it must define.
         ///
-        /// The error is the reason, including the operating system's own text.
-        pub(crate) fn open(location: &OsStr, anchor: &CStr) -> std::result::Result<Self, String> {
-            let library = ManuallyDrop::new(open_library(location).map_err(|e| error_chain(&e))?);
+        /// The error carries the reason, including the operating system's own
+        /// text, and the identity of the module when the location was loaded
+        /// before it was refused: it stays loaded.
+        pub(super) fn open(location: &OsStr, anchor: &CStr) -> std::result::Result<Self, Refusal> {
+            let (library, handle) =
+                open_library(location).map_err(|error| Refusal::unloaded(error_chain(&error)))?;
+            let library = ManuallyDrop::new(library);
+            let refused = |reason: String, path: Option<PathBuf>| Refusal {
+                reason,
+                loaded: Some(Loaded { handle, path }),
+            };
             // SAFETY: the symbol is read only as an address.
             let address = unsafe { library.get::<*const c_void>(anchor.to_bytes_with_nul()) }
                 .map(|symbol| *symbol)
                 .map_err(|error| {
-                    format!(
+                    let reason = format!(
                         "it does not export {}: {}",
                         anchor.to_string_lossy(),
                         error_chain(&error)
-                    )
+                    );
+                    refused(reason, None)
                 })?;
-            let (base, path) = containing_module(address)?;
+            let (base, path) =
+                containing_module(address).map_err(|reason| refused(reason, None))?;
             let path = path.canonicalize().unwrap_or(path);
             if Path::new(location).is_absolute() && !same_path(Path::new(location), &path) {
-                return Err(format!("the loader resolved it to {}", path.display()));
+                let reason = format!("the loader resolved it to {}", path.display());
+                return Err(refused(reason, Some(path)));
             }
             Ok(Self {
                 library,
+                handle,
                 base,
                 path,
             })
@@ -375,19 +414,24 @@ mod shared {
             );
             let mut failures = Vec::with_capacity(plan.len());
             for candidate in plan {
-                let module = match candidate.open(self.anchor) {
-                    Ok(module) => module,
-                    Err(reason) => {
-                        failures.push(format!("{candidate}: {reason}"));
-                        continue;
+                let refusal = match candidate.open(self.anchor) {
+                    Ok(module) => {
+                        // `accept` consumes the module, so its identity is taken first.
+                        let loaded = Loaded {
+                            handle: module.handle,
+                            path: Some(module.path.clone()),
+                        };
+                        match accept(module) {
+                            Ok(opened) => return Ok(opened),
+                            Err(reason) => Refusal {
+                                reason,
+                                loaded: Some(loaded),
+                            },
+                        }
                     }
+                    Err(refusal) => refusal,
                 };
-                // `accept` consumes the module, so its identity is taken first.
-                let (base, path) = (module.base, module.path.clone());
-                match accept(module) {
-                    Ok(opened) => return Ok(opened),
-                    Err(reason) => failures.push(candidate.rejection(base, &path, &reason)),
-                }
+                failures.push(candidate.describe(refusal));
             }
             Err(Error::RuntimeLoadFailed(format!(
                 "no usable {}; tried {}",
@@ -397,13 +441,15 @@ mod shared {
         }
     }
 
-    /// Load addresses of the modules that were opened and then rejected.
+    /// The modules that were loaded and then refused, by the platform loader's
+    /// handle, each with the file it was first loaded from.
     ///
-    /// A module is never closed, so a rejected one stays loaded. The platform
-    /// loader then answers a later request for a library by name with that
-    /// module whenever the name matches the one the module carries, instead of
+    /// A module is never closed, so a refused one stays loaded, whether it was
+    /// refused before or after it could be identified. The platform loader
+    /// then answers a later request for a library by name with that module
+    /// whenever the name matches the one the module carries, instead of
     /// searching for another file.
-    static REJECTED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    static REJECTED: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
 
     /// Reject an explicit library path the platform loader would search for
     /// instead of opening as the named file.
@@ -453,7 +499,7 @@ mod shared {
     }
 
     impl Candidate {
-        fn open(&self, anchor: &CStr) -> std::result::Result<Module, String> {
+        fn open(&self, anchor: &CStr) -> std::result::Result<Module, Refusal> {
             // A directory candidate names one exact file. Skipping an absent
             // one keeps the loader from searching elsewhere for that path.
             if matches!(
@@ -461,36 +507,46 @@ mod shared {
                 Origin::Companion | Origin::Executable | Origin::RuntimeDirectory
             ) && !self.location.is_file()
             {
-                return Err("not found".into());
+                return Err(Refusal::unloaded("not found"));
             }
             Module::open(self.location.as_os_str(), anchor)
         }
 
-        /// Why the module at `base`, which this candidate opened from `path`,
-        /// cannot be used, given the `reason` it was just rejected for.
+        /// Why this candidate cannot be used.
         ///
         /// A candidate that names a file reports that file's own defect. One
         /// the platform loader resolved by name reports which file that was,
-        /// and whether it is a module rejected before: the loader keeps
+        /// and whether it is a module refused before: the loader keeps
         /// returning such a module for its name, so the search cannot reach
         /// any other library of that name.
-        fn rejection(&self, base: usize, path: &Path, reason: &str) -> String {
-            let mut rejected = REJECTED.lock().unwrap_or_else(PoisonError::into_inner);
-            let rejected_before = rejected.contains(&base);
-            if !rejected_before {
-                rejected.push(base);
-            }
-            if self.origin != Origin::LoaderSearch {
-                format!("{self}: {reason}")
-            } else if rejected_before {
-                format!(
+        fn describe(&self, refusal: Refusal) -> String {
+            let Refusal { reason, loaded } = refusal;
+            let Some(loaded) = loaded else {
+                return format!("{self}: {reason}");
+            };
+            let refused_before = {
+                let mut rejected = REJECTED.lock().unwrap_or_else(PoisonError::into_inner);
+                let earlier = rejected
+                    .iter()
+                    .find(|(handle, _)| *handle == loaded.handle)
+                    .map(|(_, path)| path.clone());
+                if earlier.is_none() {
+                    let path = loaded.path.clone().unwrap_or_else(|| self.location.clone());
+                    rejected.push((loaded.handle, path));
+                }
+                earlier
+            };
+            match (self.origin, refused_before, loaded.path) {
+                (Origin::LoaderSearch, Some(path), _) => format!(
                     "{self}: the platform loader returned {}, which is already loaded and was \
                      rejected ({reason}); no other library of that name can be found by name in \
                      this process, so remove or fix that file or pass an explicit library path",
                     path.display()
-                )
-            } else {
-                format!("{self} resolved to {}: {reason}", path.display())
+                ),
+                (Origin::LoaderSearch, None, Some(path)) => {
+                    format!("{self} resolved to {}: {reason}", path.display())
+                }
+                _ => format!("{self}: {reason}"),
             }
         }
     }
@@ -592,21 +648,28 @@ mod shared {
         text
     }
 
+    /// Load `location`, returning the library with the platform loader's
+    /// handle for it.
     #[cfg(unix)]
     fn open_library(
         location: &OsStr,
-    ) -> std::result::Result<libloading::Library, libloading::Error> {
+    ) -> std::result::Result<(libloading::Library, usize), libloading::Error> {
         use libloading::os::unix::{Library, RTLD_LOCAL, RTLD_NOW};
         // SAFETY: loading runs the library's constructors. Callers select a
         // trusted NDI runtime; eager binding reports missing dependencies here
         // rather than at the first call.
-        unsafe { Library::open(Some(location), RTLD_NOW | RTLD_LOCAL) }.map(Into::into)
+        let handle = unsafe { Library::open(Some(location), RTLD_NOW | RTLD_LOCAL) }?.into_raw();
+        // SAFETY: `handle` is the open handle `into_raw` has just released.
+        let library = unsafe { Library::from_raw(handle) };
+        Ok((library.into(), handle as usize))
     }
 
+    /// Load `location`, returning the library with the platform loader's
+    /// handle for it.
     #[cfg(windows)]
     fn open_library(
         location: &OsStr,
-    ) -> std::result::Result<libloading::Library, libloading::Error> {
+    ) -> std::result::Result<(libloading::Library, usize), libloading::Error> {
         use libloading::os::windows::{Library, LOAD_WITH_ALTERED_SEARCH_PATH};
         // A full path resolves the library's own dependencies beside it; a bare
         // name uses the standard search order.
@@ -617,7 +680,10 @@ mod shared {
         };
         // SAFETY: loading runs the library's initialization routine. Callers
         // select a trusted NDI runtime.
-        unsafe { Library::load_with_flags(location, flags) }.map(Into::into)
+        let handle = unsafe { Library::load_with_flags(location, flags) }?.into_raw();
+        // SAFETY: `handle` is the open handle `into_raw` has just released.
+        let library = unsafe { Library::from_raw(handle) };
+        Ok((library.into(), handle as usize))
     }
 
     /// The load address and file of the module that defines `address`.

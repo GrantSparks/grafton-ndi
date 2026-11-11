@@ -1,6 +1,6 @@
 //! Playing recordings back as an NDI source.
 
-use std::{ffi::CString, marker::PhantomData, path::Path, ptr::NonNull, rc::Rc, time::Duration};
+use std::{marker::PhantomData, path::Path, ptr::NonNull, rc::Rc, time::Duration};
 
 use super::{
     out_param::OutParam, timeout_ms, types, FileApi, FileDuration, FileError, FilePosition,
@@ -24,11 +24,9 @@ use crate::{
 pub struct FilePlayer {
     playback: &'static sys::FilePlayback,
     handle: NonNull<NDIlib_file_player_instance_type>,
-    // The SDK does not say when it copies the strings it is given, so the
-    // creation strings live as long as the player, and the path of the file
-    // started last lives until a later start has replaced it.
+    // Strings passed to the SDK are needed only for the call that receives
+    // them; see the note in `recorder.rs`. The options are kept for `Debug`.
     options: PlayerOptions,
-    path: Option<CString>,
     // Keeps the NDI runtime initialized.
     _api: FileApi,
     _thread: PhantomData<Rc<()>>,
@@ -59,7 +57,6 @@ impl FilePlayer {
             playback,
             handle,
             options,
-            path: None,
             _api: api,
             _thread: PhantomData,
         })
@@ -84,8 +81,6 @@ impl FilePlayer {
             self.playback
                 .NDIlib_file_player_start(self.handle.as_ptr(), path.as_ptr())
         };
-        // The file started before this one is closed by now, so its path can go.
-        self.path = Some(path);
         if started {
             Ok(())
         } else {

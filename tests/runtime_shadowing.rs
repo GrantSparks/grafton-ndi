@@ -9,7 +9,7 @@
 #[path = "support/fixture.rs"]
 mod fixture;
 
-use fixture::FakeRuntime;
+use fixture::{FakeRuntime, FixtureDir};
 use grafton_ndi::{capabilities::SdkEdition, runtime::RuntimeOptions, Error, NDI};
 use std::{
     fs,
@@ -32,6 +32,11 @@ const SCENARIOS: &[(&str, Option<&str>, &str)] = &[
         None,
         "rejected",
     ),
+    (
+        "module_that_cannot_be_identified_shadows_the_loader_search",
+        Some("anchorless"),
+        "usable",
+    ),
 ];
 
 #[test]
@@ -41,11 +46,12 @@ fn loader_search_reports_what_the_platform_resolved() {
         child(&name, &root);
         return;
     }
-    let root = std::env::temp_dir().join(format!("grafton-ndi-shadow-{}", std::process::id()));
-    for directory in ["rejected", "usable"] {
-        fs::create_dir_all(root.join(directory)).unwrap();
+    let fixtures = FixtureDir::create("shadow");
+    let root = fixtures.path();
+    for directory in ["rejected", "anchorless", "usable"] {
+        fs::create_dir(root.join(directory)).unwrap();
     }
-    // Two different libraries that carry the same name.
+    // Different libraries that carry the same name.
     FakeRuntime::new()
         .with("fake_omit_required")
         .soname(NAME)
@@ -53,6 +59,12 @@ fn loader_search_reports_what_the_platform_resolved() {
     FakeRuntime::new()
         .soname(NAME)
         .build(&root.join("usable").join(NAME));
+    // One that is no NDI runtime at all: it lacks even the symbol a runtime
+    // is identified by.
+    let anchorless = root.join("anchorless").join(NAME);
+    let mut rustc = fixture::rustc("fake_dependency.rs", &anchorless);
+    rustc.arg(format!("-Clink-arg=-Wl,-soname,{NAME}"));
+    fixture::run(rustc, &anchorless);
 
     for (scenario, runtime_directory, loader_directory) in SCENARIOS {
         let mut command = Command::new(std::env::current_exe().unwrap());
@@ -63,7 +75,7 @@ fn loader_search_reports_what_the_platform_resolved() {
                 "--nocapture",
             ])
             .env("GRAFTON_SHADOW_CHILD", scenario)
-            .env("GRAFTON_SHADOW_FIXTURES", &root)
+            .env("GRAFTON_SHADOW_FIXTURES", root)
             .env_remove("NDI_RUNTIME_DIR_V6")
             .env("LD_LIBRARY_PATH", root.join(loader_directory));
         if let Some(directory) = runtime_directory {
@@ -77,7 +89,6 @@ fn loader_search_reports_what_the_platform_resolved() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    fs::remove_dir_all(root).unwrap();
 }
 
 fn standard() -> RuntimeOptions {
@@ -142,6 +153,28 @@ fn child(name: &str, root: &Path) {
                 )),
                 "{again}"
             );
+        }
+        "module_that_cannot_be_identified_shadows_the_loader_search" => {
+            let anchorless = root.join("anchorless").join(NAME);
+            let reason = load_failure();
+            assert!(
+                reason.contains(&format!(
+                    "{} (NDI_RUNTIME_DIR_V6): it does not export NDIlib_version",
+                    anchorless.display()
+                )),
+                "{reason}"
+            );
+            // It stays loaded all the same, and the search by name gets it back.
+            assert!(
+                reason.contains(&format!(
+                    "{NAME} (system library search): the platform loader returned {}, which is \
+                     already loaded and was rejected",
+                    anchorless.display()
+                )),
+                "{reason}"
+            );
+            let ndi = NDI::with_options(&standard().library_path(usable.clone())).unwrap();
+            assert_eq!(ndi.info().library_path(), Some(usable.as_path()));
         }
         _ => panic!("unknown scenario {name}"),
     }

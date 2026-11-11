@@ -1,11 +1,17 @@
 //! A test-owned stand-in for the NDI File library.
 //!
 //! The File loader tests compile this file into a shared library with `rustc`,
-//! link it against a fake NDI runtime as the real File library is linked
-//! against the real one, and load it through the crate. It includes the
-//! crate's vendored bindings, so every exported function is checked against
-//! the declaration the crate's own tables are checked against. Every function
-//! does nothing and returns zero, false or null.
+//! link it against a fake NDI runtime, and load it through the crate. Like the
+//! vendor's library it imports entry points of the NDI runtime, which the
+//! platform loader binds when the library is loaded, and names that runtime as
+//! a dependency. It includes the crate's vendored bindings, so every exported
+//! function is checked against the declaration the crate's own tables are
+//! checked against.
+//!
+//! A probe succeeds and reports, as the file's track count, the build number of
+//! the runtime the library's imports are bound to, so a test can tell which
+//! runtime that is. Every other function does nothing and returns zero, false
+//! or null.
 //!
 //! `--cfg fake_omit_recording_entry` omits one function of the recording family.
 
@@ -21,26 +27,56 @@ mod bindings;
 mod declarations;
 
 use bindings::*;
-use std::ffi::c_char;
+use std::ffi::{c_char, CStr};
 
-/// Export inert functions under their SDK names, each checked against the
-/// vendored declaration of the same name.
-macro_rules! stub {
-    ($(fn $name:ident($($argument:ident: $type:ty),* $(,)?) $(-> $return:ty)?;)+) => {$(
+/// Export functions under their SDK names, each checked against the vendored
+/// declaration of the same name.
+macro_rules! export {
+    ($(fn $name:ident($($argument:ident: $type:ty),* $(,)?) $(-> $return:ty)? $body:block)+) => {$(
         #[no_mangle]
-        pub unsafe extern "C" fn $name($($argument: $type),*) $(-> $return)? {
-            // SAFETY: every stubbed return type is an integer, a boolean or a
-            // raw pointer, for which all-zero bytes are a valid value.
-            unsafe { std::mem::zeroed() }
-        }
+        pub unsafe extern "C" fn $name($($argument: $type),*) $(-> $return)? $body
         const _: unsafe extern "C" fn($($type),*) $(-> $return)? = declarations::$name;
     )+};
+}
+
+/// Export functions that do nothing and return zero, false or null.
+macro_rules! stub {
+    ($(fn $name:ident($($argument:ident: $type:ty),* $(,)?) $(-> $return:ty)?;)+) => {
+        export! {$(
+            fn $name($($argument: $type),*) $(-> $return)? {
+                // SAFETY: every stubbed return type is an integer, a boolean or
+                // a raw pointer, for which all-zero bytes are a valid value.
+                unsafe { std::mem::zeroed() }
+            }
+        )+}
+    };
+}
+
+/// The build number of the NDI runtime this library's imports are bound to:
+/// the last component of the version that runtime reports.
+fn bound_runtime_build() -> u32 {
+    // SAFETY: the query takes no arguments and returns a static string. The
+    // call goes through this library's own import of the runtime.
+    let version = unsafe { CStr::from_ptr(declarations::NDIlib_version()) };
+    version
+        .to_str()
+        .ok()
+        .and_then(|text| text.rsplit('.').next())
+        .and_then(|build| build.parse().ok())
+        .unwrap_or(0)
+}
+
+export! {
+    fn NDIlib_file_player_probe_file(p_file_path: *const c_char, p_out_info: *mut NDIlib_file_player_file_info_t) -> bool {
+        // SAFETY: the caller passes storage for one structure.
+        unsafe { (*p_out_info).track_count = bound_runtime_build() };
+        true
+    }
 }
 
 stub! {
     fn NDIlib_file_v1_load() -> *const NDIlib_file_v1;
 
-    fn NDIlib_file_player_probe_file(p_file_path: *const c_char, p_out_info: *mut NDIlib_file_player_file_info_t) -> bool;
     fn NDIlib_file_player_create(p_create_settings: *const NDIlib_file_player_create_t) -> NDIlib_file_player_instance_t;
     fn NDIlib_file_player_destroy(p_instance: NDIlib_file_player_instance_t);
     fn NDIlib_file_player_start(p_instance: NDIlib_file_player_instance_t, p_file_path: *const c_char) -> bool;

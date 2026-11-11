@@ -50,6 +50,36 @@
 //! open performs the same stop and wait, bounded by
 //! [`RecorderOptions::with_drop_wait`], but cannot report the outcome.
 //!
+//! # Limits of the NDI 6.4 File library
+//!
+//! These were observed with the NDI 6.4 File library. They lie inside the
+//! library and this crate cannot correct them.
+//!
+//! * **A file reported closed is not proof that its data was written.** A
+//!   session's report repeats what the library said: that it finalized each
+//!   file. When the disk fills while a session is being stopped, a write comes
+//!   up short, the library extends the file all the same and reports it closed
+//!   without an error, and [`FileApi::probe`] then reports a final duration
+//!   for a file whose data is not there. [`FinishStatus::Closed`] with no
+//!   errors therefore means that the container was finalized, not that every
+//!   frame reached the disk. A recording that must be complete has to be
+//!   checked by reading it back.
+//! * **The process does not survive a full disk during recording.** When a
+//!   write fails while a session is recording, the library queues a
+//!   write-failed and an error event and then crashes in its own writer
+//!   thread, which ends the process. Nothing this crate does can prevent it.
+//!   Record only where enough space is certain.
+//! * **A file can be closed with nothing in it.** The library opens a file as
+//!   soon as a session or a rollover starts, and reports it closed even if no
+//!   frame arrived: after a stop before the source delivered anything, a
+//!   switch to a source that is not there, or a rollover while the source is
+//!   lost. [`RecordingReport::empty_files`] counts these files.
+//! * **A rollover the library cannot carry out ends the session.** It accepts
+//!   the request, fails to open the new file, closes the old one and stops.
+//!   [`FileRecorder::rollover`] checks the target's directory first, so the
+//!   usual mistake is refused and the session goes on; other causes, such as
+//!   an exact file name that already exists, still end it.
+//!
 //! # Threads
 //!
 //! [`FilePlayer`] and [`FileRecorder`] are neither `Send` nor `Sync`: the SDK

@@ -11,7 +11,7 @@ use std::{
 use super::{
     out_param::OutParam, timeout_ms, EventText, FileApi, FileError, FileResult, RecorderEvent,
     RecorderEventKind, RecorderOptions, RecorderStats, RecordingTarget, RecordingTimecode,
-    SourceFormat, SourceSpec,
+    SourceFormat, SourceSpec, TrackSelection,
 };
 use crate::sys::{self, bindings::*};
 
@@ -71,6 +71,7 @@ pub struct RecordingReport {
     session: u64,
     closure_confirmed: bool,
     closed_files: u64,
+    empty_files: u64,
     error_events: u64,
     write_failures: u64,
     dropped_events: u64,
@@ -87,8 +88,25 @@ impl RecordingReport {
         self.closure_confirmed
     }
     /// How many files were reported closed, including those closed by rollovers.
+    ///
+    /// The SDK reports a file closed whether or not anything was written to
+    /// it; see [`empty_files`](Self::empty_files).
     pub fn closed_files(&self) -> u64 {
         self.closed_files
+    }
+    /// How many of the closed files had no audio or video written to them.
+    ///
+    /// The SDK opens a file as soon as a session or a rollover starts, and
+    /// closes it as finalized even if no frame ever reached it: a stop before
+    /// the source delivered anything, a switch to a source that is not there,
+    /// a rollover while the source is lost. Such a file is empty or holds
+    /// only a header, and may not open in a player. A file counts here when
+    /// it was closed without the SDK having reported its first frame.
+    ///
+    /// Always zero for a recorder that records neither audio nor video,
+    /// because the SDK reports no first frame for metadata.
+    pub fn empty_files(&self) -> u64 {
+        self.empty_files
     }
     /// How many open-failed and error events were seen.
     pub fn error_events(&self) -> u64 {
@@ -127,6 +145,13 @@ pub enum FinishStatus {
     Indeterminate(RecordingReport),
 }
 
+/// A file the recorder's events reported open.
+struct OpenFile {
+    path: EventText,
+    /// The SDK reported the first audio or video packet written to it.
+    has_media: bool,
+}
+
 /// The record of one session, built from the recorder's events.
 struct Ledger {
     state: RecorderState,
@@ -134,7 +159,10 @@ struct Ledger {
     /// Files reported open and not yet reported closed. A rollover opens the
     /// next file before the previous one is reported closed, so two can be
     /// open at once.
-    open_files: Vec<EventText>,
+    open_files: Vec<OpenFile>,
+    /// The session records audio or video, so every file with content gets a
+    /// first-frame event.
+    records_media: bool,
     /// An event was lost, malformed or out of place, so `open_files` may not
     /// be the truth.
     uncertain: bool,
@@ -144,22 +172,24 @@ struct Ledger {
 
 impl Ledger {
     fn idle() -> Self {
-        Self::session(0, 0, RecorderState::Idle)
+        Self::session(0, 0, RecorderState::Idle, false)
     }
 
-    fn session(session: u64, dropped_base: u64, state: RecorderState) -> Self {
+    fn session(session: u64, dropped_base: u64, state: RecorderState, records_media: bool) -> Self {
         Self {
             state,
             report: RecordingReport {
                 session,
                 closure_confirmed: false,
                 closed_files: 0,
+                empty_files: 0,
                 error_events: 0,
                 write_failures: 0,
                 dropped_events: 0,
                 last_closed_path: None,
             },
             open_files: Vec::new(),
+            records_media,
             uncertain: false,
             dropped_base,
         }
@@ -185,15 +215,25 @@ impl Ledger {
     }
 
     /// Record the SDK's cumulative count of discarded events.
+    ///
+    /// Like every event, a loss outside a session belongs to none: a start
+    /// the SDK refuses queues events too, and they must not alter the report
+    /// of the session before it.
     fn dropped(&mut self, cumulative: u64) {
+        if !self.session_open() {
+            return;
+        }
         self.report.dropped_events = cumulative.saturating_sub(self.dropped_base);
         if cumulative != self.dropped_base {
             self.uncertain = true;
         }
     }
 
-    /// Record one event.
+    /// Record one event of the open session.
     fn observe(&mut self, kind: RecorderEventKind, path: EventText) {
+        if !self.session_open() {
+            return;
+        }
         // A path that is cut short cannot be matched with a later event.
         let exact =
             !path.as_bytes().is_empty() && path.is_terminated() && !path.is_possibly_truncated();
@@ -201,17 +241,28 @@ impl Ledger {
             RecorderEventKind::Started | RecorderEventKind::Rollover => {
                 let first = kind == RecorderEventKind::Started;
                 if !exact
-                    || self.open_files.contains(&path)
+                    || self.open_files.iter().any(|open| open.path == path)
                     || (first && !self.open_files.is_empty())
                 {
                     self.uncertain = true;
                 }
-                self.open_files.push(path);
+                self.open_files.push(OpenFile {
+                    path,
+                    has_media: false,
+                });
+            }
+            RecorderEventKind::FirstFrame => {
+                if let Some(open) = self.open_files.iter_mut().find(|open| open.path == path) {
+                    open.has_media = true;
+                }
             }
             RecorderEventKind::FileClosed => {
-                match self.open_files.iter().position(|open| *open == path) {
+                match self.open_files.iter().position(|open| open.path == path) {
                     Some(index) if exact => {
-                        self.open_files.remove(index);
+                        let closed = self.open_files.remove(index);
+                        if self.records_media && !closed.has_media {
+                            self.report.empty_files = self.report.empty_files.saturating_add(1);
+                        }
                     }
                     _ => self.uncertain = true,
                 }
@@ -258,32 +309,12 @@ impl Ledger {
     }
 }
 
-/// Storage handed to the SDK that must outlive the call that passed it.
-///
-/// The SDK says only of injected metadata that it is copied before the call
-/// returns. Everything else is kept until it can no longer be referenced: the
-/// creation settings and their strings for the life of the recorder, and what
-/// a session was given until a later session has started.
-struct Retained {
-    _options: RecorderOptions,
-    _create: Box<NDIlib_file_recorder_create_t>,
-    prefixes: Vec<CString>,
-    sources: Vec<(SourceSpec, Box<NDIlib_file_recorder_source_t>)>,
-    /// The index in `sources` of the one the SDK accepted last, if any.
-    source_in_effect: Option<usize>,
-}
-
-impl Retained {
-    /// Release what only sessions before the one that just started could use:
-    /// every prefix but the newest, and every source older than the one in effect.
-    fn session_started(&mut self) {
-        let newest = self.prefixes.len().saturating_sub(1);
-        self.prefixes.drain(..newest);
-        let in_effect = self.source_in_effect.unwrap_or(0);
-        self.sources.drain(..in_effect);
-        self.source_in_effect = self.source_in_effect.map(|_| 0);
-    }
-}
+// Every string and structure passed to the File library is kept only for the
+// call that receives it. The SDK headers give a lifetime for each pointer the
+// library returns and none for any it is given, and say of the source strings
+// the recorder reports that the recorder owns them: what it is given, it
+// copies. `sdk_tests` holds the library to that, by overwriting each string as
+// soon as the call it was passed to returns.
 
 fn raw_source(source: &SourceSpec) -> NDIlib_file_recorder_source_t {
     let pointer =
@@ -311,6 +342,16 @@ fn raw_source(source: &SourceSpec) -> NDIlib_file_recorder_source_t {
 /// does the same, waiting up to [`RecorderOptions::with_drop_wait`], but cannot
 /// report whether it succeeded; [`abandon`](Self::abandon) skips the wait.
 ///
+/// # What a closed file means
+///
+/// A report of closure repeats what the SDK said: that it finalized the file.
+/// It does not show that every frame reached the disk, and a file can be
+/// closed with nothing in it ([`RecordingReport::empty_files`]). With the NDI
+/// 6.4 File library a disk that fills while a session is recording ends the
+/// process, and one that fills while it is being stopped leaves a file that
+/// is reported closed without its data. See
+/// [the module's limits](super#limits-of-the-ndi-64-file-library).
+///
 /// # Events
 ///
 /// Events are taken with [`poll_event`](Self::poll_event), and
@@ -325,10 +366,15 @@ fn raw_source(source: &SourceSpec) -> NDIlib_file_recorder_source_t {
 pub struct FileRecorder {
     recording: &'static sys::FileRecording,
     handle: NonNull<NDIlib_file_recorder_instance_type>,
-    retained: Retained,
+    /// Whether audio or video is recorded, rather than metadata alone.
+    records_media: bool,
     /// The source in effect, when the last change of source was accepted.
     accepted_source: Option<SourceSpec>,
     ledger: Ledger,
+    /// The SDK has not yet been told to stop the session started last. It
+    /// needs to be, even when it ended that session itself: until then it
+    /// refuses to start another.
+    native_stop_owed: bool,
     drop_wait: Duration,
     // Keeps the NDI runtime initialized.
     _api: FileApi,
@@ -347,7 +393,7 @@ impl std::fmt::Debug for FileRecorder {
 impl FileRecorder {
     pub(super) fn create(api: FileApi, options: RecorderOptions) -> FileResult<Self> {
         let recording = api.recording()?;
-        let create = Box::new(NDIlib_file_recorder_create_t {
+        let settings = NDIlib_file_recorder_create_t {
             source_to_connect_to: raw_source(&options.source),
             track_flags: options.tracks.bits(),
             record_float_audio_planar_32f: options.planar_audio,
@@ -358,24 +404,20 @@ impl FileRecorder {
                 .map_or(std::ptr::null(), |pattern| pattern.as_ptr()),
             disable_proxy_track: options.disable_proxy,
             rollover_max_file_size_bytes: options.rollover_bytes,
-        });
-        // SAFETY: `create` and the strings it points to, owned by `options`,
-        // are valid for the call and are kept for the life of the recorder.
-        let handle = NonNull::new(unsafe { recording.NDIlib_file_recorder_create(&*create) })
+        };
+        // SAFETY: `settings` and the strings it points to, owned by `options`,
+        // are valid for the call.
+        let handle = NonNull::new(unsafe { recording.NDIlib_file_recorder_create(&settings) })
             .ok_or(FileError::Rejected("recorder creation"))?;
+        let media = TrackSelection::VIDEO.bits() | TrackSelection::AUDIO.bits();
         Ok(Self {
             recording,
             handle,
-            accepted_source: Some(options.source.clone()),
+            records_media: options.tracks.bits() & media != 0,
             drop_wait: options.drop_wait,
-            retained: Retained {
-                _options: options,
-                _create: create,
-                prefixes: Vec::new(),
-                sources: Vec::new(),
-                source_in_effect: None,
-            },
+            accepted_source: Some(options.source),
             ledger: Ledger::idle(),
+            native_stop_owed: false,
             _api: api,
             _thread: PhantomData,
         })
@@ -406,8 +448,12 @@ impl FileRecorder {
     ///
     /// * [`FileError::InvalidState`] while an earlier session is recording or
     ///   stopping; [`finish`](Self::finish) it first.
+    /// * [`FileError::Io`] when the target's directory does not exist or
+    ///   cannot be written to. The SDK is not called.
     /// * [`FileError::Rejected`] when the SDK cannot start the source or open
-    ///   the first file.
+    ///   the first file. It queues an open-failed event that says why, which
+    ///   [`poll_event`](Self::poll_event) returns; the event is counted in no
+    ///   session's report.
     pub fn start(
         &mut self,
         target: RecordingTarget,
@@ -418,6 +464,7 @@ impl FileRecorder {
                 "finish the previous session before starting another",
             ));
         }
+        target.check_directory()?;
         // Events left over from an earlier session must not be counted in this one.
         self.discard_stale_events()?;
         let session =
@@ -426,9 +473,8 @@ impl FileRecorder {
             })?;
         let dropped = self.dropped_event_count();
         let prefix = target.prefix.as_ptr();
-        self.retained.prefixes.push(target.prefix);
-        // SAFETY: the recorder is live, and `prefix` points into a string the
-        // recorder keeps until a later session has started.
+        // SAFETY: the recorder is live, and `prefix` points into `target`,
+        // which outlives the call.
         let accepted = unsafe {
             match timecode {
                 RecordingTimecode::Preserve => self
@@ -446,8 +492,13 @@ impl FileRecorder {
         if !accepted {
             return Err(FileError::Rejected("recorder start"));
         }
-        self.retained.session_started();
-        self.ledger = Ledger::session(session, dropped, RecorderState::Recording);
+        self.native_stop_owed = true;
+        self.ledger = Ledger::session(
+            session,
+            dropped,
+            RecorderState::Recording,
+            self.records_media,
+        );
         Ok(session)
     }
 
@@ -470,20 +521,30 @@ impl FileRecorder {
     /// alone does not show that it has. Use [`finish`](Self::finish) or
     /// [`wait_finished`](Self::wait_finished) to find out.
     pub fn request_stop(&mut self) -> StopRequest {
-        match self.state() {
-            RecorderState::Idle => return StopRequest::NotStarted,
-            RecorderState::Closed => return StopRequest::AlreadyClosed,
-            RecorderState::Indeterminate => return StopRequest::AlreadyEnded,
-            RecorderState::Stopping => return StopRequest::AlreadyStopping,
-            RecorderState::Recording => {}
-        }
-        self.ledger.stopping();
-        // SAFETY: the recorder is live for this borrow.
-        unsafe {
-            self.recording
-                .NDIlib_file_recorder_stop(self.handle.as_ptr())
+        let outcome = match self.state() {
+            RecorderState::Idle => StopRequest::NotStarted,
+            RecorderState::Closed => StopRequest::AlreadyClosed,
+            RecorderState::Indeterminate => StopRequest::AlreadyEnded,
+            RecorderState::Stopping => StopRequest::AlreadyStopping,
+            RecorderState::Recording => {
+                self.ledger.stopping();
+                StopRequest::Requested
+            }
         };
-        StopRequest::Requested
+        // A session the SDK is ending by itself has not been told to stop.
+        self.stop_native();
+        outcome
+    }
+
+    /// Tell the SDK to stop, unless the session started last was already told.
+    fn stop_native(&mut self) {
+        if std::mem::take(&mut self.native_stop_owed) {
+            // SAFETY: the recorder is live for this borrow.
+            unsafe {
+                self.recording
+                    .NDIlib_file_recorder_stop(self.handle.as_ptr())
+            };
+        }
     }
 
     /// Take the next queued event, waiting up to `wait` for one.
@@ -501,6 +562,11 @@ impl FileRecorder {
         self.ledger.dropped(self.dropped_event_count());
         let Some(event) = event.inspect_err(|_| self.ledger.uncertain = true)? else {
             self.ledger.drained(self.is_recording());
+            if !self.ledger.session_open() {
+                // The session is over. When the SDK ended it itself, this is
+                // the stop it still needs before it will start another.
+                self.stop_native();
+            }
             return Ok(None);
         };
         self.ledger.observe(
@@ -642,36 +708,26 @@ impl FileRecorder {
     ///
     /// # Errors
     ///
-    /// * [`FileError::InvalidState`] while a session is stopping or ended
-    ///   without a confirmed closure.
+    /// * [`FileError::InvalidState`] while a session is stopping.
     /// * [`FileError::Rejected`] when the SDK cannot start the source. The
     ///   SDK does not say which source is then in effect, so
     ///   [`last_accepted_source`](Self::last_accepted_source) returns `None`
     ///   until a later change succeeds.
     pub fn set_source(&mut self, source: SourceSpec) -> FileResult<()> {
-        if matches!(
-            self.state(),
-            RecorderState::Stopping | RecorderState::Indeterminate
-        ) {
-            return Err(FileError::InvalidState(
-                "the session is stopping, or ended without a confirmed closure",
-            ));
+        if self.state() == RecorderState::Stopping {
+            return Err(FileError::InvalidState("the session is stopping"));
         }
-        let raw = Box::new(raw_source(&source));
-        // SAFETY: the recorder is live, and `raw` and the strings it points to
-        // are kept until a later session has started.
+        let raw = raw_source(&source);
+        // SAFETY: the recorder is live, and `raw` and the strings it points
+        // to, owned by `source`, are valid for the call.
         let accepted = unsafe {
             self.recording
-                .NDIlib_file_recorder_set_source(self.handle.as_ptr(), &*raw)
+                .NDIlib_file_recorder_set_source(self.handle.as_ptr(), &raw)
         };
-        self.retained.sources.push((source, raw));
+        self.accepted_source = accepted.then_some(source);
         if accepted {
-            let index = self.retained.sources.len() - 1;
-            self.retained.source_in_effect = Some(index);
-            self.accepted_source = Some(self.retained.sources[index].0.clone());
             Ok(())
         } else {
-            self.accepted_source = None;
             Err(FileError::Rejected("recorder source change"))
         }
     }
@@ -691,7 +747,7 @@ impl FileRecorder {
     /// The path is as the SDK gave it, and lags the recorder by the events not
     /// yet taken.
     pub fn reported_current_file(&self) -> Option<&EventText> {
-        self.ledger.open_files.last()
+        self.ledger.open_files.last().map(|open| &open.path)
     }
 
     /// Close the current file and continue the session in a new one named
@@ -701,23 +757,30 @@ impl FileRecorder {
     /// new file starts decodable. A rollover that has not happened by the time
     /// the session stops is dropped.
     ///
+    /// The SDK accepts a rollover it then cannot carry out, and ends the
+    /// session when the new file cannot be opened: it reports open-failed,
+    /// closes the old file and reports an error. The target's directory is
+    /// therefore checked first, so that the usual mistake leaves the session
+    /// running. An exact file name that already exists is not caught here.
+    ///
     /// # Errors
     ///
-    /// [`FileError::InvalidState`] unless a session is recording, and
-    /// [`FileError::Rejected`] when the SDK refuses the target.
+    /// * [`FileError::InvalidState`] unless a session is recording.
+    /// * [`FileError::Io`] when the target's directory does not exist or
+    ///   cannot be written to. The SDK is not called and the session goes on.
+    /// * [`FileError::Rejected`] when the SDK refuses the target.
     pub fn rollover(&mut self, target: RecordingTarget) -> FileResult<()> {
         if self.state() != RecorderState::Recording {
             return Err(FileError::InvalidState(
                 "a rollover needs a session that is recording",
             ));
         }
-        let prefix = target.prefix.as_ptr();
-        self.retained.prefixes.push(target.prefix);
-        // SAFETY: the recorder is live, and `prefix` points into a string the
-        // recorder keeps until a later session has started.
+        target.check_directory()?;
+        // SAFETY: the recorder is live, and the prefix points into `target`,
+        // which outlives the call.
         let accepted = unsafe {
             self.recording
-                .NDIlib_file_recorder_rollover(self.handle.as_ptr(), prefix)
+                .NDIlib_file_recorder_rollover(self.handle.as_ptr(), target.prefix.as_ptr())
         };
         if accepted {
             Ok(())
@@ -802,14 +865,6 @@ impl FileRecorder {
     }
 }
 
-#[cfg(test)]
-impl FileRecorder {
-    /// How many recording prefixes and sources are still kept for the SDK.
-    pub(super) fn retained_inputs(&self) -> (usize, usize) {
-        (self.retained.prefixes.len(), self.retained.sources.len())
-    }
-}
-
 impl Drop for FileRecorder {
     fn drop(&mut self) {
         // The SDK finalizes a file between the stop request and the
@@ -822,8 +877,7 @@ impl Drop for FileRecorder {
             }
         }
         // SAFETY: the recorder is live and is destroyed exactly once, on the
-        // thread that created it. The storage in `retained` and `options` is
-        // released only after this call returns.
+        // thread that created it.
         unsafe {
             self.recording
                 .NDIlib_file_recorder_destroy(self.handle.as_ptr())
@@ -844,7 +898,7 @@ mod tests {
     }
 
     fn session() -> Ledger {
-        Ledger::session(1, 0, RecorderState::Recording)
+        Ledger::session(1, 0, RecorderState::Recording, true)
     }
 
     use RecorderEventKind::{
@@ -878,7 +932,7 @@ mod tests {
 
     #[test]
     fn lost_events_taint_an_otherwise_matching_close() {
-        let mut ledger = Ledger::session(1, 7, RecorderState::Recording);
+        let mut ledger = Ledger::session(1, 7, RecorderState::Recording, true);
         ledger.observe(Started, path("take.mkv"));
         ledger.stopping();
         ledger.observe(FileClosed, path("take.mkv"));
@@ -977,6 +1031,23 @@ mod tests {
         ledger.stopping();
         ledger.drained(false);
         assert_eq!(ledger.state, RecorderState::Indeterminate);
+    }
+
+    #[test]
+    fn events_outside_a_session_change_nothing() {
+        // A start the SDK refuses queues an open-failed event while the
+        // previous session's record is still the current one.
+        let mut ledger = session();
+        ledger.observe(Started, path("take.mkv"));
+        ledger.stopping();
+        ledger.observe(FileClosed, path("take.mkv"));
+        ledger.drained(false);
+        assert_eq!(ledger.state, RecorderState::Closed);
+        ledger.observe(OpenFailed, path("next.mkv"));
+        ledger.dropped(3);
+        assert_eq!(ledger.report.error_events, 0);
+        assert_eq!(ledger.report.dropped_events, 0);
+        assert!(ledger.report.closure_confirmed);
     }
 
     #[test]

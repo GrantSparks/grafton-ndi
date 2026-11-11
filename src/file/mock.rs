@@ -95,6 +95,12 @@ pub(super) const ROLLOVER: NDIlib_file_recorder_event_type_e =
     NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_rollover;
 pub(super) const FILE_CLOSED: NDIlib_file_recorder_event_type_e =
     NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_file_closed;
+pub(super) const OPEN_FAILED: NDIlib_file_recorder_event_type_e =
+    NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_open_failed;
+pub(super) const ERROR: NDIlib_file_recorder_event_type_e =
+    NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_error;
+pub(super) const FIRST_FRAME: NDIlib_file_recorder_event_type_e =
+    NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_first_frame;
 
 /// When a [`Recorder`] reports its open file closed after a stop.
 pub(super) enum Closing {
@@ -113,6 +119,15 @@ pub(super) struct Recorder {
     events: std::sync::Mutex<std::collections::VecDeque<NDIlib_file_recorder_event_t>>,
     changed: std::sync::Condvar,
     recording: std::sync::atomic::AtomicBool,
+    /// A session was started and no stop call has followed it. As in the real
+    /// library, this holds even after the session has ended by itself, and
+    /// while it holds no further session can start.
+    stop_owed: std::sync::atomic::AtomicBool,
+    /// Refuse the next start with an open-failed event, as the real library
+    /// does when it cannot create the first file.
+    pub(super) fail_next_start: std::sync::atomic::AtomicBool,
+    /// How many rollovers the wrapper passed on.
+    pub(super) rollovers: std::sync::atomic::AtomicUsize,
     /// Make the next captured event larger than this crate's layout of it.
     pub(super) oversize_next_event: std::sync::atomic::AtomicBool,
     pub(super) dropped_events: std::sync::atomic::AtomicU64,
@@ -139,6 +154,9 @@ impl Recorder {
             events: Default::default(),
             changed: Default::default(),
             recording: Default::default(),
+            stop_owed: Default::default(),
+            fail_next_start: Default::default(),
+            rollovers: Default::default(),
             oversize_next_event: Default::default(),
             dropped_events: Default::default(),
             stops: Default::default(),
@@ -162,6 +180,16 @@ impl Recorder {
     pub(super) fn push_event(&self, event: NDIlib_file_recorder_event_t) {
         self.events.lock().unwrap().push_back(event);
         self.changed.notify_one();
+    }
+
+    /// End the session the way the library does on its own, for example after
+    /// a format change it was told not to roll over for: the file is closed
+    /// and an error event says why. No stop call is involved.
+    pub(super) fn end_session_itself(&self) {
+        self.recording
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.push(FILE_CLOSED, TAKE);
+        self.push(ERROR, TAKE);
     }
 
     /// Stop recording and report the first file closed.
@@ -206,11 +234,17 @@ unsafe extern "C" fn recorder_start(
     handle: NDIlib_file_recorder_instance_t,
     _: *const ::std::os::raw::c_char,
 ) -> bool {
+    use std::sync::atomic::Ordering;
     // SAFETY: the wrapper passes a live handle.
     let recorder = unsafe { Recorder::from_handle(handle) };
-    recorder
-        .recording
-        .store(true, std::sync::atomic::Ordering::Release);
+    if recorder.fail_next_start.swap(false, Ordering::AcqRel) {
+        recorder.push(OPEN_FAILED, "unopenable.mkv");
+        return false;
+    }
+    if recorder.stop_owed.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    recorder.recording.store(true, Ordering::Release);
     recorder.push(STARTED, TAKE);
     true
 }
@@ -249,6 +283,11 @@ unsafe extern "C" fn recorder_stop(handle: NDIlib_file_recorder_instance_t) {
     // SAFETY: the wrapper passes a live handle.
     let recorder = unsafe { Recorder::from_handle(handle) };
     recorder.stops.fetch_add(1, Ordering::AcqRel);
+    recorder.stop_owed.store(false, Ordering::Release);
+    // A session that has already ended by itself has nothing left to close.
+    if !recorder.recording.load(Ordering::Acquire) {
+        return;
+    }
     match recorder.closing {
         Closing::AtStop => recorder.close(),
         Closing::After(delay) => {
@@ -276,10 +315,14 @@ unsafe extern "C" fn recorder_dropped(handle: NDIlib_file_recorder_instance_t) -
         .load(std::sync::atomic::Ordering::Acquire)
 }
 
-unsafe extern "C" fn accept_prefix(
-    _: NDIlib_file_recorder_instance_t,
+unsafe extern "C" fn recorder_rollover(
+    handle: NDIlib_file_recorder_instance_t,
     _: *const ::std::os::raw::c_char,
 ) -> bool {
+    // SAFETY: the wrapper passes a live handle.
+    unsafe { Recorder::from_handle(handle) }
+        .rollovers
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     true
 }
 
@@ -301,7 +344,7 @@ pub(super) fn recorder_api() -> super::FileApi {
             NDIlib_file_recorder_capture_event: recorder_capture,
             NDIlib_file_recorder_get_dropped_event_count: recorder_dropped,
             NDIlib_file_recorder_stop: recorder_stop,
-            NDIlib_file_recorder_rollover: accept_prefix,
+            NDIlib_file_recorder_rollover: recorder_rollover,
             NDIlib_file_recorder_set_source: accept_source,
             NDIlib_file_recorder_is_recording: recorder_is_recording,
             ..recording()

@@ -6,7 +6,7 @@
 #[path = "support/fixture.rs"]
 mod fixture;
 
-use fixture::FakeRuntime;
+use fixture::{FakeRuntime, FixtureDir};
 use grafton_ndi::{
     capabilities::SdkEdition,
     file::{FileApi, FileError, FileRuntimeOptions, PlayerOptions, RecorderOptions, SourceSpec},
@@ -19,26 +19,68 @@ use std::{
     process::Command,
 };
 
-/// The library names the loader searches for on this target.
+/// The library names the loader searches for on this target. The vendor's
+/// runtimes also carry theirs as their SONAME, by which its File library names
+/// the Advanced one as a dependency.
 const ADVANCED_CORE: &str = "libndi_advanced.so.6";
 const STANDARD_CORE: &str = "libndi.so.6";
 const FILE_LIBRARY: &str = "libndifile.so.6";
 
-/// Compile the fake File library to `output`, bound to the runtime at `core`
-/// the way the vendor's is: by a dependency the platform loader resolves.
+/// Compile the fake File library to `output`, linked against the runtime at
+/// `core` the way the vendor's is: it imports the runtime's entry points and
+/// looks for the runtime beside itself.
 fn build_file_library(output: &Path, core: &Path, cfgs: &[&str]) -> PathBuf {
     let mut rustc = fixture::rustc("fake_file_library.rs", output);
     for cfg in cfgs {
         rustc.args(["--cfg", cfg]);
     }
     rustc
-        .arg("-Clink-arg=-Wl,--no-as-needed")
         .arg(fixture::link_argument(core.as_os_str()))
-        .arg("-Clink-arg=-Wl,-rpath,$ORIGIN");
+        .arg("-Clink-arg=-Wl,--disable-new-dtags,-rpath,$ORIGIN");
     fixture::run(rustc, output)
 }
 
-/// The libraries the scenarios use, each directory holding one arrangement.
+/// One arrangement of libraries: a directory, the build number its Advanced
+/// runtime reports, and whether that runtime carries the vendor's SONAME.
+struct Arrangement {
+    directory: &'static str,
+    build: u32,
+    named: bool,
+}
+
+/// A runtime with its File library beside it, as the SDK installs them.
+const PAIRED: Arrangement = Arrangement {
+    directory: "paired",
+    build: 11,
+    named: true,
+};
+/// A runtime alone; a File library for it is in the runtime directory.
+const BARE: Arrangement = Arrangement {
+    directory: "bare",
+    build: 12,
+    named: true,
+};
+/// A second runtime with its own File library.
+const OTHER: Arrangement = Arrangement {
+    directory: "other",
+    build: 13,
+    named: true,
+};
+/// A runtime the platform loader cannot match by name, with a File library
+/// that names it by path.
+const UNNAMED: Arrangement = Arrangement {
+    directory: "unnamed",
+    build: 14,
+    named: false,
+};
+/// As [`UNNAMED`], with no File library anywhere that could bind to it.
+const LONELY: Arrangement = Arrangement {
+    directory: "lonely",
+    build: 15,
+    named: false,
+};
+
+/// The libraries the scenarios use.
 struct Fixtures {
     root: PathBuf,
 }
@@ -48,24 +90,18 @@ impl Fixtures {
         let fixtures = Self {
             root: root.to_owned(),
         };
-        for directory in ["paired", "bare", "other", "standard", "runtime", "partial"] {
-            fs::create_dir_all(root.join(directory)).unwrap();
+        for directory in ["standard", "runtime", "partial"] {
+            fs::create_dir(root.join(directory)).unwrap();
         }
-        // An Advanced runtime with its File library beside it.
-        let paired = FakeRuntime::new()
-            .with("fake_advanced")
-            .build(&fixtures.core("paired"));
-        build_file_library(&fixtures.file("paired"), &paired, &[]);
-        // An Advanced runtime alone; its File library is in the runtime directory.
-        let bare = FakeRuntime::new()
-            .with("fake_advanced")
-            .build(&fixtures.core("bare"));
+        let paired = fixtures.build_core(&PAIRED);
+        build_file_library(&fixtures.file(PAIRED.directory), &paired, &[]);
+        let bare = fixtures.build_core(&BARE);
         build_file_library(&fixtures.file("runtime"), &bare, &[]);
-        // A second Advanced runtime, and a File library bound to that one.
-        let other = FakeRuntime::new()
-            .with("fake_advanced")
-            .build(&fixtures.core("other"));
-        build_file_library(&fixtures.file("other"), &other, &[]);
+        let other = fixtures.build_core(&OTHER);
+        build_file_library(&fixtures.file(OTHER.directory), &other, &[]);
+        let unnamed = fixtures.build_core(&UNNAMED);
+        build_file_library(&fixtures.file(UNNAMED.directory), &unnamed, &[]);
+        fixtures.build_core(&LONELY);
         // A File library for the paired runtime that lacks a recording entry point.
         build_file_library(
             &fixtures.file("partial"),
@@ -76,8 +112,18 @@ impl Fixtures {
         fixtures
     }
 
-    fn core(&self, directory: &str) -> PathBuf {
-        self.root.join(directory).join(ADVANCED_CORE)
+    fn build_core(&self, arrangement: &Arrangement) -> PathBuf {
+        fs::create_dir(self.root.join(arrangement.directory)).unwrap();
+        let version = format!("6.4.0.{}", arrangement.build);
+        let mut runtime = FakeRuntime::new().with("fake_advanced").version(&version);
+        if arrangement.named {
+            runtime = runtime.soname(ADVANCED_CORE);
+        }
+        runtime.build(&self.core(arrangement))
+    }
+
+    fn core(&self, arrangement: &Arrangement) -> PathBuf {
+        self.root.join(arrangement.directory).join(ADVANCED_CORE)
     }
     fn file(&self, directory: &str) -> PathBuf {
         self.root.join(directory).join(FILE_LIBRARY)
@@ -87,20 +133,40 @@ impl Fixtures {
     }
 }
 
-/// A scenario and the directory it names in `NDI_RUNTIME_DIR_V6`, if any.
-const SCENARIOS: &[(&str, Option<&str>)] = &[
-    ("beside_the_runtime_first_and_pinned", Some("runtime")),
-    (
-        "runtime_directory_when_not_beside_the_runtime",
-        Some("runtime"),
-    ),
-    (
-        "standard_runtime_is_refused_before_anything_is_opened",
-        None,
-    ),
-    ("library_bound_to_another_runtime_is_refused", None),
-    ("failure_names_every_location", None),
-    ("incomplete_family_is_unavailable_alone", None),
+/// How the parent launches one scenario.
+struct Scenario {
+    name: &'static str,
+    /// Directory for `NDI_RUNTIME_DIR_V6`, relative to the fixture root.
+    runtime_directory: Option<&'static str>,
+    /// A runtime to put in the process's global symbol scope with `LD_PRELOAD`.
+    preloaded: Option<&'static Arrangement>,
+}
+
+const fn scenario(name: &'static str) -> Scenario {
+    Scenario {
+        name,
+        runtime_directory: None,
+        preloaded: None,
+    }
+}
+
+const SCENARIOS: &[Scenario] = &[
+    Scenario {
+        runtime_directory: Some("runtime"),
+        ..scenario("beside_the_runtime_first_and_pinned")
+    },
+    Scenario {
+        runtime_directory: Some("runtime"),
+        ..scenario("runtime_directory_when_not_beside_the_runtime")
+    },
+    scenario("standard_runtime_is_refused_before_anything_is_opened"),
+    scenario("library_whose_dependency_is_another_runtime_is_refused"),
+    Scenario {
+        preloaded: Some(&UNNAMED),
+        ..scenario("another_runtime_in_the_global_scope_is_refused_before_anything_is_opened")
+    },
+    scenario("failure_names_every_location"),
+    scenario("incomplete_family_is_unavailable_alone"),
 ];
 
 #[test]
@@ -110,36 +176,42 @@ fn file_library_loader_contract() {
         child(&name, &Fixtures { root });
         return;
     }
-    let root = std::env::temp_dir().join(format!("grafton-ndi-file-loader-{}", std::process::id()));
-    Fixtures::build(&root);
-    for (scenario, runtime_directory) in SCENARIOS {
+    let directory = FixtureDir::create("file-loader");
+    let fixtures = Fixtures::build(directory.path());
+    for scenario in SCENARIOS {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", "file_library_loader_contract", "--nocapture"])
-            .env("GRAFTON_FILE_LOADER_CHILD", scenario)
-            .env("GRAFTON_FILE_LOADER_FIXTURES", &root)
+            .env("GRAFTON_FILE_LOADER_CHILD", scenario.name)
+            .env("GRAFTON_FILE_LOADER_FIXTURES", directory.path())
             .env_remove("NDI_RUNTIME_DIR_V6")
             .env_remove("LD_LIBRARY_PATH");
-        if let Some(directory) = runtime_directory {
-            command.env("NDI_RUNTIME_DIR_V6", root.join(directory));
+        if let Some(runtime_directory) = scenario.runtime_directory {
+            command.env(
+                "NDI_RUNTIME_DIR_V6",
+                directory.path().join(runtime_directory),
+            );
+        }
+        if let Some(arrangement) = scenario.preloaded {
+            command.env("LD_PRELOAD", fixtures.core(arrangement));
         }
         let output = command.output().unwrap();
         assert!(
             output.status.success(),
-            "{scenario}: {}\n{}",
+            "{}: {}\n{}",
+            scenario.name,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    fs::remove_dir_all(root).unwrap();
 }
 
-/// Select the runtime at `core`.
-fn select(core: PathBuf, edition: SdkEdition) -> NDI {
+/// Select the Advanced runtime of `arrangement`.
+fn select(fixtures: &Fixtures, arrangement: &Arrangement) -> NDI {
     NDI::with_options(
         &RuntimeOptions::default()
-            .library_path(core)
-            .edition(edition),
+            .library_path(fixtures.core(arrangement))
+            .edition(SdkEdition::Advanced),
     )
     .unwrap()
 }
@@ -156,6 +228,12 @@ fn unavailable(result: Result<FileApi, FileError>) -> String {
     }
 }
 
+/// The build number of the runtime the loaded File library's imports are
+/// bound to, which the fake library reports through a probe.
+fn bound_runtime(api: &FileApi) -> u32 {
+    api.probe("recording.mkv").unwrap().track_count()
+}
+
 /// Whether a file whose path contains `name` is mapped into this process.
 fn is_loaded(name: &str) -> bool {
     fs::read_to_string("/proc/self/maps")
@@ -168,19 +246,15 @@ fn child(name: &str, fixtures: &Fixtures) {
     let defaults = FileRuntimeOptions::default();
     match name {
         "beside_the_runtime_first_and_pinned" => {
-            let ndi = select(fixtures.core("paired"), SdkEdition::Advanced);
+            let ndi = select(fixtures, &PAIRED);
             let api = FileApi::open(&ndi, &defaults).unwrap();
-            let selected = fixtures.file("paired");
+            let selected = fixtures.file(PAIRED.directory);
             assert_eq!(api.library_path(), Some(selected.as_path()));
-            // The call reaches the library, which refuses every file.
-            assert!(matches!(
-                api.probe("recording.mkv"),
-                Err(FileError::Rejected(_))
-            ));
+            assert_eq!(bound_runtime(&api), PAIRED.build);
 
             // A different library cannot replace the selected one.
             assert!(matches!(
-                FileApi::open(&ndi, &explicit(fixtures.file("other"))),
+                FileApi::open(&ndi, &explicit(fixtures.file(OTHER.directory))),
                 Err(FileError::Core(Error::RuntimeConflict(_)))
             ));
             assert!(matches!(
@@ -195,23 +269,31 @@ fn child(name: &str, fixtures: &Fixtures) {
             drop(ndi);
             assert!(!NDI::is_running());
             assert!(is_loaded(selected.to_str().unwrap()));
-            let ndi = select(fixtures.core("paired"), SdkEdition::Advanced);
+            let ndi = select(fixtures, &PAIRED);
             let api = FileApi::open(&ndi, &defaults).unwrap();
             assert_eq!(api.library_path(), Some(selected.as_path()));
-            assert!(matches!(
-                api.probe("recording.mkv"),
-                Err(FileError::Rejected(_))
-            ));
+            assert_eq!(bound_runtime(&api), PAIRED.build);
         }
         "runtime_directory_when_not_beside_the_runtime" => {
-            let ndi = select(fixtures.core("bare"), SdkEdition::Advanced);
+            let ndi = select(fixtures, &BARE);
             let api = FileApi::open(&ndi, &defaults).unwrap();
             assert_eq!(api.library_path(), Some(fixtures.file("runtime").as_path()));
+            // It has no runtime beside it: the loader bound it to the selected
+            // one, which is already loaded under the name it asks for.
+            assert_eq!(bound_runtime(&api), BARE.build);
         }
         "standard_runtime_is_refused_before_anything_is_opened" => {
-            let ndi = select(fixtures.standard_core(), SdkEdition::Standard);
+            let ndi = NDI::with_options(
+                &RuntimeOptions::default()
+                    .library_path(fixtures.standard_core())
+                    .edition(SdkEdition::Standard),
+            )
+            .unwrap();
             // A File library that exists and would load.
-            let reason = unavailable(FileApi::open(&ndi, &explicit(fixtures.file("paired"))));
+            let reason = unavailable(FileApi::open(
+                &ndi,
+                &explicit(fixtures.file(PAIRED.directory)),
+            ));
             assert!(reason.contains("Advanced SDK runtime"), "{reason}");
             assert!(!is_loaded(FILE_LIBRARY));
             assert!(!is_loaded(ADVANCED_CORE));
@@ -219,23 +301,41 @@ fn child(name: &str, fixtures: &Fixtures) {
             assert!(NDI::is_running());
             drop(ndi);
         }
-        "library_bound_to_another_runtime_is_refused" => {
-            let ndi = select(fixtures.core("paired"), SdkEdition::Advanced);
-            let reason = unavailable(FileApi::open(&ndi, &explicit(fixtures.file("other"))));
+        "library_whose_dependency_is_another_runtime_is_refused" => {
+            // The selected runtime cannot be matched by name, so this File
+            // library's dependency is satisfied by the runtime beside it.
+            let ndi = select(fixtures, &UNNAMED);
+            let foreign = fixtures.file(OTHER.directory);
+            let reason = unavailable(FileApi::open(&ndi, &explicit(foreign.clone())));
             assert!(
                 reason.contains("bound to an NDI runtime other than the selected one"),
                 "{reason}"
             );
-            assert!(
-                reason.contains(fixtures.file("other").to_str().unwrap()),
-                "{reason}"
-            );
+            assert!(reason.contains(foreign.to_str().unwrap()), "{reason}");
             // Nothing was selected, so the right library can still be.
             let api = FileApi::open(&ndi, &defaults).unwrap();
-            assert_eq!(api.library_path(), Some(fixtures.file("paired").as_path()));
+            assert_eq!(
+                api.library_path(),
+                Some(fixtures.file(UNNAMED.directory).as_path())
+            );
+            assert_eq!(bound_runtime(&api), UNNAMED.build);
+        }
+        "another_runtime_in_the_global_scope_is_refused_before_anything_is_opened" => {
+            // Another runtime was loaded with the program, under a name the
+            // File library does not ask for. The library's own dependency is
+            // the selected runtime, but the platform loader binds its imports
+            // from the global scope first: to the other runtime.
+            let ndi = select(fixtures, &PAIRED);
+            let preloaded = fixtures.core(&UNNAMED);
+            let reason = unavailable(FileApi::open(&ndi, &defaults));
+            assert!(reason.contains("global symbol scope"), "{reason}");
+            assert!(reason.contains(preloaded.to_str().unwrap()), "{reason}");
+            assert!(!is_loaded(FILE_LIBRARY));
         }
         "failure_names_every_location" => {
-            let ndi = select(fixtures.core("bare"), SdkEdition::Advanced);
+            // No File library can bind to this runtime, so the outcome does
+            // not depend on what the machine has installed.
+            let ndi = select(fixtures, &LONELY);
             let reason = unavailable(FileApi::open(&ndi, &defaults));
             let beside_executable = std::env::current_exe()
                 .unwrap()
@@ -243,25 +343,24 @@ fn child(name: &str, fixtures: &Fixtures) {
             for expected in [
                 format!(
                     "{} (next to the NDI runtime): not found",
-                    fixtures.file("bare").display()
+                    fixtures.file(LONELY.directory).display()
                 ),
                 format!(
                     "{} (next to the executable): not found",
                     beside_executable.display()
                 ),
-                format!("{FILE_LIBRARY} (system library search): "),
-                "cannot open shared object file".to_owned(),
+                format!("{FILE_LIBRARY} (system library search)"),
             ] {
                 assert!(
                     reason.contains(&expected),
                     "missing `{expected}` in: {reason}"
                 );
             }
-            // A failed search leaves selection open.
-            FileApi::open(&ndi, &explicit(fixtures.file("runtime"))).unwrap();
+            // A failed search leaves selection open: it fails the same way again.
+            unavailable(FileApi::open(&ndi, &defaults));
         }
         "incomplete_family_is_unavailable_alone" => {
-            let ndi = select(fixtures.core("paired"), SdkEdition::Advanced);
+            let ndi = select(fixtures, &PAIRED);
             let api = FileApi::open(&ndi, &explicit(fixtures.file("partial"))).unwrap();
             let options = RecorderOptions::new(SourceSpec::new("a source").unwrap());
             match api.create_recorder(options) {
@@ -271,6 +370,7 @@ fn child(name: &str, fixtures: &Fixtures) {
                 other => panic!("expected recording to be unavailable: {other:?}"),
             }
             // Playback is complete in this library and still reaches it.
+            assert_eq!(bound_runtime(&api), PAIRED.build);
             assert!(matches!(
                 api.create_player(PlayerOptions::new("a player").unwrap()),
                 Err(FileError::Rejected(_))

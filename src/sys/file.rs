@@ -186,6 +186,21 @@ impl FileRuntime {
                     .into(),
             ));
         }
+        // Where libraries are ELF objects, the platform loader binds the File
+        // library's imports from the process's global scope before it looks
+        // at the library's own dependencies. A runtime already there, such as
+        // one the program was linked or preloaded with, would be the one the
+        // File library uses, whatever its dependency resolves to.
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        if let Some(file) = foreign_global_definition(
+            Self::CORE_ENTRY,
+            api.core.NDIlib_initialize as *mut std::ffi::c_void,
+        ) {
+            return Err(Error::RuntimeLoadFailed(format!(
+                "the process's global symbol scope already holds an NDI runtime that is not the \
+                 selected one ({file}); the NDI File library would bind to it"
+            )));
+        }
         Search {
             explicit,
             beside: core.library_path(),
@@ -224,6 +239,32 @@ impl FileRuntime {
     fn accepts(&self, requested: Option<&Path>) -> Result<()> {
         confirm_selected(&self.path, requested)
     }
+}
+
+/// The file that defines `name` in the process's global symbol scope, when
+/// that definition is not the one at `selected`.
+#[cfg(all(unix, not(target_vendor = "apple"), not(ndi_link_static)))]
+fn foreign_global_definition(name: &CStr, selected: *mut std::ffi::c_void) -> Option<String> {
+    // SAFETY: a lookup of a NUL-terminated name in the default scope.
+    let address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+    if address.is_null() || address == selected {
+        return None;
+    }
+    let mut info = std::mem::MaybeUninit::<libc::Dl_info>::uninit();
+    // SAFETY: `info` is writable storage for one Dl_info; dladdr only reads
+    // the loader's module list for `address`.
+    let file = (unsafe { libc::dladdr(address, info.as_mut_ptr()) } != 0)
+        // SAFETY: dladdr reported success, so it initialized `info`.
+        .then(|| unsafe { info.assume_init() }.dli_fname)
+        .filter(|file| !file.is_null())
+        // SAFETY: a non-null dli_fname is a NUL-terminated string the loader
+        // keeps for as long as the module is loaded.
+        .map(|file| {
+            unsafe { CStr::from_ptr(file) }
+                .to_string_lossy()
+                .into_owned()
+        });
+    Some(file.unwrap_or_else(|| "a module the loader cannot name".into()))
 }
 
 #[cfg(ndi_link_static)]
