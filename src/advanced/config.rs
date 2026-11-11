@@ -2,17 +2,45 @@ use std::{ffi::CString, fmt, sync::Arc};
 
 use crate::{Error, Result};
 
-/// Immutable per-instance SDK JSON. Debug output deliberately redacts its contents.
+/// The JSON configuration of one Advanced SDK object.
+///
+/// The SDK accepts a JSON document when it creates a sender, receiver, finder
+/// and several other objects; the document's properties are defined by the
+/// NDI Advanced SDK documentation. This type holds one such document: it is
+/// checked to be a JSON object, kept byte for byte (unknown properties
+/// included), immutable, and cheap to clone.
+///
+/// A configuration can carry vendor credentials or network details, so its
+/// `Debug` output shows no content and no error message quotes it.
+///
+/// # Examples
+///
+/// ```
+/// use grafton_ndi::advanced::AdvancedConfig;
+///
+/// let config = AdvancedConfig::parse(r#"{"ndi": {"machinename": "studio-a"}}"#)?;
+/// assert_eq!(format!("{config:?}"), "AdvancedConfig([REDACTED])");
+/// # Ok::<(), grafton_ndi::Error>(())
+/// ```
 #[derive(Clone)]
 pub struct AdvancedConfig(Arc<CString>);
 
 impl AdvancedConfig {
-    /// Parse a JSON object, preserving unknown properties and the original text.
+    /// Accept a JSON object of at most one mebibyte.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidConfiguration`] when the text is too large, is not
+    /// valid JSON, is not an object, or contains a NUL.
     pub fn parse(json: impl AsRef<str>) -> Result<Self> {
         Self::parse_with_limit(json, 1024 * 1024)
     }
 
-    /// Parse with an explicit maximum byte size. Error messages never echo JSON.
+    /// Accept a JSON object of at most `maximum_bytes` bytes.
+    ///
+    /// # Errors
+    ///
+    /// As for [`parse`](Self::parse).
     pub fn parse_with_limit(json: impl AsRef<str>, maximum_bytes: usize) -> Result<Self> {
         let json = json.as_ref();
         if json.len() > maximum_bytes {
@@ -34,14 +62,21 @@ impl AdvancedConfig {
         Ok(Self(Arc::new(json)))
     }
 
-    /// Explicitly expose JSON, which may contain vendor credentials or network details.
+    /// The JSON text exactly as it was given. It may contain vendor
+    /// credentials or network details; the name is a reminder not to log it.
     pub fn expose_json(&self) -> &str {
         // Construction accepts UTF-8 and CString never changes those bytes.
         self.0.to_str().expect("validated configuration UTF-8")
     }
 
+    /// The text as a C string, valid for as long as any clone of `self` lives.
     pub(crate) fn as_ptr(&self) -> *const std::ffi::c_char {
         self.0.as_ptr()
+    }
+
+    /// An owned copy of the text for an object that retains its own.
+    pub(crate) fn to_c_string(&self) -> CString {
+        CString::clone(&self.0)
     }
 }
 

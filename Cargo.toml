@@ -87,3 +87,31 @@ syn = { version = "2", features = ["full"] }
 [[example]]
 name = "NDIlib_Recv_PNG"
 required-features = ["image-encoding"]
+
+[[example]]
+name = "advanced_allocator"
+required-features = ["advanced"]
+
+[[example]]
+name = "advanced_avsync"
+required-features = ["advanced"]
+
+[[example]]
+name = "advanced_genlock"
+required-features = ["advanced"]
+
+[[example]]
+name = "advanced_kvm"
+required-features = ["advanced"]
+
+[[example]]
+name = "advanced_passthrough"
+required-features = ["advanced"]
+
+[[example]]
+name = "advanced_queued_send"
+required-features = ["advanced"]
+
+[[example]]
+name = "advanced_source_metadata"
+required-features = ["advanced"]

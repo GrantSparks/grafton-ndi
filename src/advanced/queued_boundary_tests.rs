@@ -11,7 +11,7 @@ fn retain(state: &CallbackState, id: u64) -> usize {
         key,
         Entry {
             id: SubmissionId(id),
-            header,
+            _header: header,
             frame,
             bytes,
             complete: false,
@@ -62,11 +62,4 @@ fn malformed_callback_retains_pending_ownership_and_reports_protocol_failure() {
     assert_eq!(locked.entries.len(), 1);
     assert!(locked.ready.is_empty());
     assert!(locked.bytes > 0);
-}
-
-#[cfg(ndi_has_advanced_header)]
-#[test]
-fn completion_callback_type_matches_authorized_sdk_typedef() {
-    let callback: NDIlib_video_send_async_completion_t = Some(completion);
-    let _: Option<Callback> = callback;
 }

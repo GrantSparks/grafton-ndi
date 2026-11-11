@@ -22,6 +22,9 @@ const ADVANCED_RECEIVER: &CStr = c"NDIlib_recv_create_v4";
 /// The implementation selected for this process.
 pub(crate) struct Runtime {
     pub(crate) api: Api,
+    /// The Advanced tables, reached through `sys::advanced::AdvancedTable::of`.
+    #[cfg(ndi_has_advanced_header)]
+    pub(crate) advanced: super::advanced::AdvancedApi,
     pub(crate) info: RuntimeInfo,
     pub(crate) capabilities: Capabilities,
     // The linked provider carries no state; only the Advanced bridge reads it.
@@ -73,6 +76,8 @@ impl Runtime {
     /// The error is the reason this implementation cannot be used.
     fn describe(provider: Provider, requested: SdkEdition) -> std::result::Result<Self, String> {
         let api = Api::load(&provider).map_err(reason)?;
+        #[cfg(ndi_has_advanced_header)]
+        let advanced_tables = super::advanced::AdvancedApi::load(&provider).map_err(reason)?;
         let advanced = AdvancedEntryPoints::detect(&provider).map_err(reason)?;
         let edition = provider.edition(advanced);
         if requested == SdkEdition::Advanced && edition != SdkEdition::Advanced {
@@ -101,6 +106,8 @@ impl Runtime {
         Ok(Self {
             capabilities: Capabilities::detect(&api, version, edition, advanced),
             api,
+            #[cfg(ndi_has_advanced_header)]
+            advanced: advanced_tables,
             info,
             provider,
         })

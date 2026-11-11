@@ -362,6 +362,17 @@ impl NDI {
         &self.runtime.api
     }
 
+    /// A table of Advanced SDK entry points from the selected implementation.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedCapability`] when the runtime lacks the table or the
+    /// crate was built without the Advanced SDK declarations.
+    #[cfg(feature = "advanced")]
+    pub(crate) fn advanced<T: sys::advanced::AdvancedTable>(&self) -> Result<&'static T> {
+        T::of(self.runtime)
+    }
+
     /// Reject an unavailable operation before passing newer inputs to the SDK.
     ///
     /// # Errors

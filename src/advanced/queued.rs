@@ -1,11 +1,9 @@
-//! Native completion ownership for bounded asynchronous video queues.
+//! Asynchronous video sending with a bounded queue and completion
+//! notification.
 
-use super::{ffi, AdvancedConfig, CompressedVideoFrame};
-use crate::{advanced::ffi::native::*, Error, Result, Sender, SenderOptions, VideoFrame, NDI};
 use std::{
     collections::{BTreeMap, VecDeque},
     ffi::c_void,
-    fmt,
     marker::PhantomData,
     rc::Rc,
     sync::{
@@ -15,16 +13,27 @@ use std::{
     time::{Duration, Instant},
 };
 
-type Callback = unsafe extern "C" fn(*mut c_void, *const NDIlib_video_frame_v2_t);
-type SetCallback = unsafe extern "C" fn(NDIlib_send_instance_t, *mut c_void, Option<Callback>);
-type Submit = unsafe extern "C" fn(NDIlib_send_instance_t, *const NDIlib_video_frame_v2_t);
+use super::{AdvancedConfig, CompressedVideoFrame, Rejected};
+use crate::{
+    sys::{
+        self,
+        advanced::{native, SendCompletion},
+        bindings::*,
+    },
+    Error, Result, Sender, SenderOptions, VideoFrame, NDI,
+};
 
-/// Limits include completed frames until the application collects them.
+/// Limits on what a [`QueuedSender`] holds at once.
+///
+/// A frame counts from submission until the application takes it back, so a
+/// frame the SDK has finished with but that has not been collected still uses
+/// its share. The defaults are 8 frames and 512 MiB.
 #[derive(Debug, Clone, Copy)]
 pub struct QueueOptions {
     frames: usize,
     bytes: usize,
 }
+
 impl Default for QueueOptions {
     fn default() -> Self {
         Self {
@@ -33,17 +42,20 @@ impl Default for QueueOptions {
         }
     }
 }
+
 impl QueueOptions {
-    /// Set the maximum number of retained submissions, including completed ones.
+    /// Set the maximum number of frames held, from 1 to 65 536.
     pub fn max_frames(mut self, frames: usize) -> Self {
         self.frames = frames;
         self
     }
-    /// Set the maximum retained pixel/packet and metadata allocation bytes.
+
+    /// Set the maximum number of bytes of frame data and metadata held.
     pub fn max_bytes(mut self, bytes: usize) -> Self {
         self.bytes = bytes;
         self
     }
+
     fn validate(self) -> Result<Self> {
         if self.frames == 0
             || self.frames > 65_536
@@ -57,31 +69,40 @@ impl QueueOptions {
         Ok(self)
     }
 }
-/// A unique submission identifier within a queue, never recycled.
+/// Identifies one submission to a [`QueuedSender`]. Identifiers increase with
+/// each submission and are never reused by the same queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SubmissionId(u64);
+
 impl SubmissionId {
+    /// The identifier as a number.
     pub fn get(self) -> u64 {
         self.0
     }
 }
-/// Owned video accepted by native completion sending.
+
+/// A video frame a [`QueuedSender`] can send.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum QueuedVideoFrame {
+    /// An uncompressed frame.
     Pixels(VideoFrame),
+    /// A compressed frame.
     Compressed(CompressedVideoFrame),
 }
+
 impl From<VideoFrame> for QueuedVideoFrame {
     fn from(v: VideoFrame) -> Self {
         Self::Pixels(v)
     }
 }
+
 impl From<CompressedVideoFrame> for QueuedVideoFrame {
     fn from(v: CompressedVideoFrame) -> Self {
         Self::Compressed(v)
     }
 }
+
 impl QueuedVideoFrame {
     fn raw(&self) -> NDIlib_video_frame_v2_t {
         match self {
@@ -89,17 +110,14 @@ impl QueuedVideoFrame {
             Self::Compressed(v) => v.raw(),
         }
     }
+
     fn retained_bytes(&self) -> usize {
         match self {
             Self::Pixels(v) => v.retained_bytes(),
-            Self::Compressed(v) => {
-                v.bytes.len()
-                    + v.metadata
-                        .as_ref()
-                        .map_or(0, |m| m.as_bytes_with_nul().len())
-            }
+            Self::Compressed(v) => v.retained_bytes(),
         }
     }
+
     fn validate(&self) -> Result<()> {
         match self {
             Self::Pixels(_) => Ok(()),
@@ -107,55 +125,45 @@ impl QueuedVideoFrame {
         }
     }
 }
-/// Ownership returned when a submission cannot be accepted.
-#[derive(Debug)]
-pub struct QueueSubmitError {
-    error: Error,
-    frame: QueuedVideoFrame,
-}
-impl QueueSubmitError {
-    pub fn error(&self) -> &Error {
-        &self.error
-    }
-    pub fn into_parts(self) -> (Error, QueuedVideoFrame) {
-        (self.error, self.frame)
-    }
-}
-impl fmt::Display for QueueSubmitError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.error.fmt(f)
-    }
-}
-impl std::error::Error for QueueSubmitError {}
-/// A native-completed submission whose storage can be reused.
+/// A frame the SDK has finished sending, ready to be reused.
 #[derive(Debug)]
 pub struct CompletedVideo {
     id: SubmissionId,
     frame: QueuedVideoFrame,
 }
+
 impl CompletedVideo {
+    /// The identifier [`QueuedSender::try_submit`] returned for this frame.
     pub fn id(&self) -> SubmissionId {
         self.id
     }
+
+    /// The frame.
     pub fn frame(&self) -> &QueuedVideoFrame {
         &self.frame
     }
+
+    /// Take the frame.
     pub fn into_frame(self) -> QueuedVideoFrame {
         self.frame
     }
 }
 
+/// One submitted frame and the descriptor the SDK was given for it.
 struct Entry {
     id: SubmissionId,
-    header: Box<NDIlib_video_frame_v2_t>,
+    // Kept only so that the address given to the SDK stays valid.
+    _header: Box<NDIlib_video_frame_v2_t>,
     frame: QueuedVideoFrame,
     bytes: usize,
     complete: bool,
 }
-// SAFETY: Header pointers refer only to this entry's immutable owned allocations.
-// A callback never dereferences or drops those allocations; the locked registry
-// keeps them alive until completion and the submission call has returned.
+
+// SAFETY: the descriptor points only into allocations this entry owns, which
+// are not mutated while it is queued. The completion callback neither reads
+// nor releases them; the queue does, after completion.
 unsafe impl Send for Entry {}
+
 struct State {
     entries: BTreeMap<usize, Entry>,
     ready: VecDeque<usize>,
@@ -163,11 +171,13 @@ struct State {
     next: u64,
     options: QueueOptions,
 }
+
 struct CallbackState {
     state: Mutex<State>,
     changed: Condvar,
     protocol_error: AtomicBool,
 }
+
 impl CallbackState {
     fn new(options: QueueOptions) -> Result<Box<Self>> {
         let options = options.validate()?;
@@ -187,6 +197,7 @@ impl CallbackState {
             protocol_error: AtomicBool::new(false),
         }))
     }
+
     fn complete(&self, address: usize) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         match state.entries.get_mut(&address) {
@@ -204,12 +215,15 @@ impl CallbackState {
         }
     }
 }
+/// The completion callback the SDK calls, on its own threads, when it has
+/// finished with an asynchronously sent frame.
 unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_frame_v2_t) {
     if opaque.is_null() {
         return;
     }
-    // SDK send_destroy is the documented callback drain barrier. The owning
-    // QueuedSender retains this Box until that native destruction has returned.
+    // SAFETY: `opaque` is the callback state registered with the sender. The
+    // SDK makes no call after the sender is destroyed, and the owning
+    // `QueuedSender` releases the state only after that.
     let state = unsafe { &*opaque.cast::<CallbackState>() };
     if frame.is_null() {
         state.protocol_error.store(true, Ordering::Release);
@@ -217,8 +231,9 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
         return;
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Header addresses may be reused by the SDK. Match the owned data
-        // allocation, which remains unique throughout its retained submission.
+        // The SDK may pass its own copy of the descriptor, so a submission is
+        // recognized by its data allocation, which is unique while retained.
+        // SAFETY: non-null was checked, and the SDK passes a readable descriptor.
         state.complete(unsafe { (*frame).p_data } as usize);
     }));
     if result.is_err() {
@@ -227,97 +242,163 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
     }
 }
 
-/// A bounded, thread-affine sender using native completion callbacks.
+/// A sender that queues video frames and reports when each has been sent.
 ///
-/// Submission does not wait for the previous frame. No application callback runs
-/// on an SDK thread: collect owned frames with try_take_completed/wait_completed.
-/// Destruction blocks until the SDK drains callbacks; no deadline is promised.
+/// An ordinary asynchronous send must wait for the previous frame before it
+/// can accept the next. This sender instead keeps every submitted frame until
+/// the SDK reports it complete, so submission never waits on a slow
+/// connection, up to the limits in [`QueueOptions`]. No application code runs
+/// on an SDK thread: completed frames are collected with
+/// [`try_take_completed`](Self::try_take_completed) or
+/// [`wait_completed`](Self::wait_completed) and can be reused.
+///
+/// The sender is used from the thread that owns it. Dropping it destroys the
+/// native sender, which waits, without a timeout, for the SDK to finish with
+/// every frame still queued.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::time::Duration;
+/// use grafton_ndi::{
+///     advanced::{QueueOptions, QueuedSender},
+///     SenderOptions, VideoFrame, NDI,
+/// };
+///
+/// # fn main() -> Result<(), grafton_ndi::Error> {
+/// let ndi = NDI::new()?;
+/// let mut sender = QueuedSender::new(
+///     &ndi,
+///     &SenderOptions::builder("Queued").build(),
+///     QueueOptions::default().max_frames(4),
+/// )?;
+/// let id = sender.try_submit(VideoFrame::builder().resolution(1920, 1080).build()?)?;
+/// if let Some(done) = sender.wait_completed(Duration::from_secs(1))? {
+///     assert_eq!(done.id(), id);
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub struct QueuedSender {
-    sender: Option<Sender>,
+    // Declared first so that it is destroyed first: destroying the native
+    // sender is what ends the SDK's completion callbacks.
+    sender: Sender,
     callback: Box<CallbackState>,
-    submit: Submit,
+    core: &'static sys::Core,
     _thread: PhantomData<Rc<()>>,
 }
+
 impl QueuedSender {
-    /// Create a new sender and install completion ownership before any submission.
+    /// Create a sender with the SDK's default configuration.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedCapability`] without an Advanced runtime (or in a
+    /// build without the Advanced SDK), [`Error::InvalidConfiguration`] for
+    /// limits outside their range, and the errors of [`Sender::new`].
     pub fn new(ndi: &NDI, options: &SenderOptions, limits: QueueOptions) -> Result<Self> {
-        let register: SetCallback =
-            unsafe { ffi::required(ndi, b"NDIlib_send_set_video_async_completion\0")? };
-        let submit: Submit = unsafe { ndi.resolve_optional(b"NDIlib_send_send_video_async_v2\0")? }
-            .ok_or_else(|| Error::UnsupportedCapability {
-                capability: "queued video sending".into(),
-                reason: "native async submission unavailable".into(),
-            })?;
+        let table = ndi.advanced::<SendCompletion>()?;
         let callback = CallbackState::new(limits)?;
         let sender = Sender::new(ndi, options)?;
-        Ok(Self::install(sender, callback, submit, register))
+        Ok(Self::install(sender, callback, table))
     }
-    /// Create with retained Advanced JSON configuration.
+
+    /// Create a sender with a per-instance Advanced SDK configuration.
+    ///
+    /// # Errors
+    ///
+    /// As for [`new`](Self::new), with the errors of
+    /// [`Sender::new_with_config`].
     pub fn new_with_config(
         ndi: &NDI,
         options: &SenderOptions,
         config: &AdvancedConfig,
         limits: QueueOptions,
     ) -> Result<Self> {
-        let register: SetCallback =
-            unsafe { ffi::required(ndi, b"NDIlib_send_set_video_async_completion\0")? };
-        let submit = unsafe { ffi::required(ndi, b"NDIlib_send_send_video_async_v2\0")? };
+        let table = ndi.advanced::<SendCompletion>()?;
         let callback = CallbackState::new(limits)?;
         let sender = Sender::new_with_config(ndi, options, config)?;
-        Ok(Self::install(sender, callback, submit, register))
+        Ok(Self::install(sender, callback, table))
     }
-    /// Drain and consume an existing sender. Active advertiser registrations are
-    /// rejected because they would defer the native destruction barrier.
-    pub fn from_sender(mut sender: Sender, limits: QueueOptions) -> Result<Self> {
-        let register = unsafe {
-            ffi::required(
-                sender.runtime(),
-                b"NDIlib_send_set_video_async_completion\0",
-            )?
+
+    /// Turn an existing sender into a queued one.
+    ///
+    /// The sender's own asynchronous video send is finished first; the frame
+    /// it was still holding, if any, is returned beside the queue, and its
+    /// completion handler is removed. The conversion is one-way.
+    ///
+    /// # Errors
+    ///
+    /// Returns the sender, unchanged, with [`Error::UnsupportedCapability`]
+    /// without an Advanced runtime, or [`Error::InvalidConfiguration`] for
+    /// limits outside their range or a sender that is registered with an
+    /// advertiser (a registration keeps the native sender alive after this
+    /// value is dropped, when the completion state no longer exists).
+    pub fn from_sender(
+        mut sender: Sender,
+        limits: QueueOptions,
+    ) -> std::result::Result<(Self, Option<VideoFrame>), Rejected<Sender>> {
+        let prepare = || {
+            let table = sender.runtime().advanced::<SendCompletion>()?;
+            let callback = CallbackState::new(limits)?;
+            if !sender.has_exclusive_native_owner() {
+                return Err(Error::InvalidConfiguration(
+                    "queued conversion requires a sender without advertiser registrations".into(),
+                ));
+            }
+            Ok((table, callback))
         };
-        let submit =
-            unsafe { ffi::required(sender.runtime(), b"NDIlib_send_send_video_async_v2\0")? };
-        let callback = CallbackState::new(limits)?;
-        if !sender.has_exclusive_native_owner() {
-            return Err(Error::InvalidConfiguration(
-                "queued conversion requires a sender without advertiser registrations".into(),
-            ));
-        }
-        drop(sender.finish_video_async());
+        let (table, callback) = match prepare() {
+            Ok(prepared) => prepared,
+            Err(error) => return Err(Rejected::new(error, sender)),
+        };
+        // Nothing below can fail, so the sender may now be changed.
+        let earlier = sender.finish_video_async();
         sender.clear_async_video_done();
-        Ok(Self::install(sender, callback, submit, register))
+        Ok((Self::install(sender, callback, table), earlier))
     }
+
+    /// Register the completion callback before anything can be submitted.
     fn install(
         sender: Sender,
-        mut callback: Box<CallbackState>,
-        submit: Submit,
-        register: SetCallback,
+        callback: Box<CallbackState>,
+        table: &'static SendCompletion,
     ) -> Self {
-        unsafe {
-            register(
+        let state: *const CallbackState = &*callback;
+        // SAFETY: the sender is live. The state is heap-allocated, the callback
+        // only reads it through a shared reference, and the returned value
+        // keeps it until after the sender has been destroyed.
+        native!(table => unsafe {
+            table.NDIlib_send_set_video_async_completion(
                 sender.native_instance(),
-                (&mut *callback as *mut CallbackState).cast(),
+                state.cast_mut().cast(),
                 Some(completion),
             )
-        };
+        });
         Self {
-            sender: Some(sender),
+            core: &sender.runtime().api().core,
+            sender,
             callback,
-            submit,
             _thread: PhantomData,
         }
     }
-    /// Submit without copying. On backpressure or validation failure, recover the
-    /// original frame from QueueSubmitError. Completed frames count toward limits.
-    // Backpressure returns the original owner without adding a fallible heap
-    // allocation on an already capacity-constrained submission path.
-    #[allow(clippy::result_large_err)]
+
+    /// Queue a frame for sending, without copying it and without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns the frame with [`Error::InvalidConfiguration`] when a limit in
+    /// [`QueueOptions`] is reached (collect completed frames and try again)
+    /// or the queue has failed (see
+    /// [`completion_protocol_failed`](Self::completion_protocol_failed)), and
+    /// with [`Error::InvalidFrame`] when the frame is not sendable or shares
+    /// its data with a frame already queued.
     pub fn try_submit(
         &mut self,
         frame: impl Into<QueuedVideoFrame>,
-    ) -> std::result::Result<SubmissionId, QueueSubmitError> {
+    ) -> std::result::Result<SubmissionId, Rejected<QueuedVideoFrame>> {
         let frame = frame.into();
-        let failure = |error, frame| QueueSubmitError { error, frame };
+        let failure = Rejected::new;
         if let Err(error) = frame.validate() {
             return Err(failure(error, frame));
         }
@@ -376,7 +457,7 @@ impl QueuedSender {
                 key,
                 Entry {
                     id,
-                    header,
+                    _header: header,
                     frame,
                     bytes,
                     complete: false,
@@ -384,17 +465,18 @@ impl QueuedSender {
             );
             id
         };
-        // Publish ownership before FFI, release the lock before the SDK can call
-        // synchronously back, and retain the boxed header until collection.
+        // The entry is recorded before the call and the lock released, because
+        // the SDK may complete the frame before the call returns.
+        // SAFETY: the sender is live, and the queue keeps the descriptor and
+        // the frame it points to until the SDK reports completion.
         unsafe {
-            (self.submit)(
-                self.sender.as_ref().expect("live queue").native_instance(),
-                pointer,
-            )
+            self.core
+                .NDIlib_send_send_video_async_v2(self.sender.native_instance(), pointer)
         };
         Ok(id)
     }
-    /// Retrieve one native-completed frame without waiting.
+
+    /// Take one completed frame, if there is one.
     pub fn try_take_completed(&mut self) -> Option<CompletedVideo> {
         let mut state = self
             .callback
@@ -403,8 +485,15 @@ impl QueuedSender {
             .unwrap_or_else(|p| p.into_inner());
         take_completed(&mut state)
     }
-    /// Wait for a completion within a finite caller budget. A timeout retains all
-    /// frames and permits subsequent collection or continued use.
+
+    /// Wait up to `timeout` for a completed frame. `None` means none completed
+    /// in time; the queue is unchanged and can still be used.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidConfiguration`] when `timeout` exceeds
+    /// [`crate::MAX_TIMEOUT`] or the queue has failed (see
+    /// [`completion_protocol_failed`](Self::completion_protocol_failed)).
     pub fn wait_completed(&mut self, timeout: Duration) -> Result<Option<CompletedVideo>> {
         crate::to_ms_checked(timeout)?;
         let start = Instant::now();
@@ -436,7 +525,9 @@ impl QueuedSender {
             state = next;
         }
     }
-    /// Count native-pending plus completed-but-uncollected frames.
+
+    /// The number of frames held: those still being sent and those completed
+    /// but not yet collected.
     pub fn retained_frames(&self) -> usize {
         self.callback
             .state
@@ -445,11 +536,18 @@ impl QueuedSender {
             .entries
             .len()
     }
-    /// Whether the native callback stream violated the expected one-completion contract.
+
+    /// Whether the SDK has reported a completion that matches no queued frame,
+    /// or the same one twice.
+    ///
+    /// The queue then no longer knows which frames the SDK still reads, so it
+    /// accepts no more submissions; frames already completed can still be
+    /// collected, and dropping the sender releases the rest safely.
     pub fn completion_protocol_failed(&self) -> bool {
         self.callback.protocol_error.load(Ordering::Acquire)
     }
 }
+
 fn take_completed(state: &mut State) -> Option<CompletedVideo> {
     let key = state.ready.pop_front()?;
     let entry = state
@@ -457,20 +555,10 @@ fn take_completed(state: &mut State) -> Option<CompletedVideo> {
         .remove(&key)
         .expect("completion names retained entry");
     state.bytes -= entry.bytes;
-    // Drop the boxed header only after native completion and submission return.
-    drop(entry.header);
     Some(CompletedVideo {
         id: entry.id,
         frame: entry.frame,
     })
-}
-impl Drop for QueuedSender {
-    fn drop(&mut self) {
-        // No registry lock held: send_destroy may run completion callbacks here.
-        // Sender is exclusive and its native resource cannot outlive this call.
-        drop(self.sender.take());
-        // callback and all uncollected buffers drop only after the SDK barrier.
-    }
 }
 
 #[cfg(test)]
@@ -488,7 +576,7 @@ mod tests {
             key,
             Entry {
                 id: SubmissionId(id),
-                header,
+                _header: header,
                 frame,
                 bytes,
                 complete: false,
@@ -496,6 +584,7 @@ mod tests {
         );
         key
     }
+
     #[test]
     fn concurrent_and_out_of_order_callbacks_preserve_owned_frames() {
         let state = CallbackState::new(QueueOptions::default()).unwrap();
@@ -511,6 +600,7 @@ mod tests {
         assert_eq!(take_completed(&mut s).unwrap().id().get(), 1);
         assert_eq!(s.bytes, 0);
     }
+
     #[test]
     fn duplicate_and_unknown_completions_do_not_release_storage() {
         let state = CallbackState::new(QueueOptions::default()).unwrap();

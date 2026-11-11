@@ -1,10 +1,17 @@
-//! Explicitly opted-in native Advanced SDK tests, using only test-owned peers.
-#![cfg(all(feature = "advanced", ndi_has_advanced_header))]
+//! Advanced SDK operations against a real runtime, using only peers these
+//! tests create.
+//!
+//! The tests that need an Advanced SDK runtime start with `advanced_ndi()`, so
+//! they are skipped visibly elsewhere and fail where
+//! `GRAFTON_NDI_REQUIRE_RUNTIME` promises `advanced`. They compile in every
+//! build: the Advanced API is the same with and without the SDK's headers.
+#![cfg(feature = "advanced")]
+
 mod common;
+
 use grafton_ndi::{
-    advanced::*, capabilities::SdkEdition, runtime::RuntimeOptions, AudioFrame, Finder,
-    FinderOptions, Receiver, ReceiverOptions, Sender, SenderOptions, Source, Tally, VideoFrame,
-    NDI,
+    advanced::*, capabilities::RuntimeFeature, AudioFrame, Error, Finder, FinderOptions, Receiver,
+    ReceiverOptions, Sender, SenderOptions, Source, Tally, VideoFrame, NDI,
 };
 use std::{
     sync::{
@@ -14,27 +21,26 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn runtime() -> NDI {
-    let mut options = RuntimeOptions::default().edition(SdkEdition::Advanced);
-    if let Some(path) = std::env::var_os("GRAFTON_NDI_RUNTIME") {
-        options = options.library_path(std::path::PathBuf::from(path));
-    }
-    NDI::with_options(&options).expect("authorized Advanced runtime required")
-}
 fn options(suffix: &str) -> SenderOptions {
     SenderOptions::builder(format!("grafton-local-{}-{suffix}", std::process::id()))
         .clock_video(false)
         .clock_audio(false)
         .build()
 }
+
 fn video() -> VideoFrame {
     VideoFrame::builder().resolution(64, 32).build().unwrap()
 }
 
+fn unconnected_receiver(ndi: &NDI) -> Receiver {
+    Receiver::new(ndi, &ReceiverOptions::builder(Source::default()).build()).unwrap()
+}
+
 #[test]
-#[ignore = "requires an authorized local Advanced SDK runtime"]
 fn advanced_native_constructors_controls_and_queue() {
-    let ndi = runtime();
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
     let config = AdvancedConfig::parse("{}").unwrap();
     let sender = Sender::new_with_config(&ndi, &options("controls"), &config).unwrap();
     let source = sender.source().unwrap();
@@ -116,7 +122,8 @@ fn advanced_native_constructors_controls_and_queue() {
     let _ = packets.capture(Duration::ZERO).unwrap();
     let compressed =
         CompressedSender::new_with_config(&ndi, &options("compressed"), &config).unwrap();
-    drop(compressed.close());
+    let unsent = compressed.close();
+    assert!(unsent.program.is_none() && unsent.preview.is_none());
     let mut queue = QueuedSender::new_with_config(
         &ndi,
         &options("queue"),
@@ -132,10 +139,14 @@ fn advanced_native_constructors_controls_and_queue() {
     assert_eq!(id, completed.id());
 }
 
+/// An allocation made under one policy and freed after that policy was
+/// replaced must still be released: when the receiver is gone, nothing may
+/// remain charged to the process.
 #[test]
-#[ignore = "requires an authorized local Advanced runtime and local transport"]
 fn advanced_native_allocator_replacement_and_capture() {
-    let ndi = runtime();
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
     let sender = Sender::new(&ndi, &options("allocation")).unwrap();
     let receiver = Receiver::new(
         &ndi,
@@ -160,9 +171,12 @@ fn advanced_native_allocator_replacement_and_capture() {
         .build()
         .unwrap();
     let frame = video();
-    for _generation in 0..2 {
+    let mut video_allocations = 0;
+    for generation in 0..3 {
         let count = Arc::new(AtomicUsize::new(0));
         let allocation_count = count.clone();
+        // Replacing the policy while the receiver is running leaves frames of
+        // the earlier generation queued inside the SDK.
         receiver
             .set_video_allocator(move |request: AllocationRequest| {
                 allocation_count.fetch_add(1, Ordering::Relaxed);
@@ -190,11 +204,14 @@ fn advanced_native_allocator_replacement_and_capture() {
                 Err(error) => last_error = Some(error),
             }
         }
-        assert!(captured, "test-owned local sender did not deliver a video frame; generation={_generation}, allocator calls={}, connected={}, last error={last_error:?}", count.load(Ordering::Relaxed), receiver.receiver().is_connected());
         assert!(
-            count.load(Ordering::Relaxed) > 0,
-            "custom generation did not allocate"
+            captured,
+            "the local sender delivered no frame from generation {generation}: allocator \
+             calls={}, connected={}, last error={last_error:?}",
+            count.load(Ordering::Relaxed),
+            receiver.receiver().is_connected()
         );
+        video_allocations += count.load(Ordering::Relaxed);
     }
     let deadline = Instant::now() + Duration::from_secs(5);
     while audio_count.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
@@ -208,7 +225,159 @@ fn advanced_native_allocator_replacement_and_capture() {
         audio_count.load(Ordering::Relaxed) > 0,
         "custom audio allocator did not allocate"
     );
-    receiver.reset_video_allocator();
-    receiver.reset_audio_allocator();
-    drop(receiver.into_receiver());
+    assert!(video_allocations >= 3);
+
+    // Back to the SDK's own memory. Frames of the replaced policies may still
+    // be queued; destroying the receiver makes the SDK free every one.
+    let receiver = receiver.into_receiver();
+    assert_eq!(service.usage().active_generations(), 0);
+    drop(receiver);
+    drop(sender);
+    let usage = service.usage();
+    assert_eq!(
+        (
+            usage.retained_allocations(),
+            usage.retained_bytes(),
+            usage.generations()
+        ),
+        (0, 0, 0),
+        "an allocation outlived its receiver: {usage:?}"
+    );
+}
+
+/// A constructor that takes ownership returns what it was given when it
+/// fails, still usable.
+#[test]
+fn failed_constructors_hand_back_what_they_were_given() {
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
+
+    // No queue accepts a limit of zero frames, on any runtime.
+    let sender = Sender::new(&ndi, &options("handback")).unwrap();
+    let name = sender.source().unwrap().name;
+    let rejected = QueuedSender::from_sender(sender, QueueOptions::default().max_frames(0))
+        .err()
+        .expect("zero frames is not a valid queue limit");
+    assert!(matches!(
+        rejected.error(),
+        Error::InvalidConfiguration(_) | Error::UnsupportedCapability { .. }
+    ));
+    let sender = rejected.into_inner();
+    sender.send_video(&video());
+    assert_eq!(sender.source().unwrap().name, name);
+
+    // These succeed on an Advanced runtime and are refused elsewhere; either
+    // way the receiver comes back.
+    let receiver = match AvSync::new(unconnected_receiver(&ndi)) {
+        Ok(sync) => sync.into_receiver(),
+        Err(rejected) => {
+            assert!(matches!(
+                rejected.error(),
+                Error::UnsupportedCapability { .. }
+            ));
+            rejected.into_inner()
+        }
+    };
+    assert!(!receiver.is_connected());
+
+    let service =
+        AllocatorService::new(ndi.process_lifetime(), AllocatorLimits::default()).unwrap();
+    let receiver = match service.attach(receiver) {
+        Ok(attached) => attached.into_receiver(),
+        Err(rejected) => {
+            assert!(matches!(
+                rejected.error(),
+                Error::UnsupportedCapability { .. }
+            ));
+            rejected.into_inner()
+        }
+    };
+    assert!(!receiver.is_connected());
+}
+
+/// Without an Advanced runtime, or in a build without the Advanced SDK
+/// headers, every native operation says so and core operations carry on.
+#[test]
+fn operations_report_why_the_advanced_sdk_is_unavailable() {
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
+    if ndi
+        .require_feature(RuntimeFeature::AdvancedSenderConfiguration)
+        .is_ok()
+    {
+        // An Advanced runtime in a build with the headers: nothing is unavailable.
+        return;
+    }
+    let config = AdvancedConfig::parse("{}").unwrap();
+    let unsupported = |error: Error| {
+        let Error::UnsupportedCapability { capability, reason } = error else {
+            panic!("expected an unsupported capability, got {error:?}");
+        };
+        assert!(!capability.is_empty() && !reason.is_empty());
+    };
+
+    unsupported(
+        Sender::new_with_config(&ndi, &options("unavailable"), &config)
+            .err()
+            .unwrap(),
+    );
+    unsupported(
+        Receiver::new_with_config(
+            &ndi,
+            &ReceiverOptions::builder(Source::default()).build(),
+            &config,
+        )
+        .err()
+        .unwrap(),
+    );
+    unsupported(
+        Finder::new_with_config(&ndi, &FinderOptions::default(), &config)
+            .err()
+            .unwrap(),
+    );
+    unsupported(Genlock::new(&ndi, None, None).err().unwrap());
+    unsupported(
+        PacketReceiver::new(
+            &ndi,
+            &ReceiverOptions::builder(Source::default()).build(),
+            PassthroughPreset::Hevc,
+            &config,
+        )
+        .err()
+        .unwrap(),
+    );
+    unsupported(
+        CompressedSender::new(&ndi, &options("unavailable-compressed"))
+            .err()
+            .unwrap(),
+    );
+    unsupported(
+        QueuedSender::new(&ndi, &options("unavailable-queue"), QueueOptions::default())
+            .err()
+            .unwrap(),
+    );
+
+    let sender = Sender::new(&ndi, &options("unavailable-core")).unwrap();
+    unsupported(
+        sender
+            .set_external_tally(Tally::new(true, false))
+            .unwrap_err(),
+    );
+    unsupported(sender.keyframe_required(None).unwrap_err());
+    let mut receiver = unconnected_receiver(&ndi);
+    unsupported(receiver.request_keyframe().unwrap_err());
+    unsupported(
+        receiver
+            .set_video_quality(VideoQuality::Preview)
+            .unwrap_err(),
+    );
+    unsupported(receiver.kvm().err().unwrap());
+    let finder = Finder::new(&ndi, &FinderOptions::default()).unwrap();
+    unsupported(finder.sources_with_metadata().unwrap_err());
+
+    // The core API is unaffected.
+    sender.send_video(&video());
+    assert!(finder.current_sources().is_ok());
 }

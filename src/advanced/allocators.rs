@@ -1,8 +1,12 @@
-//! Receive allocation policies. Native callbacks use non-dereferenced generation tokens;
-//! allocations retain their generation independently until the matching native free.
-use super::ffi;
-use crate::runtime::ProcessLifetimeRuntime;
-use crate::{advanced::ffi::native::*, LineStrideOrSize, PixelFormat, Receiver, Result};
+//! Application-supplied memory for received frames.
+//!
+//! The SDK calls an allocator and its matching free function on its own
+//! threads, with an opaque value chosen at registration. Here that value is a
+//! token naming one registered policy (a "generation"), never a pointer, and
+//! every allocation is recorded as a lease under the token that made it. A
+//! lease, and through it the policy, lives until the SDK frees that
+//! allocation, however long after the policy was replaced that happens.
+
 use std::{
     alloc::{alloc_zeroed, dealloc, Layout},
     collections::HashMap,
@@ -16,11 +20,25 @@ use std::{
     },
 };
 
+use super::{invalid, AudioCodec, PacketEvent, PacketReceiver, Rejected, VideoCodec};
+use crate::{
+    runtime::ProcessLifetimeRuntime,
+    sys::{
+        advanced::{native, ReceiveAllocators},
+        bindings::*,
+    },
+    LineStrideOrSize, PixelFormat, Receiver, Result,
+};
+
 const MAX_ALLOCATION: usize = 256 * 1024 * 1024;
 
-/// Process-wide admitted-buffer limits include old generations and buffers not
-/// yet reclaimed. Arbitrary working allocations made inside a user policy are
-/// outside this accounting; wrapper allocations honor the request capacity limit.
+/// Process-wide limits on custom receive allocation.
+///
+/// The limits cover every receiver in the process, including allocations made
+/// by policies that have since been replaced and buffers whose release is
+/// still in progress. Memory a policy allocates for its own bookkeeping is not
+/// counted. The defaults are 256 generations, 1024 allocations, 1 GiB in
+/// total, 32 concurrent calls and 256 MiB per allocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AllocatorLimits {
     max_generations: usize,
@@ -29,6 +47,7 @@ pub struct AllocatorLimits {
     max_concurrent_calls: usize,
     max_allocation_bytes: usize,
 }
+
 impl Default for AllocatorLimits {
     fn default() -> Self {
         Self {
@@ -40,27 +59,40 @@ impl Default for AllocatorLimits {
         }
     }
 }
+
 impl AllocatorLimits {
+    /// The number of policies that may exist at once. A replaced policy
+    /// counts until the SDK has freed its last allocation.
     pub fn max_generations(mut self, value: usize) -> Self {
         self.max_generations = value;
         self
     }
+
+    /// The number of allocations the SDK may hold at once.
     pub fn max_allocations(mut self, value: usize) -> Self {
         self.max_allocations = value;
         self
     }
+
+    /// The total bytes the SDK may hold at once. It must be at least
+    /// [`max_allocation_bytes`](Self::max_allocation_bytes).
     pub fn max_bytes(mut self, value: usize) -> Self {
         self.max_bytes = value;
         self
     }
+
+    /// The number of policy calls that may run at the same time.
     pub fn max_concurrent_calls(mut self, value: usize) -> Self {
         self.max_concurrent_calls = value;
         self
     }
+
+    /// The largest single allocation, at most 256 MiB.
     pub fn max_allocation_bytes(mut self, value: usize) -> Self {
         self.max_allocation_bytes = value;
         self
     }
+
     fn validate(self) -> Result<Self> {
         if self.max_generations == 0
             || self.max_allocations == 0
@@ -69,13 +101,13 @@ impl AllocatorLimits {
             || self.max_allocation_bytes > MAX_ALLOCATION
             || self.max_bytes < self.max_allocation_bytes
         {
-            return Err(ffi::invalid("Invalid allocator limits"));
+            return Err(invalid("Invalid allocator limits"));
         }
         Ok(self)
     }
 }
 
-/// A validated writable allocation request; no native frame pointer escapes.
+/// What the SDK needs memory for: one frame it is about to receive.
 #[derive(Clone, Copy, Debug)]
 pub struct AllocationRequest {
     bytes: usize,
@@ -85,34 +117,60 @@ pub struct AllocationRequest {
     height: i32,
     capacity_limit: usize,
 }
+/// The kind of frame an [`AllocationRequest`] is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AllocationFormat {
+    /// Uncompressed video in this pixel format.
     Video(PixelFormat),
+    /// Uncompressed planar 32-bit floating-point audio.
     AudioPlanarF32,
+    /// Compressed video with this FourCC.
     CompressedVideo(u32),
+    /// Compressed audio with this FourCC.
     CompressedAudio(u32),
 }
+
 impl AllocationRequest {
+    /// The largest buffer, in bytes, a policy may return for this request.
     pub fn capacity_limit(self) -> usize {
         self.capacity_limit
     }
+
+    /// The smallest buffer, in bytes, that holds the frame at this request's
+    /// stride.
     pub fn minimum_bytes(self) -> usize {
         self.bytes
     }
+
+    /// Bytes per video line or per audio channel. For a compressed frame,
+    /// which has no stride, this is its size.
     pub fn stride(self) -> i32 {
         self.stride
     }
+
+    /// The kind of frame.
     pub fn format(self) -> AllocationFormat {
         self.format
     }
+
+    /// `(width, height)` in pixels for video; `(samples, channels)` for audio.
     pub fn dimensions(self) -> (i32, i32) {
         (self.width, self.height)
     }
-    /// Creates a request with a larger row/channel stride and checked storage extent.
+
+    /// The same request with a larger line or channel stride, for buffers
+    /// that need padding or alignment. The minimum size grows to match.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when the stride is
+    /// smaller than requested, an audio stride is not a multiple of four
+    /// bytes, the frame is compressed (it has no stride to change), or the
+    /// buffer would exceed the [`capacity_limit`](Self::capacity_limit).
     pub fn with_stride(self, stride: i32) -> Result<Self> {
         if stride < self.stride {
-            return Err(ffi::invalid(
+            return Err(invalid(
                 "Allocator stride is smaller than the requested stride",
             ));
         }
@@ -128,23 +186,21 @@ impl AllocationRequest {
             }
             AllocationFormat::AudioPlanarF32 => {
                 if stride % 4 != 0 {
-                    return Err(ffi::invalid(
-                        "Audio allocator stride must be aligned to f32",
-                    ));
+                    return Err(invalid("Audio allocator stride must be aligned to f32"));
                 }
                 (stride as usize)
                     .checked_mul(self.height as usize)
-                    .ok_or_else(|| ffi::invalid("Audio allocator extent overflow"))?
+                    .ok_or_else(|| invalid("Audio allocator extent overflow"))?
             }
             _ if stride == self.stride => self.bytes,
             _ => {
-                return Err(ffi::invalid(
+                return Err(invalid(
                     "Compressed allocations have a byte size, not a configurable stride",
                 ))
             }
         };
         if bytes > self.capacity_limit {
-            return Err(ffi::invalid("Allocator extent exceeds the buffer limit"));
+            return Err(invalid("Allocator extent exceeds the buffer limit"));
         }
         Ok(Self {
             bytes,
@@ -154,55 +210,92 @@ impl AllocationRequest {
     }
 }
 
-/// Storage supplied by an integration with a native memory pool.
+/// Memory from the application's own pool, lent to the SDK for one frame.
+///
+/// The value is dropped, on whichever thread the SDK frees the frame from,
+/// when the SDK no longer needs the memory.
 ///
 /// # Safety
-/// The pointer must remain uniquely owned, writable, CPU accessible, and aligned to
-/// at least 64 bytes for `capacity` initialized bytes until this object is dropped. NDI may write
-/// from arbitrary native threads. The destructor must permit that thread and must
-/// not release or remap the allocation early. No other access is permitted while
-/// the object is owned by NDI. The capacity and address must remain constant.
-/// The destructor must reclaim the storage without panicking.
+///
+/// From creation until the value is dropped:
+///
+/// * [`pointer`](Self::pointer) and [`capacity`](Self::capacity) never change;
+/// * the memory is initialized, writable from any thread, addressable by the
+///   CPU, aligned to at least 64 bytes and valid for `capacity` bytes;
+/// * nothing else reads, writes, frees or remaps it.
+///
+/// Dropping the value must not panic.
 pub unsafe trait ExternalAllocation: Send + 'static {
+    /// The start of the memory.
     fn pointer(&self) -> NonNull<u8>;
+
+    /// The size of the memory in bytes.
     fn capacity(&self) -> usize;
 }
+
+/// Zeroed memory from the global allocator.
 struct OwnedStorage {
     pointer: NonNull<u8>,
     layout: Layout,
 }
+
+// SAFETY: the storage is uniquely owned and is plain memory.
 unsafe impl Send for OwnedStorage {}
+
+// SAFETY: the memory was allocated zeroed with 64-byte alignment for exactly
+// `layout.size()` bytes, is owned by this value alone, and is released only
+// when it is dropped.
 unsafe impl ExternalAllocation for OwnedStorage {
     fn pointer(&self) -> NonNull<u8> {
         self.pointer
     }
+
     fn capacity(&self) -> usize {
         self.layout.size()
     }
 }
+
 impl Drop for OwnedStorage {
     fn drop(&mut self) {
+        // SAFETY: the pointer came from `alloc_zeroed` with this layout and is
+        // released exactly once.
         unsafe { dealloc(self.pointer.as_ptr(), self.layout) };
     }
 }
 
-/// An owned allocation. All bytes are initialized when created with `zeroed`.
+/// The memory a [`ReceiveAllocator`] returns for one [`AllocationRequest`].
 pub struct AllocationBuffer {
     storage: Box<dyn ExternalAllocation>,
     request: AllocationRequest,
 }
+
 impl AllocationBuffer {
+    /// Allocate zeroed, 64-byte-aligned memory of the request's minimum size.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when the allocation
+    /// fails.
     pub fn zeroed(request: AllocationRequest) -> Result<Self> {
         let layout = Layout::from_size_align(request.bytes, 64)
-            .map_err(|_| ffi::invalid("Invalid allocator layout"))?;
+            .map_err(|_| invalid("Invalid allocator layout"))?;
+        // SAFETY: every request has a positive size, so the layout is not
+        // zero-sized.
         let pointer = NonNull::new(unsafe { alloc_zeroed(layout) })
-            .ok_or_else(|| ffi::invalid("Allocation failed"))?;
+            .ok_or_else(|| invalid("Allocation failed"))?;
         Ok(Self {
             storage: Box::new(OwnedStorage { pointer, layout }),
             request,
         })
     }
-    /// The unsafe trait implementation carries the native storage obligations.
+
+    /// Lend memory from the application's own pool.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when the memory is
+    /// smaller than the request's minimum, larger than its capacity limit, or
+    /// not aligned to 64 bytes.
     pub fn from_external(
         request: AllocationRequest,
         storage: impl ExternalAllocation,
@@ -211,7 +304,7 @@ impl AllocationBuffer {
             || storage.capacity() > request.capacity_limit
             || !(storage.pointer().as_ptr() as usize).is_multiple_of(64)
         {
-            return Err(ffi::invalid(
+            return Err(invalid(
                 "External allocation capacity or alignment is invalid",
             ));
         }
@@ -220,16 +313,30 @@ impl AllocationBuffer {
             request,
         })
     }
+
+    /// The size of the memory in bytes.
     pub fn capacity(&self) -> usize {
         self.storage.capacity()
     }
 }
 
-/// Called on SDK threads, possibly concurrently and reentrantly. Implementations
-/// should avoid blocking. Panics are contained and become allocation failures.
+/// A policy that supplies the memory received frames are written into.
+///
+/// Any closure `Fn(AllocationRequest) -> Result<AllocationBuffer>` that is
+/// `Send + Sync` is a policy.
+///
+/// The SDK calls the policy on its own threads, possibly several at once, and
+/// stalls video or audio while a call blocks. An error or a panic makes that
+/// one allocation fail; the SDK then drops the frame.
 pub trait ReceiveAllocator: Send + Sync + 'static {
+    /// Supply memory for one frame.
+    ///
+    /// # Errors
+    ///
+    /// Any error declines the allocation.
     fn allocate(&self, request: AllocationRequest) -> Result<AllocationBuffer>;
 }
+
 impl<F: Fn(AllocationRequest) -> Result<AllocationBuffer> + Send + Sync + 'static> ReceiveAllocator
     for F
 {
@@ -238,50 +345,74 @@ impl<F: Fn(AllocationRequest) -> Result<AllocationBuffer> + Send + Sync + 'stati
     }
 }
 
+/// Where a generation is in its life.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
+    /// Registered with a receiver: it may allocate.
     Active,
+    /// Being replaced: a call already inside the policy may not publish.
     Closing,
+    /// Replaced: only its outstanding leases keep it alive.
     Retired,
 }
+
+/// One registered policy.
 struct Generation {
     phase: Mutex<Phase>,
     policy: ManuallyDrop<Arc<dyn ReceiveAllocator>>,
     count: Arc<AtomicUsize>,
 }
+
 impl Drop for Generation {
     fn drop(&mut self) {
-        // Keep the generation budget charged while user policy destruction runs.
-        // If it panics, retain that charge: reclamation may be incomplete.
+        // The generation stays counted while the policy's own destructor
+        // runs, and for good if that panics: its cleanup may be incomplete.
+        // SAFETY: the policy is taken exactly once, here.
         let policy = unsafe { ManuallyDrop::take(&mut self.policy) };
         if catch_unwind(AssertUnwindSafe(|| drop(policy))).is_ok() {
             self.count.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
+
+/// One allocation the SDK holds, and the generation that made it.
 struct Lease {
     _buffer: AllocationBuffer,
     bytes: usize,
     _generation: Arc<Generation>,
 }
+
 #[derive(Default)]
 struct State {
     active: HashMap<usize, Arc<Generation>>,
+    /// Outstanding allocations by (generation token, address).
+    ///
+    /// The SDK frees every allocation through the allocator pair that made
+    /// it, passing that pair's opaque value, even after the pair has been
+    /// replaced; the token therefore identifies the lease's generation at the
+    /// free as it did at the allocation. Keeping it in the key means a free
+    /// can release only an allocation of the generation it names, so a
+    /// repeated free cannot release a later allocation that happens to reuse
+    /// the address under another generation.
     leases: HashMap<(usize, usize), Lease>,
     bytes: usize,
     reserved_bytes: usize,
     calls: usize,
     reclaiming: usize,
 }
+
+/// Every generation and lease in the process.
 struct Registry {
     limits: AllocatorLimits,
     state: Mutex<State>,
     generations: Arc<AtomicUsize>,
     next: AtomicUsize,
 }
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
+
 impl Registry {
     fn new(limits: AllocatorLimits) -> Self {
         Self {
@@ -291,6 +422,7 @@ impl Registry {
             next: AtomicUsize::new(1),
         }
     }
+
     fn register(&self, policy: Arc<dyn ReceiveAllocator>) -> Result<usize> {
         // Rust 1.99 deprecated fetch_update in favor of try_update, which is
         // unavailable on our Rust 1.88 MSRV. Limit the allowance to these calls.
@@ -300,7 +432,7 @@ impl Registry {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < self.limits.max_generations).then_some(n + 1)
             });
-        admission.map_err(|_| ffi::invalid("Process allocator generation budget exhausted"))?;
+        admission.map_err(|_| invalid("Process allocator generation budget exhausted"))?;
         #[allow(deprecated)]
         let next_token = self
             .next
@@ -309,7 +441,7 @@ impl Registry {
             Ok(token) => token,
             Err(_) => {
                 self.generations.fetch_sub(1, Ordering::AcqRel);
-                return Err(ffi::invalid("Allocator token space exhausted"));
+                return Err(invalid("Allocator token space exhausted"));
             }
         };
         lock(&self.state).active.insert(
@@ -322,12 +454,14 @@ impl Registry {
         );
         Ok(token)
     }
+
     fn closing(&self, token: usize) {
         let generation = lock(&self.state).active.get(&token).cloned();
         if let Some(g) = generation {
             *lock(&g.phase) = Phase::Closing;
         }
     }
+
     fn retire(&self, token: usize) {
         self.closing(token);
         let generation = lock(&self.state).active.remove(&token);
@@ -336,6 +470,7 @@ impl Registry {
             drop(g);
         }
     }
+
     fn allocate(&self, token: usize, mut request: AllocationRequest) -> Option<(NonNull<u8>, i32)> {
         request.capacity_limit = self.limits.max_allocation_bytes;
         let generation = {
@@ -410,6 +545,7 @@ impl Registry {
         drop(reservation);
         Some((pointer, stride))
     }
+
     fn free(&self, token: usize, pointer: *mut u8) -> bool {
         if pointer.is_null() {
             return true;
@@ -442,19 +578,34 @@ impl Registry {
         }
     }
 }
+
 static REGISTRY: OnceLock<Registry> = OnceLock::new();
 
-/// Explicit process-lifetime SDK opt-in and shared allocator limits. The first
-/// service fixes the limits for the process; later services must agree.
-/// An embedding host must also keep the Rust module containing these callbacks
-/// loaded for the process lifetime; normal Rust application linkage already does.
+/// The registry, which exists once any [`AllocatorService`] has been created.
+fn registry() -> &'static Registry {
+    REGISTRY
+        .get()
+        .expect("an allocator service exists before anything uses the registry")
+}
+
+/// Permission to give receivers custom allocators.
+///
+/// The SDK may call an allocator's free function long after the receiver's
+/// policy was replaced, so custom allocation needs the NDI runtime to stay
+/// initialized until the process exits: the service is created from a
+/// [`ProcessLifetimeRuntime`]. The first service fixes the
+/// [`AllocatorLimits`] for the process, and later ones must name the same
+/// limits.
+///
+/// A program that loads this crate as part of a plug-in must also keep that
+/// module loaded for as long as the process runs, because the SDK holds
+/// pointers to its callbacks.
 #[derive(Clone, Copy)]
 pub struct AllocatorService {
     runtime: ProcessLifetimeRuntime,
 }
 
-/// A process-wide allocator budget snapshot. A panicking policy destructor can
-/// leave a conservative permanent generation charge; external storage must not panic.
+/// A snapshot of custom allocation across the process.
 #[derive(Clone, Copy, Debug)]
 pub struct AllocatorUsage {
     generations: usize,
@@ -464,40 +615,61 @@ pub struct AllocatorUsage {
     calls: usize,
     reclaiming: usize,
 }
+
 impl AllocatorUsage {
+    /// Policies that exist, including replaced ones whose allocations the SDK
+    /// still holds. A policy whose destructor panicked stays counted.
     pub fn generations(self) -> usize {
         self.generations
     }
+
+    /// Policies currently registered with a receiver.
     pub fn active_generations(self) -> usize {
         self.active_generations
     }
+
+    /// Allocations the SDK holds, including those being released.
     pub fn retained_allocations(self) -> usize {
         self.retained_allocations
     }
+
+    /// Bytes the SDK holds, including those being released.
     pub fn retained_bytes(self) -> usize {
         self.retained_bytes
     }
+
+    /// Policy calls running at this moment.
     pub fn in_progress_allocations(self) -> usize {
         self.calls
     }
+
+    /// Buffers whose release is running at this moment.
     pub fn in_progress_reclamations(self) -> usize {
         self.reclaiming
     }
 }
+
 impl AllocatorService {
+    /// Enable custom allocation with these process-wide limits.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when the limits are
+    /// out of range or differ from those of an earlier service.
     pub fn new(runtime: ProcessLifetimeRuntime, limits: AllocatorLimits) -> Result<Self> {
         let limits = limits.validate()?;
         let registry = REGISTRY.get_or_init(|| Registry::new(limits));
         if registry.limits != limits {
-            return Err(ffi::invalid(
+            return Err(invalid(
                 "Allocator limits differ from the existing process allocator service",
             ));
         }
         Ok(Self { runtime })
     }
-    /// Inspect retained ownership and budget pressure, including old generations.
+
+    /// What custom allocation currently holds across the process.
     pub fn usage(self) -> AllocatorUsage {
-        let registry = REGISTRY.get().expect("allocator service initialized");
+        let registry = registry();
         let state = lock(&registry.state);
         AllocatorUsage {
             generations: registry.generations.load(Ordering::Acquire),
@@ -508,190 +680,294 @@ impl AllocatorService {
             reclaiming: state.reclaiming,
         }
     }
-    /// Attach policies to a receiver whose results explicitly distinguish codec
-    /// packets from decoded fallback. Raw decoded capture remains inaccessible.
+
+    /// Take a receiver so that its allocators can be set.
+    ///
+    /// # Errors
+    ///
+    /// Returns the receiver, untouched, with
+    /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
+    /// without an Advanced runtime (or in a build without the Advanced SDK).
+    pub fn attach(
+        self,
+        receiver: Receiver,
+    ) -> std::result::Result<AllocatedReceiver, Rejected<Receiver>> {
+        match self.runtime.ndi().advanced::<ReceiveAllocators>() {
+            Ok(table) => Ok(AllocatedReceiver {
+                receiver: Some(receiver),
+                table,
+                video_token: None,
+                audio_token: None,
+                _service: self,
+            }),
+            Err(error) => Err(Rejected::new(error, receiver)),
+        }
+    }
+
+    /// Take a packet receiver so that its allocators can be set.
+    ///
+    /// # Errors
+    ///
+    /// As for [`attach`](Self::attach).
     pub fn attach_packets(
         self,
-        receiver: super::PacketReceiver,
-    ) -> Result<AllocatedPacketReceiver> {
-        Ok(AllocatedPacketReceiver {
-            inner: self.attach(receiver.receiver)?,
-        })
-    }
-    /// Takes exclusive control of allocator registration. Capture methods remain
-    /// available through a shared borrow, which cannot outlive this owner.
-    pub fn attach(self, receiver: Receiver) -> Result<AllocatedReceiver> {
-        type VideoSet = unsafe extern "C" fn(
-            NDIlib_recv_instance_t,
-            *mut c_void,
-            Option<unsafe extern "C" fn(*mut c_void, *mut NDIlib_video_frame_v2_t) -> bool>,
-            Option<unsafe extern "C" fn(*mut c_void, *const NDIlib_video_frame_v2_t) -> bool>,
-        );
-        type AudioSet = unsafe extern "C" fn(
-            NDIlib_recv_instance_t,
-            *mut c_void,
-            Option<unsafe extern "C" fn(*mut c_void, *mut NDIlib_audio_frame_v3_t) -> bool>,
-            Option<unsafe extern "C" fn(*mut c_void, *const NDIlib_audio_frame_v3_t) -> bool>,
-        );
-        let video: VideoSet =
-            unsafe { ffi::required(self.runtime.ndi(), b"NDIlib_recv_set_video_allocator\0")? };
-        let audio: AudioSet =
-            unsafe { ffi::required(self.runtime.ndi(), b"NDIlib_recv_set_audio_allocator\0")? };
-        Ok(AllocatedReceiver {
-            receiver: Some(receiver),
-            service: self,
-            video,
-            audio,
-            video_token: None,
-            audio_token: None,
-        })
+        receiver: PacketReceiver,
+    ) -> std::result::Result<AllocatedPacketReceiver, Rejected<PacketReceiver>> {
+        match self.attach(receiver.receiver) {
+            Ok(inner) => Ok(AllocatedPacketReceiver { inner }),
+            Err(rejected) => Err(rejected.map(PacketReceiver::from_receiver)),
+        }
     }
 }
 
-/// Packet capture with custom allocators and the same generation-safe reset rules.
+/// A [`PacketReceiver`] whose frames can be received into application memory.
 pub struct AllocatedPacketReceiver {
     inner: AllocatedReceiver,
 }
+
 impl AllocatedPacketReceiver {
-    pub fn capture(&mut self, timeout: std::time::Duration) -> Result<super::PacketEvent> {
-        super::PacketReceiver::capture_from(self.inner.receiver(), timeout)
+    /// Wait up to `timeout` for the next frame or event; see
+    /// [`PacketReceiver::capture`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`PacketReceiver::capture`].
+    pub fn capture(&mut self, timeout: std::time::Duration) -> Result<PacketEvent> {
+        PacketReceiver::capture_from(self.inner.receiver(), timeout)
     }
+
+    /// Receive video into memory from `policy`; see
+    /// [`AllocatedReceiver::set_video_allocator`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`AllocatedReceiver::set_video_allocator`].
     pub fn set_video_allocator(&mut self, policy: impl ReceiveAllocator) -> Result<()> {
         self.inner.set_video_allocator(policy)
     }
+
+    /// Receive audio into memory from `policy`; see
+    /// [`AllocatedReceiver::set_audio_allocator`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`AllocatedReceiver::set_audio_allocator`].
     pub fn set_audio_allocator(&mut self, policy: impl ReceiveAllocator) -> Result<()> {
         self.inner.set_audio_allocator(policy)
     }
+
+    /// Return to the SDK's own video memory.
     pub fn reset_video_allocator(&mut self) {
         self.inner.reset_video_allocator();
     }
+
+    /// Return to the SDK's own audio memory.
     pub fn reset_audio_allocator(&mut self) {
         self.inner.reset_audio_allocator();
     }
+
+    /// Ask the source for a keyframe; see [`Receiver::request_keyframe`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`Receiver::request_keyframe`].
     pub fn request_keyframe(&self) -> Result<()> {
         self.inner.receiver().request_keyframe()
     }
+
+    /// Switch between the source's program and preview streams; see
+    /// [`Receiver::set_video_quality`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`Receiver::set_video_quality`].
     pub fn set_video_quality(&mut self, quality: super::VideoQuality) -> Result<bool> {
-        self.inner
-            .receiver
-            .as_mut()
-            .expect("receiver owned")
-            .set_video_quality(quality)
+        self.inner.receiver_mut().set_video_quality(quality)
     }
+
+    /// Choose which streams the source sends; see [`Receiver::set_streams`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`Receiver::set_streams`].
     pub fn set_streams(&mut self, streams: super::StreamSelection) -> Result<super::StreamChange> {
-        self.inner
-            .receiver
-            .as_mut()
-            .expect("receiver owned")
-            .set_streams(streams)
+        self.inner.receiver_mut().set_streams(streams)
+    }
+
+    /// Return to the SDK's own memory and give the packet receiver back.
+    pub fn into_packet_receiver(self) -> PacketReceiver {
+        PacketReceiver::from_receiver(self.inner.into_receiver())
     }
 }
-type VideoSet = unsafe extern "C" fn(
-    NDIlib_recv_instance_t,
-    *mut c_void,
-    Option<unsafe extern "C" fn(*mut c_void, *mut NDIlib_video_frame_v2_t) -> bool>,
-    Option<unsafe extern "C" fn(*mut c_void, *const NDIlib_video_frame_v2_t) -> bool>,
-);
-type AudioSet = unsafe extern "C" fn(
-    NDIlib_recv_instance_t,
-    *mut c_void,
-    Option<unsafe extern "C" fn(*mut c_void, *mut NDIlib_audio_frame_v3_t) -> bool>,
-    Option<unsafe extern "C" fn(*mut c_void, *const NDIlib_audio_frame_v3_t) -> bool>,
-);
 
-/// An allocator owner. Replacement and reset leave old allocations alive until
-/// the SDK releases them; a concurrent pending allocation can be refused.
+/// Which of a receiver's two allocators an operation concerns.
+#[derive(Clone, Copy)]
+enum Stream {
+    Video,
+    Audio,
+}
+
+/// A receiver whose frames can be received into application memory.
+///
+/// Setting an allocator replaces the previous one for frames allocated from
+/// then on. Frames allocated earlier stay in the memory the earlier policy
+/// supplied, and that policy is kept until the SDK has freed the last of
+/// them. A policy call that is still running when its policy is replaced is
+/// declined.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::time::Duration;
+/// use grafton_ndi::{
+///     advanced::{AllocationBuffer, AllocationRequest, AllocatorLimits, AllocatorService},
+///     Receiver, ReceiverOptions, Source, NDI,
+/// };
+///
+/// # fn main() -> Result<(), grafton_ndi::Error> {
+/// let ndi = NDI::new()?;
+/// # let source = Source::default();
+/// let receiver = Receiver::new(&ndi, &ReceiverOptions::builder(source).build())?;
+/// let service = AllocatorService::new(ndi.process_lifetime(), AllocatorLimits::default())?;
+/// let mut receiver = service.attach(receiver)?;
+///
+/// // Pad every video line to a multiple of 256 bytes.
+/// receiver.set_video_allocator(|request: AllocationRequest| {
+///     let stride = (request.stride() + 255) / 256 * 256;
+///     AllocationBuffer::zeroed(request.with_stride(stride)?)
+/// })?;
+/// let frame = receiver.receiver().video().capture(Duration::from_secs(1))?;
+/// # let _ = frame;
+/// # Ok(())
+/// # }
+/// ```
 pub struct AllocatedReceiver {
+    // `None` only once `into_receiver` has taken it.
     receiver: Option<Receiver>,
-    service: AllocatorService,
-    video: VideoSet,
-    audio: AudioSet,
+    table: &'static ReceiveAllocators,
     video_token: Option<usize>,
     audio_token: Option<usize>,
+    // The promise that the runtime outlives every callback registered here.
+    _service: AllocatorService,
 }
+
 impl AllocatedReceiver {
+    /// The receiver, for capturing and control.
     pub fn receiver(&self) -> &Receiver {
         self.receiver.as_ref().expect("receiver owned")
     }
+
+    fn receiver_mut(&mut self) -> &mut Receiver {
+        self.receiver.as_mut().expect("receiver owned")
+    }
+
+    /// Receive video into memory from `policy`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when the process
+    /// already has [`AllocatorLimits::max_generations`] policies. The current
+    /// allocator then stays in place.
     pub fn set_video_allocator(&mut self, policy: impl ReceiveAllocator) -> Result<()> {
-        self.replace(true, Some(Arc::new(policy)))
-    }
-    pub fn set_audio_allocator(&mut self, policy: impl ReceiveAllocator) -> Result<()> {
-        self.replace(false, Some(Arc::new(policy)))
-    }
-    pub fn reset_video_allocator(&mut self) {
-        self.replace(true, None)
-            .expect("reset needs no registration");
-    }
-    pub fn reset_audio_allocator(&mut self) {
-        self.replace(false, None)
-            .expect("reset needs no registration");
-    }
-    fn replace(&mut self, video: bool, policy: Option<Arc<dyn ReceiveAllocator>>) -> Result<()> {
-        let registry = REGISTRY.get().expect("allocator service initialized");
-        let new_token = policy.map(|policy| registry.register(policy)).transpose()?;
-        let old_token = if video {
-            self.video_token
-        } else {
-            self.audio_token
-        };
-        if let Some(old) = old_token {
-            registry.closing(old);
-        }
-        let opaque = new_token.map_or(std::ptr::null_mut(), |token| token as *mut c_void);
-        let instance = self.receiver().core.instance;
-        unsafe {
-            if video {
-                (self.video)(
-                    instance,
-                    opaque,
-                    new_token.map(|_| video_allocate as _),
-                    new_token.map(|_| video_free as _),
-                );
-            } else {
-                (self.audio)(
-                    instance,
-                    opaque,
-                    new_token.map(|_| audio_allocate as _),
-                    new_token.map(|_| audio_free as _),
-                );
-            }
-        }
-        if video {
-            self.video_token = new_token;
-        } else {
-            self.audio_token = new_token;
-        }
-        if let Some(old) = old_token {
-            registry.retire(old);
-        }
+        let token = registry().register(Arc::new(policy))?;
+        self.install(Stream::Video, Some(token));
         Ok(())
     }
+
+    /// Receive audio into memory from `policy`.
+    ///
+    /// # Errors
+    ///
+    /// As for [`set_video_allocator`](Self::set_video_allocator).
+    pub fn set_audio_allocator(&mut self, policy: impl ReceiveAllocator) -> Result<()> {
+        let token = registry().register(Arc::new(policy))?;
+        self.install(Stream::Audio, Some(token));
+        Ok(())
+    }
+
+    /// Return to the SDK's own video memory.
+    pub fn reset_video_allocator(&mut self) {
+        self.install(Stream::Video, None);
+    }
+
+    /// Return to the SDK's own audio memory.
+    pub fn reset_audio_allocator(&mut self) {
+        self.install(Stream::Audio, None);
+    }
+
+    /// Register generation `token` (or the SDK's own allocator) for `stream`
+    /// and retire the generation it replaces.
+    fn install(&mut self, stream: Stream, token: Option<usize>) {
+        let registry = registry();
+        let slot = match stream {
+            Stream::Video => &mut self.video_token,
+            Stream::Audio => &mut self.audio_token,
+        };
+        let earlier = std::mem::replace(slot, token);
+        if let Some(earlier) = earlier {
+            // From here on a policy call that is still running cannot publish.
+            registry.closing(earlier);
+        }
+        let opaque = token.map_or(std::ptr::null_mut(), |token| token as *mut c_void);
+        let instance = self.receiver().core.instance;
+        let table = self.table;
+        // SAFETY: the receiver is live. The callbacks are functions of this
+        // program, which stays loaded, and the opaque value is a token they
+        // look up, never a pointer they follow.
+        native!(table => unsafe {
+            match stream {
+                Stream::Video => table.NDIlib_recv_set_video_allocator(
+                    instance,
+                    opaque,
+                    token.map(|_| video_allocate as _),
+                    token.map(|_| video_free as _),
+                ),
+                Stream::Audio => table.NDIlib_recv_set_audio_allocator(
+                    instance,
+                    opaque,
+                    token.map(|_| audio_allocate as _),
+                    token.map(|_| audio_free as _),
+                ),
+            }
+        });
+        if let Some(earlier) = earlier {
+            registry.retire(earlier);
+        }
+    }
+
+    /// Return to the SDK's own memory and give the receiver back.
     pub fn into_receiver(mut self) -> Receiver {
         self.reset_video_allocator();
         self.reset_audio_allocator();
         self.receiver.take().expect("receiver owned")
     }
 }
+
 impl Drop for AllocatedReceiver {
     fn drop(&mut self) {
         if self.receiver.is_some() {
             self.reset_video_allocator();
             self.reset_audio_allocator();
         }
-        let _ = self.service;
     }
 }
 
+/// A compressed frame's size, which the SDK passes in the stride union.
+fn compressed_size(size: i32) -> Result<usize> {
+    usize::try_from(size)
+        .ok()
+        .filter(|size| (1..=MAX_ALLOCATION).contains(size))
+        .ok_or_else(|| invalid("Invalid compressed allocation size"))
+}
+
+/// The request for the video frame the SDK is about to receive.
 fn video_request(frame: &NDIlib_video_frame_v2_t) -> Result<AllocationRequest> {
-    let fourcc = ffi::video_fourcc_bits(frame.FourCC);
-    if super::VideoCodec::from_outer(fourcc).is_some() {
+    let fourcc = frame.FourCC;
+    if VideoCodec::from_outer(fourcc).is_some() {
+        // SAFETY: for a compressed frame the union holds the data size.
         let size = unsafe { frame.__bindgen_anon_1.data_size_in_bytes };
-        if size <= 0 || size as usize > MAX_ALLOCATION {
-            return Err(ffi::invalid("Invalid compressed video allocation size"));
-        }
         return Ok(AllocationRequest {
-            bytes: size as usize,
+            bytes: compressed_size(size)?,
             stride: size,
             format: AllocationFormat::CompressedVideo(fourcc),
             width: frame.xres,
@@ -699,8 +975,8 @@ fn video_request(frame: &NDIlib_video_frame_v2_t) -> Result<AllocationRequest> {
             capacity_limit: MAX_ALLOCATION,
         });
     }
-    let pixel = PixelFormat::try_from(fourcc)
-        .map_err(|_| ffi::invalid("Unknown allocator video format"))?;
+    let pixel =
+        PixelFormat::try_from(fourcc).map_err(|_| invalid("Unknown allocator video format"))?;
     let layout =
         crate::frames::ValidatedVideoLayout::new_uncompressed(pixel, frame.xres, frame.yres, None)?;
     let LineStrideOrSize::LineStrideBytes(stride) = layout.line_stride_or_size;
@@ -713,21 +989,17 @@ fn video_request(frame: &NDIlib_video_frame_v2_t) -> Result<AllocationRequest> {
         capacity_limit: MAX_ALLOCATION,
     })
 }
+/// The request for the audio frame the SDK is about to receive.
 fn audio_request(frame: &NDIlib_audio_frame_v3_t) -> Result<AllocationRequest> {
-    let fourcc = ffi::audio_fourcc_bits(frame.FourCC);
-    if frame.FourCC != NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP {
-        let known = [
-            0xff,
-            0xff | 0x8080_8080,
-            u32::from_le_bytes(*b"Opus"),
-            u32::from_le_bytes(*b"Opus") | 0x8080_8080,
-        ];
-        let size = unsafe { frame.__bindgen_anon_1.data_size_in_bytes };
-        if !known.contains(&fourcc) || size <= 0 || size as usize > MAX_ALLOCATION {
-            return Err(ffi::invalid("Invalid compressed audio allocation request"));
+    let fourcc = frame.FourCC;
+    if fourcc != NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP {
+        if AudioCodec::from_outer(fourcc).is_none() {
+            return Err(invalid("Unknown allocator audio format"));
         }
+        // SAFETY: for a compressed frame the union holds the data size.
+        let size = unsafe { frame.__bindgen_anon_1.data_size_in_bytes };
         return Ok(AllocationRequest {
-            bytes: size as usize,
+            bytes: compressed_size(size)?,
             stride: size,
             format: AllocationFormat::CompressedAudio(fourcc),
             width: frame.no_samples,
@@ -736,16 +1008,16 @@ fn audio_request(frame: &NDIlib_audio_frame_v3_t) -> Result<AllocationRequest> {
         });
     }
     if frame.no_samples <= 0 || frame.no_channels <= 0 || frame.sample_rate <= 0 {
-        return Err(ffi::invalid("Invalid audio allocation dimensions"));
+        return Err(invalid("Invalid audio allocation dimensions"));
     }
     let stride = frame
         .no_samples
         .checked_mul(4)
-        .ok_or_else(|| ffi::invalid("Audio allocator stride overflow"))?;
+        .ok_or_else(|| invalid("Audio allocator stride overflow"))?;
     let bytes = (stride as usize)
         .checked_mul(frame.no_channels as usize)
         .filter(|n| *n <= MAX_ALLOCATION)
-        .ok_or_else(|| ffi::invalid("Audio allocator extent overflow"))?;
+        .ok_or_else(|| invalid("Audio allocator extent overflow"))?;
     Ok(AllocationRequest {
         bytes,
         stride,
@@ -755,23 +1027,22 @@ fn audio_request(frame: &NDIlib_audio_frame_v3_t) -> Result<AllocationRequest> {
         capacity_limit: MAX_ALLOCATION,
     })
 }
+/// The SDK's request for video memory. `opaque` is the generation token.
 unsafe extern "C" fn video_allocate(
     opaque: *mut c_void,
     frame: *mut NDIlib_video_frame_v2_t,
 ) -> bool {
     catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the SDK passes null or a descriptor it owns for this call.
         let Some(frame) = (unsafe { frame.as_mut() }) else {
             return false;
         };
         let request = video_request(frame);
         frame.p_data = std::ptr::null_mut();
         frame.__bindgen_anon_1.line_stride_in_bytes = 0;
-        let Ok(request) = request else {
-            return false;
-        };
-        let Some((pointer, stride)) = REGISTRY
-            .get()
-            .and_then(|r| r.allocate(opaque as usize, request))
+        let Some((pointer, stride)) = request
+            .ok()
+            .and_then(|request| REGISTRY.get()?.allocate(opaque as usize, request))
         else {
             return false;
         };
@@ -781,23 +1052,23 @@ unsafe extern "C" fn video_allocate(
     }))
     .unwrap_or(false)
 }
+
+/// The SDK's request for audio memory. `opaque` is the generation token.
 unsafe extern "C" fn audio_allocate(
     opaque: *mut c_void,
     frame: *mut NDIlib_audio_frame_v3_t,
 ) -> bool {
     catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the SDK passes null or a descriptor it owns for this call.
         let Some(frame) = (unsafe { frame.as_mut() }) else {
             return false;
         };
         let request = audio_request(frame);
         frame.p_data = std::ptr::null_mut();
         frame.__bindgen_anon_1.channel_stride_in_bytes = 0;
-        let Ok(request) = request else {
-            return false;
-        };
-        let Some((pointer, stride)) = REGISTRY
-            .get()
-            .and_then(|r| r.allocate(opaque as usize, request))
+        let Some((pointer, stride)) = request
+            .ok()
+            .and_then(|request| REGISTRY.get()?.allocate(opaque as usize, request))
         else {
             return false;
         };
@@ -807,47 +1078,44 @@ unsafe extern "C" fn audio_allocate(
     }))
     .unwrap_or(false)
 }
-unsafe extern "C" fn video_free(
-    opaque: *mut c_void,
-    frame: *const NDIlib_video_frame_v2_t,
-) -> bool {
+
+/// Release the allocation at `data` that generation `opaque` made.
+fn free(opaque: *mut c_void, data: *mut u8) -> bool {
     catch_unwind(AssertUnwindSafe(|| {
-        unsafe { frame.as_ref() }.is_some_and(|frame| {
-            REGISTRY
-                .get()
-                .is_some_and(|r| r.free(opaque as usize, frame.p_data))
-        })
-    }))
-    .unwrap_or(false)
-}
-unsafe extern "C" fn audio_free(
-    opaque: *mut c_void,
-    frame: *const NDIlib_audio_frame_v3_t,
-) -> bool {
-    catch_unwind(AssertUnwindSafe(|| {
-        unsafe { frame.as_ref() }.is_some_and(|frame| {
-            REGISTRY
-                .get()
-                .is_some_and(|r| r.free(opaque as usize, frame.p_data))
-        })
+        REGISTRY
+            .get()
+            .is_some_and(|registry| registry.free(opaque as usize, data))
     }))
     .unwrap_or(false)
 }
 
-#[cfg(ndi_has_advanced_header)]
-const _: () = {
-    let _: VideoSet = crate::sys::advanced_declarations::NDIlib_recv_set_video_allocator;
-    let _: AudioSet = crate::sys::advanced_declarations::NDIlib_recv_set_audio_allocator;
-};
+/// The SDK's release of video memory. `opaque` is the generation token.
+unsafe extern "C" fn video_free(
+    opaque: *mut c_void,
+    frame: *const NDIlib_video_frame_v2_t,
+) -> bool {
+    // SAFETY: the SDK passes null or a descriptor that is valid for this call.
+    unsafe { frame.as_ref() }.is_some_and(|frame| free(opaque, frame.p_data))
+}
+
+/// The SDK's release of audio memory. `opaque` is the generation token.
+unsafe extern "C" fn audio_free(
+    opaque: *mut c_void,
+    frame: *const NDIlib_audio_frame_v3_t,
+) -> bool {
+    // SAFETY: the SDK passes null or a descriptor that is valid for this call.
+    unsafe { frame.as_ref() }.is_some_and(|frame| free(opaque, frame.p_data))
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn native_allocation_formats_preserve_protection_and_decoded_formats() {
-        let protected_video = u32::from_le_bytes(*b"H264") | 0x8080_8080;
+        use crate::advanced::{packets::PROTECTED, StreamTier};
+        let protected_video = VideoCodec::H264.outer(StreamTier::Program, true);
         let mut video = NDIlib_video_frame_v2_t {
-            FourCC: ffi::video_fourcc_native(protected_video),
+            FourCC: protected_video,
             xres: 16,
             yres: 16,
             ..Default::default()
@@ -857,18 +1125,20 @@ mod tests {
             video_request(&video).unwrap().format(),
             AllocationFormat::CompressedVideo(protected_video)
         );
+        video.__bindgen_anon_1.data_size_in_bytes = 0;
+        assert!(video_request(&video).is_err());
         video.FourCC = PixelFormat::BGRA.into();
         assert_eq!(
             video_request(&video).unwrap().format(),
             AllocationFormat::Video(PixelFormat::BGRA)
         );
-        video.FourCC = ffi::video_fourcc_native(u32::MAX);
+        video.FourCC = u32::MAX;
         assert!(video_request(&video).is_err());
-        for codec in [0xff, u32::from_le_bytes(*b"Opus")] {
-            for protection in [0, 0x8080_8080] {
-                let bits = codec | protection;
+        for codec in [AudioCodec::Aac, AudioCodec::Opus] {
+            for protected in [false, true] {
+                let bits = codec.outer(protected);
                 let mut audio = NDIlib_audio_frame_v3_t {
-                    FourCC: ffi::audio_fourcc_native(bits),
+                    FourCC: bits,
                     ..Default::default()
                 };
                 audio.__bindgen_anon_1.data_size_in_bytes = 64;
@@ -876,11 +1146,12 @@ mod tests {
                     audio_request(&audio).unwrap().format(),
                     AllocationFormat::CompressedAudio(bits)
                 );
-                audio.FourCC = ffi::audio_fourcc_native(u32::MAX);
+                audio.FourCC = bits ^ PROTECTED ^ 1;
                 assert!(audio_request(&audio).is_err());
             }
         }
     }
+
     fn limits() -> AllocatorLimits {
         AllocatorLimits {
             max_generations: 2,
@@ -890,6 +1161,7 @@ mod tests {
             max_allocation_bytes: 64,
         }
     }
+
     fn request() -> AllocationRequest {
         AllocationRequest {
             bytes: 64,
@@ -900,6 +1172,7 @@ mod tests {
             capacity_limit: 64,
         }
     }
+
     #[test]
     fn retired_lease_keeps_generation_and_budget_until_matching_free() {
         let registry = Registry::new(limits());
@@ -922,6 +1195,36 @@ mod tests {
         assert_eq!(registry.generations.load(Ordering::Acquire), 1);
         registry.retire(next);
     }
+
+    #[test]
+    fn a_free_releases_only_an_allocation_of_the_generation_it_names() {
+        let registry = Registry::new(limits());
+        let first = registry
+            .register(Arc::new(AllocationBuffer::zeroed))
+            .unwrap();
+        let (pointer, _) = registry.allocate(first, request()).unwrap();
+        // The receiver moves on to a second generation while the SDK still
+        // holds the first one's buffer.
+        registry.retire(first);
+        let second = registry
+            .register(Arc::new(AllocationBuffer::zeroed))
+            .unwrap();
+
+        // A free that names the second generation cannot release it.
+        assert!(!registry.free(second, pointer.as_ptr()));
+        assert_eq!(lock(&registry.state).bytes, 64);
+        assert_eq!(registry.generations.load(Ordering::Acquire), 2);
+
+        // The free the SDK sends names the generation that allocated, and
+        // releases the buffer, its budget and the retired generation.
+        assert!(registry.free(first, pointer.as_ptr()));
+        assert_eq!(lock(&registry.state).bytes, 0);
+        assert!(lock(&registry.state).leases.is_empty());
+        assert_eq!(registry.generations.load(Ordering::Acquire), 1);
+        registry.retire(second);
+        assert_eq!(registry.generations.load(Ordering::Acquire), 0);
+    }
+
     #[test]
     fn policy_cannot_publish_after_close() {
         let registry = Arc::new(Registry::new(limits()));
@@ -949,6 +1252,7 @@ mod tests {
         assert_eq!(lock(&registry.state).bytes, 0);
         assert_eq!(registry.generations.load(Ordering::Acquire), 0);
     }
+
     #[test]
     fn budgets_cover_multiple_generations_and_panic_paths() {
         let registry = Registry::new(limits());
@@ -975,6 +1279,7 @@ mod tests {
         assert_eq!(lock(&registry.state).reserved_bytes, 0);
         registry.retire(panic);
     }
+
     #[test]
     fn blocked_storage_reclamation_remains_charged() {
         struct DelayedStorage {
