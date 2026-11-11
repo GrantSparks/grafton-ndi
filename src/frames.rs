@@ -13,8 +13,8 @@ use std::{
 
 use crate::{
     capture::{AudioKind, FrameFree, FrameSyncAudioFree, Guard, VideoKind},
-    ndi_lib::*,
     recv_guard::{RecvAudioGuard, RecvMetadataGuard},
+    sys::bindings::*,
     Error, Result, NDI,
 };
 
@@ -49,35 +49,35 @@ use crate::{
 #[repr(u32)]
 pub enum PixelFormat {
     /// YCbCr 4:2:2 format (16 bits per pixel) - bandwidth efficient.
-    UYVY = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY as _,
+    UYVY = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY,
     /// YCbCr 4:2:2 with alpha channel (24 bits per pixel).
-    UYVA = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVA as _,
+    UYVA = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVA,
     /// 16-bit YCbCr 4:2:2 format.
-    P216 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_P216 as _,
+    P216 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_P216,
     /// 16-bit YCbCr 4:2:2 with alpha.
-    PA16 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_PA16 as _,
+    PA16 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_PA16,
     /// Planar YCbCr 4:2:0 format (12 bits per pixel).
-    YV12 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_YV12 as _,
+    YV12 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_YV12,
     /// Planar YCbCr 4:2:0 format (12 bits per pixel).
-    I420 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_I420 as _,
+    I420 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_I420,
     /// Semi-planar YCbCr 4:2:0 format (12 bits per pixel).
-    NV12 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NV12 as _,
+    NV12 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NV12,
     /// Blue-Green-Red-Alpha format (32 bits per pixel) - full quality.
-    BGRA = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA as _,
+    BGRA = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRA,
     /// Blue-Green-Red with padding (32 bits per pixel).
-    BGRX = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRX as _,
+    BGRX = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_BGRX,
     /// Red-Green-Blue-Alpha format (32 bits per pixel) - full quality.
-    RGBA = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBA as _,
+    RGBA = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBA,
     /// Red-Green-Blue with padding (32 bits per pixel).
-    RGBX = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBX as _,
+    RGBX = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_RGBX,
     /// Full-resolution planar Y, U, V with 8-bit samples. Requires NDI 6.4 for sending.
-    NA48 = u32::from_le_bytes(*b"NA48"),
+    NA48 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NA48,
     /// Full-resolution planar Y, U, V, alpha with 8-bit samples. Requires NDI 6.4.
-    NB48 = u32::from_le_bytes(*b"NB48"),
+    NB48 = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NB48,
     /// Full-resolution planar Y, U, V with 16-bit samples. Requires NDI 6.4.
-    NA4G = u32::from_le_bytes(*b"NA4G"),
+    NA4G = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NA4G,
     /// Full-resolution planar Y, U, V, alpha with 16-bit samples. Requires NDI 6.4.
-    NB4G = u32::from_le_bytes(*b"NB4G"),
+    NB4G = NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NB4G,
 }
 
 /// Category of pixel format for buffer calculation and union field access.
@@ -934,8 +934,7 @@ impl VideoFrame {
         let metadata =
             unsafe { FrameMetadata::copy_from_raw_validated(c_frame.p_metadata, metadata_layout) };
 
-        #[allow(clippy::unnecessary_cast)] // Required for Windows where frame_format_type is i32
-        let scan_type = ScanType::try_from(c_frame.frame_format_type as u32).map_err(|_| {
+        let scan_type = ScanType::try_from(c_frame.frame_format_type).map_err(|_| {
             Error::InvalidFrame(format!(
                 "Unknown scan type: 0x{:08X}",
                 c_frame.frame_format_type
@@ -2520,16 +2519,14 @@ pub(crate) fn validate_video_layout(raw: &NDIlib_video_frame_v2_t) -> Result<Val
 
     validate_video_frame_metadata(raw.frame_rate_N, raw.frame_rate_D, raw.picture_aspect_ratio)?;
 
-    #[allow(clippy::unnecessary_cast)]
-    ScanType::try_from(raw.frame_format_type as u32).map_err(|_| {
+    ScanType::try_from(raw.frame_format_type).map_err(|_| {
         Error::InvalidFrame(format!(
             "Unknown scan type: 0x{:08X}",
             raw.frame_format_type
         ))
     })?;
 
-    #[allow(clippy::unnecessary_cast)] // Required for Windows where FourCC is i32
-    let pixel_format = PixelFormat::try_from(raw.FourCC as u32).map_err(|_| {
+    let pixel_format = PixelFormat::try_from(raw.FourCC).map_err(|_| {
         Error::InvalidFrame(format!("Unknown pixel format FourCC: 0x{:08X}", raw.FourCC))
     })?;
 
@@ -3393,8 +3390,7 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
     ///
     /// This is guaranteed to be valid since it is checked during construction.
     pub fn scan_type(&self) -> ScanType {
-        #[allow(clippy::unnecessary_cast)]
-        ScanType::try_from(self.guard.frame().frame_format_type as u32)
+        ScanType::try_from(self.guard.frame().frame_format_type)
             .expect("VideoFrameRef validates scan type during construction")
     }
 
@@ -3932,11 +3928,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn planar_444_rows_copy_without_padding_and_preserve_runtime_proof() {
         use crate::capture::FrameSyncVideoFree;
         use std::mem::MaybeUninit;
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let supported = ndi
             .require_feature(crate::capabilities::RuntimeFeature::Planar444Video)
             .is_ok();
@@ -3975,7 +3972,8 @@ mod tests {
             // Only initialized active bytes may be read; padding stays uninitialized.
             let frame = unsafe {
                 VideoRef::new(
-                    Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw).with_runtime(&ndi),
+                    Guard::<FrameSyncVideoFree>::with_test_free(ptr::null_mut(), raw, |_, _| {})
+                        .with_runtime(&ndi),
                 )
             }
             .unwrap();
@@ -4025,9 +4023,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn planar_444_runtime_proof_outlives_explicit_runtime_handles() {
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         if ndi
             .require_feature(crate::capabilities::RuntimeFeature::Planar444Video)
             .is_err()
@@ -4162,7 +4161,11 @@ mod tests {
                     ..Default::default()
                 };
                 let frame = unsafe {
-                    VideoRef::new(Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw))
+                    VideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
+                        ptr::null_mut(),
+                        raw,
+                        |_, _| {},
+                    ))
                 }
                 .unwrap();
                 let iterations = 100;
@@ -4254,7 +4257,12 @@ mod tests {
                 // Null FrameSync guards skip SDK calls; storage and metadata
                 // live until both independent guards and their views are gone.
                 let make = || unsafe {
-                    VideoRef::new(Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw)).unwrap()
+                    VideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
+                        ptr::null_mut(),
+                        raw,
+                        |_, _| {},
+                    ))
+                    .unwrap()
                 };
                 let (frame, allocations) = crate::test_alloc::allocation_count(make);
                 assert_eq!(allocations, 0);
@@ -4454,9 +4462,14 @@ mod tests {
                 },
                 ..Default::default()
             };
-            let frame =
-                unsafe { VideoRef::new(Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw)) }
-                    .unwrap();
+            let frame = unsafe {
+                VideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
+                    ptr::null_mut(),
+                    raw,
+                    |_, _| {},
+                ))
+            }
+            .unwrap();
             assert_eq!(frame.data().is_some(), padded.plane_count == 1);
             for plane in frame.planes() {
                 assert_eq!(plane.data().unwrap(), vec![42; plane.active_row_bytes()]);
@@ -4505,9 +4518,14 @@ mod tests {
                 },
                 ..Default::default()
             };
-            let borrowed =
-                unsafe { VideoRef::new(Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw)) }
-                    .unwrap();
+            let borrowed = unsafe {
+                VideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
+                    ptr::null_mut(),
+                    raw,
+                    |_, _| {},
+                ))
+            }
+            .unwrap();
             let packed = image_test_frame(format, 2, 2, None, pixels.to_vec());
             let png = borrowed.encode_png().unwrap();
             assert_eq!(
@@ -4549,9 +4567,14 @@ mod tests {
             },
             ..Default::default()
         };
-        let frame =
-            unsafe { VideoRef::new(Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw)) }
-                .unwrap();
+        let frame = unsafe {
+            VideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
+                ptr::null_mut(),
+                raw,
+                |_, _| {},
+            ))
+        }
+        .unwrap();
         assert!(frame.data().is_none());
         let owned = frame.to_owned().unwrap();
         assert_eq!(owned.data().len(), 82_176);
@@ -4618,7 +4641,9 @@ mod tests {
         );
         // The null-instance FrameSync strategy never frees these test-owned
         // pixels. The owned source stays alive for the borrowed view's use.
-        let guard = unsafe { Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), frame.to_raw()) };
+        let guard = unsafe {
+            Guard::<FrameSyncVideoFree>::with_test_free(ptr::null_mut(), frame.to_raw(), |_, _| {})
+        };
         let borrowed = unsafe { VideoRef::new(guard) }.unwrap();
         assert!(borrowed.data().is_none());
         assert_eq!(
@@ -4654,8 +4679,13 @@ mod tests {
             .pixel_format(PixelFormat::UYVY)
             .build()
             .unwrap();
-        let guard =
-            unsafe { Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), unsupported.to_raw()) };
+        let guard = unsafe {
+            Guard::<FrameSyncVideoFree>::with_test_free(
+                ptr::null_mut(),
+                unsupported.to_raw(),
+                |_, _| {},
+            )
+        };
         let borrowed = unsafe { VideoRef::new(guard) }.unwrap();
         assert!(borrowed.encode_png().is_err());
         assert!(borrowed.encode_jpeg(85).is_err());
@@ -5624,15 +5654,9 @@ mod tests {
         let expected_size = (stride * height) as usize;
         let mut data = vec![0u8; expected_size];
 
-        // Use an unknown FourCC value (0xDEADBEEF)
-        // On Windows FourCC is i32, on Linux it's u32
-        #[allow(clippy::unnecessary_cast)]
         let c_frame = NDIlib_video_frame_v2_t {
             xres: width,
             yres: height,
-            #[cfg(target_os = "windows")]
-            FourCC: 0xDEADBEEFu32 as i32, // Unknown FourCC
-            #[cfg(not(target_os = "windows"))]
             FourCC: 0xDEADBEEF, // Unknown FourCC
             frame_rate_N: 60,
             frame_rate_D: 1,
@@ -5877,7 +5901,9 @@ mod tests {
         let recv_guard =
             unsafe { Guard::<VideoKind>::with_test_free(ptr::null_mut(), recv_raw, |_, _| {}) };
         let recv = unsafe { VideoFrameRef::new(recv_guard) }.expect("receiver video ref");
-        let fs_guard = unsafe { Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), fs_raw) };
+        let fs_guard = unsafe {
+            Guard::<FrameSyncVideoFree>::with_test_free(ptr::null_mut(), fs_raw, |_, _| {})
+        };
         let fs =
             unsafe { VideoRef::<FrameSyncVideoFree>::new(fs_guard) }.expect("framesync video ref");
 
@@ -5942,8 +5968,13 @@ mod tests {
             Err(Error::InvalidFrame(_))
         ));
 
-        let fs_guard =
-            unsafe { Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw(&mut fs_data)) };
+        let fs_guard = unsafe {
+            Guard::<FrameSyncVideoFree>::with_test_free(
+                ptr::null_mut(),
+                raw(&mut fs_data),
+                |_, _| {},
+            )
+        };
         assert!(matches!(
             unsafe { VideoRef::<FrameSyncVideoFree>::new(fs_guard) },
             Err(Error::InvalidFrame(_))
@@ -7119,7 +7150,8 @@ mod tests {
             timestamp: 456,
             p_metadata: ptr::null(),
         };
-        let guard = unsafe { Guard::<FrameSyncAudioFree>::new(ptr::null_mut(), raw) };
+        let guard =
+            unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
         let frame = unsafe { AudioRef::<FrameSyncAudioFree>::new(guard, false) }.unwrap();
         assert!(frame.data().is_none());
         assert_eq!(frame.channel_data(0).unwrap(), &[1.0, 2.0, 3.0]);

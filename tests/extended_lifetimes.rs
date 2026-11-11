@@ -1,8 +1,10 @@
 //! Test-owned native fixtures exercise ownership order without SDK discovery.
-#![cfg(all(target_os = "linux", ndi_has_discovery_header, not(ndi_link_static)))]
+#![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
-#[path = "support/fixture_cc.rs"]
-mod fixture_cc;
+#[path = "support/fixture.rs"]
+mod fixture;
+
+use fixture::FakeRuntime;
 use grafton_ndi::{
     capabilities::SdkEdition,
     discovery::{
@@ -18,41 +20,16 @@ use std::{
     time::Duration,
 };
 
+/// Build a fake runtime whose senders, receivers and advertisers log their lifecycle.
 fn fixture(directory: &Path, advanced: bool) -> PathBuf {
-    let sdk = std::env::var_os("NDI_SDK_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/usr/share/NDI SDK for Linux"));
-    let library = directory.join(if advanced {
-        "libndi_advanced.so"
-    } else {
-        "libndi.so"
-    });
-    let include = if sdk.join("include").is_dir() {
-        sdk.join("include")
-    } else {
-        sdk.join("Include")
-    };
-    let mut command = fixture_cc::command();
-    command
-        .args(["-std=c11", "-shared", "-fPIC", "-DFAKE_OBJECTS"])
-        .arg("-I")
-        .arg(include)
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/support/fake_sdk.c"
-        ))
-        .arg("-o")
-        .arg(&library);
+    let runtime = FakeRuntime::new().with("fake_objects");
     if advanced {
-        command.arg("-DFAKE_ADVANCED");
+        runtime
+            .with("fake_advanced")
+            .build(&directory.join("libndi_advanced.so"))
+    } else {
+        runtime.build(&directory.join("libndi.so"))
     }
-    let result = command.output().unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    library
 }
 fn log() -> String {
     fs::read_to_string(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap()).unwrap()

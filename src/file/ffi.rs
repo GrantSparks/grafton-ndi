@@ -168,6 +168,10 @@ pub(super) struct Metadata {
 // complete lifecycle group before an object may be constructed.
 macro_rules! file_functions {
     ($( $field:ident => $symbol:ident ($($arg:ident: $ty:ty),*) -> $ret:ty; )*) => {
+        /// The File library's entry points, for the declaration coverage test.
+        #[cfg(test)]
+        pub(crate) const FUNCTION_NAMES: &[&str] = &[$(stringify!($symbol),)*];
+
         #[derive(Clone, Copy)]
         pub(super) struct Functions { $(pub $field: unsafe extern "C" fn($($ty),*) -> $ret,)* }
         impl Functions {

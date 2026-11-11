@@ -6,8 +6,9 @@
 //! descriptors, which have no metadata or timestamp fields.
 
 use crate::{
-    frames::validate_packed_audio_dimensions, ndi_lib::*, AudioFormat, AudioFrame, Error, Result,
-    Sender, NDI,
+    frames::validate_packed_audio_dimensions,
+    sys::{self, bindings::*},
+    AudioFormat, AudioFrame, Error, Result, Sender, NDI,
 };
 
 /// Full-scale integer audio level in dB above NDI's +4 dBu reference.
@@ -181,19 +182,8 @@ interleaved_input!(
     NDIlib_audio_frame_interleaved_32f_t
 );
 
-type ToInterleaved<T> = unsafe extern "C" fn(*const NDIlib_audio_frame_v3_t, *mut T) -> bool;
-type FromInterleaved<T> = unsafe extern "C" fn(*const T, *mut NDIlib_audio_frame_v3_t) -> bool;
-type SendInterleaved<T> = unsafe extern "C" fn(NDIlib_send_instance_t, *const T);
-
-unsafe fn required<F: Copy>(ndi: &NDI, name: &'static [u8]) -> Result<F> {
-    unsafe { ndi.resolve_optional::<F>(name)? }.ok_or_else(|| Error::UnsupportedCapability {
-        capability: "interleaved audio utilities".into(),
-        reason: format!(
-            "{} is unavailable",
-            String::from_utf8_lossy(&name[..name.len() - 1])
-        ),
-    })
-}
+/// The capability name reported when the interleaved helpers are unavailable.
+const INTERLEAVED_AUDIO: &str = "interleaved audio utilities";
 
 /// Native audio conversion operations, resolved together from one live runtime.
 ///
@@ -202,12 +192,7 @@ unsafe fn required<F: Copy>(ndi: &NDI, name: &'static [u8]) -> Result<F> {
 /// conversion. Methods take caller-owned output storage for reuse.
 pub struct AudioConverter {
     _ndi: NDI,
-    to_i16: ToInterleaved<NDIlib_audio_frame_interleaved_16s_t>,
-    from_i16: FromInterleaved<NDIlib_audio_frame_interleaved_16s_t>,
-    to_i32: ToInterleaved<NDIlib_audio_frame_interleaved_32s_t>,
-    from_i32: FromInterleaved<NDIlib_audio_frame_interleaved_32s_t>,
-    to_f32: ToInterleaved<NDIlib_audio_frame_interleaved_32f_t>,
-    from_f32: FromInterleaved<NDIlib_audio_frame_interleaved_32f_t>,
+    audio: &'static sys::InterleavedAudio,
 }
 
 macro_rules! conversions {
@@ -227,7 +212,7 @@ macro_rules! conversions {
             };
             // SAFETY: Both typed buffers cover the validated dimensions, do not
             // alias, and remain live throughout this synchronous conversion.
-            if !unsafe { (self.$to)(&source, &mut destination) } {
+            if !unsafe { self.audio.$to(&source, &mut destination) } {
                 return Err(Error::NativeOperationFailed { operation: stringify!($to_method) });
             }
             Ok(shape.count)
@@ -252,7 +237,7 @@ macro_rules! conversions {
             raw.p_data = destination.data_mut().as_mut_ptr().cast();
             // SAFETY: Source and destination have matching checked dimensions;
             // the exclusively borrowed output is initialized and correctly aligned.
-            if !unsafe { (self.$from)(&source, &mut raw) } {
+            if !unsafe { self.audio.$from(&source, &mut raw) } {
                 return Err(Error::NativeOperationFailed { operation: stringify!($into_method) });
             }
             Ok(())
@@ -263,26 +248,18 @@ macro_rules! conversions {
 impl AudioConverter {
     /// Resolve the complete current conversion group before exposing operations.
     pub fn new(ndi: &NDI) -> Result<Self> {
-        // SAFETY: Each function signature matches its named utilities.h export.
-        unsafe {
-            Ok(Self {
-                _ndi: ndi.clone(),
-                to_i16: required(ndi, b"NDIlib_util_audio_to_interleaved_16s_v3\0")?,
-                from_i16: required(ndi, b"NDIlib_util_audio_from_interleaved_16s_v3\0")?,
-                to_i32: required(ndi, b"NDIlib_util_audio_to_interleaved_32s_v3\0")?,
-                from_i32: required(ndi, b"NDIlib_util_audio_from_interleaved_32s_v3\0")?,
-                to_f32: required(ndi, b"NDIlib_util_audio_to_interleaved_32f_v3\0")?,
-                from_f32: required(ndi, b"NDIlib_util_audio_from_interleaved_32f_v3\0")?,
-            })
-        }
+        Ok(Self {
+            audio: ndi.api().interleaved_audio.require(INTERLEAVED_AUDIO)?,
+            _ndi: ndi.clone(),
+        })
     }
 
     conversions!(
         InterleavedAudioI16,
         i16,
         NDIlib_audio_frame_interleaved_16s_t,
-        to_i16,
-        from_i16,
+        NDIlib_util_audio_to_interleaved_16s_v3,
+        NDIlib_util_audio_from_interleaved_16s_v3,
         to_interleaved_i16,
         from_interleaved_i16,
         from_interleaved_i16_into,
@@ -292,8 +269,8 @@ impl AudioConverter {
         InterleavedAudioI32,
         i32,
         NDIlib_audio_frame_interleaved_32s_t,
-        to_i32,
-        from_i32,
+        NDIlib_util_audio_to_interleaved_32s_v3,
+        NDIlib_util_audio_from_interleaved_32s_v3,
         to_interleaved_i32,
         from_interleaved_i32,
         from_interleaved_i32_into,
@@ -303,8 +280,8 @@ impl AudioConverter {
         InterleavedAudioF32,
         f32,
         NDIlib_audio_frame_interleaved_32f_t,
-        to_f32,
-        from_f32,
+        NDIlib_util_audio_to_interleaved_32f_v3,
+        NDIlib_util_audio_from_interleaved_32f_v3,
         to_interleaved_f32,
         from_interleaved_f32,
         from_interleaved_f32_into
@@ -312,15 +289,20 @@ impl AudioConverter {
 }
 
 macro_rules! send_interleaved {
-    ($method:ident, $input:ident, $raw:ty, $symbol:literal) => {
+    ($method:ident, $input:ident, $send:ident) => {
         /// Synchronously send validated interleaved audio using the selected SDK.
         /// Source samples may be reused when this method returns. The interleaved
         /// SDK descriptors do not carry metadata or receive timestamps.
         pub fn $method(&self, frame: &$input<'_>) -> Result<()> {
-            // SAFETY: This signature matches the named native send helper.
-            let send: SendInterleaved<$raw> = unsafe { required(self.runtime(), $symbol)? };
+            let send = self
+                .runtime()
+                .api()
+                .interleaved_send
+                .require(INTERLEAVED_AUDIO)?;
             let raw = frame.raw();
-            unsafe { send(self.native_instance(), &raw) };
+            // SAFETY: the sender instance is live for this borrow and the
+            // validated source slice outlives the synchronous call.
+            unsafe { send.$send(self.native_instance(), &raw) };
             Ok(())
         }
     };
@@ -330,20 +312,17 @@ impl Sender {
     send_interleaved!(
         send_audio_interleaved_i16,
         InterleavedAudioI16,
-        NDIlib_audio_frame_interleaved_16s_t,
-        b"NDIlib_util_send_send_audio_interleaved_16s\0"
+        NDIlib_util_send_send_audio_interleaved_16s
     );
     send_interleaved!(
         send_audio_interleaved_i32,
         InterleavedAudioI32,
-        NDIlib_audio_frame_interleaved_32s_t,
-        b"NDIlib_util_send_send_audio_interleaved_32s\0"
+        NDIlib_util_send_send_audio_interleaved_32s
     );
     send_interleaved!(
         send_audio_interleaved_f32,
         InterleavedAudioF32,
-        NDIlib_audio_frame_interleaved_32f_t,
-        b"NDIlib_util_send_send_audio_interleaved_32f\0"
+        NDIlib_util_send_send_audio_interleaved_32f
     );
 }
 
@@ -391,9 +370,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn native_float_conversion_preserves_channel_order_and_reuses_storage() {
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let converter = AudioConverter::new(&ndi).unwrap();
         let samples = [0.125, -0.5, 0.25, -0.25, 0.5, -0.125];
         let input = InterleavedAudioF32::new(48000, 2, 3, &samples)
@@ -440,9 +420,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn native_integer_conversion_respects_explicit_reference_level() {
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let converter = AudioConverter::new(&ndi).unwrap();
         let i16_samples = [8192i16, -16384, 16384, -8192];
         let i16_input =
@@ -484,9 +465,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn native_interleaved_send_helpers_accept_checked_sources() {
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let options = crate::SenderOptions::builder("grafton isolated utility validation")
             .clock_audio(false)
             .clock_video(false)

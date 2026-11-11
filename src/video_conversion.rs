@@ -7,8 +7,7 @@
 
 use crate::{
     frames::{ValidatedVideoLayout, MAX_VIDEO_BYTES},
-    ndi_lib::*,
-    Error, PixelFormat, Result, VideoFrame, NDI,
+    sys, Error, PixelFormat, Result, VideoFrame, NDI,
 };
 
 /// Validated V210 storage geometry, including optional initialized row padding.
@@ -124,39 +123,21 @@ impl V210Layout {
     }
 }
 
-type Convert = unsafe extern "C" fn(*const NDIlib_video_frame_v2_t, *mut NDIlib_video_frame_v2_t);
-
 /// Native V210/P216 conversion helpers retained with their selected runtime.
 ///
 /// Both exports are resolved before construction succeeds. Operations use
 /// caller-owned initialized storage and do not allocate pixel buffers.
 pub struct VideoConverter {
     _ndi: NDI,
-    to_p216: Convert,
-    to_v210: Convert,
+    conversion: &'static sys::VideoConversion,
 }
 
 impl VideoConverter {
     /// Resolve both native utility functions from one initialized runtime.
     pub fn new(ndi: &NDI) -> Result<Self> {
-        unsafe fn resolve(ndi: &NDI, symbol: &'static [u8]) -> Result<Convert> {
-            unsafe { ndi.resolve_optional::<Convert>(symbol)? }.ok_or_else(|| {
-                Error::UnsupportedCapability {
-                    capability: "V210/P216 conversion".into(),
-                    reason: format!(
-                        "{} is unavailable",
-                        String::from_utf8_lossy(&symbol[..symbol.len() - 1])
-                    ),
-                }
-            })
-        }
-        // SAFETY: Both named utilities use the same video-v2 descriptor signature.
-        let to_p216 = unsafe { resolve(ndi, b"NDIlib_util_V210_to_P216\0")? };
-        let to_v210 = unsafe { resolve(ndi, b"NDIlib_util_P216_to_V210\0")? };
         Ok(Self {
+            conversion: ndi.api().video_conversion.require("V210/P216 conversion")?,
             _ndi: ndi.clone(),
-            to_p216,
-            to_v210,
         })
     }
 
@@ -179,12 +160,15 @@ impl VideoConverter {
         let mut input = output;
         // The native utility ignores the source FourCC; V210 deliberately is
         // not a PixelFormat variant and cannot enter the ordinary sending path.
-        input.FourCC = u32::from_le_bytes(*b"V210") as _;
+        input.FourCC = u32::from_le_bytes(*b"V210");
         input.p_data = source.as_ptr().cast_mut().cast();
         input.__bindgen_anon_1.line_stride_in_bytes = layout.stride;
         // SAFETY: Checked complete groups, native integer alignment, matching
         // extents and disjoint Rust borrows cover all accessed pixels.
-        unsafe { (self.to_p216)(&input, &mut output) };
+        unsafe {
+            self.conversion
+                .NDIlib_util_V210_to_P216(&input, &mut output)
+        };
         Ok(())
     }
 
@@ -213,7 +197,10 @@ impl VideoConverter {
         output.__bindgen_anon_1.line_stride_in_bytes = layout.stride;
         // SAFETY: Typed output is initialized and aligned for native u32 access;
         // source P216 dimensions/alignment and both extents were checked above.
-        unsafe { (self.to_v210)(&input, &mut output) };
+        unsafe {
+            self.conversion
+                .NDIlib_util_P216_to_V210(&input, &mut output)
+        };
         Ok(())
     }
 }
@@ -261,9 +248,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn native_complete_groups_roundtrip_with_independent_sample_oracle() {
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let converter = VideoConverter::new(&ndi).unwrap();
         let y = |x: usize, row: usize| ((x * 37 + row * 61 + 17) & 1023) as u32;
         let u = |pair: usize, row: usize| ((pair * 53 + row * 19 + 101) & 1023) as u32;
@@ -359,9 +347,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn invalid_buffers_and_mismatched_frames_are_rejected_before_writes() {
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let converter = VideoConverter::new(&ndi).unwrap();
         let layout = V210Layout::new(6, 1).unwrap();
         let mut output = [0x1234_5678; 4];

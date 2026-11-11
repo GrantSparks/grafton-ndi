@@ -13,8 +13,8 @@ use crate::{
         AudioFrame, LineStrideOrSize, MetadataFrame, PixelFormat, ScanType, ValidatedFrameMetadata,
         ValidatedVideoLayout, VideoFrame,
     },
-    ndi_lib::*,
     receiver::Tally,
+    sys::{self, bindings::*},
     to_ms_checked, Error, Result, NDI,
 };
 
@@ -36,26 +36,21 @@ fn async_flush_frame_ptr() -> *const NDIlib_video_frame_v2_t {
     ptr::null()
 }
 
-fn flush_null_frame(instance: NDIlib_send_instance_t) {
+fn flush_null_frame(core: &sys::Core, instance: NDIlib_send_instance_t) {
     #[cfg(target_os = "windows")]
-    {
-        let _lock = FLUSH_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        unsafe {
-            NDIlib_send_send_video_async_v2(instance, async_flush_frame_ptr());
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    unsafe {
-        NDIlib_send_send_video_async_v2(instance, async_flush_frame_ptr());
-    }
+    let _lock = FLUSH_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: the caller owns a live sender instance created through `core`; a
+    // null frame is the SDK's documented request to drain the async buffer.
+    unsafe { core.NDIlib_send_send_video_async_v2(instance, async_flush_frame_ptr()) };
 }
 
 /// SDK instance and the owned storage retained while it sends video.
 struct Inner {
     instance: NDIlib_send_instance_t,
+    // The entry points of the runtime that created `instance`.
+    core: &'static sys::Core,
     resource: Option<Arc<SenderResource>>,
     metadata_capture: parking_lot::Mutex<()>,
     video_callback: Option<AsyncCallback>,
@@ -79,10 +74,15 @@ unsafe impl Sync for SenderResource {}
 
 impl Drop for SenderResource {
     fn drop(&mut self) {
-        unsafe { NDIlib_send_destroy(self.instance) };
+        // SAFETY: this token is the instance's final owner.
+        unsafe { self._ndi.api().core.NDIlib_send_destroy(self.instance) };
     }
 }
 
+/// An NDI source that sends video, audio and metadata.
+///
+/// Create one with [`Sender::new`]. Dropping the sender completes any
+/// in-flight asynchronous video and removes the source from the network.
 #[derive(Debug)]
 pub struct Sender {
     inner: Inner,
@@ -120,7 +120,7 @@ impl Inner {
         let len = {
             let mut video = self.video.lock().unwrap_or_else(|e| e.into_inner());
             if video.in_flight {
-                flush_null_frame(self.instance);
+                flush_null_frame(self.core, self.instance);
             }
             video.completed()
         };
@@ -548,7 +548,8 @@ impl Sender {
             clock_audio: create_settings.clock_audio,
         };
 
-        let instance = unsafe { NDIlib_send_create(&c_settings) };
+        // SAFETY: the settings borrow C strings that outlive the call.
+        let instance = unsafe { ndi.api().core.NDIlib_send_create(&c_settings) };
         if instance.is_null() {
             Err(Error::InitializationFailed(
                 "Failed to create NDI send instance".into(),
@@ -570,6 +571,7 @@ impl Sender {
         Self {
             inner: Inner {
                 instance,
+                core: &ndi.api().core,
                 resource: Some(Arc::new(SenderResource {
                     instance,
                     _name: name,
@@ -617,50 +619,42 @@ impl Sender {
     /// The result owns its data. The wait budget includes contention with other
     /// metadata captures and does not block the video-send synchronization lock.
     pub fn capture_metadata(&self, timeout: Duration) -> Result<Option<MetadataFrame>> {
-        type Capture = unsafe extern "C" fn(
-            NDIlib_send_instance_t,
-            *mut NDIlib_metadata_frame_t,
-            u32,
-        ) -> NDIlib_frame_type_e;
-        type Free = unsafe extern "C" fn(NDIlib_send_instance_t, *const NDIlib_metadata_frame_t);
+        let metadata = self._ndi.api().sender_metadata.require("sender metadata")?;
         let _ = to_ms_checked(timeout)?;
         let started = Instant::now();
         let Some(_lock) = self.inner.metadata_capture.try_lock_for(timeout) else {
             return Ok(None);
-        };
-        let capture: Capture = unsafe {
-            crate::dispatch::require_optional(b"NDIlib_send_capture\0", "sender metadata")?
-        };
-        let free: Free = unsafe {
-            crate::dispatch::require_optional(b"NDIlib_send_free_metadata\0", "sender metadata")?
         };
         let mut raw = NDIlib_metadata_frame_t {
             length: 0,
             timecode: 0,
             p_data: ptr::null_mut(),
         };
-        let kind = unsafe {
-            capture(
-                self.inner.instance,
-                &mut raw,
-                to_ms_checked(timeout.saturating_sub(started.elapsed()))?,
-            )
-        };
+        let remaining = to_ms_checked(timeout.saturating_sub(started.elapsed()))?;
+        // SAFETY: the sender instance is live for this borrow and `raw` is
+        // writable storage for one metadata descriptor.
+        let kind =
+            unsafe { metadata.NDIlib_send_capture(self.inner.instance, &mut raw, remaining) };
         if kind == NDIlib_frame_type_e_NDIlib_frame_type_metadata {
             struct Release {
                 instance: NDIlib_send_instance_t,
                 raw: NDIlib_metadata_frame_t,
-                free: Free,
+                metadata: &'static sys::SenderMetadata,
             }
             impl Drop for Release {
                 fn drop(&mut self) {
-                    unsafe { (self.free)(self.instance, &self.raw) };
+                    // SAFETY: `raw` was filled by NDIlib_send_capture on this
+                    // instance and is released exactly once.
+                    unsafe {
+                        self.metadata
+                            .NDIlib_send_free_metadata(self.instance, &self.raw)
+                    };
                 }
             }
             let guard = Release {
                 instance: self.inner.instance,
                 raw,
-                free,
+                metadata,
             };
             let layout = unsafe { crate::frames::validate_metadata_layout(&guard.raw)? };
             Ok(Some(unsafe {
@@ -683,8 +677,12 @@ impl Sender {
         let len = {
             let mut video = self.inner.video.lock().unwrap_or_else(|e| e.into_inner());
             // A synchronous video send also releases the previous async frame.
+            // SAFETY: the sender instance is live for this borrow, and every pointer
+            // passed outlives the synchronous call.
             unsafe {
-                NDIlib_send_send_video_v2(self.inner.instance, &video_frame.to_raw());
+                self.inner
+                    .core
+                    .NDIlib_send_send_video_v2(self.inner.instance, &video_frame.to_raw());
             }
             video.completed()
         };
@@ -713,8 +711,12 @@ impl Sender {
             // not move its Vec/CString allocations.
             let previous = video.pending.replace(frame);
             video.in_flight = true;
+            // SAFETY: the sender instance is live for this borrow, and every pointer
+            // passed outlives the synchronous call.
             unsafe {
-                NDIlib_send_send_video_async_v2(self.inner.instance, &raw);
+                self.inner
+                    .core
+                    .NDIlib_send_send_video_async_v2(self.inner.instance, &raw);
             }
             (previous, len)
         };
@@ -734,7 +736,7 @@ impl Sender {
         let (previous, len) = {
             let mut video = self.inner.video.lock().unwrap_or_else(|e| e.into_inner());
             if video.in_flight {
-                flush_null_frame(self.inner.instance);
+                flush_null_frame(self.inner.core, self.inner.instance);
             }
             let len = video.completed();
             (video.pending.take(), len)
@@ -801,8 +803,12 @@ impl Sender {
     /// # }
     /// ```
     pub fn send_audio(&self, audio_frame: &AudioFrame) {
+        // SAFETY: the sender instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
         unsafe {
-            NDIlib_send_send_audio_v3(self.inner.instance, &audio_frame.to_raw());
+            self.inner
+                .core
+                .NDIlib_send_send_audio_v3(self.inner.instance, &audio_frame.to_raw());
         }
     }
 
@@ -811,8 +817,12 @@ impl Sender {
     pub fn send_metadata(&self, metadata_frame: &MetadataFrame) {
         let raw = metadata_frame.to_raw();
         // The borrowed C string remains live through this synchronous SDK call.
+        // SAFETY: the sender instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
         unsafe {
-            NDIlib_send_send_metadata(self.inner.instance, &raw);
+            self.inner
+                .core
+                .NDIlib_send_send_metadata(self.inner.instance, &raw);
         }
     }
 
@@ -853,8 +863,13 @@ impl Sender {
     pub fn tally(&self, timeout: Duration) -> Result<Option<Tally>> {
         let timeout_ms = to_ms_checked(timeout)?;
         let mut raw_tally = Tally::new(false, false).to_raw();
-        let success =
-            unsafe { NDIlib_send_get_tally(self.inner.instance, &mut raw_tally, timeout_ms) };
+        // SAFETY: the sender instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
+        let success = unsafe {
+            self.inner
+                .core
+                .NDIlib_send_get_tally(self.inner.instance, &mut raw_tally, timeout_ms)
+        };
 
         if success {
             Ok(Some(Tally {
@@ -900,7 +915,13 @@ impl Sender {
     /// ```
     pub fn connection_count(&self, timeout: Duration) -> Result<u32> {
         let timeout_ms = to_ms_checked(timeout)?;
-        let count = unsafe { NDIlib_send_get_no_connections(self.inner.instance, timeout_ms) };
+        // SAFETY: the sender instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
+        let count = unsafe {
+            self.inner
+                .core
+                .NDIlib_send_get_no_connections(self.inner.instance, timeout_ms)
+        };
 
         if count < 0 {
             Err(Error::Timeout("Failed to obtain connection count".into()))
@@ -909,8 +930,15 @@ impl Sender {
         }
     }
 
+    /// Remove all metadata registered for delivery to each new connection.
     pub fn clear_connection_metadata(&self) {
-        unsafe { NDIlib_send_clear_connection_metadata(self.inner.instance) }
+        // SAFETY: the sender instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
+        unsafe {
+            self.inner
+                .core
+                .NDIlib_send_clear_connection_metadata(self.inner.instance)
+        }
     }
 
     /// Adds connection metadata.
@@ -918,7 +946,13 @@ impl Sender {
     pub fn add_connection_metadata(&self, metadata_frame: &MetadataFrame) {
         let raw = metadata_frame.to_raw();
         // The borrowed C string remains live through this synchronous SDK call.
-        unsafe { NDIlib_send_add_connection_metadata(self.inner.instance, &raw) }
+        // SAFETY: the sender instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
+        unsafe {
+            self.inner
+                .core
+                .NDIlib_send_add_connection_metadata(self.inner.instance, &raw)
+        }
     }
 
     /// Sets failover source.
@@ -928,13 +962,25 @@ impl Sender {
     /// Returns an error if source conversion fails.
     pub fn set_failover(&self, source: &Source) -> Result<()> {
         let raw_source = source.to_raw()?;
-        unsafe { NDIlib_send_set_failover(self.inner.instance, &raw_source.raw) }
+        // SAFETY: the sender instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
+        unsafe {
+            self.inner
+                .core
+                .NDIlib_send_set_failover(self.inner.instance, &raw_source.raw)
+        }
         Ok(())
     }
 
     /// Clear the failover source previously configured with [`Self::set_failover`].
     pub fn clear_failover(&self) {
-        unsafe { NDIlib_send_set_failover(self.inner.instance, ptr::null()) }
+        // SAFETY: the sender instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
+        unsafe {
+            self.inner
+                .core
+                .NDIlib_send_set_failover(self.inner.instance, ptr::null())
+        }
     }
 
     /// Get the source information for this sender.
@@ -958,7 +1004,13 @@ impl Sender {
     /// # }
     /// ```
     pub fn source(&self) -> Result<Source> {
-        let source_ptr = unsafe { NDIlib_send_get_source_name(self.inner.instance) };
+        // SAFETY: the sender instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
+        let source_ptr = unsafe {
+            self.inner
+                .core
+                .NDIlib_send_get_source_name(self.inner.instance)
+        };
         // SAFETY: the SDK sender owns this live descriptor and its strings
         // through the synchronous copy performed here.
         unsafe { Source::try_from_raw(source_ptr) }
@@ -1005,7 +1057,7 @@ impl Drop for Inner {
     fn drop(&mut self) {
         let video = self.video.get_mut().unwrap_or_else(|e| e.into_inner());
         if video.in_flight {
-            flush_null_frame(self.instance);
+            flush_null_frame(self.core, self.instance);
         }
         let len = video.completed();
         // Destroy before running user code, so a callback panic cannot leak the
@@ -1050,11 +1102,18 @@ unsafe impl Send for Sender {}
 /// Exclusive ownership prevents concurrent instance destruction.
 unsafe impl Sync for Sender {}
 
+/// Configuration for creating a [`Sender`].
+///
+/// Build one with [`SenderOptions::builder`].
 #[derive(Debug, Clone)]
 pub struct SenderOptions {
+    /// The source name advertised on the network; empty lets the SDK choose.
     pub name: String,
+    /// Comma-separated discovery groups; `None` uses the SDK default.
     pub groups: Option<String>,
+    /// Pace video submissions to the frame rate instead of returning at once.
     pub clock_video: bool,
+    /// Pace audio submissions to the sample rate instead of returning at once.
     pub clock_audio: bool,
 }
 
@@ -1151,7 +1210,8 @@ mod tests {
         frame
     }
 
-    fn test_sender() -> Sender {
+    /// A sender on the real runtime, or `None` when the test must be skipped.
+    fn test_sender() -> Option<Sender> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
         let name = format!(
@@ -1159,21 +1219,24 @@ mod tests {
             std::process::id(),
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         );
-        let ndi = NDI::new().unwrap();
-        Sender::new(
-            &ndi,
-            &SenderOptions::builder(name)
-                .clock_video(false)
-                .clock_audio(false)
-                .build(),
+        let ndi = crate::test_support::ndi()?;
+        Some(
+            Sender::new(
+                &ndi,
+                &SenderOptions::builder(name)
+                    .clock_video(false)
+                    .clock_audio(false)
+                    .build(),
+            )
+            .unwrap(),
         )
-        .unwrap()
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn metadata_send_methods_reuse_validated_text_with_sdk() {
-        let sender = test_sender();
+        let Some(sender) = test_sender() else {
+            return;
+        };
         let frame = MetadataFrame::with_data("<ndi_text>é</ndi_text>", 42).unwrap();
         let expected_ptr = frame.to_raw().p_data;
         for _ in 0..3 {
@@ -1185,9 +1248,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn owned_async_recycles_original_pixel_and_metadata_allocations() {
-        let mut sender = test_sender();
+        let Some(mut sender) = test_sender() else {
+            return;
+        };
         let first = test_owned_frame(11);
         let pixels = first.data().as_ptr();
         let metadata = first.metadata_cstr().unwrap().as_ptr();
@@ -1212,12 +1276,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn mixed_sync_flush_and_copy_sends_notify_once_and_preserve_recovery() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let count = Arc::new(AtomicUsize::new(0));
         let observed = count.clone();
-        let mut sender = test_sender();
+        let Some(mut sender) = test_sender() else {
+            return;
+        };
         sender.on_async_video_done(move |len| {
             assert_eq!(len, 1024);
             observed.fetch_add(1, Ordering::SeqCst);
@@ -1277,12 +1342,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn callback_panic_after_submission_keeps_new_owned_frame_recoverable() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let count = Arc::new(AtomicUsize::new(0));
         let observed = count.clone();
-        let mut sender = test_sender();
+        let Some(mut sender) = test_sender() else {
+            return;
+        };
         sender.on_async_video_done(move |_| {
             if observed.fetch_add(1, Ordering::SeqCst) == 0 {
                 panic!("intentional completion panic");
@@ -1301,7 +1367,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn completion_callback_can_reenter_shared_flush_without_deadlock() {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
@@ -1311,7 +1376,9 @@ mod tests {
         let callback_reference = reference.clone();
         let count = Arc::new(AtomicUsize::new(0));
         let observed = count.clone();
-        let mut sender = test_sender();
+        let Some(mut sender) = test_sender() else {
+            return;
+        };
         sender.on_async_video_done(move |_| {
             observed.fetch_add(1, Ordering::SeqCst);
             let sender = callback_reference.lock().unwrap().upgrade().unwrap();
@@ -1332,12 +1399,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn sender_drop_notifies_once_for_copy() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let count = Arc::new(AtomicUsize::new(0));
         let observed = count.clone();
-        let mut sender = test_sender();
+        let Some(mut sender) = test_sender() else {
+            return;
+        };
         sender.on_async_video_done(move |_| {
             observed.fetch_add(1, Ordering::SeqCst);
         });
@@ -1354,11 +1422,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn completion_handler_can_be_replaced_and_cleared() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let count = Arc::new(AtomicUsize::new(0));
-        let mut sender = test_sender();
+        let Some(mut sender) = test_sender() else {
+            return;
+        };
         sender.on_async_video_done(|_| panic!("replaced handler must not run"));
         let observed = count.clone();
         sender.on_async_video_done(move |_| {

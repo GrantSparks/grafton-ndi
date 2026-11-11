@@ -1,4 +1,6 @@
-use grafton_ndi::{BorrowedVideoFrame, PixelFormat, Sender, SenderOptions, VideoFrame, NDI};
+mod common;
+
+use grafton_ndi::{BorrowedVideoFrame, PixelFormat, Sender, SenderOptions, VideoFrame};
 
 fn frame(value: u8) -> VideoFrame {
     let mut frame = VideoFrame::builder()
@@ -12,9 +14,10 @@ fn frame(value: u8) -> VideoFrame {
 }
 
 #[test]
-#[ignore = "Requires an installed NDI runtime"]
 fn owned_pipeline_returns_original_buffers_and_metadata() -> Result<(), grafton_ndi::Error> {
-    let ndi = NDI::new()?;
+    let Some(ndi) = common::ndi() else {
+        return Ok(());
+    };
     let options = SenderOptions::builder("owned pipeline regression")
         .clock_video(false)
         .clock_audio(false)
@@ -38,9 +41,10 @@ fn owned_pipeline_returns_original_buffers_and_metadata() -> Result<(), grafton_
 }
 
 #[test]
-#[ignore = "Requires an installed NDI runtime"]
 fn copied_send_survives_released_source() -> Result<(), grafton_ndi::Error> {
-    let ndi = NDI::new()?;
+    let Some(ndi) = common::ndi() else {
+        return Ok(());
+    };
     let options = SenderOptions::builder("copied source release regression")
         .clock_video(false)
         .clock_audio(false)
@@ -57,10 +61,11 @@ fn copied_send_survives_released_source() -> Result<(), grafton_ndi::Error> {
 }
 
 #[test]
-#[ignore = "Requires an installed NDI runtime"]
 fn mixed_owned_and_copy_send_completes_each_frame_once() -> Result<(), grafton_ndi::Error> {
     use std::sync::{Arc, Mutex};
-    let ndi = NDI::new()?;
+    let Some(ndi) = common::ndi() else {
+        return Ok(());
+    };
     let options = SenderOptions::builder("mixed async regression")
         .clock_video(false)
         .clock_audio(false)
@@ -85,13 +90,14 @@ fn mixed_owned_and_copy_send_completes_each_frame_once() -> Result<(), grafton_n
 }
 
 #[test]
-#[ignore = "Requires an installed NDI runtime"]
 fn concurrent_sync_and_reentrant_flush_preserve_owned_frame() -> Result<(), grafton_ndi::Error> {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    let ndi = NDI::new()?;
+    let Some(ndi) = common::ndi() else {
+        return Ok(());
+    };
     let options = SenderOptions::builder("sync and reentrant flush regression")
         .clock_video(false)
         .clock_audio(false)
@@ -129,13 +135,14 @@ fn concurrent_sync_and_reentrant_flush_preserve_owned_frame() -> Result<(), graf
 }
 
 #[test]
-#[ignore = "Requires an installed NDI runtime"]
 fn panicking_completion_keeps_new_owned_frame_pending() -> Result<(), grafton_ndi::Error> {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    let ndi = NDI::new()?;
+    let Some(ndi) = common::ndi() else {
+        return Ok(());
+    };
     let options = SenderOptions::builder("panicking completion regression")
         .clock_video(false)
         .clock_audio(false)
@@ -163,9 +170,10 @@ fn panicking_completion_keeps_new_owned_frame_pending() -> Result<(), grafton_nd
 }
 
 #[test]
-#[ignore = "Requires an installed NDI runtime"]
 fn copied_send_retains_metadata_after_source_drop() -> Result<(), grafton_ndi::Error> {
-    let ndi = NDI::new()?;
+    let Some(ndi) = common::ndi() else {
+        return Ok(());
+    };
     let options = SenderOptions::builder("copied metadata lifetime regression")
         .clock_video(false)
         .clock_audio(false)

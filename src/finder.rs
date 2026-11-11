@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{ndi_lib::*, to_ms_checked, Error, Result, NDI};
+use crate::{sys::bindings::*, to_ms_checked, Error, Result, NDI};
 
 /// Configuration for NDI source discovery.
 ///
@@ -188,7 +188,8 @@ impl Finder {
             p_extra_ips: extra_ips_cstr.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
         };
 
-        let instance = unsafe { NDIlib_find_create_v2(&create_settings) };
+        // SAFETY: the settings borrow C strings that outlive the call.
+        let instance = unsafe { ndi.api().core.NDIlib_find_create_v2(&create_settings) };
         if instance.is_null() {
             return Err(Error::InitializationFailed(
                 "NDIlib_find_create_v2 failed".into(),
@@ -217,7 +218,7 @@ impl Finder {
             *const std::ffi::c_char,
         ) -> NDIlib_find_instance_t;
         #[cfg(ndi_has_advanced_header)]
-        let _: Create = crate::ndi_lib::raw::NDIlib_find_create_v3;
+        let _: Create = crate::sys::advanced_declarations::NDIlib_find_create_v3;
         let create: Create =
             unsafe { crate::advanced::ffi::required(ndi, b"NDIlib_find_create_v3\0")? };
         let groups = settings.groups.as_deref().map(CString::new).transpose()?;
@@ -260,8 +261,7 @@ impl Finder {
                 NDIlib_find_instance_t,
                 *mut u32,
             ) -> *const crate::advanced::ffi::SourceV2;
-            #[cfg(ndi_has_advanced_header)]
-            let _: Get = crate::ndi_lib::raw::NDIlib_find_get_current_sources_v2;
+            let _: Get = crate::sys::advanced_declarations::NDIlib_find_get_current_sources_v2;
             let get: Get = unsafe {
                 crate::advanced::ffi::required(&self._ndi, b"NDIlib_find_get_current_sources_v2\0")?
             };
@@ -332,7 +332,13 @@ impl Finder {
     /// ```
     pub fn wait_for_sources(&self, timeout: Duration) -> Result<bool> {
         let timeout_ms = to_ms_checked(timeout)?;
-        Ok(unsafe { NDIlib_find_wait_for_sources(self.instance, timeout_ms) })
+        // SAFETY: the finder instance is live for this borrow.
+        Ok(unsafe {
+            self._ndi
+                .api()
+                .core
+                .NDIlib_find_wait_for_sources(self.instance, timeout_ms)
+        })
     }
 
     /// Returns the current list of discovered sources (snapshot).
@@ -369,7 +375,12 @@ impl Finder {
         // current_sources_with completes its deep copy.
         unsafe {
             self.current_sources_with(
-                |num_sources| NDIlib_find_get_current_sources(self.instance, num_sources),
+                |num_sources| {
+                    self._ndi
+                        .api()
+                        .core
+                        .NDIlib_find_get_current_sources(self.instance, num_sources)
+                },
                 |source| Source::try_from_raw(source),
             )
         }
@@ -510,7 +521,9 @@ impl Finder {
 
 impl Drop for Finder {
     fn drop(&mut self) {
-        unsafe { NDIlib_find_destroy(self.instance) };
+        // SAFETY: the instance was created through this runtime and is
+        // destroyed exactly once, before the runtime handle is released.
+        unsafe { self._ndi.api().core.NDIlib_find_destroy(self.instance) };
     }
 }
 
@@ -1720,14 +1733,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn concurrent_snapshots_keep_sdk_buffers_exclusive_until_copied() {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Barrier, TryLockError,
         };
 
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let finder = Finder::new(&ndi, &FinderOptions::default()).unwrap();
         let start = Barrier::new(8);
         let active_snapshot = AtomicUsize::new(0);

@@ -1,28 +1,10 @@
 //! Redirect source selection without receiving or forwarding media in Rust.
 
 use crate::{
-    dispatch::require_optional, ndi_lib::NDIlib_source_t, to_ms_checked, Error, Result, Source, NDI,
+    sys::{self, bindings::*},
+    to_ms_checked, Error, Result, Source, NDI,
 };
-use std::{
-    ffi::{c_void, CString},
-    marker::PhantomData,
-    ptr,
-    rc::Rc,
-    time::Duration,
-};
-
-type Instance = *mut c_void;
-#[repr(C)]
-struct Create {
-    name: *const std::ffi::c_char,
-    groups: *const std::ffi::c_char,
-}
-type New = unsafe extern "C" fn(*const Create) -> Instance;
-type Destroy = unsafe extern "C" fn(Instance);
-type Change = unsafe extern "C" fn(Instance, *const NDIlib_source_t) -> bool;
-type Clear = unsafe extern "C" fn(Instance) -> bool;
-type Count = unsafe extern "C" fn(Instance, u32) -> i32;
-type GetSource = unsafe extern "C" fn(Instance) -> *const NDIlib_source_t;
+use std::{ffi::CString, marker::PhantomData, ptr, rc::Rc, time::Duration};
 
 /// A router's advertised name and optional discovery groups.
 #[derive(Debug, Clone)]
@@ -51,12 +33,8 @@ impl RouterOptions {
 
 /// A thread-affine native routing source. Destruction removes its advertisement.
 pub struct Router {
-    instance: Instance,
-    destroy: Destroy,
-    change: Change,
-    clear: Clear,
-    count: Count,
-    get_source: GetSource,
+    instance: NDIlib_routing_instance_t,
+    routing: &'static sys::Routing,
     _name: CString,
     _groups: Option<CString>,
     _config: Option<CString>,
@@ -78,57 +56,51 @@ impl Router {
         Self::create(ndi, options, Some(CString::new(config.expose_json())?))
     }
     fn create(ndi: &NDI, options: &RouterOptions, config: Option<CString>) -> Result<Self> {
+        let routing = ndi.api().routing.require("source routing")?;
         let name = CString::new(options.name.as_str())?;
         let groups = options.groups.as_deref().map(CString::new).transpose()?;
-        // SAFETY: These reviewed signatures match Processing.NDI.Routing.h; the
-        // process-selected module is pinned and the full group resolves first.
-        unsafe {
-            let create: New = require_optional(b"NDIlib_routing_create\0", "routing")?;
-            let destroy = require_optional(b"NDIlib_routing_destroy\0", "routing")?;
-            let change = require_optional(b"NDIlib_routing_change\0", "routing")?;
-            let clear = require_optional(b"NDIlib_routing_clear\0", "routing")?;
-            let count = require_optional(b"NDIlib_routing_get_no_connections\0", "routing")?;
-            let get_source = require_optional(b"NDIlib_routing_get_source_name\0", "routing")?;
-            let raw = Create {
-                name: name.as_ptr(),
-                groups: groups.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
-            };
-            #[cfg(feature = "advanced")]
-            let instance = if let Some(config) = &config {
-                type Configured =
-                    unsafe extern "C" fn(*const Create, *const std::ffi::c_char) -> Instance;
-                let configured: Configured =
-                    crate::advanced::ffi::required(ndi, b"NDIlib_routing_create_v2\0")?;
-                configured(&raw, config.as_ptr())
-            } else {
-                create(&raw)
-            };
-            #[cfg(not(feature = "advanced"))]
-            let instance = create(&raw);
-            if instance.is_null() {
-                return Err(Error::InitializationFailed(
-                    "routing source creation failed".into(),
-                ));
-            }
-            Ok(Self {
-                instance,
-                destroy,
-                change,
-                clear,
-                count,
-                get_source,
-                _name: name,
-                _groups: groups,
-                _config: config,
-                _ndi: ndi.clone(),
-                _thread: PhantomData,
-            })
+        let raw = NDIlib_routing_create_t {
+            p_ndi_name: name.as_ptr(),
+            p_groups: groups.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
+        };
+        #[cfg(feature = "advanced")]
+        let instance = if let Some(config) = &config {
+            type Configured = unsafe extern "C" fn(
+                *const NDIlib_routing_create_t,
+                *const std::ffi::c_char,
+            ) -> NDIlib_routing_instance_t;
+            // SAFETY: `Configured` is the SDK's signature for this function.
+            let configured: Configured =
+                unsafe { crate::advanced::ffi::required(ndi, b"NDIlib_routing_create_v2\0")? };
+            // SAFETY: `raw` and `config` borrow C strings that outlive the call.
+            unsafe { configured(&raw, config.as_ptr()) }
+        } else {
+            // SAFETY: `raw` borrows C strings that outlive the call.
+            unsafe { routing.NDIlib_routing_create(&raw) }
+        };
+        // SAFETY: `raw` borrows C strings that outlive the call.
+        #[cfg(not(feature = "advanced"))]
+        let instance = unsafe { routing.NDIlib_routing_create(&raw) };
+        if instance.is_null() {
+            return Err(Error::InitializationFailed(
+                "routing source creation failed".into(),
+            ));
         }
+        Ok(Self {
+            instance,
+            routing,
+            _name: name,
+            _groups: groups,
+            _config: config,
+            _ndi: ndi.clone(),
+            _thread: PhantomData,
+        })
     }
     /// Select a source for connected receivers.
     pub fn change(&mut self, source: &Source) -> Result<()> {
         let raw = source.to_raw()?;
-        if unsafe { (self.change)(self.instance, &raw.raw) } {
+        // SAFETY: the router is live and `raw` owns the strings it points to.
+        if unsafe { self.routing.NDIlib_routing_change(self.instance, &raw.raw) } {
             Ok(())
         } else {
             Err(Error::NativeOperationFailed {
@@ -138,7 +110,8 @@ impl Router {
     }
     /// Disconnect the current route.
     pub fn clear(&mut self) -> Result<()> {
-        if unsafe { (self.clear)(self.instance) } {
+        // SAFETY: the router instance is live for this borrow.
+        if unsafe { self.routing.NDIlib_routing_clear(self.instance) } {
             Ok(())
         } else {
             Err(Error::NativeOperationFailed {
@@ -148,19 +121,26 @@ impl Router {
     }
     /// Count receivers; a nonzero timeout waits for connections.
     pub fn connection_count(&self, timeout: Duration) -> Result<u32> {
-        let count = unsafe { (self.count)(self.instance, to_ms_checked(timeout)?) };
+        let timeout = to_ms_checked(timeout)?;
+        // SAFETY: the router instance is live for this borrow.
+        let count = unsafe {
+            self.routing
+                .NDIlib_routing_get_no_connections(self.instance, timeout)
+        };
         u32::try_from(count).map_err(|_| Error::NativeOperationFailed {
             operation: "routing connection count",
         })
     }
     /// Copy the router's advertised source descriptor.
     pub fn source(&self) -> Result<Source> {
-        unsafe { Source::try_from_raw((self.get_source)(self.instance)) }
+        // SAFETY: the router is live, and the descriptor the SDK returns stays
+        // valid until the next call on it, after this copy completes.
+        unsafe { Source::try_from_raw(self.routing.NDIlib_routing_get_source_name(self.instance)) }
     }
     /// Send metadata immediately and on each new downstream connection.
     #[cfg(feature = "advanced")]
     pub fn add_connection_metadata(&self, metadata: &crate::MetadataFrame) -> Result<()> {
-        type Add = unsafe extern "C" fn(Instance, *const crate::ndi_lib::NDIlib_metadata_frame_t);
+        type Add = unsafe extern "C" fn(NDIlib_routing_instance_t, *const NDIlib_metadata_frame_t);
         let add: Add = unsafe {
             crate::advanced::ffi::required(&self._ndi, b"NDIlib_routing_add_connection_metadata\0")?
         };
@@ -171,7 +151,7 @@ impl Router {
     /// Clear the stored connection metadata.
     #[cfg(feature = "advanced")]
     pub fn clear_connection_metadata(&self) -> Result<()> {
-        type ClearMetadata = unsafe extern "C" fn(Instance);
+        type ClearMetadata = unsafe extern "C" fn(NDIlib_routing_instance_t);
         let clear: ClearMetadata = unsafe {
             crate::advanced::ffi::required(
                 &self._ndi,
@@ -184,6 +164,7 @@ impl Router {
 }
 impl Drop for Router {
     fn drop(&mut self) {
-        unsafe { (self.destroy)(self.instance) };
+        // SAFETY: the instance was created by this table and is destroyed once.
+        unsafe { self.routing.NDIlib_routing_destroy(self.instance) };
     }
 }

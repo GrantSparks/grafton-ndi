@@ -1,13 +1,12 @@
 mod common;
-use grafton_ndi::{
-    MetadataFrame, Receiver, ReceiverOptions, Sender, SenderOptions, VideoFrame, NDI,
-};
+use grafton_ndi::{MetadataFrame, Receiver, ReceiverOptions, Sender, SenderOptions, VideoFrame};
 use std::time::{Duration, Instant};
 
 #[test]
-#[ignore = "Requires NDI runtime and loopback networking"]
 fn reused_metadata_reaches_receiver_with_its_timecode() -> Result<(), grafton_ndi::Error> {
-    let ndi = NDI::new()?;
+    let Some(ndi) = common::ndi() else {
+        return Ok(());
+    };
     let sender = Sender::new(
         &ndi,
         &SenderOptions::builder("metadata roundtrip regression")

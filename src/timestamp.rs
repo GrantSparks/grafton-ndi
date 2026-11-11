@@ -1,6 +1,6 @@
 //! Timestamps read from the selected NDI runtime's clock.
 
-use crate::{capabilities::RuntimeFeature, Error, Result, NDI};
+use crate::{Result, NDI};
 
 /// An SDK clock reading in signed 100-nanosecond ticks since the Unix epoch.
 ///
@@ -24,27 +24,24 @@ impl NDI {
     /// Requires the NDI 6.4 timestamp helper. Missing capability is an error;
     /// this never falls back to `SystemTime` or `Instant`.
     pub fn timestamp(&self) -> Result<SdkTimestamp> {
-        self.require_feature(RuntimeFeature::SdkTimestamp)?;
-        type GetTimestamp = unsafe extern "C" fn() -> i64;
-        // SAFETY: This exact signature is declared by Processing.NDI.utilities.h.
-        let get = unsafe { self.resolve_optional::<GetTimestamp>(b"NDIlib_util_get_timestamp\0")? }
-            .ok_or_else(|| Error::UnsupportedCapability {
-                capability: "SDK timestamp".into(),
-                reason: "NDIlib_util_get_timestamp is unavailable in the selected runtime".into(),
-            })?;
-        // SAFETY: The selected runtime remains initialized through this NDI borrow.
-        Ok(SdkTimestamp(unsafe { get() }))
+        let timestamp = self.api().timestamp.require("SDK timestamp")?;
+        // SAFETY: the query takes no arguments, and this handle keeps the
+        // selected runtime initialized for the duration of the call.
+        Ok(SdkTimestamp(unsafe {
+            timestamp.NDIlib_util_get_timestamp()
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::{capabilities::RuntimeFeature, Error};
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn native_timestamp_has_utc_100ns_units_or_reports_missing_capability() {
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         if ndi.require_feature(RuntimeFeature::SdkTimestamp).is_err() {
             assert!(matches!(
                 ndi.timestamp(),

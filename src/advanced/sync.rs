@@ -1,22 +1,22 @@
 //! Exclusive AV synchronization and independent, non-cloneable pacing clocks.
 use super::{ffi, AdvancedConfig};
 use crate::{
-    finder::RawSource,
-    frames::{validate_audio_layout_allow_empty, validate_frame_metadata},
-    ndi_lib::{
+    advanced::ffi::native::{
         NDIlib_audio_frame_v3_t, NDIlib_recv_instance_t, NDIlib_source_t, NDIlib_video_frame_v2_t,
     },
+    finder::RawSource,
+    frames::{validate_audio_layout_allow_empty, validate_frame_metadata},
     AudioFrame, Capture, ConnectionStats, Error, Receiver, Result, ScanType, Source, Tally,
     VideoFrame, VideoKind, NDI,
 };
 use std::{cell::Cell, ffi::c_char, marker::PhantomData, ptr};
 
 #[cfg(ndi_has_advanced_header)]
-type AvHandle = crate::ndi_lib::raw::NDIlib_avsync_instance_t;
+type AvHandle = crate::advanced::ffi::native::NDIlib_avsync_instance_t;
 #[cfg(not(ndi_has_advanced_header))]
 type AvHandle = ffi::Opaque;
 #[cfg(ndi_has_advanced_header)]
-type GenHandle = crate::ndi_lib::raw::NDIlib_genlock_instance_t;
+type GenHandle = crate::advanced::ffi::native::NDIlib_genlock_instance_t;
 #[cfg(not(ndi_has_advanced_header))]
 type GenHandle = ffi::Opaque;
 type AvCreate = unsafe extern "C" fn(NDIlib_recv_instance_t) -> AvHandle;
@@ -270,7 +270,7 @@ type WaitAudio = unsafe extern "C" fn(GenHandle, *const NDIlib_audio_frame_v3_t)
 #[cfg(ndi_has_advanced_header)]
 mod abi_signatures {
     use super::*;
-    use crate::ndi_lib::raw;
+    use crate::sys::advanced_declarations as raw;
     const _: AvCreate = raw::NDIlib_avsync_create;
     const _: AvDestroy = raw::NDIlib_avsync_destroy;
     const _: AvSynchronize = raw::NDIlib_avsync_synchronize;

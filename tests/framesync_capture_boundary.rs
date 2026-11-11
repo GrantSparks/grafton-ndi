@@ -1,14 +1,17 @@
+mod common;
+
 use grafton_ndi::{
     Error, FrameSync, FrameSyncAudioRequest, Receiver, ReceiverOptions, ScanType, Source,
-    SourceAddress, Tally, NDI,
+    SourceAddress, Tally,
 };
 use std::time::Duration;
 
 #[test]
-#[ignore = "Requires real NDI SDK and reviewed network confinement"]
 fn attached_receiver_permits_controls_audio_metadata_and_raw_capture_after_recovery(
 ) -> Result<(), Error> {
-    let ndi = NDI::new()?;
+    let Some(ndi) = common::ndi() else {
+        return Ok(());
+    };
     let source = Source {
         name: "FrameSync capture boundary".into(),
         address: SourceAddress::None,

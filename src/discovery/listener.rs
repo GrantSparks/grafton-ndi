@@ -1,57 +1,190 @@
-use crate::{dispatch::require_optional, to_ms_checked, Error, Result, NDI};
+use crate::{
+    sys::{self, bindings::*},
+    to_ms_checked, Error, Result, NDI,
+};
 use std::{
-    ffi::{c_char, c_void, CString},
+    ffi::{c_char, CString},
     marker::PhantomData,
     ptr,
     rc::Rc,
     time::Duration,
 };
 
-type Instance = *mut c_void;
-#[repr(C)]
-struct Create {
-    url: *const c_char,
+/// The operations the sender and receiver listener tables have in common.
+trait ListenerApi: Sized + 'static {
+    type Instance: Copy;
+    /// One element of the native membership snapshot.
+    type Entry;
+
+    /// The table from the selected runtime, or an unsupported-capability error.
+    fn table(ndi: &NDI) -> Result<&'static Self>;
+
+    /// Create a listener for `url`, with Advanced JSON `config` when given.
+    /// Returns `None` when the SDK creates no instance.
+    ///
+    /// # Safety
+    ///
+    /// `url` and `config` must each be null or a NUL-terminated string that
+    /// outlives the call.
+    unsafe fn create(
+        &self,
+        ndi: &NDI,
+        url: *const c_char,
+        config: Option<*const c_char>,
+    ) -> Result<Option<Self::Instance>>;
+
+    /// # Safety
+    ///
+    /// Each method requires `instance` to be a live listener created by this
+    /// table; pointer arguments must be valid for the SDK's documented use.
+    unsafe fn destroy(&self, instance: Self::Instance);
+    unsafe fn is_connected(&self, instance: Self::Instance) -> bool;
+    unsafe fn server_url(&self, instance: Self::Instance) -> *const c_char;
+    unsafe fn entries(&self, instance: Self::Instance, count: &mut u32) -> *const Self::Entry;
+    unsafe fn wait_for_entries(&self, instance: Self::Instance, timeout_ms: u32) -> bool;
+    unsafe fn subscribe(&self, instance: Self::Instance, id: *const c_char);
+    unsafe fn unsubscribe(&self, instance: Self::Instance, id: *const c_char);
+    unsafe fn events(
+        &self,
+        instance: Self::Instance,
+        count: &mut u32,
+        timeout_ms: u32,
+    ) -> *const NDIlib_listener_event;
+    unsafe fn free_events(&self, instance: Self::Instance, events: *const NDIlib_listener_event);
 }
-#[repr(C)]
-struct RawEvent {
-    uuid: *const c_char,
-    name: *const c_char,
-    value: *const c_char,
+
+macro_rules! listener_api {
+    (
+        $Table:ty, $field:ident, $capability:literal,
+        $Instance:ty, $Entry:ty, $Create:ident,
+        $create:ident, $destroy:ident, $is_connected:ident, $server_url:ident, $entries:ident,
+        $wait:ident, $subscribe:ident, $unsubscribe:ident, $events:ident, $free_events:ident
+    ) => {
+        impl ListenerApi for $Table {
+            type Instance = $Instance;
+            type Entry = $Entry;
+
+            fn table(ndi: &NDI) -> Result<&'static Self> {
+                ndi.api().$field.require($capability)
+            }
+
+            unsafe fn create(
+                &self,
+                ndi: &NDI,
+                url: *const c_char,
+                config: Option<*const c_char>,
+            ) -> Result<Option<Self::Instance>> {
+                let settings = $Create { p_url_address: url };
+                let instance = match config {
+                    #[cfg(feature = "advanced")]
+                    Some(config) => {
+                        type Configured =
+                            unsafe extern "C" fn(*const $Create, *const c_char) -> $Instance;
+                        // SAFETY: `Configured` is the SDK's signature for the
+                        // `_ex` variant of this table's create function.
+                        let configured: Configured = unsafe {
+                            crate::advanced::ffi::required(
+                                ndi,
+                                concat!(stringify!($create), "_ex\0").as_bytes(),
+                            )?
+                        };
+                        // SAFETY: the caller guarantees both strings are valid.
+                        unsafe { configured(&settings, config) }
+                    }
+                    #[cfg(not(feature = "advanced"))]
+                    Some(_) => {
+                        let _ = ndi;
+                        return Err(Error::UnsupportedCapability {
+                            capability: $capability.into(),
+                            reason: "Advanced configuration needs the `advanced` feature".into(),
+                        });
+                    }
+                    // SAFETY: the caller guarantees `url` is valid.
+                    None => unsafe { self.$create(&settings) },
+                };
+                Ok((!instance.is_null()).then_some(instance))
+            }
+
+            unsafe fn destroy(&self, instance: Self::Instance) {
+                self.$destroy(instance)
+            }
+            unsafe fn is_connected(&self, instance: Self::Instance) -> bool {
+                self.$is_connected(instance)
+            }
+            unsafe fn server_url(&self, instance: Self::Instance) -> *const c_char {
+                self.$server_url(instance)
+            }
+            unsafe fn entries(
+                &self,
+                instance: Self::Instance,
+                count: &mut u32,
+            ) -> *const Self::Entry {
+                self.$entries(instance, count)
+            }
+            unsafe fn wait_for_entries(&self, instance: Self::Instance, timeout_ms: u32) -> bool {
+                self.$wait(instance, timeout_ms)
+            }
+            unsafe fn subscribe(&self, instance: Self::Instance, id: *const c_char) {
+                self.$subscribe(instance, id)
+            }
+            unsafe fn unsubscribe(&self, instance: Self::Instance, id: *const c_char) {
+                self.$unsubscribe(instance, id)
+            }
+            unsafe fn events(
+                &self,
+                instance: Self::Instance,
+                count: &mut u32,
+                timeout_ms: u32,
+            ) -> *const NDIlib_listener_event {
+                self.$events(instance, count, timeout_ms)
+            }
+            unsafe fn free_events(
+                &self,
+                instance: Self::Instance,
+                events: *const NDIlib_listener_event,
+            ) {
+                self.$free_events(instance, events)
+            }
+        }
+    };
 }
-#[repr(C)]
-struct RawSender {
-    uuid: *const c_char,
-    name: *const c_char,
-    metadata: *const c_char,
-    address: *const c_char,
-    port: i32,
-    groups: *const *const c_char,
-    num_groups: u32,
-    subscribed: bool,
-}
-#[repr(C)]
-struct RawReceiver {
-    uuid: *const c_char,
-    name: *const c_char,
-    input_uuid: *const c_char,
-    input_name: *const c_char,
-    address: *const c_char,
-    streams: *const u32,
-    num_streams: u32,
-    commands: *const u32,
-    num_commands: u32,
-    subscribed: bool,
-}
-type New = unsafe extern "C" fn(*const Create) -> Instance;
-type Destroy = unsafe extern "C" fn(Instance);
-type Connected = unsafe extern "C" fn(Instance) -> bool;
-type Url = unsafe extern "C" fn(Instance) -> *const c_char;
-type Snapshot<S> = unsafe extern "C" fn(Instance, *mut u32) -> *const S;
-type WaitFn = unsafe extern "C" fn(Instance, u32) -> bool;
-type Subscribe = unsafe extern "C" fn(Instance, *const c_char);
-type Events = unsafe extern "C" fn(Instance, *mut u32, u32) -> *const RawEvent;
-type FreeEvents = unsafe extern "C" fn(Instance, *const RawEvent);
-type Connect = unsafe extern "C" fn(Instance, *const c_char, *const c_char) -> bool;
+
+listener_api!(
+    sys::SenderDiscovery,
+    sender_discovery,
+    "sender discovery",
+    NDIlib_send_listener_instance_t,
+    NDIlib_sender_t,
+    NDIlib_send_listener_create_t,
+    NDIlib_send_listener_create,
+    NDIlib_send_listener_destroy,
+    NDIlib_send_listener_is_connected,
+    NDIlib_send_listener_get_server_url,
+    NDIlib_send_listener_get_senders,
+    NDIlib_send_listener_wait_for_senders,
+    NDIlib_send_listener_subscribe_events,
+    NDIlib_send_listener_unsubscribe_events,
+    NDIlib_send_listener_get_events,
+    NDIlib_send_listener_free_events
+);
+listener_api!(
+    sys::ReceiverDiscovery,
+    receiver_discovery,
+    "receiver discovery",
+    NDIlib_recv_listener_instance_t,
+    NDIlib_receiver_t,
+    NDIlib_recv_listener_create_t,
+    NDIlib_recv_listener_create,
+    NDIlib_recv_listener_destroy,
+    NDIlib_recv_listener_is_connected,
+    NDIlib_recv_listener_get_server_url,
+    NDIlib_recv_listener_get_receivers,
+    NDIlib_recv_listener_wait_for_receivers,
+    NDIlib_recv_listener_subscribe_events,
+    NDIlib_recv_listener_unsubscribe_events,
+    NDIlib_recv_listener_get_events,
+    NDIlib_recv_listener_free_events
+);
 
 /// One Discovery Server endpoint. Redundancy lists belong to AdvertiserOptions.
 #[derive(Debug, Clone, Default)]
@@ -137,19 +270,24 @@ impl ListenerEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ReceiverStream {
+    /// No stream.
     None,
+    /// The receiver accepts metadata.
     Metadata,
+    /// The receiver accepts video.
     Video,
+    /// The receiver accepts audio.
     Audio,
+    /// A stream kind this crate does not name, with its native value.
     Unknown(u32),
 }
 impl From<u32> for ReceiverStream {
     fn from(v: u32) -> Self {
         match v {
-            0 => Self::None,
-            1 => Self::Metadata,
-            2 => Self::Video,
-            3 => Self::Audio,
+            NDIlib_receiver_type_e_NDIlib_receiver_type_none => Self::None,
+            NDIlib_receiver_type_e_NDIlib_receiver_type_metadata => Self::Metadata,
+            NDIlib_receiver_type_e_NDIlib_receiver_type_video => Self::Video,
+            NDIlib_receiver_type_e_NDIlib_receiver_type_audio => Self::Audio,
             v => Self::Unknown(v),
         }
     }
@@ -158,15 +296,18 @@ impl From<u32> for ReceiverStream {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ReceiverCommand {
+    /// No command.
     None,
+    /// The receiver accepts requests to connect to another source.
     Connect,
+    /// A command this crate does not name, with its native value.
     Unknown(u32),
 }
 impl From<u32> for ReceiverCommand {
     fn from(v: u32) -> Self {
         match v {
-            0 => Self::None,
-            1 => Self::Connect,
+            NDIlib_receiver_command_e_NDIlib_receiver_command_none => Self::None,
+            NDIlib_receiver_command_e_NDIlib_receiver_command_connect => Self::Connect,
             v => Self::Unknown(v),
         }
     }
@@ -183,24 +324,31 @@ pub struct AdvertisedSender {
     subscribed: bool,
 }
 impl AdvertisedSender {
+    /// The server's identifier for this sender.
     pub fn id(&self) -> Option<&AdvertisedId> {
         self.id.as_ref()
     }
+    /// The sender's source name.
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
+    /// The connection metadata the sender advertises.
     pub fn metadata(&self) -> Option<&str> {
         self.metadata.as_deref()
     }
+    /// The sender's network address.
     pub fn address(&self) -> Option<&str> {
         self.address.as_deref()
     }
+    /// The sender's network port.
     pub fn port(&self) -> i32 {
         self.port
     }
+    /// The discovery groups the sender belongs to.
     pub fn groups(&self) -> &[Option<String>] {
         &self.groups
     }
+    /// Whether this listener is subscribed to the sender's events.
     pub fn events_subscribed(&self) -> bool {
         self.subscribed
     }
@@ -218,27 +366,35 @@ pub struct AdvertisedReceiver {
     subscribed: bool,
 }
 impl AdvertisedReceiver {
+    /// The server's identifier for this receiver.
     pub fn id(&self) -> Option<&AdvertisedId> {
         self.id.as_ref()
     }
+    /// The receiver's name.
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
+    /// The identifier of the source the receiver is connected to.
     pub fn input_id(&self) -> Option<&AdvertisedId> {
         self.input_id.as_ref()
     }
+    /// The name of the source the receiver is connected to.
     pub fn input_name(&self) -> Option<&str> {
         self.input_name.as_deref()
     }
+    /// The receiver's network address.
     pub fn address(&self) -> Option<&str> {
         self.address.as_deref()
     }
+    /// The stream kinds the receiver accepts.
     pub fn streams(&self) -> &[ReceiverStream] {
         &self.streams
     }
+    /// The remote commands the receiver accepts.
     pub fn commands(&self) -> &[ReceiverCommand] {
         &self.commands
     }
+    /// Whether this listener is subscribed to the receiver's events.
     pub fn events_subscribed(&self) -> bool {
         self.subscribed
     }
@@ -295,70 +451,112 @@ impl Budget {
     }
 }
 
-struct Listener<S> {
-    instance: Instance,
-    destroy: Destroy,
-    connected: Connected,
-    url: Url,
-    snapshot: Snapshot<S>,
-    wait: WaitFn,
-    subscribe: Subscribe,
-    unsubscribe: Subscribe,
-    events: Events,
-    free: FreeEvents,
+struct Listener<A: ListenerApi> {
+    instance: A::Instance,
+    api: &'static A,
     _url: Option<CString>,
     _config: Option<CString>,
     _ndi: NDI,
     _thread: PhantomData<Rc<()>>,
 }
-impl<S> Drop for Listener<S> {
+impl<A: ListenerApi> Drop for Listener<A> {
     fn drop(&mut self) {
-        unsafe { (self.destroy)(self.instance) };
+        // SAFETY: this listener is the instance's only owner.
+        unsafe { self.api.destroy(self.instance) };
     }
 }
-impl<S> Listener<S> {
+impl<A: ListenerApi> Listener<A> {
+    /// Resolve the complete table, then create the native listener.
+    fn create(ndi: &NDI, options: &ListenerOptions, config: Option<CString>) -> Result<Self> {
+        let api = A::table(ndi)?;
+        let url = options.server.as_deref().map(CString::new).transpose()?;
+        // SAFETY: both strings are owned by this call and retained by the
+        // listener for as long as the native instance exists.
+        let instance = unsafe {
+            api.create(
+                ndi,
+                url.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
+                config.as_ref().map(|config| config.as_ptr()),
+            )?
+        }
+        .ok_or_else(|| {
+            Error::InitializationFailed("Discovery Server listener creation failed".into())
+        })?;
+        Ok(Self {
+            instance,
+            api,
+            _url: url,
+            _config: config,
+            _ndi: ndi.clone(),
+            _thread: PhantomData,
+        })
+    }
+    fn is_connected(&self) -> bool {
+        // SAFETY: the listener instance is live for this borrow.
+        unsafe { self.api.is_connected(self.instance) }
+    }
     fn server_url(&self) -> Result<Option<String>> {
-        unsafe { Budget::new().string((self.url)(self.instance)) }
+        // SAFETY: the SDK returns null or a NUL-terminated string it owns.
+        unsafe { Budget::new().string(self.api.server_url(self.instance)) }
+    }
+    fn wait_for_changes(&mut self, timeout: Duration) -> Result<bool> {
+        let timeout = to_ms_checked(timeout)?;
+        // SAFETY: the listener instance is live for this borrow.
+        Ok(unsafe { self.api.wait_for_entries(self.instance, timeout) })
+    }
+    /// The native membership snapshot, valid until the next call on this listener.
+    fn entries<'a>(&'a mut self, budget: &mut Budget) -> Result<&'a [A::Entry]> {
+        let mut count = 0;
+        // SAFETY: the exclusive borrow keeps the SDK-owned array unchanged for
+        // `'a`; the budget validates the pointer and count before use.
+        unsafe { budget.slice(self.api.entries(self.instance, &mut count), count) }
     }
     fn subscription(&mut self, id: &AdvertisedId, subscribe: bool) -> Result<()> {
         let id = CString::new(id.as_str())?;
+        // SAFETY: the listener instance is live and `id` outlives the call.
         unsafe {
             if subscribe {
-                (self.subscribe)(self.instance, id.as_ptr());
+                self.api.subscribe(self.instance, id.as_ptr());
             } else {
-                (self.unsubscribe)(self.instance, id.as_ptr());
+                self.api.unsubscribe(self.instance, id.as_ptr());
             }
         };
         Ok(())
     }
     fn capture_events(&mut self, wait: Wait) -> Result<Vec<ListenerEvent>> {
-        let mut count = 0;
-        let events = unsafe { (self.events)(self.instance, &mut count, wait.millis()?) };
-        struct Guard {
-            instance: Instance,
-            events: *const RawEvent,
-            free: FreeEvents,
+        struct Batch<'a, A: ListenerApi> {
+            listener: &'a Listener<A>,
+            events: *const NDIlib_listener_event,
         }
-        impl Drop for Guard {
+        impl<A: ListenerApi> Drop for Batch<'_, A> {
             fn drop(&mut self) {
                 if !self.events.is_null() {
-                    unsafe { (self.free)(self.instance, self.events) };
+                    // SAFETY: the batch came from this listener and is freed once.
+                    unsafe {
+                        self.listener
+                            .api
+                            .free_events(self.listener.instance, self.events)
+                    };
                 }
             }
         }
-        let _guard = Guard {
-            instance: self.instance,
+        let timeout = wait.millis()?;
+        let mut count = 0;
+        // SAFETY: the listener instance is live for this borrow.
+        let events = unsafe { self.api.events(self.instance, &mut count, timeout) };
+        let batch = Batch {
+            listener: self,
             events,
-            free: self.free,
         };
         let mut budget = Budget::new();
-        let raw = unsafe { budget.slice(events, count)? };
+        // SAFETY: the batch stays allocated until `batch` is dropped below.
+        let raw = unsafe { budget.slice(batch.events, count)? };
         raw.iter()
             .map(|event| unsafe {
                 Ok(ListenerEvent {
-                    id: budget.string(event.uuid)?.map(AdvertisedId),
-                    name: budget.string(event.name)?,
-                    value: budget.string(event.value)?,
+                    id: budget.string(event.p_uuid)?.map(AdvertisedId),
+                    name: budget.string(event.p_name)?,
+                    value: budget.string(event.p_value)?,
                 })
             })
             .collect()
@@ -367,105 +565,19 @@ impl<S> Listener<S> {
 
 /// A thread-affine sender listener. Use owned snapshots across thread boundaries.
 pub struct SendListener {
-    inner: Listener<RawSender>,
+    inner: Listener<sys::SenderDiscovery>,
 }
 /// A thread-affine receiver listener. Remote control is always explicit.
 pub struct RecvListener {
-    inner: Listener<RawReceiver>,
-    connect: Connect,
+    inner: Listener<sys::ReceiverDiscovery>,
     latest: Vec<AdvertisedReceiver>,
 }
 
-macro_rules! create_listener {
-    ($ndi:expr, $options:expr, $config:expr, $prefix:literal, $snapshot:literal, $wait:literal) => {{
-        let url = $options.server.as_deref().map(CString::new).transpose()?;
-        let config: Option<CString> = $config;
-        unsafe {
-            let create: New = require_optional(
-                concat!($prefix, "create\0").as_bytes(),
-                "Discovery Server listener",
-            )?;
-            let destroy = require_optional(
-                concat!($prefix, "destroy\0").as_bytes(),
-                "Discovery Server listener",
-            )?;
-            let connected = require_optional(
-                concat!($prefix, "is_connected\0").as_bytes(),
-                "Discovery Server listener",
-            )?;
-            let get_url = require_optional(
-                concat!($prefix, "get_server_url\0").as_bytes(),
-                "Discovery Server listener",
-            )?;
-            let snapshot = require_optional(
-                concat!($prefix, $snapshot, "\0").as_bytes(),
-                "Discovery Server listener",
-            )?;
-            let wait = require_optional(
-                concat!($prefix, $wait, "\0").as_bytes(),
-                "Discovery Server listener",
-            )?;
-            let subscribe = require_optional(
-                concat!($prefix, "subscribe_events\0").as_bytes(),
-                "Discovery Server listener",
-            )?;
-            let unsubscribe = require_optional(
-                concat!($prefix, "unsubscribe_events\0").as_bytes(),
-                "Discovery Server listener",
-            )?;
-            let events = require_optional(
-                concat!($prefix, "get_events\0").as_bytes(),
-                "Discovery Server listener",
-            )?;
-            let free = require_optional(
-                concat!($prefix, "free_events\0").as_bytes(),
-                "Discovery Server listener",
-            )?;
-            let raw = Create {
-                url: url.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
-            };
-            #[cfg(feature = "advanced")]
-            let instance = if let Some(config) = &config {
-                type Configured = unsafe extern "C" fn(*const Create, *const c_char) -> Instance;
-                let configured: Configured = crate::advanced::ffi::required(
-                    $ndi,
-                    concat!($prefix, "create_ex\0").as_bytes(),
-                )?;
-                configured(&raw, config.as_ptr())
-            } else {
-                create(&raw)
-            };
-            #[cfg(not(feature = "advanced"))]
-            let instance = create(&raw);
-            if instance.is_null() {
-                return Err(Error::InitializationFailed(
-                    "Discovery Server listener creation failed".into(),
-                ));
-            }
-            Listener {
-                instance,
-                destroy,
-                connected,
-                url: get_url,
-                snapshot,
-                wait,
-                subscribe,
-                unsubscribe,
-                events,
-                free,
-                _url: url,
-                _config: config,
-                _ndi: $ndi.clone(),
-                _thread: PhantomData,
-            }
-        }
-    }};
-}
 macro_rules! listener_methods {
     () => {
         /// Whether the native listener is connected to its configured server.
         pub fn is_connected(&self) -> bool {
-            unsafe { (self.inner.connected)(self.inner.instance) }
+            self.inner.is_connected()
         }
         /// Copy the configured server endpoint.
         pub fn server_url(&self) -> Result<Option<String>> {
@@ -473,7 +585,7 @@ macro_rules! listener_methods {
         }
         /// Wait for a membership change; zero polls immediately.
         pub fn wait_for_changes(&mut self, timeout: Duration) -> Result<bool> {
-            Ok(unsafe { (self.inner.wait)(self.inner.instance, to_ms_checked(timeout)?) })
+            self.inner.wait_for_changes(timeout)
         }
         /// Issue a subscription request. Snapshots report whether it is active.
         pub fn subscribe(&mut self, id: &AdvertisedId) -> Result<()> {
@@ -493,14 +605,7 @@ impl SendListener {
     /// Create a listener; all required functions are checked before native creation.
     pub fn new(ndi: &NDI, options: &ListenerOptions) -> Result<Self> {
         Ok(Self {
-            inner: create_listener!(
-                ndi,
-                options,
-                None,
-                "NDIlib_send_listener_",
-                "get_senders",
-                "wait_for_senders"
-            ),
+            inner: Listener::create(ndi, options, None)?,
         })
     }
     /// Create with retained Advanced configuration.
@@ -512,38 +617,29 @@ impl SendListener {
     ) -> Result<Self> {
         let config = Some(CString::new(config.expose_json())?);
         Ok(Self {
-            inner: create_listener!(
-                ndi,
-                options,
-                config,
-                "NDIlib_send_listener_",
-                "get_senders",
-                "wait_for_senders"
-            ),
+            inner: Listener::create(ndi, options, config)?,
         })
     }
     listener_methods!();
     /// Copy the complete current sender snapshot before native storage expires.
     pub fn snapshot(&mut self) -> Result<Vec<AdvertisedSender>> {
-        let mut count = 0;
-        let values = unsafe { (self.inner.snapshot)(self.inner.instance, &mut count) };
         let mut budget = Budget::new();
-        let raw = unsafe { budget.slice(values, count)? };
+        let raw = self.inner.entries(&mut budget)?;
         raw.iter()
             .map(|s| unsafe {
                 let groups = budget
-                    .slice(s.groups, s.num_groups)?
+                    .slice(s.p_groups.cast_const(), s.num_groups)?
                     .iter()
                     .map(|v| budget.string(*v))
                     .collect::<Result<_>>()?;
                 Ok(AdvertisedSender {
-                    id: budget.string(s.uuid)?.map(AdvertisedId),
-                    name: budget.string(s.name)?,
-                    metadata: budget.string(s.metadata)?,
-                    address: budget.string(s.address)?,
+                    id: budget.string(s.p_uuid)?.map(AdvertisedId),
+                    name: budget.string(s.p_name)?,
+                    metadata: budget.string(s.p_metadata)?,
+                    address: budget.string(s.p_address)?,
                     port: s.port,
                     groups,
-                    subscribed: s.subscribed,
+                    subscribed: s.events_subscribed,
                 })
             })
             .collect()
@@ -552,22 +648,8 @@ impl SendListener {
 impl RecvListener {
     /// Create a receiver listener with explicit remote-control methods.
     pub fn new(ndi: &NDI, options: &ListenerOptions) -> Result<Self> {
-        let connect = unsafe {
-            require_optional(
-                b"NDIlib_recv_listener_send_connect\0",
-                "Discovery Server receiver control",
-            )?
-        };
         Ok(Self {
-            inner: create_listener!(
-                ndi,
-                options,
-                None,
-                "NDIlib_recv_listener_",
-                "get_receivers",
-                "wait_for_receivers"
-            ),
-            connect,
+            inner: Listener::create(ndi, options, None)?,
             latest: Vec::new(),
         })
     }
@@ -578,57 +660,41 @@ impl RecvListener {
         options: &ListenerOptions,
         config: &crate::advanced::AdvancedConfig,
     ) -> Result<Self> {
-        let connect = unsafe {
-            require_optional(
-                b"NDIlib_recv_listener_send_connect\0",
-                "Discovery Server receiver control",
-            )?
-        };
         let config = Some(CString::new(config.expose_json())?);
         Ok(Self {
-            inner: create_listener!(
-                ndi,
-                options,
-                config,
-                "NDIlib_recv_listener_",
-                "get_receivers",
-                "wait_for_receivers"
-            ),
-            connect,
+            inner: Listener::create(ndi, options, config)?,
             latest: Vec::new(),
         })
     }
     listener_methods!();
     /// Copy the complete receiver snapshot, retaining command capabilities for checks.
     pub fn snapshot(&mut self) -> Result<Vec<AdvertisedReceiver>> {
-        let mut count = 0;
-        let values = unsafe { (self.inner.snapshot)(self.inner.instance, &mut count) };
         let mut budget = Budget::new();
-        let raw = unsafe { budget.slice(values, count)? };
+        let raw = self.inner.entries(&mut budget)?;
         let copied: Result<Vec<_>> = raw
             .iter()
             .map(|s| unsafe {
                 let streams = budget
-                    .slice(s.streams, s.num_streams)?
+                    .slice(s.p_streams.cast_const(), s.num_streams)?
                     .iter()
                     .copied()
                     .map(ReceiverStream::from)
                     .collect();
                 let commands = budget
-                    .slice(s.commands, s.num_commands)?
+                    .slice(s.p_commands.cast_const(), s.num_commands)?
                     .iter()
                     .copied()
                     .map(ReceiverCommand::from)
                     .collect();
                 Ok(AdvertisedReceiver {
-                    id: budget.string(s.uuid)?.map(AdvertisedId),
-                    name: budget.string(s.name)?,
-                    input_id: budget.string(s.input_uuid)?.map(AdvertisedId),
-                    input_name: budget.string(s.input_name)?,
-                    address: budget.string(s.address)?,
+                    id: budget.string(s.p_uuid)?.map(AdvertisedId),
+                    name: budget.string(s.p_name)?,
+                    input_id: budget.string(s.p_input_uuid)?.map(AdvertisedId),
+                    input_name: budget.string(s.p_input_name)?,
+                    address: budget.string(s.p_address)?,
                     streams,
                     commands,
-                    subscribed: s.subscribed,
+                    subscribed: s.events_subscribed,
                 })
             })
             .collect();
@@ -658,8 +724,9 @@ impl RecvListener {
         }
         let id = CString::new(id.as_str())?;
         let source = source.map(CString::new).transpose()?;
+        // SAFETY: the listener instance is live and both strings outlive the call.
         if unsafe {
-            (self.connect)(
+            self.inner.api.NDIlib_recv_listener_send_connect(
                 self.inner.instance,
                 id.as_ptr(),
                 source.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
@@ -711,7 +778,3 @@ mod tests {
         assert!(ListenerOptions::default().server("a,b").is_err());
     }
 }
-
-#[cfg(all(test, ndi_has_discovery_header))]
-#[path = "listener_abi_tests.rs"]
-mod sdk_abi_tests;

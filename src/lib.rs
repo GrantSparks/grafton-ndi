@@ -1,5 +1,3 @@
-#![cfg_attr(ndi_public_docs, doc(html_no_source))]
-
 //! High-performance Rust bindings for the NDI® 6 SDK (Network Device Interface).
 //!
 //! This crate provides safe, idiomatic Rust bindings for the NDI SDK, enabling
@@ -105,24 +103,27 @@
 //!
 //! # Runtime and platform support
 //!
-//! Desktop platforms and Android load one process-retained core module with typed
-//! dispatch; Windows does not require an NDI import library for this shared path.
-//! [`NDI::new`] preserves normal initialize/destroy cycles; an explicit
-//! [`RuntimeOptions`] path can select the implementation before its first load.
-//! [`NDI::capabilities`] reports optional features without assuming hardware or
-//! license availability.
+//! Building this crate needs no NDI SDK. Desktop platforms and Android load the
+//! NDI runtime library when the first [`NDI`] handle is created, searching next
+//! to the executable, then `NDI_RUNTIME_DIR_V6`, then the platform loader's own
+//! path; see the [`runtime`] module. One successfully loaded module stays
+//! selected for the process, and [`RuntimeOptions`] can name an exact library
+//! or SDK edition before that first load. [`NDI::new`] preserves normal
+//! initialize/destroy cycles.
 //!
-//! The `advanced` and `file-io` features add optional APIs. `advanced_sdk` remains
-//! a no-op compatibility flag. Missing newer SDK functions do not prevent existing
-//! APIs from loading. Apple mobile selects a static provider through the target
-//! artifact profile, with the File archive as the sole provider when it embeds
-//! the NDI core. Available vendor slices determine the supported target profiles.
+//! Functions a runtime does not export never prevent the rest of the API from
+//! working: [`NDI::capabilities`] reports each optional capability, without
+//! assuming hardware or license availability, and the affected operations
+//! return [`Error::UnsupportedCapability`].
 //!
-//! Cross compilation requires the exact target SDK, ABI and sysroot. Build/link,
-//! emulator/simulator, and physical-device validation are separate coverage levels;
-//! see the repository SDK validation guide and CI plan for recorded results and
-//! outstanding platform validation. Artifact selection alone is not device
-//! qualification.
+//! The `advanced` and `file-io` features add optional APIs. The Advanced
+//! wrappers need the Advanced SDK headers at build time (`NDI_SDK_DIR` or a
+//! default installation); without them the same API compiles and reports that
+//! it is unavailable. `advanced_sdk` remains a no-op compatibility flag.
+//!
+//! Apple mobile targets link the vendor's static archive instead, selected from
+//! `NDI_SDK_DIR` at build time, with the File archive as the sole provider when
+//! it embeds the NDI core.
 
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
@@ -131,10 +132,9 @@
 #![allow(clippy::missing_errors_doc)]
 
 mod capture;
-mod dispatch;
 mod error;
-mod ndi_lib;
 mod recv_guard;
+mod sys;
 
 pub mod framesync;
 
@@ -229,3 +229,6 @@ mod tests;
 
 #[cfg(test)]
 mod test_alloc;
+
+#[cfg(test)]
+mod test_support;

@@ -1,7 +1,7 @@
 //! Native completion ownership for bounded asynchronous video queues.
 
 use super::{ffi, AdvancedConfig, CompressedVideoFrame};
-use crate::{ndi_lib::*, Error, Result, Sender, SenderOptions, VideoFrame, NDI};
+use crate::{advanced::ffi::native::*, Error, Result, Sender, SenderOptions, VideoFrame, NDI};
 use std::{
     collections::{BTreeMap, VecDeque},
     ffi::c_void,

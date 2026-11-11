@@ -41,16 +41,15 @@ use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use crate::{
     capture::{capture_raw, AudioKind, CaptureKind, CaptureResult, MetadataKind, VideoKind},
     finder::{RawSource, Source},
-    ndi_lib::*,
+    sys::{self, bindings::*},
     to_ms_checked, Error, MetadataFrame, Result, NDI,
 };
 
-type RecvFreeString = unsafe extern "C" fn(NDIlib_recv_instance_t, *const c_char);
-
+/// A string the receiver API returned, released when dropped.
 struct RecvStringGuard<'a> {
     core: &'a ReceiverCore,
     pointer: *const c_char,
-    free: RecvFreeString,
+    strings: &'a sys::ReceiverStrings,
 }
 impl RecvStringGuard<'_> {
     fn copy(&self) -> Result<Option<String>> {
@@ -66,9 +65,25 @@ impl RecvStringGuard<'_> {
 impl Drop for RecvStringGuard<'_> {
     fn drop(&mut self) {
         if !self.pointer.is_null() {
-            unsafe { (self.free)(self.core.instance, self.pointer) };
+            // SAFETY: the SDK returned this string for this instance and it is
+            // released exactly once.
+            unsafe {
+                self.strings
+                    .NDIlib_recv_free_string(self.core.instance, self.pointer)
+            };
         }
     }
+}
+
+/// Convert a delay the SDK reported, rejecting values outside its documented range.
+fn receiver_delay(millis: i32) -> Result<Duration> {
+    u64::try_from(millis)
+        .ok()
+        .filter(|millis| *millis <= 2000)
+        .map(Duration::from_millis)
+        .ok_or_else(|| {
+            Error::InvalidConfiguration(format!("SDK returned invalid receive delay: {millis} ms"))
+        })
 }
 
 fn receiver_delay_millis(delay: Duration) -> Result<i32> {
@@ -226,28 +241,46 @@ fn validate_ptz_preset(preset: i64) -> Result<i32> {
 
 macro_rules! ptz_command {
     ($self:expr, $func:ident, $err_msg:expr) => {
-        if unsafe { $func($self.core.instance) } {
+        // SAFETY: the receiver instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
+        if unsafe { $self.core.sdk().$func($self.core.instance) } {
             Ok(())
         } else {
             Err(Error::PtzCommandFailed($err_msg.into()))
         }
     };
     ($self:expr, $func:ident, $param:expr, $err_msg:expr) => {
-        if unsafe { $func($self.core.instance, $param) } {
+        // SAFETY: the receiver instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
+        if unsafe { $self.core.sdk().$func($self.core.instance, $param) } {
             Ok(())
         } else {
             Err(Error::PtzCommandFailed($err_msg))
         }
     };
     ($self:expr, $func:ident, $param1:expr, $param2:expr, $err_msg:expr) => {
-        if unsafe { $func($self.core.instance, $param1, $param2) } {
+        // SAFETY: the receiver instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
+        if unsafe {
+            $self
+                .core
+                .sdk()
+                .$func($self.core.instance, $param1, $param2)
+        } {
             Ok(())
         } else {
             Err(Error::PtzCommandFailed($err_msg))
         }
     };
     ($self:expr, $func:ident, $param1:expr, $param2:expr, $param3:expr, $err_msg:expr) => {
-        if unsafe { $func($self.core.instance, $param1, $param2, $param3) } {
+        // SAFETY: the receiver instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
+        if unsafe {
+            $self
+                .core
+                .sdk()
+                .$func($self.core.instance, $param1, $param2, $param3)
+        } {
             Ok(())
         } else {
             Err(Error::PtzCommandFailed($err_msg))
@@ -272,12 +305,21 @@ macro_rules! ptz_command {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ReceiverColorFormat {
+    /// BGRX for opaque video and BGRA when the source has alpha.
     #[default]
     BGRX_BGRA,
+    /// UYVY for opaque video and BGRA when the source has alpha.
     UYVY_BGRA,
+    /// RGBX for opaque video and RGBA when the source has alpha.
     RGBX_RGBA,
+    /// UYVY for opaque video and RGBA when the source has alpha.
     UYVY_RGBA,
+    /// The format the SDK can deliver with the least conversion work.
+    /// Individual fields are delivered even if video fields were disabled.
     Fastest,
+    /// The format closest to the source's native precision, including
+    /// 16-bit formats. Individual fields are delivered even if video fields
+    /// were disabled.
     Best,
     /// Preserve native planar 4:4:4 color when available. Requires NDI 6.4.
     /// Individual fields are delivered, like `Best`, even if video fields were disabled.
@@ -303,7 +345,9 @@ impl From<ReceiverColorFormat> for NDIlib_recv_color_format_e {
                 NDIlib_recv_color_format_e_NDIlib_recv_color_format_fastest
             }
             ReceiverColorFormat::Best => NDIlib_recv_color_format_e_NDIlib_recv_color_format_best,
-            ReceiverColorFormat::Best444 => 102,
+            ReceiverColorFormat::Best444 => {
+                NDIlib_recv_color_format_e_NDIlib_recv_color_format_best_444
+            }
         }
     }
 }
@@ -325,9 +369,13 @@ impl From<ReceiverColorFormat> for NDIlib_recv_color_format_e {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ReceiverBandwidth {
+    /// Receive metadata only.
     MetadataOnly,
+    /// Receive metadata and audio, without video.
     AudioOnly,
+    /// Receive metadata, audio and lower-bandwidth preview video.
     Lowest,
+    /// Receive metadata, audio and full-bandwidth video.
     #[default]
     Highest,
     /// Receive metadata and lower-bandwidth video, without audio. Requires NDI 6.4.
@@ -347,18 +395,30 @@ impl From<ReceiverBandwidth> for NDIlib_recv_bandwidth_e {
             }
             ReceiverBandwidth::Lowest => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest,
             ReceiverBandwidth::Highest => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
-            ReceiverBandwidth::VideoOnlyLowest => 1,
-            ReceiverBandwidth::VideoOnlyHighest => 101,
+            ReceiverBandwidth::VideoOnlyLowest => {
+                NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_video_only_lowest
+            }
+            ReceiverBandwidth::VideoOnlyHighest => {
+                NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_video_only_highest
+            }
         }
     }
 }
 
+/// Configuration for creating a [`Receiver`].
+///
+/// Build one with [`ReceiverOptions::builder`].
 #[derive(Debug, Default, Clone)]
 pub struct ReceiverOptions {
+    /// The source to connect to when the receiver is created.
     pub source_to_connect_to: Source,
+    /// The pixel formats the receiver delivers.
     pub color_format: ReceiverColorFormat,
+    /// Which streams are received and at what quality.
     pub bandwidth: ReceiverBandwidth,
+    /// Deliver interlaced video as individual fields instead of whole frames.
     pub allow_video_fields: bool,
+    /// The receiver's own name; the SDK generates one when this is `None`.
     pub ndi_recv_name: Option<String>,
 }
 
@@ -679,10 +739,19 @@ pub(crate) struct ReceiverCore {
 }
 
 impl Receiver {
+    /// Create a receiver and connect it to the configured source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedCapability`] when the options need a mode the
+    /// selected runtime lacks, an invalid-configuration error for a name or
+    /// source the SDK cannot be given, and [`Error::InitializationFailed`] when
+    /// the SDK creates no receiver.
     pub fn new(ndi: &NDI, create: &ReceiverOptions) -> Result<Self> {
         create.validate_runtime(ndi)?;
         let create_raw = create.to_raw()?;
-        let instance = unsafe { NDIlib_recv_create_v3(&create_raw.raw) };
+        // SAFETY: the creation settings borrow storage owned by `create_raw`.
+        let instance = unsafe { ndi.api().core.NDIlib_recv_create_v3(&create_raw.raw) };
         // SAFETY: The instance came from this runtime with validated options.
         unsafe { Self::from_native(ndi, create, instance) }
     }
@@ -787,12 +856,17 @@ impl<M: ReceiverMode> Receiver<M> {
     /// changed; `Ok(false)` means it already had this value. Delay is independent
     /// of audio buffering and stacks with FrameSync correction.
     pub fn set_video_delay(&self, delay: Duration) -> Result<bool> {
-        self.set_delay(delay, b"NDIlib_recv_set_video_delay\0")
+        let millis = receiver_delay_millis(delay)?;
+        let table = self.core.delay()?;
+        // SAFETY: the receiver instance is live for this borrow.
+        Ok(unsafe { table.NDIlib_recv_set_video_delay(self.core.instance, millis) })
     }
 
     /// Return the effective native video delay. Requires receiver-delay support.
     pub fn video_delay(&self) -> Result<Duration> {
-        self.get_delay(b"NDIlib_recv_get_video_delay\0")
+        let table = self.core.delay()?;
+        // SAFETY: the receiver instance is live for this borrow.
+        receiver_delay(unsafe { table.NDIlib_recv_get_video_delay(self.core.instance) })
     }
 
     /// Set native audio buffering with the same rounding/range as [`Self::set_video_delay`].
@@ -800,81 +874,47 @@ impl<M: ReceiverMode> Receiver<M> {
     /// Equal audio and video delays preserve their relative timing; different
     /// values deliberately offset the streams. False means unchanged, not failure.
     pub fn set_audio_delay(&self, delay: Duration) -> Result<bool> {
-        self.set_delay(delay, b"NDIlib_recv_set_audio_delay\0")
+        let millis = receiver_delay_millis(delay)?;
+        let table = self.core.delay()?;
+        // SAFETY: the receiver instance is live for this borrow.
+        Ok(unsafe { table.NDIlib_recv_set_audio_delay(self.core.instance, millis) })
     }
 
     /// Return the effective native audio delay. Requires receiver-delay support.
     pub fn audio_delay(&self) -> Result<Duration> {
-        self.get_delay(b"NDIlib_recv_get_audio_delay\0")
-    }
-
-    fn set_delay(&self, delay: Duration, symbol: &'static [u8]) -> Result<bool> {
-        let millis = receiver_delay_millis(delay)?;
-        self.core
-            ._ndi
-            .require_feature(crate::capabilities::RuntimeFeature::ReceiveDelay)?;
-        type SetDelay = unsafe extern "C" fn(NDIlib_recv_instance_t, i32) -> bool;
-        // SAFETY: Both named SDK delay setters have exactly this signature.
-        let set = unsafe { self.core.optional::<SetDelay>(symbol)? };
-        Ok(unsafe { set(self.core.instance, millis) })
-    }
-
-    fn get_delay(&self, symbol: &'static [u8]) -> Result<Duration> {
-        self.core
-            ._ndi
-            .require_feature(crate::capabilities::RuntimeFeature::ReceiveDelay)?;
-        type GetDelay = unsafe extern "C" fn(NDIlib_recv_instance_t) -> i32;
-        // SAFETY: Both named SDK delay getters have exactly this signature.
-        let get = unsafe { self.core.optional::<GetDelay>(symbol)? };
-        let value = unsafe { get(self.core.instance) };
-        if !(0..=2000).contains(&value) {
-            return Err(Error::InvalidConfiguration(format!(
-                "SDK returned invalid receive delay: {value} ms"
-            )));
-        }
-        Ok(Duration::from_millis(value as u64))
+        let table = self.core.delay()?;
+        // SAFETY: the receiver instance is live for this borrow.
+        receiver_delay(unsafe { table.NDIlib_recv_get_audio_delay(self.core.instance) })
     }
 
     /// Add validated metadata sent immediately and again on each connection.
     pub fn add_connection_metadata(&self, metadata: &MetadataFrame) -> Result<()> {
-        type Add = unsafe extern "C" fn(NDIlib_recv_instance_t, *const NDIlib_metadata_frame_t);
-        let add = unsafe {
-            self.core
-                .optional::<Add>(b"NDIlib_recv_add_connection_metadata\0")?
-        };
+        let table = self.core.connection_metadata()?;
         let raw = metadata.to_raw();
         // SAFETY: The metadata C string remains live for the synchronous SDK call.
-        unsafe { add(self.core.instance, &raw) };
+        unsafe { table.NDIlib_recv_add_connection_metadata(self.core.instance, &raw) };
         Ok(())
     }
 
     /// Clear metadata registered for subsequent receiver connections.
     pub fn clear_connection_metadata(&self) -> Result<()> {
-        type Clear = unsafe extern "C" fn(NDIlib_recv_instance_t);
-        let clear = unsafe {
-            self.core
-                .optional::<Clear>(b"NDIlib_recv_clear_connection_metadata\0")?
-        };
-        unsafe { clear(self.core.instance) };
+        let table = self.core.connection_metadata()?;
+        // SAFETY: the receiver instance is live for this borrow.
+        unsafe { table.NDIlib_recv_clear_connection_metadata(self.core.instance) };
         Ok(())
     }
 
     /// Copy the optional device web-control URL. This does not open the URL.
     pub fn web_control_url(&self) -> Result<Option<String>> {
-        type Get = unsafe extern "C" fn(NDIlib_recv_instance_t) -> *const c_char;
-        // Resolve the matching release function before requesting any allocation.
-        let free = unsafe {
-            self.core
-                .optional::<RecvFreeString>(b"NDIlib_recv_free_string\0")?
-        };
-        let get = unsafe {
-            self.core
-                .optional::<Get>(b"NDIlib_recv_get_web_control\0")?
-        };
+        let api = self.core._ndi.api();
+        // Hold the matching release function before requesting any allocation.
+        let strings = api.receiver_strings.require("receiver web control")?;
+        let web_control = api.receiver_web_control.require("receiver web control")?;
         let guard = RecvStringGuard {
             core: &self.core,
-            pointer: unsafe { get(self.core.instance) },
-            free,
+            // SAFETY: the receiver instance is live for this borrow.
+            pointer: unsafe { web_control.NDIlib_recv_get_web_control(self.core.instance) },
+            strings,
         };
         guard.copy()
     }
@@ -887,30 +927,23 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn poll_source_name_change(&self, timeout: Duration) -> Result<Option<SourceNameChange>> {
         to_ms_checked(timeout)?;
         let deadline = Instant::now() + timeout;
-        type Get = unsafe extern "C" fn(NDIlib_recv_instance_t, *mut *const c_char, u32) -> bool;
-        let free = unsafe {
-            self.core
-                .optional::<RecvFreeString>(b"NDIlib_recv_free_string\0")?
-        };
-        let get = unsafe {
-            self.core
-                .optional::<Get>(b"NDIlib_recv_get_source_name\0")?
-        };
+        let api = self.core._ndi.api();
+        let strings = api.receiver_strings.require("connected source name")?;
+        let source_name = api.receiver_source_name.require("connected source name")?;
         let Some(_query) = self.core.source_query_guard.try_lock_until(deadline) else {
             return Ok(None);
         };
         let mut pointer = ptr::null();
+        let remaining = to_ms_checked(deadline.saturating_duration_since(Instant::now()))?;
+        // SAFETY: the receiver instance is live for this borrow and `pointer` is
+        // writable storage for the returned string.
         let changed = unsafe {
-            get(
-                self.core.instance,
-                &mut pointer,
-                to_ms_checked(deadline.saturating_duration_since(Instant::now()))?,
-            )
+            source_name.NDIlib_recv_get_source_name(self.core.instance, &mut pointer, remaining)
         };
         let guard = RecvStringGuard {
             core: &self.core,
             pointer,
-            free,
+            strings,
         };
         if !changed {
             return Ok(None);
@@ -929,14 +962,26 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn connect_to(&self, source: &Source) -> Result<()> {
         let raw = source.to_raw()?;
         let _exclusive = self.core.capture_guard.write();
-        unsafe { NDIlib_recv_connect(self.core.instance, &raw.raw) };
+        // SAFETY: the receiver instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
+        unsafe {
+            self.core
+                .sdk()
+                .NDIlib_recv_connect(self.core.instance, &raw.raw)
+        };
         Ok(())
     }
 
     /// Disconnect the native receiver while retaining its original reconnect target.
     pub fn disconnect(&self) -> Result<()> {
         let _exclusive = self.core.capture_guard.write();
-        unsafe { NDIlib_recv_connect(self.core.instance, ptr::null()) };
+        // SAFETY: the receiver instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
+        unsafe {
+            self.core
+                .sdk()
+                .NDIlib_recv_connect(self.core.instance, ptr::null())
+        };
         Ok(())
     }
 
@@ -955,7 +1000,13 @@ impl<M: ReceiverMode> Receiver<M> {
     /// success while disconnected; use [`Self::is_connected`] to check the
     /// connection. The SDK retains tally state for future connections.
     pub fn set_tally(&self, tally: &Tally) -> bool {
-        unsafe { NDIlib_recv_set_tally(self.core.instance, &tally.to_raw()) }
+        // SAFETY: the receiver instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
+        unsafe {
+            self.core
+                .sdk()
+                .NDIlib_recv_set_tally(self.core.instance, &tally.to_raw())
+        }
     }
 
     /// Send metadata upstream and return the SDK's status flag unchanged.
@@ -964,12 +1015,24 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn send_metadata(&self, metadata: &MetadataFrame) -> bool {
         let raw = metadata.to_raw();
         // The borrowed C string remains live through this synchronous SDK call.
-        unsafe { NDIlib_recv_send_metadata(self.core.instance, &raw) }
+        // SAFETY: the receiver instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
+        unsafe {
+            self.core
+                .sdk()
+                .NDIlib_recv_send_metadata(self.core.instance, &raw)
+        }
     }
 
     /// Return whether the connected source supports PTZ commands.
     pub fn ptz_is_supported(&self) -> bool {
-        unsafe { NDIlib_recv_ptz_is_supported(self.core.instance) }
+        // SAFETY: the receiver instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
+        unsafe {
+            self.core
+                .sdk()
+                .NDIlib_recv_ptz_is_supported(self.core.instance)
+        }
     }
 
     /// Recall preset `0..=99` at a finite speed within `0.0..=1.0`.
@@ -1336,7 +1399,14 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # }
     /// ```
     pub fn is_connected(&self) -> bool {
-        unsafe { NDIlib_recv_get_no_connections(self.core.instance) > 0 }
+        // SAFETY: the receiver instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
+        unsafe {
+            self.core
+                .sdk()
+                .NDIlib_recv_get_no_connections(self.core.instance)
+                > 0
+        }
     }
 
     /// Re-establish this receiver's connection to its original source,
@@ -1386,7 +1456,11 @@ impl<M: ReceiverMode> Receiver<M> {
         // lifetime of `self`, and `raw` (which owns the backing
         // CStrings) outlives the call, so the pointers inside `raw.raw`
         // stay valid while the SDK copies the source descriptor.
-        unsafe { NDIlib_recv_connect(self.core.instance, &raw.raw) };
+        unsafe {
+            self.core
+                .sdk()
+                .NDIlib_recv_connect(self.core.instance, &raw.raw)
+        };
         Ok(())
     }
 
@@ -1446,17 +1520,33 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # }
     /// ```
     pub fn connection_stats(&self) -> ConnectionStats {
-        let connections = unsafe { NDIlib_recv_get_no_connections(self.core.instance) };
+        // SAFETY: the receiver instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
+        let connections = unsafe {
+            self.core
+                .sdk()
+                .NDIlib_recv_get_no_connections(self.core.instance)
+        };
 
         let mut total = NDIlib_recv_performance_t::default();
         let mut dropped = NDIlib_recv_performance_t::default();
+        // SAFETY: the receiver instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
         unsafe {
-            NDIlib_recv_get_performance(self.core.instance, &mut total, &mut dropped);
+            self.core.sdk().NDIlib_recv_get_performance(
+                self.core.instance,
+                &mut total,
+                &mut dropped,
+            );
         }
 
         let mut queue = NDIlib_recv_queue_t::default();
+        // SAFETY: the receiver instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
         unsafe {
-            NDIlib_recv_get_queue(self.core.instance, &mut queue);
+            self.core
+                .sdk()
+                .NDIlib_recv_get_queue(self.core.instance, &mut queue);
         }
 
         ConnectionStats {
@@ -1502,15 +1592,23 @@ impl<M: ReceiverMode> Receiver<M> {
 }
 
 impl ReceiverCore {
-    /// Caller must select a signature matching this exact SDK export.
-    unsafe fn optional<F: Copy>(&self, symbol: &'static [u8]) -> Result<F> {
-        unsafe { self._ndi.resolve_optional::<F>(symbol)? }.ok_or_else(|| {
-            Error::UnsupportedCapability {
-                capability: String::from_utf8_lossy(&symbol[..symbol.len().saturating_sub(1)])
-                    .into_owned(),
-                reason: "entry point unavailable in the selected runtime".into(),
-            }
-        })
+    /// The entry points of the runtime this receiver was created through.
+    pub(crate) fn sdk(&self) -> &'static sys::Core {
+        &self._ndi.api().core
+    }
+
+    fn delay(&self) -> Result<&'static sys::ReceiveDelay> {
+        self._ndi
+            .api()
+            .receive_delay
+            .require(crate::capabilities::RuntimeFeature::ReceiveDelay.name())
+    }
+
+    fn connection_metadata(&self) -> Result<&'static sys::ReceiverConnectionMetadata> {
+        self._ndi
+            .api()
+            .receiver_connection_metadata
+            .require("receiver connection metadata")
     }
 
     /// Acquire only within the caller's existing budget, including contention.
@@ -1537,7 +1635,7 @@ impl ReceiverCore {
         };
         let timeout_ms = to_ms_checked(deadline.saturating_duration_since(Instant::now()))?;
         // SAFETY: self.instance is a valid NDI receiver instance.
-        self.capture_result::<K>(unsafe { capture_raw::<K>(self.instance, timeout_ms) })
+        self.capture_result::<K>(unsafe { capture_raw::<K>(&self._ndi, self.instance, timeout_ms) })
     }
 
     fn capture_result<'rx, K: CaptureKind>(
@@ -1547,7 +1645,8 @@ impl ReceiverCore {
         match result {
             CaptureResult::Frame(guard) => {
                 // Validation (e.g. FourCC) happens during ref construction.
-                let frame_ref = unsafe { K::make_ref(guard.with_runtime(&self._ndi))? };
+                // SAFETY: the guard owns a frame this capture reported as `K`'s kind.
+                let frame_ref = unsafe { K::make_ref(guard)? };
                 Ok(Some(frame_ref))
             }
             CaptureResult::StatusChanged => {
@@ -1614,7 +1713,7 @@ impl ReceiverCore {
             // SAFETY: The live receiver and shared guard exclude reconnect;
             // null media slots request only notifications (Processing.NDI.Recv.h).
             Some(unsafe {
-                NDIlib_recv_capture_v3(
+                self.sdk().NDIlib_recv_capture_v3(
                     self.instance,
                     ptr::null_mut(),
                     ptr::null_mut(),
@@ -1635,7 +1734,13 @@ impl ReceiverCore {
 
     fn current_status(&self) -> ReceiverStatus {
         ReceiverStatus {
-            connections: unsafe { NDIlib_recv_get_no_connections(self.instance).max(0) as u32 },
+            // SAFETY: the receiver instance is live for this borrow, and every pointer
+            // passed outlives the synchronous call.
+            connections: unsafe {
+                self.sdk()
+                    .NDIlib_recv_get_no_connections(self.instance)
+                    .max(0) as u32
+            },
         }
     }
 
@@ -1667,13 +1772,14 @@ impl ReceiverCore {
 
     fn retain_non_status_event(&self, value: NDIlib_frame_type_e) {
         match value {
-            101 => self.pending_source.store(true, Ordering::Release),
+            NDIlib_frame_type_e_NDIlib_frame_type_source_change => {
+                self.pending_source.store(true, Ordering::Release)
+            }
             NDIlib_frame_type_e_NDIlib_frame_type_none
             | NDIlib_frame_type_e_NDIlib_frame_type_video
             | NDIlib_frame_type_e_NDIlib_frame_type_audio
             | NDIlib_frame_type_e_NDIlib_frame_type_metadata => {}
-            #[allow(clippy::unnecessary_cast)]
-            value => *self.pending_unknown.lock() = Some(value as u32),
+            value => *self.pending_unknown.lock() = Some(value),
         }
     }
 
@@ -1703,8 +1809,10 @@ impl ReceiverCore {
             return Ok(Some(event));
         }
         // Null media slots request notifications only; no frame allocation escapes.
+        // SAFETY: the receiver instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
         let value = unsafe {
-            NDIlib_recv_capture_v3(
+            self.sdk().NDIlib_recv_capture_v3(
                 self.instance,
                 ptr::null_mut(),
                 ptr::null_mut(),
@@ -1840,8 +1948,10 @@ impl<'rx, K: CaptureKind> Capture<'rx, K> {
 
 impl Drop for ReceiverCore {
     fn drop(&mut self) {
+        // SAFETY: the receiver instance is live for this borrow, and every pointer
+        // passed outlives the synchronous call.
         unsafe {
-            NDIlib_recv_destroy(self.instance);
+            self.sdk().NDIlib_recv_destroy(self.instance);
         }
         #[cfg(test)]
         lifecycle_test_events::record("receiver");
@@ -1872,7 +1982,9 @@ unsafe impl Sync for ReceiverCore {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SourceNameChange {
+    /// The receiver is now connected to the named source.
     Connected(String),
+    /// The receiver is no longer connected to any source.
     Disconnected,
 }
 
@@ -1880,7 +1992,9 @@ pub enum SourceNameChange {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ReceiverEvent {
+    /// The connection or the source's capabilities changed.
     StatusChanged(ReceiverStatus),
+    /// The connected source changed; poll its name for the new value.
     SourceChanged,
     /// An unknown non-media event value; no unknown payload is exposed.
     Unknown(u32),
@@ -1897,13 +2011,17 @@ pub struct ReceiverStatus {
     pub connections: u32,
 }
 
+/// Whether a source is shown on program output, on preview, or both.
 #[derive(Debug, Clone)]
 pub struct Tally {
+    /// The source is on program (live) output.
     pub on_program: bool,
+    /// The source is on preview output.
     pub on_preview: bool,
 }
 
 impl Tally {
+    /// Create a tally state.
     pub fn new(on_program: bool, on_preview: bool) -> Self {
         Tally {
             on_program,
@@ -2061,10 +2179,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn receive_64_modes_require_the_selected_runtime_before_native_creation() {
         use crate::capabilities::RuntimeFeature;
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let best = ReceiverOptions::builder(Source::default())
             .color(ReceiverColorFormat::Best444)
             .build();
@@ -2091,9 +2210,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn media_source_and_unknown_events_survive_legacy_status_polling() {
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
         for _ in 0..3 {
             assert!(receiver
@@ -2133,9 +2253,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn receive_delay_native_changed_flag_and_capability_failure() {
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
         if ndi
             .require_feature(crate::capabilities::RuntimeFeature::ReceiveDelay)
@@ -2174,7 +2295,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn receiver_allocated_strings_free_once_even_when_utf8_is_invalid() {
         use std::sync::atomic::AtomicUsize;
         static FREES: AtomicUsize = AtomicUsize::new(0);
@@ -2182,8 +2302,13 @@ mod tests {
             FREES.fetch_add(1, Ordering::Relaxed);
             drop(unsafe { CString::from_raw(pointer.cast_mut()) });
         }
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let strings = sys::ReceiverStrings {
+            NDIlib_recv_free_string: free,
+        };
         let before = FREES.load(Ordering::Relaxed);
         for (bytes, valid) in [
             (b"source".to_vec(), true),
@@ -2193,7 +2318,7 @@ mod tests {
             let guard = RecvStringGuard {
                 core: &receiver.core,
                 pointer: CString::new(bytes).unwrap().into_raw(),
-                free,
+                strings: &strings,
             };
             assert_eq!(guard.copy().is_ok(), valid);
             drop(guard);
@@ -2201,7 +2326,7 @@ mod tests {
         let empty = RecvStringGuard {
             core: &receiver.core,
             pointer: ptr::null(),
-            free,
+            strings: &strings,
         };
         assert_eq!(empty.copy().unwrap(), None);
         drop(empty);
@@ -2245,9 +2370,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn media_status_is_retained_coalesced_and_consumed_once() {
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
         fn check<K: CaptureKind>(receiver: &Receiver) {
             let (_, allocations) = crate::test_alloc::allocation_count(|| {
@@ -2284,9 +2410,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn status_wait_rechecks_publication_and_preserves_it_on_errors() {
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
         for outcome in [None, Some(NDIlib_frame_type_e_NDIlib_frame_type_none)] {
             assert!(receiver
@@ -2322,9 +2449,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn concurrent_status_pollers_take_once_and_later_publications_survive() {
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
         receiver.core.pending_status.store(true, Ordering::Release);
         let barrier = std::sync::Barrier::new(3);
@@ -2353,9 +2481,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn status_publication_during_waits_is_reported_and_newer_publication_survives() {
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
@@ -2410,9 +2539,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn receiver_mode_transitions_preserve_pending_status_and_core_identity() {
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
         let original_core = Arc::as_ptr(&receiver.core);
         receiver.core.pending_status.store(true, Ordering::Release);
@@ -2448,9 +2578,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn ptz_rejects_invalid_commands_before_calling_sdk() {
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
         for result in [
             receiver.ptz_recall_preset(u32::MAX, 0.5),
@@ -2476,9 +2607,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn outbound_controls_accept_invocation_without_a_source() {
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
         // Runtime implementations differ in their status flags when no source
         // is connected. These controls must remain callable in that state.
@@ -2492,9 +2624,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn capture_contention_obeys_zero_and_bounded_budgets() {
-        let ndi = NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
         let exclusive = receiver.core.capture_guard.write();
         std::thread::scope(|scope| {

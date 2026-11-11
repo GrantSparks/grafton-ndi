@@ -2,22 +2,20 @@
 
 use std::path::{Path, PathBuf};
 
-#[allow(clippy::type_complexity)]
-mod generated {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/api/capabilities.rs"));
-}
+use crate::sys::{AdvancedEntryPoints, Api};
 
-type MinimumVersion = (u16, u16, u16);
-type Requirements = (&'static [&'static str], Option<MinimumVersion>);
+/// The first runtime version with the NDI 6.4 pixel formats and receiver modes.
+const NDI_6_4: SdkVersion = SdkVersion {
+    major: 6,
+    minor: 4,
+    patch: 0,
+    build: 0,
+};
 
-pub(crate) fn requirements(id: &str) -> Option<Requirements> {
-    generated::CAPABILITY_REQUIREMENTS
-        .iter()
-        .find(|entry| entry.0 == id)
-        .map(|entry| (entry.2, entry.3))
-}
-
-/// The native SDK edition selected for this process.
+/// The edition of a native SDK implementation.
+///
+/// The edition of the selected implementation is detected from what it exports,
+/// never taken from its file name or from the caller's request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SdkEdition {
@@ -64,8 +62,10 @@ impl SdkVersion {
         self.build
     }
 
-    // Observed SDK strings end in a version, after platform and build date/time.
-    // Reject arbitrary embedded numbers and future major versions for semantic gates.
+    /// Parse the final token of the SDK's version text.
+    ///
+    /// Observed strings end in the version after a platform name and a build
+    /// date, so numbers elsewhere in the text are never mistaken for it.
     pub(crate) fn parse(text: &str) -> Option<Self> {
         let token = text.split_whitespace().last()?;
         let components: Vec<_> = token.split('.').collect();
@@ -87,21 +87,12 @@ impl SdkVersion {
             },
         })
     }
-
-    pub(crate) fn supports_semantics(self, id: &str) -> bool {
-        let Some((_, Some((major, minor, patch)))) = requirements(id) else {
-            return false;
-        };
-        self.major == u32::from(major)
-            && (self.minor, self.patch) >= (u32::from(minor), u32::from(patch))
-    }
 }
 
 /// Identity of the implementation actually selected, rather than just build headers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeInfo {
     pub(crate) edition: SdkEdition,
-    pub(crate) edition_verified: bool,
     pub(crate) linkage: SdkLinkage,
     pub(crate) library_path: Option<PathBuf>,
     pub(crate) raw_version: String,
@@ -109,19 +100,11 @@ pub struct RuntimeInfo {
 }
 
 impl RuntimeInfo {
-    /// Selected SDK edition. Check [`Self::edition_verified`] before using this
-    /// as evidence for edition-dependent companion libraries or ABI semantics.
+    /// The edition detected from the entry points the implementation exports.
+    ///
+    /// This does not establish a license entitlement.
     pub fn edition(&self) -> SdkEdition {
         self.edition
-    }
-    /// Whether the selected edition has positive ABI/artifact evidence.
-    ///
-    /// Older Advanced libraries with recognizable filenames but no current
-    /// edition markers may still supply the legacy API. They report `false`;
-    /// the selection label alone must not enable edition-dependent features.
-    /// Neither result establishes a license entitlement.
-    pub fn edition_verified(&self) -> bool {
-        self.edition_verified
     }
 
     /// Whether the implementation is shared or statically linked.
@@ -173,23 +156,6 @@ pub enum RuntimeFeature {
 }
 
 impl RuntimeFeature {
-    fn registry_id(self) -> &'static str {
-        match self {
-            Self::Planar444Video => "planar_444",
-            Self::ReceiveBest444 => "best_444",
-            Self::ReceiveVideoOnly => "video_only_receive",
-            Self::ReceiveDelay => "receive_delay",
-            Self::SdkTimestamp => "sdk_timestamp",
-            Self::Routing => "routing",
-            Self::SenderAdvertising => "send_advertiser",
-            Self::ReceiverAdvertising => "recv_advertiser",
-            Self::SenderDiscovery => "send_listener",
-            Self::ReceiverDiscovery => "recv_listener",
-            Self::AdvancedSenderConfiguration => "send_create_v2",
-            Self::AdvancedReceiverConfiguration => "recv_create_v4",
-        }
-    }
-
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Planar444Video => "planar 4:4:4 video",
@@ -214,7 +180,7 @@ impl RuntimeFeature {
 pub enum CapabilityUnavailable {
     /// The SDK version text is unrecognized, so new enum semantics cannot be assumed.
     RuntimeVersionUnknown,
-    /// This capability is not part of the selected runtime version.
+    /// The selected runtime predates this capability.
     RuntimeTooOld,
     /// At least one required native function is absent.
     SymbolUnavailable,
@@ -237,55 +203,84 @@ pub enum CapabilityStatus {
 /// A snapshot of core SDK capability evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
-    pub(crate) version: Option<SdkVersion>,
-    pub(crate) receive_delay: bool,
-    pub(crate) timestamp: bool,
-    pub(crate) groups: [CapabilityStatus; 7],
+    planar_444_video: CapabilityStatus,
+    receive_best_444: CapabilityStatus,
+    receive_video_only: CapabilityStatus,
+    receive_delay: CapabilityStatus,
+    sdk_timestamp: CapabilityStatus,
+    routing: CapabilityStatus,
+    sender_advertising: CapabilityStatus,
+    receiver_advertising: CapabilityStatus,
+    sender_discovery: CapabilityStatus,
+    receiver_discovery: CapabilityStatus,
+    advanced_sender_configuration: CapabilityStatus,
+    advanced_receiver_configuration: CapabilityStatus,
 }
 
 impl Capabilities {
+    /// Derive the capabilities of an implementation from the tables it
+    /// resolved, its parsed version and its detected edition.
+    pub(crate) fn detect(
+        api: &Api,
+        version: Option<SdkVersion>,
+        edition: SdkEdition,
+        advanced: AdvancedEntryPoints,
+    ) -> Self {
+        let exported = |available: bool| {
+            if available {
+                CapabilityStatus::Available
+            } else {
+                CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
+            }
+        };
+        let since = |minimum: SdkVersion| match version {
+            Some(version) if version >= minimum => CapabilityStatus::Available,
+            Some(_) => CapabilityStatus::Unavailable(CapabilityUnavailable::RuntimeTooOld),
+            None => CapabilityStatus::Unavailable(CapabilityUnavailable::RuntimeVersionUnknown),
+        };
+        let advanced_entry = |available: bool| {
+            if !cfg!(all(feature = "advanced", ndi_has_advanced_header)) {
+                CapabilityStatus::Unavailable(CapabilityUnavailable::BuildAbiUnavailable)
+            } else if edition != SdkEdition::Advanced {
+                CapabilityStatus::Unavailable(CapabilityUnavailable::WrongEdition)
+            } else {
+                exported(available)
+            }
+        };
+        Self {
+            planar_444_video: since(NDI_6_4),
+            receive_best_444: since(NDI_6_4),
+            receive_video_only: since(NDI_6_4),
+            receive_delay: exported(api.receive_delay.is_available()),
+            sdk_timestamp: exported(api.timestamp.is_available()),
+            routing: exported(api.routing.is_available()),
+            sender_advertising: exported(api.sender_advertising.is_available()),
+            receiver_advertising: exported(api.receiver_advertising.is_available()),
+            sender_discovery: exported(api.sender_discovery.is_available()),
+            receiver_discovery: exported(api.receiver_discovery.is_available()),
+            advanced_sender_configuration: advanced_entry(advanced.sender_configuration),
+            advanced_receiver_configuration: advanced_entry(advanced.receiver_configuration),
+        }
+    }
+
     /// Query a capability without changing native state.
     pub fn status(&self, feature: RuntimeFeature) -> CapabilityStatus {
         match feature {
-            RuntimeFeature::Routing => self.groups[0],
-            RuntimeFeature::SenderAdvertising => self.groups[1],
-            RuntimeFeature::ReceiverAdvertising => self.groups[2],
-            RuntimeFeature::SenderDiscovery => self.groups[3],
-            RuntimeFeature::ReceiverDiscovery => self.groups[4],
-            RuntimeFeature::AdvancedSenderConfiguration => self.groups[5],
-            RuntimeFeature::AdvancedReceiverConfiguration => self.groups[6],
-            RuntimeFeature::ReceiveDelay => {
-                if self.receive_delay {
-                    CapabilityStatus::Available
-                } else {
-                    CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
-                }
-            }
-            RuntimeFeature::SdkTimestamp => {
-                if self.timestamp {
-                    CapabilityStatus::Available
-                } else {
-                    CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
-                }
-            }
-            _ => match self.version {
-                Some(v) if v.supports_semantics(feature.registry_id()) => {
-                    CapabilityStatus::Available
-                }
-                Some(v)
-                    if requirements(feature.registry_id())
-                        .and_then(|(_, minimum)| minimum)
-                        .is_some_and(|minimum| v.major() <= u32::from(minimum.0)) =>
-                {
-                    CapabilityStatus::Unavailable(CapabilityUnavailable::RuntimeTooOld)
-                }
-                Some(_) => {
-                    CapabilityStatus::Unavailable(CapabilityUnavailable::RuntimeVersionUnknown)
-                }
-                None => CapabilityStatus::Unavailable(CapabilityUnavailable::RuntimeVersionUnknown),
-            },
+            RuntimeFeature::Planar444Video => self.planar_444_video,
+            RuntimeFeature::ReceiveBest444 => self.receive_best_444,
+            RuntimeFeature::ReceiveVideoOnly => self.receive_video_only,
+            RuntimeFeature::ReceiveDelay => self.receive_delay,
+            RuntimeFeature::SdkTimestamp => self.sdk_timestamp,
+            RuntimeFeature::Routing => self.routing,
+            RuntimeFeature::SenderAdvertising => self.sender_advertising,
+            RuntimeFeature::ReceiverAdvertising => self.receiver_advertising,
+            RuntimeFeature::SenderDiscovery => self.sender_discovery,
+            RuntimeFeature::ReceiverDiscovery => self.receiver_discovery,
+            RuntimeFeature::AdvancedSenderConfiguration => self.advanced_sender_configuration,
+            RuntimeFeature::AdvancedReceiverConfiguration => self.advanced_receiver_configuration,
         }
     }
+
     /// Whether the wrapper has enough evidence to attempt the operation.
     pub fn supports(&self, feature: RuntimeFeature) -> bool {
         self.status(feature) == CapabilityStatus::Available
@@ -295,11 +290,11 @@ impl Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn parses_final_version_not_build_time() {
         let v = SdkVersion::parse("NDI SDK LINUX 10:14:14 Nov 6 2026 6.4.0.2").unwrap();
         assert_eq!((v.major(), v.minor(), v.patch(), v.build()), (6, 4, 0, 2));
-        assert!(v.supports_semantics("planar_444"));
         for s in [
             "",
             "NDI 6.4",
@@ -310,43 +305,109 @@ mod tests {
         ] {
             assert!(SdkVersion::parse(s).is_none(), "{s}");
         }
-        assert!(!SdkVersion::parse("7.0.0")
-            .unwrap()
-            .supports_semantics("planar_444"));
     }
+
+    fn detect(
+        exported: impl Fn(&str) -> bool,
+        version: Option<&str>,
+        edition: SdkEdition,
+    ) -> Capabilities {
+        let api = Api::load(&crate::sys::table::ExportsWhere(exported)).unwrap();
+        Capabilities::detect(
+            &api,
+            version.map(|text| SdkVersion::parse(text).unwrap()),
+            edition,
+            AdvancedEntryPoints {
+                sender_configuration: edition == SdkEdition::Advanced,
+                receiver_configuration: edition == SdkEdition::Advanced,
+            },
+        )
+    }
+
     #[test]
-    fn public_features_have_reviewed_descriptors() {
+    fn unknown_identity_does_not_claim_enum_semantics() {
+        let capabilities = detect(
+            |name| name != "NDIlib_util_get_timestamp",
+            None,
+            SdkEdition::Standard,
+        );
+        assert!(capabilities.supports(RuntimeFeature::ReceiveDelay));
+        assert_eq!(
+            capabilities.status(RuntimeFeature::ReceiveBest444),
+            CapabilityStatus::Unavailable(CapabilityUnavailable::RuntimeVersionUnknown)
+        );
+        assert_eq!(
+            capabilities.status(RuntimeFeature::SdkTimestamp),
+            CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
+        );
+    }
+
+    #[test]
+    fn each_optional_table_gates_only_its_own_feature() {
+        let capabilities = detect(
+            |name| !name.starts_with("NDIlib_routing_"),
+            Some("6.4.0.2"),
+            SdkEdition::Standard,
+        );
+        assert_eq!(
+            capabilities.status(RuntimeFeature::Routing),
+            CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
+        );
         for feature in [
             RuntimeFeature::Planar444Video,
             RuntimeFeature::ReceiveBest444,
             RuntimeFeature::ReceiveVideoOnly,
             RuntimeFeature::ReceiveDelay,
             RuntimeFeature::SdkTimestamp,
-            RuntimeFeature::Routing,
             RuntimeFeature::SenderAdvertising,
             RuntimeFeature::ReceiverAdvertising,
             RuntimeFeature::SenderDiscovery,
             RuntimeFeature::ReceiverDiscovery,
-            RuntimeFeature::AdvancedSenderConfiguration,
-            RuntimeFeature::AdvancedReceiverConfiguration,
         ] {
-            assert!(requirements(feature.registry_id()).is_some(), "{feature:?}");
+            assert!(capabilities.supports(feature), "{feature:?}");
         }
     }
 
     #[test]
-    fn unknown_identity_does_not_claim_enum_semantics() {
-        let c = Capabilities {
-            version: None,
-            receive_delay: true,
-            timestamp: false,
-            groups: [CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable); 7],
-        };
-        assert!(c.supports(RuntimeFeature::ReceiveDelay));
+    fn older_runtimes_report_version_gated_features_as_too_old() {
+        let capabilities = detect(|_| true, Some("6.3.2.0"), SdkEdition::Standard);
         assert_eq!(
-            c.status(RuntimeFeature::ReceiveBest444),
-            CapabilityStatus::Unavailable(CapabilityUnavailable::RuntimeVersionUnknown)
+            capabilities.status(RuntimeFeature::Planar444Video),
+            CapabilityStatus::Unavailable(CapabilityUnavailable::RuntimeTooOld)
         );
-        assert!(!c.supports(RuntimeFeature::SdkTimestamp));
+    }
+
+    #[test]
+    fn advanced_configuration_needs_the_build_abi_and_the_advanced_edition() {
+        let features = [
+            RuntimeFeature::AdvancedSenderConfiguration,
+            RuntimeFeature::AdvancedReceiverConfiguration,
+        ];
+        let standard = detect(|_| true, Some("6.4.0.2"), SdkEdition::Standard);
+        let advanced = detect(|_| true, Some("6.4.0.2"), SdkEdition::Advanced);
+        for feature in features {
+            if cfg!(all(feature = "advanced", ndi_has_advanced_header)) {
+                assert_eq!(
+                    standard.status(feature),
+                    CapabilityStatus::Unavailable(CapabilityUnavailable::WrongEdition)
+                );
+                assert!(advanced.supports(feature));
+            } else {
+                for capabilities in [&standard, &advanced] {
+                    assert_eq!(
+                        capabilities.status(feature),
+                        CapabilityStatus::Unavailable(CapabilityUnavailable::BuildAbiUnavailable)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn version_gates_admit_every_later_release() {
+        assert!(SdkVersion::parse("6.3.2.0").unwrap() < NDI_6_4);
+        for later in ["6.4.0", "6.4.0.2", "6.5.1", "7.0.0"] {
+            assert!(SdkVersion::parse(later).unwrap() >= NDI_6_4, "{later}");
+        }
     }
 }

@@ -2,7 +2,7 @@
 //! allocations retain their generation independently until the matching native free.
 use super::ffi;
 use crate::runtime::ProcessLifetimeRuntime;
-use crate::{ndi_lib::*, LineStrideOrSize, PixelFormat, Receiver, Result};
+use crate::{advanced::ffi::native::*, LineStrideOrSize, PixelFormat, Receiver, Result};
 use std::{
     alloc::{alloc_zeroed, dealloc, Layout},
     collections::HashMap,
@@ -836,8 +836,8 @@ unsafe extern "C" fn audio_free(
 
 #[cfg(ndi_has_advanced_header)]
 const _: () = {
-    let _: VideoSet = crate::ndi_lib::raw::NDIlib_recv_set_video_allocator;
-    let _: AudioSet = crate::ndi_lib::raw::NDIlib_recv_set_audio_allocator;
+    let _: VideoSet = crate::sys::advanced_declarations::NDIlib_recv_set_video_allocator;
+    let _: AudioSet = crate::sys::advanced_declarations::NDIlib_recv_set_audio_allocator;
 };
 
 #[cfg(test)]

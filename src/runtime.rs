@@ -1,9 +1,26 @@
 //! Select an NDI implementation and manage its initialization lifetime.
 //!
-//! A successfully loaded shared core module remains pinned for the process even
-//! after the last [`NDI`] handle is dropped. Native initialization and teardown
-//! still follow handle ownership unless [`NDI::process_lifetime`] is selected.
-//! Static targets use the provider chosen at build time.
+//! The NDI runtime is loaded when the first [`NDI`] handle is created; building
+//! this crate needs no NDI SDK. A successfully loaded shared core module remains
+//! pinned for the process even after the last [`NDI`] handle is dropped. Native
+//! initialization and teardown still follow handle ownership unless
+//! [`NDI::process_lifetime`] is selected. Static targets use the SDK archive
+//! linked at build time.
+//!
+//! # Where the runtime is loaded from
+//!
+//! Unless [`RuntimeOptions::library_path`] names an exact file, the first usable
+//! library in this order is selected:
+//!
+//! 1. the directory containing the running executable;
+//! 2. the directory named by the `NDI_RUNTIME_DIR_V6` environment variable;
+//! 3. the platform loader's own search for the library name (`rpath`,
+//!    `LD_LIBRARY_PATH`, `PATH` and the system library directories).
+//!
+//! A directory that does not contain the library is skipped, and a library that
+//! cannot be loaded or lacks a required entry point does not stop the search.
+//! When nothing is usable, [`Error::RuntimeLoadFailed`] names every location
+//! tried and the operating system's reason for each.
 
 use std::{
     path::PathBuf,
@@ -12,10 +29,8 @@ use std::{
 
 use crate::{
     capabilities::{Capabilities, CapabilityStatus, RuntimeFeature, RuntimeInfo, SdkEdition},
-    dispatch,
+    sys, Error, Result,
 };
-
-use crate::{ndi_lib::*, Error, Result};
 
 /// Selection options applied before the first successful runtime load.
 ///
@@ -31,14 +46,23 @@ pub struct RuntimeOptions {
 }
 
 impl RuntimeOptions {
-    /// Select an exact absolute shared-library path instead of the loader search path.
-    /// Static providers reject an explicit shared-library path.
+    /// Load exactly this absolute shared-library path.
+    ///
+    /// No other location is tried, so a failure to load it is reported rather
+    /// than hidden by a fallback. Static providers reject an explicit path.
     pub fn library_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.library_path = Some(path.into());
         self
     }
 
-    /// Require the given SDK edition. By default the selected build artifact sets it.
+    /// Search for the runtime library of this SDK edition.
+    ///
+    /// Requesting [`SdkEdition::Advanced`] also requires the loaded module to
+    /// export the Advanced SDK entry points. Requesting
+    /// [`SdkEdition::Standard`] never rejects a module for exporting more than
+    /// the Standard SDK does. Without a request, the edition chosen when the
+    /// crate was built applies: `NDI_SDK_EDITION` if it was set, otherwise
+    /// Advanced when an Advanced SDK was installed, otherwise Standard.
     /// A static provider cannot switch away from its build-time edition.
     pub fn edition(mut self, edition: SdkEdition) -> Self {
         self.edition = Some(edition);
@@ -108,15 +132,19 @@ trait RuntimeBackend {
     fn destroy(&self);
 }
 
-struct SdkBackend;
+/// Initialization through the selected implementation's own entry points.
+struct SdkBackend(&'static sys::Core);
 
 impl RuntimeBackend for SdkBackend {
     fn initialize(&self) -> bool {
-        unsafe { NDIlib_initialize() }
+        // SAFETY: the manager serializes initialization against destruction.
+        unsafe { self.0.NDIlib_initialize() }
     }
 
     fn destroy(&self) {
-        unsafe { NDIlib_destroy() };
+        // SAFETY: the manager calls this only after the last handle is released,
+        // so no SDK object created through this initialization remains.
+        unsafe { self.0.NDIlib_destroy() };
     }
 }
 
@@ -131,12 +159,6 @@ struct RuntimeManager<B = SdkBackend> {
     state: Mutex<RuntimeState>,
     cv: Condvar,
     backend: B,
-}
-
-impl RuntimeManager {
-    const fn new() -> Self {
-        Self::with_backend(SdkBackend)
-    }
 }
 
 impl<B: RuntimeBackend> RuntimeManager<B> {
@@ -166,16 +188,6 @@ impl<B: RuntimeBackend> RuntimeManager<B> {
                     drop(guard);
 
                     // Call NDIlib_initialize outside the lock
-                    #[cfg(all(target_os = "windows", debug_assertions))]
-                    {
-                        if std::env::var("CI").is_ok() {
-                            eprintln!("[NDI] Initializing NDI runtime in CI environment...");
-                            if let Ok(sdk_dir) = std::env::var("NDI_SDK_DIR") {
-                                eprintln!("[NDI] NDI_SDK_DIR: {}", sdk_dir);
-                            }
-                        }
-                    }
-
                     let succeeded = self.backend.initialize();
 
                     // Re-acquire lock to update state
@@ -248,7 +260,12 @@ impl<B: RuntimeBackend> RuntimeManager<B> {
     }
 }
 
-static RUNTIME: RuntimeManager = RuntimeManager::new();
+/// Initialization state of the one implementation a process can select.
+static LIFECYCLE: OnceLock<RuntimeManager> = OnceLock::new();
+
+fn lifecycle(runtime: &'static sys::Runtime) -> &'static RuntimeManager {
+    LIFECYCLE.get_or_init(|| RuntimeManager::with_backend(SdkBackend(&runtime.api.core)))
+}
 
 /// Manages the NDI runtime lifecycle.
 ///
@@ -277,9 +294,14 @@ static RUNTIME: RuntimeManager = RuntimeManager::new();
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug)]
 pub struct NDI {
-    _private: (),
+    runtime: &'static sys::Runtime,
+}
+
+impl std::fmt::Debug for NDI {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NDI").finish_non_exhaustive()
+    }
 }
 
 impl NDI {
@@ -295,8 +317,8 @@ impl NDI {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::RuntimeLoadFailed`] if the SDK cannot be loaded or lacks
-    /// a required baseline symbol, and [`Error::InitializationFailed`] if native
+    /// Returns [`Error::RuntimeLoadFailed`] if no usable runtime library is found
+    /// in the [search order](crate::runtime), and [`Error::InitializationFailed`] if native
     /// initialization fails or the runtime handle reference count is exhausted.
     ///
     /// # Examples
@@ -315,28 +337,34 @@ impl NDI {
 
     /// Load the selected implementation and acquire an initialized runtime handle.
     ///
-    /// An explicit path or edition that conflicts with an already selected module
-    /// returns [`Error::RuntimeConflict`]. A failed load or initialization is retryable.
+    /// A path that differs from the already selected module, or an Advanced
+    /// request the selected module cannot satisfy, returns
+    /// [`Error::RuntimeConflict`]. A failed load or initialization is retryable.
     /// Once loading succeeds, initialization retries use that same selected module.
     pub fn with_options(options: &RuntimeOptions) -> Result<Self> {
-        dispatch::select(options)?;
-        RUNTIME.acquire()?;
-        Ok(Self { _private: () })
+        let runtime = sys::select(options)?;
+        lifecycle(runtime).acquire()?;
+        Ok(Self { runtime })
     }
 
     /// Facts about the selected implementation, including its actual loaded path.
     pub fn info(&self) -> RuntimeInfo {
-        dispatch::selected().info.clone()
+        self.runtime.info.clone()
     }
 
     /// Capability evidence for the selected implementation.
     pub fn capabilities(&self) -> Capabilities {
-        dispatch::selected().capabilities.clone()
+        self.runtime.capabilities.clone()
+    }
+
+    /// The selected implementation's entry points.
+    pub(crate) fn api(&self) -> &'static sys::Api {
+        &self.runtime.api
     }
 
     /// Reject an unavailable operation before passing newer inputs to the SDK.
     pub fn require_feature(&self, feature: RuntimeFeature) -> Result<()> {
-        match self.capabilities().status(feature) {
+        match self.runtime.capabilities.status(feature) {
             CapabilityStatus::Available => Ok(()),
             CapabilityStatus::Unavailable(reason) => Err(Error::UnsupportedCapability {
                 capability: feature.name().into(),
@@ -355,12 +383,31 @@ impl NDI {
         }
     }
 
-    /// The caller must supply the exact native C function-pointer type for `name`.
+    /// Resolve an Advanced SDK entry point by name.
+    ///
+    /// The Advanced-only headers may not be redistributed, so their functions
+    /// have no vendored declaration to build a typed table from.
+    ///
+    /// # Safety
+    ///
+    /// `T` must be the exact C function-pointer type the SDK declares for `name`.
+    #[cfg(feature = "advanced")]
     pub(crate) unsafe fn resolve_optional<T: Copy>(
         &self,
         name: &'static [u8],
     ) -> Result<Option<T>> {
-        dispatch::selected().optional(name)
+        use std::ffi::{c_void, CStr};
+        const { assert!(size_of::<T>() == size_of::<*mut c_void>()) };
+        let name = CStr::from_bytes_with_nul(name).map_err(|_| {
+            Error::InvalidConfiguration(
+                "native symbol names must have exactly one final NUL".into(),
+            )
+        })?;
+        Ok(self.runtime.resolver().resolve(name)?.map(|address| {
+            // SAFETY: the caller guarantees `T` is this symbol's function-pointer
+            // type; its size equals a pointer's (asserted above).
+            unsafe { std::mem::transmute_copy::<*mut c_void, T>(&address.as_ptr()) }
+        }))
     }
 
     /// Checks if the current CPU is supported by the NDI SDK.
@@ -385,8 +432,9 @@ impl NDI {
 
     /// Check CPU support while preserving native-library loading diagnostics.
     pub fn try_is_supported_cpu() -> Result<bool> {
-        dispatch::select(&RuntimeOptions::default())?;
-        Ok(unsafe { NDIlib_is_supported_CPU() })
+        let runtime = sys::select(&RuntimeOptions::default())?;
+        // SAFETY: the query takes no arguments and needs no initialization.
+        Ok(unsafe { runtime.api.core.NDIlib_is_supported_CPU() })
     }
 
     /// Returns the version string of the NDI runtime.
@@ -414,7 +462,7 @@ impl NDI {
     /// # }
     /// ```
     pub fn version() -> Result<String> {
-        Ok(dispatch::select(&RuntimeOptions::default())?
+        Ok(sys::select(&RuntimeOptions::default())?
             .info
             .raw_version()
             .to_owned())
@@ -431,7 +479,7 @@ impl NDI {
     /// }
     /// ```
     pub fn is_running() -> bool {
-        RUNTIME.is_running()
+        LIFECYCLE.get().is_some_and(RuntimeManager::is_running)
     }
 }
 
@@ -443,16 +491,18 @@ impl Clone for NDI {
     /// Panics if the runtime handle reference count is exhausted. The original
     /// handle and runtime remain valid.
     fn clone(&self) -> Self {
-        RUNTIME
+        lifecycle(self.runtime)
             .acquire()
             .expect("Unable to acquire another reference to the existing NDI runtime");
-        Self { _private: () }
+        Self {
+            runtime: self.runtime,
+        }
     }
 }
 
 impl Drop for NDI {
     fn drop(&mut self) {
-        RUNTIME.release();
+        lifecycle(self.runtime).release();
     }
 }
 

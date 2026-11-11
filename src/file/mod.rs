@@ -18,6 +18,8 @@
 
 mod asynchronous;
 mod ffi;
+#[cfg(test)]
+pub(crate) use ffi::FUNCTION_NAMES;
 mod player;
 mod recorder;
 mod types;
@@ -115,10 +117,6 @@ impl FileApi {
             if ndi.info().edition() != crate::capabilities::SdkEdition::Advanced {
                 return Err(unavailable("file", "RuntimeEditionMismatch: the POSIX File artifact requires the selected Advanced core; loading it alongside Standard is unsupported"));
             }
-            #[cfg(not(target_os = "windows"))]
-            if !ndi.info().edition_verified() {
-                return Err(unavailable("file", "RuntimeEditionUnverified: the selected runtime has no verified Advanced identity"));
-            }
             if cfg!(all(target_os = "windows", target_arch = "x86")) {
                 return Err(unavailable(
                     "file",
@@ -157,12 +155,7 @@ impl FileApi {
                     .map_err(|error| {
                         unavailable("file", format!("DependencySymbolUnavailable: {error}"))
                     })?;
-                let from_core =
-                    unsafe { ndi.resolve_optional::<Initialize>(b"NDIlib_initialize\0") }
-                        .map_err(FileError::Core)?
-                        .ok_or_else(|| {
-                            FileError::Unavailable("selected core lacks initialize".into())
-                        })?;
+                let from_core = ndi.api().core.NDIlib_initialize;
                 if *from_file as usize != from_core as usize {
                     return Err(unavailable("file", "RuntimeModuleConflict: File dependency resolves to a different NDI core module"));
                 }

@@ -12,9 +12,10 @@ fn wait_until(stage: &str, mut condition: impl FnMut() -> bool) {
 }
 
 #[test]
-#[ignore = "Requires NDI runtime and loopback networking"]
 fn media_capture_retains_capability_notifications() -> Result<(), Error> {
-    let ndi = NDI::new()?;
+    let Some(ndi) = common::ndi() else {
+        return Ok(());
+    };
     eprintln!("SDK: {} on {}", NDI::version()?, std::env::consts::OS);
     // Keep every source alive so each capture API uses a distinct live endpoint
     // rather than immediately reusing a retired sender's address. Rapid sender

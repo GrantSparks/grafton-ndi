@@ -1,6 +1,7 @@
 use super::{ffi, AdvancedConfig, VideoPacketFormat};
 use crate::{
-    ndi_lib::*, Receiver, ReceiverMode, ReceiverOptions, Result, Sender, SenderOptions, Tally, NDI,
+    advanced::ffi::native::*, Receiver, ReceiverMode, ReceiverOptions, Result, Sender,
+    SenderOptions, Tally, NDI,
 };
 use std::{
     ffi::{c_char, CString},
@@ -34,7 +35,7 @@ impl Sender {
             *const c_char,
         ) -> NDIlib_send_instance_t;
         #[cfg(ndi_has_advanced_header)]
-        let _: Create = crate::ndi_lib::raw::NDIlib_send_create_v2;
+        let _: Create = crate::sys::advanced_declarations::NDIlib_send_create_v2;
         let create: Create = unsafe { ffi::required(ndi, b"NDIlib_send_create_v2\0")? };
         let name = CString::new(options.name.as_str())?;
         let groups = options.groups.as_deref().map(CString::new).transpose()?;
@@ -60,7 +61,7 @@ impl Sender {
     pub fn set_external_tally(&self, tally: Tally) -> Result<bool> {
         type Set = unsafe extern "C" fn(NDIlib_send_instance_t, *const NDIlib_tally_t) -> bool;
         #[cfg(ndi_has_advanced_header)]
-        let _: Set = crate::ndi_lib::raw::NDIlib_send_set_tally;
+        let _: Set = crate::sys::advanced_declarations::NDIlib_send_set_tally;
         let set: Set = unsafe { ffi::required(self.runtime(), b"NDIlib_send_set_tally\0")? };
         let raw = NDIlib_tally_t {
             on_program: tally.on_program,
@@ -82,9 +83,9 @@ impl Sender {
             unsafe extern "C" fn(NDIlib_send_instance_t, *const NDIlib_video_frame_v2_t) -> i32;
         #[cfg(ndi_has_advanced_header)]
         {
-            let _: Get = crate::ndi_lib::raw::NDIlib_send_get_target_frame_size;
-            let _: Get = crate::ndi_lib::raw::NDIlib_send_get_target_bit_rate;
-            let _: Get = crate::ndi_lib::raw::NDIlib_send_get_q_factor;
+            let _: Get = crate::sys::advanced_declarations::NDIlib_send_get_target_frame_size;
+            let _: Get = crate::sys::advanced_declarations::NDIlib_send_get_target_bit_rate;
+            let _: Get = crate::sys::advanced_declarations::NDIlib_send_get_q_factor;
         }
         let get: Get = unsafe { ffi::required(self.runtime(), symbol)? };
         u32::try_from(unsafe { get(self.native_instance(), &format.raw()) })
@@ -107,7 +108,7 @@ impl Sender {
             *mut bool,
         ) -> i32;
         #[cfg(ndi_has_advanced_header)]
-        let _: Get = crate::ndi_lib::raw::NDIlib_send_get_q_factor_v2;
+        let _: Get = crate::sys::advanced_declarations::NDIlib_send_get_q_factor_v2;
         let get: Get = unsafe { ffi::required(self.runtime(), b"NDIlib_send_get_q_factor_v2\0")? };
         let mut short_dc = false;
         let value = unsafe {
@@ -131,7 +132,7 @@ impl Sender {
         type Get =
             unsafe extern "C" fn(NDIlib_send_instance_t, *const NDIlib_video_frame_v2_t) -> bool;
         #[cfg(ndi_has_advanced_header)]
-        let _: Get = crate::ndi_lib::raw::NDIlib_send_is_keyframe_required;
+        let _: Get = crate::sys::advanced_declarations::NDIlib_send_is_keyframe_required;
         let get: Get =
             unsafe { ffi::required(self.runtime(), b"NDIlib_send_is_keyframe_required\0")? };
         let raw = format.map(VideoPacketFormat::raw);
@@ -154,7 +155,7 @@ impl Sender {
             *const NDIlib_video_frame_v2_t,
         ) -> bool;
         #[cfg(ndi_has_advanced_header)]
-        let _: Wait = crate::ndi_lib::raw::NDIlib_send_wait_for_keyframe_request;
+        let _: Wait = crate::sys::advanced_declarations::NDIlib_send_wait_for_keyframe_request;
         let wait: Wait =
             unsafe { ffi::required(self.runtime(), b"NDIlib_send_wait_for_keyframe_request\0")? };
         let raw = format.map(VideoPacketFormat::raw);
@@ -240,7 +241,7 @@ impl Receiver {
             *const c_char,
         ) -> NDIlib_recv_instance_t;
         #[cfg(ndi_has_advanced_header)]
-        let _: Create = crate::ndi_lib::raw::NDIlib_recv_create_v4;
+        let _: Create = crate::sys::advanced_declarations::NDIlib_recv_create_v4;
         let create: Create = unsafe { ffi::required(ndi, b"NDIlib_recv_create_v4\0")? };
         let raw = options.to_raw()?;
         let instance = unsafe { create(&raw.raw, config.as_ptr()) };
@@ -255,7 +256,7 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn request_keyframe(&self) -> Result<()> {
         type Request = unsafe extern "C" fn(NDIlib_recv_instance_t);
         #[cfg(ndi_has_advanced_header)]
-        let _: Request = crate::ndi_lib::raw::NDIlib_recv_request_keyframe;
+        let _: Request = crate::sys::advanced_declarations::NDIlib_recv_request_keyframe;
         let request: Request =
             unsafe { ffi::required(&self.core._ndi, b"NDIlib_recv_request_keyframe\0")? };
         unsafe { request(self.core.instance) };
@@ -265,7 +266,7 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn set_video_quality(&mut self, quality: VideoQuality) -> Result<bool> {
         type Set = unsafe extern "C" fn(NDIlib_recv_instance_t, NDIlib_recv_bandwidth_e) -> bool;
         #[cfg(ndi_has_advanced_header)]
-        let _: Set = crate::ndi_lib::raw::NDIlib_recv_set_bandwidth;
+        let _: Set = crate::sys::advanced_declarations::NDIlib_recv_set_bandwidth;
         let set: Set = unsafe { ffi::required(&self.core._ndi, b"NDIlib_recv_set_bandwidth\0")? };
         let value = match quality {
             VideoQuality::Program => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
@@ -276,7 +277,7 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn set_streams(&mut self, streams: StreamSelection) -> Result<StreamChange> {
         type Set = unsafe extern "C" fn(NDIlib_recv_instance_t, bool, bool, bool) -> bool;
         #[cfg(ndi_has_advanced_header)]
-        let _: Set = crate::ndi_lib::raw::NDIlib_recv_set_enabled_streams;
+        let _: Set = crate::sys::advanced_declarations::NDIlib_recv_set_enabled_streams;
         let set: Set =
             unsafe { ffi::required(&self.core._ndi, b"NDIlib_recv_set_enabled_streams\0")? };
         Ok(

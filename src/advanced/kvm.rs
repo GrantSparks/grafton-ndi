@@ -1,5 +1,5 @@
 use super::ffi;
-use crate::{ndi_lib::NDIlib_recv_instance_t, Receiver, ReceiverMode, Result};
+use crate::{advanced::ffi::native::NDIlib_recv_instance_t, Receiver, ReceiverMode, Result};
 use std::{
     collections::BTreeSet,
     ffi::{c_char, CString},
@@ -183,21 +183,21 @@ fn validate_position(x: f32, y: f32) -> Result<()> {
 
 #[cfg(ndi_has_advanced_header)]
 const _: () = {
-    let _: Button = crate::ndi_lib::raw::NDIlib_recv_kvm_is_supported;
-    let _: Button = crate::ndi_lib::raw::NDIlib_recv_kvm_send_left_mouse_click;
-    let _: Button = crate::ndi_lib::raw::NDIlib_recv_kvm_send_middle_mouse_click;
-    let _: Button = crate::ndi_lib::raw::NDIlib_recv_kvm_send_right_mouse_click;
-    let _: Button = crate::ndi_lib::raw::NDIlib_recv_kvm_send_left_mouse_release;
-    let _: Button = crate::ndi_lib::raw::NDIlib_recv_kvm_send_middle_mouse_release;
-    let _: Button = crate::ndi_lib::raw::NDIlib_recv_kvm_send_right_mouse_release;
-    let _: Button = crate::ndi_lib::raw::NDIlib_recv_kvm_send_touch_finish;
-    let _: Wheel = crate::ndi_lib::raw::NDIlib_recv_kvm_send_vertical_mouse_wheel;
-    let _: Wheel = crate::ndi_lib::raw::NDIlib_recv_kvm_send_horizontal_mouse_wheel;
-    let _: Key = crate::ndi_lib::raw::NDIlib_recv_kvm_send_keyboard_press;
-    let _: Key = crate::ndi_lib::raw::NDIlib_recv_kvm_send_keyboard_release;
-    let _: Position = crate::ndi_lib::raw::NDIlib_recv_kvm_send_mouse_position;
-    let _: Clipboard = crate::ndi_lib::raw::NDIlib_recv_kvm_send_clipboard_contents;
-    let _: Touch = crate::ndi_lib::raw::NDIlib_recv_kvm_send_touch_positions;
+    let _: Button = crate::sys::advanced_declarations::NDIlib_recv_kvm_is_supported;
+    let _: Button = crate::sys::advanced_declarations::NDIlib_recv_kvm_send_left_mouse_click;
+    let _: Button = crate::sys::advanced_declarations::NDIlib_recv_kvm_send_middle_mouse_click;
+    let _: Button = crate::sys::advanced_declarations::NDIlib_recv_kvm_send_right_mouse_click;
+    let _: Button = crate::sys::advanced_declarations::NDIlib_recv_kvm_send_left_mouse_release;
+    let _: Button = crate::sys::advanced_declarations::NDIlib_recv_kvm_send_middle_mouse_release;
+    let _: Button = crate::sys::advanced_declarations::NDIlib_recv_kvm_send_right_mouse_release;
+    let _: Button = crate::sys::advanced_declarations::NDIlib_recv_kvm_send_touch_finish;
+    let _: Wheel = crate::sys::advanced_declarations::NDIlib_recv_kvm_send_vertical_mouse_wheel;
+    let _: Wheel = crate::sys::advanced_declarations::NDIlib_recv_kvm_send_horizontal_mouse_wheel;
+    let _: Key = crate::sys::advanced_declarations::NDIlib_recv_kvm_send_keyboard_press;
+    let _: Key = crate::sys::advanced_declarations::NDIlib_recv_kvm_send_keyboard_release;
+    let _: Position = crate::sys::advanced_declarations::NDIlib_recv_kvm_send_mouse_position;
+    let _: Clipboard = crate::sys::advanced_declarations::NDIlib_recv_kvm_send_clipboard_contents;
+    let _: Touch = crate::sys::advanced_declarations::NDIlib_recv_kvm_send_touch_positions;
 };
 
 #[cfg(test)]

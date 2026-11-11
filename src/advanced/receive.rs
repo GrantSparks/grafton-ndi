@@ -1,6 +1,7 @@
 use super::{ffi, packets, AdvancedConfig, CompressedAudioFrame, CompressedVideoFrame};
 use crate::{
-    ndi_lib::*, AudioFrame, MetadataFrame, Receiver, ReceiverOptions, Result, VideoFrame, NDI,
+    advanced::ffi::native::*, AudioFrame, MetadataFrame, Receiver, ReceiverOptions, Result,
+    VideoFrame, NDI,
 };
 use std::{ffi::c_char, marker::PhantomData, rc::Rc, time::Duration};
 
@@ -73,7 +74,7 @@ impl PacketReceiver {
             *const c_char,
         ) -> NDIlib_recv_instance_t;
         #[cfg(ndi_has_advanced_header)]
-        let _: Create = crate::ndi_lib::raw::NDIlib_recv_create_v4;
+        let _: Create = crate::sys::advanced_declarations::NDIlib_recv_create_v4;
         let create: Create = unsafe { ffi::required(ndi, b"NDIlib_recv_create_v4\0")? };
         let mut raw = options.to_raw()?;
         raw.raw.color_format = preset as i32 as _;
@@ -96,8 +97,9 @@ impl PacketReceiver {
         let mut audio = NDIlib_audio_frame_v3_t::default();
         let mut metadata = NDIlib_metadata_frame_t::default();
         let instance = receiver.core.instance;
+        let sdk = receiver.core.sdk();
         let kind = unsafe {
-            NDIlib_recv_capture_v3(
+            sdk.NDIlib_recv_capture_v3(
                 instance,
                 &mut video,
                 &mut audio,
@@ -107,13 +109,17 @@ impl PacketReceiver {
         };
         match kind {
             NDIlib_frame_type_e_NDIlib_frame_type_video => {
-                struct Free(NDIlib_recv_instance_t, NDIlib_video_frame_v2_t);
+                struct Free(
+                    NDIlib_recv_instance_t,
+                    NDIlib_video_frame_v2_t,
+                    &'static crate::sys::Core,
+                );
                 impl Drop for Free {
                     fn drop(&mut self) {
-                        unsafe { NDIlib_recv_free_video_v2(self.0, &self.1) };
+                        unsafe { self.2.NDIlib_recv_free_video_v2(self.0, &self.1) };
                     }
                 }
-                let guard = Free(instance, video);
+                let guard = Free(instance, video, sdk);
                 Ok(PacketEvent::Video(
                     if super::VideoCodec::from_outer(ffi::video_fourcc_bits(guard.1.FourCC))
                         .is_some()
@@ -127,13 +133,17 @@ impl PacketReceiver {
                 ))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_audio => {
-                struct Free(NDIlib_recv_instance_t, NDIlib_audio_frame_v3_t);
+                struct Free(
+                    NDIlib_recv_instance_t,
+                    NDIlib_audio_frame_v3_t,
+                    &'static crate::sys::Core,
+                );
                 impl Drop for Free {
                     fn drop(&mut self) {
-                        unsafe { NDIlib_recv_free_audio_v3(self.0, &self.1) };
+                        unsafe { self.2.NDIlib_recv_free_audio_v3(self.0, &self.1) };
                     }
                 }
-                let guard = Free(instance, audio);
+                let guard = Free(instance, audio, sdk);
                 Ok(PacketEvent::Audio(
                     if guard.1.FourCC == NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP {
                         ReceivedAudio::Decoded(unsafe {
@@ -149,13 +159,17 @@ impl PacketReceiver {
                 ))
             }
             NDIlib_frame_type_e_NDIlib_frame_type_metadata => {
-                struct Free(NDIlib_recv_instance_t, NDIlib_metadata_frame_t);
+                struct Free(
+                    NDIlib_recv_instance_t,
+                    NDIlib_metadata_frame_t,
+                    &'static crate::sys::Core,
+                );
                 impl Drop for Free {
                     fn drop(&mut self) {
-                        unsafe { NDIlib_recv_free_metadata(self.0, &self.1) };
+                        unsafe { self.2.NDIlib_recv_free_metadata(self.0, &self.1) };
                     }
                 }
-                let guard = Free(instance, metadata);
+                let guard = Free(instance, metadata, sdk);
                 Ok(PacketEvent::Metadata(unsafe {
                     MetadataFrame::from_raw_validated(
                         &guard.1,

@@ -80,9 +80,10 @@ fn scoped_reads(planes: VideoPlanes<'_>) {
 }
 
 #[test]
-#[ignore = "Requires NDI runtime and loopback networking; run alone"]
 fn live_receiver_framesync_and_owned_send_skip_padding() {
-    let ndi = NDI::new().unwrap();
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
     let sender = Sender::new(
         &ndi,
         &SenderOptions::builder("video padding regression")

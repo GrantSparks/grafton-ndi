@@ -1,14 +1,17 @@
-// Exercise target/artifact contracts without an installed SDK or native runtime.
+// Exercise SDK discovery and static-archive contracts without an installed SDK
+// or native runtime.
 #[path = "../build_apple.rs"]
 mod build_apple;
 #[path = "../build_support.rs"]
 mod build_support;
-use build_support::{resolve_installation, SelectionOptions};
+use build_support::{directory, Edition};
 use std::{
+    collections::{BTreeSet, HashSet},
     fs,
     path::{Path, PathBuf},
 };
 
+/// A synthetic SDK installation in a private temporary directory.
 struct Sdk(PathBuf);
 impl Sdk {
     fn new(name: &str) -> Self {
@@ -27,6 +30,9 @@ impl Sdk {
     fn root(&self) -> &Path {
         &self.0
     }
+    fn located(&self) -> build_support::Sdk {
+        build_support::Sdk::open(self.root()).unwrap()
+    }
 }
 impl Drop for Sdk {
     fn drop(&mut self) {
@@ -35,201 +41,237 @@ impl Drop for Sdk {
 }
 
 #[test]
-fn android_windows_host_casing_and_advanced_names_are_resolved() {
-    let sdk = Sdk::new("android-casing");
-    sdk.artifact("Lib/arm64-v8a/libndi_advanced.so");
-    let i = resolve_installation(
-        sdk.root(),
-        "android",
-        "aarch64",
-        "aarch64-linux-android",
-        SelectionOptions::default(),
+fn an_sdk_is_optional_but_an_explicit_root_must_be_one() {
+    // No default installation exists for this operating system.
+    assert_eq!(build_support::Sdk::locate(None, "freebsd"), Ok(None));
+    assert!(build_support::default_sdk_roots("freebsd").is_empty());
+    for os in ["linux", "macos", "windows"] {
+        assert!(!build_support::default_sdk_roots(os).is_empty(), "{os}");
+    }
+
+    let sdk = Sdk::new("locate");
+    let located = build_support::Sdk::locate(Some(sdk.root()), "linux")
+        .unwrap()
+        .unwrap();
+    assert_eq!(located.root, sdk.root());
+    assert_eq!(located.include_dir, sdk.root().join("Include"));
+
+    let not_an_sdk = sdk.root().join("Include");
+    let error = build_support::Sdk::locate(Some(&not_an_sdk), "linux").unwrap_err();
+    assert!(error.contains("NDI_SDK_DIR"), "{error}");
+    fs::remove_file(sdk.root().join("Include/Processing.NDI.Lib.h")).unwrap();
+    assert!(build_support::Sdk::locate(Some(sdk.root()), "linux").is_err());
+}
+
+#[test]
+fn default_edition_follows_the_request_then_the_installation() {
+    assert_eq!(Edition::parse("standard"), Ok(Edition::Standard));
+    assert_eq!(Edition::parse("advanced"), Ok(Edition::Advanced));
+    for invalid in ["", "auto", "Advanced", "standard "] {
+        assert!(Edition::parse(invalid).is_err(), "{invalid:?}");
+    }
+    assert_eq!(Edition::Standard.as_str(), "standard");
+    assert_eq!(Edition::Advanced.as_str(), "advanced");
+
+    assert_eq!(
+        build_support::default_edition(None, None),
+        Edition::Standard
+    );
+    assert_eq!(
+        build_support::default_edition(Some(Edition::Advanced), None),
+        Edition::Advanced
+    );
+
+    let sdk = Sdk::new("edition");
+    let standard = sdk.located();
+    assert!(!standard.is_advanced());
+    assert_eq!(
+        build_support::default_edition(None, Some(&standard)),
+        Edition::Standard
+    );
+    sdk.artifact("Include/Processing.NDI.Advanced.h");
+    let advanced = sdk.located();
+    assert!(advanced.is_advanced());
+    assert_eq!(
+        build_support::default_edition(None, Some(&advanced)),
+        Edition::Advanced
+    );
+    assert_eq!(
+        build_support::default_edition(Some(Edition::Standard), Some(&advanced)),
+        Edition::Standard
+    );
+}
+
+#[cfg(feature = "advanced")]
+#[test]
+fn only_headers_without_the_mit_grant_are_generated_locally() {
+    let sdk = Sdk::new("restricted");
+    fs::write(
+        sdk.root().join("Include/Processing.NDI.Lib.h"),
+        "// Permission is hereby granted, free of charge, to any person\n",
     )
     .unwrap();
-    assert_eq!(i.edition, "advanced");
-    assert_eq!(i.library_name, "libndi_advanced.so");
-    assert_eq!(i.include_dir, sdk.root().join("Include"));
-    assert_eq!(i.linkage, "dynamic");
-    assert_eq!(i.profile, "android-arm64");
+    fs::write(
+        sdk.root().join("Include/Processing.NDI.Advanced.h"),
+        "// This file is part of the NDI Advanced SDK and may not be distributed.\n",
+    )
+    .unwrap();
+    sdk.artifact("Include/notes.txt");
+    assert_eq!(
+        sdk.located().restricted_headers().unwrap(),
+        ["Processing.NDI.Advanced.h"]
+    );
 }
 
 #[test]
-fn windows_and_macos_advanced_are_real_modules_not_renamed_standard() {
-    for (name, os, arch, target, relative, runtime) in [
-        (
-            "winadv",
-            "windows",
-            "x86_64",
-            "x86_64-pc-windows-msvc",
-            "Lib/x64/Processing.NDI.Lib.Advanced.x64.lib",
-            "Processing.NDI.Lib.Advanced.x64.dll",
-        ),
-        (
-            "macadv",
-            "macos",
-            "aarch64",
-            "aarch64-apple-darwin",
-            "lib/macOS/libndi_advanced.dylib",
-            "libndi_advanced.dylib",
-        ),
-    ] {
-        let sdk = Sdk::new(name);
-        sdk.artifact(relative);
-        let i = resolve_installation(sdk.root(), os, arch, target, SelectionOptions::default())
-            .unwrap();
-        assert_eq!(i.library_name, runtime);
-        assert_eq!(i.edition, "advanced");
-        assert_eq!(i.linkage, "dynamic");
-        assert!(resolve_installation(
-            sdk.root(),
-            os,
-            arch,
-            target,
-            SelectionOptions {
-                edition: Some("standard"),
-                ..Default::default()
-            }
-        )
-        .is_err());
+fn only_apple_mobile_targets_link_statically() {
+    for os in ["ios", "tvos", "visionos"] {
+        assert!(build_support::links_statically(os), "{os}");
     }
-}
-
-#[test]
-fn embedded_profile_cannot_be_guessed_or_cross_float_libc_boundaries() {
-    let sdk = Sdk::new("explicit-profile");
-    sdk.artifact("lib/arm-himix100-linux/libndi_advanced.so");
-    let target = "armv7-unknown-linux-uclibceabi";
-    assert!(resolve_installation(
-        sdk.root(),
-        "linux",
-        "arm",
-        target,
-        SelectionOptions::default()
-    )
-    .is_err());
-    let options = SelectionOptions {
-        profile: Some("arm-himix100-linux"),
-        ..Default::default()
-    };
-    let i = resolve_installation(sdk.root(), "linux", "arm", target, options).unwrap();
-    assert_eq!(i.profile, "arm-himix100-linux");
-    for wrong in [
-        "armv7-unknown-linux-gnueabihf",
-        "armv7-unknown-linux-gnueabi",
-        "armeb-unknown-linux-gnueabi",
-    ] {
-        assert!(
-            resolve_installation(sdk.root(), "linux", "arm", wrong, options)
-                .unwrap_err()
-                .contains("requires")
-        );
+    for os in ["linux", "android", "macos", "windows"] {
+        assert!(!build_support::links_statically(os), "{os}");
     }
-    assert!(resolve_installation(
-        sdk.root(),
-        "linux",
-        "arm",
-        target,
-        SelectionOptions {
-            edition: Some("standard"),
-            ..options
-        }
-    )
-    .is_err());
 }
 
 #[test]
 fn mobile_file_is_the_sole_archive_provider_and_old_sdk_remains_usable() {
     let sdk = Sdk::new("mobile-file");
-    sdk.artifact("lib/iOS/libndi_ios.a");
-    let options = SelectionOptions {
-        file_io: true,
-        ..Default::default()
-    };
-    let core =
-        resolve_installation(sdk.root(), "ios", "aarch64", "aarch64-apple-ios", options).unwrap();
-    assert_eq!(core.static_provider, "core");
-    assert_eq!(core.link_name, "ndi_ios");
+    let core = sdk.artifact("lib/iOS/libndi_ios.a");
+    let selected = build_support::static_library(&sdk.located(), "ios", None, true).unwrap();
+    assert_eq!(selected.archive, core);
+    assert_eq!(selected.link_name, "ndi_ios");
+    assert_eq!(selected.edition, Edition::Standard);
+    assert!(!selected.provides_file_api);
+
     let file = sdk.artifact("lib/iOS/libndifile_ios.a");
-    let i =
-        resolve_installation(sdk.root(), "ios", "aarch64", "aarch64-apple-ios", options).unwrap();
-    assert_eq!(i.static_provider, "file");
-    assert_eq!(i.link_artifact, file);
-    assert_eq!(i.link_name, "ndifile_ios");
-    assert_eq!(i.linkage, "static");
-    assert!(i.library_name.is_empty());
-    assert!(resolve_installation(
-        sdk.root(),
-        "ios",
-        "aarch64",
-        "aarch64-apple-ios-sim",
-        options
-    )
-    .is_err());
-    assert!(build_support::library_subdirs("visionos", "x86_64", "x86_64-apple-visionos").is_err());
+    let selected = build_support::static_library(&sdk.located(), "ios", None, true).unwrap();
+    assert_eq!(selected.archive, file);
+    assert_eq!(selected.link_name, "ndifile_ios");
+    assert!(selected.provides_file_api);
+    // Without the feature the File archive is never linked.
+    let selected = build_support::static_library(&sdk.located(), "ios", None, false).unwrap();
+    assert_eq!(selected.archive, core);
+
+    assert!(build_support::static_library(&sdk.located(), "tvos", None, true).is_err());
+    assert!(build_support::static_library(&sdk.located(), "linux", None, true).is_err());
 }
 
 #[test]
-fn manifest_is_unique_and_cannot_select_another_edition_silently() {
-    let profiles: Vec<_> = build_support::profiles().collect();
-    let ids: std::collections::HashSet<_> = profiles.iter().map(|p| p.id).collect();
-    assert_eq!(profiles.len(), ids.len());
-    assert_eq!(profiles.iter().filter(|p| p.os == "linux").count(), 26);
-    assert!(profiles
-        .iter()
-        .all(|p| !p.target.contains("musl") && !p.target.contains("aarch64_be")));
-    let sdk = Sdk::new("edition");
-    sdk.artifact("lib/x86_64-linux-gnu/libndi.so");
-    sdk.artifact("lib/x86_64-linux-gnu/libndi_advanced.so");
-    let i = resolve_installation(
-        sdk.root(),
-        "linux",
-        "x86_64",
-        "x86_64-unknown-linux-gnu",
-        SelectionOptions {
-            edition: Some("standard"),
-            ..Default::default()
-        },
+fn static_archives_prefer_advanced_unless_an_edition_is_requested() {
+    let sdk = Sdk::new("mobile-edition");
+    let standard = sdk.artifact("lib/tvOS/libndi_tvos.a");
+    let advanced = sdk.artifact("lib/tvOS/libndi_advanced_tvos.a");
+    let located = sdk.located();
+    let selected = build_support::static_library(&located, "tvos", None, false).unwrap();
+    assert_eq!(
+        (selected.archive, selected.edition),
+        (advanced, Edition::Advanced)
+    );
+    let selected =
+        build_support::static_library(&located, "tvos", Some(Edition::Standard), false).unwrap();
+    assert_eq!(
+        (selected.archive, selected.edition),
+        (standard, Edition::Standard)
+    );
+    fs::remove_file(sdk.root().join("lib/tvOS/libndi_advanced_tvos.a")).unwrap();
+    let error = build_support::static_library(&located, "tvos", Some(Edition::Advanced), false)
+        .unwrap_err();
+    assert!(error.contains("NDI_SDK_DIR"), "{error}");
+}
+
+#[test]
+fn declaration_scan_agrees_with_a_full_parse_of_the_vendored_declarations() {
+    let bindings = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/sys/declarations.rs"
+    ))
+    .unwrap();
+    let mut parsed = BTreeSet::new();
+    for item in syn::parse_file(&bindings).unwrap().items {
+        let syn::Item::ForeignMod(block) = item else {
+            continue;
+        };
+        for item in block.items {
+            if let syn::ForeignItem::Fn(function) = item {
+                parsed.insert(function.sig.ident.to_string());
+            }
+        }
+    }
+    assert!(parsed.contains("NDIlib_initialize"));
+    let scanned: BTreeSet<String> = build_support::declared_functions(&bindings)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(scanned, parsed);
+}
+
+#[test]
+fn static_map_requires_both_a_declaration_and_an_actual_archive_export() {
+    let common = "unsafe extern \"C\" {\n    pub fn NDIlib_initialize() -> bool;\n}\nunsafe extern \"C\" {\n    pub fn NDIlib_optional(\n        value: i32,\n    );\n}\n";
+    let advanced = "unsafe extern \"C\" {\n    pub fn NDIlib_advanced();\n}\n";
+    let declarations = [("crate::a", common), ("crate::b", advanced)];
+    let exports = |names: &[&str]| -> HashSet<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    };
+
+    let map = build_support::static_symbol_map(
+        &declarations,
+        &exports(&[
+            "NDIlib_initialize",
+            "NDIlib_advanced",
+            "NDIlib_not_declared",
+        ]),
     )
     .unwrap();
-    assert_eq!(i.edition, "standard");
-    assert_eq!(i.library_name, "libndi.so.6");
-    assert!(resolve_installation(
-        sdk.root(),
-        "linux",
-        "x86_64",
-        "x86_64-unknown-linux-gnu",
-        SelectionOptions {
-            edition: Some("typo"),
-            ..Default::default()
-        }
-    )
-    .is_err());
+    assert!(map.contains("b\"NDIlib_initialize\" => Some(crate::a::NDIlib_initialize as"));
+    assert!(map.contains("b\"NDIlib_advanced\" => Some(crate::b::NDIlib_advanced as"));
+    assert!(!map.contains("NDIlib_optional"));
+    assert!(!map.contains("NDIlib_not_declared"));
+
+    let error = build_support::static_symbol_map(&declarations, &exports(&["NDIlib_advanced"]))
+        .unwrap_err();
+    assert!(error.contains("NDIlib_initialize"), "{error}");
 }
 
 #[test]
-fn elf_validation_rejects_wrong_endian_class_and_arm_float_abi() {
-    let sdk = Sdk::new("elf-abi");
-    let p = sdk.artifact("lib/test.so");
-    let mut elf = [0u8; 52];
-    elf[..4].copy_from_slice(b"\x7fELF");
-    elf[4] = 1;
-    elf[5] = 1;
-    elf[18] = 40;
-    elf[36..40].copy_from_slice(&0x0500_0400u32.to_le_bytes());
-    fs::write(&p, elf).unwrap();
-    assert!(
-        build_support::validate_elf(&p, "linux", "arm", "armv7-unknown-linux-gnueabihf").is_ok()
+fn directory_preserves_actual_entry_spelling_on_every_host() {
+    let sdk = Sdk::new("directory-spelling");
+    for (index, name) in ["Include", "iNcLuDe", "include"].iter().enumerate() {
+        let root = sdk.root().join(index.to_string());
+        let actual = root.join(name);
+        fs::create_dir_all(&actual).unwrap();
+        assert_eq!(directory(&root, "include", "Include").unwrap(), actual);
+    }
+    assert!(directory(&sdk.root().join("0"), "lib", "Lib")
+        .unwrap_err()
+        .contains("SDK directory missing"));
+}
+
+#[test]
+fn directory_rejects_distinct_matching_aliases() {
+    let sdk = Sdk::new("directory-ambiguity");
+    // Different alias names let every filesystem represent two distinct
+    // candidates, including hosts that cannot create both lib and Lib.
+    fs::create_dir_all(sdk.root().join("lib")).unwrap();
+    fs::create_dir_all(sdk.root().join("Libraries")).unwrap();
+    assert!(directory(sdk.root(), "lib", "Libraries")
+        .unwrap_err()
+        .contains("Ambiguous SDK layout"));
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_accepts_same_target_aliases_with_declared_preference() {
+    let sdk = Sdk::new("directory-alias");
+    fs::create_dir_all(sdk.root().join("Libraries")).unwrap();
+    std::os::unix::fs::symlink("Libraries", sdk.root().join("lib")).unwrap();
+    assert_eq!(
+        directory(sdk.root(), "lib", "Libraries").unwrap(),
+        sdk.root().join("lib")
     );
-    assert!(
-        build_support::validate_elf(&p, "linux", "arm", "armv7-unknown-linux-gnueabi").is_err()
-    );
-    assert!(
-        build_support::validate_elf(&p, "linux", "aarch64", "aarch64-unknown-linux-gnu").is_err()
-    );
-    elf[5] = 2;
-    fs::write(&p, elf).unwrap();
-    assert!(
-        build_support::validate_elf(&p, "linux", "arm", "armv7-unknown-linux-gnueabihf").is_err()
+    assert_eq!(
+        directory(sdk.root(), "Libraries", "lib").unwrap(),
+        sdk.root().join("Libraries")
     );
 }
 

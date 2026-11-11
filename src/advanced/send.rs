@@ -4,7 +4,7 @@ use super::{
     ffi, AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedVideoFrame, QualityPlan,
     StreamTier, VideoPacketFormat, MAX_PACKET_BYTES,
 };
-use crate::{ndi_lib::*, Result, Sender, SenderOptions, Tally, NDI};
+use crate::{advanced::ffi::native::*, Result, Sender, SenderOptions, Tally, NDI};
 use std::{ffi::CString, ptr, time::Duration};
 
 const ENVELOPE_BYTES: usize = 44;
@@ -381,15 +381,15 @@ type ScatterAudio = unsafe extern "C" fn(
 #[cfg(ndi_has_advanced_header)]
 mod abi_signatures {
     use super::*;
-    use crate::ndi_lib::raw;
+    use crate::sys::{advanced_declarations as advanced, declarations as common};
     // Anonymous unused constants check the exact generated signatures while
     // preserving optional runtime resolution (no emitted linker references).
-    const _: SendVideo = raw::NDIlib_send_send_video_v2;
-    const _: SendVideo = raw::NDIlib_send_send_video_async_v2;
-    const _: SendAudio = raw::NDIlib_send_send_audio_v3;
-    const _: ScatterVideo = raw::NDIlib_send_send_video_scatter;
-    const _: ScatterVideo = raw::NDIlib_send_send_video_scatter_async;
-    const _: ScatterAudio = raw::NDIlib_send_send_audio_scatter;
+    const _: SendVideo = common::NDIlib_send_send_video_v2;
+    const _: SendVideo = common::NDIlib_send_send_video_async_v2;
+    const _: SendAudio = common::NDIlib_send_send_audio_v3;
+    const _: ScatterVideo = advanced::NDIlib_send_send_video_scatter;
+    const _: ScatterVideo = advanced::NDIlib_send_send_video_scatter_async;
+    const _: ScatterAudio = advanced::NDIlib_send_send_audio_scatter;
 }
 
 /// Exclusive sender for compressed packets. Program and preview retain separate

@@ -1,5 +1,5 @@
 use super::ffi::{self, invalid};
-use crate::{ndi_lib::*, Result, ScanType};
+use crate::{advanced::ffi::native::*, Result, ScanType};
 use std::ffi::CString;
 
 /// Maximum compressed frame bytes accepted by the default packet constructors.
@@ -624,7 +624,7 @@ pub(crate) unsafe fn copy_audio_packet(
 
 #[cfg(ndi_has_advanced_header)]
 const _: () = {
-    use crate::ndi_lib::raw::NDIlib_compressed_packet_t as Packet;
+    use crate::advanced::ffi::native::NDIlib_compressed_packet_t as Packet;
     assert!(std::mem::size_of::<Packet>() == HEADER_BYTES);
     assert!(std::mem::offset_of!(Packet, version) == 0);
     assert!(std::mem::offset_of!(Packet, fourCC) == 4);

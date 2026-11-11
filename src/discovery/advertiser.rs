@@ -1,35 +1,10 @@
 use crate::{
-    dispatch::require_optional,
     receiver::{ReceiverCore, ReceiverMode},
     sender::SenderResource,
+    sys::{self, bindings::*},
     Error, Receiver, Result, Sender, NDI,
 };
-use std::{
-    cell::RefCell,
-    collections::BTreeMap,
-    ffi::{c_char, c_void, CString},
-    ptr,
-    rc::Rc,
-    sync::Arc,
-};
-
-type Instance = *mut c_void;
-#[repr(C)]
-struct Create {
-    url: *const c_char,
-}
-type New = unsafe extern "C" fn(*const Create) -> Instance;
-type Destroy = unsafe extern "C" fn(Instance);
-type SendAdd = unsafe extern "C" fn(Instance, crate::ndi_lib::NDIlib_send_instance_t, bool) -> bool;
-type RecvAdd = unsafe extern "C" fn(
-    Instance,
-    crate::ndi_lib::NDIlib_recv_instance_t,
-    bool,
-    bool,
-    *const c_char,
-) -> bool;
-type SendDel = unsafe extern "C" fn(Instance, crate::ndi_lib::NDIlib_send_instance_t) -> bool;
-type RecvDel = unsafe extern "C" fn(Instance, crate::ndi_lib::NDIlib_recv_instance_t) -> bool;
+use std::{cell::RefCell, collections::BTreeMap, ffi::CString, ptr, rc::Rc, sync::Arc};
 
 /// Discovery Server endpoints. Comma-separated redundancy lists are accepted.
 #[derive(Debug, Clone, Default)]
@@ -81,10 +56,8 @@ impl RecvAdvertisement {
 }
 
 struct SendCore {
-    instance: Instance,
-    destroy: Destroy,
-    add: SendAdd,
-    del: SendDel,
+    instance: NDIlib_send_advertiser_instance_t,
+    table: &'static sys::SenderAdvertising,
     entries: BTreeMap<u64, Arc<SenderResource>>,
     next: u64,
     _url: Option<CString>,
@@ -96,10 +69,8 @@ struct RecvEntry {
     _input: Option<CString>,
 }
 struct RecvCore {
-    instance: Instance,
-    destroy: Destroy,
-    add: RecvAdd,
-    del: RecvDel,
+    instance: NDIlib_recv_advertiser_instance_t,
+    table: &'static sys::ReceiverAdvertising,
     entries: BTreeMap<u64, RecvEntry>,
     next: u64,
     _url: Option<CString>,
@@ -110,7 +81,11 @@ impl SendCore {
     fn remove(&mut self, id: u64) -> bool {
         if let Some(owner) = self.entries.remove(&id) {
             // False means already absent, not an unconfirmed removal.
-            unsafe { (self.del)(self.instance, owner.instance) }
+            // SAFETY: the advertiser and the retained sender are both live.
+            unsafe {
+                self.table
+                    .NDIlib_send_advertiser_del_sender(self.instance, owner.instance)
+            }
         } else {
             false
         }
@@ -119,7 +94,11 @@ impl SendCore {
 impl RecvCore {
     fn remove(&mut self, id: u64) -> bool {
         if let Some(owner) = self.entries.remove(&id) {
-            unsafe { (self.del)(self.instance, owner.resource.instance) }
+            // SAFETY: the advertiser and the retained receiver are both live.
+            unsafe {
+                self.table
+                    .NDIlib_recv_advertiser_del_receiver(self.instance, owner.resource.instance)
+            }
         } else {
             false
         }
@@ -127,12 +106,14 @@ impl RecvCore {
 }
 impl Drop for SendCore {
     fn drop(&mut self) {
-        unsafe { (self.destroy)(self.instance) };
+        // SAFETY: this core is the advertiser's only owner.
+        unsafe { self.table.NDIlib_send_advertiser_destroy(self.instance) };
     }
 }
 impl Drop for RecvCore {
     fn drop(&mut self) {
-        unsafe { (self.destroy)(self.instance) };
+        // SAFETY: this core is the advertiser's only owner.
+        unsafe { self.table.NDIlib_recv_advertiser_destroy(self.instance) };
     }
 }
 
@@ -203,49 +184,47 @@ impl SendAdvertiser {
         Self::create(ndi, options, Some(CString::new(config.expose_json())?))
     }
     fn create(ndi: &NDI, options: &AdvertiserOptions, config: Option<CString>) -> Result<Self> {
+        let table = ndi.api().sender_advertising.require("sender advertising")?;
         let url = options.servers.as_deref().map(CString::new).transpose()?;
-        unsafe {
-            let create: New =
-                require_optional(b"NDIlib_send_advertiser_create\0", "sender advertising")?;
-            let destroy =
-                require_optional(b"NDIlib_send_advertiser_destroy\0", "sender advertising")?;
-            let add =
-                require_optional(b"NDIlib_send_advertiser_add_sender\0", "sender advertising")?;
-            let del =
-                require_optional(b"NDIlib_send_advertiser_del_sender\0", "sender advertising")?;
-            let raw = Create {
-                url: url.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
+        let raw = NDIlib_send_advertiser_create_t {
+            p_url_address: url.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
+        };
+        #[cfg(feature = "advanced")]
+        let instance = if let Some(config) = &config {
+            type Configured = unsafe extern "C" fn(
+                *const NDIlib_send_advertiser_create_t,
+                *const std::ffi::c_char,
+            )
+                -> NDIlib_send_advertiser_instance_t;
+            // SAFETY: `Configured` is the SDK's signature for this function.
+            let configured: Configured = unsafe {
+                crate::advanced::ffi::required(ndi, b"NDIlib_send_advertiser_create_ex\0")?
             };
-            #[cfg(feature = "advanced")]
-            let instance = if let Some(config) = &config {
-                type Configured = unsafe extern "C" fn(*const Create, *const c_char) -> Instance;
-                let configured: Configured =
-                    crate::advanced::ffi::required(ndi, b"NDIlib_send_advertiser_create_ex\0")?;
-                configured(&raw, config.as_ptr())
-            } else {
-                create(&raw)
-            };
-            #[cfg(not(feature = "advanced"))]
-            let instance = create(&raw);
-            if instance.is_null() {
-                return Err(Error::InitializationFailed(
-                    "sender advertiser creation failed".into(),
-                ));
-            }
-            Ok(Self {
-                core: Rc::new(RefCell::new(SendCore {
-                    instance,
-                    destroy,
-                    add,
-                    del,
-                    entries: BTreeMap::new(),
-                    next: 1,
-                    _url: url,
-                    _config: config,
-                    _ndi: ndi.clone(),
-                })),
-            })
+            // SAFETY: `raw` and `config` borrow C strings that outlive the call.
+            unsafe { configured(&raw, config.as_ptr()) }
+        } else {
+            // SAFETY: `raw` borrows a C string that outlives the call.
+            unsafe { table.NDIlib_send_advertiser_create(&raw) }
+        };
+        // SAFETY: `raw` borrows a C string that outlives the call.
+        #[cfg(not(feature = "advanced"))]
+        let instance = unsafe { table.NDIlib_send_advertiser_create(&raw) };
+        if instance.is_null() {
+            return Err(Error::InitializationFailed(
+                "sender advertiser creation failed".into(),
+            ));
         }
+        Ok(Self {
+            core: Rc::new(RefCell::new(SendCore {
+                instance,
+                table,
+                entries: BTreeMap::new(),
+                next: 1,
+                _url: url,
+                _config: config,
+                _ndi: ndi.clone(),
+            })),
+        })
     }
     /// Register without borrowing the Sender for the registration lifetime.
     /// Owned async sending remains available while monitoring is registered.
@@ -269,7 +248,15 @@ impl SendAdvertiser {
         core.next = id.checked_add(1).ok_or_else(|| {
             Error::InvalidConfiguration("advertisement identifiers exhausted".into())
         })?;
-        if !unsafe { (core.add)(core.instance, owner.instance, options.monitoring) } {
+        // SAFETY: the advertiser is live and `owner` keeps the sender alive for
+        // as long as the registration exists.
+        if !unsafe {
+            core.table.NDIlib_send_advertiser_add_sender(
+                core.instance,
+                owner.instance,
+                options.monitoring,
+            )
+        } {
             return Err(Error::NativeOperationFailed {
                 operation: "register sender",
             });
@@ -296,53 +283,50 @@ impl RecvAdvertiser {
         Self::create(ndi, options, Some(CString::new(config.expose_json())?))
     }
     fn create(ndi: &NDI, options: &AdvertiserOptions, config: Option<CString>) -> Result<Self> {
+        let table = ndi
+            .api()
+            .receiver_advertising
+            .require("receiver advertising")?;
         let url = options.servers.as_deref().map(CString::new).transpose()?;
-        unsafe {
-            let create: New =
-                require_optional(b"NDIlib_recv_advertiser_create\0", "receiver advertising")?;
-            let destroy =
-                require_optional(b"NDIlib_recv_advertiser_destroy\0", "receiver advertising")?;
-            let add = require_optional(
-                b"NDIlib_recv_advertiser_add_receiver\0",
-                "receiver advertising",
-            )?;
-            let del = require_optional(
-                b"NDIlib_recv_advertiser_del_receiver\0",
-                "receiver advertising",
-            )?;
-            let raw = Create {
-                url: url.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
+        let raw = NDIlib_recv_advertiser_create_t {
+            p_url_address: url.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
+        };
+        #[cfg(feature = "advanced")]
+        let instance = if let Some(config) = &config {
+            type Configured = unsafe extern "C" fn(
+                *const NDIlib_recv_advertiser_create_t,
+                *const std::ffi::c_char,
+            )
+                -> NDIlib_recv_advertiser_instance_t;
+            // SAFETY: `Configured` is the SDK's signature for this function.
+            let configured: Configured = unsafe {
+                crate::advanced::ffi::required(ndi, b"NDIlib_recv_advertiser_create_ex\0")?
             };
-            #[cfg(feature = "advanced")]
-            let instance = if let Some(config) = &config {
-                type Configured = unsafe extern "C" fn(*const Create, *const c_char) -> Instance;
-                let configured: Configured =
-                    crate::advanced::ffi::required(ndi, b"NDIlib_recv_advertiser_create_ex\0")?;
-                configured(&raw, config.as_ptr())
-            } else {
-                create(&raw)
-            };
-            #[cfg(not(feature = "advanced"))]
-            let instance = create(&raw);
-            if instance.is_null() {
-                return Err(Error::InitializationFailed(
-                    "receiver advertiser creation failed".into(),
-                ));
-            }
-            Ok(Self {
-                core: Rc::new(RefCell::new(RecvCore {
-                    instance,
-                    destroy,
-                    add,
-                    del,
-                    entries: BTreeMap::new(),
-                    next: 1,
-                    _url: url,
-                    _config: config,
-                    _ndi: ndi.clone(),
-                })),
-            })
+            // SAFETY: `raw` and `config` borrow C strings that outlive the call.
+            unsafe { configured(&raw, config.as_ptr()) }
+        } else {
+            // SAFETY: `raw` borrows a C string that outlives the call.
+            unsafe { table.NDIlib_recv_advertiser_create(&raw) }
+        };
+        // SAFETY: `raw` borrows a C string that outlives the call.
+        #[cfg(not(feature = "advanced"))]
+        let instance = unsafe { table.NDIlib_recv_advertiser_create(&raw) };
+        if instance.is_null() {
+            return Err(Error::InitializationFailed(
+                "receiver advertiser creation failed".into(),
+            ));
         }
+        Ok(Self {
+            core: Rc::new(RefCell::new(RecvCore {
+                instance,
+                table,
+                entries: BTreeMap::new(),
+                next: 1,
+                _url: url,
+                _config: config,
+                _ndi: ndi.clone(),
+            })),
+        })
     }
     /// Register a receiver in any mode. This exposes no raw capture capability.
     pub fn register<M: ReceiverMode>(
@@ -370,8 +354,10 @@ impl RecvAdvertiser {
         core.next = id.checked_add(1).ok_or_else(|| {
             Error::InvalidConfiguration("advertisement identifiers exhausted".into())
         })?;
+        // SAFETY: the advertiser is live, `resource` keeps the receiver alive
+        // for as long as the registration exists, and `input` outlives the call.
         if !unsafe {
-            (core.add)(
+            core.table.NDIlib_recv_advertiser_add_receiver(
                 core.instance,
                 resource.instance,
                 options.controlling,
@@ -396,7 +382,3 @@ impl RecvAdvertiser {
         })
     }
 }
-
-#[cfg(all(test, ndi_has_discovery_header))]
-#[path = "advertiser_abi_tests.rs"]
-mod sdk_abi_tests;

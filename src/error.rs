@@ -16,7 +16,11 @@ use std::{ffi::NulError, io, time::Duration};
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// The selected native module could not be loaded or lacks required baseline functions.
+    /// No usable NDI runtime library could be loaded.
+    ///
+    /// The message names every location tried and why each was rejected: the
+    /// file was absent, the operating system could not load it, or it lacks a
+    /// required entry point. Loading is retryable.
     #[error("Failed to load the NDI runtime: {0}")]
     RuntimeLoadFailed(String),
 
@@ -29,7 +33,9 @@ pub enum Error {
         reason: String,
     },
 
-    /// A different native runtime has already been selected for this process.
+    /// The request cannot be met by the runtime already selected for this
+    /// process: it names a different library, or requires the Advanced SDK when
+    /// the selected runtime is not one.
     #[error("Conflicting NDI runtime selection: {0}")]
     RuntimeConflict(String),
 
@@ -52,8 +58,8 @@ pub enum Error {
     /// NDI runtime initialization failed.
     ///
     /// The SDK rejected initialization, a handle could not be created, or the
-    /// runtime handle reference count was exhausted. A missing shared library
-    /// can instead prevent the application from loading before Rust code runs.
+    /// runtime handle reference count was exhausted. A runtime library that
+    /// cannot be loaded is reported as [`Error::RuntimeLoadFailed`] instead.
     #[error("Failed to initialize the NDI runtime: {0}")]
     InitializationFailed(String),
 

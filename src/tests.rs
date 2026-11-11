@@ -5,8 +5,8 @@ use std::ptr;
 use crate::{
     error::Error,
     frames::{AudioFrame, VideoFrame},
-    ndi_lib::*,
     receiver::Tally,
+    sys::bindings::*,
 };
 
 fn create_test_video_frame(
@@ -1287,11 +1287,10 @@ mod runtime_tests {
     /// Test that concurrent cloning of NDI handles works correctly.
     /// This verifies the atomic refcount increment path.
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn test_concurrent_clone_does_not_panic() {
-        use crate::NDI;
-
-        let ndi = Arc::new(NDI::new().expect("core suite requires an available NDI runtime"));
+        let Some(ndi) = crate::test_support::ndi().map(Arc::new) else {
+            return;
+        };
 
         let clone_count = Arc::new(AtomicUsize::new(0));
         let mut handles = vec![];
@@ -1320,11 +1319,10 @@ mod runtime_tests {
     /// Test that concurrent drop of NDI handles works correctly.
     /// This verifies the atomic refcount decrement path.
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn test_concurrent_drop_does_not_panic() {
-        use crate::NDI;
-
-        let ndi = NDI::new().expect("core suite requires an available NDI runtime");
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
 
         let mut handles = vec![];
 
@@ -1349,9 +1347,14 @@ mod runtime_tests {
     /// This verifies that the lock-free implementation handles interleaved
     /// operations from multiple threads.
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn test_mixed_acquire_release_concurrent() {
         use crate::NDI;
+
+        // Establish that a runtime exists; the threads below then exercise
+        // their own acquisitions, including first initialization.
+        if crate::test_support::ndi().is_none() {
+            return;
+        }
 
         let success_count = Arc::new(AtomicUsize::new(0));
         let mut handles = vec![];
@@ -1379,11 +1382,12 @@ mod runtime_tests {
 
     /// Test that is_running is consistent with actual runtime state.
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn test_is_running_consistency() {
         use crate::NDI;
 
-        let ndi = NDI::new().expect("core suite requires an available NDI runtime");
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         // With an active handle, is_running should be true
         assert!(NDI::is_running());
 

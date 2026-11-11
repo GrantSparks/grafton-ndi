@@ -33,9 +33,10 @@ fn wait_for_channels(fs: &FrameSync, channels: i32) -> i32 {
 }
 
 #[test]
-#[ignore = "Requires NDI runtime and loopback networking; run alone"]
 fn queried_channels_remain_fixed_when_source_format_changes() {
-    let ndi = NDI::new().unwrap();
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
     eprintln!(
         "SDK: {} on {}",
         NDI::version().unwrap(),

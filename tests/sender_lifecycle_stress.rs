@@ -1,10 +1,14 @@
 //! Owned async send lifecycle stress. The default path has no SDK callback.
-use grafton_ndi::{Sender, SenderOptions, VideoFrame, NDI};
+mod common;
+
+use grafton_ndi::{Sender, SenderOptions, VideoFrame};
 
 #[test]
-#[ignore = "Slow stress test requiring an installed NDI runtime"]
+#[ignore = "slow stress test; run explicitly"]
 fn rapid_owned_sender_lifecycle() -> Result<(), grafton_ndi::Error> {
-    let ndi = NDI::new()?;
+    let Some(ndi) = common::ndi() else {
+        return Ok(());
+    };
     for iteration in 0..20 {
         let options = SenderOptions::builder(format!("owned lifecycle {iteration}"))
             .clock_video(false)

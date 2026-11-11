@@ -80,8 +80,8 @@ use crate::{
     frames::{
         validate_packed_audio_dimensions, AudioFrame, AudioRef, ScanType, VideoFrame, VideoRef,
     },
-    ndi_lib::*,
     receiver::{FrameSyncAttached, Receiver},
+    sys::bindings::*,
     Error, Result,
 };
 
@@ -243,7 +243,7 @@ impl Drop for FrameSyncResource {
     fn drop(&mut self) {
         // SAFETY: Creation checked for null; exclusive ownership and borrowed
         // guards prevent destruction while capture buffers remain live.
-        unsafe { NDIlib_framesync_destroy(self.instance) };
+        unsafe { self._ndi.api().core.NDIlib_framesync_destroy(self.instance) };
         #[cfg(test)]
         crate::receiver::lifecycle_test_events::record("framesync");
     }
@@ -276,8 +276,9 @@ impl FrameSync {
     pub fn new(receiver: Receiver) -> Result<Self> {
         // SAFETY: The owned receiver retains a live SDK resource through creation;
         // successful creation transfers both resources into the ordered owners.
+        let core = &receiver.core._ndi.api().core;
         Self::new_with(receiver, |instance| unsafe {
-            NDIlib_framesync_create(instance)
+            core.NDIlib_framesync_create(instance)
         })
     }
 
@@ -373,8 +374,14 @@ impl FrameSync {
     pub fn capture_video(&self, field_type: ScanType) -> Result<Option<FrameSyncVideoRef<'_>>> {
         let mut frame = NDIlib_video_frame_v2_t::default();
 
+        // SAFETY: the FrameSync instance is live for this borrow and `frame` is
+        // writable storage the SDK fills or leaves zeroed.
         unsafe {
-            NDIlib_framesync_capture_video(self.resource.instance, &mut frame, field_type.into());
+            self.core().NDIlib_framesync_capture_video(
+                self.resource.instance,
+                &mut frame,
+                field_type.into(),
+            );
         }
 
         // Per SDK docs: Returns zeroed struct if no video received yet
@@ -382,8 +389,13 @@ impl FrameSync {
             return Ok(None);
         }
 
-        let guard = unsafe { Guard::<FrameSyncVideoFree>::new(self.resource.instance, frame) };
-        let frame = unsafe { FrameSyncVideoRef::new(guard.with_runtime(&self.resource._ndi))? };
+        // SAFETY: the SDK filled `frame` for this instance, and the borrow of
+        // `self` keeps the FrameSync alive for as long as the guard exists.
+        let guard = unsafe {
+            Guard::<FrameSyncVideoFree>::new(&self.resource._ndi, self.resource.instance, frame)
+        };
+        // SAFETY: the guard owns a frame this capture just returned.
+        let frame = unsafe { FrameSyncVideoRef::new(guard)? };
 
         Ok(Some(frame))
     }
@@ -486,7 +498,7 @@ impl FrameSync {
         // race a format change here. The SDK owns the returned allocation until
         // Guard frees it through this same instance, including validation errors.
         unsafe {
-            NDIlib_framesync_capture_audio_v2(
+            self.core().NDIlib_framesync_capture_audio_v2(
                 self.resource.instance,
                 &mut frame,
                 request.sample_rate,
@@ -495,7 +507,11 @@ impl FrameSync {
             );
         }
 
-        let guard = unsafe { Guard::<FrameSyncAudioFree>::new(self.resource.instance, frame) };
+        // SAFETY: the SDK filled `frame` for this instance, and the borrow of
+        // `self` keeps the FrameSync alive for as long as the guard exists.
+        let guard = unsafe {
+            Guard::<FrameSyncAudioFree>::new(&self.resource._ndi, self.resource.instance, frame)
+        };
         unsafe { FrameSyncAudioRef::new(guard, request.samples == 0) }
     }
 
@@ -547,7 +563,16 @@ impl FrameSync {
     /// # }
     /// ```
     pub fn audio_queue_depth(&self) -> i32 {
-        unsafe { NDIlib_framesync_audio_queue_depth(self.resource.instance) }
+        // SAFETY: the FrameSync instance is live for this borrow.
+        unsafe {
+            self.core()
+                .NDIlib_framesync_audio_queue_depth(self.resource.instance)
+        }
+    }
+
+    /// The entry points of the runtime this FrameSync was created through.
+    fn core(&self) -> &'static crate::sys::Core {
+        &self.resource._ndi.api().core
     }
 }
 
@@ -623,12 +648,14 @@ mod tests {
     use std::ptr;
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn receiver_modes_preserve_resource_order_and_exactly_once_destruction() {
         use crate::receiver::lifecycle_test_events::track;
+        let Some(runtime) = crate::test_support::ndi() else {
+            return;
+        };
         for recover in [false, true] {
             let events = track(|| {
-                let ndi = crate::NDI::new().unwrap();
+                let ndi = runtime.clone();
                 let mut receiver = Receiver::new(&ndi, &crate::ReceiverOptions::default()).unwrap();
                 let original = receiver.core.instance;
                 drop(ndi);
@@ -661,7 +688,7 @@ mod tests {
             );
         }
         let events = track(|| {
-            let ndi = crate::NDI::new().unwrap();
+            let ndi = runtime.clone();
             let receiver = Receiver::new(&ndi, &crate::ReceiverOptions::default()).unwrap();
             drop(ndi);
             assert!(matches!(
@@ -699,9 +726,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires real NDI SDK and reviewed network confinement"]
     fn audio_request_reuse_and_rejection_at_both_sdk_entry_points() {
-        let ndi = crate::NDI::new().unwrap();
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
         let receiver = Receiver::new(
             &ndi,
             &crate::ReceiverOptions::builder(crate::Source::default()).build(),
@@ -781,10 +809,12 @@ mod tests {
 
     #[test]
     fn test_framesync_size() {
-        // FrameSync contains an opaque pointer + the owned Receiver
+        // FrameSync contains an opaque pointer, its runtime handle and the owned Receiver
         assert_eq!(
             std::mem::size_of::<FrameSync>(),
-            std::mem::size_of::<NDIlib_framesync_instance_t>() + std::mem::size_of::<Receiver>()
+            std::mem::size_of::<NDIlib_framesync_instance_t>()
+                + std::mem::size_of::<crate::NDI>()
+                + std::mem::size_of::<Receiver>()
         );
     }
 
@@ -847,7 +877,8 @@ mod tests {
             timestamp: 0,
         };
 
-        let guard = unsafe { Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw) };
+        let guard =
+            unsafe { Guard::<FrameSyncVideoFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
         let frame = unsafe { FrameSyncVideoRef::new(guard) }.expect("valid video frame");
 
         assert_eq!(frame.metadata(), Some("framesync video"));
@@ -887,7 +918,8 @@ mod tests {
             timestamp: 0,
         };
 
-        let guard = unsafe { Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw) };
+        let guard =
+            unsafe { Guard::<FrameSyncVideoFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
         assert!(matches!(
             unsafe { FrameSyncVideoRef::new(guard) },
             Err(Error::InvalidFrame(_))
@@ -913,7 +945,8 @@ mod tests {
             timestamp: 0,
         };
 
-        let guard = unsafe { Guard::<FrameSyncVideoFree>::new(ptr::null_mut(), raw) };
+        let guard =
+            unsafe { Guard::<FrameSyncVideoFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
         let result = unsafe { FrameSyncVideoRef::new(guard) };
         assert!(matches!(result, Err(Error::InvalidFrame(_))));
     }
@@ -921,7 +954,8 @@ mod tests {
     #[test]
     fn test_framesync_audio_ref_query_no_source_empty() {
         let raw = NDIlib_audio_frame_v3_t::default();
-        let guard = unsafe { Guard::<FrameSyncAudioFree>::new(ptr::null_mut(), raw) };
+        let guard =
+            unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
         let frame = unsafe { FrameSyncAudioRef::new(guard, true) }.expect("empty query frame");
 
         assert!(frame.is_empty());
@@ -948,7 +982,8 @@ mod tests {
             timestamp: 0,
         };
 
-        let guard = unsafe { Guard::<FrameSyncAudioFree>::new(ptr::null_mut(), raw) };
+        let guard =
+            unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
         let frame = unsafe { FrameSyncAudioRef::new(guard, true) }.expect("query source frame");
 
         assert!(frame.is_empty());
@@ -960,7 +995,8 @@ mod tests {
     #[test]
     fn test_framesync_audio_ref_capture_rejects_empty() {
         let raw = NDIlib_audio_frame_v3_t::default();
-        let guard = unsafe { Guard::<FrameSyncAudioFree>::new(ptr::null_mut(), raw) };
+        let guard =
+            unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
         let result = unsafe { FrameSyncAudioRef::new(guard, false) };
 
         assert!(matches!(result, Err(Error::InvalidFrame(_))));
@@ -990,7 +1026,8 @@ mod tests {
             timestamp: 0,
         };
 
-        let guard = unsafe { Guard::<FrameSyncAudioFree>::new(ptr::null_mut(), raw) };
+        let guard =
+            unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
         let frame = unsafe { FrameSyncAudioRef::new(guard, false) }.expect("strided audio frame");
 
         assert_eq!(frame.metadata(), Some("framesync audio"));
@@ -1030,7 +1067,8 @@ mod tests {
             timestamp: 0,
         };
 
-        let guard = unsafe { Guard::<FrameSyncAudioFree>::new(ptr::null_mut(), raw) };
+        let guard =
+            unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
         assert!(matches!(
             unsafe { FrameSyncAudioRef::new(guard, false) },
             Err(Error::InvalidUtf8(_))
