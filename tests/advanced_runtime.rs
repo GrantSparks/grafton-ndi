@@ -11,12 +11,10 @@ mod common;
 
 use grafton_ndi::{
     advanced::*, capabilities::RuntimeFeature, AudioFrame, Error, Finder, FinderOptions, Receiver,
-    ReceiverBandwidth, ReceiverOptions, ScanType, Sender, SenderOptions, Source, SourceAddress,
-    Tally, VideoFrame, NDI,
+    ReceiverBandwidth, ReceiverOptions, ScanType, Sender, SenderOptions, Source, Tally, VideoFrame,
+    NDI,
 };
 use std::{
-    net::{Ipv4Addr, TcpListener, TcpStream},
-    process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Condvar, Mutex, MutexGuard,
@@ -413,34 +411,9 @@ fn operations_report_why_the_advanced_sdk_is_unavailable() {
     assert!(finder.current_sources().is_ok());
 }
 
-/// The loopback endpoint of a source that a sender of this process
-/// advertises. The sender reports its name without an address, and the first
-/// media port is not always the default, so the local discovery service is
-/// asked for the port.
+/// The loopback endpoint of a source that a sender of this process advertises.
 fn loopback(ndi: &NDI, advertised: &Source) -> Source {
-    let finder = Finder::new(
-        ndi,
-        &FinderOptions::builder().extra_ips("127.0.0.1").build(),
-    )
-    .unwrap();
-    let deadline = Instant::now() + PATIENCE;
-    loop {
-        for mut source in finder.current_sources().unwrap() {
-            if source.name == advertised.name {
-                if let SourceAddress::Ip(address) = &source.address {
-                    let port = address.rsplit(':').next().expect("SDK address port");
-                    source.address = SourceAddress::Ip(format!("127.0.0.1:{port}"));
-                    return source;
-                }
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "local sender endpoint not discovered: {}",
-            advertised.name
-        );
-        finder.wait_for_sources(SLICE).unwrap();
-    }
+    common::loopback_endpoint(ndi, &advertised.name).unwrap()
 }
 
 /// A receiver of everything `advertised` sends, compressed, on the video
@@ -1650,86 +1623,29 @@ fn allocator_calls_run_concurrently_up_to_the_documented_limit() {
     );
 }
 
-/// The Discovery Server of the SDK the selected runtime belongs to, on a
-/// loopback port, stopped when dropped.
-struct DiscoveryServer {
-    process: Child,
-    endpoint: String,
-}
-
-impl DiscoveryServer {
-    /// Start `<root>/bin/<target>/ndi-discovery-server`, which the SDK
-    /// installs beside the runtime library in `<root>/lib/<target>/`, or
-    /// return `None` when the selected runtime has no such program beside it.
-    fn start(ndi: &NDI) -> Option<Self> {
-        let info = ndi.info();
-        let library_directory = info.library_path()?.parent()?;
-        let binary = library_directory
-            .parent()?
-            .parent()?
-            .join("bin")
-            .join(library_directory.file_name()?)
-            .join("ndi-discovery-server");
-        if !binary.is_file() {
-            return None;
-        }
-        // Reserve a free port, then hand it to the server.
-        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let process = Command::new(binary)
-            .args(["-bind", "127.0.0.1", "-port", &port.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let server = Self {
-            process,
-            endpoint: format!("127.0.0.1:{port}"),
-        };
-        let deadline = Instant::now() + PATIENCE;
-        while TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_err() {
-            assert!(
-                Instant::now() < deadline,
-                "the Discovery Server did not start listening on {}",
-                server.endpoint
-            );
-            // Poll the program that is starting, not the SDK.
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        Some(server)
-    }
-}
-
-impl Drop for DiscoveryServer {
-    fn drop(&mut self) {
-        let _ = self.process.kill();
-        let _ = self.process.wait();
-    }
-}
-
 /// A sender names its metadata in its configuration, and a finder that uses
 /// the same Discovery Server is told it; a sender that names none has none.
+#[cfg(all(target_os = "linux", not(ndi_link_static)))]
 #[test]
 fn a_finder_is_told_the_metadata_a_sender_advertises() {
+    use common::discovery_server::{server_binary, Server};
+
     let Some(ndi) = common::advanced_ndi() else {
         return;
     };
     let _turn = sockets();
-    let Some(server) = DiscoveryServer::start(&ndi) else {
+    let Some(binary) = server_binary(&ndi) else {
         common::skip(
             common::Requirement::DiscoveryServer,
             "the SDK's ndi-discovery-server is not beside the selected runtime",
         );
         return;
     };
+    let server = Server::start(&binary);
     let config = |properties: &str| {
         AdvancedConfig::parse(format!(
             r#"{{"ndi":{{"networks":{{"discovery":"{}"}}{properties}}}}}"#,
-            server.endpoint
+            server.endpoint()
         ))
         .unwrap()
     };

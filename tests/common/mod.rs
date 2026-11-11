@@ -6,6 +6,9 @@
 use grafton_ndi::{capabilities, Error, Finder, FinderOptions, Sender, Source, SourceAddress, NDI};
 use std::time::{Duration, Instant};
 
+#[cfg(all(target_os = "linux", not(ndi_link_static)))]
+pub mod discovery_server;
+
 #[path = "../../src/test_support.rs"]
 mod test_support;
 pub use test_support::{advanced_ndi, ndi, skip, unique_name, Requirement};
@@ -15,7 +18,12 @@ pub use test_support::{advanced_ndi, ndi, skip, unique_name, Requirement};
 /// a previous test's sockets may still occupy it). Query the local discovery
 /// service explicitly, then retain its port while routing media over loopback.
 pub fn loopback_source(ndi: &NDI, sender: &Sender) -> grafton_ndi::Result<Source> {
-    let name = sender.source()?.name;
+    loopback_endpoint(ndi, &sender.source()?.name)
+}
+
+/// The loopback endpoint of the source this process advertises as `name`; see
+/// [`loopback_source`]. Some senders expose only their source, not themselves.
+pub fn loopback_endpoint(ndi: &NDI, name: &str) -> grafton_ndi::Result<Source> {
     let finder = Finder::new(
         ndi,
         &FinderOptions::builder().extra_ips("127.0.0.1").build(),
