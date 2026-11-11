@@ -28,7 +28,8 @@ fn media_capture_retains_capability_notifications() -> Result<(), Error> {
         .map(|kind| {
             Sender::new(
                 &ndi,
-                &SenderOptions::builder(format!("status retention {kind}")).build(),
+                &SenderOptions::builder(common::unique_name(&format!("status retention {kind}")))
+                    .build(),
             )
         })
         .collect::<Result<Vec<_>, Error>>()?;

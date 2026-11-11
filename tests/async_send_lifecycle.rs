@@ -18,7 +18,7 @@ fn owned_pipeline_returns_original_buffers_and_metadata() -> Result<(), grafton_
     let Some(ndi) = common::ndi() else {
         return Ok(());
     };
-    let options = SenderOptions::builder("owned pipeline regression")
+    let options = SenderOptions::builder(common::unique_name("owned pipeline regression"))
         .clock_video(false)
         .clock_audio(false)
         .build();
@@ -45,7 +45,7 @@ fn copied_send_survives_released_source() -> Result<(), grafton_ndi::Error> {
     let Some(ndi) = common::ndi() else {
         return Ok(());
     };
-    let options = SenderOptions::builder("copied source release regression")
+    let options = SenderOptions::builder(common::unique_name("copied source release regression"))
         .clock_video(false)
         .clock_audio(false)
         .build();
@@ -66,7 +66,7 @@ fn mixed_owned_and_copy_send_completes_each_frame_once() -> Result<(), grafton_n
     let Some(ndi) = common::ndi() else {
         return Ok(());
     };
-    let options = SenderOptions::builder("mixed async regression")
+    let options = SenderOptions::builder(common::unique_name("mixed async regression"))
         .clock_video(false)
         .clock_audio(false)
         .build();
@@ -98,10 +98,11 @@ fn concurrent_sync_and_reentrant_flush_preserve_owned_frame() -> Result<(), graf
     let Some(ndi) = common::ndi() else {
         return Ok(());
     };
-    let options = SenderOptions::builder("sync and reentrant flush regression")
-        .clock_video(false)
-        .clock_audio(false)
-        .build();
+    let options =
+        SenderOptions::builder(common::unique_name("sync and reentrant flush regression"))
+            .clock_video(false)
+            .clock_audio(false)
+            .build();
     let mut sender = Sender::new(&ndi, &options)?;
     let submitted = frame(6);
     let original_ptr = submitted.data().as_ptr();
@@ -143,7 +144,7 @@ fn panicking_completion_keeps_new_owned_frame_pending() -> Result<(), grafton_nd
     let Some(ndi) = common::ndi() else {
         return Ok(());
     };
-    let options = SenderOptions::builder("panicking completion regression")
+    let options = SenderOptions::builder(common::unique_name("panicking completion regression"))
         .clock_video(false)
         .clock_audio(false)
         .build();
@@ -174,10 +175,11 @@ fn copied_send_retains_metadata_after_source_drop() -> Result<(), grafton_ndi::E
     let Some(ndi) = common::ndi() else {
         return Ok(());
     };
-    let options = SenderOptions::builder("copied metadata lifetime regression")
-        .clock_video(false)
-        .clock_audio(false)
-        .build();
+    let options =
+        SenderOptions::builder(common::unique_name("copied metadata lifetime regression"))
+            .clock_video(false)
+            .clock_audio(false)
+            .build();
     let mut sender = Sender::new(&ndi, &options)?;
     let source = frame(8);
     let borrowed = BorrowedVideoFrame::from(&source);

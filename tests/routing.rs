@@ -13,17 +13,18 @@ fn a_router_advertises_itself_and_accepts_route_changes() {
     let Some(ndi) = common::ndi() else {
         return;
     };
-    let mut router = Router::new(&ndi, &RouterOptions::new("grafton routing validation")).unwrap();
+    let name = common::unique_name("grafton routing validation");
+    let mut router = Router::new(&ndi, &RouterOptions::new(name.as_str())).unwrap();
     let advertised = router.source().unwrap();
     assert!(
-        advertised.name.ends_with("(grafton routing validation)"),
+        advertised.name.ends_with(&format!("({name})")),
         "{advertised}"
     );
     assert_eq!(router.connection_count(Duration::ZERO).unwrap(), 0);
 
     let sender = Sender::new(
         &ndi,
-        &SenderOptions::builder("grafton routing target")
+        &SenderOptions::builder(common::unique_name("grafton routing target"))
             .clock_video(false)
             .clock_audio(false)
             .build(),

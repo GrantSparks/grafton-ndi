@@ -13,11 +13,10 @@
 //!    dropped unless [`NDI::process_lifetime`] was chosen.
 //!
 //! [`NDI::new`] performs both steps with the default options, and
-//! [`NDI::with_options`] with the options it is given. A question never
-//! selects a runtime: [`NDI::is_running`], for one, only reports the current
-//! state. The one operation that starts NDI on the caller's behalf,
-//! [`SourceCache::find_by_host`](crate::SourceCache::find_by_host), does so
-//! through [`NDI::new`].
+//! [`NDI::with_options`] with the options it is given. Nothing else in the
+//! crate selects or starts a runtime: every operation that needs NDI takes a
+//! handle, and a question such as [`NDI::is_running`] only reports the current
+//! state.
 //!
 //! ```no_run
 //! use grafton_ndi::{Runtime, RuntimeOptions};

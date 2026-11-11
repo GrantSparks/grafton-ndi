@@ -86,7 +86,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
     };
     let sender = Sender::new(
         &ndi,
-        &SenderOptions::builder("video padding regression")
+        &SenderOptions::builder(common::unique_name("video padding regression"))
             .clock_video(true)
             .clock_audio(false)
             .build(),
@@ -98,18 +98,24 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
     let host = advertised.name.split_once(" (").unwrap().0;
     let cache = SourceCache::new();
     let first = cache
-        .find_by_host(&host.to_ascii_uppercase(), Duration::from_secs(15))
+        .find_by_host(&ndi, &host.to_ascii_uppercase(), Duration::from_secs(15))
         .unwrap();
     assert_eq!(
         cache
-            .find_by_host(&format!("{}.", host.to_ascii_lowercase()), Duration::ZERO)
+            .find_by_host(
+                &ndi,
+                &format!("{}.", host.to_ascii_lowercase()),
+                Duration::ZERO
+            )
             .unwrap(),
         first
     );
     assert_eq!(cache.len(), 1);
     cache.invalidate(&host.to_ascii_lowercase());
     assert!(cache.is_empty());
-    let rediscovered = cache.find_by_host(host, Duration::from_secs(15)).unwrap();
+    let rediscovered = cache
+        .find_by_host(&ndi, host, Duration::from_secs(15))
+        .unwrap();
     let _connected = receiver(&ndi, rediscovered);
     let stop = Arc::new(AtomicBool::new(false));
     std::thread::scope(|scope| {
@@ -237,7 +243,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
         verify_owned(&receiver.video().capture(Duration::from_secs(10)).unwrap());
         let mut resend = Sender::new(
             &ndi,
-            &SenderOptions::builder("normalized padding resend")
+            &SenderOptions::builder(common::unique_name("normalized padding resend"))
                 .clock_video(false)
                 .clock_audio(false)
                 .build(),

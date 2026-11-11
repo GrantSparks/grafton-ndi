@@ -43,7 +43,7 @@ fn queried_channels_remain_fixed_when_source_format_changes() {
     );
     let sender = Sender::new(
         &ndi,
-        &SenderOptions::builder("FrameSync audio request regression")
+        &SenderOptions::builder(common::unique_name("FrameSync audio request regression"))
             .clock_audio(true)
             .build(),
     )

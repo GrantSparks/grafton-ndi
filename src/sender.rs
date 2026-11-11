@@ -1217,11 +1217,10 @@ mod tests {
     fn test_sender() -> Option<Sender> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-        let name = format!(
-            "Owned async regression {} {}",
-            std::process::id(),
+        let name = crate::test_support::unique_name(&format!(
+            "Owned async regression {}",
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
-        );
+        ));
         let ndi = crate::test_support::ndi()?;
         Some(
             Sender::new(

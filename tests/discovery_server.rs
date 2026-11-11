@@ -261,22 +261,25 @@ fn eventually<T>(what: &str, mut observe: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-fn sender(ndi: &NDI, name: &str) -> Sender {
-    let options = SenderOptions::builder(name)
+/// A sender named `label`, made unique to this process: the runtime takes a
+/// lock named after each sender and each named receiver.
+fn sender(ndi: &NDI, label: &str) -> Sender {
+    let options = SenderOptions::builder(common::unique_name(label))
         .clock_video(false)
         .clock_audio(false);
     Sender::new(ndi, &options.build()).unwrap()
 }
 
-fn receiver(ndi: &NDI, name: &str) -> Receiver {
-    let options = ReceiverOptions::builder(Source::default()).name(name);
+/// A receiver named `label`, made unique to this process like a [`sender`].
+fn receiver(ndi: &NDI, label: &str) -> Receiver {
+    let options = ReceiverOptions::builder(Source::default()).name(common::unique_name(label));
     Receiver::new(ndi, &options.build()).unwrap()
 }
 
-/// The advertised receiver that was created as `name`: the registry prefixes
-/// the machine name.
-fn named(receivers: &[AdvertisedReceiver], name: &str) -> Option<AdvertisedReceiver> {
-    let suffix = format!("({name})");
+/// The advertised receiver that [`receiver`] created for `label`: the registry
+/// prefixes the machine name.
+fn named(receivers: &[AdvertisedReceiver], label: &str) -> Option<AdvertisedReceiver> {
+    let suffix = format!("({})", common::unique_name(label));
     receivers
         .iter()
         .find(|receiver| receiver.name().is_some_and(|name| name.ends_with(&suffix)))

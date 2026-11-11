@@ -10,7 +10,8 @@ fn rapid_owned_sender_lifecycle() -> Result<(), grafton_ndi::Error> {
         return Ok(());
     };
     for iteration in 0..20 {
-        let options = SenderOptions::builder(format!("owned lifecycle {iteration}"))
+        let name = common::unique_name(&format!("owned lifecycle {iteration}"));
+        let options = SenderOptions::builder(name)
             .clock_video(false)
             .clock_audio(false)
             .build();

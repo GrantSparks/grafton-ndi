@@ -9,7 +9,7 @@ fn reused_metadata_reaches_receiver_with_its_timecode() -> Result<(), grafton_nd
     };
     let sender = Sender::new(
         &ndi,
-        &SenderOptions::builder("metadata roundtrip regression")
+        &SenderOptions::builder(common::unique_name("metadata roundtrip regression"))
             .clock_video(false)
             .build(),
     )?;

@@ -996,37 +996,47 @@ impl Display for Source {
     }
 }
 
-/// Thread-safe cache for NDI source discovery.
+/// A thread-safe cache of host-to-source lookups.
 ///
-/// `SourceCache` eliminates the need for applications to manually cache NDI instances
-/// and discovered sources. Discovery initializes the runtime on a cache miss.
-/// Cached sources own their strings and need no live runtime. Entries remain
-/// cached until explicitly invalidated or cleared.
+/// Resolving a hostname or IP address to the NDI [`Source`] it advertises
+/// takes a network discovery, which can last seconds. A `SourceCache`
+/// remembers each answer: [`find_by_host`](Self::find_by_host) discovers a
+/// host the first time it is asked for, and afterwards returns the remembered
+/// source without calling the NDI runtime at all.
+///
+/// The cache stores only owned source descriptors. It holds no [`NDI`] handle,
+/// so it does not keep NDI started, it can be created before a runtime is
+/// selected, and it can outlive every handle. A lookup that has to search the
+/// network uses the handle it is given.
+///
+/// An entry stays until [`invalidate`](Self::invalidate) or
+/// [`clear`](Self::clear) removes it: the cache does not notice a source going
+/// offline or changing address.
 /// Equivalent hostname case/final-dot and numeric IP spellings share one entry.
 /// Hostnames, IP addresses, and DNS aliases otherwise remain distinct identities.
 ///
 /// # Thread Safety
 ///
 /// `SourceCache` is thread-safe and can be shared across threads using `Arc<SourceCache>`.
-/// Interior mutability is handled internally with proper synchronization.
+/// Lookups of different hosts do not wait for one another's discovery.
 ///
 /// # Examples
 ///
 /// ```no_run
-/// use grafton_ndi::SourceCache;
+/// use grafton_ndi::{SourceCache, NDI};
 /// use std::time::Duration;
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
-/// // Create a cache instance
+/// let ndi = NDI::new()?;
 /// let cache = SourceCache::new();
 ///
-/// // Find a source by hostname or IP with automatic caching
-/// let source = cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
+/// // The first lookup of a host searches the network.
+/// let source = cache.find_by_host(&ndi, "192.168.0.107", Duration::from_secs(5))?;
 /// println!("Found source: {}", source);
 ///
-/// // Subsequent lookups use the cache
-/// let same_source = cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
-///
+/// // Later lookups of that host are answered from the cache.
+/// let same_source = cache.find_by_host(&ndi, "192.168.0.107", Duration::from_secs(5))?;
+/// assert_eq!(same_source, source);
 /// # Ok(())
 /// # }
 /// ```
@@ -1046,69 +1056,65 @@ impl CacheState {
 }
 
 impl SourceCache {
-    /// Create a new source cache.
+    /// Create an empty cache. This needs no NDI runtime.
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// use grafton_ndi::SourceCache;
     ///
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let cache = SourceCache::new();
-    /// # Ok(())
-    /// # }
+    /// assert!(cache.is_empty());
     /// ```
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Find a source by IP address or hostname with built-in caching.
+    /// Find the source advertised by a host, by IP address or hostname.
     ///
-    /// If a source matching the host has been previously found, it returns the
-    /// cached result. Otherwise it starts NDI for the duration of the lookup,
-    /// exactly as [`NDI::new`] does, performs discovery and caches the result.
-    /// When no runtime has been selected yet, that first lookup therefore
-    /// selects the default one; call [`Runtime::select`](crate::Runtime::select)
-    /// beforehand to choose another.
+    /// A host found before is answered from the cache, without calling the
+    /// NDI runtime. Otherwise a finder is created from `ndi` for the duration
+    /// of the lookup, local sources included and `host` given to it as an
+    /// extra address to query, and the first matching source is cached and
+    /// returned.
     ///
     /// # Arguments
     ///
+    /// * `ndi` - The runtime handle a discovery is run through. A cache hit
+    ///   does not use it.
     /// * `host` - The hostname or IP address to search for
     /// * `timeout` - Maximum time to wait for source discovery.
     ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
     ///
-    /// # Returns
-    ///
-    /// The discovered source, or an error if no matching source is found or
-    /// the timeout expires.
-    ///
     /// # Errors
     ///
     /// - [`Error::NoSourcesFound`] if no source matching the host is discovered
+    ///   before the timeout expires
     /// - [`Error::InvalidConfiguration`] if `host` is not a bare hostname or IP,
-    ///   or `timeout` exceeds [`crate::MAX_TIMEOUT`]
-    /// - Other errors if NDI initialization or discovery fails
+    ///   or `timeout` exceeds [`crate::MAX_TIMEOUT`]; both are checked before
+    ///   the cache is consulted
+    /// - [`Error::InitializationFailed`] if the finder cannot be created
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// use grafton_ndi::SourceCache;
+    /// use grafton_ndi::{SourceCache, NDI};
     /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::new()?;
     /// let cache = SourceCache::new();
     ///
     /// // Find by IP address
-    /// let source = cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
+    /// let source = cache.find_by_host(&ndi, "192.168.0.107", Duration::from_secs(5))?;
     ///
     /// // Find by the machine component of an SDK source name
-    /// let source = cache.find_by_host("CAMERA1", Duration::from_secs(5))?;
+    /// let source = cache.find_by_host(&ndi, "CAMERA1", Duration::from_secs(5))?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn find_by_host(&self, host: &str, timeout: Duration) -> Result<Source> {
+    pub fn find_by_host(&self, ndi: &NDI, host: &str, timeout: Duration) -> Result<Source> {
         self.find_by_host_with(host, timeout, |query| {
-            let ndi = NDI::new()?;
             let hint = host
                 .strip_prefix('[')
                 .and_then(|value| value.strip_suffix(']'))
@@ -1117,7 +1123,7 @@ impl SourceCache {
                 .show_local_sources(true)
                 .extra_ips(hint)
                 .build();
-            let finder = Finder::new(&ndi, &options)?;
+            let finder = Finder::new(ndi, &options)?;
             finder.poll_until_deadline(timeout, |sources| {
                 sources
                     .into_iter()
@@ -1126,6 +1132,9 @@ impl SourceCache {
         })
     }
 
+    /// The cache around a discovery: validate the request, answer from the
+    /// cache when possible, and otherwise run `discover` and remember what it
+    /// finds.
     fn find_by_host_with(
         &self,
         host: &str,
@@ -1183,12 +1192,13 @@ impl SourceCache {
     /// # Examples
     ///
     /// ```no_run
-    /// use grafton_ndi::SourceCache;
+    /// use grafton_ndi::{SourceCache, NDI};
     /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::new()?;
     /// let cache = SourceCache::new();
-    /// let source = cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
+    /// let source = cache.find_by_host(&ndi, "192.168.0.107", Duration::from_secs(5))?;
     ///
     /// // Later, if the source goes offline
     /// cache.invalidate("192.168.0.107");
@@ -1217,13 +1227,14 @@ impl SourceCache {
     /// # Examples
     ///
     /// ```no_run
-    /// use grafton_ndi::SourceCache;
+    /// use grafton_ndi::{SourceCache, NDI};
     /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::new()?;
     /// let cache = SourceCache::new();
-    /// cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
-    /// cache.find_by_host("192.168.0.108", Duration::from_secs(5))?;
+    /// cache.find_by_host(&ndi, "192.168.0.107", Duration::from_secs(5))?;
+    /// cache.find_by_host(&ndi, "192.168.0.108", Duration::from_secs(5))?;
     ///
     /// // Clear all cached sources
     /// cache.clear();
@@ -1246,14 +1257,15 @@ impl SourceCache {
     /// # Examples
     ///
     /// ```no_run
-    /// use grafton_ndi::SourceCache;
+    /// use grafton_ndi::{SourceCache, NDI};
     /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::new()?;
     /// let cache = SourceCache::new();
     /// assert_eq!(cache.len(), 0);
     ///
-    /// cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
+    /// cache.find_by_host(&ndi, "192.168.0.107", Duration::from_secs(5))?;
     /// assert_eq!(cache.len(), 1);
     /// # Ok(())
     /// # }
@@ -1271,14 +1283,15 @@ impl SourceCache {
     /// # Examples
     ///
     /// ```no_run
-    /// use grafton_ndi::SourceCache;
+    /// use grafton_ndi::{SourceCache, NDI};
     /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::new()?;
     /// let cache = SourceCache::new();
     /// assert!(cache.is_empty());
     ///
-    /// cache.find_by_host("192.168.0.107", Duration::from_secs(5))?;
+    /// cache.find_by_host(&ndi, "192.168.0.107", Duration::from_secs(5))?;
     /// assert!(!cache.is_empty());
     /// # Ok(())
     /// # }
@@ -1693,12 +1706,16 @@ mod tests {
         );
         for host in ["camera", "not_cached"] {
             assert!(matches!(
-                cache.find_by_host(host, Duration::MAX),
+                cache.find_by_host_with(host, Duration::MAX, |_| panic!("invalid timeout")),
                 Err(Error::InvalidConfiguration(_))
             ));
         }
+        // A hit is answered without reaching discovery, the only step that
+        // uses the runtime.
         assert_eq!(
-            cache.find_by_host("camera", Duration::ZERO).unwrap(),
+            cache
+                .find_by_host_with("camera", Duration::ZERO, |_| panic!("cache hit"))
+                .unwrap(),
             Source::default()
         );
     }

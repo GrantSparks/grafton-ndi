@@ -463,7 +463,8 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let options = crate::SenderOptions::builder("grafton isolated utility validation")
+        let name = crate::test_support::unique_name("grafton isolated utility validation");
+        let options = crate::SenderOptions::builder(name)
             .clock_audio(false)
             .clock_video(false)
             .build();
