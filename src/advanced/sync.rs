@@ -16,37 +16,40 @@ use crate::{
     Tally, VideoFrame, VideoKind, NDI,
 };
 
+use super::descriptors;
+
 /// What audio an [`AvSync::synchronize`] call asks for.
 ///
 /// AVSync selects the samples that belong to a video frame; it does not
-/// resample. Naming a sample rate or channel count states what the caller
-/// expects, and a source with a different format is reported as
-/// [`AvSyncOutcome::FormatChanged`] rather than converted.
+/// resample. A request that names a sample rate states the rate its sample
+/// count was computed for, and a source at another rate is reported as
+/// [`AvSyncOutcome::FormatChanged`] rather than given audio. The audio always
+/// has the source's own channels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AvSyncRequest {
     samples: i32,
     sample_rate: i32,
-    channels: i32,
 }
 
 impl AvSyncRequest {
-    /// Take whatever audio belongs to the video frame, in the source's format.
+    /// Take whatever audio belongs to the video frame, at the source's rate.
     pub fn automatic() -> Self {
         Self::default()
     }
 
-    /// Ask for an exact number of samples per channel, and state the expected
-    /// sample rate and channel count. Each `None` leaves that choice to the SDK.
+    /// Ask for an exact number of samples per channel, and state the sample
+    /// rate that number was computed for. Each `None` leaves that choice to
+    /// the SDK.
+    ///
+    /// With a video frame, the SDK returns the number asked for when it is
+    /// close to the audio that belongs to the frame; otherwise it returns
+    /// that audio and reports the count as adjusted.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidFrame`] when a value is zero, exceeds the SDK's range,
     /// or asks for more audio than one frame can hold.
-    pub fn new(
-        samples: Option<u32>,
-        sample_rate: Option<u32>,
-        channels: Option<u32>,
-    ) -> Result<Self> {
+    pub fn new(samples: Option<u32>, sample_rate: Option<u32>) -> Result<Self> {
         // The SDK reads zero as "not specified".
         fn value(v: Option<u32>) -> Result<i32> {
             v.map(positive).transpose().map(|v| v.unwrap_or(0))
@@ -54,17 +57,15 @@ impl AvSyncRequest {
         let request = Self {
             samples: value(samples)?,
             sample_rate: value(sample_rate)?,
-            channels: value(channels)?,
         };
-        if request.samples > 0 {
-            let bytes = (request.samples as usize)
-                .checked_mul(request.channels.max(1) as usize)
-                .and_then(|n| n.checked_mul(size_of::<f32>()));
-            if bytes.is_none_or(|n| n > crate::frames::MAX_AUDIO_BYTES) {
-                return Err(invalid(
-                    "AVSync request exceeds the supported audio storage limit",
-                ));
-            }
+        // A frame has at least one channel.
+        if (request.samples as usize)
+            .checked_mul(size_of::<f32>())
+            .is_none_or(|bytes| bytes > crate::frames::MAX_AUDIO_BYTES)
+        {
+            return Err(invalid(
+                "AVSync request exceeds the supported audio storage limit",
+            ));
         }
         Ok(request)
     }
@@ -74,22 +75,20 @@ impl AvSyncRequest {
         u32::try_from(self.samples).ok().filter(|n| *n != 0)
     }
 
-    /// The expected sample rate in hertz, if stated.
+    /// The sample rate in hertz the request was computed for, if stated.
     pub fn sample_rate(self) -> Option<u32> {
         u32::try_from(self.sample_rate).ok().filter(|n| *n != 0)
     }
 
-    /// The expected channel count, if stated.
-    pub fn channels(self) -> Option<u32> {
-        u32::try_from(self.channels).ok().filter(|n| *n != 0)
-    }
-
+    /// The descriptor the SDK reads the request from and writes the audio to.
+    ///
+    /// The SDK returns planar floating-point audio and leaves the format as
+    /// it found it, so the descriptor must already name that format.
     fn raw(self) -> NDIlib_audio_frame_v3_t {
         NDIlib_audio_frame_v3_t {
             no_samples: self.samples,
             sample_rate: self.sample_rate,
-            no_channels: self.channels,
-            ..Default::default()
+            ..descriptors::audio_frame()
         }
     }
 }
@@ -111,8 +110,9 @@ pub enum AvSyncOutcome {
         /// As for [`Audio`](Self::Audio).
         samples_adjusted: bool,
     },
-    /// The source's audio is not in the format the request stated. Nothing was
-    /// returned; ask again with the reported format, or automatically.
+    /// The source's audio is not at the sample rate the request stated.
+    /// Nothing was returned; ask again for the reported rate, or
+    /// automatically.
     FormatChanged {
         /// The source's sample rate in hertz.
         sample_rate: i32,
@@ -632,7 +632,7 @@ fn video_timing(
         frame_rate_N: positive(numerator)?,
         frame_rate_D: positive(denominator)?,
         frame_format_type: scan.into(),
-        ..Default::default()
+        ..descriptors::video_frame()
     })
 }
 
@@ -640,7 +640,7 @@ fn audio_timing(sample_rate: u32, samples: u32) -> Result<NDIlib_audio_frame_v3_
     Ok(NDIlib_audio_frame_v3_t {
         sample_rate: positive(sample_rate)?,
         no_samples: positive(samples)?,
-        ..Default::default()
+        ..descriptors::audio_frame()
     })
 }
 
@@ -704,25 +704,18 @@ mod tests {
 
     #[test]
     fn rejects_invalid_clock_and_request_values_before_native_wait() {
-        assert!(AvSyncRequest::new(Some(0), None, None).is_err());
-        assert!(AvSyncRequest::new(None, Some(u32::MAX), None).is_err());
-        assert!(AvSyncRequest::new(
-            Some((crate::frames::MAX_AUDIO_BYTES / 8 + 1) as u32),
-            None,
-            Some(2)
-        )
-        .is_err());
-        assert!(AvSyncRequest::new(
-            Some((crate::frames::MAX_AUDIO_BYTES / 4 + 1) as u32),
-            None,
-            None
-        )
-        .is_err());
+        assert!(AvSyncRequest::new(Some(0), None).is_err());
+        assert!(AvSyncRequest::new(None, Some(0)).is_err());
+        assert!(AvSyncRequest::new(None, Some(u32::MAX)).is_err());
+        let most = (crate::frames::MAX_AUDIO_BYTES / 4) as u32;
+        assert!(AvSyncRequest::new(Some(most), None).is_ok());
+        assert!(AvSyncRequest::new(Some(most + 1), None).is_err());
         assert_eq!(AvSyncRequest::automatic().samples(), None);
-        let request = AvSyncRequest::new(Some(1600), Some(48_000), Some(2)).unwrap();
+        assert_eq!(AvSyncRequest::automatic().sample_rate(), None);
+        let request = AvSyncRequest::new(Some(1600), Some(48_000)).unwrap();
         assert_eq!(
-            (request.samples(), request.sample_rate(), request.channels()),
-            (Some(1600), Some(48_000), Some(2))
+            (request.samples(), request.sample_rate()),
+            (Some(1600), Some(48_000))
         );
         assert!(audio_timing(48_000, 0).is_err());
         assert!(video_timing(60_000, 0, ScanType::Progressive).is_err());
@@ -732,6 +725,52 @@ mod tests {
         fn send<T: Send>() {}
         send::<VideoClock<'_>>();
         send::<AudioClock<'_>>();
+    }
+
+    /// The SDK fills in the audio it returns but not its format, and reads
+    /// the request from the same descriptor: every request starts as the
+    /// descriptor the SDK itself would construct, with what it asks for set.
+    #[test]
+    fn a_request_is_the_sdk_default_descriptor_with_what_it_asks_for() {
+        let planar_float = NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP;
+        let automatic = AvSyncRequest::automatic().raw();
+        assert_eq!(automatic.FourCC, planar_float);
+        assert_eq!((automatic.no_samples, automatic.sample_rate), (0, 0));
+        assert_eq!(automatic.timecode, NDIlib_send_timecode_synthesize);
+        assert!(automatic.p_data.is_null() && automatic.p_metadata.is_null());
+
+        let explicit = AvSyncRequest::new(Some(1601), Some(44_100)).unwrap().raw();
+        assert_eq!(explicit.FourCC, planar_float);
+        assert_eq!((explicit.no_samples, explicit.sample_rate), (1601, 44_100));
+
+        // What the SDK returns for a successful request validates as audio.
+        let returned = NDIlib_audio_frame_v3_t {
+            no_samples: 0,
+            sample_rate: 48_000,
+            no_channels: 2,
+            ..automatic
+        };
+        // SAFETY: an empty frame has no buffers to read.
+        assert!(matches!(
+            unsafe { outcome(Synchronized::Matched, &returned) }.unwrap(),
+            AvSyncOutcome::Empty {
+                samples_adjusted: false
+            }
+        ));
+
+        // The clocks read a rate from descriptors built the same way.
+        let video = video_timing(60_000, 1001, ScanType::Interlaced).unwrap();
+        assert_eq!(
+            video.FourCC,
+            NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY
+        );
+        assert_eq!(
+            video.frame_format_type,
+            NDIlib_frame_format_type_e_NDIlib_frame_format_type_interleaved
+        );
+        let audio = audio_timing(48_000, 1600).unwrap();
+        assert_eq!(audio.FourCC, planar_float);
+        assert_eq!((audio.sample_rate, audio.no_samples), (48_000, 1600));
     }
 
     /// The SDK's allocations are returned for every result, including the

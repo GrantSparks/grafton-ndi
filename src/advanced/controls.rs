@@ -367,7 +367,9 @@ impl<M: ReceiverMode> Receiver<M> {
     /// Switch between the source's program and preview streams.
     ///
     /// Returns whether the SDK applied the change; a receiver created without
-    /// video cannot change its video stream.
+    /// video cannot change its video stream. The SDK applies the change only
+    /// under a vendor ID that licenses this function, and reports `false`
+    /// without one.
     ///
     /// # Errors
     ///
@@ -385,7 +387,9 @@ impl<M: ReceiverMode> Receiver<M> {
     }
 
     /// Choose which streams the source sends to this receiver. A stream the
-    /// receiver was created without cannot be enabled.
+    /// receiver was created without cannot be enabled. The SDK applies the
+    /// change only under a vendor ID that licenses this function, and reports
+    /// [`StreamChange::UnchangedOrRejected`] without one.
     ///
     /// # Errors
     ///

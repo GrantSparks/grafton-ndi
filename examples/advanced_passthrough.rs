@@ -2,7 +2,8 @@
 //!
 //! This example demonstrates:
 //! - Receiving codec packets with a [`PacketReceiver`]
-//! - Sending them unchanged with a [`CompressedSender`]
+//! - Sending them on with a [`CompressedSender`], which borrows each packet
+//!   exclusively because the SDK writes to what it sends
 //! - Asking the source for a keyframe when a new viewer needs one
 //!
 //! Needs the NDI Advanced SDK at build time and an Advanced runtime.
@@ -46,7 +47,8 @@ fn main() -> Result<(), Error> {
         &ReceiverOptions::builder(source)
             .name("Passthrough Example")
             .build(),
-        PassthroughPreset::HevcWithAudio,
+        // Every compressed format, video and audio, is passed through.
+        PassthroughPreset::AlphaWithAudio,
         &AdvancedConfig::parse("{}")?,
     )?;
     // The relay forwards frames as they arrive, so the sender must not pace them.
@@ -58,22 +60,25 @@ fn main() -> Result<(), Error> {
             .build(),
     )?;
 
+    let (mut video, mut audio) = (0u32, 0u32);
     for _ in 0..600 {
         // A viewer that has just connected cannot decode until it sees a keyframe.
         if sender.keyframe_required(None)? {
             receiver.request_keyframe()?;
         }
         match receiver.capture(Duration::from_secs(1))? {
-            PacketEvent::Video(ReceivedVideo::Compressed(packet)) => {
-                match packet.validate_for_send() {
-                    Ok(()) => sender.send_video(&packet)?,
-                    Err(error) => println!("Video packet kept but not relayed: {error}"),
+            // A packet the sender cannot pass on is refused with the reason,
+            // and stays with the caller.
+            PacketEvent::Video(ReceivedVideo::Compressed(mut packet)) => {
+                match sender.send_video(&mut packet) {
+                    Ok(()) => video += 1,
+                    Err(error) => println!("Video packet not relayed: {error}"),
                 }
             }
-            PacketEvent::Audio(ReceivedAudio::Compressed(packet)) => {
-                match packet.validate_for_send() {
-                    Ok(()) => sender.send_audio(&packet)?,
-                    Err(error) => println!("Audio packet kept but not relayed: {error}"),
+            PacketEvent::Audio(ReceivedAudio::Compressed(mut packet)) => {
+                match sender.send_audio(&mut packet) {
+                    Ok(()) => audio += 1,
+                    Err(error) => println!("Audio packet not relayed: {error}"),
                 }
             }
             PacketEvent::Video(ReceivedVideo::Decoded(frame)) => println!(
@@ -81,9 +86,14 @@ fn main() -> Result<(), Error> {
                 frame.width(),
                 frame.height()
             ),
+            PacketEvent::Audio(ReceivedAudio::Decoded(frame)) => println!(
+                "The source sent {} audio samples in a format this preset decodes",
+                frame.num_samples()
+            ),
             PacketEvent::Timeout => println!("Waiting for frames..."),
             _ => {}
         }
     }
+    println!("Relayed {video} video and {audio} audio packets");
     Ok(())
 }

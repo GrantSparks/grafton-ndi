@@ -11,15 +11,34 @@ mod common;
 
 use grafton_ndi::{
     advanced::*, capabilities::RuntimeFeature, AudioFrame, Error, Finder, FinderOptions, Receiver,
-    ReceiverOptions, Sender, SenderOptions, Source, Tally, VideoFrame, NDI,
+    ReceiverBandwidth, ReceiverOptions, ScanType, Sender, SenderOptions, Source, SourceAddress,
+    Tally, VideoFrame, NDI,
 };
 use std::{
+    net::{Ipv4Addr, TcpListener, TcpStream},
+    process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Condvar, Mutex, MutexGuard,
     },
     time::{Duration, Instant},
 };
+
+/// How long a test waits for something its own peers must deliver.
+const PATIENCE: Duration = Duration::from_secs(15);
+
+/// One capture while waiting; a wait is made of as many as it needs.
+const SLICE: Duration = Duration::from_millis(100);
+
+/// The tests that create peers take turns: each waits for what its own
+/// senders deliver, and peers of several tests at once would compete for the
+/// machine's sockets and time.
+fn sockets() -> MutexGuard<'static, ()> {
+    static SOCKETS: Mutex<()> = Mutex::new(());
+    SOCKETS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn options(suffix: &str) -> SenderOptions {
     SenderOptions::builder(format!("grafton-local-{}-{suffix}", std::process::id()))
@@ -41,6 +60,7 @@ fn advanced_native_constructors_controls_and_queue() {
     let Some(ndi) = common::advanced_ndi() else {
         return;
     };
+    let _turn = sockets();
     let config = AdvancedConfig::parse("{}").unwrap();
     let sender = Sender::new_with_config(&ndi, &options("controls"), &config).unwrap();
     let source = sender.source().unwrap();
@@ -155,6 +175,7 @@ fn advanced_native_allocator_replacement_and_capture() {
     let Some(ndi) = common::advanced_ndi() else {
         return;
     };
+    let _turn = sockets();
     let sender = Sender::new(&ndi, &options("allocation")).unwrap();
     let receiver = Receiver::new(
         &ndi,
@@ -260,6 +281,7 @@ fn failed_constructors_hand_back_what_they_were_given() {
     let Some(ndi) = common::ndi() else {
         return;
     };
+    let _turn = sockets();
 
     // No queue accepts a limit of zero frames, on any runtime.
     let sender = Sender::new(&ndi, &options("handback")).unwrap();
@@ -311,6 +333,7 @@ fn operations_report_why_the_advanced_sdk_is_unavailable() {
     let Some(ndi) = common::ndi() else {
         return;
     };
+    let _turn = sockets();
     if ndi
         .require_feature(RuntimeFeature::AdvancedSenderConfiguration)
         .is_ok()
@@ -388,4 +411,1361 @@ fn operations_report_why_the_advanced_sdk_is_unavailable() {
     // The core API is unaffected.
     sender.send_video(&video());
     assert!(finder.current_sources().is_ok());
+}
+
+/// The loopback endpoint of a source that a sender of this process
+/// advertises. The sender reports its name without an address, and the first
+/// media port is not always the default, so the local discovery service is
+/// asked for the port.
+fn loopback(ndi: &NDI, advertised: &Source) -> Source {
+    let finder = Finder::new(
+        ndi,
+        &FinderOptions::builder().extra_ips("127.0.0.1").build(),
+    )
+    .unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        for mut source in finder.current_sources().unwrap() {
+            if source.name == advertised.name {
+                if let SourceAddress::Ip(address) = &source.address {
+                    let port = address.rsplit(':').next().expect("SDK address port");
+                    source.address = SourceAddress::Ip(format!("127.0.0.1:{port}"));
+                    return source;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "local sender endpoint not discovered: {}",
+            advertised.name
+        );
+        finder.wait_for_sources(SLICE).unwrap();
+    }
+}
+
+/// A receiver of everything `advertised` sends, compressed, on the video
+/// stream `bandwidth` selects.
+fn packet_receiver(ndi: &NDI, advertised: &Source, bandwidth: ReceiverBandwidth) -> PacketReceiver {
+    PacketReceiver::new(
+        ndi,
+        &ReceiverOptions::builder(loopback(ndi, advertised))
+            .bandwidth(bandwidth)
+            .build(),
+        PassthroughPreset::ProtectedWithAudio,
+        &AdvancedConfig::parse("{}").unwrap(),
+    )
+    .unwrap()
+}
+
+/// Capture until `wanted` picks something out of what arrives.
+fn await_event<T>(
+    receiver: &mut PacketReceiver,
+    what: &str,
+    mut wanted: impl FnMut(PacketEvent) -> Option<T>,
+) -> T {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        if let Some(found) = wanted(receiver.capture(SLICE).unwrap()) {
+            return found;
+        }
+        assert!(Instant::now() < deadline, "{what} did not arrive");
+    }
+}
+
+/// Timecodes below this mark the frames sent only to find out when a
+/// receiver has connected; a frame sent before that goes nowhere.
+const FIRST_TIMECODE: i64 = 1_000_000;
+
+/// The next compressed video frame, which must be the one sent with
+/// `timecode`: nothing else may arrive before it, twice, or out of order.
+fn await_video(receiver: &mut PacketReceiver, timecode: i64) -> CompressedVideoFrame {
+    await_event(
+        receiver,
+        &format!("video frame {timecode}"),
+        |event| match event {
+            PacketEvent::Video(ReceivedVideo::Compressed(frame))
+                if frame.timecode() >= FIRST_TIMECODE =>
+            {
+                assert_eq!(frame.timecode(), timecode, "an unexpected video frame");
+                Some(frame)
+            }
+            PacketEvent::Video(ReceivedVideo::Decoded(frame)) => {
+                panic!("video frame {} arrived decoded", frame.timecode())
+            }
+            _ => None,
+        },
+    )
+}
+
+/// As [`await_video`], for audio.
+fn await_audio(receiver: &mut PacketReceiver, timecode: i64) -> CompressedAudioFrame {
+    await_event(
+        receiver,
+        &format!("audio frame {timecode}"),
+        |event| match event {
+            PacketEvent::Audio(ReceivedAudio::Compressed(frame))
+                if frame.timecode() >= FIRST_TIMECODE =>
+            {
+                assert_eq!(frame.timecode(), timecode, "an unexpected audio frame");
+                Some(frame)
+            }
+            PacketEvent::Audio(ReceivedAudio::Decoded(frame)) => {
+                panic!("audio frame {} arrived decoded", frame.timecode())
+            }
+            _ => None,
+        },
+    )
+}
+
+/// Send frames with `probe` until `receiver` is given one.
+fn connect(receiver: &mut PacketReceiver, mut probe: impl FnMut(i64)) {
+    let deadline = Instant::now() + PATIENCE;
+    for timecode in 0.. {
+        probe(timecode);
+        if matches!(
+            receiver.capture(SLICE).unwrap(),
+            PacketEvent::Video(_) | PacketEvent::Audio(_)
+        ) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the receiver did not connect");
+    }
+}
+
+/// Bytes that differ from one frame to the next.
+fn payload(seed: i64, len: usize) -> Vec<u8> {
+    (0..len as i64)
+        .map(|index| (index * 31 + seed * 7 + 1) as u8)
+        .collect()
+}
+
+/// The bytes of video frame `seed`: an envelope around a payload, with
+/// parameter sets on a keyframe, for H.264 and HEVC, and a payload behind a
+/// quality byte for SpeedHQ.
+fn video_bytes(codec: VideoCodec, seed: i64, keyframe: bool) -> Vec<u8> {
+    match codec.envelope_codec() {
+        Some(envelope) => packet_envelope(
+            envelope,
+            90_000 + seed,
+            89_000 - seed,
+            keyframe,
+            &payload(seed, 4000),
+            &payload(-seed, if keyframe { 24 } else { 0 }),
+        )
+        .unwrap(),
+        None => {
+            let mut bytes = payload(seed, 4096);
+            bytes[0] %= 100;
+            bytes
+        }
+    }
+}
+
+/// A format for `codec` on the stream `tier`: a full-size picture for the
+/// program stream and one a preview receiver is given for the preview stream.
+fn video_format(codec: VideoCodec, tier: StreamTier) -> VideoPacketFormat {
+    let (width, height) = match tier {
+        StreamTier::Program => (1280, 720),
+        StreamTier::Preview => (640, 360),
+    };
+    VideoPacketFormat::new(codec, width, height)
+        .unwrap()
+        .frame_rate(60_000, 1001)
+        .unwrap()
+        .aspect_ratio(4.0 / 3.0)
+        .unwrap()
+        .tier(tier)
+}
+
+/// A keyframe of `codec` on `tier` with timecode `timecode`.
+fn keyframe(codec: VideoCodec, tier: StreamTier, timecode: i64) -> CompressedVideoFrame {
+    CompressedVideoFrame::new(
+        video_format(codec, tier),
+        video_bytes(codec, timecode, true),
+    )
+    .unwrap()
+    .with_timecode(timecode)
+}
+
+/// The sample rates an AAC configuration can name, in the order of its
+/// sampling-frequency index.
+const AAC_SAMPLE_RATES: [i32; 13] = [
+    96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000,
+    7_350,
+];
+
+/// The channel counts an AAC configuration can name, in the order of its
+/// channel configuration, which starts at one.
+const AAC_CHANNELS: [i32; 7] = [1, 2, 3, 4, 5, 6, 8];
+
+/// Every video codec.
+const VIDEO_CODECS: [VideoCodec; 7] = [
+    VideoCodec::H264,
+    VideoCodec::Hevc,
+    VideoCodec::H264Alpha,
+    VideoCodec::HevcAlpha,
+    VideoCodec::SpeedHq420,
+    VideoCodec::SpeedHq422,
+    VideoCodec::SpeedHq422Alpha,
+];
+
+/// A two-byte AAC-LC AudioSpecificConfig.
+fn aac_config(sample_rate: i32, channels: i32) -> [u8; 2] {
+    let position = |values: &[i32], value| {
+        values
+            .iter()
+            .position(|candidate| *candidate == value)
+            .unwrap() as u16
+    };
+    let frequency_index = position(&AAC_SAMPLE_RATES, sample_rate);
+    let channel_configuration = position(&AAC_CHANNELS, channels) + 1;
+    ((2 << 11) | (frequency_index << 7) | (channel_configuration << 3)).to_be_bytes()
+}
+
+/// The bytes of audio frame `seed`: an envelope with its configuration for
+/// AAC, a bare packet for Opus.
+fn audio_bytes(codec: AudioCodec, sample_rate: i32, channels: i32, seed: i64) -> Vec<u8> {
+    match codec {
+        AudioCodec::Aac => packet_envelope(
+            EnvelopeCodec::Aac,
+            48_000 + seed,
+            47_000 - seed,
+            true,
+            &payload(seed, 300),
+            &aac_config(sample_rate, channels),
+        )
+        .unwrap(),
+        _ => payload(seed, 120),
+    }
+}
+
+/// `bytes` cut into blocks at each of `cuts`.
+fn split(bytes: &[u8], cuts: &[usize]) -> Vec<Vec<u8>> {
+    let mut blocks = Vec::new();
+    let mut start = 0;
+    for end in cuts.iter().copied().chain([bytes.len()]) {
+        blocks.push(bytes[start..end].to_vec());
+        start = end;
+    }
+    blocks
+}
+
+/// Check that `received` is the packet `sent`. The SDK owns the envelope's
+/// reserved field, so an envelope is compared by everything else in it.
+fn assert_same_packet(received: &[u8], sent: &[u8], envelope: Option<EnvelopeCodec>) {
+    let Some(codec) = envelope else {
+        assert_eq!(received, sent);
+        return;
+    };
+    let (received, sent) = (
+        PacketEnvelope::parse(received).unwrap(),
+        PacketEnvelope::parse(sent).unwrap(),
+    );
+    assert_eq!(received.codec(), Some(codec));
+    assert_eq!(
+        (
+            received.presentation_time(),
+            received.decode_time(),
+            received.flags()
+        ),
+        (sent.presentation_time(), sent.decode_time(), sent.flags())
+    );
+    assert_eq!(received.data(), sent.data());
+    assert_eq!(received.extra_data(), sent.extra_data());
+    assert!(received.is_known_version() && received.trailing_bytes().is_empty());
+}
+
+/// How a compressed frame is handed to the sender.
+#[derive(Clone, Copy, Debug)]
+enum Submission {
+    Contiguous,
+    ContiguousAsync,
+    Scatter,
+    ScatterAsync,
+}
+
+/// Every video codec, on both streams, protected and not, arrives exactly as
+/// it was sent, however it was submitted.
+#[test]
+fn compressed_video_arrives_as_sent_by_every_kind_of_send() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut sender = CompressedSender::new(&ndi, &options("video-matrix")).unwrap();
+    let source = sender.source().unwrap();
+    let mut program = packet_receiver(&ndi, &source, ReceiverBandwidth::Highest);
+    let mut preview = packet_receiver(&ndi, &source, ReceiverBandwidth::Lowest);
+    for (receiver, tier) in [
+        (&mut program, StreamTier::Program),
+        (&mut preview, StreamTier::Preview),
+    ] {
+        connect(receiver, |timecode| {
+            sender
+                .send_video(&mut keyframe(VideoCodec::H264, tier, timecode))
+                .unwrap();
+        });
+    }
+
+    let scans = [
+        ScanType::Progressive,
+        ScanType::Interlaced,
+        ScanType::Field0,
+        ScanType::Field1,
+    ];
+    let submissions = [
+        Submission::Contiguous,
+        Submission::ContiguousAsync,
+        Submission::Scatter,
+        Submission::ScatterAsync,
+    ];
+    let mut timecode = FIRST_TIMECODE;
+    let mut returned = 0;
+    for codec in VIDEO_CODECS {
+        for (tier, protected) in [
+            (StreamTier::Program, false),
+            (StreamTier::Program, true),
+            (StreamTier::Preview, false),
+            (StreamTier::Preview, true),
+        ] {
+            let receiver = match tier {
+                StreamTier::Program => &mut program,
+                StreamTier::Preview => &mut preview,
+            };
+            // A keyframe starts each stream; the frames that depend on it
+            // follow, one by each kind of send.
+            let frames = submissions
+                .into_iter()
+                .flat_map(|submission| [(submission, true), (submission, false)])
+                .filter(|(_, keyframe)| *keyframe || codec.envelope_codec().is_some());
+            for (submission, keyframe) in frames {
+                timecode += 1;
+                let format = video_format(codec, tier)
+                    .protected(protected)
+                    .scan_type(scans[timecode as usize % scans.len()]);
+                let bytes = video_bytes(codec, timecode, keyframe);
+                let metadata = format!("<frame number=\"{timecode}\"/>");
+                let contiguous = || {
+                    CompressedVideoFrame::new(format, bytes.clone())
+                        .unwrap()
+                        .with_timecode(timecode)
+                        .with_metadata(metadata.as_str())
+                        .unwrap()
+                };
+                let scatter = || {
+                    // The header alone, the payload in two parts, and the
+                    // parameter sets split from it.
+                    let cuts: &[usize] = match codec.envelope_codec() {
+                        Some(_) => &[44, 2000, bytes.len() - 5],
+                        None => &[4, 2000],
+                    };
+                    ScatterVideoFrame::new(format, split(&bytes, cuts))
+                        .unwrap()
+                        .with_timecode(timecode)
+                        .with_metadata(metadata.as_str())
+                        .unwrap()
+                };
+                match submission {
+                    Submission::Contiguous => {
+                        let mut frame = contiguous();
+                        sender.send_video(&mut frame).unwrap();
+                        assert_same_packet(frame.data(), &bytes, codec.envelope_codec());
+                    }
+                    Submission::ContiguousAsync => {
+                        returned +=
+                            usize::from(sender.send_video_async(contiguous()).unwrap().is_some());
+                    }
+                    Submission::Scatter => {
+                        let mut frame = scatter();
+                        sender.send_scatter_video(&mut frame).unwrap();
+                        assert_eq!(frame.total_bytes(), bytes.len());
+                    }
+                    Submission::ScatterAsync => {
+                        returned += usize::from(
+                            sender
+                                .send_scatter_video_async(scatter())
+                                .unwrap()
+                                .is_some(),
+                        );
+                    }
+                }
+                let received = await_video(receiver, timecode);
+                assert_eq!(
+                    received.format(),
+                    format,
+                    "{codec:?} {submission:?} keyframe={keyframe}"
+                );
+                assert_eq!(received.metadata(), Some(metadata.as_str()));
+                assert_same_packet(received.data(), &bytes, codec.envelope_codec());
+            }
+        }
+    }
+    // Every asynchronous send but the first on each stream returned the frame
+    // it replaced, and the last two are still held.
+    let asynchronous = VIDEO_CODECS
+        .iter()
+        .map(|codec| {
+            if codec.envelope_codec().is_some() {
+                16
+            } else {
+                8
+            }
+        })
+        .sum::<usize>();
+    assert_eq!(returned, asynchronous - 2);
+    let unsent = sender.close();
+    assert!(unsent.program.is_some() && unsent.preview.is_some());
+}
+
+/// One compressed audio frame a test offers to the wrapper.
+#[derive(Debug)]
+struct AudioCandidate {
+    codec: AudioCodec,
+    sample_rate: i32,
+    channels: i32,
+    samples: i32,
+    /// For AAC, the sample rate and channel count its configuration names,
+    /// or `None` for a configuration too short to name them.
+    config: Option<(i32, i32)>,
+    /// For AAC, whether the envelope keeps its keyframe flag.
+    flagged: bool,
+}
+
+impl AudioCandidate {
+    fn opus(sample_rate: i32, channels: i32, samples: i32) -> Self {
+        Self {
+            codec: AudioCodec::Opus,
+            sample_rate,
+            channels,
+            samples,
+            config: None,
+            flagged: true,
+        }
+    }
+
+    /// An AAC frame whose configuration names the frame's own parameters
+    /// where it can, and 48 kHz stereo where it cannot.
+    fn aac(sample_rate: i32, channels: i32, samples: i32) -> Self {
+        let nameable = |values: &[i32], value, otherwise| {
+            if values.contains(&value) {
+                value
+            } else {
+                otherwise
+            }
+        };
+        Self {
+            codec: AudioCodec::Aac,
+            sample_rate,
+            channels,
+            samples,
+            config: Some((
+                nameable(&AAC_SAMPLE_RATES, sample_rate, 48_000),
+                nameable(&AAC_CHANNELS, channels, 2),
+            )),
+            flagged: true,
+        }
+    }
+
+    fn bytes(&self, seed: i64) -> Vec<u8> {
+        if self.codec != AudioCodec::Aac {
+            return payload(seed, 120);
+        }
+        let config = match self.config {
+            Some((sample_rate, channels)) => aac_config(sample_rate, channels).to_vec(),
+            None => vec![0x11],
+        };
+        let mut bytes = packet_envelope(
+            EnvelopeCodec::Aac,
+            48_000 + seed,
+            47_000 - seed,
+            true,
+            &payload(seed, 300),
+            &config,
+        )
+        .unwrap();
+        if !self.flagged {
+            // The flags follow the two timestamps and the reserved field.
+            bytes[32..36].copy_from_slice(&0u32.to_ne_bytes());
+        }
+        bytes
+    }
+}
+
+/// The SDK takes any compressed audio frame and silently discards the ones
+/// it does not accept. Of a grid of frames, sensible and not, every one the
+/// wrapper admits arrives exactly as it was sent, from one buffer and from
+/// several; the rest it refuses to build.
+#[test]
+fn every_audio_frame_the_wrapper_admits_is_delivered_as_sent() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut sender = CompressedSender::new(&ndi, &options("audio-matrix")).unwrap();
+    let mut receiver = packet_receiver(&ndi, &sender.source().unwrap(), ReceiverBandwidth::Highest);
+    connect(&mut receiver, |timecode| {
+        let mut probe = CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 64])
+            .unwrap()
+            .with_timecode(timecode);
+        sender.send_audio(&mut probe).unwrap();
+    });
+
+    let mut candidates = Vec::new();
+    for sample_rate in [
+        8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 96_000,
+    ] {
+        // From 2.5 ms to 120 ms, in units of 2.5 ms.
+        for (index, units) in [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48]
+            .into_iter()
+            .enumerate()
+        {
+            let channels = [1, 2, 6][index % 3];
+            candidates.push(AudioCandidate::opus(
+                sample_rate,
+                channels,
+                sample_rate * units / 400,
+            ));
+        }
+    }
+    for sample_rate in AAC_SAMPLE_RATES.into_iter().chain([22_000, 50_000]) {
+        candidates.push(AudioCandidate::aac(sample_rate, 2, 1024));
+    }
+    for channels in [1, 3, 4, 5, 6, 7, 8, 9] {
+        candidates.push(AudioCandidate::aac(48_000, channels, 1024));
+    }
+    for samples in [512, 960, 2048] {
+        candidates.push(AudioCandidate::aac(48_000, 2, samples));
+    }
+    // A configuration for another sample rate or layout than the frame's, one
+    // too short to name either, and a packet without the keyframe flag.
+    candidates.extend([
+        AudioCandidate {
+            config: Some((44_100, 2)),
+            ..AudioCandidate::aac(48_000, 2, 1024)
+        },
+        AudioCandidate {
+            config: Some((48_000, 1)),
+            ..AudioCandidate::aac(48_000, 2, 1024)
+        },
+        AudioCandidate {
+            config: None,
+            ..AudioCandidate::aac(48_000, 2, 1024)
+        },
+        AudioCandidate {
+            flagged: false,
+            ..AudioCandidate::aac(48_000, 2, 1024)
+        },
+    ]);
+
+    let mut timecode = FIRST_TIMECODE;
+    let (mut opus, mut aac) = (0, 0);
+    for candidate in candidates {
+        let AudioCandidate {
+            codec,
+            sample_rate,
+            channels,
+            samples,
+            ..
+        } = candidate;
+        // An AAC configuration is split across the last two blocks.
+        let cuts = |bytes: &[u8]| match codec {
+            AudioCodec::Aac => vec![44, 100, bytes.len() - 1],
+            _ => vec![1, 60],
+        };
+        let probe = candidate.bytes(0);
+        let admitted =
+            CompressedAudioFrame::new(codec, sample_rate, channels, samples, probe.clone()).is_ok();
+        let admitted_in_blocks = ScatterAudioFrame::new(
+            codec,
+            sample_rate,
+            channels,
+            samples,
+            split(&probe, &cuts(&probe)),
+        )
+        .is_ok();
+        assert_eq!(
+            admitted, admitted_in_blocks,
+            "one buffer and several are admitted alike: {candidate:?}"
+        );
+        if !admitted {
+            continue;
+        }
+        match codec {
+            AudioCodec::Aac => aac += 1,
+            _ => opus += 1,
+        }
+        for (scatter, protected) in [(false, false), (true, false), (false, true), (true, true)] {
+            timecode += 1;
+            let bytes = candidate.bytes(timecode);
+            let metadata = format!("<frame number=\"{timecode}\"/>");
+            if scatter {
+                let blocks = split(&bytes, &cuts(&bytes));
+                let mut frame =
+                    ScatterAudioFrame::new(codec, sample_rate, channels, samples, blocks)
+                        .unwrap()
+                        .with_timecode(timecode)
+                        .protected(protected)
+                        .with_metadata(metadata.as_str())
+                        .unwrap();
+                sender.send_scatter_audio(&mut frame).unwrap();
+            } else {
+                let mut frame =
+                    CompressedAudioFrame::new(codec, sample_rate, channels, samples, bytes.clone())
+                        .unwrap()
+                        .with_timecode(timecode)
+                        .protected(protected)
+                        .with_metadata(metadata.as_str())
+                        .unwrap();
+                sender.send_audio(&mut frame).unwrap();
+            }
+            let received = await_audio(&mut receiver, timecode);
+            assert_eq!(
+                (
+                    received.codec(),
+                    received.is_protected(),
+                    received.sample_rate(),
+                    received.channels(),
+                    received.samples()
+                ),
+                (codec, protected, sample_rate, channels, samples),
+                "scatter={scatter}"
+            );
+            assert_eq!(received.metadata(), Some(metadata.as_str()));
+            let envelope = (codec == AudioCodec::Aac).then_some(EnvelopeCodec::Aac);
+            assert_same_packet(received.data(), &bytes, envelope);
+        }
+    }
+    // Opus at five sample rates and six durations; AAC at each sample rate
+    // its configuration can name, and in stereo at 48 kHz with each of the
+    // six other layouts.
+    assert_eq!((opus, aac), (5 * 6, 13 + 6));
+}
+
+/// As for audio: of a grid of video frames on both streams, every one the
+/// wrapper admits arrives, from one buffer and from several, and the rest
+/// (previews of H.264 and HEVC that are too large, SpeedHQ frames that do not
+/// begin with a quality) it refuses to build.
+#[test]
+fn every_video_frame_the_wrapper_admits_is_delivered() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut sender = CompressedSender::new(&ndi, &options("video-grid")).unwrap();
+    let source = sender.source().unwrap();
+    let mut program = packet_receiver(&ndi, &source, ReceiverBandwidth::Highest);
+    let mut preview = packet_receiver(&ndi, &source, ReceiverBandwidth::Lowest);
+    for (receiver, tier) in [
+        (&mut program, StreamTier::Program),
+        (&mut preview, StreamTier::Preview),
+    ] {
+        connect(receiver, |timecode| {
+            sender
+                .send_video(&mut keyframe(VideoCodec::H264, tier, timecode))
+                .unwrap();
+        });
+    }
+
+    let sizes = [
+        (640, 360),
+        (360, 640),
+        (640, 640),
+        (641, 360),
+        (640, 641),
+        (1280, 720),
+        (1920, 1080),
+    ];
+    let mut timecode = FIRST_TIMECODE;
+    let (mut envelopes, mut speedhq) = (0, 0);
+    for codec in VIDEO_CODECS {
+        // The quality a SpeedHQ frame begins with. An envelope has none.
+        let qualities: &[Option<u8>] = match codec.envelope_codec() {
+            Some(_) => &[None],
+            None => &[Some(0), Some(99), Some(100), Some(255)],
+        };
+        for tier in [StreamTier::Program, StreamTier::Preview] {
+            let receiver = match tier {
+                StreamTier::Program => &mut program,
+                StreamTier::Preview => &mut preview,
+            };
+            for ((width, height), quality) in sizes
+                .into_iter()
+                .flat_map(|size| qualities.iter().map(move |quality| (size, *quality)))
+            {
+                let format = VideoPacketFormat::new(codec, width, height)
+                    .unwrap()
+                    .tier(tier);
+                // A format that leaves the aspect ratio at zero has square
+                // pixels, and arrives with the ratio that stands for.
+                let delivered = format.aspect_ratio(width as f32 / height as f32).unwrap();
+                let bytes = |timecode| {
+                    let mut bytes = video_bytes(codec, timecode, true);
+                    if let Some(quality) = quality {
+                        bytes[0] = quality;
+                    }
+                    bytes
+                };
+                let cuts: &[usize] = match codec.envelope_codec() {
+                    Some(_) => &[44, 2000],
+                    None => &[4, 2000],
+                };
+                let probe = bytes(0);
+                let admitted = CompressedVideoFrame::new(format, probe.clone()).is_ok();
+                let admitted_in_blocks =
+                    ScatterVideoFrame::new(format, split(&probe, cuts)).is_ok();
+                assert_eq!(
+                    admitted, admitted_in_blocks,
+                    "one buffer and several are admitted alike: {format:?} quality {quality:?}"
+                );
+                if !admitted {
+                    continue;
+                }
+                match codec.envelope_codec() {
+                    Some(_) => envelopes += 1,
+                    None => speedhq += 1,
+                }
+
+                timecode += 1;
+                let sent = bytes(timecode);
+                let mut frame = CompressedVideoFrame::new(format, sent.clone())
+                    .unwrap()
+                    .with_timecode(timecode);
+                sender.send_video(&mut frame).unwrap();
+                let received = await_video(receiver, timecode);
+                assert_eq!(received.format(), delivered);
+                assert_same_packet(received.data(), &sent, codec.envelope_codec());
+
+                timecode += 1;
+                let sent = bytes(timecode);
+                let mut frame = ScatterVideoFrame::new(format, split(&sent, cuts))
+                    .unwrap()
+                    .with_timecode(timecode);
+                sender.send_scatter_video(&mut frame).unwrap();
+                let received = await_video(receiver, timecode);
+                assert_eq!(received.format(), delivered);
+                assert_same_packet(received.data(), &sent, codec.envelope_codec());
+            }
+        }
+    }
+    // Four envelope codecs: every size on the program stream, the three that
+    // fit in 640 by 640 on the preview stream. Three SpeedHQ codecs: every
+    // size on both streams, with either quality.
+    assert_eq!((envelopes, speedhq), (4 * (7 + 3), 3 * 2 * 7 * 2));
+}
+
+/// A relay sends on what it receives. The SDK delivers every envelope with
+/// its reserved field set, so a relay works only if such packets can be sent.
+#[test]
+fn a_relay_delivers_every_packet_it_receives() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut origin = CompressedSender::new(&ndi, &options("relay-origin")).unwrap();
+    let mut upstream = packet_receiver(&ndi, &origin.source().unwrap(), ReceiverBandwidth::Highest);
+    let mut relay = CompressedSender::new(&ndi, &options("relay")).unwrap();
+    let mut downstream =
+        packet_receiver(&ndi, &relay.source().unwrap(), ReceiverBandwidth::Highest);
+    for (sender, receiver) in [(&mut origin, &mut upstream), (&mut relay, &mut downstream)] {
+        connect(receiver, |timecode| {
+            sender
+                .send_video(&mut keyframe(
+                    VideoCodec::H264,
+                    StreamTier::Program,
+                    timecode,
+                ))
+                .unwrap();
+        });
+    }
+
+    let mut timecode = FIRST_TIMECODE;
+    let video = [
+        (VideoCodec::H264, true),
+        (VideoCodec::H264, false),
+        (VideoCodec::H264, false),
+        (VideoCodec::Hevc, true),
+        (VideoCodec::Hevc, false),
+        (VideoCodec::H264Alpha, true),
+        (VideoCodec::HevcAlpha, true),
+        (VideoCodec::SpeedHq422, true),
+    ];
+    for (index, (codec, is_keyframe)) in video.into_iter().enumerate() {
+        timecode += 1;
+        let format = video_format(codec, StreamTier::Program);
+        let bytes = video_bytes(codec, timecode, is_keyframe);
+        let mut frame = CompressedVideoFrame::new(format, bytes.clone())
+            .unwrap()
+            .with_timecode(timecode)
+            .with_metadata("<relayed/>")
+            .unwrap();
+        origin.send_video(&mut frame).unwrap();
+
+        let mut received = await_video(&mut upstream, timecode);
+        if index % 2 == 0 {
+            relay.send_video(&mut received).unwrap();
+        } else {
+            relay.send_video_async(received).unwrap();
+        }
+        let relayed = await_video(&mut downstream, timecode);
+        assert_eq!(relayed.format(), format);
+        assert_eq!(relayed.metadata(), Some("<relayed/>"));
+        assert_same_packet(relayed.data(), &bytes, codec.envelope_codec());
+    }
+
+    let audio = [
+        (AudioCodec::Aac, 48_000, 2, 1024),
+        (AudioCodec::Aac, 44_100, 6, 1024),
+        (AudioCodec::Opus, 48_000, 2, 960),
+        (AudioCodec::Opus, 16_000, 1, 320),
+    ];
+    for (codec, sample_rate, channels, samples) in audio {
+        for _ in 0..2 {
+            timecode += 1;
+            let bytes = audio_bytes(codec, sample_rate, channels, timecode);
+            let mut frame =
+                CompressedAudioFrame::new(codec, sample_rate, channels, samples, bytes.clone())
+                    .unwrap()
+                    .with_timecode(timecode);
+            origin.send_audio(&mut frame).unwrap();
+
+            let mut received = await_audio(&mut upstream, timecode);
+            relay.send_audio(&mut received).unwrap();
+            let relayed = await_audio(&mut downstream, timecode);
+            assert_eq!(
+                (
+                    relayed.codec(),
+                    relayed.sample_rate(),
+                    relayed.channels(),
+                    relayed.samples()
+                ),
+                (codec, sample_rate, channels, samples)
+            );
+            let envelope = (codec == AudioCodec::Aac).then_some(EnvelopeCodec::Aac);
+            assert_same_packet(relayed.data(), &bytes, envelope);
+        }
+    }
+}
+
+/// The SDK writes to a frame while it sends it. The frame is still the frame
+/// that was built, and can be sent again by every kind of send.
+#[test]
+fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut sender = CompressedSender::new(&ndi, &options("resend")).unwrap();
+    let mut receiver = packet_receiver(&ndi, &sender.source().unwrap(), ReceiverBandwidth::Highest);
+    connect(&mut receiver, |timecode| {
+        sender
+            .send_video(&mut keyframe(
+                VideoCodec::H264,
+                StreamTier::Program,
+                timecode,
+            ))
+            .unwrap();
+    });
+    let format = video_format(VideoCodec::H264, StreamTier::Program);
+    let h264 = Some(EnvelopeCodec::H264);
+    let mut timecode = FIRST_TIMECODE;
+
+    // One contiguous frame, synchronously.
+    timecode += 1;
+    let bytes = video_bytes(VideoCodec::H264, timecode, true);
+    let mut frame = CompressedVideoFrame::new(format, bytes.clone())
+        .unwrap()
+        .with_timecode(timecode)
+        .with_metadata("<again/>")
+        .unwrap();
+    for _ in 0..3 {
+        sender.send_video(&mut frame).unwrap();
+        let received = await_video(&mut receiver, timecode);
+        assert_same_packet(received.data(), &bytes, h264);
+        assert_eq!(received.metadata(), Some("<again/>"));
+        assert_same_packet(frame.data(), &bytes, h264);
+        assert_eq!(frame.metadata(), Some("<again/>"));
+        frame.validate_for_send().unwrap();
+    }
+
+    // One scatter frame, synchronously.
+    timecode += 1;
+    let bytes = video_bytes(VideoCodec::H264, timecode, true);
+    let mut scatter = ScatterVideoFrame::new(format, split(&bytes, &[44, 2000]))
+        .unwrap()
+        .with_timecode(timecode);
+    for _ in 0..3 {
+        sender.send_scatter_video(&mut scatter).unwrap();
+        assert_same_packet(await_video(&mut receiver, timecode).data(), &bytes, h264);
+    }
+    let joined = scatter.into_contiguous_copy();
+    assert_same_packet(joined.data(), &bytes, h264);
+
+    // Two frames that take turns being held by an asynchronous send.
+    let mut frames = Vec::new();
+    for _ in 0..2 {
+        timecode += 1;
+        let bytes = video_bytes(VideoCodec::H264, timecode, true);
+        let frame = CompressedVideoFrame::new(format, bytes.clone())
+            .unwrap()
+            .with_timecode(timecode);
+        frames.push((timecode, bytes, Some(frame)));
+    }
+    for round in 0..6 {
+        let (timecode, bytes, frame) = &mut frames[round % 2];
+        let frame = frame.take().expect("the frame came back from the sender");
+        let replaced = sender.send_video_async(frame).unwrap();
+        assert_same_packet(await_video(&mut receiver, *timecode).data(), bytes, h264);
+        match replaced {
+            Some(SubmittedVideo::Contiguous(earlier)) => {
+                let (_, bytes, slot) = &mut frames[(round + 1) % 2];
+                assert_same_packet(earlier.data(), bytes, h264);
+                *slot = Some(earlier);
+            }
+            None => assert_eq!(round, 0),
+            Some(other) => panic!("a contiguous frame was submitted, not {other:?}"),
+        }
+    }
+
+    // Audio in an envelope, and without one.
+    for (codec, samples) in [(AudioCodec::Aac, 1024), (AudioCodec::Opus, 960)] {
+        timecode += 1;
+        let bytes = audio_bytes(codec, 48_000, 2, timecode);
+        let envelope = (codec == AudioCodec::Aac).then_some(EnvelopeCodec::Aac);
+        let mut frame = CompressedAudioFrame::new(codec, 48_000, 2, samples, bytes.clone())
+            .unwrap()
+            .with_timecode(timecode);
+        for _ in 0..3 {
+            sender.send_audio(&mut frame).unwrap();
+            assert_same_packet(
+                await_audio(&mut receiver, timecode).data(),
+                &bytes,
+                envelope,
+            );
+            assert_same_packet(frame.data(), &bytes, envelope);
+        }
+    }
+}
+
+/// A frame a queue has sent comes back complete and can be queued again.
+#[test]
+fn a_frame_returned_by_a_queued_sender_can_be_resubmitted() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut queue = QueuedSender::new(&ndi, &options("requeue"), QueueOptions::default()).unwrap();
+    let mut receiver = packet_receiver(&ndi, &queue.source().unwrap(), ReceiverBandwidth::Highest);
+    connect(&mut receiver, |timecode| {
+        queue
+            .try_submit(keyframe(VideoCodec::H264, StreamTier::Program, timecode))
+            .unwrap();
+        queue
+            .wait_completed(PATIENCE)
+            .unwrap()
+            .expect("the SDK completes a frame it was given");
+    });
+
+    let timecode = FIRST_TIMECODE + 1;
+    let bytes = video_bytes(VideoCodec::H264, timecode, true);
+    let format = video_format(VideoCodec::H264, StreamTier::Program);
+    let mut frame = QueuedVideoFrame::from(
+        CompressedVideoFrame::new(format, bytes.clone())
+            .unwrap()
+            .with_timecode(timecode),
+    );
+    for _ in 0..4 {
+        let id = queue.try_submit(frame).unwrap();
+        let received = await_video(&mut receiver, timecode);
+        assert_same_packet(received.data(), &bytes, Some(EnvelopeCodec::H264));
+        let completed = queue
+            .wait_completed(PATIENCE)
+            .unwrap()
+            .expect("the SDK completes a frame it has sent");
+        assert_eq!(completed.id(), id);
+        frame = completed.into_frame();
+        let QueuedVideoFrame::Compressed(sent) = &frame else {
+            panic!("a compressed frame was queued");
+        };
+        assert_same_packet(sent.data(), &bytes, Some(EnvelopeCodec::H264));
+    }
+    assert_eq!(queue.retained_frames(), 0);
+    assert!(!queue.completion_protocol_failed());
+}
+
+/// Sets a flag when it goes out of scope, so that a thread that runs until
+/// the flag is set also stops when the test fails.
+struct StopOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Ask `sync` for audio, once for each video frame that arrives, until it has
+/// returned audio `count` times. `with_video` passes the frame along; without
+/// it the frame only paces the requests.
+fn synchronized_audio(
+    sync: &mut AvSync,
+    request: AvSyncRequest,
+    with_video: bool,
+    count: usize,
+) -> Vec<(AudioFrame, bool)> {
+    let deadline = Instant::now() + PATIENCE;
+    let mut audio = Vec::new();
+    while audio.len() < count {
+        assert!(
+            Instant::now() < deadline,
+            "AVSync returned audio {} times, not {count}",
+            audio.len()
+        );
+        let Some(video) = sync.receiver().video().try_capture(SLICE).unwrap() else {
+            continue;
+        };
+        match sync
+            .synchronize(with_video.then_some(&video), request)
+            .unwrap()
+        {
+            AvSyncOutcome::Audio {
+                frame,
+                samples_adjusted,
+            } => audio.push((frame, samples_adjusted)),
+            // The streams are starting, or this frame's audio is still on
+            // its way.
+            AvSyncOutcome::NoAudioStream
+            | AvSyncOutcome::NoMatchingSamples
+            | AvSyncOutcome::Empty { .. } => {}
+            other => panic!("unexpected AVSync outcome {other:?}"),
+        }
+    }
+    audio
+}
+
+/// AVSync returns the audio of a source as audio: the amount that belongs to
+/// a video frame when asked automatically, and the amount asked for when a
+/// request names one.
+#[test]
+fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    // Video paced at 30 frames per second, each frame followed by the 1600
+    // samples of 48 kHz audio that last as long.
+    let sender = Sender::new(
+        &ndi,
+        &SenderOptions::builder(format!("grafton-local-{}-avsync", std::process::id()))
+            .clock_video(true)
+            .clock_audio(false)
+            .build(),
+    )
+    .unwrap();
+    let receiver = Receiver::new(
+        &ndi,
+        &ReceiverOptions::builder(common::loopback_source(&ndi, &sender).unwrap()).build(),
+    )
+    .unwrap();
+    let mut sync = AvSync::new(receiver).unwrap();
+    let video = VideoFrame::builder()
+        .resolution(64, 32)
+        .frame_rate(30, 1)
+        .build()
+        .unwrap();
+    let audio = AudioFrame::builder()
+        .sample_rate(48_000)
+        .channels(2)
+        .samples(1600)
+        .build()
+        .unwrap();
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let _stop = StopOnDrop(&stop);
+        scope.spawn(|| {
+            while !stop.load(Ordering::Acquire) {
+                sender.send_video(&video);
+                sender.send_audio(&audio);
+            }
+        });
+        let is_source_format = |frame: &AudioFrame| {
+            assert_eq!((frame.sample_rate(), frame.num_channels()), (48_000, 2));
+        };
+
+        // Automatic: the audio that spans each video frame. The span is
+        // measured between the times the frames were sent, so single results
+        // vary by a few samples around the 1600 a frame lasts.
+        let automatic = synchronized_audio(&mut sync, AvSyncRequest::automatic(), true, 9);
+        let mut counts = Vec::new();
+        for (frame, samples_adjusted) in &automatic {
+            is_source_format(frame);
+            assert!(!samples_adjusted);
+            counts.push(frame.num_samples());
+        }
+        counts.sort_unstable();
+        assert!(
+            (1520..=1680).contains(&counts[counts.len() / 2]),
+            "automatic requests returned {counts:?} samples"
+        );
+
+        // A count close to what belongs to a video frame is returned exactly.
+        let request = AvSyncRequest::new(Some(1600), Some(48_000)).unwrap();
+        let exact = synchronized_audio(&mut sync, request, true, 5);
+        for (frame, samples_adjusted) in &exact {
+            is_source_format(frame);
+            assert!(
+                *samples_adjusted || frame.num_samples() == 1600,
+                "an unadjusted result has {} samples",
+                frame.num_samples()
+            );
+        }
+        assert!(exact.iter().any(|(_, samples_adjusted)| !samples_adjusted));
+
+        // A count far from it is not: the frame's own audio comes back, and
+        // the result says that the count was not met.
+        let request = AvSyncRequest::new(Some(800), Some(48_000)).unwrap();
+        for (frame, samples_adjusted) in synchronized_audio(&mut sync, request, true, 3) {
+            is_source_format(&frame);
+            assert!(samples_adjusted && frame.num_samples() != 800);
+        }
+
+        // An exact count without a video frame is taken from the queued audio.
+        let request = AvSyncRequest::new(Some(480), Some(48_000)).unwrap();
+        for (frame, samples_adjusted) in synchronized_audio(&mut sync, request, false, 3) {
+            is_source_format(&frame);
+            assert_eq!((frame.num_samples(), samples_adjusted), (480, false));
+        }
+
+        // Everything that is queued.
+        let all = synchronized_audio(&mut sync, AvSyncRequest::automatic(), false, 1);
+        is_source_format(&all[0].0);
+        assert!(all[0].0.num_samples() > 0);
+
+        // A request computed for another sample rate than the source's is
+        // told the source's format instead of being given audio.
+        let request = AvSyncRequest::new(Some(1470), Some(44_100)).unwrap();
+        let frame = sync.receiver().video().capture(PATIENCE).unwrap();
+        assert!(matches!(
+            sync.synchronize(Some(&frame), request).unwrap(),
+            AvSyncOutcome::FormatChanged {
+                sample_rate: 48_000,
+                channels: 2
+            }
+        ));
+    });
+    drop(sync.into_receiver());
+}
+
+/// The policy calls of a test, which wait for each other inside the policy.
+#[derive(Default)]
+struct PolicyCalls {
+    /// Calls inside the policy now, the most there have been at once, the
+    /// most the service has reported in progress, and whether to stop waiting.
+    state: Mutex<(usize, usize, usize, bool)>,
+    changed: Condvar,
+}
+
+impl PolicyCalls {
+    fn lock(&self) -> MutexGuard<'_, (usize, usize, usize, bool)> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The default limits promise a number of concurrent policy calls. That many
+/// receivers, each with a frame arriving, are all inside the policy at once.
+#[test]
+fn allocator_calls_run_concurrently_up_to_the_documented_limit() {
+    /// What the documentation of `AllocatorLimits` gives as its default.
+    const CONCURRENT_CALLS: usize = 16;
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let sender = Sender::new(&ndi, &options("allocator-calls")).unwrap();
+    let source = common::loopback_source(&ndi, &sender).unwrap();
+    let service =
+        AllocatorService::new(ndi.process_lifetime(), AllocatorLimits::default()).unwrap();
+    let calls = Arc::new(PolicyCalls::default());
+    let receivers: Vec<_> = (0..CONCURRENT_CALLS)
+        .map(|_| {
+            let receiver =
+                Receiver::new(&ndi, &ReceiverOptions::builder(source.clone()).build()).unwrap();
+            let mut receiver = service.attach(receiver).unwrap();
+            let calls = calls.clone();
+            receiver
+                .set_video_allocator(move |request: AllocationRequest| {
+                    let mut state = calls.lock();
+                    state.0 += 1;
+                    state.1 = state.1.max(state.0);
+                    state.2 = state.2.max(service.usage().in_progress_allocations());
+                    calls.changed.notify_all();
+                    // Stay inside until every receiver's call is inside too.
+                    let (mut state, _) = calls
+                        .changed
+                        .wait_timeout_while(state, PATIENCE, |state| {
+                            state.1 < CONCURRENT_CALLS && !state.3
+                        })
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.0 -= 1;
+                    drop(state);
+                    AllocationBuffer::zeroed(request)
+                })
+                .unwrap();
+            receiver
+        })
+        .collect();
+
+    let frame = video();
+    let deadline = Instant::now() + PATIENCE;
+    let (peak, in_progress) = loop {
+        sender.send_video(&frame);
+        let (mut state, _) = calls
+            .changed
+            .wait_timeout_while(calls.lock(), SLICE, |state| state.1 < CONCURRENT_CALLS)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.1 >= CONCURRENT_CALLS || Instant::now() >= deadline {
+            state.3 = true;
+            calls.changed.notify_all();
+            break (state.1, state.2);
+        }
+    };
+    assert_eq!(
+        (peak, in_progress),
+        (CONCURRENT_CALLS, CONCURRENT_CALLS),
+        "policy calls that ran at once, and calls the service counted in progress"
+    );
+
+    drop(receivers);
+    drop(sender);
+    let usage = service.usage();
+    assert_eq!(
+        (
+            usage.retained_allocations(),
+            usage.retained_bytes(),
+            usage.generations(),
+            usage.in_progress_allocations()
+        ),
+        (0, 0, 0, 0),
+        "an allocation outlived its receiver: {usage:?}"
+    );
+}
+
+/// The Discovery Server of the SDK the selected runtime belongs to, on a
+/// loopback port, stopped when dropped.
+struct DiscoveryServer {
+    process: Child,
+    endpoint: String,
+}
+
+impl DiscoveryServer {
+    /// Start `<root>/bin/<target>/ndi-discovery-server`, which the SDK
+    /// installs beside the runtime library in `<root>/lib/<target>/`, or
+    /// return `None` when the selected runtime has no such program beside it.
+    fn start(ndi: &NDI) -> Option<Self> {
+        let info = ndi.info();
+        let library_directory = info.library_path()?.parent()?;
+        let binary = library_directory
+            .parent()?
+            .parent()?
+            .join("bin")
+            .join(library_directory.file_name()?)
+            .join("ndi-discovery-server");
+        if !binary.is_file() {
+            return None;
+        }
+        // Reserve a free port, then hand it to the server.
+        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let process = Command::new(binary)
+            .args(["-bind", "127.0.0.1", "-port", &port.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let server = Self {
+            process,
+            endpoint: format!("127.0.0.1:{port}"),
+        };
+        let deadline = Instant::now() + PATIENCE;
+        while TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "the Discovery Server did not start listening on {}",
+                server.endpoint
+            );
+            // Poll the program that is starting, not the SDK.
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Some(server)
+    }
+}
+
+impl Drop for DiscoveryServer {
+    fn drop(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+    }
+}
+
+/// A sender names its metadata in its configuration, and a finder that uses
+/// the same Discovery Server is told it; a sender that names none has none.
+#[test]
+fn a_finder_is_told_the_metadata_a_sender_advertises() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let Some(server) = DiscoveryServer::start(&ndi) else {
+        common::skip(
+            common::Requirement::DiscoveryServer,
+            "the SDK's ndi-discovery-server is not beside the selected runtime",
+        );
+        return;
+    };
+    let config = |properties: &str| {
+        AdvancedConfig::parse(format!(
+            r#"{{"ndi":{{"networks":{{"discovery":"{}"}}{properties}}}}}"#,
+            server.endpoint
+        ))
+        .unwrap()
+    };
+    let described = Sender::new_with_config(
+        &ndi,
+        &options("described"),
+        &config(r#","send":{"metadata":"<grafton-test kind=\"described\"/>"}"#),
+    )
+    .unwrap();
+    let undescribed = Sender::new_with_config(&ndi, &options("undescribed"), &config("")).unwrap();
+    let finder = Finder::new_with_config(&ndi, &FinderOptions::default(), &config("")).unwrap();
+
+    let names = [
+        described.source().unwrap().name,
+        undescribed.source().unwrap().name,
+    ];
+    let deadline = Instant::now() + PATIENCE;
+    let metadata = loop {
+        let sources = finder.sources_with_metadata().unwrap();
+        let found: Vec<_> = names
+            .iter()
+            .filter_map(|name| sources.iter().find(|source| source.source().name == *name))
+            .map(|source| source.metadata().map(str::to_owned))
+            .collect();
+        if found.len() == names.len() {
+            break found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the finder was told of {} of the two senders",
+            found.len()
+        );
+        finder.wait_for_sources(SLICE).unwrap();
+    };
+    assert_eq!(
+        metadata,
+        [Some("<grafton-test kind=\"described\"/>".to_owned()), None]
+    );
 }

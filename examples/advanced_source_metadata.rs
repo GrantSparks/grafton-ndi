@@ -4,6 +4,10 @@
 //! - Creating a finder with an Advanced SDK configuration
 //! - Listing each source with its metadata
 //!
+//! A sender advertises metadata in the `send.metadata` property of its own
+//! configuration, and a finder is told it by a Discovery Server: name the
+//! server in the `networks.discovery` property of the configuration below.
+//!
 //! Needs the NDI Advanced SDK at build time and an Advanced runtime.
 //!
 //! Run with: `cargo run --features advanced --example advanced_source_metadata`

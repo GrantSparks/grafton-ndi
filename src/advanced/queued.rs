@@ -20,8 +20,10 @@ use crate::{
         advanced::{native, SendCompletion},
         bindings::*,
     },
-    Error, Rejected, Result, Sender, SenderOptions, VideoFrame, NDI,
+    Error, Rejected, Result, Sender, SenderOptions, Source, VideoFrame, NDI,
 };
+
+use super::aliasable::AliasableBox;
 
 /// Limits on what a [`QueuedSender`] holds at once.
 ///
@@ -104,7 +106,9 @@ impl From<CompressedVideoFrame> for QueuedVideoFrame {
 }
 
 impl QueuedVideoFrame {
-    fn raw(&self) -> NDIlib_video_frame_v2_t {
+    /// A native descriptor that lends this frame to the SDK, which may write
+    /// to a compressed frame's bytes for as long as it holds the descriptor.
+    fn raw(&mut self) -> NDIlib_video_frame_v2_t {
         match self {
             Self::Pixels(v) => v.to_raw(),
             Self::Compressed(v) => v.raw(),
@@ -150,18 +154,22 @@ impl CompletedVideo {
 }
 
 /// One submitted frame and the descriptor the SDK was given for it.
+///
+/// The entry owns the frame it lent, so nothing can read the frame's bytes
+/// while the SDK may still write to them.
 struct Entry {
     id: SubmissionId,
     // Kept only so that the address given to the SDK stays valid.
-    _header: Box<NDIlib_video_frame_v2_t>,
+    _header: AliasableBox<NDIlib_video_frame_v2_t>,
     frame: QueuedVideoFrame,
     bytes: usize,
     complete: bool,
 }
 
-// SAFETY: the descriptor points only into allocations this entry owns, which
-// are not mutated while it is queued. The completion callback neither reads
-// nor releases them; the queue does, after completion.
+// SAFETY: the descriptor points only into allocations this entry owns, and
+// moving the entry moves none of them. While the frame is queued only the
+// SDK reads or writes them: the completion callback compares an address, and
+// the queue hands the frame out after the SDK has reported it complete.
 unsafe impl Send for Entry {}
 
 struct State {
@@ -283,7 +291,8 @@ pub struct QueuedSender {
     // Declared first so that it is destroyed first: destroying the native
     // sender is what ends the SDK's completion callbacks.
     sender: Sender,
-    callback: Box<CallbackState>,
+    // The SDK holds this address for as long as the sender exists.
+    callback: AliasableBox<CallbackState>,
     core: &'static sys::Core,
     _thread: PhantomData<Rc<()>>,
 }
@@ -364,7 +373,8 @@ impl QueuedSender {
         callback: Box<CallbackState>,
         table: &'static SendCompletion,
     ) -> Self {
-        let state: *const CallbackState = &*callback;
+        let callback = AliasableBox::new(callback);
+        let state = callback.as_ptr();
         // SAFETY: the sender is live. The state is heap-allocated, the callback
         // only reads it through a shared reference, and the returned value
         // keeps it until after the sender has been destroyed.
@@ -383,7 +393,20 @@ impl QueuedSender {
         }
     }
 
+    /// The source this sender advertises; see [`Sender::source`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`Sender::source`].
+    pub fn source(&self) -> Result<Source> {
+        self.sender.source()
+    }
+
     /// Queue a frame for sending, without copying it and without waiting.
+    ///
+    /// The queue owns the frame until it is collected: the SDK writes to a
+    /// compressed frame's bytes while it sends them. A collected frame can be
+    /// submitted again.
     ///
     /// # Errors
     ///
@@ -397,7 +420,7 @@ impl QueuedSender {
         &mut self,
         frame: impl Into<QueuedVideoFrame>,
     ) -> std::result::Result<SubmissionId, Rejected<QueuedVideoFrame>> {
-        let frame = frame.into();
+        let mut frame = frame.into();
         let failure = Rejected::new;
         if let Err(error) = frame.validate() {
             return Err(failure(error, frame));
@@ -411,9 +434,9 @@ impl QueuedSender {
             ));
         }
         let bytes = frame.retained_bytes();
-        let header = Box::new(frame.raw());
+        let header = AliasableBox::new(Box::new(frame.raw()));
         let key = header.p_data as usize;
-        let pointer = &*header as *const NDIlib_video_frame_v2_t;
+        let pointer = header.as_ptr();
         let id = {
             let mut state = self
                 .callback
@@ -467,8 +490,8 @@ impl QueuedSender {
         };
         // The entry is recorded before the call and the lock released, because
         // the SDK may complete the frame before the call returns.
-        // SAFETY: the sender is live, and the queue keeps the descriptor and
-        // the frame it points to until the SDK reports completion.
+        // SAFETY: the sender is live, and the queue owns the descriptor and
+        // the frame it lends until the SDK reports completion.
         unsafe {
             self.core
                 .NDIlib_send_send_video_async_v2(self.sender.native_instance(), pointer)
@@ -565,9 +588,9 @@ fn take_completed(state: &mut State) -> Option<CompletedVideo> {
 mod tests {
     use super::*;
     fn insert(state: &CallbackState, id: u64) -> usize {
-        let frame =
+        let mut frame =
             QueuedVideoFrame::Pixels(VideoFrame::builder().resolution(2, 2).build().unwrap());
-        let header = Box::new(frame.raw());
+        let header = AliasableBox::new(Box::new(frame.raw()));
         let key = header.p_data as usize;
         let bytes = frame.retained_bytes();
         let mut s = state.state.lock().unwrap();

@@ -30,15 +30,32 @@ use crate::{
     LineStrideOrSize, PixelFormat, Receiver, Rejected, Result,
 };
 
-const MAX_ALLOCATION: usize = 256 * 1024 * 1024;
+const MIB: usize = 1024 * 1024;
+
+const MAX_ALLOCATION: usize = 256 * MIB;
 
 /// Process-wide limits on custom receive allocation.
 ///
 /// The limits cover every receiver in the process, including allocations made
 /// by policies that have since been replaced and buffers whose release is
 /// still in progress. Memory a policy allocates for its own bookkeeping is not
-/// counted. The defaults are 256 generations, 1024 allocations, 1 GiB in
-/// total, 32 concurrent calls and 256 MiB per allocation.
+/// counted. A request the limits do not admit is declined, and the SDK then
+/// drops that frame.
+///
+/// The defaults are 256 generations, 1024 allocations, 1 GiB in total, 16
+/// concurrent calls and 64 MiB per allocation, which holds an 8-bit 4:2:2
+/// frame of 8K video.
+///
+/// # How the limits combine
+///
+/// A policy may return a larger buffer than the frame needs, so each call is
+/// granted its buffer before the policy runs: the largest single allocation,
+/// or what is left of the byte budget when that is less. A call is declined
+/// only when its grant cannot hold the frame, and it counts as an allocation
+/// while it runs. Limits are therefore accepted only when the stated number of
+/// concurrent calls can each be granted a largest allocation:
+/// `max_concurrent_calls` may not exceed `max_allocations`, and
+/// `max_concurrent_calls * max_allocation_bytes` may not exceed `max_bytes`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AllocatorLimits {
     max_generations: usize,
@@ -53,9 +70,9 @@ impl Default for AllocatorLimits {
         Self {
             max_generations: 256,
             max_allocations: 1024,
-            max_bytes: 1024 * 1024 * 1024,
-            max_concurrent_calls: 32,
-            max_allocation_bytes: MAX_ALLOCATION,
+            max_bytes: 1024 * MIB,
+            max_concurrent_calls: 16,
+            max_allocation_bytes: 64 * MIB,
         }
     }
 }
@@ -68,14 +85,15 @@ impl AllocatorLimits {
         self
     }
 
-    /// The number of allocations the SDK may hold at once.
+    /// The number of allocations the SDK may hold at once, counting the
+    /// policy calls in progress.
     pub fn max_allocations(mut self, value: usize) -> Self {
         self.max_allocations = value;
         self
     }
 
-    /// The total bytes the SDK may hold at once. It must be at least
-    /// [`max_allocation_bytes`](Self::max_allocation_bytes).
+    /// The total bytes the SDK may hold at once, counting what the policy
+    /// calls in progress have been granted.
     pub fn max_bytes(mut self, value: usize) -> Self {
         self.max_bytes = value;
         self
@@ -98,10 +116,25 @@ impl AllocatorLimits {
             || self.max_allocations == 0
             || self.max_concurrent_calls == 0
             || self.max_allocation_bytes == 0
-            || self.max_allocation_bytes > MAX_ALLOCATION
-            || self.max_bytes < self.max_allocation_bytes
         {
-            return Err(invalid("Invalid allocator limits"));
+            return Err(invalid("Allocator limits must be positive"));
+        }
+        if self.max_allocation_bytes > MAX_ALLOCATION {
+            return Err(invalid("max_allocation_bytes exceeds 256 MiB"));
+        }
+        if self.max_concurrent_calls > self.max_allocations {
+            return Err(invalid(
+                "max_concurrent_calls exceeds max_allocations, which counts every call in progress",
+            ));
+        }
+        if self
+            .max_concurrent_calls
+            .checked_mul(self.max_allocation_bytes)
+            .is_none_or(|granted| granted > self.max_bytes)
+        {
+            return Err(invalid(
+                "max_bytes is less than max_concurrent_calls allocations of max_allocation_bytes",
+            ));
         }
         Ok(self)
     }
@@ -132,7 +165,9 @@ pub enum AllocationFormat {
 }
 
 impl AllocationRequest {
-    /// The largest buffer, in bytes, a policy may return for this request.
+    /// The largest buffer, in bytes, a policy may return for this request:
+    /// [`AllocatorLimits::max_allocation_bytes`], or what is left of
+    /// [`AllocatorLimits::max_bytes`] when that is less.
     pub fn capacity_limit(self) -> usize {
         self.capacity_limit
     }
@@ -239,7 +274,22 @@ struct OwnedStorage {
     layout: Layout,
 }
 
-// SAFETY: the storage is uniquely owned and is plain memory.
+impl OwnedStorage {
+    /// Allocate `bytes` zeroed bytes aligned to 64.
+    fn zeroed(bytes: usize) -> Result<Self> {
+        let layout = Layout::from_size_align(bytes, 64)
+            .ok()
+            .filter(|layout| layout.size() != 0)
+            .ok_or_else(|| invalid("Invalid allocator layout"))?;
+        // SAFETY: the layout was just checked not to be zero-sized.
+        let pointer = NonNull::new(unsafe { alloc_zeroed(layout) })
+            .ok_or_else(|| invalid("Allocation failed"))?;
+        Ok(Self { pointer, layout })
+    }
+}
+
+// SAFETY: the value owns its allocation and nothing else refers to it, so it
+// can be released, as it can be used, from any thread.
 unsafe impl Send for OwnedStorage {}
 
 // SAFETY: the memory was allocated zeroed with 64-byte alignment for exactly
@@ -277,14 +327,8 @@ impl AllocationBuffer {
     /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when the allocation
     /// fails.
     pub fn zeroed(request: AllocationRequest) -> Result<Self> {
-        let layout = Layout::from_size_align(request.bytes, 64)
-            .map_err(|_| invalid("Invalid allocator layout"))?;
-        // SAFETY: every request has a positive size, so the layout is not
-        // zero-sized.
-        let pointer = NonNull::new(unsafe { alloc_zeroed(layout) })
-            .ok_or_else(|| invalid("Allocation failed"))?;
         Ok(Self {
-            storage: Box::new(OwnedStorage { pointer, layout }),
+            storage: Box::new(OwnedStorage::zeroed(request.bytes)?),
             request,
         })
     }
@@ -293,25 +337,30 @@ impl AllocationBuffer {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when the memory is
-    /// smaller than the request's minimum, larger than its capacity limit, or
-    /// not aligned to 64 bytes.
-    pub fn from_external(
+    /// Returns the memory with [`Error::InvalidFrame`](crate::Error::InvalidFrame)
+    /// when it is smaller than the request's minimum, larger than its capacity
+    /// limit, or not aligned to 64 bytes, so that a pool gets its buffer back.
+    pub fn from_external<S: ExternalAllocation>(
         request: AllocationRequest,
-        storage: impl ExternalAllocation,
-    ) -> Result<Self> {
-        if storage.capacity() < request.bytes
-            || storage.capacity() > request.capacity_limit
-            || !(storage.pointer().as_ptr() as usize).is_multiple_of(64)
-        {
-            return Err(invalid(
-                "External allocation capacity or alignment is invalid",
-            ));
+        storage: S,
+    ) -> std::result::Result<Self, Rejected<S>> {
+        let capacity = storage.capacity();
+        let problem = if capacity < request.bytes {
+            Some("External allocation is smaller than the request's minimum")
+        } else if capacity > request.capacity_limit {
+            Some("External allocation is larger than the request's capacity limit")
+        } else if !(storage.pointer().as_ptr() as usize).is_multiple_of(64) {
+            Some("External allocation is not aligned to 64 bytes")
+        } else {
+            None
+        };
+        match problem {
+            Some(problem) => Err(Rejected::new(invalid(problem), storage)),
+            None => Ok(Self {
+                storage: Box::new(storage),
+                request,
+            }),
         }
-        Ok(Self {
-            storage: Box::new(storage),
-            request,
-        })
     }
 
     /// The size of the memory in bytes.
@@ -413,6 +462,50 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Replace the value of `counter` with `next(value)` and return the value
+/// that was replaced, or leave it alone and return `None` when `next`
+/// declines the value it is shown.
+fn advance(counter: &AtomicUsize, next: impl Fn(usize) -> Option<usize>) -> Option<usize> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let replacement = next(current)?;
+        match counter.compare_exchange_weak(
+            current,
+            replacement,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(replaced) => return Some(replaced),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// The policy call that an admission covers: its count and the bytes it was
+/// granted stay charged until the call ends or its buffer is published.
+struct Reservation<'a> {
+    registry: &'a Registry,
+    bytes: usize,
+}
+
+impl Reservation<'_> {
+    /// End the call under a lock the caller already holds, so that the
+    /// buffer it publishes is never charged beside its own grant.
+    fn release(self, state: &mut State) {
+        state.calls -= 1;
+        state.reserved_bytes -= self.bytes;
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        let mut state = lock(&self.registry.state);
+        state.calls -= 1;
+        state.reserved_bytes -= self.bytes;
+    }
+}
+
 impl Registry {
     fn new(limits: AllocatorLimits) -> Self {
         Self {
@@ -423,36 +516,35 @@ impl Registry {
         }
     }
 
-    fn register(&self, policy: Arc<dyn ReceiveAllocator>) -> Result<usize> {
-        // Rust 1.99 deprecated fetch_update in favor of try_update, which is
-        // unavailable on our Rust 1.88 MSRV. Limit the allowance to these calls.
-        #[allow(deprecated)]
-        let admission = self
-            .generations
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < self.limits.max_generations).then_some(n + 1)
-            });
-        admission.map_err(|_| invalid("Process allocator generation budget exhausted"))?;
-        #[allow(deprecated)]
-        let next_token = self
-            .next
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1));
-        let token = match next_token {
+    /// Register `policy` as a new generation and return its token, or return
+    /// the policy when the process has no room for another.
+    fn register<P: ReceiveAllocator>(&self, policy: P) -> std::result::Result<usize, Rejected<P>> {
+        let token = match self.admit() {
             Ok(token) => token,
-            Err(_) => {
-                self.generations.fetch_sub(1, Ordering::AcqRel);
-                return Err(invalid("Allocator token space exhausted"));
-            }
+            Err(error) => return Err(Rejected::new(error, policy)),
         };
         lock(&self.state).active.insert(
             token,
             Arc::new(Generation {
                 phase: Mutex::new(Phase::Active),
-                policy: ManuallyDrop::new(policy),
+                policy: ManuallyDrop::new(Arc::new(policy)),
                 count: self.generations.clone(),
             }),
         );
         Ok(token)
+    }
+
+    /// Count one more generation and name it with a token that has never
+    /// been used.
+    fn admit(&self) -> Result<usize> {
+        advance(&self.generations, |count| {
+            (count < self.limits.max_generations).then_some(count + 1)
+        })
+        .ok_or_else(|| invalid("Process allocator generation budget exhausted"))?;
+        advance(&self.next, |token| token.checked_add(1)).ok_or_else(|| {
+            self.generations.fetch_sub(1, Ordering::AcqRel);
+            invalid("Allocator token space exhausted")
+        })
     }
 
     fn closing(&self, token: usize) {
@@ -472,35 +564,36 @@ impl Registry {
     }
 
     fn allocate(&self, token: usize, mut request: AllocationRequest) -> Option<(NonNull<u8>, i32)> {
-        request.capacity_limit = self.limits.max_allocation_bytes;
-        let generation = {
+        let (generation, reservation) = {
             let mut s = lock(&self.state);
             let generation = s.active.get(&token)?.clone();
-            // Reserve the maximum allowed return before invoking user code. This
-            // bounds simultaneous policy returns and includes their padding.
-            if request.bytes > self.limits.max_allocation_bytes
-                || s.calls >= self.limits.max_concurrent_calls
+            if s.calls >= self.limits.max_concurrent_calls
                 || s.leases.len() + s.calls + s.reclaiming >= self.limits.max_allocations
-                || s.bytes
-                    .checked_add(s.reserved_bytes)?
-                    .checked_add(self.limits.max_allocation_bytes)?
-                    > self.limits.max_bytes
             {
                 return None;
             }
-            s.calls += 1;
-            s.reserved_bytes += self.limits.max_allocation_bytes;
-            generation
-        };
-        struct Reservation<'a>(&'a Registry);
-        impl Drop for Reservation<'_> {
-            fn drop(&mut self) {
-                let mut s = lock(&self.0.state);
-                s.calls -= 1;
-                s.reserved_bytes -= self.0.limits.max_allocation_bytes;
+            // Grant the call its buffer before user code runs, so that the
+            // policies running at once cannot return more than the budget
+            // between them, padding included: the largest single allocation,
+            // or whatever is left when that is less.
+            let granted = self
+                .limits
+                .max_bytes
+                .saturating_sub(s.bytes)
+                .saturating_sub(s.reserved_bytes)
+                .min(self.limits.max_allocation_bytes);
+            if granted < request.bytes {
+                return None;
             }
-        }
-        let reservation = Reservation(self);
+            s.calls += 1;
+            s.reserved_bytes += granted;
+            let reservation = Reservation {
+                registry: self,
+                bytes: granted,
+            };
+            (generation, reservation)
+        };
+        request.capacity_limit = reservation.bytes;
         if *lock(&generation.phase) != Phase::Active {
             return None;
         }
@@ -510,7 +603,7 @@ impl Registry {
         let pointer = allocation.storage.pointer();
         let capacity = allocation.capacity();
         let actual = allocation.request;
-        if capacity > self.limits.max_allocation_bytes
+        if capacity > reservation.bytes
             || actual.format != request.format
             || actual.width != request.width
             || actual.height != request.height
@@ -530,6 +623,8 @@ impl Registry {
         if s.leases.contains_key(&(token, pointer.as_ptr() as usize)) {
             return None;
         }
+        // The buffer takes the place of the grant that covered it.
+        reservation.release(&mut s);
         s.bytes += capacity;
         let stride = actual.stride;
         s.leases.insert(
@@ -542,7 +637,6 @@ impl Registry {
         );
         drop(s);
         drop(phase);
-        drop(reservation);
         Some((pointer, stride))
     }
 
@@ -742,7 +836,10 @@ impl AllocatedPacketReceiver {
     /// # Errors
     ///
     /// As for [`AllocatedReceiver::set_video_allocator`].
-    pub fn set_video_allocator(&mut self, policy: impl ReceiveAllocator) -> Result<()> {
+    pub fn set_video_allocator<P: ReceiveAllocator>(
+        &mut self,
+        policy: P,
+    ) -> std::result::Result<(), Rejected<P>> {
         self.inner.set_video_allocator(policy)
     }
 
@@ -752,7 +849,10 @@ impl AllocatedPacketReceiver {
     /// # Errors
     ///
     /// As for [`AllocatedReceiver::set_audio_allocator`].
-    pub fn set_audio_allocator(&mut self, policy: impl ReceiveAllocator) -> Result<()> {
+    pub fn set_audio_allocator<P: ReceiveAllocator>(
+        &mut self,
+        policy: P,
+    ) -> std::result::Result<(), Rejected<P>> {
         self.inner.set_audio_allocator(policy)
     }
 
@@ -865,13 +965,14 @@ impl AllocatedReceiver {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when the process
-    /// already has [`AllocatorLimits::max_generations`] policies. The current
-    /// allocator then stays in place.
-    pub fn set_video_allocator(&mut self, policy: impl ReceiveAllocator) -> Result<()> {
-        let token = registry().register(Arc::new(policy))?;
-        self.install(Stream::Video, Some(token));
-        Ok(())
+    /// Returns the policy with [`Error::InvalidFrame`](crate::Error::InvalidFrame)
+    /// when the process already has [`AllocatorLimits::max_generations`]
+    /// policies. The current allocator then stays in place.
+    pub fn set_video_allocator<P: ReceiveAllocator>(
+        &mut self,
+        policy: P,
+    ) -> std::result::Result<(), Rejected<P>> {
+        self.set_allocator(Stream::Video, policy)
     }
 
     /// Receive audio into memory from `policy`.
@@ -879,9 +980,20 @@ impl AllocatedReceiver {
     /// # Errors
     ///
     /// As for [`set_video_allocator`](Self::set_video_allocator).
-    pub fn set_audio_allocator(&mut self, policy: impl ReceiveAllocator) -> Result<()> {
-        let token = registry().register(Arc::new(policy))?;
-        self.install(Stream::Audio, Some(token));
+    pub fn set_audio_allocator<P: ReceiveAllocator>(
+        &mut self,
+        policy: P,
+    ) -> std::result::Result<(), Rejected<P>> {
+        self.set_allocator(Stream::Audio, policy)
+    }
+
+    fn set_allocator<P: ReceiveAllocator>(
+        &mut self,
+        stream: Stream,
+        policy: P,
+    ) -> std::result::Result<(), Rejected<P>> {
+        let token = registry().register(policy)?;
+        self.install(stream, Some(token));
         Ok(())
     }
 
@@ -1160,36 +1272,373 @@ mod tests {
             max_concurrent_calls: 2,
             max_allocation_bytes: 64,
         }
+        .validate()
+        .unwrap()
+    }
+
+    fn request_of(bytes: usize) -> AllocationRequest {
+        AllocationRequest {
+            bytes,
+            stride: (bytes / 2) as i32,
+            format: AllocationFormat::AudioPlanarF32,
+            width: (bytes / 8) as i32,
+            height: 2,
+            capacity_limit: MAX_ALLOCATION,
+        }
     }
 
     fn request() -> AllocationRequest {
-        AllocationRequest {
-            bytes: 64,
-            stride: 32,
-            format: AllocationFormat::AudioPlanarF32,
-            width: 8,
-            height: 2,
-            capacity_limit: 64,
+        request_of(64)
+    }
+
+    /// A policy that can be told apart from another of its type.
+    struct Tagged(u32);
+
+    impl ReceiveAllocator for Tagged {
+        fn allocate(&self, request: AllocationRequest) -> Result<AllocationBuffer> {
+            AllocationBuffer::zeroed(request)
         }
+    }
+
+    /// Where the policy calls of a test wait for each other.
+    #[derive(Default)]
+    struct Gate {
+        state: Mutex<(usize, bool)>,
+        changed: std::sync::Condvar,
+    }
+
+    impl Gate {
+        const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+        /// Called by a policy: count the call, then wait to be let through.
+        fn enter(&self) {
+            let mut state = lock(&self.state);
+            state.0 += 1;
+            self.changed.notify_all();
+            let _ = self
+                .changed
+                .wait_timeout_while(state, Self::PATIENCE, |state| !state.1);
+        }
+
+        /// Wait until `calls` policy calls are inside, then say whether they
+        /// all arrived.
+        fn wait_for(&self, calls: usize) -> bool {
+            let (state, _) = self
+                .changed
+                .wait_timeout_while(lock(&self.state), Self::PATIENCE, |state| state.0 < calls)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.0 >= calls
+        }
+
+        fn open(&self) {
+            lock(&self.state).1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    #[test]
+    fn limits_are_accepted_only_when_they_can_all_be_reached() {
+        let defaults = AllocatorLimits::default().validate().unwrap();
+        assert_eq!(
+            (
+                defaults.max_generations,
+                defaults.max_allocations,
+                defaults.max_bytes,
+                defaults.max_concurrent_calls,
+                defaults.max_allocation_bytes,
+            ),
+            (256, 1024, 1024 * MIB, 16, 64 * MIB)
+        );
+
+        let reason = |limits: AllocatorLimits| match limits.validate() {
+            Err(crate::Error::InvalidFrame(reason)) => reason,
+            other => panic!("expected the limits to be refused, got {other:?}"),
+        };
+        for zero in [
+            defaults.max_generations(0),
+            defaults.max_allocations(0),
+            defaults.max_concurrent_calls(0),
+            defaults.max_allocation_bytes(0),
+        ] {
+            assert!(reason(zero).contains("positive"));
+        }
+        assert!(reason(defaults.max_allocation_bytes(MAX_ALLOCATION + 1)).contains("256 MiB"));
+        assert!(reason(defaults.max_allocations(15)).contains("max_allocations"));
+        // Each of these promises more concurrent calls than the byte budget
+        // can grant a largest allocation to.
+        assert!(reason(defaults.max_concurrent_calls(17)).contains("max_bytes"));
+        assert!(reason(defaults.max_allocation_bytes(64 * MIB + 1)).contains("max_bytes"));
+        assert!(reason(defaults.max_bytes(1024 * MIB - 1)).contains("max_bytes"));
+        assert!(reason(
+            defaults
+                .max_concurrent_calls(32)
+                .max_allocation_bytes(MAX_ALLOCATION)
+        )
+        .contains("max_bytes"));
+        assert!(reason(
+            defaults
+                .max_bytes(usize::MAX)
+                .max_allocations(usize::MAX)
+                .max_concurrent_calls(usize::MAX)
+        )
+        .contains("max_bytes"));
+
+        // The largest single allocation, with the budget to match.
+        defaults
+            .max_allocation_bytes(MAX_ALLOCATION)
+            .max_bytes(16 * MAX_ALLOCATION)
+            .validate()
+            .unwrap();
+        defaults
+            .max_allocation_bytes(MAX_ALLOCATION)
+            .max_concurrent_calls(4)
+            .validate()
+            .unwrap();
+    }
+
+    /// With the default limits, as many policy calls as the limits name run
+    /// at the same time, each granted a largest allocation, and one more is
+    /// declined.
+    #[test]
+    fn every_concurrent_call_the_limits_name_is_admitted() {
+        let limits = AllocatorLimits::default();
+        let calls = limits.max_concurrent_calls;
+        let registry = Registry::new(limits);
+        let gate = Arc::new(Gate::default());
+        let granted = Arc::new(Mutex::new(Vec::new()));
+        let token = registry
+            .register({
+                let (gate, granted) = (gate.clone(), granted.clone());
+                move |request: AllocationRequest| {
+                    lock(&granted).push(request.capacity_limit());
+                    gate.enter();
+                    AllocationBuffer::zeroed(request)
+                }
+            })
+            .unwrap();
+
+        let (admitted, all_inside, in_progress, one_more) = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..calls)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let (pointer, _) = registry.allocate(token, request())?;
+                        Some(pointer.as_ptr() as usize)
+                    })
+                })
+                .collect();
+            let all_inside = gate.wait_for(calls);
+            let in_progress = lock(&registry.state).calls;
+            let one_more = registry.allocate(token, request());
+            gate.open();
+            let admitted: Vec<_> = workers
+                .into_iter()
+                .filter_map(|worker| worker.join().unwrap())
+                .collect();
+            (admitted, all_inside, in_progress, one_more)
+        });
+        assert!(
+            all_inside,
+            "only {in_progress} of {calls} calls ran at once"
+        );
+        assert_eq!(in_progress, calls);
+        assert!(one_more.is_none(), "a call beyond the limit was admitted");
+        assert_eq!(admitted.len(), calls);
+        assert_eq!(*lock(&granted), vec![limits.max_allocation_bytes; calls]);
+
+        let state = lock(&registry.state);
+        assert_eq!((state.calls, state.reserved_bytes), (0, 0));
+        assert_eq!((state.leases.len(), state.bytes), (calls, calls * 64));
+        drop(state);
+        for address in admitted {
+            assert!(registry.free(token, address as *mut u8));
+        }
+        registry.retire(token);
+    }
+
+    /// A call is granted what is left of the byte budget, and declined only
+    /// when that cannot hold the frame; buffers the SDK already holds do not
+    /// cost a later call more than their own size.
+    #[test]
+    fn a_call_is_granted_what_is_left_of_the_byte_budget() {
+        let registry = Registry::new(
+            AllocatorLimits {
+                max_generations: 1,
+                max_allocations: 8,
+                max_bytes: 256,
+                max_concurrent_calls: 4,
+                max_allocation_bytes: 64,
+            }
+            .validate()
+            .unwrap(),
+        );
+        let granted = Arc::new(Mutex::new(Vec::new()));
+        let token = registry
+            .register({
+                let granted = granted.clone();
+                move |request: AllocationRequest| {
+                    lock(&granted).push(request.capacity_limit());
+                    AllocationBuffer::zeroed(request)
+                }
+            })
+            .unwrap();
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(registry.allocate(token, request()).unwrap().0);
+        }
+        held.push(registry.allocate(token, request_of(32)).unwrap().0);
+        // 224 of 256 bytes are held: 32 are left.
+        assert!(registry.allocate(token, request()).is_none());
+        held.push(registry.allocate(token, request_of(16)).unwrap().0);
+        assert!(registry.allocate(token, request_of(32)).is_none());
+        held.push(registry.allocate(token, request_of(16)).unwrap().0);
+        assert!(registry.allocate(token, request_of(8)).is_none());
+        assert_eq!(*lock(&granted), [64, 64, 64, 64, 32, 16]);
+        assert_eq!(lock(&registry.state).bytes, 256);
+
+        // Freeing returns exactly what the buffer took.
+        assert!(registry.free(token, held[0].as_ptr()));
+        assert!(registry.allocate(token, request()).is_some());
+        assert_eq!(lock(&granted).last(), Some(&64));
+    }
+
+    #[test]
+    fn a_buffer_beyond_its_grant_is_declined_and_nothing_stays_charged() {
+        let registry = Registry::new(limits());
+        let token = registry
+            .register(|request: AllocationRequest| {
+                // Twice what the call was granted.
+                let padded = AllocationRequest {
+                    capacity_limit: MAX_ALLOCATION,
+                    ..request
+                };
+                AllocationBuffer::zeroed(padded.with_stride(request.stride() * 4)?)
+            })
+            .unwrap();
+        assert!(registry.allocate(token, request()).is_none());
+        let state = lock(&registry.state);
+        assert_eq!((state.calls, state.reserved_bytes, state.bytes), (0, 0, 0));
+        assert!(state.leases.is_empty());
+    }
+
+    #[test]
+    fn a_counter_advances_only_while_its_rule_allows() {
+        let counter = AtomicUsize::new(0);
+        let below = |limit| move |value| (value < limit).then_some(value + 1);
+        assert_eq!(advance(&counter, below(2)), Some(0));
+        assert_eq!(advance(&counter, below(2)), Some(1));
+        assert_eq!(advance(&counter, below(2)), None);
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+
+        counter.store(usize::MAX - 1, Ordering::Release);
+        let next = |value: usize| value.checked_add(1);
+        assert_eq!(advance(&counter, next), Some(usize::MAX - 1));
+        assert_eq!(advance(&counter, next), None);
+        assert_eq!(counter.load(Ordering::Acquire), usize::MAX);
+
+        // Racing threads take exactly the room there is.
+        let counter = AtomicUsize::new(0);
+        let taken = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..1000 {
+                        if advance(&counter, below(1000)).is_some() {
+                            taken.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(counter.load(Ordering::Acquire), 1000);
+        assert_eq!(taken.load(Ordering::Relaxed), 1000);
+    }
+
+    #[test]
+    fn a_policy_the_process_has_no_room_for_is_handed_back() {
+        let registry = Registry::new(limits());
+        let first = registry.register(Tagged(1)).unwrap();
+        let second = registry.register(Tagged(2)).unwrap();
+        assert_eq!((first, second), (1, 2));
+
+        // The generation budget is exhausted.
+        let rejected = registry.register(Tagged(3)).unwrap_err();
+        assert!(rejected.error().to_string().contains("generation budget"));
+        assert_eq!(rejected.into_inner().0, 3);
+        assert_eq!(registry.generations.load(Ordering::Acquire), 2);
+        assert_eq!(lock(&registry.state).active.len(), 2);
+
+        // Room again, but no token left to name a generation with: the
+        // generation that was counted for the attempt is given up.
+        registry.retire(second);
+        assert_eq!(registry.generations.load(Ordering::Acquire), 1);
+        registry.next.store(usize::MAX, Ordering::Release);
+        let rejected = registry.register(Tagged(4)).unwrap_err();
+        assert!(rejected.error().to_string().contains("token space"));
+        assert_eq!(rejected.into_inner().0, 4);
+        assert_eq!(registry.generations.load(Ordering::Acquire), 1);
+        assert_eq!(registry.next.load(Ordering::Acquire), usize::MAX);
+
+        // The last token is still handed out.
+        registry.next.store(usize::MAX - 1, Ordering::Release);
+        assert_eq!(registry.register(Tagged(5)).unwrap(), usize::MAX - 1);
+        assert!(registry.allocate(usize::MAX - 1, request()).is_some());
+    }
+
+    #[test]
+    fn memory_a_request_cannot_use_is_handed_back() {
+        /// Storage that reports an address one byte into its allocation.
+        struct Misaligned(OwnedStorage);
+        // SAFETY: the buffer is refused for its alignment before any use.
+        unsafe impl ExternalAllocation for Misaligned {
+            fn pointer(&self) -> NonNull<u8> {
+                // SAFETY: the allocation is longer than one byte.
+                unsafe { self.0.pointer().add(1) }
+            }
+            fn capacity(&self) -> usize {
+                self.0.capacity() - 1
+            }
+        }
+
+        let request = AllocationRequest {
+            capacity_limit: 128,
+            ..request()
+        };
+        let refused = |storage: OwnedStorage, problem: &str| {
+            let address = storage.pointer();
+            let rejected = AllocationBuffer::from_external(request, storage)
+                .err()
+                .expect("the storage does not fit the request");
+            assert!(rejected.error().to_string().contains(problem));
+            assert_eq!(rejected.into_inner().pointer(), address);
+        };
+        refused(OwnedStorage::zeroed(32).unwrap(), "smaller");
+        refused(OwnedStorage::zeroed(192).unwrap(), "larger");
+        let rejected = AllocationBuffer::from_external(
+            request,
+            Misaligned(OwnedStorage::zeroed(128).unwrap()),
+        )
+        .err()
+        .expect("the storage is misaligned");
+        assert!(rejected.error().to_string().contains("aligned"));
+        assert_eq!(rejected.into_inner().0.capacity(), 128);
+
+        let buffer =
+            AllocationBuffer::from_external(request, OwnedStorage::zeroed(128).unwrap()).unwrap();
+        assert_eq!(buffer.capacity(), 128);
+        assert!(OwnedStorage::zeroed(0).is_err());
     }
 
     #[test]
     fn retired_lease_keeps_generation_and_budget_until_matching_free() {
         let registry = Registry::new(limits());
-        let token = registry
-            .register(Arc::new(AllocationBuffer::zeroed))
-            .unwrap();
+        let token = registry.register(AllocationBuffer::zeroed).unwrap();
         let (pointer, _) = registry.allocate(token, request()).unwrap();
         registry.retire(token);
         assert!(registry.allocate(token, request()).is_none());
         assert_eq!(registry.generations.load(Ordering::Acquire), 1);
-        let next = registry
-            .register(Arc::new(AllocationBuffer::zeroed))
-            .unwrap();
+        let next = registry.register(AllocationBuffer::zeroed).unwrap();
         assert_ne!(token, next);
-        assert!(registry
-            .register(Arc::new(AllocationBuffer::zeroed))
-            .is_err());
+        assert!(registry.register(AllocationBuffer::zeroed).is_err());
         assert!(registry.free(token, pointer.as_ptr()));
         assert!(!registry.free(token, pointer.as_ptr()));
         assert_eq!(registry.generations.load(Ordering::Acquire), 1);
@@ -1199,16 +1648,12 @@ mod tests {
     #[test]
     fn a_free_releases_only_an_allocation_of_the_generation_it_names() {
         let registry = Registry::new(limits());
-        let first = registry
-            .register(Arc::new(AllocationBuffer::zeroed))
-            .unwrap();
+        let first = registry.register(AllocationBuffer::zeroed).unwrap();
         let (pointer, _) = registry.allocate(first, request()).unwrap();
         // The receiver moves on to a second generation while the SDK still
         // holds the first one's buffer.
         registry.retire(first);
-        let second = registry
-            .register(Arc::new(AllocationBuffer::zeroed))
-            .unwrap();
+        let second = registry.register(AllocationBuffer::zeroed).unwrap();
 
         // A free that names the second generation cannot release it.
         assert!(!registry.free(second, pointer.as_ptr()));
@@ -1227,28 +1672,26 @@ mod tests {
 
     #[test]
     fn policy_cannot_publish_after_close() {
-        let registry = Arc::new(Registry::new(limits()));
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        let resume_rx = Mutex::new(resume_rx);
+        let registry = Registry::new(limits());
+        let gate = Arc::new(Gate::default());
         let token = registry
-            .register(Arc::new(move |request| {
-                entered_tx.send(()).unwrap();
-                lock(&resume_rx).recv().unwrap();
-                AllocationBuffer::zeroed(request)
-            }))
+            .register({
+                let gate = gate.clone();
+                move |request| {
+                    gate.enter();
+                    AllocationBuffer::zeroed(request)
+                }
+            })
             .unwrap();
-        let worker = registry.clone();
-        let thread = std::thread::spawn(move || {
-            worker
-                .allocate(token, request())
-                .map(|(p, s)| (p.as_ptr() as usize, s))
+        let published = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| registry.allocate(token, request()).is_some());
+            assert!(gate.wait_for(1));
+            registry.closing(token);
+            registry.retire(token);
+            gate.open();
+            worker.join().unwrap()
         });
-        entered_rx.recv().unwrap();
-        registry.closing(token);
-        registry.retire(token);
-        resume_tx.send(()).unwrap();
-        assert!(thread.join().unwrap().is_none());
+        assert!(!published);
         assert_eq!(lock(&registry.state).bytes, 0);
         assert_eq!(registry.generations.load(Ordering::Acquire), 0);
     }
@@ -1256,12 +1699,8 @@ mod tests {
     #[test]
     fn budgets_cover_multiple_generations_and_panic_paths() {
         let registry = Registry::new(limits());
-        let first = registry
-            .register(Arc::new(AllocationBuffer::zeroed))
-            .unwrap();
-        let second = registry
-            .register(Arc::new(AllocationBuffer::zeroed))
-            .unwrap();
+        let first = registry.register(AllocationBuffer::zeroed).unwrap();
+        let second = registry.register(AllocationBuffer::zeroed).unwrap();
         let (a, _) = registry.allocate(first, request()).unwrap();
         let (b, _) = registry.allocate(second, request()).unwrap();
         assert!(registry.allocate(first, request()).is_none());
@@ -1270,9 +1709,7 @@ mod tests {
         assert!(registry.free(first, a.as_ptr()));
         assert!(registry.free(second, b.as_ptr()));
         let panic = registry
-            .register(Arc::new(|_| -> Result<AllocationBuffer> {
-                panic!("policy")
-            }))
+            .register(|_| -> Result<AllocationBuffer> { panic!("policy") })
             .unwrap();
         assert!(registry.allocate(panic, request()).is_none());
         assert_eq!(lock(&registry.state).calls, 0);
@@ -1283,13 +1720,14 @@ mod tests {
     #[test]
     fn blocked_storage_reclamation_remains_charged() {
         struct DelayedStorage {
-            storage: AllocationBuffer,
-            entered: std::sync::mpsc::Sender<()>,
-            resume: std::sync::mpsc::Receiver<()>,
+            storage: OwnedStorage,
+            gate: Arc<Gate>,
         }
+        // SAFETY: the storage is an owned allocation that this value neither
+        // changes nor shares.
         unsafe impl ExternalAllocation for DelayedStorage {
             fn pointer(&self) -> NonNull<u8> {
-                self.storage.storage.pointer()
+                self.storage.pointer()
             }
             fn capacity(&self) -> usize {
                 self.storage.capacity()
@@ -1297,39 +1735,42 @@ mod tests {
         }
         impl Drop for DelayedStorage {
             fn drop(&mut self) {
-                self.entered.send(()).unwrap();
-                self.resume.recv().unwrap();
+                self.gate.enter();
             }
         }
-        let registry = Arc::new(Registry::new(AllocatorLimits {
-            max_allocations: 1,
-            ..limits()
-        }));
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        let resume_rx = Mutex::new(Some(resume_rx));
+        let registry = Registry::new(
+            AllocatorLimits {
+                max_allocations: 1,
+                max_concurrent_calls: 1,
+                ..limits()
+            }
+            .validate()
+            .unwrap(),
+        );
+        let gate = Arc::new(Gate::default());
         let token = registry
-            .register(Arc::new(move |request| {
-                AllocationBuffer::from_external(
-                    request,
-                    DelayedStorage {
-                        storage: AllocationBuffer::zeroed(request)?,
-                        entered: entered_tx.clone(),
-                        resume: lock(&resume_rx).take().unwrap(),
-                    },
-                )
-            }))
+            .register({
+                let gate = gate.clone();
+                move |request: AllocationRequest| {
+                    let storage = DelayedStorage {
+                        storage: OwnedStorage::zeroed(request.minimum_bytes())?,
+                        gate: gate.clone(),
+                    };
+                    Ok(AllocationBuffer::from_external(request, storage)?)
+                }
+            })
             .unwrap();
         let (pointer, _) = registry.allocate(token, request()).unwrap();
         let pointer = pointer.as_ptr() as usize;
-        let worker = registry.clone();
-        let free = std::thread::spawn(move || worker.free(token, pointer as *mut u8));
-        entered_rx.recv().unwrap();
-        assert_eq!(lock(&registry.state).bytes, 64);
-        assert_eq!(lock(&registry.state).reclaiming, 1);
-        assert!(registry.allocate(token, request()).is_none());
-        resume_tx.send(()).unwrap();
-        assert!(free.join().unwrap());
+        std::thread::scope(|scope| {
+            let free = scope.spawn(|| registry.free(token, pointer as *mut u8));
+            assert!(gate.wait_for(1));
+            assert_eq!(lock(&registry.state).bytes, 64);
+            assert_eq!(lock(&registry.state).reclaiming, 1);
+            assert!(registry.allocate(token, request()).is_none());
+            gate.open();
+            assert!(free.join().unwrap());
+        });
         assert_eq!(lock(&registry.state).bytes, 0);
         registry.retire(token);
     }

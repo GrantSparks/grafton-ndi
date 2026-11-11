@@ -13,6 +13,9 @@ use crate::{
 
 /// A discovered source together with the metadata it advertises.
 ///
+/// A sender advertises metadata by naming it in the `send.metadata` property
+/// of its configuration, and a finder is told it by a Discovery Server.
+///
 /// Returned by [`Finder::sources_with_metadata`].
 #[derive(Clone, Debug)]
 pub struct ExtendedSource {
@@ -26,8 +29,8 @@ impl ExtendedSource {
         &self.source
     }
 
-    /// The metadata the source advertises, if any. Bytes that are not valid
-    /// UTF-8 are replaced.
+    /// The metadata the source advertises, or `None` when it advertises
+    /// none. Bytes that are not valid UTF-8 are replaced.
     pub fn metadata(&self) -> Option<&str> {
         self.metadata.as_deref()
     }
@@ -57,12 +60,12 @@ unsafe fn extended_source(
     descriptor.__bindgen_anon_1.p_url_address = address;
     // SAFETY: the descriptor points to the caller's readable strings.
     let source = unsafe { Source::try_from_raw(&descriptor) }.ok()?;
-    let metadata = (!metadata.is_null()).then(|| {
+    let metadata = (!metadata.is_null())
         // SAFETY: non-null was checked; the caller guarantees the terminator.
-        unsafe { CStr::from_ptr(metadata) }
-            .to_string_lossy()
-            .into_owned()
-    });
+        .then(|| unsafe { CStr::from_ptr(metadata) })
+        // The SDK gives a source that advertises nothing an empty string.
+        .filter(|text| !text.is_empty())
+        .map(|text| text.to_string_lossy().into_owned());
     Some(ExtendedSource { source, metadata })
 }
 
@@ -154,9 +157,13 @@ mod tests {
             unsafe { extended_source(pointer(name), pointer(address), pointer(metadata)) }
         };
 
-        let plain = copy(Some(name), Some(address), None).unwrap();
-        assert_eq!(plain.source().name, "HOST (Camera)");
-        assert_eq!(plain.metadata(), None);
+        // A source without metadata, as a null pointer and as the empty
+        // string the SDK gives.
+        for nothing in [None, Some(c"")] {
+            let plain = copy(Some(name), Some(address), nothing).unwrap();
+            assert_eq!(plain.source().name, "HOST (Camera)");
+            assert_eq!(plain.metadata(), None);
+        }
 
         let lossy = copy(Some(name), Some(address), Some(invalid_utf8)).unwrap();
         assert_eq!(lossy.metadata(), Some("<ndi \u{fffd}/>"));
