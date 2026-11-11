@@ -59,7 +59,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// without an Advanced runtime (or in a build without the Advanced SDK).
     pub fn kvm(&mut self) -> Result<KvmSession<'_, M>> {
         Ok(KvmSession {
-            kvm: self.core._ndi.advanced()?,
+            kvm: self.core._ndi.table()?,
             receiver: self,
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),

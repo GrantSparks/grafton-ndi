@@ -1,12 +1,13 @@
 //! Test-owned native fixtures exercise ownership order without SDK discovery.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
+mod common;
 #[path = "support/fixture.rs"]
 mod fixture;
 
 use fixture::FakeRuntime;
 use grafton_ndi::{
-    capabilities::SdkEdition,
+    capabilities::{RuntimeFeature, SdkEdition},
     discovery::{
         AdvertiserOptions, RecvAdvertisement, RecvAdvertiser, SendAdvertisement, SendAdvertiser,
     },
@@ -15,6 +16,7 @@ use grafton_ndi::{
 };
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -67,13 +69,14 @@ fn native_resource_ownership() {
         "foreign_registration",
         "malformed_metadata",
     ];
-    if cfg!(all(feature = "advanced", ndi_has_advanced_header)) {
+    if cfg!(feature = "advanced") {
         scenarios.extend([
             "queue_immediate",
             "queue_destroy",
             "queue_registered_sender",
         ]);
     }
+    let mut explained = false;
     for case in scenarios {
         let result = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "native_resource_ownership", "--nocapture"])
@@ -100,12 +103,28 @@ fn native_resource_ownership() {
             )
             .output()
             .unwrap();
+        let errors = String::from_utf8_lossy(&result.stderr);
         assert!(
             result.status.success(),
-            "{case}: {}\n{}",
+            "{case}: {}\n{errors}",
             String::from_utf8_lossy(&result.stdout),
-            String::from_utf8_lossy(&result.stderr)
         );
+        // A scenario that could not run says so on its own standard error,
+        // which the harness shows only for a failure: pass the notice on, and
+        // the reason before the first one.
+        let (notices, reasons): (Vec<_>, Vec<_>) = errors
+            .lines()
+            .filter(|line| !line.is_empty())
+            .partition(|line| line.starts_with("skipped:"));
+        let mut stderr = std::io::stderr().lock();
+        for notice in notices {
+            if !std::mem::replace(&mut explained, true) {
+                for reason in &reasons {
+                    let _ = writeln!(stderr, "{reason}");
+                }
+            }
+            let _ = writeln!(stderr, "{notice} (scenario {case})");
+        }
     }
     fs::remove_dir_all(directory).unwrap();
 }
@@ -120,6 +139,17 @@ fn child(case: &str) {
         },
     ))
     .unwrap();
+    // The queue scenarios call Advanced entry points, which need a build with
+    // the Advanced SDK declarations as well as a runtime that exports them.
+    if advanced {
+        if let Err(error) = ndi.require_feature(RuntimeFeature::AdvancedSenderConfiguration) {
+            common::skip(
+                common::Requirement::Advanced,
+                &format!("the Advanced SDK cannot be used: {error}"),
+            );
+            return;
+        }
+    }
     match case {
         "sender_registration" => {
             let mut sender = sender(&ndi);
@@ -244,7 +274,7 @@ fn child(case: &str) {
             assert_eq!(log().matches("sender-metadata-free\n").count(), 1);
             drop(sender);
         }
-        #[cfg(all(feature = "advanced", ndi_has_advanced_header))]
+        #[cfg(feature = "advanced")]
         "queue_immediate" => {
             use grafton_ndi::advanced::{QueueOptions, QueuedSender};
             let mut queue = QueuedSender::new(
@@ -268,7 +298,7 @@ fn child(case: &str) {
             assert_eq!(log().matches("sender-submit-return\n").count(), 2);
             assert_eq!(log().matches("sender-destroy\n").count(), 1);
         }
-        #[cfg(all(feature = "advanced", ndi_has_advanced_header))]
+        #[cfg(feature = "advanced")]
         "queue_destroy" => {
             use grafton_ndi::advanced::{QueueOptions, QueuedSender};
             let mut queue = QueuedSender::new(
@@ -296,7 +326,7 @@ fn child(case: &str) {
             );
             assert_eq!(events.matches("sender-completion\n").count(), 2);
         }
-        #[cfg(all(feature = "advanced", ndi_has_advanced_header))]
+        #[cfg(feature = "advanced")]
         "queue_registered_sender" => {
             use grafton_ndi::advanced::{QueueOptions, QueuedSender};
             let sender = sender(&ndi);
@@ -304,7 +334,13 @@ fn child(case: &str) {
             let registration = advertiser
                 .register(&sender, SendAdvertisement::default())
                 .unwrap();
-            assert!(QueuedSender::from_sender(sender, QueueOptions::default()).is_err());
+            // A registered sender cannot become a queue: it comes back as it was.
+            let sender = QueuedSender::from_sender(sender, QueueOptions::default())
+                .err()
+                .expect("a registered sender is refused")
+                .into_inner();
+            sender.send_video(&frame());
+            drop(sender);
             assert!(!log().contains("sender-destroy\n"));
             assert!(advertiser.unregister(registration));
             drop(advertiser);

@@ -1,7 +1,7 @@
 //! Registration of senders and receivers with a Discovery Server.
 
+use super::Handle;
 use crate::{
-    capabilities::RuntimeFeature,
     receiver::{ReceiverCore, ReceiverMode},
     sender::SenderResource,
     sys::{self, bindings::*},
@@ -9,7 +9,7 @@ use crate::{
 };
 use std::{
     collections::BTreeMap,
-    ffi::CString,
+    ffi::{c_char, CString},
     fmt, ptr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -75,13 +75,26 @@ impl RecvAdvertisement {
     }
 }
 
-/// What the sender and receiver advertiser tables have in common once a native
-/// advertiser exists.
-trait AdvertiserApi: Sync + 'static {
+/// What the sender and receiver advertiser tables have in common.
+trait AdvertiserApi: sys::Table + Sync {
     /// The native advertiser handle.
-    type Instance: Copy;
+    type Instance: Handle;
+    /// The native creation settings.
+    type Settings;
     /// The native owner a registration keeps alive.
     type Member;
+
+    /// The settings for an advertiser of the Discovery Server at `url`, or of
+    /// the one the SDK is configured with when `url` is null.
+    fn settings(url: *const c_char) -> Self::Settings;
+
+    /// Create an advertiser. Returns null when the SDK creates none.
+    ///
+    /// # Safety
+    ///
+    /// The URL of `settings` must be null or a NUL-terminated string that
+    /// outlives the call.
+    unsafe fn create(&self, settings: &Self::Settings) -> Self::Instance;
 
     /// Destroy the advertiser.
     ///
@@ -101,8 +114,16 @@ trait AdvertiserApi: Sync + 'static {
 
 impl AdvertiserApi for sys::SenderAdvertising {
     type Instance = NDIlib_send_advertiser_instance_t;
+    type Settings = NDIlib_send_advertiser_create_t;
     type Member = Arc<SenderResource>;
 
+    fn settings(url: *const c_char) -> Self::Settings {
+        NDIlib_send_advertiser_create_t { p_url_address: url }
+    }
+    unsafe fn create(&self, settings: &Self::Settings) -> Self::Instance {
+        // SAFETY: forwarded to the caller's obligations.
+        unsafe { self.NDIlib_send_advertiser_create(settings) }
+    }
     unsafe fn destroy(&self, instance: Self::Instance) {
         // SAFETY: forwarded to the caller's obligations.
         unsafe { self.NDIlib_send_advertiser_destroy(instance) }
@@ -122,8 +143,16 @@ struct ReceiverMember {
 
 impl AdvertiserApi for sys::ReceiverAdvertising {
     type Instance = NDIlib_recv_advertiser_instance_t;
+    type Settings = NDIlib_recv_advertiser_create_t;
     type Member = ReceiverMember;
 
+    fn settings(url: *const c_char) -> Self::Settings {
+        NDIlib_recv_advertiser_create_t { p_url_address: url }
+    }
+    unsafe fn create(&self, settings: &Self::Settings) -> Self::Instance {
+        // SAFETY: forwarded to the caller's obligations.
+        unsafe { self.NDIlib_recv_advertiser_create(settings) }
+    }
     unsafe fn destroy(&self, instance: Self::Instance) {
         // SAFETY: forwarded to the caller's obligations.
         unsafe { self.NDIlib_recv_advertiser_destroy(instance) }
@@ -160,19 +189,36 @@ struct Advertiser<A: AdvertiserApi> {
 unsafe impl<A: AdvertiserApi> Send for Advertiser<A> where A::Member: Send {}
 
 impl<A: AdvertiserApi> Advertiser<A> {
-    /// Take ownership of the advertiser the SDK created, if it created one.
-    fn adopt(
-        instance: Option<A::Instance>,
-        api: &'static A,
-        url: Option<CString>,
-        config: Option<CString>,
+    /// Connect to the Discovery Server `options` name.
+    fn new(ndi: &NDI, options: &AdvertiserOptions) -> Result<Self> {
+        // SAFETY: the closure returns what the SDK's advertiser creation
+        // returned, and the settings it is handed outlive that call.
+        unsafe { Self::create(ndi, options, None, |api, settings| Ok(api.create(settings))) }
+    }
+
+    /// Create the native advertiser through `create`, which is handed the
+    /// table and the native settings for `options`, and keep `config` for as
+    /// long as the advertiser lives.
+    ///
+    /// # Safety
+    ///
+    /// `create` returns null or a live advertiser of `ndi`'s runtime that
+    /// nothing else owns.
+    unsafe fn create(
         ndi: &NDI,
+        options: &AdvertiserOptions,
+        config: Option<CString>,
+        create: impl FnOnce(&'static A, &A::Settings) -> Result<A::Instance>,
     ) -> Result<Self> {
-        let instance = instance.ok_or_else(|| {
-            Error::InitializationFailed(
+        let api = ndi.table::<A>()?;
+        let url = options.servers.as_deref().map(CString::new).transpose()?;
+        let settings = A::settings(url.as_ref().map_or(ptr::null(), |v| v.as_ptr()));
+        let instance = create(api, &settings)?;
+        if instance.is_null() {
+            return Err(Error::InitializationFailed(
                 "the SDK created no advertiser; it needs a reachable Discovery Server".into(),
-            )
-        })?;
+            ));
+        }
         Ok(Self {
             instance,
             api,
@@ -215,6 +261,41 @@ impl<A: AdvertiserApi> Drop for Advertiser<A> {
         unsafe { self.api.destroy(self.instance) };
     }
 }
+
+/// Let the Advanced SDK create `$Advertiser` with a configuration.
+macro_rules! configurable {
+    ($Advertiser:ident, $Settings:ty, $Instance:ty) => {
+        #[cfg(feature = "advanced")]
+        impl crate::advanced::Configurable for $Advertiser {
+            type Options = AdvertiserOptions;
+            type Settings = $Settings;
+            type Instance = $Instance;
+
+            unsafe fn create_with(
+                ndi: &NDI,
+                options: &AdvertiserOptions,
+                config: CString,
+                create: impl FnOnce(&Self::Settings) -> Result<Self::Instance>,
+            ) -> Result<Self> {
+                // SAFETY: forwarded to the caller's obligation.
+                let inner = unsafe {
+                    Advertiser::create(ndi, options, Some(config), |_, settings| create(settings))
+                }?;
+                Ok(Self { inner })
+            }
+        }
+    };
+}
+configurable!(
+    SendAdvertiser,
+    NDIlib_send_advertiser_create_t,
+    NDIlib_send_advertiser_instance_t
+);
+configurable!(
+    RecvAdvertiser,
+    NDIlib_recv_advertiser_create_t,
+    NDIlib_recv_advertiser_instance_t
+);
 
 /// Advertises senders to a Discovery Server so they can be monitored.
 ///
@@ -300,60 +381,15 @@ impl SendAdvertiser {
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime
-    /// cannot provide [sender advertising](RuntimeFeature::SenderAdvertising),
-    /// which needs NDI 6.4.0 or later; [`Error::InvalidCString`] when the server
-    /// list contains a NUL byte; and [`Error::InitializationFailed`] when the
-    /// SDK creates no advertiser, as it does when no Discovery Server is
-    /// configured or reachable.
+    /// cannot provide [sender advertising], which needs NDI 6.4.0 or later;
+    /// [`Error::InvalidCString`] when the server list contains a NUL byte; and
+    /// [`Error::InitializationFailed`] when the SDK creates no advertiser, as
+    /// it does when no Discovery Server is configured or reachable.
+    ///
+    /// [sender advertising]: crate::capabilities::RuntimeFeature::SenderAdvertising
     pub fn new(ndi: &NDI, options: &AdvertiserOptions) -> Result<Self> {
-        Self::create(ndi, options, None)
-    }
-    /// Create with Advanced configuration retained through native destruction.
-    #[cfg(feature = "advanced")]
-    pub fn new_with_config(
-        ndi: &NDI,
-        options: &AdvertiserOptions,
-        config: &crate::advanced::AdvancedConfig,
-    ) -> Result<Self> {
-        Self::create(ndi, options, Some(CString::new(config.expose_json())?))
-    }
-    fn create(ndi: &NDI, options: &AdvertiserOptions, config: Option<CString>) -> Result<Self> {
-        let table = ndi.capability(
-            RuntimeFeature::SenderAdvertising,
-            &ndi.api().sender_advertising,
-        )?;
-        let url = options.servers.as_deref().map(CString::new).transpose()?;
-        let raw = NDIlib_send_advertiser_create_t {
-            p_url_address: url.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
-        };
-        #[cfg(feature = "advanced")]
-        let instance = if let Some(config) = &config {
-            type Configured = unsafe extern "C" fn(
-                *const NDIlib_send_advertiser_create_t,
-                *const std::ffi::c_char,
-            )
-                -> NDIlib_send_advertiser_instance_t;
-            // SAFETY: `Configured` is the SDK's signature for this function.
-            let configured: Configured = unsafe {
-                crate::advanced::ffi::required(ndi, b"NDIlib_send_advertiser_create_ex\0")?
-            };
-            // SAFETY: `raw` and `config` borrow C strings that outlive the call.
-            unsafe { configured(&raw, config.as_ptr()) }
-        } else {
-            // SAFETY: `raw` borrows a C string that outlives the call.
-            unsafe { table.NDIlib_send_advertiser_create(&raw) }
-        };
-        // SAFETY: `raw` borrows a C string that outlives the call.
-        #[cfg(not(feature = "advanced"))]
-        let instance = unsafe { table.NDIlib_send_advertiser_create(&raw) };
         Ok(Self {
-            inner: Advertiser::adopt(
-                (!instance.is_null()).then_some(instance),
-                table,
-                url,
-                config,
-                ndi,
-            )?,
+            inner: Advertiser::new(ndi, options)?,
         })
     }
     /// Advertise `sender`, keeping the native sender alive for as long as the
@@ -412,61 +448,15 @@ impl RecvAdvertiser {
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime
-    /// cannot provide
-    /// [receiver advertising](RuntimeFeature::ReceiverAdvertising), which needs
-    /// NDI 6.4.0 or later; [`Error::InvalidCString`] when the server list
-    /// contains a NUL byte; and [`Error::InitializationFailed`] when the SDK
-    /// creates no advertiser, as it does when no Discovery Server is configured
-    /// or reachable.
+    /// cannot provide [receiver advertising], which needs NDI 6.4.0 or later;
+    /// [`Error::InvalidCString`] when the server list contains a NUL byte; and
+    /// [`Error::InitializationFailed`] when the SDK creates no advertiser, as
+    /// it does when no Discovery Server is configured or reachable.
+    ///
+    /// [receiver advertising]: crate::capabilities::RuntimeFeature::ReceiverAdvertising
     pub fn new(ndi: &NDI, options: &AdvertiserOptions) -> Result<Self> {
-        Self::create(ndi, options, None)
-    }
-    /// Create with Advanced configuration retained through native destruction.
-    #[cfg(feature = "advanced")]
-    pub fn new_with_config(
-        ndi: &NDI,
-        options: &AdvertiserOptions,
-        config: &crate::advanced::AdvancedConfig,
-    ) -> Result<Self> {
-        Self::create(ndi, options, Some(CString::new(config.expose_json())?))
-    }
-    fn create(ndi: &NDI, options: &AdvertiserOptions, config: Option<CString>) -> Result<Self> {
-        let table = ndi.capability(
-            RuntimeFeature::ReceiverAdvertising,
-            &ndi.api().receiver_advertising,
-        )?;
-        let url = options.servers.as_deref().map(CString::new).transpose()?;
-        let raw = NDIlib_recv_advertiser_create_t {
-            p_url_address: url.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
-        };
-        #[cfg(feature = "advanced")]
-        let instance = if let Some(config) = &config {
-            type Configured = unsafe extern "C" fn(
-                *const NDIlib_recv_advertiser_create_t,
-                *const std::ffi::c_char,
-            )
-                -> NDIlib_recv_advertiser_instance_t;
-            // SAFETY: `Configured` is the SDK's signature for this function.
-            let configured: Configured = unsafe {
-                crate::advanced::ffi::required(ndi, b"NDIlib_recv_advertiser_create_ex\0")?
-            };
-            // SAFETY: `raw` and `config` borrow C strings that outlive the call.
-            unsafe { configured(&raw, config.as_ptr()) }
-        } else {
-            // SAFETY: `raw` borrows a C string that outlives the call.
-            unsafe { table.NDIlib_recv_advertiser_create(&raw) }
-        };
-        // SAFETY: `raw` borrows a C string that outlives the call.
-        #[cfg(not(feature = "advanced"))]
-        let instance = unsafe { table.NDIlib_recv_advertiser_create(&raw) };
         Ok(Self {
-            inner: Advertiser::adopt(
-                (!instance.is_null()).then_some(instance),
-                table,
-                url,
-                config,
-                ndi,
-            )?,
+            inner: Advertiser::new(ndi, options)?,
         })
     }
     /// Advertise `receiver`, in any mode, keeping the native receiver alive for

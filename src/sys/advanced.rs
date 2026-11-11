@@ -8,8 +8,8 @@
 //! * [`advanced_tables!`] defines each table once. With the declarations a
 //!   table is a [`native_table!`](super::table::native_table) checked against
 //!   them; without, it is an uninhabited stand-in of the same name.
-//! * [`AdvancedTable::of`] hands a wrapper its table, or the reason there is
-//!   none: the runtime does not export it, or the build has no declarations.
+//! * [`Table::of`] hands a wrapper its table, or the reason there is none:
+//!   the runtime does not export it, or the build has no declarations.
 //! * [`native!`] marks an expression that uses the declarations. Without them
 //!   the expression is not compiled, and the stand-in table it names proves
 //!   the position unreachable.
@@ -17,7 +17,7 @@
 //! A wrapper therefore reads the same in both builds: it takes its table when
 //! it is constructed and calls through `native!`.
 
-use super::Runtime;
+use super::{Runtime, Table};
 use crate::{Error, Result};
 
 #[cfg(ndi_has_advanced_header)]
@@ -30,21 +30,6 @@ use super::{
 use crate::capabilities::SdkEdition;
 #[cfg(ndi_has_advanced_header)]
 use std::ffi::CStr;
-
-/// A table of Advanced SDK entry points, or its stand-in in a build without
-/// the Advanced SDK declarations.
-pub(crate) trait AdvancedTable: Sized + 'static {
-    /// The capability the table provides, as errors name it.
-    const CAPABILITY: &'static str;
-
-    /// The table resolved from `runtime`.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::UnsupportedCapability`] when the runtime lacks one of the
-    /// table's entry points or the build has no Advanced SDK declarations.
-    fn of(runtime: &'static Runtime) -> Result<&'static Self>;
-}
 
 /// Native types from the Advanced-only headers that wrappers keep in fields.
 #[cfg(ndi_has_advanced_header)]
@@ -120,8 +105,9 @@ fn not_built(capability: &str) -> Error {
 
 /// Define the Advanced tables.
 ///
-/// Each entry names the table, its field in [`AdvancedApi`] and its capability,
-/// then lists its entry points exactly as the Advanced headers declare them.
+/// Each entry names the table, its field in [`AdvancedApi`] and the name its
+/// capability is reported under, then lists its entry points exactly as the
+/// Advanced headers declare them.
 #[cfg(ndi_has_advanced_header)]
 macro_rules! advanced_tables {
     ($(
@@ -138,15 +124,13 @@ macro_rules! advanced_tables {
                 }
             }
 
-            impl AdvancedTable for $Table {
-                const CAPABILITY: &'static str = $capability;
-
+            impl Table for $Table {
                 fn of(runtime: &'static Runtime) -> Result<&'static Self> {
                     runtime
                         .advanced
                         .$field
                         .as_ref()
-                        .map_err(|symbol| not_exported(Self::CAPABILITY, runtime, symbol))
+                        .map_err(|symbol| not_exported($capability, runtime, symbol))
                 }
             }
         )+
@@ -192,11 +176,9 @@ macro_rules! advanced_tables {
             $(#[$meta])*
             pub(crate) enum $Table {}
 
-            impl AdvancedTable for $Table {
-                const CAPABILITY: &'static str = $capability;
-
+            impl Table for $Table {
                 fn of(_: &'static Runtime) -> Result<&'static Self> {
-                    Err(not_built(Self::CAPABILITY))
+                    Err(not_built($capability))
                 }
             }
         )+
@@ -222,6 +204,37 @@ advanced_tables! {
     /// Source snapshots that carry each source's metadata.
     struct SourceMetadata in source_metadata: "source metadata" {
         fn NDIlib_find_get_current_sources_v2(p_instance: NDIlib_find_instance_t, p_no_sources: *mut u32) -> *const NDIlib_source_v2_t;
+    }
+
+    /// Router creation with a per-instance JSON configuration.
+    struct RouterConfiguration in router_configuration: "Advanced router configuration" {
+        fn NDIlib_routing_create_v2(p_create_settings: *const NDIlib_routing_create_t, p_config_data: *const ::std::os::raw::c_char) -> NDIlib_routing_instance_t;
+    }
+
+    /// Metadata a router replays to each new connection.
+    struct RouterConnectionMetadata in router_connection_metadata: "router connection metadata" {
+        fn NDIlib_routing_add_connection_metadata(p_instance: NDIlib_routing_instance_t, p_metadata: *const NDIlib_metadata_frame_t);
+        fn NDIlib_routing_clear_connection_metadata(p_instance: NDIlib_routing_instance_t);
+    }
+
+    /// Sender advertiser creation with a per-instance JSON configuration.
+    struct SenderAdvertiserConfiguration in sender_advertiser_configuration: "Advanced sender advertiser configuration" {
+        fn NDIlib_send_advertiser_create_ex(p_create_settings: *const NDIlib_send_advertiser_create_t, p_config_data: *const ::std::os::raw::c_char) -> NDIlib_send_advertiser_instance_t;
+    }
+
+    /// Receiver advertiser creation with a per-instance JSON configuration.
+    struct ReceiverAdvertiserConfiguration in receiver_advertiser_configuration: "Advanced receiver advertiser configuration" {
+        fn NDIlib_recv_advertiser_create_ex(p_create_settings: *const NDIlib_recv_advertiser_create_t, p_config_data: *const ::std::os::raw::c_char) -> NDIlib_recv_advertiser_instance_t;
+    }
+
+    /// Sender listener creation with a per-instance JSON configuration.
+    struct SenderListenerConfiguration in sender_listener_configuration: "Advanced sender listener configuration" {
+        fn NDIlib_send_listener_create_ex(p_create_settings: *const NDIlib_send_listener_create_t, p_config_data: *const ::std::os::raw::c_char) -> NDIlib_send_listener_instance_t;
+    }
+
+    /// Receiver listener creation with a per-instance JSON configuration.
+    struct ReceiverListenerConfiguration in receiver_listener_configuration: "Advanced receiver listener configuration" {
+        fn NDIlib_recv_listener_create_ex(p_create_settings: *const NDIlib_recv_listener_create_t, p_config_data: *const ::std::os::raw::c_char) -> NDIlib_recv_listener_instance_t;
     }
 
     /// A sender's own contribution to its tally state.

@@ -4,19 +4,8 @@ use std::collections::BTreeMap;
 
 use super::TABLES;
 
-/// The routing and discovery modules resolve these by name.
-const BY_NAME: &str = "resolved by name through `advanced::ffi::required`";
-
-/// Declared functions that are in no table, with the reason.
-const UNWRAPPED: &[(&str, &str)] = &[
-    ("NDIlib_routing_create_v2", BY_NAME),
-    ("NDIlib_routing_add_connection_metadata", BY_NAME),
-    ("NDIlib_routing_clear_connection_metadata", BY_NAME),
-    ("NDIlib_send_advertiser_create_ex", BY_NAME),
-    ("NDIlib_recv_advertiser_create_ex", BY_NAME),
-    ("NDIlib_send_listener_create_ex", BY_NAME),
-    ("NDIlib_recv_listener_create_ex", BY_NAME),
-];
+/// Declared functions this crate deliberately does not call, with the reason.
+const UNWRAPPED: &[(&str, &str)] = &[];
 
 /// Names of the foreign functions the installed Advanced headers declare.
 fn declared_functions() -> Vec<String> {

@@ -202,7 +202,7 @@ impl AvSync {
     /// build without the Advanced SDK), or [`Error::InitializationFailed`]
     /// when the SDK creates no synchronizer.
     pub fn new(receiver: Receiver) -> std::result::Result<Self, Rejected<Receiver>> {
-        let table = match receiver.core._ndi.advanced::<AvSyncTable>() {
+        let table = match receiver.core._ndi.table::<AvSyncTable>() {
             Ok(table) => table,
             Err(error) => return Err(Rejected::new(error, receiver)),
         };
@@ -484,7 +484,7 @@ impl Genlock {
         source: Option<&Source>,
         config: Option<&AdvancedConfig>,
     ) -> Result<Self> {
-        let table = ndi.advanced::<GenlockTable>()?;
+        let table = ndi.table::<GenlockTable>()?;
         let source = source.map(Source::to_raw).transpose()?.map(Box::new);
         // SAFETY: the source descriptor and the configuration point to
         // strings that this value keeps alive for as long as the genlock.

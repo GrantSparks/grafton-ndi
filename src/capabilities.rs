@@ -325,8 +325,7 @@ impl Capabilities {
         edition: SdkEdition,
         advanced: AdvancedEntryPoints,
     ) -> Self {
-        // The feature's version gate. A missing function is reported first: it
-        // is the more specific reason, and no version makes up for it.
+        // The feature's version gate.
         let versioned = |feature: RuntimeFeature| match (feature.minimum_version(), version) {
             (None, _) => CapabilityStatus::Available,
             (Some(minimum), Some(version)) if version >= minimum => CapabilityStatus::Available,
@@ -337,6 +336,8 @@ impl Capabilities {
                 CapabilityStatus::Unavailable(CapabilityUnavailable::RuntimeVersionUnknown)
             }
         };
+        // A missing function is reported first: it is the more specific reason,
+        // and no version makes up for it.
         let exported = |feature: RuntimeFeature, available: bool| {
             if available {
                 versioned(feature)
@@ -353,71 +354,37 @@ impl Capabilities {
                 exported(feature, available)
             }
         };
-        // Strings the receiver API returns are released through a table of
-        // their own, which every capability returning one also needs.
-        let receiver_strings = api.receiver_strings.is_available();
+        let status = |feature: RuntimeFeature| match feature {
+            RuntimeFeature::AdvancedSenderConfiguration => {
+                advanced_entry(feature, advanced.sender_configuration)
+            }
+            RuntimeFeature::AdvancedReceiverConfiguration => {
+                advanced_entry(feature, advanced.receiver_configuration)
+            }
+            // Which entry points a feature needs is stated with its table. A
+            // feature without any of its own is only a version gate.
+            _ => exported(feature, api.exports(feature).unwrap_or(true)),
+        };
         Self {
-            planar_444_video: versioned(RuntimeFeature::Planar444Video),
-            receive_best_444: versioned(RuntimeFeature::ReceiveBest444),
-            receive_video_only: versioned(RuntimeFeature::ReceiveVideoOnly),
-            receive_delay: exported(
-                RuntimeFeature::ReceiveDelay,
-                api.receive_delay.is_available(),
-            ),
-            receiver_connection_metadata: exported(
-                RuntimeFeature::ReceiverConnectionMetadata,
-                api.receiver_connection_metadata.is_available(),
-            ),
-            receiver_web_control: exported(
-                RuntimeFeature::ReceiverWebControl,
-                receiver_strings && api.receiver_web_control.is_available(),
-            ),
-            connected_source_name: exported(
-                RuntimeFeature::ConnectedSourceName,
-                receiver_strings && api.receiver_source_name.is_available(),
-            ),
-            sender_metadata: exported(
-                RuntimeFeature::SenderMetadata,
-                api.sender_metadata.is_available(),
-            ),
-            sdk_timestamp: exported(RuntimeFeature::SdkTimestamp, api.timestamp.is_available()),
-            interleaved_audio_conversion: exported(
-                RuntimeFeature::InterleavedAudioConversion,
-                api.interleaved_audio.is_available(),
-            ),
-            interleaved_audio_send: exported(
-                RuntimeFeature::InterleavedAudioSend,
-                api.interleaved_send.is_available(),
-            ),
-            video_conversion: exported(
-                RuntimeFeature::VideoConversion,
-                api.video_conversion.is_available(),
-            ),
-            routing: exported(RuntimeFeature::Routing, api.routing.is_available()),
-            sender_advertising: exported(
-                RuntimeFeature::SenderAdvertising,
-                api.sender_advertising.is_available(),
-            ),
-            receiver_advertising: exported(
-                RuntimeFeature::ReceiverAdvertising,
-                api.receiver_advertising.is_available(),
-            ),
-            sender_discovery: exported(
-                RuntimeFeature::SenderDiscovery,
-                api.sender_discovery.is_available(),
-            ),
-            receiver_discovery: exported(
-                RuntimeFeature::ReceiverDiscovery,
-                api.receiver_discovery.is_available(),
-            ),
-            advanced_sender_configuration: advanced_entry(
-                RuntimeFeature::AdvancedSenderConfiguration,
-                advanced.sender_configuration,
-            ),
-            advanced_receiver_configuration: advanced_entry(
-                RuntimeFeature::AdvancedReceiverConfiguration,
-                advanced.receiver_configuration,
-            ),
+            planar_444_video: status(RuntimeFeature::Planar444Video),
+            receive_best_444: status(RuntimeFeature::ReceiveBest444),
+            receive_video_only: status(RuntimeFeature::ReceiveVideoOnly),
+            receive_delay: status(RuntimeFeature::ReceiveDelay),
+            receiver_connection_metadata: status(RuntimeFeature::ReceiverConnectionMetadata),
+            receiver_web_control: status(RuntimeFeature::ReceiverWebControl),
+            connected_source_name: status(RuntimeFeature::ConnectedSourceName),
+            sender_metadata: status(RuntimeFeature::SenderMetadata),
+            sdk_timestamp: status(RuntimeFeature::SdkTimestamp),
+            interleaved_audio_conversion: status(RuntimeFeature::InterleavedAudioConversion),
+            interleaved_audio_send: status(RuntimeFeature::InterleavedAudioSend),
+            video_conversion: status(RuntimeFeature::VideoConversion),
+            routing: status(RuntimeFeature::Routing),
+            sender_advertising: status(RuntimeFeature::SenderAdvertising),
+            receiver_advertising: status(RuntimeFeature::ReceiverAdvertising),
+            sender_discovery: status(RuntimeFeature::SenderDiscovery),
+            receiver_discovery: status(RuntimeFeature::ReceiverDiscovery),
+            advanced_sender_configuration: status(RuntimeFeature::AdvancedSenderConfiguration),
+            advanced_receiver_configuration: status(RuntimeFeature::AdvancedReceiverConfiguration),
         }
     }
 

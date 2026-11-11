@@ -22,13 +22,14 @@ const ADVANCED_RECEIVER: &CStr = c"NDIlib_recv_create_v4";
 /// The implementation selected for this process.
 pub(crate) struct Runtime {
     pub(crate) api: Api,
-    /// The Advanced tables, reached through `sys::advanced::AdvancedTable::of`.
+    /// The Advanced tables, handed out by their `Table::of`.
     #[cfg(ndi_has_advanced_header)]
     pub(crate) advanced: super::advanced::AdvancedApi,
     pub(crate) info: RuntimeInfo,
     pub(crate) capabilities: Capabilities,
-    // The linked provider carries no state; only the Advanced bridge reads it.
-    #[cfg_attr(all(ndi_link_static, not(feature = "advanced")), allow(dead_code))]
+    // The linked provider carries no state, so nothing reads it once the
+    // tables are resolved.
+    #[cfg_attr(ndi_link_static, allow(dead_code))]
     provider: Provider,
 }
 
@@ -111,13 +112,6 @@ impl Runtime {
             info,
             provider,
         })
-    }
-
-    /// The provider's raw symbol lookup, for Advanced entry points whose
-    /// declarations are not vendored.
-    #[cfg(feature = "advanced")]
-    pub(crate) fn resolver(&self) -> &dyn Resolver {
-        &self.provider
     }
 }
 

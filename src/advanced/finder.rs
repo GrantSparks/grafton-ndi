@@ -83,7 +83,7 @@ impl Finder {
         settings: &FinderOptions,
         config: &AdvancedConfig,
     ) -> Result<Self> {
-        let table = ndi.advanced::<FinderConfiguration>()?;
+        let table = ndi.table::<FinderConfiguration>()?;
         // SAFETY: the closure returns what the SDK's finder creation returned:
         // null, or a fresh instance that nothing else owns. The settings and
         // the configuration outlive the call.
@@ -107,7 +107,7 @@ impl Finder {
     /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
     /// without an Advanced runtime.
     pub fn sources_with_metadata(&self) -> Result<Vec<ExtendedSource>> {
-        let table = self.runtime().advanced::<SourceMetadata>()?;
+        let table = self.runtime().table::<SourceMetadata>()?;
         Ok(self.snapshot(|instance| {
             native!(table => {
                 let mut count = 0;

@@ -43,7 +43,7 @@ impl Sender {
         options: &SenderOptions,
         config: &AdvancedConfig,
     ) -> Result<Self> {
-        let table = ndi.advanced::<SenderConfiguration>()?;
+        let table = ndi.table::<SenderConfiguration>()?;
         let name = CString::new(options.name.as_str())?;
         let groups = options.groups.as_deref().map(CString::new).transpose()?;
         // The sender retains the exact allocation given to the SDK, in case the
@@ -78,7 +78,7 @@ impl Sender {
     ///
     /// [`Error::UnsupportedCapability`] without an Advanced runtime.
     pub fn set_external_tally(&self, tally: Tally) -> Result<bool> {
-        let table = self.runtime().advanced::<SenderTally>()?;
+        let table = self.runtime().table::<SenderTally>()?;
         let tally = tally.to_raw();
         // SAFETY: the sender instance is live for this borrow.
         Ok(native!(table => unsafe {
@@ -94,7 +94,7 @@ impl Sender {
     /// [`Error::UnsupportedCapability`] without an Advanced runtime, and
     /// [`Error::InvalidFrame`] when the SDK has no guidance for the format.
     pub fn target_frame_bytes(&self, format: VideoPacketFormat) -> Result<u32> {
-        let table = self.runtime().advanced::<EncoderGuidance>()?;
+        let table = self.runtime().table::<EncoderGuidance>()?;
         let format = format.raw();
         // SAFETY: the sender instance is live for this borrow.
         encoder_quantity(native!(table => unsafe {
@@ -109,7 +109,7 @@ impl Sender {
     ///
     /// As for [`target_frame_bytes`](Self::target_frame_bytes).
     pub fn target_bit_rate(&self, format: VideoPacketFormat) -> Result<u32> {
-        let table = self.runtime().advanced::<EncoderGuidance>()?;
+        let table = self.runtime().table::<EncoderGuidance>()?;
         let format = format.raw();
         // SAFETY: the sender instance is live for this borrow.
         encoder_quantity(native!(table => unsafe {
@@ -125,7 +125,7 @@ impl Sender {
     ///
     /// As for [`target_frame_bytes`](Self::target_frame_bytes).
     pub fn legacy_quality(&self, format: VideoPacketFormat) -> Result<u32> {
-        let table = self.runtime().advanced::<EncoderGuidance>()?;
+        let table = self.runtime().table::<EncoderGuidance>()?;
         let format = format.raw();
         // SAFETY: the sender instance is live for this borrow.
         encoder_quantity(native!(table => unsafe {
@@ -147,7 +147,7 @@ impl Sender {
         format: VideoPacketFormat,
         supports_new_format: bool,
     ) -> Result<QualityPlan> {
-        let table = self.runtime().advanced::<QualityPlanning>()?;
+        let table = self.runtime().table::<QualityPlanning>()?;
         let format = format.raw();
         let mut short_dc = false;
         // SAFETY: the sender instance is live for this borrow and `short_dc`
@@ -182,7 +182,7 @@ impl Sender {
     ///
     /// [`Error::UnsupportedCapability`] without an Advanced runtime.
     pub fn keyframe_required(&self, format: Option<VideoPacketFormat>) -> Result<bool> {
-        let table = self.runtime().advanced::<KeyframeDemand>()?;
+        let table = self.runtime().table::<KeyframeDemand>()?;
         let format = format.map(VideoPacketFormat::raw);
         // SAFETY: the sender instance is live for this borrow.
         Ok(native!(table => unsafe {
@@ -206,7 +206,7 @@ impl Sender {
         timeout: Duration,
         format: Option<VideoPacketFormat>,
     ) -> Result<bool> {
-        let table = self.runtime().advanced::<KeyframeDemand>()?;
+        let table = self.runtime().table::<KeyframeDemand>()?;
         let timeout = crate::to_ms_checked(timeout)?;
         let format = format.map(VideoPacketFormat::raw);
         // SAFETY: the sender instance is live for this borrow.
@@ -321,7 +321,7 @@ impl Receiver {
         options: &ReceiverOptions,
         config: &AdvancedConfig,
     ) -> Result<Self> {
-        let table = ndi.advanced::<ReceiverConfiguration>()?;
+        let table = ndi.table::<ReceiverConfiguration>()?;
         Self::configured(ndi, table, options, config, |_| {})
     }
 
@@ -358,7 +358,7 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// [`Error::UnsupportedCapability`] without an Advanced runtime.
     pub fn request_keyframe(&self) -> Result<()> {
-        let table = self.core._ndi.advanced::<KeyframeRequest>()?;
+        let table = self.core._ndi.table::<KeyframeRequest>()?;
         // SAFETY: the receiver instance is live for this borrow.
         native!(table => unsafe { table.NDIlib_recv_request_keyframe(self.core.instance) });
         Ok(())
@@ -373,7 +373,7 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// [`Error::UnsupportedCapability`] without an Advanced runtime.
     pub fn set_video_quality(&mut self, quality: VideoQuality) -> Result<bool> {
-        let table = self.core._ndi.advanced::<ReceiverBandwidthControl>()?;
+        let table = self.core._ndi.table::<ReceiverBandwidthControl>()?;
         let bandwidth = match quality {
             VideoQuality::Program => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
             VideoQuality::Preview => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest,
@@ -391,7 +391,7 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// [`Error::UnsupportedCapability`] without an Advanced runtime.
     pub fn set_streams(&mut self, streams: StreamSelection) -> Result<StreamChange> {
-        let table = self.core._ndi.advanced::<ReceiverStreamControl>()?;
+        let table = self.core._ndi.table::<ReceiverStreamControl>()?;
         // SAFETY: the receiver instance is live for this borrow.
         let changed = native!(table => unsafe {
             table.NDIlib_recv_set_enabled_streams(

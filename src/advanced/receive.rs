@@ -209,7 +209,7 @@ impl PacketReceiver {
         preset: PassthroughPreset,
         config: &AdvancedConfig,
     ) -> Result<Self> {
-        let table = ndi.advanced::<ReceiverConfiguration>()?;
+        let table = ndi.table::<ReceiverConfiguration>()?;
         let color_format = preset.color_format(table);
         let receiver = Receiver::configured(ndi, table, options, config, |create| {
             create.color_format = color_format;

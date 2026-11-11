@@ -25,7 +25,6 @@
 #![warn(missing_docs)]
 
 use crate::{
-    capabilities::RuntimeFeature,
     sys::{self, bindings::*},
     to_ms_checked, Error, Result, Source, NDI,
 };
@@ -96,47 +95,46 @@ impl Router {
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime has no
-    /// [routing support](RuntimeFeature::Routing), [`Error::InvalidCString`]
+    /// [routing support](crate::capabilities::RuntimeFeature::Routing), [`Error::InvalidCString`]
     /// when the name or groups contain a NUL byte, and
     /// [`Error::InitializationFailed`] when the SDK creates no source.
     pub fn new(ndi: &NDI, options: &RouterOptions) -> Result<Self> {
-        Self::create(ndi, options, None)
+        // SAFETY: the closure returns what the SDK's router creation returned,
+        // and the settings it is handed outlive that call.
+        unsafe {
+            Self::create(ndi, options, None, |routing, settings| {
+                Ok(routing.NDIlib_routing_create(settings))
+            })
+        }
     }
-    /// Create a routing source with retained Advanced JSON configuration.
-    #[cfg(feature = "advanced")]
-    pub fn new_with_config(
+
+    /// Create a router through `create`, which is handed the routing table and
+    /// the native settings for `options`, and keep `config` for as long as the
+    /// router lives.
+    ///
+    /// # Safety
+    ///
+    /// `create` returns null or a live router of `ndi`'s runtime that nothing
+    /// else owns.
+    unsafe fn create(
         ndi: &NDI,
         options: &RouterOptions,
-        config: &crate::advanced::AdvancedConfig,
+        config: Option<CString>,
+        create: impl FnOnce(
+            &'static sys::Routing,
+            &NDIlib_routing_create_t,
+        ) -> Result<NDIlib_routing_instance_t>,
     ) -> Result<Self> {
-        Self::create(ndi, options, Some(CString::new(config.expose_json())?))
-    }
-    fn create(ndi: &NDI, options: &RouterOptions, config: Option<CString>) -> Result<Self> {
-        let routing = ndi.capability(RuntimeFeature::Routing, &ndi.api().routing)?;
+        let routing = ndi.table::<sys::Routing>()?;
         let name = CString::new(options.name.as_str())?;
         let groups = options.groups.as_deref().map(CString::new).transpose()?;
-        let raw = NDIlib_routing_create_t {
-            p_ndi_name: name.as_ptr(),
-            p_groups: groups.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
-        };
-        #[cfg(feature = "advanced")]
-        let instance = if let Some(config) = &config {
-            type Configured = unsafe extern "C" fn(
-                *const NDIlib_routing_create_t,
-                *const std::ffi::c_char,
-            ) -> NDIlib_routing_instance_t;
-            // SAFETY: `Configured` is the SDK's signature for this function.
-            let configured: Configured =
-                unsafe { crate::advanced::ffi::required(ndi, b"NDIlib_routing_create_v2\0")? };
-            // SAFETY: `raw` and `config` borrow C strings that outlive the call.
-            unsafe { configured(&raw, config.as_ptr()) }
-        } else {
-            // SAFETY: `raw` borrows C strings that outlive the call.
-            unsafe { routing.NDIlib_routing_create(&raw) }
-        };
-        // SAFETY: `raw` borrows C strings that outlive the call.
-        #[cfg(not(feature = "advanced"))]
-        let instance = unsafe { routing.NDIlib_routing_create(&raw) };
+        let instance = create(
+            routing,
+            &NDIlib_routing_create_t {
+                p_ndi_name: name.as_ptr(),
+                p_groups: groups.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
+            },
+        )?;
         if instance.is_null() {
             return Err(Error::InitializationFailed(
                 "routing source creation failed".into(),
@@ -151,6 +149,19 @@ impl Router {
             _ndi: ndi.clone(),
         })
     }
+
+    /// The native router, for calls through an Advanced table.
+    #[cfg(feature = "advanced")]
+    pub(crate) fn native_instance(&self) -> NDIlib_routing_instance_t {
+        self.instance
+    }
+
+    /// The runtime this router was created through.
+    #[cfg(feature = "advanced")]
+    pub(crate) fn runtime(&self) -> &NDI {
+        &self._ndi
+    }
+
     /// Route connected and future receivers to `source`.
     ///
     /// # Errors
@@ -216,31 +227,25 @@ impl Router {
         // valid until the router is destroyed, after this copy completes.
         unsafe { Source::try_from_raw(self.routing.NDIlib_routing_get_source_name(self.instance)) }
     }
-    /// Send metadata immediately and on each new downstream connection.
-    #[cfg(feature = "advanced")]
-    pub fn add_connection_metadata(&self, metadata: &crate::MetadataFrame) -> Result<()> {
-        type Add = unsafe extern "C" fn(NDIlib_routing_instance_t, *const NDIlib_metadata_frame_t);
-        let add: Add = unsafe {
-            crate::advanced::ffi::required(&self._ndi, b"NDIlib_routing_add_connection_metadata\0")?
-        };
-        unsafe { add(self.instance, &metadata.to_raw()) };
-        Ok(())
-    }
+}
 
-    /// Clear the stored connection metadata.
-    #[cfg(feature = "advanced")]
-    pub fn clear_connection_metadata(&self) -> Result<()> {
-        type ClearMetadata = unsafe extern "C" fn(NDIlib_routing_instance_t);
-        let clear: ClearMetadata = unsafe {
-            crate::advanced::ffi::required(
-                &self._ndi,
-                b"NDIlib_routing_clear_connection_metadata\0",
-            )?
-        };
-        unsafe { clear(self.instance) };
-        Ok(())
+#[cfg(feature = "advanced")]
+impl crate::advanced::Configurable for Router {
+    type Options = RouterOptions;
+    type Settings = NDIlib_routing_create_t;
+    type Instance = NDIlib_routing_instance_t;
+
+    unsafe fn create_with(
+        ndi: &NDI,
+        options: &RouterOptions,
+        config: CString,
+        create: impl FnOnce(&Self::Settings) -> Result<Self::Instance>,
+    ) -> Result<Self> {
+        // SAFETY: forwarded to the caller's obligation.
+        unsafe { Self::create(ndi, options, Some(config), |_, settings| create(settings)) }
     }
 }
+
 impl Drop for Router {
     fn drop(&mut self) {
         // SAFETY: the instance was created by this table and is destroyed once.

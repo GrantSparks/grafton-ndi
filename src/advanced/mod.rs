@@ -1,7 +1,7 @@
 //! NDI Advanced SDK operations.
 //!
-//! * Per-instance JSON configuration of senders, receivers and finders
-//!   ([`AdvancedConfig`]).
+//! * Per-instance JSON configuration of senders, receivers, finders, routers
+//!   and Discovery Server advertisers and listeners ([`AdvancedConfig`]).
 //! * Compressed passthrough: receiving codec packets ([`PacketReceiver`]) and
 //!   sending them ([`CompressedSender`]), including scatter-gather submission.
 //! * Encoder guidance, keyframe demand and stream selection on the ordinary
@@ -59,19 +59,21 @@
 
 mod allocators;
 mod config;
+mod configured;
 mod controls;
-pub(crate) mod ffi;
 mod finder;
 mod kvm;
 mod packets;
 mod queued;
 mod receive;
 mod rejected;
+mod routing;
 mod send;
 mod sync;
 
 pub use allocators::*;
 pub use config::AdvancedConfig;
+pub(crate) use configured::Configurable;
 pub use controls::*;
 pub use finder::ExtendedSource;
 pub use kvm::*;

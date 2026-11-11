@@ -59,3 +59,14 @@ pub use listener::{
     AdvertisedId, AdvertisedReceiver, AdvertisedSender, ListenerEvent, ListenerOptions,
     ReceiverCommand, ReceiverStream, RecvListener, SendListener, Wait,
 };
+
+/// A native object handle, which is null when the SDK created nothing.
+trait Handle: Copy {
+    fn is_null(self) -> bool;
+}
+
+impl<T> Handle for *mut T {
+    fn is_null(self) -> bool {
+        <*mut T>::is_null(self)
+    }
+}

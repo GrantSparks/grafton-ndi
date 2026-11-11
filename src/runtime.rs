@@ -362,17 +362,6 @@ impl NDI {
         &self.runtime.api
     }
 
-    /// A table of Advanced SDK entry points from the selected implementation.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::UnsupportedCapability`] when the runtime lacks the table or the
-    /// crate was built without the Advanced SDK declarations.
-    #[cfg(feature = "advanced")]
-    pub(crate) fn advanced<T: sys::advanced::AdvancedTable>(&self) -> Result<&'static T> {
-        T::of(self.runtime)
-    }
-
     /// Reject an unavailable operation before passing newer inputs to the SDK.
     ///
     /// # Errors
@@ -383,14 +372,13 @@ impl NDI {
         self.runtime.require(feature)
     }
 
-    /// The table of entry points behind an optional capability, or the error
-    /// [`Self::require_feature`] reports for it.
-    pub(crate) fn capability<T>(
-        &self,
-        feature: RuntimeFeature,
-        table: &'static sys::Optional<T>,
-    ) -> Result<&'static T> {
-        self.runtime.capability(feature, table)
+    /// The entry points of an optional capability, core or Advanced, or the
+    /// error [`Self::require_feature`] reports for it.
+    ///
+    /// The table type alone selects the capability, so a table cannot be
+    /// obtained without its gate or under another capability's name.
+    pub(crate) fn table<T: sys::Table>(&self) -> Result<&'static T> {
+        T::of(self.runtime)
     }
 
     /// Retain an initialized runtime reference until process exit.
@@ -401,33 +389,6 @@ impl NDI {
         ProcessLifetimeRuntime {
             ndi: PROCESS_LIFETIME.get_or_init(|| self.clone()),
         }
-    }
-
-    /// Resolve an Advanced SDK entry point by name.
-    ///
-    /// The Advanced-only headers may not be redistributed, so their functions
-    /// have no vendored declaration to build a typed table from.
-    ///
-    /// # Safety
-    ///
-    /// `T` must be the exact C function-pointer type the SDK declares for `name`.
-    #[cfg(feature = "advanced")]
-    pub(crate) unsafe fn resolve_optional<T: Copy>(
-        &self,
-        name: &'static [u8],
-    ) -> Result<Option<T>> {
-        use std::ffi::{c_void, CStr};
-        const { assert!(size_of::<T>() == size_of::<*mut c_void>()) };
-        let name = CStr::from_bytes_with_nul(name).map_err(|_| {
-            Error::InvalidConfiguration(
-                "native symbol names must have exactly one final NUL".into(),
-            )
-        })?;
-        Ok(self.runtime.resolver().resolve(name)?.map(|address| {
-            // SAFETY: the caller guarantees `T` is this symbol's function-pointer
-            // type; its size equals a pointer's (asserted above).
-            unsafe { std::mem::transmute_copy::<*mut c_void, T>(&address.as_ptr()) }
-        }))
     }
 
     /// Checks if the current CPU is supported by the NDI SDK.

@@ -1,6 +1,6 @@
 //! Timestamps read from the selected NDI runtime's clock.
 
-use crate::{capabilities::RuntimeFeature, Result, NDI};
+use crate::{Result, NDI};
 
 /// An SDK clock reading in signed 100-nanosecond ticks since the Unix epoch.
 ///
@@ -24,7 +24,7 @@ impl NDI {
     /// Requires the NDI 6.4 timestamp helper. Missing capability is an error;
     /// this never falls back to `SystemTime` or `Instant`.
     pub fn timestamp(&self) -> Result<SdkTimestamp> {
-        let timestamp = self.capability(RuntimeFeature::SdkTimestamp, &self.api().timestamp)?;
+        let timestamp = self.table::<crate::sys::Timestamp>()?;
         // SAFETY: the query takes no arguments, and this handle keeps the
         // selected runtime initialized for the duration of the call.
         Ok(SdkTimestamp(unsafe {
@@ -35,7 +35,7 @@ impl NDI {
 
 #[cfg(test)]
 mod tests {
-    use super::RuntimeFeature;
+    use crate::capabilities::RuntimeFeature;
     use crate::Error;
 
     #[test]

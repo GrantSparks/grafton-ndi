@@ -692,7 +692,7 @@ impl AllocatorService {
         self,
         receiver: Receiver,
     ) -> std::result::Result<AllocatedReceiver, Rejected<Receiver>> {
-        match self.runtime.ndi().advanced::<ReceiveAllocators>() {
+        match self.runtime.ndi().table::<ReceiveAllocators>() {
             Ok(table) => Ok(AllocatedReceiver {
                 receiver: Some(receiver),
                 table,

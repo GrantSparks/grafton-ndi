@@ -645,7 +645,7 @@ impl CompressedSender {
     /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
     /// when the runtime has no scatter sending.
     pub fn send_scatter_video(&mut self, frame: &ScatterVideoFrame) -> Result<()> {
-        let table = self.sender.runtime().advanced::<ScatterSend>()?;
+        let table = self.sender.runtime().table::<ScatterSend>()?;
         let descriptor = frame.descriptor();
         let scatter = frame.storage.descriptor(table);
         // SAFETY: the sender is live, and both descriptors borrow `frame`,
@@ -666,7 +666,7 @@ impl CompressedSender {
         &mut self,
         frame: ScatterVideoFrame,
     ) -> std::result::Result<Option<SubmittedVideo>, Rejected<ScatterVideoFrame>> {
-        let table = match self.sender.runtime().advanced::<ScatterSend>() {
+        let table = match self.sender.runtime().table::<ScatterSend>() {
             Ok(table) => table,
             Err(error) => return Err(Rejected::new(error, frame)),
         };
@@ -694,7 +694,7 @@ impl CompressedSender {
     /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
     /// when the runtime has no scatter sending.
     pub fn send_scatter_audio(&mut self, frame: &ScatterAudioFrame) -> Result<()> {
-        let table = self.sender.runtime().advanced::<ScatterSend>()?;
+        let table = self.sender.runtime().table::<ScatterSend>()?;
         let descriptor = frame.descriptor();
         let scatter = frame.storage.descriptor(table);
         // SAFETY: the sender is live, and both descriptors borrow `frame`,

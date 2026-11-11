@@ -6,7 +6,6 @@
 //! descriptors, which have no metadata or timestamp fields.
 
 use crate::{
-    capabilities::RuntimeFeature,
     frames::validate_packed_audio_dimensions,
     sys::{self, bindings::*},
     AudioFormat, AudioFrame, Error, Result, Sender, NDI,
@@ -247,10 +246,7 @@ impl AudioConverter {
     /// Resolve the complete current conversion group before exposing operations.
     pub fn new(ndi: &NDI) -> Result<Self> {
         Ok(Self {
-            audio: ndi.capability(
-                RuntimeFeature::InterleavedAudioConversion,
-                &ndi.api().interleaved_audio,
-            )?,
+            audio: ndi.table()?,
             _ndi: ndi.clone(),
         })
     }
@@ -296,10 +292,7 @@ macro_rules! send_interleaved {
         /// SDK descriptors do not carry metadata or receive timestamps.
         pub fn $method(&self, frame: &$input<'_>) -> Result<()> {
             let ndi = self.runtime();
-            let send = ndi.capability(
-                RuntimeFeature::InterleavedAudioSend,
-                &ndi.api().interleaved_send,
-            )?;
+            let send = ndi.table::<sys::InterleavedSend>()?;
             let raw = frame.raw();
             // SAFETY: the sender instance is live for this borrow and the
             // validated source slice outlives the synchronous call.

@@ -906,11 +906,11 @@ impl<M: ReceiverMode> Receiver<M> {
 
     /// Copy the optional device web-control URL. This does not open the URL.
     pub fn web_control_url(&self) -> Result<Option<String>> {
-        let ndi = &self.core._ndi;
-        let feature = RuntimeFeature::ReceiverWebControl;
-        // Hold the matching release function before requesting any allocation.
-        let strings = ndi.capability(feature, &ndi.api().receiver_strings)?;
-        let web_control = ndi.capability(feature, &ndi.api().receiver_web_control)?;
+        // The query comes with the function that releases what it returns.
+        let (web_control, strings) = self
+            .core
+            ._ndi
+            .table::<(sys::ReceiverWebControl, sys::ReceiverStrings)>()?;
         let guard = RecvStringGuard {
             core: &self.core,
             // SAFETY: the receiver instance is live for this borrow.
@@ -928,10 +928,11 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn poll_source_name_change(&self, timeout: Duration) -> Result<Option<SourceNameChange>> {
         to_ms_checked(timeout)?;
         let deadline = Instant::now() + timeout;
-        let ndi = &self.core._ndi;
-        let feature = RuntimeFeature::ConnectedSourceName;
-        let strings = ndi.capability(feature, &ndi.api().receiver_strings)?;
-        let source_name = ndi.capability(feature, &ndi.api().receiver_source_name)?;
+        // The query comes with the function that releases what it returns.
+        let (source_name, strings) = self
+            .core
+            ._ndi
+            .table::<(sys::ReceiverSourceName, sys::ReceiverStrings)>()?;
         let Some(_query) = self.core.source_query_guard.try_lock_until(deadline) else {
             return Ok(None);
         };
@@ -1600,15 +1601,11 @@ impl ReceiverCore {
     }
 
     fn delay(&self) -> Result<&'static sys::ReceiveDelay> {
-        self._ndi
-            .capability(RuntimeFeature::ReceiveDelay, &self._ndi.api().receive_delay)
+        self._ndi.table()
     }
 
     fn connection_metadata(&self) -> Result<&'static sys::ReceiverConnectionMetadata> {
-        self._ndi.capability(
-            RuntimeFeature::ReceiverConnectionMetadata,
-            &self._ndi.api().receiver_connection_metadata,
-        )
+        self._ndi.table()
     }
 
     /// Acquire only within the caller's existing budget, including contention.

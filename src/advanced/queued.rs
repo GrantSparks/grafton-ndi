@@ -297,7 +297,7 @@ impl QueuedSender {
     /// build without the Advanced SDK), [`Error::InvalidConfiguration`] for
     /// limits outside their range, and the errors of [`Sender::new`].
     pub fn new(ndi: &NDI, options: &SenderOptions, limits: QueueOptions) -> Result<Self> {
-        let table = ndi.advanced::<SendCompletion>()?;
+        let table = ndi.table::<SendCompletion>()?;
         let callback = CallbackState::new(limits)?;
         let sender = Sender::new(ndi, options)?;
         Ok(Self::install(sender, callback, table))
@@ -315,7 +315,7 @@ impl QueuedSender {
         config: &AdvancedConfig,
         limits: QueueOptions,
     ) -> Result<Self> {
-        let table = ndi.advanced::<SendCompletion>()?;
+        let table = ndi.table::<SendCompletion>()?;
         let callback = CallbackState::new(limits)?;
         let sender = Sender::new_with_config(ndi, options, config)?;
         Ok(Self::install(sender, callback, table))
@@ -339,7 +339,7 @@ impl QueuedSender {
         limits: QueueOptions,
     ) -> std::result::Result<(Self, Option<VideoFrame>), Rejected<Sender>> {
         let prepare = || {
-            let table = sender.runtime().advanced::<SendCompletion>()?;
+            let table = sender.runtime().table::<SendCompletion>()?;
             let callback = CallbackState::new(limits)?;
             if !sender.has_exclusive_native_owner() {
                 return Err(Error::InvalidConfiguration(
