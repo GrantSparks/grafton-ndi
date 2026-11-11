@@ -134,6 +134,7 @@
 mod capture;
 mod error;
 mod recv_guard;
+mod rejected;
 mod sys;
 
 pub mod framesync;
@@ -191,6 +192,7 @@ pub use {
     },
 };
 
+pub use rejected::Rejected;
 pub use timestamp::SdkTimestamp;
 
 #[cfg(feature = "image-encoding")]

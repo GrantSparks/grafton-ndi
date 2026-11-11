@@ -3,8 +3,8 @@
 
 use std::ffi::CString;
 
-use super::{invalid, Rejected};
-use crate::{sys::bindings::*, Result, ScanType};
+use super::invalid;
+use crate::{sys::bindings::*, Rejected, Result, ScanType};
 
 /// Maximum compressed frame size, in bytes, that this module sends or accepts.
 pub const MAX_PACKET_BYTES: usize = 256 * 1024 * 1024;

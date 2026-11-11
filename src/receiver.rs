@@ -705,6 +705,11 @@ impl ReceiverMode for FrameSyncAttached {}
 
 /// An owned NDI receiver. The default mode permits all raw capture kinds.
 /// FrameSync privately changes the mode while retaining the same resource core.
+///
+/// Dropping the receiver disconnects it from its source, unless a
+/// [`RecvAdvertiser`](crate::discovery::RecvAdvertiser) registration still
+/// holds it: a registered receiver stays connected, and advertised, until that
+/// registration is removed or its advertiser is dropped.
 pub struct Receiver<M: ReceiverMode = RawCapture> {
     pub(crate) core: Arc<ReceiverCore>,
     _mode: PhantomData<M>,

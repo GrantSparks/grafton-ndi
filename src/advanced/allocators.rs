@@ -20,14 +20,14 @@ use std::{
     },
 };
 
-use super::{invalid, AudioCodec, PacketEvent, PacketReceiver, Rejected, VideoCodec};
+use super::{invalid, AudioCodec, PacketEvent, PacketReceiver, VideoCodec};
 use crate::{
     runtime::ProcessLifetimeRuntime,
     sys::{
         advanced::{native, ReceiveAllocators},
         bindings::*,
     },
-    LineStrideOrSize, PixelFormat, Receiver, Result,
+    LineStrideOrSize, PixelFormat, Receiver, Rejected, Result,
 };
 
 const MAX_ALLOCATION: usize = 256 * 1024 * 1024;

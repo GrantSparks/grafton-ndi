@@ -82,30 +82,38 @@ fn advanced_native_constructors_controls_and_queue() {
         AdvertiserOptions, ListenerOptions, RecvAdvertiser, RecvListener, SendAdvertiser,
         SendListener,
     };
-    let _send_advertiser = SendAdvertiser::new_with_config(
+    // The Discovery Server objects need NDI 6.4.0. An Advanced runtime older
+    // than that refuses to create them, with or without a configuration.
+    fn created<T>(ndi: &NDI, feature: RuntimeFeature, object: grafton_ndi::Result<T>) -> Option<T> {
+        match (ndi.require_feature(feature), object) {
+            (Ok(()), object) => Some(object.unwrap()),
+            (Err(_), Err(Error::UnsupportedCapability { .. })) => None,
+            (Err(gate), Err(other)) => panic!("{gate}, but creation failed with: {other}"),
+            (Err(gate), Ok(_)) => panic!("{gate}, but the object was created"),
+        }
+    }
+    let advertisers = AdvertiserOptions::default().servers("127.0.0.1");
+    let listeners = ListenerOptions::default().server("127.0.0.1").unwrap();
+    let _send_advertiser = created(
         &ndi,
-        &AdvertiserOptions::default().servers("127.0.0.1"),
-        &config,
-    )
-    .unwrap();
-    let _recv_advertiser = RecvAdvertiser::new_with_config(
+        RuntimeFeature::SenderAdvertising,
+        SendAdvertiser::new_with_config(&ndi, &advertisers, &config),
+    );
+    let _recv_advertiser = created(
         &ndi,
-        &AdvertiserOptions::default().servers("127.0.0.1"),
-        &config,
-    )
-    .unwrap();
-    let _send_listener = SendListener::new_with_config(
+        RuntimeFeature::ReceiverAdvertising,
+        RecvAdvertiser::new_with_config(&ndi, &advertisers, &config),
+    );
+    let _send_listener = created(
         &ndi,
-        &ListenerOptions::default().server("127.0.0.1").unwrap(),
-        &config,
-    )
-    .unwrap();
-    let _recv_listener = RecvListener::new_with_config(
+        RuntimeFeature::SenderDiscovery,
+        SendListener::new_with_config(&ndi, &listeners, &config),
+    );
+    let _recv_listener = created(
         &ndi,
-        &ListenerOptions::default().server("127.0.0.1").unwrap(),
-        &config,
-    )
-    .unwrap();
+        RuntimeFeature::ReceiverDiscovery,
+        RecvListener::new_with_config(&ndi, &listeners, &config),
+    );
     let av = AvSync::new(receiver).unwrap();
     drop(av.into_receiver());
     let mut genlock = Genlock::new(&ndi, None, Some(&config)).unwrap();

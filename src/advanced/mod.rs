@@ -35,7 +35,7 @@
 //! # Ownership
 //!
 //! An operation that takes ownership of a receiver, a sender or a frame hands
-//! it back inside [`Rejected`] when it fails.
+//! it back inside [`Rejected`](crate::Rejected) when it fails.
 
 #![warn(missing_docs)]
 // An operation that fails hands its input back inside the error, so these
@@ -66,7 +66,6 @@ mod kvm;
 mod packets;
 mod queued;
 mod receive;
-mod rejected;
 mod routing;
 mod send;
 mod sync;
@@ -80,7 +79,6 @@ pub use kvm::*;
 pub use packets::*;
 pub use queued::*;
 pub use receive::*;
-pub use rejected::Rejected;
 pub use send::*;
 pub use sync::*;
 

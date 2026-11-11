@@ -4,12 +4,15 @@
 //! and control. This example registers a sender of its own with the server,
 //! then prints the senders and receivers the server reports as they change.
 //!
-//! It needs a reachable Discovery Server (the SDK ships one as
-//! `ndi-discovery-server`) and an NDI 6.4.0 or later runtime.
+//! It needs a Discovery Server (the SDK ships one as `ndi-discovery-server`)
+//! and an NDI 6.4.0 or later runtime. The server does not have to be running
+//! yet: advertisers and listeners connect in the background, a few seconds
+//! after it appears.
 //!
 //! Run with: `cargo run --example discovery_server -- 127.0.0.1:5959`
 //!
-//! Without an argument the Discovery Server from the NDI configuration is used.
+//! Without an argument the Discovery Server from the NDI configuration is
+//! used, and the example fails if that names none.
 
 use grafton_ndi::{
     discovery::{
@@ -58,11 +61,27 @@ fn main() -> Result<(), Error> {
             .unwrap_or_else(|| "the configured Discovery Server".into())
     );
 
+    // Creating the listeners did not wait for the server. They connect in the
+    // background, and their snapshots are empty until they do.
+    let mut connected = false;
+    println!("Waiting for the Discovery Server...");
+
     let deadline = Instant::now() + WATCH;
     while Instant::now() < deadline {
         // Print the registry whenever either side of it changes.
         let senders_changed = senders.wait_for_changes(Duration::from_secs(1))?;
         let receivers_changed = receivers.wait_for_changes(Duration::ZERO)?;
+        if senders.is_connected() != connected {
+            connected = !connected;
+            println!(
+                "{}",
+                if connected {
+                    "Connected."
+                } else {
+                    "Connection lost."
+                }
+            );
+        }
         if !senders_changed && !receivers_changed {
             continue;
         }
@@ -86,6 +105,7 @@ fn main() -> Result<(), Error> {
         }
     }
 
-    advertiser.unregister(registration);
+    // Only the advertiser that issued a registration can end it.
+    advertiser.unregister(registration)?;
     Ok(())
 }

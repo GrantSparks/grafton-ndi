@@ -6,7 +6,7 @@ use super::{
     invalid,
     packets::{frame_metadata, EnvelopeHeader, ENVELOPE_HEADER_BYTES},
     AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedVideoFrame, EnvelopeCodec,
-    QualityPlan, Rejected, StreamTier, VideoPacketFormat, MAX_PACKET_BYTES,
+    QualityPlan, StreamTier, VideoPacketFormat, MAX_PACKET_BYTES,
 };
 use crate::{
     sys::{
@@ -14,7 +14,7 @@ use crate::{
         advanced::{native, FrameScatter, ScatterSend},
         bindings::*,
     },
-    Result, Sender, SenderOptions, Tally, NDI,
+    Rejected, Result, Sender, SenderOptions, Tally, NDI,
 };
 
 /// Maximum number of blocks in one scatter frame.

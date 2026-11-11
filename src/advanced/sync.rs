@@ -2,7 +2,7 @@
 
 use std::{cell::Cell, marker::PhantomData, ptr};
 
-use super::{invalid, AdvancedConfig, Rejected};
+use super::{invalid, AdvancedConfig};
 use crate::{
     finder::RawSource,
     frames::{validate_audio_layout_allow_empty, validate_frame_metadata},
@@ -12,8 +12,8 @@ use crate::{
         },
         bindings::*,
     },
-    AudioFrame, Capture, ConnectionStats, Error, Receiver, Result, ScanType, Source, Tally,
-    VideoFrame, VideoKind, NDI,
+    AudioFrame, Capture, ConnectionStats, Error, Receiver, Rejected, Result, ScanType, Source,
+    Tally, VideoFrame, VideoKind, NDI,
 };
 
 /// What audio an [`AvSync::synchronize`] call asks for.

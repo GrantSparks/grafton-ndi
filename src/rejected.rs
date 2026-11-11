@@ -4,25 +4,36 @@ use crate::Error;
 
 /// A failed operation that hands back the value it would have consumed.
 ///
-/// Operations in this module that take ownership of a receiver, a sender or a
-/// frame return this on failure, so the caller keeps the object and can use
-/// it, retry, or drop it deliberately.
+/// Operations that take ownership of a value the caller cannot recreate — a
+/// receiver, a sender, a frame, a registration — return this on failure, so
+/// the caller keeps the value and can use it, retry, or drop it deliberately.
 ///
 /// `Rejected<T>` converts into [`Error`] (dropping the value), so `?` works in
 /// a function that returns [`crate::Result`].
 ///
 /// # Examples
 ///
-/// ```
-/// use grafton_ndi::advanced::{CompressedVideoFrame, VideoCodec, VideoPacketFormat};
+/// ```no_run
+/// use grafton_ndi::{
+///     discovery::{AdvertiserOptions, SendAdvertisement, SendAdvertiser},
+///     Sender, SenderOptions, NDI,
+/// };
 ///
-/// let format = VideoPacketFormat::new(VideoCodec::H264, 1920, 1080)?;
-/// // Not an H.264 packet envelope: the bytes come back with the reason.
-/// let rejected = CompressedVideoFrame::new(format, vec![0; 16]).unwrap_err();
-/// println!("not sendable: {rejected}");
-/// let bytes: Vec<u8> = rejected.into_inner();
-/// assert_eq!(bytes.len(), 16);
-/// # Ok::<(), grafton_ndi::Error>(())
+/// # fn main() -> Result<(), grafton_ndi::Error> {
+/// let ndi = NDI::new()?;
+/// let server = AdvertiserOptions::default().servers("127.0.0.1");
+/// let mut studio = SendAdvertiser::new(&ndi, &server)?;
+/// let mut backup = SendAdvertiser::new(&ndi, &server)?;
+/// let sender = Sender::new(&ndi, &SenderOptions::builder("Camera 1").build())?;
+/// let registration = studio.register(&sender, SendAdvertisement::default())?;
+///
+/// // Only the advertiser that issued a registration can remove it. Another
+/// // one hands it back with the reason instead of consuming it.
+/// let rejected = backup.unregister(registration).unwrap_err();
+/// println!("still registered: {rejected}");
+/// studio.unregister(rejected.into_inner())?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct Rejected<T> {
     error: Error,
@@ -55,6 +66,7 @@ impl<T> Rejected<T> {
     }
 
     /// Replace the returned value, keeping the reason.
+    #[cfg(feature = "advanced")]
     pub(crate) fn map<U>(self, value: impl FnOnce(T) -> U) -> Rejected<U> {
         Rejected {
             error: self.error,

@@ -12,7 +12,7 @@ use fixture::FakeRuntime;
 use grafton_ndi::{
     capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, SdkEdition},
     discovery::{
-        AdvertisedId, AdvertiserOptions, ListenerOptions, ReceiverCommand, ReceiverStream,
+        AdvertiserOptions, ListenerOptions, ReceiverCommand, ReceiverId, ReceiverStream,
         RecvAdvertisement, RecvAdvertiser, RecvListener, SendAdvertisement, SendAdvertiser,
         SendListener, Wait,
     },
@@ -30,6 +30,10 @@ const DISCOVERY_SERVER: [(RuntimeFeature, &str); 4] = [
     (RuntimeFeature::SenderDiscovery, "sender discovery"),
     (RuntimeFeature::ReceiverDiscovery, "receiver discovery"),
 ];
+
+/// The Discovery Server every object here names. The SDK creates advertisers
+/// and listeners only for an address, and does not need to reach it.
+const SERVER: &str = "192.0.2.1";
 
 // What the fake runtime's fixed membership advertises; see `fake_runtime.rs`.
 const SENDER_ID: &[u8] = b"sender-\xff\xfe";
@@ -70,9 +74,12 @@ const VARIANTS: &[Variant] = &[
         exports_functions: true,
         scenarios: &[
             "fixed_runtime_is_accepted",
+            "creation_needs_an_address",
+            "advertisement_options_reach_the_sdk",
             "malformed_text_is_decoded_lossily",
             "identifiers_round_trip_exactly",
             "event_batches",
+            "large_event_batches",
             "owners_move_between_threads",
             "routing",
         ],
@@ -127,21 +134,33 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// The error of each Discovery Server constructor, in `DISCOVERY_SERVER` order.
-fn constructor_errors(ndi: &NDI) -> [Option<Error>; 4] {
-    let advertiser = AdvertiserOptions::default();
-    let listener = ListenerOptions::default();
+fn constructor_errors(
+    ndi: &NDI,
+    advertiser: &AdvertiserOptions,
+    listener: &ListenerOptions,
+) -> [Option<Error>; 4] {
     [
-        SendAdvertiser::new(ndi, &advertiser).err(),
-        RecvAdvertiser::new(ndi, &advertiser).err(),
-        SendListener::new(ndi, &listener).err(),
-        RecvListener::new(ndi, &listener).err(),
+        SendAdvertiser::new(ndi, advertiser).err(),
+        RecvAdvertiser::new(ndi, advertiser).err(),
+        SendListener::new(ndi, listener).err(),
+        RecvListener::new(ndi, listener).err(),
     ]
+}
+
+/// The options of an advertiser and a listener for [`SERVER`].
+fn server() -> (AdvertiserOptions, ListenerOptions) {
+    (
+        AdvertiserOptions::default().servers(SERVER),
+        ListenerOptions::default().server(SERVER).unwrap(),
+    )
 }
 
 /// Every Discovery Server capability is unavailable for `reason`, and every
 /// constructor says so, under the capability's name, without calling the SDK.
 fn assert_refused(ndi: &NDI, reason: CapabilityUnavailable, explanation: &str) {
-    for ((feature, name), error) in DISCOVERY_SERVER.into_iter().zip(constructor_errors(ndi)) {
+    let (advertisers, listeners) = server();
+    let errors = constructor_errors(ndi, &advertisers, &listeners);
+    for ((feature, name), error) in DISCOVERY_SERVER.into_iter().zip(errors) {
         assert_eq!(
             ndi.capabilities().status(feature),
             CapabilityStatus::Unavailable(reason),
@@ -167,8 +186,7 @@ fn child(scenario: &str) {
             .edition(SdkEdition::Standard),
     )
     .unwrap();
-    let advertisers = AdvertiserOptions::default();
-    let listeners = ListenerOptions::default();
+    let (advertisers, listeners) = server();
     match scenario {
         "older_runtime_is_refused" => {
             assert_refused(
@@ -198,7 +216,7 @@ fn child(scenario: &str) {
             ];
             for (((feature, name), error), symbol) in DISCOVERY_SERVER
                 .into_iter()
-                .zip(constructor_errors(&ndi))
+                .zip(constructor_errors(&ndi, &advertisers, &listeners))
                 .zip(first_missing)
             {
                 assert_eq!(
@@ -252,6 +270,101 @@ fn child(scenario: &str) {
                 assert_eq!(events.matches(&format!("{object}-create\n")).count(), 1);
                 assert_eq!(events.matches(&format!("{object}-destroy\n")).count(), 1);
             }
+        }
+        "creation_needs_an_address" => {
+            // With no server named and none configured the SDK creates
+            // nothing, and the error says that rather than blaming the network.
+            let errors = constructor_errors(
+                &ndi,
+                &AdvertiserOptions::default(),
+                &ListenerOptions::default(),
+            );
+            for ((_, name), error) in DISCOVERY_SERVER.into_iter().zip(errors) {
+                let Some(Error::InitializationFailed(reason)) = error else {
+                    panic!("{name}: expected a creation failure, got {error:?}");
+                };
+                assert!(
+                    reason.contains("no Discovery Server was named"),
+                    "{name}: {reason}"
+                );
+                assert!(!reason.contains("reachable"), "{name}: {reason}");
+            }
+            assert!(!log().contains("-create\n"), "{}", log());
+        }
+        "advertisement_options_reach_the_sdk" => {
+            let receiver = |name: &str| {
+                let options = ReceiverOptions::builder(Source::default()).name(name);
+                Receiver::new(&ndi, &options.build()).unwrap()
+            };
+            let (controlled, monitored) = (receiver("controlled"), receiver("monitored"));
+            let mut advertiser = RecvAdvertiser::new(&ndi, &advertisers).unwrap();
+            let in_group = advertiser
+                .register(
+                    &controlled,
+                    RecvAdvertisement::default()
+                        .allow_controlling(true)
+                        .input_group("Program feed"),
+                )
+                .unwrap();
+            advertiser
+                .register(
+                    &monitored,
+                    RecvAdvertisement::default().allow_monitoring(true),
+                )
+                .unwrap();
+            let events = log();
+            // Each flag arrives as the one it was set as, for the receiver it
+            // was set for.
+            let registered: Vec<_> = events
+                .lines()
+                .filter(|event| event.starts_with("recv-advertiser-add "))
+                .collect();
+            assert_eq!(
+                registered,
+                [
+                    "recv-advertiser-add controlling=true monitoring=false",
+                    "recv-advertiser-add controlling=false monitoring=true",
+                ]
+            );
+            // The group name outlives the call that registered it: this
+            // runtime reads it only when the registration ends.
+            assert!(advertiser.unregister(in_group).unwrap());
+            drop(advertiser);
+            let events = log();
+            assert!(
+                events.contains(&format!(
+                    "recv-advertiser-remove group={}\n",
+                    hex(b"Program feed")
+                )),
+                "{events}"
+            );
+            assert!(events.contains("recv-advertiser-remove group=null\n"));
+
+            let sender = |name: &str| Sender::new(&ndi, &SenderOptions::builder(name).build());
+            let (plain, monitored) = (sender("plain").unwrap(), sender("monitored").unwrap());
+            let mut advertiser = SendAdvertiser::new(&ndi, &advertisers).unwrap();
+            advertiser
+                .register(&plain, SendAdvertisement::default())
+                .unwrap();
+            advertiser
+                .register(
+                    &monitored,
+                    SendAdvertisement::default().allow_monitoring(true),
+                )
+                .unwrap();
+            let events = log();
+            assert_eq!(
+                events
+                    .matches("send-advertiser-add monitoring=false\n")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .matches("send-advertiser-add monitoring=true\n")
+                    .count(),
+                1
+            );
         }
         "malformed_text_is_decoded_lossily" => {
             let mut listener = SendListener::new(&ndi, &listeners).unwrap();
@@ -325,8 +438,8 @@ fn child(scenario: &str) {
             // The decoded text is for display: it names no advertised peer.
             // Neither does a receiver that is absent, and one that does not
             // accept the command is refused. None of these reaches the SDK.
-            let displayed = AdvertisedId::new(controllable.to_string()).unwrap();
-            let absent = AdvertisedId::new("absent").unwrap();
+            let displayed = ReceiverId::new(controllable.to_string()).unwrap();
+            let absent = ReceiverId::new("absent").unwrap();
             let fixed = snapshot[1].id().unwrap();
             for id in [&displayed, &absent, fixed] {
                 assert!(matches!(
@@ -366,6 +479,28 @@ fn child(scenario: &str) {
             assert!(log().contains("recv-listener-events 4294967295\n"));
             assert_eq!(log().matches("recv-listener-free-events\n").count(), 1);
         }
+        "large_event_batches" => {
+            let mut listener = SendListener::new(&ndi, &listeners).unwrap();
+            let wait = Wait::For(Duration::from_millis(5));
+            // The number of events is not itself a limit: only the bytes they
+            // take to copy are.
+            std::env::set_var("GRAFTON_FAKE_EVENT_COUNT", "70000");
+            let events = listener.capture_events(wait).unwrap();
+            assert_eq!(events.len(), 70_000);
+            assert_eq!(events[69_998].name(), Some("tally"));
+            assert!(events[69_999].name().is_none());
+
+            // A batch whose descriptors alone exceed 16 MiB is refused for its
+            // size, and released: the listener keeps working afterwards.
+            std::env::set_var("GRAFTON_FAKE_EVENT_COUNT", "700000");
+            let Err(Error::InvalidFrame(reason)) = listener.capture_events(wait) else {
+                panic!("a batch larger than the copy limit must be refused");
+            };
+            assert!(reason.contains("16 MiB"), "{reason}");
+            assert_eq!(log().matches("send-listener-free-events\n").count(), 2);
+            std::env::remove_var("GRAFTON_FAKE_EVENT_COUNT");
+            assert_eq!(listener.capture_events(wait).unwrap().len(), 2);
+        }
         "owners_move_between_threads" => {
             let sender = Sender::new(&ndi, &SenderOptions::builder("moved").build()).unwrap();
             let receiver =
@@ -386,8 +521,8 @@ fn child(scenario: &str) {
             std::thread::spawn(move || {
                 router.clear().unwrap();
                 assert_eq!(router.source().unwrap().name, "moved router");
-                assert!(send_advertiser.unregister(sent));
-                assert!(recv_advertiser.unregister(received));
+                assert!(send_advertiser.unregister(sent).unwrap());
+                assert!(recv_advertiser.unregister(received).unwrap());
                 assert_eq!(send_listener.snapshot().unwrap().len(), 2);
                 assert_eq!(recv_listener.snapshot().unwrap().len(), 2);
             })

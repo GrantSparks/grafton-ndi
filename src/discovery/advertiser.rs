@@ -1,11 +1,11 @@
 //! Registration of senders and receivers with a Discovery Server.
 
-use super::Handle;
+use super::{not_created, Handle};
 use crate::{
     receiver::{ReceiverCore, ReceiverMode},
     sender::SenderResource,
     sys::{self, bindings::*},
-    Error, Receiver, Result, Sender, NDI,
+    Error, Receiver, Rejected, Result, Sender, NDI,
 };
 use std::{
     collections::BTreeMap,
@@ -19,8 +19,8 @@ use std::{
 
 /// The Discovery Server an advertiser registers with.
 ///
-/// Without explicit servers the SDK uses the Discovery Server from its own
-/// configuration.
+/// Without explicit servers the SDK uses the Discovery Server from the NDI
+/// configuration. If that names none either, the advertiser cannot be created.
 #[derive(Debug, Clone, Default)]
 pub struct AdvertiserOptions {
     servers: Option<String>,
@@ -215,9 +215,7 @@ impl<A: AdvertiserApi> Advertiser<A> {
         let settings = A::settings(url.as_ref().map_or(ptr::null(), |v| v.as_ptr()));
         let instance = create(api, &settings)?;
         if instance.is_null() {
-            return Err(Error::InitializationFailed(
-                "the SDK created no advertiser; it needs a reachable Discovery Server".into(),
-            ));
+            return Err(not_created("advertiser", options.servers.as_deref()));
         }
         Ok(Self {
             instance,
@@ -236,15 +234,25 @@ impl<A: AdvertiserApi> Advertiser<A> {
         id
     }
 
-    /// End the registration `id`. Returns whether this advertiser held it and
-    /// the SDK confirmed its removal.
-    fn release(&mut self, id: u64) -> bool {
+    /// End the registration `id`, which the token `registration` names.
+    /// Returns whether the SDK confirmed the removal.
+    ///
+    /// # Errors
+    ///
+    /// Hands `registration` back, changing nothing, when another advertiser
+    /// issued it: the token is the only way to end that registration.
+    fn release<R>(&mut self, id: u64, registration: R) -> std::result::Result<bool, Rejected<R>> {
         let Some(member) = self.members.remove(&id) else {
-            return false;
+            return Err(Rejected::new(
+                Error::InvalidConfiguration(
+                    "the registration was issued by another advertiser".into(),
+                ),
+                registration,
+            ));
         };
         // SAFETY: the advertiser is live for this borrow. `member` is released
         // only after the SDK has forgotten it.
-        unsafe { self.api.remove(self.instance, &member) }
+        Ok(unsafe { self.api.remove(self.instance, &member) })
     }
 }
 
@@ -303,6 +311,17 @@ configurable!(
 /// registration here makes a sender visible to [`SendListener`]s, not to
 /// finders or receivers.
 ///
+/// # Connection
+///
+/// An advertiser connects in the background and keeps trying for as long as
+/// it lives. It is created, and accepts registrations, whether or not its
+/// server can be reached, and delivers them once the server answers, which
+/// can take several seconds after the server appears. It has no way to report
+/// whether it is connected. To find out, use a [`SendListener`] on the same
+/// server: [`is_connected`](super::SendListener::is_connected) reports the
+/// connection, and a [snapshot](super::SendListener::snapshot) shows whether
+/// the registration arrived.
+///
 /// # Ownership
 ///
 /// The advertiser owns its registrations. Registering a sender keeps the native
@@ -323,6 +342,17 @@ pub struct SendAdvertiser {
 /// Advertises receivers to a Discovery Server so they can be monitored and,
 /// when permitted, told which source to connect to.
 ///
+/// # Connection
+///
+/// An advertiser connects in the background and keeps trying for as long as
+/// it lives. It is created, and accepts registrations, whether or not its
+/// server can be reached, and delivers them once the server answers, which
+/// can take several seconds after the server appears. It has no way to report
+/// whether it is connected. To find out, use a [`RecvListener`] on the same
+/// server: [`is_connected`](super::RecvListener::is_connected) reports the
+/// connection, and a [snapshot](super::RecvListener::snapshot) shows whether
+/// the registration arrived.
+///
 /// # Ownership
 ///
 /// The advertiser owns its registrations. Registering a receiver keeps the
@@ -335,6 +365,8 @@ pub struct SendAdvertiser {
 ///
 /// An advertiser is [`Send`] but not [`Sync`]: it may be moved to another
 /// thread, and is used by one thread at a time.
+///
+/// [`RecvListener`]: super::RecvListener
 pub struct RecvAdvertiser {
     inner: Advertiser<sys::ReceiverAdvertising>,
 }
@@ -347,16 +379,18 @@ const _: () = {
 
 /// Names one sender registration for [`SendAdvertiser::unregister`].
 ///
-/// The registration belongs to the advertiser that issued it. Dropping this
-/// value changes nothing: the sender stays advertised, and alive, until the
-/// registration is removed or the advertiser is dropped.
+/// The registration belongs to the advertiser that issued it, and only that
+/// advertiser can end it. Dropping this value changes nothing: the sender
+/// stays advertised, and alive, until the registration is removed or the
+/// advertiser is dropped.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct SendRegistration(u64);
 /// Names one receiver registration for [`RecvAdvertiser::unregister`].
 ///
-/// The registration belongs to the advertiser that issued it. Dropping this
-/// value changes nothing: the receiver stays advertised, and alive, until the
-/// registration is removed or the advertiser is dropped.
+/// The registration belongs to the advertiser that issued it, and only that
+/// advertiser can end it. Dropping this value changes nothing: the receiver
+/// stays advertised, and alive, until the registration is removed or the
+/// advertiser is dropped.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct RecvRegistration(u64);
 
@@ -376,15 +410,20 @@ impl fmt::Debug for RecvAdvertiser {
 }
 
 impl SendAdvertiser {
-    /// Connect to the Discovery Server without registering any sender.
+    /// Create an advertiser for the Discovery Server `options` name, without
+    /// registering any sender.
+    ///
+    /// Success does not mean the server was reached; see
+    /// [Connection](Self#connection).
     ///
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime
     /// cannot provide [sender advertising], which needs NDI 6.4.0 or later;
     /// [`Error::InvalidCString`] when the server list contains a NUL byte; and
-    /// [`Error::InitializationFailed`] when the SDK creates no advertiser, as
-    /// it does when no Discovery Server is configured or reachable.
+    /// [`Error::InitializationFailed`] when the SDK creates no advertiser. It
+    /// creates none for an address it cannot parse, and none when `options`
+    /// name no server and the NDI configuration supplies none.
     ///
     /// [sender advertising]: crate::capabilities::RuntimeFeature::SenderAdvertising
     pub fn new(ndi: &NDI, options: &AdvertiserOptions) -> Result<Self> {
@@ -436,22 +475,36 @@ impl SendAdvertiser {
     }
     /// Stop advertising a sender and release this advertiser's hold on it.
     ///
-    /// Returns whether the SDK confirmed the removal. A registration issued by
-    /// another advertiser is left untouched and reports `false`.
-    pub fn unregister(&mut self, registration: SendRegistration) -> bool {
-        self.inner.release(registration.0)
+    /// Returns whether the SDK confirmed the removal. Either way the
+    /// registration has ended and no longer keeps the sender alive.
+    ///
+    /// # Errors
+    ///
+    /// Only the advertiser that issued a registration can end it. Another one
+    /// changes nothing and hands the registration back inside [`Rejected`], so
+    /// that it can still be given to the advertiser it belongs to.
+    pub fn unregister(
+        &mut self,
+        registration: SendRegistration,
+    ) -> std::result::Result<bool, Rejected<SendRegistration>> {
+        self.inner.release(registration.0, registration)
     }
 }
 impl RecvAdvertiser {
-    /// Connect to the Discovery Server without registering any receiver.
+    /// Create an advertiser for the Discovery Server `options` name, without
+    /// registering any receiver.
+    ///
+    /// Success does not mean the server was reached; see
+    /// [Connection](Self#connection).
     ///
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime
     /// cannot provide [receiver advertising], which needs NDI 6.4.0 or later;
     /// [`Error::InvalidCString`] when the server list contains a NUL byte; and
-    /// [`Error::InitializationFailed`] when the SDK creates no advertiser, as
-    /// it does when no Discovery Server is configured or reachable.
+    /// [`Error::InitializationFailed`] when the SDK creates no advertiser. It
+    /// creates none for an address it cannot parse, and none when `options`
+    /// name no server and the NDI configuration supplies none.
     ///
     /// [receiver advertising]: crate::capabilities::RuntimeFeature::ReceiverAdvertising
     pub fn new(ndi: &NDI, options: &AdvertiserOptions) -> Result<Self> {
@@ -515,9 +568,18 @@ impl RecvAdvertiser {
     }
     /// Stop advertising a receiver and release this advertiser's hold on it.
     ///
-    /// Returns whether the SDK confirmed the removal. A registration issued by
-    /// another advertiser is left untouched and reports `false`.
-    pub fn unregister(&mut self, registration: RecvRegistration) -> bool {
-        self.inner.release(registration.0)
+    /// Returns whether the SDK confirmed the removal. Either way the
+    /// registration has ended and no longer keeps the receiver alive.
+    ///
+    /// # Errors
+    ///
+    /// Only the advertiser that issued a registration can end it. Another one
+    /// changes nothing and hands the registration back inside [`Rejected`], so
+    /// that it can still be given to the advertiser it belongs to.
+    pub fn unregister(
+        &mut self,
+        registration: RecvRegistration,
+    ) -> std::result::Result<bool, Rejected<RecvRegistration>> {
+        self.inner.release(registration.0, registration)
     }
 }

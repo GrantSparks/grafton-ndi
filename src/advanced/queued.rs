@@ -13,14 +13,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{AdvancedConfig, CompressedVideoFrame, Rejected};
+use super::{AdvancedConfig, CompressedVideoFrame};
 use crate::{
     sys::{
         self,
         advanced::{native, SendCompletion},
         bindings::*,
     },
-    Error, Result, Sender, SenderOptions, VideoFrame, NDI,
+    Error, Rejected, Result, Sender, SenderOptions, VideoFrame, NDI,
 };
 
 /// Limits on what a [`QueuedSender`] holds at once.

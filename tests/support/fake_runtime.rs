@@ -10,14 +10,20 @@
 //! * `fake_objects` — senders, receivers, routers and advertisers are real
 //!   allocations whose lifecycle is written to the file named by
 //!   `GRAFTON_FAKE_NDI_LOG`, and the optional sender-metadata, routing and
-//!   advertiser functions are exported;
+//!   advertiser functions are exported. Registrations log the flags they were
+//!   given, and a receiver's input-group name is read only when its
+//!   registration ends;
 //! * `fake_discovery` — export the sender and receiver listener functions over
 //!   a fixed membership whose identifiers and text are partly not UTF-8, and
-//!   log every identifier passed back, byte for byte;
+//!   log every identifier passed back, byte for byte. An event batch holds
+//!   `GRAFTON_FAKE_EVENT_COUNT` events (two by default);
 //! * `fake_advanced` — also export the Advanced SDK entry points;
 //! * `fake_receiver_v4` — also export only `NDIlib_recv_create_v4`, as a newer
 //!   Standard runtime might;
 //! * `fake_omit_required` — omit one required function.
+//!
+//! Like the SDK, advertisers and listeners are created only for a Discovery
+//! Server address; this runtime has no configuration to supply one.
 //!
 //! `FAKE_NDI_VERSION` in the compiler's environment replaces the version text.
 
@@ -55,6 +61,28 @@ fn log(operation: &str) {
     {
         let _ = writeln!(file, "{operation}");
     }
+}
+
+/// A string argument as the bytes it holds, or `null`.
+#[cfg(any(fake_objects, fake_discovery))]
+unsafe fn bytes(text: *const c_char) -> String {
+    if text.is_null() {
+        return "null".into();
+    }
+    unsafe { CStr::from_ptr(text) }
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Whether creation settings name a Discovery Server, which the SDK needs
+/// before it creates an advertiser or a listener.
+#[cfg(any(fake_objects, fake_discovery))]
+macro_rules! names_a_server {
+    ($settings:expr) => {
+        !$settings.is_null() && !unsafe { (*$settings).p_url_address }.is_null()
+    };
 }
 
 /// Export functions under their SDK names, each checked against the vendored
@@ -199,6 +227,14 @@ mod objects {
         }
     }
 
+    /// A receiver advertiser. It keeps the input-group name of each
+    /// registration as the pointer it was given and reads it only when the
+    /// registration ends, as an implementation that does not copy the name
+    /// would: a name released early is then read after its release.
+    struct RecvAdvertiser {
+        groups: Vec<(NDIlib_recv_instance_t, *const c_char)>,
+    }
+
     /// A routing source and the descriptor handed out for it.
     struct Router {
         name: CString,
@@ -284,6 +320,9 @@ mod objects {
         }
 
         fn NDIlib_send_advertiser_create(p_create_settings: *const NDIlib_send_advertiser_create_t) -> NDIlib_send_advertiser_instance_t {
+            if !names_a_server!(p_create_settings) {
+                return std::ptr::null_mut();
+            }
             log("send-advertiser-create");
             handle()
         }
@@ -294,7 +333,7 @@ mod objects {
         }
 
         fn NDIlib_send_advertiser_add_sender(p_instance: NDIlib_send_advertiser_instance_t, p_sender: NDIlib_send_instance_t, allow_monitoring: bool) -> bool {
-            log(if allow_monitoring { "send-advertiser-add-monitoring" } else { "send-advertiser-add" });
+            log(&format!("send-advertiser-add monitoring={allow_monitoring}"));
             true
         }
 
@@ -304,22 +343,32 @@ mod objects {
         }
 
         fn NDIlib_recv_advertiser_create(p_create_settings: *const NDIlib_recv_advertiser_create_t) -> NDIlib_recv_advertiser_instance_t {
+            if !names_a_server!(p_create_settings) {
+                return std::ptr::null_mut();
+            }
             log("recv-advertiser-create");
-            handle()
+            Box::into_raw(Box::new(RecvAdvertiser { groups: Vec::new() })).cast()
         }
 
         fn NDIlib_recv_advertiser_destroy(p_instance: NDIlib_recv_advertiser_instance_t) {
             log("recv-advertiser-destroy");
-            unsafe { release(p_instance) };
+            drop(unsafe { Box::from_raw(p_instance.cast::<RecvAdvertiser>()) });
         }
 
         fn NDIlib_recv_advertiser_add_receiver(p_instance: NDIlib_recv_advertiser_instance_t, p_receiver: NDIlib_recv_instance_t, allow_controlling: bool, allow_monitoring: bool, p_input_group_name: *const c_char) -> bool {
-            log("recv-advertiser-add");
+            log(&format!("recv-advertiser-add controlling={allow_controlling} monitoring={allow_monitoring}"));
+            let advertiser = unsafe { &mut *p_instance.cast::<RecvAdvertiser>() };
+            advertiser.groups.push((p_receiver, p_input_group_name));
             true
         }
 
         fn NDIlib_recv_advertiser_del_receiver(p_instance: NDIlib_recv_advertiser_instance_t, p_receiver: NDIlib_recv_instance_t) -> bool {
-            log("recv-advertiser-remove");
+            let advertiser = unsafe { &mut *p_instance.cast::<RecvAdvertiser>() };
+            let Some(index) = advertiser.groups.iter().position(|(receiver, _)| *receiver == p_receiver) else {
+                return false;
+            };
+            let (_, group) = advertiser.groups.swap_remove(index);
+            log(&format!("recv-advertiser-remove group={}", unsafe { bytes(group) }));
             true
         }
 
@@ -377,34 +426,27 @@ mod discovery {
     const INPUT_ID: &CStr = c"input-\xfd";
     const EVENT_VALUE: &CStr = c"<tally on=\"\xff\"/>";
 
-    /// The number of events in every batch.
-    const EVENTS: usize = 2;
+    /// The events most recently handed out, which stay allocated until freed.
+    type Batch = Vec<NDIlib_listener_event>;
 
     struct SendListener {
         senders: [NDIlib_sender_t; 2],
         _groups: Box<[*const c_char; 3]>,
+        batch: Batch,
     }
 
     struct RecvListener {
         receivers: [NDIlib_receiver_t; 2],
         _streams: Box<[NDIlib_receiver_type_e; 3]>,
         _commands: Box<[NDIlib_receiver_command_e; 2]>,
+        batch: Batch,
     }
 
-    /// A string argument as the bytes it holds, or `null`.
-    unsafe fn bytes(text: *const c_char) -> String {
-        if text.is_null() {
-            return "null".into();
-        }
-        unsafe { CStr::from_ptr(text) }
-            .to_bytes()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
-    }
-
-    /// A batch of events from `uuid`, or none when the caller does not wait.
+    /// Fill `batch` with events and hand it out, or hand out nothing when the
+    /// caller does not wait. Events alternate between one from `uuid` and one
+    /// with no fields.
     unsafe fn events(
+        batch: &mut Batch,
         uuid: &'static CStr,
         p_num_events: *mut u32,
         timeout_in_ms: u32,
@@ -412,34 +454,43 @@ mod discovery {
         if timeout_in_ms == 0 {
             return ptr::null();
         }
-        let batch: Box<[NDIlib_listener_event; EVENTS]> = Box::new([
-            NDIlib_listener_event {
-                p_uuid: uuid.as_ptr(),
-                p_name: c"tally".as_ptr(),
-                p_value: EVENT_VALUE.as_ptr(),
-            },
-            NDIlib_listener_event {
-                p_uuid: ptr::null(),
-                p_name: ptr::null(),
-                p_value: ptr::null(),
-            },
-        ]);
-        unsafe { *p_num_events = EVENTS as u32 };
-        Box::into_raw(batch).cast()
+        let count = std::env::var("GRAFTON_FAKE_EVENT_COUNT").map_or(2, |count| {
+            count
+                .parse::<u32>()
+                .expect("GRAFTON_FAKE_EVENT_COUNT is a count")
+        });
+        *batch = (0..count)
+            .map(|index| {
+                if index % 2 == 0 {
+                    NDIlib_listener_event {
+                        p_uuid: uuid.as_ptr(),
+                        p_name: c"tally".as_ptr(),
+                        p_value: EVENT_VALUE.as_ptr(),
+                    }
+                } else {
+                    NDIlib_listener_event {
+                        p_uuid: ptr::null(),
+                        p_name: ptr::null(),
+                        p_value: ptr::null(),
+                    }
+                }
+            })
+            .collect();
+        unsafe { *p_num_events = count };
+        batch.as_ptr()
     }
 
-    unsafe fn free_events(p_events: *const NDIlib_listener_event) {
-        drop(unsafe {
-            Box::from_raw(
-                p_events
-                    .cast_mut()
-                    .cast::<[NDIlib_listener_event; EVENTS]>(),
-            )
-        });
+    /// Release the batch `p_events` was handed out from.
+    unsafe fn free_events(batch: &mut Batch, p_events: *const NDIlib_listener_event) {
+        assert_eq!(batch.as_ptr(), p_events, "freed a batch not handed out");
+        *batch = Batch::new();
     }
 
     export! {
         fn NDIlib_send_listener_create(p_create_settings: *const NDIlib_send_listener_create_t) -> NDIlib_send_listener_instance_t {
+            if !names_a_server!(p_create_settings) {
+                return ptr::null_mut();
+            }
             log("send-listener-create");
             let mut groups = Box::new([c"public".as_ptr(), SENDER_GROUP.as_ptr(), ptr::null()]);
             let senders = [
@@ -464,7 +515,7 @@ mod discovery {
                     events_subscribed: true,
                 },
             ];
-            Box::into_raw(Box::new(SendListener { senders, _groups: groups })).cast()
+            Box::into_raw(Box::new(SendListener { senders, _groups: groups, batch: Batch::new() })).cast()
         }
 
         fn NDIlib_send_listener_destroy(p_instance: NDIlib_send_listener_instance_t) {
@@ -500,15 +551,20 @@ mod discovery {
 
         fn NDIlib_send_listener_get_events(p_instance: NDIlib_send_listener_instance_t, p_num_events: *mut u32, timeout_in_ms: u32) -> *const NDIlib_send_listener_event {
             log(&format!("send-listener-events {timeout_in_ms}"));
-            unsafe { events(SENDER_ID, p_num_events, timeout_in_ms) }
+            let listener = unsafe { &mut *p_instance.cast::<SendListener>() };
+            unsafe { events(&mut listener.batch, SENDER_ID, p_num_events, timeout_in_ms) }
         }
 
         fn NDIlib_send_listener_free_events(p_instance: NDIlib_send_listener_instance_t, p_events: *const NDIlib_send_listener_event) {
             log("send-listener-free-events");
-            unsafe { free_events(p_events) };
+            let listener = unsafe { &mut *p_instance.cast::<SendListener>() };
+            unsafe { free_events(&mut listener.batch, p_events) };
         }
 
         fn NDIlib_recv_listener_create(p_create_settings: *const NDIlib_recv_listener_create_t) -> NDIlib_recv_listener_instance_t {
+            if !names_a_server!(p_create_settings) {
+                return ptr::null_mut();
+            }
             log("recv-listener-create");
             let mut streams = Box::new([
                 NDIlib_receiver_type_e_NDIlib_receiver_type_video,
@@ -545,7 +601,7 @@ mod discovery {
                     events_subscribed: false,
                 },
             ];
-            Box::into_raw(Box::new(RecvListener { receivers, _streams: streams, _commands: commands })).cast()
+            Box::into_raw(Box::new(RecvListener { receivers, _streams: streams, _commands: commands, batch: Batch::new() })).cast()
         }
 
         fn NDIlib_recv_listener_destroy(p_instance: NDIlib_recv_listener_instance_t) {
@@ -581,12 +637,14 @@ mod discovery {
 
         fn NDIlib_recv_listener_get_events(p_instance: NDIlib_recv_listener_instance_t, p_num_events: *mut u32, timeout_in_ms: u32) -> *const NDIlib_recv_listener_event {
             log(&format!("recv-listener-events {timeout_in_ms}"));
-            unsafe { events(RECEIVER_ID, p_num_events, timeout_in_ms) }
+            let listener = unsafe { &mut *p_instance.cast::<RecvListener>() };
+            unsafe { events(&mut listener.batch, RECEIVER_ID, p_num_events, timeout_in_ms) }
         }
 
         fn NDIlib_recv_listener_free_events(p_instance: NDIlib_recv_listener_instance_t, p_events: *const NDIlib_recv_listener_event) {
             log("recv-listener-free-events");
-            unsafe { free_events(p_events) };
+            let listener = unsafe { &mut *p_instance.cast::<RecvListener>() };
+            unsafe { free_events(&mut listener.batch, p_events) };
         }
 
         fn NDIlib_recv_listener_send_connect(p_instance: NDIlib_recv_listener_instance_t, p_receiver_uuid: *const c_char, p_source_name: *const c_char) -> bool {

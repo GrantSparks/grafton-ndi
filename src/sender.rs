@@ -82,7 +82,10 @@ impl Drop for SenderResource {
 /// An NDI source that sends video, audio and metadata.
 ///
 /// Create one with [`Sender::new`]. Dropping the sender completes any
-/// in-flight asynchronous video and removes the source from the network.
+/// in-flight asynchronous video and removes the source from the network,
+/// unless a [`SendAdvertiser`](crate::discovery::SendAdvertiser) registration
+/// still holds it: a registered sender stays on the network until that
+/// registration is removed or its advertiser is dropped.
 #[derive(Debug)]
 pub struct Sender {
     inner: Inner,
