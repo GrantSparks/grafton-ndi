@@ -2,6 +2,12 @@ name: Publish
 
 # A `v<version>` tag on a commit of main publishes that version to crates.io.
 # docs.rs builds the API documentation from the published crate.
+#
+# Nothing in this file decides who may publish. A tag runs the workflow of the
+# commit it points at, so whoever can push a tag can also change every check
+# below. The controls are repository settings, listed in order in ci/README.md:
+# the reviewers the `crates-io` environment requires, the crates.io trusted
+# publisher bound to that environment, and the rule on who may create `v*` tags.
 on:
   push:
     tags: ['v*']
@@ -54,18 +60,24 @@ jobs:
     needs: ci
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    outputs:
+      sha256: ${{ steps.package.outputs.sha256 }}
+      toolchain: ${{ steps.package.outputs.toolchain }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Package and build the packaged crate
+        id: package
         run: |
           cargo package --locked --package grafton-ndi
+          crate="target/package/grafton-ndi-${GITHUB_REF_NAME#v}.crate"
+          {
+            echo "sha256=$(sha256sum "$crate" | cut -d' ' -f1)"
+            echo "toolchain=$(rustc --version | cut -d' ' -f2)"
+          } >> "$GITHUB_OUTPUT"
           mkdir "$RUNNER_TEMP/release"
-          cp target/package/grafton-ndi-*.crate "$RUNNER_TEMP/release/"
-          cd "$RUNNER_TEMP/release"
-          sha256sum grafton-ndi-*.crate > SHA256SUMS
-          rustc --version | cut -d' ' -f2 > toolchain
-          cat SHA256SUMS toolchain
+          cp "$crate" "$RUNNER_TEMP/release/"
+      # For inspection only: the publish job does not read this artifact.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: crate
@@ -73,9 +85,13 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Holds the crates.io trusted-publishing identity, so it compiles nothing:
-  # it re-creates the package without building it, requires the bytes to equal
-  # the verified package, and uploads.
+  # Holds the crates.io trusted-publishing identity, so it runs nothing from the
+  # repository. Cargo is started outside the checkout, where it reads no Cargo
+  # configuration and no toolchain file from the repository, and with
+  # --no-verify, so no build script or crate code is compiled. From the job that
+  # built code it takes two values, each checked for its exact form before use:
+  # the SHA-256 of the verified package, which the package re-created here must
+  # have, and the toolchain version that produced it.
   publish:
     name: publish to crates.io
     needs: verify
@@ -85,24 +101,34 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    env:
+      VERIFIED_SHA256: ${{ needs.verify.outputs.sha256 }}
+      VERIFIED_TOOLCHAIN: ${{ needs.verify.outputs.toolchain }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        with:
-          name: crate
-          path: ${{ runner.temp }}/release
       - name: Re-create the verified package
+        working-directory: ${{ runner.temp }}
         run: |
-          toolchain=$(cat "$RUNNER_TEMP/release/toolchain")
-          [[ "$toolchain" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          rustup toolchain install "$toolchain" --profile minimal
-          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
-          RUSTUP_TOOLCHAIN="$toolchain" cargo package --locked --no-verify --package grafton-ndi
-          cd target/package
-          sha256sum --check "$RUNNER_TEMP/release/SHA256SUMS"
+          if ! [[ "$VERIFIED_SHA256" =~ ^[0-9a-f]{64}$ && "$VERIFIED_TOOLCHAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::the verify job did not report a SHA-256 and a toolchain version"
+            exit 1
+          fi
+          rustup toolchain install "$VERIFIED_TOOLCHAIN" --profile minimal
+          export RUSTUP_TOOLCHAIN="$VERIFIED_TOOLCHAIN" CARGO_TARGET_DIR="$RUNNER_TEMP/target"
+          {
+            echo "RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN"
+            echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+          } >> "$GITHUB_ENV"
+          cargo package --locked --no-verify --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --package grafton-ndi
+          actual=$(sha256sum "$CARGO_TARGET_DIR/package/grafton-ndi-${GITHUB_REF_NAME#v}.crate" | cut -d' ' -f1)
+          if [ "$actual" != "$VERIFIED_SHA256" ]; then
+            echo "::error::this package is $actual, the verified package is $VERIFIED_SHA256"
+            exit 1
+          fi
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth
       - name: Publish
+        working-directory: ${{ runner.temp }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish --locked --no-verify --package grafton-ndi
+        run: cargo publish --locked --no-verify --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --package grafton-ndi

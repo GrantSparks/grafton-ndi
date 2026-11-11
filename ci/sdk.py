@@ -11,8 +11,10 @@ ci/sdk-packages.json before anything opens it. The command prints the
 NDI_SDK_DIR and NDI_RUNTIME_DIR_V6 values to use, and appends them to
 --github-env when given.
 
-Messages never include a source location: the private store's repository,
-asset identifiers and URLs must not reach a public log.
+Nothing this script prints includes a value from the source map or a credential:
+the private store's repository, asset identifiers, URLs and local paths must not
+reach a public log. Local archives are copied before use, so the vendor tools it
+runs are never given such a path either.
 """
 from __future__ import annotations
 
@@ -31,6 +33,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import traceback
 from typing import NamedTuple
 import urllib.error
 import urllib.parse
@@ -63,7 +66,6 @@ class SdkError(Exception):
 class Download(NamedTuple):
     url: str
     headers: dict
-    secret_env: tuple
 
 
 def load_pins(path=PINS):
@@ -84,8 +86,8 @@ def artifact_id(pin):
     return f"ndi-{pin['version']}-{pin['edition']}-{pin['platform']}-{pin['sha256']}"
 
 
-def select_source(package, pin, environ):
-    """Resolve the package's entry in NDI_SDK_SOURCES_JSON to a local path or a download."""
+def source_map(environ):
+    """The `packages` object of the private source map in NDI_SDK_SOURCES_JSON."""
     raw = environ.get('NDI_SDK_SOURCES_JSON')
     if not raw:
         raise SdkError('NDI_SDK_SOURCES_JSON is not set; pass --archive to use a local archive')
@@ -95,14 +97,36 @@ def select_source(package, pin, environ):
         raise SdkError('NDI_SDK_SOURCES_JSON is not valid JSON') from None
     if not isinstance(data, dict) or data.get('schema') != 1 or not isinstance(data.get('packages'), dict):
         raise SdkError('NDI_SDK_SOURCES_JSON must be {"schema": 1, "packages": {...}}')
-    entries = [data['packages'][key] for key in (package, artifact_id(pin)) if key in data['packages']]
+    return data['packages']
+
+
+def secret_variables(environ):
+    """Names of the variables that carry acquisition secrets: ours and every one the source map names."""
+    names = {name for name in environ if name.startswith('NDI_SDK_')}
+    try:
+        entries = list(source_map(environ).values())
+    except SdkError:
+        return names
+    for entry in entries:
+        asset = entry.get('github_release_asset') if isinstance(entry, dict) else None
+        for name in (entry.get('url_env') if isinstance(entry, dict) else None,
+                     asset.get('token_env') if isinstance(asset, dict) else None):
+            if isinstance(name, str):
+                names.add(name)
+    return names
+
+
+def select_source(package, pin, environ):
+    """Resolve the package's entry in the source map to a local path or a download."""
+    packages = source_map(environ)
+    entries = [packages[key] for key in (package, artifact_id(pin)) if key in packages]
     if len(entries) != 1 or not isinstance(entries[0], dict) or len(entries[0]) != 1:
         raise SdkError(f'{package}: the source map must hold exactly one single-kind entry for this package')
     kind, value = next(iter(entries[0].items()))
     if kind == 'archive' and isinstance(value, str) and Path(value).is_absolute():
         return Path(value)
     if kind == 'url_env' and isinstance(value, str):
-        return https_download(environ.get(value, ''), {}, (value,))
+        return https_download(environ.get(value, ''), {})
     if kind == 'github_release_asset' and isinstance(value, dict):
         repo, asset = value.get('repo'), value.get('asset_id')
         token_env = value.get('token_env', DEFAULT_TOKEN_ENV)
@@ -111,18 +135,19 @@ def select_source(package, pin, environ):
             raise SdkError(f'{package}: malformed github_release_asset source')
         token = environ.get(token_env)
         if not token:
-            raise SdkError(f'{package}: the archive read token ({token_env}) is not set')
+            raise SdkError(f'{package}: the archive read token is not set '
+                           f'({DEFAULT_TOKEN_ENV}, or the variable the source map names)')
         # The token goes to api.github.com only; the redirect to the signed asset URL drops it.
         return https_download(f'https://api.github.com/repos/{repo}/releases/assets/{asset}', {
             'Authorization': 'Bearer ' + token, 'Accept': 'application/octet-stream',
-            'X-GitHub-Api-Version': '2026-03-10'}, (token_env,))
+            'X-GitHub-Api-Version': '2026-03-10'})
     raise SdkError(f'{package}: source entries are "archive", "url_env" or "github_release_asset"')
 
 
-def https_download(url, headers, secret_env):
+def https_download(url, headers):
     if not url.startswith('https://'):
         raise SdkError('the SDK source is not configured as an HTTPS URL')
-    return Download(url, headers, secret_env)
+    return Download(url, headers)
 
 
 class CredentialFreeRedirects(urllib.request.HTTPRedirectHandler):
@@ -162,6 +187,18 @@ def download(source, destination, *, opener=None, sleep=time.sleep):
         sleep(RETRY_DELAYS[attempt])
 
 
+def snapshot(source, destination):
+    """Copy a local archive into the staging directory.
+
+    Everything afterwards reads the copy: the bytes that are verified are the bytes
+    that are unpacked, and no later message or tool argument can name the source.
+    """
+    try:
+        shutil.copyfile(source, destination)
+    except OSError as error:
+        raise SdkError(f'the local archive could not be read ({error.strerror or type(error).__name__})') from None
+
+
 def verify(archive, pin):
     """Refuse an archive whose size or SHA-256 differs from the pin."""
     size = archive.stat().st_size
@@ -188,6 +225,26 @@ def checked_members(stream, root):
         elif not (member.isfile() or member.isdir()):
             raise SdkError('archive contains a device or other special member')
         yield member
+
+
+def reject_outside_links(root):
+    """Refuse an unpacked tree in which a symbolic link leads out of it.
+
+    A link passes `checked_members` while its target does not exist yet, and can
+    point somewhere else once a later member lands, so the finished tree is checked too.
+    """
+    root = root.resolve()
+    for directory, subdirectories, files in os.walk(root):  # links are listed, never followed
+        for name in subdirectories + files:
+            path = Path(directory, name)
+            if not path.is_symlink():
+                continue
+            try:
+                inside = path.resolve().is_relative_to(root)
+            except (OSError, RuntimeError):  # a loop
+                inside = False
+            if not inside:
+                raise SdkError('unpacked package contains a link that leads out of it')
 
 
 def extract_tar(fileobj, destination):
@@ -220,6 +277,18 @@ def extract_embedded(archive, destination):
             extract_tar(payload, destination)
 
 
+def run_tool(name, command, environ, timeout=None):
+    """Run a vendor tool. A failure reports the tool and its status, never its arguments."""
+    try:
+        subprocess.run(command, check=True, env=environ, timeout=timeout)
+    except subprocess.CalledProcessError as error:
+        raise SdkError(f'{name} failed with exit status {error.returncode}') from None
+    except subprocess.TimeoutExpired:
+        raise SdkError(f'{name} did not finish within {timeout} seconds') from None
+    except OSError as error:
+        raise SdkError(f'{name} could not be started ({error.strerror or type(error).__name__})') from None
+
+
 def extract(archive, platform, destination, environ):
     if platform in ('linux', 'android'):
         extract_embedded(archive, destination)
@@ -227,13 +296,13 @@ def extract(archive, platform, destination, environ):
         if sys.platform != 'darwin':
             raise SdkError('Apple packages can only be unpacked on macOS (pkgutil)')
         # --expand-full unpacks the payload without installing it or running package scripts.
-        subprocess.run(['pkgutil', '--expand-full', str(archive), str(destination)], check=True, env=environ)
+        run_tool('pkgutil', ['pkgutil', '--expand-full', str(archive), str(destination)], environ)
     else:
         if sys.platform != 'win32':
             raise SdkError('Windows packages can only be unpacked on Windows (vendor installer)')
         destination.mkdir(parents=True)
-        subprocess.run([str(archive), '/VERYSILENT', '/SP-', '/SUPPRESSMSGBOXES', '/NORESTART', '/NOCANCEL',
-                        f'/DIR={destination}'], check=True, timeout=300, env=environ)
+        run_tool('the vendor installer', [str(archive), '/VERYSILENT', '/SP-', '/SUPPRESSMSGBOXES', '/NORESTART',
+                                          '/NOCANCEL', f'/DIR={destination}'], environ, timeout=300)
 
 
 def sdk_root(directory):
@@ -293,23 +362,21 @@ def install(package, dest, *, archive=None, target=None, environ=None, pins=None
     if dest.exists():
         raise SdkError(f'{dest} already exists')
     source = Path(archive) if archive else select_source(package, pin, environ)
-    secret_env = source.secret_env if isinstance(source, Download) else ()
     # Vendor tools never see acquisition credentials.
-    tool_env = {name: value for name, value in environ.items()
-                if not name.startswith('NDI_SDK_') and name not in secret_env}
+    secret = secret_variables(environ)
+    tool_env = {name: value for name, value in environ.items() if name not in secret}
     dest.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.ndi-sdk-', dir=dest.parent) as staging:
         staging = Path(staging)
+        local = staging / ARCHIVE_NAME[pin['platform']]
         if isinstance(source, Download):
-            local = staging / ARCHIVE_NAME[pin['platform']]
             download(source, local)
-        elif source.is_file():
-            local = source
         else:
-            raise SdkError('the local archive does not exist')
+            snapshot(source, local)
         verify(local, pin)
         unpacked = staging / 'sdk'
         extract(local, pin['platform'], unpacked, tool_env)
+        reject_outside_links(unpacked)
         root = sdk_root(unpacked)
         if pin['platform'] == 'linux':
             add_soname_links(root)
@@ -344,8 +411,12 @@ def main(argv=None):
     except SdkError as error:
         print(f'error: {error}', file=sys.stderr)
         return 1
-    except (OSError, subprocess.SubprocessError, tarfile.TarError) as error:
-        print(f'error: {type(error).__name__}: {error}', file=sys.stderr)
+    except Exception as error:  # noqa: BLE001 - nothing unexpected may print a value it carries
+        # Only messages written for SdkError are known to be free of source locations
+        # and credentials, so anything else reports its type and where it was raised.
+        print(f'error: unexpected {type(error).__name__}', file=sys.stderr)
+        for frame in traceback.extract_tb(error.__traceback__):
+            print(f'  at {Path(frame.filename).name}:{frame.lineno} in {frame.name}', file=sys.stderr)
         return 1
     lines = ''.join(f'{name}={value}\n' for name, value in values.items())
     sys.stdout.write(lines)

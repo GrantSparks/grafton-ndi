@@ -76,6 +76,11 @@ jobs:
           cargo +1.88.0 check --locked --workspace --all-targets --all-features
       - name: Packaged crate builds
         run: cargo package --locked --package grafton-ndi
+      # Skipped while the crate's major version is ahead of every published
+      # release: nothing constrains a new major version, and the old release
+      # needs an NDI SDK to build.
+      - name: Semver check against the last release
+        run: python ci/semver.py
       - name: Dependency advisories
         run: |
           cargo install cargo-audit --version 0.23.0 --locked
@@ -130,16 +135,22 @@ jobs:
       - name: Link the examples for Android
         run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" scripts/build-android.sh aarch64-linux-android
 
-  # This job needs the private SDK archives. It runs for events that can read
-  # the repository secrets, while the repository variable NDI_CI_RELEASED is
-  # "true"; required-ci treats a skip on such an event as a failure.
+  # This job needs the private SDK archives, so it runs only where the secrets
+  # exist: not for pull requests from forks, and not for Dependabot, whose runs
+  # are given none. The repository variable NDI_CI_RELEASED switches it on, and
+  # required-ci treats a skip anywhere else as a failure.
+  #
+  # The job as a whole is the trust boundary for those secrets. Only the
+  # provisioning step is given them in its environment, but every step runs on
+  # the machine they were sent to, with administrator rights: the tests, every
+  # build script and procedural macro in Cargo.lock, and whatever a step installs.
   #
   # No dependency cache and no uploads: SDK files and the Advanced bindings
   # generated into the target directory must stay on the runner.
   sdk:
     name: sdk (${{ matrix.name }})
     if: >-
-      vars.NDI_CI_RELEASED == 'true' &&
+      vars.NDI_CI_RELEASED == 'true' && github.actor != 'dependabot[bot]' &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     strategy:
       fail-fast: false
@@ -161,7 +172,6 @@ jobs:
             target: x86_64-unknown-linux-gnu
             package: 6.3.2-standard-linux
             require: '1'
-            semver: true
           - name: linux-x64 standard-6.4
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
@@ -264,8 +274,8 @@ jobs:
         run: |
           if (!(Test-Path 'C:\Program Files\LLVM\bin\clang.exe')) { choco install llvm --version=20.1.8 -y }
           'LIBCLANG_PATH=C:\Program Files\LLVM\bin' | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-      # The only step that sees the acquisition secrets. It exports NDI_SDK_DIR
-      # and NDI_RUNTIME_DIR_V6 for the steps that follow.
+      # The only step that is given the acquisition secrets. It exports
+      # NDI_SDK_DIR and NDI_RUNTIME_DIR_V6 for the steps that follow.
       - name: Provision the SDK
         env:
           NDI_SDK_SOURCES_JSON: ${{ secrets.NDI_SDK_SOURCES_JSON }}
@@ -277,7 +287,7 @@ jobs:
           case "$RUNNER_OS" in
             Linux) ci/offline/linux.sh python3 ci/offline/check.py ;;
             macOS) ci/offline/macos.sh python3 ci/offline/check.py ;;
-            Windows) pwsh -NoProfile -File ci/offline/windows.ps1 "$(python -c 'import sys; print(sys.executable)')" ci/offline/check.py ;;
+            Windows) pwsh -NoProfile -File ci/offline/windows.ps1 "$(python -c 'import sys; sys.stdout.write(sys.executable)')" ci/offline/check.py ;;
           esac
       - name: Tests against the real runtime, all features
         env:
@@ -301,13 +311,6 @@ jobs:
       - name: Vendored bindings are current
         if: matrix.bindings
         run: cargo xtask bindgen --check --sdk "$NDI_SDK_DIR"
-      # The published baseline runs bindgen against an installed SDK, so this check
-      # lives in an SDK job until a release that builds without one is the baseline.
-      - name: Semver check against the last release
-        if: matrix.semver
-        run: |
-          cargo install cargo-semver-checks --version 0.51.0 --locked
-          cargo semver-checks
       - name: Build for the statically linked Apple mobile targets
         if: matrix.apple-mobile
         run: ci/apple-mobile.sh
@@ -323,5 +326,8 @@ jobs:
       - name: Every job this event requires succeeded
         env:
           RESULTS: ${{ toJSON(needs) }}
-          SDK_EXPECTED: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          # The condition of the sdk job, without the switch that turns it on.
+          SDK_EXPECTED: >-
+            ${{ github.actor != 'dependabot[bot]' &&
+            (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
         run: python3 ci/gate.py

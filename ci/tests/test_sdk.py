@@ -2,13 +2,17 @@ import contextlib
 import hashlib
 import io
 import json
+import http.client
 import os
 from pathlib import Path
 import ssl
+import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 
@@ -116,18 +120,17 @@ class Sources(unittest.TestCase):
                 self.assertEqual(source.url, 'https://api.github.com/repos/owner/store/releases/assets/42')
                 self.assertEqual(source.headers['Authorization'], 'Bearer secret')
                 self.assertEqual(source.headers['Accept'], 'application/octet-stream')
-                self.assertEqual(source.secret_env, ('NDI_SDK_ARCHIVE_TOKEN',))
 
     def test_github_asset_honours_a_named_token_variable(self):
         asset = {'github_release_asset': {'repo': 'o/r', 'asset_id': 1, 'token_env': 'OTHER'}}
         self.assertEqual(self.select({'pkg': asset}, OTHER='t').headers['Authorization'], 'Bearer t')
-        with self.assertRaisesRegex(sdk.SdkError, 'OTHER'):
+        with self.assertRaisesRegex(sdk.SdkError, 'archive read token is not set') as failure:
             self.select({'pkg': asset}, NDI_SDK_ARCHIVE_TOKEN='unused')
+        self.assertNotIn('OTHER', str(failure.exception))
 
     def test_url_and_archive_entries(self):
         source = self.select({'pkg': {'url_env': 'SDK_URL'}}, SDK_URL='https://example.invalid/sdk')
-        self.assertEqual((source.url, source.headers, source.secret_env),
-                         ('https://example.invalid/sdk', {}, ('SDK_URL',)))
+        self.assertEqual(source, sdk.Download('https://example.invalid/sdk', {}))
         self.assertEqual(self.select({'pkg': {'archive': '/store/sdk.tar.gz'}}), Path('/store/sdk.tar.gz'))
 
     def test_invalid_configuration_is_rejected(self):
@@ -180,7 +183,7 @@ def http_error(code):
 
 
 class Downloads(Workspace):
-    SOURCE = sdk.Download('https://private.invalid/asset', {'Authorization': 'Bearer t'}, ())
+    SOURCE = sdk.Download('https://private.invalid/asset', {'Authorization': 'Bearer t'})
 
     def fetch(self, *outcomes):
         opener, sleeps = FakeOpener(*outcomes), []
@@ -285,6 +288,49 @@ class Install(Workspace):
                 self.install(linux_download(members))
             self.assertEqual(sorted(path.name for path in self.work.iterdir()), ['download.tar.gz'])
 
+    def test_link_that_escapes_once_a_later_member_lands_is_never_installed(self):
+        # `p` dangles when it is checked, because `q` does not exist yet: its target
+        # collapses to the root. Once `q` lands, `p` leads to a directory outside.
+        outside = self.work / 'outside'
+        outside.mkdir()
+        depth = len(self.work.parts) + 2
+        root = 'NDI SDK for Linux'
+        members = [(f'{root}/include/Processing.NDI.Lib.h', b''),
+                   (f'{root}/lib/x86_64-linux-gnu/libndi.so.6.9.1', b''),
+                   (f'{root}/Version.txt', b'v6.9.1.0'),
+                   link('p', '/'.join(['q'] * depth + ['..'] * depth) + str(outside)),
+                   link('q', '.')]
+        try:
+            self.install(linux_download(members))
+        except (sdk.SdkError, tarfile.TarError):
+            pass  # Python 3.11 reaches the check of the finished tree
+        else:
+            sdk.reject_outside_links(self.work / 'sdk')  # newer tarfile filters rewrite the link to stay inside
+        self.assertFalse(any(path.is_symlink() and not path.resolve().is_relative_to(self.work / 'sdk')
+                             for path in self.work.rglob('*')))
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_finished_tree_may_not_contain_a_link_that_leads_out_of_it(self):
+        tree = self.work / 'tree'
+        (tree / 'lib').mkdir(parents=True)
+        (tree / 'lib' / 'libndi.so.6.9.1').write_bytes(b'')
+        (tree / 'lib' / 'libndi.so').symlink_to('libndi.so.6.9.1')
+        (tree / 'lib' / 'up').symlink_to('..')
+        (tree / 'dangling').symlink_to('lib/absent')
+        sdk.reject_outside_links(tree)
+        outside = self.work / 'outside'
+        outside.mkdir()
+        # The last target stays inside when collapsed as text, and leaves through the `up` link.
+        for name, target in (('absolute', outside), ('relative', Path('..') / '..' / 'outside'),
+                             ('through-a-link', Path('up') / '..' / 'outside')):
+            with self.subTest(name):
+                escaping = tree / 'lib' / name
+                escaping.symlink_to(target)
+                with self.assertRaisesRegex(sdk.SdkError, 'leads out of it'):
+                    sdk.reject_outside_links(tree)
+                escaping.unlink()
+        sdk.reject_outside_links(tree)
+
     def test_installer_script_must_be_unique_and_carry_the_marker(self):
         payload = tarball([('x', b'')])
         for name, data in {
@@ -309,8 +355,11 @@ class Install(Workspace):
 
     def test_vendor_tools_do_not_receive_acquisition_secrets(self):
         data = linux_download()
-        sources = {'schema': 1, 'packages': {'test-linux': {'url_env': 'PRIVATE_URL'}}}
-        environ = {'NDI_SDK_SOURCES_JSON': json.dumps(sources), 'NDI_SDK_ARCHIVE_TOKEN': 't',
+        # Every variable the map names is withheld, not only the ones this package uses.
+        sources = {'schema': 1, 'packages': {
+            'test-linux': {'url_env': 'PRIVATE_URL'},
+            'another': {'github_release_asset': {'repo': 'o/r', 'asset_id': 1, 'token_env': 'OTHER_TOKEN'}}}}
+        environ = {'NDI_SDK_SOURCES_JSON': json.dumps(sources), 'NDI_SDK_ARCHIVE_TOKEN': 't', 'OTHER_TOKEN': 't',
                    'PRIVATE_URL': 'https://private.invalid/sdk', 'PATH': '/bin'}
         seen = {}
         original = (sdk.download, sdk.extract)
@@ -326,6 +375,188 @@ class Install(Workspace):
         sdk.extract = extract
         self.install(data, archive=False, environ=environ)
         self.assertEqual(seen, {'PATH': '/bin'})
+
+
+@contextlib.contextmanager
+def captured_output():
+    """Collect everything written to standard output and error, by this process and its children."""
+    captured = []
+    python_out, python_err = io.StringIO(), io.StringIO()
+    with tempfile.TemporaryFile() as sink:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        saved = os.dup(1), os.dup(2)
+        os.dup2(sink.fileno(), 1)
+        os.dup2(sink.fileno(), 2)
+        try:
+            with contextlib.redirect_stdout(python_out), contextlib.redirect_stderr(python_err):
+                yield captured
+        finally:
+            for descriptor, original in zip((1, 2), saved):
+                os.dup2(original, descriptor)
+                os.close(original)
+            sink.seek(0)
+            captured.append(python_out.getvalue() + python_err.getvalue() + sink.read().decode('utf-8', 'replace'))
+
+
+# Every private value used below contains this word, or is this number.
+SENTINEL, ASSET_ID = 'sentinel', 987654321
+STORE = 'private-store-sentinel'
+URL = 'https://host-sentinel.invalid/path-sentinel?signature=sig-sentinel'
+TOKEN = 'token-sentinel'
+GITHUB_ASSET = {'github_release_asset': {'repo': 'owner-sentinel/repo-sentinel', 'asset_id': ASSET_ID,
+                                         'token_env': 'TOKEN_ENV_SENTINEL'}}
+URL_ENTRY = {'url_env': 'URL_ENV_SENTINEL'}
+
+
+def refusal(code):
+    return urllib.error.HTTPError(URL, code, f'refused for {URL} with {TOKEN}', {}, None)
+
+
+class NothingPrivateIsPrinted(Workspace):
+    """No failure may print a value from the source map, from a variable it names, or the token."""
+
+    def setUp(self):
+        super().setUp()
+        self.data = linux_download()
+        self.junk = b'not an archive'
+        self.archive = self.work / STORE / 'package'
+        self.archive.parent.mkdir()
+        self.tools = self.work / 'tools'
+        self.tools.mkdir()
+
+    def junk_pin(self, platform):
+        return {'platform': platform, 'size': len(self.junk), 'sha256': hashlib.sha256(self.junk).hexdigest()}
+
+    def tool(self, name, script):
+        path = self.tools / name
+        path.write_text(script)
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+    def failed_install(self, entry=None, *, sources=None, environ=None, pin=None, platform=None, outcomes=(),
+                       patches=()):
+        """Install through the command line with `entry` as the package's source; return what was printed."""
+        if sources is None:
+            # Other packages' entries name variables too, and those must stay private as well.
+            sources = json.dumps({'schema': 1, 'packages': {
+                'test-linux': entry, 'another': GITHUB_ASSET, 'a-third': URL_ENTRY}})
+        environ = {'NDI_SDK_SOURCES_JSON': sources, 'NDI_SDK_ARCHIVE_TOKEN': TOKEN, 'TOKEN_ENV_SENTINEL': TOKEN,
+                   'URL_ENV_SENTINEL': URL, **(environ or {})}
+        pins = self.pins(self.data, **(pin or {}))
+        opener = FakeOpener(*outcomes)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, {name: value for name, value in environ.items() if value}))
+            for name in (name for name, value in environ.items() if not value):
+                os.environ.pop(name, None)
+            stack.enter_context(mock.patch.object(sdk, 'load_pins', lambda: pins))
+            stack.enter_context(mock.patch.object(sdk, 'RETRY_DELAYS', (0, 0)))
+            stack.enter_context(mock.patch.object(sdk.urllib.request, 'build_opener', lambda *handlers: opener))
+            if platform:
+                stack.enter_context(mock.patch.object(sys, 'platform', platform))
+            for patch in patches:
+                stack.enter_context(patch)
+            captured = stack.enter_context(captured_output())
+            status = sdk.main(['install', 'test-linux', '--dest', str(self.work / 'dest')])
+        self.assertEqual(status, 1)
+        self.assertFalse((self.work / 'dest').exists())
+        return captured[0]
+
+    def assert_nothing_private(self, output):
+        self.assertIn('error: ', output)
+        self.assertNotIn(SENTINEL, output.lower())
+        self.assertNotIn(str(ASSET_ID), output)
+
+    def test_local_archive_failures(self):
+        local = {'archive': str(self.archive)}
+        cases = {
+            'missing': lambda: None,
+            'a directory': self.archive.mkdir,
+            'another size': lambda: self.archive.write_bytes(b'x'),
+            'other bytes': lambda: self.archive.write_bytes(bytes(len(self.data))),
+        }
+        for name, prepare in cases.items():
+            with self.subTest(name):
+                prepare()
+                self.assert_nothing_private(self.failed_install(local))
+                if self.archive.is_dir():
+                    self.archive.rmdir()
+
+    def test_unreadable_archive_reports_its_type_and_place_only(self):
+        self.archive.write_bytes(self.junk)
+        output = self.failed_install({'archive': str(self.archive)}, pin=self.junk_pin('linux'))
+        self.assert_nothing_private(output)
+        self.assertRegex(output, r'error: unexpected ReadError\n  at sdk\.py:\d+ in main\n')
+
+    def test_vendor_tool_failures(self):
+        self.archive.write_bytes(self.junk)
+        local = {'archive': str(self.archive)}
+        path = {'PATH': f'{self.tools}{os.pathsep}{os.environ["PATH"]}'}
+        # The stand-in prints its arguments and its whole environment before failing.
+        self.tool('pkgutil', '#!/bin/sh\necho "pkgutil: cannot expand $*" >&2\nenv >&2\nexit 3\n')
+        output = self.failed_install(local, pin=self.junk_pin('apple'), platform='darwin', environ=path)
+        self.assert_nothing_private(output)
+        self.assertIn('pkgutil: cannot expand --expand-full ', output)
+        self.assertIn('error: pkgutil failed with exit status 3\n', output)
+        with self.subTest('not installed'):
+            output = self.failed_install(local, pin=self.junk_pin('apple'), platform='darwin',
+                                         environ={'PATH': str(self.work / 'empty')})
+            self.assert_nothing_private(output)
+            self.assertIn('error: pkgutil could not be started (No such file or directory)\n', output)
+        with self.subTest('installer cannot run'):
+            output = self.failed_install(local, pin=self.junk_pin('windows'), platform='win32')
+            self.assert_nothing_private(output)
+            self.assertIn('error: the vendor installer could not be started (', output)
+
+    def test_vendor_tool_timeout_names_the_tool_only(self):
+        with mock.patch.object(sdk.subprocess, 'run', side_effect=subprocess.TimeoutExpired([STORE, TOKEN], 300)):
+            with self.assertRaises(sdk.SdkError) as failure:
+                sdk.run_tool('the vendor installer', [STORE, TOKEN], {}, timeout=300)
+        self.assertEqual(str(failure.exception), 'the vendor installer did not finish within 300 seconds')
+
+    def test_download_failures(self):
+        cases = {
+            'variable unset': dict(entry=URL_ENTRY, environ={'URL_ENV_SENTINEL': ''}),
+            'not https': dict(entry=URL_ENTRY, environ={'URL_ENV_SENTINEL': URL.replace('https', 'http')}),
+            'refused': dict(entry=URL_ENTRY, outcomes=[refusal(404)]),
+            'unavailable': dict(entry=URL_ENTRY, outcomes=[refusal(503)] * 3),
+            'no connection': dict(entry=URL_ENTRY, outcomes=[urllib.error.URLError(OSError(f'no route to {URL}'))] * 3),
+            'tls': dict(entry=URL_ENTRY, outcomes=[urllib.error.URLError(ssl.SSLError(1, f'bad certificate {URL}'))]),
+            'dropped': dict(entry=URL_ENTRY, outcomes=[http.client.IncompleteRead(TOKEN.encode())] * 3),
+            'other content': dict(entry=URL_ENTRY, outcomes=[b'other content']),
+            'token unset': dict(entry=GITHUB_ASSET, environ={'TOKEN_ENV_SENTINEL': ''}),
+            'asset refused': dict(entry=GITHUB_ASSET, outcomes=[refusal(401)]),
+        }
+        for name, case in cases.items():
+            with self.subTest(name):
+                self.assert_nothing_private(self.failed_install(case.pop('entry'), **case))
+
+    def test_malformed_source_maps(self):
+        asset = GITHUB_ASSET['github_release_asset']
+        entries = {
+            'two kinds': {'archive': str(self.archive), **URL_ENTRY},
+            'unknown kind': {'ftp': URL},
+            'relative archive': {'archive': f'{STORE}/package'},
+            'not an object': URL,
+            'bad repository': {'github_release_asset': {**asset, 'repo': 'owner-sentinel/repo sentinel'}},
+            'bad asset id': {'github_release_asset': {**asset, 'asset_id': 'asset-sentinel'}},
+            'bad token variable': {'github_release_asset': {**asset, 'token_env': [TOKEN]}},
+        }
+        for name, entry in entries.items():
+            with self.subTest(name):
+                self.assert_nothing_private(self.failed_install(entry))
+        whole = json.dumps({'schema': 1, 'packages': {'test-linux': URL_ENTRY}})
+        ambiguous = {'test-linux': URL_ENTRY, sdk.artifact_id(self.pins(self.data)['test-linux']): GITHUB_ASSET}
+        for name, sources in {'cut short': whole[:-9], 'another schema': whole.replace('1', '2', 1),
+                              'ambiguous': json.dumps({'schema': 1, 'packages': ambiguous})}.items():
+            with self.subTest(name):
+                self.assert_nothing_private(self.failed_install(sources=sources))
+
+    def test_unexpected_failure_reports_its_type_and_place_only(self):
+        self.archive.write_bytes(self.data)
+        broken = mock.patch.object(sdk, 'sdk_root', side_effect=RuntimeError(f'{STORE} {TOKEN} {URL}'))
+        output = self.failed_install({'archive': str(self.archive)}, patches=[broken])
+        self.assert_nothing_private(output)
+        self.assertRegex(output, r'\Aerror: unexpected RuntimeError\n(  at \w+\.py:\d+ in \w+\n)+\Z')
 
 
 class CommandLine(Workspace):

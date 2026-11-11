@@ -1,3 +1,20 @@
-# Workflows, the release path and CI scripts change only with the owner's review.
+# Changes to these paths need the owner's review once "Require review from Code
+# Owners" is on for main (see ci/README.md). They decide what CI runs and what a
+# release publishes, without being part of the crate's source.
+
+# Workflows, the release path and the scripts they run.
 /.github/ @GrantSparks
 /ci/ @GrantSparks
+/scripts/ @GrantSparks
+
+# Read by cargo and rustup in every job without being named anywhere. Cargo
+# configuration can run programs and redirect registries, and the toolchain file
+# selects the compiler; neither is part of the published crate.
+/.cargo/ @GrantSparks
+/rust-toolchain.toml @GrantSparks
+
+# The dependency set and its exact versions. Every build script and procedural
+# macro in the lockfile runs in the job that holds the SDK secrets, and the
+# manifest lists the files a release publishes.
+/Cargo.toml @GrantSparks
+/Cargo.lock @GrantSparks

@@ -35,6 +35,17 @@ class Gate(unittest.TestCase):
         self.assertEqual(gate.failures({**FORK, 'test': 'failure'}, False), ['test: failure (required: success)'])
         self.assertEqual(gate.failures({**FORK, 'lint': 'skipped'}, False), ['lint: skipped (required: success)'])
 
+    def test_dependabot_runs_are_judged_like_fork_pull_requests(self):
+        # Dependabot's runs are given no Actions secrets, although its branches are in this repository.
+        # The workflow must therefore skip the sdk job for them and tell the gate not to expect it.
+        text = WORKFLOW.read_text(encoding='utf-8')
+        condition = re.search(r'\n  sdk:\n(?:.*\n)*?    if: >-\n((?:      .*\n)+)', text).group(1)
+        expected = re.search(r'\n          SDK_EXPECTED: >-\n((?:            .*\n)+)', text).group(1)
+        for expression in (condition, expected):
+            self.assertIn("github.actor != 'dependabot[bot]' &&", expression)
+        self.assertEqual(self.run_main(FORK, 'false'), (0, '', ''))
+        self.assertEqual(self.run_main(GREEN, 'false')[0], 1)
+
     def test_the_sdk_job_never_runs_for_forks_and_never_skips_elsewhere(self):
         self.assertEqual(gate.failures(GREEN, False), ['sdk: success (required: skipped)'])
         self.assertEqual(gate.failures(FORK, True), ['sdk: skipped (required: success)'])
