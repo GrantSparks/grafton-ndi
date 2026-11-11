@@ -12,8 +12,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
 
     // Initialize NDI
     let ndi = NDI::new()?;
-    let version = NDI::version()?;
-    println!("NDI version: {version}");
+    println!("NDI version: {}", ndi.info().raw_version());
 
     // Create a finder to discover sources
     let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;

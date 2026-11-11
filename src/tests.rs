@@ -9,6 +9,18 @@ use crate::{
     sys::bindings::*,
 };
 
+/// A requirement the test environment promises must have a test in this
+/// build; see `test_support`. This runs in every build, whatever its features.
+#[test]
+fn every_promised_requirement_has_a_test_in_this_build() {
+    let unverifiable = crate::test_support::unverifiable_promises();
+    assert!(
+        unverifiable.is_empty(),
+        "GRAFTON_NDI_REQUIRE_RUNTIME promises what no test in this build can check: {}",
+        unverifiable.join("; ")
+    );
+}
+
 fn create_test_video_frame(
     width: i32,
     height: i32,

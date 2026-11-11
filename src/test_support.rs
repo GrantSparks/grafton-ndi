@@ -7,7 +7,9 @@
 //!   is `None`, so it runs wherever that code is installed and is visibly skipped
 //!   elsewhere;
 //! * automation that must not skip lists what its environment provides in
-//!   `GRAFTON_NDI_REQUIRE_RUNTIME`, which turns the matching skips into failures.
+//!   `GRAFTON_NDI_REQUIRE_RUNTIME`, which turns the matching skips into failures;
+//! * a listed entry whose tests are not part of the build fails too, through
+//!   [`unverifiable_promises`]: it could otherwise never be broken.
 
 use std::{io::Write, sync::Mutex};
 
@@ -60,32 +62,75 @@ impl Requirement {
         }
     }
 
-    /// Whether the environment promises to provide it.
+    /// What this build lacks to have any test of the requirement.
+    ///
+    /// The tests that need native code beyond a runtime are compiled only for
+    /// some features and targets. Where none of them is, a promise of that
+    /// code would be kept by there being nothing to break it.
+    fn needs(self) -> Option<&'static str> {
+        let missing = |present: bool, needed: &'static str| (!present).then_some(needed);
+        match self {
+            Self::Runtime => None,
+            Self::Advanced => missing(cfg!(feature = "advanced"), "the `advanced` feature"),
+            Self::File => missing(cfg!(feature = "file-io"), "the `file-io` feature"),
+            Self::DiscoveryServer => missing(
+                cfg!(all(target_os = "linux", not(ndi_link_static))),
+                "a Linux target that loads the runtime dynamically",
+            ),
+        }
+    }
+
+    /// The entries of `GRAFTON_NDI_REQUIRE_RUNTIME`.
     ///
     /// An entry that names no requirement is a configuration mistake and
     /// panics: a misspelt promise must not quietly allow skips.
-    fn is_promised(self) -> bool {
+    fn promised() -> Vec<Self> {
         let Some(promises) = std::env::var_os(REQUIRE_RUNTIME) else {
-            return false;
+            return Vec::new();
         };
         let promises = promises
             .to_str()
             .unwrap_or_else(|| panic!("{REQUIRE_RUNTIME} is not UTF-8"));
-        let mut promised = false;
-        for entry in promises.split(',').map(str::trim) {
-            let named = Self::ALL
-                .into_iter()
-                .find(|requirement| requirement.token() == entry)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{REQUIRE_RUNTIME} lists {entry:?}; expected 1, advanced, file or \
-                         discovery-server"
-                    )
-                });
-            promised |= named == self || self == Self::Runtime;
-        }
-        promised
+        promises
+            .split(',')
+            .map(str::trim)
+            .map(|entry| {
+                Self::ALL
+                    .into_iter()
+                    .find(|requirement| requirement.token() == entry)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{REQUIRE_RUNTIME} lists {entry:?}; expected 1, advanced, file or \
+                             discovery-server"
+                        )
+                    })
+            })
+            .collect()
     }
+
+    /// Whether the environment promises to provide it. Any entry promises a
+    /// runtime.
+    fn is_promised(self) -> bool {
+        Self::promised()
+            .into_iter()
+            .any(|named| named == self || self == Self::Runtime)
+    }
+}
+
+/// The entries of `GRAFTON_NDI_REQUIRE_RUNTIME` that no test compiled into
+/// this build can check, each with the feature or target its tests need.
+///
+/// One always-compiled test asserts that this is empty, so that listing
+/// `advanced` for a build without the `advanced` feature, for example, fails
+/// instead of passing with nothing checked.
+pub fn unverifiable_promises() -> Vec<String> {
+    Requirement::promised()
+        .into_iter()
+        .filter_map(|requirement| {
+            let needed = requirement.needs()?;
+            Some(format!("`{}` needs {needed}", requirement.token()))
+        })
+        .collect()
 }
 
 /// Record that the calling test is skipped because `requirement` is not met.

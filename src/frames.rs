@@ -4038,11 +4038,11 @@ mod tests {
             .pixel_format(PixelFormat::NB4G)
             .build_for(&ndi)
             .unwrap();
-        let version = NDI::version().unwrap();
+        let runtime = ndi.runtime();
         drop(ndi);
         assert!(NDI::is_running());
         let reacquired = NDI::new().unwrap();
-        assert_eq!(NDI::version().unwrap(), version);
+        assert_eq!(reacquired.info(), runtime.info());
         drop(reacquired);
         let copy = crate::BorrowedVideoFrame::from(&frame)
             .try_to_owned()

@@ -3,7 +3,6 @@ mod common;
 
 use grafton_ndi::{
     AudioFrame, FrameSync, FrameSyncAudioRequest, Receiver, ReceiverOptions, Sender, SenderOptions,
-    NDI,
 };
 use std::{
     sync::{
@@ -39,7 +38,7 @@ fn queried_channels_remain_fixed_when_source_format_changes() {
     };
     eprintln!(
         "SDK: {} on {}",
-        NDI::version().unwrap(),
+        ndi.info().raw_version(),
         std::env::consts::OS
     );
     let sender = Sender::new(

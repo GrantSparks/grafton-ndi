@@ -1064,9 +1064,12 @@ impl SourceCache {
 
     /// Find a source by IP address or hostname with built-in caching.
     ///
-    /// This method handles NDI initialization and source discovery internally.
     /// If a source matching the host has been previously found, it returns the
-    /// cached result. Otherwise, it performs NDI discovery and caches the result.
+    /// cached result. Otherwise it starts NDI for the duration of the lookup,
+    /// exactly as [`NDI::new`] does, performs discovery and caches the result.
+    /// When no runtime has been selected yet, that first lookup therefore
+    /// selects the default one; call [`Runtime::select`](crate::Runtime::select)
+    /// beforehand to choose another.
     ///
     /// # Arguments
     ///

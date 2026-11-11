@@ -186,7 +186,7 @@ pub use {
         ReceiverColorFormat, ReceiverEvent, ReceiverMode, ReceiverOptions, ReceiverOptionsBuilder,
         ReceiverStatus, SourceNameChange, Tally,
     },
-    runtime::{ProcessLifetimeRuntime, RuntimeOptions, NDI},
+    runtime::{ProcessLifetimeRuntime, Runtime, RuntimeOptions, NDI},
     sender::{
         BorrowedVideoFrame, BorrowedVideoFrameBuilder, Sender, SenderOptions, SenderOptionsBuilder,
     },

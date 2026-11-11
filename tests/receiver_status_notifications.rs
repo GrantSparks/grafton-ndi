@@ -1,6 +1,6 @@
 mod common;
 
-use grafton_ndi::{Error, MetadataFrame, Receiver, ReceiverOptions, Sender, SenderOptions, NDI};
+use grafton_ndi::{Error, MetadataFrame, Receiver, ReceiverOptions, Sender, SenderOptions};
 use std::time::{Duration, Instant};
 
 fn wait_until(stage: &str, mut condition: impl FnMut() -> bool) {
@@ -16,7 +16,11 @@ fn media_capture_retains_capability_notifications() -> Result<(), Error> {
     let Some(ndi) = common::ndi() else {
         return Ok(());
     };
-    eprintln!("SDK: {} on {}", NDI::version()?, std::env::consts::OS);
+    eprintln!(
+        "SDK: {} on {}",
+        ndi.info().raw_version(),
+        std::env::consts::OS
+    );
     // Keep every source alive so each capture API uses a distinct live endpoint
     // rather than immediately reusing a retired sender's address. Rapid sender
     // teardown is covered by the separate lifecycle stress test.

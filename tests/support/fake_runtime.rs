@@ -26,6 +26,12 @@
 //! Server address; this runtime has no configuration to supply one.
 //!
 //! `FAKE_NDI_VERSION` in the compiler's environment replaces the version text.
+//!
+//! Two variables are read each time the function they affect is called, so a
+//! test can change the outcome while the library is loaded:
+//! `GRAFTON_FAKE_NDI_INITIALIZE=fail` makes initialization fail, and
+//! `GRAFTON_FAKE_NDI_CPU=unsupported` makes the runtime report a CPU it
+//! cannot run on.
 
 #![allow(non_snake_case, unused_variables, clippy::missing_safety_doc)]
 
@@ -111,7 +117,7 @@ macro_rules! stub {
 export! {
     fn NDIlib_initialize() -> bool {
         log("initialize");
-        true
+        std::env::var_os("GRAFTON_FAKE_NDI_INITIALIZE").is_none_or(|outcome| outcome != "fail")
     }
 
     fn NDIlib_destroy() {
@@ -129,7 +135,7 @@ export! {
     }
 
     fn NDIlib_is_supported_CPU() -> bool {
-        true
+        std::env::var_os("GRAFTON_FAKE_NDI_CPU").is_none_or(|cpu| cpu != "unsupported")
     }
 }
 

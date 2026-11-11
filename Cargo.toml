@@ -1,6 +1,6 @@
 [package]
 name = "grafton-ndi"
-version = "2.1.0"
+version = "3.0.0"
 edition = "2021"
 rust-version = "1.88"
 build = "build.rs"
@@ -60,9 +60,6 @@ bindgen = { version = "0.72.1", optional = true }
 
 [features]
 default = ["image-encoding"]
-# Retained 2.0 compatibility flag with no effect. The runtime edition is chosen
-# when the runtime is loaded; see `RuntimeOptions::edition`.
-advanced_sdk = []
 # Opt-in Advanced SDK wrappers. Their native declarations are generated at build
 # time from an installed Advanced SDK (NDI_SDK_DIR or a default location); without
 # one the API still compiles and every operation reports that it is unavailable.

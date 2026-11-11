@@ -172,7 +172,7 @@ impl FileApi {
     ///   or with [`Error::InvalidConfiguration`](crate::Error::InvalidConfiguration)
     ///   when it names a relative path.
     pub fn open(ndi: &NDI, options: &FileRuntimeOptions) -> FileResult<Self> {
-        let runtime = sys::select_file(&ndi.info(), ndi.api(), options.library_path.as_deref())
+        let runtime = sys::select_file(ndi.info(), ndi.api(), options.library_path.as_deref())
             .map_err(|error| match error {
                 crate::Error::RuntimeLoadFailed(reason) => FileError::Unavailable(reason),
                 other => FileError::Core(other),

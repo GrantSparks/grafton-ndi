@@ -1,11 +1,43 @@
 //! Select an NDI implementation and manage its initialization lifetime.
 //!
-//! The NDI runtime is loaded when the first [`NDI`] handle is created; building
-//! this crate needs no NDI SDK. A successfully loaded shared core module remains
-//! pinned for the process even after the last [`NDI`] handle is dropped. Native
-//! initialization and teardown still follow handle ownership unless
-//! [`NDI::process_lifetime`] is selected. Static targets use the SDK archive
-//! linked at build time.
+//! Using NDI takes two steps, and each is explicit:
+//!
+//! 1. **Select.** [`Runtime::select`] loads the NDI runtime library and pins it
+//!    for the rest of the process. Nothing is started. The [`Runtime`] it
+//!    returns describes the library: where it was loaded from, its edition and
+//!    version ([`Runtime::info`]), what it can do ([`Runtime::capabilities`])
+//!    and whether it can run on this CPU ([`Runtime::is_supported_cpu`]).
+//! 2. **Initialize.** [`Runtime::initialize`] starts NDI and returns an [`NDI`]
+//!    handle, from which every finder, sender and receiver is created. NDI
+//!    stays started while any handle exists, and stops when the last one is
+//!    dropped unless [`NDI::process_lifetime`] was chosen.
+//!
+//! [`NDI::new`] performs both steps with the default options, and
+//! [`NDI::with_options`] with the options it is given. A question never
+//! selects a runtime: [`NDI::is_running`], for one, only reports the current
+//! state. The one operation that starts NDI on the caller's behalf,
+//! [`SourceCache::find_by_host`](crate::SourceCache::find_by_host), does so
+//! through [`NDI::new`].
+//!
+//! ```no_run
+//! use grafton_ndi::{Runtime, RuntimeOptions};
+//!
+//! # fn main() -> Result<(), grafton_ndi::Error> {
+//! let runtime = Runtime::select(&RuntimeOptions::default())?;
+//! println!("NDI {}", runtime.info().raw_version());
+//! if !runtime.is_supported_cpu() {
+//!     eprintln!("this CPU cannot run the selected NDI runtime");
+//! }
+//! let ndi = runtime.initialize()?;
+//! # drop(ndi);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Building this crate needs no NDI SDK. A selected shared library stays
+//! loaded for the life of the process, including after the last [`NDI`] handle
+//! is dropped. Statically linked targets use the SDK archive linked at build
+//! time, and selecting it loads nothing.
 //!
 //! # Where the runtime is loaded from
 //!
@@ -17,12 +49,23 @@
 //! 3. the platform loader's own search for the library name (`rpath`,
 //!    `LD_LIBRARY_PATH`, `PATH` and the system library directories).
 //!
-//! A directory that does not contain the library is skipped, and a library that
-//! cannot be loaded or lacks a required entry point does not stop the search.
-//! When nothing is usable, [`Error::RuntimeLoadFailed`] names every location
-//! tried and the operating system's reason for each.
+//! A directory that does not contain the library is skipped. A library that
+//! cannot be loaded, or that loads but is rejected because it lacks a required
+//! entry point or is not the requested edition, is recorded and the search
+//! moves on to the next location. When nothing is usable,
+//! [`Error::RuntimeLoadFailed`] names every location tried and the reason for
+//! each, including the operating system's own.
+//!
+//! One limit applies to a library that loads but is rejected: it stays loaded,
+//! because a native library can never be unloaded safely. If the platform
+//! loader's own search then matches the library name to that module, it
+//! returns the module again instead of looking further, so no other library
+//! of that name can be reached by name in this process. The error names the
+//! rejected file. Remove or fix that file, or name the wanted library with
+//! [`RuntimeOptions::library_path`].
 
 use std::{
+    fmt,
     path::PathBuf,
     sync::{Condvar, Mutex, MutexGuard, OnceLock},
 };
@@ -32,13 +75,26 @@ use crate::{
     sys, Error, Result,
 };
 
-/// Selection options applied before the first successful runtime load.
+/// Which NDI runtime to select; see [`Runtime::select`].
 ///
-/// Successful selection is process-wide and immutable. Failed loads can be retried.
-/// [`NDI::version`] and CPU queries also select the default module when none has
-/// been selected, even though they do not initialize it. Apply explicit options
-/// before those queries when selecting a particular installation.
-/// Loading a native library executes its native constructors; use trusted SDK files.
+/// The default options search for the runtime library in the
+/// [documented order](crate::runtime#where-the-runtime-is-loaded-from) and ask
+/// for the edition chosen when the crate was built.
+///
+/// # Examples
+///
+/// ```no_run
+/// use grafton_ndi::{Runtime, RuntimeOptions, SdkEdition};
+///
+/// # fn main() -> Result<(), grafton_ndi::Error> {
+/// let options = RuntimeOptions::default()
+///     .library_path("/opt/ndi/lib/libndi.so.6")
+///     .edition(SdkEdition::Standard);
+/// let runtime = Runtime::select(&options)?;
+/// # let _ = runtime;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeOptions {
     pub(crate) library_path: Option<PathBuf>,
@@ -49,7 +105,8 @@ impl RuntimeOptions {
     /// Load exactly this absolute shared-library path.
     ///
     /// No other location is tried, so a failure to load it is reported rather
-    /// than hidden by a fallback. Static providers reject an explicit path.
+    /// than hidden by a fallback. A statically linked target has no library to
+    /// load and rejects an explicit path.
     pub fn library_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.library_path = Some(path.into());
         self
@@ -57,16 +114,221 @@ impl RuntimeOptions {
 
     /// Search for the runtime library of this SDK edition.
     ///
-    /// Requesting [`SdkEdition::Advanced`] also requires the loaded module to
-    /// export the Advanced SDK entry points. Requesting
-    /// [`SdkEdition::Standard`] never rejects a module for exporting more than
-    /// the Standard SDK does. Without a request, the edition chosen when the
-    /// crate was built applies: `NDI_SDK_EDITION` if it was set, otherwise
-    /// Advanced when an Advanced SDK was installed, otherwise Standard.
-    /// A static provider cannot switch away from its build-time edition.
+    /// Requesting [`SdkEdition::Advanced`] also requires the selected
+    /// implementation to export the Advanced SDK entry points. Requesting
+    /// [`SdkEdition::Standard`] never rejects an implementation for exporting
+    /// more than the Standard SDK does, so an Advanced runtime meets it.
+    /// Without a request, the edition chosen when the crate was built applies:
+    /// `NDI_SDK_EDITION` if it was set, otherwise Advanced when an Advanced SDK
+    /// was installed, otherwise Standard.
+    ///
+    /// A statically linked target has one implementation, the archive linked
+    /// at build time, and the same rule decides whether it meets the request.
     pub fn edition(mut self, edition: SdkEdition) -> Self {
         self.edition = Some(edition);
         self
+    }
+}
+
+/// The NDI implementation selected for this process.
+///
+/// A `Runtime` is a small `Copy` handle. Obtaining one loads and pins the NDI
+/// runtime library but does not start NDI, so it can be inspected first:
+/// [`info`](Self::info) for its path, edition and version,
+/// [`capabilities`](Self::capabilities) for what it supports and
+/// [`is_supported_cpu`](Self::is_supported_cpu) for whether it can run here.
+/// [`initialize`](Self::initialize) then starts NDI.
+///
+/// A process has one selected implementation. Once [`select`](Self::select)
+/// succeeds, every handle refers to it, and what the accessors return stays
+/// valid until the process exits.
+///
+/// # Examples
+///
+/// ```no_run
+/// use grafton_ndi::{Finder, FinderOptions, Runtime, RuntimeFeature, RuntimeOptions};
+///
+/// # fn main() -> Result<(), grafton_ndi::Error> {
+/// let runtime = Runtime::select(&RuntimeOptions::default())?;
+///
+/// let info = runtime.info();
+/// println!("{:?} {} from {:?}", info.edition(), info.raw_version(), info.library_path());
+/// if !runtime.capabilities().supports(RuntimeFeature::Planar444Video) {
+///     println!("this runtime predates the planar 4:4:4 formats");
+/// }
+///
+/// let ndi = runtime.initialize()?;
+/// let finder = Finder::new(&ndi, &FinderOptions::default())?;
+/// # drop(finder);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Copy)]
+pub struct Runtime {
+    selected: &'static sys::Runtime,
+}
+
+impl Runtime {
+    /// Select the NDI implementation `options` describe, without starting NDI.
+    ///
+    /// The first successful call loads the runtime library, checks that it
+    /// exports every entry point this crate requires, and pins it for the rest
+    /// of the process. Later calls return the same implementation, provided
+    /// their options are met by it. A statically linked target selects the
+    /// archive linked at build time.
+    ///
+    /// Loading a native library runs its initialization code: select only
+    /// trusted SDK files.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::RuntimeLoadFailed`] when no usable library is found. Nothing
+    ///   is selected and the call can be repeated, with other options if
+    ///   wanted. The message names every location tried and the reason for
+    ///   each.
+    /// * [`Error::RuntimeConflict`] when an implementation is already selected
+    ///   and does not meet `options`: they name a different library file, or
+    ///   ask for the Advanced SDK when the selected implementation is not one.
+    /// * [`Error::InvalidConfiguration`] when `options` name a relative
+    ///   library path.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use grafton_ndi::{Error, Runtime, RuntimeOptions};
+    ///
+    /// match Runtime::select(&RuntimeOptions::default()) {
+    ///     Ok(runtime) => println!("selected {:?}", runtime.info().library_path()),
+    ///     Err(Error::RuntimeLoadFailed(tried)) => eprintln!("NDI is not installed: {tried}"),
+    ///     Err(error) => eprintln!("{error}"),
+    /// }
+    /// ```
+    pub fn select(options: &RuntimeOptions) -> Result<Self> {
+        sys::select(options).map(|selected| Self { selected })
+    }
+
+    /// The selected implementation's identity: the file it was loaded from,
+    /// its edition, how it is linked and the version it reports.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{Runtime, RuntimeOptions};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let runtime = Runtime::select(&RuntimeOptions::default())?;
+    /// println!("NDI version: {}", runtime.info().raw_version());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn info(&self) -> &'static RuntimeInfo {
+        &self.selected.info
+    }
+
+    /// What the selected implementation supports, by optional capability.
+    ///
+    /// This is evidence about the library and this build, not about hardware
+    /// or licenses.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{Runtime, RuntimeFeature, RuntimeOptions};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let runtime = Runtime::select(&RuntimeOptions::default())?;
+    /// let status = runtime.capabilities().status(RuntimeFeature::ReceiveDelay);
+    /// println!("receive delay: {status:?}");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn capabilities(&self) -> &'static Capabilities {
+        &self.selected.capabilities
+    }
+
+    /// Check that the selected implementation provides `feature`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedCapability`] naming the capability and why
+    /// the selected implementation or this build cannot provide it.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{Runtime, RuntimeFeature, RuntimeOptions};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let runtime = Runtime::select(&RuntimeOptions::default())?;
+    /// runtime.require_feature(RuntimeFeature::Routing)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn require_feature(&self, feature: RuntimeFeature) -> Result<()> {
+        self.selected.require(feature)
+    }
+
+    /// Whether the selected implementation can run on this CPU.
+    ///
+    /// The implementation itself answers, because the instructions it needs
+    /// depend on the SDK version and the platform. A runtime that does not
+    /// start for this reason makes [`Runtime::initialize`] report
+    /// [`Error::UnsupportedCpu`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{Runtime, RuntimeOptions};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let runtime = Runtime::select(&RuntimeOptions::default())?;
+    /// if !runtime.is_supported_cpu() {
+    ///     eprintln!("this CPU lacks instructions the NDI runtime needs");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn is_supported_cpu(&self) -> bool {
+        is_supported_cpu(&self.selected.api.core)
+    }
+
+    /// Start NDI and return a handle to it.
+    ///
+    /// NDI is started by the first handle and stays started while any handle
+    /// exists; each further call, like [`NDI::clone`], only adds a handle.
+    /// Dropping the last one stops NDI, after which this can be called again.
+    /// The call is thread-safe.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::UnsupportedCpu`] when the implementation does not start and
+    ///   reports that this CPU cannot run it.
+    /// * [`Error::InitializationFailed`] when it does not start for any other
+    ///   reason, or the count of handles is exhausted.
+    ///
+    /// A failed start can be retried.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{Error, Runtime, RuntimeOptions};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let runtime = Runtime::select(&RuntimeOptions::default())?;
+    /// match runtime.initialize() {
+    ///     Ok(ndi) => println!("NDI is running: {ndi:?}"),
+    ///     Err(Error::UnsupportedCpu) => eprintln!("NDI cannot run on this CPU"),
+    ///     Err(error) => return Err(error),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn initialize(&self) -> Result<NDI> {
+        lifecycle(self.selected).acquire()?;
+        Ok(NDI { runtime: *self })
+    }
+}
+
+impl fmt::Debug for Runtime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Runtime")
+            .field("info", self.info())
+            .finish()
     }
 }
 
@@ -126,10 +388,21 @@ impl RuntimeState {
     }
 }
 
-// Private SDK hooks let tests exercise the production state machine.
+/// The native calls the lifecycle needs. Tests substitute their own, so the
+/// production state machine runs without an SDK.
 trait RuntimeBackend {
+    /// Start NDI; `false` when it does not start.
     fn initialize(&self) -> bool;
+    /// Whether the implementation can run on this CPU.
+    fn is_supported_cpu(&self) -> bool;
+    /// Stop NDI.
     fn destroy(&self);
+}
+
+/// Whether the implementation behind `core` can run on this CPU.
+fn is_supported_cpu(core: &sys::Core) -> bool {
+    // SAFETY: the query takes no arguments and needs no initialization.
+    unsafe { core.NDIlib_is_supported_CPU() }
 }
 
 /// Initialization through the selected implementation's own entry points.
@@ -139,6 +412,10 @@ impl RuntimeBackend for SdkBackend {
     fn initialize(&self) -> bool {
         // SAFETY: the manager serializes initialization against destruction.
         unsafe { self.0.NDIlib_initialize() }
+    }
+
+    fn is_supported_cpu(&self) -> bool {
+        is_supported_cpu(self.0)
     }
 
     fn destroy(&self) {
@@ -187,24 +464,20 @@ impl<B: RuntimeBackend> RuntimeManager<B> {
                     guard.phase = Phase::Initializing;
                     drop(guard);
 
-                    // Call NDIlib_initialize outside the lock
-                    let succeeded = self.backend.initialize();
+                    // The native calls run outside the lock.
+                    let started = self.start();
 
                     // Re-acquire lock to update state
                     guard = Self::recover_guard(self.state.lock());
 
-                    if succeeded {
+                    if started.is_ok() {
                         guard.phase = Phase::Running;
                         guard.refcount = 1;
-                        self.cv.notify_all();
-                        return Ok(());
                     } else {
                         guard.phase = Phase::Failed;
-                        self.cv.notify_all();
-                        return Err(Error::InitializationFailed(
-                            "NDIlib_initialize failed".into(),
-                        ));
                     }
+                    self.cv.notify_all();
+                    return started;
                 }
 
                 Phase::Initializing | Phase::Destroying => {
@@ -221,6 +494,22 @@ impl<B: RuntimeBackend> RuntimeManager<B> {
                     return Ok(());
                 }
             }
+        }
+    }
+
+    /// Start NDI, classifying a failure by what the implementation reports.
+    ///
+    /// The CPU is consulted only after a failed start: an implementation that
+    /// starts is the authority on whether it can run.
+    fn start(&self) -> Result<()> {
+        if self.backend.initialize() {
+            Ok(())
+        } else if self.backend.is_supported_cpu() {
+            Err(Error::InitializationFailed(
+                "NDIlib_initialize returned false on a CPU the runtime reports as supported".into(),
+            ))
+        } else {
+            Err(Error::UnsupportedCpu)
         }
     }
 
@@ -267,16 +556,18 @@ fn lifecycle(runtime: &'static sys::Runtime) -> &'static RuntimeManager {
     LIFECYCLE.get_or_init(|| RuntimeManager::with_backend(SdkBackend(&runtime.api.core)))
 }
 
-/// Manages the NDI runtime lifecycle.
+/// A handle to the started NDI runtime.
 ///
-/// The `NDI` struct is the entry point for all NDI operations. It ensures the NDI
-/// runtime is properly initialized and cleaned up. Multiple instances can exist
-/// simultaneously - they share the same underlying runtime through reference counting.
-/// Create handles with [`NDI::new`] or [`Clone::clone`]; direct construction is private
-/// so every handle owns a reference to the initialized runtime.
-/// Releasing the final handle tears down native initialization, but does not unload
-/// or change the selected module. [`NDI::process_lifetime`] explicitly retains an
-/// initialized handle until process exit.
+/// Every finder, sender and receiver is created from an `NDI` handle, and NDI
+/// stays started while any handle exists: those objects each retain one, and
+/// [`Clone::clone`] and [`Runtime::initialize`] add more. Dropping the last
+/// handle stops NDI but leaves the selected library loaded, so NDI can be
+/// started again. [`NDI::process_lifetime`] keeps it started until the process
+/// exits.
+///
+/// [`NDI::new`] selects the default runtime and starts it in one call. To
+/// inspect a runtime before starting it, or to choose which one is loaded, use
+/// [`Runtime::select`] and then [`Runtime::initialize`].
 ///
 /// # Examples
 ///
@@ -284,42 +575,42 @@ fn lifecycle(runtime: &'static sys::Runtime) -> &'static RuntimeManager {
 /// use grafton_ndi::NDI;
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
-/// // Create an NDI instance
 /// let ndi = NDI::new()?;
 ///
-/// // The runtime stays alive as long as any NDI instance exists
-/// let ndi2 = ndi.clone(); // Cheap reference-counted clone
+/// // NDI stays started for as long as any handle exists.
+/// let another = ndi.clone();
+/// drop(ndi);
+/// assert!(NDI::is_running());
 ///
-/// // Without a process-lifetime opt-in, the last handle tears down initialization.
+/// // Dropping the last handle stops it.
+/// drop(another);
 /// # Ok(())
 /// # }
 /// ```
 pub struct NDI {
-    runtime: &'static sys::Runtime,
+    runtime: Runtime,
 }
 
-impl std::fmt::Debug for NDI {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for NDI {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NDI").finish_non_exhaustive()
     }
 }
 
 impl NDI {
-    /// Creates a new NDI instance.
+    /// Select the default NDI runtime and start it.
     ///
-    /// This checked constructor is thread-safe and can be called from multiple
-    /// threads. It initializes the runtime when necessary; otherwise it acquires
-    /// another runtime reference. Cloning a live handle also acquires a reference.
-    /// The runtime is destroyed when the last handle is dropped, including handles
-    /// retained internally by senders, receivers, and finders, unless a
-    /// [`ProcessLifetimeRuntime`] reference was retained. The loaded core module
-    /// remains selected and pinned after teardown.
+    /// This is [`Runtime::select`] with the default [`RuntimeOptions`]
+    /// followed by [`Runtime::initialize`]. It is thread-safe: the first
+    /// handle starts NDI and later calls add handles to the running runtime.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::RuntimeLoadFailed`] if no usable runtime library is found
-    /// in the [search order](crate::runtime), and [`Error::InitializationFailed`] if native
-    /// initialization fails or the runtime handle reference count is exhausted.
+    /// Returns [`Error::RuntimeLoadFailed`] if no usable runtime library is
+    /// found in the [search order](crate::runtime#where-the-runtime-is-loaded-from),
+    /// [`Error::UnsupportedCpu`] if the runtime does not start because this
+    /// CPU cannot run it, and [`Error::InitializationFailed`] if it does not
+    /// start for another reason or the count of handles is exhausted.
     ///
     /// # Examples
     ///
@@ -335,31 +626,63 @@ impl NDI {
         Self::with_options(&RuntimeOptions::default())
     }
 
-    /// Load the selected implementation and acquire an initialized runtime handle.
+    /// Select the NDI runtime `options` describe and start it.
     ///
-    /// A path that differs from the already selected module, or an Advanced
-    /// request the selected module cannot satisfy, returns
-    /// [`Error::RuntimeConflict`]. A failed load or initialization is retryable.
-    /// Once loading succeeds, initialization retries use that same selected module.
+    /// This is [`Runtime::select`] followed by [`Runtime::initialize`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of those two steps. A failed selection or start can
+    /// be retried; once selection has succeeded, every later call uses the
+    /// selected runtime and reports [`Error::RuntimeConflict`] for options it
+    /// does not meet.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use grafton_ndi::{RuntimeOptions, SdkEdition, NDI};
+    ///
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::with_options(&RuntimeOptions::default().edition(SdkEdition::Advanced))?;
+    /// # drop(ndi);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_options(options: &RuntimeOptions) -> Result<Self> {
-        let runtime = sys::select(options)?;
-        lifecycle(runtime).acquire()?;
-        Ok(Self { runtime })
+        Runtime::select(options)?.initialize()
     }
 
-    /// Facts about the selected implementation, including its actual loaded path.
-    pub fn info(&self) -> RuntimeInfo {
-        self.runtime.info.clone()
+    /// The selected implementation this handle keeps started.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::NDI;
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = NDI::new()?;
+    /// // A second handle from the same runtime, without selecting again.
+    /// let another = ndi.runtime().initialize()?;
+    /// # drop(another);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn runtime(&self) -> Runtime {
+        self.runtime
     }
 
-    /// Capability evidence for the selected implementation.
-    pub fn capabilities(&self) -> Capabilities {
-        self.runtime.capabilities.clone()
+    /// The selected implementation's identity; see [`Runtime::info`].
+    pub fn info(&self) -> &'static RuntimeInfo {
+        self.runtime.info()
+    }
+
+    /// What the selected implementation supports; see [`Runtime::capabilities`].
+    pub fn capabilities(&self) -> &'static Capabilities {
+        self.runtime.capabilities()
     }
 
     /// The selected implementation's entry points.
     pub(crate) fn api(&self) -> &'static sys::Api {
-        &self.runtime.api
+        &self.runtime.selected.api
     }
 
     /// Reject an unavailable operation before passing newer inputs to the SDK.
@@ -369,7 +692,7 @@ impl NDI {
     /// Returns [`Error::UnsupportedCapability`] naming the capability and why
     /// the selected runtime or this build cannot provide it.
     pub fn require_feature(&self, feature: RuntimeFeature) -> Result<()> {
-        self.runtime.require(feature)
+        self.runtime.require_feature(feature)
     }
 
     /// The entry points of an optional capability, core or Advanced, or the
@@ -378,7 +701,7 @@ impl NDI {
     /// The table type alone selects the capability, so a table cannot be
     /// obtained without its gate or under another capability's name.
     pub(crate) fn table<T: sys::Table>(&self) -> Result<&'static T> {
-        T::of(self.runtime)
+        T::of(self.runtime.selected)
     }
 
     /// Retain an initialized runtime reference until process exit.
@@ -391,66 +714,10 @@ impl NDI {
         }
     }
 
-    /// Checks if the current CPU is supported by the NDI SDK.
+    /// Whether NDI is started, by this or any other handle in the process.
     ///
-    /// Requirements depend on the selected SDK artifact. This query selects the
-    /// default module when none has been selected; it does not initialize NDI.
-    /// A loading failure returns `false`; [`NDI::try_is_supported_cpu`] preserves
-    /// the loading error.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// if grafton_ndi::NDI::is_supported_cpu() {
-    ///     println!("CPU is supported by NDI");
-    /// } else {
-    ///     eprintln!("CPU lacks required features for NDI");
-    /// }
-    /// ```
-    pub fn is_supported_cpu() -> bool {
-        Self::try_is_supported_cpu().unwrap_or(false)
-    }
-
-    /// Check CPU support while preserving native-library loading diagnostics.
-    pub fn try_is_supported_cpu() -> Result<bool> {
-        let runtime = sys::select(&RuntimeOptions::default())?;
-        // SAFETY: the query takes no arguments and needs no initialization.
-        Ok(unsafe { runtime.api.core.NDIlib_is_supported_CPU() })
-    }
-
-    /// Returns the version string of the NDI runtime.
-    ///
-    /// This selects the default module if necessary without initializing NDI.
-    /// Apply explicit [`RuntimeOptions`] before this query to select another
-    /// installation. The result describes the selected implementation, not the
-    /// headers used to compile the crate.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the module cannot be loaded, its version cannot be
-    /// retrieved, or its version text contains invalid UTF-8.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::NDI;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// match NDI::version() {
-    ///     Ok(version) => println!("NDI version: {}", version),
-    ///     Err(e) => eprintln!("Failed to get version: {}", e),
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn version() -> Result<String> {
-        Ok(sys::select(&RuntimeOptions::default())?
-            .info
-            .raw_version()
-            .to_owned())
-    }
-    /// Checks if the NDI runtime is currently initialized.
-    ///
-    /// This can be useful for diagnostic purposes or conditional initialization.
+    /// This only reads the current state: it never selects or loads a
+    /// runtime, and is `false` before one has been selected.
     ///
     /// # Examples
     ///
@@ -472,7 +739,7 @@ impl Clone for NDI {
     /// Panics if the runtime handle reference count is exhausted. The original
     /// handle and runtime remain valid.
     fn clone(&self) -> Self {
-        lifecycle(self.runtime)
+        lifecycle(self.runtime.selected)
             .acquire()
             .expect("Unable to acquire another reference to the existing NDI runtime");
         Self {
@@ -483,7 +750,7 @@ impl Clone for NDI {
 
 impl Drop for NDI {
     fn drop(&mut self) {
-        lifecycle(self.runtime).release();
+        lifecycle(self.runtime.selected).release();
     }
 }
 
@@ -499,7 +766,9 @@ mod tests {
     struct MockBackend {
         init_count: AtomicUsize,
         destroy_count: AtomicUsize,
+        cpu_query_count: AtomicUsize,
         init_should_fail: AtomicBool,
+        cpu_unsupported: AtomicBool,
         init_delay_ms: AtomicUsize,
         destroy_delay_ms: AtomicUsize,
     }
@@ -511,6 +780,11 @@ mod tests {
             ));
             self.init_count.fetch_add(1, Ordering::AcqRel);
             !self.init_should_fail.load(Ordering::Acquire)
+        }
+
+        fn is_supported_cpu(&self) -> bool {
+            self.cpu_query_count.fetch_add(1, Ordering::AcqRel);
+            !self.cpu_unsupported.load(Ordering::Acquire)
         }
 
         fn destroy(&self) {
@@ -544,6 +818,57 @@ mod tests {
         manager.state.lock().unwrap().refcount = 1;
         manager.release();
         assert_eq!(manager.backend.destroy_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn a_failed_start_is_classified_by_what_the_cpu_supports() {
+        let manager = RuntimeManager::with_backend(MockBackend::default());
+        manager
+            .backend
+            .init_should_fail
+            .store(true, Ordering::Release);
+
+        // The implementation supports the CPU, so it failed for another reason.
+        assert!(matches!(
+            manager.acquire(),
+            Err(Error::InitializationFailed(_))
+        ));
+        assert_eq!(manager.phase(), Phase::Failed);
+
+        manager
+            .backend
+            .cpu_unsupported
+            .store(true, Ordering::Release);
+        assert!(matches!(manager.acquire(), Err(Error::UnsupportedCpu)));
+        assert_eq!(manager.phase(), Phase::Failed);
+        assert!(!manager.is_running());
+        assert_eq!(manager.backend.init_count.load(Ordering::Acquire), 2);
+        assert_eq!(manager.backend.cpu_query_count.load(Ordering::Acquire), 2);
+        assert_eq!(manager.backend.destroy_count.load(Ordering::Acquire), 0);
+
+        // Either failure leaves the runtime ready for another attempt.
+        manager
+            .backend
+            .init_should_fail
+            .store(false, Ordering::Release);
+        manager.acquire().unwrap();
+        assert!(manager.is_running());
+        manager.release();
+    }
+
+    #[test]
+    fn a_runtime_that_starts_is_not_asked_about_the_cpu() {
+        let manager = RuntimeManager::with_backend(MockBackend::default());
+        // The start itself is the authority: a successful one is never
+        // overruled by the separate CPU query.
+        manager
+            .backend
+            .cpu_unsupported
+            .store(true, Ordering::Release);
+        manager.acquire().unwrap();
+        assert!(manager.is_running());
+        assert_eq!(manager.backend.cpu_query_count.load(Ordering::Acquire), 0);
+        manager.release();
     }
 
     // ========== Lifecycle Invariant Tests ==========

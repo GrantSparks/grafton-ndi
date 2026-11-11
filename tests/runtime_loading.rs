@@ -8,7 +8,7 @@ mod fixture;
 use fixture::FakeRuntime;
 use grafton_ndi::{
     capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, SdkEdition},
-    runtime::RuntimeOptions,
+    runtime::{Runtime, RuntimeOptions},
     Error, NDI,
 };
 use std::{
@@ -33,7 +33,14 @@ struct Fixtures {
 
 impl Fixtures {
     fn build(root: &Path) -> Self {
-        for directory in ["bundle", "runtime", "loader", "empty", "mislabelled"] {
+        for directory in [
+            "bundle",
+            "runtime",
+            "loader",
+            "empty",
+            "mislabelled",
+            "unloadable",
+        ] {
             fs::create_dir_all(root.join(directory)).unwrap();
         }
         let fixtures = Self {
@@ -74,6 +81,14 @@ impl Fixtures {
             fixtures.mislabelled().join(ADVANCED_NAME),
         )
         .unwrap();
+        // A file under that name which is not a library at all. The platform
+        // loader stops at the first file of the wanted name on its path, so
+        // this decides its search whatever the host has installed.
+        fs::write(
+            fixtures.unloadable().join(ADVANCED_NAME),
+            "not a shared library\n",
+        )
+        .unwrap();
         fixtures
     }
 
@@ -109,6 +124,9 @@ impl Fixtures {
     }
     fn mislabelled(&self) -> PathBuf {
         self.root.join("mislabelled")
+    }
+    fn unloadable(&self) -> PathBuf {
+        self.root.join("unloadable")
     }
     fn log(&self) -> PathBuf {
         PathBuf::from(std::env::var_os("GRAFTON_FAKE_NDI_LOG").unwrap())
@@ -169,8 +187,14 @@ const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         runtime_directory: Some("mislabelled"),
+        loader_directory: Some("unloadable"),
         ..scenario("failure_names_every_candidate")
     },
+    Scenario {
+        runtime_directory: Some("runtime"),
+        ..scenario("selecting_and_starting_are_separate_steps")
+    },
+    scenario("a_failed_start_is_classified_and_can_be_retried"),
 ];
 
 #[test]
@@ -238,6 +262,13 @@ fn search_selects() -> (NDI, String) {
     (ndi, version)
 }
 
+/// Whether the file at `library` is mapped into this process.
+fn is_loaded(library: &Path) -> bool {
+    fs::read_to_string("/proc/self/maps")
+        .unwrap()
+        .contains(library.to_str().unwrap())
+}
+
 fn load_failure(result: Result<NDI, Error>) -> String {
     match result {
         Err(Error::RuntimeLoadFailed(reason)) => reason,
@@ -268,8 +299,8 @@ fn child(name: &str, fixtures: &Fixtures) {
                 capabilities.status(RuntimeFeature::Planar444Video),
                 CapabilityStatus::Unavailable(CapabilityUnavailable::RuntimeTooOld)
             );
-            assert!(NDI::try_is_supported_cpu().unwrap());
-            assert!(NDI::version().unwrap().contains("6.3.2.0"));
+            assert!(ndi.runtime().is_supported_cpu());
+            assert!(ndi.info().raw_version().contains("6.3.2.0"));
             drop(ndi);
             assert!(!NDI::is_running());
             drop(NDI::with_options(&options).unwrap());
@@ -316,6 +347,8 @@ fn child(name: &str, fixtures: &Fixtures) {
             assert_eq!(ndi.info().edition(), SdkEdition::Advanced);
             // The edition is detected, so a later Advanced request agrees.
             drop(NDI::with_options(&explicit(advanced).edition(SdkEdition::Advanced)).unwrap());
+            // A Standard request is met by the selected Advanced module too.
+            drop(NDI::with_options(&standard()).unwrap());
         }
         "later_major_version_keeps_version_gated_features" => {
             let ndi = NDI::with_options(&explicit(fixtures.next_major())).unwrap();
@@ -434,6 +467,7 @@ fn child(name: &str, fixtures: &Fixtures) {
                 .unwrap()
                 .with_file_name(ADVANCED_NAME);
             let in_runtime_directory = fixtures.mislabelled().join(ADVANCED_NAME);
+            let on_loader_path = fixtures.unloadable().join(ADVANCED_NAME);
             for expected in [
                 format!(
                     "{} (next to the executable): not found",
@@ -443,8 +477,10 @@ fn child(name: &str, fixtures: &Fixtures) {
                     "{} (NDI_RUNTIME_DIR_V6): it does not export the Advanced SDK entry points",
                     in_runtime_directory.display()
                 ),
-                format!("{ADVANCED_NAME} (system library search): "),
-                "cannot open shared object file".to_owned(),
+                // The search by name is reported with the platform loader's
+                // own reason, which alone knows the file that search reached.
+                format!("{ADVANCED_NAME} (system library search): dlopen failed: "),
+                format!("{}: ", on_loader_path.display()),
             ] {
                 assert!(
                     reason.contains(&expected),
@@ -453,6 +489,79 @@ fn child(name: &str, fixtures: &Fixtures) {
             }
             // Nothing was selected, so a usable runtime can still be chosen.
             drop(NDI::with_options(&options).unwrap());
+        }
+        "selecting_and_starting_are_separate_steps" => {
+            // A usable runtime is installed where the default search finds it,
+            // yet asking a question loads nothing.
+            let installed = fixtures.runtime().join(STANDARD_NAME);
+            assert!(!NDI::is_running());
+            assert!(!is_loaded(&installed));
+
+            let runtime = Runtime::select(&standard()).unwrap();
+            assert!(is_loaded(&installed));
+            assert_eq!(runtime.info().library_path(), Some(installed.as_path()));
+            assert!(runtime.info().raw_version().ends_with(IN_RUNTIME_DIRECTORY));
+            assert!(runtime.is_supported_cpu());
+            assert!(!runtime
+                .capabilities()
+                .supports(RuntimeFeature::ReceiveDelay));
+            // Selected and inspected, and still not started.
+            assert!(!NDI::is_running());
+            assert!(!fixtures.log().exists());
+
+            let ndi = runtime.initialize().unwrap();
+            assert!(NDI::is_running());
+            assert_eq!(fs::read_to_string(fixtures.log()).unwrap(), "initialize\n");
+            // Every handle refers to the one selection.
+            let again = Runtime::select(&standard()).unwrap();
+            assert!(std::ptr::eq(again.info(), runtime.info()));
+            assert!(std::ptr::eq(ndi.info(), runtime.info()));
+            assert!(std::ptr::eq(
+                ndi.runtime().capabilities(),
+                runtime.capabilities()
+            ));
+            // A handle obtained from another handle shares the running runtime.
+            let another = ndi.runtime().initialize().unwrap();
+            drop(ndi);
+            assert!(NDI::is_running());
+            drop(another);
+            assert!(!NDI::is_running());
+            assert_eq!(
+                fs::read_to_string(fixtures.log()).unwrap(),
+                "initialize\ndestroy\n"
+            );
+        }
+        "a_failed_start_is_classified_and_can_be_retried" => {
+            // The fake reads these variables on each call. This process runs
+            // only this scenario, so nothing else reads the environment.
+            let runtime = Runtime::select(&options).unwrap();
+            std::env::set_var("GRAFTON_FAKE_NDI_INITIALIZE", "fail");
+            assert!(runtime.is_supported_cpu());
+            assert!(matches!(
+                runtime.initialize(),
+                Err(Error::InitializationFailed(_))
+            ));
+
+            std::env::set_var("GRAFTON_FAKE_NDI_CPU", "unsupported");
+            assert!(!runtime.is_supported_cpu());
+            assert!(matches!(runtime.initialize(), Err(Error::UnsupportedCpu)));
+            // The one-call shortcut reports the same cause.
+            assert!(matches!(
+                NDI::with_options(&options),
+                Err(Error::UnsupportedCpu)
+            ));
+            assert!(!NDI::is_running());
+
+            // Neither failure is permanent.
+            std::env::remove_var("GRAFTON_FAKE_NDI_INITIALIZE");
+            std::env::remove_var("GRAFTON_FAKE_NDI_CPU");
+            let ndi = runtime.initialize().unwrap();
+            assert!(NDI::is_running());
+            drop(ndi);
+            assert_eq!(
+                fs::read_to_string(fixtures.log()).unwrap(),
+                "initialize\ninitialize\ninitialize\ninitialize\ndestroy\n"
+            );
         }
         _ => panic!("unknown loader scenario {name}"),
     }

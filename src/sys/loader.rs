@@ -27,9 +27,6 @@ pub(crate) struct Runtime {
     pub(crate) advanced: super::advanced::AdvancedApi,
     pub(crate) info: RuntimeInfo,
     pub(crate) capabilities: Capabilities,
-    // The linked provider carries no state, so nothing reads it once the
-    // tables are resolved.
-    #[cfg_attr(ndi_link_static, allow(dead_code))]
     provider: Provider,
 }
 
@@ -71,6 +68,17 @@ pub(crate) fn default_edition() -> SdkEdition {
     }
 }
 
+/// Whether an implementation of edition `provided` meets a request for
+/// `requested`.
+///
+/// The Advanced SDK exports everything the Standard SDK does, so only a
+/// request for the Advanced SDK can go unmet. Every provider decides by this
+/// rule, both when it first describes an implementation and when a later
+/// request is checked against the one already selected.
+fn meets(requested: SdkEdition, provided: SdkEdition) -> bool {
+    requested != SdkEdition::Advanced || provided == SdkEdition::Advanced
+}
+
 impl Runtime {
     /// Resolve the tables of an opened implementation and describe it.
     ///
@@ -81,7 +89,7 @@ impl Runtime {
         let advanced_tables = super::advanced::AdvancedApi::load(&provider).map_err(reason)?;
         let advanced = AdvancedEntryPoints::detect(&provider).map_err(reason)?;
         let edition = provider.edition(advanced);
-        if requested == SdkEdition::Advanced && edition != SdkEdition::Advanced {
+        if !meets(requested, edition) {
             return Err("it does not export the Advanced SDK entry points".into());
         }
         // SAFETY: NDIlib_version takes no arguments and may be called before
@@ -112,6 +120,27 @@ impl Runtime {
             info,
             provider,
         })
+    }
+
+    /// Confirm that this implementation, which is selected for the process
+    /// and cannot be replaced, meets `options`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::RuntimeConflict`] when `options` ask for an edition it is not
+    /// or name a library it was not loaded from;
+    /// [`Error::InvalidConfiguration`] when they name a relative path.
+    fn accepts(&self, options: &RuntimeOptions) -> Result<()> {
+        if options
+            .edition
+            .is_some_and(|requested| !meets(requested, self.info.edition))
+        {
+            return Err(Error::RuntimeConflict(
+                "the selected NDI implementation is not an Advanced SDK".into(),
+            ));
+        }
+        self.provider
+            .confirm_location(options.library_path.as_deref())
     }
 }
 
@@ -234,6 +263,12 @@ mod shared {
 
         pub(super) const LINKAGE: SdkLinkage = SdkLinkage::Shared;
 
+        /// Confirm that a request naming the library at `requested` is met by
+        /// this module.
+        pub(super) fn confirm_location(&self, requested: Option<&Path>) -> Result<()> {
+            confirm_selected(&self.path, requested)
+        }
+
         /// A module is an Advanced runtime when it exports both Advanced entry
         /// points; its file name and the caller's request are not evidence.
         pub(super) fn edition(&self, advanced: AdvancedEntryPoints) -> SdkEdition {
@@ -273,17 +308,6 @@ mod shared {
                 description: &format!("{requested:?} runtime"),
             }
             .open(|module| Runtime::describe(module, requested))
-        }
-
-        pub(in crate::sys) fn accepts(&self, options: &RuntimeOptions) -> Result<()> {
-            if options.edition == Some(SdkEdition::Advanced)
-                && self.info.edition != SdkEdition::Advanced
-            {
-                return Err(Error::RuntimeConflict(
-                    "the selected NDI runtime is not an Advanced SDK runtime".into(),
-                ));
-            }
-            confirm_selected(&self.provider.path, options.library_path.as_deref())
         }
     }
 
@@ -784,7 +808,7 @@ mod shared {
 mod linked {
     use std::{
         ffi::{c_void, CStr},
-        path::PathBuf,
+        path::{Path, PathBuf},
         ptr::NonNull,
     };
 
@@ -809,6 +833,18 @@ mod linked {
             None
         }
 
+        /// A linked archive is the only implementation there is, so no request
+        /// can name a library to load in its place.
+        pub(super) fn confirm_location(&self, requested: Option<&Path>) -> Result<()> {
+            match requested {
+                None => Ok(()),
+                Some(requested) => Err(Error::RuntimeConflict(format!(
+                    "the NDI SDK is linked into this program, so {} cannot be loaded instead",
+                    requested.display()
+                ))),
+            }
+        }
+
         /// The build selected exactly one edition-specific archive.
         pub(super) fn edition(&self, _advanced: AdvancedEntryPoints) -> SdkEdition {
             super::default_edition()
@@ -825,27 +861,27 @@ mod linked {
     }
 
     impl Runtime {
-        pub(in crate::sys) fn load(options: &RuntimeOptions) -> Result<Self> {
-            conflict_with_linked(options)?;
+        /// The archive was chosen when the program was built, so the request
+        /// plays no part here: it is checked against the archive exactly as
+        /// against any implementation that is already selected.
+        pub(in crate::sys) fn load(_: &RuntimeOptions) -> Result<Self> {
             Self::describe(Linked, super::default_edition())
                 .map_err(|reason| Error::RuntimeLoadFailed(format!("the linked SDK: {reason}")))
         }
-
-        pub(in crate::sys) fn accepts(&self, options: &RuntimeOptions) -> Result<()> {
-            conflict_with_linked(options)
-        }
     }
+}
 
-    fn conflict_with_linked(options: &RuntimeOptions) -> Result<()> {
-        let other_edition = options
-            .edition
-            .is_some_and(|edition| edition != super::default_edition());
-        if options.library_path.is_some() || other_edition {
-            return Err(Error::RuntimeConflict(
-                "a statically linked NDI implementation cannot select a different module or edition"
-                    .into(),
-            ));
-        }
-        Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_request_for_the_advanced_sdk_can_go_unmet() {
+        use SdkEdition::{Advanced, Standard};
+        assert!(meets(Standard, Standard));
+        // An Advanced implementation exports all of the Standard SDK.
+        assert!(meets(Standard, Advanced));
+        assert!(meets(Advanced, Advanced));
+        assert!(!meets(Advanced, Standard));
     }
 }

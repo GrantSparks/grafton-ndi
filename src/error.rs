@@ -59,9 +59,20 @@ pub enum Error {
     ///
     /// The SDK rejected initialization, a handle could not be created, or the
     /// runtime handle reference count was exhausted. A runtime library that
-    /// cannot be loaded is reported as [`Error::RuntimeLoadFailed`] instead.
+    /// cannot be loaded is reported as [`Error::RuntimeLoadFailed`] instead,
+    /// and one that does not start because of the CPU as
+    /// [`Error::UnsupportedCpu`].
     #[error("Failed to initialize the NDI runtime: {0}")]
     InitializationFailed(String),
+
+    /// The selected NDI runtime cannot run on this CPU.
+    ///
+    /// The runtime did not start and reports that the CPU lacks instructions
+    /// it requires. Which instructions those are depends on the SDK version
+    /// and the platform. [`Runtime::is_supported_cpu`](crate::Runtime::is_supported_cpu)
+    /// answers the same question without starting NDI.
+    #[error("The selected NDI runtime does not support this CPU")]
+    UnsupportedCpu,
 
     /// A null pointer was returned by the NDI SDK.
     ///
