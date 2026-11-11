@@ -230,5 +230,7 @@ mod tests;
 #[cfg(test)]
 mod test_alloc;
 
+// Shared with the integration tests, which use helpers the unit tests do not.
 #[cfg(test)]
+#[allow(dead_code)]
 mod test_support;
