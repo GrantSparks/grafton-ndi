@@ -1,182 +1,350 @@
 # Advanced SDK integration
 
-Enable the `advanced` Cargo feature and provide an authorized Advanced SDK through
-`NDI_SDK_DIR`. Select the matching runtime with `RuntimeOptions::edition(SdkEdition::Advanced)`;
-`RuntimeOptions::library_path` can identify an exact local library. The existing
-`advanced_sdk` compatibility flag remains an accepted no-op.
+The `advanced` Cargo feature adds the `grafton_ndi::advanced` module: the parts
+of NDI that only the NDI Advanced SDK provides. This guide explains what the
+module needs, how it reports that something is missing, and the ownership rules
+its types follow. The rustdoc of each type is the reference. Where an example
+program shows a type in use, its section names the file.
 
-Enabling a Rust feature does not grant an NDI entitlement. The public Rust API stays
-available when built with Standard headers, but native Advanced operations return
-`UnsupportedCapability` with a `BuildUnavailable` reason. Packet construction and
-validation remain usable without Advanced headers. When Advanced headers are
-present, operations require the Advanced edition and resolve exports from the one
-selected runtime. Missing exports
-remain errors, independently of version labels or library filenames.
+## Requirements
 
-`AdvancedConfig::parse` accepts an owned JSON object, preserves unknown extension
-keys, and redacts its debug representation. The constructors retain the exact
-configuration allocation through native destruction. `expose_json` is an explicit
-way to read configuration that may contain credentials. Sender, receiver, finder,
-router, both advertisers and both listeners have `new_with_config` constructors.
-Avoid putting credentials in debug logs, examples, or environment diagnostics.
+Using the module needs three things, in this order:
 
-## Codec packets and sending
+1. The `advanced` Cargo feature.
 
-Use `PacketReceiver` with an explicit `PassthroughPreset` for compressed reception.
-Its owned result distinguishes decoded video/audio, compressed packets, metadata,
-and status events. It does not expose a raw receiver that could enter FrameSync.
-Use ordinary `Receiver` for decoded media.
+   ```toml
+   [dependencies]
+   grafton-ndi = { version = "3.0", features = ["advanced"] }
+   ```
 
-`CompressedVideoFrame` and `CompressedAudioFrame` own their data. Video describes its
-codec, program/preview tier, dimensions, timing and scan type through
-`VideoPacketFormat`. H.264, HEVC and AAC use a checked packet envelope. Opus is a
-packet without that prefix; SpeedHQ has its own header. Structural validation does
-not decode or prove the validity of a codec bitstream. Applications must provide
-correct codec payloads and the configuration data required for keyframes/AAC.
-Protected flags describe SDK packet conventions; they do not encrypt payloads.
+2. An NDI Advanced SDK on the machine that builds the crate. The Advanced SDK
+   headers may not be redistributed, so the crate does not contain their
+   declarations. The build script generates them with bindgen from the SDK
+   named by `NDI_SDK_DIR`, or from a default installation directory. That step
+   needs a `libclang` shared library.
 
-Received envelope extensions, unknown flags and reserved data are preserved after
-bounds validation. Sending accepts understood header versions and flags, zero
-reserved fields, and complete payload lengths. This separates future-compatible
-inspection from emitting an unknown native representation.
+3. An Advanced SDK runtime selected when the program runs. A build that found
+   an Advanced SDK searches for the Advanced runtime library by default. See
+   [SDK editions](../README.md#sdk-editions) in the README.
 
-`CompressedSender` owns an exclusive sender. Its asynchronous sends retain program
-and preview buffers separately. A subsequent asynchronous send on the same tier
-returns that tier's previous ownership. Synchronous sends conservatively retain
-previous async storage. `close` destroys the native sender before returning any
-remaining buffers. SDK implementations may internally copy compressed data; Rust
-ownership alone is not a zero-copy guarantee.
+Enabling the feature neither selects an SDK edition nor grants a license
+entitlement.
 
-`ScatterVideoFrame` and `ScatterAudioFrame` own their segments and native pointer
-arrays. The entire packet header must fit in the first segment. Both synchronous
-scatter operations and asynchronous video scatter are available. Use the explicit
-`into_contiguous_copy` conversion when submitting scatter data to `QueuedSender`.
+## When a requirement is missing
 
-`QueuedSender` uses native completion callbacks with bounded frame and byte counts,
-including completed frames the application has not collected. `try_submit` returns
-ownership on backpressure. `try_take_completed` and `wait_completed` return completed
-frames on the application thread; application code never runs in the completion
-trampoline. An existing sender can be consumed only after ordinary async work is
-drained and no advertiser retains its native resource. The queue exposes no sender
-reference that could add another owner. Drop waits for native callback completion;
-it does not promise a destruction deadline.
+The public API of the module is the same in every build. What differs is what
+an operation returns:
 
-## Custom receive allocation
+| Situation | Result of a native operation |
+| --- | --- |
+| Built without the Advanced SDK headers | `Error::UnsupportedCapability`; the reason says the crate was built without them |
+| Built with the headers, Standard runtime selected | `Error::UnsupportedCapability`; the reason says the runtime is not an Advanced SDK runtime |
+| Built with the headers, Advanced runtime selected | The operation runs |
 
-Custom allocators require explicit permanent runtime initialization:
+Core operations are unaffected in every case. The module's data types work in
+every build as well: packet formats, compressed frames, packet envelopes,
+scatter frames, options and limits can be constructed, validated and inspected
+without the Advanced SDK.
 
-```rust,no_run
-use grafton_ndi::{NDI, Receiver};
-use grafton_ndi::advanced::{
-    AllocationBuffer, AllocationRequest, AllocatorLimits, AllocatorService,
-};
+To find out in advance, ask the runtime:
 
-fn customize(ndi: &NDI, receiver: Receiver) -> grafton_ndi::Result<()> {
-    let service = AllocatorService::new(
-        ndi.process_lifetime(),
-        AllocatorLimits::default(),
-    )?;
-    let mut receiver = service.attach(receiver)?;
-    receiver.set_video_allocator(|request: AllocationRequest| {
-        AllocationBuffer::zeroed(request)
-    })?;
-    receiver.reset_video_allocator();
-    let receiver = receiver.into_receiver();
-    drop(receiver);
+```rust
+use grafton_ndi::{capabilities::RuntimeFeature, NDI};
+
+fn main() -> grafton_ndi::Result<()> {
+    let ndi = NDI::new()?;
+    match ndi.require_feature(RuntimeFeature::AdvancedSenderConfiguration) {
+        Ok(()) => println!("Advanced SDK operations can be used"),
+        Err(error) => println!("{error}"),
+    }
     Ok(())
 }
 ```
 
-`NDI::process_lifetime` permanently retains one initialized runtime reference and
-its native code. Dropping tokens does not undo this choice. Ordinary applications
-that do not request this token keep their normal runtime lifecycle. Registrations,
-policies and frame allocations are still reclaimed normally. An embedding host
-that loads this Rust code as an unloadable plugin must keep that containing module
-loaded for the process lifetime after opting in; ordinary Rust application linkage
-already keeps the callback code and registry alive.
+The types of this module take the functions they need when they are
+constructed, so their constructors report a missing requirement. The Advanced
+methods on the ordinary `Sender` and `Receiver` report it when they are called.
 
-Policies run on SDK threads, can run concurrently/reentrantly, and should return
-quickly. The wrapper validates allocation sizes and strides, uses initialized
-64-byte-aligned owned storage, and contains policy panics. `with_stride` requests
-padding within the configured per-allocation limit. `ExternalAllocation` is the
-unsafe bridge to a native pool: its implementation guarantees writable initialized
-CPU-accessible memory, alignment, exclusivity, stable capacity and a non-panicking
-release on an arbitrary SDK thread.
+## Ownership
 
-Video/audio allocators can be replaced or reset during use. Replacement allocates a
-fresh generation before changing the current registration. Closing generations
-reject pending allocation commits; already-published buffers retain their generation
-until the matching native free. Opaque callback tokens are never dereferenced or
-reused. Native callbacks may finish after replacement. This is why the permanent
-runtime opt-in is separate from buffer ownership.
+An operation that takes ownership of a receiver, a sender or a frame hands the
+value back when it fails. The error type is `grafton_ndi::Rejected<T>`:
 
-The first `AllocatorService` fixes process-wide limits. Later services must request
-the same limits. Limits cover old generations, admitted calls, retained allocations,
-and reclamation still in progress. Arbitrary working memory allocated by a user
-policy is outside this accounting. `usage` reports current ownership pressure.
-Unknown frees never release arbitrary memory. Failed or panicking reclamation keeps
-its budget charged conservatively. `attach_packets` provides the same allocator
-ownership for packet receivers without exposing decoded-only capture methods.
+```rust
+use grafton_ndi::advanced::{CompressedVideoFrame, VideoCodec, VideoPacketFormat};
 
-## Synchronization and controls
-
-`AvSync` consumes a receiver and exposes a restricted video/control view. It cannot
-be used alongside raw audio capture or FrameSync on that receiver. Synchronization
-returns owned audio or distinct format-change/no-stream/no-match/error outcomes;
-all native audio is freed with the matching AVSync function. `into_receiver`
-destroys AVSync before returning the receiver.
-
-`Genlock` retains its source/configuration and supplies separate non-cloneable video
-and audio clock tokens for scoped workers. Source changes require exclusive access.
-Clock waits can block and have no native timeout/cancellation contract. A fallback
-result means system-clock pacing, rather than an invented timeout.
-
-Dynamic receive bandwidth accepts only the SDK's documented program/preview choices.
-Stream changes preserve the ambiguous native false result as unchanged-or-rejected.
-Encoder guidance preserves quality-format negotiation, and keyframe waiting remains
-separate from querying current demand. Routing metadata and external tally are
-available through their owning objects.
-
-KVM requires an explicit exclusive `KvmSession`. It does not read the local clipboard
-or automatically control discovered devices. The session validates coordinates,
-tracks pressed keys/buttons/touch, and attempts release on drop. Connection failure
-can prevent cleanup delivery; callers can invoke `release_all` explicitly.
-
-## Verification
-
-Local native evidence for this integration includes Linux x86_64 with Advanced
-SDK 6.4. Pure/compile coverage also checks the old Standard 6.3.2 header path and
-the existing Rust MSRV. Required hosted native suites use Linux x64, Windows x64
-and macOS ARM64 representatives; other supported profiles receive ABI/link or
-package checks. Consult the exact revision's results in [SDK validation](sdk-validation.md)
-and the [CI matrix](../ci/README.md); workflow definitions are not completed runs.
-SDKs 6.0/6.1.1 and physical devices do not have current validation results.
-Supported profiles require SDKs and toolchains obtainable and usable on GitHub-hosted
-CI; a specialized BSP artifact without those prerequisites remains unsupported.
-
-Pure Rust tests cover packet bounds/extensions, independent stream ownership,
-concurrent/out-of-order completion, malformed completion callbacks, allocator
-retirement/free races, global budgets, panic cleanup and blocked reclamation.
-Authorized-header builds compare manually typed native function pointers and packed
-packet offsets with locally generated SDK declarations. Compile contracts exclude
-raw audio through AVSync and concurrent reconnects while clock tokens are borrowed.
-
-The ignored `advanced_runtime` integration tests exercise actual Advanced SDK
-constructors, controls, callback completion and local video/audio capture through
-padded custom allocators with replacement/reset. Build without starting native
-peers:
-
-```sh
-cargo test --features advanced --test advanced_runtime --no-run
+fn main() -> grafton_ndi::Result<()> {
+    let format = VideoPacketFormat::new(VideoCodec::H264, 1920, 1080)?;
+    // Not an H.264 packet envelope, so the bytes come back with the reason.
+    let rejected = CompressedVideoFrame::new(format, vec![0; 16]).unwrap_err();
+    println!("not sendable: {}", rejected.error());
+    let bytes: Vec<u8> = rejected.into_inner();
+    assert_eq!(bytes.len(), 16);
+    Ok(())
+}
 ```
 
-Run each ignored test in its own process through the platform network confinement
-used by [the native CI runner](../ci/native.py); see its [operating guide](../ci/README.md).
-A Cargo test command by itself does not establish network isolation.
-`GRAFTON_NDI_RUNTIME` is an exact-library-path override used by these tests, not a
-general crate loader environment variable; applications use `RuntimeOptions`.
-These tests use test-owned loopback peers and do not require physical hardware. Codec
-interoperability, entitlements, physical KVM devices and long-duration clock behavior
-require their corresponding fixtures; a constructor or symbol check does not prove
-those behaviors. Platform evidence remains identified separately as native,
-emulated, or build-only.
+`Rejected<T>` converts into `Error`, dropping the value, so `?` works in a
+function that returns `grafton_ndi::Result`. Use `into_inner` or `into_parts`
+when the value matters: a receiver to keep using, a frame to retry.
+
+## Configuration
+
+`AdvancedConfig` holds the JSON document the Advanced SDK accepts when it
+creates an object. `AdvancedConfig::parse` checks that the text is a JSON object
+of at most one mebibyte and keeps it byte for byte, unknown properties
+included. The properties themselves are defined by the NDI Advanced SDK
+documentation.
+
+A configuration can carry credentials or network details. Its `Debug` output
+shows no content, and no error quotes it. `expose_json` returns the text and is
+named as a reminder not to log it.
+
+Constructors that take a configuration are named `new_with_config`. `Sender`,
+`Receiver`, `Finder`, `Router`, both advertisers, both listeners,
+`CompressedSender` and `QueuedSender` have one. `PacketReceiver::new` and
+`Genlock::new` take the configuration as a parameter. Each object keeps its
+configuration for as long as it lives.
+
+`Finder::sources_with_metadata` returns each source together with the metadata
+it advertises. A sender advertises metadata through its configuration, and a
+finder learns it only from a Discovery Server. The metadata of a source that
+advertises none is `None`.
+
+Example: `examples/advanced_source_metadata.rs`.
+
+## Compressed streams
+
+### Receiving packets
+
+`PacketReceiver` delivers a frame as the codec packet the source sent when the
+frame's format is one that its `PassthroughPreset` names, and as a decoded frame
+otherwise. One `capture` call returns whichever frame or event arrives first as
+a `PacketEvent`, and every result owns its data. A `PacketReceiver` is used from
+the thread that owns it and cannot feed a `FrameSync`. Use an ordinary
+`Receiver` for decoded media only.
+
+### Packet formats
+
+`CompressedVideoFrame` and `CompressedAudioFrame` own their bytes. A video
+frame's `VideoPacketFormat` names its codec, its stream (program or preview),
+dimensions, frame rate, aspect ratio and scan type. An aspect ratio of zero
+means square pixels and is the default.
+
+H.264, HEVC and AAC payloads travel inside a packet envelope: a 44-byte header
+followed by the payload and the codec configuration. `packet_envelope` builds
+one and `PacketEnvelope::parse` reads one. Opus and SpeedHQ frames have no
+envelope.
+
+Construction validates the memory layout the SDK relies on: sizes and, where
+there is one, the envelope. It does not decode or validate the codec bitstream;
+supplying a correct bitstream, and the codec configuration that keyframes and
+AAC packets need, is the application's job. The `protected` setting describes
+an SDK packet convention. It does not encrypt anything.
+
+The SDK accepts any compressed frame and silently discards those it will not
+deliver. Construction therefore also refuses frames that would be discarded:
+
+- a SpeedHQ frame whose first byte, its quality, is 100 or more;
+- an H.264 or HEVC picture on the preview stream that is larger than 640 by
+  640 pixels;
+- Opus at a sample rate other than 8, 12, 16, 24 or 48 kHz, or with a frame
+  length other than 2.5, 5, 10, 20, 40 or 60 ms;
+- an AAC frame that does not hold 1024 samples per channel or lacks its codec
+  configuration.
+
+These rules were observed with the 6.4.0.2 runtime on Linux.
+
+Parsing a received envelope keeps what it does not understand: later header
+versions, unknown flags and the reserved field stay readable. Sending is
+stricter. A frame is sendable only with a version-0 header, no unknown flags
+and no bytes after the lengths the header declares; `validate_for_send` checks
+this.
+
+### Sending packets
+
+`CompressedSender` owns its sender exclusively. Its program and preview streams
+are independent. The synchronous sends (`send_video`, `send_audio`,
+`send_scatter_video`, `send_scatter_audio`) borrow the frame mutably, because
+the SDK writes to the frame's bytes while it sends them. A frame can be sent
+again afterwards, and a received packet can be relayed. An asynchronous send
+keeps the frame until the next asynchronous send on the same stream, which
+returns the earlier frame for reuse. `close` destroys the native sender, which waits for the SDK to finish
+with pending frames, and returns the frames that were still held as
+`UnsentVideo`.
+
+`ScatterVideoFrame` and `ScatterAudioFrame` hold one frame in several owned
+blocks, which are sent without being joined. For H.264 and HEVC the first block
+must hold the complete envelope header. `into_contiguous_copy` joins the blocks
+into an ordinary compressed frame.
+
+Moving a frame into a sender does not copy it in this crate. The SDK may still
+copy data internally.
+
+Example: `examples/advanced_passthrough.rs` relays a source's packets
+unchanged.
+
+## Queued sending
+
+An ordinary asynchronous video send has to wait for the previous frame before
+it accepts the next. `QueuedSender` keeps every submitted frame until the SDK
+reports it sent, so submission does not wait for a slow connection.
+
+- `QueueOptions` bounds the queue by frame count and by bytes. A frame counts
+  from submission until the application takes it back. The defaults are 8
+  frames and 512 MiB.
+- `try_submit` returns a `SubmissionId`, or returns the frame in a `Rejected`
+  when a limit is reached. Collect completed frames and submit again.
+- `try_take_completed` and `wait_completed` return completed frames on the
+  application's thread. No application code runs on an SDK thread.
+- `from_sender` converts an existing `Sender`. It returns the frame the sender
+  was still holding, if any. It refuses, and returns the sender, when the
+  sender is registered with an advertiser.
+- `source` returns the source the sender advertises, as it does on
+  `CompressedSender`.
+- A `QueuedSender` is used from the thread that owns it. Dropping it destroys
+  the native sender, which waits without a timeout for the SDK to finish with
+  the frames still queued.
+
+Example: `examples/advanced_queued_send.rs`.
+
+## Custom receive allocation
+
+By default the SDK allocates the memory of received frames. An
+`AllocatorService` lets the application supply that memory instead.
+
+The SDK can call an allocator's free function long after the allocator was
+replaced. Custom allocation therefore needs the runtime to stay initialized
+until the process exits, and creating the service requires the explicit opt-in
+for that:
+
+```rust
+use grafton_ndi::advanced::{
+    AllocationBuffer, AllocationRequest, AllocatorLimits, AllocatorService,
+};
+use grafton_ndi::{Receiver, NDI};
+
+fn customize(ndi: &NDI, receiver: Receiver) -> grafton_ndi::Result<Receiver> {
+    let service = AllocatorService::new(ndi.process_lifetime(), AllocatorLimits::default())?;
+    let mut receiver = service.attach(receiver)?;
+    // Pad every video line to a multiple of 256 bytes.
+    receiver.set_video_allocator(|request: AllocationRequest| {
+        let stride = (request.stride() + 255) / 256 * 256;
+        AllocationBuffer::zeroed(request.with_stride(stride)?)
+    })?;
+    // ... capture through `receiver.receiver()` ...
+    receiver.reset_video_allocator();
+    Ok(receiver.into_receiver())
+}
+```
+
+`NDI::process_lifetime` keeps one initialized runtime reference permanently.
+Dropping the returned value does not undo it. Applications that never call it
+keep the normal lifecycle. A program that loads this crate inside a plug-in
+must also keep that plug-in loaded for the life of the process, because the SDK
+holds pointers to the crate's callbacks.
+
+What to know about allocator policies:
+
+- A policy runs on SDK threads, possibly several at once. It should return
+  quickly. A panic in a policy is contained.
+- `AllocationBuffer::zeroed` supplies zeroed, 64-byte-aligned memory.
+  `AllocationRequest::with_stride` asks for padded lines. `ExternalAllocation`
+  is the `unsafe` trait for memory from another pool; its implementer
+  guarantees the properties the trait documents.
+- Setting an allocator replaces the previous one for frames allocated from then
+  on. Frames allocated earlier stay in the memory the earlier policy supplied,
+  and that policy is kept until the SDK has freed the last of them.
+- `AllocatorLimits` are process-wide and fixed by the first service; later
+  services must name the same limits. They count allocations made by policies
+  that have since been replaced. The defaults allow 16 concurrent policy calls
+  and 64 MiB per allocation, within 1 GiB in total. Limits that could not all
+  be honored at once are rejected. A request the limits do not admit is
+  declined, and the SDK then drops that frame. `AllocatorService::usage`
+  reports what is currently held.
+- `set_video_allocator`, `set_audio_allocator` and
+  `AllocationBuffer::from_external` return what they were given inside
+  `Rejected` when they fail.
+- `attach_packets` does the same for a `PacketReceiver`.
+
+Example: `examples/advanced_allocator.rs`.
+
+## Synchronization
+
+`AvSync` returns the audio that belongs to each video frame's timestamp. It
+takes over the receiver's audio, so it owns the receiver: capture video through
+`AvSync::receiver`, then call `synchronize`. `AvSyncRequest::automatic()` takes
+whatever audio belongs to the frame; `AvSyncRequest::new(samples, sample_rate)`
+asks for an exact number of samples. The outcome is the audio, or says
+why there is none: no samples for this frame, a changed audio format, no audio
+stream, no samples matching the frame's time, or an SDK error. Nothing is
+retried or converted. `into_receiver` stops synchronizing and returns the
+receiver.
+
+`Genlock` paces a sender from the timing of a reference source. `clocks`
+returns a video clock and an audio clock; wait on the matching one before
+submitting each frame, and create the sender with its own clocking disabled.
+Each wait reports whether the reference or the system clock paced it; the
+system clock is used while no reference signal arrives. The waits block their
+thread and cannot be cancelled or given a deadline. Both clocks borrow the
+genlock, so the reference cannot be changed while a clock is in use.
+
+Examples: `examples/advanced_avsync.rs`, `examples/advanced_genlock.rs`.
+
+## Encoder guidance, keyframes and stream selection
+
+These are methods on the ordinary `Sender` and `Receiver`:
+
+- `Sender::target_frame_bytes`, `target_bit_rate`, `legacy_quality` and
+  `quality_plan` report what an encoder should aim for when it produces a given
+  `VideoPacketFormat` for the sender's connections.
+- `Sender::keyframe_required` reports whether a connected receiver needs a
+  keyframe, and `wait_for_keyframe_change` waits for that to change.
+  `Receiver::request_keyframe` asks the source for one; the source decides
+  whether to send it.
+- `Sender::set_external_tally` sets the sender's own contribution to its tally.
+- `Receiver::set_video_quality` switches between the source's program and
+  preview streams. `Receiver::set_streams` chooses which streams the source
+  sends. The SDK reports only whether the selection changed, so `StreamChange`
+  cannot tell "already in effect" from "refused". The SDK applies either
+  change only under a vendor ID that licenses the function, and reports no
+  change without one.
+
+## KVM
+
+`Receiver::kvm` starts a `KvmSession`, exclusive remote control of the source
+the receiver is connected to. The receiver is borrowed mutably for the session.
+The session sends pointer, button, wheel, key, touch and clipboard messages;
+each method returns whether the SDK accepted the message, which is not a
+confirmation that the source acted on it. The session never reads the local
+clipboard. It remembers what it has pressed and releases it when dropped, on a
+best-effort basis; call `release_all` to learn whether that succeeded.
+
+Example: `examples/advanced_kvm.rs`.
+
+## Running the tests
+
+The Advanced tests compile in every build. Those that need an Advanced runtime
+start with the `advanced_ndi()` test helper and are skipped, with a message,
+when the build has no Advanced SDK declarations or the selected runtime is a
+Standard one.
+
+To run them, build with the Advanced SDK and select its runtime. On Linux
+x86_64:
+
+```sh
+export NDI_SDK_DIR="/path/to/NDI Advanced SDK for Linux"
+export NDI_RUNTIME_DIR_V6="$NDI_SDK_DIR/lib/x86_64-linux-gnu"
+GRAFTON_NDI_REQUIRE_RUNTIME=advanced cargo test --features advanced
+```
+
+`GRAFTON_NDI_REQUIRE_RUNTIME=advanced` makes a test that would have skipped
+fail instead, so the run cannot pass without exercising the Advanced runtime.
+The tests create their own senders and receivers on the local machine and need
+no hardware.
+
+What the tests establish is limited to what they run. The Advanced runtime
+tests were run on Linux x86_64 with the Advanced SDK 6.4.0.2. They do not
+cover KVM against a real source, allocator layouts for 4:2:0 and planar 4:4:4
+video, real codec bitstreams, license entitlements, long-running clock
+behavior, or any other platform.

@@ -1,8 +1,9 @@
-//! High-performance Rust bindings for the NDI® 6 SDK (Network Device Interface).
+//! Rust bindings for the NDI® 6 SDK (Network Device Interface).
 //!
-//! This crate provides safe, idiomatic Rust bindings for the NDI SDK, enabling
-//! real-time, low-latency video/audio streaming over IP networks. NDI is widely
-//! used in broadcast, live production, and video conferencing applications.
+//! This crate wraps the NDI SDK in Rust ownership types for discovering
+//! sources and for sending and receiving video, audio and metadata over IP
+//! networks. Building it needs no NDI SDK: the NDI runtime library is loaded
+//! when a runtime is selected.
 //!
 //! # Quick Start
 //!
@@ -11,7 +12,7 @@
 //! use std::time::Duration;
 //!
 //! # fn main() -> Result<(), grafton_ndi::Error> {
-//! // Initialize the NDI runtime
+//! // Select the default NDI runtime and start it
 //! let ndi = NDI::new()?;
 //!
 //! // Find sources on the network
@@ -32,25 +33,67 @@
 //!
 //! ## Runtime Management
 //!
-//! The [`NDI`] struct manages the NDI runtime lifecycle. Create a handle before
-//! constructing SDK resources; those resources retain their own runtime
-//! references. [`SourceCache`] acquires the runtime on cache misses, while its
-//! cached owned source descriptors need no live runtime handle.
+//! Using NDI takes two steps. [`Runtime::select`] loads the NDI runtime library
+//! and pins it for the process without starting NDI; the [`Runtime`] it returns
+//! describes the library. [`Runtime::initialize`] starts NDI and returns an
+//! [`NDI`] handle. [`NDI::new`] does both with the default options. Create a
+//! handle before constructing SDK resources; those resources retain their own
+//! handles, and NDI stops when the last one is dropped. The [`runtime`] module
+//! describes where the runtime library is loaded from and how
+//! [`RuntimeOptions`] selects one.
 //!
 //! ## Source Discovery
 //!
 //! Use [`Finder`] to discover NDI sources on the network. Sources can be filtered
-//! by groups and additional IP addresses can be specified for discovery.
+//! by groups and additional IP addresses can be specified for discovery. See
+//! the [`finder`] module.
+//!
+//! [`SourceCache`] remembers which source belongs to a host, so repeated
+//! lookups of a known device skip discovery. A lookup takes the [`NDI`] handle;
+//! the cached source descriptors need none.
+//!
+//! ```no_run
+//! use grafton_ndi::{SourceCache, NDI};
+//! use std::time::Duration;
+//!
+//! # fn main() -> Result<(), grafton_ndi::Error> {
+//! let ndi = NDI::new()?;
+//! let cache = SourceCache::new();
+//! let camera = cache.find_by_host(&ndi, "192.168.1.100", Duration::from_secs(5))?;
+//! println!("Found: {camera}");
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! ## Receiving
 //!
 //! The [`Receiver`] type handles receiving video, audio, and metadata from NDI
-//! sources. It supports various color formats and bandwidth modes.
+//! sources. It supports various color formats and bandwidth modes. See the
+//! [`receiver`] module, and [`framesync`] for clock-corrected pull capture.
 //!
 //! ## Sending
 //!
 //! Use [`Sender`] to transmit video, audio, and metadata as an NDI source.
-//! Senders can be configured with clock settings and group assignments.
+//! Senders can be configured with clock settings and group assignments. See
+//! the [`sender`] and [`frames`] modules.
+//!
+//! ## Optional capabilities
+//!
+//! NDI runtimes differ in what they provide. [`NDI::capabilities`] reports
+//! each optional capability of the selected runtime, without assuming
+//! hardware or license availability, and an operation whose capability is
+//! missing returns [`Error::UnsupportedCapability`]; the rest of the API keeps
+//! working. See the [`capabilities`] module.
+//!
+//! ## Further modules
+//!
+//! - [`routing`]: a source that redirects its receivers to another source.
+//! - [`discovery`]: registration with, and listing of, an NDI Discovery Server.
+//! - [`utilities`] and [`video_conversion`]: checked audio and video
+//!   conversions.
+//! - `advanced` (Cargo feature `advanced`): NDI Advanced SDK operations.
+//! - `file` (Cargo feature `file-io`): recording and playback through the NDI
+//!   File API.
 //!
 //! # Thread Safety
 //!
@@ -94,36 +137,24 @@
 //!
 //! Note: Only video supports async sending in the NDI SDK. Audio and metadata are always synchronous.
 //!
-//! # Performance
-//!
-//! - **Borrowed receive buffers**: Read SDK-owned frames without wrapper pixel copies
-//! - **Async completion**: Owned frames are recovered after SDK synchronization
-//! - **Bandwidth control**: Multiple quality levels for different use cases
-//! - **SDK processing**: Encoding and acceleration depend on the installed NDI SDK
-//!
 //! # Runtime and platform support
 //!
-//! Building this crate needs no NDI SDK. Desktop platforms and Android load the
-//! NDI runtime library when the first [`NDI`] handle is created, searching next
-//! to the executable, then `NDI_RUNTIME_DIR_V6`, then the platform loader's own
-//! path; see the [`runtime`] module. One successfully loaded module stays
-//! selected for the process, and [`RuntimeOptions`] can name an exact library
-//! or SDK edition before that first load. [`NDI::new`] preserves normal
-//! initialize/destroy cycles.
-//!
-//! Functions a runtime does not export never prevent the rest of the API from
-//! working: [`NDI::capabilities`] reports each optional capability, without
-//! assuming hardware or license availability, and the affected operations
-//! return [`Error::UnsupportedCapability`].
+//! Desktop platforms and Android load the NDI runtime library when a runtime
+//! is selected, searching next to the executable, then `NDI_RUNTIME_DIR_V6`,
+//! then the platform loader's own path; see the [`runtime`] module. A library
+//! that cannot be found is reported as [`Error::RuntimeLoadFailed`]. The
+//! selected library stays selected, and loaded, for the life of the process,
+//! and [`RuntimeOptions`] can name an exact library or SDK edition for that
+//! selection. NDI itself starts and stops with the [`NDI`] handles.
 //!
 //! The `advanced` and `file-io` features add optional APIs. The Advanced
 //! wrappers need the Advanced SDK headers at build time (`NDI_SDK_DIR` or a
 //! default installation); without them the same API compiles and reports that
-//! it is unavailable. `advanced_sdk` remains a no-op compatibility flag.
+//! it is unavailable.
 //!
-//! Apple mobile targets link the vendor's static archive instead, selected from
-//! `NDI_SDK_DIR` at build time, with the File archive as the sole provider when
-//! it embeds the NDI core.
+//! iOS, tvOS and visionOS targets link the vendor's static archive instead,
+//! selected from `NDI_SDK_DIR` at build time, with the File archive as the
+//! sole provider when it embeds the NDI core.
 
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]

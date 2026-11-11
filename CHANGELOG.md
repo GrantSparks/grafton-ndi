@@ -6,109 +6,143 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Entries and examples describe the API of their named release. For the current
-API, see the [README](README.md) and [2.0 migration guide](docs/migration/1.x-to-2.0.md).
+API, see the [README](README.md) and the migration guides for
+[2.0](docs/migration/1.x-to-2.0.md) and [3.0](docs/migration/2.0-to-3.0.md).
 
-## [Unreleased]
+## [3.0.0] - Unreleased
 
-This SDK integration preserves existing 2.x APIs, defaults and the Rust 1.88
-minimum. The package remains 2.0.1 until a separate release-version decision.
-The compatibility target remains NDI 6.x; local assessment evidence includes
-Standard 6.3.2/6.4 and Advanced 6.4 on Linux x86_64. NDI 6.0 and 6.1.1 were not
-revalidated, and are not newly declared unsupported.
+Version 3.0.0 loads the NDI library when the program selects a runtime instead
+of linking it when the program is built. Building the crate no longer needs an
+NDI SDK. Three public signatures changed and one Cargo feature was removed;
+see the [2.0 to 3.0 migration guide](docs/migration/2.0-to-3.0.md).
+
+The compatibility target remains NDI 6.x and Rust 1.88. The test suite was run
+on Linux x86_64 against the Standard 6.3.2, Standard 6.4.0.2 and Advanced
+6.4.0.2 runtimes. Windows, macOS, Android and iOS targets were compiled and
+linted only. NDI 6.0 and 6.1.1 were not tested. See
+[SDK validation](docs/sdk-validation.md).
+
+### Breaking Changes
+
+- The NDI library is loaded at run time. A program whose NDI library is
+  missing now starts, and `NDI::new` returns `Error::RuntimeLoadFailed` naming
+  every location tried and the reason for each. In 2.0 such a program did not
+  start.
+- `SourceCache::find_by_host` takes the `NDI` handle as its first argument. The
+  cache no longer starts NDI by itself.
+- `NDI::is_supported_cpu` is removed. Use `Runtime::is_supported_cpu` on a
+  selected runtime, or `ndi.runtime().is_supported_cpu()`.
+- `NDI::version` is removed. Use `ndi.info().raw_version()`, or
+  `Runtime::select(..)?.info().raw_version()` before NDI is started.
+- The `advanced_sdk` Cargo feature, which had no effect, is removed.
+- A runtime that does not start because the CPU lacks instructions it needs is
+  reported as `Error::UnsupportedCpu` instead of `Error::InitializationFailed`.
 
 ### Added
 
-- NDI 6.4 planar `NA48`, `NB48`, `NA4G` and `NB4G` video, `Best444`, video-only
-  receive bandwidth, independent audio/video delay controls and SDK timestamps.
-  Extended-format frame builders retain proof from a compatible runtime through
-  `build_for(&ndi)`; existing formats keep their runtime-independent builders.
-- Standard source routing, Discovery Server advertisers/listeners, owned event
-  snapshots and subscriptions, explicit remote connection control, receiver
-  information/control helpers, and sender metadata capture with matching frees.
-- Checked interleaved audio conversion/sending and V210/P216 video conversion.
-- Optional `advanced` APIs for retained JSON configuration, compressed/packet and
-  scatter streams, bounded native completion queues, custom receive allocators,
-  AVSync, Genlock, encoder/keyframe controls and explicit KVM sessions.
-  Allocator callbacks require the irreversible `NDI::process_lifetime()` opt-in;
-  ordinary applications keep reference-counted native teardown.
-- Optional `file-io` recording and playback with owned events, finalization state,
-  and executor-independent async owners. Recorder timeouts retain state; drop
-  does not certify that a recording was finalized.
-- Explicit Apple mobile static profiles and a Linux artifact inventory. Supported
-  release profiles require SDK/toolchain inputs obtainable and testable on
-  GitHub-hosted runners; 19 vendor BSP profiles remain unsupported candidates.
-  Public Debian armhf build/link checks cover the four RPi GNU profiles at a
-  glibc 2.36 build floor, without claiming glibc 2.17 or board qualification.
-  File static archives supply the sole core provider when selected. Target
-  availability also requires a supplied SDK slice and usable Rust target; build,
-  emulation and physical-device evidence remain separate.
-- A reviewed SDK API registry, generated capability requirements, independent
-  C/Rust ABI probes and SDK comparison/classification tools for future upgrades.
-  The development store verifies retained archives and extracted installations;
-  future SDK retention is prospective and does not require historical collection.
+- Runtime selection in two explicit steps. `Runtime::select` loads the NDI
+  library and pins it for the process without starting NDI;
+  `Runtime::initialize` starts NDI and returns an `NDI` handle. `NDI::new` and
+  `NDI::with_options` do both, and `NDI::runtime` returns the selected runtime.
+  `RuntimeOptions` chooses an exact library path or an SDK edition.
+- `Runtime::info` and `NDI::info` return a `RuntimeInfo` with the loaded
+  library's path, edition, linkage and version.
+- Capability queries in the new `capabilities` module. `capabilities()` reports
+  each `RuntimeFeature` as available or gives the reason it is not, and
+  `require_feature` returns that reason as an error. Both are on `Runtime` and
+  on `NDI`.
+- `Error::RuntimeLoadFailed`, `Error::RuntimeConflict`,
+  `Error::UnsupportedCpu`, `Error::UnsupportedCapability`,
+  `Error::RuntimeRequired` and `Error::NativeOperationFailed`.
+- `Rejected<T>`, the error of an operation that takes ownership of a value and
+  hands it back when it fails.
+- NDI 6.4 media support: the planar 4:4:4 formats `NA48`, `NB48`, `NA4G` and
+  `NB4G`, `ReceiverColorFormat::Best444`, and the
+  `ReceiverBandwidth::VideoOnlyLowest` and `VideoOnlyHighest` modes. Frames in
+  the new formats are built with `build_for(&ndi)` and keep that runtime alive.
+- Receiver controls: independent video and audio delay
+  (`set_video_delay`, `set_audio_delay` and their getters), connection
+  metadata, `web_control_url`, `poll_source_name_change`, `poll_event`,
+  `connect_to` and `disconnect`.
+- `Sender::capture_metadata` for metadata sent back by connected receivers,
+  and `Sender::send_audio_interleaved_i16`, `_i32` and `_f32`.
+- `NDI::timestamp`, the SDK's current timestamp as an `SdkTimestamp`.
+- The `utilities` module: `AudioConverter` converts between planar and
+  interleaved audio with explicit reference levels.
+- The `video_conversion` module: `VideoConverter` converts between V210 and
+  P216.
+- The `routing` module: a `Router` is a source that redirects its receivers to
+  another source.
+- The `discovery` module for NDI Discovery Servers. `SendAdvertiser` and
+  `RecvAdvertiser` register senders and receivers; `SendListener` and
+  `RecvListener` return owned snapshots and events and can request a receiver
+  connection. These need NDI 6.4.0 or later, because earlier runtimes can crash
+  when the objects are destroyed. An advertiser keeps its registered senders
+  and receivers alive until they are unregistered or it is dropped. Text from
+  the network is decoded lossily, and the identifier types `SenderId`,
+  `ReceiverId` and `InputGroupId` keep the server's exact bytes.
+- The optional `advanced` feature and module for the NDI Advanced SDK: JSON
+  configuration of senders, receivers, finders, routers, advertisers and
+  listeners (`AdvancedConfig`), compressed and scatter sending
+  (`CompressedSender`), compressed reception (`PacketReceiver`), queued sending
+  with completion (`QueuedSender`), custom receive allocators
+  (`AllocatorService`), `AvSync`, `Genlock`, encoder and keyframe controls, and
+  `KvmSession`. The declarations of the Advanced-only headers are generated on
+  the build machine from an installed Advanced SDK. Without one the same API
+  compiles and every native operation returns `Error::UnsupportedCapability`.
+  See the [Advanced SDK guide](docs/advanced.md).
+- `NDI::process_lifetime`, an explicit opt-in that keeps NDI started until the
+  process exits. Custom receive allocators require it.
+- The optional `file-io` feature and `file` module for the NDI File library:
+  `FileApi::open` finds the library, `FileRecorder` records a source to disk
+  with an explicit report of whether the file was finalized, `FilePlayer`
+  plays a recording as an NDI source, and `AsyncFileRecorder` and
+  `AsyncFilePlayer` offer the same operations as futures for any executor. See
+  the [File API guide](docs/file-io.md).
+- iOS, tvOS and visionOS targets, which link the static archive from the NDI
+  SDK for Apple named by `NDI_SDK_DIR`.
+- `NDI_SDK_EDITION` (`standard` or `advanced`) to set the edition a build
+  searches for by default.
+- Examples for runtime selection, routing, the Discovery Server, the File API
+  and each Advanced SDK capability.
 
 ### Changed
 
-- Route existing and optional native calls through one selected implementation.
-  Shared runtimes load explicitly, remain pinned, and validate symbol provenance;
-  successful module selection is immutable while normal initialization can tear
-  down and restart. Load failures are retryable and missing optional APIs return
-  capability diagnostics without disabling existing calls.
-- Expose `RuntimeOptions`, runtime identity/version/capability queries and a
-  diagnostic-preserving CPU query. Runtime path/edition selection is independent
-  of Cargo API features. The legacy `advanced_sdk` feature remains a no-op.
-- Preserve existing API availability with older headers, including all-feature
-  builds with Standard headers. Advanced native calls require authorized local
-  Advanced ABI generation and matching runtime operations. A Cargo feature or
-  exported symbol does not establish hardware support or license entitlement.
-- Define representative hosted validation in 16 SDK jobs with 52 individual
-  checks: full runtime suites on Linux x64, Windows x64 and macOS ARM64; current
-  Standard/Advanced ABI/link or packaging for all 20 supported profiles; sampled
-  compatibility, MSRV and mobile execution. Related checks reuse verified SDK
-  installations within a job while retaining separate results. The broader
-  82-check audit remains available on demand. Workflow definitions alone do not
-  establish successful execution.
-- Run the 39 SDK-dependent core tests through explicit desktop confinement in
-  native, compatibility and feature checks. Ordinary CI tests use an unavailable
-  default runtime path; SDK resource compile contracts remain uncalled. macOS
-  native execution requires per-operation boundary, cleanup and recovery evidence,
-  and public runtime identities contain only validated structured fields.
+- Building for Windows, macOS, Linux and Android needs no NDI SDK, no
+  `libclang` and no bindgen: the bindings are generated from the SDK headers
+  ahead of time and are part of the crate. The documentation builds without an
+  SDK, and the crate's `documentation` link points to docs.rs.
+- The library is searched for next to the executable, then in the directory
+  named by `NDI_RUNTIME_DIR_V6`, then by the operating system's loader.
+- The selected library stays loaded until the process exits. `NDI` handles
+  still start and stop the SDK by reference count.
+- The default SDK edition comes from `NDI_SDK_EDITION`, otherwise from an NDI
+  SDK found on the build machine, otherwise it is Standard. The edition of the
+  loaded library is detected from the functions it exports, and an Advanced
+  runtime meets a request for the Standard edition.
+- `NDI_SDK_DIR` is read only to choose the default edition, to find the
+  Advanced SDK headers for the `advanced` feature, and to find the static
+  archive for Apple mobile targets. When it is set it must name an SDK
+  installation.
+- Tests that need an NDI runtime run under plain `cargo test` when one can be
+  loaded and are otherwise skipped with a message. `GRAFTON_NDI_REQUIRE_RUNTIME`
+  turns those skips into failures.
+- The published package contains only the sources, examples, build scripts,
+  README, changelog and license. `Cargo.lock` is tracked in the repository.
+- `Debug` for `NDI` prints `NDI { .. }`.
 
 ### Fixed
 
-- Recognize Advanced Windows/macOS artifacts and Windows-hosted Android installer
-  directory casing. Validate explicit target profiles and actual static archive
-  exports before generating linked symbol references.
-- Retain advertised sender/receiver resources through registration lifetimes,
-  preserve async-send storage until SDK completion, and keep callback generation
-  ownership through allocator replacement/reset and delayed native frees.
-- Preserve legacy owned `UnwindSafe` contracts after moving receiver ownership
-  behind shared internal state, with compile-time regression coverage.
+- An unchanged Cargo invocation no longer rebuilds the crate and the crates
+  that depend on it. In 2.0.0 the build script's own generated file was one of
+  its inputs (#121).
 
-### Current limitations
+### Removed
 
-- `FileRecorder::native_source()` and `native_current_file()` remain unavailable
-  until their native pointer lifetimes have a safe copy boundary. The owned
-  request/event alternatives have explicitly different semantics; complete safe
-  File getter coverage is not claimed.
-- Required runtime coverage is representative; additional profiles have explicit
-  ABI/link or packaging coverage, and physical-device qualification remains
-  separate. Only the exact revision's completed aggregate establishes release
-  acceptance. Vendor BSP candidates lacking obtainable hosted toolchains are
-  outside the supported release matrix. Missing ARM64 Apple simulator
-  slices and the absent x86 visionOS Rust target are not claimed as supported
-  combinations. See [SDK validation](docs/sdk-validation.md),
-  [Advanced integration](docs/advanced.md) and [File I/O](docs/file-io.md).
-
-
-## [2.0.1] - 2026-11-10
-
-### Fixed
-
-- Stop rebuilding grafton-ndi and dependent crates on unchanged Cargo invocations
-  by excluding the generated bindgen wrapper from build-script inputs. SDK headers
-  and `NDI_SDK_DIR` changes still trigger binding regeneration (#121).
-- Check repeated builds and test compilation in CI to catch unnecessary rebuilds.
+- The build-time dependency on bindgen for the default feature set. The
+  `LIBCLANG_PATH`, `CLANG_PATH`, `BINDGEN_EXTRA_CLANG_ARGS` and `SDKROOT`
+  variables are no longer inputs of this crate's build script.
+- The API documentation hosted on GitHub Pages. The reference is on docs.rs.
 
 ## [2.0.0] - 2026-10-16
 

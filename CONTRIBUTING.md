@@ -6,41 +6,75 @@ the ownership and memory-layout guarantees around the SDK calls.
 
 ## Local setup
 
-Install NDI SDK 6, its runtime libraries, and a C toolchain with a discoverable
-`libclang` shared library. See the [README prerequisites](README.md#prerequisites)
-for platform paths, `NDI_SDK_DIR`, `LIBCLANG_PATH`, and runtime library discovery.
-Building generates bindings from your installed SDK; the repository does not
-contain a standalone replacement for that installation.
+Building, linting and documenting the crate need only a Rust toolchain. No NDI
+SDK, `libclang` or bindgen is involved: the bindings in `src/sys` are checked in.
 
 Use current stable Rust for development. [rust-toolchain.toml](rust-toolchain.toml)
 selects stable with `clippy`, `rustfmt`, and `rust-src`. The library's minimum Rust
 version is 1.88; development dependencies and compiler-diagnostic fixtures use
-current stable. Required CI checks Rust 1.88 on representative Linux x64 SDK
-versions and the baseline Android ARM64 SDK, and uses nightly for formatting.
-Additional Apple targets use the toolchain specified by their profile; that does not raise the crate-wide MSRV. Run results,
-not workflow definitions, establish validation.
+current stable.
 
 Start with:
 
 ```bash
 cargo build
-cargo test --lib
+cargo test
 cargo run --example NDIlib_Find
 ```
 
-The discovery example needs a working NDI runtime and network environment.
-Ordinary `cargo test` skips the 39 registered SDK-dependent core tests; their
-runtime evidence comes from the confined runner described below. Run manual
-device tests that advertise or receive synthetic sources on an appropriate
-isolated test network. The [development SDK store](ci/sdk-store.md) provides
-verified side-by-side installations. Keep vendor archives, generated bindings and
-SDK inspection output outside the source checkout.
+`cargo test` passes without an NDI runtime: the tests that need one print
+`skipped: <test> needs an NDI runtime` and return. The discovery example needs
+a runtime and a network.
+
+### Getting a runtime for the real tests
+
+Install an [NDI SDK](https://ndi.video/for-developers/ndi-sdk/) and tell the
+crate where its runtime library is. On Linux x86_64, for example:
+
+```bash
+export NDI_RUNTIME_DIR_V6="/usr/share/NDI SDK for Linux/lib/x86_64-linux-gnu"
+cargo test --all-features
+```
+
+`ci/sdk.py` unpacks a downloaded SDK archive into a directory of your choice
+without running the vendor's installer, after checking it against a pinned
+hash, and prints the two variables to export:
+
+```bash
+python ci/sdk.py install current-standard-linux --dest ~/ndi/standard-6.4 \
+    --archive ~/Downloads/Install_NDI_SDK_v6_Linux.tar.gz --target x86_64-unknown-linux-gnu
+```
+
+`python ci/sdk.py list` names the packages it knows. See the
+[CI guide](ci/README.md#sdk-packages).
+
+The [README](README.md#finding-the-runtime) describes the full search order.
+Tests against a real runtime create senders, receivers and finders, which
+announce themselves on the local network. Run them on a network where that is
+acceptable.
+
+Three more things are optional and unlock more tests:
+
+- An NDI **Advanced SDK**. Set `NDI_SDK_DIR` to its root at build time so the
+  `advanced` feature can generate its declarations (this needs `libclang`), and
+  point `NDI_RUNTIME_DIR_V6` at its runtime directory.
+- The NDI **File library**, for the `file-io` tests. The SDK installs it beside
+  the runtime library. On Linux and macOS it works only with the Advanced SDK
+  runtime.
+- The SDK's **`ndi-discovery-server`** program, for the end-to-end Discovery
+  Server test. The test looks for it in the SDK that the selected runtime
+  library belongs to, at `bin/<target>/ndi-discovery-server` beside
+  `lib/<target>/`.
+
+Keep SDK archives, SDK headers and SDK documentation outside the source
+checkout.
 
 ## Where changes belong
 
 | Files | Responsibility |
 | --- | --- |
-| `src/runtime.rs`, `src/dispatch.rs`, `src/capabilities.rs` | Runtime selection, one retained native provider, initialization leases, typed dispatch and capability evidence |
+| `src/runtime.rs`, `src/capabilities.rs` | Runtime selection, initialization by reference count, capability queries |
+| `src/sys/` | The private native boundary: generated bindings, typed function tables, the loader that fills them |
 | `src/finder.rs` | Source discovery, owned descriptors, address parsing, and lookup cache |
 | `src/receiver.rs` | Receiver configuration, capture views, reconnect synchronization, status, and controls |
 | `src/capture.rs`, `src/recv_guard.rs` | Private SDK capture/free strategies and guards that keep buffers tied to their owners |
@@ -48,14 +82,14 @@ SDK inspection output outside the source checkout.
 | `src/framesync.rs` | Clock-corrected pull capture and receiver ownership boundaries |
 | `src/sender.rs` | Synchronous sends, owned async video pipeline, copied submissions, and completion handlers |
 | `src/async_runtime.rs` | Tokio/smol blocking adapters, deadlines, task errors, and cancellation |
-| `src/routing.rs`, `src/discovery/` | Routing, retained advertisements, listener snapshots and events |
-| `src/advanced/` | Optional configuration, packets, queues, allocators, synchronization and KVM |
-| `src/file/` | Optional thread-affine File owners, owned events, finalization and async commands |
-| `src/utilities.rs`, `src/video_conversion.rs`, `src/timestamp.rs` | Checked SDK audio/video conversions and distinct SDK timestamps |
-| `src/ndi_lib.rs` | Private generated ABI declarations and existing-call dispatch forwarding |
-| `build.rs`, `build_support.rs`, `build_apple.rs`, `build_profiles.tsv` | SDK discovery, target/artifact selection, ABI checks and static export verification |
-| `api/`, `tools/sdk/` | Reviewed SDK coverage/capability metadata and independent target ABI probes |
-| `ci/` | Hosted validation policy, verified SDK provisioning and development store |
+| `src/routing.rs`, `src/discovery/` | Routing sources, Discovery Server advertisers and listeners |
+| `src/advanced/` | Optional Advanced SDK configuration, packets, queues, allocators, synchronization and KVM |
+| `src/file/` | Optional File API recording and playback |
+| `src/rejected.rs` | `Rejected<T>`, the error that hands a consumed value back |
+| `src/utilities.rs`, `src/video_conversion.rs`, `src/timestamp.rs` | Checked SDK audio/video conversions and SDK timestamps |
+| `build.rs`, `build_support.rs`, `build_apple.rs` | Default edition, Advanced declarations for the `advanced` feature, static linking for Apple mobile targets |
+| `xtask/` | The generator for the checked-in bindings |
+| `.github/workflows/`, `ci/` | The CI and release workflows and their scripts; see the [CI guide](ci/README.md) |
 | `examples/`, `tests/` | Application workflows, SDK regressions, and public compile contracts |
 
 Keep shared behavior in its existing implementation. For example, owned and
@@ -67,6 +101,96 @@ separate receive, send, and FrameSync calculations.
 SDK routing and free strategies are private. New generic APIs should not expose
 raw handles or SDK structures merely to reuse an internal implementation.
 
+## Native functions and bindings
+
+Nothing outside `src/sys` converts an address into a function pointer or looks a
+symbol up by name. Every native call goes through a table defined with the
+`native_table!` macro:
+
+- The macro checks each signature at compile time against the generated
+  declaration of the same name, so a table cannot drift from the SDK header.
+- A table is resolved once, when the runtime is selected, and it resolves
+  completely or not at all. A wrapper that holds a table can call every function
+  in it.
+- `Core` in `src/sys/api.rs` holds the functions every supported NDI 6 runtime
+  exports. A library that lacks one of them is rejected when it is loaded. Every
+  other table is one optional capability.
+
+### Adding a native function
+
+1. Find its declaration in `src/sys/declarations.rs`. If it is not there, the
+   bindings predate the SDK version that added it; see
+   [Regenerating the bindings](#regenerating-the-bindings).
+2. Add it to a table in `src/sys/api.rs`. Put it in an existing table only when
+   it belongs to that table's capability and every runtime that exports the
+   table's other functions also exports this one. Otherwise add an entry to the
+   `optional_tables!` invocation. One entry states the table, the field that
+   holds it and the `RuntimeFeature` it is gated and reported under, followed
+   by its functions:
+
+   ```text
+   /// Source routing.
+   struct Routing in routing: Routing {
+       fn NDIlib_routing_create(p_create_settings: *const NDIlib_routing_create_t) -> NDIlib_routing_instance_t;
+       ...
+   }
+   ```
+
+   Do not add to `Core` unless every supported runtime exports the function.
+3. A new capability needs its `RuntimeFeature` variant in
+   `src/capabilities.rs`. Give it a minimum version there only when the
+   exported functions are not evidence enough.
+4. Call the function from a wrapper that obtained the table with
+   `ndi.table::<sys::Routing>()?`. That accessor is the only way to reach an
+   optional table, and it applies the capability's gate. `src/routing.rs`
+   shows the pattern. The wrapper keeps the `NDI` handle for as long as its
+   native object exists.
+
+A test fails when a declared function is unclassified:
+`every_declared_function_is_in_one_table_or_explicitly_unwrapped` in
+`src/sys/coverage_tests.rs`. A function the crate deliberately does not call
+goes into that file's `UNWRAPPED` list with the reason.
+
+Functions of the File library go in the `native_table!` tables of
+`src/sys/file.rs`.
+
+Functions that only the Advanced SDK headers declare go in the
+`advanced_tables!` invocation in `src/sys/advanced.rs`. Those headers may not be
+redistributed, so their declarations are generated into `OUT_DIR` on machines
+that have an Advanced SDK and are never checked in. Code that uses them is
+written inside `native!(table => ...)`, which compiles the body only when the
+declarations exist. The Advanced coverage test in
+`src/sys/advanced_coverage_tests.rs` runs only in such a build, so lint and test
+Advanced changes with `NDI_SDK_DIR` naming an Advanced SDK.
+
+### Regenerating the bindings
+
+`src/sys/bindings.rs` (types and constants) and `src/sys/declarations.rs`
+(functions) are generated. Never edit them by hand. Regenerate them when
+adopting a newer SDK:
+
+```bash
+cargo xtask bindgen --sdk "/path/to/NDI SDK for Linux"
+```
+
+The generator needs `libclang` and `rustfmt`, and an SDK whose headers include
+the File API header (NDI 6.4 or later). It reads only headers that carry the
+MIT permission notice, and it generates for eleven targets and requires the
+output to be the same for all of them, so one pair of files serves every
+platform. The files are written already formatted, so `cargo fmt` and `rustfmt`
+leave them unchanged. The first lines of each file name the SDK version they
+came from.
+
+To verify that the checked-in files match an SDK without changing them:
+
+```bash
+cargo xtask bindgen --check --sdk "/path/to/NDI SDK for Linux"
+```
+
+Run the check after regenerating and whenever `xtask/` changes. After a
+regeneration, the coverage test names every new function that needs a table or
+an `UNWRAPPED` entry.
+
 ## Safety and SDK contracts
 
 For changes touching FFI, cite the applicable installed SDK header or
@@ -75,25 +199,23 @@ PR and explain the specific contract the code relies on. Put the lasting safety
 argument beside the unsafe operation. State which allocation owns each pointer,
 how its length and alignment are established, and which synchronization or free
 operation ends SDK access. Reference header names and summarize the contract
-without copying restricted vendor source into public review material. Generated
-Advanced declarations stay in `OUT_DIR`; curated ABI declarations need recorded
-redistribution provenance and retained notices.
+without copying vendor source or documentation into the repository.
 
 The important project invariants are:
 
-- A live SDK resource retains its native provider and initialization lease.
-  Normal `NDI` acquisition/destruction follows the production reference-counting
-  state machine. Shared module pinning is separate from keeping NDI initialized;
-  permanent initialization requires the explicit `ProcessLifetimeRuntime` opt-in.
-- Existing and optional calls use the same selected core module. Validate complete
-  create/destroy/free groups before creating a resource. Never reinterpret a short
-  older SDK function table as a newer layout. Audit actual executable imports;
-  unused generated extern declarations alone are not dynamic imports.
-- Installed headers, compiled ABI, resolved symbols, version-gated enum semantics,
-  edition evidence and hardware/license availability are separate facts. New frame
-  formats retain their runtime proof; a Cargo feature must not bypass this check.
-  Older headers still expose stable Rust API shapes with explicit unavailability
-  where a native ABI cannot be compiled.
+- A live SDK resource keeps an `NDI` handle, which keeps the runtime
+  initialized. Normal `NDI` acquisition and destruction follow reference
+  counting. Keeping the library loaded is separate from keeping NDI
+  initialized; permanent initialization requires the explicit
+  `ProcessLifetimeRuntime` opt-in.
+- Every call uses the one library selected for the process. A wrapper takes its
+  table before it creates a native object, so a create function is never called
+  without its matching destroy and free functions.
+- What a runtime exports, what its version implies, its edition, and hardware or
+  license availability are separate facts. New frame formats keep the runtime
+  that proved them; a Cargo feature must not bypass this check.
+- The `advanced` API has the same shape with and without the Advanced SDK
+  headers. An operation that cannot run reports `UnsupportedCapability`.
 - Frame layout fields stay private. Checked dimensions, plane sizes, strides,
   and metadata bounds must remain valid after every safe mutation. Follow the
   [SDK frame layouts](https://docs.ndi.video/all/developing-with-ndi/sdk/frame-types),
@@ -125,6 +247,8 @@ The important project invariants are:
 - Dropping an async future only suppresses work before its cancellation gate.
   A task that passed the gate can still enter SDK code after the future is gone;
   an SDK call cannot be interrupted by dropping the future.
+- An operation that takes ownership of a caller's object returns that object
+  when it fails.
 
 Do not test invalid pointers by dereferencing them. Construct malformed
 *descriptors* over allocations that satisfy the tested unsafe preconditions, or
@@ -147,128 +271,134 @@ would fail for the original behavior. Useful evidence depends on the change:
   boundaries, and matching SDK free operations.
 - Async changes: blocking-pool queue delay, reconnect-lock contention,
   zero-timeout calls, cancellation before and after work starts, and task panics.
-- Build changes: target/artifact selection, actual static exports, rejected ABI
-  mismatches, missing optional libraries and mixed header/runtime versions. A Rust
-  loader build does not prove the vendor C link interface; test both where required.
+- Loader and capability changes: the search order, a library that is rejected,
+  a second selection, missing optional functions, and both sides of a version
+  gate.
+- Build changes: the default edition, a missing or invalid `NDI_SDK_DIR`, and
+  static archive selection for Apple mobile targets.
 - Callback changes: immediate/delayed, concurrent, out-of-order and duplicate
   completion, allocator replacement/reset, late free, panic containment and budgets.
-- File changes: source/path ownership, finalization evidence, timeout retention,
-  automatic stop/rollover, event loss and owner-thread destruction. Do not replace
-  the two unavailable recorder pointer getters with an unproven borrowed slice.
-- SDK upgrades: reviewed declaration/export changes, independent production-ABI
-  comparisons, same-major enum gates and generated capability-registry drift.
+
+### Tests that need native code
+
+A test that needs a real NDI runtime is not marked `#[ignore]`. It asks for the
+runtime first and returns when there is none:
+
+```rust
+#[test]
+fn sender_reports_its_source() {
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
+    // The test body runs only where a runtime could be loaded.
+    let options = grafton_ndi::SenderOptions::builder("test sender").build();
+    let sender = grafton_ndi::Sender::new(&ndi, &options).unwrap();
+    assert!(!sender.source().unwrap().name.is_empty());
+}
+```
+
+The helpers live in `src/test_support.rs`. Unit tests use them as
+`crate::test_support`, and integration tests through `mod common;`:
+
+| Helper | Returns `None`, and reports a skip, when |
+| --- | --- |
+| `ndi()` | no NDI runtime library can be loaded |
+| `advanced_ndi()` | the runtime is not an Advanced SDK runtime, or the build lacks the Advanced SDK declarations |
+| `skip(Requirement::…, reason)` | called directly by a test that found another requirement unmet, such as the File library or the Discovery Server |
+
+A skip is printed to standard error as `skipped: <test> needs <requirement>`,
+with the reason on first use. `#[ignore]` is kept for manual benchmarks and slow
+stress tests only. A test that needs a fixture creates it.
+
+`GRAFTON_NDI_REQUIRE_RUNTIME` turns skips into failures. Its value is a
+comma-separated list of what the environment provides: `1` for any runtime,
+`advanced`, `file`, and `discovery-server`. An environment that sets
+`GRAFTON_NDI_REQUIRE_RUNTIME=advanced` fails every test that would have skipped
+for lack of an Advanced runtime, so a run that was meant to cover the Advanced
+paths cannot pass without them. An entry that is not one of the four is
+rejected when a skip consults it. An entry that no test in the build can check
+fails the run as well, for example `advanced` without the `advanced` feature,
+because such a promise could never be broken.
+
+The NDI runtime reserves every sender and receiver name machine-wide with a
+lock file in `TMPDIR`, named `NTK_SEND_<sender name>` or `NTK_RECV_<receiver
+name>`. Two test runs that share a temporary directory can therefore fail each
+other. Give each run its own `TMPDIR`, or use the loopback-only runner
+described under [Continuous integration](#continuous-integration), which does.
+
+The loader, ownership, Discovery Server and File-library scenarios in
+`tests/runtime_loading.rs`, `tests/runtime_shadowing.rs`,
+`tests/extended_lifetimes.rs`, `tests/discovery.rs` and
+`tests/file_loading.rs` need no SDK. They are Linux-only: they compile a fake
+NDI runtime from `tests/support/fake_runtime.rs` with `rustc` when they run, and
+`tests/runtime_loading.rs` also calls `readelf`. Add a variant to the fake
+runtime when a loader or capability change needs a library that behaves in a
+particular way.
+
+### Checks before review
 
 For a focused Rust change, the usual starting checks are:
 
 ```bash
-cargo test --lib
-cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --all-features
 ```
-
-CI's formatting job uses `cargo +nightly fmt --all -- --check`. Use that command
-when reproducing a formatting difference; the ordinary local command follows
-the checked-in stable toolchain.
 
 Before requesting review of changes spanning public APIs or feature gates, run
-the broader checks used by [CI](.github/workflows/rust.yml):
+the feature combinations separately. A feature that compiles only together with
+another one is a defect:
 
 ```bash
-cargo test --all-features
-cargo build --examples
+cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --no-default-features -- -D warnings
+cargo clippy --all-targets --no-default-features --features advanced -- -D warnings
+cargo clippy --all-targets --no-default-features --features file-io -- -D warnings
 cargo build --examples --all-features
-cargo test --examples
-cargo test --examples --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-```
-
-These ordinary Cargo commands run pure tests, fake-SDK loader contracts and
-runnable doctests. They do not replace the opt-in native core, regression,
-Advanced or File suites. CI points ordinary tests' default runtime resolver at a
-fresh empty private directory, preventing accidental default-SDK loads; explicit
-fake-module fixtures still choose their own paths. The example test command also
-exercises the PCM conversion regressions in `NDIlib_Recv_Audio_16bpp.rs`.
-
-For optional-feature changes, also exercise the independent configurations.
-Building examples explicitly is important: library tests alone do not establish
-that application workflows still compile.
-
-```bash
 cargo test --no-default-features
-cargo build --examples --no-default-features
-cargo test --examples --no-default-features
-cargo test --no-default-features --features tokio
-cargo build --examples --no-default-features --features tokio
-cargo test --examples --no-default-features --features tokio
-cargo test --no-default-features --features smol
-cargo build --examples --no-default-features --features smol
-cargo test --examples --no-default-features --features smol
-cargo test --no-default-features --features tokio,smol
-cargo build --examples --no-default-features --features tokio,smol
-cargo test --examples --no-default-features --features tokio,smol
-cargo check --no-default-features --features advanced_sdk
+cargo test -p xtask
 ```
 
-The PNG example is skipped without `image-encoding`. `advanced_sdk` remains a
-no-op; `advanced` and `file-io` are separate opt-ins. Check their builds both with
-Standard headers and with the authorized SDK supplying the native API. An
-all-feature Standard build exercises unavailable-ABI behavior; it does not prove
-Advanced or File runtime operation. Features never select the runtime edition.
-
-The confined runner executes all 39 core tests individually on native and
-compatibility checks, and repeats them for each of the nine feature selections
-in feature checks. Add SDK-dependent tests to [the core registry](ci/core_tests.py)
-and mark them with its ignore reason. A native test must require a successful
-runtime initialization rather than treating a missing SDK as a passing test.
-
-For example, with a Standard Linux x64 SDK and working unprivileged `bwrap`
-network namespaces:
+A build without the Advanced SDK headers compiles none of the `advanced`
+module's native code and relaxes the unused-code lints for it. Changes under
+`src/advanced/` or `src/sys/advanced.rs` must therefore also be linted and
+tested with the headers present:
 
 ```bash
-export NDI_SDK_DIR='/path/to/NDI SDK for Linux'
-export NDI_SDK_PROFILE='x86_64-linux-gnu'
-export NDI_SDK_EDITION='standard'
+export NDI_SDK_DIR="/path/to/NDI Advanced SDK for Linux"
 export NDI_RUNTIME_DIR_V6="$NDI_SDK_DIR/lib/x86_64-linux-gnu"
-export NDI_EXPECTED_RUNTIME="$NDI_RUNTIME_DIR_V6/libndi.so"
-export CARGO_TARGET_DIR='/path/to/private/target'
-cargo generate-lockfile
-python ci/native.py --mode core --feature-set all --target x86_64-unknown-linux-gnu --output /path/to/private/core-results
-python ci/native.py --mode regressions --target x86_64-unknown-linux-gnu --output /path/to/private/regression-results
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+GRAFTON_NDI_REQUIRE_RUNTIME=advanced cargo test --all-features
 ```
 
-Use fresh output directories. `--feature-set 0` through `8` selects the exact
-ordered configurations in [FEATURE_SETS](ci/common.py), with default features
-disabled; `all` selects all features. Windows requires elevated PowerShell and
-Windows Defender Firewall control. The macOS executor is restricted to disposable
-GitHub-hosted runners; do not invoke it on a development Mac. Native raw logs stay
-private. See the [CI guide](ci/README.md) for boundary checks and evidence limits.
-
-Run the normally ignored Advanced/File suites using their documented fixtures and
-confinement, and record the selected header SDK and actual loaded runtime separately:
-[Advanced guide](docs/advanced.md), [File guide](docs/file-io.md), and
-[validation policy](ci/README.md).
-
-For sender lifetime/synchronization changes, run the confined `regressions` mode;
-it includes the owned async pipeline and repeated sender lifecycle tests.
+The PNG example is skipped without `image-encoding`. `advanced` and `file-io`
+are separate opt-ins. Features never select the runtime edition.
 
 For dependency, build, or language-feature changes, check library compatibility
 separately from contributor tooling:
 
 ```bash
-cargo +1.88.0 check --all-targets --all-features
-cargo +1.88.0 test --lib --all-features
-cargo generate-lockfile
+cargo +1.88.0 check --workspace --all-features --all-targets
 cargo audit --deny warnings
 ```
 
-The library does not track `Cargo.lock`. Audit the freshly resolved graph across
-all optional and target dependencies. Keep bindgen at 0.72.1 until mixed
-`syn`/`prettyplease` consumer resolutions are validated; retain base64 0.22 until explicit SIMD-engine validation. See
-[the 2.0 migration guide](docs/migration/1.x-to-2.0.md#async-std-to-smol) for
-application lockfile updates.
+`Cargo.lock` is tracked. Use `--locked` to build exactly what it records, and
+commit it when a dependency changes. Keep the bindgen versions of the build
+script and of `xtask` in step. Keep base64 at 0.22 until its SIMD engine has
+been validated separately.
 
-Report the SDK/platform and checks actually exercised. Identify unavailable
-platform or Advanced SDK coverage rather than implying an untested matrix passed.
+The crate must keep compiling for targets you cannot run. Checking another
+target needs only its Rust standard library:
+
+```bash
+rustup target add x86_64-pc-windows-msvc
+cargo clippy --all-features --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+```
+
+Report the SDK version, platform and checks actually exercised. Say which
+platforms or SDK editions were not covered rather than implying an untested
+combination passed.
 
 ## Compile contracts
 
@@ -306,50 +436,73 @@ costs, update rustdoc and affected examples, and add an appropriate entry to
 [CHANGELOG.md](CHANGELOG.md). Update migration guidance when existing callers
 must change their code. Prefer shared helpers over parallel implementations.
 
+Every public item has rustdoc: what it does, its units, its error conditions
+and its threading rules. The `advanced`, `capabilities`, `discovery`, `file`
+and `routing` modules enforce this with `#![warn(missing_docs)]`.
+
 Use a concise title describing the resulting change; existing commits commonly
 use `fix:`, `feat:`, `docs:`, or a scoped form such as `fix(sender):`.
 Contributions use the repository's [Apache-2.0 license](LICENSE).
 
+## Continuous integration
+
+The [CI guide](ci/README.md) is the reference for the workflows; this section
+only says what a contributor needs.
+
+Two workflows exist. `.github/workflows/rust.yml` checks every push to `main`
+and every pull request: lint, tests without an NDI runtime on Linux, macOS and
+Windows, cross-target lint, and tests against real runtimes in an SDK matrix.
+One check, `required-ci`, summarizes them. A pull request from a fork cannot
+read the secrets that provide the SDK packages, so its SDK jobs are skipped and
+the other jobs decide. `.github/workflows/publish.yml` releases a version.
+
+These workflows have not yet run on a hosted runner. Their Linux x86_64
+commands have been run by hand; every macOS and Windows step is unverified
+until the first hosted run. The CI guide keeps the
+[list of what is unproven](ci/README.md#not-yet-run-on-a-hosted-runner).
+
+Before pushing, run what the `lint` and `test` jobs run:
+
+```bash
+python -m unittest discover -s ci/tests
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
+cargo test --locked --all-features
+```
+
+To run the tests against a real runtime the way the SDK jobs do, with loopback
+networking only and a private temporary directory, add the runner
+configuration. On Linux this needs `bubblewrap`:
+
+```bash
+export NDI_RUNTIME_DIR_V6="$HOME/ndi/standard-6.4/NDI SDK for Linux/lib/x86_64-linux-gnu"
+GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --config ci/offline.toml --all-features
+```
+
+A release is made by merging the version bump to `main`, tagging that commit
+`v<version>` and pushing the tag. The CI guide describes what the tag triggers
+and the repository settings it relies on.
+
 ## SDK upgrades and platform qualification
 
-The active provisioning and validation path is documented in [ci/README.md](ci/README.md)
-and [ci/sdk-store.md](ci/sdk-store.md). The catalog contains 12 reviewed bundles:
-four Standard 6.3.2 platforms and eight Standard/Advanced 6.4 platforms. Review and
-retain SDKs as they arrive. The compatibility target is NDI 6.x; NDI 6.0 and 6.1.1
-do not have current validation results.
+To adopt a newer NDI SDK:
 
-Use [tools/sdk/README.md](tools/sdk/README.md) to snapshot, compare and classify
-SDK changes, regenerate capability metadata and run independent ABI probes. A
-new or changed declaration needs a reviewed disposition; an unavailable wrapper
-must remain visibly unavailable. Keep original archive hashes, header/runtime
-identity and test results together. A passed symbol or layout check does not prove
-callback lifetimes, codec interoperability or hardware behavior.
+1. Regenerate the bindings from its headers and run the check, as described
+   under [Regenerating the bindings](#regenerating-the-bindings).
+2. Run the tests. The coverage test lists each newly declared function; give
+   it a table or an `UNWRAPPED` entry.
+3. Read the SDK's change notes for behavior changes in functions the crate
+   already calls. A capability whose functions exist in older runtimes but
+   misbehave there needs a minimum version in `RuntimeFeature`.
+4. Run the full test suite against the new runtime and against the oldest
+   runtime the crate has been tested with, and record both in
+   [docs/sdk-validation.md](docs/sdk-validation.md).
 
-The supported release matrix is limited to artifacts and toolchains that can be
-acquired and exercised on GitHub-hosted runners. The full artifact inventory also
-retains vendor BSP candidates outside that supported matrix. Add a candidate only
-with an obtainable, reviewed toolchain and the required hosted checks; do not
-substitute a generic same-CPU sysroot for a vendor ABI. Physical-device results
-remain separate manual qualification and never require a private CI runner.
+The compatibility target is NDI 6.x. Record what was measured for each
+platform: tests run against a real runtime, or compiled and linted only. A
+passing symbol or layout check does not prove callback lifetimes, codec
+interoperability or hardware behavior.
 
-Required CI groups 52 checks into 16 SDK runner jobs. Full native suites use
-Linux x64, Windows x64 and macOS ARM64 representatives in both SDK editions; other
-supported profiles retain ABI/link or packaging checks. The broader 82-check
-audit is available through the explicit `extended` scope. Add a new required
-combination when it covers a distinct risk, rather than multiplying every
-architecture, SDK edition, version and compiler by default.
-
-Record the measured coverage: native, emulator/simulator, or build/link-only.
-Public Debian armhf checks for the four RPi GNU profiles use a glibc 2.36 build
-sysroot; they do not prove glibc 2.17 deployment or board-specific CPU behavior.
-A prepared workflow or SDK inventory is not a successful hosted run. See the
-[SDK validation record](docs/sdk-validation.md) for current and historical evidence.
-
-Private source maps contain locators; authentication is a separate credential.
-Never commit either private maps or credentials, SDK archives, or generated vendor
-bindings. Remote release assets can be replaced or deleted: verified archive hashes
-establish the expected content, not immutable remote storage. Public source review
-and hosted validation do not authorize publication of SDK materials or release
-promotion. The old composite setup actions remain
-[documented as historical tooling](.github/actions/README.md); the active workflow
-uses the shared provisioner instead.
+Never commit SDK archives, SDK headers, generated declarations of the Advanced
+SDK headers, or credentials.
