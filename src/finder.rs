@@ -747,6 +747,12 @@ pub(crate) struct RawSource {
     pub raw: NDIlib_source_t,
 }
 
+// SAFETY: the descriptor's pointers lead only into the strings this value
+// owns, whose heap buffers do not move when the value does, and nothing
+// writes through them. Moving it to another thread moves those strings with
+// it, as moving a `CString` does.
+unsafe impl Send for RawSource {}
+
 impl Source {
     /// The source named `name`, without an address.
     pub fn new(name: impl Into<String>) -> Self {

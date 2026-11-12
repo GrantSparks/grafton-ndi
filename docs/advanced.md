@@ -533,7 +533,12 @@ sample rate and a number of samples per channel.
 Each wait reports whether the reference or the system clock paced it; the
 system clock is used while no reference signal arrives. The waits block their
 thread and cannot be cancelled or given a deadline. Both clocks borrow the
-genlock, so the reference cannot be changed while a clock is in use.
+genlock, so the reference cannot be changed while a clock is in use. A
+`Genlock` is `Send` but not `Sync`: it can be created on one thread and
+connected, waited on and dropped on others, and each clock can wait on a
+thread of its own, but `is_active`, which the SDK does not document as safe
+to call from several threads at once, is called through the genlock on one
+thread at a time.
 
 Examples: `examples/advanced_avsync.rs`, `examples/advanced_genlock.rs`.
 

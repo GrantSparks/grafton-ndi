@@ -2626,3 +2626,95 @@ fn genlock_follows_a_local_reference_and_returns_to_the_system_clock() {
         );
     }
 }
+
+/// Wait with `wait` until what it reports is `wanted`, on whatever thread
+/// calls this.
+fn until_paced_by(wanted: ClockSource, mut wait: impl FnMut() -> ClockSource, what: &str) {
+    let deadline = Instant::now() + PATIENCE;
+    while wait() != wanted {
+        assert!(
+            Instant::now() < deadline,
+            "the {what} clock was not paced by {wanted:?}"
+        );
+    }
+}
+
+/// A genlock works on threads other than the one that created it: it is
+/// connected to a reference and acquires it on a second thread, its clocks
+/// are paced by the reference on two more, and it is disconnected and
+/// destroyed on a fifth.
+#[test]
+fn a_genlock_moves_between_threads() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let sender = Sender::new(
+        &ndi,
+        &SenderOptions::new(common::unique_name("moved-genlock"))
+            .clock_video(true)
+            .clock_audio(false),
+    )
+    .unwrap();
+    let source = common::loopback_source(&ndi, &sender).unwrap();
+    // Created on this thread, without a reference, and never used here again.
+    let genlock = Genlock::new(&ndi, None, None).unwrap();
+    let thirty = FrameRate::new(30, 1).unwrap();
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let _stop = StopOnDrop(&stop);
+        scope.spawn(|| {
+            let video = video();
+            let audio = AudioFrame::builder()
+                .sample_rate(48_000)
+                .num_channels(2)
+                .num_samples(1600)
+                .build()
+                .unwrap();
+            while !stop.load(Ordering::Acquire) {
+                sender.send_video(&video).unwrap();
+                sender.send_audio(&audio);
+            }
+        });
+        let source = &source;
+        let genlock = scope
+            .spawn(move || {
+                let mut genlock = genlock;
+                genlock.connect(Some(source)).unwrap();
+                let deadline = Instant::now() + PATIENCE;
+                while !genlock.is_active() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "genlock did not acquire the reference"
+                    );
+                    let (mut video, _) = genlock.clocks();
+                    video.wait(thirty, ScanType::Progressive);
+                }
+                let (mut video, mut audio) = genlock.clocks();
+                std::thread::scope(|clocks| {
+                    clocks.spawn(move || {
+                        let wait = || video.wait(thirty, ScanType::Progressive);
+                        until_paced_by(ClockSource::ReferenceSignal, wait, "video");
+                    });
+                    clocks.spawn(move || {
+                        let wait = || audio.wait(48_000, 1600).unwrap();
+                        until_paced_by(ClockSource::ReferenceSignal, wait, "audio");
+                    });
+                });
+                genlock
+            })
+            .join()
+            .unwrap();
+        scope
+            .spawn(move || {
+                let mut genlock = genlock;
+                genlock.connect(None).unwrap();
+                let (mut video, _) = genlock.clocks();
+                let wait = || video.wait(thirty, ScanType::Progressive);
+                until_paced_by(ClockSource::SystemClock, wait, "video");
+                drop(genlock);
+            })
+            .join()
+            .unwrap();
+    });
+}

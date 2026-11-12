@@ -561,10 +561,26 @@ struct GenResource {
     _ndi: Ndi,
 }
 
+// SAFETY: a genlock belongs to no thread. Processing.NDI.Genlock.h and the
+// Advanced SDK manual (25.5) state no thread for creating, connecting,
+// querying or destroying one, and let its two waits run on separate threads,
+// neither of which need be the one that created it. In the 6.3.2 and 6.4
+// Linux x86_64 runtimes, `NDIlib_genlock_connect` hands the source to
+// `NDIlib_recv_connect` on a receiver the genlock owns, a receiver operation
+// that this crate already makes from any thread. Moving the handle changes
+// only which thread makes the calls: the runtime handle it keeps is Send, a
+// `Genlock` is not Sync, and connecting and destroying take it exclusively,
+// so neither overlaps a wait or a query. `a_genlock_moves_between_threads` in
+// tests/advanced_runtime.rs creates, connects, waits on and destroys one on
+// five threads against each runtime the tests use.
+unsafe impl Send for GenResource {}
+
 // SAFETY: the SDK allows the video wait and the audio wait to run on separate
-// threads at the same time. Those are the only operations reachable through a
-// shared reference: one non-cloneable token exists for each, and connecting
-// or destroying requires exclusive access to the owner.
+// threads at the same time. Those are the only operations that reach this
+// from another thread: one non-cloneable clock exists for each, and while the
+// clocks exist they borrow the genlock exclusively, so neither `is_active`,
+// reached through a `Genlock`, which is not Sync, nor connecting or
+// destroying overlaps them.
 unsafe impl Sync for GenResource {}
 
 impl Drop for GenResource {
@@ -584,6 +600,15 @@ impl Drop for GenResource {
 /// so.
 ///
 /// The waits block their thread and cannot be cancelled or given a deadline.
+///
+/// # Threading
+///
+/// A genlock is [`Send`] but not [`Sync`]: it can be created on one thread
+/// and connected, waited on and dropped on others. Each of its two clocks
+/// can be moved to a thread of its own while they borrow it, because the SDK
+/// lets the video and the audio wait run on separate threads at once. The
+/// SDK gives no such assurance for [`is_active`](Self::is_active), so a
+/// shared reference to the genlock stays on one thread.
 ///
 /// # Examples
 ///
@@ -605,6 +630,12 @@ pub struct Genlock {
     resource: GenResource,
     _source: Option<Box<RawSource>>,
     _config: Option<AdvancedConfig>,
+    // Through a shared reference only `is_active` is reached, and the SDK
+    // documents only the two waits as safe on separate threads at once
+    // (Processing.NDI.Genlock.h, Advanced SDK manual 25.5), not concurrent
+    // queries, so Sync is withheld. The waits run through the clocks, which
+    // borrow the genlock exclusively. Send comes from the fields.
+    _not_sync: NotSync,
 }
 
 impl Genlock {
@@ -645,6 +676,7 @@ impl Genlock {
             },
             _source: source,
             _config: config.cloned(),
+            _not_sync: NotSync(PhantomData),
         })
     }
 
@@ -929,6 +961,14 @@ mod tests {
     fn av_sync_is_send_and_unwind_safe() {
         fn traits<T: Send + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
         traits::<AvSync>();
+    }
+
+    /// As for AvSync; tests/ui/advanced/pass/genlock_is_send_but_not_sync.rs
+    /// checks that `Sync` is withheld.
+    #[test]
+    fn genlock_is_send_and_unwind_safe() {
+        fn traits<T: Send + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        traits::<Genlock>();
     }
 
     /// The SDK's allocations are returned for every result, including the
