@@ -37,7 +37,8 @@
 //!   one created before the server appeared, connects on a later attempt but
 //!   then never lists the senders or receivers registered before it
 //!   connected: only those registered afterwards. Create listeners once their
-//!   server is up, or replace one that connected late.
+//!   server is up, or replace a listener that took ten seconds or more to
+//!   report `is_connected`, the interval at which the runtime tries again.
 //!
 //! The measurements are in the
 //! [SDK validation record](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/sdk-validation.md#discovery-server-objects).

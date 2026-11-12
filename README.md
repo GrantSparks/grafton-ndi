@@ -67,7 +67,7 @@ The crate checks what the selected runtime provides before it calls into it. An 
 | Advanced SDK operations (`advanced` feature), with an Advanced runtime | Not tested | Yes | Yes |
 | File API (`file-io` feature) | No | No | Yes |
 
-The 6.3.2 runtime exports the Discovery Server functions, but destroying an advertiser or listener there while it is connected to a server aborts the process, measured in every object type and with no call order that avoids it, so the crate refuses them before 6.4.0. [Known issues](#known-issues) lists this and three rarer defects that 6.4 still has. The File library first ships with the 6.4 SDK. On Linux, macOS and Android it works only beside the Advanced runtime.
+The 6.3.2 runtime exports the Discovery Server functions, but destroying an advertiser or listener there while it is connected to a server aborts the process, measured in every object type and with no call order that avoids it, so the crate refuses them before 6.4.0. [Known issues](#known-issues) lists this and the defects that 6.4 still has. The File library first ships with the 6.4 SDK. On Linux, macOS and Android it works only beside the Advanced runtime.
 
 ### Platforms
 
@@ -113,9 +113,11 @@ These are defects and limits of the NDI SDK, not of this crate: measured on Linu
 - **A quick re-registration crashes listeners (6.3.2 and 6.4.0.2).** Moving one sender or receiver from one advertiser to another on the same server within a few tens of milliseconds can crash a listener on that server, in any process. Wait about a second between unregistering and registering again, or drop the first advertiser before registering with the second.
 - **An unsubscribe can block a receiver's connect for good (6.3.2 and 6.4.0.2).** When a listener, in this process or another, unsubscribes from a receiver that a `RecvAdvertiser` registers while that receiver connects, its connect can block forever. Drop the listener to stop receiving a receiver's events; this crate's listeners never unsubscribe on their own.
 - **A send advertiser's destroy can hang (6.4.0.2).** Dropping a `SendAdvertiser` never returned once in about a million destroys under heavy load.
+- **A listener that connects late misses earlier registrations (6.4.0.2).** An advertiser or listener that finds no server tries again every 10 seconds. A listener that connects on such a later attempt lists only the senders and receivers registered after it connected. Create listeners once their server is up, or replace a listener that took ten seconds or more to report `is_connected`.
 
 ### Receiving and sending
 
+- **NDI|HX video needs an extra decoder on Linux (6.4).** The Windows and macOS runtimes decode NDI|HX (H.264 and HEVC) themselves. On Linux the runtime decodes it only with the NDI|HX Driver for Linux, `libndihx.so` and its bundled FFmpeg libraries copied beside the runtime library, or with FFmpeg 7's `libavcodec` on the loader's path. Without either, a receiver of an NDI|HX source gets black 1920×1080 frames instead of the picture, and no error; the hosted Ubuntu 24.04 runners of GitHub Actions had neither. The driver's licence notes that on Linux NDI grants no H.264 or AAC licence.
 - **A FrameSync takes its receiver's audio.** Raw audio capture beside a FrameSync (measured with 6.3.2 and 6.4) takes the frames the FrameSync needs, and the FrameSync returns silence in their place. A FrameSync's receiver therefore has no audio capture.
 - **Standard encoding may convert 4:4:4 video to 4:2:2.** Sending a planar 4:4:4 frame does not guarantee that a receiver gets 4:4:4.
 - **Sender and receiver names are reserved machine-wide** through lock files in the temporary directory (`NTK_SEND_<name>`, `NTK_RECV_<name>`). Two processes that share `TMPDIR` cannot each create a sender, or a receiver, of the same name at the same time.

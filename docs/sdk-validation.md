@@ -209,7 +209,7 @@ None of these workarounds made it safe:
 Never destroying them leaks about three threads and four descriptors per
 object. The crate therefore refuses the four objects before 6.4.0.
 
-Three defects remain in 6.4.0.2, observed the same way. The crate cannot
+Four defects remain in 6.4.0.2, observed the same way. The crate cannot
 prevent them; the documentation of the affected methods says how to stay clear
 of them.
 - **Listener crash on a quick move.** A listener on the server crashes when
@@ -231,6 +231,21 @@ of them.
 - **Rare send-advertiser destroy hang.** `NDIlib_send_advertiser_destroy`
   blocked for good once, waiting on one of the advertiser's own threads, in
   about 1.1 million destroys on 6.4.0.2 under heavy load.
+- **A late listener misses earlier registrations.** An advertiser or listener
+  that finds no server tries again every 10 s, with no backoff (8 attempts
+  traced over 75 s). A listener that connects only on such a later attempt
+  lists only what is registered after it connected, never what reached the
+  server before.
+  - The listener's first attempt sends its query and a second message that
+    the server answers with its registry; a retry sends only the query.
+  - Sender and receiver listeners behaved alike, on Standard and Advanced
+    6.4.0.2.
+  - A listener created before the server never listed an earlier
+    registration in 8 of 8 runs watched for 25 to 35 s.
+  - It listed one made after it connected in 12 of 12 runs, within 2 ms.
+  - A listener created once the server was serving listed the earlier one at
+    once in 7 of 7 runs.
+  - `tests/discovery_server.rs` checks the two halves that work.
 
 No test repeats these measurements.
 
