@@ -394,7 +394,7 @@ if ptz.is_supported() {
 }
 ```
 
-`poll_event` spends its timeout as the capture verbs do: in attempts of at most 100 ms, waiting across the SDK's early returns, and returning `None` only once the whole timeout is spent. Every capture holds the receiver's shared capture guard for one such attempt, so `reconnect`, `connect_to` and `disconnect` wait about 100 ms at most for captures in flight, however long their timeouts. The controls work in every receiver mode, including a FrameSync's receiver and, with the `advanced` feature, the `Receiver<PacketAttached>` that `PacketReceiver::receiver()` returns.
+`poll_event` spends its timeout as the capture verbs do: in attempts of at most 100 ms, waiting across the SDK's early returns, and returning `None` only once the whole timeout is spent. Every capture holds the receiver's shared capture guard for one such attempt, so `reconnect`, `connect_to` and `disconnect` wait about 100 ms at most for captures in flight, however long their timeouts. The controls work in every receiver mode, including a FrameSync's receiver and, with the `advanced` feature, the `Receiver<PacketAttached>` that `PacketReceiver::receiver()` returns and the `Receiver<AvSyncAttached>` that `AvSync::receiver()` returns, which also keeps its own video and metadata capture and `poll_event`.
 
 ### Integrate With Async Runtimes
 

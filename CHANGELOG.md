@@ -163,11 +163,13 @@ as `None`. Most programs need changes; see the
   same status as `ReceiverEvent::StatusChanged`, together with the other
   receiver events, and is the only poller, so two pollers no longer compete for
   one notification.
-- `Receiver::audio`, `metadata` and `poll_event` need the receiver's mode to
-  implement the new sealed `CaptureMode`, which `RawCapture` and
-  `FrameSyncAttached` do. Generic code bounded by `M: ReceiverMode` that
-  captures audio or metadata, or polls events, bounds `M: CaptureMode`; the
-  common controls keep `ReceiverMode`.
+- `Receiver::metadata` and `poll_event` need the receiver's mode to implement
+  the new sealed `MetadataMode`, `Receiver::audio` the new sealed
+  `CaptureMode`, which extends it, and `Receiver::video` the new sealed
+  `VideoMode`. `RawCapture` implements all three and `FrameSyncAttached` the
+  first two. Generic code bounded by `M: ReceiverMode` that captures audio
+  bounds `M: CaptureMode`, code that only captures metadata or polls events
+  can bound `M: MetadataMode`, and the common controls keep `ReceiverMode`.
 - FrameSync's owned captures take the short names: `capture_video` and
   `capture_audio` return owned frames, as `capture_video_owned` and
   `capture_audio_owned` did, and the borrowing captures are
@@ -348,6 +350,17 @@ as `None`. Most programs need changes; see the
   metadata and the keyframe and stream controls, but no audio, metadata or
   event capture of its own, which packet capture takes. `AllocatedPacketReceiver`
   lends it through `receiver` and has `set_stream_tier` and `set_streams`.
+  `PacketReceiver::new` checks against the runtime only the color format its
+  preset gives the SDK, not the options' own, which the preset replaces.
+- `advanced::AvSync::receiver` lends its receiver as
+  `Receiver<AvSyncAttached>`, with its own video and metadata capture,
+  `poll_event` and every control the modes share, but no audio capture, which
+  the synchronizer takes. It is never lent mutably, because the synchronizer
+  reads the receiver's native instance; `AvSync` has `set_stream_tier`,
+  `set_streams` and `kvm` itself. `AvSync::synchronize` takes `&self` and
+  reads the video frame in place, an owned `VideoFrame` or a `VideoFrameRef`
+  captured with `capture_ref`, so the capture-then-synchronize loop copies no
+  pixels. `AvSync` is neither `Send` nor `Sync`.
 - `advanced::KvmSession::receiver` lends the session's receiver for the whole
   session, so frames can be captured, and held, while keys, buttons and
   touches stay pressed across them on one connection. `Receiver::kvm` still

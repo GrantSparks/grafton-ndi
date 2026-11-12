@@ -223,9 +223,9 @@ pub use {
         AudioInputFormat, FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncVideoRef,
     },
     receiver::{
-        Capture, CaptureMode, ConnectionStats, FrameSyncAttached, Ptz, RawCapture, Receiver,
-        ReceiverBandwidth, ReceiverColorFormat, ReceiverEvent, ReceiverMode, ReceiverOptions,
-        ReceiverStatus, SettingChange, SourceNameChange, Tally,
+        Capture, CaptureMode, ConnectionStats, FrameSyncAttached, MetadataMode, Ptz, RawCapture,
+        Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverEvent, ReceiverMode,
+        ReceiverOptions, ReceiverStatus, SettingChange, SourceNameChange, Tally, VideoMode,
     },
     runtime::{Ndi, ProcessLifetimeRuntime, Runtime, RuntimeOptions},
     sender::{

@@ -1,0 +1,11 @@
+error[E0505]: cannot move out of `sync` because it is borrowed
+ --> tests/ui/advanced/fail/av_sync_video_ref_outlives_sync.rs:7:20
+  |
+5 | fn outlive(sync: AvSync) {
+  |            ---- binding `sync` declared here
+6 |     let video = sync.receiver().video().capture_ref(Duration::ZERO).unwrap();
+  |                 ---- borrow of `sync` occurs here
+7 |     let receiver = sync.into_receiver();
+  |                    ^^^^ move out of `sync` occurs here
+8 |     drop(video);
+  |          ----- borrow later used here

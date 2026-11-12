@@ -76,7 +76,7 @@ mod routing;
 mod send;
 mod sync;
 
-pub use crate::receiver::PacketAttached;
+pub use crate::receiver::{AvSyncAttached, PacketAttached};
 pub use allocators::*;
 pub use config::AdvancedConfig;
 pub(crate) use configured::Configurable;

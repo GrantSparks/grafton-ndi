@@ -3287,6 +3287,15 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
         })
     }
 
+    /// The SDK descriptor of this frame, exactly as its capture delivered it,
+    /// for an SDK call that reads a captured frame in place. The guard keeps
+    /// every buffer it points to allocated and unchanged for as long as
+    /// `self` is borrowed.
+    #[cfg(feature = "advanced")]
+    pub(crate) fn raw(&self) -> &NDIlib_video_frame_v2_t {
+        self.guard.frame()
+    }
+
     /// Get the frame width in pixels.
     pub fn width(&self) -> u32 {
         self.layout.width

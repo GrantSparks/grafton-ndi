@@ -219,7 +219,10 @@ a `PacketEvent`, and every result owns its data. It waits up to its timeout as
 a `Receiver`'s capture does, capturing again when the SDK returns early with
 nothing, and returns `None` only once the whole timeout is spent. A
 `PacketReceiver` is used from the thread that owns it and cannot feed a
-`FrameSync`. Use an ordinary `Receiver` for decoded media only.
+`FrameSync`. Use an ordinary `Receiver` for decoded media only. The preset's
+color format replaces the options' own, and only the preset's is checked
+against the runtime: options that ask for `ReceiverColorFormat::Best444`, which
+needs NDI 6.4, still make a packet receiver on an older Advanced runtime.
 
 `receiver()` returns the `Receiver<PacketAttached>` the packet receiver holds,
 with the controls every receiver mode has: `set_tally`, `ptz`,
@@ -442,7 +445,51 @@ Example: `examples/advanced_allocator.rs`.
 `AvSync` returns the audio that belongs to each video frame's timestamp. It
 takes over the receiver's audio, so it owns the receiver: capture video through
 `AvSync::receiver`, then call `synchronize`. `AvSync::new` takes the receiver
-and hands it back inside `Rejected` when it fails. `AvSyncRequest::automatic()`
+and hands it back inside `Rejected` when it fails.
+
+`receiver()` returns the `Receiver<AvSyncAttached>` the synchronizer holds. In
+this mode the receiver keeps its own `video` and `metadata` capture and
+`poll_event`, and the controls every receiver mode has: `set_tally`, `ptz`,
+`connection_stats`, `send_metadata`, `request_keyframe`, the delays,
+`connect_to`, `reconnect` and `poll_source_name_change`. Its `audio` does not
+exist in this mode, because the synchronizer takes the audio. The receiver is
+never lent mutably, since the synchronizer reads its native instance and a
+mutable receiver could be swapped for another `AvSync`'s; `AvSync` itself has
+`set_stream_tier`, `set_streams` and `kvm`, the controls that borrow the
+receiver exclusively.
+
+`synchronize` takes the frame by reference, either a `VideoFrameRef` captured
+with `capture_ref` or an owned `VideoFrame`, and reads it in place, so the
+usual loop copies no pixels:
+
+```rust
+use std::time::Duration;
+use grafton_ndi::{
+    advanced::{AvSync, AvSyncOutcome, AvSyncRequest},
+    Receiver, Tally,
+};
+
+fn play(receiver: Receiver) -> grafton_ndi::Result<()> {
+    let sync = AvSync::new(receiver)?;
+    sync.receiver().set_tally(Tally::new(true, false));
+    while let Some(video) = sync.receiver().video().capture_ref(Duration::from_secs(1))? {
+        if let AvSyncOutcome::Audio { frame, .. } =
+            sync.synchronize(Some(&video), AvSyncRequest::automatic())?
+        {
+            println!("{} samples for {}x{}", frame.num_samples(), video.width(), video.height());
+        }
+    }
+    Ok(())
+}
+```
+
+An `AvSync` is neither `Send` nor `Sync`: one thread synchronizes, one call at
+a time. The receiver it lends is both, so scoped threads can capture video or
+metadata, poll events or reconnect through it meanwhile. `synchronize` does not
+take the receiver's capture guard, as FrameSync's captures do not, so a
+reconnect neither waits for it nor holds it off.
+
+`AvSyncRequest::automatic()`
 takes whatever audio belongs to the frame. `AvSyncRequest::new(Some(sample_rate),
 Some(num_samples))` asks for that many samples per channel, computed for that
 sample rate; each `None` leaves the choice to the SDK. The SDK may return a
@@ -451,7 +498,8 @@ then reports the count as adjusted. The outcome is the audio, or says why there
 is none: no samples for this frame, a changed audio format (with the source's
 sample rate and channel count), no audio stream, no samples matching the
 frame's time, or an SDK error. Nothing is retried or converted.
-`into_receiver` stops synchronizing and returns the receiver.
+`into_receiver` stops synchronizing and returns the receiver, with its own
+audio capture again.
 
 `Genlock` paces a sender from the timing of a reference source. `clocks`
 returns a video clock and an audio clock; wait on the matching one before

@@ -2,8 +2,10 @@
 //!
 //! This example demonstrates:
 //! - Handing a receiver to an [`AvSync`]
-//! - Capturing video through it
-//! - Asking for the audio matching each frame's timestamp
+//! - Capturing video through it, in place in the SDK's buffer
+//! - Asking for the audio matching each frame's timestamp, without copying
+//!   the frame
+//! - Polling the receiver's events and publishing tally while it is attached
 //!
 //! Needs the NDI Advanced SDK at build time and an Advanced runtime.
 //!
@@ -16,7 +18,7 @@ use std::{env, time::Duration};
 
 use grafton_ndi::{
     advanced::{AvSync, AvSyncOutcome, AvSyncRequest},
-    Error, Ndi, Receiver, ReceiverOptions,
+    Error, Ndi, Receiver, ReceiverEvent, ReceiverOptions, Tally,
 };
 
 #[path = "common/mod.rs"]
@@ -40,10 +42,23 @@ fn main() -> Result<(), Error> {
 
     let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source).name("AVSync Example"))?;
     // On failure the receiver comes back inside the error; `?` drops it here.
-    let mut sync = AvSync::new(receiver)?;
+    let sync = AvSync::new(receiver)?;
+    // Every receiver control stays available while the receiver is attached.
+    sync.receiver().set_tally(Tally::new(true, false));
 
     for _ in 0..120 {
-        let Some(video) = sync.receiver().video().capture(Duration::from_secs(1))? else {
+        if let Some(ReceiverEvent::StatusChanged(status)) =
+            sync.receiver().poll_event(Duration::ZERO)?
+        {
+            println!("{} connections", status.connections());
+        }
+        // The frame borrows the SDK's buffer, and the synchronizer reads it
+        // there: no pixels are copied.
+        let Some(video) = sync
+            .receiver()
+            .video()
+            .capture_ref(Duration::from_secs(1))?
+        else {
             println!("No video yet...");
             continue;
         };

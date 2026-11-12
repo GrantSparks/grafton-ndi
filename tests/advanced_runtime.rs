@@ -13,8 +13,8 @@ use grafton_ndi::{
     advanced::*,
     capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, SdkEdition},
     AudioFrame, Error, Finder, FinderOptions, FrameRate, MediaTypes, MetadataFrame, Ndi, Receiver,
-    ReceiverBandwidth, ReceiverOptions, ScanType, Sender, SenderMode, SenderOptions, SettingChange,
-    Source, StreamTier, Tally, Timecode, VideoFrame,
+    ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions, ScanType, Sender, SenderMode,
+    SenderOptions, SettingChange, Source, StreamTier, Tally, Timecode, VideoFrame,
 };
 use std::{
     sync::{
@@ -186,7 +186,30 @@ fn advanced_native_constructors_controls_and_queue() {
         RuntimeFeature::ReceiverDiscovery,
         RecvListener::new(&ndi, &listeners),
     );
-    let av = AvSync::new(receiver).unwrap();
+    // An attached receiver keeps every control, its events and its video and
+    // metadata capture.
+    let mut av = AvSync::new(receiver).unwrap();
+    {
+        let receiver = av.receiver();
+        receiver.set_tally(Tally::new(true, false));
+        let _ = receiver.connection_stats();
+        let _ = receiver.ptz().is_supported();
+        receiver.request_keyframe().unwrap();
+        let _ = receiver.poll_event(Duration::ZERO).unwrap();
+        let _ = receiver.metadata().capture(Duration::ZERO).unwrap();
+        let _ = receiver.video().capture_ref(Duration::ZERO).unwrap();
+        receiver.reconnect().unwrap();
+    }
+    for change in [
+        av.set_stream_tier(StreamTier::Program).unwrap(),
+        av.set_streams(MediaTypes::ALL).unwrap(),
+    ] {
+        assert!(matches!(
+            change,
+            SettingChange::Applied | SettingChange::Unchanged
+        ));
+    }
+    let _ = av.kvm().unwrap().is_supported();
     drop(av.into_receiver());
     let mut genlock = Genlock::new(&ndi, None, Some(&config)).unwrap();
     genlock.connect(None).unwrap();
@@ -199,6 +222,17 @@ fn advanced_native_constructors_controls_and_queue() {
     )
     .unwrap();
     let _ = packets.capture(Duration::ZERO).unwrap();
+    // The preset's color format replaces the options' own, so only the
+    // preset's is required of the runtime: Best444, which needs NDI 6.4, is
+    // never asked for.
+    drop(
+        PacketReceiver::new(
+            &ndi,
+            &ReceiverOptions::new(Source::new("")).color_format(ReceiverColorFormat::Best444),
+            PassthroughPreset::HevcWithAudio,
+        )
+        .unwrap(),
+    );
     // Nothing is connected, so there is nowhere to send metadata.
     assert!(matches!(
         packets
@@ -1661,13 +1695,24 @@ impl Drop for StopOnDrop<'_> {
     }
 }
 
+/// What each [`synchronized_audio`] request passes along with the video frame
+/// that paces it.
+#[derive(Clone, Copy)]
+enum Pass {
+    /// The frame as captured, borrowed from the SDK's buffer.
+    Captured,
+    /// An owned copy of the frame.
+    Owned,
+    /// No frame: it only paces the requests.
+    Nothing,
+}
+
 /// Ask `sync` for audio, once for each video frame that arrives, until it has
-/// returned audio `count` times. `with_video` passes the frame along; without
-/// it the frame only paces the requests.
+/// returned audio `count` times, passing along what `pass` says.
 fn synchronized_audio(
-    sync: &mut AvSync,
+    sync: &AvSync,
     request: AvSyncRequest,
-    with_video: bool,
+    pass: Pass,
     count: usize,
 ) -> Vec<(AudioFrame, bool)> {
     let deadline = Instant::now() + PATIENCE;
@@ -1678,13 +1723,15 @@ fn synchronized_audio(
             "AVSync returned audio {} times, not {count}",
             audio.len()
         );
-        let Some(video) = sync.receiver().video().capture(SLICE).unwrap() else {
+        let Some(video) = sync.receiver().video().capture_ref(SLICE).unwrap() else {
             continue;
         };
-        match sync
-            .synchronize(with_video.then_some(&video), request)
-            .unwrap()
-        {
+        let outcome = match pass {
+            Pass::Captured => sync.synchronize(Some(&video), request),
+            Pass::Owned => sync.synchronize(Some(&video.try_to_owned().unwrap()), request),
+            Pass::Nothing => sync.synchronize(None, request),
+        };
+        match outcome.unwrap() {
             AvSyncOutcome::Audio {
                 frame,
                 samples_adjusted,
@@ -1723,10 +1770,11 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
         &ReceiverOptions::new(common::loopback_source(&ndi, &sender).unwrap()),
     )
     .unwrap();
-    let mut sync = AvSync::new(receiver).unwrap();
+    let sync = AvSync::new(receiver).unwrap();
     let video = VideoFrame::builder()
         .resolution(64, 32)
         .frame_rate(FrameRate::new(30, 1).unwrap())
+        .metadata("<frame/>")
         .build()
         .unwrap();
     let audio = AudioFrame::builder()
@@ -1742,7 +1790,21 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
             while !stop.load(Ordering::Acquire) {
                 sender.send_video(&video).unwrap();
                 sender.send_audio(&audio);
+                sender.send_metadata(&MetadataFrame::new("<avsync/>").unwrap());
             }
+        });
+        // The lent receiver captures metadata and polls events on another
+        // thread while this one synchronizes.
+        let (receiver, stopped) = (sync.receiver(), &stop);
+        let metadata = scope.spawn(move || {
+            let mut captured = 0;
+            while !stopped.load(Ordering::Acquire) {
+                if receiver.metadata().capture_ref(SLICE).unwrap().is_some() {
+                    captured += 1;
+                }
+                let _ = receiver.poll_event(Duration::ZERO).unwrap();
+            }
+            captured
         });
         let is_source_format = |frame: &AudioFrame| {
             assert_eq!((frame.sample_rate(), frame.num_channels()), (48_000, 2));
@@ -1751,7 +1813,7 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
         // Automatic: the audio that spans each video frame. The span is
         // measured between the times the frames were sent, so single results
         // vary by a few samples around the 1600 a frame lasts.
-        let automatic = synchronized_audio(&mut sync, AvSyncRequest::automatic(), true, 9);
+        let automatic = synchronized_audio(&sync, AvSyncRequest::automatic(), Pass::Captured, 9);
         let mut counts = Vec::new();
         for (frame, samples_adjusted) in &automatic {
             is_source_format(frame);
@@ -1766,7 +1828,7 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
 
         // A count close to what belongs to a video frame is returned exactly.
         let request = AvSyncRequest::new(Some(48_000), Some(1600)).unwrap();
-        let exact = synchronized_audio(&mut sync, request, true, 5);
+        let exact = synchronized_audio(&sync, request, Pass::Owned, 5);
         for (frame, samples_adjusted) in &exact {
             is_source_format(frame);
             assert!(
@@ -1780,25 +1842,26 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
         // A count far from it is not: the frame's own audio comes back, and
         // the result says that the count was not met.
         let request = AvSyncRequest::new(Some(48_000), Some(800)).unwrap();
-        for (frame, samples_adjusted) in synchronized_audio(&mut sync, request, true, 3) {
+        for (frame, samples_adjusted) in synchronized_audio(&sync, request, Pass::Captured, 3) {
             is_source_format(&frame);
             assert!(samples_adjusted && frame.num_samples() != 800);
         }
 
         // An exact count without a video frame is taken from the queued audio.
         let request = AvSyncRequest::new(Some(48_000), Some(480)).unwrap();
-        for (frame, samples_adjusted) in synchronized_audio(&mut sync, request, false, 3) {
+        for (frame, samples_adjusted) in synchronized_audio(&sync, request, Pass::Nothing, 3) {
             is_source_format(&frame);
             assert_eq!((frame.num_samples(), samples_adjusted), (480, false));
         }
 
         // Everything that is queued.
-        let all = synchronized_audio(&mut sync, AvSyncRequest::automatic(), false, 1);
+        let all = synchronized_audio(&sync, AvSyncRequest::automatic(), Pass::Nothing, 1);
         is_source_format(&all[0].0);
         assert!(all[0].0.num_samples() > 0);
 
         // A request computed for another sample rate than the source's is
-        // told the source's format instead of being given audio.
+        // told the source's format instead of being given audio, for an owned
+        // frame as for a captured one.
         let request = AvSyncRequest::new(Some(44_100), Some(1470)).unwrap();
         let frame = sync
             .receiver()
@@ -1813,6 +1876,8 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
                 num_channels: 2
             }
         ));
+        stop.store(true, Ordering::Release);
+        assert!(metadata.join().unwrap() > 0, "no metadata was captured");
     });
     drop(sync.into_receiver());
 }
@@ -2115,7 +2180,7 @@ fn avsync_follows_source_format_changes_and_preserves_audio_samples() {
         &ReceiverOptions::new(common::loopback_source(&ndi, &sender).unwrap()),
     )
     .unwrap();
-    let mut sync = AvSync::new(receiver).unwrap();
+    let sync = AvSync::new(receiver).unwrap();
     let phase = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
@@ -2166,7 +2231,7 @@ fn avsync_follows_source_format_changes_and_preserves_audio_samples() {
                     Instant::now() < deadline,
                     "AVSync did not follow format {index}"
                 );
-                let Some(video) = sync.receiver().video().capture(SLICE).unwrap() else {
+                let Some(video) = sync.receiver().video().capture_ref(SLICE).unwrap() else {
                     continue;
                 };
                 if let AvSyncOutcome::Audio { frame, .. } = sync

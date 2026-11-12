@@ -1,19 +1,20 @@
 //! Audio matched to video timestamps, and clocks locked to a reference source.
 
-use std::{cell::Cell, marker::PhantomData, ptr};
+use std::{cell::Cell, marker::PhantomData, ptr, rc::Rc};
 
-use super::{invalid_input, sdk_quantity, AdvancedConfig};
+use super::{invalid_input, sdk_quantity, AdvancedConfig, KvmSession};
 use crate::{
     finder::RawSource,
     frames::{validate_frame_metadata, validate_returned_audio, ReturnedAudio, MAX_AUDIO_BYTES},
+    receiver::AvSyncAttached,
     sys::{
         advanced::{
             native, AvSync as AvSyncTable, AvSyncHandle, Genlock as GenlockTable, GenlockHandle,
         },
         bindings::*,
     },
-    AudioFrame, Capture, ConnectionStats, Error, FrameRate, Ndi, Receiver, Rejected, Result,
-    ScanType, Source, Tally, VideoFrame, VideoKind,
+    AudioFrame, Error, FrameRate, MediaTypes, Ndi, Receiver, Rejected, Result, ScanType,
+    SettingChange, Source, StreamTier, VideoFrame, VideoFrameRef,
 };
 
 use super::descriptors;
@@ -166,7 +167,19 @@ impl Drop for AvResource {
 /// The synchronizer takes over the receiver's audio, so it owns the receiver:
 /// capture video through [`receiver`](Self::receiver), then ask
 /// [`synchronize`](Self::synchronize) for the audio that belongs to each
-/// frame. [`into_receiver`](Self::into_receiver) returns the receiver.
+/// frame, passing the frame as it was captured, without copying it.
+/// [`into_receiver`](Self::into_receiver) returns the receiver.
+///
+/// The receiver is lent in the [`AvSyncAttached`] mode, with its video and
+/// metadata capture, its events and every receiver control, but no audio
+/// capture of its own.
+///
+/// # Threading
+///
+/// An `AvSync` is neither [`Send`] nor [`Sync`]: it synchronizes on the
+/// thread that created it, one call at a time. The receiver it lends is
+/// `Sync`, so scoped threads can capture video or metadata, poll events or
+/// reconnect through it while that thread synchronizes.
 ///
 /// # Examples
 ///
@@ -181,9 +194,10 @@ impl Drop for AvResource {
 /// let ndi = Ndi::new()?;
 /// # let source = Source::new("");
 /// let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source))?;
-/// let mut sync = AvSync::new(receiver)?;
+/// let sync = AvSync::new(receiver)?;
 ///
-/// if let Some(video) = sync.receiver().video().capture(Duration::from_secs(1))? {
+/// // The frame stays in the SDK's buffer: nothing is copied.
+/// if let Some(video) = sync.receiver().video().capture_ref(Duration::from_secs(1))? {
 ///     if let AvSyncOutcome::Audio { frame, .. } =
 ///         sync.synchronize(Some(&video), AvSyncRequest::automatic())?
 ///     {
@@ -196,7 +210,12 @@ impl Drop for AvResource {
 pub struct AvSync {
     // Declared first so that it is destroyed before the receiver it reads.
     resource: AvResource,
-    receiver: Receiver,
+    receiver: Receiver<AvSyncAttached>,
+    // `synchronize` takes `&self`, so withholding Sync keeps two
+    // synchronizations of one synchronizer from running at once, which the
+    // SDK does not document as safe. Send stays withheld, as it always was.
+    // The raw handle already withholds both; this states it.
+    _thread_affinity: PhantomData<Rc<()>>,
 }
 
 impl AvSync {
@@ -228,30 +247,93 @@ impl AvSync {
         }
         Ok(Self {
             resource: AvResource { handle, table },
-            receiver,
+            receiver: receiver.into_mode(),
+            _thread_affinity: PhantomData,
         })
     }
 
-    /// The receiver's video and controls. Its audio belongs to the
-    /// synchronizer and is not reachable here.
-    pub fn receiver(&self) -> AvSyncReceiver<'_> {
-        AvSyncReceiver {
-            receiver: &self.receiver,
-        }
+    /// The receiver this holds, in the [`AvSyncAttached`] mode: its video and
+    /// metadata capture, its events, and the controls every receiver has:
+    /// tally, PTZ, statistics, upstream metadata, keyframe requests, delays,
+    /// connecting, reconnecting and source-name changes.
+    ///
+    /// A video frame captured through it can be handed to
+    /// [`synchronize`](Self::synchronize) as it is. Its own audio capture
+    /// does not exist in this mode, because the synchronizer takes the audio:
+    ///
+    /// ```compile_fail,E0277
+    /// use grafton_ndi::advanced::AvSync;
+    /// fn capture(sync: &AvSync) {
+    ///     let _ = sync.receiver().audio();
+    /// }
+    /// ```
+    ///
+    /// The synchronizer reads this receiver's native instance, so the
+    /// receiver is never lent mutably, where it could be swapped for another
+    /// `AvSync`'s. [`set_stream_tier`](Self::set_stream_tier),
+    /// [`set_streams`](Self::set_streams) and [`kvm`](Self::kvm) reach the
+    /// controls that borrow it exclusively.
+    pub fn receiver(&self) -> &Receiver<AvSyncAttached> {
+        &self.receiver
     }
 
-    /// Stop synchronizing and return the receiver.
+    /// Switch between the source's program and preview streams; see
+    /// [`Receiver::set_stream_tier`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`Receiver::set_stream_tier`].
+    pub fn set_stream_tier(&mut self, tier: StreamTier) -> Result<SettingChange> {
+        self.receiver.set_stream_tier(tier)
+    }
+
+    /// Choose which streams the source sends; see [`Receiver::set_streams`].
+    /// Without audio, there is nothing to synchronize.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Receiver::set_streams`].
+    pub fn set_streams(&mut self, streams: MediaTypes) -> Result<SettingChange> {
+        self.receiver.set_streams(streams)
+    }
+
+    /// Start a remote-control session with the connected source; see
+    /// [`Receiver::kvm`]. The session borrows this exclusively for as long as
+    /// it lasts.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Receiver::kvm`].
+    pub fn kvm(&mut self) -> Result<KvmSession<'_, AvSyncAttached>> {
+        self.receiver.kvm()
+    }
+
+    /// Stop synchronizing and return the receiver, with its own audio
+    /// capture again.
     pub fn into_receiver(self) -> Receiver {
-        let Self { resource, receiver } = self;
+        let Self {
+            resource, receiver, ..
+        } = self;
         drop(resource);
-        receiver
+        receiver.into_mode()
     }
 
     /// Fetch the audio that belongs to `video`, or with `None` whatever audio
     /// is currently queued.
     ///
+    /// The frame is read in place: a [`VideoFrameRef`] captured through
+    /// [`receiver`](Self::receiver) is handed to the SDK as the SDK delivered
+    /// it, and an owned [`VideoFrame`] as it is, so no pixels are copied.
     /// One call makes one native request: a changed format or missing audio
     /// is reported, never retried or converted.
+    ///
+    /// Only the thread that owns this `AvSync` synchronizes, one call at a
+    /// time. Other threads may meanwhile capture video or metadata, poll
+    /// events or use the controls through the receiver it lends. This does
+    /// not take the receiver's capture guard, as
+    /// [`FrameSync`](crate::FrameSync) captures do not, so a
+    /// [`reconnect`](Receiver::reconnect) neither waits for it nor holds it
+    /// off.
     ///
     /// # Errors
     ///
@@ -259,11 +341,13 @@ impl AvSync {
     /// validation, and [`Error::UnexpectedSdkResult`] when it reports a
     /// format change to a sample rate or channel count that is not positive.
     pub fn synchronize(
-        &mut self,
-        video: Option<&VideoFrame>,
+        &self,
+        video: Option<&dyn AvSyncVideo>,
         request: AvSyncRequest,
     ) -> Result<AvSyncOutcome> {
-        let video = video.map(VideoFrame::to_raw);
+        // A copy of the frame's descriptor, pointing into the frame's own
+        // buffers, which the borrow keeps allocated for the call.
+        let video = video.map(video_sealed::Sealed::descriptor);
         let AvResource { handle, table } = self.resource;
         let mut returned = Returned {
             audio: request.raw(),
@@ -274,9 +358,34 @@ impl AvSync {
             },
         };
         let status = native!(AvSync, table => {
-            // SAFETY: the synchronizer is live, the video descriptor (if any)
-            // borrows a frame that outlives the call, and the audio
-            // descriptor is writable.
+            // SAFETY: the synchronizer is live, and so is the receiver it
+            // reads, which `self` owns and destroys after it. The video
+            // descriptor (if any) describes a frame borrowed for the call: an
+            // owned frame's buffers, or the SDK's own descriptor of a captured
+            // frame, whose guard keeps its buffers allocated. The SDK takes
+            // it as a const reference and only reads it
+            // (Processing.NDI.AVSync.h). The audio descriptor is writable.
+            //
+            // No other synchronization of this synchronizer runs, which the
+            // header does not document as safe: this takes `&self`, and an
+            // AvSync is not Sync. Captures through the lent
+            // receiver may run on other threads meanwhile. The synchronizer
+            // takes the receiver's audio as an audio capture of it would
+            // (Processing.NDI.AVSync.h), and the SDK lets video, audio and
+            // metadata be captured from one receiver on separate threads at
+            // once (Processing.NDI.Recv.h). The AvSyncAttached mode has no
+            // audio capture, so the synchronizer is the only audio consumer.
+            //
+            // The receiver's capture guard is not taken, as FrameSync's
+            // captures do not take it. The guard keeps the crate's own
+            // NDIlib_recv_capture_v3 calls from overlapping
+            // NDIlib_recv_connect. How a synchronizer reads its receiver,
+            // during this call or on its own, is internal to the SDK and not
+            // documented, so a lock around this call could not be shown to
+            // cover it. Processing.NDI.FrameSync.h leaves a frame
+            // synchronizer's receiver usable for its other operations, and a
+            // FrameSync's receiver already reconnects while it captures; this
+            // synchronizer is treated the same way.
             let code = unsafe {
                 table.NDIlib_avsync_synchronize(
                     handle,
@@ -376,48 +485,38 @@ unsafe fn outcome(status: Synchronized, audio: &NDIlib_audio_frame_v3_t) -> Resu
     })
 }
 
-/// The video and controls of a receiver that an [`AvSync`] owns.
-///
-/// There is deliberately no way to capture audio here: the synchronizer
-/// consumes it.
-///
-/// ```compile_fail,E0599
-/// use grafton_ndi::advanced::AvSync;
-/// fn capture(sync: &AvSync) {
-///     let _ = sync.receiver().audio();
-/// }
-/// ```
-pub struct AvSyncReceiver<'a> {
-    receiver: &'a Receiver,
-}
+mod video_sealed {
+    use crate::sys::bindings::NDIlib_video_frame_v2_t;
 
-impl AvSyncReceiver<'_> {
-    /// Capture video; see [`Receiver::video`].
-    pub fn video(&self) -> Capture<'_, VideoKind> {
-        self.receiver.video()
-    }
-
-    /// The source the receiver was created for.
-    pub fn source(&self) -> &Source {
-        self.receiver.source()
-    }
-
-    /// Whether the receiver is connected to its source.
-    pub fn is_connected(&self) -> bool {
-        self.receiver.is_connected()
-    }
-
-    /// Connection and performance statistics; see
-    /// [`Receiver::connection_stats`].
-    pub fn connection_stats(&self) -> ConnectionStats {
-        self.receiver.connection_stats()
-    }
-
-    /// Publish this receiver's tally state; see [`Receiver::set_tally`].
-    pub fn set_tally(&self, tally: Tally) {
-        self.receiver.set_tally(tally);
+    pub trait Sealed {
+        /// A copy of the frame's SDK descriptor, which points into buffers
+        /// that the borrow of `self` keeps allocated and unchanged.
+        fn descriptor(&self) -> NDIlib_video_frame_v2_t;
     }
 }
+
+/// A video frame that [`AvSync::synchronize`] reads in place, without copying
+/// its pixels: an owned [`VideoFrame`], or a [`VideoFrameRef`] captured from a
+/// receiver, such as the one [`AvSync::receiver`] lends.
+///
+/// The trait is sealed; those two are the only video frames it covers.
+pub trait AvSyncVideo: video_sealed::Sealed {}
+
+impl video_sealed::Sealed for VideoFrame {
+    fn descriptor(&self) -> NDIlib_video_frame_v2_t {
+        self.to_raw()
+    }
+}
+
+impl AvSyncVideo for VideoFrame {}
+
+impl video_sealed::Sealed for VideoFrameRef<'_> {
+    fn descriptor(&self) -> NDIlib_video_frame_v2_t {
+        *self.raw()
+    }
+}
+
+impl AvSyncVideo for VideoFrameRef<'_> {}
 
 /// What paced a completed [`VideoClock::wait`] or [`AudioClock::wait`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -806,6 +905,14 @@ mod tests {
         let audio = audio_timing(48_000, 1600).unwrap();
         assert_eq!(audio.FourCC, planar_float);
         assert_eq!((audio.sample_rate, audio.no_samples), (48_000, 1600));
+    }
+
+    /// Only the thread auto traits are withheld;
+    /// tests/ui/advanced/pass/av_sync_is_thread_affine.rs checks those.
+    #[test]
+    fn av_sync_stays_unwind_safe() {
+        fn unwind_safe<T: std::panic::UnwindSafe>() {}
+        unwind_safe::<AvSync>();
     }
 
     /// The SDK's allocations are returned for every result, including the

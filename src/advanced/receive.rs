@@ -149,8 +149,9 @@ impl PacketReceiver {
     /// [configuration](ReceiverOptions::config), or the SDK's default one when
     /// they carry none.
     ///
-    /// The options' color format is replaced by the preset; fielded video is
-    /// always allowed, because a compressed stream cannot be deinterlaced.
+    /// The options' color format is replaced by the preset, and is neither
+    /// used nor checked against the runtime; fielded video is always allowed,
+    /// because a compressed stream cannot be deinterlaced.
     ///
     /// # Errors
     ///
@@ -161,26 +162,19 @@ impl PacketReceiver {
     /// [`Error::UnsupportedCapability`]: crate::Error::UnsupportedCapability
     /// [`RuntimeFeature::Passthrough`]: crate::capabilities::RuntimeFeature::Passthrough
     pub fn new(ndi: &Ndi, options: &ReceiverOptions, preset: PassthroughPreset) -> Result<Self> {
-        let color_format = ndi.passthrough_format(preset)?;
+        let options = creation_options(options, ndi.passthrough_format(preset)?);
         let config = AdvancedConfig::or_empty(options.config.as_ref());
         // SAFETY: the closure returns what the SDK's configured receiver
-        // creation returned for the settings it was handed with the preset's
-        // color format and fielded video; the strings the copy points to
+        // creation returned for the settings it was handed, which carry the
+        // preset's color format and fielded video; the strings they point to
         // belong to the creation path, which outlives the call.
         let receiver = unsafe {
             <Receiver as super::Configurable>::configured(
                 ndi,
-                options,
+                &options,
                 "NDIlib_recv_create_v4",
                 &config,
-                |table: &'static ReceiverConfiguration, settings, text| {
-                    let settings = NDIlib_recv_create_v3_t {
-                        color_format,
-                        allow_video_fields: true,
-                        ..*settings
-                    };
-                    native!(ReceiverConfiguration, table => table.NDIlib_recv_create_v4(&settings, text))
-                },
+                |table: &'static ReceiverConfiguration, settings, text| native!(ReceiverConfiguration, table => table.NDIlib_recv_create_v4(settings, text)),
             )
         }?;
         Ok(Self::from_receiver(receiver.into_mode()))
@@ -290,6 +284,23 @@ impl PacketReceiver {
         };
         Ok(Some(event))
     }
+}
+
+/// The options a packet receiver is created from: `options` with the preset's
+/// native `color_format` in place of their own, and with video fields
+/// allowed, because a compressed stream cannot be deinterlaced.
+///
+/// The creation path checks these against the runtime, so it checks what the
+/// SDK is given: a color format the preset replaces is never required of the
+/// runtime.
+fn creation_options(
+    options: &ReceiverOptions,
+    color_format: NDIlib_recv_color_format_e,
+) -> ReceiverOptions {
+    options
+        .clone()
+        .with_passthrough(color_format)
+        .allow_video_fields(true)
 }
 
 // Each delivered frame is held by the receiver's shared capture guard, which
@@ -552,6 +563,97 @@ mod tests {
             .is_none());
         assert!(began.elapsed() >= budget);
         assert!(native_capture_calls::take() >= 1);
+    }
+
+    /// A packet receiver is created from the preset's color format, so that is
+    /// the one checked against the runtime: options asking for Best444, which
+    /// a 6.3.2 runtime is too old for, still make a packet receiver there.
+    #[test]
+    fn packet_receivers_validate_the_color_format_the_sdk_is_given() {
+        use crate::{
+            capabilities::{
+                Capabilities, CapabilityUnavailable, RuntimeFeature, RuntimeInfo, SdkEdition,
+                SdkLinkage, SdkVersion,
+            },
+            sys::{advanced::AdvancedApi, table::ExportsWhere, Api, Evidence},
+            ReceiverColorFormat, Source,
+        };
+
+        // An Advanced 6.3.2 runtime that exports every function the crate
+        // knows, gated as the loader gates the runtime it selects.
+        let exports = ExportsWhere(|_: &str| true);
+        let (api, advanced) = (
+            Api::load(&exports).unwrap(),
+            AdvancedApi::load(&exports).unwrap(),
+        );
+        let version = SdkVersion::parse("NDI SDK TEST 6.3.2.0");
+        let capabilities = Capabilities::detect(&api, &advanced, version, SdkEdition::Advanced);
+        let info = RuntimeInfo {
+            edition: SdkEdition::Advanced,
+            linkage: SdkLinkage::Shared,
+            library_path: None,
+            raw_version: "NDI SDK TEST 6.3.2.0".into(),
+            version,
+        };
+        let runtime = Evidence {
+            api: &api,
+            advanced: &advanced,
+            info: &info,
+            capabilities: &capabilities,
+        };
+        let require = |feature| runtime.require(feature);
+        let too_old = |result: Result<()>, wanted: RuntimeFeature| {
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::UnsupportedCapability {
+                        feature,
+                        reason: CapabilityUnavailable::RuntimeTooOld,
+                        ..
+                    }) if feature == wanted
+                ),
+                "{result:?}"
+            );
+        };
+
+        let best = ReceiverOptions::new(Source::new(""))
+            .color_format(ReceiverColorFormat::Best444)
+            .allow_video_fields(false);
+        // An ordinary receiver would be given Best444.
+        too_old(
+            best.validate_runtime(require),
+            RuntimeFeature::ReceiveBest444,
+        );
+
+        let mut checked = 0;
+        for preset in PassthroughPreset::ALL {
+            let Ok(color_format) = runtime.passthrough_format(preset) else {
+                // Only a preset this build's headers do not declare.
+                assert!(!AdvancedApi::declares(RuntimeFeature::Passthrough(preset)));
+                continue;
+            };
+            let packets = creation_options(&best, color_format);
+            packets.validate_runtime(require).unwrap();
+            let settings = packets.to_raw().unwrap().raw;
+            assert_eq!(settings.color_format, color_format, "{preset:?}");
+            assert!(settings.allow_video_fields);
+
+            // What the SDK is given is still checked: video-only bandwidth
+            // needs NDI 6.4 too.
+            let video_only = best
+                .clone()
+                .bandwidth(crate::ReceiverBandwidth::VideoOnlyHighest);
+            too_old(
+                creation_options(&video_only, color_format).validate_runtime(require),
+                RuntimeFeature::ReceiveVideoOnly,
+            );
+            checked += 1;
+        }
+        let declared = PassthroughPreset::ALL
+            .into_iter()
+            .filter(|&preset| AdvancedApi::declares(RuntimeFeature::Passthrough(preset)))
+            .count();
+        assert_eq!(checked, declared);
     }
 
     /// Only the thread auto traits are withheld; tests/ui/advanced/fail checks

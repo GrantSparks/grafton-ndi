@@ -1,0 +1,23 @@
+error[E0599]: no method named `receiver_mut` found for mutable reference `&mut grafton_ndi::advanced::AvSync` in the current scope
+ --> tests/ui/advanced/fail/av_sync_has_no_receiver_mut.rs:5:26
+  |
+5 |     std::mem::swap(first.receiver_mut(), second.receiver_mut());
+  |                          ^^^^^^^^^^^^
+  |
+help: there is a method `receiver` with a similar name
+  |
+5 -     std::mem::swap(first.receiver_mut(), second.receiver_mut());
+5 +     std::mem::swap(first.receiver(), second.receiver_mut());
+  |
+
+error[E0599]: no method named `receiver_mut` found for mutable reference `&mut grafton_ndi::advanced::AvSync` in the current scope
+ --> tests/ui/advanced/fail/av_sync_has_no_receiver_mut.rs:5:49
+  |
+5 |     std::mem::swap(first.receiver_mut(), second.receiver_mut());
+  |                                                 ^^^^^^^^^^^^
+  |
+help: there is a method `receiver` with a similar name
+  |
+5 -     std::mem::swap(first.receiver_mut(), second.receiver_mut());
+5 +     std::mem::swap(first.receiver_mut(), second.receiver());
+  |

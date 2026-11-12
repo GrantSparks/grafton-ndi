@@ -416,6 +416,11 @@ pub struct ReceiverOptions {
     name: Option<String>,
     #[cfg(feature = "advanced")]
     pub(crate) config: Option<crate::advanced::AdvancedConfig>,
+    /// A native color format that the creation settings carry in place of
+    /// `color_format`: a passthrough preset's, which no
+    /// [`ReceiverColorFormat`] names.
+    #[cfg(feature = "advanced")]
+    passthrough: Option<NDIlib_recv_color_format_e>,
 }
 
 #[repr(C)]
@@ -438,6 +443,8 @@ impl ReceiverOptions {
             name: None,
             #[cfg(feature = "advanced")]
             config: None,
+            #[cfg(feature = "advanced")]
+            passthrough: None,
         }
     }
 
@@ -594,15 +601,43 @@ impl ReceiverOptions {
         self
     }
 
-    pub(crate) fn validate_runtime(&self, ndi: &Ndi) -> Result<()> {
-        if matches!(self.color_format, ReceiverColorFormat::Best444) {
-            ndi.require_feature(RuntimeFeature::ReceiveBest444)?;
+    /// These options with the native color format `format`, which no
+    /// [`ReceiverColorFormat`] names, in place of their own: the one a
+    /// passthrough preset selects. Validation and the creation settings both
+    /// take it, so what is checked is what the SDK is given.
+    #[cfg(feature = "advanced")]
+    pub(crate) fn with_passthrough(mut self, format: NDIlib_recv_color_format_e) -> Self {
+        self.passthrough = Some(format);
+        self
+    }
+
+    /// The color format the creation settings carry.
+    fn sdk_color_format(&self) -> NDIlib_recv_color_format_e {
+        #[cfg(feature = "advanced")]
+        if let Some(format) = self.passthrough {
+            return format;
+        }
+        self.color_format.to_sdk()
+    }
+
+    /// Refuse settings that the runtime cannot take, before anything is
+    /// created: `require` refuses a capability the runtime lacks, as
+    /// [`Ndi::require_feature`] does.
+    ///
+    /// Only the settings the SDK is given are checked: a color format that a
+    /// passthrough preset replaced is not.
+    pub(crate) fn validate_runtime(
+        &self,
+        require: impl Fn(RuntimeFeature) -> Result<()>,
+    ) -> Result<()> {
+        if self.sdk_color_format() == ReceiverColorFormat::Best444.to_sdk() {
+            require(RuntimeFeature::ReceiveBest444)?;
         }
         if matches!(
             self.bandwidth,
             ReceiverBandwidth::VideoOnlyLowest | ReceiverBandwidth::VideoOnlyHighest
         ) {
-            ndi.require_feature(RuntimeFeature::ReceiveVideoOnly)?;
+            require(RuntimeFeature::ReceiveVideoOnly)?;
         }
         Ok(())
     }
@@ -617,7 +652,7 @@ impl ReceiverOptions {
         Ok(RawRecvCreateV3 {
             raw: NDIlib_recv_create_v3_t {
                 source_to_connect_to: source_raw,
-                color_format: self.color_format.to_sdk(),
+                color_format: self.sdk_color_format(),
                 bandwidth: self.bandwidth.to_sdk(),
                 allow_video_fields: self.allow_video_fields,
                 p_ndi_recv_name,
@@ -630,7 +665,9 @@ impl ReceiverOptions {
 
 mod mode_sealed {
     pub trait Sealed {}
+    pub trait MetadataSealed {}
     pub trait CaptureSealed {}
+    pub trait VideoSealed {}
 }
 
 /// Sealed receiver capability mode: what a [`Receiver`] may do besides its
@@ -638,16 +675,34 @@ mod mode_sealed {
 ///
 /// The common controls work in every mode: tally, PTZ, upstream metadata,
 /// connection statistics, delays, source-name changes, connecting and
-/// reconnecting. A [`CaptureMode`] adds the receiver's own audio, metadata and
-/// event capture, and only [`RawCapture`] adds video capture.
+/// reconnecting. A [`MetadataMode`] adds the receiver's own metadata capture
+/// and event polling, a [`CaptureMode`] adds audio capture to those, and a
+/// [`VideoMode`] adds video capture. Only [`RawCapture`] is all three.
 pub trait ReceiverMode: mode_sealed::Sealed + Send + Sync {}
+
+/// Sealed receiver mode in which the receiver's own metadata capture and
+/// event polling are available: [`RawCapture`], [`FrameSyncAttached`] and,
+/// with the `advanced` feature, the `AvSyncAttached` mode of an Advanced
+/// `AvSync`'s receiver.
+///
+/// A mode without it hands every frame and event to the object that holds
+/// the receiver, which captures them itself.
+pub trait MetadataMode: ReceiverMode + mode_sealed::MetadataSealed {}
 
 /// Sealed receiver mode in which the receiver's own audio, metadata and event
 /// capture are available: [`RawCapture`] and [`FrameSyncAttached`].
 ///
-/// A mode without it hands those frames and events to the object that holds
-/// the receiver, which captures them itself.
-pub trait CaptureMode: ReceiverMode + mode_sealed::CaptureSealed {}
+/// A [`MetadataMode`] without it hands the receiver's audio to the object
+/// that holds the receiver.
+pub trait CaptureMode: MetadataMode + mode_sealed::CaptureSealed {}
+
+/// Sealed receiver mode in which the receiver's own video capture is
+/// available: [`RawCapture`] and, with the `advanced` feature, the
+/// `AvSyncAttached` mode of an Advanced `AvSync`'s receiver.
+///
+/// A mode without it hands the receiver's video to the object that holds the
+/// receiver.
+pub trait VideoMode: ReceiverMode + mode_sealed::VideoSealed {}
 
 /// Ordinary receiver mode, permitting raw video capture.
 #[derive(Debug)]
@@ -665,23 +720,51 @@ pub enum FrameSyncAttached {}
 #[cfg(feature = "advanced")]
 #[derive(Debug)]
 pub enum PacketAttached {}
+/// Receiver mode held by [`AvSync`](crate::advanced::AvSync), whose
+/// synchronizer takes the receiver's audio.
+///
+/// The receiver's own video and metadata capture and its event polling are
+/// available in this mode, as are the common controls. Its audio capture is
+/// not: the synchronizer consumes the audio and returns it matched to video
+/// through [`AvSync::synchronize`](crate::advanced::AvSync::synchronize).
+#[cfg(feature = "advanced")]
+#[derive(Debug)]
+pub enum AvSyncAttached {}
 impl mode_sealed::Sealed for RawCapture {}
 impl mode_sealed::Sealed for FrameSyncAttached {}
+impl mode_sealed::MetadataSealed for RawCapture {}
+impl mode_sealed::MetadataSealed for FrameSyncAttached {}
 impl mode_sealed::CaptureSealed for RawCapture {}
 impl mode_sealed::CaptureSealed for FrameSyncAttached {}
+impl mode_sealed::VideoSealed for RawCapture {}
 impl ReceiverMode for RawCapture {}
 impl ReceiverMode for FrameSyncAttached {}
+impl MetadataMode for RawCapture {}
+impl MetadataMode for FrameSyncAttached {}
 impl CaptureMode for RawCapture {}
 impl CaptureMode for FrameSyncAttached {}
+impl VideoMode for RawCapture {}
 #[cfg(feature = "advanced")]
 impl mode_sealed::Sealed for PacketAttached {}
 #[cfg(feature = "advanced")]
 impl ReceiverMode for PacketAttached {}
+#[cfg(feature = "advanced")]
+impl mode_sealed::Sealed for AvSyncAttached {}
+#[cfg(feature = "advanced")]
+impl mode_sealed::MetadataSealed for AvSyncAttached {}
+#[cfg(feature = "advanced")]
+impl mode_sealed::VideoSealed for AvSyncAttached {}
+#[cfg(feature = "advanced")]
+impl ReceiverMode for AvSyncAttached {}
+#[cfg(feature = "advanced")]
+impl MetadataMode for AvSyncAttached {}
+#[cfg(feature = "advanced")]
+impl VideoMode for AvSyncAttached {}
 
 /// An owned NDI receiver. The default mode permits all raw capture kinds.
-/// [`FrameSync`](crate::FrameSync), and the Advanced `PacketReceiver`, change
-/// the mode of the receiver they hold while retaining the same resource core;
-/// see [`ReceiverMode`].
+/// [`FrameSync`](crate::FrameSync), and the Advanced `PacketReceiver` and
+/// `AvSync`, change the mode of the receiver they hold while retaining the
+/// same resource core; see [`ReceiverMode`].
 ///
 /// Dropping the receiver disconnects it from its source, unless a
 /// [`RecvAdvertiser`](crate::discovery::RecvAdvertiser) registration still
@@ -768,7 +851,7 @@ impl Receiver {
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(&'static sys::Core, &NDIlib_recv_create_v3_t) -> NDIlib_recv_instance_t,
     ) -> Result<Self> {
-        options.validate_runtime(ndi)?;
+        options.validate_runtime(|feature| ndi.require_feature(feature))?;
         let raw = options.to_raw()?;
         let instance = create(&ndi.api().core, &raw.raw);
         if instance.is_null() {
@@ -790,7 +873,9 @@ impl Receiver {
             _mode: PhantomData,
         })
     }
+}
 
+impl<M: VideoMode> Receiver<M> {
     /// Capture **video** frames from this receiver.
     ///
     /// Returns a [`Capture`] view with two verbs, which both wait up to their
@@ -1209,7 +1294,9 @@ impl<M: ReceiverMode> Receiver<M> {
     }
 }
 
-impl<M: CaptureMode> Receiver<M> {
+/// The receiver's own event polling, metadata capture and, in a
+/// [`CaptureMode`], audio capture.
+impl<M: MetadataMode> Receiver<M> {
     /// Wait up to `timeout` for a status or source change, or return `None`
     /// when none came.
     ///
@@ -1241,6 +1328,8 @@ impl<M: CaptureMode> Receiver<M> {
     ///
     /// Returns a [`Capture`] view; see [`Receiver::video`] for its two verbs,
     /// [`capture`](Capture::capture) and [`capture_ref`](Capture::capture_ref).
+    /// It exists in each [`CaptureMode`]; an Advanced `AvSync` takes the
+    /// audio of the receiver it holds.
     ///
     /// # Examples
     ///
@@ -1257,7 +1346,10 @@ impl<M: CaptureMode> Receiver<M> {
     /// # }
     /// ```
     #[must_use = "the Capture view does nothing until a capture verb is called"]
-    pub fn audio(&self) -> Capture<'_, AudioKind> {
+    pub fn audio(&self) -> Capture<'_, AudioKind>
+    where
+        M: CaptureMode,
+    {
         Capture::new(&self.core)
     }
 
@@ -1630,9 +1722,11 @@ pub(crate) mod native_capture_calls {
 /// the budget expires, so the timeout is not a strict wall-clock completion
 /// guarantee.
 ///
-/// Only the ordinary receiver mode exposes a video view. FrameSync owns video
-/// capture until [`crate::FrameSync::into_receiver`] restores the ordinary mode.
-/// Audio and metadata views exist in each [`CaptureMode`].
+/// A video view exists in each [`VideoMode`], an audio view in each
+/// [`CaptureMode`] and a metadata view in each [`MetadataMode`]. FrameSync
+/// owns video capture until [`crate::FrameSync::into_receiver`] restores the
+/// ordinary mode, and an Advanced `AvSync` owns audio capture until its
+/// `into_receiver` does.
 pub struct Capture<'rx, K: CaptureKind> {
     rx: &'rx ReceiverCore,
     _kind: PhantomData<K>,
@@ -1916,7 +2010,8 @@ unsafe impl Send for ReceiverCore {}
 /// [`Receiver::video`], [`Receiver::audio`], and [`Receiver::metadata`]) can be
 /// safely called from multiple threads simultaneously. The wrapper's capture
 /// guard excludes reconnect calls from receiver capture calls. Receiver modes
-/// prevent raw video capture while a FrameSync owns this core.
+/// prevent raw video capture while a FrameSync owns this core, and raw audio
+/// capture while an Advanced AvSync, which takes the audio, owns it.
 /// Borrowed frame guards retain the receiver borrow until they free their buffers.
 unsafe impl Sync for ReceiverCore {}
 
@@ -2190,7 +2285,8 @@ mod tests {
         let best = ReceiverOptions::new(test_source()).color_format(ReceiverColorFormat::Best444);
         assert_eq!(best.to_raw().unwrap().raw.color_format, 102);
         assert_eq!(
-            best.validate_runtime(&ndi).is_ok(),
+            best.validate_runtime(|feature| ndi.require_feature(feature))
+                .is_ok(),
             ndi.require_feature(RuntimeFeature::ReceiveBest444).is_ok()
         );
         for (bandwidth, value) in [
@@ -2200,12 +2296,16 @@ mod tests {
             let options = ReceiverOptions::new(test_source()).bandwidth(bandwidth);
             assert_eq!(options.to_raw().unwrap().raw.bandwidth, value);
             assert_eq!(
-                options.validate_runtime(&ndi).is_ok(),
+                options
+                    .validate_runtime(|feature| ndi.require_feature(feature))
+                    .is_ok(),
                 ndi.require_feature(RuntimeFeature::ReceiveVideoOnly)
                     .is_ok()
             );
         }
-        assert!(unconnected().validate_runtime(&ndi).is_ok());
+        assert!(unconnected()
+            .validate_runtime(|feature| ndi.require_feature(feature))
+            .is_ok());
     }
 
     #[test]

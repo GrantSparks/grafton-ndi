@@ -1,0 +1,43 @@
+error[E0277]: the trait bound `AvSyncAttached: CaptureMode` is not satisfied
+ --> tests/ui/advanced/fail/av_sync_receiver_has_no_audio_capture.rs:9:22
+  |
+9 |     let _ = receiver.audio().capture(Duration::ZERO);
+  |                      ^^^^^ the trait `CaptureMode` is not implemented for `AvSyncAttached`
+  |
+help: the following other types implement trait `CaptureMode`
+ --> src/receiver.rs
+  |
+  | impl CaptureMode for RawCapture {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `RawCapture`
+  | impl CaptureMode for FrameSyncAttached {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `FrameSyncAttached`
+note: required by a bound in `grafton_ndi::Receiver::<M>::audio`
+ --> src/receiver.rs
+  |
+  |     pub fn audio(&self) -> Capture<'_, AudioKind>
+  |            ----- required by a bound in this associated function
+  |     where
+  |         M: CaptureMode,
+  |            ^^^^^^^^^^^ required by this bound in `Receiver::<M>::audio`
+
+error[E0277]: the trait bound `AvSyncAttached: CaptureMode` is not satisfied
+  --> tests/ui/advanced/fail/av_sync_receiver_has_no_audio_capture.rs:12:29
+   |
+12 |     let _ = sync.receiver().audio().capture_ref(Duration::ZERO);
+   |                             ^^^^^ the trait `CaptureMode` is not implemented for `AvSyncAttached`
+   |
+help: the following other types implement trait `CaptureMode`
+  --> src/receiver.rs
+   |
+   | impl CaptureMode for RawCapture {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `RawCapture`
+   | impl CaptureMode for FrameSyncAttached {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `FrameSyncAttached`
+note: required by a bound in `grafton_ndi::Receiver::<M>::audio`
+  --> src/receiver.rs
+   |
+   |     pub fn audio(&self) -> Capture<'_, AudioKind>
+   |            ----- required by a bound in this associated function
+   |     where
+   |         M: CaptureMode,
+   |            ^^^^^^^^^^^ required by this bound in `Receiver::<M>::audio`
