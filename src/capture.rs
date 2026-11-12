@@ -35,7 +35,7 @@ use crate::{
         AudioFrame, AudioFrameRef, MetadataFrame, MetadataFrameRef, VideoFrame, VideoFrameRef,
     },
     sys::{self, bindings::*},
-    Result, NDI,
+    Error, Result, NDI,
 };
 
 /// Sealed trait module to prevent external implementations of [`FrameFree`] and
@@ -449,32 +449,59 @@ impl<'owner, S: FrameFree> Drop for Guard<'owner, S> {
     }
 }
 
-/// Result of a generic capture operation.
-///
-/// This enum represents the possible outcomes of calling `NDIlib_recv_capture_v3`:
-/// - `Frame`: Successfully captured a frame of the expected type
-/// - `None`: No frame available (timeout)
-/// - `Error`: The SDK returned an error frame
+/// Result of a generic capture operation: the frame `NDIlib_recv_capture_v3`
+/// was asked for, or what it reported instead.
 pub(crate) enum CaptureResult<'rx, K: CaptureKind> {
     /// Successfully captured a frame of the expected type.
     Frame(Guard<'rx, K>),
-    /// No frame available within timeout, or a different frame type was returned.
+    /// No frame for the caller; see [`Notification`].
+    Notification(Notification),
+}
+
+/// What `NDIlib_recv_capture_v3` reports in place of a frame the caller asked
+/// for. None of these carries a frame buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Notification {
+    /// Nothing arrived within the timeout. A frame type whose slot the caller
+    /// left null is reported the same way, because no frame was delivered.
     None,
-    /// A capability invalidation notification, without a frame buffer.
+    /// The connection's status or the source's capabilities changed.
     StatusChanged,
-    /// The native connection's source changed, without a frame buffer.
+    /// The receiver is now connected to a different source.
     SourceChanged,
-    /// An unrecognized notification code, without exposing an unknown payload.
+    /// A frame type this crate does not know, with its native value.
     Unknown(u32),
-    /// The SDK returned an error frame.
-    Error,
+}
+
+impl Notification {
+    /// Classify a frame type `NDIlib_recv_capture_v3` returned without a frame
+    /// for the caller.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CaptureFailed`] for an error frame, which
+    /// `Processing.NDI.Recv.h` documents as a lost connection.
+    pub(crate) fn classify(frame_type: NDIlib_frame_type_e) -> Result<Self> {
+        match frame_type {
+            NDIlib_frame_type_e_NDIlib_frame_type_none
+            | NDIlib_frame_type_e_NDIlib_frame_type_video
+            | NDIlib_frame_type_e_NDIlib_frame_type_audio
+            | NDIlib_frame_type_e_NDIlib_frame_type_metadata => Ok(Self::None),
+            NDIlib_frame_type_e_NDIlib_frame_type_status_change => Ok(Self::StatusChanged),
+            NDIlib_frame_type_e_NDIlib_frame_type_source_change => Ok(Self::SourceChanged),
+            NDIlib_frame_type_e_NDIlib_frame_type_error => Err(Error::CaptureFailed(
+                "the SDK returned an error frame: the connection was lost".into(),
+            )),
+            value => Ok(Self::Unknown(value)),
+        }
+    }
 }
 
 /// Capture a frame of kind `K` from an NDI receiver.
 ///
 /// Routes the frame into the matching `NDIlib_recv_capture_v3` slot via
-/// [`CaptureStrategy::capture_into`] and classifies the result. Other frame types
-/// are treated as [`CaptureResult::None`]; status changes are retained separately.
+/// [`CaptureStrategy::capture_into`]; any other result is classified by
+/// [`Notification::classify`].
 ///
 /// # Safety
 ///
@@ -485,20 +512,15 @@ pub(crate) unsafe fn capture_raw<'rx, K: CaptureKind>(
     runtime: &'rx NDI,
     instance: NDIlib_recv_instance_t,
     timeout_ms: u32,
-) -> CaptureResult<'rx, K> {
+) -> Result<CaptureResult<'rx, K>> {
     let mut frame = K::RawFrame::default();
     let frame_type = K::capture_into(&runtime.api().core, instance, &mut frame, timeout_ms);
-
-    match frame_type {
-        t if t == K::FRAME_TYPE => CaptureResult::Frame(Guard::<K>::new(runtime, instance, frame)),
-        NDIlib_frame_type_e_NDIlib_frame_type_none => CaptureResult::None,
-        NDIlib_frame_type_e_NDIlib_frame_type_status_change => CaptureResult::StatusChanged,
-        NDIlib_frame_type_e_NDIlib_frame_type_error => CaptureResult::Error,
-        NDIlib_frame_type_e_NDIlib_frame_type_source_change => CaptureResult::SourceChanged,
-        NDIlib_frame_type_e_NDIlib_frame_type_video
-        | NDIlib_frame_type_e_NDIlib_frame_type_audio
-        | NDIlib_frame_type_e_NDIlib_frame_type_metadata => CaptureResult::None,
-        value => CaptureResult::Unknown(value),
+    if frame_type == K::FRAME_TYPE {
+        Ok(CaptureResult::Frame(Guard::<K>::new(
+            runtime, instance, frame,
+        )))
+    } else {
+        Notification::classify(frame_type).map(CaptureResult::Notification)
     }
 }
 
@@ -573,6 +595,44 @@ mod tests {
         assert!(size_of::<Guard<MetadataKind>>() > 0);
         assert!(size_of::<Guard<FrameSyncVideoFree>>() > 0);
         assert!(size_of::<Guard<FrameSyncAudioFree>>() > 0);
+    }
+
+    #[test]
+    fn frame_types_without_a_frame_are_classified_once() {
+        for (frame_type, expected) in [
+            (
+                NDIlib_frame_type_e_NDIlib_frame_type_none,
+                Notification::None,
+            ),
+            (
+                NDIlib_frame_type_e_NDIlib_frame_type_video,
+                Notification::None,
+            ),
+            (
+                NDIlib_frame_type_e_NDIlib_frame_type_audio,
+                Notification::None,
+            ),
+            (
+                NDIlib_frame_type_e_NDIlib_frame_type_metadata,
+                Notification::None,
+            ),
+            (
+                NDIlib_frame_type_e_NDIlib_frame_type_status_change,
+                Notification::StatusChanged,
+            ),
+            (
+                NDIlib_frame_type_e_NDIlib_frame_type_source_change,
+                Notification::SourceChanged,
+            ),
+            (987, Notification::Unknown(987)),
+        ] {
+            assert_eq!(Notification::classify(frame_type).unwrap(), expected);
+        }
+        let error = Notification::classify(NDIlib_frame_type_e_NDIlib_frame_type_error);
+        assert!(
+            matches!(&error, Err(Error::CaptureFailed(reason)) if reason.contains("error frame")),
+            "{error:?}"
+        );
     }
 
     #[test]

@@ -42,7 +42,9 @@ use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 
 use crate::{
     capabilities::RuntimeFeature,
-    capture::{capture_raw, AudioKind, CaptureKind, CaptureResult, MetadataKind, VideoKind},
+    capture::{
+        capture_raw, AudioKind, CaptureKind, CaptureResult, MetadataKind, Notification, VideoKind,
+    },
     finder::{RawSource, Source},
     sys::{self, bindings::*},
     timeout::Deadline,
@@ -999,27 +1001,13 @@ impl<M: ReceiverMode> Receiver<M> {
     /// imply the source is already available. Existing FrameSync ownership remains.
     pub fn connect_to(&self, source: &Source) -> Result<()> {
         let raw = source.to_raw()?;
-        let _exclusive = self.core.capture_guard.write();
-        // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
-        unsafe {
-            self.core
-                .sdk()
-                .NDIlib_recv_connect(self.core.instance, &raw.raw)
-        };
+        self.core.connect(Some(&raw));
         Ok(())
     }
 
     /// Disconnect the native receiver while retaining its original reconnect target.
     pub fn disconnect(&self) {
-        let _exclusive = self.core.capture_guard.write();
-        // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
-        unsafe {
-            self.core
-                .sdk()
-                .NDIlib_recv_connect(self.core.instance, ptr::null())
-        };
+        self.core.connect(None);
     }
 
     /// Poll coalesced status/source invalidations, including those seen by media capture.
@@ -1409,18 +1397,7 @@ impl<M: ReceiverMode> Receiver<M> {
         // Marshal before locking; this touches only `self.core.source`, not the
         // instance, so it need not hold off captures.
         let raw = self.core.source.to_raw()?;
-        // Exclusive guard: waits for in-flight captures to drain and blocks new
-        // ones, so `NDIlib_recv_connect` never overlaps `NDIlib_recv_capture_v3`.
-        let _exclusive = self.core.capture_guard.write();
-        // SAFETY: `self.core.instance` is a valid receiver instance for the
-        // lifetime of `self`, and `raw` (which owns the backing
-        // CStrings) outlives the call, so the pointers inside `raw.raw`
-        // stay valid while the SDK copies the source descriptor.
-        unsafe {
-            self.core
-                .sdk()
-                .NDIlib_recv_connect(self.core.instance, &raw.raw)
-        };
+        self.core.connect(Some(&raw));
         Ok(())
     }
 
@@ -1538,6 +1515,23 @@ impl ReceiverCore {
         self._ndi.table()
     }
 
+    /// Point the native receiver at `source`, or at no source, once no capture
+    /// is in flight.
+    ///
+    /// The capture guard is held exclusively for the call: it waits for
+    /// in-flight captures to drain and holds off new ones, so
+    /// `NDIlib_recv_connect` never overlaps `NDIlib_recv_capture_v3` on this
+    /// instance, the one combination `Processing.NDI.Recv.h` does not make safe.
+    fn connect(&self, source: Option<&RawSource>) {
+        let _exclusive = self.capture_guard.write();
+        let source = source.map_or(ptr::null(), |raw| ptr::from_ref(&raw.raw));
+        // SAFETY: the receiver instance is live for this borrow. `source` is
+        // null or points into a `RawSource`, which owns the strings its
+        // descriptor points to and outlives this synchronous call, during
+        // which the SDK copies the descriptor.
+        unsafe { self.sdk().NDIlib_recv_connect(self.instance, source) };
+    }
+
     /// Acquire only within the caller's existing budget, including contention.
     ///
     /// Every `NDIlib_recv_capture_v3` call on this instance holds this guard,
@@ -1570,7 +1564,8 @@ impl ReceiverCore {
         };
         let timeout_ms = deadline.remaining_ms();
         // SAFETY: self.instance is a valid NDI receiver instance.
-        self.capture_result::<K>(unsafe { capture_raw::<K>(&self._ndi, self.instance, timeout_ms) })
+        let result = unsafe { capture_raw::<K>(&self._ndi, self.instance, timeout_ms) }?;
+        self.capture_result::<K>(result)
     }
 
     fn capture_result<'rx, K: CaptureKind>(
@@ -1584,20 +1579,10 @@ impl ReceiverCore {
                 let frame_ref = unsafe { K::make_ref(guard)? };
                 Ok(Some(frame_ref))
             }
-            CaptureResult::StatusChanged => {
-                self.pending_status.store(true, Ordering::Release);
+            CaptureResult::Notification(notification) => {
+                self.retain(notification);
                 Ok(None)
             }
-            CaptureResult::SourceChanged => {
-                self.pending_source.store(true, Ordering::Release);
-                Ok(None)
-            }
-            CaptureResult::Unknown(value) => {
-                *self.pending_unknown.lock() = Some(value);
-                Ok(None)
-            }
-            CaptureResult::None => Ok(None),
-            CaptureResult::Error => Err(Error::CaptureFailed("Received an error frame".into())),
         }
     }
 
@@ -1660,16 +1645,13 @@ impl ReceiverCore {
         }
     }
 
-    fn retain_non_status_event(&self, value: NDIlib_frame_type_e) {
-        match value {
-            NDIlib_frame_type_e_NDIlib_frame_type_source_change => {
-                self.pending_source.store(true, Ordering::Release)
-            }
-            NDIlib_frame_type_e_NDIlib_frame_type_none
-            | NDIlib_frame_type_e_NDIlib_frame_type_video
-            | NDIlib_frame_type_e_NDIlib_frame_type_audio
-            | NDIlib_frame_type_e_NDIlib_frame_type_metadata => {}
-            value => *self.pending_unknown.lock() = Some(value),
+    /// Keep a notification a capture reported for [`Self::poll_event`].
+    fn retain(&self, notification: Notification) {
+        match notification {
+            Notification::None => {}
+            Notification::StatusChanged => self.pending_status.store(true, Ordering::Release),
+            Notification::SourceChanged => self.pending_source.store(true, Ordering::Release),
+            Notification::Unknown(value) => *self.pending_unknown.lock() = Some(value),
         }
     }
 
@@ -1709,15 +1691,7 @@ impl ReceiverCore {
                 deadline.remaining_ms(),
             )
         };
-        match value {
-            NDIlib_frame_type_e_NDIlib_frame_type_error => {
-                return Err(Error::CaptureFailed("Received an error frame".into()))
-            }
-            NDIlib_frame_type_e_NDIlib_frame_type_status_change => {
-                self.pending_status.store(true, Ordering::Release)
-            }
-            value => self.retain_non_status_event(value),
-        }
+        self.retain(Notification::classify(value)?);
         Ok(self.take_pending_event())
     }
 }
@@ -2106,11 +2080,13 @@ mod tests {
         for _ in 0..3 {
             assert!(receiver
                 .core
-                .capture_result::<VideoKind>(CaptureResult::SourceChanged)
+                .capture_result::<VideoKind>(CaptureResult::Notification(
+                    Notification::SourceChanged
+                ))
                 .unwrap()
                 .is_none());
         }
-        receiver.core.retain_non_status_event(987);
+        receiver.core.retain(Notification::classify(987).unwrap());
         assert!(matches!(
             receiver.core.take_pending_event(),
             Some(ReceiverEvent::SourceChanged)
@@ -2122,10 +2098,12 @@ mod tests {
         assert!(receiver.core.take_pending_event().is_none());
         assert!(receiver
             .core
-            .capture_result::<VideoKind>(CaptureResult::Unknown(988))
+            .capture_result::<VideoKind>(CaptureResult::Notification(Notification::Unknown(988)))
             .unwrap()
             .is_none());
-        receiver.core.retain_non_status_event(101);
+        receiver.core.retain(
+            Notification::classify(NDIlib_frame_type_e_NDIlib_frame_type_source_change).unwrap(),
+        );
         assert!(matches!(
             receiver.core.take_pending_event(),
             Some(ReceiverEvent::SourceChanged)
@@ -2371,13 +2349,15 @@ mod tests {
                 for _ in 0..3 {
                     assert!(receiver
                         .core
-                        .capture_result::<K>(CaptureResult::StatusChanged)
+                        .capture_result::<K>(CaptureResult::Notification(
+                            Notification::StatusChanged
+                        ))
                         .unwrap()
                         .is_none());
                 }
                 assert!(receiver
                     .core
-                    .capture_result::<K>(CaptureResult::None)
+                    .capture_result::<K>(CaptureResult::Notification(Notification::None))
                     .unwrap()
                     .is_none());
                 assert!(matches!(
@@ -2470,7 +2450,7 @@ mod tests {
         let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
         receiver
             .core
-            .capture_result::<AudioKind>(CaptureResult::StatusChanged)
+            .capture_result::<AudioKind>(CaptureResult::Notification(Notification::StatusChanged))
             .unwrap();
         assert!(receiver.core.take_pending_status().is_some());
 
@@ -2478,7 +2458,7 @@ mod tests {
         let _exclusive = receiver.core.capture_guard.write();
         receiver
             .core
-            .capture_result::<VideoKind>(CaptureResult::StatusChanged)
+            .capture_result::<VideoKind>(CaptureResult::Notification(Notification::StatusChanged))
             .unwrap();
         assert!(matches!(
             receiver.poll_event(Duration::ZERO).unwrap(),

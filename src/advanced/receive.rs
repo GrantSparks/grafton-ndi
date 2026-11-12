@@ -6,7 +6,7 @@ use super::{
     packets, AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedVideoFrame, VideoCodec,
 };
 use crate::{
-    capture::{AudioKind, CaptureKind, Guard, MetadataKind, VideoKind},
+    capture::{AudioKind, CaptureKind, Guard, MetadataKind, Notification, VideoKind},
     sys::{
         self,
         advanced::{declared, native, ReceiverConfiguration},
@@ -327,13 +327,12 @@ impl PacketReceiver {
                 // SAFETY: `metadata` holds the delivered frame; see above.
                 metadata_event(unsafe { Guard::<MetadataKind>::new(ndi, instance, metadata) })
             }
-            NDIlib_frame_type_e_NDIlib_frame_type_none => Ok(PacketEvent::Timeout),
-            NDIlib_frame_type_e_NDIlib_frame_type_status_change => Ok(PacketEvent::StatusChanged),
-            NDIlib_frame_type_e_NDIlib_frame_type_source_change => Ok(PacketEvent::SourceChanged),
-            NDIlib_frame_type_e_NDIlib_frame_type_error => Err(Error::CaptureFailed(
-                "Packet receiver reported an SDK error".into(),
-            )),
-            other => Ok(PacketEvent::Unknown(other)),
+            other => Ok(match Notification::classify(other)? {
+                Notification::None => PacketEvent::Timeout,
+                Notification::StatusChanged => PacketEvent::StatusChanged,
+                Notification::SourceChanged => PacketEvent::SourceChanged,
+                Notification::Unknown(value) => PacketEvent::Unknown(value),
+            }),
         }
     }
 
