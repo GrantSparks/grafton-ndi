@@ -4072,7 +4072,7 @@ mod tests {
             let packed = validate_packed_audio_dimensions(channels, samples);
             let owned =
                 validate_outbound_audio_layout(48_000, channels, samples, AudioFormat::Fltp);
-            let request = crate::FrameSyncAudioRequest::capture(channels, samples);
+            let request = crate::FrameSyncAudioRequest::capture_at(48_000, channels, samples);
             assert_eq!(
                 packed.is_ok(),
                 valid,

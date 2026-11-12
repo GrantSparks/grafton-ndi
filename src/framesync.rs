@@ -142,20 +142,19 @@ impl AudioInputFormat {
 /// A validated, reusable audio capture for [`FrameSync::capture_audio`] and
 /// [`FrameSync::capture_audio_ref`].
 ///
-/// [`capture`](Self::capture) and [`capture_at`](Self::capture_at) require
-/// explicit positive output channels and samples per channel. Construction checks
-/// the SDK's signed byte stride and the 64 MiB packed sample payload limit before
-/// any native work. This bounds requested samples, not SDK internal memory use.
+/// [`capture_at`](Self::capture_at) and [`for_input`](Self::for_input) require
+/// an explicit positive sample rate, output channels and samples per channel.
+/// Construction checks the SDK's signed byte stride and the 64 MiB packed
+/// sample payload limit before any native work. This bounds requested samples, not SDK internal memory use.
 /// Successful construction and request reuse allocate nothing in the wrapper;
 /// submitting a request performs no dimension checks, locks, or extra SDK queries.
 /// Returned descriptors and metadata are still validated after each capture.
 ///
-/// Every request captures samples. To follow the source's channels, call
+/// Every request captures samples. To follow the source's format, call
 /// [`FrameSync::audio_input_format`] until it returns `Some`, then build a
-/// request with that format's [`num_channels`](AudioInputFormat::num_channels).
-/// Query again and rebuild when the application chooses to follow format
-/// changes. The SDK converts to the request's channel count even if the source
-/// changes meanwhile.
+/// request with [`for_input`](Self::for_input). Query again and rebuild when
+/// the application chooses to follow format changes. The SDK converts to the
+/// request's rate and channel count even if the source changes meanwhile.
 ///
 /// # Example
 ///
@@ -179,48 +178,36 @@ impl AudioInputFormat {
 /// let request = FrameSyncAudioRequest::capture_at(48_000, format.num_channels(), 1_024)?;
 /// let audio = framesync.capture_audio(request)?;
 /// assert_eq!(audio.num_channels(), format.num_channels());
+///
+/// // Or in the source's rate and channels.
+/// let request = FrameSyncAudioRequest::for_input(format, 1_024)?;
 /// # Ok(())
 /// # }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FrameSyncAudioRequest {
-    // The SDK's signed arguments, checked positive; the sample rate is zero
-    // for the source's rate.
+    // The SDK's signed arguments, all checked positive.
     sample_rate: i32,
     num_channels: i32,
     num_samples: i32,
 }
 
 impl FrameSyncAudioRequest {
-    /// Capture samples at the source's sample rate, converted to
-    /// `num_channels` channels of `num_samples` samples each.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidFrame`] for a zero dimension, an
-    /// unrepresentable signed byte stride, arithmetic overflow, or a sample
-    /// payload exceeding 64 MiB. Validation does not allocate sample storage.
-    pub fn capture(num_channels: u32, num_samples: u32) -> Result<Self> {
-        Self::checked(0, num_channels, num_samples)
-    }
-
     /// Capture samples resampled to `sample_rate` Hz, converted to
     /// `num_channels` channels of `num_samples` samples each.
+    ///
+    /// To follow the source's format, use [`for_input`](Self::for_input).
     ///
     /// A request can be copied and reused across borrowed and owned captures.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidFrame`] for a sample rate outside
-    /// `1..=i32::MAX` or invalid dimensions as described in
-    /// [`capture`](Self::capture).
+    /// `1..=i32::MAX`, a zero dimension, an unrepresentable signed byte
+    /// stride, arithmetic overflow, or a sample payload exceeding 64 MiB.
+    /// Validation does not allocate sample storage.
     pub fn capture_at(sample_rate: u32, num_channels: u32, num_samples: u32) -> Result<Self> {
         let sample_rate = validate_audio_sample_rate(sample_rate.into())?;
-        Self::checked(sample_rate, num_channels, num_samples)
-    }
-
-    /// A capture request with a checked or zero (source) sample rate.
-    fn checked(sample_rate: u32, num_channels: u32, num_samples: u32) -> Result<Self> {
         validate_packed_audio_dimensions(num_channels, num_samples)?;
         // Lossless: the rate and the packed dimensions were checked to fit
         // the SDK's signed arguments.
@@ -229,6 +216,50 @@ impl FrameSyncAudioRequest {
             num_channels: num_channels as i32,
             num_samples: num_samples as i32,
         })
+    }
+
+    /// Capture samples at the sample rate and channel count of `format`, with
+    /// `num_samples` samples per channel.
+    ///
+    /// `format` comes from [`FrameSync::audio_input_format`], which returns
+    /// `None` until the source's audio has arrived. The request fixes the
+    /// format it was built from: if the source changes later the SDK converts
+    /// to the request's rate and channels. To follow such changes, query the
+    /// format again and build a new request.
+    ///
+    /// # Errors
+    ///
+    /// As for [`capture_at`](Self::capture_at): [`Error::InvalidFrame`] for a
+    /// zero or oversized `num_samples`, or a payload exceeding 64 MiB.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{Ndi, ReceiverOptions, Receiver, FrameSync, FrameSyncAudioRequest, Source};
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = Ndi::new()?;
+    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("Test")))?;
+    /// let framesync = FrameSync::new(receiver)?;
+    ///
+    /// // Wait until the source's audio format is known.
+    /// let format = loop {
+    ///     if let Some(format) = framesync.audio_input_format()? {
+    ///         break format;
+    ///     }
+    ///     std::thread::sleep(Duration::from_millis(10));
+    /// };
+    ///
+    /// let request = FrameSyncAudioRequest::for_input(format, 1_024)?;
+    /// let audio = framesync.capture_audio(request)?;
+    /// assert_eq!(audio.sample_rate(), format.sample_rate());
+    /// // To follow a source change, call `audio_input_format` again and
+    /// // build a new request.
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn for_input(format: AudioInputFormat, num_samples: u32) -> Result<Self> {
+        Self::capture_at(format.sample_rate(), format.num_channels(), num_samples)
     }
 }
 
@@ -551,18 +582,19 @@ impl FrameSync {
     /// the request's channels and samples per channel; the SDK supplies
     /// silence when no audio has arrived.
     ///
-    /// # Following the source's channels
+    /// # Following the source's format
     ///
-    /// A request names its channel count explicitly. To capture in the
-    /// source's channels, wait for [`Self::audio_input_format`] to return
-    /// `Some`, then build a request with that channel count.
+    /// A request names its sample rate and channel count explicitly. To
+    /// capture in the source's format, wait for [`Self::audio_input_format`]
+    /// to return `Some`, then build a request with
+    /// [`FrameSyncAudioRequest::for_input`].
     ///
     /// # Errors
     ///
-    /// Returns frame-validation errors if the SDK returns malformed audio
-    /// dimensions, sample layout, buffers, or metadata, including a frame
-    /// without samples. Request dimensions were already validated at
-    /// construction.
+    /// Returns frame-validation errors only if the SDK returns malformed audio
+    /// dimensions, sample layout, buffers, or metadata. A capture before any
+    /// audio has arrived is not an error. Request dimensions were already
+    /// validated at construction.
     ///
     /// # Example
     ///
@@ -576,13 +608,13 @@ impl FrameSync {
     /// # let receiver = Receiver::new(&ndi, &options)?;
     /// let framesync = FrameSync::new(receiver)?;
     ///
-    /// let channels = loop {
+    /// let format = loop {
     ///     match framesync.audio_input_format()? {
-    ///         Some(format) => break format.num_channels(),
+    ///         Some(format) => break format,
     ///         None => std::thread::sleep(Duration::from_millis(10)),
     ///     }
     /// };
-    /// let request = FrameSyncAudioRequest::capture(channels, 1_024)?;
+    /// let request = FrameSyncAudioRequest::for_input(format, 1_024)?;
     ///
     /// let audio = framesync.capture_audio_ref(request)?;
     /// println!("{} channels at {} Hz", audio.num_channels(), audio.sample_rate());
@@ -599,12 +631,12 @@ impl FrameSync {
         audio_test_calls::capture();
         // SAFETY: The live FrameSync owns its receiver/runtime. Request fields
         // are private: construction checked positive channels and samples, the
-        // packed FLTP payload and the signed byte stride, and a positive or
-        // zero (source) sample rate. Processing.NDI.FrameSync.h permits
-        // explicit output channels independent of input. No source-channel
-        // sentinel can race a format change here. The SDK owns the returned
-        // allocation until Guard frees it through this same instance,
-        // including validation errors.
+        // packed FLTP payload and the signed byte stride, and a positive
+        // sample rate. Processing.NDI.FrameSync.h permits an output rate and
+        // channel count independent of the input, and supplies silence before
+        // audio arrives. No source-format sentinel can race a format change
+        // here. The SDK owns the returned allocation until Guard frees it
+        // through this same instance, including validation errors.
         unsafe {
             self.core().NDIlib_framesync_capture_audio_v2(
                 self.resource.instance,
@@ -904,13 +936,22 @@ mod tests {
             (i32::MAX.unsigned_abs(), 1),
             (u32::MAX, u32::MAX),
         ] {
-            assert!(FrameSyncAudioRequest::capture(channels, samples).is_err());
             assert!(FrameSyncAudioRequest::capture_at(48_000, channels, samples).is_err());
         }
         // Exact cap, with no sample allocation or native call.
-        assert!(FrameSyncAudioRequest::capture(2, 8_388_608).is_ok());
-        assert!(FrameSyncAudioRequest::capture(1, 16_777_216).is_ok());
-        assert!(FrameSyncAudioRequest::capture(1, 16_777_217).is_err());
+        assert!(FrameSyncAudioRequest::capture_at(48_000, 2, 8_388_608).is_ok());
+        assert!(FrameSyncAudioRequest::capture_at(48_000, 1, 16_777_216).is_ok());
+        assert!(FrameSyncAudioRequest::capture_at(48_000, 1, 16_777_217).is_err());
+        let format = AudioInputFormat::new(
+            NonZeroU32::new(44_100).unwrap(),
+            NonZeroU32::new(6).unwrap(),
+        );
+        assert_eq!(
+            FrameSyncAudioRequest::for_input(format, 480).unwrap(),
+            FrameSyncAudioRequest::capture_at(44_100, 6, 480).unwrap()
+        );
+        assert!(FrameSyncAudioRequest::for_input(format, 0).is_err());
+        assert!(FrameSyncAudioRequest::for_input(format, 536_870_912).is_err());
     }
 
     #[test]
@@ -939,7 +980,9 @@ mod tests {
 
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
             for _ in 0..1000 {
-                std::hint::black_box(FrameSyncAudioRequest::capture(2, 8_388_608).unwrap());
+                std::hint::black_box(
+                    FrameSyncAudioRequest::capture_at(48_000, 2, 8_388_608).unwrap(),
+                );
             }
         });
         assert_eq!(allocations, 0);
@@ -969,12 +1012,34 @@ mod tests {
             assert_eq!(audio_test_calls::take(), (1, 1));
         }
 
-        // No source rate is known: response validation must still run and free
-        // the SDK descriptor on its error path, for both entry points.
-        let unknown_rate = FrameSyncAudioRequest::capture(2, 1024).unwrap();
-        assert!(fs.capture_audio_ref(unknown_rate).is_err());
+        // No audio has arrived: a request at any explicit shape still gets
+        // silence in exactly that shape from both entry points, and each
+        // capture frees the SDK descriptor exactly once.
+        let shaped = FrameSyncAudioRequest::capture_at(44_100, 6, 480).unwrap();
+        let frame = fs.capture_audio_ref(shaped).unwrap();
+        assert_eq!(
+            (
+                frame.sample_rate(),
+                frame.num_channels(),
+                frame.num_samples()
+            ),
+            (44_100, 6, 480)
+        );
+        assert_eq!(frame.channels().count(), 6);
+        assert!(frame
+            .channels()
+            .all(|channel| channel.len() == 480 && channel.iter().all(|&s| s == 0.0)));
+        drop(frame);
         assert_eq!(audio_test_calls::take(), (1, 1));
-        assert!(fs.capture_audio(unknown_rate).is_err());
+        let owned = fs.capture_audio(shaped).unwrap();
+        assert_eq!(
+            (
+                owned.sample_rate(),
+                owned.num_channels(),
+                owned.num_samples()
+            ),
+            (44_100, 6, 480)
+        );
         assert_eq!(audio_test_calls::take(), (1, 1));
 
         // The input-format query reports that no source format is known, frees

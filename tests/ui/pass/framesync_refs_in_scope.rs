@@ -28,7 +28,7 @@ fn compile_contract() -> Result<(), grafton_ndi::Error> {
         let _owned = video.try_to_owned()?;
     }
 
-    let audio = framesync.capture_audio_ref(FrameSyncAudioRequest::capture(2, 1024)?)?;
+    let audio = framesync.capture_audio_ref(FrameSyncAudioRequest::capture_at(48_000, 2, 1024)?)?;
     let _ = (
         audio.sample_rate(),
         audio.num_channels(),

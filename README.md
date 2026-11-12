@@ -352,7 +352,7 @@ if let Some(video) = frame_sync.capture_video_ref(ScanType::Progressive)? {
     println!("video: {}x{}", video.width(), video.height());
 }
 
-// 1024 stereo samples at 48 kHz, resampled from the source's audio.
+// 1024 stereo samples at 48 kHz, converted from the source's audio.
 let request = FrameSyncAudioRequest::capture_at(48_000, 2, 1024)?;
 let audio = frame_sync.capture_audio_ref(request)?;
 println!("audio: {} channels at {} Hz", audio.num_channels(), audio.sample_rate());
@@ -361,8 +361,9 @@ println!("audio: {} channels at {} Hz", audio.num_channels(), audio.sample_rate(
 An audio capture always returns samples in the requested shape, silence until
 the source's audio arrives. `frame_sync.audio_input_format()` reports the
 source's sample rate and channel count, or `None` before any audio arrives; to
-follow the source's channels, wait for `Some` and build the request from its
-`num_channels()`.
+follow the source's format, wait for `Some` and build the request with
+`FrameSyncAudioRequest::for_input(format, 1024)`; query again and rebuild to
+follow later changes.
 
 `FrameSync::new` hands the receiver back inside `Rejected` when the SDK creates no
 synchronizer. `FrameSync` owns its receiver. `frame_sync.receiver()` provides controls, audio,

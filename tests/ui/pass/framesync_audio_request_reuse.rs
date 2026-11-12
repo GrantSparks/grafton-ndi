@@ -7,7 +7,9 @@ fn reuse(fs: &FrameSync) -> Result<(), grafton_ndi::Error> {
         let _borrowed = fs.capture_audio_ref(request)?;
         let _owned = fs.capture_audio(copy)?;
     }
-    let _source_rate = FrameSyncAudioRequest::capture(2, 1024)?;
+    if let Some(format) = fs.audio_input_format()? {
+        let _followed = FrameSyncAudioRequest::for_input(format, 1024)?;
+    }
     Ok(())
 }
 

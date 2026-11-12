@@ -14,13 +14,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn wait_for_channels(fs: &FrameSync, channels: u32) -> u32 {
+fn wait_for_channels(fs: &FrameSync, channels: u32) -> grafton_ndi::AudioInputFormat {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if let Some(format) = fs.audio_input_format().unwrap() {
             if format.num_channels() == channels {
                 assert_eq!(format.sample_rate(), 48_000);
-                return format.num_channels();
+                return format;
             }
         }
         assert!(
@@ -81,8 +81,8 @@ fn queried_channels_remain_fixed_when_source_format_changes() {
         }
         let _stop = Stop(source_channels.clone());
 
-        let channels = wait_for_channels(&fs, 2);
-        let request = FrameSyncAudioRequest::capture(channels, 480).unwrap();
+        let format = wait_for_channels(&fs, 2);
+        let request = FrameSyncAudioRequest::for_input(format, 480).unwrap();
         {
             let frame = fs.capture_audio_ref(request).unwrap();
             assert_eq!((frame.num_channels(), frame.num_samples()), (2, 480));
@@ -92,7 +92,7 @@ fn queried_channels_remain_fixed_when_source_format_changes() {
         // Deliberately change the source between the format query, request
         // construction and capture.
         source_channels.store(4, Ordering::Relaxed);
-        let new_channels = wait_for_channels(&fs, 4);
+        let new_format = wait_for_channels(&fs, 4);
         for _ in 0..3 {
             let frame = fs.capture_audio_ref(request).unwrap();
             assert_eq!(
@@ -109,8 +109,8 @@ fn queried_channels_remain_fixed_when_source_format_changes() {
             assert_eq!((owned.num_channels(), owned.num_samples()), (2, 480));
             assert_eq!(owned.channel_data(1).unwrap().len(), 480);
         }
-        // Applications can explicitly choose to follow the newly queried count.
-        let updated = FrameSyncAudioRequest::capture(new_channels, 480).unwrap();
+        // Applications can explicitly choose to follow the newly queried format.
+        let updated = FrameSyncAudioRequest::for_input(new_format, 480).unwrap();
         let frame = fs.capture_audio_ref(updated).unwrap();
         assert_eq!((frame.num_channels(), frame.num_samples()), (4, 480));
         assert!(frame.channels().all(|channel| channel.len() == 480));

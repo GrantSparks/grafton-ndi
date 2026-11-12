@@ -174,7 +174,12 @@ as `None`. Most programs need changes; see the
   `capture_video_ref` and `capture_audio_ref`. `FrameSync::new` hands the
   receiver back in a `Rejected` when the SDK does not create the FrameSync.
   `FrameSyncAudioRequest::capture_with(Some(rate), ..)` is
-  `capture_at(rate, ..)`, and `capture_with(None, ..)` is `capture(..)`.
+  `capture_at(rate, ..)`. `capture_with(None, ..)`, a request at the source's
+  sample rate, has no equivalent: until the source's audio arrives the SDK
+  answers such a request with a zero sample rate, so it could not return the
+  silence every other request returns. A request always names a positive
+  sample rate; `FrameSyncAudioRequest::for_input` builds one from the format
+  `FrameSync::audio_input_format()` reports.
 - FrameSync's audio input-format query is separate from capture.
   `FrameSyncAudioRequest::query_input()` is removed, and
   `FrameSync::audio_input_format()` returns `Result<Option<AudioInputFormat>>`:
@@ -345,6 +350,10 @@ as `None`. Most programs need changes; see the
   [File API guide](docs/file-io.md).
 - `FrameSync::audio_input_format` and `AudioInputFormat`: the format of the
   audio a FrameSync is receiving, without capturing samples.
+- `FrameSyncAudioRequest::for_input(format, num_samples)`: a request at the
+  sample rate and channel count of an `AudioInputFormat`, to capture in the
+  source's format. Query the format again and rebuild the request to follow a
+  change.
 - Examples for runtime selection, routing, the Discovery Server, the File API
   and each Advanced SDK capability.
 
