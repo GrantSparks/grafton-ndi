@@ -1,6 +1,6 @@
 //! Receiving compressed packets instead of decoded frames.
 
-use std::{marker::PhantomData, rc::Rc, time::Duration};
+use std::time::Duration;
 
 use super::{
     packets, AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedVideoFrame, VideoCodec,
@@ -107,8 +107,7 @@ pub enum PacketEvent {
 /// A receiver that delivers compressed packets where it can.
 ///
 /// One capture call returns whichever frame or event arrives first, as a
-/// [`PacketEvent`]; every result owns its data. The receiver is used from the
-/// thread that owns it, one call at a time. It cannot feed a
+/// [`PacketEvent`]; every result owns its data. It cannot feed a
 /// [`FrameSync`](crate::framesync::FrameSync), which needs decoded frames.
 ///
 /// [`receiver`](Self::receiver) and [`receiver_mut`](Self::receiver_mut) reach
@@ -116,6 +115,14 @@ pub enum PacketEvent {
 /// controls: tally, PTZ, statistics, upstream metadata, keyframe requests,
 /// stream selection, reconnecting and KVM. Its own frame and event capture is
 /// unavailable, because packet capture takes them.
+///
+/// # Threading
+///
+/// A packet receiver is [`Send`] and [`Sync`], as the [`Receiver`] it holds
+/// is: it can be created on one thread, capture on another and be dropped on a
+/// third. [`capture`](Self::capture) takes it mutably, so it captures one call
+/// at a time; through a shared reference only the receiver's controls are
+/// reached, which any number of threads may use at once.
 ///
 /// # Examples
 ///
@@ -141,8 +148,14 @@ pub enum PacketEvent {
 /// # }
 /// ```
 pub struct PacketReceiver {
+    // Its Send and Sync are the receiver's. Nothing here ties a packet
+    // receiver to a thread: it is created as an ordinary receiver is, with a
+    // passthrough color format, and its capture is the receiver's
+    // NDIlib_recv_capture_v3, which the SDK lets several threads call at
+    // once (Processing.NDI.Recv.h), under the receiver's capture guard.
+    // Every result is copied into owned values and the SDK's frame freed
+    // before `capture` returns, so no SDK buffer outlives the call.
     pub(crate) receiver: Receiver<PacketAttached>,
-    _thread_affinity: PhantomData<Rc<()>>,
 }
 
 impl PacketReceiver {
@@ -183,10 +196,7 @@ impl PacketReceiver {
     }
 
     pub(crate) fn from_receiver(receiver: Receiver<PacketAttached>) -> Self {
-        Self {
-            receiver,
-            _thread_affinity: PhantomData,
-        }
+        Self { receiver }
     }
 
     /// The receiver this holds, for the common controls: tally, PTZ,
@@ -641,12 +651,12 @@ mod tests {
         assert_eq!(checked, declared);
     }
 
-    /// Only the thread auto traits are withheld; tests/ui/advanced/fail checks
-    /// those.
+    /// Both packet receivers move between and are shared across threads, and
+    /// stay unwind safe.
     #[test]
-    fn packet_receivers_stay_unwind_safe() {
-        fn unwind_safe<T: std::panic::UnwindSafe>() {}
-        unwind_safe::<PacketReceiver>();
-        unwind_safe::<crate::advanced::AllocatedPacketReceiver>();
+    fn packet_receivers_are_send_sync_and_unwind_safe() {
+        fn traits<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        traits::<PacketReceiver>();
+        traits::<crate::advanced::AllocatedPacketReceiver>();
     }
 }

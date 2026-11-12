@@ -227,7 +227,10 @@ otherwise. One `capture` call returns whichever frame or event arrives first as
 a `PacketEvent`, and every result owns its data. It waits up to its timeout as
 a `Receiver`'s capture does, capturing again when the SDK returns early with
 nothing, and returns `None` only once the whole timeout is spent. A
-`PacketReceiver` is used from the thread that owns it and cannot feed a
+`PacketReceiver` is `Send` and `Sync`, as a `Receiver` is: it can be created
+on one thread, capture on another and be dropped on a third. `capture` takes
+it mutably, so one call captures at a time, while other threads use the
+receiver's controls through a shared reference. It cannot feed a
 `FrameSync`. Use an ordinary `Receiver` for decoded media only. The preset's
 color format replaces the options' own, and only the preset's is checked
 against the runtime: options that ask for `ReceiverColorFormat::Best444`, which
@@ -447,7 +450,10 @@ What to know about allocator policies:
   `capture` and `receiver()`, and `set_stream_tier` and `set_streams` of its
   own in place of `receiver_mut()`, which would let its receiver, on which
   the allocators are installed, be swapped for another. `into_packet_receiver`
-  gives the packet receiver back.
+  gives the packet receiver back. Both allocated receivers are `Send` and
+  `Sync`: the SDK calls the policies on threads of its own whatever thread
+  set them, so a receiver can be attached, given allocators, capture and be
+  dropped on different threads.
 - Dropping an allocated receiver, or taking its receiver back, first returns
   the receiver to the SDK's own memory. A receiver that a `RecvAdvertiser`
   registration keeps alive afterwards frees the allocations it still holds

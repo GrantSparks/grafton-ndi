@@ -838,10 +838,7 @@ impl AllocatorService {
         receiver: PacketReceiver,
     ) -> std::result::Result<AllocatedPacketReceiver, Rejected<PacketReceiver>> {
         match self.allocation(receiver.receiver) {
-            Ok(inner) => Ok(AllocatedPacketReceiver {
-                inner,
-                _thread_affinity: std::marker::PhantomData,
-            }),
+            Ok(inner) => Ok(AllocatedPacketReceiver { inner }),
             Err(rejected) => Err(rejected.map(PacketReceiver::from_receiver)),
         }
     }
@@ -866,21 +863,32 @@ impl AllocatorService {
 
 /// A [`PacketReceiver`] whose frames can be received into application memory.
 ///
-/// It keeps the packet receiver's threading rule: it is used from the thread
-/// that owns it, one call at a time, so it is neither [`Send`] nor [`Sync`].
-/// [`into_packet_receiver`](Self::into_packet_receiver) gives the receiver
-/// back on that same thread. [`receiver`](Self::receiver) reaches the
-/// receiver's controls, as [`PacketReceiver::receiver`] does, and
+/// [`into_packet_receiver`](Self::into_packet_receiver) gives the packet
+/// receiver back. [`receiver`](Self::receiver) reaches the receiver's
+/// controls, as [`PacketReceiver::receiver`] does, and
 /// [`set_stream_tier`](Self::set_stream_tier) and
 /// [`set_streams`](Self::set_streams) the two that borrow it exclusively.
 /// There is no `receiver_mut`: the allocators are installed on this
 /// receiver's native instance, so it is never lent out mutably, where it
 /// could be swapped for another packet receiver's.
+///
+/// # Threading
+///
+/// It is [`Send`] and [`Sync`], as the packet receiver and an
+/// [`AllocatedReceiver`] are: capturing, setting and resetting allocators,
+/// and dropping it can each happen on any thread. Capturing and changing an
+/// allocator take it mutably; a shared reference reaches only the receiver's
+/// controls.
 pub struct AllocatedPacketReceiver {
+    // Its Send and Sync are those of the allocation, which an
+    // AllocatedReceiver shares. The SDK calls the policies on threads of its
+    // own, possibly several at once, and lets the allocators be changed at
+    // any time, with each allocation freed exactly once through the free
+    // function it was made with (Advanced SDK manual, 25.4.2.1). Neither a
+    // policy nor its registration is tied to the thread that set it: the
+    // opaque value is a token into the process-wide registry, which every
+    // callback locks.
     inner: Allocation<PacketAttached>,
-    // The thread restriction of the PacketReceiver this was made from, which
-    // would otherwise be lost: a Receiver is Send and Sync.
-    _thread_affinity: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl AllocatedPacketReceiver {

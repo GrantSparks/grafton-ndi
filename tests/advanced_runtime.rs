@@ -1614,7 +1614,6 @@ fn a_queued_sender_moves_between_threads() {
     let _turn = sockets();
     let mut queue =
         QueuedSender::new(&ndi, &options("moved-queue"), QueueOptions::default()).unwrap();
-    // A packet receiver stays on the thread that created it.
     let mut receiver = packet_receiver(
         &ndi,
         &queue.sender().source().unwrap(),
@@ -1666,6 +1665,163 @@ fn a_queued_sender_moves_between_threads() {
         });
     });
     std::thread::spawn(move || drop(queue)).join().unwrap();
+}
+
+/// Use `receiver` through shared references from four threads at once, each
+/// making every call the receiver's controls offer that changes nothing at
+/// the source; it is connected, so each sees the connection.
+fn share_controls<M: grafton_ndi::ReceiverMode>(receiver: &Receiver<M>) {
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                for _ in 0..50 {
+                    assert!(receiver.is_connected());
+                    assert!(receiver.connection_stats().connections() >= 1);
+                    receiver.set_tally(Tally::new(true, false));
+                    let _ = receiver.poll_source_name_change(Duration::ZERO).unwrap();
+                }
+            });
+        }
+    });
+}
+
+/// A packet receiver works on threads other than the one that created it: it
+/// captures packets after a move, its receiver's controls are used through
+/// shared references from several threads at once, and it is destroyed on a
+/// third thread.
+#[test]
+fn a_packet_receiver_moves_between_threads() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut sender = CompressedSender::new(&ndi, &options("moved-packets")).unwrap();
+    // Created on this thread, which never uses it.
+    let receiver = packet_receiver(
+        &ndi,
+        &sender.sender().source().unwrap(),
+        ReceiverBandwidth::Highest,
+    );
+    let stop = AtomicBool::new(false);
+    let receiver = std::thread::scope(|scope| {
+        let capture = scope.spawn(|| {
+            let _stop = StopOnDrop(&stop);
+            let mut receiver = receiver;
+            let deadline = Instant::now() + PATIENCE;
+            let mut verified = 0;
+            while verified < 4 {
+                assert!(Instant::now() < deadline, "{verified} packets arrived");
+                if let Some(PacketEvent::Video(ReceivedVideo::Compressed(frame))) =
+                    receiver.capture(SLICE).unwrap()
+                {
+                    let timecode = frame.timecode().ticks();
+                    assert!(timecode >= FIRST_TIMECODE);
+                    assert_same_packet(
+                        frame.data(),
+                        &video_bytes(VideoCodec::H264, timecode, true),
+                        Some(EnvelopeCodec::H264),
+                    );
+                    verified += 1;
+                }
+            }
+            receiver
+        });
+        let mut timecode = FIRST_TIMECODE;
+        while !stop.load(Ordering::Acquire) {
+            sender
+                .send_video(&mut keyframe(
+                    VideoCodec::H264,
+                    StreamTier::Program,
+                    timecode,
+                ))
+                .unwrap();
+            timecode += 1;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        capture.join().unwrap()
+    });
+    share_controls(receiver.receiver());
+    std::thread::spawn(move || drop(receiver)).join().unwrap();
+    assert!(sender.close().program.is_none());
+}
+
+/// A packet receiver with allocators works on threads other than the one that
+/// attached them: it captures into the policy's memory after a move, replaces
+/// the policy there, shares its receiver's controls across threads, and is
+/// destroyed on another thread, after which the SDK has freed every
+/// allocation either policy made.
+#[test]
+fn an_allocated_packet_receiver_moves_between_threads() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let sender = Sender::new(&ndi, &options("moved-allocation")).unwrap();
+    let packets = PacketReceiver::new(
+        &ndi,
+        &ReceiverOptions::new(common::loopback_source(&ndi, &sender).unwrap()),
+        PassthroughPreset::ProtectedWithAudio,
+    )
+    .unwrap();
+    let service =
+        AllocatorService::new(ndi.process_lifetime(), AllocatorLimits::default()).unwrap();
+    let policy = |count: &Arc<AtomicUsize>| {
+        let count = count.clone();
+        move |request: AllocationRequest| {
+            count.fetch_add(1, Ordering::Relaxed);
+            AllocationBuffer::zeroed(request)
+        }
+    };
+    // Attached and given its first policy on this thread, which never uses
+    // it again.
+    let (first, second) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let mut packets = service.attach_packets(packets).unwrap();
+    packets.set_video_allocator(policy(&first)).unwrap();
+
+    let stop = AtomicBool::new(false);
+    let packets = std::thread::scope(|scope| {
+        let capture = scope.spawn(|| {
+            let _stop = StopOnDrop(&stop);
+            let mut packets = packets;
+            // Capture until video arrives after `count`'s policy has run.
+            let used = |packets: &mut AllocatedPacketReceiver, count: &AtomicUsize| {
+                let deadline = Instant::now() + PATIENCE;
+                loop {
+                    assert!(Instant::now() < deadline, "the policy was not used");
+                    let video =
+                        matches!(packets.capture(SLICE).unwrap(), Some(PacketEvent::Video(_)));
+                    if video && count.load(Ordering::Relaxed) > 0 {
+                        return;
+                    }
+                }
+            };
+            used(&mut packets, &first);
+            packets.set_video_allocator(policy(&second)).unwrap();
+            used(&mut packets, &second);
+            packets
+        });
+        let frame = video();
+        while !stop.load(Ordering::Acquire) {
+            sender.send_video(&frame).unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        capture.join().unwrap()
+    });
+    share_controls(packets.receiver());
+    std::thread::spawn(move || drop(packets)).join().unwrap();
+    assert_eq!(service.usage().active_generations(), 0);
+
+    drop(sender);
+    let usage = service.usage();
+    assert_eq!(
+        (
+            usage.retained_allocations(),
+            usage.retained_bytes(),
+            usage.generations()
+        ),
+        (0, 0, 0),
+        "an allocation outlived its receiver: {usage:?}"
+    );
 }
 
 /// Connect a receiver to the source `sender` advertises and exchange

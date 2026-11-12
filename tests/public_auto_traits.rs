@@ -4,12 +4,12 @@
 //! breaking change, fails to compile. CI builds these tests without the
 //! Advanced SDK headers and with them, so a trait that holds in only one of
 //! those builds fails as well: the `advanced` API has the same shape in both.
-//! A trait a type lacks is its documented design: the File objects and the
-//! Advanced receivers stay on their thread, the Discovery Server owners are
-//! `Send` only, and `Error` and an ordinary `Sender` may hold application
-//! values that are not unwind safe. Gaining a trait is not a breaking change;
-//! list it here when a type gains one, and list a new public type with the
-//! traits it is meant to have.
+//! A trait a type lacks is its documented design: the File objects, `AvSync`
+//! and `Genlock` stay on their thread, the Discovery Server owners and
+//! `AllocationBuffer` are `Send` only, and `Error` and an ordinary `Sender`
+//! may hold application values that are not unwind safe. Gaining a trait is
+//! not a breaking change; list it here when a type gains one, and list a new
+//! public type with the traits it is meant to have.
 
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
@@ -111,7 +111,7 @@ fn advanced_types_keep_their_auto_traits() {
     use grafton_ndi::{advanced::*, RawCapture};
     has! {
         AdvancedConfig: Send, Sync, UnwindSafe, RefUnwindSafe;
-        AllocatedPacketReceiver: UnwindSafe, RefUnwindSafe;
+        AllocatedPacketReceiver: Send, Sync, UnwindSafe, RefUnwindSafe;
         AllocatedReceiver: Send, Sync, UnwindSafe, RefUnwindSafe;
         AllocationBuffer: Send;
         AllocationFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -136,7 +136,7 @@ fn advanced_types_keep_their_auto_traits() {
         MouseButton: Send, Sync, UnwindSafe, RefUnwindSafe;
         PacketAttached: Send, Sync, UnwindSafe, RefUnwindSafe;
         PacketEvent: Send, Sync, UnwindSafe, RefUnwindSafe;
-        PacketReceiver: UnwindSafe, RefUnwindSafe;
+        PacketReceiver: Send, Sync, UnwindSafe, RefUnwindSafe;
         PassthroughPreset: Send, Sync, UnwindSafe, RefUnwindSafe;
         QualityPlan: Send, Sync, UnwindSafe, RefUnwindSafe;
         QueueOptions: Send, Sync, UnwindSafe, RefUnwindSafe;
