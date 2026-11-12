@@ -90,6 +90,13 @@
     "size": 149624072,
     "sha256": "3630a0e28e4cb77933a151e5087dd4b6567e0f502bebcf6202ea9e8c6f7ae256"
   },
+  "current-hx-driver-linux": {
+    "version": "6.4.0.2",
+    "driver": "hx",
+    "platform": "linux",
+    "size": 22540162,
+    "sha256": "8db03931abf85e2486d7d42f89db8176d15ec2559947ae990e088a02ffee08da"
+  },
   "current-standard-android": {
     "version": "6.4.0.2",
     "edition": "standard",

@@ -258,28 +258,32 @@ class Rules(unittest.TestCase):
                 workflows.load(text)
 
 
-def checkable(target, pin, *, all_features, headers=None):
+def checkable(target, pin, *, all_features, headers=None, driver=None):
     """What tests can check in a build for `target` running against the package `pin`.
 
     `headers` is the package the build reads its headers from, `pin` itself
-    unless given. This restates the crate's test policy: the Discovery Server
-    tests are Linux only and need a 6.4 runtime; the Advanced tests need the
-    `advanced` feature, an Advanced runtime and Advanced headers; the File tests
-    need the `file-io` feature and a File library the runtime can drive, which
-    is an Advanced runtime everywhere except Windows, where the library is
-    edition-neutral and ships for x64. The HEVC decode test is an Advanced test
-    that also needs a 6.4 runtime and an NDI|HX decoder, which is built into the
-    runtime on Windows and macOS; no Linux row installs one.
+    unless given, and `driver` the driver package installed beside the runtime.
+    This restates the crate's test policy: the Discovery Server tests are Linux
+    only and need a 6.4 runtime; the Advanced tests need the `advanced` feature,
+    an Advanced runtime and Advanced headers; the File tests need the `file-io`
+    feature and a File library the runtime can drive, which is an Advanced
+    runtime everywhere except Windows, where the library is edition-neutral and
+    ships for x64. The HEVC decode test is an Advanced test that also needs a
+    6.4 runtime and an NDI|HX decoder, which is built into the runtime on
+    Windows and macOS; on Linux it is the NDI|HX driver of the runtime's release.
     """
     platform, advanced = pin['platform'], pin['edition'] == 'advanced'
     declared = (headers or pin)['edition'] == 'advanced'
     current = sdk.version_tuple(pin['version']) >= (6, 4, 0, 0)
+    decoder = platform in ('windows', 'apple') or (
+        driver is not None and driver['driver'] == 'hx' and driver['platform'] == platform
+        and driver['version'] == pin['version'])
     found = {'1'}
     if platform == 'linux' and current:
         found.add('discovery-server')
     if all_features and advanced and declared:
         found.add('advanced')
-        if current and platform in ('windows', 'apple'):
+        if current and decoder:
             found.add('hx-decoder')
     if all_features and current and (target == 'x86_64-pc-windows-msvc' if platform == 'windows' else advanced):
         found.add('file')
@@ -318,15 +322,27 @@ class SdkJob(unittest.TestCase):
         self.assertEqual({row['package'].rsplit('-', 1)[0] for row in self.rows},
                          {'6.1.1-standard', '6.3.2-standard', '6.3.2-advanced', 'current-standard', 'current-advanced'})
 
+    def test_a_row_installs_only_a_driver_built_for_its_runtime(self):
+        rows = [row for row in self.rows if 'hx-driver' in row]
+        self.assertEqual([row['name'] for row in rows], ['linux-x64 advanced-6.4'])
+        for row in rows:
+            driver, package = self.pins[row['hx-driver']], self.pins[row['package']]
+            self.assertEqual((driver['platform'], driver['version']), (package['platform'], package['version']))
+            self.assertIn(row['target'], sdk.DRIVERS[driver['driver']].directories)
+        provision = next(step for step in self.job['steps'] if step.get('name') == 'Provision the SDK')['run']
+        self.assertIn('if [ -n "${{ matrix.hx-driver }}" ]; then\n  python ci/sdk.py install-driver '
+                      '"${{ matrix.hx-driver }}" --sdk "$RUNNER_TEMP/ndi-sdk" --target "$TARGET"\nfi', provision)
+
     def test_each_step_promises_exactly_what_its_build_can_check(self):
         """A promise no test in the build can check fails that build; a missing one lets tests skip."""
         for row in self.rows:
-            pin, target = self.pins[row['package']], row['target']
+            pin, target, driver = self.pins[row['package']], row['target'], self.pins.get(row.get('hx-driver'))
             for step, promise, all_features in (('all features', row['require'], True),
                                                 ('no default features', row.get('require-no-default', '1'), False)):
                 with self.subTest(row=row['name'], step=step):
                     # `1` is implied by every other entry, so it is spelt out only when it stands alone.
-                    self.assertEqual(set(promise.split(',')) | {'1'}, checkable(target, pin, all_features=all_features))
+                    self.assertEqual(set(promise.split(',')) | {'1'},
+                                     checkable(target, pin, all_features=all_features, driver=driver))
         tests = {step['run']: step['env'] for step in self.job['steps']
                  if step.get('run', '').startswith('cargo test')}
         command = 'cargo test --locked --config ci/offline.toml --target "$TARGET" '
@@ -369,10 +385,11 @@ class SdkJob(unittest.TestCase):
 
     def test_each_compatibility_pass_promises_exactly_what_it_can_check(self):
         """The first step builds with the row's headers against each baseline runtime, the second with each
-        baseline's headers against the row's runtime; a Standard baseline has no headers a build reads."""
+        baseline's headers against the row's runtime; a Standard baseline has no headers a build reads. Only
+        the row's own runtime has the row's driver beside it."""
         baseline_runtimes, baseline_headers = [step for step in self.job['steps'] if step.get('if') == 'matrix.compatibility']
         for row in (row for row in self.rows if 'compatibility' in row):
-            current, target = self.pins[row['package']], row['target']
+            current, target, driver = self.pins[row['package']], row['target'], self.pins.get(row.get('hx-driver'))
             baselines = {'standard': self.pins[row['compatibility']], 'advanced': self.pins[row['compatibility-advanced']]}
             with self.subTest(row=row['name'], step=baseline_runtimes['name']):
                 self.assertEqual(exported_promises(baseline_runtimes, row['require']),
@@ -380,7 +397,7 @@ class SdkJob(unittest.TestCase):
                                   for edition, pin in baselines.items()})
             with self.subTest(row=row['name'], step=baseline_headers['name']):
                 self.assertEqual(exported_promises(baseline_headers, row['require']),
-                                 {edition: checkable(target, current, all_features=True, headers=pin)
+                                 {edition: checkable(target, current, all_features=True, headers=pin, driver=driver)
                                   for edition, pin in baselines.items()})
 
     def test_readme_matrix_table_matches_the_workflow(self):

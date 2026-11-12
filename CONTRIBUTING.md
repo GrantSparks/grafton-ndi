@@ -61,7 +61,7 @@ Tests against a real runtime create senders, receivers and finders, which
 announce themselves on the local network. Run them on a network where that is
 acceptable.
 
-Three more things are optional and unlock more tests:
+Four more things are optional and unlock more tests:
 
 - An NDI **Advanced SDK**. Set `NDI_SDK_DIR` to its root at build time so the
   `advanced` feature can generate its declarations (this needs `libclang`), and
@@ -73,6 +73,26 @@ Three more things are optional and unlock more tests:
   Server test. The test looks for it in the SDK that the selected runtime
   library belongs to, at `bin/<target>/ndi-discovery-server` beside
   `lib/<target>/`.
+- An **NDI|HX video decoder**, for the test that decodes HEVC from an Advanced
+  sender with a 6.4 runtime. Windows and macOS runtimes have one built in. On
+  Linux the runtime decodes NDI|HX only through the NDI|HX Driver for Linux
+  copied beside its runtime library, or through FFmpeg 7's
+  `libavcodec-ndi.so.61` or `libavcodec.so.61` on the loader path; an older
+  FFmpeg does not count. Without one, the test is skipped. To install the
+  driver into an SDK that `ci/sdk.py install` unpacked, download it from NDI
+  and run:
+
+  ```bash
+  python ci/sdk.py install-driver current-hx-driver-linux --sdk ~/ndi/advanced-6.4 \
+      --archive ~/Downloads/NDIHXDriverForLinux.tar.gz --target x86_64-unknown-linux-gnu
+  ```
+
+  It checks the archive against its pin and refuses a runtime from another
+  vendor build, since the driver works only with its own. The driver comes
+  under the NDI|HX licence agreement, which the archive includes. On Linux, NDI
+  grants no licence for the H.264 and AAC technology the driver uses, so make
+  sure your use is licensed; the bundled FFmpeg libraries have their own
+  licence as well. The driver needs `libcurl.so.4` on the system.
 
 Keep SDK archives, SDK headers and SDK documentation outside the source
 checkout.

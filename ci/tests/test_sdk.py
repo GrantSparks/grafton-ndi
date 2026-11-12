@@ -24,16 +24,17 @@ TARGET = 'x86_64-unknown-linux-gnu'
 
 
 def tarball(members, compression='gz'):
-    """Build a tar archive from (name, content) pairs or prepared TarInfo objects."""
+    """Build a tar archive from (name, content) or (name, content, mode) tuples or prepared TarInfo objects."""
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode='w:' + compression) as archive:
         for member in members:
             if isinstance(member, tarfile.TarInfo):
                 archive.addfile(member)
                 continue
-            name, content = member
+            name, content, *mode = member
             info = tarfile.TarInfo(name)
             info.size = len(content)
+            info.mode = mode[0] if mode else info.mode
             archive.addfile(info, io.BytesIO(content))
     return buffer.getvalue()
 
@@ -49,6 +50,23 @@ def linux_download(members=None, script='Install_NDI_SDK_v6_Linux.sh'):
         ]
     installer = b'#!/bin/sh\nexit 1\n__NDI_ARCHIVE_BEGIN__\n' + tarball(members)
     return tarball([(script, installer)])
+
+
+DRIVER_ROOT = 'NDIHXDriverForLinux'
+
+
+def driver_members(build='0000000'):
+    """The vendor's NDI|HX driver layout: a Version.txt naming its build, and libraries per architecture."""
+    return [(f'{DRIVER_ROOT}/Version.txt', f'NDI|HX 2026-01-01 git-{build}\n'.encode()),
+            (f'{DRIVER_ROOT}/README.txt', b'Copy the libraries beside libndi.so.6.\n'),
+            (f'{DRIVER_ROOT}/x86_64-linux-gnu/libndihx.so', b'hx', 0o755),
+            (f'{DRIVER_ROOT}/x86_64-linux-gnu/libavcodec-ndi.so.61', b'avcodec'),
+            (f'{DRIVER_ROOT}/i686-linux-gnu/libndihx.so', b'hx 32-bit', 0o755)]
+
+
+def driver_download(members=None, script='NDIHXDriverForLinux.sh'):
+    """A download shaped like the vendor's driver: a tarball holding one self-extracting script."""
+    return linux_download(driver_members() if members is None else members, script)
 
 
 def link(name, target, kind=tarfile.SYMTYPE):
@@ -91,19 +109,41 @@ class Pins(unittest.TestCase):
                 self.assertIn(pins[name]['edition'], name)
         self.assertEqual(len({pin['sha256'] for pin in pins.values()}), len(pins))
 
+    def test_checked_in_driver_accompanies_the_current_linux_sdk(self):
+        pins = sdk.load_pins()
+        drivers = {name for name, pin in pins.items() if 'driver' in pin}
+        self.assertEqual(drivers, {'current-hx-driver-linux'})
+        driver = pins['current-hx-driver-linux']
+        self.assertEqual((driver['driver'], driver['platform'], driver['version']),
+                         ('hx', 'linux', pins['current-advanced-linux']['version']))
+
     def test_malformed_pin_is_rejected(self):
         good = {'version': '6.4.0.2', 'edition': 'standard', 'platform': 'linux', 'size': 1, 'sha256': 'a' * 64}
-        for field, value in (('sha256', 'A' * 64), ('size', 0), ('size', '1'), ('platform', 'bsd'),
-                             ('edition', 'pro'), ('version', 'six')):
-            with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as directory:
+        driver = {**{k: v for k, v in good.items() if k != 'edition'}, 'driver': 'hx'}
+        for pin in (good, driver):
+            with tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / 'pins.json'
-                path.write_text(json.dumps({'p': {**good, field: value}}))
+                path.write_text(json.dumps({'p': pin}))
+                self.assertEqual(sdk.load_pins(path), {'p': pin})
+        cases = [(good, field, value) for field, value in (
+            ('sha256', 'A' * 64), ('size', 0), ('size', '1'), ('platform', 'bsd'), ('edition', 'pro'),
+            ('version', 'six'), ('driver', 'hx'))]
+        # A driver is pinned for the platform it runs on, and is not also an SDK.
+        cases += [(driver, field, value) for field, value in (
+            ('driver', 'other'), ('driver', ['hx']), ('platform', 'windows'), ('edition', 'advanced'),
+            ('size', 0), ('sha256', 'a' * 63))]
+        for pin, field, value in cases:
+            with self.subTest(pin=sorted(pin), field=field, value=value), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'pins.json'
+                path.write_text(json.dumps({'p': {**pin, field: value}}))
                 with self.assertRaises(sdk.SdkError):
                     sdk.load_pins(path)
 
     def test_artifact_id_is_content_qualified(self):
         pin = {'version': '6.4.0.2', 'edition': 'advanced', 'platform': 'apple', 'sha256': 'f' * 64}
         self.assertEqual(sdk.artifact_id(pin), 'ndi-6.4.0.2-advanced-apple-' + 'f' * 64)
+        driver = {'version': '6.4.0.2', 'driver': 'hx', 'platform': 'linux', 'sha256': 'f' * 64}
+        self.assertEqual(sdk.artifact_id(driver), 'ndi-6.4.0.2-hx-driver-linux-' + 'f' * 64)
 
 
 class Sources(unittest.TestCase):
@@ -382,6 +422,167 @@ class Install(Workspace):
         self.install(data, archive=False, environ=environ)
         self.assertEqual(seen, {'PATH': '/bin'})
 
+    def test_a_driver_package_is_not_an_sdk(self):
+        data = driver_download()
+        pins = {'test-linux': {'version': '6.9.1', 'driver': 'hx', 'platform': 'linux', 'size': len(data),
+                               'sha256': hashlib.sha256(data).hexdigest()}}
+        with self.assertRaisesRegex(sdk.SdkError, 'is a driver package; install it with the install-driver command'):
+            self.install(data, pins=pins)
+        self.assertEqual(sorted(path.name for path in self.work.iterdir()), ['download.tar.gz'])
+
+
+class InstallDriver(Workspace):
+    """A driver is copied beside the runtime of an SDK that `install` unpacked."""
+
+    def setUp(self):
+        super().setUp()
+        self.install(linux_download())
+        self.root = self.work / 'sdk' / 'NDI SDK for Linux'
+        self.runtime = self.root / 'lib' / 'x86_64-linux-gnu'
+        self.before = self.runtime_files()
+        # The driver's staging directory goes to the temporary directory, which is the workspace here.
+        temporary = self.work / 'tmp'
+        temporary.mkdir()
+        patch = mock.patch.object(tempfile, 'tempdir', str(temporary))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def runtime_files(self):
+        return {path.name: (os.readlink(path) if path.is_symlink() else path.read_bytes())
+                for path in self.runtime.iterdir()}
+
+    def driver_pins(self, data, **overrides):
+        pin = {'version': '6.9.1', 'driver': 'hx', 'platform': 'linux', 'size': len(data),
+               'sha256': hashlib.sha256(data).hexdigest(), **overrides}
+        return {'test-driver': pin}
+
+    def install_driver(self, data, *, pins=None, target=TARGET, directory=None, environ=None, archive=True):
+        path = self.work / 'driver.tar.gz'
+        path.write_bytes(data)
+        return sdk.install_driver('test-driver', self.work / 'sdk' if directory is None else directory,
+                                  target=target, archive=path if archive else None,
+                                  environ={} if environ is None else environ,
+                                  pins=self.driver_pins(data) if pins is None else pins)
+
+    def assert_runtime_unchanged(self):
+        self.assertEqual(self.runtime_files(), self.before)
+        self.assertEqual(list((self.work / 'tmp').iterdir()), [])
+
+    def test_the_target_libraries_are_copied_beside_the_runtime(self):
+        installed = self.install_driver(driver_download())
+        self.assertEqual(installed, [str(self.runtime / name) for name in ('libavcodec-ndi.so.61', 'libndihx.so')])
+        self.assertEqual(self.runtime_files(), {**self.before, 'libndihx.so': b'hx', 'libavcodec-ndi.so.61': b'avcodec'})
+        self.assertEqual(stat.S_IMODE((self.runtime / 'libndihx.so').stat().st_mode), 0o755)
+        self.assertEqual(list((self.work / 'tmp').iterdir()), [])
+
+    def test_the_sdk_is_named_by_its_install_directory_or_its_root(self):
+        self.install_driver(driver_download(), directory=self.root)
+        self.assertTrue((self.runtime / 'libndihx.so').is_file())
+
+    def test_source_map_archive_is_used_when_no_archive_is_given(self):
+        data = driver_download()
+        stored = self.work / 'stored.tar.gz'
+        stored.write_bytes(data)
+        sources = {'schema': 1, 'packages': {'test-driver': {'archive': str(stored)}}}
+        self.install_driver(data, archive=False, environ={'NDI_SDK_SOURCES_JSON': json.dumps(sources)})
+        self.assertTrue((self.runtime / 'libndihx.so').is_file())
+
+    def test_archive_must_match_the_pin_before_it_is_opened(self):
+        data = driver_download()
+        for field, value in (('size', len(data) + 1), ('sha256', '0' * 64)):
+            with self.subTest(field=field), self.assertRaisesRegex(sdk.SdkError, 'the pin says'):
+                self.install_driver(data, pins=self.driver_pins(data, **{field: value}))
+            self.assert_runtime_unchanged()
+
+    def test_the_driver_must_come_from_the_runtimes_build(self):
+        data = driver_download(driver_members(build='1111111'))
+        with self.assertRaisesRegex(sdk.SdkError, 'the driver is build git-1111111 and the SDK build git-0000000'):
+            self.install_driver(data)
+        self.assert_runtime_unchanged()
+
+    def test_the_sdk_must_be_the_release_the_driver_is_pinned_to(self):
+        data = driver_download()
+        with self.assertRaisesRegex(sdk.SdkError, 'does not name the pinned version 6.9.2'):
+            self.install_driver(data, pins=self.driver_pins(data, version='6.9.2'))
+        self.assert_runtime_unchanged()
+
+    def test_existing_files_are_never_overwritten(self):
+        (self.runtime / 'libavcodec-ndi.so.61').write_bytes(b'someone else\'s')
+        self.before = self.runtime_files()
+        with self.assertRaisesRegex(sdk.SdkError, 'already has libavcodec-ndi.so.61$'):
+            self.install_driver(driver_download())
+        self.assert_runtime_unchanged()
+
+    def test_a_failed_copy_leaves_no_part_of_the_driver(self):
+        copies = []
+
+        def failing(source, destination, length=0):
+            copies.append(destination.name)
+            if len(copies) == 2:
+                raise OSError(28, 'No space left on device')
+            destination.write(source.read())
+        with mock.patch.object(sdk.shutil, 'copyfileobj', failing), self.assertRaises(OSError):
+            self.install_driver(driver_download())
+        self.assertEqual(len(copies), 2)
+        self.assert_runtime_unchanged()
+
+    def test_wrong_content_is_rejected(self):
+        version, library, dependency, other = driver_members()[0], *driver_members()[2:5]
+        cases = {
+            'no library for the target': [version, other],
+            'no driver version file': [library, dependency],
+            'no build in the version file': [(version[0], b'NDI|HX 2026-01-01\n'), library],
+            'two builds in the version file': [(version[0], b'git-0000000 git-1111111\n'), library],
+            'two roots': [version, library, ('other/Version.txt', version[1]), ('other/x86_64-linux-gnu/libndihx.so', b'')],
+            'an unexpected file': [version, library, (f'{DRIVER_ROOT}/x86_64-linux-gnu/hx-helper', b'')],
+            'a linked library': [version, library, link(f'{DRIVER_ROOT}/x86_64-linux-gnu/libavutil-ndi.so.59',
+                                                         'libndihx.so')],
+        }
+        for name, members in cases.items():
+            with self.subTest(name), self.assertRaises(sdk.SdkError):
+                self.install_driver(driver_download(members))
+            self.assert_runtime_unchanged()
+        with self.subTest('an SDK installer instead'), self.assertRaisesRegex(sdk.SdkError, 'NDIHXDriverForLinux'):
+            self.install_driver(driver_download(script='Install_NDI_SDK_v6_Linux.sh'))
+        self.assert_runtime_unchanged()
+
+    def test_unsafe_archive_members_are_rejected(self):
+        version, library = driver_members()[0], driver_members()[2]
+        cases = {
+            'parent path': [version, library, ('../escape', b'')],
+            'symlink outside': [version, library, link(f'{DRIVER_ROOT}/link', '../../outside')],
+            'path through symlink': [link('inside', '..'), ('inside/escape', b'')],
+        }
+        for name, members in cases.items():
+            with self.subTest(name), self.assertRaises((sdk.SdkError, tarfile.TarError)):
+                self.install_driver(driver_download(members))
+            self.assert_runtime_unchanged()
+            self.assertEqual(sorted(path.name for path in self.work.iterdir()), ['download.tar.gz', 'driver.tar.gz',
+                                                                                 'sdk', 'tmp'])
+
+    def test_package_target_and_sdk_are_checked_before_any_work(self):
+        data = driver_download()
+        absent = self.work / 'absent'
+        for target in ('aarch64-unknown-linux-gnu', 'x86_64-pc-windows-msvc', 'riscv64gc-unknown-linux-gnu'):
+            with self.subTest(target=target), self.assertRaisesRegex(sdk.SdkError, 'has no libraries for target'):
+                sdk.install_driver('test-driver', self.work / 'sdk', target=target, archive=absent, environ={},
+                                   pins=self.driver_pins(data))
+        cases = {
+            'an SDK package': ('test-linux', self.work / 'sdk', 'is an SDK package'),
+            'an unknown package': ('absent', self.work / 'sdk', 'unknown package'),
+            'no SDK there': ('test-driver', absent, 'is not a directory'),
+        }
+        pins = {**self.driver_pins(data), **self.pins(data)}
+        for name, (package, directory, message) in cases.items():
+            with self.subTest(name), self.assertRaisesRegex(sdk.SdkError, message):
+                sdk.install_driver(package, directory, target=TARGET, archive=absent, environ={}, pins=pins)
+        with self.subTest('no runtime library'):
+            for path in self.runtime.iterdir():
+                path.rename(self.work / path.name)
+            with self.assertRaisesRegex(sdk.SdkError, 'has no runtime library in lib/x86_64-linux-gnu'):
+                sdk.install_driver('test-driver', self.work / 'sdk', target=TARGET, archive=absent, environ={},
+                                   pins=pins)
+
 
 @contextlib.contextmanager
 def captured_output():
@@ -504,15 +705,15 @@ class NothingPrivateIsPrinted(Workspace):
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
     def failed_install(self, entry=None, *, sources=None, environ=None, pin=None, platform=None, outcomes=(),
-                       patches=()):
+                       patches=(), package='test-linux', pins=None, arguments=None):
         """Install through the command line with `entry` as the package's source; return what was printed."""
         if sources is None:
             # Other packages' entries name variables too, and those must stay private as well.
             sources = json.dumps({'schema': 1, 'packages': {
-                'test-linux': entry, 'another': GITHUB_ASSET, 'a-third': URL_ENTRY}})
+                package: entry, 'another': GITHUB_ASSET, 'a-third': URL_ENTRY}})
         environ = {'NDI_SDK_SOURCES_JSON': sources, 'NDI_SDK_ARCHIVE_TOKEN': TOKEN, 'TOKEN_ENV_SENTINEL': TOKEN,
                    'URL_ENV_SENTINEL': URL, **(environ or {})}
-        pins = self.pins(self.data, **(pin or {}))
+        pins = self.pins(self.data, **(pin or {})) if pins is None else pins
         opener = FakeOpener(*outcomes)
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.dict(os.environ, {name: value for name, value in environ.items() if value}))
@@ -526,7 +727,7 @@ class NothingPrivateIsPrinted(Workspace):
             for patch in patches:
                 stack.enter_context(patch)
             captured = stack.enter_context(captured_output())
-            status = sdk.main(['install', 'test-linux', '--dest', str(self.work / 'dest')])
+            status = sdk.main(arguments or ['install', package, '--dest', str(self.work / 'dest')])
         self.assertEqual(status, 1)
         self.assertFalse((self.work / 'dest').exists())
         return captured[0]
@@ -621,6 +822,34 @@ class NothingPrivateIsPrinted(Workspace):
             with self.subTest(name):
                 self.assert_nothing_private(self.failed_install(sources=sources))
 
+    def test_driver_failures(self):
+        """install-driver acquires its package as install does, under the same rule."""
+        local = self.work / 'sdk.tar.gz'
+        local.write_bytes(self.data)
+        sdk.install('test-linux', self.work / 'sdk', archive=local, target=TARGET, environ={}, pins=self.pins(self.data))
+        runtime = self.work / 'sdk' / 'NDI SDK for Linux' / 'lib' / 'x86_64-linux-gnu'
+        before = sorted(path.name for path in runtime.iterdir())
+        driver = driver_download()
+        pins = {'test-driver': {'version': '6.9.1', 'driver': 'hx', 'platform': 'linux', 'size': len(driver),
+                                'sha256': hashlib.sha256(driver).hexdigest()}}
+        arguments = ['install-driver', 'test-driver', '--sdk', str(self.work / 'sdk'), '--target', TARGET]
+        stored = {'archive': str(self.archive)}
+        cases = {
+            'missing': dict(entry=stored),
+            'other bytes': dict(entry=stored, prepare=lambda: self.archive.write_bytes(bytes(len(driver)))),
+            'junk of the pinned size': dict(entry=stored, prepare=lambda: self.archive.write_bytes(self.junk),
+                                            pin=dict(size=len(self.junk), sha256=hashlib.sha256(self.junk).hexdigest())),
+            'refused': dict(entry=URL_ENTRY, outcomes=[refusal(404)]),
+            'token unset': dict(entry=GITHUB_ASSET, environ={'TOKEN_ENV_SENTINEL': ''}),
+        }
+        for name, case in cases.items():
+            with self.subTest(name):
+                case.pop('prepare', lambda: None)()
+                case_pins = {'test-driver': {**pins['test-driver'], **case.pop('pin', {})}}
+                self.assert_nothing_private(self.failed_install(case.pop('entry'), package='test-driver',
+                                                                pins=case_pins, arguments=arguments, **case))
+                self.assertEqual(sorted(path.name for path in runtime.iterdir()), before)
+
     def test_unexpected_failure_reports_its_type_and_place_only(self):
         self.archive.write_bytes(self.data)
         broken = mock.patch.object(sdk, 'sdk_root', side_effect=RuntimeError(f'{STORE} {TOKEN} {URL}'))
@@ -662,6 +891,28 @@ class CommandLine(Workspace):
         status, stdout, stderr = self.run_main(*arguments)
         self.assertEqual((status, stdout), (1, ''))
         self.assertRegex(stderr, r'\Aerror: .+ already exists\n\Z')
+
+    def test_install_driver_prints_what_it_added_and_refuses_to_add_it_twice(self):
+        data, driver = linux_download(), driver_download()
+        pins = {**self.pins(data), 'test-driver': {'version': '6.9.1', 'driver': 'hx', 'platform': 'linux',
+                                                   'size': len(driver), 'sha256': hashlib.sha256(driver).hexdigest()}}
+        self.addCleanup(setattr, sdk, 'load_pins', sdk.load_pins)
+        sdk.load_pins = lambda: pins
+        archive = self.work / 'driver.tar.gz'
+        archive.write_bytes(driver)
+        status, _, _ = self.run_main('install', 'test-linux', '--dest', str(self.work / 'sdk'),
+                                     '--archive', str(self.archive(data)))
+        self.assertEqual(status, 0)
+        arguments = ('install-driver', 'test-driver', '--sdk', str(self.work / 'sdk'), '--archive', str(archive),
+                     '--target', TARGET)
+        status, stdout, _ = self.run_main(*arguments)
+        self.assertEqual(status, 0)
+        runtime = self.work / 'sdk' / 'NDI SDK for Linux' / 'lib' / 'x86_64-linux-gnu'
+        self.assertEqual(stdout, f'installed {runtime}/libavcodec-ndi.so.61\ninstalled {runtime}/libndihx.so\n')
+        status, stdout, stderr = self.run_main(*arguments)
+        self.assertEqual((status, stdout), (1, ''))
+        self.assertEqual(stderr, 'error: the runtime directory already has libavcodec-ndi.so.61, libndihx.so\n')
+        self.assertIn('test-driver\t6.9.1\thx-driver\tlinux\n', self.run_main('list')[1])
 
 
 if __name__ == '__main__':

@@ -53,7 +53,7 @@ workflow by the script tests.
 | linux-x64 standard-6.3.2 | ubuntu-24.04 | x86_64-unknown-linux-gnu | 6.3.2-standard-linux | `1` | `1` | |
 | linux-x64 advanced-6.3.2 | ubuntu-24.04 | x86_64-unknown-linux-gnu | 6.3.2-advanced-linux | `advanced` | `1` | Advanced lint |
 | linux-x64 standard-6.4 | ubuntu-24.04 | x86_64-unknown-linux-gnu | current-standard-linux | `1,discovery-server` | `1,discovery-server` | vendored bindings check |
-| linux-x64 advanced-6.4 | ubuntu-24.04 | x86_64-unknown-linux-gnu | current-advanced-linux | `advanced,file,discovery-server` | `1,discovery-server` | Advanced lint |
+| linux-x64 advanced-6.4 | ubuntu-24.04 | x86_64-unknown-linux-gnu | current-advanced-linux | `advanced,file,discovery-server,hx-decoder` | `1,discovery-server` | Advanced lint |
 | linux-x86 standard-6.4 | ubuntu-24.04 | i686-unknown-linux-gnu | current-standard-linux | `1,discovery-server` | `1,discovery-server` | |
 | linux-arm64 standard-6.4 | ubuntu-24.04-arm | aarch64-unknown-linux-gnu | current-standard-linux | `1,discovery-server` | `1,discovery-server` | |
 | windows-x64 standard-6.3.2 | windows-2025 | x86_64-pc-windows-msvc | 6.3.2-standard-windows | `1` | `1` | |
@@ -80,9 +80,10 @@ run's runtime; the test checks video pixels, audio samples, timecodes and
 metadata. A run with a Standard runtime promises `1`, a run with an Advanced
 baseline runtime `advanced`, and a run with the current Advanced runtime the
 row's promise, with `advanced` replaced by `1` and `hx-decoder` dropped when
-the build has no Advanced declarations. Every run checks the loaded runtime's
-version, edition and path against the values `sdk.py` exported for it. Advanced
-operations without matching build declarations report unavailable.
+the build has no Advanced declarations. Only the current runtime has the row's
+NDI|HX driver beside it. Every run checks the loaded runtime's version, edition
+and path against the values `sdk.py` exported for it. Advanced operations
+without matching build declarations report unavailable.
 
 Each row:
 
@@ -93,7 +94,9 @@ Each row:
    and `NDI_RUNTIME_DIR_V6` to the following steps, together with
    `GRAFTON_NDI_EXPECTED_VERSION`, `GRAFTON_NDI_EXPECTED_EDITION` and
    `GRAFTON_NDI_EXPECTED_RUNTIME`, and also as step outputs. Every real-runtime
-   test checks the loaded module against those values. A row with
+   test checks the loaded module against those values. A row with an
+   `hx-driver` copies that driver package beside the runtime it just
+   installed (see [The NDI|HX driver](#the-ndihx-driver)). A row with
    compatibility runs provisions its two baseline packages too, into separate
    directories, and writes their values to files under `$RUNNER_TEMP` for those
    runs. This step is the only one given the secrets in its environment;
@@ -148,7 +151,7 @@ mistake cannot pass as a skip:
 | `advanced` | an Advanced runtime, compiled with its headers | the `advanced` feature is on |
 | `file` | a File library the selected runtime can drive: an Advanced runtime on Linux and macOS, any 6.4 runtime on 64-bit Windows | the `file-io` feature is on |
 | `discovery-server` | the SDK's Discovery Server program and a 6.4 runtime, whose advertisers and listeners can use it | the target is Linux |
-| `hx-decoder` | an NDI\|HX video decoder the selected runtime can use. It is built into the runtime on Windows and macOS. On Linux the runtime needs the NDI\|HX Driver or FFmpeg 7, and the runner has neither | the `advanced` feature is on |
+| `hx-decoder` | an NDI\|HX video decoder the selected runtime can use. It is built into the runtime on Windows and macOS. On Linux the runtime needs the NDI\|HX Driver for Linux or FFmpeg 7; the runner has no FFmpeg 7, so a row provides the driver through `hx-driver` | the `advanced` feature is on |
 
 A promise that no test in a build can check is itself a failure, and a missing
 one lets a test skip, so each step promises exactly what its build can check:
@@ -157,8 +160,9 @@ no-default-features step only `1` and, on Linux with a 6.4 package,
 `discovery-server`. The script tests hold every row to this rule.
 
 The only test of `hx-decoder` sends HEVC 4:4:4 from an Advanced sender and
-decodes it with the 6.4 Best444 receiver mode, so only the Windows and macOS
-Advanced 6.4 rows promise it. Without a decoder the runtime delivers black
+decodes it with the 6.4 Best444 receiver mode, so the rows that promise it are
+the Windows and macOS Advanced 6.4 rows and the Linux x64 Advanced 6.4 row,
+which installs the driver. Without a decoder the runtime delivers black
 1920x1080 frames instead of the picture, so the test looks for one first:
 `hx_decoder()` in `src/test_support.rs` lists where.
 
@@ -199,15 +203,50 @@ An entry is one of `github_release_asset` (read with the token in
 path). The token is sent to `api.github.com` only and a transient HTTP failure
 is retried twice. A package's entry is keyed by its id, as above, or by its
 content-qualified name, `ndi-<version>-<edition>-<platform>-<sha256>`, and
-exactly one of the two must be present. The map needs an entry for every
+exactly one of the two must be present. A driver package's name has
+`hx-driver` in place of the edition. The map needs an entry for every
 package the `sdk` matrix uses, including the baseline packages of the
-compatibility runs.
+compatibility runs and the `hx-driver` packages.
 
 Nothing the script prints contains a value from the source map, from a variable
 the map names, or the token: its own messages are written without them, a
 failing vendor tool is reported by name and exit status, and anything unexpected
 by its type and the line that raised it. The vendor tools are given the staged
 copy, never a path from the map, and none of those variables.
+
+### The NDI|HX driver
+
+On Linux the NDI runtime decodes NDI|HX video (H.264 and HEVC) only through a
+decoder it finds when it runs. NDI ships one separately as the NDI|HX Driver
+for Linux: `libndihx.so` and the FFmpeg 7 libraries it bundles under `-ndi`
+names, which the runtime loads when they are in its own directory. `current-hx-driver-linux` pins that download.
+Its pin has `driver` where an SDK's has `edition`, and its version is the SDK
+release it was built with: the driver's `Version.txt` carries no version
+number, only the vendor build (`git-…`).
+
+```sh
+python ci/sdk.py install-driver current-hx-driver-linux --sdk ~/ndi/advanced-6.4 \
+    --archive ~/Downloads/NDIHXDriverForLinux.tar.gz --target x86_64-unknown-linux-gnu
+```
+
+`--sdk` is the directory `install` unpacked an SDK into, or the SDK root. The
+command acquires and checks the archive as `install` does, unpacks the
+self-extracting `NDIHXDriverForLinux*.sh` without running it, and refuses links
+that lead out of the unpacked tree. It then requires that the SDK's
+`Version.txt` names the pinned release and the same vendor build as the
+driver's, and copies only `libndihx.so` and the `lib*-ndi.so.*` libraries of the
+target's directory (`x86_64-linux-gnu` or `i686-linux-gnu`) beside the
+runtime library. It refuses any other file there, refuses to overwrite a file
+the runtime directory already has, removes what it copied when a copy fails,
+and prints the files it added. The driver also needs `libcurl.so.4` on the
+system, which the Ubuntu runner image includes.
+
+In the `sdk` job, the provisioning step installs a row's `hx-driver` beside the
+runtime it has just installed, so the secrets stay with that one step. The
+driver comes under the NDI|HX licence agreement, which its archive includes. On
+Linux, NDI grants no licence for the H.264 and AAC technology the driver uses,
+so whoever runs it must hold any licence that use needs; the bundled FFmpeg
+libraries carry their own licence too.
 
 ## Loopback-only test runs
 
@@ -390,7 +429,7 @@ have libclang installed.
 
 | File | Purpose |
 |---|---|
-| `sdk.py`, `sdk-packages.json` | verify and install a pinned SDK package |
+| `sdk.py`, `sdk-packages.json` | verify and install a pinned SDK package, or a pinned driver beside an installed runtime |
 | `offline.toml`, `offline/` | loopback-only test runner per operating system, and the check that it isolates |
 | `gate.py` | the `required-ci` decision |
 | `semver.py` | the semver check against the newest published release |
@@ -452,6 +491,10 @@ New, and so unverified anywhere but Linux x86_64:
   their wrappers, and on every platform the hand-off of the baseline values
   through the files under `$RUNNER_TEMP` and the step outputs;
 - provisioning the 6.1.1 and 6.3.2 baseline packages in CI;
+- installing the NDI|HX driver in CI, from its source-map entry, and the
+  `hx-decoder` promise on Linux, which has passed by hand against a local copy
+  of the Advanced 6.4 runtime with the driver beside it and the system FFmpeg
+  hidden;
 - building tvOS and visionOS on the stable toolchain;
 - the Android example link in `cross`;
 - access to the secrets and the download from the private store;

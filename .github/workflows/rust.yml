@@ -161,7 +161,8 @@ jobs:
       #   file              a File library the selected runtime can drive
       #   discovery-server  the SDK's Discovery Server program (Linux, 6.4)
       #   hx-decoder        an NDI|HX video decoder (built into the runtime on
-      #                     Windows and macOS; no Linux row installs one)
+      #                     Windows and macOS; on Linux, the driver package a
+      #                     row names in `hx-driver`, copied beside its runtime)
       # Each step promises exactly what its build can check. A build without the
       # advanced and file-io features can check only the first and the last, so
       # the no-default-features step promises `require-no-default`, or `1` in a
@@ -194,9 +195,10 @@ jobs:
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             package: current-advanced-linux
+            hx-driver: current-hx-driver-linux
             compatibility: 6.1.1-standard-linux
             compatibility-advanced: 6.3.2-advanced-linux
-            require: advanced,file,discovery-server
+            require: advanced,file,discovery-server,hx-decoder
             require-no-default: 1,discovery-server
           - name: linux-x86 standard-6.4
             runner: ubuntu-24.04
@@ -306,7 +308,9 @@ jobs:
           if (!(Test-Path 'C:\Program Files\LLVM\bin\clang.exe')) { choco install llvm --version=20.1.8 -y }
           'LIBCLANG_PATH=C:\Program Files\LLVM\bin' | Out-File $env:GITHUB_ENV -Append -Encoding utf8
       # The only step that is given the acquisition secrets. It exports
-      # NDI_SDK_DIR and NDI_RUNTIME_DIR_V6 for the steps that follow.
+      # NDI_SDK_DIR and NDI_RUNTIME_DIR_V6 for the steps that follow, and copies
+      # a row's `hx-driver` beside that runtime. The compatibility runs' baseline
+      # runtimes get none: a driver works only with the runtime of its own build.
       - name: Provision the SDK
         id: sdk
         env:
@@ -314,6 +318,9 @@ jobs:
           NDI_SDK_ARCHIVE_TOKEN: ${{ secrets.NDI_SDK_ARCHIVE_TOKEN }}
         run: |
           python ci/sdk.py install "$PACKAGE" --dest "$RUNNER_TEMP/ndi-sdk" --target "$TARGET" --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT"
+          if [ -n "${{ matrix.hx-driver }}" ]; then
+            python ci/sdk.py install-driver "${{ matrix.hx-driver }}" --sdk "$RUNNER_TEMP/ndi-sdk" --target "$TARGET"
+          fi
           if [ -n "${{ matrix.compatibility }}" ]; then
             python ci/sdk.py install "${{ matrix.compatibility }}" --dest "$RUNNER_TEMP/ndi-compat" --target "$TARGET" --github-env "$RUNNER_TEMP/ndi-compat-standard.env"
             python ci/sdk.py install "${{ matrix.compatibility-advanced }}" --dest "$RUNNER_TEMP/ndi-compat-advanced" --target "$TARGET" --github-env "$RUNNER_TEMP/ndi-compat-advanced.env"

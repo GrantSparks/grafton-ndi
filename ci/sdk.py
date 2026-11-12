@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Install one pinned NDI SDK package for CI or local development.
+"""Install one pinned NDI SDK package, or a driver for one, for CI or local development.
 
     python ci/sdk.py install current-standard-linux --dest /tmp/ndi \\
         --target x86_64-unknown-linux-gnu [--archive FILE] [--github-env FILE]
+    python ci/sdk.py install-driver current-hx-driver-linux --sdk /tmp/ndi \\
+        --target x86_64-unknown-linux-gnu [--archive FILE]
     python ci/sdk.py list
 
 The archive comes from --archive or from the private source map in
 NDI_SDK_SOURCES_JSON. Its size and SHA-256 are checked against
-ci/sdk-packages.json before anything opens it. The command prints the
+ci/sdk-packages.json before anything opens it. `install` prints the
 NDI_SDK_DIR and NDI_RUNTIME_DIR_V6 values to use, and appends them to
---github-env when given.
+--github-env when given. `install-driver` copies a driver's libraries beside
+the runtime library of an SDK that `install` unpacked, after checking that
+both come from the same vendor build, and prints the files it added.
 
 Nothing this script prints includes a value from the source map or a credential:
 the private store's repository, asset identifiers, URLs and local paths must not
@@ -19,6 +23,7 @@ runs are never given such a path either.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fnmatch
 import hashlib
 import http.client
@@ -41,6 +46,9 @@ import urllib.request
 
 PINS = Path(__file__).with_name('sdk-packages.json')
 PIN_FIELDS = {'version', 'edition', 'platform', 'size', 'sha256'}
+# A driver package names its driver where an SDK names its edition. Its version
+# is that of the SDK release it was built with.
+DRIVER_FIELDS = PIN_FIELDS - {'edition'} | {'driver'}
 ARCHIVE_NAME = {'linux': 'sdk.tar.gz', 'android': 'sdk.tar.gz', 'apple': 'sdk.pkg', 'windows': 'sdk.exe'}
 # Rust target -> (package platform, runtime directory, core library for standard / advanced).
 RUNTIMES = {
@@ -59,7 +67,26 @@ RETRY_DELAYS = (2, 5)
 RENAME_DELAYS = (1, 2, 4, 8, 15)
 TRANSIENT_STATUS = {408, 500, 502, 503, 504}
 INSTALLER_MARKER = re.compile(rb'^__NDI_ARCHIVE_BEGIN__\r?\n', re.MULTILINE)
+SDK_INSTALLER = 'Install_NDI*.sh'
 VERSION = re.compile(r'(?<![0-9])v(\d+(?:\.\d+){1,3})(?![0-9.])')
+# The vendor build a Version.txt names, such as `git-7bdfb5361`.
+BUILD = re.compile(r'(?<![\w-])git-([0-9a-f]+)(?![\w-])')
+
+
+class Driver(NamedTuple):
+    """A library the runtime loads from its own directory when it is there."""
+    platform: str
+    installer: str  # the self-extracting script in the download
+    library: str  # the library the runtime loads
+    dependencies: re.Pattern  # the names of the libraries that must sit beside it
+    directories: dict  # Rust target -> the directory of the unpacked driver that holds its libraries
+
+
+DRIVERS = {
+    # The NDI|HX Driver for Linux decodes NDI|HX video for the runtime it is copied beside.
+    'hx': Driver('linux', 'NDIHXDriverForLinux*.sh', 'libndihx.so', re.compile(r'lib\w+-ndi\.so\.\d+'),
+                 {'x86_64-unknown-linux-gnu': 'x86_64-linux-gnu', 'i686-unknown-linux-gnu': 'i686-linux-gnu'}),
+}
 
 
 class SdkError(Exception):
@@ -71,22 +98,38 @@ class Download(NamedTuple):
     headers: dict
 
 
+def well_formed(pin):
+    """Whether `pin` is an SDK package's or a driver package's entry, with sound values."""
+    if not isinstance(pin, dict):
+        return False
+    if set(pin) == PIN_FIELDS:
+        known = pin['platform'] in ARCHIVE_NAME and pin['edition'] in ('standard', 'advanced')
+    elif set(pin) == DRIVER_FIELDS:
+        driver = DRIVERS.get(pin['driver']) if isinstance(pin['driver'], str) else None
+        known = driver is not None and pin['platform'] == driver.platform
+    else:
+        return False
+    return (known and bool(re.fullmatch(r'\d+(\.\d+){1,3}', str(pin['version'])))
+            and type(pin['size']) is int and pin['size'] > 0
+            and bool(re.fullmatch(r'[0-9a-f]{64}', str(pin['sha256']))))
+
+
 def load_pins(path=PINS):
     pins = json.loads(Path(path).read_text(encoding='utf-8'))
     for name, pin in pins.items():
-        if (not isinstance(pin, dict) or set(pin) != PIN_FIELDS
-                or pin['platform'] not in ARCHIVE_NAME
-                or pin['edition'] not in ('standard', 'advanced')
-                or not re.fullmatch(r'\d+(\.\d+){1,3}', str(pin['version']))
-                or type(pin['size']) is not int or pin['size'] <= 0
-                or not re.fullmatch(r'[0-9a-f]{64}', str(pin['sha256']))):
+        if not well_formed(pin):
             raise SdkError(f'{name}: malformed entry in {Path(path).name}')
     return pins
 
 
+def kind(pin):
+    """An SDK package's edition, or `<driver>-driver` for a driver package."""
+    return pin['edition'] if 'edition' in pin else f"{pin['driver']}-driver"
+
+
 def artifact_id(pin):
     """The content-qualified name the private source map may use instead of the package id."""
-    return f"ndi-{pin['version']}-{pin['edition']}-{pin['platform']}-{pin['sha256']}"
+    return f"ndi-{pin['version']}-{kind(pin)}-{pin['platform']}-{pin['sha256']}"
 
 
 def source_map(environ):
@@ -259,17 +302,18 @@ def extract_tar(fileobj, destination):
         stream.extractall(root, members=checked_members(stream, root), **options)
 
 
-def extract_embedded(archive, destination):
+def extract_embedded(archive, destination, installer=SDK_INSTALLER):
     """Unpack a Linux or Android download.
 
-    The download is a tarball holding one self-extracting `Install_NDI*.sh` whose tail,
-    after a marker line, is the SDK tarball. The script is not executed.
+    The download is a tarball holding one self-extracting script named like
+    `installer` whose tail, after a marker line, is the package's tarball. The
+    script is not executed.
     """
     with tarfile.open(archive, mode='r:*') as outer:
         scripts = [member for member in outer.getmembers()
-                   if member.isfile() and fnmatch.fnmatch(Path(member.name).name, 'Install_NDI*.sh')]
+                   if member.isfile() and fnmatch.fnmatch(Path(member.name).name, installer)]
         if len(scripts) != 1:
-            raise SdkError('archive must contain exactly one Install_NDI*.sh')
+            raise SdkError(f'archive must contain exactly one {installer}')
         with outer.extractfile(scripts[0]) as script, tempfile.TemporaryFile() as payload:
             shutil.copyfileobj(script, payload, 1 << 20)
             payload.seek(0)
@@ -378,13 +422,54 @@ def publish(unpacked, dest, *, windows=None, sleep=time.sleep):
                        f'{sum(RENAME_DELAYS)} s (a virus scanner or the installer may still hold its files)') from error
 
 
-def install(package, dest, *, archive=None, target=None, environ=None, pins=None):
-    """Install `package` into `dest` and return the environment that selects it."""
-    environ = os.environ if environ is None else environ
+def pinned(package, pins, *, driver):
+    """The pin of `package`, which must be a driver package exactly when `driver` is true."""
     pins = load_pins() if pins is None else pins
     if package not in pins:
         raise SdkError(f'unknown package {package}; known: {", ".join(sorted(pins))}')
     pin = pins[package]
+    if driver and 'driver' not in pin:
+        raise SdkError(f'{package} is an SDK package; install it with the install command')
+    if not driver and 'driver' in pin:
+        raise SdkError(f'{package} is a driver package; install it with the install-driver command')
+    return pin
+
+
+@contextlib.contextmanager
+def staged(parent, prefix):
+    """A new private directory under `parent` that is removed afterwards, if it can be.
+
+    Removing it must never decide the outcome: on Windows the installer's own
+    files can still be locked then, and the error would replace the real one,
+    or fail an installation that has already succeeded. The directory is made
+    and removed here and not by tempfile.TemporaryDirectory, whose handling of
+    cleanup errors differs between Python versions.
+    """
+    staging = Path(tempfile.mkdtemp(prefix=prefix, dir=parent))
+    try:
+        yield staging
+    finally:
+        try:
+            shutil.rmtree(staging)
+        except OSError:
+            pass  # a leftover directory is harmless; the outcome stands
+
+
+def fetch(source, pin, staging):
+    """Copy or download the package into `staging` and check it against its pin before anything opens it."""
+    local = staging / ARCHIVE_NAME[pin['platform']]
+    if isinstance(source, Download):
+        download(source, local)
+    else:
+        snapshot(source, local)
+    verify(local, pin)
+    return local
+
+
+def install(package, dest, *, archive=None, target=None, environ=None, pins=None):
+    """Install `package` into `dest` and return the environment that selects it."""
+    environ = os.environ if environ is None else environ
+    pin = pinned(package, pins, driver=False)
     library = runtime_library(pin, target) if target else None
     dest = Path(dest).absolute()
     if dest.exists():
@@ -394,19 +479,8 @@ def install(package, dest, *, archive=None, target=None, environ=None, pins=None
     secret = secret_variables(environ)
     tool_env = {name: value for name, value in environ.items() if name not in secret}
     dest.parent.mkdir(parents=True, exist_ok=True)
-    # Removing the staging directory must never decide the outcome: on Windows the
-    # installer's own files can still be locked then, and the error would replace
-    # the real one, or fail an installation that has already succeeded. The
-    # directory is made and removed here and not by tempfile.TemporaryDirectory,
-    # whose handling of cleanup errors differs between Python versions.
-    staging = Path(tempfile.mkdtemp(prefix='.ndi-sdk-', dir=dest.parent))
-    try:
-        local = staging / ARCHIVE_NAME[pin['platform']]
-        if isinstance(source, Download):
-            download(source, local)
-        else:
-            snapshot(source, local)
-        verify(local, pin)
+    with staged(dest.parent, '.ndi-sdk-') as staging:
+        local = fetch(source, pin, staging)
         unpacked = staging / 'sdk'
         extract(local, pin['platform'], unpacked, tool_env)
         reject_outside_links(unpacked)
@@ -426,12 +500,93 @@ def install(package, dest, *, archive=None, target=None, environ=None, pins=None
             values['GRAFTON_NDI_EXPECTED_EDITION'] = pin['edition']
         # The destination appears only once every check has passed.
         publish(unpacked, dest)
-    finally:
-        try:
-            shutil.rmtree(staging)
-        except OSError:
-            pass  # a leftover directory is harmless; the outcome above stands
     return {name: str(path) for name, path in values.items()}
+
+
+def build_of(version_file, what):
+    """The one vendor build that a Version.txt names."""
+    text = version_file.read_text(encoding='utf-8', errors='replace') if version_file.is_file() else ''
+    found = set(BUILD.findall(text))
+    if len(found) != 1:
+        raise SdkError(f'{what} Version.txt does not name one vendor build')
+    return found.pop()
+
+
+def driver_libraries(unpacked, driver, target):
+    """The directory of the unpacked driver that holds the libraries for `target`, and their names.
+
+    Every file there must be the driver library or one of its dependencies, so
+    that nothing the runtime needs is left behind and nothing else is copied.
+    """
+    roots = sorted({library.parent.parent for library in unpacked.rglob(driver.library)
+                    if (library.parent.parent / 'Version.txt').is_file()})
+    if len(roots) != 1:
+        raise SdkError(f'expected one driver root in the package, found {len(roots)}')
+    directory = roots[0] / driver.directories[target]
+    names = sorted(path.name for path in directory.iterdir()) if directory.is_dir() else []
+    if driver.library not in names:
+        raise SdkError(f'the driver has no {driver.directories[target]}/{driver.library}')
+    for name in names:
+        path = directory / name
+        if path.is_symlink() or not path.is_file():
+            raise SdkError(f'the driver\'s {name} is not a regular file')
+        if name != driver.library and not driver.dependencies.fullmatch(name):
+            raise SdkError(f'the driver\'s {driver.directories[target]} holds an unexpected file {name}')
+    return roots[0], directory, names
+
+
+def install_driver(package, sdk, *, target, archive=None, environ=None, pins=None):
+    """Copy the libraries of the driver `package` beside the runtime library of the SDK in `sdk`.
+
+    `sdk` is the directory `install` unpacked an SDK into, or the SDK root
+    itself. The driver must come from the same vendor build as that SDK, and
+    none of its files may exist in the runtime directory yet. Returns the files
+    it added.
+    """
+    environ = os.environ if environ is None else environ
+    pin = pinned(package, pins, driver=True)
+    driver = DRIVERS[pin['driver']]
+    if target not in driver.directories:
+        raise SdkError(f'the {package} driver has no libraries for target {target}')
+    sdk = Path(sdk).absolute()
+    if not sdk.is_dir():
+        raise SdkError(f'{sdk} is not a directory')
+    root = sdk_root(sdk)
+    # The driver carries no version number, only the build it came from. The
+    # SDK must be the pinned release and name the same build.
+    check_version(root, pin)
+    sdk_build = build_of(root / 'Version.txt', 'the SDK\'s')
+    runtime = root / RUNTIMES[target][1]
+    if not any((runtime / name).is_file() for name in RUNTIMES[target][2:]):
+        raise SdkError(f'the SDK has no runtime library in {RUNTIMES[target][1]}')
+    source = Path(archive) if archive else select_source(package, pin, environ)
+    with staged(None, '.ndi-driver-') as staging:
+        local = fetch(source, pin, staging)
+        unpacked = staging / 'driver'
+        extract_embedded(local, unpacked, driver.installer)
+        reject_outside_links(unpacked)
+        driver_root, directory, names = driver_libraries(unpacked, driver, target)
+        driver_build = build_of(driver_root / 'Version.txt', 'the driver\'s')
+        if driver_build != sdk_build:
+            raise SdkError(f'the driver is build git-{driver_build} and the SDK build git-{sdk_build}; '
+                           f'a driver works only with the runtime of its own build')
+        present = [name for name in names if os.path.lexists(runtime / name)]
+        if present:
+            raise SdkError(f'the runtime directory already has {", ".join(present)}')
+        installed = []
+        try:
+            for name in names:
+                # `x` refuses a file that appeared since the check above.
+                with (directory / name).open('rb') as library, (runtime / name).open('xb') as copy:
+                    installed.append(runtime / name)
+                    shutil.copyfileobj(library, copy, 1 << 20)
+                shutil.copymode(directory / name, runtime / name)
+        except BaseException:
+            # Half a driver beside a runtime is worse than none.
+            for path in installed:
+                path.unlink(missing_ok=True)
+            raise
+    return [str(path) for path in installed]
 
 
 def main(argv=None):
@@ -445,11 +600,21 @@ def main(argv=None):
     command.add_argument('--target', help='Rust target whose runtime directory to export')
     command.add_argument('--github-env', type=Path, help='append the exported variables to this file')
     command.add_argument('--github-output', type=Path, help='append the selected SDK values as step outputs')
+    command = commands.add_parser('install-driver', help='verify a driver package and copy it beside a runtime')
+    command.add_argument('package')
+    command.add_argument('--sdk', required=True, type=Path,
+                         help='the directory install unpacked the SDK into, or the SDK root')
+    command.add_argument('--target', required=True, help='Rust target whose runtime directory receives the driver')
+    command.add_argument('--archive', type=Path, help='local archive instead of NDI_SDK_SOURCES_JSON')
     args = parser.parse_args(argv)
     try:
         if args.command == 'list':
             for name, pin in sorted(load_pins().items()):
-                print(f"{name}\t{pin['version']}\t{pin['edition']}\t{pin['platform']}")
+                print(f"{name}\t{pin['version']}\t{kind(pin)}\t{pin['platform']}")
+            return 0
+        if args.command == 'install-driver':
+            installed = install_driver(args.package, args.sdk, target=args.target, archive=args.archive)
+            sys.stdout.write(''.join(f'installed {path}\n' for path in installed))
             return 0
         values = install(args.package, args.dest, archive=args.archive, target=args.target)
     except SdkError as error:
