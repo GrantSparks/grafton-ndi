@@ -66,7 +66,8 @@ pub struct Router {
     routing: &'static sys::Routing,
     _name: CString,
     _groups: Option<CString>,
-    _config: Option<CString>,
+    #[cfg(feature = "advanced")]
+    _config: Option<crate::advanced::AdvancedConfig>,
     _ndi: NDI,
 }
 
@@ -99,36 +100,38 @@ impl Router {
     /// when the name or groups contain a NUL byte, and
     /// [`Error::NativeOperationFailed`] when the SDK creates no source.
     pub fn new(ndi: &NDI, options: &RouterOptions) -> Result<Self> {
-        // SAFETY: the closure returns what the SDK's router creation returned,
-        // and the settings it is handed outlive that call.
+        // SAFETY: the SDK's router creation returns null or a fresh router
+        // that nothing else owns, and the settings outlive the call.
         unsafe {
             Self::create(
                 ndi,
                 options,
-                None,
                 "NDIlib_routing_create",
-                |routing, settings| Ok(routing.NDIlib_routing_create(settings)),
+                #[cfg(feature = "advanced")]
+                None,
+                |routing, settings| routing.NDIlib_routing_create(settings),
             )
         }
     }
 
-    /// Create a router through `create`, which is handed the routing table and
-    /// the native settings for `options`, and keep `config` for as long as the
-    /// router lives.
+    /// The one creation path: create a router through `create`, the entry
+    /// point `operation`, which is handed the routing table and the native
+    /// settings for `options`, and keep `config` for as long as the router
+    /// lives.
     ///
     /// # Safety
     ///
-    /// `create` returns null or a live router of `ndi`'s runtime that nothing
-    /// else owns.
-    unsafe fn create(
+    /// `create` returns null or a live router of `ndi`'s runtime, made from
+    /// the settings it was handed, that nothing else owns.
+    pub(crate) unsafe fn create(
         ndi: &NDI,
         options: &RouterOptions,
-        config: Option<CString>,
         operation: &'static str,
+        #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(
             &'static sys::Routing,
             &NDIlib_routing_create_t,
-        ) -> Result<NDIlib_routing_instance_t>,
+        ) -> NDIlib_routing_instance_t,
     ) -> Result<Self> {
         let routing = ndi.table::<sys::Routing>()?;
         let name = CString::new(options.name.as_str())?;
@@ -139,7 +142,7 @@ impl Router {
                 p_ndi_name: name.as_ptr(),
                 p_groups: groups.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
             },
-        )?;
+        );
         if instance.is_null() {
             return Err(Error::NativeOperationFailed { operation });
         }
@@ -148,6 +151,7 @@ impl Router {
             routing,
             _name: name,
             _groups: groups,
+            #[cfg(feature = "advanced")]
             _config: config,
             _ndi: ndi.clone(),
         })
@@ -229,31 +233,6 @@ impl Router {
         // SAFETY: the router is live, and the descriptor the SDK returns stays
         // valid until the router is destroyed, after this copy completes.
         unsafe { Source::try_from_raw(self.routing.NDIlib_routing_get_source_name(self.instance)) }
-    }
-}
-
-#[cfg(feature = "advanced")]
-impl crate::advanced::Configurable for Router {
-    type Options = RouterOptions;
-    type Settings = NDIlib_routing_create_t;
-    type Instance = NDIlib_routing_instance_t;
-
-    unsafe fn create_with(
-        ndi: &NDI,
-        options: &RouterOptions,
-        config: CString,
-        create: impl FnOnce(&Self::Settings) -> Result<Self::Instance>,
-    ) -> Result<Self> {
-        // SAFETY: forwarded to the caller's obligation.
-        unsafe {
-            Self::create(
-                ndi,
-                options,
-                Some(config),
-                "NDIlib_routing_create_v2",
-                |_, settings| create(settings),
-            )
-        }
     }
 }
 

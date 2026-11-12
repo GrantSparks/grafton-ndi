@@ -69,14 +69,10 @@ impl AdvancedConfig {
         self.0.to_str().expect("validated configuration UTF-8")
     }
 
-    /// The text as a C string, valid for as long as any clone of `self` lives.
+    /// The text as a C string. Every clone shares this one buffer, which
+    /// neither moves nor is freed while any clone of `self` lives.
     pub(crate) fn as_ptr(&self) -> *const std::ffi::c_char {
         self.0.as_ptr()
-    }
-
-    /// An owned copy of the text for an object that retains its own.
-    pub(crate) fn to_c_string(&self) -> CString {
-        CString::clone(&self.0)
     }
 }
 

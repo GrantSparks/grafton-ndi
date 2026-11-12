@@ -177,7 +177,8 @@ struct Advertiser<A: AdvertiserApi> {
     api: &'static A,
     members: BTreeMap<u64, A::Member>,
     _url: Option<CString>,
-    _config: Option<CString>,
+    #[cfg(feature = "advanced")]
+    _config: Option<crate::advanced::AdvancedConfig>,
     _ndi: NDI,
 }
 
@@ -191,29 +192,38 @@ unsafe impl<A: AdvertiserApi> Send for Advertiser<A> where A::Member: Send {}
 impl<A: AdvertiserApi> Advertiser<A> {
     /// Connect to the Discovery Server `options` name.
     fn new(ndi: &NDI, options: &AdvertiserOptions) -> Result<Self> {
-        // SAFETY: the closure returns what the SDK's advertiser creation
-        // returned, and the settings it is handed outlive that call.
-        unsafe { Self::create(ndi, options, None, |api, settings| Ok(api.create(settings))) }
+        // SAFETY: the SDK's advertiser creation returns null or a fresh
+        // advertiser that nothing else owns, and the settings outlive the call.
+        unsafe {
+            Self::create(
+                ndi,
+                options,
+                #[cfg(feature = "advanced")]
+                None,
+                |api, settings| api.create(settings),
+            )
+        }
     }
 
-    /// Create the native advertiser through `create`, which is handed the
-    /// table and the native settings for `options`, and keep `config` for as
-    /// long as the advertiser lives.
+    /// The one creation path of both advertisers: create the native
+    /// advertiser through `create`, which is handed the table and the native
+    /// settings for `options`, and keep `config` for as long as the
+    /// advertiser lives.
     ///
     /// # Safety
     ///
-    /// `create` returns null or a live advertiser of `ndi`'s runtime that
-    /// nothing else owns.
+    /// `create` returns null or a live advertiser of `ndi`'s runtime, made
+    /// from the settings it was handed, that nothing else owns.
     unsafe fn create(
         ndi: &NDI,
         options: &AdvertiserOptions,
-        config: Option<CString>,
-        create: impl FnOnce(&'static A, &A::Settings) -> Result<A::Instance>,
+        #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
+        create: impl FnOnce(&'static A, &A::Settings) -> A::Instance,
     ) -> Result<Self> {
         let api = ndi.table::<A>()?;
         let url = options.servers.as_deref().map(CString::new).transpose()?;
         let settings = A::settings(url.as_ref().map_or(ptr::null(), |v| v.as_ptr()));
-        let instance = create(api, &settings)?;
+        let instance = create(api, &settings);
         if instance.is_null() {
             return Err(not_created("advertiser", options.servers.as_deref()));
         }
@@ -222,6 +232,7 @@ impl<A: AdvertiserApi> Advertiser<A> {
             api,
             members: BTreeMap::new(),
             _url: url,
+            #[cfg(feature = "advanced")]
             _config: config,
             _ndi: ndi.clone(),
         })
@@ -269,41 +280,6 @@ impl<A: AdvertiserApi> Drop for Advertiser<A> {
         unsafe { self.api.destroy(self.instance) };
     }
 }
-
-/// Let the Advanced SDK create `$Advertiser` with a configuration.
-macro_rules! configurable {
-    ($Advertiser:ident, $Settings:ty, $Instance:ty) => {
-        #[cfg(feature = "advanced")]
-        impl crate::advanced::Configurable for $Advertiser {
-            type Options = AdvertiserOptions;
-            type Settings = $Settings;
-            type Instance = $Instance;
-
-            unsafe fn create_with(
-                ndi: &NDI,
-                options: &AdvertiserOptions,
-                config: CString,
-                create: impl FnOnce(&Self::Settings) -> Result<Self::Instance>,
-            ) -> Result<Self> {
-                // SAFETY: forwarded to the caller's obligation.
-                let inner = unsafe {
-                    Advertiser::create(ndi, options, Some(config), |_, settings| create(settings))
-                }?;
-                Ok(Self { inner })
-            }
-        }
-    };
-}
-configurable!(
-    SendAdvertiser,
-    NDIlib_send_advertiser_create_t,
-    NDIlib_send_advertiser_instance_t
-);
-configurable!(
-    RecvAdvertiser,
-    NDIlib_recv_advertiser_create_t,
-    NDIlib_recv_advertiser_instance_t
-);
 
 /// Advertises senders to a Discovery Server so they can be monitored.
 ///
@@ -490,6 +466,31 @@ impl SendAdvertiser {
         self.inner.release(registration.0, registration)
     }
 }
+#[cfg(feature = "advanced")]
+impl SendAdvertiser {
+    /// Create the advertiser with `config`, through the creation path both
+    /// advertisers share. An advertiser the SDK does not create is reported by
+    /// the server it was given, so the entry point's name is not needed.
+    ///
+    /// # Safety
+    ///
+    /// `create` returns null or a live advertiser of `ndi`'s runtime, made
+    /// from the settings it was handed, that nothing else owns.
+    pub(crate) unsafe fn create(
+        ndi: &NDI,
+        options: &AdvertiserOptions,
+        _operation: &'static str,
+        config: Option<crate::advanced::AdvancedConfig>,
+        create: impl FnOnce(
+            &'static sys::SenderAdvertising,
+            &NDIlib_send_advertiser_create_t,
+        ) -> NDIlib_send_advertiser_instance_t,
+    ) -> Result<Self> {
+        // SAFETY: forwarded to the caller's obligation.
+        let inner = unsafe { Advertiser::create(ndi, options, config, create) }?;
+        Ok(Self { inner })
+    }
+}
 impl RecvAdvertiser {
     /// Create an advertiser for the Discovery Server `options` name, without
     /// registering any receiver.
@@ -581,5 +582,30 @@ impl RecvAdvertiser {
         registration: RecvRegistration,
     ) -> std::result::Result<bool, Rejected<RecvRegistration>> {
         self.inner.release(registration.0, registration)
+    }
+}
+#[cfg(feature = "advanced")]
+impl RecvAdvertiser {
+    /// Create the advertiser with `config`, through the creation path both
+    /// advertisers share. An advertiser the SDK does not create is reported by
+    /// the server it was given, so the entry point's name is not needed.
+    ///
+    /// # Safety
+    ///
+    /// `create` returns null or a live advertiser of `ndi`'s runtime, made
+    /// from the settings it was handed, that nothing else owns.
+    pub(crate) unsafe fn create(
+        ndi: &NDI,
+        options: &AdvertiserOptions,
+        _operation: &'static str,
+        config: Option<crate::advanced::AdvancedConfig>,
+        create: impl FnOnce(
+            &'static sys::ReceiverAdvertising,
+            &NDIlib_recv_advertiser_create_t,
+        ) -> NDIlib_recv_advertiser_instance_t,
+    ) -> Result<Self> {
+        // SAFETY: forwarded to the caller's obligation.
+        let inner = unsafe { Advertiser::create(ndi, options, config, create) }?;
+        Ok(Self { inner })
     }
 }

@@ -10,7 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{sys::bindings::*, to_ms_checked, Error, Result, NDI};
+use crate::{
+    sys::{self, bindings::*},
+    to_ms_checked, Error, Result, NDI,
+};
 
 /// Configuration for NDI source discovery.
 ///
@@ -151,9 +154,9 @@ pub struct Finder {
     sources_lock: Mutex<()>,
     _groups: Option<CString>,    // Hold ownership of CStrings
     _extra_ips: Option<CString>, // to ensure they outlive SDK usage
-    _ndi: NDI,
     #[cfg(feature = "advanced")]
-    _advanced_config: Option<crate::advanced::AdvancedConfig>,
+    _config: Option<crate::advanced::AdvancedConfig>,
+    _ndi: NDI,
 }
 
 impl Finder {
@@ -169,56 +172,35 @@ impl Finder {
     /// Returns an error if the finder cannot be created, typically due to
     /// invalid settings or network issues.
     pub fn new(ndi: &NDI, settings: &FinderOptions) -> Result<Self> {
-        let groups_cstr = settings
-            .groups
-            .as_deref()
-            .map(CString::new)
-            .transpose()
-            .map_err(Error::InvalidCString)?;
-        let extra_ips_cstr = settings
-            .extra_ips
-            .as_deref()
-            .map(CString::new)
-            .transpose()
-            .map_err(Error::InvalidCString)?;
-
-        let create_settings = NDIlib_find_create_t {
-            show_local_sources: settings.show_local_sources,
-            p_groups: groups_cstr.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
-            p_extra_ips: extra_ips_cstr.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
-        };
-
-        // SAFETY: the settings borrow C strings that outlive the call.
-        let instance = unsafe { ndi.api().core.NDIlib_find_create_v2(&create_settings) };
-        if instance.is_null() {
-            return Err(Error::NativeOperationFailed {
-                operation: "NDIlib_find_create_v2",
-            });
+        // SAFETY: the SDK's finder creation returns null or a fresh finder
+        // that nothing else owns, and the settings outlive the call.
+        unsafe {
+            Self::create(
+                ndi,
+                settings,
+                "NDIlib_find_create_v2",
+                #[cfg(feature = "advanced")]
+                None,
+                |core, raw| core.NDIlib_find_create_v2(raw),
+            )
         }
-        Ok(Self {
-            instance,
-            sources_lock: Mutex::new(()),
-            _groups: groups_cstr,
-            _extra_ips: extra_ips_cstr,
-            _ndi: ndi.clone(),
-            #[cfg(feature = "advanced")]
-            _advanced_config: None,
-        })
     }
 
-    /// Create a finder through `create`, which is handed the native settings
-    /// for `settings`, and retain `config` for as long as the finder lives.
+    /// The one creation path: create a finder through `create`, the entry
+    /// point `operation`, which is handed the core table and the native
+    /// settings for `settings`, and keep `config` for as long as the finder
+    /// lives.
     ///
     /// # Safety
     ///
-    /// `create` returns null or a live finder of `ndi`'s runtime that nothing
-    /// else owns.
-    #[cfg(feature = "advanced")]
-    pub(crate) unsafe fn create_with(
+    /// `create` returns null or a live finder of `ndi`'s runtime, made from
+    /// the settings it was handed, that nothing else owns.
+    pub(crate) unsafe fn create(
         ndi: &NDI,
         settings: &FinderOptions,
-        config: crate::advanced::AdvancedConfig,
-        create: impl FnOnce(&NDIlib_find_create_t) -> NDIlib_find_instance_t,
+        operation: &'static str,
+        #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
+        create: impl FnOnce(&'static sys::Core, &NDIlib_find_create_t) -> NDIlib_find_instance_t,
     ) -> Result<Self> {
         let groups = settings.groups.as_deref().map(CString::new).transpose()?;
         let extra_ips = settings
@@ -226,23 +208,25 @@ impl Finder {
             .as_deref()
             .map(CString::new)
             .transpose()?;
-        let instance = create(&NDIlib_find_create_t {
-            show_local_sources: settings.show_local_sources,
-            p_groups: groups.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
-            p_extra_ips: extra_ips.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
-        });
+        let instance = create(
+            &ndi.api().core,
+            &NDIlib_find_create_t {
+                show_local_sources: settings.show_local_sources,
+                p_groups: groups.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+                p_extra_ips: extra_ips.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+            },
+        );
         if instance.is_null() {
-            return Err(Error::NativeOperationFailed {
-                operation: "NDIlib_find_create_v3",
-            });
+            return Err(Error::NativeOperationFailed { operation });
         }
         Ok(Self {
             instance,
             sources_lock: Mutex::new(()),
             _groups: groups,
             _extra_ips: extra_ips,
+            #[cfg(feature = "advanced")]
+            _config: config,
             _ndi: ndi.clone(),
-            _advanced_config: Some(config),
         })
     }
 

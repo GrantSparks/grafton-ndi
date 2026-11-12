@@ -237,10 +237,26 @@ impl PacketReceiver {
     ) -> Result<Self> {
         let table = ndi.table::<ReceiverConfiguration>()?;
         let color_format = preset.color_format(table)?;
-        let receiver = Receiver::configured(ndi, table, options, config, |create| {
-            create.color_format = color_format;
-            create.allow_video_fields = true;
-        })?;
+        // SAFETY: the closure returns what the SDK's configured receiver
+        // creation returned for the settings it was handed with the preset's
+        // color format and fielded video; the strings the copy points to
+        // belong to the creation path, which outlives the call.
+        let receiver = unsafe {
+            <Receiver as super::Configurable>::configured(
+                ndi,
+                options,
+                "NDIlib_recv_create_v4",
+                config,
+                |table: &'static ReceiverConfiguration, settings, text| {
+                    let settings = NDIlib_recv_create_v3_t {
+                        color_format,
+                        allow_video_fields: true,
+                        ..*settings
+                    };
+                    native!(ReceiverConfiguration, table => table.NDIlib_recv_create_v4(&settings, text))
+                },
+            )
+        }?;
         Ok(Self::from_receiver(receiver))
     }
 

@@ -63,7 +63,8 @@ pub(crate) struct SenderResource {
     pub(crate) instance: NDIlib_send_instance_t,
     _name: CString,
     _groups: Option<CString>,
-    _configuration: Option<CString>,
+    #[cfg(feature = "advanced")]
+    _config: Option<crate::advanced::AdvancedConfig>,
     _ndi: NDI,
 }
 
@@ -537,49 +538,61 @@ impl Sender {
     /// - The groups string contains a null byte
     /// - NDI fails to create the send instance
     pub fn new(ndi: &NDI, create_settings: &SenderOptions) -> Result<Self> {
-        let name_cstr =
-            CString::new(create_settings.name.clone()).map_err(Error::InvalidCString)?;
-        let groups_cstr = match &create_settings.groups {
-            Some(groups) => Some(CString::new(groups.clone()).map_err(Error::InvalidCString)?),
-            None => None,
-        };
-
-        let c_settings = NDIlib_send_create_t {
-            p_ndi_name: name_cstr.as_ptr(),
-            p_groups: groups_cstr.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
-            clock_video: create_settings.clock_video,
-            clock_audio: create_settings.clock_audio,
-        };
-
-        // SAFETY: the settings borrow C strings that outlive the call.
-        let instance = unsafe { ndi.api().core.NDIlib_send_create(&c_settings) };
-        if instance.is_null() {
-            Err(Error::NativeOperationFailed {
-                operation: "NDIlib_send_create",
-            })
-        } else {
-            // SAFETY: Creation returned a fresh native instance owned by this call.
-            Ok(unsafe { Self::from_native(ndi, instance, name_cstr, groups_cstr, None) })
+        // SAFETY: the SDK's sender creation returns null or a fresh sender
+        // that nothing else owns, and the settings outlive the call.
+        unsafe {
+            Self::create(
+                ndi,
+                create_settings,
+                "NDIlib_send_create",
+                #[cfg(feature = "advanced")]
+                None,
+                |core, raw| core.NDIlib_send_create(raw),
+            )
         }
     }
 
-    /// Take exclusive ownership of a freshly created native sender.
-    pub(crate) unsafe fn from_native(
+    /// The one creation path: create a sender through `create`, the entry
+    /// point `operation`, which is handed the core table and the native
+    /// settings for `options`, and keep `config` for as long as the native
+    /// sender lives.
+    ///
+    /// # Safety
+    ///
+    /// `create` returns null or a live sender of `ndi`'s runtime, made from
+    /// the settings it was handed, that nothing else owns.
+    pub(crate) unsafe fn create(
         ndi: &NDI,
-        instance: NDIlib_send_instance_t,
-        name: CString,
-        groups: Option<CString>,
-        configuration: Option<CString>,
-    ) -> Self {
-        Self {
+        options: &SenderOptions,
+        operation: &'static str,
+        #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
+        create: impl FnOnce(&'static sys::Core, &NDIlib_send_create_t) -> NDIlib_send_instance_t,
+    ) -> Result<Self> {
+        let name = CString::new(options.name.as_str())?;
+        let groups = options.groups.as_deref().map(CString::new).transpose()?;
+        let core = &ndi.api().core;
+        let instance = create(
+            core,
+            &NDIlib_send_create_t {
+                p_ndi_name: name.as_ptr(),
+                p_groups: groups.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+                clock_video: options.clock_video,
+                clock_audio: options.clock_audio,
+            },
+        );
+        if instance.is_null() {
+            return Err(Error::NativeOperationFailed { operation });
+        }
+        Ok(Self {
             inner: Inner {
                 instance,
-                core: &ndi.api().core,
+                core,
                 resource: Some(Arc::new(SenderResource {
                     instance,
                     _name: name,
                     _groups: groups,
-                    _configuration: configuration,
+                    #[cfg(feature = "advanced")]
+                    _config: config,
                     _ndi: ndi.clone(),
                 })),
                 metadata_capture: parking_lot::Mutex::new(()),
@@ -587,7 +600,7 @@ impl Sender {
                 video: Mutex::new(VideoState::default()),
             },
             _ndi: ndi.clone(),
-        }
+        })
     }
 
     pub(crate) fn native_instance(&self) -> NDIlib_send_instance_t {

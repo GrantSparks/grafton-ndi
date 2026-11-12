@@ -794,27 +794,39 @@ impl Receiver {
     /// source the SDK cannot be given, and [`Error::NativeOperationFailed`] when
     /// the SDK creates no receiver.
     pub fn new(ndi: &NDI, create: &ReceiverOptions) -> Result<Self> {
-        create.validate_runtime(ndi)?;
-        let create_raw = create.to_raw()?;
-        // SAFETY: the creation settings borrow storage owned by `create_raw`.
-        let instance = unsafe { ndi.api().core.NDIlib_recv_create_v3(&create_raw.raw) };
-        // SAFETY: The instance came from this runtime with validated options.
-        unsafe { Self::from_native(ndi, create, instance, "NDIlib_recv_create_v3") }
+        // SAFETY: the SDK's receiver creation returns null or a fresh receiver
+        // that nothing else owns, and the settings outlive the call.
+        unsafe {
+            Self::create(
+                ndi,
+                create,
+                "NDIlib_recv_create_v3",
+                #[cfg(feature = "advanced")]
+                None,
+                |core, raw| core.NDIlib_recv_create_v3(raw),
+            )
+        }
     }
 
-    /// Adopt an exclusively owned receiver from the selected runtime.
+    /// The one creation path: check `options` against the runtime, create a
+    /// receiver through `create`, the entry point `operation`, which is
+    /// handed the core table and the native settings for `options`, and keep
+    /// `config` for as long as the native receiver lives.
     ///
     /// # Safety
-    /// The caller must validate `create.validate_runtime(ndi)` before creating
-    /// the instance, and transfer its sole ownership here. NULL is accepted as
-    /// a native creation failure reported as `operation` failing. The instance
-    /// must match `ndi` and `create`.
-    pub(crate) unsafe fn from_native(
+    ///
+    /// `create` returns null or a live receiver of `ndi`'s runtime, made from
+    /// the settings it was handed, that nothing else owns.
+    pub(crate) unsafe fn create(
         ndi: &NDI,
-        create: &ReceiverOptions,
-        instance: NDIlib_recv_instance_t,
+        options: &ReceiverOptions,
         operation: &'static str,
+        #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
+        create: impl FnOnce(&'static sys::Core, &NDIlib_recv_create_v3_t) -> NDIlib_recv_instance_t,
     ) -> Result<Self> {
+        options.validate_runtime(ndi)?;
+        let raw = options.to_raw()?;
+        let instance = create(&ndi.api().core, &raw.raw);
         if instance.is_null() {
             return Err(Error::NativeOperationFailed { operation });
         }
@@ -822,24 +834,17 @@ impl Receiver {
             core: Arc::new(ReceiverCore {
                 instance,
                 _ndi: ndi.clone(),
-                source: create.source_to_connect_to.clone(),
+                source: options.source_to_connect_to.clone(),
                 capture_guard: RwLock::new(()),
                 pending_status: AtomicBool::new(false),
                 pending_source: AtomicBool::new(false),
                 pending_unknown: Mutex::new(None),
                 source_query_guard: Mutex::new(()),
                 #[cfg(feature = "advanced")]
-                _config: None,
+                _config: config,
             }),
             _mode: PhantomData,
         })
-    }
-
-    #[cfg(feature = "advanced")]
-    pub(crate) fn retain_config(&mut self, config: crate::advanced::AdvancedConfig) {
-        Arc::get_mut(&mut self.core)
-            .expect("configuration is retained before sharing a newly created receiver")
-            ._config = Some(config);
     }
 
     /// Capture **video** frames from this receiver.

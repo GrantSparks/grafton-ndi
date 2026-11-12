@@ -1,18 +1,17 @@
-//! Advanced SDK configuration and controls on the ordinary sender and receiver.
+//! Advanced SDK controls on the ordinary sender and receiver.
 
-use std::{ffi::CString, time::Duration};
+use std::time::Duration;
 
-use super::{invalid, AdvancedConfig, VideoPacketFormat};
+use super::{invalid, VideoPacketFormat};
 use crate::{
     sys::{
         advanced::{
             native, EncoderGuidance, KeyframeDemand, KeyframeRequest, QualityPlanning,
-            ReceiverBandwidthControl, ReceiverConfiguration, ReceiverStreamControl,
-            SenderConfiguration, SenderTally,
+            ReceiverBandwidthControl, ReceiverStreamControl, SenderTally,
         },
         bindings::*,
     },
-    Error, Receiver, ReceiverMode, ReceiverOptions, Result, Sender, SenderOptions, Tally, NDI,
+    Receiver, ReceiverMode, Result, Sender, Tally,
 };
 
 /// Encoder guidance is a non-negative quantity; the SDK reports a frame format
@@ -28,47 +27,6 @@ fn stream(format: Option<&NDIlib_video_frame_v2_t>) -> *const NDIlib_video_frame
 }
 
 impl Sender {
-    /// Create a sender with a per-instance Advanced SDK configuration.
-    ///
-    /// The sender keeps the configuration for as long as it lives.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::UnsupportedCapability`] without an Advanced runtime (or in a
-    /// build without the Advanced SDK), an invalid-string error for a name or
-    /// group containing NUL, and [`Error::NativeOperationFailed`] when the SDK
-    /// creates no sender.
-    pub fn new_with_config(
-        ndi: &NDI,
-        options: &SenderOptions,
-        config: &AdvancedConfig,
-    ) -> Result<Self> {
-        let table = ndi.table::<SenderConfiguration>()?;
-        let name = CString::new(options.name.as_str())?;
-        let groups = options.groups.as_deref().map(CString::new).transpose()?;
-        // The sender retains the exact allocation given to the SDK, in case the
-        // SDK keeps the pointer rather than copying the text.
-        let configuration = config.to_c_string();
-        let create = NDIlib_send_create_t {
-            p_ndi_name: name.as_ptr(),
-            p_groups: groups.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
-            clock_video: options.clock_video,
-            clock_audio: options.clock_audio,
-        };
-        // SAFETY: the settings and the configuration point to C strings that
-        // outlive the call.
-        let instance: NDIlib_send_instance_t = native!(SenderConfiguration, table => unsafe {
-            table.NDIlib_send_create_v2(&create, configuration.as_ptr())
-        });
-        if instance.is_null() {
-            return Err(Error::NativeOperationFailed {
-                operation: "NDIlib_send_create_v2",
-            });
-        }
-        // SAFETY: creation returned a fresh instance that nothing else owns.
-        Ok(unsafe { Self::from_native(ndi, instance, name, groups, Some(configuration)) })
-    }
-
     /// Set this sender's own contribution to its tally state, which is
     /// otherwise the combination of what its receivers report.
     ///
@@ -76,7 +34,8 @@ impl Sender {
     ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedCapability`] without an Advanced runtime.
+    /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
+    /// without an Advanced runtime.
     pub fn set_external_tally(&self, tally: Tally) -> Result<bool> {
         let table = self.runtime().table::<SenderTally>()?;
         let tally = tally.to_raw();
@@ -91,8 +50,10 @@ impl Sender {
     ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedCapability`] without an Advanced runtime, and
-    /// [`Error::InvalidFrame`] when the SDK has no guidance for the format.
+    /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
+    /// without an Advanced runtime, and
+    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when the SDK has no
+    /// guidance for the format.
     pub fn target_frame_bytes(&self, format: VideoPacketFormat) -> Result<u32> {
         let table = self.runtime().table::<EncoderGuidance>()?;
         let format = format.raw();
@@ -139,9 +100,10 @@ impl Sender {
     ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedCapability`] without an Advanced runtime, and
-    /// [`Error::InvalidFrame`] when `format` is not a SpeedHQ format the SDK
-    /// has guidance for.
+    /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
+    /// without an Advanced runtime, and
+    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when `format` is not
+    /// a SpeedHQ format the SDK has guidance for.
     pub fn quality_plan(
         &self,
         format: VideoPacketFormat,
@@ -180,7 +142,8 @@ impl Sender {
     ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedCapability`] without an Advanced runtime.
+    /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
+    /// without an Advanced runtime.
     pub fn keyframe_required(&self, format: Option<VideoPacketFormat>) -> Result<bool> {
         let table = self.runtime().table::<KeyframeDemand>()?;
         let format = format.map(VideoPacketFormat::raw);
@@ -198,9 +161,10 @@ impl Sender {
     ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedCapability`] without an Advanced runtime, and
-    /// [`Error::InvalidConfiguration`] when `timeout` exceeds
-    /// [`crate::MAX_TIMEOUT`].
+    /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
+    /// without an Advanced runtime, and
+    /// [`Error::InvalidConfiguration`](crate::Error::InvalidConfiguration)
+    /// when `timeout` exceeds [`crate::MAX_TIMEOUT`].
     pub fn wait_for_keyframe_change(
         &self,
         timeout: Duration,
@@ -305,59 +269,14 @@ pub enum StreamChange {
     UnchangedOrRejected,
 }
 
-impl Receiver {
-    /// Create a receiver with a per-instance Advanced SDK configuration.
-    ///
-    /// The receiver keeps the configuration for as long as it lives.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::UnsupportedCapability`] without an Advanced runtime (or in a
-    /// build without the Advanced SDK) or when the options need a mode the
-    /// runtime lacks, an invalid-string error for a name containing NUL, and
-    /// [`Error::NativeOperationFailed`] when the SDK creates no receiver.
-    pub fn new_with_config(
-        ndi: &NDI,
-        options: &ReceiverOptions,
-        config: &AdvancedConfig,
-    ) -> Result<Self> {
-        let table = ndi.table::<ReceiverConfiguration>()?;
-        Self::configured(ndi, table, options, config, |_| {})
-    }
-
-    /// Create a configured receiver after `adjust` has edited the native
-    /// creation settings.
-    pub(super) fn configured(
-        ndi: &NDI,
-        table: &'static ReceiverConfiguration,
-        options: &ReceiverOptions,
-        config: &AdvancedConfig,
-        adjust: impl FnOnce(&mut NDIlib_recv_create_v3_t),
-    ) -> Result<Self> {
-        options.validate_runtime(ndi)?;
-        let mut create = options.to_raw()?;
-        adjust(&mut create.raw);
-        // SAFETY: `create` owns every string its settings point to, and
-        // `config` outlives the call.
-        let instance: NDIlib_recv_instance_t = native!(ReceiverConfiguration, table => unsafe {
-            table.NDIlib_recv_create_v4(&create.raw, config.as_ptr())
-        });
-        // SAFETY: the options were validated for this runtime above, and the
-        // instance (or null) is the fresh result of creation.
-        let mut receiver =
-            unsafe { Self::from_native(ndi, options, instance, "NDIlib_recv_create_v4")? };
-        receiver.retain_config(config.clone());
-        Ok(receiver)
-    }
-}
-
 impl<M: ReceiverMode> Receiver<M> {
     /// Ask the source for a keyframe. The request is advisory: the source
     /// decides whether and when to send one.
     ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedCapability`] without an Advanced runtime.
+    /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
+    /// without an Advanced runtime.
     pub fn request_keyframe(&self) -> Result<()> {
         let table = self.core._ndi.table::<KeyframeRequest>()?;
         // SAFETY: the receiver instance is live for this borrow.
@@ -374,7 +293,8 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedCapability`] without an Advanced runtime.
+    /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
+    /// without an Advanced runtime.
     pub fn set_video_quality(&mut self, quality: VideoQuality) -> Result<bool> {
         let table = self.core._ndi.table::<ReceiverBandwidthControl>()?;
         let bandwidth = match quality {
@@ -394,7 +314,8 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedCapability`] without an Advanced runtime.
+    /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
+    /// without an Advanced runtime.
     pub fn set_streams(&mut self, streams: StreamSelection) -> Result<StreamChange> {
         let table = self.core._ndi.table::<ReceiverStreamControl>()?;
         // SAFETY: the receiver instance is live for this borrow.

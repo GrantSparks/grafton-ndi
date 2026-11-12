@@ -1,14 +1,13 @@
-//! Finder configuration and the metadata sources advertise.
+//! The metadata sources advertise to a finder.
 
 use std::ffi::{c_char, CStr};
 
-use super::AdvancedConfig;
 use crate::{
     sys::{
-        advanced::{native, FinderConfiguration, SourceMetadata},
+        advanced::{native, SourceMetadata},
         bindings::*,
     },
-    Finder, FinderOptions, Result, Source, NDI,
+    Finder, Result, Source,
 };
 
 /// A discovered source together with the metadata it advertises.
@@ -70,36 +69,6 @@ unsafe fn extended_source(
 }
 
 impl Finder {
-    /// Create a finder with a per-instance Advanced SDK configuration.
-    ///
-    /// The finder keeps the configuration for as long as it lives.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
-    /// without an Advanced runtime (or in a build without the Advanced SDK),
-    /// an invalid-string error for settings containing NUL, and
-    /// [`Error::NativeOperationFailed`](crate::Error::NativeOperationFailed)
-    /// when the SDK creates no finder.
-    pub fn new_with_config(
-        ndi: &NDI,
-        settings: &FinderOptions,
-        config: &AdvancedConfig,
-    ) -> Result<Self> {
-        let table = ndi.table::<FinderConfiguration>()?;
-        // SAFETY: the closure returns what the SDK's finder creation returned:
-        // null, or a fresh instance that nothing else owns. The settings and
-        // the configuration outlive the call.
-        unsafe {
-            Self::create_with(
-                ndi,
-                settings,
-                config.clone(),
-                |create| native!(FinderConfiguration, table => table.NDIlib_find_create_v3(create, config.as_ptr())),
-            )
-        }
-    }
-
     /// The sources currently known, each with the metadata it advertises.
     ///
     /// This is [`current_sources`](Self::current_sources) with metadata: a

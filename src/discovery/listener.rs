@@ -577,7 +577,8 @@ struct Listener<A: ListenerApi> {
     instance: A::Instance,
     api: &'static A,
     _url: Option<CString>,
-    _config: Option<CString>,
+    #[cfg(feature = "advanced")]
+    _config: Option<crate::advanced::AdvancedConfig>,
     _ndi: NDI,
 }
 
@@ -597,29 +598,37 @@ impl<A: ListenerApi> Drop for Listener<A> {
 impl<A: ListenerApi> Listener<A> {
     /// Connect to the Discovery Server `options` name.
     fn new(ndi: &NDI, options: &ListenerOptions) -> Result<Self> {
-        // SAFETY: the closure returns what the SDK's listener creation
-        // returned, and the settings it is handed outlive that call.
-        unsafe { Self::create(ndi, options, None, |api, settings| Ok(api.create(settings))) }
+        // SAFETY: the SDK's listener creation returns null or a fresh listener
+        // that nothing else owns, and the settings outlive the call.
+        unsafe {
+            Self::create(
+                ndi,
+                options,
+                #[cfg(feature = "advanced")]
+                None,
+                |api, settings| api.create(settings),
+            )
+        }
     }
 
-    /// Create the native listener through `create`, which is handed the table
-    /// and the native settings for `options`, and keep `config` for as long
-    /// as the listener lives.
+    /// The one creation path of both listeners: create the native listener
+    /// through `create`, which is handed the table and the native settings
+    /// for `options`, and keep `config` for as long as the listener lives.
     ///
     /// # Safety
     ///
-    /// `create` returns null or a live listener of `ndi`'s runtime that
-    /// nothing else owns.
+    /// `create` returns null or a live listener of `ndi`'s runtime, made from
+    /// the settings it was handed, that nothing else owns.
     unsafe fn create(
         ndi: &NDI,
         options: &ListenerOptions,
-        config: Option<CString>,
-        create: impl FnOnce(&'static A, &A::Settings) -> Result<A::Instance>,
+        #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
+        create: impl FnOnce(&'static A, &A::Settings) -> A::Instance,
     ) -> Result<Self> {
         let api = ndi.table::<A>()?;
         let url = options.server.as_deref().map(CString::new).transpose()?;
         let settings = A::settings(url.as_ref().map_or(ptr::null(), |v| v.as_ptr()));
-        let instance = create(api, &settings)?;
+        let instance = create(api, &settings);
         if instance.is_null() {
             return Err(not_created("listener", options.server.as_deref()));
         }
@@ -627,6 +636,7 @@ impl<A: ListenerApi> Listener<A> {
             instance,
             api,
             _url: url,
+            #[cfg(feature = "advanced")]
             _config: config,
             _ndi: ndi.clone(),
         })
@@ -754,40 +764,56 @@ pub struct RecvListener {
     inner: Listener<sys::ReceiverDiscovery>,
 }
 
-/// Let the Advanced SDK create `$Listener` with a configuration.
-macro_rules! configurable {
-    ($Listener:ident, $Settings:ty, $Instance:ty) => {
-        #[cfg(feature = "advanced")]
-        impl crate::advanced::Configurable for $Listener {
-            type Options = ListenerOptions;
-            type Settings = $Settings;
-            type Instance = $Instance;
-
-            unsafe fn create_with(
-                ndi: &NDI,
-                options: &ListenerOptions,
-                config: CString,
-                create: impl FnOnce(&Self::Settings) -> Result<Self::Instance>,
-            ) -> Result<Self> {
-                // SAFETY: forwarded to the caller's obligation.
-                let inner = unsafe {
-                    Listener::create(ndi, options, Some(config), |_, settings| create(settings))
-                }?;
-                Ok(Self { inner })
-            }
-        }
-    };
+#[cfg(feature = "advanced")]
+impl SendListener {
+    /// Create the listener with `config`, through the creation path both
+    /// listeners share. A listener the SDK does not create is reported by the
+    /// server it was given, so the entry point's name is not needed.
+    ///
+    /// # Safety
+    ///
+    /// `create` returns null or a live listener of `ndi`'s runtime, made from
+    /// the settings it was handed, that nothing else owns.
+    pub(crate) unsafe fn create(
+        ndi: &NDI,
+        options: &ListenerOptions,
+        _operation: &'static str,
+        config: Option<crate::advanced::AdvancedConfig>,
+        create: impl FnOnce(
+            &'static sys::SenderDiscovery,
+            &NDIlib_send_listener_create_t,
+        ) -> NDIlib_send_listener_instance_t,
+    ) -> Result<Self> {
+        // SAFETY: forwarded to the caller's obligation.
+        let inner = unsafe { Listener::create(ndi, options, config, create) }?;
+        Ok(Self { inner })
+    }
 }
-configurable!(
-    SendListener,
-    NDIlib_send_listener_create_t,
-    NDIlib_send_listener_instance_t
-);
-configurable!(
-    RecvListener,
-    NDIlib_recv_listener_create_t,
-    NDIlib_recv_listener_instance_t
-);
+#[cfg(feature = "advanced")]
+impl RecvListener {
+    /// Create the listener with `config`, through the creation path both
+    /// listeners share. A listener the SDK does not create is reported by the
+    /// server it was given, so the entry point's name is not needed.
+    ///
+    /// # Safety
+    ///
+    /// `create` returns null or a live listener of `ndi`'s runtime, made from
+    /// the settings it was handed, that nothing else owns.
+    pub(crate) unsafe fn create(
+        ndi: &NDI,
+        options: &ListenerOptions,
+        _operation: &'static str,
+        config: Option<crate::advanced::AdvancedConfig>,
+        create: impl FnOnce(
+            &'static sys::ReceiverDiscovery,
+            &NDIlib_recv_listener_create_t,
+        ) -> NDIlib_recv_listener_instance_t,
+    ) -> Result<Self> {
+        // SAFETY: forwarded to the caller's obligation.
+        let inner = unsafe { Listener::create(ndi, options, config, create) }?;
+        Ok(Self { inner })
+    }
+}
 
 const _: () = {
     const fn assert_send<T: Send>() {}
