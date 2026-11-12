@@ -4,8 +4,8 @@
 //! breaking change, fails to compile. CI builds these tests without the
 //! Advanced SDK headers and with them, so a trait that holds in only one of
 //! those builds fails as well: the `advanced` API has the same shape in both.
-//! A trait a type lacks is its documented design: the File objects, `AvSync`
-//! and `Genlock` stay on their thread, the Discovery Server owners and
+//! A trait a type lacks is its documented design: the File objects and
+//! `Genlock` stay on their thread, `AvSync`, the Discovery Server owners and
 //! `AllocationBuffer` are `Send` only, and `Error` and an ordinary `Sender`
 //! may hold application values that are not unwind safe. Gaining a trait is
 //! not a breaking change; list it here when a type gains one, and list a new
@@ -120,7 +120,7 @@ fn advanced_types_keep_their_auto_traits() {
         AllocatorService: Send, Sync, UnwindSafe, RefUnwindSafe;
         AllocatorUsage: Send, Sync, UnwindSafe, RefUnwindSafe;
         AudioCodec: Send, Sync, UnwindSafe, RefUnwindSafe;
-        AvSync: UnwindSafe, RefUnwindSafe;
+        AvSync: Send, UnwindSafe, RefUnwindSafe;
         AvSyncAttached: Send, Sync, UnwindSafe, RefUnwindSafe;
         AvSyncOutcome: Send, Sync, UnwindSafe, RefUnwindSafe;
         AvSyncRequest: Send, Sync, UnwindSafe, RefUnwindSafe;

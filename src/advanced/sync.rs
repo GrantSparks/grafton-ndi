@@ -1,6 +1,6 @@
 //! Audio matched to video timestamps, and clocks locked to a reference source.
 
-use std::{cell::Cell, marker::PhantomData, ptr, rc::Rc};
+use std::{cell::Cell, marker::PhantomData, ptr};
 
 use super::{invalid_input, sdk_quantity, AdvancedConfig, KvmSession};
 use crate::{
@@ -154,6 +154,17 @@ struct AvResource {
     table: &'static AvSyncTable,
 }
 
+// SAFETY: a synchronizer belongs to no thread. Processing.NDI.AVSync.h and the
+// Advanced SDK manual (25.6.2) have it created from a receiver, used for as
+// long as it is needed and destroyed before that receiver, and state no
+// thread for any of its functions. Moving the handle changes only which
+// thread makes those calls: the receiver it reads is Send and moves with it,
+// inside the same AvSync, which destroys the synchronizer first, and AvSync is
+// not Sync, so its calls never overlap. `an_avsync_moves_between_threads` in
+// tests/advanced_runtime.rs creates, synchronizes and destroys one on three
+// threads against each runtime the tests use.
+unsafe impl Send for AvResource {}
+
 impl Drop for AvResource {
     fn drop(&mut self) {
         // SAFETY: the handle was created by this table and is destroyed once,
@@ -176,10 +187,12 @@ impl Drop for AvResource {
 ///
 /// # Threading
 ///
-/// An `AvSync` is neither [`Send`] nor [`Sync`]: it synchronizes on the
-/// thread that created it, one call at a time. The receiver it lends is
-/// `Sync`, so scoped threads can capture video or metadata, poll events or
-/// reconnect through it while that thread synchronizes.
+/// An `AvSync` is [`Send`] but not [`Sync`]. It can be created on one thread
+/// and synchronize and be dropped on another, but it synchronizes one call at
+/// a time: the SDK does not document two synchronizations of one
+/// synchronizer running at once. The receiver it lends is `Sync`, so scoped
+/// threads can capture video or metadata, poll events or reconnect through it
+/// while the thread that holds the `AvSync` synchronizes.
 ///
 /// # Examples
 ///
@@ -212,11 +225,19 @@ pub struct AvSync {
     resource: AvResource,
     receiver: Receiver<AvSyncAttached>,
     // `synchronize` takes `&self`, so withholding Sync keeps two
-    // synchronizations of one synchronizer from running at once, which the
-    // SDK does not document as safe. Send stays withheld, as it always was.
-    // The raw handle already withholds both; this states it.
-    _thread_affinity: PhantomData<Rc<()>>,
+    // synchronizations of one synchronizer from running at once, which
+    // neither Processing.NDI.AVSync.h nor the Advanced SDK manual (25.6)
+    // documents as safe. The raw handle already withholds Sync; this states
+    // it. Send comes from the fields.
+    _not_sync: NotSync,
 }
+
+/// A field that withholds [`Sync`] from the type that holds it, and nothing
+/// else: that type keeps [`Send`] and both unwind traits.
+struct NotSync(PhantomData<Cell<()>>);
+
+// It holds nothing, so a panic cannot leave it half-changed.
+impl std::panic::RefUnwindSafe for NotSync {}
 
 impl AvSync {
     /// Start synchronizing the audio of `receiver`.
@@ -248,7 +269,7 @@ impl AvSync {
         Ok(Self {
             resource: AvResource { handle, table },
             receiver: receiver.into_mode(),
-            _thread_affinity: PhantomData,
+            _not_sync: NotSync(PhantomData),
         })
     }
 
@@ -327,10 +348,10 @@ impl AvSync {
     /// One call makes one native request: a changed format or missing audio
     /// is reported, never retried or converted.
     ///
-    /// Only the thread that owns this `AvSync` synchronizes, one call at a
-    /// time. Other threads may meanwhile capture video or metadata, poll
-    /// events or use the controls through the receiver it lends. This does
-    /// not take the receiver's capture guard, as
+    /// One call synchronizes at a time, on the thread that holds this
+    /// `AvSync`, which is not `Sync`. Other threads may meanwhile capture
+    /// video or metadata, poll events or use the controls through the
+    /// receiver it lends. This does not take the receiver's capture guard, as
     /// [`FrameSync`](crate::FrameSync) captures do not, so a
     /// [`reconnect`](Receiver::reconnect) neither waits for it nor holds it
     /// off.
@@ -902,12 +923,12 @@ mod tests {
         assert_eq!((audio.sample_rate, audio.no_samples), (48_000, 1600));
     }
 
-    /// Only the thread auto traits are withheld;
-    /// tests/ui/advanced/pass/av_sync_is_thread_affine.rs checks those.
+    /// Only `Sync` is withheld, which
+    /// tests/ui/advanced/pass/av_sync_is_send_but_not_sync.rs checks.
     #[test]
-    fn av_sync_stays_unwind_safe() {
-        fn unwind_safe<T: std::panic::UnwindSafe>() {}
-        unwind_safe::<AvSync>();
+    fn av_sync_is_send_and_unwind_safe() {
+        fn traits<T: Send + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        traits::<AvSync>();
     }
 
     /// The SDK's allocations are returned for every result, including the

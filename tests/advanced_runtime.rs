@@ -2104,6 +2104,80 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
     drop(sync.into_receiver());
 }
 
+/// A synchronizer works on threads other than the one that created it: it
+/// returns a source's audio, sample for sample, on a thread it was moved to,
+/// and is destroyed on a third while the source is still sending.
+#[test]
+fn an_avsync_moves_between_threads() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let sender = Sender::new(
+        &ndi,
+        &SenderOptions::new(common::unique_name("moved-avsync"))
+            .clock_video(true)
+            .clock_audio(false),
+    )
+    .unwrap();
+    let receiver = Receiver::new(
+        &ndi,
+        &ReceiverOptions::new(common::loopback_source(&ndi, &sender).unwrap()),
+    )
+    .unwrap();
+    // Created on this thread, which never uses it.
+    let sync = AvSync::new(receiver).unwrap();
+    let video = VideoFrame::builder()
+        .resolution(64, 32)
+        .frame_rate(FrameRate::new(30, 1).unwrap())
+        .build()
+        .unwrap();
+    let audio = AudioFrame::builder()
+        .sample_rate(48_000)
+        .num_channels(2)
+        .num_samples(1600)
+        .data(vec![0.25; 3200])
+        .build()
+        .unwrap();
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let _stop = StopOnDrop(&stop);
+        scope.spawn(|| {
+            while !stop.load(Ordering::Acquire) {
+                sender.send_video(&video).unwrap();
+                sender.send_audio(&audio);
+            }
+        });
+        let sync = scope
+            .spawn(move || {
+                // The first audio after the streams start may hold alignment
+                // silence; the source's own samples follow.
+                let deadline = Instant::now() + PATIENCE;
+                loop {
+                    let returned =
+                        synchronized_audio(&sync, AvSyncRequest::automatic(), Pass::Captured, 1);
+                    let frame = &returned[0].0;
+                    assert_eq!((frame.sample_rate(), frame.num_channels()), (48_000, 2));
+                    if frame
+                        .data()
+                        .iter()
+                        .all(|sample| (sample - 0.25).abs() < 0.001)
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "AVSync returned none of the source's samples"
+                    );
+                }
+                sync
+            })
+            .join()
+            .unwrap();
+        scope.spawn(move || drop(sync)).join().unwrap();
+    });
+}
+
 /// The policy calls of a test, which wait for each other inside the policy.
 #[derive(Default)]
 struct PolicyCalls {

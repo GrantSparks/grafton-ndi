@@ -504,11 +504,14 @@ fn play(receiver: Receiver) -> grafton_ndi::Result<()> {
 }
 ```
 
-An `AvSync` is neither `Send` nor `Sync`: one thread synchronizes, one call at
-a time. The receiver it lends is both, so scoped threads can capture video or
-metadata, poll events or reconnect through it meanwhile. `synchronize` does not
-take the receiver's capture guard, as FrameSync's captures do not, so a
-reconnect neither waits for it nor holds it off.
+An `AvSync` is `Send` but not `Sync`: it can be created on one thread and
+synchronize and be dropped on another, such as a worker thread, but one call
+synchronizes at a time, because the SDK does not document two
+synchronizations of one synchronizer running at once. The receiver it lends
+is both, so scoped threads can capture video or metadata, poll events or
+reconnect through it meanwhile. `synchronize` does not take the receiver's
+capture guard, as FrameSync's captures do not, so a reconnect neither waits
+for it nor holds it off.
 
 `AvSyncRequest::automatic()`
 takes whatever audio belongs to the frame. `AvSyncRequest::new(Some(sample_rate),
