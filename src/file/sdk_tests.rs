@@ -265,6 +265,7 @@ fn a_recording_is_finalized_and_probes_with_its_video_track() {
         panic!("the recording was not confirmed closed");
     };
     assert!(report.closure_confirmed());
+    assert!(!report.stopped_by_sdk());
     assert_eq!(report.closed_files(), 1);
     assert_eq!(report.empty_files(), 0);
     assert_eq!(report.error_events(), 0);
@@ -363,7 +364,7 @@ fn injected_metadata_is_recorded_on_the_metadata_track() {
     let marker = crate::MetadataFrame::with_data("<marker cue=\"intro\"/>", 0).unwrap();
     assert!(matches!(
         recorder.inject_metadata(&marker),
-        Err(FileError::InvalidState(_))
+        Err(FileError::InvalidState(StateError::NotRecording))
     ));
     recorder
         .start(
@@ -678,6 +679,7 @@ fn a_session_the_library_ended_on_a_format_change_can_be_followed_by_another() {
     }
     let report = recorder.report();
     assert!(report.closure_confirmed());
+    assert!(report.stopped_by_sdk());
     assert_eq!(report.closed_files(), 1);
     assert_eq!(report.error_events(), 1);
     assert_eq!(recorder.request_stop(), StopRequest::AlreadyClosed);
@@ -979,4 +981,152 @@ fn the_library_copies_every_string_a_player_gives_it() {
         playback.NDIlib_file_player_stop(handle);
         playback.NDIlib_file_player_destroy(handle);
     }
+}
+
+/// Poll until the recorder's state is `wanted`.
+fn await_state(recorder: &mut FileRecorder, wanted: RecorderState) {
+    let deadline = Instant::now() + PATIENCE;
+    while recorder.state() != wanted {
+        assert!(Instant::now() < deadline, "{:?}", recorder.state());
+        recorder.poll_event(Duration::from_millis(50)).unwrap();
+    }
+}
+
+#[test]
+fn an_exact_recording_ends_at_a_format_change_with_its_file_finalized() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("exact-format");
+    let source = LiveSource::start(&ndi, "exact-format");
+    let file = scratch.path("take.mkv");
+    let mut recorder = api.create_recorder(exact_video(&source)).unwrap();
+    recorder
+        .start(
+            RecordingTarget::new(&file).unwrap(),
+            RecordingTimecode::Preserve,
+        )
+        .unwrap();
+    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+
+    source.change_format();
+    // With no second name to roll over to, the library closes the file and
+    // ends the session instead of failing to open a file of the same name.
+    await_state(&mut recorder, RecorderState::Closed);
+    let report = recorder.report();
+    assert!(report.closure_confirmed());
+    assert!(report.stopped_by_sdk());
+    assert_eq!(report.closed_files(), 1);
+    assert_eq!(report.empty_files(), 0);
+    let FinishStatus::Closed(finished) = recorder.finish(PATIENCE).unwrap() else {
+        panic!("the session had been closed");
+    };
+    assert!(finished.stopped_by_sdk());
+    let info = api.probe(&file).unwrap();
+    assert!(info.duration().is_final());
+    assert!(info.duration().value().ticks() > 0);
+}
+
+#[test]
+fn an_exact_session_refuses_a_change_of_source_and_keeps_recording() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("exact-source");
+    let source = LiveSource::start(&ndi, "exact-source");
+    let file = scratch.path("take.mkv");
+    let mut recorder = api.create_recorder(exact_video(&source)).unwrap();
+    recorder
+        .start(
+            RecordingTarget::new(&file).unwrap(),
+            RecordingTimecode::Preserve,
+        )
+        .unwrap();
+    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+
+    assert!(matches!(
+        recorder.set_source(source.spec.clone()),
+        Err(FileError::InvalidState(StateError::ExactFileName))
+    ));
+    let before = recorder.stats().unwrap().unwrap().video_frames();
+    let deadline = Instant::now() + PATIENCE;
+    while recorder.stats().unwrap().unwrap().video_frames() <= before {
+        assert!(Instant::now() < deadline, "the session stopped recording");
+        assert!(recorder
+            .poll_event(Duration::from_millis(20))
+            .unwrap()
+            .is_none_or(|event| {
+                !matches!(
+                    event.kind(),
+                    RecorderEventKind::Error | RecorderEventKind::OpenFailed
+                )
+            }));
+    }
+    assert!(recorder.is_recording());
+    assert_eq!(recorder.state(), RecorderState::Recording);
+
+    let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
+        panic!("the recording was not confirmed closed");
+    };
+    assert!(!report.stopped_by_sdk());
+    assert_eq!(report.closed_files(), 1);
+    assert_eq!(report.error_events(), 0);
+    assert!(api.probe(&file).unwrap().duration().is_final());
+}
+
+#[test]
+fn an_exact_target_that_exists_is_refused_before_the_library_sees_it() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("exact-exists");
+    let source = LiveSource::start(&ndi, "exact-exists");
+    let file = scratch.path("taken.mkv");
+    std::fs::write(&file, b"kept").unwrap();
+    let mut recorder = api.create_recorder(exact_video(&source)).unwrap();
+    match recorder.start(
+        RecordingTarget::new(&file).unwrap(),
+        RecordingTimecode::Preserve,
+    ) {
+        Err(FileError::Io(error)) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        }
+        other => panic!("expected the existing file to be refused: {other:?}"),
+    }
+    // Had the library been asked, it would have queued an open-failed event.
+    assert!(recorder
+        .poll_event(Duration::from_millis(200))
+        .unwrap()
+        .is_none());
+    assert_eq!(recorder.state(), RecorderState::Idle);
+    assert!(!recorder.is_recording());
+    assert_eq!(std::fs::read(&file).unwrap(), b"kept");
+}
+
+#[test]
+fn finishing_without_a_wait_reports_the_close_the_stop_queued() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("finish-now");
+    let source = LiveSource::start(&ndi, "finish-now");
+    let file = scratch.path("take.mkv");
+    let mut recorder = api.create_recorder(exact_video(&source)).unwrap();
+    recorder
+        .start(
+            RecordingTarget::new(&file).unwrap(),
+            RecordingTimecode::Preserve,
+        )
+        .unwrap();
+    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+    thread::sleep(Duration::from_millis(200));
+    // The 6.4 library finalizes the file inside the stop call and queues its
+    // close before returning, so no wait is needed to see it.
+    let outcome = recorder.finish(Duration::ZERO).unwrap();
+    let FinishStatus::Closed(report) = outcome else {
+        panic!("the close was already queued: {outcome:?}");
+    };
+    assert!(report.closure_confirmed());
+    assert!(!report.stopped_by_sdk());
+    assert!(api.probe(&file).unwrap().duration().is_final());
 }

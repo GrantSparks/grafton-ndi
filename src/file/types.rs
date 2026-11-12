@@ -23,9 +23,10 @@ pub enum FileError {
     /// A value cannot be represented by the native API.
     #[error("Invalid File API input: {0}")]
     InvalidInput(String),
-    /// The operation is not permitted in the current session state.
+    /// The operation is not permitted in the current state; the
+    /// [`StateError`] says which state forbids it.
     #[error("Invalid File API state: {0}")]
-    InvalidState(&'static str),
+    InvalidState(StateError),
     /// A native boolean operation was rejected; events may carry more detail.
     #[error("The File SDK rejected {0}")]
     Rejected(&'static str),
@@ -42,6 +43,77 @@ pub enum FileError {
 
 /// Result type for File API operations.
 pub type FileResult<T> = std::result::Result<T, FileError>;
+
+/// Why an operation is not permitted in the current state, carried by
+/// [`FileError::InvalidState`].
+///
+/// Its `Display` text describes the state for diagnostics; match on the
+/// variant rather than the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StateError {
+    /// A session is recording or stopping, so another cannot start. Finish
+    /// it, or keep taking events until it has ended.
+    PreviousSessionOpen,
+    /// Events from an earlier session kept arriving, so a new session was not
+    /// started.
+    EarlierSessionEvents,
+    /// Waiting for a session to end needs a session that has been asked to
+    /// stop, or that the SDK is ending.
+    StopNotRequested,
+    /// The session is stopping.
+    Stopping,
+    /// The operation needs a session that is recording.
+    NotRecording,
+    /// The recorder names its files exactly, so it cannot switch to a new file
+    /// during a session: the next file would have the same name. Use a
+    /// filename pattern with `{index}`.
+    ExactFileName,
+    /// The async handle's command queue is full.
+    QueueFull,
+    /// Another waiter is already pending on the async handle: another event
+    /// future, or another close.
+    WaiterPending,
+    /// The async handle's object has been closed, or its thread stopped
+    /// before it carried out the operation.
+    Closed,
+    /// The async handle's thread failed.
+    OwnerFailed,
+}
+
+impl StateError {
+    /// Whether the same call can succeed later without anything else changing
+    /// on this handle: true only for [`QueueFull`](Self::QueueFull), once
+    /// queued commands have run, and [`WaiterPending`](Self::WaiterPending),
+    /// once the other waiter has finished.
+    ///
+    /// The other states change only through another call, such as finishing a
+    /// session, or never, for a handle that is closed.
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::QueueFull | Self::WaiterPending)
+    }
+}
+
+impl std::fmt::Display for StateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::PreviousSessionOpen => "finish the previous session before starting another",
+            Self::EarlierSessionEvents => {
+                "the recorder keeps producing events from an earlier session"
+            }
+            Self::StopNotRequested => "request a stop before waiting for the session to end",
+            Self::Stopping => "the session is stopping",
+            Self::NotRecording => "the operation needs a session that is recording",
+            Self::ExactFileName => {
+                "a recorder with an exact file name cannot switch to a new file during a session"
+            }
+            Self::QueueFull => "File command queue is full",
+            Self::WaiterPending => "another File waiter is already pending",
+            Self::Closed => "File owner has closed",
+            Self::OwnerFailed => "File owner thread failed",
+        })
+    }
+}
 
 fn cstring(value: &str, what: &str, allow_empty: bool) -> FileResult<CString> {
     if !allow_empty && value.is_empty() {
@@ -220,12 +292,16 @@ impl BitOr for TrackSelection {
 }
 
 /// Recorder configuration fixed when its native instance is created.
+///
+/// The options are checked against each other when a recorder is created, so
+/// the order of the builder calls does not matter.
 #[derive(Debug, Clone)]
 pub struct RecorderOptions {
     pub(super) source: SourceSpec,
     pub(super) tracks: TrackSelection,
     pub(super) planar_audio: bool,
-    pub(super) disable_auto_rollover: bool,
+    /// `None` until set: on for indexed file names, off for exact ones.
+    pub(super) format_change_rollover: Option<bool>,
     pub(super) pattern: Option<CString>,
     pub(super) disable_proxy: bool,
     pub(super) rollover_bytes: u64,
@@ -239,7 +315,7 @@ impl RecorderOptions {
             source,
             tracks: TrackSelection::ALL,
             planar_audio: false,
-            disable_auto_rollover: false,
+            format_change_rollover: None,
             pattern: None,
             disable_proxy: false,
             rollover_bytes: 0,
@@ -284,9 +360,23 @@ impl RecorderOptions {
         self
     }
 
-    /// Whether source format changes automatically roll into a new file.
+    /// Whether a change of the source's format closes the current file and
+    /// continues the session in a new one.
+    ///
+    /// Left unset, a format change rolls over to a new file when files are
+    /// indexed, and closes the file and ends the session when the file name
+    /// is exact, because a second file cannot take the same name. With
+    /// `false` a format change always ends the session. A session that ends
+    /// this way is reported by [`RecordingReport::stopped_by_sdk`].
+    ///
+    /// `true` cannot be combined with an exact file name
+    /// ([`exact_filename`](Self::exact_filename), or a pattern without
+    /// `{index}`): creating the recorder then fails with
+    /// [`FileError::InvalidInput`].
+    ///
+    /// [`RecordingReport::stopped_by_sdk`]: super::RecordingReport::stopped_by_sdk
     pub fn with_format_change_rollover(mut self, enabled: bool) -> Self {
-        self.disable_auto_rollover = !enabled;
+        self.format_change_rollover = Some(enabled);
         self
     }
 
@@ -297,14 +387,44 @@ impl RecorderOptions {
     }
 
     /// Set a soft size threshold for keyframe-aligned rollover; zero disables it.
+    ///
+    /// A nonzero size cannot be combined with an exact file name
+    /// ([`exact_filename`](Self::exact_filename), or a pattern without
+    /// `{index}`), because the next file would have the same name: creating
+    /// the recorder then fails with [`FileError::InvalidInput`].
     pub fn with_rollover_size(mut self, bytes: u64) -> Self {
         self.rollover_bytes = bytes;
         self
     }
 
-    /// Use the supplied recording target as an exact filename.
+    /// Name each recording file exactly as its [`RecordingTarget`] says, with
+    /// no index.
     ///
-    /// Native creation fails if that file already exists; no overwrite is implied.
+    /// Nothing is ever overwritten: [`FileRecorder::start`] and
+    /// [`FileRecorder::rollover`] refuse a target that already exists with a
+    /// [`FileError::Io`] of kind [`AlreadyExists`](std::io::ErrorKind::AlreadyExists),
+    /// before the SDK is called.
+    ///
+    /// One target names one file, so a session cannot move to a new file by
+    /// itself:
+    ///
+    /// * a format change of the source closes the file and ends the session,
+    ///   which [`RecordingReport::stopped_by_sdk`] then reports; see
+    ///   [`with_format_change_rollover`](Self::with_format_change_rollover);
+    /// * format-change rollover switched on, or a nonzero
+    ///   [`with_rollover_size`](Self::with_rollover_size), is refused with
+    ///   [`FileError::InvalidInput`] when the recorder is created;
+    /// * [`FileRecorder::set_source`] is refused during a session with
+    ///   [`StateError::ExactFileName`].
+    ///
+    /// [`FileRecorder::rollover`] to a new target still works. Use
+    /// [`with_pattern`](Self::with_pattern) with `{index}` for recordings that
+    /// must survive these changes.
+    ///
+    /// [`FileRecorder::start`]: super::FileRecorder::start
+    /// [`FileRecorder::rollover`]: super::FileRecorder::rollover
+    /// [`FileRecorder::set_source`]: super::FileRecorder::set_source
+    /// [`RecordingReport::stopped_by_sdk`]: super::RecordingReport::stopped_by_sdk
     pub fn exact_filename(mut self) -> Self {
         self.pattern = Some(CString::new("{prefix}").expect("literal has no NUL"));
         self
@@ -318,7 +438,13 @@ impl RecorderOptions {
 
     /// Set a filename pattern using `{prefix}`, `{index}` and `{index:N}` tokens.
     ///
-    /// `{index:N}` pads the index with zeros to `N` digits, from 1 through 1024.
+    /// `{prefix}` is replaced by the [`RecordingTarget`], and `{index:N}` pads
+    /// the index with zeros to `N` digits, from 1 through 1024. The pattern
+    /// may name a directory, for example `{prefix}/{index:03}.mkv`; that
+    /// directory must exist.
+    ///
+    /// A pattern without `{index}` or `{index:N}` names its file exactly,
+    /// with every rule of [`exact_filename`](Self::exact_filename).
     ///
     /// # Errors
     ///
@@ -351,35 +477,206 @@ impl RecorderOptions {
     pub fn drop_wait(&self) -> Duration {
         self.drop_wait
     }
+
+    /// Check the options against each other and settle what they leave open.
+    ///
+    /// Done when a recorder is created rather than in the builder methods,
+    /// so that the order of those calls does not matter.
+    pub(super) fn resolve(&self) -> FileResult<ResolvedOptions> {
+        let naming = FileNaming::new(self.filename_pattern())?;
+        if naming.is_exact() {
+            if self.format_change_rollover == Some(true) {
+                return Err(FileError::InvalidInput(
+                    "a recorder with an exact file name cannot roll over at a format change, \
+                     because the next file would have the same name; use a filename pattern \
+                     with {index}, or leave format-change rollover unset"
+                        .into(),
+                ));
+            }
+            if self.rollover_bytes > 0 {
+                return Err(FileError::InvalidInput(
+                    "a recorder with an exact file name cannot roll over at a size limit, \
+                     because the next file would have the same name; use a filename pattern \
+                     with {index}"
+                        .into(),
+                ));
+            }
+        }
+        Ok(ResolvedOptions {
+            format_change_rollover: self.format_change_rollover.unwrap_or(!naming.is_exact()),
+            naming,
+        })
+    }
 }
 
-fn validate_pattern(pattern: &str) -> FileResult<()> {
+/// What a recorder's options settle once they are checked against each other.
+pub(super) struct ResolvedOptions {
+    pub(super) naming: FileNaming,
+    /// Whether a format change rolls over to a new file.
+    pub(super) format_change_rollover: bool,
+}
+
+/// The SDK's filename pattern when none is set.
+const DEFAULT_PATTERN: &str = "{prefix}_{index:03}.mkv";
+
+/// One part of a filename pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatternPart<'a> {
+    Text(&'a str),
+    Prefix,
+    /// `{index}`, with no padding, or `{index:N}`, padded to `N` digits.
+    Index(usize),
+}
+
+/// The literal text and tokens of a filename pattern, in order.
+fn pattern_parts(pattern: &str) -> FileResult<Vec<PatternPart<'_>>> {
+    let unmatched = || FileError::InvalidInput("unmatched filename-pattern brace".into());
+    let mut parts = Vec::new();
     let mut rest = pattern;
     while let Some(start) = rest.find(['{', '}']) {
         if rest.as_bytes()[start] == b'}' {
-            return Err(FileError::InvalidInput(
-                "unmatched filename-pattern brace".into(),
-            ));
+            return Err(unmatched());
+        }
+        if start > 0 {
+            parts.push(PatternPart::Text(&rest[..start]));
         }
         let after = &rest[start + 1..];
-        let end = after
-            .find('}')
-            .ok_or_else(|| FileError::InvalidInput("unmatched filename-pattern brace".into()))?;
+        let end = after.find('}').ok_or_else(unmatched)?;
         let token = &after[..end];
-        let valid = match token {
-            "prefix" | "index" => true,
-            _ => token.strip_prefix("index:").is_some_and(|width| {
-                !width.is_empty()
-                    && width.bytes().all(|b| b.is_ascii_digit())
-                    && width.parse::<u16>().is_ok_and(|n| (1..=1024).contains(&n))
-            }),
+        let width = |width: &str| {
+            (!width.is_empty() && width.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| width.parse::<u16>().ok())
+                .flatten()
+                .filter(|n| (1..=1024).contains(n))
         };
-        if !valid {
-            return Err(FileError::InvalidInput(format!(
-                "unsupported filename-pattern token {{{token}}}"
+        parts.push(match token {
+            "prefix" => PatternPart::Prefix,
+            "index" => PatternPart::Index(0),
+            _ => match token.strip_prefix("index:").and_then(width) {
+                Some(width) => PatternPart::Index(usize::from(width)),
+                None => {
+                    return Err(FileError::InvalidInput(format!(
+                        "unsupported filename-pattern token {{{token}}}"
+                    )))
+                }
+            },
+        });
+        rest = &after[end + 1..];
+    }
+    if !rest.is_empty() {
+        parts.push(PatternPart::Text(rest));
+    }
+    Ok(parts)
+}
+
+fn validate_pattern(pattern: &str) -> FileResult<()> {
+    pattern_parts(pattern).map(drop)
+}
+
+/// How a recorder names its files.
+#[derive(Debug, Clone)]
+pub(super) struct FileNaming {
+    pattern: String,
+    /// The pattern has no index, so each target names exactly one file.
+    exact: bool,
+}
+
+impl FileNaming {
+    /// The naming of `pattern`, or of the SDK's default when there is none.
+    pub(super) fn new(pattern: Option<&str>) -> FileResult<Self> {
+        let pattern = pattern.unwrap_or(DEFAULT_PATTERN);
+        let exact = !pattern_parts(pattern)?
+            .iter()
+            .any(|part| matches!(part, PatternPart::Index(_)));
+        Ok(Self {
+            pattern: pattern.to_owned(),
+            exact,
+        })
+    }
+
+    /// Whether each target names exactly one file.
+    pub(super) fn is_exact(&self) -> bool {
+        self.exact
+    }
+
+    /// The file the pattern names for `target`: the exact file, or for an
+    /// indexed pattern the one with index 1, which locates its directory.
+    ///
+    /// A pattern that leaves the path relative is resolved, as the SDK
+    /// resolves it, against the current directory.
+    pub(super) fn first_file(&self, target: &RecordingTarget) -> FileResult<PathBuf> {
+        let prefix = target.prefix.to_str().expect("validated UTF-8");
+        let mut name = String::new();
+        for part in pattern_parts(&self.pattern)? {
+            match part {
+                PatternPart::Text(text) => name.push_str(text),
+                PatternPart::Prefix => name.push_str(prefix),
+                PatternPart::Index(width) => name.push_str(&format!("{:0width$}", 1)),
+            }
+        }
+        let file = PathBuf::from(name);
+        Ok(if file.is_absolute() {
+            file
+        } else {
+            std::env::current_dir()?.join(file)
+        })
+    }
+
+    /// Confirm that the SDK can create the file this naming gives `target`:
+    /// that its directory exists and can be written to, and, for an exact
+    /// name, that the file does not exist yet.
+    ///
+    /// The SDK accepts a rollover to a file it cannot create and then ends
+    /// the whole session, so the mistake is caught here, while the session
+    /// can still go on. Nothing is created.
+    pub(super) fn check(&self, target: &RecordingTarget) -> FileResult<()> {
+        let file = self.first_file(target)?;
+        check_directory(file.parent().unwrap_or(&file))?;
+        if self.exact && std::fs::symlink_metadata(&file).is_ok() {
+            return Err(FileError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "the recording file {} already exists, and an exact file name never \
+                     replaces a file",
+                    file.display()
+                ),
             )));
         }
-        rest = &after[end + 1..];
+        Ok(())
+    }
+}
+
+/// Confirm that `directory` exists and can be written to.
+fn check_directory(directory: &Path) -> FileResult<()> {
+    let refuse = |kind, problem: &str| {
+        FileError::Io(std::io::Error::new(
+            kind,
+            format!("the recording directory {} {problem}", directory.display()),
+        ))
+    };
+    match std::fs::metadata(directory) {
+        Err(error) => return Err(refuse(error.kind(), "cannot be used")),
+        Ok(found) if !found.is_dir() => {
+            return Err(refuse(
+                std::io::ErrorKind::NotADirectory,
+                "is not a directory",
+            ))
+        }
+        Ok(_) => {}
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = CString::new(directory.as_os_str().as_bytes()).map_err(|_| {
+            FileError::InvalidInput("the recording directory contains a NUL".into())
+        })?;
+        // SAFETY: `path` is a NUL-terminated string that outlives the call.
+        if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
+            return Err(refuse(
+                std::io::ErrorKind::PermissionDenied,
+                "cannot be written to",
+            ));
+        }
     }
     Ok(())
 }
@@ -427,49 +724,6 @@ impl RecordingTarget {
     /// The frozen absolute path/prefix, without filesystem canonicalization.
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    /// Confirm that the directory the recording would be created in exists
-    /// and can be written to.
-    ///
-    /// The SDK accepts a rollover to a path it cannot open and then ends the
-    /// whole session, so the mistake is caught here, while the session can
-    /// still go on. Nothing is created.
-    pub(super) fn check_directory(&self) -> FileResult<()> {
-        let refuse = |kind, problem: &str, directory: &Path| {
-            FileError::Io(std::io::Error::new(
-                kind,
-                format!("the recording directory {} {problem}", directory.display()),
-            ))
-        };
-        let directory = self.path.parent().unwrap_or(&self.path);
-        match std::fs::metadata(directory) {
-            Err(error) => return Err(refuse(error.kind(), "cannot be used", directory)),
-            Ok(found) if !found.is_dir() => {
-                return Err(refuse(
-                    std::io::ErrorKind::NotADirectory,
-                    "is not a directory",
-                    directory,
-                ))
-            }
-            Ok(_) => {}
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            let path = CString::new(directory.as_os_str().as_bytes()).map_err(|_| {
-                FileError::InvalidInput("the recording directory contains a NUL".into())
-            })?;
-            // SAFETY: `path` is a NUL-terminated string that outlives the call.
-            if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
-                return Err(refuse(
-                    std::io::ErrorKind::PermissionDenied,
-                    "cannot be written to",
-                    directory,
-                ));
-            }
-        }
-        Ok(())
     }
 }
 
@@ -1248,6 +1502,196 @@ mod tests {
         let target = RecordingTarget::new("nonexistent-parent/take").unwrap();
         assert!(target.path().is_absolute());
         assert!(target.path().ends_with("nonexistent-parent/take"));
+    }
+
+    #[test]
+    fn only_a_full_queue_or_a_pending_waiter_is_retryable() {
+        use StateError::*;
+        for (state, retryable) in [
+            (PreviousSessionOpen, false),
+            (EarlierSessionEvents, false),
+            (StopNotRequested, false),
+            (Stopping, false),
+            (NotRecording, false),
+            (ExactFileName, false),
+            (QueueFull, true),
+            (WaiterPending, true),
+            (Closed, false),
+            (OwnerFailed, false),
+        ] {
+            assert_eq!(state.is_retryable(), retryable, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn state_errors_keep_their_messages() {
+        assert_eq!(
+            StateError::PreviousSessionOpen.to_string(),
+            "finish the previous session before starting another"
+        );
+        assert_eq!(
+            StateError::QueueFull.to_string(),
+            "File command queue is full"
+        );
+        assert_eq!(
+            FileError::InvalidState(StateError::Stopping).to_string(),
+            "Invalid File API state: the session is stopping"
+        );
+    }
+
+    fn options() -> RecorderOptions {
+        RecorderOptions::new(SourceSpec::new("camera").unwrap())
+    }
+
+    fn refused(options: RecorderOptions) -> String {
+        match options.resolve() {
+            Err(FileError::InvalidInput(reason)) => reason,
+            Err(other) => panic!("expected the options to be refused as input: {other}"),
+            Ok(_) => panic!("expected the options to be refused"),
+        }
+    }
+
+    #[test]
+    fn a_pattern_is_exact_when_it_has_no_index() {
+        for (pattern, exact) in [
+            (None, false),
+            (Some("{prefix}"), true),
+            (Some("{prefix}.mkv"), true),
+            (Some("{prefix}_{index}.mkv"), false),
+            (Some("{prefix}/{index:03}.mkv"), false),
+        ] {
+            assert_eq!(
+                FileNaming::new(pattern).unwrap().is_exact(),
+                exact,
+                "{pattern:?}"
+            );
+        }
+        assert!(options()
+            .exact_filename()
+            .resolve()
+            .unwrap()
+            .naming
+            .is_exact());
+        assert!(!options()
+            .exact_filename()
+            .indexed_filenames()
+            .resolve()
+            .unwrap()
+            .naming
+            .is_exact());
+    }
+
+    #[test]
+    fn format_change_rollover_follows_the_naming_unless_set() {
+        let rolls = |options: RecorderOptions| options.resolve().unwrap().format_change_rollover;
+        assert!(rolls(options()));
+        assert!(!rolls(options().exact_filename()));
+        assert!(!rolls(options().with_format_change_rollover(false)));
+        assert!(!rolls(
+            options()
+                .exact_filename()
+                .with_format_change_rollover(false)
+        ));
+        assert!(rolls(
+            options()
+                .with_pattern("{prefix}-{index:2}.mkv")
+                .unwrap()
+                .with_format_change_rollover(true)
+        ));
+    }
+
+    #[test]
+    fn an_exact_name_that_would_roll_over_is_refused_whatever_the_call_order() {
+        for options in [
+            options().exact_filename().with_format_change_rollover(true),
+            options().with_format_change_rollover(true).exact_filename(),
+            options()
+                .with_format_change_rollover(true)
+                .with_pattern("{prefix}.mkv")
+                .unwrap(),
+        ] {
+            let reason = refused(options);
+            assert!(reason.contains("format change"), "{reason}");
+            assert!(reason.contains("{index}"), "{reason}");
+        }
+        for options in [
+            options().exact_filename().with_rollover_size(1 << 20),
+            options().with_rollover_size(1 << 20).exact_filename(),
+        ] {
+            let reason = refused(options);
+            assert!(reason.contains("size limit"), "{reason}");
+            assert!(reason.contains("{index}"), "{reason}");
+        }
+        // Indexed names may roll over either way.
+        options()
+            .with_rollover_size(1 << 20)
+            .with_format_change_rollover(true)
+            .resolve()
+            .unwrap();
+    }
+
+    /// A fresh directory under the system temporary directory.
+    fn scratch(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "grafton-ndi-naming-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        directory
+    }
+
+    fn io_kind(result: FileResult<()>) -> std::io::ErrorKind {
+        match result {
+            Err(FileError::Io(error)) => error.kind(),
+            other => panic!("expected a filesystem error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_file_a_pattern_names_is_where_it_is_checked() {
+        let directory = scratch("check");
+        let target = RecordingTarget::new(directory.join("take")).unwrap();
+        let first = |pattern: Option<&str>| {
+            FileNaming::new(pattern)
+                .unwrap()
+                .first_file(&target)
+                .unwrap()
+        };
+        assert_eq!(first(None), directory.join("take_001.mkv"));
+        assert_eq!(first(Some("{prefix}")), directory.join("take"));
+        assert_eq!(
+            first(Some("{prefix}/{index:03}.mkv")),
+            directory.join("take/001.mkv")
+        );
+
+        // The default pattern checks the target's own directory.
+        FileNaming::new(None).unwrap().check(&target).unwrap();
+        let missing = RecordingTarget::new(directory.join("absent/take")).unwrap();
+        assert_eq!(
+            io_kind(FileNaming::new(None).unwrap().check(&missing)),
+            std::io::ErrorKind::NotFound
+        );
+        // A pattern that names a directory of its own checks that one.
+        let nested = FileNaming::new(Some("{prefix}/{index:03}.mkv")).unwrap();
+        assert_eq!(io_kind(nested.check(&target)), std::io::ErrorKind::NotFound);
+        std::fs::create_dir(directory.join("take")).unwrap();
+        nested.check(&target).unwrap();
+
+        // An exact name refuses a file that exists, and an indexed one does not.
+        let exact = FileNaming::new(Some("{prefix}.mkv")).unwrap();
+        exact.check(&target).unwrap();
+        std::fs::write(directory.join("take.mkv"), b"kept").unwrap();
+        assert_eq!(
+            io_kind(exact.check(&target)),
+            std::io::ErrorKind::AlreadyExists
+        );
+        std::fs::write(directory.join("take_001.mkv"), b"kept").unwrap();
+        FileNaming::new(None).unwrap().check(&target).unwrap();
+        assert_eq!(std::fs::read(directory.join("take.mkv")).unwrap(), b"kept");
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

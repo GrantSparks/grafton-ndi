@@ -5,7 +5,7 @@
 //! The receiver can monitor connection status changes:
 //!
 //! ```no_run
-//! # use grafton_ndi::{NDI, Receiver, ReceiverOptions, ReceiverBandwidth, Source};
+//! # use grafton_ndi::{NDI, Receiver, ReceiverEvent, ReceiverOptions, ReceiverBandwidth, Source};
 //! # use std::time::Duration;
 //! # fn main() -> Result<(), grafton_ndi::Error> {
 //! # let ndi = NDI::new()?;
@@ -17,7 +17,9 @@
 //! let receiver = Receiver::new(&ndi, &options)?;
 //!
 //! // Poll for status changes
-//! if let Some(status) = receiver.poll_status_change(Duration::from_millis(1000))? {
+//! if let Some(ReceiverEvent::StatusChanged(status)) =
+//!     receiver.poll_event(Duration::from_millis(1000))?
+//! {
 //!     println!("Active connections: {}", status.connections);
 //! }
 //! # Ok(())
@@ -230,9 +232,9 @@ fn validate_ptz_value(name: &str, value: f32, min: f32, max: f32) -> Result<()> 
     }
 }
 
-fn validate_ptz_preset(preset: i64) -> Result<i32> {
-    if (0..=99).contains(&preset) {
-        Ok(preset as i32)
+fn validate_ptz_preset(preset: u8) -> Result<i32> {
+    if preset <= 99 {
+        Ok(i32::from(preset))
     } else {
         Err(Error::InvalidConfiguration(
             "PTZ preset must be within 0..=99".into(),
@@ -241,25 +243,29 @@ fn validate_ptz_preset(preset: i64) -> Result<i32> {
 }
 
 macro_rules! ptz_command {
-    ($self:expr, $func:ident, $err_msg:expr) => {
+    ($self:expr, $func:ident) => {
         // SAFETY: the receiver instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
         if unsafe { $self.core.sdk().$func($self.core.instance) } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed($err_msg.into()))
+            Err(Error::NativeOperationFailed {
+                operation: stringify!($func),
+            })
         }
     };
-    ($self:expr, $func:ident, $param:expr, $err_msg:expr) => {
+    ($self:expr, $func:ident, $param:expr) => {
         // SAFETY: the receiver instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
         if unsafe { $self.core.sdk().$func($self.core.instance, $param) } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed($err_msg))
+            Err(Error::NativeOperationFailed {
+                operation: stringify!($func),
+            })
         }
     };
-    ($self:expr, $func:ident, $param1:expr, $param2:expr, $err_msg:expr) => {
+    ($self:expr, $func:ident, $param1:expr, $param2:expr) => {
         // SAFETY: the receiver instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
         if unsafe {
@@ -270,10 +276,12 @@ macro_rules! ptz_command {
         } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed($err_msg))
+            Err(Error::NativeOperationFailed {
+                operation: stringify!($func),
+            })
         }
     };
-    ($self:expr, $func:ident, $param1:expr, $param2:expr, $param3:expr, $err_msg:expr) => {
+    ($self:expr, $func:ident, $param1:expr, $param2:expr, $param3:expr) => {
         // SAFETY: the receiver instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
         if unsafe {
@@ -284,7 +292,9 @@ macro_rules! ptz_command {
         } {
             Ok(())
         } else {
-            Err(Error::PtzCommandFailed($err_msg))
+            Err(Error::NativeOperationFailed {
+                operation: stringify!($func),
+            })
         }
     };
 }
@@ -409,7 +419,7 @@ impl From<ReceiverBandwidth> for NDIlib_recv_bandwidth_e {
 /// Configuration for creating a [`Receiver`].
 ///
 /// Build one with [`ReceiverOptions::builder`].
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct ReceiverOptions {
     /// The source to connect to when the receiver is created.
     pub source_to_connect_to: Source,
@@ -481,6 +491,14 @@ impl ReceiverOptions {
     }
 }
 
+impl Default for ReceiverOptions {
+    /// The options [`ReceiverOptions::builder`] builds for [`Source::default`]
+    /// without any setting changed.
+    fn default() -> Self {
+        Self::builder(Source::default()).build()
+    }
+}
+
 /// Builder for configuring a ReceiverOptions with ergonomic method chaining
 #[derive(Debug, Clone)]
 pub struct ReceiverOptionsBuilder {
@@ -521,7 +539,7 @@ impl ReceiverOptionsBuilder {
     /// ```no_run
     /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptionsBuilder, Receiver};
     /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// # finder.wait_for_sources(Duration::from_secs(1))?;
@@ -604,7 +622,7 @@ impl ReceiverOptionsBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptionsBuilder, Receiver};
+    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverEvent, ReceiverOptionsBuilder, Receiver};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = NDI::new()?;
@@ -617,7 +635,9 @@ impl ReceiverOptionsBuilder {
     /// let receiver = Receiver::new(&ndi, &options)?;
     ///
     /// // Poll for status changes
-    /// if let Some(status) = receiver.poll_status_change(Duration::from_millis(1000))? {
+    /// if let Some(ReceiverEvent::StatusChanged(status)) =
+    ///     receiver.poll_event(Duration::from_millis(1000))?
+    /// {
     ///     println!("Active connections: {}", status.connections);
     /// }
     /// # Ok(())
@@ -750,7 +770,7 @@ impl Receiver {
     ///
     /// Returns [`Error::UnsupportedCapability`] when the options need a mode the
     /// selected runtime lacks, an invalid-configuration error for a name or
-    /// source the SDK cannot be given, and [`Error::InitializationFailed`] when
+    /// source the SDK cannot be given, and [`Error::NativeOperationFailed`] when
     /// the SDK creates no receiver.
     pub fn new(ndi: &NDI, create: &ReceiverOptions) -> Result<Self> {
         create.validate_runtime(ndi)?;
@@ -758,7 +778,7 @@ impl Receiver {
         // SAFETY: the creation settings borrow storage owned by `create_raw`.
         let instance = unsafe { ndi.api().core.NDIlib_recv_create_v3(&create_raw.raw) };
         // SAFETY: The instance came from this runtime with validated options.
-        unsafe { Self::from_native(ndi, create, instance) }
+        unsafe { Self::from_native(ndi, create, instance, "NDIlib_recv_create_v3") }
     }
 
     /// Adopt an exclusively owned receiver from the selected runtime.
@@ -766,16 +786,16 @@ impl Receiver {
     /// # Safety
     /// The caller must validate `create.validate_runtime(ndi)` before creating
     /// the instance, and transfer its sole ownership here. NULL is accepted as
-    /// a native creation failure. The instance must match `ndi` and `create`.
+    /// a native creation failure reported as `operation` failing. The instance
+    /// must match `ndi` and `create`.
     pub(crate) unsafe fn from_native(
         ndi: &NDI,
         create: &ReceiverOptions,
         instance: NDIlib_recv_instance_t,
+        operation: &'static str,
     ) -> Result<Self> {
         if instance.is_null() {
-            return Err(Error::InitializationFailed(
-                "Failed to create NDI recv instance".into(),
-            ));
+            return Err(Error::NativeOperationFailed { operation });
         }
         Ok(Self {
             core: Arc::new(ReceiverCore {
@@ -981,7 +1001,7 @@ impl<M: ReceiverMode> Receiver<M> {
     }
 
     /// Disconnect the native receiver while retaining its original reconnect target.
-    pub fn disconnect(&self) -> Result<()> {
+    pub fn disconnect(&self) {
         let _exclusive = self.core.capture_guard.write();
         // SAFETY: the receiver instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
@@ -990,14 +1010,15 @@ impl<M: ReceiverMode> Receiver<M> {
                 .sdk()
                 .NDIlib_recv_connect(self.core.instance, ptr::null())
         };
-        Ok(())
     }
 
     /// Poll coalesced status/source invalidations, including those seen by media capture.
     ///
-    /// These are not an ordered history or broadcast stream. This method and
-    /// [`Self::poll_status_change`] compete for status changes. Source-name change
-    /// observation uses the SDK's separate [`Self::poll_source_name_change`] API.
+    /// These are not an ordered history or broadcast stream. Concurrent pollers
+    /// compete to consume a pending notification. A pending notification avoids
+    /// waiting, but publication cannot interrupt an SDK wait already in
+    /// progress. The new source name is read with the SDK's separate
+    /// [`Self::poll_source_name_change`] API.
     pub fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
         self.core.poll_event(timeout)
     }
@@ -1049,17 +1070,11 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
     /// parameters, before issuing an SDK command.
-    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
-    pub fn ptz_recall_preset(&self, preset: u32, speed: f32) -> Result<()> {
-        let preset = validate_ptz_preset(i64::from(preset))?;
+    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
+    pub fn ptz_recall_preset(&self, preset: u8, speed: f32) -> Result<()> {
+        let preset = validate_ptz_preset(preset)?;
         validate_ptz_value("speed", speed, 0.0, 1.0)?;
-        ptz_command!(
-            self,
-            NDIlib_recv_ptz_recall_preset,
-            preset,
-            speed,
-            format!("Failed to recall PTZ preset {preset} with speed {speed}")
-        )
+        ptz_command!(self, NDIlib_recv_ptz_recall_preset, preset, speed)
     }
 
     /// Set absolute zoom to a finite value within `0.0..=1.0`.
@@ -1069,15 +1084,10 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
     /// parameters, before issuing an SDK command.
-    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
+    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
     pub fn ptz_zoom(&self, zoom_value: f32) -> Result<()> {
         validate_ptz_value("zoom_value", zoom_value, 0.0, 1.0)?;
-        ptz_command!(
-            self,
-            NDIlib_recv_ptz_zoom,
-            zoom_value,
-            format!("Failed to set PTZ zoom to {zoom_value}")
-        )
+        ptz_command!(self, NDIlib_recv_ptz_zoom, zoom_value)
     }
 
     /// Set zoom speed within `-1.0..=1.0` (finite).
@@ -1087,15 +1097,10 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
     /// parameters, before issuing an SDK command.
-    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
+    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
     pub fn ptz_zoom_speed(&self, zoom_speed: f32) -> Result<()> {
         validate_ptz_value("zoom_speed", zoom_speed, -1.0, 1.0)?;
-        ptz_command!(
-            self,
-            NDIlib_recv_ptz_zoom_speed,
-            zoom_speed,
-            format!("Failed to set PTZ zoom speed to {zoom_speed}")
-        )
+        ptz_command!(self, NDIlib_recv_ptz_zoom_speed, zoom_speed)
     }
 
     /// Set finite pan and tilt positions within `-1.0..=1.0`.
@@ -1105,17 +1110,11 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
     /// parameters, before issuing an SDK command.
-    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
+    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
     pub fn ptz_pan_tilt(&self, pan_value: f32, tilt_value: f32) -> Result<()> {
         validate_ptz_value("pan_value", pan_value, -1.0, 1.0)?;
         validate_ptz_value("tilt_value", tilt_value, -1.0, 1.0)?;
-        ptz_command!(
-            self,
-            NDIlib_recv_ptz_pan_tilt,
-            pan_value,
-            tilt_value,
-            format!("Failed to set PTZ pan/tilt to ({pan_value}, {tilt_value})")
-        )
+        ptz_command!(self, NDIlib_recv_ptz_pan_tilt, pan_value, tilt_value)
     }
 
     /// Set finite pan and tilt speeds within `-1.0..=1.0`.
@@ -1125,17 +1124,11 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
     /// parameters, before issuing an SDK command.
-    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
+    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
     pub fn ptz_pan_tilt_speed(&self, pan_speed: f32, tilt_speed: f32) -> Result<()> {
         validate_ptz_value("pan_speed", pan_speed, -1.0, 1.0)?;
         validate_ptz_value("tilt_speed", tilt_speed, -1.0, 1.0)?;
-        ptz_command!(
-            self,
-            NDIlib_recv_ptz_pan_tilt_speed,
-            pan_speed,
-            tilt_speed,
-            format!("Failed to set PTZ pan/tilt speed to ({pan_speed}, {tilt_speed})")
-        )
+        ptz_command!(self, NDIlib_recv_ptz_pan_tilt_speed, pan_speed, tilt_speed)
     }
 
     /// Store the current camera settings as preset `0..=99`.
@@ -1144,28 +1137,19 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
     /// parameters, before issuing an SDK command.
-    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
-    pub fn ptz_store_preset(&self, preset_no: i32) -> Result<()> {
-        let preset_no = validate_ptz_preset(i64::from(preset_no))?;
-        ptz_command!(
-            self,
-            NDIlib_recv_ptz_store_preset,
-            preset_no,
-            format!("Failed to store PTZ preset {preset_no}")
-        )
+    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
+    pub fn ptz_store_preset(&self, preset_no: u8) -> Result<()> {
+        let preset_no = validate_ptz_preset(preset_no)?;
+        ptz_command!(self, NDIlib_recv_ptz_store_preset, preset_no)
     }
 
     /// Enable automatic focus.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
+    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
     pub fn ptz_auto_focus(&self) -> Result<()> {
-        ptz_command!(
-            self,
-            NDIlib_recv_ptz_auto_focus,
-            "Failed to enable PTZ auto focus"
-        )
+        ptz_command!(self, NDIlib_recv_ptz_auto_focus)
     }
 
     /// Set finite absolute focus within `0.0..=1.0`.
@@ -1175,15 +1159,10 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
     /// parameters, before issuing an SDK command.
-    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
+    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
     pub fn ptz_focus(&self, focus_value: f32) -> Result<()> {
         validate_ptz_value("focus_value", focus_value, 0.0, 1.0)?;
-        ptz_command!(
-            self,
-            NDIlib_recv_ptz_focus,
-            focus_value,
-            format!("Failed to set PTZ focus to {focus_value}")
-        )
+        ptz_command!(self, NDIlib_recv_ptz_focus, focus_value)
     }
 
     /// Set finite focus speed within `-1.0..=1.0`.
@@ -1193,67 +1172,46 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
     /// parameters, before issuing an SDK command.
-    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
+    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
     pub fn ptz_focus_speed(&self, focus_speed: f32) -> Result<()> {
         validate_ptz_value("focus_speed", focus_speed, -1.0, 1.0)?;
-        ptz_command!(
-            self,
-            NDIlib_recv_ptz_focus_speed,
-            focus_speed,
-            format!("Failed to set PTZ focus speed to {focus_speed}")
-        )
+        ptz_command!(self, NDIlib_recv_ptz_focus_speed, focus_speed)
     }
 
     /// Enable automatic white balance.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
+    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
     pub fn ptz_white_balance_auto(&self) -> Result<()> {
-        ptz_command!(
-            self,
-            NDIlib_recv_ptz_white_balance_auto,
-            "Failed to set PTZ auto white balance"
-        )
+        ptz_command!(self, NDIlib_recv_ptz_white_balance_auto)
     }
 
     /// Select the indoor white-balance preset.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
+    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
     pub fn ptz_white_balance_indoor(&self) -> Result<()> {
-        ptz_command!(
-            self,
-            NDIlib_recv_ptz_white_balance_indoor,
-            "Failed to set PTZ indoor white balance"
-        )
+        ptz_command!(self, NDIlib_recv_ptz_white_balance_indoor)
     }
 
     /// Select the outdoor white-balance preset.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
+    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
     pub fn ptz_white_balance_outdoor(&self) -> Result<()> {
-        ptz_command!(
-            self,
-            NDIlib_recv_ptz_white_balance_outdoor,
-            "Failed to set PTZ outdoor white balance"
-        )
+        ptz_command!(self, NDIlib_recv_ptz_white_balance_outdoor)
     }
 
     /// Set white balance from the current image.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
+    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
     pub fn ptz_white_balance_oneshot(&self) -> Result<()> {
-        ptz_command!(
-            self,
-            NDIlib_recv_ptz_white_balance_oneshot,
-            "Failed to set PTZ oneshot white balance"
-        )
+        ptz_command!(self, NDIlib_recv_ptz_white_balance_oneshot)
     }
 
     /// Set finite red and blue white-balance levels within `0.0..=1.0`.
@@ -1262,30 +1220,20 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
     /// parameters, before issuing an SDK command.
-    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
+    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
     pub fn ptz_white_balance_manual(&self, red: f32, blue: f32) -> Result<()> {
         validate_ptz_value("red", red, 0.0, 1.0)?;
         validate_ptz_value("blue", blue, 0.0, 1.0)?;
-        ptz_command!(
-            self,
-            NDIlib_recv_ptz_white_balance_manual,
-            red,
-            blue,
-            format!("Failed to set PTZ manual white balance (red: {red}, blue: {blue})")
-        )
+        ptz_command!(self, NDIlib_recv_ptz_white_balance_manual, red, blue)
     }
 
     /// Enable automatic exposure.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
+    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
     pub fn ptz_exposure_auto(&self) -> Result<()> {
-        ptz_command!(
-            self,
-            NDIlib_recv_ptz_exposure_auto,
-            "Failed to set PTZ auto exposure"
-        )
+        ptz_command!(self, NDIlib_recv_ptz_exposure_auto)
     }
 
     /// Set finite exposure within `0.0..=1.0`, from dark to light.
@@ -1294,15 +1242,10 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
     /// parameters, before issuing an SDK command.
-    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
+    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
     pub fn ptz_exposure_manual(&self, exposure_level: f32) -> Result<()> {
         validate_ptz_value("exposure_level", exposure_level, 0.0, 1.0)?;
-        ptz_command!(
-            self,
-            NDIlib_recv_ptz_exposure_manual,
-            exposure_level,
-            format!("Failed to set PTZ manual exposure to {exposure_level}")
-        )
+        ptz_command!(self, NDIlib_recv_ptz_exposure_manual, exposure_level)
     }
 
     /// Set finite iris, gain, and shutter-speed levels within `0.0..=1.0`.
@@ -1312,7 +1255,7 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
     /// parameters, before issuing an SDK command.
-    /// Returns [`Error::PtzCommandFailed`] if the SDK rejects the command.
+    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
     pub fn ptz_exposure_manual_v2(&self, iris: f32, gain: f32, shutter_speed: f32) -> Result<()> {
         validate_ptz_value("iris", iris, 0.0, 1.0)?;
         validate_ptz_value("gain", gain, 0.0, 1.0)?;
@@ -1322,8 +1265,7 @@ impl<M: ReceiverMode> Receiver<M> {
             NDIlib_recv_ptz_exposure_manual_v2,
             iris,
             gain,
-            shutter_speed,
-            format!("Failed to set PTZ manual exposure v2 (iris: {iris}, gain: {gain}, shutter: {shutter_speed})")
+            shutter_speed
         )
     }
 
@@ -1570,33 +1512,6 @@ impl<M: ReceiverMode> Receiver<M> {
             metadata_frames_queued: queue.metadata_frames.max(0) as u32,
         }
     }
-
-    /// Poll for SDK receiver status changes, including notifications consumed by media capture.
-    ///
-    /// Multiple unobserved notifications can coalesce. Concurrent status pollers
-    /// compete to consume them; this is not a broadcast or event history. A pending
-    /// notification avoids waiting, but publication cannot interrupt an SDK wait
-    /// already in progress. Notifications are rechecked after lock/SDK waits.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Maximum time to wait for status change.
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Returns
-    ///
-    /// * `Some(ReceiverStatus)` - Status has changed
-    /// * `None` - Timeout occurred with no status change, including when a
-    ///   reconnect holds the capture lock for the remaining budget.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`],
-    /// or [`Error::CaptureFailed`] if the SDK reports a lost connection.
-    /// The budget includes lock contention; SDK calls may overshoot it.
-    pub fn poll_status_change(&self, timeout: Duration) -> Result<Option<ReceiverStatus>> {
-        self.core.poll_status_change(timeout)
-    }
 }
 
 impl ReceiverCore {
@@ -1707,25 +1622,6 @@ impl ReceiverCore {
         )
     }
 
-    pub fn poll_status_change(&self, timeout: Duration) -> Result<Option<ReceiverStatus>> {
-        self.poll_status_with(timeout, |deadline| {
-            let _capture = self.capture_lock_until(deadline)?;
-            let timeout_ms = to_ms_checked(deadline.saturating_duration_since(Instant::now()))
-                .expect("remaining validated timeout");
-            // SAFETY: The live receiver and shared guard exclude reconnect;
-            // null media slots request only notifications (Processing.NDI.Recv.h).
-            Some(unsafe {
-                self.sdk().NDIlib_recv_capture_v3(
-                    self.instance,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    timeout_ms,
-                )
-            })
-        })
-    }
-
     fn take_pending_status(&self) -> Option<ReceiverStatus> {
         // Atomic swap linearizes competing pollers with capture publication.
         // A store after this take remains pending; no load/store pair can erase it.
@@ -1743,32 +1639,6 @@ impl ReceiverCore {
                     .NDIlib_recv_get_no_connections(self.instance)
                     .max(0) as u32
             },
-        }
-    }
-
-    fn poll_status_with(
-        &self,
-        timeout: Duration,
-        capture: impl FnOnce(Instant) -> Option<NDIlib_frame_type_e>,
-    ) -> Result<Option<ReceiverStatus>> {
-        to_ms_checked(timeout)?;
-        let deadline = Instant::now() + timeout;
-        if let Some(status) = self.take_pending_status() {
-            return Ok(Some(status));
-        }
-        match capture(deadline) {
-            Some(NDIlib_frame_type_e_NDIlib_frame_type_error) => {
-                // Errors must not consume notifications published during the wait.
-                Err(Error::CaptureFailed("Received an error frame".into()))
-            }
-            Some(NDIlib_frame_type_e_NDIlib_frame_type_status_change) => {
-                Ok(Some(self.current_status()))
-            }
-            Some(value) => {
-                self.retain_non_status_event(value);
-                Ok(self.take_pending_status())
-            }
-            None => Ok(self.take_pending_status()),
         }
     }
 
@@ -1854,7 +1724,7 @@ impl ReceiverCore {
 ///   60 fps). Convert to an owned frame with `to_owned` when you need to keep or
 ///   send it.
 ///
-/// Media capture retains status notifications for [`Receiver::poll_status_change`],
+/// Media capture retains status notifications for [`Receiver::poll_event`],
 /// even when retries later time out.
 ///
 /// Every verb holds a shared capture guard for the duration of a single SDK
@@ -2211,7 +2081,7 @@ mod tests {
     }
 
     #[test]
-    fn media_source_and_unknown_events_survive_legacy_status_polling() {
+    fn media_source_and_unknown_events_are_retained_for_poll_event() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
@@ -2223,11 +2093,7 @@ mod tests {
                 .unwrap()
                 .is_none());
         }
-        assert!(receiver
-            .core
-            .poll_status_with(Duration::ZERO, |_| Some(987))
-            .unwrap()
-            .is_none());
+        receiver.core.retain_non_status_event(987);
         assert!(matches!(
             receiver.core.take_pending_event(),
             Some(ReceiverEvent::SourceChanged)
@@ -2251,6 +2117,18 @@ mod tests {
             receiver.core.take_pending_event(),
             Some(ReceiverEvent::Unknown(988))
         ));
+    }
+
+    #[test]
+    fn default_options_equal_the_builder_defaults() {
+        let default = ReceiverOptions::default();
+        let built = ReceiverOptions::builder(Source::default()).build();
+        assert_eq!(default.source_to_connect_to, built.source_to_connect_to);
+        assert_eq!(default.color_format, built.color_format);
+        assert_eq!(default.bandwidth, built.bandwidth);
+        assert_eq!(default.allow_video_fields, built.allow_video_fields);
+        assert_eq!(default.ndi_recv_name, built.ndi_recv_name);
+        assert!(default.allow_video_fields);
     }
 
     #[test]
@@ -2387,18 +2265,11 @@ mod tests {
                     .capture_result::<K>(CaptureResult::None)
                     .unwrap()
                     .is_none());
-                assert!(receiver
-                    .core
-                    .poll_status_with(Duration::ZERO, |_| panic!("pending skips SDK"))
-                    .unwrap()
-                    .is_some());
-                assert!(receiver
-                    .core
-                    .poll_status_with(Duration::ZERO, |_| Some(
-                        NDIlib_frame_type_e_NDIlib_frame_type_none
-                    ))
-                    .unwrap()
-                    .is_none());
+                assert!(matches!(
+                    receiver.core.take_pending_event(),
+                    Some(ReceiverEvent::StatusChanged(_))
+                ));
+                assert!(receiver.core.take_pending_event().is_none());
             });
             assert_eq!(allocations, 0);
         }
@@ -2408,42 +2279,19 @@ mod tests {
     }
 
     #[test]
-    fn status_wait_rechecks_publication_and_preserves_it_on_errors() {
+    fn pending_status_survives_an_invalid_poll_event_timeout() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
         let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
-        for outcome in [None, Some(NDIlib_frame_type_e_NDIlib_frame_type_none)] {
-            assert!(receiver
-                .core
-                .poll_status_with(Duration::ZERO, |_| {
-                    receiver.core.pending_status.store(true, Ordering::Release);
-                    outcome
-                })
-                .unwrap()
-                .is_some());
-            assert!(!receiver.core.pending_status.load(Ordering::Acquire));
-        }
-        assert!(matches!(
-            receiver.core.poll_status_with(Duration::ZERO, |_| {
-                receiver.core.pending_status.store(true, Ordering::Release);
-                Some(NDIlib_frame_type_e_NDIlib_frame_type_error)
-            }),
-            Err(Error::CaptureFailed(_))
-        ));
-        assert!(receiver.poll_status_change(Duration::MAX).is_err());
+        receiver.core.pending_status.store(true, Ordering::Release);
+        assert!(receiver.poll_event(Duration::MAX).is_err());
         assert!(receiver.core.pending_status.load(Ordering::Acquire));
-        assert!(receiver
-            .poll_status_change(Duration::ZERO)
-            .unwrap()
-            .is_some());
-        assert!(receiver
-            .core
-            .poll_status_with(Duration::ZERO, |_| Some(
-                NDIlib_frame_type_e_NDIlib_frame_type_status_change
-            ))
-            .unwrap()
-            .is_some());
+        assert!(matches!(
+            receiver.poll_event(Duration::ZERO).unwrap(),
+            Some(ReceiverEvent::StatusChanged(_))
+        ));
+        assert!(!receiver.core.pending_status.load(Ordering::Acquire));
     }
 
     #[test]
@@ -2479,31 +2327,11 @@ mod tests {
     }
 
     #[test]
-    fn status_publication_during_waits_is_reported_and_newer_publication_survives() {
+    fn status_publication_is_consumed_once_and_newer_publication_survives() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
         let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
-            let receiver = &receiver;
-            let worker = scope.spawn(move || {
-                receiver.core.poll_status_with(Duration::from_secs(1), |_| {
-                    entered_tx.send(()).unwrap();
-                    resume_rx.recv().unwrap();
-                    Some(NDIlib_frame_type_e_NDIlib_frame_type_none)
-                })
-            });
-            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-            receiver
-                .core
-                .capture_result::<MetadataKind>(CaptureResult::StatusChanged)
-                .unwrap();
-            resume_tx.send(()).unwrap();
-            assert!(worker.join().unwrap().unwrap().is_some());
-        });
-        assert!(receiver.core.take_pending_status().is_none());
         receiver
             .core
             .capture_result::<AudioKind>(CaptureResult::StatusChanged)
@@ -2516,24 +2344,10 @@ mod tests {
             .core
             .capture_result::<VideoKind>(CaptureResult::StatusChanged)
             .unwrap();
-        assert!(receiver
-            .poll_status_change(Duration::ZERO)
-            .unwrap()
-            .is_some());
-        // Publication during a failed lock wait is also rechecked, without a
-        // second SDK call or a fresh deadline.
-        assert!(receiver
-            .core
-            .poll_status_with(Duration::ZERO, |deadline| {
-                receiver
-                    .core
-                    .capture_result::<VideoKind>(CaptureResult::StatusChanged)
-                    .unwrap();
-                assert!(receiver.core.capture_lock_until(deadline).is_none());
-                None
-            })
-            .unwrap()
-            .is_some());
+        assert!(matches!(
+            receiver.poll_event(Duration::ZERO).unwrap(),
+            Some(ReceiverEvent::StatusChanged(_))
+        ));
     }
 
     #[test]
@@ -2545,20 +2359,19 @@ mod tests {
         let original_core = Arc::as_ptr(&receiver.core);
         receiver.core.pending_status.store(true, Ordering::Release);
         let fs = crate::FrameSync::new(receiver).unwrap();
-        assert!(fs
-            .receiver()
-            .poll_status_change(Duration::ZERO)
-            .unwrap()
-            .is_some());
+        assert!(matches!(
+            fs.receiver().poll_event(Duration::ZERO).unwrap(),
+            Some(ReceiverEvent::StatusChanged(_))
+        ));
         fs.receiver()
             .core
             .pending_status
             .store(true, Ordering::Release);
         let receiver = fs.into_receiver();
-        assert!(receiver
-            .poll_status_change(Duration::ZERO)
-            .unwrap()
-            .is_some());
+        assert!(matches!(
+            receiver.poll_event(Duration::ZERO).unwrap(),
+            Some(ReceiverEvent::StatusChanged(_))
+        ));
         assert!(!receiver.core.pending_status.load(Ordering::Acquire));
         assert_eq!(Arc::as_ptr(&receiver.core), original_core);
         assert_eq!(
@@ -2582,10 +2395,10 @@ mod tests {
         };
         let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
         for result in [
-            receiver.ptz_recall_preset(u32::MAX, 0.5),
+            receiver.ptz_recall_preset(u8::MAX, 0.5),
             receiver.ptz_recall_preset(100, 0.5),
             receiver.ptz_recall_preset(0, f32::NAN),
-            receiver.ptz_store_preset(-1),
+            receiver.ptz_store_preset(100),
             receiver.ptz_zoom(f32::INFINITY),
             receiver.ptz_zoom_speed(-1.1),
             receiver.ptz_pan_tilt(0.0, 1.1),
@@ -2637,10 +2450,7 @@ mod tests {
                     .try_capture(Duration::ZERO)
                     .unwrap()
                     .is_none());
-                assert!(receiver
-                    .poll_status_change(Duration::ZERO)
-                    .unwrap()
-                    .is_none());
+                assert!(receiver.poll_event(Duration::ZERO).unwrap().is_none());
                 assert!(receiver
                     .audio()
                     .try_capture(Duration::from_millis(5))

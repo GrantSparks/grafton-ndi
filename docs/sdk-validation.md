@@ -17,44 +17,45 @@ totals of every test binary and the doctests.
 
 ### Runs with one SDK
 
-| Build made with | Runtime | Features | Required to be present | Passed | Failed | Ignored |
+| Advanced headers | Runtime | Features | Required to be present | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- | --- |
-| No NDI SDK | None | all | Nothing | 613 | 0 | 3 |
-| Standard 6.1.1 | Standard 6.1.1 | all | `1` | 613 | 0 | 3 |
-| Standard 6.1.1 | Standard 6.1.1 | none | `1` | 402 | 0 | 2 |
-| Standard 6.3.2 | Standard 6.3.2 | all | `1` | 613 | 0 | 3 |
-| Standard 6.3.2 | Standard 6.3.2 | default | `1` | 428 | 0 | 3 |
-| Standard 6.3.2 | Standard 6.3.2 | none | `1` | 402 | 0 | 2 |
-| Advanced SDK 6.3.2 | Advanced 6.3.2 | all | `advanced` | 616 | 0 | 3 |
-| Advanced SDK 6.3.2 | Advanced 6.3.2 | none | `1` | 402 | 0 | 2 |
-| Standard 6.4.0.2 | Standard 6.4.0.2 | all | `1,discovery-server` | 613 | 0 | 3 |
-| Standard 6.4.0.2 | Standard 6.4.0.2 | none | `1,discovery-server` | 402 | 0 | 2 |
-| Advanced SDK 6.4.0.2 | Advanced 6.4.0.2 | all | `advanced,file,discovery-server` | 616 | 0 | 3 |
-| Advanced SDK 6.4.0.2 | Advanced 6.4.0.2 | none | `1,discovery-server` | 402 | 0 | 2 |
+| None | None | all | Nothing | 636 | 0 | 3 |
+| None | Standard 6.1.1 | all | `1` | 636 | 0 | 3 |
+| None | Standard 6.1.1 | none | `1` | 398 | 0 | 2 |
+| None | Standard 6.3.2 | all | `1` | 636 | 0 | 3 |
+| None | Standard 6.3.2 | default | `1` | 424 | 0 | 3 |
+| None | Standard 6.3.2 | none | `1` | 398 | 0 | 2 |
+| Advanced 6.3.2 | Advanced 6.3.2 | all | `advanced` | 639 | 0 | 3 |
+| None | Advanced 6.3.2 | none | `1` | 398 | 0 | 2 |
+| None | Standard 6.4.0.2 | all | `1,discovery-server` | 636 | 0 | 3 |
+| None | Standard 6.4.0.2 | none | `1,discovery-server` | 398 | 0 | 2 |
+| Advanced 6.4.0.2 | Advanced 6.4.0.2 | all | `advanced,file,discovery-server` | 639 | 0 | 3 |
+| None | Advanced 6.4.0.2 | none | `1,discovery-server` | 398 | 0 | 2 |
+| None | Advanced 6.4.0.2 | `file-io` | `1,file,discovery-server` | 508 | 0 | 2 |
 
-"Build made with" is the SDK that `NDI_SDK_DIR` named when the crate was built.
-It sets the default edition and supplies the Advanced SDK headers; the core
-bindings are always the vendored 6.4.0.2 ones. "Required to be present" is the
-value of `GRAFTON_NDI_REQUIRE_RUNTIME`: what the environment promised, so that a
-test could not pass by skipping. In the first row the tests that need a runtime
-reported skips. The other rows visibly skip the Advanced or File operations
-that their build and runtime cannot provide; the requirements make sure that
-the operations a row promises were not skipped. The ignored tests are two
-manual benchmarks and, with all or default features, one slow stress test.
+"Advanced headers" is the Advanced SDK that `NDI_SDK_DIR` named for a build
+with the `advanced` feature, whose Advanced-only headers that build reads. No
+other build reads an SDK, so "None" also covers a build made where a Standard
+SDK, or an Advanced SDK without the feature, was installed. The core bindings
+are always the vendored 6.4.0.2 ones. "Required to be present" is the value of
+`GRAFTON_NDI_REQUIRE_RUNTIME`: what the environment promised, so that a test
+could not pass by skipping. In the first row the system's runtime was hidden
+and the tests that need a runtime reported skips. The other rows visibly skip
+the Advanced or File operations that their build and runtime cannot provide;
+the requirements make sure that the operations a row promises were not
+skipped. The ignored tests are two manual benchmarks and, with all or default
+features, one slow stress test.
 
-The Standard 6.4.0.2 and Advanced 6.4.0.2 rows with all features first ran
-while a second test run shared the machine. Each then failed one test,
-`tests/receiver_video_only.rs`: with `ReceiverBandwidth::VideoOnlyLowest`, its
-control receiver received no audio within 15 seconds. Run alone, both rows
-passed, as recorded above. The test's sender was then unclocked, so it sent
-video and audio as fast as its loop turned: about 17,000 frames of each a
-second, some 500 times real time. With every core busy, the runtime dropped the
-control receiver's connection within the first second and had not restored it
-30 seconds later, even after the load and the sending had stopped. The test now
-sends in real time, clocked 30 fps video with 1/30 s of audio per frame. With
-twice as many busy processes as the machine has cores, the old test failed 3 of
-3 runs against Standard 6.4.0.2; the new one passed 10 of 10 against each of
-Standard and Advanced 6.4.0.2. The rows above were run before this change.
+`tests/receiver_video_only.rs` used to send without a clock, so it sent video
+and audio as fast as its loop turned: about 17,000 frames of each a second,
+some 500 times real time. With every core busy, the runtime dropped the control
+receiver's connection within the first second and had not restored it 30
+seconds later, even after the load and the sending had stopped, and the test
+failed. It now sends in real time, clocked 30 fps video with 1/30 s of audio per
+frame. With twice as many busy processes as the machine has cores, the old test
+failed 3 of 3 runs against Standard 6.4.0.2; the new one passed 10 of 10 against
+each of Standard and Advanced 6.4.0.2. The rows above were run with the new
+test, one at a time.
 
 ### Runs that cross versions
 
@@ -65,12 +66,12 @@ sends video, audio and metadata to a receiver on the run's runtime, and
 timecodes and metadata. Both processes are confined to loopback, and each checks
 the identity of the runtime it loaded.
 
-| Build made with | Runtime | Peer sending | Required to be present | Passed | Failed | Ignored |
+| Advanced headers | Runtime | Peer sending | Required to be present | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- | --- |
-| Advanced SDK 6.4.0.2, `NDI_SDK_EDITION=standard` | Standard 6.1.1 | Advanced 6.4.0.2 | `1` | 616 | 0 | 3 |
-| Advanced SDK 6.4.0.2 | Advanced 6.3.2 | Advanced 6.4.0.2 | `advanced` | 616 | 0 | 3 |
-| Standard 6.1.1, `NDI_SDK_EDITION=advanced` | Advanced 6.4.0.2 | Standard 6.1.1 | `1,file,discovery-server` | 613 | 0 | 3 |
-| Advanced SDK 6.3.2 | Advanced 6.4.0.2 | Advanced 6.3.2 | `advanced,file,discovery-server` | 616 | 0 | 3 |
+| Advanced 6.4.0.2 | Standard 6.1.1 | Advanced 6.4.0.2 | `1` | 639 | 0 | 3 |
+| Advanced 6.4.0.2 | Advanced 6.3.2 | Advanced 6.4.0.2 | `advanced` | 639 | 0 | 3 |
+| None | Advanced 6.4.0.2 | Standard 6.1.1 | `1,file,discovery-server` | 636 | 0 | 3 |
+| Advanced 6.3.2 | Advanced 6.4.0.2 | Advanced 6.3.2 | `advanced,file,discovery-server` | 639 | 0 | 3 |
 
 So 6.1.1 and 6.4 exchanged media in both directions, as did Advanced 6.3.2 and
 6.4, and Advanced builds ran against runtimes of another version in both
@@ -260,8 +261,8 @@ runner and why the tests need a private temporary directory.
 directory of your choice and prints the variables above, together with the
 `GRAFTON_NDI_EXPECTED_*` values that make the tests check the runtime they
 load. The crossed runs set `NDI_SDK_DIR` to one SDK, `NDI_RUNTIME_DIR_V6` and
-the expected values to another, `NDI_SDK_EDITION` to the runtime's edition, and
-the `GRAFTON_NDI_PEER_*` values to the SDK that is not loaded. The
+the expected values to another, and the `GRAFTON_NDI_PEER_*` values to the SDK
+that is not loaded. The
 [CI workflow](../.github/workflows/rust.yml) shows each step.
 
 To check that the crate still compiles for a target you cannot run:

@@ -9,9 +9,9 @@ use std::{
 };
 
 use super::{
-    out_param::OutParam, timeout_ms, EventText, FileApi, FileError, FileResult, RecorderEvent,
-    RecorderEventKind, RecorderOptions, RecorderStats, RecordingTarget, RecordingTimecode,
-    SourceFormat, SourceSpec, TrackSelection,
+    out_param::OutParam, timeout_ms, types::FileNaming, EventText, FileApi, FileError, FileResult,
+    RecorderEvent, RecorderEventKind, RecorderOptions, RecorderStats, RecordingTarget,
+    RecordingTimecode, SourceFormat, SourceSpec, StateError, TrackSelection,
 };
 use crate::sys::{self, bindings::*};
 
@@ -24,7 +24,8 @@ const FINISH_POLL: Duration = Duration::from_millis(25);
 const SETTLE_POLL: Duration = Duration::from_millis(1);
 
 /// How many stale events [`FileRecorder::start`] discards before giving up on
-/// finding the queue empty.
+/// finding the queue empty, and how many queued events a wait takes after its
+/// deadline before it reports a timeout.
 const STALE_EVENT_LIMIT: usize = 256;
 
 /// Where a recorder is in its session.
@@ -76,6 +77,7 @@ pub struct RecordingReport {
     write_failures: u64,
     dropped_events: u64,
     last_closed_path: Option<EventText>,
+    stopped_by_sdk: bool,
 }
 
 impl RecordingReport {
@@ -127,6 +129,26 @@ impl RecordingReport {
     pub fn last_closed_path(&self) -> Option<&EventText> {
         self.last_closed_path.as_ref()
     }
+    /// Whether the SDK ended the session by itself, rather than because it
+    /// was asked to stop.
+    ///
+    /// True once the session has ended, as [`RecorderState::Closed`] or
+    /// [`RecorderState::Indeterminate`], without a stop requested through
+    /// [`request_stop`](FileRecorder::request_stop),
+    /// [`finish`](FileRecorder::finish), [`abandon`](FileRecorder::abandon)
+    /// or dropping the recorder. The SDK ends a session after an error it
+    /// cannot recover from, such as a new file it cannot open, and at a
+    /// format change when the recorder does not roll over; the report's
+    /// [`error_events`](Self::error_events) then usually say why. A stop
+    /// requested after the SDK had already stopped recording does not count
+    /// as the caller's.
+    ///
+    /// False while the session is open, and for a session that ran until it
+    /// was asked to stop. A closed session with this true was finalized, but
+    /// did not record for as long as intended.
+    pub fn stopped_by_sdk(&self) -> bool {
+        self.stopped_by_sdk
+    }
 }
 
 /// The outcome of waiting for a session to end.
@@ -136,7 +158,9 @@ impl RecordingReport {
 #[non_exhaustive]
 pub enum FinishStatus {
     /// Every file the session opened is finalized. The report still records
-    /// any errors during the session.
+    /// any errors during the session, and
+    /// [`stopped_by_sdk`](RecordingReport::stopped_by_sdk) says whether the
+    /// recording ran until it was asked to stop or the SDK ended it sooner.
     Closed(RecordingReport),
     /// The wait ended first. Call [`FileRecorder::wait_finished`] to keep waiting.
     TimedOut(RecordingReport),
@@ -168,6 +192,8 @@ struct Ledger {
     uncertain: bool,
     /// The SDK's count of discarded events when the session began.
     dropped_base: u64,
+    /// The caller asked for the session to stop while it was recording.
+    stop_requested: bool,
 }
 
 impl Ledger {
@@ -187,11 +213,13 @@ impl Ledger {
                 write_failures: 0,
                 dropped_events: 0,
                 last_closed_path: None,
+                stopped_by_sdk: false,
             },
             open_files: Vec::new(),
             records_media,
             uncertain: false,
             dropped_base,
+            stop_requested: false,
         }
     }
 
@@ -208,10 +236,20 @@ impl Ledger {
         self.open_files.is_empty() && self.report.closed_files > 0
     }
 
-    /// Record that a stop is under way: requested by the caller, or announced
-    /// by the SDK after an unrecoverable error.
+    /// Record that a stop is under way, announced by the SDK after an
+    /// unrecoverable error.
     fn stopping(&mut self) {
         self.state = RecorderState::Stopping;
+    }
+
+    /// Record that the caller asked for the session to stop.
+    ///
+    /// `still_recording` is whether the SDK was still recording when asked:
+    /// a request that comes after the SDK has ended the session by itself
+    /// does not make the caller the one who stopped it.
+    fn stop_requested(&mut self, still_recording: bool) {
+        self.stop_requested |= still_recording;
+        self.stopping();
     }
 
     /// Record the SDK's cumulative count of discarded events.
@@ -306,6 +344,9 @@ impl Ledger {
             // The session stopped without ever reporting a file.
             self.state = RecorderState::Indeterminate;
         }
+        if !self.session_open() {
+            self.report.stopped_by_sdk = !self.stop_requested;
+        }
     }
 }
 
@@ -370,6 +411,8 @@ pub struct FileRecorder {
     records_media: bool,
     /// The source in effect, when the last change of source was accepted.
     accepted_source: Option<SourceSpec>,
+    /// How the recorder names its files.
+    naming: FileNaming,
     ledger: Ledger,
     /// The SDK has not yet been told to stop the session started last. It
     /// needs to be, even when it ended that session itself: until then it
@@ -392,12 +435,13 @@ impl std::fmt::Debug for FileRecorder {
 
 impl FileRecorder {
     pub(super) fn create(api: FileApi, options: RecorderOptions) -> FileResult<Self> {
+        let resolved = options.resolve()?;
         let recording = api.recording()?;
         let settings = NDIlib_file_recorder_create_t {
             source_to_connect_to: raw_source(&options.source),
             track_flags: options.tracks.bits(),
             record_float_audio_planar_32f: options.planar_audio,
-            disable_auto_rollover_on_format_change: options.disable_auto_rollover,
+            disable_auto_rollover_on_format_change: !resolved.format_change_rollover,
             p_output_filename_pattern: options
                 .pattern
                 .as_ref()
@@ -416,6 +460,7 @@ impl FileRecorder {
             records_media: options.tracks.bits() & media != 0,
             drop_wait: options.drop_wait,
             accepted_source: Some(options.source),
+            naming: resolved.naming,
             ledger: Ledger::idle(),
             native_stop_owed: false,
             _api: api,
@@ -441,15 +486,21 @@ impl FileRecorder {
     ///
     /// The recorder's filename pattern turns the target into file names. With
     /// the default indexed pattern the lowest unused index is chosen; with an
-    /// exact filename the SDK refuses a file that already exists. Nothing is
-    /// overwritten or removed, and the parent directory must exist.
+    /// exact file name ([`RecorderOptions::exact_filename`]) a file that
+    /// already exists is refused. Nothing is overwritten or removed, and the
+    /// directory the pattern names must exist.
     ///
     /// # Errors
     ///
-    /// * [`FileError::InvalidState`] while an earlier session is recording or
-    ///   stopping; [`finish`](Self::finish) it first.
-    /// * [`FileError::Io`] when the target's directory does not exist or
-    ///   cannot be written to. The SDK is not called.
+    /// * [`FileError::InvalidState`] with [`StateError::PreviousSessionOpen`]
+    ///   while an earlier session is recording or stopping;
+    ///   [`finish`](Self::finish) it first. With
+    ///   [`StateError::EarlierSessionEvents`] when the SDK keeps reporting
+    ///   events of an earlier session.
+    /// * [`FileError::Io`] when the directory of the file the pattern names
+    ///   does not exist or cannot be written to, or, with an exact file name,
+    ///   with kind [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) when
+    ///   that file exists. The SDK is not called.
     /// * [`FileError::Rejected`] when the SDK cannot start the source or open
     ///   the first file. It queues an open-failed event that says why, which
     ///   [`poll_event`](Self::poll_event) returns; the event is counted in no
@@ -460,11 +511,9 @@ impl FileRecorder {
         timecode: RecordingTimecode,
     ) -> FileResult<u64> {
         if self.ledger.session_open() {
-            return Err(FileError::InvalidState(
-                "finish the previous session before starting another",
-            ));
+            return Err(FileError::InvalidState(StateError::PreviousSessionOpen));
         }
-        target.check_directory()?;
+        self.naming.check(&target)?;
         // Events left over from an earlier session must not be counted in this one.
         self.discard_stale_events()?;
         let session =
@@ -510,9 +559,7 @@ impl FileRecorder {
                 return Ok(());
             }
         }
-        Err(FileError::InvalidState(
-            "the recorder keeps producing events from an earlier session",
-        ))
+        Err(FileError::InvalidState(StateError::EarlierSessionEvents))
     }
 
     /// Ask the SDK to stop the session. Idempotent.
@@ -527,7 +574,8 @@ impl FileRecorder {
             RecorderState::Indeterminate => StopRequest::AlreadyEnded,
             RecorderState::Stopping => StopRequest::AlreadyStopping,
             RecorderState::Recording => {
-                self.ledger.stopping();
+                let still_recording = self.is_recording();
+                self.ledger.stop_requested(still_recording);
                 StopRequest::Requested
             }
         };
@@ -608,10 +656,17 @@ impl FileRecorder {
     /// Events that arrive during the wait are consumed; their effect is in
     /// the returned report.
     ///
+    /// The wait covers taking the closure's event, not the stop itself, which
+    /// the SDK may carry out before it returns. Events already queued are
+    /// taken even when the wait is over, so `finish(Duration::ZERO)` reports
+    /// [`FinishStatus::Closed`] when the SDK finalized the file during the
+    /// stop.
+    ///
     /// # Errors
     ///
-    /// [`FileError::InvalidState`] when no session was started, and the
-    /// errors of [`poll_event`](Self::poll_event).
+    /// [`FileError::InvalidState`] with [`StateError::StopNotRequested`] when
+    /// no session was started, and the errors of
+    /// [`poll_event`](Self::poll_event).
     pub fn finish(&mut self, wait: Duration) -> FileResult<FinishStatus> {
         timeout_ms(wait)?;
         self.request_stop();
@@ -620,13 +675,15 @@ impl FileRecorder {
 
     /// Wait up to `wait` for a stopping session to end.
     ///
-    /// Use this to keep waiting after [`FinishStatus::TimedOut`].
+    /// Use this to keep waiting after [`FinishStatus::TimedOut`]. Events
+    /// already queued are taken even when `wait` is over, so a closure that
+    /// has been reported is never missed.
     ///
     /// # Errors
     ///
-    /// [`FileError::InvalidState`] when no session was started or the session
-    /// has not been asked to stop, and the errors of
-    /// [`poll_event`](Self::poll_event).
+    /// [`FileError::InvalidState`] with [`StateError::StopNotRequested`] when
+    /// no session was started or the session has not been asked to stop, and
+    /// the errors of [`poll_event`](Self::poll_event).
     pub fn wait_finished(&mut self, wait: Duration) -> FileResult<FinishStatus> {
         self.wait_finished_from(Instant::now(), wait, |_| false)
     }
@@ -635,6 +692,10 @@ impl FileRecorder {
     ///
     /// `each` is called after every poll with the event it returned, if any,
     /// and ends the wait early by returning true.
+    ///
+    /// Once the deadline has passed, events already queued are still taken,
+    /// without waiting, until the queue is found empty: the deadline may have
+    /// passed during the native stop, after the closure was reported.
     pub(super) fn wait_finished_from(
         &mut self,
         started: Instant,
@@ -643,11 +704,10 @@ impl FileRecorder {
     ) -> FileResult<FinishStatus> {
         timeout_ms(wait)?;
         if matches!(self.state(), RecorderState::Idle | RecorderState::Recording) {
-            return Err(FileError::InvalidState(
-                "request a stop before waiting for the session to end",
-            ));
+            return Err(FileError::InvalidState(StateError::StopNotRequested));
         }
         let mut interrupted = false;
+        let mut late_polls = 0;
         loop {
             match self.state() {
                 RecorderState::Closed => return Ok(FinishStatus::Closed(self.report())),
@@ -657,8 +717,14 @@ impl FileRecorder {
                 _ => {}
             }
             let remaining = wait.saturating_sub(started.elapsed());
-            if interrupted || remaining.is_zero() {
+            if interrupted {
                 return Ok(FinishStatus::TimedOut(self.report()));
+            }
+            if remaining.is_zero() {
+                if late_polls == STALE_EVENT_LIMIT {
+                    return Ok(FinishStatus::TimedOut(self.report()));
+                }
+                late_polls += 1;
             }
             // With every file closed, one empty poll settles the outcome.
             let budget = remaining.min(if self.ledger.all_closed() {
@@ -667,7 +733,17 @@ impl FileRecorder {
                 FINISH_POLL
             });
             let event = self.poll_event(budget)?;
+            let drained = event.is_none();
             interrupted = each(event);
+            if remaining.is_zero() && drained {
+                // The queue was empty and its state recorded: what it shows
+                // now is the outcome.
+                return Ok(match self.state() {
+                    RecorderState::Closed => FinishStatus::Closed(self.report()),
+                    RecorderState::Indeterminate => FinishStatus::Indeterminate(self.report()),
+                    _ => FinishStatus::TimedOut(self.report()),
+                });
+            }
         }
     }
 
@@ -724,19 +800,32 @@ impl FileRecorder {
     /// Switch to recording another source.
     ///
     /// During a session the SDK starts the new source at once and rolls over
-    /// to a new file. Before a session, the source is used by the next
-    /// [`start`](Self::start).
+    /// to a new file, named from the session's current target. Before a
+    /// session, the source is used by the next [`start`](Self::start).
+    ///
+    /// A recorder with an exact file name
+    /// ([`RecorderOptions::exact_filename`], or a pattern without `{index}`)
+    /// cannot roll over to a file of the same name, and the SDK would end the
+    /// session instead, so it refuses a change of source during a session
+    /// and the session goes on. Before a session the change works as for any
+    /// recorder.
     ///
     /// # Errors
     ///
-    /// * [`FileError::InvalidState`] while a session is stopping.
+    /// * [`FileError::InvalidState`] with [`StateError::ExactFileName`]
+    ///   during a session, recording or stopping, of a recorder with an exact
+    ///   file name, and with [`StateError::Stopping`] while any other
+    ///   recorder's session is stopping. The SDK is not called.
     /// * [`FileError::Rejected`] when the SDK cannot start the source. The
     ///   SDK does not say which source is then in effect, so
     ///   [`last_accepted_source`](Self::last_accepted_source) returns `None`
     ///   until a later change succeeds.
     pub fn set_source(&mut self, source: SourceSpec) -> FileResult<()> {
+        if self.naming.is_exact() && self.ledger.session_open() {
+            return Err(FileError::InvalidState(StateError::ExactFileName));
+        }
         if self.state() == RecorderState::Stopping {
-            return Err(FileError::InvalidState("the session is stopping"));
+            return Err(FileError::InvalidState(StateError::Stopping));
         }
         let raw = raw_source(&source);
         // SAFETY: the recorder is live, and `raw` and the strings it points
@@ -780,23 +869,25 @@ impl FileRecorder {
     ///
     /// The SDK accepts a rollover it then cannot carry out, and ends the
     /// session when the new file cannot be opened: it reports open-failed,
-    /// closes the old file and reports an error. The target's directory is
-    /// therefore checked first, so that the usual mistake leaves the session
-    /// running. An exact file name that already exists is not caught here.
+    /// closes the old file and reports an error. The file the pattern names
+    /// for the target is therefore checked first: its directory must exist
+    /// and be writable, and with an exact file name the file must not exist.
+    /// The usual mistakes then leave the session running.
     ///
     /// # Errors
     ///
-    /// * [`FileError::InvalidState`] unless a session is recording.
-    /// * [`FileError::Io`] when the target's directory does not exist or
-    ///   cannot be written to. The SDK is not called and the session goes on.
+    /// * [`FileError::InvalidState`] with [`StateError::NotRecording`] unless
+    ///   a session is recording.
+    /// * [`FileError::Io`] when the directory of the file the pattern names
+    ///   does not exist or cannot be written to, or, with an exact file name,
+    ///   with kind [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) when
+    ///   that file exists. The SDK is not called and the session goes on.
     /// * [`FileError::Rejected`] when the SDK refuses the target.
     pub fn rollover(&mut self, target: RecordingTarget) -> FileResult<()> {
         if self.state() != RecorderState::Recording {
-            return Err(FileError::InvalidState(
-                "a rollover needs a session that is recording",
-            ));
+            return Err(FileError::InvalidState(StateError::NotRecording));
         }
-        target.check_directory()?;
+        self.naming.check(&target)?;
         // SAFETY: the recorder is live, and the prefix points into `target`,
         // which outlives the call.
         let accepted = unsafe {
@@ -817,15 +908,14 @@ impl FileRecorder {
     ///
     /// # Errors
     ///
-    /// [`FileError::InvalidState`] unless a session is recording,
+    /// [`FileError::InvalidState`] with [`StateError::NotRecording`] unless a
+    /// session is recording,
     /// [`FileError::InvalidInput`] when the metadata contains a NUL or is too
     /// long, and [`FileError::Rejected`] when the SDK refuses it, for example
     /// because the metadata track is not being recorded.
     pub fn inject_metadata(&mut self, metadata: &crate::MetadataFrame) -> FileResult<()> {
         if self.state() != RecorderState::Recording {
-            return Err(FileError::InvalidState(
-                "metadata can only be injected into a session that is recording",
-            ));
+            return Err(FileError::InvalidState(StateError::NotRecording));
         }
         let data = CString::new(metadata.data())
             .map_err(|_| FileError::InvalidInput("the metadata contains a NUL".into()))?;
@@ -930,7 +1020,7 @@ mod tests {
     fn closure_needs_the_matching_file_and_a_stopped_drained_recorder() {
         let mut ledger = session();
         ledger.observe(Started, path("take.mkv"));
-        ledger.stopping();
+        ledger.stop_requested(true);
         ledger.observe(FileClosed, path("take.mkv"));
         assert!(!ledger.report.closure_confirmed);
         ledger.drained(true);
@@ -944,7 +1034,7 @@ mod tests {
     fn a_close_for_another_file_never_confirms_the_session() {
         let mut ledger = session();
         ledger.observe(Started, path("first.mkv"));
-        ledger.stopping();
+        ledger.stop_requested(true);
         ledger.observe(FileClosed, path("other.mkv"));
         ledger.drained(false);
         assert_eq!(ledger.state, RecorderState::Indeterminate);
@@ -955,7 +1045,7 @@ mod tests {
     fn lost_events_taint_an_otherwise_matching_close() {
         let mut ledger = Ledger::session(1, 7, RecorderState::Recording, true);
         ledger.observe(Started, path("take.mkv"));
-        ledger.stopping();
+        ledger.stop_requested(true);
         ledger.observe(FileClosed, path("take.mkv"));
         ledger.dropped(8);
         ledger.drained(false);
@@ -974,7 +1064,7 @@ mod tests {
         ledger.observe(FileClosed, path("first.mkv"));
         ledger.drained(true);
         assert_eq!(ledger.state, RecorderState::Recording);
-        ledger.stopping();
+        ledger.stop_requested(true);
         ledger.observe(FileClosed, path("second.mkv"));
         ledger.drained(false);
         assert_eq!(ledger.state, RecorderState::Closed);
@@ -990,7 +1080,7 @@ mod tests {
         ledger.drained(true);
         assert_eq!(ledger.state, RecorderState::Recording);
         ledger.observe(Rollover, path("second.mkv"));
-        ledger.stopping();
+        ledger.stop_requested(true);
         ledger.drained(false);
         assert_eq!(ledger.state, RecorderState::Stopping);
         ledger.observe(FileClosed, path("second.mkv"));
@@ -1004,7 +1094,7 @@ mod tests {
         // the SDK reports only the close of the file that was open.
         let mut ledger = session();
         ledger.observe(Started, path("first.mkv"));
-        ledger.stopping();
+        ledger.stop_requested(true);
         ledger.observe(FileClosed, path("first.mkv"));
         ledger.drained(false);
         assert_eq!(ledger.state, RecorderState::Closed);
@@ -1049,7 +1139,7 @@ mod tests {
     #[test]
     fn a_session_that_stops_without_reporting_a_file_is_indeterminate_not_pending() {
         let mut ledger = session();
-        ledger.stopping();
+        ledger.stop_requested(true);
         ledger.drained(false);
         assert_eq!(ledger.state, RecorderState::Indeterminate);
     }
@@ -1060,7 +1150,7 @@ mod tests {
         // previous session's record is still the current one.
         let mut ledger = session();
         ledger.observe(Started, path("take.mkv"));
-        ledger.stopping();
+        ledger.stop_requested(true);
         ledger.observe(FileClosed, path("take.mkv"));
         ledger.drained(false);
         assert_eq!(ledger.state, RecorderState::Closed);
@@ -1069,6 +1159,67 @@ mod tests {
         assert_eq!(ledger.report.error_events, 0);
         assert_eq!(ledger.report.dropped_events, 0);
         assert!(ledger.report.closure_confirmed);
+    }
+
+    #[test]
+    fn a_session_stopped_on_request_was_not_stopped_by_the_sdk() {
+        let mut ledger = session();
+        ledger.observe(Started, path("take.mkv"));
+        assert!(!ledger.report.stopped_by_sdk, "an open session");
+        ledger.stop_requested(true);
+        ledger.observe(FileClosed, path("take.mkv"));
+        ledger.drained(true);
+        assert!(!ledger.report.stopped_by_sdk, "still stopping");
+        ledger.drained(false);
+        assert_eq!(ledger.state, RecorderState::Closed);
+        assert!(!ledger.report.stopped_by_sdk);
+    }
+
+    #[test]
+    fn an_sdk_error_that_starts_the_stop_is_not_a_request() {
+        let mut ledger = session();
+        ledger.observe(Started, path("take.mkv"));
+        ledger.observe(OpenFailed, path("next.mkv"));
+        ledger.observe(Error, path(""));
+        assert_eq!(ledger.state, RecorderState::Stopping);
+        ledger.observe(FileClosed, path("take.mkv"));
+        ledger.drained(false);
+        assert_eq!(ledger.state, RecorderState::Closed);
+        assert!(ledger.report.closure_confirmed);
+        assert!(ledger.report.stopped_by_sdk);
+    }
+
+    #[test]
+    fn a_close_at_a_format_change_with_no_request_was_the_sdks() {
+        let mut ledger = session();
+        ledger.observe(Started, path("take.mkv"));
+        ledger.observe(FormatChanged, path("take.mkv"));
+        ledger.observe(FileClosed, path("take.mkv"));
+        ledger.drained(false);
+        assert_eq!(ledger.state, RecorderState::Closed);
+        assert!(ledger.report.stopped_by_sdk);
+    }
+
+    #[test]
+    fn a_request_after_the_sdk_stopped_recording_leaves_the_stop_to_the_sdk() {
+        let mut ledger = session();
+        ledger.observe(Started, path("take.mkv"));
+        // The SDK had ended the session before the request reached it.
+        ledger.stop_requested(false);
+        ledger.observe(FileClosed, path("take.mkv"));
+        ledger.drained(false);
+        assert_eq!(ledger.state, RecorderState::Closed);
+        assert!(ledger.report.stopped_by_sdk);
+    }
+
+    #[test]
+    fn an_indeterminate_end_with_no_request_was_the_sdks() {
+        let mut ledger = session();
+        ledger.observe(Started, path("take.mkv"));
+        ledger.dropped(1);
+        ledger.drained(false);
+        assert_eq!(ledger.state, RecorderState::Indeterminate);
+        assert!(ledger.report.stopped_by_sdk);
     }
 
     #[test]

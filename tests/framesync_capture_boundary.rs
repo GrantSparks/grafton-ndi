@@ -34,7 +34,7 @@ fn attached_receiver_permits_controls_audio_metadata_and_raw_capture_after_recov
             .receiver()
             .audio()
             .try_capture_ref(Duration::ZERO)?;
-        let _ = framesync.receiver().poll_status_change(Duration::ZERO)?;
+        let _ = framesync.receiver().poll_event(Duration::ZERO)?;
         receiver = framesync.into_receiver();
         assert!(receiver.video().try_capture(Duration::ZERO)?.is_none());
     }

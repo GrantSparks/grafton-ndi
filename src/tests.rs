@@ -428,63 +428,44 @@ fn test_source_matches_host() {
 }
 
 #[test]
-fn test_source_ip_address() {
+fn test_source_host() {
     use crate::finder::{Source, SourceAddress};
 
     let ip_source = Source {
         name: "CAMERA1".to_string(),
         address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
     };
-    assert_eq!(ip_source.ip_address(), Some("192.168.1.100"));
+    assert_eq!(ip_source.host(), Some("192.168.1.100"));
 
     let ip_no_port = Source {
         name: "CAMERA2".to_string(),
         address: SourceAddress::Ip("192.168.1.101".to_string()),
     };
-    assert_eq!(ip_no_port.ip_address(), Some("192.168.1.101"));
+    assert_eq!(ip_no_port.host(), Some("192.168.1.101"));
 
     let url_source = Source {
         name: "Studio".to_string(),
         address: SourceAddress::Url("http://camera.local:8080".to_string()),
     };
-    assert_eq!(url_source.ip_address(), Some("camera.local"));
+    assert_eq!(url_source.host(), Some("camera.local"));
 
     let url_with_path = Source {
         name: "Studio2".to_string(),
         address: SourceAddress::Url("http://camera.local:8080/stream".to_string()),
     };
-    assert_eq!(url_with_path.ip_address(), Some("camera.local"));
+    assert_eq!(url_with_path.host(), Some("camera.local"));
 
     let url_no_scheme = Source {
         name: "Studio3".to_string(),
         address: SourceAddress::Url("camera.local:8080".to_string()),
     };
-    assert_eq!(url_no_scheme.ip_address(), Some("camera.local"));
+    assert_eq!(url_no_scheme.host(), Some("camera.local"));
 
     let none_source = Source {
         name: "None".to_string(),
         address: SourceAddress::None,
     };
-    assert_eq!(none_source.ip_address(), None);
-}
-
-#[test]
-fn test_source_host() {
-    use crate::finder::{Source, SourceAddress};
-
-    let source = Source {
-        name: "CAMERA1".to_string(),
-        address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
-    };
-    assert_eq!(source.host(), source.ip_address());
-    assert_eq!(source.host(), Some("192.168.1.100"));
-
-    let url_source = Source {
-        name: "Studio".to_string(),
-        address: SourceAddress::Url("http://camera.local:8080".to_string()),
-    };
-    assert_eq!(url_source.host(), url_source.ip_address());
-    assert_eq!(url_source.host(), Some("camera.local"));
+    assert_eq!(none_source.host(), None);
 }
 
 #[test]
@@ -500,7 +481,6 @@ fn test_source_matching_real_world_example() {
     assert!(!source.matches_host("192.168.0"));
     assert!(source.matches_host("CAMERA1"));
     assert!(source.matches_host("192.168.0.107"));
-    assert_eq!(source.ip_address(), Some("192.168.0.107"));
     assert_eq!(source.host(), Some("192.168.0.107"));
     assert_eq!(source.address.port(), Some(5960));
 }
@@ -1136,25 +1116,11 @@ fn test_async_feature_flags_mutually_compatible() {
     // If this compiles, both can be enabled together
 }
 
-// LineStrideOrSize enum tests (issue #15)
-
-#[test]
-fn test_line_stride_or_size_to_raw_uncompressed() {
-    use crate::frames::LineStrideOrSize;
-
-    // Test conversion from enum to C union for uncompressed format
-    let stride = LineStrideOrSize::LineStrideBytes(7680); // 1920 * 4
-    let c_union: NDIlib_video_frame_v2_t__bindgen_ty_1 = stride.into();
-
-    // Should write only line_stride_in_bytes
-    unsafe {
-        assert_eq!(c_union.line_stride_in_bytes, 7680);
-    }
-}
+// Line stride tests (issue #15)
 
 #[test]
 fn test_video_frame_from_raw_uncompressed_bgra() {
-    use crate::frames::{LineStrideOrSize, PixelFormat};
+    use crate::frames::PixelFormat;
 
     // Test that from_raw reads ONLY line_stride_in_bytes for uncompressed formats
     let test_width = 1920;
@@ -1167,12 +1133,7 @@ fn test_video_frame_from_raw_uncompressed_bgra() {
     unsafe {
         let frame = VideoFrame::from_raw(&c_frame).unwrap();
 
-        // Should have LineStrideBytes variant
-        match frame.line_stride_or_size() {
-            LineStrideOrSize::LineStrideBytes(stride) => {
-                assert_eq!(stride, line_stride);
-            }
-        }
+        assert_eq!(frame.line_stride_bytes(), line_stride as usize);
 
         // Verify data size calculation
         let expected_size = (line_stride * test_height) as usize;
@@ -1222,21 +1183,15 @@ fn test_video_frame_from_raw_unknown_format_returns_error() {
 
 #[test]
 fn test_video_frame_to_raw_roundtrip_uncompressed() {
-    use crate::frames::{LineStrideOrSize, PixelFormat, VideoFrame};
+    use crate::frames::{PixelFormat, VideoFrame};
 
-    // Build a video frame with LineStrideBytes
     let frame = VideoFrame::builder()
         .resolution(1920, 1080)
         .pixel_format(PixelFormat::BGRA)
         .build()
         .unwrap();
 
-    // Verify it has LineStrideBytes
-    match frame.line_stride_or_size() {
-        LineStrideOrSize::LineStrideBytes(stride) => {
-            assert_eq!(stride, 1920 * 4);
-        }
-    }
+    assert_eq!(frame.line_stride_bytes(), 1920 * 4);
 
     // Convert to raw
     let raw = frame.to_raw();
@@ -1249,43 +1204,15 @@ fn test_video_frame_to_raw_roundtrip_uncompressed() {
 
 #[test]
 fn test_video_frame_builder_creates_line_stride_bytes() {
-    use crate::frames::{LineStrideOrSize, PixelFormat, VideoFrame};
+    use crate::frames::{PixelFormat, VideoFrame};
 
-    // All builder-created frames should use LineStrideBytes
     let frame = VideoFrame::builder()
         .resolution(640, 480)
         .pixel_format(PixelFormat::RGBA)
         .build()
         .unwrap();
 
-    match frame.line_stride_or_size() {
-        LineStrideOrSize::LineStrideBytes(stride) => {
-            assert_eq!(stride, 640 * 4);
-        }
-    }
-}
-
-#[test]
-fn test_line_stride_or_size_debug() {
-    use crate::frames::LineStrideOrSize;
-
-    // Test Debug implementation (should not use unsafe)
-    let stride = LineStrideOrSize::LineStrideBytes(7680);
-    let debug_str = format!("{:?}", stride);
-    assert!(debug_str.contains("LineStrideBytes"));
-    assert!(debug_str.contains("7680"));
-}
-
-#[test]
-fn test_line_stride_or_size_equality() {
-    use crate::frames::LineStrideOrSize;
-
-    let stride1 = LineStrideOrSize::LineStrideBytes(7680);
-    let stride2 = LineStrideOrSize::LineStrideBytes(7680);
-    let stride3 = LineStrideOrSize::LineStrideBytes(3840);
-
-    assert_eq!(stride1, stride2);
-    assert_ne!(stride1, stride3);
+    assert_eq!(frame.line_stride_bytes(), 640 * 4);
 }
 
 /// Tests for the lock-free atomic RuntimeManager implementation.

@@ -48,10 +48,19 @@
 //! 3. the platform loader's own search for the library name (`rpath`,
 //!    `LD_LIBRARY_PATH`, `PATH` and the system library directories).
 //!
-//! A directory that does not contain the library is skipped. A library that
-//! cannot be loaded, or that loads but is rejected because it lacks a required
-//! entry point or is not the requested edition, is recorded and the search
-//! moves on to the next location. When nothing is usable,
+//! Each location is tried for the file names of both SDK editions, for
+//! example `libndi.so.6` and `libndi_advanced.so.6` on Linux, unless
+//! [`RuntimeOptions::edition`] asks for one. A build with the `advanced`
+//! feature, or with `file-io` on a platform where the File library needs the
+//! Advanced runtime, tries the Advanced name first at each location, and other
+//! builds the Standard name; where a library is installed matters more than
+//! which edition it is. Nothing installed on the build machine changes the
+//! search.
+//!
+//! A file that is not there is skipped. A library that cannot be loaded, or
+//! that loads but is rejected because it lacks a required entry point or is
+//! not the requested edition, is recorded and the search moves on. When
+//! nothing is usable,
 //! [`Error::RuntimeLoadFailed`] names every location tried and the reason for
 //! each, including the operating system's own.
 //!
@@ -76,9 +85,9 @@ use crate::{
 
 /// Which NDI runtime to select; see [`Runtime::select`].
 ///
-/// The default options search for the runtime library in the
-/// [documented order](crate::runtime#where-the-runtime-is-loaded-from) and ask
-/// for the edition chosen when the crate was built.
+/// The default options search for the runtime library of either edition in
+/// the [documented order](crate::runtime#where-the-runtime-is-loaded-from)
+/// and accept whichever is found first.
 ///
 /// # Examples
 ///
@@ -111,15 +120,14 @@ impl RuntimeOptions {
         self
     }
 
-    /// Search for the runtime library of this SDK edition.
+    /// Search only for the runtime library of this SDK edition.
     ///
     /// Requesting [`SdkEdition::Advanced`] also requires the selected
     /// implementation to export the Advanced SDK entry points. Requesting
     /// [`SdkEdition::Standard`] never rejects an implementation for exporting
-    /// more than the Standard SDK does, so an Advanced runtime meets it.
-    /// Without a request, the edition chosen when the crate was built applies:
-    /// `NDI_SDK_EDITION` if it was set, otherwise Advanced when an Advanced SDK
-    /// was installed, otherwise Standard.
+    /// more than the Standard SDK does, so an Advanced runtime found under the
+    /// Standard file name, or named by [`library_path`](Self::library_path),
+    /// meets it. Without a request, the libraries of both editions are sought.
     ///
     /// A statically linked target has one implementation, the archive linked
     /// at build time, and the same rule decides whether it meets the request.

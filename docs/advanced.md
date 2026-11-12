@@ -18,22 +18,28 @@ Using the module needs three things, in this order:
    ```
 
 2. An NDI Advanced SDK on the machine that builds the crate. The Advanced SDK
-   headers may not be redistributed, so the crate does not contain their
-   declarations. The build script generates them with bindgen from the SDK
-   named by `NDI_SDK_DIR`, or from a default installation directory. That step
-   needs a `libclang` shared library; a build that finds an Advanced SDK and no
-   `libclang` fails.
+   headers may not be redistributed, so the crate does not contain them. Their
+   declarations, types and constants are generated with bindgen at build time
+   from the SDK named by `NDI_SDK_DIR`, or from a default installation
+   directory. The crate itself carries only what it needs to call the SDK: the
+   name and signature of each Advanced function it uses, which the build checks
+   against the generated declarations, and the byte layout of the compressed
+   packet header it reads and writes. The generation step needs a `libclang`
+   shared library; a build that finds an Advanced SDK and no `libclang` fails.
 
-   The build uses the first SDK it finds. On Windows and macOS the Standard
-   SDK's default location is checked before the Advanced SDK's, so when both
-   are installed, name the Advanced SDK in `NDI_SDK_DIR`. An SDK whose
-   `include` directory has no `Processing.NDI.Advanced.h` is a Standard SDK,
-   and a build with it has no Advanced declarations.
+   Without `NDI_SDK_DIR`, the build looks only where the Advanced SDK
+   installer puts the SDK: `/usr/share/NDI Advanced SDK for Linux`,
+   `/Library/NDI Advanced SDK for Apple` or
+   `C:\Program Files\NDI\NDI 6 Advanced SDK`. An SDK whose `include`
+   directory has no `Processing.NDI.Advanced.h` is a Standard SDK, and a build
+   with it has no Advanced declarations.
 
-3. An Advanced SDK runtime selected when the program runs. A build that found
-   an Advanced SDK searches for the Advanced runtime library by default, unless
-   `NDI_SDK_EDITION` says otherwise. If only a Standard runtime is installed,
-   `NDI::new()` then fails with `Error::RuntimeLoadFailed`. See
+3. An Advanced SDK runtime when the program runs. Without an edition request
+   the search accepts either edition and, in a build with this feature, tries
+   the Advanced library first at each location. If it finds only a Standard
+   runtime, `NDI::new()` succeeds and the Advanced operations report
+   `Error::UnsupportedCapability`. Request `SdkEdition::Advanced` to require
+   the Advanced runtime when it is selected. See
    [SDK editions](../README.md#sdk-editions) in the README.
 
 Enabling the feature neither selects an SDK edition nor grants a license

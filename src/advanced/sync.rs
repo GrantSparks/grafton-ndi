@@ -199,7 +199,7 @@ impl AvSync {
     ///
     /// Returns the receiver, untouched, with
     /// [`Error::UnsupportedCapability`] without an Advanced runtime (or in a
-    /// build without the Advanced SDK), or [`Error::InitializationFailed`]
+    /// build without the Advanced SDK), or [`Error::NativeOperationFailed`]
     /// when the SDK creates no synchronizer.
     pub fn new(receiver: Receiver) -> std::result::Result<Self, Rejected<Receiver>> {
         let table = match receiver.core._ndi.table::<AvSyncTable>() {
@@ -213,7 +213,9 @@ impl AvSync {
         });
         if handle.is_null() {
             return Err(Rejected::new(
-                Error::InitializationFailed("AVSync creation failed".into()),
+                Error::NativeOperationFailed {
+                    operation: "NDIlib_avsync_create",
+                },
                 receiver,
             ));
         }
@@ -477,7 +479,7 @@ impl Genlock {
     ///
     /// [`Error::UnsupportedCapability`] without an Advanced runtime (or in a
     /// build without the Advanced SDK), an invalid-string error for a source
-    /// containing NUL, and [`Error::InitializationFailed`] when the SDK
+    /// containing NUL, and [`Error::NativeOperationFailed`] when the SDK
     /// creates no genlock.
     pub fn new(
         ndi: &NDI,
@@ -495,9 +497,9 @@ impl Genlock {
             )
         });
         if handle.is_null() {
-            return Err(Error::InitializationFailed(
-                "Genlock creation failed".into(),
-            ));
+            return Err(Error::NativeOperationFailed {
+                operation: "NDIlib_genlock_create",
+            });
         }
         Ok(Self {
             resource: GenResource {

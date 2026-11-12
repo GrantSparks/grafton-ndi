@@ -1,6 +1,8 @@
 mod common;
 
-use grafton_ndi::{Error, MetadataFrame, Receiver, ReceiverOptions, Sender, SenderOptions};
+use grafton_ndi::{
+    Error, MetadataFrame, Receiver, ReceiverEvent, ReceiverOptions, Sender, SenderOptions,
+};
 use std::time::{Duration, Instant};
 
 fn wait_until(stage: &str, mut condition: impl FnMut() -> bool) {
@@ -40,10 +42,7 @@ fn media_capture_retains_capability_notifications() -> Result<(), Error> {
         let options = ReceiverOptions::builder(source).build();
         let media = Receiver::new(&ndi, &options)?;
         wait_until("initial receiver connection", || media.is_connected());
-        while media
-            .poll_status_change(Duration::from_millis(50))?
-            .is_some()
-        {}
+        while media.poll_event(Duration::from_millis(50))?.is_some() {}
         assert!(!media.ptz_is_supported());
         // Exercise two distinct capability invalidations using the SDK's
         // Send_VirtualPTZ / Send_Capabilities XML conventions. Capability flag
@@ -114,11 +113,17 @@ fn media_capture_retains_capability_notifications() -> Result<(), Error> {
                 }),
             }
             assert!(
-                media.poll_status_change(Duration::ZERO)?.is_some(),
+                matches!(
+                    media.poll_event(Duration::ZERO)?,
+                    Some(ReceiverEvent::StatusChanged(_))
+                ),
                 "capture kind {kind} lost status"
             );
             assert!(
-                media.poll_status_change(Duration::ZERO)?.is_none(),
+                !matches!(
+                    media.poll_event(Duration::ZERO)?,
+                    Some(ReceiverEvent::StatusChanged(_))
+                ),
                 "notification replayed"
             );
         }

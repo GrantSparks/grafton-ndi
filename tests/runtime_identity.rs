@@ -12,7 +12,12 @@ fn provisioned_identity_is_checked_in_the_process_that_loads_the_runtime() {
         return;
     }
     let directory = fixture::FixtureDir::create("identity");
-    let edition = env!("GRAFTON_NDI_EDITION");
+    // Without a request both editions are sought; this build prefers one.
+    let edition = if cfg!(any(feature = "advanced", feature = "file-io")) {
+        "advanced"
+    } else {
+        "standard"
+    };
     let (name, wrong_edition) = if edition == "advanced" {
         ("libndi_advanced.so.6", "standard")
     } else {

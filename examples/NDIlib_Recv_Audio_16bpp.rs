@@ -8,7 +8,7 @@
 //! Optional arguments:
 //! - IP address to search: `cargo run --example NDIlib_Recv_Audio_16bpp -- 192.168.0.110`
 
-use grafton_ndi::{Error, Receiver, ReceiverOptions, NDI};
+use grafton_ndi::{Error, Receiver, ReceiverEvent, ReceiverOptions, NDI};
 
 use std::{
     env,
@@ -82,7 +82,7 @@ fn main() -> Result<(), Error> {
             println!("Meta data received.");
         }
 
-        if let Some(_status) = receiver.poll_status_change(Duration::ZERO)? {
+        if let Some(ReceiverEvent::StatusChanged(_status)) = receiver.poll_event(Duration::ZERO)? {
             println!("Receiver connection status changed.");
         }
 

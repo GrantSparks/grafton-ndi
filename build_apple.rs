@@ -244,8 +244,3 @@ pub fn inspect(path: &Path, arch: &str, os: &str) -> Result<StaticArchive, Strin
         bytes: archive.to_vec(),
     })
 }
-
-#[allow(dead_code)]
-pub fn validate(path: &Path, arch: &str, os: &str) -> Result<u32, String> {
-    inspect(path, arch, os).map(|a| a.deployment_floor)
-}

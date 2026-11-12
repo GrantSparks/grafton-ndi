@@ -59,8 +59,28 @@ pub(crate) fn select(options: &RuntimeOptions) -> Result<&'static Runtime> {
     Ok(runtime)
 }
 
-/// The edition used when [`RuntimeOptions`] names none, fixed by the build.
-pub(crate) fn default_edition() -> SdkEdition {
+/// The editions whose libraries are searched for when [`RuntimeOptions`]
+/// names none, in order of preference at each location.
+///
+/// Every runtime meets a request that names no edition, so both are looked
+/// for. Where both are installed in one place, a build that needs the Advanced
+/// runtime for some of its API prefers it: one with the `advanced` feature, or
+/// with `file-io` where the File library works only beside the Advanced
+/// runtime. Other builds prefer the Standard one. Nothing on the build machine
+/// affects the order.
+#[cfg(not(ndi_link_static))]
+const DEFAULT_SEARCH: [SdkEdition; 2] = if cfg!(any(
+    feature = "advanced",
+    all(feature = "file-io", not(windows))
+)) {
+    [SdkEdition::Advanced, SdkEdition::Standard]
+} else {
+    [SdkEdition::Standard, SdkEdition::Advanced]
+};
+
+/// The edition of the archive linked into this program, chosen by the build.
+#[cfg(ndi_link_static)]
+fn linked_edition() -> SdkEdition {
     if env!("GRAFTON_NDI_EDITION") == "advanced" {
         SdkEdition::Advanced
     } else {
@@ -337,14 +357,30 @@ mod shared {
     }
 
     impl Runtime {
+        /// Search for the runtime library `options` describe: the requested
+        /// edition's file name, or, without a request, the file names of both
+        /// editions at each location.
         pub(in crate::sys) fn load(options: &RuntimeOptions) -> Result<Self> {
-            let requested = options.edition.unwrap_or_else(super::default_edition);
+            let editions = match options.edition {
+                Some(requested) => vec![requested],
+                None => super::DEFAULT_SEARCH.to_vec(),
+            };
+            let names: Vec<&str> = editions
+                .iter()
+                .map(|&edition| library_name(edition))
+                .collect();
+            let description = match options.edition {
+                Some(requested) => format!("{requested:?} runtime"),
+                None => "NDI runtime".to_owned(),
+            };
+            // Without a request any edition is acceptable, as it is for Standard.
+            let requested = options.edition.unwrap_or(SdkEdition::Standard);
             Search {
                 explicit: options.library_path.as_deref(),
                 beside: None,
-                name: library_name(requested),
+                names: &names,
                 anchor: CORE_ANCHOR,
-                description: &format!("{requested:?} runtime"),
+                description: &description,
             }
             .open(|module| Runtime::describe(module, requested))
         }
@@ -378,8 +414,9 @@ mod shared {
         /// The file of an already selected library this one is installed
         /// beside; its directory is searched first.
         pub(in crate::sys) beside: Option<&'a Path>,
-        /// The library's file name on this target.
-        pub(in crate::sys) name: &'a str,
+        /// The library's file names on this target, tried in this order at
+        /// each location.
+        pub(in crate::sys) names: &'a [&'a str],
         /// A symbol the library must define; it identifies the opened module.
         pub(in crate::sys) anchor: &'a CStr,
         /// What is being looked for, as the error names it.
@@ -410,7 +447,7 @@ mod shared {
                 self.beside.and_then(Path::parent),
                 executable.as_deref().and_then(Path::parent),
                 runtime_directory.as_deref(),
-                self.name,
+                self.names,
             );
             let mut failures = Vec::with_capacity(plan.len());
             for candidate in plan {
@@ -551,18 +588,20 @@ mod shared {
         }
     }
 
-    /// The ordered places to look for `name`.
+    /// The ordered places to look for the library under any of `names`.
     ///
     /// An explicit path is exclusive. Otherwise a library installed beside the
     /// one it accompanies wins over one shipped beside the executable, which
     /// wins over an installed runtime, which wins over whatever the platform
-    /// loader finds on its own.
+    /// loader finds on its own. Each location is tried for every name, in
+    /// order, before the next location: where a library is installed matters
+    /// more than which of the names it has.
     pub(super) fn search_plan(
         explicit: Option<&Path>,
         companion_directory: Option<&Path>,
         executable_directory: Option<&Path>,
         runtime_directory: Option<&Path>,
-        name: &str,
+        names: &[&str],
     ) -> Vec<Candidate> {
         if let Some(path) = explicit {
             return vec![Candidate {
@@ -571,6 +610,11 @@ mod shared {
             }];
         }
         let mut plan: Vec<Candidate> = Vec::new();
+        let mut add = |location: PathBuf, origin| {
+            if !plan.iter().any(|earlier| earlier.location == location) {
+                plan.push(Candidate { location, origin });
+            }
+        };
         let directories = [
             (companion_directory, Origin::Companion),
             (executable_directory, Origin::Executable),
@@ -578,22 +622,19 @@ mod shared {
         ];
         for (directory, origin) in directories {
             let Some(directory) = directory else { continue };
-            let location = directory.join(name);
-            if !plan.iter().any(|earlier| earlier.location == location) {
-                plan.push(Candidate { location, origin });
+            for name in names {
+                add(directory.join(name), origin);
             }
         }
         // Application bundles locate their libraries through the run path.
         if cfg!(target_vendor = "apple") {
-            plan.push(Candidate {
-                location: Path::new("@rpath").join(name),
-                origin: Origin::LoaderSearch,
-            });
+            for name in names {
+                add(Path::new("@rpath").join(name), Origin::LoaderSearch);
+            }
         }
-        plan.push(Candidate {
-            location: PathBuf::from(name),
-            origin: Origin::LoaderSearch,
-        });
+        for name in names {
+            add(PathBuf::from(name), Origin::LoaderSearch);
+        }
         plan
     }
 
@@ -772,7 +813,7 @@ mod shared {
                 Some(Path::new("/core")),
                 Some(Path::new("/app")),
                 Some(Path::new("/runtime")),
-                "libndi.so.6",
+                &["libndi.so.6"],
             );
             assert_eq!(
                 locations(&plan),
@@ -787,7 +828,7 @@ mod shared {
                 None,
                 Some(Path::new("/app")),
                 Some(Path::new("/runtime")),
-                "libndi.so.6",
+                &["libndi.so.6"],
             );
             let mut expected = vec![
                 (PathBuf::from("/app/libndi.so.6"), Origin::Executable),
@@ -805,7 +846,7 @@ mod shared {
 
         #[test]
         fn the_loader_search_remains_when_no_directory_is_known() {
-            let plan = search_plan(None, None, None, None, "libndi.so.6");
+            let plan = search_plan(None, None, None, None, &["libndi.so.6"]);
             assert_eq!(
                 plan.last().map(|candidate| candidate.origin),
                 Some(Origin::LoaderSearch)
@@ -822,7 +863,7 @@ mod shared {
                 None,
                 Some(Path::new("/app")),
                 Some(Path::new("/app")),
-                "libndi.so.6",
+                &["libndi.so.6"],
             );
             let bundled = plan
                 .iter()
@@ -838,7 +879,7 @@ mod shared {
                 Some(Path::new("/core")),
                 Some(Path::new("/app")),
                 Some(Path::new("/runtime")),
-                "libndifile.so.6",
+                &["libndifile.so.6"],
             );
             assert_eq!(
                 locations(&plan)[..3],
@@ -855,6 +896,56 @@ mod shared {
                 plan.last().map(|candidate| candidate.origin),
                 Some(Origin::LoaderSearch)
             );
+        }
+
+        #[test]
+        fn every_name_is_tried_at_a_location_before_the_next_location() {
+            let plan = search_plan(
+                None,
+                None,
+                Some(Path::new("/app")),
+                Some(Path::new("/runtime")),
+                &["libndi.so.6", "libndi_advanced.so.6"],
+            );
+            let mut expected = vec![
+                (PathBuf::from("/app/libndi.so.6"), Origin::Executable),
+                (
+                    PathBuf::from("/app/libndi_advanced.so.6"),
+                    Origin::Executable,
+                ),
+                (
+                    PathBuf::from("/runtime/libndi.so.6"),
+                    Origin::RuntimeDirectory,
+                ),
+                (
+                    PathBuf::from("/runtime/libndi_advanced.so.6"),
+                    Origin::RuntimeDirectory,
+                ),
+            ];
+            if cfg!(target_vendor = "apple") {
+                expected.push((PathBuf::from("@rpath/libndi.so.6"), Origin::LoaderSearch));
+                expected.push((
+                    PathBuf::from("@rpath/libndi_advanced.so.6"),
+                    Origin::LoaderSearch,
+                ));
+            }
+            expected.push((PathBuf::from("libndi.so.6"), Origin::LoaderSearch));
+            expected.push((PathBuf::from("libndi_advanced.so.6"), Origin::LoaderSearch));
+            assert_eq!(locations(&plan), expected);
+        }
+
+        #[test]
+        fn without_a_request_both_editions_are_sought_with_the_features_preference_first() {
+            use crate::capabilities::SdkEdition::{Advanced, Standard};
+            let expected = if cfg!(any(
+                feature = "advanced",
+                all(feature = "file-io", not(windows))
+            )) {
+                [Advanced, Standard]
+            } else {
+                [Standard, Advanced]
+            };
+            assert_eq!(super::super::DEFAULT_SEARCH, expected);
         }
 
         #[test]
@@ -913,7 +1004,7 @@ mod linked {
 
         /// The build selected exactly one edition-specific archive.
         pub(super) fn edition(&self, _advanced: AdvancedEntryPoints) -> SdkEdition {
-            super::default_edition()
+            super::linked_edition()
         }
     }
 
@@ -931,7 +1022,7 @@ mod linked {
         /// plays no part here: it is checked against the archive exactly as
         /// against any implementation that is already selected.
         pub(in crate::sys) fn load(_: &RuntimeOptions) -> Result<Self> {
-            Self::describe(Linked, super::default_edition())
+            Self::describe(Linked, super::linked_edition())
                 .map_err(|reason| Error::RuntimeLoadFailed(format!("the linked SDK: {reason}")))
         }
     }

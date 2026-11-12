@@ -5,9 +5,8 @@
 mod common;
 
 use grafton_ndi::{
-    BorrowedVideoFrame, FrameSync, LineStrideOrSize, PixelFormat, Receiver, ReceiverColorFormat,
-    ReceiverOptions, ScanType, Sender, SenderOptions, Source, SourceCache, VideoFrame, VideoPlanes,
-    NDI,
+    BorrowedVideoFrame, FrameSync, PixelFormat, Receiver, ReceiverColorFormat, ReceiverOptions,
+    ScanType, Sender, SenderOptions, Source, SourceCache, VideoFrame, VideoPlanes, NDI,
 };
 use std::{
     sync::{
@@ -30,10 +29,7 @@ fn receiver(ndi: &NDI, source: Source) -> Receiver {
 
 fn verify_owned(frame: &VideoFrame) {
     assert_eq!((frame.width(), frame.height()), (642, 32));
-    assert_eq!(
-        frame.line_stride_or_size(),
-        LineStrideOrSize::LineStrideBytes(2568)
-    );
+    assert_eq!(frame.line_stride_bytes(), 2568);
     assert_eq!(frame.data().len(), 82_176);
     assert_eq!(frame.metadata(), Some("<padding-regression/>"));
     // System calls make uninitialized values observable to Memcheck.
@@ -156,7 +152,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
                 break frame;
             }
         };
-        eprintln!("receiver SDK stride: {:?}", borrowed.line_stride_or_size());
+        eprintln!("receiver SDK stride: {:?}", borrowed.line_stride_bytes());
         assert!(borrowed.data().is_none(), "expected padded SDK output");
         scoped_reads(borrowed.planes());
         let mut active = 0;
@@ -207,7 +203,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
                 "FrameSync did not produce a frame"
             );
             if let Some(frame) = framesync.capture_video(ScanType::Progressive).unwrap() {
-                eprintln!("FrameSync SDK stride: {:?}", frame.line_stride_or_size());
+                eprintln!("FrameSync SDK stride: {:?}", frame.line_stride_bytes());
                 scoped_reads(frame.planes());
                 for plane in frame.planes() {
                     for row in plane.rows() {
@@ -235,10 +231,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
             .metadata()
             .try_capture(Duration::ZERO)
             .unwrap();
-        let _ = framesync
-            .receiver()
-            .poll_status_change(Duration::ZERO)
-            .unwrap();
+        let _ = framesync.receiver().poll_event(Duration::ZERO).unwrap();
         let receiver = framesync.into_receiver();
         verify_owned(&receiver.video().capture(Duration::from_secs(10)).unwrap());
         let mut resend = Sender::new(

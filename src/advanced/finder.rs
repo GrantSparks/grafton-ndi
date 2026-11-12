@@ -79,7 +79,7 @@ impl Finder {
     /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
     /// without an Advanced runtime (or in a build without the Advanced SDK),
     /// an invalid-string error for settings containing NUL, and
-    /// [`Error::InitializationFailed`](crate::Error::InitializationFailed)
+    /// [`Error::NativeOperationFailed`](crate::Error::NativeOperationFailed)
     /// when the SDK creates no finder.
     pub fn new_with_config(
         ndi: &NDI,

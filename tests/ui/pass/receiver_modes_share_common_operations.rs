@@ -7,7 +7,7 @@ fn common<M: ReceiverMode>(receiver: &Receiver<M>) {
     let _ = receiver.source();
     let _ = receiver.audio().try_capture_ref(Duration::ZERO);
     let _ = receiver.metadata().try_capture(Duration::ZERO);
-    let _ = receiver.poll_status_change(Duration::ZERO);
+    let _ = receiver.poll_event(Duration::ZERO);
     let _ = receiver.reconnect();
 }
 fn workflow(receiver: Receiver) {

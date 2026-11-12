@@ -191,9 +191,9 @@ impl Finder {
         // SAFETY: the settings borrow C strings that outlive the call.
         let instance = unsafe { ndi.api().core.NDIlib_find_create_v2(&create_settings) };
         if instance.is_null() {
-            return Err(Error::InitializationFailed(
-                "NDIlib_find_create_v2 failed".into(),
-            ));
+            return Err(Error::NativeOperationFailed {
+                operation: "NDIlib_find_create_v2",
+            });
         }
         Ok(Self {
             instance,
@@ -232,9 +232,9 @@ impl Finder {
             p_extra_ips: extra_ips.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
         });
         if instance.is_null() {
-            return Err(Error::InitializationFailed(
-                "Advanced finder creation failed".into(),
-            ));
+            return Err(Error::NativeOperationFailed {
+                operation: "NDIlib_find_create_v3",
+            });
         }
         Ok(Self {
             instance,
@@ -831,31 +831,12 @@ impl Source {
     /// unrecognized syntax returns `None`.
     ///
     /// For IP-based sources, this returns the IP portion without the port.
-    /// For URL-based sources, this extracts the hostname portion.
+    /// For URL-based sources, this extracts the hostname portion, which may be
+    /// a name such as `camera.local` rather than an IP address.
     ///
     /// # Returns
     ///
-    /// `Some(ip)` if an IP or hostname is found, `None` otherwise.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use grafton_ndi::{Source, SourceAddress};
-    ///
-    /// let source = Source {
-    ///     name: "CAMERA1".to_string(),
-    ///     address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
-    /// };
-    ///
-    /// assert_eq!(source.ip_address(), Some("192.168.1.100"));
-    /// ```
-    pub fn ip_address(&self) -> Option<&str> {
-        self.address.authority().map(|authority| authority.host)
-    }
-
-    /// Extract the hostname or IP without port.
-    ///
-    /// This is an alias for `ip_address()` for better API discoverability.
+    /// `Some(host)` if an IP or hostname is found, `None` otherwise.
     ///
     /// # Examples
     ///
@@ -870,7 +851,7 @@ impl Source {
     /// assert_eq!(source.host(), Some("192.168.1.100"));
     /// ```
     pub fn host(&self) -> Option<&str> {
-        self.ip_address()
+        self.address.authority().map(|authority| authority.host)
     }
 
     /// Copy an SDK source descriptor into owned strings after null checks.
@@ -1093,7 +1074,7 @@ impl SourceCache {
     /// - [`Error::InvalidConfiguration`] if `host` is not a bare hostname or IP,
     ///   or `timeout` exceeds [`crate::MAX_TIMEOUT`]; both are checked before
     ///   the cache is consulted
-    /// - [`Error::InitializationFailed`] if the finder cannot be created
+    /// - [`Error::NativeOperationFailed`] if the finder cannot be created
     ///
     /// # Examples
     ///

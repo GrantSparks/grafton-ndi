@@ -36,8 +36,7 @@ such a change cannot merge without the owner's approval (see
 The semver check ([`semver.py`](semver.py)) runs `cargo semver-checks` with no
 options against the newest release on crates.io. It is skipped while the crate's
 major version is ahead of every published release: a new major version may
-change anything, so the tool would run no lint, and the previous major release
-needs an NDI SDK to build.
+change anything, so the tool would run no lint.
 
 A new push to a pull request cancels its running check. Runs for `main`, manual
 runs and releases are never cancelled. Every job has a timeout, the default
@@ -69,17 +68,19 @@ workflow by the script tests.
 | macos-x64 standard-6.4 | macos-15-intel | x86_64-apple-darwin | current-standard-apple | `1` | `1` | |
 
 On the Linux x64, Windows x64 and macOS ARM64 current Advanced rows, four
-additional runs, with all features, cross the header/runtime boundary in both
-directions: current Advanced headers with each retained baseline runtime, and
-each baseline's headers with the current Advanced runtime. The Linux Standard
+additional runs, with all features, cross versions in both directions: a
+build with the current Advanced headers against each retained baseline
+runtime, and a build from each baseline SDK against the current Advanced
+runtime. A Standard SDK has no headers a build reads, so the Standard
+baseline's build has no Advanced declarations. The Linux Standard
 baseline is 6.1.1; the Windows and macOS Standard baselines and every Advanced
 baseline are 6.3.2. Each compatibility run also starts a peer process on the
 other SDK, under the same network confinement, which sends to a receiver on the
 run's runtime; the test checks video pixels, audio samples, timecodes and
 metadata. A run with a Standard runtime promises `1`, a run with an Advanced
 baseline runtime `advanced`, and a run with the current Advanced runtime the
-row's promise, with `advanced` replaced by `1` when the headers are a Standard
-SDK's. Every run checks the loaded runtime's version, edition and path against
+row's promise, with `advanced` replaced by `1` when the build has no Advanced
+declarations. Every run checks the loaded runtime's version, edition and path against
 the values `sdk.py` exported for it. Advanced operations without matching build
 declarations report unavailable.
 

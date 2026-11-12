@@ -3,10 +3,9 @@ name = "grafton-ndi"
 version = "3.0.0"
 edition = "2021"
 rust-version = "1.88"
-build = "build.rs"
 authors = ["Grant Sparks <grant@grafton.ai>"]
 description = "High-performance Rust bindings for the NDI® 6 SDK - real-time IP video streaming"
-license = "Apache-2.0"
+license = "Apache-2.0 AND MIT"
 repository = "https://github.com/GrantSparks/grafton-ndi"
 homepage = "https://www.grafton.ai"
 documentation = "https://docs.rs/grafton-ndi"
@@ -45,7 +44,7 @@ jpeg-encoder = { version = "0.7.1", optional = true }
 png = { version = "0.18", optional = true }
 
 # Optional dependencies for async runtime integration
-tokio = { version = "1.53.3", optional = true, features = ["rt", "rt-multi-thread", "sync", "macros"] }
+tokio = { version = "1.53.3", optional = true, features = ["rt"] }
 smol = { version = "2.0.2", optional = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -82,6 +81,8 @@ smol = ["dep:smol"]
 ctrlc = "3.5"
 trybuild = "1.0.122"
 syn = { version = "2", features = ["full"] }
+# Doc examples use `#[tokio::main]`; the library itself needs only `rt`.
+tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread"] }
 
 [[example]]
 name = "NDIlib_Recv_PNG"

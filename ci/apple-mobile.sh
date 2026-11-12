@@ -9,24 +9,26 @@ set -euo pipefail
 
 : "${NDI_SDK_DIR:?Set NDI_SDK_DIR to the NDI SDK for Apple}"
 
-# build <toolchain> <target> <Xcode SDK> <deployment variable> <minimum OS> [cargo arguments]
+# build <toolchain> <target> <deployment variable> <minimum OS> [cargo arguments]
+#
+# A library build links nothing, so it needs no Xcode SDK.
 build() {
-  local toolchain=$1 target=$2 sdk=$3 variable=$4 minimum=$5
-  shift 5
+  local toolchain=$1 target=$2 variable=$3 minimum=$4
+  shift 4
   echo "== $target ($toolchain)"
-  env "SDKROOT=$(xcrun --sdk "$sdk" --show-sdk-path)" "$variable=$minimum" \
+  env "$variable=$minimum" \
     cargo "+$toolchain" build --locked --lib --all-features --target "$target" "$@"
 }
 
 rustup target add --toolchain stable \
   aarch64-apple-ios x86_64-apple-ios aarch64-apple-tvos aarch64-apple-visionos
-build stable aarch64-apple-ios iphoneos IPHONEOS_DEPLOYMENT_TARGET 16.0
-build stable x86_64-apple-ios iphonesimulator IPHONEOS_DEPLOYMENT_TARGET 16.0
-build stable aarch64-apple-tvos appletvos TVOS_DEPLOYMENT_TARGET 16.0
-build stable aarch64-apple-visionos xros XROS_DEPLOYMENT_TARGET 1.0
+build stable aarch64-apple-ios IPHONEOS_DEPLOYMENT_TARGET 16.0
+build stable x86_64-apple-ios IPHONEOS_DEPLOYMENT_TARGET 16.0
+build stable aarch64-apple-tvos TVOS_DEPLOYMENT_TARGET 16.0
+build stable aarch64-apple-visionos XROS_DEPLOYMENT_TARGET 1.0
 
 # rustup ships no standard library for the tvOS simulator target, so build one.
 nightly='nightly-2026-11-10'
 rustup toolchain install "$nightly" --profile minimal --component rust-src
-build "$nightly" x86_64-apple-tvos appletvsimulator TVOS_DEPLOYMENT_TARGET 16.0 \
+build "$nightly" x86_64-apple-tvos TVOS_DEPLOYMENT_TARGET 16.0 \
   -Zbuild-std=std,panic_abort

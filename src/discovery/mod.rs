@@ -83,9 +83,10 @@ pub use listener::{
 /// The error for an advertiser or listener the SDK did not create.
 ///
 /// The SDK creates these objects for any address it can parse, reachable or
-/// not, so a refusal is about the address: `server` is the one that was given.
+/// not, so a refusal is about the configuration: `server` is the address that
+/// was given.
 fn not_created(object: &str, server: Option<&str>) -> crate::Error {
-    crate::Error::InitializationFailed(match server {
+    crate::Error::InvalidConfiguration(match server {
         Some(server) => format!(
             "the SDK created no {object}: it does not accept {server:?} as a Discovery Server \
              address"

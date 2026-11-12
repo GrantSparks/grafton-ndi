@@ -10,8 +10,8 @@ Building, linting and documenting the crate need only a Rust toolchain. No NDI
 SDK, `libclang` or bindgen is involved: the bindings in `src/sys` are checked in.
 One exception: with `--all-features`, the `advanced` feature looks for an
 Advanced SDK in `NDI_SDK_DIR` or a default installation directory. When it
-finds one it runs bindgen, which needs `libclang`, and the build then searches
-for the Advanced runtime by default. `NDI_SDK_EDITION` overrides that default.
+finds one it runs bindgen, which needs `libclang`. No SDK on the build machine
+changes which runtime library a program searches for.
 
 Use current stable Rust for development. [rust-toolchain.toml](rust-toolchain.toml)
 selects stable with `clippy`, `rustfmt`, and `rust-src`. The library's minimum Rust
@@ -96,7 +96,7 @@ checkout.
 | `src/rejected.rs`, `src/error.rs` | `Rejected<T>`, the error that hands a consumed value back, and the crate's `Error` |
 | `src/utilities.rs`, `src/video_conversion.rs`, `src/timestamp.rs` | Checked SDK audio/video conversions and SDK timestamps |
 | `src/sys/advanced.rs`, `src/sys/advanced_tables.rs` | The Advanced SDK's function tables, grouped into families, and the one place that depends on which families the installed headers declare |
-| `build.rs`, `build_support.rs`, `build_apple.rs`, `build_advanced.rs` | Default edition, Advanced declarations for the `advanced` feature and the selection of the families they declare, static linking for Apple mobile targets |
+| `build.rs`, `build_support.rs`, `build_apple.rs`, `build_advanced.rs` | Advanced declarations for the `advanced` feature and the selection of the families they declare, static linking for Apple mobile targets |
 | `xtask/` | The generator for the checked-in bindings |
 | `.github/workflows/`, `ci/`, `scripts/` | The CI and release workflows and their scripts; see the [CI guide](ci/README.md) |
 | `src/test_support.rs`, `tests/common/`, `tests/support/` | The skip policy and runtime-identity checks of the tests, shared helpers, and the fake native runtimes the loader tests compile |
@@ -171,8 +171,11 @@ Functions of the File library go in the `native_table!` tables of
 
 Functions that only the Advanced SDK headers declare go in the
 `advanced_tables!` invocation in `src/sys/advanced_tables.rs`. Those headers may
-not be redistributed, so their declarations are generated into `OUT_DIR` on
-machines that have an Advanced SDK and are never checked in. Each entry of the
+not be redistributed. The invocation holds only the name and signature of each
+function the crate calls; the headers' own declarations, types and constants
+are generated into `OUT_DIR` on machines that have an Advanced SDK, are never
+checked in, and are what every signature is checked against when the crate is
+compiled. Each entry of the
 invocation is a family of functions that are used together. The build script
 reads the same file, through `build_advanced.rs`, and makes a family available
 only when the installed headers declare every one of its functions, so an older
@@ -298,8 +301,8 @@ would fail for the original behavior. Useful evidence depends on the change:
 - Loader and capability changes: the search order, a library that is rejected,
   a second selection, missing optional functions, and both sides of a version
   gate.
-- Build changes: the default edition, a missing or invalid `NDI_SDK_DIR`, and
-  static archive selection for Apple mobile targets.
+- Build changes: a missing or invalid `NDI_SDK_DIR` in the builds that read
+  it, and static archive selection for Apple mobile targets.
 - Callback changes: immediate/delayed, concurrent, out-of-order and duplicate
   completion, allocator replacement/reset, late free, panic containment and budgets.
 

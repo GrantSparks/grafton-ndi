@@ -11,7 +11,7 @@
 //! - IP addresses to search: `cargo run --example status_monitor -- 192.168.0.100`
 //! - Source to monitor: `cargo run --example status_monitor -- --source "Camera 1"`
 
-use grafton_ndi::{Receiver, ReceiverBandwidth, ReceiverOptions, NDI};
+use grafton_ndi::{Receiver, ReceiverBandwidth, ReceiverEvent, ReceiverOptions, NDI};
 
 use std::{
     env,
@@ -84,16 +84,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Multiple changes may coalesce; refresh capabilities on each notification.
     // Monitor status changes
     loop {
-        if let Some(status) = receiver.poll_status_change(Duration::from_secs(1))? {
-            println!(
-                "[Status Change] Connections: {} (source capabilities may also have changed)",
-                status.connections
-            );
-            println!("PTZ supported: {}", receiver.ptz_is_supported());
-        } else {
-            // Timeout - could show a heartbeat here
-            print!(".");
-            io::stdout().flush()?;
+        match receiver.poll_event(Duration::from_secs(1))? {
+            Some(ReceiverEvent::StatusChanged(status)) => {
+                println!(
+                    "[Status Change] Connections: {} (source capabilities may also have changed)",
+                    status.connections
+                );
+                println!("PTZ supported: {}", receiver.ptz_is_supported());
+            }
+            Some(_) => {}
+            None => {
+                // Timeout - could show a heartbeat here
+                print!(".");
+                io::stdout().flush()?;
+            }
         }
     }
 }

@@ -328,7 +328,8 @@ class SdkJob(unittest.TestCase):
         steps = [step for step in self.job['steps'] if step.get('if') == 'matrix.compatibility']
         self.assertEqual(len(steps), 2)
         for step in steps:
-            self.assertEqual(step['env']['GRAFTON_NDI_REQUIRE_RUNTIME'], '1')
+            self.assertNotIn('env', step)
+            self.assertIn('export GRAFTON_NDI_REQUIRE_RUNTIME=', step['run'])
             self.assertIn('cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features', step['run'])
             self.assertIn('ndi-compat-$edition.env', step['run'])
             self.assertIn('for edition in standard advanced; do', step['run'])

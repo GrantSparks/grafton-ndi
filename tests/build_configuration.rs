@@ -110,42 +110,18 @@ fn an_sdk_is_optional_but_an_explicit_root_must_be_one() {
 }
 
 #[test]
-fn default_edition_follows_the_request_then_the_installation() {
-    assert_eq!(Edition::parse("standard"), Ok(Edition::Standard));
-    assert_eq!(Edition::parse("advanced"), Ok(Edition::Advanced));
-    for invalid in ["", "auto", "Advanced", "standard "] {
-        assert!(Edition::parse(invalid).is_err(), "{invalid:?}");
-    }
+fn a_static_edition_is_embedded_in_the_spelling_the_loader_reads() {
     assert_eq!(Edition::Standard.as_str(), "standard");
     assert_eq!(Edition::Advanced.as_str(), "advanced");
+}
 
-    assert_eq!(
-        build_support::default_edition(None, None),
-        Edition::Standard
-    );
-    assert_eq!(
-        build_support::default_edition(Some(Edition::Advanced), None),
-        Edition::Advanced
-    );
-
+#[cfg(feature = "advanced")]
+#[test]
+fn an_installation_is_advanced_when_it_has_the_advanced_header() {
     let sdk = Sdk::new("edition");
-    let standard = sdk.located();
-    assert!(!standard.is_advanced());
-    assert_eq!(
-        build_support::default_edition(None, Some(&standard)),
-        Edition::Standard
-    );
+    assert!(!sdk.located().is_advanced());
     sdk.artifact("Include/Processing.NDI.Advanced.h");
-    let advanced = sdk.located();
-    assert!(advanced.is_advanced());
-    assert_eq!(
-        build_support::default_edition(None, Some(&advanced)),
-        Edition::Advanced
-    );
-    assert_eq!(
-        build_support::default_edition(Some(Edition::Standard), Some(&advanced)),
-        Edition::Standard
-    );
+    assert!(sdk.located().is_advanced());
 }
 
 #[cfg(feature = "advanced")]
@@ -183,44 +159,44 @@ fn only_apple_mobile_targets_link_statically() {
 fn mobile_file_is_the_sole_archive_provider_and_old_sdk_remains_usable() {
     let sdk = Sdk::new("mobile-file");
     let core = sdk.artifact("lib/iOS/libndi_ios.a");
-    let selected = build_support::static_library(&sdk.located(), "ios", None, true).unwrap();
+    let selected = build_support::static_library(&sdk.located(), "ios", true).unwrap();
     assert_eq!(selected.archive, core);
     assert_eq!(selected.link_name, "ndi_ios");
     assert_eq!(selected.edition, Edition::Standard);
 
     let file = sdk.artifact("lib/iOS/libndifile_ios.a");
-    let selected = build_support::static_library(&sdk.located(), "ios", None, true).unwrap();
+    let selected = build_support::static_library(&sdk.located(), "ios", true).unwrap();
     assert_eq!(selected.archive, file);
     assert_eq!(selected.link_name, "ndifile_ios");
     // Without the feature the File archive is never linked.
-    let selected = build_support::static_library(&sdk.located(), "ios", None, false).unwrap();
+    let selected = build_support::static_library(&sdk.located(), "ios", false).unwrap();
     assert_eq!(selected.archive, core);
 
-    assert!(build_support::static_library(&sdk.located(), "tvos", None, true).is_err());
-    assert!(build_support::static_library(&sdk.located(), "linux", None, true).is_err());
+    assert!(build_support::static_library(&sdk.located(), "tvos", true).is_err());
+    assert!(build_support::static_library(&sdk.located(), "linux", true).is_err());
 }
 
 #[test]
-fn static_archives_prefer_advanced_unless_an_edition_is_requested() {
+fn the_static_archive_of_the_sdk_decides_the_edition() {
     let sdk = Sdk::new("mobile-edition");
-    let standard = sdk.artifact("lib/tvOS/libndi_tvos.a");
-    let advanced = sdk.artifact("lib/tvOS/libndi_advanced_tvos.a");
     let located = sdk.located();
-    let selected = build_support::static_library(&located, "tvos", None, false).unwrap();
-    assert_eq!(
-        (selected.archive, selected.edition),
-        (advanced, Edition::Advanced)
-    );
-    let selected =
-        build_support::static_library(&located, "tvos", Some(Edition::Standard), false).unwrap();
+    // A File archive alone is not a core archive of either edition.
+    sdk.artifact("lib/tvOS/libndifile_tvos.a");
+    let error = build_support::static_library(&located, "tvos", true).unwrap_err();
+    assert!(error.contains("NDI_SDK_DIR"), "{error}");
+
+    let standard = sdk.artifact("lib/tvOS/libndi_tvos.a");
+    let selected = build_support::static_library(&located, "tvos", false).unwrap();
     assert_eq!(
         (selected.archive, selected.edition),
         (standard, Edition::Standard)
     );
-    fs::remove_file(sdk.root().join("lib/tvOS/libndi_advanced_tvos.a")).unwrap();
-    let error = build_support::static_library(&located, "tvos", Some(Edition::Advanced), false)
-        .unwrap_err();
-    assert!(error.contains("NDI_SDK_DIR"), "{error}");
+    let advanced = sdk.artifact("lib/tvOS/libndi_advanced_tvos.a");
+    let selected = build_support::static_library(&located, "tvos", false).unwrap();
+    assert_eq!(
+        (selected.archive, selected.edition),
+        (advanced, Edition::Advanced)
+    );
 }
 
 #[test]
@@ -355,15 +331,18 @@ fn apple_static_validator_distinguishes_device_from_simulator_not_just_cpu() {
     let p = sdk.artifact("lib/iOS/test.a");
     fs::write(&p, apple_archive(2)).unwrap();
     assert_eq!(
-        build_apple::validate(&p, "aarch64", "ios").unwrap(),
+        build_apple::inspect(&p, "aarch64", "ios")
+            .unwrap()
+            .deployment_floor,
         16 << 16
     );
     fs::write(&p, apple_archive(7)).unwrap();
-    assert!(build_apple::validate(&p, "aarch64", "ios")
+    assert!(build_apple::inspect(&p, "aarch64", "ios")
+        .map(|archive| archive.deployment_floor)
         .unwrap_err()
         .contains("device/simulator"));
     fs::write(&p, &apple_archive(2)[..45]).unwrap();
-    assert!(build_apple::validate(&p, "aarch64", "ios").is_err());
+    assert!(build_apple::inspect(&p, "aarch64", "ios").is_err());
 }
 
 #[test]

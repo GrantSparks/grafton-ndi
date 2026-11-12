@@ -97,14 +97,18 @@ impl Router {
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime has no
     /// [routing support](crate::capabilities::RuntimeFeature::Routing), [`Error::InvalidCString`]
     /// when the name or groups contain a NUL byte, and
-    /// [`Error::InitializationFailed`] when the SDK creates no source.
+    /// [`Error::NativeOperationFailed`] when the SDK creates no source.
     pub fn new(ndi: &NDI, options: &RouterOptions) -> Result<Self> {
         // SAFETY: the closure returns what the SDK's router creation returned,
         // and the settings it is handed outlive that call.
         unsafe {
-            Self::create(ndi, options, None, |routing, settings| {
-                Ok(routing.NDIlib_routing_create(settings))
-            })
+            Self::create(
+                ndi,
+                options,
+                None,
+                "NDIlib_routing_create",
+                |routing, settings| Ok(routing.NDIlib_routing_create(settings)),
+            )
         }
     }
 
@@ -120,6 +124,7 @@ impl Router {
         ndi: &NDI,
         options: &RouterOptions,
         config: Option<CString>,
+        operation: &'static str,
         create: impl FnOnce(
             &'static sys::Routing,
             &NDIlib_routing_create_t,
@@ -136,9 +141,7 @@ impl Router {
             },
         )?;
         if instance.is_null() {
-            return Err(Error::InitializationFailed(
-                "routing source creation failed".into(),
-            ));
+            return Err(Error::NativeOperationFailed { operation });
         }
         Ok(Self {
             instance,
@@ -242,7 +245,15 @@ impl crate::advanced::Configurable for Router {
         create: impl FnOnce(&Self::Settings) -> Result<Self::Instance>,
     ) -> Result<Self> {
         // SAFETY: forwarded to the caller's obligation.
-        unsafe { Self::create(ndi, options, Some(config), |_, settings| create(settings)) }
+        unsafe {
+            Self::create(
+                ndi,
+                options,
+                Some(config),
+                "NDIlib_routing_create_v2",
+                |_, settings| create(settings),
+            )
+        }
     }
 }
 

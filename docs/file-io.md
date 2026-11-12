@@ -6,6 +6,13 @@ library. This guide explains what the module needs, how a recording is
 finished, and the threading rules of its types. The rustdoc of each type is the
 reference.
 
+The module is a supported part of the crate and follows its semantic
+versioning like the rest of the API. Its errors name what went wrong by type
+(`FileError`, and `StateError` for an operation the current state does not
+allow), its public structures can gain fields without a breaking change, and
+its enums are `#[non_exhaustive]`, so later SDK releases can be supported in
+3.x minor versions.
+
 ## Requirements
 
 ```toml
@@ -147,6 +154,9 @@ fn record(file: &FileApi) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match recorder.finish(Duration::from_secs(5))? {
+        FinishStatus::Closed(report) if report.stopped_by_sdk() => {
+            println!("finalized, but the SDK ended the session early: {report:?}")
+        }
         FinishStatus::Closed(report) => println!("closed {} file(s)", report.closed_files()),
         other => println!("not confirmed complete: {other:?}"),
     }
@@ -160,12 +170,16 @@ SDK starts a new file by itself when the options ask for it, for example at a
 size limit. `RecorderOptions` also selects the tracks to record and how files
 are named. `inject_metadata` writes a metadata frame into the recording.
 
-`start` and `rollover` check that the target's directory exists and, on Unix,
-that it is writable before they call the SDK, and return `FileError::Io` when
-it is not. The session, if one is open, goes on.
+Before they call the SDK, `start` and `rollover` work out the file that the
+filename pattern names for the target. Its directory must exist and, on Unix,
+be writable; with an exact file name the file must not exist yet. Otherwise
+they return `FileError::Io`, of kind `AlreadyExists` for an exact file that
+exists, and the session, if one is open, goes on. A pattern can name a
+directory of its own, such as `{prefix}/{index:03}.mkv`; that directory is the
+one checked.
 
-`start` returns `FileError::InvalidState` while a session is recording or
-stopping. A recorder learns that a session ended only from the events it takes,
+`start` returns `FileError::InvalidState(StateError::PreviousSessionOpen)`
+while a session is recording or stopping. A recorder learns that a session ended only from the events it takes,
 so keep calling `poll_event`, or call `finish`, until `state()` is
 `RecorderState::Closed` or `RecorderState::Indeterminate`. A new session can
 then start, including after a session the SDK ended by itself, for example at a
@@ -185,7 +199,32 @@ Other recorder operations:
   keyframe (`with_rollover_size`), whether a format change starts a new file
   (`with_format_change_rollover`), the file name pattern (`exact_filename`,
   `with_pattern`) and whether the source's proxy is recorded alongside its
-  full-quality video (`with_proxy`).
+  full-quality video (`with_proxy`). The options are checked against each
+  other when the recorder is created, so the order of these calls does not
+  matter.
+
+### Exact file names
+
+By default files are indexed: the target `take` becomes `take_001.mkv`, and
+each new file of the session takes the next free index. `exact_filename()`, or
+a `with_pattern` pattern without `{index}` or `{index:N}`, names the file
+exactly instead. One target then names one file, so the session cannot move to
+a new file by itself:
+
+- `start` and `rollover` refuse a target whose file exists, so nothing is ever
+  overwritten. `rollover` to a new target works.
+- A format change of the source closes the file and ends the session, because
+  format-change rollover is off for an exact name unless set.
+  `RecordingReport::stopped_by_sdk` then reports that the SDK ended it.
+- `with_format_change_rollover(true)` or a nonzero `with_rollover_size` is
+  refused with `FileError::InvalidInput` when the recorder is created
+  (`create_recorder`, `reset`, or creating an `AsyncFileRecorder`).
+- `set_source` during a session returns
+  `FileError::InvalidState(StateError::ExactFileName)` without calling the SDK,
+  and the session goes on. Between sessions it works as for any recorder.
+
+Use an indexed pattern for a recording that must survive a format change or a
+change of source.
 
 ### Finishing a recording
 
@@ -198,6 +237,18 @@ a `FinishStatus`:
 | `Closed` | Every file the session opened was reported finalized. |
 | `TimedOut` | The wait ended first. Call `wait_finished` to keep waiting. |
 | `Indeterminate` | The session ended, but its events do not show that every file was finalized. Waiting longer does not change this. |
+
+The wait covers taking the closure's event, not the stop, which the 6.4 SDK
+carries out before `NDIlib_file_recorder_stop` returns. Events already queued
+are taken even when the wait is over, so `finish(Duration::ZERO)` reports
+`Closed` when the SDK finalized the file during the stop.
+
+`Closed` means that the files were finalized. `RecordingReport::stopped_by_sdk`
+says whether the recording ran until you stopped it: it is true when the
+session ended without a stop requested through `request_stop`, `finish`,
+`abandon` or a drop, for example after a new file could not be opened or at a
+format change that does not roll over. Such a session is finalized but shorter
+than intended, and its `error_events` usually say why.
 
 Treat a recording as complete only when the status is `Closed`. Each status
 carries a `RecordingReport` with the number of files closed, the number of
@@ -252,9 +303,11 @@ library, and this crate cannot correct them.
   `RecordingReport::empty_files` counts these files.
 - **A rollover the library cannot carry out ends the session.** The library
   accepts the request, fails to open the new file, closes the old one and
-  stops. `rollover` checks the target's directory first, so the usual mistake
-  is refused and the session goes on. Other causes, such as an exact file name
-  that already exists, still end the session.
+  stops. `rollover` checks the file the pattern names first: a missing or
+  unwritable directory, and an exact file name that already exists, are
+  refused and the session goes on. A file that cannot be opened for another
+  reason, or one created after the check, still ends the session, which
+  `RecordingReport::stopped_by_sdk` then reports.
 
 ## Threads and async code
 
@@ -301,13 +354,19 @@ does not change the recording report. `AsyncFileOptions` and
 
 Await `finish` to learn whether the recording is complete, then await `close`;
 neither blocks the executor. `close` ends the object for every clone, and later
-calls on other clones fail with `FileError::InvalidState`. Dropping the last
-clone instead blocks the dropping thread until the object's thread has
-finished. For a recorder that means stopping an open session, waiting up to the
-drop wait for the file to be finalized, and destroying the recorder. The file
-is then finalized as far as the SDK reported within that wait, but the outcome
-cannot be reported. `AsyncFileRecorder::reset` replaces the native recorder as
-`FileRecorder::reset` does.
+calls on other clones fail with `FileError::InvalidState(StateError::Closed)`.
+`AsyncFileRecorder::reset` replaces the native recorder as `FileRecorder::reset`
+does.
+
+**Dropping the last clone blocks the dropping thread** until the object's
+thread has finished. For a recorder that means stopping an open session,
+waiting up to the drop wait for the file to be finalized, and destroying the
+recorder; for a player, destroying it and removing its source. This is
+deliberate: a file is finalized by the time the drop returns, even when the
+drop happens as the program exits, although the outcome cannot be reported.
+Code that must not block, such as a task on an async executor, awaits `close()`
+before letting the last clone go; once the object is closed, dropping its clones
+does not block.
 
 ## Errors
 
@@ -318,7 +377,7 @@ is `#[non_exhaustive]`:
 | --- | --- |
 | `Unavailable` | The File library, or the part of it an operation needs, cannot be used in this process. The text says why. |
 | `InvalidInput` | A value cannot be represented by the native API, for example a path that is not UTF-8. |
-| `InvalidState` | The operation is not permitted in the current state, for example `start` during an open session, or a call on an async handle that is closing or whose command queue is full. |
+| `InvalidState` | The operation is not permitted in the current state. The `StateError` it carries says which, for example `PreviousSessionOpen` for `start` during an open session, `ExactFileName` for `set_source` during a session with an exact file name, or `QueueFull` and `Closed` for an async handle whose command queue is full or that has been closed. `StateError::is_retryable` is true only for `QueueFull` and `WaiterPending`, which can succeed later without anything else changing. |
 | `Rejected` | The SDK refused an operation; the recorder's or player's events may say more. |
 | `Protocol` | The SDK returned something that violates the expected contract. |
 | `Core` | An operation of the core NDI API failed, or `FileApi::open` was given a relative library path or one that conflicts with the library already selected. |
@@ -328,12 +387,11 @@ is `#[non_exhaustive]`:
 
 The File tests follow the crate's test policy. Those that need the File library
 are skipped, with a message, when it cannot be used, and they make their own
-recordings. To run them on Linux x86_64, build with the Advanced SDK, so that
-the crate searches for the Advanced runtime by default, and select its runtime:
+recordings. To run them on Linux x86_64, point the runtime search at the
+Advanced SDK's runtime; a `file-io` build tries the Advanced library first:
 
 ```sh
-export NDI_SDK_DIR="/path/to/NDI Advanced SDK for Linux"
-export NDI_RUNTIME_DIR_V6="$NDI_SDK_DIR/lib/x86_64-linux-gnu"
+export NDI_RUNTIME_DIR_V6="/path/to/NDI Advanced SDK for Linux/lib/x86_64-linux-gnu"
 GRAFTON_NDI_REQUIRE_RUNTIME=file cargo test --locked --config ci/offline.toml --features file-io
 ```
 

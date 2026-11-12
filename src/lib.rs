@@ -224,8 +224,8 @@ pub use {
     finder::{Finder, FinderOptions, FinderOptionsBuilder, Source, SourceAddress, SourceCache},
     frames::{
         AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout, FormatCategory,
-        LineStrideOrSize, MetadataFrame, MetadataFrameRef, PixelFormat, PixelFormatInfo, ScanType,
-        VideoFrame, VideoFrameBuilder, VideoFrameRef, VideoPlane, VideoPlanes, VideoRows,
+        MetadataFrame, MetadataFrameRef, PixelFormat, PixelFormatInfo, ScanType, VideoFrame,
+        VideoFrameBuilder, VideoFrameRef, VideoPlane, VideoPlanes, VideoRows,
     },
     framesync::{FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncVideoRef},
     receiver::{

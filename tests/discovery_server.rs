@@ -270,7 +270,7 @@ fn creation_does_not_wait_for_the_server() {
             SendListener::new(&ndi, &ListenerOptions::default().server(address).unwrap()).err(),
         ];
         for error in errors {
-            let Some(Error::InitializationFailed(reason)) = error else {
+            let Some(Error::InvalidConfiguration(reason)) = error else {
                 panic!("{address:?}: expected a creation failure, got {error:?}");
             };
             assert!(reason.contains(&format!("{address:?}")), "{reason}");

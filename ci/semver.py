@@ -8,7 +8,7 @@ version in Cargo.toml and every lint applies.
 
 The check is skipped in one case, when the crate's major version is ahead of
 every published release. A new major version may change anything, so the tool
-would run no lint, and it would still have to build the old release first.
+would run no lint.
 """
 import json
 from pathlib import Path

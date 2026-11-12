@@ -22,7 +22,7 @@
 //! - Custom output file: `cargo run --example NDIlib_Recv_PNG -- --output MyImage.png`
 //! - Both: `cargo run --example NDIlib_Recv_PNG -- 192.168.0.100 --output MyImage.png`
 
-use grafton_ndi::{Error, Receiver, ReceiverColorFormat, ReceiverOptions, NDI};
+use grafton_ndi::{Receiver, ReceiverColorFormat, ReceiverOptions, NDI};
 
 use std::{
     env, fs,
@@ -32,7 +32,7 @@ use std::{
 #[path = "common/mod.rs"]
 mod common;
 
-fn main() -> Result<(), Error> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     let mut extra_ips = Vec::new();
     let mut output_file = "CoolNDIImage.png";
@@ -95,11 +95,8 @@ fn main() -> Result<(), Error> {
     println!("  Resolution: {width}x{height}");
     let fourcc = video_frame.pixel_format();
     println!("  Format: {fourcc:?}");
-    match video_frame.line_stride_or_size() {
-        grafton_ndi::LineStrideOrSize::LineStrideBytes(stride) => {
-            println!("  Line stride: {stride} bytes");
-        }
-    }
+    let stride = video_frame.line_stride_bytes();
+    println!("  Line stride: {stride} bytes");
     let data_size = video_frame.data().len();
     println!("  Data size: {data_size} bytes");
     let frame_rate_n = video_frame.frame_rate_n();

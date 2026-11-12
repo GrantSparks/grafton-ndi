@@ -289,9 +289,9 @@ impl FrameSync {
         let instance = create(receiver.core.instance);
         if instance.is_null() {
             // The untouched raw receiver drops normally on creation failure.
-            return Err(Error::InitializationFailed(
-                "Failed to create NDI framesync instance".into(),
-            ));
+            return Err(Error::NativeOperationFailed {
+                operation: "NDIlib_framesync_create",
+            });
         }
         let resource = FrameSyncResource {
             instance,
@@ -644,7 +644,7 @@ pub(crate) mod audio_test_calls {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frames::{AudioFormat, LineStrideOrSize, PixelFormat};
+    use crate::frames::{AudioFormat, PixelFormat};
     use std::ptr;
 
     #[test]
@@ -693,7 +693,9 @@ mod tests {
             drop(ndi);
             assert!(matches!(
                 FrameSync::new_with(receiver, |_| ptr::null_mut()),
-                Err(Error::InitializationFailed(_))
+                Err(Error::NativeOperationFailed {
+                    operation: "NDIlib_framesync_create"
+                })
             ));
         });
         assert_eq!(events, ["receiver"]);
@@ -883,10 +885,7 @@ mod tests {
 
         assert_eq!(frame.metadata(), Some("framesync video"));
         assert_eq!(frame.data().unwrap().len(), expected_len);
-        assert_eq!(
-            frame.line_stride_or_size(),
-            LineStrideOrSize::LineStrideBytes(stride)
-        );
+        assert_eq!(frame.line_stride_bytes(), stride as usize);
         let owned = frame.to_owned().expect("owned conversion");
         assert_eq!(owned.metadata(), Some("framesync video"));
         assert!(format!("{frame:?}").contains("FrameSyncVideoRef"));

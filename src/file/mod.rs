@@ -52,7 +52,8 @@
 //! with a file-closed event. [`FileRecorder::finish`] requests the stop, waits
 //! for that event and returns a [`FinishStatus`]; treat a recording as complete
 //! only when it is [`FinishStatus::Closed`], and inspect the [`RecordingReport`]
-//! for errors during the session. Dropping a recorder whose session is still
+//! for errors during the session. [`RecordingReport::stopped_by_sdk`] says
+//! whether the SDK ended the session before it was asked to stop. Dropping a recorder whose session is still
 //! open performs the same stop and wait, bounded by
 //! [`RecorderOptions::with_drop_wait`], but cannot report the outcome.
 //!
@@ -87,9 +88,11 @@
 //!   lost. [`RecordingReport::empty_files`] counts these files.
 //! * **A rollover the library cannot carry out ends the session.** It accepts
 //!   the request, fails to open the new file, closes the old one and stops.
-//!   [`FileRecorder::rollover`] checks the target's directory first, so the
-//!   usual mistake is refused and the session goes on; other causes, such as
-//!   an exact file name that already exists, still end it.
+//!   [`FileRecorder::rollover`] checks the file its pattern names first, so a
+//!   missing directory or an exact file name that already exists is refused
+//!   and the session goes on; a file that cannot be opened for another reason
+//!   still ends it. An exact file name cannot roll over by itself at all; see
+//!   [`RecorderOptions::exact_filename`].
 //!
 //! # Threads
 //!
@@ -275,8 +278,12 @@ impl FileApi {
     ///
     /// # Errors
     ///
-    /// [`FileError::Rejected`] when the SDK cannot create the recorder and
-    /// [`FileError::Unavailable`] when the library provides no recording.
+    /// [`FileError::InvalidInput`] when the options conflict: an exact file
+    /// name ([`RecorderOptions::exact_filename`], or a pattern without
+    /// `{index}`) with format-change rollover switched on or a nonzero
+    /// rollover size. [`FileError::Rejected`] when the SDK cannot create the
+    /// recorder and [`FileError::Unavailable`] when the library provides no
+    /// recording.
     pub fn create_recorder(&self, options: RecorderOptions) -> FileResult<FileRecorder> {
         FileRecorder::create(self.clone(), options)
     }

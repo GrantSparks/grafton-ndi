@@ -27,7 +27,7 @@ use crate::{
         advanced::{native, ReceiveAllocators},
         bindings::*,
     },
-    LineStrideOrSize, PixelFormat, Receiver, Rejected, Result,
+    PixelFormat, Receiver, Rejected, Result,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -1091,7 +1091,7 @@ fn video_request(frame: &NDIlib_video_frame_v2_t) -> Result<AllocationRequest> {
         PixelFormat::try_from(fourcc).map_err(|_| invalid("Unknown allocator video format"))?;
     let layout =
         crate::frames::ValidatedVideoLayout::new_uncompressed(pixel, frame.xres, frame.yres, None)?;
-    let LineStrideOrSize::LineStrideBytes(stride) = layout.line_stride_or_size;
+    let stride = layout.line_stride_raw;
     Ok(AllocationRequest {
         bytes: layout.data_len_bytes,
         stride,

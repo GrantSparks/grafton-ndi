@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use std::{ffi::NulError, io, time::Duration};
+use std::{ffi::NulError, time::Duration};
 
 /// The main error type for NDI operations.
 ///
@@ -49,6 +49,10 @@ pub enum Error {
     },
 
     /// The native SDK rejected an operation after capability validation.
+    ///
+    /// This includes creating an object: a finder, receiver, sender or other
+    /// object the SDK does not create is reported with `operation` naming the
+    /// creating function.
     #[error("The NDI SDK rejected {operation}")]
     NativeOperationFailed {
         /// Native operation or public action that failed.
@@ -57,11 +61,13 @@ pub enum Error {
 
     /// NDI runtime initialization failed.
     ///
-    /// The SDK rejected initialization, a handle could not be created, or the
-    /// runtime handle reference count was exhausted. A runtime library that
-    /// cannot be loaded is reported as [`Error::RuntimeLoadFailed`] instead,
-    /// and one that does not start because of the CPU as
-    /// [`Error::UnsupportedCpu`].
+    /// Returned only for the runtime itself: the SDK refused to start, or the
+    /// runtime handle reference count was exhausted. A finder, receiver,
+    /// sender or other object the SDK does not create is reported as
+    /// [`Error::NativeOperationFailed`], naming the creating function. A
+    /// runtime library that cannot be loaded is reported as
+    /// [`Error::RuntimeLoadFailed`] instead, and one that does not start
+    /// because of the CPU as [`Error::UnsupportedCpu`].
     #[error("Failed to initialize the NDI runtime: {0}")]
     InitializationFailed(String),
 
@@ -96,26 +102,11 @@ pub enum Error {
     #[error("Invalid frame data: {0}")]
     InvalidFrame(String),
 
-    /// PTZ (Pan-Tilt-Zoom) camera control command failed.
-    #[error("PTZ command failed: {0}")]
-    PtzCommandFailed(String),
-
     /// Configuration parameters are invalid.
     ///
     /// This can occur when builder validation fails or conflicting options are set.
     #[error("Invalid configuration: {0}")]
     InvalidConfiguration(String),
-
-    /// I/O operation failed.
-    #[error(transparent)]
-    Io(#[from] io::Error),
-
-    /// Operation timed out with generic context.
-    ///
-    /// This is a general timeout error. For frame capture timeouts with retry information,
-    /// see [`Error::FrameTimeout`].
-    #[error("Operation timed out: {0}")]
-    Timeout(String),
 
     /// The capture wait budget expired without a frame.
     ///
@@ -145,57 +136,6 @@ pub enum Error {
         attempts: usize,
         /// Total elapsed time during capture attempts
         elapsed: Duration,
-    },
-
-    /// NDI source became unavailable during operation.
-    ///
-    /// This error indicates that an NDI source that was previously available has gone offline
-    /// or become unreachable. This is different from [`Error::NoSourcesFound`] which indicates
-    /// that no matching sources were ever discovered.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use grafton_ndi::Error;
-    /// match some_operation() {
-    ///     Err(Error::SourceUnavailable { source_name }) => {
-    ///         eprintln!("Lost connection to source: {}", source_name);
-    ///         // Could attempt to reconnect or switch to backup source
-    ///     }
-    ///     Err(e) => eprintln!("Other error: {}", e),
-    ///     Ok(_) => println!("Success"),
-    /// }
-    /// # fn some_operation() -> Result<(), Error> { Ok(()) }
-    /// ```
-    #[error("NDI source became unavailable: {source_name}")]
-    SourceUnavailable {
-        /// Name or identifier of the source that became unavailable
-        source_name: String,
-    },
-
-    /// Receiver disconnected from its NDI source.
-    ///
-    /// This error indicates that an active receiver lost its connection to the source.
-    /// The reason field provides additional context about why the disconnection occurred.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use grafton_ndi::Error;
-    /// match some_operation() {
-    ///     Err(Error::Disconnected { reason }) => {
-    ///         eprintln!("Receiver disconnected: {}", reason);
-    ///         // Could implement automatic reconnection logic
-    ///     }
-    ///     Err(e) => eprintln!("Other error: {}", e),
-    ///     Ok(_) => println!("Success"),
-    /// }
-    /// # fn some_operation() -> Result<(), Error> { Ok(()) }
-    /// ```
-    #[error("Receiver disconnected from source: {reason}")]
-    Disconnected {
-        /// Reason for the disconnection
-        reason: String,
     },
 
     /// No NDI sources found matching the specified criteria.

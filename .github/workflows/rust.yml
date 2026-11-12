@@ -77,8 +77,7 @@ jobs:
       - name: Packaged crate builds
         run: cargo package --locked --package grafton-ndi
       # Skipped while the crate's major version is ahead of every published
-      # release: nothing constrains a new major version, and the old release
-      # needs an NDI SDK to build.
+      # release: nothing constrains a new major version.
       - name: Semver check against the last release
         run: python ci/semver.py
       - name: Dependency advisories
@@ -283,11 +282,15 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends bubblewrap libavahi-client3 libclang-dev
+          sudo apt-get install --yes --no-install-recommends bubblewrap libavahi-client3
           # Ubuntu 24.04 denies the unprivileged user namespace that bwrap needs.
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+      # Only the Advanced headers and the bindings check run bindgen.
+      - name: Linux libclang
+        if: runner.os == 'Linux' && (contains(matrix.package, 'advanced') || matrix.bindings)
+        run: sudo apt-get install --yes --no-install-recommends libclang-dev
       - name: 32-bit Linux linker and runtime dependencies
         if: matrix.target == 'i686-unknown-linux-gnu'
         run: |
@@ -295,7 +298,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends gcc-multilib libc6-dev:i386 libavahi-client3:i386
       - name: Windows libclang
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && contains(matrix.package, 'advanced')
         shell: pwsh
         run: |
           if (!(Test-Path 'C:\Program Files\LLVM\bin\clang.exe')) { choco install llvm --version=20.1.8 -y }
@@ -349,8 +352,6 @@ jobs:
 
       - name: Current Advanced headers with baseline runtimes
         if: matrix.compatibility
-        env:
-          GRAFTON_NDI_REQUIRE_RUNTIME: '1'
         run: |
           export GRAFTON_NDI_PEER_RUNTIME="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_RUNTIME }}"
           export GRAFTON_NDI_PEER_VERSION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_VERSION }}"
@@ -358,14 +359,13 @@ jobs:
           for edition in standard advanced; do
             while IFS='=' read -r name value; do export "$name=$value"; done < "$RUNNER_TEMP/ndi-compat-$edition.env"
             export NDI_SDK_DIR="${{ steps.sdk.outputs.NDI_SDK_DIR }}"
-            export NDI_SDK_EDITION="$edition"
             if [ "$edition" = advanced ]; then export GRAFTON_NDI_REQUIRE_RUNTIME=advanced; else export GRAFTON_NDI_REQUIRE_RUNTIME=1; fi
             cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features
           done
-      - name: Baseline headers with the current Advanced runtime
+      # A Standard baseline SDK has no headers a build reads, so its pass is a
+      # build without Advanced declarations.
+      - name: Baseline SDK builds with the current Advanced runtime
         if: matrix.compatibility
-        env:
-          GRAFTON_NDI_REQUIRE_RUNTIME: '1'
         run: |
           for edition in standard advanced; do
             while IFS='=' read -r name value; do export "$name=$value"; done < "$RUNNER_TEMP/ndi-compat-$edition.env"
@@ -376,7 +376,6 @@ jobs:
             export GRAFTON_NDI_EXPECTED_RUNTIME="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_RUNTIME }}"
             export GRAFTON_NDI_EXPECTED_VERSION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_VERSION }}"
             export GRAFTON_NDI_EXPECTED_EDITION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_EDITION }}"
-            export NDI_SDK_EDITION=advanced
             require="${{ matrix.require }}"
             if [ "$edition" = standard ]; then require="${require/advanced/1}"; fi
             export GRAFTON_NDI_REQUIRE_RUNTIME="$require"

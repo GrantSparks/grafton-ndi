@@ -10,7 +10,7 @@ use std::{
 use crate::{
     finder::Source,
     frames::{
-        AudioFrame, LineStrideOrSize, MetadataFrame, PixelFormat, ScanType, ValidatedFrameMetadata,
+        AudioFrame, MetadataFrame, PixelFormat, ScanType, ValidatedFrameMetadata,
         ValidatedVideoLayout, VideoFrame,
     },
     receiver::Tally,
@@ -311,9 +311,9 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         self.data
     }
 
-    /// Get the validated first-plane line stride.
-    pub fn line_stride_or_size(&self) -> LineStrideOrSize {
-        self.layout.line_stride_or_size
+    /// Get the validated first-plane line stride in bytes.
+    pub fn line_stride_bytes(&self) -> usize {
+        self.layout.line_stride_bytes
     }
 
     /// Complete validated storage extent, including row padding.
@@ -388,7 +388,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
             frame_format_type: self.scan_type.into(),
             timecode: self.timecode,
             p_data: self.data.as_ptr() as *mut u8,
-            __bindgen_anon_1: self.layout.line_stride_or_size.into(),
+            __bindgen_anon_1: self.layout.raw_line_stride(),
             p_metadata: self.metadata.map_or(ptr::null(), |m| m.as_ptr()),
             timestamp: self.timestamp,
         }
@@ -554,9 +554,9 @@ impl Sender {
         // SAFETY: the settings borrow C strings that outlive the call.
         let instance = unsafe { ndi.api().core.NDIlib_send_create(&c_settings) };
         if instance.is_null() {
-            Err(Error::InitializationFailed(
-                "Failed to create NDI send instance".into(),
-            ))
+            Err(Error::NativeOperationFailed {
+                operation: "NDIlib_send_create",
+            })
         } else {
             // SAFETY: Creation returned a fresh native instance owned by this call.
             Ok(unsafe { Self::from_native(ndi, instance, name_cstr, groups_cstr, None) })
@@ -897,7 +897,7 @@ impl Sender {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Timeout`] if the SDK returns a negative value (indicating timeout or error).
+    /// Returns [`Error::NativeOperationFailed`] if the SDK returns a negative connection count.
     /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
     ///
     /// # Examples
@@ -927,7 +927,9 @@ impl Sender {
         };
 
         if count < 0 {
-            Err(Error::Timeout("Failed to obtain connection count".into()))
+            Err(Error::NativeOperationFailed {
+                operation: "NDIlib_send_get_no_connections",
+            })
         } else {
             Ok(count as u32)
         }

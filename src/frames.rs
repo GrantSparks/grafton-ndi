@@ -426,31 +426,6 @@ impl From<ScanType> for i32 {
     }
 }
 
-/// First-plane line stride for the supported uncompressed video formats.
-/// Compressed and opaque payloads are not represented by safe frame types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LineStrideOrSize {
-    /// Line stride in bytes for uncompressed formats.
-    /// This is the number of bytes per row of video data.
-    LineStrideBytes(i32),
-}
-
-impl From<LineStrideOrSize> for NDIlib_video_frame_v2_t__bindgen_ty_1 {
-    fn from(value: LineStrideOrSize) -> Self {
-        // Writing to a union field is safe when the field type implements Copy.
-        // We write exactly one field of the union based on the enum variant.
-        match value {
-            LineStrideOrSize::LineStrideBytes(stride) =>
-            {
-                #[allow(clippy::field_reassign_with_default)]
-                NDIlib_video_frame_v2_t__bindgen_ty_1 {
-                    line_stride_in_bytes: stride,
-                }
-            }
-        }
-    }
-}
-
 /// Establish the sendability invariant without coupling layout calculations to NDI.
 /// Baseline formats never acquire a runtime reference.
 pub(crate) fn validate_video_format_runtime(
@@ -500,7 +475,7 @@ impl fmt::Debug for VideoFrame {
             .field("scan_type", &self.scan_type)
             .field("timecode", &self.timecode)
             .field("data (bytes)", &self.data.len())
-            .field("line_stride_or_size", &self.line_stride_or_size())
+            .field("line_stride_bytes", &self.line_stride_bytes())
             .field("metadata", &self.metadata())
             .field("timestamp", &self.timestamp)
             .finish()
@@ -541,7 +516,7 @@ impl VideoFrame {
             frame_format_type: self.scan_type.into(),
             timecode: self.timecode,
             p_data: self.data.as_ptr() as *mut u8,
-            __bindgen_anon_1: self.layout.line_stride_or_size.into(),
+            __bindgen_anon_1: self.layout.raw_line_stride(),
             p_metadata: self
                 .metadata
                 .as_ref()
@@ -619,9 +594,9 @@ impl VideoFrame {
         self.timestamp
     }
 
-    /// Get the validated line stride or data size union field.
-    pub fn line_stride_or_size(&self) -> LineStrideOrSize {
-        self.layout.line_stride_or_size
+    /// Get the validated first-plane line stride in bytes.
+    pub fn line_stride_bytes(&self) -> usize {
+        self.layout.line_stride_bytes
     }
 
     pub(crate) fn validated_layout(&self) -> ValidatedVideoLayout {
@@ -745,7 +720,7 @@ impl VideoFrame {
     /// ```no_run
     /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptions, Receiver, ReceiverColorFormat};
     /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// # finder.wait_for_sources(Duration::from_millis(1000))?;
@@ -797,7 +772,7 @@ impl VideoFrame {
     /// ```no_run
     /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptions, Receiver, ReceiverColorFormat};
     /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let ndi = NDI::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// # finder.wait_for_sources(Duration::from_millis(1000))?;
@@ -1131,13 +1106,6 @@ impl Default for VideoFrameBuilder {
     }
 }
 
-impl Drop for VideoFrame {
-    fn drop(&mut self) {
-        // With owned data, we don't need to free SDK pointers anymore
-        // The Vec<u8> handles memory cleanup automatically
-    }
-}
-
 /// Owned, tightly packed planar floating-point audio with a validated layout.
 ///
 /// Channel samples are contiguous, with channels stored one after another.
@@ -1349,7 +1317,6 @@ pub struct AudioFrameBuilder {
     num_channels: Option<i32>,
     num_samples: Option<i32>,
     timecode: Option<i64>,
-    format: Option<AudioFormat>,
     data: Option<Vec<f32>>,
     layout: Option<AudioLayout>,
     metadata: Option<String>,
@@ -1364,7 +1331,6 @@ impl AudioFrameBuilder {
             num_channels: None,
             num_samples: None,
             timecode: None,
-            format: None,
             data: None,
             layout: None,
             metadata: None,
@@ -1397,13 +1363,6 @@ impl AudioFrameBuilder {
     #[must_use]
     pub fn timecode(mut self, tc: i64) -> Self {
         self.timecode = Some(tc);
-        self
-    }
-
-    /// Set the audio format
-    #[must_use]
-    pub fn format(mut self, format: AudioFormat) -> Self {
-        self.format = Some(format);
         self
     }
 
@@ -1470,7 +1429,7 @@ impl AudioFrameBuilder {
         let sample_rate = self.sample_rate.unwrap_or(48000);
         let num_channels = self.num_channels.unwrap_or(2);
         let num_samples = self.num_samples.unwrap_or(1024);
-        let format = self.format.unwrap_or(AudioFormat::FLTP);
+        let format = AudioFormat::FLTP;
         let layout = self.layout.unwrap_or(AudioLayout::Planar);
         let timecode = self.timecode.unwrap_or(NDIlib_send_timecode_synthesize);
         let audio_layout =
@@ -1545,13 +1504,6 @@ impl Default for AudioFrame {
         AudioFrame::builder()
             .build()
             .expect("Default AudioFrame should always succeed")
-    }
-}
-
-impl Drop for AudioFrame {
-    fn drop(&mut self) {
-        // With owned data, we don't need to free SDK pointers anymore
-        // The Vec<f32> handles memory cleanup automatically
     }
 }
 
@@ -2406,8 +2358,10 @@ pub(crate) struct ValidatedVideoLayout {
     payload_len_bytes: usize,
     plane_layouts: [VideoPlaneLayout; MAX_VIDEO_PLANES],
     plane_count: usize,
-    /// The validated first-plane SDK line stride.
-    pub line_stride_or_size: LineStrideOrSize,
+    /// The validated first-plane line stride in bytes.
+    pub line_stride_bytes: usize,
+    /// The same stride as the SDK's `i32` field, validated to fit.
+    pub line_stride_raw: i32,
 }
 
 impl ValidatedVideoLayout {
@@ -2477,8 +2431,16 @@ impl ValidatedVideoLayout {
             payload_len_bytes,
             plane_layouts,
             plane_count,
-            line_stride_or_size: LineStrideOrSize::LineStrideBytes(line_stride_i32),
+            line_stride_bytes: line_stride_usize,
+            line_stride_raw: line_stride_i32,
         })
+    }
+
+    /// The SDK union carrying the first-plane line stride.
+    pub(crate) fn raw_line_stride(&self) -> NDIlib_video_frame_v2_t__bindgen_ty_1 {
+        NDIlib_video_frame_v2_t__bindgen_ty_1 {
+            line_stride_in_bytes: self.line_stride_raw,
+        }
     }
 
     fn planes(&self) -> &[VideoPlaneLayout] {
@@ -3404,11 +3366,11 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
         self.guard.frame().timestamp
     }
 
-    /// Get the line stride or data size.
+    /// Get the validated first-plane line stride in bytes.
     ///
     /// This returns the cached, validated value computed at construction time.
-    pub fn line_stride_or_size(&self) -> LineStrideOrSize {
-        self.layout.line_stride_or_size
+    pub fn line_stride_bytes(&self) -> usize {
+        self.layout.line_stride_bytes
     }
 
     /// Get frame metadata as UTF-8 text, if present.
@@ -3505,7 +3467,7 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> fmt::Debug for VideoR
             .field("scan_type", &self.scan_type())
             .field("timecode", &self.timecode())
             .field("active data (bytes)", &self.layout.payload_len_bytes)
-            .field("line_stride_or_size", &self.line_stride_or_size())
+            .field("line_stride_bytes", &self.line_stride_bytes())
             .field("metadata", &self.metadata())
             .field("timestamp", &self.timestamp())
             .finish()
@@ -4350,10 +4312,7 @@ mod tests {
                 assert_eq!(owned.data(), expected);
                 assert_eq!(raw_owned.data(), expected);
                 assert_eq!(owned.pixel_format(), format);
-                assert_eq!(
-                    owned.line_stride_or_size(),
-                    LineStrideOrSize::LineStrideBytes(dimensions[0].0 as i32)
-                );
+                assert_eq!(owned.line_stride_bytes(), dimensions[0].0);
                 assert_eq!(owned.metadata(), Some("<video-padding/>"));
                 assert_eq!((owned.frame_rate_n(), owned.frame_rate_d()), (30000, 1001));
                 assert_eq!(owned.picture_aspect_ratio(), 1.25);
@@ -4415,10 +4374,7 @@ mod tests {
                     .unwrap();
                 let normalized = send.try_to_owned().unwrap();
                 assert_eq!(normalized.data(), expected);
-                assert_eq!(
-                    normalized.line_stride_or_size(),
-                    copied.line_stride_or_size()
-                );
+                assert_eq!(normalized.line_stride_bytes(), copied.line_stride_bytes());
                 assert_eq!(normalized.metadata(), Some("<video-padding/>"));
             }
         }
@@ -4578,10 +4534,7 @@ mod tests {
         assert!(frame.data().is_none());
         let owned = frame.to_owned().unwrap();
         assert_eq!(owned.data().len(), 82_176);
-        assert_eq!(
-            owned.line_stride_or_size(),
-            LineStrideOrSize::LineStrideBytes(2568)
-        );
+        assert_eq!(owned.line_stride_bytes(), 2568);
         assert!(owned.data().iter().all(|&byte| byte == 17));
     }
 
@@ -5518,11 +5471,7 @@ mod tests {
                 .build()
                 .expect("Builder should succeed");
 
-            assert_eq!(
-                frame.line_stride_or_size(),
-                LineStrideOrSize::LineStrideBytes(256 * 2),
-                "{format:?} line stride"
-            );
+            assert_eq!(frame.line_stride_bytes(), 256 * 2, "{format:?} line stride");
             assert_eq!(frame.data().len(), expected_len, "{format:?} buffer size");
         }
     }
@@ -5848,11 +5797,11 @@ mod tests {
             "data() should use validated pixel format for size calculation"
         );
 
-        // Verify line_stride_or_size() uses validated format
+        // Verify line_stride_bytes() uses validated format
         assert_eq!(
-            frame_ref.line_stride_or_size(),
-            LineStrideOrSize::LineStrideBytes(stride),
-            "line_stride_or_size() should use validated format"
+            frame_ref.line_stride_bytes(),
+            stride as usize,
+            "line_stride_bytes() should use validated format"
         );
     }
 
@@ -5917,7 +5866,7 @@ mod tests {
         assert_eq!(recv.scan_type(), ScanType::Interlaced);
         assert_eq!(recv.timecode(), fs.timecode());
         assert_eq!(recv.timestamp(), fs.timestamp());
-        assert_eq!(recv.line_stride_or_size(), fs.line_stride_or_size());
+        assert_eq!(recv.line_stride_bytes(), fs.line_stride_bytes());
         assert_eq!(recv.metadata(), fs.metadata());
         assert_eq!(recv.data(), fs.data());
     }
@@ -6793,10 +6742,8 @@ mod tests {
         let layout = result.unwrap();
         assert_eq!(layout.pixel_format, PixelFormat::BGRA);
         assert_eq!(layout.data_len_bytes, expected_size);
-        assert_eq!(
-            layout.line_stride_or_size,
-            LineStrideOrSize::LineStrideBytes(stride)
-        );
+        assert_eq!(layout.line_stride_raw, stride);
+        assert_eq!(layout.line_stride_bytes, stride as usize);
     }
 
     /// Test validate_video_layout accepts the first-plane strides the SDK
@@ -6836,10 +6783,8 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{format:?} stride {stride} rejected: {e}"));
             assert_eq!(layout.pixel_format, format);
             assert_eq!(layout.data_len_bytes, expected_size, "{format:?}");
-            assert_eq!(
-                layout.line_stride_or_size,
-                LineStrideOrSize::LineStrideBytes(stride)
-            );
+            assert_eq!(layout.line_stride_raw, stride);
+            assert_eq!(layout.line_stride_bytes, stride as usize);
         }
     }
 
@@ -6964,10 +6909,8 @@ mod tests {
         };
         let layout = validate_video_layout(&raw).unwrap();
         assert_eq!(layout.data_len_bytes, data.len());
-        assert_eq!(
-            layout.line_stride_or_size,
-            LineStrideOrSize::LineStrideBytes(64)
-        );
+        assert_eq!(layout.line_stride_raw, 64);
+        assert_eq!(layout.line_stride_bytes, 64);
         let owned = unsafe { VideoFrame::from_raw(&raw) }.unwrap();
         assert_eq!(owned.data().len(), data.len());
     }

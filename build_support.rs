@@ -1,8 +1,8 @@
 //! SDK discovery and static-archive selection, shared by the build script and its tests.
 //!
-//! Dynamically loaded targets need none of this to build: an SDK found here only
-//! chooses the default runtime edition and, with the `advanced` feature, supplies
-//! the Advanced-only headers. Statically linked Apple targets link its archive.
+//! Dynamically loaded targets need none of this to build: an SDK found here
+//! only supplies the Advanced-only headers, with the `advanced` feature.
+//! Statically linked Apple targets link its archive.
 
 use std::{
     collections::{BTreeSet, HashSet},
@@ -10,6 +10,7 @@ use std::{
 };
 
 /// The header only an Advanced SDK installation contains.
+#[cfg(feature = "advanced")]
 const ADVANCED_HEADER: &str = "Processing.NDI.Advanced.h";
 
 /// The umbrella header every SDK installation contains.
@@ -19,7 +20,7 @@ const UMBRELLA_HEADER: &str = "Processing.NDI.Lib.h";
 #[cfg(feature = "advanced")]
 const MIT_GRANT: &str = "Permission is hereby granted, free of charge";
 
-/// An SDK edition, as named by `NDI_SDK_EDITION` and the crate's runtime options.
+/// The edition of a static archive, which the statically linked runtime reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Edition {
     Standard,
@@ -27,17 +28,6 @@ pub enum Edition {
 }
 
 impl Edition {
-    /// Parse the value of `NDI_SDK_EDITION`.
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "standard" => Ok(Self::Standard),
-            "advanced" => Ok(Self::Advanced),
-            _ => Err(format!(
-                "Invalid NDI_SDK_EDITION {value:?}; expected standard or advanced"
-            )),
-        }
-    }
-
     /// The spelling embedded into the crate.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -91,28 +81,15 @@ pub fn directory(root: &Path, lowercase: &str, uppercase: &str) -> Result<PathBu
     Ok(selected.clone())
 }
 
-/// The roots the vendor installers use on `os`, in order of preference.
+/// Where the vendor's Advanced SDK installers put the SDK on `os`.
+///
+/// Only a build with the `advanced` feature looks for an SDK it was not given,
+/// and only an Advanced SDK has anything such a build uses.
 pub fn default_sdk_roots(os: &str) -> &'static [&'static str] {
     match os {
-        "macos" => &[
-            "/Library/NDI SDK for macOS",
-            "/Library/NDI SDK for Apple",
-            "/Library/NDI Advanced SDK for Apple",
-            "/Library/NDI 6 SDK",
-            "/Library/NDI SDK",
-            "/Library/NewTek/NDI SDK",
-            "/Library/Application Support/NDI SDK for Apple",
-            "/Applications/NDI SDK for Apple",
-            "/Applications/NDI 6 SDK",
-        ],
-        "linux" => &[
-            "/usr/share/NDI Advanced SDK for Linux",
-            "/usr/share/NDI SDK for Linux",
-        ],
-        "windows" => &[
-            r"C:\Program Files\NDI\NDI 6 SDK",
-            r"C:\Program Files\NDI\NDI 6 Advanced SDK",
-        ],
+        "macos" => &["/Library/NDI Advanced SDK for Apple"],
+        "linux" => &["/usr/share/NDI Advanced SDK for Linux"],
+        "windows" => &[r"C:\Program Files\NDI\NDI 6 Advanced SDK"],
         _ => &[],
     }
 }
@@ -156,21 +133,15 @@ impl Sdk {
     }
 
     /// Whether this is an Advanced SDK installation.
+    #[cfg(feature = "advanced")]
     pub fn is_advanced(&self) -> bool {
         self.include_dir.join(ADVANCED_HEADER).is_file()
     }
 
-    /// The installation's own edition.
-    pub fn edition(&self) -> Edition {
-        if self.is_advanced() {
-            Edition::Advanced
-        } else {
-            Edition::Standard
-        }
-    }
-
-    /// File names of the headers without the MIT grant. Their declarations may
-    /// be generated for the local build but never checked in.
+    /// File names of the headers without the MIT grant. They and the
+    /// declarations generated from them stay on the build machine; only the
+    /// signatures of the functions the crate calls are checked in, in
+    /// `src/sys/advanced_tables.rs`.
     #[cfg(feature = "advanced")]
     pub fn restricted_headers(&self) -> Result<Vec<String>, String> {
         let read_error = |error| format!("Cannot read {}: {error}", self.include_dir.display());
@@ -195,16 +166,6 @@ impl Sdk {
     }
 }
 
-/// The runtime edition the crate searches for by default.
-///
-/// An explicit request wins; otherwise the located installation decides, and
-/// with neither the Standard runtime is assumed.
-pub fn default_edition(requested: Option<Edition>, sdk: Option<&Sdk>) -> Edition {
-    requested
-        .or_else(|| sdk.map(Sdk::edition))
-        .unwrap_or(Edition::Standard)
-}
-
 /// Whether `os` links the SDK into the application instead of loading it.
 pub fn links_statically(os: &str) -> bool {
     matches!(os, "ios" | "tvos" | "visionos")
@@ -220,14 +181,11 @@ pub struct StaticLibrary {
 
 /// Select the one archive to link for a static Apple target.
 ///
-/// A mobile File archive already contains the core, so it replaces the core
+/// Each vendor SDK holds one core archive, Standard or Advanced, so the SDK
+/// decides the edition; a directory holding both links the Advanced one. A
+/// mobile File archive already contains the core, so it replaces the core
 /// archive instead of being linked beside it.
-pub fn static_library(
-    sdk: &Sdk,
-    os: &str,
-    requested: Option<Edition>,
-    file_io: bool,
-) -> Result<StaticLibrary, String> {
+pub fn static_library(sdk: &Sdk, os: &str, file_io: bool) -> Result<StaticLibrary, String> {
     let (subdirectory, platform) = match os {
         "ios" => ("iOS", "ios"),
         "tvos" => ("tvOS", "tvos"),
@@ -241,7 +199,6 @@ pub fn static_library(
         (Edition::Standard, format!("ndi_{platform}")),
     ]
     .into_iter()
-    .filter(|(edition, _)| requested.is_none_or(|requested| requested == *edition))
     .find(|(_, name)| archive(name).is_file())
     .ok_or_else(|| {
         format!(

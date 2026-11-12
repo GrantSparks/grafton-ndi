@@ -280,7 +280,7 @@ fn child(scenario: &str) {
                 &ListenerOptions::default(),
             );
             for ((_, name), error) in DISCOVERY_SERVER.into_iter().zip(errors) {
-                let Some(Error::InitializationFailed(reason)) = error else {
+                let Some(Error::InvalidConfiguration(reason)) = error else {
                     panic!("{name}: expected a creation failure, got {error:?}");
                 };
                 assert!(

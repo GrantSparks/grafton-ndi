@@ -863,7 +863,7 @@ impl SendListener {
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime
     /// cannot provide [sender discovery], which needs NDI 6.4.0 or later;
     /// [`Error::InvalidCString`] when the endpoint contains a NUL byte; and
-    /// [`Error::InitializationFailed`] when the SDK creates no listener. It
+    /// [`Error::InvalidConfiguration`] when the SDK creates no listener. It
     /// creates none for an address it cannot parse, and none when `options`
     /// name no server and the NDI configuration supplies none.
     ///
@@ -921,7 +921,7 @@ impl RecvListener {
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime
     /// cannot provide [receiver discovery], which needs NDI 6.4.0 or later;
     /// [`Error::InvalidCString`] when the endpoint contains a NUL byte; and
-    /// [`Error::InitializationFailed`] when the SDK creates no listener. It
+    /// [`Error::InvalidConfiguration`] when the SDK creates no listener. It
     /// creates none for an address it cannot parse, and none when `options`
     /// name no server and the NDI configuration supplies none.
     ///

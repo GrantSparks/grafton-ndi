@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use grafton_ndi::{Error, Receiver, ReceiverOptions, NDI};
+use grafton_ndi::{Error, Receiver, ReceiverEvent, ReceiverOptions, NDI};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -57,8 +57,10 @@ fn main() -> Result<(), Error> {
     // Run for 30 seconds
     let start = Instant::now();
     while !exit_loop.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(30) {
-        // Use poll_status_change to check for status changes
-        if let Some(_status) = receiver.poll_status_change(Duration::from_secs(1))? {
+        // Use poll_event to check for status changes
+        if let Some(ReceiverEvent::StatusChanged(_status)) =
+            receiver.poll_event(Duration::from_secs(1))?
+        {
             // Check PTZ support on status change
             if receiver.ptz_is_supported() {
                 println!("This source supports PTZ functionality. Moving to preset #3.");

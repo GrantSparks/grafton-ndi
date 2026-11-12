@@ -14,11 +14,9 @@ target="${1:?Usage: scripts/build-android.sh <Rust Android target>}"
 case "$target" in
   aarch64-linux-android|i686-linux-android|x86_64-linux-android)
     clang_target="$target"
-    header_target="$target"
     ;;
   armv7-linux-androideabi)
     clang_target=armv7a-linux-androideabi
-    header_target=arm-linux-androideabi
     ;;
   *) echo "Unsupported Android target: $target" >&2; exit 1 ;;
 esac
@@ -36,11 +34,5 @@ if [ ! -x "$linker" ]; then
 fi
 linker_var="CARGO_TARGET_$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')_LINKER"
 export "$linker_var=$linker"
-# Only the Advanced headers are parsed at build time. The API level is selected
-# through Clang's target, because redefining __ANDROID_API__ conflicts with the
-# Android driver's built-in macro. The paths stay quoted for bindgen's shell-word
-# parser: SDK and NDK directories may contain spaces.
-bindgen_var="BINDGEN_EXTRA_CLANG_ARGS_${target//-/_}"
-export "$bindgen_var=--target=${clang_target}${api} --sysroot=\"$toolchain/sysroot\" -isystem \"$toolchain/sysroot/usr/include/$header_target\""
 rustup target add "$target"
 cargo build --locked --examples --all-features --target "$target"

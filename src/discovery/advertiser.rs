@@ -421,7 +421,7 @@ impl SendAdvertiser {
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime
     /// cannot provide [sender advertising], which needs NDI 6.4.0 or later;
     /// [`Error::InvalidCString`] when the server list contains a NUL byte; and
-    /// [`Error::InitializationFailed`] when the SDK creates no advertiser. It
+    /// [`Error::InvalidConfiguration`] when the SDK creates no advertiser. It
     /// creates none for an address it cannot parse, and none when `options`
     /// name no server and the NDI configuration supplies none.
     ///
@@ -502,7 +502,7 @@ impl RecvAdvertiser {
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime
     /// cannot provide [receiver advertising], which needs NDI 6.4.0 or later;
     /// [`Error::InvalidCString`] when the server list contains a NUL byte; and
-    /// [`Error::InitializationFailed`] when the SDK creates no advertiser. It
+    /// [`Error::InvalidConfiguration`] when the SDK creates no advertiser. It
     /// creates none for an address it cannot parse, and none when `options`
     /// name no server and the NDI configuration supplies none.
     ///

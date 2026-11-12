@@ -73,7 +73,7 @@ iOS, tvOS and visionOS targets link the vendor's static archive into the applica
 - The build links the archive for the target from the SDK's `lib/iOS`, `lib/tvOS` or `lib/visionOS` directory, together with the system frameworks it needs. With `file-io`, the File archive is linked in its place when the SDK supplies one.
 - The archive must contain a slice for the target's CPU and platform. In the NDI SDK for Apple 6.4 the arm64 slices are device builds and the x86_64 slices are simulator builds.
 - The 6.4 archives need iOS 16.0, tvOS 16.0 or visionOS 1.0. If `IPHONEOS_DEPLOYMENT_TARGET`, `TVOS_DEPLOYMENT_TARGET` or `XROS_DEPLOYMENT_TARGET` is set below the minimum the archive was built for, the build fails.
-- The edition is fixed by the archive. `RuntimeOptions::library_path` is rejected with `Error::RuntimeConflict`, and selecting the runtime loads nothing.
+- The edition is that of the SDK: an NDI Advanced SDK for Apple links its Advanced archive, an NDI SDK for Apple its Standard one. `RuntimeOptions::library_path` is rejected with `Error::RuntimeConflict`, and selecting the runtime loads nothing.
 
 ## What It Covers
 
@@ -160,7 +160,9 @@ The runtime library is loaded when the program selects a runtime, not when the p
 2. The directory named by the `NDI_RUNTIME_DIR_V6` environment variable. This is the variable the NDI SDK itself uses for the runtime directory.
 3. The platform loader's own search for the library name: the executable's run path, `LD_LIBRARY_PATH` or `PATH`, and the system library directories. On macOS the name is first tried as `@rpath/<name>`.
 
-A directory that does not contain the library is skipped. A library that cannot be loaded, that lacks a function every NDI 6 runtime exports, or that is not the requested edition is rejected, and the search continues.
+Each location is tried for the library of either SDK edition, under the file names below, before the search moves to the next location. A build with the `advanced` feature, or with `file-io` on Linux, macOS or Android, where the File library needs the Advanced runtime, tries the Advanced name first at each location; other builds try the Standard name first. A program that needs one edition can ask for it; see [SDK editions](#sdk-editions). What is installed on the build machine plays no part.
+
+A file that is not there is skipped. A library that cannot be loaded, that lacks a function every NDI 6 runtime exports, or that is not the requested edition is rejected, and the search continues.
 
 The library file names are:
 
@@ -185,7 +187,7 @@ println!("loaded {:?}", ndi.info().library_path());
 When no usable library is found, `NDI::new()` returns `Error::RuntimeLoadFailed`. Its message names every location tried and the operating system's reason for each:
 
 ```text
-Failed to load the NDI runtime: no usable Standard runtime; tried /opt/app/libndi.so.6 (next to the executable): not found; /opt/ndi/libndi.so.6 (NDI_RUNTIME_DIR_V6): not found; libndi.so.6 (system library search): dlopen failed: libndi.so.6: cannot open shared object file: No such file or directory
+Failed to load the NDI runtime: no usable NDI runtime; tried /opt/app/libndi.so.6 (next to the executable): not found; /opt/app/libndi_advanced.so.6 (next to the executable): not found; libndi.so.6 (system library search): dlopen failed: libndi.so.6: cannot open shared object file: No such file or directory; libndi_advanced.so.6 (system library search): dlopen failed: libndi_advanced.so.6: cannot open shared object file: No such file or directory
 ```
 
 A failed selection can be retried. A successful one is permanent: the selected library stays loaded until the process exits. A later request that it cannot meet returns `Error::RuntimeConflict`: one that names a different library, or one that requires the Advanced edition when the selected library is a Standard runtime.
@@ -213,13 +215,12 @@ A runtime that does not start because of the CPU makes `initialize` return `Erro
 
 ### SDK editions
 
-NDI ships a Standard SDK and an Advanced SDK with different runtime libraries. An edition request decides which library name the search uses:
+NDI ships a Standard SDK and an Advanced SDK with different runtime libraries. Without a request, the search accepts the library of either edition, so a program finds whichever runtime the machine has. A request narrows the search to one library name:
 
-- `RuntimeOptions::default().edition(SdkEdition::Advanced)` searches for the Advanced library and fails unless the loaded library exports the Advanced SDK entry points.
-- `RuntimeOptions::default().edition(SdkEdition::Standard)` searches for the Standard library. An Advanced runtime also meets a Standard request.
-- Without a request, the default chosen when the crate was built applies: the value of `NDI_SDK_EDITION` (`standard` or `advanced`) if it was set, otherwise the edition of an NDI SDK found on the build machine, otherwise Standard.
+- `RuntimeOptions::default().edition(SdkEdition::Advanced)` searches only for the Advanced library and fails unless the loaded library exports the Advanced SDK entry points. Use it when the program needs Advanced SDK operations.
+- `RuntimeOptions::default().edition(SdkEdition::Standard)` searches only for the Standard library. An Advanced runtime found under that name, or named by an explicit path, also meets a Standard request.
 
-The build looks for an SDK in the directory named by `NDI_SDK_DIR`, or else in the vendor installers' default locations, and uses the first one it finds. On Linux the Advanced SDK's location is checked before the Standard SDK's; on Windows and macOS the Standard SDK's comes first, so name an Advanced SDK in `NDI_SDK_DIR` there when both are installed. A build that finds an Advanced SDK searches for the Advanced runtime by default. Set `NDI_SDK_EDITION=standard` for that build, or request `SdkEdition::Standard` at run time, to use the Standard runtime instead. `NDI_SDK_DIR` must name an SDK installation when it is set, and `NDI_SDK_EDITION` must be `standard` or `advanced`; any other value fails the build.
+The search does not depend on how or where the crate was built. `NDI_SDK_DIR` matters only to builds that read an SDK: the `advanced` feature and the Apple mobile targets.
 
 `ndi.info().edition()` reports the edition of the library that was actually loaded, detected from the functions it exports. An edition says nothing about a license entitlement.
 
@@ -372,6 +373,7 @@ capture. The type system prevents raw-video capture while FrameSync owns it.
 Receivers report connection health, frame-drop statistics, and PTZ support. Use `set_tally` to send program/preview state upstream; sender tally reports receiver state.
 
 ```rust
+use grafton_ndi::ReceiverEvent;
 use std::time::Duration;
 
 if receiver.is_connected() {
@@ -379,7 +381,7 @@ if receiver.is_connected() {
     println!("video drop rate: {:.2}%", stats.video_drop_percentage());
 }
 
-if let Some(status) = receiver.poll_status_change(Duration::from_millis(100))? {
+if let Some(ReceiverEvent::StatusChanged(status)) = receiver.poll_event(Duration::from_millis(100))? {
     println!("Active connections: {}", status.connections);
 }
 
@@ -542,7 +544,7 @@ Names and metadata from the network are decoded lossily, so one malformed peer c
 The `advanced` feature adds the `advanced` module. Using it needs three things:
 
 1. The `advanced` Cargo feature.
-2. An NDI Advanced SDK on the build machine, in `NDI_SDK_DIR` or a default installation directory. The Advanced SDK headers may not be redistributed, so the build generates their declarations locally with bindgen, which needs `libclang`. A build that finds an Advanced SDK and no `libclang` fails.
+2. An NDI Advanced SDK on the build machine, in `NDI_SDK_DIR` or a default installation directory. The Advanced SDK headers may not be redistributed, so the build generates their declarations, types and constants locally with bindgen, which needs `libclang`; the crate itself carries only the signatures of the Advanced functions it calls. A build that finds an Advanced SDK and no `libclang` fails.
 3. An Advanced SDK runtime selected when the program runs.
 
 The module's API is the same whether or not the build found the Advanced SDK. Without it, or with a Standard runtime, each native operation returns `Error::UnsupportedCapability` with the reason. Older Advanced SDK headers disable only the operations they do not declare. The data types in the module, such as packets, envelopes and options, work in every build. The Advanced SDK 6.3.2 and 6.4.0.2 were tested; see [NDI versions](#ndi-versions).
@@ -677,7 +679,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, the bindings g
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
 
-The bindings in `src/sys/bindings.rs` and `src/sys/declarations.rs` are generated from NDI SDK headers that the vendor distributes under the MIT license. Each file starts with that copyright and permission notice.
+The bindings in `src/sys/bindings.rs` and `src/sys/declarations.rs` are generated from NDI SDK headers that the vendor distributes under the MIT license. Each file starts with that copyright and permission notice, and the package's license expression is therefore `Apache-2.0 AND MIT`.
 
 The NDI SDK and runtime are supplied separately under their vendor terms.
 

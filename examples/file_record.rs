@@ -89,6 +89,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 report.closed_files(),
                 report.error_events()
             );
+            if report.stopped_by_sdk() {
+                println!("The SDK ended the session before it was asked to stop.");
+            }
         }
         other => println!("The recording was not confirmed complete: {other:?}"),
     }

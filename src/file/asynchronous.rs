@@ -7,7 +7,7 @@ use super::{
     timeout_ms, EventText, FileApi, FileDuration, FileError, FileInfo, FilePlayer, FilePosition,
     FileRecorder, FileResult, FinishStatus, PlayerEvent, PlayerOptions, PlayerStats, RecorderEvent,
     RecorderOptions, RecorderState, RecorderStats, RecordingReport, RecordingTarget,
-    RecordingTimecode, SourceFormat, SourceSpec, SourceTimecode, StopRequest,
+    RecordingTimecode, SourceFormat, SourceSpec, SourceTimecode, StateError, StopRequest,
 };
 use crate::Source;
 use std::{
@@ -58,8 +58,9 @@ impl Default for AsyncFileOptions {
 
 impl AsyncFileOptions {
     /// Set how many commands may wait for the owner thread, from 1 through
-    /// 4096. A command submitted to a full queue fails at once, except a
-    /// request to stop, which is always accepted so that it cannot be lost.
+    /// 4096. A command submitted to a full queue fails at once with
+    /// [`StateError::QueueFull`], except a request to stop, which is always
+    /// accepted so that it cannot be lost.
     ///
     /// # Errors
     ///
@@ -109,6 +110,14 @@ struct Response<T> {
 /// has begun cancels it; once it has begun, dropping only discards the result.
 /// Requests to stop, finish or close run even if their future is dropped, as
 /// those methods say.
+///
+/// # Errors
+///
+/// Besides the operation's own errors, every operation can fail with
+/// [`FileError::InvalidState`]: with [`StateError::QueueFull`] when the
+/// handle's command queue is full, with [`StateError::Closed`] when the
+/// handle has been closed or its thread stopped before carrying the operation
+/// out, and with [`StateError::OwnerFailed`] when that thread failed.
 ///
 /// # Panics
 ///
@@ -228,9 +237,7 @@ impl<T> Drop for Reply<T> {
         if !self.delivered && !self.cancelled.load(Ordering::Acquire) {
             deliver(
                 &self.response,
-                Err(FileError::InvalidState(
-                    "File owner stopped before returning this operation",
-                )),
+                Err(FileError::InvalidState(StateError::Closed)),
                 false,
             );
         }
@@ -320,8 +327,10 @@ impl<E> EventQueue<E> {
 /// within the wait.
 ///
 /// The wait starts when the future is first polled. One future may wait on a
-/// handle at a time; a second fails with [`FileError::InvalidState`]. Dropping
-/// the future does not stop events from being pumped.
+/// handle at a time; a second fails with [`FileError::InvalidState`] and
+/// [`StateError::WaiterPending`]. Once the handle is closed and every queued
+/// event has been taken, the future fails with [`StateError::Closed`].
+/// Dropping the future does not stop events from being pumped.
 ///
 /// # Panics
 ///
@@ -360,14 +369,12 @@ impl<E> Future for FileEventFuture<E> {
             .is_some_and(|w| w.token.strong_count() != 0 && !w.token.ptr_eq(&token))
         {
             this.consumed = true;
-            return Poll::Ready(Err(FileError::InvalidState(
-                "another File event waiter is already pending",
-            )));
+            return Poll::Ready(Err(FileError::InvalidState(StateError::WaiterPending)));
         }
         let ready = if let Some(event) = events.queue.pop_front() {
             Some(event.map(Some))
         } else if events.closed {
-            Some(Err(FileError::InvalidState("File owner has closed")))
+            Some(Err(FileError::InvalidState(StateError::Closed)))
         } else if deadline <= Instant::now() {
             Some(Ok(None))
         } else {
@@ -431,7 +438,7 @@ impl Control {
             let mut closing = lock(&self.closing);
             if closing.complete {
                 reply.complete(if closing.failed {
-                    Err(FileError::InvalidState("File owner thread failed"))
+                    Err(FileError::InvalidState(StateError::OwnerFailed))
                 } else {
                     Ok(())
                 });
@@ -442,9 +449,7 @@ impl Control {
                 .as_ref()
                 .is_some_and(|r| !r.cancelled.load(Ordering::Acquire))
             {
-                reply.complete(Err(FileError::InvalidState(
-                    "another close waiter is already pending",
-                )));
+                reply.complete(Err(FileError::InvalidState(StateError::WaiterPending)));
                 return future;
             }
             closing.reply = Some(reply);
@@ -462,7 +467,7 @@ impl Control {
         };
         if let Some(reply) = reply {
             reply.complete(if failed {
-                Err(FileError::InvalidState("File owner thread failed"))
+                Err(FileError::InvalidState(StateError::OwnerFailed))
             } else {
                 Ok(())
             });
@@ -544,15 +549,13 @@ impl<H: Owner> Worker<H> {
         work: impl FnOnce(&mut H, &OperationContext) -> FileResult<T> + Send + 'static,
     ) -> FileOperation<T> {
         if self.control.shutdown.load(Ordering::Acquire) {
-            return FileOperation::failed(FileError::InvalidState("File owner is closing"));
+            return FileOperation::failed(FileError::InvalidState(StateError::Closed));
         }
         let waiting = (!persistent).then(|| Arc::clone(&self.waiting));
         if let Some(waiting) = &waiting {
             if waiting.fetch_add(1, Ordering::AcqRel) >= self.capacity {
                 waiting.fetch_sub(1, Ordering::AcqRel);
-                return FileOperation::failed(FileError::InvalidState(
-                    "File command queue is full",
-                ));
+                return FileOperation::failed(FileError::InvalidState(StateError::QueueFull));
             }
         }
         let (reply, future) = operation();
@@ -570,7 +573,7 @@ impl<H: Owner> Worker<H> {
             reply.complete(work(owner, &context));
         });
         if self.sender.send(job).is_err() {
-            future.immediate_failure(FileError::InvalidState("File owner has stopped"));
+            future.immediate_failure(FileError::InvalidState(StateError::Closed));
         }
         future
     }
@@ -672,10 +675,16 @@ fn run_owner<H: Owner>(
 
 /// A [`FilePlayer`] on a thread of its own, driven through futures.
 ///
-/// Clones share one player. Dropping the last clone stops playback, removes
-/// the advertised source and waits for the player's thread to finish, which
-/// blocks the dropping thread for as long as the SDK takes to destroy the
-/// player. To avoid blocking an executor, await [`close`](Self::close) first.
+/// Clones share one player.
+///
+/// # Dropping blocks
+///
+/// Dropping the last clone stops playback, removes the advertised source and
+/// then **blocks the dropping thread** until the player's thread has
+/// destroyed the player, for as long as the SDK takes. When the drop
+/// returns, the source is gone. A caller that must not block, such as a task
+/// on an async executor, awaits [`close`](Self::close) instead, which does the
+/// same without blocking; dropping the clones afterwards does not block.
 #[derive(Clone)]
 pub struct AsyncFilePlayer {
     worker: Arc<Worker<FilePlayer>>,
@@ -817,6 +826,12 @@ impl AsyncFilePlayer {
     /// The future completes when the SDK has destroyed the player. Nothing
     /// blocks the calling thread, and the close runs even if the future is
     /// dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::InvalidState`] with [`StateError::WaiterPending`] while
+    /// another close of this object is awaited, and with
+    /// [`StateError::OwnerFailed`] when the object's thread failed.
     pub fn close(self) -> FileOperation<()> {
         self.worker.control.request_close()
     }
@@ -833,12 +848,17 @@ impl AsyncFilePlayer {
 /// know a recording is complete, then await [`close`](Self::close). Neither
 /// blocks the executor.
 ///
-/// Dropping the last clone instead blocks the dropping thread until the
+/// # Dropping blocks
+///
+/// Dropping the last clone **blocks the dropping thread** until the
 /// recorder's thread has finished: it stops a session that is still open,
 /// waits up to [`RecorderOptions::with_drop_wait`] for the SDK to finalize the
-/// file, and destroys the recorder. The file is therefore finalized, as far as
-/// the SDK reports within that wait, by the time the drop returns, but the
-/// outcome cannot be reported.
+/// file, and destroys the recorder. This is deliberate: when the drop
+/// returns, the file is finalized as far as the SDK reported within that
+/// wait, even when the drop happens as the program exits. The outcome cannot
+/// be reported. A caller that must not block, such as a task on an async
+/// executor, awaits [`close`](Self::close) instead, which does the same
+/// without blocking; dropping the clones afterwards does not block.
 #[derive(Clone)]
 pub struct AsyncFileRecorder {
     worker: Arc<Worker<FileRecorder>>,
@@ -846,6 +866,9 @@ pub struct AsyncFileRecorder {
 
 impl AsyncFileRecorder {
     /// Create a recorder with the default queue sizes.
+    ///
+    /// The future fails as [`FileApi::create_recorder`] does, including with
+    /// [`FileError::InvalidInput`] for options that conflict.
     pub fn create(api: FileApi, options: RecorderOptions) -> FileOperation<Self> {
         Self::create_with_options(api, options, AsyncFileOptions::default())
     }
@@ -982,6 +1005,12 @@ impl AsyncFileRecorder {
     /// whether the file was finalized: await [`finish`](Self::finish) first to
     /// learn that. Nothing blocks the calling thread, and the close runs even
     /// if the future is dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::InvalidState`] with [`StateError::WaiterPending`] while
+    /// another close of this object is awaited, and with
+    /// [`StateError::OwnerFailed`] when the object's thread failed.
     pub fn close(self) -> FileOperation<()> {
         self.worker.control.request_close()
     }
@@ -1153,7 +1182,7 @@ mod tests {
                 owner.counter += 100;
                 Ok(())
             })),
-            Err(FileError::InvalidState("File command queue is full"))
+            Err(FileError::InvalidState(StateError::QueueFull))
         ));
         release_tx.send(()).unwrap();
         block_on(blocker).unwrap();
@@ -1168,12 +1197,18 @@ mod tests {
         let (worker, dropped) = local_worker();
         let created = block_on(worker.call(|owner| Ok(owner.created))).unwrap();
         let failed: FileOperation<()> = worker.call(|_| panic!("mock owner failure"));
-        assert!(block_on(failed).is_err());
+        assert!(matches!(
+            block_on(failed),
+            Err(FileError::InvalidState(StateError::Closed))
+        ));
         assert_eq!(
             dropped.recv_timeout(Duration::from_secs(1)).unwrap(),
             created
         );
-        assert!(block_on(worker.control.request_close()).is_err());
+        assert!(matches!(
+            block_on(worker.control.request_close()),
+            Err(FileError::InvalidState(StateError::OwnerFailed))
+        ));
         assert!(block_on(worker.call(|_| Ok(()))).is_err());
     }
 
@@ -1316,7 +1351,7 @@ mod tests {
         let queued = recorder.is_recording();
         assert!(matches!(
             block_on(recorder.is_recording()),
-            Err(FileError::InvalidState("File command queue is full"))
+            Err(FileError::InvalidState(StateError::QueueFull))
         ));
         // A stop is not: it must not be lost, even if nobody waits for it.
         drop(recorder.request_stop());
@@ -1387,7 +1422,10 @@ mod tests {
             .as_mut()
             .poll(&mut Context::from_waker(&waker))
             .is_pending());
-        assert!(block_on(events.wait(Duration::ZERO)).is_err());
+        assert!(matches!(
+            block_on(events.wait(Duration::ZERO)),
+            Err(FileError::InvalidState(StateError::WaiterPending))
+        ));
         drop(first);
         assert_eq!(block_on(events.wait(Duration::ZERO)).unwrap(), None);
     }
@@ -1397,8 +1435,34 @@ mod tests {
         let (worker, dropped) = local_worker();
         let event = worker.events.wait(Duration::from_secs(3));
         block_on(worker.control.request_close()).unwrap();
-        assert!(block_on(event).is_err());
-        assert!(block_on(worker.call(|_| Ok(()))).is_err());
+        assert!(matches!(
+            block_on(event),
+            Err(FileError::InvalidState(StateError::Closed))
+        ));
+        assert!(matches!(
+            block_on(worker.call(|_| Ok(()))),
+            Err(FileError::InvalidState(StateError::Closed))
+        ));
         dropped.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn an_async_finish_whose_stop_outlasts_its_wait_takes_the_queued_close() {
+        let (device, recorder) = mock_recorder(Closing::DuringSlowStop(Duration::from_millis(80)));
+        let outcome = block_on(recorder.finish(Duration::from_millis(10))).unwrap();
+        assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        block_on(recorder.close()).unwrap();
+    }
+
+    #[test]
+    fn async_creation_refuses_conflicting_options() {
+        let options = RecorderOptions::new(SourceSpec::new("mock source").unwrap())
+            .exact_filename()
+            .with_format_change_rollover(true);
+        assert!(matches!(
+            block_on(AsyncFileRecorder::create(mock::recorder_api(), options)),
+            Err(FileError::InvalidInput(_))
+        ));
     }
 }

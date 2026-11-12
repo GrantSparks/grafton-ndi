@@ -240,7 +240,7 @@ fn validated_deadline(timeout: Duration) -> Result<Instant> {
     to_ms_checked(timeout)?;
     Instant::now()
         .checked_add(timeout)
-        .ok_or_else(|| Error::Timeout("Capture deadline cannot be represented".into()))
+        .ok_or_else(|| Error::InvalidConfiguration("Capture deadline cannot be represented".into()))
 }
 
 // Shared by both capture verbs so validation and queue accounting agree.

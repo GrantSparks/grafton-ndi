@@ -36,7 +36,7 @@ impl Sender {
     ///
     /// [`Error::UnsupportedCapability`] without an Advanced runtime (or in a
     /// build without the Advanced SDK), an invalid-string error for a name or
-    /// group containing NUL, and [`Error::InitializationFailed`] when the SDK
+    /// group containing NUL, and [`Error::NativeOperationFailed`] when the SDK
     /// creates no sender.
     pub fn new_with_config(
         ndi: &NDI,
@@ -61,9 +61,9 @@ impl Sender {
             table.NDIlib_send_create_v2(&create, configuration.as_ptr())
         });
         if instance.is_null() {
-            return Err(Error::InitializationFailed(
-                "Advanced sender creation failed".into(),
-            ));
+            return Err(Error::NativeOperationFailed {
+                operation: "NDIlib_send_create_v2",
+            });
         }
         // SAFETY: creation returned a fresh instance that nothing else owns.
         Ok(unsafe { Self::from_native(ndi, instance, name, groups, Some(configuration)) })
@@ -315,7 +315,7 @@ impl Receiver {
     /// [`Error::UnsupportedCapability`] without an Advanced runtime (or in a
     /// build without the Advanced SDK) or when the options need a mode the
     /// runtime lacks, an invalid-string error for a name containing NUL, and
-    /// [`Error::InitializationFailed`] when the SDK creates no receiver.
+    /// [`Error::NativeOperationFailed`] when the SDK creates no receiver.
     pub fn new_with_config(
         ndi: &NDI,
         options: &ReceiverOptions,
@@ -344,7 +344,8 @@ impl Receiver {
         });
         // SAFETY: the options were validated for this runtime above, and the
         // instance (or null) is the fresh result of creation.
-        let mut receiver = unsafe { Self::from_native(ndi, options, instance)? };
+        let mut receiver =
+            unsafe { Self::from_native(ndi, options, instance, "NDIlib_recv_create_v4")? };
         receiver.retain_config(config.clone());
         Ok(receiver)
     }

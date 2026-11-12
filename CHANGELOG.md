@@ -23,10 +23,10 @@ removed, and the build no longer links the NDI library; see the
   The minimum Rust version remains 1.88; the tvOS and visionOS targets need a
   later release.
 - The test suite was run on Linux x86_64 against the Standard 6.1.1 runtime and
-  the Standard and Advanced 6.3.2 and 6.4.0.2 runtimes. Builds made with one
-  version's SDK also ran against another version's runtime, and 6.1.1 and
-  Advanced 6.3.2 peers exchanged video, audio and metadata with 6.4 peers in
-  both directions. Other NDI 6 releases, including 6.0, were not tested.
+  the Standard and Advanced 6.3.2 and 6.4.0.2 runtimes. Builds with one
+  version's Advanced headers also ran against another version's runtime, and
+  6.1.1 and Advanced 6.3.2 peers exchanged video, audio and metadata with 6.4
+  peers in both directions. Other NDI 6 releases, including 6.0, were not tested.
 - The other Linux architectures, Windows, macOS, Android and iOS were compiled
   and linted only, and tvOS and visionOS were not built. The CI workflows that
   test the other platforms have not yet run on a hosted runner. See
@@ -55,11 +55,16 @@ removed, and the build no longer links the NDI library; see the
   named by `NDI_RUNTIME_DIR_V6`, then by the operating system's loader. A
   library in either directory is used even where 2.0 loaded another one from
   the loader's path.
-- The default SDK edition comes from `NDI_SDK_EDITION`, otherwise from an NDI
-  SDK found on the build machine, otherwise it is Standard. A build machine
-  without the Advanced SDK that a 2.0 build used produces a program that
-  searches for the Standard runtime; set `NDI_SDK_EDITION=advanced` there to
-  keep the Advanced one.
+- Unless the program requests an edition, each location is searched for the
+  runtime libraries of both the Standard and the Advanced SDK, the Advanced
+  name first in builds with the `advanced` feature or, outside Windows, the
+  `file-io` feature, and the Standard name first otherwise. Nothing installed
+  on the build machine changes the search. A 2.0
+  build on a Linux or Android machine with the Advanced SDK linked the Advanced
+  library and needed that runtime wherever it ran; the same program built with
+  3.0 also runs with the Standard runtime, and loads it where both are
+  installed in one place. Request `SdkEdition::Advanced` where the Advanced
+  runtime is required.
 - `SourceCache::find_by_host` takes the `NDI` handle as its first argument. The
   cache no longer starts NDI by itself.
 - `NDI::is_supported_cpu` is removed. Use `Runtime::is_supported_cpu` on a
@@ -70,6 +75,36 @@ removed, and the build no longer links the NDI library; see the
 - The `advanced_sdk` Cargo feature, which had no effect, is removed.
 - A runtime that does not start because the CPU lacks instructions it needs is
   reported as `Error::UnsupportedCpu` instead of `Error::InitializationFailed`.
+- A finder, receiver, sender, FrameSync or other object the SDK does not create
+  is reported as `Error::NativeOperationFailed`, whose `operation` names the
+  creating function, instead of `Error::InitializationFailed`, which now means
+  only that the runtime did not start. A Discovery Server address the SDK
+  refuses is `Error::InvalidConfiguration`.
+- `Error::SourceUnavailable`, `Error::Disconnected` and `Error::Io`, which the
+  crate never returned, are removed, and so is the `From<std::io::Error>`
+  conversion that came with `Io`. `Error::Timeout`, returned only by
+  `Sender::connection_count`, which now returns
+  `Error::NativeOperationFailed`, is removed. `Error::PtzCommandFailed` is
+  removed; a PTZ command the SDK rejects is `Error::NativeOperationFailed`
+  naming the PTZ function.
+- `Source::ip_address` is removed; `Source::host` returns the same value, which
+  for a URL source is a host name.
+- `Receiver::poll_status_change` is removed. `Receiver::poll_event` returns the
+  same status as `ReceiverEvent::StatusChanged`, together with the other
+  receiver events, and is the only poller, so two pollers no longer compete for
+  one notification.
+- `ptz_store_preset` and `ptz_recall_preset` take the preset as a `u8`; they
+  took an `i32` and a `u32`.
+- `LineStrideOrSize` is removed. `VideoFrame`, `VideoFrameRef` and
+  `BorrowedVideoFrame` report the first plane's stride with
+  `line_stride_bytes() -> usize` instead of `line_stride_or_size()`.
+- `AudioFrameBuilder::format` is removed. `AudioFormat::FLTP` is the only
+  format and every frame uses it.
+- `ReceiverOptions::default()` allows video fields, as
+  `ReceiverOptions::builder` and the SDK do; it did not.
+- The `tokio` feature enables only Tokio's `rt` feature. A program that uses
+  `#[tokio::main]` or the multi-threaded runtime enables those features in its
+  own Tokio dependency.
 
 ### Added
 
@@ -135,11 +170,14 @@ removed, and the build no longer links the NDI library; see the
   `FilePlayer` plays a recording as an NDI source, and `AsyncFileRecorder` and
   `AsyncFilePlayer` offer the same operations as futures for any executor.
   `reset` on either recorder replaces one whose session could not be confirmed
-  closed and returns that session's report. On Linux, macOS and Android the
-  File library needs the Advanced SDK runtime. See the
-  [File API guide](docs/file-io.md).
-- `NDI_SDK_EDITION` (`standard` or `advanced`) to set the edition a build
-  searches for by default.
+  closed and returns that session's report, and `RecordingReport::stopped_by_sdk`
+  says whether a finalized session ran until it was asked to stop. A recorder
+  with an exact file name never overwrites a file and refuses the options and
+  operations that would need a second file of the same name, instead of
+  letting the SDK end the session. Errors for an operation the current state
+  does not allow carry a `StateError`, which says whether a retry can succeed.
+  On Linux, macOS and Android the File library needs the Advanced SDK runtime.
+  See the [File API guide](docs/file-io.md).
 - Examples for runtime selection, routing, the Discovery Server, the File API
   and each Advanced SDK capability.
 
@@ -150,10 +188,14 @@ removed, and the build no longer links the NDI library; see the
   generated from the SDK headers ahead of time and are part of the crate. The
   documentation builds without an SDK, and the crate's `documentation` link
   points to docs.rs.
-- `NDI_SDK_DIR` is read only to choose the default edition, to find the
-  Advanced SDK headers for the `advanced` feature, and to find the static
-  archive for Apple mobile targets. When it is set it must name an SDK
-  installation.
+- `NDI_SDK_DIR` is read only by builds with the `advanced` feature, to find
+  the Advanced SDK headers, and by builds for Apple mobile targets, to find the
+  static archive. In those builds a set value must name an SDK installation;
+  every other build ignores it, and changing it no longer rebuilds them.
+  Without it, an `advanced` build looks only in the Advanced SDK installer's
+  default directory.
+- The package's license expression is `Apache-2.0 AND MIT`: the vendored
+  bindings carry the MIT notice of the SDK headers they are generated from.
 - The published package contains only the sources, examples, build scripts,
   README, changelog and license. The tests and the guides under `docs/` are not
   in it.
@@ -176,7 +218,8 @@ removed, and the build no longer links the NDI library; see the
   that depend on it. In 2.0.0 the build script's own generated file was one of
   its inputs (#121).
 - On Linux, an Advanced SDK directory in the default location that is not a
-  usable SDK no longer fails the build; the next default location is tried.
+  usable SDK no longer fails the build; the build continues without the
+  Advanced declarations, as when no SDK is installed.
 - `NDI::new` no longer writes diagnostics to standard error in Windows debug
   builds when the `CI` environment variable is set.
 

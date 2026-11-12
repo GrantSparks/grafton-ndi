@@ -204,7 +204,7 @@ impl FileRuntime {
         Search {
             explicit,
             beside: core.library_path(),
-            name: Self::LIBRARY_NAME,
+            names: &[Self::LIBRARY_NAME],
             anchor: Self::ANCHOR,
             description: "NDI File library",
         }

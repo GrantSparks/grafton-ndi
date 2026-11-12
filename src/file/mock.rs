@@ -108,6 +108,9 @@ pub(super) enum Closing {
     AtStop,
     /// This long after the stop returns, as its documentation allows.
     After(std::time::Duration),
+    /// Before the stop returns, which takes this long, as the 6.4 SDK's stop
+    /// does while it finalizes a file.
+    DuringSlowStop(std::time::Duration),
     /// Never: the event is lost.
     Never,
 }
@@ -129,6 +132,15 @@ pub(super) struct Recorder {
     pub(super) refuse_creation: std::sync::atomic::AtomicBool,
     /// How many rollovers the wrapper passed on.
     pub(super) rollovers: std::sync::atomic::AtomicUsize,
+    /// How many native recorders were created from this one, and how many
+    /// starts and changes of source the wrapper passed on.
+    pub(super) creates: std::sync::atomic::AtomicUsize,
+    pub(super) starts: std::sync::atomic::AtomicUsize,
+    pub(super) source_changes: std::sync::atomic::AtomicUsize,
+    /// What creation was told about rolling over: whether a format change
+    /// does not roll over, and the size that does.
+    pub(super) created_without_format_rollover: std::sync::atomic::AtomicBool,
+    pub(super) created_rollover_bytes: std::sync::atomic::AtomicU64,
     /// Make the next captured event larger than this crate's layout of it.
     pub(super) oversize_next_event: std::sync::atomic::AtomicBool,
     pub(super) dropped_events: std::sync::atomic::AtomicU64,
@@ -159,6 +171,11 @@ impl Recorder {
             fail_next_start: Default::default(),
             refuse_creation: Default::default(),
             rollovers: Default::default(),
+            creates: Default::default(),
+            starts: Default::default(),
+            source_changes: Default::default(),
+            created_without_format_rollover: Default::default(),
+            created_rollover_bytes: Default::default(),
             oversize_next_event: Default::default(),
             dropped_events: Default::default(),
             stops: Default::default(),
@@ -213,17 +230,25 @@ impl Recorder {
 }
 
 unsafe extern "C" fn recorder_create(
-    _: *const NDIlib_file_recorder_create_t,
+    settings: *const NDIlib_file_recorder_create_t,
 ) -> NDIlib_file_recorder_instance_t {
+    use std::sync::atomic::Ordering;
     let recorder = NEXT_RECORDER
         .with(|next| next.borrow_mut().take())
         .expect("a mock recorder was installed on this thread");
-    if recorder
-        .refuse_creation
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
+    if recorder.refuse_creation.load(Ordering::Acquire) {
         return std::ptr::null_mut();
     }
+    // SAFETY: the wrapper passes settings that are valid for the call.
+    let settings = unsafe { &*settings };
+    recorder.created_without_format_rollover.store(
+        settings.disable_auto_rollover_on_format_change,
+        Ordering::Release,
+    );
+    recorder
+        .created_rollover_bytes
+        .store(settings.rollover_max_file_size_bytes, Ordering::Release);
+    recorder.creates.fetch_add(1, Ordering::AcqRel);
     Box::into_raw(Box::new(recorder)).cast()
 }
 
@@ -245,6 +270,7 @@ unsafe extern "C" fn recorder_start(
     use std::sync::atomic::Ordering;
     // SAFETY: the wrapper passes a live handle.
     let recorder = unsafe { Recorder::from_handle(handle) };
+    recorder.starts.fetch_add(1, Ordering::AcqRel);
     if recorder.fail_next_start.swap(false, Ordering::AcqRel) {
         recorder.push(OPEN_FAILED, "unopenable.mkv");
         return false;
@@ -305,6 +331,10 @@ unsafe extern "C" fn recorder_stop(handle: NDIlib_file_recorder_instance_t) {
                 recorder.close();
             });
         }
+        Closing::DuringSlowStop(delay) => {
+            std::thread::sleep(delay);
+            recorder.close();
+        }
         Closing::Never => recorder.recording.store(false, Ordering::Release),
     }
 }
@@ -335,9 +365,13 @@ unsafe extern "C" fn recorder_rollover(
 }
 
 unsafe extern "C" fn accept_source(
-    _: NDIlib_file_recorder_instance_t,
+    handle: NDIlib_file_recorder_instance_t,
     _: *const NDIlib_file_recorder_source_t,
 ) -> bool {
+    // SAFETY: the wrapper passes a live handle.
+    unsafe { Recorder::from_handle(handle) }
+        .source_changes
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     true
 }
 

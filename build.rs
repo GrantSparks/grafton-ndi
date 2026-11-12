@@ -2,14 +2,14 @@
 //!
 //! Dynamically loaded targets build without an NDI SDK: the vendored bindings in
 //! `src/sys` describe the ABI and the runtime library is located when the
-//! program runs. This script only
+//! program runs. Nothing installed on the build machine changes which runtime a
+//! program looks for. This script only
 //!
-//! * records the default runtime edition (`NDI_SDK_EDITION`, else the edition of
-//!   an installed SDK, else Standard);
 //! * with the `advanced` feature, generates declarations for the Advanced-only
 //!   headers of an installed Advanced SDK, which may not be redistributed;
 //! * for statically linked Apple targets, selects, validates and links the
-//!   vendor archive.
+//!   vendor archive of the SDK in `NDI_SDK_DIR`, whose edition is the one the
+//!   program runs.
 
 use std::{
     env, fs,
@@ -29,19 +29,8 @@ fn main() {
         "build_support.rs",
         "build_apple.rs",
         "build_advanced.rs",
-        "src/sys/advanced_tables.rs",
-        "src/sys/declarations.rs",
     ] {
         println!("cargo:rerun-if-changed={path}");
-    }
-    for name in [
-        "NDI_SDK_DIR",
-        "NDI_SDK_EDITION",
-        "IPHONEOS_DEPLOYMENT_TARGET",
-        "TVOS_DEPLOYMENT_TARGET",
-        "XROS_DEPLOYMENT_TARGET",
-    ] {
-        println!("cargo:rerun-if-env-changed={name}");
     }
     for cfg in [
         "ndi_link_static",
@@ -57,11 +46,33 @@ fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR missing"));
     println!("cargo:rustc-env=GRAFTON_NDI_TARGET={target}");
 
-    let requested = env::var("NDI_SDK_EDITION")
-        .ok()
-        .map(|value| Edition::parse(&value).unwrap_or_else(|error| panic!("{error}")));
-    let sdk = Sdk::locate(env::var_os("NDI_SDK_DIR").as_deref().map(Path::new), &os)
-        .unwrap_or_else(|error| panic!("{error}"));
+    let links_statically = build_support::links_statically(&os);
+    // Only the Advanced headers and a static archive come from an SDK; any
+    // other build ignores whatever is installed, and the variables that
+    // describe it.
+    let needs_sdk = links_statically || cfg!(feature = "advanced");
+    if needs_sdk {
+        println!("cargo:rerun-if-env-changed=NDI_SDK_DIR");
+    }
+    if cfg!(feature = "advanced") {
+        println!("cargo:rerun-if-changed=src/sys/advanced_tables.rs");
+    }
+    if links_statically {
+        println!("cargo:rerun-if-changed=src/sys/declarations.rs");
+        for name in [
+            "IPHONEOS_DEPLOYMENT_TARGET",
+            "TVOS_DEPLOYMENT_TARGET",
+            "XROS_DEPLOYMENT_TARGET",
+        ] {
+            println!("cargo:rerun-if-env-changed={name}");
+        }
+    }
+    let sdk = if needs_sdk {
+        Sdk::locate(env::var_os("NDI_SDK_DIR").as_deref().map(Path::new), &os)
+            .unwrap_or_else(|error| panic!("{error}"))
+    } else {
+        None
+    };
     if let Some(sdk) = &sdk {
         println!("cargo:rerun-if-changed={}", sdk.include_dir.display());
     }
@@ -85,22 +96,13 @@ fn main() {
         println!("cargo:rustc-cfg=ndi_has_advanced_header");
     }
 
-    let edition = if build_support::links_statically(&os) {
+    if links_statically {
         let sdk = sdk.as_ref().unwrap_or_else(|| {
             panic!("{target} links the NDI SDK statically; set NDI_SDK_DIR to the Apple SDK")
         });
-        link_static(
-            sdk,
-            &os,
-            &arch,
-            requested,
-            advanced_declarations.as_deref(),
-            &out,
-        )
-    } else {
-        build_support::default_edition(requested, sdk.as_ref())
-    };
-    println!("cargo:rustc-env=GRAFTON_NDI_EDITION={}", edition.as_str());
+        let edition = link_static(sdk, &os, &arch, advanced_declarations.as_deref(), &out);
+        println!("cargo:rustc-env=GRAFTON_NDI_EDITION={}", edition.as_str());
+    }
 }
 
 /// Select, validate and link the vendor archive, and write the static
@@ -109,17 +111,12 @@ fn link_static(
     sdk: &Sdk,
     os: &str,
     arch: &str,
-    requested: Option<Edition>,
     advanced_declarations: Option<&str>,
     out: &Path,
 ) -> Edition {
-    let library = build_support::static_library(
-        sdk,
-        os,
-        requested,
-        env::var_os("CARGO_FEATURE_FILE_IO").is_some(),
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
+    let library =
+        build_support::static_library(sdk, os, env::var_os("CARGO_FEATURE_FILE_IO").is_some())
+            .unwrap_or_else(|error| panic!("{error}"));
     println!("cargo:rerun-if-changed={}", library.archive.display());
     let archive = build_apple::inspect(&library.archive, arch, os)
         .unwrap_or_else(|error| panic!("Invalid Apple static SDK artifact: {error}"));
