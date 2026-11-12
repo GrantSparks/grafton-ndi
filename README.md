@@ -300,6 +300,8 @@ if let Some(frame) = receiver.video().capture_ref(Duration::from_secs(1))? {
 Owned capture and copied video sends pack planes tightly and can reduce the
 source stride. Format, plane order, metadata, timing, aspect ratio, and scan type
 are preserved. Owned frames expose the same `planes()` views, without padding.
+So does a `BorrowedVideoFrame` built for sending: its views read the active
+rows of a padded buffer in place, while its `data()` includes the padding.
 Borrowed PNG/JPEG encoding reads active rows directly.
 
 `copy_into(&mut owned)` makes the same copy into an existing `VideoFrame` or

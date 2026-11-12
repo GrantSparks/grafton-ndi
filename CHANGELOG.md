@@ -268,6 +268,10 @@ as `None`. Most programs need changes; see the
   nothing after the first copy, so copying borrowed pixels into the frame
   `send_video_async` returns makes an asynchronous send loop that allocates no
   frames. A video copy that fails leaves the destination unchanged.
+- `BorrowedVideoFrame::plane` and `planes` borrow the active rows of a frame
+  built over an application buffer, padded or not, without copying, as the
+  plane views of owned and captured frames do; its `data()` still returns the
+  whole validated storage, padding included.
 - Runtime selection in two explicit steps. `Runtime::select` loads the NDI
   library and pins it for the process without starting NDI;
   `Runtime::initialize` starts NDI and returns an `Ndi` handle. `Ndi::new` and
@@ -414,6 +418,10 @@ as `None`. Most programs need changes; see the
 
 ### Changed
 
+- `AudioFrame`'s `Debug` output lists the same fields as `AudioFrameRef`'s
+  and `FrameSyncAudioRef`'s: sample rate, channel and sample counts,
+  timecode, format, channel stride, metadata and timestamp. It no longer
+  prints every sample or the frame's internal layout.
 - Without the `advanced` feature, building for Windows, macOS, Linux and
   Android needs no NDI SDK, no `libclang` and no bindgen: the bindings are
   generated from the SDK headers ahead of time and are part of the crate. The

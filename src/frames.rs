@@ -537,6 +537,391 @@ pub(crate) fn sdk_video_frame(
     }
 }
 
+/// The parts of a video frame that its shared accessors read.
+///
+/// [`VideoFrame`], [`VideoRef`] and
+/// [`BorrowedVideoFrame`](crate::BorrowedVideoFrame) lend their validated
+/// layout, header, pixels and metadata through it, and [`video_accessors!`]
+/// generates their public accessors and `Debug` from it, so that each is
+/// written and documented once. The trait is crate-private, so these are
+/// its only implementations.
+///
+/// # Safety
+///
+/// The plane views read through [`pixels`](Self::pixels): it must point to
+/// storage that [`layout`](Self::layout) describes, with every active row
+/// initialized and unchanged while `self` is borrowed. Row padding need not
+/// be initialized.
+pub(crate) trait VideoParts {
+    /// The validated layout of the frame's pixels.
+    fn layout(&self) -> &ValidatedVideoLayout;
+
+    /// The validated header.
+    fn header(&self) -> &VideoHeader;
+
+    /// The start of the frame's pixel storage.
+    fn pixels(&self) -> *const u8;
+
+    /// The validated metadata text, or `None` when the frame has none.
+    fn metadata_text(&self) -> Option<&str>;
+
+    /// The time the sender submitted the frame, when it is known.
+    fn sdk_timestamp(&self) -> Option<SdkTimestamp>;
+
+    /// One plane, or `None` for an invalid index: the view behind every
+    /// generated `plane`.
+    #[inline]
+    fn plane_view(&self, index: usize) -> Option<VideoPlane<'_>> {
+        // SAFETY: the trait's contract: `pixels` points to storage `layout`
+        // describes, with every active row initialized and unchanged while
+        // `self`, which the view borrows, is borrowed.
+        unsafe { self.layout().view_plane(self.pixels(), index) }
+    }
+
+    /// Every plane in SDK memory order: the view behind every generated
+    /// `planes`.
+    #[inline]
+    fn plane_views(&self) -> VideoPlanes<'_> {
+        // SAFETY: as for `plane_view`.
+        unsafe { self.layout().view_planes(self.pixels()) }
+    }
+}
+
+/// Generate a video frame type's shared public accessors and its `Debug`
+/// from its [`VideoParts`], so that each accessor is written, and
+/// documented, once. Every generated method delegates to the frame's
+/// validated parts.
+///
+/// A frame type passes its `impl` header; its `Debug` name and the layout
+/// field that sizes its pixel data; and, for the accessors whose meaning
+/// differs between types, the type-specific paragraph of their docs. A
+/// frame that can hold received pixels, a capture or an owned frame that
+/// may be a copy of one, also passes `timestamp` and `encoders`, the
+/// receive method its encoder examples capture with: it gets a timestamp
+/// and image encoders. A frame built only for sending has neither.
+macro_rules! video_accessors {
+    (
+        $(#[$attr:meta])*
+        impl[$($generics:tt)*] $frame:ty;
+        debug($name:expr, $data:literal = $data_len:ident);
+        timecode { $(#[$timecode:meta])* }
+        line_stride_bytes { $(#[$line_stride:meta])* }
+        plane { $(#[$plane:meta])* }
+        timestamp { $(#[$timestamp:meta])* }
+        encoders($capture:ident) { $(#[$encoders:meta])* }
+    ) => {
+        $crate::frames::video_accessors! {
+            @shared
+            $(#[$attr])*
+            impl[$($generics)*] $frame;
+            debug($name, $data = $data_len, timestamp);
+            timecode { $(#[$timecode])* }
+            line_stride_bytes { $(#[$line_stride])* }
+            plane { $(#[$plane])* }
+            items {
+                /// Get the time the sender submitted this frame.
+                ///
+                $(#[$timestamp])*
+                #[inline]
+                pub fn timestamp(&self) -> Option<$crate::SdkTimestamp> {
+                    $crate::frames::VideoParts::sdk_timestamp(self)
+                }
+
+                #[cfg(feature = "image-encoding")]
+                fn image_source(&self) -> $crate::Result<$crate::frames::ImagePixelSource<'_>> {
+                    $crate::frames::ImagePixelSource::from_plane(
+                        *$crate::frames::VideoParts::layout(self),
+                        self.plane(0).expect("validated video plane"),
+                    )
+                }
+
+                /// Encode the video frame as PNG bytes.
+                ///
+                $(#[$encoders])*
+                ///
+                /// This method encodes the frame to PNG format, automatically handling color format
+                /// conversion from the NDI frame format (BGRA/RGBA/etc.) to PNG-compatible RGBA.
+                ///
+                /// # Supported Formats
+                ///
+                /// - `RGBA`: Direct active-row encoding without a pixel copy
+                /// - `BGRA`: Swaps red and blue channels and preserves alpha
+                /// - `RGBX`: Treats the fourth byte as padding and writes opaque alpha
+                /// - `BGRX`: Swaps red/blue and writes opaque alpha
+                /// - Other formats: Returns an error (unsupported for now)
+                ///
+                /// # Stride Handling
+                ///
+                /// This method consumes active pixels row-by-row according to the frame's
+                /// validated line stride. Valid row padding is skipped. RGBA rows borrow
+                /// directly; other supported formats reuse at most `width * 4` scratch bytes.
+                /// Codec buffers and encoded output require additional memory.
+                ///
+                /// # Errors
+                ///
+                /// Returns an error if:
+                /// - The frame format is not RGBA/RGBX/BGRA/BGRX
+                /// - PNG encoding fails
+                ///
+                /// # Example
+                ///
+                /// ```no_run
+                /// # use grafton_ndi::{Ndi, Finder, FinderOptions, ReceiverOptions, Receiver, ReceiverColorFormat};
+                /// # use std::time::Duration;
+                /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+                /// # let ndi = Ndi::new()?;
+                /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
+                /// # finder.wait_for_sources(Duration::from_millis(1000))?;
+                /// # let sources = finder.current_sources()?;
+                /// # let Some(source) = sources.first() else { return Ok(()); };
+                /// # let options = ReceiverOptions::new(source.clone()).color_format(ReceiverColorFormat::RgbxRgba);
+                /// # let receiver = Receiver::new(&ndi, &options)?;
+                #[doc = concat!(" # let Some(video_frame) = receiver.video().", stringify!($capture), "(Duration::from_secs(5))? else { return Ok(()); };")]
+                /// let png_bytes = video_frame.encode_png()?;
+                /// std::fs::write("frame.png", &png_bytes)?;
+                /// # Ok(())
+                /// # }
+                /// ```
+                #[cfg(feature = "image-encoding")]
+                pub fn encode_png(&self) -> $crate::Result<Vec<u8>> {
+                    self.image_source()?.encode_png()
+                }
+
+                /// Encode the video frame as JPEG bytes with the specified quality.
+                ///
+                $(#[$encoders])*
+                ///
+                /// This method encodes the frame to JPEG format, automatically handling color format
+                /// conversion from the NDI frame format into codec component rows without
+                /// a full-frame RGB staging buffer. Codec/output storage is additional.
+                ///
+                /// # Arguments
+                ///
+                /// * `quality` - JPEG quality from 1 (lowest) to 100 (highest). Typical values are 80-95.
+                ///
+                /// # Supported Formats
+                ///
+                /// - `RGBA` / `RGBX`: Emits RGB
+                /// - `BGRA` / `BGRX`: Swaps red/blue and emits RGB
+                /// - Other formats: Returns an error (unsupported for now)
+                ///
+                /// # Errors
+                ///
+                /// Returns an error if:
+                /// - The frame format is not RGBA/RGBX/BGRA/BGRX
+                /// - The quality is outside `1..=100`
+                /// - The dimensions exceed JPEG's `u16` width/height range
+                /// - JPEG encoding fails
+                ///
+                /// # Example
+                ///
+                /// ```no_run
+                /// # use grafton_ndi::{Ndi, Finder, FinderOptions, ReceiverOptions, Receiver, ReceiverColorFormat};
+                /// # use std::time::Duration;
+                /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+                /// # let ndi = Ndi::new()?;
+                /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
+                /// # finder.wait_for_sources(Duration::from_millis(1000))?;
+                /// # let sources = finder.current_sources()?;
+                /// # let Some(source) = sources.first() else { return Ok(()); };
+                /// # let options = ReceiverOptions::new(source.clone()).color_format(ReceiverColorFormat::RgbxRgba);
+                /// # let receiver = Receiver::new(&ndi, &options)?;
+                #[doc = concat!(" # let Some(video_frame) = receiver.video().", stringify!($capture), "(Duration::from_secs(5))? else { return Ok(()); };")]
+                /// let jpeg_bytes = video_frame.encode_jpeg(85)?;
+                /// std::fs::write("frame.jpg", &jpeg_bytes)?;
+                /// # Ok(())
+                /// # }
+                /// ```
+                #[cfg(feature = "image-encoding")]
+                pub fn encode_jpeg(&self, quality: u8) -> $crate::Result<Vec<u8>> {
+                    self.image_source()?.encode_jpeg(quality)
+                }
+
+                /// Encode the video frame as a base64 data URL for embedding in HTML/JSON.
+                ///
+                $(#[$encoders])*
+                ///
+                /// This produces a string in the format: `data:image/png;base64,...` or
+                /// `data:image/jpeg;base64,...` that can be directly used in HTML `<img>` tags
+                /// or stored in JSON.
+                ///
+                /// # Arguments
+                ///
+                /// * `format` - The image format to use (PNG or JPEG with quality)
+                ///
+                /// # Example
+                ///
+                /// ```no_run
+                /// # use grafton_ndi::{Ndi, Finder, FinderOptions, ReceiverOptions, Receiver, ReceiverColorFormat, ImageFormat};
+                /// # use std::time::Duration;
+                /// # fn main() -> Result<(), grafton_ndi::Error> {
+                /// # let ndi = Ndi::new()?;
+                /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
+                /// # finder.wait_for_sources(Duration::from_millis(1000))?;
+                /// # let sources = finder.current_sources()?;
+                /// # let Some(source) = sources.first() else { return Ok(()); };
+                /// # let options = ReceiverOptions::new(source.clone()).color_format(ReceiverColorFormat::RgbxRgba);
+                /// # let receiver = Receiver::new(&ndi, &options)?;
+                #[doc = concat!(" # let Some(video_frame) = receiver.video().", stringify!($capture), "(Duration::from_secs(5))? else { return Ok(()); };")]
+                ///
+                /// // As PNG
+                /// let data_url = video_frame.encode_data_url(ImageFormat::Png)?;
+                /// println!("<img src=\"{}\">", data_url);
+                ///
+                /// // As JPEG with quality 90
+                /// let data_url = video_frame.encode_data_url(ImageFormat::Jpeg(90))?;
+                /// # Ok(())
+                /// # }
+                /// ```
+                #[cfg(feature = "image-encoding")]
+                pub fn encode_data_url(&self, format: $crate::frames::ImageFormat) -> $crate::Result<String> {
+                    self.image_source()?.encode_data_url(format)
+                }
+            }
+        }
+    };
+    (
+        $(#[$attr:meta])*
+        impl[$($generics:tt)*] $frame:ty;
+        debug($name:expr, $data:literal = $data_len:ident);
+        timecode { $(#[$timecode:meta])* }
+        line_stride_bytes { $(#[$line_stride:meta])* }
+        plane { $(#[$plane:meta])* }
+    ) => {
+        $crate::frames::video_accessors! {
+            @shared
+            $(#[$attr])*
+            impl[$($generics)*] $frame;
+            debug($name, $data = $data_len);
+            timecode { $(#[$timecode])* }
+            line_stride_bytes { $(#[$line_stride])* }
+            plane { $(#[$plane])* }
+            items {}
+        }
+    };
+    // The accessors and `Debug` of every video frame, with a frame type's
+    // own `items` and the accessors among them that `Debug` prints last.
+    (
+        @shared
+        $(#[$attr:meta])*
+        impl[$($generics:tt)*] $frame:ty;
+        debug($name:expr, $data:literal = $data_len:ident $(, $extra:ident)*);
+        timecode { $(#[$timecode:meta])* }
+        line_stride_bytes { $(#[$line_stride:meta])* }
+        plane { $(#[$plane:meta])* }
+        items { $($items:tt)* }
+    ) => {
+        $(#[$attr])*
+        impl<$($generics)*> $frame {
+            /// Get the frame width in pixels.
+            #[inline]
+            pub fn width(&self) -> u32 {
+                $crate::frames::VideoParts::layout(self).width
+            }
+
+            /// Get the frame height in pixels.
+            #[inline]
+            pub fn height(&self) -> u32 {
+                $crate::frames::VideoParts::layout(self).height
+            }
+
+            /// Get the pixel format.
+            ///
+            /// It is a supported uncompressed format, validated when the
+            /// frame was constructed.
+            #[inline]
+            pub fn pixel_format(&self) -> $crate::PixelFormat {
+                $crate::frames::VideoParts::layout(self).pixel_format
+            }
+
+            /// Get the frame rate.
+            #[inline]
+            pub fn frame_rate(&self) -> $crate::FrameRate {
+                $crate::frames::VideoParts::header(self).frame_rate
+            }
+
+            /// Get the picture aspect ratio, width over height as displayed; `0.0`
+            /// means square pixels.
+            #[inline]
+            pub fn picture_aspect_ratio(&self) -> f32 {
+                $crate::frames::VideoParts::header(self).picture_aspect_ratio
+            }
+
+            /// Get the scan type: progressive, interlaced, or a single field.
+            #[inline]
+            pub fn scan_type(&self) -> $crate::ScanType {
+                $crate::frames::VideoParts::header(self).scan_type
+            }
+
+            /// Get the timecode.
+            ///
+            $(#[$timecode])*
+            #[inline]
+            pub fn timecode(&self) -> $crate::Timecode {
+                $crate::frames::VideoParts::header(self).timecode
+            }
+
+            /// Get the validated first-plane line stride in bytes: the
+            /// distance between the starts of consecutive rows of the first
+            /// plane.
+            ///
+            $(#[$line_stride])*
+            #[inline]
+            pub fn line_stride_bytes(&self) -> usize {
+                $crate::frames::VideoParts::layout(self).line_stride_bytes
+            }
+
+            /// Get frame metadata as UTF-8 text, if present.
+            ///
+            /// Empty metadata, `Some("")`, is distinct from none, `None`.
+            #[inline]
+            pub fn metadata(&self) -> Option<&str> {
+                $crate::frames::VideoParts::metadata_text(self)
+            }
+
+            /// Get one plane in SDK memory order, or `None` for an invalid index.
+            ///
+            /// Plane order follows the pixel format, as for
+            /// [`VideoPlane`](crate::VideoPlane), whose rows exclude any row
+            /// padding.
+            ///
+            $(#[$plane])*
+            #[inline]
+            pub fn plane(&self, index: usize) -> Option<$crate::VideoPlane<'_>> {
+                $crate::frames::VideoParts::plane_view(self, index)
+            }
+
+            /// Iterate planes in SDK memory order without allocating or copying.
+            #[inline]
+            pub fn planes(&self) -> $crate::VideoPlanes<'_> {
+                $crate::frames::VideoParts::plane_views(self)
+            }
+
+            $($items)*
+        }
+
+        $(#[$attr])*
+        impl<$($generics)*> ::std::fmt::Debug for $frame {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                f.debug_struct($name)
+                    .field("width", &self.width())
+                    .field("height", &self.height())
+                    .field("pixel_format", &self.pixel_format())
+                    .field("frame_rate", &self.frame_rate())
+                    .field("picture_aspect_ratio", &self.picture_aspect_ratio())
+                    .field("scan_type", &self.scan_type())
+                    .field("timecode", &self.timecode())
+                    .field($data, &$crate::frames::VideoParts::layout(self).$data_len)
+                    .field("line_stride_bytes", &self.line_stride_bytes())
+                    .field("metadata", &self.metadata())
+                    $(.field(stringify!($extra), &self.$extra()))*
+                    .finish()
+            }
+        }
+    };
+}
+pub(crate) use video_accessors;
+
 /// An owned video frame with validated dimensions, format, stride, and buffer size.
 ///
 /// Owned frames contain tightly packed active pixels: copies of borrowed or
@@ -551,22 +936,50 @@ pub struct VideoFrame {
     timestamp: Option<SdkTimestamp>,
 }
 
-impl fmt::Debug for VideoFrame {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("VideoFrame")
-            .field("width", &self.width())
-            .field("height", &self.height())
-            .field("pixel_format", &self.pixel_format())
-            .field("frame_rate", &self.frame_rate())
-            .field("picture_aspect_ratio", &self.picture_aspect_ratio())
-            .field("scan_type", &self.scan_type())
-            .field("timecode", &self.timecode())
-            .field("data (bytes)", &self.data.len())
-            .field("line_stride_bytes", &self.line_stride_bytes())
-            .field("metadata", &self.metadata())
-            .field("timestamp", &self.timestamp())
-            .finish()
+impl VideoParts for VideoFrame {
+    #[inline]
+    fn layout(&self) -> &ValidatedVideoLayout {
+        &self.layout
     }
+    #[inline]
+    fn header(&self) -> &VideoHeader {
+        &self.header
+    }
+    /// The frame's buffer holds its validated layout exactly, with every
+    /// byte initialized, and stays immutable while `self` is borrowed.
+    #[inline]
+    fn pixels(&self) -> *const u8 {
+        self.data.as_ptr()
+    }
+    #[inline]
+    fn metadata_text(&self) -> Option<&str> {
+        self.metadata.as_ref().map(FrameMetadata::as_str)
+    }
+    #[inline]
+    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+        self.timestamp
+    }
+}
+
+video_accessors! {
+    impl[] VideoFrame;
+    debug("VideoFrame", "data (bytes)" = data_len_bytes);
+    timecode {
+        /// A built frame starts with [`Timecode::SYNTHESIZE`]; a copy of a
+        /// received frame keeps the timecode it arrived with.
+    }
+    line_stride_bytes {
+        /// An owned frame's rows are tightly packed, so this is the packed
+        /// stride.
+    }
+    plane {
+        /// The rows of an owned frame have no padding.
+    }
+    timestamp {
+        /// A frame has one only when it was copied from a received frame
+        /// that carries one; frames built for sending have none.
+    }
+    encoders(capture) {}
 }
 
 impl VideoFrame {
@@ -612,56 +1025,6 @@ impl VideoFrame {
         )
     }
 
-    /// Get the frame width in pixels.
-    pub fn width(&self) -> u32 {
-        self.layout.width
-    }
-
-    /// Get the frame height in pixels.
-    pub fn height(&self) -> u32 {
-        self.layout.height
-    }
-
-    /// Get the supported pixel format.
-    pub fn pixel_format(&self) -> PixelFormat {
-        self.layout.pixel_format
-    }
-
-    /// Get the frame rate.
-    pub fn frame_rate(&self) -> FrameRate {
-        self.header.frame_rate
-    }
-
-    /// Get the picture aspect ratio, width over height as displayed; `0.0`
-    /// means square pixels.
-    pub fn picture_aspect_ratio(&self) -> f32 {
-        self.header.picture_aspect_ratio
-    }
-
-    /// Get the scan type.
-    pub fn scan_type(&self) -> ScanType {
-        self.header.scan_type
-    }
-
-    /// Get the timecode.
-    ///
-    /// A built frame starts with [`Timecode::SYNTHESIZE`]; a copy of a
-    /// received frame keeps the timecode it arrived with.
-    pub fn timecode(&self) -> Timecode {
-        self.header.timecode
-    }
-
-    /// Get the time the sender submitted this frame, when it was copied from
-    /// a received frame that carries one. Frames built for sending have none.
-    pub fn timestamp(&self) -> Option<SdkTimestamp> {
-        self.timestamp
-    }
-
-    /// Get the validated first-plane line stride in bytes.
-    pub fn line_stride_bytes(&self) -> usize {
-        self.layout.line_stride_bytes
-    }
-
     /// Set the timecode without reallocating the pixels.
     pub fn set_timecode(&mut self, timecode: Timecode) {
         self.header.timecode = timecode;
@@ -690,14 +1053,6 @@ impl VideoFrame {
         Ok(())
     }
 
-    pub(crate) fn validated_layout(&self) -> ValidatedVideoLayout {
-        self.layout
-    }
-
-    pub(crate) fn header(&self) -> VideoHeader {
-        self.header
-    }
-
     /// Get the frame data: every plane, tightly packed, in SDK plane order.
     pub fn data(&self) -> &[u8] {
         &self.data
@@ -723,27 +1078,6 @@ impl VideoFrame {
         Ok(())
     }
 
-    /// Get one plane in SDK memory order, or `None` for an invalid index.
-    ///
-    /// Plane order follows the pixel format, as for [`VideoPlane`]. The rows
-    /// of an owned frame have no padding.
-    pub fn plane(&self, index: usize) -> Option<VideoPlane<'_>> {
-        // SAFETY: the frame's buffer covers its validated layout with every
-        // byte initialized, and stays immutable while `self` is borrowed.
-        unsafe { self.layout.view_plane(self.data.as_ptr(), index) }
-    }
-
-    /// Iterate planes in SDK memory order without allocating or copying.
-    pub fn planes(&self) -> VideoPlanes<'_> {
-        // SAFETY: as for `plane`.
-        unsafe { self.layout.view_planes(self.data.as_ptr()) }
-    }
-
-    /// Get frame metadata as UTF-8 text, if present.
-    pub fn metadata(&self) -> Option<&str> {
-        self.metadata.as_ref().map(FrameMetadata::as_str)
-    }
-
     pub(crate) fn metadata_cstr(&self) -> Option<&CStr> {
         self.metadata.as_ref().map(FrameMetadata::as_cstr)
     }
@@ -764,148 +1098,6 @@ impl VideoFrame {
     pub fn set_metadata<S: Into<String>>(&mut self, metadata: Option<S>) -> Result<()> {
         self.metadata = metadata.map(FrameMetadata::new).transpose()?;
         Ok(())
-    }
-
-    #[cfg(feature = "image-encoding")]
-    fn image_source(&self) -> Result<ImagePixelSource<'_>> {
-        ImagePixelSource::from_plane(self.layout, self.plane(0).expect("validated video plane"))
-    }
-
-    /// Encode the video frame as PNG bytes.
-    ///
-    /// This method encodes the frame to PNG format, automatically handling color format
-    /// conversion from the NDI frame format (BGRA/RGBA/etc.) to PNG-compatible RGBA.
-    ///
-    /// # Supported Formats
-    ///
-    /// - `RGBA`: Direct active-row encoding without a pixel copy
-    /// - `BGRA`: Swaps red and blue channels and preserves alpha
-    /// - `RGBX`: Treats the fourth byte as padding and writes opaque alpha
-    /// - `BGRX`: Swaps red/blue and writes opaque alpha
-    /// - Other formats: Returns an error (unsupported for now)
-    ///
-    /// # Stride Handling
-    ///
-    /// This method consumes active pixels row-by-row according to the frame's
-    /// validated line stride. Valid row padding is skipped. RGBA rows borrow
-    /// directly; other supported formats reuse at most `width * 4` scratch bytes.
-    /// Codec buffers and encoded output require additional memory.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The frame format is not RGBA/RGBX/BGRA/BGRX
-    /// - PNG encoding fails
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{Ndi, Finder, FinderOptions, ReceiverOptions, Receiver, ReceiverColorFormat};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let ndi = Ndi::new()?;
-    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.wait_for_sources(Duration::from_millis(1000))?;
-    /// # let sources = finder.current_sources()?;
-    /// # let Some(source) = sources.first() else { return Ok(()); };
-    /// # let options = ReceiverOptions::new(source.clone()).color_format(ReceiverColorFormat::RgbxRgba);
-    /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// # let Some(video_frame) = receiver.video().capture(Duration::from_secs(5))? else { return Ok(()); };
-    /// let png_bytes = video_frame.encode_png()?;
-    /// std::fs::write("frame.png", &png_bytes)?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[cfg(feature = "image-encoding")]
-    pub fn encode_png(&self) -> Result<Vec<u8>> {
-        self.image_source()?.encode_png()
-    }
-
-    /// Encode the video frame as JPEG bytes with the specified quality.
-    ///
-    /// This method encodes the frame to JPEG format, automatically handling color format
-    /// conversion from the NDI frame format into codec component rows without
-    /// a full-frame RGB staging buffer. Codec/output storage is additional.
-    ///
-    /// # Arguments
-    ///
-    /// * `quality` - JPEG quality from 1 (lowest) to 100 (highest). Typical values are 80-95.
-    ///
-    /// # Supported Formats
-    ///
-    /// - `RGBA` / `RGBX`: Emits RGB
-    /// - `BGRA` / `BGRX`: Swaps red/blue and emits RGB
-    /// - Other formats: Returns an error (unsupported for now)
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The frame format is not RGBA/RGBX/BGRA/BGRX
-    /// - The quality is outside `1..=100`
-    /// - The dimensions exceed JPEG's `u16` width/height range
-    /// - JPEG encoding fails
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{Ndi, Finder, FinderOptions, ReceiverOptions, Receiver, ReceiverColorFormat};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let ndi = Ndi::new()?;
-    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.wait_for_sources(Duration::from_millis(1000))?;
-    /// # let sources = finder.current_sources()?;
-    /// # let Some(source) = sources.first() else { return Ok(()); };
-    /// # let options = ReceiverOptions::new(source.clone()).color_format(ReceiverColorFormat::RgbxRgba);
-    /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// # let Some(video_frame) = receiver.video().capture(Duration::from_secs(5))? else { return Ok(()); };
-    /// let jpeg_bytes = video_frame.encode_jpeg(85)?;
-    /// std::fs::write("frame.jpg", &jpeg_bytes)?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[cfg(feature = "image-encoding")]
-    pub fn encode_jpeg(&self, quality: u8) -> Result<Vec<u8>> {
-        self.image_source()?.encode_jpeg(quality)
-    }
-
-    /// Encode the video frame as a base64 data URL for embedding in HTML/JSON.
-    ///
-    /// This produces a string in the format: `data:image/png;base64,...` or
-    /// `data:image/jpeg;base64,...` that can be directly used in HTML `<img>` tags
-    /// or stored in JSON.
-    ///
-    /// # Arguments
-    ///
-    /// * `format` - The image format to use (PNG or JPEG with quality)
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{Ndi, Finder, FinderOptions, ReceiverOptions, Receiver, ReceiverColorFormat, ImageFormat};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = Ndi::new()?;
-    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.wait_for_sources(Duration::from_millis(1000))?;
-    /// # let sources = finder.current_sources()?;
-    /// # let Some(source) = sources.first() else { return Ok(()); };
-    /// # let options = ReceiverOptions::new(source.clone()).color_format(ReceiverColorFormat::RgbxRgba);
-    /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// # let Some(video_frame) = receiver.video().capture(Duration::from_secs(5))? else { return Ok(()); };
-    ///
-    /// // As PNG
-    /// let data_url = video_frame.encode_data_url(ImageFormat::Png)?;
-    /// println!("<img src=\"{}\">", data_url);
-    ///
-    /// // As JPEG with quality 90
-    /// let data_url = video_frame.encode_data_url(ImageFormat::Jpeg(90))?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[cfg(feature = "image-encoding")]
-    pub fn encode_data_url(&self, format: ImageFormat) -> Result<String> {
-        self.image_source()?.encode_data_url(format)
     }
 
     /// # Safety
@@ -1159,18 +1351,230 @@ impl VideoFrameBuilder {
     }
 }
 
+/// The parts of an audio frame that its shared accessors read.
+///
+/// [`AudioFrame`] and [`AudioRef`] lend their validated layout, timing,
+/// samples and metadata through it, and [`audio_accessors!`] generates
+/// their public accessors and `Debug` from it, so that each is written and
+/// documented once. The trait is crate-private, so these are its only implementations.
+///
+/// # Safety
+///
+/// The channel views read through [`samples`](Self::samples): it must point
+/// to `f32`-aligned storage that [`layout`](Self::layout) describes, with
+/// every channel's samples initialized and unchanged while `self` is
+/// borrowed. Padding between channels need not be initialized.
+pub(crate) trait AudioParts {
+    /// The validated layout of the frame's samples.
+    fn layout(&self) -> &ValidatedAudioLayout;
+
+    /// The frame's timecode.
+    fn timecode(&self) -> Timecode;
+
+    /// The time the sender submitted the frame, when it is known.
+    fn sdk_timestamp(&self) -> Option<SdkTimestamp>;
+
+    /// The start of the frame's sample storage.
+    fn samples(&self) -> *const f32;
+
+    /// The validated metadata text, or `None` when the frame has none.
+    fn metadata_text(&self) -> Option<&str>;
+
+    /// One channel's samples, or `None` for an invalid channel: the view
+    /// behind every generated `channel_data`.
+    #[inline]
+    fn channel_view(&self, channel: usize) -> Option<&[f32]> {
+        // SAFETY: the trait's contract: `samples` points to aligned storage
+        // `layout` describes, with every channel's samples initialized and
+        // unchanged while `self`, which the slice borrows, is borrowed.
+        unsafe { self.layout().channel(self.samples(), channel) }
+    }
+
+    /// Every channel's samples, in order: the view behind every generated
+    /// `channels`.
+    #[inline]
+    fn channel_views(&self) -> impl ExactSizeIterator<Item = &[f32]> + '_ {
+        // SAFETY: as for `channel_view`.
+        unsafe { self.layout().channels(self.samples()) }
+    }
+}
+
+/// Generate an audio frame type's shared public accessors and its `Debug`
+/// from its [`AudioParts`], so that each accessor is written, and
+/// documented, once. Every generated method delegates to the frame's
+/// validated parts.
+///
+/// A frame type passes its `impl` header, its `Debug` name and, for the
+/// accessors whose meaning differs between types, the type-specific
+/// paragraph of their docs.
+macro_rules! audio_accessors {
+    (
+        $(#[$attr:meta])*
+        impl[$($generics:tt)*] $frame:ty;
+        debug($name:expr);
+        timecode { $(#[$timecode:meta])* }
+        timestamp { $(#[$timestamp:meta])* }
+        channel_stride_bytes { $(#[$channel_stride:meta])* }
+        channel_data { $(#[$channel_data:meta])* }
+    ) => {
+        $(#[$attr])*
+        impl<$($generics)*> $frame {
+            /// Get the sample rate in Hz.
+            #[inline]
+            pub fn sample_rate(&self) -> u32 {
+                AudioParts::layout(self).sample_rate
+            }
+
+            /// Get the number of audio channels.
+            #[inline]
+            pub fn num_channels(&self) -> u32 {
+                AudioParts::layout(self).num_channels()
+            }
+
+            /// Get the number of samples per channel.
+            #[inline]
+            pub fn num_samples(&self) -> u32 {
+                AudioParts::layout(self).num_samples()
+            }
+
+            /// Get the timecode.
+            ///
+            $(#[$timecode])*
+            #[inline]
+            pub fn timecode(&self) -> Timecode {
+                AudioParts::timecode(self)
+            }
+
+            /// Get the time the sender submitted this frame.
+            ///
+            $(#[$timestamp])*
+            #[inline]
+            pub fn timestamp(&self) -> Option<SdkTimestamp> {
+                AudioParts::sdk_timestamp(self)
+            }
+
+            /// Get the audio format.
+            ///
+            /// It is a supported format, validated when the frame was
+            /// constructed.
+            #[inline]
+            pub fn format(&self) -> AudioFormat {
+                AudioParts::layout(self).format
+            }
+
+            /// Get the distance between the starts of consecutive channels in
+            /// bytes.
+            ///
+            $(#[$channel_stride])*
+            #[inline]
+            pub fn channel_stride_bytes(&self) -> usize {
+                AudioParts::layout(self).channel_stride_bytes()
+            }
+
+            /// Get frame metadata as UTF-8 text, if present.
+            ///
+            /// Empty metadata, `Some("")`, is distinct from none, `None`.
+            #[inline]
+            pub fn metadata(&self) -> Option<&str> {
+                AudioParts::metadata_text(self)
+            }
+
+            /// Get one channel's samples, or `None` for an invalid channel.
+            ///
+            /// The slice borrows the frame's samples without copying and
+            /// excludes any padding between channels.
+            ///
+            $(#[$channel_data])*
+            #[inline]
+            pub fn channel_data(&self, channel: usize) -> Option<&[f32]> {
+                AudioParts::channel_view(self, channel)
+            }
+
+            /// Iterate over the channels' samples, in channel order, without
+            /// copying or reading padding between channels.
+            #[inline]
+            pub fn channels(&self) -> impl ExactSizeIterator<Item = &[f32]> + '_ {
+                AudioParts::channel_views(self)
+            }
+        }
+
+        $(#[$attr])*
+        impl<$($generics)*> ::std::fmt::Debug for $frame {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                f.debug_struct($name)
+                    .field("sample_rate", &self.sample_rate())
+                    .field("num_channels", &self.num_channels())
+                    .field("num_samples", &self.num_samples())
+                    .field("timecode", &self.timecode())
+                    .field("format", &self.format())
+                    .field("samples per channel", &AudioParts::layout(self).no_samples)
+                    .field("channel_stride_bytes", &self.channel_stride_bytes())
+                    .field("metadata", &self.metadata())
+                    .field("timestamp", &self.timestamp())
+                    .finish()
+            }
+        }
+    };
+}
+
 /// Owned, tightly packed planar floating-point audio with a validated layout.
 ///
 /// Channel samples are contiguous, with channels stored one after another.
 /// Conversion from borrowed SDK audio omits inter-channel padding. Cloning
 /// copies the samples and metadata.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AudioFrame {
     layout: ValidatedAudioLayout,
     timecode: Timecode,
     data: Vec<f32>,
     metadata: Option<FrameMetadata>,
     timestamp: Option<SdkTimestamp>,
+}
+
+impl AudioParts for AudioFrame {
+    #[inline]
+    fn layout(&self) -> &ValidatedAudioLayout {
+        &self.layout
+    }
+    #[inline]
+    fn timecode(&self) -> Timecode {
+        self.timecode
+    }
+    #[inline]
+    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+        self.timestamp
+    }
+    /// The frame's buffer holds every sample of its packed layout,
+    /// initialized, and stays immutable while `self` is borrowed.
+    #[inline]
+    fn samples(&self) -> *const f32 {
+        self.data.as_ptr()
+    }
+    #[inline]
+    fn metadata_text(&self) -> Option<&str> {
+        self.metadata.as_ref().map(FrameMetadata::as_str)
+    }
+}
+
+audio_accessors! {
+    impl[] AudioFrame;
+    debug("AudioFrame");
+    timecode {
+        /// A built frame starts with [`Timecode::SYNTHESIZE`]; a copy of a
+        /// received frame keeps the timecode it arrived with.
+    }
+    timestamp {
+        /// A frame has one only when it was copied from a received frame
+        /// that carries one; frames built for sending have none.
+    }
+    channel_stride_bytes {
+        /// It is one channel's samples, since an owned frame has no padding.
+    }
+    channel_data {
+        /// Data is always stored in planar format internally. If
+        /// `AudioLayout::Interleaved` was specified at build time, the data
+        /// was converted to planar during construction.
+    }
 }
 
 impl AudioFrame {
@@ -1242,49 +1646,9 @@ impl AudioFrame {
         unsafe { AudioCopySource::new(raw, layout, metadata_layout) }.to_frame()
     }
 
-    /// Get the sample rate in Hz.
-    pub fn sample_rate(&self) -> u32 {
-        self.layout.sample_rate
-    }
-
-    /// Get the number of audio channels.
-    pub fn num_channels(&self) -> u32 {
-        self.layout.num_channels()
-    }
-
-    /// Get the number of samples per channel.
-    pub fn num_samples(&self) -> u32 {
-        self.layout.num_samples()
-    }
-
-    /// Get the timecode.
-    ///
-    /// A built frame starts with [`Timecode::SYNTHESIZE`]; a copy of a
-    /// received frame keeps the timecode it arrived with.
-    pub fn timecode(&self) -> Timecode {
-        self.timecode
-    }
-
-    /// Get the time the sender submitted this frame, when it was copied from
-    /// a received frame that carries one. Frames built for sending have none.
-    pub fn timestamp(&self) -> Option<SdkTimestamp> {
-        self.timestamp
-    }
-
     /// Set the timecode without reallocating the samples.
     pub fn set_timecode(&mut self, timecode: Timecode) {
         self.timecode = timecode;
-    }
-
-    /// Get the audio format.
-    pub fn format(&self) -> AudioFormat {
-        self.layout.format
-    }
-
-    /// Get the distance between the starts of consecutive channels in bytes:
-    /// one channel's samples, since an owned frame has no padding.
-    pub fn channel_stride_bytes(&self) -> usize {
-        self.layout.channel_stride_bytes()
     }
 
     /// Get tightly packed planar audio as 32-bit floats.
@@ -1318,11 +1682,6 @@ impl AudioFrame {
         Ok(())
     }
 
-    /// Get frame metadata as UTF-8 text, if present.
-    pub fn metadata(&self) -> Option<&str> {
-        self.metadata.as_ref().map(FrameMetadata::as_str)
-    }
-
     /// Replace frame metadata.
     ///
     /// # Errors
@@ -1335,26 +1694,10 @@ impl AudioFrame {
         Ok(())
     }
 
-    /// Get audio data for a specific channel.
-    ///
-    /// Data is always stored in planar format internally. If `AudioLayout::Interleaved`
-    /// was specified at build time, the data was converted to planar during construction.
-    pub fn channel_data(&self, channel: usize) -> Option<&[f32]> {
-        let range = self.layout.channel_range(channel)?;
-        Some(&self.data[range])
-    }
-
     /// Get mutable samples for one channel without allocating.
     pub fn channel_data_mut(&mut self, channel: usize) -> Option<&mut [f32]> {
         let range = self.layout.channel_range(channel)?;
         Some(&mut self.data[range])
-    }
-
-    /// Iterate over the channels' samples, in channel order.
-    pub fn channels(&self) -> impl ExactSizeIterator<Item = &[f32]> + '_ {
-        // SAFETY: the frame's buffer holds every sample of its packed layout,
-        // initialized, and stays immutable while `self` is borrowed.
-        unsafe { self.layout.channels(self.data.as_ptr()) }
     }
 }
 
@@ -3461,67 +3804,6 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
         self.guard.frame()
     }
 
-    /// Get the frame width in pixels.
-    pub fn width(&self) -> u32 {
-        self.layout.width
-    }
-
-    /// Get the frame height in pixels.
-    pub fn height(&self) -> u32 {
-        self.layout.height
-    }
-
-    /// Get the pixel format.
-    ///
-    /// This is guaranteed to be a valid, supported format since it's validated during construction.
-    pub fn pixel_format(&self) -> PixelFormat {
-        self.layout.pixel_format
-    }
-
-    /// Get the frame rate.
-    pub fn frame_rate(&self) -> FrameRate {
-        self.header.frame_rate
-    }
-
-    /// Get the picture aspect ratio, width over height as displayed; `0.0`
-    /// means square pixels.
-    pub fn picture_aspect_ratio(&self) -> f32 {
-        self.header.picture_aspect_ratio
-    }
-
-    /// Get the scan type (progressive, interlaced, etc.).
-    pub fn scan_type(&self) -> ScanType {
-        self.header.scan_type
-    }
-
-    /// Get the timecode.
-    pub fn timecode(&self) -> Timecode {
-        self.header.timecode
-    }
-
-    /// Get the time the sender submitted this frame, or `None` when the SDK
-    /// does not know it.
-    pub fn timestamp(&self) -> Option<SdkTimestamp> {
-        SdkTimestamp::from_sdk(self.guard.frame().timestamp)
-    }
-
-    /// Get the validated first-plane line stride in bytes.
-    ///
-    /// This returns the cached, validated value computed at construction time.
-    pub fn line_stride_bytes(&self) -> usize {
-        self.layout.line_stride_bytes
-    }
-
-    /// Get frame metadata as UTF-8 text, if present.
-    pub fn metadata(&self) -> Option<&str> {
-        self.metadata.map(|text| {
-            // SAFETY: `new` validated `text` from this frame's `p_metadata`,
-            // and the guard keeps that SDK allocation live and unchanged
-            // while `self` is borrowed.
-            unsafe { text.text(self.guard.frame().p_metadata) }
-        })
-    }
-
     /// Borrow all active pixels when contiguous, in SDK plane order.
     ///
     /// Returns `None` if padding separates active rows or planes. Use
@@ -3538,46 +3820,6 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
         Some(unsafe {
             slice::from_raw_parts(self.guard.frame().p_data, self.layout.payload_len_bytes)
         })
-    }
-
-    /// Get one plane in SDK memory order, or `None` for an invalid index.
-    pub fn plane(&self, index: usize) -> Option<VideoPlane<'_>> {
-        // SAFETY: The returned lifetime borrows this guard, which retains the
-        // allocation and its initialized, immutable active rows.
-        unsafe { self.layout.view_plane(self.guard.frame().p_data, index) }
-    }
-
-    /// Iterate planes in SDK memory order without allocating or copying.
-    pub fn planes(&self) -> VideoPlanes<'_> {
-        // SAFETY: as for `plane`.
-        unsafe { self.layout.view_planes(self.guard.frame().p_data) }
-    }
-
-    #[cfg(feature = "image-encoding")]
-    fn image_source(&self) -> Result<ImagePixelSource<'_>> {
-        ImagePixelSource::from_plane(self.layout, self.plane(0).expect("validated video plane"))
-    }
-
-    /// Encode PNG directly from the borrowed SDK pixels, without first
-    /// copying the frame into an owned `VideoFrame`. Uses the same supported
-    /// formats and padding handling as [`VideoFrame::encode_png`].
-    #[cfg(feature = "image-encoding")]
-    pub fn encode_png(&self) -> Result<Vec<u8>> {
-        self.image_source()?.encode_png()
-    }
-
-    /// Encode JPEG directly from borrowed SDK pixels. Quality must be in
-    /// `1..=100`; see [`VideoFrame::encode_jpeg`] for format restrictions.
-    #[cfg(feature = "image-encoding")]
-    pub fn encode_jpeg(&self, quality: u8) -> Result<Vec<u8>> {
-        self.image_source()?.encode_jpeg(quality)
-    }
-
-    /// Encode borrowed SDK pixels as a PNG or JPEG base64 data URL without an
-    /// intermediate owned frame. See [`VideoFrame::encode_data_url`].
-    #[cfg(feature = "image-encoding")]
-    pub fn encode_data_url(&self, format: ImageFormat) -> Result<String> {
-        self.image_source()?.encode_data_url(format)
     }
 
     /// Copy this borrowed frame into an owned `VideoFrame`.
@@ -3633,22 +3875,53 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
     }
 }
 
-#[allow(private_bounds)]
-impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> fmt::Debug for VideoRef<'a, S> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct(S::REF_DEBUG_NAME)
-            .field("width", &self.width())
-            .field("height", &self.height())
-            .field("pixel_format", &self.pixel_format())
-            .field("frame_rate", &self.frame_rate())
-            .field("picture_aspect_ratio", &self.picture_aspect_ratio())
-            .field("scan_type", &self.scan_type())
-            .field("timecode", &self.timecode())
-            .field("active data (bytes)", &self.layout.payload_len_bytes)
-            .field("line_stride_bytes", &self.line_stride_bytes())
-            .field("metadata", &self.metadata())
-            .field("timestamp", &self.timestamp())
-            .finish()
+impl<S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoParts for VideoRef<'_, S> {
+    #[inline]
+    fn layout(&self) -> &ValidatedVideoLayout {
+        &self.layout
+    }
+    #[inline]
+    fn header(&self) -> &VideoHeader {
+        &self.header
+    }
+    /// `new` validated the layout from the frame this guard owns, and the
+    /// guard keeps the SDK's pixels allocated and unchanged while `self` is
+    /// borrowed.
+    #[inline]
+    fn pixels(&self) -> *const u8 {
+        self.guard.frame().p_data
+    }
+    #[inline]
+    fn metadata_text(&self) -> Option<&str> {
+        self.metadata.map(|text| {
+            // SAFETY: `new` validated `text` from this frame's `p_metadata`,
+            // and the guard keeps that SDK allocation live and unchanged
+            // while `self` is borrowed.
+            unsafe { text.text(self.guard.frame().p_metadata) }
+        })
+    }
+    #[inline]
+    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+        SdkTimestamp::from_sdk(self.guard.frame().timestamp)
+    }
+}
+
+video_accessors! {
+    #[allow(private_bounds)]
+    impl['a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>] VideoRef<'a, S>;
+    debug(S::REF_DEBUG_NAME, "active data (bytes)" = payload_len_bytes);
+    timecode {}
+    line_stride_bytes {
+        /// It is the SDK's stride, which can include row padding, cached and
+        /// validated when the frame was captured.
+    }
+    plane {}
+    timestamp {
+        /// It is `None` when the SDK does not know it.
+    }
+    encoders(capture_ref) {
+        /// It encodes directly from the borrowed SDK pixels, without first
+        /// copying the frame into an owned [`VideoFrame`].
     }
 }
 
@@ -3720,48 +3993,6 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
         })
     }
 
-    /// Get the sample rate in Hz.
-    pub fn sample_rate(&self) -> u32 {
-        self.layout.sample_rate
-    }
-
-    /// Get the number of audio channels.
-    pub fn num_channels(&self) -> u32 {
-        self.layout.num_channels()
-    }
-
-    /// Get the number of samples per channel.
-    pub fn num_samples(&self) -> u32 {
-        self.layout.num_samples()
-    }
-
-    /// Get the timecode.
-    pub fn timecode(&self) -> Timecode {
-        Timecode::from_ticks(self.guard.frame().timecode)
-    }
-
-    /// Get the time the sender submitted this frame, or `None` when the SDK
-    /// does not know it.
-    pub fn timestamp(&self) -> Option<SdkTimestamp> {
-        SdkTimestamp::from_sdk(self.guard.frame().timestamp)
-    }
-
-    /// Get the distance between the starts of consecutive channels in bytes,
-    /// including any padding between them.
-    pub fn channel_stride_bytes(&self) -> usize {
-        self.layout.channel_stride_bytes()
-    }
-
-    /// Get frame metadata as UTF-8 text, if present.
-    pub fn metadata(&self) -> Option<&str> {
-        self.metadata.map(|text| {
-            // SAFETY: `from_guard` validated `text` from this frame's
-            // `p_metadata`, and the guard keeps that SDK allocation live and
-            // unchanged while `self` is borrowed.
-            unsafe { text.text(self.guard.frame().p_metadata) }
-        })
-    }
-
     /// Get a zero-copy slice when channels are tightly packed.
     ///
     /// Returns `None` for multi-channel buffers with padding between channels.
@@ -3781,29 +4012,6 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
                 self.layout.sample_count,
             )
         })
-    }
-
-    /// Get the zero-copy samples for a single channel, excluding padding.
-    pub fn channel_data(&self, channel: usize) -> Option<&[f32]> {
-        // SAFETY: the guard retains the validated, aligned SDK buffer, whose
-        // channel samples are initialized, for this borrow.
-        unsafe {
-            self.layout
-                .channel(self.guard.frame().p_data.cast(), channel)
-        }
-    }
-
-    /// Iterate over channel slices without reading inter-channel padding.
-    pub fn channels(&self) -> impl ExactSizeIterator<Item = &[f32]> + '_ {
-        // SAFETY: as for `channel_data`.
-        unsafe { self.layout.channels(self.guard.frame().p_data.cast()) }
-    }
-
-    /// Get the audio format (FourCC code).
-    ///
-    /// This is guaranteed to be a valid, supported format since it's validated during construction.
-    pub fn format(&self) -> AudioFormat {
-        self.layout.format
     }
 
     /// Copy this borrowed frame into an owned `AudioFrame`.
@@ -3860,6 +4068,51 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
     }
 }
 
+impl<S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioParts for AudioRef<'_, S> {
+    #[inline]
+    fn layout(&self) -> &ValidatedAudioLayout {
+        &self.layout
+    }
+    #[inline]
+    fn timecode(&self) -> Timecode {
+        Timecode::from_ticks(self.guard.frame().timecode)
+    }
+    #[inline]
+    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+        SdkTimestamp::from_sdk(self.guard.frame().timestamp)
+    }
+    /// `from_guard` validated the layout, including sample alignment, from
+    /// the frame this guard owns, and the guard keeps the SDK's samples
+    /// allocated and unchanged while `self` is borrowed.
+    #[inline]
+    fn samples(&self) -> *const f32 {
+        self.guard.frame().p_data.cast()
+    }
+    #[inline]
+    fn metadata_text(&self) -> Option<&str> {
+        self.metadata.map(|text| {
+            // SAFETY: `from_guard` validated `text` from this frame's
+            // `p_metadata`, and the guard keeps that SDK allocation live and
+            // unchanged while `self` is borrowed.
+            unsafe { text.text(self.guard.frame().p_metadata) }
+        })
+    }
+}
+
+audio_accessors! {
+    #[allow(private_bounds)]
+    impl['a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>] AudioRef<'a, S>;
+    debug(S::REF_DEBUG_NAME);
+    timecode {}
+    timestamp {
+        /// It is `None` when the SDK does not know it.
+    }
+    channel_stride_bytes {
+        /// It includes any padding between channels.
+    }
+    channel_data {}
+}
+
 impl<'rx> AudioRef<'rx, AudioKind> {
     /// Create a borrowed audio frame from a receiver RAII guard, validated
     /// as [`from_guard`](Self::from_guard) describes.
@@ -3884,23 +4137,6 @@ impl<'fs> AudioRef<'fs, FrameSyncAudioFree> {
     /// `NDIlib_framesync_capture_audio_v2` with a capture request.
     pub(crate) unsafe fn new(guard: Guard<'fs, FrameSyncAudioFree>) -> Result<Self> {
         unsafe { Self::from_guard(guard) }
-    }
-}
-
-#[allow(private_bounds)]
-impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> fmt::Debug for AudioRef<'a, S> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct(S::REF_DEBUG_NAME)
-            .field("sample_rate", &self.sample_rate())
-            .field("num_channels", &self.num_channels())
-            .field("num_samples", &self.num_samples())
-            .field("timecode", &self.timecode())
-            .field("format", &self.format())
-            .field("samples per channel", &self.layout.no_samples)
-            .field("channel_stride_bytes", &self.channel_stride_bytes())
-            .field("metadata", &self.metadata())
-            .field("timestamp", &self.timestamp())
-            .finish()
     }
 }
 
@@ -4678,6 +4914,92 @@ mod tests {
                     assert_eq!(source.owned().data(), expected);
                     assert_copies_reuse(source, video_destinations("<video-padding/>".len()));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_video_planes_borrow_only_the_active_rows_of_a_padded_buffer() {
+        fn rows_of(planes: VideoPlanes<'_>) -> Vec<Vec<Vec<u8>>> {
+            planes
+                .map(|plane| plane.rows().map(<[u8]>::to_vec).collect())
+                .collect()
+        }
+        const PADDING: u8 = 0xEE;
+        // Independently specified active plane dimensions for 4x4 images.
+        let cases: &[(PixelFormat, &[(usize, usize)])] = &[
+            (PixelFormat::Bgra, &[(16, 4)]),
+            (PixelFormat::Bgrx, &[(16, 4)]),
+            (PixelFormat::Rgba, &[(16, 4)]),
+            (PixelFormat::Rgbx, &[(16, 4)]),
+            (PixelFormat::Uyvy, &[(8, 4)]),
+            (PixelFormat::Uyva, &[(8, 4), (4, 4)]),
+            (PixelFormat::P216, &[(8, 4), (8, 4)]),
+            (PixelFormat::Pa16, &[(8, 4), (8, 4), (8, 4)]),
+            (PixelFormat::Yv12, &[(4, 4), (2, 2), (2, 2)]),
+            (PixelFormat::I420, &[(4, 4), (2, 2), (2, 2)]),
+            (PixelFormat::Nv12, &[(4, 4), (4, 2)]),
+        ];
+        for &(format, dimensions) in cases {
+            for padding in [0, 4, 8] {
+                let stride = dimensions[0].0 + padding;
+                // Each row's active bytes followed by its padding, which holds
+                // a marker; the expected rows hold the active bytes alone.
+                let mut buffer = Vec::new();
+                let mut expected = Vec::new();
+                let mut row_offsets = Vec::new();
+                for (i, &(active, rows)) in dimensions.iter().enumerate() {
+                    let plane_stride = stride * active / dimensions[0].0;
+                    let mut plane_rows = Vec::new();
+                    let mut plane_offsets = Vec::new();
+                    for row in 0..rows {
+                        let values: Vec<u8> = (0..active)
+                            .map(|byte| (i * 71 + row * 17 + byte) as u8)
+                            .collect();
+                        plane_offsets.push(buffer.len());
+                        buffer.extend_from_slice(&values);
+                        buffer.resize(buffer.len() + plane_stride - active, PADDING);
+                        plane_rows.push(values);
+                    }
+                    expected.push(plane_rows);
+                    row_offsets.push(plane_offsets);
+                }
+                let frame = crate::BorrowedVideoFrame::builder(&buffer, 4, 4, format)
+                    .line_stride(stride)
+                    .build()
+                    .unwrap();
+                // `data` is the whole padded storage; the views see past it.
+                assert_eq!(frame.data(), buffer);
+                let ((), allocations) = crate::test_alloc::allocation_count(|| {
+                    assert_eq!(frame.planes().len(), dimensions.len());
+                    assert!(frame.plane(dimensions.len()).is_none());
+                    for (i, plane) in frame.planes().enumerate() {
+                        let (active, rows) = dimensions[i];
+                        assert_eq!(plane.row_stride(), stride * active / dimensions[0].0);
+                        assert_eq!(plane.active_row_bytes(), active);
+                        assert_eq!(plane.row_count(), rows);
+                        assert_eq!(plane.data().is_some(), padding == 0);
+                        assert!(plane.row(rows).is_none());
+                        let indexed = frame.plane(i).unwrap();
+                        for (row_index, row) in plane.rows().enumerate() {
+                            assert_eq!(row, expected[i][row_index]);
+                            assert_eq!(indexed.row(row_index), Some(row));
+                            // Borrowed in place, at the row's start in the buffer.
+                            assert_eq!(row.as_ptr(), buffer[row_offsets[i][row_index]..].as_ptr());
+                        }
+                    }
+                });
+                assert_eq!(allocations, 0);
+                assert_eq!(rows_of(frame.planes()), expected);
+                // The owned copy holds the same rows, packed without padding,
+                // and a frame borrowing that copy views them unchanged.
+                let owned = frame.try_to_owned().unwrap();
+                assert_eq!(rows_of(owned.planes()), expected);
+                assert_eq!(
+                    rows_of(crate::BorrowedVideoFrame::from(&owned).planes()),
+                    expected
+                );
+                assert!(owned.planes().all(|plane| plane.data().is_some()));
             }
         }
     }
@@ -6982,6 +7304,23 @@ mod tests {
         assert_eq!((frame.num_samples(), frame.num_channels()), (1024, 2));
         assert_eq!(frame.sample_rate(), 48_000);
         assert_eq!(frame.timestamp(), Some(SdkTimestamp::from_ticks(67890)));
+    }
+
+    #[test]
+    fn audio_frame_debug_lists_the_borrowed_frame_fields_not_samples() {
+        let frame = AudioFrame::builder()
+            .num_channels(2)
+            .num_samples(3)
+            .timecode(Timecode::from_ticks(5))
+            .metadata("<audio/>")
+            .build()
+            .unwrap();
+        assert_eq!(
+            format!("{frame:?}"),
+            "AudioFrame { sample_rate: 48000, num_channels: 2, num_samples: 3, \
+             timecode: Timecode(5), format: Fltp, samples per channel: 3, \
+             channel_stride_bytes: 12, metadata: Some(\"<audio/>\"), timestamp: None }"
+        );
     }
 
     #[test]

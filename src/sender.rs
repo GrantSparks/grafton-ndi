@@ -399,20 +399,49 @@ pub struct BorrowedVideoFrame<'buf> {
     metadata_layout: Option<MetadataText>,
 }
 
-impl fmt::Debug for BorrowedVideoFrame<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BorrowedVideoFrame")
-            .field("width", &self.width())
-            .field("height", &self.height())
-            .field("pixel_format", &self.pixel_format())
-            .field("frame_rate", &self.frame_rate())
-            .field("picture_aspect_ratio", &self.picture_aspect_ratio())
-            .field("scan_type", &self.scan_type())
-            .field("timecode", &self.timecode())
-            .field("data (bytes)", &self.data.len())
-            .field("line_stride_bytes", &self.line_stride_bytes())
-            .field("metadata", &self.metadata())
-            .finish()
+impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
+    #[inline]
+    fn layout(&self) -> &ValidatedVideoLayout {
+        &self.layout
+    }
+    #[inline]
+    fn header(&self) -> &VideoHeader {
+        &self.header
+    }
+    /// `data` is exactly the storage the layout describes, as construction
+    /// checked, initialized like any slice, and borrowed unchanged for
+    /// `'buf`.
+    #[inline]
+    fn pixels(&self) -> *const u8 {
+        self.data.as_ptr()
+    }
+    #[inline]
+    fn metadata_text(&self) -> Option<&str> {
+        let (metadata, text) = self.metadata.zip(self.metadata_layout)?;
+        // SAFETY: Construction validated `text` from this same immutable CStr,
+        // which stays borrowed for `'buf`.
+        Some(unsafe { text.text(metadata.as_ptr()) })
+    }
+    /// A frame built for sending carries no timestamp; [`Self::to_raw`]
+    /// sends none.
+    #[inline]
+    fn sdk_timestamp(&self) -> Option<crate::SdkTimestamp> {
+        None
+    }
+}
+
+crate::frames::video_accessors! {
+    impl['buf] BorrowedVideoFrame<'buf>;
+    debug("BorrowedVideoFrame", "data (bytes)" = data_len_bytes);
+    timecode {}
+    line_stride_bytes {
+        /// It is the stride the frame was built with, which can include row
+        /// padding.
+    }
+    plane {
+        /// Its rows exclude the padding of the frame's line stride, which
+        /// [`Self::data`] includes, so the active pixels of a padded buffer
+        /// can be read in place.
     }
 }
 
@@ -549,60 +578,12 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         .copy_into(destination)
     }
 
-    /// Get the frame width in pixels.
-    pub fn width(&self) -> u32 {
-        self.layout.width
-    }
-
-    /// Get the frame height in pixels.
-    pub fn height(&self) -> u32 {
-        self.layout.height
-    }
-
-    /// Get the validated uncompressed pixel format.
-    pub fn pixel_format(&self) -> PixelFormat {
-        self.layout.pixel_format
-    }
-
-    /// Get the frame rate.
-    pub fn frame_rate(&self) -> FrameRate {
-        self.header.frame_rate
-    }
-
-    /// Get the picture aspect ratio, width over height as displayed; `0.0`
-    /// means square pixels.
-    pub fn picture_aspect_ratio(&self) -> f32 {
-        self.header.picture_aspect_ratio
-    }
-
-    /// Get the scan type.
-    pub fn scan_type(&self) -> ScanType {
-        self.header.scan_type
-    }
-
-    /// Get the timecode.
-    pub fn timecode(&self) -> Timecode {
-        self.header.timecode
-    }
-
     /// Get the pixel data: exactly the frame's validated storage, including
     /// any row padding. Bytes of the source buffer beyond the frame are not
-    /// part of it.
+    /// part of it. [`Self::plane`] and [`Self::planes`] borrow the active
+    /// rows alone.
     pub fn data(&self) -> &[u8] {
         self.data
-    }
-
-    /// Get the validated first-plane line stride in bytes.
-    pub fn line_stride_bytes(&self) -> usize {
-        self.layout.line_stride_bytes
-    }
-
-    /// Get cached UTF-8 metadata text, preserving absent versus present-empty.
-    pub fn metadata(&self) -> Option<&str> {
-        let (metadata, text) = self.metadata.zip(self.metadata_layout)?;
-        // SAFETY: Construction validated `text` from this same immutable CStr,
-        // which stays borrowed for `'buf`.
-        Some(unsafe { text.text(metadata.as_ptr()) })
     }
 
     /// Return this frame with `timecode`.
@@ -737,8 +718,8 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
 impl<'buf> From<&'buf VideoFrame> for BorrowedVideoFrame<'buf> {
     fn from(frame: &'buf VideoFrame) -> Self {
         BorrowedVideoFrame {
-            layout: frame.validated_layout(),
-            header: frame.header(),
+            layout: *crate::frames::VideoParts::layout(frame),
+            header: *crate::frames::VideoParts::header(frame),
             data: frame.data(),
             metadata: frame.metadata_cstr(),
             metadata_layout: frame.validated_metadata(),
