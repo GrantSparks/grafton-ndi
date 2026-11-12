@@ -373,7 +373,11 @@ as `None`. Most programs need changes; see the
   the build machine from an installed Advanced SDK. Without one the same API
   compiles and every native operation returns `Error::UnsupportedCapability`,
   and older or partial Advanced headers disable only the operations they do not
-  declare. See the [Advanced SDK guide](docs/advanced.md).
+  declare. Every public type has the same auto traits with and without the
+  headers. `CompressedSender`, `QueuedSender`, `PacketReceiver` and
+  `AllocatedPacketReceiver` are `Send` and `Sync`, and `AvSync` and `Genlock`
+  are `Send`: each can be created on one thread and used and dropped on
+  another. See the [Advanced SDK guide](docs/advanced.md).
 - `advanced::CompressedSender::sender` and `advanced::QueuedSender::sender`
   lend their native sender as `Sender<CompressedAttached>` and
   `Sender<QueueAttached>`, with every operation the modes share, so a
@@ -395,7 +399,8 @@ as `None`. Most programs need changes; see the
   `set_streams` and `kvm` itself. `AvSync::synchronize` takes `&self` and
   reads the video frame in place, an owned `VideoFrame` or a `VideoFrameRef`
   captured with `capture_ref`, so the capture-then-synchronize loop copies no
-  pixels. `AvSync` is neither `Send` nor `Sync`.
+  pixels. `AvSync` is `Send` but not `Sync`: it can move to another thread,
+  and synchronizes one call at a time.
 - `advanced::KvmSession::receiver` lends the session's receiver for the whole
   session, so frames can be captured, and held, while keys, buttons and
   touches stay pressed across them on one connection. `Receiver::kvm` still
@@ -443,6 +448,9 @@ as `None`. Most programs need changes; see the
 
 ### Changed
 
+- `Receiver`, in every mode, and `FrameSync` are `RefUnwindSafe`, so a shared
+  reference to one can cross `catch_unwind`. Their shared state has no lock
+  that a panic can leave half-changed.
 - `AudioFrame`'s `Debug` output lists the same fields as `AudioFrameRef`'s
   and `FrameSyncAudioRef`'s: sample rate, channel and sample counts,
   timecode, format, channel stride, metadata and timestamp. It no longer
