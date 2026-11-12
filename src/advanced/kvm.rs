@@ -1,8 +1,8 @@
 //! Remote keyboard, mouse, touch and clipboard control of a source.
 
-use std::{collections::BTreeSet, ffi::CString};
+use std::{collections::BTreeSet, ffi::CString, time::Duration};
 
-use super::invalid_input;
+use super::{invalid_input, PacketAttached, PacketEvent, PacketReceiver};
 use crate::{
     sys::{
         advanced::{native, Kvm},
@@ -33,9 +33,24 @@ pub enum WheelAxis {
 
 /// Exclusive remote control of the source a receiver is connected to.
 ///
-/// Created by [`Receiver::kvm`]; the receiver is borrowed mutably for the
-/// session, so nothing else can use it meanwhile. The session never reads the
-/// local clipboard: it sends only the text it is given.
+/// Created by [`Receiver::kvm`], which borrows the receiver mutably, so a
+/// receiver has at most one session at a time. The session lends the receiver
+/// back as a shared reference through [`receiver`](Self::receiver), so frames
+/// can be captured, and held, while keys, buttons and touches stay pressed
+/// across them. The lent receiver offers what any `&Receiver` offers: capture,
+/// tally, PTZ, statistics, metadata and reconnecting. For a
+/// [`PacketReceiver`](super::PacketReceiver), which has no frame capture of its
+/// own, [`KvmSession::capture`] on a session from `packets.receiver_mut().kvm()`
+/// delivers its packets and events.
+///
+/// A source change through the lent receiver (`connect_to`, `reconnect` or
+/// `disconnect`) leaves whatever the session holds pressed on the previous
+/// source, and the session cannot tell it to let go once the receiver has moved
+/// on. Call [`release_all`](Self::release_all) before changing source.
+///
+/// The session never reads the local clipboard: it sends only the text it is
+/// given. It is `Send` and `Sync`, as the receiver is; its input methods take
+/// `&mut self`, so one thread at a time sends input.
 ///
 /// Every method that sends a message returns
 /// [`Error::NativeOperationFailed`], naming the SDK function, when the SDK did
@@ -44,7 +59,7 @@ pub enum WheelAxis {
 /// pressed, and dropping it releases them on a best-effort basis; call
 /// [`release_all`](Self::release_all) to learn whether that succeeded.
 pub struct KvmSession<'a, M: ReceiverMode> {
-    receiver: &'a mut Receiver<M>,
+    receiver: &'a Receiver<M>,
     kvm: &'static Kvm,
     keys: BTreeSet<i32>,
     buttons: BTreeSet<MouseButton>,
@@ -58,10 +73,13 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// [`Error::UnsupportedCapability`]
     /// without an Advanced runtime (or in a build without the Advanced SDK).
+    ///
+    /// The receiver stays borrowed for the session, so only one exists at a
+    /// time; use [`KvmSession::receiver`] to keep using it meanwhile.
     pub fn kvm(&mut self) -> Result<KvmSession<'_, M>> {
         Ok(KvmSession {
             kvm: self.core._ndi.table()?,
-            receiver: self,
+            receiver: &*self,
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
             touching: false,
@@ -79,8 +97,11 @@ impl<M: ReceiverMode> Receiver<M> {
 macro_rules! kvm_send {
     ($session:expr, $func:ident $(, $arg:expr)*) => {{
         let (kvm, instance) = ($session.kvm, $session.instance());
-        // SAFETY: the receiver instance is live for the session's borrow, and
-        // every argument outlives the synchronous call.
+        // SAFETY: the receiver instance is live for the session's shared
+        // borrow of the receiver, and every argument outlives the synchronous
+        // call. Like the receiver's PTZ commands, which run through `&self`,
+        // these functions take the instance alone, so concurrent use of the
+        // receiver through `receiver()` does not conflict with them.
         let sent = native!(Kvm, kvm => unsafe { kvm.$func(instance $(, $arg)*) });
         if sent {
             Ok(())
@@ -113,7 +134,17 @@ fn validate_position(x: f32, y: f32) -> Result<()> {
     }
 }
 
-impl<M: ReceiverMode> KvmSession<'_, M> {
+impl<'a, M: ReceiverMode> KvmSession<'a, M> {
+    /// The receiver, lent for the session's whole lifetime.
+    ///
+    /// A frame captured through it can be held while the session's input
+    /// methods run, which is how a key, button or touch stays down across
+    /// captured frames. Changing the source through it is covered in the
+    /// [type documentation](KvmSession).
+    pub fn receiver(&self) -> &'a Receiver<M> {
+        self.receiver
+    }
+
     fn instance(&self) -> NDIlib_recv_instance_t {
         self.receiver.core.instance
     }
@@ -304,6 +335,23 @@ impl<M: ReceiverMode> KvmSession<'_, M> {
             released = released.and(self.finish_touch());
         }
         released
+    }
+}
+
+impl KvmSession<'_, PacketAttached> {
+    /// Wait up to `timeout` for the next frame or event of a
+    /// [`PacketReceiver`], exactly as [`PacketReceiver::capture`] does, while
+    /// the session holds its inputs.
+    ///
+    /// Every result owns its data, so nothing it returns keeps the session
+    /// borrowed. It takes `&mut self`, as the packet receiver's does, so one
+    /// capture runs at a time.
+    ///
+    /// # Errors
+    ///
+    /// As for [`PacketReceiver::capture`].
+    pub fn capture(&mut self, timeout: Duration) -> Result<Option<PacketEvent>> {
+        PacketReceiver::capture_from(self.receiver, timeout)
     }
 }
 

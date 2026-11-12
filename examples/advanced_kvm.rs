@@ -2,7 +2,7 @@
 //!
 //! This example demonstrates:
 //! - Starting a [`KvmSession`](grafton_ndi::advanced::KvmSession) on a receiver
-//! - Moving the pointer and clicking
+//! - Capturing video through the session while a drag stays held
 //! - Releasing everything that was pressed
 //!
 //! Needs the NDI Advanced SDK at build time and an Advanced runtime.
@@ -45,13 +45,25 @@ fn main() -> Result<(), Error> {
         return Ok(());
     }
 
-    // Click once in the middle of the source's screen.
-    session.move_pointer(0.5, 0.5)?;
+    // Drag from the left of the source's screen to the right. The button
+    // stays down across the frames captured through the session's receiver.
+    session.move_pointer(0.25, 0.5)?;
     session.mouse_down(MouseButton::Left)?;
+    for step in 1..=5u8 {
+        // The frame stays borrowed from the receiver while input is sent.
+        let frame = session
+            .receiver()
+            .video()
+            .capture_ref(Duration::from_secs(1))?;
+        if let Some(frame) = &frame {
+            println!("Frame {}x{} while dragging", frame.width(), frame.height());
+        }
+        session.move_pointer(0.25 + 0.1 * f32::from(step), 0.5)?;
+    }
     session.mouse_up(MouseButton::Left)?;
 
     match session.release_all() {
-        Ok(()) => println!("Clicked, and nothing is left pressed"),
+        Ok(()) => println!("Dragged, and nothing is left pressed"),
         Err(error) => println!("Something may still be pressed: {error}"),
     }
     Ok(())

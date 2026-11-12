@@ -1,0 +1,9 @@
+error[E0499]: cannot borrow `*receiver` as mutable more than once at a time
+ --> tests/ui/advanced/fail/second_kvm_session.rs:5:18
+  |
+4 |     let first = receiver.kvm().unwrap();
+  |                 -------- first mutable borrow occurs here
+5 |     let second = receiver.kvm().unwrap();
+  |                  ^^^^^^^^ second mutable borrow occurs here
+6 |     let _ = (first.is_supported(), second.is_supported());
+  |              ----- first borrow later used here

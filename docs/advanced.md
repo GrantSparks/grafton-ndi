@@ -492,8 +492,16 @@ have the same encoder guidance, keyframe and tally methods as `Sender`.
 ## KVM
 
 `Receiver::kvm` starts a `KvmSession`, exclusive remote control of the source
-the receiver is connected to. The receiver is borrowed mutably for the session.
-The session sends pointer, button, wheel, key, touch and clipboard messages. A
+the receiver is connected to. The receiver is borrowed mutably to start the
+session, so a receiver has one session at a time, and the session lends it back
+as `&Receiver` through `receiver()` for the session's whole lifetime. A video
+frame captured through it can be held while the session sends input, so a key,
+button or touch stays down across captured frames. For a `PacketReceiver`,
+start the session with `receiver_mut().kvm()` and capture with
+`KvmSession::capture`, which behaves as `PacketReceiver::capture` does. A
+source change through the lent receiver (`connect_to`, `reconnect`,
+`disconnect`) leaves held inputs on the previous source: call `release_all`
+first. The session sends pointer, button, wheel, key, touch and clipboard messages. A
 message the SDK does not send, for example because nothing is connected, is
 reported as `Error::NativeOperationFailed` naming the SDK function; a message
 it sends is not a confirmation that the source acted on it. `is_supported`

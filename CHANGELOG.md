@@ -329,6 +329,13 @@ as `None`. Most programs need changes; see the
   metadata and the keyframe and stream controls, but no audio, metadata or
   event capture of its own, which packet capture takes. `AllocatedPacketReceiver`
   lends it through `receiver` and has `set_stream_tier` and `set_streams`.
+- `advanced::KvmSession::receiver` lends the session's receiver for the whole
+  session, so frames can be captured, and held, while keys, buttons and
+  touches stay pressed across them on one connection. `Receiver::kvm` still
+  borrows the receiver mutably, so a receiver has one session at a time. A
+  session started from `PacketReceiver::receiver_mut` captures packets and
+  events with `KvmSession::capture`. Inputs held when the lent receiver changes
+  source stay pressed on the previous source; call `release_all` first.
 - `Ndi::process_lifetime`, an explicit opt-in that keeps NDI started until the
   process exits. Custom receive allocators require it.
 - The optional `file-io` feature and `file` module for the NDI File library of

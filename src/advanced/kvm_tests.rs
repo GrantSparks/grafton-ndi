@@ -78,10 +78,10 @@ fn rejected_releases_are_retained_and_drop_retries_only_the_inputs_still_pressed
     let Some(ndi) = crate::test_support::ndi() else {
         return;
     };
-    let mut receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new(""))).unwrap();
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new(""))).unwrap();
     CALLS.with_borrow_mut(|calls| *calls = Calls::default());
     let mut session = KvmSession {
-        receiver: &mut receiver,
+        receiver: &receiver,
         kvm: &TABLE,
         keys: BTreeSet::new(),
         buttons: BTreeSet::new(),
