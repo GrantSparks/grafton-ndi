@@ -36,14 +36,6 @@ fn async_flush_frame_ptr() -> *const NDIlib_video_frame_v2_t {
     ptr::null()
 }
 
-/// Every caller holds the sender's video state, by its lock or by `&mut`, so
-/// one sender's flushes never overlap; different senders flush independently.
-fn flush_null_frame(core: &sys::Core, instance: NDIlib_send_instance_t) {
-    // SAFETY: the caller owns a live sender instance created through `core`; a
-    // null frame is the SDK's documented request to drain the async buffer.
-    unsafe { core.NDIlib_send_send_video_async_v2(instance, async_flush_frame_ptr()) };
-}
-
 /// The handle of a native sender: the one value through which this crate
 /// reaches an SDK sender, and the one place where the sender types' thread
 /// safety rests on the SDK's contract rather than on their Rust fields.
@@ -190,7 +182,10 @@ type AsyncCallback = Box<dyn Fn(usize) + Send + Sync>;
 /// The sender's owned async video frame and whether the SDK may still read it.
 ///
 /// A frame in flight always exists, so the state cannot say "in flight" without
-/// the allocation the SDK is reading.
+/// the allocation the SDK is reading. A frame leaves `InFlight` only through
+/// [`Self::completed`], which takes the proof that the SDK has synchronized,
+/// or by being displaced by [`Self::submit`], which hands it back only with
+/// that proof. Only a retained frame can be taken out.
 #[derive(Default)]
 enum VideoState {
     /// No frame is held.
@@ -207,9 +202,15 @@ impl VideoState {
         matches!(self, Self::InFlight(_))
     }
 
-    // Claim notification before invoking user code so panic/reentry cannot
-    // notify twice. The caller must first synchronize the SDK.
-    fn completed(&mut self) -> Option<usize> {
+    /// Mark the frame in flight as released and claim its notification,
+    /// returning the pixel-buffer length to report.
+    ///
+    /// `_synchronized` proves that the SDK has returned from a synchronizing
+    /// call made on this frame's sender after the frame was submitted, so no
+    /// completion is reported before the call that ended the SDK's access.
+    /// The notification is claimed before any user code runs, so a handler
+    /// that panics or reenters cannot be notified twice.
+    fn completed(&mut self, _synchronized: video_sync::Synchronized) -> Option<usize> {
         match std::mem::take(self) {
             Self::InFlight(frame) => {
                 let len = frame.data().len();
@@ -223,19 +224,33 @@ impl VideoState {
         }
     }
 
-    /// Store a newly submitted frame and return the previous one, if any.
-    fn submit(&mut self, frame: VideoFrame) -> Option<VideoFrame> {
-        match std::mem::replace(self, Self::InFlight(frame)) {
-            Self::Idle => None,
-            Self::Retained(previous) | Self::InFlight(previous) => Some(previous),
+    /// Synchronize the SDK if it may still read the held frame, then complete
+    /// it: the release a flush, a finish and sender destruction share.
+    ///
+    /// `instance` is the live sender, created through `core`, that this state
+    /// belongs to.
+    fn synchronize_and_complete(
+        &mut self,
+        core: &sys::Core,
+        instance: SendInstance,
+    ) -> Option<usize> {
+        if !self.is_in_flight() {
+            // A retained frame was completed when the SDK released it.
+            return None;
         }
+        let synchronized = self.flush(core, instance);
+        self.completed(synchronized)
     }
 
-    /// Remove the held frame, leaving the state idle.
-    fn take_frame(&mut self) -> Option<VideoFrame> {
+    /// Remove the retained frame, leaving the state idle. A frame in flight
+    /// stays held: it can be taken only once it has completed.
+    fn take_retained(&mut self) -> Option<VideoFrame> {
         match std::mem::take(self) {
-            Self::Idle => None,
-            Self::Retained(frame) | Self::InFlight(frame) => Some(frame),
+            Self::Retained(frame) => Some(frame),
+            other => {
+                *self = other;
+                None
+            }
         }
     }
 
@@ -244,6 +259,97 @@ impl VideoState {
         match self {
             Self::Idle => None,
             Self::Retained(frame) | Self::InFlight(frame) => Some(frame),
+        }
+    }
+}
+
+/// The SDK calls that synchronize a sender's asynchronous video, and the proof
+/// that one has returned.
+///
+/// The field of [`Synchronized`] is private to this module, so the rest of the
+/// crate can obtain one only by making one of these calls, and each returns it
+/// only after the SDK has returned. Each takes the sender's video state by
+/// `&mut`, so its caller holds that state, by its lock or by `&mut`: one
+/// sender's synchronizing calls never overlap, and different senders
+/// synchronize independently.
+///
+/// Each takes `instance`, the live sender, created through `core`, that the
+/// state belongs to. `Inner` holds all three, and its `SenderResource`
+/// destroys the sender only after `Inner::drop` has drained it.
+mod video_sync {
+    use super::{async_flush_frame_ptr, BorrowedVideoFrame, SendInstance, VideoFrame, VideoState};
+    use crate::sys;
+
+    /// Proof that the SDK has returned from a call that synchronizes a
+    /// sender's asynchronous video: an asynchronous or synchronous video send,
+    /// or a null flush. `Processing.NDI.Send.h` and the [NDI-Send]
+    /// documentation list these as synchronizing events: when one returns, the
+    /// SDK no longer reads the frame previously submitted asynchronously.
+    ///
+    /// [`VideoState::completed`] consumes it, so a frame is reported complete
+    /// only after the call that released it.
+    ///
+    /// [NDI-Send]: https://docs.ndi.video/all/developing-with-ndi/sdk/ndi-send
+    #[must_use = "the proof completes the frame the SDK released"]
+    pub(super) struct Synchronized(());
+
+    impl VideoState {
+        /// Wait for the SDK to release the frame in flight by passing a true
+        /// NULL frame pointer, the SDK's documented request to drain the
+        /// asynchronous buffer.
+        pub(super) fn flush(&mut self, core: &sys::Core, instance: SendInstance) -> Synchronized {
+            // SAFETY: `instance` is the live sender, created through `core`,
+            // that this state belongs to, and a null frame pointer is the
+            // SDK's documented request to drain the async buffer.
+            unsafe { core.NDIlib_send_send_video_async_v2(instance.0, async_flush_frame_ptr()) };
+            Synchronized(())
+        }
+
+        /// Send `frame` synchronously. When this returns, the SDK has
+        /// finished reading `frame` and has released the frame in flight.
+        pub(super) fn send(
+            &mut self,
+            core: &sys::Core,
+            instance: SendInstance,
+            frame: BorrowedVideoFrame<'_>,
+        ) -> Synchronized {
+            let raw = frame.to_raw();
+            // SAFETY: `instance` is the live sender, created through `core`,
+            // that this state belongs to. `raw` points into pixels and
+            // metadata that `frame` borrows for longer than this call; the SDK
+            // has finished reading them when the synchronous send returns and
+            // keeps no reference afterwards.
+            unsafe { core.NDIlib_send_send_video_v2(instance.0, &raw) };
+            Synchronized(())
+        }
+
+        /// Make `frame` the frame in flight and hand it to the SDK. Returns
+        /// the state it displaced, whose frame the SDK has released, with the
+        /// proof of that release.
+        pub(super) fn submit(
+            &mut self,
+            core: &sys::Core,
+            instance: SendInstance,
+            frame: VideoFrame,
+        ) -> (VideoState, Synchronized) {
+            let raw = frame.to_raw();
+            // The sender owns the new frame before the SDK sees it. Moving a
+            // frame does not move its pixel `Vec` or metadata `CString`
+            // allocations, which `raw` points into.
+            let displaced = std::mem::replace(self, Self::InFlight(frame));
+            // SAFETY: `instance` is the live sender, created through `core`,
+            // that this state belongs to. The SDK reads the new frame's
+            // allocations after this call returns, until the next
+            // synchronizing call: `self` owns them, and an in-flight frame
+            // leaves it only with a later call's proof, while `Inner::drop`
+            // drains the SDK before the state is dropped. A sender that is
+            // never dropped leaks the frame rather than freeing it. Until
+            // this call returns the SDK may still read the displaced frame:
+            // `displaced` owns it across the call and is handed back only
+            // with the proof the call produces, so it cannot be dropped
+            // first.
+            unsafe { core.NDIlib_send_send_video_async_v2(instance.0, &raw) };
+            (displaced, Synchronized(()))
         }
     }
 }
@@ -258,10 +364,7 @@ impl Inner {
     fn complete(&self) {
         let len = {
             let mut video = self.video.lock().unwrap_or_else(|e| e.into_inner());
-            if video.is_in_flight() {
-                flush_null_frame(self.core, self.instance.0);
-            }
-            video.completed()
+            video.synchronize_and_complete(self.core, self.instance)
         };
         self.notify(len);
     }
@@ -722,20 +825,12 @@ impl Sender {
     pub fn send_video<'a>(&self, frame: impl Into<BorrowedVideoFrame<'a>>) -> Result<()> {
         let frame: BorrowedVideoFrame<'a> = frame.into();
         self.require_video_format(frame.pixel_format())?;
-        let raw = frame.to_raw();
         let len = {
             let mut video = self.inner.video.lock().unwrap_or_else(|e| e.into_inner());
-            // A synchronous video send also releases the previous async frame.
-            // SAFETY: the sender instance is live for this borrow. `raw` points
-            // into pixels and metadata that `frame` borrows for `'a`, which
-            // outlives this call; the SDK has finished reading them when the
-            // synchronous send returns and keeps no reference afterwards.
-            unsafe {
-                self.inner
-                    .core
-                    .NDIlib_send_send_video_v2(self.inner.instance.0, &raw);
-            }
-            video.completed()
+            // A synchronous video send also releases the previous async frame,
+            // which completes once the send has returned.
+            let synchronized = video.send(self.inner.core, self.inner.instance, frame);
+            video.completed(synchronized)
         };
         self.inner.notify(len);
         Ok(())
@@ -773,25 +868,20 @@ impl Sender {
 
     /// Hand a checked frame to the SDK and return the previous one, if any.
     fn submit_video_async(&mut self, frame: VideoFrame) -> Option<VideoFrame> {
-        let raw = frame.to_raw();
         let (previous, len) = {
             let mut video = self.inner.video.lock().unwrap_or_else(|e| e.into_inner());
-            let len = video.completed();
-            // Store the new owner before FFI, retaining the old owner locally
-            // until this call synchronizes its SDK access. Moving a frame does
-            // not move its Vec/CString allocations.
-            let previous = video.submit(frame);
-            // SAFETY: the sender instance is live for this borrow, and every pointer
-            // passed outlives the synchronous call.
-            unsafe {
-                self.inner
-                    .core
-                    .NDIlib_send_send_video_async_v2(self.inner.instance.0, &raw);
-            }
-            (previous, len)
+            // The sender owns the new frame before the SDK sees it. The
+            // previous frame stays owned by `displaced` until the submission,
+            // which synchronizes the SDK's access to it, has returned; only
+            // the proof of that return completes it.
+            let (mut displaced, synchronized) =
+                video.submit(self.inner.core, self.inner.instance, frame);
+            let len = displaced.completed(synchronized);
+            (displaced.take_retained(), len)
         };
         // State is consistent and the mutex unlocked before user code. If it
-        // panics, previous is safe to drop and the sender retains the new frame.
+        // panics, the synchronized previous frame is safe to drop and the
+        // sender retains the new frame.
         self.inner.notify(len);
         previous
     }
@@ -805,11 +895,8 @@ impl Sender {
     pub fn finish_video_async(&mut self) -> Option<VideoFrame> {
         let (previous, len) = {
             let mut video = self.inner.video.lock().unwrap_or_else(|e| e.into_inner());
-            if video.is_in_flight() {
-                flush_null_frame(self.inner.core, self.inner.instance.0);
-            }
-            let len = video.completed();
-            (video.take_frame(), len)
+            let len = video.synchronize_and_complete(self.inner.core, self.inner.instance);
+            (video.take_retained(), len)
         };
         self.inner.notify(len);
         previous
@@ -979,6 +1066,8 @@ impl<M: SenderMode> Sender<M> {
         let kind =
             unsafe { metadata.NDIlib_send_capture(self.inner.instance.0, &mut raw, remaining) };
         if kind == NDIlib_frame_type_e_NDIlib_frame_type_metadata {
+            /// Frees one frame that `NDIlib_send_capture` filled, through the
+            /// sender and the runtime table that filled it, when dropped.
             struct Release {
                 instance: NDIlib_send_instance_t,
                 raw: NDIlib_metadata_frame_t,
@@ -986,20 +1075,38 @@ impl<M: SenderMode> Sender<M> {
             }
             impl Drop for Release {
                 fn drop(&mut self) {
-                    // SAFETY: `raw` was filled by NDIlib_send_capture on this
-                    // instance and is released exactly once.
+                    // SAFETY: a `Release` is built only below, right after
+                    // `NDIlib_send_capture` reported that it filled `raw` on
+                    // `instance` through `metadata`, the table of the runtime
+                    // that created the sender. The guard never leaves this
+                    // call, whose `&Sender` keeps the sender alive and whose
+                    // capture lock is released only after the guard drops.
+                    // This drop is the frame's only release: it is freed
+                    // exactly once, through the same instance, after its last
+                    // read.
                     unsafe {
                         self.metadata
                             .NDIlib_send_free_metadata(self.instance, &self.raw)
                     };
                 }
             }
+            // From here the guard owns the captured frame, so every exit frees
+            // it: a validation error, a panic, or the owned copy's return.
             let guard = Release {
                 instance: self.inner.instance.0,
                 raw,
                 metadata,
             };
+            // SAFETY: `NDIlib_send_capture` filled `guard.raw` on this sender
+            // and reported a metadata frame, which stays allocated until the
+            // guard frees it. Its `p_data` is null or SDK storage of `length`
+            // bytes ending in the NUL terminator, or a NUL-terminated string
+            // when `length` is zero, as `Processing.NDI.structs.h` describes a
+            // metadata frame; validation reads no further than that.
             let layout = unsafe { crate::frames::validate_metadata_layout(&guard.raw)? };
+            // SAFETY: `layout` was validated from `guard.raw` just above, and
+            // the guard keeps that same `p_data` allocation unfreed while the
+            // text is copied into the owned frame.
             Ok(Some(unsafe {
                 MetadataFrame::from_raw_validated(&guard.raw, layout)
             }))
@@ -1243,11 +1350,11 @@ impl<M: SenderMode> Sender<M> {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        let video = self.video.get_mut().unwrap_or_else(|e| e.into_inner());
-        if video.is_in_flight() {
-            flush_null_frame(self.core, self.instance.0);
-        }
-        let len = video.completed();
+        let len = self
+            .video
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .synchronize_and_complete(self.core, self.instance);
         // Destroy before running user code, so a callback panic cannot leak the
         // SDK instance. Pending allocations remain alive through destruction.
         // The native instance may intentionally outlive this facade when an
@@ -1553,6 +1660,76 @@ mod tests {
         sender.finish_video_async().unwrap();
         sender.flush_async_blocking();
         assert_eq!(count.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn every_synchronizing_call_completes_a_frame_once_and_recovery_keeps_its_identity() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = Arc::new(AtomicUsize::new(0));
+        let observed = count.clone();
+        let Some(mut sender) = test_sender() else {
+            return;
+        };
+        sender.on_async_video_done(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+        let notified = || count.load(Ordering::SeqCst);
+        let in_flight = |sender: &Sender| sender.inner.video.lock().unwrap().is_in_flight();
+        let frame = |value| {
+            let frame = test_owned_frame(value);
+            let pixels = frame.data().as_ptr();
+            (frame, pixels)
+        };
+
+        // A synchronous send completes the frame in flight; the next
+        // submission returns that allocation without notifying it again.
+        let (a, a_pixels) = frame(1);
+        assert!(sender.send_video_async(a).unwrap().is_none());
+        assert!(in_flight(&sender));
+        assert_eq!(notified(), 0);
+        sender.send_video(&test_owned_frame(9)).unwrap();
+        assert!(!in_flight(&sender));
+        assert_eq!(notified(), 1);
+        let (b, b_pixels) = frame(2);
+        let previous = sender.send_video_async(b).unwrap().unwrap();
+        assert_eq!(previous.data().as_ptr(), a_pixels);
+        assert_eq!(notified(), 1);
+
+        // A flush does the same, and a second flush finds nothing in flight.
+        sender.flush_async_blocking();
+        assert!(!in_flight(&sender));
+        sender.flush_async_blocking();
+        assert_eq!(notified(), 2);
+        let (c, c_pixels) = frame(3);
+        let previous = sender.send_video_async(c).unwrap().unwrap();
+        assert_eq!(previous.data().as_ptr(), b_pixels);
+        assert_eq!(notified(), 2);
+
+        // A submission completes the in-flight frame it displaces.
+        let (d, d_pixels) = frame(4);
+        let previous = sender.send_video_async(d).unwrap().unwrap();
+        assert_eq!(previous.data().as_ptr(), c_pixels);
+        assert!(in_flight(&sender));
+        assert_eq!(notified(), 3);
+
+        // Finishing recovers a frame a synchronous send already completed
+        // without notifying it again.
+        sender.send_video(&test_owned_frame(9)).unwrap();
+        assert_eq!(notified(), 4);
+        assert_eq!(
+            sender.finish_video_async().unwrap().data().as_ptr(),
+            d_pixels
+        );
+        assert!(sender.finish_video_async().is_none());
+        assert_eq!(notified(), 4);
+
+        // Destroying a sender whose retained frame was already completed
+        // notifies nothing more.
+        sender.send_video_async(frame(5).0).unwrap();
+        sender.flush_async_blocking();
+        assert_eq!(notified(), 5);
+        drop(sender);
+        assert_eq!(notified(), 5);
     }
 
     #[test]
