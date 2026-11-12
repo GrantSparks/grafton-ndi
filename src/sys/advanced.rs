@@ -166,15 +166,27 @@ macro_rules! advanced_tables {
 
 include!("advanced_tables.rs");
 
-/// The receiver color format a packet receiver is created with to pass
-/// through `preset`, or the header's name for the constant that gives it
-/// when this build does not declare it.
-pub(crate) fn passthrough_format(
-    preset: PassthroughPreset,
-) -> std::result::Result<NDIlib_recv_color_format_e, &'static CStr> {
-    macro_rules! formats {
-        ($($Preset:ident => $constant:ident,)+) => {
-            match preset {
+/// Declares every passthrough preset with the extended receiver color format
+/// that selects it: `passthrough_format`, and the test list
+/// `PassthroughPreset::ALL`. The match in `passthrough_format` is
+/// exhaustive, so the compiler refuses a list that misses a preset, and a
+/// preset listed twice is an unreachable pattern.
+macro_rules! passthrough_presets {
+    ($($Preset:ident => $constant:ident,)+) => {
+        impl PassthroughPreset {
+            /// Every preset, in the order listed, for tests that cover each one.
+            #[cfg(test)]
+            pub(crate) const ALL: [Self; [$(stringify!($Preset)),+].len()] =
+                [$(Self::$Preset),+];
+        }
+
+        /// The receiver color format a packet receiver is created with to pass
+        /// through `preset`, or the header's name for the constant that gives it
+        /// when this build does not declare it.
+        pub(crate) fn passthrough_format(
+            preset: PassthroughPreset,
+        ) -> std::result::Result<NDIlib_recv_color_format_e, &'static CStr> {
+            let format: std::result::Result<_, &'static CStr> = match preset {
                 $(PassthroughPreset::$Preset => declared! { $constant {
                     // The extended color formats take the target's C enum
                     // type; the creation settings carry the same bits.
@@ -184,35 +196,36 @@ pub(crate) fn passthrough_format(
                 } else {
                     Err(super::table::symbol_name(concat!(stringify!($constant), "\0")))
                 } },)+
-            }
-        };
-    }
-    let format: std::result::Result<_, &'static CStr> = formats! {
-        SpeedHqOnly => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v1,
-        SpeedHq => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v2,
-        SpeedHqBest => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v2_best,
-        H264 => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v3,
-        H264Best => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v3_best,
-        H264WithAudio => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v3_with_audio,
-        Hevc => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v4,
-        HevcBest => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v4_best,
-        HevcWithAudio => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v4_with_audio,
-        Alpha => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v5,
-        AlphaBest => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v5_best,
-        AlphaWithAudio => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v5_with_audio,
-        Protected => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6,
-        ProtectedBest => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6_best,
-        ProtectedWithAudio => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6_with_audio,
+            };
+            // The headers declare each constant without its enumeration's
+            // name, which the generated binding prefixes it with.
+            format.map_err(|binding| {
+                binding
+                    .to_bytes_with_nul()
+                    .strip_prefix(b"NDIlib_recv_color_format_ex_e_")
+                    .and_then(|name| CStr::from_bytes_with_nul(name).ok())
+                    .unwrap_or(binding)
+            })
+        }
     };
-    // The headers declare each constant without its enumeration's name, which
-    // the generated binding prefixes it with.
-    format.map_err(|binding| {
-        binding
-            .to_bytes_with_nul()
-            .strip_prefix(b"NDIlib_recv_color_format_ex_e_")
-            .and_then(|name| CStr::from_bytes_with_nul(name).ok())
-            .unwrap_or(binding)
-    })
+}
+
+passthrough_presets! {
+    SpeedHqOnly => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v1,
+    SpeedHq => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v2,
+    SpeedHqBest => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v2_best,
+    H264 => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v3,
+    H264Best => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v3_best,
+    H264WithAudio => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v3_with_audio,
+    Hevc => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v4,
+    HevcBest => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v4_best,
+    HevcWithAudio => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v4_with_audio,
+    Alpha => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v5,
+    AlphaBest => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v5_best,
+    AlphaWithAudio => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v5_with_audio,
+    Protected => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6,
+    ProtectedBest => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6_best,
+    ProtectedWithAudio => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6_with_audio,
 }
 
 impl Evidence<'_> {
