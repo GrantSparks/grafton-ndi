@@ -16,6 +16,11 @@ help: the following other types implement trait `Send`
   | unsafe impl Sync for Guard<'_, AudioKind> {}
   | unsafe impl Send for Guard<'_, MetadataKind> {}
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, MetadataKind>`
+note: required because it appears within the type `frames::ValidatedFrame<grafton_ndi::capture::Guard<'static, grafton_ndi::capture::FrameSyncVideoFree>, (frames::ValidatedVideoLayout, frames::VideoHeader)>`
+ --> src/frames.rs
+  |
+  | pub(crate) struct ValidatedFrame<F, V> {
+  |                   ^^^^^^^^^^^^^^
 note: required because it appears within the type `VideoRef<'static, grafton_ndi::capture::FrameSyncVideoFree>`
  --> src/frames.rs
   |
@@ -45,6 +50,11 @@ help: the following other types implement trait `Send`
   | unsafe impl Sync for Guard<'_, AudioKind> {}
   | unsafe impl Send for Guard<'_, MetadataKind> {}
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, MetadataKind>`
+note: required because it appears within the type `frames::ValidatedFrame<grafton_ndi::capture::Guard<'static, grafton_ndi::capture::FrameSyncAudioFree>, frames::ValidatedAudioLayout>`
+ --> src/frames.rs
+  |
+  | pub(crate) struct ValidatedFrame<F, V> {
+  |                   ^^^^^^^^^^^^^^
 note: required because it appears within the type `AudioRef<'static, grafton_ndi::capture::FrameSyncAudioFree>`
  --> src/frames.rs
   |
@@ -74,6 +84,11 @@ help: the following other types implement trait `Sync`
   | unsafe impl Send for Guard<'_, MetadataKind> {}
   | unsafe impl Sync for Guard<'_, MetadataKind> {}
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, MetadataKind>`
+note: required because it appears within the type `frames::ValidatedFrame<grafton_ndi::capture::Guard<'static, grafton_ndi::capture::FrameSyncVideoFree>, (frames::ValidatedVideoLayout, frames::VideoHeader)>`
+ --> src/frames.rs
+  |
+  | pub(crate) struct ValidatedFrame<F, V> {
+  |                   ^^^^^^^^^^^^^^
 note: required because it appears within the type `VideoRef<'static, grafton_ndi::capture::FrameSyncVideoFree>`
  --> src/frames.rs
   |
@@ -103,6 +118,11 @@ help: the following other types implement trait `Sync`
   | unsafe impl Send for Guard<'_, MetadataKind> {}
   | unsafe impl Sync for Guard<'_, MetadataKind> {}
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `grafton_ndi::capture::Guard<'_, MetadataKind>`
+note: required because it appears within the type `frames::ValidatedFrame<grafton_ndi::capture::Guard<'static, grafton_ndi::capture::FrameSyncAudioFree>, frames::ValidatedAudioLayout>`
+ --> src/frames.rs
+  |
+  | pub(crate) struct ValidatedFrame<F, V> {
+  |                   ^^^^^^^^^^^^^^
 note: required because it appears within the type `AudioRef<'static, grafton_ndi::capture::FrameSyncAudioFree>`
  --> src/frames.rs
   |

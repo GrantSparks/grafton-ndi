@@ -5,7 +5,7 @@ use std::{cell::Cell, marker::PhantomData, ptr, rc::Rc};
 use super::{invalid_input, sdk_quantity, AdvancedConfig, KvmSession};
 use crate::{
     finder::RawSource,
-    frames::{validate_frame_metadata, validate_returned_audio, ReturnedAudio, MAX_AUDIO_BYTES},
+    frames::{AudioParts, ReturnedAudio, ValidatedAudio, MAX_AUDIO_BYTES},
     receiver::AvSyncAttached,
     sys::{
         advanced::{
@@ -445,20 +445,15 @@ unsafe fn outcome(status: Synchronized, audio: &NDIlib_audio_frame_v3_t) -> Resu
     Ok(match status {
         Synchronized::Matched | Synchronized::Adjusted => {
             let samples_adjusted = status == Synchronized::Adjusted;
-            match validate_returned_audio(audio)? {
+            // SAFETY: forwarded to the caller's obligation; the borrow holds
+            // the descriptor through the copy.
+            match unsafe { ValidatedAudio::returned_audio(audio)? } {
                 // The format of an empty result is not reported.
                 ReturnedAudio::Empty(_) => AvSyncOutcome::Empty { samples_adjusted },
-                ReturnedAudio::Samples(layout) => {
-                    // SAFETY: forwarded to the caller's obligation.
-                    let frame = unsafe {
-                        let metadata = validate_frame_metadata(audio.p_metadata)?;
-                        AudioFrame::from_raw_validated(*audio, layout, metadata)
-                    };
-                    AvSyncOutcome::Audio {
-                        frame,
-                        samples_adjusted,
-                    }
-                }
+                ReturnedAudio::Samples(validated) => AvSyncOutcome::Audio {
+                    frame: validated.owned_copy(),
+                    samples_adjusted,
+                },
             }
         }
         Synchronized::NoAudioStream => AvSyncOutcome::NoAudioStream,

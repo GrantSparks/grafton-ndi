@@ -395,8 +395,8 @@ pub struct BorrowedVideoFrame<'buf> {
     header: VideoHeader,
     /// Exactly the validated storage extent.
     data: &'buf [u8],
-    metadata: Option<&'buf CStr>,
-    metadata_layout: Option<MetadataText>,
+    /// The metadata text, validated with its terminator.
+    metadata: Option<MetadataText<'buf>>,
 }
 
 impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
@@ -416,11 +416,8 @@ impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
         self.data.as_ptr()
     }
     #[inline]
-    fn metadata_text(&self) -> Option<&str> {
-        let (metadata, text) = self.metadata.zip(self.metadata_layout)?;
-        // SAFETY: Construction validated `text` from this same immutable CStr,
-        // which stays borrowed for `'buf`.
-        Some(unsafe { text.text(metadata.as_ptr()) })
+    fn metadata_text(&self) -> Option<MetadataText<'_>> {
+        self.metadata
     }
     /// A frame built for sending carries no timestamp; [`Self::to_raw`]
     /// sends none.
@@ -496,17 +493,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// The copy cannot fail: building the frame validated everything it
     /// relies on, and the packed layout of a valid frame is valid.
     pub fn to_owned(&self) -> VideoFrame {
-        // SAFETY: The immutable slices retain initialized pixels and bounded UTF-8
-        // metadata for these cached proofs throughout the active-row copy.
-        unsafe {
-            crate::frames::VideoCopySource::new(
-                self.to_raw(),
-                self.layout,
-                self.header,
-                self.metadata_layout,
-            )
-        }
-        .to_frame()
+        crate::frames::VideoParts::owned_copy(self)
     }
 
     /// Copy this borrowed frame into `destination`, reusing its allocations.
@@ -559,16 +546,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// # }
     /// ```
     pub fn copy_into(&self, destination: &mut VideoFrame) {
-        // SAFETY: as for `to_owned`.
-        unsafe {
-            crate::frames::VideoCopySource::new(
-                self.to_raw(),
-                self.layout,
-                self.header,
-                self.metadata_layout,
-            )
-        }
-        .copy_into(destination);
+        crate::frames::VideoParts::copy_into_owned(self, destination);
     }
 
     /// Get the pixel data: exactly the frame's validated storage, including
@@ -605,7 +583,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
             &self.layout,
             &self.header,
             self.data.as_ptr(),
-            self.metadata.map_or(ptr::null(), CStr::as_ptr),
+            self.metadata.map_or(ptr::null(), MetadataText::as_ptr),
             None,
         )
     }
@@ -692,7 +670,7 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
                 layout.data_len_bytes,
             )));
         };
-        let metadata_layout = MetadataText::from_cstr(self.metadata)?;
+        let metadata = self.metadata.map(MetadataText::from_cstr).transpose()?;
         Ok(BorrowedVideoFrame {
             layout,
             header: VideoHeader {
@@ -702,8 +680,7 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
                 timecode: self.timecode,
             },
             data,
-            metadata: self.metadata,
-            metadata_layout,
+            metadata,
         })
     }
 }
@@ -714,8 +691,7 @@ impl<'buf> From<&'buf VideoFrame> for BorrowedVideoFrame<'buf> {
             layout: *crate::frames::VideoParts::layout(frame),
             header: *crate::frames::VideoParts::header(frame),
             data: frame.data(),
-            metadata: frame.metadata_cstr(),
-            metadata_layout: frame.validated_metadata(),
+            metadata: crate::frames::VideoParts::metadata_text(frame),
         }
     }
 }
@@ -1144,14 +1120,12 @@ impl<M: SenderMode> Sender<M> {
             // guard frees it. Its `p_data` is null or SDK storage of `length`
             // bytes ending in the NUL terminator, or a NUL-terminated string
             // when `length` is zero, as `Processing.NDI.structs.h` describes a
-            // metadata frame; validation reads no further than that.
-            let layout = unsafe { crate::frames::validate_metadata_layout(&guard.raw)? };
-            // SAFETY: `layout` was validated from `guard.raw` just above, and
-            // the guard keeps that same `p_data` allocation unfreed while the
-            // text is copied into the owned frame.
-            Ok(Some(unsafe {
-                MetadataFrame::from_raw_validated(&guard.raw, layout)
-            }))
+            // metadata frame; validation reads no further than that. The
+            // text borrows `guard.raw`, so it is copied before the guard frees
+            // it.
+            let text = unsafe { crate::frames::validate_metadata_layout(&guard.raw)? };
+            let timecode = Timecode::from_ticks(guard.raw.timecode);
+            Ok(Some(MetadataFrame::copied(text, timecode)))
         } else if kind == NDIlib_frame_type_e_NDIlib_frame_type_none {
             Ok(None)
         } else {

@@ -537,14 +537,16 @@ pub(crate) fn sdk_video_frame(
     }
 }
 
-/// The parts of a video frame that its shared accessors read.
+/// The parts of a video frame that its shared accessors and owned copies
+/// read.
 ///
-/// [`VideoFrame`], [`VideoRef`] and
-/// [`BorrowedVideoFrame`](crate::BorrowedVideoFrame) lend their validated
-/// layout, header, pixels and metadata through it, and [`video_accessors!`]
-/// generates their public accessors and `Debug` from it, so that each is
-/// written and documented once. The trait is crate-private, so these are
-/// its only implementations.
+/// [`VideoFrame`], a received frame's [`ValidatedFrame`] and its
+/// [`VideoRef`], and [`BorrowedVideoFrame`](crate::BorrowedVideoFrame) lend
+/// their validated layout, header, pixels and metadata through it, and
+/// [`video_accessors!`] generates their public accessors and `Debug` from
+/// it, so that each is written and documented once. Each implementation
+/// takes every part from one value that was validated as a whole. The trait
+/// is crate-private, so these are its only implementations.
 ///
 /// # Safety
 ///
@@ -563,7 +565,7 @@ pub(crate) trait VideoParts {
     fn pixels(&self) -> *const u8;
 
     /// The validated metadata text, or `None` when the frame has none.
-    fn metadata_text(&self) -> Option<&str>;
+    fn metadata_text(&self) -> Option<MetadataText<'_>>;
 
     /// The time the sender submitted the frame, when it is known.
     fn sdk_timestamp(&self) -> Option<SdkTimestamp>;
@@ -584,6 +586,74 @@ pub(crate) trait VideoParts {
     fn plane_views(&self) -> VideoPlanes<'_> {
         // SAFETY: as for `plane_view`.
         unsafe { self.layout().view_planes(self.pixels()) }
+    }
+
+    /// Copy the frame into a new owned frame: one pixel allocation, and one
+    /// metadata allocation when there is metadata.
+    fn owned_copy(&self) -> VideoFrame {
+        let packed = self.layout().packed();
+        let metadata = self
+            .metadata_text()
+            .map(|text| FrameMetadata::copy_from(text, None));
+        packed_video(
+            self,
+            packed,
+            Vec::with_capacity(packed.data_len_bytes),
+            metadata,
+        )
+    }
+
+    /// Copy the frame into `destination`, reusing its pixel and metadata
+    /// allocations.
+    ///
+    /// `destination` becomes exactly the frame [`Self::owned_copy`] returns,
+    /// whatever it held before. Its pixel buffer is reused when its capacity
+    /// holds the packed frame, and otherwise replaced without copying its old
+    /// contents; its metadata string is reused as
+    /// [`FrameMetadata::copy_from`] describes.
+    ///
+    /// Nothing can fail part-way: any allocation happens while `destination`
+    /// is still a whole frame, and the only moment its buffer and layout
+    /// disagree spans copies into reserved capacity, which neither allocate
+    /// nor panic.
+    fn copy_into_owned(&self, destination: &mut VideoFrame) {
+        let packed = self.layout().packed();
+        let len = packed.data_len_bytes;
+        let replacement = (destination.data.capacity() < len).then(|| Vec::with_capacity(len));
+        let storage = destination.metadata.take();
+        let metadata = self
+            .metadata_text()
+            .map(|text| FrameMetadata::copy_from(text, storage));
+        let data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
+        *destination = packed_video(self, packed, data, metadata);
+    }
+}
+
+/// The owned copy of `source`: `packed`, its packed layout, with `data`,
+/// whose capacity holds `packed`, filled with every plane's active rows.
+/// Every owned video copy is made here. Filling reserved capacity neither
+/// allocates nor panics.
+fn packed_video<P: VideoParts + ?Sized>(
+    source: &P,
+    packed: ValidatedVideoLayout,
+    mut data: Vec<u8>,
+    metadata: Option<FrameMetadata>,
+) -> VideoFrame {
+    data.clear();
+    // The views read active rows only, never row padding.
+    for plane in source.plane_views() {
+        match plane.data() {
+            Some(active) => data.extend_from_slice(active),
+            None => plane.rows().for_each(|row| data.extend_from_slice(row)),
+        }
+    }
+
+    VideoFrame {
+        layout: packed,
+        header: *source.header(),
+        data,
+        metadata,
+        timestamp: source.sdk_timestamp(),
     }
 }
 
@@ -877,6 +947,7 @@ macro_rules! video_accessors {
             #[inline]
             pub fn metadata(&self) -> Option<&str> {
                 $crate::frames::VideoParts::metadata_text(self)
+                    .map($crate::frames::MetadataText::as_str)
             }
 
             /// Get one plane in SDK memory order, or `None` for an invalid index.
@@ -952,8 +1023,8 @@ impl VideoParts for VideoFrame {
         self.data.as_ptr()
     }
     #[inline]
-    fn metadata_text(&self) -> Option<&str> {
-        self.metadata.as_ref().map(FrameMetadata::as_str)
+    fn metadata_text(&self) -> Option<MetadataText<'_>> {
+        self.metadata.as_ref().map(FrameMetadata::text)
     }
     #[inline]
     fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
@@ -1078,14 +1149,11 @@ impl VideoFrame {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn metadata_cstr(&self) -> Option<&CStr> {
-        self.metadata.as_ref().map(FrameMetadata::as_cstr)
-    }
-
-    pub(crate) fn validated_metadata(&self) -> Option<MetadataText> {
-        // `FrameMetadata` construction established `MetadataText`'s invariant
-        // for the C string that `metadata_cstr` lends.
-        self.metadata().map(|text| MetadataText { len: text.len() })
+        self.metadata
+            .as_ref()
+            .map(|metadata| metadata.inner.as_c_str())
     }
 
     /// Replace frame metadata.
@@ -1106,120 +1174,9 @@ impl VideoFrame {
     /// copy, and null or SDK-readable metadata.
     #[cfg(test)]
     pub(crate) unsafe fn from_raw(c_frame: &NDIlib_video_frame_v2_t) -> Result<VideoFrame> {
-        let (layout, header) = validate_video_frame(c_frame)?;
-        // SAFETY: forwarded to the caller, and the layout, header and
-        // metadata text are validated from this descriptor.
-        unsafe {
-            let metadata = validate_frame_metadata(c_frame.p_metadata)?;
-            Ok(VideoCopySource::new(*c_frame, layout, header, metadata).to_frame())
-        }
-    }
-}
-
-/// A validated uncompressed SDK video frame: the source of every owned video
-/// copy, whether into a new frame or into one whose allocations are reused.
-///
-/// [`Self::new`] establishes the invariant that makes copying safe: the
-/// layout, header and metadata text were validated from the descriptor, and
-/// its pixels and metadata stay live, initialized and unchanged for `'a`.
-#[derive(Clone, Copy)]
-pub(crate) struct VideoCopySource<'a> {
-    raw: NDIlib_video_frame_v2_t,
-    layout: ValidatedVideoLayout,
-    header: VideoHeader,
-    metadata: Option<MetadataText>,
-    storage: PhantomData<&'a [u8]>,
-}
-
-impl VideoCopySource<'_> {
-    /// # Safety
-    ///
-    /// `layout` and `header` must have been validated from `raw`, and
-    /// `metadata` from its metadata pointer. Its allocation must cover the
-    /// layout, with every active row initialized, and it and the metadata
-    /// must stay live and unchanged for the source's lifetime; row padding
-    /// may be uninitialized.
-    pub(crate) unsafe fn new(
-        raw: NDIlib_video_frame_v2_t,
-        layout: ValidatedVideoLayout,
-        header: VideoHeader,
-        metadata: Option<MetadataText>,
-    ) -> Self {
-        Self {
-            raw,
-            layout,
-            header,
-            metadata,
-            storage: PhantomData,
-        }
-    }
-
-    /// Copy into a new frame: one pixel allocation, and one metadata
-    /// allocation when there is metadata.
-    pub(crate) fn to_frame(self) -> VideoFrame {
-        let packed = self.layout.packed();
-        let metadata = self.copy_metadata(None);
-        self.into_frame(packed, Vec::with_capacity(packed.data_len_bytes), metadata)
-    }
-
-    /// Copy into `destination`, reusing its pixel and metadata allocations.
-    ///
-    /// `destination` becomes exactly the frame [`Self::to_frame`] returns,
-    /// whatever it held before. Its pixel buffer is reused when its capacity
-    /// holds the packed frame, and otherwise replaced without copying its old
-    /// contents; its metadata string is reused as
-    /// [`FrameMetadata::copy_from_raw_validated`] describes.
-    ///
-    /// Nothing can fail part-way: any allocation happens while `destination`
-    /// is still a whole frame, and the only moment its buffer and layout
-    /// disagree spans copies into reserved capacity, which neither allocate
-    /// nor panic.
-    pub(crate) fn copy_into(self, destination: &mut VideoFrame) {
-        let packed = self.layout.packed();
-        let len = packed.data_len_bytes;
-        let replacement = (destination.data.capacity() < len).then(|| Vec::with_capacity(len));
-        let metadata = self.copy_metadata(destination.metadata.take());
-        let data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
-        *destination = self.into_frame(packed, data, metadata);
-    }
-
-    /// The metadata text, copied into `storage` when there is one.
-    fn copy_metadata(self, storage: Option<FrameMetadata>) -> Option<FrameMetadata> {
-        self.metadata.map(|text| {
-            // SAFETY: `new` requires `text` to have been validated from this
-            // live `p_metadata`.
-            unsafe { FrameMetadata::copy_from_raw_validated(self.raw.p_metadata, text, storage) }
-        })
-    }
-
-    /// The owned frame: `packed`, with `data`, whose capacity holds
-    /// `packed`, filled with every plane's active rows. Every owned video
-    /// copy is made here. Filling reserved capacity neither allocates nor
-    /// panics.
-    fn into_frame(
-        self,
-        packed: ValidatedVideoLayout,
-        mut data: Vec<u8>,
-        metadata: Option<FrameMetadata>,
-    ) -> VideoFrame {
-        data.clear();
-        // SAFETY: `new` requires the allocation to cover `layout` with every
-        // active row initialized and unchanged while this source lives. The
-        // views read active rows only, never the SDK's row padding.
-        for plane in unsafe { self.layout.view_planes(self.raw.p_data) } {
-            match plane.data() {
-                Some(active) => data.extend_from_slice(active),
-                None => plane.rows().for_each(|row| data.extend_from_slice(row)),
-            }
-        }
-
-        VideoFrame {
-            layout: packed,
-            header: self.header,
-            data,
-            metadata,
-            timestamp: SdkTimestamp::from_sdk(self.raw.timestamp),
-        }
+        // SAFETY: forwarded to the caller; the borrow holds the descriptor.
+        let frame = unsafe { ValidatedVideo::video(c_frame)? };
+        Ok(frame.owned_copy())
     }
 }
 
@@ -1344,12 +1301,16 @@ impl VideoFrameBuilder {
     }
 }
 
-/// The parts of an audio frame that its shared accessors read.
+/// The parts of an audio frame that its shared accessors and owned copies
+/// read.
 ///
-/// [`AudioFrame`] and [`AudioRef`] lend their validated layout, timing,
-/// samples and metadata through it, and [`audio_accessors!`] generates
-/// their public accessors and `Debug` from it, so that each is written and
-/// documented once. The trait is crate-private, so these are its only implementations.
+/// [`AudioFrame`], and a received frame's [`ValidatedFrame`] and its
+/// [`AudioRef`], lend their validated layout, timing, samples and metadata
+/// through it, and [`audio_accessors!`] generates their public accessors and
+/// `Debug` from it, so that each is written and documented once. Each
+/// implementation takes every part from one value that was validated as a
+/// whole. The trait is crate-private, so these are its only
+/// implementations.
 ///
 /// # Safety
 ///
@@ -1371,7 +1332,7 @@ pub(crate) trait AudioParts {
     fn samples(&self) -> *const f32;
 
     /// The validated metadata text, or `None` when the frame has none.
-    fn metadata_text(&self) -> Option<&str>;
+    fn metadata_text(&self) -> Option<MetadataText<'_>>;
 
     /// One channel's samples, or `None` for an invalid channel: the view
     /// behind every generated `channel_data`.
@@ -1389,6 +1350,67 @@ pub(crate) trait AudioParts {
     fn channel_views(&self) -> impl ExactSizeIterator<Item = &[f32]> + '_ {
         // SAFETY: as for `channel_view`.
         unsafe { self.layout().channels(self.samples()) }
+    }
+
+    /// Copy the frame into a new owned frame: one sample allocation, and one
+    /// metadata allocation when there is metadata.
+    fn owned_copy(&self) -> AudioFrame {
+        let packed = self.layout().packed();
+        let metadata = self
+            .metadata_text()
+            .map(|text| FrameMetadata::copy_from(text, None));
+        packed_audio(
+            self,
+            packed,
+            Vec::with_capacity(packed.sample_count),
+            metadata,
+        )
+    }
+
+    /// Copy the frame into `destination`, reusing its sample and metadata
+    /// allocations.
+    ///
+    /// `destination` becomes exactly the frame [`Self::owned_copy`] returns,
+    /// whatever it held before. Its sample buffer is reused when its capacity
+    /// holds the packed samples, and otherwise replaced without copying its
+    /// old contents; its metadata string is reused as
+    /// [`FrameMetadata::copy_from`] describes. As for video, any allocation
+    /// happens while `destination` is still a whole frame.
+    fn copy_into_owned(&self, destination: &mut AudioFrame) {
+        let packed = self.layout().packed();
+        let len = packed.sample_count;
+        let replacement = (destination.data.capacity() < len).then(|| Vec::with_capacity(len));
+        let storage = destination.metadata.take();
+        let metadata = self
+            .metadata_text()
+            .map(|text| FrameMetadata::copy_from(text, storage));
+        let data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
+        *destination = packed_audio(self, packed, data, metadata);
+    }
+}
+
+/// The owned copy of `source`: `packed`, its packed layout, with `data`,
+/// whose capacity holds `packed`, filled with the channels back to back.
+/// Every owned audio copy is made here. Filling reserved capacity neither
+/// allocates nor panics.
+fn packed_audio<P: AudioParts + ?Sized>(
+    source: &P,
+    packed: ValidatedAudioLayout,
+    mut data: Vec<f32>,
+    metadata: Option<FrameMetadata>,
+) -> AudioFrame {
+    data.clear();
+    // The views read channel samples only, never padding between channels.
+    for samples in source.channel_views() {
+        data.extend_from_slice(samples);
+    }
+
+    AudioFrame {
+        layout: packed,
+        timecode: source.timecode(),
+        data,
+        metadata,
+        timestamp: source.sdk_timestamp(),
     }
 }
 
@@ -1469,7 +1491,7 @@ macro_rules! audio_accessors {
             /// Empty metadata, `Some("")`, is distinct from none, `None`.
             #[inline]
             pub fn metadata(&self) -> Option<&str> {
-                AudioParts::metadata_text(self)
+                AudioParts::metadata_text(self).map(MetadataText::as_str)
             }
 
             /// Get one channel's samples, or `None` for an invalid channel.
@@ -1544,8 +1566,8 @@ impl AudioParts for AudioFrame {
         self.data.as_ptr()
     }
     #[inline]
-    fn metadata_text(&self) -> Option<&str> {
-        self.metadata.as_ref().map(FrameMetadata::as_str)
+    fn metadata_text(&self) -> Option<MetadataText<'_>> {
+        self.metadata.as_ref().map(FrameMetadata::text)
     }
 }
 
@@ -1613,30 +1635,9 @@ impl AudioFrame {
     /// `raw` must reference live SDK sample and metadata allocations with
     /// initialized active samples through this ownership copy.
     pub(crate) unsafe fn from_raw(raw: NDIlib_audio_frame_v3_t) -> Result<AudioFrame> {
-        // Use the shared validation helper to validate and compute layout
-        let layout = validate_audio_layout(&raw)?;
-        // SAFETY: forwarded to the caller, and the layout and metadata text
-        // are validated from this descriptor.
-        unsafe {
-            let metadata_layout = validate_frame_metadata(raw.p_metadata)?;
-            Ok(Self::from_raw_validated(raw, layout, metadata_layout))
-        }
-    }
-
-    /// Copy validated SDK audio into a new owned frame, for AvSync, which
-    /// validates the SDK's descriptor itself. Validation already established
-    /// everything the copy relies on, so it cannot fail.
-    ///
-    /// # Safety
-    /// As for [`AudioCopySource::new`].
-    #[cfg(any(test, feature = "advanced"))]
-    pub(crate) unsafe fn from_raw_validated(
-        raw: NDIlib_audio_frame_v3_t,
-        layout: ValidatedAudioLayout,
-        metadata_layout: Option<MetadataText>,
-    ) -> AudioFrame {
-        // SAFETY: forwarded to the caller.
-        unsafe { AudioCopySource::new(raw, layout, metadata_layout) }.to_frame()
+        // SAFETY: forwarded to the caller; the borrow holds the descriptor.
+        let frame = unsafe { ValidatedAudio::audio(&raw)? };
+        Ok(frame.owned_copy())
     }
 
     /// Set the timecode without reallocating the samples.
@@ -1685,106 +1686,6 @@ impl AudioFrame {
     pub fn channel_data_mut(&mut self, channel: usize) -> Option<&mut [f32]> {
         let range = self.layout.channel_range(channel)?;
         Some(&mut self.data[range])
-    }
-}
-
-/// Validated SDK audio: the source of every owned audio copy, whether into a
-/// new frame or into one whose allocations are reused.
-///
-/// [`Self::new`] establishes the invariant that makes copying safe: the
-/// layout and metadata text were validated from the descriptor, and its
-/// channel samples and metadata stay live, initialized and unchanged for `'a`.
-#[derive(Clone, Copy)]
-pub(crate) struct AudioCopySource<'a> {
-    raw: NDIlib_audio_frame_v3_t,
-    layout: ValidatedAudioLayout,
-    metadata: Option<MetadataText>,
-    storage: PhantomData<&'a [f32]>,
-}
-
-impl AudioCopySource<'_> {
-    /// # Safety
-    ///
-    /// `layout` must have been validated from this exact `raw` descriptor,
-    /// and `metadata` from its metadata pointer. Its channel samples must be
-    /// aligned and initialized, and they and the metadata must stay live and
-    /// unchanged for the source's lifetime; inter-channel padding may be
-    /// uninitialized.
-    pub(crate) unsafe fn new(
-        raw: NDIlib_audio_frame_v3_t,
-        layout: ValidatedAudioLayout,
-        metadata: Option<MetadataText>,
-    ) -> Self {
-        Self {
-            raw,
-            layout,
-            metadata,
-            storage: PhantomData,
-        }
-    }
-
-    /// Copy into a new frame: one sample allocation, and one metadata
-    /// allocation when there is metadata.
-    pub(crate) fn to_frame(self) -> AudioFrame {
-        let packed = self.layout.packed();
-        let metadata = self.copy_metadata(None);
-        self.into_frame(packed, Vec::with_capacity(packed.sample_count), metadata)
-    }
-
-    /// Copy into `destination`, reusing its sample and metadata allocations.
-    ///
-    /// `destination` becomes exactly the frame [`Self::to_frame`] returns,
-    /// whatever it held before. Its sample buffer is reused when its capacity
-    /// holds the packed samples, and otherwise replaced without copying its
-    /// old contents; its metadata string is reused as
-    /// [`FrameMetadata::copy_from_raw_validated`] describes. As for video,
-    /// any allocation happens while `destination` is still a whole frame.
-    pub(crate) fn copy_into(self, destination: &mut AudioFrame) {
-        let packed = self.layout.packed();
-        let len = packed.sample_count;
-        let replacement = (destination.data.capacity() < len).then(|| Vec::with_capacity(len));
-        let metadata = self.copy_metadata(destination.metadata.take());
-        let data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
-        *destination = self.into_frame(packed, data, metadata);
-    }
-
-    /// The metadata text, copied into `storage` when there is one. The SDK
-    /// keeps and frees its own string.
-    fn copy_metadata(self, storage: Option<FrameMetadata>) -> Option<FrameMetadata> {
-        self.metadata.map(|text| {
-            // SAFETY: `new` requires `text` to describe this live
-            // `p_metadata`.
-            unsafe { FrameMetadata::copy_from_raw_validated(self.raw.p_metadata, text, storage) }
-        })
-    }
-
-    /// The owned frame: `packed`, with `data`, whose capacity holds
-    /// `packed`, filled with the channels back to back. Every owned audio
-    /// copy is made here. Filling reserved capacity neither allocates nor
-    /// panics.
-    fn into_frame(
-        self,
-        packed: ValidatedAudioLayout,
-        mut data: Vec<f32>,
-        metadata: Option<FrameMetadata>,
-    ) -> AudioFrame {
-        data.clear();
-        // Only channel samples are initialized audio. Never form a typed slice
-        // over inter-channel padding supplied by the SDK.
-        // SAFETY: `new` requires an aligned FLTP buffer with `no_samples`
-        // initialized floats at each validated channel offset, unchanged
-        // while this source lives.
-        for samples in unsafe { self.layout.channels(self.raw.p_data.cast::<f32>()) } {
-            data.extend_from_slice(samples);
-        }
-
-        AudioFrame {
-            layout: packed,
-            timecode: Timecode::from_ticks(self.raw.timecode),
-            data,
-            metadata,
-            timestamp: SdkTimestamp::from_sdk(self.raw.timestamp),
-        }
     }
 }
 
@@ -2102,84 +2003,81 @@ impl MetadataFrame {
     /// or the crate's metadata cap, as required by `validate_frame_metadata`.
     #[cfg(test)]
     pub(crate) unsafe fn from_raw(raw: &NDIlib_metadata_frame_t) -> Result<Self> {
+        // SAFETY: forwarded to the caller.
         let text = unsafe { validate_metadata_layout(raw)? };
-        Ok(unsafe { Self::from_raw_validated(raw, text) })
+        Ok(Self::copied(text, Timecode::from_ticks(raw.timecode)))
     }
 
-    /// Create from a raw NDI metadata frame after its layout has been validated.
-    ///
-    /// # Safety
-    ///
-    /// `text` must have been produced by `validate_metadata_layout(raw)` while
-    /// the same `raw.p_data` allocation is still valid.
-    pub(crate) unsafe fn from_raw_validated(
-        raw: &NDIlib_metadata_frame_t,
-        text: Option<MetadataText>,
-    ) -> Self {
-        let data = match text {
-            // SAFETY: the caller guarantees `text` was validated from this
-            // live `raw.p_data` allocation.
-            Some(text) => unsafe { FrameMetadata::copy_from_raw_validated(raw.p_data, text, None) },
-            // The empty null frame carries no text; it is empty metadata.
-            None => FrameMetadata {
+    /// Copy validated metadata text into an owned frame. `None`, the empty
+    /// null frame, carries no text; it is empty metadata.
+    pub(crate) fn copied(text: Option<MetadataText<'_>>, timecode: Timecode) -> Self {
+        let data = text.map_or_else(
+            || FrameMetadata {
                 inner: CString::default(),
             },
-        };
-
-        Self {
-            data,
-            timecode: Timecode::from_ticks(raw.timecode),
-        }
+            |text| FrameMetadata::copy_from(text, None),
+        );
+        Self { data, timecode }
     }
 }
 
-/// Validated SDK text of known length, cached so that accessors can expose it
-/// without rescanning.
+/// Validated metadata text, borrowed together with its terminator: the
+/// pointer and length of a C string that is known to be valid.
 ///
-/// The `len` bytes at the pointer it was validated from are valid UTF-8 with
-/// no NUL byte, they are followed by a NUL terminator, and
-/// `len + 1 <= MAX_METADATA_BYTES`. Absent text (a null pointer, or the
-/// standalone frame's empty null frame) is `None` of `Option<MetadataText>`;
-/// `Some` with a `len` of zero is an explicit, non-null empty C string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MetadataText {
-    /// The payload length in bytes, excluding the NUL terminator.
-    len: usize,
+/// `with_nul` is UTF-8 whose only NUL byte is its last, and it is at most
+/// [`MAX_METADATA_BYTES`] long. Each construction establishes this: the
+/// validation of application, SDK and owned text, and the re-borrow of SDK
+/// text that [`ValidatedFrame`] measured. Absent text (a null pointer, or a
+/// standalone frame's empty null frame) is `None` of
+/// `Option<MetadataText>`; an explicit, non-null empty C string is `"\0"`.
+///
+/// It is a shared string borrow, so a frame that holds one keeps its thread
+/// and unwind auto traits.
+#[derive(Clone, Copy)]
+pub(crate) struct MetadataText<'a> {
+    with_nul: &'a str,
 }
 
-impl MetadataText {
-    /// Validate application metadata. Bounded application CStr validation
-    /// uses the known slice length, never a raw scan.
-    pub(crate) fn from_cstr(metadata: Option<&CStr>) -> Result<Option<Self>> {
-        let Some(metadata) = metadata else {
-            return Ok(None);
-        };
-        validate_metadata_len_with_nul(metadata.to_bytes_with_nul().len())?;
-        let text = metadata
-            .to_str()
-            .map_err(|e| Error::InvalidUtf8(e.to_string()))?;
-        Ok(Some(Self { len: text.len() }))
+impl<'a> MetadataText<'a> {
+    /// Validate application metadata: its length and UTF-8. A `CStr` ends in
+    /// its only NUL, so its known length bounds every check, and nothing
+    /// scans raw memory.
+    pub(crate) fn from_cstr(metadata: &'a CStr) -> Result<Self> {
+        let with_nul = metadata.to_bytes_with_nul();
+        validate_metadata_len_with_nul(with_nul.len())?;
+        let with_nul = str::from_utf8(with_nul).map_err(|e| Error::InvalidUtf8(e.to_string()))?;
+        Ok(Self { with_nul })
     }
 
-    /// Borrow the validated text at `data`. An empty text never reads `data`.
-    ///
-    /// # Safety
-    ///
-    /// `data` must be the pointer this text was validated from, or the
-    /// pointer of the owned C string it describes, and the allocation behind
-    /// it must stay live and unchanged for `'a`.
-    pub(crate) unsafe fn text<'a>(self, data: *const c_char) -> &'a str {
-        if self.len == 0 {
-            return "";
-        }
-        // SAFETY: a non-empty text was validated from a non-null pointer, and
-        // the type's invariant makes its first `len` bytes initialized and
-        // readable; `u8` needs no alignment, `len` is below
-        // `MAX_METADATA_BYTES`, and the caller keeps the bytes live and
-        // unchanged for `'a`.
-        let bytes = unsafe { slice::from_raw_parts(data.cast::<u8>(), self.len) };
-        // SAFETY: validation checked that these bytes are UTF-8.
-        unsafe { str::from_utf8_unchecked(bytes) }
+    /// The text, without its terminator.
+    pub(crate) fn as_str(self) -> &'a str {
+        // The last byte is the one-byte NUL character, so this is a
+        // character boundary.
+        &self.with_nul[..self.with_nul.len() - 1]
+    }
+
+    /// The text as a C string for the SDK: the terminator follows it.
+    pub(crate) fn as_ptr(self) -> *const c_char {
+        self.with_nul.as_ptr().cast()
+    }
+
+    /// The text's length, terminator included.
+    fn len_with_nul(self) -> usize {
+        self.with_nul.len()
+    }
+}
+
+impl fmt::Debug for MetadataText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("MetadataText").field(&self.as_str()).finish()
+    }
+}
+
+impl From<MetadataText<'_>> for CString {
+    /// Copy the text into a new C string: one allocation, of exactly its
+    /// size.
+    fn from(text: MetadataText<'_>) -> Self {
+        FrameMetadata::copy_from(text, None).inner
     }
 }
 
@@ -2192,12 +2090,15 @@ impl MetadataText {
 /// This validates only memory layout and UTF-8. XML well-formedness is
 /// intentionally not checked because NDI receivers are expected to tolerate
 /// badly formed XML metadata.
+///
 /// # Safety
+///
 /// `raw.p_data`, when non-null, must reference readable storage for the
-/// declared length or a NUL-terminated string within the metadata cap.
+/// declared length or a NUL-terminated string within the metadata cap, live
+/// and unchanged for as long as `raw` is borrowed.
 pub(crate) unsafe fn validate_metadata_layout(
     raw: &NDIlib_metadata_frame_t,
-) -> Result<Option<MetadataText>> {
+) -> Result<Option<MetadataText<'_>>> {
     if raw.length < 0 {
         return Err(Error::InvalidFrame(format!(
             "Metadata frame has negative length: {}",
@@ -2227,23 +2128,25 @@ pub(crate) unsafe fn validate_metadata_layout(
     })?;
     validate_metadata_len_with_nul(len_with_nul)?;
 
+    // SAFETY: `p_data` is non-null, and the caller keeps the declared
+    // `len_with_nul` bytes at it readable and unchanged while `raw` is
+    // borrowed; `u8` needs no alignment, and the length is within the
+    // metadata cap.
     let bytes = unsafe { slice::from_raw_parts(raw.p_data.cast::<u8>(), len_with_nul) };
-    if bytes[len_with_nul - 1] != 0 {
+    let Some((&0, payload)) = bytes.split_last() else {
         return Err(Error::InvalidFrame(
             "Metadata frame length does not include a trailing NUL terminator".into(),
         ));
-    }
-
-    let payload = &bytes[..len_with_nul - 1];
+    };
     if payload.contains(&0) {
         return Err(Error::InvalidFrame(
             "Metadata frame contains an interior NUL byte".into(),
         ));
     }
 
-    str::from_utf8(payload).map_err(|err| Error::InvalidUtf8(err.to_string()))?;
-
-    Ok(Some(MetadataText { len: payload.len() }))
+    // The bytes end in their only NUL and are within the cap.
+    let with_nul = str::from_utf8(bytes).map_err(|err| Error::InvalidUtf8(err.to_string()))?;
+    Ok(Some(MetadataText { with_nul }))
 }
 
 fn validate_metadata_len_with_nul(len_with_nul: usize) -> Result<i32> {
@@ -2295,9 +2198,18 @@ impl FrameMetadata {
         })
     }
 
+    /// The text with its terminator.
+    pub(crate) fn text(&self) -> MetadataText<'_> {
+        // SAFETY: construction accepts `String`s and validated text only, so
+        // the bytes are UTF-8, and the terminator is one more UTF-8
+        // character. `new` checked the size cap and that the terminator is
+        // the only NUL, and `copy_from` copies text that has both properties.
+        let with_nul = unsafe { str::from_utf8_unchecked(self.inner.as_bytes_with_nul()) };
+        MetadataText { with_nul }
+    }
+
     pub(crate) fn as_str(&self) -> &str {
-        // SAFETY: construction accepts String and validated SDK UTF-8 only.
-        unsafe { str::from_utf8_unchecked(self.inner.as_bytes()) }
+        self.text().as_str()
     }
 
     pub(crate) fn into_string(self) -> String {
@@ -2306,43 +2218,26 @@ impl FrameMetadata {
             .expect("FrameMetadata validates UTF-8 at construction")
     }
 
-    pub(crate) fn as_cstr(&self) -> &CStr {
-        self.inner.as_c_str()
-    }
-
     pub(crate) fn as_ptr(&self) -> *const c_char {
         self.inner.as_ptr()
     }
 
-    /// Copy validated SDK text into owned metadata, reusing the allocation of
+    /// Copy validated text into owned metadata, reusing the allocation of
     /// `storage` when there is one.
     ///
     /// Without `storage` this allocates once. With it, it allocates nothing
     /// when the old and new texts have the same length, and otherwise
     /// resizes the old string's buffer once, since a C string's storage is
     /// exactly its length.
-    ///
-    /// # Safety
-    ///
-    /// As for [`MetadataText::text`]: `text` must have been validated from
-    /// this `data` pointer while the pointed-to allocation is still valid.
-    unsafe fn copy_from_raw_validated(
-        data: *const c_char,
-        text: MetadataText,
-        storage: Option<Self>,
-    ) -> Self {
-        // SAFETY: forwarded to the caller's obligation.
-        let text = unsafe { text.text(data) };
+    fn copy_from(text: MetadataText<'_>, storage: Option<Self>) -> Self {
         let mut bytes = storage.map_or_else(Vec::new, |old| old.inner.into_bytes_with_nul());
         bytes.clear();
         // Exactly the string's size: the conversion below keeps a buffer of
         // that capacity and shrinks a larger one.
-        bytes.reserve_exact(text.len() + 1);
-        bytes.extend_from_slice(text.as_bytes());
-        bytes.push(0);
+        bytes.reserve_exact(text.len_with_nul());
+        bytes.extend_from_slice(text.with_nul.as_bytes());
 
-        // SAFETY: validated text contains no NUL byte, and exactly one
-        // terminator was appended.
+        // SAFETY: `MetadataText` ends in its only NUL byte, copied with it.
         let inner = unsafe { CString::from_vec_with_nul_unchecked(bytes) };
         Self { inner }
     }
@@ -2370,10 +2265,11 @@ impl fmt::Debug for FrameMetadata {
 /// # Safety
 ///
 /// When non-null, `p_metadata` must be readable byte-by-byte until either the
-/// first NUL terminator or `MAX_METADATA_BYTES` bytes have been read.
-pub(crate) unsafe fn validate_frame_metadata(
+/// first NUL terminator or `MAX_METADATA_BYTES` bytes have been read, and
+/// the bytes it reads must stay live and unchanged for `'a`.
+pub(crate) unsafe fn validate_frame_metadata<'a>(
     p_metadata: *const c_char,
-) -> Result<Option<MetadataText>> {
+) -> Result<Option<MetadataText<'a>>> {
     if p_metadata.is_null() {
         return Ok(None);
     }
@@ -2384,9 +2280,13 @@ pub(crate) unsafe fn validate_frame_metadata(
             "Frame metadata is missing a NUL terminator within {MAX_METADATA_BYTES} bytes"
         )));
     };
-    str::from_utf8(payload).map_err(|err| Error::InvalidUtf8(err.to_string()))?;
-    // The NUL was found at index `payload.len()`, below the cap.
-    Ok(Some(MetadataText { len: payload.len() }))
+    // SAFETY: the scan just read these bytes and the NUL after them, all
+    // within the cap, from the non-null `p_metadata`, which the caller keeps
+    // live and unchanged for `'a`; `u8` needs no alignment.
+    let bytes = unsafe { slice::from_raw_parts(p_metadata.cast::<u8>(), payload.len() + 1) };
+    // The bytes end in their only NUL, found below the cap.
+    let with_nul = str::from_utf8(bytes).map_err(|err| Error::InvalidUtf8(err.to_string()))?;
+    Ok(Some(MetadataText { with_nul }))
 }
 
 /// The bytes of an SDK string before its first NUL, or `None` when there is
@@ -3467,10 +3367,14 @@ pub(crate) fn validate_audio_layout(raw: &NDIlib_audio_frame_v3_t) -> Result<Val
 /// Audio the SDK returned from a call that may legitimately deliver no
 /// samples: a FrameSync input-format query, or an AVSync result with nothing
 /// to deliver.
+///
+/// A frame of samples is its layout when only the shape was classified, and
+/// a [`ValidatedFrame`] when [`ValidatedAudio::returned_audio`] validated its
+/// metadata too.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum ReturnedAudio {
+pub(crate) enum ReturnedAudio<T = ValidatedAudioLayout> {
     /// A frame of samples, validated as [`validate_audio_layout`] validates.
-    Samples(ValidatedAudioLayout),
+    Samples(T),
     /// No samples. Carries the input format when the SDK reported one, and
     /// `None` when no source format is known yet.
     Empty(Option<AudioInputFormat>),
@@ -3557,6 +3461,267 @@ fn validate_audio_format(fourcc: NDIlib_FourCC_audio_type_e) -> Result<AudioForm
             "Unknown audio format FourCC: 0x{:08X}",
             fourcc
         ))),
+    }
+}
+
+// ============================================================================
+// SDK frames validated as a whole
+// ============================================================================
+
+/// An SDK frame descriptor that a [`ValidatedFrame`] holds: where it keeps
+/// its metadata text.
+pub(crate) trait SdkDescriptor {
+    /// The descriptor's metadata text pointer, null for none.
+    fn metadata_pointer(&self) -> *const c_char;
+}
+
+impl SdkDescriptor for NDIlib_video_frame_v2_t {
+    fn metadata_pointer(&self) -> *const c_char {
+        self.p_metadata
+    }
+}
+
+impl SdkDescriptor for NDIlib_audio_frame_v3_t {
+    fn metadata_pointer(&self) -> *const c_char {
+        self.p_metadata
+    }
+}
+
+impl SdkDescriptor for NDIlib_metadata_frame_t {
+    fn metadata_pointer(&self) -> *const c_char {
+        self.p_data
+    }
+}
+
+/// A holder of one SDK frame descriptor: a capture [`Guard`], which owns the
+/// frame and frees it when dropped, or a borrow of a descriptor.
+pub(crate) trait HoldsDescriptor {
+    /// The descriptor it holds.
+    type Descriptor: SdkDescriptor;
+
+    /// The descriptor.
+    fn descriptor(&self) -> &Self::Descriptor;
+}
+
+impl<S: FrameFree> HoldsDescriptor for Guard<'_, S>
+where
+    S::RawFrame: SdkDescriptor,
+{
+    type Descriptor = S::RawFrame;
+
+    fn descriptor(&self) -> &S::RawFrame {
+        self.frame()
+    }
+}
+
+impl<D: SdkDescriptor> HoldsDescriptor for &D {
+    type Descriptor = D;
+
+    fn descriptor(&self) -> &D {
+        self
+    }
+}
+
+/// An SDK frame validated as a whole: the holder `F` of its descriptor, what
+/// was validated from that descriptor, `V`, and the length of its metadata
+/// text.
+///
+/// Only the validation functions construct one, each from the one descriptor
+/// its holder holds: [`ValidatedVideo::video`], [`ValidatedAudio::audio`],
+/// [`ValidatedAudio::returned_audio`] and
+/// [`ValidatedMetadata::metadata_frame`]. A layout or text validated from
+/// another descriptor therefore cannot be paired with it, and every view and
+/// owned copy of a received frame takes its parts from here.
+///
+/// The text is kept as a length and borrowed again from the descriptor's
+/// pointer, so that this type adds no pointer of its own: a frame reference
+/// that holds one keeps the thread and unwind auto traits of its guard. `V`
+/// is a parameter rather than a projection from `F` so that a reference
+/// stays covariant in the lifetime of its guard.
+pub(crate) struct ValidatedFrame<F, V> {
+    frame: F,
+    validated: V,
+    /// The length of the metadata text, terminator included, or `None` for
+    /// none.
+    text_len_with_nul: Option<usize>,
+}
+
+/// A video frame validated with its layout and header.
+pub(crate) type ValidatedVideo<F> = ValidatedFrame<F, (ValidatedVideoLayout, VideoHeader)>;
+
+/// A frame of audio samples validated with its layout.
+pub(crate) type ValidatedAudio<F> = ValidatedFrame<F, ValidatedAudioLayout>;
+
+/// A standalone metadata frame, which is its text alone.
+pub(crate) type ValidatedMetadata<F> = ValidatedFrame<F, ()>;
+
+impl<F: HoldsDescriptor, V> ValidatedFrame<F, V> {
+    /// Pair `frame` with `validated`, which the caller validated from its
+    /// descriptor, and the per-frame metadata text the descriptor points to.
+    ///
+    /// # Safety
+    ///
+    /// The descriptor's metadata pointer must be null, or readable up to its
+    /// first NUL or [`MAX_METADATA_BYTES`], with those bytes live and
+    /// unchanged until `frame` is dropped, and `frame` must hold that one
+    /// descriptor for as long as it lives.
+    unsafe fn with_frame_metadata(frame: F, validated: V) -> Result<Self> {
+        // SAFETY: forwarded to the caller.
+        let text = unsafe { validate_frame_metadata(frame.descriptor().metadata_pointer())? };
+        Ok(Self {
+            text_len_with_nul: text.map(MetadataText::len_with_nul),
+            frame,
+            validated,
+        })
+    }
+
+    /// The descriptor, exactly as the SDK delivered it.
+    pub(crate) fn descriptor(&self) -> &F::Descriptor {
+        self.frame.descriptor()
+    }
+
+    /// The validated metadata text, or `None` when the frame has none.
+    pub(crate) fn metadata(&self) -> Option<MetadataText<'_>> {
+        let len_with_nul = self.text_len_with_nul?;
+        let data = self.descriptor().metadata_pointer().cast::<u8>();
+        // SAFETY: a validation function measured `len_with_nul` bytes of
+        // text at this descriptor's metadata pointer, which `frame` holds
+        // unchanged: UTF-8 whose only NUL is its last byte, within the cap.
+        // The function's caller keeps those bytes live and unchanged until
+        // `frame` is dropped, and the text borrows `self`, which holds it.
+        let with_nul =
+            unsafe { str::from_utf8_unchecked(slice::from_raw_parts(data, len_with_nul)) };
+        Some(MetadataText { with_nul })
+    }
+}
+
+impl<F: HoldsDescriptor<Descriptor = NDIlib_video_frame_v2_t>> ValidatedVideo<F> {
+    /// Validate the uncompressed video frame `frame` holds: its pointer,
+    /// header, pixel format and layout, as [`validate_video_frame`] does, and
+    /// its metadata text.
+    ///
+    /// # Safety
+    ///
+    /// `frame` must hold one descriptor for as long as it lives, and until
+    /// it is dropped, its pixel allocation must cover the layout the
+    /// descriptor describes, with every active row initialized, and its
+    /// metadata pointer must be null or readable up to its first NUL or
+    /// [`MAX_METADATA_BYTES`], all live and unchanged. Row padding need not
+    /// be initialized.
+    pub(crate) unsafe fn video(frame: F) -> Result<Self> {
+        let validated = validate_video_frame(frame.descriptor())?;
+        // SAFETY: forwarded to the caller.
+        unsafe { Self::with_frame_metadata(frame, validated) }
+    }
+}
+
+impl<F: HoldsDescriptor<Descriptor = NDIlib_audio_frame_v3_t>> ValidatedAudio<F> {
+    /// Validate the frame of audio samples `frame` holds, as
+    /// [`validate_audio_layout`] does, and its metadata text.
+    ///
+    /// # Safety
+    ///
+    /// `frame` must hold one descriptor for as long as it lives, and until
+    /// it is dropped, every channel's samples at the offsets the descriptor
+    /// describes must be initialized, and its metadata pointer must be null
+    /// or readable up to its first NUL or [`MAX_METADATA_BYTES`], all live
+    /// and unchanged. Padding between channels need not be initialized.
+    pub(crate) unsafe fn audio(frame: F) -> Result<Self> {
+        let validated = validate_audio_layout(frame.descriptor())?;
+        // SAFETY: forwarded to the caller.
+        unsafe { Self::with_frame_metadata(frame, validated) }
+    }
+
+    /// Validate audio the SDK returned where no samples is a valid answer:
+    /// its shape, as [`validate_returned_audio`] classifies it, and the
+    /// metadata text of a frame of samples.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::audio`], for a descriptor that holds samples.
+    #[cfg(feature = "advanced")]
+    pub(crate) unsafe fn returned_audio(frame: F) -> Result<ReturnedAudio<Self>> {
+        Ok(match validate_returned_audio(frame.descriptor())? {
+            ReturnedAudio::Empty(format) => ReturnedAudio::Empty(format),
+            // SAFETY: forwarded to the caller for a frame of samples.
+            ReturnedAudio::Samples(validated) => {
+                ReturnedAudio::Samples(unsafe { Self::with_frame_metadata(frame, validated)? })
+            }
+        })
+    }
+}
+
+impl<F: HoldsDescriptor<Descriptor = NDIlib_metadata_frame_t>> ValidatedMetadata<F> {
+    /// Validate the standalone metadata frame `frame` holds, as
+    /// [`validate_metadata_layout`] does.
+    ///
+    /// # Safety
+    ///
+    /// `frame` must hold one descriptor for as long as it lives, and until
+    /// it is dropped, its data pointer must be null or reference readable
+    /// storage for the declared length, or a NUL-terminated string within
+    /// the metadata cap when the length is zero, live and unchanged.
+    pub(crate) unsafe fn metadata_frame(frame: F) -> Result<Self> {
+        // SAFETY: forwarded to the caller.
+        let text = unsafe { validate_metadata_layout(frame.descriptor())? };
+        Ok(Self {
+            text_len_with_nul: text.map(MetadataText::len_with_nul),
+            frame,
+            validated: (),
+        })
+    }
+}
+
+impl<F: HoldsDescriptor<Descriptor = NDIlib_video_frame_v2_t>> VideoParts for ValidatedVideo<F> {
+    #[inline]
+    fn layout(&self) -> &ValidatedVideoLayout {
+        &self.validated.0
+    }
+    #[inline]
+    fn header(&self) -> &VideoHeader {
+        &self.validated.1
+    }
+    /// [`Self::video`] validated the layout from this descriptor, whose
+    /// pixels stay allocated and unchanged while `frame` lives, as its
+    /// caller guaranteed; the views borrow `self`, which holds it.
+    #[inline]
+    fn pixels(&self) -> *const u8 {
+        self.descriptor().p_data
+    }
+    #[inline]
+    fn metadata_text(&self) -> Option<MetadataText<'_>> {
+        self.metadata()
+    }
+    #[inline]
+    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+        SdkTimestamp::from_sdk(self.descriptor().timestamp)
+    }
+}
+
+impl<F: HoldsDescriptor<Descriptor = NDIlib_audio_frame_v3_t>> AudioParts for ValidatedAudio<F> {
+    #[inline]
+    fn layout(&self) -> &ValidatedAudioLayout {
+        &self.validated
+    }
+    #[inline]
+    fn timecode(&self) -> Timecode {
+        Timecode::from_ticks(self.descriptor().timecode)
+    }
+    #[inline]
+    fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
+        SdkTimestamp::from_sdk(self.descriptor().timestamp)
+    }
+    /// [`Self::audio`] validated the layout, including sample alignment,
+    /// from this descriptor, whose samples stay allocated and unchanged
+    /// while `frame` lives, as its caller guaranteed; the views borrow
+    /// `self`, which holds it.
+    #[inline]
+    fn samples(&self) -> *const f32 {
+        self.descriptor().p_data.cast()
+    }
+    #[inline]
+    fn metadata_text(&self) -> Option<MetadataText<'_>> {
+        self.metadata()
     }
 }
 
@@ -3765,12 +3930,9 @@ impl std::iter::FusedIterator for VideoPlanes<'_> {}
 /// the owned [`VideoFrame`]. At 60 fps, this saves ~475 MB/s of memory bandwidth.
 #[allow(private_bounds)]
 pub struct VideoRef<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> {
-    guard: Guard<'a, S>,
-    /// Cached validated layout information (pixel format, data length, stride/size).
-    /// Computed once at construction time; `data()` uses this cached value.
-    layout: ValidatedVideoLayout,
-    header: VideoHeader,
-    metadata: Option<MetadataText>,
+    /// The captured frame and the layout, header and metadata text validated
+    /// from it once, when it was captured; accessors read the cached values.
+    frame: ValidatedVideo<Guard<'a, S>>,
 }
 
 /// A zero-copy borrowed video frame from a [`Receiver`](crate::Receiver) capture.
@@ -3791,24 +3953,21 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
     /// - Valid dimensions and stride
     /// - Valid frame rate, picture aspect ratio and scan type
     /// - Buffer size within `MAX_VIDEO_BYTES` limit
+    /// - Metadata text
     ///
-    /// The validated layout and header are cached so that accessors return
-    /// them without re-computation or unchecked arithmetic.
+    /// The validated layout, header and text are cached so that accessors
+    /// return them without re-computation or unchecked arithmetic.
     ///
     /// # Safety
     ///
     /// The caller must ensure the guard was created from a valid NDI instance
     /// and contains a frame populated by the matching SDK capture call.
     pub(crate) unsafe fn new(guard: Guard<'a, S>) -> Result<Self> {
-        let (layout, header) = validate_video_frame(guard.frame())?;
-        let metadata = unsafe { validate_frame_metadata(guard.frame().p_metadata)? };
-
-        Ok(Self {
-            guard,
-            layout,
-            header,
-            metadata,
-        })
+        // SAFETY: the guard holds the one descriptor the capture populated
+        // until it frees the frame on drop, and the SDK keeps the pixels and
+        // metadata it points to allocated and unchanged until then.
+        let frame = unsafe { ValidatedVideo::video(guard)? };
+        Ok(Self { frame })
     }
 
     /// The SDK descriptor of this frame, exactly as its capture delivered it,
@@ -3817,7 +3976,7 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
     /// `self` is borrowed.
     #[cfg(feature = "advanced")]
     pub(crate) fn raw(&self) -> &NDIlib_video_frame_v2_t {
-        self.guard.frame()
+        self.frame.descriptor()
     }
 
     /// Borrow all active pixels when contiguous, in SDK plane order.
@@ -3827,15 +3986,14 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
     /// [`Self::to_owned`] for a tightly packed owned buffer. A single packed
     /// row can be borrowed even when its stride includes trailing padding.
     pub fn data(&self) -> Option<&[u8]> {
-        if !self.layout.is_contiguous() {
+        let layout = VideoParts::layout(self);
+        if !layout.is_contiguous() {
             return None;
         }
         // SAFETY: The guard retains the SDK allocation for this borrow. Layout
         // validation bounds the range; contiguity proves every byte is active,
         // initialized payload, with no intervening or trailing padding.
-        Some(unsafe {
-            slice::from_raw_parts(self.guard.frame().p_data, self.layout.payload_len_bytes)
-        })
+        Some(unsafe { slice::from_raw_parts(self.pixels(), layout.payload_len_bytes) })
     }
 
     /// Copy this borrowed frame into an owned `VideoFrame`.
@@ -3849,7 +4007,7 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
     /// The copy cannot fail: capture validated everything it relies on, and
     /// the packed layout of a valid frame is valid.
     pub fn to_owned(&self) -> VideoFrame {
-        self.copy_source().to_frame()
+        self.frame.owned_copy()
     }
 
     /// Copy this borrowed frame into `destination`, reusing its allocations.
@@ -3871,47 +4029,31 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
     /// FrameSync frame stays on its capture thread. The destination is an
     /// ordinary owned frame either way.
     pub fn copy_into(&self, destination: &mut VideoFrame) {
-        self.copy_source().copy_into(destination);
-    }
-
-    fn copy_source(&self) -> VideoCopySource<'_> {
-        // SAFETY: `new` validated the layout, header and metadata text from
-        // the frame this guard owns, and the guard keeps the SDK's pixels and
-        // metadata live and unchanged while `self` is borrowed.
-        unsafe {
-            VideoCopySource::new(*self.guard.frame(), self.layout, self.header, self.metadata)
-        }
+        self.frame.copy_into_owned(destination);
     }
 }
 
+/// Every part comes from the one [`ValidatedFrame`].
 impl<S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoParts for VideoRef<'_, S> {
     #[inline]
     fn layout(&self) -> &ValidatedVideoLayout {
-        &self.layout
+        self.frame.layout()
     }
     #[inline]
     fn header(&self) -> &VideoHeader {
-        &self.header
+        self.frame.header()
     }
-    /// `new` validated the layout from the frame this guard owns, and the
-    /// guard keeps the SDK's pixels allocated and unchanged while `self` is
-    /// borrowed.
     #[inline]
     fn pixels(&self) -> *const u8 {
-        self.guard.frame().p_data
+        self.frame.pixels()
     }
     #[inline]
-    fn metadata_text(&self) -> Option<&str> {
-        self.metadata.map(|text| {
-            // SAFETY: `new` validated `text` from this frame's `p_metadata`,
-            // and the guard keeps that SDK allocation live and unchanged
-            // while `self` is borrowed.
-            unsafe { text.text(self.guard.frame().p_metadata) }
-        })
+    fn metadata_text(&self) -> Option<MetadataText<'_>> {
+        self.frame.metadata()
     }
     #[inline]
     fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
-        SdkTimestamp::from_sdk(self.guard.frame().timestamp)
+        self.frame.sdk_timestamp()
     }
 }
 
@@ -3958,11 +4100,9 @@ video_accessors! {
 /// - Receiver refs are `Send + Sync`; FrameSync refs stay on their capture thread
 #[allow(private_bounds)]
 pub struct AudioRef<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> {
-    guard: Guard<'a, S>,
-    /// Cached validated layout information (format, sample count).
-    /// Computed once at construction time; `data()` uses this cached value.
-    layout: ValidatedAudioLayout,
-    metadata: Option<MetadataText>,
+    /// The captured frame and the layout and metadata text validated from it
+    /// once, when it was captured; accessors read the cached values.
+    frame: ValidatedAudio<Guard<'a, S>>,
 }
 
 /// A zero-copy borrowed audio frame from a [`Receiver`](crate::Receiver) capture.
@@ -3992,14 +4132,11 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
     /// The caller must ensure the guard was created from a valid NDI instance
     /// and contains a frame populated by the matching SDK capture call.
     unsafe fn from_guard(guard: Guard<'a, S>) -> Result<Self> {
-        let layout = validate_audio_layout(guard.frame())?;
-        let metadata = unsafe { validate_frame_metadata(guard.frame().p_metadata)? };
-
-        Ok(Self {
-            guard,
-            layout,
-            metadata,
-        })
+        // SAFETY: the guard holds the one descriptor the capture populated
+        // until it frees the frame on drop, and the SDK keeps the samples and
+        // metadata it points to allocated and unchanged until then.
+        let frame = unsafe { ValidatedAudio::audio(guard)? };
+        Ok(Self { frame })
     }
 
     /// Get a zero-copy slice when channels are tightly packed.
@@ -4008,19 +4145,13 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
     /// Use [`channel_data`](Self::channel_data) or [`channels`](Self::channels)
     /// for those buffers.
     pub fn data(&self) -> Option<&[f32]> {
-        if self.layout.no_channels > 1
-            && self.layout.channel_stride_samples != self.layout.no_samples
-        {
+        let layout = AudioParts::layout(self);
+        if layout.no_channels > 1 && layout.channel_stride_samples != layout.no_samples {
             return None;
         }
         // SAFETY: a packed FLTP buffer contains only initialized samples;
         // construction checked dimensions, byte bounds, and float alignment.
-        Some(unsafe {
-            slice::from_raw_parts(
-                self.guard.frame().p_data.cast::<f32>(),
-                self.layout.sample_count,
-            )
-        })
+        Some(unsafe { slice::from_raw_parts(self.samples(), layout.sample_count) })
     }
 
     /// Copy this borrowed frame into an owned `AudioFrame`.
@@ -4033,7 +4164,7 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
     ///
     /// The copy cannot fail: capture validated everything it relies on.
     pub fn to_owned(&self) -> AudioFrame {
-        self.copy_source().to_frame()
+        self.frame.owned_copy()
     }
 
     /// Copy this borrowed frame into `destination`, reusing its allocations.
@@ -4055,46 +4186,31 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
     /// FrameSync frame stays on its capture thread. The destination is an
     /// ordinary owned frame either way.
     pub fn copy_into(&self, destination: &mut AudioFrame) {
-        self.copy_source().copy_into(destination);
-    }
-
-    fn copy_source(&self) -> AudioCopySource<'_> {
-        // SAFETY: `from_guard` validated the layout, including sample
-        // alignment, and the metadata text from the frame this guard owns,
-        // and the guard keeps the SDK's samples and metadata live and
-        // unchanged while `self` is borrowed.
-        unsafe { AudioCopySource::new(*self.guard.frame(), self.layout, self.metadata) }
+        self.frame.copy_into_owned(destination);
     }
 }
 
+/// Every part comes from the one [`ValidatedFrame`].
 impl<S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioParts for AudioRef<'_, S> {
     #[inline]
     fn layout(&self) -> &ValidatedAudioLayout {
-        &self.layout
+        self.frame.layout()
     }
     #[inline]
     fn timecode(&self) -> Timecode {
-        Timecode::from_ticks(self.guard.frame().timecode)
+        self.frame.timecode()
     }
     #[inline]
     fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
-        SdkTimestamp::from_sdk(self.guard.frame().timestamp)
+        self.frame.sdk_timestamp()
     }
-    /// `from_guard` validated the layout, including sample alignment, from
-    /// the frame this guard owns, and the guard keeps the SDK's samples
-    /// allocated and unchanged while `self` is borrowed.
     #[inline]
     fn samples(&self) -> *const f32 {
-        self.guard.frame().p_data.cast()
+        self.frame.samples()
     }
     #[inline]
-    fn metadata_text(&self) -> Option<&str> {
-        self.metadata.map(|text| {
-            // SAFETY: `from_guard` validated `text` from this frame's
-            // `p_metadata`, and the guard keeps that SDK allocation live and
-            // unchanged while `self` is borrowed.
-            unsafe { text.text(self.guard.frame().p_metadata) }
-        })
+    fn metadata_text(&self) -> Option<MetadataText<'_>> {
+        self.frame.metadata()
     }
 }
 
@@ -4171,10 +4287,10 @@ impl<'fs> AudioRef<'fs, FrameSyncAudioFree> {
 /// # }
 /// ```
 pub struct MetadataFrameRef<'rx> {
-    guard: RecvMetadataGuard<'rx>,
-    /// Cached validated text, `None` for the empty null frame. Computed once
-    /// at construction time; `data()` and `as_bytes()` use this cached value.
-    text: Option<MetadataText>,
+    /// The captured frame and its text, validated once when it was captured;
+    /// `data()` and `as_bytes()` read the cached length. The empty null frame
+    /// has no text.
+    frame: ValidatedMetadata<RecvMetadataGuard<'rx>>,
 }
 
 impl<'rx> MetadataFrameRef<'rx> {
@@ -4185,15 +4301,16 @@ impl<'rx> MetadataFrameRef<'rx> {
     /// The caller must ensure the guard was created from a valid NDI receiver
     /// and contains a frame populated by `NDIlib_recv_capture_v3`.
     pub(crate) unsafe fn new(guard: RecvMetadataGuard<'rx>) -> Result<Self> {
-        // SAFETY: the receive guard owns the SDK metadata buffer through validation.
-        let text = unsafe { validate_metadata_layout(guard.frame())? };
-
-        Ok(Self { guard, text })
+        // SAFETY: the receive guard holds the one descriptor the capture
+        // populated until it frees the frame on drop, and the SDK keeps the
+        // text it points to allocated and unchanged until then.
+        let frame = unsafe { ValidatedMetadata::metadata_frame(guard)? };
+        Ok(Self { frame })
     }
 
     /// Get the timecode.
     pub fn timecode(&self) -> Timecode {
-        Timecode::from_ticks(self.guard.frame().timecode)
+        Timecode::from_ticks(self.frame.descriptor().timecode)
     }
 
     /// Get a zero-copy view of the metadata text.
@@ -4201,12 +4318,7 @@ impl<'rx> MetadataFrameRef<'rx> {
     /// This returns a reference directly into the NDI SDK's buffer.
     /// No allocation or string copying is performed.
     pub fn data(&self) -> &str {
-        self.text.map_or("", |text| {
-            // SAFETY: `new` validated `text` from this frame's `p_data`, and
-            // the receive guard keeps that SDK buffer live and unchanged while
-            // `self` is borrowed.
-            unsafe { text.text(self.guard.frame().p_data) }
-        })
+        self.frame.metadata().map_or("", MetadataText::as_str)
     }
 
     /// Get a zero-copy view of the metadata UTF-8 payload bytes, excluding the
@@ -4220,9 +4332,7 @@ impl<'rx> MetadataFrameRef<'rx> {
     /// This performs a string copy, allowing the frame to outlive
     /// the NDI buffer and be sent across threads.
     pub fn to_owned(&self) -> MetadataFrame {
-        // SAFETY: `new` validated `text` from this frame, whose buffer the
-        // receive guard keeps live through the copy.
-        unsafe { MetadataFrame::from_raw_validated(self.guard.frame(), self.text) }
+        MetadataFrame::copied(self.frame.metadata(), self.timecode())
     }
 }
 
@@ -4709,7 +4819,7 @@ mod tests {
                     baseline.as_secs_f64() * 1000.0 / f64::from(iterations),
                     packed.as_secs_f64() * 1000.0 / f64::from(iterations),
                     traversal.as_secs_f64() * 1_000_000.0 / f64::from(iterations * 100),
-                    frame.layout.payload_len_bytes);
+                    VideoParts::layout(&frame).payload_len_bytes);
             }
         }
     }
@@ -4857,8 +4967,8 @@ mod tests {
                         assert_eq!(reversed.join().unwrap(), serial);
                     });
                 }
-                assert_eq!(frame.layout.data_len_bytes, offset);
-                assert_eq!(frame.layout.payload_len_bytes, expected.len());
+                assert_eq!(VideoParts::layout(&frame).data_len_bytes, offset);
+                assert_eq!(VideoParts::layout(&frame).payload_len_bytes, expected.len());
                 let owned = frame.to_owned();
                 let raw_owned = unsafe { VideoFrame::from_raw(&raw) }.unwrap();
                 assert_eq!(owned.data(), expected);
@@ -6670,7 +6780,7 @@ mod tests {
         let raw = null_metadata_raw(0);
         let layout = unsafe { validate_metadata_layout(&raw) }.expect("empty null frame is valid");
 
-        assert_eq!(layout, None);
+        assert!(layout.is_none());
     }
 
     #[test]
@@ -6680,7 +6790,11 @@ mod tests {
         let layout =
             unsafe { validate_metadata_layout(&raw) }.expect("explicit empty payload is valid");
 
-        assert_eq!(layout, Some(MetadataText { len: 0 }));
+        assert_eq!(layout.map(MetadataText::as_str), Some(""));
+        assert_eq!(
+            layout.map(MetadataText::as_ptr),
+            Some(raw.p_data.cast_const())
+        );
     }
 
     #[test]
@@ -6693,11 +6807,10 @@ mod tests {
 
         // The SDK length includes the terminator; the text excludes it.
         assert_eq!(
-            layout,
-            Some(MetadataText {
-                len: data.len() - 1
-            })
+            layout.map(MetadataText::as_str),
+            Some("<ndi tally=\"preview\"/>")
         );
+        assert_eq!(layout.map(MetadataText::len_with_nul), Some(data.len()));
     }
 
     #[test]
@@ -6707,8 +6820,8 @@ mod tests {
         let layout =
             unsafe { validate_metadata_layout(&raw) }.expect("extra bytes after length ignored");
 
-        assert_eq!(layout, Some(MetadataText { len: 2 }));
-        let owned = unsafe { MetadataFrame::from_raw_validated(&raw, layout) };
+        assert_eq!(layout.map(MetadataText::as_str), Some("ok"));
+        let owned = MetadataFrame::copied(layout, Timecode::from_ticks(raw.timecode));
         assert_eq!(owned.data(), "ok");
     }
 
@@ -6727,8 +6840,8 @@ mod tests {
         let mut data = b"<ndi/>\0ignored".to_vec();
         let raw = metadata_raw_from_bytes(&mut data, 0);
         let layout = unsafe { validate_metadata_layout(&raw) }.expect("SDK C-string sentinel");
-        assert_eq!(layout, Some(MetadataText { len: 6 }));
-        let owned = unsafe { MetadataFrame::from_raw_validated(&raw, layout) };
+        assert_eq!(layout.map(MetadataText::as_str), Some("<ndi/>"));
+        let owned = MetadataFrame::copied(layout, Timecode::from_ticks(raw.timecode));
         assert_eq!(owned.data(), "<ndi/>");
     }
 
@@ -6866,12 +6979,8 @@ mod tests {
         });
         assert_eq!(allocations, 0);
 
-        let bytes = frame.data.inner.as_bytes_with_nul();
-        let layout = MetadataText {
-            len: bytes.len() - 1,
-        };
-        let (copy, allocations) = crate::test_alloc::allocation_count(|| unsafe {
-            FrameMetadata::copy_from_raw_validated(bytes.as_ptr().cast(), layout, None)
+        let (copy, allocations) = crate::test_alloc::allocation_count(|| {
+            FrameMetadata::copy_from(frame.data.text(), None)
         });
         assert_eq!(allocations, 1);
         assert_eq!(copy.as_str(), frame.data());
@@ -6881,11 +6990,11 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_frame_from_raw_validated_copies_only_payload() {
+    fn test_metadata_frame_copy_holds_only_payload() {
         let mut data = b"copy-me\0\0\xFF".to_vec();
         let raw = metadata_raw_from_bytes(&mut data, 8);
         let layout = unsafe { validate_metadata_layout(&raw) }.unwrap();
-        let frame = unsafe { MetadataFrame::from_raw_validated(&raw, layout) };
+        let frame = MetadataFrame::copied(layout, Timecode::from_ticks(raw.timecode));
 
         assert_eq!(frame.data(), "copy-me");
         assert_eq!(frame.timecode(), Timecode::from_ticks(12345));
@@ -6945,7 +7054,12 @@ mod tests {
 
         assert_eq!(frame_ref.data(), "zero-copy");
         assert_eq!(frame_ref.as_bytes(), b"zero-copy");
-        assert_eq!(frame_ref.text, Some(MetadataText { len: 9 }));
+        // The text is borrowed in place, with the length the SDK declared.
+        assert_eq!(frame_ref.data().as_ptr(), data.as_ptr());
+        assert_eq!(
+            frame_ref.frame.metadata().map(MetadataText::len_with_nul),
+            Some(10)
+        );
 
         assert_eq!(frame_ref.timecode(), Timecode::from_ticks(12345));
         let owned = frame_ref.to_owned();
@@ -6961,7 +7075,7 @@ mod tests {
         let raw = null_metadata_raw(0);
         let guard = unsafe { RecvMetadataGuard::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
         let frame_ref = unsafe { MetadataFrameRef::new(guard) }.expect("empty null frame");
-        assert_eq!(frame_ref.text, None);
+        assert!(frame_ref.frame.metadata().is_none());
         assert_eq!(frame_ref.data(), "");
         assert_eq!(frame_ref.as_bytes(), b"");
         let owned = frame_ref.to_owned();
@@ -6974,7 +7088,10 @@ mod tests {
         let raw = metadata_raw_from_bytes(&mut data, 0);
         let guard = unsafe { RecvMetadataGuard::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
         let frame_ref = unsafe { MetadataFrameRef::new(guard) }.expect("empty C-string sentinel");
-        assert_eq!(frame_ref.text, Some(MetadataText { len: 0 }));
+        assert_eq!(
+            frame_ref.frame.metadata().map(MetadataText::len_with_nul),
+            Some(1)
+        );
         assert_eq!(frame_ref.data(), "");
         assert_eq!(frame_ref.as_bytes(), b"");
         assert_eq!(frame_ref.to_owned().data(), "");
@@ -7005,7 +7122,7 @@ mod tests {
     fn test_validate_frame_metadata_accepts_null_without_allocation_state() {
         let layout = unsafe { validate_frame_metadata(ptr::null()) }.expect("null is valid");
 
-        assert_eq!(layout, None);
+        assert!(layout.is_none());
     }
 
     #[test]
@@ -7014,11 +7131,9 @@ mod tests {
         let layout = unsafe { validate_frame_metadata(data.as_mut_ptr().cast::<c_char>()) }
             .expect("explicit empty metadata is valid");
 
-        assert_eq!(layout, Some(MetadataText { len: 0 }));
-        assert_eq!(
-            layout.map(|text| unsafe { text.text(data.as_ptr().cast::<c_char>()) }),
-            Some("")
-        );
+        let text = layout.expect("explicit empty text");
+        assert_eq!(text.as_str(), "");
+        assert_eq!(text.as_ptr(), data.as_ptr().cast::<c_char>());
     }
 
     #[test]
@@ -7027,16 +7142,10 @@ mod tests {
         let layout = unsafe { validate_frame_metadata(data.as_mut_ptr().cast::<c_char>()) }
             .expect("valid UTF-8 metadata");
 
-        assert_eq!(
-            layout,
-            Some(MetadataText {
-                len: "hello metadata".len()
-            })
-        );
-        assert_eq!(
-            layout.map(|text| unsafe { text.text(data.as_ptr().cast::<c_char>()) }),
-            Some("hello metadata")
-        );
+        let text = layout.expect("text");
+        assert_eq!(text.as_str(), "hello metadata");
+        assert_eq!(text.len_with_nul(), "hello metadata".len() + 1);
+        assert_eq!(text.as_ptr(), data.as_ptr().cast::<c_char>());
     }
 
     #[test]
@@ -7049,10 +7158,8 @@ mod tests {
 
         // Exactly `MAX_METADATA_BYTES` including the terminator.
         assert_eq!(
-            layout,
-            Some(MetadataText {
-                len: MAX_METADATA_BYTES - 1
-            })
+            layout.map(MetadataText::len_with_nul),
+            Some(MAX_METADATA_BYTES)
         );
     }
 
@@ -8311,7 +8418,8 @@ mod tests {
             "data() should return slice with cached length"
         );
         assert_eq!(
-            frame_ref.layout.data_len_bytes, expected_size,
+            VideoParts::layout(&frame_ref).data_len_bytes,
+            expected_size,
             "Cached data_len_bytes should match expected"
         );
     }
@@ -8355,7 +8463,8 @@ mod tests {
             "data() should return slice with cached sample count"
         );
         assert_eq!(
-            frame_ref.layout.sample_count, sample_count,
+            AudioParts::layout(&frame_ref).sample_count,
+            sample_count,
             "Cached sample_count should match expected"
         );
     }
