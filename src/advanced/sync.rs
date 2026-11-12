@@ -151,7 +151,7 @@ impl Drop for AvResource {
     fn drop(&mut self) {
         // SAFETY: the handle was created by this table and is destroyed once,
         // while the receiver it reads from is still alive.
-        native!(self.table => unsafe { self.table.NDIlib_avsync_destroy(self.handle) });
+        native!(AvSync, self.table => unsafe { self.table.NDIlib_avsync_destroy(self.handle) });
     }
 }
 
@@ -208,7 +208,7 @@ impl AvSync {
         };
         // SAFETY: the receiver instance is live, and this value keeps it
         // alive for longer than the synchronizer.
-        let handle: AvSyncHandle = native!(table => unsafe {
+        let handle: AvSyncHandle = native!(AvSync, table => unsafe {
             table.NDIlib_avsync_create(receiver.core.instance)
         });
         if handle.is_null() {
@@ -260,10 +260,10 @@ impl AvSync {
             release: |audio: &mut NDIlib_audio_frame_v3_t| {
                 // SAFETY: the synchronizer that filled the descriptor is live,
                 // and the descriptor is returned to it exactly once.
-                native!(table => unsafe { table.NDIlib_avsync_free_audio(handle, audio) })
+                native!(AvSync, table => unsafe { table.NDIlib_avsync_free_audio(handle, audio) })
             },
         };
-        let status = native!(table => {
+        let status = native!(AvSync, table => {
             use crate::sys::advanced_bindings::*;
             // SAFETY: the synchronizer is live, the video descriptor (if any)
             // borrows a frame that outlives the call, and the audio
@@ -432,7 +432,7 @@ unsafe impl Sync for GenResource {}
 impl Drop for GenResource {
     fn drop(&mut self) {
         // SAFETY: the handle was created by this table and is destroyed once.
-        native!(self.table => unsafe { self.table.NDIlib_genlock_destroy(self.handle) });
+        native!(Genlock, self.table => unsafe { self.table.NDIlib_genlock_destroy(self.handle) });
     }
 }
 
@@ -488,7 +488,7 @@ impl Genlock {
         let source = source.map(Source::to_raw).transpose()?.map(Box::new);
         // SAFETY: the source descriptor and the configuration point to
         // strings that this value keeps alive for as long as the genlock.
-        let handle: GenlockHandle = native!(table => unsafe {
+        let handle: GenlockHandle = native!(Genlock, table => unsafe {
             table.NDIlib_genlock_create(
                 source.as_ref().map_or(ptr::null(), |source| &source.raw),
                 config.map_or(ptr::null(), AdvancedConfig::as_ptr),
@@ -523,7 +523,7 @@ impl Genlock {
         let GenResource { handle, table, .. } = self.resource;
         // SAFETY: the genlock is live and no wait is in progress, and the new
         // descriptor is stored below before the earlier one is released.
-        native!(table => unsafe {
+        native!(Genlock, table => unsafe {
             table.NDIlib_genlock_connect(
                 handle,
                 source.as_ref().map_or(ptr::null(), |source| &source.raw),
@@ -537,7 +537,7 @@ impl Genlock {
     pub fn is_active(&self) -> bool {
         let GenResource { handle, table, .. } = self.resource;
         // SAFETY: the genlock is live for this borrow.
-        native!(table => unsafe { table.NDIlib_genlock_is_active(handle) })
+        native!(Genlock, table => unsafe { table.NDIlib_genlock_is_active(handle) })
     }
 
     /// The video clock and the audio clock.
@@ -583,7 +583,7 @@ impl VideoClock<'_> {
         let GenResource { handle, table, .. } = *self.resource;
         // SAFETY: the genlock outlives this clock, and only this clock waits
         // for video.
-        Ok(ClockSource::from_active(native!(table => unsafe {
+        Ok(ClockSource::from_active(native!(Genlock, table => unsafe {
             table.NDIlib_genlock_wait_video(handle, &timing)
         })))
     }
@@ -608,7 +608,7 @@ impl AudioClock<'_> {
         let GenResource { handle, table, .. } = *self.resource;
         // SAFETY: the genlock outlives this clock, and only this clock waits
         // for audio.
-        Ok(ClockSource::from_active(native!(table => unsafe {
+        Ok(ClockSource::from_active(native!(Genlock, table => unsafe {
             table.NDIlib_genlock_wait_audio(handle, &timing)
         })))
     }

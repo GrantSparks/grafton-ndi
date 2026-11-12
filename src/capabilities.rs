@@ -346,7 +346,19 @@ impl Capabilities {
             }
         };
         let advanced_entry = |feature: RuntimeFeature, available: bool| {
-            if !cfg!(all(feature = "advanced", ndi_has_advanced_header)) {
+            #[cfg(feature = "advanced")]
+            let declared = match feature {
+                RuntimeFeature::AdvancedSenderConfiguration => {
+                    crate::sys::advanced::declared! { SenderConfiguration { true } else { false } }
+                }
+                RuntimeFeature::AdvancedReceiverConfiguration => {
+                    crate::sys::advanced::declared! { ReceiverConfiguration { true } else { false } }
+                }
+                _ => unreachable!("an Advanced creation feature"),
+            };
+            #[cfg(not(feature = "advanced"))]
+            let declared = false;
+            if !declared {
                 CapabilityStatus::Unavailable(CapabilityUnavailable::BuildAbiUnavailable)
             } else if edition != SdkEdition::Advanced {
                 CapabilityStatus::Unavailable(CapabilityUnavailable::WrongEdition)
@@ -593,14 +605,21 @@ mod tests {
 
     #[test]
     fn advanced_configuration_needs_the_build_abi_and_the_advanced_edition() {
+        #[cfg(feature = "advanced")]
+        let built = [
+            crate::sys::advanced::declared! { SenderConfiguration { true } else { false } },
+            crate::sys::advanced::declared! { ReceiverConfiguration { true } else { false } },
+        ];
+        #[cfg(not(feature = "advanced"))]
+        let built = [false, false];
         let features = [
             RuntimeFeature::AdvancedSenderConfiguration,
             RuntimeFeature::AdvancedReceiverConfiguration,
         ];
         let standard = detect(|_| true, Some("6.4.0.2"), SdkEdition::Standard);
         let advanced = detect(|_| true, Some("6.4.0.2"), SdkEdition::Advanced);
-        for feature in features {
-            if cfg!(all(feature = "advanced", ndi_has_advanced_header)) {
+        for (feature, built) in features.into_iter().zip(built) {
+            if built {
                 assert_eq!(
                     standard.status(feature),
                     CapabilityStatus::Unavailable(CapabilityUnavailable::WrongEdition)

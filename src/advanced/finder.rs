@@ -95,7 +95,7 @@ impl Finder {
                 ndi,
                 settings,
                 config.clone(),
-                |create| native!(table => table.NDIlib_find_create_v3(create, config.as_ptr())),
+                |create| native!(FinderConfiguration, table => table.NDIlib_find_create_v3(create, config.as_ptr())),
             )
         }
     }
@@ -112,7 +112,7 @@ impl Finder {
     pub fn sources_with_metadata(&self) -> Result<Vec<ExtendedSource>> {
         let table = self.runtime().table::<SourceMetadata>()?;
         Ok(self.snapshot(|instance| {
-            native!(table => {
+            native!(SourceMetadata, table => {
                 let mut count = 0;
                 // SAFETY: the finder is live, and the snapshot lock is held
                 // until everything the SDK returns has been copied.

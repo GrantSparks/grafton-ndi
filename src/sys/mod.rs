@@ -36,6 +36,7 @@ pub(crate) mod declarations;
     clippy::pedantic
 )]
 pub(crate) mod advanced_bindings {
+    #[allow(unused_imports)]
     use super::bindings::*;
     include!(concat!(env!("OUT_DIR"), "/ndi_advanced.rs"));
 }
@@ -44,6 +45,7 @@ pub(crate) mod advanced_bindings {
 #[cfg(ndi_has_advanced_header)]
 #[allow(non_snake_case, dead_code, clippy::all, clippy::pedantic)]
 pub(crate) mod advanced_declarations {
+    #[allow(unused_imports)]
     use super::{advanced_bindings::*, bindings::*};
     include!(concat!(env!("OUT_DIR"), "/ndi_advanced_declarations.rs"));
 }

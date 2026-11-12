@@ -51,18 +51,29 @@ workflow by the script tests.
 | Row | Runner | Target | Package | Promise, all features | Promise, no default features | Also runs |
 |---|---|---|---|---|---|---|
 | linux-x64 standard-6.3.2 | ubuntu-24.04 | x86_64-unknown-linux-gnu | 6.3.2-standard-linux | `1` | `1` | |
+| linux-x64 advanced-6.3.2 | ubuntu-24.04 | x86_64-unknown-linux-gnu | 6.3.2-advanced-linux | `advanced` | `1` | Advanced lint |
 | linux-x64 standard-6.4 | ubuntu-24.04 | x86_64-unknown-linux-gnu | current-standard-linux | `1,discovery-server` | `1,discovery-server` | vendored bindings check |
 | linux-x64 advanced-6.4 | ubuntu-24.04 | x86_64-unknown-linux-gnu | current-advanced-linux | `advanced,file,discovery-server` | `1,discovery-server` | Advanced lint |
 | linux-x86 standard-6.4 | ubuntu-24.04 | i686-unknown-linux-gnu | current-standard-linux | `1,discovery-server` | `1,discovery-server` | |
 | linux-arm64 standard-6.4 | ubuntu-24.04-arm | aarch64-unknown-linux-gnu | current-standard-linux | `1,discovery-server` | `1,discovery-server` | |
 | windows-x64 standard-6.3.2 | windows-2025 | x86_64-pc-windows-msvc | 6.3.2-standard-windows | `1` | `1` | |
+| windows-x64 advanced-6.3.2 | windows-2025 | x86_64-pc-windows-msvc | 6.3.2-advanced-windows | `advanced` | `1` | Advanced lint |
 | windows-x64 standard-6.4 | windows-2025 | x86_64-pc-windows-msvc | current-standard-windows | `1,file` | `1` | |
 | windows-x64 advanced-6.4 | windows-2025 | x86_64-pc-windows-msvc | current-advanced-windows | `advanced,file` | `1` | Advanced lint |
 | windows-x86 advanced-6.4 | windows-2025 | i686-pc-windows-msvc | current-advanced-windows | `advanced` | `1` | Advanced lint |
 | macos-arm64 standard-6.3.2 | macos-15 | aarch64-apple-darwin | 6.3.2-standard-apple | `1` | `1` | |
+| macos-arm64 advanced-6.3.2 | macos-15 | aarch64-apple-darwin | 6.3.2-advanced-apple | `advanced` | `1` | Advanced lint |
 | macos-arm64 standard-6.4 | macos-15 | aarch64-apple-darwin | current-standard-apple | `1` | `1` | Apple mobile builds |
 | macos-arm64 advanced-6.4 | macos-15 | aarch64-apple-darwin | current-advanced-apple | `advanced,file` | `1` | Advanced lint, Apple mobile builds |
 | macos-x64 standard-6.4 | macos-15-intel | x86_64-apple-darwin | current-standard-apple | `1` | `1` | |
+
+On the Linux x64, Windows x64 and macOS ARM64 current Advanced rows, four
+additional runs cross the header/runtime boundary in both directions: current
+Advanced headers with each pinned 6.3.2 runtime (Standard and Advanced), and
+both 6.3.2 header editions with the current Advanced runtime. Each requires the
+operations its build/runtime combination provides and verifies the runtime's
+identity. Advanced operations without matching build declarations report
+unavailable.
 
 Each row:
 
@@ -70,7 +81,11 @@ Each row:
    `libavahi-client3` and `libclang-dev` on Linux (plus the i386 linker and
    libraries for the x86 row), LLVM on Windows;
 2. provisions the package with [`sdk.py`](sdk.py), which exports `NDI_SDK_DIR`
-   and `NDI_RUNTIME_DIR_V6` to the following steps. This is the only step that
+   and `NDI_RUNTIME_DIR_V6` to the following steps, together with
+   `GRAFTON_NDI_EXPECTED_VERSION`, `GRAFTON_NDI_EXPECTED_EDITION` and
+   `GRAFTON_NDI_EXPECTED_RUNTIME`. Every real-runtime test checks the loaded
+   module against those values. Header and runtime selection remain separate
+   for the compatibility runs. This is the only step that
    is given the secrets in its environment;
 3. proves that the test runner isolates ([`offline/check.py`](offline/check.py)
    outside and inside it);

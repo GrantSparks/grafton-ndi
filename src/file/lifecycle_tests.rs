@@ -131,6 +131,67 @@ fn a_session_whose_close_is_never_reported_times_out_rather_than_claiming_closur
 }
 
 #[test]
+fn resetting_an_unconfirmed_session_preserves_its_report_and_isolates_late_events() {
+    let old = mock::Recorder::new(Closing::Never);
+    let mut recorder = recording_on(&old);
+    assert!(matches!(
+        recorder.finish(Duration::ZERO).unwrap(),
+        FinishStatus::TimedOut(_)
+    ));
+
+    let replacement = mock::Recorder::new(Closing::AtStop);
+    replacement.install();
+    let report = recorder
+        .reset(RecorderOptions::new(
+            SourceSpec::new("replacement").unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(report.session(), 1);
+    assert!(!report.closure_confirmed());
+    assert_eq!(old.destroys.load(Ordering::Acquire), 1);
+    assert_eq!(recorder.state(), RecorderState::Idle);
+    assert_eq!(recorder.report().session(), report.session());
+    // Even a close reported after replacement belongs only to the destroyed
+    // native instance. It must never close the replacement's new session.
+    old.push(FILE_CLOSED, TAKE);
+    let session = recorder
+        .start(target("replacement"), RecordingTimecode::Preserve)
+        .unwrap();
+    assert_eq!(session, report.session() + 1);
+    take_events(&mut recorder);
+    assert_eq!(recorder.report().closed_files(), 0);
+    assert!(matches!(
+        recorder.finish(Duration::from_secs(1)).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+    drop(recorder);
+    assert_eq!(replacement.destroys.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn a_failed_reset_keeps_the_old_recorder_and_its_finalization_pending() {
+    let old = mock::Recorder::new(Closing::Never);
+    let mut recorder = recording_on(&old);
+    recorder.finish(Duration::ZERO).unwrap();
+    let replacement = mock::Recorder::new(Closing::AtStop);
+    replacement.refuse_creation.store(true, Ordering::Release);
+    replacement.install();
+    assert!(matches!(
+        recorder.reset(RecorderOptions::new(
+            SourceSpec::new("replacement").unwrap()
+        )),
+        Err(FileError::Rejected("recorder creation"))
+    ));
+    assert_eq!(old.destroys.load(Ordering::Acquire), 0);
+    assert_eq!(recorder.state(), RecorderState::Stopping);
+    old.push(FILE_CLOSED, TAKE);
+    assert!(matches!(
+        recorder.wait_finished(Duration::from_secs(1)).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+}
+
+#[test]
 fn lost_sdk_events_end_the_session_as_indeterminate() {
     let device = mock::Recorder::new(Closing::AtStop);
     let mut recorder = recording_on(&device);

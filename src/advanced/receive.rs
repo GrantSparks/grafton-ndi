@@ -8,7 +8,7 @@ use super::{
 use crate::{
     sys::{
         self,
-        advanced::{native, ReceiverConfiguration},
+        advanced::{declared, native, ReceiverConfiguration},
         bindings::*,
     },
     AudioFrame, Error, MetadataFrame, Receiver, ReceiverOptions, Result, VideoFrame, NDI,
@@ -57,59 +57,72 @@ pub enum PassthroughPreset {
 
 impl PassthroughPreset {
     /// The receiver color format that selects this preset.
-    fn color_format(self, table: &'static ReceiverConfiguration) -> NDIlib_recv_color_format_e {
-        native!(table => {
+    fn color_format(
+        self,
+        table: &'static ReceiverConfiguration,
+    ) -> Result<NDIlib_recv_color_format_e> {
+        native!(ReceiverConfiguration, table => {
             use sys::advanced_bindings::*;
-            let format = match self {
+            macro_rules! optional_format {
+                ($constant:ident) => {
+                    declared! { $constant {
+                        Some(u32::from_ne_bytes($constant.to_ne_bytes()))
+                    } else { None } }
+                };
+            }
+            let format: u32 = match self {
                 Self::SpeedHqOnly => {
-                    NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v1
+                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v1)
                 }
                 Self::SpeedHq => {
-                    NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v2
+                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v2)
                 }
                 Self::SpeedHqBest => {
-                    NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v2_best
+                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v2_best)
                 }
                 Self::H264 => {
-                    NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v3
+                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v3)
                 }
                 Self::H264Best => {
-                    NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v3_best
+                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v3_best)
                 }
                 Self::H264WithAudio => {
-                    NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v3_with_audio
+                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v3_with_audio)
                 }
                 Self::Hevc => {
-                    NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v4
+                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v4)
                 }
                 Self::HevcBest => {
-                    NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v4_best
+                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v4_best)
                 }
                 Self::HevcWithAudio => {
-                    NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v4_with_audio
+                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v4_with_audio)
                 }
                 Self::Alpha => {
-                    NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v5
+                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v5)
                 }
                 Self::AlphaBest => {
-                    NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v5_best
+                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v5_best)
                 }
                 Self::AlphaWithAudio => {
-                    NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v5_with_audio
+                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v5_with_audio)
                 }
                 Self::Protected => {
-                    NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6
+                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6)
                 }
                 Self::ProtectedBest => {
-                    NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6_best
+                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6_best)
                 }
                 Self::ProtectedWithAudio => {
-                    NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6_with_audio
+                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6_with_audio)
                 }
-            };
+            }.ok_or_else(|| Error::UnsupportedCapability {
+                capability: "compressed receive preset".into(),
+                reason: format!("the installed Advanced SDK headers do not declare {self:?}"),
+            })?;
             // The extended color formats take the target's C enum type; the
             // creation settings carry the same bits.
-            NDIlib_recv_color_format_e::from_ne_bytes(format.to_ne_bytes())
+            Ok(NDIlib_recv_color_format_e::from_ne_bytes(format.to_ne_bytes()))
         })
     }
 }
@@ -210,7 +223,7 @@ impl PacketReceiver {
         config: &AdvancedConfig,
     ) -> Result<Self> {
         let table = ndi.table::<ReceiverConfiguration>()?;
-        let color_format = preset.color_format(table);
+        let color_format = preset.color_format(table)?;
         let receiver = Receiver::configured(ndi, table, options, config, |create| {
             create.color_format = color_format;
             create.allow_video_fields = true;

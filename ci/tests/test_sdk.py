@@ -80,10 +80,10 @@ class Workspace(unittest.TestCase):
 
 
 class Pins(unittest.TestCase):
-    def test_checked_in_pins_cover_three_packages_per_platform(self):
+    def test_checked_in_pins_cover_standard_and_advanced_baselines_per_platform(self):
         pins = sdk.load_pins()
         for platform in ('linux', 'android', 'apple', 'windows'):
-            names = {f'{prefix}-{platform}' for prefix in ('6.3.2-standard', 'current-standard', 'current-advanced')}
+            names = {f'{prefix}-{platform}' for prefix in ('6.3.2-standard', '6.3.2-advanced', 'current-standard', 'current-advanced')}
             self.assertLessEqual(names, set(pins))
             for name in names:
                 self.assertEqual(pins[name]['platform'], platform)
@@ -228,7 +228,12 @@ class Install(Workspace):
         values = self.install(linux_download())
         root = self.work / 'sdk' / 'NDI SDK for Linux'
         runtime = root / 'lib' / 'x86_64-linux-gnu'
-        self.assertEqual(values, {'NDI_SDK_DIR': str(root), 'NDI_RUNTIME_DIR_V6': str(runtime)})
+        self.assertEqual(values, {
+            'NDI_SDK_DIR': str(root), 'NDI_RUNTIME_DIR_V6': str(runtime),
+            'GRAFTON_NDI_EXPECTED_RUNTIME': str(runtime / 'libndi.so.6'),
+            'GRAFTON_NDI_EXPECTED_VERSION': '6.9.1.0',
+            'GRAFTON_NDI_EXPECTED_EDITION': 'standard',
+        })
         self.assertTrue((root / 'include' / 'Processing.NDI.Lib.h').is_file())
         for alias in ('libndi.so', 'libndi.so.6'):
             self.assertEqual(os.readlink(runtime / alias), 'libndi.so.6.9.1')
@@ -578,12 +583,17 @@ class CommandLine(Workspace):
         sdk.load_pins = lambda: self.pins(data)
         exported = self.work / 'github-env'
         exported.write_text('EXISTING=1\n')
+        outputs = self.work / 'github-output'
         arguments = ('install', 'test-linux', '--dest', str(self.work / 'sdk'), '--archive', str(self.archive(data)),
-                     '--target', TARGET, '--github-env', str(exported))
+                     '--target', TARGET, '--github-env', str(exported), '--github-output', str(outputs))
         status, stdout, _ = self.run_main(*arguments)
         self.assertEqual(status, 0)
         self.assertEqual(exported.read_text(), 'EXISTING=1\n' + stdout)
-        self.assertRegex(stdout, r'\ANDI_SDK_DIR=.+/sdk/NDI SDK for Linux\nNDI_RUNTIME_DIR_V6=.+/x86_64-linux-gnu\n\Z')
+        self.assertEqual(outputs.read_text(), stdout)
+        self.assertNotIn(b'\r', outputs.read_bytes())
+        self.assertRegex(stdout, r'\ANDI_SDK_DIR=.+/sdk/NDI SDK for Linux\nNDI_RUNTIME_DIR_V6=.+/x86_64-linux-gnu\n'
+                         r'GRAFTON_NDI_EXPECTED_RUNTIME=.+/libndi.so.6\n'
+                         r'GRAFTON_NDI_EXPECTED_VERSION=6.9.1.0\nGRAFTON_NDI_EXPECTED_EDITION=standard\n\Z')
         status, stdout, stderr = self.run_main(*arguments)
         self.assertEqual((status, stdout), (1, ''))
         self.assertRegex(stderr, r'\Aerror: .+ already exists\n\Z')

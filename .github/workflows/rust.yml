@@ -172,6 +172,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
             package: 6.3.2-standard-linux
             require: '1'
+          - name: linux-x64 advanced-6.3.2
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            package: 6.3.2-advanced-linux
+            require: advanced
           - name: linux-x64 standard-6.4
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
@@ -183,6 +188,8 @@ jobs:
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             package: current-advanced-linux
+            compatibility: 6.3.2-standard-linux
+            compatibility-advanced: 6.3.2-advanced-linux
             require: advanced,file,discovery-server
             require-no-default: 1,discovery-server
           - name: linux-x86 standard-6.4
@@ -202,6 +209,11 @@ jobs:
             target: x86_64-pc-windows-msvc
             package: 6.3.2-standard-windows
             require: '1'
+          - name: windows-x64 advanced-6.3.2
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            package: 6.3.2-advanced-windows
+            require: advanced
           - name: windows-x64 standard-6.4
             runner: windows-2025
             target: x86_64-pc-windows-msvc
@@ -211,6 +223,8 @@ jobs:
             runner: windows-2025
             target: x86_64-pc-windows-msvc
             package: current-advanced-windows
+            compatibility: 6.3.2-standard-windows
+            compatibility-advanced: 6.3.2-advanced-windows
             require: advanced,file
           - name: windows-x86 advanced-6.4
             runner: windows-2025
@@ -222,6 +236,11 @@ jobs:
             target: aarch64-apple-darwin
             package: 6.3.2-standard-apple
             require: '1'
+          - name: macos-arm64 advanced-6.3.2
+            runner: macos-15
+            target: aarch64-apple-darwin
+            package: 6.3.2-advanced-apple
+            require: advanced
           - name: macos-arm64 standard-6.4
             runner: macos-15
             target: aarch64-apple-darwin
@@ -232,6 +251,8 @@ jobs:
             runner: macos-15
             target: aarch64-apple-darwin
             package: current-advanced-apple
+            compatibility: 6.3.2-standard-apple
+            compatibility-advanced: 6.3.2-advanced-apple
             require: advanced,file
             apple-mobile: true
           - name: macos-x64 standard-6.4
@@ -277,10 +298,16 @@ jobs:
       # The only step that is given the acquisition secrets. It exports
       # NDI_SDK_DIR and NDI_RUNTIME_DIR_V6 for the steps that follow.
       - name: Provision the SDK
+        id: sdk
         env:
           NDI_SDK_SOURCES_JSON: ${{ secrets.NDI_SDK_SOURCES_JSON }}
           NDI_SDK_ARCHIVE_TOKEN: ${{ secrets.NDI_SDK_ARCHIVE_TOKEN }}
-        run: python ci/sdk.py install "$PACKAGE" --dest "$RUNNER_TEMP/ndi-sdk" --target "$TARGET" --github-env "$GITHUB_ENV"
+        run: |
+          python ci/sdk.py install "$PACKAGE" --dest "$RUNNER_TEMP/ndi-sdk" --target "$TARGET" --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT"
+          if [ -n "${{ matrix.compatibility }}" ]; then
+            python ci/sdk.py install "${{ matrix.compatibility }}" --dest "$RUNNER_TEMP/ndi-compat" --target "$TARGET" --github-env "$RUNNER_TEMP/ndi-compat-standard.env"
+            python ci/sdk.py install "${{ matrix.compatibility-advanced }}" --dest "$RUNNER_TEMP/ndi-compat-advanced" --target "$TARGET" --github-env "$RUNNER_TEMP/ndi-compat-advanced.env"
+          fi
       - name: Test runner leaves loopback networking only
         run: |
           python ci/offline/check.py --online
@@ -314,6 +341,36 @@ jobs:
       - name: Build for the statically linked Apple mobile targets
         if: matrix.apple-mobile
         run: ci/apple-mobile.sh
+
+      - name: Current Advanced headers with baseline runtimes
+        if: matrix.compatibility
+        env:
+          GRAFTON_NDI_REQUIRE_RUNTIME: '1'
+        run: |
+          for edition in standard advanced; do
+            while IFS='=' read -r name value; do export "$name=$value"; done < "$RUNNER_TEMP/ndi-compat-$edition.env"
+            export NDI_SDK_DIR="${{ steps.sdk.outputs.NDI_SDK_DIR }}"
+            export NDI_SDK_EDITION="$edition"
+            if [ "$edition" = advanced ]; then export GRAFTON_NDI_REQUIRE_RUNTIME=advanced; else export GRAFTON_NDI_REQUIRE_RUNTIME=1; fi
+            cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features
+          done
+      - name: Baseline headers with the current Advanced runtime
+        if: matrix.compatibility
+        env:
+          GRAFTON_NDI_REQUIRE_RUNTIME: '1'
+        run: |
+          for edition in standard advanced; do
+            while IFS='=' read -r name value; do export "$name=$value"; done < "$RUNNER_TEMP/ndi-compat-$edition.env"
+            export NDI_RUNTIME_DIR_V6="${{ steps.sdk.outputs.NDI_RUNTIME_DIR_V6 }}"
+            export GRAFTON_NDI_EXPECTED_RUNTIME="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_RUNTIME }}"
+            export GRAFTON_NDI_EXPECTED_VERSION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_VERSION }}"
+            export GRAFTON_NDI_EXPECTED_EDITION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_EDITION }}"
+            export NDI_SDK_EDITION=advanced
+            require="${{ matrix.require }}"
+            if [ "$edition" = standard ]; then require="${require/advanced/1}"; fi
+            export GRAFTON_NDI_REQUIRE_RUNTIME="$require"
+            cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features
+          done
 
   required-ci:
     name: required-ci

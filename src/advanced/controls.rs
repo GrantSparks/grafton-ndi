@@ -57,7 +57,7 @@ impl Sender {
         };
         // SAFETY: the settings and the configuration point to C strings that
         // outlive the call.
-        let instance: NDIlib_send_instance_t = native!(table => unsafe {
+        let instance: NDIlib_send_instance_t = native!(SenderConfiguration, table => unsafe {
             table.NDIlib_send_create_v2(&create, configuration.as_ptr())
         });
         if instance.is_null() {
@@ -81,7 +81,7 @@ impl Sender {
         let table = self.runtime().table::<SenderTally>()?;
         let tally = tally.to_raw();
         // SAFETY: the sender instance is live for this borrow.
-        Ok(native!(table => unsafe {
+        Ok(native!(SenderTally, table => unsafe {
             table.NDIlib_send_set_tally(self.native_instance(), &tally)
         }))
     }
@@ -97,7 +97,7 @@ impl Sender {
         let table = self.runtime().table::<EncoderGuidance>()?;
         let format = format.raw();
         // SAFETY: the sender instance is live for this borrow.
-        encoder_quantity(native!(table => unsafe {
+        encoder_quantity(native!(EncoderGuidance, table => unsafe {
             table.NDIlib_send_get_target_frame_size(self.native_instance(), &format)
         }))
     }
@@ -112,7 +112,7 @@ impl Sender {
         let table = self.runtime().table::<EncoderGuidance>()?;
         let format = format.raw();
         // SAFETY: the sender instance is live for this borrow.
-        encoder_quantity(native!(table => unsafe {
+        encoder_quantity(native!(EncoderGuidance, table => unsafe {
             table.NDIlib_send_get_target_bit_rate(self.native_instance(), &format)
         }))
     }
@@ -128,7 +128,7 @@ impl Sender {
         let table = self.runtime().table::<EncoderGuidance>()?;
         let format = format.raw();
         // SAFETY: the sender instance is live for this borrow.
-        encoder_quantity(native!(table => unsafe {
+        encoder_quantity(native!(EncoderGuidance, table => unsafe {
             table.NDIlib_send_get_q_factor(self.native_instance(), &format)
         }))
     }
@@ -152,7 +152,7 @@ impl Sender {
         let mut short_dc = false;
         // SAFETY: the sender instance is live for this borrow and `short_dc`
         // is writable storage for the flag.
-        let value: i32 = native!(table => unsafe {
+        let value: i32 = native!(QualityPlanning, table => unsafe {
             table.NDIlib_send_get_q_factor_v2(
                 self.native_instance(),
                 &format,
@@ -185,7 +185,7 @@ impl Sender {
         let table = self.runtime().table::<KeyframeDemand>()?;
         let format = format.map(VideoPacketFormat::raw);
         // SAFETY: the sender instance is live for this borrow.
-        Ok(native!(table => unsafe {
+        Ok(native!(KeyframeDemand, table => unsafe {
             table.NDIlib_send_is_keyframe_required(self.native_instance(), stream(format.as_ref()))
         }))
     }
@@ -210,7 +210,7 @@ impl Sender {
         let timeout = crate::to_ms_checked(timeout)?;
         let format = format.map(VideoPacketFormat::raw);
         // SAFETY: the sender instance is live for this borrow.
-        Ok(native!(table => unsafe {
+        Ok(native!(KeyframeDemand, table => unsafe {
             table.NDIlib_send_wait_for_keyframe_request(
                 self.native_instance(),
                 timeout,
@@ -339,7 +339,7 @@ impl Receiver {
         adjust(&mut create.raw);
         // SAFETY: `create` owns every string its settings point to, and
         // `config` outlives the call.
-        let instance: NDIlib_recv_instance_t = native!(table => unsafe {
+        let instance: NDIlib_recv_instance_t = native!(ReceiverConfiguration, table => unsafe {
             table.NDIlib_recv_create_v4(&create.raw, config.as_ptr())
         });
         // SAFETY: the options were validated for this runtime above, and the
@@ -360,7 +360,7 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn request_keyframe(&self) -> Result<()> {
         let table = self.core._ndi.table::<KeyframeRequest>()?;
         // SAFETY: the receiver instance is live for this borrow.
-        native!(table => unsafe { table.NDIlib_recv_request_keyframe(self.core.instance) });
+        native!(KeyframeRequest, table => unsafe { table.NDIlib_recv_request_keyframe(self.core.instance) });
         Ok(())
     }
 
@@ -381,7 +381,7 @@ impl<M: ReceiverMode> Receiver<M> {
             VideoQuality::Preview => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest,
         };
         // SAFETY: the receiver instance is live for this borrow.
-        Ok(native!(table => unsafe {
+        Ok(native!(ReceiverBandwidthControl, table => unsafe {
             table.NDIlib_recv_set_bandwidth(self.core.instance, bandwidth)
         }))
     }
@@ -397,7 +397,7 @@ impl<M: ReceiverMode> Receiver<M> {
     pub fn set_streams(&mut self, streams: StreamSelection) -> Result<StreamChange> {
         let table = self.core._ndi.table::<ReceiverStreamControl>()?;
         // SAFETY: the receiver instance is live for this borrow.
-        let changed = native!(table => unsafe {
+        let changed = native!(ReceiverStreamControl, table => unsafe {
             table.NDIlib_recv_set_enabled_streams(
                 self.core.instance,
                 streams.video,

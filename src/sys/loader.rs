@@ -23,7 +23,7 @@ const ADVANCED_RECEIVER: &CStr = c"NDIlib_recv_create_v4";
 pub(crate) struct Runtime {
     pub(crate) api: Api,
     /// The Advanced tables, handed out by their `Table::of`.
-    #[cfg(ndi_has_advanced_header)]
+    #[cfg(feature = "advanced")]
     pub(crate) advanced: super::advanced::AdvancedApi,
     pub(crate) info: RuntimeInfo,
     pub(crate) capabilities: Capabilities,
@@ -85,7 +85,7 @@ impl Runtime {
     /// The error is the reason this implementation cannot be used.
     fn describe(provider: Provider, requested: SdkEdition) -> std::result::Result<Self, String> {
         let api = Api::load(&provider).map_err(reason)?;
-        #[cfg(ndi_has_advanced_header)]
+        #[cfg(feature = "advanced")]
         let advanced_tables = super::advanced::AdvancedApi::load(&provider).map_err(reason)?;
         let advanced = AdvancedEntryPoints::detect(&provider).map_err(reason)?;
         let edition = provider.edition(advanced);
@@ -115,7 +115,7 @@ impl Runtime {
         Ok(Self {
             capabilities: Capabilities::detect(&api, version, edition, advanced),
             api,
-            #[cfg(ndi_has_advanced_header)]
+            #[cfg(feature = "advanced")]
             advanced: advanced_tables,
             info,
             provider,

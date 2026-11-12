@@ -292,7 +292,7 @@ class SdkJob(unittest.TestCase):
             with self.subTest(row=row['name']):
                 self.assertEqual(sdk.RUNTIMES[row['target']][0], self.pins[row['package']]['platform'])
         self.assertEqual({row['package'].rsplit('-', 1)[0] for row in self.rows},
-                         {'6.3.2-standard', 'current-standard', 'current-advanced'})
+                         {'6.3.2-standard', '6.3.2-advanced', 'current-standard', 'current-advanced'})
 
     def test_each_step_promises_exactly_what_its_build_can_check(self):
         """A promise no test in the build can check fails that build; a missing one lets tests skip."""
@@ -303,12 +303,39 @@ class SdkJob(unittest.TestCase):
                 with self.subTest(row=row['name'], step=step):
                     # `1` is implied by every other entry, so it is spelt out only when it stands alone.
                     self.assertEqual(set(promise.split(',')) | {'1'}, checkable(target, pin, all_features=all_features))
-        tests = {step['run']: step['env'] for step in self.job['steps'] if 'cargo test' in step.get('run', '')}
+        tests = {step['run']: step['env'] for step in self.job['steps']
+                 if step.get('run', '').startswith('cargo test')}
         command = 'cargo test --locked --config ci/offline.toml --target "$TARGET" '
         self.assertEqual(tests, {
             command + '--all-features': {'GRAFTON_NDI_REQUIRE_RUNTIME': '${{ matrix.require }}'},
             command + '--no-default-features': {
                 'GRAFTON_NDI_REQUIRE_RUNTIME': "${{ matrix.require-no-default || '1' }}"}})
+
+    def test_compatibility_runs_use_independent_headers_and_runtime_identity(self):
+        rows = [row for row in self.rows if 'compatibility' in row]
+        self.assertEqual({self.pins[row['compatibility']]['platform'] for row in rows},
+                         {'linux', 'windows', 'apple'})
+        for row in rows:
+            self.assertEqual(self.pins[row['compatibility']]['edition'], 'standard')
+            self.assertEqual(self.pins[row['compatibility-advanced']]['edition'], 'advanced')
+            self.assertEqual(self.pins[row['compatibility-advanced']]['platform'], self.pins[row['compatibility']]['platform'])
+            self.assertEqual(sdk.version_tuple(self.pins[row['compatibility-advanced']]['version']),
+                             sdk.version_tuple(self.pins[row['compatibility']]['version']))
+            self.assertLess(sdk.version_tuple(self.pins[row['compatibility']]['version']),
+                            sdk.version_tuple(self.pins[row['package']]['version']))
+            self.assertEqual(self.pins[row['compatibility']]['platform'],
+                             self.pins[row['package']]['platform'])
+        steps = [step for step in self.job['steps'] if step.get('if') == 'matrix.compatibility']
+        self.assertEqual(len(steps), 2)
+        for step in steps:
+            self.assertEqual(step['env']['GRAFTON_NDI_REQUIRE_RUNTIME'], '1')
+            self.assertIn('cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features', step['run'])
+            self.assertIn('ndi-compat-$edition.env', step['run'])
+            self.assertIn('for edition in standard advanced; do', step['run'])
+        self.assertIn('export NDI_SDK_DIR="${{ steps.sdk.outputs.NDI_SDK_DIR }}"', steps[0]['run'])
+        for name in ('NDI_RUNTIME_DIR_V6', 'GRAFTON_NDI_EXPECTED_VERSION',
+                     'GRAFTON_NDI_EXPECTED_EDITION', 'GRAFTON_NDI_EXPECTED_RUNTIME'):
+            self.assertIn(f'export {name}="${{{{ steps.sdk.outputs.{name} }}}}"', steps[1]['run'])
 
     def test_readme_matrix_table_matches_the_workflow(self):
         readme = (ROOT / 'ci' / 'README.md').read_text(encoding='utf-8')

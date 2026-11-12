@@ -386,6 +386,11 @@ def install(package, dest, *, archive=None, target=None, environ=None, pins=None
             if not (root / library).is_file():
                 raise SdkError(f'package has no {library.as_posix()}')
             values['NDI_RUNTIME_DIR_V6'] = dest / (root / library.parent).relative_to(unpacked)
+            # The test process must verify the library it actually loaded, not
+            # infer identity from the archive or the directory it was given.
+            values['GRAFTON_NDI_EXPECTED_RUNTIME'] = dest / (root / library).relative_to(unpacked)
+            values['GRAFTON_NDI_EXPECTED_VERSION'] = '.'.join(map(str, version_tuple(pin['version'])))
+            values['GRAFTON_NDI_EXPECTED_EDITION'] = pin['edition']
         # The destination appears only once every check has passed.
         unpacked.rename(dest)
     return {name: str(path) for name, path in values.items()}
@@ -401,6 +406,7 @@ def main(argv=None):
     command.add_argument('--archive', type=Path, help='local archive instead of NDI_SDK_SOURCES_JSON')
     command.add_argument('--target', help='Rust target whose runtime directory to export')
     command.add_argument('--github-env', type=Path, help='append the exported variables to this file')
+    command.add_argument('--github-output', type=Path, help='append the selected SDK values as step outputs')
     args = parser.parse_args(argv)
     try:
         if args.command == 'list':
@@ -420,9 +426,12 @@ def main(argv=None):
         return 1
     lines = ''.join(f'{name}={value}\n' for name, value in values.items())
     sys.stdout.write(lines)
-    if args.github_env:
-        with args.github_env.open('a', encoding='utf-8') as stream:
-            stream.write(lines)
+    for destination in (args.github_env, args.github_output):
+        if destination:
+            # These records are also read by Bash in compatibility jobs on
+            # Windows; native CRLF would become part of the exported paths.
+            with destination.open('a', encoding='utf-8', newline='\n') as stream:
+                stream.write(lines)
     return 0
 
 

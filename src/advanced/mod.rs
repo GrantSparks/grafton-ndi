@@ -28,6 +28,9 @@
 //! [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability) with
 //! the reason; the data types in this module (packets, envelopes, options)
 //! work everywhere. Core operations are unaffected in every case.
+//! An older installed Advanced SDK disables only the declaration families or
+//! receive presets it lacks. The remaining operations keep their native ABI
+//! checks and still require the matching runtime exports.
 //!
 //! Enabling this module neither selects an SDK edition nor grants a license
 //! entitlement.
@@ -47,7 +50,7 @@
 // which leaves the parameters, imports and helpers those bodies use without a
 // reader. Every build that has the declarations enforces these lints.
 #![cfg_attr(
-    not(ndi_has_advanced_header),
+    not(ndi_has_complete_advanced_header),
     allow(
         dead_code,
         unreachable_code,

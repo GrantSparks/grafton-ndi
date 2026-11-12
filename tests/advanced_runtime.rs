@@ -1685,3 +1685,295 @@ fn a_finder_is_told_the_metadata_a_sender_advertises() {
         [Some("<grafton-test kind=\"described\"/>".to_owned()), None]
     );
 }
+
+/// A real encoded picture exercises the decoder and planar pixel layout. The
+/// adjacent-pixel chroma pattern detects accidental 4:2:2/4:2:0 conversion.
+#[test]
+fn hevc_444_decodes_to_the_original_full_resolution_chroma_planes() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    if ndi.require_feature(RuntimeFeature::ReceiveBest444).is_err() {
+        return;
+    }
+    let _turn = sockets();
+    let mut sender = CompressedSender::new(&ndi, &options("hevc-444")).unwrap();
+    let receiver = Receiver::new(
+        &ndi,
+        &ReceiverOptions::builder(loopback(&ndi, &sender.source().unwrap()))
+            .color(grafton_ndi::ReceiverColorFormat::Best444)
+            .build(),
+    )
+    .unwrap();
+    let bitstream = include_bytes!("data/chroma-444.hevc");
+    // This encoder emits VPS, SPS and PPS before the IDR. Keep those exact
+    // Annex B units inline and in the envelope's extra data, as the SDK asks.
+    let end = bitstream
+        .windows(4)
+        .enumerate()
+        .find_map(|(i, bytes)| {
+            // The slice uses a three-byte start code, while the parameter sets
+            // use four. For both, `header` is the NAL header after the start code.
+            let (start, header) = if bytes == [0, 0, 0, 1] {
+                (i, *bitstream.get(i + 4)?)
+            } else if bytes[..3] == [0, 0, 1] {
+                (i, bytes[3])
+            } else {
+                return None;
+            };
+            (((header >> 1) & 0x3f) < 32).then_some(start)
+        })
+        .expect("the fixture has an IDR slice after VPS, SPS and PPS");
+    let format = VideoPacketFormat::new(VideoCodec::Hevc, 64, 32)
+        .unwrap()
+        .frame_rate(30, 1)
+        .unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    let mut pts = 0;
+    loop {
+        let bytes = packet_envelope(
+            EnvelopeCodec::Hevc,
+            pts,
+            pts,
+            true,
+            bitstream,
+            &bitstream[..end],
+        )
+        .unwrap();
+        let mut packet = CompressedVideoFrame::new(format, bytes).unwrap();
+        sender.send_video(&mut packet).unwrap();
+        if let Some(frame) = receiver.video().try_capture_ref(SLICE).unwrap() {
+            assert_eq!((frame.width(), frame.height()), (64, 32));
+            assert_eq!(frame.pixel_format(), grafton_ndi::PixelFormat::NA48);
+            assert_eq!(frame.planes().len(), 3);
+            for (plane_index, plane) in frame.planes().enumerate() {
+                assert_eq!(plane.row_count(), 32);
+                for (y, row) in plane.rows().enumerate() {
+                    assert_eq!(row.len(), 64);
+                    for (x, value) in row.iter().copied().enumerate() {
+                        let expected = match plane_index {
+                            0 => 64 + (x + y) % 64,
+                            1 => 64 + 64 * (x % 2),
+                            2 => 80 + 64 * (y % 2),
+                            _ => unreachable!(),
+                        } as u8;
+                        assert_eq!(value, expected, "plane {plane_index}, ({x}, {y})");
+                    }
+                }
+            }
+            break;
+        }
+        pts += 3000;
+        assert!(Instant::now() < deadline, "HEVC 4:4:4 video did not decode");
+    }
+}
+
+#[test]
+fn genlock_clocks_wait_on_the_system_clock_without_a_reference() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut genlock = Genlock::new(&ndi, None, None).unwrap();
+    for _ in 0..2 {
+        let (mut video, mut audio) = genlock.clocks();
+        std::thread::scope(|scope| {
+            let video = scope.spawn(move || {
+                let began = Instant::now();
+                for _ in 0..4 {
+                    assert_eq!(
+                        video.wait(60, 1, ScanType::Progressive).unwrap(),
+                        ClockSource::SystemClock
+                    );
+                }
+                began.elapsed()
+            });
+            let audio = scope.spawn(move || {
+                let began = Instant::now();
+                for _ in 0..4 {
+                    assert_eq!(audio.wait(48_000, 800).unwrap(), ClockSource::SystemClock);
+                }
+                began.elapsed()
+            });
+            for elapsed in [video.join().unwrap(), audio.join().unwrap()] {
+                assert!(
+                    elapsed >= Duration::from_millis(20),
+                    "the clock did not pace: {elapsed:?}"
+                );
+                assert!(elapsed < PATIENCE, "the clock took {elapsed:?}");
+            }
+        });
+        // Reconnecting is allowed only once both unique clock borrows ended.
+        genlock.connect(None).unwrap();
+    }
+}
+
+#[test]
+fn avsync_follows_source_format_changes_and_preserves_audio_samples() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let sender = Sender::new(
+        &ndi,
+        &SenderOptions::builder(common::unique_name("avsync-format"))
+            .clock_video(true)
+            .clock_audio(false)
+            .build(),
+    )
+    .unwrap();
+    let receiver = Receiver::new(
+        &ndi,
+        &ReceiverOptions::builder(common::loopback_source(&ndi, &sender).unwrap()).build(),
+    )
+    .unwrap();
+    let mut sync = AvSync::new(receiver).unwrap();
+    let phase = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let _stop = StopOnDrop(&stop);
+        scope.spawn(|| {
+            let video = [
+                VideoFrame::builder()
+                    .resolution(64, 32)
+                    .frame_rate(30, 1)
+                    .build()
+                    .unwrap(),
+                VideoFrame::builder()
+                    .resolution(128, 64)
+                    .frame_rate(25, 1)
+                    .build()
+                    .unwrap(),
+            ];
+            let audio = [
+                AudioFrame::builder()
+                    .sample_rate(48_000)
+                    .channels(2)
+                    .samples(1600)
+                    .data(vec![0.25; 3200])
+                    .build()
+                    .unwrap(),
+                AudioFrame::builder()
+                    .sample_rate(44_100)
+                    .channels(1)
+                    .samples(1764)
+                    .data(vec![0.5; 1764])
+                    .build()
+                    .unwrap(),
+            ];
+            while !stop.load(Ordering::Acquire) {
+                let index = phase.load(Ordering::Acquire);
+                sender.send_video(&video[index]);
+                sender.send_audio(&audio[index]);
+            }
+        });
+        for (index, rate, channels, width, sample) in
+            [(0, 48_000, 2, 64, 0.25f32), (1, 44_100, 1, 128, 0.5)]
+        {
+            phase.store(index, Ordering::Release);
+            let deadline = Instant::now() + PATIENCE;
+            let mut matches = 0;
+            while matches < 4 {
+                assert!(
+                    Instant::now() < deadline,
+                    "AVSync did not follow format {index}"
+                );
+                let Some(video) = sync.receiver().video().try_capture(SLICE).unwrap() else {
+                    continue;
+                };
+                if let AvSyncOutcome::Audio { frame, .. } = sync
+                    .synchronize(Some(&video), AvSyncRequest::automatic())
+                    .unwrap()
+                {
+                    if video.width() == width
+                        && frame.sample_rate() == rate
+                        && frame.num_channels() == channels
+                    {
+                        assert!(!frame.data().is_empty());
+                        // The first packet after a format change may contain
+                        // alignment silence. A stable, matching frame must
+                        // eventually preserve the source's samples.
+                        if frame
+                            .data()
+                            .iter()
+                            .all(|value| (*value - sample).abs() < 0.001)
+                        {
+                            matches += 1;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn genlock_follows_a_local_reference_and_returns_to_the_system_clock() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let sender = Sender::new(
+        &ndi,
+        &SenderOptions::builder(common::unique_name("genlock-reference"))
+            .clock_video(true)
+            .clock_audio(false)
+            .build(),
+    )
+    .unwrap();
+    let source = common::loopback_source(&ndi, &sender).unwrap();
+    let mut genlock = Genlock::new(&ndi, Some(&source), None).unwrap();
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let _stop = StopOnDrop(&stop);
+        scope.spawn(|| {
+            let video = video();
+            let audio = AudioFrame::builder()
+                .sample_rate(48_000)
+                .channels(2)
+                .samples(1600)
+                .build()
+                .unwrap();
+            while !stop.load(Ordering::Acquire) {
+                sender.send_video(&video);
+                sender.send_audio(&audio);
+            }
+        });
+        let deadline = Instant::now() + PATIENCE;
+        while !genlock.is_active() {
+            assert!(
+                Instant::now() < deadline,
+                "genlock did not acquire the reference"
+            );
+            let (mut video, _) = genlock.clocks();
+            video.wait(30, 1, ScanType::Progressive).unwrap();
+        }
+        let (mut video, mut audio) = genlock.clocks();
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let video = video.wait(30, 1, ScanType::Progressive).unwrap();
+            let audio = audio.wait(48_000, 1600).unwrap();
+            if video == ClockSource::ReferenceSignal && audio == ClockSource::ReferenceSignal {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the clocks did not use the reference"
+            );
+        }
+    });
+    genlock.connect(None).unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    let (mut video, mut audio) = genlock.clocks();
+    loop {
+        let video = video.wait(30, 1, ScanType::Progressive).unwrap();
+        let audio = audio.wait(48_000, 1600).unwrap();
+        if video == ClockSource::SystemClock && audio == ClockSource::SystemClock {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the clocks did not fall back after disconnect"
+        );
+    }
+}

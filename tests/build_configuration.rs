@@ -1,5 +1,8 @@
 // Exercise SDK discovery and static-archive contracts without an installed SDK
 // or native runtime.
+#[cfg(feature = "advanced")]
+#[path = "../build_advanced.rs"]
+mod build_advanced;
 #[path = "../build_apple.rs"]
 mod build_apple;
 #[path = "../build_support.rs"]
@@ -10,6 +13,49 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+
+#[cfg(feature = "advanced")]
+#[test]
+fn advanced_availability_discards_missing_functions_types_and_constants_before_resolution() {
+    let selection = build_advanced::selection(
+        "pub const Present: u32 = 7; pub type Handle = *mut u8;",
+        "unsafe extern \"C\" { pub fn NDIlib_recv_set_bandwidth(); }",
+    );
+    assert!(!selection.complete);
+    // Exercise the actual macro expansion, including discarded tokens which
+    // deliberately refer to nonexistent types. A table family needs all of
+    // its functions, while individual constants can be checked independently.
+    let source = format!(
+        r#"{}
+        declared! {{ AbsentType {{ type Broken = NotAType; }} else {{}} }}
+        fn main() {{
+            assert_eq!(declared! {{ Present {{ 7 }} else {{ 0 }} }}, 7);
+            assert!(declared! {{ ReceiverBandwidthControl {{ true }} else {{ false }} }});
+            assert!(!declared! {{ ScatterSend {{ NotAType::missing() }} else {{ false }} }});
+            assert!(!declared! {{ Genlock {{ NotAType::missing() }} else {{ false }} }});
+        }}"#,
+        selection.source
+    );
+    let fixture = Sdk::new("advanced-availability");
+    let path = fixture.root().join("selector.rs");
+    fs::write(&path, source).unwrap();
+    let output = std::process::Command::new("rustc")
+        .args(["--edition=2021", "--deny=warnings"])
+        .arg(&path)
+        .arg("-o")
+        .arg(fixture.root().join("selector"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(std::process::Command::new(fixture.root().join("selector"))
+        .status()
+        .unwrap()
+        .success());
+}
 
 /// A synthetic SDK installation in a private temporary directory.
 struct Sdk(PathBuf);

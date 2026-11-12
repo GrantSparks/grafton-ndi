@@ -1277,8 +1277,10 @@ const _: () = {
     // Enum constants of the Advanced-only headers take the target's C enum
     // type, which is signed on some targets; compare bit patterns.
     macro_rules! same_bits {
-        ($ours:expr, $native:expr) => {
-            assert!($ours == u32::from_ne_bytes($native.to_ne_bytes()))
+        ($ours:expr, $native:ident) => {
+            crate::sys::advanced::declared! { $native {
+                assert!($ours == u32::from_ne_bytes($native.to_ne_bytes()));
+            } else {} }
         };
     }
 
@@ -1427,6 +1429,7 @@ const _: () = {
         NDIlib_compressed_FourCC_type_e_NDIlib_compressed_FourCC_type_AAC
     );
 
+    crate::sys::advanced::declared! { NDIlib_compressed_packet_t {
     assert!(KEYFRAME == NDIlib_compressed_packet_flags_keyframe);
     assert!(ENVELOPE_HEADER_BYTES as i32 == NDIlib_compressed_packet_version_0);
     assert!(size_of::<NDIlib_compressed_packet_t>() == ENVELOPE_HEADER_BYTES);
@@ -1438,6 +1441,7 @@ const _: () = {
     assert!(offset_of!(NDIlib_compressed_packet_t, flags) == FLAGS_OFFSET);
     assert!(offset_of!(NDIlib_compressed_packet_t, data_size) == DATA_SIZE_OFFSET);
     assert!(offset_of!(NDIlib_compressed_packet_t, extra_data_size) == EXTRA_DATA_SIZE_OFFSET);
+    } else {} }
 };
 
 /// Frames for this module's unit tests.

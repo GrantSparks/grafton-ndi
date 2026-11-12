@@ -465,6 +465,33 @@ fn an_async_recorder_finishes_and_closes_without_blocking() {
         panic!("the recording was not confirmed closed: {outcome:?}");
     };
     assert_eq!(report.closed_files(), 1);
+    let previous = block_on(recorder.reset(exact_video(&source))).unwrap();
+    assert_eq!(previous.session(), report.session());
+    assert!(previous.closure_confirmed());
+    assert_eq!(block_on(recorder.state()).unwrap(), RecorderState::Idle);
+    let next_file = scratch.path("after-reset.mkv");
+    let next_session = block_on(recorder.start(
+        RecordingTarget::new(&next_file).unwrap(),
+        RecordingTimecode::Preserve,
+    ))
+    .unwrap();
+    assert_eq!(next_session, report.session() + 1);
+    let deadline = Instant::now() + PATIENCE;
+    while block_on(recorder.stats())
+        .unwrap()
+        .is_none_or(|stats| stats.video_frames() == 0)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "nothing was recorded after reset"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(matches!(
+        block_on(recorder.finish(PATIENCE)).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+    assert!(api.probe(&next_file).unwrap().duration().is_final());
     let retained = recorder.clone();
     block_on(recorder.close()).unwrap();
     assert!(

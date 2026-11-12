@@ -126,6 +126,7 @@ pub(super) struct Recorder {
     /// Refuse the next start with an open-failed event, as the real library
     /// does when it cannot create the first file.
     pub(super) fail_next_start: std::sync::atomic::AtomicBool,
+    pub(super) refuse_creation: std::sync::atomic::AtomicBool,
     /// How many rollovers the wrapper passed on.
     pub(super) rollovers: std::sync::atomic::AtomicUsize,
     /// Make the next captured event larger than this crate's layout of it.
@@ -156,6 +157,7 @@ impl Recorder {
             recording: Default::default(),
             stop_owed: Default::default(),
             fail_next_start: Default::default(),
+            refuse_creation: Default::default(),
             rollovers: Default::default(),
             oversize_next_event: Default::default(),
             dropped_events: Default::default(),
@@ -216,6 +218,12 @@ unsafe extern "C" fn recorder_create(
     let recorder = NEXT_RECORDER
         .with(|next| next.borrow_mut().take())
         .expect("a mock recorder was installed on this thread");
+    if recorder
+        .refuse_creation
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return std::ptr::null_mut();
+    }
     Box::into_raw(Box::new(recorder)).cast()
 }
 

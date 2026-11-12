@@ -93,7 +93,7 @@ impl ScatterStorage {
     /// The SDK may write to the blocks for as long as it holds the
     /// description, so the caller keeps the storage exclusively for that long.
     fn descriptor(&mut self, table: &'static ScatterSend) -> FrameScatter {
-        native!(table => FrameScatter {
+        native!(ScatterSend, table => FrameScatter {
             p_data_blocks: self.pointers.as_ptr().cast(),
             p_data_blocks_size: self.sizes.as_ptr().cast(),
         })
@@ -712,7 +712,7 @@ impl CompressedSender {
         let scatter = frame.storage.descriptor(table);
         // SAFETY: the sender is live, and both descriptors lend `frame`, which
         // is borrowed exclusively for longer than this synchronous call.
-        native!(table => unsafe {
+        native!(ScatterSend, table => unsafe {
             table.NDIlib_send_send_video_scatter(self.instance(), &descriptor, &scatter)
         });
         Ok(())
@@ -738,7 +738,7 @@ impl CompressedSender {
             // SAFETY: the sender is live, and the pending entry owns both
             // descriptors and the blocks they lend until the SDK has finished
             // with them.
-            native!(table => unsafe {
+            native!(ScatterSend, table => unsafe {
                 table.NDIlib_send_send_video_scatter_async(
                     instance,
                     next.descriptor.as_ptr(),
@@ -763,7 +763,7 @@ impl CompressedSender {
         let scatter = frame.storage.descriptor(table);
         // SAFETY: the sender is live, and both descriptors lend `frame`, which
         // is borrowed exclusively for longer than this synchronous call.
-        native!(table => unsafe {
+        native!(ScatterSend, table => unsafe {
             table.NDIlib_send_send_audio_scatter(self.instance(), &descriptor, &scatter)
         });
         Ok(())

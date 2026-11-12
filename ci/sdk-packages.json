@@ -1,4 +1,32 @@
 {
+  "6.3.2-advanced-android": {
+    "version": "6.3.2",
+    "edition": "advanced",
+    "platform": "android",
+    "size": 108694201,
+    "sha256": "c7ba281612f12af682d2a2f35e9956fe3fd9e1f82a67618a47523ce4e6cb60f5"
+  },
+  "6.3.2-advanced-apple": {
+    "version": "6.3.2",
+    "edition": "advanced",
+    "platform": "apple",
+    "size": 304921462,
+    "sha256": "34853cab07620783f05604b2f2430cd60d1a5f2a0140f351c5238f75ba9505a2"
+  },
+  "6.3.2-advanced-linux": {
+    "version": "6.3.2",
+    "edition": "advanced",
+    "platform": "linux",
+    "size": 343705629,
+    "sha256": "1fa1d38d84e9fade6d6eb064463e6db89cc4d696d552cb35e70646c09ca05f70"
+  },
+  "6.3.2-advanced-windows": {
+    "version": "6.3.2",
+    "edition": "advanced",
+    "platform": "windows",
+    "size": 145536712,
+    "sha256": "a14eddba963a459ccdbb5c2c43d3a610b023b3dd77f03e8069274bb38c8f12c7"
+  },
   "6.3.2-standard-android": {
     "version": "6.3.2",
     "edition": "standard",

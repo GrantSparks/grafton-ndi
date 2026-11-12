@@ -91,13 +91,13 @@ impl<M: ReceiverMode> KvmSession<'_, M> {
     /// when the receiver connects to a different source.
     pub fn is_supported(&self) -> bool {
         // SAFETY: the receiver instance is live for this borrow.
-        native!(self.kvm => unsafe { self.kvm.NDIlib_recv_kvm_is_supported(self.instance()) })
+        native!(Kvm, self.kvm => unsafe { self.kvm.NDIlib_recv_kvm_is_supported(self.instance()) })
     }
 
     /// Press a mouse button.
     pub fn mouse_down(&mut self, button: MouseButton) -> bool {
         // SAFETY: the receiver instance is live for this borrow.
-        let sent = native!(self.kvm => unsafe {
+        let sent = native!(Kvm, self.kvm => unsafe {
             match button {
                 MouseButton::Left => self.kvm.NDIlib_recv_kvm_send_left_mouse_click(self.instance()),
                 MouseButton::Middle => {
@@ -115,7 +115,7 @@ impl<M: ReceiverMode> KvmSession<'_, M> {
     /// Release a mouse button.
     pub fn mouse_up(&mut self, button: MouseButton) -> bool {
         // SAFETY: the receiver instance is live for this borrow.
-        let sent = native!(self.kvm => unsafe {
+        let sent = native!(Kvm, self.kvm => unsafe {
             match button {
                 MouseButton::Left => {
                     self.kvm.NDIlib_recv_kvm_send_left_mouse_release(self.instance())
@@ -157,7 +157,7 @@ impl<M: ReceiverMode> KvmSession<'_, M> {
 
     fn press(&mut self, key: i32) -> bool {
         // SAFETY: the receiver instance is live for this borrow.
-        let sent = native!(self.kvm => unsafe {
+        let sent = native!(Kvm, self.kvm => unsafe {
             self.kvm.NDIlib_recv_kvm_send_keyboard_press(self.instance(), key)
         });
         if sent {
@@ -168,7 +168,7 @@ impl<M: ReceiverMode> KvmSession<'_, M> {
 
     fn release(&mut self, key: i32) -> bool {
         // SAFETY: the receiver instance is live for this borrow.
-        let sent = native!(self.kvm => unsafe {
+        let sent = native!(Kvm, self.kvm => unsafe {
             self.kvm.NDIlib_recv_kvm_send_keyboard_release(self.instance(), key)
         });
         if sent {
@@ -188,7 +188,7 @@ impl<M: ReceiverMode> KvmSession<'_, M> {
             return Err(invalid("KVM wheel units must be finite"));
         }
         // SAFETY: the receiver instance is live for this borrow.
-        Ok(native!(self.kvm => unsafe {
+        Ok(native!(Kvm, self.kvm => unsafe {
             match axis {
                 WheelAxis::Vertical => {
                     self.kvm.NDIlib_recv_kvm_send_vertical_mouse_wheel(self.instance(), units)
@@ -212,7 +212,7 @@ impl<M: ReceiverMode> KvmSession<'_, M> {
         let position = [x, y];
         // SAFETY: the receiver instance is live for this borrow, and
         // `position` holds the two coordinates the SDK reads.
-        Ok(native!(self.kvm => unsafe {
+        Ok(native!(Kvm, self.kvm => unsafe {
             self.kvm.NDIlib_recv_kvm_send_mouse_position(self.instance(), position.as_ptr())
         }))
     }
@@ -226,7 +226,7 @@ impl<M: ReceiverMode> KvmSession<'_, M> {
         let text = CString::new(text)?;
         // SAFETY: the receiver instance is live for this borrow, and `text`
         // outlives the call.
-        Ok(native!(self.kvm => unsafe {
+        Ok(native!(Kvm, self.kvm => unsafe {
             self.kvm.NDIlib_recv_kvm_send_clipboard_contents(self.instance(), text.as_ptr())
         }))
     }
@@ -246,7 +246,7 @@ impl<M: ReceiverMode> KvmSession<'_, M> {
         }
         // SAFETY: the receiver instance is live for this borrow, and `points`
         // is `count` consecutive coordinate pairs.
-        let sent = native!(self.kvm => unsafe {
+        let sent = native!(Kvm, self.kvm => unsafe {
             self.kvm.NDIlib_recv_kvm_send_touch_positions(
                 self.instance(),
                 count,
@@ -262,7 +262,7 @@ impl<M: ReceiverMode> KvmSession<'_, M> {
     /// Lift every touch.
     pub fn finish_touch(&mut self) -> bool {
         // SAFETY: the receiver instance is live for this borrow.
-        let sent = native!(self.kvm => unsafe {
+        let sent = native!(Kvm, self.kvm => unsafe {
             self.kvm.NDIlib_recv_kvm_send_touch_finish(self.instance())
         });
         if sent {
@@ -322,3 +322,9 @@ mod tests {
         assert!(key_symbol(u32::MAX).is_err());
     }
 }
+
+#[cfg(test)]
+crate::sys::advanced::declared! { Kvm {
+    #[path = "kvm_tests.rs"]
+    mod ownership_tests;
+} else {} }

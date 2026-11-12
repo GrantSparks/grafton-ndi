@@ -378,7 +378,7 @@ impl QueuedSender {
         // SAFETY: the sender is live. The state is heap-allocated, the callback
         // only reads it through a shared reference, and the returned value
         // keeps it until after the sender has been destroyed.
-        native!(table => unsafe {
+        native!(SendCompletion, table => unsafe {
             table.NDIlib_send_set_video_async_completion(
                 sender.native_instance(),
                 state.cast_mut().cast(),

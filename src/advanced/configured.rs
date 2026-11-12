@@ -75,7 +75,7 @@ unsafe fn configured<T: Configurable, C: Table>(
 
 /// Define `new_with_config` for an object created by `$create` of `$Table`.
 macro_rules! new_with_config {
-    ($(#[$doc:meta])* $Object:ty, $Options:ty, $Table:ty, $create:ident) => {
+    ($(#[$doc:meta])* $Object:ty, $Options:ty, $Table:ident, $create:ident) => {
         impl $Object {
             $(#[$doc])*
             ///
@@ -97,7 +97,7 @@ macro_rules! new_with_config {
                 // configuration it is handed outlive that call.
                 unsafe {
                     configured(ndi, options, config, |table: &'static $Table, settings, text| {
-                        native!(table => table.$create(settings, text))
+                        native!($Table, table => table.$create(settings, text))
                     })
                 }
             }

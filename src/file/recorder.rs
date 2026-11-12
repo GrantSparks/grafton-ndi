@@ -680,6 +680,27 @@ impl FileRecorder {
         self.report()
     }
 
+    /// Abandon this native recorder and replace it with a new idle recorder.
+    ///
+    /// Use this after a finalization timeout when the SDK stopped producing
+    /// events and the old session cannot be confirmed closed. The returned
+    /// report preserves that uncertainty; the old file may be truncated.
+    /// The replacement has its own event queue, so delayed events from the old
+    /// session cannot affect a new recording. The last report is retained and
+    /// session numbers continue increasing across resets.
+    ///
+    /// The replacement is created first. If creation fails, this recorder and
+    /// its report are kept and can still be polled or finalized.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`FileApi::create_recorder`].
+    pub fn reset(&mut self, options: RecorderOptions) -> FileResult<RecordingReport> {
+        let mut replacement = Self::create(self._api.clone(), options)?;
+        replacement.ledger.report = self.report();
+        Ok(std::mem::replace(self, replacement).abandon())
+    }
+
     /// Whether the SDK is recording or waiting for frames. False once a stop
     /// has taken effect; this alone does not show that a file was finalized.
     pub fn is_recording(&self) -> bool {

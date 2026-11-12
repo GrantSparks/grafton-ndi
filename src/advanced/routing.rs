@@ -20,7 +20,7 @@ impl Router {
         let metadata = metadata.to_raw();
         // SAFETY: the router is live for this borrow, and the descriptor
         // borrows the caller's frame, which outlives the call.
-        native!(table => unsafe {
+        native!(RouterConnectionMetadata, table => unsafe {
             table.NDIlib_routing_add_connection_metadata(router, &metadata)
         });
         Ok(())
@@ -36,7 +36,7 @@ impl Router {
         let table = self.runtime().table::<RouterConnectionMetadata>()?;
         let router = self.native_instance();
         // SAFETY: the router is live for this borrow.
-        native!(table => unsafe { table.NDIlib_routing_clear_connection_metadata(router) });
+        native!(RouterConnectionMetadata, table => unsafe { table.NDIlib_routing_clear_connection_metadata(router) });
         Ok(())
     }
 }

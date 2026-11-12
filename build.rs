@@ -16,6 +16,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(feature = "advanced")]
+mod build_advanced;
 mod build_apple;
 mod build_support;
 
@@ -26,6 +28,8 @@ fn main() {
         "build.rs",
         "build_support.rs",
         "build_apple.rs",
+        "build_advanced.rs",
+        "src/sys/advanced_tables.rs",
         "src/sys/declarations.rs",
     ] {
         println!("cargo:rerun-if-changed={path}");
@@ -39,7 +43,11 @@ fn main() {
     ] {
         println!("cargo:rerun-if-env-changed={name}");
     }
-    for cfg in ["ndi_link_static", "ndi_has_advanced_header"] {
+    for cfg in [
+        "ndi_link_static",
+        "ndi_has_advanced_header",
+        "ndi_has_complete_advanced_header",
+    ] {
         println!("cargo:rustc-check-cfg=cfg({cfg})");
     }
 
@@ -65,6 +73,14 @@ fn main() {
         .map(|sdk| generate_advanced_bindings(sdk, &target, &out));
     #[cfg(not(feature = "advanced"))]
     let advanced_declarations: Option<String> = None;
+    #[cfg(feature = "advanced")]
+    if advanced_declarations.is_none() {
+        fs::write(
+            out.join("ndi_advanced_selection.rs"),
+            build_advanced::selection("", "").source,
+        )
+        .expect("Write unavailable Advanced declarations");
+    }
     if advanced_declarations.is_some() {
         println!("cargo:rustc-cfg=ndi_has_advanced_header");
     }
@@ -247,12 +263,19 @@ fn generate_advanced_bindings(sdk: &Sdk, target: &str, out: &Path) -> String {
         fs::write(out.join(file), &bindings).expect("Write Advanced SDK bindings");
         bindings
     };
-    generate(
+    let types = generate(
         bindgen::CodegenConfig::all() - bindgen::CodegenConfig::FUNCTIONS,
         "ndi_advanced.rs",
     );
-    generate(
+    let functions = generate(
         bindgen::CodegenConfig::FUNCTIONS,
         "ndi_advanced_declarations.rs",
-    )
+    );
+    let selection = build_advanced::selection(&types, &functions);
+    if selection.complete {
+        println!("cargo:rustc-cfg=ndi_has_complete_advanced_header");
+    }
+    fs::write(out.join("ndi_advanced_selection.rs"), selection.source)
+        .expect("Write Advanced declaration availability");
+    functions
 }

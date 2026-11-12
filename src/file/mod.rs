@@ -40,6 +40,12 @@
 //! it again instead of looking further; the error names the file, and the remedy
 //! is to remove or fix it or to pass [`FileRuntimeOptions::library_path`].
 //!
+//! The native borrowed source/path getters are deliberately not called: their
+//! strings can be invalidated by the SDK's recording thread. Use
+//! [`FileRecorder::last_accepted_source`] for the last accepted source request
+//! and [`FileRecorder::reported_current_file`] for the owned event view of the
+//! file. These can lag or differ from the native state as their docs describe.
+//!
 //! # Finishing a recording
 //!
 //! The SDK finalizes a file asynchronously after a stop request and reports it
@@ -49,6 +55,11 @@
 //! for errors during the session. Dropping a recorder whose session is still
 //! open performs the same stop and wait, bounded by
 //! [`RecorderOptions::with_drop_wait`], but cannot report the outcome.
+//!
+//! After a finalization timeout, [`FileRecorder::reset`] explicitly abandons
+//! the uncertain session and replaces its native instance. The old report is
+//! returned without confirmation of closure; a new event queue keeps late
+//! events from being attributed to the replacement's next session.
 //!
 //! # Limits of the NDI 6.4 File library
 //!

@@ -57,8 +57,7 @@ fn every_declared_function_is_in_one_table_or_explicitly_unwrapped() {
             "{name} is declared by the Advanced SDK headers but is in no table and not in UNWRAPPED"
         );
     }
-    assert!(
-        classified.is_empty(),
-        "classified names the Advanced SDK headers do not declare: {classified:?}"
-    );
+    // Known families absent from older headers remain classified, but are
+    // disabled by the declaration selector. Every declaration present above
+    // must still have exactly one owner.
 }

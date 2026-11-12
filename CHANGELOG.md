@@ -40,6 +40,20 @@ linted only. NDI 6.0 and 6.1.1 were not tested. See
 
 ### Added
 
+- Advanced API availability follows individual declaration families, so older
+  or partial Advanced headers preserve the public API and disable only missing
+  operations. The shared table registry drives both build and runtime selection.
+- `FileRecorder::reset` and `AsyncFileRecorder::reset` recover from an unconfirmed
+  session by replacing the native instance while returning its uncertain report.
+- Pinned Advanced 6.3.2 packages for Linux, Windows, Apple and Android, with
+  native baseline rows on Linux, Windows and macOS, and compatibility runs in
+  both directions against current Advanced headers and runtimes.
+- Qualification checks the loaded runtime's exact version, edition and module
+  path, crosses current/baseline headers and runtimes in both directions, and
+  tests real HEVC 4:4:4 pixels, video-only audio suppression, AVSync format
+  changes, Genlock reference/fallback pacing and KVM input-release ownership.
+
+
 - Runtime selection in two explicit steps. `Runtime::select` loads the NDI
   library and pins it for the process without starting NDI;
   `Runtime::initialize` starts NDI and returns an `NDI` handle. `NDI::new` and

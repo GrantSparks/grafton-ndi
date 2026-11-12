@@ -1026,7 +1026,7 @@ impl AllocatedReceiver {
         // SAFETY: the receiver is live. The callbacks are functions of this
         // program, which stays loaded, and the opaque value is a token they
         // look up, never a pointer they follow.
-        native!(table => unsafe {
+        native!(ReceiveAllocators, table => unsafe {
             match stream {
                 Stream::Video => table.NDIlib_recv_set_video_allocator(
                     instance,

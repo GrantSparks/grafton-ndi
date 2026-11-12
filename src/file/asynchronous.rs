@@ -890,6 +890,13 @@ impl AsyncFileRecorder {
         self.finish_inner(wait, false)
     }
 
+    /// Replace the native recorder after abandoning its old session; see
+    /// [`FileRecorder::reset`]. Queued events already delivered to this
+    /// worker's event stream remain available to the caller.
+    pub fn reset(&self, options: RecorderOptions) -> FileOperation<RecordingReport> {
+        self.worker.call(move |recorder| recorder.reset(options))
+    }
+
     fn finish_inner(&self, wait: Duration, stop: bool) -> FileOperation<FinishStatus> {
         if let Err(error) = timeout_ms(wait) {
             return FileOperation::failed(error);
