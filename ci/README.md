@@ -208,6 +208,9 @@ Tests against a real runtime create NDI senders and finders. `ci/offline.toml`
 makes Cargo start every test executable through a wrapper in
 [`offline/`](offline) that leaves it loopback networking only, so nothing is
 announced on, or reached over, the network the machine is attached to.
+Doctests are included: the current stable Cargo hands the same runner to
+rustdoc, which starts each compiled doctest through it, with or without
+`--target`.
 
 | | Linux ([`linux.sh`](offline/linux.sh)) | macOS ([`macos.sh`](offline/macos.sh)) | Windows ([`windows.ps1`](offline/windows.ps1)) |
 |---|---|---|---|
