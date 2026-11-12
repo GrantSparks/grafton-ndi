@@ -1448,26 +1448,15 @@ impl AudioFrameBuilder {
                 AudioLayout::Interleaved => {
                     let nc = audio_layout.no_channels;
                     let ns = audio_layout.no_samples;
+                    // The validated layout and the length check above make
+                    // `input_data` exactly `ns` frames of `nc` interleaved
+                    // samples; channel `ch` is every `nc`th sample from `ch`.
                     let mut planar = vec![0.0f32; sample_count];
-                    for ch in 0..nc {
-                        for s in 0..ns {
-                            let dst = ch
-                                .checked_mul(ns)
-                                .and_then(|idx| idx.checked_add(s))
-                                .ok_or_else(|| {
-                                    Error::InvalidFrame(
-                                        "Audio planar conversion index overflow".into(),
-                                    )
-                                })?;
-                            let src = s
-                                .checked_mul(nc)
-                                .and_then(|idx| idx.checked_add(ch))
-                                .ok_or_else(|| {
-                                    Error::InvalidFrame(
-                                        "Audio interleaved conversion index overflow".into(),
-                                    )
-                                })?;
-                            planar[dst] = input_data[src];
+                    for (ch, out) in planar.chunks_exact_mut(ns).enumerate() {
+                        for (dst, &sample) in
+                            out.iter_mut().zip(input_data[ch..].iter().step_by(nc))
+                        {
+                            *dst = sample;
                         }
                     }
                     planar
@@ -3999,6 +3988,51 @@ mod tests {
         drop(frame);
         assert!(NDI::is_running());
         assert!(copy.runtime_proof().is_some());
+    }
+
+    /// Interleaved input is transposed into exact per-channel planes.
+    #[test]
+    fn interleaved_audio_builds_exact_planar_output() {
+        // Sample counts that are not multiples of the channel count or each other.
+        for (channels, samples) in [
+            (1, 1),
+            (1, 7),
+            (2, 1),
+            (2, 5),
+            (2, 13),
+            (3, 7),
+            (3, 1),
+            (5, 11),
+        ] {
+            // Value encodes (channel, sample) so any misplacement is visible.
+            let value = |ch: usize, s: usize| (ch * 1000 + s) as f32;
+            let mut interleaved = Vec::with_capacity(channels * samples);
+            for s in 0..samples {
+                for ch in 0..channels {
+                    interleaved.push(value(ch, s));
+                }
+            }
+            let frame = AudioFrame::builder()
+                .sample_rate(48_000)
+                .channels(channels as i32)
+                .samples(samples as i32)
+                .layout(AudioLayout::Interleaved)
+                .data(interleaved)
+                .build()
+                .unwrap();
+            let expected: Vec<f32> = (0..channels)
+                .flat_map(|ch| (0..samples).map(move |s| value(ch, s)))
+                .collect();
+            assert_eq!(frame.data(), expected, "{channels}ch x {samples}");
+        }
+        // A wrong input length is still rejected before any transposition.
+        assert!(AudioFrame::builder()
+            .channels(3)
+            .samples(4)
+            .layout(AudioLayout::Interleaved)
+            .data(vec![0.0; 11])
+            .build()
+            .is_err());
     }
 
     /// Every audio path reports a bad sample rate with the same message.
