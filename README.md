@@ -39,7 +39,7 @@ The crate checks what the selected runtime provides before it calls into it. An 
 | Advanced SDK operations (`advanced` feature), with an Advanced runtime | Not tested | Yes | Yes |
 | File API (`file-io` feature) | No | No | Yes |
 
-The 6.3.2 runtime exports the Discovery Server functions, but destroying an advertiser or listener there while it is connected to a server aborts the process, measured in every object type and with no call order that avoids it, so the crate refuses them before 6.4.0. [SDK validation](docs/sdk-validation.md#discovery-server-objects) records the measurement and three rarer defects that 6.4 still has. The File library first ships with the 6.4 SDK. On Linux, macOS and Android it works only beside the Advanced runtime.
+The 6.3.2 runtime exports the Discovery Server functions, but destroying an advertiser or listener there while it is connected to a server aborts the process, measured in every object type and with no call order that avoids it, so the crate refuses them before 6.4.0. [Known issues](#known-issues) lists this and three rarer defects that 6.4 still has. The File library first ships with the 6.4 SDK. On Linux, macOS and Android it works only beside the Advanced runtime.
 
 ### Platforms
 
@@ -74,6 +74,34 @@ iOS, tvOS and visionOS targets link the vendor's static archive into the applica
 - The archive must contain a slice for the target's CPU and platform. In the NDI SDK for Apple 6.4 the arm64 slices are device builds and the x86_64 slices are simulator builds.
 - The 6.4 archives need iOS 16.0, tvOS 16.0 or visionOS 1.0. If `IPHONEOS_DEPLOYMENT_TARGET`, `TVOS_DEPLOYMENT_TARGET` or `XROS_DEPLOYMENT_TARGET` is set below the minimum the archive was built for, the build fails.
 - The edition is that of the SDK: an NDI Advanced SDK for Apple links its Advanced archive, an NDI SDK for Apple its Standard one. `RuntimeOptions::library_path` is rejected with `Error::RuntimeConflict`, and selecting the runtime loads nothing.
+
+## Known issues
+
+These are defects and limits of the NDI SDK, not of this crate: measured on Linux x86_64 where a version is named, otherwise stated by the SDK's own documentation or API. None can be corrected from outside the SDK. Where a type or a check can keep an application clear of one, the crate does so; otherwise this list and the documentation of the affected methods say how to stay clear of it. [SDK validation](docs/sdk-validation.md#discovery-server-objects) and the [File API guide](docs/file-io.md#limits-of-the-ndi-64-file-library) record the measurements.
+
+### Discovery Server
+
+- **Destroying an object aborts the process on 6.3.x.** On a 6.3.2 runtime, destroying a `SendAdvertiser`, `RecvAdvertiser`, `SendListener` or `RecvListener` while it is connected to a server aborts the process ("pure virtual method called"). No order of calls avoids it, so the crate refuses all four before NDI 6.4.0 with `Error::UnsupportedCapability`. 6.4.0.2 never aborted in the same tests.
+- **A quick re-registration crashes listeners (6.3.2 and 6.4.0.2).** Moving one sender or receiver from one advertiser to another on the same server within a few tens of milliseconds can crash a listener on that server, in any process. Wait about a second between unregistering and registering again, or drop the first advertiser before registering with the second.
+- **An unsubscribe can block a receiver's connect for good (6.3.2 and 6.4.0.2).** When a listener, in this process or another, unsubscribes from a receiver that a `RecvAdvertiser` registers while that receiver connects, its connect can block forever. Drop the listener to stop receiving a receiver's events; this crate's listeners never unsubscribe on their own.
+- **A send advertiser's destroy can hang (6.4.0.2).** Dropping a `SendAdvertiser` never returned once in about a million destroys under heavy load.
+
+### Receiving and sending
+
+- **A FrameSync takes its receiver's audio.** Raw audio capture beside a FrameSync (measured with 6.3.2 and 6.4) takes the frames the FrameSync needs, and the FrameSync returns silence in their place. A FrameSync's receiver therefore has no audio capture.
+- **Standard encoding may convert 4:4:4 video to 4:2:2.** Sending a planar 4:4:4 frame does not guarantee that a receiver gets 4:4:4.
+- **Sender and receiver names are reserved machine-wide** through lock files in the temporary directory (`NTK_SEND_<name>`, `NTK_RECV_<name>`). Two processes that share `TMPDIR` cannot each create a sender, or a receiver, of the same name at the same time.
+- **Some waits cannot be cut short.** A `Genlock` clock's wait cannot be cancelled or given a deadline. Dropping a `QueuedSender` waits, without a timeout, for the SDK to finish with every queued frame. An async call whose SDK work has started runs to the end of that SDK call even if its future is dropped.
+- **Stream tier and stream selection need a licensed vendor ID** (Advanced). Without one, the SDK ignores `set_stream_tier` and `set_streams` and reports no change, which the crate cannot tell from "already in effect".
+
+### File library (NDI 6.4)
+
+- It works only beside the Advanced runtime on Linux, macOS and Android.
+- A file reported closed is not proof that its data was written: when the disk fills while a session stops, the library still reports the file closed without an error.
+- A write that fails while recording, for example on a full disk, crashes the process inside the library.
+- A file can be closed with nothing in it, after a stop or a source switch before any frame arrived. `RecordingReport::empty_files` counts these.
+- A rollover the library cannot carry out ends the session. `rollover` refuses the cases it can check first.
+- The recorder's own getters for its source and its current file return strings that the library's recording thread can invalidate, so the crate does not call them, and `last_accepted_source` and `reported_current_file` follow the recorder's events instead.
 
 ## What It Covers
 
@@ -547,7 +575,7 @@ An operation whose capability is unavailable returns `Error::UnsupportedCapabili
 The capabilities with a minimum version need NDI 6.4.0:
 
 - `Planar444Video`, `ReceiveBest444` and `ReceiveVideoOnly`, because an older runtime does not know those values.
-- `SenderAdvertising`, `ReceiverAdvertising`, `SenderDiscovery` and `ReceiverDiscovery`, and the Advanced `AdvancedSenderAdvertiserConfiguration`, `AdvancedReceiverAdvertiserConfiguration`, `AdvancedSenderListenerConfiguration` and `AdvancedReceiverListenerConfiguration`, because older runtimes can crash when those objects are destroyed.
+- `SenderAdvertising`, `ReceiverAdvertising`, `SenderDiscovery` and `ReceiverDiscovery`, and the Advanced `AdvancedSenderAdvertiserConfiguration`, `AdvancedReceiverAdvertiserConfiguration`, `AdvancedSenderListenerConfiguration` and `AdvancedReceiverListenerConfiguration`, because destroying one of those objects aborts a 6.3.2 process (see [Known issues](#known-issues)).
 
 The Advanced SDK capabilities, which the [Advanced SDK guide](docs/advanced.md#capabilities) lists, also need an Advanced SDK runtime and a build that declares them. The others depend only on what the runtime exports. The [table of NDI versions](#ndi-versions) shows what each tested runtime provides. Availability says nothing about hardware or license requirements.
 
