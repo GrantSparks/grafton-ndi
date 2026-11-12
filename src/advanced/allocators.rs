@@ -351,7 +351,20 @@ impl Drop for OwnedStorage {
 }
 
 /// The memory a [`ReceiveAllocator`] returns for one [`AllocationRequest`].
+///
+/// # Threading
+///
+/// A buffer is [`Send`]: a policy returns it on an SDK thread, and the SDK
+/// may free it on another. It is not [`Sync`], because it can hold an
+/// [`ExternalAllocation`], which needs only to be `Send`, and
+/// [`capacity`](Self::capacity) asks that allocation through a shared
+/// reference.
 pub struct AllocationBuffer {
+    // `ExternalAllocation` asks only for Send, so that a pool whose handle is
+    // not Sync can lend memory, and `capacity` calls into it through `&self`;
+    // Sync would let two threads make that call at once. Nothing needs it:
+    // the registry keeps each buffer behind its mutex, which needs only Send,
+    // and frees it by value.
     storage: Box<dyn ExternalAllocation>,
     request: AllocationRequest,
 }
