@@ -366,6 +366,12 @@ as `None`. Most programs need changes; see the
   same `Error::CaptureFailed` message from `Receiver` capture,
   `Receiver::poll_event` and `advanced::PacketReceiver::capture`, and every
   audio path reports an invalid sample rate with the same message.
+- On Windows, flushing one sender's async video (`flush_async_blocking`,
+  `finish_video_async`, or dropping it with a frame in flight) no longer
+  waits for other senders' flushes. The process-wide lock that serialized
+  them dates from flushes that passed an empty frame instead of the null
+  frame pointer the SDK documents. Flushes of one sender were already
+  serialized by that sender.
 
 ### Removed
 

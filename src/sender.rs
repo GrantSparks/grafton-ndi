@@ -26,9 +26,6 @@ compile_error!(
     "This crate requires atomic pointer support. Please use a target with atomics enabled."
 );
 
-#[cfg(target_os = "windows")]
-static FLUSH_MUTEX: Mutex<()> = Mutex::new(());
-
 /// Flush the async video pipeline by passing a true NULL pointer.
 ///
 /// The NDI SDK documentation specifies that calling
@@ -39,11 +36,9 @@ fn async_flush_frame_ptr() -> *const NDIlib_video_frame_v2_t {
     ptr::null()
 }
 
+/// Every caller holds the sender's video state, by its lock or by `&mut`, so
+/// one sender's flushes never overlap; different senders flush independently.
 fn flush_null_frame(core: &sys::Core, instance: NDIlib_send_instance_t) {
-    #[cfg(target_os = "windows")]
-    let _lock = FLUSH_MUTEX
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // SAFETY: the caller owns a live sender instance created through `core`; a
     // null frame is the SDK's documented request to drain the async buffer.
     unsafe { core.NDIlib_send_send_video_async_v2(instance, async_flush_frame_ptr()) };

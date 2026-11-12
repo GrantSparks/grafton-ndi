@@ -1,5 +1,11 @@
 mod common;
 
+use std::{
+    sync::{mpsc, Arc, Barrier},
+    thread,
+    time::Duration,
+};
+
 use grafton_ndi::{BorrowedVideoFrame, PixelFormat, Sender, SenderOptions, VideoFrame};
 
 fn frame(value: u8) -> VideoFrame {
@@ -125,6 +131,54 @@ fn concurrent_sync_and_reentrant_flush_preserve_owned_frame() -> Result<(), graf
     assert_eq!(returned.data().as_ptr(), original_ptr);
     assert_eq!(returned.metadata(), Some("<frame value=\"6\"/>"));
     assert_eq!(completions.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+/// One sender's async sends, flushes, finish, and a drop with a frame still in
+/// flight, run by `senders_on_separate_threads_flush_independently`. Returns
+/// the first byte of the frame `finish_video_async` recovers.
+fn flush_repeatedly(mut sender: Sender, start: &Barrier) -> grafton_ndi::Result<Option<u8>> {
+    start.wait();
+    for value in 1..=FLUSH_ROUNDS {
+        sender.send_video_async(frame(value))?;
+        sender.flush_async_blocking();
+    }
+    let recovered = sender.finish_video_async().map(|frame| frame.data()[0]);
+    sender.send_video_async(frame(0))?;
+    drop(sender);
+    Ok(recovered)
+}
+
+const FLUSH_ROUNDS: u8 = 200;
+
+#[test]
+fn senders_on_separate_threads_flush_independently() -> Result<(), grafton_ndi::Error> {
+    const SENDERS: usize = 4;
+    let Some(ndi) = common::ndi() else {
+        return Ok(());
+    };
+    let start = Arc::new(Barrier::new(SENDERS));
+    let (done, finished) = mpsc::channel();
+    for index in 0..SENDERS {
+        let name = common::unique_name(&format!("concurrent flush {index}"));
+        let options = SenderOptions::new(name)
+            .clock_video(false)
+            .clock_audio(false);
+        let sender = Sender::new(&ndi, &options)?;
+        let (start, done) = (start.clone(), done.clone());
+        // Detached rather than scoped, so a flush that never returns fails the
+        // watchdog below instead of hanging the join.
+        thread::spawn(move || {
+            let _ = done.send(flush_repeatedly(sender, &start));
+        });
+    }
+    drop(done);
+    for _ in 0..SENDERS {
+        let recovered = finished
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a sender's flush did not return")?;
+        assert_eq!(recovered, Some(FLUSH_ROUNDS));
+    }
     Ok(())
 }
 
