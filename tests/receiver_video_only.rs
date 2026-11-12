@@ -17,17 +17,25 @@ fn video_only_modes_deliver_video_while_an_ordinary_receiver_also_gets_audio() {
         // The constructors' rejection on older runtimes is tested separately.
         return;
     }
+    // Send in real time: clocked 30 fps video, each frame paired with 1600
+    // samples (1/30 s) of 48 kHz audio. An unclocked loop sends hundreds of
+    // times faster, and on a busy machine the runtime then drops the ordinary
+    // receiver's connection and does not restore it within the deadline.
     let sender = Sender::new(
         &ndi,
         &SenderOptions::builder(common::unique_name("video-only"))
-            .clock_video(false)
+            .clock_video(true)
             .clock_audio(false)
             .build(),
     )
     .unwrap();
     let source = common::loopback_source(&ndi, &sender).unwrap();
     let ordinary = Receiver::new(&ndi, &ReceiverOptions::builder(source.clone()).build()).unwrap();
-    let video = VideoFrame::builder().resolution(64, 32).build().unwrap();
+    let video = VideoFrame::builder()
+        .resolution(64, 32)
+        .frame_rate(30, 1)
+        .build()
+        .unwrap();
     let audio = AudioFrame::builder()
         .sample_rate(48_000)
         .channels(2)

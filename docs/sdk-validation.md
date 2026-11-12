@@ -46,8 +46,15 @@ The Standard 6.4.0.2 and Advanced 6.4.0.2 rows with all features first ran
 while a second test run shared the machine. Each then failed one test,
 `tests/receiver_video_only.rs`: with `ReceiverBandwidth::VideoOnlyLowest`, its
 control receiver received no audio within 15 seconds. Run alone, both rows
-passed, as recorded above, and that test passed ten times in a row. It is
-sensitive to load.
+passed, as recorded above. The test's sender was then unclocked, so it sent
+video and audio as fast as its loop turned: about 17,000 frames of each a
+second, some 500 times real time. With every core busy, the runtime dropped the
+control receiver's connection within the first second and had not restored it
+30 seconds later, even after the load and the sending had stopped. The test now
+sends in real time, clocked 30 fps video with 1/30 s of audio per frame. With
+twice as many busy processes as the machine has cores, the old test failed 3 of
+3 runs against Standard 6.4.0.2; the new one passed 10 of 10 against each of
+Standard and Advanced 6.4.0.2. The rows above were run before this change.
 
 ### Runs that cross versions
 
