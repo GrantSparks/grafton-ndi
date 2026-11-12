@@ -35,7 +35,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
@@ -45,7 +45,8 @@ use crate::{
     capture::{capture_raw, AudioKind, CaptureKind, CaptureResult, MetadataKind, VideoKind},
     finder::{RawSource, Source},
     sys::{self, bindings::*},
-    to_ms_checked, Error, MetadataFrame, Result, NDI,
+    timeout::Deadline,
+    Error, MetadataFrame, Result, NDI,
 };
 
 /// A string the receiver API returned, released when dropped.
@@ -148,30 +149,35 @@ impl Default for RetryPolicy {
 ///
 /// # Parameters
 ///
-/// - `timeout`: Total time allowed for the operation to succeed.
+/// - `deadline`: The caller's budget, which may have started before this call.
 /// - `policy`: Retry timing configuration.
 /// - `capture_fn`: A closure that attempts to capture a frame with a given timeout.
 ///
 /// # Returns
 ///
 /// - `Ok(T)`: The captured frame on success.
-/// - `Err(Error::FrameTimeout)`: If no frame is captured within the total timeout.
-fn retry_capture<T, F>(timeout: Duration, policy: &RetryPolicy, capture_fn: F) -> Result<T>
+/// - `Err(Error::FrameTimeout)`: If no frame is captured within the budget; its
+///   `elapsed` counts from the start of the budget.
+fn retry_capture<T, F>(deadline: Deadline, policy: &RetryPolicy, capture_fn: F) -> Result<T>
 where
     F: FnMut(Duration) -> Result<Option<T>>,
 {
-    let start_time = Instant::now();
     retry_capture_with_clock(
-        timeout,
+        deadline.budget(),
         policy,
         capture_fn,
-        || start_time.elapsed(),
+        || deadline.elapsed(),
         std::thread::sleep,
     )
 }
 
+/// [`retry_capture`] for a budget of `budget`, with `elapsed` reporting the
+/// time since the budget started and `sleep` pausing between attempts.
+///
+/// The first attempt is made even when nothing is left of the budget, so a
+/// zero budget makes exactly one attempt, with a zero timeout.
 fn retry_capture_with_clock<T, F, E, S>(
-    timeout: Duration,
+    budget: Duration,
     policy: &RetryPolicy,
     mut capture_fn: F,
     mut elapsed: E,
@@ -182,64 +188,28 @@ where
     E: FnMut() -> Duration,
     S: FnMut(Duration),
 {
-    to_ms_checked(timeout)?;
-
+    let mut poll = policy.poll_interval.min(budget.saturating_sub(elapsed()));
+    // The time left of the budget, or the timeout once none is.
+    let mut time_left = |attempts| {
+        let elapsed = elapsed();
+        let left = budget.saturating_sub(elapsed);
+        if left.is_zero() {
+            Err(Error::FrameTimeout { attempts, elapsed })
+        } else {
+            Ok(left)
+        }
+    };
     let mut attempts = 0;
-
-    if timeout.is_zero() {
-        attempts += 1;
-        return match capture_fn(Duration::ZERO)? {
-            Some(frame) => Ok(frame),
-            None => Err(Error::FrameTimeout {
-                attempts,
-                elapsed: elapsed(),
-            }),
-        };
-    }
-
     loop {
-        let elapsed_before_attempt = elapsed();
-        let Some(remaining) = timeout.checked_sub(elapsed_before_attempt) else {
-            return Err(Error::FrameTimeout {
-                attempts,
-                elapsed: elapsed_before_attempt,
-            });
-        };
-
-        if remaining.is_zero() {
-            return Err(Error::FrameTimeout {
-                attempts,
-                elapsed: elapsed_before_attempt,
-            });
-        }
-
-        let poll_timeout = policy.poll_interval.min(remaining);
         attempts += 1;
-
-        match capture_fn(poll_timeout)? {
-            Some(frame) => return Ok(frame),
-            None => {
-                let elapsed_after_attempt = elapsed();
-                let Some(remaining) = timeout.checked_sub(elapsed_after_attempt) else {
-                    return Err(Error::FrameTimeout {
-                        attempts,
-                        elapsed: elapsed_after_attempt,
-                    });
-                };
-
-                if remaining.is_zero() {
-                    return Err(Error::FrameTimeout {
-                        attempts,
-                        elapsed: elapsed_after_attempt,
-                    });
-                }
-
-                let sleep_duration = policy.sleep_between.min(remaining);
-                if !sleep_duration.is_zero() {
-                    sleep(sleep_duration);
-                }
-            }
+        if let Some(frame) = capture_fn(poll)? {
+            return Ok(frame);
         }
+        let pause = policy.sleep_between.min(time_left(attempts)?);
+        if !pause.is_zero() {
+            sleep(pause);
+        }
+        poll = policy.poll_interval.min(time_left(attempts)?);
     }
 }
 
@@ -981,8 +951,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// not an error: invalid sequences are replaced with U+FFFD, as
     /// [`Finder`](crate::Finder) does for discovered source names.
     pub fn poll_source_name_change(&self, timeout: Duration) -> Result<Option<SourceNameChange>> {
-        to_ms_checked(timeout)?;
-        let deadline = Instant::now() + timeout;
+        let deadline = Deadline::after(timeout)?;
         // The query comes with the function that releases what it returns.
         let (source_name, strings) = self
             .core
@@ -995,13 +964,13 @@ impl<M: ReceiverMode> Receiver<M> {
         &self,
         source_name: &sys::ReceiverSourceName,
         strings: &sys::ReceiverStrings,
-        deadline: Instant,
+        deadline: Deadline,
     ) -> Result<Option<SourceNameChange>> {
-        let Some(_query) = self.core.source_query_guard.try_lock_until(deadline) else {
+        let Some(_query) = self.core.source_query_guard.try_lock_until(deadline.end()) else {
             return Ok(None);
         };
         let mut pointer = ptr::null();
-        let remaining = to_ms_checked(deadline.saturating_duration_since(Instant::now()))?;
+        let remaining = deadline.remaining_ms();
         // SAFETY: the receiver instance is live for this borrow and `pointer` is
         // writable storage for the returned string.
         let changed = unsafe {
@@ -1573,8 +1542,8 @@ impl ReceiverCore {
     ///
     /// Every `NDIlib_recv_capture_v3` call on this instance holds this guard,
     /// so that none overlaps a connect or reconnect.
-    pub(crate) fn capture_lock_until(&self, deadline: Instant) -> Option<RwLockReadGuard<'_, ()>> {
-        self.capture_guard.try_read_until(deadline)
+    pub(crate) fn capture_lock_until(&self, deadline: Deadline) -> Option<RwLockReadGuard<'_, ()>> {
+        self.capture_guard.try_read_until(deadline.end())
     }
 
     /// Hold the lock a reconnect holds, so that a test can contend with capture.
@@ -1589,18 +1558,17 @@ impl ReceiverCore {
     /// `NDIlib_recv_capture_v3` call, so it runs concurrently with other
     /// captures but never overlaps a [`reconnect`](Receiver::reconnect).
     fn capture_ref_kind<K: CaptureKind>(&self, timeout: Duration) -> Result<Option<K::Ref<'_>>> {
-        to_ms_checked(timeout)?;
-        self.capture_ref_kind_until::<K>(Instant::now() + timeout)
+        self.capture_ref_kind_until::<K>(Deadline::after(timeout)?)
     }
 
     fn capture_ref_kind_until<K: CaptureKind>(
         &self,
-        deadline: Instant,
+        deadline: Deadline,
     ) -> Result<Option<K::Ref<'_>>> {
         let Some(_capture) = self.capture_lock_until(deadline) else {
             return Ok(None);
         };
-        let timeout_ms = to_ms_checked(deadline.saturating_duration_since(Instant::now()))?;
+        let timeout_ms = deadline.remaining_ms();
         // SAFETY: self.instance is a valid NDI receiver instance.
         self.capture_result::<K>(unsafe { capture_raw::<K>(&self._ndi, self.instance, timeout_ms) })
     }
@@ -1646,7 +1614,7 @@ impl ReceiverCore {
 
     pub(crate) fn try_capture_kind_until<K: CaptureKind>(
         &self,
-        deadline: Instant,
+        deadline: Deadline,
     ) -> Result<Option<K::Owned>> {
         match self.capture_ref_kind_until::<K>(deadline)? {
             Some(frame_ref) => Ok(Some(K::ref_to_owned(&frame_ref)?)),
@@ -1660,16 +1628,16 @@ impl ReceiverCore {
     /// [`RetryPolicy`], absorbing the SDK's initial-sync misses where it returns
     /// `none` immediately instead of blocking for the full timeout.
     pub(crate) fn capture_kind<K: CaptureKind>(&self, timeout: Duration) -> Result<K::Owned> {
-        to_ms_checked(timeout)?;
-        self.capture_kind_until::<K>(Instant::now() + timeout)
+        self.capture_kind_until::<K>(Deadline::after(timeout)?)
     }
 
-    pub(crate) fn capture_kind_until<K: CaptureKind>(&self, deadline: Instant) -> Result<K::Owned> {
-        retry_capture(
-            deadline.saturating_duration_since(Instant::now()),
-            &RetryPolicy::default(),
-            |poll| self.try_capture_kind_until::<K>(deadline.min(Instant::now() + poll)),
-        )
+    pub(crate) fn capture_kind_until<K: CaptureKind>(
+        &self,
+        deadline: Deadline,
+    ) -> Result<K::Owned> {
+        retry_capture(deadline, &RetryPolicy::default(), |poll| {
+            self.try_capture_kind_until::<K>(deadline.within(poll))
+        })
     }
 
     fn take_pending_status(&self) -> Option<ReceiverStatus> {
@@ -1719,8 +1687,7 @@ impl ReceiverCore {
     }
 
     fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
-        to_ms_checked(timeout)?;
-        let deadline = Instant::now() + timeout;
+        let deadline = Deadline::after(timeout)?;
         if let Some(event) = self.take_pending_event() {
             return Ok(Some(event));
         }
@@ -1739,7 +1706,7 @@ impl ReceiverCore {
                 ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null_mut(),
-                to_ms_checked(deadline.saturating_duration_since(Instant::now()))?,
+                deadline.remaining_ms(),
             )
         };
         match value {
@@ -2331,8 +2298,11 @@ mod tests {
         let poll = |changed, name: Option<&[u8]>| {
             NEXT.with(|next| *next.borrow_mut() = (changed, name.map(<[u8]>::to_vec)));
             let before = FREES.load(Ordering::Relaxed);
-            let change =
-                receiver.poll_source_name_change_until(&source_name, &strings, Instant::now());
+            let change = receiver.poll_source_name_change_until(
+                &source_name,
+                &strings,
+                Deadline::after(Duration::ZERO).unwrap(),
+            );
             (change.unwrap(), FREES.load(Ordering::Relaxed) - before)
         };
         assert_eq!(
@@ -2437,6 +2407,27 @@ mod tests {
             Some(ReceiverEvent::StatusChanged(_))
         ));
         assert!(!receiver.core.pending_status.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn every_receiver_wait_refuses_a_timeout_above_max_timeout() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let excessive = crate::MAX_TIMEOUT + Duration::from_nanos(1);
+        for result in [
+            receiver.video().capture(excessive).map(drop),
+            receiver.audio().try_capture(excessive).map(drop),
+            receiver.metadata().try_capture_ref(excessive).map(drop),
+            receiver.poll_event(excessive).map(drop),
+            receiver.poll_source_name_change(excessive).map(drop),
+        ] {
+            assert!(
+                matches!(result, Err(Error::InvalidConfiguration(_))),
+                "{result:?}"
+            );
+        }
     }
 
     #[test]
@@ -2897,20 +2888,77 @@ mod tests {
     }
 
     #[test]
-    fn retry_validates_total_timeout_before_attempts() {
-        let attempts = Cell::new(0);
+    fn retry_timeout_counts_time_spent_before_the_first_attempt() {
+        // A caller's 50 ms budget of which 30 ms went before the retry began,
+        // as when an async capture waited for a blocking-pool thread.
+        let clock = FakeClock::default();
+        clock.advance(Duration::from_millis(30));
+        let mut polls = Vec::new();
 
-        let result: Result<i32> = retry_capture(
-            crate::MAX_TIMEOUT + Duration::from_nanos(1),
+        let result: Result<i32> = retry_capture_with_clock(
+            Duration::from_millis(50),
             &RetryPolicy::default(),
-            |_| {
-                attempts.set(attempts.get() + 1);
-                Ok(Some(42))
+            |poll| {
+                polls.push(poll);
+                clock.advance(poll);
+                Ok(None)
             },
+            || clock.elapsed(),
+            |_| panic!("an expired budget should not sleep"),
         );
 
-        assert!(matches!(result, Err(Error::InvalidConfiguration(_))));
-        assert_eq!(attempts.get(), 0);
+        match result {
+            Err(Error::FrameTimeout { attempts, elapsed }) => {
+                assert_eq!(attempts, 1);
+                assert_eq!(elapsed, Duration::from_millis(50));
+            }
+            other => panic!("Expected FrameTimeout error, got {other:?}"),
+        }
+        assert_eq!(polls, [Duration::from_millis(20)]);
+    }
+
+    #[test]
+    fn retry_with_a_spent_budget_makes_one_nonblocking_attempt() {
+        let clock = FakeClock::default();
+        clock.advance(Duration::from_millis(70));
+        let mut polls = Vec::new();
+
+        let result: Result<i32> = retry_capture_with_clock(
+            Duration::from_millis(50),
+            &RetryPolicy::default(),
+            |poll| {
+                polls.push(poll);
+                Ok(None)
+            },
+            || clock.elapsed(),
+            |_| panic!("a spent budget should not sleep"),
+        );
+
+        assert!(matches!(
+            result,
+            Err(Error::FrameTimeout { attempts: 1, elapsed }) if elapsed == Duration::from_millis(70)
+        ));
+        assert_eq!(polls, [Duration::ZERO]);
+    }
+
+    #[test]
+    fn retry_capture_measures_the_callers_budget() {
+        let deadline = Deadline::after(Duration::from_millis(20)).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        let mut polls = Vec::new();
+
+        let result: Result<i32> = retry_capture(deadline, &RetryPolicy::default(), |poll| {
+            polls.push(poll);
+            Ok(None)
+        });
+
+        let Err(Error::FrameTimeout { attempts, elapsed }) = result else {
+            panic!("Expected FrameTimeout error, got {result:?}");
+        };
+        assert!(attempts >= 1);
+        assert!(elapsed >= Duration::from_millis(20), "{elapsed:?}");
+        // The first poll is taken from what was left after the caller's 5 ms.
+        assert!(polls[0] <= Duration::from_millis(15), "{polls:?}");
     }
 
     #[test]

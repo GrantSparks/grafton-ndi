@@ -60,12 +60,13 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use crate::{
     capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
-    to_ms_checked, ConnectionStats, Error, Receiver, Result,
+    timeout::Deadline,
+    ConnectionStats, Error, Receiver, Result,
 };
 
 // Dropping a future prevents its queued closure from starting SDK work. Work
@@ -236,21 +237,14 @@ pub struct AsyncReceiverGeneric<R: SpawnBlocking> {
     _runtime: PhantomData<R>,
 }
 
-fn validated_deadline(timeout: Duration) -> Result<Instant> {
-    to_ms_checked(timeout)?;
-    Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| Error::InvalidConfiguration("Capture deadline cannot be represented".into()))
-}
-
 // Shared by both capture verbs so validation and queue accounting agree.
 async fn with_timeout_budget<R, F, T>(timeout: Duration, operation: F) -> Result<T>
 where
     R: SpawnBlocking,
-    F: FnOnce(Instant) -> Result<T> + Send + 'static,
+    F: FnOnce(Deadline) -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    let deadline = validated_deadline(timeout)?;
+    let deadline = Deadline::after(timeout)?;
     R::spawn_blocking(move || operation(deadline)).await?
 }
 
@@ -624,14 +618,23 @@ mod timeout_tests {
             let budget = Duration::from_millis(20);
             let mut capture = Box::pin(with_timeout_budget::<TokioRuntime, _, _>(
                 budget,
-                |deadline| Ok(deadline.saturating_duration_since(Instant::now())),
+                |deadline| {
+                    Ok((
+                        deadline.remaining(),
+                        deadline.remaining_ms(),
+                        deadline.elapsed(),
+                    ))
+                },
             ));
             let mut context = Context::from_waker(Waker::noop());
             assert!(matches!(capture.as_mut().poll(&mut context), Poll::Pending));
             // Keep the sole worker occupied until the whole budget has elapsed.
             std::thread::sleep(budget + Duration::from_millis(5));
             release_tx.send(()).unwrap();
-            assert_eq!(capture.await.unwrap(), Duration::ZERO);
+            let (remaining, remaining_ms, elapsed) = capture.await.unwrap();
+            assert_eq!((remaining, remaining_ms), (Duration::ZERO, 0));
+            // The queue delay is part of the time the budget reports as spent.
+            assert!(elapsed >= budget + Duration::from_millis(5), "{elapsed:?}");
             blocker.await.unwrap();
         });
     }
@@ -640,7 +643,7 @@ mod timeout_tests {
     fn invalid_budget_is_rejected_before_spawning() {
         // No entered runtime: trying to submit work would panic.
         let mut capture = Box::pin(with_timeout_budget::<TokioRuntime, _, ()>(
-            crate::MAX_TIMEOUT + Duration::from_secs(1),
+            crate::MAX_TIMEOUT + Duration::from_nanos(1),
             |_| panic!("invalid timeout must not execute blocking work"),
         ));
         let mut context = Context::from_waker(Waker::noop());
@@ -657,6 +660,7 @@ mod smol_tests {
     use std::{
         sync::mpsc,
         task::{Context, Poll, Waker},
+        time::Instant,
     };
 
     #[test]
@@ -699,7 +703,7 @@ mod smol_tests {
         let called = Arc::new(AtomicBool::new(false));
         let worker_called = Arc::clone(&called);
         let result = ::smol::block_on(with_timeout_budget::<SmolRuntime, _, _>(
-            crate::MAX_TIMEOUT + Duration::from_secs(1),
+            crate::MAX_TIMEOUT + Duration::from_nanos(1),
             move |_| {
                 worker_called.store(true, Ordering::Release);
                 Ok(())
@@ -716,10 +720,10 @@ mod smol_tests {
         let (release_tx, release_rx) = mpsc::channel();
         let mut operation = Box::pin(with_timeout_budget::<SmolRuntime, _, _>(
             budget,
-            move |deadline| {
-                started_tx.send(deadline).unwrap();
+            move |deadline: Deadline| {
+                started_tx.send(deadline.end()).unwrap();
                 release_rx.recv().unwrap();
-                Ok(deadline.saturating_duration_since(Instant::now()))
+                Ok(deadline.remaining())
             },
         ));
         // Construction must not consume the wait budget.

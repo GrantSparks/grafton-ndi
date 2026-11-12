@@ -183,6 +183,7 @@ mod error;
 mod recv_guard;
 mod rejected;
 mod sys;
+mod timeout;
 
 pub mod framesync;
 
@@ -248,29 +249,23 @@ pub use frames::ImageFormat;
 /// Alias for Result with our Error type
 pub type Result<T> = std::result::Result<T, crate::error::Error>;
 
-/// Maximum timeout duration supported by the NDI SDK (~49.7 days).
+/// The largest finite timeout: `u32::MAX - 1` milliseconds (~49.7 days).
 ///
-/// The NDI SDK uses `u32` milliseconds for timeout values, which limits the maximum
-/// timeout to approximately 49.7 days. Attempting to use a larger `Duration` will
-/// result in an error.
-pub const MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(u32::MAX as u64);
+/// The NDI SDK takes every timeout as a `uint32_t` count of milliseconds and
+/// reserves the largest value, 0xFFFFFFFF, for a wait without a limit (see
+/// the event functions in `Processing.NDI.RecvListener.h`). A finite wait is
+/// therefore never passed to the SDK as `u32::MAX`. A longer timeout is
+/// refused as invalid input: [`Error::InvalidConfiguration`], or
+/// `FileError::InvalidInput` from the File API.
+///
+/// A timeout is rounded up to whole milliseconds, so a non-zero wait shorter
+/// than a millisecond becomes one millisecond, and only [`Duration::ZERO`]
+/// polls without blocking.
+///
+/// [`Duration::ZERO`]: std::time::Duration::ZERO
+pub const MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(u32::MAX as u64 - 1);
 
-/// Converts a `Duration` to milliseconds for FFI, checking for overflow.
-///
-/// # Errors
-///
-/// Returns [`Error::InvalidConfiguration`] if the duration exceeds [`MAX_TIMEOUT`].
-///
-pub(crate) fn to_ms_checked(d: std::time::Duration) -> Result<u32> {
-    if d > MAX_TIMEOUT {
-        Err(Error::InvalidConfiguration(format!(
-            "timeout {:?} exceeds MAX_TIMEOUT (~49.7 days)",
-            d
-        )))
-    } else {
-        Ok(d.as_millis() as u32)
-    }
-}
+pub(crate) use timeout::to_ms_checked;
 
 #[cfg(test)]
 #[path = "tests.rs"]

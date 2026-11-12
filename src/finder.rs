@@ -7,11 +7,12 @@ use std::{
     net::IpAddr,
     ptr,
     sync::Mutex,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use crate::{
     sys::{self, bindings::*},
+    timeout::Deadline,
     to_ms_checked, Error, Result, NDI,
 };
 
@@ -283,14 +284,19 @@ impl Finder {
     /// # }
     /// ```
     pub fn wait_for_sources(&self, timeout: Duration) -> Result<bool> {
-        let timeout_ms = to_ms_checked(timeout)?;
+        Ok(self.wait_for_sources_ms(to_ms_checked(timeout)?))
+    }
+
+    /// [`Self::wait_for_sources`] with a timeout already in the SDK's
+    /// milliseconds.
+    fn wait_for_sources_ms(&self, timeout_ms: u32) -> bool {
         // SAFETY: the finder instance is live for this borrow.
-        Ok(unsafe {
+        unsafe {
             self._ndi
                 .api()
                 .core
                 .NDIlib_find_wait_for_sources(self.instance, timeout_ms)
-        })
+        }
     }
 
     /// Returns the current list of discovered sources (snapshot).
@@ -396,20 +402,18 @@ impl Finder {
     ) -> Result<Option<T>> {
         // Validate up front so an over-long timeout is rejected even when the
         // first snapshot already satisfies `accept`.
-        to_ms_checked(timeout)?;
-        let deadline = Instant::now() + timeout;
+        let deadline = Deadline::after(timeout)?;
         loop {
             if let Some(selected) = accept(self.current_sources()?) {
                 return Ok(Some(selected));
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            if deadline.is_expired() {
                 return Ok(None);
             }
-            // Block until the source list changes or the remaining window
-            // expires; either way the next iteration re-snapshots and the
-            // zero-`remaining` check then terminates the loop.
-            self.wait_for_sources(remaining)?;
+            // Block until the source list changes or the window ends; either
+            // way the next iteration re-snapshots. The wait is rounded up, so
+            // the last one lasts until the deadline rather than polling.
+            self.wait_for_sources_ms(deadline.remaining_ms());
         }
     }
 

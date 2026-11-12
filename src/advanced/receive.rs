@@ -1,10 +1,6 @@
 //! Receiving compressed packets instead of decoded frames.
 
-use std::{
-    marker::PhantomData,
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{marker::PhantomData, rc::Rc, time::Duration};
 
 use super::{
     packets, AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedVideoFrame, VideoCodec,
@@ -16,6 +12,7 @@ use crate::{
         advanced::{declared, native, ReceiverConfiguration},
         bindings::*,
     },
+    timeout::Deadline,
     AudioFrame, Error, MetadataFrame, Receiver, ReceiverOptions, Result, VideoFrame, NDI,
 };
 
@@ -282,8 +279,7 @@ impl PacketReceiver {
     /// One capture on `receiver`, under the same capture lock and timeout
     /// budget as the receiver's own capture verbs.
     pub(crate) fn capture_from(receiver: &Receiver, timeout: Duration) -> Result<PacketEvent> {
-        crate::to_ms_checked(timeout)?;
-        let deadline = Instant::now() + timeout;
+        let deadline = Deadline::after(timeout)?;
         let core = &*receiver.core;
         let mut video = NDIlib_video_frame_v2_t::default();
         let mut audio = NDIlib_audio_frame_v3_t::default();
@@ -295,8 +291,7 @@ impl PacketReceiver {
             let Some(_capture) = core.capture_lock_until(deadline) else {
                 return Ok(PacketEvent::Timeout);
             };
-            let timeout_ms =
-                crate::to_ms_checked(deadline.saturating_duration_since(Instant::now()))?;
+            let timeout_ms = deadline.remaining_ms();
             #[cfg(test)]
             native_capture_calls::record();
             // SAFETY: the receiver instance is live for this borrow, and the

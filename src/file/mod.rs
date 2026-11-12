@@ -313,18 +313,16 @@ fn missing(family: &str, symbol: &CStr) -> FileError {
     ))
 }
 
-/// A wait as the SDK's millisecond timeout, rounded up.
-///
-/// The largest value is refused rather than passed on, because the SDK may
-/// treat it as "wait forever".
+/// A wait as the SDK's millisecond timeout, by the rule every wait in the
+/// crate follows: rounded up, and refused above [`crate::MAX_TIMEOUT`] rather
+/// than passed on as the value the SDK may treat as "wait forever".
 pub(super) fn timeout_ms(wait: Duration) -> FileResult<u32> {
-    let millis = wait.as_millis() + u128::from(!wait.subsec_nanos().is_multiple_of(1_000_000));
-    u32::try_from(millis)
-        .ok()
-        .filter(|&millis| millis != u32::MAX)
-        .ok_or_else(|| {
-            FileError::InvalidInput("a wait must be less than u32::MAX milliseconds".into())
-        })
+    crate::timeout::sdk_millis(wait).ok_or_else(|| {
+        FileError::InvalidInput(format!(
+            "a wait of {wait:?} exceeds MAX_TIMEOUT ({:?})",
+            crate::MAX_TIMEOUT
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -348,3 +346,15 @@ mod lifecycle_tests;
 
 #[cfg(test)]
 mod sdk_tests;
+
+#[cfg(test)]
+#[test]
+fn file_waits_follow_the_crate_timeout_rule() {
+    for (wait, millis) in crate::timeout::rounding_table() {
+        match (timeout_ms(wait), millis) {
+            (Ok(value), Some(millis)) => assert_eq!(value, millis, "{wait:?}"),
+            (Err(FileError::InvalidInput(_)), None) => {}
+            (other, _) => panic!("{wait:?} converted to {other:?}"),
+        }
+    }
+}

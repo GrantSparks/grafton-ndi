@@ -278,16 +278,10 @@ pub enum Wait {
 impl Wait {
     fn millis(self) -> Result<u32> {
         match self {
+            // The listener headers reserve 0xFFFFFFFF for an indefinite wait,
+            // which no finite wait converts to.
             Self::Forever => Ok(u32::MAX),
-            Self::For(value) => {
-                let millis = value.as_nanos().div_ceil(1_000_000);
-                if millis >= u128::from(u32::MAX) {
-                    return Err(Error::InvalidConfiguration(
-                        "finite event timeout must be less than UINT32_MAX milliseconds".into(),
-                    ));
-                }
-                Ok(millis as u32)
-            }
+            Self::For(value) => to_ms_checked(value),
         }
     }
 }
@@ -1067,19 +1061,13 @@ mod tests {
     use super::*;
     #[test]
     fn finite_wait_never_turns_into_infinity() {
-        assert_eq!(Wait::For(Duration::ZERO).millis().unwrap(), 0);
-        assert_eq!(Wait::For(Duration::from_nanos(1)).millis().unwrap(), 1);
-        assert_eq!(
-            Wait::For(Duration::from_millis(u32::MAX as u64 - 1))
-                .millis()
-                .unwrap(),
-            u32::MAX - 1
-        );
-        assert!(
-            Wait::For(Duration::from_nanos((u32::MAX as u64 - 1) * 1_000_000 + 1))
-                .millis()
-                .is_err()
-        );
+        for (wait, millis) in crate::timeout::rounding_table() {
+            match (Wait::For(wait).millis(), millis) {
+                (Ok(value), Some(millis)) => assert_eq!(value, millis, "{wait:?}"),
+                (Err(Error::InvalidConfiguration(_)), None) => {}
+                (other, _) => panic!("{wait:?} converted to {other:?}"),
+            }
+        }
         assert_eq!(Wait::Forever.millis().unwrap(), u32::MAX);
     }
     #[test]
