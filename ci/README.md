@@ -248,8 +248,14 @@ datagram of the unconfined process itself (`refused`, as inside the wrapper). Th
 control then prints, on stdout, that this is a limitation and does not fail;
 the refusal of the mDNS group inside the runner shows nothing about the wrapper
 on such a machine, and only the public TCP connections attribute the refusals to
-it. A timeout or any other outcome of the datagram still fails the control. The
-check exercises the one process the wrapper starts. It does not show what the
+it. A timeout or any other outcome of the datagram still fails the control.
+Inside the Windows wrapper there is a second exception: Defender Firewall drops
+a blocked outbound datagram without failing the send, so `sendto` succeeds and
+the check cannot observe the refusal (Linux and macOS report it at once). When
+every public TCP connection was refused, which shows that the block rules apply
+to the program, a datagram that reports `reached` is printed as a limitation and
+does not fail; with any TCP connection not refused, or any other datagram
+outcome, the check fails as on every other platform. The check exercises the one process the wrapper starts. It does not show what the
 points above say a wrapper leaves open.
 
 Two parts of the wrappers exist because of how the SDK behaves:
@@ -425,7 +431,12 @@ New, and so unverified anywhere but Linux x86_64:
   fails at once there (with a permission error) instead of timing out. The first
   hosted run showed that the unconfined macOS runner cannot send to the mDNS
   group (the datagram is refused), which the `--online` control now reports as a
-  limitation; whether the unconfined Windows runner can is not yet known;
+  limitation; whether the unconfined Windows runner can is not yet known. The
+  Windows run of the loopback-only check (run 43318507917) showed that the
+  public TCP connections are refused at once inside the wrapper but that the
+  mDNS datagram is `reached`, because the firewall discards it silently; the
+  check now reports that as a limitation on Windows, and that report itself is
+  not yet confirmed by a hosted run;
 - every promise of the Windows and macOS rows, in particular `file` beside a
   Standard runtime in the Windows x64 Standard 6.4 row;
 - the Advanced lint on Windows and macOS;

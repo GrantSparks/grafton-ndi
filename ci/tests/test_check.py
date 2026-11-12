@@ -93,6 +93,41 @@ class Problems(unittest.TestCase):
         self.assertIn('mDNS group could not be checked', out.getvalue())
         self.assertEqual(err.getvalue(), '')
 
+    def test_windows_reports_an_unobservable_datagram_as_a_limitation(self):
+        with mock.patch.object(check.sys, 'platform', 'win32'):
+            self.assertEqual(self.problems(False, multicast=passing), ([], [check.WINDOWS_LIMITATION]))
+        self.assertIn('without failing the send', check.WINDOWS_LIMITATION)
+        self.assertIn('refused TCP connections', check.WINDOWS_LIMITATION)
+
+    def test_windows_still_fails_when_a_tcp_attempt_is_not_refused(self):
+        def one_reached(address):
+            if address[0] == '8.8.8.8':
+                return None
+            raise OSError(errno.ENETUNREACH, 'unreachable')
+        with mock.patch.object(check.sys, 'platform', 'win32'):
+            self.assertEqual(self.failures(False, connect=one_reached, multicast=passing),
+                             ['TCP to 8.8.8.8:53 was not refused: reached',
+                              'UDP to the mDNS group 224.0.0.251:5353 was not refused: reached'])
+            self.assertEqual(self.failures(False, multicast=raising(TimeoutError())),
+                             ['UDP to the mDNS group 224.0.0.251:5353 was not refused: timed out'])
+            self.assertEqual(self.problems(False, multicast=passing, udp=raising(OSError(errno.EPERM, 'denied'))),
+                             (['IPv4 loopback UDP: refused'], [check.WINDOWS_LIMITATION]))
+
+    def test_other_platforms_still_fail_on_a_reached_datagram(self):
+        for platform in ('linux', 'darwin'):
+            with self.subTest(platform=platform), mock.patch.object(check.sys, 'platform', platform):
+                self.assertEqual(self.failures(False, multicast=passing),
+                                 ['UDP to the mDNS group 224.0.0.251:5353 was not refused: reached'])
+
+    def test_main_passes_with_the_windows_limitation(self):
+        with mock.patch.object(check.sys, 'platform', 'win32'), mock.patch.multiple(
+                check, connect=self.REFUSED, send_multicast=passing, loopback_tcp=passing, loopback_udp=passing), \
+                mock.patch('sys.stdout', new_callable=io.StringIO) as out, \
+                mock.patch('sys.stderr', new_callable=io.StringIO) as err:
+            self.assertEqual(check.main([]), 0)
+        self.assertIn('limitation of this control: the firewall drops', out.getvalue())
+        self.assertEqual(err.getvalue(), '')
+
     def test_main_still_fails_on_a_failure(self):
         with mock.patch.object(check, 'problems', return_value=(['boom'], [])), \
                 mock.patch('sys.stdout', new_callable=io.StringIO), \

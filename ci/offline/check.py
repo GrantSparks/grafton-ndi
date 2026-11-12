@@ -19,6 +19,14 @@ That is printed on stdout, and the refusal of the group inside the runner then
 shows nothing about the wrapper. A timeout or any other outcome still fails, and
 so does a refused public TCP connection.
 
+One outcome inside a runner is a limitation too, and only on Windows: the
+firewall drops a blocked outbound datagram without failing the send, so the
+program cannot observe that the mDNS datagram was refused. When every TCP
+attempt was refused, which shows that the block rules apply to this program,
+a datagram that was "reached" is printed as a limitation and does not fail.
+Any other outcome of the datagram, and any TCP attempt that was not refused,
+still fails, and nothing changes on other platforms.
+
 Only the calling process is exercised. What each runner confines beyond that,
 and what it does not, is described in ci/README.md.
 """
@@ -33,6 +41,9 @@ MDNS = ('224.0.0.251', 5353)
 # (a network namespace) or no permission (a sandbox profile, a firewall rule).
 LIMITATION = ('the unconfined process is itself refused the mDNS group, so a refusal of the group inside the '
               'runner shows nothing about the wrapper')
+WINDOWS_LIMITATION = ('the firewall drops a blocked datagram without failing the send, so the check cannot observe '
+                      'the mDNS group being refused; the refused TCP connections show that the block rules apply to '
+                      'this program')
 REFUSED = {errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EPERM, errno.EACCES}
 
 
@@ -82,7 +93,8 @@ def problems(online):
     """What differs from the expected state, and what the check could not show.
 
     Returns (failures, limitations): everything must be reachable online and
-    only loopback otherwise. A limitation is printed but does not fail the check.
+    only loopback otherwise, except for the Windows datagram described in the module
+    docstring. A limitation is printed but does not fail the check.
     """
     leaving = {f'TCP to {host}:{port}': outcome(lambda address=(host, port): connect(address))
                for host, port in EXTERNAL}
@@ -96,6 +108,12 @@ def problems(online):
         return (found if udp == 'reached' else found + [f'the mDNS group was not reached: {udp}']), []
     found = [f'IPv4 loopback {name}: {result}' for name, result in
              (('TCP', outcome(loopback_tcp)), ('UDP', outcome(loopback_udp))) if result != 'reached']
+    *tcp, udp = leaving.values()
+    if sys.platform == 'win32' and udp == 'reached' and all(result == 'refused' for result in tcp):
+        # Not an error of the wrapper: the send succeeds and the firewall discards the packet.
+        leaving.popitem()
+        return found + [f'{name} was not refused: {result}' for name, result in leaving.items()
+                        if result != 'refused'], [WINDOWS_LIMITATION]
     return found + [f'{name} was not refused: {result}' for name, result in leaving.items() if result != 'refused'], []
 
 
@@ -109,9 +127,13 @@ def main(argv=None):
     for problem in found:
         print(f'network check failed: {problem}', file=sys.stderr)
     if not found:
-        print(('online: a public address can be reached; the mDNS group could not be checked' if limitations
-               else 'online: a public address and the mDNS group can be reached') if online
-              else 'offline: loopback works and every attempt to leave the machine is refused')
+        if online:
+            print('online: a public address can be reached; the mDNS group could not be checked' if limitations
+                  else 'online: a public address and the mDNS group can be reached')
+        else:
+            print('offline: loopback works and every TCP attempt to leave the machine is refused; the mDNS '
+                  'group could not be checked' if limitations
+                  else 'offline: loopback works and every attempt to leave the machine is refused')
     return 1 if found else 0
 
 
