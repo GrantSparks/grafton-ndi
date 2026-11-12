@@ -306,17 +306,40 @@ impl FrameFree for FrameSyncAudioFree {
 pub struct Guard<'owner, S: FrameFree> {
     instance: S::Instance,
     frame: S::RawFrame,
-    // The runtime the frame was captured through, borrowed from the owner so the
-    // owner cannot be dropped while a frame is outstanding, and used to free
-    // it. Only synthetic unit-test frames have none; `test_free` releases those.
-    runtime: Option<&'owner Ndi>,
+    // The release names the strategy only in unit tests, whose synthetic
+    // variant is the one that uses it.
+    #[cfg(not(test))]
+    release: Release<'owner>,
     #[cfg(test)]
-    test_free: Option<TestFrameFree<S>>,
+    release: Release<'owner, S>,
     // FrameSync buffers remain conservative about cross-thread use. Receiver
     // strategies explicitly opt in below using the SDK's cross-thread free
     // guarantee, rather than raw-pointer auto traits from generated bindings.
     _thread_affine: PhantomData<Rc<()>>,
 }
+
+/// How a [`Guard`] releases its frame when it is dropped.
+///
+/// Outside unit tests the only variant is [`Release::Native`], so every
+/// guard frees its frame through the SDK.
+enum Release<'owner, #[cfg(test)] S: FrameFree> {
+    /// Through the free strategy's SDK call, in the runtime the frame was
+    /// captured through. The runtime is borrowed from the owner, so the owner
+    /// cannot be dropped while the frame is outstanding.
+    Native(&'owner Ndi),
+    /// Through a unit test's callback, which owns the synthetic frame.
+    #[cfg(test)]
+    Synthetic(TestFrameFree<S>),
+}
+
+// Outside unit tests the release state is the runtime reference alone, as
+// large as the `Option<&Ndi>` it replaced, so a guard is no larger.
+#[cfg(not(test))]
+const _: () = {
+    use std::mem::{align_of, size_of};
+    assert!(size_of::<Release<'static>>() == size_of::<Option<&'static Ndi>>());
+    assert!(align_of::<Release<'static>>() == align_of::<Option<&'static Ndi>>());
+};
 
 impl<'owner, S: FrameFree> Guard<'owner, S> {
     /// Create a new frame guard.
@@ -337,9 +360,7 @@ impl<'owner, S: FrameFree> Guard<'owner, S> {
         Self {
             instance,
             frame,
-            runtime: Some(runtime),
-            #[cfg(test)]
-            test_free: None,
+            release: Release::Native(runtime),
             _thread_affine: PhantomData,
         }
     }
@@ -363,8 +384,7 @@ impl<'owner, S: FrameFree> Guard<'owner, S> {
         Self {
             instance,
             frame,
-            runtime: None,
-            test_free: Some(free),
+            release: Release::Synthetic(free),
             _thread_affine: PhantomData,
         }
     }
@@ -389,17 +409,16 @@ unsafe impl Sync for Guard<'_, MetadataKind> {}
 
 impl<'owner, S: FrameFree> Drop for Guard<'owner, S> {
     fn drop(&mut self) {
-        #[cfg(test)]
-        if let Some(free) = self.test_free {
-            // SAFETY: with_test_free requires this callback to own release of
-            // the synthetic descriptor, including failed validation and unwind.
-            unsafe { free(self.instance, &mut self.frame) };
-            return;
-        }
-        if let Some(runtime) = self.runtime {
+        match self.release {
             // SAFETY: `new` requires the instance and frame to be valid and to
             // belong to this runtime.
-            unsafe { S::free(&runtime.api().core, self.instance, &mut self.frame) };
+            Release::Native(runtime) => unsafe {
+                S::free(&runtime.api().core, self.instance, &mut self.frame);
+            },
+            // SAFETY: with_test_free requires this callback to own release of
+            // the synthetic descriptor, including failed validation and unwind.
+            #[cfg(test)]
+            Release::Synthetic(free) => unsafe { free(self.instance, &mut self.frame) },
         }
     }
 }
