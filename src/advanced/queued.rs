@@ -304,9 +304,9 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
 /// ```
 pub struct QueuedSender {
     // Declared first so that it is destroyed first: destroying the native
-    // sender is what ends the SDK's completion callbacks. Its mode keeps any
-    // other owner, such as an advertiser registration, from keeping it alive
-    // after the callback state is freed.
+    // sender is what ends the SDK's completion callbacks. Its mode owns the
+    // native sender exclusively, so no other owner, such as an advertiser
+    // registration, can keep it alive after the callback state is freed.
     sender: Sender<QueueAttached>,
     // The SDK holds this address for as long as the sender exists.
     callback: AliasableBox<CallbackState>,
@@ -325,7 +325,7 @@ impl QueuedSender {
     pub fn new(ndi: &Ndi, options: &SenderOptions, limits: QueueOptions) -> Result<Self> {
         let table = ndi.table::<SendCompletion>()?;
         let callback = CallbackState::new(limits)?;
-        let sender = Sender::new(ndi, options)?;
+        let sender = Sender::open(ndi, options)?;
         Ok(Self::install(sender, callback, table))
     }
 
@@ -343,39 +343,40 @@ impl QueuedSender {
     /// advertiser (a registration keeps the native sender alive after this
     /// value is dropped, when the completion state no longer exists).
     pub fn from_sender(
-        mut sender: Sender,
+        sender: Sender,
         limits: QueueOptions,
     ) -> std::result::Result<(Self, Option<VideoFrame>), Rejected<Sender>> {
         let prepare = || {
             let table = sender.runtime().table::<SendCompletion>()?;
-            let callback = CallbackState::new(limits)?;
-            if !sender.has_exclusive_native_owner() {
-                return Err(Error::InvalidInput(
-                    "queued conversion requires a sender without advertiser registrations".into(),
-                ));
-            }
-            Ok((table, callback))
+            Ok((table, CallbackState::new(limits)?))
         };
         let (table, callback) = match prepare() {
             Ok(prepared) => prepared,
             Err(error) => return Err(Rejected::new(error, sender)),
         };
-        // Nothing below can fail, so the sender may now be changed.
-        let earlier = sender.finish_video_async();
-        sender.clear_async_video_done();
-        Ok((Self::install(sender, callback, table), earlier))
+        // The conversion takes the native sender only when no registration
+        // shares it, and retires the sender's asynchronous video pipeline.
+        match sender.into_attached() {
+            Ok((sender, earlier)) => Ok((Self::install(sender, callback, table), earlier)),
+            Err(sender) => Err(Rejected::new(
+                Error::InvalidInput(
+                    "queued conversion requires a sender without advertiser registrations".into(),
+                ),
+                sender,
+            )),
+        }
     }
 
     /// Register the completion callback before anything can be submitted.
     ///
-    /// The sender must have no other owner and nothing in flight: its mode
-    /// changes here, and only the queue sends video on it from now on.
+    /// The sender's mode owns its native sender exclusively and has no
+    /// asynchronous video pipeline, so nothing else is in flight on it: only
+    /// the queue sends video on it from now on.
     fn install(
-        sender: Sender,
+        sender: Sender<QueueAttached>,
         callback: Box<CallbackState>,
         table: &'static SendCompletion,
     ) -> Self {
-        let sender = sender.into_mode::<QueueAttached>();
         let callback = AliasableBox::new(callback);
         let state = callback.as_ptr();
         // SAFETY: the sender is live. The state is heap-allocated, the callback

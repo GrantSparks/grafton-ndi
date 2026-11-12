@@ -16,7 +16,9 @@
 //! SDK: it takes the configured entry point's table before anything is built
 //! or created, then hands the SDK the configuration's own buffer and the owner
 //! a clone of it to keep. `configurable!` implements the trait for the finder,
-//! sender, receiver and router, and defines each one's `new_configured` on
+//! the sender in each of its modes, the receiver and the router, so that the
+//! Advanced senders create theirs in their own mode, and defines each one's
+//! `new_configured` on
 //! that path; the object's `new` calls `new_configured` when its options carry
 //! a configuration, and otherwise gives the creation path the SDK's plain
 //! entry point and no configuration. The advertisers and listeners share one
@@ -42,7 +44,8 @@ use crate::{
         bindings::*,
         Table,
     },
-    Finder, FinderOptions, Ndi, Receiver, ReceiverOptions, Result, Sender, SenderOptions,
+    Finder, FinderOptions, Ndi, Receiver, ReceiverOptions, Result, Sender, SenderMode,
+    SenderOptions,
 };
 
 /// An object whose SDK creation function has an Advanced counterpart that
@@ -108,13 +111,14 @@ pub(crate) trait Configurable: Sized {
 }
 
 /// Implement [`Configurable`] for `$Object` on its creation path, and define
-/// its `new_configured` on the entry point `$create` of table `$Table`.
+/// its `new_configured` on the entry point `$create` of table `$Table`. An
+/// object generic over its mode names the mode parameter and its bound.
 macro_rules! configurable {
     (
-        $Object:ident($Options:ty, $Settings:ty) -> $Instance:ty,
+        $Object:ty $(where $Mode:ident: $Bound:path)? => ($Options:ty, $Settings:ty) -> $Instance:ty,
         $Table:ident::$create:ident
     ) => {
-        impl Configurable for $Object {
+        impl$(<$Mode: $Bound>)? Configurable for $Object {
             type Options = $Options;
             type Settings = $Settings;
             type Instance = $Instance;
@@ -135,7 +139,7 @@ macro_rules! configurable {
             }
         }
 
-        impl $Object {
+        impl$(<$Mode: $Bound>)? $Object {
             /// Create the object through its configured entry point with
             /// `config`, which it keeps for as long as it lives: what `new`
             /// does for options that carry a configuration. Without an
@@ -164,19 +168,19 @@ macro_rules! configurable {
 }
 
 configurable!(
-    Finder(FinderOptions, NDIlib_find_create_t) -> NDIlib_find_instance_t,
+    Finder => (FinderOptions, NDIlib_find_create_t) -> NDIlib_find_instance_t,
     FinderConfiguration::NDIlib_find_create_v3
 );
 configurable!(
-    Sender(SenderOptions, NDIlib_send_create_t) -> NDIlib_send_instance_t,
+    Sender<M> where M: SenderMode => (SenderOptions, NDIlib_send_create_t) -> NDIlib_send_instance_t,
     SenderConfiguration::NDIlib_send_create_v2
 );
 configurable!(
-    Receiver(ReceiverOptions, NDIlib_recv_create_v3_t) -> NDIlib_recv_instance_t,
+    Receiver => (ReceiverOptions, NDIlib_recv_create_v3_t) -> NDIlib_recv_instance_t,
     ReceiverConfiguration::NDIlib_recv_create_v4
 );
 configurable!(
-    Router(RouterOptions, NDIlib_routing_create_t) -> NDIlib_routing_instance_t,
+    Router => (RouterOptions, NDIlib_routing_create_t) -> NDIlib_routing_instance_t,
     RouterConfiguration::NDIlib_routing_create_v2
 );
 

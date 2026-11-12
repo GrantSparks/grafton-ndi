@@ -13,6 +13,10 @@ use super::{
     VideoPacketFormat, MAX_PACKET_BYTES,
 };
 use crate::{
+    sender::{
+        in_flight::{self, Destroyed, InFlight, Lend, Lent},
+        SendHandle,
+    },
     sys::{
         advanced::{native, FrameScatter, ScatterSend},
         bindings::*,
@@ -463,11 +467,17 @@ pub struct UnsentVideo {
 ///
 /// The entry owns all of these, so nothing can read the frame's bytes while
 /// the SDK may still write to them.
-struct PendingVideo {
-    frame: SubmittedVideo,
-    // The scatter list of a scatter frame, kept only so that the address
-    // given to the SDK stays valid. Its arrays belong to the frame.
-    _scatter: Option<AliasableBox<FrameScatter>>,
+enum PendingVideo {
+    /// A frame submitted with [`CompressedSender::send_video_async`].
+    Contiguous(CompressedVideoFrame),
+    /// A frame submitted with [`CompressedSender::send_scatter_video_async`].
+    Scatter {
+        frame: ScatterVideoFrame,
+        // The scatter list given to the SDK, kept only so that its address
+        // stays valid. Its arrays belong to the frame.
+        list: AliasableBox<FrameScatter>,
+        table: &'static ScatterSend,
+    },
 }
 
 // SAFETY: the scatter list points only into allocations this entry owns, and
@@ -477,36 +487,42 @@ struct PendingVideo {
 unsafe impl Send for PendingVideo {}
 
 impl PendingVideo {
-    fn contiguous(frame: CompressedVideoFrame) -> Self {
-        Self {
-            frame: SubmittedVideo::Contiguous(frame),
-            _scatter: None,
+    /// The entry for a scatter frame, sent through `table`, with a scatter
+    /// list that stays where it is for as long as the entry exists.
+    fn scatter(mut frame: ScatterVideoFrame, table: &'static ScatterSend) -> Self {
+        let list = AliasableBox::new(Box::new(frame.storage.descriptor(table)));
+        Self::Scatter { frame, list, table }
+    }
+
+    /// The stream the frame is sent on.
+    fn tier(&self) -> StreamTier {
+        match self {
+            Self::Contiguous(frame) => frame.format().tier(),
+            Self::Scatter { frame, .. } => frame.format().tier(),
         }
     }
 
-    /// The entry for a scatter frame, and the address of its scatter list,
-    /// which stays valid for as long as the entry does.
-    fn scatter(
-        mut frame: ScatterVideoFrame,
-        table: &'static ScatterSend,
-    ) -> (Self, *const FrameScatter) {
-        let scatter = AliasableBox::new(Box::new(frame.storage.descriptor(table)));
-        let address = scatter.as_ptr();
-        let pending = Self {
-            frame: SubmittedVideo::Scatter(frame),
-            _scatter: Some(scatter),
-        };
-        (pending, address)
+    fn into_submitted(self) -> SubmittedVideo {
+        match self {
+            Self::Contiguous(frame) => SubmittedVideo::Contiguous(frame),
+            Self::Scatter { frame, .. } => SubmittedVideo::Scatter(frame),
+        }
     }
+}
 
+impl Lend for PendingVideo {
     /// The video descriptor to submit this entry with, which the SDK reads
-    /// only during the call. It lends the frame's bytes, or for a scatter
-    /// frame only its metadata, so the entry must be kept for as long as the
-    /// SDK may access them.
-    fn descriptor(&mut self) -> NDIlib_video_frame_v2_t {
-        match &mut self.frame {
-            SubmittedVideo::Contiguous(frame) => frame.raw(),
-            SubmittedVideo::Scatter(frame) => frame.descriptor(),
+    /// only during the call, and for a scatter frame its scatter list. The
+    /// descriptor lends the frame's bytes, or for a scatter frame only its
+    /// metadata; the list lends the blocks. All of them belong to the entry.
+    fn lend(&mut self) -> Lent {
+        match self {
+            Self::Contiguous(frame) => Lent::Frame(frame.raw()),
+            Self::Scatter { frame, list, table } => Lent::Scatter {
+                table,
+                frame: frame.descriptor(),
+                scatter: list.as_ptr(),
+            },
         }
     }
 }
@@ -514,35 +530,39 @@ impl PendingVideo {
 /// The frame most recently submitted asynchronously on each stream.
 ///
 /// The SDK uses an asynchronously sent frame until the next send on the same
-/// stream returns, so each stream keeps exactly one frame alive.
+/// stream returns, so each stream keeps exactly one frame in flight, and an
+/// earlier frame comes back only with the proof that the submission that
+/// replaced it has returned, or that the native sender was destroyed.
 #[derive(Default)]
 struct PendingStreams {
-    program: Option<PendingVideo>,
-    preview: Option<PendingVideo>,
+    program: InFlight<PendingVideo>,
+    preview: InFlight<PendingVideo>,
 }
 
 impl PendingStreams {
-    /// Hand `next` to the SDK through `submit`, then take back the frame it
+    /// Hand `next` to the SDK through `sender`, then take back the frame it
     /// replaces on the same stream.
-    fn submit(
-        &mut self,
-        mut next: PendingVideo,
-        submit: impl FnOnce(&mut PendingVideo),
-    ) -> Option<SubmittedVideo> {
-        // Both streams' earlier frames stay alive throughout the native call;
-        // only the matching stream's frame is released once it has returned.
-        submit(&mut next);
-        let slot = match next.frame.format().tier() {
+    fn submit(&mut self, sender: SendHandle, next: PendingVideo) -> Option<SubmittedVideo> {
+        let slot = match next.tier() {
             StreamTier::Program => &mut self.program,
             StreamTier::Preview => &mut self.preview,
         };
-        slot.replace(next).map(|earlier| earlier.frame)
+        // The other stream's frame stays in flight in its own slot.
+        let (displaced, synchronized) = slot.submit(sender, next);
+        displaced
+            .release(synchronized)
+            .map(PendingVideo::into_submitted)
     }
 
-    fn take(&mut self) -> UnsentVideo {
+    /// Both streams' frames, once their native sender has been destroyed.
+    fn into_unsent(self, destroyed: &Destroyed) -> UnsentVideo {
+        let release = |slot: InFlight<PendingVideo>| {
+            slot.into_released(destroyed)
+                .map(PendingVideo::into_submitted)
+        };
         UnsentVideo {
-            program: self.program.take().map(|pending| pending.frame),
-            preview: self.preview.take().map(|pending| pending.frame),
+            program: release(self.program),
+            preview: release(self.preview),
         }
     }
 }
@@ -625,9 +645,9 @@ impl PendingStreams {
 /// ```
 pub struct CompressedSender {
     // Declared first so that it is destroyed first: destroying the native
-    // sender is what ends the SDK's use of the pending frames. Its mode keeps
-    // any other owner, such as an advertiser registration, from keeping it
-    // alive after they are freed.
+    // sender is what ends the SDK's use of the pending frames. Its mode owns
+    // the native sender exclusively, so no other owner, such as an advertiser
+    // registration, can keep it alive after they are freed.
     sender: Sender<CompressedAttached>,
     pending: PendingStreams,
 }
@@ -645,7 +665,7 @@ impl CompressedSender {
     pub fn new(ndi: &Ndi, options: &SenderOptions) -> Result<Self> {
         let config = AdvancedConfig::or_empty(options.config.as_ref());
         Ok(Self {
-            sender: Sender::new_configured(ndi, options, &config)?.into_mode(),
+            sender: Sender::new_configured(ndi, options, &config)?,
             pending: PendingStreams::default(),
         })
     }
@@ -708,20 +728,9 @@ impl CompressedSender {
         if let Err(error) = frame.validate_for_send() {
             return Err(Rejected::new(error, frame));
         }
-        let (core, instance) = (self.sender.core(), self.instance());
         Ok(self
             .pending
-            .submit(PendingVideo::contiguous(frame), |next| {
-                let descriptor = next.descriptor();
-                // SAFETY: the sender is live. The SDK reads the video
-                // descriptor only during this call, so it may be a stack
-                // value. What it points to, the frame's bytes and metadata,
-                // belongs to the pending entry, which the sender keeps until
-                // the SDK has synchronized the frame: until the next
-                // asynchronous send on the same stream has returned, or the
-                // native sender has been destroyed.
-                unsafe { core.NDIlib_send_send_video_async_v2(instance, &descriptor) }
-            }))
+            .submit(self.sender.handle(), PendingVideo::Contiguous(frame)))
     }
 
     /// Send an audio frame and return when the SDK has finished with it.
@@ -780,22 +789,9 @@ impl CompressedSender {
             Ok(table) => table,
             Err(error) => return Err(Rejected::new(error, frame)),
         };
-        let instance = self.instance();
-        let (pending, scatter) = PendingVideo::scatter(frame, table);
-        Ok(self.pending.submit(pending, |next| {
-            let descriptor = next.descriptor();
-            // SAFETY: the sender is live. The SDK reads the video descriptor
-            // only during this call, so it may be a stack value. What the two
-            // descriptors point to, the frame's metadata and the scatter list
-            // at `scatter` with its pointer and size arrays and the blocks
-            // they name, belongs to the pending entry, which the sender keeps
-            // until the SDK has synchronized the frame: until the next
-            // asynchronous send on the same stream has returned, or the
-            // native sender has been destroyed.
-            native!(ScatterSend, table => unsafe {
-                table.NDIlib_send_send_video_scatter_async(instance, &descriptor, scatter)
-            })
-        }))
+        Ok(self
+            .pending
+            .submit(self.sender.handle(), PendingVideo::scatter(frame, table)))
     }
 
     /// Send an audio frame held in several blocks and return when the SDK has
@@ -824,12 +820,8 @@ impl CompressedSender {
     /// Destroying the native sender waits for the SDK to finish with every
     /// pending frame, without a timeout.
     pub fn close(self) -> UnsentVideo {
-        let Self {
-            sender,
-            mut pending,
-        } = self;
-        drop(sender);
-        pending.take()
+        let Self { sender, pending } = self;
+        pending.into_unsent(&in_flight::destroy(sender))
     }
 }
 
@@ -1083,21 +1075,21 @@ mod tests {
     }
 
     /// The SDK reads an asynchronous send's video descriptor during the call,
-    /// so a submission retains what the descriptor points to and not the
-    /// descriptor: the frame, and for a scatter frame its scatter list.
+    /// so a submission lends what the descriptor points to and not the
+    /// descriptor: the frame, and for a scatter frame its scatter list, all of
+    /// which the pending entry owns.
     #[test]
-    fn async_submission_retains_what_the_descriptor_points_to() {
+    fn async_submission_lends_what_the_pending_entry_owns() {
         let (format, bytes) = h264();
         let frame = CompressedVideoFrame::new(format, bytes.clone()).unwrap();
         let data = frame.data().as_ptr();
-        let mut streams = PendingStreams::default();
-        let (returned, allocations) = crate::test_alloc::allocation_count(|| {
-            streams.submit(PendingVideo::contiguous(frame), |next| {
-                assert_eq!(next.descriptor().p_data.cast_const(), data);
-            })
-        });
-        assert!(returned.is_none());
+        let mut pending = PendingVideo::Contiguous(frame);
+        let (lent, allocations) = crate::test_alloc::allocation_count(|| pending.lend());
         assert_eq!(allocations, 0);
+        let Lent::Frame(descriptor) = lent else {
+            panic!("a contiguous frame is lent through one descriptor");
+        };
+        assert_eq!(descriptor.p_data.cast_const(), data);
 
         let Some(ndi) = crate::test_support::advanced_ndi() else {
             return;
@@ -1106,62 +1098,63 @@ mod tests {
         let frame = ScatterVideoFrame::new(format, split(&bytes, &[44])).unwrap();
         let pointers = frame.storage.pointers.as_ptr().cast::<*const u8>();
         let sizes = frame.storage.sizes.as_ptr().cast::<i32>();
-        let ((pending, scatter), allocations) =
+        let (mut pending, allocations) =
             crate::test_alloc::allocation_count(|| PendingVideo::scatter(frame, table));
         // The scatter list is the only new allocation: its arrays belong to
         // the frame.
         assert_eq!(allocations, 1);
-        let mut streams = PendingStreams::default();
-        assert!(streams.submit(pending, |_| {}).is_none());
-        assert!(streams.program.is_some());
-        // Moving the entry into its stream leaves the list where the SDK was
-        // told it is, still naming the frame's arrays.
+        let Lent::Scatter { scatter, .. } = pending.lend() else {
+            panic!("a scatter frame is lent with its scatter list");
+        };
+        // Moving the entry, as its stream's slot does, leaves the list where
+        // the SDK was told it is, still naming the frame's arrays.
+        let mut moved = Box::new(pending);
+        let Lent::Scatter { scatter: after, .. } = moved.lend() else {
+            panic!("a scatter frame is lent with its scatter list");
+        };
+        assert_eq!(after, scatter);
         native!(ScatterSend, table => {
-            // SAFETY: the stream retains the entry, which owns the list.
+            // SAFETY: the moved entry owns the list.
             let list = unsafe { &*scatter };
             assert_eq!(list.p_data_blocks.cast::<*const u8>(), pointers);
             assert_eq!(list.p_data_blocks_size.cast::<i32>(), sizes);
         });
     }
 
+    /// Each stream keeps its own frame in flight: a submission hands back the
+    /// earlier frame of its own stream, the very allocation the SDK was lent,
+    /// and closing hands back the frame each stream still held.
     #[test]
-    fn async_storage_is_retained_per_tier_through_native_submission() {
-        let (format, bytes) = h264();
-        let make = |tier| {
-            PendingVideo::contiguous(
-                CompressedVideoFrame::new(format.with_tier(tier), bytes.clone()).unwrap(),
-            )
+    fn async_frames_are_retained_per_stream_until_synchronized() {
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
         };
-        let mut streams = PendingStreams::default();
-        let mut old_program_data = ptr::null_mut();
-        assert!(streams
-            .submit(make(StreamTier::Program), |next| {
-                old_program_data = next.descriptor().p_data;
-            })
-            .is_none());
-        assert!(streams
-            .submit(make(StreamTier::Preview), |_| {
-                // The earlier program bytes survive both moving their owner
-                // and a preview submission, as the SDK requires of what an
-                // asynchronous frame accesses, and the SDK can still write to
-                // them. The descriptor itself is not kept: the SDK read it
-                // during its call.
-                unsafe { old_program_data.add(24).write(9) };
-            })
-            .is_none());
-        let returned = streams.submit(make(StreamTier::Program), |_| {}).unwrap();
-        assert_eq!(returned.format().tier(), StreamTier::Program);
+        let (format, bytes) = h264();
+        let make = |tier| CompressedVideoFrame::new(format.with_tier(tier), bytes.clone()).unwrap();
+        let options = SenderOptions::new(crate::test_support::unique_name("Per-stream retention"))
+            .clock_video(false);
+        let mut sender = CompressedSender::new(&ndi, &options).unwrap();
+        let program = make(StreamTier::Program);
+        let program_data = program.data().as_ptr();
+        assert!(sender.send_video_async(program).unwrap().is_none());
+        // A preview submission leaves the program frame in flight.
+        let preview = sender.send_video_async(make(StreamTier::Preview));
+        assert!(preview.unwrap().is_none());
+        assert!(sender.pending.program.is_in_flight());
+        let returned = sender
+            .send_video_async(make(StreamTier::Program))
+            .unwrap()
+            .unwrap();
         let SubmittedVideo::Contiguous(returned) = returned else {
             panic!("a contiguous frame was submitted");
         };
-        // The same allocation the SDK was lent comes back.
-        assert_eq!(returned.data().as_ptr(), old_program_data.cast_const());
-        assert_eq!(returned.data()[24], 9);
+        assert_eq!(returned.format().tier(), StreamTier::Program);
+        assert_eq!(returned.data().as_ptr(), program_data);
+        // The SDK may have stamped the reserved field, and nothing else.
         assert_eq!(returned.data()[..24], bytes[..24]);
-        assert_eq!(returned.data()[25..], bytes[25..]);
+        assert_eq!(returned.data()[32..], bytes[32..]);
         returned.validate_for_send().unwrap();
-        assert!(streams.preview.is_some());
-        let unsent = streams.take();
+        let unsent = sender.close();
         assert_eq!(unsent.program.unwrap().format().tier(), StreamTier::Program);
         assert_eq!(unsent.preview.unwrap().format().tier(), StreamTier::Preview);
     }
