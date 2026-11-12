@@ -866,6 +866,10 @@ pub(crate) fn is_framesync_video_empty(frame: &NDIlib_video_frame_v2_t) -> bool 
         && frame.frame_format_type == 0
         && frame.timecode == 0
         && frame.p_data.is_null()
+        // SAFETY: both members of the descriptor's union are `int`s at the
+        // same offset, so reading either one reads the four bytes the SDK
+        // wrote as a valid `i32`. The SDK's zeroed "no video" state has zero
+        // there whichever member `Processing.NDI.structs.h` makes it.
         && unsafe { frame.__bindgen_anon_1.data_size_in_bytes } == 0
         && frame.p_metadata.is_null()
         && frame.timestamp == 0

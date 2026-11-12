@@ -2130,6 +2130,9 @@ pub(crate) unsafe fn validate_metadata_layout(
         // The SDK permits zero length as a C-string sentinel. Apply the same
         // bounded scan and SDK pointer-validity contract as per-frame metadata;
         // a non-null pointer validates to `Some`.
+        // SAFETY: the caller keeps a non-null `p_data` of zero length
+        // readable up to its first NUL or the metadata cap, and unchanged,
+        // while `raw` is borrowed.
         return unsafe { validate_frame_metadata(raw.p_data) };
     }
 
@@ -2870,7 +2873,11 @@ pub(crate) fn validate_video_frame(
 
     let header = VideoHeader::from_sdk(raw)?;
     let pixel_format = PixelFormat::try_from(FourCc::from_raw(raw.FourCC))?;
-    // SAFETY: an uncompressed frame's union holds its line stride.
+    // SAFETY: both members of the descriptor's union are `int`s at the same
+    // offset, so reading either one reads the four bytes the SDK or the
+    // caller wrote as a valid `i32`. `Processing.NDI.structs.h` makes the
+    // member the line stride for a FourCC that is not a compressed type, and
+    // `PixelFormat::try_from` just accepted an uncompressed format.
     let line_stride = unsafe { raw.__bindgen_anon_1.line_stride_in_bytes };
     let layout = ValidatedVideoLayout::from_sdk(pixel_format, raw.xres, raw.yres, line_stride)?;
     Ok((layout, header))
@@ -3388,6 +3395,11 @@ pub(crate) fn validate_audio_layout(raw: &NDIlib_audio_frame_v3_t) -> Result<Val
         validate_positive_audio_counts(raw.no_channels.into(), raw.no_samples.into())?;
 
     let format = validate_audio_format(raw.FourCC)?;
+    // SAFETY: both members of the descriptor's union are `int`s at the same
+    // offset, so reading either one reads the four bytes the SDK or the
+    // caller wrote as a valid `i32`. `Processing.NDI.structs.h` makes the
+    // member the channel stride for planar audio that is not compressed, and
+    // `validate_audio_format` just accepted FLTP, the planar float format.
     let channel_stride_in_bytes = unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes };
     let channel_stride_bytes = usize::try_from(channel_stride_in_bytes)
         .ok()
@@ -3489,6 +3501,11 @@ pub(crate) fn validate_returned_audio(raw: &NDIlib_audio_frame_v3_t) -> Result<R
         )));
     }
 
+    // SAFETY: both members of the descriptor's union are `int`s at the same
+    // offset, so reading either one reads the four bytes the SDK wrote as a
+    // valid `i32`, whichever member `Processing.NDI.structs.h` makes it for
+    // this FourCC. Audio without samples has neither a channel stride nor a
+    // buffer size, so the value must be zero whatever its meaning.
     let channel_stride_in_bytes = unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes };
     if channel_stride_in_bytes != 0 {
         return Err(Error::InvalidFrame(format!(
@@ -4290,6 +4307,7 @@ impl<'rx> AudioRef<'rx, AudioKind> {
     /// The caller must ensure the guard was created from a valid NDI receiver
     /// and contains a frame populated by `NDIlib_recv_capture_v3`.
     pub(crate) unsafe fn new(guard: RecvAudioGuard<'rx>) -> Result<Self> {
+        // SAFETY: forwarded to the caller.
         unsafe { Self::from_guard(guard) }
     }
 }
@@ -4304,6 +4322,7 @@ impl<'fs> AudioRef<'fs, FrameSyncAudioFree> {
     /// instance and contains a frame populated by
     /// `NDIlib_framesync_capture_audio_v2` with a capture request.
     pub(crate) unsafe fn new(guard: Guard<'fs, FrameSyncAudioFree>) -> Result<Self> {
+        // SAFETY: forwarded to the caller.
         unsafe { Self::from_guard(guard) }
     }
 }
