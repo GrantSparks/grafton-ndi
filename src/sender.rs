@@ -4,7 +4,7 @@ use std::{
     ffi::{CStr, CString},
     fmt, ptr,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use crate::{
@@ -15,6 +15,7 @@ use crate::{
     },
     receiver::Tally,
     sys::{self, bindings::*},
+    timeout::Deadline,
     to_ms_checked, Error, Result, NDI,
 };
 
@@ -679,9 +680,8 @@ impl Sender {
     /// metadata captures and does not block the video-send synchronization lock.
     pub fn capture_metadata(&self, timeout: Duration) -> Result<Option<MetadataFrame>> {
         let metadata = self._ndi.table::<sys::SenderMetadata>()?;
-        let _ = to_ms_checked(timeout)?;
-        let started = Instant::now();
-        let Some(_lock) = self.inner.metadata_capture.try_lock_for(timeout) else {
+        let deadline = Deadline::after(timeout)?;
+        let Some(_lock) = self.inner.metadata_capture.try_lock_until(deadline.end()) else {
             return Ok(None);
         };
         let mut raw = NDIlib_metadata_frame_t {
@@ -689,7 +689,7 @@ impl Sender {
             timecode: 0,
             p_data: ptr::null_mut(),
         };
-        let remaining = to_ms_checked(timeout.saturating_sub(started.elapsed()))?;
+        let remaining = deadline.remaining_ms();
         // SAFETY: the sender instance is live for this borrow and `raw` is
         // writable storage for one metadata descriptor.
         let kind =

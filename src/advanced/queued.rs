@@ -10,7 +10,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Condvar, Mutex,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use super::{AdvancedConfig, CompressedVideoFrame};
@@ -20,6 +20,7 @@ use crate::{
         advanced::{native, SendCompletion},
         bindings::*,
     },
+    timeout::Deadline,
     Error, Rejected, Result, Sender, SenderOptions, Source, VideoFrame, NDI,
 };
 
@@ -518,8 +519,7 @@ impl QueuedSender {
     /// [`crate::MAX_TIMEOUT`] or the queue has failed (see
     /// [`completion_protocol_failed`](Self::completion_protocol_failed)).
     pub fn wait_completed(&mut self, timeout: Duration) -> Result<Option<CompletedVideo>> {
-        crate::to_ms_checked(timeout)?;
-        let start = Instant::now();
+        let deadline = Deadline::after(timeout)?;
         let mut state = self
             .callback
             .state
@@ -534,12 +534,10 @@ impl QueuedSender {
                     "native completion protocol failed".into(),
                 ));
             }
-            let Some(remaining) = timeout
-                .checked_sub(start.elapsed())
-                .filter(|v| !v.is_zero())
-            else {
+            let remaining = deadline.remaining();
+            if remaining.is_zero() {
                 return Ok(None);
-            };
+            }
             let (next, _) = self
                 .callback
                 .changed
