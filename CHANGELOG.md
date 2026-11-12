@@ -244,6 +244,14 @@ as `None`. Most programs need changes; see the
 
 ### Added
 
+- `AsyncReceiver::receiver` lends the wrapped `Receiver` for its controls:
+  tally, PTZ, upstream and connection metadata, delays, `web_control_url` and
+  `source`. `AsyncReceiver::poll_event`, `poll_source_name_change`,
+  `connect_to` and `disconnect` are the async versions of the `Receiver`
+  methods of the same names, on the runtime's blocking pool, with their
+  errors and `Error::SpawnFailed`; `disconnect` therefore returns
+  `Result<()>`. The two polls' timeouts start when the future is first polled
+  and include blocking-pool queue delay, as `AsyncCapture::capture`'s does.
 - `Sender::send_video` takes a `BorrowedVideoFrame`, by value or by reference,
   as well as `&VideoFrame`, and sends it in place: a borrowed buffer, including
   one with padded rows, is sent without being copied, and can be reused when
@@ -419,6 +427,9 @@ as `None`. Most programs need changes; see the
 
 ### Fixed
 
+- A status or source change that an `AsyncReceiver` capture passed over was
+  kept for `Receiver::poll_event`, which async code could not reach, so it was
+  never read. `AsyncReceiver::poll_event` returns it.
 - An unchanged Cargo invocation no longer rebuilds the crate and the crates
   that depend on it. In 2.0.0 the build script's own generated file was one of
   its inputs (#121).

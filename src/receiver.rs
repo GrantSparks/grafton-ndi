@@ -945,45 +945,8 @@ impl<M: ReceiverMode> Receiver<M> {
     /// not an error: invalid sequences are replaced with U+FFFD, as
     /// [`Finder`](crate::Finder) does for discovered source names.
     pub fn poll_source_name_change(&self, timeout: Duration) -> Result<Option<SourceNameChange>> {
-        let deadline = Deadline::after(timeout)?;
-        // The query comes with the function that releases what it returns.
-        let (source_name, strings) = self
-            .core
-            ._ndi
-            .table::<(sys::ReceiverSourceName, sys::ReceiverStrings)>()?;
-        self.poll_source_name_change_until(source_name, strings, deadline)
-    }
-
-    fn poll_source_name_change_until(
-        &self,
-        source_name: &sys::ReceiverSourceName,
-        strings: &sys::ReceiverStrings,
-        deadline: Deadline,
-    ) -> Result<Option<SourceNameChange>> {
-        let Some(_query) = self.core.source_query_guard.try_lock_until(deadline.end()) else {
-            return Ok(None);
-        };
-        let mut pointer = ptr::null();
-        let remaining = deadline.remaining_ms();
-        // SAFETY: the receiver instance is live for this borrow and `pointer` is
-        // writable storage for the returned string.
-        let changed = unsafe {
-            source_name.NDIlib_recv_get_source_name(self.core.instance, &mut pointer, remaining)
-        };
-        let guard = RecvStringGuard {
-            core: &self.core,
-            pointer,
-            strings,
-        };
-        if !changed {
-            return Ok(None);
-        }
-        // The SDK reports a change only once, since the previous call, so a
-        // strict decoding error here would lose the name for good.
-        Ok(Some(match guard.copy_lossy()? {
-            Some(name) => SourceNameChange::Connected(name),
-            None => SourceNameChange::Disconnected,
-        }))
+        self.core
+            .poll_source_name_change_until(Deadline::after(timeout)?)
     }
 
     /// Request a different native source without changing the original target.
@@ -1271,7 +1234,7 @@ impl<M: CaptureMode> Receiver<M> {
     /// (~49.7 days), and [`Error::CaptureFailed`] when the SDK reports a lost
     /// connection.
     pub fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
-        self.core.poll_event(timeout)
+        self.core.poll_event_until(Deadline::after(timeout)?)
     }
 
     /// Capture **audio** frames from this receiver.
@@ -1453,7 +1416,7 @@ impl ReceiverCore {
         }
     }
 
-    /// Keep a notification a capture reported for [`Self::poll_event`].
+    /// Keep a notification a capture reported for [`Self::poll_event_until`].
     fn retain(&self, notification: Notification) {
         match notification {
             Notification::None => {}
@@ -1476,14 +1439,67 @@ impl ReceiverCore {
             .map(ReceiverEvent::Unknown)
     }
 
-    /// [`Receiver::poll_event`]: event attempts in the one capture loop.
-    fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
-        capture_within(Deadline::after(timeout)?, |attempt| {
-            self.poll_event_once(attempt)
-        })
+    /// The one implementation of event polling, behind [`Receiver::poll_event`]
+    /// and the async receivers' `poll_event`: event attempts in the one
+    /// capture loop until `deadline` is spent, which may have started before
+    /// this call. An expired `deadline`, like a zero timeout, makes one
+    /// attempt without waiting.
+    pub(crate) fn poll_event_until(&self, deadline: Deadline) -> Result<Option<ReceiverEvent>> {
+        capture_within(deadline, |attempt| self.poll_event_once(attempt))
     }
 
-    /// One attempt of [`Self::poll_event`]: a pending event, or what one SDK
+    /// The one implementation of [`Receiver::poll_source_name_change`], also
+    /// behind the async receivers' version: wait until `deadline` for a
+    /// change of the connected source's name.
+    ///
+    /// The tables are resolved after the caller validated the timeout, so an
+    /// invalid timeout is reported before a missing capability.
+    pub(crate) fn poll_source_name_change_until(
+        &self,
+        deadline: Deadline,
+    ) -> Result<Option<SourceNameChange>> {
+        // The query comes with the function that releases what it returns.
+        let (source_name, strings) = self
+            ._ndi
+            .table::<(sys::ReceiverSourceName, sys::ReceiverStrings)>()?;
+        self.poll_source_name_change_with(source_name, strings, deadline)
+    }
+
+    /// [`Self::poll_source_name_change_until`] through the given tables, so
+    /// that a test can substitute the SDK functions.
+    fn poll_source_name_change_with(
+        &self,
+        source_name: &sys::ReceiverSourceName,
+        strings: &sys::ReceiverStrings,
+        deadline: Deadline,
+    ) -> Result<Option<SourceNameChange>> {
+        let Some(_query) = self.source_query_guard.try_lock_until(deadline.end()) else {
+            return Ok(None);
+        };
+        let mut pointer = ptr::null();
+        let remaining = deadline.remaining_ms();
+        // SAFETY: the receiver instance is live for this borrow and `pointer` is
+        // writable storage for the returned string.
+        let changed = unsafe {
+            source_name.NDIlib_recv_get_source_name(self.instance, &mut pointer, remaining)
+        };
+        let guard = RecvStringGuard {
+            core: self,
+            pointer,
+            strings,
+        };
+        if !changed {
+            return Ok(None);
+        }
+        // The SDK reports a change only once, since the previous call, so a
+        // strict decoding error here would lose the name for good.
+        Ok(Some(match guard.copy_lossy()? {
+            Some(name) => SourceNameChange::Connected(name),
+            None => SourceNameChange::Disconnected,
+        }))
+    }
+
+    /// One attempt of [`Self::poll_event_until`]: a pending event, or what one SDK
     /// capture without media slots reports within `attempt`.
     ///
     /// A pending event is taken before waiting for the guard, so that it is
@@ -2401,7 +2417,7 @@ mod tests {
         let poll = |changed, name: Option<&[u8]>| {
             NEXT.with(|next| *next.borrow_mut() = (changed, name.map(<[u8]>::to_vec)));
             let before = FREES.load(Ordering::Relaxed);
-            let change = receiver.poll_source_name_change_until(
+            let change = receiver.core.poll_source_name_change_with(
                 &source_name,
                 &strings,
                 Deadline::after(Duration::ZERO).unwrap(),

@@ -178,7 +178,8 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
         #[cfg(feature = "tokio")]
         let receiver = {
             use grafton_ndi::asynchronous::tokio::AsyncReceiver;
-            // Use a separate receiver because AsyncReceiver retains its owner.
+            // Use a separate receiver: AsyncReceiver keeps the receiver it
+            // wraps, and FrameSync::new below takes this one by value.
             let async_receiver =
                 AsyncReceiver::new(self::receiver(&ndi, receiver.source().clone()));
             let runtime = tokio::runtime::Runtime::new().unwrap();

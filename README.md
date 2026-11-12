@@ -398,17 +398,23 @@ if ptz.is_supported() {
 
 ### Integrate With Async Runtimes
 
-NDI receive calls are fundamentally blocking SDK calls. The optional async wrappers make that explicit by running receive work on the runtime's blocking pool while preserving the timeout budget from the future's first poll. `capture` includes blocking-pool queue delay and reconnect-lock contention in the same deadline, and returns `None` only once all of it is spent. Dropping a future suppresses work before its cancellation gate; a task that has passed that gate cannot be interrupted and may still consume a frame, even if it is waiting for the reconnect lock. Queued work can still finish after the budget expires; these wrappers do not impose a wall-clock completion deadline.
+NDI receive calls are fundamentally blocking SDK calls. The optional async wrappers make that explicit by running receive work on the runtime's blocking pool while preserving the timeout budget from the future's first poll. `capture`, `poll_event` and `poll_source_name_change` include blocking-pool queue delay and reconnect-lock contention in the same deadline, and return `None` only once all of it is spent. Dropping a future suppresses work before its cancellation gate; a task that has passed that gate cannot be interrupted and may still consume a frame or an event, even if it is waiting for the reconnect lock. Queued work can still finish after the budget expires; these wrappers do not impose a wall-clock completion deadline.
 
 `grafton_ndi::asynchronous::AsyncReceiver<R>` and its `AsyncCapture` views are generic over the runtime, `Tokio` or `Smol` (one per Cargo feature); `asynchronous::tokio` and `asynchronous::smol` name them for one runtime.
 
+A status or source change that an async capture passes over is kept for `poll_event`, as for the synchronous receiver. `connect_to`, `disconnect` and `reconnect` wait for the capture attempts in flight, so they run on the blocking pool too. `receiver()` lends the wrapped `Receiver` for the controls that do not wait, such as tally, PTZ and upstream metadata; its waiting calls block the calling thread, so use the async methods for those.
+
 ```rust
-use grafton_ndi::asynchronous::tokio::AsyncReceiver;
+use grafton_ndi::{asynchronous::tokio::AsyncReceiver, ReceiverEvent, Tally};
 use std::time::Duration;
 
 let async_receiver = AsyncReceiver::new(receiver);
+async_receiver.receiver().set_tally(Tally::new(true, false));
 if let Some(frame) = async_receiver.video().capture(Duration::from_secs(5)).await? {
     println!("{}x{}", frame.width(), frame.height());
+}
+if let Some(ReceiverEvent::StatusChanged(status)) = async_receiver.poll_event(Duration::ZERO).await? {
+    println!("Active connections: {}", status.connections());
 }
 ```
 
