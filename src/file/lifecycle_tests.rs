@@ -4,7 +4,7 @@ use super::{
     mock::{self, Closing, FILE_CLOSED, ROLLOVER, TAKE},
     *,
 };
-use crate::{sys, MediaTypes};
+use crate::{sys, timeout::Deadline, MediaTypes};
 use std::{
     cell::Cell,
     sync::{atomic::Ordering, Arc},
@@ -493,14 +493,17 @@ fn malformed_player_options_are_refused_before_the_sdk_creates_a_player() {
         },
         mock::recording(),
     );
+    assert!(matches!(
+        api.create_player(&PlayerOptions::new("")),
+        Err(Error::InvalidInput(_))
+    ));
     for options in [
-        PlayerOptions::new(""),
         PlayerOptions::new("mock\0player"),
         PlayerOptions::new("mock player").groups("a\0b"),
     ] {
         assert!(matches!(
             api.create_player(&options),
-            Err(Error::InvalidInput(_))
+            Err(Error::InvalidCString(_))
         ));
     }
     assert_eq!(PLAYER_CREATES.get(), 0);
@@ -656,13 +659,65 @@ fn a_wait_that_ends_during_a_slow_stop_still_takes_the_queued_close() {
     let mut recorder = recording_on(&device);
     // As the async recorder waits: from before the stop, which outlasts the
     // wait.
-    let started = Instant::now();
+    let deadline = Deadline::after(Duration::from_millis(10)).unwrap();
     recorder.request_stop();
-    assert!(started.elapsed() > Duration::from_millis(10));
-    let outcome = recorder
-        .wait_finished_from(started, Duration::from_millis(10), |_| false)
-        .unwrap();
+    assert!(deadline.is_expired());
+    let outcome = recorder.wait_finished_from(deadline, |_| false).unwrap();
     assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+}
+
+#[test]
+fn finish_starts_its_wait_once_the_stop_has_returned() {
+    // The stop alone outlasts the wait, and the close comes after it: only a
+    // wait that starts after the stop sees it.
+    let device = mock::Recorder::new(Closing::AfterSlowStop(
+        Duration::from_millis(300),
+        Duration::from_millis(50),
+    ));
+    let mut recorder = recording_on(&device);
+    let outcome = recorder.finish(Duration::from_millis(250)).unwrap();
+    assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
+}
+
+#[test]
+fn a_timeout_out_of_range_is_refused_before_the_stop() {
+    let device = mock::Recorder::new(Closing::AtStop);
+    let mut recorder = recording_on(&device);
+    let too_long = crate::MAX_TIMEOUT + Duration::from_nanos(1);
+    for result in [recorder.finish(too_long), recorder.wait_finished(too_long)] {
+        assert!(
+            matches!(&result, Err(Error::InvalidInput(reason)) if reason.contains("MAX_TIMEOUT")),
+            "{result:?}"
+        );
+    }
+    assert_eq!(device.stops.load(Ordering::Acquire), 0);
+    assert_eq!(recorder.state(), RecorderState::Recording);
+    assert!(matches!(
+        recorder.finish(crate::MAX_TIMEOUT).unwrap(),
+        FinishStatus::Closed(_)
+    ));
+}
+
+#[test]
+fn injected_metadata_reaches_the_sdk_as_the_frames_own_text() {
+    let device = mock::Recorder::new(Closing::AtStop);
+    let mut recorder = recording_on(&device);
+    let metadata = crate::MetadataFrame::new("<marker cue=\"intro\"/>")
+        .unwrap()
+        .with_timecode(crate::Timecode::from_ticks(1_234));
+    recorder.inject_metadata(&metadata).unwrap();
+    let injected = device.injected.lock().unwrap();
+    let [frame] = injected.as_slice() else {
+        panic!("one frame was injected, not {}", injected.len());
+    };
+    // The frame's own storage, not a copy made for the call.
+    assert_eq!(frame.address, metadata.data().as_ptr() as usize);
+    assert_eq!(
+        usize::try_from(frame.length).unwrap(),
+        metadata.data().len() + 1
+    );
+    assert_eq!(frame.bytes, b"<marker cue=\"intro\"/>\0");
+    assert_eq!(frame.timecode, 1_234);
 }
 
 #[test]

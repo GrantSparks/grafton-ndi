@@ -87,11 +87,18 @@ impl std::fmt::Display for StateError {
     }
 }
 
+/// `value` as a C string for the SDK.
+///
+/// # Errors
+///
+/// [`Error::InvalidInput`] naming `what` when `value` is empty and
+/// `allow_empty` is false, and [`Error::InvalidCString`] when it contains a
+/// NUL.
 fn cstring(value: &str, what: &str, allow_empty: bool) -> Result<CString> {
     if !allow_empty && value.is_empty() {
         return Err(Error::InvalidInput(format!("{what} must not be empty")));
     }
-    CString::new(value).map_err(|_| Error::InvalidInput(format!("{what} contains an embedded NUL")))
+    Ok(CString::new(value)?)
 }
 
 /// An owned source name or direct URL used by a recorder.
@@ -109,7 +116,8 @@ impl SourceSpec {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`] when the name is empty or contains a NUL.
+    /// [`Error::InvalidInput`] when the name is empty, and
+    /// [`Error::InvalidCString`] when it contains a NUL.
     pub fn new(name: impl AsRef<str>) -> Result<Self> {
         Ok(Self {
             name: Some(cstring(name.as_ref(), "source name", false)?),
@@ -122,7 +130,8 @@ impl SourceSpec {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`] when the address is empty or contains a NUL.
+    /// [`Error::InvalidInput`] when the address is empty, and
+    /// [`Error::InvalidCString`] when it contains a NUL.
     pub fn from_url(url: impl AsRef<str>) -> Result<Self> {
         Ok(Self {
             name: None,
@@ -199,8 +208,8 @@ impl PlayerOptions {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`] when the name is empty, or the name or the
-    /// groups contain a NUL.
+    /// [`Error::InvalidInput`] when the name is empty, and
+    /// [`Error::InvalidCString`] when the name or the groups contain a NUL.
     pub(super) fn resolve(&self) -> Result<ResolvedPlayerOptions> {
         Ok(ResolvedPlayerOptions {
             name: cstring(&self.name, "player name", false)?,
@@ -270,9 +279,9 @@ pub enum FileNaming {
     /// A pattern without `{index}` or `{index:N}` names its file exactly,
     /// with every rule of [`Exact`](Self::Exact).
     ///
-    /// A pattern that is empty, has an unknown token or unbalanced braces, or
-    /// contains a NUL is refused with [`Error::InvalidInput`] when the
-    /// recorder is created.
+    /// A pattern that is empty, or has an unknown token or unbalanced braces,
+    /// is refused with [`Error::InvalidInput`] when the recorder is created,
+    /// and one that contains a NUL with [`Error::InvalidCString`].
     Pattern(String),
 }
 
@@ -415,7 +424,8 @@ impl RecorderOptions {
     /// [`Error::InvalidInput`] when the drop wait exceeds
     /// [`crate::MAX_TIMEOUT`], the track selection is empty, the filename
     /// pattern is malformed, or an exact file name is combined with a
-    /// rollover.
+    /// rollover, and [`Error::InvalidCString`] when the filename pattern
+    /// contains a NUL.
     pub(super) fn resolve(&self) -> Result<ResolvedRecorderOptions> {
         crate::to_ms_checked(self.drop_wait)?;
         if self.tracks.is_empty() {
@@ -621,8 +631,7 @@ fn check_directory(directory: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        let path = CString::new(directory.as_os_str().as_bytes())
-            .map_err(|_| Error::InvalidInput("the recording directory contains a NUL".into()))?;
+        let path = CString::new(directory.as_os_str().as_bytes())?;
         // SAFETY: `path` is a NUL-terminated string that outlives the call.
         if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
             return Err(refuse(
@@ -650,9 +659,10 @@ impl RecordingTarget {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`] when the path is empty, is not UTF-8 or
-    /// contains a NUL, and [`Error::Io`] when a relative path cannot be
-    /// resolved because the current directory is unavailable.
+    /// [`Error::InvalidInput`] when the path is empty or is not UTF-8,
+    /// [`Error::InvalidCString`] when it contains a NUL, and [`Error::Io`]
+    /// when a relative path cannot be resolved because the current directory
+    /// is unavailable.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let (path, prefix) = resolve_path(path.as_ref(), "recording target")?;
         Ok(Self { prefix, path })
@@ -670,9 +680,10 @@ impl RecordingTarget {
 ///
 /// # Errors
 ///
-/// [`Error::InvalidInput`] when the path is empty, is not UTF-8 or
-/// contains a NUL, and [`Error::Io`] when a relative path cannot be
-/// resolved because the current directory is unavailable.
+/// [`Error::InvalidInput`] naming `what` when the path is empty or is not
+/// UTF-8, [`Error::InvalidCString`] when it contains a NUL, and
+/// [`Error::Io`] when a relative path cannot be resolved because the current
+/// directory is unavailable.
 pub(super) fn resolve_path(path: &Path, what: &str) -> Result<(PathBuf, CString)> {
     if path.as_os_str().is_empty() {
         return Err(Error::InvalidInput(format!("{what} must not be empty")));
@@ -1471,6 +1482,14 @@ mod tests {
         }
     }
 
+    /// Where the NUL that `result` was refused for is, in bytes.
+    fn nul_position<T: std::fmt::Debug>(result: Result<T>) -> usize {
+        match result {
+            Err(Error::InvalidCString(error)) => error.nul_position(),
+            other => panic!("expected InvalidCString, got {other:?}"),
+        }
+    }
+
     #[test]
     fn path_errors_name_what_the_path_is() {
         let empty = Path::new("");
@@ -1482,14 +1501,28 @@ mod tests {
             invalid_text(RecordingTarget::new(empty)),
             "recording target must not be empty"
         );
+    }
+
+    #[test]
+    fn a_nul_in_any_string_for_the_sdk_is_the_crates_c_string_error() {
         let nul = Path::new("/take\0.mkv");
+        assert_eq!(nul_position(path_string(nul)), 5);
+        assert_eq!(nul_position(RecordingTarget::new(nul)), 5);
+        assert_eq!(nul_position(SourceSpec::new("cam\0era")), 3);
+        assert_eq!(nul_position(SourceSpec::from_url("url\0tail")), 3);
+        assert_eq!(nul_position(PlayerOptions::new("Re\0play").resolve()), 2);
         assert_eq!(
-            invalid_text(path_string(nul)),
-            "file path contains an embedded NUL"
+            nul_position(PlayerOptions::new("Replay").groups("a\0b").resolve()),
+            1
         );
+        let pattern = FileNaming::Pattern("{prefix}\0_{index}.mkv".into());
         assert_eq!(
-            invalid_text(RecordingTarget::new(nul)),
-            "recording target contains an embedded NUL"
+            nul_position(
+                RecorderOptions::new(SourceSpec::new("camera").unwrap())
+                    .naming(pattern)
+                    .resolve()
+            ),
+            8
         );
     }
 
@@ -1541,14 +1574,6 @@ mod tests {
         assert_eq!(
             invalid_text(PlayerOptions::new("").resolve()),
             "player name must not be empty"
-        );
-        assert_eq!(
-            invalid_text(PlayerOptions::new("Re\0play").resolve()),
-            "player name contains an embedded NUL"
-        );
-        assert_eq!(
-            invalid_text(PlayerOptions::new("Replay").groups("a\0b").resolve()),
-            "player groups contains an embedded NUL"
         );
     }
 
@@ -1611,7 +1636,6 @@ mod tests {
             "{unknown}",
             "{index:0}",
             "{index:2000}",
-            "a\0b",
         ] {
             assert!(
                 matches!(

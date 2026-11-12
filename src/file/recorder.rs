@@ -1,12 +1,6 @@
 //! Recording an NDI source to disk, with explicit finalization.
 
-use std::{
-    ffi::CString,
-    marker::PhantomData,
-    ptr::NonNull,
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{ffi::CString, marker::PhantomData, ptr::NonNull, rc::Rc, time::Duration};
 
 use super::{
     out_param::OutParam,
@@ -16,6 +10,7 @@ use super::{
 };
 use crate::{
     sys::{self, bindings::*},
+    timeout::Deadline,
     Error, MediaTypes, Result,
 };
 
@@ -615,8 +610,16 @@ impl FileRecorder {
     /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`],
     /// and [`Error::UnexpectedSdkResult`] when the SDK's event is malformed.
     pub fn poll_event(&mut self, timeout: Duration) -> Result<Option<RecorderEvent>> {
-        let timeout = crate::to_ms_checked(timeout)?;
-        let event = self.capture(timeout);
+        self.poll_event_ms(crate::to_ms_checked(timeout)?)
+    }
+
+    /// [`poll_event`](Self::poll_event), waiting up to `wait_ms` milliseconds.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnexpectedSdkResult`] when the SDK's event is malformed.
+    fn poll_event_ms(&mut self, wait_ms: u32) -> Result<Option<RecorderEvent>> {
+        let event = self.capture(wait_ms);
         self.ledger.dropped(self.dropped_event_count());
         let Some(event) = event.inspect_err(|_| self.ledger.uncertain = true)? else {
             self.ledger.drained(self.is_recording());
@@ -670,20 +673,23 @@ impl FileRecorder {
     /// records it, and the wait goes on. One that could not be read at all
     /// makes the outcome [`FinishStatus::Indeterminate`] rather than an error.
     ///
-    /// The wait covers taking the closure's event, not the stop itself, which
-    /// the SDK may carry out before it returns. Events already queued are
-    /// taken even when the wait is over, so `finish(Duration::ZERO)` reports
-    /// [`FinishStatus::Closed`] when the SDK finalized the file during the
-    /// stop.
+    /// The wait starts once the stop has returned, and covers taking the
+    /// closure's event, not the stop itself, which the SDK may carry out
+    /// before it returns. Events already queued are taken even when the wait
+    /// is over, so `finish(Duration::ZERO)` reports [`FinishStatus::Closed`]
+    /// when the SDK finalized the file during the stop.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`],
-    /// and [`Error::InvalidState`] with
+    /// without requesting the stop, and [`Error::InvalidState`] with
     /// [`StateError::StopNotRequested`] when no session was started. Neither
     /// is returned once the wait has begun: whatever the SDK's events hold,
     /// the outcome is a [`FinishStatus`].
     pub fn finish(&mut self, timeout: Duration) -> Result<FinishStatus> {
+        // Checked here, so that a timeout out of range leaves the session
+        // recording; the budget itself starts after the stop, in
+        // `wait_finished`.
         crate::to_ms_checked(timeout)?;
         self.request_stop();
         self.wait_finished(timeout)
@@ -705,10 +711,10 @@ impl FileRecorder {
     /// session has not been asked to stop. Neither is returned once the wait
     /// has begun.
     pub fn wait_finished(&mut self, timeout: Duration) -> Result<FinishStatus> {
-        self.wait_finished_from(Instant::now(), timeout, |_| false)
+        self.wait_finished_from(Deadline::after(timeout)?, |_| false)
     }
 
-    /// Wait until `timeout` after `started` for a stopping session to end.
+    /// Wait for a stopping session to end, until `deadline` is spent.
     ///
     /// `each` is called after every poll with what the poll returned,
     /// including a malformed event's error, and ends the wait early by
@@ -719,13 +725,16 @@ impl FileRecorder {
     /// Once the deadline has passed, events already queued are still taken,
     /// without waiting, until the queue is found empty: the deadline may have
     /// passed during the native stop, after the closure was reported.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidState`] with [`StateError::StopNotRequested`] when no
+    /// session was started or the session has not been asked to stop.
     pub(super) fn wait_finished_from(
         &mut self,
-        started: Instant,
-        timeout: Duration,
+        deadline: Deadline,
         mut each: impl FnMut(Result<Option<RecorderEvent>>) -> bool,
     ) -> Result<FinishStatus> {
-        crate::to_ms_checked(timeout)?;
         if matches!(self.state(), RecorderState::Idle | RecorderState::Recording) {
             return Err(Error::InvalidState(StateError::StopNotRequested));
         }
@@ -739,30 +748,31 @@ impl FileRecorder {
                 }
                 _ => {}
             }
-            let remaining = timeout.saturating_sub(started.elapsed());
             if interrupted {
                 return Ok(FinishStatus::TimedOut(self.report()));
             }
-            if remaining.is_zero() {
+            // Read once, so that this poll and the check after it agree on
+            // whether it was a late one.
+            let expired = deadline.is_expired();
+            if expired {
                 if late_polls == STALE_EVENT_LIMIT {
                     return Ok(FinishStatus::TimedOut(self.report()));
                 }
                 late_polls += 1;
             }
             // With every file closed, one empty poll settles the outcome.
-            let budget = remaining.min(if self.ledger.all_closed() {
+            let step = if self.ledger.all_closed() {
                 SETTLE_POLL
             } else {
                 FINISH_POLL
-            });
-            // `budget` is within `timeout`, which was checked above, so a failed
-            // poll is an event that was taken but could not be decoded, or
-            // could not be read at all. Either way its effect is already in
-            // the ledger, which the loop goes on to settle.
-            let polled = self.poll_event(budget);
+            };
+            // A failed poll is an event that was taken but could not be
+            // decoded, or could not be read at all. Either way its effect is
+            // already in the ledger, which the loop goes on to settle.
+            let polled = self.poll_event_ms(deadline.within(step).remaining_ms());
             let drained = matches!(polled, Ok(None));
             interrupted = each(polled);
-            if remaining.is_zero() && drained {
+            if expired && drained {
                 // The queue was empty and its state recorded: what it shows
                 // now is the outcome.
                 return Ok(match self.state() {
@@ -943,31 +953,27 @@ impl FileRecorder {
     /// Write a metadata frame into the recording at its current position.
     ///
     /// The frame's timecode is stored and re-published on playback; it does
-    /// not move the frame on the file's timeline.
+    /// not move the frame on the file's timeline. The frame's text is handed
+    /// to the SDK as it is, without a copy.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidState`] with [`StateError::NotRecording`] unless a
-    /// session is recording,
-    /// [`Error::InvalidInput`] when the metadata contains a NUL or is too
-    /// long, and [`Error::NativeOperationFailed`] when the SDK refuses it, for example
-    /// because the metadata track is not being recorded.
+    /// session is recording, and [`Error::NativeOperationFailed`] when the
+    /// SDK refuses it, for example because the metadata track is not being
+    /// recorded.
     pub fn inject_metadata(&mut self, metadata: &crate::MetadataFrame) -> Result<()> {
         if self.state() != RecorderState::Recording {
             return Err(Error::InvalidState(StateError::NotRecording));
         }
-        let data = CString::new(metadata.data())
-            .map_err(|_| Error::InvalidInput("the metadata contains a NUL".into()))?;
-        let length = i32::try_from(data.as_bytes_with_nul().len()).map_err(|_| {
-            Error::InvalidInput("the metadata is longer than the SDK can accept".into())
-        })?;
-        let frame = NDIlib_metadata_frame_t {
-            length,
-            timecode: metadata.timecode().ticks(),
-            p_data: data.as_ptr().cast_mut(),
-        };
-        // SAFETY: the recorder is live. The SDK copies the frame before it
-        // returns and does not write through `p_data`.
+        let frame = metadata.to_raw();
+        // SAFETY: the recorder is live. `frame.p_data` points to the
+        // NUL-terminated text that `metadata` owns, `frame.length` bytes with
+        // the terminator, within the crate's metadata cap. `metadata` is
+        // borrowed for the whole of this synchronous call, and
+        // `Processing.NDI.Lib.File.Recorder.h` has the SDK take the frame as
+        // `const` and copy the payload before returning, so it neither keeps
+        // nor writes through `p_data`.
         let injected = unsafe {
             self.recording
                 .NDIlib_file_recorder_inject_metadata(self.handle.as_ptr(), &frame)

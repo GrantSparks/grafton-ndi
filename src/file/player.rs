@@ -75,9 +75,9 @@ impl FilePlayer {
     ///
     /// # Errors
     ///
-    /// [`Error::NativeOperationFailed`] when the SDK cannot open the file, and
-    /// [`Error::InvalidInput`] when the path is empty, is not UTF-8 or
-    /// contains a NUL.
+    /// [`Error::NativeOperationFailed`] when the SDK cannot open the file,
+    /// [`Error::InvalidInput`] when the path is empty or is not UTF-8, and
+    /// [`Error::InvalidCString`] when it contains a NUL.
     pub fn start(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = types::path_string(path.as_ref())?;
         // SAFETY: the player is live and `path` is a NUL-terminated string

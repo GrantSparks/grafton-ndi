@@ -111,8 +111,20 @@ pub(super) enum Closing {
     /// Before the stop returns, which takes this long, as the 6.4 SDK's stop
     /// does while it finalizes a file.
     DuringSlowStop(std::time::Duration),
+    /// The second duration after a stop that itself takes the first.
+    AfterSlowStop(std::time::Duration, std::time::Duration),
     /// Never: the event is lost.
     Never,
+}
+
+/// A metadata frame as the wrapper handed it to the SDK.
+pub(super) struct InjectedFrame {
+    /// The address of its text: the wrapper's own storage, unless it copied.
+    pub(super) address: usize,
+    pub(super) length: i32,
+    pub(super) timecode: i64,
+    /// The `length` bytes at that address, read during the call.
+    pub(super) bytes: Vec<u8>,
 }
 
 /// A stand-in for the SDK's recorder: an event queue the test can feed, and a
@@ -132,6 +144,8 @@ pub(super) struct Recorder {
     pub(super) refuse_creation: std::sync::atomic::AtomicBool,
     /// How many rollovers the wrapper passed on.
     pub(super) rollovers: std::sync::atomic::AtomicUsize,
+    /// Every metadata frame the wrapper injected, in order.
+    pub(super) injected: std::sync::Mutex<Vec<InjectedFrame>>,
     /// How many native recorders were created from this one, and how many
     /// starts and changes of source the wrapper passed on.
     pub(super) creates: std::sync::atomic::AtomicUsize,
@@ -175,6 +189,7 @@ impl Recorder {
             fail_next_start: Default::default(),
             refuse_creation: Default::default(),
             rollovers: Default::default(),
+            injected: Default::default(),
             creates: Default::default(),
             starts: Default::default(),
             source_changes: Default::default(),
@@ -222,6 +237,15 @@ impl Recorder {
         self.recording
             .store(false, std::sync::atomic::Ordering::Release);
         self.push(FILE_CLOSED, TAKE);
+    }
+
+    /// [`close`](Self::close), `delay` from now, from a thread of its own.
+    fn close_after(self: &std::sync::Arc<Self>, delay: std::time::Duration) {
+        let recorder = std::sync::Arc::clone(self);
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            recorder.close();
+        });
     }
 
     /// The recorder behind a handle this module created.
@@ -342,16 +366,14 @@ unsafe extern "C" fn recorder_stop(handle: NDIlib_file_recorder_instance_t) {
     }
     match recorder.closing {
         Closing::AtStop => recorder.close(),
-        Closing::After(delay) => {
-            let recorder = std::sync::Arc::clone(recorder);
-            std::thread::spawn(move || {
-                std::thread::sleep(delay);
-                recorder.close();
-            });
-        }
+        Closing::After(delay) => recorder.close_after(delay),
         Closing::DuringSlowStop(delay) => {
             std::thread::sleep(delay);
             recorder.close();
+        }
+        Closing::AfterSlowStop(stop, delay) => {
+            std::thread::sleep(stop);
+            recorder.close_after(delay);
         }
         Closing::Never => recorder.recording.store(false, Ordering::Release),
     }
@@ -382,6 +404,26 @@ unsafe extern "C" fn recorder_rollover(
     true
 }
 
+unsafe extern "C" fn recorder_inject_metadata(
+    handle: NDIlib_file_recorder_instance_t,
+    frame: *const NDIlib_metadata_frame_t,
+) -> bool {
+    // SAFETY: the wrapper passes a live handle, and a frame that is valid for
+    // the call.
+    let (recorder, frame) = unsafe { (Recorder::from_handle(handle), &*frame) };
+    let length = usize::try_from(frame.length).expect("a length the SDK accepts");
+    // SAFETY: the wrapper's frame points to `length` readable bytes, its
+    // terminator included, for the call.
+    let bytes = unsafe { std::slice::from_raw_parts(frame.p_data.cast::<u8>(), length) };
+    recorder.injected.lock().unwrap().push(InjectedFrame {
+        address: frame.p_data as usize,
+        length: frame.length,
+        timecode: frame.timecode,
+        bytes: bytes.to_vec(),
+    });
+    true
+}
+
 unsafe extern "C" fn accept_source(
     handle: NDIlib_file_recorder_instance_t,
     _: *const NDIlib_file_recorder_source_t,
@@ -405,6 +447,7 @@ pub(super) fn recorder_api() -> super::FileApi {
             NDIlib_file_recorder_get_dropped_event_count: recorder_dropped,
             NDIlib_file_recorder_stop: recorder_stop,
             NDIlib_file_recorder_rollover: recorder_rollover,
+            NDIlib_file_recorder_inject_metadata: recorder_inject_metadata,
             NDIlib_file_recorder_set_source: accept_source,
             NDIlib_file_recorder_is_recording: recorder_is_recording,
             ..recording()

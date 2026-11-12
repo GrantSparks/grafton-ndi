@@ -245,10 +245,11 @@ impl FileApi {
     /// # Errors
     ///
     /// [`Error::NativeOperationFailed`] when the SDK cannot read the file,
-    /// [`Error::InvalidInput`] when the path is empty, is not UTF-8 or
-    /// contains a NUL, [`Error::Io`] when a relative path cannot be
-    /// resolved because the current directory is unavailable, and
-    /// [`Error::RuntimeLoadFailed`] when the library provides no playback.
+    /// [`Error::InvalidInput`] when the path is empty or is not UTF-8,
+    /// [`Error::InvalidCString`] when it contains a NUL, [`Error::Io`] when a
+    /// relative path cannot be resolved because the current directory is
+    /// unavailable, and [`Error::RuntimeLoadFailed`] when the library
+    /// provides no playback.
     pub fn probe(&self, path: impl AsRef<Path>) -> Result<FileInfo> {
         let playback = self.playback()?;
         let path = types::path_string(path.as_ref())?;
@@ -274,10 +275,11 @@ impl FileApi {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidInput`] when the player's name is empty, or its name
-    /// or groups contain a NUL. [`Error::NativeOperationFailed`] when the SDK
-    /// cannot create the player and [`Error::RuntimeLoadFailed`] when the
-    /// library provides no playback.
+    /// [`Error::InvalidInput`] when the player's name is empty, and
+    /// [`Error::InvalidCString`] when its name or groups contain a NUL.
+    /// [`Error::NativeOperationFailed`] when the SDK cannot create the player
+    /// and [`Error::RuntimeLoadFailed`] when the library provides no
+    /// playback.
     pub fn create_player(&self, options: &PlayerOptions) -> Result<FilePlayer> {
         FilePlayer::create(self.clone(), options)
     }
@@ -295,6 +297,7 @@ impl FileApi {
     /// malformed [`FileNaming::Pattern`], or an exact file name
     /// ([`FileNaming::Exact`], or a pattern without `{index}`) with
     /// format-change rollover switched on or a nonzero rollover size.
+    /// [`Error::InvalidCString`] when the filename pattern contains a NUL.
     /// [`Error::NativeOperationFailed`] when the SDK cannot create the
     /// recorder and [`Error::RuntimeLoadFailed`] when the library provides no
     /// recording.

@@ -12,7 +12,7 @@ use super::{
     RecorderState, RecorderStats, RecordingReport, RecordingTarget, RecordingTimecode,
     SourceFormat, SourceSpec, StateError, StopRequest,
 };
-use crate::{Error, MetadataFrame, Result, Source, Timecode};
+use crate::{timeout::Deadline, Error, MetadataFrame, Result, Source, Timecode};
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
@@ -480,7 +480,6 @@ impl<E: Send + 'static> EventQueue<E> {
             budget,
             deadline: None,
             timer: None,
-            invalid: crate::to_ms_checked(budget).err(),
             consumed: false,
         }
     }
@@ -533,11 +532,12 @@ pub struct FileEventFuture<E> {
     /// `events`, as the deadline timer reaches it.
     expiry: Weak<dyn Expire>,
     token: Arc<()>,
+    /// The caller's timeout, checked when the wait starts.
     budget: Duration,
-    deadline: Option<Instant>,
+    /// The wait's budget, from its first poll on.
+    deadline: Option<Deadline>,
     /// This wait's registration with the deadline timer, while it has one.
     timer: Option<TimerKey>,
-    invalid: Option<Error>,
     consumed: bool,
 }
 
@@ -574,12 +574,15 @@ impl<E> Future for FileEventFuture<E> {
             !this.consumed,
             "a completed FileEventFuture was polled again"
         );
-        if let Some(error) = this.invalid.take() {
-            return this.complete(Err(error));
-        }
-        let deadline = *this
-            .deadline
-            .get_or_insert_with(|| Instant::now() + this.budget);
+        // The wait starts at the first poll, which is also where a timeout
+        // out of range is reported, before anything else.
+        let deadline = match this.deadline {
+            Some(deadline) => deadline,
+            None => match Deadline::after(this.budget) {
+                Ok(deadline) => *this.deadline.insert(deadline),
+                Err(error) => return this.complete(Err(error)),
+            },
+        };
         let token = Arc::downgrade(&this.token);
         let ready = {
             let mut events = lock(&this.events.0);
@@ -594,7 +597,7 @@ impl<E> Future for FileEventFuture<E> {
                     Some(event.map(Some))
                 } else if events.closed {
                     Some(Err(stopped(events.failed)))
-                } else if deadline <= Instant::now() {
+                } else if deadline.is_expired() {
                     Some(Ok(None))
                 } else {
                     None
@@ -603,7 +606,7 @@ impl<E> Future for FileEventFuture<E> {
                     Some(_) => None,
                     None => Some(EventWaiter {
                         token: Weak::clone(&token),
-                        deadline,
+                        deadline: deadline.end(),
                         waker: cx.waker().clone(),
                     }),
                 };
@@ -617,7 +620,7 @@ impl<E> Future for FileEventFuture<E> {
         // It is made with no queue lock held: the timer may wake this future
         // at once, which then finds itself registered as the waiter.
         if this.timer.is_none() {
-            match TIMER.register(deadline, Weak::clone(&this.expiry), token) {
+            match TIMER.register(deadline.end(), Weak::clone(&this.expiry), token) {
                 Ok(key) => this.timer = Some(key),
                 Err(error) => {
                     this.release_waiter();
@@ -1217,16 +1220,18 @@ impl AsyncFileRecorder {
     }
 
     fn finish_inner(&self, timeout: Duration, stop: bool) -> FileOperation<FinishStatus> {
-        if let Err(error) = crate::to_ms_checked(timeout) {
-            return FileOperation::failed(error);
-        }
-        let submitted = Instant::now();
+        // The budget starts with the call, so it includes the time the
+        // command spends queued and, for a finish, the stop.
+        let deadline = match Deadline::after(timeout) {
+            Ok(deadline) => deadline,
+            Err(error) => return FileOperation::failed(error),
+        };
         let events = Arc::clone(&self.worker.events);
         self.worker.submit(stop, move |recorder, context| {
             if stop {
                 recorder.request_stop();
             }
-            recorder.wait_finished_from(submitted, timeout, |polled| {
+            recorder.wait_finished_from(deadline, |polled| {
                 // As the pump delivers them: a malformed event as its error.
                 if let Some(event) = polled.transpose() {
                     events.push(event);
@@ -1793,6 +1798,65 @@ mod tests {
         assert!(matches!(outcome, FinishStatus::Closed(_)), "{outcome:?}");
         assert_eq!(device.stops.load(Ordering::Acquire), 1);
         block_on(recorder.close()).unwrap();
+    }
+
+    #[test]
+    fn an_async_finish_measures_its_wait_from_the_call() {
+        // The command waits behind another for longer than its whole wait,
+        // so once it runs only the events already queued are taken, and the
+        // close comes after them.
+        let (device, recorder) = mock_recorder(Closing::After(Duration::from_millis(50)));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let blocker = recorder.worker.call(move |_| {
+            entered_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(400));
+            Ok(())
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let finishing = recorder.finish(Duration::from_millis(200));
+        block_on(blocker).unwrap();
+        let outcome = block_on(finishing).unwrap();
+        assert!(matches!(outcome, FinishStatus::TimedOut(_)), "{outcome:?}");
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        block_on(recorder.close()).unwrap();
+    }
+
+    #[test]
+    fn an_async_timeout_out_of_range_fails_at_once_and_stops_nothing() {
+        let (device, recorder) = mock_recorder(Closing::AtStop);
+        let too_long = crate::MAX_TIMEOUT + Duration::from_nanos(1);
+        for finishing in [recorder.finish(too_long), recorder.wait_finished(too_long)] {
+            // Completed before it was returned: nothing was queued.
+            assert!(lock(&finishing.response).completed);
+            let result = block_on(finishing);
+            assert!(
+                matches!(&result, Err(Error::InvalidInput(reason)) if reason.contains("MAX_TIMEOUT")),
+                "{result:?}"
+            );
+        }
+        assert_eq!(
+            block_on(recorder.state()).unwrap(),
+            RecorderState::Recording
+        );
+        assert_eq!(device.stops.load(Ordering::Acquire), 0);
+        block_on(recorder.close()).unwrap();
+    }
+
+    #[test]
+    fn an_event_wait_out_of_range_fails_at_its_first_poll_without_waiting() {
+        let events = Arc::new(EventQueue::<u32>::new(1));
+        events.push(Ok(7));
+        let mut waiting = Box::pin(events.wait(crate::MAX_TIMEOUT + Duration::from_nanos(1)));
+        let polled = waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(&idle_waker()));
+        assert!(
+            matches!(&polled, Poll::Ready(Err(Error::InvalidInput(reason))) if reason.contains("MAX_TIMEOUT")),
+            "{polled:?}"
+        );
+        assert!(waiting.timer.is_none());
+        // It took nothing and left no waiter behind.
+        assert_eq!(block_on(events.wait(Duration::ZERO)).unwrap(), Some(7));
     }
 
     /// A waker for a poll whose wake-up the test does not wait for.

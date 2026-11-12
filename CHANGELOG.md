@@ -369,8 +369,20 @@ as `None`. Most programs need changes; see the
   the others reported `StateError::Closed`, which now means only a handle that
   was closed or whose thread stopped normally.
 - `FilePlayer::start`, `FileApi::probe` and the async player's `start` and
-  `probe` describe an empty, non-UTF-8 or NUL-containing path as a "file
-  path"; their errors called it a "recording target".
+  `probe` describe an empty or non-UTF-8 path as a "file path"; their errors
+  called it a "recording target".
+- A NUL in a string the File API passes to the SDK (a path, a source name or
+  URL, a player's name or groups, a filename pattern) is reported as
+  `Error::InvalidCString`, as everywhere else in the crate. It was
+  `Error::InvalidInput`.
+- `FileRecorder::inject_metadata` and the async recorder's `inject_metadata`
+  hand the SDK the `MetadataFrame`'s own text instead of a copy made for each
+  call, and no longer list `Error::InvalidInput`, which no `MetadataFrame`
+  could cause.
+- The File API's waits that poll more than once take every poll from one
+  budget, as the receiver's and sender's do. An async event wait whose end
+  cannot be represented on the platform fails with `Error::InvalidInput`
+  instead of panicking.
 
 ## [2.0.0] - 2026-10-16
 
