@@ -5,9 +5,12 @@
 //! bits. Widths must be multiples of six; partial groups are deliberately rejected.
 //! These are sample-packing conversions, without color-space or HDR transforms.
 
+use std::ptr;
+
 use crate::{
-    frames::{ValidatedVideoLayout, MAX_VIDEO_BYTES},
-    sys, Error, Ndi, PixelFormat, Result, VideoFrame,
+    frames::{sdk_video_frame, ValidatedVideoLayout, VideoHeader, MAX_VIDEO_BYTES},
+    sys::{self, bindings::NDIlib_video_frame_v2_t},
+    Error, FrameRate, Ndi, PixelFormat, Result, ScanType, Timecode, VideoFrame,
 };
 
 /// Validated V210 storage geometry, including optional initialized row padding.
@@ -115,6 +118,9 @@ impl V210Layout {
         Ok(())
     }
 
+    /// Require `frame` to be P216 with this layout's dimensions. Its samples
+    /// are then exactly the packed P216 frame [`Self::p216_descriptor`]
+    /// describes.
     fn check_p216(self, frame: &VideoFrame) -> Result<()> {
         if frame.pixel_format() != PixelFormat::P216
             || frame.width() != self.width
@@ -124,14 +130,60 @@ impl V210Layout {
                 "P216 frame format and dimensions must match the V210 layout".into(),
             ));
         }
-        // VideoFrame owns bytes. A custom Rust global allocator need only align
-        // that allocation for u8, whereas these native helpers access u16 samples.
-        if !(frame.data().as_ptr() as usize).is_multiple_of(std::mem::align_of::<u16>()) {
-            return Err(Error::InvalidFrame(
-                "P216 sample storage must be aligned for 16-bit access".into(),
-            ));
-        }
         Ok(())
+    }
+
+    /// The SDK descriptor of the packed P216 frame of this layout's
+    /// dimensions, two full-height planes of 16-bit samples, over the `len`
+    /// bytes at `data`.
+    ///
+    /// The samples may start at any address. The NDI SDK documentation of
+    /// video frames gives a frame's `p_data` no alignment requirement, and
+    /// the crate itself reads P216 samples only as bytes, so their alignment
+    /// depends on nothing, including the global allocator.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFrame`] when `len` is not exactly that frame's size.
+    fn p216_descriptor(self, data: *const u8, len: usize) -> Result<NDIlib_video_frame_v2_t> {
+        // `with_line_stride` validated this layout for these dimensions.
+        let p216 = ValidatedVideoLayout::new_uncompressed(
+            PixelFormat::P216,
+            self.width,
+            self.height,
+            None,
+        )?;
+        if len != p216.data_len_bytes {
+            return Err(Error::InvalidFrame(format!(
+                "P216 buffer has {len} bytes, requires {}",
+                p216.data_len_bytes
+            )));
+        }
+        // The utilities convert samples; the header only has to be valid.
+        let header = VideoHeader {
+            frame_rate: const { FrameRate::per_second(30) },
+            picture_aspect_ratio: 0.0,
+            scan_type: ScanType::Progressive,
+            timecode: Timecode::SYNTHESIZE,
+        };
+        Ok(sdk_video_frame(&p216, &header, data, ptr::null(), None))
+    }
+
+    /// The SDK descriptor of this layout's V210 words at `data`: `p216`, the
+    /// descriptor of the matching P216 frame, with the V210 FourCC, which the
+    /// native utilities ignore, and the V210 stride.
+    fn v210_descriptor(
+        self,
+        p216: NDIlib_video_frame_v2_t,
+        data: *const u32,
+    ) -> NDIlib_video_frame_v2_t {
+        let mut v210 = p216;
+        // V210 deliberately is not a PixelFormat variant, so it cannot enter
+        // the ordinary sending path.
+        v210.FourCC = u32::from_le_bytes(*b"V210");
+        v210.p_data = data.cast_mut().cast();
+        v210.__bindgen_anon_1.line_stride_in_bytes = self.sdk_line_stride();
+        v210
     }
 }
 
@@ -159,24 +211,33 @@ impl VideoConverter {
     /// samples are replaced: destination timecode, timestamps, metadata and frame
     /// headers remain unchanged. P216 samples contain the ten bits shifted left
     /// by six. Extra source words and row padding are ignored.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFrame`] when `destination` is not a P216 frame of the
+    /// layout's dimensions, or `source` is shorter than the layout's storage.
+    /// `destination` is then unchanged.
     pub fn v210_to_p216(
         &self,
         layout: V210Layout,
         source: &[u32],
         destination: &mut VideoFrame,
     ) -> Result<()> {
-        layout.check_storage(source.len())?;
         layout.check_p216(destination)?;
-        let mut output = destination.to_raw();
-        output.p_data = destination.data_mut().as_mut_ptr();
-        let mut input = output;
-        // The native utility ignores the source FourCC; V210 deliberately is
-        // not a PixelFormat variant and cannot enter the ordinary sending path.
-        input.FourCC = u32::from_le_bytes(*b"V210");
-        input.p_data = source.as_ptr().cast_mut().cast();
-        input.__bindgen_anon_1.line_stride_in_bytes = layout.sdk_line_stride();
-        // SAFETY: Checked complete groups, native integer alignment, matching
-        // extents and disjoint Rust borrows cover all accessed pixels.
+        self.unpack(layout, source, destination.data_mut())
+    }
+
+    /// Unpack `source` into `p216`, the samples of the packed P216 frame of
+    /// `layout`'s dimensions, which may start at any address.
+    fn unpack(&self, layout: V210Layout, source: &[u32], p216: &mut [u8]) -> Result<()> {
+        layout.check_storage(source.len())?;
+        let mut output = layout.p216_descriptor(p216.as_mut_ptr(), p216.len())?;
+        let input = layout.v210_descriptor(output, source.as_ptr());
+        // SAFETY: `source` holds every word of the layout's rows and `p216`
+        // exactly the P216 frame `output` describes, both initialized and
+        // borrowed apart for the call, which keeps no reference. The V210
+        // words are aligned `u32`s, and the NDI SDK documentation requires
+        // no alignment of a video frame's data, so the P216 bytes need none.
         unsafe {
             self.conversion
                 .NDIlib_util_V210_to_P216(&input, &mut output)
@@ -190,6 +251,12 @@ impl VideoConverter {
     /// the SDK preserves unused bits through read/modify/write operations. Their
     /// two unused high bits therefore remain zero. Row padding and extra trailing
     /// words are unchanged. V210 utility buffers carry no frame metadata.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFrame`] when `source` is not a P216 frame of the
+    /// layout's dimensions, or `destination` is shorter than the layout's
+    /// storage. `destination` is then unchanged.
     pub fn p216_to_v210(
         &self,
         source: &VideoFrame,
@@ -197,18 +264,25 @@ impl VideoConverter {
         destination: &mut [u32],
     ) -> Result<()> {
         layout.check_p216(source)?;
+        self.pack(layout, source.data(), destination)
+    }
+
+    /// Pack `p216`, the samples of the packed P216 frame of `layout`'s
+    /// dimensions, which may start at any address, into `destination`.
+    fn pack(&self, layout: V210Layout, p216: &[u8], destination: &mut [u32]) -> Result<()> {
+        let input = layout.p216_descriptor(p216.as_ptr(), p216.len())?;
         layout.check_storage(destination.len())?;
         let stride_words = layout.stride / 4;
         let active = layout.active_words_per_row();
         for row in destination[..layout.words].chunks_exact_mut(stride_words) {
             row[..active].fill(0);
         }
-        let input = source.to_raw();
-        let mut output = input;
-        output.p_data = destination.as_mut_ptr().cast();
-        output.__bindgen_anon_1.line_stride_in_bytes = layout.sdk_line_stride();
-        // SAFETY: Typed output is initialized and aligned for native u32 access;
-        // source P216 dimensions/alignment and both extents were checked above.
+        let mut output = layout.v210_descriptor(input, destination.as_mut_ptr());
+        // SAFETY: `p216` holds exactly the P216 frame `input` describes and
+        // `destination` every word of the layout's rows, both initialized and
+        // borrowed apart for the call, which keeps no reference. The V210
+        // words are aligned `u32`s, and the NDI SDK documentation requires
+        // no alignment of a video frame's data, so the P216 bytes need none.
         unsafe {
             self.conversion
                 .NDIlib_util_P216_to_V210(&input, &mut output)
@@ -355,6 +429,50 @@ mod tests {
                     assert_eq!(*back.last().unwrap(), 0x5a5a_5a5a);
                 }
             }
+        }
+    }
+
+    /// P216 samples need no alignment: the SDK documents none for a video
+    /// frame's data, and the crate reads them only as bytes. Samples at an
+    /// odd address, which a frame's allocation may have under another global
+    /// allocator, convert exactly as the frame's own do; storage of the wrong
+    /// size is refused.
+    #[test]
+    fn p216_samples_at_an_odd_address_convert_like_a_frame() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let converter = VideoConverter::new(&ndi).unwrap();
+        for (width, height) in [(6, 1), (48, 3), (1920, 4)] {
+            let layout = V210Layout::new(width, height).unwrap();
+            let source: Vec<u32> = (0..layout.required_words() as u32)
+                .map(|word| word.wrapping_mul(0x9e37_79b9) & 0x3fff_ffff)
+                .collect();
+            let mut frame = VideoFrame::builder()
+                .resolution(width, height)
+                .pixel_format(PixelFormat::P216)
+                .build()
+                .unwrap();
+            converter.v210_to_p216(layout, &source, &mut frame).unwrap();
+
+            let len = frame.data().len();
+            let mut storage = vec![0u8; len + 1];
+            let odd = usize::from(storage.as_ptr().addr().is_multiple_of(2));
+            let p216 = &mut storage[odd..odd + len];
+            assert!(!p216.as_ptr().addr().is_multiple_of(2));
+            converter.unpack(layout, &source, p216).unwrap();
+            assert_eq!(&*p216, frame.data());
+
+            let mut packed = vec![0; layout.required_words()];
+            converter.pack(layout, p216, &mut packed).unwrap();
+            let mut expected = vec![0; layout.required_words()];
+            converter
+                .p216_to_v210(&frame, layout, &mut expected)
+                .unwrap();
+            assert_eq!(packed, expected);
+
+            assert!(converter.unpack(layout, &source, &mut p216[1..]).is_err());
+            assert!(converter.pack(layout, &p216[1..], &mut packed).is_err());
         }
     }
 
