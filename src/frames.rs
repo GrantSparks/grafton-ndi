@@ -2766,28 +2766,28 @@ impl ValidatedVideoLayout {
     /// This layout with every plane's rows packed, without padding: the
     /// layout of an owned copy of the frame.
     ///
-    /// It shares [`video_plane_layouts`] with validation, and cannot fail
-    /// for a valid layout. The packed storage is the active payload, which
-    /// is at most the storage already checked for overflow and against
-    /// [`MAX_VIDEO_BYTES`], and is not zero. The packed stride is the width
-    /// times the bytes per pixel, even because every valid width is even,
-    /// and the height is unchanged, so every parity rule still holds.
+    /// It keeps each validated plane's active rows and closes the gaps: a
+    /// plane's stride becomes its active row and its offset the payload of
+    /// the planes before it, so the storage is exactly the active payload.
+    /// Nothing is computed that validation did not already bound: every
+    /// partial sum is at most the payload, which validation summed without
+    /// overflow and which is at most the storage it checked against
+    /// [`MAX_VIDEO_BYTES`]. It is the layout [`video_plane_layouts`] gives
+    /// the packed stride, `width` times the bytes per pixel, which a test
+    /// checks for every format.
     pub(crate) fn packed(&self) -> Self {
-        // The first plane's active row is the minimum, packed stride.
-        let stride = self.plane_layouts[0].active_row_bytes;
-        let (plane_layouts, plane_count, data_len_bytes, payload_len_bytes) = video_plane_layouts(
-            self.pixel_format.info(),
-            stride,
-            stride,
-            self.height as usize,
-        )
-        .expect("a valid video layout packs into a valid layout");
+        let mut plane_layouts = self.plane_layouts;
+        let mut offset = 0;
+        for plane in &mut plane_layouts[..self.plane_count] {
+            plane.offset = offset;
+            plane.row_stride = plane.active_row_bytes;
+            offset += plane.active_row_bytes * plane.row_count;
+        }
+        debug_assert_eq!(offset, self.payload_len_bytes);
         Self {
-            data_len_bytes,
-            payload_len_bytes,
+            data_len_bytes: self.payload_len_bytes,
             plane_layouts,
-            plane_count,
-            line_stride_bytes: stride,
+            line_stride_bytes: self.plane_layouts[0].active_row_bytes,
             ..*self
         }
     }
