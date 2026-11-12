@@ -487,9 +487,12 @@ fn raw_source(source: &SourceSpec) -> NDIlib_file_recorder_source_t {
 /// discards events that are not taken promptly, and a session that lost
 /// events can no longer be confirmed closed, so poll throughout a recording.
 ///
-/// A recorder belongs to the thread that created it. Every method calls into
-/// the SDK and may block. [`AsyncFileRecorder`](super::AsyncFileRecorder)
-/// offers the same operations as futures.
+/// A recorder belongs to the thread that created it, so it is neither
+/// [`Send`] nor [`Sync`]: the File API documents no thread on which a
+/// recorder may be used or destroyed, nor whether two calls on one recorder
+/// may overlap. Every method calls into the SDK and may block.
+/// [`AsyncFileRecorder`](super::AsyncFileRecorder) offers the same operations
+/// as futures.
 pub struct FileRecorder {
     recording: &'static sys::FileRecording,
     handle: NonNull<NDIlib_file_recorder_instance_type>,
@@ -507,6 +510,13 @@ pub struct FileRecorder {
     drop_wait: Duration,
     // Keeps the NDI runtime initialized.
     _api: FileApi,
+    // Neither the NDI File Format API documentation nor
+    // Processing.NDI.Lib.File.Recorder.h says on which threads a recorder may
+    // be created, used and destroyed, or whether calls on one recorder may
+    // overlap; the header mentions concurrent recorders only for the memory
+    // each one takes. Without that contract a recorder stays on its creating
+    // thread, and AsyncFileRecorder creates, uses and destroys one on a
+    // thread of its own.
     _thread: PhantomData<Rc<()>>,
 }
 

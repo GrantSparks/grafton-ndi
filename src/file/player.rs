@@ -18,9 +18,12 @@ use crate::{
 /// so receivers stay connected between files. Dropping the player stops
 /// playback and removes the source.
 ///
-/// A player belongs to the thread that created it. Every method calls into the
-/// SDK and may block. [`AsyncFilePlayer`](super::AsyncFilePlayer) offers the
-/// same operations as futures.
+/// A player belongs to the thread that created it, so it is neither [`Send`]
+/// nor [`Sync`]: the File API documents no thread on which a player may be
+/// used or destroyed, nor whether two calls on one player may overlap. Every
+/// method calls into the SDK and may block.
+/// [`AsyncFilePlayer`](super::AsyncFilePlayer) offers the same operations as
+/// futures.
 pub struct FilePlayer {
     playback: &'static sys::FilePlayback,
     handle: NonNull<NDIlib_file_player_instance_type>,
@@ -29,6 +32,13 @@ pub struct FilePlayer {
     name: String,
     // Keeps the NDI runtime initialized.
     _api: FileApi,
+    // Neither the NDI File Format API documentation nor
+    // Processing.NDI.Lib.File.Player.h says on which threads a player may be
+    // created, used and destroyed, or whether calls on one player may
+    // overlap; their only mention of threads is the player's own playback
+    // thread. Without that contract a player stays on its creating thread,
+    // and AsyncFilePlayer creates, uses and destroys one on a thread of its
+    // own.
     _thread: PhantomData<Rc<()>>,
 }
 
