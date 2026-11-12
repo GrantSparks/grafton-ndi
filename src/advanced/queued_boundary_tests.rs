@@ -8,14 +8,13 @@ fn retain(state: &CallbackState, id: u64) -> usize {
     let bytes = frame.retained_bytes();
     let mut locked = state.state.lock().unwrap();
     locked.bytes += bytes;
-    locked.entries.insert(
+    locked.in_flight.insert(
         key,
         Entry {
             id: SubmissionId(id),
-            _header: header,
+            header,
             frame,
             bytes,
-            complete: false,
         },
     );
     key
@@ -40,14 +39,14 @@ fn completion_trampoline_accepts_copied_descriptors_on_concurrent_threads() {
         }
     });
     let mut locked = state.state.lock().unwrap();
-    assert_eq!(locked.entries.len(), 2);
+    assert_eq!((locked.in_flight.len(), locked.ready.len()), (0, 2));
     let mut completed = [
         take_completed(&mut locked).unwrap().id().get(),
         take_completed(&mut locked).unwrap().id().get(),
     ];
     completed.sort_unstable();
     assert_eq!(completed, [1, 2]);
-    assert!(locked.entries.is_empty());
+    assert_eq!(locked.retained(), 0);
     assert_eq!(locked.bytes, 0);
     assert!(!state.protocol_error.load(Ordering::Acquire));
 }
@@ -60,7 +59,6 @@ fn malformed_callback_retains_pending_ownership_and_reports_protocol_failure() {
     unsafe { completion(opaque, std::ptr::null()) };
     assert!(state.protocol_error.load(Ordering::Acquire));
     let locked = state.state.lock().unwrap();
-    assert_eq!(locked.entries.len(), 1);
-    assert!(locked.ready.is_empty());
+    assert_eq!((locked.in_flight.len(), locked.ready.len()), (1, 0));
     assert!(locked.bytes > 0);
 }

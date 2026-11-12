@@ -2,7 +2,7 @@
 //! notification.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{HashMap, VecDeque},
     ffi::c_void,
     marker::PhantomData,
     rc::Rc,
@@ -167,25 +167,50 @@ impl CompletedVideo {
 /// while the SDK may still write to them.
 struct Entry {
     id: SubmissionId,
-    // Kept only so that the address given to the SDK stays valid.
-    _header: AliasableBox<NDIlib_video_frame_v2_t>,
+    // Kept so that the address given to the SDK stays valid. Its data
+    // pointer identifies the submission.
+    header: AliasableBox<NDIlib_video_frame_v2_t>,
     frame: QueuedVideoFrame,
     bytes: usize,
-    complete: bool,
+}
+
+impl Entry {
+    /// The address of the frame's data, by which a completion names it.
+    fn key(&self) -> usize {
+        self.header.p_data as usize
+    }
 }
 
 // SAFETY: the descriptor points only into allocations this entry owns, and
 // moving the entry moves none of them. While the frame is queued only the
-// SDK reads or writes them: the completion callback compares an address, and
-// the queue hands the frame out after the SDK has reported it complete.
+// SDK reads or writes them: the completion callback moves the entry from
+// `State::in_flight` to `State::ready` without touching the frame, and the
+// queue hands the frame out only from `ready`, after the SDK has reported
+// it complete.
 unsafe impl Send for Entry {}
 
+/// The frames a queue holds. Each is in exactly one place: in flight until
+/// the SDK reports it complete, then ready until it is collected.
 struct State {
-    entries: BTreeMap<usize, Entry>,
-    ready: VecDeque<usize>,
+    // The frames the SDK may still read, by the address of their data.
+    in_flight: HashMap<usize, Entry>,
+    // The frames the SDK has finished with, in the order it reported them.
+    ready: VecDeque<Entry>,
     bytes: usize,
     next: u64,
     options: QueueOptions,
+}
+
+impl State {
+    /// The frames held, in flight or ready.
+    fn retained(&self) -> usize {
+        self.in_flight.len() + self.ready.len()
+    }
+
+    /// Whether a frame held, in flight or ready, has its data at `key`.
+    fn holds(&self, key: usize) -> bool {
+        self.in_flight.contains_key(&key) || self.ready.iter().any(|entry| entry.key() == key)
+    }
 }
 
 struct CallbackState {
@@ -197,13 +222,17 @@ struct CallbackState {
 impl CallbackState {
     fn new(options: QueueOptions) -> Result<Box<Self>> {
         let options = options.validate()?;
+        let unavailable =
+            |_| Error::InvalidInput("unable to allocate bounded completion storage".into());
+        let mut in_flight = HashMap::new();
+        in_flight.try_reserve(options.frames).map_err(unavailable)?;
         let mut ready = VecDeque::new();
-        ready.try_reserve_exact(options.frames).map_err(|_| {
-            Error::InvalidInput("unable to allocate bounded completion storage".into())
-        })?;
+        ready
+            .try_reserve_exact(options.frames)
+            .map_err(unavailable)?;
         Ok(Box::new(Self {
             state: Mutex::new(State {
-                entries: BTreeMap::new(),
+                in_flight,
                 ready,
                 bytes: 0,
                 next: 1,
@@ -214,21 +243,27 @@ impl CallbackState {
         }))
     }
 
+    /// Record that the SDK has finished with the frame whose data is at
+    /// `address`. Runs on an SDK thread.
+    ///
+    /// No allocator or user code runs here. Removing the entry from the map
+    /// keeps the map's storage (std gives a map's storage back only through
+    /// `shrink_to` and `shrink_to_fit`), and `ready` was given room for every
+    /// frame the queue can hold before the callback was registered, while
+    /// `try_submit` keeps the queue within that many. The entry is moved, so
+    /// nothing is freed.
     fn complete(&self, address: usize) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        match state.entries.get_mut(&address) {
-            Some(entry) if !entry.complete => {
-                entry.complete = true;
-                // Capacity was reserved for every retained entry before native
-                // registration. No allocator or user callback runs here.
-                state.ready.push_back(address);
-                self.changed.notify_all();
-            }
-            _ => {
-                self.protocol_error.store(true, Ordering::Release);
-                self.changed.notify_all();
-            }
+        let State {
+            in_flight, ready, ..
+        } = &mut *state;
+        match in_flight.remove(&address) {
+            Some(entry) => ready.push_back(entry),
+            // No frame in flight has this data: the SDK named a frame twice,
+            // or one it was never given.
+            None => self.protocol_error.store(true, Ordering::Release),
         }
+        self.changed.notify_all();
     }
 }
 /// The completion callback the SDK calls, on its own threads, when it has
@@ -466,10 +501,10 @@ impl QueuedSender {
             else {
                 return Err(failure(Error::QueueFull(QueueLimit::Bytes), frame));
             };
-            if state.entries.len() >= state.options.frames {
+            if state.retained() >= state.options.frames {
                 return Err(failure(Error::QueueFull(QueueLimit::Frames), frame));
             }
-            if key == 0 || state.entries.contains_key(&key) {
+            if key == 0 || state.holds(key) {
                 return Err(failure(
                     Error::InvalidFrame(
                         "queued frames require distinct owned data allocations".into(),
@@ -486,14 +521,13 @@ impl QueuedSender {
             let id = SubmissionId(state.next);
             state.next = next;
             state.bytes = total;
-            state.entries.insert(
+            state.in_flight.insert(
                 key,
                 Entry {
                     id,
-                    _header: header,
+                    header,
                     frame,
                     bytes,
-                    complete: false,
                 },
             );
             id
@@ -564,8 +598,7 @@ impl QueuedSender {
             .state
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .entries
-            .len()
+            .retained()
     }
 
     /// Whether the SDK has reported a completion that matches no queued frame,
@@ -580,11 +613,7 @@ impl QueuedSender {
 }
 
 fn take_completed(state: &mut State) -> Option<CompletedVideo> {
-    let key = state.ready.pop_front()?;
-    let entry = state
-        .entries
-        .remove(&key)
-        .expect("completion names retained entry");
+    let entry = state.ready.pop_front()?;
     state.bytes -= entry.bytes;
     Some(CompletedVideo {
         id: entry.id,
@@ -603,14 +632,13 @@ mod tests {
         let bytes = frame.retained_bytes();
         let mut s = state.state.lock().unwrap();
         s.bytes += bytes;
-        s.entries.insert(
+        s.in_flight.insert(
             key,
             Entry {
                 id: SubmissionId(id),
-                _header: header,
+                header,
                 frame,
                 bytes,
-                complete: false,
             },
         );
         key
@@ -626,7 +654,7 @@ mod tests {
             scope.spawn(|| state.complete(a));
         });
         let mut s = state.state.lock().unwrap();
-        assert_eq!(s.entries.len(), 2);
+        assert_eq!((s.in_flight.len(), s.ready.len()), (0, 2));
         assert_eq!(take_completed(&mut s).unwrap().id().get(), 2);
         assert_eq!(take_completed(&mut s).unwrap().id().get(), 1);
         assert_eq!(s.bytes, 0);
@@ -665,11 +693,39 @@ mod tests {
         state.complete(a);
         state.complete(0);
         let mut s = state.state.lock().unwrap();
-        assert_eq!(s.ready.len(), 1);
-        assert_eq!(s.entries.len(), 1);
+        assert_eq!((s.in_flight.len(), s.ready.len()), (0, 1));
         assert!(state.protocol_error.load(Ordering::Acquire));
         assert!(take_completed(&mut s).is_some());
         assert!(take_completed(&mut s).is_none());
+    }
+
+    /// The SDK's thread neither allocates nor frees when it reports a
+    /// completion, a duplicate or an unknown frame: the entry moves between
+    /// storage reserved before the callback was registered, and neither
+    /// collection gives any of it back.
+    #[test]
+    fn completion_moves_an_entry_without_allocating_or_freeing() {
+        let state = CallbackState::new(QueueOptions::default().max_frames(3)).unwrap();
+        let keys = [insert(&state, 1), insert(&state, 2), insert(&state, 3)];
+        let capacities = |state: &CallbackState| {
+            let s = state.state.lock().unwrap();
+            (s.in_flight.capacity(), s.ready.capacity())
+        };
+        let reserved = capacities(&state);
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            for key in [keys[2], keys[0], keys[1], keys[0], 0] {
+                state.complete(key);
+            }
+        });
+        assert_eq!(allocations, 0);
+        assert_eq!(capacities(&state), reserved);
+        let mut s = state.state.lock().unwrap();
+        assert_eq!((s.in_flight.len(), s.ready.len()), (0, 3));
+        let order: Vec<_> = std::iter::from_fn(|| take_completed(&mut s))
+            .map(|completed| completed.id().get())
+            .collect();
+        assert_eq!(order, [3, 1, 2]);
+        assert!(state.protocol_error.load(Ordering::Acquire));
     }
 }
 
