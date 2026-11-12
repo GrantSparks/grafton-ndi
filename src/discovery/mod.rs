@@ -37,8 +37,43 @@
 //! The measurements are in the
 //! [SDK validation record](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/sdk-validation.md#discovery-server-objects).
 //!
-//! The native owners are [`Send`] but not [`Sync`]. Snapshots and events are
-//! plain owned data.
+//! # Threads
+//!
+//! The native owners are [`Send`] but not [`Sync`]: each can move to another
+//! thread, and one thread at a time uses it. Snapshots and events are plain
+//! owned data. To keep an owner in state that several threads share, put it in
+//! a [`Mutex`](std::sync::Mutex). The owner is `Send`, so the mutex is `Sync`,
+//! and the methods that change an owner take it exclusively in any case:
+//!
+//! ```no_run
+//! use std::sync::{Arc, Mutex};
+//! use grafton_ndi::{
+//!     discovery::{AdvertiserOptions, SendAdvertisement, SendAdvertiser},
+//!     Ndi, Sender, SenderOptions,
+//! };
+//!
+//! /// What every request handler of a server shares.
+//! struct Shared {
+//!     advertiser: Mutex<SendAdvertiser>,
+//! }
+//!
+//! # fn main() -> grafton_ndi::Result<()> {
+//! let ndi = Ndi::new()?;
+//! let shared = Arc::new(Shared {
+//!     advertiser: Mutex::new(SendAdvertiser::new(&ndi, &AdvertiserOptions::new())?),
+//! });
+//! let sender = Sender::new(&ndi, &SenderOptions::new("Camera 1"))?;
+//! let worker = std::thread::spawn({
+//!     let shared = Arc::clone(&shared);
+//!     move || {
+//!         let mut advertiser = shared.advertiser.lock().unwrap();
+//!         advertiser.register(&sender, SendAdvertisement::new())
+//!     }
+//! });
+//! let _registration = worker.join().unwrap()?;
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! # Connecting
 //!

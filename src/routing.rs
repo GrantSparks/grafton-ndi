@@ -73,7 +73,9 @@ impl RouterOptions {
 /// # Threading
 ///
 /// A router is [`Send`] but not [`Sync`]: it may be moved to another thread,
-/// and is used by one thread at a time.
+/// and is used by one thread at a time. To keep one in state that several
+/// threads share, put it in a [`Mutex`](std::sync::Mutex), which is `Sync`
+/// because the router is `Send`.
 pub struct Router {
     instance: NDIlib_routing_instance_t,
     routing: &'static sys::Routing,
