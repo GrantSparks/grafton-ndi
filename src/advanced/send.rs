@@ -5,12 +5,9 @@ use std::ptr;
 use super::{
     aliasable::AliasableBox,
     invalid_frame,
-    packets::{
-        attach_metadata, attach_timecode, AudioParameters, EnvelopeHeader, FrameExtras, HasExtras,
-        ENVELOPE_HEADER_BYTES,
-    },
-    AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedVideoFrame, EnvelopeCodec,
-    VideoPacketFormat, MAX_PACKET_BYTES,
+    packets::{attach_metadata, attach_timecode, AudioParameters, FrameExtras, HasExtras},
+    AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedVideoFrame, VideoPacketFormat,
+    MAX_PACKET_BYTES,
 };
 use crate::{
     sender::{
@@ -312,14 +309,11 @@ impl ScatterAudioFrame {
     ) -> std::result::Result<Self, Rejected<Vec<Vec<u8>>>> {
         let check = || {
             let parameters = AudioParameters::new(sample_rate, num_channels, num_samples)?;
-            codec.validate_delivery(parameters)?;
             let total = ScatterStorage::total(&blocks)?;
-            if codec == AudioCodec::Aac {
-                let header = EnvelopeHeader::read(first_block(&blocks, ENVELOPE_HEADER_BYTES)?)?;
-                header.validate_for_send(EnvelopeCodec::Aac, total)?;
-                let config = bytes_at(&blocks, header.extra_offset());
-                header.validate_aac(config, parameters)?;
-            }
+            let header = first_block(&blocks, codec.header_bytes())?;
+            codec.validate_for_send(parameters, header, total, |offset| {
+                bytes_at(&blocks, offset)
+            })?;
             Ok((parameters, total))
         };
         match check() {
@@ -830,7 +824,7 @@ mod tests {
     use super::*;
     use crate::advanced::{
         packets::testing::{aac_config, aac_packet},
-        PacketEnvelope, VideoCodec,
+        EnvelopeCodec, PacketEnvelope, VideoCodec,
     };
 
     fn h264() -> (VideoPacketFormat, Vec<u8>) {

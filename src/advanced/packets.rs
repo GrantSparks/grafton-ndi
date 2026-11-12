@@ -1105,10 +1105,46 @@ impl AudioParameters {
 }
 
 impl AudioCodec {
+    /// The number of bytes at the start of a frame of this codec that hold
+    /// its header: the envelope header for AAC, none for Opus.
+    pub(crate) fn header_bytes(self) -> usize {
+        match self {
+            Self::Aac => ENVELOPE_HEADER_BYTES,
+            Self::Opus => 0,
+        }
+    }
+
+    /// Check that a frame of this codec with `parameters`, `total` bytes long
+    /// and beginning with `header`, is one this module can send and the SDK
+    /// delivers; see [`AudioCodec`]. `header` holds
+    /// [`header_bytes`](Self::header_bytes) bytes or more, and `bytes_at`
+    /// reads the frame's two bytes at an offset, when it has them.
+    ///
+    /// The one admission of compressed audio, whether the frame is held in
+    /// one buffer or in several blocks, as
+    /// [`VideoPacketFormat::validate_for_send`] is for video.
+    pub(crate) fn validate_for_send(
+        self,
+        parameters: AudioParameters,
+        header: &[u8],
+        total: usize,
+        bytes_at: impl FnOnce(usize) -> Option<[u8; 2]>,
+    ) -> Result<()> {
+        self.validate_delivery(parameters)?;
+        match self {
+            Self::Opus => Ok(()),
+            Self::Aac => {
+                let header = EnvelopeHeader::read(header)?;
+                header.validate_for_send(EnvelopeCodec::Aac, total)?;
+                header.validate_aac(bytes_at(header.extra_offset()), parameters)
+            }
+        }
+    }
+
     /// Check the parameters a frame of this codec is delivered with; see
     /// [`AudioCodec`]. An AAC frame's configuration is checked separately,
     /// against its envelope.
-    pub(crate) fn validate_delivery(self, parameters: AudioParameters) -> Result<()> {
+    fn validate_delivery(self, parameters: AudioParameters) -> Result<()> {
         let AudioParameters {
             sample_rate,
             num_channels,
@@ -1313,33 +1349,27 @@ impl CompressedAudioFrame {
     ///
     /// [`Error::InvalidFrame`] with the reason.
     pub fn validate_for_send(&self) -> Result<()> {
-        let envelope = self.validate()?;
-        self.codec.validate_delivery(self.parameters)?;
-        if let Some(packet) = envelope {
-            packet
-                .header
-                .validate_for_send(EnvelopeCodec::Aac, self.bytes.len())?;
-            packet
-                .header
-                .validate_aac(packet.extra_data().first_chunk().copied(), self.parameters)?;
-        }
-        Ok(())
+        self.validate()?;
+        let bytes = &*self.bytes;
+        self.codec
+            .validate_for_send(self.parameters, bytes, bytes.len(), |offset| {
+                bytes.get(offset..)?.first_chunk().copied()
+            })
     }
 
-    /// The checks that hold for received frames as well. Returns the envelope
-    /// of a frame whose codec has one.
-    pub(crate) fn validate(&self) -> Result<Option<PacketEnvelope<'_>>> {
+    /// The checks that hold for received frames as well.
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.bytes.is_empty() || self.bytes.len() > MAX_PACKET_BYTES {
             return Err(invalid_frame("Invalid compressed audio size"));
         }
         if self.codec != AudioCodec::Aac {
-            return Ok(None);
+            return Ok(());
         }
         let packet = PacketEnvelope::parse(&self.bytes)?;
         if packet.codec() != Some(EnvelopeCodec::Aac) || packet.data().is_empty() {
             return Err(invalid_frame("Invalid AAC packet envelope"));
         }
-        Ok(Some(packet))
+        Ok(())
     }
 
     /// A native descriptor that lends this frame's bytes and metadata to the
