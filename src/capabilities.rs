@@ -151,12 +151,26 @@ impl RuntimeInfo {
 ///
 /// The list below is the only place a capability is declared. Each entry
 /// states its documentation, its variant, whether it belongs to the `core` or
-/// the `advanced` SDK, the name it is reported under and, after `since`, the
-/// first runtime version it may be used with. The enum, its `name`,
-/// `minimum_version` and `is_advanced`, [`RuntimeFeature::UNIT`] and the place
-/// [`Capabilities`] keeps each status are all generated from it, so none of
-/// them can leave a capability out. `Passthrough`, the one variant with a
-/// field, is written out here.
+/// the `advanced` SDK and the name it is reported under, then any of:
+///
+/// - `since`, the first runtime version it may be used with;
+/// - `requires`, the capabilities whose tables its operations also take, each
+///   listed before it. Once its own gate passes, the capability reports the
+///   status, and the evidence, of the first of them that is unavailable, so
+///   its operations are refused under the capability itself rather than under
+///   the one they reach later;
+/// - `ungated`, with the reason, for a core capability that every runtime
+///   provides.
+///
+/// A core capability is gated by its table in `optional_tables!`, by `since`
+/// or by `requires`. One with none of them would be reported available on
+/// every runtime, so it fails to compile unless it says `ungated`, and only
+/// such a one may (see `Api::missing`).
+///
+/// The enum, its `name`, `minimum_version`, `requirements` and `is_advanced`,
+/// [`RuntimeFeature::UNIT`] and the place [`Capabilities`] keeps each status
+/// are all generated from the list, so none of them can leave a capability
+/// out. `Passthrough`, the one variant with a field, is written out here.
 macro_rules! runtime_features {
     (@advanced core) => {
         false
@@ -170,9 +184,21 @@ macro_rules! runtime_features {
     (@minimum $minimum:ident) => {
         Some($minimum)
     };
+    (@ungated $edition:ident) => {
+        false
+    };
+    (@ungated core $why:literal) => {
+        true
+    };
+    (@ungated advanced $why:literal) => {
+        compile_error!("an Advanced capability is always gated by its table")
+    };
     ($(
         $(#[$meta:meta])*
-        $edition:ident $Variant:ident as $name:literal $(since $minimum:ident)?;
+        $edition:ident $Variant:ident as $name:literal
+            $(since $minimum:ident)?
+            $(requires $($required:ident),+)?
+            $(ungated $why:literal)?;
     )+) => {
         /// A capability that this build or the selected runtime may lack.
         ///
@@ -186,7 +212,12 @@ macro_rules! runtime_features {
         /// cannot destroy an object safely. Every capability from
         /// [`AdvancedFinderConfiguration`](Self::AdvancedFinderConfiguration) on
         /// belongs to the Advanced SDK: it also needs an Advanced SDK runtime and a
-        /// build with the `advanced` feature whose SDK headers declare it.
+        /// build with the `advanced` feature whose SDK headers declare it. A
+        /// capability whose operations go on to use another one's functions, such
+        /// as [`AdvancedRouterConfiguration`](Self::AdvancedRouterConfiguration)
+        /// with [`Routing`](Self::Routing), is also unavailable whenever that one
+        /// is: once its own requirements are met, it reports that one's reason,
+        /// and its operations are refused with that one's evidence.
         /// Availability says nothing about hardware or licenses.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         #[non_exhaustive]
@@ -211,6 +242,19 @@ macro_rules! runtime_features {
         enum Index {
             $($Variant,)+
         }
+
+        // A capability requires only capabilities listed before it, so no
+        // requirement is circular and `Capabilities::detect` finds each
+        // requirement's status already derived.
+        $($($(
+            const _: () = assert!(
+                (Index::$required as usize) < (Index::$Variant as usize),
+                concat!(
+                    stringify!($Variant), " requires ", stringify!($required),
+                    ", which must be listed before it"
+                ),
+            );
+        )+)?)+
 
         /// Where [`Capabilities`] finds a feature's status.
         enum Slot {
@@ -251,13 +295,37 @@ macro_rules! runtime_features {
             /// The 6.4 formats and receiver modes are enum values an older runtime
             /// would misread. The advertiser and listener functions exist in older
             /// runtimes, but the vendor's change log records crashes when destroying
-            /// those objects that were fixed in 6.3.2 and again in 6.4.0; an object
-            /// created with Advanced configuration is destroyed the same way.
-            pub(crate) fn minimum_version(self) -> Option<SdkVersion> {
+            /// those objects that were fixed in 6.3.2 and again in 6.4.0. An object
+            /// created with Advanced configuration is destroyed the same way, so its
+            /// capability requires the core one and reports that one's version gate.
+            pub(crate) const fn minimum_version(self) -> Option<SdkVersion> {
                 match self {
                     $(Self::$Variant => runtime_features!(@minimum $($minimum)?),)+
                     #[cfg(feature = "advanced")]
                     Self::Passthrough(_) => None,
+                }
+            }
+
+            /// The capabilities whose tables the capability's operations also
+            /// take, in the order they are checked. The capability is
+            /// unavailable whenever one of them is, and then reports the status
+            /// of the first one that is.
+            pub(crate) const fn requirements(self) -> &'static [Self] {
+                match self {
+                    $(Self::$Variant => &[$($(Self::$required),+)?],)+
+                    #[cfg(feature = "advanced")]
+                    Self::Passthrough(_) => &[],
+                }
+            }
+
+            /// Whether the capability is declared `ungated`: a core capability
+            /// without a table, a minimum version or a requirement, which every
+            /// runtime provides.
+            pub(crate) const fn is_ungated(self) -> bool {
+                match self {
+                    $(Self::$Variant => runtime_features!(@ungated $edition $($why)?),)+
+                    #[cfg(feature = "advanced")]
+                    Self::Passthrough(_) => false,
                 }
             }
 
@@ -266,7 +334,7 @@ macro_rules! runtime_features {
             /// Each such capability is gated by a table of Advanced entry points,
             /// which states, with the build's declarations, what the capability
             /// needs.
-            pub(crate) fn is_advanced(self) -> bool {
+            pub(crate) const fn is_advanced(self) -> bool {
                 match self {
                     $(Self::$Variant => runtime_features!(@advanced $edition),)+
                     #[cfg(feature = "advanced")]
@@ -323,28 +391,32 @@ runtime_features! {
     advanced AdvancedSenderConfiguration as "Advanced sender configuration";
     /// Creating a receiver with Advanced JSON configuration.
     advanced AdvancedReceiverConfiguration as "Advanced receiver configuration";
-    /// Creating a router with Advanced JSON configuration.
-    advanced AdvancedRouterConfiguration as "Advanced router configuration";
+    /// Creating a router with Advanced JSON configuration. Needs
+    /// [`Routing`](Self::Routing), whose functions the router goes on to use.
+    advanced AdvancedRouterConfiguration as "Advanced router configuration"
+        requires Routing;
     /// Creating a Discovery Server sender advertiser with Advanced JSON
-    /// configuration. Needs NDI 6.4.0 or later, as
-    /// [`SenderAdvertising`](Self::SenderAdvertising) does, whose functions
-    /// the advertiser goes on to use.
-    advanced AdvancedSenderAdvertiserConfiguration as "Advanced sender advertiser configuration" since NDI_6_4;
+    /// configuration. Needs [`SenderAdvertising`](Self::SenderAdvertising),
+    /// whose functions the advertiser goes on to use, and so NDI 6.4.0 or
+    /// later.
+    advanced AdvancedSenderAdvertiserConfiguration as "Advanced sender advertiser configuration"
+        requires SenderAdvertising;
     /// Creating a Discovery Server receiver advertiser with Advanced JSON
-    /// configuration. Needs NDI 6.4.0 or later, as
-    /// [`ReceiverAdvertising`](Self::ReceiverAdvertising) does, whose
-    /// functions the advertiser goes on to use.
-    advanced AdvancedReceiverAdvertiserConfiguration as "Advanced receiver advertiser configuration" since NDI_6_4;
+    /// configuration. Needs
+    /// [`ReceiverAdvertising`](Self::ReceiverAdvertising), whose functions
+    /// the advertiser goes on to use, and so NDI 6.4.0 or later.
+    advanced AdvancedReceiverAdvertiserConfiguration as "Advanced receiver advertiser configuration"
+        requires ReceiverAdvertising;
     /// Creating a Discovery Server sender listener with Advanced JSON
-    /// configuration. Needs NDI 6.4.0 or later, as
-    /// [`SenderDiscovery`](Self::SenderDiscovery) does, whose functions the
-    /// listener goes on to use.
-    advanced AdvancedSenderListenerConfiguration as "Advanced sender listener configuration" since NDI_6_4;
+    /// configuration. Needs [`SenderDiscovery`](Self::SenderDiscovery), whose
+    /// functions the listener goes on to use, and so NDI 6.4.0 or later.
+    advanced AdvancedSenderListenerConfiguration as "Advanced sender listener configuration"
+        requires SenderDiscovery;
     /// Creating a Discovery Server receiver listener with Advanced JSON
-    /// configuration. Needs NDI 6.4.0 or later, as
-    /// [`ReceiverDiscovery`](Self::ReceiverDiscovery) does, whose functions
-    /// the listener goes on to use.
-    advanced AdvancedReceiverListenerConfiguration as "Advanced receiver listener configuration" since NDI_6_4;
+    /// configuration. Needs [`ReceiverDiscovery`](Self::ReceiverDiscovery),
+    /// whose functions the listener goes on to use, and so NDI 6.4.0 or later.
+    advanced AdvancedReceiverListenerConfiguration as "Advanced receiver listener configuration"
+        requires ReceiverDiscovery;
     /// Source snapshots that carry each source's metadata.
     advanced SourceMetadata as "source metadata";
     /// Metadata a router replays to each new connection.
@@ -428,6 +500,10 @@ pub struct Capabilities {
     /// The status of each variant without a field, at its index in
     /// [`RuntimeFeature::UNIT`].
     statuses: [CapabilityStatus; RuntimeFeature::UNIT.len()],
+    /// The capability whose own gate gave each of those statuses: the
+    /// variant itself, or the capability it requires whose status it copied,
+    /// and whose evidence a refusal reports.
+    refused_by: [RuntimeFeature; RuntimeFeature::UNIT.len()],
 }
 
 /// Each capability's status, keyed by the capability.
@@ -445,7 +521,11 @@ impl Capabilities {
     ///
     /// This is the one rule every capability is gated by: an operation is
     /// refused exactly when the status derived here, or for a passthrough
-    /// preset from the configured receiver's here, is unavailable.
+    /// preset from the configured receiver's here, is unavailable. A
+    /// capability's status covers the capabilities it requires, so an
+    /// operation that goes on to take another capability's table is refused
+    /// under its own capability first, for the reason that table's capability
+    /// gives.
     pub(crate) fn detect(
         api: &Api,
         #[cfg(feature = "advanced")] advanced: &AdvancedApi,
@@ -472,9 +552,10 @@ impl Capabilities {
                 CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
             }
         };
-        let status = |feature: RuntimeFeature| {
+        let own = |feature: RuntimeFeature| {
             // Which entry points a feature needs is stated with its table. A
-            // core feature without any of its own is only a version gate.
+            // core feature without any of its own is gated by its version or
+            // its requirements.
             if !feature.is_advanced() {
                 return exported(feature, api.missing(feature).is_none());
             }
@@ -496,9 +577,29 @@ impl Capabilities {
                 exported(feature, resolved)
             }
         };
-        Self {
-            statuses: RuntimeFeature::UNIT.map(status),
+        // A feature's own gate is reported first; once it passes, the
+        // feature takes the status of the first feature it requires that is
+        // unavailable, as refused by that one's gate. Each requirement is
+        // listed earlier, so its status is already derived.
+        let mut capabilities = Self {
+            statuses: [CapabilityStatus::Available; RuntimeFeature::UNIT.len()],
+            refused_by: RuntimeFeature::UNIT,
+        };
+        for (index, feature) in RuntimeFeature::UNIT.into_iter().enumerate() {
+            let status = own(feature);
+            let required = feature
+                .requirements()
+                .iter()
+                .copied()
+                .find(|required| !capabilities.supports(*required));
+            if let (CapabilityStatus::Available, Some(required)) = (status, required) {
+                capabilities.statuses[index] = capabilities.status(required);
+                capabilities.refused_by[index] = capabilities.refused_by(required);
+            } else {
+                capabilities.statuses[index] = status;
+            }
         }
+        capabilities
     }
 
     /// Query a capability without changing native state.
@@ -521,6 +622,19 @@ impl Capabilities {
     /// Whether the wrapper has enough evidence to attempt the operation.
     pub fn supports(&self, feature: RuntimeFeature) -> bool {
         self.status(feature) == CapabilityStatus::Available
+    }
+
+    /// The capability whose own gate gave `feature`'s status, and whose
+    /// evidence a refusal of `feature` reports: `feature` itself, or the
+    /// capability it requires whose status it copied. A passthrough preset
+    /// is its own, since its table's evidence already leads to the configured
+    /// receiver's.
+    pub(crate) fn refused_by(&self, feature: RuntimeFeature) -> RuntimeFeature {
+        match feature.slot() {
+            Slot::Unit(index) => self.refused_by[index],
+            #[cfg(feature = "advanced")]
+            Slot::Passthrough => feature,
+        }
     }
 }
 
@@ -664,24 +778,45 @@ mod tests {
                 // An implementation that exports everything, has the latest
                 // version and the Advanced edition provides every feature this
                 // build declares.
-                let expected = if !declared(feature) {
-                    CapabilityStatus::Unavailable(CapabilityUnavailable::BuildAbiUnavailable)
-                } else if feature.is_advanced() && edition != SdkEdition::Advanced {
-                    CapabilityStatus::Unavailable(CapabilityUnavailable::WrongEdition)
-                } else {
-                    match (feature.minimum_version(), version) {
-                        (Some(_), None) => CapabilityStatus::Unavailable(
-                            CapabilityUnavailable::RuntimeVersionUnknown,
-                        ),
-                        (Some(_), Some("6.3.2.0")) => {
-                            CapabilityStatus::Unavailable(CapabilityUnavailable::RuntimeTooOld)
-                        }
-                        _ => CapabilityStatus::Available,
-                    }
-                };
-                assert_eq!(status, expected, "{context}");
+                assert_eq!(
+                    status,
+                    exporting_everything(feature, version, edition),
+                    "{context}"
+                );
             }
         }
+    }
+
+    /// The status of `feature` for an implementation that exports every
+    /// function, with version text ending in `version` and edition `edition`:
+    /// its own gate, then the status of the first capability it requires
+    /// that is unavailable.
+    fn exporting_everything(
+        feature: RuntimeFeature,
+        version: Option<&str>,
+        edition: SdkEdition,
+    ) -> CapabilityStatus {
+        use CapabilityUnavailable::*;
+        let own = if !declared(feature) {
+            Some(BuildAbiUnavailable)
+        } else if feature.is_advanced() && edition != SdkEdition::Advanced {
+            Some(WrongEdition)
+        } else {
+            match (feature.minimum_version(), version) {
+                (Some(_), None) => Some(RuntimeVersionUnknown),
+                (Some(_), Some("6.3.2.0")) => Some(RuntimeTooOld),
+                _ => None,
+            }
+        };
+        if let Some(reason) = own {
+            return CapabilityStatus::Unavailable(reason);
+        }
+        feature
+            .requirements()
+            .iter()
+            .map(|&required| exporting_everything(required, version, edition))
+            .find(|status| *status != CapabilityStatus::Available)
+            .unwrap_or(CapabilityStatus::Available)
     }
 
     /// The generated list holds each feature once, at the index its status is
@@ -877,15 +1012,98 @@ mod tests {
         );
     }
 
+    /// A capability that requires another reports, once its own gate passes,
+    /// that one's reason and evidence: on a runtime that lacks the required
+    /// table, and on one too old for it. It is still refused as itself.
+    #[test]
+    fn a_capability_reports_the_reason_of_one_it_requires() {
+        use CapabilityStatus::*;
+        use CapabilityUnavailable::*;
+        let requiring: Vec<_> = RuntimeFeature::UNIT
+            .into_iter()
+            .filter(|feature| !feature.requirements().is_empty())
+            .collect();
+        // The configured router and Discovery Server objects, and no others.
+        assert_eq!(
+            requiring,
+            [
+                RuntimeFeature::AdvancedRouterConfiguration,
+                RuntimeFeature::AdvancedSenderAdvertiserConfiguration,
+                RuntimeFeature::AdvancedReceiverAdvertiserConfiguration,
+                RuntimeFeature::AdvancedSenderListenerConfiguration,
+                RuntimeFeature::AdvancedReceiverListenerConfiguration,
+            ]
+        );
+        let without_routing = Fixture::new(
+            |name| !name.starts_with("NDIlib_routing_") || name.ends_with("_v2"),
+            Some("6.4.0.2"),
+            SdkEdition::Advanced,
+        );
+        let too_old = Fixture::new(|_| true, Some("6.3.2.0"), SdkEdition::Advanced);
+        for (feature, fixture, required, reason, detail) in [
+            (
+                RuntimeFeature::AdvancedRouterConfiguration,
+                &without_routing,
+                RuntimeFeature::Routing,
+                SymbolUnavailable,
+                "NDIlib_routing_create",
+            ),
+            (
+                RuntimeFeature::AdvancedSenderAdvertiserConfiguration,
+                &too_old,
+                RuntimeFeature::SenderAdvertising,
+                RuntimeTooOld,
+                "it needs NDI 6.4.0.0 or later and the runtime reports \"NDI SDK TEST 6.3.2.0\"",
+            ),
+        ] {
+            let capabilities = &fixture.capabilities;
+            assert_eq!(capabilities.status(required), Unavailable(reason));
+            let refused = refusal(fixture.evidence().require(feature));
+            if declared(feature) {
+                assert_eq!(capabilities.status(feature), Unavailable(reason));
+                assert_eq!(capabilities.refused_by(feature), required);
+                // Refused as itself, with the requirement's evidence.
+                assert_eq!(refused, Err((feature, reason, detail.into())));
+                assert_eq!(
+                    refusal(fixture.evidence().require(required)),
+                    Err((required, reason, detail.into()))
+                );
+            } else {
+                // A build without the declarations is refused for them first.
+                assert_eq!(
+                    capabilities.status(feature),
+                    Unavailable(BuildAbiUnavailable)
+                );
+                assert_eq!(capabilities.refused_by(feature), feature);
+            }
+        }
+    }
+
     /// Every Advanced table's gate and `Ndi::require_feature` are one gate:
     /// for every reason a status can give, both accept the table's feature or
     /// both refuse it, reporting that feature with the same reason and
-    /// evidence.
+    /// evidence. That includes a runtime without a function of a core
+    /// capability the feature requires: the feature is refused as itself
+    /// before its operation can reach that capability's table.
     #[cfg(feature = "advanced")]
     #[test]
     fn every_advanced_gate_reports_its_own_feature_and_agrees_with_its_status() {
         use crate::sys::advanced::GATES;
+        use CapabilityStatus::*;
         use CapabilityUnavailable::*;
+
+        /// The first entry point of `feature`'s core table, which a runtime
+        /// that exports only the required functions lacks, or `None` when it
+        /// has no table.
+        fn first_core_entry(feature: RuntimeFeature) -> Option<&'static str> {
+            let core = |name: &str| {
+                crate::sys::Core::SYMBOLS
+                    .iter()
+                    .any(|symbol| symbol.to_bytes() == name.as_bytes())
+            };
+            let api = Api::load(&crate::sys::table::ExportsWhere(core)).unwrap();
+            api.missing(feature).map(|symbol| symbol.to_str().unwrap())
+        }
 
         // One table for each Advanced feature other than a preset, and none
         // for a core feature.
@@ -899,46 +1117,101 @@ mod tests {
 
         for &(feature, symbols, gate) in GATES {
             let entry = symbols[0].to_str().unwrap();
+            // Each required capability that has a table, with its first entry
+            // point.
+            let requirements: Vec<_> = feature
+                .requirements()
+                .iter()
+                .filter_map(|&required| Some((required, first_core_entry(required)?)))
+                .collect();
             // Every combination of edition, the table's first entry point and
-            // the version: a shared runtime is Advanced only when it exports
-            // the edition's entry points, but a linked archive has the edition
-            // the build chose, whatever it lacks.
+            // the version, and each required table's first entry point: a
+            // shared runtime is Advanced only when it exports the edition's
+            // entry points, but a linked archive has the edition the build
+            // chose, whatever it lacks.
+            let mut scenarios = vec![
+                (None, SdkEdition::Advanced, "6.4.0.2"),
+                (None, SdkEdition::Standard, "6.4.0.2"),
+                (Some(entry), SdkEdition::Advanced, "6.4.0.2"),
+                (Some(entry), SdkEdition::Standard, "6.4.0.2"),
+                (None, SdkEdition::Advanced, "6.3.2.0"),
+            ];
+            for &(_, required_entry) in &requirements {
+                scenarios.push((Some(required_entry), SdkEdition::Advanced, "6.4.0.2"));
+                scenarios.push((Some(required_entry), SdkEdition::Standard, "6.4.0.2"));
+            }
             let mut reached = Vec::new();
-            for (lacks_entry, edition, version) in [
-                (false, SdkEdition::Advanced, "6.4.0.2"),
-                (false, SdkEdition::Standard, "6.4.0.2"),
-                (true, SdkEdition::Advanced, "6.4.0.2"),
-                (true, SdkEdition::Standard, "6.4.0.2"),
-                (false, SdkEdition::Advanced, "6.3.2.0"),
-            ] {
-                let fixture =
-                    Fixture::new(|name| !lacks_entry || name != entry, Some(version), edition);
+            for (lacking, edition, version) in scenarios {
+                let fixture = Fixture::new(|name| Some(name) != lacking, Some(version), edition);
                 let evidence = fixture.evidence();
-                let context =
-                    format!("{feature:?} lacking {entry}: {lacks_entry}, {edition:?} {version}");
+                let context = format!("{feature:?} lacking {lacking:?}, {edition:?} {version}");
                 let required = refusal(evidence.require(feature));
                 assert_eq!(refusal(gate(evidence)), required, "{context}");
                 let status = fixture.capabilities.status(feature);
                 reached.push(status);
+                // The feature's own gate is reported before its requirements.
+                if declared(feature) && edition == SdkEdition::Standard {
+                    assert_eq!(status, Unavailable(WrongEdition), "{context}");
+                }
+                // Once it passes, a runtime without a required table's entry
+                // point refuses the feature as itself, with that table's
+                // reason and evidence.
+                if let Some(&(needed, needed_entry)) = requirements
+                    .iter()
+                    .find(|(_, entry)| lacking == Some(*entry))
+                {
+                    if declared(feature) && edition == SdkEdition::Advanced {
+                        assert_eq!(status, Unavailable(SymbolUnavailable), "{context}");
+                        assert_eq!(
+                            fixture.capabilities.refused_by(feature),
+                            needed,
+                            "{context}"
+                        );
+                        assert_eq!(
+                            required,
+                            Err((feature, SymbolUnavailable, needed_entry.to_owned())),
+                            "{context}"
+                        );
+                    }
+                }
+                let too_old = format!(
+                    "it needs NDI 6.4.0.0 or later and the runtime reports \"NDI SDK TEST {version}\""
+                );
                 let expected = match status {
-                    CapabilityStatus::Available => Ok(()),
-                    CapabilityStatus::Unavailable(reason) => {
+                    Available => Ok(()),
+                    Unavailable(reason) => {
                         let detail = match reason {
                             // The declaration the build lacks is one of the table's.
                             BuildAbiUnavailable => {
                                 let Err((_, _, detail)) = &required else {
                                     panic!("{context}: accepted without declarations");
                                 };
-                                assert!(symbols.iter().any(|symbol| symbol.to_str() == Ok(detail.as_str())), "{context}: {detail}");
+                                assert!(
+                                    symbols
+                                        .iter()
+                                        .any(|symbol| symbol.to_str() == Ok(detail.as_str())),
+                                    "{context}: {detail}"
+                                );
                                 detail.clone()
                             }
-                            // The entry point the runtime lacks; a runtime that
-                            // exports it but is not Advanced has none to give.
-                            SymbolUnavailable | WrongEdition if lacks_entry => entry.to_owned(),
+                            // The entry point the runtime lacks: the table's
+                            // own or, once its own gate passes, a required
+                            // table's. A runtime that exports the table's own
+                            // but is not Advanced has none to give.
+                            SymbolUnavailable | WrongEdition if lacking == Some(entry) => {
+                                entry.to_owned()
+                            }
+                            SymbolUnavailable
+                                if requirements
+                                    .iter()
+                                    .any(|(_, entry)| lacking == Some(*entry)) =>
+                            {
+                                lacking.unwrap_or_default().to_owned()
+                            }
                             SymbolUnavailable | WrongEdition => String::new(),
-                            RuntimeTooOld | RuntimeVersionUnknown => format!(
-                                "it needs NDI 6.4.0.0 or later and the runtime reports \"NDI SDK TEST {version}\""
-                            ),
+                            // The version gate of the feature or of the one it
+                            // requires.
+                            RuntimeTooOld | RuntimeVersionUnknown => too_old,
                         };
                         Err((feature, reason, detail))
                     }
@@ -947,21 +1220,26 @@ mod tests {
             }
             let expected: &[_] = if declared(feature) {
                 &[
-                    CapabilityStatus::Available,
-                    CapabilityStatus::Unavailable(WrongEdition),
-                    CapabilityStatus::Unavailable(SymbolUnavailable),
+                    Available,
+                    Unavailable(WrongEdition),
+                    Unavailable(SymbolUnavailable),
                 ]
             } else {
-                &[CapabilityStatus::Unavailable(BuildAbiUnavailable)]
+                &[Unavailable(BuildAbiUnavailable)]
             };
             for status in expected {
                 assert!(reached.contains(status), "{feature:?}: {status:?}");
             }
-            // Only the Discovery Server objects have a minimum version.
-            let too_old = CapabilityStatus::Unavailable(RuntimeTooOld);
+            // A feature is too old for a runtime when it has a minimum version
+            // of its own, or requires a feature that has one.
+            let versioned = feature.minimum_version().is_some()
+                || feature
+                    .requirements()
+                    .iter()
+                    .any(|required| required.minimum_version().is_some());
             assert_eq!(
-                reached.contains(&too_old),
-                declared(feature) && feature.minimum_version().is_some(),
+                reached.contains(&Unavailable(RuntimeTooOld)),
+                declared(feature) && versioned,
                 "{feature:?}"
             );
         }

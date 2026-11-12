@@ -64,6 +64,11 @@ impl Fixtures {
             .with("fake_advanced")
             .build(&fixtures.advanced());
         FakeRuntime::new()
+            .with("fake_advanced")
+            .with("fake_configured_creation")
+            .version("6.4.0.0")
+            .build(&fixtures.configured_only());
+        FakeRuntime::new()
             .version("7.0.0.1")
             .build(&fixtures.next_major());
         FakeRuntime::new()
@@ -106,6 +111,12 @@ impl Fixtures {
     }
     fn advanced(&self) -> PathBuf {
         self.root.join("libndi_fake_advanced.so")
+    }
+    /// An Advanced 6.4 module with the configured creation functions of the
+    /// router, advertisers and listeners, but none of the core functions
+    /// those objects go on to use.
+    fn configured_only(&self) -> PathBuf {
+        self.root.join("libndi_configured_only.so")
     }
     fn next_major(&self) -> PathBuf {
         self.root.join("libndi_next_major.so")
@@ -160,6 +171,7 @@ const SCENARIOS: &[Scenario] = &[
     scenario("newer_standard_runtime_is_accepted"),
     scenario("advanced_module_satisfies_a_standard_request"),
     scenario("later_major_version_keeps_version_gated_features"),
+    scenario("configured_objects_are_refused_for_their_own_capability"),
     scenario("process_lifetime"),
     scenario("no_imports"),
     scenario("foreign_symbol"),
@@ -360,6 +372,15 @@ fn child(name: &str, fixtures: &Fixtures) {
             ] {
                 assert!(ndi.capabilities().supports(feature), "{feature:?}");
             }
+        }
+        "configured_objects_are_refused_for_their_own_capability" => {
+            let ndi = Ndi::with_options(&explicit(fixtures.configured_only())).unwrap();
+            assert_eq!(ndi.info().edition(), SdkEdition::Advanced);
+            #[cfg(feature = "advanced")]
+            configured_objects_are_refused_for_their_own_capability(&ndi);
+            // Nothing was created, through either entry point.
+            let log = fs::read_to_string(fixtures.log()).unwrap();
+            assert_eq!(log, "initialize\n");
         }
         "process_lifetime" => {
             let ndi = Ndi::with_options(&options).unwrap();
@@ -564,5 +585,99 @@ fn child(name: &str, fixtures: &Fixtures) {
             );
         }
         _ => panic!("unknown loader scenario {name}"),
+    }
+}
+
+/// A configured router, advertiser or listener goes on to use the functions
+/// of a core capability, which `ndi` lacks. Creating one is refused for its
+/// own capability, exactly as its status says, with the core capability's
+/// reason and evidence, and before any native call.
+#[cfg(feature = "advanced")]
+fn configured_objects_are_refused_for_their_own_capability(ndi: &Ndi) {
+    use grafton_ndi::{
+        advanced::AdvancedConfig,
+        discovery::{
+            AdvertiserOptions, ListenerOptions, RecvAdvertiser, RecvListener, SendAdvertiser,
+            SendListener,
+        },
+        routing::{Router, RouterOptions},
+    };
+    let config = AdvancedConfig::parse("{}").unwrap();
+    let advertisers = AdvertiserOptions::default()
+        .servers("127.0.0.1")
+        .config(config.clone());
+    let listeners = ListenerOptions::default()
+        .server("127.0.0.1")
+        .config(config.clone());
+    let router = RouterOptions::new("configured").config(config);
+    // A build with the declarations accepts the configured sender, which the
+    // module exports in full; one without them refuses every configured
+    // object for its declarations first.
+    let declared = ndi
+        .capabilities()
+        .supports(RuntimeFeature::AdvancedSenderConfiguration);
+    for (feature, required, first_missing, error) in [
+        (
+            RuntimeFeature::AdvancedRouterConfiguration,
+            RuntimeFeature::Routing,
+            "NDIlib_routing_create",
+            Router::new(ndi, &router).err(),
+        ),
+        (
+            RuntimeFeature::AdvancedSenderAdvertiserConfiguration,
+            RuntimeFeature::SenderAdvertising,
+            "NDIlib_send_advertiser_create",
+            SendAdvertiser::new(ndi, &advertisers).err(),
+        ),
+        (
+            RuntimeFeature::AdvancedReceiverAdvertiserConfiguration,
+            RuntimeFeature::ReceiverAdvertising,
+            "NDIlib_recv_advertiser_create",
+            RecvAdvertiser::new(ndi, &advertisers).err(),
+        ),
+        (
+            RuntimeFeature::AdvancedSenderListenerConfiguration,
+            RuntimeFeature::SenderDiscovery,
+            "NDIlib_send_listener_create",
+            SendListener::new(ndi, &listeners).err(),
+        ),
+        (
+            RuntimeFeature::AdvancedReceiverListenerConfiguration,
+            RuntimeFeature::ReceiverDiscovery,
+            "NDIlib_recv_listener_create",
+            RecvListener::new(ndi, &listeners).err(),
+        ),
+    ] {
+        assert_eq!(
+            ndi.capabilities().status(required),
+            CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable),
+            "{required:?}"
+        );
+        let status = ndi.capabilities().status(feature);
+        let expected = if declared {
+            CapabilityUnavailable::SymbolUnavailable
+        } else {
+            CapabilityUnavailable::BuildAbiUnavailable
+        };
+        assert_eq!(
+            status,
+            CapabilityStatus::Unavailable(expected),
+            "{feature:?}"
+        );
+        for error in [error, ndi.require_feature(feature).err()] {
+            let (refused, reason, detail) = match error {
+                Some(Error::UnsupportedCapability {
+                    feature,
+                    reason,
+                    detail,
+                }) => (feature, reason, detail),
+                other => panic!("{feature:?}: expected an unsupported capability, got {other:?}"),
+            };
+            assert_eq!((refused, reason), (feature, expected));
+            if declared {
+                // The evidence is the core capability's: its first function.
+                assert_eq!(detail, first_missing, "{feature:?}");
+            }
+        }
     }
 }

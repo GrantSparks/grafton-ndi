@@ -20,7 +20,12 @@
 //! * `fake_advanced` — also export the Advanced SDK entry points;
 //! * `fake_receiver_v4` — also export only `NDIlib_recv_create_v4`, as a newer
 //!   Standard runtime might;
-//! * `fake_omit_required` — omit one required function.
+//! * `fake_omit_required` — omit one required function;
+//! * `fake_configured_creation` — also export the Advanced entry points that
+//!   create a router, advertisers and listeners with a configuration. Each
+//!   logs `<entry point>` and creates nothing. Without `fake_objects` and
+//!   `fake_discovery`, the core functions those objects go on to use are
+//!   missing.
 //!
 //! Like the SDK, advertisers and listeners are created only for a Discovery
 //! Server address; this runtime has no configuration to supply one.
@@ -709,4 +714,29 @@ pub unsafe extern "C" fn NDIlib_send_set_video_async_completion(
     let sender = unsafe { &mut *p_instance.cast::<objects::Sender>() };
     sender.opaque = p_opaque;
     sender.completion = p_deallocator;
+}
+
+/// Export the Advanced entry points that create an object from its settings
+/// and a configuration. Each logs its call and creates nothing.
+#[cfg(fake_configured_creation)]
+macro_rules! configured_creation {
+    ($($name:ident($Settings:ty) -> $Instance:ty;)+) => {$(
+        #[no_mangle]
+        pub unsafe extern "C" fn $name(
+            p_create_settings: *const $Settings,
+            p_config_data: *const c_char,
+        ) -> $Instance {
+            log(stringify!($name));
+            std::ptr::null_mut()
+        }
+    )+};
+}
+
+#[cfg(fake_configured_creation)]
+configured_creation! {
+    NDIlib_routing_create_v2(NDIlib_routing_create_t) -> NDIlib_routing_instance_t;
+    NDIlib_send_advertiser_create_ex(NDIlib_send_advertiser_create_t) -> NDIlib_send_advertiser_instance_t;
+    NDIlib_recv_advertiser_create_ex(NDIlib_recv_advertiser_create_t) -> NDIlib_recv_advertiser_instance_t;
+    NDIlib_send_listener_create_ex(NDIlib_send_listener_create_t) -> NDIlib_send_listener_instance_t;
+    NDIlib_recv_listener_create_ex(NDIlib_recv_listener_create_t) -> NDIlib_recv_listener_instance_t;
 }

@@ -280,7 +280,14 @@ as `None`. Most programs need changes; see the
 - Capability queries in the new `capabilities` module. `capabilities()` reports
   each `RuntimeFeature`, the Advanced SDK's included, as available or gives the
   reason it is not, and `require_feature` returns that reason as an error. Both
-  are on `Runtime` and on `Ndi`.
+  are on `Runtime` and on `Ndi`. A capability whose operations go on to use
+  another one's functions is unavailable whenever that one is, and then reports
+  that one's reason and evidence: `AdvancedRouterConfiguration` requires
+  `Routing`, and the four Advanced advertiser and listener configurations
+  require `SenderAdvertising`, `ReceiverAdvertising`, `SenderDiscovery` and
+  `ReceiverDiscovery`, and so NDI 6.4.0 or later. Creating such an object with
+  a configuration is refused under its own capability, exactly when
+  `capabilities()` says it is unavailable.
 - `Error::RuntimeLoadFailed`, `Error::RuntimeConflict`,
   `Error::UnsupportedCpu`, `Error::UnsupportedCapability`,
   `Error::NativeOperationFailed`, `Error::NotConnected`,

@@ -152,11 +152,27 @@ symbol up by name. Every native call goes through a table defined with the
    Do not add to `Core` unless every supported runtime exports the function.
 3. A new capability is one entry in the `runtime_features!` list in
    `src/capabilities.rs`: its documentation, its variant, whether it is
-   `core` or `advanced`, the name it is reported under and, with `since`, a
-   minimum version only when the exported functions are not evidence enough.
-   The enum, its name, version and edition lookups, the place `Capabilities`
-   keeps its status and the tests' list of every capability are generated
-   from that entry.
+   `core` or `advanced` and the name it is reported under, then any of:
+
+   - `since` and a minimum version, only when the exported functions are not
+     evidence enough;
+   - `requires` and the capabilities whose tables its operations also take,
+     each listed before it. A configured router, for example, goes on to use
+     the functions of `Routing`, so `AdvancedRouterConfiguration requires
+     Routing`. Once the capability's own gate passes, it reports the status
+     of the first requirement that is unavailable, and its operations are
+     refused under the capability itself, with that requirement's reason and
+     evidence, before they take any other table;
+   - `ungated` and the reason, for a core capability that every runtime
+     provides.
+
+   A core capability is gated by its table in `optional_tables!`, by `since`
+   or by `requires`. The crate does not compile when a core capability has
+   none of these and does not say `ungated`, or says it and has one.
+
+   The enum, its name, version, requirement and edition lookups, the place
+   `Capabilities` keeps its status and the tests' list of every capability
+   are generated from that entry.
 4. Call the function from a wrapper that obtained the table with
    `ndi.table::<sys::Routing>()?`. That accessor is the only way to reach an
    optional table, and it applies the capability's gate. `src/routing.rs`

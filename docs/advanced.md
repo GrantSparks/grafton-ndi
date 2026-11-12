@@ -57,6 +57,7 @@ an operation returns:
 | Built with headers that do not declare the requested `PassthroughPreset` | `Error::UnsupportedCapability` for `RuntimeFeature::Passthrough` with that preset, with `reason` `BuildAbiUnavailable`; `detail` names the receiver color format the headers lack |
 | Standard runtime selected | `Error::UnsupportedCapability` with `reason` `WrongEdition`; `detail` names the operation's function when the runtime does not export it |
 | Advanced runtime that does not export a function the operation needs | `Error::UnsupportedCapability` with `reason` `SymbolUnavailable`; `detail` names the function |
+| Advanced runtime without the core capability whose functions the created object goes on to use (`Routing` for a configured router, the advertising or discovery capability for a configured Discovery Server object) | `Error::UnsupportedCapability` for the operation's own `RuntimeFeature`, with the `reason` and `detail` that core capability gives, such as `SymbolUnavailable` and the function the runtime does not export |
 | Every requirement met | The operation runs |
 
 `feature` is the `RuntimeFeature` the operation needs and `reason` a
@@ -72,7 +73,8 @@ the Advanced SDK.
 
 The Discovery Server advertisers and listeners also need an NDI 6.4.0 or later
 runtime, with or without a configuration, so an Advanced 6.3.2 runtime refuses
-to create them.
+to create them, reporting `RuntimeTooOld`: without a configuration for their
+core capability, and with one for their Advanced capability.
 
 ## Capabilities
 
@@ -110,11 +112,18 @@ only the operations it names:
 A packet receiver is created as a receiver with a configuration is, so
 `Passthrough` needs everything `AdvancedReceiverConfiguration` does, and also
 that the build's headers declare the receiver color format that selects the
-preset. The four advertiser and listener configurations need NDI 6.4.0 or
-later, as the Discovery Server objects they create do. A runtime that exports
-only one of the two creation functions `NDIlib_send_create_v2` and
-`NDIlib_recv_create_v4` is not an Advanced SDK runtime, so every Advanced
-capability is refused for it:
+preset. Each configured object that goes on to use the functions of a core
+capability requires it: `AdvancedRouterConfiguration` requires `Routing`, and
+the four advertiser and listener configurations require `SenderAdvertising`,
+`ReceiverAdvertising`, `SenderDiscovery` and `ReceiverDiscovery`, and so NDI
+6.4.0 or later. Once its own functions are in place, such a capability is
+unavailable whenever the one it requires is, and reports that one's reason, so
+creating the object is refused for its own capability, with the core
+capability's evidence, and never for the core one.
+
+A runtime that exports only one of the two creation functions
+`NDIlib_send_create_v2` and `NDIlib_recv_create_v4` is not an Advanced SDK
+runtime, so every Advanced capability is refused for it:
 
 ```rust
 use grafton_ndi::{capabilities::RuntimeFeature, Ndi};

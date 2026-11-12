@@ -14,6 +14,14 @@ use std::{
     time::Duration,
 };
 
+/// The Advanced entry point that creates a listener of table `A` from its
+/// settings and a JSON configuration, returning null when the SDK creates none.
+#[cfg(feature = "advanced")]
+type ConfiguredEntry<A> = unsafe extern "C" fn(
+    *const <A as ListenerApi>::Settings,
+    *const c_char,
+) -> <A as ListenerApi>::Instance;
+
 /// The operations the sender and receiver listener tables have in common.
 trait ListenerApi: sys::Table + Sync {
     /// The native listener handle.
@@ -24,6 +32,12 @@ trait ListenerApi: sys::Table + Sync {
     type Entry;
     /// What identifies one of the peers this listener lists.
     type Id: Identifier;
+    /// The Advanced table of the entry point that also takes a configuration.
+    #[cfg(feature = "advanced")]
+    type Configured: sys::Table;
+    /// That entry point's name.
+    #[cfg(feature = "advanced")]
+    const CONFIGURED: &'static str;
 
     /// The settings for a listener of the Discovery Server at `url`, or of the
     /// one the SDK is configured with when `url` is null.
@@ -36,6 +50,10 @@ trait ListenerApi: sys::Table + Sync {
     /// The URL of `settings` must be null or a NUL-terminated string that
     /// outlives the call.
     unsafe fn create(&self, settings: &Self::Settings) -> Self::Instance;
+
+    /// The entry point of `table` that also takes a configuration.
+    #[cfg(feature = "advanced")]
+    fn configured_entry(table: &'static Self::Configured) -> ConfiguredEntry<Self>;
 
     /// # Safety
     ///
@@ -61,19 +79,28 @@ macro_rules! listener_api {
     (
         $Table:ty, $Instance:ty, $Entry:ty, $Id:ty, $Settings:ident,
         $create:ident, $destroy:ident, $is_connected:ident, $server_url:ident, $entries:ident,
-        $wait:ident, $subscribe:ident, $unsubscribe:ident, $events:ident, $free_events:ident
+        $wait:ident, $subscribe:ident, $unsubscribe:ident, $events:ident, $free_events:ident,
+        $Configured:ident::$create_configured:ident
     ) => {
         impl ListenerApi for $Table {
             type Instance = $Instance;
             type Settings = $Settings;
             type Entry = $Entry;
             type Id = $Id;
+            #[cfg(feature = "advanced")]
+            type Configured = sys::advanced::$Configured;
+            #[cfg(feature = "advanced")]
+            const CONFIGURED: &'static str = stringify!($create_configured);
 
             fn settings(url: *const c_char) -> Self::Settings {
                 $Settings { p_url_address: url }
             }
             unsafe fn create(&self, settings: &Self::Settings) -> Self::Instance {
                 self.$create(settings)
+            }
+            #[cfg(feature = "advanced")]
+            fn configured_entry(table: &'static Self::Configured) -> ConfiguredEntry<Self> {
+                sys::advanced::native!($Configured, table => table.$create_configured)
             }
             unsafe fn destroy(&self, instance: Self::Instance) {
                 self.$destroy(instance)
@@ -134,7 +161,8 @@ listener_api!(
     NDIlib_send_listener_subscribe_events,
     NDIlib_send_listener_unsubscribe_events,
     NDIlib_send_listener_get_events,
-    NDIlib_send_listener_free_events
+    NDIlib_send_listener_free_events,
+    SenderListenerConfiguration::NDIlib_send_listener_create_ex
 );
 listener_api!(
     sys::ReceiverDiscovery,
@@ -151,7 +179,8 @@ listener_api!(
     NDIlib_recv_listener_subscribe_events,
     NDIlib_recv_listener_unsubscribe_events,
     NDIlib_recv_listener_get_events,
-    NDIlib_recv_listener_free_events
+    NDIlib_recv_listener_free_events,
+    ReceiverListenerConfiguration::NDIlib_recv_listener_create_ex
 );
 
 /// The Discovery Server a listener connects to.
@@ -582,8 +611,26 @@ impl<A: ListenerApi> Drop for Listener<A> {
     }
 }
 impl<A: ListenerApi> Listener<A> {
-    /// Connect to the Discovery Server `options` name.
+    /// Connect to the Discovery Server `options` name, through the Advanced
+    /// entry point when the options carry a configuration.
     fn new(ndi: &Ndi, options: &ListenerOptions) -> Result<Self> {
+        #[cfg(feature = "advanced")]
+        if let Some(config) = &options.config {
+            use crate::advanced::Configurable;
+            // SAFETY: the closure returns what the configured entry point
+            // returned for the settings and the configuration it was handed.
+            return unsafe {
+                Self::configured(
+                    ndi,
+                    options,
+                    A::CONFIGURED,
+                    config,
+                    |table: &'static A::Configured, settings, text| {
+                        A::configured_entry(table)(settings, text)
+                    },
+                )
+            };
+        }
         // SAFETY: the SDK's listener creation returns null or a fresh listener
         // that nothing else owns, and the settings outlive the call.
         unsafe {
@@ -597,9 +644,10 @@ impl<A: ListenerApi> Listener<A> {
         }
     }
 
-    /// The one creation path of both listeners: create the native listener
-    /// through `create`, which is handed the table and the native settings
-    /// for `options`, and keep `config` for as long as the listener lives.
+    /// The one creation path of both listeners, with and without a
+    /// configuration: create the native listener through `create`, which is
+    /// handed the table and the native settings for `options`, and keep
+    /// `config` for as long as the listener lives.
     ///
     /// # Safety
     ///
@@ -611,6 +659,9 @@ impl<A: ListenerApi> Listener<A> {
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(&'static A, &A::Settings) -> A::Instance,
     ) -> Result<Self> {
+        // A listener with a configuration gets here only once its own
+        // capability, which requires this table's, has been allowed, so it
+        // is never refused for this table.
         let api = ndi.table::<A>()?;
         if options
             .server
@@ -721,6 +772,26 @@ impl<A: ListenerApi> Listener<A> {
     }
 }
 
+#[cfg(feature = "advanced")]
+impl<A: ListenerApi> crate::advanced::Configurable for Listener<A> {
+    type Options = ListenerOptions;
+    type Settings = A::Settings;
+    type Instance = A::Instance;
+
+    /// A listener the SDK does not create is reported by the server it was
+    /// given, so the entry point's name is not needed.
+    unsafe fn create_with(
+        ndi: &Ndi,
+        options: &ListenerOptions,
+        _operation: &'static str,
+        config: crate::advanced::AdvancedConfig,
+        create: impl FnOnce(&A::Settings) -> A::Instance,
+    ) -> Result<Self> {
+        // SAFETY: forwarded to the caller's obligation.
+        unsafe { Self::create(ndi, options, Some(config), |_, settings| create(settings)) }
+    }
+}
+
 /// Lists the senders registered with a Discovery Server and reports their
 /// events.
 ///
@@ -757,57 +828,6 @@ pub struct SendListener {
 /// data and can be shared freely.
 pub struct RecvListener {
     inner: Listener<sys::ReceiverDiscovery>,
-}
-
-#[cfg(feature = "advanced")]
-impl SendListener {
-    /// Create the listener with `config`, through the creation path both
-    /// listeners share. A listener the SDK does not create is reported by the
-    /// server it was given, so the entry point's name is not needed.
-    ///
-    /// # Safety
-    ///
-    /// `create` returns null or a live listener of `ndi`'s runtime, made from
-    /// the settings it was handed, that nothing else owns.
-    pub(crate) unsafe fn create(
-        ndi: &Ndi,
-        options: &ListenerOptions,
-        _operation: &'static str,
-        config: Option<crate::advanced::AdvancedConfig>,
-        create: impl FnOnce(
-            &'static sys::SenderDiscovery,
-            &NDIlib_send_listener_create_t,
-        ) -> NDIlib_send_listener_instance_t,
-    ) -> Result<Self> {
-        // SAFETY: forwarded to the caller's obligation.
-        let inner = unsafe { Listener::create(ndi, options, config, create) }?;
-        Ok(Self { inner })
-    }
-}
-#[cfg(feature = "advanced")]
-impl RecvListener {
-    /// Create the listener with `config`, through the creation path both
-    /// listeners share. A listener the SDK does not create is reported by the
-    /// server it was given, so the entry point's name is not needed.
-    ///
-    /// # Safety
-    ///
-    /// `create` returns null or a live listener of `ndi`'s runtime, made from
-    /// the settings it was handed, that nothing else owns.
-    pub(crate) unsafe fn create(
-        ndi: &Ndi,
-        options: &ListenerOptions,
-        _operation: &'static str,
-        config: Option<crate::advanced::AdvancedConfig>,
-        create: impl FnOnce(
-            &'static sys::ReceiverDiscovery,
-            &NDIlib_recv_listener_create_t,
-        ) -> NDIlib_recv_listener_instance_t,
-    ) -> Result<Self> {
-        // SAFETY: forwarded to the caller's obligation.
-        let inner = unsafe { Listener::create(ndi, options, config, create) }?;
-        Ok(Self { inner })
-    }
 }
 
 const _: () = {
@@ -893,10 +913,6 @@ impl SendListener {
     ///
     /// [sender discovery]: crate::capabilities::RuntimeFeature::SenderDiscovery
     pub fn new(ndi: &Ndi, options: &ListenerOptions) -> Result<Self> {
-        #[cfg(feature = "advanced")]
-        if let Some(config) = &options.config {
-            return Self::new_configured(ndi, options, config);
-        }
         Ok(Self {
             inner: Listener::new(ndi, options)?,
         })
@@ -957,10 +973,6 @@ impl RecvListener {
     ///
     /// [receiver discovery]: crate::capabilities::RuntimeFeature::ReceiverDiscovery
     pub fn new(ndi: &Ndi, options: &ListenerOptions) -> Result<Self> {
-        #[cfg(feature = "advanced")]
-        if let Some(config) = &options.config {
-            return Self::new_configured(ndi, options, config);
-        }
         Ok(Self {
             inner: Listener::new(ndi, options)?,
         })

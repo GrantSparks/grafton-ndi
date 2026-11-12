@@ -15,25 +15,29 @@
 //! [`Configurable::configured`] is the one place a configuration reaches the
 //! SDK: it takes the configured entry point's table before anything is built
 //! or created, then hands the SDK the configuration's own buffer and the owner
-//! a clone of it to keep. `configurable!` implements the trait for each object
-//! and defines its `new_configured` on that path. The object's `new` calls
-//! `new_configured` when its options carry a configuration, and otherwise
-//! gives the creation path the SDK's plain entry point and no configuration.
+//! a clone of it to keep. `configurable!` implements the trait for the finder,
+//! sender, receiver and router, and defines each one's `new_configured` on
+//! that path; the object's `new` calls `new_configured` when its options carry
+//! a configuration, and otherwise gives the creation path the SDK's plain
+//! entry point and no configuration. The advertisers and listeners share one
+//! generic owner each, which implements the trait once, beside its creation
+//! path, and makes the same choice in its own `new`.
+//!
+//! Taking the configured table applies its capability's gate, which includes
+//! the gates of the capabilities it requires: the router's includes source
+//! routing, and each Discovery Server object's includes the core capability
+//! whose functions it goes on to use. A configured object is therefore refused
+//! under its own capability before its creation path takes any other table.
 
 use std::ffi::c_char;
 
 use super::AdvancedConfig;
 use crate::{
-    discovery::{
-        AdvertiserOptions, ListenerOptions, RecvAdvertiser, RecvListener, SendAdvertiser,
-        SendListener,
-    },
     routing::{Router, RouterOptions},
     sys::{
         advanced::{
-            native, FinderConfiguration, ReceiverAdvertiserConfiguration, ReceiverConfiguration,
-            ReceiverListenerConfiguration, RouterConfiguration, SenderAdvertiserConfiguration,
-            SenderConfiguration, SenderListenerConfiguration,
+            native, FinderConfiguration, ReceiverConfiguration, RouterConfiguration,
+            SenderConfiguration,
         },
         bindings::*,
         Table,
@@ -175,31 +179,18 @@ configurable!(
     Router(RouterOptions, NDIlib_routing_create_t) -> NDIlib_routing_instance_t,
     RouterConfiguration::NDIlib_routing_create_v2
 );
-configurable!(
-    SendAdvertiser(AdvertiserOptions, NDIlib_send_advertiser_create_t)
-        -> NDIlib_send_advertiser_instance_t,
-    SenderAdvertiserConfiguration::NDIlib_send_advertiser_create_ex
-);
-configurable!(
-    RecvAdvertiser(AdvertiserOptions, NDIlib_recv_advertiser_create_t)
-        -> NDIlib_recv_advertiser_instance_t,
-    ReceiverAdvertiserConfiguration::NDIlib_recv_advertiser_create_ex
-);
-configurable!(
-    SendListener(ListenerOptions, NDIlib_send_listener_create_t)
-        -> NDIlib_send_listener_instance_t,
-    SenderListenerConfiguration::NDIlib_send_listener_create_ex
-);
-configurable!(
-    RecvListener(ListenerOptions, NDIlib_recv_listener_create_t)
-        -> NDIlib_recv_listener_instance_t,
-    ReceiverListenerConfiguration::NDIlib_recv_listener_create_ex
-);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{capabilities::RuntimeFeature, Error, Source};
+    use crate::{
+        capabilities::RuntimeFeature,
+        discovery::{
+            AdvertiserOptions, ListenerOptions, RecvAdvertiser, RecvListener, SendAdvertiser,
+            SendListener,
+        },
+        Error, Source,
+    };
 
     /// Without the Advanced SDK each constructor given a configuration is
     /// refused before anything native is created, whichever gate refuses it

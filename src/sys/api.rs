@@ -216,9 +216,29 @@ macro_rules! optional_tables {
 
             /// The first entry point behind `feature` that the implementation
             /// does not export. `None` when it exports them all, and for a
-            /// feature with no table here: one that is only a version gate,
-            /// or that belongs to the Advanced SDK.
+            /// feature with no table here: a core feature gated only by its
+            /// version or its requirements, or one that belongs to the
+            /// Advanced SDK.
             pub(crate) fn missing(&self, feature: RuntimeFeature) -> Option<&'static CStr> {
+                // A core feature with no table here, no minimum version and no
+                // requirement would be reported available on every runtime.
+                // The crate does not compile unless each such feature says it
+                // is `ungated`, and no other one does.
+                const _: () = {
+                    let mut index = 0;
+                    while index < RuntimeFeature::UNIT.len() {
+                        let feature = RuntimeFeature::UNIT[index];
+                        let gated = matches!(feature, $(RuntimeFeature::$feature)|+)
+                            || feature.minimum_version().is_some()
+                            || !feature.requirements().is_empty();
+                        assert!(
+                            feature.is_advanced() || gated != feature.is_ungated(),
+                            "a core capability without a table, `since` or `requires` must be \
+                             declared `ungated`, and only such a one may be"
+                        );
+                        index += 1;
+                    }
+                };
                 match feature {
                     $(RuntimeFeature::$feature => self.$field.0.as_ref().err().copied(),)+
                     _ => None,
@@ -408,9 +428,12 @@ impl<'a> Evidence<'a> {
         feature: RuntimeFeature,
         reason: CapabilityUnavailable,
     ) -> Error {
+        // A status copied from a capability that `feature` requires is
+        // reported with that capability's evidence.
+        let evidence = self.capabilities.refused_by(feature);
         let detail = match reason {
             CapabilityUnavailable::RuntimeTooOld | CapabilityUnavailable::RuntimeVersionUnknown => {
-                feature.minimum_version().map(|minimum| {
+                evidence.minimum_version().map(|minimum| {
                     format!(
                         "it needs NDI {minimum} or later and the runtime reports {:?}",
                         self.info.raw_version
@@ -423,7 +446,7 @@ impl<'a> Evidence<'a> {
             CapabilityUnavailable::SymbolUnavailable
             | CapabilityUnavailable::WrongEdition
             | CapabilityUnavailable::BuildAbiUnavailable => self
-                .missing(feature)
+                .missing(evidence)
                 .map(|symbol| symbol.to_string_lossy().into_owned()),
         };
         Error::UnsupportedCapability {

@@ -152,6 +152,9 @@ impl Router {
             &NDIlib_routing_create_t,
         ) -> NDIlib_routing_instance_t,
     ) -> Result<Self> {
+        // A router with a configuration gets here only once its own
+        // capability, which requires routing, has been allowed, so it is
+        // never refused for `Routing`.
         let routing = ndi.table::<sys::Routing>()?;
         let name = CString::new(options.name.as_str())?;
         let groups = options.groups.as_deref().map(CString::new).transpose()?;
