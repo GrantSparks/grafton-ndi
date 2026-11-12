@@ -195,6 +195,12 @@ as `None`. Most programs need changes; see the
   hands a refused frame back in a `Rejected`. Every video send checks that the
   sender's runtime supports the frame's pixel format before anything reaches
   the SDK.
+- `Sender::tally(timeout)` is replaced by `Sender::tally()`, which returns the
+  current `Tally` every time, and `Sender::wait_for_tally_change(timeout)`,
+  which returns `Some` with the new tally when it changes and `None` when the
+  timeout passes first. 2.0's `tally` returned `None` whenever the tally had
+  not changed since the previous query, so a poll of a source that stayed on
+  program reported it only once.
 - `Sender` has sealed modes, as receivers do: `Sender<M: SenderMode = RawSend>`,
   and `Sender` still names the ordinary sender with every operation. The
   source, metadata in both directions, tally, connection count and connection
@@ -238,6 +244,11 @@ as `None`. Most programs need changes; see the
 
 ### Added
 
+- `Sender::send_video` takes a `BorrowedVideoFrame`, by value or by reference,
+  as well as `&VideoFrame`, and sends it in place: a borrowed buffer, including
+  one with padded rows, is sent without being copied, and can be reused when
+  the call returns. In 2.0 a borrowed frame reached the SDK only through
+  `send_video_async_copy`, which copies the whole frame on every call.
 - Runtime selection in two explicit steps. `Runtime::select` loads the NDI
   library and pins it for the process without starting NDI;
   `Runtime::initialize` starts NDI and returns an `Ndi` handle. `Ndi::new` and

@@ -314,7 +314,7 @@ an RGB staging frame. Codec storage and encoded output require additional memory
 
 ### Publish Sources
 
-`Sender` publishes a named NDI source and sends video, audio, and metadata. It also exposes connection count, tally, failover, and connection metadata APIs. The Advanced `CompressedSender` and `QueuedSender` lend the same shared operations through `sender()`, as a `Sender` in another mode that has no uncompressed video sends and cannot be registered with an advertiser.
+`Sender` publishes a named NDI source and sends video, audio, and metadata. It also exposes connection count, tally (`tally()` for the current state, `wait_for_tally_change(timeout)` to wait for a change), failover, and connection metadata APIs. The Advanced `CompressedSender` and `QueuedSender` lend the same shared operations through `sender()`, as a `Sender` in another mode that has no uncompressed video sends and cannot be registered with an advertiser.
 
 ```rust
 use grafton_ndi::{FrameRate, PixelFormat, Sender, SenderOptions, VideoFrame};
@@ -423,7 +423,7 @@ The crate's public API is organized around a small set of resource types:
 - `FrameSync` wraps a receiver for clock-corrected pull capture.
 - `VideoFrame`, `AudioFrame`, and `MetadataFrame` represent application-owned frame data.
 
-Most applications can start with owned frame APIs such as `receiver.video().capture()` and `sender.send_video()`. For receive hot paths, borrowed receive refs keep data in SDK buffers without an extra copy. `sender.send_video_async(frame)`, the SDK's asynchronous video send, takes `&mut Sender` and moves an owned `VideoFrame` into the sender without copying pixels. It returns the previous completed frame for reuse, and `Ok(None)` on the first call; a frame the sender refuses comes back inside `Rejected`. This avoids Rust wrapper pixel copies; SDK encoding and network processing may still copy data. Use two frames and call `finish_video_async()` to recover the final frame. For borrowed buffers, `send_video_async_copy(&frame)` explicitly copies pixels and metadata into sender-owned storage and returns the previous frame as `Result<Option<VideoFrame>>`; the source buffer can immediately be reused. Owned frames are `Clone`; cloning copies their pixels.
+Most applications can start with owned frame APIs such as `receiver.video().capture()` and `sender.send_video()`. For receive hot paths, borrowed receive refs keep data in SDK buffers without an extra copy. `sender.send_video_async(frame)`, the SDK's asynchronous video send, takes `&mut Sender` and moves an owned `VideoFrame` into the sender without copying pixels. It returns the previous completed frame for reuse, and `Ok(None)` on the first call; a frame the sender refuses comes back inside `Rejected`. This avoids Rust wrapper pixel copies; SDK encoding and network processing may still copy data. Use two frames and call `finish_video_async()` to recover the final frame. For borrowed or padded-stride buffers, build a `BorrowedVideoFrame` and call `send_video(frame)`: the synchronous send reads the pixels and metadata in place without allocating or copying, and the SDK has released the buffer when the call returns, so it can be reused immediately. `send_video_async_copy(&frame)` is for the asynchronous pipeline: it copies pixels and metadata into sender-owned storage and returns the previous frame as `Result<Option<VideoFrame>>`. Owned frames are `Clone`; cloning copies their pixels.
 
 Frames carry time as typed values in 100-nanosecond ticks: `Timecode` is the editorial timecode, which starts at `Timecode::SYNTHESIZE` (the SDK generates one) on every frame built for sending, and `SdkTimestamp` is the time the sender submitted a frame, which received frames report as `Option<SdkTimestamp>`. Frame rates are `FrameRate` values, and a pixel format converts to and from its `FourCc`.
 
@@ -445,7 +445,7 @@ Frame layout fields that describe SDK-facing memory are private. Builders, acces
 
 - Use owned frame APIs when clarity matters or when frame data must outlive the SDK capture buffer.
 - Use borrowed receive refs when you need direct access to SDK-owned buffers during a tight capture loop.
-- Use two owned video frames with `send_video_async` to reuse pixel allocations without per-send copies; use `send_video_async_copy` when borrowing external buffers is more convenient.
+- Use two owned video frames with `send_video_async` to reuse pixel allocations without per-send copies; send a `BorrowedVideoFrame` over an external or padded buffer with the synchronous `send_video`, which copies nothing, and use `send_video_async_copy` only when the asynchronous pipeline is wanted for a borrowed buffer, accepting the copy.
 - Use `FrameSync` when capture timing is driven by an external output clock.
 - Use lower bandwidth modes for previews and monitoring surfaces.
 - Keep image encoding off real-time paths unless the workload is sized for compression.

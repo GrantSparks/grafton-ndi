@@ -8,7 +8,8 @@ fn common<M: SenderMode>(sender: &Sender<M>, metadata: &MetadataFrame, failover:
     let _ = sender.source();
     sender.send_metadata(metadata);
     let _ = sender.capture_metadata(Duration::ZERO);
-    let _ = sender.tally(Duration::ZERO);
+    let _ = sender.tally();
+    let _ = sender.wait_for_tally_change(Duration::ZERO);
     let _ = sender.connection_count(Duration::ZERO);
     sender.add_connection_metadata(metadata);
     sender.clear_connection_metadata();

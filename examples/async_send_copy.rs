@@ -1,4 +1,7 @@
 //! Explicit copying convenience for pixels owned by another subsystem.
+//!
+//! `Sender::send_video(frame)` sends the same borrowed frame synchronously
+//! without copying it; copy only when the asynchronous pipeline is wanted.
 use grafton_ndi::{BorrowedVideoFrame, FrameRate, Ndi, PixelFormat, SenderOptions};
 
 fn main() -> Result<(), grafton_ndi::Error> {

@@ -10,7 +10,8 @@ fn compressed(sender: &CompressedSender, metadata: &MetadataFrame, failover: &So
     let _ = sender.source();
     sender.send_metadata(metadata);
     let _ = sender.capture_metadata(Duration::ZERO);
-    let _ = sender.tally(Duration::ZERO);
+    let _ = sender.tally();
+    let _ = sender.wait_for_tally_change(Duration::ZERO);
     let _ = sender.connection_count(Duration::ZERO);
     sender.add_connection_metadata(metadata);
     sender.clear_connection_metadata();
@@ -34,7 +35,8 @@ fn queued(
     let _ = sender.send_audio_interleaved_f32(interleaved);
     sender.send_metadata(metadata);
     let _ = sender.capture_metadata(Duration::ZERO);
-    let _ = sender.tally(Duration::ZERO);
+    let _ = sender.tally();
+    let _ = sender.wait_for_tally_change(Duration::ZERO);
     let _ = sender.connection_count(Duration::ZERO);
     sender.add_connection_metadata(metadata);
     sender.clear_connection_metadata();

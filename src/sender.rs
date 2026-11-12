@@ -278,8 +278,10 @@ impl fmt::Debug for Inner {
 
 /// A borrowed video frame that references external pixel data.
 ///
-/// [`Sender::send_video_async_copy`] copies its pixels and metadata into an
-/// owned frame; source buffers can be reused immediately after submission.
+/// [`Sender::send_video`] sends it synchronously without copying, including
+/// with padded rows; the buffer can be reused as soon as the call returns.
+/// [`Sender::send_video_async_copy`] instead copies its pixels and metadata
+/// into an owned frame for the asynchronous pipeline.
 ///
 /// Create one with [`Self::builder`]. Construction borrows without
 /// allocation and validates the entire supported uncompressed layout once.
@@ -572,6 +574,12 @@ impl<'buf> From<&'buf VideoFrame> for BorrowedVideoFrame<'buf> {
     }
 }
 
+impl<'a, 'buf> From<&'a BorrowedVideoFrame<'buf>> for BorrowedVideoFrame<'buf> {
+    fn from(frame: &'a BorrowedVideoFrame<'buf>) -> Self {
+        *frame
+    }
+}
+
 impl Sender {
     /// Creates a new NDI send instance.
     ///
@@ -676,7 +684,13 @@ impl Sender {
         ) == 1
     }
 
-    /// Send a video frame synchronously.
+    /// Send a video frame synchronously, without copying it.
+    ///
+    /// Accepts `&VideoFrame`, a [`BorrowedVideoFrame`], or `&BorrowedVideoFrame`.
+    /// The SDK reads the pixels and metadata in place: nothing is allocated
+    /// or copied, including for a borrowed frame with padded rows. This is
+    /// the call to use for borrowed or padded buffers; unlike
+    /// [`Self::send_video_async_copy`] it needs no owned copy.
     ///
     /// The SDK has released the input buffer when this returns; the caller may
     /// then reuse or release it. This also completes a previous async video send.
@@ -687,17 +701,39 @@ impl Sender {
     /// cannot send the frame's pixel format (the planar 4:4:4 formats need
     /// [`RuntimeFeature::Planar444Video`](crate::RuntimeFeature::Planar444Video)).
     /// Nothing is sent and no pending send is changed.
-    pub fn send_video(&self, video_frame: &VideoFrame) -> Result<()> {
-        self.require_video_format(video_frame.pixel_format())?;
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{BorrowedVideoFrame, Ndi, PixelFormat, Sender, SenderOptions};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = Ndi::new()?;
+    /// # let sender = Sender::new(&ndi, &SenderOptions::new("Padded"))?;
+    /// // 64 pixels per row, padded to a 512-byte stride.
+    /// let mut buffer = vec![0u8; 512 * 32];
+    /// let frame = BorrowedVideoFrame::builder(&buffer, 64, 32, PixelFormat::Bgra)
+    ///     .line_stride(512)
+    ///     .build()?;
+    /// sender.send_video(frame)?;
+    /// buffer.fill(0xff); // the SDK is done with the buffer
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn send_video<'a>(&self, frame: impl Into<BorrowedVideoFrame<'a>>) -> Result<()> {
+        let frame: BorrowedVideoFrame<'a> = frame.into();
+        self.require_video_format(frame.pixel_format())?;
+        let raw = frame.to_raw();
         let len = {
             let mut video = self.inner.video.lock().unwrap_or_else(|e| e.into_inner());
             // A synchronous video send also releases the previous async frame.
-            // SAFETY: the sender instance is live for this borrow, and every pointer
-            // passed outlives the synchronous call.
+            // SAFETY: the sender instance is live for this borrow. `raw` points
+            // into pixels and metadata that `frame` borrows for `'a`, which
+            // outlives this call; the SDK has finished reading them when the
+            // synchronous send returns and keeps no reference afterwards.
             unsafe {
                 self.inner
                     .core
-                    .NDIlib_send_send_video_v2(self.inner.instance.0, &video_frame.to_raw());
+                    .NDIlib_send_send_video_v2(self.inner.instance.0, &raw);
             }
             video.completed()
         };
@@ -990,20 +1026,41 @@ impl<M: SenderMode> Sender<M> {
         }
     }
 
-    /// Get the current tally state for this sender.
+    /// The tally this sender currently reports.
     ///
-    /// # Arguments
+    /// Polls without waiting and returns the current state every time, whether
+    /// or not it has changed since the last query. Call
+    /// [`Self::wait_for_tally_change`] to block until it changes. Never fails
+    /// and may be called from any thread.
     ///
-    /// * `timeout` - Maximum time to wait for tally information.
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+    /// # Examples
     ///
-    /// # Returns
+    /// ```no_run
+    /// # use grafton_ndi::{Ndi, SenderOptions};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let ndi = Ndi::new()?;
+    /// let options = SenderOptions::new("Test Sender");
+    /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
     ///
-    /// `Ok(Some(tally))` if tally was successfully retrieved, `Ok(None)` on timeout.
+    /// let tally = sender.tally();
+    /// println!("On program: {}, On preview: {}", tally.on_program(), tally.on_preview());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn tally(&self) -> Tally {
+        self.get_tally(0).1
+    }
+
+    /// Wait up to `timeout` for the tally to change.
+    ///
+    /// Returns `Ok(Some(tally))` with the new state when the SDK reports a
+    /// change, and `Ok(None)` when `timeout` elapses first. Use
+    /// [`Self::tally`] to read the current state without waiting.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidInput`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    /// Returns [`Error::InvalidInput`] if `timeout` exceeds [`crate::MAX_TIMEOUT`]
+    /// (about 49.7 days).
     ///
     /// # Examples
     ///
@@ -1015,31 +1072,35 @@ impl<M: SenderMode> Sender<M> {
     /// let options = SenderOptions::new("Test Sender");
     /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
     ///
-    /// // Try to get tally with 1 second timeout
-    /// if let Some(tally) = sender.tally(Duration::from_secs(1))? {
+    /// if let Some(tally) = sender.wait_for_tally_change(Duration::from_secs(1))? {
     ///     println!("On program: {}, On preview: {}", tally.on_program(), tally.on_preview());
     /// } else {
-    ///     println!("Tally request timed out");
+    ///     println!("Tally did not change");
     /// }
     /// # Ok(())
     /// # }
     /// ```
-    pub fn tally(&self, timeout: Duration) -> Result<Option<Tally>> {
+    pub fn wait_for_tally_change(&self, timeout: Duration) -> Result<Option<Tally>> {
         let timeout_ms = to_ms_checked(timeout)?;
+        let (changed, tally) = self.get_tally(timeout_ms);
+        Ok(changed.then_some(tally))
+    }
+
+    /// Query the SDK's tally, waiting up to `timeout_ms`; returns whether it
+    /// changed, and the tally.
+    fn get_tally(&self, timeout_ms: u32) -> (bool, Tally) {
         let mut raw_tally = Tally::default().to_sdk();
         // SAFETY: the sender instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
-        let success = unsafe {
+        let changed = unsafe {
             self.inner
                 .core
                 .NDIlib_send_get_tally(self.inner.instance.0, &mut raw_tally, timeout_ms)
         };
-
-        if success {
-            Ok(Some(Tally::new(raw_tally.on_program, raw_tally.on_preview)))
-        } else {
-            Ok(None)
-        }
+        (
+            changed,
+            Tally::new(raw_tally.on_program, raw_tally.on_preview),
+        )
     }
 
     /// Get the number of active connections to this sender.
@@ -1358,6 +1419,71 @@ mod tests {
         let final_frame = sender.finish_video_async().unwrap();
         assert_eq!(final_frame.data().as_ptr(), second_pixels);
         assert!(sender.finish_video_async().is_none());
+    }
+
+    #[test]
+    fn synchronous_send_of_a_padded_borrowed_frame_allocates_nothing() {
+        let Some(sender) = test_sender() else {
+            return;
+        };
+        // 16 pixels per row, padded to a 96-byte stride.
+        let data = vec![5u8; 96 * 16];
+        let metadata = c"<padded/>";
+        let borrowed = BorrowedVideoFrame::builder(&data, 16, 16, PixelFormat::Bgra)
+            .line_stride(96)
+            .metadata(metadata)
+            .build()
+            .unwrap();
+        // Warm any lazily created SDK or runtime state before counting.
+        sender.send_video(borrowed).unwrap();
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            sender.send_video(borrowed).unwrap();
+            // Lint allowed: the by-reference form is what is under test.
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            sender.send_video(&borrowed).unwrap();
+        });
+        assert_eq!(allocations, 0);
+        // An owned frame is lent the same way.
+        let owned = test_owned_frame(3);
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            sender.send_video(&owned).unwrap();
+        });
+        assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn synchronous_send_describes_an_owned_frame_as_the_frame_itself() {
+        let owned = test_owned_frame(8);
+        let borrowed = BorrowedVideoFrame::from(&owned);
+        let (expected, lent) = (owned.to_raw(), borrowed.to_raw());
+        assert_eq!(lent.p_data, expected.p_data);
+        assert_eq!(lent.p_metadata, expected.p_metadata);
+        // SAFETY: both descriptors are uncompressed, so the union holds the stride.
+        let strides = unsafe {
+            (
+                lent.__bindgen_anon_1.line_stride_in_bytes,
+                expected.__bindgen_anon_1.line_stride_in_bytes,
+            )
+        };
+        assert_eq!(strides.0, strides.1);
+        assert_eq!(
+            (lent.xres, lent.yres, lent.FourCC, lent.timecode),
+            (
+                expected.xres,
+                expected.yres,
+                expected.FourCC,
+                expected.timecode
+            )
+        );
+        assert_eq!(
+            (lent.frame_rate_N, lent.frame_rate_D, lent.frame_format_type),
+            (
+                expected.frame_rate_N,
+                expected.frame_rate_D,
+                expected.frame_format_type
+            )
+        );
+        assert_eq!(lent.picture_aspect_ratio, expected.picture_aspect_ratio);
     }
 
     #[test]
