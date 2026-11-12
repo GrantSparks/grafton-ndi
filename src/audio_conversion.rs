@@ -8,7 +8,7 @@
 use crate::{
     frames::validate_packed_audio_dimensions,
     sys::{self, bindings::*},
-    AudioFormat, AudioFrame, Error, Ndi, Result, Sender, Timecode,
+    AudioFrame, Error, Ndi, Result, Sender, Timecode,
 };
 
 /// Full-scale integer audio level in dB above NDI's +4 dBu reference.
@@ -73,17 +73,18 @@ impl AudioShape {
         Self::new(sample_rate, num_channels, num_samples)
     }
 
-    fn from_planar(frame: &AudioFrame) -> Result<Self> {
-        if frame.format() != AudioFormat::Fltp {
-            return Err(Error::InvalidFrame(
-                "native audio conversion requires FLTP".into(),
-            ));
+    /// The shape of an owned frame. An `AudioFrame` is packed FLTP whose
+    /// layout was validated when it was built or copied: a sample rate in
+    /// `1..=i32::MAX`, positive channel and sample counts whose packed size is
+    /// within the shared payload limit, and exactly `channels * samples`
+    /// samples. Nothing is checked again.
+    fn from_planar(frame: &AudioFrame) -> Self {
+        Self {
+            sample_rate: frame.sample_rate(),
+            num_channels: frame.num_channels(),
+            num_samples: frame.num_samples(),
+            count: frame.data().len(),
         }
-        Self::new(
-            frame.sample_rate(),
-            frame.num_channels(),
-            frame.num_samples(),
-        )
     }
 
     fn check_output(self, length: usize) -> Result<()> {
@@ -96,8 +97,9 @@ impl AudioShape {
         Ok(())
     }
 
+    /// Require a destination frame of exactly this shape, so that the native
+    /// conversion writes every sample of it and nothing beyond.
     fn check_planar(self, frame: &AudioFrame) -> Result<()> {
-        Self::from_planar(frame)?;
         if frame.sample_rate() != self.sample_rate
             || frame.num_channels() != self.num_channels
             || frame.num_samples() != self.num_samples
@@ -121,7 +123,8 @@ impl AudioShape {
 
     /// The SDK's `sample_rate`, `no_channels` and `no_samples`.
     fn to_sdk(self) -> (i32, i32, i32) {
-        // Lossless: construction checked each against the SDK's signed range.
+        // Lossless: `new`, or the validated layout of the frame `from_planar`
+        // read, checked each against the SDK's signed range.
         (
             self.sample_rate as i32,
             self.num_channels as i32,
@@ -226,7 +229,7 @@ macro_rules! conversions {
         /// untouched. Integer output can clip depending on the explicit reference
         /// level. On native failure the active prefix may be partially modified.
         pub fn $to_method(&self, source: &AudioFrame, destination: &mut [$sample] $(, $reference: AudioReferenceLevel)?) -> Result<usize> {
-            let shape = AudioShape::from_planar(source)?;
+            let shape = AudioShape::from_planar(source);
             shape.check_output(destination.len())?;
             let source = source.to_raw();
             let (sample_rate, no_channels, no_samples) = shape.to_sdk();

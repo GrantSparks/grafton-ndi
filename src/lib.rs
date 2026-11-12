@@ -220,7 +220,9 @@ pub use {
         MetadataFrame, MetadataFrameRef, PixelFormat, PixelFormatInfo, ScanType, VideoFrame,
         VideoFrameBuilder, VideoFrameRef, VideoPlane, VideoPlanes, VideoRows,
     },
-    framesync::{FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncVideoRef},
+    framesync::{
+        AudioInputFormat, FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncVideoRef,
+    },
     receiver::{
         Capture, ConnectionStats, FrameSyncAttached, Ptz, RawCapture, Receiver, ReceiverBandwidth,
         ReceiverColorFormat, ReceiverEvent, ReceiverMode, ReceiverOptions, ReceiverStatus,

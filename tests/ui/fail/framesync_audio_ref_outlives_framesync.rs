@@ -14,7 +14,7 @@ fn main() {
     let frame_ref = {
         let framesync = FrameSync::new(receiver(&ndi)).unwrap();
         framesync
-            .capture_audio_ref(FrameSyncAudioRequest::query_input())
+            .capture_audio_ref(FrameSyncAudioRequest::capture(2, 1024).unwrap())
             .unwrap()
     };
 

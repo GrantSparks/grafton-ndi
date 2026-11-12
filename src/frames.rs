@@ -4,13 +4,14 @@ use std::{
     ffi::{CStr, CString},
     fmt,
     marker::PhantomData,
-    num::NonZeroUsize,
+    num::{NonZeroU32, NonZeroUsize},
     os::raw::c_char,
     ptr, slice, str,
 };
 
 use crate::{
     capture::{AudioKind, FrameFree, FrameSyncAudioFree, Guard, VideoKind},
+    framesync::AudioInputFormat,
     recv_guard::{RecvAudioGuard, RecvMetadataGuard},
     sys::{self, bindings::*},
     Error, FourCc, FrameRate, Rejected, Result, SdkTimestamp, Timecode,
@@ -1149,9 +1150,12 @@ impl AudioFrame {
         let layout = validate_audio_layout(&raw)?;
         let metadata_layout = unsafe { validate_frame_metadata(raw.p_metadata)? };
 
-        unsafe { Self::from_raw_validated(raw, layout, metadata_layout) }
+        Ok(unsafe { Self::from_raw_validated(raw, layout, metadata_layout) })
     }
 
+    /// Copy validated SDK audio into an owned frame. Validation already
+    /// established everything the copy relies on, so it cannot fail.
+    ///
     /// # Safety
     /// `layout` must have been validated from this exact `raw` descriptor.
     /// Its active samples must remain live, aligned, and initialized through
@@ -1160,13 +1164,7 @@ impl AudioFrame {
         raw: NDIlib_audio_frame_v3_t,
         layout: ValidatedAudioLayout,
         metadata_layout: ValidatedFrameMetadata,
-    ) -> Result<AudioFrame> {
-        if layout.is_empty() {
-            return Err(Error::InvalidFrame(
-                "Cannot create owned AudioFrame from an empty audio layout".into(),
-            ));
-        }
-
+    ) -> AudioFrame {
         // Only channel samples are initialized audio. Never form a typed slice
         // over inter-channel padding supplied by the SDK.
         let packed_layout = layout.packed();
@@ -1181,13 +1179,13 @@ impl AudioFrame {
         let metadata =
             unsafe { FrameMetadata::copy_from_raw_validated(raw.p_metadata, metadata_layout) };
 
-        Ok(AudioFrame {
+        AudioFrame {
             layout: packed_layout,
             timecode: Timecode::from_ticks(raw.timecode),
             data,
             metadata,
             timestamp: SdkTimestamp::from_sdk(raw.timestamp),
-        })
+        }
     }
 
     /// Get the sample rate in Hz.
@@ -1226,9 +1224,7 @@ impl AudioFrame {
 
     /// Get the audio format.
     pub fn format(&self) -> AudioFormat {
-        self.layout
-            .format()
-            .expect("owned AudioFrame always has a concrete audio format")
+        self.layout.format
     }
 
     /// Get the distance between the starts of consecutive channels in bytes:
@@ -2640,20 +2636,22 @@ fn video_plane_layouts(
 
 /// Validated audio frame layout information.
 ///
-/// This struct holds pre-validated layout information for an audio frame,
-/// including the channel stride and computed backing sample count. Creating
-/// this struct performs all necessary bounds checking, so consumers can safely
-/// use the cached values without re-validation.
+/// This struct holds pre-validated layout information for a frame of audio
+/// samples, including the channel stride and computed backing sample count.
+/// Every layout describes at least one sample in at least one channel; audio
+/// the SDK returns without samples is classified by
+/// [`validate_returned_audio`] instead. Creating this struct performs all
+/// necessary bounds checking, so consumers can safely use the cached values
+/// without re-validation.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ValidatedAudioLayout {
-    /// The validated audio format, or `None` for a query/no-source empty state.
-    pub format: Option<AudioFormat>,
-    /// The validated sample rate: positive, or zero only for an empty
-    /// no-source state; at most `i32::MAX`.
+    /// The validated audio format.
+    pub format: AudioFormat,
+    /// The validated sample rate: positive and at most `i32::MAX`.
     pub sample_rate: u32,
-    /// The validated channel count.
+    /// The validated channel count: positive.
     pub no_channels: usize,
-    /// The validated samples per channel.
+    /// The validated samples per channel: positive.
     pub no_samples: usize,
     /// The validated channel stride in `f32` samples.
     pub channel_stride_samples: usize,
@@ -2666,15 +2664,10 @@ pub(crate) struct ValidatedAudioLayout {
 // The channel count, sample count and channel stride in bytes of a valid
 // layout are each at most its byte extent, and the sample rate is checked
 // against i32::MAX, so every one of them fits the SDK's signed 32-bit fields.
-// The channel count of an empty layout comes from such a field.
 const _: () = assert!(MAX_AUDIO_BYTES <= i32::MAX as usize);
 
 impl ValidatedAudioLayout {
-    fn from_packed(
-        format: Option<AudioFormat>,
-        sample_rate: u32,
-        packed: &PackedAudioDimensions,
-    ) -> Self {
+    fn from_packed(format: AudioFormat, sample_rate: u32, packed: &PackedAudioDimensions) -> Self {
         Self {
             format,
             sample_rate,
@@ -2692,14 +2685,6 @@ impl ValidatedAudioLayout {
             sample_count: self.no_channels * self.no_samples,
             ..self
         }
-    }
-
-    pub(crate) fn is_empty(self) -> bool {
-        self.sample_count == 0
-    }
-
-    pub(crate) fn format(self) -> Option<AudioFormat> {
-        self.format
     }
 
     fn num_channels(self) -> u32 {
@@ -2735,7 +2720,7 @@ impl ValidatedAudioLayout {
     }
 
     pub(crate) fn channel_range(self, channel: usize) -> Option<std::ops::Range<usize>> {
-        if self.is_empty() || channel >= self.no_channels {
+        if channel >= self.no_channels {
             return None;
         }
 
@@ -2759,15 +2744,14 @@ impl ValidatedAudioLayout {
     }
 
     /// Every channel's samples of the frame stored at `data`, in order,
-    /// without reading inter-channel padding. An empty frame has none.
+    /// without reading inter-channel padding.
     ///
     /// # Safety
     ///
     /// As for [`Self::channel`].
     unsafe fn channels<'a>(self, data: *const f32) -> impl ExactSizeIterator<Item = &'a [f32]> {
-        let count = if self.is_empty() { 0 } else { self.no_channels };
         // SAFETY: forwarded to the caller, for channels that all exist.
-        (0..count)
+        (0..self.no_channels)
             .map(move |channel| unsafe { self.channel(data, channel) }.expect("validated channel"))
     }
 }
@@ -2782,7 +2766,7 @@ fn validate_outbound_audio_layout(
     let packed = validate_packed_audio_dimensions(no_channels, no_samples)?;
 
     Ok(ValidatedAudioLayout::from_packed(
-        Some(format),
+        format,
         sample_rate,
         &packed,
     ))
@@ -2906,27 +2890,10 @@ pub(crate) fn validate_packed_audio_dimensions(
 /// # Returns
 ///
 /// `Ok(ValidatedAudioLayout)` if the frame is valid, or `Err(Error::InvalidFrame(...))` otherwise.
+/// A descriptor without samples is invalid here; only
+/// [`validate_returned_audio`] accepts one.
 pub(crate) fn validate_audio_layout(raw: &NDIlib_audio_frame_v3_t) -> Result<ValidatedAudioLayout> {
-    validate_audio_layout_inner(raw, false)
-}
-
-/// Validate a FrameSync audio frame that is allowed to be a documented
-/// query/no-source zero-length state.
-pub(crate) fn validate_audio_layout_allow_empty(
-    raw: &NDIlib_audio_frame_v3_t,
-) -> Result<ValidatedAudioLayout> {
-    validate_audio_layout_inner(raw, true)
-}
-
-fn validate_audio_layout_inner(
-    raw: &NDIlib_audio_frame_v3_t,
-    allow_empty: bool,
-) -> Result<ValidatedAudioLayout> {
     if raw.no_samples == 0 {
-        if allow_empty {
-            return validate_empty_audio_layout(raw);
-        }
-
         return Err(Error::InvalidFrame("Invalid number of samples: 0".into()));
     }
 
@@ -2986,7 +2953,7 @@ fn validate_audio_layout_inner(
     let sample_count = checked_audio_extent(no_channels, no_samples, channel_stride_samples)?;
 
     Ok(ValidatedAudioLayout {
-        format: Some(format),
+        format,
         sample_rate,
         no_channels,
         no_samples,
@@ -2995,7 +2962,35 @@ fn validate_audio_layout_inner(
     })
 }
 
-fn validate_empty_audio_layout(raw: &NDIlib_audio_frame_v3_t) -> Result<ValidatedAudioLayout> {
+/// Audio the SDK returned from a call that may legitimately deliver no
+/// samples: a FrameSync input-format query, or an AVSync result with nothing
+/// to deliver.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ReturnedAudio {
+    /// A frame of samples, validated as [`validate_audio_layout`] validates.
+    Samples(ValidatedAudioLayout),
+    /// No samples. Carries the input format when the SDK reported one, and
+    /// `None` when no source format is known yet.
+    Empty(Option<AudioInputFormat>),
+}
+
+/// Classify audio the SDK returned where "no samples" is a valid answer.
+///
+/// A descriptor with a nonzero sample count must pass
+/// [`validate_audio_layout`]. One without samples must have a null data
+/// pointer and a zero channel stride, and either a zero sample rate and
+/// channel count (no source yet, where the FourCC may also be left zero) or a
+/// positive sample rate and channel count with a supported FourCC.
+///
+/// # Errors
+///
+/// [`Error::InvalidFrame`] for any other shape. The descriptor's metadata is
+/// not examined.
+pub(crate) fn validate_returned_audio(raw: &NDIlib_audio_frame_v3_t) -> Result<ReturnedAudio> {
+    if raw.no_samples != 0 {
+        return validate_audio_layout(raw).map(ReturnedAudio::Samples);
+    }
+
     if !raw.p_data.is_null() {
         return Err(Error::InvalidFrame(
             "Zero-length audio frame has non-null data pointer".into(),
@@ -3024,30 +3019,31 @@ fn validate_empty_audio_layout(raw: &NDIlib_audio_frame_v3_t) -> Result<Validate
         )));
     }
 
-    let no_source = raw.sample_rate == 0 && raw.no_channels == 0;
-    let query_format = raw.sample_rate > 0 && raw.no_channels > 0;
-    if !no_source && !query_format {
-        return Err(Error::InvalidFrame(format!(
-            "Invalid zero-length audio query state: sample_rate={}, no_channels={}",
-            raw.sample_rate, raw.no_channels
-        )));
-    }
-
-    let format = if no_source && raw.FourCC == 0 {
-        None
-    } else {
-        Some(validate_audio_format(raw.FourCC)?)
+    // Both were just checked nonnegative, so zero is the only value that
+    // does not convert.
+    let sample_rate = NonZeroU32::new(raw.sample_rate.unsigned_abs());
+    let num_channels = NonZeroU32::new(raw.no_channels.unsigned_abs());
+    let format = match (sample_rate, num_channels) {
+        // No source format is known yet. The SDK may leave the FourCC unset.
+        (None, None) => {
+            if raw.FourCC != 0 {
+                validate_audio_format(raw.FourCC)?;
+            }
+            None
+        }
+        (Some(sample_rate), Some(num_channels)) => {
+            validate_audio_format(raw.FourCC)?;
+            Some(AudioInputFormat::new(sample_rate, num_channels))
+        }
+        _ => {
+            return Err(Error::InvalidFrame(format!(
+                "Invalid zero-length audio state: sample_rate={}, no_channels={}",
+                raw.sample_rate, raw.no_channels
+            )))
+        }
     };
 
-    // Both were just checked nonnegative.
-    Ok(ValidatedAudioLayout {
-        format,
-        sample_rate: raw.sample_rate.unsigned_abs(),
-        no_channels: raw.no_channels.unsigned_abs() as usize,
-        no_samples: 0,
-        channel_stride_samples: 0,
-        sample_count: 0,
-    })
+    Ok(ReturnedAudio::Empty(format))
 }
 
 fn validate_audio_format(fourcc: NDIlib_FourCC_audio_type_e) -> Result<AudioFormat> {
@@ -3476,14 +3472,15 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> fmt::Debug for VideoR
 /// freed when dropped, via whichever `NDIlib_*_free_audio*` call the strategy `S`
 /// encodes.
 ///
-/// The shared accessors and the `Debug` impl are written exactly once here; the
-/// two public spellings are aliases that layer their differing format/owned/empty
-/// policy on top:
+/// The two public spellings are type aliases over this one core, so every
+/// accessor and the `Debug` impl are written exactly once:
 /// - [`AudioFrameRef<'rx>`] — frames captured from a [`Receiver`](crate::Receiver)
-///   (always concrete: `format() -> AudioFormat`, `try_to_owned() -> AudioFrame`).
+///   (freed via `NDIlib_recv_free_audio_v3`).
 /// - [`FrameSyncAudioRef<'fs>`](crate::FrameSyncAudioRef) — frames captured from a
-///   [`FrameSync`](crate::FrameSync), which additionally model a validated empty
-///   query/no-source state (`is_empty`, `Option`-returning `format`/`try_to_owned`).
+///   [`FrameSync`](crate::FrameSync) (freed via `NDIlib_framesync_free_audio_v2`).
+///
+/// Every frame holds samples: at least one channel of at least one sample, in
+/// a supported format.
 ///
 /// **Key characteristics:**
 /// - Zero allocations: References NDI SDK buffers directly
@@ -3503,26 +3500,30 @@ pub struct AudioRef<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> {
 ///
 /// This is the receiver spelling of the generic [`AudioRef`]; the
 /// [`FrameSync`](crate::FrameSync) spelling is
-/// [`FrameSyncAudioRef`](crate::FrameSyncAudioRef). The receiver path always
-/// yields a concrete audio frame, so [`format`](AudioRef::format) returns an
-/// [`AudioFormat`] and [`try_to_owned`](AudioRef::try_to_owned) an [`AudioFrame`]; the
-/// FrameSync path additionally models a validated empty query/no-source state.
+/// [`FrameSyncAudioRef`](crate::FrameSyncAudioRef). Both share one accessor and
+/// `Debug` implementation.
 pub type AudioFrameRef<'rx> = AudioRef<'rx, AudioKind>;
 
 #[allow(private_bounds)]
 impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
-    /// Store a guard alongside an already-validated audio layout, validating and
-    /// caching the frame metadata. The per-family constructors compute `layout`
-    /// (concrete vs. empty-query) and funnel through here.
+    /// Validate the frame an RAII guard owns, for either family's `new`.
+    ///
+    /// Validates the frame layout including:
+    /// - Valid audio format (FourCC)
+    /// - Non-null, `f32`-aligned data pointer
+    /// - Positive sample rate, channel count, and sample count
+    /// - Channel stride and buffer size within the `MAX_AUDIO_BYTES` limit
+    ///
+    /// and the frame metadata. Both are cached so that accessors return
+    /// slices without re-computation or unchecked arithmetic. A descriptor
+    /// without samples is rejected.
     ///
     /// # Safety
     ///
     /// The caller must ensure the guard was created from a valid NDI instance
-    /// and that `layout` was validated from the same frame the guard owns.
-    pub(crate) unsafe fn from_validated_layout(
-        guard: Guard<'a, S>,
-        layout: ValidatedAudioLayout,
-    ) -> Result<Self> {
+    /// and contains a frame populated by the matching SDK capture call.
+    unsafe fn from_guard(guard: Guard<'a, S>) -> Result<Self> {
+        let layout = validate_audio_layout(guard.frame())?;
         let metadata = unsafe { validate_frame_metadata(guard.frame().p_metadata)? };
 
         Ok(Self {
@@ -3573,11 +3574,8 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
     ///
     /// Returns `None` for multi-channel buffers with padding between channels.
     /// Use [`channel_data`](Self::channel_data) or [`channels`](Self::channels)
-    /// for those buffers. An empty query/no-source frame returns `Some(&[])`.
+    /// for those buffers.
     pub fn data(&self) -> Option<&[f32]> {
-        if self.layout.is_empty() {
-            return Some(&[]);
-        }
         if self.layout.no_channels > 1
             && self.layout.channel_stride_samples != self.layout.no_samples
         {
@@ -3604,119 +3602,60 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
     }
 
     /// Iterate over channel slices without reading inter-channel padding.
-    /// Empty query/no-source frames yield no channels.
     pub fn channels(&self) -> impl ExactSizeIterator<Item = &[f32]> + '_ {
         // SAFETY: as for `channel_data`.
         unsafe { self.layout.channels(self.guard.frame().p_data.cast()) }
-    }
-}
-
-impl<'rx> AudioRef<'rx, AudioKind> {
-    /// Create a borrowed audio frame from a receiver RAII guard.
-    ///
-    /// Validates the frame layout including:
-    /// - Valid audio format (FourCC)
-    /// - Non-null data pointer
-    /// - Valid sample rate, channel count, and sample count
-    /// - Buffer size within `MAX_AUDIO_BYTES` limit
-    ///
-    /// The validated layout is cached so that `data()` can return slices
-    /// without re-computation or unchecked arithmetic.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure the guard was created from a valid NDI receiver
-    /// and contains a frame populated by `NDIlib_recv_capture_v3`.
-    pub(crate) unsafe fn new(guard: RecvAudioGuard<'rx>) -> Result<Self> {
-        let layout = validate_audio_layout(guard.frame())?;
-        unsafe { Self::from_validated_layout(guard, layout) }
     }
 
     /// Get the audio format (FourCC code).
     ///
     /// This is guaranteed to be a valid, supported format since it's validated during construction.
     pub fn format(&self) -> AudioFormat {
-        self.layout
-            .format()
-            .expect("validate_audio_layout requires a concrete audio format")
+        self.layout.format
     }
 
     /// Copy this borrowed frame into an owned `AudioFrame`.
     ///
     /// Copies channel samples into tightly packed planar storage and copies
     /// metadata, allowing the frame to outlive the SDK buffer. Padding is omitted.
+    /// Allocates one sample buffer, and one metadata string when present.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidFrame`] if the packed copy is not a valid
-    /// frame.
+    /// None at present: capture validated everything the copy relies on. The
+    /// `Result` matches [`VideoRef::try_to_owned`], whose copy can fail.
     pub fn try_to_owned(&self) -> Result<AudioFrame> {
-        // SAFETY: the receive guard owns the exact validated frame through copying.
-        unsafe { AudioFrame::from_raw_validated(*self.guard.frame(), self.layout, self.metadata) }
+        // SAFETY: the guard owns the exact validated frame through copying.
+        Ok(unsafe {
+            AudioFrame::from_raw_validated(*self.guard.frame(), self.layout, self.metadata)
+        })
+    }
+}
+
+impl<'rx> AudioRef<'rx, AudioKind> {
+    /// Create a borrowed audio frame from a receiver RAII guard, validated
+    /// as [`from_guard`](Self::from_guard) describes.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the guard was created from a valid NDI receiver
+    /// and contains a frame populated by `NDIlib_recv_capture_v3`.
+    pub(crate) unsafe fn new(guard: RecvAudioGuard<'rx>) -> Result<Self> {
+        unsafe { Self::from_guard(guard) }
     }
 }
 
 impl<'fs> AudioRef<'fs, FrameSyncAudioFree> {
-    /// Create a borrowed audio frame from a FrameSync RAII guard.
-    ///
-    /// When `query_input` is set, the SDK may report a validated empty
-    /// query/no-source state (no samples); otherwise a concrete frame is
-    /// required. A query that unexpectedly returns samples is rejected.
+    /// Create a borrowed audio frame from a FrameSync RAII guard, validated
+    /// as [`from_guard`](Self::from_guard) describes.
     ///
     /// # Safety
     ///
     /// The caller must ensure the guard was created from a valid FrameSync
-    /// instance and contains a frame populated by `NDIlib_framesync_capture_audio_v2`.
-    pub(crate) unsafe fn new(
-        guard: Guard<'fs, FrameSyncAudioFree>,
-        query_input: bool,
-    ) -> Result<Self> {
-        let layout = if query_input {
-            if guard.frame().no_samples != 0 {
-                return Err(Error::InvalidFrame(format!(
-                    "FrameSync audio query returned {} samples",
-                    guard.frame().no_samples
-                )));
-            }
-            validate_audio_layout_allow_empty(guard.frame())?
-        } else {
-            validate_audio_layout(guard.frame())?
-        };
-        unsafe { Self::from_validated_layout(guard, layout) }
-    }
-
-    /// Returns true for a valid query/no-source state with no sample buffer.
-    pub fn is_empty(&self) -> bool {
-        self.layout.is_empty()
-    }
-
-    /// Get the audio format (FourCC code), or `None` for an empty query/no-source state.
-    pub fn format(&self) -> Option<AudioFormat> {
-        self.layout.format()
-    }
-
-    /// Copy this borrowed frame into an owned `AudioFrame`.
-    ///
-    /// Copies channel samples into tightly packed planar storage and copies
-    /// metadata, allowing the frame to outlive the SDK buffer. Padding is omitted.
-    ///
-    /// Returns `Ok(None)` for a valid query/no-source state with no sample
-    /// buffer to own.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidFrame`] if the packed copy is not a valid
-    /// frame.
-    pub fn try_to_owned(&self) -> Result<Option<AudioFrame>> {
-        if self.layout.is_empty() {
-            Ok(None)
-        } else {
-            // SAFETY: the FrameSync guard owns the exact validated frame through copying.
-            unsafe {
-                AudioFrame::from_raw_validated(*self.guard.frame(), self.layout, self.metadata)
-            }
-            .map(Some)
-        }
+    /// instance and contains a frame populated by
+    /// `NDIlib_framesync_capture_audio_v2` with a capture request.
+    pub(crate) unsafe fn new(guard: Guard<'fs, FrameSyncAudioFree>) -> Result<Self> {
+        unsafe { Self::from_guard(guard) }
     }
 }
 
@@ -3728,10 +3667,7 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> fmt::Debug for AudioR
             .field("num_channels", &self.num_channels())
             .field("num_samples", &self.num_samples())
             .field("timecode", &self.timecode())
-            // Render the format from the cached layout (`Option<AudioFormat>`) so
-            // this single impl serves both the receiver and FrameSync spellings,
-            // whose public `format()` return types differ.
-            .field("format", &self.layout.format())
+            .field("format", &self.format())
             .field("samples per channel", &self.layout.no_samples)
             .field("channel_stride_bytes", &self.channel_stride_bytes())
             .field("metadata", &self.metadata())
@@ -7264,7 +7200,7 @@ mod tests {
         assert!(result.is_ok(), "Should validate valid audio frame");
 
         let layout = result.unwrap();
-        assert_eq!(layout.format, Some(AudioFormat::Fltp));
+        assert_eq!(layout.format, AudioFormat::Fltp);
         assert_eq!(layout.sample_count, sample_count);
     }
 
@@ -7292,7 +7228,7 @@ mod tests {
         };
         let guard =
             unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let frame = unsafe { AudioRef::<FrameSyncAudioFree>::new(guard, false) }.unwrap();
+        let frame = unsafe { AudioRef::<FrameSyncAudioFree>::new(guard) }.unwrap();
         assert!(frame.data().is_none());
         assert_eq!(frame.channel_data(0).unwrap(), &[1.0, 2.0, 3.0]);
         assert_eq!(frame.channel_data(1).unwrap(), &[4.0, 5.0, 6.0]);
@@ -7305,7 +7241,7 @@ mod tests {
             frame.channels().flatten().copied().collect::<Vec<_>>(),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
         );
-        let mut owned = frame.try_to_owned().unwrap().unwrap();
+        let mut owned = frame.try_to_owned().unwrap();
         assert_eq!(owned.channel_stride_bytes(), 12);
         assert_eq!(owned.data(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(
@@ -7374,62 +7310,153 @@ mod tests {
         assert_eq!(layout.channel_range(1), Some(6..10));
     }
 
-    /// Test validate_audio_layout_allow_empty accepts the documented no-source query state.
+    /// The SDK's no-source answer has no samples and no format, whether it
+    /// leaves the FourCC unset or sets it.
     #[test]
-    fn test_validate_audio_layout_empty_query_no_source() {
-        let raw = NDIlib_audio_frame_v3_t::default();
-
-        let layout =
-            validate_audio_layout_allow_empty(&raw).expect("all-zero query state should validate");
-        assert!(layout.is_empty());
-        assert_eq!(layout.format(), None);
-        assert_eq!(layout.sample_count, 0);
+    fn returned_audio_accepts_the_no_source_state() {
+        let unset = NDIlib_audio_frame_v3_t::default();
+        let set = NDIlib_audio_frame_v3_t {
+            FourCC: AudioFormat::Fltp.to_sdk(),
+            ..unset
+        };
+        for raw in [unset, set] {
+            assert!(matches!(
+                validate_returned_audio(&raw),
+                Ok(ReturnedAudio::Empty(None))
+            ));
+        }
     }
 
-    /// Test validate_audio_layout_allow_empty accepts source-format query without samples.
+    /// A positive sample rate and channel count without samples is the
+    /// source's format.
     #[test]
-    fn test_validate_audio_layout_empty_query_with_source_format() {
+    fn returned_audio_reports_a_format_without_samples() {
         let raw = NDIlib_audio_frame_v3_t {
             sample_rate: 48000,
             no_channels: 2,
-            no_samples: 0,
-            timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
-            p_data: ptr::null_mut(),
-            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
-                channel_stride_in_bytes: 0,
-            },
-            p_metadata: ptr::null(),
-            timestamp: 0,
+            FourCC: AudioFormat::Fltp.to_sdk(),
+            ..Default::default()
         };
-
-        let layout = validate_audio_layout_allow_empty(&raw)
-            .expect("query source format should validate without samples");
-        assert!(layout.is_empty());
-        assert_eq!(layout.format(), Some(AudioFormat::Fltp));
-        assert_eq!(layout.sample_rate, 48000);
-        assert_eq!(layout.no_channels, 2);
+        match validate_returned_audio(&raw) {
+            Ok(ReturnedAudio::Empty(Some(format))) => {
+                assert_eq!((format.sample_rate(), format.num_channels()), (48000, 2));
+            }
+            other => panic!("expected a format without samples, got {other:?}"),
+        }
     }
 
-    /// Test empty audio validation rejects partial query/no-source states.
+    /// Samples are validated exactly as every other frame of audio is, and
+    /// neither state without samples is a frame of audio.
     #[test]
-    fn test_validate_audio_layout_rejects_partial_empty_query() {
+    fn returned_audio_validates_samples_strictly() {
+        let mut data = [0.0f32; 8];
         let raw = NDIlib_audio_frame_v3_t {
             sample_rate: 48000,
-            no_channels: 0,
-            no_samples: 0,
-            timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
-            p_data: ptr::null_mut(),
+            no_channels: 2,
+            no_samples: 4,
+            FourCC: AudioFormat::Fltp.to_sdk(),
+            p_data: data.as_mut_ptr().cast(),
             __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
-                channel_stride_in_bytes: 0,
+                channel_stride_in_bytes: 16,
             },
-            p_metadata: ptr::null(),
-            timestamp: 0,
+            ..Default::default()
         };
+        match validate_returned_audio(&raw) {
+            Ok(ReturnedAudio::Samples(layout)) => {
+                assert_eq!(layout.format, AudioFormat::Fltp);
+                assert_eq!((layout.no_channels, layout.no_samples), (2, 4));
+                assert_eq!(layout.sample_count, 8);
+            }
+            other => panic!("expected samples, got {other:?}"),
+        }
+        // A negative count is not "no samples"; it fails strict validation.
+        let negative = NDIlib_audio_frame_v3_t {
+            no_samples: -1,
+            ..raw
+        };
+        assert!(matches!(
+            validate_returned_audio(&negative),
+            Err(Error::InvalidFrame(_))
+        ));
 
-        let result = validate_audio_layout_allow_empty(&raw);
-        assert!(matches!(result, Err(Error::InvalidFrame(_))));
+        let format_only = NDIlib_audio_frame_v3_t {
+            sample_rate: 48000,
+            no_channels: 2,
+            FourCC: AudioFormat::Fltp.to_sdk(),
+            ..Default::default()
+        };
+        for raw in [NDIlib_audio_frame_v3_t::default(), format_only] {
+            match validate_audio_layout(&raw) {
+                Err(Error::InvalidFrame(message)) => {
+                    assert_eq!(message, "Invalid number of samples: 0");
+                }
+                other => panic!("expected InvalidFrame, got {other:?}"),
+            }
+        }
+    }
+
+    /// Every other shape without samples is rejected.
+    #[test]
+    fn returned_audio_rejects_partial_and_malformed_empty_states() {
+        let format = NDIlib_audio_frame_v3_t {
+            sample_rate: 48000,
+            no_channels: 2,
+            FourCC: AudioFormat::Fltp.to_sdk(),
+            ..Default::default()
+        };
+        let mut sample = 0.0f32;
+        let rejected = [
+            // Only one of the sample rate and channel count is known.
+            NDIlib_audio_frame_v3_t {
+                no_channels: 0,
+                ..format
+            },
+            NDIlib_audio_frame_v3_t {
+                sample_rate: 0,
+                ..format
+            },
+            // Negative values.
+            NDIlib_audio_frame_v3_t {
+                sample_rate: -48000,
+                ..format
+            },
+            NDIlib_audio_frame_v3_t {
+                no_channels: -2,
+                ..format
+            },
+            // A buffer or a channel stride without samples.
+            NDIlib_audio_frame_v3_t {
+                p_data: (&mut sample as *mut f32).cast(),
+                ..format
+            },
+            NDIlib_audio_frame_v3_t {
+                __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                    channel_stride_in_bytes: 4,
+                },
+                ..format
+            },
+            // A format needs a supported FourCC; no source allows only an
+            // unset or supported one.
+            NDIlib_audio_frame_v3_t {
+                FourCC: 0,
+                ..format
+            },
+            NDIlib_audio_frame_v3_t {
+                FourCC: 0x1234_5678,
+                ..format
+            },
+            NDIlib_audio_frame_v3_t {
+                FourCC: 0x1234_5678,
+                ..Default::default()
+            },
+        ];
+        for (index, raw) in rejected.iter().enumerate() {
+            let result = validate_returned_audio(raw);
+            assert!(
+                matches!(result, Err(Error::InvalidFrame(_))),
+                "shape {index}: {result:?}"
+            );
+        }
     }
 
     /// Test validate_audio_layout rejects invalid channel stride.

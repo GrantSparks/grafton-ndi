@@ -5,7 +5,7 @@ use std::{cell::Cell, marker::PhantomData, ptr};
 use super::{invalid_input, sdk_quantity, AdvancedConfig};
 use crate::{
     finder::RawSource,
-    frames::{validate_audio_layout_allow_empty, validate_frame_metadata, MAX_AUDIO_BYTES},
+    frames::{validate_frame_metadata, validate_returned_audio, ReturnedAudio, MAX_AUDIO_BYTES},
     sys::{
         advanced::{
             native, AvSync as AvSyncTable, AvSyncHandle, Genlock as GenlockTable, GenlockHandle,
@@ -336,18 +336,19 @@ unsafe fn outcome(status: Synchronized, audio: &NDIlib_audio_frame_v3_t) -> Resu
     Ok(match status {
         Synchronized::Matched | Synchronized::Adjusted => {
             let samples_adjusted = status == Synchronized::Adjusted;
-            let layout = validate_audio_layout_allow_empty(audio)?;
-            if layout.is_empty() {
-                AvSyncOutcome::Empty { samples_adjusted }
-            } else {
-                // SAFETY: forwarded to the caller's obligation.
-                let frame = unsafe {
-                    let metadata = validate_frame_metadata(audio.p_metadata)?;
-                    AudioFrame::from_raw_validated(*audio, layout, metadata)?
-                };
-                AvSyncOutcome::Audio {
-                    frame,
-                    samples_adjusted,
+            match validate_returned_audio(audio)? {
+                // The format of an empty result is not reported.
+                ReturnedAudio::Empty(_) => AvSyncOutcome::Empty { samples_adjusted },
+                ReturnedAudio::Samples(layout) => {
+                    // SAFETY: forwarded to the caller's obligation.
+                    let frame = unsafe {
+                        let metadata = validate_frame_metadata(audio.p_metadata)?;
+                        AudioFrame::from_raw_validated(*audio, layout, metadata)
+                    };
+                    AvSyncOutcome::Audio {
+                        frame,
+                        samples_adjusted,
+                    }
                 }
             }
         }

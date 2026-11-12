@@ -358,6 +358,12 @@ let audio = frame_sync.capture_audio_ref(request)?;
 println!("audio: {} channels at {} Hz", audio.num_channels(), audio.sample_rate());
 ```
 
+An audio capture always returns samples in the requested shape, silence until
+the source's audio arrives. `frame_sync.audio_input_format()` reports the
+source's sample rate and channel count, or `None` before any audio arrives; to
+follow the source's channels, wait for `Some` and build the request from its
+`num_channels()`.
+
 `FrameSync::new` hands the receiver back inside `Rejected` when the SDK creates no
 synchronizer. `FrameSync` owns its receiver. `frame_sync.receiver()` provides controls, audio,
 metadata, and status through `Receiver<FrameSyncAttached>`. Use

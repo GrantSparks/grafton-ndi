@@ -172,16 +172,26 @@ fn main() -> Result<(), Error> {
         audio_samples_total += audio.num_samples() as usize;
 
         if video_frames == 1 {
-            // Print audio info on first video frame
-            if !audio.is_empty() {
-                println!("Audio stream info:");
-                println!("  Sample rate: {} Hz", audio.sample_rate());
-                println!("  Channels: {}", audio.num_channels());
-                println!("  Samples per frame: {}", audio.num_samples());
-                println!("  Format: {:?}", audio.format());
-                println!();
-            } else {
-                println!("No audio stream detected yet\n");
+            // On the first video frame, report the source's audio format and
+            // the blocks requested from it.
+            match framesync.audio_input_format()? {
+                Some(input) => {
+                    println!("Audio stream info:");
+                    println!(
+                        "  Source: {} channels at {} Hz",
+                        input.num_channels(),
+                        input.sample_rate()
+                    );
+                    println!(
+                        "  Requested: {} channels at {} Hz",
+                        audio.num_channels(),
+                        audio.sample_rate()
+                    );
+                    println!("  Samples per block: {}", audio.num_samples());
+                    println!("  Format: {:?}", audio.format());
+                    println!();
+                }
+                None => println!("No audio stream detected yet; capturing silence\n"),
             }
         }
 

@@ -170,6 +170,17 @@ as `None`. Most programs need changes; see the
   receiver back in a `Rejected` when the SDK does not create the FrameSync.
   `FrameSyncAudioRequest::capture_with(Some(rate), ..)` is
   `capture_at(rate, ..)`, and `capture_with(None, ..)` is `capture(..)`.
+- FrameSync's audio input-format query is separate from capture.
+  `FrameSyncAudioRequest::query_input()` is removed, and
+  `FrameSync::audio_input_format()` returns `Result<Option<AudioInputFormat>>`:
+  the source's positive sample rate and channel count, or `None` before any
+  audio arrives. Every request captures samples, so `capture_audio` returns
+  `Result<AudioFrame>`, and `FrameSyncAudioRef` loses `is_empty()`; its
+  `format()` returns `AudioFormat` and its `try_to_owned()` returns
+  `Result<AudioFrame>`, as `AudioFrameRef`'s do. A capture the SDK answers
+  without samples is an `Error::InvalidFrame`. In 2.0 an owned
+  `capture_audio(query_input())` returned `Ok(None)` and lost the format it
+  queried.
 - `Sender::send_video` returns `Result<()>`, and `Sender::send_video_async`
   hands a refused frame back in a `Rejected`. Every video send checks that the
   sender's runtime supports the frame's pixel format before anything reaches
@@ -303,6 +314,8 @@ as `None`. Most programs need changes; see the
   `StateError` says whether a retry can succeed. On Linux, macOS and Android
   the File library needs the Advanced SDK runtime. See the
   [File API guide](docs/file-io.md).
+- `FrameSync::audio_input_format` and `AudioInputFormat`: the format of the
+  audio a FrameSync is receiving, without capturing samples.
 - Examples for runtime selection, routing, the Discovery Server, the File API
   and each Advanced SDK capability.
 

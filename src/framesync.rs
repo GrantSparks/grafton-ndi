@@ -66,21 +66,20 @@
 //!
 //!     // Capture audio at your sound card's rate
 //!     let request = FrameSyncAudioRequest::capture_at(48_000, 2, 1_024)?;
-//!     if let Some(audio) = framesync.capture_audio(request)? {
-//!         println!("{} audio samples", audio.num_samples());
-//!     }
+//!     let audio = framesync.capture_audio(request)?;
+//!     println!("{} audio samples", audio.num_samples());
 //!
 //!     Ok(())
 //! }
 //! ```
 
-use std::fmt;
+use std::{fmt, num::NonZeroU32};
 
 use crate::{
     capture::{FrameSyncAudioFree, FrameSyncVideoFree, Guard},
     frames::{
-        validate_audio_sample_rate, validate_packed_audio_dimensions, AudioFrame, AudioRef,
-        ScanType, VideoFrame, VideoRef,
+        validate_audio_sample_rate, validate_packed_audio_dimensions, validate_returned_audio,
+        AudioFrame, AudioRef, ReturnedAudio, ScanType, VideoFrame, VideoRef,
     },
     receiver::{FrameSyncAttached, Receiver},
     sys::bindings::*,
@@ -102,15 +101,46 @@ pub type FrameSyncVideoRef<'fs> = VideoRef<'fs, FrameSyncVideoFree>;
 ///
 /// This is the FrameSync spelling of the generic
 /// [`AudioRef`]; the [`Receiver`]
-/// spelling is [`AudioFrameRef`](crate::AudioFrameRef). The FrameSync path can
-/// produce a validated empty query/no-source state, so
-/// [`is_empty`](AudioRef::is_empty) and an `Option`-returning
-/// [`format`](AudioRef::format)/[`try_to_owned`](AudioRef::try_to_owned) are available.
-/// The frame is automatically freed when dropped via
-/// `NDIlib_framesync_free_audio_v2`.
+/// spelling is [`AudioFrameRef`](crate::AudioFrameRef). Both share one accessor
+/// and `Debug` implementation, and both always hold samples. The frame is
+/// automatically freed when dropped via `NDIlib_framesync_free_audio_v2`.
+/// This owning reference is neither `Send` nor `Sync`.
 pub type FrameSyncAudioRef<'fs> = AudioRef<'fs, FrameSyncAudioFree>;
 
-/// A validated, reusable audio operation for [`FrameSync::capture_audio`].
+/// The format of the audio a [`FrameSync`] is receiving, as reported by
+/// [`FrameSync::audio_input_format`].
+///
+/// Both values are positive. The sample rate is at most `i32::MAX`, so
+/// [`FrameSyncAudioRequest::capture_at`] accepts it. This is a plain value: it
+/// is `Copy`, `Send` and `Sync`, and holds no SDK resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AudioInputFormat {
+    sample_rate: NonZeroU32,
+    num_channels: NonZeroU32,
+}
+
+impl AudioInputFormat {
+    /// A format the SDK reported, with values already checked positive.
+    pub(crate) const fn new(sample_rate: NonZeroU32, num_channels: NonZeroU32) -> Self {
+        Self {
+            sample_rate,
+            num_channels,
+        }
+    }
+
+    /// The incoming audio's sample rate in Hz: positive.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate.get()
+    }
+
+    /// The incoming audio's channel count: positive.
+    pub fn num_channels(&self) -> u32 {
+        self.num_channels.get()
+    }
+}
+
+/// A validated, reusable audio capture for [`FrameSync::capture_audio`] and
+/// [`FrameSync::capture_audio_ref`].
 ///
 /// [`capture`](Self::capture) and [`capture_at`](Self::capture_at) require
 /// explicit positive output channels and samples per channel. Construction checks
@@ -120,32 +150,48 @@ pub type FrameSyncAudioRef<'fs> = AudioRef<'fs, FrameSyncAudioFree>;
 /// submitting a request performs no dimension checks, locks, or extra SDK queries.
 /// Returned descriptors and metadata are still validated after each capture.
 ///
-/// [`query_input`](Self::query_input) queries the current input format without
-/// requesting samples. To follow source channels, query first, wait for a positive
-/// channel count, then build a capture request with that concrete count. Re-query
-/// and rebuild when the application chooses to follow format changes. The SDK
-/// converts to the explicit output count even if the source changes meanwhile.
+/// Every request captures samples. To follow the source's channels, call
+/// [`FrameSync::audio_input_format`] until it returns `Some`, then build a
+/// request with that format's [`num_channels`](AudioInputFormat::num_channels).
+/// Query again and rebuild when the application chooses to follow format
+/// changes. The SDK converts to the request's channel count even if the source
+/// changes meanwhile.
+///
+/// # Example
+///
+/// ```no_run
+/// # use grafton_ndi::{Ndi, ReceiverOptions, Receiver, FrameSync, FrameSyncAudioRequest, Source};
+/// # use std::time::Duration;
+/// # fn main() -> Result<(), grafton_ndi::Error> {
+/// # let ndi = Ndi::new()?;
+/// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("Test")))?;
+/// let framesync = FrameSync::new(receiver)?;
+///
+/// // Wait until the source's audio format is known.
+/// let format = loop {
+///     if let Some(format) = framesync.audio_input_format()? {
+///         break format;
+///     }
+///     std::thread::sleep(Duration::from_millis(10));
+/// };
+///
+/// // 1024 samples per channel, in the source's channels, at 48 kHz.
+/// let request = FrameSyncAudioRequest::capture_at(48_000, format.num_channels(), 1_024)?;
+/// let audio = framesync.capture_audio(request)?;
+/// assert_eq!(audio.num_channels(), format.num_channels());
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FrameSyncAudioRequest {
-    // The SDK's signed arguments: all zero for a query, otherwise checked
-    // positive (the sample rate is zero for the source's rate).
+    // The SDK's signed arguments, checked positive; the sample rate is zero
+    // for the source's rate.
     sample_rate: i32,
     num_channels: i32,
     num_samples: i32,
 }
 
 impl FrameSyncAudioRequest {
-    /// Query the current incoming audio format without requesting sample data.
-    /// The result has zero sample rate and channels if no input format is known.
-    #[must_use]
-    pub const fn query_input() -> Self {
-        Self {
-            sample_rate: 0,
-            num_channels: 0,
-            num_samples: 0,
-        }
-    }
-
     /// Capture samples at the source's sample rate, converted to
     /// `num_channels` channels of `num_samples` samples each.
     ///
@@ -183,10 +229,6 @@ impl FrameSyncAudioRequest {
             num_channels: num_channels as i32,
             num_samples: num_samples as i32,
         })
-    }
-
-    fn is_query(self) -> bool {
-        self.num_samples == 0
     }
 }
 
@@ -458,19 +500,19 @@ impl FrameSync {
     ///
     /// # Arguments
     ///
-    /// * `request` - Explicit capture or query operation; see
-    ///   [`FrameSyncAudioRequest`].
+    /// * `request` - The output sample rate, channels and samples per
+    ///   channel; see [`FrameSyncAudioRequest`].
     ///
     /// # Returns
     ///
-    /// * `Ok(Some(AudioFrame))` - An owned copy of the captured samples
-    /// * `Ok(None)` - A query request, which returns the input format but no
-    ///   samples; use [`Self::capture_audio_ref`] to read that format
+    /// An owned copy of the captured samples, in the request's channels and
+    /// samples per channel. The SDK supplies silence when no audio has
+    /// arrived. To read the source's format instead, use
+    /// [`Self::audio_input_format`].
     ///
     /// # Errors
     ///
-    /// As for [`Self::capture_audio_ref`], and when the owned copy is not a
-    /// valid frame.
+    /// As for [`Self::capture_audio_ref`].
     ///
     /// # Example
     ///
@@ -488,43 +530,45 @@ impl FrameSync {
     ///
     /// loop {
     ///     // Request 1024 stereo samples at 48kHz
-    ///     if let Some(audio) = framesync.capture_audio(request)? {
-    ///         // Process each channel.
-    ///         for samples in audio.channels() {
-    ///             println!("Got {} samples in a channel", samples.len());
-    ///         }
+    ///     let audio = framesync.capture_audio(request)?;
+    ///     // Process each channel.
+    ///     for samples in audio.channels() {
+    ///         println!("Got {} samples in a channel", samples.len());
     ///     }
     ///     # break;
     /// }
     /// # Ok(())
     /// # }
     /// ```
-    pub fn capture_audio(&self, request: FrameSyncAudioRequest) -> Result<Option<AudioFrame>> {
+    pub fn capture_audio(&self, request: FrameSyncAudioRequest) -> Result<AudioFrame> {
         self.capture_audio_ref(request)?.try_to_owned()
     }
 
     /// Capture audio with dynamic resampling, borrowing the SDK's samples
     /// without copying them.
     ///
-    /// Resampling is as for [`Self::capture_audio`].
+    /// Resampling is as for [`Self::capture_audio`]. The frame always holds
+    /// the request's channels and samples per channel; the SDK supplies
+    /// silence when no audio has arrived.
     ///
-    /// # Querying Input Format
+    /// # Following the source's channels
     ///
-    /// Use [`FrameSyncAudioRequest::query_input`] to query the current input
-    /// format without capturing samples. The returned frame contains the
-    /// input's sample rate and channel count, or a validated empty no-source
-    /// state when no audio format has been received yet.
+    /// A request names its channel count explicitly. To capture in the
+    /// source's channels, wait for [`Self::audio_input_format`] to return
+    /// `Some`, then build a request with that channel count.
     ///
     /// # Errors
     ///
     /// Returns frame-validation errors if the SDK returns malformed audio
-    /// dimensions, sample layout, buffers, or metadata. Request dimensions were
-    /// already validated at construction.
+    /// dimensions, sample layout, buffers, or metadata, including a frame
+    /// without samples. Request dimensions were already validated at
+    /// construction.
     ///
     /// # Example
     ///
     /// ```no_run
     /// # use grafton_ndi::{Ndi, ReceiverOptions, Receiver, FrameSync, FrameSyncAudioRequest, Source, SourceAddress};
+    /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// # let ndi = Ndi::new()?;
     /// # let source = Source::new("Test");
@@ -532,12 +576,16 @@ impl FrameSync {
     /// # let receiver = Receiver::new(&ndi, &options)?;
     /// let framesync = FrameSync::new(receiver)?;
     ///
-    /// let input = framesync.capture_audio_ref(FrameSyncAudioRequest::query_input())?;
-    /// if input.is_empty() && input.num_channels() == 0 {
-    ///     println!("No audio source yet");
-    /// } else {
-    ///     println!("{} channels at {} Hz", input.num_channels(), input.sample_rate());
-    /// }
+    /// let channels = loop {
+    ///     match framesync.audio_input_format()? {
+    ///         Some(format) => break format.num_channels(),
+    ///         None => std::thread::sleep(Duration::from_millis(10)),
+    ///     }
+    /// };
+    /// let request = FrameSyncAudioRequest::capture(channels, 1_024)?;
+    ///
+    /// let audio = framesync.capture_audio_ref(request)?;
+    /// println!("{} channels at {} Hz", audio.num_channels(), audio.sample_rate());
     /// # Ok(())
     /// # }
     /// ```
@@ -550,12 +598,13 @@ impl FrameSync {
         #[cfg(test)]
         audio_test_calls::capture();
         // SAFETY: The live FrameSync owns its receiver/runtime. Request fields
-        // are private: capture construction checked the packed FLTP payload and
-        // signed byte stride; only query_input() can submit zero samples/channels.
-        // Processing.NDI.FrameSync.h permits explicit output channels independent
-        // of input and all-zero format queries. No source-channel sentinel can
-        // race a format change here. The SDK owns the returned allocation until
-        // Guard frees it through this same instance, including validation errors.
+        // are private: construction checked positive channels and samples, the
+        // packed FLTP payload and the signed byte stride, and a positive or
+        // zero (source) sample rate. Processing.NDI.FrameSync.h permits
+        // explicit output channels independent of input. No source-channel
+        // sentinel can race a format change here. The SDK owns the returned
+        // allocation until Guard frees it through this same instance,
+        // including validation errors.
         unsafe {
             self.core().NDIlib_framesync_capture_audio_v2(
                 self.resource.instance,
@@ -571,7 +620,78 @@ impl FrameSync {
         let guard = unsafe {
             Guard::<FrameSyncAudioFree>::new(&self.resource._ndi, self.resource.instance, frame)
         };
-        unsafe { FrameSyncAudioRef::new(guard, request.is_query()) }
+        // SAFETY: the guard owns a frame this capture just returned.
+        unsafe { FrameSyncAudioRef::new(guard) }
+    }
+
+    /// Query the format of the audio this FrameSync is receiving, without
+    /// capturing samples.
+    ///
+    /// This makes the SDK's input-format query: one native call that does not
+    /// wait for network audio and frees what the SDK returned before
+    /// returning. It allocates nothing unless it fails. Like the other
+    /// FrameSync methods it may be called from any thread.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(format))` - The source's sample rate and channel count, both
+    ///   positive
+    /// * `Ok(None)` - No audio format has been received yet
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidFrame`] when the SDK's answer is neither of
+    /// those: samples, a data pointer or channel stride, a negative value, a
+    /// zero sample rate with a positive channel count or the reverse, or an
+    /// unsupported FourCC.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{Ndi, ReceiverOptions, Receiver, FrameSync, Source};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = Ndi::new()?;
+    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("Test")))?;
+    /// let framesync = FrameSync::new(receiver)?;
+    ///
+    /// match framesync.audio_input_format()? {
+    ///     Some(format) => println!(
+    ///         "{} channels at {} Hz",
+    ///         format.num_channels(),
+    ///         format.sample_rate()
+    ///     ),
+    ///     None => println!("No audio yet"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn audio_input_format(&self) -> Result<Option<AudioInputFormat>> {
+        let mut frame = NDIlib_audio_frame_v3_t::default();
+
+        #[cfg(test)]
+        audio_test_calls::capture();
+        // SAFETY: The live FrameSync owns its receiver/runtime.
+        // Processing.NDI.FrameSync.h defines a zero sample rate, channel count
+        // and sample count as a query that returns the current input format,
+        // or a zero sample rate and channel count when there is none, without
+        // capturing samples. The SDK owns whatever it returned until Guard
+        // frees it through this same instance, including validation errors.
+        unsafe {
+            self.core().NDIlib_framesync_capture_audio_v2(
+                self.resource.instance,
+                &mut frame,
+                0,
+                0,
+                0,
+            );
+        }
+
+        // SAFETY: the SDK filled `frame` for this instance, and the borrow of
+        // `self` keeps the FrameSync alive until the guard is dropped here.
+        let guard = unsafe {
+            Guard::<FrameSyncAudioFree>::new(&self.resource._ndi, self.resource.instance, frame)
+        };
+        input_format(guard.frame())
     }
 
     /// Query the current audio queue depth.
@@ -655,6 +775,20 @@ pub(crate) fn is_framesync_video_empty(frame: &NDIlib_video_frame_v2_t) -> bool 
         && unsafe { frame.__bindgen_anon_1.data_size_in_bytes } == 0
         && frame.p_metadata.is_null()
         && frame.timestamp == 0
+}
+
+/// The answer to an input-format query: the format, or `None` when no source
+/// format is known. Samples in the answer, or any other shape
+/// [`validate_returned_audio`] rejects, are an error. The metadata pointer is
+/// not read: the answer exposes no metadata.
+fn input_format(returned: &NDIlib_audio_frame_v3_t) -> Result<Option<AudioInputFormat>> {
+    match validate_returned_audio(returned)? {
+        ReturnedAudio::Empty(format) => Ok(format),
+        ReturnedAudio::Samples(layout) => Err(Error::InvalidFrame(format!(
+            "FrameSync audio input-format query returned {} channels of {} samples",
+            layout.no_channels, layout.no_samples
+        ))),
+    }
 }
 
 // A thread-local seam at the actual SDK capture/free boundaries. This lets tests
@@ -806,7 +940,6 @@ mod tests {
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
             for _ in 0..1000 {
                 std::hint::black_box(FrameSyncAudioRequest::capture(2, 8_388_608).unwrap());
-                std::hint::black_box(FrameSyncAudioRequest::query_input());
             }
         });
         assert_eq!(allocations, 0);
@@ -831,7 +964,8 @@ mod tests {
             });
             assert_eq!(allocations, 0);
             assert_eq!(audio_test_calls::take(), (1, 1));
-            assert!(fs.capture_audio(request).unwrap().is_some());
+            let owned = fs.capture_audio(request).unwrap();
+            assert_eq!((owned.num_channels(), owned.num_samples()), (2, 1024));
             assert_eq!(audio_test_calls::take(), (1, 1));
         }
 
@@ -842,16 +976,16 @@ mod tests {
         assert_eq!(audio_test_calls::take(), (1, 1));
         assert!(fs.capture_audio(unknown_rate).is_err());
         assert_eq!(audio_test_calls::take(), (1, 1));
-        assert!(fs
-            .capture_audio_ref(FrameSyncAudioRequest::query_input())
-            .unwrap()
-            .is_empty());
-        assert_eq!(audio_test_calls::take(), (1, 1));
-        assert!(fs
-            .capture_audio(FrameSyncAudioRequest::query_input())
-            .unwrap()
-            .is_none());
-        assert_eq!(audio_test_calls::take(), (1, 1));
+
+        // The input-format query reports that no source format is known, frees
+        // what the SDK returned exactly once, and allocates nothing.
+        for _ in 0..3 {
+            let (format, allocations) =
+                crate::test_alloc::allocation_count(|| fs.audio_input_format());
+            assert_eq!(format.unwrap(), None);
+            assert_eq!(allocations, 0);
+            assert_eq!(audio_test_calls::take(), (1, 1));
+        }
     }
 
     #[test]
@@ -995,55 +1129,95 @@ mod tests {
         assert!(matches!(result, Err(Error::InvalidFrame(_))));
     }
 
+    /// The answer to an input-format query maps to `None` for the no-source
+    /// state and to the format otherwise; samples in the answer are refused.
     #[test]
-    fn test_framesync_audio_ref_query_no_source_empty() {
-        let raw = NDIlib_audio_frame_v3_t::default();
-        let guard =
-            unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let frame = unsafe { FrameSyncAudioRef::new(guard, true) }.expect("empty query frame");
-
-        assert!(frame.is_empty());
-        assert_eq!(frame.metadata(), None);
-        assert!(frame.data().unwrap().is_empty());
-        assert_eq!(frame.format(), None);
-        assert!(frame.try_to_owned().expect("owned conversion").is_none());
-        assert!(format!("{frame:?}").contains("FrameSyncAudioRef"));
-    }
-
-    #[test]
-    fn test_framesync_audio_ref_query_source_format_empty() {
-        let raw = NDIlib_audio_frame_v3_t {
-            sample_rate: 48000,
-            no_channels: 2,
-            no_samples: 0,
-            timecode: 0,
-            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
-            p_data: ptr::null_mut(),
-            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
-                channel_stride_in_bytes: 0,
-            },
-            p_metadata: ptr::null(),
-            timestamp: 0,
+    fn input_format_maps_no_source_and_format_states() {
+        let fltp = NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP;
+        // No source yet, with the FourCC unset or set.
+        let no_source = NDIlib_audio_frame_v3_t::default();
+        assert_eq!(input_format(&no_source).unwrap(), None);
+        let no_source_fltp = NDIlib_audio_frame_v3_t {
+            FourCC: fltp,
+            ..no_source
         };
+        assert_eq!(input_format(&no_source_fltp).unwrap(), None);
 
-        let guard =
-            unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let frame = unsafe { FrameSyncAudioRef::new(guard, true) }.expect("query source frame");
+        let format = NDIlib_audio_frame_v3_t {
+            sample_rate: 48_000,
+            no_channels: 2,
+            FourCC: fltp,
+            ..no_source
+        };
+        let format = input_format(&format).unwrap().expect("a reported format");
+        assert_eq!((format.sample_rate(), format.num_channels()), (48_000, 2));
+        let widest = NDIlib_audio_frame_v3_t {
+            sample_rate: i32::MAX,
+            no_channels: i32::MAX,
+            FourCC: fltp,
+            ..no_source
+        };
+        let widest = input_format(&widest).unwrap().expect("a reported format");
+        assert_eq!(widest.sample_rate(), i32::MAX.unsigned_abs());
+        assert_eq!(widest.num_channels(), i32::MAX.unsigned_abs());
+        assert!(FrameSyncAudioRequest::capture_at(widest.sample_rate(), 2, 1).is_ok());
 
-        assert!(frame.is_empty());
-        assert_eq!(frame.sample_rate(), 48000);
-        assert_eq!(frame.num_channels(), 2);
-        assert_eq!(frame.format(), Some(AudioFormat::Fltp));
+        // Well-formed samples are still not an answer to a query.
+        let mut samples = [0.0f32; 8];
+        let with_samples = NDIlib_audio_frame_v3_t {
+            sample_rate: 48_000,
+            no_channels: 2,
+            no_samples: 4,
+            FourCC: fltp,
+            p_data: samples.as_mut_ptr().cast(),
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: 16,
+            },
+            ..no_source
+        };
+        match input_format(&with_samples) {
+            Err(Error::InvalidFrame(message)) => {
+                assert!(
+                    message.contains("query returned 2 channels of 4 samples"),
+                    "{message}"
+                )
+            }
+            other => panic!("expected InvalidFrame, got {other:?}"),
+        }
+        // A partial state is neither answer.
+        for (sample_rate, no_channels) in [(48_000, 0), (0, 2), (-1, 2), (48_000, -1)] {
+            let partial = NDIlib_audio_frame_v3_t {
+                sample_rate,
+                no_channels,
+                FourCC: fltp,
+                ..no_source
+            };
+            assert!(matches!(
+                input_format(&partial),
+                Err(Error::InvalidFrame(_))
+            ));
+        }
     }
 
+    /// A capture always holds samples: neither SDK state without samples is a
+    /// FrameSync audio frame.
     #[test]
     fn test_framesync_audio_ref_capture_rejects_empty() {
-        let raw = NDIlib_audio_frame_v3_t::default();
-        let guard =
-            unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let result = unsafe { FrameSyncAudioRef::new(guard, false) };
+        let no_source = NDIlib_audio_frame_v3_t::default();
+        let format_only = NDIlib_audio_frame_v3_t {
+            sample_rate: 48_000,
+            no_channels: 2,
+            FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
+            ..no_source
+        };
+        for raw in [no_source, format_only] {
+            let guard = unsafe {
+                Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {})
+            };
+            let result = unsafe { FrameSyncAudioRef::new(guard) };
 
-        assert!(matches!(result, Err(Error::InvalidFrame(_))));
+            assert!(matches!(result, Err(Error::InvalidFrame(_))));
+        }
     }
 
     #[test]
@@ -1072,18 +1246,17 @@ mod tests {
 
         let guard =
             unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        let frame = unsafe { FrameSyncAudioRef::new(guard, false) }.expect("strided audio frame");
+        let frame = unsafe { FrameSyncAudioRef::new(guard) }.expect("strided audio frame");
 
         assert_eq!(frame.metadata(), Some("framesync audio"));
         assert!(frame.data().is_none());
+        assert_eq!(frame.format(), AudioFormat::Fltp);
         assert_eq!(frame.channel_data(0), Some(&[1.0, 2.0, 3.0, 4.0][..]));
         assert_eq!(frame.channel_data(1), Some(&[10.0, 20.0, 30.0, 40.0][..]));
         assert_eq!(frame.channel_stride_bytes(), stride_samples as usize * 4);
+        assert!(format!("{frame:?}").contains("FrameSyncAudioRef"));
 
-        let owned = frame
-            .try_to_owned()
-            .expect("owned conversion")
-            .expect("samples");
+        let owned = frame.try_to_owned().expect("owned conversion");
         assert_eq!(owned.metadata(), Some("framesync audio"));
         assert_eq!(owned.data().len(), 8);
         assert_eq!(owned.channel_stride_bytes(), 16);
@@ -1114,7 +1287,7 @@ mod tests {
         let guard =
             unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
         assert!(matches!(
-            unsafe { FrameSyncAudioRef::new(guard, false) },
+            unsafe { FrameSyncAudioRef::new(guard) },
             Err(Error::InvalidUtf8(_))
         ));
     }

@@ -1,4 +1,6 @@
-//! SDK regression for query-to-request migration and changing source channels.
+//! SDK regression: an application follows the source's channels through
+//! `FrameSync::audio_input_format`, and a capture request keeps its own
+//! channel count when the source changes.
 mod common;
 
 use grafton_ndi::{
@@ -15,13 +17,11 @@ use std::{
 fn wait_for_channels(fs: &FrameSync, channels: u32) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let format = fs
-            .capture_audio_ref(FrameSyncAudioRequest::query_input())
-            .unwrap();
-        if format.num_channels() == channels {
-            assert_eq!(format.sample_rate(), 48_000);
-            assert!(format.is_empty());
-            return format.num_channels();
+        if let Some(format) = fs.audio_input_format().unwrap() {
+            if format.num_channels() == channels {
+                assert_eq!(format.sample_rate(), 48_000);
+                return format.num_channels();
+            }
         }
         assert!(
             Instant::now() < deadline,
@@ -89,7 +89,8 @@ fn queried_channels_remain_fixed_when_source_format_changes() {
             assert!(frame.channels().all(|channel| channel.len() == 480));
         }
 
-        // Deliberately change the source between query/construction and capture.
+        // Deliberately change the source between the format query, request
+        // construction and capture.
         source_channels.store(4, Ordering::Relaxed);
         let new_channels = wait_for_channels(&fs, 4);
         for _ in 0..3 {
@@ -104,7 +105,7 @@ fn queried_channels_remain_fixed_when_source_format_changes() {
             );
             assert_eq!(frame.channels().len(), 2);
             assert!(frame.channels().all(|channel| channel.len() == 480));
-            let owned = fs.capture_audio(request).unwrap().unwrap();
+            let owned = fs.capture_audio(request).unwrap();
             assert_eq!((owned.num_channels(), owned.num_samples()), (2, 480));
             assert_eq!(owned.channel_data(1).unwrap().len(), 480);
         }
