@@ -6,10 +6,12 @@ use super::{
     packets, AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedVideoFrame, VideoCodec,
 };
 use crate::{
-    capture::{AudioKind, CaptureKind, Guard, MetadataKind, Notification, VideoKind},
+    capture::{
+        capture_any, AudioKind, CaptureKind, Delivered, Guard, MetadataKind, Notification,
+        VideoKind,
+    },
     receiver::{capture_within, Attempt, PacketAttached},
     sys::{
-        self,
         advanced::{native, ReceiverConfiguration},
         bindings::*,
     },
@@ -251,36 +253,19 @@ impl PacketReceiver {
         let Some(lock) = receiver.core.capture_lock(attempt) else {
             return Ok(None);
         };
-        let mut video = NDIlib_video_frame_v2_t::default();
-        let mut audio = NDIlib_audio_frame_v3_t::default();
-        let mut metadata = NDIlib_metadata_frame_t::default();
-        let kind = lock.capture(Some(&mut video), Some(&mut audio), Some(&mut metadata));
-        let (ndi, instance) = (lock.runtime(), lock.instance());
+        let delivered = capture_any(&lock)?;
         drop(lock);
-        // In each frame arm, the SDK filled only the descriptor of the kind it
-        // returned, for this instance, which was created through `ndi`. The
-        // guard borrows the receiver, so the instance outlives the frame, and
-        // it frees the frame exactly once through the matching
-        // NDIlib_recv_free_* function, whether or not the copy succeeds.
-        let event = match kind {
-            sys::bindings::NDIlib_frame_type_e_NDIlib_frame_type_video => {
-                // SAFETY: `video` holds the delivered frame; see above.
-                video_event(unsafe { Guard::<VideoKind>::new(ndi, instance, video) })?
-            }
-            sys::bindings::NDIlib_frame_type_e_NDIlib_frame_type_audio => {
-                // SAFETY: `audio` holds the delivered frame; see above.
-                audio_event(unsafe { Guard::<AudioKind>::new(ndi, instance, audio) })?
-            }
-            sys::bindings::NDIlib_frame_type_e_NDIlib_frame_type_metadata => {
-                // SAFETY: `metadata` holds the delivered frame; see above.
-                metadata_event(unsafe { Guard::<MetadataKind>::new(ndi, instance, metadata) })?
-            }
-            other => match Notification::classify(other)? {
-                Notification::None => return Ok(None),
-                Notification::StatusChanged => PacketEvent::StatusChanged,
-                Notification::SourceChanged => PacketEvent::SourceChanged,
-                Notification::Unknown(value) => PacketEvent::Unknown(value),
-            },
+        // Each guard borrows the receiver and frees its frame exactly once
+        // through the matching NDIlib_recv_free_* function, whether or not
+        // the copy succeeds.
+        let event = match delivered {
+            Delivered::Video(frame) => video_event(frame)?,
+            Delivered::Audio(frame) => audio_event(frame)?,
+            Delivered::Metadata(frame) => metadata_event(frame)?,
+            Delivered::Notification(Notification::None) => return Ok(None),
+            Delivered::Notification(Notification::StatusChanged) => PacketEvent::StatusChanged,
+            Delivered::Notification(Notification::SourceChanged) => PacketEvent::SourceChanged,
+            Delivered::Notification(Notification::Unknown(value)) => PacketEvent::Unknown(value),
         };
         Ok(Some(event))
     }

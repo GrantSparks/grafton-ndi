@@ -324,6 +324,91 @@ struct FrameSyncResource {
     _ndi: crate::Ndi,
 }
 
+/// What one `NDIlib_framesync_capture_audio_v2` call asks the SDK for.
+#[derive(Clone, Copy)]
+enum AudioCall {
+    /// Samples in a validated request's rate, channels and sample count.
+    Samples(FrameSyncAudioRequest),
+    /// The input-format query: a zero sample rate, channel count and sample
+    /// count.
+    InputFormat,
+}
+
+impl FrameSyncResource {
+    /// Capture video for `scan_type`: the guard of the frame the SDK
+    /// returned, or `None` for the documented all-zero "no video yet" state,
+    /// which holds nothing to free. The one place a FrameSync video guard is
+    /// made.
+    fn capture_video(&self, scan_type: ScanType) -> Option<Guard<'_, FrameSyncVideoFree>> {
+        let mut frame = NDIlib_video_frame_v2_t::default();
+        // SAFETY: the FrameSync instance is live for this borrow and `frame` is
+        // writable storage the SDK fills or leaves zeroed.
+        unsafe {
+            self._ndi.api().core.NDIlib_framesync_capture_video(
+                self.instance,
+                &mut frame,
+                scan_type.to_sdk(),
+            );
+        }
+        if is_framesync_video_empty(&frame) {
+            return None;
+        }
+        // SAFETY: the call above filled `frame` through this instance, which
+        // was created through `_ndi`. The guard borrows this resource, which
+        // destroys the instance only when dropped, so the instance outlives
+        // the guard, which frees the frame exactly once through
+        // NDIlib_framesync_free_video, including when validation fails.
+        Some(unsafe { Guard::new(&self._ndi, self.instance, frame) })
+    }
+
+    /// Make `call`: the guard of what the SDK returned, which it returns
+    /// whether or not audio has arrived. The one place a FrameSync audio
+    /// guard is made.
+    fn capture_audio(&self, call: AudioCall) -> Guard<'_, FrameSyncAudioFree> {
+        let (sample_rate, num_channels, num_samples) = match call {
+            AudioCall::Samples(request) => (
+                request.sample_rate,
+                request.num_channels,
+                request.num_samples,
+            ),
+            AudioCall::InputFormat => (0, 0, 0),
+        };
+        let mut frame = NDIlib_audio_frame_v3_t::default();
+
+        #[cfg(test)]
+        audio_test_calls::capture();
+        // SAFETY: the FrameSync instance is live for this borrow and `frame` is
+        // writable storage. Processing.NDI.FrameSync.h defines both calls:
+        // - A request's private fields were checked at construction: positive
+        //   channels and samples, the packed FLTP payload and the signed byte
+        //   stride, and a positive sample rate. The SDK permits an output rate
+        //   and channel count independent of the input, and supplies silence
+        //   before audio arrives, so no source-format sentinel can race a
+        //   format change here.
+        // - A zero sample rate, channel count and sample count is a query
+        //   that returns the current input format, or a zero sample rate and
+        //   channel count when there is none, without capturing samples.
+        // Either way the SDK owns what it returned until it is freed through
+        // this same instance.
+        unsafe {
+            self._ndi.api().core.NDIlib_framesync_capture_audio_v2(
+                self.instance,
+                &mut frame,
+                sample_rate,
+                num_channels,
+                num_samples,
+            );
+        }
+
+        // SAFETY: the call above filled `frame` through this instance, which
+        // was created through `_ndi`. The guard borrows this resource, which
+        // destroys the instance only when dropped, so the instance outlives
+        // the guard, which frees the frame exactly once through
+        // NDIlib_framesync_free_audio_v2, including when validation fails.
+        unsafe { Guard::new(&self._ndi, self.instance, frame) }
+    }
+}
+
 impl Drop for FrameSyncResource {
     fn drop(&mut self) {
         // SAFETY: Creation checked for null; exclusive ownership and borrowed
@@ -489,27 +574,9 @@ impl FrameSync {
     /// format or malformed frame descriptor, including invalid dimensions,
     /// stride, buffers, or metadata.
     pub fn capture_video_ref(&self, scan_type: ScanType) -> Result<Option<FrameSyncVideoRef<'_>>> {
-        let mut frame = NDIlib_video_frame_v2_t::default();
-
-        // SAFETY: the FrameSync instance is live for this borrow and `frame` is
-        // writable storage the SDK fills or leaves zeroed.
-        unsafe {
-            self.core().NDIlib_framesync_capture_video(
-                self.resource.instance,
-                &mut frame,
-                scan_type.to_sdk(),
-            );
-        }
-
-        // Per SDK docs: Returns zeroed struct if no video received yet
-        if is_framesync_video_empty(&frame) {
+        // Per SDK docs: a zeroed struct if no video has been received yet.
+        let Some(guard) = self.resource.capture_video(scan_type) else {
             return Ok(None);
-        }
-
-        // SAFETY: the SDK filled `frame` for this instance, and the borrow of
-        // `self` keeps the FrameSync alive for as long as the guard exists.
-        let guard = unsafe {
-            Guard::<FrameSyncVideoFree>::new(&self.resource._ndi, self.resource.instance, frame)
         };
         // SAFETY: the guard owns a frame this capture just returned.
         let frame = unsafe { FrameSyncVideoRef::new(guard)? };
@@ -625,34 +692,9 @@ impl FrameSync {
         &self,
         request: FrameSyncAudioRequest,
     ) -> Result<FrameSyncAudioRef<'_>> {
-        let mut frame = NDIlib_audio_frame_v3_t::default();
-
-        #[cfg(test)]
-        audio_test_calls::capture();
-        // SAFETY: The live FrameSync owns its receiver/runtime. Request fields
-        // are private: construction checked positive channels and samples, the
-        // packed FLTP payload and the signed byte stride, and a positive
-        // sample rate. Processing.NDI.FrameSync.h permits an output rate and
-        // channel count independent of the input, and supplies silence before
-        // audio arrives. No source-format sentinel can race a format change
-        // here. The SDK owns the returned allocation until Guard frees it
-        // through this same instance, including validation errors.
-        unsafe {
-            self.core().NDIlib_framesync_capture_audio_v2(
-                self.resource.instance,
-                &mut frame,
-                request.sample_rate,
-                request.num_channels,
-                request.num_samples,
-            );
-        }
-
-        // SAFETY: the SDK filled `frame` for this instance, and the borrow of
-        // `self` keeps the FrameSync alive for as long as the guard exists.
-        let guard = unsafe {
-            Guard::<FrameSyncAudioFree>::new(&self.resource._ndi, self.resource.instance, frame)
-        };
-        // SAFETY: the guard owns a frame this capture just returned.
+        let guard = self.resource.capture_audio(AudioCall::Samples(request));
+        // SAFETY: the guard owns the samples this capture request just
+        // returned.
         unsafe { FrameSyncAudioRef::new(guard) }
     }
 
@@ -698,31 +740,8 @@ impl FrameSync {
     /// # }
     /// ```
     pub fn audio_input_format(&self) -> Result<Option<AudioInputFormat>> {
-        let mut frame = NDIlib_audio_frame_v3_t::default();
-
-        #[cfg(test)]
-        audio_test_calls::capture();
-        // SAFETY: The live FrameSync owns its receiver/runtime.
-        // Processing.NDI.FrameSync.h defines a zero sample rate, channel count
-        // and sample count as a query that returns the current input format,
-        // or a zero sample rate and channel count when there is none, without
-        // capturing samples. The SDK owns whatever it returned until Guard
-        // frees it through this same instance, including validation errors.
-        unsafe {
-            self.core().NDIlib_framesync_capture_audio_v2(
-                self.resource.instance,
-                &mut frame,
-                0,
-                0,
-                0,
-            );
-        }
-
-        // SAFETY: the SDK filled `frame` for this instance, and the borrow of
-        // `self` keeps the FrameSync alive until the guard is dropped here.
-        let guard = unsafe {
-            Guard::<FrameSyncAudioFree>::new(&self.resource._ndi, self.resource.instance, frame)
-        };
+        // The guard frees what the query returned when it is dropped here.
+        let guard = self.resource.capture_audio(AudioCall::InputFormat);
         input_format(guard.frame())
     }
 

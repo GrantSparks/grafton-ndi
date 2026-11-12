@@ -85,34 +85,21 @@ impl Finder {
     /// without an Advanced runtime.
     pub fn sources_with_metadata(&self) -> Result<Vec<ExtendedSource>> {
         let table = self.runtime().table::<SourceMetadata>()?;
-        Ok(self.snapshot(|instance| {
-            native!(SourceMetadata, table => {
-                let mut count = 0;
-                // SAFETY: the finder is live, and the snapshot lock is held
-                // until everything the SDK returns has been copied.
-                let sources =
-                    unsafe { table.NDIlib_find_get_current_sources_v2(instance, &mut count) };
-                if sources.is_null() {
-                    return Vec::new();
-                }
-                // SAFETY: the SDK returned `count` descriptors that stay valid
-                // until the next snapshot call, which the lock excludes.
-                unsafe { std::slice::from_raw_parts(sources, count as usize) }
-                    .iter()
-                    .filter_map(|source| {
-                        // SAFETY: the descriptor's strings are valid for as
-                        // long as the snapshot is.
-                        unsafe {
-                            extended_source(
-                                source.p_ndi_name,
-                                source.p_url_address,
-                                source.p_metadata,
-                            )
-                        }
-                    })
-                    .collect()
+        native!(SourceMetadata, table => {
+            // SAFETY: `snapshot` hands the fetch the finder's live instance,
+            // for which the SDK returns null or `count` descriptors whose
+            // strings stay valid until the next snapshot call; the snapshot
+            // lock excludes that call until every descriptor has been copied,
+            // and each copy reads only its descriptor's strings meanwhile.
+            Ok(unsafe {
+                self.snapshot(
+                    |instance, count| table.NDIlib_find_get_current_sources_v2(instance, count),
+                    |source| {
+                        extended_source(source.p_ndi_name, source.p_url_address, source.p_metadata)
+                    },
+                )
             })
-        }))
+        })
     }
 }
 

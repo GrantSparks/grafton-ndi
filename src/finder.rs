@@ -212,17 +212,46 @@ impl Finder {
         })
     }
 
-    /// Run `read` on the native finder while no other snapshot can be taken.
+    /// The one snapshot loop: while no other snapshot can be taken, `fetch`
+    /// the SDK's array of descriptors from this finder's instance and `copy`
+    /// each one, leaving out those `copy` rejects.
     ///
-    /// The SDK owns a snapshot and its strings until the next snapshot call on
-    /// the same finder, so `read` must finish copying before it returns.
-    #[cfg(feature = "advanced")]
-    pub(crate) fn snapshot<T>(&self, read: impl FnOnce(NDIlib_find_instance_t) -> T) -> T {
+    /// The SDK owns a snapshot, the array and its strings, until the next
+    /// snapshot call on the same finder, so the fetch and every copy stay in
+    /// one critical section: locking only the SDK call would not be enough.
+    /// A descriptor the SDK should not produce (null strings naming neither a
+    /// source nor an address, or a string longer than the limit) is left
+    /// out, so that one malformed entry does not hide the others.
+    ///
+    /// # Safety
+    ///
+    /// `fetch` must return null, or a live array of at least the count it
+    /// writes, whose descriptors and the C strings they point to stay
+    /// readable until the next snapshot call on this finder.
+    pub(crate) unsafe fn snapshot<D, T>(
+        &self,
+        fetch: impl FnOnce(NDIlib_find_instance_t, &mut u32) -> *const D,
+        mut copy: impl FnMut(&D) -> Option<T>,
+    ) -> Vec<T> {
         let _snapshot = self
             .sources_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        read(self.instance)
+        let mut count = 0;
+        let descriptors = fetch(self.instance, &mut count);
+        if descriptors.is_null() {
+            return Vec::new();
+        }
+        let mut copied = Vec::with_capacity(count as usize);
+        for index in 0..count as usize {
+            // SAFETY: `index` is below the count the SDK reported for this
+            // live, non-null array, which the lock keeps from being replaced
+            // until the loop ends; `copy` cannot keep the reference.
+            if let Some(value) = copy(unsafe { &*descriptors.add(index) }) {
+                copied.push(value);
+            }
+        }
+        copied
     }
 
     /// The runtime this finder was created through.
@@ -325,37 +354,21 @@ impl Finder {
         }
     }
 
-    // Keep acquisition and conversion in one critical section: the SDK owns both
-    // the array and its strings, so locking only the SDK call is insufficient.
+    /// [`Self::snapshot`] of plain source descriptors: an entry `copy` fails
+    /// to convert is left out.
+    ///
     /// # Safety
-    /// `fetch` must return a live array of the reported count, with readable
-    /// source descriptors and C strings until all copies finish under the lock.
+    ///
+    /// As for [`Self::snapshot`]: `fetch` must return null or a live array of
+    /// the count it writes, with readable source descriptors and C strings
+    /// until all copies finish under the lock.
     unsafe fn current_sources_with(
         &self,
         fetch: impl FnOnce(&mut u32) -> *const NDIlib_source_t,
         mut copy: impl FnMut(*const NDIlib_source_t) -> Result<Source>,
     ) -> Result<Vec<Source>> {
-        let _snapshot = self
-            .sources_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut num_sources = 0;
-        let sources_ptr = fetch(&mut num_sources);
-        if sources_ptr.is_null() {
-            return Ok(vec![]);
-        }
-
-        // A descriptor the SDK should not produce (null, naming neither a
-        // source nor an address, or with a string longer than the limit) is
-        // left out, so that one malformed entry does not hide the others.
-        let mut sources = Vec::with_capacity(num_sources as usize);
-        for i in 0..num_sources as usize {
-            // SAFETY: the SDK reported `num_sources` entries in this live array.
-            if let Ok(source) = copy(unsafe { sources_ptr.add(i) }) {
-                sources.push(source);
-            }
-        }
-        Ok(sources)
+        // SAFETY: forwarded to the caller's obligations on `fetch`.
+        Ok(unsafe { self.snapshot(|_, count| fetch(count), |source| copy(source).ok()) })
     }
 
     /// Poll discovery until `accept` selects a value or `timeout` elapses.

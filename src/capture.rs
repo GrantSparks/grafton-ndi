@@ -19,7 +19,10 @@
 //!   the SDK capture call and its frame-type discriminant, and copies a
 //!   borrowed frame into an owned one. The capture itself is made only through
 //!   a [`CaptureLock`], the proof that the receiver's shared capture guard is
-//!   held, so no receiver capture can overlap a reconnect.
+//!   held, so no receiver capture can overlap a reconnect. [`capture_raw`]
+//!   (one kind) and `capture_any` (every kind) both turn what that capture
+//!   delivered into a guard through `Captured::take`, the one place a
+//!   receiver guard is made.
 //!
 //! # Example
 //!
@@ -124,16 +127,15 @@ pub(crate) trait CaptureStrategy:
     /// The frame-type discriminant `NDIlib_recv_capture_v3` returns for this kind.
     const FRAME_TYPE: NDIlib_frame_type_e;
 
-    /// Run one capture for this kind under `lock`, routing `frame` into the
-    /// matching `NDIlib_recv_capture_v3` slot and leaving the others null.
-    fn capture_into(lock: &CaptureLock<'_>, frame: &mut Self::RawFrame) -> NDIlib_frame_type_e;
+    /// This kind's media slot of an `NDIlib_recv_capture_v3` call.
+    fn slot(slots: &mut Slots) -> &mut Option<Self::RawFrame>;
 
     /// Wrap a freshly captured frame guard in its borrowed view, validating any
     /// kind-specific invariants (e.g. FourCC) during construction.
     ///
     /// # Safety
     ///
-    /// `guard` must own a frame that `capture_into` reported as
+    /// `guard` must own a frame that a receiver capture reported as
     /// [`FRAME_TYPE`](Self::FRAME_TYPE).
     unsafe fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>>
     where
@@ -166,8 +168,8 @@ impl CaptureKind for VideoKind {
 impl CaptureStrategy for VideoKind {
     const FRAME_TYPE: NDIlib_frame_type_e = NDIlib_frame_type_e_NDIlib_frame_type_video;
 
-    fn capture_into(lock: &CaptureLock<'_>, frame: &mut Self::RawFrame) -> NDIlib_frame_type_e {
-        lock.capture(Some(frame), None, None)
+    fn slot(slots: &mut Slots) -> &mut Option<Self::RawFrame> {
+        &mut slots.video
     }
 
     unsafe fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>> {
@@ -200,8 +202,8 @@ impl CaptureKind for AudioKind {
 impl CaptureStrategy for AudioKind {
     const FRAME_TYPE: NDIlib_frame_type_e = NDIlib_frame_type_e_NDIlib_frame_type_audio;
 
-    fn capture_into(lock: &CaptureLock<'_>, frame: &mut Self::RawFrame) -> NDIlib_frame_type_e {
-        lock.capture(None, Some(frame), None)
+    fn slot(slots: &mut Slots) -> &mut Option<Self::RawFrame> {
+        &mut slots.audio
     }
 
     unsafe fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>> {
@@ -234,8 +236,8 @@ impl CaptureKind for MetadataKind {
 impl CaptureStrategy for MetadataKind {
     const FRAME_TYPE: NDIlib_frame_type_e = NDIlib_frame_type_e_NDIlib_frame_type_metadata;
 
-    fn capture_into(lock: &CaptureLock<'_>, frame: &mut Self::RawFrame) -> NDIlib_frame_type_e {
-        lock.capture(None, None, Some(frame))
+    fn slot(slots: &mut Slots) -> &mut Option<Self::RawFrame> {
+        &mut slots.metadata
     }
 
     unsafe fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>> {
@@ -456,30 +458,153 @@ impl Notification {
     }
 }
 
+/// The media descriptors of one `NDIlib_recv_capture_v3` call: `Some` for
+/// each slot the call is given, `None` for each it leaves null.
+///
+/// Only this module makes one, and only to hand it to `Captured::capture`.
+pub(crate) struct Slots {
+    video: Option<NDIlib_video_frame_v2_t>,
+    audio: Option<NDIlib_audio_frame_v3_t>,
+    metadata: Option<NDIlib_metadata_frame_t>,
+}
+
+impl Slots {
+    /// The slot of kind `K` alone, so that the SDK can deliver no frame of
+    /// another kind, which nothing would take and free.
+    fn only<K: CaptureStrategy>() -> Self {
+        let mut slots = Self {
+            video: None,
+            audio: None,
+            metadata: None,
+        };
+        *K::slot(&mut slots) = Some(K::RawFrame::default());
+        slots
+    }
+
+    /// All three media slots.
+    #[cfg(feature = "advanced")]
+    fn all() -> Self {
+        Self {
+            video: Some(NDIlib_video_frame_v2_t::default()),
+            audio: Some(NDIlib_audio_frame_v3_t::default()),
+            metadata: Some(NDIlib_metadata_frame_t::default()),
+        }
+    }
+}
+
+/// What one `NDIlib_recv_capture_v3` call under a [`CaptureLock`] returned:
+/// the frame type it reported, and the descriptors it was given.
+///
+/// Only [`Self::capture`] makes one, straight from that call, so a
+/// descriptor it holds was given to the call, which filled it when the frame
+/// type is that descriptor's kind and left it alone otherwise. A caller
+/// [takes](Self::take) every kind it gave a slot: a frame left in its slot
+/// would never be freed.
+struct Captured<'rx> {
+    runtime: &'rx Ndi,
+    instance: NDIlib_recv_instance_t,
+    frame_type: NDIlib_frame_type_e,
+    slots: Slots,
+}
+
+impl<'rx> Captured<'rx> {
+    /// Capture under `lock`, within what is left of its attempt, giving the
+    /// SDK the descriptors of `slots`.
+    fn capture(lock: &CaptureLock<'rx>, mut slots: Slots) -> Self {
+        let frame_type = lock.capture(
+            slots.video.as_mut(),
+            slots.audio.as_mut(),
+            slots.metadata.as_mut(),
+        );
+        Self {
+            runtime: lock.runtime(),
+            instance: lock.instance(),
+            frame_type,
+            slots,
+        }
+    }
+
+    /// The guard of the frame of kind `K` this capture delivered, or `None`
+    /// when it delivered none of that kind; the one place a receiver guard
+    /// is made.
+    fn take<K: CaptureStrategy>(&mut self) -> Option<Guard<'rx, K>> {
+        if self.frame_type != K::FRAME_TYPE {
+            return None;
+        }
+        let frame = K::slot(&mut self.slots).take()?;
+        // SAFETY: the SDK reported a frame of kind `K` and was given `K`'s
+        // descriptor, so it wrote that frame there (Processing.NDI.Recv.h:
+        // it fills only the descriptor of the kind it returns). `capture`
+        // made that call on `instance`, created through `runtime`, and
+        // taking the descriptor out of its slot wraps the frame once. The
+        // lock borrowed the receiver for 'rx, as `runtime` and the guard do,
+        // so the instance outlives the guard, which frees the frame exactly
+        // once through the matching NDIlib_recv_free_* function.
+        Some(unsafe { Guard::new(self.runtime, self.instance, frame) })
+    }
+
+    /// What the capture reported in place of a frame a caller took.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Notification::classify`].
+    fn notification(&self) -> Result<Notification> {
+        Notification::classify(self.frame_type)
+    }
+}
+
 /// Capture a frame of kind `K` from the receiver `lock` holds the capture
 /// guard of, within what is left of the lock's attempt.
 ///
-/// Routes the frame into the matching `NDIlib_recv_capture_v3` slot via
-/// [`CaptureStrategy::capture_into`]; any other result is classified by
-/// [`Notification::classify`]. The frame's guard borrows the receiver for
-/// `'rx`, as the lock does, and outlives the lock.
+/// Gives `NDIlib_recv_capture_v3` the slot of kind `K` alone; any other
+/// result is classified by [`Notification::classify`]. The frame's guard
+/// borrows the receiver for `'rx`, as the lock does, and outlives the lock.
 pub(crate) fn capture_raw<'rx, K: CaptureKind>(
     lock: &CaptureLock<'rx>,
 ) -> Result<CaptureResult<'rx, K>> {
-    let mut frame = K::RawFrame::default();
-    let frame_type = K::capture_into(lock, &mut frame);
-    if frame_type == K::FRAME_TYPE {
-        // SAFETY: the SDK reported a frame of this kind, which it wrote to
-        // `frame`, the only slot `capture_into` gives it, for the lock's
-        // receiver instance, created through the lock's runtime. The lock
-        // borrows that receiver for 'rx, so the instance outlives the guard,
-        // which frees the frame through the matching NDIlib_recv_free_*.
-        Ok(CaptureResult::Frame(unsafe {
-            Guard::<K>::new(lock.runtime(), lock.instance(), frame)
-        }))
-    } else {
-        Notification::classify(frame_type).map(CaptureResult::Notification)
+    let mut captured = Captured::capture(lock, Slots::only::<K>());
+    match captured.take::<K>() {
+        Some(guard) => Ok(CaptureResult::Frame(guard)),
+        None => captured.notification().map(CaptureResult::Notification),
     }
+}
+
+/// What one capture with all three media slots delivered: a frame of any
+/// kind, or what the SDK reported in its place.
+#[cfg(feature = "advanced")]
+pub(crate) enum Delivered<'rx> {
+    /// A video frame.
+    Video(Guard<'rx, VideoKind>),
+    /// An audio frame.
+    Audio(Guard<'rx, AudioKind>),
+    /// A metadata frame.
+    Metadata(Guard<'rx, MetadataKind>),
+    /// No frame; see [`Notification`].
+    Notification(Notification),
+}
+
+/// Capture a frame of whichever kind arrives first from the receiver `lock`
+/// holds the capture guard of, within what is left of the lock's attempt.
+///
+/// Gives `NDIlib_recv_capture_v3` all three media slots and wraps the
+/// frame it delivered in the guard of its kind, as [`capture_raw`] does for
+/// one kind; any other result is classified by [`Notification::classify`].
+///
+/// # Errors
+///
+/// As for [`Notification::classify`].
+#[cfg(feature = "advanced")]
+pub(crate) fn capture_any<'rx>(lock: &CaptureLock<'rx>) -> Result<Delivered<'rx>> {
+    let mut captured = Captured::capture(lock, Slots::all());
+    Ok(if let Some(frame) = captured.take::<VideoKind>() {
+        Delivered::Video(frame)
+    } else if let Some(frame) = captured.take::<AudioKind>() {
+        Delivered::Audio(frame)
+    } else if let Some(frame) = captured.take::<MetadataKind>() {
+        Delivered::Metadata(frame)
+    } else {
+        Delivered::Notification(captured.notification()?)
+    })
 }
 
 // Convenience aliases for the receiver guard kinds that have a kind-specific
@@ -591,6 +716,24 @@ mod tests {
             matches!(&error, Err(Error::CaptureFailed(reason)) if reason.contains("error frame")),
             "{error:?}"
         );
+    }
+
+    /// A single-kind capture is given no other slot: the SDK could fill one,
+    /// and only the requested kind's frame is taken and freed.
+    #[test]
+    fn a_capture_is_given_only_the_slots_it_takes_frames_from() {
+        fn given(slots: &Slots) -> [bool; 3] {
+            [
+                slots.video.is_some(),
+                slots.audio.is_some(),
+                slots.metadata.is_some(),
+            ]
+        }
+        assert_eq!(given(&Slots::only::<VideoKind>()), [true, false, false]);
+        assert_eq!(given(&Slots::only::<AudioKind>()), [false, true, false]);
+        assert_eq!(given(&Slots::only::<MetadataKind>()), [false, false, true]);
+        #[cfg(feature = "advanced")]
+        assert_eq!(given(&Slots::all()), [true, true, true]);
     }
 
     #[test]
