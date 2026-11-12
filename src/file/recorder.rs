@@ -1,6 +1,12 @@
 //! Recording an NDI source to disk, with explicit finalization.
 
-use std::{ffi::CString, marker::PhantomData, ptr::NonNull, rc::Rc, time::Duration};
+use std::{
+    ffi::CString,
+    marker::PhantomData,
+    ptr::NonNull,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use super::{
     out_param::OutParam,
@@ -845,7 +851,8 @@ impl FileRecorder {
             // A failed poll is an event that was taken but could not be
             // decoded, or could not be read at all. Either way its effect is
             // already in the ledger, which the loop goes on to settle.
-            let polled = self.poll_event_ms(deadline.within(step).remaining_ms());
+            let polled =
+                self.poll_event_ms(deadline.within_at(Instant::now(), step).remaining_ms());
             let drained = matches!(polled, Ok(None));
             interrupted = each(polled);
             if expired && drained {

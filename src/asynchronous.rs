@@ -751,21 +751,16 @@ mod timeout_tests {
 
             let budget = Duration::from_millis(20);
             let mut capture = Box::pin(with_timeout_budget::<Tokio, _, _>(budget, |deadline| {
-                Ok((
-                    deadline.remaining(),
-                    deadline.remaining_ms(),
-                    deadline.elapsed(),
-                ))
+                Ok((deadline.remaining(), deadline.remaining_ms()))
             }));
             let mut context = Context::from_waker(Waker::noop());
             assert!(matches!(capture.as_mut().poll(&mut context), Poll::Pending));
             // Keep the sole worker occupied until the whole budget has elapsed.
             std::thread::sleep(budget + Duration::from_millis(5));
             release_tx.send(()).unwrap();
-            let (remaining, remaining_ms, elapsed) = capture.await.unwrap();
+            // The queue delay spent the budget: the work starts with none left.
+            let (remaining, remaining_ms) = capture.await.unwrap();
             assert_eq!((remaining, remaining_ms), (Duration::ZERO, 0));
-            // The queue delay is part of the time the budget reports as spent.
-            assert!(elapsed >= budget + Duration::from_millis(5), "{elapsed:?}");
             blocker.await.unwrap();
         });
     }

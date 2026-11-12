@@ -42,9 +42,6 @@ pub(crate) fn to_ms_checked(wait: Duration) -> Result<u32> {
 /// pausing between retries and every SDK call all spend the same budget.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Deadline {
-    /// When the budget started, which only tests ask.
-    #[cfg(test)]
-    start: Instant,
     end: Instant,
 }
 
@@ -72,17 +69,7 @@ impl Deadline {
                 "timeout {timeout:?} ends at an instant this platform cannot represent"
             ))
         })?;
-        Ok(Self {
-            #[cfg(test)]
-            start,
-            end,
-        })
-    }
-
-    /// The same budget, ending `wait` from now if that comes first.
-    #[cfg(feature = "file-io")]
-    pub(crate) fn within(self, wait: Duration) -> Self {
-        self.within_at(Instant::now(), wait)
+        Ok(Self { end })
     }
 
     /// The same budget, ending `wait` after `now` if that comes first.
@@ -96,18 +83,6 @@ impl Deadline {
     /// The instant the budget ends.
     pub(crate) fn end(self) -> Instant {
         self.end
-    }
-
-    /// The whole budget, from its start to its end.
-    #[cfg(test)]
-    pub(crate) fn budget(self) -> Duration {
-        self.end.duration_since(self.start)
-    }
-
-    /// The time since the budget started.
-    #[cfg(test)]
-    pub(crate) fn elapsed(self) -> Duration {
-        self.start.elapsed()
     }
 
     /// The time left, zero once the budget is spent.
@@ -181,14 +156,13 @@ mod tests {
 
         let zero = Deadline::after(Duration::ZERO).unwrap();
         assert!(zero.is_expired());
-        assert_eq!(zero.budget(), Duration::ZERO);
         assert_eq!(zero.remaining(), Duration::ZERO);
         assert_eq!(zero.remaining_ms(), 0);
 
-        let longest = Deadline::after(MAX_TIMEOUT).unwrap();
+        let start = Instant::now();
+        let longest = Deadline::starting(start, MAX_TIMEOUT).unwrap();
         assert!(!longest.is_expired());
-        assert_eq!(longest.budget(), MAX_TIMEOUT);
-        assert!(longest.elapsed() < Duration::from_secs(60));
+        assert_eq!(longest.end(), start + MAX_TIMEOUT);
         // Rounded up, the time left is still the full budget, never u32::MAX.
         assert_eq!(longest.remaining_ms(), u32::MAX - 1);
 
@@ -200,11 +174,10 @@ mod tests {
     }
 
     #[test]
-    fn a_narrowed_deadline_keeps_its_start_and_never_extends_the_budget() {
+    fn a_narrowed_deadline_never_extends_the_budget() {
         let deadline = Deadline::after(Duration::from_secs(60)).unwrap();
         let now = Instant::now();
         let attempt = deadline.within_at(now, Duration::from_millis(100));
-        assert_eq!(attempt.start, deadline.start);
         assert_eq!(attempt.end(), now + Duration::from_millis(100));
         assert!(attempt.end() <= deadline.end());
         assert!(attempt.remaining() <= Duration::from_millis(100));
@@ -230,7 +203,6 @@ mod tests {
         let start = Instant::now() + Duration::from_secs(3600);
         let deadline = Deadline::starting(start, Duration::from_millis(50)).unwrap();
         assert_eq!(deadline.end(), start + Duration::from_millis(50));
-        assert_eq!(deadline.budget(), Duration::from_millis(50));
         assert_eq!(deadline.remaining_at(start), Duration::from_millis(50));
         assert_eq!(
             deadline.remaining_at(start + Duration::from_millis(30)),
