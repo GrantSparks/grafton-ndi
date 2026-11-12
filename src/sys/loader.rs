@@ -9,6 +9,7 @@ use std::ffi::CStr;
 use super::{api::Api, selection::Selection, table::Resolver};
 use crate::{
     capabilities::{Capabilities, RuntimeInfo, SdkEdition, SdkVersion},
+    frames::{bounded_sdk_text, MAX_SDK_STRING_BYTES},
     runtime::RuntimeOptions,
     Error, Result,
 };
@@ -119,10 +120,14 @@ impl Runtime {
         if version.is_null() {
             return Err("NDIlib_version returned no version text".into());
         }
-        // SAFETY: non-null was checked and the SDK keeps the string alive for
+        // Read as far as the first NUL, but no further than one SDK string may
+        // reach: a text without a terminator that close is not a version.
+        // SAFETY: non-null was checked, and the SDK keeps the string alive for
         // as long as the implementation is loaded, which is the whole process.
-        let raw_version = unsafe { CStr::from_ptr(version) }
-            .to_str()
+        // The scan stops at its terminator or at the limit.
+        let raw_version = unsafe { bounded_sdk_text(version, MAX_SDK_STRING_BYTES) }
+            .ok_or("its version text has no terminator within the 4 MiB one SDK string may take")?;
+        let raw_version = std::str::from_utf8(raw_version)
             .map_err(|error| format!("its version text is not UTF-8: {error}"))?
             .to_owned();
         let version = SdkVersion::parse(&raw_version);

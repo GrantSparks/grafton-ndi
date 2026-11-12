@@ -72,6 +72,9 @@ impl Fixtures {
             .version("7.0.0.1")
             .build(&fixtures.next_major());
         FakeRuntime::new()
+            .with("fake_long_version")
+            .build(&fixtures.long_version());
+        FakeRuntime::new()
             .version(BESIDE_EXECUTABLE)
             .build(&fixtures.bundle().join(STANDARD_NAME));
         FakeRuntime::new()
@@ -120,6 +123,10 @@ impl Fixtures {
     }
     fn next_major(&self) -> PathBuf {
         self.root.join("libndi_next_major.so")
+    }
+    /// A module whose version text is longer than one SDK string may be.
+    fn long_version(&self) -> PathBuf {
+        self.root.join("libndi_long_version.so")
     }
     fn bundle(&self) -> PathBuf {
         self.root.join("bundle")
@@ -171,6 +178,7 @@ const SCENARIOS: &[Scenario] = &[
     scenario("newer_standard_runtime_is_accepted"),
     scenario("advanced_module_satisfies_a_standard_request"),
     scenario("later_major_version_keeps_version_gated_features"),
+    scenario("overlong_version_text_is_refused"),
     scenario("configured_objects_are_refused_for_their_own_capability"),
     scenario("process_lifetime"),
     scenario("no_imports"),
@@ -372,6 +380,17 @@ fn child(name: &str, fixtures: &Fixtures) {
             ] {
                 assert!(ndi.capabilities().supports(feature), "{feature:?}");
             }
+        }
+        "overlong_version_text_is_refused" => {
+            // Its terminator lies past the limit: the module is refused for
+            // that, rather than read until the terminator however far away.
+            let reason = load_failure(Ndi::with_options(&explicit(fixtures.long_version())));
+            assert!(
+                reason.contains("version text has no terminator within the 4 MiB"),
+                "{reason}"
+            );
+            // A refused module selects nothing.
+            drop(Ndi::with_options(&options).unwrap());
         }
         "configured_objects_are_refused_for_their_own_capability" => {
             let ndi = Ndi::with_options(&explicit(fixtures.configured_only())).unwrap();

@@ -31,6 +31,8 @@
 //! Server address; this runtime has no configuration to supply one.
 //!
 //! `FAKE_NDI_VERSION` in the compiler's environment replaces the version text.
+//! `--cfg fake_long_version` replaces it with a string whose terminator lies
+//! one byte past the 4 MiB the crate reads of one SDK string.
 //!
 //! Three variables are read each time the function they affect is called, so
 //! a test can change the outcome while the library is loaded:
@@ -135,6 +137,11 @@ export! {
         static VERSION: OnceLock<CString> = OnceLock::new();
         VERSION
             .get_or_init(|| {
+                if cfg!(fake_long_version) {
+                    // 4 MiB of text, then the terminator.
+                    let text = vec![b'6'; 4 * 1024 * 1024];
+                    return CString::new(text).expect("the text has no NUL");
+                }
                 let version = option_env!("FAKE_NDI_VERSION").unwrap_or("NDI SDK TEST 6.3.2.0");
                 CString::new(version).expect("version text has no interior NUL")
             })
