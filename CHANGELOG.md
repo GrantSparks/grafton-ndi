@@ -141,7 +141,8 @@ as `None`. Most programs need changes; see the
   `u32` and `i32`. A pixel format's FourCC is a `FourCc`:
   `FourCc::from(format)` gives it and `PixelFormat::try_from(fourcc)` reverses
   it.
-- `VideoRef::to_owned` and `AudioRef::to_owned` are `try_to_owned`.
+- `to_owned` on `VideoRef` and `AudioRef`, FrameSync's included, returns the
+  owned frame instead of a `Result`: a copy of a validated frame cannot fail.
   `VideoFrame::replace_data` and `AudioFrame::replace_data` hand a refused
   buffer back in a `Rejected`. The unsafe `VideoFrame::from_raw` is removed.
 - `Capture::capture` returns `Ok(None)` when no frame arrives within the
@@ -197,8 +198,8 @@ as `None`. Most programs need changes; see the
   the source's positive sample rate and channel count, or `None` before any
   audio arrives. Every request captures samples, so `capture_audio` returns
   `Result<AudioFrame>`, and `FrameSyncAudioRef` loses `is_empty()`; its
-  `format()` returns `AudioFormat` and its `try_to_owned()` returns
-  `Result<AudioFrame>`, as `AudioFrameRef`'s do. A capture the SDK answers
+  `format()` returns `AudioFormat` and its `to_owned()` returns an
+  `AudioFrame`, as `AudioFrameRef`'s does. A capture the SDK answers
   without samples is an `Error::InvalidFrame`. In 2.0 an owned
   `capture_audio(query_input())` returned `Ok(None)` and lost the format it
   queried.
@@ -271,12 +272,13 @@ as `None`. Most programs need changes; see the
 - `copy_into(&mut destination)` on `VideoFrameRef`, `FrameSyncVideoRef`,
   `AudioFrameRef`, `FrameSyncAudioRef` and `BorrowedVideoFrame` copies the
   frame into an existing `VideoFrame` or `AudioFrame`, which ends up exactly as
-  `try_to_owned` would have made it but keeps its pixel or sample buffer when
+  `to_owned` would have made it but keeps its pixel or sample buffer when
   that is large enough, and its metadata string when the text has the same
   length. Copying frames of one shape into the same destination allocates
   nothing after the first copy, so copying borrowed pixels into the frame
   `send_video_async` returns makes an asynchronous send loop that allocates no
-  frames. A video copy that fails leaves the destination unchanged.
+  frames. Neither `to_owned` nor `copy_into` can fail: a copy of a frame that
+  was validated when it was captured or built is valid.
 - `BorrowedVideoFrame::plane` and `planes` borrow the active rows of a frame
   built over an application buffer, padded or not, without copying, as the
   plane views of owned and captured frames do; its `data()` still returns the
@@ -343,7 +345,7 @@ as `None`. Most programs need changes; see the
   `InterleavedAudioI16`, `InterleavedAudioI32` and `InterleavedAudioF32` take
   the sample count from the length of their data.
 - The `video_conversion` module: `VideoConverter` converts between V210 and
-  P216.
+  P216. P216 samples may start at any address.
 - The `routing` module: a `Router` is a source that redirects its receivers to
   another source.
 - The `discovery` module for NDI Discovery Servers. `SendAdvertiser` and
@@ -351,7 +353,10 @@ as `None`. Most programs need changes; see the
   `RecvListener` return owned snapshots and events and can request a receiver
   connection, which is refused with `Error::ReceiverRequestNotAccepted` when
   the listener lists no receiver that accepts it. These need NDI 6.4.0 or
-  later, because earlier runtimes can crash when the objects are destroyed. An
+  later: a 6.3.2 runtime exports their functions, but destroying any of the
+  four while it is connected to a server aborts the process ("pure virtual
+  method called") within seconds of repeated use, and no order of calls
+  avoids it. An
   advertiser keeps its registered senders and receivers alive until they are
   unregistered or it is dropped. Text from the network is decoded lossily, and
   the identifier types `SenderId`, `ReceiverId` and `InputGroupId` keep the
