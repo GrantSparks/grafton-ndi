@@ -147,296 +147,238 @@ impl RuntimeInfo {
     }
 }
 
-/// A capability that this build or the selected runtime may lack.
+/// Define [`RuntimeFeature`] from one entry for each variant without a field.
 ///
-/// [`Capabilities::status`] reports each one in advance, and every operation
-/// that needs one that is unavailable fails with
-/// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
-/// naming it, before anything reaches the SDK.
-///
-/// A core capability depends on the functions the runtime exports and, for
-/// some, on its version: an older runtime would misread newer input values, or
-/// cannot destroy an object safely. Every capability from
-/// [`AdvancedFinderConfiguration`](Self::AdvancedFinderConfiguration) on
-/// belongs to the Advanced SDK: it also needs an Advanced SDK runtime and a
-/// build with the `advanced` feature whose SDK headers declare it.
-/// Availability says nothing about hardware or licenses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum RuntimeFeature {
+/// The list below is the only place a capability is declared. Each entry
+/// states its documentation, its variant, whether it belongs to the `core` or
+/// the `advanced` SDK, the name it is reported under and, after `since`, the
+/// first runtime version it may be used with. The enum, its `name`,
+/// `minimum_version` and `is_advanced`, [`RuntimeFeature::UNIT`] and the place
+/// [`Capabilities`] keeps each status are all generated from it, so none of
+/// them can leave a capability out. `Passthrough`, the one variant with a
+/// field, is written out here.
+macro_rules! runtime_features {
+    (@advanced core) => {
+        false
+    };
+    (@advanced advanced) => {
+        true
+    };
+    (@minimum) => {
+        None
+    };
+    (@minimum $minimum:ident) => {
+        Some($minimum)
+    };
+    ($(
+        $(#[$meta:meta])*
+        $edition:ident $Variant:ident as $name:literal $(since $minimum:ident)?;
+    )+) => {
+        /// A capability that this build or the selected runtime may lack.
+        ///
+        /// [`Capabilities::status`] reports each one in advance, and every operation
+        /// that needs one that is unavailable fails with
+        /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
+        /// naming it, before anything reaches the SDK.
+        ///
+        /// A core capability depends on the functions the runtime exports and, for
+        /// some, on its version: an older runtime would misread newer input values, or
+        /// cannot destroy an object safely. Every capability from
+        /// [`AdvancedFinderConfiguration`](Self::AdvancedFinderConfiguration) on
+        /// belongs to the Advanced SDK: it also needs an Advanced SDK runtime and a
+        /// build with the `advanced` feature whose SDK headers declare it.
+        /// Availability says nothing about hardware or licenses.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[non_exhaustive]
+        pub enum RuntimeFeature {
+            $(
+                $(#[$meta])*
+                $Variant,
+            )+
+            /// Receiving compressed packets with this preset.
+            ///
+            /// A packet receiver is created as a receiver with Advanced JSON
+            /// configuration is, so this needs everything
+            /// [`AdvancedReceiverConfiguration`](Self::AdvancedReceiverConfiguration)
+            /// does, and also that this build's headers declare the receiver color
+            /// format that selects the preset.
+            #[cfg(feature = "advanced")]
+            Passthrough(PassthroughPreset),
+        }
+
+        /// The variants of [`RuntimeFeature`] without a field, numbered in
+        /// declaration order from zero.
+        enum Index {
+            $($Variant,)+
+        }
+
+        /// Where [`Capabilities`] finds a feature's status.
+        enum Slot {
+            /// At this index of the statuses it keeps.
+            Unit(usize),
+            /// Derived from the configured receiver's, for a passthrough preset.
+            #[cfg(feature = "advanced")]
+            Passthrough,
+        }
+
+        impl RuntimeFeature {
+            /// Every variant without a field, in declaration order: the
+            /// capabilities whose statuses [`Capabilities`] keeps.
+            pub(crate) const UNIT: [Self; [$(Index::$Variant),+].len()] = [$(Self::$Variant),+];
+
+            /// Where [`Capabilities`] finds the capability's status. The
+            /// variant at each index of [`Self::UNIT`] is kept at that index.
+            fn slot(self) -> Slot {
+                match self {
+                    $(Self::$Variant => Slot::Unit(Index::$Variant as usize),)+
+                    #[cfg(feature = "advanced")]
+                    Self::Passthrough(_) => Slot::Passthrough,
+                }
+            }
+
+            /// The one name the capability is reported under.
+            pub(crate) fn name(self) -> &'static str {
+                match self {
+                    $(Self::$Variant => $name,)+
+                    #[cfg(feature = "advanced")]
+                    Self::Passthrough(_) => "compressed passthrough preset",
+                }
+            }
+
+            /// The first runtime version the capability may be used with, when the
+            /// functions a runtime exports are not evidence enough.
+            ///
+            /// The 6.4 formats and receiver modes are enum values an older runtime
+            /// would misread. The advertiser and listener functions exist in older
+            /// runtimes, but the vendor's change log records crashes when destroying
+            /// those objects that were fixed in 6.3.2 and again in 6.4.0; an object
+            /// created with Advanced configuration is destroyed the same way.
+            pub(crate) fn minimum_version(self) -> Option<SdkVersion> {
+                match self {
+                    $(Self::$Variant => runtime_features!(@minimum $($minimum)?),)+
+                    #[cfg(feature = "advanced")]
+                    Self::Passthrough(_) => None,
+                }
+            }
+
+            /// Whether the capability belongs to the Advanced SDK.
+            ///
+            /// Each such capability is gated by a table of Advanced entry points,
+            /// which states, with the build's declarations, what the capability
+            /// needs.
+            pub(crate) fn is_advanced(self) -> bool {
+                match self {
+                    $(Self::$Variant => runtime_features!(@advanced $edition),)+
+                    #[cfg(feature = "advanced")]
+                    Self::Passthrough(_) => true,
+                }
+            }
+        }
+    };
+}
+
+runtime_features! {
     /// Submitting and receiving the NDI 6.4 planar 4:4:4 formats.
-    Planar444Video,
+    core Planar444Video as "planar 4:4:4 video" since NDI_6_4;
     /// The Best444 receiver color mode.
-    ReceiveBest444,
+    core ReceiveBest444 as "Best444 receiver mode" since NDI_6_4;
     /// Video-only highest and lowest receiver bandwidth modes.
-    ReceiveVideoOnly,
+    core ReceiveVideoOnly as "video-only receiver bandwidth" since NDI_6_4;
     /// Independent native audio/video receiver delays.
-    ReceiveDelay,
+    core ReceiveDelay as "receiver audio/video delay";
     /// Metadata a receiver replays to every new connection.
-    ReceiverConnectionMetadata,
+    core ReceiverConnectionMetadata as "receiver connection metadata";
     /// The connected source's web-control URL.
-    ReceiverWebControl,
+    core ReceiverWebControl as "receiver web control";
     /// Notifications of the connected source's actual name.
-    ConnectedSourceName,
+    core ConnectedSourceName as "connected source name";
     /// Metadata a sender captures from its connected receivers.
-    SenderMetadata,
+    core SenderMetadata as "sender metadata";
     /// The SDK current-timestamp operation.
-    SdkTimestamp,
+    core SdkTimestamp as "SDK timestamp";
     /// Conversion between planar and interleaved audio.
-    InterleavedAudioConversion,
+    core InterleavedAudioConversion as "interleaved audio conversion";
     /// Direct submission of interleaved audio to a sender.
-    InterleavedAudioSend,
+    core InterleavedAudioSend as "interleaved audio submission";
     /// Conversion between the V210 and P216 video layouts.
-    VideoConversion,
+    core VideoConversion as "V210/P216 conversion";
     /// Source routing, including its create/destroy and query operations.
-    Routing,
+    core Routing as "source routing";
     /// Discovery Server sender registration and removal. Needs NDI 6.4.0 or
     /// later: earlier runtimes can crash when an advertiser is destroyed.
-    SenderAdvertising,
+    core SenderAdvertising as "sender advertising" since NDI_6_4;
     /// Discovery Server receiver registration and removal. Needs NDI 6.4.0 or
     /// later: earlier runtimes can crash when an advertiser is destroyed.
-    ReceiverAdvertising,
+    core ReceiverAdvertising as "receiver advertising" since NDI_6_4;
     /// Sender snapshots, subscriptions and owned event batches. Needs NDI
     /// 6.4.0 or later: earlier runtimes can crash when a listener is destroyed.
-    SenderDiscovery,
+    core SenderDiscovery as "sender discovery" since NDI_6_4;
     /// Receiver snapshots, subscriptions, event batches and connection control.
     /// Needs NDI 6.4.0 or later: earlier runtimes can crash when a listener is
     /// destroyed.
-    ReceiverDiscovery,
+    core ReceiverDiscovery as "receiver discovery" since NDI_6_4;
     /// Creating a finder with Advanced JSON configuration.
-    AdvancedFinderConfiguration,
+    advanced AdvancedFinderConfiguration as "Advanced finder configuration";
     /// Creating a sender with Advanced JSON configuration.
-    AdvancedSenderConfiguration,
+    advanced AdvancedSenderConfiguration as "Advanced sender configuration";
     /// Creating a receiver with Advanced JSON configuration.
-    AdvancedReceiverConfiguration,
+    advanced AdvancedReceiverConfiguration as "Advanced receiver configuration";
     /// Creating a router with Advanced JSON configuration.
-    AdvancedRouterConfiguration,
+    advanced AdvancedRouterConfiguration as "Advanced router configuration";
     /// Creating a Discovery Server sender advertiser with Advanced JSON
     /// configuration. Needs NDI 6.4.0 or later, as
     /// [`SenderAdvertising`](Self::SenderAdvertising) does, whose functions
     /// the advertiser goes on to use.
-    AdvancedSenderAdvertiserConfiguration,
+    advanced AdvancedSenderAdvertiserConfiguration as "Advanced sender advertiser configuration" since NDI_6_4;
     /// Creating a Discovery Server receiver advertiser with Advanced JSON
     /// configuration. Needs NDI 6.4.0 or later, as
     /// [`ReceiverAdvertising`](Self::ReceiverAdvertising) does, whose
     /// functions the advertiser goes on to use.
-    AdvancedReceiverAdvertiserConfiguration,
+    advanced AdvancedReceiverAdvertiserConfiguration as "Advanced receiver advertiser configuration" since NDI_6_4;
     /// Creating a Discovery Server sender listener with Advanced JSON
     /// configuration. Needs NDI 6.4.0 or later, as
     /// [`SenderDiscovery`](Self::SenderDiscovery) does, whose functions the
     /// listener goes on to use.
-    AdvancedSenderListenerConfiguration,
+    advanced AdvancedSenderListenerConfiguration as "Advanced sender listener configuration" since NDI_6_4;
     /// Creating a Discovery Server receiver listener with Advanced JSON
     /// configuration. Needs NDI 6.4.0 or later, as
     /// [`ReceiverDiscovery`](Self::ReceiverDiscovery) does, whose functions
     /// the listener goes on to use.
-    AdvancedReceiverListenerConfiguration,
+    advanced AdvancedReceiverListenerConfiguration as "Advanced receiver listener configuration" since NDI_6_4;
     /// Source snapshots that carry each source's metadata.
-    SourceMetadata,
+    advanced SourceMetadata as "source metadata";
     /// Metadata a router replays to each new connection.
-    RouterConnectionMetadata,
+    advanced RouterConnectionMetadata as "router connection metadata";
     /// A sender's own contribution to its tally state.
-    SenderTally,
+    advanced SenderTally as "sender tally override";
     /// The target frame size, bit rate and quality for an encoder feeding a
     /// sender.
-    EncoderGuidance,
+    advanced EncoderGuidance as "encoder guidance";
     /// Encoder quality together with the formats the connected receivers
     /// accept.
-    EncoderQualityPlanning,
+    advanced EncoderQualityPlanning as "encoder quality planning";
     /// Whether the receivers connected to a sender need a keyframe, and
     /// waiting for one to ask for it.
-    KeyframeDemand,
+    advanced KeyframeDemand as "keyframe demand";
     /// A receiver's request for a keyframe from its source.
-    KeyframeRequest,
+    advanced KeyframeRequest as "keyframe request";
     /// Sending compressed frames held in several blocks.
-    ScatterSend,
+    advanced ScatterSend as "scatter sending";
     /// A receiver's choice between its source's program and preview streams.
-    ReceiverStreamTier,
+    advanced ReceiverStreamTier as "receiver stream tier";
     /// A receiver's choice of which of its source's streams it receives.
-    ReceiverStreamSelection,
+    advanced ReceiverStreamSelection as "receiver stream selection";
     /// Application-supplied memory for the frames a receiver delivers.
-    ReceiveAllocators,
+    advanced ReceiveAllocators as "custom receive allocators";
     /// Notification that the SDK has finished with an asynchronously sent
     /// video frame.
-    SendCompletion,
+    advanced SendCompletion as "asynchronous send completion";
     /// Matching a receiver's audio to its video timestamps.
-    AvSync,
+    advanced AvSync as "AV synchronization";
     /// Clocks locked to a reference source.
-    Genlock,
+    advanced Genlock as "genlock";
     /// Keyboard, mouse, touch and clipboard control of a source.
-    Kvm,
-    /// Receiving compressed packets with this preset.
-    ///
-    /// A packet receiver is created as a receiver with Advanced JSON
-    /// configuration is, so this needs everything
-    /// [`AdvancedReceiverConfiguration`](Self::AdvancedReceiverConfiguration)
-    /// does, and also that this build's headers declare the receiver color
-    /// format that selects the preset.
-    #[cfg(feature = "advanced")]
-    Passthrough(PassthroughPreset),
-}
-
-impl RuntimeFeature {
-    /// The one name the capability is reported under.
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::Planar444Video => "planar 4:4:4 video",
-            Self::ReceiveBest444 => "Best444 receiver mode",
-            Self::ReceiveVideoOnly => "video-only receiver bandwidth",
-            Self::ReceiveDelay => "receiver audio/video delay",
-            Self::ReceiverConnectionMetadata => "receiver connection metadata",
-            Self::ReceiverWebControl => "receiver web control",
-            Self::ConnectedSourceName => "connected source name",
-            Self::SenderMetadata => "sender metadata",
-            Self::SdkTimestamp => "SDK timestamp",
-            Self::InterleavedAudioConversion => "interleaved audio conversion",
-            Self::InterleavedAudioSend => "interleaved audio submission",
-            Self::VideoConversion => "V210/P216 conversion",
-            Self::Routing => "source routing",
-            Self::SenderAdvertising => "sender advertising",
-            Self::ReceiverAdvertising => "receiver advertising",
-            Self::SenderDiscovery => "sender discovery",
-            Self::ReceiverDiscovery => "receiver discovery",
-            Self::AdvancedFinderConfiguration => "Advanced finder configuration",
-            Self::AdvancedSenderConfiguration => "Advanced sender configuration",
-            Self::AdvancedReceiverConfiguration => "Advanced receiver configuration",
-            Self::AdvancedRouterConfiguration => "Advanced router configuration",
-            Self::AdvancedSenderAdvertiserConfiguration => {
-                "Advanced sender advertiser configuration"
-            }
-            Self::AdvancedReceiverAdvertiserConfiguration => {
-                "Advanced receiver advertiser configuration"
-            }
-            Self::AdvancedSenderListenerConfiguration => "Advanced sender listener configuration",
-            Self::AdvancedReceiverListenerConfiguration => {
-                "Advanced receiver listener configuration"
-            }
-            Self::SourceMetadata => "source metadata",
-            Self::RouterConnectionMetadata => "router connection metadata",
-            Self::SenderTally => "sender tally override",
-            Self::EncoderGuidance => "encoder guidance",
-            Self::EncoderQualityPlanning => "encoder quality planning",
-            Self::KeyframeDemand => "keyframe demand",
-            Self::KeyframeRequest => "keyframe request",
-            Self::ScatterSend => "scatter sending",
-            Self::ReceiverStreamTier => "receiver stream tier",
-            Self::ReceiverStreamSelection => "receiver stream selection",
-            Self::ReceiveAllocators => "custom receive allocators",
-            Self::SendCompletion => "asynchronous send completion",
-            Self::AvSync => "AV synchronization",
-            Self::Genlock => "genlock",
-            Self::Kvm => "KVM control",
-            #[cfg(feature = "advanced")]
-            Self::Passthrough(_) => "compressed passthrough preset",
-        }
-    }
-
-    /// The first runtime version the capability may be used with, when the
-    /// functions a runtime exports are not evidence enough.
-    ///
-    /// The 6.4 formats and receiver modes are enum values an older runtime
-    /// would misread. The advertiser and listener functions exist in older
-    /// runtimes, but the vendor's change log records crashes when destroying
-    /// those objects that were fixed in 6.3.2 and again in 6.4.0; an object
-    /// created with Advanced configuration is destroyed the same way.
-    pub(crate) fn minimum_version(self) -> Option<SdkVersion> {
-        match self {
-            Self::Planar444Video
-            | Self::ReceiveBest444
-            | Self::ReceiveVideoOnly
-            | Self::SenderAdvertising
-            | Self::ReceiverAdvertising
-            | Self::SenderDiscovery
-            | Self::ReceiverDiscovery
-            | Self::AdvancedSenderAdvertiserConfiguration
-            | Self::AdvancedReceiverAdvertiserConfiguration
-            | Self::AdvancedSenderListenerConfiguration
-            | Self::AdvancedReceiverListenerConfiguration => Some(NDI_6_4),
-            Self::ReceiveDelay
-            | Self::ReceiverConnectionMetadata
-            | Self::ReceiverWebControl
-            | Self::ConnectedSourceName
-            | Self::SenderMetadata
-            | Self::SdkTimestamp
-            | Self::InterleavedAudioConversion
-            | Self::InterleavedAudioSend
-            | Self::VideoConversion
-            | Self::Routing
-            | Self::AdvancedFinderConfiguration
-            | Self::AdvancedSenderConfiguration
-            | Self::AdvancedReceiverConfiguration
-            | Self::AdvancedRouterConfiguration
-            | Self::SourceMetadata
-            | Self::RouterConnectionMetadata
-            | Self::SenderTally
-            | Self::EncoderGuidance
-            | Self::EncoderQualityPlanning
-            | Self::KeyframeDemand
-            | Self::KeyframeRequest
-            | Self::ScatterSend
-            | Self::ReceiverStreamTier
-            | Self::ReceiverStreamSelection
-            | Self::ReceiveAllocators
-            | Self::SendCompletion
-            | Self::AvSync
-            | Self::Genlock
-            | Self::Kvm => None,
-            #[cfg(feature = "advanced")]
-            Self::Passthrough(_) => None,
-        }
-    }
-
-    /// Whether the capability belongs to the Advanced SDK.
-    ///
-    /// Each such capability is gated by a table of Advanced entry points,
-    /// which states, with the build's declarations, what the capability
-    /// needs.
-    pub(crate) fn is_advanced(self) -> bool {
-        match self {
-            Self::Planar444Video
-            | Self::ReceiveBest444
-            | Self::ReceiveVideoOnly
-            | Self::ReceiveDelay
-            | Self::ReceiverConnectionMetadata
-            | Self::ReceiverWebControl
-            | Self::ConnectedSourceName
-            | Self::SenderMetadata
-            | Self::SdkTimestamp
-            | Self::InterleavedAudioConversion
-            | Self::InterleavedAudioSend
-            | Self::VideoConversion
-            | Self::Routing
-            | Self::SenderAdvertising
-            | Self::ReceiverAdvertising
-            | Self::SenderDiscovery
-            | Self::ReceiverDiscovery => false,
-            Self::AdvancedFinderConfiguration
-            | Self::AdvancedSenderConfiguration
-            | Self::AdvancedReceiverConfiguration
-            | Self::AdvancedRouterConfiguration
-            | Self::AdvancedSenderAdvertiserConfiguration
-            | Self::AdvancedReceiverAdvertiserConfiguration
-            | Self::AdvancedSenderListenerConfiguration
-            | Self::AdvancedReceiverListenerConfiguration
-            | Self::SourceMetadata
-            | Self::RouterConnectionMetadata
-            | Self::SenderTally
-            | Self::EncoderGuidance
-            | Self::EncoderQualityPlanning
-            | Self::KeyframeDemand
-            | Self::KeyframeRequest
-            | Self::ScatterSend
-            | Self::ReceiverStreamTier
-            | Self::ReceiverStreamSelection
-            | Self::ReceiveAllocators
-            | Self::SendCompletion
-            | Self::AvSync
-            | Self::Genlock
-            | Self::Kvm => true,
-            #[cfg(feature = "advanced")]
-            Self::Passthrough(_) => true,
-        }
-    }
+    advanced Kvm as "KVM control";
 }
 
 /// Why a capability cannot safely be used in this process.
@@ -481,48 +423,20 @@ pub enum CapabilityStatus {
 
 /// What the selected implementation, together with this build, provides:
 /// one [`CapabilityStatus`] for every [`RuntimeFeature`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Capabilities {
-    planar_444_video: CapabilityStatus,
-    receive_best_444: CapabilityStatus,
-    receive_video_only: CapabilityStatus,
-    receive_delay: CapabilityStatus,
-    receiver_connection_metadata: CapabilityStatus,
-    receiver_web_control: CapabilityStatus,
-    connected_source_name: CapabilityStatus,
-    sender_metadata: CapabilityStatus,
-    sdk_timestamp: CapabilityStatus,
-    interleaved_audio_conversion: CapabilityStatus,
-    interleaved_audio_send: CapabilityStatus,
-    video_conversion: CapabilityStatus,
-    routing: CapabilityStatus,
-    sender_advertising: CapabilityStatus,
-    receiver_advertising: CapabilityStatus,
-    sender_discovery: CapabilityStatus,
-    receiver_discovery: CapabilityStatus,
-    advanced_finder_configuration: CapabilityStatus,
-    advanced_sender_configuration: CapabilityStatus,
-    advanced_receiver_configuration: CapabilityStatus,
-    advanced_router_configuration: CapabilityStatus,
-    advanced_sender_advertiser_configuration: CapabilityStatus,
-    advanced_receiver_advertiser_configuration: CapabilityStatus,
-    advanced_sender_listener_configuration: CapabilityStatus,
-    advanced_receiver_listener_configuration: CapabilityStatus,
-    source_metadata: CapabilityStatus,
-    router_connection_metadata: CapabilityStatus,
-    sender_tally: CapabilityStatus,
-    encoder_guidance: CapabilityStatus,
-    encoder_quality_planning: CapabilityStatus,
-    keyframe_demand: CapabilityStatus,
-    keyframe_request: CapabilityStatus,
-    scatter_send: CapabilityStatus,
-    receiver_stream_tier: CapabilityStatus,
-    receiver_stream_selection: CapabilityStatus,
-    receive_allocators: CapabilityStatus,
-    send_completion: CapabilityStatus,
-    av_sync: CapabilityStatus,
-    genlock: CapabilityStatus,
-    kvm: CapabilityStatus,
+    /// The status of each variant without a field, at its index in
+    /// [`RuntimeFeature::UNIT`].
+    statuses: [CapabilityStatus; RuntimeFeature::UNIT.len()],
+}
+
+/// Each capability's status, keyed by the capability.
+impl fmt::Debug for Capabilities {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(RuntimeFeature::UNIT.iter().zip(&self.statuses))
+            .finish()
+    }
 }
 
 impl Capabilities {
@@ -583,114 +497,20 @@ impl Capabilities {
             }
         };
         Self {
-            planar_444_video: status(RuntimeFeature::Planar444Video),
-            receive_best_444: status(RuntimeFeature::ReceiveBest444),
-            receive_video_only: status(RuntimeFeature::ReceiveVideoOnly),
-            receive_delay: status(RuntimeFeature::ReceiveDelay),
-            receiver_connection_metadata: status(RuntimeFeature::ReceiverConnectionMetadata),
-            receiver_web_control: status(RuntimeFeature::ReceiverWebControl),
-            connected_source_name: status(RuntimeFeature::ConnectedSourceName),
-            sender_metadata: status(RuntimeFeature::SenderMetadata),
-            sdk_timestamp: status(RuntimeFeature::SdkTimestamp),
-            interleaved_audio_conversion: status(RuntimeFeature::InterleavedAudioConversion),
-            interleaved_audio_send: status(RuntimeFeature::InterleavedAudioSend),
-            video_conversion: status(RuntimeFeature::VideoConversion),
-            routing: status(RuntimeFeature::Routing),
-            sender_advertising: status(RuntimeFeature::SenderAdvertising),
-            receiver_advertising: status(RuntimeFeature::ReceiverAdvertising),
-            sender_discovery: status(RuntimeFeature::SenderDiscovery),
-            receiver_discovery: status(RuntimeFeature::ReceiverDiscovery),
-            advanced_finder_configuration: status(RuntimeFeature::AdvancedFinderConfiguration),
-            advanced_sender_configuration: status(RuntimeFeature::AdvancedSenderConfiguration),
-            advanced_receiver_configuration: status(RuntimeFeature::AdvancedReceiverConfiguration),
-            advanced_router_configuration: status(RuntimeFeature::AdvancedRouterConfiguration),
-            advanced_sender_advertiser_configuration: status(
-                RuntimeFeature::AdvancedSenderAdvertiserConfiguration,
-            ),
-            advanced_receiver_advertiser_configuration: status(
-                RuntimeFeature::AdvancedReceiverAdvertiserConfiguration,
-            ),
-            advanced_sender_listener_configuration: status(
-                RuntimeFeature::AdvancedSenderListenerConfiguration,
-            ),
-            advanced_receiver_listener_configuration: status(
-                RuntimeFeature::AdvancedReceiverListenerConfiguration,
-            ),
-            source_metadata: status(RuntimeFeature::SourceMetadata),
-            router_connection_metadata: status(RuntimeFeature::RouterConnectionMetadata),
-            sender_tally: status(RuntimeFeature::SenderTally),
-            encoder_guidance: status(RuntimeFeature::EncoderGuidance),
-            encoder_quality_planning: status(RuntimeFeature::EncoderQualityPlanning),
-            keyframe_demand: status(RuntimeFeature::KeyframeDemand),
-            keyframe_request: status(RuntimeFeature::KeyframeRequest),
-            scatter_send: status(RuntimeFeature::ScatterSend),
-            receiver_stream_tier: status(RuntimeFeature::ReceiverStreamTier),
-            receiver_stream_selection: status(RuntimeFeature::ReceiverStreamSelection),
-            receive_allocators: status(RuntimeFeature::ReceiveAllocators),
-            send_completion: status(RuntimeFeature::SendCompletion),
-            av_sync: status(RuntimeFeature::AvSync),
-            genlock: status(RuntimeFeature::Genlock),
-            kvm: status(RuntimeFeature::Kvm),
+            statuses: RuntimeFeature::UNIT.map(status),
         }
     }
 
     /// Query a capability without changing native state.
     pub fn status(&self, feature: RuntimeFeature) -> CapabilityStatus {
-        match feature {
-            RuntimeFeature::Planar444Video => self.planar_444_video,
-            RuntimeFeature::ReceiveBest444 => self.receive_best_444,
-            RuntimeFeature::ReceiveVideoOnly => self.receive_video_only,
-            RuntimeFeature::ReceiveDelay => self.receive_delay,
-            RuntimeFeature::ReceiverConnectionMetadata => self.receiver_connection_metadata,
-            RuntimeFeature::ReceiverWebControl => self.receiver_web_control,
-            RuntimeFeature::ConnectedSourceName => self.connected_source_name,
-            RuntimeFeature::SenderMetadata => self.sender_metadata,
-            RuntimeFeature::SdkTimestamp => self.sdk_timestamp,
-            RuntimeFeature::InterleavedAudioConversion => self.interleaved_audio_conversion,
-            RuntimeFeature::InterleavedAudioSend => self.interleaved_audio_send,
-            RuntimeFeature::VideoConversion => self.video_conversion,
-            RuntimeFeature::Routing => self.routing,
-            RuntimeFeature::SenderAdvertising => self.sender_advertising,
-            RuntimeFeature::ReceiverAdvertising => self.receiver_advertising,
-            RuntimeFeature::SenderDiscovery => self.sender_discovery,
-            RuntimeFeature::ReceiverDiscovery => self.receiver_discovery,
-            RuntimeFeature::AdvancedFinderConfiguration => self.advanced_finder_configuration,
-            RuntimeFeature::AdvancedSenderConfiguration => self.advanced_sender_configuration,
-            RuntimeFeature::AdvancedReceiverConfiguration => self.advanced_receiver_configuration,
-            RuntimeFeature::AdvancedRouterConfiguration => self.advanced_router_configuration,
-            RuntimeFeature::AdvancedSenderAdvertiserConfiguration => {
-                self.advanced_sender_advertiser_configuration
-            }
-            RuntimeFeature::AdvancedReceiverAdvertiserConfiguration => {
-                self.advanced_receiver_advertiser_configuration
-            }
-            RuntimeFeature::AdvancedSenderListenerConfiguration => {
-                self.advanced_sender_listener_configuration
-            }
-            RuntimeFeature::AdvancedReceiverListenerConfiguration => {
-                self.advanced_receiver_listener_configuration
-            }
-            RuntimeFeature::SourceMetadata => self.source_metadata,
-            RuntimeFeature::RouterConnectionMetadata => self.router_connection_metadata,
-            RuntimeFeature::SenderTally => self.sender_tally,
-            RuntimeFeature::EncoderGuidance => self.encoder_guidance,
-            RuntimeFeature::EncoderQualityPlanning => self.encoder_quality_planning,
-            RuntimeFeature::KeyframeDemand => self.keyframe_demand,
-            RuntimeFeature::KeyframeRequest => self.keyframe_request,
-            RuntimeFeature::ScatterSend => self.scatter_send,
-            RuntimeFeature::ReceiverStreamTier => self.receiver_stream_tier,
-            RuntimeFeature::ReceiverStreamSelection => self.receiver_stream_selection,
-            RuntimeFeature::ReceiveAllocators => self.receive_allocators,
-            RuntimeFeature::SendCompletion => self.send_completion,
-            RuntimeFeature::AvSync => self.av_sync,
-            RuntimeFeature::Genlock => self.genlock,
-            RuntimeFeature::Kvm => self.kvm,
+        match feature.slot() {
+            Slot::Unit(index) => self.statuses[index],
             // A preset adds a declaration to the configured receiver it is
             // created as; the rest of its status is that receiver's.
             #[cfg(feature = "advanced")]
-            RuntimeFeature::Passthrough(_) => {
+            Slot::Passthrough => {
                 if AdvancedApi::declares(feature) {
-                    self.advanced_receiver_configuration
+                    self.status(RuntimeFeature::AdvancedReceiverConfiguration)
                 } else {
                     CapabilityStatus::Unavailable(CapabilityUnavailable::BuildAbiUnavailable)
                 }
@@ -785,80 +605,12 @@ mod tests {
         Fixture::new(exported, version, edition).capabilities
     }
 
-    /// Every passthrough preset.
-    #[cfg(feature = "advanced")]
-    const PRESETS: [PassthroughPreset; 15] = {
-        use PassthroughPreset::*;
-        [
-            SpeedHqOnly,
-            SpeedHq,
-            SpeedHqBest,
-            H264,
-            H264Best,
-            H264WithAudio,
-            Hevc,
-            HevcBest,
-            HevcWithAudio,
-            Alpha,
-            AlphaBest,
-            AlphaWithAudio,
-            Protected,
-            ProtectedBest,
-            ProtectedWithAudio,
-        ]
-    };
-
     /// Every feature, with each passthrough preset in builds that have them.
     fn every_feature() -> Vec<RuntimeFeature> {
-        use RuntimeFeature::*;
-        let features = vec![
-            Planar444Video,
-            ReceiveBest444,
-            ReceiveVideoOnly,
-            ReceiveDelay,
-            ReceiverConnectionMetadata,
-            ReceiverWebControl,
-            ConnectedSourceName,
-            SenderMetadata,
-            SdkTimestamp,
-            InterleavedAudioConversion,
-            InterleavedAudioSend,
-            VideoConversion,
-            Routing,
-            SenderAdvertising,
-            ReceiverAdvertising,
-            SenderDiscovery,
-            ReceiverDiscovery,
-            AdvancedFinderConfiguration,
-            AdvancedSenderConfiguration,
-            AdvancedReceiverConfiguration,
-            AdvancedRouterConfiguration,
-            AdvancedSenderAdvertiserConfiguration,
-            AdvancedReceiverAdvertiserConfiguration,
-            AdvancedSenderListenerConfiguration,
-            AdvancedReceiverListenerConfiguration,
-            SourceMetadata,
-            RouterConnectionMetadata,
-            SenderTally,
-            EncoderGuidance,
-            EncoderQualityPlanning,
-            KeyframeDemand,
-            KeyframeRequest,
-            ScatterSend,
-            ReceiverStreamTier,
-            ReceiverStreamSelection,
-            ReceiveAllocators,
-            SendCompletion,
-            AvSync,
-            Genlock,
-            Kvm,
-        ];
+        let features = RuntimeFeature::UNIT.into_iter();
         #[cfg(feature = "advanced")]
-        let features = features
-            .into_iter()
-            .chain(PRESETS.map(Passthrough))
-            .collect();
-        features
+        let features = features.chain(PassthroughPreset::ALL.map(RuntimeFeature::Passthrough));
+        features.collect()
     }
 
     /// Whether this build declares what `feature` needs.
@@ -930,6 +682,64 @@ mod tests {
                 assert_eq!(status, expected, "{context}");
             }
         }
+    }
+
+    /// The generated list holds each feature once, at the index its status is
+    /// kept at, and reports each under a name no other feature has.
+    #[test]
+    fn every_feature_is_listed_once_under_its_own_name() {
+        use std::collections::HashSet;
+
+        let features = every_feature();
+        let distinct: HashSet<_> = features.iter().copied().collect();
+        assert_eq!(distinct.len(), features.len());
+        for (index, feature) in RuntimeFeature::UNIT.into_iter().enumerate() {
+            assert!(
+                matches!(feature.slot(), Slot::Unit(at) if at == index),
+                "{feature:?}"
+            );
+        }
+
+        // Every passthrough preset is reported under the one name.
+        let names: HashSet<_> = RuntimeFeature::UNIT
+            .into_iter()
+            .map(RuntimeFeature::name)
+            .collect();
+        assert_eq!(names.len(), RuntimeFeature::UNIT.len());
+        #[cfg(feature = "advanced")]
+        for preset in PassthroughPreset::ALL {
+            let name = RuntimeFeature::Passthrough(preset).name();
+            assert!(!names.contains(name), "{preset:?}: {name}");
+        }
+
+        // As the enum's documentation says, every capability from
+        // `AdvancedFinderConfiguration` on belongs to the Advanced SDK.
+        let core = RuntimeFeature::UNIT
+            .iter()
+            .take_while(|feature| !feature.is_advanced())
+            .count();
+        assert_eq!(
+            RuntimeFeature::UNIT[core],
+            RuntimeFeature::AdvancedFinderConfiguration
+        );
+        assert!(RuntimeFeature::UNIT[core..]
+            .iter()
+            .all(|feature| feature.is_advanced()));
+    }
+
+    #[test]
+    fn debug_output_names_each_feature_with_its_status() {
+        let capabilities = detect(
+            |name| !name.starts_with("NDIlib_routing_"),
+            Some("6.4.0.2"),
+            SdkEdition::Standard,
+        );
+        let debug = format!("{capabilities:?}");
+        assert!(
+            debug.contains("Routing: Unavailable(SymbolUnavailable)"),
+            "{debug}"
+        );
+        assert!(debug.contains("ReceiveDelay: Available"), "{debug}");
     }
 
     #[test]
@@ -1164,7 +974,7 @@ mod tests {
     fn every_preset_gate_reports_its_own_preset() {
         use CapabilityUnavailable::*;
         const RECEIVER: &str = "NDIlib_recv_create_v4";
-        for preset in PRESETS {
+        for preset in PassthroughPreset::ALL {
             let feature = RuntimeFeature::Passthrough(preset);
             let format = crate::sys::advanced::passthrough_format(preset);
             for (lacks_receiver, edition) in [

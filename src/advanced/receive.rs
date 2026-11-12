@@ -63,6 +63,28 @@ pub enum PassthroughPreset {
     ProtectedWithAudio,
 }
 
+impl PassthroughPreset {
+    /// Every preset, in declaration order, for tests that cover each one.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 15] = [
+        Self::SpeedHqOnly,
+        Self::SpeedHq,
+        Self::SpeedHqBest,
+        Self::H264,
+        Self::H264Best,
+        Self::H264WithAudio,
+        Self::Hevc,
+        Self::HevcBest,
+        Self::HevcWithAudio,
+        Self::Alpha,
+        Self::AlphaBest,
+        Self::AlphaWithAudio,
+        Self::Protected,
+        Self::ProtectedBest,
+        Self::ProtectedWithAudio,
+    ];
+}
+
 /// Video from a [`PacketReceiver`]: a codec packet when the source's format is
 /// one the preset passes through, a decoded frame otherwise.
 #[derive(Clone, Debug)]

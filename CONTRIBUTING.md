@@ -150,9 +150,13 @@ symbol up by name. Every native call goes through a table defined with the
    ```
 
    Do not add to `Core` unless every supported runtime exports the function.
-3. A new capability needs its `RuntimeFeature` variant in
-   `src/capabilities.rs`. Give it a minimum version there only when the
-   exported functions are not evidence enough.
+3. A new capability is one entry in the `runtime_features!` list in
+   `src/capabilities.rs`: its documentation, its variant, whether it is
+   `core` or `advanced`, the name it is reported under and, with `since`, a
+   minimum version only when the exported functions are not evidence enough.
+   The enum, its name, version and edition lookups, the place `Capabilities`
+   keeps its status and the tests' list of every capability are generated
+   from that entry.
 4. Call the function from a wrapper that obtained the table with
    `ndi.table::<sys::Routing>()?`. That accessor is the only way to reach an
    optional table, and it applies the capability's gate. `src/routing.rs`
@@ -179,8 +183,8 @@ checked in, and are what every signature is checked against when the crate is
 compiled. Each entry of the
 invocation is a family of functions that are used together, and names, as an
 `optional_tables!` entry does, the `RuntimeFeature` it is gated and reported
-under; a new family needs its own variant in `src/capabilities.rs`, which
-`RuntimeFeature::is_advanced` counts as an Advanced capability. The build script
+under; a new family needs its own `advanced` entry in the `runtime_features!`
+list in `src/capabilities.rs`. The build script
 reads the same file, through `build_advanced.rs`, and makes a family available
 only when the installed headers declare every one of its functions, so an older
 Advanced SDK that lacks a family still builds the same public API. Code that
@@ -548,7 +552,7 @@ To adopt a newer NDI SDK:
    it a table or an `UNWRAPPED` entry.
 3. Read the SDK's change notes for behavior changes in functions the crate
    already calls. A capability whose functions exist in older runtimes but
-   misbehave there needs a minimum version in `RuntimeFeature`.
+   misbehave there needs a `since` version in its `runtime_features!` entry.
 4. Pin the new packages in `ci/sdk-packages.json`, and update the `sdk` matrix
    in `.github/workflows/rust.yml` and its table in the
    [CI guide](ci/README.md#the-sdk-job); the script tests check that the two
