@@ -14,8 +14,9 @@ help: the following other types implement trait `CaptureMode`
 note: required by a bound in `grafton_ndi::Receiver::<M>::audio`
  --> src/receiver.rs
   |
+  | impl<M: MetadataMode> Receiver<M> {
+...
   |     pub fn audio(&self) -> Capture<'_, AudioKind>
-  |            ----- required by a bound in this associated function
   |     where
   |         M: CaptureMode,
   |            ^^^^^^^^^^^ required by this bound in `Receiver::<M>::audio`
@@ -36,8 +37,9 @@ help: the following other types implement trait `CaptureMode`
 note: required by a bound in `grafton_ndi::Receiver::<M>::audio`
   --> src/receiver.rs
    |
+   | impl<M: MetadataMode> Receiver<M> {
+...
    |     pub fn audio(&self) -> Capture<'_, AudioKind>
-   |            ----- required by a bound in this associated function
    |     where
    |         M: CaptureMode,
    |            ^^^^^^^^^^^ required by this bound in `Receiver::<M>::audio`

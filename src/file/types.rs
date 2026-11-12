@@ -1502,9 +1502,15 @@ mod tests {
 
     #[test]
     fn a_nul_in_any_string_for_the_sdk_is_the_crates_c_string_error() {
-        let nul = Path::new("/take\0.mkv");
-        assert_eq!(nul_position(path_string(nul)), 5);
-        assert_eq!(nul_position(RecordingTarget::new(nul)), 5);
+        // An absolute path on every platform: `/take` is not one on Windows, where
+        // it would be resolved against the current drive and the NUL would sit
+        // after that prefix. The path is used as it is, so the NUL stays where
+        // `str::find` puts it in the text.
+        let nul = std::env::current_dir().unwrap().join("take\0.mkv");
+        assert!(nul.is_absolute());
+        let at = nul.to_str().unwrap().find('\0').unwrap();
+        assert_eq!(nul_position(path_string(&nul)), at);
+        assert_eq!(nul_position(RecordingTarget::new(&nul)), at);
         assert_eq!(nul_position(SourceSpec::new("cam\0era")), 3);
         assert_eq!(nul_position(SourceSpec::from_url("url\0tail")), 3);
         assert_eq!(nul_position(PlayerOptions::new("Re\0play").resolve()), 2);

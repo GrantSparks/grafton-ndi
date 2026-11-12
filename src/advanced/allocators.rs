@@ -1490,12 +1490,21 @@ mod tests {
         )
         .contains("max_bytes"));
 
-        // The largest single allocation, with the budget to match.
-        defaults
-            .max_allocation_bytes(MAX_ALLOCATION)
-            .max_bytes(16 * MAX_ALLOCATION)
-            .validate()
-            .unwrap();
+        // The largest single allocation, with the budget to match: accepted
+        // whenever the budget for the calls can be named. On a 32-bit target
+        // sixteen largest allocations are 4 GiB, which no `usize` holds, so
+        // the same limits are refused there as unreachable.
+        for calls in [4, 16] {
+            let limits = defaults
+                .max_allocation_bytes(MAX_ALLOCATION)
+                .max_concurrent_calls(calls);
+            match calls.checked_mul(MAX_ALLOCATION) {
+                Some(budget) => {
+                    limits.max_bytes(budget).validate().unwrap();
+                }
+                None => assert!(reason(limits.max_bytes(usize::MAX)).contains("max_bytes")),
+            }
+        }
         defaults
             .max_allocation_bytes(MAX_ALLOCATION)
             .max_concurrent_calls(4)

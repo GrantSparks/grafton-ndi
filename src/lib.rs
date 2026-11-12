@@ -174,6 +174,18 @@
 //! Note: Only video supports async sending in the NDI SDK. Audio and metadata are always synchronous.
 
 #![warn(clippy::return_self_not_must_use)]
+// Android has no native thread-locals, so std expands `thread_local!` through
+// its OS-key implementation, which wraps even a `const { .. }` initializer in
+// an ordinary function; clippy then asks for the `const` the test-only
+// thread-locals already have. Plain `allow`: an expectation would go unfulfilled
+// in an Android build without tests.
+#![cfg_attr(
+    all(test, target_os = "android"),
+    allow(
+        clippy::missing_const_for_thread_local,
+        reason = "false positive: the OS-key thread_local! expansion hides the const initializer"
+    )
+)]
 
 mod capture;
 mod error;

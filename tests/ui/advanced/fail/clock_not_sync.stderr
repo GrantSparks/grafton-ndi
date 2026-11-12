@@ -8,6 +8,9 @@ error[E0277]: `Cell<()>` cannot be shared between threads safely
   = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`
 note: required because it appears within the type `PhantomData<Cell<()>>`
  --> $RUST/core/src/marker.rs
+  |
+  | pub struct PhantomData<T: PointeeSized>;
+  |            ^^^^^^^^^^^
 note: required because it appears within the type `VideoClock<'static>`
  --> src/advanced/sync.rs
   |
