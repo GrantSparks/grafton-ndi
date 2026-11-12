@@ -362,9 +362,11 @@ reports it sent, so submission does not wait for a slow connection.
   which it checks as `Sender::send_video` does.
 - `try_take_completed` and `wait_completed` return completed frames on the
   application's thread. No application code runs on an SDK thread.
-- `from_sender` converts an existing `Sender`. It returns the frame the sender
-  was still holding, if any. It refuses, and returns the sender, when the
-  sender is registered with an advertiser.
+- `from_sender` converts an existing `Sender`. It drains the sender's
+  asynchronous video and returns the frame the sender was still holding, if
+  any. The sender's completion handler is dropped without being called, so a
+  handler that would panic cannot lose the sender. It refuses, and returns the
+  sender unchanged, when the sender is registered with an advertiser.
 - `sender()` lends the sender as a `Sender<QueueAttached>`: the source,
   `send_audio`, metadata in both directions, tally, connections, failover and
   the Advanced controls. It has no video sends, which would bypass the queue,

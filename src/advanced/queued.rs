@@ -331,9 +331,12 @@ impl QueuedSender {
 
     /// Turn an existing sender into a queued one.
     ///
-    /// The sender's own asynchronous video send is finished first; the frame
-    /// it was still holding, if any, is returned beside the queue, and its
-    /// completion handler is removed. The conversion is one-way.
+    /// The sender's own asynchronous video send is finished first: the SDK is
+    /// drained, and the frame the sender was still holding, if any, is
+    /// returned beside the queue. Its completion handler is dropped without
+    /// being called, even for a frame that was still in flight, which comes
+    /// back here instead of being notified, so a handler that would panic
+    /// cannot lose the sender. The conversion is one-way.
     ///
     /// # Errors
     ///
@@ -627,6 +630,31 @@ mod tests {
         assert_eq!(take_completed(&mut s).unwrap().id().get(), 2);
         assert_eq!(take_completed(&mut s).unwrap().id().get(), 1);
         assert_eq!(s.bytes, 0);
+    }
+
+    /// Converting a sender does not call its completion handler: a handler
+    /// that would panic cannot lose the sender, and the frame still in
+    /// flight comes back beside the queue.
+    #[test]
+    fn converting_a_sender_runs_no_completion_handler() {
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
+        };
+        let options = SenderOptions::new(crate::test_support::unique_name("Queued conversion"))
+            .clock_video(false);
+        let mut sender = Sender::new(&ndi, &options).unwrap();
+        sender.on_async_video_done(|_| panic!("a conversion must not run the completion handler"));
+        let frame = VideoFrame::builder().resolution(16, 16).build().unwrap();
+        let pixels = frame.data().as_ptr();
+        assert!(sender.send_video_async(frame).unwrap().is_none());
+        let (mut queue, earlier) =
+            QueuedSender::from_sender(sender, QueueOptions::default()).unwrap();
+        assert_eq!(earlier.unwrap().data().as_ptr(), pixels);
+        // The queue sends on the converted sender.
+        let next = VideoFrame::builder().resolution(16, 16).build().unwrap();
+        let id = queue.try_submit(next).unwrap();
+        let completed = queue.wait_completed(Duration::from_secs(5)).unwrap();
+        assert_eq!(completed.unwrap().id(), id);
     }
 
     #[test]

@@ -359,13 +359,21 @@ impl VideoPipeline {
         })
     }
 
-    /// End the pipeline: drain the SDK and take the retained frame, as
-    /// [`Self::finish`] does, and drop the completion handler with the
-    /// pipeline. Nothing is left in flight once this returns.
+    /// End the pipeline without calling its completion handler: drain the
+    /// SDK, take the retained frame, and drop the handler.
+    ///
+    /// A frame that was still in flight is returned rather than notified, so
+    /// a handler that would panic cannot unwind out of the conversion and
+    /// lose what its caller is converting. Nothing is left in flight once
+    /// this returns.
     #[cfg(feature = "advanced")]
-    fn retire(self) -> Option<VideoFrame> {
-        // Dropping the idle pipeline afterwards makes no SDK call.
-        self.finish()
+    fn retire(mut self) -> Option<VideoFrame> {
+        self.callback = None;
+        let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
+        // The notification `drain` claims has no handler left to run.
+        let _ = drain(state, self.sender);
+        state.take_retained()
+        // Dropping the idle pipeline makes no SDK call and notifies nothing.
     }
 }
 
@@ -1193,7 +1201,9 @@ impl Sender {
     ///
     /// The pipeline is retired: the SDK is drained, so nothing this sender
     /// submitted is in flight once the sender is in mode `T`, which has no
-    /// pipeline. Returns the sender unchanged, with nothing synchronized,
+    /// pipeline, and the completion handler is dropped without being called,
+    /// so a handler that would panic cannot lose the sender. Returns the
+    /// sender unchanged, with nothing synchronized,
     /// when an advertiser registration shares its native sender: the
     /// registration could keep it alive after the frames an Advanced sender
     /// lends the SDK are freed.
@@ -1350,6 +1360,10 @@ impl Sender {
     /// Replaces the previous handler. The current handler observes completion of
     /// a frame still in flight, including one submitted before registration.
     /// Frames completed before registration are not notified retroactively.
+    ///
+    /// Converting the sender with the Advanced `QueuedSender::from_sender`
+    /// drops the handler without calling it: that conversion returns the
+    /// frame still in flight instead of notifying it.
     pub fn on_async_video_done<F>(&mut self, handler: F)
     where
         F: Fn(usize) + Send + Sync + 'static,
