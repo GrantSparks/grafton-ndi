@@ -7,15 +7,14 @@ use super::{
 };
 use crate::{
     capture::{AudioKind, CaptureKind, Guard, MetadataKind, Notification, VideoKind},
-    receiver::capture_within,
+    receiver::{capture_within, Attempt, PacketAttached},
     sys::{
         self,
         advanced::{native, ReceiverConfiguration},
         bindings::*,
     },
     timeout::Deadline,
-    AudioFrame, MediaTypes, MetadataFrame, Ndi, Receiver, ReceiverOptions, Result, SettingChange,
-    StreamTier, VideoFrame,
+    AudioFrame, MetadataFrame, Ndi, Receiver, ReceiverOptions, Result, VideoFrame,
 };
 
 /// Which compressed formats a [`PacketReceiver`] passes through.
@@ -132,13 +131,19 @@ pub enum PacketEvent {
 /// thread that owns it, one call at a time. It cannot feed a
 /// [`FrameSync`](crate::framesync::FrameSync), which needs decoded frames.
 ///
+/// [`receiver`](Self::receiver) and [`receiver_mut`](Self::receiver_mut) reach
+/// the [`Receiver`] it holds, in the [`PacketAttached`] mode, for the common
+/// controls: tally, PTZ, statistics, upstream metadata, keyframe requests,
+/// stream selection, reconnecting and KVM. Its own frame and event capture is
+/// unavailable, because packet capture takes them.
+///
 /// # Examples
 ///
 /// ```no_run
 /// use std::time::Duration;
 /// use grafton_ndi::{
 ///     advanced::{PacketEvent, PacketReceiver, PassthroughPreset, ReceivedVideo},
-///     ReceiverOptions, Source, Ndi,
+///     ReceiverOptions, Source, Ndi, Tally,
 /// };
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
@@ -146,6 +151,7 @@ pub enum PacketEvent {
 /// # let source = Source::new("ENCODER (HEVC)");
 /// let mut receiver =
 ///     PacketReceiver::new(&ndi, &ReceiverOptions::new(source), PassthroughPreset::Hevc)?;
+/// receiver.receiver().set_tally(Tally::new(true, false));
 /// if let Some(PacketEvent::Video(ReceivedVideo::Compressed(packet))) =
 ///     receiver.capture(Duration::from_secs(1))?
 /// {
@@ -155,7 +161,7 @@ pub enum PacketEvent {
 /// # }
 /// ```
 pub struct PacketReceiver {
-    pub(crate) receiver: Receiver,
+    pub(crate) receiver: Receiver<PacketAttached>,
     _thread_affinity: PhantomData<Rc<()>>,
 }
 
@@ -199,14 +205,31 @@ impl PacketReceiver {
                 },
             )
         }?;
-        Ok(Self::from_receiver(receiver))
+        Ok(Self::from_receiver(receiver.into_mode()))
     }
 
-    pub(crate) fn from_receiver(receiver: Receiver) -> Self {
+    pub(crate) fn from_receiver(receiver: Receiver<PacketAttached>) -> Self {
         Self {
             receiver,
             _thread_affinity: PhantomData,
         }
+    }
+
+    /// The receiver this holds, for the common controls: tally, PTZ,
+    /// statistics, upstream metadata, keyframe requests, delays, reconnecting
+    /// and source-name changes.
+    ///
+    /// Its own frame and event capture is unavailable in the
+    /// [`PacketAttached`] mode; [`capture`](Self::capture) delivers both.
+    pub fn receiver(&self) -> &Receiver<PacketAttached> {
+        &self.receiver
+    }
+
+    /// The receiver this holds, for the controls that borrow it exclusively:
+    /// [`Receiver::set_stream_tier`], [`Receiver::set_streams`] and
+    /// [`Receiver::kvm`].
+    pub fn receiver_mut(&mut self) -> &mut Receiver<PacketAttached> {
+        &mut self.receiver
     }
 
     /// Wait up to `timeout` for the next frame or event, or return `None`
@@ -217,8 +240,9 @@ impl PacketReceiver {
     /// while a new connection synchronizes; this captures again until
     /// something arrives, and returns `None` only once the whole timeout is
     /// spent. [`Duration::ZERO`] makes one attempt without waiting. Every SDK
-    /// call holds the receiver's shared capture guard, so none overlaps a
-    /// reconnect, and waiting for that guard spends the same timeout.
+    /// call holds the receiver's shared capture guard for one attempt of at
+    /// most 100 ms, so none overlaps a reconnect and a reconnect waits for one
+    /// attempt at most; waiting for that guard spends the same timeout.
     ///
     /// # Errors
     ///
@@ -237,7 +261,7 @@ impl PacketReceiver {
     /// [`capture`](Self::capture) on `receiver`, in the receiver's own capture
     /// loop.
     pub(crate) fn capture_from(
-        receiver: &Receiver,
+        receiver: &Receiver<PacketAttached>,
         timeout: Duration,
     ) -> Result<Option<PacketEvent>> {
         capture_within(Deadline::after(timeout)?, |attempt| {
@@ -245,44 +269,27 @@ impl PacketReceiver {
         })
     }
 
-    /// One SDK capture on `receiver` within `deadline`, under the capture
+    /// One SDK capture on `receiver` within `attempt`, under the capture
     /// lock the receiver's own capture verbs hold. `None` when the lock was
     /// not free in time, or the SDK returned neither a frame nor an event.
-    fn poll(receiver: &Receiver, deadline: Deadline) -> Result<Option<PacketEvent>> {
-        let core = &*receiver.core;
+    fn poll(receiver: &Receiver<PacketAttached>, attempt: Attempt) -> Result<Option<PacketEvent>> {
+        // A connect or reconnect holds this lock exclusively. Waiting for it
+        // spends the attempt; a zero timeout does not wait, and when the lock
+        // is not available in time no capture is attempted.
+        let Some(lock) = receiver.core.capture_lock(attempt) else {
+            return Ok(None);
+        };
         let mut video = NDIlib_video_frame_v2_t::default();
         let mut audio = NDIlib_audio_frame_v3_t::default();
         let mut metadata = NDIlib_metadata_frame_t::default();
-        let kind = {
-            // A connect or reconnect holds this lock exclusively. Waiting for
-            // it spends the caller's budget; a zero timeout does not wait, and
-            // when the lock is not available in time no capture is attempted.
-            let Some(_capture) = core.capture_lock_until(deadline) else {
-                return Ok(None);
-            };
-            let timeout_ms = deadline.remaining_ms();
-            #[cfg(test)]
-            native_capture_calls::record();
-            // SAFETY: the receiver instance is live for this borrow, and the
-            // three descriptors are writable locals. The capture lock held
-            // here keeps the call from overlapping NDIlib_recv_connect on the
-            // same instance, which Processing.NDI.Recv.h does not make safe.
-            unsafe {
-                core.sdk().NDIlib_recv_capture_v3(
-                    core.instance,
-                    &mut video,
-                    &mut audio,
-                    &mut metadata,
-                    timeout_ms,
-                )
-            }
-        };
+        let kind = lock.capture(Some(&mut video), Some(&mut audio), Some(&mut metadata));
+        let (ndi, instance) = (lock.runtime(), lock.instance());
+        drop(lock);
         // In each frame arm, the SDK filled only the descriptor of the kind it
         // returned, for this instance, which was created through `ndi`. The
         // guard borrows the receiver, so the instance outlives the frame, and
         // it frees the frame exactly once through the matching
         // NDIlib_recv_free_* function, whether or not the copy succeeds.
-        let (ndi, instance) = (&core._ndi, core.instance);
         let event = match kind {
             sys::bindings::NDIlib_frame_type_e_NDIlib_frame_type_video => {
                 // SAFETY: `video` holds the delivered frame; see above.
@@ -304,49 +311,6 @@ impl PacketReceiver {
             },
         };
         Ok(Some(event))
-    }
-
-    /// Switch between the source's program and preview streams; see
-    /// [`Receiver::set_stream_tier`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`Receiver::set_stream_tier`].
-    pub fn set_stream_tier(&mut self, tier: StreamTier) -> Result<SettingChange> {
-        self.receiver.set_stream_tier(tier)
-    }
-
-    /// Choose which streams the source sends; see [`Receiver::set_streams`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`Receiver::set_streams`].
-    pub fn set_streams(&mut self, streams: MediaTypes) -> Result<SettingChange> {
-        self.receiver.set_streams(streams)
-    }
-
-    /// Ask the source for a keyframe, which a decoder needs before it can
-    /// start on a compressed stream; see [`Receiver::request_keyframe`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`Receiver::request_keyframe`].
-    pub fn request_keyframe(&self) -> Result<()> {
-        self.receiver.request_keyframe()
-    }
-
-    /// Send metadata upstream, to the source; see [`Receiver::send_metadata`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`Receiver::send_metadata`].
-    pub fn send_metadata(&self, metadata: &MetadataFrame) -> Result<()> {
-        self.receiver.send_metadata(metadata)
-    }
-
-    /// Whether the receiver is connected to its source.
-    pub fn is_connected(&self) -> bool {
-        self.receiver.is_connected()
     }
 }
 
@@ -393,22 +357,6 @@ fn decoded<K: CaptureKind>(frame: Guard<'_, K>) -> Result<K::Owned> {
     K::ref_to_owned(&frame)
 }
 
-/// Counts native capture calls on the calling thread, so that tests can tell
-/// a capture that was skipped from one that found nothing.
-#[cfg(test)]
-mod native_capture_calls {
-    use std::cell::Cell;
-    std::thread_local! {
-        static CALLS: Cell<usize> = const { Cell::new(0) };
-    }
-    pub(super) fn record() {
-        CALLS.with(|calls| calls.set(calls.get() + 1));
-    }
-    pub(super) fn take() -> usize {
-        CALLS.with(|calls| calls.replace(0))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -421,6 +369,7 @@ mod tests {
     use crate::{
         advanced::{EnvelopeCodec, PacketEnvelope, VideoPacketFormat},
         frames::PixelFormat,
+        receiver::native_capture_calls,
         Error, Timecode,
     };
 
@@ -584,7 +533,10 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new(""))).unwrap();
+        let receiver: Receiver<PacketAttached> =
+            Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new("")))
+                .unwrap()
+                .into_mode();
         native_capture_calls::take();
         assert!(matches!(
             PacketReceiver::capture_from(&receiver, Duration::MAX),

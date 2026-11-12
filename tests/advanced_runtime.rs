@@ -201,7 +201,9 @@ fn advanced_native_constructors_controls_and_queue() {
     let _ = packets.capture(Duration::ZERO).unwrap();
     // Nothing is connected, so there is nowhere to send metadata.
     assert!(matches!(
-        packets.send_metadata(&grafton_ndi::MetadataFrame::new("<local-test/>").unwrap()),
+        packets
+            .receiver()
+            .send_metadata(&grafton_ndi::MetadataFrame::new("<local-test/>").unwrap()),
         Err(Error::NotConnected)
     ));
     let compressed =
@@ -327,6 +329,81 @@ fn advanced_native_allocator_replacement_and_capture() {
         ),
         (0, 0, 0),
         "an allocation outlived its receiver: {usage:?}"
+    );
+}
+
+/// The receiver of an allocated packet receiver can be advertised, and the
+/// registration keeps the native receiver alive after the allocated receiver
+/// is gone. Dropping it returns the receiver to the SDK's own memory first;
+/// the allocations the policy made are still freed, through the process-wide
+/// registry, when the registration ends and the native receiver with it.
+#[test]
+fn an_advertised_packet_receiver_outlives_its_allocators() {
+    use grafton_ndi::discovery::{AdvertiserOptions, RecvAdvertisement, RecvAdvertiser};
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    if let Err(unavailable) = ndi.require_feature(RuntimeFeature::ReceiverAdvertising) {
+        eprintln!("skipped: receiver advertising: {unavailable}");
+        return;
+    }
+    let _turn = sockets();
+    let sender = Sender::new(&ndi, &options("advertised-allocation")).unwrap();
+    let packets = PacketReceiver::new(
+        &ndi,
+        &ReceiverOptions::new(common::loopback_source(&ndi, &sender).unwrap()),
+        PassthroughPreset::ProtectedWithAudio,
+    )
+    .unwrap();
+    let service =
+        AllocatorService::new(ndi.process_lifetime(), AllocatorLimits::default()).unwrap();
+    let mut packets = service.attach_packets(packets).unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let allocations = count.clone();
+    packets
+        .set_video_allocator(move |request: AllocationRequest| {
+            allocations.fetch_add(1, Ordering::Relaxed);
+            AllocationBuffer::zeroed(request)
+        })
+        .unwrap();
+    let frame = video();
+    let deadline = Instant::now() + PATIENCE;
+    while count.load(Ordering::Relaxed) == 0 {
+        assert!(Instant::now() < deadline, "the policy made no allocation");
+        sender.send_video(&frame).unwrap();
+        let _ = packets.capture(SLICE).unwrap();
+    }
+
+    let mut advertiser =
+        RecvAdvertiser::new(&ndi, &AdvertiserOptions::default().servers("127.0.0.1")).unwrap();
+    let registration = advertiser
+        .register(packets.receiver(), RecvAdvertisement::new())
+        .unwrap();
+    // Frames the policy allocated stay queued in the SDK while the allocated
+    // receiver goes; the registration keeps the native receiver.
+    for _ in 0..3 {
+        sender.send_video(&frame).unwrap();
+    }
+    drop(packets);
+    assert_eq!(service.usage().active_generations(), 0);
+    // The native receiver is still alive, and connected, in the SDK's memory.
+    assert_eq!(sender.connection_count(Duration::ZERO).unwrap(), 1);
+    for _ in 0..3 {
+        sender.send_video(&frame).unwrap();
+    }
+
+    advertiser.unregister(registration).unwrap();
+    drop(advertiser);
+    drop(sender);
+    let usage = service.usage();
+    assert_eq!(
+        (
+            usage.retained_allocations(),
+            usage.retained_bytes(),
+            usage.generations()
+        ),
+        (0, 0, 0),
+        "an allocation outlived its advertised receiver: {usage:?}"
     );
 }
 

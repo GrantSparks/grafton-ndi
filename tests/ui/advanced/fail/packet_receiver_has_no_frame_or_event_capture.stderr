@@ -1,0 +1,47 @@
+error[E0599]: no method named `video` found for reference `&grafton_ndi::Receiver<PacketAttached>` in the current scope
+ --> tests/ui/advanced/fail/packet_receiver_has_no_frame_or_event_capture.rs:6:32
+  |
+6 |     let _ = packets.receiver().video();
+  |                                ^^^^^ method not found in `&grafton_ndi::Receiver<PacketAttached>`
+
+error[E0599]: the method `audio` exists for reference `&grafton_ndi::Receiver<PacketAttached>`, but its trait bounds were not satisfied
+ --> tests/ui/advanced/fail/packet_receiver_has_no_frame_or_event_capture.rs:7:32
+  |
+7 |     let _ = packets.receiver().audio();
+  |                                ^^^^^ method cannot be called on `&grafton_ndi::Receiver<PacketAttached>` due to unsatisfied trait bounds
+  |
+ ::: src/receiver.rs
+  |
+  | pub enum PacketAttached {}
+  | ----------------------- doesn't satisfy `PacketAttached: CaptureMode`
+  |
+  = note: the following trait bounds were not satisfied:
+          `PacketAttached: CaptureMode`
+
+error[E0599]: the method `metadata` exists for reference `&grafton_ndi::Receiver<PacketAttached>`, but its trait bounds were not satisfied
+ --> tests/ui/advanced/fail/packet_receiver_has_no_frame_or_event_capture.rs:8:32
+  |
+8 |     let _ = packets.receiver().metadata();
+  |                                ^^^^^^^^
+  |
+ ::: src/receiver.rs
+  |
+  | pub enum PacketAttached {}
+  | ----------------------- doesn't satisfy `PacketAttached: CaptureMode`
+  |
+  = note: the following trait bounds were not satisfied:
+          `PacketAttached: CaptureMode`
+
+error[E0599]: the method `poll_event` exists for reference `&grafton_ndi::Receiver<PacketAttached>`, but its trait bounds were not satisfied
+ --> tests/ui/advanced/fail/packet_receiver_has_no_frame_or_event_capture.rs:9:32
+  |
+9 |     let _ = packets.receiver().poll_event(Duration::ZERO);
+  |                                ^^^^^^^^^^ method cannot be called on `&grafton_ndi::Receiver<PacketAttached>` due to unsatisfied trait bounds
+  |
+ ::: src/receiver.rs
+  |
+  | pub enum PacketAttached {}
+  | ----------------------- doesn't satisfy `PacketAttached: CaptureMode`
+  |
+  = note: the following trait bounds were not satisfied:
+          `PacketAttached: CaptureMode`

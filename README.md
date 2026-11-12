@@ -393,6 +393,8 @@ if ptz.is_supported() {
 }
 ```
 
+`poll_event` spends its timeout as the capture verbs do: in attempts of at most 100 ms, waiting across the SDK's early returns, and returning `None` only once the whole timeout is spent. Every capture holds the receiver's shared capture guard for one such attempt, so `reconnect`, `connect_to` and `disconnect` wait about 100 ms at most for captures in flight, however long their timeouts. The controls work in every receiver mode, including a FrameSync's receiver and, with the `advanced` feature, the `Receiver<PacketAttached>` that `PacketReceiver::receiver()` returns.
+
 ### Integrate With Async Runtimes
 
 NDI receive calls are fundamentally blocking SDK calls. The optional async wrappers make that explicit by running receive work on the runtime's blocking pool while preserving the timeout budget from the future's first poll. `capture` includes blocking-pool queue delay and reconnect-lock contention in the same deadline, and returns `None` only once all of it is spent. Dropping a future suppresses work before its cancellation gate; a task that has passed that gate cannot be interrupted and may still consume a frame, even if it is waiting for the reconnect lock. Queued work can still finish after the budget expires; these wrappers do not impose a wall-clock completion deadline.

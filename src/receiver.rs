@@ -131,7 +131,8 @@ fn receiver_delay_millis(delay: Duration) -> Result<i32> {
 }
 
 /// The timing of the retry loop behind every receiver capture, for all frame
-/// kinds and for both [`Capture`] verbs and the async ones.
+/// kinds, for both [`Capture`] verbs and the async ones, and for
+/// [`Receiver::poll_event`].
 struct RetryPolicy {
     /// Timeout per individual capture attempt.
     poll_interval: Duration,
@@ -175,15 +176,27 @@ where
 /// Run `attempt` under the default [`RetryPolicy`] until it returns a value or
 /// `deadline` is spent, handing each attempt what is left of `deadline`
 /// narrowed to the policy's poll interval: the one capture loop behind every
-/// receiver capture, the Advanced packet receivers' included.
+/// receiver capture and [`Receiver::poll_event`], the Advanced packet
+/// receivers' included.
 pub(crate) fn capture_within<T>(
     deadline: Deadline,
-    mut attempt: impl FnMut(Deadline) -> Result<Option<T>>,
+    mut attempt: impl FnMut(Attempt) -> Result<Option<T>>,
 ) -> Result<Option<T>> {
     retry_capture(deadline, &RetryPolicy::default(), |poll| {
-        attempt(deadline.within(poll))
+        attempt(Attempt(deadline.within(poll)))
     })
 }
+
+/// One attempt of [`capture_within`]: the caller's deadline, narrowed to the
+/// poll interval of the default [`RetryPolicy`].
+///
+/// Only [`capture_within`] makes one, and the shared capture guard is taken
+/// only within one ([`ReceiverCore::capture_lock`]), with the SDK waiting only
+/// for what is left of it. No capture therefore holds the guard for longer
+/// than one poll interval, and a reconnect waits for it about that long at
+/// most, however long the timeout of a capture in flight.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Attempt(Deadline);
 
 /// [`retry_capture`] for a budget of `budget`, with `elapsed` reporting the
 /// time since the budget started and `sleep` pausing between attempts.
@@ -614,10 +627,24 @@ impl ReceiverOptions {
 
 mod mode_sealed {
     pub trait Sealed {}
+    pub trait CaptureSealed {}
 }
 
-/// Sealed receiver capability mode. Common controls, audio, and metadata work in both modes.
+/// Sealed receiver capability mode: what a [`Receiver`] may do besides its
+/// common controls.
+///
+/// The common controls work in every mode: tally, PTZ, upstream metadata,
+/// connection statistics, delays, source-name changes, connecting and
+/// reconnecting. A [`CaptureMode`] adds the receiver's own audio, metadata and
+/// event capture, and only [`RawCapture`] adds video capture.
 pub trait ReceiverMode: mode_sealed::Sealed + Send + Sync {}
+
+/// Sealed receiver mode in which the receiver's own audio, metadata and event
+/// capture are available: [`RawCapture`] and [`FrameSyncAttached`].
+///
+/// A mode without it hands those frames and events to the object that holds
+/// the receiver, which captures them itself.
+pub trait CaptureMode: ReceiverMode + mode_sealed::CaptureSealed {}
 
 /// Ordinary receiver mode, permitting raw video capture.
 #[derive(Debug)]
@@ -625,13 +652,33 @@ pub enum RawCapture {}
 /// Receiver mode held exclusively by [`crate::FrameSync`], without raw video access.
 #[derive(Debug)]
 pub enum FrameSyncAttached {}
+/// Receiver mode held by
+/// [`PacketReceiver`](crate::advanced::PacketReceiver), with the common
+/// controls only.
+///
+/// Packet capture takes every frame and event the receiver delivers, so the
+/// receiver's own video, audio, metadata and event capture are unavailable in
+/// this mode.
+#[cfg(feature = "advanced")]
+#[derive(Debug)]
+pub enum PacketAttached {}
 impl mode_sealed::Sealed for RawCapture {}
 impl mode_sealed::Sealed for FrameSyncAttached {}
+impl mode_sealed::CaptureSealed for RawCapture {}
+impl mode_sealed::CaptureSealed for FrameSyncAttached {}
 impl ReceiverMode for RawCapture {}
 impl ReceiverMode for FrameSyncAttached {}
+impl CaptureMode for RawCapture {}
+impl CaptureMode for FrameSyncAttached {}
+#[cfg(feature = "advanced")]
+impl mode_sealed::Sealed for PacketAttached {}
+#[cfg(feature = "advanced")]
+impl ReceiverMode for PacketAttached {}
 
 /// An owned NDI receiver. The default mode permits all raw capture kinds.
-/// FrameSync privately changes the mode while retaining the same resource core.
+/// [`FrameSync`](crate::FrameSync), and the Advanced `PacketReceiver`, change
+/// the mode of the receiver they hold while retaining the same resource core;
+/// see [`ReceiverMode`].
 ///
 /// Dropping the receiver disconnects it from its source, unless a
 /// [`RecvAdvertiser`](crate::discovery::RecvAdvertiser) registration still
@@ -661,6 +708,9 @@ pub(crate) struct ReceiverCore {
     /// *exclusively*. This guarantees `NDIlib_recv_connect` never overlaps a
     /// `NDIlib_recv_capture_v3` on the same instance — the one combination the
     /// SDK does not make safe — without otherwise serializing capture.
+    ///
+    /// A shared hold is a [`CaptureLock`], taken for one [`Attempt`] only, and
+    /// the native capture cannot be called without one.
     capture_guard: RwLock<()>,
     pending_status: AtomicBool,
     pending_source: AtomicBool,
@@ -936,28 +986,20 @@ impl<M: ReceiverMode> Receiver<M> {
     /// Request a different native source without changing the original target.
     ///
     /// [`Self::reconnect`] continues to reconnect to [`Self::source`]. This call
-    /// waits for active capture calls, then issues the request; success does not
-    /// imply the source is already available. Existing FrameSync ownership remains.
+    /// waits for the capture attempts in flight, as [`Self::reconnect`] does,
+    /// then issues the request; success does not imply the source is already
+    /// available. Existing FrameSync ownership remains.
     pub fn connect_to(&self, source: &Source) -> Result<()> {
         let raw = source.to_raw()?;
         self.core.connect(Some(&raw));
         Ok(())
     }
 
-    /// Disconnect the native receiver while retaining its original reconnect target.
+    /// Disconnect the native receiver while retaining its original reconnect
+    /// target, once the capture attempts in flight have returned, as for
+    /// [`Self::reconnect`].
     pub fn disconnect(&self) {
         self.core.connect(None);
-    }
-
-    /// Poll coalesced status/source invalidations, including those seen by media capture.
-    ///
-    /// These are not an ordered history or broadcast stream. Concurrent pollers
-    /// compete to consume a pending notification. A pending notification avoids
-    /// waiting, but publication cannot interrupt an SDK wait already in
-    /// progress. The new source name is read with the SDK's separate
-    /// [`Self::poll_source_name_change`] API.
-    pub fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
-        self.core.poll_event(timeout)
     }
 
     /// Publish this receiver's program and preview tally to its source.
@@ -1025,54 +1067,6 @@ impl<M: ReceiverMode> Receiver<M> {
         Ptz { core: &self.core }
     }
 
-    /// Capture **audio** frames from this receiver.
-    ///
-    /// Returns a [`Capture`] view; see [`Receiver::video`] for its two verbs,
-    /// [`capture`](Capture::capture) and [`capture_ref`](Capture::capture_ref).
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = Ndi::new()?;
-    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)")))?;
-    /// if let Some(audio) = receiver.audio().capture_ref(Duration::from_secs(1))? {
-    ///     println!("{} channels, {} samples", audio.num_channels(), audio.num_samples());
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[must_use = "the Capture view does nothing until a capture verb is called"]
-    pub fn audio(&self) -> Capture<'_, AudioKind> {
-        Capture::new(&self.core)
-    }
-
-    /// Capture **metadata** frames from this receiver.
-    ///
-    /// Returns a [`Capture`] view; see [`Receiver::video`] for its two verbs,
-    /// [`capture`](Capture::capture) and [`capture_ref`](Capture::capture_ref).
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = Ndi::new()?;
-    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)")))?;
-    /// if let Some(meta) = receiver.metadata().capture(Duration::from_millis(100))? {
-    ///     println!("metadata: {}", meta.data());
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[must_use = "the Capture view does nothing until a capture verb is called"]
-    pub fn metadata(&self) -> Capture<'_, MetadataKind> {
-        Capture::new(&self.core)
-    }
-
     /// Check if the receiver is still connected to its source.
     ///
     /// Returns `true` if there is at least one active connection to the source,
@@ -1126,12 +1120,16 @@ impl<M: ReceiverMode> Receiver<M> {
     /// `NDIlib_recv_connect` is the one receive call the SDK does *not* make
     /// safe to run concurrently with `NDIlib_recv_capture_v3` on the same
     /// instance. This method therefore takes the receiver's capture guard
-    /// exclusively: it **blocks until every in-flight capture on this receiver
-    /// returns**, and holds off any capture that starts while it runs. Captures
-    /// on the same receiver still run concurrently with each other; only a
-    /// reconnect is exclusive. Because it can block for as long as a capture's
-    /// timeout, prefer short capture timeouts on receivers you intend to
-    /// recover, and call it off the async runtime — `AsyncReceiver::reconnect`
+    /// exclusively: it **blocks until every capture attempt in flight on this
+    /// receiver returns**, and holds off any attempt that starts while it waits
+    /// or runs. Every capture on the receiver — the [`Capture`] verbs,
+    /// [`poll_event`](Self::poll_event), and the Advanced packet capture —
+    /// holds the guard for one attempt of at most 100 ms, whatever its own
+    /// timeout, so a reconnect waits about that long at most. A capture held
+    /// off spends its own timeout waiting and captures again once the
+    /// reconnect is done. Captures on the same receiver still run concurrently
+    /// with each other; only a reconnect is exclusive. It is still a blocking
+    /// call, so call it off the async runtime — `AsyncReceiver::reconnect`
     /// does this for you.
     ///
     /// # Errors
@@ -1245,6 +1243,83 @@ impl<M: ReceiverMode> Receiver<M> {
     }
 }
 
+impl<M: CaptureMode> Receiver<M> {
+    /// Wait up to `timeout` for a status or source change, or return `None`
+    /// when none came.
+    ///
+    /// Events are coalesced invalidations, including those that media capture
+    /// passed over and kept, not an ordered history or broadcast stream.
+    /// Concurrent pollers compete to consume a pending one. The new source
+    /// name is read with the SDK's separate [`Self::poll_source_name_change`]
+    /// API.
+    ///
+    /// The timeout is spent as the [`Capture`] verbs spend it: in attempts of
+    /// at most 100 ms, each of which first takes a pending event and otherwise
+    /// waits in the SDK, under the receiver's shared capture guard, for the
+    /// rest of the attempt. The SDK's early returns are waited over, so `None`
+    /// comes only once the whole timeout is spent, and [`Duration::ZERO`]
+    /// makes one attempt without waiting. An event that a concurrent capture
+    /// keeps is returned by the next attempt, and a
+    /// [`reconnect`](Self::reconnect) waits for one attempt at most.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`]
+    /// (~49.7 days), and [`Error::CaptureFailed`] when the SDK reports a lost
+    /// connection.
+    pub fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
+        self.core.poll_event(timeout)
+    }
+
+    /// Capture **audio** frames from this receiver.
+    ///
+    /// Returns a [`Capture`] view; see [`Receiver::video`] for its two verbs,
+    /// [`capture`](Capture::capture) and [`capture_ref`](Capture::capture_ref).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = Ndi::new()?;
+    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)")))?;
+    /// if let Some(audio) = receiver.audio().capture_ref(Duration::from_secs(1))? {
+    ///     println!("{} channels, {} samples", audio.num_channels(), audio.num_samples());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use = "the Capture view does nothing until a capture verb is called"]
+    pub fn audio(&self) -> Capture<'_, AudioKind> {
+        Capture::new(&self.core)
+    }
+
+    /// Capture **metadata** frames from this receiver.
+    ///
+    /// Returns a [`Capture`] view; see [`Receiver::video`] for its two verbs,
+    /// [`capture`](Capture::capture) and [`capture_ref`](Capture::capture_ref).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = Ndi::new()?;
+    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)")))?;
+    /// if let Some(meta) = receiver.metadata().capture(Duration::from_millis(100))? {
+    ///     println!("metadata: {}", meta.data());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use = "the Capture view does nothing until a capture verb is called"]
+    pub fn metadata(&self) -> Capture<'_, MetadataKind> {
+        Capture::new(&self.core)
+    }
+}
+
 impl ReceiverCore {
     /// The entry points of the runtime this receiver was created through.
     pub(crate) fn sdk(&self) -> &'static sys::Core {
@@ -1262,10 +1337,12 @@ impl ReceiverCore {
     /// Point the native receiver at `source`, or at no source, once no capture
     /// is in flight.
     ///
-    /// The capture guard is held exclusively for the call: it waits for
-    /// in-flight captures to drain and holds off new ones, so
+    /// The capture guard is held exclusively for the call: it waits for the
+    /// capture attempts in flight to return and holds off new ones, so
     /// `NDIlib_recv_connect` never overlaps `NDIlib_recv_capture_v3` on this
     /// instance, the one combination `Processing.NDI.Recv.h` does not make safe.
+    /// Each attempt holds the guard for one [`Attempt`] at most, so this waits
+    /// about one poll interval at most.
     fn connect(&self, source: Option<&RawSource>) {
         let _exclusive = self.capture_guard.write();
         let source = source.map_or(ptr::null(), |raw| ptr::from_ref(&raw.raw));
@@ -1276,12 +1353,19 @@ impl ReceiverCore {
         unsafe { self.sdk().NDIlib_recv_connect(self.instance, source) };
     }
 
-    /// Acquire only within the caller's existing budget, including contention.
+    /// Take the shared capture guard for `attempt`, waiting for it no longer
+    /// than the attempt lasts: `None` when a connect or reconnect held it, or
+    /// waited for it, until then.
     ///
-    /// Every `NDIlib_recv_capture_v3` call on this instance holds this guard,
-    /// so that none overlaps a connect or reconnect.
-    pub(crate) fn capture_lock_until(&self, deadline: Deadline) -> Option<RwLockReadGuard<'_, ()>> {
-        self.capture_guard.try_read_until(deadline.end())
+    /// This is the only way to make a [`CaptureLock`], and so to call
+    /// `NDIlib_recv_capture_v3` on this instance.
+    pub(crate) fn capture_lock(&self, attempt: Attempt) -> Option<CaptureLock<'_>> {
+        let shared = self.capture_guard.try_read_until(attempt.0.end())?;
+        Some(CaptureLock {
+            core: self,
+            attempt,
+            _shared: shared,
+        })
     }
 
     /// Hold the lock a reconnect holds, so that a test can contend with capture.
@@ -1290,21 +1374,19 @@ impl ReceiverCore {
         self.capture_guard.write()
     }
 
-    /// One SDK capture of kind `K` within `deadline`.
+    /// One SDK capture of kind `K` within `attempt`.
     ///
-    /// Holds the shared capture guard for the duration of one
-    /// `NDIlib_recv_capture_v3` call, so it runs concurrently with other
-    /// captures but never overlaps a [`reconnect`](Receiver::reconnect).
-    /// `None` when the guard was not free in time, or the SDK returned
-    /// without a frame of this kind; a notification it returned instead is
-    /// kept for [`Receiver::poll_event`].
-    fn poll_ref_until<K: CaptureKind>(&self, deadline: Deadline) -> Result<Option<K::Ref<'_>>> {
-        let Some(_capture) = self.capture_lock_until(deadline) else {
+    /// Holds the shared capture guard for one `NDIlib_recv_capture_v3` call,
+    /// so it runs concurrently with other captures but never overlaps a
+    /// [`reconnect`](Receiver::reconnect). `None` when the guard was not free
+    /// in time, or the SDK returned without a frame of this kind; a
+    /// notification it returned instead is kept for [`Receiver::poll_event`].
+    fn poll_ref_until<K: CaptureKind>(&self, attempt: Attempt) -> Result<Option<K::Ref<'_>>> {
+        let Some(lock) = self.capture_lock(attempt) else {
             return Ok(None);
         };
-        let timeout_ms = deadline.remaining_ms();
-        // SAFETY: self.instance is a valid NDI receiver instance.
-        let result = unsafe { capture_raw::<K>(&self._ndi, self.instance, timeout_ms) }?;
+        let result = capture_raw::<K>(&lock)?;
+        drop(lock);
         self.capture_result::<K>(result)
     }
 
@@ -1391,31 +1473,110 @@ impl ReceiverCore {
             .map(ReceiverEvent::Unknown)
     }
 
+    /// [`Receiver::poll_event`]: event attempts in the one capture loop.
     fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
-        let deadline = Deadline::after(timeout)?;
+        capture_within(Deadline::after(timeout)?, |attempt| {
+            self.poll_event_once(attempt)
+        })
+    }
+
+    /// One attempt of [`Self::poll_event`]: a pending event, or what one SDK
+    /// capture without media slots reports within `attempt`.
+    ///
+    /// A pending event is taken before waiting for the guard, so that it is
+    /// returned even while a reconnect holds the guard, and again once the
+    /// guard is held, so that one a capture kept meanwhile spares the wait.
+    fn poll_event_once(&self, attempt: Attempt) -> Result<Option<ReceiverEvent>> {
         if let Some(event) = self.take_pending_event() {
             return Ok(Some(event));
         }
-        let Some(_capture) = self.capture_lock_until(deadline) else {
+        let Some(lock) = self.capture_lock(attempt) else {
             return Ok(self.take_pending_event());
         };
         if let Some(event) = self.take_pending_event() {
             return Ok(Some(event));
         }
         // Null media slots request notifications only; no frame allocation escapes.
-        // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
-        let value = unsafe {
-            self.sdk().NDIlib_recv_capture_v3(
-                self.instance,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                deadline.remaining_ms(),
-            )
-        };
-        self.retain(Notification::classify(value)?);
+        let frame_type = lock.capture(None, None, None);
+        drop(lock);
+        self.retain(Notification::classify(frame_type)?);
         Ok(self.take_pending_event())
+    }
+}
+
+/// Proof that the shared capture guard of one receiver is held, for one
+/// [`Attempt`]: the only way to call `NDIlib_recv_capture_v3`.
+///
+/// Only [`ReceiverCore::capture_lock`] makes one, and every function that
+/// reaches the native capture takes one by reference, so no capture can
+/// overlap `NDIlib_recv_connect` on the same instance, which takes the guard
+/// exclusively and which `Processing.NDI.Recv.h` does not make safe to run
+/// beside a capture. The lock also fixes the receiver the capture is made on
+/// and how long it may wait: what is left of its attempt.
+pub(crate) struct CaptureLock<'rx> {
+    core: &'rx ReceiverCore,
+    attempt: Attempt,
+    _shared: RwLockReadGuard<'rx, ()>,
+}
+
+impl<'rx> CaptureLock<'rx> {
+    /// The runtime the receiver was created through, which frees the frames
+    /// a capture under this lock delivers.
+    pub(crate) fn runtime(&self) -> &'rx Ndi {
+        &self.core._ndi
+    }
+
+    /// The receiver instance a capture under this lock is made on.
+    pub(crate) fn instance(&self) -> NDIlib_recv_instance_t {
+        self.core.instance
+    }
+
+    /// The receiver's one `NDIlib_recv_capture_v3` call: wait for what is
+    /// left of this lock's attempt for a frame of a kind whose descriptor is
+    /// given, or for a notification, and return the frame type the SDK
+    /// reported.
+    ///
+    /// The SDK fills only the descriptor of the kind it returns, and only
+    /// when that descriptor was given; the caller frees such a frame through
+    /// the matching `NDIlib_recv_free_*` function of [`Self::runtime`].
+    pub(crate) fn capture(
+        &self,
+        video: Option<&mut NDIlib_video_frame_v2_t>,
+        audio: Option<&mut NDIlib_audio_frame_v3_t>,
+        metadata: Option<&mut NDIlib_metadata_frame_t>,
+    ) -> NDIlib_frame_type_e {
+        #[cfg(test)]
+        native_capture_calls::record();
+        // SAFETY: the receiver instance is live for 'rx, which this lock
+        // borrows it for. Each descriptor is null or exclusively borrowed,
+        // writable storage that outlives the synchronous call. The lock holds
+        // the shared capture guard, so NDIlib_recv_connect, which takes it
+        // exclusively, cannot run on this instance during the call.
+        unsafe {
+            self.core.sdk().NDIlib_recv_capture_v3(
+                self.core.instance,
+                video.map_or(ptr::null_mut(), ptr::from_mut),
+                audio.map_or(ptr::null_mut(), ptr::from_mut),
+                metadata.map_or(ptr::null_mut(), ptr::from_mut),
+                self.attempt.0.remaining_ms(),
+            )
+        }
+    }
+}
+
+/// Counts native capture calls on the calling thread, so that tests can tell
+/// a capture that was skipped from one that found nothing.
+#[cfg(test)]
+pub(crate) mod native_capture_calls {
+    use std::cell::Cell;
+    std::thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+    pub(crate) fn record() {
+        CALLS.with(|calls| calls.set(calls.get() + 1));
+    }
+    pub(crate) fn take() -> usize {
+        CALLS.with(|calls| calls.replace(0))
     }
 }
 
@@ -1440,17 +1601,19 @@ impl ReceiverCore {
 /// A status or source change they pass over is kept for
 /// [`Receiver::poll_event`].
 ///
-/// Every SDK call holds a shared capture guard, so captures of different
-/// kinds run concurrently with each other but never overlap a
-/// [`Receiver::reconnect`]. Each timeout budget starts when the verb is
-/// called and includes waiting for that guard. A zero timeout makes one
-/// attempt and never waits for the guard; if it is unavailable, no SDK
+/// Each attempt waits at most 100 ms, and every SDK call holds a shared
+/// capture guard for one attempt, so captures of different kinds run
+/// concurrently with each other but never overlap a [`Receiver::reconnect`],
+/// which waits for one attempt at most. Each timeout budget starts when the
+/// verb is called and includes waiting for that guard. A zero timeout makes
+/// one attempt and never waits for the guard; if it is unavailable, no SDK
 /// capture is attempted. SDK calls and owned-frame copying may finish after
 /// the budget expires, so the timeout is not a strict wall-clock completion
 /// guarantee.
 ///
 /// Only the ordinary receiver mode exposes a video view. FrameSync owns video
 /// capture until [`crate::FrameSync::into_receiver`] restores the ordinary mode.
+/// Audio and metadata views exist in each [`CaptureMode`].
 pub struct Capture<'rx, K: CaptureKind> {
     rx: &'rx ReceiverCore,
     _kind: PhantomData<K>,
@@ -2583,6 +2746,106 @@ mod tests {
             worker.join().unwrap();
             result.unwrap();
         });
+    }
+
+    /// A long `poll_event` holds the capture guard for one attempt at a time:
+    /// a reconnect gets it within about one poll interval, a capture that
+    /// starts while the reconnect waits still reaches the SDK within its own
+    /// budget, and an event a capture keeps ends the poll at its next attempt.
+    /// One SDK call holding the guard for the whole timeout made the
+    /// reconnect wait almost five seconds.
+    #[test]
+    fn a_long_poll_event_holds_off_reconnect_for_one_attempt_at_most() {
+        use std::{sync::mpsc, time::Instant};
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = &Receiver::new(&ndi, &unconnected()).unwrap();
+        let stop = &AtomicBool::new(false);
+        let budget = Duration::from_secs(1);
+        std::thread::scope(|scope| {
+            let (polling, started_polling) = mpsc::channel();
+            let poller = scope.spawn(move || {
+                polling.send(()).unwrap();
+                loop {
+                    // Nothing is connected, so only the event published
+                    // below ends a poll before its timeout.
+                    let event = receiver.poll_event(Duration::from_secs(5)).unwrap();
+                    if stop.load(Ordering::Acquire) {
+                        return event;
+                    }
+                }
+            });
+            started_polling.recv().unwrap();
+            // Let the poller settle into an SDK wait under the guard.
+            std::thread::sleep(Duration::from_millis(250));
+
+            let (waiting, writer_waits) = mpsc::channel();
+            let capture = scope.spawn(move || {
+                writer_waits.recv().unwrap();
+                // Start once the reconnect is queued for the guard: a fair
+                // lock holds this capture off until the reconnect is done.
+                std::thread::sleep(Duration::from_millis(20));
+                native_capture_calls::take();
+                let began = Instant::now();
+                let frame = receiver.metadata().capture(budget).unwrap();
+                (
+                    frame.is_none(),
+                    began.elapsed(),
+                    native_capture_calls::take(),
+                )
+            });
+            waiting.send(()).unwrap();
+            let began = Instant::now();
+            receiver.reconnect().unwrap();
+            let reconnected = began.elapsed();
+            let (nothing_arrived, captured_for, sdk_calls) = capture.join().unwrap();
+
+            stop.store(true, Ordering::Release);
+            let published = Instant::now();
+            receiver.core.retain(Notification::StatusChanged);
+            let ended = poller.join().unwrap();
+            let poll_ended_after = published.elapsed();
+
+            assert!(reconnected < Duration::from_secs(1), "{reconnected:?}");
+            assert!(nothing_arrived);
+            // The capture waited for the guard within its budget, then
+            // reached the SDK, and spent the rest of its budget there.
+            assert!(sdk_calls >= 1, "{sdk_calls} SDK calls");
+            assert!(captured_for >= budget, "{captured_for:?}");
+            assert!(
+                captured_for < budget + Duration::from_millis(500),
+                "{captured_for:?}"
+            );
+            assert!(ended.is_some());
+            assert!(
+                poll_ended_after < Duration::from_secs(1),
+                "{poll_ended_after:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn poll_event_spends_its_timeout_in_bounded_attempts() {
+        use std::time::Instant;
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        // A zero timeout makes exactly one attempt, with a zero SDK wait.
+        native_capture_calls::take();
+        let began = Instant::now();
+        assert!(receiver.poll_event(Duration::ZERO).unwrap().is_none());
+        assert!(began.elapsed() < Duration::from_millis(500));
+        assert_eq!(native_capture_calls::take(), 1);
+        // Nothing is connected: the whole budget is spent, in attempts of at
+        // most one poll interval each, where one SDK call used to take it all.
+        let budget = Duration::from_millis(450);
+        let began = Instant::now();
+        assert!(receiver.poll_event(budget).unwrap().is_none());
+        assert!(began.elapsed() >= budget, "{:?}", began.elapsed());
+        let calls = native_capture_calls::take();
+        assert!(calls >= 3, "{calls} SDK calls");
     }
 
     #[test]

@@ -85,7 +85,7 @@ checkout.
 | `src/sys/` | The private native boundary: generated bindings, typed function tables, the loader that fills them |
 | `src/finder.rs` | Source discovery, owned descriptors, address parsing, and lookup cache |
 | `src/receiver.rs` | Receiver configuration, capture views, reconnect synchronization, status, and controls |
-| `src/capture.rs`, `src/recv_guard.rs` | Private SDK capture/free strategies and guards that keep buffers tied to their owners |
+| `src/capture.rs` | Private SDK capture/free strategies and guards that keep buffers tied to their owners |
 | `src/frames.rs` | Owned and borrowed frames, layout/metadata validation, channel access, and image encoding |
 | `src/framesync.rs` | Clock-corrected pull capture and receiver ownership boundaries |
 | `src/sender.rs` | Synchronous sends, owned async video pipeline, copied submissions, and completion handlers |

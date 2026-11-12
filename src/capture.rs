@@ -15,9 +15,11 @@
 //!   [`FrameSync`](crate::FrameSync) — shares one guard rather than hand-rolling
 //!   its own.
 //! - [`CaptureKind`] exposes only the borrowed and owned frame types.
-//! - `CaptureStrategy` privately connects each receiver kind to its SDK capture
-//!   call and frame-type discriminant, and copies a borrowed frame into an
-//!   owned one.
+//! - `CaptureStrategy` privately connects each receiver kind to its slot of
+//!   the SDK capture call and its frame-type discriminant, and copies a
+//!   borrowed frame into an owned one. The capture itself is made only through
+//!   a [`CaptureLock`], the proof that the receiver's shared capture guard is
+//!   held, so no receiver capture can overlap a reconnect.
 //!
 //! # Example
 //!
@@ -35,6 +37,7 @@ use crate::{
     frames::{
         AudioFrame, AudioFrameRef, MetadataFrame, MetadataFrameRef, VideoFrame, VideoFrameRef,
     },
+    receiver::CaptureLock,
     sys::{self, bindings::*},
     Error, Ndi, Result,
 };
@@ -121,20 +124,9 @@ pub(crate) trait CaptureStrategy:
     /// The frame-type discriminant `NDIlib_recv_capture_v3` returns for this kind.
     const FRAME_TYPE: NDIlib_frame_type_e;
 
-    /// Run a capture for this kind, routing `frame` into the matching
-    /// `NDIlib_recv_capture_v3` slot and ignoring the others.
-    ///
-    /// # Safety
-    ///
-    /// - `instance` must be a valid NDI receiver instance created through the
-    ///   runtime `core` belongs to.
-    /// - `frame` must point to a writable [`RawFrame`](FrameFree::RawFrame).
-    unsafe fn capture_into(
-        core: &sys::Core,
-        instance: NDIlib_recv_instance_t,
-        frame: *mut Self::RawFrame,
-        timeout_ms: u32,
-    ) -> NDIlib_frame_type_e;
+    /// Run one capture for this kind under `lock`, routing `frame` into the
+    /// matching `NDIlib_recv_capture_v3` slot and leaving the others null.
+    fn capture_into(lock: &CaptureLock<'_>, frame: &mut Self::RawFrame) -> NDIlib_frame_type_e;
 
     /// Wrap a freshly captured frame guard in its borrowed view, validating any
     /// kind-specific invariants (e.g. FourCC) during construction.
@@ -174,19 +166,8 @@ impl CaptureKind for VideoKind {
 impl CaptureStrategy for VideoKind {
     const FRAME_TYPE: NDIlib_frame_type_e = NDIlib_frame_type_e_NDIlib_frame_type_video;
 
-    unsafe fn capture_into(
-        core: &sys::Core,
-        instance: NDIlib_recv_instance_t,
-        frame: *mut Self::RawFrame,
-        timeout_ms: u32,
-    ) -> NDIlib_frame_type_e {
-        core.NDIlib_recv_capture_v3(
-            instance,
-            frame,
-            std::ptr::null_mut(), // no audio
-            std::ptr::null_mut(), // no metadata
-            timeout_ms,
-        )
+    fn capture_into(lock: &CaptureLock<'_>, frame: &mut Self::RawFrame) -> NDIlib_frame_type_e {
+        lock.capture(Some(frame), None, None)
     }
 
     unsafe fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>> {
@@ -219,19 +200,8 @@ impl CaptureKind for AudioKind {
 impl CaptureStrategy for AudioKind {
     const FRAME_TYPE: NDIlib_frame_type_e = NDIlib_frame_type_e_NDIlib_frame_type_audio;
 
-    unsafe fn capture_into(
-        core: &sys::Core,
-        instance: NDIlib_recv_instance_t,
-        frame: *mut Self::RawFrame,
-        timeout_ms: u32,
-    ) -> NDIlib_frame_type_e {
-        core.NDIlib_recv_capture_v3(
-            instance,
-            std::ptr::null_mut(), // no video
-            frame,
-            std::ptr::null_mut(), // no metadata
-            timeout_ms,
-        )
+    fn capture_into(lock: &CaptureLock<'_>, frame: &mut Self::RawFrame) -> NDIlib_frame_type_e {
+        lock.capture(None, Some(frame), None)
     }
 
     unsafe fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>> {
@@ -264,19 +234,8 @@ impl CaptureKind for MetadataKind {
 impl CaptureStrategy for MetadataKind {
     const FRAME_TYPE: NDIlib_frame_type_e = NDIlib_frame_type_e_NDIlib_frame_type_metadata;
 
-    unsafe fn capture_into(
-        core: &sys::Core,
-        instance: NDIlib_recv_instance_t,
-        frame: *mut Self::RawFrame,
-        timeout_ms: u32,
-    ) -> NDIlib_frame_type_e {
-        core.NDIlib_recv_capture_v3(
-            instance,
-            std::ptr::null_mut(), // no video
-            std::ptr::null_mut(), // no audio
-            frame,
-            timeout_ms,
-        )
+    fn capture_into(lock: &CaptureLock<'_>, frame: &mut Self::RawFrame) -> NDIlib_frame_type_e {
+        lock.capture(None, None, Some(frame))
     }
 
     unsafe fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>> {
@@ -497,28 +456,27 @@ impl Notification {
     }
 }
 
-/// Capture a frame of kind `K` from an NDI receiver.
+/// Capture a frame of kind `K` from the receiver `lock` holds the capture
+/// guard of, within what is left of the lock's attempt.
 ///
 /// Routes the frame into the matching `NDIlib_recv_capture_v3` slot via
 /// [`CaptureStrategy::capture_into`]; any other result is classified by
-/// [`Notification::classify`].
-///
-/// # Safety
-///
-/// `instance` must be a valid NDI receiver instance created through `runtime`
-/// that remains alive for `'rx`. The caller must tie `'rx` to a borrow of its
-/// owning Receiver.
-pub(crate) unsafe fn capture_raw<'rx, K: CaptureKind>(
-    runtime: &'rx Ndi,
-    instance: NDIlib_recv_instance_t,
-    timeout_ms: u32,
+/// [`Notification::classify`]. The frame's guard borrows the receiver for
+/// `'rx`, as the lock does, and outlives the lock.
+pub(crate) fn capture_raw<'rx, K: CaptureKind>(
+    lock: &CaptureLock<'rx>,
 ) -> Result<CaptureResult<'rx, K>> {
     let mut frame = K::RawFrame::default();
-    let frame_type = K::capture_into(&runtime.api().core, instance, &mut frame, timeout_ms);
+    let frame_type = K::capture_into(lock, &mut frame);
     if frame_type == K::FRAME_TYPE {
-        Ok(CaptureResult::Frame(Guard::<K>::new(
-            runtime, instance, frame,
-        )))
+        // SAFETY: the SDK reported a frame of this kind, which it wrote to
+        // `frame`, the only slot `capture_into` gives it, for the lock's
+        // receiver instance, created through the lock's runtime. The lock
+        // borrows that receiver for 'rx, so the instance outlives the guard,
+        // which frees the frame through the matching NDIlib_recv_free_*.
+        Ok(CaptureResult::Frame(unsafe {
+            Guard::<K>::new(lock.runtime(), lock.instance(), frame)
+        }))
     } else {
         Notification::classify(frame_type).map(CaptureResult::Notification)
     }

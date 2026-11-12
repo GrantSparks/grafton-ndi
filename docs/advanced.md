@@ -221,6 +221,33 @@ nothing, and returns `None` only once the whole timeout is spent. A
 `PacketReceiver` is used from the thread that owns it and cannot feed a
 `FrameSync`. Use an ordinary `Receiver` for decoded media only.
 
+`receiver()` returns the `Receiver<PacketAttached>` the packet receiver holds,
+with the controls every receiver mode has: `set_tally`, `ptz`,
+`connection_stats`, `send_metadata`, `request_keyframe`, the delays,
+`reconnect` and `poll_source_name_change`. `receiver_mut()` reaches the ones
+that borrow the receiver exclusively: `set_stream_tier`, `set_streams` and
+`kvm`. The receiver's own `video`, `audio`, `metadata` and `poll_event` do not
+exist in this mode, because `capture` takes every frame and event:
+
+```rust
+use std::time::Duration;
+use grafton_ndi::{
+    advanced::{PacketEvent, PacketReceiver, PassthroughPreset},
+    Ndi, ReceiverOptions, Source, StreamTier, Tally,
+};
+
+fn relay(ndi: &Ndi, source: Source) -> grafton_ndi::Result<()> {
+    let mut packets =
+        PacketReceiver::new(ndi, &ReceiverOptions::new(source), PassthroughPreset::Hevc)?;
+    packets.receiver().set_tally(Tally::new(true, false));
+    packets.receiver_mut().set_stream_tier(StreamTier::Program)?;
+    if let Some(PacketEvent::StatusChanged) = packets.capture(Duration::from_secs(1))? {
+        println!("connections: {}", packets.receiver().connection_stats().connections());
+    }
+    Ok(())
+}
+```
+
 ### Packet formats
 
 `CompressedVideoFrame` and `CompressedAudioFrame` own their bytes. A video
@@ -396,7 +423,15 @@ What to know about allocator policies:
   `Rejected` when they fail.
 - `attach_packets` does for a `PacketReceiver` what `attach` does for a
   `Receiver`, and hands the `PacketReceiver` back inside `Rejected` when it
-  fails.
+  fails. The `AllocatedPacketReceiver` it returns has the packet receiver's
+  `capture` and `receiver()`, and `set_stream_tier` and `set_streams` of its
+  own in place of `receiver_mut()`, which would let its receiver, on which
+  the allocators are installed, be swapped for another. `into_packet_receiver`
+  gives the packet receiver back.
+- Dropping an allocated receiver, or taking its receiver back, first returns
+  the receiver to the SDK's own memory. A receiver that a `RecvAdvertiser`
+  registration keeps alive afterwards frees the allocations it still holds
+  through the same process-wide registry, which outlives every receiver.
 
 Example: `examples/advanced_allocator.rs`.
 

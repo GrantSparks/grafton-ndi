@@ -178,7 +178,6 @@
 mod capture;
 mod error;
 mod media;
-mod recv_guard;
 mod rejected;
 mod sys;
 mod time;
@@ -224,9 +223,9 @@ pub use {
         AudioInputFormat, FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncVideoRef,
     },
     receiver::{
-        Capture, ConnectionStats, FrameSyncAttached, Ptz, RawCapture, Receiver, ReceiverBandwidth,
-        ReceiverColorFormat, ReceiverEvent, ReceiverMode, ReceiverOptions, ReceiverStatus,
-        SettingChange, SourceNameChange, Tally,
+        Capture, CaptureMode, ConnectionStats, FrameSyncAttached, Ptz, RawCapture, Receiver,
+        ReceiverBandwidth, ReceiverColorFormat, ReceiverEvent, ReceiverMode, ReceiverOptions,
+        ReceiverStatus, SettingChange, SourceNameChange, Tally,
     },
     runtime::{Ndi, ProcessLifetimeRuntime, Runtime, RuntimeOptions},
     sender::{

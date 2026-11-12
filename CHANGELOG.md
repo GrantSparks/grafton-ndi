@@ -163,6 +163,11 @@ as `None`. Most programs need changes; see the
   same status as `ReceiverEvent::StatusChanged`, together with the other
   receiver events, and is the only poller, so two pollers no longer compete for
   one notification.
+- `Receiver::audio`, `metadata` and `poll_event` need the receiver's mode to
+  implement the new sealed `CaptureMode`, which `RawCapture` and
+  `FrameSyncAttached` do. Generic code bounded by `M: ReceiverMode` that
+  captures audio or metadata, or polls events, bounds `M: CaptureMode`; the
+  common controls keep `ReceiverMode`.
 - FrameSync's owned captures take the short names: `capture_video` and
   `capture_audio` return owned frames, as `capture_video_owned` and
   `capture_audio_owned` did, and the borrowing captures are
@@ -310,6 +315,11 @@ as `None`. Most programs need changes; see the
   compressed source receives metadata such as PTZ and KVM requests and a
   queued source also carries audio. `SendAdvertiser::register` takes only
   `Sender<RawSend>`, so a wrapped sender cannot be registered.
+- `advanced::PacketReceiver::receiver` and `receiver_mut` lend its receiver as
+  `Receiver<PacketAttached>`, with tally, PTZ, connection statistics, upstream
+  metadata and the keyframe and stream controls, but no audio, metadata or
+  event capture of its own, which packet capture takes. `AllocatedPacketReceiver`
+  lends it through `receiver` and has `set_stream_tier` and `set_streams`.
 - `Ndi::process_lifetime`, an explicit opt-in that keeps NDI started until the
   process exits. Custom receive allocators require it.
 - The optional `file-io` feature and `file` module for the NDI File library of
@@ -389,6 +399,14 @@ as `None`. Most programs need changes; see the
   received frames, `BorrowedVideoFrame` and the Advanced allocators refused
   them. YV12 and I420 still need an even stride and height, and NV12 an even
   height.
+- `Receiver::poll_event` held the receiver's capture guard for its whole
+  timeout in one SDK call, so `reconnect`, `connect_to` and `disconnect`, and
+  every capture queued behind them, waited up to that timeout. It now runs in
+  the capture verbs' loop: attempts of at most 100 ms, each taking a pending
+  event first. A reconnect waits for one attempt at most, and `poll_event`
+  returns `None` only once its whole timeout is spent; `Duration::ZERO` still
+  makes one non-blocking attempt. Every native receiver capture now takes the
+  guard's proof as an argument, so none can be made without it.
 - After the thread of an async File player or recorder fails, the command it
   was running, commands queued or submitted later, event waits and `close()`
   all report `StateError::OwnerFailed`, as documented. Only `close()` did;

@@ -353,11 +353,12 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// in place. See [`Receiver::reconnect`].
     ///
     /// Unlike the liveness probes above, a reconnect takes the receiver's
-    /// capture guard exclusively, so it can block until in-flight captures
-    /// (which run on the blocking pool) drain. It therefore runs on the
-    /// blocking pool too, never on the async runtime's threads, and is safe to
-    /// call while captures on this receiver are in flight — they serialize
-    /// instead of racing. Confirm recovery via [`Self::connection_stats`].
+    /// capture guard exclusively, so it blocks until the capture attempts in
+    /// flight (which run on the blocking pool) return: one attempt of at most
+    /// 100 ms each, whatever their timeouts. It therefore runs on the blocking
+    /// pool too, never on the async runtime's threads, and is safe to call
+    /// while captures on this receiver are in flight — they serialize instead
+    /// of racing. Confirm recovery via [`Self::connection_stats`].
     ///
     /// # Errors
     ///

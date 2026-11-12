@@ -10,9 +10,11 @@ use std::{
 };
 
 use crate::{
-    capture::{AudioKind, FrameFree, FrameSyncAudioFree, Guard, VideoKind},
+    capture::{
+        AudioKind, FrameFree, FrameSyncAudioFree, Guard, RecvAudioGuard, RecvMetadataGuard,
+        VideoKind,
+    },
     framesync::AudioInputFormat,
-    recv_guard::{RecvAudioGuard, RecvMetadataGuard},
     sys::{self, bindings::*},
     Error, FourCc, FrameRate, Rejected, Result, SdkTimestamp, Timecode,
 };
@@ -5787,7 +5789,7 @@ mod tests {
     /// Test that AudioFrameRef::new rejects unknown FourCC
     #[test]
     fn test_audioframeref_unknown_fourcc() {
-        use crate::recv_guard::RecvAudioGuard;
+        use crate::capture::RecvAudioGuard;
 
         let num_samples = 1024;
         let num_channels = 2;
@@ -5829,7 +5831,7 @@ mod tests {
     /// Test that AudioFrameRef::new accepts known FourCC and stores validated format
     #[test]
     fn test_audioframeref_known_fourcc() {
-        use crate::recv_guard::RecvAudioGuard;
+        use crate::capture::RecvAudioGuard;
 
         let num_samples = 1024;
         let num_channels = 2;

@@ -25,12 +25,13 @@ use super::{
 };
 use crate::{
     frames::ValidatedVideoLayout,
+    receiver::PacketAttached,
     runtime::ProcessLifetimeRuntime,
     sys::{
         advanced::{native, ReceiveAllocators},
         bindings::*,
     },
-    Error, FourCc, MediaTypes, MetadataFrame, PixelFormat, Receiver, Rejected, Result,
+    Error, FourCc, MediaTypes, PixelFormat, RawCapture, Receiver, ReceiverMode, Rejected, Result,
     SettingChange, StreamTier,
 };
 
@@ -823,16 +824,8 @@ impl AllocatorService {
         self,
         receiver: Receiver,
     ) -> std::result::Result<AllocatedReceiver, Rejected<Receiver>> {
-        match self.runtime.ndi().table::<ReceiveAllocators>() {
-            Ok(table) => Ok(AllocatedReceiver {
-                receiver: Some(receiver),
-                table,
-                video_token: None,
-                audio_token: None,
-                _service: self,
-            }),
-            Err(error) => Err(Rejected::new(error, receiver)),
-        }
+        self.allocation(receiver)
+            .map(|inner| AllocatedReceiver { inner })
     }
 
     /// Take a packet receiver so that its allocators can be set.
@@ -844,12 +837,29 @@ impl AllocatorService {
         self,
         receiver: PacketReceiver,
     ) -> std::result::Result<AllocatedPacketReceiver, Rejected<PacketReceiver>> {
-        match self.attach(receiver.receiver) {
+        match self.allocation(receiver.receiver) {
             Ok(inner) => Ok(AllocatedPacketReceiver {
                 inner,
                 _thread_affinity: std::marker::PhantomData,
             }),
             Err(rejected) => Err(rejected.map(PacketReceiver::from_receiver)),
+        }
+    }
+
+    /// Take `receiver`, in any mode, with no allocator of its own set yet.
+    fn allocation<M: ReceiverMode>(
+        self,
+        receiver: Receiver<M>,
+    ) -> std::result::Result<Allocation<M>, Rejected<Receiver<M>>> {
+        match self.runtime.ndi().table::<ReceiveAllocators>() {
+            Ok(table) => Ok(Allocation {
+                receiver: Some(receiver),
+                table,
+                video_token: None,
+                audio_token: None,
+                _service: self,
+            }),
+            Err(error) => Err(Rejected::new(error, receiver)),
         }
     }
 }
@@ -859,11 +869,17 @@ impl AllocatorService {
 /// It keeps the packet receiver's threading rule: it is used from the thread
 /// that owns it, one call at a time, so it is neither [`Send`] nor [`Sync`].
 /// [`into_packet_receiver`](Self::into_packet_receiver) gives the receiver
-/// back on that same thread.
+/// back on that same thread. [`receiver`](Self::receiver) reaches the
+/// receiver's controls, as [`PacketReceiver::receiver`] does, and
+/// [`set_stream_tier`](Self::set_stream_tier) and
+/// [`set_streams`](Self::set_streams) the two that borrow it exclusively.
+/// There is no `receiver_mut`: the allocators are installed on this
+/// receiver's native instance, so it is never lent out mutably, where it
+/// could be swapped for another packet receiver's.
 pub struct AllocatedPacketReceiver {
-    inner: AllocatedReceiver,
+    inner: Allocation<PacketAttached>,
     // The thread restriction of the PacketReceiver this was made from, which
-    // would otherwise be lost: an AllocatedReceiver is Send and Sync.
+    // would otherwise be lost: a Receiver is Send and Sync.
     _thread_affinity: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
@@ -878,49 +894,9 @@ impl AllocatedPacketReceiver {
         PacketReceiver::capture_from(self.inner.receiver(), timeout)
     }
 
-    /// Receive video into memory from `policy`; see
-    /// [`AllocatedReceiver::set_video_allocator`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`AllocatedReceiver::set_video_allocator`].
-    pub fn set_video_allocator<P: ReceiveAllocator>(
-        &mut self,
-        policy: P,
-    ) -> std::result::Result<(), Rejected<P>> {
-        self.inner.set_video_allocator(policy)
-    }
-
-    /// Receive audio into memory from `policy`; see
-    /// [`AllocatedReceiver::set_audio_allocator`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`AllocatedReceiver::set_audio_allocator`].
-    pub fn set_audio_allocator<P: ReceiveAllocator>(
-        &mut self,
-        policy: P,
-    ) -> std::result::Result<(), Rejected<P>> {
-        self.inner.set_audio_allocator(policy)
-    }
-
-    /// Return to the SDK's own video memory.
-    pub fn reset_video_allocator(&mut self) {
-        self.inner.reset_video_allocator();
-    }
-
-    /// Return to the SDK's own audio memory.
-    pub fn reset_audio_allocator(&mut self) {
-        self.inner.reset_audio_allocator();
-    }
-
-    /// Ask the source for a keyframe; see [`Receiver::request_keyframe`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`Receiver::request_keyframe`].
-    pub fn request_keyframe(&self) -> Result<()> {
-        self.inner.receiver().request_keyframe()
+    /// The receiver, for its controls; see [`PacketReceiver::receiver`].
+    pub fn receiver(&self) -> &Receiver<PacketAttached> {
+        self.inner.receiver()
     }
 
     /// Switch between the source's program and preview streams; see
@@ -942,13 +918,40 @@ impl AllocatedPacketReceiver {
         self.inner.receiver_mut().set_streams(streams)
     }
 
-    /// Send metadata upstream, to the source; see [`Receiver::send_metadata`].
+    /// Receive video into memory from `policy`; see
+    /// [`AllocatedReceiver::set_video_allocator`].
     ///
     /// # Errors
     ///
-    /// As for [`Receiver::send_metadata`].
-    pub fn send_metadata(&self, metadata: &MetadataFrame) -> Result<()> {
-        self.inner.receiver().send_metadata(metadata)
+    /// As for [`AllocatedReceiver::set_video_allocator`].
+    pub fn set_video_allocator<P: ReceiveAllocator>(
+        &mut self,
+        policy: P,
+    ) -> std::result::Result<(), Rejected<P>> {
+        self.inner.set_allocator(Stream::Video, policy)
+    }
+
+    /// Receive audio into memory from `policy`; see
+    /// [`AllocatedReceiver::set_audio_allocator`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`AllocatedReceiver::set_audio_allocator`].
+    pub fn set_audio_allocator<P: ReceiveAllocator>(
+        &mut self,
+        policy: P,
+    ) -> std::result::Result<(), Rejected<P>> {
+        self.inner.set_allocator(Stream::Audio, policy)
+    }
+
+    /// Return to the SDK's own video memory.
+    pub fn reset_video_allocator(&mut self) {
+        self.inner.install(Stream::Video, None);
+    }
+
+    /// Return to the SDK's own audio memory.
+    pub fn reset_audio_allocator(&mut self) {
+        self.inner.install(Stream::Audio, None);
     }
 
     /// Return to the SDK's own memory and give the packet receiver back.
@@ -1000,23 +1003,13 @@ enum Stream {
 /// # }
 /// ```
 pub struct AllocatedReceiver {
-    // `None` only once `into_receiver` has taken it.
-    receiver: Option<Receiver>,
-    table: &'static ReceiveAllocators,
-    video_token: Option<usize>,
-    audio_token: Option<usize>,
-    // The promise that the runtime outlives every callback registered here.
-    _service: AllocatorService,
+    inner: Allocation<RawCapture>,
 }
 
 impl AllocatedReceiver {
     /// The receiver, for capturing and control.
     pub fn receiver(&self) -> &Receiver {
-        self.receiver.as_ref().expect("receiver owned")
-    }
-
-    fn receiver_mut(&mut self) -> &mut Receiver {
-        self.receiver.as_mut().expect("receiver owned")
+        self.inner.receiver()
     }
 
     /// Receive video into memory from `policy`.
@@ -1030,7 +1023,7 @@ impl AllocatedReceiver {
         &mut self,
         policy: P,
     ) -> std::result::Result<(), Rejected<P>> {
-        self.set_allocator(Stream::Video, policy)
+        self.inner.set_allocator(Stream::Video, policy)
     }
 
     /// Receive audio into memory from `policy`.
@@ -1042,7 +1035,50 @@ impl AllocatedReceiver {
         &mut self,
         policy: P,
     ) -> std::result::Result<(), Rejected<P>> {
-        self.set_allocator(Stream::Audio, policy)
+        self.inner.set_allocator(Stream::Audio, policy)
+    }
+
+    /// Return to the SDK's own video memory.
+    pub fn reset_video_allocator(&mut self) {
+        self.inner.install(Stream::Video, None);
+    }
+
+    /// Return to the SDK's own audio memory.
+    pub fn reset_audio_allocator(&mut self) {
+        self.inner.install(Stream::Audio, None);
+    }
+
+    /// Return to the SDK's own memory and give the receiver back.
+    pub fn into_receiver(self) -> Receiver {
+        self.inner.into_receiver()
+    }
+}
+
+/// A receiver in mode `M` and the allocators set on it: what
+/// [`AllocatedReceiver`] and [`AllocatedPacketReceiver`] share.
+///
+/// Dropping it, or taking the receiver back, returns the receiver to the
+/// SDK's own memory first. The receiver itself may live on afterwards, in a
+/// [`RecvAdvertiser`](crate::discovery::RecvAdvertiser) registration: the
+/// allocations it still holds are then freed through the token-keyed registry,
+/// which outlives every receiver.
+struct Allocation<M: ReceiverMode> {
+    // `None` only once `into_receiver` has taken it.
+    receiver: Option<Receiver<M>>,
+    table: &'static ReceiveAllocators,
+    video_token: Option<usize>,
+    audio_token: Option<usize>,
+    // The promise that the runtime outlives every callback registered here.
+    _service: AllocatorService,
+}
+
+impl<M: ReceiverMode> Allocation<M> {
+    fn receiver(&self) -> &Receiver<M> {
+        self.receiver.as_ref().expect("receiver owned")
+    }
+
+    fn receiver_mut(&mut self) -> &mut Receiver<M> {
+        self.receiver.as_mut().expect("receiver owned")
     }
 
     fn set_allocator<P: ReceiveAllocator>(
@@ -1053,16 +1089,6 @@ impl AllocatedReceiver {
         let token = registry().register(policy)?;
         self.install(stream, Some(token));
         Ok(())
-    }
-
-    /// Return to the SDK's own video memory.
-    pub fn reset_video_allocator(&mut self) {
-        self.install(Stream::Video, None);
-    }
-
-    /// Return to the SDK's own audio memory.
-    pub fn reset_audio_allocator(&mut self) {
-        self.install(Stream::Audio, None);
     }
 
     /// Register generation `token` (or the SDK's own allocator) for `stream`
@@ -1106,18 +1132,22 @@ impl AllocatedReceiver {
     }
 
     /// Return to the SDK's own memory and give the receiver back.
-    pub fn into_receiver(mut self) -> Receiver {
-        self.reset_video_allocator();
-        self.reset_audio_allocator();
+    fn into_receiver(mut self) -> Receiver<M> {
+        self.reset();
         self.receiver.take().expect("receiver owned")
+    }
+
+    /// Return to the SDK's own memory for both streams.
+    fn reset(&mut self) {
+        self.install(Stream::Video, None);
+        self.install(Stream::Audio, None);
     }
 }
 
-impl Drop for AllocatedReceiver {
+impl<M: ReceiverMode> Drop for Allocation<M> {
     fn drop(&mut self) {
         if self.receiver.is_some() {
-            self.reset_video_allocator();
-            self.reset_audio_allocator();
+            self.reset();
         }
     }
 }
@@ -1287,6 +1317,7 @@ unsafe extern "C" fn audio_free(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::StreamTier;
     #[test]
     fn native_allocation_formats_preserve_protection_and_decoded_formats() {
         use crate::advanced::packets::PROTECTED;
