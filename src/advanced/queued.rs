@@ -228,7 +228,7 @@ impl CallbackState {
         ready
             .try_reserve_exact(options.frames)
             .map_err(unavailable)?;
-        Ok(Box::new(Self {
+        let state = Box::new(Self {
             state: Mutex::new(State {
                 in_flight,
                 ready,
@@ -238,7 +238,15 @@ impl CallbackState {
             }),
             changed: Condvar::new(),
             protocol_error: AtomicBool::new(false),
-        }))
+        });
+        // Where the standard library allocates a mutex's or condition
+        // variable's operating-system object on first use, as it does on
+        // macOS, that first use must not be the SDK's thread reporting a
+        // completion, which would then allocate. Use both once here, on the
+        // thread creating the queue.
+        drop(state.state.lock());
+        state.changed.notify_all();
+        Ok(state)
     }
 
     /// Record that the SDK has finished with the frame whose data is at
