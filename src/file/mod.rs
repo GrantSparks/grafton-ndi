@@ -235,7 +235,12 @@ impl FileRuntimeOptions {
 #[derive(Clone)]
 pub struct FileApi {
     runtime: &'static sys::FileRuntime,
-    // Absent only when the entry points are test doubles, which need no runtime.
+    /// Keeps the NDI runtime initialized.
+    #[cfg(not(test))]
+    _ndi: Ndi,
+    /// In a unit-test build, the API of a library of test doubles has none:
+    /// it reaches no runtime. Every other API keeps one, as in other builds.
+    #[cfg(test)]
     _ndi: Option<Ndi>,
 }
 
@@ -268,6 +273,9 @@ impl FileApi {
         let runtime = sys::select_file(ndi.info(), ndi.api(), options.library_path.as_deref())?;
         Ok(Self {
             runtime,
+            #[cfg(not(test))]
+            _ndi: ndi.clone(),
+            #[cfg(test)]
             _ndi: Some(ndi.clone()),
         })
     }

@@ -587,6 +587,24 @@ impl Budget {
     }
 }
 
+/// Copy the Discovery Server endpoint a listener reports: `None` for a null
+/// pointer, or for a string with no terminator within
+/// [`MAX_SDK_STRING_BYTES`], and bytes that are not UTF-8 replaced with
+/// U+FFFD.
+///
+/// # Safety
+///
+/// A non-null `url` must be readable byte by byte until either its first NUL
+/// or [`MAX_SDK_STRING_BYTES`] bytes have been read.
+unsafe fn endpoint(url: *const c_char) -> Option<String> {
+    if url.is_null() {
+        return None;
+    }
+    // SAFETY: forwarded to the caller's obligation for a non-null pointer.
+    let bytes = unsafe { bounded_sdk_text(url, MAX_SDK_STRING_BYTES) }?;
+    Some(String::from_utf8_lossy(bytes).into_owned())
+}
+
 /// A native listener and the strings its creation settings point to.
 struct Listener<A: ListenerApi> {
     instance: A::Instance,
@@ -695,13 +713,9 @@ impl<A: ListenerApi> Listener<A> {
     fn server_url(&self) -> Option<String> {
         // SAFETY: the listener instance is live for this borrow.
         let url = unsafe { self.api.server_url(self.instance) };
-        if url.is_null() {
-            return None;
-        }
         // SAFETY: a non-null result is a NUL-terminated string the SDK keeps
-        // for the listener's lifetime.
-        let url = unsafe { CStr::from_ptr(url) };
-        Some(url.to_string_lossy().into_owned())
+        // for the listener's lifetime, which this borrow is within.
+        unsafe { endpoint(url) }
     }
     fn wait_for_changes(&mut self, timeout: Duration) -> Result<bool> {
         let timeout = to_ms_checked(timeout)?;
@@ -856,6 +870,16 @@ macro_rules! listener_methods {
         }
         /// The Discovery Server endpoint the listener uses, when the SDK
         /// reports one.
+        ///
+        /// `None` when the SDK reports none, and also when what it reports
+        /// is no string of less than 4 MiB, the most this crate reads from
+        /// one SDK string. No endpoint is that long, and the value is for
+        /// display only: the listener does not depend on it and the crate
+        /// never passes it back to the SDK. So a value that cannot be read
+        /// is reported as no value, rather than as an error that every
+        /// caller of this getter would have to handle. Bytes that are not
+        /// UTF-8 are replaced with U+FFFD, as in the other text a listener
+        /// reports.
         pub fn server_url(&self) -> Option<String> {
             self.inner.server_url()
         }
@@ -1197,6 +1221,32 @@ mod tests {
                 panic!("a string larger than the budget must be refused");
             };
             assert!(reason.contains("16 MiB"), "{reason}");
+        }
+    }
+    #[test]
+    fn an_endpoint_is_read_only_up_to_the_string_limit() {
+        let mut longest = vec![b'x'; MAX_SDK_STRING_BYTES];
+        longest[MAX_SDK_STRING_BYTES - 1] = 0;
+        // Its terminator lies just past the limit, so the scan never reaches
+        // it; nothing past the limit is read.
+        let mut too_long = vec![b'x'; MAX_SDK_STRING_BYTES + 1];
+        too_long[MAX_SDK_STRING_BYTES] = 0;
+        // SAFETY: every non-null pointer is a live NUL-terminated string.
+        unsafe {
+            assert_eq!(endpoint(ptr::null()), None);
+            assert_eq!(
+                endpoint(c"192.0.2.1:5959".as_ptr()).as_deref(),
+                Some("192.0.2.1:5959")
+            );
+            assert_eq!(
+                endpoint(c"host-\xff:5959".as_ptr()).as_deref(),
+                Some("host-\u{fffd}:5959")
+            );
+            assert_eq!(
+                endpoint(longest.as_ptr().cast()).map(|url| url.len()),
+                Some(MAX_SDK_STRING_BYTES - 1)
+            );
+            assert_eq!(endpoint(too_long.as_ptr().cast()), None);
         }
     }
     #[test]
