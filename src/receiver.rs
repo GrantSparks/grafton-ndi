@@ -5,22 +5,20 @@
 //! The receiver can monitor connection status changes:
 //!
 //! ```no_run
-//! # use grafton_ndi::{NDI, Receiver, ReceiverEvent, ReceiverOptions, ReceiverBandwidth, Source};
+//! # use grafton_ndi::{Ndi, Receiver, ReceiverEvent, ReceiverOptions, ReceiverBandwidth, Source};
 //! # use std::time::Duration;
 //! # fn main() -> Result<(), grafton_ndi::Error> {
-//! # let ndi = NDI::new()?;
-//! # let source = Source::default();
+//! # let ndi = Ndi::new()?;
+//! # let source = Source::new("CAMERA (Program)");
 //! // In real usage, obtain the source from Finder::find_sources().
-//! let options = ReceiverOptions::builder(source)
-//!     .bandwidth(ReceiverBandwidth::MetadataOnly)
-//!     .build();
+//! let options = ReceiverOptions::new(source).bandwidth(ReceiverBandwidth::MetadataOnly);
 //! let receiver = Receiver::new(&ndi, &options)?;
 //!
 //! // Poll for status changes
 //! if let Some(ReceiverEvent::StatusChanged(status)) =
 //!     receiver.poll_event(Duration::from_millis(1000))?
 //! {
-//!     println!("Active connections: {}", status.connections);
+//!     println!("Active connections: {}", status.connections());
 //! }
 //! # Ok(())
 //! # }
@@ -48,7 +46,7 @@ use crate::{
     finder::{RawSource, Source},
     sys::{self, bindings::*},
     timeout::Deadline,
-    Error, MetadataFrame, Result, NDI,
+    Error, MetadataFrame, Ndi, Result,
 };
 
 /// A string the receiver API returned, released when dropped.
@@ -58,35 +56,44 @@ struct RecvStringGuard<'a> {
     strings: &'a sys::ReceiverStrings,
 }
 impl RecvStringGuard<'_> {
-    /// Copy the string, failing with [`Error::InvalidUtf8`] when it is not UTF-8.
-    fn copy(&self) -> Result<Option<String>> {
-        // SDK-returned strings are readable and NUL terminated. Reuse the
-        // bounded UTF-8 validator; this guard releases even on validation error.
-        let layout = unsafe { crate::frames::validate_frame_metadata(self.pointer)? };
-        Ok(
-            unsafe { crate::frames::FrameMetadata::copy_from_raw_validated(self.pointer, layout) }
-                .map(crate::frames::FrameMetadata::into_string),
-        )
-    }
-
-    /// Copy the string, replacing invalid UTF-8 with U+FFFD.
+    /// The string's bytes before its terminator, or `None` for a null string.
     ///
-    /// For a value the SDK reports only once, where an error would lose it.
-    /// The scan for the terminator has the same bound as [`Self::copy`], and a
-    /// string without one within it is still an error.
-    fn copy_lossy(&self) -> Result<Option<String>> {
+    /// The scan for the terminator is bounded by
+    /// [`MAX_METADATA_BYTES`](crate::frames::MAX_METADATA_BYTES); a string
+    /// without one within it is an [`Error::UnexpectedSdkResult`].
+    fn bytes(&self) -> Result<Option<&[u8]>> {
         if self.pointer.is_null() {
             return Ok(None);
         }
         // SAFETY: the SDK returned a readable NUL-terminated string, which
         // this guard keeps allocated for as long as it is borrowed.
         let bytes = unsafe { crate::frames::bounded_sdk_text(self.pointer) }.ok_or_else(|| {
-            Error::InvalidFrame(format!(
+            Error::UnexpectedSdkResult(format!(
                 "SDK string is missing a NUL terminator within {} bytes",
                 crate::frames::MAX_METADATA_BYTES
             ))
         })?;
-        Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
+        Ok(Some(bytes))
+    }
+
+    /// Copy the string, failing with [`Error::InvalidUtf8`] when it is not UTF-8.
+    fn copy(&self) -> Result<Option<String>> {
+        self.bytes()?
+            .map(|bytes| {
+                std::str::from_utf8(bytes)
+                    .map(str::to_owned)
+                    .map_err(|error| Error::InvalidUtf8(error.to_string()))
+            })
+            .transpose()
+    }
+
+    /// Copy the string, replacing invalid UTF-8 with U+FFFD.
+    ///
+    /// For a value the SDK reports only once, where an error would lose it.
+    fn copy_lossy(&self) -> Result<Option<String>> {
+        Ok(self
+            .bytes()?
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned()))
     }
 }
 impl Drop for RecvStringGuard<'_> {
@@ -109,13 +116,13 @@ fn receiver_delay(millis: i32) -> Result<Duration> {
         .filter(|millis| *millis <= 2000)
         .map(Duration::from_millis)
         .ok_or_else(|| {
-            Error::InvalidConfiguration(format!("SDK returned invalid receive delay: {millis} ms"))
+            Error::UnexpectedSdkResult(format!("SDK returned invalid receive delay: {millis} ms"))
         })
 }
 
 fn receiver_delay_millis(delay: Duration) -> Result<i32> {
     if delay > Duration::from_secs(2) {
-        return Err(Error::InvalidConfiguration(
+        return Err(Error::InvalidInput(
             "receive delay must not exceed two seconds".into(),
         ));
     }
@@ -123,14 +130,13 @@ fn receiver_delay_millis(delay: Duration) -> Result<i32> {
     Ok(delay.as_nanos().div_ceil(1_000_000) as i32)
 }
 
-/// Retry policy configuration for frame capture operations.
-///
-/// This struct encapsulates the timing parameters for the retry loop used by
-/// the reliable [`Capture::capture`] verb across all frame kinds.
+/// The timing of the retry loop behind every receiver capture, for all frame
+/// kinds and for both [`Capture`] verbs and the async ones.
 struct RetryPolicy {
     /// Timeout per individual capture attempt.
     poll_interval: Duration,
-    /// Sleep duration between retry attempts to avoid busy-waiting.
+    /// Pause after an attempt that returned before its timeout without a
+    /// frame, so that early returns do not busy-wait.
     sleep_between: Duration,
 }
 
@@ -143,24 +149,17 @@ impl Default for RetryPolicy {
     }
 }
 
-/// Generic retry helper for frame capture operations.
+/// Retry `capture_fn` until it returns a frame or `deadline` is spent.
 ///
-/// This function encapsulates the retry logic that handles NDI SDK synchronization
-/// behavior during initial connection. The first few capture calls may return
-/// immediately while the stream synchronizes.
+/// The SDK returns from a capture early, without a frame, while a new
+/// connection synchronizes and whenever it reports a status or source change,
+/// so one SDK call does not wait out the caller's timeout. Each attempt is
+/// handed at most the policy's poll interval of what is left of the budget,
+/// which may have started before this call.
 ///
-/// # Parameters
-///
-/// - `deadline`: The caller's budget, which may have started before this call.
-/// - `policy`: Retry timing configuration.
-/// - `capture_fn`: A closure that attempts to capture a frame with a given timeout.
-///
-/// # Returns
-///
-/// - `Ok(T)`: The captured frame on success.
-/// - `Err(Error::FrameTimeout)`: If no frame is captured within the budget; its
-///   `elapsed` counts from the start of the budget.
-fn retry_capture<T, F>(deadline: Deadline, policy: &RetryPolicy, capture_fn: F) -> Result<T>
+/// Returns `Ok(None)` once the budget is spent without a frame. An error from
+/// an attempt ends the loop.
+fn retry_capture<T, F>(deadline: Deadline, policy: &RetryPolicy, capture_fn: F) -> Result<Option<T>>
 where
     F: FnMut(Duration) -> Result<Option<T>>,
 {
@@ -173,45 +172,61 @@ where
     )
 }
 
+/// Run `attempt` under the default [`RetryPolicy`] until it returns a value or
+/// `deadline` is spent, handing each attempt what is left of `deadline`
+/// narrowed to the policy's poll interval: the one capture loop behind every
+/// receiver capture, the Advanced packet receivers' included.
+pub(crate) fn capture_within<T>(
+    deadline: Deadline,
+    mut attempt: impl FnMut(Deadline) -> Result<Option<T>>,
+) -> Result<Option<T>> {
+    retry_capture(deadline, &RetryPolicy::default(), |poll| {
+        attempt(deadline.within(poll))
+    })
+}
+
 /// [`retry_capture`] for a budget of `budget`, with `elapsed` reporting the
 /// time since the budget started and `sleep` pausing between attempts.
 ///
 /// The first attempt is made even when nothing is left of the budget, so a
 /// zero budget makes exactly one attempt, with a zero timeout.
+///
+/// Only an attempt that returned before its own timeout is followed by the
+/// policy's pause: that is the SDK's early return, which would otherwise spin.
+/// An attempt that waited out its timeout is followed at once by the next, so
+/// that a frame arriving in between is not delayed by a pause.
 fn retry_capture_with_clock<T, F, E, S>(
     budget: Duration,
     policy: &RetryPolicy,
     mut capture_fn: F,
     mut elapsed: E,
     mut sleep: S,
-) -> Result<T>
+) -> Result<Option<T>>
 where
     F: FnMut(Duration) -> Result<Option<T>>,
     E: FnMut() -> Duration,
     S: FnMut(Duration),
 {
-    let mut poll = policy.poll_interval.min(budget.saturating_sub(elapsed()));
-    // The time left of the budget, or the timeout once none is.
-    let mut time_left = |attempts| {
-        let elapsed = elapsed();
-        let left = budget.saturating_sub(elapsed);
-        if left.is_zero() {
-            Err(Error::FrameTimeout { attempts, elapsed })
-        } else {
-            Ok(left)
-        }
-    };
-    let mut attempts = 0;
+    let time_left =
+        |spent: Duration| Some(budget.saturating_sub(spent)).filter(|left| !left.is_zero());
+    let mut started = elapsed();
+    let mut poll = policy.poll_interval.min(budget.saturating_sub(started));
     loop {
-        attempts += 1;
         if let Some(frame) = capture_fn(poll)? {
-            return Ok(frame);
+            return Ok(Some(frame));
         }
-        let pause = policy.sleep_between.min(time_left(attempts)?);
-        if !pause.is_zero() {
-            sleep(pause);
+        let mut now = elapsed();
+        if now.saturating_sub(started) < poll {
+            if let Some(left) = time_left(now) {
+                sleep(policy.sleep_between.min(left));
+                now = elapsed();
+            }
         }
-        poll = policy.poll_interval.min(time_left(attempts)?);
+        let Some(left) = time_left(now) else {
+            return Ok(None);
+        };
+        started = now;
+        poll = policy.poll_interval.min(left);
     }
 }
 
@@ -219,7 +234,7 @@ fn validate_ptz_value(name: &str, value: f32, min: f32, max: f32) -> Result<()> 
     if value.is_finite() && (min..=max).contains(&value) {
         Ok(())
     } else {
-        Err(Error::InvalidConfiguration(format!(
+        Err(Error::InvalidInput(format!(
             "{name} must be finite and within {min}..={max}"
         )))
     }
@@ -229,67 +244,26 @@ fn validate_ptz_preset(preset: u8) -> Result<i32> {
     if preset <= 99 {
         Ok(i32::from(preset))
     } else {
-        Err(Error::InvalidConfiguration(
+        Err(Error::InvalidInput(
             "PTZ preset must be within 0..=99".into(),
         ))
     }
 }
 
+/// Send one PTZ command, the SDK function `$func` with arguments `$arg`, to
+/// the source `$ptz` controls.
 macro_rules! ptz_command {
-    ($self:expr, $func:ident) => {
-        // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
-        if unsafe { $self.core.sdk().$func($self.core.instance) } {
+    ($ptz:expr, $func:ident $(, $arg:expr)*) => {{
+        // SAFETY: the receiver instance is live for the handle's borrow, and
+        // every argument is a plain value.
+        if unsafe { $ptz.core.sdk().$func($ptz.core.instance $(, $arg)*) } {
             Ok(())
         } else {
             Err(Error::NativeOperationFailed {
                 operation: stringify!($func),
             })
         }
-    };
-    ($self:expr, $func:ident, $param:expr) => {
-        // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
-        if unsafe { $self.core.sdk().$func($self.core.instance, $param) } {
-            Ok(())
-        } else {
-            Err(Error::NativeOperationFailed {
-                operation: stringify!($func),
-            })
-        }
-    };
-    ($self:expr, $func:ident, $param1:expr, $param2:expr) => {
-        // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
-        if unsafe {
-            $self
-                .core
-                .sdk()
-                .$func($self.core.instance, $param1, $param2)
-        } {
-            Ok(())
-        } else {
-            Err(Error::NativeOperationFailed {
-                operation: stringify!($func),
-            })
-        }
-    };
-    ($self:expr, $func:ident, $param1:expr, $param2:expr, $param3:expr) => {
-        // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
-        if unsafe {
-            $self
-                .core
-                .sdk()
-                .$func($self.core.instance, $param1, $param2, $param3)
-        } {
-            Ok(())
-        } else {
-            Err(Error::NativeOperationFailed {
-                operation: stringify!($func),
-            })
-        }
-    };
+    }};
 }
 
 /// Operational color formats for received video frames.
@@ -304,20 +278,20 @@ macro_rules! ptz_command {
 /// expressions should include a wildcard arm.
 ///
 /// Choose an explicit operational value such as [`ReceiverColorFormat::Fastest`],
-/// [`ReceiverColorFormat::Best`], [`ReceiverColorFormat::RGBX_RGBA`], or
-/// [`ReceiverColorFormat::BGRX_BGRA`] for receiver configuration.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// [`ReceiverColorFormat::Best`], [`ReceiverColorFormat::RgbxRgba`], or
+/// [`ReceiverColorFormat::BgrxBgra`] for receiver configuration.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ReceiverColorFormat {
     /// BGRX for opaque video and BGRA when the source has alpha.
     #[default]
-    BGRX_BGRA,
+    BgrxBgra,
     /// UYVY for opaque video and BGRA when the source has alpha.
-    UYVY_BGRA,
+    UyvyBgra,
     /// RGBX for opaque video and RGBA when the source has alpha.
-    RGBX_RGBA,
+    RgbxRgba,
     /// UYVY for opaque video and RGBA when the source has alpha.
-    UYVY_RGBA,
+    UyvyRgba,
     /// The format the SDK can deliver with the least conversion work.
     /// Individual fields are delivered even if video fields were disabled.
     Fastest,
@@ -330,28 +304,17 @@ pub enum ReceiverColorFormat {
     Best444,
 }
 
-impl From<ReceiverColorFormat> for NDIlib_recv_color_format_e {
-    fn from(format: ReceiverColorFormat) -> Self {
-        match format {
-            ReceiverColorFormat::BGRX_BGRA => {
-                NDIlib_recv_color_format_e_NDIlib_recv_color_format_BGRX_BGRA
-            }
-            ReceiverColorFormat::UYVY_BGRA => {
-                NDIlib_recv_color_format_e_NDIlib_recv_color_format_UYVY_BGRA
-            }
-            ReceiverColorFormat::RGBX_RGBA => {
-                NDIlib_recv_color_format_e_NDIlib_recv_color_format_RGBX_RGBA
-            }
-            ReceiverColorFormat::UYVY_RGBA => {
-                NDIlib_recv_color_format_e_NDIlib_recv_color_format_UYVY_RGBA
-            }
-            ReceiverColorFormat::Fastest => {
-                NDIlib_recv_color_format_e_NDIlib_recv_color_format_fastest
-            }
-            ReceiverColorFormat::Best => NDIlib_recv_color_format_e_NDIlib_recv_color_format_best,
-            ReceiverColorFormat::Best444 => {
-                NDIlib_recv_color_format_e_NDIlib_recv_color_format_best_444
-            }
+impl ReceiverColorFormat {
+    /// The SDK's value for this format.
+    const fn to_sdk(self) -> NDIlib_recv_color_format_e {
+        match self {
+            Self::BgrxBgra => NDIlib_recv_color_format_e_NDIlib_recv_color_format_BGRX_BGRA,
+            Self::UyvyBgra => NDIlib_recv_color_format_e_NDIlib_recv_color_format_UYVY_BGRA,
+            Self::RgbxRgba => NDIlib_recv_color_format_e_NDIlib_recv_color_format_RGBX_RGBA,
+            Self::UyvyRgba => NDIlib_recv_color_format_e_NDIlib_recv_color_format_UYVY_RGBA,
+            Self::Fastest => NDIlib_recv_color_format_e_NDIlib_recv_color_format_fastest,
+            Self::Best => NDIlib_recv_color_format_e_NDIlib_recv_color_format_best,
+            Self::Best444 => NDIlib_recv_color_format_e_NDIlib_recv_color_format_best_444,
         }
     }
 }
@@ -370,7 +333,7 @@ impl From<ReceiverColorFormat> for NDIlib_recv_color_format_e {
 /// Choose an explicit operational value such as [`ReceiverBandwidth::Highest`],
 /// [`ReceiverBandwidth::Lowest`], [`ReceiverBandwidth::AudioOnly`], or
 /// [`ReceiverBandwidth::MetadataOnly`] for receiver configuration.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ReceiverBandwidth {
     /// Receive metadata only.
@@ -388,42 +351,55 @@ pub enum ReceiverBandwidth {
     VideoOnlyHighest,
 }
 
-impl From<ReceiverBandwidth> for NDIlib_recv_bandwidth_e {
-    fn from(bandwidth: ReceiverBandwidth) -> Self {
-        match bandwidth {
-            ReceiverBandwidth::MetadataOnly => {
-                NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_metadata_only
-            }
-            ReceiverBandwidth::AudioOnly => {
-                NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_audio_only
-            }
-            ReceiverBandwidth::Lowest => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest,
-            ReceiverBandwidth::Highest => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
-            ReceiverBandwidth::VideoOnlyLowest => {
+impl ReceiverBandwidth {
+    /// The SDK's value for this mode.
+    const fn to_sdk(self) -> NDIlib_recv_bandwidth_e {
+        match self {
+            Self::MetadataOnly => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_metadata_only,
+            Self::AudioOnly => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_audio_only,
+            Self::Lowest => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest,
+            Self::Highest => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
+            Self::VideoOnlyLowest => {
                 NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_video_only_lowest
             }
-            ReceiverBandwidth::VideoOnlyHighest => {
+            Self::VideoOnlyHighest => {
                 NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_video_only_highest
             }
         }
     }
 }
 
-/// Configuration for creating a [`Receiver`].
+/// Configuration for creating a [`Receiver`]: the source it connects to and
+/// how it delivers that source's media.
 ///
-/// Build one with [`ReceiverOptions::builder`].
+/// [`new`](Self::new) starts from the defaults; the presets start from
+/// settings suited to one use. Every setter replaces one setting.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use grafton_ndi::{Ndi, Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions, Source};
+/// # fn main() -> Result<(), grafton_ndi::Error> {
+/// # let ndi = Ndi::new()?;
+/// # let source = Source::new("CAMERA (Program)");
+/// // In real usage, obtain the source from Finder::find_sources().
+/// let options = ReceiverOptions::new(source)
+///     .color_format(ReceiverColorFormat::UyvyBgra)
+///     .bandwidth(ReceiverBandwidth::Lowest)
+///     .name("Multiviewer");
+/// let receiver = Receiver::new(&ndi, &options)?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct ReceiverOptions {
-    /// The source to connect to when the receiver is created.
-    pub source_to_connect_to: Source,
-    /// The pixel formats the receiver delivers.
-    pub color_format: ReceiverColorFormat,
-    /// Which streams are received and at what quality.
-    pub bandwidth: ReceiverBandwidth,
-    /// Deliver interlaced video as individual fields instead of whole frames.
-    pub allow_video_fields: bool,
-    /// The receiver's own name; the SDK generates one when this is `None`.
-    pub ndi_recv_name: Option<String>,
+    source: Source,
+    color_format: ReceiverColorFormat,
+    bandwidth: ReceiverBandwidth,
+    allow_video_fields: bool,
+    name: Option<String>,
+    #[cfg(feature = "advanced")]
+    pub(crate) config: Option<crate::advanced::AdvancedConfig>,
 }
 
 #[repr(C)]
@@ -434,7 +410,175 @@ pub(crate) struct RawRecvCreateV3 {
 }
 
 impl ReceiverOptions {
-    pub(crate) fn validate_runtime(&self, ndi: &NDI) -> Result<()> {
+    /// Receive from `source` with the default settings:
+    /// [`ReceiverColorFormat::BgrxBgra`], [`ReceiverBandwidth::Highest`],
+    /// video fields allowed, and a receiver name the SDK chooses.
+    pub fn new(source: Source) -> Self {
+        Self {
+            source,
+            color_format: ReceiverColorFormat::BgrxBgra,
+            bandwidth: ReceiverBandwidth::Highest,
+            allow_video_fields: true,
+            name: None,
+            #[cfg(feature = "advanced")]
+            config: None,
+        }
+    }
+
+    /// Settings for capturing snapshots: RGB color, low bandwidth, whole
+    /// frames.
+    ///
+    /// Suited to image export, thumbnails and analysis pipelines, and to
+    /// networks with little bandwidth to spare:
+    /// - color format [`ReceiverColorFormat::RgbxRgba`], which the image
+    ///   encoders take;
+    /// - bandwidth [`ReceiverBandwidth::Lowest`], the source's preview stream;
+    /// - video fields not allowed, so interlaced video arrives as whole frames.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{Ndi, Finder, FinderOptions, ReceiverOptions, Receiver};
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let ndi = Ndi::new()?;
+    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
+    /// # finder.wait_for_sources(Duration::from_secs(1))?;
+    /// # let sources = finder.current_sources()?;
+    /// let options = ReceiverOptions::snapshot_preset(sources[0].clone()).name("Snapshot Receiver");
+    /// let receiver = Receiver::new(&ndi, &options)?;
+    ///
+    /// // Capture and encode in one line (requires image-encoding feature)
+    /// #[cfg(feature = "image-encoding")]
+    /// if let Some(frame) = receiver.video().capture(Duration::from_secs(5))? {
+    ///     let png_bytes = frame.encode_png()?;
+    ///     std::fs::write("snapshot.png", &png_bytes)?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn snapshot_preset(source: Source) -> Self {
+        Self::new(source)
+            .color_format(ReceiverColorFormat::RgbxRgba)
+            .bandwidth(ReceiverBandwidth::Lowest)
+            .allow_video_fields(false)
+    }
+
+    /// Settings for full-quality video processing: RGB color, full
+    /// bandwidth, interlaced video as fields.
+    ///
+    /// Suited to recording, broadcast and analysis that needs every pixel:
+    /// - color format [`ReceiverColorFormat::RgbxRgba`];
+    /// - bandwidth [`ReceiverBandwidth::Highest`], the source's program stream;
+    /// - video fields allowed, so interlaced video keeps its fields.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{Ndi, Finder, FinderOptions, ReceiverOptions, Receiver};
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = Ndi::new()?;
+    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
+    /// # finder.wait_for_sources(Duration::from_secs(1))?;
+    /// # let sources = finder.current_sources()?;
+    /// let options =
+    ///     ReceiverOptions::high_quality_preset(sources[0].clone()).name("High Quality Receiver");
+    /// let receiver = Receiver::new(&ndi, &options)?;
+    ///
+    /// // Capture full quality frames
+    /// if let Some(frame) = receiver.video().capture(Duration::from_secs(5))? {
+    ///     println!("Captured {width}x{height} frame", width = frame.width(), height = frame.height());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn high_quality_preset(source: Source) -> Self {
+        Self::new(source)
+            .color_format(ReceiverColorFormat::RgbxRgba)
+            .bandwidth(ReceiverBandwidth::Highest)
+            .allow_video_fields(true)
+    }
+
+    /// Settings for monitoring a connection and controlling the source,
+    /// without its video or audio.
+    ///
+    /// Suited to connection tracking, tally and PTZ control:
+    /// - bandwidth [`ReceiverBandwidth::MetadataOnly`];
+    /// - the default color format, which no frame uses;
+    /// - video fields not allowed.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{Ndi, Finder, FinderOptions, ReceiverEvent, ReceiverOptions, Receiver};
+    /// # use std::time::Duration;
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = Ndi::new()?;
+    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
+    /// # finder.wait_for_sources(Duration::from_secs(1))?;
+    /// # let sources = finder.current_sources()?;
+    /// let options = ReceiverOptions::monitoring_preset(sources[0].clone()).name("Status Monitor");
+    /// let receiver = Receiver::new(&ndi, &options)?;
+    ///
+    /// // Poll for status changes
+    /// if let Some(ReceiverEvent::StatusChanged(status)) =
+    ///     receiver.poll_event(Duration::from_millis(1000))?
+    /// {
+    ///     println!("Active connections: {}", status.connections());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn monitoring_preset(source: Source) -> Self {
+        Self::new(source)
+            .bandwidth(ReceiverBandwidth::MetadataOnly)
+            .allow_video_fields(false)
+    }
+
+    /// Set the pixel formats the receiver delivers video in.
+    #[must_use]
+    pub fn color_format(mut self, color_format: ReceiverColorFormat) -> Self {
+        self.color_format = color_format;
+        self
+    }
+
+    /// Set which of the source's streams the receiver takes, and at what
+    /// quality.
+    #[must_use]
+    pub fn bandwidth(mut self, bandwidth: ReceiverBandwidth) -> Self {
+        self.bandwidth = bandwidth;
+        self
+    }
+
+    /// Set whether interlaced video is delivered as individual fields rather
+    /// than whole frames.
+    #[must_use]
+    pub fn allow_video_fields(mut self, allow: bool) -> Self {
+        self.allow_video_fields = allow;
+        self
+    }
+
+    /// Set the receiver's own name, which the SDK otherwise chooses.
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Create the receiver with this per-instance Advanced SDK configuration,
+    /// which it keeps for as long as it lives.
+    ///
+    /// [`Receiver::new`] then needs an Advanced runtime, and a build with the
+    /// Advanced SDK.
+    #[cfg(feature = "advanced")]
+    #[must_use]
+    pub fn config(mut self, config: crate::advanced::AdvancedConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    pub(crate) fn validate_runtime(&self, ndi: &Ndi) -> Result<()> {
         if matches!(self.color_format, ReceiverColorFormat::Best444) {
             ndi.require_feature(RuntimeFeature::ReceiveBest444)?;
         }
@@ -447,254 +591,24 @@ impl ReceiverOptions {
         Ok(())
     }
 
-    /// Convert to raw format for FFI use
-    ///
-    /// # Safety
-    ///
-    /// The returned RawRecvCreateV3 struct uses #[repr(C)] to guarantee C-compatible layout
-    /// for safe FFI interop with the NDI SDK.
+    /// The native creation settings, with the strings they point to.
     pub(crate) fn to_raw(&self) -> Result<RawRecvCreateV3> {
-        let source = self.source_to_connect_to.to_raw()?;
-        let name = self
-            .ndi_recv_name
-            .as_ref()
-            .map(|n| CString::new(n.clone()))
-            .transpose()
-            .map_err(Error::InvalidCString)?;
-
+        let source = self.source.to_raw()?;
+        let name = self.name.as_deref().map(CString::new).transpose()?;
         let p_ndi_recv_name = name.as_ref().map_or(ptr::null(), |n| n.as_ptr());
         let source_raw = source.raw;
 
         Ok(RawRecvCreateV3 {
             raw: NDIlib_recv_create_v3_t {
                 source_to_connect_to: source_raw,
-                color_format: self.color_format.into(),
-                bandwidth: self.bandwidth.into(),
+                color_format: self.color_format.to_sdk(),
+                bandwidth: self.bandwidth.to_sdk(),
                 allow_video_fields: self.allow_video_fields,
                 p_ndi_recv_name,
             },
             _source: source,
             _name: name,
         })
-    }
-
-    /// Create a builder for configuring a receiver
-    pub fn builder(source: Source) -> ReceiverOptionsBuilder {
-        ReceiverOptionsBuilder::new(source)
-    }
-}
-
-impl Default for ReceiverOptions {
-    /// The options [`ReceiverOptions::builder`] builds for [`Source::default`]
-    /// without any setting changed.
-    fn default() -> Self {
-        Self::builder(Source::default()).build()
-    }
-}
-
-/// Builder for configuring a ReceiverOptions with ergonomic method chaining
-#[derive(Debug, Clone)]
-pub struct ReceiverOptionsBuilder {
-    source_to_connect_to: Source,
-    color_format: Option<ReceiverColorFormat>,
-    bandwidth: Option<ReceiverBandwidth>,
-    allow_video_fields: Option<bool>,
-    ndi_recv_name: Option<String>,
-}
-
-impl ReceiverOptionsBuilder {
-    /// Create a new builder with the specified source
-    pub fn new(source: Source) -> Self {
-        Self {
-            source_to_connect_to: source,
-            color_format: None,
-            bandwidth: None,
-            allow_video_fields: None,
-            ndi_recv_name: None,
-        }
-    }
-
-    /// Preset for capturing snapshots (low resolution, RGBA, lowest bandwidth).
-    ///
-    /// This preset is optimized for:
-    /// - Image export and snapshot capture
-    /// - AI/ML processing pipelines
-    /// - Thumbnail generation
-    /// - Low bandwidth environments
-    ///
-    /// Configuration:
-    /// - Color format: `RGBX_RGBA` (compatible with image encoding)
-    /// - Bandwidth: `Lowest` (reduces resolution and bitrate)
-    /// - Video fields: Disabled (progressive frames only)
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptionsBuilder, Receiver};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let ndi = NDI::new()?;
-    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.wait_for_sources(Duration::from_secs(1))?;
-    /// # let sources = finder.current_sources()?;
-    /// let options = ReceiverOptionsBuilder::snapshot_preset(sources[0].clone())
-    ///     .name("Snapshot Receiver")
-    ///     .build();
-    /// let receiver = Receiver::new(&ndi, &options)?;
-    ///
-    /// // Capture and encode in one line (requires image-encoding feature)
-    /// #[cfg(feature = "image-encoding")]
-    /// {
-    ///     let frame = receiver.video().capture(Duration::from_secs(5))?;
-    ///     let png_bytes = frame.encode_png()?;
-    ///     std::fs::write("snapshot.png", &png_bytes)?;
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn snapshot_preset(source: Source) -> Self {
-        Self::new(source)
-            .color(ReceiverColorFormat::RGBX_RGBA)
-            .bandwidth(ReceiverBandwidth::Lowest)
-            .allow_video_fields(false)
-    }
-
-    /// Preset for high-quality video processing (full resolution, highest bandwidth).
-    ///
-    /// This preset is optimized for:
-    /// - Professional video processing workflows
-    /// - Recording and archival
-    /// - Real-time video analysis requiring full quality
-    /// - Broadcasting and production
-    ///
-    /// Configuration:
-    /// - Color format: `RGBX_RGBA` (uncompressed, compatible with most tools)
-    /// - Bandwidth: `Highest` (full resolution and bitrate)
-    /// - Video fields: Enabled (supports interlaced sources)
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverOptionsBuilder, Receiver};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.wait_for_sources(Duration::from_secs(1))?;
-    /// # let sources = finder.current_sources()?;
-    /// let options = ReceiverOptionsBuilder::high_quality_preset(sources[0].clone())
-    ///     .name("High Quality Receiver")
-    ///     .build();
-    /// let receiver = Receiver::new(&ndi, &options)?;
-    ///
-    /// // Capture full quality frames
-    /// let frame = receiver.video().capture(Duration::from_secs(5))?;
-    /// println!("Captured {width}x{height} frame", width = frame.width(), height = frame.height());
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn high_quality_preset(source: Source) -> Self {
-        Self::new(source)
-            .color(ReceiverColorFormat::RGBX_RGBA)
-            .bandwidth(ReceiverBandwidth::Highest)
-            .allow_video_fields(true)
-    }
-
-    /// Preset for metadata and connection monitoring only (no video/audio).
-    ///
-    /// This preset is optimized for:
-    /// - Connection status tracking
-    /// - PTZ control applications
-    /// - Minimal bandwidth overhead
-    ///
-    /// Configuration:
-    /// - Bandwidth: `MetadataOnly` (no video or audio data)
-    /// - Color format: Default (not used for metadata-only)
-    /// - Video fields: Disabled (not applicable)
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{NDI, Finder, FinderOptions, ReceiverEvent, ReceiverOptionsBuilder, Receiver};
-    /// # use std::time::Duration;
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-    /// # finder.wait_for_sources(Duration::from_secs(1))?;
-    /// # let sources = finder.current_sources()?;
-    /// let options = ReceiverOptionsBuilder::monitoring_preset(sources[0].clone())
-    ///     .name("Status Monitor")
-    ///     .build();
-    /// let receiver = Receiver::new(&ndi, &options)?;
-    ///
-    /// // Poll for status changes
-    /// if let Some(ReceiverEvent::StatusChanged(status)) =
-    ///     receiver.poll_event(Duration::from_millis(1000))?
-    /// {
-    ///     println!("Active connections: {}", status.connections);
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn monitoring_preset(source: Source) -> Self {
-        Self::new(source)
-            .bandwidth(ReceiverBandwidth::MetadataOnly)
-            .allow_video_fields(false)
-    }
-
-    /// Set the color format for received video
-    #[must_use]
-    pub fn color(mut self, fmt: ReceiverColorFormat) -> Self {
-        self.color_format = Some(fmt);
-        self
-    }
-
-    /// Set the bandwidth mode for the receiver
-    #[must_use]
-    pub fn bandwidth(mut self, bw: ReceiverBandwidth) -> Self {
-        self.bandwidth = Some(bw);
-        self
-    }
-
-    /// Configure whether to allow video fields
-    #[must_use]
-    pub fn allow_video_fields(mut self, allow: bool) -> Self {
-        self.allow_video_fields = Some(allow);
-        self
-    }
-
-    /// Set the name for this receiver
-    #[must_use]
-    pub fn name<S: Into<String>>(mut self, name: S) -> Self {
-        self.ndi_recv_name = Some(name.into());
-        self
-    }
-
-    /// Build the receiver options
-    ///
-    /// This method is infallible and simply applies defaults for any unset options.
-    /// To create a `Receiver`, pass the resulting `ReceiverOptions` to `Receiver::new()`.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{NDI, ReceiverOptions, Receiver, Source};
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = Source::default();
-    /// let options = ReceiverOptions::builder(source).build();
-    /// let receiver = Receiver::new(&ndi, &options)?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn build(self) -> ReceiverOptions {
-        ReceiverOptions {
-            source_to_connect_to: self.source_to_connect_to,
-            color_format: self.color_format.unwrap_or(ReceiverColorFormat::BGRX_BGRA),
-            bandwidth: self.bandwidth.unwrap_or(ReceiverBandwidth::Highest),
-            allow_video_fields: self.allow_video_fields.unwrap_or(true),
-            ndi_recv_name: self.ndi_recv_name,
-        }
     }
 }
 
@@ -738,7 +652,7 @@ impl<M: ReceiverMode + std::panic::UnwindSafe> std::panic::UnwindSafe for Receiv
 
 pub(crate) struct ReceiverCore {
     pub(crate) instance: NDIlib_recv_instance_t,
-    pub(crate) _ndi: NDI,
+    pub(crate) _ndi: Ndi,
     source: Source,
     /// Serializes connection changes against in-flight captures.
     ///
@@ -762,16 +676,21 @@ impl Receiver {
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedCapability`] when the options need a mode the
-    /// selected runtime lacks, an invalid-configuration error for a name or
-    /// source the SDK cannot be given, and [`Error::NativeOperationFailed`] when
-    /// the SDK creates no receiver.
-    pub fn new(ndi: &NDI, create: &ReceiverOptions) -> Result<Self> {
+    /// selected runtime lacks, or carry an Advanced configuration that the
+    /// runtime or this build cannot take; [`Error::InvalidCString`] for a name
+    /// or source that contains a NUL byte; and [`Error::NativeOperationFailed`]
+    /// when the SDK creates no receiver.
+    pub fn new(ndi: &Ndi, options: &ReceiverOptions) -> Result<Self> {
+        #[cfg(feature = "advanced")]
+        if let Some(config) = &options.config {
+            return Self::new_configured(ndi, options, config);
+        }
         // SAFETY: the SDK's receiver creation returns null or a fresh receiver
         // that nothing else owns, and the settings outlive the call.
         unsafe {
             Self::create(
                 ndi,
-                create,
+                options,
                 "NDIlib_recv_create_v3",
                 #[cfg(feature = "advanced")]
                 None,
@@ -790,7 +709,7 @@ impl Receiver {
     /// `create` returns null or a live receiver of `ndi`'s runtime, made from
     /// the settings it was handed, that nothing else owns.
     pub(crate) unsafe fn create(
-        ndi: &NDI,
+        ndi: &Ndi,
         options: &ReceiverOptions,
         operation: &'static str,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
@@ -806,7 +725,7 @@ impl Receiver {
             core: Arc::new(ReceiverCore {
                 instance,
                 _ndi: ndi.clone(),
-                source: options.source_to_connect_to.clone(),
+                source: options.source.clone(),
                 capture_guard: RwLock::new(()),
                 pending_status: AtomicBool::new(false),
                 pending_source: AtomicBool::new(false),
@@ -821,14 +740,13 @@ impl Receiver {
 
     /// Capture **video** frames from this receiver.
     ///
-    /// Returns a [`Capture`] view whose verbs cover the three capture styles:
+    /// Returns a [`Capture`] view with two verbs, which both wait up to their
+    /// timeout for a frame:
     ///
-    /// - [`capture`](Capture::capture) — reliable owned capture that retries
-    ///   across the NDI SDK's initial-sync warm-up.
-    /// - [`try_capture`](Capture::try_capture) — a single owned poll, `Ok(None)`
-    ///   when no frame is ready.
-    /// - [`try_capture_ref`](Capture::try_capture_ref) — a single zero-copy poll
-    ///   borrowing the SDK buffer in place.
+    /// - [`capture`](Capture::capture) copies the frame into an owned
+    ///   [`VideoFrame`](crate::VideoFrame);
+    /// - [`capture_ref`](Capture::capture_ref) borrows the SDK's buffer in
+    ///   place.
     ///
     /// Video frames may carry per-row padding (e.g. RGBX/BGRX); see
     /// [`VideoFrame`](crate::VideoFrame) for how to read them correctly.
@@ -836,19 +754,18 @@ impl Receiver {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
+    /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let options = ReceiverOptions::builder(source).build();
-    /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// // Reliable owned capture
-    /// let frame = receiver.video().capture(Duration::from_secs(5))?;
-    /// println!("{}x{}", frame.width(), frame.height());
+    /// # let ndi = Ndi::new()?;
+    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)")))?;
+    /// // An owned copy
+    /// if let Some(frame) = receiver.video().capture(Duration::from_secs(5))? {
+    ///     println!("{}x{}", frame.width(), frame.height());
+    /// }
     ///
     /// // Zero-copy borrow
-    /// if let Some(frame) = receiver.video().try_capture_ref(Duration::from_secs(1))? {
+    /// if let Some(frame) = receiver.video().capture_ref(Duration::from_secs(1))? {
     ///     for plane in frame.planes() {
     ///         for row in plane.rows() {
     ///             println!("{} active bytes in place", row.len());
@@ -875,17 +792,30 @@ impl<M: ReceiverMode> Receiver<M> {
     /// Set native video buffering, in the range zero through two seconds.
     ///
     /// Positive fractional milliseconds round up. Values above two seconds are
-    /// rejected instead of silently clamped. `Ok(true)` means the effective delay
-    /// changed; `Ok(false)` means it already had this value. Delay is independent
-    /// of audio buffering and stacks with FrameSync correction.
-    pub fn set_video_delay(&self, delay: Duration) -> Result<bool> {
+    /// rejected instead of silently clamped. [`SettingChange::Unchanged`]
+    /// means the delay already had this value. Delay is independent of audio
+    /// buffering and stacks with FrameSync correction.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] for a delay above two seconds, and
+    /// [`Error::UnsupportedCapability`] without
+    /// [`RuntimeFeature::ReceiveDelay`].
+    pub fn set_video_delay(&self, delay: Duration) -> Result<SettingChange> {
         let millis = receiver_delay_millis(delay)?;
         let table = self.core.delay()?;
         // SAFETY: the receiver instance is live for this borrow.
-        Ok(unsafe { table.NDIlib_recv_set_video_delay(self.core.instance, millis) })
+        let changed = unsafe { table.NDIlib_recv_set_video_delay(self.core.instance, millis) };
+        Ok(SettingChange::from_sdk(changed))
     }
 
     /// Return the effective native video delay. Requires receiver-delay support.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedCapability`] without
+    /// [`RuntimeFeature::ReceiveDelay`], and [`Error::UnexpectedSdkResult`]
+    /// when the SDK reports a delay outside 0 to 2000 ms.
     pub fn video_delay(&self) -> Result<Duration> {
         let table = self.core.delay()?;
         // SAFETY: the receiver instance is live for this borrow.
@@ -895,15 +825,24 @@ impl<M: ReceiverMode> Receiver<M> {
     /// Set native audio buffering with the same rounding/range as [`Self::set_video_delay`].
     ///
     /// Equal audio and video delays preserve their relative timing; different
-    /// values deliberately offset the streams. False means unchanged, not failure.
-    pub fn set_audio_delay(&self, delay: Duration) -> Result<bool> {
+    /// values deliberately offset the streams.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::set_video_delay`].
+    pub fn set_audio_delay(&self, delay: Duration) -> Result<SettingChange> {
         let millis = receiver_delay_millis(delay)?;
         let table = self.core.delay()?;
         // SAFETY: the receiver instance is live for this borrow.
-        Ok(unsafe { table.NDIlib_recv_set_audio_delay(self.core.instance, millis) })
+        let changed = unsafe { table.NDIlib_recv_set_audio_delay(self.core.instance, millis) };
+        Ok(SettingChange::from_sdk(changed))
     }
 
     /// Return the effective native audio delay. Requires receiver-delay support.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::video_delay`].
     pub fn audio_delay(&self) -> Result<Duration> {
         let table = self.core.delay()?;
         // SAFETY: the receiver instance is live for this borrow.
@@ -1021,270 +960,85 @@ impl<M: ReceiverMode> Receiver<M> {
         self.core.poll_event(timeout)
     }
 
-    /// Publish this receiver's program/preview tally upstream.
+    /// Publish this receiver's program and preview tally to its source.
     ///
-    /// Returns the SDK's status flag unchanged. SDK implementations may report
-    /// success while disconnected; use [`Self::is_connected`] to check the
-    /// connection. The SDK retains tally state for future connections.
-    pub fn set_tally(&self, tally: &Tally) -> bool {
-        // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
+    /// The SDK keeps the state and sends it to every source the receiver
+    /// connects to, so it can be set before a connection and survives a
+    /// reconnect.
+    pub fn set_tally(&self, tally: Tally) {
+        // `Processing.NDI.Recv.h`: the flag is false when nothing is
+        // connected, and the state is sent the moment something connects, so
+        // it reports no failure.
+        // SAFETY: the receiver instance is live for this borrow, and the
+        // tally outlives the synchronous call.
         unsafe {
             self.core
                 .sdk()
-                .NDIlib_recv_set_tally(self.core.instance, &tally.to_raw())
-        }
+                .NDIlib_recv_set_tally(self.core.instance, &tally.to_sdk())
+        };
     }
 
-    /// Send metadata upstream and return the SDK's status flag unchanged.
+    /// Send metadata upstream, to the source this receiver is connected to.
     ///
-    /// This flag is not a connection query; use [`Self::is_connected`] for that.
-    pub fn send_metadata(&self, metadata: &MetadataFrame) -> bool {
+    /// # Errors
+    ///
+    /// [`Error::NotConnected`] when the receiver is connected to no source,
+    /// so nothing was sent.
+    pub fn send_metadata(&self, metadata: &MetadataFrame) -> Result<()> {
         let raw = metadata.to_raw();
-        // The borrowed C string remains live through this synchronous SDK call.
-        // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
-        unsafe {
+        // SAFETY: the receiver instance is live for this borrow, and the
+        // borrowed C string outlives the synchronous call.
+        let sent = unsafe {
             self.core
                 .sdk()
                 .NDIlib_recv_send_metadata(self.core.instance, &raw)
+        };
+        // `Processing.NDI.Recv.h`: false means nothing is connected.
+        if sent {
+            Ok(())
+        } else {
+            Err(Error::NotConnected)
         }
     }
 
-    /// Return whether the connected source supports PTZ commands.
-    pub fn ptz_is_supported(&self) -> bool {
-        // SAFETY: the receiver instance is live for this borrow, and every pointer
-        // passed outlives the synchronous call.
-        unsafe {
-            self.core
-                .sdk()
-                .NDIlib_recv_ptz_is_supported(self.core.instance)
-        }
-    }
-
-    /// Recall preset `0..=99` at a finite speed within `0.0..=1.0`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
-    /// parameters, before issuing an SDK command.
-    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
-    pub fn ptz_recall_preset(&self, preset: u8, speed: f32) -> Result<()> {
-        let preset = validate_ptz_preset(preset)?;
-        validate_ptz_value("speed", speed, 0.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_recall_preset, preset, speed)
-    }
-
-    /// Set absolute zoom to a finite value within `0.0..=1.0`.
-    /// Zero is zoomed in; one is zoomed out.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
-    /// parameters, before issuing an SDK command.
-    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
-    pub fn ptz_zoom(&self, zoom_value: f32) -> Result<()> {
-        validate_ptz_value("zoom_value", zoom_value, 0.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_zoom, zoom_value)
-    }
-
-    /// Set zoom speed within `-1.0..=1.0` (finite).
-    /// Negative moves outward; positive moves inward.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
-    /// parameters, before issuing an SDK command.
-    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
-    pub fn ptz_zoom_speed(&self, zoom_speed: f32) -> Result<()> {
-        validate_ptz_value("zoom_speed", zoom_speed, -1.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_zoom_speed, zoom_speed)
-    }
-
-    /// Set finite pan and tilt positions within `-1.0..=1.0`.
-    /// Pan increases from left to right; tilt increases from bottom to top.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
-    /// parameters, before issuing an SDK command.
-    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
-    pub fn ptz_pan_tilt(&self, pan_value: f32, tilt_value: f32) -> Result<()> {
-        validate_ptz_value("pan_value", pan_value, -1.0, 1.0)?;
-        validate_ptz_value("tilt_value", tilt_value, -1.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_pan_tilt, pan_value, tilt_value)
-    }
-
-    /// Set finite pan and tilt speeds within `-1.0..=1.0`.
-    /// Positive pan moves left; positive tilt moves up. Zero stops motion.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
-    /// parameters, before issuing an SDK command.
-    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
-    pub fn ptz_pan_tilt_speed(&self, pan_speed: f32, tilt_speed: f32) -> Result<()> {
-        validate_ptz_value("pan_speed", pan_speed, -1.0, 1.0)?;
-        validate_ptz_value("tilt_speed", tilt_speed, -1.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_pan_tilt_speed, pan_speed, tilt_speed)
-    }
-
-    /// Store the current camera settings as preset `0..=99`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
-    /// parameters, before issuing an SDK command.
-    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
-    pub fn ptz_store_preset(&self, preset_no: u8) -> Result<()> {
-        let preset_no = validate_ptz_preset(preset_no)?;
-        ptz_command!(self, NDIlib_recv_ptz_store_preset, preset_no)
-    }
-
-    /// Enable automatic focus.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
-    pub fn ptz_auto_focus(&self) -> Result<()> {
-        ptz_command!(self, NDIlib_recv_ptz_auto_focus)
-    }
-
-    /// Set finite absolute focus within `0.0..=1.0`.
-    /// Zero focuses at infinity; one focuses as close as possible.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
-    /// parameters, before issuing an SDK command.
-    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
-    pub fn ptz_focus(&self, focus_value: f32) -> Result<()> {
-        validate_ptz_value("focus_value", focus_value, 0.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_focus, focus_value)
-    }
-
-    /// Set finite focus speed within `-1.0..=1.0`.
-    /// Negative focuses outward; positive focuses inward.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
-    /// parameters, before issuing an SDK command.
-    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
-    pub fn ptz_focus_speed(&self, focus_speed: f32) -> Result<()> {
-        validate_ptz_value("focus_speed", focus_speed, -1.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_focus_speed, focus_speed)
-    }
-
-    /// Enable automatic white balance.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
-    pub fn ptz_white_balance_auto(&self) -> Result<()> {
-        ptz_command!(self, NDIlib_recv_ptz_white_balance_auto)
-    }
-
-    /// Select the indoor white-balance preset.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
-    pub fn ptz_white_balance_indoor(&self) -> Result<()> {
-        ptz_command!(self, NDIlib_recv_ptz_white_balance_indoor)
-    }
-
-    /// Select the outdoor white-balance preset.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
-    pub fn ptz_white_balance_outdoor(&self) -> Result<()> {
-        ptz_command!(self, NDIlib_recv_ptz_white_balance_outdoor)
-    }
-
-    /// Set white balance from the current image.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
-    pub fn ptz_white_balance_oneshot(&self) -> Result<()> {
-        ptz_command!(self, NDIlib_recv_ptz_white_balance_oneshot)
-    }
-
-    /// Set finite red and blue white-balance levels within `0.0..=1.0`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
-    /// parameters, before issuing an SDK command.
-    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
-    pub fn ptz_white_balance_manual(&self, red: f32, blue: f32) -> Result<()> {
-        validate_ptz_value("red", red, 0.0, 1.0)?;
-        validate_ptz_value("blue", blue, 0.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_white_balance_manual, red, blue)
-    }
-
-    /// Enable automatic exposure.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
-    pub fn ptz_exposure_auto(&self) -> Result<()> {
-        ptz_command!(self, NDIlib_recv_ptz_exposure_auto)
-    }
-
-    /// Set finite exposure within `0.0..=1.0`, from dark to light.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
-    /// parameters, before issuing an SDK command.
-    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
-    pub fn ptz_exposure_manual(&self, exposure_level: f32) -> Result<()> {
-        validate_ptz_value("exposure_level", exposure_level, 0.0, 1.0)?;
-        ptz_command!(self, NDIlib_recv_ptz_exposure_manual, exposure_level)
-    }
-
-    /// Set finite iris, gain, and shutter-speed levels within `0.0..=1.0`.
-    /// Iris and gain increase from dark to light; shutter speed increases from slow to fast.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidConfiguration`] for out-of-range or non-finite
-    /// parameters, before issuing an SDK command.
-    /// Returns [`Error::NativeOperationFailed`] if the SDK rejects the command.
-    pub fn ptz_exposure_manual_v2(&self, iris: f32, gain: f32, shutter_speed: f32) -> Result<()> {
-        validate_ptz_value("iris", iris, 0.0, 1.0)?;
-        validate_ptz_value("gain", gain, 0.0, 1.0)?;
-        validate_ptz_value("shutter_speed", shutter_speed, 0.0, 1.0)?;
-        ptz_command!(
-            self,
-            NDIlib_recv_ptz_exposure_manual_v2,
-            iris,
-            gain,
-            shutter_speed
-        )
-    }
-
-    /// Capture **audio** frames from this receiver.
-    ///
-    /// Returns a [`Capture`] view; see [`Receiver::video`] for the three
-    /// capture verbs it exposes ([`capture`](Capture::capture),
-    /// [`try_capture`](Capture::try_capture),
-    /// [`try_capture_ref`](Capture::try_capture_ref)).
+    /// Control the pan, tilt, zoom, focus, white balance and exposure of the
+    /// connected source.
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
+    /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = Ndi::new()?;
+    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::monitoring_preset(Source::new("CAMERA (Program)")))?;
+    /// let ptz = receiver.ptz();
+    /// if ptz.is_supported() {
+    ///     ptz.zoom(0.5)?;
+    ///     ptz.pan_tilt(-0.25, 0.1)?;
+    ///     ptz.auto_focus()?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use = "the Ptz handle does nothing until a command is called"]
+    pub fn ptz(&self) -> Ptz<'_> {
+        Ptz { core: &self.core }
+    }
+
+    /// Capture **audio** frames from this receiver.
+    ///
+    /// Returns a [`Capture`] view; see [`Receiver::video`] for its two verbs,
+    /// [`capture`](Capture::capture) and [`capture_ref`](Capture::capture_ref).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let options = ReceiverOptions::builder(source).build();
-    /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// if let Some(audio) = receiver.audio().try_capture_ref(Duration::from_secs(1))? {
+    /// # let ndi = Ndi::new()?;
+    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)")))?;
+    /// if let Some(audio) = receiver.audio().capture_ref(Duration::from_secs(1))? {
     ///     println!("{} channels, {} samples", audio.num_channels(), audio.num_samples());
     /// }
     /// # Ok(())
@@ -1297,22 +1051,18 @@ impl<M: ReceiverMode> Receiver<M> {
 
     /// Capture **metadata** frames from this receiver.
     ///
-    /// Returns a [`Capture`] view; see [`Receiver::video`] for the three
-    /// capture verbs it exposes ([`capture`](Capture::capture),
-    /// [`try_capture`](Capture::try_capture),
-    /// [`try_capture_ref`](Capture::try_capture_ref)).
+    /// Returns a [`Capture`] view; see [`Receiver::video`] for its two verbs,
+    /// [`capture`](Capture::capture) and [`capture_ref`](Capture::capture_ref).
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
+    /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let options = ReceiverOptions::builder(source).build();
-    /// # let receiver = Receiver::new(&ndi, &options)?;
-    /// if let Some(meta) = receiver.metadata().try_capture(Duration::from_millis(100))? {
+    /// # let ndi = Ndi::new()?;
+    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)")))?;
+    /// if let Some(meta) = receiver.metadata().capture(Duration::from_millis(100))? {
     ///     println!("metadata: {}", meta.data());
     /// }
     /// # Ok(())
@@ -1332,12 +1082,10 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
+    /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let options = ReceiverOptions::builder(source).build();
-    /// # let receiver = Receiver::new(&ndi, &options)?;
+    /// # let ndi = Ndi::new()?;
+    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)")))?;
     /// if receiver.is_connected() {
     ///     println!("Still connected to source");
     /// } else {
@@ -1370,7 +1118,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// tearing down and rebuilding the receiver would incur.
     ///
     /// Liveness can be observed via [`Self::is_connected`] and
-    /// [`Self::connection_stats`] (`video_frames_received` resuming its
+    /// [`Self::connection_stats`] (`video_frames_received()` resuming its
     /// climb indicates frames are flowing again).
     ///
     /// # Thread safety
@@ -1411,14 +1159,12 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
+    /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let options = ReceiverOptions::builder(source).build();
-    /// # let receiver = Receiver::new(&ndi, &options)?;
+    /// # let ndi = Ndi::new()?;
+    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)")))?;
     /// let source = receiver.source();
-    /// println!("Original target: {name}", name = source.name);
+    /// println!("Original target: {name}", name = source.name());
     /// # Ok(())
     /// # }
     /// ```
@@ -1440,17 +1186,15 @@ impl<M: ReceiverMode> Receiver<M> {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, Receiver, ReceiverOptions, Source, SourceAddress};
+    /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let options = ReceiverOptions::builder(source).build();
-    /// # let receiver = Receiver::new(&ndi, &options)?;
+    /// # let ndi = Ndi::new()?;
+    /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)")))?;
     /// let stats = receiver.connection_stats();
-    /// println!("Connections: {connections}", connections = stats.connections);
+    /// println!("Connections: {connections}", connections = stats.connections());
     /// println!("Video frames: {received} (dropped: {dropped})",
-    ///          received = stats.video_frames_received,
-    ///          dropped = stats.video_frames_dropped);
+    ///          received = stats.video_frames_received(),
+    ///          dropped = stats.video_frames_dropped());
     /// println!("Frame drop rate: {rate:.2}%",
     ///          rate = stats.video_drop_percentage());
     /// # Ok(())
@@ -1546,19 +1290,15 @@ impl ReceiverCore {
         self.capture_guard.write()
     }
 
-    /// Single zero-copy poll backing every [`Capture::try_capture_ref`].
+    /// One SDK capture of kind `K` within `deadline`.
     ///
     /// Holds the shared capture guard for the duration of one
     /// `NDIlib_recv_capture_v3` call, so it runs concurrently with other
     /// captures but never overlaps a [`reconnect`](Receiver::reconnect).
-    fn capture_ref_kind<K: CaptureKind>(&self, timeout: Duration) -> Result<Option<K::Ref<'_>>> {
-        self.capture_ref_kind_until::<K>(Deadline::after(timeout)?)
-    }
-
-    fn capture_ref_kind_until<K: CaptureKind>(
-        &self,
-        deadline: Deadline,
-    ) -> Result<Option<K::Ref<'_>>> {
+    /// `None` when the guard was not free in time, or the SDK returned
+    /// without a frame of this kind; a notification it returned instead is
+    /// kept for [`Receiver::poll_event`].
+    fn poll_ref_until<K: CaptureKind>(&self, deadline: Deadline) -> Result<Option<K::Ref<'_>>> {
         let Some(_capture) = self.capture_lock_until(deadline) else {
             return Ok(None);
         };
@@ -1586,43 +1326,26 @@ impl ReceiverCore {
         }
     }
 
-    /// Single owned poll backing every [`Capture::try_capture`].
-    pub(crate) fn try_capture_kind<K: CaptureKind>(
+    /// The one capture loop, behind [`Capture::capture_ref`] and every owned
+    /// capture: SDK captures under the default [`RetryPolicy`] until one
+    /// delivers a frame of kind `K` or `deadline` is spent.
+    pub(crate) fn capture_ref_until<K: CaptureKind>(
         &self,
-        timeout: Duration,
-    ) -> Result<Option<K::Owned>> {
-        match self.capture_ref_kind::<K>(timeout)? {
-            Some(frame_ref) => Ok(Some(K::ref_to_owned(&frame_ref)?)),
-            None => Ok(None),
-        }
+        deadline: Deadline,
+    ) -> Result<Option<K::Ref<'_>>> {
+        capture_within(deadline, |attempt| self.poll_ref_until::<K>(attempt))
     }
 
-    pub(crate) fn try_capture_kind_until<K: CaptureKind>(
+    /// [`Self::capture_ref_until`], copied into an owned frame: behind
+    /// [`Capture::capture`] and the async receivers' capture.
+    pub(crate) fn capture_until<K: CaptureKind>(
         &self,
         deadline: Deadline,
     ) -> Result<Option<K::Owned>> {
-        match self.capture_ref_kind_until::<K>(deadline)? {
-            Some(frame_ref) => Ok(Some(K::ref_to_owned(&frame_ref)?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Retried owned capture backing every [`Capture::capture`].
-    ///
-    /// Polls [`try_capture_kind`](Self::try_capture_kind) under the default
-    /// [`RetryPolicy`], absorbing the SDK's initial-sync misses where it returns
-    /// `none` immediately instead of blocking for the full timeout.
-    pub(crate) fn capture_kind<K: CaptureKind>(&self, timeout: Duration) -> Result<K::Owned> {
-        self.capture_kind_until::<K>(Deadline::after(timeout)?)
-    }
-
-    pub(crate) fn capture_kind_until<K: CaptureKind>(
-        &self,
-        deadline: Deadline,
-    ) -> Result<K::Owned> {
-        retry_capture(deadline, &RetryPolicy::default(), |poll| {
-            self.try_capture_kind_until::<K>(deadline.within(poll))
-        })
+        self.capture_ref_until::<K>(deadline)?
+            .as_ref()
+            .map(K::ref_to_owned)
+            .transpose()
     }
 
     fn take_pending_status(&self) -> Option<ReceiverStatus> {
@@ -1700,31 +1423,31 @@ impl ReceiverCore {
 ///
 /// Created by [`Receiver::video`], [`Receiver::audio`], and
 /// [`Receiver::metadata`]. The view is a cheap borrow of the receiver and does
-/// nothing on its own — call one of its verbs to capture:
+/// nothing on its own; call one of its verbs to capture:
 ///
-/// - [`capture`](Self::capture) — reliable owned capture with built-in retry.
-///   **The primary method.** It absorbs the NDI SDK's initial-sync warm-up (the
-///   first few polls after connecting may return `none` immediately instead of
-///   blocking). It can be used in a continuous capture loop.
-/// - [`try_capture`](Self::try_capture) — a single owned poll; `Ok(None)` when
-///   no frame is ready. For manual polling where you handle timing yourself.
-/// - [`try_capture_ref`](Self::try_capture_ref) — a single zero-copy poll that
-///   borrows the SDK's buffer in place (no allocation, no memcpy). The
-///   recommended API for performance-critical, in-place processing: for a
-///   1920×1080 BGRA frame it avoids ~8.3 MB of copying per frame (~475 MB/s at
-///   60 fps). Convert to an owned frame with `to_owned` when you need to keep or
-///   send it.
+/// - [`capture`](Self::capture) copies the frame into an owned value that
+///   can be kept, sent or moved to another thread.
+/// - [`capture_ref`](Self::capture_ref) borrows the SDK's buffer in place,
+///   with no allocation and no copy. It is the one for in-place processing:
+///   for a 1920×1080 BGRA frame it avoids ~8.3 MB of copying per frame
+///   (~475 MB/s at 60 fps). Convert it with `try_to_owned` when you need to
+///   keep or send it.
 ///
-/// Media capture retains status notifications for [`Receiver::poll_event`],
-/// even when retries later time out.
+/// Both wait up to their timeout for a frame. The SDK returns from a capture
+/// early, without a frame, while a new connection synchronizes and whenever
+/// it reports a status or source change; both verbs capture again until a
+/// frame arrives, and return `Ok(None)` only once the whole timeout is spent.
+/// A status or source change they pass over is kept for
+/// [`Receiver::poll_event`].
 ///
-/// Every verb holds a shared capture guard for the duration of a single SDK
-/// call, so captures of different kinds run concurrently with each other but
-/// never overlap a [`Receiver::reconnect`]. Each timeout budget starts when the
-/// verb is called and includes waiting for that guard. A zero timeout never
-/// waits for the guard; if it is unavailable, no SDK capture is attempted.
-/// SDK calls and owned-frame copying may finish after the budget expires, so
-/// the timeout is not a strict wall-clock completion guarantee.
+/// Every SDK call holds a shared capture guard, so captures of different
+/// kinds run concurrently with each other but never overlap a
+/// [`Receiver::reconnect`]. Each timeout budget starts when the verb is
+/// called and includes waiting for that guard. A zero timeout makes one
+/// attempt and never waits for the guard; if it is unavailable, no SDK
+/// capture is attempted. SDK calls and owned-frame copying may finish after
+/// the budget expires, so the timeout is not a strict wall-clock completion
+/// guarantee.
 ///
 /// Only the ordinary receiver mode exposes a video view. FrameSync owns video
 /// capture until [`crate::FrameSync::into_receiver`] restores the ordinary mode.
@@ -1741,71 +1464,245 @@ impl<'rx, K: CaptureKind> Capture<'rx, K> {
         }
     }
 
-    /// Reliable owned capture: blocks up to `timeout`, retrying across the NDI
-    /// SDK's initial-sync warm-up.
+    /// Wait up to `timeout` for a frame and return an owned copy of it, or
+    /// `None` when none arrived in time.
     ///
-    /// `timeout` is a total retry budget; each individual SDK poll is capped to
-    /// the remaining budget, and [`Duration::ZERO`] performs one non-blocking
-    /// attempt, skipping the SDK call if the capture guard is unavailable.
-    /// Waiting for a reconnect lock consumes the same budget. The SDK itself may return after its requested timeout, so this
-    /// budget is not a strict wall-clock completion guarantee.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Total time to wait for a frame. Must not exceed
-    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
+    /// See [`Capture`] for how the timeout is spent; [`Duration::ZERO`]
+    /// makes one attempt without waiting.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::FrameTimeout`] if no frame arrives within `timeout`;
-    /// returns [`Error::InvalidConfiguration`] for an excessive timeout. SDK and frame-validation errors
-    /// propagate from the capture itself.
-    pub fn capture(&self, timeout: Duration) -> Result<K::Owned> {
-        self.rx.capture_kind::<K>(timeout)
+    /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`]
+    /// (~49.7 days), [`Error::CaptureFailed`] when the SDK reports a lost
+    /// connection, and the errors of validating and copying the frame.
+    pub fn capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
+        self.rx.capture_until::<K>(Deadline::after(timeout)?)
     }
 
-    /// Single owned poll: returns `Ok(None)` if no frame is available within
-    /// `timeout`.
-    ///
-    /// Prefer [`capture`](Self::capture) for reliable capture; this variant does
-    /// not retry the SDK's warm-up misses. The timeout includes waiting for a
-    /// reconnect lock; see [`Capture`] for the shared timeout contract.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Maximum time to wait for a frame. Must not exceed
-    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidConfiguration`] for an excessive timeout. SDK connection errors return
-    /// [`Error::CaptureFailed`]; malformed frame descriptors also return errors.
-    pub fn try_capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
-        self.rx.try_capture_kind::<K>(timeout)
-    }
-
-    /// Single zero-copy poll: returns a borrowed view of the SDK's buffer, or
-    /// `Ok(None)` if no frame is available within `timeout`.
+    /// Wait up to `timeout` for a frame and borrow the SDK's buffer in
+    /// place, or return `None` when none arrived in time.
     ///
     /// The returned reference borrows the [`Receiver`] (not this temporary
     /// view), so it may outlive the `Capture` while keeping the receiver
-    /// borrowed. The timeout includes waiting for a reconnect lock; see
-    /// [`Capture`] for the shared timeout contract.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Maximum time to wait for a frame. Must not exceed
-    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
+    /// borrowed. See [`Capture`] for how the timeout is spent.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidConfiguration`] for an excessive timeout. SDK connection errors return
-    /// [`Error::CaptureFailed`]; malformed frame descriptors also return errors.
-    pub fn try_capture_ref(&self, timeout: Duration) -> Result<Option<K::Ref<'rx>>> {
+    /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`]
+    /// (~49.7 days), [`Error::CaptureFailed`] when the SDK reports a lost
+    /// connection, and the errors of validating the frame.
+    pub fn capture_ref(&self, timeout: Duration) -> Result<Option<K::Ref<'rx>>> {
         // Bind through `'rx` so the returned borrow is tied to the receiver, not
         // to this short-lived view.
         let rx: &'rx ReceiverCore = self.rx;
-        rx.capture_ref_kind::<K>(timeout)
+        rx.capture_ref_until::<K>(Deadline::after(timeout)?)
+    }
+}
+
+/// Pan, tilt, zoom, focus, white balance and exposure control of the source a
+/// [`Receiver`] is connected to, from [`Receiver::ptz`].
+///
+/// A value outside its range, or not finite, is refused with
+/// [`Error::InvalidInput`] before anything is sent. A command the SDK does
+/// not send is reported as [`Error::NativeOperationFailed`].
+#[derive(Clone, Copy)]
+pub struct Ptz<'rx> {
+    core: &'rx ReceiverCore,
+}
+
+impl Ptz<'_> {
+    /// Whether the connected source accepts PTZ commands.
+    #[must_use]
+    pub fn is_supported(&self) -> bool {
+        // SAFETY: the receiver instance is live for the handle's borrow.
+        unsafe {
+            self.core
+                .sdk()
+                .NDIlib_recv_ptz_is_supported(self.core.instance)
+        }
+    }
+
+    /// Recall preset `0..=99`, moving at `speed` within `0.0..=1.0`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Ptz`].
+    pub fn recall_preset(&self, preset: u8, speed: f32) -> Result<()> {
+        let preset = validate_ptz_preset(preset)?;
+        validate_ptz_value("speed", speed, 0.0, 1.0)?;
+        ptz_command!(self, NDIlib_recv_ptz_recall_preset, preset, speed)
+    }
+
+    /// Store the current camera settings as preset `0..=99`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Ptz`].
+    pub fn store_preset(&self, preset: u8) -> Result<()> {
+        let preset = validate_ptz_preset(preset)?;
+        ptz_command!(self, NDIlib_recv_ptz_store_preset, preset)
+    }
+
+    /// Set the absolute zoom within `0.0..=1.0`: zero is zoomed in, one is
+    /// zoomed out.
+    ///
+    /// # Errors
+    ///
+    /// See [`Ptz`].
+    pub fn zoom(&self, zoom: f32) -> Result<()> {
+        validate_ptz_value("zoom", zoom, 0.0, 1.0)?;
+        ptz_command!(self, NDIlib_recv_ptz_zoom, zoom)
+    }
+
+    /// Set the zoom speed within `-1.0..=1.0`: negative zooms out, positive
+    /// zooms in, zero stops.
+    ///
+    /// # Errors
+    ///
+    /// See [`Ptz`].
+    pub fn zoom_speed(&self, speed: f32) -> Result<()> {
+        validate_ptz_value("zoom speed", speed, -1.0, 1.0)?;
+        ptz_command!(self, NDIlib_recv_ptz_zoom_speed, speed)
+    }
+
+    /// Set the absolute pan and tilt within `-1.0..=1.0`: pan increases from
+    /// left to right, tilt from bottom to top.
+    ///
+    /// # Errors
+    ///
+    /// See [`Ptz`].
+    pub fn pan_tilt(&self, pan: f32, tilt: f32) -> Result<()> {
+        validate_ptz_value("pan", pan, -1.0, 1.0)?;
+        validate_ptz_value("tilt", tilt, -1.0, 1.0)?;
+        ptz_command!(self, NDIlib_recv_ptz_pan_tilt, pan, tilt)
+    }
+
+    /// Set the pan and tilt speeds within `-1.0..=1.0`: positive pans left
+    /// and tilts up, zero stops.
+    ///
+    /// # Errors
+    ///
+    /// See [`Ptz`].
+    pub fn pan_tilt_speed(&self, pan_speed: f32, tilt_speed: f32) -> Result<()> {
+        validate_ptz_value("pan speed", pan_speed, -1.0, 1.0)?;
+        validate_ptz_value("tilt speed", tilt_speed, -1.0, 1.0)?;
+        ptz_command!(self, NDIlib_recv_ptz_pan_tilt_speed, pan_speed, tilt_speed)
+    }
+
+    /// Focus automatically.
+    ///
+    /// # Errors
+    ///
+    /// See [`Ptz`].
+    pub fn auto_focus(&self) -> Result<()> {
+        ptz_command!(self, NDIlib_recv_ptz_auto_focus)
+    }
+
+    /// Set the absolute focus within `0.0..=1.0`: zero focuses at infinity,
+    /// one as close as possible.
+    ///
+    /// # Errors
+    ///
+    /// See [`Ptz`].
+    pub fn focus(&self, focus: f32) -> Result<()> {
+        validate_ptz_value("focus", focus, 0.0, 1.0)?;
+        ptz_command!(self, NDIlib_recv_ptz_focus, focus)
+    }
+
+    /// Set the focus speed within `-1.0..=1.0`: negative focuses farther,
+    /// positive nearer, zero stops.
+    ///
+    /// # Errors
+    ///
+    /// See [`Ptz`].
+    pub fn focus_speed(&self, speed: f32) -> Result<()> {
+        validate_ptz_value("focus speed", speed, -1.0, 1.0)?;
+        ptz_command!(self, NDIlib_recv_ptz_focus_speed, speed)
+    }
+
+    /// Balance white automatically.
+    ///
+    /// # Errors
+    ///
+    /// See [`Ptz`].
+    pub fn white_balance_auto(&self) -> Result<()> {
+        ptz_command!(self, NDIlib_recv_ptz_white_balance_auto)
+    }
+
+    /// Select the indoor white-balance preset.
+    ///
+    /// # Errors
+    ///
+    /// See [`Ptz`].
+    pub fn white_balance_indoor(&self) -> Result<()> {
+        ptz_command!(self, NDIlib_recv_ptz_white_balance_indoor)
+    }
+
+    /// Select the outdoor white-balance preset.
+    ///
+    /// # Errors
+    ///
+    /// See [`Ptz`].
+    pub fn white_balance_outdoor(&self) -> Result<()> {
+        ptz_command!(self, NDIlib_recv_ptz_white_balance_outdoor)
+    }
+
+    /// Balance white once, from the current image.
+    ///
+    /// # Errors
+    ///
+    /// See [`Ptz`].
+    pub fn white_balance_oneshot(&self) -> Result<()> {
+        ptz_command!(self, NDIlib_recv_ptz_white_balance_oneshot)
+    }
+
+    /// Set the red and blue white-balance levels within `0.0..=1.0`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Ptz`].
+    pub fn white_balance_manual(&self, red: f32, blue: f32) -> Result<()> {
+        validate_ptz_value("red", red, 0.0, 1.0)?;
+        validate_ptz_value("blue", blue, 0.0, 1.0)?;
+        ptz_command!(self, NDIlib_recv_ptz_white_balance_manual, red, blue)
+    }
+
+    /// Set the exposure automatically.
+    ///
+    /// # Errors
+    ///
+    /// See [`Ptz`].
+    pub fn exposure_auto(&self) -> Result<()> {
+        ptz_command!(self, NDIlib_recv_ptz_exposure_auto)
+    }
+
+    /// Set the exposure level within `0.0..=1.0`, from dark to light.
+    ///
+    /// # Errors
+    ///
+    /// See [`Ptz`].
+    pub fn exposure_manual(&self, level: f32) -> Result<()> {
+        validate_ptz_value("exposure level", level, 0.0, 1.0)?;
+        ptz_command!(self, NDIlib_recv_ptz_exposure_manual, level)
+    }
+
+    /// Set the iris, gain and shutter speed within `0.0..=1.0`: iris and gain
+    /// from dark to light, shutter speed from slow to fast.
+    ///
+    /// # Errors
+    ///
+    /// See [`Ptz`].
+    pub fn exposure_manual_detailed(&self, iris: f32, gain: f32, shutter_speed: f32) -> Result<()> {
+        validate_ptz_value("iris", iris, 0.0, 1.0)?;
+        validate_ptz_value("gain", gain, 0.0, 1.0)?;
+        validate_ptz_value("shutter speed", shutter_speed, 0.0, 1.0)?;
+        ptz_command!(
+            self,
+            NDIlib_recv_ptz_exposure_manual_v2,
+            iris,
+            gain,
+            shutter_speed
+        )
     }
 }
 
@@ -1842,7 +1739,7 @@ unsafe impl Send for ReceiverCore {}
 unsafe impl Sync for ReceiverCore {}
 
 /// A source-name change observed by the native receiver.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SourceNameChange {
     /// The receiver is now connected to the named source.
@@ -1852,7 +1749,7 @@ pub enum SourceNameChange {
 }
 
 /// A coalesced receiver invalidation, not an ordered event history.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ReceiverEvent {
     /// The connection or the source's capabilities changed.
@@ -1863,36 +1760,55 @@ pub enum ReceiverEvent {
     Unknown(u32),
 }
 
-/// An SDK status-change notification and the current connection count.
+/// What a status-change notification reports: the current connection count.
 ///
-/// The event may also indicate changed source capabilities or web control;
-/// the SDK does not identify a specific changed field. Tally is published
-/// upstream through [`Receiver::set_tally`], rather than received here.
-#[derive(Debug, Clone)]
+/// The notification may also mean that the source's capabilities or web
+/// control changed; the SDK does not say which. Tally is published upstream
+/// through [`Receiver::set_tally`], rather than received here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ReceiverStatus {
-    /// Current number of connected sources (normally zero or one).
-    pub connections: u32,
+    connections: u32,
+}
+
+impl ReceiverStatus {
+    /// The number of sources the receiver is connected to: normally zero or
+    /// one.
+    #[must_use]
+    pub const fn connections(self) -> u32 {
+        self.connections
+    }
 }
 
 /// Whether a source is shown on program output, on preview, or both.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Tally {
-    /// The source is on program (live) output.
-    pub on_program: bool,
-    /// The source is on preview output.
-    pub on_preview: bool,
+    on_program: bool,
+    on_preview: bool,
 }
 
 impl Tally {
-    /// Create a tally state.
-    pub fn new(on_program: bool, on_preview: bool) -> Self {
-        Tally {
+    /// A tally state: on program (live) output, on preview, both or neither.
+    #[must_use]
+    pub const fn new(on_program: bool, on_preview: bool) -> Self {
+        Self {
             on_program,
             on_preview,
         }
     }
 
-    pub(crate) fn to_raw(&self) -> NDIlib_tally_t {
+    /// Whether the source is on program (live) output.
+    #[must_use]
+    pub const fn on_program(self) -> bool {
+        self.on_program
+    }
+
+    /// Whether the source is on preview output.
+    #[must_use]
+    pub const fn on_preview(self) -> bool {
+        self.on_preview
+    }
+
+    pub(crate) const fn to_sdk(self) -> NDIlib_tally_t {
         NDIlib_tally_t {
             on_program: self.on_program,
             on_preview: self.on_preview,
@@ -1900,91 +1816,134 @@ impl Tally {
     }
 }
 
+/// Whether a setting changed.
+///
+/// Returned by the setters whose SDK call reports whether it changed anything.
+/// Callers that only want the setting in effect can ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SettingChange {
+    /// The setting changed.
+    Applied,
+    /// The setting did not change: it was already in effect, or the SDK did
+    /// not apply it. Each setter says when the SDK does not.
+    Unchanged,
+}
+
+impl SettingChange {
+    /// The change an SDK call reported with `changed`.
+    pub(crate) const fn from_sdk(changed: bool) -> Self {
+        if changed {
+            Self::Applied
+        } else {
+            Self::Unchanged
+        }
+    }
+}
+
 /// Connection and performance statistics for a receiver.
 ///
-/// Provides detailed metrics about receiver health including connection count,
-/// frame counts, and drop rates. Useful for monitoring and diagnostics.
-#[derive(Debug, Clone)]
+/// Connection count, frame counts, drop rates and queue depths, from
+/// [`Receiver::connection_stats`]. Useful for monitoring and diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ConnectionStats {
-    /// Number of active connections to this receiver
-    pub connections: u32,
-
-    /// Total number of video frames received
-    pub video_frames_received: u64,
-
-    /// Total number of audio frames received
-    pub audio_frames_received: u64,
-
-    /// Total number of metadata frames received
-    pub metadata_frames_received: u64,
-
-    /// Number of video frames dropped due to buffer overflow or processing delays
-    pub video_frames_dropped: u64,
-
-    /// Number of audio frames dropped
-    pub audio_frames_dropped: u64,
-
-    /// Number of metadata frames dropped
-    pub metadata_frames_dropped: u64,
-
-    /// Number of video frames currently queued for processing
-    pub video_frames_queued: u32,
-
-    /// Number of audio frames currently queued
-    pub audio_frames_queued: u32,
-
-    /// Number of metadata frames currently queued
-    pub metadata_frames_queued: u32,
+    connections: u32,
+    video_frames_received: u64,
+    audio_frames_received: u64,
+    metadata_frames_received: u64,
+    video_frames_dropped: u64,
+    audio_frames_dropped: u64,
+    metadata_frames_dropped: u64,
+    video_frames_queued: u32,
+    audio_frames_queued: u32,
+    metadata_frames_queued: u32,
 }
 
 impl ConnectionStats {
-    /// Calculate video frame drop percentage.
-    ///
-    /// Returns the percentage of video frames that were dropped out of the total
-    /// received + dropped. Returns 0.0 if both counters are zero.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use grafton_ndi::ConnectionStats;
-    /// let stats = ConnectionStats {
-    ///     connections: 1,
-    ///     video_frames_received: 900,
-    ///     video_frames_dropped: 100,
-    ///     audio_frames_received: 0,
-    ///     audio_frames_dropped: 0,
-    ///     metadata_frames_received: 0,
-    ///     metadata_frames_dropped: 0,
-    ///     video_frames_queued: 5,
-    ///     audio_frames_queued: 0,
-    ///     metadata_frames_queued: 0,
-    /// };
-    /// assert_eq!(stats.video_drop_percentage(), 10.0);
-    /// ```
+    /// The number of active connections.
+    #[must_use]
+    pub const fn connections(&self) -> u32 {
+        self.connections
+    }
+
+    /// The total number of video frames received.
+    #[must_use]
+    pub const fn video_frames_received(&self) -> u64 {
+        self.video_frames_received
+    }
+
+    /// The total number of audio frames received.
+    #[must_use]
+    pub const fn audio_frames_received(&self) -> u64 {
+        self.audio_frames_received
+    }
+
+    /// The total number of metadata frames received.
+    #[must_use]
+    pub const fn metadata_frames_received(&self) -> u64 {
+        self.metadata_frames_received
+    }
+
+    /// The number of video frames dropped, because a buffer overflowed or
+    /// processing fell behind.
+    #[must_use]
+    pub const fn video_frames_dropped(&self) -> u64 {
+        self.video_frames_dropped
+    }
+
+    /// The number of audio frames dropped.
+    #[must_use]
+    pub const fn audio_frames_dropped(&self) -> u64 {
+        self.audio_frames_dropped
+    }
+
+    /// The number of metadata frames dropped.
+    #[must_use]
+    pub const fn metadata_frames_dropped(&self) -> u64 {
+        self.metadata_frames_dropped
+    }
+
+    /// The number of video frames queued, waiting to be captured.
+    #[must_use]
+    pub const fn video_frames_queued(&self) -> u32 {
+        self.video_frames_queued
+    }
+
+    /// The number of audio frames queued.
+    #[must_use]
+    pub const fn audio_frames_queued(&self) -> u32 {
+        self.audio_frames_queued
+    }
+
+    /// The number of metadata frames queued.
+    #[must_use]
+    pub const fn metadata_frames_queued(&self) -> u32 {
+        self.metadata_frames_queued
+    }
+
+    /// The percentage of video frames dropped, out of those received and
+    /// dropped; 0.0 when both counts are zero.
+    #[must_use]
     pub fn video_drop_percentage(&self) -> f64 {
         drop_percentage(self.video_frames_received, self.video_frames_dropped)
     }
 
-    /// Calculate audio frame drop percentage.
-    ///
-    /// Returns the percentage of audio frames that were dropped out of the total
-    /// received + dropped. Returns 0.0 if both counters are zero.
+    /// The percentage of audio frames dropped, out of those received and
+    /// dropped; 0.0 when both counts are zero.
+    #[must_use]
     pub fn audio_drop_percentage(&self) -> f64 {
         drop_percentage(self.audio_frames_received, self.audio_frames_dropped)
     }
 
-    /// Calculate metadata frame drop percentage.
-    ///
-    /// Returns the percentage of metadata frames that were dropped out of the total
-    /// received + dropped. Returns 0.0 if both counters are zero.
+    /// The percentage of metadata frames dropped, out of those received and
+    /// dropped; 0.0 when both counts are zero.
+    #[must_use]
     pub fn metadata_drop_percentage(&self) -> f64 {
         drop_percentage(self.metadata_frames_received, self.metadata_frames_dropped)
     }
 
-    /// Check if the receiver is currently connected.
-    ///
-    /// Returns `true` if there is at least one active connection.
-    pub fn is_connected(&self) -> bool {
+    /// Whether there is at least one active connection.
+    #[must_use]
+    pub const fn is_connected(&self) -> bool {
         self.connections > 0
     }
 }
@@ -2046,9 +2005,7 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let best = ReceiverOptions::builder(Source::default())
-            .color(ReceiverColorFormat::Best444)
-            .build();
+        let best = ReceiverOptions::new(test_source()).color_format(ReceiverColorFormat::Best444);
         assert_eq!(best.to_raw().unwrap().raw.color_format, 102);
         assert_eq!(
             best.validate_runtime(&ndi).is_ok(),
@@ -2058,9 +2015,7 @@ mod tests {
             (ReceiverBandwidth::VideoOnlyLowest, 1),
             (ReceiverBandwidth::VideoOnlyHighest, 101),
         ] {
-            let options = ReceiverOptions::builder(Source::default())
-                .bandwidth(bandwidth)
-                .build();
+            let options = ReceiverOptions::new(test_source()).bandwidth(bandwidth);
             assert_eq!(options.to_raw().unwrap().raw.bandwidth, value);
             assert_eq!(
                 options.validate_runtime(&ndi).is_ok(),
@@ -2068,7 +2023,7 @@ mod tests {
                     .is_ok()
             );
         }
-        assert!(ReceiverOptions::default().validate_runtime(&ndi).is_ok());
+        assert!(unconnected().validate_runtime(&ndi).is_ok());
     }
 
     #[test]
@@ -2076,7 +2031,7 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         for _ in 0..3 {
             assert!(receiver
                 .core
@@ -2115,34 +2070,35 @@ mod tests {
     }
 
     #[test]
-    fn default_options_equal_the_builder_defaults() {
-        let default = ReceiverOptions::default();
-        let built = ReceiverOptions::builder(Source::default()).build();
-        assert_eq!(default.source_to_connect_to, built.source_to_connect_to);
-        assert_eq!(default.color_format, built.color_format);
-        assert_eq!(default.bandwidth, built.bandwidth);
-        assert_eq!(default.allow_video_fields, built.allow_video_fields);
-        assert_eq!(default.ndi_recv_name, built.ndi_recv_name);
-        assert!(default.allow_video_fields);
-    }
-
-    #[test]
     fn receive_delay_native_changed_flag_and_capability_failure() {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         if ndi.require_feature(RuntimeFeature::ReceiveDelay).is_ok() {
             assert_eq!(receiver.video_delay().unwrap(), Duration::ZERO);
             assert_eq!(receiver.audio_delay().unwrap(), Duration::ZERO);
-            assert!(!receiver.set_video_delay(Duration::ZERO).unwrap());
-            assert!(receiver.set_video_delay(Duration::from_nanos(1)).unwrap());
+            use SettingChange::{Applied, Unchanged};
+            assert_eq!(receiver.set_video_delay(Duration::ZERO).unwrap(), Unchanged);
+            assert_eq!(
+                receiver.set_video_delay(Duration::from_nanos(1)).unwrap(),
+                Applied
+            );
             assert_eq!(receiver.video_delay().unwrap(), Duration::from_millis(1));
-            assert!(!receiver.set_video_delay(Duration::from_millis(1)).unwrap());
+            assert_eq!(
+                receiver.set_video_delay(Duration::from_millis(1)).unwrap(),
+                Unchanged
+            );
             assert_eq!(receiver.audio_delay().unwrap(), Duration::ZERO);
-            assert!(receiver.set_audio_delay(Duration::from_secs(2)).unwrap());
+            assert_eq!(
+                receiver.set_audio_delay(Duration::from_secs(2)).unwrap(),
+                Applied
+            );
             assert_eq!(receiver.audio_delay().unwrap(), Duration::from_secs(2));
-            assert!(!receiver.set_audio_delay(Duration::from_secs(2)).unwrap());
+            assert_eq!(
+                receiver.set_audio_delay(Duration::from_secs(2)).unwrap(),
+                Unchanged
+            );
             assert!(receiver.set_audio_delay(Duration::from_secs(3)).is_err());
             assert_eq!(receiver.audio_delay().unwrap(), Duration::from_secs(2));
         } else {
@@ -2176,7 +2132,7 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         let strings = sys::ReceiverStrings {
             NDIlib_recv_free_string: free,
         };
@@ -2211,7 +2167,7 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         let strings = sys::ReceiverStrings {
             NDIlib_recv_free_string: keep,
         };
@@ -2234,7 +2190,10 @@ mod tests {
         assert_eq!(copy(&longest).unwrap().unwrap().len(), max - 1);
         // Without one, the scan stops at the bound and reports an error.
         let unterminated = vec![b'x'; max];
-        assert!(matches!(copy(&unterminated), Err(Error::InvalidFrame(_))));
+        assert!(matches!(
+            copy(&unterminated),
+            Err(Error::UnexpectedSdkResult(_))
+        ));
     }
 
     #[test]
@@ -2266,7 +2225,7 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         let source_name = sys::ReceiverSourceName {
             NDIlib_recv_get_source_name: get_source_name,
         };
@@ -2302,8 +2261,14 @@ mod tests {
         assert_eq!(poll(false, None), (None, 0));
     }
 
+    /// A source no receiver can connect to: no name and no address.
     fn test_source() -> Source {
-        Source::default()
+        Source::new("")
+    }
+
+    /// The options of a receiver that stays unconnected.
+    fn unconnected() -> ReceiverOptions {
+        ReceiverOptions::new(test_source())
     }
 
     #[derive(Default)]
@@ -2343,7 +2308,7 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         fn check<K: CaptureKind>(receiver: &Receiver) {
             let (_, allocations) = crate::test_alloc::allocation_count(|| {
                 for _ in 0..3 {
@@ -2378,7 +2343,7 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         receiver.core.pending_status.store(true, Ordering::Release);
         assert!(receiver.poll_event(Duration::MAX).is_err());
         assert!(receiver.core.pending_status.load(Ordering::Acquire));
@@ -2394,19 +2359,16 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         let excessive = crate::MAX_TIMEOUT + Duration::from_nanos(1);
         for result in [
             receiver.video().capture(excessive).map(drop),
-            receiver.audio().try_capture(excessive).map(drop),
-            receiver.metadata().try_capture_ref(excessive).map(drop),
+            receiver.audio().capture_ref(excessive).map(drop),
+            receiver.metadata().capture(excessive).map(drop),
             receiver.poll_event(excessive).map(drop),
             receiver.poll_source_name_change(excessive).map(drop),
         ] {
-            assert!(
-                matches!(result, Err(Error::InvalidConfiguration(_))),
-                "{result:?}"
-            );
+            assert!(matches!(result, Err(Error::InvalidInput(_))), "{result:?}");
         }
     }
 
@@ -2415,7 +2377,7 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         receiver.core.pending_status.store(true, Ordering::Release);
         let barrier = std::sync::Barrier::new(3);
         std::thread::scope(|scope| {
@@ -2447,7 +2409,7 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         receiver
             .core
             .capture_result::<AudioKind>(CaptureResult::Notification(Notification::StatusChanged))
@@ -2471,7 +2433,7 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         let original_core = Arc::as_ptr(&receiver.core);
         receiver.core.pending_status.store(true, Ordering::Release);
         let fs = crate::FrameSync::new(receiver).unwrap();
@@ -2497,6 +2459,38 @@ mod tests {
     }
 
     #[test]
+    fn value_types_read_back_what_the_sdk_reported() {
+        assert_eq!(SettingChange::from_sdk(true), SettingChange::Applied);
+        assert_eq!(SettingChange::from_sdk(false), SettingChange::Unchanged);
+        let idle = ConnectionStats::default();
+        assert!(!idle.is_connected());
+        assert_eq!(idle.connections(), 0);
+        assert_eq!(idle.video_drop_percentage(), 0.0);
+        let stats = ConnectionStats {
+            connections: 1,
+            video_frames_received: 900,
+            video_frames_dropped: 100,
+            audio_frames_received: 3,
+            metadata_frames_dropped: 1,
+            video_frames_queued: 5,
+            ..idle
+        };
+        assert!(stats.is_connected());
+        assert_eq!(stats.video_drop_percentage(), 10.0);
+        assert_eq!(stats.audio_drop_percentage(), 0.0);
+        assert_eq!(stats.metadata_drop_percentage(), 100.0);
+        assert_eq!(
+            (
+                stats.video_frames_received(),
+                stats.audio_frames_received(),
+                stats.video_frames_queued()
+            ),
+            (900, 3, 5)
+        );
+        assert_eq!(ReceiverStatus { connections: 2 }.connections(), 2);
+    }
+
+    #[test]
     fn drop_rates_handle_extreme_public_counters() {
         assert_eq!(drop_percentage(0, 0), 0.0);
         assert_eq!(drop_percentage(900, 100), 10.0);
@@ -2509,23 +2503,24 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        let ptz = receiver.ptz();
         for result in [
-            receiver.ptz_recall_preset(u8::MAX, 0.5),
-            receiver.ptz_recall_preset(100, 0.5),
-            receiver.ptz_recall_preset(0, f32::NAN),
-            receiver.ptz_store_preset(100),
-            receiver.ptz_zoom(f32::INFINITY),
-            receiver.ptz_zoom_speed(-1.1),
-            receiver.ptz_pan_tilt(0.0, 1.1),
-            receiver.ptz_pan_tilt_speed(f32::NAN, 0.0),
-            receiver.ptz_focus(-0.1),
-            receiver.ptz_focus_speed(1.1),
-            receiver.ptz_white_balance_manual(0.0, 1.1),
-            receiver.ptz_exposure_manual(f32::NEG_INFINITY),
-            receiver.ptz_exposure_manual_v2(0.5, f32::NAN, 0.5),
+            ptz.recall_preset(u8::MAX, 0.5),
+            ptz.recall_preset(100, 0.5),
+            ptz.recall_preset(0, f32::NAN),
+            ptz.store_preset(100),
+            ptz.zoom(f32::INFINITY),
+            ptz.zoom_speed(-1.1),
+            ptz.pan_tilt(0.0, 1.1),
+            ptz.pan_tilt_speed(f32::NAN, 0.0),
+            ptz.focus(-0.1),
+            ptz.focus_speed(1.1),
+            ptz.white_balance_manual(0.0, 1.1),
+            ptz.exposure_manual(f32::NEG_INFINITY),
+            ptz.exposure_manual_detailed(0.5, f32::NAN, 0.5),
         ] {
-            assert!(matches!(result, Err(Error::InvalidConfiguration(_))));
+            assert!(matches!(result, Err(Error::InvalidInput(_))));
         }
         assert_eq!(validate_ptz_preset(0).unwrap(), 0);
         assert_eq!(validate_ptz_preset(99).unwrap(), 99);
@@ -2538,14 +2533,20 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
-        // Runtime implementations differ in their status flags when no source
-        // is connected. These controls must remain callable in that state.
-        let _sdk_status = receiver.set_tally(&Tally::new(true, false));
-        let frame = MetadataFrame::with_data("<ndi_text>é</ndi_text>", 42).unwrap();
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        // Tally is kept for a later connection. Metadata has nowhere to go,
+        // which runtimes may or may not report; either way the call returns.
+        receiver.set_tally(Tally::new(true, false));
+        let frame = MetadataFrame::new("<ndi_text>é</ndi_text>")
+            .unwrap()
+            .with_timecode(crate::Timecode::from_ticks(42));
         let pointer = frame.to_raw().p_data;
         for _ in 0..3 {
-            let _sdk_status = receiver.send_metadata(&frame);
+            let sent = receiver.send_metadata(&frame);
+            assert!(
+                matches!(sent, Ok(()) | Err(Error::NotConnected)),
+                "{sent:?}"
+            );
             assert_eq!(frame.to_raw().p_data, pointer);
         }
     }
@@ -2555,27 +2556,24 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         let exclusive = receiver.core.capture_guard.write();
         std::thread::scope(|scope| {
             let (done, completed) = std::sync::mpsc::channel();
             let receiver = &receiver;
             let worker = scope.spawn(move || {
-                assert!(receiver
-                    .video()
-                    .try_capture(Duration::ZERO)
-                    .unwrap()
-                    .is_none());
+                assert!(receiver.video().capture(Duration::ZERO).unwrap().is_none());
                 assert!(receiver.poll_event(Duration::ZERO).unwrap().is_none());
                 assert!(receiver
                     .audio()
-                    .try_capture(Duration::from_millis(5))
+                    .capture(Duration::from_millis(5))
                     .unwrap()
                     .is_none());
-                assert!(matches!(
-                    receiver.video().capture(Duration::from_millis(5)),
-                    Err(Error::FrameTimeout { .. })
-                ));
+                assert!(receiver
+                    .metadata()
+                    .capture_ref(Duration::from_millis(5))
+                    .unwrap()
+                    .is_none());
                 done.send(()).unwrap();
             });
             // The writer remains held until the worker has returned: a stale
@@ -2590,27 +2588,27 @@ mod tests {
     #[test]
     fn receiver_color_format_maps_to_exact_sdk_values() {
         assert_eq!(
-            NDIlib_recv_color_format_e::from(ReceiverColorFormat::BGRX_BGRA),
+            ReceiverColorFormat::BgrxBgra.to_sdk(),
             NDIlib_recv_color_format_e_NDIlib_recv_color_format_BGRX_BGRA
         );
         assert_eq!(
-            NDIlib_recv_color_format_e::from(ReceiverColorFormat::UYVY_BGRA),
+            ReceiverColorFormat::UyvyBgra.to_sdk(),
             NDIlib_recv_color_format_e_NDIlib_recv_color_format_UYVY_BGRA
         );
         assert_eq!(
-            NDIlib_recv_color_format_e::from(ReceiverColorFormat::RGBX_RGBA),
+            ReceiverColorFormat::RgbxRgba.to_sdk(),
             NDIlib_recv_color_format_e_NDIlib_recv_color_format_RGBX_RGBA
         );
         assert_eq!(
-            NDIlib_recv_color_format_e::from(ReceiverColorFormat::UYVY_RGBA),
+            ReceiverColorFormat::UyvyRgba.to_sdk(),
             NDIlib_recv_color_format_e_NDIlib_recv_color_format_UYVY_RGBA
         );
         assert_eq!(
-            NDIlib_recv_color_format_e::from(ReceiverColorFormat::Fastest),
+            ReceiverColorFormat::Fastest.to_sdk(),
             NDIlib_recv_color_format_e_NDIlib_recv_color_format_fastest
         );
         assert_eq!(
-            NDIlib_recv_color_format_e::from(ReceiverColorFormat::Best),
+            ReceiverColorFormat::Best.to_sdk(),
             NDIlib_recv_color_format_e_NDIlib_recv_color_format_best
         );
     }
@@ -2618,29 +2616,26 @@ mod tests {
     #[test]
     fn receiver_bandwidth_maps_to_exact_sdk_values() {
         assert_eq!(
-            NDIlib_recv_bandwidth_e::from(ReceiverBandwidth::MetadataOnly),
+            ReceiverBandwidth::MetadataOnly.to_sdk(),
             NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_metadata_only
         );
         assert_eq!(
-            NDIlib_recv_bandwidth_e::from(ReceiverBandwidth::AudioOnly),
+            ReceiverBandwidth::AudioOnly.to_sdk(),
             NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_audio_only
         );
         assert_eq!(
-            NDIlib_recv_bandwidth_e::from(ReceiverBandwidth::Lowest),
+            ReceiverBandwidth::Lowest.to_sdk(),
             NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest
         );
         assert_eq!(
-            NDIlib_recv_bandwidth_e::from(ReceiverBandwidth::Highest),
+            ReceiverBandwidth::Highest.to_sdk(),
             NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest
         );
     }
 
     #[test]
     fn receiver_options_defaults_emit_operational_raw_modes() {
-        let raw = ReceiverOptions::builder(test_source())
-            .build()
-            .to_raw()
-            .unwrap();
+        let raw = unconnected().to_raw().unwrap();
 
         assert_raw_receiver_modes(
             &raw,
@@ -2652,8 +2647,7 @@ mod tests {
 
     #[test]
     fn snapshot_preset_emits_operational_raw_modes() {
-        let raw = ReceiverOptionsBuilder::snapshot_preset(test_source())
-            .build()
+        let raw = ReceiverOptions::snapshot_preset(test_source())
             .to_raw()
             .unwrap();
 
@@ -2667,8 +2661,7 @@ mod tests {
 
     #[test]
     fn high_quality_preset_emits_operational_raw_modes() {
-        let raw = ReceiverOptionsBuilder::high_quality_preset(test_source())
-            .build()
+        let raw = ReceiverOptions::high_quality_preset(test_source())
             .to_raw()
             .unwrap();
 
@@ -2682,8 +2675,7 @@ mod tests {
 
     #[test]
     fn monitoring_preset_emits_operational_raw_modes() {
-        let raw = ReceiverOptionsBuilder::monitoring_preset(test_source())
-            .build()
+        let raw = ReceiverOptions::monitoring_preset(test_source())
             .to_raw()
             .unwrap();
 
@@ -2715,7 +2707,7 @@ mod tests {
             |_| {},
         );
 
-        assert_eq!(result.unwrap(), 42);
+        assert_eq!(result.unwrap(), Some(42));
         assert_eq!(polls, [Duration::from_millis(25)]);
     }
 
@@ -2729,7 +2721,7 @@ mod tests {
         let mut polls = Vec::new();
         let mut sleeps = Vec::new();
 
-        let result: Result<i32> = retry_capture_with_clock(
+        let result: Result<Option<i32>> = retry_capture_with_clock(
             Duration::from_millis(50),
             &policy,
             |poll| {
@@ -2748,10 +2740,7 @@ mod tests {
             },
         );
 
-        assert!(matches!(
-            result,
-            Err(Error::FrameTimeout { attempts: 2, .. })
-        ));
+        assert!(result.unwrap().is_none());
         assert_eq!(
             polls,
             [Duration::from_millis(40), Duration::from_millis(35)]
@@ -2775,16 +2764,16 @@ mod tests {
             |_| panic!("zero-timeout success should not sleep"),
         );
 
-        assert_eq!(result.unwrap(), 42);
+        assert_eq!(result.unwrap(), Some(42));
         assert_eq!(polls, [Duration::ZERO]);
     }
 
     #[test]
-    fn retry_zero_timeout_miss_times_out_after_one_attempt() {
+    fn retry_zero_timeout_miss_gives_up_after_one_attempt() {
         let clock = FakeClock::default();
         let mut polls = Vec::new();
 
-        let result: Result<i32> = retry_capture_with_clock(
+        let result: Result<Option<i32>> = retry_capture_with_clock(
             Duration::ZERO,
             &RetryPolicy::default(),
             |poll| {
@@ -2795,18 +2784,12 @@ mod tests {
             |_| panic!("zero-timeout miss should not sleep"),
         );
 
-        match result {
-            Err(Error::FrameTimeout { attempts, elapsed }) => {
-                assert_eq!(attempts, 1);
-                assert_eq!(elapsed, Duration::ZERO);
-            }
-            _ => panic!("Expected FrameTimeout error"),
-        }
+        assert!(result.unwrap().is_none());
         assert_eq!(polls, [Duration::ZERO]);
     }
 
     #[test]
-    fn retry_timeout_counts_only_actual_capture_attempts() {
+    fn retry_stops_when_an_attempt_spends_the_budget() {
         let clock = FakeClock::default();
         let policy = RetryPolicy {
             poll_interval: Duration::from_millis(8),
@@ -2814,7 +2797,7 @@ mod tests {
         };
         let mut polls = Vec::new();
 
-        let result: Result<i32> = retry_capture_with_clock(
+        let result: Result<Option<i32>> = retry_capture_with_clock(
             Duration::from_millis(10),
             &policy,
             |poll| {
@@ -2826,13 +2809,7 @@ mod tests {
             |_| panic!("expired timeout should not sleep"),
         );
 
-        match result {
-            Err(Error::FrameTimeout { attempts, elapsed }) => {
-                assert_eq!(attempts, 1);
-                assert_eq!(elapsed, Duration::from_millis(10));
-            }
-            _ => panic!("Expected FrameTimeout error"),
-        }
+        assert!(result.unwrap().is_none());
         assert_eq!(polls, [Duration::from_millis(8)]);
     }
 
@@ -2845,12 +2822,16 @@ mod tests {
         };
         let mut sleeps = Vec::new();
 
-        let result: Result<i32> = retry_capture_with_clock(
+        let mut attempts = 0;
+
+        let result: Result<Option<i32>> = retry_capture_with_clock(
             Duration::from_millis(10),
             &policy,
             |poll| {
+                attempts += 1;
                 assert_eq!(poll, Duration::from_millis(8));
-                clock.advance(Duration::from_millis(8));
+                // An early return, 1 ms short of the attempt's timeout.
+                clock.advance(Duration::from_millis(7));
                 Ok(None)
             },
             || clock.elapsed(),
@@ -2860,11 +2841,75 @@ mod tests {
             },
         );
 
-        assert!(matches!(
-            result,
-            Err(Error::FrameTimeout { attempts: 1, .. })
-        ));
-        assert_eq!(sleeps, [Duration::from_millis(2)]);
+        assert!(result.unwrap().is_none());
+        assert_eq!(attempts, 1);
+        assert_eq!(sleeps, [Duration::from_millis(3)]);
+    }
+
+    #[test]
+    fn retry_follows_a_full_wait_at_once() {
+        // Every attempt waits out its timeout, as when no frame is sent: the
+        // next attempt starts at once, so a frame arriving in between is taken
+        // without a pause.
+        let clock = FakeClock::default();
+        let mut polls = Vec::new();
+
+        let result: Result<Option<i32>> = retry_capture_with_clock(
+            Duration::from_millis(250),
+            &RetryPolicy::default(),
+            |poll| {
+                polls.push(poll);
+                clock.advance(poll);
+                Ok(None)
+            },
+            || clock.elapsed(),
+            |_| panic!("an attempt that waited out its timeout must not be followed by a pause"),
+        );
+
+        assert!(result.unwrap().is_none());
+        assert_eq!(clock.elapsed(), Duration::from_millis(250));
+        assert_eq!(
+            polls,
+            [
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+                Duration::from_millis(50),
+            ]
+        );
+    }
+
+    #[test]
+    fn retry_pauses_only_after_an_early_return() {
+        // Warm-up: the SDK returns 3 ms into the first attempt and at once on
+        // the second, then waits out the third, and the fourth delivers.
+        let clock = FakeClock::default();
+        let mut polls = Vec::new();
+        let mut sleeps = Vec::new();
+        let waits = [3, 0, 100].map(Duration::from_millis);
+
+        let result = retry_capture_with_clock(
+            Duration::from_secs(1),
+            &RetryPolicy::default(),
+            |poll| {
+                let Some(wait) = waits.get(polls.len()).copied() else {
+                    return Ok(Some(42));
+                };
+                polls.push(poll);
+                clock.advance(wait);
+                Ok(None)
+            },
+            || clock.elapsed(),
+            |sleep| {
+                sleeps.push(sleep);
+                clock.advance(sleep);
+            },
+        );
+
+        assert_eq!(result.unwrap(), Some(42));
+        assert_eq!(polls, [Duration::from_millis(100); 3]);
+        assert_eq!(sleeps, [Duration::from_millis(10); 2]);
+        // One deadline for the whole call: 3 + 10 + 0 + 10 + 100 ms.
+        assert_eq!(clock.elapsed(), Duration::from_millis(123));
     }
 
     #[test]
@@ -2875,7 +2920,7 @@ mod tests {
         clock.advance(Duration::from_millis(30));
         let mut polls = Vec::new();
 
-        let result: Result<i32> = retry_capture_with_clock(
+        let result: Result<Option<i32>> = retry_capture_with_clock(
             Duration::from_millis(50),
             &RetryPolicy::default(),
             |poll| {
@@ -2887,13 +2932,8 @@ mod tests {
             |_| panic!("an expired budget should not sleep"),
         );
 
-        match result {
-            Err(Error::FrameTimeout { attempts, elapsed }) => {
-                assert_eq!(attempts, 1);
-                assert_eq!(elapsed, Duration::from_millis(50));
-            }
-            other => panic!("Expected FrameTimeout error, got {other:?}"),
-        }
+        assert!(result.unwrap().is_none());
+        assert_eq!(clock.elapsed(), Duration::from_millis(50));
         assert_eq!(polls, [Duration::from_millis(20)]);
     }
 
@@ -2903,7 +2943,7 @@ mod tests {
         clock.advance(Duration::from_millis(70));
         let mut polls = Vec::new();
 
-        let result: Result<i32> = retry_capture_with_clock(
+        let result: Result<Option<i32>> = retry_capture_with_clock(
             Duration::from_millis(50),
             &RetryPolicy::default(),
             |poll| {
@@ -2914,10 +2954,7 @@ mod tests {
             |_| panic!("a spent budget should not sleep"),
         );
 
-        assert!(matches!(
-            result,
-            Err(Error::FrameTimeout { attempts: 1, elapsed }) if elapsed == Duration::from_millis(70)
-        ));
+        assert!(result.unwrap().is_none());
         assert_eq!(polls, [Duration::ZERO]);
     }
 
@@ -2927,16 +2964,16 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         let mut polls = Vec::new();
 
-        let result: Result<i32> = retry_capture(deadline, &RetryPolicy::default(), |poll| {
-            polls.push(poll);
-            Ok(None)
-        });
+        let result: Result<Option<i32>> =
+            retry_capture(deadline, &RetryPolicy::default(), |poll| {
+                polls.push(poll);
+                Ok(None)
+            });
 
-        let Err(Error::FrameTimeout { attempts, elapsed }) = result else {
-            panic!("Expected FrameTimeout error, got {result:?}");
-        };
-        assert!(attempts >= 1);
-        assert!(elapsed >= Duration::from_millis(20), "{elapsed:?}");
+        assert!(result.unwrap().is_none());
+        assert!(!polls.is_empty());
+        // `None` comes only once the whole budget is spent.
+        assert!(deadline.is_expired());
         // The first poll is taken from what was left after the caller's 5 ms.
         assert!(polls[0] <= Duration::from_millis(15), "{polls:?}");
     }
@@ -2961,7 +2998,7 @@ mod tests {
             |sleep| clock.advance(sleep),
         );
 
-        assert_eq!(result.unwrap(), 42);
+        assert_eq!(result.unwrap(), Some(42));
         assert_eq!(attempts.get(), 2);
     }
 
@@ -2971,7 +3008,7 @@ mod tests {
         let attempts = Cell::new(0);
         let mut sleeps = Vec::new();
 
-        let result: Result<i32> = retry_capture_with_clock(
+        let result: Result<Option<i32>> = retry_capture_with_clock(
             Duration::from_secs(1),
             &RetryPolicy::default(),
             |_| {

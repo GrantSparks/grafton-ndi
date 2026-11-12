@@ -1,9 +1,12 @@
-use grafton_ndi::{advanced::{AvSync, CompressedSender, Genlock, ScatterVideoFrame}, Receiver, ScanType};
+use grafton_ndi::{
+    advanced::{AvSync, CompressedSender, Genlock, ScatterVideoFrame},
+    FrameRate, Receiver, ScanType,
+};
 
-fn independent_scoped_clocks(genlock: &mut Genlock) {
+fn independent_scoped_clocks(genlock: &mut Genlock, frame_rate: FrameRate) {
     let (mut video, mut audio) = genlock.clocks();
     std::thread::scope(|scope| {
-        scope.spawn(move || video.wait(30, 1, ScanType::Progressive));
+        scope.spawn(move || video.wait(frame_rate, ScanType::Progressive));
         scope.spawn(move || audio.wait(48_000, 1600));
     });
 }

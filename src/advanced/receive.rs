@@ -7,13 +7,15 @@ use super::{
 };
 use crate::{
     capture::{AudioKind, CaptureKind, Guard, MetadataKind, Notification, VideoKind},
+    receiver::capture_within,
     sys::{
         self,
-        advanced::{declared, native, ReceiverConfiguration},
+        advanced::{native, ReceiverConfiguration},
         bindings::*,
     },
     timeout::Deadline,
-    AudioFrame, Error, MetadataFrame, Receiver, ReceiverOptions, Result, VideoFrame, NDI,
+    AudioFrame, MediaTypes, MetadataFrame, Ndi, Receiver, ReceiverOptions, Result, SettingChange,
+    StreamTier, VideoFrame,
 };
 
 /// Which compressed formats a [`PacketReceiver`] passes through.
@@ -22,7 +24,11 @@ use crate::{
 /// any other frame is delivered decoded, so every capture can yield either
 /// kind. Decoded video is 8-bit unless the preset is one of the "best" ones,
 /// which keep the source's bit depth.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Whether a preset can be used is
+/// [`RuntimeFeature::Passthrough`](crate::capabilities::RuntimeFeature::Passthrough):
+/// the headers of an older SDK may not declare every preset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PassthroughPreset {
     /// SpeedHQ only.
@@ -57,89 +63,9 @@ pub enum PassthroughPreset {
     ProtectedWithAudio,
 }
 
-impl PassthroughPreset {
-    /// The receiver color format that selects this preset.
-    fn color_format(
-        self,
-        table: &'static ReceiverConfiguration,
-    ) -> Result<NDIlib_recv_color_format_e> {
-        native!(ReceiverConfiguration, table => {
-            use sys::advanced_bindings::*;
-            // The value of a constant, or its name when the headers this
-            // build was made with do not declare it.
-            macro_rules! optional_format {
-                ($constant:ident) => {
-                    declared! { $constant {
-                        Ok(u32::from_ne_bytes($constant.to_ne_bytes()))
-                    } else { Err(stringify!($constant)) } }
-                };
-            }
-            let format: u32 = match self {
-                Self::SpeedHqOnly => {
-                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v1)
-                }
-                Self::SpeedHq => {
-                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v2)
-                }
-                Self::SpeedHqBest => {
-                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v2_best)
-                }
-                Self::H264 => {
-                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v3)
-                }
-                Self::H264Best => {
-                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v3_best)
-                }
-                Self::H264WithAudio => {
-                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v3_with_audio)
-                }
-                Self::Hevc => {
-                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v4)
-                }
-                Self::HevcBest => {
-                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v4_best)
-                }
-                Self::HevcWithAudio => {
-                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v4_with_audio)
-                }
-                Self::Alpha => {
-                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v5)
-                }
-                Self::AlphaBest => {
-                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v5_best)
-                }
-                Self::AlphaWithAudio => {
-                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v5_with_audio)
-                }
-                Self::Protected => {
-                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6)
-                }
-                Self::ProtectedBest => {
-                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6_best)
-                }
-                Self::ProtectedWithAudio => {
-                    optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6_with_audio)
-                }
-            }.map_err(|constant: &'static str| Error::UnsupportedCapability {
-                capability: "compressed receive preset",
-                reason: crate::capabilities::CapabilityUnavailable::BuildAbiUnavailable,
-                // The headers declare the constant without the enumeration's
-                // name, which the generated binding prefixes it with.
-                detail: constant
-                    .strip_prefix("NDIlib_recv_color_format_ex_e_")
-                    .unwrap_or(constant)
-                    .to_owned(),
-            })?;
-            // The extended color formats take the target's C enum type; the
-            // creation settings carry the same bits.
-            Ok(NDIlib_recv_color_format_e::from_ne_bytes(format.to_ne_bytes()))
-        })
-    }
-}
-
 /// Video from a [`PacketReceiver`]: a codec packet when the source's format is
 /// one the preset passes through, a decoded frame otherwise.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum ReceivedVideo {
     /// A decoded frame.
@@ -150,7 +76,7 @@ pub enum ReceivedVideo {
 
 /// Audio from a [`PacketReceiver`]: a codec packet when the source's format is
 /// one the preset passes through, decoded samples otherwise.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum ReceivedAudio {
     /// Decoded planar floating-point audio.
@@ -160,7 +86,7 @@ pub enum ReceivedAudio {
 }
 
 /// What one [`PacketReceiver::capture`] call produced.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum PacketEvent {
     /// A video frame.
@@ -169,8 +95,6 @@ pub enum PacketEvent {
     Audio(ReceivedAudio),
     /// A metadata frame.
     Metadata(MetadataFrame),
-    /// Nothing arrived within the timeout.
-    Timeout,
     /// The connection or the source's properties changed.
     StatusChanged,
     /// The receiver is now connected to a different source.
@@ -181,7 +105,7 @@ pub enum PacketEvent {
 
 /// A receiver that delivers compressed packets where it can.
 ///
-/// One capture call returns whichever frame arrives first, as a
+/// One capture call returns whichever frame or event arrives first, as a
 /// [`PacketEvent`]; every result owns its data. The receiver is used from the
 /// thread that owns it, one call at a time. It cannot feed a
 /// [`FrameSync`](crate::framesync::FrameSync), which needs decoded frames.
@@ -191,20 +115,16 @@ pub enum PacketEvent {
 /// ```no_run
 /// use std::time::Duration;
 /// use grafton_ndi::{
-///     advanced::{AdvancedConfig, PacketEvent, PacketReceiver, PassthroughPreset, ReceivedVideo},
-///     ReceiverOptions, Source, NDI,
+///     advanced::{PacketEvent, PacketReceiver, PassthroughPreset, ReceivedVideo},
+///     ReceiverOptions, Source, Ndi,
 /// };
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
-/// let ndi = NDI::new()?;
-/// # let source = Source::default();
-/// let mut receiver = PacketReceiver::new(
-///     &ndi,
-///     &ReceiverOptions::builder(source).build(),
-///     PassthroughPreset::Hevc,
-///     &AdvancedConfig::parse("{}")?,
-/// )?;
-/// if let PacketEvent::Video(ReceivedVideo::Compressed(packet)) =
+/// let ndi = Ndi::new()?;
+/// # let source = Source::new("ENCODER (HEVC)");
+/// let mut receiver =
+///     PacketReceiver::new(&ndi, &ReceiverOptions::new(source), PassthroughPreset::Hevc)?;
+/// if let Some(PacketEvent::Video(ReceivedVideo::Compressed(packet))) =
 ///     receiver.capture(Duration::from_secs(1))?
 /// {
 ///     println!("{:?}: {} bytes", packet.format().codec(), packet.data().len());
@@ -218,22 +138,25 @@ pub struct PacketReceiver {
 }
 
 impl PacketReceiver {
-    /// Create a receiver that passes through the formats `preset` names.
+    /// Create a receiver that passes through the formats `preset` names,
+    /// with the options' Advanced SDK
+    /// [configuration](ReceiverOptions::config), or the SDK's default one when
+    /// they carry none.
     ///
     /// The options' color format is replaced by the preset; fielded video is
     /// always allowed, because a compressed stream cannot be deinterlaced.
     ///
     /// # Errors
     ///
-    /// As for [`Receiver::new_with_config`].
-    pub fn new(
-        ndi: &NDI,
-        options: &ReceiverOptions,
-        preset: PassthroughPreset,
-        config: &AdvancedConfig,
-    ) -> Result<Self> {
-        let table = ndi.table::<ReceiverConfiguration>()?;
-        let color_format = preset.color_format(table)?;
+    /// As for [`Receiver::new`], with [`Error::UnsupportedCapability`]
+    /// without an Advanced runtime (or in a build without the Advanced SDK),
+    /// and reported for [`RuntimeFeature::Passthrough`] with this preset.
+    ///
+    /// [`Error::UnsupportedCapability`]: crate::Error::UnsupportedCapability
+    /// [`RuntimeFeature::Passthrough`]: crate::capabilities::RuntimeFeature::Passthrough
+    pub fn new(ndi: &Ndi, options: &ReceiverOptions, preset: PassthroughPreset) -> Result<Self> {
+        let color_format = ndi.passthrough_format(preset)?;
+        let config = AdvancedConfig::or_empty(options.config.as_ref());
         // SAFETY: the closure returns what the SDK's configured receiver
         // creation returned for the settings it was handed with the preset's
         // color format and fielded video; the strings the copy points to
@@ -243,7 +166,7 @@ impl PacketReceiver {
                 ndi,
                 options,
                 "NDIlib_recv_create_v4",
-                config,
+                &config,
                 |table: &'static ReceiverConfiguration, settings, text| {
                     let settings = NDIlib_recv_create_v3_t {
                         color_format,
@@ -264,22 +187,46 @@ impl PacketReceiver {
         }
     }
 
-    /// Wait up to `timeout` for the next frame or event.
+    /// Wait up to `timeout` for the next frame or event, or return `None`
+    /// when none arrived in time.
+    ///
+    /// The timeout is spent as [`Capture::capture`](crate::Capture::capture)
+    /// spends it. The SDK returns early, with neither a frame nor an event,
+    /// while a new connection synchronizes; this captures again until
+    /// something arrives, and returns `None` only once the whole timeout is
+    /// spent. [`Duration::ZERO`] makes one attempt without waiting. Every SDK
+    /// call holds the receiver's shared capture guard, so none overlaps a
+    /// reconnect, and waiting for that guard spends the same timeout.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidConfiguration`] when `timeout` exceeds
+    /// [`Error::InvalidInput`] when `timeout` exceeds
     /// [`crate::MAX_TIMEOUT`], [`Error::CaptureFailed`] when the SDK reports a
     /// lost connection, and [`Error::InvalidFrame`] when a delivered frame
     /// fails validation.
-    pub fn capture(&mut self, timeout: Duration) -> Result<PacketEvent> {
+    ///
+    /// [`Error::InvalidInput`]: crate::Error::InvalidInput
+    /// [`Error::CaptureFailed`]: crate::Error::CaptureFailed
+    /// [`Error::InvalidFrame`]: crate::Error::InvalidFrame
+    pub fn capture(&mut self, timeout: Duration) -> Result<Option<PacketEvent>> {
         Self::capture_from(&self.receiver, timeout)
     }
 
-    /// One capture on `receiver`, under the same capture lock and timeout
-    /// budget as the receiver's own capture verbs.
-    pub(crate) fn capture_from(receiver: &Receiver, timeout: Duration) -> Result<PacketEvent> {
-        let deadline = Deadline::after(timeout)?;
+    /// [`capture`](Self::capture) on `receiver`, in the receiver's own capture
+    /// loop.
+    pub(crate) fn capture_from(
+        receiver: &Receiver,
+        timeout: Duration,
+    ) -> Result<Option<PacketEvent>> {
+        capture_within(Deadline::after(timeout)?, |attempt| {
+            Self::poll(receiver, attempt)
+        })
+    }
+
+    /// One SDK capture on `receiver` within `deadline`, under the capture
+    /// lock the receiver's own capture verbs hold. `None` when the lock was
+    /// not free in time, or the SDK returned neither a frame nor an event.
+    fn poll(receiver: &Receiver, deadline: Deadline) -> Result<Option<PacketEvent>> {
         let core = &*receiver.core;
         let mut video = NDIlib_video_frame_v2_t::default();
         let mut audio = NDIlib_audio_frame_v3_t::default();
@@ -289,7 +236,7 @@ impl PacketReceiver {
             // it spends the caller's budget; a zero timeout does not wait, and
             // when the lock is not available in time no capture is attempted.
             let Some(_capture) = core.capture_lock_until(deadline) else {
-                return Ok(PacketEvent::Timeout);
+                return Ok(None);
             };
             let timeout_ms = deadline.remaining_ms();
             #[cfg(test)]
@@ -314,36 +261,37 @@ impl PacketReceiver {
         // it frees the frame exactly once through the matching
         // NDIlib_recv_free_* function, whether or not the copy succeeds.
         let (ndi, instance) = (&core._ndi, core.instance);
-        match kind {
-            NDIlib_frame_type_e_NDIlib_frame_type_video => {
+        let event = match kind {
+            sys::bindings::NDIlib_frame_type_e_NDIlib_frame_type_video => {
                 // SAFETY: `video` holds the delivered frame; see above.
-                video_event(unsafe { Guard::<VideoKind>::new(ndi, instance, video) })
+                video_event(unsafe { Guard::<VideoKind>::new(ndi, instance, video) })?
             }
-            NDIlib_frame_type_e_NDIlib_frame_type_audio => {
+            sys::bindings::NDIlib_frame_type_e_NDIlib_frame_type_audio => {
                 // SAFETY: `audio` holds the delivered frame; see above.
-                audio_event(unsafe { Guard::<AudioKind>::new(ndi, instance, audio) })
+                audio_event(unsafe { Guard::<AudioKind>::new(ndi, instance, audio) })?
             }
-            NDIlib_frame_type_e_NDIlib_frame_type_metadata => {
+            sys::bindings::NDIlib_frame_type_e_NDIlib_frame_type_metadata => {
                 // SAFETY: `metadata` holds the delivered frame; see above.
-                metadata_event(unsafe { Guard::<MetadataKind>::new(ndi, instance, metadata) })
+                metadata_event(unsafe { Guard::<MetadataKind>::new(ndi, instance, metadata) })?
             }
-            other => Ok(match Notification::classify(other)? {
-                Notification::None => PacketEvent::Timeout,
+            other => match Notification::classify(other)? {
+                Notification::None => return Ok(None),
                 Notification::StatusChanged => PacketEvent::StatusChanged,
                 Notification::SourceChanged => PacketEvent::SourceChanged,
                 Notification::Unknown(value) => PacketEvent::Unknown(value),
-            }),
-        }
+            },
+        };
+        Ok(Some(event))
     }
 
     /// Switch between the source's program and preview streams; see
-    /// [`Receiver::set_video_quality`].
+    /// [`Receiver::set_stream_tier`].
     ///
     /// # Errors
     ///
-    /// As for [`Receiver::set_video_quality`].
-    pub fn set_video_quality(&mut self, quality: super::VideoQuality) -> Result<bool> {
-        self.receiver.set_video_quality(quality)
+    /// As for [`Receiver::set_stream_tier`].
+    pub fn set_stream_tier(&mut self, tier: StreamTier) -> Result<SettingChange> {
+        self.receiver.set_stream_tier(tier)
     }
 
     /// Choose which streams the source sends; see [`Receiver::set_streams`].
@@ -351,7 +299,7 @@ impl PacketReceiver {
     /// # Errors
     ///
     /// As for [`Receiver::set_streams`].
-    pub fn set_streams(&mut self, streams: super::StreamSelection) -> Result<super::StreamChange> {
+    pub fn set_streams(&mut self, streams: MediaTypes) -> Result<SettingChange> {
         self.receiver.set_streams(streams)
     }
 
@@ -365,9 +313,12 @@ impl PacketReceiver {
         self.receiver.request_keyframe()
     }
 
-    /// Send metadata upstream to the source. Returns whether the receiver is
-    /// connected and the SDK accepted the frame.
-    pub fn send_metadata(&self, metadata: &MetadataFrame) -> bool {
+    /// Send metadata upstream, to the source; see [`Receiver::send_metadata`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`Receiver::send_metadata`].
+    pub fn send_metadata(&self, metadata: &MetadataFrame) -> Result<()> {
         self.receiver.send_metadata(metadata)
     }
 
@@ -446,8 +397,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        advanced::{packet_envelope, EnvelopeCodec, VideoPacketFormat},
+        advanced::{EnvelopeCodec, PacketEnvelope, VideoPacketFormat},
         frames::PixelFormat,
+        Error, Timecode,
     };
 
     unsafe fn count_release<T>(instance: NDIlib_recv_instance_t, _frame: &mut T) {
@@ -476,8 +428,8 @@ mod tests {
     fn delivered_video_is_copied_and_freed_once_even_when_invalid() {
         let mut source = VideoFrame::builder()
             .resolution(4, 2)
-            .pixel_format(PixelFormat::BGRA)
-            .timecode(17)
+            .pixel_format(PixelFormat::Bgra)
+            .timecode(Timecode::from_ticks(17))
             .metadata("<frame/>")
             .build()
             .unwrap();
@@ -491,8 +443,8 @@ mod tests {
         };
         assert_eq!(frame.data(), source.data());
         assert_eq!((frame.width(), frame.height()), (4, 2));
-        assert_eq!(frame.pixel_format(), PixelFormat::BGRA);
-        assert_eq!(frame.timecode(), 17);
+        assert_eq!(frame.pixel_format(), PixelFormat::Bgra);
+        assert_eq!(frame.timecode(), Timecode::from_ticks(17));
         assert_eq!(frame.metadata(), Some("<frame/>"));
 
         let no_pixels = NDIlib_video_frame_v2_t {
@@ -511,7 +463,7 @@ mod tests {
 
         let format = VideoPacketFormat::new(VideoCodec::H264, 16, 16).unwrap();
         let packet =
-            packet_envelope(EnvelopeCodec::H264, 10, 9, true, &[1, 2, 3], &[4, 5]).unwrap();
+            PacketEnvelope::encode(EnvelopeCodec::H264, 10, 9, true, &[1, 2, 3], &[4, 5]).unwrap();
         let mut sent = CompressedVideoFrame::new(format, packet.clone()).unwrap();
         let (event, releases) = deliver::<VideoKind>(sent.raw(), video_event);
         assert_eq!(releases, 1);
@@ -532,9 +484,9 @@ mod tests {
     fn delivered_audio_is_copied_and_freed_once_even_when_invalid() {
         let mut source = AudioFrame::builder()
             .sample_rate(48_000)
-            .channels(2)
-            .samples(4)
-            .timecode(23)
+            .num_channels(2)
+            .num_samples(4)
+            .timecode(Timecode::from_ticks(23))
             .build()
             .unwrap();
         for (index, sample) in source.data_mut().iter_mut().enumerate() {
@@ -547,7 +499,7 @@ mod tests {
         };
         assert_eq!(frame.data(), source.data());
         assert_eq!((frame.sample_rate(), frame.num_channels()), (48_000, 2));
-        assert_eq!(frame.timecode(), 23);
+        assert_eq!(frame.timecode(), Timecode::from_ticks(23));
 
         let no_samples = NDIlib_audio_frame_v3_t {
             p_data: ptr::null_mut(),
@@ -582,13 +534,18 @@ mod tests {
 
     #[test]
     fn delivered_metadata_is_copied_and_freed_once_even_when_invalid() {
-        let source = MetadataFrame::with_data("<tally/>", 31).unwrap();
+        let source = MetadataFrame::new("<tally/>")
+            .unwrap()
+            .with_timecode(Timecode::from_ticks(31));
         let (event, releases) = deliver::<MetadataKind>(source.to_raw(), metadata_event);
         assert_eq!(releases, 1);
         let PacketEvent::Metadata(frame) = event.unwrap() else {
             panic!("metadata is copied");
         };
-        assert_eq!((frame.data(), frame.timecode()), ("<tally/>", 31));
+        assert_eq!(
+            (frame.data(), frame.timecode()),
+            ("<tally/>", Timecode::from_ticks(31))
+        );
 
         let bad_text = NDIlib_metadata_frame_t {
             length: NOT_UTF8.len() as i32,
@@ -605,11 +562,11 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new(""))).unwrap();
         native_capture_calls::take();
         assert!(matches!(
             PacketReceiver::capture_from(&receiver, Duration::MAX),
-            Err(Error::InvalidConfiguration(_))
+            Err(Error::InvalidInput(_))
         ));
         let reconnect = receiver.core.reconnect_lock();
         std::thread::scope(|scope| {
@@ -617,10 +574,9 @@ mod tests {
             let receiver = &receiver;
             let worker = scope.spawn(move || {
                 for timeout in [Duration::ZERO, Duration::from_millis(5)] {
-                    assert!(matches!(
-                        PacketReceiver::capture_from(receiver, timeout).unwrap(),
-                        PacketEvent::Timeout
-                    ));
+                    assert!(PacketReceiver::capture_from(receiver, timeout)
+                        .unwrap()
+                        .is_none());
                 }
                 done.send(native_capture_calls::take()).unwrap();
             });
@@ -634,6 +590,16 @@ mod tests {
         });
         PacketReceiver::capture_from(&receiver, Duration::ZERO).unwrap();
         assert_eq!(native_capture_calls::take(), 1);
+
+        // Nothing is connected, so nothing arrives: the capture waits out its
+        // whole budget, capturing again as often as the SDK returns early.
+        let budget = Duration::from_millis(250);
+        let began = std::time::Instant::now();
+        assert!(PacketReceiver::capture_from(&receiver, budget)
+            .unwrap()
+            .is_none());
+        assert!(began.elapsed() >= budget);
+        assert!(native_capture_calls::take() >= 1);
     }
 
     /// Only the thread auto traits are withheld; tests/ui/advanced/fail checks

@@ -5,7 +5,7 @@
 
 use grafton_ndi::{
     discovery::{AdvertiserOptions, ListenerOptions},
-    NDI,
+    Ndi,
 };
 use std::{
     io::{BufRead, BufReader, Read},
@@ -25,7 +25,7 @@ const START_ATTEMPTS: usize = 5;
 
 /// The server program of the SDK the selected runtime belongs to, or `None`
 /// when that runtime has none beside it.
-pub fn server_binary(ndi: &NDI) -> Option<PathBuf> {
+pub fn server_binary(ndi: &Ndi) -> Option<PathBuf> {
     let directory = ndi.info().library_path()?.parent()?;
     let binary = directory
         .parent()?
@@ -194,7 +194,7 @@ impl Server {
     }
 
     pub fn listeners(&self) -> ListenerOptions {
-        ListenerOptions::default().server(self.endpoint()).unwrap()
+        ListenerOptions::default().server(self.endpoint())
     }
 }
 

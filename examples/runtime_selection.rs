@@ -10,7 +10,7 @@
 //! of searching for one:
 //! `cargo run --example runtime_selection -- /opt/ndi/lib/libndi.so.6`
 
-use grafton_ndi::{Error, Runtime, RuntimeFeature, RuntimeOptions, NDI};
+use grafton_ndi::{Error, Ndi, Runtime, RuntimeFeature, RuntimeOptions};
 
 /// Capabilities that vary between runtime versions and editions.
 const FEATURES: [RuntimeFeature; 6] = [
@@ -54,11 +54,11 @@ fn main() -> Result<(), Error> {
             runtime.capabilities().status(feature)
         );
     }
-    println!("NDI started: {}", NDI::is_running());
+    println!("NDI started: {}", Ndi::is_running());
 
     // Step two: initialize. NDI runs for as long as a handle exists.
     let ndi = runtime.initialize()?;
-    println!("NDI started: {}", NDI::is_running());
+    println!("NDI started: {}", Ndi::is_running());
     drop(ndi);
     Ok(())
 }

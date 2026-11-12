@@ -2,7 +2,7 @@ use grafton_ndi::Receiver;
 fn check(owner: Receiver) {
     let frame = owner
         .video()
-        .try_capture_ref(std::time::Duration::ZERO)
+        .capture_ref(std::time::Duration::ZERO)
         .unwrap()
         .unwrap();
     let planes = frame.planes();

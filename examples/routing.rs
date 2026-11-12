@@ -15,7 +15,7 @@
 
 use grafton_ndi::{
     routing::{Router, RouterOptions},
-    Error, NDI,
+    Error, Ndi,
 };
 
 use std::{env, thread, time::Duration};
@@ -34,23 +34,23 @@ fn main() -> Result<(), Error> {
         if argument == "--name" {
             name = arguments
                 .next()
-                .ok_or_else(|| Error::InvalidConfiguration("--name needs a value".into()))?;
+                .ok_or_else(|| Error::InvalidInput("--name needs a value".into()))?;
         } else {
             extra_ips.push(argument);
         }
     }
     let extra_ips: Vec<&str> = extra_ips.iter().map(String::as_str).collect();
 
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
     let mut router = Router::new(&ndi, &RouterOptions::new(name))?;
     println!("Advertising router: {}", router.source()?);
 
     let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
-    let own_name = router.source()?.name;
+    let own = router.source()?;
     let sources: Vec<_> = finder
         .find_sources(Duration::from_secs(5))?
         .into_iter()
-        .filter(|source| source.name != own_name)
+        .filter(|source| source.name() != own.name())
         .collect();
     if sources.is_empty() {
         println!("No sources found to route to.");

@@ -5,6 +5,7 @@ use std::ptr;
 use crate::{
     error::Error,
     frames::{AudioFrame, VideoFrame},
+    media::FrameRate,
     receiver::Tally,
     sys::bindings::*,
 };
@@ -149,15 +150,15 @@ fn test_audio_frame_channel_data_interleaved() {
     let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
     let frame = AudioFrame::builder()
         .sample_rate(48000)
-        .channels(2)
-        .samples(3)
+        .num_channels(2)
+        .num_samples(3)
         .data(data)
         .layout(AudioLayout::Interleaved)
         .build()
         .unwrap();
 
     // Data is converted to planar at build time, stride is always set
-    assert_eq!(frame.channel_stride_in_bytes(), 12); // 3 samples * 4 bytes
+    assert_eq!(frame.channel_stride_bytes(), 12); // 3 samples * 4 bytes
 
     // After conversion, channel_data should return the de-interleaved samples
     let ch0 = frame.channel_data(0).unwrap();
@@ -175,8 +176,8 @@ fn test_audio_frame_builder_data_length_validation() {
 
     // Too few samples
     let result = AudioFrame::builder()
-        .channels(2)
-        .samples(3)
+        .num_channels(2)
+        .num_samples(3)
         .data(vec![1.0, 2.0, 3.0]) // 3 instead of 6
         .layout(AudioLayout::Planar)
         .build();
@@ -192,8 +193,8 @@ fn test_audio_frame_builder_data_length_validation() {
 
     // Too many samples
     let result = AudioFrame::builder()
-        .channels(2)
-        .samples(3)
+        .num_channels(2)
+        .num_samples(3)
         .data(vec![1.0; 10])
         .layout(AudioLayout::Interleaved)
         .build();
@@ -215,14 +216,14 @@ fn test_audio_frame_channel_data_planar() {
     let data = vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0];
     let frame = AudioFrame::builder()
         .sample_rate(48000)
-        .channels(2)
-        .samples(3)
+        .num_channels(2)
+        .num_samples(3)
         .data(data)
         .layout(AudioLayout::Planar)
         .build()
         .unwrap();
 
-    assert_eq!(frame.channel_stride_in_bytes(), 12);
+    assert_eq!(frame.channel_stride_bytes(), 12);
 
     let ch0 = frame.channel_data(0).unwrap();
     assert_eq!(ch0, vec![1.0, 3.0, 5.0]);
@@ -237,35 +238,35 @@ fn test_audio_frame_channel_data_planar() {
 fn test_audio_frame_default_layout() {
     let frame = AudioFrame::builder()
         .sample_rate(48000)
-        .channels(2)
-        .samples(100)
+        .num_channels(2)
+        .num_samples(100)
         .build()
         .unwrap();
 
-    assert_eq!(frame.channel_stride_in_bytes(), 400);
+    assert_eq!(frame.channel_stride_bytes(), 400);
 }
 
 #[test]
 fn test_video_frame_builder() {
     let frame = VideoFrame::builder()
         .resolution(1920, 1080)
-        .frame_rate(30, 1)
+        .frame_rate(FrameRate::new(30, 1).unwrap())
         .metadata("test metadata")
         .build()
         .unwrap();
 
     assert_eq!(frame.width(), 1920);
     assert_eq!(frame.height(), 1080);
-    assert_eq!(frame.frame_rate_n(), 30);
-    assert_eq!(frame.frame_rate_d(), 1);
+    let rate = frame.frame_rate();
+    assert_eq!((rate.numerator(), rate.denominator()), (30, 1));
 }
 
 #[test]
 fn test_audio_frame_builder() {
     let frame = AudioFrame::builder()
         .sample_rate(48000)
-        .channels(2)
-        .samples(1024)
+        .num_channels(2)
+        .num_samples(1024)
         .build()
         .unwrap();
 
@@ -273,22 +274,21 @@ fn test_audio_frame_builder() {
     assert_eq!(frame.num_channels(), 2);
     assert_eq!(frame.num_samples(), 1024);
     assert_eq!(frame.data().len(), 2048);
-    assert_eq!(frame.channel_stride_in_bytes(), 4096);
+    assert_eq!(frame.channel_stride_bytes(), 4096);
 }
 
 #[test]
-fn test_tally_to_raw() {
-    let tally = Tally::new(true, false);
-    let raw = tally.to_raw();
-
-    assert!(raw.on_program);
-    assert!(!raw.on_preview);
-
-    let tally2 = Tally::new(false, true);
-    let raw2 = tally2.to_raw();
-
-    assert!(!raw2.on_program);
-    assert!(raw2.on_preview);
+fn test_tally_round_trips_through_the_sdk_descriptor() {
+    for (on_program, on_preview) in [(false, false), (true, false), (false, true), (true, true)] {
+        let tally = Tally::new(on_program, on_preview);
+        assert_eq!(
+            (tally.on_program(), tally.on_preview()),
+            (on_program, on_preview)
+        );
+        let raw = tally.to_sdk();
+        assert_eq!((raw.on_program, raw.on_preview), (on_program, on_preview));
+    }
+    assert_eq!(Tally::default(), Tally::new(false, false));
 }
 
 #[test]
@@ -357,9 +357,6 @@ fn test_source_address_contains_host() {
     assert!(!url_addr.contains_host("8080"));
     assert!(url_addr.contains_host("CAMERA.LOCAL."));
     assert!(!url_addr.contains_host("other.local"));
-
-    let none_addr = SourceAddress::None;
-    assert!(!none_addr.contains_host("anything"));
 }
 
 #[test]
@@ -384,9 +381,6 @@ fn test_source_address_port() {
     let url_scheme_only = SourceAddress::Url("http://camera.local/stream".to_string());
     assert_eq!(url_scheme_only.port(), None);
 
-    let none_addr = SourceAddress::None;
-    assert_eq!(none_addr.port(), None);
-
     // An unbracketed IPv6 literal has no explicit port delimiter.
     let ipv6_literal = SourceAddress::Ip("fe80::1:5960".to_string());
     assert_eq!(ipv6_literal.port(), None);
@@ -399,10 +393,8 @@ fn test_source_address_port() {
 fn test_source_matches_host() {
     use crate::finder::{Source, SourceAddress};
 
-    let source = Source {
-        name: "CAMERA1 (Chan1)".to_string(),
-        address: SourceAddress::Ip("192.168.0.107:5960".to_string()),
-    };
+    let source = Source::new("CAMERA1 (Chan1)")
+        .with_address(SourceAddress::Ip("192.168.0.107:5960".to_string()));
     assert!(source.matches_host("192.168.0.107"));
     assert!(!source.matches_host("192.168.0"));
     assert!(!source.matches_host("192.168.1"));
@@ -411,18 +403,13 @@ fn test_source_matches_host() {
     assert!(!source.matches_host("Chan1"));
     assert!(!source.matches_host("CAMERA2"));
 
-    let url_source = Source {
-        name: "Studio Camera".to_string(),
-        address: SourceAddress::Url("http://studio.local:8080".to_string()),
-    };
+    let url_source = Source::new("Studio Camera")
+        .with_address(SourceAddress::Url("http://studio.local:8080".to_string()));
     assert!(url_source.matches_host("studio.local"));
     assert!(!url_source.matches_host("Studio"));
     assert!(!url_source.matches_host("other"));
 
-    let no_addr_source = Source {
-        name: "Local Source".to_string(),
-        address: SourceAddress::None,
-    };
+    let no_addr_source = Source::new("Local Source");
     assert!(!no_addr_source.matches_host("Local"));
     assert!(!no_addr_source.matches_host("192.168.1.1"));
 }
@@ -431,40 +418,28 @@ fn test_source_matches_host() {
 fn test_source_host() {
     use crate::finder::{Source, SourceAddress};
 
-    let ip_source = Source {
-        name: "CAMERA1".to_string(),
-        address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
-    };
+    let ip_source =
+        Source::new("CAMERA1").with_address(SourceAddress::Ip("192.168.1.100:5960".to_string()));
     assert_eq!(ip_source.host(), Some("192.168.1.100"));
 
-    let ip_no_port = Source {
-        name: "CAMERA2".to_string(),
-        address: SourceAddress::Ip("192.168.1.101".to_string()),
-    };
+    let ip_no_port =
+        Source::new("CAMERA2").with_address(SourceAddress::Ip("192.168.1.101".to_string()));
     assert_eq!(ip_no_port.host(), Some("192.168.1.101"));
 
-    let url_source = Source {
-        name: "Studio".to_string(),
-        address: SourceAddress::Url("http://camera.local:8080".to_string()),
-    };
+    let url_source = Source::new("Studio")
+        .with_address(SourceAddress::Url("http://camera.local:8080".to_string()));
     assert_eq!(url_source.host(), Some("camera.local"));
 
-    let url_with_path = Source {
-        name: "Studio2".to_string(),
-        address: SourceAddress::Url("http://camera.local:8080/stream".to_string()),
-    };
+    let url_with_path = Source::new("Studio2").with_address(SourceAddress::Url(
+        "http://camera.local:8080/stream".to_string(),
+    ));
     assert_eq!(url_with_path.host(), Some("camera.local"));
 
-    let url_no_scheme = Source {
-        name: "Studio3".to_string(),
-        address: SourceAddress::Url("camera.local:8080".to_string()),
-    };
+    let url_no_scheme =
+        Source::new("Studio3").with_address(SourceAddress::Url("camera.local:8080".to_string()));
     assert_eq!(url_no_scheme.host(), Some("camera.local"));
 
-    let none_source = Source {
-        name: "None".to_string(),
-        address: SourceAddress::None,
-    };
+    let none_source = Source::new("None");
     assert_eq!(none_source.host(), None);
 }
 
@@ -472,17 +447,15 @@ fn test_source_host() {
 fn test_source_matching_real_world_example() {
     use crate::finder::{Source, SourceAddress};
 
-    let source = Source {
-        name: "CAMERA1 (Chan1, 192.168.0.107)".to_string(),
-        address: SourceAddress::Ip("192.168.0.107:5960".to_string()),
-    };
+    let source = Source::new("CAMERA1 (Chan1, 192.168.0.107)")
+        .with_address(SourceAddress::Ip("192.168.0.107:5960".to_string()));
 
     assert!(source.matches_host("192.168.0.107"));
     assert!(!source.matches_host("192.168.0"));
     assert!(source.matches_host("CAMERA1"));
     assert!(source.matches_host("192.168.0.107"));
     assert_eq!(source.host(), Some("192.168.0.107"));
-    assert_eq!(source.address.port(), Some(5960));
+    assert_eq!(source.address().unwrap().port(), Some(5960));
 }
 
 #[test]
@@ -533,7 +506,7 @@ fn test_video_frame_encode_png_rgba() {
 
     let frame = VideoFrame::builder()
         .resolution(width, height)
-        .pixel_format(PixelFormat::RGBA)
+        .pixel_format(PixelFormat::Rgba)
         .build()
         .unwrap();
 
@@ -565,7 +538,7 @@ fn test_video_frame_encode_png_bgra() {
 
     let frame = VideoFrame::builder()
         .resolution(width, height)
-        .pixel_format(PixelFormat::BGRA)
+        .pixel_format(PixelFormat::Bgra)
         .build()
         .unwrap();
 
@@ -588,7 +561,7 @@ fn test_video_frame_encode_png_unsupported_format() {
 
     let frame = VideoFrame::builder()
         .resolution(2, 2)
-        .pixel_format(PixelFormat::UYVY)
+        .pixel_format(PixelFormat::Uyvy)
         .build()
         .unwrap();
 
@@ -605,7 +578,7 @@ fn test_video_frame_encode_png_unsupported_format() {
 fn test_video_frame_encode_rejects_multi_plane_422_formats() {
     use crate::frames::{ImageFormat, PixelFormat, VideoFrame};
 
-    for format in [PixelFormat::UYVA, PixelFormat::P216, PixelFormat::PA16] {
+    for format in [PixelFormat::Uyva, PixelFormat::P216, PixelFormat::Pa16] {
         let frame = VideoFrame::builder()
             .resolution(4, 2)
             .pixel_format(format)
@@ -639,7 +612,7 @@ fn test_video_frame_encode_jpeg_rgba() {
 
     let frame = VideoFrame::builder()
         .resolution(width, height)
-        .pixel_format(PixelFormat::RGBA)
+        .pixel_format(PixelFormat::Rgba)
         .build()
         .unwrap();
 
@@ -669,7 +642,7 @@ fn test_video_frame_encode_jpeg_bgra() {
 
     let frame = VideoFrame::builder()
         .resolution(width, height)
-        .pixel_format(PixelFormat::BGRA)
+        .pixel_format(PixelFormat::Bgra)
         .build()
         .unwrap();
 
@@ -708,7 +681,7 @@ fn test_video_frame_encode_jpeg_quality_range() {
 
     let frame = VideoFrame::builder()
         .resolution(width, height)
-        .pixel_format(PixelFormat::RGBA)
+        .pixel_format(PixelFormat::Rgba)
         .build()
         .unwrap();
 
@@ -738,7 +711,7 @@ fn test_video_frame_encode_data_url_png() {
 
     let frame = VideoFrame::builder()
         .resolution(width, height)
-        .pixel_format(PixelFormat::RGBA)
+        .pixel_format(PixelFormat::Rgba)
         .build()
         .unwrap();
 
@@ -774,7 +747,7 @@ fn test_video_frame_encode_data_url_jpeg() {
 
     let frame = VideoFrame::builder()
         .resolution(width, height)
-        .pixel_format(PixelFormat::RGBA)
+        .pixel_format(PixelFormat::Rgba)
         .build()
         .unwrap();
 
@@ -833,16 +806,13 @@ fn test_source_cache_len_and_is_empty() {
 fn test_receiver_snapshot_preset() {
     use crate::{
         finder::{Source, SourceAddress},
-        receiver::ReceiverOptionsBuilder,
+        receiver::ReceiverOptions,
     };
 
-    let source = Source {
-        name: "Test Source".to_string(),
-        address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
-    };
+    let source = Source::new("Test Source")
+        .with_address(SourceAddress::Ip("192.168.1.100:5960".to_string()));
 
-    let builder = ReceiverOptionsBuilder::snapshot_preset(source.clone());
-    let customized = builder.name("My Snapshot Receiver");
+    let customized = ReceiverOptions::snapshot_preset(source.clone()).name("My Snapshot Receiver");
     let _ = format!("{customized:?}");
 }
 
@@ -850,16 +820,13 @@ fn test_receiver_snapshot_preset() {
 fn test_receiver_high_quality_preset() {
     use crate::{
         finder::{Source, SourceAddress},
-        receiver::ReceiverOptionsBuilder,
+        receiver::ReceiverOptions,
     };
 
-    let source = Source {
-        name: "Test Source".to_string(),
-        address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
-    };
+    let source = Source::new("Test Source")
+        .with_address(SourceAddress::Ip("192.168.1.100:5960".to_string()));
 
-    let builder = ReceiverOptionsBuilder::high_quality_preset(source.clone());
-    let customized = builder.name("My HQ Receiver");
+    let customized = ReceiverOptions::high_quality_preset(source.clone()).name("My HQ Receiver");
     let _ = format!("{customized:?}");
 }
 
@@ -867,16 +834,13 @@ fn test_receiver_high_quality_preset() {
 fn test_receiver_monitoring_preset() {
     use crate::{
         finder::{Source, SourceAddress},
-        receiver::ReceiverOptionsBuilder,
+        receiver::ReceiverOptions,
     };
 
-    let source = Source {
-        name: "Test Source".to_string(),
-        address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
-    };
+    let source = Source::new("Test Source")
+        .with_address(SourceAddress::Ip("192.168.1.100:5960".to_string()));
 
-    let builder = ReceiverOptionsBuilder::monitoring_preset(source.clone());
-    let customized = builder.name("My Monitor");
+    let customized = ReceiverOptions::monitoring_preset(source.clone()).name("My Monitor");
     let _ = format!("{customized:?}");
 }
 
@@ -884,17 +848,15 @@ fn test_receiver_monitoring_preset() {
 fn test_receiver_presets_are_distinct() {
     use crate::{
         finder::{Source, SourceAddress},
-        receiver::ReceiverOptionsBuilder,
+        receiver::ReceiverOptions,
     };
 
-    let source = Source {
-        name: "Test Source".to_string(),
-        address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
-    };
+    let source = Source::new("Test Source")
+        .with_address(SourceAddress::Ip("192.168.1.100:5960".to_string()));
 
-    let _snapshot = ReceiverOptionsBuilder::snapshot_preset(source.clone());
-    let _hq = ReceiverOptionsBuilder::high_quality_preset(source.clone());
-    let _monitor = ReceiverOptionsBuilder::monitoring_preset(source.clone());
+    let _snapshot = ReceiverOptions::snapshot_preset(source.clone());
+    let _hq = ReceiverOptions::high_quality_preset(source.clone());
+    let _monitor = ReceiverOptions::monitoring_preset(source.clone());
 }
 
 // Async runtime integration tests (feature-gated)
@@ -902,9 +864,9 @@ fn test_receiver_presets_are_distinct() {
 #[test]
 fn test_tokio_async_receiver_creation() {
     use crate::{
-        finder::{Source, SourceAddress},
-        receiver::{Receiver, ReceiverOptionsBuilder},
-        NDI,
+        finder::Source,
+        receiver::{Receiver, ReceiverOptions},
+        Ndi,
     };
 
     // Test that AsyncReceiver can be created and is cloneable
@@ -918,19 +880,16 @@ fn test_tokio_async_receiver_creation() {
     // Note: We can't create a real receiver without NDI SDK runtime,
     // so we just test the type exists and compiles
     let _ = || {
-        use crate::tokio::AsyncReceiver;
+        use crate::asynchronous::tokio::AsyncReceiver;
 
         // Mock receiver (won't actually work without NDI initialized)
-        let source = Source {
-            name: "Test".into(),
-            address: SourceAddress::None,
-        };
+        let source = Source::new("Test");
 
         // This won't run but proves the API compiles
         if false {
             use std::sync::Arc;
-            let ndi = Arc::new(NDI::new().unwrap());
-            let options = ReceiverOptionsBuilder::snapshot_preset(source).build();
+            let ndi = Arc::new(Ndi::new().unwrap());
+            let options = ReceiverOptions::snapshot_preset(source);
             let receiver = Receiver::new(&ndi, &options).unwrap();
             let async_receiver = AsyncReceiver::new(receiver);
             let _cloned = async_receiver.clone();
@@ -945,23 +904,20 @@ fn test_tokio_async_receiver_methods_exist() {
     // This is a compile-time test - if it compiles, the methods exist
 
     use crate::{
-        finder::{Source, SourceAddress},
-        receiver::{Receiver, ReceiverOptionsBuilder},
-        tokio::AsyncReceiver,
-        NDI,
+        asynchronous::tokio::AsyncReceiver,
+        finder::Source,
+        receiver::{Receiver, ReceiverOptions},
+        Ndi,
     };
 
     // Test that all methods exist and can be called (in a closure that won't execute)
     let _ = || async {
-        let source = Source {
-            name: "Test".into(),
-            address: SourceAddress::None,
-        };
+        let source = Source::new("Test");
 
         if false {
             use std::sync::Arc;
-            let ndi = Arc::new(NDI::new().unwrap());
-            let options = ReceiverOptionsBuilder::snapshot_preset(source).build();
+            let ndi = Arc::new(Ndi::new().unwrap());
+            let options = ReceiverOptions::snapshot_preset(source);
             let receiver = Receiver::new(&ndi, &options).unwrap();
             let async_receiver = AsyncReceiver::new(receiver);
 
@@ -970,33 +926,21 @@ fn test_tokio_async_receiver_methods_exist() {
                 .video()
                 .capture(std::time::Duration::from_secs(5))
                 .await;
-            let _ = async_receiver
-                .video()
-                .try_capture(std::time::Duration::from_millis(100))
-                .await;
 
             let _ = async_receiver
                 .audio()
                 .capture(std::time::Duration::from_secs(5))
                 .await;
-            let _ = async_receiver
-                .audio()
-                .try_capture(std::time::Duration::from_millis(100))
-                .await;
 
             let _ = async_receiver
                 .metadata()
                 .capture(std::time::Duration::from_secs(5))
-                .await;
-            let _ = async_receiver
-                .metadata()
-                .try_capture(std::time::Duration::from_millis(100))
                 .await;
 
             // Liveness / recovery primitives (Issue #997).
             let _: bool = async_receiver.is_connected();
             let _stats = async_receiver.connection_stats();
-            let _: u64 = async_receiver.connection_stats().video_frames_received;
+            let _: u64 = async_receiver.connection_stats().video_frames_received();
             let _: crate::Result<()> = async_receiver.reconnect().await;
         }
     };
@@ -1006,26 +950,23 @@ fn test_tokio_async_receiver_methods_exist() {
 #[test]
 fn test_smol_async_receiver_creation() {
     use crate::{
-        finder::{Source, SourceAddress},
-        receiver::{Receiver, ReceiverOptionsBuilder},
-        NDI,
+        finder::Source,
+        receiver::{Receiver, ReceiverOptions},
+        Ndi,
     };
 
     // Test that AsyncReceiver can be created and is cloneable for smol
 
     let _ = || {
-        use crate::smol::AsyncReceiver;
+        use crate::asynchronous::smol::AsyncReceiver;
 
-        let source = Source {
-            name: "Test".into(),
-            address: SourceAddress::None,
-        };
+        let source = Source::new("Test");
 
         // This won't run but proves the API compiles
         if false {
             use std::sync::Arc;
-            let ndi = Arc::new(NDI::new().unwrap());
-            let options = ReceiverOptionsBuilder::snapshot_preset(source).build();
+            let ndi = Arc::new(Ndi::new().unwrap());
+            let options = ReceiverOptions::snapshot_preset(source);
             let receiver = Receiver::new(&ndi, &options).unwrap();
             let async_receiver = AsyncReceiver::new(receiver);
             let _cloned = async_receiver.clone();
@@ -1039,23 +980,20 @@ fn test_smol_async_receiver_methods_exist() {
     // Verify all expected async methods exist on smol AsyncReceiver
 
     use crate::{
-        finder::{Source, SourceAddress},
-        receiver::{Receiver, ReceiverOptionsBuilder},
-        smol::AsyncReceiver,
-        NDI,
+        asynchronous::smol::AsyncReceiver,
+        finder::Source,
+        receiver::{Receiver, ReceiverOptions},
+        Ndi,
     };
 
     // Test that all methods exist and can be called (in a closure that won't execute)
     let _ = || async {
-        let source = Source {
-            name: "Test".into(),
-            address: SourceAddress::None,
-        };
+        let source = Source::new("Test");
 
         if false {
             use std::sync::Arc;
-            let ndi = Arc::new(NDI::new().unwrap());
-            let options = ReceiverOptionsBuilder::snapshot_preset(source).build();
+            let ndi = Arc::new(Ndi::new().unwrap());
+            let options = ReceiverOptions::snapshot_preset(source);
             let receiver = Receiver::new(&ndi, &options).unwrap();
             let async_receiver = AsyncReceiver::new(receiver);
 
@@ -1064,33 +1002,21 @@ fn test_smol_async_receiver_methods_exist() {
                 .video()
                 .capture(std::time::Duration::from_secs(5))
                 .await;
-            let _ = async_receiver
-                .video()
-                .try_capture(std::time::Duration::from_millis(100))
-                .await;
 
             let _ = async_receiver
                 .audio()
                 .capture(std::time::Duration::from_secs(5))
                 .await;
-            let _ = async_receiver
-                .audio()
-                .try_capture(std::time::Duration::from_millis(100))
-                .await;
 
             let _ = async_receiver
                 .metadata()
                 .capture(std::time::Duration::from_secs(5))
-                .await;
-            let _ = async_receiver
-                .metadata()
-                .try_capture(std::time::Duration::from_millis(100))
                 .await;
 
             // Liveness / recovery primitives (Issue #997).
             let _: bool = async_receiver.is_connected();
             let _stats = async_receiver.connection_stats();
-            let _: u64 = async_receiver.connection_stats().video_frames_received;
+            let _: u64 = async_receiver.connection_stats().video_frames_received();
             let _: crate::Result<()> = async_receiver.reconnect().await;
         }
     };
@@ -1103,13 +1029,13 @@ fn test_async_feature_flags_mutually_compatible() {
 
     #[cfg(feature = "tokio")]
     {
-        use crate::tokio::AsyncReceiver as TokioAsyncReceiver;
+        use crate::asynchronous::tokio::AsyncReceiver as TokioAsyncReceiver;
         let _tokio_type_check = std::any::type_name::<TokioAsyncReceiver>();
     }
 
     #[cfg(feature = "smol")]
     {
-        use crate::smol::AsyncReceiver as SmolReceiver;
+        use crate::asynchronous::smol::AsyncReceiver as SmolReceiver;
         let _smol_type_check = std::any::type_name::<SmolReceiver>();
     }
 
@@ -1138,7 +1064,7 @@ fn test_video_frame_from_raw_uncompressed_bgra() {
         // Verify data size calculation
         let expected_size = (line_stride * test_height) as usize;
         assert_eq!(frame.data().len(), expected_size);
-        assert_eq!(frame.pixel_format(), PixelFormat::BGRA);
+        assert_eq!(frame.pixel_format(), PixelFormat::Bgra);
 
         drop(frame);
         Vec::from_raw_parts(c_frame.p_data, expected_size, expected_size);
@@ -1187,7 +1113,7 @@ fn test_video_frame_to_raw_roundtrip_uncompressed() {
 
     let frame = VideoFrame::builder()
         .resolution(1920, 1080)
-        .pixel_format(PixelFormat::BGRA)
+        .pixel_format(PixelFormat::Bgra)
         .build()
         .unwrap();
 
@@ -1208,7 +1134,7 @@ fn test_video_frame_builder_creates_line_stride_bytes() {
 
     let frame = VideoFrame::builder()
         .resolution(640, 480)
-        .pixel_format(PixelFormat::RGBA)
+        .pixel_format(PixelFormat::Rgba)
         .build()
         .unwrap();
 
@@ -1287,7 +1213,7 @@ mod runtime_tests {
     /// operations from multiple threads.
     #[test]
     fn test_mixed_acquire_release_concurrent() {
-        use crate::NDI;
+        use crate::Ndi;
 
         // Establish that a runtime exists; the threads below then exercise
         // their own acquisitions, including first initialization.
@@ -1302,7 +1228,7 @@ mod runtime_tests {
             let count = Arc::clone(&success_count);
             handles.push(thread::spawn(move || {
                 for _ in 0..50 {
-                    let ndi = NDI::new().expect("every concurrent acquisition must succeed");
+                    let ndi = Ndi::new().expect("every concurrent acquisition must succeed");
                     let _clone = ndi.clone();
                     count.fetch_add(1, Ordering::Relaxed);
                     // Both ndi and _clone are dropped here
@@ -1322,23 +1248,23 @@ mod runtime_tests {
     /// Test that is_running is consistent with actual runtime state.
     #[test]
     fn test_is_running_consistency() {
-        use crate::NDI;
+        use crate::Ndi;
 
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
         // With an active handle, is_running should be true
-        assert!(NDI::is_running());
+        assert!(Ndi::is_running());
 
         let clone = ndi.clone();
-        assert!(NDI::is_running());
+        assert!(Ndi::is_running());
 
         drop(clone);
         // Still running because ndi is alive
-        assert!(NDI::is_running());
+        assert!(Ndi::is_running());
 
         drop(ndi);
         // After dropping all handles, state depends on test isolation.
-        let _final_state = NDI::is_running();
+        let _final_state = Ndi::is_running();
     }
 }

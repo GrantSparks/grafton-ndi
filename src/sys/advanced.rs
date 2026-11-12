@@ -4,10 +4,11 @@
 //! Missing declaration families have uninhabited stand-ins; wrappers preserve
 //! their public API and return a typed capability error before reaching them.
 
-use super::{table::Resolver, Evidence, Table};
+use super::{bindings::NDIlib_recv_color_format_e, table::Resolver, Evidence, Table};
 use crate::{
-    capabilities::{CapabilityUnavailable, RuntimeFeature, SdkEdition},
-    Error, Result,
+    advanced::PassthroughPreset,
+    capabilities::{CapabilityUnavailable, RuntimeFeature},
+    Result,
 };
 use std::ffi::CStr;
 
@@ -48,72 +49,17 @@ macro_rules! native {
 }
 pub(crate) use native;
 
-/// The error for an Advanced table, reported under `capability`, that did not
-/// resolve for want of `symbol`: a function this build does not declare when
-/// the family is not `declared`, and otherwise one the runtime does not export.
+/// Define the Advanced SDK's tables.
 ///
-/// The reasons are tried in the order [`Capabilities`] derives them in.
-///
-/// [`Capabilities`]: crate::capabilities::Capabilities
-fn unresolved(
-    capability: &'static str,
-    edition: SdkEdition,
-    declared: bool,
-    symbol: &CStr,
-) -> Error {
-    let reason = if !declared {
-        CapabilityUnavailable::BuildAbiUnavailable
-    } else if edition == SdkEdition::Advanced {
-        CapabilityUnavailable::SymbolUnavailable
-    } else {
-        CapabilityUnavailable::WrongEdition
-    };
-    Error::UnsupportedCapability {
-        capability,
-        reason,
-        detail: symbol.to_string_lossy().into_owned(),
-    }
-}
-
-/// How an `advanced_tables!` entry is gated.
-///
-/// An entry names either the [`RuntimeFeature`] it is gated and reported
-/// under, as an `optional_tables!` entry does, or the name it is reported
-/// under when the table alone is its gate.
-macro_rules! gate {
-    // Handed out under the feature's status, as a core table is, so that
-    // `NDI::require_feature` and the table always agree.
-    (of $Table:ident in $field:ident: $feature:ident, $evidence:ident) => {
-        $evidence.capability(RuntimeFeature::$feature, &$evidence.advanced.$field)
-    };
-    (of $Table:ident in $field:ident: $capability:literal, $evidence:ident) => {
-        $evidence.advanced.$field.as_ref().map_err(|symbol| {
-            unresolved(
-                $capability,
-                $evidence.info.edition(),
-                declared! { $Table { true } else { false } },
-                symbol,
-            )
-        })
-    };
-    (missing $field:ident: $feature:ident, $api:ident, $requested:ident) => {
-        if $requested == RuntimeFeature::$feature {
-            return $api.$field.as_ref().err().copied();
-        }
-    };
-    (missing $field:ident: $capability:literal, $api:ident, $requested:ident) => {};
-    (declares $Table:ident: $feature:ident, $requested:ident) => {
-        if $requested == RuntimeFeature::$feature {
-            return declared! { $Table { true } else { false } };
-        }
-    };
-    (declares $Table:ident: $capability:literal, $requested:ident) => {};
-}
-
+/// Each entry states, once, everything about one capability: the table of its
+/// entry points, the field of [`AdvancedApi`] that holds it, and the
+/// [`RuntimeFeature`] it is gated and reported under. A table is handed out
+/// under its feature's status, as a core table is, so that
+/// `Ndi::require_feature` and the table always agree.
 macro_rules! advanced_tables {
     ($(
         $(#[$meta:meta])*
-        struct $Table:ident in $field:ident: $gate:tt {
+        struct $Table:ident in $field:ident: $feature:ident {
             $(fn $name:ident($($argument:ident: $type:ty),* $(,)?) $(-> $return:ty)?;)+
         }
     )+) => {
@@ -154,7 +100,7 @@ macro_rules! advanced_tables {
 
             impl Table for $Table {
                 fn within(evidence: Evidence<'_>) -> Result<&'_ Self> {
-                    gate!(of $Table in $field: $gate, evidence)
+                    evidence.capability(RuntimeFeature::$feature, &evidence.advanced.$field)
                 }
             }
         )+
@@ -171,21 +117,47 @@ macro_rules! advanced_tables {
 
             /// The first function of the table gated by `feature` that did not
             /// resolve: one the implementation does not export or, when its
-            /// family is not declared, one this build does not declare. `None`
-            /// when the table resolved, and for a feature that gates no table
-            /// here.
+            /// family is not declared, one this build does not declare. A
+            /// passthrough preset's receiver is the configured receiver, after
+            /// the color format constant this build may not declare. `None`
+            /// when everything resolved, and for a core feature.
             pub(crate) fn missing(&self, feature: RuntimeFeature) -> Option<&'static CStr> {
-                $(gate!(missing $field: $gate, self, feature);)+
-                None
+                match feature {
+                    $(RuntimeFeature::$feature => self.$field.as_ref().err().copied(),)+
+                    RuntimeFeature::Passthrough(preset) => passthrough_format(preset)
+                        .err()
+                        .or_else(|| self.missing(RuntimeFeature::AdvancedReceiverConfiguration)),
+                    _ => None,
+                }
             }
 
-            /// Whether this build declares the table gated by `feature`.
-            /// `false` for a feature that gates no table here.
+            /// Whether this build declares what `feature` needs: the table it
+            /// gates and, for a passthrough preset, the color format constant
+            /// that selects it. `false` for a core feature.
             pub(crate) fn declares(feature: RuntimeFeature) -> bool {
-                $(gate!(declares $Table: $gate, feature);)+
-                false
+                match feature {
+                    $(RuntimeFeature::$feature => declared! { $Table { true } else { false } },)+
+                    RuntimeFeature::Passthrough(preset) => {
+                        passthrough_format(preset).is_ok()
+                            && Self::declares(RuntimeFeature::AdvancedReceiverConfiguration)
+                    }
+                    _ => false,
+                }
             }
         }
+
+        /// Each Advanced table's feature, exported names and gate, for tests
+        /// that hold every gate to the feature it reports.
+        #[cfg(test)]
+        pub(crate) const GATES: &[(
+            RuntimeFeature,
+            &[&CStr],
+            fn(Evidence<'_>) -> Result<()>,
+        )] = &[$((
+            RuntimeFeature::$feature,
+            $Table::SYMBOLS,
+            |evidence| $Table::within(evidence).map(|_| ()),
+        ),)+];
 
         #[cfg(all(test, ndi_has_advanced_header))]
         const TABLES: &[(&str, &[&CStr])] = &[$((stringify!($Table), $Table::SYMBOLS),)+];
@@ -193,6 +165,78 @@ macro_rules! advanced_tables {
 }
 
 include!("advanced_tables.rs");
+
+/// The receiver color format a packet receiver is created with to pass
+/// through `preset`, or the header's name for the constant that gives it
+/// when this build does not declare it.
+pub(crate) fn passthrough_format(
+    preset: PassthroughPreset,
+) -> std::result::Result<NDIlib_recv_color_format_e, &'static CStr> {
+    macro_rules! formats {
+        ($($Preset:ident => $constant:ident,)+) => {
+            match preset {
+                $(PassthroughPreset::$Preset => declared! { $constant {
+                    // The extended color formats take the target's C enum
+                    // type; the creation settings carry the same bits.
+                    Ok(NDIlib_recv_color_format_e::from_ne_bytes(
+                        super::advanced_bindings::$constant.to_ne_bytes(),
+                    ))
+                } else {
+                    Err(super::table::symbol_name(concat!(stringify!($constant), "\0")))
+                } },)+
+            }
+        };
+    }
+    let format: std::result::Result<_, &'static CStr> = formats! {
+        SpeedHqOnly => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v1,
+        SpeedHq => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v2,
+        SpeedHqBest => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v2_best,
+        H264 => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v3,
+        H264Best => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v3_best,
+        H264WithAudio => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v3_with_audio,
+        Hevc => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v4,
+        HevcBest => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v4_best,
+        HevcWithAudio => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v4_with_audio,
+        Alpha => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v5,
+        AlphaBest => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v5_best,
+        AlphaWithAudio => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v5_with_audio,
+        Protected => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6,
+        ProtectedBest => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6_best,
+        ProtectedWithAudio => NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6_with_audio,
+    };
+    // The headers declare each constant without its enumeration's name, which
+    // the generated binding prefixes it with.
+    format.map_err(|binding| {
+        binding
+            .to_bytes_with_nul()
+            .strip_prefix(b"NDIlib_recv_color_format_ex_e_")
+            .and_then(|name| CStr::from_bytes_with_nul(name).ok())
+            .unwrap_or(binding)
+    })
+}
+
+impl Evidence<'_> {
+    /// The receiver color format that selects `preset`, once the preset's
+    /// gate allows it. That gate includes the configured receiver's, so the
+    /// receiver's table is then available too.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
+    /// for [`RuntimeFeature::Passthrough`], whenever [`Self::require`]
+    /// refuses it.
+    pub(crate) fn passthrough_format(
+        self,
+        preset: PassthroughPreset,
+    ) -> Result<NDIlib_recv_color_format_e> {
+        let feature = RuntimeFeature::Passthrough(preset);
+        self.require(feature)?;
+        // The preset's status is available only when its constant is
+        // declared, so this is reached only if that rule ever changes.
+        passthrough_format(preset)
+            .map_err(|_| self.unavailable(feature, CapabilityUnavailable::BuildAbiUnavailable))
+    }
+}
 
 #[cfg(all(test, ndi_has_advanced_header))]
 #[path = "advanced_coverage_tests.rs"]

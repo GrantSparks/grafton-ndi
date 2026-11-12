@@ -14,11 +14,11 @@ use grafton_ndi::{
     discovery::{
         AdvertiserOptions, ListenerOptions, ReceiverCommand, ReceiverId, ReceiverStream,
         RecvAdvertisement, RecvAdvertiser, RecvListener, SendAdvertisement, SendAdvertiser,
-        SendListener, Wait,
+        SendListener,
     },
     routing::{Router, RouterOptions},
     runtime::RuntimeOptions,
-    Error, Receiver, ReceiverOptions, Sender, SenderOptions, Source, SourceAddress, NDI,
+    Error, Ndi, Receiver, ReceiverOptions, Sender, SenderOptions, Source,
 };
 use std::{fs, path::PathBuf, process::Command, time::Duration};
 
@@ -135,7 +135,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// The error of each Discovery Server constructor, in `DISCOVERY_SERVER` order.
 fn constructor_errors(
-    ndi: &NDI,
+    ndi: &Ndi,
     advertiser: &AdvertiserOptions,
     listener: &ListenerOptions,
 ) -> [Option<Error>; 4] {
@@ -151,14 +151,14 @@ fn constructor_errors(
 fn server() -> (AdvertiserOptions, ListenerOptions) {
     (
         AdvertiserOptions::default().servers(SERVER),
-        ListenerOptions::default().server(SERVER).unwrap(),
+        ListenerOptions::default().server(SERVER),
     )
 }
 
 /// Every Discovery Server capability is unavailable for `expected`, and every
-/// constructor says so, under the capability's name and with `evidence`,
-/// without calling the SDK. `NDI::require_feature` gives the same error.
-fn assert_refused(ndi: &NDI, expected: CapabilityUnavailable, evidence: &str) {
+/// constructor says so, reporting the capability with `evidence`, without
+/// calling the SDK. `Ndi::require_feature` gives the same error.
+fn assert_refused(ndi: &Ndi, expected: CapabilityUnavailable, evidence: &str) {
     let (advertisers, listeners) = server();
     let errors = constructor_errors(ndi, &advertisers, &listeners);
     for ((feature, name), error) in DISCOVERY_SERVER.into_iter().zip(errors) {
@@ -170,11 +170,11 @@ fn assert_refused(ndi: &NDI, expected: CapabilityUnavailable, evidence: &str) {
         for error in [error, ndi.require_feature(feature).err()] {
             match error {
                 Some(Error::UnsupportedCapability {
-                    capability,
+                    feature: refused,
                     reason,
                     detail,
                 }) => {
-                    assert_eq!((capability, reason), (name, expected));
+                    assert_eq!((refused, reason), (feature, expected));
                     assert_eq!(detail, evidence, "{name}");
                 }
                 Some(other) => panic!("{name}: unexpected error {other}"),
@@ -187,7 +187,7 @@ fn assert_refused(ndi: &NDI, expected: CapabilityUnavailable, evidence: &str) {
 
 fn child(scenario: &str) {
     let library = PathBuf::from(std::env::var_os("GRAFTON_DISCOVERY_LIBRARY").unwrap());
-    let ndi = NDI::with_options(
+    let ndi = Ndi::with_options(
         &RuntimeOptions::default()
             .library_path(library)
             .edition(SdkEdition::Standard),
@@ -233,27 +233,27 @@ fn child(scenario: &str) {
                 // The capability's own gate names the function too.
                 for error in [error, ndi.require_feature(feature).err()] {
                     let Some(Error::UnsupportedCapability {
-                        capability,
+                        feature: refused,
                         reason,
                         detail,
                     }) = error
                     else {
                         panic!("{name}: expected an unsupported capability");
                     };
-                    assert_eq!(capability, name);
+                    assert_eq!(refused, feature);
                     assert_eq!(reason, CapabilityUnavailable::SymbolUnavailable);
                     assert_eq!(detail, symbol, "{name}");
                 }
             }
             let Err(Error::UnsupportedCapability {
-                capability,
+                feature,
                 reason,
                 detail,
             }) = Router::new(&ndi, &RouterOptions::new("bare"))
             else {
                 panic!("routing needs its functions");
             };
-            assert_eq!(capability, "source routing");
+            assert_eq!(feature, RuntimeFeature::Routing);
             assert_eq!(reason, CapabilityUnavailable::SymbolUnavailable);
             assert_eq!(detail, "NDIlib_routing_create");
         }
@@ -300,7 +300,7 @@ fn child(scenario: &str) {
                 &ListenerOptions::default(),
             );
             for ((_, name), error) in DISCOVERY_SERVER.into_iter().zip(errors) {
-                let Some(Error::InvalidConfiguration(reason)) = error else {
+                let Some(Error::InvalidInput(reason)) = error else {
                     panic!("{name}: expected a creation failure, got {error:?}");
                 };
                 assert!(
@@ -309,12 +309,24 @@ fn child(scenario: &str) {
                 );
                 assert!(!reason.contains("reachable"), "{name}: {reason}");
             }
+            // A listener uses one server, so a list is refused before the SDK
+            // is asked for anything.
+            let several = ListenerOptions::default().server("192.0.2.1,192.0.2.2");
+            for error in [
+                SendListener::new(&ndi, &several).err(),
+                RecvListener::new(&ndi, &several).err(),
+            ] {
+                let Some(Error::InvalidInput(reason)) = error else {
+                    panic!("expected a refused server list, got {error:?}");
+                };
+                assert!(reason.contains("one Discovery Server"), "{reason}");
+            }
             assert!(!log().contains("-create\n"), "{}", log());
         }
         "advertisement_options_reach_the_sdk" => {
             let receiver = |name: &str| {
-                let options = ReceiverOptions::builder(Source::default()).name(name);
-                Receiver::new(&ndi, &options.build()).unwrap()
+                let options = ReceiverOptions::new(Source::new("")).name(name);
+                Receiver::new(&ndi, &options).unwrap()
             };
             let (controlled, monitored) = (receiver("controlled"), receiver("monitored"));
             let mut advertiser = RecvAdvertiser::new(&ndi, &advertisers).unwrap();
@@ -348,7 +360,7 @@ fn child(scenario: &str) {
             );
             // The group name outlives the call that registered it: this
             // runtime reads it only when the registration ends.
-            assert!(advertiser.unregister(in_group).unwrap());
+            advertiser.unregister(in_group).unwrap();
             drop(advertiser);
             let events = log();
             assert!(
@@ -360,7 +372,7 @@ fn child(scenario: &str) {
             );
             assert!(events.contains("recv-advertiser-remove group=null\n"));
 
-            let sender = |name: &str| Sender::new(&ndi, &SenderOptions::builder(name).build());
+            let sender = |name: &str| Sender::new(&ndi, &SenderOptions::new(name));
             let (plain, monitored) = (sender("plain").unwrap(), sender("monitored").unwrap());
             let mut advertiser = SendAdvertiser::new(&ndi, &advertisers).unwrap();
             advertiser
@@ -479,9 +491,7 @@ fn child(scenario: &str) {
         }
         "event_batches" => {
             let mut senders = SendListener::new(&ndi, &listeners).unwrap();
-            let events = senders
-                .capture_events(Wait::For(Duration::from_millis(5)))
-                .unwrap();
+            let events = senders.capture_events(Duration::from_millis(5)).unwrap();
             let [first, second] = events.as_slice() else {
                 panic!("expected two events, got {events:?}");
             };
@@ -490,10 +500,7 @@ fn child(scenario: &str) {
             assert_eq!(first.value(), Some("<tally on=\"\u{fffd}\"/>"));
             assert!(second.id().is_none() && second.name().is_none() && second.value().is_none());
             // A poll that finds nothing is an empty batch with nothing to free.
-            assert!(senders
-                .capture_events(Wait::For(Duration::ZERO))
-                .unwrap()
-                .is_empty());
+            assert!(senders.capture_events(Duration::ZERO).unwrap().is_empty());
             assert_eq!(
                 log().matches("send-listener-free-events\n").count(),
                 1,
@@ -502,14 +509,15 @@ fn child(scenario: &str) {
             );
 
             let mut receivers = RecvListener::new(&ndi, &listeners).unwrap();
-            let events = receivers.capture_events(Wait::Forever).unwrap();
+            // The longest wait never reaches the SDK's indefinite 0xFFFFFFFF.
+            let events = receivers.capture_events(grafton_ndi::MAX_TIMEOUT).unwrap();
             assert_eq!(events[0].id().unwrap().as_bytes(), RECEIVER_ID);
-            assert!(log().contains("recv-listener-events 4294967295\n"));
+            assert!(log().contains("recv-listener-events 4294967294\n"));
             assert_eq!(log().matches("recv-listener-free-events\n").count(), 1);
         }
         "large_event_batches" => {
             let mut listener = SendListener::new(&ndi, &listeners).unwrap();
-            let wait = Wait::For(Duration::from_millis(5));
+            let wait = Duration::from_millis(5);
             // The number of events is not itself a limit: only the bytes they
             // take to copy are.
             std::env::set_var("GRAFTON_FAKE_EVENT_COUNT", "70000");
@@ -521,7 +529,7 @@ fn child(scenario: &str) {
             // A batch whose descriptors alone exceed 16 MiB is refused for its
             // size, and released: the listener keeps working afterwards.
             std::env::set_var("GRAFTON_FAKE_EVENT_COUNT", "700000");
-            let Err(Error::InvalidFrame(reason)) = listener.capture_events(wait) else {
+            let Err(Error::UnexpectedSdkResult(reason)) = listener.capture_events(wait) else {
                 panic!("a batch larger than the copy limit must be refused");
             };
             assert!(reason.contains("16 MiB"), "{reason}");
@@ -530,9 +538,8 @@ fn child(scenario: &str) {
             assert_eq!(listener.capture_events(wait).unwrap().len(), 2);
         }
         "owners_move_between_threads" => {
-            let sender = Sender::new(&ndi, &SenderOptions::builder("moved").build()).unwrap();
-            let receiver =
-                Receiver::new(&ndi, &ReceiverOptions::builder(Source::default()).build()).unwrap();
+            let sender = Sender::new(&ndi, &SenderOptions::new("moved")).unwrap();
+            let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
             let mut router = Router::new(&ndi, &RouterOptions::new("moved router")).unwrap();
             let mut send_advertiser = SendAdvertiser::new(&ndi, &advertisers).unwrap();
             let mut recv_advertiser = RecvAdvertiser::new(&ndi, &advertisers).unwrap();
@@ -548,9 +555,9 @@ fn child(scenario: &str) {
             // not create it.
             std::thread::spawn(move || {
                 router.clear().unwrap();
-                assert_eq!(router.source().unwrap().name, "moved router");
-                assert!(send_advertiser.unregister(sent).unwrap());
-                assert!(recv_advertiser.unregister(received).unwrap());
+                assert_eq!(router.source().unwrap().name(), "moved router");
+                send_advertiser.unregister(sent).unwrap();
+                recv_advertiser.unregister(received).unwrap();
                 assert_eq!(send_listener.snapshot().unwrap().len(), 2);
                 assert_eq!(recv_listener.snapshot().unwrap().len(), 2);
             })
@@ -574,14 +581,9 @@ fn child(scenario: &str) {
         "routing" => {
             let mut router =
                 Router::new(&ndi, &RouterOptions::new("Program").groups("public")).unwrap();
-            assert_eq!(router.source().unwrap().name, "Program");
+            assert_eq!(router.source().unwrap().name(), "Program");
             assert_eq!(router.connection_count(Duration::ZERO).unwrap(), 0);
-            router
-                .change(&Source {
-                    name: "STUDIO (Camera 2)".into(),
-                    address: SourceAddress::None,
-                })
-                .unwrap();
+            router.change(&Source::new("STUDIO (Camera 2)")).unwrap();
             router.clear().unwrap();
             assert!(router.connection_count(Duration::MAX).is_err());
             drop(router);
@@ -593,5 +595,5 @@ fn child(scenario: &str) {
         _ => panic!("unknown discovery scenario {scenario}"),
     }
     drop(ndi);
-    assert!(!NDI::is_running());
+    assert!(!Ndi::is_running());
 }

@@ -14,9 +14,10 @@
 //!   surface — the [`Receiver`](crate::Receiver) capture path and
 //!   [`FrameSync`](crate::FrameSync) — shares one guard rather than hand-rolling
 //!   its own.
-//! - [`CaptureKind`] exposes only borrowed/owned frame types and conversion.
+//! - [`CaptureKind`] exposes only the borrowed and owned frame types.
 //! - `CaptureStrategy` privately connects each receiver kind to its SDK capture
-//!   call and frame-type discriminant.
+//!   call and frame-type discriminant, and copies a borrowed frame into an
+//!   owned one.
 //!
 //! # Example
 //!
@@ -35,7 +36,7 @@ use crate::{
         AudioFrame, AudioFrameRef, MetadataFrame, MetadataFrameRef, VideoFrame, VideoFrameRef,
     },
     sys::{self, bindings::*},
-    Error, Result, NDI,
+    Error, Ndi, Result,
 };
 
 /// Sealed trait module to prevent external implementations of [`FrameFree`] and
@@ -96,9 +97,10 @@ type TestFrameFree<S> = unsafe fn(<S as FrameFree>::Instance, &mut <S as FrameFr
 /// A sealed receiver capture kind with its borrowed and owned frame types.
 ///
 /// Implemented for [`VideoKind`], [`AudioKind`], and [`MetadataKind`]. Raw SDK
-/// routing and freeing are private implementation details. Generic callers can
-/// use [`crate::Capture`] with this trait and convert `K::Ref<'_>` into
-/// `K::Owned` through [`Self::ref_to_owned`].
+/// routing, freeing and copying are private implementation details. Generic
+/// callers use [`crate::Capture`] with this trait: its
+/// [`capture_ref`](crate::Capture::capture_ref) yields `K::Ref<'_>` and its
+/// [`capture`](crate::Capture::capture) `K::Owned`.
 ///
 /// Receiver frame references implement `Send + Sync` and can move to scoped
 /// worker threads while borrowing their receiver. FrameSync references use
@@ -109,13 +111,10 @@ pub trait CaptureKind: CaptureStrategy + Sized {
     type Ref<'rx>;
     /// An owned frame that can outlive the receiver.
     type Owned;
-
-    /// Copy a borrowed view into an owned frame.
-    fn ref_to_owned(frame: &Self::Ref<'_>) -> Result<Self::Owned>;
 }
 
 /// Private SDK routing paired with the corresponding free strategy.
-/// Implementations must capture, wrap, and free the same raw frame family.
+/// Implementations must capture, wrap, free and copy the same raw frame family.
 pub(crate) trait CaptureStrategy:
     FrameFree<Instance = NDIlib_recv_instance_t> + Sized
 {
@@ -147,6 +146,11 @@ pub(crate) trait CaptureStrategy:
     unsafe fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>>
     where
         Self: CaptureKind;
+
+    /// Copy a borrowed view into an owned frame.
+    fn ref_to_owned(frame: &<Self as CaptureKind>::Ref<'_>) -> Result<<Self as CaptureKind>::Owned>
+    where
+        Self: CaptureKind;
 }
 
 /// Marker type for video frame capture operations.
@@ -165,9 +169,6 @@ impl FrameFree for VideoKind {
 impl CaptureKind for VideoKind {
     type Ref<'rx> = VideoFrameRef<'rx>;
     type Owned = VideoFrame;
-    fn ref_to_owned(frame: &Self::Ref<'_>) -> Result<Self::Owned> {
-        frame.to_owned()
-    }
 }
 
 impl CaptureStrategy for VideoKind {
@@ -191,6 +192,10 @@ impl CaptureStrategy for VideoKind {
     unsafe fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>> {
         VideoFrameRef::new(guard)
     }
+
+    fn ref_to_owned(frame: &VideoFrameRef<'_>) -> Result<VideoFrame> {
+        frame.try_to_owned()
+    }
 }
 
 /// Marker type for audio frame capture operations.
@@ -209,9 +214,6 @@ impl FrameFree for AudioKind {
 impl CaptureKind for AudioKind {
     type Ref<'rx> = AudioFrameRef<'rx>;
     type Owned = AudioFrame;
-    fn ref_to_owned(frame: &Self::Ref<'_>) -> Result<Self::Owned> {
-        frame.to_owned()
-    }
 }
 
 impl CaptureStrategy for AudioKind {
@@ -235,6 +237,10 @@ impl CaptureStrategy for AudioKind {
     unsafe fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>> {
         AudioFrameRef::new(guard)
     }
+
+    fn ref_to_owned(frame: &AudioFrameRef<'_>) -> Result<AudioFrame> {
+        frame.try_to_owned()
+    }
 }
 
 /// Marker type for metadata frame capture operations.
@@ -253,10 +259,6 @@ impl FrameFree for MetadataKind {
 impl CaptureKind for MetadataKind {
     type Ref<'rx> = MetadataFrameRef<'rx>;
     type Owned = MetadataFrame;
-    fn ref_to_owned(frame: &Self::Ref<'_>) -> Result<Self::Owned> {
-        // Metadata `to_owned` is infallible; lift it into the shared `Result` shape.
-        Ok(frame.to_owned())
-    }
 }
 
 impl CaptureStrategy for MetadataKind {
@@ -279,6 +281,11 @@ impl CaptureStrategy for MetadataKind {
 
     unsafe fn make_ref<'rx>(guard: Guard<'rx, Self>) -> Result<<Self as CaptureKind>::Ref<'rx>> {
         MetadataFrameRef::new(guard)
+    }
+
+    fn ref_to_owned(frame: &MetadataFrameRef<'_>) -> Result<MetadataFrame> {
+        // Metadata `to_owned` is infallible; lift it into the shared `Result` shape.
+        Ok(frame.to_owned())
     }
 }
 
@@ -339,9 +346,9 @@ pub struct Guard<'owner, S: FrameFree> {
     instance: S::Instance,
     frame: S::RawFrame,
     // The runtime the frame was captured through, borrowed from the owner so the
-    // owner cannot be dropped while a frame is outstanding. Only synthetic
-    // unit-test frames have none; `test_free` releases those.
-    runtime: Option<&'owner NDI>,
+    // owner cannot be dropped while a frame is outstanding, and used to free
+    // it. Only synthetic unit-test frames have none; `test_free` releases those.
+    runtime: Option<&'owner Ndi>,
     #[cfg(test)]
     test_free: Option<TestFrameFree<S>>,
     // FrameSync buffers remain conservative about cross-thread use. Receiver
@@ -362,7 +369,7 @@ impl<'owner, S: FrameFree> Guard<'owner, S> {
     /// - the owning instance and captured allocation remain valid for all of
     ///   `'owner`; callers must tie this lifetime to a borrow of that owner
     pub(crate) unsafe fn new(
-        runtime: &'owner NDI,
+        runtime: &'owner Ndi,
         instance: S::Instance,
         frame: S::RawFrame,
     ) -> Self {
@@ -399,19 +406,6 @@ impl<'owner, S: FrameFree> Guard<'owner, S> {
             test_free: Some(free),
             _thread_affine: PhantomData,
         }
-    }
-
-    /// Give a synthetic frame the runtime identity a native owner would supply.
-    #[cfg(test)]
-    pub(crate) fn with_runtime(mut self, runtime: &'owner NDI) -> Self {
-        self.runtime = Some(runtime);
-        self
-    }
-
-    /// The native owner's runtime, used to prove capabilities when a borrowed
-    /// frame is converted into an owned one.
-    pub(crate) fn runtime(&self) -> Option<&'owner NDI> {
-        self.runtime
     }
 
     /// Get a reference to the underlying raw frame.
@@ -483,15 +477,21 @@ impl Notification {
     /// `Processing.NDI.Recv.h` documents as a lost connection.
     pub(crate) fn classify(frame_type: NDIlib_frame_type_e) -> Result<Self> {
         match frame_type {
-            NDIlib_frame_type_e_NDIlib_frame_type_none
-            | NDIlib_frame_type_e_NDIlib_frame_type_video
-            | NDIlib_frame_type_e_NDIlib_frame_type_audio
-            | NDIlib_frame_type_e_NDIlib_frame_type_metadata => Ok(Self::None),
-            NDIlib_frame_type_e_NDIlib_frame_type_status_change => Ok(Self::StatusChanged),
-            NDIlib_frame_type_e_NDIlib_frame_type_source_change => Ok(Self::SourceChanged),
-            NDIlib_frame_type_e_NDIlib_frame_type_error => Err(Error::CaptureFailed(
-                "the SDK returned an error frame: the connection was lost".into(),
-            )),
+            sys::bindings::NDIlib_frame_type_e_NDIlib_frame_type_none
+            | sys::bindings::NDIlib_frame_type_e_NDIlib_frame_type_video
+            | sys::bindings::NDIlib_frame_type_e_NDIlib_frame_type_audio
+            | sys::bindings::NDIlib_frame_type_e_NDIlib_frame_type_metadata => Ok(Self::None),
+            sys::bindings::NDIlib_frame_type_e_NDIlib_frame_type_status_change => {
+                Ok(Self::StatusChanged)
+            }
+            sys::bindings::NDIlib_frame_type_e_NDIlib_frame_type_source_change => {
+                Ok(Self::SourceChanged)
+            }
+            sys::bindings::NDIlib_frame_type_e_NDIlib_frame_type_error => {
+                Err(Error::CaptureFailed(
+                    "the SDK returned an error frame: the connection was lost".into(),
+                ))
+            }
             value => Ok(Self::Unknown(value)),
         }
     }
@@ -509,7 +509,7 @@ impl Notification {
 /// that remains alive for `'rx`. The caller must tie `'rx` to a borrow of its
 /// owning Receiver.
 pub(crate) unsafe fn capture_raw<'rx, K: CaptureKind>(
-    runtime: &'rx NDI,
+    runtime: &'rx Ndi,
     instance: NDIlib_recv_instance_t,
     timeout_ms: u32,
 ) -> Result<CaptureResult<'rx, K>> {

@@ -1,4 +1,4 @@
-use grafton_ndi::{Error, Source, SourceCache, NDI};
+use grafton_ndi::{Error, Ndi, Source, SourceCache};
 use std::time::Duration;
 
 fn cache_contract<T: Default + Send + Sync + 'static>() {}
@@ -9,7 +9,7 @@ fn main() {
     let _: fn() -> SourceCache = SourceCache::new;
 
     // A lookup that may search the network is given the handle to search with.
-    let _: fn(&SourceCache, &NDI, &str, Duration) -> Result<Source, Error> =
+    let _: fn(&SourceCache, &Ndi, &str, Duration) -> Result<Source, Error> =
         SourceCache::find_by_host;
 
     // Everything else is the cache alone.

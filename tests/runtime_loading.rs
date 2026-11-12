@@ -9,7 +9,7 @@ use fixture::FakeRuntime;
 use grafton_ndi::{
     capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, SdkEdition},
     runtime::{Runtime, RuntimeOptions},
-    Error, NDI,
+    Error, Ndi,
 };
 use std::{
     fs,
@@ -256,8 +256,8 @@ fn explicit(path: PathBuf) -> RuntimeOptions {
 }
 
 /// The runtime the search order selects, with its version text.
-fn search_selects() -> (NDI, String) {
-    let ndi = NDI::with_options(&standard()).unwrap();
+fn search_selects() -> (Ndi, String) {
+    let ndi = Ndi::with_options(&standard()).unwrap();
     let version = ndi.info().raw_version().to_owned();
     (ndi, version)
 }
@@ -269,7 +269,7 @@ fn is_loaded(library: &Path) -> bool {
         .contains(library.to_str().unwrap())
 }
 
-fn load_failure(result: Result<NDI, Error>) -> String {
+fn load_failure(result: Result<Ndi, Error>) -> String {
     match result {
         Err(Error::RuntimeLoadFailed(reason)) => reason,
         Err(other) => panic!("expected a load failure, got {other}"),
@@ -282,11 +282,11 @@ fn child(name: &str, fixtures: &Fixtures) {
     let options = explicit(complete.clone());
     match name {
         "retry_and_capabilities" => {
-            let reason = load_failure(NDI::with_options(&explicit(fixtures.missing())));
+            let reason = load_failure(Ndi::with_options(&explicit(fixtures.missing())));
             assert!(reason.contains("NDIlib_send_set_failover"), "{reason}");
-            assert!(!NDI::is_running());
-            let ndi = NDI::with_options(&options).unwrap();
-            assert!(NDI::is_running());
+            assert!(!Ndi::is_running());
+            let ndi = Ndi::with_options(&options).unwrap();
+            assert!(Ndi::is_running());
             assert_eq!(ndi.info().library_path(), Some(complete.as_path()));
             assert_eq!(ndi.info().edition(), SdkEdition::Standard);
             assert_eq!(ndi.info().version().unwrap().minor(), 3);
@@ -302,56 +302,56 @@ fn child(name: &str, fixtures: &Fixtures) {
             assert!(ndi.runtime().is_supported_cpu());
             assert!(ndi.info().raw_version().contains("6.3.2.0"));
             drop(ndi);
-            assert!(!NDI::is_running());
-            drop(NDI::with_options(&options).unwrap());
+            assert!(!Ndi::is_running());
+            drop(Ndi::with_options(&options).unwrap());
             let log = fs::read_to_string(fixtures.log()).unwrap();
             assert_eq!(log, "initialize\ndestroy\ninitialize\ndestroy\n");
         }
         "conflict" => {
-            let ndi = NDI::with_options(&options).unwrap();
+            let ndi = Ndi::with_options(&options).unwrap();
             assert!(matches!(
-                NDI::with_options(&explicit(fixtures.missing())),
+                Ndi::with_options(&explicit(fixtures.missing())),
                 Err(Error::RuntimeConflict(_))
             ));
             assert!(matches!(
-                NDI::with_options(&RuntimeOptions::default().edition(SdkEdition::Advanced)),
+                Ndi::with_options(&RuntimeOptions::default().edition(SdkEdition::Advanced)),
                 Err(Error::RuntimeConflict(_))
             ));
             // The selected module satisfies a request that names no other one.
-            drop(NDI::with_options(&standard()).unwrap());
+            drop(Ndi::with_options(&standard()).unwrap());
             drop(ndi);
         }
         "advanced_request_needs_advanced_entry_points" => {
             // A caller's request cannot turn a Standard module into an Advanced
             // runtime, whatever the file is called.
             for standard_module in [complete.clone(), fixtures.mislabelled().join(ADVANCED_NAME)] {
-                let reason = load_failure(NDI::with_options(
+                let reason = load_failure(Ndi::with_options(
                     &explicit(standard_module).edition(SdkEdition::Advanced),
                 ));
                 assert!(reason.contains("Advanced SDK entry points"), "{reason}");
             }
             // The failed request leaves selection open.
-            let ndi = NDI::with_options(&options).unwrap();
+            let ndi = Ndi::with_options(&options).unwrap();
             assert_eq!(ndi.info().edition(), SdkEdition::Standard);
         }
         "newer_standard_runtime_is_accepted" => {
             // A Standard runtime that gains an entry point today found only in
             // the Advanced SDK is still a usable Standard runtime.
-            let ndi = NDI::with_options(&explicit(fixtures.newer_standard())).unwrap();
+            let ndi = Ndi::with_options(&explicit(fixtures.newer_standard())).unwrap();
             assert_eq!(ndi.info().edition(), SdkEdition::Standard);
-            assert!(NDI::is_running());
+            assert!(Ndi::is_running());
         }
         "advanced_module_satisfies_a_standard_request" => {
             let advanced = fixtures.advanced();
-            let ndi = NDI::with_options(&explicit(advanced.clone())).unwrap();
+            let ndi = Ndi::with_options(&explicit(advanced.clone())).unwrap();
             assert_eq!(ndi.info().edition(), SdkEdition::Advanced);
             // The edition is detected, so a later Advanced request agrees.
-            drop(NDI::with_options(&explicit(advanced).edition(SdkEdition::Advanced)).unwrap());
+            drop(Ndi::with_options(&explicit(advanced).edition(SdkEdition::Advanced)).unwrap());
             // A Standard request is met by the selected Advanced module too.
-            drop(NDI::with_options(&standard()).unwrap());
+            drop(Ndi::with_options(&standard()).unwrap());
         }
         "later_major_version_keeps_version_gated_features" => {
-            let ndi = NDI::with_options(&explicit(fixtures.next_major())).unwrap();
+            let ndi = Ndi::with_options(&explicit(fixtures.next_major())).unwrap();
             assert_eq!(ndi.info().version().unwrap().major(), 7);
             for feature in [
                 RuntimeFeature::Planar444Video,
@@ -362,21 +362,21 @@ fn child(name: &str, fixtures: &Fixtures) {
             }
         }
         "process_lifetime" => {
-            let ndi = NDI::with_options(&options).unwrap();
+            let ndi = Ndi::with_options(&options).unwrap();
             let token = ndi.process_lifetime();
             assert_eq!(token.ndi().info(), ndi.info());
             drop(ndi);
-            assert!(NDI::is_running());
+            assert!(Ndi::is_running());
             let log = fs::read_to_string(fixtures.log()).unwrap();
             assert_eq!(log, "initialize\n");
         }
         "foreign_symbol" => {
-            let reason = load_failure(NDI::with_options(&explicit(fixtures.foreign())));
+            let reason = load_failure(Ndi::with_options(&explicit(fixtures.foreign())));
             assert!(
                 reason.contains("NDIlib_send_set_failover resolves outside"),
                 "{reason}"
             );
-            drop(NDI::with_options(&options).unwrap());
+            drop(Ndi::with_options(&options).unwrap());
         }
         "concurrent_selection" => {
             use std::sync::{Arc, Barrier};
@@ -388,7 +388,7 @@ fn child(name: &str, fixtures: &Fixtures) {
                     let ready = ready.clone();
                     let release = release.clone();
                     std::thread::spawn(move || {
-                        let ndi = NDI::with_options(&options).unwrap();
+                        let ndi = Ndi::with_options(&options).unwrap();
                         ready.wait();
                         release.wait();
                         drop(ndi);
@@ -402,7 +402,7 @@ fn child(name: &str, fixtures: &Fixtures) {
             for thread in threads {
                 thread.join().unwrap();
             }
-            assert!(!NDI::is_running());
+            assert!(!Ndi::is_running());
         }
         "no_imports" => {
             let output = Command::new("readelf")
@@ -423,7 +423,7 @@ fn child(name: &str, fixtures: &Fixtures) {
             // Usable runtimes exist in the runtime directory and on the loader
             // path, but an explicit path names the only acceptable one.
             let absent = fixtures.empty().join(STANDARD_NAME);
-            let reason = load_failure(NDI::with_options(&explicit(absent.clone())));
+            let reason = load_failure(Ndi::with_options(&explicit(absent.clone())));
             assert!(reason.contains(absent.to_str().unwrap()), "{reason}");
             assert!(reason.contains("No such file or directory"), "{reason}");
             assert!(
@@ -431,8 +431,8 @@ fn child(name: &str, fixtures: &Fixtures) {
                 "{reason}"
             );
             assert!(matches!(
-                NDI::with_options(&standard().library_path("libndi.so.6")),
-                Err(Error::InvalidConfiguration(_))
+                Ndi::with_options(&standard().library_path("libndi.so.6")),
+                Err(Error::InvalidInput(_))
             ));
         }
         "empty_runtime_directory_falls_back_to_the_loader" => {
@@ -460,7 +460,7 @@ fn child(name: &str, fixtures: &Fixtures) {
             );
         }
         "failure_names_every_candidate" => {
-            let reason = load_failure(NDI::with_options(
+            let reason = load_failure(Ndi::with_options(
                 &RuntimeOptions::default().edition(SdkEdition::Advanced),
             ));
             let beside_executable = std::env::current_exe()
@@ -488,13 +488,13 @@ fn child(name: &str, fixtures: &Fixtures) {
                 );
             }
             // Nothing was selected, so a usable runtime can still be chosen.
-            drop(NDI::with_options(&options).unwrap());
+            drop(Ndi::with_options(&options).unwrap());
         }
         "selecting_and_starting_are_separate_steps" => {
             // A usable runtime is installed where the default search finds it,
             // yet asking a question loads nothing.
             let installed = fixtures.runtime().join(STANDARD_NAME);
-            assert!(!NDI::is_running());
+            assert!(!Ndi::is_running());
             assert!(!is_loaded(&installed));
 
             let runtime = Runtime::select(&standard()).unwrap();
@@ -506,11 +506,11 @@ fn child(name: &str, fixtures: &Fixtures) {
                 .capabilities()
                 .supports(RuntimeFeature::ReceiveDelay));
             // Selected and inspected, and still not started.
-            assert!(!NDI::is_running());
+            assert!(!Ndi::is_running());
             assert!(!fixtures.log().exists());
 
             let ndi = runtime.initialize().unwrap();
-            assert!(NDI::is_running());
+            assert!(Ndi::is_running());
             assert_eq!(fs::read_to_string(fixtures.log()).unwrap(), "initialize\n");
             // Every handle refers to the one selection.
             let again = Runtime::select(&standard()).unwrap();
@@ -523,9 +523,9 @@ fn child(name: &str, fixtures: &Fixtures) {
             // A handle obtained from another handle shares the running runtime.
             let another = ndi.runtime().initialize().unwrap();
             drop(ndi);
-            assert!(NDI::is_running());
+            assert!(Ndi::is_running());
             drop(another);
-            assert!(!NDI::is_running());
+            assert!(!Ndi::is_running());
             assert_eq!(
                 fs::read_to_string(fixtures.log()).unwrap(),
                 "initialize\ndestroy\n"
@@ -547,16 +547,16 @@ fn child(name: &str, fixtures: &Fixtures) {
             assert!(matches!(runtime.initialize(), Err(Error::UnsupportedCpu)));
             // The one-call shortcut reports the same cause.
             assert!(matches!(
-                NDI::with_options(&options),
+                Ndi::with_options(&options),
                 Err(Error::UnsupportedCpu)
             ));
-            assert!(!NDI::is_running());
+            assert!(!Ndi::is_running());
 
             // Neither failure is permanent.
             std::env::remove_var("GRAFTON_FAKE_NDI_INITIALIZE");
             std::env::remove_var("GRAFTON_FAKE_NDI_CPU");
             let ndi = runtime.initialize().unwrap();
-            assert!(NDI::is_running());
+            assert!(Ndi::is_running());
             drop(ndi);
             assert_eq!(
                 fs::read_to_string(fixtures.log()).unwrap(),

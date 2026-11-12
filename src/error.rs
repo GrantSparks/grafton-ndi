@@ -1,16 +1,16 @@
-//! Error types for the grafton-ndi library.
+//! The crate's one error type.
 
 use thiserror::Error;
 
-use std::{ffi::NulError, fmt, time::Duration};
+use std::{ffi::NulError, fmt};
 
-use crate::capabilities::CapabilityUnavailable;
+use crate::capabilities::{CapabilityUnavailable, RuntimeFeature};
 
-/// The main error type for NDI operations.
+/// Every error this crate reports, from the core API, the `advanced` module
+/// and the File API alike.
 ///
-/// This enum represents all possible errors that can occur when using the
-/// grafton-ndi library. It provides detailed error messages and automatic
-/// conversion from common error types.
+/// Each variant says when it occurs. Its text is for diagnostics; match on
+/// the variant and its fields rather than on the text.
 ///
 /// This enum is marked `#[non_exhaustive]` so that new error variants can be
 /// added as the NDI SDK surface evolves without constituting a breaking change.
@@ -18,33 +18,50 @@ use crate::capabilities::CapabilityUnavailable;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// No usable NDI runtime library could be loaded.
+    /// No usable NDI library could be loaded, or the selected File library
+    /// lacks entry points an operation needs.
     ///
-    /// The message names every location tried and why each was rejected: the
-    /// file was absent, the operating system could not load it, or it lacks a
-    /// required entry point. Loading is retryable.
-    #[error("Failed to load the NDI runtime: {0}")]
+    /// * Selecting the NDI runtime ([`Runtime::select`] and every constructor
+    ///   that selects one): no usable runtime library was found. The message
+    ///   names every location tried and why each was rejected: the file was
+    ///   absent, the operating system could not load it, or it lacks a
+    ///   required entry point. Nothing is selected, so the call can be
+    ///   repeated.
+    /// * Opening the File API (`file::FileApi::open`): no usable File library
+    ///   was found, with every location tried and the reason for each.
+    ///   Nothing is selected, so the call can be repeated.
+    /// * A File API operation that needs the File library's playback or
+    ///   recording entry points, when the selected library does not export
+    ///   them. The message names the first one missing. The library stays
+    ///   selected, so the operation keeps failing.
+    ///
+    /// [`Runtime::select`]: crate::Runtime::select
+    #[error("Failed to load an NDI library: {0}")]
     RuntimeLoadFailed(String),
 
-    /// An optional operation is unavailable in this build or with the
-    /// selected runtime.
+    /// An operation needs a capability this build or the selected runtime
+    /// does not provide.
     ///
-    /// For a capability a [`RuntimeFeature`] describes, `reason` is the one
-    /// [`Capabilities::status`] reports for it, so a caller can branch on it
-    /// without reading text. The condition lasts for the life of the process:
-    /// the runtime is selected once, and a build that lacks a declaration has
-    /// to be rebuilt, with the `advanced` feature and with `NDI_SDK_DIR`
-    /// naming an NDI Advanced SDK whose headers declare it.
+    /// `feature` is the capability, and `reason` is the one
+    /// [`Capabilities::status`] reports for it, so a caller can branch on
+    /// either without reading text. Every operation that needs the capability
+    /// is refused this way before anything reaches the SDK, and
+    /// [`Ndi::require_feature`] reports the same error in advance. The
+    /// condition lasts for the life of the process: the runtime is selected
+    /// once, and a build that lacks a declaration has to be rebuilt, with the
+    /// `advanced` feature and with `NDI_SDK_DIR` naming an NDI Advanced SDK
+    /// whose headers declare it.
     ///
-    /// [`RuntimeFeature`]: crate::capabilities::RuntimeFeature
     /// [`Capabilities::status`]: crate::capabilities::Capabilities::status
-    #[error("NDI capability {capability} is unavailable: {}", Unavailability(.reason, .detail))]
+    /// [`Ndi::require_feature`]: crate::Ndi::require_feature
+    #[error(
+        "NDI capability {} is unavailable: {}",
+        .feature.name(),
+        Unavailability(.reason, .detail)
+    )]
     UnsupportedCapability {
-        /// The capability's name. For one a [`RuntimeFeature`] describes, it
-        /// is the same whichever operation the capability gates.
-        ///
-        /// [`RuntimeFeature`]: crate::capabilities::RuntimeFeature
-        capability: &'static str,
+        /// The capability, the same whichever operation it gates.
+        feature: RuntimeFeature,
         /// Why it is unavailable.
         reason: CapabilityUnavailable,
         /// The evidence: the entry point the runtime lacks (for
@@ -65,29 +82,40 @@ pub enum Error {
         detail: String,
     },
 
-    /// The request cannot be met by the runtime already selected for this
-    /// process: it names a different library, or requires the Advanced SDK when
-    /// the selected runtime is not one.
+    /// The request cannot be met by the implementation already selected for
+    /// this process, which cannot be replaced.
+    ///
+    /// * The runtime options name a library file other than the selected one,
+    ///   ask for the Advanced SDK when the selected runtime is not one, or
+    ///   name any file when the SDK is linked into the program.
+    /// * Loading a native library re-entered runtime selection on the same
+    ///   thread.
+    /// * The File API options name a File library other than the selected one,
+    ///   or any library when the File library is linked into the program.
+    /// * The File library cannot accompany the selected runtime: on Linux,
+    ///   macOS and Android it needs the Advanced SDK runtime, and it is
+    ///   refused while the process's global symbol scope holds an NDI runtime
+    ///   other than the selected one, which it would bind to.
     #[error("Conflicting NDI runtime selection: {0}")]
     RuntimeConflict(String),
 
-    /// Construction requires proof from an initialized compatible runtime.
-    #[error("{feature} requires an initialized compatible runtime; use {operation}")]
-    RuntimeRequired {
-        /// Functionality requiring runtime validation.
-        feature: &'static str,
-        /// Runtime-aware constructor to use.
-        operation: &'static str,
-    },
-
-    /// The native SDK rejected an operation after capability validation.
+    /// The native SDK did not perform an operation.
     ///
-    /// This includes creating an object: a finder, receiver, sender or other
-    /// object the SDK does not create is reported with `operation` naming the
-    /// creating function.
-    #[error("The NDI SDK rejected {operation}")]
+    /// It returned the failure value its header gives the operation: `false`
+    /// from an operation that reports success, or null from one that creates
+    /// an object (a finder, receiver, sender, router, FrameSync, AV sync or
+    /// genlock instance, or a File player or recorder) or returns a source
+    /// descriptor. A source descriptor with neither a name nor an address is
+    /// reported the same way. `operation` names the SDK function or the File
+    /// API operation. A Discovery Server advertiser or listener the SDK does
+    /// not create is reported as [`Error::InvalidInput`] instead, because the
+    /// SDK refuses only the address it was given.
+    ///
+    /// The SDK gives no further reason. The File library may report one as
+    /// an event.
+    #[error("The NDI SDK did not perform {operation}")]
     NativeOperationFailed {
-        /// Native operation or public action that failed.
+        /// The SDK function, or the File API operation, that failed.
         operation: &'static str,
     },
 
@@ -112,69 +140,92 @@ pub enum Error {
     #[error("The selected NDI runtime does not support this CPU")]
     UnsupportedCpu,
 
-    /// A null pointer was returned by the NDI SDK.
+    /// The SDK sent nothing because nothing is connected.
     ///
-    /// Indicates an internal NDI error or invalid operation.
-    #[error("Encountered a null pointer in function: {0}")]
-    NullPointer(String),
+    /// A receiver sends metadata upstream to the source it is connected to,
+    /// and `Processing.NDI.Recv.h` documents a refusal as meaning that it is
+    /// connected to none. A later attempt can succeed once it has connected.
+    #[error("Not connected: the NDI SDK sent nothing")]
+    NotConnected,
 
-    /// Invalid UTF-8 data in a string from the NDI SDK.
+    /// Text the SDK delivered is not UTF-8.
+    ///
+    /// Reported for the metadata of a captured frame, a received metadata
+    /// frame, and the strings a receiver returns, such as its source's
+    /// web-control URL. Text a peer advertises through a Discovery Server is
+    /// decoded lossily instead.
     #[error("Invalid UTF-8 string in data: {0}")]
     InvalidUtf8(String),
 
-    /// Failed to create a C string due to null bytes.
+    /// Text passed to the SDK contains a NUL byte, which a C string cannot
+    /// hold.
     #[error("Invalid CString: {0}")]
     InvalidCString(#[from] NulError),
 
-    /// Frame capture operation failed.
+    /// A capture reported a failure instead of a frame or an event.
+    ///
+    /// A receiver's capture returned the SDK's error frame type, which
+    /// `Processing.NDI.Recv.h` documents as a lost connection; or a sender's
+    /// metadata capture returned a frame type other than metadata or none.
     #[error("Failed to capture frame: {0}")]
     CaptureFailed(String),
 
-    /// Frame data is invalid or corrupted.
+    /// A frame, or a value describing media, is invalid.
+    ///
+    /// * A frame the SDK delivered (video, audio, metadata or a compressed
+    ///   packet) fails validation: its dimensions, format, strides, sizes or
+    ///   pointers are inconsistent, or its metadata has no terminator within
+    ///   the limit.
+    /// * A frame, packet or buffer being built, converted or sent does not
+    ///   match its format: a buffer is too small, a dimension, stride or rate
+    ///   is out of range, or a format cannot be used for the operation. This
+    ///   includes a compressed frame the SDK would discard instead of
+    ///   delivering it.
+    ///
+    /// A value that describes no one frame, such as a compressed video format
+    /// or an allocation, AV sync, clock or remote-control value of the
+    /// `advanced` module, is [`Error::InvalidInput`] when it is out of range.
     #[error("Invalid frame data: {0}")]
     InvalidFrame(String),
 
-    /// Configuration parameters are invalid.
+    /// A value passed to the crate cannot be used.
     ///
-    /// This can occur when builder validation fails or conflicting options are set.
-    #[error("Invalid configuration: {0}")]
-    InvalidConfiguration(String),
+    /// It is out of range, malformed, or conflicts with another setting: for
+    /// example a timeout above [`MAX_TIMEOUT`](crate::MAX_TIMEOUT), a relative
+    /// library path, a receive delay above two seconds, a PTZ value outside
+    /// its range, malformed Advanced configuration JSON, more than one
+    /// Discovery Server for a listener, allocator limits that cannot all be
+    /// reached, a queue limit that has been reached, a registration handed to
+    /// an advertiser that did not issue it, a compressed video format, an
+    /// allocation stride or buffer, an AV sync or clock quantity or a remote
+    /// control value out of the range the SDK accepts, or a File API name,
+    /// path or option the File library cannot take. The message says which value and why, and nothing reaches the
+    /// SDK, with one exception: the SDK creates a Discovery Server advertiser
+    /// or listener for any address it can parse, so when it creates none, the
+    /// address it was given, or the lack of one, is reported here.
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
 
-    /// The capture wait budget expired without a frame.
+    /// A value the SDK returned, other than a frame, breaks the SDK's
+    /// documented contract, or exceeds a limit this crate places on what it
+    /// copies.
     ///
-    /// Includes the number of capture attempts and the time since the caller's
-    /// timeout budget started. At least one attempt is made, even when the
-    /// budget is zero or already spent; further retries are not guaranteed.
-    /// For async capture, the budget starts on the future's first poll, so
-    /// `elapsed` includes time spent waiting for a blocking-pool thread.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use grafton_ndi::Error;
-    /// # use std::time::Duration;
-    /// match some_operation() {
-    ///     Err(Error::FrameTimeout { attempts, elapsed }) => {
-    ///         eprintln!("Frame timeout after {} attempts in {:?}", attempts, elapsed);
-    ///         // Could implement retry logic based on attempts count
-    ///     }
-    ///     Err(e) => eprintln!("Other error: {}", e),
-    ///     Ok(_) => println!("Success"),
-    /// }
-    /// # fn some_operation() -> Result<(), Error> { Ok(()) }
-    /// ```
-    #[error("Frame capture timed out after {attempts} attempts ({elapsed:?})")]
-    FrameTimeout {
-        /// Number of capture attempts made before timing out
-        attempts: usize,
-        /// Time since the caller's timeout budget started
-        elapsed: Duration,
-    },
+    /// For example a negative connection count, a receive delay outside the
+    /// range the SDK accepts, a string without a terminator within its limit,
+    /// a Discovery Server snapshot or event batch that is malformed or larger
+    /// than one copy may be, a send-completion callback for a frame the SDK
+    /// was not handed or had already returned, negative encoder guidance, an
+    /// AV sync format change to a sample rate or channel count that is not
+    /// positive, or a File SDK result that cannot be represented. Malformed
+    /// frames are reported as [`Error::InvalidFrame`], and text that is not
+    /// UTF-8 as [`Error::InvalidUtf8`].
+    #[error("Unexpected NDI SDK result: {0}")]
+    UnexpectedSdkResult(String),
 
-    /// No NDI sources found matching the specified criteria.
+    /// Source discovery finished without a source that matches.
     ///
-    /// This error is returned when source discovery completes but no sources match
-    /// the requested criteria (e.g., host/IP filter, group filter).
+    /// Returned by the finder's host lookups when no source on the requested
+    /// host was discovered within the wait.
     ///
     /// # Example
     ///
@@ -234,6 +285,30 @@ pub enum Error {
     /// ```
     #[error("Failed to spawn blocking task: {0}")]
     SpawnFailed(String),
+
+    /// A File API operation is not permitted in the current state of its
+    /// recorder or async handle.
+    ///
+    /// The [`StateError`](crate::file::StateError) says which state forbids
+    /// it, and [`StateError::is_retryable`](crate::file::StateError::is_retryable)
+    /// whether the same call can succeed later without anything else changing.
+    #[cfg(feature = "file-io")]
+    #[error("Invalid File API state: {0}")]
+    InvalidState(crate::file::StateError),
+
+    /// An operating-system operation of the File API failed.
+    ///
+    /// * Resolving a relative path against the current directory, which may
+    ///   be unavailable.
+    /// * Checking, before a recording starts or rolls over, that the
+    ///   directory of its first file exists and can be written to, and that an
+    ///   exact file name does not exist yet
+    ///   ([`AlreadyExists`](std::io::ErrorKind::AlreadyExists)).
+    /// * Starting the thread of an async File handle or probe, or the timer
+    ///   thread that async event waits share.
+    #[cfg(feature = "file-io")]
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 /// Why a capability is unavailable, followed by its evidence when there is any.
@@ -275,7 +350,7 @@ mod tests {
 
     fn unsupported(reason: CapabilityUnavailable, detail: &str) -> String {
         Error::UnsupportedCapability {
-            capability: "source routing",
+            feature: RuntimeFeature::Routing,
             reason,
             detail: detail.into(),
         }

@@ -5,7 +5,7 @@ use grafton_ndi::{BorrowedVideoFrame, PixelFormat, Sender, SenderOptions, VideoF
 fn frame(value: u8) -> VideoFrame {
     let mut frame = VideoFrame::builder()
         .resolution(16, 16)
-        .pixel_format(PixelFormat::BGRA)
+        .pixel_format(PixelFormat::Bgra)
         .metadata(format!("<frame value=\"{value}\"/>"))
         .build()
         .unwrap();
@@ -18,17 +18,16 @@ fn owned_pipeline_returns_original_buffers_and_metadata() -> Result<(), grafton_
     let Some(ndi) = common::ndi() else {
         return Ok(());
     };
-    let options = SenderOptions::builder(common::unique_name("owned pipeline regression"))
+    let options = SenderOptions::new(common::unique_name("owned pipeline regression"))
         .clock_video(false)
-        .clock_audio(false)
-        .build();
+        .clock_audio(false);
     let mut sender = Sender::new(&ndi, &options)?;
     let first = frame(1);
     let first_ptr = first.data().as_ptr();
-    assert!(sender.send_video_async(first).is_none());
+    assert!(sender.send_video_async(first)?.is_none());
     let second = frame(2);
     let second_ptr = second.data().as_ptr();
-    let recovered = sender.send_video_async(second).unwrap();
+    let recovered = sender.send_video_async(second)?.unwrap();
     assert_eq!(recovered.data().as_ptr(), first_ptr);
     assert!(recovered.data().iter().all(|byte| *byte == 1));
     assert_eq!(recovered.metadata(), Some("<frame value=\"1\"/>"));
@@ -45,14 +44,12 @@ fn copied_send_survives_released_source() -> Result<(), grafton_ndi::Error> {
     let Some(ndi) = common::ndi() else {
         return Ok(());
     };
-    let options = SenderOptions::builder(common::unique_name("copied source release regression"))
+    let options = SenderOptions::new(common::unique_name("copied source release regression"))
         .clock_video(false)
-        .clock_audio(false)
-        .build();
+        .clock_audio(false);
     let mut sender = Sender::new(&ndi, &options)?;
     let mut buffer = vec![7; 16 * 16 * 4];
-    let borrowed =
-        BorrowedVideoFrame::try_from_uncompressed(&buffer, 16, 16, PixelFormat::BGRA, 30, 1)?;
+    let borrowed = BorrowedVideoFrame::builder(&buffer, 16, 16, PixelFormat::Bgra).build()?;
     let _ = sender.send_video_async_copy(&borrowed)?;
     buffer.fill(9);
     drop(buffer);
@@ -66,24 +63,22 @@ fn mixed_owned_and_copy_send_completes_each_frame_once() -> Result<(), grafton_n
     let Some(ndi) = common::ndi() else {
         return Ok(());
     };
-    let options = SenderOptions::builder(common::unique_name("mixed async regression"))
+    let options = SenderOptions::new(common::unique_name("mixed async regression"))
         .clock_video(false)
-        .clock_audio(false)
-        .build();
+        .clock_audio(false);
     let mut sender = Sender::new(&ndi, &options)?;
     let completed = Arc::new(Mutex::new(Vec::new()));
     let recorded = completed.clone();
     sender.on_async_video_done(move |len| recorded.lock().unwrap().push(len));
-    let _ = sender.send_video_async(frame(3));
+    sender.send_video_async(frame(3))?;
     let source = vec![4; 16 * 16 * 4];
-    let borrowed =
-        BorrowedVideoFrame::try_from_uncompressed(&source, 16, 16, PixelFormat::BGRA, 30, 1)?;
+    let borrowed = BorrowedVideoFrame::builder(&source, 16, 16, PixelFormat::Bgra).build()?;
     let recovered = sender.send_video_async_copy(&borrowed)?.unwrap();
     assert_eq!(recovered.data()[0], 3);
     sender.flush_async_blocking();
     assert_eq!(completed.lock().unwrap().as_slice(), &[1024, 1024]);
     assert_eq!(sender.finish_video_async().unwrap().data()[0], 4);
-    let _ = sender.send_video_async(frame(5));
+    sender.send_video_async(frame(5))?;
     drop(sender);
     assert_eq!(completed.lock().unwrap().as_slice(), &[1024, 1024, 1024]);
     Ok(())
@@ -98,15 +93,13 @@ fn concurrent_sync_and_reentrant_flush_preserve_owned_frame() -> Result<(), graf
     let Some(ndi) = common::ndi() else {
         return Ok(());
     };
-    let options =
-        SenderOptions::builder(common::unique_name("sync and reentrant flush regression"))
-            .clock_video(false)
-            .clock_audio(false)
-            .build();
+    let options = SenderOptions::new(common::unique_name("sync and reentrant flush regression"))
+        .clock_video(false)
+        .clock_audio(false);
     let mut sender = Sender::new(&ndi, &options)?;
     let submitted = frame(6);
     let original_ptr = submitted.data().as_ptr();
-    let _ = sender.send_video_async(submitted);
+    sender.send_video_async(submitted)?;
     let reference = Arc::new(std::sync::Mutex::new(std::sync::Weak::<Sender>::new()));
     let weak_reference = reference.clone();
     let completions = Arc::new(AtomicUsize::new(0));
@@ -124,7 +117,7 @@ fn concurrent_sync_and_reentrant_flush_preserve_owned_frame() -> Result<(), graf
     *reference.lock().unwrap() = Arc::downgrade(&shared);
     std::thread::scope(|scope| {
         scope.spawn(|| shared.flush_async_blocking());
-        scope.spawn(|| shared.send_video(&frame(7)));
+        scope.spawn(|| shared.send_video(&frame(7)).unwrap());
     });
     assert_eq!(completions.load(Ordering::SeqCst), 1);
     let mut sender = Arc::try_unwrap(shared).ok().unwrap();
@@ -144,10 +137,9 @@ fn panicking_completion_keeps_new_owned_frame_pending() -> Result<(), grafton_nd
     let Some(ndi) = common::ndi() else {
         return Ok(());
     };
-    let options = SenderOptions::builder(common::unique_name("panicking completion regression"))
+    let options = SenderOptions::new(common::unique_name("panicking completion regression"))
         .clock_video(false)
-        .clock_audio(false)
-        .build();
+        .clock_audio(false);
     let mut sender = Sender::new(&ndi, &options)?;
     let callbacks = Arc::new(AtomicUsize::new(0));
     let recorded = callbacks.clone();
@@ -156,7 +148,7 @@ fn panicking_completion_keeps_new_owned_frame_pending() -> Result<(), grafton_nd
             panic!("intentional completion panic");
         }
     });
-    let _ = sender.send_video_async(frame(1));
+    sender.send_video_async(frame(1))?;
     let next = frame(2);
     let next_ptr = next.data().as_ptr();
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -175,11 +167,9 @@ fn copied_send_retains_metadata_after_source_drop() -> Result<(), grafton_ndi::E
     let Some(ndi) = common::ndi() else {
         return Ok(());
     };
-    let options =
-        SenderOptions::builder(common::unique_name("copied metadata lifetime regression"))
-            .clock_video(false)
-            .clock_audio(false)
-            .build();
+    let options = SenderOptions::new(common::unique_name("copied metadata lifetime regression"))
+        .clock_video(false)
+        .clock_audio(false);
     let mut sender = Sender::new(&ndi, &options)?;
     let source = frame(8);
     let borrowed = BorrowedVideoFrame::from(&source);

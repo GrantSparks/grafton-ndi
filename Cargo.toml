@@ -32,7 +32,6 @@ members = ["xtask"]
 
 [dependencies]
 parking_lot = "0.12"
-num_enum = "0.7.6"
 thiserror = "2.0.21"
 libloading = "0.9.0"
 serde_json = { version = "1.0", optional = true }
@@ -60,7 +59,7 @@ bindgen = { version = "0.72.1", optional = true }
 syn = { version = "2", features = ["full"], optional = true }
 
 [features]
-default = ["image-encoding"]
+default = []
 # Opt-in Advanced SDK wrappers. Their native declarations are generated at build
 # time from an installed Advanced SDK (NDI_SDK_DIR or a default location); without
 # one the API still compiles and every operation reports that it is unavailable.
@@ -68,7 +67,7 @@ advanced = ["dep:serde_json", "dep:bindgen", "dep:syn"]
 # Optional source recording and file-to-network playback API.
 file-io = []
 # Enable image encoding support (PNG, JPEG, data URLs).
-# Enabled by default. Use `default-features = false` for a minimal build.
+# Opt-in; adds the base64, jpeg-encoder and png dependencies.
 image-encoding = ["dep:base64", "dep:jpeg-encoder", "dep:png"]
 # Enable async runtime integration for Tokio
 # Adds dependency: tokio

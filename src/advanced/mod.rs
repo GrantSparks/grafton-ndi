@@ -1,7 +1,8 @@
 //! NDI Advanced SDK operations.
 //!
 //! * Per-instance JSON configuration of senders, receivers, finders, routers
-//!   and Discovery Server advertisers and listeners ([`AdvancedConfig`]).
+//!   and Discovery Server advertisers and listeners ([`AdvancedConfig`]),
+//!   given to each through the `config` setter of its options.
 //! * Compressed passthrough: receiving codec packets ([`PacketReceiver`]) and
 //!   sending them ([`CompressedSender`]), including scatter-gather submission.
 //! * Encoder guidance, keyframe demand and stream selection on the ordinary
@@ -87,7 +88,22 @@ pub use receive::*;
 pub use send::*;
 pub use sync::*;
 
-/// An invalid-frame error with `message`.
-fn invalid(message: &str) -> crate::Error {
+/// [`Error::InvalidFrame`](crate::Error::InvalidFrame) with `message`: a frame
+/// or packet that is malformed, or that cannot be built or sent.
+fn invalid_frame(message: impl Into<String>) -> crate::Error {
     crate::Error::InvalidFrame(message.into())
+}
+
+/// [`Error::InvalidInput`](crate::Error::InvalidInput) with `message`: a value
+/// this module was given that it cannot use, whatever frame it is for.
+fn invalid_input(message: impl Into<String>) -> crate::Error {
+    crate::Error::InvalidInput(message.into())
+}
+
+/// `value` when it is in `1..=i32::MAX`, the range of the SDK's signed
+/// quantities: dimensions, sample rates, channel and sample counts.
+fn sdk_quantity(value: impl Into<i64>) -> Option<u32> {
+    u32::try_from(value.into())
+        .ok()
+        .filter(|value| (1..=i32::MAX.unsigned_abs()).contains(value))
 }

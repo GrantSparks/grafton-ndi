@@ -6,11 +6,11 @@
 //! touching a frame.
 //!
 //! ```no_run
-//! use grafton_ndi::{routing::{Router, RouterOptions}, Finder, FinderOptions, NDI};
+//! use grafton_ndi::{routing::{Router, RouterOptions}, Finder, FinderOptions, Ndi};
 //! use std::time::Duration;
 //!
 //! # fn main() -> Result<(), grafton_ndi::Error> {
-//! let ndi = NDI::new()?;
+//! let ndi = Ndi::new()?;
 //! let mut router = Router::new(&ndi, &RouterOptions::new("Program"))?;
 //!
 //! let finder = Finder::new(&ndi, &FinderOptions::default())?;
@@ -26,7 +26,7 @@
 
 use crate::{
     sys::{self, bindings::*},
-    to_ms_checked, Error, Result, Source, NDI,
+    to_ms_checked, Error, Ndi, Result, Source,
 };
 use std::{ffi::CString, fmt, ptr, time::Duration};
 
@@ -35,6 +35,8 @@ use std::{ffi::CString, fmt, ptr, time::Duration};
 pub struct RouterOptions {
     name: String,
     groups: Option<String>,
+    #[cfg(feature = "advanced")]
+    config: Option<crate::advanced::AdvancedConfig>,
 }
 impl RouterOptions {
     /// Configure a named routing source. Creating the Router advertises it.
@@ -42,16 +44,27 @@ impl RouterOptions {
         Self {
             name: name.into(),
             groups: None,
+            #[cfg(feature = "advanced")]
+            config: None,
         }
     }
-    /// Select discovery groups; omission uses the SDK default.
+    /// Set the comma-separated discovery groups the router is advertised in,
+    /// instead of those of the NDI configuration.
+    #[must_use]
     pub fn groups(mut self, groups: impl Into<String>) -> Self {
         self.groups = Some(groups.into());
         self
     }
-    /// Configured source name.
-    pub fn name(&self) -> &str {
-        &self.name
+    /// Create the router with this per-instance Advanced SDK configuration,
+    /// which it keeps for as long as it lives.
+    ///
+    /// [`Router::new`] then needs an Advanced runtime, and a build with the
+    /// Advanced SDK.
+    #[cfg(feature = "advanced")]
+    #[must_use]
+    pub fn config(mut self, config: crate::advanced::AdvancedConfig) -> Self {
+        self.config = Some(config);
+        self
     }
 }
 
@@ -68,7 +81,7 @@ pub struct Router {
     _groups: Option<CString>,
     #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
-    _ndi: NDI,
+    _ndi: Ndi,
 }
 
 // SAFETY: the SDK attaches no routing instance to the thread that created it;
@@ -96,10 +109,16 @@ impl Router {
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime has no
-    /// [routing support](crate::capabilities::RuntimeFeature::Routing), [`Error::InvalidCString`]
-    /// when the name or groups contain a NUL byte, and
-    /// [`Error::NativeOperationFailed`] when the SDK creates no source.
-    pub fn new(ndi: &NDI, options: &RouterOptions) -> Result<Self> {
+    /// [routing support](crate::capabilities::RuntimeFeature::Routing), or the
+    /// options carry an Advanced configuration that the runtime or this build
+    /// cannot take; [`Error::InvalidCString`] when the name or groups contain a
+    /// NUL byte; and [`Error::NativeOperationFailed`] when the SDK creates no
+    /// source.
+    pub fn new(ndi: &Ndi, options: &RouterOptions) -> Result<Self> {
+        #[cfg(feature = "advanced")]
+        if let Some(config) = &options.config {
+            return Self::new_configured(ndi, options, config);
+        }
         // SAFETY: the SDK's router creation returns null or a fresh router
         // that nothing else owns, and the settings outlive the call.
         unsafe {
@@ -124,7 +143,7 @@ impl Router {
     /// `create` returns null or a live router of `ndi`'s runtime, made from
     /// the settings it was handed, that nothing else owns.
     pub(crate) unsafe fn create(
-        ndi: &NDI,
+        ndi: &Ndi,
         options: &RouterOptions,
         operation: &'static str,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
@@ -165,7 +184,7 @@ impl Router {
 
     /// The runtime this router was created through.
     #[cfg(feature = "advanced")]
-    pub(crate) fn runtime(&self) -> &NDI {
+    pub(crate) fn runtime(&self) -> &Ndi {
         &self._ndi
     }
 
@@ -209,8 +228,8 @@ impl Router {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidConfiguration`] when `timeout` exceeds
-    /// [`crate::MAX_TIMEOUT`], and [`Error::NativeOperationFailed`] when the SDK
+    /// Returns [`Error::InvalidInput`] when `timeout` exceeds
+    /// [`crate::MAX_TIMEOUT`], and [`Error::UnexpectedSdkResult`] when the SDK
     /// reports a negative count.
     pub fn connection_count(&self, timeout: Duration) -> Result<u32> {
         let timeout = to_ms_checked(timeout)?;
@@ -219,8 +238,10 @@ impl Router {
             self.routing
                 .NDIlib_routing_get_no_connections(self.instance, timeout)
         };
-        u32::try_from(count).map_err(|_| Error::NativeOperationFailed {
-            operation: "routing connection count",
+        u32::try_from(count).map_err(|_| {
+            Error::UnexpectedSdkResult(format!(
+                "NDIlib_routing_get_no_connections returned a negative count: {count}"
+            ))
         })
     }
     /// The source descriptor this router is advertised under, which receivers
@@ -228,11 +249,17 @@ impl Router {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NullPointer`] when the SDK supplies no descriptor.
+    /// Returns [`Error::NativeOperationFailed`] when the SDK supplies no
+    /// descriptor, or one that names neither a source nor an address.
     pub fn source(&self) -> Result<Source> {
         // SAFETY: the router is live, and the descriptor the SDK returns stays
         // valid until the router is destroyed, after this copy completes.
-        unsafe { Source::try_from_raw(self.routing.NDIlib_routing_get_source_name(self.instance)) }
+        unsafe {
+            Source::try_from_raw(
+                self.routing.NDIlib_routing_get_source_name(self.instance),
+                "NDIlib_routing_get_source_name",
+            )
+        }
     }
 }
 

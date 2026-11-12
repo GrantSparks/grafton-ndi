@@ -2,8 +2,8 @@
 mod common;
 
 use grafton_ndi::{
-    capabilities::RuntimeFeature, AudioFrame, Receiver, ReceiverBandwidth, ReceiverOptions, Sender,
-    SenderOptions, VideoFrame,
+    capabilities::RuntimeFeature, AudioFrame, FrameRate, Receiver, ReceiverBandwidth,
+    ReceiverOptions, Sender, SenderOptions, VideoFrame,
 };
 use std::time::{Duration, Instant};
 
@@ -23,23 +23,22 @@ fn video_only_modes_deliver_video_while_an_ordinary_receiver_also_gets_audio() {
     // receiver's connection and does not restore it within the deadline.
     let sender = Sender::new(
         &ndi,
-        &SenderOptions::builder(common::unique_name("video-only"))
+        &SenderOptions::new(common::unique_name("video-only"))
             .clock_video(true)
-            .clock_audio(false)
-            .build(),
+            .clock_audio(false),
     )
     .unwrap();
     let source = common::loopback_source(&ndi, &sender).unwrap();
-    let ordinary = Receiver::new(&ndi, &ReceiverOptions::builder(source.clone()).build()).unwrap();
+    let ordinary = Receiver::new(&ndi, &ReceiverOptions::new(source.clone())).unwrap();
     let video = VideoFrame::builder()
         .resolution(64, 32)
-        .frame_rate(30, 1)
+        .frame_rate(FrameRate::new(30, 1).unwrap())
         .build()
         .unwrap();
     let audio = AudioFrame::builder()
         .sample_rate(48_000)
-        .channels(2)
-        .samples(1600)
+        .num_channels(2)
+        .num_samples(1600)
         .build()
         .unwrap();
     for bandwidth in [
@@ -48,9 +47,7 @@ fn video_only_modes_deliver_video_while_an_ordinary_receiver_also_gets_audio() {
     ] {
         let receiver = Receiver::new(
             &ndi,
-            &ReceiverOptions::builder(source.clone())
-                .bandwidth(bandwidth)
-                .build(),
+            &ReceiverOptions::new(source.clone()).bandwidth(bandwidth),
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -58,18 +55,13 @@ fn video_only_modes_deliver_video_while_an_ordinary_receiver_also_gets_audio() {
         let mut ordinary_audio = 0;
         let mut connected_since = None;
         loop {
-            sender.send_video(&video);
+            sender.send_video(&video).unwrap();
             sender.send_audio(&audio);
-            ordinary_audio += usize::from(
-                ordinary
-                    .audio()
-                    .try_capture(Duration::ZERO)
-                    .unwrap()
-                    .is_some(),
-            );
+            ordinary_audio +=
+                usize::from(ordinary.audio().capture(Duration::ZERO).unwrap().is_some());
             if receiver
                 .video()
-                .try_capture(Duration::from_millis(20))
+                .capture(Duration::from_millis(20))
                 .unwrap()
                 .is_some()
             {
@@ -77,11 +69,7 @@ fn video_only_modes_deliver_video_while_an_ordinary_receiver_also_gets_audio() {
                 connected_since.get_or_insert_with(Instant::now);
             }
             assert!(
-                receiver
-                    .audio()
-                    .try_capture(Duration::ZERO)
-                    .unwrap()
-                    .is_none(),
+                receiver.audio().capture(Duration::ZERO).unwrap().is_none(),
                 "{bandwidth:?} delivered audio"
             );
             if videos >= 10

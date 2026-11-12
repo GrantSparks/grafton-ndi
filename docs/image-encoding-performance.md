@@ -16,8 +16,8 @@ Every reported time is the median of three encodes. The same complete matrix
 was run with the dependency's optional SIMD feature unified into the build.
 
 ```bash
-cargo test --release --lib image_encoding_resources -- --ignored --nocapture
-cargo test --release --lib --features jpeg-encoder/simd image_encoding_resources -- --ignored --nocapture
+cargo test --release --lib --features image-encoding image_encoding_resources -- --ignored --nocapture
+cargo test --release --lib --features image-encoding,jpeg-encoder/simd image_encoding_resources -- --ignored --nocapture
 ```
 
 ## Wrapper conversion scratch
@@ -44,7 +44,7 @@ build exercises the same differential tests.
 
 ## Encoding peak and wall time
 
-The following default-feature results use contiguous, uniform BGRA. Peak bytes
+The following `image-encoding` results use contiguous, uniform BGRA. Peak bytes
 are the maximum simultaneously live allocation sizes requested by the encoding
 call on its thread, **including codec and output storage**. They exclude the
 preexisting source frame and allocator overhead; they are not process RSS.
@@ -65,7 +65,7 @@ from 113,920,228 to 114,253,991 B because streaming changes compression chunking
 decoded pixels remain exact. JPEG 100 still needs 268,620,148 B of codec/output
 heap for that input, despite eliminating its 99,532,800-byte RGB staging buffer.
 
-Across the complete default-feature matrix, row/staged median time ratios were
+Across the complete `image-encoding` matrix, row/staged median time ratios were
 0.796–0.995 for PNG and 0.711–0.933 for JPEG. With JPEG SIMD enabled they were
 0.787–0.978 and 0.753–0.964, respectively. These runs found no repeatable
 throughput regression requiring a separate contiguous path. JPEG output was

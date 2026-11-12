@@ -6,17 +6,17 @@ use grafton_ndi::{
 };
 use std::{
     sync::{
-        atomic::{AtomicI32, Ordering},
+        atomic::{AtomicU32, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
 
-fn wait_for_channels(fs: &FrameSync, channels: i32) -> i32 {
+fn wait_for_channels(fs: &FrameSync, channels: u32) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let format = fs
-            .capture_audio(FrameSyncAudioRequest::query_input())
+            .capture_audio_ref(FrameSyncAudioRequest::query_input())
             .unwrap();
         if format.num_channels() == channels {
             assert_eq!(format.sample_rate(), 48_000);
@@ -43,26 +43,25 @@ fn queried_channels_remain_fixed_when_source_format_changes() {
     );
     let sender = Sender::new(
         &ndi,
-        &SenderOptions::builder(common::unique_name("FrameSync audio request regression"))
-            .clock_audio(true)
-            .build(),
+        &SenderOptions::new(common::unique_name("FrameSync audio request regression"))
+            .clock_audio(true),
     )
     .unwrap();
     let source = common::loopback_source(&ndi, &sender).unwrap();
-    let receiver = Receiver::new(&ndi, &ReceiverOptions::builder(source).build()).unwrap();
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source)).unwrap();
     let fs = FrameSync::new(receiver).unwrap();
-    let source_channels = Arc::new(AtomicI32::new(2));
+    let source_channels = Arc::new(AtomicU32::new(2));
     std::thread::scope(|scope| {
         let worker_channels = source_channels.clone();
         scope.spawn(move || {
             let stereo = AudioFrame::builder()
-                .channels(2)
-                .samples(480)
+                .num_channels(2)
+                .num_samples(480)
                 .build()
                 .unwrap();
             let quad = AudioFrame::builder()
-                .channels(4)
-                .samples(480)
+                .num_channels(4)
+                .num_samples(480)
                 .build()
                 .unwrap();
             loop {
@@ -74,7 +73,7 @@ fn queried_channels_remain_fixed_when_source_format_changes() {
                 }
             }
         });
-        struct Stop(Arc<AtomicI32>);
+        struct Stop(Arc<AtomicU32>);
         impl Drop for Stop {
             fn drop(&mut self) {
                 self.0.store(0, Ordering::Relaxed);
@@ -85,7 +84,7 @@ fn queried_channels_remain_fixed_when_source_format_changes() {
         let channels = wait_for_channels(&fs, 2);
         let request = FrameSyncAudioRequest::capture(channels, 480).unwrap();
         {
-            let frame = fs.capture_audio(request).unwrap();
+            let frame = fs.capture_audio_ref(request).unwrap();
             assert_eq!((frame.num_channels(), frame.num_samples()), (2, 480));
             assert!(frame.channels().all(|channel| channel.len() == 480));
         }
@@ -94,7 +93,7 @@ fn queried_channels_remain_fixed_when_source_format_changes() {
         source_channels.store(4, Ordering::Relaxed);
         let new_channels = wait_for_channels(&fs, 4);
         for _ in 0..3 {
-            let frame = fs.capture_audio(request).unwrap();
+            let frame = fs.capture_audio_ref(request).unwrap();
             assert_eq!(
                 (
                     frame.sample_rate(),
@@ -105,13 +104,13 @@ fn queried_channels_remain_fixed_when_source_format_changes() {
             );
             assert_eq!(frame.channels().len(), 2);
             assert!(frame.channels().all(|channel| channel.len() == 480));
-            let owned = fs.capture_audio_owned(request).unwrap().unwrap();
+            let owned = fs.capture_audio(request).unwrap().unwrap();
             assert_eq!((owned.num_channels(), owned.num_samples()), (2, 480));
             assert_eq!(owned.channel_data(1).unwrap().len(), 480);
         }
         // Applications can explicitly choose to follow the newly queried count.
         let updated = FrameSyncAudioRequest::capture(new_channels, 480).unwrap();
-        let frame = fs.capture_audio(updated).unwrap();
+        let frame = fs.capture_audio_ref(updated).unwrap();
         assert_eq!((frame.num_channels(), frame.num_samples()), (4, 480));
         assert!(frame.channels().all(|channel| channel.len() == 480));
     });

@@ -1,12 +1,13 @@
 //! Compressed frames and the packet envelope that frames H.264, HEVC and AAC
 //! payloads on the wire.
 
-use std::ffi::CString;
+use std::ffi::{c_char, CString};
 
-use super::invalid;
-use crate::{sys::bindings::*, Rejected, Result, ScanType};
-
-use super::{aliasable::AliasableBox, descriptors};
+use super::{aliasable::AliasableBox, descriptors, invalid_frame, sdk_quantity};
+use crate::{
+    sys::bindings::*, Error, FourCc, FrameRate, Rejected, Result, ScanType, SdkTimestamp,
+    StreamTier, Timecode,
+};
 
 /// Maximum compressed frame size, in bytes, that this module sends or accepts.
 pub const MAX_PACKET_BYTES: usize = 256 * 1024 * 1024;
@@ -28,7 +29,7 @@ const SPEEDHQ_QUALITY_LIMIT: u8 = 100;
 
 /// The largest width and height of an H.264 or HEVC picture on the preview
 /// stream.
-const MAX_PREVIEW_DIMENSION: i32 = 640;
+const MAX_PREVIEW_DIMENSION: u32 = 640;
 
 // Byte offsets of the envelope header fields.
 const VERSION_OFFSET: usize = 0;
@@ -67,7 +68,7 @@ fn field<const N: usize>(bytes: &[u8], offset: usize) -> [u8; N] {
 ///
 /// Which frames reach a receiver also depends on the order they are sent in;
 /// see [`CompressedSender`](super::CompressedSender).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum VideoCodec {
     /// SpeedHQ 4:2:0.
@@ -84,17 +85,6 @@ pub enum VideoCodec {
     H264Alpha,
     /// HEVC with alpha in a packet envelope.
     HevcAlpha,
-}
-
-/// Which of a source's two video streams a compressed frame belongs to.
-///
-/// The SDK tracks asynchronous sends of the two tiers separately.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StreamTier {
-    /// The full-quality stream.
-    Program,
-    /// The low-bandwidth stream.
-    Preview,
 }
 
 impl VideoCodec {
@@ -153,7 +143,7 @@ impl VideoCodec {
 }
 
 /// A codec whose payload travels inside a packet envelope.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum EnvelopeCodec {
     /// H.264 video.
@@ -165,20 +155,20 @@ pub enum EnvelopeCodec {
 }
 
 impl EnvelopeCodec {
-    /// The code the envelope header carries for this codec.
-    pub const fn code(self) -> u32 {
-        match self {
+    /// The FourCC the envelope header carries for this codec.
+    pub const fn fourcc(self) -> FourCc {
+        FourCc::from_raw(match self {
             Self::H264 => fourcc(b"H264"),
             Self::Hevc => fourcc(b"HEVC"),
             Self::Aac => 0xff,
-        }
+        })
     }
 
-    /// The codec an envelope header code names, if this module knows it.
-    pub fn from_code(code: u32) -> Option<Self> {
+    /// The codec an envelope header's FourCC names, if this module knows it.
+    pub fn from_fourcc(fourcc: FourCc) -> Option<Self> {
         [Self::H264, Self::Hevc, Self::Aac]
             .into_iter()
-            .find(|codec| codec.code() == code)
+            .find(|codec| codec.fourcc() == fourcc)
     }
 }
 
@@ -186,7 +176,7 @@ impl EnvelopeCodec {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EnvelopeHeader {
     size: usize,
-    codec: u32,
+    codec: FourCc,
     pts: i64,
     dts: i64,
     reserved: u64,
@@ -199,15 +189,15 @@ impl EnvelopeHeader {
     /// Read the header at the start of `bytes`.
     pub(crate) fn read(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < ENVELOPE_HEADER_BYTES {
-            return Err(invalid("Truncated compressed packet header"));
+            return Err(invalid_frame("Truncated compressed packet header"));
         }
-        let size = i32::from_ne_bytes(field(bytes, VERSION_OFFSET));
-        if size < ENVELOPE_HEADER_BYTES as i32 {
-            return Err(invalid("Unsupported compressed packet header size"));
-        }
+        let size = usize::try_from(i32::from_ne_bytes(field(bytes, VERSION_OFFSET)))
+            .ok()
+            .filter(|size| *size >= ENVELOPE_HEADER_BYTES)
+            .ok_or_else(|| invalid_frame("Unsupported compressed packet header size"))?;
         Ok(Self {
-            size: size as usize,
-            codec: u32::from_ne_bytes(field(bytes, CODEC_OFFSET)),
+            size,
+            codec: FourCc::from_raw(u32::from_ne_bytes(field(bytes, CODEC_OFFSET))),
             pts: i64::from_ne_bytes(field(bytes, PTS_OFFSET)),
             dts: i64::from_ne_bytes(field(bytes, DTS_OFFSET)),
             reserved: u64::from_ne_bytes(field(bytes, RESERVED_OFFSET)),
@@ -243,18 +233,20 @@ impl EnvelopeHeader {
     /// or received carries whatever the SDK left there.
     pub(crate) fn validate_for_send(&self, codec: EnvelopeCodec, total: usize) -> Result<()> {
         if self.size != ENVELOPE_HEADER_BYTES || self.flags & !KEYFRAME != 0 {
-            return Err(invalid(
+            return Err(invalid_frame(
                 "Cannot send a packet with an unsupported header version or unknown flags",
             ));
         }
-        if self.codec != codec.code() {
-            return Err(invalid("Packet codec does not match the frame's codec"));
+        if self.codec != codec.fourcc() {
+            return Err(invalid_frame(
+                "Packet codec does not match the frame's codec",
+            ));
         }
         if self.data_len == 0 {
-            return Err(invalid("Empty codec payload"));
+            return Err(invalid_frame("Empty codec payload"));
         }
         if self.total_len() != Some(total) {
-            return Err(invalid(
+            return Err(invalid_frame(
                 "Packet header lengths do not match the size of the frame",
             ));
         }
@@ -265,14 +257,14 @@ impl EnvelopeHeader {
     /// sent: a decoder cannot start on a keyframe without its parameter sets.
     pub(crate) fn validate_video_configuration(&self) -> Result<()> {
         if self.is_keyframe() && self.extra_len == 0 {
-            return Err(invalid("Keyframes require codec configuration data"));
+            return Err(invalid_frame("Keyframes require codec configuration data"));
         }
         Ok(())
     }
 
-    /// Check what the SDK needs of an AAC packet to deliver it as audio at
-    /// `sample_rate` hertz with `channels` channels. `config` is the first two
-    /// bytes of the packet's codec configuration, when it has that many.
+    /// Check what the SDK needs of an AAC packet to deliver it as audio with
+    /// `parameters`. `config` is the first two bytes of the packet's codec
+    /// configuration, when it has that many.
     ///
     /// The SDK reads the sample rate and the channel layout from those bytes,
     /// where an AudioSpecificConfig keeps them, and discards a packet whose
@@ -280,14 +272,13 @@ impl EnvelopeHeader {
     pub(crate) fn validate_aac(
         &self,
         config: Option<[u8; 2]>,
-        sample_rate: i32,
-        channels: i32,
+        parameters: AudioParameters,
     ) -> Result<()> {
         if !self.is_keyframe() {
-            return Err(invalid("AAC packets must carry the keyframe flag"));
+            return Err(invalid_frame("AAC packets must carry the keyframe flag"));
         }
         let Some(config) = config else {
-            return Err(invalid(
+            return Err(invalid_frame(
                 "AAC packets require their AudioSpecificConfig as codec configuration data",
             ));
         };
@@ -296,17 +287,17 @@ impl EnvelopeHeader {
         let bits = u16::from_be_bytes(config);
         let frequency_index = usize::from((bits >> 7) & 0xf);
         let channel_configuration = usize::from((bits >> 3) & 0xf);
-        if AAC_SAMPLE_RATES.get(frequency_index) != Some(&sample_rate) {
-            return Err(invalid(
+        if AAC_SAMPLE_RATES.get(frequency_index) != Some(&parameters.sample_rate) {
+            return Err(invalid_frame(
                 "The AAC configuration names a different sample rate than the frame",
             ));
         }
         if channel_configuration
             .checked_sub(1)
             .and_then(|index| AAC_CHANNELS.get(index))
-            != Some(&channels)
+            != Some(&parameters.num_channels)
         {
-            return Err(invalid(
+            return Err(invalid_frame(
                 "The AAC configuration names a different channel layout than the frame",
             ));
         }
@@ -315,7 +306,7 @@ impl EnvelopeHeader {
 }
 
 /// A bounds-checked view of a packet envelope: its header, codec payload and
-/// codec configuration data.
+/// codec configuration data. [`encode`](Self::encode) builds one.
 ///
 /// Parsing keeps what it does not understand. Flags, the reserved field and
 /// header bytes added by a later envelope version are all readable, so a
@@ -331,30 +322,99 @@ impl<'a> PacketEnvelope<'a> {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when the slice is
-    /// shorter than a header, longer than [`MAX_PACKET_BYTES`], or shorter than
-    /// the lengths its header declares.
+    /// [`Error::InvalidFrame`] when the slice is shorter than a header, longer
+    /// than [`MAX_PACKET_BYTES`], or shorter than the lengths its header
+    /// declares.
     pub fn parse(bytes: &'a [u8]) -> Result<Self> {
         if bytes.len() > MAX_PACKET_BYTES {
-            return Err(invalid("Invalid compressed packet length"));
+            return Err(invalid_frame("Invalid compressed packet length"));
         }
         let header = EnvelopeHeader::read(bytes)?;
         let end = header
             .total_len()
-            .ok_or_else(|| invalid("Compressed packet length overflow"))?;
+            .ok_or_else(|| invalid_frame("Compressed packet length overflow"))?;
         if end > bytes.len() {
-            return Err(invalid("Truncated compressed packet"));
+            return Err(invalid_frame("Truncated compressed packet"));
         }
         Ok(Self { bytes, header })
     }
 
-    /// The codec, when the header names one this module knows.
-    pub fn codec(self) -> Option<EnvelopeCodec> {
-        EnvelopeCodec::from_code(self.header.codec)
+    /// Build a version-0 packet envelope around one codec payload.
+    ///
+    /// `presentation_time` and `decode_time` are in the stream's own units.
+    /// `keyframe` marks a video keyframe; AAC has no other kind of packet, so
+    /// an AAC envelope carries the flag whatever `keyframe` says. `extra_data`
+    /// is the codec configuration (parameter sets for H.264 and HEVC, the
+    /// AudioSpecificConfig for AAC); video keyframes and every AAC packet need
+    /// it to be sendable.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFrame`] when `data` is empty or the packet would exceed
+    /// [`MAX_PACKET_BYTES`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use grafton_ndi::advanced::{EnvelopeCodec, PacketEnvelope};
+    ///
+    /// let packet = PacketEnvelope::encode(EnvelopeCodec::H264, 0, 0, true, &[0x65, 0x88], &[0x67, 0x42])?;
+    /// let view = PacketEnvelope::parse(&packet)?;
+    /// assert!(view.is_keyframe());
+    /// assert_eq!(view.data(), [0x65, 0x88]);
+    /// assert_eq!(view.extra_data(), [0x67, 0x42]);
+    /// # Ok::<(), grafton_ndi::Error>(())
+    /// ```
+    pub fn encode(
+        codec: EnvelopeCodec,
+        presentation_time: i64,
+        decode_time: i64,
+        keyframe: bool,
+        data: &[u8],
+        extra_data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let size = ENVELOPE_HEADER_BYTES
+            .checked_add(data.len())
+            .and_then(|n| n.checked_add(extra_data.len()))
+            .ok_or_else(|| invalid_frame("Packet size overflow"))?;
+        if data.is_empty() || size > MAX_PACKET_BYTES {
+            return Err(invalid_frame("Invalid compressed packet payload size"));
+        }
+        let mut bytes = vec![0; size];
+        let mut put = |offset: usize, value: &[u8]| {
+            bytes[offset..offset + value.len()].copy_from_slice(value);
+        };
+        put(
+            VERSION_OFFSET,
+            &(ENVELOPE_HEADER_BYTES as i32).to_ne_bytes(),
+        );
+        put(CODEC_OFFSET, &codec.fourcc().raw().to_ne_bytes());
+        put(PTS_OFFSET, &presentation_time.to_ne_bytes());
+        put(DTS_OFFSET, &decode_time.to_ne_bytes());
+        // The SDK delivers no AAC packet without the flag.
+        let keyframe = keyframe || codec == EnvelopeCodec::Aac;
+        put(
+            FLAGS_OFFSET,
+            &(if keyframe { KEYFRAME } else { 0 }).to_ne_bytes(),
+        );
+        // The size check above bounds both lengths well below u32::MAX.
+        put(DATA_SIZE_OFFSET, &(data.len() as u32).to_ne_bytes());
+        put(
+            EXTRA_DATA_SIZE_OFFSET,
+            &(extra_data.len() as u32).to_ne_bytes(),
+        );
+        put(ENVELOPE_HEADER_BYTES, data);
+        put(ENVELOPE_HEADER_BYTES + data.len(), extra_data);
+        Ok(bytes)
     }
 
-    /// The codec code exactly as the header carries it.
-    pub fn codec_code(self) -> u32 {
+    /// The codec, when the header names one this module knows.
+    pub fn codec(self) -> Option<EnvelopeCodec> {
+        EnvelopeCodec::from_fourcc(self.header.codec)
+    }
+
+    /// The codec's FourCC exactly as the header carries it.
+    pub fn fourcc(self) -> FourCc {
         self.header.codec
     }
 
@@ -373,7 +433,9 @@ impl<'a> PacketEnvelope<'a> {
         self.header.is_keyframe()
     }
 
-    /// Every flag bit, including ones this module does not interpret.
+    /// The header's flags field, every bit as the packet carries it,
+    /// including bits this module does not interpret.
+    /// [`is_keyframe`](Self::is_keyframe) reads the one it does.
     pub fn flags(self) -> u32 {
         self.header.flags
     }
@@ -415,72 +477,15 @@ impl<'a> PacketEnvelope<'a> {
     }
 }
 
-/// Build a version-0 packet envelope around one codec payload.
-///
-/// `pts` and `dts` are in the stream's own units. `keyframe` marks a video
-/// keyframe; AAC has no other kind of packet, so an AAC envelope carries the
-/// flag whatever `keyframe` says. `extra_data` is the codec configuration
-/// (parameter sets for H.264 and HEVC, the AudioSpecificConfig for AAC); video
-/// keyframes and every AAC packet need it to be sendable.
-///
-/// # Errors
-///
-/// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when `data` is empty or
-/// the packet would exceed [`MAX_PACKET_BYTES`].
-///
-/// # Examples
-///
-/// ```
-/// use grafton_ndi::advanced::{packet_envelope, EnvelopeCodec, PacketEnvelope};
-///
-/// let packet = packet_envelope(EnvelopeCodec::H264, 0, 0, true, &[0x65, 0x88], &[0x67, 0x42])?;
-/// let view = PacketEnvelope::parse(&packet)?;
-/// assert!(view.is_keyframe());
-/// assert_eq!(view.data(), [0x65, 0x88]);
-/// assert_eq!(view.extra_data(), [0x67, 0x42]);
-/// # Ok::<(), grafton_ndi::Error>(())
-/// ```
-pub fn packet_envelope(
-    codec: EnvelopeCodec,
-    pts: i64,
-    dts: i64,
-    keyframe: bool,
-    data: &[u8],
-    extra_data: &[u8],
-) -> Result<Vec<u8>> {
-    let size = ENVELOPE_HEADER_BYTES
-        .checked_add(data.len())
-        .and_then(|n| n.checked_add(extra_data.len()))
-        .ok_or_else(|| invalid("Packet size overflow"))?;
-    if data.is_empty() || size > MAX_PACKET_BYTES {
-        return Err(invalid("Invalid compressed packet payload size"));
+/// A picture aspect ratio this module accepts: finite and not negative.
+fn checked_aspect_ratio(ratio: f32) -> std::result::Result<f32, String> {
+    if ratio.is_finite() && ratio >= 0.0 {
+        Ok(ratio)
+    } else {
+        Err(format!(
+            "Picture aspect ratio {ratio} must be finite and not negative; zero selects square pixels"
+        ))
     }
-    let mut bytes = vec![0; size];
-    let mut put = |offset: usize, value: &[u8]| {
-        bytes[offset..offset + value.len()].copy_from_slice(value);
-    };
-    put(
-        VERSION_OFFSET,
-        &(ENVELOPE_HEADER_BYTES as i32).to_ne_bytes(),
-    );
-    put(CODEC_OFFSET, &codec.code().to_ne_bytes());
-    put(PTS_OFFSET, &pts.to_ne_bytes());
-    put(DTS_OFFSET, &dts.to_ne_bytes());
-    // The SDK delivers no AAC packet without the flag.
-    let keyframe = keyframe || codec == EnvelopeCodec::Aac;
-    put(
-        FLAGS_OFFSET,
-        &(if keyframe { KEYFRAME } else { 0 }).to_ne_bytes(),
-    );
-    // The size check above bounds both lengths well below u32::MAX.
-    put(DATA_SIZE_OFFSET, &(data.len() as u32).to_ne_bytes());
-    put(
-        EXTRA_DATA_SIZE_OFFSET,
-        &(extra_data.len() as u32).to_ne_bytes(),
-    );
-    put(ENVELOPE_HEADER_BYTES, data);
-    put(ENVELOPE_HEADER_BYTES + data.len(), extra_data);
-    Ok(bytes)
 }
 
 /// The codec, geometry and timing of compressed video, independent of any
@@ -489,101 +494,121 @@ pub fn packet_envelope(
 /// # Examples
 ///
 /// ```
-/// use grafton_ndi::advanced::{StreamTier, VideoCodec, VideoPacketFormat};
+/// use grafton_ndi::{
+///     advanced::{VideoCodec, VideoPacketFormat},
+///     FrameRate, StreamTier,
+/// };
 ///
 /// let format = VideoPacketFormat::new(VideoCodec::Hevc, 1920, 1080)?
-///     .frame_rate(60_000, 1001)?
-///     .tier(StreamTier::Program);
-/// assert_eq!(format.frame_rate_parts(), (60_000, 1001));
+///     .with_frame_rate(FrameRate::new(60_000, 1001)?)
+///     .with_tier(StreamTier::Program);
+/// assert_eq!(format.frame_rate(), FrameRate::new(60_000, 1001)?);
+/// assert!(VideoPacketFormat::new(VideoCodec::Hevc, 0, 1080).is_err());
 /// # Ok::<(), grafton_ndi::Error>(())
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VideoPacketFormat {
-    pub(crate) codec: VideoCodec,
-    pub(crate) tier: StreamTier,
-    pub(crate) protected: bool,
-    width: i32,
-    height: i32,
-    rate_n: i32,
-    rate_d: i32,
-    aspect: f32,
-    scan: ScanType,
+    codec: VideoCodec,
+    tier: StreamTier,
+    protected: bool,
+    // Both in 1..=i32::MAX, the range of the SDK's signed fields.
+    width: u32,
+    height: u32,
+    frame_rate: FrameRate,
+    picture_aspect_ratio: f32,
+    scan_type: ScanType,
 }
 
 impl VideoPacketFormat {
     /// A progressive program-tier format at 30 frames per second with square
-    /// pixels. Adjust it with the other methods.
+    /// pixels. Adjust it with the `with_*` methods.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when a dimension is
-    /// not positive.
-    pub fn new(codec: VideoCodec, width: i32, height: i32) -> Result<Self> {
-        if width <= 0 || height <= 0 {
-            return Err(invalid("Compressed video dimensions must be positive"));
+    /// [`Error::InvalidInput`] unless both dimensions are in `1..=i32::MAX`,
+    /// the range the SDK can carry.
+    pub fn new(codec: VideoCodec, width: u32, height: u32) -> Result<Self> {
+        Self::checked(codec, width.into(), height.into()).map_err(Error::InvalidInput)
+    }
+
+    /// The one dimension check, for values from the API and from the SDK.
+    /// The error is the reason, for the caller to report as its own variant.
+    fn checked(codec: VideoCodec, width: i64, height: i64) -> std::result::Result<Self, String> {
+        match (sdk_quantity(width), sdk_quantity(height)) {
+            (Some(width), Some(height)) => Ok(Self {
+                codec,
+                tier: StreamTier::Program,
+                protected: false,
+                width,
+                height,
+                frame_rate: const { FrameRate::per_second(30) },
+                picture_aspect_ratio: 0.0,
+                scan_type: ScanType::Progressive,
+            }),
+            _ => Err(format!(
+                "Compressed video dimensions {width}x{height} must each be in 1..={}",
+                i32::MAX
+            )),
         }
+    }
+
+    /// The format of a compressed frame the SDK delivered; a value out of
+    /// range makes the frame invalid.
+    pub(crate) fn from_sdk(raw: &NDIlib_video_frame_v2_t) -> Result<Self> {
+        let (codec, tier, protected) = VideoCodec::from_outer(raw.FourCC)
+            .ok_or_else(|| invalid_frame("Unknown compressed video FourCC"))?;
+        let format =
+            Self::checked(codec, raw.xres.into(), raw.yres.into()).map_err(Error::InvalidFrame)?;
         Ok(Self {
-            codec,
-            tier: StreamTier::Program,
-            protected: false,
-            width,
-            height,
-            rate_n: 30,
-            rate_d: 1,
-            aspect: 0.0,
-            scan: ScanType::Progressive,
+            tier,
+            protected,
+            frame_rate: FrameRate::from_sdk(raw.frame_rate_N, raw.frame_rate_D)?,
+            picture_aspect_ratio: checked_aspect_ratio(raw.picture_aspect_ratio)
+                .map_err(Error::InvalidFrame)?,
+            scan_type: ScanType::from_sdk(raw.frame_format_type)
+                .ok_or_else(|| invalid_frame("Unknown packet scan type"))?,
+            ..format
         })
     }
 
-    /// Set the frame rate as a fraction, for example `30_000 / 1001`.
+    /// The same format at `frame_rate`.
+    #[must_use]
+    pub fn with_frame_rate(self, frame_rate: FrameRate) -> Self {
+        Self { frame_rate, ..self }
+    }
+
+    /// The same format with picture aspect ratio `ratio` (width over height
+    /// of the displayed picture). `0.0` means square pixels, as the SDK
+    /// defines it; a receiver is then given the ratio of the frame's width to
+    /// its height.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when either part is
-    /// not positive.
-    pub fn frame_rate(mut self, numerator: i32, denominator: i32) -> Result<Self> {
-        if numerator <= 0 || denominator <= 0 {
-            return Err(invalid("Frame rate must be positive"));
-        }
-        self.rate_n = numerator;
-        self.rate_d = denominator;
-        Ok(self)
+    /// [`Error::InvalidInput`] when the value is negative or not finite.
+    pub fn with_picture_aspect_ratio(self, ratio: f32) -> Result<Self> {
+        let picture_aspect_ratio = checked_aspect_ratio(ratio).map_err(Error::InvalidInput)?;
+        Ok(Self {
+            picture_aspect_ratio,
+            ..self
+        })
     }
 
-    /// Set the picture aspect ratio (width over height of the displayed
-    /// picture). `0.0` means square pixels, as the SDK defines it; a receiver
-    /// is then given the ratio of the frame's width to its height.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when the value is
-    /// negative or not finite.
-    pub fn aspect_ratio(mut self, value: f32) -> Result<Self> {
-        if !value.is_finite() || value < 0.0 {
-            return Err(invalid(
-                "Aspect ratio must be finite and not negative; zero selects square pixels",
-            ));
-        }
-        self.aspect = value;
-        Ok(self)
+    /// The same format on the program or preview stream.
+    #[must_use]
+    pub fn with_tier(self, tier: StreamTier) -> Self {
+        Self { tier, ..self }
     }
 
-    /// Select the program or preview stream.
-    pub fn tier(mut self, tier: StreamTier) -> Self {
-        self.tier = tier;
-        self
+    /// The same format with scan type `scan_type`.
+    #[must_use]
+    pub fn with_scan_type(self, scan_type: ScanType) -> Self {
+        Self { scan_type, ..self }
     }
 
-    /// Set the scan type.
-    pub fn scan_type(mut self, scan: ScanType) -> Self {
-        self.scan = scan;
-        self
-    }
-
-    /// Mark the stream as protected.
-    pub fn protected(mut self, protected: bool) -> Self {
-        self.protected = protected;
-        self
+    /// The same format, marked as a protected stream or not.
+    #[must_use]
+    pub fn with_protected(self, protected: bool) -> Self {
+        Self { protected, ..self }
     }
 
     /// The codec.
@@ -591,39 +616,39 @@ impl VideoPacketFormat {
         self.codec
     }
 
+    /// Width in pixels.
+    pub fn width(self) -> u32 {
+        self.width
+    }
+
+    /// Height in pixels.
+    pub fn height(self) -> u32 {
+        self.height
+    }
+
+    /// The frame rate.
+    pub fn frame_rate(self) -> FrameRate {
+        self.frame_rate
+    }
+
+    /// The picture aspect ratio; `0.0` means square pixels.
+    pub fn picture_aspect_ratio(self) -> f32 {
+        self.picture_aspect_ratio
+    }
+
     /// The stream this format belongs to.
-    pub fn stream_tier(self) -> StreamTier {
+    pub fn tier(self) -> StreamTier {
         self.tier
+    }
+
+    /// The scan type.
+    pub fn scan_type(self) -> ScanType {
+        self.scan_type
     }
 
     /// Whether the stream is protected.
     pub fn is_protected(self) -> bool {
         self.protected
-    }
-
-    /// Width in pixels.
-    pub fn width(self) -> i32 {
-        self.width
-    }
-
-    /// Height in pixels.
-    pub fn height(self) -> i32 {
-        self.height
-    }
-
-    /// The frame rate as `(numerator, denominator)`.
-    pub fn frame_rate_parts(self) -> (i32, i32) {
-        (self.rate_n, self.rate_d)
-    }
-
-    /// The picture aspect ratio; `0.0` means square pixels.
-    pub fn picture_aspect_ratio(self) -> f32 {
-        self.aspect
-    }
-
-    /// The scan type.
-    pub fn scan(self) -> ScanType {
-        self.scan
     }
 
     /// The number of bytes at the start of a frame of this format that hold
@@ -645,7 +670,7 @@ impl VideoPacketFormat {
                 .first()
                 .is_none_or(|quality| *quality >= SPEEDHQ_QUALITY_LIMIT)
             {
-                return Err(invalid(
+                return Err(invalid_frame(
                     "A SpeedHQ frame begins with its quality, a byte below 100",
                 ));
             }
@@ -657,24 +682,39 @@ impl VideoPacketFormat {
         if self.tier == StreamTier::Preview
             && (self.width > MAX_PREVIEW_DIMENSION || self.height > MAX_PREVIEW_DIMENSION)
         {
-            return Err(invalid(
+            return Err(invalid_frame(
                 "An H.264 or HEVC picture on the preview stream is at most 640 pixels wide and 640 high",
             ));
         }
         Ok(())
     }
 
-    /// A native frame descriptor with this format and no data.
+    /// A native frame descriptor with this format and no data, no timecode
+    /// and no metadata.
     pub(crate) fn raw(self) -> NDIlib_video_frame_v2_t {
+        let (numerator, denominator) = self.frame_rate.to_sdk();
         NDIlib_video_frame_v2_t {
-            xres: self.width,
-            yres: self.height,
+            // Lossless: both dimensions are at most i32::MAX.
+            xres: self.width as i32,
+            yres: self.height as i32,
             FourCC: self.codec.outer(self.tier, self.protected),
-            frame_rate_N: self.rate_n,
-            frame_rate_D: self.rate_d,
-            picture_aspect_ratio: self.aspect,
-            frame_format_type: self.scan.into(),
+            frame_rate_N: numerator,
+            frame_rate_D: denominator,
+            picture_aspect_ratio: self.picture_aspect_ratio,
+            frame_format_type: self.scan_type.to_sdk(),
             ..descriptors::video_frame()
+        }
+    }
+
+    /// A native descriptor of a frame with this format and `extras`, without
+    /// data.
+    pub(crate) fn descriptor(self, extras: &FrameExtras) -> NDIlib_video_frame_v2_t {
+        let (timecode, timestamp, p_metadata) = extras.to_sdk();
+        NDIlib_video_frame_v2_t {
+            timecode,
+            timestamp,
+            p_metadata,
+            ..self.raw()
         }
     }
 }
@@ -682,32 +722,46 @@ impl VideoPacketFormat {
 /// Text attached to a frame, checked against the frame metadata limit.
 pub(crate) fn frame_metadata(value: String) -> Result<CString> {
     if value.len() >= crate::frames::MAX_METADATA_BYTES {
-        return Err(invalid("Packet metadata exceeds its size limit"));
+        return Err(invalid_frame("Packet metadata exceeds its size limit"));
     }
     Ok(CString::new(value)?)
 }
 
-/// The per-frame timecode and metadata every compressed and scatter frame
+/// The timecode, timestamp and metadata every compressed and scatter frame
 /// carries, with the single checked way to set the metadata.
-#[derive(Debug)]
+///
+/// The default is what a frame built for sending carries: a timecode for the
+/// SDK to synthesize, no timestamp and no metadata.
+#[derive(Clone, Debug, Default)]
 pub(crate) struct FrameExtras {
-    timecode: i64,
+    timecode: Timecode,
+    timestamp: Option<SdkTimestamp>,
     metadata: Option<CString>,
 }
 
 impl FrameExtras {
-    /// A frame built for sending: the SDK synthesizes the timecode.
-    pub(crate) fn new() -> Self {
-        Self::received(NDIlib_send_timecode_synthesize, None)
-    }
-
     /// The values the SDK delivered with a received frame.
-    pub(crate) fn received(timecode: i64, metadata: Option<CString>) -> Self {
-        Self { timecode, metadata }
+    ///
+    /// # Safety
+    ///
+    /// `metadata` is null or a readable NUL-terminated string.
+    unsafe fn received(timecode: i64, timestamp: i64, metadata: *const c_char) -> Result<Self> {
+        Ok(Self {
+            timecode: Timecode::from_ticks(timecode),
+            timestamp: SdkTimestamp::from_sdk(timestamp),
+            // SAFETY: forwarded to the caller's obligation.
+            metadata: unsafe { copy_metadata(metadata)? },
+        })
     }
 
-    pub(crate) fn timecode(&self) -> i64 {
+    /// The timecode.
+    pub(crate) fn timecode(&self) -> Timecode {
         self.timecode
+    }
+
+    /// The timestamp of a received frame.
+    pub(crate) fn timestamp(&self) -> Option<SdkTimestamp> {
+        self.timestamp
     }
 
     /// The metadata text, if any.
@@ -723,12 +777,17 @@ impl FrameExtras {
             .map_or(0, |metadata| metadata.as_bytes_with_nul().len())
     }
 
-    /// The pointer a native descriptor lends to the SDK, null without
-    /// metadata. It is valid for as long as these extras are.
-    pub(crate) fn metadata_ptr(&self) -> *const std::ffi::c_char {
-        self.metadata
-            .as_ref()
-            .map_or(std::ptr::null(), |metadata| metadata.as_ptr())
+    /// The timecode, timestamp and metadata fields of a native descriptor.
+    /// The metadata pointer is null without metadata, and valid for as long
+    /// as these extras are.
+    fn to_sdk(&self) -> (i64, i64, *const c_char) {
+        (
+            self.timecode.ticks(),
+            SdkTimestamp::to_sdk(self.timestamp),
+            self.metadata
+                .as_ref()
+                .map_or(std::ptr::null(), |metadata| metadata.as_ptr()),
+        )
     }
 }
 
@@ -738,7 +797,7 @@ pub(crate) trait HasExtras: Sized {
 }
 
 /// Set a frame's timecode.
-pub(crate) fn attach_timecode<T: HasExtras>(mut frame: T, timecode: i64) -> T {
+pub(crate) fn attach_timecode<T: HasExtras>(mut frame: T, timecode: Timecode) -> T {
     frame.extras_mut().timecode = timecode;
     frame
 }
@@ -767,7 +826,7 @@ pub(crate) fn attach_metadata<T: HasExtras>(
 /// Sending lends the bytes to the SDK, which writes to them: it stamps the
 /// envelope's reserved field. A send therefore takes the frame exclusively or
 /// by value, and a frame stays sendable however often it has been sent.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CompressedVideoFrame {
     pub(crate) format: VideoPacketFormat,
     pub(crate) bytes: AliasableBox<[u8]>,
@@ -782,17 +841,17 @@ impl HasExtras for CompressedVideoFrame {
 
 impl CompressedVideoFrame {
     /// Take ownership of one frame's bytes: a packet envelope for H.264 and
-    /// HEVC (see [`packet_envelope`]), a SpeedHQ frame otherwise. The timecode
-    /// is synthesized by the SDK unless [`with_timecode`](Self::with_timecode)
-    /// sets one.
+    /// HEVC (see [`PacketEnvelope::encode`]), a SpeedHQ frame otherwise. The
+    /// timecode is synthesized by the SDK unless
+    /// [`with_timecode`](Self::with_timecode) sets one.
     ///
     /// # Errors
     ///
-    /// Returns the bytes with [`Error::InvalidFrame`](crate::Error::InvalidFrame)
-    /// when they are empty, too large, not an envelope of the format's codec,
-    /// an envelope this module cannot send (a later header version, unknown
-    /// flags, trailing bytes, or a keyframe without codec configuration), or
-    /// a frame the SDK does not deliver (see [`VideoCodec`]).
+    /// Returns the bytes with [`Error::InvalidFrame`] when they are empty, too
+    /// large, not an envelope of the format's codec, an envelope this module
+    /// cannot send (a later header version, unknown flags, trailing bytes, or
+    /// a keyframe without codec configuration), or a frame the SDK does not
+    /// deliver (see [`VideoCodec`]).
     pub fn new(
         format: VideoPacketFormat,
         bytes: Vec<u8>,
@@ -801,26 +860,27 @@ impl CompressedVideoFrame {
             Ok(()) => Ok(Self {
                 format,
                 bytes: AliasableBox::new(bytes.into_boxed_slice()),
-                extras: FrameExtras::new(),
+                extras: FrameExtras::default(),
             }),
             Err(error) => Err(Rejected::new(error, bytes)),
         }
     }
 
-    /// Attach per-frame metadata.
+    /// The same frame with per-frame metadata.
     ///
     /// # Errors
     ///
     /// Returns the frame unchanged when the text is too long or contains a NUL.
     pub fn with_metadata(
         self,
-        value: impl Into<String>,
+        metadata: impl Into<String>,
     ) -> std::result::Result<Self, Rejected<Self>> {
-        attach_metadata(self, value.into())
+        attach_metadata(self, metadata.into())
     }
 
-    /// Set the timecode, in 100-nanosecond units.
-    pub fn with_timecode(self, timecode: i64) -> Self {
+    /// The same frame with `timecode`.
+    #[must_use]
+    pub fn with_timecode(self, timecode: Timecode) -> Self {
         attach_timecode(self, timecode)
     }
 
@@ -834,10 +894,16 @@ impl CompressedVideoFrame {
         self.format
     }
 
-    /// The timecode in 100-nanosecond units, or the SDK's "synthesize" value
-    /// on a frame built for sending without one.
-    pub fn timecode(&self) -> i64 {
+    /// The timecode: [`Timecode::SYNTHESIZE`] on a frame built for sending
+    /// without one.
+    pub fn timecode(&self) -> Timecode {
         self.extras.timecode()
+    }
+
+    /// When the sender submitted a received frame, as the SDK recorded it;
+    /// `None` on a frame built for sending.
+    pub fn timestamp(&self) -> Option<SdkTimestamp> {
+        self.extras.timestamp()
     }
 
     /// The per-frame metadata, if any.
@@ -846,7 +912,7 @@ impl CompressedVideoFrame {
     }
 
     /// Take the codec bytes.
-    pub fn into_bytes(self) -> Vec<u8> {
+    pub fn into_data(self) -> Vec<u8> {
         self.bytes.into_box().into_vec()
     }
 
@@ -859,7 +925,7 @@ impl CompressedVideoFrame {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) with the reason.
+    /// [`Error::InvalidFrame`] with the reason.
     pub fn validate_for_send(&self) -> Result<()> {
         validate_video_packet(self.format, &self.bytes, Use::Send)
     }
@@ -873,12 +939,10 @@ impl CompressedVideoFrame {
     /// SDK. The SDK may write to the bytes for as long as it holds the
     /// descriptor, so the caller keeps the frame exclusively for that long.
     pub(crate) fn raw(&mut self) -> NDIlib_video_frame_v2_t {
-        let mut raw = self.format.raw();
+        let mut raw = self.format.descriptor(&self.extras);
         // Construction bounds the length by MAX_PACKET_BYTES, below i32::MAX.
         raw.__bindgen_anon_1.data_size_in_bytes = self.bytes.len() as i32;
         raw.p_data = self.bytes.as_mut_ptr().cast();
-        raw.p_metadata = self.extras.metadata_ptr();
-        raw.timecode = self.extras.timecode();
         raw
     }
 }
@@ -898,20 +962,22 @@ pub(crate) fn validate_video_packet(
     purpose: Use,
 ) -> Result<()> {
     if bytes.is_empty() || bytes.len() > MAX_PACKET_BYTES {
-        return Err(invalid("Invalid compressed video size"));
+        return Err(invalid_frame("Invalid compressed video size"));
     }
     match format.codec.envelope_codec() {
         Some(codec) => {
             let packet = PacketEnvelope::parse(bytes)?;
             if packet.codec() != Some(codec) {
-                return Err(invalid("Packet codec does not match video descriptor"));
+                return Err(invalid_frame(
+                    "Packet codec does not match video descriptor",
+                ));
             }
             if packet.data().is_empty() {
-                return Err(invalid("Empty codec payload"));
+                return Err(invalid_frame("Empty codec payload"));
             }
         }
         None if bytes.len() < SPEEDHQ_HEADER_BYTES => {
-            return Err(invalid("Truncated SpeedHQ frame"));
+            return Err(invalid_frame("Truncated SpeedHQ frame"));
         }
         None => {}
     }
@@ -923,23 +989,23 @@ pub(crate) fn validate_video_packet(
 
 /// The sample rates an AAC configuration can name, in the order of its
 /// sampling-frequency index.
-const AAC_SAMPLE_RATES: [i32; 13] = [
+const AAC_SAMPLE_RATES: [u32; 13] = [
     96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000,
     7_350,
 ];
 
 /// The channel counts an AAC configuration can name, in the order of its
 /// channel configuration, which starts at one.
-const AAC_CHANNELS: [i32; 7] = [1, 2, 3, 4, 5, 6, 8];
+const AAC_CHANNELS: [u32; 7] = [1, 2, 3, 4, 5, 6, 8];
 
 /// The number of samples per channel in an AAC frame.
-const AAC_FRAME_SAMPLES: i32 = 1024;
+const AAC_FRAME_SAMPLES: u32 = 1024;
 
 /// The sample rates Opus runs at.
-const OPUS_SAMPLE_RATES: [i32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];
+const OPUS_SAMPLE_RATES: [u32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];
 
 /// The durations of an Opus frame, in units of 2.5 ms.
-const OPUS_FRAME_DURATIONS: [i64; 6] = [1, 2, 4, 8, 16, 24];
+const OPUS_FRAME_DURATIONS: [u64; 6] = [1, 2, 4, 8, 16, 24];
 
 /// A compressed audio codec.
 ///
@@ -958,7 +1024,7 @@ const OPUS_FRAME_DURATIONS: [i64; 6] = [1, 2, 4, 8, 16, 24];
 ///   channel layout the configuration names must be the frame's own, which
 ///   allows the thirteen indexed sample rates from 7350 Hz to 96 kHz and one
 ///   to six or eight channels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum AudioCodec {
     /// AAC in a packet envelope.
@@ -967,54 +1033,118 @@ pub enum AudioCodec {
     Opus,
 }
 
-/// Check that every dimension of a compressed audio frame is positive.
-fn validate_audio_dimensions(sample_rate: i32, channels: i32, samples: i32) -> Result<()> {
-    if sample_rate <= 0 || channels <= 0 || samples <= 0 {
-        return Err(invalid("Compressed audio dimensions must be positive"));
+/// The sample rate, channel count and samples per channel of one compressed
+/// audio frame, each in `1..=i32::MAX`, the range of the SDK's signed fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AudioParameters {
+    pub(crate) sample_rate: u32,
+    pub(crate) num_channels: u32,
+    pub(crate) num_samples: u32,
+}
+
+impl AudioParameters {
+    /// The parameters of a frame being built.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFrame`] unless each is in `1..=i32::MAX`.
+    pub(crate) fn new(sample_rate: u32, num_channels: u32, num_samples: u32) -> Result<Self> {
+        Self::checked(sample_rate.into(), num_channels.into(), num_samples.into())
     }
-    Ok(())
+
+    /// The parameters of a frame the SDK delivered.
+    fn from_sdk(raw: &NDIlib_audio_frame_v3_t) -> Result<Self> {
+        Self::checked(
+            raw.sample_rate.into(),
+            raw.no_channels.into(),
+            raw.no_samples.into(),
+        )
+    }
+
+    /// The one check, for values from the API and from the SDK.
+    fn checked(sample_rate: i64, num_channels: i64, num_samples: i64) -> Result<Self> {
+        match (
+            sdk_quantity(sample_rate),
+            sdk_quantity(num_channels),
+            sdk_quantity(num_samples),
+        ) {
+            (Some(sample_rate), Some(num_channels), Some(num_samples)) => Ok(Self {
+                sample_rate,
+                num_channels,
+                num_samples,
+            }),
+            _ => Err(invalid_frame(format!(
+                "Compressed audio of {sample_rate} Hz, {num_channels} channels and \
+                 {num_samples} samples per channel: each must be in 1..={}",
+                i32::MAX
+            ))),
+        }
+    }
+
+    /// A native descriptor of a compressed audio frame of `codec` with these
+    /// parameters and `extras`, without data.
+    pub(crate) fn descriptor(
+        self,
+        codec: AudioCodec,
+        protected: bool,
+        extras: &FrameExtras,
+    ) -> NDIlib_audio_frame_v3_t {
+        let (timecode, timestamp, p_metadata) = extras.to_sdk();
+        NDIlib_audio_frame_v3_t {
+            // Lossless: each is at most i32::MAX.
+            sample_rate: self.sample_rate as i32,
+            no_channels: self.num_channels as i32,
+            no_samples: self.num_samples as i32,
+            FourCC: codec.outer(protected),
+            timecode,
+            timestamp,
+            p_metadata,
+            ..descriptors::audio_frame()
+        }
+    }
 }
 
 impl AudioCodec {
     /// Check the parameters a frame of this codec is delivered with; see
     /// [`AudioCodec`]. An AAC frame's configuration is checked separately,
     /// against its envelope.
-    pub(crate) fn validate_delivery(
-        self,
-        sample_rate: i32,
-        channels: i32,
-        samples: i32,
-    ) -> Result<()> {
-        validate_audio_dimensions(sample_rate, channels, samples)?;
+    pub(crate) fn validate_delivery(self, parameters: AudioParameters) -> Result<()> {
+        let AudioParameters {
+            sample_rate,
+            num_channels,
+            num_samples,
+        } = parameters;
         match self {
             Self::Opus => {
                 if !OPUS_SAMPLE_RATES.contains(&sample_rate) {
-                    return Err(invalid(
+                    return Err(invalid_frame(
                         "Opus is sent at 8000, 12000, 16000, 24000 or 48000 Hz",
                     ));
                 }
                 // One unit is 2.5 ms, which is a four-hundredth of a second.
-                let units = i64::from(samples) * 400;
+                let units = u64::from(num_samples) * 400;
                 if !OPUS_FRAME_DURATIONS
                     .iter()
-                    .any(|duration| units == duration * i64::from(sample_rate))
+                    .any(|duration| units == duration * u64::from(sample_rate))
                 {
-                    return Err(invalid(
+                    return Err(invalid_frame(
                         "An Opus frame holds 2.5, 5, 10, 20, 40 or 60 ms of audio",
                     ));
                 }
             }
             Self::Aac => {
-                if samples != AAC_FRAME_SAMPLES {
-                    return Err(invalid("An AAC frame holds 1024 samples per channel"));
+                if num_samples != AAC_FRAME_SAMPLES {
+                    return Err(invalid_frame("An AAC frame holds 1024 samples per channel"));
                 }
                 if !AAC_SAMPLE_RATES.contains(&sample_rate) {
-                    return Err(invalid(
+                    return Err(invalid_frame(
                         "AAC is sent at a sample rate its configuration can name, from 7350 to 96000 Hz",
                     ));
                 }
-                if !AAC_CHANNELS.contains(&channels) {
-                    return Err(invalid("AAC is sent with one to six or eight channels"));
+                if !AAC_CHANNELS.contains(&num_channels) {
+                    return Err(invalid_frame(
+                        "AAC is sent with one to six or eight channels",
+                    ));
                 }
             }
         }
@@ -1024,7 +1154,7 @@ impl AudioCodec {
     /// The FourCC a frame of this codec is sent with.
     pub(crate) const fn outer(self, protected: bool) -> u32 {
         (match self {
-            Self::Aac => EnvelopeCodec::Aac.code(),
+            Self::Aac => EnvelopeCodec::Aac.fourcc().raw(),
             Self::Opus => fourcc(b"Opus"),
         }) | if protected { PROTECTED } else { 0 }
     }
@@ -1045,14 +1175,12 @@ impl AudioCodec {
 ///
 /// Sending lends the bytes to the SDK, which writes to them, so a send takes
 /// the frame exclusively; see [`CompressedVideoFrame`].
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CompressedAudioFrame {
     pub(crate) codec: AudioCodec,
     pub(crate) protected: bool,
     pub(crate) bytes: AliasableBox<[u8]>,
-    pub(crate) sample_rate: i32,
-    pub(crate) channels: i32,
-    pub(crate) samples: i32,
+    pub(crate) parameters: AudioParameters,
     pub(crate) extras: FrameExtras,
 }
 
@@ -1064,43 +1192,47 @@ impl HasExtras for CompressedAudioFrame {
 
 impl CompressedAudioFrame {
     /// Take ownership of one audio frame's bytes: a packet envelope for AAC
-    /// (see [`packet_envelope`]), one bare packet for Opus. `samples` is the
-    /// number of samples per channel the frame decodes to.
+    /// (see [`PacketEnvelope::encode`]), one bare packet for Opus.
+    /// `num_samples` is the number of samples per channel the frame decodes
+    /// to.
     ///
     /// # Errors
     ///
-    /// Returns the bytes with [`Error::InvalidFrame`](crate::Error::InvalidFrame)
-    /// when a dimension is not positive, the bytes are empty or too large, the
-    /// parameters are not ones the codec is delivered with (see
-    /// [`AudioCodec`]), or an AAC envelope is malformed or disagrees with them.
+    /// Returns the bytes with [`Error::InvalidFrame`] when a parameter is not
+    /// in `1..=i32::MAX`, the bytes are empty or too large, the parameters are
+    /// not ones the codec is delivered with (see [`AudioCodec`]), or an AAC
+    /// envelope is malformed or disagrees with them.
     pub fn new(
         codec: AudioCodec,
-        sample_rate: i32,
-        channels: i32,
-        samples: i32,
+        sample_rate: u32,
+        num_channels: u32,
+        num_samples: u32,
         bytes: Vec<u8>,
     ) -> std::result::Result<Self, Rejected<Vec<u8>>> {
+        let parameters = match AudioParameters::new(sample_rate, num_channels, num_samples) {
+            Ok(parameters) => parameters,
+            Err(error) => return Err(Rejected::new(error, bytes)),
+        };
         let frame = Self {
             codec,
             protected: false,
             bytes: AliasableBox::new(bytes.into_boxed_slice()),
-            sample_rate,
-            channels,
-            samples,
-            extras: FrameExtras::new(),
+            parameters,
+            extras: FrameExtras::default(),
         };
         match frame.validate_for_send() {
             Ok(()) => Ok(frame),
-            Err(error) => Err(Rejected::new(error, frame.into_bytes())),
+            Err(error) => Err(Rejected::new(error, frame.into_data())),
         }
     }
 
-    /// Set the timecode, in 100-nanosecond units.
-    pub fn with_timecode(self, timecode: i64) -> Self {
+    /// The same frame with `timecode`.
+    #[must_use]
+    pub fn with_timecode(self, timecode: Timecode) -> Self {
         attach_timecode(self, timecode)
     }
 
-    /// Attach per-frame metadata.
+    /// The same frame with per-frame metadata.
     ///
     /// # Errors
     ///
@@ -1112,10 +1244,10 @@ impl CompressedAudioFrame {
         attach_metadata(self, metadata.into())
     }
 
-    /// Mark the stream as protected.
-    pub fn protected(mut self, protected: bool) -> Self {
-        self.protected = protected;
-        self
+    /// The same frame, marked as a protected stream or not.
+    #[must_use]
+    pub fn with_protected(self, protected: bool) -> Self {
+        Self { protected, ..self }
     }
 
     /// The codec bytes.
@@ -1134,24 +1266,30 @@ impl CompressedAudioFrame {
     }
 
     /// Sample rate in hertz.
-    pub fn sample_rate(&self) -> i32 {
-        self.sample_rate
+    pub fn sample_rate(&self) -> u32 {
+        self.parameters.sample_rate
     }
 
     /// Number of channels.
-    pub fn channels(&self) -> i32 {
-        self.channels
+    pub fn num_channels(&self) -> u32 {
+        self.parameters.num_channels
     }
 
     /// Samples per channel the frame decodes to.
-    pub fn samples(&self) -> i32 {
-        self.samples
+    pub fn num_samples(&self) -> u32 {
+        self.parameters.num_samples
     }
 
-    /// The timecode in 100-nanosecond units, or the SDK's "synthesize" value
-    /// on a frame built for sending without one.
-    pub fn timecode(&self) -> i64 {
+    /// The timecode: [`Timecode::SYNTHESIZE`] on a frame built for sending
+    /// without one.
+    pub fn timecode(&self) -> Timecode {
         self.extras.timecode()
+    }
+
+    /// When the sender submitted a received frame, as the SDK recorded it;
+    /// `None` on a frame built for sending.
+    pub fn timestamp(&self) -> Option<SdkTimestamp> {
+        self.extras.timestamp()
     }
 
     /// The per-frame metadata, if any.
@@ -1160,7 +1298,7 @@ impl CompressedAudioFrame {
     }
 
     /// Take the codec bytes.
-    pub fn into_bytes(self) -> Vec<u8> {
+    pub fn into_data(self) -> Vec<u8> {
         self.bytes.into_box().into_vec()
     }
 
@@ -1173,20 +1311,17 @@ impl CompressedAudioFrame {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) with the reason.
+    /// [`Error::InvalidFrame`] with the reason.
     pub fn validate_for_send(&self) -> Result<()> {
         let envelope = self.validate()?;
-        self.codec
-            .validate_delivery(self.sample_rate, self.channels, self.samples)?;
+        self.codec.validate_delivery(self.parameters)?;
         if let Some(packet) = envelope {
             packet
                 .header
                 .validate_for_send(EnvelopeCodec::Aac, self.bytes.len())?;
-            packet.header.validate_aac(
-                packet.extra_data().first_chunk().copied(),
-                self.sample_rate,
-                self.channels,
-            )?;
+            packet
+                .header
+                .validate_aac(packet.extra_data().first_chunk().copied(), self.parameters)?;
         }
         Ok(())
     }
@@ -1194,16 +1329,15 @@ impl CompressedAudioFrame {
     /// The checks that hold for received frames as well. Returns the envelope
     /// of a frame whose codec has one.
     pub(crate) fn validate(&self) -> Result<Option<PacketEnvelope<'_>>> {
-        validate_audio_dimensions(self.sample_rate, self.channels, self.samples)?;
         if self.bytes.is_empty() || self.bytes.len() > MAX_PACKET_BYTES {
-            return Err(invalid("Invalid compressed audio size"));
+            return Err(invalid_frame("Invalid compressed audio size"));
         }
         if self.codec != AudioCodec::Aac {
             return Ok(None);
         }
         let packet = PacketEnvelope::parse(&self.bytes)?;
         if packet.codec() != Some(EnvelopeCodec::Aac) || packet.data().is_empty() {
-            return Err(invalid("Invalid AAC packet envelope"));
+            return Err(invalid_frame("Invalid AAC packet envelope"));
         }
         Ok(Some(packet))
     }
@@ -1211,16 +1345,10 @@ impl CompressedAudioFrame {
     /// A native descriptor that lends this frame's bytes and metadata to the
     /// SDK; see [`CompressedVideoFrame::raw`].
     pub(crate) fn raw(&mut self) -> NDIlib_audio_frame_v3_t {
-        let mut raw = NDIlib_audio_frame_v3_t {
-            sample_rate: self.sample_rate,
-            no_channels: self.channels,
-            no_samples: self.samples,
-            timecode: self.extras.timecode(),
-            FourCC: self.codec.outer(self.protected),
-            p_data: self.bytes.as_mut_ptr().cast(),
-            p_metadata: self.extras.metadata_ptr(),
-            ..descriptors::audio_frame()
-        };
+        let mut raw = self
+            .parameters
+            .descriptor(self.codec, self.protected, &self.extras);
+        raw.p_data = self.bytes.as_mut_ptr().cast();
         // Validation bounds the length by MAX_PACKET_BYTES, below i32::MAX.
         raw.__bindgen_anon_1.data_size_in_bytes = self.bytes.len() as i32;
         raw
@@ -1232,7 +1360,7 @@ impl CompressedAudioFrame {
 /// # Safety
 ///
 /// `pointer` is null or a readable NUL-terminated string.
-pub(crate) unsafe fn copy_metadata(pointer: *const std::ffi::c_char) -> Result<Option<CString>> {
+unsafe fn copy_metadata(pointer: *const c_char) -> Result<Option<CString>> {
     // SAFETY: forwarded to the caller's obligation.
     let layout = unsafe { crate::frames::validate_frame_metadata(pointer)? };
     Ok(
@@ -1248,12 +1376,13 @@ pub(crate) unsafe fn copy_metadata(pointer: *const std::ffi::c_char) -> Result<O
 ///
 /// When `data` is not null it is readable for `size` bytes.
 unsafe fn packet_bytes<'a>(data: *const u8, size: i32) -> Result<&'a [u8]> {
-    if size <= 0 || size as usize > MAX_PACKET_BYTES || data.is_null() {
-        return Err(invalid("Invalid compressed frame buffer"));
-    }
+    let size = usize::try_from(size)
+        .ok()
+        .filter(|size| !data.is_null() && (1..=MAX_PACKET_BYTES).contains(size))
+        .ok_or_else(|| invalid_frame("Invalid compressed frame buffer"))?;
     // SAFETY: non-null and a positive in-range size were checked; the caller
     // guarantees readability for that size.
-    Ok(unsafe { std::slice::from_raw_parts(data, size as usize) })
+    Ok(unsafe { std::slice::from_raw_parts(data, size) })
 }
 
 /// Copy a compressed video frame the SDK delivered.
@@ -1266,17 +1395,7 @@ unsafe fn packet_bytes<'a>(data: *const u8, size: i32) -> Result<&'a [u8]> {
 pub(crate) unsafe fn copy_video_packet(
     raw: &NDIlib_video_frame_v2_t,
 ) -> Result<CompressedVideoFrame> {
-    let (codec, tier, protected) = VideoCodec::from_outer(raw.FourCC)
-        .ok_or_else(|| invalid("Unknown compressed video FourCC"))?;
-    let format = VideoPacketFormat::new(codec, raw.xres, raw.yres)?
-        .frame_rate(raw.frame_rate_N, raw.frame_rate_D)?
-        .aspect_ratio(raw.picture_aspect_ratio)?
-        .tier(tier)
-        .protected(protected)
-        .scan_type(
-            ScanType::try_from(raw.frame_format_type)
-                .map_err(|_| invalid("Unknown packet scan type"))?,
-        );
+    let format = VideoPacketFormat::from_sdk(raw)?;
     // SAFETY: a compressed frame's union holds its size, and the caller
     // guarantees the buffer is readable for it.
     let bytes = unsafe { packet_bytes(raw.p_data, raw.__bindgen_anon_1.data_size_in_bytes)? };
@@ -1285,7 +1404,7 @@ pub(crate) unsafe fn copy_video_packet(
         format,
         bytes: AliasableBox::new(bytes.into()),
         // SAFETY: forwarded to the caller's obligation.
-        extras: FrameExtras::received(raw.timecode, unsafe { copy_metadata(raw.p_metadata)? }),
+        extras: unsafe { FrameExtras::received(raw.timecode, raw.timestamp, raw.p_metadata)? },
     })
 }
 
@@ -1298,7 +1417,8 @@ pub(crate) unsafe fn copy_audio_packet(
     raw: &NDIlib_audio_frame_v3_t,
 ) -> Result<CompressedAudioFrame> {
     let (codec, protected) = AudioCodec::from_outer(raw.FourCC)
-        .ok_or_else(|| invalid("Unknown compressed audio FourCC"))?;
+        .ok_or_else(|| invalid_frame("Unknown compressed audio FourCC"))?;
+    let parameters = AudioParameters::from_sdk(raw)?;
     // SAFETY: a compressed frame's union holds its size, and the caller
     // guarantees the buffer is readable for it.
     let bytes = unsafe { packet_bytes(raw.p_data, raw.__bindgen_anon_1.data_size_in_bytes)? };
@@ -1306,11 +1426,9 @@ pub(crate) unsafe fn copy_audio_packet(
         codec,
         protected,
         bytes: AliasableBox::new(bytes.into()),
-        sample_rate: raw.sample_rate,
-        channels: raw.no_channels,
-        samples: raw.no_samples,
+        parameters,
         // SAFETY: forwarded to the caller's obligation.
-        extras: FrameExtras::received(raw.timecode, unsafe { copy_metadata(raw.p_metadata)? }),
+        extras: unsafe { FrameExtras::received(raw.timecode, raw.timestamp, raw.p_metadata)? },
     };
     frame.validate()?;
     Ok(frame)
@@ -1467,15 +1585,15 @@ const _: () = {
     );
 
     same_bits!(
-        EnvelopeCodec::H264.code(),
+        EnvelopeCodec::H264.fourcc().raw(),
         NDIlib_compressed_FourCC_type_e_NDIlib_compressed_FourCC_type_H264
     );
     same_bits!(
-        EnvelopeCodec::Hevc.code(),
+        EnvelopeCodec::Hevc.fourcc().raw(),
         NDIlib_compressed_FourCC_type_e_NDIlib_compressed_FourCC_type_HEVC
     );
     same_bits!(
-        EnvelopeCodec::Aac.code(),
+        EnvelopeCodec::Aac.fourcc().raw(),
         NDIlib_compressed_FourCC_type_e_NDIlib_compressed_FourCC_type_AAC
     );
 
@@ -1501,8 +1619,8 @@ pub(crate) mod testing {
 
     /// A two-byte AAC-LC AudioSpecificConfig for an indexed sample rate and a
     /// channel count the configuration can name.
-    pub(crate) fn aac_config(sample_rate: i32, channels: i32) -> [u8; 2] {
-        let position = |values: &[i32], value| {
+    pub(crate) fn aac_config(sample_rate: u32, channels: u32) -> [u8; 2] {
+        let position = |values: &[u32], value| {
             values
                 .iter()
                 .position(|candidate| *candidate == value)
@@ -1514,8 +1632,8 @@ pub(crate) mod testing {
     }
 
     /// An AAC packet envelope with a matching configuration.
-    pub(crate) fn aac_packet(sample_rate: i32, channels: i32, payload: &[u8]) -> Vec<u8> {
-        packet_envelope(
+    pub(crate) fn aac_packet(sample_rate: u32, channels: u32, payload: &[u8]) -> Vec<u8> {
+        PacketEnvelope::encode(
             EnvelopeCodec::Aac,
             0,
             0,
@@ -1535,13 +1653,17 @@ mod tests {
         VideoPacketFormat::new(VideoCodec::H264, 16, 16).unwrap()
     }
 
-    fn aac(sample_rate: i32, channels: i32, samples: i32, packet: Vec<u8>) -> Result<()> {
+    fn h264_packet(keyframe: bool, extra_data: &[u8]) -> Vec<u8> {
+        PacketEnvelope::encode(EnvelopeCodec::H264, 0, 0, keyframe, &[1], extra_data).unwrap()
+    }
+
+    fn aac(sample_rate: u32, channels: u32, samples: u32, packet: Vec<u8>) -> Result<()> {
         CompressedAudioFrame::new(AudioCodec::Aac, sample_rate, channels, samples, packet)
             .map(drop)
             .map_err(Rejected::into_error)
     }
 
-    fn opus(sample_rate: i32, channels: i32, samples: i32) -> Result<()> {
+    fn opus(sample_rate: u32, channels: u32, samples: u32) -> Result<()> {
         CompressedAudioFrame::new(AudioCodec::Opus, sample_rate, channels, samples, vec![1; 8])
             .map(drop)
             .map_err(Rejected::into_error)
@@ -1550,16 +1672,19 @@ mod tests {
     /// The text of an invalid-frame error.
     fn reason(result: Result<()>) -> String {
         match result {
-            Err(crate::Error::InvalidFrame(reason)) => reason,
+            Err(Error::InvalidFrame(reason)) => reason,
             other => panic!("expected an invalid frame, got {other:?}"),
         }
     }
 
     #[test]
     fn packed_header_parsing_preserves_extensions_and_checks_bounds() {
-        let mut bytes = packet_envelope(EnvelopeCodec::H264, 12, -4, true, &[1, 2], &[3]).unwrap();
+        let mut bytes =
+            PacketEnvelope::encode(EnvelopeCodec::H264, 12, -4, true, &[1, 2], &[3]).unwrap();
         let p = PacketEnvelope::parse(&bytes).unwrap();
         assert_eq!(p.codec(), Some(EnvelopeCodec::H264));
+        assert_eq!(p.fourcc(), EnvelopeCodec::H264.fourcc());
+        assert_eq!(p.fourcc().raw().to_le_bytes(), *b"H264");
         assert_eq!(p.presentation_time(), 12);
         assert_eq!(p.decode_time(), -4);
         assert!(p.is_keyframe());
@@ -1575,6 +1700,16 @@ mod tests {
         assert!(CompressedVideoFrame::new(h264_format(), bytes.clone()).is_err());
         bytes[36..40].copy_from_slice(&u32::MAX.to_ne_bytes());
         assert!(PacketEnvelope::parse(&bytes).is_err());
+
+        // An unknown codec is kept, by its FourCC.
+        let mut unknown = h264_packet(false, &[]);
+        unknown[CODEC_OFFSET..CODEC_OFFSET + 4].copy_from_slice(b"AV01");
+        let p = PacketEnvelope::parse(&unknown).unwrap();
+        assert_eq!(p.codec(), None);
+        assert_eq!(p.fourcc(), FourCc::from_raw(u32::from_ne_bytes(*b"AV01")));
+        for codec in [EnvelopeCodec::H264, EnvelopeCodec::Hevc, EnvelopeCodec::Aac] {
+            assert_eq!(EnvelopeCodec::from_fourcc(codec.fourcc()), Some(codec));
+        }
     }
 
     #[test]
@@ -1588,25 +1723,73 @@ mod tests {
                     );
                     let format = VideoPacketFormat::new(codec, 16, 16)
                         .unwrap()
-                        .tier(tier)
-                        .protected(protected);
+                        .with_tier(tier)
+                        .with_protected(protected);
                     let bytes = match codec.envelope_codec() {
-                        Some(code) => packet_envelope(code, 0, 0, false, &[1], &[]).unwrap(),
+                        Some(code) => PacketEnvelope::encode(code, 0, 0, false, &[1], &[]).unwrap(),
                         None => vec![1, 2, 3, 4],
                     };
                     let mut frame = CompressedVideoFrame::new(format, bytes).unwrap();
                     let raw = frame.raw();
                     assert_eq!(raw.FourCC, codec.outer(tier, protected));
                     let copied = unsafe { copy_video_packet(&raw) }.unwrap();
-                    assert_eq!(copied.format.codec, codec);
-                    assert_eq!(copied.format.tier, tier);
-                    assert_eq!(copied.format.protected, protected);
+                    assert_eq!(copied.format(), format);
+                    assert_eq!(copied.format().codec(), codec);
+                    assert_eq!(copied.format().tier(), tier);
+                    assert_eq!(copied.format().is_protected(), protected);
                     assert_eq!(copied.data(), frame.data());
                 }
             }
         }
         assert!(PacketEnvelope::parse(b"Opus").is_err());
-        assert!(VideoPacketFormat::new(VideoCodec::H264, 0, 1).is_err());
+    }
+
+    /// The dimensions of a format the caller describes are input; those of a
+    /// frame the SDK delivered belong to the frame.
+    #[test]
+    fn packet_format_dimensions_are_checked_on_both_sides_of_the_sdk() {
+        let max = i32::MAX.unsigned_abs();
+        let format = VideoPacketFormat::new(VideoCodec::H264, max, 1).unwrap();
+        assert_eq!((format.width(), format.height()), (max, 1));
+        for (width, height) in [(0, 1), (1, 0), (max + 1, 1), (1, u32::MAX)] {
+            assert!(matches!(
+                VideoPacketFormat::new(VideoCodec::H264, width, height),
+                Err(Error::InvalidInput(reason)) if reason.contains("1..=")
+            ));
+        }
+        let delivered = h264_format().raw();
+        for (xres, yres) in [(0, 16), (16, -1), (i32::MIN, 16)] {
+            let raw = NDIlib_video_frame_v2_t {
+                xres,
+                yres,
+                ..delivered
+            };
+            assert!(matches!(
+                VideoPacketFormat::from_sdk(&raw),
+                Err(Error::InvalidFrame(_))
+            ));
+        }
+        let raw = NDIlib_video_frame_v2_t {
+            frame_rate_D: 0,
+            ..delivered
+        };
+        assert!(matches!(
+            VideoPacketFormat::from_sdk(&raw),
+            Err(Error::InvalidFrame(_))
+        ));
+
+        let rate = FrameRate::new(60_000, 1001).unwrap();
+        let format = h264_format()
+            .with_frame_rate(rate)
+            .with_scan_type(ScanType::Interlaced);
+        assert_eq!(h264_format().frame_rate(), FrameRate::new(30, 1).unwrap());
+        assert_eq!(
+            (format.frame_rate(), format.scan_type()),
+            (rate, ScanType::Interlaced)
+        );
+        let raw = format.raw();
+        assert_eq!((raw.frame_rate_N, raw.frame_rate_D), (60_000, 1001));
+        assert_eq!(VideoPacketFormat::from_sdk(&raw).unwrap(), format);
     }
 
     #[test]
@@ -1614,17 +1797,22 @@ mod tests {
         let format = h264_format();
         assert_eq!(format.picture_aspect_ratio(), 0.0);
         assert_eq!(
-            format.aspect_ratio(0.0).unwrap().picture_aspect_ratio(),
+            format
+                .with_picture_aspect_ratio(0.0)
+                .unwrap()
+                .picture_aspect_ratio(),
             0.0
         );
-        assert!(format.aspect_ratio(-1.0).is_err());
-        assert!(format.aspect_ratio(f32::NAN).is_err());
-        assert!(format.aspect_ratio(f32::INFINITY).is_err());
+        for ratio in [-1.0, f32::NAN, f32::INFINITY] {
+            assert!(matches!(
+                format.with_picture_aspect_ratio(ratio),
+                Err(Error::InvalidInput(_))
+            ));
+        }
 
         // A received frame whose descriptor leaves the ratio unset is kept
         // as it is.
-        let bytes = packet_envelope(EnvelopeCodec::H264, 0, 0, false, &[1], &[]).unwrap();
-        let mut frame = CompressedVideoFrame::new(format, bytes).unwrap();
+        let mut frame = CompressedVideoFrame::new(format, h264_packet(false, &[])).unwrap();
         let raw = frame.raw();
         assert_eq!(raw.picture_aspect_ratio, 0.0);
         let received = unsafe { copy_video_packet(&raw) }.unwrap();
@@ -1636,6 +1824,15 @@ mod tests {
         };
         let received = unsafe { copy_video_packet(&wide) }.unwrap();
         assert_eq!(received.format().picture_aspect_ratio(), 16.0 / 9.0);
+
+        let negative = NDIlib_video_frame_v2_t {
+            picture_aspect_ratio: -1.0,
+            ..raw
+        };
+        assert!(matches!(
+            unsafe { copy_video_packet(&negative) },
+            Err(Error::InvalidFrame(_))
+        ));
     }
 
     #[test]
@@ -1643,16 +1840,23 @@ mod tests {
         let rejected = CompressedVideoFrame::new(h264_format(), vec![7; 20]).unwrap_err();
         assert_eq!(rejected.into_inner(), vec![7; 20]);
 
-        let rejected =
-            CompressedAudioFrame::new(AudioCodec::Opus, 0, 2, 960, vec![1, 2]).unwrap_err();
-        assert_eq!(rejected.into_inner(), [1, 2]);
+        for (sample_rate, channels) in [(0, 2), (48_000, i32::MAX.unsigned_abs() + 1)] {
+            let rejected =
+                CompressedAudioFrame::new(AudioCodec::Opus, sample_rate, channels, 960, vec![1, 2])
+                    .unwrap_err();
+            assert!(
+                matches!(rejected.error(), Error::InvalidFrame(reason) if reason.contains("1..="))
+            );
+            assert_eq!(rejected.into_inner(), [1, 2]);
+        }
 
-        let frame = CompressedVideoFrame::new(h264_format().tier(StreamTier::Preview), {
-            packet_envelope(EnvelopeCodec::H264, 0, 0, false, &[1], &[]).unwrap()
-        })
+        let frame = CompressedVideoFrame::new(
+            h264_format().with_tier(StreamTier::Preview),
+            h264_packet(false, &[]),
+        )
         .unwrap();
         let frame = frame.with_metadata("nul\0inside").unwrap_err().into_inner();
-        assert_eq!(frame.format().stream_tier(), StreamTier::Preview);
+        assert_eq!(frame.format().tier(), StreamTier::Preview);
         assert_eq!(frame.metadata(), None);
         let frame = frame.with_metadata("<ok/>").unwrap();
         assert_eq!(frame.metadata(), Some("<ok/>"));
@@ -1663,11 +1867,19 @@ mod tests {
         let bytes = aac_packet(48_000, 2, &[1]);
         let mut frame = CompressedAudioFrame::new(AudioCodec::Aac, 48_000, 2, 1024, bytes)
             .unwrap()
-            .protected(true);
+            .with_protected(true);
         let raw = frame.raw();
         let copied = unsafe { copy_audio_packet(&raw) }.unwrap();
         assert_eq!(copied.codec(), AudioCodec::Aac);
         assert!(copied.is_protected());
+        assert_eq!(
+            (
+                copied.sample_rate(),
+                copied.num_channels(),
+                copied.num_samples()
+            ),
+            (48_000, 2, 1024)
+        );
         assert_eq!(copied.data(), frame.data());
     }
 
@@ -1690,9 +1902,32 @@ mod tests {
         assert!(unsafe { copy_video_packet(&video) }.is_err());
     }
 
+    /// Received audio whose parameters are not positive is an invalid frame,
+    /// whatever its bytes.
+    #[test]
+    fn delivered_audio_parameters_are_validated_before_they_become_unsigned() {
+        let mut frame =
+            CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 8]).unwrap();
+        let raw = frame.raw();
+        for (sample_rate, no_channels, no_samples) in
+            [(0, 2, 960), (48_000, -2, 960), (48_000, 2, 0)]
+        {
+            let delivered = NDIlib_audio_frame_v3_t {
+                sample_rate,
+                no_channels,
+                no_samples,
+                ..raw
+            };
+            assert!(matches!(
+                unsafe { copy_audio_packet(&delivered) },
+                Err(Error::InvalidFrame(_))
+            ));
+        }
+    }
+
     #[test]
     fn receiving_keeps_unknown_flags_but_sending_rejects_them() {
-        let mut bytes = packet_envelope(EnvelopeCodec::H264, 0, 0, false, &[1], &[]).unwrap();
+        let mut bytes = h264_packet(false, &[]);
         bytes[FLAGS_OFFSET..FLAGS_OFFSET + 4].copy_from_slice(&2u32.to_ne_bytes());
         let format = h264_format();
         assert_eq!(PacketEnvelope::parse(&bytes).unwrap().flags(), 2);
@@ -1713,7 +1948,7 @@ mod tests {
 
         // As received: any value, on video and on audio.
         for value in [1, 1533, u64::MAX] {
-            let mut video = packet_envelope(EnvelopeCodec::H264, 0, 0, true, &[1], &[2]).unwrap();
+            let mut video = h264_packet(true, &[2]);
             stamp(&mut video, value);
             assert_eq!(PacketEnvelope::parse(&video).unwrap().reserved(), value);
             let frame = CompressedVideoFrame::new(format, video).unwrap();
@@ -1726,8 +1961,7 @@ mod tests {
         }
 
         // As sent: the SDK writes through the pointer the descriptor lends.
-        let bytes = packet_envelope(EnvelopeCodec::H264, 0, 0, true, &[1], &[2]).unwrap();
-        let mut frame = CompressedVideoFrame::new(format, bytes).unwrap();
+        let mut frame = CompressedVideoFrame::new(format, h264_packet(true, &[2])).unwrap();
         for value in 1..=2u64 {
             let raw = frame.raw();
             // SAFETY: the descriptor lends the frame's own bytes, which hold a
@@ -1762,7 +1996,7 @@ mod tests {
             for tier in [StreamTier::Program, StreamTier::Preview] {
                 let format = VideoPacketFormat::new(codec, 1920, 1080)
                     .unwrap()
-                    .tier(tier);
+                    .with_tier(tier);
                 for quality in [0, 1, 99] {
                     video(format, vec![quality, 0, 0, 0]).unwrap();
                 }
@@ -1779,7 +2013,7 @@ mod tests {
 
         // The preview stream of an envelope codec fits in 640 by 640.
         let keyframe = |codec: VideoCodec| {
-            packet_envelope(codec.envelope_codec().unwrap(), 0, 0, true, &[1], &[2]).unwrap()
+            PacketEnvelope::encode(codec.envelope_codec().unwrap(), 0, 0, true, &[1], &[2]).unwrap()
         };
         for codec in [
             VideoCodec::H264,
@@ -1790,7 +2024,7 @@ mod tests {
             let preview = |width, height| {
                 let format = VideoPacketFormat::new(codec, width, height)
                     .unwrap()
-                    .tier(StreamTier::Preview);
+                    .with_tier(StreamTier::Preview);
                 video(format, keyframe(codec))
             };
             for (width, height) in [(640, 360), (360, 640), (640, 640), (1, 1)] {
@@ -1802,14 +2036,14 @@ mod tests {
                 // The program stream has no such limit, and neither has a
                 // frame that was received.
                 video(format, keyframe(codec)).unwrap();
-                let format = format.tier(StreamTier::Preview);
+                let format = format.with_tier(StreamTier::Preview);
                 assert!(validate_video_packet(format, &keyframe(codec), Use::Receive).is_ok());
             }
         }
         // SpeedHQ previews are not limited.
         let format = VideoPacketFormat::new(VideoCodec::SpeedHq422, 1920, 1080)
             .unwrap()
-            .tier(StreamTier::Preview);
+            .with_tier(StreamTier::Preview);
         video(format, vec![0; 4]).unwrap();
     }
 
@@ -1818,13 +2052,14 @@ mod tests {
         let config = aac_config(48_000, 2);
         for keyframe in [false, true] {
             let packet =
-                packet_envelope(EnvelopeCodec::Aac, 0, 0, keyframe, &[1], &config).unwrap();
+                PacketEnvelope::encode(EnvelopeCodec::Aac, 0, 0, keyframe, &[1], &config).unwrap();
             assert!(PacketEnvelope::parse(&packet).unwrap().is_keyframe());
             aac(48_000, 2, 1024, packet).unwrap();
         }
         // The flag stays the caller's choice for video.
-        let packet = packet_envelope(EnvelopeCodec::H264, 0, 0, false, &[1], &[]).unwrap();
-        assert!(!PacketEnvelope::parse(&packet).unwrap().is_keyframe());
+        assert!(!PacketEnvelope::parse(&h264_packet(false, &[]))
+            .unwrap()
+            .is_keyframe());
 
         // An AAC packet from elsewhere without the flag is kept when received
         // and refused when sent: the SDK would drop it without a word.
@@ -1834,10 +2069,8 @@ mod tests {
             codec: AudioCodec::Aac,
             protected: false,
             bytes: AliasableBox::new(packet.clone().into_boxed_slice()),
-            sample_rate: 48_000,
-            channels: 2,
-            samples: 1024,
-            extras: FrameExtras::received(0, None),
+            parameters: AudioParameters::new(48_000, 2, 1024).unwrap(),
+            extras: FrameExtras::default(),
         };
         assert!(received.validate().is_ok());
         assert!(reason(received.validate_for_send()).contains("keyframe flag"));
@@ -1863,7 +2096,7 @@ mod tests {
         for channels in [1, 2, 6, 255] {
             opus(48_000, channels, 960).unwrap();
         }
-        assert!(reason(opus(48_000, 0, 960)).contains("positive"));
+        assert!(reason(opus(48_000, 0, 960)).contains("1..="));
     }
 
     #[test]
@@ -1890,25 +2123,93 @@ mod tests {
 
         // No configuration, and one too short to name a rate and a layout.
         for config in [&[][..], &[0x11][..]] {
-            let packet = packet_envelope(EnvelopeCodec::Aac, 0, 0, true, &[1], config).unwrap();
+            let packet =
+                PacketEnvelope::encode(EnvelopeCodec::Aac, 0, 0, true, &[1], config).unwrap();
             assert!(reason(aac(48_000, 2, 1024, packet)).contains("AudioSpecificConfig"));
         }
         // A longer configuration is read by its first two bytes.
         let mut config = aac_config(48_000, 2).to_vec();
         config.extend([0x56, 0xe5, 0x00]);
-        let packet = packet_envelope(EnvelopeCodec::Aac, 0, 0, true, &[1], &config).unwrap();
+        let packet = PacketEnvelope::encode(EnvelopeCodec::Aac, 0, 0, true, &[1], &config).unwrap();
         aac(48_000, 2, 1024, packet).unwrap();
 
         // Sample rates and layouts the configuration has no index for.
         let unindexed = |frequency_index: u16, channel_configuration: u16| {
             let config = ((2u16 << 11) | (frequency_index << 7) | (channel_configuration << 3))
                 .to_be_bytes();
-            let packet = packet_envelope(EnvelopeCodec::Aac, 0, 0, true, &[1], &config).unwrap();
+            let packet =
+                PacketEnvelope::encode(EnvelopeCodec::Aac, 0, 0, true, &[1], &config).unwrap();
             reason(aac(48_000, 2, 1024, packet))
         };
         assert!(unindexed(15, 2).contains("sample rate"));
         assert!(unindexed(3, 0).contains("channel layout"));
         assert!(unindexed(3, 8).contains("channel layout"));
+    }
+
+    /// A frame built for sending carries no timestamp, and its descriptor
+    /// says so; a received frame keeps the timecode and timestamp the SDK
+    /// delivered.
+    #[test]
+    fn received_frames_keep_their_timecode_and_timestamp() {
+        let mut video = CompressedVideoFrame::new(h264_format(), h264_packet(false, &[]))
+            .unwrap()
+            .with_timecode(Timecode::from_ticks(17));
+        assert_eq!(video.timestamp(), None);
+        let raw = video.raw();
+        assert_eq!(raw.timecode, 17);
+        assert_eq!(raw.timestamp, NDIlib_recv_timestamp_undefined);
+        let delivered = NDIlib_video_frame_v2_t {
+            timestamp: 4242,
+            ..raw
+        };
+        let received = unsafe { copy_video_packet(&delivered) }.unwrap();
+        assert_eq!(received.timecode(), Timecode::from_ticks(17));
+        assert_eq!(received.timestamp(), Some(SdkTimestamp::from_ticks(4242)));
+        // Relaying a received frame hands the SDK what it delivered.
+        assert_eq!(received.clone().raw().timestamp, 4242);
+        let received = unsafe { copy_video_packet(&raw) }.unwrap();
+        assert_eq!(received.timestamp(), None);
+
+        let mut audio = CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 8])
+            .unwrap()
+            .with_timecode(Timecode::from_ticks(-5));
+        assert_eq!(audio.timecode(), Timecode::from_ticks(-5));
+        let delivered = NDIlib_audio_frame_v3_t {
+            timestamp: 99,
+            ..audio.raw()
+        };
+        let received = unsafe { copy_audio_packet(&delivered) }.unwrap();
+        assert_eq!(received.timecode(), Timecode::from_ticks(-5));
+        assert_eq!(received.timestamp(), Some(SdkTimestamp::from_ticks(99)));
+    }
+
+    /// A clone owns its own copy of the bytes, so the SDK's writes to one
+    /// never show in the other.
+    #[test]
+    fn a_cloned_frame_owns_a_copy_of_its_bytes() {
+        let frame = CompressedVideoFrame::new(h264_format(), h264_packet(true, &[2]))
+            .unwrap()
+            .with_metadata("<copy/>")
+            .unwrap();
+        let mut copy = frame.clone();
+        assert_eq!(copy.data(), frame.data());
+        assert_ne!(copy.data().as_ptr(), frame.data().as_ptr());
+        assert_eq!(copy.metadata(), Some("<copy/>"));
+        let raw = copy.raw();
+        // SAFETY: the descriptor lends the copy's own bytes, which hold a
+        // complete header, and the copy is borrowed exclusively.
+        unsafe { raw.p_data.add(RESERVED_OFFSET).write(7) };
+        assert_eq!(copy.data()[RESERVED_OFFSET], 7);
+        assert_eq!(frame.data()[RESERVED_OFFSET], 0);
+
+        let audio = CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 8])
+            .unwrap()
+            .with_protected(true);
+        let copy = audio.clone();
+        assert_eq!(
+            (copy.data(), copy.is_protected(), copy.num_samples()),
+            (audio.data(), true, 960)
+        );
     }
 
     #[test]
@@ -1923,7 +2224,9 @@ mod tests {
         let audio = frame.raw();
         assert_eq!(audio.timecode, NDIlib_send_timecode_synthesize);
         assert_eq!(audio.FourCC, AudioCodec::Opus.outer(false));
-        assert_eq!(audio.timestamp, 0);
+        // A frame built for sending has no timestamp; the SDK ignores the
+        // field when it sends.
+        assert_eq!(audio.timestamp, NDIlib_recv_timestamp_undefined);
         assert!(audio.p_metadata.is_null());
     }
 }

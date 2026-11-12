@@ -98,7 +98,7 @@ native_table! {
 ///
 /// This is the only way to an optional table, for the core SDK and the
 /// Advanced SDK alike, so a table can never be used without the gate of the
-/// capability it belongs to, or under another capability's name.
+/// capability it belongs to, or be reported under another capability.
 pub(crate) trait Table: Sized + 'static {
     /// The entry points resolved from `runtime`.
     ///
@@ -109,13 +109,14 @@ pub(crate) trait Table: Sized + 'static {
         Self::within(runtime.evidence())
     }
 
-    /// The entry points `evidence` holds, once the capability's gate allows
-    /// them. A table gated by a [`RuntimeFeature`] is refused, with the same
-    /// error, whenever [`Evidence::require`] refuses that feature.
+    /// The entry points `evidence` holds, once the gate of the
+    /// [`RuntimeFeature`] the table belongs to allows them. The table is
+    /// refused, with the same error, whenever [`Evidence::require`] refuses
+    /// that feature.
     ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedCapability`], under the capability's name, when
+    /// [`Error::UnsupportedCapability`] for the table's feature, when
     /// the runtime lacks an entry point, is too old for the capability, or
     /// (for the Advanced SDK) is not an Advanced SDK runtime, or the build
     /// has no declarations for it.
@@ -220,11 +221,7 @@ macro_rules! optional_tables {
             pub(crate) fn missing(&self, feature: RuntimeFeature) -> Option<&'static CStr> {
                 match feature {
                     $(RuntimeFeature::$feature => self.$field.0.as_ref().err().copied(),)+
-                    RuntimeFeature::Planar444Video
-                    | RuntimeFeature::ReceiveBest444
-                    | RuntimeFeature::ReceiveVideoOnly
-                    | RuntimeFeature::AdvancedSenderConfiguration
-                    | RuntimeFeature::AdvancedReceiverConfiguration => None,
+                    _ => None,
                 }
             }
         }
@@ -348,7 +345,7 @@ optional_tables! {
 
 impl Runtime {
     /// What the gates of this implementation's capabilities decide from.
-    fn evidence(&self) -> Evidence<'_> {
+    pub(crate) fn evidence(&self) -> Evidence<'_> {
         Evidence {
             api: &self.api,
             #[cfg(feature = "advanced")]
@@ -373,8 +370,8 @@ impl<'a> Evidence<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::UnsupportedCapability`] under the capability's name,
-    /// with the reason its status gives.
+    /// Returns [`Error::UnsupportedCapability`] for `feature`, with the
+    /// reason its status gives.
     pub(crate) fn require(self, feature: RuntimeFeature) -> Result<()> {
         match self.capabilities.status(feature) {
             CapabilityStatus::Available => Ok(()),
@@ -386,7 +383,7 @@ impl<'a> Evidence<'a> {
     ///
     /// A capability's status includes any gate its table cannot express, such
     /// as a version or an edition, so it is always applied together with the
-    /// table, and both are reported under the one name `feature` carries.
+    /// table, and both are reported as `feature`.
     pub(in crate::sys) fn capability<T>(
         self,
         feature: RuntimeFeature,
@@ -398,7 +395,7 @@ impl<'a> Evidence<'a> {
         table
             .as_ref()
             .map_err(|symbol| Error::UnsupportedCapability {
-                capability: feature.name(),
+                feature,
                 reason: CapabilityUnavailable::SymbolUnavailable,
                 detail: symbol.to_string_lossy().into_owned(),
             })
@@ -406,7 +403,11 @@ impl<'a> Evidence<'a> {
 
     /// The error for `feature`, whose status is `reason`, with the evidence
     /// for it.
-    fn unavailable(self, feature: RuntimeFeature, reason: CapabilityUnavailable) -> Error {
+    pub(in crate::sys) fn unavailable(
+        self,
+        feature: RuntimeFeature,
+        reason: CapabilityUnavailable,
+    ) -> Error {
         let detail = match reason {
             CapabilityUnavailable::RuntimeTooOld | CapabilityUnavailable::RuntimeVersionUnknown => {
                 feature.minimum_version().map(|minimum| {
@@ -426,7 +427,7 @@ impl<'a> Evidence<'a> {
                 .map(|symbol| symbol.to_string_lossy().into_owned()),
         };
         Error::UnsupportedCapability {
-            capability: feature.name(),
+            feature,
             reason,
             detail: detail.unwrap_or_default(),
         }

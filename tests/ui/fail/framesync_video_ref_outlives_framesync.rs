@@ -1,23 +1,20 @@
 #![allow(unused)]
 
-use grafton_ndi::{FrameSync, NDI, Receiver, ReceiverOptions, ScanType, Source, SourceAddress};
+use grafton_ndi::{FrameSync, Ndi, Receiver, ReceiverOptions, ScanType, Source};
 
-fn receiver(ndi: &NDI) -> Receiver {
-    let source = Source {
-        name: "compile-contract".to_owned(),
-        address: SourceAddress::None,
-    };
-    let options = ReceiverOptions::builder(source).build();
+fn receiver(ndi: &Ndi) -> Receiver {
+    let source = Source::new("compile-contract");
+    let options = ReceiverOptions::new(source);
     Receiver::new(ndi, &options).unwrap()
 }
 
 fn main() {
-    let ndi = NDI::new().unwrap();
+    let ndi = Ndi::new().unwrap();
 
     let frame_ref = {
         let framesync = FrameSync::new(receiver(&ndi)).unwrap();
         framesync
-            .capture_video(ScanType::Progressive)
+            .capture_video_ref(ScanType::Progressive)
             .unwrap()
             .unwrap()
     };

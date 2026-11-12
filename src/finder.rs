@@ -13,114 +13,88 @@ use std::{
 use crate::{
     sys::{self, bindings::*},
     timeout::Deadline,
-    to_ms_checked, Error, Result, NDI,
+    to_ms_checked, Error, Ndi, Result,
 };
 
 /// Configuration for NDI source discovery.
 ///
-/// Use the builder pattern to create instances with specific settings.
+/// The defaults find the sources of the groups the NDI configuration names,
+/// including those of this machine, with no extra addresses to query.
 ///
 /// # Examples
 ///
 /// ```
 /// use grafton_ndi::FinderOptions;
 ///
-/// // Find all sources including local ones
-/// let finder = FinderOptions::builder()
-///     .show_local_sources(true)
-///     .build();
+/// // Find sources in specific groups, other machines only
+/// let options = FinderOptions::new()
+///     .show_local_sources(false)
+///     .groups("Public,Studio");
 ///
-/// // Find sources in specific groups
-/// let finder = FinderOptions::builder()
-///     .groups("Public,Studio")
-///     .build();
-///
-/// // Find sources on specific hosts
-/// let finder = FinderOptions::builder()
-///     .extra_ips("192.168.1.100,10.0.0.100")
-///     .build();
+/// // Also query hosts that discovery does not reach
+/// let options = FinderOptions::new().extra_ips("192.168.1.100,10.0.0.100");
 /// ```
 #[derive(Debug, Clone)]
 pub struct FinderOptions {
-    /// Whether to include local sources in discovery.
-    pub show_local_sources: bool,
-    /// Comma-separated list of groups to search (e.g., "Public,Private").
-    pub groups: Option<String>,
-    /// Additional comma-separated IP addresses to query.
-    pub extra_ips: Option<String>,
+    show_local_sources: bool,
+    groups: Option<String>,
+    extra_ips: Option<String>,
+    #[cfg(feature = "advanced")]
+    config: Option<crate::advanced::AdvancedConfig>,
 }
 
 impl Default for FinderOptions {
     fn default() -> Self {
-        Self::builder().build()
+        Self::new()
     }
 }
 
 impl FinderOptions {
-    /// Create a builder for configuring find options
-    pub fn builder() -> FinderOptionsBuilder {
-        FinderOptionsBuilder::new()
-    }
-}
-
-/// Builder for configuring FinderOptions with ergonomic method chaining
-#[derive(Debug, Clone)]
-pub struct FinderOptionsBuilder {
-    show_local_sources: Option<bool>,
-    groups: Option<String>,
-    extra_ips: Option<String>,
-}
-
-impl FinderOptionsBuilder {
-    /// Creates a new builder with default settings.
-    ///
-    /// Default settings:
-    /// - `show_local_sources`: `true`
-    /// - `groups`: `None` (use SDK-configured default groups)
-    /// - `extra_ips`: `None` (no additional IPs)
+    /// The default options: local sources included, the groups of the NDI
+    /// configuration, and no extra addresses.
     pub fn new() -> Self {
         Self {
-            show_local_sources: None,
+            show_local_sources: true,
             groups: None,
             extra_ips: None,
+            #[cfg(feature = "advanced")]
+            config: None,
         }
     }
 
-    /// Configure whether to show local sources
+    /// Set whether sources on this machine are found.
     #[must_use]
     pub fn show_local_sources(mut self, show: bool) -> Self {
-        self.show_local_sources = Some(show);
+        self.show_local_sources = show;
         self
     }
 
-    /// Set the groups to search
+    /// Set the comma-separated groups to search, such as `"Public,Studio"`,
+    /// instead of those of the NDI configuration.
     #[must_use]
-    pub fn groups<S: Into<String>>(mut self, groups: S) -> Self {
+    pub fn groups(mut self, groups: impl Into<String>) -> Self {
         self.groups = Some(groups.into());
         self
     }
 
-    /// Set extra IPs to search
+    /// Set comma-separated IP addresses to query directly, for sources that
+    /// discovery does not reach.
     #[must_use]
-    pub fn extra_ips<S: Into<String>>(mut self, ips: S) -> Self {
+    pub fn extra_ips(mut self, ips: impl Into<String>) -> Self {
         self.extra_ips = Some(ips.into());
         self
     }
 
-    /// Build the FinderOptions
+    /// Create the finder with this per-instance Advanced SDK configuration,
+    /// which it keeps for as long as it lives.
+    ///
+    /// [`Finder::new`] then needs an Advanced runtime, and a build with the
+    /// Advanced SDK.
+    #[cfg(feature = "advanced")]
     #[must_use]
-    pub fn build(self) -> FinderOptions {
-        FinderOptions {
-            show_local_sources: self.show_local_sources.unwrap_or(true),
-            groups: self.groups,
-            extra_ips: self.extra_ips,
-        }
-    }
-}
-
-impl Default for FinderOptionsBuilder {
-    fn default() -> Self {
-        Self::new()
+    pub fn config(mut self, config: crate::advanced::AdvancedConfig) -> Self {
+        self.config = Some(config);
+        self
     }
 }
 
@@ -132,12 +106,11 @@ impl Default for FinderOptionsBuilder {
 /// # Examples
 ///
 /// ```no_run
-/// # use grafton_ndi::{NDI, FinderOptions, Finder};
+/// # use grafton_ndi::{Ndi, FinderOptions, Finder};
 /// # use std::time::Duration;
 /// # fn main() -> Result<(), grafton_ndi::Error> {
-/// let ndi = NDI::new()?;
-/// let options = FinderOptions::builder().show_local_sources(true).build();
-/// let finder = Finder::new(&ndi, &options)?;
+/// let ndi = Ndi::new()?;
+/// let finder = Finder::new(&ndi, &FinderOptions::new())?;
 ///
 /// // Wait for initial discovery
 /// if finder.wait_for_sources(Duration::from_secs(5))? {
@@ -157,7 +130,7 @@ pub struct Finder {
     _extra_ips: Option<CString>, // to ensure they outlive SDK usage
     #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
-    _ndi: NDI,
+    _ndi: Ndi,
 }
 
 impl Finder {
@@ -166,19 +139,26 @@ impl Finder {
     /// # Arguments
     ///
     /// * `ndi` - The NDI instance (cloned internally to keep the runtime alive)
-    /// * `settings` - Configuration for source discovery
+    /// * `options` - Configuration for source discovery
     ///
     /// # Errors
     ///
-    /// Returns an error if the finder cannot be created, typically due to
-    /// invalid settings or network issues.
-    pub fn new(ndi: &NDI, settings: &FinderOptions) -> Result<Self> {
+    /// Returns [`Error::InvalidCString`] when the groups or extra addresses
+    /// contain a NUL byte, [`Error::UnsupportedCapability`] when the options
+    /// carry an Advanced configuration that the runtime or this build cannot
+    /// take, and [`Error::NativeOperationFailed`] when the SDK creates no
+    /// finder.
+    pub fn new(ndi: &Ndi, options: &FinderOptions) -> Result<Self> {
+        #[cfg(feature = "advanced")]
+        if let Some(config) = &options.config {
+            return Self::new_configured(ndi, options, config);
+        }
         // SAFETY: the SDK's finder creation returns null or a fresh finder
         // that nothing else owns, and the settings outlive the call.
         unsafe {
             Self::create(
                 ndi,
-                settings,
+                options,
                 "NDIlib_find_create_v2",
                 #[cfg(feature = "advanced")]
                 None,
@@ -197,7 +177,7 @@ impl Finder {
     /// `create` returns null or a live finder of `ndi`'s runtime, made from
     /// the settings it was handed, that nothing else owns.
     pub(crate) unsafe fn create(
-        ndi: &NDI,
+        ndi: &Ndi,
         settings: &FinderOptions,
         operation: &'static str,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
@@ -246,7 +226,7 @@ impl Finder {
 
     /// The runtime this finder was created through.
     #[cfg(feature = "advanced")]
-    pub(crate) fn runtime(&self) -> &NDI {
+    pub(crate) fn runtime(&self) -> &Ndi {
         &self._ndi
     }
 
@@ -266,15 +246,15 @@ impl Finder {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    /// Returns [`Error::InvalidInput`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, FinderOptions, Finder};
+    /// # use grafton_ndi::{Ndi, FinderOptions, Finder};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
+    /// # let ndi = Ndi::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// // Wait up to 5 seconds for changes
     /// if finder.wait_for_sources(Duration::from_secs(5))? {
@@ -315,9 +295,9 @@ impl Finder {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, FinderOptions, Finder};
+    /// # use grafton_ndi::{Ndi, FinderOptions, Finder};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
+    /// # let ndi = Ndi::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// // Get current snapshot of sources
     /// let sources = finder.current_sources()?;
@@ -339,7 +319,7 @@ impl Finder {
                         .core
                         .NDIlib_find_get_current_sources(self.instance, num_sources)
                 },
-                |source| Source::try_from_raw(source),
+                |source| Source::try_from_raw(source, "NDIlib_find_get_current_sources"),
             )
         }
     }
@@ -444,15 +424,15 @@ impl Finder {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    /// Returns [`Error::InvalidInput`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, FinderOptions, Finder};
+    /// # use grafton_ndi::{Ndi, FinderOptions, Finder};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
+    /// # let ndi = Ndi::new()?;
     /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
     /// // Discover for up to 5 seconds, then list everything found
     /// let sources = finder.find_sources(Duration::from_secs(5))?;
@@ -655,11 +635,8 @@ impl HostKeyBuffer {
 ///
 /// NDI sources can be addressed via URL (for NDI HX sources) or IP address
 /// (for standard NDI sources).
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SourceAddress {
-    /// No address available.
-    #[default]
-    None,
     /// URL address (typically for NDI HX sources).
     Url(String),
     /// IP address (for standard NDI sources).
@@ -729,38 +706,35 @@ impl SourceAddress {
     // host[:port] forms; never inspect their path, query, or fragment as a port.
     fn authority(&self) -> Option<Authority<'_>> {
         match self {
-            Self::None => None,
             Self::Ip(address) | Self::Url(address) => parse_authority(address),
         }
     }
 }
 
-/// Represents an NDI source discovered on the network.
+/// An NDI source: its name and, when known, its network address.
 ///
 /// Equality and hashing compare the complete name and address, including the
 /// address variant; they do not imply persistent device identity.
 ///
-/// Sources contain a human-readable name and network address. The name
-/// typically includes the machine name and source name (e.g., "MACHINE (Source)").
+/// The name typically includes the machine name and source name (e.g.,
+/// "MACHINE (Source)"). A source found by a [`Finder`] has the address it
+/// advertises; a receiver given a source without one looks it up by name.
 ///
 /// # Examples
 ///
 /// ```
 /// use grafton_ndi::{Source, SourceAddress};
 ///
-/// let source = Source {
-///     name: "LAPTOP (Camera 1)".to_string(),
-///     address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
-/// };
-///
-/// println!("Source: {}", source); // Displays: LAPTOP (Camera 1)@192.168.1.100:5960
+/// let source = Source::new("LAPTOP (Camera 1)")
+///     .with_address(SourceAddress::Ip("192.168.1.100:5960".to_string()));
+/// assert_eq!(source.name(), "LAPTOP (Camera 1)");
+/// assert_eq!(source.to_string(), "LAPTOP (Camera 1)@192.168.1.100:5960");
+/// assert!(Source::new("LAPTOP (Camera 1)").address().is_none());
 /// ```
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Source {
-    /// The NDI source name (e.g., "MACHINE (Source Name)").
-    pub name: String,
-    /// The network address for connecting to this source.
-    pub address: SourceAddress,
+    name: String,
+    address: Option<SourceAddress>,
 }
 
 #[repr(C)]
@@ -772,6 +746,34 @@ pub(crate) struct RawSource {
 }
 
 impl Source {
+    /// The source named `name`, without an address.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            address: None,
+        }
+    }
+
+    /// This source, at `address`.
+    #[must_use]
+    pub fn with_address(self, address: SourceAddress) -> Self {
+        Self {
+            address: Some(address),
+            ..self
+        }
+    }
+
+    /// The NDI source name (e.g., "MACHINE (Source Name)"). A source the SDK
+    /// described by its address alone has an empty name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The network address for connecting to this source, when known.
+    pub fn address(&self) -> Option<&SourceAddress> {
+        self.address.as_ref()
+    }
+
     /// Check if this source matches a given host or IP address.
     ///
     /// This checks the complete address host, or for hostname queries the
@@ -786,10 +788,8 @@ impl Source {
     /// ```
     /// use grafton_ndi::{Source, SourceAddress};
     ///
-    /// let source = Source {
-    ///     name: "CAMERA1 (Chan1, 192.168.0.107)".to_string(),
-    ///     address: SourceAddress::Ip("192.168.0.107:5960".to_string()),
-    /// };
+    /// let source = Source::new("CAMERA1 (Chan1, 192.168.0.107)")
+    ///     .with_address(SourceAddress::Ip("192.168.0.107:5960".to_string()));
     ///
     /// assert!(source.matches_host("192.168.0.107"));
     /// assert!(source.matches_host("CAMERA1"));
@@ -800,7 +800,11 @@ impl Source {
     }
 
     fn matches_query(&self, query: HostQuery<'_>) -> bool {
-        if self.address.matches_query(query) {
+        if self
+            .address
+            .as_ref()
+            .is_some_and(|address| address.matches_query(query))
+        {
             return true;
         }
         match query {
@@ -831,37 +835,41 @@ impl Source {
     /// ```
     /// use grafton_ndi::{Source, SourceAddress};
     ///
-    /// let source = Source {
-    ///     name: "CAMERA1".to_string(),
-    ///     address: SourceAddress::Ip("192.168.1.100:5960".to_string()),
-    /// };
+    /// let source = Source::new("CAMERA1")
+    ///     .with_address(SourceAddress::Ip("192.168.1.100:5960".to_string()));
     ///
     /// assert_eq!(source.host(), Some("192.168.1.100"));
     /// ```
     pub fn host(&self) -> Option<&str> {
-        self.address.authority().map(|authority| authority.host)
+        self.address
+            .as_ref()?
+            .authority()
+            .map(|authority| authority.host)
     }
 
-    /// Copy an SDK source descriptor into owned strings after null checks.
+    /// Copy a source descriptor that the SDK function `operation` returned
+    /// into owned strings after null checks.
     ///
     /// Null checks cannot validate dangling or otherwise invalid pointers. The
     /// SDK must provide a live descriptor and readable NUL-terminated strings.
     ///
     /// # Errors
     ///
-    /// Returns `Error::NullPointer` if:
-    /// - The source pointer itself is null
-    /// - Both the `p_ndi_name` and source address fields are null
+    /// Returns [`Error::NativeOperationFailed`] naming `operation` when the
+    /// descriptor is null, or names neither a source nor an address.
     ///
     /// # Safety
     ///
     /// A non-null `source_ptr` must point to a live `NDIlib_source_t`. Its non-null
     /// string pointers must remain readable through their NUL terminators until
     /// copying finishes.
-    pub(crate) unsafe fn try_from_raw(source_ptr: *const NDIlib_source_t) -> Result<Self> {
-        // Check top-level pointer
+    pub(crate) unsafe fn try_from_raw(
+        source_ptr: *const NDIlib_source_t,
+        operation: &'static str,
+    ) -> Result<Self> {
+        let failed = || Error::NativeOperationFailed { operation };
         if source_ptr.is_null() {
-            return Err(Error::NullPointer("NDIlib_source_t pointer".into()));
+            return Err(failed());
         }
 
         let ndi_source = unsafe { &*source_ptr };
@@ -869,7 +877,7 @@ impl Source {
         let name = if ndi_source.p_ndi_name.is_null() {
             // The SDK accepts an address-only descriptor with a null name.
             if unsafe { ndi_source.__bindgen_anon_1.p_url_address }.is_null() {
-                return Err(Error::NullPointer("NDIlib_source_t::p_ndi_name".into()));
+                return Err(failed());
             }
             String::new()
         } else {
@@ -885,18 +893,15 @@ impl Source {
         // IP addresses for regular sources. We check URL first as it's
         // typically used for newer/HX sources.
         let address = unsafe {
-            if !ndi_source.__bindgen_anon_1.p_url_address.is_null() {
-                let url_str = CStr::from_ptr(ndi_source.__bindgen_anon_1.p_url_address)
-                    .to_string_lossy()
-                    .into_owned();
-                if url_str.contains("://") {
-                    SourceAddress::Url(url_str)
+            let address = ndi_source.__bindgen_anon_1.p_url_address;
+            (!address.is_null()).then(|| {
+                let address = CStr::from_ptr(address).to_string_lossy().into_owned();
+                if address.contains("://") {
+                    SourceAddress::Url(address)
                 } else {
-                    SourceAddress::Ip(url_str)
+                    SourceAddress::Ip(address)
                 }
-            } else {
-                SourceAddress::None
-            }
+            })
         };
 
         Ok(Source { name, address })
@@ -912,7 +917,7 @@ impl Source {
         let name = CString::new(self.name.clone()).map_err(Error::InvalidCString)?;
 
         let (url_address, ip_address, __bindgen_anon_1) = match &self.address {
-            SourceAddress::Url(url) => {
+            Some(SourceAddress::Url(url)) => {
                 let url_cstr = CString::new(url.clone()).map_err(Error::InvalidCString)?;
                 let p_url = url_cstr.as_ptr();
                 (
@@ -923,7 +928,7 @@ impl Source {
                     },
                 )
             }
-            SourceAddress::Ip(ip) => {
+            Some(SourceAddress::Ip(ip)) => {
                 let ip_cstr = CString::new(ip.clone()).map_err(Error::InvalidCString)?;
                 let p_ip = ip_cstr.as_ptr();
                 (
@@ -932,7 +937,7 @@ impl Source {
                     NDIlib_source_t__bindgen_ty_1 { p_ip_address: p_ip },
                 )
             }
-            SourceAddress::None => (
+            None => (
                 None,
                 None,
                 NDIlib_source_t__bindgen_ty_1 {
@@ -958,9 +963,10 @@ impl Source {
 impl Display for Source {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match &self.address {
-            SourceAddress::Url(url) => write!(f, "{name}@{url}", name = self.name),
-            SourceAddress::Ip(ip) => write!(f, "{name}@{ip}", name = self.name),
-            SourceAddress::None => write!(f, "{name}", name = self.name),
+            Some(SourceAddress::Url(address) | SourceAddress::Ip(address)) => {
+                write!(f, "{name}@{address}", name = self.name)
+            }
+            None => write!(f, "{name}", name = self.name),
         }
     }
 }
@@ -973,7 +979,7 @@ impl Display for Source {
 /// host the first time it is asked for, and afterwards returns the remembered
 /// source without calling the NDI runtime at all.
 ///
-/// The cache stores only owned source descriptors. It holds no [`NDI`] handle,
+/// The cache stores only owned source descriptors. It holds no [`Ndi`] handle,
 /// so it does not keep NDI started, it can be created before a runtime is
 /// selected, and it can outlive every handle. A lookup that has to search the
 /// network uses the handle it is given.
@@ -992,11 +998,11 @@ impl Display for Source {
 /// # Examples
 ///
 /// ```no_run
-/// use grafton_ndi::{SourceCache, NDI};
+/// use grafton_ndi::{SourceCache, Ndi};
 /// use std::time::Duration;
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
-/// let ndi = NDI::new()?;
+/// let ndi = Ndi::new()?;
 /// let cache = SourceCache::new();
 ///
 /// // The first lookup of a host searches the network.
@@ -1059,7 +1065,7 @@ impl SourceCache {
     ///
     /// - [`Error::NoSourcesFound`] if no source matching the host is discovered
     ///   before the timeout expires
-    /// - [`Error::InvalidConfiguration`] if `host` is not a bare hostname or IP,
+    /// - [`Error::InvalidInput`] if `host` is not a bare hostname or IP,
     ///   or `timeout` exceeds [`crate::MAX_TIMEOUT`]; both are checked before
     ///   the cache is consulted
     /// - [`Error::NativeOperationFailed`] if the finder cannot be created
@@ -1067,11 +1073,11 @@ impl SourceCache {
     /// # Examples
     ///
     /// ```no_run
-    /// use grafton_ndi::{SourceCache, NDI};
+    /// use grafton_ndi::{SourceCache, Ndi};
     /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = NDI::new()?;
+    /// let ndi = Ndi::new()?;
     /// let cache = SourceCache::new();
     ///
     /// // Find by IP address
@@ -1082,16 +1088,13 @@ impl SourceCache {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn find_by_host(&self, ndi: &NDI, host: &str, timeout: Duration) -> Result<Source> {
+    pub fn find_by_host(&self, ndi: &Ndi, host: &str, timeout: Duration) -> Result<Source> {
         self.find_by_host_with(host, timeout, |query| {
             let hint = host
                 .strip_prefix('[')
                 .and_then(|value| value.strip_suffix(']'))
                 .unwrap_or(host);
-            let options = FinderOptions::builder()
-                .show_local_sources(true)
-                .extra_ips(hint)
-                .build();
+            let options = FinderOptions::new().extra_ips(hint);
             let finder = Finder::new(ndi, &options)?;
             finder.poll_until_deadline(timeout, |sources| {
                 sources
@@ -1111,7 +1114,7 @@ impl SourceCache {
         discover: impl FnOnce(HostQuery<'_>) -> Result<Option<Source>>,
     ) -> Result<Source> {
         let query = HostQuery::parse(host).ok_or_else(|| {
-            Error::InvalidConfiguration("Host must be a bare hostname or IP address".into())
+            Error::InvalidInput("Host must be a bare hostname or IP address".into())
         })?;
         to_ms_checked(timeout)?;
         let key = HostKeyBuffer::new(query);
@@ -1161,11 +1164,11 @@ impl SourceCache {
     /// # Examples
     ///
     /// ```no_run
-    /// use grafton_ndi::{SourceCache, NDI};
+    /// use grafton_ndi::{SourceCache, Ndi};
     /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = NDI::new()?;
+    /// let ndi = Ndi::new()?;
     /// let cache = SourceCache::new();
     /// let source = cache.find_by_host(&ndi, "192.168.0.107", Duration::from_secs(5))?;
     ///
@@ -1196,11 +1199,11 @@ impl SourceCache {
     /// # Examples
     ///
     /// ```no_run
-    /// use grafton_ndi::{SourceCache, NDI};
+    /// use grafton_ndi::{SourceCache, Ndi};
     /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = NDI::new()?;
+    /// let ndi = Ndi::new()?;
     /// let cache = SourceCache::new();
     /// cache.find_by_host(&ndi, "192.168.0.107", Duration::from_secs(5))?;
     /// cache.find_by_host(&ndi, "192.168.0.108", Duration::from_secs(5))?;
@@ -1226,11 +1229,11 @@ impl SourceCache {
     /// # Examples
     ///
     /// ```no_run
-    /// use grafton_ndi::{SourceCache, NDI};
+    /// use grafton_ndi::{SourceCache, Ndi};
     /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = NDI::new()?;
+    /// let ndi = Ndi::new()?;
     /// let cache = SourceCache::new();
     /// assert_eq!(cache.len(), 0);
     ///
@@ -1252,11 +1255,11 @@ impl SourceCache {
     /// # Examples
     ///
     /// ```no_run
-    /// use grafton_ndi::{SourceCache, NDI};
+    /// use grafton_ndi::{SourceCache, Ndi};
     /// use std::time::Duration;
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = NDI::new()?;
+    /// let ndi = Ndi::new()?;
     /// let cache = SourceCache::new();
     /// assert!(cache.is_empty());
     ///
@@ -1372,14 +1375,11 @@ mod tests {
         ] {
             for (first, second) in [(a, b), (b, a)] {
                 let cache = SourceCache::new();
-                let old = Source {
-                    name: "camera".into(),
-                    address: SourceAddress::Ip("192.0.2.1:5960".into()),
-                };
-                let fresh = Source {
-                    address: SourceAddress::Ip("192.0.2.1:5961".into()),
-                    ..old.clone()
-                };
+                let old =
+                    Source::new("camera").with_address(SourceAddress::Ip("192.0.2.1:5960".into()));
+                let fresh = old
+                    .clone()
+                    .with_address(SourceAddress::Ip("192.0.2.1:5961".into()));
                 cache
                     .find_by_host_with(first, Duration::ZERO, |_| Ok(Some(old.clone())))
                     .unwrap();
@@ -1416,7 +1416,7 @@ mod tests {
                 assert_eq!(cache.len(), 1);
                 cache.clear();
                 assert!(cache
-                    .find_by_host_with(first, Duration::ZERO, |_| Err(Error::InvalidConfiguration(
+                    .find_by_host_with(first, Duration::ZERO, |_| Err(Error::InvalidInput(
                         "discovery failed".into()
                     )))
                     .is_err());
@@ -1430,19 +1430,14 @@ mod tests {
 
     #[test]
     fn exact_host_matching_ignores_labels_ports_and_url_payloads() {
-        let other = Source {
-            name: "CAMERA10 (192.168.1.1)".into(),
-            address: SourceAddress::Ip("192.168.1.100:5960".into()),
-        };
+        let other = Source::new("CAMERA10 (192.168.1.1)")
+            .with_address(SourceAddress::Ip("192.168.1.100:5960".into()));
         assert!(!other.matches_host("192.168.1.1"));
         assert!(!other.matches_host("5960"));
         assert!(!other.matches_host("CAMERA1"));
-        let exact = Source {
-            name: "CAMERA1 (Program)".into(),
-            address: SourceAddress::Url(
-                "http://user:pass@Camera.Local:8080/ndi?next=192.0.2.1".into(),
-            ),
-        };
+        let exact = Source::new("CAMERA1 (Program)").with_address(SourceAddress::Url(
+            "http://user:pass@Camera.Local:8080/ndi?next=192.0.2.1".into(),
+        ));
         assert!(exact.matches_host("camera.local."));
         assert!(exact.matches_host("camera1"));
         assert!(!exact.matches_host("192.0.2.1"));
@@ -1473,14 +1468,10 @@ mod tests {
     #[test]
     fn cache_selects_exact_host_and_rejects_invalid_queries_before_discovery() {
         let cache = SourceCache::new();
-        let wrong = Source {
-            name: "CAMERA10 (Program)".into(),
-            address: SourceAddress::Ip("192.168.1.100:5960".into()),
-        };
-        let right = Source {
-            name: "CAMERA1 (Program)".into(),
-            address: SourceAddress::Ip("192.168.1.1:5961".into()),
-        };
+        let wrong = Source::new("CAMERA10 (Program)")
+            .with_address(SourceAddress::Ip("192.168.1.100:5960".into()));
+        let right = Source::new("CAMERA1 (Program)")
+            .with_address(SourceAddress::Ip("192.168.1.1:5961".into()));
         let timeout = Duration::ZERO;
         let selected = cache
             .find_by_host_with("192.168.1.1", timeout, |query| {
@@ -1502,7 +1493,7 @@ mod tests {
                 cache.find_by_host_with(invalid, timeout, |_| panic!(
                     "invalid query reached discovery"
                 )),
-                Err(Error::InvalidConfiguration(_))
+                Err(Error::InvalidInput(_))
             ));
         }
         assert_eq!(cache.len(), 1);
@@ -1515,14 +1506,9 @@ mod tests {
             let cache = Arc::new(SourceCache::new());
             let (started_tx, started_rx) = mpsc::channel();
             let (resume_tx, resume_rx) = mpsc::channel();
-            let old = Source {
-                name: "old".into(),
-                address: SourceAddress::Ip("192.0.2.1:5960".into()),
-            };
-            let fresh = Source {
-                name: "fresh".into(),
-                address: SourceAddress::Ip("192.0.2.1:5961".into()),
-            };
+            let old = Source::new("old").with_address(SourceAddress::Ip("192.0.2.1:5960".into()));
+            let fresh =
+                Source::new("fresh").with_address(SourceAddress::Ip("192.0.2.1:5961".into()));
             let pending = Arc::clone(&cache);
             let old_result = old.clone();
             let thread = std::thread::spawn(move || {
@@ -1571,10 +1557,7 @@ mod tests {
                     .find_by_host_with("camera.local", Duration::ZERO, |_| {
                         started_tx.send(()).unwrap();
                         resume_rx.recv().unwrap();
-                        Ok(Some(Source {
-                            name: "CAMERA (Program)".into(),
-                            address: SourceAddress::None,
-                        }))
+                        Ok(Some(Source::new("CAMERA (Program)")))
                     })
                     .unwrap()
             });
@@ -1595,10 +1578,7 @@ mod tests {
         let cache = SourceCache::new();
         cache.cache.lock().unwrap().generation = Some(u64::MAX);
         cache.invalidate("absent");
-        let source = Source {
-            name: "camera".into(),
-            address: SourceAddress::Ip("192.0.2.1".into()),
-        };
+        let source = Source::new("camera").with_address(SourceAddress::Ip("192.0.2.1".into()));
         assert_eq!(
             cache
                 .find_by_host_with("192.0.2.1", Duration::ZERO, |_| Ok(Some(source.clone())))
@@ -1611,10 +1591,14 @@ mod tests {
 
     #[test]
     fn defaults_include_local_sources() {
-        assert!(FinderOptions::default().show_local_sources);
-        assert_eq!(
-            FinderOptions::default().show_local_sources,
-            FinderOptions::builder().build().show_local_sources
+        for options in [FinderOptions::default(), FinderOptions::new()] {
+            assert!(options.show_local_sources);
+            assert!(options.groups.is_none() && options.extra_ips.is_none());
+        }
+        assert!(
+            !FinderOptions::new()
+                .show_local_sources(false)
+                .show_local_sources
         );
     }
 
@@ -1632,12 +1616,9 @@ mod tests {
             ("http://camera?x=:123", "camera", None),
             ("http://user:pass@[::1]:8080/path", "::1", Some(8080)),
         ] {
-            let source = Source {
-                name: String::new(),
-                address: SourceAddress::Url(address.into()),
-            };
+            let source = Source::new("").with_address(SourceAddress::Url(address.into()));
             assert_eq!(source.host(), Some(host), "{address}");
-            assert_eq!(source.address.port(), port, "{address}");
+            assert_eq!(source.address().unwrap().port(), port, "{address}");
         }
         assert!(parse_authority("[::1").is_none());
         assert!(parse_authority("camera:invalid").is_none());
@@ -1646,14 +1627,13 @@ mod tests {
 
     #[test]
     fn discovery_accumulates_structurally_distinct_sources_in_order() {
-        let first = Source {
-            name: "Camera".into(),
-            address: SourceAddress::Ip("192.0.2.1".into()),
-        };
-        let mut changed = first.clone();
-        changed.address = SourceAddress::Ip("192.0.2.2".into());
-        let mut distinct_variant = first.clone();
-        distinct_variant.address = SourceAddress::Url("192.0.2.1".into());
+        let first = Source::new("Camera").with_address(SourceAddress::Ip("192.0.2.1".into()));
+        let changed = first
+            .clone()
+            .with_address(SourceAddress::Ip("192.0.2.2".into()));
+        let distinct_variant = first
+            .clone()
+            .with_address(SourceAddress::Url("192.0.2.1".into()));
         let mut seen = HashSet::new();
         let mut discovered = Vec::new();
         accumulate_sources(&mut discovered, &mut seen, vec![first.clone()]);
@@ -1671,12 +1651,12 @@ mod tests {
         let cache = SourceCache::new();
         cache.cache.lock().unwrap().entries.insert(
             HostKeyBuffer::new(HostQuery::parse("camera").unwrap()).into_owned(),
-            Source::default(),
+            Source::new("camera"),
         );
         for host in ["camera", "not_cached"] {
             assert!(matches!(
                 cache.find_by_host_with(host, Duration::MAX, |_| panic!("invalid timeout")),
-                Err(Error::InvalidConfiguration(_))
+                Err(Error::InvalidInput(_))
             ));
         }
         // A hit is answered without reaching discovery, the only step that
@@ -1685,7 +1665,7 @@ mod tests {
             cache
                 .find_by_host_with("camera", Duration::ZERO, |_| panic!("cache hit"))
                 .unwrap(),
-            Source::default()
+            Source::new("camera")
         );
     }
 
@@ -1735,15 +1715,15 @@ mod tests {
                             // copying, even if competing threads are not scheduled.
                             assert!(matches!(finder.sources_lock.try_lock(), Err(TryLockError::WouldBlock)));
                             std::thread::yield_now();
-                            let owned = Source::try_from_raw(source);
+                            let owned = Source::try_from_raw(source, "test snapshot");
                             assert_eq!(active_snapshot.fetch_sub(1, Ordering::SeqCst), 1);
                             owned
                         },
                     ) }.unwrap();
                     drop(name);
                     drop(address);
-                    assert_eq!(sources[0].name, format!("Camera {index}"));
-                    assert!(matches!(&sources[0].address, SourceAddress::Ip(ip) if ip == &format!("192.0.2.{index}:5960")));
+                    assert_eq!(sources[0].name(), format!("Camera {index}"));
+                    assert!(matches!(sources[0].address(), Some(SourceAddress::Ip(ip)) if ip == &format!("192.0.2.{index}:5960")));
                 });
             }
         });
@@ -1769,15 +1749,14 @@ mod tests {
 
     #[test]
     fn test_try_from_raw_null_pointer() {
-        // Test that null pointer is rejected
-        let result = unsafe { Source::try_from_raw(ptr::null()) };
-        assert!(result.is_err());
-        match result {
-            Err(Error::NullPointer(msg)) => {
-                assert!(msg.contains("NDIlib_source_t pointer"));
-            }
-            _ => panic!("Expected NullPointer error"),
-        }
+        // A null descriptor is a failure of the function that returned it.
+        let result = unsafe { Source::try_from_raw(ptr::null(), "NDIlib_send_get_source_name") };
+        assert!(matches!(
+            result,
+            Err(Error::NativeOperationFailed {
+                operation: "NDIlib_send_get_source_name"
+            })
+        ));
     }
 
     #[test]
@@ -1790,14 +1769,13 @@ mod tests {
             },
         };
 
-        let result = unsafe { Source::try_from_raw(&source as *const _) };
-        assert!(result.is_err());
-        match result {
-            Err(Error::NullPointer(msg)) => {
-                assert!(msg.contains("p_ndi_name"));
-            }
-            _ => panic!("Expected NullPointer error for null name"),
-        }
+        let result = unsafe { Source::try_from_raw(&source, "NDIlib_find_get_current_sources") };
+        assert!(matches!(
+            result,
+            Err(Error::NativeOperationFailed {
+                operation: "NDIlib_find_get_current_sources"
+            })
+        ));
     }
 
     #[test]
@@ -1809,10 +1787,10 @@ mod tests {
                 p_url_address: url.as_ptr(),
             },
         };
-        let source = unsafe { Source::try_from_raw(&raw) }.unwrap();
-        assert!(source.name.is_empty());
+        let source = unsafe { Source::try_from_raw(&raw, "test") }.unwrap();
+        assert!(source.name().is_empty());
         assert!(
-            matches!(source.address, SourceAddress::Url(ref address) if address == "ndi://127.0.0.1:5960")
+            matches!(source.address(), Some(SourceAddress::Url(address)) if address == "ndi://127.0.0.1:5960")
         );
         let roundtrip = source.to_raw().unwrap();
         assert!(!roundtrip.raw.p_ndi_name.is_null());
@@ -1831,13 +1809,13 @@ mod tests {
             },
         };
 
-        let result = unsafe { Source::try_from_raw(&source as *const _) };
+        let result = unsafe { Source::try_from_raw(&source, "test") };
         assert!(result.is_ok());
 
         let source = result.unwrap();
-        assert_eq!(source.name, "Test Source");
-        match source.address {
-            SourceAddress::Ip(ip_str) => {
+        assert_eq!(source.name(), "Test Source");
+        match source.address() {
+            Some(SourceAddress::Ip(ip_str)) => {
                 assert_eq!(ip_str, "192.168.1.100:5960");
             }
             _ => panic!("Expected IP address"),
@@ -1857,13 +1835,13 @@ mod tests {
             },
         };
 
-        let result = unsafe { Source::try_from_raw(&source as *const _) };
+        let result = unsafe { Source::try_from_raw(&source, "test") };
         assert!(result.is_ok());
 
         let source = result.unwrap();
-        assert_eq!(source.name, "HX Source");
-        match source.address {
-            SourceAddress::Url(url_str) => {
+        assert_eq!(source.name(), "HX Source");
+        match source.address() {
+            Some(SourceAddress::Url(url_str)) => {
                 assert_eq!(url_str, "http://camera.local:8080/ndi");
             }
             _ => panic!("Expected URL address"),
@@ -1882,15 +1860,12 @@ mod tests {
             },
         };
 
-        let result = unsafe { Source::try_from_raw(&source as *const _) };
+        let result = unsafe { Source::try_from_raw(&source, "test") };
         assert!(result.is_ok());
 
         let source = result.unwrap();
-        assert_eq!(source.name, "Source No Addr");
-        match source.address {
-            SourceAddress::None => {}
-            _ => panic!("Expected None address"),
-        }
+        assert_eq!(source.name(), "Source No Addr");
+        assert!(source.address().is_none());
     }
 
     #[test]

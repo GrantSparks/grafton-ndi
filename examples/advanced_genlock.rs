@@ -16,7 +16,7 @@ use std::{env, time::Duration};
 
 use grafton_ndi::{
     advanced::{ClockSource, Genlock},
-    Error, ScanType, Sender, SenderOptions, VideoFrame, NDI,
+    Error, FrameRate, Ndi, ScanType, Sender, SenderOptions, VideoFrame,
 };
 
 #[path = "common/mod.rs"]
@@ -26,7 +26,7 @@ fn main() -> Result<(), Error> {
     let args: Vec<String> = env::args().collect();
     let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
 
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
     let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
     let reference = finder
         .find_sources(Duration::from_secs(5))?
@@ -41,19 +41,18 @@ fn main() -> Result<(), Error> {
     // The genlock paces the frames, so the sender's own clock is switched off.
     let sender = Sender::new(
         &ndi,
-        &SenderOptions::builder("Genlocked Sender Example")
-            .clock_video(false)
-            .build(),
+        &SenderOptions::new("Genlocked Sender Example").clock_video(false),
     )?;
+    let frame_rate = FrameRate::new(60_000, 1001)?;
     let frame = VideoFrame::builder()
         .resolution(1920, 1080)
-        .frame_rate(60_000, 1001)
+        .frame_rate(frame_rate)
         .build()?;
 
     let (mut video_clock, _audio_clock) = genlock.clocks();
     let mut paced_by = None;
     for _ in 0..600 {
-        let clock = video_clock.wait(60_000, 1001, ScanType::Progressive)?;
+        let clock = video_clock.wait(frame_rate, ScanType::Progressive);
         if paced_by != Some(clock) {
             match clock {
                 ClockSource::ReferenceSignal => println!("Paced by the reference source"),
@@ -61,7 +60,7 @@ fn main() -> Result<(), Error> {
             }
             paced_by = Some(clock);
         }
-        sender.send_video(&frame);
+        sender.send_video(&frame)?;
     }
     Ok(())
 }

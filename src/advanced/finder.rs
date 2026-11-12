@@ -16,7 +16,7 @@ use crate::{
 /// of its configuration, and a finder is told it by a Discovery Server.
 ///
 /// Returned by [`Finder::sources_with_metadata`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ExtendedSource {
     source: Source,
     metadata: Option<String>,
@@ -58,7 +58,8 @@ unsafe fn extended_source(
     };
     descriptor.__bindgen_anon_1.p_url_address = address;
     // SAFETY: the descriptor points to the caller's readable strings.
-    let source = unsafe { Source::try_from_raw(&descriptor) }.ok()?;
+    let source =
+        unsafe { Source::try_from_raw(&descriptor, "NDIlib_find_get_current_sources_v2") }.ok()?;
     let metadata = (!metadata.is_null())
         // SAFETY: non-null was checked; the caller guarantees the terminator.
         .then(|| unsafe { CStr::from_ptr(metadata) })
@@ -130,13 +131,13 @@ mod tests {
         // string the SDK gives.
         for nothing in [None, Some(c"")] {
             let plain = copy(Some(name), Some(address), nothing).unwrap();
-            assert_eq!(plain.source().name, "HOST (Camera)");
+            assert_eq!(plain.source().name(), "HOST (Camera)");
             assert_eq!(plain.metadata(), None);
         }
 
         let lossy = copy(Some(name), Some(address), Some(invalid_utf8)).unwrap();
         assert_eq!(lossy.metadata(), Some("<ndi \u{fffd}/>"));
-        assert_eq!(lossy.into_source().name, "HOST (Camera)");
+        assert_eq!(lossy.into_source().name(), "HOST (Camera)");
 
         // Neither a name nor an address: there is nothing to connect to.
         assert!(copy(None, None, Some(invalid_utf8)).is_none());

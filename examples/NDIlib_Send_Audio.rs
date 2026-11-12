@@ -6,7 +6,7 @@
 //!
 //! Run with: `cargo run --example NDIlib_Send_Audio`
 
-use grafton_ndi::{AudioFrame, Error, Sender, SenderOptions, NDI};
+use grafton_ndi::{AudioFrame, Error, Ndi, Sender, SenderOptions};
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -22,20 +22,20 @@ fn main() -> Result<(), Error> {
     })
     .expect("Error setting Ctrl-C handler");
 
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
 
     // Create an NDI source that is clocked to audio
-    let send_options = SenderOptions::builder("My Audio").clock_audio(true).build();
+    let send_options = SenderOptions::new("My Audio").clock_audio(true);
 
     let sender = Sender::new(&ndi, &send_options)?;
 
     // Audio parameters
     let sample_rate = 48000;
-    let no_channels = 4;
-    let no_samples = 1920;
+    let num_channels = 4;
+    let num_samples = 1920;
 
     // Create audio buffer (planar format)
-    let mut audio_data = vec![0.0f32; (no_samples * no_channels) as usize];
+    let mut audio_data = vec![0.0f32; (num_samples * num_channels) as usize];
 
     for idx in 0..50 {
         if exit_loop.load(Ordering::Relaxed) {
@@ -47,8 +47,8 @@ fn main() -> Result<(), Error> {
 
         let audio_frame = AudioFrame::builder()
             .sample_rate(sample_rate)
-            .channels(no_channels)
-            .samples(no_samples)
+            .num_channels(num_channels)
+            .num_samples(num_samples)
             .data(audio_data.clone())
             .build()?;
 

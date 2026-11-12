@@ -17,10 +17,10 @@ use std::{env, time::Duration};
 
 use grafton_ndi::{
     advanced::{
-        AdvancedConfig, CompressedSender, PacketEvent, PacketReceiver, PassthroughPreset,
-        ReceivedAudio, ReceivedVideo,
+        CompressedSender, PacketEvent, PacketReceiver, PassthroughPreset, ReceivedAudio,
+        ReceivedVideo,
     },
-    Error, ReceiverOptions, SenderOptions, NDI,
+    Error, Ndi, ReceiverOptions, SenderOptions,
 };
 
 #[path = "common/mod.rs"]
@@ -30,7 +30,7 @@ fn main() -> Result<(), Error> {
     let args: Vec<String> = env::args().collect();
     let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
 
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
     let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
     let Some(source) = finder
         .find_sources(Duration::from_secs(5))?
@@ -44,20 +44,16 @@ fn main() -> Result<(), Error> {
 
     let mut receiver = PacketReceiver::new(
         &ndi,
-        &ReceiverOptions::builder(source)
-            .name("Passthrough Example")
-            .build(),
+        &ReceiverOptions::new(source).name("Passthrough Example"),
         // Every compressed format, video and audio, is passed through.
         PassthroughPreset::AlphaWithAudio,
-        &AdvancedConfig::parse("{}")?,
     )?;
     // The relay forwards frames as they arrive, so the sender must not pace them.
     let mut sender = CompressedSender::new(
         &ndi,
-        &SenderOptions::builder("Passthrough Relay")
+        &SenderOptions::new("Passthrough Relay")
             .clock_video(false)
-            .clock_audio(false)
-            .build(),
+            .clock_audio(false),
     )?;
 
     let (mut video, mut audio) = (0u32, 0u32);
@@ -69,29 +65,29 @@ fn main() -> Result<(), Error> {
         match receiver.capture(Duration::from_secs(1))? {
             // A packet the sender cannot pass on is refused with the reason,
             // and stays with the caller.
-            PacketEvent::Video(ReceivedVideo::Compressed(mut packet)) => {
+            Some(PacketEvent::Video(ReceivedVideo::Compressed(mut packet))) => {
                 match sender.send_video(&mut packet) {
                     Ok(()) => video += 1,
                     Err(error) => println!("Video packet not relayed: {error}"),
                 }
             }
-            PacketEvent::Audio(ReceivedAudio::Compressed(mut packet)) => {
+            Some(PacketEvent::Audio(ReceivedAudio::Compressed(mut packet))) => {
                 match sender.send_audio(&mut packet) {
                     Ok(()) => audio += 1,
                     Err(error) => println!("Audio packet not relayed: {error}"),
                 }
             }
-            PacketEvent::Video(ReceivedVideo::Decoded(frame)) => println!(
+            Some(PacketEvent::Video(ReceivedVideo::Decoded(frame))) => println!(
                 "The source sent {}x{} video in a format this preset decodes",
                 frame.width(),
                 frame.height()
             ),
-            PacketEvent::Audio(ReceivedAudio::Decoded(frame)) => println!(
+            Some(PacketEvent::Audio(ReceivedAudio::Decoded(frame))) => println!(
                 "The source sent {} audio samples in a format this preset decodes",
                 frame.num_samples()
             ),
-            PacketEvent::Timeout => println!("Waiting for frames..."),
-            _ => {}
+            None => println!("Waiting for frames..."),
+            Some(_) => {}
         }
     }
     println!("Relayed {video} video and {audio} audio packets");

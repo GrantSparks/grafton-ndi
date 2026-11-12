@@ -1,6 +1,6 @@
 //! Storage for the structures the File library fills in through a pointer.
 
-use super::{FileError, FileResult};
+use crate::{Error, Result};
 
 /// Bytes kept after every structure the File library writes.
 const GUARD: usize = 4096;
@@ -44,11 +44,11 @@ impl<T: Copy + Default> OutParam<T> {
     ///
     /// # Errors
     ///
-    /// [`FileError::Protocol`] when the library wrote more than this crate's
+    /// [`Error::UnexpectedSdkResult`] when the library wrote more than this crate's
     /// layout of `T`, in which case nothing it wrote can be trusted.
-    pub(super) fn read(&self) -> FileResult<T> {
+    pub(super) fn read(&self) -> Result<T> {
         if self.guard.iter().any(|&byte| byte != SENTINEL) {
-            return Err(FileError::Protocol(format!(
+            return Err(Error::UnexpectedSdkResult(format!(
                 "the File library wrote past the {} bytes this crate's SDK headers give {}",
                 size_of::<T>(),
                 std::any::type_name::<T>()
@@ -79,7 +79,7 @@ mod tests {
         // `larger` stays within them.
         unsafe { out.as_mut_ptr().cast::<u8>().write_bytes(0, larger) };
         let error = out.read().unwrap_err();
-        assert!(matches!(error, FileError::Protocol(_)), "{error}");
+        assert!(matches!(error, Error::UnexpectedSdkResult(_)), "{error}");
     }
 
     #[test]

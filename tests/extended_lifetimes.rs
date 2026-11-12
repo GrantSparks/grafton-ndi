@@ -12,7 +12,7 @@ use grafton_ndi::{
         AdvertiserOptions, RecvAdvertisement, RecvAdvertiser, SendAdvertisement, SendAdvertiser,
     },
     runtime::RuntimeOptions,
-    Error, Receiver, ReceiverOptions, Sender, SenderOptions, Source, VideoFrame, NDI,
+    Error, Ndi, Receiver, ReceiverOptions, Sender, SenderOptions, Source, VideoFrame,
 };
 use std::{
     fs,
@@ -55,8 +55,8 @@ fn server() -> AdvertiserOptions {
 fn frame() -> VideoFrame {
     VideoFrame::builder().resolution(2, 2).build().unwrap()
 }
-fn sender(ndi: &NDI) -> Sender {
-    Sender::new(ndi, &SenderOptions::builder("fixture").build()).unwrap()
+fn sender(ndi: &Ndi) -> Sender {
+    Sender::new(ndi, &SenderOptions::new("fixture")).unwrap()
 }
 
 #[test]
@@ -76,6 +76,7 @@ fn native_resource_ownership() {
         "receiver_registration",
         "dropped_receiver_advertiser",
         "foreign_registration",
+        "refused_unregistration",
         "malformed_metadata",
     ];
     if cfg!(feature = "advanced") {
@@ -140,7 +141,7 @@ fn native_resource_ownership() {
 fn child(case: &str) {
     let advanced = case.starts_with("queue_");
     let path = PathBuf::from(std::env::var_os("GRAFTON_OWNERSHIP_LIBRARY").unwrap());
-    let ndi = NDI::with_options(&RuntimeOptions::default().library_path(path).edition(
+    let ndi = Ndi::with_options(&RuntimeOptions::default().library_path(path).edition(
         if advanced {
             SdkEdition::Advanced
         } else {
@@ -169,12 +170,12 @@ fn child(case: &str) {
             assert!(advertiser
                 .register(&sender, SendAdvertisement::default())
                 .is_err());
-            sender.send_video_async(frame());
+            sender.send_video_async(frame()).unwrap();
             drop(sender);
             assert!(log().contains("sender-flush\n"));
             // The registration, not the dropped handle, keeps the sender alive.
             assert!(!log().contains("sender-destroy\n"));
-            assert!(advertiser.unregister(registration).unwrap());
+            advertiser.unregister(registration).unwrap();
             let events = log();
             assert!(
                 position(&events, "send-advertiser-remove") < position(&events, "sender-destroy")
@@ -218,8 +219,7 @@ fn child(case: &str) {
             assert_eq!(events.matches("sender-destroy\n").count(), 1);
         }
         "receiver_registration" => {
-            let receiver =
-                Receiver::new(&ndi, &ReceiverOptions::builder(Source::default()).build()).unwrap();
+            let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
             let mut advertiser = RecvAdvertiser::new(&ndi, &server()).unwrap();
             let registration = advertiser
                 .register(&receiver, RecvAdvertisement::default())
@@ -229,7 +229,7 @@ fn child(case: &str) {
                 .is_err());
             drop(receiver);
             assert!(!log().contains("receiver-destroy\n"));
-            assert!(advertiser.unregister(registration).unwrap());
+            advertiser.unregister(registration).unwrap();
             let events = log();
             assert!(
                 position(&events, "recv-advertiser-remove group=null")
@@ -239,8 +239,7 @@ fn child(case: &str) {
             drop(advertiser);
         }
         "dropped_receiver_advertiser" => {
-            let receiver =
-                Receiver::new(&ndi, &ReceiverOptions::builder(Source::default()).build()).unwrap();
+            let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
             let mut advertiser = RecvAdvertiser::new(&ndi, &server()).unwrap();
             let _ = advertiser
                 .register(
@@ -272,24 +271,23 @@ fn child(case: &str) {
             // Another advertiser neither ends the registration nor calls the
             // SDK for it: it hands the registration back with the reason.
             let rejected = other.unregister(registration).unwrap_err();
-            assert!(matches!(rejected.error(), Error::InvalidConfiguration(_)));
+            assert!(matches!(rejected.error(), Error::InvalidInput(_)));
             assert!(!log().contains("send-advertiser-remove\n"));
             let registration = rejected.into_inner();
             // It may advertise the same sender itself.
             let second = other
                 .register(&sender, SendAdvertisement::default())
                 .unwrap();
-            assert!(other.unregister(second).unwrap());
+            other.unregister(second).unwrap();
             drop(other);
             drop(sender);
             assert!(!log().contains("sender-destroy\n"));
             // The registration that came back still ends where it was issued.
-            assert!(advertiser.unregister(registration).unwrap());
+            advertiser.unregister(registration).unwrap();
             assert_eq!(log().matches("sender-destroy\n").count(), 1);
             drop(advertiser);
 
-            let receiver =
-                Receiver::new(&ndi, &ReceiverOptions::builder(Source::default()).build()).unwrap();
+            let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
             let mut advertiser = RecvAdvertiser::new(&ndi, &server()).unwrap();
             let mut other = RecvAdvertiser::new(&ndi, &server()).unwrap();
             let registration = advertiser
@@ -298,8 +296,57 @@ fn child(case: &str) {
             let rejected = other.unregister(registration).unwrap_err();
             assert!(!log().contains("recv-advertiser-remove"));
             drop(receiver);
-            assert!(advertiser.unregister(rejected.into_inner()).unwrap());
+            advertiser.unregister(rejected.into_inner()).unwrap();
             assert_eq!(log().matches("receiver-destroy\n").count(), 1);
+        }
+        "refused_unregistration" => {
+            let sender = sender(&ndi);
+            let mut advertiser = SendAdvertiser::new(&ndi, &server()).unwrap();
+            let registration = advertiser
+                .register(&sender, SendAdvertisement::default())
+                .unwrap();
+            drop(sender);
+            // An SDK that removes nothing fails the call, which changes
+            // nothing: the registration comes back and keeps the sender alive.
+            std::env::set_var("GRAFTON_FAKE_ADVERTISER_REMOVE", "refuse");
+            let rejected = advertiser.unregister(registration).unwrap_err();
+            assert!(matches!(
+                rejected.error(),
+                Error::NativeOperationFailed {
+                    operation: "unregister sender"
+                }
+            ));
+            assert!(!log().contains("sender-destroy\n"));
+            std::env::remove_var("GRAFTON_FAKE_ADVERTISER_REMOVE");
+            // The registration that came back can still be ended.
+            advertiser.unregister(rejected.into_inner()).unwrap();
+            assert_eq!(log().matches("sender-destroy\n").count(), 1);
+            drop(advertiser);
+
+            let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new(""))).unwrap();
+            let mut advertiser = RecvAdvertiser::new(&ndi, &server()).unwrap();
+            let registration = advertiser
+                .register(&receiver, RecvAdvertisement::default())
+                .unwrap();
+            drop(receiver);
+            std::env::set_var("GRAFTON_FAKE_ADVERTISER_REMOVE", "refuse");
+            let rejected = advertiser.unregister(registration).unwrap_err();
+            assert!(matches!(
+                rejected.error(),
+                Error::NativeOperationFailed {
+                    operation: "unregister receiver"
+                }
+            ));
+            assert!(!log().contains("receiver-destroy\n"));
+            std::env::remove_var("GRAFTON_FAKE_ADVERTISER_REMOVE");
+            // Dropping the advertiser ends the registration that remained.
+            drop(advertiser);
+            let events = log();
+            assert!(
+                position(&events, "recv-advertiser-remove group=null")
+                    < position(&events, "receiver-destroy")
+            );
+            assert_eq!(events.matches("receiver-destroy\n").count(), 1);
         }
         "malformed_metadata" => {
             let sender = sender(&ndi);
@@ -312,7 +359,7 @@ fn child(case: &str) {
             use grafton_ndi::advanced::{QueueOptions, QueuedSender};
             let mut queue = QueuedSender::new(
                 &ndi,
-                &SenderOptions::builder("queue").build(),
+                &SenderOptions::new("queue"),
                 QueueOptions::default().max_frames(1),
             )
             .unwrap();
@@ -334,12 +381,9 @@ fn child(case: &str) {
         #[cfg(feature = "advanced")]
         "queue_destroy" => {
             use grafton_ndi::advanced::{QueueOptions, QueuedSender};
-            let mut queue = QueuedSender::new(
-                &ndi,
-                &SenderOptions::builder("queue").build(),
-                QueueOptions::default(),
-            )
-            .unwrap();
+            let mut queue =
+                QueuedSender::new(&ndi, &SenderOptions::new("queue"), QueueOptions::default())
+                    .unwrap();
             queue.try_submit(frame()).unwrap();
             queue.try_submit(frame()).unwrap();
             assert!(queue
@@ -372,15 +416,15 @@ fn child(case: &str) {
                 .err()
                 .expect("a registered sender is refused")
                 .into_inner();
-            sender.send_video(&frame());
+            sender.send_video(&frame()).unwrap();
             drop(sender);
             assert!(!log().contains("sender-destroy\n"));
-            assert!(advertiser.unregister(registration).unwrap());
+            advertiser.unregister(registration).unwrap();
             drop(advertiser);
             assert_eq!(log().matches("sender-destroy\n").count(), 1);
         }
         _ => panic!("unknown fixture scenario"),
     }
     drop(ndi);
-    assert!(!NDI::is_running());
+    assert!(!Ndi::is_running());
 }

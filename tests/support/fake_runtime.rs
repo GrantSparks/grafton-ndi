@@ -27,11 +27,13 @@
 //!
 //! `FAKE_NDI_VERSION` in the compiler's environment replaces the version text.
 //!
-//! Two variables are read each time the function they affect is called, so a
-//! test can change the outcome while the library is loaded:
-//! `GRAFTON_FAKE_NDI_INITIALIZE=fail` makes initialization fail, and
+//! Three variables are read each time the function they affect is called, so
+//! a test can change the outcome while the library is loaded:
+//! `GRAFTON_FAKE_NDI_INITIALIZE=fail` makes initialization fail,
 //! `GRAFTON_FAKE_NDI_CPU=unsupported` makes the runtime report a CPU it
-//! cannot run on.
+//! cannot run on, and `GRAFTON_FAKE_ADVERTISER_REMOVE=refuse` makes the
+//! advertisers remove nothing and return false, as the SDK does for an object
+//! it does not know.
 
 #![allow(non_snake_case, unused_variables, clippy::missing_safety_doc)]
 
@@ -257,6 +259,11 @@ mod objects {
         drop(unsafe { Box::from_raw(instance.cast::<u8>()) });
     }
 
+    /// Whether the test asked the advertisers to remove nothing.
+    fn refuses_removal() -> bool {
+        std::env::var_os("GRAFTON_FAKE_ADVERTISER_REMOVE").is_some_and(|mode| mode == "refuse")
+    }
+
     export! {
         fn NDIlib_recv_create_v3(p_create_settings: *const NDIlib_recv_create_v3_t) -> NDIlib_recv_instance_t {
             log("receiver-create");
@@ -344,6 +351,9 @@ mod objects {
         }
 
         fn NDIlib_send_advertiser_del_sender(p_instance: NDIlib_send_advertiser_instance_t, p_sender: NDIlib_send_instance_t) -> bool {
+            if refuses_removal() {
+                return false;
+            }
             log("send-advertiser-remove");
             true
         }
@@ -369,6 +379,9 @@ mod objects {
         }
 
         fn NDIlib_recv_advertiser_del_receiver(p_instance: NDIlib_recv_advertiser_instance_t, p_receiver: NDIlib_recv_instance_t) -> bool {
+            if refuses_removal() {
+                return false;
+            }
             let advertiser = unsafe { &mut *p_instance.cast::<RecvAdvertiser>() };
             let Some(index) = advertiser.groups.iter().position(|(receiver, _)| *receiver == p_receiver) else {
                 return false;

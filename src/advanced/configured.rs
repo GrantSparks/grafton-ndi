@@ -2,12 +2,13 @@
 //!
 //! Every object the SDK can also create with a JSON configuration (the
 //! finder, sender, receiver and router, and the Discovery Server advertisers
-//! and listeners) has one creation path: an unsafe `create` function beside
-//! its `new`. It builds the native settings from the options, hands them to
-//! the SDK entry point it is given, turns a null result into the object's
-//! creation error, and constructs the native owner holding the configuration
-//! it is given, in a field that exists only with the `advanced` feature. `new`
-//! gives it the SDK's plain entry point and no configuration.
+//! and listeners) takes it from its options, whose `config` setter exists
+//! with the `advanced` feature. Each object has one creation path: an unsafe
+//! `create` function beside its `new`. It builds the native settings from the
+//! options, hands them to the SDK entry point it is given, turns a null result
+//! into the object's creation error, and constructs the native owner holding
+//! the configuration it is given, in a field that exists only with the
+//! `advanced` feature.
 //!
 //! This module adds the configured half once, for all of them.
 //! [`Configurable`] is that creation path as generic code sees it, and
@@ -15,7 +16,9 @@
 //! SDK: it takes the configured entry point's table before anything is built
 //! or created, then hands the SDK the configuration's own buffer and the owner
 //! a clone of it to keep. `configurable!` implements the trait for each object
-//! and defines its `new_with_config` on that path.
+//! and defines its `new_configured` on that path. The object's `new` calls
+//! `new_configured` when its options carry a configuration, and otherwise
+//! gives the creation path the SDK's plain entry point and no configuration.
 
 use std::ffi::c_char;
 
@@ -35,7 +38,7 @@ use crate::{
         bindings::*,
         Table,
     },
-    Finder, FinderOptions, Receiver, ReceiverOptions, Result, Sender, SenderOptions, NDI,
+    Finder, FinderOptions, Ndi, Receiver, ReceiverOptions, Result, Sender, SenderOptions,
 };
 
 /// An object whose SDK creation function has an Advanced counterpart that
@@ -57,7 +60,7 @@ pub(crate) trait Configurable: Sized {
     /// `create` returns null or a live object of `ndi`'s runtime, made from
     /// the settings it was handed, that nothing else owns.
     unsafe fn create_with(
-        ndi: &NDI,
+        ndi: &Ndi,
         options: &Self::Options,
         operation: &'static str,
         config: AdvancedConfig,
@@ -77,7 +80,7 @@ pub(crate) trait Configurable: Sized {
     /// `create` returns what that entry point returned for the settings and
     /// the configuration it was handed.
     unsafe fn configured<C: Table>(
-        ndi: &NDI,
+        ndi: &Ndi,
         options: &Self::Options,
         operation: &'static str,
         config: &AdvancedConfig,
@@ -101,10 +104,9 @@ pub(crate) trait Configurable: Sized {
 }
 
 /// Implement [`Configurable`] for `$Object` on its creation path, and define
-/// its `new_with_config` on the entry point `$create` of table `$Table`.
+/// its `new_configured` on the entry point `$create` of table `$Table`.
 macro_rules! configurable {
     (
-        $(#[$doc:meta])*
         $Object:ident($Options:ty, $Settings:ty) -> $Instance:ty,
         $Table:ident::$create:ident
     ) => {
@@ -114,7 +116,7 @@ macro_rules! configurable {
             type Instance = $Instance;
 
             unsafe fn create_with(
-                ndi: &NDI,
+                ndi: &Ndi,
                 options: &$Options,
                 operation: &'static str,
                 config: AdvancedConfig,
@@ -130,18 +132,13 @@ macro_rules! configurable {
         }
 
         impl $Object {
-            $(#[$doc])*
-            ///
-            /// The object keeps the configuration for as long as it lives.
-            ///
-            /// # Errors
-            ///
-            /// The errors of [`new`](Self::new), and
-            /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
-            /// without an Advanced runtime (or in a build without the Advanced
-            /// SDK).
-            pub fn new_with_config(
-                ndi: &NDI,
+            /// Create the object through its configured entry point with
+            /// `config`, which it keeps for as long as it lives: what `new`
+            /// does for options that carry a configuration. Without an
+            /// Advanced runtime, or in a build without the Advanced SDK, it is
+            /// refused with `Error::UnsupportedCapability`.
+            pub(crate) fn new_configured(
+                ndi: &Ndi,
                 options: &$Options,
                 config: &AdvancedConfig,
             ) -> Result<Self> {
@@ -163,50 +160,37 @@ macro_rules! configurable {
 }
 
 configurable!(
-    /// Create a finder with a per-instance Advanced SDK configuration.
     Finder(FinderOptions, NDIlib_find_create_t) -> NDIlib_find_instance_t,
     FinderConfiguration::NDIlib_find_create_v3
 );
 configurable!(
-    /// Create a sender with a per-instance Advanced SDK configuration.
     Sender(SenderOptions, NDIlib_send_create_t) -> NDIlib_send_instance_t,
     SenderConfiguration::NDIlib_send_create_v2
 );
 configurable!(
-    /// Create a receiver with a per-instance Advanced SDK configuration.
     Receiver(ReceiverOptions, NDIlib_recv_create_v3_t) -> NDIlib_recv_instance_t,
     ReceiverConfiguration::NDIlib_recv_create_v4
 );
 configurable!(
-    /// Create and advertise a routing source with a per-instance Advanced SDK
-    /// configuration.
     Router(RouterOptions, NDIlib_routing_create_t) -> NDIlib_routing_instance_t,
     RouterConfiguration::NDIlib_routing_create_v2
 );
 configurable!(
-    /// Connect to the Discovery Server with a per-instance Advanced SDK
-    /// configuration, without registering any sender.
     SendAdvertiser(AdvertiserOptions, NDIlib_send_advertiser_create_t)
         -> NDIlib_send_advertiser_instance_t,
     SenderAdvertiserConfiguration::NDIlib_send_advertiser_create_ex
 );
 configurable!(
-    /// Connect to the Discovery Server with a per-instance Advanced SDK
-    /// configuration, without registering any receiver.
     RecvAdvertiser(AdvertiserOptions, NDIlib_recv_advertiser_create_t)
         -> NDIlib_recv_advertiser_instance_t,
     ReceiverAdvertiserConfiguration::NDIlib_recv_advertiser_create_ex
 );
 configurable!(
-    /// Connect to the Discovery Server with a per-instance Advanced SDK
-    /// configuration.
     SendListener(ListenerOptions, NDIlib_send_listener_create_t)
         -> NDIlib_send_listener_instance_t,
     SenderListenerConfiguration::NDIlib_send_listener_create_ex
 );
 configurable!(
-    /// Connect to the Discovery Server with a per-instance Advanced SDK
-    /// configuration.
     RecvListener(ListenerOptions, NDIlib_recv_listener_create_t)
         -> NDIlib_recv_listener_instance_t,
     ReceiverListenerConfiguration::NDIlib_recv_listener_create_ex
@@ -217,8 +201,9 @@ mod tests {
     use super::*;
     use crate::{capabilities::RuntimeFeature, Error, Source};
 
-    /// Without the Advanced SDK each constructor is refused before anything
-    /// native is created, whichever gate refuses it first.
+    /// Without the Advanced SDK each constructor given a configuration is
+    /// refused before anything native is created, whichever gate refuses it
+    /// first.
     #[test]
     fn configured_creation_is_refused_without_the_advanced_sdk() {
         let Some(ndi) = crate::test_support::ndi() else {
@@ -238,17 +223,27 @@ mod tests {
                 "{error:?}"
             );
         };
-        refused(Finder::new_with_config(&ndi, &FinderOptions::default(), &config).err());
-        let sender = SenderOptions::builder("configured").build();
-        refused(Sender::new_with_config(&ndi, &sender, &config).err());
-        let receiver = ReceiverOptions::builder(Source::default()).build();
-        refused(Receiver::new_with_config(&ndi, &receiver, &config).err());
-        refused(Router::new_with_config(&ndi, &RouterOptions::new("configured"), &config).err());
-        let advertiser = AdvertiserOptions::default().servers("127.0.0.1");
-        refused(SendAdvertiser::new_with_config(&ndi, &advertiser, &config).err());
-        refused(RecvAdvertiser::new_with_config(&ndi, &advertiser, &config).err());
-        let listener = ListenerOptions::default().server("127.0.0.1").unwrap();
-        refused(SendListener::new_with_config(&ndi, &listener, &config).err());
-        refused(RecvListener::new_with_config(&ndi, &listener, &config).err());
+        let finder = FinderOptions::new().config(config.clone());
+        refused(Finder::new(&ndi, &finder).err());
+        let sender = SenderOptions::new("configured").config(config.clone());
+        refused(Sender::new(&ndi, &sender).err());
+        let receiver = ReceiverOptions::new(Source::new("")).config(config.clone());
+        refused(Receiver::new(&ndi, &receiver).err());
+        let router = RouterOptions::new("configured").config(config.clone());
+        refused(Router::new(&ndi, &router).err());
+        let advertiser = AdvertiserOptions::default()
+            .servers("127.0.0.1")
+            .config(config.clone());
+        refused(SendAdvertiser::new(&ndi, &advertiser).err());
+        refused(RecvAdvertiser::new(&ndi, &advertiser).err());
+        let listener = ListenerOptions::default()
+            .server("127.0.0.1")
+            .config(config.clone());
+        refused(SendListener::new(&ndi, &listener).err());
+        refused(RecvListener::new(&ndi, &listener).err());
+        // A listener that names more than one server is refused too, but only
+        // once the configured entry point has been found.
+        let listeners = ListenerOptions::default().server("a,b").config(config);
+        refused(SendListener::new(&ndi, &listeners).err());
     }
 }

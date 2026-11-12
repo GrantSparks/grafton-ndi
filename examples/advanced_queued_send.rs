@@ -13,14 +13,14 @@ use std::{thread, time::Duration};
 
 use grafton_ndi::{
     advanced::{QueueOptions, QueuedSender, QueuedVideoFrame},
-    Error, SenderOptions, VideoFrame, NDI,
+    Error, Ndi, SenderOptions, VideoFrame,
 };
 
 fn main() -> Result<(), Error> {
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
     let mut sender = QueuedSender::new(
         &ndi,
-        &SenderOptions::builder("Queued Sender Example").build(),
+        &SenderOptions::new("Queued Sender Example"),
         QueueOptions::default().max_frames(4),
     )?;
 

@@ -7,9 +7,10 @@ finished, and the threading rules of its types. The rustdoc of each type is the
 reference.
 
 The module is a supported part of the crate and follows its semantic
-versioning like the rest of the API. Its errors name what went wrong by type
-(`FileError`, and `StateError` for an operation the current state does not
-allow), its public structures can gain fields without a breaking change, and
+versioning like the rest of the API. Its errors are the crate's `Error`, which
+names what went wrong by variant (with `StateError` for an operation the
+current state does not allow), its public structures can gain fields without a
+breaking change, and
 its enums are `#[non_exhaustive]`, so later SDK releases can be supported in
 3.x minor versions.
 
@@ -28,16 +29,18 @@ needed:
 
 ```rust
 use grafton_ndi::{
-    file::{FileApi, FileError, FileRuntimeOptions},
-    NDI,
+    file::{FileApi, FileRuntimeOptions},
+    Error, Ndi,
 };
 
 fn main() -> grafton_ndi::Result<()> {
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
     match FileApi::open(&ndi, &FileRuntimeOptions::default()) {
         Ok(file) => println!("File library: {:?}", file.library_path()),
         // The text lists every location tried and why each failed.
-        Err(FileError::Unavailable(reason)) => println!("no File library: {reason}"),
+        Err(Error::RuntimeLoadFailed(reason)) => println!("no File library: {reason}"),
+        // The selected runtime is one the File library cannot accompany.
+        Err(Error::RuntimeConflict(reason)) => println!("File library refused: {reason}"),
         Err(error) => println!("{error}"),
     }
     Ok(())
@@ -56,8 +59,8 @@ library in this order is selected:
 The file is named `libndifile.so.6` on Linux, `libndifile.dylib` on macOS,
 `libndifile.so` on Android and `Processing.NDI.Lib.File.x64.dll` on 64-bit
 Windows. `FileRuntimeOptions::library_path` takes an absolute path and tries
-nothing else. A relative path, or a path other than that of the library already
-selected, fails with `FileError::Core`.
+nothing else. A relative path fails with `Error::InvalidInput`, and a path other
+than that of the library already selected with `Error::RuntimeConflict`.
 
 Like the NDI runtime, a File library that was selected stays selected and
 loaded for the life of the process. A library that loads but cannot be used
@@ -70,9 +73,9 @@ Which NDI runtime the File library works with depends on the platform:
 
 | Platform | Rule |
 | --- | --- |
-| Linux, macOS, Android | The File library uses the Advanced SDK runtime. `FileApi::open` refuses it beside a Standard runtime before loading anything. Select the Advanced runtime; see [SDK editions](../README.md#sdk-editions). |
+| Linux, macOS, Android | The File library uses the Advanced SDK runtime. `FileApi::open` refuses it beside a Standard runtime with `Error::RuntimeConflict`, before loading anything. Select the Advanced runtime; see [SDK editions](../README.md#sdk-editions). |
 | Windows | The File library does not depend on the runtime's edition. The SDK ships it for 64-bit Windows only. |
-| iOS, tvOS, visionOS | The File archive is linked at build time, in place of the core archive, when the NDI SDK for Apple supplies one; without it `FileApi::open` returns `FileError::Unavailable`. See [Apple mobile targets](../README.md#apple-mobile-targets). |
+| iOS, tvOS, visionOS | The File archive is linked at build time, in place of the core archive, when the NDI SDK for Apple supplies one; without it `FileApi::open` returns `Error::RuntimeLoadFailed`. See [Apple mobile targets](../README.md#apple-mobile-targets). |
 
 ## Probing a recording
 
@@ -105,7 +108,7 @@ use grafton_ndi::file::{FileApi, PlayerEventKind, PlayerOptions};
 use std::time::Duration;
 
 fn play(file: &FileApi) -> Result<(), Box<dyn std::error::Error>> {
-    let mut player = file.create_player(&PlayerOptions::new("Replay")?)?;
+    let mut player = file.create_player(&PlayerOptions::new("Replay"))?;
     println!("advertising {}", player.advertised_source()?);
     player.start("take_001.mkv")?;
     loop {
@@ -173,17 +176,17 @@ are named. `inject_metadata` writes a metadata frame into the recording.
 Before they call the SDK, `start` and `rollover` work out the file that the
 filename pattern names for the target. Its directory must exist and, on Unix,
 be writable; with an exact file name the file must not exist yet. Otherwise
-they return `FileError::Io`, of kind `AlreadyExists` for an exact file that
+they return `Error::Io`, of kind `AlreadyExists` for an exact file that
 exists, and the session, if one is open, goes on. A pattern can name a
 directory of its own, such as `{prefix}/{index:03}.mkv`; that directory is the
 one checked.
 
 The methods of `FileApi`, `FileRecorder` and `FilePlayer` borrow the options,
 targets and sources they are given, so a value stays with the caller when the
-call fails and can be corrected and passed again. The async handles take them
-by value, because their work runs on another thread.
+call fails and can be corrected and passed again. The async handles borrow them
+too, and send a copy to the thread that does the work.
 
-`start` returns `FileError::InvalidState(StateError::PreviousSessionOpen)`
+`start` returns `Error::InvalidState(StateError::PreviousSessionOpen)`
 while a session is recording or stopping. A recorder learns that a session ended only from the events it takes,
 so keep calling `poll_event`, or call `finish`, until `state()` is
 `RecorderState::Closed` or `RecorderState::Indeterminate`. A new session can
@@ -201,31 +204,33 @@ Other recorder operations:
   invalidate, so the crate does not call them; these values can lag behind
   the SDK.
 - `RecorderOptions` sets a size after which a new file starts at the next
-  keyframe (`with_rollover_size`), whether a format change starts a new file
-  (`with_format_change_rollover`), the file name pattern (`exact_filename`,
-  `with_pattern`) and whether the source's proxy is recorded alongside its
-  full-quality video (`with_proxy`). The options are checked against each
-  other when the recorder is created, so the order of these calls does not
-  matter.
+  keyframe (`rollover_size`), whether a format change starts a new file
+  (`format_change_rollover`), how files are named (`naming`, with a
+  `FileNaming`) and whether the source's proxy is recorded alongside its
+  full-quality video (`proxy`). Options are checked when the recorder is
+  created (`create_recorder`, `reset`, or creating an `AsyncFileRecorder`),
+  against each other as well, so the order of these calls does not matter.
+  `PlayerOptions` and `AsyncFileOptions` are likewise checked when the player
+  or the async handle is created.
 
 ### Exact file names
 
-By default files are indexed: the target `take` becomes `take_001.mkv`, and
-each new file of the session takes the next free index. `exact_filename()`, or
-a `with_pattern` pattern without `{index}` or `{index:N}`, names the file
-exactly instead. One target then names one file, so the session cannot move to
-a new file by itself:
+By default files are indexed (`FileNaming::Indexed`): the target `take`
+becomes `take_001.mkv`, and each new file of the session takes the next free
+index. `FileNaming::Exact`, or a `FileNaming::Pattern` without `{index}` or
+`{index:N}`, names the file exactly instead. One target then names one file, so
+the session cannot move to a new file by itself:
 
 - `start` and `rollover` refuse a target whose file exists, so nothing is ever
   overwritten. `rollover` to a new target works.
 - A format change of the source closes the file and ends the session, because
   format-change rollover is off for an exact name unless set.
   `RecordingReport::stopped_by_sdk` then reports that the SDK ended it.
-- `with_format_change_rollover(true)` or a nonzero `with_rollover_size` is
-  refused with `FileError::InvalidInput` when the recorder is created
+- `format_change_rollover(true)` or a nonzero `rollover_size` is
+  refused with `Error::InvalidInput` when the recorder is created
   (`create_recorder`, `reset`, or creating an `AsyncFileRecorder`).
 - `set_source` during a session returns
-  `FileError::InvalidState(StateError::ExactFileName)` without calling the SDK,
+  `Error::InvalidState(StateError::ExactFileName)` without calling the SDK,
   and the session goes on. Between sessions it works as for any recorder.
 
 Use an indexed pattern for a recording that must survive a format change or a
@@ -282,7 +287,7 @@ replacement cannot be created, `reset` returns the error and the old recorder
 stays as it was.
 
 Dropping a recorder whose session is still open stops it and waits for the
-file to be finalized, for at most `RecorderOptions::with_drop_wait`
+file to be finalized, for at most `RecorderOptions::drop_wait`
 (`RecorderOptions::DEFAULT_DROP_WAIT` is five seconds). The drop cannot report
 the outcome, so call `finish` when the result matters. `abandon` destroys the
 recorder at once without waiting and returns its report; the file of a session
@@ -338,11 +343,11 @@ use grafton_ndi::file::{
 };
 use std::time::Duration;
 
-async fn record(file: FileApi) -> Result<(), Box<dyn std::error::Error>> {
+async fn record(file: &FileApi) -> Result<(), Box<dyn std::error::Error>> {
     let options = RecorderOptions::new(SourceSpec::new("STUDIO (Camera 1)")?);
-    let recorder = AsyncFileRecorder::create(file, options).await?;
+    let recorder = AsyncFileRecorder::create(file, &options).await?;
     recorder
-        .start(RecordingTarget::new("take")?, RecordingTimecode::Preserve)
+        .start(&RecordingTarget::new("take")?, RecordingTimecode::Preserve)
         .await?;
 
     // ... record for as long as needed ...
@@ -356,27 +361,27 @@ async fn record(file: FileApi) -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 The async recorder takes its events continuously, so its report stays current
-without polling. `next_event(wait)` delivers them to the application, including
+without polling. `next_event(timeout)` delivers them to the application, including
 those `finish` takes while it waits, with a malformed event as
-`FileError::Protocol`; a handle keeps up to 256 undelivered events, discards
+`Error::UnexpectedSdkResult`; a handle keeps up to 256 undelivered events, discards
 the oldest beyond that and counts the discarded ones in
 `notification_dropped_count`. A discarded notification does not change the
 recording report. `AsyncFileOptions` and `create_with_options` change the queue
-sizes.
+sizes, each from 1 to 4096.
 
-`next_event(wait)` returns `Ok(None)` when `wait` runs out, even while the
+`next_event(timeout)` returns `Ok(None)` when `timeout` runs out, even while the
 object's thread is blocked in a command, because one timer thread shared by
 every async handle in the process keeps the deadlines; it starts with the first
 wait that needs it. If that thread cannot be started, the wait fails with
-`FileError::Io`, and the next wait tries again. A pending `next_event` fails
-with `FileError::InvalidState(StateError::Closed)` as soon as the object's
+`Error::Io`, and the next wait tries again. A pending `next_event` fails
+with `Error::InvalidState(StateError::Closed)` as soon as the object's
 thread stops taking events, without waiting for a recorder's drop wait. If the
 thread failed instead (it panicked, or could not be started), the wait fails
 with `StateError::OwnerFailed`.
 
 Await `finish` to learn whether the recording is complete, then await `close`;
 neither blocks the executor. `close` ends the object for every clone, and later
-calls on other clones fail with `FileError::InvalidState(StateError::Closed)`.
+calls on other clones fail with `Error::InvalidState(StateError::Closed)`.
 After the object's thread has failed, the command it was running, every queued
 and later command, every event wait and `close` fail with
 `StateError::OwnerFailed` instead, so a failure is never mistaken for a close.
@@ -395,18 +400,19 @@ does not block.
 
 ## Errors
 
-File operations return `FileResult<T>`, whose error is `FileError`. The enum
-is `#[non_exhaustive]`:
+File operations return `grafton_ndi::Result<T>`, whose error is the crate's
+`Error`, as every other operation does. These are the variants the File API
+reports:
 
 | Variant | Meaning |
 | --- | --- |
-| `Unavailable` | The File library, or the part of it an operation needs, cannot be used in this process. The text says why. |
-| `InvalidInput` | A value cannot be represented by the native API, for example a path that is empty, is not UTF-8 or contains a NUL. The text names what the value is, such as the file path of a player or probe, or a recording target. |
+| `RuntimeLoadFailed` | No usable File library was found (the text lists every location tried and why each failed), or the selected library lacks the playback or recording entry points an operation needs (the text names the first one missing). |
+| `RuntimeConflict` | The File library cannot accompany the selected runtime, or `FileRuntimeOptions::library_path` names a library other than the one already selected. |
+| `InvalidInput` | A value cannot be represented by the native API, for example a path that is empty, is not UTF-8 or contains a NUL, or options that are out of range or conflict, which are refused when the player, recorder or async handle is created. The text names what the value is, such as the file path of a player or probe, or a recording target. |
 | `InvalidState` | The operation is not permitted in the current state. The `StateError` it carries says which, for example `PreviousSessionOpen` for `start` during an open session, `ExactFileName` for `set_source` during a session with an exact file name, or `QueueFull`, `Closed` and `OwnerFailed` for an async handle whose command queue is full, that has been closed, or whose thread failed. `StateError::is_retryable` is true only for `QueueFull` and `WaiterPending`, which can succeed later without anything else changing. |
-| `Rejected` | The SDK refused an operation; the recorder's or player's events may say more. |
-| `Protocol` | The SDK returned something that violates the expected contract. |
-| `Core` | An operation of the core NDI API failed, or `FileApi::open` was given a relative library path or one that conflicts with the library already selected. |
-| `Io` | A filesystem operation failed. |
+| `NativeOperationFailed` | The SDK refused an operation, which `operation` names; the recorder's or player's events may say more. |
+| `UnexpectedSdkResult` | The SDK returned something that violates the expected contract. |
+| `Io` | A filesystem operation failed, or a thread for an async handle could not be started. |
 
 ## Running the tests
 

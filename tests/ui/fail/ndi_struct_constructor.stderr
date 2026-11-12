@@ -1,5 +1,5 @@
-error: cannot construct `NDI` with struct literal syntax due to private fields
+error: cannot construct `Ndi` with struct literal syntax due to private fields
  --> tests/ui/fail/ndi_struct_constructor.rs:4:10
   |
-4 |     drop(NDI {});
+4 |     drop(Ndi {});
   |          ^^^

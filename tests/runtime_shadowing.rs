@@ -10,7 +10,7 @@
 mod fixture;
 
 use fixture::{FakeRuntime, FixtureDir};
-use grafton_ndi::{capabilities::SdkEdition, runtime::RuntimeOptions, Error, NDI};
+use grafton_ndi::{capabilities::SdkEdition, runtime::RuntimeOptions, Error, Ndi};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -96,7 +96,7 @@ fn standard() -> RuntimeOptions {
 }
 
 fn load_failure() -> String {
-    match NDI::with_options(&standard()) {
+    match Ndi::with_options(&standard()) {
         Err(Error::RuntimeLoadFailed(reason)) => reason,
         Err(other) => panic!("expected a load failure, got {other}"),
         Ok(ndi) => panic!("expected a load failure, but loaded {:?}", ndi.info()),
@@ -132,7 +132,7 @@ fn child(name: &str, root: &Path) {
             assert!(reason.contains("pass an explicit library path"), "{reason}");
             // The usable library was never reached by name; naming its file
             // reaches it.
-            let ndi = NDI::with_options(&standard().library_path(usable.clone())).unwrap();
+            let ndi = Ndi::with_options(&standard().library_path(usable.clone())).unwrap();
             assert_eq!(ndi.info().library_path(), Some(usable.as_path()));
         }
         "loader_search_reports_the_file_it_resolved" => {
@@ -173,7 +173,7 @@ fn child(name: &str, root: &Path) {
                 )),
                 "{reason}"
             );
-            let ndi = NDI::with_options(&standard().library_path(usable.clone())).unwrap();
+            let ndi = Ndi::with_options(&standard().library_path(usable.clone())).unwrap();
             assert_eq!(ndi.info().library_path(), Some(usable.as_path()));
         }
         _ => panic!("unknown scenario {name}"),

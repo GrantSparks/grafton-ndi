@@ -15,7 +15,7 @@ use std::{io::Write, sync::Mutex};
 
 use super::{
     capabilities::{self, RuntimeFeature},
-    Error, NDI,
+    Error, Ndi,
 };
 
 /// A comma-separated list of what the environment provides; see [`Requirement`].
@@ -184,8 +184,8 @@ pub fn unique_name(label: &str) -> String {
 /// A test that needs the real SDK starts with
 /// `let Some(ndi) = ndi() else { return };`. Every failure other than a missing
 /// runtime library panics.
-pub fn ndi() -> Option<NDI> {
-    match NDI::new() {
+pub fn ndi() -> Option<Ndi> {
+    match Ndi::new() {
         Ok(ndi) => {
             assert_expected_identity(ndi.info());
             Some(ndi)
@@ -203,7 +203,7 @@ pub fn ndi() -> Option<NDI> {
 
 /// An initialized Advanced SDK runtime, or `None` when the selected runtime is
 /// not one or this build lacks the Advanced SDK declarations.
-pub fn advanced_ndi() -> Option<NDI> {
+pub fn advanced_ndi() -> Option<Ndi> {
     let ndi = ndi()?;
     match ndi.require_feature(RuntimeFeature::AdvancedSenderConfiguration) {
         Ok(()) => Some(ndi),

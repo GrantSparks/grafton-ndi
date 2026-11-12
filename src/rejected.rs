@@ -16,15 +16,15 @@ use crate::Error;
 /// ```no_run
 /// use grafton_ndi::{
 ///     discovery::{AdvertiserOptions, SendAdvertisement, SendAdvertiser},
-///     Sender, SenderOptions, NDI,
+///     Sender, SenderOptions, Ndi,
 /// };
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
-/// let ndi = NDI::new()?;
+/// let ndi = Ndi::new()?;
 /// let server = AdvertiserOptions::default().servers("127.0.0.1");
 /// let mut studio = SendAdvertiser::new(&ndi, &server)?;
 /// let mut backup = SendAdvertiser::new(&ndi, &server)?;
-/// let sender = Sender::new(&ndi, &SenderOptions::builder("Camera 1").build())?;
+/// let sender = Sender::new(&ndi, &SenderOptions::new("Camera 1"))?;
 /// let registration = studio.register(&sender, SendAdvertisement::default())?;
 ///
 /// // Only the advertiser that issued a registration can remove it. Another
@@ -37,12 +37,17 @@ use crate::Error;
 /// ```
 pub struct Rejected<T> {
     error: Error,
-    value: T,
+    // Boxed so that a failure stays as small as an `Error` whatever the value
+    // (an owned frame is hundreds of bytes); only a rejection allocates.
+    value: Box<T>,
 }
 
 impl<T> Rejected<T> {
     pub(crate) fn new(error: Error, value: T) -> Self {
-        Self { error, value }
+        Self {
+            error,
+            value: Box::new(value),
+        }
     }
 
     /// Why the operation failed.
@@ -52,7 +57,7 @@ impl<T> Rejected<T> {
 
     /// The value the operation did not consume.
     pub fn into_inner(self) -> T {
-        self.value
+        *self.value
     }
 
     /// The reason, discarding the value.
@@ -62,16 +67,13 @@ impl<T> Rejected<T> {
 
     /// The reason and the value.
     pub fn into_parts(self) -> (Error, T) {
-        (self.error, self.value)
+        (self.error, *self.value)
     }
 
     /// Replace the returned value, keeping the reason.
     #[cfg(feature = "advanced")]
     pub(crate) fn map<U>(self, value: impl FnOnce(T) -> U) -> Rejected<U> {
-        Rejected {
-            error: self.error,
-            value: value(self.value),
-        }
+        Rejected::new(self.error, value(*self.value))
     }
 }
 

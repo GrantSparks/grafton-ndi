@@ -89,12 +89,13 @@ checkout.
 | `src/frames.rs` | Owned and borrowed frames, layout/metadata validation, channel access, and image encoding |
 | `src/framesync.rs` | Clock-corrected pull capture and receiver ownership boundaries |
 | `src/sender.rs` | Synchronous sends, owned async video pipeline, copied submissions, and completion handlers |
-| `src/async_runtime.rs` | Tokio/smol blocking adapters, deadlines, task errors, and cancellation |
+| `src/asynchronous.rs` | Tokio/smol blocking adapters, deadlines, task errors, and cancellation |
 | `src/routing.rs`, `src/discovery/` | Routing sources, Discovery Server advertisers and listeners |
 | `src/advanced/` | Optional Advanced SDK configuration, packets, queues, allocators, synchronization and KVM |
 | `src/file/` | Optional File API recording and playback |
 | `src/rejected.rs`, `src/error.rs` | `Rejected<T>`, the error that hands a consumed value back, and the crate's `Error` |
-| `src/utilities.rs`, `src/video_conversion.rs`, `src/timestamp.rs` | Checked SDK audio/video conversions and SDK timestamps |
+| `src/audio_conversion.rs`, `src/video_conversion.rs` | Checked SDK audio/video conversions |
+| `src/media.rs`, `src/time.rs` | Shared media values (`FrameRate`, `FourCc`, `StreamTier`, `MediaTypes`) and time values (`Timecode`, `SdkTimestamp`) |
 | `src/sys/advanced.rs`, `src/sys/advanced_tables.rs` | The Advanced SDK's function tables, grouped into families, and the one place that depends on which families the installed headers declare |
 | `build.rs`, `build_support.rs`, `build_apple.rs`, `build_advanced.rs` | Advanced declarations for the `advanced` feature and the selection of the families they declare, static linking for Apple mobile targets |
 | `xtask/` | The generator for the checked-in bindings |
@@ -155,7 +156,7 @@ symbol up by name. Every native call goes through a table defined with the
 4. Call the function from a wrapper that obtained the table with
    `ndi.table::<sys::Routing>()?`. That accessor is the only way to reach an
    optional table, and it applies the capability's gate. `src/routing.rs`
-   shows the pattern. The wrapper keeps the `NDI` handle for as long as its
+   shows the pattern. The wrapper keeps the `Ndi` handle for as long as its
    native object exists.
 
 A test fails when a declared function is unclassified:
@@ -176,7 +177,10 @@ function the crate calls; the headers' own declarations, types and constants
 are generated into `OUT_DIR` on machines that have an Advanced SDK, are never
 checked in, and are what every signature is checked against when the crate is
 compiled. Each entry of the
-invocation is a family of functions that are used together. The build script
+invocation is a family of functions that are used together, and names, as an
+`optional_tables!` entry does, the `RuntimeFeature` it is gated and reported
+under; a new family needs its own variant in `src/capabilities.rs`, which
+`RuntimeFeature::is_advanced` counts as an Advanced capability. The build script
 reads the same file, through `build_advanced.rs`, and makes a family available
 only when the installed headers declare every one of its functions, so an older
 Advanced SDK that lacks a family still builds the same public API. Code that
@@ -230,8 +234,8 @@ without copying vendor source or documentation into the repository.
 
 The important project invariants are:
 
-- A live SDK resource keeps an `NDI` handle, which keeps the runtime
-  initialized. Normal `NDI` acquisition and destruction follow reference
+- A live SDK resource keeps an `Ndi` handle, which keeps the runtime
+  initialized. Normal `Ndi` acquisition and destruction follow reference
   counting. Keeping the library loaded is separate from keeping NDI
   initialized; permanent initialization requires the explicit
   `ProcessLifetimeRuntime` opt-in.
@@ -318,9 +322,9 @@ fn sender_reports_its_source() {
         return;
     };
     // The test body runs only where a runtime could be loaded.
-    let options = grafton_ndi::SenderOptions::builder("test sender").build();
+    let options = grafton_ndi::SenderOptions::new("test sender");
     let sender = grafton_ndi::Sender::new(&ndi, &options).unwrap();
-    assert!(!sender.source().unwrap().name.is_empty());
+    assert!(!sender.source().unwrap().name().is_empty());
 }
 ```
 

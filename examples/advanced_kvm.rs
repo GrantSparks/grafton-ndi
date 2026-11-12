@@ -14,7 +14,7 @@
 
 use std::{env, thread, time::Duration};
 
-use grafton_ndi::{advanced::MouseButton, Error, Receiver, ReceiverOptions, NDI};
+use grafton_ndi::{advanced::MouseButton, Error, Ndi, Receiver, ReceiverOptions};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -23,7 +23,7 @@ fn main() -> Result<(), Error> {
     let args: Vec<String> = env::args().collect();
     let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
 
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
     let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
     let Some(source) = finder
         .find_sources(Duration::from_secs(5))?
@@ -35,10 +35,7 @@ fn main() -> Result<(), Error> {
     };
     println!("Connecting to {source}");
 
-    let mut receiver = Receiver::new(
-        &ndi,
-        &ReceiverOptions::builder(source).name("KVM Example").build(),
-    )?;
+    let mut receiver = Receiver::new(&ndi, &ReceiverOptions::new(source).name("KVM Example"))?;
     // Give the connection a moment to report what the source supports.
     thread::sleep(Duration::from_secs(2));
 
@@ -50,13 +47,12 @@ fn main() -> Result<(), Error> {
 
     // Click once in the middle of the source's screen.
     session.move_pointer(0.5, 0.5)?;
-    session.mouse_down(MouseButton::Left);
-    session.mouse_up(MouseButton::Left);
+    session.mouse_down(MouseButton::Left)?;
+    session.mouse_up(MouseButton::Left)?;
 
-    if session.release_all() {
-        println!("Clicked, and nothing is left pressed");
-    } else {
-        println!("The source did not accept every release");
+    match session.release_all() {
+        Ok(()) => println!("Clicked, and nothing is left pressed"),
+        Err(error) => println!("Something may still be pressed: {error}"),
     }
     Ok(())
 }

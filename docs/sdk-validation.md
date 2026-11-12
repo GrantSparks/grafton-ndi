@@ -23,7 +23,7 @@ totals of every test binary and the doctests.
 | None | Standard 6.1.1 | all | `1` | 636 | 0 | 3 |
 | None | Standard 6.1.1 | none | `1` | 398 | 0 | 2 |
 | None | Standard 6.3.2 | all | `1` | 636 | 0 | 3 |
-| None | Standard 6.3.2 | default | `1` | 424 | 0 | 3 |
+| None | Standard 6.3.2 | `image-encoding` | `1` | 424 | 0 | 3 |
 | None | Standard 6.3.2 | none | `1` | 398 | 0 | 2 |
 | Advanced 6.3.2 | Advanced 6.3.2 | all | `advanced` | 639 | 0 | 3 |
 | None | Advanced 6.3.2 | none | `1` | 398 | 0 | 2 |
@@ -43,8 +43,8 @@ could not pass by skipping. In the first row the system's runtime was hidden
 and the tests that need a runtime reported skips. The other rows visibly skip
 the Advanced or File operations that their build and runtime cannot provide;
 the requirements make sure that the operations a row promises were not
-skipped. The ignored tests are two manual benchmarks and, with all or default
-features, one slow stress test.
+skipped. The ignored tests are a manual benchmark, a slow stress test and,
+with all features or `image-encoding`, a second manual benchmark.
 
 `tests/receiver_video_only.rs` used to send without a clock, so it sent video
 and audio as fast as its loop turned: about 17,000 frames of each a second,
@@ -96,7 +96,8 @@ The runtimes report their versions as `6.1.1` (for 6.1.1), `6.3.2.0` and
 | `ReceiveDelay`, `SdkTimestamp` | `SymbolUnavailable` | `SymbolUnavailable` | `SymbolUnavailable` | Available | Available |
 | `ConnectedSourceName` | `SymbolUnavailable` | Available | Available | Available | Available |
 | `SenderAdvertising`, `ReceiverAdvertising`, `SenderDiscovery`, `ReceiverDiscovery` | `SymbolUnavailable` | `RuntimeTooOld` | `RuntimeTooOld` | Available | Available |
-| `AdvancedSenderConfiguration`, `AdvancedReceiverConfiguration` | `WrongEdition` | `WrongEdition` | Available | `WrongEdition` | Available |
+| `AdvancedSenderAdvertiserConfiguration`, `AdvancedReceiverAdvertiserConfiguration`, `AdvancedSenderListenerConfiguration`, `AdvancedReceiverListenerConfiguration` | `WrongEdition` | `WrongEdition` | `RuntimeTooOld` | `WrongEdition` | Available |
+| Every other Advanced capability, including `Passthrough` with each of the 15 presets | `WrongEdition` | `WrongEdition` | Available | `WrongEdition` | Available |
 | The other seven capabilities | Available | Available | Available | Available | Available |
 | `FileApi::open` | Refused: Standard runtime | Refused: Standard runtime | No File library | Refused: Standard runtime | Available |
 

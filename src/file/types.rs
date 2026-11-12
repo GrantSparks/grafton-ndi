@@ -3,53 +3,21 @@
 use std::{
     borrow::Cow,
     ffi::{c_char, CString},
-    ops::BitOr,
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use crate::sys::bindings::*;
-
-/// Errors from File API configuration, loading or native operations.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum FileError {
-    /// The File library, or the part of it an operation needs, cannot be used
-    /// in this process. The text says why: no library was found (with every
-    /// location tried), the selected NDI runtime is not one the File library
-    /// can accompany, or the library lacks an entry point.
-    #[error("File API unavailable: {0}")]
-    Unavailable(String),
-    /// A value cannot be represented by the native API.
-    #[error("Invalid File API input: {0}")]
-    InvalidInput(String),
-    /// The operation is not permitted in the current state; the
-    /// [`StateError`] says which state forbids it.
-    #[error("Invalid File API state: {0}")]
-    InvalidState(StateError),
-    /// A native boolean operation was rejected; events may carry more detail.
-    #[error("The File SDK rejected {0}")]
-    Rejected(&'static str),
-    /// A native result violates the expected representation/contract.
-    #[error("Invalid File SDK result: {0}")]
-    Protocol(String),
-    /// A core NDI operation failed.
-    #[error(transparent)]
-    Core(#[from] crate::Error),
-    /// Local path resolution or another filesystem operation failed.
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-}
-
-/// Result type for File API operations.
-pub type FileResult<T> = std::result::Result<T, FileError>;
+use crate::{
+    sys::{self, bindings::*},
+    Error, FourCc, FrameRate, MediaTypes, Result, ScanType, StreamTier, Timecode,
+};
 
 /// Why an operation is not permitted in the current state, carried by
-/// [`FileError::InvalidState`].
+/// [`Error::InvalidState`].
 ///
 /// Its `Display` text describes the state for diagnostics; match on the
 /// variant rather than the text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum StateError {
     /// A session is recording or stopping, so another cannot start. Finish
@@ -119,19 +87,18 @@ impl std::fmt::Display for StateError {
     }
 }
 
-fn cstring(value: &str, what: &str, allow_empty: bool) -> FileResult<CString> {
+fn cstring(value: &str, what: &str, allow_empty: bool) -> Result<CString> {
     if !allow_empty && value.is_empty() {
-        return Err(FileError::InvalidInput(format!("{what} must not be empty")));
+        return Err(Error::InvalidInput(format!("{what} must not be empty")));
     }
-    CString::new(value)
-        .map_err(|_| FileError::InvalidInput(format!("{what} contains an embedded NUL")))
+    CString::new(value).map_err(|_| Error::InvalidInput(format!("{what} contains an embedded NUL")))
 }
 
 /// An owned source name or direct URL used by a recorder.
 ///
 /// Name and URL constructors are separate because the SDK gives a nonempty name
 /// precedence over a URL. No discovery occurs while constructing this value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SourceSpec {
     pub(super) name: Option<CString>,
     pub(super) url: Option<CString>,
@@ -142,8 +109,8 @@ impl SourceSpec {
     ///
     /// # Errors
     ///
-    /// [`FileError::InvalidInput`] when the name is empty or contains a NUL.
-    pub fn new(name: impl AsRef<str>) -> FileResult<Self> {
+    /// [`Error::InvalidInput`] when the name is empty or contains a NUL.
+    pub fn new(name: impl AsRef<str>) -> Result<Self> {
         Ok(Self {
             name: Some(cstring(name.as_ref(), "source name", false)?),
             url: None,
@@ -155,8 +122,8 @@ impl SourceSpec {
     ///
     /// # Errors
     ///
-    /// [`FileError::InvalidInput`] when the address is empty or contains a NUL.
-    pub fn from_url(url: impl AsRef<str>) -> FileResult<Self> {
+    /// [`Error::InvalidInput`] when the address is empty or contains a NUL.
+    pub fn from_url(url: impl AsRef<str>) -> Result<Self> {
         Ok(Self {
             name: None,
             url: Some(cstring(url.as_ref(), "source URL", false)?),
@@ -179,17 +146,17 @@ impl SourceSpec {
 }
 
 impl TryFrom<&crate::Source> for SourceSpec {
-    type Error = FileError;
+    type Error = Error;
 
-    fn try_from(source: &crate::Source) -> FileResult<Self> {
-        if !source.name.is_empty() {
-            Self::new(&source.name)
+    fn try_from(source: &crate::Source) -> Result<Self> {
+        if !source.name().is_empty() {
+            Self::new(source.name())
         } else {
-            match &source.address {
-                crate::SourceAddress::Ip(address) | crate::SourceAddress::Url(address) => {
+            match source.address() {
+                Some(crate::SourceAddress::Ip(address) | crate::SourceAddress::Url(address)) => {
                     Self::from_url(address)
                 }
-                crate::SourceAddress::None => Err(FileError::InvalidInput(
+                None => Err(Error::InvalidInput(
                     "source has neither a name nor an address".into(),
                 )),
             }
@@ -197,138 +164,157 @@ impl TryFrom<&crate::Source> for SourceSpec {
     }
 }
 
-/// Private-field player configuration. Creating this value advertises nothing.
+/// How a player advertises its NDI source. Creating this value advertises
+/// nothing.
+///
+/// The options are checked when a player is created from them, by
+/// [`FileApi::create_player`](super::FileApi::create_player) or
+/// [`AsyncFilePlayer::create`](super::AsyncFilePlayer::create): the name must
+/// not be empty, and neither the name nor the groups may contain a NUL.
 #[derive(Debug, Clone)]
 pub struct PlayerOptions {
+    pub(super) name: String,
+    groups: Option<String>,
+}
+
+impl PlayerOptions {
+    /// A player that advertises its source as `name`, in the groups of the
+    /// NDI configuration.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            groups: None,
+        }
+    }
+
+    /// Set the comma-separated NDI groups the player's source is advertised
+    /// in, instead of those of the NDI configuration.
+    #[must_use]
+    pub fn groups(mut self, groups: impl Into<String>) -> Self {
+        self.groups = Some(groups.into());
+        self
+    }
+
+    /// Check the options and convert their strings for the SDK.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] when the name is empty, or the name or the
+    /// groups contain a NUL.
+    pub(super) fn resolve(&self) -> Result<ResolvedPlayerOptions> {
+        Ok(ResolvedPlayerOptions {
+            name: cstring(&self.name, "player name", false)?,
+            groups: self
+                .groups
+                .as_deref()
+                .map(|groups| cstring(groups, "player groups", true))
+                .transpose()?,
+        })
+    }
+}
+
+/// A player's options, checked and converted for the SDK.
+#[derive(Debug)]
+pub(super) struct ResolvedPlayerOptions {
     pub(super) name: CString,
     pub(super) groups: Option<CString>,
 }
 
-impl PlayerOptions {
-    /// Choose the name of the NDI source the player advertises.
-    ///
-    /// # Errors
-    ///
-    /// [`FileError::InvalidInput`] when the name is empty or contains a NUL.
-    pub fn new(name: impl AsRef<str>) -> FileResult<Self> {
-        Ok(Self {
-            name: cstring(name.as_ref(), "player name", false)?,
-            groups: None,
-        })
-    }
-
-    /// Set the comma-separated NDI groups the player's source is advertised in.
-    ///
-    /// # Errors
-    ///
-    /// [`FileError::InvalidInput`] when the text contains a NUL.
-    pub fn with_groups(mut self, groups: impl AsRef<str>) -> FileResult<Self> {
-        self.groups = Some(cstring(groups.as_ref(), "player groups", true)?);
-        Ok(self)
-    }
-
-    /// The configured name.
-    pub fn name(&self) -> &str {
-        self.name.to_str().expect("validated UTF-8")
-    }
-
-    /// The configured group string, if supplied.
-    pub fn groups(&self) -> Option<&str> {
-        self.groups
-            .as_ref()
-            .map(|s| s.to_str().expect("validated UTF-8"))
-    }
-}
-
-/// A nonempty selection of recording tracks.
+/// How a recorder names the files of a session from its [`RecordingTarget`].
 ///
-/// Unlike the C API, an empty bitmask is rejected rather than meaning all tracks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TrackSelection(u32);
-
-impl TrackSelection {
-    /// Record video.
-    pub const VIDEO: Self =
-        Self(NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_video);
-    /// Record audio.
-    pub const AUDIO: Self =
-        Self(NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_audio);
-    /// Record metadata.
-    pub const METADATA: Self =
-        Self(NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_metadata);
-    /// Record all three track types.
-    pub const ALL: Self =
-        Self(NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_all);
-
-    /// A selection from the SDK's track flags.
+/// Whatever the naming, nothing is ever overwritten or removed, and the
+/// directory the name leads to must exist.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum FileNaming {
+    /// Name each file exactly as its [`RecordingTarget`] says, with no index.
     ///
-    /// # Errors
+    /// [`FileRecorder::start`] and [`FileRecorder::rollover`] refuse a target
+    /// that already exists with an [`Error::Io`] of kind
+    /// [`AlreadyExists`](std::io::ErrorKind::AlreadyExists), before the SDK is
+    /// called.
     ///
-    /// [`FileError::InvalidInput`] when no flag is set or an unknown one is.
-    pub fn from_bits(bits: u32) -> FileResult<Self> {
-        if bits == 0 || bits & !Self::ALL.0 != 0 {
-            Err(FileError::InvalidInput(
-                "track selection must contain one or more known track flags".into(),
-            ))
-        } else {
-            Ok(Self(bits))
-        }
-    }
-
-    /// Native selection bits.
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
-}
-
-impl Default for TrackSelection {
-    fn default() -> Self {
-        Self::ALL
-    }
-}
-
-impl BitOr for TrackSelection {
-    type Output = Self;
-
-    fn bitor(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
+    /// One target names one file, so a session cannot move to a new file by
+    /// itself:
+    ///
+    /// * a format change of the source closes the file and ends the session,
+    ///   which [`RecordingReport::stopped_by_sdk`] then reports; see
+    ///   [`RecorderOptions::format_change_rollover`];
+    /// * format-change rollover switched on, or a nonzero
+    ///   [`RecorderOptions::rollover_size`], is refused with
+    ///   [`Error::InvalidInput`] when the recorder is created;
+    /// * [`FileRecorder::set_source`] is refused during a session with
+    ///   [`StateError::ExactFileName`].
+    ///
+    /// [`FileRecorder::rollover`] to a new target still works. Use
+    /// [`Indexed`](Self::Indexed), or a [`Pattern`](Self::Pattern) with
+    /// `{index}`, for recordings that must survive these changes.
+    ///
+    /// [`FileRecorder::start`]: super::FileRecorder::start
+    /// [`FileRecorder::rollover`]: super::FileRecorder::rollover
+    /// [`FileRecorder::set_source`]: super::FileRecorder::set_source
+    /// [`RecordingReport::stopped_by_sdk`]: super::RecordingReport::stopped_by_sdk
+    Exact,
+    /// The SDK's indexed `{prefix}_{index:03}.mkv`: the target `take` becomes
+    /// `take_001.mkv`, and each new file of the session takes the lowest
+    /// unused index.
+    #[default]
+    Indexed,
+    /// A filename pattern using `{prefix}`, `{index}` and `{index:N}` tokens.
+    ///
+    /// `{prefix}` is replaced by the [`RecordingTarget`], and `{index:N}` pads
+    /// the index with zeros to `N` digits, from 1 through 1024. The pattern
+    /// may name a directory, for example `{prefix}/{index:03}.mkv`; that
+    /// directory must exist.
+    ///
+    /// A pattern without `{index}` or `{index:N}` names its file exactly,
+    /// with every rule of [`Exact`](Self::Exact).
+    ///
+    /// A pattern that is empty, has an unknown token or unbalanced braces, or
+    /// contains a NUL is refused with [`Error::InvalidInput`] when the
+    /// recorder is created.
+    Pattern(String),
 }
 
 /// Recorder configuration fixed when its native instance is created.
 ///
-/// The options are checked against each other when a recorder is created, so
-/// the order of the builder calls does not matter.
+/// Nothing is checked until a recorder is created from the options, by
+/// [`FileApi::create_recorder`](super::FileApi::create_recorder),
+/// [`FileRecorder::reset`](super::FileRecorder::reset) or
+/// [`AsyncFileRecorder::create`](super::AsyncFileRecorder::create). The
+/// options are then checked against each other, so the order of the setter
+/// calls does not matter.
 #[derive(Debug, Clone)]
 pub struct RecorderOptions {
     pub(super) source: SourceSpec,
-    pub(super) tracks: TrackSelection,
+    pub(super) tracks: MediaTypes,
     pub(super) planar_audio: bool,
     /// `None` until set: on for indexed file names, off for exact ones.
-    pub(super) format_change_rollover: Option<bool>,
-    pub(super) pattern: Option<CString>,
-    pub(super) disable_proxy: bool,
-    pub(super) rollover_bytes: u64,
+    format_change_rollover: Option<bool>,
+    naming: FileNaming,
+    pub(super) proxy: bool,
+    pub(super) rollover_size: u64,
     pub(super) drop_wait: Duration,
 }
 
 impl RecorderOptions {
-    /// Record all tracks, including a proxy when available, using indexed names.
+    /// Record every track of `source`, including its proxy when it has one,
+    /// in [`FileNaming::Indexed`] files.
     pub fn new(source: SourceSpec) -> Self {
         Self {
             source,
-            tracks: TrackSelection::ALL,
+            tracks: MediaTypes::ALL,
             planar_audio: false,
             format_change_rollover: None,
-            pattern: None,
-            disable_proxy: false,
-            rollover_bytes: 0,
+            naming: FileNaming::Indexed,
+            proxy: true,
+            rollover_size: 0,
             drop_wait: Self::DEFAULT_DROP_WAIT,
         }
     }
 
     /// How long dropping a recorder waits for its open file to be finalized,
-    /// unless [`with_drop_wait`](Self::with_drop_wait) says otherwise.
+    /// unless [`drop_wait`](Self::drop_wait) says otherwise.
     pub const DEFAULT_DROP_WAIT: Duration = Duration::from_secs(5);
 
     /// Set how long dropping the recorder waits for an unfinished session.
@@ -341,17 +327,22 @@ impl RecorderOptions {
     /// SDK does not report closure. `Duration::ZERO` destroys at once, like
     /// [`FileRecorder::abandon`](super::FileRecorder::abandon).
     ///
-    /// # Errors
-    ///
-    /// [`FileError::InvalidInput`] when `wait` exceeds [`crate::MAX_TIMEOUT`].
-    pub fn with_drop_wait(mut self, wait: Duration) -> FileResult<Self> {
-        super::timeout_ms(wait)?;
+    /// A wait longer than [`crate::MAX_TIMEOUT`] is refused with
+    /// [`Error::InvalidInput`] when the recorder is created.
+    #[must_use]
+    pub fn drop_wait(mut self, wait: Duration) -> Self {
         self.drop_wait = wait;
-        Ok(self)
+        self
     }
 
-    /// Select which track types to record.
-    pub fn with_tracks(mut self, tracks: TrackSelection) -> Self {
+    /// Select which track types to record: all three unless this says
+    /// otherwise.
+    ///
+    /// An empty selection is refused with [`Error::InvalidInput`] when the
+    /// recorder is created, rather than meaning all tracks as it does to the
+    /// SDK.
+    #[must_use]
+    pub fn tracks(mut self, tracks: MediaTypes) -> Self {
         self.tracks = tracks;
         self
     }
@@ -359,7 +350,8 @@ impl RecorderOptions {
     /// Store uncompressed float audio as native planar data when true.
     ///
     /// The default interleaved layout is more widely playable by third parties.
-    pub fn with_planar_audio(mut self, planar: bool) -> Self {
+    #[must_use]
+    pub fn planar_audio(mut self, planar: bool) -> Self {
         self.planar_audio = planar;
         self
     }
@@ -374,131 +366,86 @@ impl RecorderOptions {
     /// this way is reported by [`RecordingReport::stopped_by_sdk`].
     ///
     /// `true` cannot be combined with an exact file name
-    /// ([`exact_filename`](Self::exact_filename), or a pattern without
+    /// ([`FileNaming::Exact`], or a [`FileNaming::Pattern`] without
     /// `{index}`): creating the recorder then fails with
-    /// [`FileError::InvalidInput`].
+    /// [`Error::InvalidInput`].
     ///
     /// [`RecordingReport::stopped_by_sdk`]: super::RecordingReport::stopped_by_sdk
-    pub fn with_format_change_rollover(mut self, enabled: bool) -> Self {
+    #[must_use]
+    pub fn format_change_rollover(mut self, enabled: bool) -> Self {
         self.format_change_rollover = Some(enabled);
         self
     }
 
     /// Whether to record the source's proxy alongside its full-quality video.
-    pub fn with_proxy(mut self, enabled: bool) -> Self {
-        self.disable_proxy = !enabled;
+    #[must_use]
+    pub fn proxy(mut self, enabled: bool) -> Self {
+        self.proxy = enabled;
         self
     }
 
-    /// Set a soft size threshold for keyframe-aligned rollover; zero disables it.
+    /// Set a soft size threshold, in bytes, for keyframe-aligned rollover;
+    /// zero disables it.
     ///
     /// A nonzero size cannot be combined with an exact file name
-    /// ([`exact_filename`](Self::exact_filename), or a pattern without
+    /// ([`FileNaming::Exact`], or a [`FileNaming::Pattern`] without
     /// `{index}`), because the next file would have the same name: creating
-    /// the recorder then fails with [`FileError::InvalidInput`].
-    pub fn with_rollover_size(mut self, bytes: u64) -> Self {
-        self.rollover_bytes = bytes;
+    /// the recorder then fails with [`Error::InvalidInput`].
+    #[must_use]
+    pub fn rollover_size(mut self, bytes: u64) -> Self {
+        self.rollover_size = bytes;
         self
     }
 
-    /// Name each recording file exactly as its [`RecordingTarget`] says, with
-    /// no index.
-    ///
-    /// Nothing is ever overwritten: [`FileRecorder::start`] and
-    /// [`FileRecorder::rollover`] refuse a target that already exists with a
-    /// [`FileError::Io`] of kind [`AlreadyExists`](std::io::ErrorKind::AlreadyExists),
-    /// before the SDK is called.
-    ///
-    /// One target names one file, so a session cannot move to a new file by
-    /// itself:
-    ///
-    /// * a format change of the source closes the file and ends the session,
-    ///   which [`RecordingReport::stopped_by_sdk`] then reports; see
-    ///   [`with_format_change_rollover`](Self::with_format_change_rollover);
-    /// * format-change rollover switched on, or a nonzero
-    ///   [`with_rollover_size`](Self::with_rollover_size), is refused with
-    ///   [`FileError::InvalidInput`] when the recorder is created;
-    /// * [`FileRecorder::set_source`] is refused during a session with
-    ///   [`StateError::ExactFileName`].
-    ///
-    /// [`FileRecorder::rollover`] to a new target still works. Use
-    /// [`with_pattern`](Self::with_pattern) with `{index}` for recordings that
-    /// must survive these changes.
-    ///
-    /// [`FileRecorder::start`]: super::FileRecorder::start
-    /// [`FileRecorder::rollover`]: super::FileRecorder::rollover
-    /// [`FileRecorder::set_source`]: super::FileRecorder::set_source
-    /// [`RecordingReport::stopped_by_sdk`]: super::RecordingReport::stopped_by_sdk
-    pub fn exact_filename(mut self) -> Self {
-        self.pattern = Some(CString::new("{prefix}").expect("literal has no NUL"));
+    /// Set how the recorder names its files: [`FileNaming::Indexed`] unless
+    /// this says otherwise.
+    #[must_use]
+    pub fn naming(mut self, naming: FileNaming) -> Self {
+        self.naming = naming;
         self
     }
 
-    /// Restore the SDK's indexed `{prefix}_{index:03}.mkv` naming policy.
-    pub fn indexed_filenames(mut self) -> Self {
-        self.pattern = None;
-        self
-    }
-
-    /// Set a filename pattern using `{prefix}`, `{index}` and `{index:N}` tokens.
+    /// Check the options and settle what they leave open.
     ///
-    /// `{prefix}` is replaced by the [`RecordingTarget`], and `{index:N}` pads
-    /// the index with zeros to `N` digits, from 1 through 1024. The pattern
-    /// may name a directory, for example `{prefix}/{index:03}.mkv`; that
-    /// directory must exist.
-    ///
-    /// A pattern without `{index}` or `{index:N}` names its file exactly,
-    /// with every rule of [`exact_filename`](Self::exact_filename).
+    /// Done when a recorder is created rather than in the setters, so that
+    /// the order of those calls does not matter.
     ///
     /// # Errors
     ///
-    /// [`FileError::InvalidInput`] when the pattern is empty, has an unknown
-    /// token or unbalanced braces, or contains a NUL.
-    pub fn with_pattern(mut self, pattern: impl AsRef<str>) -> FileResult<Self> {
-        validate_pattern(pattern.as_ref())?;
-        self.pattern = Some(cstring(pattern.as_ref(), "filename pattern", false)?);
-        Ok(self)
-    }
-
-    /// The configured initial source.
-    pub fn source(&self) -> &SourceSpec {
-        &self.source
-    }
-
-    /// The configured track selection.
-    pub fn tracks(&self) -> TrackSelection {
-        self.tracks
-    }
-
-    /// The configured filename pattern, or None for the SDK indexed default.
-    pub fn filename_pattern(&self) -> Option<&str> {
-        self.pattern
-            .as_ref()
-            .map(|s| s.to_str().expect("validated UTF-8"))
-    }
-
-    /// How long dropping the recorder waits for an unfinished session.
-    pub fn drop_wait(&self) -> Duration {
-        self.drop_wait
-    }
-
-    /// Check the options against each other and settle what they leave open.
-    ///
-    /// Done when a recorder is created rather than in the builder methods,
-    /// so that the order of those calls does not matter.
-    pub(super) fn resolve(&self) -> FileResult<ResolvedOptions> {
-        let naming = FileNaming::new(self.filename_pattern())?;
+    /// [`Error::InvalidInput`] when the drop wait exceeds
+    /// [`crate::MAX_TIMEOUT`], the track selection is empty, the filename
+    /// pattern is malformed, or an exact file name is combined with a
+    /// rollover.
+    pub(super) fn resolve(&self) -> Result<ResolvedRecorderOptions> {
+        crate::to_ms_checked(self.drop_wait)?;
+        if self.tracks.is_empty() {
+            return Err(Error::InvalidInput(
+                "a recorder must record video, audio or metadata; an empty track selection \
+                 would record all three"
+                    .into(),
+            ));
+        }
+        // The SDK is given no pattern for its own indexed default.
+        let (pattern, given) = match &self.naming {
+            FileNaming::Exact => (EXACT_PATTERN, true),
+            FileNaming::Indexed => (DEFAULT_PATTERN, false),
+            FileNaming::Pattern(pattern) => (pattern.as_str(), true),
+        };
+        let naming = NamePattern::new(pattern)?;
+        let pattern = given
+            .then(|| cstring(pattern, "filename pattern", false))
+            .transpose()?;
         if naming.is_exact() {
             if self.format_change_rollover == Some(true) {
-                return Err(FileError::InvalidInput(
+                return Err(Error::InvalidInput(
                     "a recorder with an exact file name cannot roll over at a format change, \
                      because the next file would have the same name; use a filename pattern \
                      with {index}, or leave format-change rollover unset"
                         .into(),
                 ));
             }
-            if self.rollover_bytes > 0 {
-                return Err(FileError::InvalidInput(
+            if self.rollover_size > 0 {
+                return Err(Error::InvalidInput(
                     "a recorder with an exact file name cannot roll over at a size limit, \
                      because the next file would have the same name; use a filename pattern \
                      with {index}"
@@ -506,22 +453,29 @@ impl RecorderOptions {
                 ));
             }
         }
-        Ok(ResolvedOptions {
+        Ok(ResolvedRecorderOptions {
             format_change_rollover: self.format_change_rollover.unwrap_or(!naming.is_exact()),
             naming,
+            pattern,
         })
     }
 }
 
 /// What a recorder's options settle once they are checked against each other.
-pub(super) struct ResolvedOptions {
-    pub(super) naming: FileNaming,
+#[derive(Debug)]
+pub(super) struct ResolvedRecorderOptions {
+    pub(super) naming: NamePattern,
+    /// The pattern the SDK is given, or `None` for its own indexed default.
+    pub(super) pattern: Option<CString>,
     /// Whether a format change rolls over to a new file.
     pub(super) format_change_rollover: bool,
 }
 
 /// The SDK's filename pattern when none is set.
 const DEFAULT_PATTERN: &str = "{prefix}_{index:03}.mkv";
+
+/// The pattern that names each file exactly as its target says.
+const EXACT_PATTERN: &str = "{prefix}";
 
 /// One part of a filename pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -533,8 +487,8 @@ enum PatternPart<'a> {
 }
 
 /// The literal text and tokens of a filename pattern, in order.
-fn pattern_parts(pattern: &str) -> FileResult<Vec<PatternPart<'_>>> {
-    let unmatched = || FileError::InvalidInput("unmatched filename-pattern brace".into());
+fn pattern_parts(pattern: &str) -> Result<Vec<PatternPart<'_>>> {
+    let unmatched = || Error::InvalidInput("unmatched filename-pattern brace".into());
     let mut parts = Vec::new();
     let mut rest = pattern;
     while let Some(start) = rest.find(['{', '}']) {
@@ -559,7 +513,7 @@ fn pattern_parts(pattern: &str) -> FileResult<Vec<PatternPart<'_>>> {
             _ => match token.strip_prefix("index:").and_then(width) {
                 Some(width) => PatternPart::Index(usize::from(width)),
                 None => {
-                    return Err(FileError::InvalidInput(format!(
+                    return Err(Error::InvalidInput(format!(
                         "unsupported filename-pattern token {{{token}}}"
                     )))
                 }
@@ -573,22 +527,18 @@ fn pattern_parts(pattern: &str) -> FileResult<Vec<PatternPart<'_>>> {
     Ok(parts)
 }
 
-fn validate_pattern(pattern: &str) -> FileResult<()> {
-    pattern_parts(pattern).map(drop)
-}
-
-/// How a recorder names its files.
+/// The filename pattern a recorder names its files with.
 #[derive(Debug, Clone)]
-pub(super) struct FileNaming {
+pub(super) struct NamePattern {
     pattern: String,
     /// The pattern has no index, so each target names exactly one file.
     exact: bool,
 }
 
-impl FileNaming {
-    /// The naming of `pattern`, or of the SDK's default when there is none.
-    pub(super) fn new(pattern: Option<&str>) -> FileResult<Self> {
-        let pattern = pattern.unwrap_or(DEFAULT_PATTERN);
+impl NamePattern {
+    /// Parse `pattern`, failing with [`Error::InvalidInput`] when it is
+    /// malformed.
+    fn new(pattern: &str) -> Result<Self> {
         let exact = !pattern_parts(pattern)?
             .iter()
             .any(|part| matches!(part, PatternPart::Index(_)));
@@ -608,7 +558,7 @@ impl FileNaming {
     ///
     /// A pattern that leaves the path relative is resolved, as the SDK
     /// resolves it, against the current directory.
-    pub(super) fn first_file(&self, target: &RecordingTarget) -> FileResult<PathBuf> {
+    pub(super) fn first_file(&self, target: &RecordingTarget) -> Result<PathBuf> {
         let prefix = target.prefix.to_str().expect("validated UTF-8");
         let mut name = String::new();
         for part in pattern_parts(&self.pattern)? {
@@ -626,18 +576,18 @@ impl FileNaming {
         })
     }
 
-    /// Confirm that the SDK can create the file this naming gives `target`:
+    /// Confirm that the SDK can create the file this pattern gives `target`:
     /// that its directory exists and can be written to, and, for an exact
     /// name, that the file does not exist yet.
     ///
     /// The SDK accepts a rollover to a file it cannot create and then ends
     /// the whole session, so the mistake is caught here, while the session
     /// can still go on. Nothing is created.
-    pub(super) fn check(&self, target: &RecordingTarget) -> FileResult<()> {
+    pub(super) fn check(&self, target: &RecordingTarget) -> Result<()> {
         let file = self.first_file(target)?;
         check_directory(file.parent().unwrap_or(&file))?;
         if self.exact && std::fs::symlink_metadata(&file).is_ok() {
-            return Err(FileError::Io(std::io::Error::new(
+            return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 format!(
                     "the recording file {} already exists, and an exact file name never \
@@ -651,9 +601,9 @@ impl FileNaming {
 }
 
 /// Confirm that `directory` exists and can be written to.
-fn check_directory(directory: &Path) -> FileResult<()> {
+fn check_directory(directory: &Path) -> Result<()> {
     let refuse = |kind, problem: &str| {
-        FileError::Io(std::io::Error::new(
+        Error::Io(std::io::Error::new(
             kind,
             format!("the recording directory {} {problem}", directory.display()),
         ))
@@ -671,9 +621,8 @@ fn check_directory(directory: &Path) -> FileResult<()> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        let path = CString::new(directory.as_os_str().as_bytes()).map_err(|_| {
-            FileError::InvalidInput("the recording directory contains a NUL".into())
-        })?;
+        let path = CString::new(directory.as_os_str().as_bytes())
+            .map_err(|_| Error::InvalidInput("the recording directory contains a NUL".into()))?;
         // SAFETY: `path` is a NUL-terminated string that outlives the call.
         if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
             return Err(refuse(
@@ -690,7 +639,7 @@ fn check_directory(directory: &Path) -> FileResult<()> {
 /// Construction freezes the current directory for relative paths. It neither
 /// creates directories nor creates/removes/overwrites a file. The SDK requires
 /// losslessly representable UTF-8 paths.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RecordingTarget {
     pub(super) prefix: CString,
     path: PathBuf,
@@ -701,10 +650,10 @@ impl RecordingTarget {
     ///
     /// # Errors
     ///
-    /// [`FileError::InvalidInput`] when the path is empty, is not UTF-8 or
-    /// contains a NUL, and [`FileError::Io`] when a relative path cannot be
+    /// [`Error::InvalidInput`] when the path is empty, is not UTF-8 or
+    /// contains a NUL, and [`Error::Io`] when a relative path cannot be
     /// resolved because the current directory is unavailable.
-    pub fn new(path: impl AsRef<Path>) -> FileResult<Self> {
+    pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let (path, prefix) = resolve_path(path.as_ref(), "recording target")?;
         Ok(Self { prefix, path })
     }
@@ -721,12 +670,12 @@ impl RecordingTarget {
 ///
 /// # Errors
 ///
-/// [`FileError::InvalidInput`] when the path is empty, is not UTF-8 or
-/// contains a NUL, and [`FileError::Io`] when a relative path cannot be
+/// [`Error::InvalidInput`] when the path is empty, is not UTF-8 or
+/// contains a NUL, and [`Error::Io`] when a relative path cannot be
 /// resolved because the current directory is unavailable.
-pub(super) fn resolve_path(path: &Path, what: &str) -> FileResult<(PathBuf, CString)> {
+pub(super) fn resolve_path(path: &Path, what: &str) -> Result<(PathBuf, CString)> {
     if path.as_os_str().is_empty() {
-        return Err(FileError::InvalidInput(format!("{what} must not be empty")));
+        return Err(Error::InvalidInput(format!("{what} must not be empty")));
     }
     let absolute = if path.is_absolute() {
         path.to_owned()
@@ -735,18 +684,18 @@ pub(super) fn resolve_path(path: &Path, what: &str) -> FileResult<(PathBuf, CStr
     };
     let text = absolute
         .to_str()
-        .ok_or_else(|| FileError::InvalidInput(format!("{what} is not lossless UTF-8")))?;
+        .ok_or_else(|| Error::InvalidInput(format!("{what} is not lossless UTF-8")))?;
     let text = cstring(text, what, false)?;
     Ok((absolute, text))
 }
 
 /// A path to play or probe, as the SDK takes it.
-pub(super) fn path_string(path: &Path) -> FileResult<CString> {
+pub(super) fn path_string(path: &Path) -> Result<CString> {
     Ok(resolve_path(path, "file path")?.1)
 }
 
 /// Original SDK event bytes, retaining invalid UTF-8 and truncation evidence.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EventText {
     bytes: Vec<u8>,
     terminated: bool,
@@ -800,24 +749,9 @@ impl EventText {
     }
 }
 
-/// A raw codec/pixel identifier in a file's track description.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct FourCc(pub(super) u32);
-
-impl FourCc {
-    /// Preserve a raw SDK FourCC, including unknown future values.
-    pub const fn from_raw(value: u32) -> Self {
-        Self(value)
-    }
-
-    /// The unchanged SDK identifier.
-    pub const fn raw(self) -> u32 {
-        self.0
-    }
-}
-
-/// Unsigned file-relative time in 100ns units, distinct from editorial timecode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+/// Unsigned file-relative time in 100ns units, distinct from the editorial
+/// [`Timecode`] that frames carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct FilePosition(pub(super) u64);
 
 impl FilePosition {
@@ -831,12 +765,12 @@ impl FilePosition {
     ///
     /// # Errors
     ///
-    /// [`FileError::InvalidInput`] when the duration exceeds 64 bits of ticks.
-    pub fn from_duration(duration: Duration) -> FileResult<Self> {
+    /// [`Error::InvalidInput`] when the duration exceeds 64 bits of ticks.
+    pub fn from_duration(duration: Duration) -> Result<Self> {
         let ticks = duration.as_nanos() / 100;
         u64::try_from(ticks)
             .map(Self)
-            .map_err(|_| FileError::InvalidInput("file position exceeds 64-bit ticks".into()))
+            .map_err(|_| Error::InvalidInput("file position exceeds 64-bit ticks".into()))
     }
 
     /// Native 100ns ticks.
@@ -850,35 +784,21 @@ impl FilePosition {
     }
 }
 
-/// Signed editorial source timecode, which need not be monotonic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SourceTimecode(pub(super) i64);
-
-impl SourceTimecode {
-    /// Preserve a native signed timecode in 100ns units.
-    pub const fn from_ticks(ticks: i64) -> Self {
-        Self(ticks)
-    }
-
-    /// Native signed 100ns ticks.
-    pub const fn ticks(self) -> i64 {
-        self.0
-    }
-}
-
 /// Timecode policy applied when a recording session starts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum RecordingTimecode {
     /// Preserve the source's original editorial timecode.
     #[default]
     Preserve,
-    /// Generate session timecode starting at this value.
-    GenerateFrom(SourceTimecode),
+    /// Generate the session's timecode, starting at this value and advancing
+    /// with the content, in place of the source's own. Use it when the source
+    /// provides no meaningful timecode.
+    GenerateFrom(Timecode),
 }
 
 /// A current duration that may still be growing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct FileDuration {
     pub(super) position: FilePosition,
     pub(super) is_final: bool,
@@ -896,111 +816,107 @@ impl FileDuration {
     }
 }
 
-/// Scan information recorded in a track header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum FileScanType {
-    /// Interleaved fields, or the zero default in files lacking scan metadata.
-    Interleaved,
-    /// Progressive full frames.
-    Progressive,
-    /// First field.
-    Field0,
-    /// Second field.
-    Field1,
-    /// A future raw scan identifier.
-    Unknown(u32),
-}
-
-impl FileScanType {
-    pub(super) fn from_raw(value: u32) -> Self {
-        match value {
-            NDIlib_file_video_frame_format_e_NDIlib_file_video_frame_format_interleaved => {
-                Self::Interleaved
-            }
-            NDIlib_file_video_frame_format_e_NDIlib_file_video_frame_format_progressive => {
-                Self::Progressive
-            }
-            NDIlib_file_video_frame_format_e_NDIlib_file_video_frame_format_field_0 => Self::Field0,
-            NDIlib_file_video_frame_format_e_NDIlib_file_video_frame_format_field_1 => Self::Field1,
-            value => Self::Unknown(value),
-        }
-    }
-}
-
 /// An owned description of one video track, not a decoded pixel layout.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// A recorder's events describe the source's declared format, and a probe the
+/// track header of the file. A value the SDK does not know yet is zero or
+/// `None`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VideoTrack {
-    pub(super) high_quality: bool,
-    pub(super) width: i32,
-    pub(super) height: i32,
-    pub(super) frame_rate_n: i32,
-    pub(super) frame_rate_d: i32,
-    pub(super) fourcc: FourCc,
-    pub(super) scan_type: FileScanType,
-    pub(super) aspect_ratio: f32,
+    tier: StreamTier,
+    width: u32,
+    height: u32,
+    frame_rate: Option<FrameRate>,
+    fourcc: FourCc,
+    scan_type: Option<ScanType>,
+    picture_aspect_ratio: Option<f32>,
 }
 
 impl VideoTrack {
-    /// Whether this is the primary full-bandwidth representation.
-    pub fn is_high_quality(&self) -> bool {
-        self.high_quality
+    /// Which of the source's streams the track recorded: the full-quality
+    /// program stream or the low-bandwidth preview (proxy) stream.
+    pub fn tier(&self) -> StreamTier {
+        self.tier
     }
-    /// Raw resolution. Zero values mean not yet known.
-    pub fn resolution(&self) -> (i32, i32) {
-        (self.width, self.height)
+
+    /// The width in pixels, or zero while it is not known.
+    pub fn width(&self) -> u32 {
+        self.width
     }
-    /// Raw rational frame rate; a zero denominator remains unknown.
-    pub fn frame_rate(&self) -> (i32, i32) {
-        (self.frame_rate_n, self.frame_rate_d)
+
+    /// The height in pixels, or zero while it is not known.
+    pub fn height(&self) -> u32 {
+        self.height
     }
-    /// Codec/packing identifier, including unknown future values.
+
+    /// The frame rate, or `None` while it is not known.
+    pub fn frame_rate(&self) -> Option<FrameRate> {
+        self.frame_rate
+    }
+
+    /// The codec or packing identifier, including one this crate does not
+    /// know.
     pub fn fourcc(&self) -> FourCc {
         self.fourcc
     }
-    /// Recorded scan information; older files can retain the default value.
-    pub fn scan_type(&self) -> FileScanType {
+
+    /// The scan type, or `None` for a value this crate does not know.
+    ///
+    /// A file recorded before the SDK stored the scan type reports
+    /// [`ScanType::Interlaced`], the SDK's zero value.
+    pub fn scan_type(&self) -> Option<ScanType> {
         self.scan_type
     }
-    /// Display aspect ratio when positive and finite; zero/invalid means unknown.
-    pub fn aspect_ratio(&self) -> Option<f32> {
-        (self.aspect_ratio.is_finite() && self.aspect_ratio > 0.0).then_some(self.aspect_ratio)
+
+    /// The display aspect ratio of the full frame, such as 16/9, or `None`
+    /// when it is not known, in which case the pixels are square.
+    pub fn picture_aspect_ratio(&self) -> Option<f32> {
+        self.picture_aspect_ratio
     }
 }
 
 /// An owned layout snapshot containing no borrowed native memory.
-#[derive(Debug, Clone, PartialEq, Default)]
+///
+/// A value the SDK does not know, or that does not apply, such as the audio
+/// of a source without audio, is zero.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SourceFormat {
-    pub(super) video_tracks: Vec<VideoTrack>,
-    pub(super) audio_sample_rate: i32,
-    pub(super) audio_channels: i32,
-    pub(super) audio_samples: i32,
-    pub(super) audio_bit_depth: u32,
-    pub(super) audio_fourcc: FourCc,
+    video_tracks: Vec<VideoTrack>,
+    audio_sample_rate: u32,
+    audio_num_channels: u32,
+    audio_num_samples: u32,
+    audio_bit_depth: u32,
+    audio_fourcc: FourCc,
 }
 
 impl SourceFormat {
-    /// Populated video tracks, at most HQ plus proxy.
+    /// The populated video tracks: the program track first, then the
+    /// preview (proxy) track when there is one.
     pub fn video_tracks(&self) -> &[VideoTrack] {
         &self.video_tracks
     }
-    /// Raw sample rate, possibly zero until observed.
-    pub fn audio_sample_rate(&self) -> i32 {
+
+    /// The audio sample rate in Hz.
+    pub fn audio_sample_rate(&self) -> u32 {
         self.audio_sample_rate
     }
-    /// Raw channel count, possibly zero until observed.
-    pub fn audio_channels(&self) -> i32 {
-        self.audio_channels
+
+    /// The number of audio channels.
+    pub fn audio_num_channels(&self) -> u32 {
+        self.audio_num_channels
     }
-    /// Raw samples per packet/frame when known.
-    pub fn audio_samples(&self) -> i32 {
-        self.audio_samples
+
+    /// The number of audio samples per channel in each packet.
+    pub fn audio_num_samples(&self) -> u32 {
+        self.audio_num_samples
     }
-    /// Audio bit depth as reported by the SDK.
+
+    /// The audio bit depth.
     pub fn audio_bit_depth(&self) -> u32 {
         self.audio_bit_depth
     }
-    /// Audio codec/packing identifier.
+
+    /// The audio codec or packing identifier.
     pub fn audio_fourcc(&self) -> FourCc {
         self.audio_fourcc
     }
@@ -1045,7 +961,7 @@ impl FileInfo {
 }
 
 /// Playback event kind; unknown native values remain observable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PlayerEventKind {
     /// Natural end of file.
@@ -1067,18 +983,18 @@ pub enum PlayerEventKind {
 impl PlayerEventKind {
     pub(super) fn from_raw(value: u32) -> Self {
         match value {
-            NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_ended => Self::Ended,
-            NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_error => Self::Error,
-            NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_file_opened => {
+            sys::bindings::NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_ended => Self::Ended,
+            sys::bindings::NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_error => Self::Error,
+            sys::bindings::NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_file_opened => {
                 Self::FileOpened
             }
-            NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_first_frame => {
+            sys::bindings::NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_first_frame => {
                 Self::FirstFrame
             }
-            NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_file_closed => {
+            sys::bindings::NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_file_closed => {
                 Self::FileClosed
             }
-            NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_looped => Self::Looped,
+            sys::bindings::NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_looped => Self::Looped,
             value => Self::Unknown(value),
         }
     }
@@ -1092,7 +1008,7 @@ pub struct PlayerEvent {
     pub(super) message: EventText,
     pub(super) first_pts: FilePosition,
     pub(super) last_pts: FilePosition,
-    pub(super) source_timecode: Option<SourceTimecode>,
+    pub(super) source_timecode: Option<Timecode>,
     pub(super) source_format: SourceFormat,
 }
 
@@ -1117,8 +1033,9 @@ impl PlayerEvent {
     pub fn last_pts(&self) -> FilePosition {
         self.last_pts
     }
-    /// Editorial source timecode when the SDK marked it known.
-    pub fn source_timecode(&self) -> Option<SourceTimecode> {
+    /// The source's original editorial timecode, recorded with the frame,
+    /// when the SDK knows it. Unlike the file position it need not increase.
+    pub fn source_timecode(&self) -> Option<Timecode> {
         self.source_timecode
     }
     /// Source format snapshot; zero/empty fields may mean inapplicable.
@@ -1128,7 +1045,7 @@ impl PlayerEvent {
 }
 
 /// Recorder event kind; a write failure is not necessarily fatal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RecorderEventKind {
     /// First output file opened.
@@ -1160,35 +1077,35 @@ pub enum RecorderEventKind {
 impl RecorderEventKind {
     pub(super) fn from_raw(value: u32) -> Self {
         match value {
-            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_started => {
+            sys::bindings::NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_started => {
                 Self::Started
             }
-            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_rollover => {
+            sys::bindings::NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_rollover => {
                 Self::Rollover
             }
-            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_open_failed => {
+            sys::bindings::NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_open_failed => {
                 Self::OpenFailed
             }
-            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_write_failed => {
+            sys::bindings::NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_write_failed => {
                 Self::WriteFailed
             }
-            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_error => Self::Error,
-            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_format_changed => {
+            sys::bindings::NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_error => Self::Error,
+            sys::bindings::NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_format_changed => {
                 Self::FormatChanged
             }
-            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_first_frame => {
+            sys::bindings::NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_first_frame => {
                 Self::FirstFrame
             }
-            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_source_lost => {
+            sys::bindings::NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_source_lost => {
                 Self::SourceLost
             }
-            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_source_connected => {
+            sys::bindings::NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_source_connected => {
                 Self::SourceConnected
             }
-            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_file_closed => {
+            sys::bindings::NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_file_closed => {
                 Self::FileClosed
             }
-            NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_proxy_missing => {
+            sys::bindings::NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_proxy_missing => {
                 Self::ProxyMissing
             }
             value => Self::Unknown(value),
@@ -1202,7 +1119,7 @@ pub struct RecorderEvent {
     pub(super) kind: RecorderEventKind,
     pub(super) path: EventText,
     pub(super) message: EventText,
-    pub(super) track_flags: u32,
+    pub(super) tracks: MediaTypes,
     pub(super) dropped_packet_count: u64,
     pub(super) first_pts: FilePosition,
     pub(super) last_pts: FilePosition,
@@ -1223,9 +1140,10 @@ impl RecorderEvent {
     pub fn message(&self) -> &EventText {
         &self.message
     }
-    /// Raw affected-track bits, retaining future values and the zero sentinel.
-    pub fn track_flags(&self) -> u32 {
-        self.track_flags
+    /// The track a [`WriteFailed`](RecorderEventKind::WriteFailed) event
+    /// concerns; empty for every other event.
+    pub fn tracks(&self) -> MediaTypes {
+        self.tracks
     }
     /// Packet count attached to this particular event, not all session drops.
     pub fn dropped_packet_count(&self) -> u64 {
@@ -1250,7 +1168,7 @@ impl RecorderEvent {
 }
 
 /// Owned playback counters for the current or most recent file session.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct PlayerStats {
     pub(super) video_frames: [u64; 2],
     pub(super) audio_frames: u64,
@@ -1278,7 +1196,7 @@ impl PlayerStats {
 }
 
 /// Owned recorder telemetry. Counts refer to packets rather than decoded samples.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct RecorderStats {
     pub(super) bytes_written: u64,
     pub(super) video_frames: u64,
@@ -1335,49 +1253,123 @@ impl RecorderStats {
     }
 }
 
-impl From<&NDIlib_file_video_track_format_t> for VideoTrack {
-    fn from(raw: &NDIlib_file_video_track_format_t) -> Self {
-        Self {
-            high_quality: raw.is_high_quality,
-            width: raw.xres,
-            height: raw.yres,
-            frame_rate_n: raw.frame_rate_n,
-            frame_rate_d: raw.frame_rate_d,
-            fourcc: FourCc::from_raw(raw.fourcc),
-            scan_type: FileScanType::from_raw(raw.frame_format_type),
-            aspect_ratio: raw.picture_aspect_ratio,
+/// A quantity the SDK reports as a signed integer, which must not be negative.
+fn non_negative(value: i32, what: &str) -> Result<u32> {
+    u32::try_from(value).map_err(|_| {
+        Error::UnexpectedSdkResult(format!(
+            "the source format reports a negative {what}: {value}"
+        ))
+    })
+}
+
+/// The scan type a File SDK frame format names, if it names one.
+fn scan_type(format: NDIlib_file_video_frame_format_e) -> Option<ScanType> {
+    match format {
+        sys::bindings::NDIlib_file_video_frame_format_e_NDIlib_file_video_frame_format_interleaved => {
+            Some(ScanType::Interlaced)
         }
+        sys::bindings::NDIlib_file_video_frame_format_e_NDIlib_file_video_frame_format_progressive => {
+            Some(ScanType::Progressive)
+        }
+        sys::bindings::NDIlib_file_video_frame_format_e_NDIlib_file_video_frame_format_field_0 => {
+            Some(ScanType::Field0)
+        }
+        sys::bindings::NDIlib_file_video_frame_format_e_NDIlib_file_video_frame_format_field_1 => {
+            Some(ScanType::Field1)
+        }
+        _ => None,
     }
 }
 
-impl TryFrom<&NDIlib_file_source_format_t> for SourceFormat {
-    type Error = FileError;
+/// Each media type and the SDK's recorder track flag for it.
+const TRACK_FLAGS: [(MediaTypes, NDIlib_file_recorder_track_flags_e); 3] = [
+    (
+        MediaTypes::VIDEO,
+        NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_video,
+    ),
+    (
+        MediaTypes::AUDIO,
+        NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_audio,
+    ),
+    (
+        MediaTypes::METADATA,
+        NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_metadata,
+    ),
+];
 
-    fn try_from(raw: &NDIlib_file_source_format_t) -> FileResult<Self> {
-        let count = usize::try_from(raw.video_track_count)
-            .map_err(|_| FileError::Protocol("video track count does not fit usize".into()))?;
+/// The SDK's recorder track flags for `tracks`.
+pub(super) fn track_flags(tracks: MediaTypes) -> NDIlib_file_recorder_track_flags_e {
+    TRACK_FLAGS
+        .into_iter()
+        .filter(|&(kind, _)| tracks.contains(kind))
+        .fold(0, |flags, (_, flag)| flags | flag)
+}
+
+/// The media types the SDK's recorder track flags name. A flag this crate
+/// does not know is left out.
+fn tracks(flags: NDIlib_file_recorder_track_flags_e) -> MediaTypes {
+    TRACK_FLAGS
+        .into_iter()
+        .filter(|&(_, flag)| flags & flag == flag)
+        .fold(MediaTypes::NONE, |tracks, (kind, _)| tracks | kind)
+}
+
+impl VideoTrack {
+    /// The track the SDK's `raw` describes.
+    pub(super) fn from_sdk(raw: &NDIlib_file_video_track_format_t) -> Result<Self> {
+        let ratio = raw.picture_aspect_ratio;
+        Ok(Self {
+            tier: if raw.is_high_quality {
+                StreamTier::Program
+            } else {
+                StreamTier::Preview
+            },
+            width: non_negative(raw.xres, "width")?,
+            height: non_negative(raw.yres, "height")?,
+            // Both parts are at most i32::MAX, so only a zero part, which
+            // the SDK reports while the rate is unknown, has no frame rate.
+            frame_rate: FrameRate::new(
+                non_negative(raw.frame_rate_n, "frame-rate numerator")?,
+                non_negative(raw.frame_rate_d, "frame-rate denominator")?,
+            )
+            .ok(),
+            fourcc: FourCc::from_raw(raw.fourcc),
+            scan_type: scan_type(raw.frame_format_type),
+            picture_aspect_ratio: (ratio.is_finite() && ratio > 0.0).then_some(ratio),
+        })
+    }
+}
+
+impl SourceFormat {
+    /// The format the SDK's `raw` describes.
+    pub(super) fn from_sdk(raw: &NDIlib_file_source_format_t) -> Result<Self> {
+        let count = usize::try_from(raw.video_track_count).map_err(|_| {
+            Error::UnexpectedSdkResult("video track count does not fit usize".into())
+        })?;
         let tracks = raw.video_tracks.get(..count).ok_or_else(|| {
-            FileError::Protocol(format!(
+            Error::UnexpectedSdkResult(format!(
                 "source format reports {} video tracks; the SDK layout holds {}",
                 raw.video_track_count,
                 raw.video_tracks.len()
             ))
         })?;
         Ok(Self {
-            video_tracks: tracks.iter().map(VideoTrack::from).collect(),
-            audio_sample_rate: raw.audio_sample_rate,
-            audio_channels: raw.audio_no_channels,
-            audio_samples: raw.audio_no_samples,
+            video_tracks: tracks
+                .iter()
+                .map(VideoTrack::from_sdk)
+                .collect::<Result<_>>()?,
+            audio_sample_rate: non_negative(raw.audio_sample_rate, "audio sample rate")?,
+            audio_num_channels: non_negative(raw.audio_no_channels, "audio channel count")?,
+            audio_num_samples: non_negative(raw.audio_no_samples, "audio sample count")?,
             audio_bit_depth: raw.audio_bit_depth,
             audio_fourcc: FourCc::from_raw(raw.audio_fourcc),
         })
     }
 }
 
-impl TryFrom<&NDIlib_file_player_file_info_t> for FileInfo {
-    type Error = FileError;
-
-    fn try_from(raw: &NDIlib_file_player_file_info_t) -> FileResult<Self> {
+impl FileInfo {
+    /// The information the SDK's `raw` reports.
+    pub(super) fn from_sdk(raw: &NDIlib_file_player_file_info_t) -> Result<Self> {
         Ok(Self {
             duration: FileDuration {
                 position: FilePosition::from_ticks(raw.duration_100ns),
@@ -1387,15 +1379,14 @@ impl TryFrom<&NDIlib_file_player_file_info_t> for FileInfo {
             video_track_count: raw.video_track_count,
             audio_track_count: raw.audio_track_count,
             metadata_track_count: raw.metadata_track_count,
-            source_format: SourceFormat::try_from(&raw.source_format)?,
+            source_format: SourceFormat::from_sdk(&raw.source_format)?,
         })
     }
 }
 
-impl TryFrom<&NDIlib_file_player_event_t> for PlayerEvent {
-    type Error = FileError;
-
-    fn try_from(raw: &NDIlib_file_player_event_t) -> FileResult<Self> {
+impl PlayerEvent {
+    /// The event the SDK's `raw` reports.
+    pub(super) fn from_sdk(raw: &NDIlib_file_player_event_t) -> Result<Self> {
         Ok(Self {
             kind: PlayerEventKind::from_raw(raw.type_),
             path: EventText::from_buffer(&raw.p_path),
@@ -1404,32 +1395,32 @@ impl TryFrom<&NDIlib_file_player_event_t> for PlayerEvent {
             last_pts: FilePosition::from_ticks(raw.last_pts_100ns),
             source_timecode: raw
                 .has_source_timecode
-                .then(|| SourceTimecode::from_ticks(raw.source_timecode_100ns)),
-            source_format: SourceFormat::try_from(&raw.source_format)?,
+                .then(|| Timecode::from_ticks(raw.source_timecode_100ns)),
+            source_format: SourceFormat::from_sdk(&raw.source_format)?,
         })
     }
 }
 
-impl TryFrom<&NDIlib_file_recorder_event_t> for RecorderEvent {
-    type Error = FileError;
-
-    fn try_from(raw: &NDIlib_file_recorder_event_t) -> FileResult<Self> {
+impl RecorderEvent {
+    /// The event the SDK's `raw` reports.
+    pub(super) fn from_sdk(raw: &NDIlib_file_recorder_event_t) -> Result<Self> {
         Ok(Self {
             kind: RecorderEventKind::from_raw(raw.type_),
             path: EventText::from_buffer(&raw.p_path),
             message: EventText::from_buffer(&raw.p_message),
-            track_flags: raw.track_flags,
+            tracks: tracks(raw.track_flags),
             dropped_packet_count: raw.dropped_packet_count,
             first_pts: FilePosition::from_ticks(raw.first_pts_100ns),
             last_pts: FilePosition::from_ticks(raw.last_pts_100ns),
             format_text: EventText::from_buffer(&raw.source_format),
-            source_format: SourceFormat::try_from(&raw.source_format_payload)?,
+            source_format: SourceFormat::from_sdk(&raw.source_format_payload)?,
         })
     }
 }
 
-impl From<&NDIlib_file_player_stats_t> for PlayerStats {
-    fn from(raw: &NDIlib_file_player_stats_t) -> Self {
+impl PlayerStats {
+    /// The statistics the SDK's `raw` reports.
+    pub(super) fn from_sdk(raw: &NDIlib_file_player_stats_t) -> Self {
         Self {
             video_frames: raw.video_frames_sent,
             audio_frames: raw.audio_frames_sent,
@@ -1439,8 +1430,9 @@ impl From<&NDIlib_file_player_stats_t> for PlayerStats {
     }
 }
 
-impl From<&NDIlib_file_recorder_stats_t> for RecorderStats {
-    fn from(raw: &NDIlib_file_recorder_stats_t) -> Self {
+impl RecorderStats {
+    /// The statistics the SDK's `raw` reports.
+    pub(super) fn from_sdk(raw: &NDIlib_file_recorder_stats_t) -> Self {
         Self {
             bytes_written: raw.bytes_written,
             video_frames: raw.video_frames,
@@ -1472,9 +1464,9 @@ impl From<&NDIlib_file_recorder_stats_t> for RecorderStats {
 mod tests {
     use super::*;
 
-    fn invalid_text<T: std::fmt::Debug>(result: FileResult<T>) -> String {
+    fn invalid_text<T: std::fmt::Debug>(result: Result<T>) -> String {
         match result {
-            Err(FileError::InvalidInput(text)) => text,
+            Err(Error::InvalidInput(text)) => text,
             other => panic!("expected InvalidInput, got {other:?}"),
         }
     }
@@ -1537,23 +1529,81 @@ mod tests {
     }
 
     #[test]
+    fn player_options_are_checked_when_they_are_resolved() {
+        let resolved = PlayerOptions::new("Replay").groups("").resolve().unwrap();
+        assert_eq!(resolved.name.as_bytes(), b"Replay");
+        assert_eq!(resolved.groups.unwrap().as_bytes(), b"");
+        assert!(PlayerOptions::new("Replay")
+            .resolve()
+            .unwrap()
+            .groups
+            .is_none());
+        assert_eq!(
+            invalid_text(PlayerOptions::new("").resolve()),
+            "player name must not be empty"
+        );
+        assert_eq!(
+            invalid_text(PlayerOptions::new("Re\0play").resolve()),
+            "player name contains an embedded NUL"
+        );
+        assert_eq!(
+            invalid_text(PlayerOptions::new("Replay").groups("a\0b").resolve()),
+            "player groups contains an embedded NUL"
+        );
+    }
+
+    #[test]
+    fn a_drop_wait_beyond_the_largest_timeout_is_refused_when_resolved() {
+        let options = RecorderOptions::new(SourceSpec::new("camera").unwrap());
+        assert_eq!(options.drop_wait, RecorderOptions::DEFAULT_DROP_WAIT);
+        options
+            .clone()
+            .drop_wait(crate::MAX_TIMEOUT)
+            .resolve()
+            .unwrap();
+        assert!(invalid_text(
+            options
+                .drop_wait(crate::MAX_TIMEOUT + Duration::from_millis(1))
+                .resolve()
+        )
+        .contains("MAX_TIMEOUT"));
+    }
+
+    #[test]
     fn tracks_do_not_silently_map_empty_to_all() {
-        assert!(TrackSelection::from_bits(0).is_err());
-        assert!(TrackSelection::from_bits(8).is_err());
-        assert_eq!((TrackSelection::AUDIO | TrackSelection::METADATA).bits(), 6);
+        let options = RecorderOptions::new(SourceSpec::new("camera").unwrap());
+        assert_eq!(options.tracks, MediaTypes::ALL);
+        assert!(options.resolve().is_ok());
+        let empty = options.clone().tracks(MediaTypes::NONE);
+        assert!(invalid_text(empty.resolve()).contains("empty track selection"));
+        let some = options.tracks(MediaTypes::AUDIO | MediaTypes::METADATA);
+        assert_eq!(some.tracks, MediaTypes::AUDIO | MediaTypes::METADATA);
+        assert!(some.resolve().is_ok());
+    }
+
+    /// The pattern the SDK is given for `naming`.
+    fn sdk_pattern(naming: FileNaming) -> Result<Option<String>> {
+        let options = RecorderOptions::new(SourceSpec::new("camera").unwrap()).naming(naming);
+        Ok(options
+            .resolve()?
+            .pattern
+            .map(|pattern| pattern.into_string().unwrap()))
     }
 
     #[test]
     fn filename_patterns_are_validated_without_filesystem_mutation() {
-        let options = RecorderOptions::new(SourceSpec::new("camera").unwrap());
+        assert_eq!(sdk_pattern(FileNaming::default()).unwrap(), None);
+        assert_eq!(sdk_pattern(FileNaming::Indexed).unwrap(), None);
         assert_eq!(
-            options.clone().exact_filename().filename_pattern(),
+            sdk_pattern(FileNaming::Exact).unwrap().as_deref(),
             Some("{prefix}")
         );
-        assert!(options
-            .clone()
-            .with_pattern("{prefix}_{index:03}.mkv")
-            .is_ok());
+        assert_eq!(
+            sdk_pattern(FileNaming::Pattern("{prefix}_{index:03}.mkv".into()))
+                .unwrap()
+                .as_deref(),
+            Some("{prefix}_{index:03}.mkv")
+        );
         for pattern in [
             "",
             "{prefix",
@@ -1564,7 +1614,10 @@ mod tests {
             "a\0b",
         ] {
             assert!(
-                options.clone().with_pattern(pattern).is_err(),
+                matches!(
+                    sdk_pattern(FileNaming::Pattern(pattern.into())),
+                    Err(Error::InvalidInput(_))
+                ),
                 "{pattern:?}"
             );
         }
@@ -1603,7 +1656,7 @@ mod tests {
             "File command queue is full"
         );
         assert_eq!(
-            FileError::InvalidState(StateError::Stopping).to_string(),
+            Error::InvalidState(StateError::Stopping).to_string(),
             "Invalid File API state: the session is stopping"
         );
     }
@@ -1614,7 +1667,7 @@ mod tests {
 
     fn refused(options: RecorderOptions) -> String {
         match options.resolve() {
-            Err(FileError::InvalidInput(reason)) => reason,
+            Err(Error::InvalidInput(reason)) => reason,
             Err(other) => panic!("expected the options to be refused as input: {other}"),
             Ok(_) => panic!("expected the options to be refused"),
         }
@@ -1623,69 +1676,69 @@ mod tests {
     #[test]
     fn a_pattern_is_exact_when_it_has_no_index() {
         for (pattern, exact) in [
-            (None, false),
-            (Some("{prefix}"), true),
-            (Some("{prefix}.mkv"), true),
-            (Some("{prefix}_{index}.mkv"), false),
-            (Some("{prefix}/{index:03}.mkv"), false),
+            (DEFAULT_PATTERN, false),
+            (EXACT_PATTERN, true),
+            ("{prefix}.mkv", true),
+            ("{prefix}_{index}.mkv", false),
+            ("{prefix}/{index:03}.mkv", false),
         ] {
             assert_eq!(
-                FileNaming::new(pattern).unwrap().is_exact(),
+                NamePattern::new(pattern).unwrap().is_exact(),
                 exact,
                 "{pattern:?}"
             );
         }
-        assert!(options()
-            .exact_filename()
-            .resolve()
-            .unwrap()
-            .naming
-            .is_exact());
-        assert!(!options()
-            .exact_filename()
-            .indexed_filenames()
-            .resolve()
-            .unwrap()
-            .naming
-            .is_exact());
+        let exact = |options: RecorderOptions| options.resolve().unwrap().naming.is_exact();
+        assert!(!exact(options()));
+        assert!(exact(options().naming(FileNaming::Exact)));
+        assert!(exact(
+            options().naming(FileNaming::Pattern("{prefix}.mkv".into()))
+        ));
+        assert!(!exact(
+            options()
+                .naming(FileNaming::Exact)
+                .naming(FileNaming::Indexed)
+        ));
     }
 
     #[test]
     fn format_change_rollover_follows_the_naming_unless_set() {
         let rolls = |options: RecorderOptions| options.resolve().unwrap().format_change_rollover;
         assert!(rolls(options()));
-        assert!(!rolls(options().exact_filename()));
-        assert!(!rolls(options().with_format_change_rollover(false)));
+        assert!(!rolls(options().naming(FileNaming::Exact)));
+        assert!(!rolls(options().format_change_rollover(false)));
         assert!(!rolls(
             options()
-                .exact_filename()
-                .with_format_change_rollover(false)
+                .naming(FileNaming::Exact)
+                .format_change_rollover(false)
         ));
         assert!(rolls(
             options()
-                .with_pattern("{prefix}-{index:2}.mkv")
-                .unwrap()
-                .with_format_change_rollover(true)
+                .naming(FileNaming::Pattern("{prefix}-{index:2}.mkv".into()))
+                .format_change_rollover(true)
         ));
     }
 
     #[test]
     fn an_exact_name_that_would_roll_over_is_refused_whatever_the_call_order() {
         for options in [
-            options().exact_filename().with_format_change_rollover(true),
-            options().with_format_change_rollover(true).exact_filename(),
             options()
-                .with_format_change_rollover(true)
-                .with_pattern("{prefix}.mkv")
-                .unwrap(),
+                .naming(FileNaming::Exact)
+                .format_change_rollover(true),
+            options()
+                .format_change_rollover(true)
+                .naming(FileNaming::Exact),
+            options()
+                .format_change_rollover(true)
+                .naming(FileNaming::Pattern("{prefix}.mkv".into())),
         ] {
             let reason = refused(options);
             assert!(reason.contains("format change"), "{reason}");
             assert!(reason.contains("{index}"), "{reason}");
         }
         for options in [
-            options().exact_filename().with_rollover_size(1 << 20),
-            options().with_rollover_size(1 << 20).exact_filename(),
+            options().naming(FileNaming::Exact).rollover_size(1 << 20),
+            options().rollover_size(1 << 20).naming(FileNaming::Exact),
         ] {
             let reason = refused(options);
             assert!(reason.contains("size limit"), "{reason}");
@@ -1693,8 +1746,8 @@ mod tests {
         }
         // Indexed names may roll over either way.
         options()
-            .with_rollover_size(1 << 20)
-            .with_format_change_rollover(true)
+            .rollover_size(1 << 20)
+            .format_change_rollover(true)
             .resolve()
             .unwrap();
     }
@@ -1712,9 +1765,9 @@ mod tests {
         directory
     }
 
-    fn io_kind(result: FileResult<()>) -> std::io::ErrorKind {
+    fn io_kind(result: Result<()>) -> std::io::ErrorKind {
         match result {
-            Err(FileError::Io(error)) => error.kind(),
+            Err(Error::Io(error)) => error.kind(),
             other => panic!("expected a filesystem error: {other:?}"),
         }
     }
@@ -1723,34 +1776,35 @@ mod tests {
     fn the_file_a_pattern_names_is_where_it_is_checked() {
         let directory = scratch("check");
         let target = RecordingTarget::new(directory.join("take")).unwrap();
-        let first = |pattern: Option<&str>| {
-            FileNaming::new(pattern)
+        let first = |pattern: &str| {
+            NamePattern::new(pattern)
                 .unwrap()
                 .first_file(&target)
                 .unwrap()
         };
-        assert_eq!(first(None), directory.join("take_001.mkv"));
-        assert_eq!(first(Some("{prefix}")), directory.join("take"));
+        assert_eq!(first(DEFAULT_PATTERN), directory.join("take_001.mkv"));
+        assert_eq!(first(EXACT_PATTERN), directory.join("take"));
         assert_eq!(
-            first(Some("{prefix}/{index:03}.mkv")),
+            first("{prefix}/{index:03}.mkv"),
             directory.join("take/001.mkv")
         );
 
         // The default pattern checks the target's own directory.
-        FileNaming::new(None).unwrap().check(&target).unwrap();
+        let indexed = NamePattern::new(DEFAULT_PATTERN).unwrap();
+        indexed.check(&target).unwrap();
         let missing = RecordingTarget::new(directory.join("absent/take")).unwrap();
         assert_eq!(
-            io_kind(FileNaming::new(None).unwrap().check(&missing)),
+            io_kind(indexed.check(&missing)),
             std::io::ErrorKind::NotFound
         );
         // A pattern that names a directory of its own checks that one.
-        let nested = FileNaming::new(Some("{prefix}/{index:03}.mkv")).unwrap();
+        let nested = NamePattern::new("{prefix}/{index:03}.mkv").unwrap();
         assert_eq!(io_kind(nested.check(&target)), std::io::ErrorKind::NotFound);
         std::fs::create_dir(directory.join("take")).unwrap();
         nested.check(&target).unwrap();
 
         // An exact name refuses a file that exists, and an indexed one does not.
-        let exact = FileNaming::new(Some("{prefix}.mkv")).unwrap();
+        let exact = NamePattern::new("{prefix}.mkv").unwrap();
         exact.check(&target).unwrap();
         std::fs::write(directory.join("take.mkv"), b"kept").unwrap();
         assert_eq!(
@@ -1758,7 +1812,7 @@ mod tests {
             std::io::ErrorKind::AlreadyExists
         );
         std::fs::write(directory.join("take_001.mkv"), b"kept").unwrap();
-        FileNaming::new(None).unwrap().check(&target).unwrap();
+        indexed.check(&target).unwrap();
         assert_eq!(std::fs::read(directory.join("take.mkv")).unwrap(), b"kept");
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -1787,7 +1841,6 @@ mod tests {
                 .ticks(),
             1
         );
-        assert_eq!(SourceTimecode::from_ticks(-100).ticks(), -100);
     }
 
     #[test]
@@ -1800,7 +1853,100 @@ mod tests {
             RecorderEventKind::from_raw(4321),
             RecorderEventKind::Unknown(4321)
         );
-        assert_eq!(FileScanType::from_raw(99), FileScanType::Unknown(99));
+        assert_eq!(scan_type(99), None);
+    }
+
+    #[test]
+    fn every_file_frame_format_names_its_scan_type() {
+        for (format, scan) in [
+            (
+                NDIlib_file_video_frame_format_e_NDIlib_file_video_frame_format_interleaved,
+                ScanType::Interlaced,
+            ),
+            (
+                NDIlib_file_video_frame_format_e_NDIlib_file_video_frame_format_progressive,
+                ScanType::Progressive,
+            ),
+            (
+                NDIlib_file_video_frame_format_e_NDIlib_file_video_frame_format_field_0,
+                ScanType::Field0,
+            ),
+            (
+                NDIlib_file_video_frame_format_e_NDIlib_file_video_frame_format_field_1,
+                ScanType::Field1,
+            ),
+        ] {
+            assert_eq!(scan_type(format), Some(scan));
+        }
+    }
+
+    #[test]
+    fn track_selections_map_to_exactly_the_sdk_flags_and_back() {
+        assert_eq!(
+            track_flags(MediaTypes::ALL),
+            NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_all
+        );
+        assert_eq!(
+            track_flags(MediaTypes::VIDEO),
+            NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_video
+        );
+        assert_eq!(
+            track_flags(MediaTypes::AUDIO | MediaTypes::METADATA),
+            NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_audio
+                | NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_metadata
+        );
+        // The SDK reads no flags as all of them; creation refuses that first.
+        assert_eq!(track_flags(MediaTypes::NONE), 0);
+        for selection in [
+            MediaTypes::NONE,
+            MediaTypes::VIDEO,
+            MediaTypes::AUDIO,
+            MediaTypes::METADATA,
+            MediaTypes::VIDEO | MediaTypes::METADATA,
+            MediaTypes::ALL,
+        ] {
+            assert_eq!(tracks(track_flags(selection)), selection);
+        }
+        // A flag from a later SDK is left out rather than misread.
+        assert_eq!(
+            tracks(
+                1 << 8 | NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_audio
+            ),
+            MediaTypes::AUDIO
+        );
+    }
+
+    #[test]
+    fn a_write_failure_names_its_track() {
+        let raw = NDIlib_file_recorder_event_t {
+            type_: NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_write_failed,
+            track_flags: NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_audio,
+            ..Default::default()
+        };
+        assert_eq!(
+            RecorderEvent::from_sdk(&raw).unwrap().tracks(),
+            MediaTypes::AUDIO
+        );
+        let other = NDIlib_file_recorder_event_t {
+            type_: NDIlib_file_recorder_event_type_e_NDIlib_file_recorder_event_type_started,
+            ..Default::default()
+        };
+        assert!(RecorderEvent::from_sdk(&other).unwrap().tracks().is_empty());
+    }
+
+    #[test]
+    fn a_player_event_keeps_the_source_timecode_only_when_the_sdk_has_one() {
+        let mut raw = NDIlib_file_player_event_t {
+            type_: NDIlib_file_player_event_type_e_NDIlib_file_player_event_type_first_frame,
+            source_timecode_100ns: -100,
+            ..Default::default()
+        };
+        assert_eq!(PlayerEvent::from_sdk(&raw).unwrap().source_timecode(), None);
+        raw.has_source_timecode = true;
+        assert_eq!(
+            PlayerEvent::from_sdk(&raw).unwrap().source_timecode(),
+            Some(Timecode::from_ticks(-100))
+        );
     }
 
     #[test]
@@ -1810,15 +1956,122 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            SourceFormat::try_from(&raw),
-            Err(FileError::Protocol(_))
+            SourceFormat::from_sdk(&raw),
+            Err(Error::UnexpectedSdkResult(_))
         ));
         raw.video_track_count = 2;
+        raw.video_tracks[0].is_high_quality = true;
         raw.video_tracks[1].fourcc = u32::MAX;
-        let snapshot = SourceFormat::try_from(&raw).unwrap();
+        let snapshot = SourceFormat::from_sdk(&raw).unwrap();
         assert_eq!(snapshot.video_tracks().len(), 2);
+        assert_eq!(snapshot.video_tracks()[0].tier(), StreamTier::Program);
+        assert_eq!(snapshot.video_tracks()[1].tier(), StreamTier::Preview);
         assert_eq!(snapshot.video_tracks()[1].fourcc().raw(), u32::MAX);
-        assert_eq!(snapshot.video_tracks()[0].aspect_ratio(), None);
+        assert_eq!(snapshot.video_tracks()[0].picture_aspect_ratio(), None);
+    }
+
+    #[test]
+    fn a_track_reports_what_the_sdk_knows_and_nothing_it_does_not() {
+        let mut raw = NDIlib_file_video_track_format_t {
+            is_high_quality: true,
+            xres: 1920,
+            yres: 1080,
+            frame_rate_n: 30_000,
+            frame_rate_d: 1_001,
+            fourcc: u32::from_le_bytes(*b"H264"),
+            frame_format_type:
+                NDIlib_file_video_frame_format_e_NDIlib_file_video_frame_format_progressive,
+            picture_aspect_ratio: 16.0 / 9.0,
+        };
+        let track = VideoTrack::from_sdk(&raw).unwrap();
+        assert_eq!(track.tier(), StreamTier::Program);
+        assert_eq!((track.width(), track.height()), (1920, 1080));
+        assert_eq!(
+            track.frame_rate(),
+            Some(FrameRate::new(30_000, 1_001).unwrap())
+        );
+        assert_eq!(track.fourcc().raw().to_le_bytes(), *b"H264");
+        assert_eq!(track.scan_type(), Some(ScanType::Progressive));
+        assert_eq!(track.picture_aspect_ratio(), Some(16.0 / 9.0));
+
+        // Zero is what the SDK reports for what it does not know yet.
+        let unknown = VideoTrack::from_sdk(&NDIlib_file_video_track_format_t {
+            frame_rate_n: 30,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!((unknown.width(), unknown.height()), (0, 0));
+        assert_eq!(unknown.frame_rate(), None);
+        assert_eq!(unknown.picture_aspect_ratio(), None);
+        raw.frame_format_type = 99;
+        raw.picture_aspect_ratio = f32::NAN;
+        let future = VideoTrack::from_sdk(&raw).unwrap();
+        assert_eq!(future.scan_type(), None);
+        assert_eq!(future.picture_aspect_ratio(), None);
+    }
+
+    #[test]
+    fn a_negative_quantity_breaks_the_sdk_contract() {
+        let track = NDIlib_file_video_track_format_t {
+            xres: 1920,
+            yres: 1080,
+            frame_rate_n: 30,
+            frame_rate_d: 1,
+            ..Default::default()
+        };
+        for broken in [
+            NDIlib_file_video_track_format_t { xres: -1, ..track },
+            NDIlib_file_video_track_format_t { yres: -1, ..track },
+            NDIlib_file_video_track_format_t {
+                frame_rate_n: -30,
+                ..track
+            },
+            NDIlib_file_video_track_format_t {
+                frame_rate_d: -1,
+                ..track
+            },
+        ] {
+            assert!(matches!(
+                VideoTrack::from_sdk(&broken),
+                Err(Error::UnexpectedSdkResult(_))
+            ));
+        }
+        let format = NDIlib_file_source_format_t {
+            audio_sample_rate: 48_000,
+            audio_no_channels: 2,
+            audio_no_samples: 1_600,
+            audio_bit_depth: 32,
+            ..Default::default()
+        };
+        let audio = SourceFormat::from_sdk(&format).unwrap();
+        assert_eq!(
+            (
+                audio.audio_sample_rate(),
+                audio.audio_num_channels(),
+                audio.audio_num_samples(),
+                audio.audio_bit_depth()
+            ),
+            (48_000, 2, 1_600, 32)
+        );
+        for broken in [
+            NDIlib_file_source_format_t {
+                audio_sample_rate: -1,
+                ..format
+            },
+            NDIlib_file_source_format_t {
+                audio_no_channels: -1,
+                ..format
+            },
+            NDIlib_file_source_format_t {
+                audio_no_samples: -1,
+                ..format
+            },
+        ] {
+            assert!(matches!(
+                SourceFormat::from_sdk(&broken),
+                Err(Error::UnexpectedSdkResult(_))
+            ));
+        }
     }
 
     #[test]
@@ -1828,7 +2081,7 @@ mod tests {
             ..Default::default()
         };
         raw.p_path.fill(0xff_u8 as c_char);
-        let event = RecorderEvent::try_from(&raw).unwrap();
+        let event = RecorderEvent::from_sdk(&raw).unwrap();
         assert_eq!(event.kind(), RecorderEventKind::FileClosed);
         assert!(!event.path().is_terminated());
         assert!(event.path().to_str().is_err());

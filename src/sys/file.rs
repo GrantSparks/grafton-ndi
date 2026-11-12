@@ -107,7 +107,8 @@ static SELECTED: Selection<FileRuntime> = Selection::new();
 ///
 /// [`Error::RuntimeLoadFailed`] when no usable File library can be provided
 /// (retryable), [`Error::RuntimeConflict`] when a different one is already
-/// pinned, [`Error::InvalidConfiguration`] for a relative `library_path`.
+/// pinned or the selected core runtime is one no File library can accompany,
+/// [`Error::InvalidInput`] for a relative `library_path`.
 pub(crate) fn select_file(
     core: &RuntimeInfo,
     api: &Api,
@@ -180,7 +181,7 @@ impl FileRuntime {
         // process, so it is refused before anything is opened. The Windows
         // File library carries its own implementation and imports none.
         if cfg!(unix) && core.edition() != crate::capabilities::SdkEdition::Advanced {
-            return Err(Error::RuntimeLoadFailed(
+            return Err(Error::RuntimeConflict(
                 "the NDI File library needs the Advanced SDK runtime, and the selected runtime \
                  is the Standard one"
                     .into(),
@@ -196,7 +197,7 @@ impl FileRuntime {
             Self::CORE_ENTRY,
             api.core.NDIlib_initialize as *mut std::ffi::c_void,
         ) {
-            return Err(Error::RuntimeLoadFailed(format!(
+            return Err(Error::RuntimeConflict(format!(
                 "the process's global symbol scope already holds an NDI runtime that is not the \
                  selected one ({file}); the NDI File library would bind to it"
             )));

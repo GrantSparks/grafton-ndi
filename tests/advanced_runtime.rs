@@ -11,9 +11,10 @@ mod common;
 
 use grafton_ndi::{
     advanced::*,
-    capabilities::{CapabilityUnavailable, RuntimeFeature, SdkEdition},
-    AudioFrame, Error, Finder, FinderOptions, Receiver, ReceiverBandwidth, ReceiverOptions,
-    ScanType, Sender, SenderOptions, Source, Tally, VideoFrame, NDI,
+    capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, SdkEdition},
+    AudioFrame, Error, Finder, FinderOptions, FrameRate, MediaTypes, Ndi, Receiver,
+    ReceiverBandwidth, ReceiverOptions, ScanType, Sender, SenderOptions, SettingChange, Source,
+    StreamTier, Tally, Timecode, VideoFrame,
 };
 use std::{
     sync::{
@@ -40,18 +41,17 @@ fn sockets() -> MutexGuard<'static, ()> {
 }
 
 fn options(suffix: &str) -> SenderOptions {
-    SenderOptions::builder(format!("grafton-local-{}-{suffix}", std::process::id()))
+    SenderOptions::new(format!("grafton-local-{}-{suffix}", std::process::id()))
         .clock_video(false)
         .clock_audio(false)
-        .build()
 }
 
 fn video() -> VideoFrame {
     VideoFrame::builder().resolution(64, 32).build().unwrap()
 }
 
-fn unconnected_receiver(ndi: &NDI) -> Receiver {
-    Receiver::new(ndi, &ReceiverOptions::builder(Source::default()).build()).unwrap()
+fn unconnected_receiver(ndi: &Ndi) -> Receiver {
+    Receiver::new(ndi, &ReceiverOptions::new(Source::new(""))).unwrap()
 }
 
 #[test]
@@ -61,39 +61,88 @@ fn advanced_native_constructors_controls_and_queue() {
     };
     let _turn = sockets();
     let config = AdvancedConfig::parse("{}").unwrap();
-    let sender = Sender::new_with_config(&ndi, &options("controls"), &config).unwrap();
+    let sender = Sender::new(&ndi, &options("controls").config(config.clone())).unwrap();
     let source = sender.source().unwrap();
     let mut receiver =
-        Receiver::new_with_config(&ndi, &ReceiverOptions::builder(source).build(), &config)
-            .unwrap();
-    let finder = Finder::new_with_config(&ndi, &FinderOptions::default(), &config).unwrap();
+        Receiver::new(&ndi, &ReceiverOptions::new(source).config(config.clone())).unwrap();
+    let finder = Finder::new(&ndi, &FinderOptions::new().config(config.clone())).unwrap();
     let _snapshot = finder.sources_with_metadata().unwrap();
-    let _ = sender.set_external_tally(Tally::new(false, false)).unwrap();
+    sender.set_external_tally(Tally::new(false, false)).unwrap();
     let _ = sender.keyframe_required(None).unwrap();
     let _ = sender
         .wait_for_keyframe_change(Duration::ZERO, None)
         .unwrap();
     receiver.request_keyframe().unwrap();
-    let _ = receiver.set_video_quality(VideoQuality::Program).unwrap();
-    let _ = receiver
-        .set_streams(StreamSelection::new(true, true, true))
-        .unwrap();
+    // Without a vendor ID licensed for them the SDK applies neither change.
+    for change in [
+        receiver.set_stream_tier(StreamTier::Program).unwrap(),
+        receiver.set_streams(MediaTypes::ALL).unwrap(),
+    ] {
+        assert!(matches!(
+            change,
+            SettingChange::Applied | SettingChange::Unchanged
+        ));
+    }
     {
         let session = receiver.kvm().unwrap();
         let _ = session.is_supported();
     }
-    let router = grafton_ndi::routing::Router::new_with_config(
+    {
+        // Nothing is connected, so the SDK sends no KVM message, and the
+        // session records nothing as pressed.
+        let mut unconnected = unconnected_receiver(&ndi);
+        let mut session = unconnected.kvm().unwrap();
+        assert!(!session.is_supported());
+        assert!(matches!(
+            session.mouse_down(MouseButton::Left),
+            Err(Error::NativeOperationFailed {
+                operation: "NDIlib_recv_kvm_send_left_mouse_click"
+            })
+        ));
+        assert!(matches!(
+            session.key_down(0xff0d),
+            Err(Error::NativeOperationFailed {
+                operation: "NDIlib_recv_kvm_send_keyboard_press"
+            })
+        ));
+        assert!(matches!(
+            session.move_pointer(0.5, 1.5),
+            Err(Error::InvalidInput(_))
+        ));
+        session.release_all().unwrap();
+    }
+    // Quality guidance applies to SpeedHQ alone, and is refused for any other
+    // codec before the SDK is asked.
+    let speedhq = VideoPacketFormat::new(VideoCodec::SpeedHq422, 1920, 1080).unwrap();
+    let h264 = VideoPacketFormat::new(VideoCodec::H264, 1920, 1080).unwrap();
+    for format in [speedhq, h264] {
+        sender.target_frame_bytes(format).unwrap();
+        sender.target_bit_rate(format).unwrap();
+    }
+    assert!(sender.legacy_quality(speedhq).unwrap() < 100);
+    sender.quality_plan(speedhq, true).unwrap();
+    assert!(matches!(
+        sender.legacy_quality(h264),
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        sender.quality_plan(h264, false),
+        Err(Error::InvalidInput(_))
+    ));
+    let router = grafton_ndi::routing::Router::new(
         &ndi,
         &grafton_ndi::routing::RouterOptions::new(format!(
             "grafton-local-{}-router",
             std::process::id()
-        )),
-        &config,
+        ))
+        .config(config.clone()),
     )
     .unwrap();
     router
         .add_connection_metadata(
-            &grafton_ndi::MetadataFrame::with_data("<local-test/>", 0).unwrap(),
+            &grafton_ndi::MetadataFrame::new("<local-test/>")
+                .unwrap()
+                .with_timecode(grafton_ndi::Timecode::from_ticks(0)),
         )
         .unwrap();
     router.clear_connection_metadata().unwrap();
@@ -103,7 +152,7 @@ fn advanced_native_constructors_controls_and_queue() {
     };
     // The Discovery Server objects need NDI 6.4.0. An Advanced runtime older
     // than that refuses to create them, with or without a configuration.
-    fn created<T>(ndi: &NDI, feature: RuntimeFeature, object: grafton_ndi::Result<T>) -> Option<T> {
+    fn created<T>(ndi: &Ndi, feature: RuntimeFeature, object: grafton_ndi::Result<T>) -> Option<T> {
         match (ndi.require_feature(feature), object) {
             (Ok(()), object) => Some(object.unwrap()),
             (Err(_), Err(Error::UnsupportedCapability { .. })) => None,
@@ -111,27 +160,31 @@ fn advanced_native_constructors_controls_and_queue() {
             (Err(gate), Ok(_)) => panic!("{gate}, but the object was created"),
         }
     }
-    let advertisers = AdvertiserOptions::default().servers("127.0.0.1");
-    let listeners = ListenerOptions::default().server("127.0.0.1").unwrap();
+    let advertisers = AdvertiserOptions::default()
+        .servers("127.0.0.1")
+        .config(config.clone());
+    let listeners = ListenerOptions::default()
+        .server("127.0.0.1")
+        .config(config.clone());
     let _send_advertiser = created(
         &ndi,
         RuntimeFeature::SenderAdvertising,
-        SendAdvertiser::new_with_config(&ndi, &advertisers, &config),
+        SendAdvertiser::new(&ndi, &advertisers),
     );
     let _recv_advertiser = created(
         &ndi,
         RuntimeFeature::ReceiverAdvertising,
-        RecvAdvertiser::new_with_config(&ndi, &advertisers, &config),
+        RecvAdvertiser::new(&ndi, &advertisers),
     );
     let _send_listener = created(
         &ndi,
         RuntimeFeature::SenderDiscovery,
-        SendListener::new_with_config(&ndi, &listeners, &config),
+        SendListener::new(&ndi, &listeners),
     );
     let _recv_listener = created(
         &ndi,
         RuntimeFeature::ReceiverDiscovery,
-        RecvListener::new_with_config(&ndi, &listeners, &config),
+        RecvListener::new(&ndi, &listeners),
     );
     let av = AvSync::new(receiver).unwrap();
     drop(av.into_receiver());
@@ -141,20 +194,23 @@ fn advanced_native_constructors_controls_and_queue() {
     drop(genlock);
     let mut packets = PacketReceiver::new(
         &ndi,
-        &ReceiverOptions::builder(Source::default()).build(),
+        &ReceiverOptions::new(Source::new("")).config(config.clone()),
         PassthroughPreset::HevcWithAudio,
-        &config,
     )
     .unwrap();
     let _ = packets.capture(Duration::ZERO).unwrap();
+    // Nothing is connected, so there is nowhere to send metadata.
+    assert!(matches!(
+        packets.send_metadata(&grafton_ndi::MetadataFrame::new("<local-test/>").unwrap()),
+        Err(Error::NotConnected)
+    ));
     let compressed =
-        CompressedSender::new_with_config(&ndi, &options("compressed"), &config).unwrap();
+        CompressedSender::new(&ndi, &options("compressed").config(config.clone())).unwrap();
     let unsent = compressed.close();
     assert!(unsent.program.is_none() && unsent.preview.is_none());
-    let mut queue = QueuedSender::new_with_config(
+    let mut queue = QueuedSender::new(
         &ndi,
-        &options("queue"),
-        &config,
+        &options("queue").config(config),
         QueueOptions::default().max_frames(2),
     )
     .unwrap();
@@ -178,7 +234,7 @@ fn advanced_native_allocator_replacement_and_capture() {
     let sender = Sender::new(&ndi, &options("allocation")).unwrap();
     let receiver = Receiver::new(
         &ndi,
-        &ReceiverOptions::builder(common::loopback_source(&ndi, &sender).unwrap()).build(),
+        &ReceiverOptions::new(common::loopback_source(&ndi, &sender).unwrap()),
     )
     .unwrap();
     let service =
@@ -194,8 +250,8 @@ fn advanced_native_allocator_replacement_and_capture() {
         .unwrap();
     let audio = AudioFrame::builder()
         .sample_rate(48_000)
-        .channels(2)
-        .samples(1600)
+        .num_channels(2)
+        .num_samples(1600)
         .build()
         .unwrap();
     let frame = video();
@@ -215,20 +271,21 @@ fn advanced_native_allocator_replacement_and_capture() {
         let mut captured = false;
         let mut last_error = None;
         while Instant::now() < deadline {
-            sender.send_video(&frame);
+            sender.send_video(&frame).unwrap();
             sender.send_audio(&audio);
             match receiver
                 .receiver()
                 .video()
                 .capture(Duration::from_millis(100))
             {
-                Ok(received) => {
+                Ok(Some(received)) => {
                     assert_eq!(received.width(), 64);
                     if count.load(Ordering::Relaxed) > 0 {
                         captured = true;
                         break;
                     }
                 }
+                Ok(None) => {}
                 Err(error) => last_error = Some(error),
             }
         }
@@ -284,17 +341,17 @@ fn failed_constructors_hand_back_what_they_were_given() {
 
     // No queue accepts a limit of zero frames, on any runtime.
     let sender = Sender::new(&ndi, &options("handback")).unwrap();
-    let name = sender.source().unwrap().name;
+    let source = sender.source().unwrap();
     let rejected = QueuedSender::from_sender(sender, QueueOptions::default().max_frames(0))
         .err()
         .expect("zero frames is not a valid queue limit");
     assert!(matches!(
         rejected.error(),
-        Error::InvalidConfiguration(_) | Error::UnsupportedCapability { .. }
+        Error::InvalidInput(_) | Error::UnsupportedCapability { .. }
     ));
     let sender = rejected.into_inner();
-    sender.send_video(&video());
-    assert_eq!(sender.source().unwrap().name, name);
+    sender.send_video(&video()).unwrap();
+    assert_eq!(sender.source().unwrap(), source);
 
     // These succeed on an Advanced runtime and are refused elsewhere; either
     // way the receiver comes back.
@@ -342,66 +399,78 @@ fn operations_report_why_the_advanced_sdk_is_unavailable() {
     }
     let config = AdvancedConfig::parse("{}").unwrap();
     let edition = ndi.info().edition();
-    let unsupported = |error: Error| {
+    // Each operation is refused for its own capability, with the reason its
+    // status gives: the runtime for its edition, or the build for the
+    // declarations it lacks, which it names. Nothing here is a version gate.
+    let unsupported = |expected: RuntimeFeature, error: Error| {
         let Error::UnsupportedCapability {
-            capability,
+            feature,
             reason,
             detail,
         } = error
         else {
             panic!("expected an unsupported capability, got {error:?}");
         };
-        assert!(!capability.is_empty());
-        // The runtime is refused for its edition, or the build for the
-        // declarations it lacks, which it names; nothing here is a version
-        // gate.
+        assert_eq!(feature, expected);
+        assert_eq!(
+            ndi.capabilities().status(feature),
+            CapabilityStatus::Unavailable(reason),
+            "{feature:?}"
+        );
         match reason {
             CapabilityUnavailable::WrongEdition => {
-                assert_eq!(edition, SdkEdition::Standard, "{capability}");
+                assert_eq!(edition, SdkEdition::Standard, "{feature:?}");
             }
             CapabilityUnavailable::BuildAbiUnavailable => {
-                assert!(detail.starts_with("NDIlib_"), "{capability}: {detail}");
+                assert!(detail.starts_with("NDIlib_"), "{feature:?}: {detail}");
             }
-            other => panic!("{capability}: unexpected reason {other:?}"),
+            other => panic!("{feature:?}: unexpected reason {other:?}"),
         }
     };
 
     unsupported(
-        Sender::new_with_config(&ndi, &options("unavailable"), &config)
+        RuntimeFeature::AdvancedSenderConfiguration,
+        Sender::new(&ndi, &options("unavailable").config(config.clone()))
             .err()
             .unwrap(),
     );
     unsupported(
-        Receiver::new_with_config(
+        RuntimeFeature::AdvancedReceiverConfiguration,
+        Receiver::new(
             &ndi,
-            &ReceiverOptions::builder(Source::default()).build(),
-            &config,
+            &ReceiverOptions::new(Source::new("")).config(config.clone()),
         )
         .err()
         .unwrap(),
     );
     unsupported(
-        Finder::new_with_config(&ndi, &FinderOptions::default(), &config)
+        RuntimeFeature::AdvancedFinderConfiguration,
+        Finder::new(&ndi, &FinderOptions::new().config(config))
             .err()
             .unwrap(),
     );
-    unsupported(Genlock::new(&ndi, None, None).err().unwrap());
     unsupported(
+        RuntimeFeature::Genlock,
+        Genlock::new(&ndi, None, None).err().unwrap(),
+    );
+    unsupported(
+        RuntimeFeature::Passthrough(PassthroughPreset::Hevc),
         PacketReceiver::new(
             &ndi,
-            &ReceiverOptions::builder(Source::default()).build(),
+            &ReceiverOptions::new(Source::new("")),
             PassthroughPreset::Hevc,
-            &config,
         )
         .err()
         .unwrap(),
     );
     unsupported(
+        RuntimeFeature::AdvancedSenderConfiguration,
         CompressedSender::new(&ndi, &options("unavailable-compressed"))
             .err()
             .unwrap(),
     );
     unsupported(
+        RuntimeFeature::SendCompletion,
         QueuedSender::new(&ndi, &options("unavailable-queue"), QueueOptions::default())
             .err()
             .unwrap(),
@@ -409,42 +478,52 @@ fn operations_report_why_the_advanced_sdk_is_unavailable() {
 
     let sender = Sender::new(&ndi, &options("unavailable-core")).unwrap();
     unsupported(
+        RuntimeFeature::SenderTally,
         sender
             .set_external_tally(Tally::new(true, false))
             .unwrap_err(),
     );
-    unsupported(sender.keyframe_required(None).unwrap_err());
-    let mut receiver = unconnected_receiver(&ndi);
-    unsupported(receiver.request_keyframe().unwrap_err());
     unsupported(
-        receiver
-            .set_video_quality(VideoQuality::Preview)
-            .unwrap_err(),
+        RuntimeFeature::KeyframeDemand,
+        sender.keyframe_required(None).unwrap_err(),
     );
-    unsupported(receiver.kvm().err().unwrap());
+    let mut receiver = unconnected_receiver(&ndi);
+    unsupported(
+        RuntimeFeature::KeyframeRequest,
+        receiver.request_keyframe().unwrap_err(),
+    );
+    unsupported(
+        RuntimeFeature::ReceiverStreamTier,
+        receiver.set_stream_tier(StreamTier::Preview).unwrap_err(),
+    );
+    unsupported(
+        RuntimeFeature::ReceiverStreamSelection,
+        receiver.set_streams(MediaTypes::VIDEO).unwrap_err(),
+    );
+    unsupported(RuntimeFeature::Kvm, receiver.kvm().err().unwrap());
     let finder = Finder::new(&ndi, &FinderOptions::default()).unwrap();
-    unsupported(finder.sources_with_metadata().unwrap_err());
+    unsupported(
+        RuntimeFeature::SourceMetadata,
+        finder.sources_with_metadata().unwrap_err(),
+    );
 
     // The core API is unaffected.
-    sender.send_video(&video());
+    sender.send_video(&video()).unwrap();
     assert!(finder.current_sources().is_ok());
 }
 
 /// The loopback endpoint of a source that a sender of this process advertises.
-fn loopback(ndi: &NDI, advertised: &Source) -> Source {
-    common::loopback_endpoint(ndi, &advertised.name).unwrap()
+fn loopback(ndi: &Ndi, advertised: &Source) -> Source {
+    common::loopback_endpoint(ndi, advertised.name()).unwrap()
 }
 
 /// A receiver of everything `advertised` sends, compressed, on the video
 /// stream `bandwidth` selects.
-fn packet_receiver(ndi: &NDI, advertised: &Source, bandwidth: ReceiverBandwidth) -> PacketReceiver {
+fn packet_receiver(ndi: &Ndi, advertised: &Source, bandwidth: ReceiverBandwidth) -> PacketReceiver {
     PacketReceiver::new(
         ndi,
-        &ReceiverOptions::builder(loopback(ndi, advertised))
-            .bandwidth(bandwidth)
-            .build(),
+        &ReceiverOptions::new(loopback(ndi, advertised)).bandwidth(bandwidth),
         PassthroughPreset::ProtectedWithAudio,
-        &AdvancedConfig::parse("{}").unwrap(),
     )
     .unwrap()
 }
@@ -457,7 +536,7 @@ fn await_event<T>(
 ) -> T {
     let deadline = Instant::now() + PATIENCE;
     loop {
-        if let Some(found) = wanted(receiver.capture(SLICE).unwrap()) {
+        if let Some(found) = receiver.capture(SLICE).unwrap().and_then(&mut wanted) {
             return found;
         }
         assert!(Instant::now() < deadline, "{what} did not arrive");
@@ -476,13 +555,17 @@ fn await_video(receiver: &mut PacketReceiver, timecode: i64) -> CompressedVideoF
         &format!("video frame {timecode}"),
         |event| match event {
             PacketEvent::Video(ReceivedVideo::Compressed(frame))
-                if frame.timecode() >= FIRST_TIMECODE =>
+                if frame.timecode().ticks() >= FIRST_TIMECODE =>
             {
-                assert_eq!(frame.timecode(), timecode, "an unexpected video frame");
+                assert_eq!(
+                    frame.timecode().ticks(),
+                    timecode,
+                    "an unexpected video frame"
+                );
                 Some(frame)
             }
             PacketEvent::Video(ReceivedVideo::Decoded(frame)) => {
-                panic!("video frame {} arrived decoded", frame.timecode())
+                panic!("video frame {:?} arrived decoded", frame.timecode())
             }
             _ => None,
         },
@@ -496,13 +579,17 @@ fn await_audio(receiver: &mut PacketReceiver, timecode: i64) -> CompressedAudioF
         &format!("audio frame {timecode}"),
         |event| match event {
             PacketEvent::Audio(ReceivedAudio::Compressed(frame))
-                if frame.timecode() >= FIRST_TIMECODE =>
+                if frame.timecode().ticks() >= FIRST_TIMECODE =>
             {
-                assert_eq!(frame.timecode(), timecode, "an unexpected audio frame");
+                assert_eq!(
+                    frame.timecode().ticks(),
+                    timecode,
+                    "an unexpected audio frame"
+                );
                 Some(frame)
             }
             PacketEvent::Audio(ReceivedAudio::Decoded(frame)) => {
-                panic!("audio frame {} arrived decoded", frame.timecode())
+                panic!("audio frame {:?} arrived decoded", frame.timecode())
             }
             _ => None,
         },
@@ -516,7 +603,7 @@ fn connect(receiver: &mut PacketReceiver, mut probe: impl FnMut(i64)) {
         probe(timecode);
         if matches!(
             receiver.capture(SLICE).unwrap(),
-            PacketEvent::Video(_) | PacketEvent::Audio(_)
+            Some(PacketEvent::Video(_) | PacketEvent::Audio(_))
         ) {
             return;
         }
@@ -536,7 +623,7 @@ fn payload(seed: i64, len: usize) -> Vec<u8> {
 /// quality byte for SpeedHQ.
 fn video_bytes(codec: VideoCodec, seed: i64, keyframe: bool) -> Vec<u8> {
     match codec.envelope_codec() {
-        Some(envelope) => packet_envelope(
+        Some(envelope) => PacketEnvelope::encode(
             envelope,
             90_000 + seed,
             89_000 - seed,
@@ -562,11 +649,10 @@ fn video_format(codec: VideoCodec, tier: StreamTier) -> VideoPacketFormat {
     };
     VideoPacketFormat::new(codec, width, height)
         .unwrap()
-        .frame_rate(60_000, 1001)
+        .with_frame_rate(FrameRate::new(60_000, 1001).unwrap())
+        .with_picture_aspect_ratio(4.0 / 3.0)
         .unwrap()
-        .aspect_ratio(4.0 / 3.0)
-        .unwrap()
-        .tier(tier)
+        .with_tier(tier)
 }
 
 /// A keyframe of `codec` on `tier` with timecode `timecode`.
@@ -576,19 +662,19 @@ fn keyframe(codec: VideoCodec, tier: StreamTier, timecode: i64) -> CompressedVid
         video_bytes(codec, timecode, true),
     )
     .unwrap()
-    .with_timecode(timecode)
+    .with_timecode(Timecode::from_ticks(timecode))
 }
 
 /// The sample rates an AAC configuration can name, in the order of its
 /// sampling-frequency index.
-const AAC_SAMPLE_RATES: [i32; 13] = [
+const AAC_SAMPLE_RATES: [u32; 13] = [
     96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000,
     7_350,
 ];
 
 /// The channel counts an AAC configuration can name, in the order of its
 /// channel configuration, which starts at one.
-const AAC_CHANNELS: [i32; 7] = [1, 2, 3, 4, 5, 6, 8];
+const AAC_CHANNELS: [u32; 7] = [1, 2, 3, 4, 5, 6, 8];
 
 /// Every video codec.
 const VIDEO_CODECS: [VideoCodec; 7] = [
@@ -602,8 +688,8 @@ const VIDEO_CODECS: [VideoCodec; 7] = [
 ];
 
 /// A two-byte AAC-LC AudioSpecificConfig.
-fn aac_config(sample_rate: i32, channels: i32) -> [u8; 2] {
-    let position = |values: &[i32], value| {
+fn aac_config(sample_rate: u32, channels: u32) -> [u8; 2] {
+    let position = |values: &[u32], value| {
         values
             .iter()
             .position(|candidate| *candidate == value)
@@ -616,9 +702,9 @@ fn aac_config(sample_rate: i32, channels: i32) -> [u8; 2] {
 
 /// The bytes of audio frame `seed`: an envelope with its configuration for
 /// AAC, a bare packet for Opus.
-fn audio_bytes(codec: AudioCodec, sample_rate: i32, channels: i32, seed: i64) -> Vec<u8> {
+fn audio_bytes(codec: AudioCodec, sample_rate: u32, channels: u32, seed: i64) -> Vec<u8> {
     match codec {
-        AudioCodec::Aac => packet_envelope(
+        AudioCodec::Aac => PacketEnvelope::encode(
             EnvelopeCodec::Aac,
             48_000 + seed,
             47_000 - seed,
@@ -733,14 +819,14 @@ fn compressed_video_arrives_as_sent_by_every_kind_of_send() {
             for (submission, keyframe) in frames {
                 timecode += 1;
                 let format = video_format(codec, tier)
-                    .protected(protected)
-                    .scan_type(scans[timecode as usize % scans.len()]);
+                    .with_protected(protected)
+                    .with_scan_type(scans[timecode as usize % scans.len()]);
                 let bytes = video_bytes(codec, timecode, keyframe);
                 let metadata = format!("<frame number=\"{timecode}\"/>");
                 let contiguous = || {
                     CompressedVideoFrame::new(format, bytes.clone())
                         .unwrap()
-                        .with_timecode(timecode)
+                        .with_timecode(Timecode::from_ticks(timecode))
                         .with_metadata(metadata.as_str())
                         .unwrap()
                 };
@@ -753,7 +839,7 @@ fn compressed_video_arrives_as_sent_by_every_kind_of_send() {
                     };
                     ScatterVideoFrame::new(format, split(&bytes, cuts))
                         .unwrap()
-                        .with_timecode(timecode)
+                        .with_timecode(Timecode::from_ticks(timecode))
                         .with_metadata(metadata.as_str())
                         .unwrap()
                 };
@@ -813,18 +899,18 @@ fn compressed_video_arrives_as_sent_by_every_kind_of_send() {
 #[derive(Debug)]
 struct AudioCandidate {
     codec: AudioCodec,
-    sample_rate: i32,
-    channels: i32,
-    samples: i32,
+    sample_rate: u32,
+    channels: u32,
+    samples: u32,
     /// For AAC, the sample rate and channel count its configuration names,
     /// or `None` for a configuration too short to name them.
-    config: Option<(i32, i32)>,
+    config: Option<(u32, u32)>,
     /// For AAC, whether the envelope keeps its keyframe flag.
     flagged: bool,
 }
 
 impl AudioCandidate {
-    fn opus(sample_rate: i32, channels: i32, samples: i32) -> Self {
+    fn opus(sample_rate: u32, channels: u32, samples: u32) -> Self {
         Self {
             codec: AudioCodec::Opus,
             sample_rate,
@@ -837,8 +923,8 @@ impl AudioCandidate {
 
     /// An AAC frame whose configuration names the frame's own parameters
     /// where it can, and 48 kHz stereo where it cannot.
-    fn aac(sample_rate: i32, channels: i32, samples: i32) -> Self {
-        let nameable = |values: &[i32], value, otherwise| {
+    fn aac(sample_rate: u32, channels: u32, samples: u32) -> Self {
+        let nameable = |values: &[u32], value, otherwise| {
             if values.contains(&value) {
                 value
             } else {
@@ -866,7 +952,7 @@ impl AudioCandidate {
             Some((sample_rate, channels)) => aac_config(sample_rate, channels).to_vec(),
             None => vec![0x11],
         };
-        let mut bytes = packet_envelope(
+        let mut bytes = PacketEnvelope::encode(
             EnvelopeCodec::Aac,
             48_000 + seed,
             47_000 - seed,
@@ -898,7 +984,7 @@ fn every_audio_frame_the_wrapper_admits_is_delivered_as_sent() {
     connect(&mut receiver, |timecode| {
         let mut probe = CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 64])
             .unwrap()
-            .with_timecode(timecode);
+            .with_timecode(Timecode::from_ticks(timecode));
         sender.send_audio(&mut probe).unwrap();
     });
 
@@ -995,8 +1081,8 @@ fn every_audio_frame_the_wrapper_admits_is_delivered_as_sent() {
                 let mut frame =
                     ScatterAudioFrame::new(codec, sample_rate, channels, samples, blocks)
                         .unwrap()
-                        .with_timecode(timecode)
-                        .protected(protected)
+                        .with_timecode(Timecode::from_ticks(timecode))
+                        .with_protected(protected)
                         .with_metadata(metadata.as_str())
                         .unwrap();
                 sender.send_scatter_audio(&mut frame).unwrap();
@@ -1004,8 +1090,8 @@ fn every_audio_frame_the_wrapper_admits_is_delivered_as_sent() {
                 let mut frame =
                     CompressedAudioFrame::new(codec, sample_rate, channels, samples, bytes.clone())
                         .unwrap()
-                        .with_timecode(timecode)
-                        .protected(protected)
+                        .with_timecode(Timecode::from_ticks(timecode))
+                        .with_protected(protected)
                         .with_metadata(metadata.as_str())
                         .unwrap();
                 sender.send_audio(&mut frame).unwrap();
@@ -1016,8 +1102,8 @@ fn every_audio_frame_the_wrapper_admits_is_delivered_as_sent() {
                     received.codec(),
                     received.is_protected(),
                     received.sample_rate(),
-                    received.channels(),
-                    received.samples()
+                    received.num_channels(),
+                    received.num_samples()
                 ),
                 (codec, protected, sample_rate, channels, samples),
                 "scatter={scatter}"
@@ -1086,10 +1172,12 @@ fn every_video_frame_the_wrapper_admits_is_delivered() {
             {
                 let format = VideoPacketFormat::new(codec, width, height)
                     .unwrap()
-                    .tier(tier);
+                    .with_tier(tier);
                 // A format that leaves the aspect ratio at zero has square
                 // pixels, and arrives with the ratio that stands for.
-                let delivered = format.aspect_ratio(width as f32 / height as f32).unwrap();
+                let delivered = format
+                    .with_picture_aspect_ratio(width as f32 / height as f32)
+                    .unwrap();
                 let bytes = |timecode| {
                     let mut bytes = video_bytes(codec, timecode, true);
                     if let Some(quality) = quality {
@@ -1121,7 +1209,7 @@ fn every_video_frame_the_wrapper_admits_is_delivered() {
                 let sent = bytes(timecode);
                 let mut frame = CompressedVideoFrame::new(format, sent.clone())
                     .unwrap()
-                    .with_timecode(timecode);
+                    .with_timecode(Timecode::from_ticks(timecode));
                 sender.send_video(&mut frame).unwrap();
                 let received = await_video(receiver, timecode);
                 assert_eq!(received.format(), delivered);
@@ -1131,7 +1219,7 @@ fn every_video_frame_the_wrapper_admits_is_delivered() {
                 let sent = bytes(timecode);
                 let mut frame = ScatterVideoFrame::new(format, split(&sent, cuts))
                     .unwrap()
-                    .with_timecode(timecode);
+                    .with_timecode(Timecode::from_ticks(timecode));
                 sender.send_scatter_video(&mut frame).unwrap();
                 let received = await_video(receiver, timecode);
                 assert_eq!(received.format(), delivered);
@@ -1187,7 +1275,7 @@ fn a_relay_delivers_every_packet_it_receives() {
         let bytes = video_bytes(codec, timecode, is_keyframe);
         let mut frame = CompressedVideoFrame::new(format, bytes.clone())
             .unwrap()
-            .with_timecode(timecode)
+            .with_timecode(Timecode::from_ticks(timecode))
             .with_metadata("<relayed/>")
             .unwrap();
         origin.send_video(&mut frame).unwrap();
@@ -1217,7 +1305,7 @@ fn a_relay_delivers_every_packet_it_receives() {
             let mut frame =
                 CompressedAudioFrame::new(codec, sample_rate, channels, samples, bytes.clone())
                     .unwrap()
-                    .with_timecode(timecode);
+                    .with_timecode(Timecode::from_ticks(timecode));
             origin.send_audio(&mut frame).unwrap();
 
             let mut received = await_audio(&mut upstream, timecode);
@@ -1227,8 +1315,8 @@ fn a_relay_delivers_every_packet_it_receives() {
                 (
                     relayed.codec(),
                     relayed.sample_rate(),
-                    relayed.channels(),
-                    relayed.samples()
+                    relayed.num_channels(),
+                    relayed.num_samples()
                 ),
                 (codec, sample_rate, channels, samples)
             );
@@ -1266,7 +1354,7 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
     let bytes = video_bytes(VideoCodec::H264, timecode, true);
     let mut frame = CompressedVideoFrame::new(format, bytes.clone())
         .unwrap()
-        .with_timecode(timecode)
+        .with_timecode(Timecode::from_ticks(timecode))
         .with_metadata("<again/>")
         .unwrap();
     for _ in 0..3 {
@@ -1284,7 +1372,7 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
     let bytes = video_bytes(VideoCodec::H264, timecode, true);
     let mut scatter = ScatterVideoFrame::new(format, split(&bytes, &[44, 2000]))
         .unwrap()
-        .with_timecode(timecode);
+        .with_timecode(Timecode::from_ticks(timecode));
     for _ in 0..3 {
         sender.send_scatter_video(&mut scatter).unwrap();
         assert_same_packet(await_video(&mut receiver, timecode).data(), &bytes, h264);
@@ -1299,7 +1387,7 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
         let bytes = video_bytes(VideoCodec::H264, timecode, true);
         let frame = CompressedVideoFrame::new(format, bytes.clone())
             .unwrap()
-            .with_timecode(timecode);
+            .with_timecode(Timecode::from_ticks(timecode));
         frames.push((timecode, bytes, Some(frame)));
     }
     for round in 0..6 {
@@ -1325,7 +1413,7 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
         let envelope = (codec == AudioCodec::Aac).then_some(EnvelopeCodec::Aac);
         let mut frame = CompressedAudioFrame::new(codec, 48_000, 2, samples, bytes.clone())
             .unwrap()
-            .with_timecode(timecode);
+            .with_timecode(Timecode::from_ticks(timecode));
         for _ in 0..3 {
             sender.send_audio(&mut frame).unwrap();
             assert_same_packet(
@@ -1363,7 +1451,7 @@ fn a_frame_returned_by_a_queued_sender_can_be_resubmitted() {
     let mut frame = QueuedVideoFrame::from(
         CompressedVideoFrame::new(format, bytes.clone())
             .unwrap()
-            .with_timecode(timecode),
+            .with_timecode(Timecode::from_ticks(timecode)),
     );
     for _ in 0..4 {
         let id = queue.try_submit(frame).unwrap();
@@ -1411,7 +1499,7 @@ fn synchronized_audio(
             "AVSync returned audio {} times, not {count}",
             audio.len()
         );
-        let Some(video) = sync.receiver().video().try_capture(SLICE).unwrap() else {
+        let Some(video) = sync.receiver().video().capture(SLICE).unwrap() else {
             continue;
         };
         match sync
@@ -1446,27 +1534,26 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
     // samples of 48 kHz audio that last as long.
     let sender = Sender::new(
         &ndi,
-        &SenderOptions::builder(format!("grafton-local-{}-avsync", std::process::id()))
+        &SenderOptions::new(format!("grafton-local-{}-avsync", std::process::id()))
             .clock_video(true)
-            .clock_audio(false)
-            .build(),
+            .clock_audio(false),
     )
     .unwrap();
     let receiver = Receiver::new(
         &ndi,
-        &ReceiverOptions::builder(common::loopback_source(&ndi, &sender).unwrap()).build(),
+        &ReceiverOptions::new(common::loopback_source(&ndi, &sender).unwrap()),
     )
     .unwrap();
     let mut sync = AvSync::new(receiver).unwrap();
     let video = VideoFrame::builder()
         .resolution(64, 32)
-        .frame_rate(30, 1)
+        .frame_rate(FrameRate::new(30, 1).unwrap())
         .build()
         .unwrap();
     let audio = AudioFrame::builder()
         .sample_rate(48_000)
-        .channels(2)
-        .samples(1600)
+        .num_channels(2)
+        .num_samples(1600)
         .build()
         .unwrap();
     let stop = AtomicBool::new(false);
@@ -1474,7 +1561,7 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
         let _stop = StopOnDrop(&stop);
         scope.spawn(|| {
             while !stop.load(Ordering::Acquire) {
-                sender.send_video(&video);
+                sender.send_video(&video).unwrap();
                 sender.send_audio(&audio);
             }
         });
@@ -1499,7 +1586,7 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
         );
 
         // A count close to what belongs to a video frame is returned exactly.
-        let request = AvSyncRequest::new(Some(1600), Some(48_000)).unwrap();
+        let request = AvSyncRequest::new(Some(48_000), Some(1600)).unwrap();
         let exact = synchronized_audio(&mut sync, request, true, 5);
         for (frame, samples_adjusted) in &exact {
             is_source_format(frame);
@@ -1513,14 +1600,14 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
 
         // A count far from it is not: the frame's own audio comes back, and
         // the result says that the count was not met.
-        let request = AvSyncRequest::new(Some(800), Some(48_000)).unwrap();
+        let request = AvSyncRequest::new(Some(48_000), Some(800)).unwrap();
         for (frame, samples_adjusted) in synchronized_audio(&mut sync, request, true, 3) {
             is_source_format(&frame);
             assert!(samples_adjusted && frame.num_samples() != 800);
         }
 
         // An exact count without a video frame is taken from the queued audio.
-        let request = AvSyncRequest::new(Some(480), Some(48_000)).unwrap();
+        let request = AvSyncRequest::new(Some(48_000), Some(480)).unwrap();
         for (frame, samples_adjusted) in synchronized_audio(&mut sync, request, false, 3) {
             is_source_format(&frame);
             assert_eq!((frame.num_samples(), samples_adjusted), (480, false));
@@ -1533,13 +1620,18 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
 
         // A request computed for another sample rate than the source's is
         // told the source's format instead of being given audio.
-        let request = AvSyncRequest::new(Some(1470), Some(44_100)).unwrap();
-        let frame = sync.receiver().video().capture(PATIENCE).unwrap();
+        let request = AvSyncRequest::new(Some(44_100), Some(1470)).unwrap();
+        let frame = sync
+            .receiver()
+            .video()
+            .capture(PATIENCE)
+            .unwrap()
+            .expect("a frame within the wait");
         assert!(matches!(
             sync.synchronize(Some(&frame), request).unwrap(),
             AvSyncOutcome::FormatChanged {
                 sample_rate: 48_000,
-                channels: 2
+                num_channels: 2
             }
         ));
     });
@@ -1580,8 +1672,7 @@ fn allocator_calls_run_concurrently_up_to_the_documented_limit() {
     let calls = Arc::new(PolicyCalls::default());
     let receivers: Vec<_> = (0..CONCURRENT_CALLS)
         .map(|_| {
-            let receiver =
-                Receiver::new(&ndi, &ReceiverOptions::builder(source.clone()).build()).unwrap();
+            let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source.clone())).unwrap();
             let mut receiver = service.attach(receiver).unwrap();
             let calls = calls.clone();
             receiver
@@ -1610,7 +1701,7 @@ fn allocator_calls_run_concurrently_up_to_the_documented_limit() {
     let frame = video();
     let deadline = Instant::now() + PATIENCE;
     let (peak, in_progress) = loop {
-        sender.send_video(&frame);
+        sender.send_video(&frame).unwrap();
         let (mut state, _) = calls
             .changed
             .wait_timeout_while(calls.lock(), SLICE, |state| state.1 < CONCURRENT_CALLS)
@@ -1668,28 +1759,30 @@ fn a_finder_is_told_the_metadata_a_sender_advertises() {
         ))
         .unwrap()
     };
-    let described = Sender::new_with_config(
+    let described = Sender::new(
         &ndi,
-        &options("described"),
-        &config(r#","send":{"metadata":"<grafton-test kind=\"described\"/>"}"#),
+        &options("described").config(config(
+            r#","send":{"metadata":"<grafton-test kind=\"described\"/>"}"#,
+        )),
     )
     .unwrap();
-    let undescribed = Sender::new_with_config(&ndi, &options("undescribed"), &config("")).unwrap();
-    let finder = Finder::new_with_config(&ndi, &FinderOptions::default(), &config("")).unwrap();
+    let undescribed = Sender::new(&ndi, &options("undescribed").config(config(""))).unwrap();
+    let finder = Finder::new(&ndi, &FinderOptions::new().config(config(""))).unwrap();
 
-    let names = [
-        described.source().unwrap().name,
-        undescribed.source().unwrap().name,
-    ];
+    let sources = [described.source().unwrap(), undescribed.source().unwrap()];
     let deadline = Instant::now() + PATIENCE;
     let metadata = loop {
-        let sources = finder.sources_with_metadata().unwrap();
-        let found: Vec<_> = names
+        let found_sources = finder.sources_with_metadata().unwrap();
+        let found: Vec<_> = sources
             .iter()
-            .filter_map(|name| sources.iter().find(|source| source.source().name == *name))
+            .filter_map(|wanted| {
+                found_sources
+                    .iter()
+                    .find(|source| source.source().name() == wanted.name())
+            })
             .map(|source| source.metadata().map(str::to_owned))
             .collect();
-        if found.len() == names.len() {
+        if found.len() == sources.len() {
             break found;
         }
         assert!(
@@ -1719,9 +1812,8 @@ fn hevc_444_decodes_to_the_original_full_resolution_chroma_planes() {
     let mut sender = CompressedSender::new(&ndi, &options("hevc-444")).unwrap();
     let receiver = Receiver::new(
         &ndi,
-        &ReceiverOptions::builder(loopback(&ndi, &sender.source().unwrap()))
-            .color(grafton_ndi::ReceiverColorFormat::Best444)
-            .build(),
+        &ReceiverOptions::new(loopback(&ndi, &sender.source().unwrap()))
+            .color_format(grafton_ndi::ReceiverColorFormat::Best444),
     )
     .unwrap();
     let bitstream = include_bytes!("data/chroma-444.hevc");
@@ -1745,12 +1837,11 @@ fn hevc_444_decodes_to_the_original_full_resolution_chroma_planes() {
         .expect("the fixture has an IDR slice after VPS, SPS and PPS");
     let format = VideoPacketFormat::new(VideoCodec::Hevc, 64, 32)
         .unwrap()
-        .frame_rate(30, 1)
-        .unwrap();
+        .with_frame_rate(FrameRate::new(30, 1).unwrap());
     let deadline = Instant::now() + PATIENCE;
     let mut pts = 0;
     loop {
-        let bytes = packet_envelope(
+        let bytes = PacketEnvelope::encode(
             EnvelopeCodec::Hevc,
             pts,
             pts,
@@ -1761,9 +1852,9 @@ fn hevc_444_decodes_to_the_original_full_resolution_chroma_planes() {
         .unwrap();
         let mut packet = CompressedVideoFrame::new(format, bytes).unwrap();
         sender.send_video(&mut packet).unwrap();
-        if let Some(frame) = receiver.video().try_capture_ref(SLICE).unwrap() {
+        if let Some(frame) = receiver.video().capture_ref(SLICE).unwrap() {
             assert_eq!((frame.width(), frame.height()), (64, 32));
-            assert_eq!(frame.pixel_format(), grafton_ndi::PixelFormat::NA48);
+            assert_eq!(frame.pixel_format(), grafton_ndi::PixelFormat::Na48);
             assert_eq!(frame.planes().len(), 3);
             for (plane_index, plane) in frame.planes().enumerate() {
                 assert_eq!(plane.row_count(), 32);
@@ -1801,7 +1892,7 @@ fn genlock_clocks_wait_on_the_system_clock_without_a_reference() {
                 let began = Instant::now();
                 for _ in 0..4 {
                     assert_eq!(
-                        video.wait(60, 1, ScanType::Progressive).unwrap(),
+                        video.wait(FrameRate::new(60, 1).unwrap(), ScanType::Progressive),
                         ClockSource::SystemClock
                     );
                 }
@@ -1835,15 +1926,14 @@ fn avsync_follows_source_format_changes_and_preserves_audio_samples() {
     let _turn = sockets();
     let sender = Sender::new(
         &ndi,
-        &SenderOptions::builder(common::unique_name("avsync-format"))
+        &SenderOptions::new(common::unique_name("avsync-format"))
             .clock_video(true)
-            .clock_audio(false)
-            .build(),
+            .clock_audio(false),
     )
     .unwrap();
     let receiver = Receiver::new(
         &ndi,
-        &ReceiverOptions::builder(common::loopback_source(&ndi, &sender).unwrap()).build(),
+        &ReceiverOptions::new(common::loopback_source(&ndi, &sender).unwrap()),
     )
     .unwrap();
     let mut sync = AvSync::new(receiver).unwrap();
@@ -1855,34 +1945,34 @@ fn avsync_follows_source_format_changes_and_preserves_audio_samples() {
             let video = [
                 VideoFrame::builder()
                     .resolution(64, 32)
-                    .frame_rate(30, 1)
+                    .frame_rate(FrameRate::new(30, 1).unwrap())
                     .build()
                     .unwrap(),
                 VideoFrame::builder()
                     .resolution(128, 64)
-                    .frame_rate(25, 1)
+                    .frame_rate(FrameRate::new(25, 1).unwrap())
                     .build()
                     .unwrap(),
             ];
             let audio = [
                 AudioFrame::builder()
                     .sample_rate(48_000)
-                    .channels(2)
-                    .samples(1600)
+                    .num_channels(2)
+                    .num_samples(1600)
                     .data(vec![0.25; 3200])
                     .build()
                     .unwrap(),
                 AudioFrame::builder()
                     .sample_rate(44_100)
-                    .channels(1)
-                    .samples(1764)
+                    .num_channels(1)
+                    .num_samples(1764)
                     .data(vec![0.5; 1764])
                     .build()
                     .unwrap(),
             ];
             while !stop.load(Ordering::Acquire) {
                 let index = phase.load(Ordering::Acquire);
-                sender.send_video(&video[index]);
+                sender.send_video(&video[index]).unwrap();
                 sender.send_audio(&audio[index]);
             }
         });
@@ -1897,7 +1987,7 @@ fn avsync_follows_source_format_changes_and_preserves_audio_samples() {
                     Instant::now() < deadline,
                     "AVSync did not follow format {index}"
                 );
-                let Some(video) = sync.receiver().video().try_capture(SLICE).unwrap() else {
+                let Some(video) = sync.receiver().video().capture(SLICE).unwrap() else {
                     continue;
                 };
                 if let AvSyncOutcome::Audio { frame, .. } = sync
@@ -1934,14 +2024,14 @@ fn genlock_follows_a_local_reference_and_returns_to_the_system_clock() {
     let _turn = sockets();
     let sender = Sender::new(
         &ndi,
-        &SenderOptions::builder(common::unique_name("genlock-reference"))
+        &SenderOptions::new(common::unique_name("genlock-reference"))
             .clock_video(true)
-            .clock_audio(false)
-            .build(),
+            .clock_audio(false),
     )
     .unwrap();
     let source = common::loopback_source(&ndi, &sender).unwrap();
     let mut genlock = Genlock::new(&ndi, Some(&source), None).unwrap();
+    let thirty = FrameRate::new(30, 1).unwrap();
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
         let _stop = StopOnDrop(&stop);
@@ -1949,12 +2039,12 @@ fn genlock_follows_a_local_reference_and_returns_to_the_system_clock() {
             let video = video();
             let audio = AudioFrame::builder()
                 .sample_rate(48_000)
-                .channels(2)
-                .samples(1600)
+                .num_channels(2)
+                .num_samples(1600)
                 .build()
                 .unwrap();
             while !stop.load(Ordering::Acquire) {
-                sender.send_video(&video);
+                sender.send_video(&video).unwrap();
                 sender.send_audio(&audio);
             }
         });
@@ -1965,12 +2055,12 @@ fn genlock_follows_a_local_reference_and_returns_to_the_system_clock() {
                 "genlock did not acquire the reference"
             );
             let (mut video, _) = genlock.clocks();
-            video.wait(30, 1, ScanType::Progressive).unwrap();
+            video.wait(thirty, ScanType::Progressive);
         }
         let (mut video, mut audio) = genlock.clocks();
         let deadline = Instant::now() + PATIENCE;
         loop {
-            let video = video.wait(30, 1, ScanType::Progressive).unwrap();
+            let video = video.wait(thirty, ScanType::Progressive);
             let audio = audio.wait(48_000, 1600).unwrap();
             if video == ClockSource::ReferenceSignal && audio == ClockSource::ReferenceSignal {
                 break;
@@ -1985,7 +2075,7 @@ fn genlock_follows_a_local_reference_and_returns_to_the_system_clock() {
     let deadline = Instant::now() + PATIENCE;
     let (mut video, mut audio) = genlock.clocks();
     loop {
-        let video = video.wait(30, 1, ScanType::Progressive).unwrap();
+        let video = video.wait(thirty, ScanType::Progressive);
         let audio = audio.wait(48_000, 1600).unwrap();
         if video == ClockSource::SystemClock && audio == ClockSource::SystemClock {
             break;

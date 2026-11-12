@@ -16,17 +16,13 @@
 
 use std::time::Duration;
 
-use grafton_ndi::{advanced::AdvancedConfig, Error, Finder, FinderOptions, NDI};
+use grafton_ndi::{advanced::AdvancedConfig, Error, Finder, FinderOptions, Ndi};
 
 fn main() -> Result<(), Error> {
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
     // The properties of this JSON document are defined by the NDI Advanced SDK.
     let config = AdvancedConfig::parse("{}")?;
-    let finder = Finder::new_with_config(
-        &ndi,
-        &FinderOptions::builder().show_local_sources(true).build(),
-        &config,
-    )?;
+    let finder = Finder::new(&ndi, &FinderOptions::new().config(config))?;
 
     println!("Searching for NDI sources...");
     finder.wait_for_sources(Duration::from_secs(5))?;

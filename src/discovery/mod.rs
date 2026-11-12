@@ -13,7 +13,7 @@
 //! All four need an NDI 6.4.0 or later runtime; earlier runtimes can crash
 //! when these objects are destroyed, so their constructors return
 //! [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
-//! there. [`NDI::capabilities`](crate::NDI::capabilities) reports each one.
+//! there. [`Ndi::capabilities`](crate::Ndi::capabilities) reports each one.
 //!
 //! The native owners are [`Send`] but not [`Sync`]. Snapshots and events are
 //! plain owned data.
@@ -46,13 +46,13 @@
 //! ```no_run
 //! use grafton_ndi::{
 //!     discovery::{ListenerOptions, RecvListener},
-//!     NDI,
+//!     Ndi,
 //! };
 //! use std::time::Duration;
 //!
 //! # fn main() -> Result<(), grafton_ndi::Error> {
-//! let ndi = NDI::new()?;
-//! let options = ListenerOptions::default().server("127.0.0.1")?;
+//! let ndi = Ndi::new()?;
+//! let options = ListenerOptions::default().server("127.0.0.1");
 //! let mut listener = RecvListener::new(&ndi, &options)?;
 //! // The listener connects in the background; give it time to hear from the
 //! // server before reading the registry.
@@ -77,7 +77,7 @@ pub use advertiser::{
 };
 pub use listener::{
     AdvertisedReceiver, AdvertisedSender, InputGroupId, ListenerEvent, ListenerOptions,
-    ReceiverCommand, ReceiverId, ReceiverStream, RecvListener, SendListener, SenderId, Wait,
+    ReceiverCommand, ReceiverId, ReceiverStream, RecvListener, SendListener, SenderId,
 };
 
 /// The error for an advertiser or listener the SDK did not create.
@@ -86,7 +86,7 @@ pub use listener::{
 /// not, so a refusal is about the configuration: `server` is the address that
 /// was given.
 fn not_created(object: &str, server: Option<&str>) -> crate::Error {
-    crate::Error::InvalidConfiguration(match server {
+    crate::Error::InvalidInput(match server {
         Some(server) => format!(
             "the SDK created no {object}: it does not accept {server:?} as a Discovery Server \
              address"

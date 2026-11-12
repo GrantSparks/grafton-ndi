@@ -19,7 +19,7 @@ use grafton_ndi::{
         AdvertiserOptions, ListenerOptions, RecvListener, SendAdvertisement, SendAdvertiser,
         SendListener,
     },
-    Error, Sender, SenderOptions, NDI,
+    Error, Ndi, Sender, SenderOptions,
 };
 
 use std::{
@@ -36,17 +36,14 @@ fn main() -> Result<(), Error> {
     let mut listener_options = ListenerOptions::default();
     if let Some(server) = &server {
         advertiser_options = advertiser_options.servers(server.as_str());
-        listener_options = listener_options.server(server.as_str())?;
+        listener_options = listener_options.server(server.as_str());
     }
 
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
 
     // Register a sender. The advertiser keeps it registered, and alive, until
     // the registration is removed or the advertiser is dropped.
-    let sender = Sender::new(
-        &ndi,
-        &SenderOptions::builder("Discovery Server Example").build(),
-    )?;
+    let sender = Sender::new(&ndi, &SenderOptions::new("Discovery Server Example"))?;
     let mut advertiser = SendAdvertiser::new(&ndi, &advertiser_options)?;
     let registration =
         advertiser.register(&sender, SendAdvertisement::default().allow_monitoring(true))?;

@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use super::{AdvancedConfig, CompressedVideoFrame};
+use super::CompressedVideoFrame;
 use crate::{
     sys::{
         self,
@@ -21,7 +21,7 @@ use crate::{
         bindings::*,
     },
     timeout::Deadline,
-    Error, Rejected, Result, Sender, SenderOptions, Source, VideoFrame, NDI,
+    Error, Ndi, Rejected, Result, Sender, SenderOptions, Source, VideoFrame,
 };
 
 use super::aliasable::AliasableBox;
@@ -39,21 +39,28 @@ pub struct QueueOptions {
 
 impl Default for QueueOptions {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QueueOptions {
+    /// The default limits: 8 frames and 512 MiB.
+    pub fn new() -> Self {
         Self {
             frames: 8,
             bytes: 512 * 1024 * 1024,
         }
     }
-}
 
-impl QueueOptions {
     /// Set the maximum number of frames held, from 1 to 65 536.
+    #[must_use]
     pub fn max_frames(mut self, frames: usize) -> Self {
         self.frames = frames;
         self
     }
 
     /// Set the maximum number of bytes of frame data and metadata held.
+    #[must_use]
     pub fn max_bytes(mut self, bytes: usize) -> Self {
         self.bytes = bytes;
         self
@@ -65,7 +72,7 @@ impl QueueOptions {
             || self.bytes == 0
             || self.bytes > isize::MAX as usize
         {
-            return Err(Error::InvalidConfiguration(
+            return Err(Error::InvalidInput(
                 "queue requires 1..=65536 frames and a positive addressable byte limit".into(),
             ));
         }
@@ -85,7 +92,7 @@ impl SubmissionId {
 }
 
 /// A video frame a [`QueuedSender`] can send.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum QueuedVideoFrame {
     /// An uncompressed frame.
@@ -123,15 +130,16 @@ impl QueuedVideoFrame {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    /// Check that `sender` can send this frame, as its own send methods do.
+    fn validate(&self, sender: &Sender) -> Result<()> {
         match self {
-            Self::Pixels(_) => Ok(()),
+            Self::Pixels(v) => sender.require_video_format(v.pixel_format()),
             Self::Compressed(v) => v.validate_for_send(),
         }
     }
 }
 /// A frame the SDK has finished sending, ready to be reused.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CompletedVideo {
     id: SubmissionId,
     frame: QueuedVideoFrame,
@@ -192,7 +200,7 @@ impl CallbackState {
         let options = options.validate()?;
         let mut ready = VecDeque::new();
         ready.try_reserve_exact(options.frames).map_err(|_| {
-            Error::InvalidConfiguration("unable to allocate bounded completion storage".into())
+            Error::InvalidInput("unable to allocate bounded completion storage".into())
         })?;
         Ok(Box::new(Self {
             state: Mutex::new(State {
@@ -271,14 +279,14 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
 /// use std::time::Duration;
 /// use grafton_ndi::{
 ///     advanced::{QueueOptions, QueuedSender},
-///     SenderOptions, VideoFrame, NDI,
+///     SenderOptions, VideoFrame, Ndi,
 /// };
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
-/// let ndi = NDI::new()?;
+/// let ndi = Ndi::new()?;
 /// let mut sender = QueuedSender::new(
 ///     &ndi,
-///     &SenderOptions::builder("Queued").build(),
+///     &SenderOptions::new("Queued"),
 ///     QueueOptions::default().max_frames(4),
 /// )?;
 /// let id = sender.try_submit(VideoFrame::builder().resolution(1920, 1080).build()?)?;
@@ -299,35 +307,18 @@ pub struct QueuedSender {
 }
 
 impl QueuedSender {
-    /// Create a sender with the SDK's default configuration.
+    /// Create a sender, with the options' Advanced SDK
+    /// [configuration](SenderOptions::config) when they carry one.
     ///
     /// # Errors
     ///
     /// [`Error::UnsupportedCapability`] without an Advanced runtime (or in a
-    /// build without the Advanced SDK), [`Error::InvalidConfiguration`] for
+    /// build without the Advanced SDK), [`Error::InvalidInput`] for
     /// limits outside their range, and the errors of [`Sender::new`].
-    pub fn new(ndi: &NDI, options: &SenderOptions, limits: QueueOptions) -> Result<Self> {
+    pub fn new(ndi: &Ndi, options: &SenderOptions, limits: QueueOptions) -> Result<Self> {
         let table = ndi.table::<SendCompletion>()?;
         let callback = CallbackState::new(limits)?;
         let sender = Sender::new(ndi, options)?;
-        Ok(Self::install(sender, callback, table))
-    }
-
-    /// Create a sender with a per-instance Advanced SDK configuration.
-    ///
-    /// # Errors
-    ///
-    /// As for [`new`](Self::new), with the errors of
-    /// [`Sender::new_with_config`].
-    pub fn new_with_config(
-        ndi: &NDI,
-        options: &SenderOptions,
-        config: &AdvancedConfig,
-        limits: QueueOptions,
-    ) -> Result<Self> {
-        let table = ndi.table::<SendCompletion>()?;
-        let callback = CallbackState::new(limits)?;
-        let sender = Sender::new_with_config(ndi, options, config)?;
         Ok(Self::install(sender, callback, table))
     }
 
@@ -340,7 +331,7 @@ impl QueuedSender {
     /// # Errors
     ///
     /// Returns the sender, unchanged, with [`Error::UnsupportedCapability`]
-    /// without an Advanced runtime, or [`Error::InvalidConfiguration`] for
+    /// without an Advanced runtime, or [`Error::InvalidInput`] for
     /// limits outside their range or a sender that is registered with an
     /// advertiser (a registration keeps the native sender alive after this
     /// value is dropped, when the completion state no longer exists).
@@ -352,7 +343,7 @@ impl QueuedSender {
             let table = sender.runtime().table::<SendCompletion>()?;
             let callback = CallbackState::new(limits)?;
             if !sender.has_exclusive_native_owner() {
-                return Err(Error::InvalidConfiguration(
+                return Err(Error::InvalidInput(
                     "queued conversion requires a sender without advertiser registrations".into(),
                 ));
             }
@@ -411,24 +402,26 @@ impl QueuedSender {
     ///
     /// # Errors
     ///
-    /// Returns the frame with [`Error::InvalidConfiguration`] when a limit in
-    /// [`QueueOptions`] is reached (collect completed frames and try again)
-    /// or the queue has failed (see
-    /// [`completion_protocol_failed`](Self::completion_protocol_failed)), and
-    /// with [`Error::InvalidFrame`] when the frame is not sendable or shares
-    /// its data with a frame already queued.
+    /// Returns the frame with [`Error::InvalidInput`] when a limit in
+    /// [`QueueOptions`] is reached (collect completed frames and try again),
+    /// with [`Error::UnexpectedSdkResult`] when the queue has failed (see
+    /// [`completion_protocol_failed`](Self::completion_protocol_failed)),
+    /// with [`Error::UnsupportedCapability`] when the runtime cannot send an
+    /// uncompressed frame's pixel format (as [`Sender::send_video`] checks),
+    /// and with [`Error::InvalidFrame`] when the frame is not sendable or
+    /// shares its data with a frame already queued.
     pub fn try_submit(
         &mut self,
         frame: impl Into<QueuedVideoFrame>,
     ) -> std::result::Result<SubmissionId, Rejected<QueuedVideoFrame>> {
         let mut frame = frame.into();
         let failure = Rejected::new;
-        if let Err(error) = frame.validate() {
+        if let Err(error) = frame.validate(&self.sender) {
             return Err(failure(error, frame));
         }
         if self.callback.protocol_error.load(Ordering::Acquire) {
             return Err(failure(
-                Error::InvalidConfiguration(
+                Error::UnexpectedSdkResult(
                     "native completion protocol failed; drain and close this queue".into(),
                 ),
                 frame,
@@ -450,13 +443,13 @@ impl QueuedSender {
                 .filter(|total| *total <= state.options.bytes)
             else {
                 return Err(failure(
-                    Error::InvalidConfiguration("queued video byte limit reached".into()),
+                    Error::InvalidInput("queued video byte limit reached".into()),
                     frame,
                 ));
             };
             if state.entries.len() >= state.options.frames {
                 return Err(failure(
-                    Error::InvalidConfiguration("queued video frame limit reached".into()),
+                    Error::InvalidInput("queued video frame limit reached".into()),
                     frame,
                 ));
             }
@@ -470,7 +463,7 @@ impl QueuedSender {
             }
             let Some(next) = state.next.checked_add(1) else {
                 return Err(failure(
-                    Error::InvalidConfiguration("queue submission identifiers exhausted".into()),
+                    Error::InvalidInput("queue submission identifiers exhausted".into()),
                     frame,
                 ));
             };
@@ -515,8 +508,8 @@ impl QueuedSender {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidConfiguration`] when `timeout` exceeds
-    /// [`crate::MAX_TIMEOUT`] or the queue has failed (see
+    /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`],
+    /// and [`Error::UnexpectedSdkResult`] when the queue has failed (see
     /// [`completion_protocol_failed`](Self::completion_protocol_failed)).
     pub fn wait_completed(&mut self, timeout: Duration) -> Result<Option<CompletedVideo>> {
         let deadline = Deadline::after(timeout)?;
@@ -530,7 +523,7 @@ impl QueuedSender {
                 return Ok(Some(frame));
             }
             if self.callback.protocol_error.load(Ordering::Acquire) {
-                return Err(Error::InvalidConfiguration(
+                return Err(Error::UnexpectedSdkResult(
                     "native completion protocol failed".into(),
                 ));
             }

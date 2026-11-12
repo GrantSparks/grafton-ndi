@@ -65,6 +65,14 @@ impl<T: ?Sized> Drop for AliasableBox<T> {
     }
 }
 
+impl<T: Clone> Clone for AliasableBox<[T]> {
+    /// A new allocation with a copy of the elements, read through a shared
+    /// reference, which no write by the SDK can overlap.
+    fn clone(&self) -> Self {
+        Self::new(Box::from(&**self))
+    }
+}
+
 impl<T: ?Sized + fmt::Debug> fmt::Debug for AliasableBox<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         (**self).fmt(f)

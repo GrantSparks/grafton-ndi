@@ -8,7 +8,7 @@
 //! Optional arguments:
 //! - IP address to search: `cargo run --example NDIlib_Recv_Audio_16bpp -- 192.168.0.110`
 
-use grafton_ndi::{Error, Receiver, ReceiverEvent, ReceiverOptions, NDI};
+use grafton_ndi::{Error, Ndi, Receiver, ReceiverEvent, ReceiverOptions};
 
 use std::{
     env,
@@ -35,7 +35,7 @@ fn main() -> Result<(), Error> {
     })
     .expect("Error setting Ctrl-C handler");
 
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
 
     let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
 
@@ -47,15 +47,13 @@ fn main() -> Result<(), Error> {
     };
 
     // Create a receiver for the first source
-    let options = ReceiverOptions::builder(sources[0].clone())
-        .name("Example Audio Converter Receiver")
-        .build();
+    let options = ReceiverOptions::new(sources[0].clone()).name("Example Audio Converter Receiver");
     let receiver = Receiver::new(&ndi, &options)?;
 
     // Run for one minute
     let start = Instant::now();
     while !exit_loop.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(60) {
-        if let Some(video_frame) = receiver.video().try_capture(Duration::ZERO)? {
+        if let Some(video_frame) = receiver.video().capture(Duration::ZERO)? {
             println!(
                 "Video data received ({width}x{height}).",
                 width = video_frame.width(),
@@ -63,7 +61,7 @@ fn main() -> Result<(), Error> {
             );
         }
 
-        if let Some(audio_frame) = receiver.audio().try_capture(Duration::ZERO)? {
+        if let Some(audio_frame) = receiver.audio().capture(Duration::ZERO)? {
             println!(
                 "Audio data received ({num_samples} samples).",
                 num_samples = audio_frame.num_samples()
@@ -78,7 +76,7 @@ fn main() -> Result<(), Error> {
             );
         }
 
-        if let Some(_metadata) = receiver.metadata().try_capture(Duration::ZERO)? {
+        if let Some(_metadata) = receiver.metadata().capture(Duration::ZERO)? {
             println!("Meta data received.");
         }
 
@@ -127,8 +125,8 @@ mod tests {
     #[test]
     fn converts_planar_stereo_into_scaled_interleaved_pcm() {
         let frame = AudioFrame::builder()
-            .channels(2)
-            .samples(2)
+            .num_channels(2)
+            .num_samples(2)
             .data(vec![0.25, -0.25, 0.5, -0.5])
             .build()
             .unwrap();
@@ -145,8 +143,8 @@ mod tests {
     #[test]
     fn clamps_pcm_to_signed_16_bit_limits() {
         let frame = AudioFrame::builder()
-            .channels(1)
-            .samples(2)
+            .num_channels(1)
+            .num_samples(2)
             .data(vec![-2.0, 2.0])
             .build()
             .unwrap();

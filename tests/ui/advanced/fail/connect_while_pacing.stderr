@@ -5,5 +5,5 @@ error[E0499]: cannot borrow `*genlock` as mutable more than once at a time
   |                               ------- first mutable borrow occurs here
 5 |     genlock.connect(None).unwrap();
   |     ^^^^^^^ second mutable borrow occurs here
-6 |     let _ = video.wait(30, 1, ScanType::Progressive);
+6 |     let _ = video.wait(frame_rate, ScanType::Progressive);
   |             ----- first borrow later used here

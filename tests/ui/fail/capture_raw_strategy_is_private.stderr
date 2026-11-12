@@ -10,6 +10,11 @@ error[E0432]: unresolved imports `grafton_ndi::FrameFree`, `grafton_ndi::FrameSy
 help: a similar name exists in the module
   |
 1 - use grafton_ndi::{FrameFree, FrameSyncAudioFree, FrameSyncVideoFree};
+1 + use grafton_ndi::{FrameRate, FrameSyncAudioFree, FrameSyncVideoFree};
+  |
+help: a similar name exists in the module
+  |
+1 - use grafton_ndi::{FrameFree, FrameSyncAudioFree, FrameSyncVideoFree};
 1 + use grafton_ndi::{FrameFree, FrameSyncAudioRef, FrameSyncVideoFree};
   |
 help: a similar name exists in the module

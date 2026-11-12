@@ -141,6 +141,10 @@ pub(super) struct Recorder {
     /// does not roll over, and the size that does.
     pub(super) created_without_format_rollover: std::sync::atomic::AtomicBool,
     pub(super) created_rollover_bytes: std::sync::atomic::AtomicU64,
+    /// The filename pattern creation was given, if any, and whether it was
+    /// told to leave out the proxy.
+    pub(super) created_pattern: std::sync::Mutex<Option<String>>,
+    pub(super) created_without_proxy: std::sync::atomic::AtomicBool,
     /// Make the next captured event larger than this crate's layout of it.
     pub(super) oversize_next_event: std::sync::atomic::AtomicBool,
     pub(super) dropped_events: std::sync::atomic::AtomicU64,
@@ -176,6 +180,8 @@ impl Recorder {
             source_changes: Default::default(),
             created_without_format_rollover: Default::default(),
             created_rollover_bytes: Default::default(),
+            created_pattern: Default::default(),
+            created_without_proxy: Default::default(),
             oversize_next_event: Default::default(),
             dropped_events: Default::default(),
             stops: Default::default(),
@@ -248,6 +254,18 @@ unsafe extern "C" fn recorder_create(
     recorder
         .created_rollover_bytes
         .store(settings.rollover_max_file_size_bytes, Ordering::Release);
+    *recorder.created_pattern.lock().unwrap() = (!settings.p_output_filename_pattern.is_null())
+        .then(|| {
+            // SAFETY: a pattern the wrapper passes is a NUL-terminated string
+            // that is valid for the call.
+            unsafe { std::ffi::CStr::from_ptr(settings.p_output_filename_pattern) }
+                .to_str()
+                .unwrap()
+                .to_owned()
+        });
+    recorder
+        .created_without_proxy
+        .store(settings.disable_proxy_track, Ordering::Release);
     recorder.creates.fetch_add(1, Ordering::AcqRel);
     Box::into_raw(Box::new(recorder)).cast()
 }

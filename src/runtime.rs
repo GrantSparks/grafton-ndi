@@ -7,15 +7,15 @@
 //!    returns describes the library: where it was loaded from, its edition and
 //!    version ([`Runtime::info`]), what it can do ([`Runtime::capabilities`])
 //!    and whether it can run on this CPU ([`Runtime::is_supported_cpu`]).
-//! 2. **Initialize.** [`Runtime::initialize`] starts NDI and returns an [`NDI`]
+//! 2. **Initialize.** [`Runtime::initialize`] starts NDI and returns an [`Ndi`]
 //!    handle, from which every finder, sender and receiver is created. NDI
 //!    stays started while any handle exists, and stops when the last one is
-//!    dropped unless [`NDI::process_lifetime`] was chosen.
+//!    dropped unless [`Ndi::process_lifetime`] was chosen.
 //!
-//! [`NDI::new`] performs both steps with the default options, and
-//! [`NDI::with_options`] with the options it is given. Nothing else in the
+//! [`Ndi::new`] performs both steps with the default options, and
+//! [`Ndi::with_options`] with the options it is given. Nothing else in the
 //! crate selects or starts a runtime: every operation that needs NDI takes a
-//! handle, and a question such as [`NDI::is_running`] only reports the current
+//! handle, and a question such as [`Ndi::is_running`] only reports the current
 //! state.
 //!
 //! ```no_run
@@ -34,7 +34,7 @@
 //! ```
 //!
 //! Building this crate needs no NDI SDK. A selected shared library stays
-//! loaded for the life of the process, including after the last [`NDI`] handle
+//! loaded for the life of the process, including after the last [`Ndi`] handle
 //! is dropped. Statically linked targets use the SDK archive linked at build
 //! time, and selecting it loads nothing.
 //!
@@ -110,11 +110,18 @@ pub struct RuntimeOptions {
 }
 
 impl RuntimeOptions {
+    /// The default options: the runtime library of either edition, from the
+    /// [documented search](crate::runtime#where-the-runtime-is-loaded-from).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Load exactly this absolute shared-library path.
     ///
     /// No other location is tried, so a failure to load it is reported rather
     /// than hidden by a fallback. A statically linked target has no library to
     /// load and rejects an explicit path.
+    #[must_use]
     pub fn library_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.library_path = Some(path.into());
         self
@@ -131,6 +138,7 @@ impl RuntimeOptions {
     ///
     /// A statically linked target has one implementation, the archive linked
     /// at build time, and the same rule decides whether it meets the request.
+    #[must_use]
     pub fn edition(mut self, edition: SdkEdition) -> Self {
         self.edition = Some(edition);
         self
@@ -196,7 +204,7 @@ impl Runtime {
     /// * [`Error::RuntimeConflict`] when an implementation is already selected
     ///   and does not meet `options`: they name a different library file, or
     ///   ask for the Advanced SDK when the selected implementation is not one.
-    /// * [`Error::InvalidConfiguration`] when `options` name a relative
+    /// * [`Error::InvalidInput`] when `options` name a relative
     ///   library path.
     ///
     /// # Examples
@@ -298,7 +306,7 @@ impl Runtime {
     /// Start NDI and return a handle to it.
     ///
     /// NDI is started by the first handle and stays started while any handle
-    /// exists; each further call, like [`NDI::clone`], only adds a handle.
+    /// exists; each further call, like [`Ndi::clone`], only adds a handle.
     /// Dropping the last one stops NDI, after which this can be called again.
     /// The call is thread-safe.
     ///
@@ -325,9 +333,9 @@ impl Runtime {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn initialize(&self) -> Result<NDI> {
+    pub fn initialize(&self) -> Result<Ndi> {
         lifecycle(self.selected).acquire()?;
-        Ok(NDI { runtime: *self })
+        Ok(Ndi { runtime: *self })
     }
 }
 
@@ -341,23 +349,23 @@ impl fmt::Debug for Runtime {
 
 /// An explicit promise that the selected NDI runtime stays initialized until exit.
 ///
-/// Created by [`NDI::process_lifetime`]. The first creation retains one runtime
+/// Created by [`Ndi::process_lifetime`]. The first creation retains one runtime
 /// reference permanently. Dropping this token does not reverse that choice.
 /// This is intended for native callbacks whose completion cannot be bounded by a
 /// normal sender/receiver lifetime. It does not grant an SDK license entitlement.
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessLifetimeRuntime {
-    ndi: &'static NDI,
+    ndi: &'static Ndi,
 }
 
 impl ProcessLifetimeRuntime {
     /// Borrow the permanently retained runtime handle.
-    pub fn ndi(&self) -> &NDI {
+    pub fn ndi(&self) -> &Ndi {
         self.ndi
     }
 }
 
-static PROCESS_LIFETIME: OnceLock<NDI> = OnceLock::new();
+static PROCESS_LIFETIME: OnceLock<Ndi> = OnceLock::new();
 
 /// Runtime lifecycle phase.
 ///
@@ -438,7 +446,7 @@ impl RuntimeBackend for SdkBackend {
 /// - Allows re-initialization after teardown
 /// - Allows retry after initialization failure
 /// - Avoids spin loops by using `Condvar` waits
-/// - Maintains the invariant: `NDI::new()` returns `Ok` only when runtime is initialized
+/// - Maintains the invariant: `Ndi::new()` returns `Ok` only when runtime is initialized
 struct RuntimeManager<B = SdkBackend> {
     state: Mutex<RuntimeState>,
     cv: Condvar,
@@ -565,46 +573,46 @@ fn lifecycle(runtime: &'static sys::Runtime) -> &'static RuntimeManager {
 
 /// A handle to the started NDI runtime.
 ///
-/// Every finder, sender and receiver is created from an `NDI` handle, and NDI
+/// Every finder, sender and receiver is created from an `Ndi` handle, and NDI
 /// stays started while any handle exists: those objects each retain one, and
 /// [`Clone::clone`] and [`Runtime::initialize`] add more. Dropping the last
 /// handle stops NDI but leaves the selected library loaded, so NDI can be
-/// started again. [`NDI::process_lifetime`] keeps it started until the process
+/// started again. [`Ndi::process_lifetime`] keeps it started until the process
 /// exits.
 ///
-/// [`NDI::new`] selects the default runtime and starts it in one call. To
+/// [`Ndi::new`] selects the default runtime and starts it in one call. To
 /// inspect a runtime before starting it, or to choose which one is loaded, use
 /// [`Runtime::select`] and then [`Runtime::initialize`].
 ///
 /// # Examples
 ///
 /// ```no_run
-/// use grafton_ndi::NDI;
+/// use grafton_ndi::Ndi;
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
-/// let ndi = NDI::new()?;
+/// let ndi = Ndi::new()?;
 ///
 /// // NDI stays started for as long as any handle exists.
 /// let another = ndi.clone();
 /// drop(ndi);
-/// assert!(NDI::is_running());
+/// assert!(Ndi::is_running());
 ///
 /// // Dropping the last handle stops it.
 /// drop(another);
 /// # Ok(())
 /// # }
 /// ```
-pub struct NDI {
+pub struct Ndi {
     runtime: Runtime,
 }
 
-impl fmt::Debug for NDI {
+impl fmt::Debug for Ndi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("NDI").finish_non_exhaustive()
+        f.debug_struct("Ndi").finish_non_exhaustive()
     }
 }
 
-impl NDI {
+impl Ndi {
     /// Select the default NDI runtime and start it.
     ///
     /// This is [`Runtime::select`] with the default [`RuntimeOptions`]
@@ -622,9 +630,9 @@ impl NDI {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::NDI;
+    /// # use grafton_ndi::Ndi;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = NDI::new()?;
+    /// let ndi = Ndi::new()?;
     /// // Use NDI operations...
     /// # Ok(())
     /// # }
@@ -647,10 +655,10 @@ impl NDI {
     /// # Examples
     ///
     /// ```no_run
-    /// use grafton_ndi::{RuntimeOptions, SdkEdition, NDI};
+    /// use grafton_ndi::{RuntimeOptions, SdkEdition, Ndi};
     ///
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = NDI::with_options(&RuntimeOptions::default().edition(SdkEdition::Advanced))?;
+    /// let ndi = Ndi::with_options(&RuntimeOptions::default().edition(SdkEdition::Advanced))?;
     /// # drop(ndi);
     /// # Ok(())
     /// # }
@@ -664,9 +672,9 @@ impl NDI {
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::NDI;
+    /// # use grafton_ndi::Ndi;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = NDI::new()?;
+    /// let ndi = Ndi::new()?;
     /// // A second handle from the same runtime, without selecting again.
     /// let another = ndi.runtime().initialize()?;
     /// # drop(another);
@@ -706,9 +714,20 @@ impl NDI {
     /// error [`Self::require_feature`] reports for it.
     ///
     /// The table type alone selects the capability, so a table cannot be
-    /// obtained without its gate or under another capability's name.
+    /// obtained without its gate or be reported as another capability.
     pub(crate) fn table<T: sys::Table>(&self) -> Result<&'static T> {
         T::of(self.runtime.selected)
+    }
+
+    /// The receiver color format that selects `preset`, or the error
+    /// [`Self::require_feature`] reports for it. The preset's gate includes
+    /// the configured receiver's, so that table is then available too.
+    #[cfg(feature = "advanced")]
+    pub(crate) fn passthrough_format(
+        &self,
+        preset: crate::advanced::PassthroughPreset,
+    ) -> Result<sys::bindings::NDIlib_recv_color_format_e> {
+        self.runtime.selected.evidence().passthrough_format(preset)
     }
 
     /// Retain an initialized runtime reference until process exit.
@@ -729,7 +748,7 @@ impl NDI {
     /// # Examples
     ///
     /// ```
-    /// if grafton_ndi::NDI::is_running() {
+    /// if grafton_ndi::Ndi::is_running() {
     ///     println!("NDI runtime is active");
     /// }
     /// ```
@@ -738,7 +757,7 @@ impl NDI {
     }
 }
 
-impl Clone for NDI {
+impl Clone for Ndi {
     /// Acquires another reference to the active runtime.
     ///
     /// # Panics
@@ -755,7 +774,7 @@ impl Clone for NDI {
     }
 }
 
-impl Drop for NDI {
+impl Drop for Ndi {
     fn drop(&mut self) {
         lifecycle(self.runtime.selected).release();
     }
@@ -883,7 +902,7 @@ mod tests {
     #[test]
     fn test_reinit_after_teardown() {
         // Issue requirement: create NDI, drop all, create NDI again
-        // => init called twice, destroy called twice, both NDI::new() return Ok
+        // => init called twice, destroy called twice, both Ndi::new() return Ok
         let manager = Arc::new(RuntimeManager::with_backend(MockBackend::default()));
 
         // First cycle
@@ -1001,7 +1020,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_acquire_single_init() {
-        // Issue requirement: concurrent NDI::new() calls result in at most one init per cycle
+        // Issue requirement: concurrent Ndi::new() calls result in at most one init per cycle
         let manager = Arc::new(RuntimeManager::with_backend(MockBackend::default()));
 
         // Add a small delay to init to increase chance of race

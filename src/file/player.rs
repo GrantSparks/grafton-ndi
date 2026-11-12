@@ -3,12 +3,12 @@
 use std::{marker::PhantomData, path::Path, ptr::NonNull, rc::Rc, time::Duration};
 
 use super::{
-    out_param::OutParam, timeout_ms, types, FileApi, FileDuration, FileError, FilePosition,
-    FileResult, PlayerEvent, PlayerOptions, PlayerStats, SourceFormat, SourceTimecode,
+    out_param::OutParam, types, FileApi, FileDuration, FilePosition, PlayerEvent, PlayerOptions,
+    PlayerStats, SourceFormat,
 };
 use crate::{
     sys::{self, bindings::*},
-    Source,
+    Error, Result, Source, Timecode,
 };
 
 /// An NDI source that plays recordings.
@@ -41,22 +41,26 @@ impl std::fmt::Debug for FilePlayer {
 }
 
 impl FilePlayer {
-    pub(super) fn create(api: FileApi, options: &PlayerOptions) -> FileResult<Self> {
+    pub(super) fn create(api: FileApi, options: &PlayerOptions) -> Result<Self> {
+        let resolved = options.resolve()?;
         let playback = api.playback()?;
         let settings = NDIlib_file_player_create_t {
-            p_ndi_send_name: options.name.as_ptr(),
-            p_groups: options
+            p_ndi_send_name: resolved.name.as_ptr(),
+            p_groups: resolved
                 .groups
                 .as_ref()
                 .map_or(std::ptr::null(), |groups| groups.as_ptr()),
         };
         // SAFETY: `settings` and the strings it points to are valid for the call.
-        let handle = NonNull::new(unsafe { playback.NDIlib_file_player_create(&settings) })
-            .ok_or(FileError::Rejected("player creation"))?;
+        let handle = NonNull::new(unsafe { playback.NDIlib_file_player_create(&settings) }).ok_or(
+            Error::NativeOperationFailed {
+                operation: "player creation",
+            },
+        )?;
         Ok(Self {
             playback,
             handle,
-            name: options.name().to_owned(),
+            name: options.name.clone(),
             _api: api,
             _thread: PhantomData,
         })
@@ -71,10 +75,10 @@ impl FilePlayer {
     ///
     /// # Errors
     ///
-    /// [`FileError::Rejected`] when the SDK cannot open the file, and
-    /// [`FileError::InvalidInput`] when the path is empty, is not UTF-8 or
+    /// [`Error::NativeOperationFailed`] when the SDK cannot open the file, and
+    /// [`Error::InvalidInput`] when the path is empty, is not UTF-8 or
     /// contains a NUL.
-    pub fn start(&mut self, path: impl AsRef<Path>) -> FileResult<()> {
+    pub fn start(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = types::path_string(path.as_ref())?;
         // SAFETY: the player is live and `path` is a NUL-terminated string
         // that outlives the call.
@@ -85,7 +89,9 @@ impl FilePlayer {
         if started {
             Ok(())
         } else {
-            Err(FileError::Rejected("player start"))
+            Err(Error::NativeOperationFailed {
+                operation: "player start",
+            })
         }
     }
 
@@ -105,14 +111,15 @@ impl FilePlayer {
         }
     }
 
-    /// Take the next queued event, waiting up to `wait` for one.
+    /// Take the next queued event, waiting up to `timeout` for one, or
+    /// `None` when none arrives in time.
     ///
     /// # Errors
     ///
-    /// [`FileError::InvalidInput`] when `wait` exceeds [`crate::MAX_TIMEOUT`],
-    /// and [`FileError::Protocol`] when the SDK's event is malformed.
-    pub fn poll_event(&mut self, wait: Duration) -> FileResult<Option<PlayerEvent>> {
-        let wait = timeout_ms(wait)?;
+    /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`],
+    /// and [`Error::UnexpectedSdkResult`] when the SDK's event is malformed.
+    pub fn poll_event(&mut self, timeout: Duration) -> Result<Option<PlayerEvent>> {
+        let timeout = crate::to_ms_checked(timeout)?;
         let mut event = OutParam::<NDIlib_file_player_event_t>::new();
         // SAFETY: the player is live and `event` is writable storage for the
         // structure the SDK fills in.
@@ -120,7 +127,7 @@ impl FilePlayer {
             self.playback.NDIlib_file_player_capture_event(
                 self.handle.as_ptr(),
                 event.as_mut_ptr(),
-                wait,
+                timeout,
             )
         };
         let event = event.read()?;
@@ -128,11 +135,11 @@ impl FilePlayer {
             return Ok(None);
         }
         if kind != event.type_ {
-            return Err(FileError::Protocol(
+            return Err(Error::UnexpectedSdkResult(
                 "the player returned one event type and stored another".into(),
             ));
         }
-        Ok(Some(PlayerEvent::try_from(&event)?))
+        Ok(Some(PlayerEvent::from_sdk(&event)?))
     }
 
     /// How many events the SDK has discarded since the player was created
@@ -149,9 +156,9 @@ impl FilePlayer {
     ///
     /// # Errors
     ///
-    /// [`FileError::Protocol`] when the SDK's structure does not match this
+    /// [`Error::UnexpectedSdkResult`] when the SDK's structure does not match this
     /// crate's layout.
-    pub fn stats(&self) -> FileResult<Option<PlayerStats>> {
+    pub fn stats(&self) -> Result<Option<PlayerStats>> {
         let mut stats = OutParam::<NDIlib_file_player_stats_t>::new();
         // SAFETY: the player is live and `stats` is writable storage for the
         // structure the SDK fills in.
@@ -160,7 +167,7 @@ impl FilePlayer {
                 .NDIlib_file_player_get_stats(self.handle.as_ptr(), stats.as_mut_ptr())
         };
         let stats = stats.read()?;
-        Ok(available.then(|| PlayerStats::from(&stats)))
+        Ok(available.then(|| PlayerStats::from_sdk(&stats)))
     }
 
     /// Seek to a position on the file's timeline, where zero is its first frame.
@@ -170,8 +177,8 @@ impl FilePlayer {
     ///
     /// # Errors
     ///
-    /// [`FileError::Rejected`] when the SDK refuses the seek.
-    pub fn seek(&mut self, position: FilePosition) -> FileResult<()> {
+    /// [`Error::NativeOperationFailed`] when the SDK refuses the seek.
+    pub fn seek(&mut self, position: FilePosition) -> Result<()> {
         // SAFETY: the player is live for this borrow.
         let sought = unsafe {
             self.playback
@@ -180,7 +187,9 @@ impl FilePlayer {
         if sought {
             Ok(())
         } else {
-            Err(FileError::Rejected("time seek"))
+            Err(Error::NativeOperationFailed {
+                operation: "time seek",
+            })
         }
     }
 
@@ -191,8 +200,8 @@ impl FilePlayer {
     ///
     /// # Errors
     ///
-    /// [`FileError::Rejected`] when the SDK refuses the seek.
-    pub fn seek_frame_approximate(&mut self, frame: u64) -> FileResult<()> {
+    /// [`Error::NativeOperationFailed`] when the SDK refuses the seek.
+    pub fn seek_frame_approximate(&mut self, frame: u64) -> Result<()> {
         // SAFETY: the player is live for this borrow.
         let sought = unsafe {
             self.playback
@@ -201,7 +210,9 @@ impl FilePlayer {
         if sought {
             Ok(())
         } else {
-            Err(FileError::Rejected("frame seek"))
+            Err(Error::NativeOperationFailed {
+                operation: "frame seek",
+            })
         }
     }
 
@@ -279,22 +290,22 @@ impl FilePlayer {
 
     /// The recorded source timecode of the frame sent last. Unlike the
     /// position it is editorial and need not increase.
-    pub fn source_timecode(&self) -> Option<SourceTimecode> {
+    pub fn source_timecode(&self) -> Option<Timecode> {
         let mut ticks = 0;
         // SAFETY: the player is live and the pointer is writable.
         unsafe {
             self.playback
                 .NDIlib_file_player_get_current_source_timecode(self.handle.as_ptr(), &mut ticks)
         }
-        .then_some(SourceTimecode::from_ticks(ticks))
+        .then_some(Timecode::from_ticks(ticks))
     }
 
     /// The track layout of the current file, once one with audio or video is open.
     ///
     /// # Errors
     ///
-    /// [`FileError::Protocol`] when the SDK's structure is malformed.
-    pub fn source_format(&self) -> FileResult<Option<SourceFormat>> {
+    /// [`Error::UnexpectedSdkResult`] when the SDK's structure is malformed.
+    pub fn source_format(&self) -> Result<Option<SourceFormat>> {
         let mut format = OutParam::<NDIlib_file_source_format_t>::new();
         // SAFETY: the player is live and `format` is writable storage for the
         // structure the SDK fills in.
@@ -303,7 +314,7 @@ impl FilePlayer {
                 .NDIlib_file_player_get_source_format(self.handle.as_ptr(), format.as_mut_ptr())
         };
         let format = format.read()?;
-        known.then(|| SourceFormat::try_from(&format)).transpose()
+        known.then(|| SourceFormat::from_sdk(&format)).transpose()
     }
 
     /// The NDI source this player advertises, for example to connect a
@@ -311,18 +322,19 @@ impl FilePlayer {
     ///
     /// # Errors
     ///
-    /// [`FileError::Core`] when the SDK returns no source or one whose name is
-    /// not UTF-8.
-    pub fn advertised_source(&self) -> FileResult<Source> {
+    /// [`Error::NativeOperationFailed`] when the SDK returns no source, or one
+    /// that names neither a source nor an address.
+    pub fn advertised_source(&self) -> Result<Source> {
         // SAFETY: the player is live. The descriptor the SDK returns, and its
         // strings, stay valid until the player is destroyed, which this borrow
         // rules out while they are copied.
-        Ok(unsafe {
+        unsafe {
             Source::try_from_raw(
                 self.playback
                     .NDIlib_file_player_get_advertised_source(self.handle.as_ptr()),
+                "NDIlib_file_player_get_advertised_source",
             )
-        }?)
+        }
     }
 
     /// Stop playback and remove the advertised source.

@@ -7,7 +7,10 @@
 //! material from a sender on the loopback interface; none needs a prepared file.
 
 use super::*;
-use crate::test_support::{self, Requirement};
+use crate::{
+    test_support::{self, Requirement},
+    MediaTypes,
+};
 use std::{
     future::Future,
     path::PathBuf,
@@ -24,11 +27,12 @@ use std::{
 const PATIENCE: Duration = Duration::from_secs(15);
 
 /// The selected runtime and its File library, or `None` when either is absent.
-fn file_api() -> Option<(crate::NDI, FileApi)> {
+fn file_api() -> Option<(crate::Ndi, FileApi)> {
     let ndi = test_support::ndi()?;
     match FileApi::open(&ndi, &FileRuntimeOptions::default()) {
         Ok(api) => Some((ndi, api)),
-        Err(FileError::Unavailable(reason)) => {
+        // Without a File library, or beside a runtime it cannot accompany.
+        Err(Error::RuntimeLoadFailed(reason) | Error::RuntimeConflict(reason)) => {
             test_support::skip(
                 Requirement::File,
                 &format!("the NDI File library is unavailable: {reason}"),
@@ -85,10 +89,9 @@ struct LiveSource {
 }
 
 impl LiveSource {
-    fn start(ndi: &crate::NDI, test: &str) -> Self {
+    fn start(ndi: &crate::Ndi, test: &str) -> Self {
         let name = format!("grafton-file-{}-{test}", std::process::id());
-        let sender =
-            crate::Sender::new(ndi, &crate::SenderOptions::builder(name.as_str()).build()).unwrap();
+        let sender = crate::Sender::new(ndi, &crate::SenderOptions::new(name.as_str())).unwrap();
         let spec = Self::loopback(ndi, &sender);
         let running = Arc::new(AtomicBool::new(true));
         let keep_running = Arc::clone(&running);
@@ -98,17 +101,19 @@ impl LiveSource {
             let frame = |width, height| {
                 crate::VideoFrame::builder()
                     .resolution(width, height)
-                    .pixel_format(crate::PixelFormat::BGRA)
+                    .pixel_format(crate::PixelFormat::Bgra)
                     .build()
                     .unwrap()
             };
             let (small, large) = (frame(320, 180), frame(640, 360));
             while keep_running.load(Ordering::Acquire) {
-                sender.send_video(if send_larger.load(Ordering::Acquire) {
-                    &large
-                } else {
-                    &small
-                });
+                sender
+                    .send_video(if send_larger.load(Ordering::Acquire) {
+                        &large
+                    } else {
+                        &small
+                    })
+                    .unwrap();
                 thread::sleep(Duration::from_millis(10));
             }
         });
@@ -128,20 +133,15 @@ impl LiveSource {
 
     /// The sender's endpoint on the loopback interface, so that recording does
     /// not depend on which other interfaces the machine has.
-    fn loopback(ndi: &crate::NDI, sender: &crate::Sender) -> SourceSpec {
-        let name = sender.source().unwrap().name;
-        let finder = crate::Finder::new(
-            ndi,
-            &crate::FinderOptions::builder()
-                .extra_ips("127.0.0.1")
-                .build(),
-        )
-        .unwrap();
+    fn loopback(ndi: &crate::Ndi, sender: &crate::Sender) -> SourceSpec {
+        let name = sender.source().unwrap().name().to_owned();
+        let finder =
+            crate::Finder::new(ndi, &crate::FinderOptions::new().extra_ips("127.0.0.1")).unwrap();
         let deadline = Instant::now() + PATIENCE;
         loop {
             for source in finder.current_sources().unwrap() {
-                if let (true, crate::SourceAddress::Ip(address)) =
-                    (source.name == name, &source.address)
+                if let (true, Some(crate::SourceAddress::Ip(address))) =
+                    (source.name() == name, source.address())
                 {
                     let port = address.rsplit(':').next().expect("an address with a port");
                     return SourceSpec::from_url(format!("127.0.0.1:{port}")).unwrap();
@@ -165,9 +165,26 @@ impl Drop for LiveSource {
 /// Options that record the live source's video to exactly the given file name.
 fn exact_video(source: &LiveSource) -> RecorderOptions {
     RecorderOptions::new(source.spec.clone())
-        .exact_filename()
-        .with_proxy(false)
-        .with_tracks(TrackSelection::VIDEO)
+        .naming(FileNaming::Exact)
+        .proxy(false)
+        .tracks(MediaTypes::VIDEO)
+}
+
+/// Check that `track` describes the program video [`LiveSource`] sends
+/// before its format changes: 320x180 progressive at 60 frames per second,
+/// 16:9.
+fn assert_live_video(track: &VideoTrack) {
+    assert_eq!(track.tier(), crate::StreamTier::Program, "{track:?}");
+    assert_eq!((track.width(), track.height()), (320, 180), "{track:?}");
+    let rate = track.frame_rate().expect("a known frame rate");
+    assert_eq!(rate.numerator(), 60 * rate.denominator(), "{rate:?}");
+    assert_eq!(track.scan_type(), Some(crate::ScanType::Progressive));
+    assert!(
+        track
+            .picture_aspect_ratio()
+            .is_some_and(|ratio| (ratio - 16.0 / 9.0).abs() < 1e-3),
+        "{track:?}"
+    );
 }
 
 /// Poll until an event of `kind` arrives, failing on a recorder error.
@@ -251,6 +268,8 @@ fn a_recording_is_finalized_and_probes_with_its_video_track() {
     assert_eq!(session, 1);
     let first = await_event(&mut recorder, RecorderEventKind::FirstFrame);
     assert_eq!(first.source_format().video_tracks().len(), 1);
+    assert_live_video(&first.source_format().video_tracks()[0]);
+    assert!(first.tracks().is_empty());
     assert_eq!(
         recorder.reported_current_file().unwrap().as_bytes(),
         file.to_str().unwrap().as_bytes()
@@ -274,11 +293,12 @@ fn a_recording_is_finalized_and_probes_with_its_video_track() {
 
     let info = api.probe(&file).unwrap();
     assert_eq!(info.video_track_count(), 1);
+    assert_live_video(&info.source_format().video_tracks()[0]);
     assert!(info.duration().is_final());
     assert!(info.duration().value().ticks() > 0);
     assert!(matches!(
         api.probe(scratch.path("absent.mkv")),
-        Err(FileError::Rejected(_))
+        Err(Error::NativeOperationFailed { .. })
     ));
 }
 
@@ -290,8 +310,8 @@ fn a_rollover_requested_just_before_the_stop_still_ends_in_a_confirmed_close() {
     let scratch = Scratch::new("late-rollover");
     let source = LiveSource::start(&ndi, "late-rollover");
     let options = RecorderOptions::new(source.spec.clone())
-        .with_proxy(false)
-        .with_tracks(TrackSelection::VIDEO);
+        .proxy(false)
+        .tracks(MediaTypes::VIDEO);
     let mut recorder = api.create_recorder(&options).unwrap();
     recorder
         .start(
@@ -318,8 +338,8 @@ fn rollovers_and_a_source_switch_end_in_a_confirmed_close_of_every_file() {
     let scratch = Scratch::new("rollovers");
     let source = LiveSource::start(&ndi, "rollovers");
     let options = RecorderOptions::new(source.spec.clone())
-        .with_proxy(false)
-        .with_tracks(TrackSelection::VIDEO);
+        .proxy(false)
+        .tracks(MediaTypes::VIDEO);
     let mut recorder = api.create_recorder(&options).unwrap();
     recorder
         .start(
@@ -357,19 +377,21 @@ fn injected_metadata_is_recorded_on_the_metadata_track() {
     let source = LiveSource::start(&ndi, "metadata");
     let file = scratch.path("marked.mkv");
     let options = RecorderOptions::new(source.spec.clone())
-        .exact_filename()
-        .with_proxy(false)
-        .with_tracks(TrackSelection::VIDEO | TrackSelection::METADATA);
+        .naming(FileNaming::Exact)
+        .proxy(false)
+        .tracks(MediaTypes::VIDEO | MediaTypes::METADATA);
     let mut recorder = api.create_recorder(&options).unwrap();
-    let marker = crate::MetadataFrame::with_data("<marker cue=\"intro\"/>", 0).unwrap();
+    let marker = crate::MetadataFrame::new("<marker cue=\"intro\"/>")
+        .unwrap()
+        .with_timecode(crate::Timecode::from_ticks(0));
     assert!(matches!(
         recorder.inject_metadata(&marker),
-        Err(FileError::InvalidState(StateError::NotRecording))
+        Err(Error::InvalidState(StateError::NotRecording))
     ));
     recorder
         .start(
             &RecordingTarget::new(&file).unwrap(),
-            RecordingTimecode::GenerateFrom(SourceTimecode::from_ticks(36_000_000_000)),
+            RecordingTimecode::GenerateFrom(crate::Timecode::from_ticks(36_000_000_000)),
         )
         .unwrap();
     await_event(&mut recorder, RecorderEventKind::FirstFrame);
@@ -420,9 +442,9 @@ fn dropping_an_async_recorder_leaves_a_finalized_file() {
     let scratch = Scratch::new("async-drop");
     let source = LiveSource::start(&ndi, "async-drop");
     let file = scratch.path("dropped.mkv");
-    let recorder = block_on(AsyncFileRecorder::create(api.clone(), exact_video(&source))).unwrap();
+    let recorder = block_on(AsyncFileRecorder::create(&api, &exact_video(&source))).unwrap();
     block_on(recorder.start(
-        RecordingTarget::new(&file).unwrap(),
+        &RecordingTarget::new(&file).unwrap(),
         RecordingTimecode::Preserve,
     ))
     .unwrap();
@@ -454,9 +476,9 @@ fn an_async_recorder_finishes_and_closes_without_blocking() {
     let scratch = Scratch::new("async-finish");
     let source = LiveSource::start(&ndi, "async-finish");
     let file = scratch.path("finished.mkv");
-    let recorder = block_on(AsyncFileRecorder::create(api.clone(), exact_video(&source))).unwrap();
+    let recorder = block_on(AsyncFileRecorder::create(&api, &exact_video(&source))).unwrap();
     block_on(recorder.start(
-        RecordingTarget::new(&file).unwrap(),
+        &RecordingTarget::new(&file).unwrap(),
         RecordingTimecode::Preserve,
     ))
     .unwrap();
@@ -466,13 +488,13 @@ fn an_async_recorder_finishes_and_closes_without_blocking() {
         panic!("the recording was not confirmed closed: {outcome:?}");
     };
     assert_eq!(report.closed_files(), 1);
-    let previous = block_on(recorder.reset(exact_video(&source))).unwrap();
+    let previous = block_on(recorder.reset(&exact_video(&source))).unwrap();
     assert_eq!(previous.session(), report.session());
     assert!(previous.closure_confirmed());
     assert_eq!(block_on(recorder.state()).unwrap(), RecorderState::Idle);
     let next_file = scratch.path("after-reset.mkv");
     let next_session = block_on(recorder.start(
-        RecordingTarget::new(&next_file).unwrap(),
+        &RecordingTarget::new(&next_file).unwrap(),
         RecordingTimecode::Preserve,
     ))
     .unwrap();
@@ -512,11 +534,9 @@ fn a_player_plays_a_recording_and_keeps_its_source_between_files() {
     record_clip(&api, &LiveSource::start(&ndi, "player"), &clip);
 
     let name = format!("grafton-file-player-{}", std::process::id());
-    let mut player = api
-        .create_player(&PlayerOptions::new(&name).unwrap())
-        .unwrap();
+    let mut player = api.create_player(&PlayerOptions::new(&name)).unwrap();
     let source = player.advertised_source().unwrap();
-    assert!(source.name.contains(&name), "{source:?}");
+    assert!(source.name().contains(&name), "{source:?}");
     assert!(!player.is_running());
     player.set_paused(true);
     assert!(
@@ -526,7 +546,7 @@ fn a_player_plays_a_recording_and_keeps_its_source_between_files() {
     player.set_looping(true);
     assert!(matches!(
         player.start(scratch.path("absent.mkv")),
-        Err(FileError::Rejected(_))
+        Err(Error::NativeOperationFailed { .. })
     ));
 
     player.start(&clip).unwrap();
@@ -590,23 +610,19 @@ fn an_async_player_runs_on_its_own_thread_and_closes_every_clone() {
     record_clip(&api, &LiveSource::start(&ndi, "async-player"), &clip);
 
     assert_eq!(
-        block_on(AsyncFilePlayer::probe(api.clone(), clip.clone()))
+        block_on(AsyncFilePlayer::probe(&api, &clip))
             .unwrap()
             .video_track_count(),
         1
     );
     let name = format!("grafton-file-async-player-{}", std::process::id());
-    let player = block_on(AsyncFilePlayer::create(
-        api,
-        PlayerOptions::new(&name).unwrap(),
-    ))
-    .unwrap();
+    let player = block_on(AsyncFilePlayer::create(&api, &PlayerOptions::new(&name))).unwrap();
     assert!(block_on(player.advertised_source())
         .unwrap()
-        .name
+        .name()
         .contains(&name));
     block_on(player.set_looping(true)).unwrap();
-    block_on(player.start(clip)).unwrap();
+    block_on(player.start(&clip)).unwrap();
     assert!(block_on(player.is_running()).unwrap());
     assert!(block_on(player.is_looping()).unwrap());
     block_on(player.set_paused(true)).unwrap();
@@ -632,7 +648,7 @@ fn the_file_library_stays_selected_after_its_handles_are_dropped() {
     // Its entry points are still callable.
     assert!(matches!(
         reopened.probe(std::env::temp_dir().join("grafton-ndi-absent.mkv")),
-        Err(FileError::Rejected(_))
+        Err(Error::NativeOperationFailed { .. })
     ));
     if let Some(selected) = selected {
         assert!(matches!(
@@ -640,7 +656,7 @@ fn the_file_library_stays_selected_after_its_handles_are_dropped() {
                 &ndi,
                 &FileRuntimeOptions::default().library_path(selected.with_file_name("other"))
             ),
-            Err(FileError::Core(crate::Error::RuntimeConflict(_)))
+            Err(Error::RuntimeConflict(_))
         ));
         FileApi::open(&ndi, &FileRuntimeOptions::default().library_path(selected)).unwrap();
     }
@@ -649,9 +665,9 @@ fn the_file_library_stays_selected_after_its_handles_are_dropped() {
 /// Options under which a format change ends the session instead of rolling over.
 fn stop_on_format_change(source: &LiveSource) -> RecorderOptions {
     RecorderOptions::new(source.spec.clone())
-        .with_proxy(false)
-        .with_tracks(TrackSelection::VIDEO)
-        .with_format_change_rollover(false)
+        .proxy(false)
+        .tracks(MediaTypes::VIDEO)
+        .format_change_rollover(false)
 }
 
 #[test]
@@ -708,12 +724,12 @@ fn an_async_session_the_library_ended_on_a_format_change_can_be_followed_by_anot
     let scratch = Scratch::new("async-format-stop");
     let source = LiveSource::start(&ndi, "async-format-stop");
     let recorder = block_on(AsyncFileRecorder::create(
-        api.clone(),
-        stop_on_format_change(&source),
+        &api,
+        &stop_on_format_change(&source),
     ))
     .unwrap();
     block_on(recorder.start(
-        RecordingTarget::new(scratch.path("first")).unwrap(),
+        &RecordingTarget::new(scratch.path("first")).unwrap(),
         RecordingTimecode::Preserve,
     ))
     .unwrap();
@@ -740,7 +756,7 @@ fn an_async_session_the_library_ended_on_a_format_change_can_be_followed_by_anot
     source.change_format();
     state_becomes(RecorderState::Closed);
     let session = block_on(recorder.start(
-        RecordingTarget::new(scratch.path("second")).unwrap(),
+        &RecordingTarget::new(scratch.path("second")).unwrap(),
         RecordingTimecode::Preserve,
     ))
     .unwrap();
@@ -761,8 +777,8 @@ fn a_rollover_into_a_missing_directory_is_refused_and_the_session_goes_on() {
     let scratch = Scratch::new("missing-directory");
     let source = LiveSource::start(&ndi, "missing-directory");
     let missing = || RecordingTarget::new(scratch.path("absent/take")).unwrap();
-    let not_found = |result: FileResult<()>| match result {
-        Err(FileError::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+    let not_found = |result: Result<()>| match result {
+        Err(Error::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
         other => panic!("expected the directory to be reported missing: {other:?}"),
     };
     let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
@@ -799,8 +815,8 @@ fn a_file_that_received_nothing_is_reported_as_empty() {
     let scratch = Scratch::new("empty-file");
     let source = LiveSource::start(&ndi, "empty-file");
     let options = RecorderOptions::new(source.spec.clone())
-        .with_proxy(false)
-        .with_tracks(TrackSelection::VIDEO);
+        .proxy(false)
+        .tracks(MediaTypes::VIDEO);
     let mut recorder = api.create_recorder(&options).unwrap();
     recorder
         .start(
@@ -856,7 +872,7 @@ fn the_library_copies_every_string_a_recorder_gives_it() {
             p_ndi_name: std::ptr::null(),
             p_url_address: url.as_ptr().cast(),
         },
-        track_flags: TrackSelection::VIDEO.bits(),
+        track_flags: NDIlib_file_recorder_track_flags_e_NDIlib_file_recorder_track_flags_video,
         record_float_audio_planar_32f: false,
         disable_auto_rollover_on_format_change: false,
         p_output_filename_pattern: pattern.as_ptr().cast(),
@@ -953,10 +969,13 @@ fn the_library_copies_every_string_a_player_gives_it() {
     // SAFETY: the player is live, and the descriptor it returns stays valid
     // until the player is destroyed.
     let source = unsafe {
-        crate::Source::try_from_raw(playback.NDIlib_file_player_get_advertised_source(handle))
+        crate::Source::try_from_raw(
+            playback.NDIlib_file_player_get_advertised_source(handle),
+            "NDIlib_file_player_get_advertised_source",
+        )
     }
     .unwrap();
-    assert!(source.name.contains(&advertised), "{source:?}");
+    assert!(source.name().contains(&advertised), "{source:?}");
 
     let mut path = c_buffer(clip.to_str().unwrap());
     // SAFETY: the player is live and `path` is valid for the call.
@@ -1048,7 +1067,7 @@ fn an_exact_session_refuses_a_change_of_source_and_keeps_recording() {
 
     assert!(matches!(
         recorder.set_source(&source.spec),
-        Err(FileError::InvalidState(StateError::ExactFileName))
+        Err(Error::InvalidState(StateError::ExactFileName))
     ));
     let before = recorder.stats().unwrap().unwrap().video_frames();
     let deadline = Instant::now() + PATIENCE;
@@ -1090,7 +1109,7 @@ fn an_exact_target_that_exists_is_refused_before_the_library_sees_it() {
         &RecordingTarget::new(&file).unwrap(),
         RecordingTimecode::Preserve,
     ) {
-        Err(FileError::Io(error)) => {
+        Err(Error::Io(error)) => {
             assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
         }
         other => panic!("expected the existing file to be refused: {other:?}"),

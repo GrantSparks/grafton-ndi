@@ -16,7 +16,7 @@ use std::{env, time::Duration};
 
 use grafton_ndi::{
     file::{FileApi, FileRuntimeOptions, PlayerEventKind, PlayerOptions},
-    NDI,
+    Ndi,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .unwrap_or_else(|| "grafton-ndi File Player".to_owned());
 
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
     let file = FileApi::open(&ndi, &FileRuntimeOptions::default())?;
 
     // Probing reads the file's layout without advertising anything.
@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // The source is advertised from here until the player is dropped.
-    let mut player = file.create_player(&PlayerOptions::new(&name)?)?;
+    let mut player = file.create_player(&PlayerOptions::new(name))?;
     println!("Advertising {}", player.advertised_source()?);
     player.start(&recording)?;
 

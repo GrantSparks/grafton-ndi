@@ -26,11 +26,11 @@ pub(crate) fn sdk_millis(wait: Duration) -> Option<u32> {
     u32::try_from(wait.as_nanos().div_ceil(1_000_000)).ok()
 }
 
-/// [`sdk_millis`], failing with [`Error::InvalidConfiguration`] for a wait
+/// [`sdk_millis`], failing with [`Error::InvalidInput`] for a wait
 /// that exceeds [`MAX_TIMEOUT`].
 pub(crate) fn to_ms_checked(wait: Duration) -> Result<u32> {
     sdk_millis(wait).ok_or_else(|| {
-        Error::InvalidConfiguration(format!(
+        Error::InvalidInput(format!(
             "timeout {wait:?} exceeds MAX_TIMEOUT ({MAX_MILLIS} ms, about 49.7 days)"
         ))
     })
@@ -51,13 +51,13 @@ impl Deadline {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidConfiguration`] when `timeout` exceeds [`MAX_TIMEOUT`],
+    /// [`Error::InvalidInput`] when `timeout` exceeds [`MAX_TIMEOUT`],
     /// or when the instant it ends at cannot be represented.
     pub(crate) fn after(timeout: Duration) -> Result<Self> {
         to_ms_checked(timeout)?;
         let start = Instant::now();
         let end = start.checked_add(timeout).ok_or_else(|| {
-            Error::InvalidConfiguration(format!(
+            Error::InvalidInput(format!(
                 "timeout {timeout:?} ends at an instant this platform cannot represent"
             ))
         })?;
@@ -137,7 +137,7 @@ mod tests {
             assert_eq!(sdk_millis(wait), millis, "{wait:?}");
             match (to_ms_checked(wait), millis) {
                 (Ok(value), Some(millis)) => assert_eq!(value, millis, "{wait:?}"),
-                (Err(Error::InvalidConfiguration(reason)), None) => {
+                (Err(Error::InvalidInput(reason)), None) => {
                     assert!(reason.contains("MAX_TIMEOUT"), "{reason}");
                 }
                 (other, _) => panic!("{wait:?} converted to {other:?}"),

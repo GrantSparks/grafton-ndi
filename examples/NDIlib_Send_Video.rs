@@ -7,19 +7,19 @@
 
 use std::time::Instant;
 
-use grafton_ndi::{Error, PixelFormat, Sender, SenderOptions, VideoFrame, NDI};
+use grafton_ndi::{Error, Ndi, PixelFormat, Sender, SenderOptions, VideoFrame};
 
 fn main() -> Result<(), Error> {
     // Initialize NDI
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
 
     // Create the NDI sender
-    let send_options = SenderOptions::builder("My Video").build();
+    let send_options = SenderOptions::new("My Video");
     let sender = Sender::new(&ndi, &send_options)?;
 
     // Build 1920x1080 frames at the default 60 fps.
-    let xres = 1920i32;
-    let yres = 1080i32;
+    let xres = 1920u32;
+    let yres = 1080u32;
 
     // Send full batches until at least 10 seconds have elapsed.
     let start = Instant::now();
@@ -31,13 +31,13 @@ fn main() -> Result<(), Error> {
             // Create video frame with test pattern
             let video_frame = VideoFrame::builder()
                 .resolution(xres, yres)
-                .pixel_format(PixelFormat::BGRX)
+                .pixel_format(PixelFormat::Bgrx)
                 .build()?;
 
             // Zero-initialized BGRX pixels produce a black frame.
 
             // Send the frame (SDK handles timing)
-            sender.send_video(&video_frame);
+            sender.send_video(&video_frame)?;
         }
 
         // Display FPS

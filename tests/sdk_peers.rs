@@ -9,9 +9,9 @@
 mod common;
 
 use grafton_ndi::{
-    capabilities::SdkEdition, AudioFrame, MetadataFrame, PixelFormat, Receiver,
+    capabilities::SdkEdition, AudioFrame, FrameRate, MetadataFrame, Ndi, PixelFormat, Receiver,
     ReceiverColorFormat, ReceiverOptions, RuntimeOptions, Sender, SenderOptions, Source,
-    SourceAddress, VideoFrame, NDI,
+    SourceAddress, Timecode, VideoFrame,
 };
 use std::{
     io::{BufRead, BufReader, Write},
@@ -25,7 +25,7 @@ use std::{
 };
 
 const TIMEOUT: Duration = Duration::from_secs(20);
-const TIMECODE: i64 = 123_456_789;
+const TIMECODE: Timecode = Timecode::from_ticks(123_456_789);
 const METADATA: &str = "<grafton-cross-sdk/>";
 
 struct Peer {
@@ -63,7 +63,7 @@ impl Drop for Peer {
 
 fn serve() {
     let path = std::env::var_os("GRAFTON_NDI_PEER_RUNTIME").unwrap();
-    let ndi = NDI::with_options(
+    let ndi = Ndi::with_options(
         &RuntimeOptions::default()
             .library_path(path)
             .edition(SdkEdition::Standard),
@@ -72,14 +72,13 @@ fn serve() {
     common::assert_expected_identity(ndi.info());
     let sender = Sender::new(
         &ndi,
-        &SenderOptions::builder(common::unique_name("cross-sdk"))
+        &SenderOptions::new(common::unique_name("cross-sdk"))
             .clock_video(true)
-            .clock_audio(false)
-            .build(),
+            .clock_audio(false),
     )
     .unwrap();
     let source = common::loopback_source(&ndi, &sender).unwrap();
-    let SourceAddress::Ip(address) = source.address else {
+    let Some(SourceAddress::Ip(address)) = source.address() else {
         panic!("no loopback endpoint")
     };
     // Native diagnostics need not be UTF-8. Exercise the same pipe before our
@@ -87,10 +86,10 @@ fn serve() {
     std::io::stdout()
         .write_all(b"\xffnative diagnostic\n")
         .unwrap();
-    println!("GRAFTON_PEER_READY {address} {}", source.name);
+    println!("GRAFTON_PEER_READY {address} {}", source.name());
     let video = VideoFrame::builder()
         .resolution(64, 32)
-        .frame_rate(30, 1)
+        .frame_rate(FrameRate::new(30, 1).unwrap())
         .data([40, 120, 200, 255].repeat(64 * 32))
         .timecode(TIMECODE)
         .metadata(METADATA)
@@ -98,13 +97,15 @@ fn serve() {
         .unwrap();
     let audio = AudioFrame::builder()
         .sample_rate(48_000)
-        .channels(2)
-        .samples(1600)
+        .num_channels(2)
+        .num_samples(1600)
         .data(vec![0.25; 3200])
         .timecode(TIMECODE)
         .build()
         .unwrap();
-    let metadata = MetadataFrame::with_data(METADATA, TIMECODE).unwrap();
+    let metadata = MetadataFrame::new(METADATA)
+        .unwrap()
+        .with_timecode(TIMECODE);
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
     thread::spawn(move || {
@@ -118,7 +119,7 @@ fn serve() {
             Instant::now() < deadline,
             "the parent never stopped the peer"
         );
-        sender.send_video(&video);
+        sender.send_video(&video).unwrap();
         sender.send_audio(&audio);
         sender.send_metadata(&metadata);
     }
@@ -191,12 +192,10 @@ fn different_sdk_versions_exchange_video_audio_and_metadata() {
         .expect("peer address and source name");
     let receiver = Receiver::new(
         &ndi,
-        &ReceiverOptions::builder(Source {
-            name: name.to_owned(),
-            address: SourceAddress::Ip(address.to_owned()),
-        })
-        .color(ReceiverColorFormat::BGRX_BGRA)
-        .build(),
+        &ReceiverOptions::new(
+            Source::new(name.to_owned()).with_address(SourceAddress::Ip(address.to_owned())),
+        )
+        .color_format(ReceiverColorFormat::BgrxBgra),
     )
     .unwrap();
     let deadline = Instant::now() + TIMEOUT;
@@ -206,15 +205,11 @@ fn different_sdk_versions_exchange_video_audio_and_metadata() {
             Instant::now() < deadline,
             "cross-SDK delivery: video={video}, audio={audio}, metadata={metadata}"
         );
-        if let Some(frame) = receiver
-            .video()
-            .try_capture(Duration::from_millis(20))
-            .unwrap()
-        {
+        if let Some(frame) = receiver.video().capture(Duration::from_millis(20)).unwrap() {
             assert_eq!((frame.width(), frame.height()), (64, 32));
             assert!(matches!(
                 frame.pixel_format(),
-                PixelFormat::BGRA | PixelFormat::BGRX
+                PixelFormat::Bgra | PixelFormat::Bgrx
             ));
             assert_eq!(frame.timecode(), TIMECODE);
             assert_eq!(frame.metadata(), Some(METADATA));
@@ -227,11 +222,7 @@ fn different_sdk_versions_exchange_video_audio_and_metadata() {
                 .all(|(&actual, expected)| actual.abs_diff(expected) <= 8)));
             video = true;
         }
-        if let Some(frame) = receiver
-            .audio()
-            .try_capture(Duration::from_millis(20))
-            .unwrap()
-        {
+        if let Some(frame) = receiver.audio().capture(Duration::from_millis(20)).unwrap() {
             assert_eq!((frame.sample_rate(), frame.num_channels()), (48_000, 2));
             assert_eq!(frame.timecode(), TIMECODE);
             assert!(!frame.data().is_empty());
@@ -243,7 +234,7 @@ fn different_sdk_versions_exchange_video_audio_and_metadata() {
         }
         if let Some(frame) = receiver
             .metadata()
-            .try_capture(Duration::from_millis(20))
+            .capture(Duration::from_millis(20))
             .unwrap()
         {
             if frame.data() == METADATA {

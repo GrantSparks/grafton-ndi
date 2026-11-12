@@ -5,8 +5,8 @@
 mod common;
 
 use grafton_ndi::{
-    BorrowedVideoFrame, FrameSync, PixelFormat, Receiver, ReceiverColorFormat, ReceiverOptions,
-    ScanType, Sender, SenderOptions, Source, SourceCache, VideoFrame, VideoPlanes, NDI,
+    BorrowedVideoFrame, FrameSync, Ndi, PixelFormat, Receiver, ReceiverColorFormat,
+    ReceiverOptions, ScanType, Sender, SenderOptions, Source, SourceCache, VideoFrame, VideoPlanes,
 };
 use std::{
     sync::{
@@ -16,13 +16,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn receiver(ndi: &NDI, source: Source) -> Receiver {
+fn receiver(ndi: &Ndi, source: Source) -> Receiver {
     Receiver::new(
         ndi,
-        &ReceiverOptions::builder(source)
-            .color(ReceiverColorFormat::BGRX_BGRA)
-            .allow_video_fields(false)
-            .build(),
+        &ReceiverOptions::new(source)
+            .color_format(ReceiverColorFormat::BgrxBgra)
+            .allow_video_fields(false),
     )
     .unwrap()
 }
@@ -82,16 +81,15 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
     };
     let sender = Sender::new(
         &ndi,
-        &SenderOptions::builder(common::unique_name("video padding regression"))
+        &SenderOptions::new(common::unique_name("video padding regression"))
             .clock_video(true)
-            .clock_audio(false)
-            .build(),
+            .clock_audio(false),
     )
     .unwrap();
     let source = common::loopback_source(&ndi, &sender).unwrap();
     // Resolve the advertised machine component through equivalent spellings.
     let advertised = sender.source().unwrap();
-    let host = advertised.name.split_once(" (").unwrap().0;
+    let host = advertised.name().split_once(" (").unwrap().0;
     let cache = SourceCache::new();
     let first = cache
         .find_by_host(&ndi, &host.to_ascii_uppercase(), Duration::from_secs(15))
@@ -119,7 +117,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
         scope.spawn(move || {
             let mut frame = VideoFrame::builder()
                 .resolution(642, 32)
-                .pixel_format(PixelFormat::BGRA)
+                .pixel_format(PixelFormat::Bgra)
                 .metadata("<padding-regression/>")
                 .build()
                 .unwrap();
@@ -127,7 +125,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
                 pixel.copy_from_slice(&[40, 80, 120, 255]);
             }
             while !worker_stop.load(Ordering::Relaxed) {
-                sender.send_video(&frame);
+                sender.send_video(&frame).unwrap();
             }
         });
         struct Stop(Arc<AtomicBool>);
@@ -146,7 +144,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
             );
             if let Some(frame) = receiver
                 .video()
-                .try_capture_ref(Duration::from_millis(100))
+                .capture_ref(Duration::from_millis(100))
                 .unwrap()
             {
                 break frame;
@@ -168,31 +166,37 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
             std::fs::write("/dev/null", borrowed.encode_png().unwrap()).unwrap();
             std::fs::write("/dev/null", borrowed.encode_jpeg(85).unwrap()).unwrap();
         }
-        let owned = borrowed.to_owned().unwrap();
+        let owned = borrowed.try_to_owned().unwrap();
         verify_owned(&owned);
         drop(borrowed);
-        let owned_capture = receiver.video().capture(Duration::from_secs(10)).unwrap();
+        let owned_capture = receiver
+            .video()
+            .capture(Duration::from_secs(10))
+            .unwrap()
+            .expect("a frame within the timeout");
         verify_owned(&owned_capture);
         #[cfg(feature = "tokio")]
         let receiver = {
-            use grafton_ndi::tokio::AsyncReceiver;
+            use grafton_ndi::asynchronous::tokio::AsyncReceiver;
             // Use a separate receiver because AsyncReceiver retains its owner.
             let async_receiver =
                 AsyncReceiver::new(self::receiver(&ndi, receiver.source().clone()));
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let frame = runtime
                 .block_on(async_receiver.video().capture(Duration::from_secs(10)))
-                .unwrap();
+                .unwrap()
+                .expect("a frame within the timeout");
             verify_owned(&frame);
             receiver
         };
         #[cfg(feature = "smol")]
         {
-            use grafton_ndi::smol::AsyncReceiver;
+            use grafton_ndi::asynchronous::smol::AsyncReceiver;
             let async_receiver =
                 AsyncReceiver::new(self::receiver(&ndi, receiver.source().clone()));
-            let frame =
-                smol::block_on(async_receiver.video().capture(Duration::from_secs(10))).unwrap();
+            let frame = smol::block_on(async_receiver.video().capture(Duration::from_secs(10)))
+                .unwrap()
+                .expect("a frame within the timeout");
             verify_owned(&frame);
         }
         let framesync = FrameSync::new(receiver).unwrap();
@@ -202,7 +206,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
                 Instant::now() < deadline,
                 "FrameSync did not produce a frame"
             );
-            if let Some(frame) = framesync.capture_video(ScanType::Progressive).unwrap() {
+            if let Some(frame) = framesync.capture_video_ref(ScanType::Progressive).unwrap() {
                 eprintln!("FrameSync SDK stride: {:?}", frame.line_stride_bytes());
                 scoped_reads(frame.planes());
                 for plane in frame.planes() {
@@ -215,35 +219,40 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
                     std::fs::write("/dev/null", frame.encode_png().unwrap()).unwrap();
                     std::fs::write("/dev/null", frame.encode_jpeg(85).unwrap()).unwrap();
                 }
-                verify_owned(&frame.to_owned().unwrap());
+                verify_owned(&frame.try_to_owned().unwrap());
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         verify_owned(
             &framesync
-                .capture_video_owned(ScanType::Progressive)
+                .capture_video(ScanType::Progressive)
                 .unwrap()
                 .unwrap(),
         );
         let _ = framesync
             .receiver()
             .metadata()
-            .try_capture(Duration::ZERO)
+            .capture(Duration::ZERO)
             .unwrap();
         let _ = framesync.receiver().poll_event(Duration::ZERO).unwrap();
         let receiver = framesync.into_receiver();
-        verify_owned(&receiver.video().capture(Duration::from_secs(10)).unwrap());
+        verify_owned(
+            &receiver
+                .video()
+                .capture(Duration::from_secs(10))
+                .unwrap()
+                .expect("a frame within the timeout"),
+        );
         let mut resend = Sender::new(
             &ndi,
-            &SenderOptions::builder(common::unique_name("normalized padding resend"))
+            &SenderOptions::new(common::unique_name("normalized padding resend"))
                 .clock_video(false)
-                .clock_audio(false)
-                .build(),
+                .clock_audio(false),
         )
         .unwrap();
         let original = owned.data().as_ptr();
-        assert!(resend.send_video_async(owned).is_none());
+        assert!(resend.send_video_async(owned).unwrap().is_none());
         let borrowed_send = BorrowedVideoFrame::from(&owned_capture);
         let recovered = resend
             .send_video_async_copy(&borrowed_send)

@@ -78,7 +78,7 @@ fn rejected_releases_are_retained_and_drop_retries_only_the_inputs_still_pressed
     let Some(ndi) = crate::test_support::ndi() else {
         return;
     };
-    let mut receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+    let mut receiver = Receiver::new(&ndi, &ReceiverOptions::new(crate::Source::new(""))).unwrap();
     CALLS.with_borrow_mut(|calls| *calls = Calls::default());
     let mut session = KvmSession {
         receiver: &mut receiver,
@@ -87,12 +87,22 @@ fn rejected_releases_are_retained_and_drop_retries_only_the_inputs_still_pressed
         buttons: BTreeSet::new(),
         touching: false,
     };
-    assert!(session.key_down(0xff0d).unwrap());
-    assert!(session.mouse_down(MouseButton::Left));
-    assert!(session.touch(&[[0.25, 0.5], [0.75, 1.0]]).unwrap());
-    assert!(session.set_clipboard_text("clipboard é").unwrap());
-    assert!(session.set_clipboard_text("bad\0text").is_err());
-    assert!(!session.release_all());
+    session.key_down(0xff0d).unwrap();
+    session.mouse_down(MouseButton::Left).unwrap();
+    session.touch(&[[0.25, 0.5], [0.75, 1.0]]).unwrap();
+    session.set_clipboard_text("clipboard é").unwrap();
+    assert!(matches!(
+        session.set_clipboard_text("bad\0text"),
+        Err(Error::InvalidCString(_))
+    ));
+    // The first key release is refused: the session says which function,
+    // keeps the key, and still releases the rest.
+    assert!(matches!(
+        session.release_all(),
+        Err(Error::NativeOperationFailed {
+            operation: "NDIlib_recv_kvm_send_keyboard_release"
+        })
+    ));
     assert_eq!(session.keys.len(), 1);
     assert!(session.buttons.is_empty());
     assert!(!session.touching);

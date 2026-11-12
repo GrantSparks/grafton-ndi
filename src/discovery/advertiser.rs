@@ -5,7 +5,7 @@ use crate::{
     receiver::{ReceiverCore, ReceiverMode},
     sender::SenderResource,
     sys::{self, bindings::*},
-    Error, Receiver, Rejected, Result, Sender, NDI,
+    Error, Ndi, Receiver, Rejected, Result, Sender,
 };
 use std::{
     collections::BTreeMap,
@@ -24,15 +24,33 @@ use std::{
 #[derive(Debug, Clone, Default)]
 pub struct AdvertiserOptions {
     servers: Option<String>,
+    #[cfg(feature = "advanced")]
+    config: Option<crate::advanced::AdvancedConfig>,
 }
 impl AdvertiserOptions {
+    /// The default options: the Discovery Server of the NDI configuration.
+    pub fn new() -> Self {
+        Self::default()
+    }
     /// Use explicit endpoints instead of the SDK configuration.
     ///
     /// Each endpoint is a host name or IP address, optionally followed by a
     /// colon and a port (5959 when omitted). Several endpoints separated by
     /// commas register with redundant servers.
+    #[must_use]
     pub fn servers(mut self, servers: impl Into<String>) -> Self {
         self.servers = Some(servers.into());
+        self
+    }
+    /// Create the advertiser with this per-instance Advanced SDK
+    /// configuration, which it keeps for as long as it lives.
+    ///
+    /// [`SendAdvertiser::new`] and [`RecvAdvertiser::new`] then need an
+    /// Advanced runtime, and a build with the Advanced SDK.
+    #[cfg(feature = "advanced")]
+    #[must_use]
+    pub fn config(mut self, config: crate::advanced::AdvancedConfig) -> Self {
+        self.config = Some(config);
         self
     }
 }
@@ -42,7 +60,12 @@ pub struct SendAdvertisement {
     monitoring: bool,
 }
 impl SendAdvertisement {
+    /// The default advertisement: no remote monitoring.
+    pub fn new() -> Self {
+        Self::default()
+    }
     /// Permit remote monitoring of this sender.
+    #[must_use]
     pub fn allow_monitoring(mut self, enabled: bool) -> Self {
         self.monitoring = enabled;
         self
@@ -57,18 +80,26 @@ pub struct RecvAdvertisement {
     input_group: Option<String>,
 }
 impl RecvAdvertisement {
+    /// The default advertisement: no remote monitoring or source control, and
+    /// no input group.
+    pub fn new() -> Self {
+        Self::default()
+    }
     /// Permit remote monitoring.
+    #[must_use]
     pub fn allow_monitoring(mut self, enabled: bool) -> Self {
         self.monitoring = enabled;
         self
     }
     /// Permit Discovery Server clients to change this receiver's source.
+    #[must_use]
     pub fn allow_controlling(mut self, enabled: bool) -> Self {
         self.controlling = enabled;
         self
     }
     /// Name the receiver's input group. Receivers that share a group name, such
     /// as the video and audio receivers of one input, are presented together.
+    #[must_use]
     pub fn input_group(mut self, group: impl Into<String>) -> Self {
         self.input_group = Some(group.into());
         self
@@ -104,7 +135,8 @@ trait AdvertiserApi: sys::Table + Sync {
     /// must not be used again.
     unsafe fn destroy(&self, instance: Self::Instance);
 
-    /// Stop advertising `member`. Returns false when the SDK did not know it.
+    /// Stop advertising `member`. Returns false, having removed nothing, when
+    /// the SDK did not know it.
     ///
     /// # Safety
     ///
@@ -179,7 +211,7 @@ struct Advertiser<A: AdvertiserApi> {
     _url: Option<CString>,
     #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
-    _ndi: NDI,
+    _ndi: Ndi,
 }
 
 // SAFETY: the SDK attaches no advertiser to the thread that created it; its
@@ -191,7 +223,7 @@ unsafe impl<A: AdvertiserApi> Send for Advertiser<A> where A::Member: Send {}
 
 impl<A: AdvertiserApi> Advertiser<A> {
     /// Connect to the Discovery Server `options` name.
-    fn new(ndi: &NDI, options: &AdvertiserOptions) -> Result<Self> {
+    fn new(ndi: &Ndi, options: &AdvertiserOptions) -> Result<Self> {
         // SAFETY: the SDK's advertiser creation returns null or a fresh
         // advertiser that nothing else owns, and the settings outlive the call.
         unsafe {
@@ -215,7 +247,7 @@ impl<A: AdvertiserApi> Advertiser<A> {
     /// `create` returns null or a live advertiser of `ndi`'s runtime, made
     /// from the settings it was handed, that nothing else owns.
     unsafe fn create(
-        ndi: &NDI,
+        ndi: &Ndi,
         options: &AdvertiserOptions,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(&'static A, &A::Settings) -> A::Instance,
@@ -245,25 +277,38 @@ impl<A: AdvertiserApi> Advertiser<A> {
         id
     }
 
-    /// End the registration `id`, which the token `registration` names.
-    /// Returns whether the SDK confirmed the removal.
+    /// End the registration `id`, which the token `registration` names, as
+    /// the native `operation`.
     ///
     /// # Errors
     ///
-    /// Hands `registration` back, changing nothing, when another advertiser
-    /// issued it: the token is the only way to end that registration.
-    fn release<R>(&mut self, id: u64, registration: R) -> std::result::Result<bool, Rejected<R>> {
-        let Some(member) = self.members.remove(&id) else {
+    /// Hands `registration` back, changing nothing: with
+    /// [`Error::InvalidInput`] when another advertiser issued it, since the
+    /// token is the only way to end that registration, and with
+    /// [`Error::NativeOperationFailed`] when the SDK removes nothing because
+    /// it does not know the registered object.
+    fn release<R>(
+        &mut self,
+        id: u64,
+        registration: R,
+        operation: &'static str,
+    ) -> std::result::Result<(), Rejected<R>> {
+        let Some(member) = self.members.get(&id) else {
             return Err(Rejected::new(
-                Error::InvalidConfiguration(
-                    "the registration was issued by another advertiser".into(),
-                ),
+                Error::InvalidInput("the registration was issued by another advertiser".into()),
                 registration,
             ));
         };
-        // SAFETY: the advertiser is live for this borrow. `member` is released
-        // only after the SDK has forgotten it.
-        Ok(unsafe { self.api.remove(self.instance, &member) })
+        // SAFETY: the advertiser is live for this borrow.
+        if !unsafe { self.api.remove(self.instance, member) } {
+            return Err(Rejected::new(
+                Error::NativeOperationFailed { operation },
+                registration,
+            ));
+        }
+        // The SDK has forgotten the object, so it may be released.
+        self.members.remove(&id);
+        Ok(())
     }
 }
 
@@ -395,14 +440,19 @@ impl SendAdvertiser {
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime
-    /// cannot provide [sender advertising], which needs NDI 6.4.0 or later;
-    /// [`Error::InvalidCString`] when the server list contains a NUL byte; and
-    /// [`Error::InvalidConfiguration`] when the SDK creates no advertiser. It
-    /// creates none for an address it cannot parse, and none when `options`
-    /// name no server and the NDI configuration supplies none.
+    /// cannot provide [sender advertising], which needs NDI 6.4.0 or later, or
+    /// the options carry an Advanced configuration that the runtime or this
+    /// build cannot take; [`Error::InvalidCString`] when the server list
+    /// contains a NUL byte; and [`Error::InvalidInput`] when the SDK creates
+    /// no advertiser. It creates none for an address it cannot parse, and none
+    /// when `options` name no server and the NDI configuration supplies none.
     ///
     /// [sender advertising]: crate::capabilities::RuntimeFeature::SenderAdvertising
-    pub fn new(ndi: &NDI, options: &AdvertiserOptions) -> Result<Self> {
+    pub fn new(ndi: &Ndi, options: &AdvertiserOptions) -> Result<Self> {
+        #[cfg(feature = "advanced")]
+        if let Some(config) = &options.config {
+            return Self::new_configured(ndi, options, config);
+        }
         Ok(Self {
             inner: Advertiser::new(ndi, options)?,
         })
@@ -415,7 +465,7 @@ impl SendAdvertiser {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidConfiguration`] when this advertiser already
+    /// Returns [`Error::InvalidInput`] when this advertiser already
     /// advertises the sender, and [`Error::NativeOperationFailed`] when the SDK
     /// refuses the registration.
     pub fn register(
@@ -430,9 +480,7 @@ impl SendAdvertiser {
             .values()
             .any(|member| Arc::ptr_eq(member, &owner))
         {
-            return Err(Error::InvalidConfiguration(
-                "sender is already registered".into(),
-            ));
+            return Err(Error::InvalidInput("sender is already registered".into()));
         }
         // SAFETY: the advertiser is live for this borrow and `owner` keeps the
         // sender alive for as long as the registration exists.
@@ -451,19 +499,22 @@ impl SendAdvertiser {
     }
     /// Stop advertising a sender and release this advertiser's hold on it.
     ///
-    /// Returns whether the SDK confirmed the removal. Either way the
-    /// registration has ended and no longer keeps the sender alive.
-    ///
     /// # Errors
     ///
-    /// Only the advertiser that issued a registration can end it. Another one
-    /// changes nothing and hands the registration back inside [`Rejected`], so
-    /// that it can still be given to the advertiser it belongs to.
+    /// A failure changes nothing and hands the registration back inside
+    /// [`Rejected`]. Only the advertiser that issued a registration can end
+    /// it: another one fails with [`Error::InvalidInput`], and the
+    /// registration can still be given to the advertiser it belongs to. The
+    /// call fails with [`Error::NativeOperationFailed`] when the SDK removes
+    /// nothing because it does not know the sender; the registration then
+    /// stays in effect, and keeps the sender alive, until it is removed or
+    /// the advertiser is dropped.
     pub fn unregister(
         &mut self,
         registration: SendRegistration,
-    ) -> std::result::Result<bool, Rejected<SendRegistration>> {
-        self.inner.release(registration.0, registration)
+    ) -> std::result::Result<(), Rejected<SendRegistration>> {
+        self.inner
+            .release(registration.0, registration, "unregister sender")
     }
 }
 #[cfg(feature = "advanced")]
@@ -477,7 +528,7 @@ impl SendAdvertiser {
     /// `create` returns null or a live advertiser of `ndi`'s runtime, made
     /// from the settings it was handed, that nothing else owns.
     pub(crate) unsafe fn create(
-        ndi: &NDI,
+        ndi: &Ndi,
         options: &AdvertiserOptions,
         _operation: &'static str,
         config: Option<crate::advanced::AdvancedConfig>,
@@ -501,14 +552,19 @@ impl RecvAdvertiser {
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime
-    /// cannot provide [receiver advertising], which needs NDI 6.4.0 or later;
-    /// [`Error::InvalidCString`] when the server list contains a NUL byte; and
-    /// [`Error::InvalidConfiguration`] when the SDK creates no advertiser. It
-    /// creates none for an address it cannot parse, and none when `options`
-    /// name no server and the NDI configuration supplies none.
+    /// cannot provide [receiver advertising], which needs NDI 6.4.0 or later,
+    /// or the options carry an Advanced configuration that the runtime or this
+    /// build cannot take; [`Error::InvalidCString`] when the server list
+    /// contains a NUL byte; and [`Error::InvalidInput`] when the SDK creates
+    /// no advertiser. It creates none for an address it cannot parse, and none
+    /// when `options` name no server and the NDI configuration supplies none.
     ///
     /// [receiver advertising]: crate::capabilities::RuntimeFeature::ReceiverAdvertising
-    pub fn new(ndi: &NDI, options: &AdvertiserOptions) -> Result<Self> {
+    pub fn new(ndi: &Ndi, options: &AdvertiserOptions) -> Result<Self> {
+        #[cfg(feature = "advanced")]
+        if let Some(config) = &options.config {
+            return Self::new_configured(ndi, options, config);
+        }
         Ok(Self {
             inner: Advertiser::new(ndi, options)?,
         })
@@ -522,7 +578,7 @@ impl RecvAdvertiser {
     /// # Errors
     ///
     /// Returns [`Error::InvalidCString`] when the input-group name contains a
-    /// NUL byte, [`Error::InvalidConfiguration`] when this advertiser already
+    /// NUL byte, [`Error::InvalidInput`] when this advertiser already
     /// advertises the receiver, and [`Error::NativeOperationFailed`] when the
     /// SDK refuses the registration.
     pub fn register<M: ReceiverMode>(
@@ -542,9 +598,7 @@ impl RecvAdvertiser {
             .values()
             .any(|member| Arc::ptr_eq(&member.resource, &resource))
         {
-            return Err(Error::InvalidConfiguration(
-                "receiver is already registered".into(),
-            ));
+            return Err(Error::InvalidInput("receiver is already registered".into()));
         }
         // SAFETY: the advertiser is live for this borrow, `resource` keeps the
         // receiver alive for as long as the registration exists, and the
@@ -569,19 +623,22 @@ impl RecvAdvertiser {
     }
     /// Stop advertising a receiver and release this advertiser's hold on it.
     ///
-    /// Returns whether the SDK confirmed the removal. Either way the
-    /// registration has ended and no longer keeps the receiver alive.
-    ///
     /// # Errors
     ///
-    /// Only the advertiser that issued a registration can end it. Another one
-    /// changes nothing and hands the registration back inside [`Rejected`], so
-    /// that it can still be given to the advertiser it belongs to.
+    /// A failure changes nothing and hands the registration back inside
+    /// [`Rejected`]. Only the advertiser that issued a registration can end
+    /// it: another one fails with [`Error::InvalidInput`], and the
+    /// registration can still be given to the advertiser it belongs to. The
+    /// call fails with [`Error::NativeOperationFailed`] when the SDK removes
+    /// nothing because it does not know the receiver; the registration then
+    /// stays in effect, and keeps the receiver alive, until it is removed or
+    /// the advertiser is dropped.
     pub fn unregister(
         &mut self,
         registration: RecvRegistration,
-    ) -> std::result::Result<bool, Rejected<RecvRegistration>> {
-        self.inner.release(registration.0, registration)
+    ) -> std::result::Result<(), Rejected<RecvRegistration>> {
+        self.inner
+            .release(registration.0, registration, "unregister receiver")
     }
 }
 #[cfg(feature = "advanced")]
@@ -595,7 +652,7 @@ impl RecvAdvertiser {
     /// `create` returns null or a live advertiser of `ndi`'s runtime, made
     /// from the settings it was handed, that nothing else owns.
     pub(crate) unsafe fn create(
-        ndi: &NDI,
+        ndi: &Ndi,
         options: &AdvertiserOptions,
         _operation: &'static str,
         config: Option<crate::advanced::AdvancedConfig>,

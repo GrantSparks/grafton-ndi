@@ -33,7 +33,7 @@ The crate checks what the selected runtime provides before it calls into it. An 
 | Every API that 2.0 had: source discovery, receiving, sending, FrameSync, PTZ, tally and status | Yes | Yes | Yes |
 | Routing, receiver connection metadata, the web-control URL, metadata from receivers to a sender, interleaved audio, V210/P216 conversion | Yes | Yes | Yes |
 | `Receiver::poll_source_name_change` | No | Yes | Yes |
-| Receiver video and audio delay, `NDI::timestamp` | No | No | Yes |
+| Receiver video and audio delay, `Ndi::timestamp` | No | No | Yes |
 | Planar 4:4:4 video formats, `ReceiverColorFormat::Best444`, the video-only bandwidth modes | No | No | Yes |
 | Discovery Server advertisers and listeners | No | No | Yes |
 | Advanced SDK operations (`advanced` feature), with an Advanced runtime | Not tested | Yes | Yes |
@@ -77,7 +77,7 @@ iOS, tvOS and visionOS targets link the vendor's static archive into the applica
 
 ## What It Covers
 
-- **Runtime lifecycle** - Select the NDI runtime library, inspect it, then start and stop NDI through cheap, reference-counted `NDI` handles.
+- **Runtime lifecycle** - Select the NDI runtime library, inspect it, then start and stop NDI through cheap, reference-counted `Ndi` handles.
 - **Network discovery** - Discover sources, wait for source-list changes, search groups or extra IP addresses, and cache host/IP lookups.
 - **Receiving** - Capture video, audio, and metadata with configurable bandwidth and color-format choices.
 - **Sending** - Publish an NDI source and send video, audio, metadata, connection metadata, and failover information.
@@ -85,7 +85,7 @@ iOS, tvOS and visionOS targets link the vendor's static archive into the applica
 - **Monitoring** - Query receiver connection status, frame-drop statistics, tally state, and sender connection counts.
 - **PTZ control** - Drive supported pan, tilt, zoom, focus, exposure, and white-balance commands.
 - **Async integration** - Use optional Tokio or smol wrappers for receive workflows without blocking the async runtime.
-- **Image snapshots** - Encode captured video frames as PNG, JPEG, or data URLs with the default `image-encoding` feature.
+- **Image snapshots** - Encode captured video frames as PNG, JPEG, or data URLs with the `image-encoding` feature.
 - **Routing and Discovery Server** - Redirect receivers with a routing source, register senders and receivers with a Discovery Server, list what it reports, and request receiver connections.
 - **Media formats and controls** - Planar 4:4:4 formats, receiver color and bandwidth modes, delay controls, SDK timestamps, and checked audio and video conversions.
 - **Advanced SDK** - Optional compressed and scatter streams, completion queues, custom receive allocation, JSON configuration, source metadata, encoder and keyframe controls, AVSync, Genlock, and KVM.
@@ -95,18 +95,13 @@ iOS, tvOS and visionOS targets link the vendor's static archive into the applica
 ## Quick Start
 
 ```rust
-use grafton_ndi::{Finder, FinderOptions, NDI};
+use grafton_ndi::{Finder, FinderOptions, Ndi};
 use std::time::Duration;
 
 fn main() -> grafton_ndi::Result<()> {
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
 
-    let finder = Finder::new(
-        &ndi,
-        &FinderOptions::builder()
-            .show_local_sources(true)
-            .build(),
-    )?;
+    let finder = Finder::new(&ndi, &FinderOptions::new())?;
 
     for source in finder.find_sources(Duration::from_secs(5))? {
         println!("Found source: {source}");
@@ -129,12 +124,12 @@ Feature flags:
 
 | Feature | Effect |
 | --- | --- |
-| `image-encoding` | PNG, JPEG and data-URL encoding of video frames. Enabled by default. |
+| `image-encoding` | PNG, JPEG and data-URL encoding of video frames. Off by default. |
 | `tokio`, `smol` | Receiver adapters for the named async runtime. Each is independent. |
 | `advanced` | The `advanced` module: NDI Advanced SDK operations. See [Advanced SDK](#advanced-sdk). |
 | `file-io` | The `file` module: recording and playback through the NDI File API. See the [File API guide](docs/file-io.md). |
 
-Use `default-features = false` for a build without image encoding. Cargo features select Rust APIs only. They do not choose an SDK edition or a runtime library; see [SDK editions](#sdk-editions).
+No feature is enabled by default; enable each one you need, for example `features = ["image-encoding"]`. Cargo features select Rust APIs only. They do not choose an SDK edition or a runtime library; see [SDK editions](#sdk-editions).
 
 ### Requirements
 
@@ -154,7 +149,7 @@ Two cases read an SDK at build time:
 
 ### Finding the runtime
 
-The runtime library is loaded when the program selects a runtime, not when the program starts. `NDI::new()` selects the default runtime and starts NDI; [Selecting a runtime](#selecting-a-runtime) shows the two steps separately. The first usable library in this order is selected:
+The runtime library is loaded when the program selects a runtime, not when the program starts. `Ndi::new()` selects the default runtime and starts NDI; [Selecting a runtime](#selecting-a-runtime) shows the two steps separately. The first usable library in this order is selected:
 
 1. The directory that contains the running executable.
 2. The directory named by the `NDI_RUNTIME_DIR_V6` environment variable. This is the variable the NDI SDK itself uses for the runtime directory.
@@ -174,20 +169,20 @@ The library file names are:
 | Linux | `libndi.so.6` | `libndi_advanced.so.6` |
 | Android | `libndi.so` | `libndi_advanced.so` |
 
-To load one exact file instead, pass its absolute path. No other location is tried, and a relative path returns `Error::InvalidConfiguration`:
+To load one exact file instead, pass its absolute path. No other location is tried, and a relative path returns `Error::InvalidInput`:
 
 ```rust
-use grafton_ndi::{RuntimeOptions, NDI};
+use grafton_ndi::{RuntimeOptions, Ndi};
 
 let options = RuntimeOptions::default().library_path("/opt/ndi/lib/libndi.so.6");
-let ndi = NDI::with_options(&options)?;
+let ndi = Ndi::with_options(&options)?;
 println!("loaded {:?}", ndi.info().library_path());
 ```
 
-When no usable library is found, `NDI::new()` returns `Error::RuntimeLoadFailed`. Its message names every location tried and the operating system's reason for each:
+When no usable library is found, `Ndi::new()` returns `Error::RuntimeLoadFailed`. Its message names every location tried and the operating system's reason for each:
 
 ```text
-Failed to load the NDI runtime: no usable NDI runtime; tried /opt/app/libndi.so.6 (next to the executable): not found; /opt/app/libndi_advanced.so.6 (next to the executable): not found; libndi.so.6 (system library search): dlopen failed: libndi.so.6: cannot open shared object file: No such file or directory; libndi_advanced.so.6 (system library search): dlopen failed: libndi_advanced.so.6: cannot open shared object file: No such file or directory
+Failed to load an NDI library: no usable NDI runtime; tried /opt/app/libndi.so.6 (next to the executable): not found; /opt/app/libndi_advanced.so.6 (next to the executable): not found; libndi.so.6 (system library search): dlopen failed: libndi.so.6: cannot open shared object file: No such file or directory; libndi_advanced.so.6 (system library search): dlopen failed: libndi_advanced.so.6: cannot open shared object file: No such file or directory
 ```
 
 A failed selection can be retried. A successful one is permanent: the selected library stays loaded until the process exits. A later request that it cannot meet returns `Error::RuntimeConflict`: one that names a different library, or one that requires the Advanced edition when the selected library is a Standard runtime.
@@ -196,7 +191,7 @@ One limit applies to the search. A library that loads but is rejected stays load
 
 ### Selecting a runtime
 
-Using NDI takes two steps. `Runtime::select` loads the library and pins it for the rest of the process without starting NDI. `Runtime::initialize` starts NDI and returns the `NDI` handle from which finders, senders and receivers are created. `NDI::new()` does both with the default options, and `NDI::with_options` with the options it is given. Nothing else selects a runtime.
+Using NDI takes two steps. `Runtime::select` loads the library and pins it for the rest of the process without starting NDI. `Runtime::initialize` starts NDI and returns the `Ndi` handle from which finders, senders and receivers are created. `Ndi::new()` does both with the default options, and `Ndi::with_options` with the options it is given. Nothing else selects a runtime.
 
 Selecting first lets a program inspect the library before it starts it:
 
@@ -234,11 +229,9 @@ The search does not depend on how or where the crate was built. `NDI_SDK_DIR` ma
 use grafton_ndi::{Finder, FinderOptions};
 use std::time::Duration;
 
-let options = FinderOptions::builder()
-    .show_local_sources(true)
+let options = FinderOptions::new()
     .groups("Public,Studio")
-    .extra_ips("192.168.1.100")
-    .build();
+    .extra_ips("192.168.1.100");
 let finder = Finder::new(&ndi, &options)?;
 
 if finder.wait_for_sources(Duration::from_secs(2))? {
@@ -248,7 +241,7 @@ if finder.wait_for_sources(Duration::from_secs(2))? {
 }
 ```
 
-For applications that repeatedly reconnect to known devices, `SourceCache` handles discovery and exact host/IP matching, and keeps each source it finds until `invalidate()` or `clear()` removes it. Its lookups take the `NDI` handle. Pass a complete bare hostname or IP address. Hostname ASCII case, an optional final dot, and equivalent numeric IP spellings share one cache entry. `len()` counts distinct host identities; `invalidate()` accepts any equivalent spelling. For searches by partial IP or source label, filter a `Finder` snapshot explicitly.
+For applications that repeatedly reconnect to known devices, `SourceCache` handles discovery and exact host/IP matching, and keeps each source it finds until `invalidate()` or `clear()` removes it. Its lookups take the `Ndi` handle. Pass a complete bare hostname or IP address. Hostname ASCII case, an optional final dot, and equivalent numeric IP spellings share one cache entry. `len()` counts distinct host identities; `invalidate()` accepts any equivalent spelling. For searches by partial IP or source label, filter a `Finder` snapshot explicitly.
 
 ```rust
 use grafton_ndi::SourceCache;
@@ -268,22 +261,23 @@ use grafton_ndi::{
 };
 use std::time::Duration;
 
-let options = ReceiverOptions::builder(camera.clone())
-    .color(ReceiverColorFormat::RGBX_RGBA)
-    .bandwidth(ReceiverBandwidth::Highest)
-    .build();
+let options = ReceiverOptions::new(camera.clone())
+    .color_format(ReceiverColorFormat::RgbxRgba)
+    .bandwidth(ReceiverBandwidth::Highest);
 let receiver = Receiver::new(&ndi, &options)?;
 
-let video = receiver.video().capture(Duration::from_secs(5))?;
-println!(
-    "{}x{} {:?}",
-    video.width(),
-    video.height(),
-    video.pixel_format()
-);
+// Each capture waits up to its timeout, and returns `None` if nothing came.
+if let Some(video) = receiver.video().capture(Duration::from_secs(5))? {
+    println!(
+        "{}x{} {:?}",
+        video.width(),
+        video.height(),
+        video.pixel_format()
+    );
+}
 
-let audio = receiver.audio().try_capture(Duration::from_millis(100))?;
-let metadata = receiver.metadata().try_capture(Duration::from_millis(100))?;
+let audio = receiver.audio().capture(Duration::from_millis(100))?;
+let metadata = receiver.metadata().capture(Duration::from_millis(100))?;
 ```
 
 Borrowed receiver and FrameSync video expose only initialized active pixels.
@@ -292,20 +286,21 @@ Borrowed receiver and FrameSync video expose only initialized active pixels.
 allocation or pixel copies:
 
 ```rust
-if let Some(frame) = receiver.video().try_capture_ref(Duration::from_secs(1))? {
+if let Some(frame) = receiver.video().capture_ref(Duration::from_secs(1))? {
     for plane in frame.planes() {
         for row in plane.rows() {
             // Each row contains active bytes only, with no SDK padding.
             println!("{} active bytes", row.len());
         }
     }
-    let packed = frame.to_owned()?; // one pixel allocation; active rows only
+    let packed = frame.try_to_owned()?; // one pixel allocation; active rows only
 }
 ```
 
 Owned capture and copied video sends pack planes tightly and can reduce the
 source stride. Format, plane order, metadata, timing, aspect ratio, and scan type
-are preserved. Borrowed PNG/JPEG encoding reads active rows directly.
+are preserved. Owned frames expose the same `planes()` views, without padding.
+Borrowed PNG/JPEG encoding reads active rows directly.
 
 `VideoPlane`, `VideoRows`, and `VideoPlanes` implement `Send + Sync`. You can
 move preconstructed views into scoped workers or share them for immutable reads,
@@ -322,23 +317,22 @@ an RGB staging frame. Codec storage and encoded output require additional memory
 `Sender` publishes a named NDI source and sends video, audio, and metadata. It also exposes connection count, tally, failover, and connection metadata APIs.
 
 ```rust
-use grafton_ndi::{PixelFormat, Sender, SenderOptions, VideoFrame};
+use grafton_ndi::{FrameRate, PixelFormat, Sender, SenderOptions, VideoFrame};
 use std::time::Duration;
 
-let options = SenderOptions::builder("Rust Program Output")
+let options = SenderOptions::new("Rust Program Output")
     .clock_video(true)
-    .clock_audio(true)
-    .build();
+    .clock_audio(true);
 let sender = Sender::new(&ndi, &options)?;
 
 let mut frame = VideoFrame::builder()
     .resolution(1920, 1080)
-    .pixel_format(PixelFormat::BGRA)
-    .frame_rate(60, 1)
+    .pixel_format(PixelFormat::Bgra)
+    .frame_rate(FrameRate::new(60, 1)?)
     .build()?;
 frame.data_mut().fill(0);
 
-sender.send_video(&frame);
+sender.send_video(&frame)?;
 
 let connections = sender.connection_count(Duration::from_millis(500))?;
 println!("connected receivers: {connections}");
@@ -353,24 +347,26 @@ use grafton_ndi::{FrameSync, FrameSyncAudioRequest, ScanType};
 
 let frame_sync = FrameSync::new(receiver)?;
 
-if let Some(video) = frame_sync.capture_video(ScanType::Progressive)? {
+// Borrow the SDK's frame; `capture_video` returns an owned copy instead.
+if let Some(video) = frame_sync.capture_video_ref(ScanType::Progressive)? {
     println!("video: {}x{}", video.width(), video.height());
 }
 
 // 1024 stereo samples at 48 kHz, resampled from the source's audio.
-let request = FrameSyncAudioRequest::capture_with(Some(48_000), 2, 1024)?;
-let audio = frame_sync.capture_audio(request)?;
+let request = FrameSyncAudioRequest::capture_at(48_000, 2, 1024)?;
+let audio = frame_sync.capture_audio_ref(request)?;
 println!("audio: {} channels at {} Hz", audio.num_channels(), audio.sample_rate());
 ```
 
-`FrameSync` owns its receiver. `frame_sync.receiver()` provides controls, audio,
+`FrameSync::new` hands the receiver back inside `Rejected` when the SDK creates no
+synchronizer. `FrameSync` owns its receiver. `frame_sync.receiver()` provides controls, audio,
 metadata, and status through `Receiver<FrameSyncAttached>`. Use
 `frame_sync.into_receiver()` to recover an ordinary `Receiver` with raw video
 capture. The type system prevents raw-video capture while FrameSync owns it.
 
 ### Monitor and Control
 
-Receivers report connection health, frame-drop statistics, and PTZ support. Use `set_tally` to send program/preview state upstream; sender tally reports receiver state.
+Receivers report connection health and frame-drop statistics, and control a PTZ camera through `receiver.ptz()`. Use `set_tally` to send program/preview state upstream, where the SDK keeps it for every connection; sender tally reports receiver state. `send_metadata` sends metadata upstream and returns `Error::NotConnected` when there is no source to send it to.
 
 ```rust
 use grafton_ndi::ReceiverEvent;
@@ -382,38 +378,45 @@ if receiver.is_connected() {
 }
 
 if let Some(ReceiverEvent::StatusChanged(status)) = receiver.poll_event(Duration::from_millis(100))? {
-    println!("Active connections: {}", status.connections);
+    println!("Active connections: {}", status.connections());
 }
 
-if receiver.ptz_is_supported() {
-    receiver.ptz_zoom(0.25)?;
+let ptz = receiver.ptz();
+if ptz.is_supported() {
+    ptz.zoom(0.25)?;
 }
 ```
 
 ### Integrate With Async Runtimes
 
-NDI receive calls are fundamentally blocking SDK calls. The optional async wrappers make that explicit by running receive work on the runtime's blocking pool while preserving the timeout budget from the future's first poll. Both `capture` and `try_capture` include blocking-pool queue delay and reconnect-lock contention in the same deadline. Dropping a future suppresses work before its cancellation gate; a task that has passed that gate cannot be interrupted and may still consume a frame, even if it is waiting for the reconnect lock. Queued work can still finish after the budget expires; these wrappers do not impose a wall-clock completion deadline.
+NDI receive calls are fundamentally blocking SDK calls. The optional async wrappers make that explicit by running receive work on the runtime's blocking pool while preserving the timeout budget from the future's first poll. `capture` includes blocking-pool queue delay and reconnect-lock contention in the same deadline, and returns `None` only once all of it is spent. Dropping a future suppresses work before its cancellation gate; a task that has passed that gate cannot be interrupted and may still consume a frame, even if it is waiting for the reconnect lock. Queued work can still finish after the budget expires; these wrappers do not impose a wall-clock completion deadline.
+
+`grafton_ndi::asynchronous::AsyncReceiver<R>` and its `AsyncCapture` views are generic over the runtime, `Tokio` or `Smol` (one per Cargo feature); `asynchronous::tokio` and `asynchronous::smol` name them for one runtime.
 
 ```rust
-use grafton_ndi::tokio::AsyncReceiver;
+use grafton_ndi::asynchronous::tokio::AsyncReceiver;
 use std::time::Duration;
 
 let async_receiver = AsyncReceiver::new(receiver);
-let frame = async_receiver.video().capture(Duration::from_secs(5)).await?;
+if let Some(frame) = async_receiver.video().capture(Duration::from_secs(5)).await? {
+    println!("{}x{}", frame.width(), frame.height());
+}
 ```
 
 ## API Model
 
 The crate's public API is organized around a small set of resource types:
 
-- `Runtime` is the selected NDI runtime library; `NDI` is a handle that keeps NDI started.
+- `Runtime` is the selected NDI runtime library; `Ndi` is a handle that keeps NDI started.
 - `Finder` discovers `Source` values on the network.
 - `Receiver` connects to a source and captures video, audio, and metadata.
 - `Sender` publishes an NDI source.
 - `FrameSync` wraps a receiver for clock-corrected pull capture.
 - `VideoFrame`, `AudioFrame`, and `MetadataFrame` represent application-owned frame data.
 
-Most applications can start with owned frame APIs such as `receiver.video().capture()` and `sender.send_video()`. For receive hot paths, borrowed receive refs keep data in SDK buffers without an extra copy. `sender.send_video_async(frame)`, the SDK's asynchronous video send, takes `&mut Sender` and moves an owned `VideoFrame` into the sender without copying pixels. It returns the previous completed frame for reuse, and `None` on the first call. This avoids Rust wrapper pixel copies; SDK encoding and network processing may still copy data. Use two frames and call `finish_video_async()` to recover the final frame. For borrowed buffers, `send_video_async_copy(&frame)` explicitly copies pixels and metadata into sender-owned storage and returns the previous frame as `Result<Option<VideoFrame>>`; the source buffer can immediately be reused.
+Most applications can start with owned frame APIs such as `receiver.video().capture()` and `sender.send_video()`. For receive hot paths, borrowed receive refs keep data in SDK buffers without an extra copy. `sender.send_video_async(frame)`, the SDK's asynchronous video send, takes `&mut Sender` and moves an owned `VideoFrame` into the sender without copying pixels. It returns the previous completed frame for reuse, and `Ok(None)` on the first call; a frame the sender refuses comes back inside `Rejected`. This avoids Rust wrapper pixel copies; SDK encoding and network processing may still copy data. Use two frames and call `finish_video_async()` to recover the final frame. For borrowed buffers, `send_video_async_copy(&frame)` explicitly copies pixels and metadata into sender-owned storage and returns the previous frame as `Result<Option<VideoFrame>>`; the source buffer can immediately be reused. Owned frames are `Clone`; cloning copies their pixels.
+
+Frames carry time as typed values in 100-nanosecond ticks: `Timecode` is the editorial timecode, which starts at `Timecode::SYNTHESIZE` (the SDK generates one) on every frame built for sending, and `SdkTimestamp` is the time the sender submitted a frame, which received frames report as `Option<SdkTimestamp>`. Frame rates are `FrameRate` values, and a pixel format converts to and from its `FourCc`.
 
 Frame layout fields that describe SDK-facing memory are private. Builders, accessors, checked mutation methods, and `PixelFormat` helpers keep dimensions, strides, metadata, and buffer sizes consistent before data crosses the FFI boundary.
 
@@ -422,8 +425,8 @@ Frame layout fields that describe SDK-facing memory are private. Builders, acces
 `grafton-ndi` aims to be a predictable Rust layer over NDI, not a replacement for the NDI SDK documentation.
 
 - **Typed function tables**: every native call goes through a table of functions resolved once: when the runtime is selected, or when `FileApi::open` loads the File library. Each table's signatures are checked at compile time against bindings generated from the SDK headers.
-- **One runtime per process**: the selected library stays loaded until the process exits, while `NDI` handles start and stop the SDK by reference count.
-- **RAII lifecycle**: NDI handles, senders, receivers, frames, and pending async sends clean up through ownership.
+- **One runtime per process**: the selected library stays loaded until the process exits, while `Ndi` handles start and stop the SDK by reference count.
+- **RAII lifecycle**: `Ndi` handles, senders, receivers, frames, and pending async sends clean up through ownership.
 - **Initialized receive views**: borrowed video rows and audio channels expose active payload only; `data()` is optional for padded layouts. Owned capture packs active payload without reading SDK padding.
 - **Checked frame descriptions**: frame dimensions, line strides, channel strides, metadata strings, and buffer sizes are validated before slices or strings are exposed.
 - **Explicit blocking behavior**: timeout-bearing calls validate their wait budgets; SDK sends and drains have no deadline. Async adapters run SDK work on a blocking pool.
@@ -442,7 +445,7 @@ The compile-contract tests in `tests/ui` verify the important lifetime rules aro
 
 ## Image Encoding
 
-With the default `image-encoding` feature, captured `VideoFrame` values can be encoded directly:
+With the `image-encoding` feature, captured `VideoFrame` values can be encoded directly:
 
 ```rust
 use grafton_ndi::ImageFormat;
@@ -452,13 +455,13 @@ let jpeg = video.encode_jpeg(85)?;
 let data_url = video.encode_data_url(ImageFormat::Png)?;
 ```
 
-Encoding accepts RGBA, RGBX, BGRA and BGRX frames, and returns an error for other formats. Ask a receiver for `ReceiverColorFormat::RGBX_RGBA` or `BGRX_BGRA` when its frames are to be encoded. JPEG quality is 1 to 100.
+Encoding accepts RGBA, RGBX, BGRA and BGRX frames, and returns an error for other formats. Ask a receiver for `ReceiverColorFormat::RgbxRgba` or `BgrxBgra` when its frames are to be encoded. JPEG quality is 1 to 100.
 
 ## Runtime capabilities and optional APIs
 
 `runtime.info()`, or `ndi.info()` on a handle, gives the identity of the selected library: its path, edition, version and whether it is shared or statically linked.
 
-Runtimes differ in what they provide. `capabilities()` reports each optional capability, and `require_feature` turns an unavailable one into an error before any native call is made. Both are available on `Runtime` and on `NDI`:
+Runtimes differ in what they provide. `capabilities()` reports each optional capability, and `require_feature` turns an unavailable one into an error before any native call is made. Both are available on `Runtime` and on `Ndi`:
 
 ```rust
 use grafton_ndi::capabilities::{CapabilityStatus, RuntimeFeature};
@@ -473,7 +476,7 @@ match ndi.capabilities().status(RuntimeFeature::ReceiveDelay) {
 ndi.require_feature(RuntimeFeature::SenderDiscovery)?;
 ```
 
-An operation whose capability is unavailable returns `Error::UnsupportedCapability` with the capability's name, the reason, which is the `CapabilityUnavailable` that `capabilities().status(...)` reports, and the evidence in `detail`: the function the runtime does not export, the version it reports against the one required, or the declaration the build lacks. Other operations keep working. A capability is unavailable for one of these reasons:
+An operation whose capability is unavailable returns `Error::UnsupportedCapability` with the capability as a `RuntimeFeature` in `feature`, the reason, which is the `CapabilityUnavailable` that `capabilities().status(feature)` reports, and the evidence in `detail`: the function the runtime does not export, the version it reports against the one required, or the declaration the build lacks. Every capability an operation can be refused for is a `RuntimeFeature`, so `capabilities()` reports all of them in advance, and an operation is refused exactly when `require_feature` refuses its feature. Other operations keep working. A capability is unavailable for one of these reasons:
 
 | Reason | Meaning |
 | --- | --- |
@@ -486,17 +489,15 @@ An operation whose capability is unavailable returns `Error::UnsupportedCapabili
 The capabilities with a minimum version need NDI 6.4.0:
 
 - `Planar444Video`, `ReceiveBest444` and `ReceiveVideoOnly`, because an older runtime does not know those values.
-- `SenderAdvertising`, `ReceiverAdvertising`, `SenderDiscovery` and `ReceiverDiscovery`, because older runtimes can crash when those objects are destroyed.
+- `SenderAdvertising`, `ReceiverAdvertising`, `SenderDiscovery` and `ReceiverDiscovery`, and the Advanced `AdvancedSenderAdvertiserConfiguration`, `AdvancedReceiverAdvertiserConfiguration`, `AdvancedSenderListenerConfiguration` and `AdvancedReceiverListenerConfiguration`, because older runtimes can crash when those objects are destroyed.
 
-Apart from the two Advanced SDK capabilities, the others depend only on what the runtime exports. The [table of NDI versions](#ndi-versions) shows what each tested runtime provides. Availability says nothing about hardware or license requirements.
+The Advanced SDK capabilities, which the [Advanced SDK guide](docs/advanced.md#capabilities) lists, also need an Advanced SDK runtime and a build that declares them. The others depend only on what the runtime exports. The [table of NDI versions](#ndi-versions) shows what each tested runtime provides. Availability says nothing about hardware or license requirements.
 
-Planar `NA48`, `NB48`, `NA4G`, and `NB4G` frames need a runtime with `Planar444Video`. Construct them with
-`VideoFrame::builder().pixel_format(format).build_for(&ndi)` or the borrowed-frame
-equivalent. The frame keeps the runtime alive, including when captured or copied. `build()` works without a runtime for every other format, and returns `Error::RuntimeRequired` for these four. Standard encoding may convert 4:4:4 inputs to 4:2:2.
+Planar 4:4:4 frames (`PixelFormat::Na48`, `Nb48`, `Na4g` and `Nb4g`) are built, captured and copied like any other format, without a runtime. Sending one needs a runtime with `Planar444Video`: `send_video`, `send_video_async`, `send_video_async_copy` and `QueuedSender::try_submit` check the sender's runtime first and return `Error::UnsupportedCapability`, sending nothing and keeping any pending frame, when it lacks the capability. Standard encoding may convert 4:4:4 inputs to 4:2:2.
 
-`Receiver::set_video_delay` and `set_audio_delay` need `ReceiveDelay`. They accept at most 2000 ms, round positive fractional milliseconds upward, and report whether the native value changed.
+`Receiver::set_video_delay` and `set_audio_delay` need `ReceiveDelay`. They accept at most 2000 ms, round positive fractional milliseconds upward, and report whether the native value changed as a `SettingChange`.
 
-`utilities` provides checked conversions between planar and interleaved audio, with explicit reference levels for integer samples, and `Sender::send_audio_interleaved_i16`, `_i32` and `_f32`. `video_conversion` provides V210/P216 conversions for complete six-pixel V210 groups.
+`audio_conversion` provides checked conversions between planar and interleaved audio, with explicit reference levels for integer samples, and `Sender::send_audio_interleaved_i16`, `_i32` and `_f32`. `video_conversion` provides V210/P216 conversions for complete six-pixel V210 groups.
 
 ### Routing
 
@@ -521,7 +522,7 @@ The `discovery` module works with an NDI Discovery Server, which keeps a registr
 use grafton_ndi::discovery::{ListenerOptions, RecvListener};
 use std::time::Duration;
 
-let options = ListenerOptions::default().server("127.0.0.1")?;
+let options = ListenerOptions::default().server("127.0.0.1");
 let mut listener = RecvListener::new(&ndi, &options)?;
 // The listener connects in the background.
 listener.wait_for_changes(Duration::from_secs(2))?;
@@ -535,9 +536,9 @@ for receiver in listener.snapshot()? {
 
 Each object is created for a server address: the one in its options, or else the one in the NDI configuration. Apart from an older runtime and invalid option text, creation fails only when there is no address or the SDK cannot parse it. A server that cannot be reached is not an error. The object keeps trying in the background and starts working a few seconds after the server appears. A listener reports its connection through `is_connected`, and its snapshots are empty until it connects. An advertiser reports nothing. `RecvListener::request_connect` and `request_disconnect` send a request only to a receiver the listener lists as accepting it, and otherwise return `Error::ReceiverRequestNotAccepted`. Its `advertised` field is `false` when no listed receiver has the identifier, which a later request can change, for example once the listener has connected.
 
-An advertiser owns its registrations. `register` returns a token, and the registered sender or receiver stays alive until `unregister` is called with that token or the advertiser is dropped, even if the application drops its own handle first. A token given to an advertiser that did not issue it comes back inside `Rejected`.
+An advertiser owns its registrations. `register` returns a token, and the registered sender or receiver stays alive until `unregister` is called with that token or the advertiser is dropped, even if the application drops its own handle first. A token given to an advertiser that did not issue it comes back inside `Rejected`, as does one whose object the SDK does not remove, which fails with `Error::NativeOperationFailed` and changes nothing.
 
-Names and metadata from the network are decoded lossily, so one malformed peer cannot fail a snapshot. Identifiers are the exception: a `SenderId`, `ReceiverId` or `InputGroupId` keeps the server's exact bytes, so passing one back always names the same peer, and each kind is its own type. One snapshot or event batch is limited to 16 MiB, and one string to less than 4 MiB. A larger one returns `Error::InvalidFrame`, and the events of a refused batch are lost. `Router`, the advertisers and the listeners are `Send` and not `Sync`.
+Names and metadata from the network are decoded lossily, so one malformed peer cannot fail a snapshot. Identifiers are the exception: a `SenderId`, `ReceiverId` or `InputGroupId` keeps the server's exact bytes, so passing one back always names the same peer, and each kind is its own type. One snapshot or event batch is limited to 16 MiB, and one string to less than 4 MiB. A larger one returns `Error::UnexpectedSdkResult`, and the events of a refused batch are lost. `Router`, the advertisers and the listeners are `Send` and not `Sync`.
 
 ### Advanced SDK
 
@@ -562,7 +563,7 @@ let file = FileApi::open(&ndi, &FileRuntimeOptions::default())?;
 let info = file.probe("take_001.mkv")?;
 println!("{} track(s)", info.track_count());
 
-let mut player = file.create_player(&PlayerOptions::new("Replay")?)?;
+let mut player = file.create_player(&PlayerOptions::new("Replay"))?;
 player.start("take_001.mkv")?;
 ```
 
@@ -601,7 +602,7 @@ Receiving:
 | `NDIlib_Recv_Audio.rs` | `cargo run --example NDIlib_Recv_Audio` | Receive and inspect audio. |
 | `NDIlib_Recv_Audio_16bpp.rs` | `cargo run --example NDIlib_Recv_Audio_16bpp` | Receive audio and convert it to 16-bit samples. |
 | `NDIlib_Recv_FrameSync.rs` | `cargo run --example NDIlib_Recv_FrameSync` | Clock-corrected capture with `FrameSync`. |
-| `NDIlib_Recv_PNG.rs` | `cargo run --example NDIlib_Recv_PNG` | Receive video and save a PNG. Needs the `image-encoding` feature, which is on by default. |
+| `NDIlib_Recv_PNG.rs` | `cargo run --features image-encoding --example NDIlib_Recv_PNG` | Receive video and save a PNG. Needs the `image-encoding` feature. |
 | `NDIlib_Recv_PTZ.rs` | `cargo run --example NDIlib_Recv_PTZ` | Control PTZ cameras. |
 | `concurrent_capture.rs` | `cargo run --example concurrent_capture` | Capture video, audio and metadata from one receiver on separate threads. |
 
@@ -648,7 +649,7 @@ cargo test --all-features
 `cargo test` runs the tests that need a real NDI runtime when one can be loaded. When none can, each of those tests is skipped and says so on standard error:
 
 ```text
-skipped: frames::tests::planar_444_rows_copy_without_padding_and_preserve_runtime_proof needs an NDI runtime
+skipped: frames::tests::planar_444_formats_are_sendable_only_where_the_runtime_supports_them needs an NDI runtime
 ```
 
 Those tests create senders, receivers and finders, which announce themselves on the local network like any NDI program.

@@ -11,15 +11,14 @@ fn rapid_owned_sender_lifecycle() -> Result<(), grafton_ndi::Error> {
     };
     for iteration in 0..20 {
         let name = common::unique_name(&format!("owned lifecycle {iteration}"));
-        let options = SenderOptions::builder(name)
+        let options = SenderOptions::new(name)
             .clock_video(false)
-            .clock_audio(false)
-            .build();
+            .clock_audio(false);
         let mut sender = Sender::new(&ndi, &options)?;
         let mut next = VideoFrame::builder().resolution(16, 16).build()?;
         for value in 0..50 {
             next.data_mut().fill(value);
-            let returned = sender.send_video_async(next);
+            let returned = sender.send_video_async(next)?;
             next = match returned {
                 Some(frame) => frame,
                 None => VideoFrame::builder().resolution(16, 16).build()?,

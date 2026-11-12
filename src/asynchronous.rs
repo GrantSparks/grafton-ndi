@@ -1,15 +1,22 @@
-//! Async runtime integration for Tokio and smol.
+//! Async receivers for Tokio and smol.
 //!
-//! This module provides async wrappers around the synchronous NDI receiver API,
-//! allowing integration with async Rust applications using Tokio or smol runtimes.
+//! [`AsyncReceiver`] wraps the synchronous NDI receiver API for an async
+//! runtime, and its `video`, `audio` and `metadata` return an
+//! [`AsyncCapture`] view that captures one kind of frame. Both are generic
+//! over the [`AsyncRuntime`] whose blocking thread pool runs the NDI operations:
+//! [`Tokio`] with the `tokio` Cargo feature, [`Smol`] with the `smol` feature.
+//! The [`tokio`] and [`smol`] submodules name both types for one runtime, for
+//! example `grafton_ndi::asynchronous::tokio::AsyncReceiver`. This module
+//! exists when either feature is enabled, and each runtime only with its own
+//! feature; the crate root does not re-export any of it.
 //!
 //! The NDI SDK operations are inherently synchronous and blocking, so these wrappers
 //! use `spawn_blocking` internally to run NDI operations on a thread pool without
 //! blocking the async runtime.
 //!
-//! For `capture` and `try_capture`, the timeout budget starts when the future
-//! is first polled, rather than when it is constructed. The same deadline covers
-//! blocking-pool queue delay, receiver capture-gate contention, and SDK waits.
+//! For `capture`, the timeout budget starts when the future is first polled,
+//! rather than when it is constructed. The same deadline covers blocking-pool
+//! queue delay, receiver capture-gate contention, and SDK waits.
 //! This is a wait budget, not a hard completion deadline: scheduling, frame copying,
 //! and other processing can delay the result beyond it.
 //!
@@ -28,25 +35,23 @@
 //! ```no_run
 //! # #[cfg(feature = "tokio")]
 //! # {
-//! use grafton_ndi::{NDI, ReceiverOptionsBuilder, tokio::AsyncReceiver};
+//! use grafton_ndi::{Ndi, ReceiverOptions, asynchronous::tokio::AsyncReceiver};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), grafton_ndi::Error> {
-//!     let ndi = NDI::new()?;
+//!     let ndi = Ndi::new()?;
 //!     // ... obtain source from finder ...
-//!     # let source = grafton_ndi::Source {
-//!     #     name: "Test".into(),
-//!     #     address: grafton_ndi::SourceAddress::None
-//!     # };
+//!     # let source = grafton_ndi::Source::new("CAMERA (Program)");
 //!
-//!     let options = ReceiverOptionsBuilder::snapshot_preset(source).build();
+//!     let options = ReceiverOptions::snapshot_preset(source);
 //!     let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
 //!
 //!     let async_receiver = AsyncReceiver::new(receiver);
 //!
 //!     // Capture frame asynchronously without blocking the runtime
-//!     let frame = async_receiver.video().capture(std::time::Duration::from_secs(5)).await?;
-//!     println!("Captured {}x{} frame", frame.width(), frame.height());
+//!     if let Some(frame) = async_receiver.video().capture(std::time::Duration::from_secs(5)).await? {
+//!         println!("Captured {}x{} frame", frame.width(), frame.height());
+//!     }
 //!
 //!     Ok(())
 //! }
@@ -68,6 +73,36 @@ use crate::{
     timeout::Deadline,
     ConnectionStats, Error, Receiver, Result,
 };
+
+mod private {
+    use std::future::Future;
+
+    use crate::Result;
+
+    /// Proof that the caller is this crate.
+    ///
+    /// A bound on [`AsyncRuntime`](super::AsyncRuntime) makes [`Spawn::spawn_blocking`]
+    /// reachable from other crates even though they cannot name [`Spawn`];
+    /// they cannot name this type either, so they cannot call it.
+    pub struct Token;
+
+    /// How a runtime runs blocking work on its thread pool.
+    ///
+    /// It is not nameable outside the crate, which keeps it out of the API
+    /// and seals [`AsyncRuntime`](super::AsyncRuntime).
+    pub trait Spawn {
+        /// Run `f` on the runtime's blocking thread pool and return its result.
+        ///
+        /// # Errors
+        ///
+        /// [`Error::SpawnFailed`](crate::Error::SpawnFailed) when the work
+        /// cannot be submitted, is cancelled before it starts, or panics.
+        fn spawn_blocking<F, T>(token: Token, f: F) -> impl Future<Output = Result<T>> + Send
+        where
+            F: FnOnce() -> T + Send + 'static,
+            T: Send + 'static;
+    }
+}
 
 // Dropping a future prevents its queued closure from starting SDK work. Work
 // that has already passed this gate cannot be interrupted safely.
@@ -103,52 +138,35 @@ where
     (guard, work)
 }
 
-/// Trait for async runtime spawn-blocking abstraction.
+/// An async runtime whose blocking thread pool runs the NDI operations of an
+/// [`AsyncReceiver`] and its [`AsyncCapture`] views: [`Tokio`] or [`Smol`].
 ///
-/// This trait enables runtime-agnostic async code by abstracting the spawn-blocking
-/// mechanism. Each runtime (Tokio, smol) provides its own implementation.
+/// The trait is sealed and has no items of its own; it only selects the
+/// runtime.
+pub trait AsyncRuntime: private::Spawn + Send + Sync {}
+
+/// The Tokio runtime, which runs blocking work with
+/// `tokio::task::spawn_blocking`.
 ///
-/// The trait is sealed to prevent external implementations and ensure consistent
-/// error handling across all supported runtimes.
-pub trait SpawnBlocking: sealed::Sealed + Clone + Send + Sync + 'static {
-    /// Spawns a blocking operation on a thread pool and returns its result.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(Error::SpawnFailed)` if the blocking task panics or is cancelled.
-    fn spawn_blocking<F, R>(f: F) -> impl Future<Output = Result<R>> + Send
-    where
-        F: FnOnce() -> R + Send + 'static,
-        R: Send + 'static;
-}
-
-mod sealed {
-    pub trait Sealed {}
-
-    #[cfg(feature = "tokio")]
-    impl Sealed for super::TokioRuntime {}
-
-    #[cfg(feature = "smol")]
-    impl Sealed for super::SmolRuntime {}
-}
-
-/// Tokio async runtime marker type.
-///
-/// Used as a type parameter for [`AsyncReceiverGeneric`] to select Tokio's
-/// `spawn_blocking` implementation.
+/// The work runs on the runtime of the task that awaits it; awaiting outside
+/// a Tokio runtime fails with [`Error::SpawnFailed`]. Only a type, never a
+/// value. Requires the `tokio` feature.
 #[cfg(feature = "tokio")]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct TokioRuntime;
+#[derive(Debug)]
+pub enum Tokio {}
 
 #[cfg(feature = "tokio")]
-impl SpawnBlocking for TokioRuntime {
+impl AsyncRuntime for Tokio {}
+
+#[cfg(feature = "tokio")]
+impl private::Spawn for Tokio {
     // Using `impl Future` instead of `async fn` in trait because we need explicit
     // Send bounds on the returned future. This pattern is intentional.
     #[allow(clippy::manual_async_fn)]
-    fn spawn_blocking<F, R>(f: F) -> impl Future<Output = Result<R>> + Send
+    fn spawn_blocking<F, T>(_: private::Token, f: F) -> impl Future<Output = Result<T>> + Send
     where
-        F: FnOnce() -> R + Send + 'static,
-        R: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
     {
         async {
             let handle = ::tokio::runtime::Handle::try_current()
@@ -162,23 +180,25 @@ impl SpawnBlocking for TokioRuntime {
     }
 }
 
-/// smol runtime marker type.
+/// The smol runtime, which runs blocking work with `smol::unblock`.
 ///
-/// Used as a type parameter for [`AsyncReceiverGeneric`] to select smol's
-/// `unblock` implementation.
+/// Only a type, never a value. Requires the `smol` feature.
 #[cfg(feature = "smol")]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SmolRuntime;
+#[derive(Debug)]
+pub enum Smol {}
 
 #[cfg(feature = "smol")]
-impl SpawnBlocking for SmolRuntime {
+impl AsyncRuntime for Smol {}
+
+#[cfg(feature = "smol")]
+impl private::Spawn for Smol {
     // Using `impl Future` instead of `async fn` in trait because we need explicit
     // Send bounds on the returned future. This pattern is intentional.
     #[allow(clippy::manual_async_fn)]
-    fn spawn_blocking<F, R>(f: F) -> impl Future<Output = Result<R>> + Send
+    fn spawn_blocking<F, T>(_: private::Token, f: F) -> impl Future<Output = Result<T>> + Send
     where
-        F: FnOnce() -> R + Send + 'static,
-        R: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
     {
         async {
             let (_cancellation, work) = blocking_operation(f);
@@ -187,43 +207,43 @@ impl SpawnBlocking for SmolRuntime {
     }
 }
 
-/// Generic async receiver wrapper parameterized by runtime.
+/// An async wrapper over a [`Receiver`] that runs its blocking NDI operations
+/// on the blocking thread pool of the runtime `R`, so that they do not block
+/// the async runtime.
 ///
-/// This struct provides async versions of the [`Receiver`] methods by running
-/// blocking NDI operations on the runtime's thread pool using `spawn_blocking`.
-///
-/// # Type Parameters
-///
-/// - `R`: The async runtime type, implementing [`SpawnBlocking`]. Use
-///   [`TokioRuntime`] or [`SmolRuntime`].
+/// [`tokio::AsyncReceiver`] and [`smol::AsyncReceiver`] name it for each
+/// runtime.
 ///
 /// # Thread Safety
 ///
 /// The underlying [`Receiver`] is wrapped in an [`Arc`] to allow sharing across
 /// async tasks and safe cloning. The NDI SDK receiver is inherently thread-safe.
 ///
+/// # Error Handling
+///
+/// The methods that run on the blocking pool convert a panic there, or the
+/// cancellation of the blocking task, into [`Error::SpawnFailed`] rather than
+/// propagating it.
+///
 /// # Example
 ///
 /// ```no_run
 /// # #[cfg(feature = "tokio")]
 /// # {
-/// use grafton_ndi::{NDI, ReceiverOptionsBuilder, tokio::AsyncReceiver};
+/// use grafton_ndi::{Ndi, ReceiverOptions, asynchronous::tokio::AsyncReceiver};
 ///
 /// #[tokio::main]
 /// async fn main() -> Result<(), grafton_ndi::Error> {
-///     let ndi = NDI::new()?;
+///     let ndi = Ndi::new()?;
 ///     // ... obtain source ...
-///     # let source = grafton_ndi::Source {
-///     #     name: "Test".into(),
-///     #     address: grafton_ndi::SourceAddress::None
-///     # };
+///     # let source = grafton_ndi::Source::new("CAMERA (Program)");
 ///
-///     let options = ReceiverOptionsBuilder::snapshot_preset(source).build();
+///     let options = ReceiverOptions::snapshot_preset(source);
 ///     let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
 ///     let async_receiver = AsyncReceiver::new(receiver);
 ///
-///     // Non-blocking async capture
-///     match async_receiver.video().try_capture(std::time::Duration::from_millis(100)).await? {
+///     // Capture without blocking the runtime
+///     match async_receiver.video().capture(std::time::Duration::from_millis(100)).await? {
 ///         Some(frame) => println!("Got frame: {}x{}", frame.width(), frame.height()),
 ///         None => println!("No frame available"),
 ///     }
@@ -232,23 +252,24 @@ impl SpawnBlocking for SmolRuntime {
 /// }
 /// # }
 /// ```
-pub struct AsyncReceiverGeneric<R: SpawnBlocking> {
+pub struct AsyncReceiver<R: AsyncRuntime> {
     inner: Arc<Receiver>,
     _runtime: PhantomData<R>,
 }
 
-// Shared by both capture verbs so validation and queue accounting agree.
+// Starts the budget on the future's first poll, so that blocking-pool queue
+// delay is spent from it.
 async fn with_timeout_budget<R, F, T>(timeout: Duration, operation: F) -> Result<T>
 where
-    R: SpawnBlocking,
+    R: AsyncRuntime,
     F: FnOnce(Deadline) -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
     let deadline = Deadline::after(timeout)?;
-    R::spawn_blocking(move || operation(deadline)).await?
+    R::spawn_blocking(private::Token, move || operation(deadline)).await?
 }
 
-impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
+impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// Create a new async receiver wrapper.
     ///
     /// The receiver is wrapped in an [`Arc`] to allow sharing across async tasks.
@@ -261,30 +282,25 @@ impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
 
     /// Capture **video** frames without blocking the async runtime.
     ///
-    /// Returns an [`AsyncCapture`] view; see [`AsyncCapture`] for its verbs
-    /// ([`capture`](AsyncCapture::capture),
-    /// [`try_capture`](AsyncCapture::try_capture)). Mirrors
-    /// [`Receiver::video`], running each capture on the blocking pool.
+    /// Returns an [`AsyncCapture`] view; see [`AsyncCapture::capture`].
+    /// Mirrors [`Receiver::video`], running each capture on the blocking pool.
     ///
     /// # Example
     ///
     /// ```no_run
     /// # #[cfg(feature = "tokio")]
     /// # {
-    /// # use grafton_ndi::{NDI, ReceiverOptions, tokio::AsyncReceiver};
+    /// # use grafton_ndi::{Ndi, ReceiverOptions, asynchronous::tokio::AsyncReceiver};
     /// # use std::time::Duration;
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = grafton_ndi::Source {
-    /// #     name: "Test".into(),
-    /// #     address: grafton_ndi::SourceAddress::None
-    /// # };
-    /// # let options = ReceiverOptions::builder(source).build();
-    /// # let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
+    /// # let ndi = Ndi::new()?;
+    /// # let source = grafton_ndi::Source::new("CAMERA (Program)");
+    /// # let receiver = grafton_ndi::Receiver::new(&ndi, &ReceiverOptions::new(source))?;
     /// let async_receiver = AsyncReceiver::new(receiver);
-    /// let frame = async_receiver.video().capture(Duration::from_secs(5)).await?;
-    /// println!("Captured {}x{} frame", frame.width(), frame.height());
+    /// if let Some(frame) = async_receiver.video().capture(Duration::from_secs(5)).await? {
+    ///     println!("Captured {}x{} frame", frame.width(), frame.height());
+    /// }
     /// # Ok(())
     /// # }
     /// # }
@@ -325,7 +341,7 @@ impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
     /// receiver. See [`Receiver::connection_stats`].
     ///
     /// A cheap, non-blocking SDK query, so it runs inline rather than on
-    /// the blocking pool. `connection_stats().video_frames_received` is
+    /// the blocking pool. `connection_stats().video_frames_received()` is
     /// the canonical liveness signal: it advances as the receiver pulls
     /// frames off the network, independent of how often the caller
     /// captures, so a frozen counter means the feed itself has stalled.
@@ -343,6 +359,11 @@ impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
     /// call while captures on this receiver are in flight — they serialize
     /// instead of racing. Confirm recovery via [`Self::connection_stats`].
     ///
+    /// # Errors
+    ///
+    /// The errors of [`Receiver::reconnect`], and [`Error::SpawnFailed`] when
+    /// the blocking task panicked or was cancelled.
+    ///
     /// # Cancellation
     ///
     /// Dropping this future skips work if the blocking closure observes the
@@ -351,114 +372,11 @@ impl<R: SpawnBlocking> AsyncReceiverGeneric<R> {
     /// after this future is dropped.
     pub async fn reconnect(&self) -> Result<()> {
         let receiver = Arc::clone(&self.inner);
-        R::spawn_blocking(move || receiver.reconnect()).await?
+        R::spawn_blocking(private::Token, move || receiver.reconnect()).await?
     }
 }
 
-/// A typed view over an async receiver for capturing frames of one kind,
-/// without blocking the async runtime.
-///
-/// Created by [`AsyncReceiverGeneric::video`], [`audio`](AsyncReceiverGeneric::audio),
-/// and [`metadata`](AsyncReceiverGeneric::metadata). Each verb runs the
-/// underlying synchronous capture on the runtime's blocking pool:
-///
-/// - [`capture`](Self::capture) — reliable owned capture with built-in retry.
-///   The timeout budget starts when the future is first polled; `spawn_blocking`
-///   queue delay is subtracted before the SDK begins waiting.
-/// - [`try_capture`](Self::try_capture) — a single owned poll; `Ok(None)` when
-///   no frame is ready. Its budget also includes blocking task queue delay.
-///
-/// There is no zero-copy `try_capture_ref` here: a borrowed frame is tied to
-/// the receiver and cannot cross the `spawn_blocking` boundary. Use
-/// [`Receiver::video`]'s [`Capture::try_capture_ref`](crate::Capture::try_capture_ref)
-/// on the synchronous receiver for in-place processing.
-pub struct AsyncCapture<'rx, R: SpawnBlocking, K: CaptureKind> {
-    recv: &'rx AsyncReceiverGeneric<R>,
-    _kind: PhantomData<K>,
-}
-
-impl<'rx, R: SpawnBlocking, K: CaptureKind> AsyncCapture<'rx, R, K>
-where
-    K::Owned: Send + 'static,
-{
-    fn new(recv: &'rx AsyncReceiverGeneric<R>) -> Self {
-        Self {
-            recv,
-            _kind: PhantomData,
-        }
-    }
-
-    /// Async version of [`Capture::capture`](crate::Capture::capture):
-    /// reliable owned capture that retries across the SDK's initial-sync
-    /// warm-up, run on the blocking pool.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Total budget to wait for a frame, starting when the future
-    ///   is first polled. Blocking-pool queue delay and capture-gate contention
-    ///   count against the same budget. Completion can occur after this budget
-    ///   because scheduling and frame processing are not bounded by it.
-    ///   Must not exceed
-    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(frame)` - Successfully captured a frame
-    /// * `Err(Error::FrameTimeout)` - No frame received within timeout (includes retry details)
-    /// * `Err(Error::SpawnFailed)` - The blocking task panicked or was cancelled
-    /// * `Err(_)` - Another error occurred during capture
-    ///
-    /// # Cancellation
-    ///
-    /// Dropping this future skips work if the blocking closure observes the
-    /// cancellation flag at its entry gate. After passing that gate, work
-    /// continues, including waiting for receiver access, and can consume a frame
-    /// whose result is discarded.
-    pub async fn capture(&self, timeout: Duration) -> Result<K::Owned> {
-        let receiver = Arc::clone(&self.recv.inner);
-        with_timeout_budget::<R, _, _>(timeout, move |deadline| {
-            receiver.core.capture_kind_until::<K>(deadline)
-        })
-        .await
-    }
-
-    /// Async version of
-    /// [`Capture::try_capture`](crate::Capture::try_capture): a single owned
-    /// poll, run on the blocking pool.
-    ///
-    /// # Arguments
-    ///
-    /// * `timeout` - Total wait budget from the future's first poll, including
-    ///   blocking-pool queue delay and capture-gate contention. With an exhausted
-    ///   budget, an immediately available gate permits a zero-timeout SDK poll;
-    ///   otherwise this returns `Ok(None)` without an SDK call. Scheduling and
-    ///   frame processing can delay completion beyond this budget.
-    ///   Must not exceed
-    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Some(frame))` - Successfully captured a frame
-    /// * `Ok(None)` - No frame available within timeout
-    /// * `Err(Error::SpawnFailed)` - The blocking task panicked or was cancelled
-    /// * `Err(_)` - An error occurred during capture
-    ///
-    /// # Cancellation
-    ///
-    /// Dropping this future skips work if the blocking closure observes the
-    /// cancellation flag at its entry gate. After passing that gate, work
-    /// continues, including waiting for receiver access, and can consume a frame
-    /// whose result is discarded.
-    pub async fn try_capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
-        let receiver = Arc::clone(&self.recv.inner);
-        with_timeout_budget::<R, _, _>(timeout, move |deadline| {
-            receiver.core.try_capture_kind_until::<K>(deadline)
-        })
-        .await
-    }
-}
-
-impl<R: SpawnBlocking> Clone for AsyncReceiverGeneric<R> {
+impl<R: AsyncRuntime> Clone for AsyncReceiver<R> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -467,96 +385,133 @@ impl<R: SpawnBlocking> Clone for AsyncReceiverGeneric<R> {
     }
 }
 
-// Runtime-specific receiver aliases
+/// A typed view over an async receiver for capturing frames of one kind,
+/// without blocking the async runtime.
+///
+/// Created by [`AsyncReceiver::video`], [`audio`](AsyncReceiver::audio),
+/// and [`metadata`](AsyncReceiver::metadata). Its
+/// [`capture`](Self::capture) runs the synchronous
+/// [`Capture::capture`](crate::Capture::capture) on the runtime's blocking
+/// pool, with the same semantics, and its timeout budget also covers the
+/// time the work waits for a blocking-pool thread.
+///
+/// There is no zero-copy `capture_ref` here: a borrowed frame is tied to
+/// the receiver and cannot cross the `spawn_blocking` boundary. Use
+/// [`Capture::capture_ref`](crate::Capture::capture_ref) on the synchronous
+/// receiver for in-place processing.
+pub struct AsyncCapture<'rx, R: AsyncRuntime, K: CaptureKind> {
+    recv: &'rx AsyncReceiver<R>,
+    _kind: PhantomData<K>,
+}
+
+impl<'rx, R: AsyncRuntime, K: CaptureKind> AsyncCapture<'rx, R, K>
+where
+    K::Owned: Send + 'static,
+{
+    fn new(recv: &'rx AsyncReceiver<R>) -> Self {
+        Self {
+            recv,
+            _kind: PhantomData,
+        }
+    }
+
+    /// Async version of [`Capture::capture`](crate::Capture::capture): wait
+    /// up to `timeout` for a frame and return an owned copy of it, or `None`
+    /// when none arrived in time, running on the blocking pool.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Total budget to wait for a frame, starting when the future
+    ///   is first polled. Blocking-pool queue delay and capture-gate contention
+    ///   count against the same budget, and `None` comes only once all of it
+    ///   is spent. Completion can occur after this budget because scheduling
+    ///   and frame processing are not bounded by it. Must not exceed
+    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Capture::capture`](crate::Capture::capture), and
+    /// [`Error::SpawnFailed`] when the blocking task panicked or was
+    /// cancelled.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future skips work if the blocking closure observes the
+    /// cancellation flag at its entry gate. After passing that gate, work
+    /// continues, including waiting for receiver access, and can consume a frame
+    /// whose result is discarded.
+    pub async fn capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
+        let receiver = Arc::clone(&self.recv.inner);
+        with_timeout_budget::<R, _, _>(timeout, move |deadline| {
+            receiver.core.capture_until::<K>(deadline)
+        })
+        .await
+    }
+}
 
 #[cfg(feature = "tokio")]
 pub mod tokio {
-    //! Tokio async runtime integration.
-    //!
-    //! Provides [`AsyncReceiver`] wrapper that uses `tokio::task::spawn_blocking`
-    //! to run NDI operations without blocking the Tokio runtime.
+    //! [`AsyncReceiver`] and [`AsyncCapture`] on the Tokio runtime: the
+    //! generic [`asynchronous::AsyncReceiver`](super::AsyncReceiver) and
+    //! [`asynchronous::AsyncCapture`](super::AsyncCapture) with
+    //! [`Tokio`](super::Tokio), which run blocking work with
+    //! `tokio::task::spawn_blocking`.
     //!
     //! # Example
     //!
     //! ```no_run
-    //! # #[cfg(feature = "tokio")]
-    //! # {
-    //! use grafton_ndi::{NDI, ReceiverOptionsBuilder, tokio::AsyncReceiver};
+    //! use grafton_ndi::{Ndi, ReceiverOptions, asynchronous::tokio::AsyncReceiver};
     //!
     //! #[tokio::main]
     //! async fn main() -> Result<(), grafton_ndi::Error> {
-    //!     let ndi = NDI::new()?;
+    //!     let ndi = Ndi::new()?;
     //!     // ... obtain source ...
-    //!     # let source = grafton_ndi::Source {
-    //!     #     name: "Test".into(),
-    //!     #     address: grafton_ndi::SourceAddress::None
-    //!     # };
+    //!     # let source = grafton_ndi::Source::new("CAMERA (Program)");
     //!
-    //!     let options = ReceiverOptionsBuilder::snapshot_preset(source).build();
+    //!     let options = ReceiverOptions::snapshot_preset(source);
     //!     let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
     //!     let async_receiver = AsyncReceiver::new(receiver);
     //!
-    //!     // Non-blocking async capture
-    //!     match async_receiver.video().try_capture(std::time::Duration::from_millis(100)).await? {
+    //!     // Capture without blocking the runtime
+    //!     match async_receiver.video().capture(std::time::Duration::from_millis(100)).await? {
     //!         Some(frame) => println!("Got frame: {}x{}", frame.width(), frame.height()),
     //!         None => println!("No frame available"),
     //!     }
     //!
     //!     Ok(())
     //! }
-    //! # }
     //! ```
 
-    use super::{AsyncReceiverGeneric, TokioRuntime};
-
-    /// Async receiver wrapper for Tokio runtime.
-    ///
-    /// This is a type alias for the generic async receiver parameterized with
-    /// the Tokio runtime. It provides async versions of the [`crate::Receiver`]
-    /// methods by running blocking NDI operations on Tokio's blocking thread
-    /// pool using `spawn_blocking`.
-    ///
-    /// # Thread Safety
-    ///
-    /// The underlying `Receiver` is wrapped in an `Arc` to allow sharing across
-    /// async tasks and safe cloning. The NDI SDK receiver is inherently thread-safe.
-    ///
-    /// # Error Handling
-    ///
-    /// All methods return [`crate::Result`], converting any task panic or cancellation
-    /// into [`crate::Error::SpawnFailed`] rather than propagating the panic.
-    pub type AsyncReceiver = AsyncReceiverGeneric<TokioRuntime>;
+    /// An [`AsyncReceiver`](super::AsyncReceiver) on the Tokio runtime.
+    pub type AsyncReceiver = super::AsyncReceiver<super::Tokio>;
+    /// An [`AsyncCapture`](super::AsyncCapture) on the Tokio runtime.
+    pub type AsyncCapture<'rx, K> = super::AsyncCapture<'rx, super::Tokio, K>;
 }
 
 #[cfg(feature = "smol")]
 pub mod smol {
-    //! smol runtime integration.
-    //!
-    //! Provides [`AsyncReceiver`] wrapper that uses `::smol::unblock`
-    //! to run NDI operations without blocking the smol runtime.
+    //! [`AsyncReceiver`] and [`AsyncCapture`] on the smol runtime: the
+    //! generic [`asynchronous::AsyncReceiver`](super::AsyncReceiver) and
+    //! [`asynchronous::AsyncCapture`](super::AsyncCapture) with
+    //! [`Smol`](super::Smol), which run blocking work with `smol::unblock`.
     //!
     //! # Example
     //!
     //! ```no_run
-    //! # #[cfg(feature = "smol")]
-    //! # {
-    //! use grafton_ndi::{NDI, ReceiverOptionsBuilder, smol::AsyncReceiver};
+    //! use grafton_ndi::{Ndi, ReceiverOptions, asynchronous::smol::AsyncReceiver};
     //!
     //! fn main() -> Result<(), grafton_ndi::Error> {
     //!     ::smol::block_on(async {
-    //!         let ndi = NDI::new()?;
+    //!         let ndi = Ndi::new()?;
     //!         // ... obtain source ...
-    //!         # let source = grafton_ndi::Source {
-    //!         #     name: "Test".into(),
-    //!         #     address: grafton_ndi::SourceAddress::None
-    //!         # };
+    //!         # let source = grafton_ndi::Source::new("CAMERA (Program)");
     //!
-    //!         let options = ReceiverOptionsBuilder::snapshot_preset(source).build();
+    //!         let options = ReceiverOptions::snapshot_preset(source);
     //!         let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
     //!         let async_receiver = AsyncReceiver::new(receiver);
     //!
-    //!         // Non-blocking async capture
-    //!         match async_receiver.video().try_capture(std::time::Duration::from_millis(100)).await? {
+    //!         // Capture without blocking the runtime
+    //!         match async_receiver.video().capture(std::time::Duration::from_millis(100)).await? {
     //!             Some(frame) => println!("Got frame: {}x{}", frame.width(), frame.height()),
     //!             None => println!("No frame available"),
     //!         }
@@ -564,28 +519,12 @@ pub mod smol {
     //!         Ok(())
     //!     })
     //! }
-    //! # }
     //! ```
 
-    use super::{AsyncReceiverGeneric, SmolRuntime};
-
-    /// Async receiver wrapper for smol runtime.
-    ///
-    /// This is a type alias for the generic async receiver parameterized with
-    /// the smol runtime. It provides async versions of the [`crate::Receiver`]
-    /// methods by running blocking NDI operations on smol's blocking thread
-    /// pool using `::smol::unblock`.
-    ///
-    /// # Thread Safety
-    ///
-    /// The underlying `Receiver` is wrapped in an `Arc` to allow sharing across
-    /// async tasks and safe cloning. The NDI SDK receiver is inherently thread-safe.
-    ///
-    /// # Error Handling
-    ///
-    /// All methods return [`crate::Result`], converting blocking-operation
-    /// panics into [`crate::Error::SpawnFailed`].
-    pub type AsyncReceiver = AsyncReceiverGeneric<SmolRuntime>;
+    /// An [`AsyncReceiver`](super::AsyncReceiver) on the smol runtime.
+    pub type AsyncReceiver = super::AsyncReceiver<super::Smol>;
+    /// An [`AsyncCapture`](super::AsyncCapture) on the smol runtime.
+    pub type AsyncCapture<'rx, K> = super::AsyncCapture<'rx, super::Smol, K>;
 }
 
 #[cfg(all(test, feature = "tokio"))]
@@ -616,16 +555,13 @@ mod timeout_tests {
             started_rx.recv().unwrap();
 
             let budget = Duration::from_millis(20);
-            let mut capture = Box::pin(with_timeout_budget::<TokioRuntime, _, _>(
-                budget,
-                |deadline| {
-                    Ok((
-                        deadline.remaining(),
-                        deadline.remaining_ms(),
-                        deadline.elapsed(),
-                    ))
-                },
-            ));
+            let mut capture = Box::pin(with_timeout_budget::<Tokio, _, _>(budget, |deadline| {
+                Ok((
+                    deadline.remaining(),
+                    deadline.remaining_ms(),
+                    deadline.elapsed(),
+                ))
+            }));
             let mut context = Context::from_waker(Waker::noop());
             assert!(matches!(capture.as_mut().poll(&mut context), Poll::Pending));
             // Keep the sole worker occupied until the whole budget has elapsed.
@@ -642,7 +578,7 @@ mod timeout_tests {
     #[test]
     fn invalid_budget_is_rejected_before_spawning() {
         // No entered runtime: trying to submit work would panic.
-        let mut capture = Box::pin(with_timeout_budget::<TokioRuntime, _, ()>(
+        let mut capture = Box::pin(with_timeout_budget::<Tokio, _, ()>(
             crate::MAX_TIMEOUT + Duration::from_nanos(1),
             |_| panic!("invalid timeout must not execute blocking work"),
         ));
@@ -656,7 +592,10 @@ mod timeout_tests {
 
 #[cfg(all(test, feature = "smol"))]
 mod smol_tests {
-    use super::*;
+    use super::{
+        private::{Spawn, Token},
+        *,
+    };
     use std::{
         sync::mpsc,
         task::{Context, Poll, Waker},
@@ -667,7 +606,7 @@ mod smol_tests {
     fn dropping_unpolled_future_starts_no_work() {
         let called = Arc::new(AtomicBool::new(false));
         let worker_called = Arc::clone(&called);
-        let operation = SmolRuntime::spawn_blocking(move || {
+        let operation = Smol::spawn_blocking(Token, move || {
             worker_called.store(true, Ordering::Release);
         });
         drop(operation);
@@ -679,7 +618,7 @@ mod smol_tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let (finished_tx, finished_rx) = mpsc::channel();
-        let mut operation = Box::pin(SmolRuntime::spawn_blocking(move || {
+        let mut operation = Box::pin(Smol::spawn_blocking(Token, move || {
             started_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             finished_tx.send(42).unwrap();
@@ -702,7 +641,7 @@ mod smol_tests {
     fn invalid_budget_does_not_start_work() {
         let called = Arc::new(AtomicBool::new(false));
         let worker_called = Arc::clone(&called);
-        let result = ::smol::block_on(with_timeout_budget::<SmolRuntime, _, _>(
+        let result = ::smol::block_on(with_timeout_budget::<Smol, _, _>(
             crate::MAX_TIMEOUT + Duration::from_nanos(1),
             move |_| {
                 worker_called.store(true, Ordering::Release);
@@ -718,7 +657,7 @@ mod smol_tests {
         let budget = Duration::from_millis(20);
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let mut operation = Box::pin(with_timeout_budget::<SmolRuntime, _, _>(
+        let mut operation = Box::pin(with_timeout_budget::<Smol, _, _>(
             budget,
             move |deadline: Deadline| {
                 started_tx.send(deadline.end()).unwrap();
@@ -747,7 +686,10 @@ mod smol_tests {
 
 #[cfg(test)]
 mod executor_tests {
-    use super::*;
+    use super::{
+        private::{Spawn, Token},
+        *,
+    };
 
     #[test]
     fn cancellation_skips_queued_operation() {
@@ -776,7 +718,7 @@ mod executor_tests {
     #[test]
     fn missing_tokio_context_returns_error() {
         use std::task::{Context, Poll, Waker};
-        let mut operation = Box::pin(TokioRuntime::spawn_blocking(|| 42));
+        let mut operation = Box::pin(Tokio::spawn_blocking(Token, || 42));
         let mut context = Context::from_waker(Waker::noop());
         assert!(matches!(
             operation.as_mut().poll(&mut context),
@@ -790,7 +732,7 @@ mod executor_tests {
         let runtime = ::tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        let result = runtime.block_on(TokioRuntime::spawn_blocking(|| panic!("test panic")));
+        let result = runtime.block_on(Tokio::spawn_blocking(Token, || panic!("test panic")));
         assert!(
             matches!(result, Err(Error::SpawnFailed(message)) if message.contains("test panic"))
         );
@@ -799,7 +741,7 @@ mod executor_tests {
     #[cfg(feature = "smol")]
     #[test]
     fn smol_converts_blocking_panic() {
-        let result = ::smol::block_on(SmolRuntime::spawn_blocking(|| panic!("test panic")));
+        let result = ::smol::block_on(Smol::spawn_blocking(Token, || panic!("test panic")));
         assert!(
             matches!(result, Err(Error::SpawnFailed(message)) if message.contains("test panic"))
         );
@@ -823,7 +765,7 @@ mod executor_tests {
             started_rx.recv().unwrap();
             let called = Arc::new(AtomicBool::new(false));
             let worker_called = Arc::clone(&called);
-            let mut operation = Box::pin(TokioRuntime::spawn_blocking(move || {
+            let mut operation = Box::pin(Tokio::spawn_blocking(Token, move || {
                 worker_called.store(true, Ordering::Release)
             }));
             let mut context = Context::from_waker(Waker::noop());

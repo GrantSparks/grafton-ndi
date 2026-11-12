@@ -30,11 +30,12 @@ pub(crate) struct Runtime {
     provider: Provider,
 }
 
-/// Which Advanced SDK entry points an implementation exports.
+/// Which of the entry points that identify the Advanced SDK an
+/// implementation exports.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct AdvancedEntryPoints {
-    pub(crate) sender_configuration: bool,
-    pub(crate) receiver_configuration: bool,
+struct AdvancedEntryPoints {
+    sender_configuration: bool,
+    receiver_configuration: bool,
 }
 
 impl AdvancedEntryPoints {
@@ -132,8 +133,12 @@ impl Runtime {
             raw_version,
             version,
         };
+        #[cfg(feature = "advanced")]
+        let capabilities = Capabilities::detect(&api, &advanced_tables, version, edition);
+        #[cfg(not(feature = "advanced"))]
+        let capabilities = Capabilities::detect(&api, version, edition);
         Ok(Self {
-            capabilities: Capabilities::detect(&api, version, edition, advanced),
+            capabilities,
             api,
             #[cfg(feature = "advanced")]
             advanced: advanced_tables,
@@ -149,7 +154,7 @@ impl Runtime {
     ///
     /// [`Error::RuntimeConflict`] when `options` ask for an edition it is not
     /// or name a library it was not loaded from;
-    /// [`Error::InvalidConfiguration`] when they name a relative path.
+    /// [`Error::InvalidInput`] when they name a relative path.
     fn accepts(&self, options: &RuntimeOptions) -> Result<()> {
         if options
             .edition
@@ -428,7 +433,7 @@ mod shared {
         ///
         /// # Errors
         ///
-        /// [`Error::InvalidConfiguration`] for a relative explicit path;
+        /// [`Error::InvalidInput`] for a relative explicit path;
         /// otherwise [`Error::RuntimeLoadFailed`] naming every location tried
         /// and the reason each was rejected.
         pub(in crate::sys) fn open<T>(
@@ -494,7 +499,7 @@ mod shared {
         if path.is_absolute() {
             Ok(())
         } else {
-            Err(Error::InvalidConfiguration(
+            Err(Error::InvalidInput(
                 "an explicit NDI library path must be absolute".into(),
             ))
         }

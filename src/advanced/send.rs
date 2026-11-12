@@ -3,13 +3,14 @@
 use std::{ptr, time::Duration};
 
 use super::{
-    invalid,
+    aliasable::AliasableBox,
+    invalid_frame,
     packets::{
-        attach_metadata, attach_timecode, EnvelopeHeader, FrameExtras, HasExtras,
+        attach_metadata, attach_timecode, AudioParameters, EnvelopeHeader, FrameExtras, HasExtras,
         ENVELOPE_HEADER_BYTES,
     },
     AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedVideoFrame, EnvelopeCodec,
-    QualityPlan, StreamTier, VideoPacketFormat, MAX_PACKET_BYTES,
+    QualityPlan, VideoPacketFormat, MAX_PACKET_BYTES,
 };
 use crate::{
     sys::{
@@ -17,10 +18,8 @@ use crate::{
         advanced::{native, FrameScatter, ScatterSend},
         bindings::*,
     },
-    Rejected, Result, Sender, SenderOptions, Source, Tally, NDI,
+    Ndi, Rejected, Result, Sender, SenderOptions, Source, StreamTier, Tally, Timecode,
 };
-
-use super::{aliasable::AliasableBox, descriptors};
 
 /// Maximum number of blocks in one scatter frame.
 pub const MAX_SCATTER_BLOCKS: usize = 65_536;
@@ -47,21 +46,28 @@ unsafe impl Send for ScatterStorage {}
 // `descriptor`, and that takes the storage exclusively.
 unsafe impl Sync for ScatterStorage {}
 
+impl Clone for ScatterStorage {
+    /// Copies of the blocks, with arrays that describe the copies.
+    fn clone(&self) -> Self {
+        Self::new(self.blocks().map(<[u8]>::to_vec).collect(), self.total)
+    }
+}
+
 impl ScatterStorage {
     /// Check a block list and return its total size in bytes.
     fn total(blocks: &[Vec<u8>]) -> Result<usize> {
         if blocks.is_empty() || blocks.len() > MAX_SCATTER_BLOCKS {
-            return Err(invalid("Invalid scatter block count"));
+            return Err(invalid_frame("Invalid scatter block count"));
         }
         let mut total = 0usize;
         for block in blocks {
             if block.is_empty() {
-                return Err(invalid("Scatter blocks must not be empty"));
+                return Err(invalid_frame("Scatter blocks must not be empty"));
             }
             total = total
                 .checked_add(block.len())
                 .filter(|total| *total <= MAX_PACKET_BYTES)
-                .ok_or_else(|| invalid("Scatter frame exceeds the packet size limit"))?;
+                .ok_or_else(|| invalid_frame("Scatter frame exceeds the packet size limit"))?;
         }
         Ok(total)
     }
@@ -120,7 +126,7 @@ impl ScatterStorage {
 fn first_block(blocks: &[Vec<u8>], header_bytes: usize) -> Result<&[u8]> {
     let first = &blocks[0];
     if first.len() < header_bytes {
-        return Err(invalid(
+        return Err(invalid_frame(
             "The first scatter block must hold the frame's complete header",
         ));
     }
@@ -142,17 +148,18 @@ fn bytes_at<const N: usize>(blocks: &[Vec<u8>], offset: usize) -> Option<[u8; N]
 /// The blocks are sent as they are, without being joined: an encoder can hand
 /// over its header, payload and parameter sets separately. The first block
 /// must hold the frame's complete header: for H.264 and HEVC the 44-byte
-/// packet envelope header (see [`packet_envelope`](super::packet_envelope)
-/// for the layout), for SpeedHQ its first four bytes.
+/// packet envelope header (see [`PacketEnvelope`](super::PacketEnvelope)),
+/// for SpeedHQ its first four bytes.
 ///
 /// # Examples
 ///
 /// ```
 /// use grafton_ndi::advanced::{
-///     packet_envelope, EnvelopeCodec, ScatterVideoFrame, VideoCodec, VideoPacketFormat,
+///     EnvelopeCodec, PacketEnvelope, ScatterVideoFrame, VideoCodec, VideoPacketFormat,
 /// };
 ///
-/// let packet = packet_envelope(EnvelopeCodec::H264, 0, 0, true, &[0x65; 64], &[0x67; 8])?;
+/// let packet =
+///     PacketEnvelope::encode(EnvelopeCodec::H264, 0, 0, true, &[0x65; 64], &[0x67; 8])?;
 /// let (header, rest) = packet.split_at(44);
 /// let frame = ScatterVideoFrame::new(
 ///     VideoPacketFormat::new(VideoCodec::H264, 1280, 720)?,
@@ -161,7 +168,7 @@ fn bytes_at<const N: usize>(blocks: &[Vec<u8>], offset: usize) -> Option<[u8; N]
 /// assert_eq!(frame.total_bytes(), packet.len());
 /// # Ok::<(), grafton_ndi::Error>(())
 /// ```
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ScatterVideoFrame {
     format: VideoPacketFormat,
     storage: ScatterStorage,
@@ -197,7 +204,7 @@ impl ScatterVideoFrame {
             Ok(total) => Ok(Self {
                 format,
                 storage: ScatterStorage::new(blocks, total),
-                extras: FrameExtras::new(),
+                extras: FrameExtras::default(),
             }),
             Err(error) => Err(Rejected::new(error, blocks)),
         }
@@ -218,21 +225,33 @@ impl ScatterVideoFrame {
         self.storage.total
     }
 
-    /// Set the timecode, in 100-nanosecond units.
-    pub fn with_timecode(self, timecode: i64) -> Self {
+    /// The timecode: [`Timecode::SYNTHESIZE`] unless
+    /// [`with_timecode`](Self::with_timecode) set one.
+    pub fn timecode(&self) -> Timecode {
+        self.extras.timecode()
+    }
+
+    /// The per-frame metadata, if any.
+    pub fn metadata(&self) -> Option<&str> {
+        self.extras.metadata()
+    }
+
+    /// The same frame with `timecode`.
+    #[must_use]
+    pub fn with_timecode(self, timecode: Timecode) -> Self {
         attach_timecode(self, timecode)
     }
 
-    /// Attach per-frame metadata.
+    /// The same frame with per-frame metadata.
     ///
     /// # Errors
     ///
     /// Returns the frame unchanged when the text is too long or contains a NUL.
     pub fn with_metadata(
         self,
-        value: impl Into<String>,
+        metadata: impl Into<String>,
     ) -> std::result::Result<Self, Rejected<Self>> {
-        attach_metadata(self, value.into())
+        attach_metadata(self, metadata.into())
     }
 
     /// Join the blocks into one newly allocated contiguous frame.
@@ -247,10 +266,7 @@ impl ScatterVideoFrame {
     /// A native descriptor without data: a scatter send takes the payload
     /// from the block arrays and ignores the frame's own data fields.
     fn descriptor(&self) -> NDIlib_video_frame_v2_t {
-        let mut raw = self.format.raw();
-        raw.timecode = self.extras.timecode();
-        raw.p_metadata = self.extras.metadata_ptr();
-        raw
+        self.format.descriptor(&self.extras)
     }
 }
 
@@ -258,13 +274,11 @@ impl ScatterVideoFrame {
 ///
 /// For AAC the first block must hold the complete 44-byte packet envelope
 /// header; Opus has no envelope.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ScatterAudioFrame {
     codec: AudioCodec,
     storage: ScatterStorage,
-    sample_rate: i32,
-    channels: i32,
-    samples: i32,
+    parameters: AudioParameters,
     protected: bool,
     extras: FrameExtras,
 }
@@ -276,43 +290,42 @@ impl HasExtras for ScatterAudioFrame {
 }
 
 impl ScatterAudioFrame {
-    /// Take ownership of one frame's blocks, in order. `samples` is the number
-    /// of samples per channel the frame decodes to.
+    /// Take ownership of one frame's blocks, in order. `num_samples` is the
+    /// number of samples per channel the frame decodes to.
     ///
     /// # Errors
     ///
     /// Returns the blocks with [`Error::InvalidFrame`](crate::Error::InvalidFrame)
-    /// when a dimension is not positive, the parameters are not ones the
-    /// codec is delivered with (see [`AudioCodec`]), the block list is invalid
-    /// (as for [`ScatterVideoFrame::new`]), or the blocks do not hold a
-    /// sendable AAC packet that agrees with the parameters.
+    /// when a parameter is not in `1..=i32::MAX`, the parameters are not ones
+    /// the codec is delivered with (see [`AudioCodec`]), the block list is
+    /// invalid (as for [`ScatterVideoFrame::new`]), or the blocks do not hold
+    /// a sendable AAC packet that agrees with the parameters.
     pub fn new(
         codec: AudioCodec,
-        sample_rate: i32,
-        channels: i32,
-        samples: i32,
+        sample_rate: u32,
+        num_channels: u32,
+        num_samples: u32,
         blocks: Vec<Vec<u8>>,
     ) -> std::result::Result<Self, Rejected<Vec<Vec<u8>>>> {
         let check = || {
-            codec.validate_delivery(sample_rate, channels, samples)?;
+            let parameters = AudioParameters::new(sample_rate, num_channels, num_samples)?;
+            codec.validate_delivery(parameters)?;
             let total = ScatterStorage::total(&blocks)?;
             if codec == AudioCodec::Aac {
                 let header = EnvelopeHeader::read(first_block(&blocks, ENVELOPE_HEADER_BYTES)?)?;
                 header.validate_for_send(EnvelopeCodec::Aac, total)?;
                 let config = bytes_at(&blocks, header.extra_offset());
-                header.validate_aac(config, sample_rate, channels)?;
+                header.validate_aac(config, parameters)?;
             }
-            Ok(total)
+            Ok((parameters, total))
         };
         match check() {
-            Ok(total) => Ok(Self {
+            Ok((parameters, total)) => Ok(Self {
                 codec,
                 storage: ScatterStorage::new(blocks, total),
-                sample_rate,
-                channels,
-                samples,
+                parameters,
                 protected: false,
-                extras: FrameExtras::new(),
+                extras: FrameExtras::default(),
             }),
             Err(error) => Err(Rejected::new(error, blocks)),
         }
@@ -323,19 +336,35 @@ impl ScatterAudioFrame {
         self.codec
     }
 
+    /// Whether the stream is protected.
+    pub fn is_protected(&self) -> bool {
+        self.protected
+    }
+
     /// Sample rate in hertz.
-    pub fn sample_rate(&self) -> i32 {
-        self.sample_rate
+    pub fn sample_rate(&self) -> u32 {
+        self.parameters.sample_rate
     }
 
     /// Number of channels.
-    pub fn channels(&self) -> i32 {
-        self.channels
+    pub fn num_channels(&self) -> u32 {
+        self.parameters.num_channels
     }
 
     /// Samples per channel the frame decodes to.
-    pub fn samples(&self) -> i32 {
-        self.samples
+    pub fn num_samples(&self) -> u32 {
+        self.parameters.num_samples
+    }
+
+    /// The timecode: [`Timecode::SYNTHESIZE`] unless
+    /// [`with_timecode`](Self::with_timecode) set one.
+    pub fn timecode(&self) -> Timecode {
+        self.extras.timecode()
+    }
+
+    /// The per-frame metadata, if any.
+    pub fn metadata(&self) -> Option<&str> {
+        self.extras.metadata()
     }
 
     /// The blocks, in order.
@@ -348,27 +377,28 @@ impl ScatterAudioFrame {
         self.storage.total
     }
 
-    /// Set the timecode, in 100-nanosecond units.
-    pub fn with_timecode(self, timecode: i64) -> Self {
+    /// The same frame with `timecode`.
+    #[must_use]
+    pub fn with_timecode(self, timecode: Timecode) -> Self {
         attach_timecode(self, timecode)
     }
 
-    /// Attach per-frame metadata.
+    /// The same frame with per-frame metadata.
     ///
     /// # Errors
     ///
     /// Returns the frame unchanged when the text is too long or contains a NUL.
     pub fn with_metadata(
         self,
-        value: impl Into<String>,
+        metadata: impl Into<String>,
     ) -> std::result::Result<Self, Rejected<Self>> {
-        attach_metadata(self, value.into())
+        attach_metadata(self, metadata.into())
     }
 
-    /// Mark the stream as protected.
-    pub fn protected(mut self, protected: bool) -> Self {
-        self.protected = protected;
-        self
+    /// The same frame, marked as a protected stream or not.
+    #[must_use]
+    pub fn with_protected(self, protected: bool) -> Self {
+        Self { protected, ..self }
     }
 
     /// Join the blocks into one newly allocated contiguous frame.
@@ -377,30 +407,21 @@ impl ScatterAudioFrame {
             codec: self.codec,
             protected: self.protected,
             bytes: AliasableBox::new(self.storage.copy_contiguous().into_boxed_slice()),
-            sample_rate: self.sample_rate,
-            channels: self.channels,
-            samples: self.samples,
+            parameters: self.parameters,
             extras: self.extras,
         }
     }
 
     /// A native descriptor without data; see [`ScatterVideoFrame::descriptor`].
     fn descriptor(&self) -> NDIlib_audio_frame_v3_t {
-        NDIlib_audio_frame_v3_t {
-            sample_rate: self.sample_rate,
-            no_channels: self.channels,
-            no_samples: self.samples,
-            timecode: self.extras.timecode(),
-            FourCC: self.codec.outer(self.protected),
-            p_metadata: self.extras.metadata_ptr(),
-            ..descriptors::audio_frame()
-        }
+        self.parameters
+            .descriptor(self.codec, self.protected, &self.extras)
     }
 }
 
 /// A video frame that was submitted asynchronously and that the SDK has
 /// finished with.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum SubmittedVideo {
     /// A frame submitted with [`CompressedSender::send_video_async`].
@@ -420,7 +441,7 @@ impl SubmittedVideo {
 }
 
 /// The frames a [`CompressedSender`] still held when it was closed.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct UnsentVideo {
     /// The last frame submitted asynchronously on the program stream.
     pub program: Option<SubmittedVideo>,
@@ -512,7 +533,7 @@ impl PendingStreams {
         // Both streams' earlier frames stay alive throughout the native call;
         // only the matching stream's frame is released once it has returned.
         submit(&mut next);
-        let slot = match next.frame.format().stream_tier() {
+        let slot = match next.frame.format().tier() {
             StreamTier::Program => &mut self.program,
             StreamTier::Preview => &mut self.preview,
         };
@@ -577,20 +598,22 @@ impl PendingStreams {
 /// ```no_run
 /// use grafton_ndi::{
 ///     advanced::{
-///         packet_envelope, CompressedSender, CompressedVideoFrame, EnvelopeCodec, VideoCodec,
+///         CompressedSender, CompressedVideoFrame, EnvelopeCodec, PacketEnvelope, VideoCodec,
 ///         VideoPacketFormat,
 ///     },
-///     SenderOptions, NDI,
+///     FrameRate, Ndi, SenderOptions,
 /// };
 ///
 /// # fn encoded_access_unit() -> (Vec<u8>, Vec<u8>) { (vec![0], vec![0]) }
 /// # fn main() -> Result<(), grafton_ndi::Error> {
-/// let ndi = NDI::new()?;
-/// let mut sender = CompressedSender::new(&ndi, &SenderOptions::builder("Encoder").build())?;
-/// let format = VideoPacketFormat::new(VideoCodec::H264, 1920, 1080)?.frame_rate(60, 1)?;
+/// let ndi = Ndi::new()?;
+/// let mut sender = CompressedSender::new(&ndi, &SenderOptions::new("Encoder"))?;
+/// let format = VideoPacketFormat::new(VideoCodec::H264, 1920, 1080)?
+///     .with_frame_rate(FrameRate::new(60, 1)?);
 ///
 /// let (payload, parameter_sets) = encoded_access_unit();
-/// let packet = packet_envelope(EnvelopeCodec::H264, 0, 0, true, &payload, &parameter_sets)?;
+/// let packet =
+///     PacketEnvelope::encode(EnvelopeCodec::H264, 0, 0, true, &payload, &parameter_sets)?;
 /// let mut frame = CompressedVideoFrame::new(format, packet)?;
 /// sender.send_video(&mut frame)?;
 /// # Ok(())
@@ -605,27 +628,19 @@ pub struct CompressedSender {
 }
 
 impl CompressedSender {
-    /// Create a sender with the SDK's default configuration.
+    /// Create a sender with the options' Advanced SDK
+    /// [configuration](SenderOptions::config), or the SDK's default one when
+    /// they carry none.
     ///
     /// # Errors
     ///
-    /// As for [`Sender::new_with_config`].
-    pub fn new(ndi: &NDI, options: &SenderOptions) -> Result<Self> {
-        Self::new_with_config(ndi, options, &AdvancedConfig::parse("{}")?)
-    }
-
-    /// Create a sender with a per-instance Advanced SDK configuration.
-    ///
-    /// # Errors
-    ///
-    /// As for [`Sender::new_with_config`].
-    pub fn new_with_config(
-        ndi: &NDI,
-        options: &SenderOptions,
-        config: &AdvancedConfig,
-    ) -> Result<Self> {
+    /// As for [`Sender::new`], and
+    /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
+    /// without an Advanced runtime (or in a build without the Advanced SDK).
+    pub fn new(ndi: &Ndi, options: &SenderOptions) -> Result<Self> {
+        let config = AdvancedConfig::or_empty(options.config.as_ref());
         Ok(Self {
-            sender: Sender::new_with_config(ndi, options, config)?,
+            sender: Sender::new_configured(ndi, options, &config)?,
             pending: PendingStreams::default(),
             core: &ndi.api().core,
         })
@@ -797,7 +812,7 @@ impl CompressedSender {
     /// # Errors
     ///
     /// As for [`Sender::set_external_tally`].
-    pub fn set_external_tally(&self, tally: Tally) -> Result<bool> {
+    pub fn set_external_tally(&self, tally: Tally) -> Result<()> {
         self.sender.set_external_tally(tally)
     }
 
@@ -884,15 +899,14 @@ impl CompressedSender {
 mod tests {
     use super::*;
     use crate::advanced::{
-        packet_envelope,
         packets::testing::{aac_config, aac_packet},
-        VideoCodec,
+        PacketEnvelope, VideoCodec,
     };
 
     fn h264() -> (VideoPacketFormat, Vec<u8>) {
         (
             VideoPacketFormat::new(VideoCodec::H264, 16, 16).unwrap(),
-            packet_envelope(EnvelopeCodec::H264, 10, 9, true, &[1, 2, 3], &[4, 5]).unwrap(),
+            PacketEnvelope::encode(EnvelopeCodec::H264, 10, 9, true, &[1, 2, 3], &[4, 5]).unwrap(),
         )
     }
 
@@ -909,9 +923,9 @@ mod tests {
 
     fn scatter_audio(
         codec: AudioCodec,
-        sample_rate: i32,
-        channels: i32,
-        samples: i32,
+        sample_rate: u32,
+        channels: u32,
+        samples: u32,
         blocks: Vec<Vec<u8>>,
     ) -> Result<ScatterAudioFrame> {
         ScatterAudioFrame::new(codec, sample_rate, channels, samples, blocks)
@@ -972,7 +986,7 @@ mod tests {
         let preview = |width, height| {
             let format = VideoPacketFormat::new(VideoCodec::H264, width, height)
                 .unwrap()
-                .tier(StreamTier::Preview);
+                .with_tier(StreamTier::Preview);
             ScatterVideoFrame::new(format, split(&bytes, &[44]))
         };
         preview(640, 640).unwrap();
@@ -981,7 +995,8 @@ mod tests {
         assert!(reason(ScatterVideoFrame::new(format, split(&bytes, &[43]))).contains("header"));
 
         // A keyframe needs its parameter sets here too.
-        let bare = packet_envelope(EnvelopeCodec::H264, 0, 0, true, &[1, 2, 3], &[]).unwrap();
+        let bare =
+            PacketEnvelope::encode(EnvelopeCodec::H264, 0, 0, true, &[1, 2, 3], &[]).unwrap();
         let refused = ScatterVideoFrame::new(format, split(&bare, &[44]));
         assert!(reason(refused).contains("codec configuration"));
     }
@@ -997,6 +1012,41 @@ mod tests {
             ScatterAudioFrame::new(AudioCodec::Opus, 48_000, 0, 960, vec![vec![1], vec![2]])
                 .unwrap_err();
         assert_eq!(rejected.into_inner(), [[1], [2]]);
+    }
+
+    /// A clone owns copies of the blocks, and its arrays describe the copies.
+    #[test]
+    fn a_cloned_scatter_frame_describes_its_own_blocks() {
+        let (format, bytes) = h264();
+        let frame = ScatterVideoFrame::new(format, split(&bytes, &[44, 47]))
+            .unwrap()
+            .with_timecode(Timecode::from_ticks(3))
+            .with_metadata("<scatter/>")
+            .unwrap();
+        let copy = frame.clone();
+        assert_eq!(
+            (copy.timecode(), copy.metadata()),
+            (Timecode::from_ticks(3), Some("<scatter/>"))
+        );
+        let blocks = copy.storage.blocks.iter().zip(copy.storage.pointers.iter());
+        for ((block, pointer), original) in blocks.zip(frame.storage.blocks.iter()) {
+            assert_eq!(block.as_ptr().cast::<u8>(), *pointer);
+            assert_ne!(block.as_ptr(), original.as_ptr());
+            assert_eq!(**block, **original);
+        }
+        assert_eq!(&*copy.storage.sizes, &*frame.storage.sizes);
+        assert!(copy.storage.pointers[3].is_null());
+
+        let audio = scatter_audio(AudioCodec::Opus, 48_000, 2, 960, vec![vec![1], vec![2]])
+            .unwrap()
+            .with_protected(true);
+        let copy = audio.clone();
+        assert!(copy.is_protected());
+        assert_eq!(
+            (copy.sample_rate(), copy.num_channels(), copy.num_samples()),
+            (48_000, 2, 960)
+        );
+        assert_eq!(copy.into_contiguous_copy().data(), &[1, 2]);
     }
 
     /// The SDK stamps the reserved field of the envelope in the first block
@@ -1061,7 +1111,8 @@ mod tests {
 
         let config = aac_config(48_000, 2);
         for config in [&[][..], &config[..1]] {
-            let bare = packet_envelope(EnvelopeCodec::Aac, 0, 0, true, &[1, 2], config).unwrap();
+            let bare =
+                PacketEnvelope::encode(EnvelopeCodec::Aac, 0, 0, true, &[1, 2], config).unwrap();
             let result = scatter_audio(AudioCodec::Aac, 48_000, 2, 1024, split(&bare, &[44]));
             assert!(reason(result).contains("AudioSpecificConfig"));
         }
@@ -1080,7 +1131,7 @@ mod tests {
         frame.validate_for_send().unwrap();
         assert!(reason(opus(44_100, 882)).contains("48000 Hz"));
         assert!(reason(opus(48_000, 1440)).contains("ms of audio"));
-        assert!(reason(opus(0, 960)).contains("positive"));
+        assert!(reason(opus(0, 960)).contains("1..="));
     }
 
     #[test]
@@ -1140,7 +1191,7 @@ mod tests {
         let (format, bytes) = h264();
         let make = |tier| {
             PendingVideo::contiguous(
-                CompressedVideoFrame::new(format.tier(tier), bytes.clone()).unwrap(),
+                CompressedVideoFrame::new(format.with_tier(tier), bytes.clone()).unwrap(),
             )
         };
         let mut streams = PendingStreams::default();
@@ -1161,7 +1212,7 @@ mod tests {
             })
             .is_none());
         let returned = streams.submit(make(StreamTier::Program), |_| {}).unwrap();
-        assert_eq!(returned.format().stream_tier(), StreamTier::Program);
+        assert_eq!(returned.format().tier(), StreamTier::Program);
         let SubmittedVideo::Contiguous(returned) = returned else {
             panic!("a contiguous frame was submitted");
         };
@@ -1173,13 +1224,7 @@ mod tests {
         returned.validate_for_send().unwrap();
         assert!(streams.preview.is_some());
         let unsent = streams.take();
-        assert_eq!(
-            unsent.program.unwrap().format().stream_tier(),
-            StreamTier::Program
-        );
-        assert_eq!(
-            unsent.preview.unwrap().format().stream_tier(),
-            StreamTier::Preview
-        );
+        assert_eq!(unsent.program.unwrap().format().tier(), StreamTier::Program);
+        assert_eq!(unsent.preview.unwrap().format().tier(), StreamTier::Preview);
     }
 }

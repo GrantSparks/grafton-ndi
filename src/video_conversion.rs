@@ -7,7 +7,7 @@
 
 use crate::{
     frames::{ValidatedVideoLayout, MAX_VIDEO_BYTES},
-    sys, Error, PixelFormat, Result, VideoFrame, NDI,
+    sys, Error, Ndi, PixelFormat, Result, VideoFrame,
 };
 
 /// Validated V210 storage geometry, including optional initialized row padding.
@@ -15,41 +15,46 @@ use crate::{
 /// Width must be positive and divisible by six. Height must be positive. Rows
 /// contain at least `width / 6 * 16` bytes; their stride must be divisible by four.
 /// Both the V210 storage and equivalent P216 frame must fit the 256 MiB video cap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct V210Layout {
-    width: i32,
-    height: i32,
-    stride: i32,
+    width: u32,
+    height: u32,
+    stride: usize,
     words: usize,
 }
 
 impl V210Layout {
     /// Create a tightly packed layout of complete six-pixel groups.
-    pub fn new(width: i32, height: i32) -> Result<Self> {
-        let active = Self::active_words_checked(width)?;
-        let stride = active
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFrame`] for a width that is zero or not a multiple of
+    /// six, a zero height, or storage beyond the video limit.
+    pub fn new(width: u32, height: u32) -> Result<Self> {
+        let stride = Self::active_words_checked(width)?
             .checked_mul(4)
-            .and_then(|n| i32::try_from(n).ok())
-            .ok_or_else(|| {
-                Error::InvalidFrame("V210 row stride exceeds the native range".into())
-            })?;
+            .ok_or_else(|| Error::InvalidFrame("V210 active row size overflow".into()))?;
         Self::with_line_stride(width, height, stride)
     }
 
     /// Create a layout with a byte stride that may include row padding.
-    pub fn with_line_stride(width: i32, height: i32, stride_bytes: i32) -> Result<Self> {
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::new`], and for a stride that is not a multiple of four
+    /// or does not cover every complete pixel group.
+    pub fn with_line_stride(width: u32, height: u32, stride_bytes: usize) -> Result<Self> {
         let active_words = Self::active_words_checked(width)?;
         // Reuse the established even-width/height/extent validation for the
         // corresponding two full-height, 16-bit P216 planes.
         ValidatedVideoLayout::new_uncompressed(PixelFormat::P216, width, height, None)?;
-        if stride_bytes <= 0 || stride_bytes % 4 != 0 || (stride_bytes as usize / 4) < active_words
-        {
+        if stride_bytes == 0 || !stride_bytes.is_multiple_of(4) || stride_bytes / 4 < active_words {
             return Err(Error::InvalidFrame(
                 "V210 stride must be a multiple of four and cover every complete pixel group"
                     .into(),
             ));
         }
-        let bytes = (stride_bytes as usize)
+        let bytes = stride_bytes
             .checked_mul(height as usize)
             .filter(|bytes| *bytes <= MAX_VIDEO_BYTES)
             .ok_or_else(|| Error::InvalidFrame("V210 storage exceeds the video limit".into()))?;
@@ -61,8 +66,8 @@ impl V210Layout {
         })
     }
 
-    fn active_words_checked(width: i32) -> Result<usize> {
-        if width <= 0 || width % 6 != 0 {
+    fn active_words_checked(width: u32) -> Result<usize> {
+        if width == 0 || !width.is_multiple_of(6) {
             return Err(Error::InvalidFrame(
                 "V210 conversion requires a positive width divisible by six".into(),
             ));
@@ -73,15 +78,15 @@ impl V210Layout {
     }
 
     /// Pixel width, always a multiple of six.
-    pub const fn width(self) -> i32 {
+    pub const fn width(self) -> u32 {
         self.width
     }
     /// Positive row count.
-    pub const fn height(self) -> i32 {
+    pub const fn height(self) -> u32 {
         self.height
     }
     /// Byte stride between V210 rows.
-    pub const fn line_stride_bytes(self) -> i32 {
+    pub const fn line_stride_bytes(self) -> usize {
         self.stride
     }
     /// Complete required storage, including row padding, in 32-bit words.
@@ -91,6 +96,13 @@ impl V210Layout {
     /// Active 32-bit words in each row, excluding padding.
     pub const fn active_words_per_row(self) -> usize {
         self.width as usize / 6 * 4
+    }
+
+    /// The SDK's `line_stride_in_bytes`.
+    fn sdk_line_stride(self) -> i32 {
+        // Lossless: the stride is at most the storage, which is within the
+        // video limit, below i32::MAX.
+        self.stride as i32
     }
 
     fn check_storage(self, words: usize) -> Result<()> {
@@ -128,13 +140,13 @@ impl V210Layout {
 /// Both exports are resolved before construction succeeds. Operations use
 /// caller-owned initialized storage and do not allocate pixel buffers.
 pub struct VideoConverter {
-    _ndi: NDI,
+    _ndi: Ndi,
     conversion: &'static sys::VideoConversion,
 }
 
 impl VideoConverter {
     /// Resolve both native utility functions from one initialized runtime.
-    pub fn new(ndi: &NDI) -> Result<Self> {
+    pub fn new(ndi: &Ndi) -> Result<Self> {
         Ok(Self {
             conversion: ndi.table()?,
             _ndi: ndi.clone(),
@@ -162,7 +174,7 @@ impl VideoConverter {
         // not a PixelFormat variant and cannot enter the ordinary sending path.
         input.FourCC = u32::from_le_bytes(*b"V210");
         input.p_data = source.as_ptr().cast_mut().cast();
-        input.__bindgen_anon_1.line_stride_in_bytes = layout.stride;
+        input.__bindgen_anon_1.line_stride_in_bytes = layout.sdk_line_stride();
         // SAFETY: Checked complete groups, native integer alignment, matching
         // extents and disjoint Rust borrows cover all accessed pixels.
         unsafe {
@@ -186,7 +198,7 @@ impl VideoConverter {
     ) -> Result<()> {
         layout.check_p216(source)?;
         layout.check_storage(destination.len())?;
-        let stride_words = layout.stride as usize / 4;
+        let stride_words = layout.stride / 4;
         let active = layout.active_words_per_row();
         for row in destination[..layout.words].chunks_exact_mut(stride_words) {
             row[..active].fill(0);
@@ -194,7 +206,7 @@ impl VideoConverter {
         let input = source.to_raw();
         let mut output = input;
         output.p_data = destination.as_mut_ptr().cast();
-        output.__bindgen_anon_1.line_stride_in_bytes = layout.stride;
+        output.__bindgen_anon_1.line_stride_in_bytes = layout.sdk_line_stride();
         // SAFETY: Typed output is initialized and aligned for native u32 access;
         // source P216 dimensions/alignment and both extents were checked above.
         unsafe {
@@ -208,24 +220,25 @@ impl VideoConverter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Timecode;
 
     #[test]
     fn complete_group_geometry_and_checked_caps() {
-        for width in [0, -6, 1, 2, 4, 8, 10, i32::MAX] {
+        for width in [0, 1, 2, 4, 8, 10, i32::MAX.unsigned_abs(), u32::MAX] {
             assert!(V210Layout::new(width, 1).is_err());
         }
-        for height in [0, -1, i32::MAX] {
+        for height in [0, i32::MAX.unsigned_abs(), u32::MAX] {
             assert!(V210Layout::new(6, height).is_err());
         }
-        for stride in [-1, 0, 12, 17, 18, i32::MAX] {
+        for stride in [0, 12, 17, 18, i32::MAX.unsigned_abs() as usize, usize::MAX] {
             assert!(V210Layout::with_line_stride(6, 1, stride).is_err());
         }
-        for width in [6, 12, 18, 48, 1920, 3840, 12_288] {
-            for height in [1, 3, 1080, 2160, 65_536] {
+        for width in [6u32, 12, 18, 48, 1920, 3840, 12_288] {
+            for height in [1u32, 3, 1080, 2160, 65_536] {
                 for padding in [0, 4, 128] {
-                    let stride = width / 6 * 16 + padding;
+                    let stride = width as usize / 6 * 16 + padding;
                     let actual = V210Layout::with_line_stride(width, height, stride);
-                    let packed = i128::from(stride) * i128::from(height);
+                    let packed = stride as i128 * i128::from(height);
                     let planar = i128::from(width) * i128::from(height) * 4;
                     assert_eq!(
                         actual.is_ok(),
@@ -262,10 +275,10 @@ mod tests {
                     let layout = V210Layout::with_line_stride(
                         width,
                         height,
-                        width / 6 * 16 + padding_words * 4,
+                        width as usize / 6 * 16 + padding_words * 4,
                     )
                     .unwrap();
-                    let stride = layout.line_stride_bytes() as usize / 4;
+                    let stride = layout.line_stride_bytes() / 4;
                     let mut packed = vec![0xa5a5_a5a5u32; layout.required_words() + 2];
                     let source = &mut packed[1..layout.required_words() + 1];
                     for row in 0..height as usize {
@@ -285,16 +298,15 @@ mod tests {
                     let mut frame = VideoFrame::builder()
                         .resolution(width, height)
                         .pixel_format(PixelFormat::P216)
-                        .timecode(123)
-                        .timestamp(456)
+                        .timecode(Timecode::from_ticks(123))
                         .metadata("<preserve/>")
                         .build()
                         .unwrap();
                     let address = frame.data().as_ptr();
                     converter.v210_to_p216(layout, source, &mut frame).unwrap();
                     assert_eq!(frame.data().as_ptr(), address);
-                    assert_eq!(frame.timecode(), 123);
-                    assert_eq!(frame.timestamp(), 456);
+                    assert_eq!(frame.timecode(), Timecode::from_ticks(123));
+                    assert_eq!(frame.timestamp(), None);
                     assert_eq!(frame.metadata(), Some("<preserve/>"));
                     let plane_samples = width as usize * height as usize;
                     for row in 0..height as usize {

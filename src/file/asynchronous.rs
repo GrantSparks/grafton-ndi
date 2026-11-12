@@ -7,17 +7,17 @@
 
 use super::types::resolve_path;
 use super::{
-    timeout_ms, EventText, FileApi, FileDuration, FileError, FileInfo, FilePlayer, FilePosition,
-    FileRecorder, FileResult, FinishStatus, PlayerEvent, PlayerOptions, PlayerStats, RecorderEvent,
-    RecorderOptions, RecorderState, RecorderStats, RecordingReport, RecordingTarget,
-    RecordingTimecode, SourceFormat, SourceSpec, SourceTimecode, StateError, StopRequest,
+    EventText, FileApi, FileDuration, FileInfo, FilePlayer, FilePosition, FileRecorder,
+    FinishStatus, PlayerEvent, PlayerOptions, PlayerStats, RecorderEvent, RecorderOptions,
+    RecorderState, RecorderStats, RecordingReport, RecordingTarget, RecordingTimecode,
+    SourceFormat, SourceSpec, StateError, StopRequest,
 };
-use crate::Source;
+use crate::{Error, MetadataFrame, Result, Source, Timecode};
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
     panic::{catch_unwind, AssertUnwindSafe},
-    path::PathBuf,
+    path::Path,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -41,8 +41,11 @@ fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// The sizes of the queues between an async handle and its owner thread.
 ///
-/// The default holds 64 pending commands and 256 undelivered events.
-#[derive(Clone, Debug)]
+/// The default holds 64 pending commands and 256 undelivered events. Each
+/// capacity must be from 1 through 4096; the `create_with_options`
+/// functions of [`AsyncFilePlayer`] and [`AsyncFileRecorder`] refuse any
+/// other with [`Error::InvalidInput`].
+#[derive(Clone, Copy, Debug)]
 pub struct AsyncFileOptions {
     command_capacity: usize,
     event_capacity: usize,
@@ -50,56 +53,59 @@ pub struct AsyncFileOptions {
 
 impl Default for AsyncFileOptions {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AsyncFileOptions {
+    /// The default sizes: 64 pending commands and 256 undelivered events.
+    pub fn new() -> Self {
         Self {
             command_capacity: 64,
             event_capacity: 256,
         }
     }
-}
 
-impl AsyncFileOptions {
-    /// Set how many commands may wait for the owner thread, from 1 through
-    /// 4096. A command submitted to a full queue fails at once with
+    /// Set how many commands may wait for the owner thread. A command
+    /// submitted to a full queue fails at once with
     /// [`StateError::QueueFull`], except a request to stop, which is always
     /// accepted so that it cannot be lost.
-    ///
-    /// # Errors
-    ///
-    /// [`FileError::InvalidInput`] when `capacity` is out of range.
-    pub fn with_command_capacity(mut self, capacity: usize) -> FileResult<Self> {
-        validate_capacity(capacity)?;
+    #[must_use]
+    pub fn command_capacity(mut self, capacity: usize) -> Self {
         self.command_capacity = capacity;
-        Ok(self)
+        self
     }
 
-    /// Set how many events may wait to be received, from 1 through 4096. When
-    /// the queue is full the oldest event is discarded and counted.
+    /// Set how many events may wait to be received. When the queue is full
+    /// the oldest event is discarded and counted.
     ///
     /// A recorder's session report is updated before an event enters this
     /// queue, so an event discarded here never affects what the report says.
-    ///
-    /// # Errors
-    ///
-    /// [`FileError::InvalidInput`] when `capacity` is out of range.
-    pub fn with_event_capacity(mut self, capacity: usize) -> FileResult<Self> {
-        validate_capacity(capacity)?;
+    #[must_use]
+    pub fn event_capacity(mut self, capacity: usize) -> Self {
         self.event_capacity = capacity;
-        Ok(self)
+        self
     }
-}
 
-fn validate_capacity(capacity: usize) -> FileResult<()> {
-    if (1..=MAX_CAPACITY).contains(&capacity) {
-        Ok(())
-    } else {
-        Err(FileError::InvalidInput(format!(
-            "async queue capacity must be between 1 and {MAX_CAPACITY}"
-        )))
+    /// Check that both capacities are in range.
+    fn validate(self) -> Result<Self> {
+        for (queue, capacity) in [
+            ("command", self.command_capacity),
+            ("event", self.event_capacity),
+        ] {
+            if !(1..=MAX_CAPACITY).contains(&capacity) {
+                return Err(Error::InvalidInput(format!(
+                    "async {queue} queue capacity must be between 1 and {MAX_CAPACITY}, not \
+                     {capacity}"
+                )));
+            }
+        }
+        Ok(self)
     }
 }
 
 struct Response<T> {
-    value: Option<FileResult<T>>,
+    value: Option<Result<T>>,
     completed: bool,
     waker: Option<Waker>,
 }
@@ -115,7 +121,7 @@ struct Response<T> {
 /// # Errors
 ///
 /// Besides the operation's own errors, every operation can fail with
-/// [`FileError::InvalidState`]: with [`StateError::QueueFull`] when the
+/// [`Error::InvalidState`]: with [`StateError::QueueFull`] when the
 /// handle's command queue is full, with [`StateError::Closed`] when the
 /// handle has been closed or its thread stopped normally before carrying the
 /// operation out, and with [`StateError::OwnerFailed`] when that thread failed
@@ -142,7 +148,7 @@ impl<T> std::fmt::Debug for FileOperation<T> {
 }
 
 impl<T> Future for FileOperation<T> {
-    type Output = FileResult<T>;
+    type Output = Result<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -203,7 +209,7 @@ fn operation<T>() -> (Reply<T>, FileOperation<T>) {
     )
 }
 
-fn deliver<T>(response: &Mutex<Response<T>>, value: FileResult<T>, replace: bool) {
+fn deliver<T>(response: &Mutex<Response<T>>, value: Result<T>, replace: bool) {
     let wake = {
         let mut response = lock(response);
         if response.completed && !replace {
@@ -220,8 +226,8 @@ fn deliver<T>(response: &Mutex<Response<T>>, value: FileResult<T>, replace: bool
 
 /// The error for an operation that did not run because its owner thread is
 /// gone: a failed thread, or one that stopped normally.
-fn stopped(failed: bool) -> FileError {
-    FileError::InvalidState(if failed {
+fn stopped(failed: bool) -> Error {
+    Error::InvalidState(if failed {
         StateError::OwnerFailed
     } else {
         StateError::Closed
@@ -229,7 +235,7 @@ fn stopped(failed: bool) -> FileError {
 }
 
 impl<T> FileOperation<T> {
-    fn failed(error: FileError) -> Self {
+    fn failed(error: Error) -> Self {
         let (reply, future) = operation();
         reply.complete(Err(error));
         future
@@ -237,13 +243,13 @@ impl<T> FileOperation<T> {
 
     // Only used before the future is returned to the caller. A rejected job's
     // Reply destructor may already have supplied a generic stopped error.
-    fn immediate_failure(&self, error: FileError) {
+    fn immediate_failure(&self, error: Error) {
         deliver(&self.response, Err(error), true);
     }
 }
 
 impl<T> Reply<T> {
-    fn complete(mut self, value: FileResult<T>) {
+    fn complete(mut self, value: Result<T>) {
         self.delivered = true;
         if !self.cancelled.load(Ordering::Acquire) {
             deliver(&self.response, value, false);
@@ -408,7 +414,7 @@ struct EventWaiter {
 }
 
 struct Events<E> {
-    queue: VecDeque<FileResult<E>>,
+    queue: VecDeque<Result<E>>,
     capacity: usize,
     dropped: u64,
     closed: bool,
@@ -431,7 +437,7 @@ impl<E> EventQueue<E> {
         }))
     }
 
-    fn push(&self, value: FileResult<E>) {
+    fn push(&self, value: Result<E>) {
         let wake = {
             let mut events = lock(&self.0);
             if events.queue.len() == events.capacity {
@@ -474,7 +480,7 @@ impl<E: Send + 'static> EventQueue<E> {
             budget,
             deadline: None,
             timer: None,
-            invalid: timeout_ms(budget).err(),
+            invalid: crate::to_ms_checked(budget).err(),
             consumed: false,
         }
     }
@@ -497,13 +503,13 @@ impl<E: Send> Expire for EventQueue<E> {
 }
 
 /// The next event from a player or recorder, or `None` when none arrives
-/// within the wait.
+/// within the timeout.
 ///
 /// The wait starts when the future is first polled, and ends on time even
 /// while the player's or recorder's thread is busy with a command that
 /// blocks: a timer thread shared by every handle in the process keeps the
 /// deadline. One future may wait on a handle at a time; a second fails with
-/// [`FileError::InvalidState`] and [`StateError::WaiterPending`]. Once the
+/// [`Error::InvalidState`] and [`StateError::WaiterPending`]. Once the
 /// handle is closed and every queued event has been taken, the future fails
 /// with [`StateError::Closed`], or with [`StateError::OwnerFailed`] when the
 /// thread failed; that happens as soon as the handle's thread stops taking
@@ -512,9 +518,9 @@ impl<E: Send> Expire for EventQueue<E> {
 ///
 /// # Errors
 ///
-/// Besides those above, [`FileError::InvalidInput`] when the wait exceeds
-/// [`crate::MAX_TIMEOUT`], [`FileError::Protocol`] for an event the
-/// SDK delivered malformed, and [`FileError::Io`] when the wait has to be
+/// Besides those above, [`Error::InvalidInput`] when the timeout exceeds
+/// [`crate::MAX_TIMEOUT`], [`Error::UnexpectedSdkResult`] for an event the
+/// SDK delivered malformed, and [`Error::Io`] when the wait has to be
 /// timed and the timer thread cannot be started; a later wait tries to start
 /// it again.
 ///
@@ -531,13 +537,13 @@ pub struct FileEventFuture<E> {
     deadline: Option<Instant>,
     /// This wait's registration with the deadline timer, while it has one.
     timer: Option<TimerKey>,
-    invalid: Option<FileError>,
+    invalid: Option<Error>,
     consumed: bool,
 }
 
 impl<E> FileEventFuture<E> {
     /// Complete with `value`, giving up the timer registration.
-    fn complete(&mut self, value: FileResult<Option<E>>) -> Poll<FileResult<Option<E>>> {
+    fn complete(&mut self, value: Result<Option<E>>) -> Poll<Result<Option<E>>> {
         self.consumed = true;
         if let Some(key) = self.timer.take() {
             TIMER.cancel(key);
@@ -560,7 +566,7 @@ impl<E> FileEventFuture<E> {
 }
 
 impl<E> Future for FileEventFuture<E> {
-    type Output = FileResult<Option<E>>;
+    type Output = Result<Option<E>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -582,7 +588,7 @@ impl<E> Future for FileEventFuture<E> {
                 .as_ref()
                 .is_some_and(|w| w.token.strong_count() != 0 && !w.token.ptr_eq(&token))
             {
-                Some(Err(FileError::InvalidState(StateError::WaiterPending)))
+                Some(Err(Error::InvalidState(StateError::WaiterPending)))
             } else {
                 let ready = if let Some(event) = events.queue.pop_front() {
                     Some(event.map(Some))
@@ -615,7 +621,7 @@ impl<E> Future for FileEventFuture<E> {
                 Ok(key) => this.timer = Some(key),
                 Err(error) => {
                     this.release_waiter();
-                    return this.complete(Err(FileError::Io(error)));
+                    return this.complete(Err(Error::Io(error)));
                 }
             }
         }
@@ -665,7 +671,7 @@ impl Control {
             let mut closing = lock(&self.closing);
             if closing.complete {
                 reply.complete(if closing.failed {
-                    Err(FileError::InvalidState(StateError::OwnerFailed))
+                    Err(Error::InvalidState(StateError::OwnerFailed))
                 } else {
                     Ok(())
                 });
@@ -676,7 +682,7 @@ impl Control {
                 .as_ref()
                 .is_some_and(|r| !r.cancelled.load(Ordering::Acquire))
             {
-                reply.complete(Err(FileError::InvalidState(StateError::WaiterPending)));
+                reply.complete(Err(Error::InvalidState(StateError::WaiterPending)));
                 return future;
             }
             closing.reply = Some(reply);
@@ -701,7 +707,7 @@ impl Control {
         };
         if let Some(reply) = reply {
             reply.complete(if failed {
-                Err(FileError::InvalidState(StateError::OwnerFailed))
+                Err(Error::InvalidState(StateError::OwnerFailed))
             } else {
                 Ok(())
             });
@@ -726,19 +732,19 @@ trait Owner: 'static {
     type Event: Send + 'static;
 
     /// Take the next native event without waiting.
-    fn poll_native(&mut self) -> FileResult<Option<Self::Event>>;
+    fn poll_native(&mut self) -> Result<Option<Self::Event>>;
 }
 
 impl Owner for FilePlayer {
     type Event = PlayerEvent;
-    fn poll_native(&mut self) -> FileResult<Option<Self::Event>> {
+    fn poll_native(&mut self) -> Result<Option<Self::Event>> {
         self.poll_event(Duration::ZERO)
     }
 }
 
 impl Owner for FileRecorder {
     type Event = RecorderEvent;
-    fn poll_native(&mut self) -> FileResult<Option<Self::Event>> {
+    fn poll_native(&mut self) -> Result<Option<Self::Event>> {
         self.poll_event(Duration::ZERO)
     }
 }
@@ -780,7 +786,7 @@ impl<H: Owner> Worker<H> {
     fn submit<T: Send + 'static>(
         &self,
         persistent: bool,
-        work: impl FnOnce(&mut H, &OperationContext) -> FileResult<T> + Send + 'static,
+        work: impl FnOnce(&mut H, &OperationContext) -> Result<T> + Send + 'static,
     ) -> FileOperation<T> {
         if self.control.failed() {
             return FileOperation::failed(stopped(true));
@@ -792,7 +798,7 @@ impl<H: Owner> Worker<H> {
         if let Some(waiting) = &waiting {
             if waiting.fetch_add(1, Ordering::AcqRel) >= self.capacity {
                 waiting.fetch_sub(1, Ordering::AcqRel);
-                return FileOperation::failed(FileError::InvalidState(StateError::QueueFull));
+                return FileOperation::failed(Error::InvalidState(StateError::QueueFull));
             }
         }
         let (mut reply, future) = operation();
@@ -818,7 +824,7 @@ impl<H: Owner> Worker<H> {
 
     fn call<T: Send + 'static>(
         &self,
-        work: impl FnOnce(&mut H) -> FileResult<T> + Send + 'static,
+        work: impl FnOnce(&mut H) -> Result<T> + Send + 'static,
     ) -> FileOperation<T> {
         self.submit(false, move |owner, _| work(owner))
     }
@@ -826,12 +832,18 @@ impl<H: Owner> Worker<H> {
 
 /// Start an owner thread, create its native object there, and return the
 /// handle `wrap` builds around the worker.
+///
+/// Options out of range fail the operation before anything is started.
 fn spawn_owner<H: Owner, T: Send + 'static>(
     name: &str,
-    create: impl FnOnce() -> FileResult<H> + Send + 'static,
+    create: impl FnOnce() -> Result<H> + Send + 'static,
     options: AsyncFileOptions,
     wrap: impl FnOnce(Arc<Worker<H>>) -> T + Send + 'static,
 ) -> FileOperation<T> {
+    let options = match options.validate() {
+        Ok(options) => options,
+        Err(error) => return FileOperation::failed(error),
+    };
     let (sender, receiver) = mpsc::channel();
     let control = Arc::new(Control::new());
     let events = Arc::new(EventQueue::new(options.event_capacity));
@@ -880,7 +892,7 @@ fn spawn_owner<H: Owner, T: Send + 'static>(
     match spawned {
         Ok(thread) => *lock(&worker.thread) = Some(thread),
         Err(error) => {
-            future.immediate_failure(FileError::Io(error));
+            future.immediate_failure(Error::Io(error));
             events.close(true);
             control.completed(true);
         }
@@ -938,16 +950,23 @@ pub struct AsyncFilePlayer {
 
 impl AsyncFilePlayer {
     /// Create a player and advertise its source, with the default queue sizes.
-    pub fn create(api: FileApi, options: PlayerOptions) -> FileOperation<Self> {
-        Self::create_with_options(api, options, AsyncFileOptions::default())
+    ///
+    /// The future fails as [`FileApi::create_player`] does. The options are
+    /// only read, so they stay with the caller whatever the outcome.
+    pub fn create(api: &FileApi, options: &PlayerOptions) -> FileOperation<Self> {
+        Self::create_with_options(api, options, AsyncFileOptions::new())
     }
 
     /// Create a player and advertise its source, with the given queue sizes.
+    ///
+    /// The future fails as [`create`](Self::create) does, and with
+    /// [`Error::InvalidInput`] when a queue size is out of range.
     pub fn create_with_options(
-        api: FileApi,
-        options: PlayerOptions,
+        api: &FileApi,
+        options: &PlayerOptions,
         asynchronous: AsyncFileOptions,
     ) -> FileOperation<Self> {
+        let (api, options) = (api.clone(), options.clone());
         spawn_owner(
             "ndi-file-player",
             move || api.create_player(&options),
@@ -956,15 +975,17 @@ impl AsyncFilePlayer {
         )
     }
 
-    /// Read a recording's duration and track layout on a temporary thread.
-    /// No player is created and nothing is advertised.
-    pub fn probe(api: FileApi, path: impl Into<PathBuf>) -> FileOperation<FileInfo> {
+    /// Read a recording's duration and track layout on a temporary thread;
+    /// see [`FileApi::probe`]. No player is created and nothing is
+    /// advertised.
+    pub fn probe(api: &FileApi, path: impl AsRef<Path>) -> FileOperation<FileInfo> {
         // Resolved here, so that the working directory is the one at call
         // time rather than whenever the owner thread gets to it.
-        let path = match resolve_path(&path.into(), "file path") {
+        let path = match resolve_path(path.as_ref(), "file path") {
             Ok((path, _)) => path,
             Err(error) => return FileOperation::failed(error),
         };
+        let api = api.clone();
         let (reply, future) = operation();
         if let Err(error) = thread::Builder::new()
             .name("ndi-file-probe".into())
@@ -974,16 +995,16 @@ impl AsyncFilePlayer {
                 }
             })
         {
-            future.immediate_failure(FileError::Io(error));
+            future.immediate_failure(Error::Io(error));
         }
         future
     }
 
     /// Play a file; see [`FilePlayer::start`].
-    pub fn start(&self, path: impl Into<PathBuf>) -> FileOperation<()> {
+    pub fn start(&self, path: impl AsRef<Path>) -> FileOperation<()> {
         // Resolved here, so that the working directory is the one at call
         // time rather than whenever the owner thread gets to it.
-        let path = match resolve_path(&path.into(), "file path") {
+        let path = match resolve_path(path.as_ref(), "file path") {
             Ok((path, _)) => path,
             Err(error) => return FileOperation::failed(error),
         };
@@ -1001,9 +1022,9 @@ impl AsyncFilePlayer {
     pub fn is_running(&self) -> FileOperation<bool> {
         self.worker.call(|p| Ok(p.is_running()))
     }
-    /// Wait up to `wait` for the player's next event.
-    pub fn next_event(&self, wait: Duration) -> FileEventFuture<PlayerEvent> {
-        self.worker.events.wait(wait)
+    /// Wait up to `timeout` for the player's next event.
+    pub fn next_event(&self, timeout: Duration) -> FileEventFuture<PlayerEvent> {
+        self.worker.events.wait(timeout)
     }
     /// How many events the SDK discarded before the player's thread took them.
     pub fn dropped_event_count(&self) -> FileOperation<u64> {
@@ -1059,7 +1080,7 @@ impl AsyncFilePlayer {
         self.worker.call(|p| Ok(p.position()))
     }
     /// The recorded source timecode of the frame sent last.
-    pub fn source_timecode(&self) -> FileOperation<Option<SourceTimecode>> {
+    pub fn source_timecode(&self) -> FileOperation<Option<Timecode>> {
         self.worker.call(|p| Ok(p.source_timecode()))
     }
     /// The track layout of the current file.
@@ -1079,7 +1100,7 @@ impl AsyncFilePlayer {
     ///
     /// # Errors
     ///
-    /// [`FileError::InvalidState`] with [`StateError::WaiterPending`] while
+    /// [`Error::InvalidState`] with [`StateError::WaiterPending`] while
     /// another close of this object is awaited, and with
     /// [`StateError::OwnerFailed`] when the object's thread failed.
     pub fn close(self) -> FileOperation<()> {
@@ -1102,7 +1123,7 @@ impl AsyncFilePlayer {
 ///
 /// Dropping the last clone **blocks the dropping thread** until the
 /// recorder's thread has finished: it stops a session that is still open,
-/// waits up to [`RecorderOptions::with_drop_wait`] for the SDK to finalize the
+/// waits up to [`RecorderOptions::drop_wait`] for the SDK to finalize the
 /// file, and destroys the recorder. This is deliberate: when the drop
 /// returns, the file is finalized as far as the SDK reported within that
 /// wait, even when the drop happens as the program exits. The outcome cannot
@@ -1118,16 +1139,21 @@ impl AsyncFileRecorder {
     /// Create a recorder with the default queue sizes.
     ///
     /// The future fails as [`FileApi::create_recorder`] does, including with
-    /// [`FileError::InvalidInput`] for options that conflict.
-    pub fn create(api: FileApi, options: RecorderOptions) -> FileOperation<Self> {
-        Self::create_with_options(api, options, AsyncFileOptions::default())
+    /// [`Error::InvalidInput`] for options that conflict. The options are
+    /// only read, so they stay with the caller whatever the outcome.
+    pub fn create(api: &FileApi, options: &RecorderOptions) -> FileOperation<Self> {
+        Self::create_with_options(api, options, AsyncFileOptions::new())
     }
     /// Create a recorder with the given queue sizes.
+    ///
+    /// The future fails as [`create`](Self::create) does, and with
+    /// [`Error::InvalidInput`] when a queue size is out of range.
     pub fn create_with_options(
-        api: FileApi,
-        options: RecorderOptions,
+        api: &FileApi,
+        options: &RecorderOptions,
         asynchronous: AsyncFileOptions,
     ) -> FileOperation<Self> {
+        let (api, options) = (api.clone(), options.clone());
         spawn_owner(
             "ndi-file-recorder",
             move || api.create_recorder(&options),
@@ -1138,9 +1164,10 @@ impl AsyncFileRecorder {
     /// Start a session; see [`FileRecorder::start`].
     pub fn start(
         &self,
-        target: RecordingTarget,
+        target: &RecordingTarget,
         timecode: RecordingTimecode,
     ) -> FileOperation<u64> {
+        let target = target.clone();
         self.worker.call(move |r| r.start(&target, timecode))
     }
     /// Ask the SDK to stop the session. The request runs even if the returned
@@ -1148,8 +1175,8 @@ impl AsyncFileRecorder {
     pub fn request_stop(&self) -> FileOperation<StopRequest> {
         self.worker.submit(true, |r, _| Ok(r.request_stop()))
     }
-    /// Stop the session and wait up to `wait` for its last file to be closed;
-    /// see [`FileRecorder::finish`].
+    /// Stop the session and wait up to `timeout` for its last file to be
+    /// closed; see [`FileRecorder::finish`].
     ///
     /// The wait is measured from this call, so it includes time the command
     /// spends queued. Dropping the future ends the wait but not the stop: the
@@ -1158,16 +1185,16 @@ impl AsyncFileRecorder {
     ///
     /// Events taken during the wait go to [`next_event`](Self::next_event)
     /// as the recorder's thread delivers any other, a malformed one as
-    /// [`FileError::Protocol`]; it does not end the wait.
+    /// [`Error::UnexpectedSdkResult`]; it does not end the wait.
     ///
     /// # Errors
     ///
     /// Those of [`FileRecorder::finish`], and those every
     /// [`FileOperation`] can fail with.
-    pub fn finish(&self, wait: Duration) -> FileOperation<FinishStatus> {
-        self.finish_inner(wait, true)
+    pub fn finish(&self, timeout: Duration) -> FileOperation<FinishStatus> {
+        self.finish_inner(timeout, true)
     }
-    /// Wait up to `wait` for a stopping session to end; see
+    /// Wait up to `timeout` for a stopping session to end; see
     /// [`FileRecorder::wait_finished`].
     ///
     /// Events taken during the wait are delivered as by
@@ -1177,19 +1204,20 @@ impl AsyncFileRecorder {
     ///
     /// Those of [`FileRecorder::wait_finished`], and those every
     /// [`FileOperation`] can fail with.
-    pub fn wait_finished(&self, wait: Duration) -> FileOperation<FinishStatus> {
-        self.finish_inner(wait, false)
+    pub fn wait_finished(&self, timeout: Duration) -> FileOperation<FinishStatus> {
+        self.finish_inner(timeout, false)
     }
 
     /// Replace the native recorder after abandoning its old session; see
     /// [`FileRecorder::reset`]. Queued events already delivered to this
     /// worker's event stream remain available to the caller.
-    pub fn reset(&self, options: RecorderOptions) -> FileOperation<RecordingReport> {
+    pub fn reset(&self, options: &RecorderOptions) -> FileOperation<RecordingReport> {
+        let options = options.clone();
         self.worker.call(move |recorder| recorder.reset(&options))
     }
 
-    fn finish_inner(&self, wait: Duration, stop: bool) -> FileOperation<FinishStatus> {
-        if let Err(error) = timeout_ms(wait) {
+    fn finish_inner(&self, timeout: Duration, stop: bool) -> FileOperation<FinishStatus> {
+        if let Err(error) = crate::to_ms_checked(timeout) {
             return FileOperation::failed(error);
         }
         let submitted = Instant::now();
@@ -1198,7 +1226,7 @@ impl AsyncFileRecorder {
             if stop {
                 recorder.request_stop();
             }
-            recorder.wait_finished_from(submitted, wait, |polled| {
+            recorder.wait_finished_from(submitted, timeout, |polled| {
                 // As the pump delivers them: a malformed event as its error.
                 if let Some(event) = polled.transpose() {
                     events.push(event);
@@ -1208,10 +1236,10 @@ impl AsyncFileRecorder {
         })
     }
 
-    /// Wait up to `wait` for the recorder's next event. Dropping the future
-    /// does not affect the recording.
-    pub fn next_event(&self, wait: Duration) -> FileEventFuture<RecorderEvent> {
-        self.worker.events.wait(wait)
+    /// Wait up to `timeout` for the recorder's next event. Dropping the
+    /// future does not affect the recording.
+    pub fn next_event(&self, timeout: Duration) -> FileEventFuture<RecorderEvent> {
+        self.worker.events.wait(timeout)
     }
     /// How many events the SDK discarded before the recorder's thread took them.
     pub fn dropped_event_count(&self) -> FileOperation<u64> {
@@ -1235,7 +1263,8 @@ impl AsyncFileRecorder {
         self.worker.call(|r| Ok(r.is_recording()))
     }
     /// Switch to recording another source; see [`FileRecorder::set_source`].
-    pub fn set_source(&self, source: SourceSpec) -> FileOperation<()> {
+    pub fn set_source(&self, source: &SourceSpec) -> FileOperation<()> {
+        let source = source.clone();
         self.worker.call(move |r| r.set_source(&source))
     }
     /// The source the SDK accepted last; see
@@ -1249,11 +1278,14 @@ impl AsyncFileRecorder {
     }
     /// Close the current file and continue in a new one; see
     /// [`FileRecorder::rollover`].
-    pub fn rollover(&self, target: RecordingTarget) -> FileOperation<()> {
+    pub fn rollover(&self, target: &RecordingTarget) -> FileOperation<()> {
+        let target = target.clone();
         self.worker.call(move |r| r.rollover(&target))
     }
-    /// Write a metadata frame into the recording at its current position.
-    pub fn inject_metadata(&self, metadata: crate::MetadataFrame) -> FileOperation<()> {
+    /// Write a metadata frame into the recording at its current position;
+    /// see [`FileRecorder::inject_metadata`].
+    pub fn inject_metadata(&self, metadata: &MetadataFrame) -> FileOperation<()> {
+        let metadata = metadata.clone();
         self.worker.call(move |r| r.inject_metadata(&metadata))
     }
     /// The recorder's running counters.
@@ -1268,7 +1300,7 @@ impl AsyncFileRecorder {
     /// every clone of this handle.
     ///
     /// A session that is still open is stopped and given up to
-    /// [`RecorderOptions::with_drop_wait`] to finalize its file. The future
+    /// [`RecorderOptions::drop_wait`] to finalize its file. The future
     /// completes when the SDK has destroyed the recorder, and does not say
     /// whether the file was finalized: await [`finish`](Self::finish) first to
     /// learn that. Nothing blocks the calling thread, and the close runs even
@@ -1276,7 +1308,7 @@ impl AsyncFileRecorder {
     ///
     /// # Errors
     ///
-    /// [`FileError::InvalidState`] with [`StateError::WaiterPending`] while
+    /// [`Error::InvalidState`] with [`StateError::WaiterPending`] while
     /// another close of this object is awaited, and with
     /// [`StateError::OwnerFailed`] when the object's thread failed.
     pub fn close(self) -> FileOperation<()> {
@@ -1289,7 +1321,7 @@ mod tests {
     use super::{
         super::{
             mock::{self, Closing},
-            RecorderEventKind,
+            FileNaming, RecorderEventKind,
         },
         *,
     };
@@ -1334,7 +1366,7 @@ mod tests {
     }
     impl Owner for LocalOwner {
         type Event = usize;
-        fn poll_native(&mut self) -> FileResult<Option<usize>> {
+        fn poll_native(&mut self) -> Result<Option<usize>> {
             Ok(None)
         }
     }
@@ -1345,7 +1377,7 @@ mod tests {
         }
     }
     fn local_worker() -> (Arc<Worker<LocalOwner>>, Receiver<thread::ThreadId>) {
-        local_worker_with_options(AsyncFileOptions::default())
+        local_worker_with_options(AsyncFileOptions::new())
     }
     fn local_worker_with_options(
         options: AsyncFileOptions,
@@ -1432,9 +1464,7 @@ mod tests {
 
     #[test]
     fn bounded_queue_rejects_excess_work_without_executing_it() {
-        let options = AsyncFileOptions::default()
-            .with_command_capacity(1)
-            .unwrap();
+        let options = AsyncFileOptions::new().command_capacity(1);
         let (worker, dropped) = local_worker_with_options(options);
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -1453,7 +1483,7 @@ mod tests {
                 owner.counter += 100;
                 Ok(())
             })),
-            Err(FileError::InvalidState(StateError::QueueFull))
+            Err(Error::InvalidState(StateError::QueueFull))
         ));
         release_tx.send(()).unwrap();
         block_on(blocker).unwrap();
@@ -1463,19 +1493,16 @@ mod tests {
         dropped.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
-    fn owner_failed<T: std::fmt::Debug>(result: FileResult<T>) {
+    fn owner_failed<T: std::fmt::Debug>(result: Result<T>) {
         assert!(
-            matches!(
-                result,
-                Err(FileError::InvalidState(StateError::OwnerFailed))
-            ),
+            matches!(result, Err(Error::InvalidState(StateError::OwnerFailed))),
             "expected OwnerFailed, got {result:?}"
         );
     }
 
-    fn closed<T: std::fmt::Debug>(result: FileResult<T>) {
+    fn closed<T: std::fmt::Debug>(result: Result<T>) {
         assert!(
-            matches!(result, Err(FileError::InvalidState(StateError::Closed))),
+            matches!(result, Err(Error::InvalidState(StateError::Closed))),
             "expected Closed, got {result:?}"
         );
     }
@@ -1547,7 +1574,7 @@ mod tests {
                     _not_send: Rc::new(()),
                 })
             },
-            AsyncFileOptions::default(),
+            AsyncFileOptions::new(),
             |worker| worker,
         );
         entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -1560,10 +1587,7 @@ mod tests {
     }
 
     fn mock_recorder(closing: Closing) -> (Arc<mock::Recorder>, AsyncFileRecorder) {
-        mock_recorder_with(
-            closing,
-            AsyncFileOptions::default().with_event_capacity(1).unwrap(),
-        )
+        mock_recorder_with(closing, AsyncFileOptions::new().event_capacity(1))
     }
 
     fn mock_recorder_with(
@@ -1584,7 +1608,7 @@ mod tests {
         ))
         .unwrap();
         block_on(recorder.start(
-            RecordingTarget::new(std::env::temp_dir().join("mock-file-not-created")).unwrap(),
+            &RecordingTarget::new(std::env::temp_dir().join("mock-file-not-created")).unwrap(),
             RecordingTimecode::Preserve,
         ))
         .unwrap();
@@ -1642,7 +1666,7 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         let session = block_on(recorder.start(
-            RecordingTarget::new(std::env::temp_dir().join("mock-file-not-created")).unwrap(),
+            &RecordingTarget::new(std::env::temp_dir().join("mock-file-not-created")).unwrap(),
             RecordingTimecode::Preserve,
         ))
         .unwrap();
@@ -1653,9 +1677,7 @@ mod tests {
 
     #[test]
     fn a_stop_is_carried_out_even_when_the_command_queue_is_full() {
-        let options = AsyncFileOptions::default()
-            .with_command_capacity(1)
-            .unwrap();
+        let options = AsyncFileOptions::new().command_capacity(1);
         let (device, recorder) = mock_recorder_with(Closing::AtStop, options);
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -1669,7 +1691,7 @@ mod tests {
         let queued = recorder.is_recording();
         assert!(matches!(
             block_on(recorder.is_recording()),
-            Err(FileError::InvalidState(StateError::QueueFull))
+            Err(Error::InvalidState(StateError::QueueFull))
         ));
         // A stop is not: it must not be lost, even if nobody waits for it.
         drop(recorder.request_stop());
@@ -1742,7 +1764,7 @@ mod tests {
             .is_pending());
         assert!(matches!(
             block_on(events.wait(Duration::ZERO)),
-            Err(FileError::InvalidState(StateError::WaiterPending))
+            Err(Error::InvalidState(StateError::WaiterPending))
         ));
         drop(first);
         assert_eq!(block_on(events.wait(Duration::ZERO)).unwrap(), None);
@@ -1755,11 +1777,11 @@ mod tests {
         block_on(worker.control.request_close()).unwrap();
         assert!(matches!(
             block_on(event),
-            Err(FileError::InvalidState(StateError::Closed))
+            Err(Error::InvalidState(StateError::Closed))
         ));
         assert!(matches!(
             block_on(worker.call(|_| Ok(()))),
-            Err(FileError::InvalidState(StateError::Closed))
+            Err(Error::InvalidState(StateError::Closed))
         ));
         dropped.recv_timeout(Duration::from_secs(1)).unwrap();
     }
@@ -1780,7 +1802,7 @@ mod tests {
 
     #[test]
     fn an_async_finish_delivers_a_malformed_event_it_takes_to_the_event_stream() {
-        let (device, recorder) = mock_recorder_with(Closing::Never, AsyncFileOptions::default());
+        let (device, recorder) = mock_recorder_with(Closing::Never, AsyncFileOptions::new());
         let finishing = recorder.finish(Duration::from_secs(5));
         while device.stops.load(Ordering::Acquire) == 0 {
             thread::sleep(Duration::from_millis(1));
@@ -1798,7 +1820,7 @@ mod tests {
         assert_eq!(started.kind(), RecorderEventKind::Started);
         let malformed = block_on(recorder.next_event(Duration::ZERO));
         assert!(
-            matches!(malformed, Err(FileError::Protocol(_))),
+            matches!(malformed, Err(Error::UnexpectedSdkResult(_))),
             "{malformed:?}"
         );
         block_on(recorder.close()).unwrap();
@@ -1847,7 +1869,7 @@ mod tests {
         let outcome = block_on(waiting.as_mut());
         let waited = begun.elapsed();
         assert!(
-            matches!(outcome, Err(FileError::InvalidState(StateError::Closed))),
+            matches!(outcome, Err(Error::InvalidState(StateError::Closed))),
             "{outcome:?}"
         );
         assert!(
@@ -1952,11 +1974,59 @@ mod tests {
     #[test]
     fn async_creation_refuses_conflicting_options() {
         let options = RecorderOptions::new(SourceSpec::new("mock source").unwrap())
-            .exact_filename()
-            .with_format_change_rollover(true);
+            .naming(FileNaming::Exact)
+            .format_change_rollover(true);
         assert!(matches!(
-            block_on(AsyncFileRecorder::create(mock::recorder_api(), options)),
-            Err(FileError::InvalidInput(_))
+            block_on(AsyncFileRecorder::create(&mock::recorder_api(), &options)),
+            Err(Error::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn queue_sizes_out_of_range_are_refused_before_a_thread_starts() {
+        for options in [
+            AsyncFileOptions::new().command_capacity(0),
+            AsyncFileOptions::new().event_capacity(0),
+            AsyncFileOptions::new().command_capacity(MAX_CAPACITY + 1),
+            AsyncFileOptions::new().event_capacity(MAX_CAPACITY + 1),
+        ] {
+            let created = spawn_owner(
+                "file-test-refused",
+                || -> Result<LocalOwner> { panic!("the owner was created") },
+                options,
+                |worker| worker,
+            );
+            assert!(matches!(
+                block_on(created),
+                Err(Error::InvalidInput(reason)) if reason.contains("capacity")
+            ));
+        }
+        let api = mock::recorder_api();
+        let player_options = PlayerOptions::new("mock player");
+        assert!(matches!(
+            block_on(AsyncFilePlayer::create_with_options(
+                &api,
+                &player_options,
+                AsyncFileOptions::new().event_capacity(0),
+            )),
+            Err(Error::InvalidInput(_))
+        ));
+        let recorder_options = RecorderOptions::new(SourceSpec::new("mock source").unwrap());
+        assert!(matches!(
+            block_on(AsyncFileRecorder::create_with_options(
+                &api,
+                &recorder_options,
+                AsyncFileOptions::new().command_capacity(0),
+            )),
+            Err(Error::InvalidInput(_))
+        ));
+        // The largest sizes are accepted.
+        let (worker, dropped) = local_worker_with_options(
+            AsyncFileOptions::new()
+                .command_capacity(MAX_CAPACITY)
+                .event_capacity(MAX_CAPACITY),
+        );
+        drop(worker);
+        dropped.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 }

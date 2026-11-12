@@ -15,7 +15,7 @@
 //!
 //! With the default options the recorder waits a few seconds at start-up for
 //! the source's low-bandwidth proxy stream, so a very short recording can be
-//! empty; `RecorderOptions::with_proxy(false)` starts at once.
+//! empty; `RecorderOptions::proxy(false)` starts at once.
 //!
 //! The File library ships with the NDI SDK, beside the runtime library. On
 //! Linux and macOS it needs the Advanced SDK runtime.
@@ -30,7 +30,7 @@ use grafton_ndi::{
         FileApi, FileRuntimeOptions, FinishStatus, RecorderEventKind, RecorderOptions,
         RecordingTarget, RecordingTimecode, SourceSpec,
     },
-    NDI,
+    Ndi,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let seconds = arguments.next().map_or(Ok(10), |text| text.parse())?;
 
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
     let file = FileApi::open(&ndi, &FileRuntimeOptions::default())?;
     println!("File library: {:?}", file.library_path());
 

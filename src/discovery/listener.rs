@@ -4,7 +4,7 @@
 use super::{not_created, Handle};
 use crate::{
     sys::{self, bindings::*},
-    to_ms_checked, Error, Result, NDI,
+    to_ms_checked, Error, Ndi, Result,
 };
 use std::{
     borrow::Cow,
@@ -160,26 +160,34 @@ listener_api!(
 #[derive(Debug, Clone, Default)]
 pub struct ListenerOptions {
     server: Option<String>,
+    #[cfg(feature = "advanced")]
+    config: Option<crate::advanced::AdvancedConfig>,
 }
 impl ListenerOptions {
+    /// The default options: the Discovery Server of the NDI configuration.
+    pub fn new() -> Self {
+        Self::default()
+    }
     /// Connect to this endpoint: a host name or IP address, optionally followed
     /// by a colon and a port (5959 when omitted).
     ///
-    /// # Errors
+    /// One endpoint only: the listener constructors refuse a comma-separated
+    /// list, of which a listener would use only the first entry.
+    #[must_use]
+    pub fn server(mut self, server: impl Into<String>) -> Self {
+        self.server = Some(server.into());
+        self
+    }
+    /// Create the listener with this per-instance Advanced SDK configuration,
+    /// which it keeps for as long as it lives.
     ///
-    /// Returns [`Error::InvalidConfiguration`] for a comma-separated list, of
-    /// which a listener would use only the first entry, and
-    /// [`Error::InvalidCString`] when the endpoint contains a NUL byte.
-    pub fn server(mut self, server: impl Into<String>) -> Result<Self> {
-        let server = server.into();
-        if server.contains(',') {
-            return Err(Error::InvalidConfiguration(
-                "a listener accepts one Discovery Server endpoint".into(),
-            ));
-        }
-        CString::new(server.as_str())?;
-        self.server = Some(server);
-        Ok(self)
+    /// [`SendListener::new`] and [`RecvListener::new`] then need an Advanced
+    /// runtime, and a build with the Advanced SDK.
+    #[cfg(feature = "advanced")]
+    #[must_use]
+    pub fn config(mut self, config: crate::advanced::AdvancedConfig) -> Self {
+        self.config = Some(config);
+        self
     }
 }
 
@@ -266,26 +274,6 @@ identifier!(
     InputGroupId
 );
 
-/// A finite event wait or an explicit indefinite wait.
-#[derive(Debug, Clone, Copy)]
-#[non_exhaustive]
-pub enum Wait {
-    /// A finite budget, rounded upward to whole milliseconds.
-    For(Duration),
-    /// Wait until an event arrives; this is not cancellable.
-    Forever,
-}
-impl Wait {
-    fn millis(self) -> Result<u32> {
-        match self {
-            // The listener headers reserve 0xFFFFFFFF for an indefinite wait,
-            // which no finite wait converts to.
-            Self::Forever => Ok(u32::MAX),
-            Self::For(value) => to_ms_checked(value),
-        }
-    }
-}
-
 /// An event a subscribed sender or receiver reported.
 ///
 /// `Id` is the kind of peer the event came from: [`SenderId`] for the events
@@ -293,7 +281,7 @@ impl Wait {
 ///
 /// Event names and values are defined by the peer and are preserved as sent,
 /// apart from the lossy decoding described on [`ListenerEvent::name`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ListenerEvent<Id> {
     id: Option<Id>,
     name: Option<String>,
@@ -315,11 +303,9 @@ impl<Id> ListenerEvent<Id> {
 }
 
 /// A receiver stream kind. These are individual values, not bit flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ReceiverStream {
-    /// No stream.
-    None,
     /// The receiver accepts metadata.
     Metadata,
     /// The receiver accepts video.
@@ -329,34 +315,40 @@ pub enum ReceiverStream {
     /// A stream kind this crate does not name, with its native value.
     Unknown(u32),
 }
-impl From<u32> for ReceiverStream {
-    fn from(v: u32) -> Self {
-        match v {
-            NDIlib_receiver_type_e_NDIlib_receiver_type_none => Self::None,
-            NDIlib_receiver_type_e_NDIlib_receiver_type_metadata => Self::Metadata,
-            NDIlib_receiver_type_e_NDIlib_receiver_type_video => Self::Video,
-            NDIlib_receiver_type_e_NDIlib_receiver_type_audio => Self::Audio,
-            v => Self::Unknown(v),
+impl ReceiverStream {
+    /// The stream kind the SDK's `value` names, or `None` for the SDK's
+    /// "none", which only terminates the list a receiver advertises.
+    fn from_sdk(value: NDIlib_receiver_type_e) -> Option<Self> {
+        match value {
+            sys::bindings::NDIlib_receiver_type_e_NDIlib_receiver_type_none => None,
+            sys::bindings::NDIlib_receiver_type_e_NDIlib_receiver_type_metadata => {
+                Some(Self::Metadata)
+            }
+            sys::bindings::NDIlib_receiver_type_e_NDIlib_receiver_type_video => Some(Self::Video),
+            sys::bindings::NDIlib_receiver_type_e_NDIlib_receiver_type_audio => Some(Self::Audio),
+            value => Some(Self::Unknown(value)),
         }
     }
 }
 /// A remote command a receiver advertises that it accepts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ReceiverCommand {
-    /// No command.
-    None,
     /// The receiver accepts requests to connect to another source.
     Connect,
     /// A command this crate does not name, with its native value.
     Unknown(u32),
 }
-impl From<u32> for ReceiverCommand {
-    fn from(v: u32) -> Self {
-        match v {
-            NDIlib_receiver_command_e_NDIlib_receiver_command_none => Self::None,
-            NDIlib_receiver_command_e_NDIlib_receiver_command_connect => Self::Connect,
-            v => Self::Unknown(v),
+impl ReceiverCommand {
+    /// The command the SDK's `value` names, or `None` for the SDK's "none",
+    /// which only terminates the list a receiver advertises.
+    fn from_sdk(value: NDIlib_receiver_command_e) -> Option<Self> {
+        match value {
+            sys::bindings::NDIlib_receiver_command_e_NDIlib_receiver_command_none => None,
+            sys::bindings::NDIlib_receiver_command_e_NDIlib_receiver_command_connect => {
+                Some(Self::Connect)
+            }
+            value => Some(Self::Unknown(value)),
         }
     }
 }
@@ -367,7 +359,7 @@ impl From<u32> for ReceiverCommand {
 /// Every string is whatever the sender advertised. Text that is not valid
 /// UTF-8 is decoded with U+FFFD in place of the offending bytes; only the
 /// [identifier](Self::id) keeps its exact bytes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AdvertisedSender {
     id: Option<SenderId>,
     name: Option<String>,
@@ -414,7 +406,7 @@ impl AdvertisedSender {
 /// Every string is whatever the receiver advertised. Text that is not valid
 /// UTF-8 is decoded with U+FFFD in place of the offending bytes; only the
 /// identifiers keep their exact bytes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AdvertisedReceiver {
     id: Option<ReceiverId>,
     name: Option<String>,
@@ -478,7 +470,7 @@ impl Budget {
     }
     /// The error for data that does not fit in what is left of the budget.
     fn exceeded() -> Error {
-        Error::InvalidFrame(
+        Error::UnexpectedSdkResult(
             "the Discovery Server data is larger than the 16 MiB one snapshot or event batch \
              may copy"
                 .into(),
@@ -504,7 +496,7 @@ impl Budget {
         // SAFETY: every byte before the terminator is readable.
         let Some(len) = (0..limit).find(|&len| unsafe { *value.add(len) } == 0) else {
             return Err(if limit == STRING_LIMIT {
-                Error::InvalidFrame(
+                Error::UnexpectedSdkResult(
                     "a Discovery Server string is longer than the 4 MiB one string may be".into(),
                 )
             } else {
@@ -548,7 +540,7 @@ impl Budget {
             return Ok(&[]);
         }
         if value.is_null() {
-            return Err(Error::InvalidFrame(format!(
+            return Err(Error::UnexpectedSdkResult(format!(
                 "the SDK reported {count} Discovery Server entries without supplying them"
             )));
         }
@@ -573,7 +565,7 @@ struct Listener<A: ListenerApi> {
     _url: Option<CString>,
     #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
-    _ndi: NDI,
+    _ndi: Ndi,
 }
 
 // SAFETY: the SDK attaches no listener to the thread that created it; its
@@ -591,7 +583,7 @@ impl<A: ListenerApi> Drop for Listener<A> {
 }
 impl<A: ListenerApi> Listener<A> {
     /// Connect to the Discovery Server `options` name.
-    fn new(ndi: &NDI, options: &ListenerOptions) -> Result<Self> {
+    fn new(ndi: &Ndi, options: &ListenerOptions) -> Result<Self> {
         // SAFETY: the SDK's listener creation returns null or a fresh listener
         // that nothing else owns, and the settings outlive the call.
         unsafe {
@@ -614,12 +606,21 @@ impl<A: ListenerApi> Listener<A> {
     /// `create` returns null or a live listener of `ndi`'s runtime, made from
     /// the settings it was handed, that nothing else owns.
     unsafe fn create(
-        ndi: &NDI,
+        ndi: &Ndi,
         options: &ListenerOptions,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(&'static A, &A::Settings) -> A::Instance,
     ) -> Result<Self> {
         let api = ndi.table::<A>()?;
+        if options
+            .server
+            .as_deref()
+            .is_some_and(|server| server.contains(','))
+        {
+            return Err(Error::InvalidInput(
+                "a listener accepts one Discovery Server endpoint".into(),
+            ));
+        }
         let url = options.server.as_deref().map(CString::new).transpose()?;
         let settings = A::settings(url.as_ref().map_or(ptr::null(), |v| v.as_ptr()));
         let instance = create(api, &settings);
@@ -674,7 +675,7 @@ impl<A: ListenerApi> Listener<A> {
             }
         };
     }
-    fn capture_events(&mut self, wait: Wait) -> Result<Vec<ListenerEvent<A::Id>>> {
+    fn capture_events(&mut self, timeout: Duration) -> Result<Vec<ListenerEvent<A::Id>>> {
         struct Batch<'a, A: ListenerApi> {
             listener: &'a Listener<A>,
             events: *const NDIlib_listener_event,
@@ -689,7 +690,7 @@ impl<A: ListenerApi> Listener<A> {
                 };
             }
         }
-        let timeout = wait.millis()?;
+        let timeout = to_ms_checked(timeout)?;
         let mut count = 0;
         // SAFETY: the listener instance is live for this borrow.
         let events = unsafe { self.api.events(self.instance, &mut count, timeout) };
@@ -769,7 +770,7 @@ impl SendListener {
     /// `create` returns null or a live listener of `ndi`'s runtime, made from
     /// the settings it was handed, that nothing else owns.
     pub(crate) unsafe fn create(
-        ndi: &NDI,
+        ndi: &Ndi,
         options: &ListenerOptions,
         _operation: &'static str,
         config: Option<crate::advanced::AdvancedConfig>,
@@ -794,7 +795,7 @@ impl RecvListener {
     /// `create` returns null or a live listener of `ndi`'s runtime, made from
     /// the settings it was handed, that nothing else owns.
     pub(crate) unsafe fn create(
-        ndi: &NDI,
+        ndi: &Ndi,
         options: &ListenerOptions,
         _operation: &'static str,
         config: Option<crate::advanced::AdvancedConfig>,
@@ -842,7 +843,7 @@ macro_rules! listener_methods {
         ///
         /// # Errors
         ///
-        /// Returns [`Error::InvalidConfiguration`] when `timeout` exceeds
+        /// Returns [`Error::InvalidInput`] when `timeout` exceeds
         /// [`crate::MAX_TIMEOUT`].
         pub fn wait_for_changes(&mut self, timeout: Duration) -> Result<bool> {
             self.inner.wait_for_changes(timeout)
@@ -857,18 +858,19 @@ macro_rules! listener_methods {
             self.inner.subscription(id, false)
         }
         /// Take the events that arrived since the last call, in arrival order,
-        /// waiting up to `wait` for the first one. An empty batch means none
-        /// arrived in time.
+        /// waiting up to `timeout` for the first one. An empty batch means none
+        /// arrived in time; a zero timeout polls.
         ///
         /// # Errors
         ///
-        /// Returns [`Error::InvalidConfiguration`] for a finite wait the SDK
-        /// cannot express, and [`Error::InvalidFrame`] when copying the batch
-        /// would take more than 16 MiB, or one of its strings is 4 MiB or
-        /// longer. The SDK has already handed such a batch over, so it is
-        /// released without being returned and its events are lost.
-        pub fn capture_events(&mut self, wait: Wait) -> Result<Vec<ListenerEvent<$Id>>> {
-            self.inner.capture_events(wait)
+        /// Returns [`Error::InvalidInput`] when `timeout` exceeds
+        /// [`crate::MAX_TIMEOUT`], and [`Error::UnexpectedSdkResult`] when the
+        /// batch is malformed, copying it would take more than 16 MiB, or one
+        /// of its strings is 4 MiB or longer. The SDK has already handed such a
+        /// batch over, so it is released without being returned and its events
+        /// are lost.
+        pub fn capture_events(&mut self, timeout: Duration) -> Result<Vec<ListenerEvent<$Id>>> {
+            self.inner.capture_events(timeout)
         }
     };
 }
@@ -881,14 +883,20 @@ impl SendListener {
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime
-    /// cannot provide [sender discovery], which needs NDI 6.4.0 or later;
-    /// [`Error::InvalidCString`] when the endpoint contains a NUL byte; and
-    /// [`Error::InvalidConfiguration`] when the SDK creates no listener. It
-    /// creates none for an address it cannot parse, and none when `options`
-    /// name no server and the NDI configuration supplies none.
+    /// cannot provide [sender discovery], which needs NDI 6.4.0 or later, or the
+    /// options carry an Advanced configuration that the runtime or this build
+    /// cannot take; [`Error::InvalidCString`] when the endpoint contains a NUL
+    /// byte; and [`Error::InvalidInput`] when the options name more than one
+    /// endpoint, or the SDK creates no listener. It creates none for an
+    /// address it cannot parse, and none when `options` name no server and the
+    /// NDI configuration supplies none.
     ///
     /// [sender discovery]: crate::capabilities::RuntimeFeature::SenderDiscovery
-    pub fn new(ndi: &NDI, options: &ListenerOptions) -> Result<Self> {
+    pub fn new(ndi: &Ndi, options: &ListenerOptions) -> Result<Self> {
+        #[cfg(feature = "advanced")]
+        if let Some(config) = &options.config {
+            return Self::new_configured(ndi, options, config);
+        }
         Ok(Self {
             inner: Listener::new(ndi, options)?,
         })
@@ -899,7 +907,7 @@ impl SendListener {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidFrame`] when the SDK's snapshot is malformed,
+    /// Returns [`Error::UnexpectedSdkResult`] when the SDK's snapshot is malformed,
     /// when copying it would take more than 16 MiB, or when one of its strings
     /// is 4 MiB or longer. Text that is not valid UTF-8 is decoded lossily and
     /// never fails the snapshot.
@@ -939,14 +947,20 @@ impl RecvListener {
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedCapability`] when the selected runtime
-    /// cannot provide [receiver discovery], which needs NDI 6.4.0 or later;
-    /// [`Error::InvalidCString`] when the endpoint contains a NUL byte; and
-    /// [`Error::InvalidConfiguration`] when the SDK creates no listener. It
-    /// creates none for an address it cannot parse, and none when `options`
-    /// name no server and the NDI configuration supplies none.
+    /// cannot provide [receiver discovery], which needs NDI 6.4.0 or later, or the
+    /// options carry an Advanced configuration that the runtime or this build
+    /// cannot take; [`Error::InvalidCString`] when the endpoint contains a NUL
+    /// byte; and [`Error::InvalidInput`] when the options name more than one
+    /// endpoint, or the SDK creates no listener. It creates none for an
+    /// address it cannot parse, and none when `options` name no server and the
+    /// NDI configuration supplies none.
     ///
     /// [receiver discovery]: crate::capabilities::RuntimeFeature::ReceiverDiscovery
-    pub fn new(ndi: &NDI, options: &ListenerOptions) -> Result<Self> {
+    pub fn new(ndi: &Ndi, options: &ListenerOptions) -> Result<Self> {
+        #[cfg(feature = "advanced")]
+        if let Some(config) = &options.config {
+            return Self::new_configured(ndi, options, config);
+        }
         Ok(Self {
             inner: Listener::new(ndi, options)?,
         })
@@ -957,7 +971,7 @@ impl RecvListener {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidFrame`] when the SDK's snapshot is malformed,
+    /// Returns [`Error::UnexpectedSdkResult`] when the SDK's snapshot is malformed,
     /// when copying it would take more than 16 MiB, or when one of its strings
     /// is 4 MiB or longer. Text that is not valid UTF-8 is decoded lossily and
     /// never fails the snapshot.
@@ -973,13 +987,13 @@ impl RecvListener {
                         .slice(receiver.p_streams.cast_const(), receiver.num_streams)?
                         .iter()
                         .copied()
-                        .map(ReceiverStream::from)
+                        .filter_map(ReceiverStream::from_sdk)
                         .collect();
                     let commands = budget
                         .slice(receiver.p_commands.cast_const(), receiver.num_commands)?
                         .iter()
                         .copied()
-                        .map(ReceiverCommand::from)
+                        .filter_map(ReceiverCommand::from_sdk)
                         .collect();
                     Ok(AdvertisedReceiver {
                         id: budget.id(receiver.p_uuid)?,
@@ -1060,18 +1074,7 @@ impl RecvListener {
 mod tests {
     use super::*;
     #[test]
-    fn finite_wait_never_turns_into_infinity() {
-        for (wait, millis) in crate::timeout::rounding_table() {
-            match (Wait::For(wait).millis(), millis) {
-                (Ok(value), Some(millis)) => assert_eq!(value, millis, "{wait:?}"),
-                (Err(Error::InvalidConfiguration(_)), None) => {}
-                (other, _) => panic!("{wait:?} converted to {other:?}"),
-            }
-        }
-        assert_eq!(Wait::Forever.millis().unwrap(), u32::MAX);
-    }
-    #[test]
-    fn bounded_copy_preserves_null_empty_and_unknown_values() {
+    fn bounded_copy_preserves_null_and_empty_values() {
         let mut budget = Budget::new();
         // SAFETY: every non-null pointer is a live NUL-terminated string.
         unsafe {
@@ -1081,9 +1084,33 @@ mod tests {
             assert!(budget.slice::<u32>(ptr::null(), 1).is_err());
             assert!(budget.slice::<u32>(ptr::null(), 0).unwrap().is_empty());
         }
-        assert_eq!(ReceiverStream::from(3), ReceiverStream::Audio);
-        assert_eq!(ReceiverStream::from(999), ReceiverStream::Unknown(999));
-        assert!(ListenerOptions::default().server("a,b").is_err());
+    }
+    #[test]
+    fn list_terminators_are_dropped_and_unknown_values_kept() {
+        assert_eq!(
+            ReceiverStream::from_sdk(NDIlib_receiver_type_e_NDIlib_receiver_type_none),
+            None
+        );
+        assert_eq!(
+            ReceiverStream::from_sdk(NDIlib_receiver_type_e_NDIlib_receiver_type_audio),
+            Some(ReceiverStream::Audio)
+        );
+        assert_eq!(
+            ReceiverStream::from_sdk(999),
+            Some(ReceiverStream::Unknown(999))
+        );
+        assert_eq!(
+            ReceiverCommand::from_sdk(NDIlib_receiver_command_e_NDIlib_receiver_command_none),
+            None
+        );
+        assert_eq!(
+            ReceiverCommand::from_sdk(NDIlib_receiver_command_e_NDIlib_receiver_command_connect),
+            Some(ReceiverCommand::Connect)
+        );
+        assert_eq!(
+            ReceiverCommand::from_sdk(999),
+            Some(ReceiverCommand::Unknown(999))
+        );
     }
     #[test]
     fn text_is_decoded_lossily_and_identifiers_keep_their_bytes() {
@@ -1121,7 +1148,7 @@ mod tests {
             );
             assert!(matches!(
                 budget.text(c"a".as_ptr()),
-                Err(Error::InvalidFrame(_))
+                Err(Error::UnexpectedSdkResult(_))
             ));
         }
     }
@@ -1146,7 +1173,8 @@ mod tests {
                     .len(),
                 wide.len()
             );
-            let Err(Error::InvalidFrame(reason)) = Budget::new().slice(wide.as_ptr(), u32::MAX)
+            let Err(Error::UnexpectedSdkResult(reason)) =
+                Budget::new().slice(wide.as_ptr(), u32::MAX)
             else {
                 panic!("an array larger than the budget must be refused");
             };

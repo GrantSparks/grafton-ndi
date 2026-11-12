@@ -20,14 +20,18 @@ use std::{
     },
 };
 
-use super::{invalid, AudioCodec, PacketEvent, PacketReceiver, VideoCodec};
+use super::{
+    invalid_frame, invalid_input, sdk_quantity, AudioCodec, PacketEvent, PacketReceiver, VideoCodec,
+};
 use crate::{
+    frames::ValidatedVideoLayout,
     runtime::ProcessLifetimeRuntime,
     sys::{
         advanced::{native, ReceiveAllocators},
         bindings::*,
     },
-    PixelFormat, Receiver, Rejected, Result,
+    Error, FourCc, MediaTypes, MetadataFrame, PixelFormat, Receiver, Rejected, Result,
+    SettingChange, StreamTier,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -67,6 +71,14 @@ pub struct AllocatorLimits {
 
 impl Default for AllocatorLimits {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AllocatorLimits {
+    /// The default limits: 256 generations, 1024 allocations, 1 GiB in total,
+    /// 16 concurrent calls and 64 MiB per allocation.
+    pub fn new() -> Self {
         Self {
             max_generations: 256,
             max_allocations: 1024,
@@ -75,11 +87,10 @@ impl Default for AllocatorLimits {
             max_allocation_bytes: 64 * MIB,
         }
     }
-}
 
-impl AllocatorLimits {
     /// The number of policies that may exist at once. A replaced policy
     /// counts until the SDK has freed its last allocation.
+    #[must_use]
     pub fn max_generations(mut self, value: usize) -> Self {
         self.max_generations = value;
         self
@@ -87,6 +98,7 @@ impl AllocatorLimits {
 
     /// The number of allocations the SDK may hold at once, counting the
     /// policy calls in progress.
+    #[must_use]
     pub fn max_allocations(mut self, value: usize) -> Self {
         self.max_allocations = value;
         self
@@ -94,36 +106,40 @@ impl AllocatorLimits {
 
     /// The total bytes the SDK may hold at once, counting what the policy
     /// calls in progress have been granted.
+    #[must_use]
     pub fn max_bytes(mut self, value: usize) -> Self {
         self.max_bytes = value;
         self
     }
 
     /// The number of policy calls that may run at the same time.
+    #[must_use]
     pub fn max_concurrent_calls(mut self, value: usize) -> Self {
         self.max_concurrent_calls = value;
         self
     }
 
     /// The largest single allocation, at most 256 MiB.
+    #[must_use]
     pub fn max_allocation_bytes(mut self, value: usize) -> Self {
         self.max_allocation_bytes = value;
         self
     }
 
     fn validate(self) -> Result<Self> {
+        let limits_error = |reason: &str| crate::Error::InvalidInput(reason.into());
         if self.max_generations == 0
             || self.max_allocations == 0
             || self.max_concurrent_calls == 0
             || self.max_allocation_bytes == 0
         {
-            return Err(invalid("Allocator limits must be positive"));
+            return Err(limits_error("Allocator limits must be positive"));
         }
         if self.max_allocation_bytes > MAX_ALLOCATION {
-            return Err(invalid("max_allocation_bytes exceeds 256 MiB"));
+            return Err(limits_error("max_allocation_bytes exceeds 256 MiB"));
         }
         if self.max_concurrent_calls > self.max_allocations {
-            return Err(invalid(
+            return Err(limits_error(
                 "max_concurrent_calls exceeds max_allocations, which counts every call in progress",
             ));
         }
@@ -132,7 +148,7 @@ impl AllocatorLimits {
             .checked_mul(self.max_allocation_bytes)
             .is_none_or(|granted| granted > self.max_bytes)
         {
-            return Err(invalid(
+            return Err(limits_error(
                 "max_bytes is less than max_concurrent_calls allocations of max_allocation_bytes",
             ));
         }
@@ -141,17 +157,23 @@ impl AllocatorLimits {
 }
 
 /// What the SDK needs memory for: one frame it is about to receive.
-#[derive(Clone, Copy, Debug)]
+///
+/// Planar audio is laid out as a picture is, one channel to a line: its
+/// [`width`](Self::width) is the number of samples per channel, its
+/// [`height`](Self::height) the number of channels, and its
+/// [`stride`](Self::stride) the distance between channels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AllocationRequest {
     bytes: usize,
-    stride: i32,
+    stride: usize,
     format: AllocationFormat,
-    width: i32,
-    height: i32,
+    width: u32,
+    height: u32,
     capacity_limit: usize,
 }
+
 /// The kind of frame an [`AllocationRequest`] is for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum AllocationFormat {
     /// Uncompressed video in this pixel format.
@@ -159,9 +181,9 @@ pub enum AllocationFormat {
     /// Uncompressed planar 32-bit floating-point audio.
     AudioPlanarF32,
     /// Compressed video with this FourCC.
-    CompressedVideo(u32),
+    CompressedVideo(FourCc),
     /// Compressed audio with this FourCC.
-    CompressedAudio(u32),
+    CompressedAudio(FourCc),
 }
 
 impl AllocationRequest {
@@ -180,7 +202,7 @@ impl AllocationRequest {
 
     /// Bytes per video line or per audio channel. For a compressed frame,
     /// which has no stride, this is its size.
-    pub fn stride(self) -> i32 {
+    pub fn stride(self) -> usize {
         self.stride
     }
 
@@ -189,9 +211,14 @@ impl AllocationRequest {
         self.format
     }
 
-    /// `(width, height)` in pixels for video; `(samples, channels)` for audio.
-    pub fn dimensions(self) -> (i32, i32) {
-        (self.width, self.height)
+    /// Width in pixels of video; samples per channel of audio.
+    pub fn width(self) -> u32 {
+        self.width
+    }
+
+    /// Height in pixels of video; channels of audio.
+    pub fn height(self) -> u32 {
+        self.height
     }
 
     /// The same request with a larger line or channel stride, for buffers
@@ -199,43 +226,51 @@ impl AllocationRequest {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when the stride is
-    /// smaller than requested, an audio stride is not a multiple of four
-    /// bytes, the frame is compressed (it has no stride to change), or the
-    /// buffer would exceed the [`capacity_limit`](Self::capacity_limit).
-    pub fn with_stride(self, stride: i32) -> Result<Self> {
+    /// [`Error::InvalidInput`] when the stride is smaller than requested, is
+    /// not one the frame's layout allows (an audio stride is a multiple of
+    /// four bytes; a 4:2:0 or UYVA video stride is even), the frame is
+    /// compressed (it has no stride to change), or the buffer would exceed
+    /// the [`capacity_limit`](Self::capacity_limit).
+    pub fn with_stride(self, stride: usize) -> Result<Self> {
         if stride < self.stride {
-            return Err(invalid(
-                "Allocator stride is smaller than the requested stride",
-            ));
+            return Err(invalid_input(format!(
+                "Allocator stride {stride} is smaller than the requested stride {}",
+                self.stride
+            )));
         }
         let bytes = match self.format {
             AllocationFormat::Video(pixel) => {
-                crate::frames::ValidatedVideoLayout::new_uncompressed(
-                    pixel,
-                    self.width,
-                    self.height,
-                    Some(stride),
-                )?
-                .data_len_bytes
+                ValidatedVideoLayout::new_uncompressed(pixel, self.width, self.height, Some(stride))
+                    // The layout rules report the frame that breaks them;
+                    // here what breaks them is the caller's stride.
+                    .map_err(|error| match error {
+                        Error::InvalidFrame(reason) => invalid_input(reason),
+                        other => other,
+                    })?
+                    .data_len_bytes
             }
             AllocationFormat::AudioPlanarF32 => {
-                if stride % 4 != 0 {
-                    return Err(invalid("Audio allocator stride must be aligned to f32"));
+                if !stride.is_multiple_of(size_of::<f32>()) {
+                    return Err(invalid_input(format!(
+                        "Audio allocator stride {stride} is not a whole number of samples"
+                    )));
                 }
-                (stride as usize)
+                stride
                     .checked_mul(self.height as usize)
-                    .ok_or_else(|| invalid("Audio allocator extent overflow"))?
+                    .ok_or_else(|| invalid_input("Audio allocator extent overflow"))?
             }
             _ if stride == self.stride => self.bytes,
             _ => {
-                return Err(invalid(
+                return Err(invalid_input(
                     "Compressed allocations have a byte size, not a configurable stride",
                 ))
             }
         };
         if bytes > self.capacity_limit {
-            return Err(invalid("Allocator extent exceeds the buffer limit"));
+            return Err(invalid_input(format!(
+                "An allocation of {bytes} bytes exceeds the capacity limit of {} bytes",
+                self.capacity_limit
+            )));
         }
         Ok(Self {
             bytes,
@@ -280,10 +315,11 @@ impl OwnedStorage {
         let layout = Layout::from_size_align(bytes, 64)
             .ok()
             .filter(|layout| layout.size() != 0)
-            .ok_or_else(|| invalid("Invalid allocator layout"))?;
+            .ok_or_else(|| invalid_input(format!("No allocation can hold {bytes} bytes")))?;
         // SAFETY: the layout was just checked not to be zero-sized.
-        let pointer = NonNull::new(unsafe { alloc_zeroed(layout) })
-            .ok_or_else(|| invalid("Allocation failed"))?;
+        let pointer = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or_else(|| {
+            invalid_input(format!("The global allocator did not supply {bytes} bytes"))
+        })?;
         Ok(Self { pointer, layout })
     }
 }
@@ -324,8 +360,8 @@ impl AllocationBuffer {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when the allocation
-    /// fails.
+    /// [`Error::InvalidInput`] when the global allocator cannot supply that
+    /// much memory.
     pub fn zeroed(request: AllocationRequest) -> Result<Self> {
         Ok(Self {
             storage: Box::new(OwnedStorage::zeroed(request.bytes)?),
@@ -337,9 +373,9 @@ impl AllocationBuffer {
     ///
     /// # Errors
     ///
-    /// Returns the memory with [`Error::InvalidFrame`](crate::Error::InvalidFrame)
-    /// when it is smaller than the request's minimum, larger than its capacity
-    /// limit, or not aligned to 64 bytes, so that a pool gets its buffer back.
+    /// Returns the memory with [`Error::InvalidInput`] when it is smaller than
+    /// the request's minimum, larger than its capacity limit, or not aligned
+    /// to 64 bytes, so that a pool gets its buffer back.
     pub fn from_external<S: ExternalAllocation>(
         request: AllocationRequest,
         storage: S,
@@ -355,7 +391,7 @@ impl AllocationBuffer {
             None
         };
         match problem {
-            Some(problem) => Err(Rejected::new(invalid(problem), storage)),
+            Some(problem) => Err(Rejected::new(invalid_input(problem), storage)),
             None => Ok(Self {
                 storage: Box::new(storage),
                 request,
@@ -540,10 +576,10 @@ impl Registry {
         advance(&self.generations, |count| {
             (count < self.limits.max_generations).then_some(count + 1)
         })
-        .ok_or_else(|| invalid("Process allocator generation budget exhausted"))?;
+        .ok_or_else(|| invalid_input("Process allocator generation budget exhausted"))?;
         advance(&self.next, |token| token.checked_add(1)).ok_or_else(|| {
             self.generations.fetch_sub(1, Ordering::AcqRel);
-            invalid("Allocator token space exhausted")
+            invalid_input("Allocator token space exhausted")
         })
     }
 
@@ -613,6 +649,8 @@ impl Registry {
         {
             return None;
         }
+        // At most the capacity, which is at most MAX_ALLOCATION.
+        let stride = i32::try_from(actual.stride).ok()?;
         // Serialize publication against Closing. An admitted policy may have
         // blocked while replacement/destruction began; it must not publish late.
         let phase = lock(&generation.phase);
@@ -626,7 +664,6 @@ impl Registry {
         // The buffer takes the place of the grant that covered it.
         reservation.release(&mut s);
         s.bytes += capacity;
-        let stride = actual.stride;
         s.leases.insert(
             (token, pointer.as_ptr() as usize),
             Lease {
@@ -700,7 +737,7 @@ pub struct AllocatorService {
 }
 
 /// A snapshot of custom allocation across the process.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct AllocatorUsage {
     generations: usize,
     active_generations: usize,
@@ -748,14 +785,14 @@ impl AllocatorService {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) when the limits are
+    /// [`Error::InvalidInput`](crate::Error::InvalidInput) when the limits are
     /// out of range or differ from those of an earlier service.
     pub fn new(runtime: ProcessLifetimeRuntime, limits: AllocatorLimits) -> Result<Self> {
         let limits = limits.validate()?;
         let registry = REGISTRY.get_or_init(|| Registry::new(limits));
         if registry.limits != limits {
-            return Err(invalid(
-                "Allocator limits differ from the existing process allocator service",
+            return Err(crate::Error::InvalidInput(
+                "Allocator limits differ from the existing process allocator service".into(),
             ));
         }
         Ok(Self { runtime })
@@ -837,7 +874,7 @@ impl AllocatedPacketReceiver {
     /// # Errors
     ///
     /// As for [`PacketReceiver::capture`].
-    pub fn capture(&mut self, timeout: std::time::Duration) -> Result<PacketEvent> {
+    pub fn capture(&mut self, timeout: std::time::Duration) -> Result<Option<PacketEvent>> {
         PacketReceiver::capture_from(self.inner.receiver(), timeout)
     }
 
@@ -887,13 +924,13 @@ impl AllocatedPacketReceiver {
     }
 
     /// Switch between the source's program and preview streams; see
-    /// [`Receiver::set_video_quality`].
+    /// [`Receiver::set_stream_tier`].
     ///
     /// # Errors
     ///
-    /// As for [`Receiver::set_video_quality`].
-    pub fn set_video_quality(&mut self, quality: super::VideoQuality) -> Result<bool> {
-        self.inner.receiver_mut().set_video_quality(quality)
+    /// As for [`Receiver::set_stream_tier`].
+    pub fn set_stream_tier(&mut self, tier: StreamTier) -> Result<SettingChange> {
+        self.inner.receiver_mut().set_stream_tier(tier)
     }
 
     /// Choose which streams the source sends; see [`Receiver::set_streams`].
@@ -901,8 +938,17 @@ impl AllocatedPacketReceiver {
     /// # Errors
     ///
     /// As for [`Receiver::set_streams`].
-    pub fn set_streams(&mut self, streams: super::StreamSelection) -> Result<super::StreamChange> {
+    pub fn set_streams(&mut self, streams: MediaTypes) -> Result<SettingChange> {
         self.inner.receiver_mut().set_streams(streams)
+    }
+
+    /// Send metadata upstream, to the source; see [`Receiver::send_metadata`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`Receiver::send_metadata`].
+    pub fn send_metadata(&self, metadata: &MetadataFrame) -> Result<()> {
+        self.inner.receiver().send_metadata(metadata)
     }
 
     /// Return to the SDK's own memory and give the packet receiver back.
@@ -932,23 +978,24 @@ enum Stream {
 /// use std::time::Duration;
 /// use grafton_ndi::{
 ///     advanced::{AllocationBuffer, AllocationRequest, AllocatorLimits, AllocatorService},
-///     Receiver, ReceiverOptions, Source, NDI,
+///     Receiver, ReceiverOptions, Source, Ndi,
 /// };
 ///
 /// # fn main() -> Result<(), grafton_ndi::Error> {
-/// let ndi = NDI::new()?;
-/// # let source = Source::default();
-/// let receiver = Receiver::new(&ndi, &ReceiverOptions::builder(source).build())?;
+/// let ndi = Ndi::new()?;
+/// # let source = Source::new("");
+/// let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source))?;
 /// let service = AllocatorService::new(ndi.process_lifetime(), AllocatorLimits::default())?;
 /// let mut receiver = service.attach(receiver)?;
 ///
 /// // Pad every video line to a multiple of 256 bytes.
 /// receiver.set_video_allocator(|request: AllocationRequest| {
-///     let stride = (request.stride() + 255) / 256 * 256;
+///     let stride = request.stride().next_multiple_of(256);
 ///     AllocationBuffer::zeroed(request.with_stride(stride)?)
 /// })?;
-/// let frame = receiver.receiver().video().capture(Duration::from_secs(1))?;
-/// # let _ = frame;
+/// if let Some(frame) = receiver.receiver().video().capture(Duration::from_secs(1))? {
+///     println!("line stride: {} bytes", frame.line_stride_bytes());
+/// }
 /// # Ok(())
 /// # }
 /// ```
@@ -976,9 +1023,9 @@ impl AllocatedReceiver {
     ///
     /// # Errors
     ///
-    /// Returns the policy with [`Error::InvalidFrame`](crate::Error::InvalidFrame)
-    /// when the process already has [`AllocatorLimits::max_generations`]
-    /// policies. The current allocator then stays in place.
+    /// Returns the policy with [`Error::InvalidInput`] when the process already
+    /// has [`AllocatorLimits::max_generations`] policies. The current
+    /// allocator then stays in place.
     pub fn set_video_allocator<P: ReceiveAllocator>(
         &mut self,
         policy: P,
@@ -1080,73 +1127,80 @@ fn compressed_size(size: i32) -> Result<usize> {
     usize::try_from(size)
         .ok()
         .filter(|size| (1..=MAX_ALLOCATION).contains(size))
-        .ok_or_else(|| invalid("Invalid compressed allocation size"))
+        .ok_or_else(|| invalid_frame("Invalid compressed allocation size"))
+}
+
+/// A dimension of a compressed frame the SDK is about to receive.
+fn compressed_dimension(value: i32) -> Result<u32> {
+    u32::try_from(value)
+        .map_err(|_| invalid_frame(format!("Negative compressed allocation dimension {value}")))
 }
 
 /// The request for the video frame the SDK is about to receive.
 fn video_request(frame: &NDIlib_video_frame_v2_t) -> Result<AllocationRequest> {
-    let fourcc = frame.FourCC;
-    if VideoCodec::from_outer(fourcc).is_some() {
+    let fourcc = FourCc::from_raw(frame.FourCC);
+    if VideoCodec::from_outer(frame.FourCC).is_some() {
         // SAFETY: for a compressed frame the union holds the data size.
-        let size = unsafe { frame.__bindgen_anon_1.data_size_in_bytes };
+        let size = compressed_size(unsafe { frame.__bindgen_anon_1.data_size_in_bytes })?;
         return Ok(AllocationRequest {
-            bytes: compressed_size(size)?,
+            bytes: size,
             stride: size,
             format: AllocationFormat::CompressedVideo(fourcc),
-            width: frame.xres,
-            height: frame.yres,
+            width: compressed_dimension(frame.xres)?,
+            height: compressed_dimension(frame.yres)?,
             capacity_limit: MAX_ALLOCATION,
         });
     }
-    let pixel =
-        PixelFormat::try_from(fourcc).map_err(|_| invalid("Unknown allocator video format"))?;
-    let layout =
-        crate::frames::ValidatedVideoLayout::new_uncompressed(pixel, frame.xres, frame.yres, None)?;
-    let stride = layout.line_stride_raw;
+    let pixel = PixelFormat::try_from(fourcc)
+        .map_err(|_| invalid_frame("Unknown allocator video format"))?;
+    let layout = ValidatedVideoLayout::from_sdk(pixel, frame.xres, frame.yres, 0)?;
     Ok(AllocationRequest {
         bytes: layout.data_len_bytes,
-        stride,
+        stride: layout.line_stride_bytes,
         format: AllocationFormat::Video(pixel),
-        width: frame.xres,
-        height: frame.yres,
+        width: layout.width,
+        height: layout.height,
         capacity_limit: MAX_ALLOCATION,
     })
 }
+
 /// The request for the audio frame the SDK is about to receive.
 fn audio_request(frame: &NDIlib_audio_frame_v3_t) -> Result<AllocationRequest> {
-    let fourcc = frame.FourCC;
-    if fourcc != NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP {
-        if AudioCodec::from_outer(fourcc).is_none() {
-            return Err(invalid("Unknown allocator audio format"));
+    if frame.FourCC != NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP {
+        if AudioCodec::from_outer(frame.FourCC).is_none() {
+            return Err(invalid_frame("Unknown allocator audio format"));
         }
         // SAFETY: for a compressed frame the union holds the data size.
-        let size = unsafe { frame.__bindgen_anon_1.data_size_in_bytes };
+        let size = compressed_size(unsafe { frame.__bindgen_anon_1.data_size_in_bytes })?;
         return Ok(AllocationRequest {
-            bytes: compressed_size(size)?,
+            bytes: size,
             stride: size,
-            format: AllocationFormat::CompressedAudio(fourcc),
-            width: frame.no_samples,
-            height: frame.no_channels,
+            format: AllocationFormat::CompressedAudio(FourCc::from_raw(frame.FourCC)),
+            width: compressed_dimension(frame.no_samples)?,
+            height: compressed_dimension(frame.no_channels)?,
             capacity_limit: MAX_ALLOCATION,
         });
     }
-    if frame.no_samples <= 0 || frame.no_channels <= 0 || frame.sample_rate <= 0 {
-        return Err(invalid("Invalid audio allocation dimensions"));
-    }
-    let stride = frame
-        .no_samples
-        .checked_mul(4)
-        .ok_or_else(|| invalid("Audio allocator stride overflow"))?;
-    let bytes = (stride as usize)
-        .checked_mul(frame.no_channels as usize)
+    let (Some(samples), Some(channels), Some(_)) = (
+        sdk_quantity(frame.no_samples),
+        sdk_quantity(frame.no_channels),
+        sdk_quantity(frame.sample_rate),
+    ) else {
+        return Err(invalid_frame("Invalid audio allocation dimensions"));
+    };
+    let stride = (samples as usize)
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| invalid_frame("Audio allocator stride overflow"))?;
+    let bytes = stride
+        .checked_mul(channels as usize)
         .filter(|n| *n <= MAX_ALLOCATION)
-        .ok_or_else(|| invalid("Audio allocator extent overflow"))?;
+        .ok_or_else(|| invalid_frame("Audio allocator extent overflow"))?;
     Ok(AllocationRequest {
         bytes,
         stride,
         format: AllocationFormat::AudioPlanarF32,
-        width: frame.no_samples,
-        height: frame.no_channels,
+        width: samples,
+        height: channels,
         capacity_limit: MAX_ALLOCATION,
     })
 }
@@ -1235,7 +1289,7 @@ mod tests {
     use super::*;
     #[test]
     fn native_allocation_formats_preserve_protection_and_decoded_formats() {
-        use crate::advanced::{packets::PROTECTED, StreamTier};
+        use crate::advanced::packets::PROTECTED;
         let protected_video = VideoCodec::H264.outer(StreamTier::Program, true);
         let mut video = NDIlib_video_frame_v2_t {
             FourCC: protected_video,
@@ -1244,17 +1298,28 @@ mod tests {
             ..Default::default()
         };
         video.__bindgen_anon_1.data_size_in_bytes = 64;
+        let request = video_request(&video).unwrap();
         assert_eq!(
-            video_request(&video).unwrap().format(),
-            AllocationFormat::CompressedVideo(protected_video)
+            request.format(),
+            AllocationFormat::CompressedVideo(FourCc::from_raw(protected_video))
         );
+        assert_eq!(
+            (request.width(), request.height(), request.stride()),
+            (16, 16, 64)
+        );
+        video.xres = -16;
+        assert!(matches!(video_request(&video), Err(Error::InvalidFrame(_))));
+        video.xres = 16;
         video.__bindgen_anon_1.data_size_in_bytes = 0;
         assert!(video_request(&video).is_err());
-        video.FourCC = PixelFormat::BGRA.into();
+        video.FourCC = crate::FourCc::from(PixelFormat::Bgra).raw();
+        let request = video_request(&video).unwrap();
+        assert_eq!(request.format(), AllocationFormat::Video(PixelFormat::Bgra));
         assert_eq!(
-            video_request(&video).unwrap().format(),
-            AllocationFormat::Video(PixelFormat::BGRA)
+            (request.width(), request.height(), request.stride()),
+            (16, 16, 64)
         );
+        assert_eq!(request.minimum_bytes(), 16 * 64);
         video.FourCC = u32::MAX;
         assert!(video_request(&video).is_err());
         for codec in [AudioCodec::Aac, AudioCodec::Opus] {
@@ -1267,7 +1332,7 @@ mod tests {
                 audio.__bindgen_anon_1.data_size_in_bytes = 64;
                 assert_eq!(
                     audio_request(&audio).unwrap().format(),
-                    AllocationFormat::CompressedAudio(bits)
+                    AllocationFormat::CompressedAudio(FourCc::from_raw(bits))
                 );
                 audio.FourCC = bits ^ PROTECTED ^ 1;
                 assert!(audio_request(&audio).is_err());
@@ -1290,9 +1355,9 @@ mod tests {
     fn request_of(bytes: usize) -> AllocationRequest {
         AllocationRequest {
             bytes,
-            stride: (bytes / 2) as i32,
+            stride: bytes / 2,
             format: AllocationFormat::AudioPlanarF32,
-            width: (bytes / 8) as i32,
+            width: (bytes / 8) as u32,
             height: 2,
             capacity_limit: MAX_ALLOCATION,
         }
@@ -1362,7 +1427,7 @@ mod tests {
         );
 
         let reason = |limits: AllocatorLimits| match limits.validate() {
-            Err(crate::Error::InvalidFrame(reason)) => reason,
+            Err(crate::Error::InvalidInput(reason)) => reason,
             other => panic!("expected the limits to be refused, got {other:?}"),
         };
         for zero in [
@@ -1573,7 +1638,9 @@ mod tests {
 
         // The generation budget is exhausted.
         let rejected = registry.register(Tagged(3)).unwrap_err();
-        assert!(rejected.error().to_string().contains("generation budget"));
+        assert!(
+            matches!(rejected.error(), Error::InvalidInput(reason) if reason.contains("generation budget"))
+        );
         assert_eq!(rejected.into_inner().0, 3);
         assert_eq!(registry.generations.load(Ordering::Acquire), 2);
         assert_eq!(lock(&registry.state).active.len(), 2);
@@ -1619,7 +1686,9 @@ mod tests {
             let rejected = AllocationBuffer::from_external(request, storage)
                 .err()
                 .expect("the storage does not fit the request");
-            assert!(rejected.error().to_string().contains(problem));
+            assert!(
+                matches!(rejected.error(), Error::InvalidInput(reason) if reason.contains(problem))
+            );
             assert_eq!(rejected.into_inner().pointer(), address);
         };
         refused(OwnedStorage::zeroed(32).unwrap(), "smaller");
@@ -1637,6 +1706,46 @@ mod tests {
             AllocationBuffer::from_external(request, OwnedStorage::zeroed(128).unwrap()).unwrap();
         assert_eq!(buffer.capacity(), 128);
         assert!(OwnedStorage::zeroed(0).is_err());
+    }
+
+    #[test]
+    fn strides_a_request_cannot_use_are_refused_as_input() {
+        let input = |result: Result<AllocationRequest>| match result {
+            Err(Error::InvalidInput(reason)) => reason,
+            other => panic!("expected invalid input, got {other:?}"),
+        };
+        let planar = video_request(&NDIlib_video_frame_v2_t {
+            FourCC: FourCc::from(PixelFormat::I420).raw(),
+            xres: 16,
+            yres: 16,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(planar.stride(), 16);
+        let padded = planar.with_stride(32).unwrap();
+        assert_eq!(
+            (padded.stride(), padded.minimum_bytes()),
+            (32, 32 * 16 * 3 / 2)
+        );
+        assert!(input(planar.with_stride(15)).contains("smaller"));
+        assert!(input(planar.with_stride(17)).contains("even"));
+
+        let audio = request();
+        assert!(input(audio.with_stride(34)).contains("whole number"));
+        let limited = AllocationRequest {
+            capacity_limit: 64,
+            ..audio
+        };
+        assert!(input(limited.with_stride(36)).contains("capacity limit"));
+
+        let compressed = AllocationRequest {
+            format: AllocationFormat::CompressedAudio(FourCc::from_raw(
+                AudioCodec::Opus.outer(false),
+            )),
+            ..audio
+        };
+        assert_eq!(compressed.with_stride(32).unwrap(), compressed);
+        assert!(input(compressed.with_stride(36)).contains("Compressed"));
     }
 
     #[test]

@@ -11,12 +11,12 @@ use crate::{
     finder::Source,
     frames::{
         AudioFrame, MetadataFrame, PixelFormat, ScanType, ValidatedFrameMetadata,
-        ValidatedVideoLayout, VideoFrame,
+        ValidatedVideoLayout, VideoFrame, VideoHeader,
     },
     receiver::Tally,
     sys::{self, bindings::*},
     timeout::Deadline,
-    to_ms_checked, Error, Result, NDI,
+    to_ms_checked, Error, FrameRate, Ndi, Rejected, Result, Timecode,
 };
 
 #[cfg(not(target_has_atomic = "ptr"))]
@@ -66,7 +66,7 @@ pub(crate) struct SenderResource {
     _groups: Option<CString>,
     #[cfg(feature = "advanced")]
     _config: Option<crate::advanced::AdvancedConfig>,
-    _ndi: NDI,
+    _ndi: Ndi,
 }
 
 // SAFETY: Same documented native ownership/transfer contract as Sender. Tokens
@@ -91,7 +91,7 @@ impl Drop for SenderResource {
 #[derive(Debug)]
 pub struct Sender {
     inner: Inner,
-    _ndi: NDI,
+    _ndi: Ndi,
 }
 
 type AsyncCallback = Box<dyn Fn(usize) + Send + Sync>;
@@ -191,85 +191,65 @@ unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
 /// A borrowed video frame that references external pixel data.
+///
 /// [`Sender::send_video_async_copy`] copies its pixels and metadata into an
 /// owned frame; source buffers can be reused immediately after submission.
 ///
-/// Fields are private to enforce safety invariants. Use
-/// [`Self::try_from_uncompressed`] for packed pixels, or [`Self::builder`] for
-/// explicit stride, metadata, and header options. Construction borrows without
+/// Create one with [`Self::builder`]. Construction borrows without
 /// allocation and validates the entire supported uncompressed layout once.
+/// Copying it copies only the borrows.
+#[derive(Clone, Copy)]
 pub struct BorrowedVideoFrame<'buf> {
     layout: ValidatedVideoLayout,
-    frame_rate_n: i32,
-    frame_rate_d: i32,
-    picture_aspect_ratio: f32,
-    scan_type: ScanType,
-    timecode: i64,
+    header: VideoHeader,
+    /// Exactly the validated storage extent.
     data: &'buf [u8],
     metadata: Option<&'buf CStr>,
     metadata_layout: ValidatedFrameMetadata,
-    timestamp: i64,
-    runtime_proof: Option<NDI>,
+}
+
+impl fmt::Debug for BorrowedVideoFrame<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BorrowedVideoFrame")
+            .field("width", &self.width())
+            .field("height", &self.height())
+            .field("pixel_format", &self.pixel_format())
+            .field("frame_rate", &self.frame_rate())
+            .field("picture_aspect_ratio", &self.picture_aspect_ratio())
+            .field("scan_type", &self.scan_type())
+            .field("timecode", &self.timecode())
+            .field("data (bytes)", &self.data.len())
+            .field("line_stride_bytes", &self.line_stride_bytes())
+            .field("metadata", &self.metadata())
+            .finish()
+    }
 }
 
 impl<'buf> BorrowedVideoFrame<'buf> {
-    /// Create a borrowed video frame from an uncompressed pixel buffer.
+    /// Configure a checked borrowed frame over `data`.
     ///
-    /// This constructor validates that the buffer is large enough for the specified
-    /// dimensions and pixel format, returning an error if validation fails.
-    /// Width must be positive and even for every pixel format. Height must be
-    /// positive, and must also be even for 4:2:0 formats.
-    ///
-    /// # Arguments
-    ///
-    /// * `data` - Borrowed slice containing pixel data
-    /// * `width` - Frame width in pixels
-    /// * `height` - Frame height in pixels
-    /// * `pixel_format` - Uncompressed pixel format (BGRA, UYVY, etc.)
-    /// * `frame_rate_n` - Frame rate numerator (e.g., 60 for 60fps, 30000 for 29.97fps)
-    /// * `frame_rate_d` - Frame rate denominator (e.g., 1 for 60fps, 1001 for 29.97fps)
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::InvalidFrame` if the buffer is too small for the specified format.
+    /// Its defaults are the packed line stride, 30/1 frames per second, a
+    /// 16:9 picture aspect ratio, progressive scan, [`Timecode::SYNTHESIZE`]
+    /// and no metadata. All validation occurs in
+    /// [`BorrowedVideoFrameBuilder::build`].
     ///
     /// # Example
     ///
-    /// ```no_run
-    /// # use grafton_ndi::{BorrowedVideoFrame, PixelFormat};
+    /// ```
+    /// # use grafton_ndi::{BorrowedVideoFrame, FrameRate, PixelFormat};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let buffer = vec![0u8; 1920 * 1080 * 4]; // BGRA buffer
-    /// let frame = BorrowedVideoFrame::try_from_uncompressed(
-    ///     &buffer,
-    ///     1920,
-    ///     1080,
-    ///     PixelFormat::BGRA,
-    ///     30,
-    ///     1
-    /// )?;
+    /// let frame = BorrowedVideoFrame::builder(&buffer, 1920, 1080, PixelFormat::Bgra)
+    ///     .frame_rate(FrameRate::new(30_000, 1_001)?)
+    ///     .build()?;
+    /// assert_eq!(frame.line_stride_bytes(), 1920 * 4);
     /// # Ok(())
     /// # }
     /// ```
-    pub fn try_from_uncompressed(
-        data: &'buf [u8],
-        width: i32,
-        height: i32,
-        pixel_format: PixelFormat,
-        frame_rate_n: i32,
-        frame_rate_d: i32,
-    ) -> Result<Self> {
-        Self::builder(data, width, height, pixel_format)
-            .frame_rate(frame_rate_n, frame_rate_d)
-            .build()
-    }
-
-    /// Configure a checked borrowed frame, including padded first-plane stride.
-    /// Defaults match `try_from_uncompressed`, with a frame rate of 30/1.
-    /// All validation occurs in [`BorrowedVideoFrameBuilder::build`].
     pub fn builder(
         data: &'buf [u8],
-        width: i32,
-        height: i32,
+        width: u32,
+        height: u32,
         pixel_format: PixelFormat,
     ) -> BorrowedVideoFrameBuilder<'buf> {
         BorrowedVideoFrameBuilder {
@@ -278,13 +258,11 @@ impl<'buf> BorrowedVideoFrame<'buf> {
             height,
             pixel_format,
             line_stride: None,
-            frame_rate_n: 30,
-            frame_rate_d: 1,
+            frame_rate: const { FrameRate::per_second(30) },
             picture_aspect_ratio: 16.0 / 9.0,
             scan_type: ScanType::Progressive,
-            timecode: NDIlib_send_timecode_synthesize,
+            timecode: Timecode::SYNTHESIZE,
             metadata: None,
-            timestamp: 0,
         }
     }
 
@@ -293,26 +271,31 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// Active pixels are copied into tightly packed planes; row padding is
     /// skipped and the owned stride can shrink. Metadata is copied separately;
     /// no reference to the source is retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidFrame`] if the packed copy is not a valid
+    /// frame.
     pub fn try_to_owned(&self) -> Result<VideoFrame> {
         // SAFETY: The immutable slices retain initialized pixels and bounded UTF-8
         // metadata for these cached proofs throughout the active-row copy.
         unsafe {
-            VideoFrame::from_raw_validated_for(
+            VideoFrame::from_raw_validated(
                 &self.to_raw(),
                 self.layout,
+                self.header,
                 self.metadata_layout,
-                self.runtime_proof.as_ref(),
             )
         }
     }
 
     /// Get the frame width in pixels.
-    pub fn width(&self) -> i32 {
+    pub fn width(&self) -> u32 {
         self.layout.width
     }
 
     /// Get the frame height in pixels.
-    pub fn height(&self) -> i32 {
+    pub fn height(&self) -> u32 {
         self.layout.height
     }
 
@@ -321,37 +304,30 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         self.layout.pixel_format
     }
 
-    /// Get the raw SDK FourCC value.
-    pub fn fourcc(&self) -> u32 {
-        self.layout.pixel_format.into()
+    /// Get the frame rate.
+    pub fn frame_rate(&self) -> FrameRate {
+        self.header.frame_rate
     }
 
-    /// Get the frame rate numerator.
-    pub fn frame_rate_n(&self) -> i32 {
-        self.frame_rate_n
-    }
-
-    /// Get the frame rate denominator.
-    pub fn frame_rate_d(&self) -> i32 {
-        self.frame_rate_d
-    }
-
-    /// Get the picture aspect ratio.
+    /// Get the picture aspect ratio, width over height as displayed; `0.0`
+    /// means square pixels.
     pub fn picture_aspect_ratio(&self) -> f32 {
-        self.picture_aspect_ratio
+        self.header.picture_aspect_ratio
     }
 
     /// Get the scan type.
     pub fn scan_type(&self) -> ScanType {
-        self.scan_type
+        self.header.scan_type
     }
 
     /// Get the timecode.
-    pub fn timecode(&self) -> i64 {
-        self.timecode
+    pub fn timecode(&self) -> Timecode {
+        self.header.timecode
     }
 
-    /// Get a reference to the pixel data.
+    /// Get the pixel data: exactly the frame's validated storage, including
+    /// any row padding. Bytes of the source buffer beyond the frame are not
+    /// part of it.
     pub fn data(&self) -> &[u8] {
         self.data
     }
@@ -361,113 +337,76 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         self.layout.line_stride_bytes
     }
 
-    /// Complete validated storage extent, including row padding.
-    pub fn validated_data_len(&self) -> usize {
-        self.layout.data_len_bytes
-    }
-
     /// Get cached UTF-8 metadata text, preserving absent versus present-empty.
     pub fn metadata(&self) -> Option<&str> {
         // SAFETY: Construction validates UTF-8 and retains the same immutable CStr.
         unsafe {
             crate::frames::frame_metadata_str(
-                self.metadata.map_or(ptr::null(), |m| m.as_ptr()),
+                self.metadata.map_or(ptr::null(), CStr::as_ptr),
                 self.metadata_layout,
             )
         }
     }
 
-    /// Get the timestamp.
-    pub fn timestamp(&self) -> i64 {
-        self.timestamp
-    }
-
-    /// Set the timecode, in 100 ns units.
-    ///
-    /// [`try_from_uncompressed`](Self::try_from_uncompressed) leaves it at
-    /// `NDIlib_send_timecode_synthesize`, which asks the SDK to make one up.
+    /// Return this frame with `timecode`.
     ///
     /// # Example
     ///
-    /// ```no_run
-    /// # use grafton_ndi::{BorrowedVideoFrame, PixelFormat};
+    /// ```
+    /// # use grafton_ndi::{BorrowedVideoFrame, PixelFormat, Timecode};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
     /// let buffer = vec![0u8; 1920 * 1080 * 2];
-    /// let frame = BorrowedVideoFrame::try_from_uncompressed(
-    ///     &buffer, 1920, 1080, PixelFormat::UYVY, 25, 1,
-    /// )?
-    /// .with_timecode(10_000_000);
-    /// assert_eq!(frame.timecode(), 10_000_000);
+    /// let frame = BorrowedVideoFrame::builder(&buffer, 1920, 1080, PixelFormat::Uyvy)
+    ///     .build()?
+    ///     .with_timecode(Timecode::from_ticks(10_000_000));
+    /// assert_eq!(frame.timecode().ticks(), 10_000_000);
     /// # Ok(())
     /// # }
     /// ```
     #[must_use]
-    pub fn with_timecode(mut self, timecode: i64) -> Self {
-        self.timecode = timecode;
+    pub fn with_timecode(mut self, timecode: Timecode) -> Self {
+        self.header.timecode = timecode;
         self
     }
 
-    /// Set the picture aspect ratio, width over height as displayed; `0.0`
-    /// means square pixels, whatever the resolution.
-    ///
-    /// [`try_from_uncompressed`](Self::try_from_uncompressed) assumes 16:9.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidFrame`] if `ratio` is negative or not finite.
-    pub fn with_picture_aspect_ratio(mut self, ratio: f32) -> Result<Self> {
-        crate::frames::validate_video_frame_metadata(self.frame_rate_n, self.frame_rate_d, ratio)?;
-        self.picture_aspect_ratio = ratio;
-        Ok(self)
-    }
-
-    fn to_raw(&self) -> NDIlib_video_frame_v2_t {
-        // Validation is now performed at construction time, so no runtime checks needed here
-        NDIlib_video_frame_v2_t {
-            xres: self.layout.width,
-            yres: self.layout.height,
-            FourCC: self.layout.pixel_format.into(),
-            frame_rate_N: self.frame_rate_n,
-            frame_rate_D: self.frame_rate_d,
-            picture_aspect_ratio: self.picture_aspect_ratio,
-            frame_format_type: self.scan_type.into(),
-            timecode: self.timecode,
-            p_data: self.data.as_ptr() as *mut u8,
-            __bindgen_anon_1: self.layout.raw_line_stride(),
-            p_metadata: self.metadata.map_or(ptr::null(), |m| m.as_ptr()),
-            timestamp: self.timestamp,
-        }
+    fn to_raw(self) -> NDIlib_video_frame_v2_t {
+        crate::frames::sdk_video_frame(
+            &self.layout,
+            &self.header,
+            self.data.as_ptr(),
+            self.metadata.map_or(ptr::null(), CStr::as_ptr),
+            None,
+        )
     }
 }
 
-/// Builder for a borrowed uncompressed video frame. No pixels or metadata are copied.
+/// Builder for a [`BorrowedVideoFrame`], reached through
+/// [`BorrowedVideoFrame::builder`]. No pixels or metadata are copied.
+#[derive(Clone, Copy)]
 pub struct BorrowedVideoFrameBuilder<'buf> {
     data: &'buf [u8],
-    width: i32,
-    height: i32,
+    width: u32,
+    height: u32,
     pixel_format: PixelFormat,
-    line_stride: Option<i32>,
-    frame_rate_n: i32,
-    frame_rate_d: i32,
+    line_stride: Option<usize>,
+    frame_rate: FrameRate,
     picture_aspect_ratio: f32,
     scan_type: ScanType,
-    timecode: i64,
+    timecode: Timecode,
     metadata: Option<&'buf CStr>,
-    timestamp: i64,
 }
 
 impl<'buf> BorrowedVideoFrameBuilder<'buf> {
-    /// Set first-plane stride in bytes. Zero selects the packed stride.
+    /// Set the first-plane stride in bytes. Zero selects the packed stride.
     #[must_use]
-    pub fn line_stride(mut self, stride: i32) -> Self {
+    pub fn line_stride(mut self, stride: usize) -> Self {
         self.line_stride = Some(stride);
         self
     }
-    /// Set the positive frame-rate numerator and denominator.
+    /// Set the frame rate.
     #[must_use]
-    pub fn frame_rate(mut self, numerator: i32, denominator: i32) -> Self {
-        self.frame_rate_n = numerator;
-        self.frame_rate_d = denominator;
+    pub fn frame_rate(mut self, frame_rate: FrameRate) -> Self {
+        self.frame_rate = frame_rate;
         self
     }
     /// Set a finite nonnegative aspect ratio; zero selects square pixels.
@@ -482,9 +421,9 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
         self.scan_type = scan_type;
         self
     }
-    /// Set the timecode in 100 ns units, including literal zero.
+    /// Set the timecode.
     #[must_use]
-    pub fn timecode(mut self, timecode: i64) -> Self {
+    pub fn timecode(mut self, timecode: Timecode) -> Self {
         self.timecode = timecode;
         self
     }
@@ -494,80 +433,58 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
         self.metadata = Some(metadata);
         self
     }
-    /// Set the SDK timestamp, including literal zero.
-    #[must_use]
-    pub fn timestamp(mut self, timestamp: i64) -> Self {
-        self.timestamp = timestamp;
-        self
-    }
 
     /// Validate dimensions, stride, initialized slice extent, headers, and metadata.
-    /// Successful construction allocates nothing. Invalid layout/header values or
-    /// metadata exceeding the 4 MiB cap return [`Error::InvalidFrame`]; invalid
-    /// metadata UTF-8 returns [`Error::InvalidUtf8`]. The input slices remain borrowed.
+    ///
+    /// Successful construction allocates nothing and never loads or queries
+    /// an NDI runtime: whether the runtime can send the pixel format is
+    /// checked when the frame is sent. The input slices remain borrowed.
+    ///
+    /// # Errors
+    ///
+    /// Invalid layout/header values, a buffer smaller than the layout, or
+    /// metadata exceeding the 4 MiB cap return [`Error::InvalidFrame`];
+    /// invalid metadata UTF-8 returns [`Error::InvalidUtf8`].
     pub fn build(self) -> Result<BorrowedVideoFrame<'buf>> {
-        self.build_with_runtime(None)
-    }
-
-    /// Validate a frame against the selected runtime, retaining a runtime lease
-    /// for formats that require it. Existing formats retain their pure construction path.
-    pub fn build_for(self, ndi: &NDI) -> Result<BorrowedVideoFrame<'buf>> {
-        self.build_with_runtime(Some(ndi))
-    }
-
-    fn build_with_runtime(self, ndi: Option<&NDI>) -> Result<BorrowedVideoFrame<'buf>> {
-        let runtime_proof = crate::frames::validate_video_format_runtime(self.pixel_format, ndi)?;
-        crate::frames::validate_video_frame_metadata(
-            self.frame_rate_n,
-            self.frame_rate_d,
-            self.picture_aspect_ratio,
-        )?;
+        crate::frames::validate_picture_aspect_ratio(self.picture_aspect_ratio)?;
         let layout = ValidatedVideoLayout::new_uncompressed(
             self.pixel_format,
             self.width,
             self.height,
             self.line_stride,
         )?;
-        if self.data.len() < layout.data_len_bytes {
+        let Some(data) = self.data.get(..layout.data_len_bytes) else {
             return Err(Error::InvalidFrame(format!(
                 "Buffer too small for {:?}: got {} bytes, expected at least {}",
                 self.pixel_format,
                 self.data.len(),
                 layout.data_len_bytes,
             )));
-        }
+        };
         let metadata_layout = ValidatedFrameMetadata::from_cstr(self.metadata)?;
         Ok(BorrowedVideoFrame {
             layout,
-            data: self.data,
-            frame_rate_n: self.frame_rate_n,
-            frame_rate_d: self.frame_rate_d,
-            picture_aspect_ratio: self.picture_aspect_ratio,
-            scan_type: self.scan_type,
-            timecode: self.timecode,
+            header: VideoHeader {
+                frame_rate: self.frame_rate,
+                picture_aspect_ratio: self.picture_aspect_ratio,
+                scan_type: self.scan_type,
+                timecode: self.timecode,
+            },
+            data,
             metadata: self.metadata,
             metadata_layout,
-            timestamp: self.timestamp,
-            runtime_proof,
         })
     }
 }
 
 impl<'buf> From<&'buf VideoFrame> for BorrowedVideoFrame<'buf> {
     fn from(frame: &'buf VideoFrame) -> Self {
-        let layout = frame.validated_layout();
         BorrowedVideoFrame {
-            frame_rate_n: frame.frame_rate_n(),
-            frame_rate_d: frame.frame_rate_d(),
-            picture_aspect_ratio: frame.picture_aspect_ratio(),
-            scan_type: frame.scan_type(),
-            timecode: frame.timecode(),
+            layout: frame.validated_layout(),
+            header: frame.header(),
             data: frame.data(),
-            layout,
             metadata: frame.metadata_cstr(),
             metadata_layout: frame.validated_metadata(),
-            timestamp: frame.timestamp(),
-            runtime_proof: frame.runtime_proof().cloned(),
         }
     }
 }
@@ -577,17 +494,21 @@ impl Sender {
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The sender name contains a null byte
-    /// - The groups string contains a null byte
-    /// - NDI fails to create the send instance
-    pub fn new(ndi: &NDI, create_settings: &SenderOptions) -> Result<Self> {
+    /// Returns [`Error::InvalidCString`] when the name or groups contain a
+    /// NUL byte, [`Error::UnsupportedCapability`] when the options carry an
+    /// Advanced configuration that the runtime or this build cannot take, and
+    /// [`Error::NativeOperationFailed`] when the SDK creates no sender.
+    pub fn new(ndi: &Ndi, options: &SenderOptions) -> Result<Self> {
+        #[cfg(feature = "advanced")]
+        if let Some(config) = &options.config {
+            return Self::new_configured(ndi, options, config);
+        }
         // SAFETY: the SDK's sender creation returns null or a fresh sender
         // that nothing else owns, and the settings outlive the call.
         unsafe {
             Self::create(
                 ndi,
-                create_settings,
+                options,
                 "NDIlib_send_create",
                 #[cfg(feature = "advanced")]
                 None,
@@ -606,7 +527,7 @@ impl Sender {
     /// `create` returns null or a live sender of `ndi`'s runtime, made from
     /// the settings it was handed, that nothing else owns.
     pub(crate) unsafe fn create(
-        ndi: &NDI,
+        ndi: &Ndi,
         options: &SenderOptions,
         operation: &'static str,
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
@@ -670,7 +591,7 @@ impl Sender {
         ) == 1
     }
 
-    pub(crate) fn runtime(&self) -> &NDI {
+    pub(crate) fn runtime(&self) -> &Ndi {
         &self._ndi
     }
 
@@ -728,11 +649,25 @@ impl Sender {
         }
     }
 
+    /// Check that this sender's runtime can send `pixel_format`: the one
+    /// check every video send makes before anything reaches the SDK.
+    pub(crate) fn require_video_format(&self, pixel_format: PixelFormat) -> Result<()> {
+        pixel_format.require_sendable(&self._ndi)
+    }
+
     /// Send a video frame synchronously.
     ///
     /// The SDK has released the input buffer when this returns; the caller may
     /// then reuse or release it. This also completes a previous async video send.
-    pub fn send_video(&self, video_frame: &VideoFrame) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedCapability`] if this sender's runtime
+    /// cannot send the frame's pixel format (the planar 4:4:4 formats need
+    /// [`RuntimeFeature::Planar444Video`](crate::RuntimeFeature::Planar444Video)).
+    /// Nothing is sent and no pending send is changed.
+    pub fn send_video(&self, video_frame: &VideoFrame) -> Result<()> {
+        self.require_video_format(video_frame.pixel_format())?;
         let len = {
             let mut video = self.inner.video.lock().unwrap_or_else(|e| e.into_inner());
             // A synchronous video send also releases the previous async frame.
@@ -746,6 +681,7 @@ impl Sender {
             video.completed()
         };
         self.inner.notify(len);
+        Ok(())
     }
 
     /// Submit an owned frame without copying its pixel or metadata allocations.
@@ -760,7 +696,26 @@ impl Sender {
     /// No SDK completion callback is registered, including with Advanced SDK.
     /// If a Rust completion handler panics, the new frame remains retained and
     /// the synchronized previous frame is dropped rather than returned.
-    pub fn send_video_async(&mut self, frame: VideoFrame) -> Option<VideoFrame> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the frame, unsent, with [`Error::UnsupportedCapability`] if
+    /// this sender's runtime cannot send its pixel format (the planar 4:4:4
+    /// formats need
+    /// [`RuntimeFeature::Planar444Video`](crate::RuntimeFeature::Planar444Video)).
+    /// No pending send is changed.
+    pub fn send_video_async(
+        &mut self,
+        frame: VideoFrame,
+    ) -> std::result::Result<Option<VideoFrame>, Rejected<VideoFrame>> {
+        if let Err(error) = self.require_video_format(frame.pixel_format()) {
+            return Err(Rejected::new(error, frame));
+        }
+        Ok(self.submit_video_async(frame))
+    }
+
+    /// Hand a checked frame to the SDK and return the previous one, if any.
+    fn submit_video_async(&mut self, frame: VideoFrame) -> Option<VideoFrame> {
         let raw = frame.to_raw();
         let (previous, len) = {
             let mut video = self.inner.video.lock().unwrap_or_else(|e| e.into_inner());
@@ -812,14 +767,17 @@ impl Sender {
     ///
     /// # Errors
     ///
-    /// Returns an error if the borrowed frame cannot be represented as a supported
-    /// owned video layout. No pending send is changed when validation fails.
+    /// Returns [`Error::UnsupportedCapability`] if this sender's runtime
+    /// cannot send the frame's pixel format, checked before anything is
+    /// copied, or an error if the borrowed frame cannot be represented as a
+    /// supported owned video layout. No pending send is changed on failure.
     pub fn send_video_async_copy(
         &mut self,
         frame: &BorrowedVideoFrame<'_>,
     ) -> Result<Option<VideoFrame>> {
+        self.require_video_format(frame.pixel_format())?;
         let owned = frame.try_to_owned()?;
-        Ok(self.send_video_async(owned))
+        Ok(self.submit_video_async(owned))
     }
 
     /// Sends an audio frame synchronously.
@@ -832,18 +790,18 @@ impl Sender {
     /// # Example
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, SenderOptions, AudioFrame};
+    /// # use grafton_ndi::{Ndi, SenderOptions, AudioFrame};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let options = SenderOptions::builder("Test").build();
+    /// # let ndi = Ndi::new()?;
+    /// # let options = SenderOptions::new("Test");
     /// # let sender = grafton_ndi::Sender::new(&ndi, &options)?;
     /// let mut audio_buffer = vec![0.0f32; 48000 * 2]; // 1 second of stereo audio
     ///
     /// // Fill buffer with audio data...
     /// let frame = AudioFrame::builder()
     ///     .sample_rate(48000)
-    ///     .channels(2)
-    ///     .samples(48000)
+    ///     .num_channels(2)
+    ///     .num_samples(48000)
     ///     .data(audio_buffer.clone())
     ///     .build()?;
     /// sender.send_audio(&frame);
@@ -852,8 +810,8 @@ impl Sender {
     /// audio_buffer.fill(0.5);
     /// let frame2 = AudioFrame::builder()
     ///     .sample_rate(48000)
-    ///     .channels(2)
-    ///     .samples(48000)
+    ///     .num_channels(2)
+    ///     .num_samples(48000)
     ///     .data(audio_buffer)
     ///     .build()?;
     /// sender.send_audio(&frame2);
@@ -897,21 +855,21 @@ impl Sender {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    /// Returns [`Error::InvalidInput`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, SenderOptions};
+    /// # use grafton_ndi::{Ndi, SenderOptions};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = NDI::new()?;
-    /// let options = SenderOptions::builder("Test Sender").build();
+    /// let ndi = Ndi::new()?;
+    /// let options = SenderOptions::new("Test Sender");
     /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
     ///
     /// // Try to get tally with 1 second timeout
     /// if let Some(tally) = sender.tally(Duration::from_secs(1))? {
-    ///     println!("On program: {}, On preview: {}", tally.on_program, tally.on_preview);
+    ///     println!("On program: {}, On preview: {}", tally.on_program(), tally.on_preview());
     /// } else {
     ///     println!("Tally request timed out");
     /// }
@@ -920,7 +878,7 @@ impl Sender {
     /// ```
     pub fn tally(&self, timeout: Duration) -> Result<Option<Tally>> {
         let timeout_ms = to_ms_checked(timeout)?;
-        let mut raw_tally = Tally::new(false, false).to_raw();
+        let mut raw_tally = Tally::default().to_sdk();
         // SAFETY: the sender instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
         let success = unsafe {
@@ -930,10 +888,7 @@ impl Sender {
         };
 
         if success {
-            Ok(Some(Tally {
-                on_program: raw_tally.on_program,
-                on_preview: raw_tally.on_preview,
-            }))
+            Ok(Some(Tally::new(raw_tally.on_program, raw_tally.on_preview)))
         } else {
             Ok(None)
         }
@@ -952,17 +907,17 @@ impl Sender {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NativeOperationFailed`] if the SDK returns a negative connection count.
-    /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    /// Returns [`Error::UnexpectedSdkResult`] if the SDK returns a negative connection count.
+    /// Returns [`Error::InvalidInput`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, SenderOptions};
+    /// # use grafton_ndi::{Ndi, SenderOptions};
     /// # use std::time::Duration;
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = NDI::new()?;
-    /// let options = SenderOptions::builder("Test Sender").build();
+    /// let ndi = Ndi::new()?;
+    /// let options = SenderOptions::new("Test Sender");
     /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
     ///
     /// // Get connection count with 1 second timeout
@@ -981,13 +936,11 @@ impl Sender {
                 .NDIlib_send_get_no_connections(self.inner.instance, timeout_ms)
         };
 
-        if count < 0 {
-            Err(Error::NativeOperationFailed {
-                operation: "NDIlib_send_get_no_connections",
-            })
-        } else {
-            Ok(count as u32)
-        }
+        u32::try_from(count).map_err(|_| {
+            Error::UnexpectedSdkResult(format!(
+                "NDIlib_send_get_no_connections returned a negative count: {count}"
+            ))
+        })
     }
 
     /// Remove all metadata registered for delivery to each new connection.
@@ -1047,16 +1000,16 @@ impl Sender {
     ///
     /// # Errors
     ///
-    /// Returns `Error::NullPointer` if the NDI SDK returns a null pointer or
-    /// if the source data contains null pointers.
+    /// Returns [`Error::NativeOperationFailed`] when the SDK supplies no
+    /// descriptor, or one that names neither a source nor an address.
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, SenderOptions};
+    /// # use grafton_ndi::{Ndi, SenderOptions};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = NDI::new()?;
-    /// let options = SenderOptions::builder("Test Sender").build();
+    /// let ndi = Ndi::new()?;
+    /// let options = SenderOptions::new("Test Sender");
     /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
     /// let source = sender.source()?;
     /// println!("Sender source: {source}");
@@ -1073,7 +1026,7 @@ impl Sender {
         };
         // SAFETY: the SDK sender owns this live descriptor and its strings
         // through the synchronous copy performed here.
-        unsafe { Source::try_from_raw(source_ptr) }
+        unsafe { Source::try_from_raw(source_ptr, "NDIlib_send_get_source_name") }
     }
 
     /// Replace the completion handler receiving the submitted pixel-buffer length.
@@ -1164,105 +1117,92 @@ unsafe impl Sync for Sender {}
 
 /// Configuration for creating a [`Sender`].
 ///
-/// Build one with [`SenderOptions::builder`].
+/// The defaults pace video and audio submissions to their frame and sample
+/// rates, in the groups of the NDI configuration.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use grafton_ndi::{Ndi, SenderOptions, Sender};
+/// # fn main() -> Result<(), grafton_ndi::Error> {
+/// # let ndi = Ndi::new()?;
+/// let options = SenderOptions::new("My Sender").groups("Studio");
+/// let sender = Sender::new(&ndi, &options)?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct SenderOptions {
-    /// The source name advertised on the network; empty lets the SDK choose.
-    pub name: String,
-    /// Comma-separated discovery groups; `None` uses the SDK default.
-    pub groups: Option<String>,
-    /// Pace video submissions to the frame rate instead of returning at once.
-    pub clock_video: bool,
-    /// Pace audio submissions to the sample rate instead of returning at once.
-    pub clock_audio: bool,
+    name: String,
+    groups: Option<String>,
+    clock_video: bool,
+    clock_audio: bool,
+    #[cfg(feature = "advanced")]
+    pub(crate) config: Option<crate::advanced::AdvancedConfig>,
 }
 
 impl SenderOptions {
-    /// Create a builder for configuring send options
-    pub fn builder<S: Into<String>>(name: S) -> SenderOptionsBuilder {
-        SenderOptionsBuilder::new(name)
-    }
-}
-
-/// Builder for configuring [`SenderOptions`] with method chaining.
-#[derive(Debug, Clone)]
-pub struct SenderOptionsBuilder {
-    name: String,
-    groups: Option<String>,
-    clock_video: Option<bool>,
-    clock_audio: Option<bool>,
-}
-
-impl SenderOptionsBuilder {
-    /// Create a new builder with the specified name
-    pub fn new<S: Into<String>>(name: S) -> Self {
+    /// A sender advertised as `name`, which the SDK chooses when it is empty,
+    /// with the default settings.
+    pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             groups: None,
-            clock_video: None,
-            clock_audio: None,
+            clock_video: true,
+            clock_audio: true,
+            #[cfg(feature = "advanced")]
+            config: None,
         }
     }
 
-    /// Set the groups for this sender
+    /// Set the comma-separated discovery groups the sender is advertised
+    /// in, instead of those of the NDI configuration.
     #[must_use]
-    pub fn groups<S: Into<String>>(mut self, groups: S) -> Self {
+    pub fn groups(mut self, groups: impl Into<String>) -> Self {
         self.groups = Some(groups.into());
         self
     }
 
-    /// Configure whether to clock video
+    /// Set whether video submissions are paced to the frame rate, rather
+    /// than returning at once.
     #[must_use]
     pub fn clock_video(mut self, clock: bool) -> Self {
-        self.clock_video = Some(clock);
+        self.clock_video = clock;
         self
     }
 
-    /// Configure whether to clock audio
+    /// Set whether audio submissions are paced to the sample rate, rather
+    /// than returning at once.
     #[must_use]
     pub fn clock_audio(mut self, clock: bool) -> Self {
-        self.clock_audio = Some(clock);
+        self.clock_audio = clock;
         self
     }
 
-    /// Build the sender options
+    /// Create the sender with this per-instance Advanced SDK configuration,
+    /// which it keeps for as long as it lives.
     ///
-    /// This method is infallible and simply applies defaults for any unset options.
-    /// Validation is performed when creating a `Sender` via `Sender::new()`.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use grafton_ndi::{NDI, SenderOptions, Sender};
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// let options = SenderOptions::builder("My Sender").build();
-    /// let sender = Sender::new(&ndi, &options)?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn build(self) -> SenderOptions {
-        let clock_video = self.clock_video.unwrap_or(true);
-        let clock_audio = self.clock_audio.unwrap_or(true);
-
-        SenderOptions {
-            name: self.name,
-            groups: self.groups,
-            clock_video,
-            clock_audio,
-        }
+    /// [`Sender::new`] then needs an Advanced runtime, and a build with the
+    /// Advanced SDK.
+    #[cfg(feature = "advanced")]
+    #[must_use]
+    pub fn config(mut self, config: crate::advanced::AdvancedConfig) -> Self {
+        self.config = Some(config);
+        self
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RuntimeFeature;
     use std::sync::Arc;
 
     fn test_owned_frame(value: u8) -> VideoFrame {
         let mut frame = VideoFrame::builder()
             .resolution(16, 16)
-            .pixel_format(PixelFormat::BGRA)
-            .frame_rate(30, 1)
+            .pixel_format(PixelFormat::Bgra)
+            .frame_rate(FrameRate::new(30, 1).unwrap())
             .metadata(format!("<frame value='{value}'/>"))
             .build()
             .unwrap();
@@ -1282,10 +1222,9 @@ mod tests {
         Some(
             Sender::new(
                 &ndi,
-                &SenderOptions::builder(name)
+                &SenderOptions::new(name)
                     .clock_video(false)
-                    .clock_audio(false)
-                    .build(),
+                    .clock_audio(false),
             )
             .unwrap(),
         )
@@ -1296,7 +1235,9 @@ mod tests {
         let Some(sender) = test_sender() else {
             return;
         };
-        let frame = MetadataFrame::with_data("<ndi_text>é</ndi_text>", 42).unwrap();
+        let frame = MetadataFrame::new("<ndi_text>é</ndi_text>")
+            .unwrap()
+            .with_timecode(Timecode::from_ticks(42));
         let expected_ptr = frame.to_raw().p_data;
         for _ in 0..3 {
             sender.send_metadata(&frame);
@@ -1314,7 +1255,7 @@ mod tests {
         let first = test_owned_frame(11);
         let pixels = first.data().as_ptr();
         let metadata = first.metadata_cstr().unwrap().as_ptr();
-        assert!(sender.send_video_async(first).is_none());
+        assert!(sender.send_video_async(first).unwrap().is_none());
         {
             let video = sender.inner.video.lock().unwrap();
             let Some(frame) = video.frame() else {
@@ -1325,7 +1266,7 @@ mod tests {
         }
         let second = test_owned_frame(22);
         let second_pixels = second.data().as_ptr();
-        let recycled = sender.send_video_async(second).unwrap();
+        let recycled = sender.send_video_async(second).unwrap().unwrap();
         assert_eq!(recycled.data().as_ptr(), pixels);
         assert_eq!(recycled.metadata_cstr().unwrap().as_ptr(), metadata);
         assert_eq!(recycled.metadata(), Some("<frame value='11'/>"));
@@ -1348,19 +1289,19 @@ mod tests {
         });
         let frame = test_owned_frame(1);
         let pixels = frame.data().as_ptr();
-        sender.send_video_async(frame);
-        sender.send_video(&test_owned_frame(9));
+        sender.send_video_async(frame).unwrap();
+        sender.send_video(&test_owned_frame(9)).unwrap();
         sender.flush_async_blocking();
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert_eq!(sender.finish_video_async().unwrap().data().as_ptr(), pixels);
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
         // A copied send recovers the previous owned frame after synchronization.
-        sender.send_video_async(test_owned_frame(2));
+        sender.send_video_async(test_owned_frame(2)).unwrap();
         let data = vec![3; 1024];
         let metadata = CString::new("<copy/>").unwrap();
         {
-            let borrowed = BorrowedVideoFrame::builder(&data, 16, 16, PixelFormat::BGRA)
+            let borrowed = BorrowedVideoFrame::builder(&data, 16, 16, PixelFormat::Bgra)
                 .metadata(&metadata)
                 .build()
                 .unwrap();
@@ -1392,7 +1333,10 @@ mod tests {
             assert_eq!(copy.metadata().unwrap(), "<copy/>");
         }
         // Copies are ordinary owned frames and are returned for reuse too.
-        let copied = sender.send_video_async(test_owned_frame(4)).unwrap();
+        let copied = sender
+            .send_video_async(test_owned_frame(4))
+            .unwrap()
+            .unwrap();
         assert_eq!(copied.data()[0], 3);
         assert_eq!(copied.metadata(), Some("<copy/>"));
         sender.finish_video_async().unwrap();
@@ -1413,11 +1357,11 @@ mod tests {
                 panic!("intentional completion panic");
             }
         });
-        sender.send_video_async(test_owned_frame(1));
+        sender.send_video_async(test_owned_frame(1)).unwrap();
         let second = test_owned_frame(2);
         let pixels = second.data().as_ptr();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            sender.send_video_async(second);
+            let _ = sender.send_video_async(second);
         }));
         assert!(result.is_err());
         assert_eq!(sender.finish_video_async().unwrap().data().as_ptr(), pixels);
@@ -1442,9 +1386,9 @@ mod tests {
             observed.fetch_add(1, Ordering::SeqCst);
             let sender = callback_reference.lock().unwrap().upgrade().unwrap();
             sender.flush_async_blocking();
-            sender.send_video(&test_owned_frame(7));
+            sender.send_video(&test_owned_frame(7)).unwrap();
         });
-        sender.send_video_async(test_owned_frame(5));
+        sender.send_video_async(test_owned_frame(5)).unwrap();
         let sender = Arc::new(sender);
         *reference.lock().unwrap() = Arc::downgrade(&sender);
         std::thread::scope(|scope| {
@@ -1470,9 +1414,9 @@ mod tests {
         });
         let data = vec![0; 1024];
         {
-            let frame =
-                BorrowedVideoFrame::try_from_uncompressed(&data, 16, 16, PixelFormat::BGRA, 30, 1)
-                    .unwrap();
+            let frame = BorrowedVideoFrame::builder(&data, 16, 16, PixelFormat::Bgra)
+                .build()
+                .unwrap();
             assert!(sender.send_video_async_copy(&frame).unwrap().is_none());
         }
         drop(data);
@@ -1492,10 +1436,10 @@ mod tests {
         sender.on_async_video_done(move |_| {
             observed.fetch_add(1, Ordering::SeqCst);
         });
-        sender.send_video_async(test_owned_frame(1));
+        sender.send_video_async(test_owned_frame(1)).unwrap();
         sender.finish_video_async();
         sender.clear_async_video_done();
-        sender.send_video_async(test_owned_frame(2));
+        sender.send_video_async(test_owned_frame(2)).unwrap();
         sender.finish_video_async();
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
@@ -1506,43 +1450,96 @@ mod tests {
     }
 
     #[test]
+    fn planar_444_sends_check_the_senders_runtime_before_the_sdk() {
+        let Some(mut sender) = test_sender() else {
+            return;
+        };
+        let supported = sender
+            .runtime()
+            .require_feature(RuntimeFeature::Planar444Video)
+            .is_ok();
+        let frame = VideoFrame::builder()
+            .resolution(16, 16)
+            .pixel_format(PixelFormat::Nb4g)
+            .build()
+            .unwrap();
+        let pixels = frame.data().as_ptr();
+        let data = frame.data().to_vec();
+        let borrowed = BorrowedVideoFrame::builder(&data, 16, 16, PixelFormat::Nb4g)
+            .build()
+            .unwrap();
+        // An earlier frame stays in flight through every rejection.
+        assert!(sender
+            .send_video_async(test_owned_frame(1))
+            .unwrap()
+            .is_none());
+        if supported {
+            sender.send_video(&frame).unwrap();
+            let previous = sender.send_video_async(frame).unwrap().unwrap();
+            assert_eq!(previous.data()[0], 1);
+            let previous = sender.send_video_async_copy(&borrowed).unwrap().unwrap();
+            assert_eq!(previous.data().as_ptr(), pixels);
+        } else {
+            let unsupported = |error: &Error| {
+                matches!(
+                    error,
+                    Error::UnsupportedCapability {
+                        feature: RuntimeFeature::Planar444Video,
+                        ..
+                    }
+                )
+            };
+            assert!(unsupported(&sender.send_video(&frame).unwrap_err()));
+            let rejected = sender.send_video_async(frame).unwrap_err();
+            assert!(unsupported(rejected.error()));
+            assert_eq!(rejected.into_inner().data().as_ptr(), pixels);
+            assert!(unsupported(
+                &sender.send_video_async_copy(&borrowed).unwrap_err()
+            ));
+            assert!(sender.inner.video.lock().unwrap().is_in_flight());
+        }
+        assert!(sender.finish_video_async().is_some());
+    }
+
+    #[test]
     fn borrowed_builder_validates_padded_layouts_and_preserves_headers_without_allocating() {
         for format in [
-            PixelFormat::BGRA,
-            PixelFormat::BGRX,
-            PixelFormat::RGBA,
-            PixelFormat::RGBX,
-            PixelFormat::UYVY,
-            PixelFormat::UYVA,
+            PixelFormat::Bgra,
+            PixelFormat::Bgrx,
+            PixelFormat::Rgba,
+            PixelFormat::Rgbx,
+            PixelFormat::Uyvy,
+            PixelFormat::Uyva,
             PixelFormat::P216,
-            PixelFormat::PA16,
+            PixelFormat::Pa16,
             PixelFormat::I420,
-            PixelFormat::YV12,
-            PixelFormat::NV12,
+            PixelFormat::Yv12,
+            PixelFormat::Nv12,
         ] {
             for stride in [
                 0,
-                format.try_line_stride(4).unwrap(),
-                format.try_line_stride(4).unwrap() + 8,
+                format.line_stride(4).unwrap(),
+                format.line_stride(4).unwrap() + 8,
             ] {
                 let layout =
                     ValidatedVideoLayout::new_uncompressed(format, 4, 4, Some(stride)).unwrap();
-                let data = vec![19; layout.data_len_bytes];
+                // A longer buffer is accepted; the frame is its layout's extent.
+                let data = vec![19; layout.data_len_bytes + 3];
                 let metadata = c"<pixels>é</pixels>";
+                let rate = FrameRate::new(30000, 1001).unwrap();
                 let (borrowed, allocations) = crate::test_alloc::allocation_count(|| {
                     let frame = BorrowedVideoFrame::builder(&data, 4, 4, format)
                         .line_stride(stride)
-                        .frame_rate(30000, 1001)
+                        .frame_rate(rate)
                         .picture_aspect_ratio(1.25)
                         .scan_type(ScanType::Interlaced)
-                        .timecode(0)
-                        .timestamp(67890)
+                        .timecode(Timecode::from_ticks(0))
                         .metadata(metadata)
                         .build()
                         .unwrap();
                     for _ in 0..3 {
                         assert_eq!(frame.metadata(), Some("<pixels>é</pixels>"));
-                        assert_eq!(frame.validated_data_len(), data.len());
+                        assert_eq!(frame.data(), &data[..layout.data_len_bytes]);
                         assert_eq!(frame.pixel_format(), format);
                     }
                     frame
@@ -1551,23 +1548,30 @@ mod tests {
                 let (owned, allocations) =
                     crate::test_alloc::allocation_count(|| borrowed.try_to_owned().unwrap());
                 assert_eq!(allocations, 2);
-                assert_eq!((owned.frame_rate_n(), owned.frame_rate_d()), (30000, 1001));
+                assert_eq!(owned.frame_rate(), rate);
                 assert_eq!(owned.picture_aspect_ratio(), 1.25);
                 assert_eq!(owned.scan_type(), ScanType::Interlaced);
-                assert_eq!((owned.timecode(), owned.timestamp()), (0, 67890));
+                assert_eq!(
+                    (owned.timecode(), owned.timestamp()),
+                    (Timecode::from_ticks(0), None)
+                );
                 assert_eq!(owned.metadata(), borrowed.metadata());
                 let (reborrowed, allocations) =
                     crate::test_alloc::allocation_count(|| BorrowedVideoFrame::from(&owned));
                 assert_eq!(allocations, 0);
                 assert_eq!(reborrowed.metadata(), borrowed.metadata());
-                assert!(
-                    BorrowedVideoFrame::builder(&data[..data.len() - 1], 4, 4, format)
-                        .line_stride(stride)
-                        .build()
-                        .is_err()
-                );
+                assert_eq!(reborrowed.frame_rate(), rate);
+                assert!(BorrowedVideoFrame::builder(
+                    &data[..layout.data_len_bytes - 1],
+                    4,
+                    4,
+                    format
+                )
+                .line_stride(stride)
+                .build()
+                .is_err());
             }
-            for stride in [-1, 1, i32::MAX] {
+            for stride in [1, i32::MAX.unsigned_abs() as usize, usize::MAX] {
                 let expected = ValidatedVideoLayout::new_uncompressed(format, 4, 4, Some(stride));
                 let result = BorrowedVideoFrame::builder(&[], 4, 4, format)
                     .line_stride(stride)
@@ -1582,7 +1586,7 @@ mod tests {
     fn borrowed_metadata_is_bounded_utf8_and_preserves_empty_presence() {
         let data = [0; 16];
         for metadata in [None, Some(c"")] {
-            let mut builder = BorrowedVideoFrame::builder(&data, 2, 2, PixelFormat::BGRA);
+            let mut builder = BorrowedVideoFrame::builder(&data, 2, 2, PixelFormat::Bgra);
             if let Some(metadata) = metadata {
                 builder = builder.metadata(metadata);
             }
@@ -1594,7 +1598,7 @@ mod tests {
         }
         let invalid = c"\xff";
         assert!(matches!(
-            BorrowedVideoFrame::builder(&data, 2, 2, PixelFormat::BGRA)
+            BorrowedVideoFrame::builder(&data, 2, 2, PixelFormat::Bgra)
                 .metadata(invalid)
                 .build(),
             Err(Error::InvalidUtf8(_))
@@ -1606,7 +1610,7 @@ mod tests {
             let mut bytes = vec![b'x'; len];
             bytes[len - 1] = 0;
             let metadata = CStr::from_bytes_with_nul(&bytes).unwrap();
-            let result = BorrowedVideoFrame::builder(&data, 2, 2, PixelFormat::BGRA)
+            let result = BorrowedVideoFrame::builder(&data, 2, 2, PixelFormat::Bgra)
                 .metadata(metadata)
                 .build();
             assert_eq!(result.is_ok(), len == crate::frames::MAX_METADATA_BYTES);
@@ -1614,158 +1618,110 @@ mod tests {
     }
 
     #[test]
-    fn test_borrowed_frame_setters() {
+    fn test_borrowed_frame_timecode_and_aspect_ratio() {
         let buffer = vec![0u8; 64 * 36 * 2];
-        let frame =
-            BorrowedVideoFrame::try_from_uncompressed(&buffer, 64, 36, PixelFormat::UYVY, 25, 1)
-                .unwrap();
-        assert_eq!(frame.timecode(), NDIlib_send_timecode_synthesize);
+        let frame = BorrowedVideoFrame::builder(&buffer, 64, 36, PixelFormat::Uyvy)
+            .build()
+            .unwrap();
+        assert_eq!(frame.timecode(), Timecode::SYNTHESIZE);
         assert_eq!(frame.picture_aspect_ratio(), 16.0 / 9.0);
 
-        let frame = frame
-            .with_timecode(1234)
-            .with_picture_aspect_ratio(0.0)
-            .unwrap();
-        assert_eq!(frame.timecode(), 1234);
+        let frame = BorrowedVideoFrame::builder(&buffer, 64, 36, PixelFormat::Uyvy)
+            .picture_aspect_ratio(0.0)
+            .build()
+            .unwrap()
+            .with_timecode(Timecode::from_ticks(1234));
+        assert_eq!(frame.timecode(), Timecode::from_ticks(1234));
         assert_eq!(frame.picture_aspect_ratio(), 0.0);
         let raw = frame.to_raw();
         assert_eq!((raw.timecode, raw.picture_aspect_ratio), (1234, 0.0));
+        assert_eq!(raw.timestamp, NDIlib_recv_timestamp_undefined);
 
         for bad in [-1.0, f32::NAN, f32::INFINITY] {
-            let frame = BorrowedVideoFrame::try_from_uncompressed(
-                &buffer,
-                64,
-                36,
-                PixelFormat::UYVY,
-                25,
-                1,
-            )
-            .unwrap();
-            assert!(frame.with_picture_aspect_ratio(bad).is_err(), "{bad}");
+            assert!(
+                BorrowedVideoFrame::builder(&buffer, 64, 36, PixelFormat::Uyvy)
+                    .picture_aspect_ratio(bad)
+                    .build()
+                    .is_err(),
+                "{bad}"
+            );
         }
     }
 
+    /// Build a borrowed frame of `format` over `buffer` at 30 frames per second.
+    fn borrowed(
+        buffer: &[u8],
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+    ) -> Result<BorrowedVideoFrame<'_>> {
+        BorrowedVideoFrame::builder(buffer, width, height, format).build()
+    }
+
     #[test]
-    fn test_try_from_uncompressed_exact_size() {
+    fn test_borrowed_builder_exact_size() {
         // BGRA format: 1920x1080x4 bytes
         let buffer = vec![0u8; 1920 * 1080 * 4];
-        let result = BorrowedVideoFrame::try_from_uncompressed(
-            &buffer,
-            1920,
-            1080,
-            PixelFormat::BGRA,
-            30,
-            1,
-        );
-        assert!(result.is_ok());
+        assert!(borrowed(&buffer, 1920, 1080, PixelFormat::Bgra).is_ok());
     }
 
     #[test]
-    fn test_try_from_uncompressed_oversized_buffer() {
+    fn test_borrowed_builder_oversized_buffer() {
         // Buffer larger than needed should succeed
         let buffer = vec![0u8; 1920 * 1080 * 4 + 1000];
-        let result = BorrowedVideoFrame::try_from_uncompressed(
-            &buffer,
-            1920,
-            1080,
-            PixelFormat::BGRA,
-            30,
-            1,
-        );
-        assert!(result.is_ok());
+        let frame = borrowed(&buffer, 1920, 1080, PixelFormat::Bgra).unwrap();
+        assert_eq!(frame.data().len(), 1920 * 1080 * 4);
     }
 
     #[test]
-    fn test_try_from_uncompressed_undersized_buffer() {
+    fn test_borrowed_builder_undersized_buffer() {
         // Buffer too small should fail
         let buffer = vec![0u8; 1920 * 1080 * 4 - 1];
-        let result = BorrowedVideoFrame::try_from_uncompressed(
-            &buffer,
-            1920,
-            1080,
-            PixelFormat::BGRA,
-            30,
-            1,
-        );
+        let result = borrowed(&buffer, 1920, 1080, PixelFormat::Bgra);
         assert!(result.is_err());
         if let Err(Error::InvalidFrame(msg)) = result {
             assert!(msg.contains("Buffer too small"));
-            assert!(msg.contains("BGRA"));
+            assert!(msg.contains("Bgra"));
         }
     }
 
     #[test]
-    fn test_try_from_uncompressed_uyvy() {
+    fn test_borrowed_builder_uyvy() {
         // UYVY format: 1920x1080x2 bytes
-        let expected_size = 1920 * 1080 * 2;
-        let buffer = vec![0u8; expected_size];
-        let result = BorrowedVideoFrame::try_from_uncompressed(
-            &buffer,
-            1920,
-            1080,
-            PixelFormat::UYVY,
-            60,
-            1,
-        );
-        assert!(result.is_ok());
+        let buffer = vec![0u8; 1920 * 1080 * 2];
+        assert!(borrowed(&buffer, 1920, 1080, PixelFormat::Uyvy).is_ok());
     }
 
     #[test]
-    fn test_try_from_uncompressed_nv12() {
+    fn test_borrowed_builder_nv12() {
         // NV12 planar format: Y plane + UV plane
-        let width = 1920;
-        let height = 1080;
-        let expected_size = PixelFormat::NV12.try_buffer_size(width, height).unwrap();
+        let expected_size = PixelFormat::Nv12.buffer_len(1920, 1080).unwrap();
         let buffer = vec![0u8; expected_size];
-
-        let result = BorrowedVideoFrame::try_from_uncompressed(
-            &buffer,
-            width,
-            height,
-            PixelFormat::NV12,
-            30,
-            1,
-        );
-        assert!(result.is_ok());
+        assert!(borrowed(&buffer, 1920, 1080, PixelFormat::Nv12).is_ok());
     }
 
     #[test]
-    fn test_try_from_uncompressed_i420() {
+    fn test_borrowed_builder_i420() {
         // I420 planar format
-        let width = 640;
-        let height = 480;
-        let expected_size = PixelFormat::I420.try_buffer_size(width, height).unwrap();
+        let expected_size = PixelFormat::I420.buffer_len(640, 480).unwrap();
         let buffer = vec![0u8; expected_size];
-
-        let result = BorrowedVideoFrame::try_from_uncompressed(
-            &buffer,
-            width,
-            height,
-            PixelFormat::I420,
-            30,
-            1,
-        );
-        assert!(result.is_ok());
+        assert!(borrowed(&buffer, 640, 480, PixelFormat::I420).is_ok());
     }
 
     #[test]
-    fn test_try_from_uncompressed_rejects_invalid_layout() {
+    fn test_borrowed_builder_rejects_invalid_layout() {
         let buffer = vec![0u8; 4096];
 
         assert!(matches!(
-            BorrowedVideoFrame::try_from_uncompressed(&buffer, 0, 480, PixelFormat::BGRA, 30, 1),
+            borrowed(&buffer, 0, 480, PixelFormat::Bgra),
             Err(Error::InvalidFrame(_))
         ));
         assert!(matches!(
-            BorrowedVideoFrame::try_from_uncompressed(&buffer, 640, -1, PixelFormat::BGRA, 30, 1),
+            borrowed(&buffer, 640, 0, PixelFormat::Bgra),
             Err(Error::InvalidFrame(_))
         ));
         assert!(matches!(
-            BorrowedVideoFrame::try_from_uncompressed(&buffer, 641, 480, PixelFormat::I420, 30, 1),
-            Err(Error::InvalidFrame(_))
-        ));
-        assert!(matches!(
-            BorrowedVideoFrame::try_from_uncompressed(&buffer, 640, 480, PixelFormat::BGRA, 0, 1),
+            borrowed(&buffer, 641, 480, PixelFormat::I420),
             Err(Error::InvalidFrame(_))
         ));
     }
@@ -1773,56 +1729,57 @@ mod tests {
     #[test]
     fn test_getters() {
         let buffer = vec![0u8; 1920 * 1080 * 4];
-        let frame = BorrowedVideoFrame::try_from_uncompressed(
-            &buffer,
-            1920,
-            1080,
-            PixelFormat::BGRA,
-            60,
-            1,
-        )
-        .unwrap();
+        let frame = BorrowedVideoFrame::builder(&buffer, 1920, 1080, PixelFormat::Bgra)
+            .frame_rate(FrameRate::new(60, 1).unwrap())
+            .build()
+            .unwrap();
 
         assert_eq!(frame.width(), 1920);
         assert_eq!(frame.height(), 1080);
-        assert_eq!(frame.pixel_format(), PixelFormat::BGRA);
-        assert_eq!(frame.frame_rate_n(), 60);
-        assert_eq!(frame.frame_rate_d(), 1);
+        assert_eq!(frame.pixel_format(), PixelFormat::Bgra);
+        assert_eq!(frame.frame_rate(), FrameRate::new(60, 1).unwrap());
         assert_eq!(frame.picture_aspect_ratio(), 16.0 / 9.0);
         assert_eq!(frame.scan_type(), ScanType::Progressive);
-        assert_eq!(frame.timecode(), NDIlib_send_timecode_synthesize);
+        assert_eq!(frame.timecode(), Timecode::SYNTHESIZE);
         assert_eq!(frame.data().len(), buffer.len());
+        assert_eq!(frame.line_stride_bytes(), 1920 * 4);
         assert!(frame.metadata().is_none());
-        assert_eq!(frame.timestamp(), 0);
+        // Copies share the borrow, and Debug summarizes rather than dumps pixels.
+        let copy = frame;
+        assert_eq!(copy.data().as_ptr(), frame.data().as_ptr());
+        assert!(format!("{frame:?}").contains("data (bytes): 8294400"));
+        assert_eq!(
+            borrowed(&buffer, 1920, 1080, PixelFormat::Bgra)
+                .unwrap()
+                .frame_rate(),
+            FrameRate::new(30, 1).unwrap()
+        );
     }
 
     #[test]
     fn test_all_pixel_formats_validation() {
         // Test that validation works correctly for all pixel formats
         let test_cases = vec![
-            (PixelFormat::BGRA, 1920, 1080, 1920 * 1080 * 4),
-            (PixelFormat::RGBA, 1920, 1080, 1920 * 1080 * 4),
-            (PixelFormat::BGRX, 1920, 1080, 1920 * 1080 * 4),
-            (PixelFormat::RGBX, 1920, 1080, 1920 * 1080 * 4),
-            (PixelFormat::UYVY, 1920, 1080, 1920 * 1080 * 2),
-            (PixelFormat::UYVA, 1920, 1080, 1920 * 1080 * 3),
+            (PixelFormat::Bgra, 1920, 1080, 1920 * 1080 * 4),
+            (PixelFormat::Rgba, 1920, 1080, 1920 * 1080 * 4),
+            (PixelFormat::Bgrx, 1920, 1080, 1920 * 1080 * 4),
+            (PixelFormat::Rgbx, 1920, 1080, 1920 * 1080 * 4),
+            (PixelFormat::Uyvy, 1920, 1080, 1920 * 1080 * 2),
+            (PixelFormat::Uyva, 1920, 1080, 1920 * 1080 * 3),
             (PixelFormat::P216, 1920, 1080, 1920 * 1080 * 4),
-            (PixelFormat::PA16, 1920, 1080, 1920 * 1080 * 6),
+            (PixelFormat::Pa16, 1920, 1080, 1920 * 1080 * 6),
         ];
 
         for (format, width, height, expected_min_size) in test_cases {
             // Exact size should work
             let buffer = vec![0u8; expected_min_size];
-            let result =
-                BorrowedVideoFrame::try_from_uncompressed(&buffer, width, height, format, 30, 1);
+            let result = borrowed(&buffer, width, height, format);
             assert!(result.is_ok(), "Failed for format {:?}", format);
 
             // One byte too small should fail
             if expected_min_size > 0 {
                 let buffer = vec![0u8; expected_min_size - 1];
-                let result = BorrowedVideoFrame::try_from_uncompressed(
-                    &buffer, width, height, format, 30, 1,
-                );
+                let result = borrowed(&buffer, width, height, format);
                 assert!(result.is_err(), "Should fail for undersized {:?}", format);
             }
         }
@@ -1834,20 +1791,17 @@ mod tests {
         let width = 1920;
         let height = 1080;
 
-        for format in [PixelFormat::NV12, PixelFormat::I420, PixelFormat::YV12] {
-            let expected_size = format.try_buffer_size(width, height).unwrap();
+        for format in [PixelFormat::Nv12, PixelFormat::I420, PixelFormat::Yv12] {
+            let expected_size = format.buffer_len(width, height).unwrap();
 
             let buffer = vec![0u8; expected_size];
-            let result =
-                BorrowedVideoFrame::try_from_uncompressed(&buffer, width, height, format, 30, 1);
+            let result = borrowed(&buffer, width, height, format);
             assert!(result.is_ok(), "Failed for planar format {:?}", format);
 
             // One byte too small should fail
             if expected_size > 0 {
                 let buffer = vec![0u8; expected_size - 1];
-                let result = BorrowedVideoFrame::try_from_uncompressed(
-                    &buffer, width, height, format, 30, 1,
-                );
+                let result = borrowed(&buffer, width, height, format);
                 assert!(result.is_err(), "Should fail for undersized {:?}", format);
             }
         }

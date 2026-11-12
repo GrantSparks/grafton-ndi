@@ -16,7 +16,7 @@ use std::{env, time::Duration};
 
 use grafton_ndi::{
     advanced::{AllocationBuffer, AllocationRequest, AllocatorLimits, AllocatorService},
-    Error, Receiver, ReceiverOptions, NDI,
+    Error, Ndi, Receiver, ReceiverOptions,
 };
 
 #[path = "common/mod.rs"]
@@ -26,7 +26,7 @@ fn main() -> Result<(), Error> {
     let args: Vec<String> = env::args().collect();
     let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
 
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
     let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
     let Some(source) = finder
         .find_sources(Duration::from_secs(5))?
@@ -40,9 +40,7 @@ fn main() -> Result<(), Error> {
 
     let receiver = Receiver::new(
         &ndi,
-        &ReceiverOptions::builder(source)
-            .name("Allocator Example")
-            .build(),
+        &ReceiverOptions::new(source).name("Allocator Example"),
     )?;
     // Custom allocation keeps the NDI runtime initialized until the process exits.
     let service = AllocatorService::new(ndi.process_lifetime(), AllocatorLimits::default())?;
@@ -50,7 +48,7 @@ fn main() -> Result<(), Error> {
 
     // Called on SDK threads: pad every video line to a multiple of 256 bytes.
     receiver.set_video_allocator(|request: AllocationRequest| {
-        let stride = (request.stride() + 255) / 256 * 256;
+        let stride = request.stride().next_multiple_of(256);
         AllocationBuffer::zeroed(request.with_stride(stride)?)
     })?;
 
@@ -58,7 +56,7 @@ fn main() -> Result<(), Error> {
         if let Some(frame) = receiver
             .receiver()
             .video()
-            .try_capture(Duration::from_secs(1))?
+            .capture(Duration::from_secs(1))?
         {
             let usage = service.usage();
             println!(

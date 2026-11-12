@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use grafton_ndi::{Finder, FinderOptions, Result, Source, NDI};
+use grafton_ndi::{Finder, FinderOptions, Ndi, Result, Source};
 
 /// Build a [`Finder`] that discovers local sources plus any extra IP addresses
 /// supplied on the command line.
@@ -27,19 +27,19 @@ use grafton_ndi::{Finder, FinderOptions, Result, Source, NDI};
 /// `extra_ips` are the positional, non-flag arguments each example collects
 /// from `std::env::args` (e.g. `192.168.0.110` or `10.0.0.0/24`). Local
 /// sources are always included so loopback senders are visible during testing.
-pub fn finder_with_extra_ips(ndi: &NDI, extra_ips: &[&str]) -> Result<Finder> {
-    let mut builder = FinderOptions::builder().show_local_sources(true);
+pub fn finder_with_extra_ips(ndi: &Ndi, extra_ips: &[&str]) -> Result<Finder> {
+    let mut options = FinderOptions::new();
 
     if !extra_ips.is_empty() {
         println!("Searching additional IPs/subnets:");
         for ip in extra_ips {
             println!("  - {ip}");
         }
-        builder = builder.extra_ips(extra_ips.join(","));
+        options = options.extra_ips(extra_ips.join(","));
         println!();
     }
 
-    Finder::new(ndi, &builder.build())
+    Finder::new(ndi, &options)
 }
 
 /// Block until at least one source is discovered, re-checking every second.

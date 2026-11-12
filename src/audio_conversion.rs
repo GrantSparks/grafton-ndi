@@ -8,11 +8,11 @@
 use crate::{
     frames::validate_packed_audio_dimensions,
     sys::{self, bindings::*},
-    AudioFormat, AudioFrame, Error, Result, Sender, NDI,
+    AudioFormat, AudioFrame, Error, Ndi, Result, Sender, Timecode,
 };
 
 /// Full-scale integer audio level in dB above NDI's +4 dBu reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AudioReferenceLevel(i32);
 
 impl AudioReferenceLevel {
@@ -35,30 +35,46 @@ impl AudioReferenceLevel {
     }
 }
 
+/// Checked FLTP dimensions shared by interleaved inputs and planar frames.
 #[derive(Debug, Clone, Copy)]
 struct AudioShape {
-    rate: i32,
-    channels: i32,
-    samples: i32,
+    sample_rate: u32,
+    num_channels: u32,
+    num_samples: u32,
     count: usize,
 }
 
 impl AudioShape {
-    fn new(rate: i32, channels: i32, samples: i32) -> Result<Self> {
-        crate::frames::validate_audio_sample_rate(rate)?;
+    fn new(sample_rate: u32, num_channels: u32, num_samples: u32) -> Result<Self> {
+        let sample_rate = crate::frames::validate_audio_sample_rate(sample_rate.into())?;
         // Share FLTP's checked stride and 64 MiB payload ceiling. This also
         // bounds conversion destinations for 16-bit source data.
-        let count = validate_packed_audio_dimensions(channels, samples)?.sample_count();
+        let count = validate_packed_audio_dimensions(num_channels, num_samples)?.sample_count();
         Ok(Self {
-            rate,
-            channels,
-            samples,
+            sample_rate,
+            num_channels,
+            num_samples,
             count,
         })
     }
 
+    /// The shape of `len` interleaved samples in `num_channels` channels.
+    fn interleaved(sample_rate: u32, num_channels: u32, len: usize) -> Result<Self> {
+        let num_samples = usize::try_from(num_channels)
+            .ok()
+            .filter(|&channels| channels > 0 && len.is_multiple_of(channels))
+            .and_then(|channels| u32::try_from(len / channels).ok())
+            .filter(|&samples| samples > 0)
+            .ok_or_else(|| {
+                Error::InvalidFrame(format!(
+                    "interleaved audio has {len} samples, which is not a non-zero multiple of {num_channels} channels"
+                ))
+            })?;
+        Self::new(sample_rate, num_channels, num_samples)
+    }
+
     fn from_planar(frame: &AudioFrame) -> Result<Self> {
-        if frame.format() != AudioFormat::FLTP {
+        if frame.format() != AudioFormat::Fltp {
             return Err(Error::InvalidFrame(
                 "native audio conversion requires FLTP".into(),
             ));
@@ -82,9 +98,9 @@ impl AudioShape {
 
     fn check_planar(self, frame: &AudioFrame) -> Result<()> {
         Self::from_planar(frame)?;
-        if frame.sample_rate() != self.rate
-            || frame.num_channels() != self.channels
-            || frame.num_samples() != self.samples
+        if frame.sample_rate() != self.sample_rate
+            || frame.num_channels() != self.num_channels
+            || frame.num_samples() != self.num_samples
         {
             return Err(Error::InvalidFrame(
                 "planar destination rate, channels and samples must match the interleaved source"
@@ -94,13 +110,23 @@ impl AudioShape {
         Ok(())
     }
 
-    fn allocate(self, timecode: i64) -> Result<AudioFrame> {
+    fn allocate(self, timecode: Timecode) -> Result<AudioFrame> {
         AudioFrame::builder()
-            .sample_rate(self.rate)
-            .channels(self.channels)
-            .samples(self.samples)
+            .sample_rate(self.sample_rate)
+            .num_channels(self.num_channels)
+            .num_samples(self.num_samples)
             .timecode(timecode)
             .build()
+    }
+
+    /// The SDK's `sample_rate`, `no_channels` and `no_samples`.
+    fn to_sdk(self) -> (i32, i32, i32) {
+        // Lossless: construction checked each against the SDK's signed range.
+        (
+            self.sample_rate as i32,
+            self.num_channels as i32,
+            self.num_samples as i32,
+        )
     }
 }
 
@@ -108,47 +134,55 @@ macro_rules! interleaved_input {
     ($name:ident, $sample:ty, $raw:ident $(, $reference:ident)?) => {
         /// Borrowed, validated interleaved audio. Construction does not load NDI.
         ///
-        /// Samples are ordered sample-first, then channel. The slice must contain
-        /// exactly `channels * samples` elements; the equivalent FLTP allocation
-        /// must fit the library's 64 MiB audio limit. Metadata is not represented.
+        /// Samples are ordered sample-first, then channel. The number of
+        /// samples per channel is the slice's length divided by the channel
+        /// count, which must divide it exactly; the equivalent FLTP
+        /// allocation must fit the library's 64 MiB audio limit. Metadata is
+        /// not represented.
         #[derive(Debug, Clone, Copy)]
         pub struct $name<'a> {
             shape: AudioShape,
             data: &'a [$sample],
-            timecode: i64,
+            timecode: Timecode,
             $($reference: AudioReferenceLevel,)?
         }
 
         impl<'a> $name<'a> {
-            /// Validate the header and complete initialized source slice.
-            pub fn new(rate: i32, channels: i32, samples: i32, data: &'a [$sample] $(, $reference: AudioReferenceLevel)?) -> Result<Self> {
-                let shape = AudioShape::new(rate, channels, samples)?;
-                if data.len() != shape.count {
-                    return Err(Error::InvalidFrame(format!("interleaved audio has {} samples, expected {}", data.len(), shape.count)));
-                }
-                Ok(Self { shape, data, timecode: NDIlib_send_timecode_synthesize, $($reference,)? })
+            /// Validate the header and the complete initialized source slice.
+            ///
+            /// # Errors
+            ///
+            /// [`Error::InvalidFrame`] for a sample rate outside
+            /// `1..=i32::MAX`, a `data` length that is not a non-zero
+            /// multiple of `num_channels`, or audio larger than the 64 MiB
+            /// limit.
+            pub fn new(sample_rate: u32, num_channels: u32, data: &'a [$sample] $(, $reference: AudioReferenceLevel)?) -> Result<Self> {
+                let shape = AudioShape::interleaved(sample_rate, num_channels, data.len())?;
+                Ok(Self { shape, data, timecode: Timecode::SYNTHESIZE, $($reference,)? })
             }
 
-            /// Override the synthesized timecode, in native 100 ns units.
+            /// Return this audio with `timecode` instead of
+            /// [`Timecode::SYNTHESIZE`].
             #[must_use]
-            pub fn with_timecode(mut self, timecode: i64) -> Self { self.timecode = timecode; self }
+            pub fn with_timecode(mut self, timecode: Timecode) -> Self { self.timecode = timecode; self }
             /// Sample rate in Hz.
-            pub fn sample_rate(&self) -> i32 { self.shape.rate }
+            pub fn sample_rate(&self) -> u32 { self.shape.sample_rate }
             /// Number of interleaved channels.
-            pub fn channels(&self) -> i32 { self.shape.channels }
+            pub fn num_channels(&self) -> u32 { self.shape.num_channels }
             /// Number of samples per channel.
-            pub fn samples(&self) -> i32 { self.shape.samples }
-            /// Native timecode, including the synthesis sentinel when requested.
-            pub fn timecode(&self) -> i64 { self.timecode }
+            pub fn num_samples(&self) -> u32 { self.shape.num_samples }
+            /// The timecode.
+            pub fn timecode(&self) -> Timecode { self.timecode }
             /// Complete initialized interleaved samples.
             pub fn data(&self) -> &'a [$sample] { self.data }
 
             fn raw(&self) -> $raw {
+                let (sample_rate, no_channels, no_samples) = self.shape.to_sdk();
                 $raw {
-                    sample_rate: self.shape.rate,
-                    no_channels: self.shape.channels,
-                    no_samples: self.shape.samples,
-                    timecode: self.timecode,
+                    sample_rate,
+                    no_channels,
+                    no_samples,
+                    timecode: self.timecode.ticks(),
                     p_data: self.data.as_ptr().cast_mut(),
                     $($reference: self.$reference.db(),)?
                 }
@@ -181,7 +215,7 @@ interleaved_input!(
 /// not silently substitute old v2 operations or Rust's existing f32 builder
 /// conversion. Methods take caller-owned output storage for reuse.
 pub struct AudioConverter {
-    _ndi: NDI,
+    _ndi: Ndi,
     audio: &'static sys::InterleavedAudio,
 }
 
@@ -195,8 +229,9 @@ macro_rules! conversions {
             let shape = AudioShape::from_planar(source)?;
             shape.check_output(destination.len())?;
             let source = source.to_raw();
+            let (sample_rate, no_channels, no_samples) = shape.to_sdk();
             let mut destination = $raw {
-                sample_rate: shape.rate, no_channels: shape.channels, no_samples: shape.samples,
+                sample_rate, no_channels, no_samples,
                 timecode: source.timecode, p_data: destination.as_mut_ptr(),
                 $($reference: $reference.db(),)?
             };
@@ -237,7 +272,7 @@ macro_rules! conversions {
 
 impl AudioConverter {
     /// Resolve the complete current conversion group before exposing operations.
-    pub fn new(ndi: &NDI) -> Result<Self> {
+    pub fn new(ndi: &Ndi) -> Result<Self> {
         Ok(Self {
             audio: ndi.table()?,
             _ndi: ndi.clone(),
@@ -319,39 +354,46 @@ mod tests {
 
     #[test]
     fn interleaved_validation_rejects_bad_dimensions_lengths_and_limits() {
-        for (rate, channels, samples) in [
-            (0, 2, 1),
-            (48000, 0, 1),
+        let samples = vec![0.0f32; 16_777_217];
+        for (rate, channels, len) in [
+            (0, 2, 2),
+            (1 << 31, 2, 2),
+            (48000, 0, 2),
             (48000, 2, 0),
-            (48000, -1, 1),
-            (48000, i32::MAX, i32::MAX),
+            (48000, 2, 3),
+            (48000, 3, 2),
+            (48000, u32::MAX, 2),
             (48000, 1, 16_777_217),
         ] {
-            assert!(InterleavedAudioF32::new(rate, channels, samples, &[]).is_err());
+            assert!(InterleavedAudioF32::new(rate, channels, &samples[..len]).is_err());
             assert!(InterleavedAudioI16::new(
                 rate,
                 channels,
-                samples,
-                &[],
+                &vec![0; len],
                 AudioReferenceLevel::SEND
             )
             .is_err());
             assert!(InterleavedAudioI32::new(
                 rate,
                 channels,
-                samples,
-                &[],
+                &vec![0; len],
                 AudioReferenceLevel::SEND
             )
             .is_err());
         }
-        assert!(InterleavedAudioF32::new(48000, 2, 2, &[0.0; 3]).is_err());
-        assert!(InterleavedAudioF32::new(48000, 2, 2, &[0.0; 5]).is_err());
-        let samples = [0.0f32; 4];
-        let frame = InterleavedAudioF32::new(48000, 2, 2, &samples).unwrap();
+        let samples = [0.0f32; 6];
+        let frame = InterleavedAudioF32::new(48000, 2, &samples).unwrap();
         assert_eq!(frame.data().as_ptr(), samples.as_ptr());
-        assert_eq!(frame.channels(), 2);
-        assert_eq!(frame.samples(), 2);
+        assert_eq!(frame.sample_rate(), 48000);
+        assert_eq!(frame.num_channels(), 2);
+        assert_eq!(frame.num_samples(), 3);
+        assert_eq!(frame.timecode(), Timecode::SYNTHESIZE);
+        let frame = InterleavedAudioF32::new(48000, 3, &samples).unwrap();
+        assert_eq!(frame.num_samples(), 2);
+        assert_eq!(
+            frame.with_timecode(Timecode::from_ticks(7)).raw().timecode,
+            7
+        );
         assert_eq!(AudioReferenceLevel::SEND.db(), 0);
         assert_eq!(AudioReferenceLevel::RECEIVE_HEADROOM.db(), 20);
     }
@@ -363,12 +405,12 @@ mod tests {
         };
         let converter = AudioConverter::new(&ndi).unwrap();
         let samples = [0.125, -0.5, 0.25, -0.25, 0.5, -0.125];
-        let input = InterleavedAudioF32::new(48000, 2, 3, &samples)
+        let input = InterleavedAudioF32::new(48000, 2, &samples)
             .unwrap()
-            .with_timecode(1234);
+            .with_timecode(Timecode::from_ticks(1234));
         let frame = converter.from_interleaved_f32(&input).unwrap();
         assert_eq!(frame.data(), &[0.125, 0.25, 0.5, -0.5, -0.25, -0.125]);
-        assert_eq!(frame.timecode(), 1234);
+        assert_eq!(frame.timecode(), Timecode::from_ticks(1234));
         assert_eq!(frame.metadata(), None);
         let mut output = [99.0; 8];
         assert_eq!(
@@ -380,10 +422,9 @@ mod tests {
         assert!(converter.to_interleaved_f32(&frame, &mut [0.0; 5]).is_err());
 
         let mut destination = AudioFrame::builder()
-            .channels(2)
-            .samples(3)
-            .timecode(5678)
-            .timestamp(9012)
+            .num_channels(2)
+            .num_samples(3)
+            .timecode(Timecode::from_ticks(5678))
             .metadata("<keep/>")
             .build()
             .unwrap();
@@ -393,12 +434,12 @@ mod tests {
             .unwrap();
         assert_eq!(destination.data().as_ptr(), pointer);
         assert_eq!(destination.data(), frame.data());
-        assert_eq!(destination.timecode(), 5678);
-        assert_eq!(destination.timestamp(), 9012);
+        assert_eq!(destination.timecode(), Timecode::from_ticks(5678));
+        assert_eq!(destination.timestamp(), None);
         assert_eq!(destination.metadata(), Some("<keep/>"));
         let mut wrong_dimensions = AudioFrame::builder()
-            .channels(1)
-            .samples(6)
+            .num_channels(1)
+            .num_samples(6)
             .build()
             .unwrap();
         assert!(converter
@@ -414,7 +455,7 @@ mod tests {
         let converter = AudioConverter::new(&ndi).unwrap();
         let i16_samples = [8192i16, -16384, 16384, -8192];
         let i16_input =
-            InterleavedAudioI16::new(48000, 2, 2, &i16_samples, AudioReferenceLevel::SEND).unwrap();
+            InterleavedAudioI16::new(48000, 2, &i16_samples, AudioReferenceLevel::SEND).unwrap();
         let frame = converter.from_interleaved_i16(&i16_input).unwrap();
         // Native integer conversion scales against the positive integer maximum,
         // rather than assuming that 32768 maps exactly to reference amplitude.
@@ -441,7 +482,7 @@ mod tests {
 
         let i32_samples = [536_870_912i32, -1_073_741_824, 1_073_741_824, -536_870_912];
         let i32_input =
-            InterleavedAudioI32::new(48000, 2, 2, &i32_samples, AudioReferenceLevel::SEND).unwrap();
+            InterleavedAudioI32::new(48000, 2, &i32_samples, AudioReferenceLevel::SEND).unwrap();
         let frame = converter.from_interleaved_i32(&i32_input).unwrap();
         assert_eq!(frame.data(), &[0.25, 0.5, -0.5, -0.25]);
         let mut roundtrip = [0i32; 4];
@@ -457,18 +498,15 @@ mod tests {
             return;
         };
         let name = crate::test_support::unique_name("grafton isolated utility validation");
-        let options = crate::SenderOptions::builder(name)
+        let options = crate::SenderOptions::new(name)
             .clock_audio(false)
-            .clock_video(false)
-            .build();
+            .clock_video(false);
         let sender = Sender::new(&ndi, &options).unwrap();
         let i16_input =
-            InterleavedAudioI16::new(48000, 2, 2, &[1, -1, 2, -2], AudioReferenceLevel::SEND)
-                .unwrap();
+            InterleavedAudioI16::new(48000, 2, &[1, -1, 2, -2], AudioReferenceLevel::SEND).unwrap();
         let i32_input =
-            InterleavedAudioI32::new(48000, 2, 2, &[1, -1, 2, -2], AudioReferenceLevel::SEND)
-                .unwrap();
-        let f32_input = InterleavedAudioF32::new(48000, 2, 2, &[0.1, -0.1, 0.2, -0.2]).unwrap();
+            InterleavedAudioI32::new(48000, 2, &[1, -1, 2, -2], AudioReferenceLevel::SEND).unwrap();
+        let f32_input = InterleavedAudioF32::new(48000, 2, &[0.1, -0.1, 0.2, -0.2]).unwrap();
         sender.send_audio_interleaved_i16(&i16_input).unwrap();
         sender.send_audio_interleaved_i32(&i32_input).unwrap();
         sender.send_audio_interleaved_f32(&f32_input).unwrap();

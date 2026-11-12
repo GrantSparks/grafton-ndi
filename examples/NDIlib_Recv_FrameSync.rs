@@ -31,8 +31,8 @@
 //! - Samples per audio block: `cargo run --example NDIlib_Recv_FrameSync -- --audio-samples 512`
 
 use grafton_ndi::{
-    Error, FrameSync, FrameSyncAudioRequest, Receiver, ReceiverColorFormat, ReceiverOptions,
-    ScanType, NDI,
+    Error, FrameSync, FrameSyncAudioRequest, Ndi, Receiver, ReceiverColorFormat, ReceiverOptions,
+    ScanType,
 };
 
 #[path = "common/mod.rs"]
@@ -77,7 +77,7 @@ fn main() -> Result<(), Error> {
     println!("NDI FrameSync Example");
     println!("=====================\n");
 
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
     println!("NDI initialized successfully");
 
     println!("Configuration:");
@@ -101,29 +101,28 @@ fn main() -> Result<(), Error> {
 
     let first_source = &sources[0];
     println!("\nCreating receiver for: {first_source}");
-    let options = ReceiverOptions::builder(sources[0].clone())
-        .color(ReceiverColorFormat::RGBX_RGBA)
-        .build();
+    let options =
+        ReceiverOptions::new(sources[0].clone()).color_format(ReceiverColorFormat::RgbxRgba);
     let receiver = Receiver::new(&ndi, &options)?;
 
     println!("Creating FrameSync for clock-corrected capture...");
     let framesync = FrameSync::new(receiver)?;
-    let audio_request = FrameSyncAudioRequest::capture_with(
-        Some(audio_sample_rate),
-        audio_channels,
-        audio_samples,
-    )?;
+    let audio_request =
+        FrameSyncAudioRequest::capture_at(audio_sample_rate, audio_channels, audio_samples)?;
 
     // The attached receiver exposes controls, audio, metadata, and status.
     // Raw video becomes available again after framesync.into_receiver().
-    println!("PTZ supported: {}", framesync.receiver().ptz_is_supported());
+    println!(
+        "PTZ supported: {}",
+        framesync.receiver().ptz().is_supported()
+    );
     println!("FrameSync created successfully");
     println!("\nCapturing {frame_count} frames with FrameSync...\n");
 
     let start_time = Instant::now();
     let mut video_frames = 0;
     let mut audio_samples_total = 0;
-    let mut last_video_timecode: i64 = 0;
+    let mut last_video_timecode = None;
     let mut repeated_timecodes = 0;
 
     // One audio block defines each software output tick. Video is sampled at
@@ -136,23 +135,20 @@ fn main() -> Result<(), Error> {
         let loop_start = Instant::now();
 
         // Sample available video without waiting for the next network frame.
-        if let Some(video) = framesync.capture_video(ScanType::Progressive)? {
+        if let Some(video) = framesync.capture_video_ref(ScanType::Progressive)? {
             // A repeated timecode can indicate repeated video; senders may also
             // assign identical timecodes to different frames.
-            if video.timecode() == last_video_timecode && video_frames > 0 {
+            if last_video_timecode == Some(video.timecode()) {
                 repeated_timecodes += 1;
             }
-            last_video_timecode = video.timecode();
+            last_video_timecode = Some(video.timecode());
 
             if video_frames == 0 {
                 println!("First video frame received:");
                 println!("  Resolution: {}x{}", video.width(), video.height());
                 println!("  Format: {:?}", video.pixel_format());
-                println!(
-                    "  Frame rate: {}/{}",
-                    video.frame_rate_n(),
-                    video.frame_rate_d()
-                );
+                let rate = video.frame_rate();
+                println!("  Frame rate: {}/{}", rate.numerator(), rate.denominator());
                 println!(
                     "  Data size: {} bytes",
                     video
@@ -172,7 +168,7 @@ fn main() -> Result<(), Error> {
         }
 
         // Request one output block; the SDK supplies silence if needed.
-        let audio = framesync.capture_audio(audio_request)?;
+        let audio = framesync.capture_audio_ref(audio_request)?;
         audio_samples_total += audio.num_samples() as usize;
 
         if video_frames == 1 {

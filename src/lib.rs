@@ -13,7 +13,7 @@
 //! x86_64, and its bindings are generated from the 6.4.0.2 headers. Other NDI 6
 //! releases have not been tested. A runtime provides only what its version
 //! offers: an operation it cannot perform returns
-//! [`Error::UnsupportedCapability`], and [`NDI::capabilities`] reports each
+//! [`Error::UnsupportedCapability`], and [`Ndi::capabilities`] reports each
 //! capability in advance.
 //!
 //! Windows, macOS, Linux and Android load the NDI runtime library when a
@@ -23,7 +23,7 @@
 //! [`Error::RuntimeLoadFailed`]. The selected library stays selected, and
 //! loaded, for the life of the process, and [`RuntimeOptions`] can name an
 //! exact library or SDK edition for that selection. NDI itself starts and
-//! stops with the [`NDI`] handles.
+//! stops with the [`Ndi`] handles.
 //!
 //! iOS, tvOS and visionOS targets link the static archive of the NDI SDK for
 //! Apple instead, selected from `NDI_SDK_DIR` at build time. With `file-io`,
@@ -36,16 +36,15 @@
 //! # Quick Start
 //!
 //! ```no_run
-//! use grafton_ndi::{NDI, FinderOptions, Finder};
+//! use grafton_ndi::{Ndi, FinderOptions, Finder};
 //! use std::time::Duration;
 //!
 //! # fn main() -> Result<(), grafton_ndi::Error> {
 //! // Select the default NDI runtime and start it
-//! let ndi = NDI::new()?;
+//! let ndi = Ndi::new()?;
 //!
 //! // Find sources on the network
-//! let options = FinderOptions::builder().show_local_sources(true).build();
-//! let finder = Finder::new(&ndi, &options)?;
+//! let finder = Finder::new(&ndi, &FinderOptions::new())?;
 //!
 //! // Discover sources
 //! let sources = finder.find_sources(Duration::from_secs(5))?;
@@ -64,7 +63,7 @@
 //! Using NDI takes two steps. [`Runtime::select`] loads the NDI runtime library
 //! and pins it for the process without starting NDI; the [`Runtime`] it returns
 //! describes the library. [`Runtime::initialize`] starts NDI and returns an
-//! [`NDI`] handle. [`NDI::new`] does both with the default options. Create a
+//! [`Ndi`] handle. [`Ndi::new`] does both with the default options. Create a
 //! handle before constructing SDK resources; those resources retain their own
 //! handles, and NDI stops when the last one is dropped. The [`runtime`] module
 //! describes where the runtime library is loaded from and how
@@ -77,15 +76,15 @@
 //! the [`finder`] module.
 //!
 //! [`SourceCache`] remembers which source belongs to a host, so repeated
-//! lookups of a known device skip discovery. A lookup takes the [`NDI`] handle;
+//! lookups of a known device skip discovery. A lookup takes the [`Ndi`] handle;
 //! the cached source descriptors need none.
 //!
 //! ```no_run
-//! use grafton_ndi::{SourceCache, NDI};
+//! use grafton_ndi::{SourceCache, Ndi};
 //! use std::time::Duration;
 //!
 //! # fn main() -> Result<(), grafton_ndi::Error> {
-//! let ndi = NDI::new()?;
+//! let ndi = Ndi::new()?;
 //! let cache = SourceCache::new();
 //! let camera = cache.find_by_host(&ndi, "192.168.1.100", Duration::from_secs(5))?;
 //! println!("Found: {camera}");
@@ -107,7 +106,7 @@
 //!
 //! ## Optional capabilities
 //!
-//! NDI runtimes differ in what they provide. [`NDI::capabilities`] reports
+//! NDI runtimes differ in what they provide. [`Ndi::capabilities`] reports
 //! each optional capability of the selected runtime, without assuming
 //! hardware or license availability, and an operation whose capability is
 //! missing returns [`Error::UnsupportedCapability`]; the rest of the API keeps
@@ -117,7 +116,7 @@
 //!
 //! - [`routing`]: a source that redirects its receivers to another source.
 //! - [`discovery`]: registration with, and listing of, an NDI Discovery Server.
-//! - [`utilities`] and [`video_conversion`]: checked audio and video
+//! - [`audio_conversion`] and [`video_conversion`]: checked audio and video
 //!   conversions.
 //! - `advanced` (Cargo feature `advanced`): NDI Advanced SDK operations. They
 //!   need the Advanced SDK headers at build time (`NDI_SDK_DIR` or a default
@@ -125,9 +124,9 @@
 //!   unavailable.
 //! - `file` (Cargo feature `file-io`): recording and playback through the NDI
 //!   File API.
-//! - `tokio` and `smol` (Cargo features of the same names): receivers for the
-//!   named async runtime.
-//! - PNG, JPEG and data-URL encoding of video frames, with the default
+//! - `asynchronous` (Cargo features `tokio` and `smol`): receivers for the
+//!   Tokio or smol async runtime.
+//! - PNG, JPEG and data-URL encoding of video frames, with the
 //!   `image-encoding` feature.
 //!
 //! # Thread Safety
@@ -145,16 +144,18 @@
 //! [`Sender::send_video_async`] takes ownership of a [`VideoFrame`] without
 //! copying its pixel or metadata allocations. The next submission returns the
 //! previous frame after SDK synchronization; finish recovers the final frame.
+//! Every video send first checks that the sender's runtime supports the
+//! frame's pixel format, and a frame it refuses comes back unsent.
 //!
 //! ```no_run
-//! # use grafton_ndi::{NDI, SenderOptions, VideoFrame, PixelFormat};
+//! # use grafton_ndi::{Ndi, SenderOptions, VideoFrame, PixelFormat};
 //! # fn main() -> Result<(), grafton_ndi::Error> {
-//! # let ndi = NDI::new()?;
-//! # let mut sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::builder("Test").build())?;
-//! let first = VideoFrame::builder().resolution(1920, 1080).pixel_format(PixelFormat::BGRA).build()?;
-//! let second = VideoFrame::builder().resolution(1920, 1080).pixel_format(PixelFormat::BGRA).build()?;
-//! assert!(sender.send_video_async(first).is_none());
-//! let mut reusable = sender.send_video_async(second).unwrap();
+//! # let ndi = Ndi::new()?;
+//! # let mut sender = grafton_ndi::Sender::new(&ndi, &SenderOptions::new("Test"))?;
+//! let first = VideoFrame::builder().resolution(1920, 1080).pixel_format(PixelFormat::Bgra).build()?;
+//! let second = VideoFrame::builder().resolution(1920, 1080).pixel_format(PixelFormat::Bgra).build()?;
+//! assert!(sender.send_video_async(first)?.is_none());
+//! let mut reusable = sender.send_video_async(second)?.unwrap();
 //! reusable.data_mut().fill(0);
 //! let final_frame = sender.finish_video_async().unwrap();
 //! # Ok(())
@@ -172,28 +173,25 @@
 //!
 //! Note: Only video supports async sending in the NDI SDK. Audio and metadata are always synchronous.
 
-#![allow(non_upper_case_globals)]
-#![allow(non_camel_case_types)]
-#![allow(clippy::wildcard_imports)]
-#![allow(clippy::must_use_candidate)]
-#![allow(clippy::missing_errors_doc)]
+#![warn(clippy::return_self_not_must_use)]
 
 mod capture;
 mod error;
+mod media;
 mod recv_guard;
 mod rejected;
 mod sys;
+mod time;
 mod timeout;
 
 pub mod framesync;
 
+pub mod audio_conversion;
 pub mod finder;
 pub mod frames;
 pub mod receiver;
 pub mod runtime;
 pub mod sender;
-mod timestamp;
-pub mod utilities;
 pub mod video_conversion;
 
 pub mod capabilities;
@@ -207,13 +205,7 @@ pub mod advanced;
 pub mod file;
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
-mod async_runtime;
-
-#[cfg(feature = "tokio")]
-pub use async_runtime::tokio;
-
-#[cfg(feature = "smol")]
-pub use async_runtime::smol;
+pub mod asynchronous;
 
 pub use {
     capabilities::{
@@ -222,7 +214,7 @@ pub use {
     },
     capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
     error::*,
-    finder::{Finder, FinderOptions, FinderOptionsBuilder, Source, SourceAddress, SourceCache},
+    finder::{Finder, FinderOptions, Source, SourceAddress, SourceCache},
     frames::{
         AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout, FormatCategory,
         MetadataFrame, MetadataFrameRef, PixelFormat, PixelFormatInfo, ScanType, VideoFrame,
@@ -230,18 +222,17 @@ pub use {
     },
     framesync::{FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncVideoRef},
     receiver::{
-        Capture, ConnectionStats, FrameSyncAttached, RawCapture, Receiver, ReceiverBandwidth,
-        ReceiverColorFormat, ReceiverEvent, ReceiverMode, ReceiverOptions, ReceiverOptionsBuilder,
-        ReceiverStatus, SourceNameChange, Tally,
+        Capture, ConnectionStats, FrameSyncAttached, Ptz, RawCapture, Receiver, ReceiverBandwidth,
+        ReceiverColorFormat, ReceiverEvent, ReceiverMode, ReceiverOptions, ReceiverStatus,
+        SettingChange, SourceNameChange, Tally,
     },
-    runtime::{ProcessLifetimeRuntime, Runtime, RuntimeOptions, NDI},
-    sender::{
-        BorrowedVideoFrame, BorrowedVideoFrameBuilder, Sender, SenderOptions, SenderOptionsBuilder,
-    },
+    runtime::{Ndi, ProcessLifetimeRuntime, Runtime, RuntimeOptions},
+    sender::{BorrowedVideoFrame, BorrowedVideoFrameBuilder, Sender, SenderOptions},
 };
 
+pub use media::{FourCc, FrameRate, MediaTypes, StreamTier};
 pub use rejected::Rejected;
-pub use timestamp::SdkTimestamp;
+pub use time::{SdkTimestamp, Timecode};
 
 #[cfg(feature = "image-encoding")]
 pub use frames::ImageFormat;
@@ -255,8 +246,7 @@ pub type Result<T> = std::result::Result<T, crate::error::Error>;
 /// reserves the largest value, 0xFFFFFFFF, for a wait without a limit (see
 /// the event functions in `Processing.NDI.RecvListener.h`). A finite wait is
 /// therefore never passed to the SDK as `u32::MAX`. A longer timeout is
-/// refused as invalid input: [`Error::InvalidConfiguration`], or
-/// `FileError::InvalidInput` from the File API.
+/// refused with [`Error::InvalidInput`].
 ///
 /// A timeout is rounded up to whole milliseconds, so a non-zero wait shorter
 /// than a millisecond becomes one millisecond, and only [`Duration::ZERO`]

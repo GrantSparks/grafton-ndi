@@ -13,7 +13,7 @@
 
 use std::{env, thread, time::Duration};
 
-use grafton_ndi::{Error, Receiver, ReceiverBandwidth, ReceiverOptions, NDI};
+use grafton_ndi::{Error, Ndi, Receiver, ReceiverBandwidth, ReceiverOptions};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -27,7 +27,7 @@ fn main() -> Result<(), Error> {
     println!("=========================================\n");
 
     // Initialize the NDI runtime
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
     println!("NDI initialized successfully\n");
 
     // Configure the finder
@@ -54,10 +54,9 @@ fn main() -> Result<(), Error> {
     println!("Connecting to: {}\n", source);
 
     // Create a receiver for audio
-    let options = ReceiverOptions::builder(source)
+    let options = ReceiverOptions::new(source)
         .bandwidth(ReceiverBandwidth::AudioOnly)
-        .name("Audio Capture Example")
-        .build();
+        .name("Audio Capture Example");
     let receiver = Receiver::new(&ndi, &options)?;
 
     println!("Receiver created successfully");
@@ -65,13 +64,16 @@ fn main() -> Result<(), Error> {
 
     // Capture a few audio frames
     for i in 0..5 {
-        match receiver.audio().try_capture(Duration::from_secs(5))? {
+        match receiver.audio().capture(Duration::from_secs(5))? {
             Some(audio_frame) => {
                 println!("Frame {}: ", i + 1);
                 println!("  Sample rate: {} Hz", audio_frame.sample_rate());
                 println!("  Channels: {}", audio_frame.num_channels());
                 println!("  Samples: {}", audio_frame.num_samples());
-                println!("  Timestamp: {}", audio_frame.timestamp());
+                match audio_frame.timestamp() {
+                    Some(timestamp) => println!("  Timestamp: {} ticks", timestamp.ticks()),
+                    None => println!("  Timestamp: unknown"),
+                }
                 println!("  Format: {:?}", audio_frame.format());
 
                 // Get the audio data as f32

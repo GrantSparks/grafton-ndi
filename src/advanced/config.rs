@@ -8,7 +8,9 @@ use crate::{Error, Result};
 /// and several other objects; the document's properties are defined by the
 /// NDI Advanced SDK documentation. This type holds one such document: it is
 /// checked to be a JSON object, kept byte for byte (unknown properties
-/// included), immutable, and cheap to clone.
+/// included), immutable, and cheap to clone. An object takes it through the
+/// `config` setter of its options, such as
+/// [`SenderOptions::config`](crate::SenderOptions::config).
 ///
 /// A configuration can carry vendor credentials or network details, so its
 /// `Debug` output shows no content and no error message quotes it.
@@ -30,7 +32,7 @@ impl AdvancedConfig {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidConfiguration`] when the text is too large, is not
+    /// [`Error::InvalidInput`] when the text is too large, is not
     /// valid JSON, is not an object, or contains a NUL.
     pub fn parse(json: impl AsRef<str>) -> Result<Self> {
         Self::parse_with_limit(json, 1024 * 1024)
@@ -44,21 +46,19 @@ impl AdvancedConfig {
     pub fn parse_with_limit(json: impl AsRef<str>, maximum_bytes: usize) -> Result<Self> {
         let json = json.as_ref();
         if json.len() > maximum_bytes {
-            return Err(Error::InvalidConfiguration(
+            return Err(Error::InvalidInput(
                 "Advanced configuration exceeds its byte limit".into(),
             ));
         }
-        let value: serde_json::Value = serde_json::from_str(json).map_err(|_| {
-            Error::InvalidConfiguration("Invalid Advanced configuration JSON".into())
-        })?;
+        let value: serde_json::Value = serde_json::from_str(json)
+            .map_err(|_| Error::InvalidInput("Invalid Advanced configuration JSON".into()))?;
         if !value.is_object() {
-            return Err(Error::InvalidConfiguration(
+            return Err(Error::InvalidInput(
                 "Advanced configuration must be a JSON object".into(),
             ));
         }
-        let json = CString::new(json).map_err(|_| {
-            Error::InvalidConfiguration("Advanced configuration contains NUL".into())
-        })?;
+        let json = CString::new(json)
+            .map_err(|_| Error::InvalidInput("Advanced configuration contains NUL".into()))?;
         Ok(Self(Arc::new(json)))
     }
 
@@ -67,6 +67,14 @@ impl AdvancedConfig {
     pub fn expose_json(&self) -> &str {
         // Construction accepts UTF-8 and CString never changes those bytes.
         self.0.to_str().expect("validated configuration UTF-8")
+    }
+
+    /// `config`, or the empty configuration `{}` without one: the
+    /// configuration of an object whose only creation function takes one.
+    pub(crate) fn or_empty(config: Option<&Self>) -> Self {
+        config
+            .cloned()
+            .unwrap_or_else(|| Self(Arc::new(c"{}".to_owned())))
     }
 
     /// The text as a C string. Every clone shares this one buffer, which
@@ -96,5 +104,19 @@ mod tests {
         assert!(AdvancedConfig::parse_with_limit(input, 3).is_err());
         let error = AdvancedConfig::parse("{\"private-value\":").unwrap_err();
         assert!(!error.to_string().contains("private-value"));
+    }
+
+    #[test]
+    fn a_missing_configuration_becomes_the_empty_object() {
+        let empty = AdvancedConfig::or_empty(None);
+        assert_eq!(empty.expose_json(), "{}");
+        assert_eq!(
+            empty.expose_json(),
+            AdvancedConfig::parse("{}").unwrap().expose_json()
+        );
+        let given = AdvancedConfig::parse(r#"{"ndi":{}}"#).unwrap();
+        let kept = AdvancedConfig::or_empty(Some(&given));
+        // The same shared buffer, not a copy of the text.
+        assert_eq!(kept.as_ptr(), given.as_ptr());
     }
 }

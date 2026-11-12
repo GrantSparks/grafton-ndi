@@ -2,25 +2,22 @@
 
 use std::time::Duration;
 
-use grafton_ndi::{Receiver, ReceiverOptions, Source, SourceAddress, NDI};
+use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
 
-fn receiver(ndi: &NDI) -> Receiver {
-    let source = Source {
-        name: "compile-contract".to_owned(),
-        address: SourceAddress::None,
-    };
-    let options = ReceiverOptions::builder(source).build();
+fn receiver(ndi: &Ndi) -> Receiver {
+    let source = Source::new("compile-contract");
+    let options = ReceiverOptions::new(source);
     Receiver::new(ndi, &options).unwrap()
 }
 
 fn main() {
-    let ndi = NDI::new().unwrap();
+    let ndi = Ndi::new().unwrap();
 
     let frame_ref = {
         let receiver = receiver(&ndi);
         receiver
             .metadata()
-            .try_capture_ref(Duration::from_millis(1))
+            .capture_ref(Duration::from_millis(1))
             .unwrap()
             .unwrap()
     };

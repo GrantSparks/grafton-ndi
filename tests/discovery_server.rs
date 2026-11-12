@@ -15,7 +15,7 @@ use grafton_ndi::{
         AdvertisedReceiver, AdvertiserOptions, ListenerOptions, ReceiverCommand, RecvAdvertisement,
         RecvAdvertiser, RecvListener, SendAdvertisement, SendAdvertiser, SendListener,
     },
-    Error, Receiver, ReceiverOptions, Sender, SenderOptions, Source, NDI,
+    Error, Ndi, Receiver, ReceiverOptions, Sender, SenderOptions, Source,
 };
 use std::{
     io::{BufRead, BufReader, Write},
@@ -29,7 +29,7 @@ use common::discovery_server::{free_port, server_binary, Server, SETTLE};
 
 /// A runtime whose advertisers and listeners are usable, or `None` after
 /// reporting the skip.
-fn discovery_runtime() -> Option<NDI> {
+fn discovery_runtime() -> Option<Ndi> {
     let ndi = common::ndi()?;
     let unsupported = [
         RuntimeFeature::SenderAdvertising,
@@ -51,7 +51,7 @@ fn discovery_runtime() -> Option<NDI> {
 /// That runtime and the server binary of the SDK it belongs to
 /// (`<root>/bin/<target>/ndi-discovery-server` beside `<root>/lib/<target>/`),
 /// or `None` after reporting the skip.
-fn discovery_server() -> Option<(NDI, PathBuf)> {
+fn discovery_server() -> Option<(Ndi, PathBuf)> {
     let ndi = discovery_runtime()?;
     let binary = server_binary(&ndi);
     match binary {
@@ -79,17 +79,17 @@ fn eventually<T>(what: &str, mut observe: impl FnMut() -> Option<T>) -> T {
 
 /// A sender named `label`, made unique to this process: the runtime takes a
 /// lock named after each sender and each named receiver.
-fn sender(ndi: &NDI, label: &str) -> Sender {
-    let options = SenderOptions::builder(common::unique_name(label))
+fn sender(ndi: &Ndi, label: &str) -> Sender {
+    let options = SenderOptions::new(common::unique_name(label))
         .clock_video(false)
         .clock_audio(false);
-    Sender::new(ndi, &options.build()).unwrap()
+    Sender::new(ndi, &options).unwrap()
 }
 
 /// A receiver named `label`, made unique to this process like a [`sender`].
-fn receiver(ndi: &NDI, label: &str) -> Receiver {
-    let options = ReceiverOptions::builder(Source::default()).name(common::unique_name(label));
-    Receiver::new(ndi, &options.build()).unwrap()
+fn receiver(ndi: &Ndi, label: &str) -> Receiver {
+    let options = ReceiverOptions::new(Source::new("")).name(common::unique_name(label));
+    Receiver::new(ndi, &options).unwrap()
 }
 
 /// The advertised receiver that [`receiver`] created for `label`: the registry
@@ -111,7 +111,7 @@ fn advertised_senders_and_receivers_reach_listeners() {
 
     // A sender registered with one advertiser appears to a sender listener.
     let sender = sender(&ndi, "grafton discovery loopback sender");
-    let sender_name = sender.source().unwrap().name;
+    let sender_name = sender.source().unwrap().name().to_owned();
     let mut send_advertiser = SendAdvertiser::new(&ndi, &server.advertisers()).unwrap();
     let sender_registration = send_advertiser
         .register(&sender, SendAdvertisement::default().allow_monitoring(true))
@@ -206,7 +206,7 @@ fn advertised_senders_and_receivers_reach_listeners() {
     ));
 
     // Removing a registration removes the peer from the registry.
-    assert!(send_advertiser.unregister(sender_registration).unwrap());
+    send_advertiser.unregister(sender_registration).unwrap();
     eventually("the sender to leave the registry", || {
         send_listener
             .wait_for_changes(Duration::from_millis(100))
@@ -218,9 +218,9 @@ fn advertised_senders_and_receivers_reach_listeners() {
             .all(|advertised| advertised.id() != Some(&sender_id))
             .then_some(())
     });
-    assert!(recv_advertiser
+    recv_advertiser
         .unregister(controllable_registration)
-        .unwrap());
+        .unwrap();
     eventually("the receiver to leave the registry", || {
         recv_listener
             .wait_for_changes(Duration::from_millis(100))
@@ -244,7 +244,7 @@ fn creation_does_not_wait_for_the_server() {
     // reports that it is not connected.
     let endpoint = "127.0.0.1:1";
     let advertisers = AdvertiserOptions::default().servers(endpoint);
-    let listeners = ListenerOptions::default().server(endpoint).unwrap();
+    let listeners = ListenerOptions::default().server(endpoint);
     let sender = sender(&ndi, "grafton discovery unreachable sender");
     let receiver = receiver(&ndi, "grafton discovery unreachable receiver");
     let mut send_advertiser = SendAdvertiser::new(&ndi, &advertisers).unwrap();
@@ -267,10 +267,10 @@ fn creation_does_not_wait_for_the_server() {
     for address in ["", "not a host:xyz", "127.0.0.1:99999"] {
         let errors = [
             SendAdvertiser::new(&ndi, &AdvertiserOptions::default().servers(address)).err(),
-            SendListener::new(&ndi, &ListenerOptions::default().server(address).unwrap()).err(),
+            SendListener::new(&ndi, &ListenerOptions::default().server(address)).err(),
         ];
         for error in errors {
-            let Some(Error::InvalidConfiguration(reason)) = error else {
+            let Some(Error::InvalidInput(reason)) = error else {
                 panic!("{address:?}: expected a creation failure, got {error:?}");
             };
             assert!(reason.contains(&format!("{address:?}")), "{reason}");
@@ -288,7 +288,7 @@ fn objects_connect_when_their_server_appears() {
     let port = free_port();
     let endpoint = format!("127.0.0.1:{port}");
     let sender = sender(&ndi, "grafton discovery late server sender");
-    let sender_name = sender.source().unwrap().name;
+    let sender_name = sender.source().unwrap().name().to_owned();
     let mut advertiser = SendAdvertiser::new(
         &ndi,
         &AdvertiserOptions::default().servers(endpoint.as_str()),
@@ -297,13 +297,8 @@ fn objects_connect_when_their_server_appears() {
     advertiser
         .register(&sender, SendAdvertisement::default())
         .unwrap();
-    let mut listener = SendListener::new(
-        &ndi,
-        &ListenerOptions::default()
-            .server(endpoint.as_str())
-            .unwrap(),
-    )
-    .unwrap();
+    let mut listener =
+        SendListener::new(&ndi, &ListenerOptions::default().server(endpoint.as_str())).unwrap();
     assert!(!listener.is_connected());
 
     // Once a server appears there, both connect on their own and the

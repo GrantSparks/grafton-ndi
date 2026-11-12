@@ -42,18 +42,18 @@
 //!
 //! ```no_run
 //! use grafton_ndi::{
-//!     NDI, Finder, FinderOptions, ReceiverOptions, Receiver, FrameSync,
+//!     Ndi, Finder, FinderOptions, ReceiverOptions, Receiver, FrameSync,
 //!     FrameSyncAudioRequest, ScanType,
 //! };
 //! use std::time::Duration;
 //!
 //! fn main() -> Result<(), grafton_ndi::Error> {
-//!     let ndi = NDI::new()?;
+//!     let ndi = Ndi::new()?;
 //!     let finder = Finder::new(&ndi, &FinderOptions::default())?;
 //!     finder.wait_for_sources(Duration::from_secs(1))?;
 //!     let sources = finder.current_sources()?;
 //!
-//!     let options = ReceiverOptions::builder(sources[0].clone()).build();
+//!     let options = ReceiverOptions::new(sources[0].clone());
 //!     let receiver = Receiver::new(&ndi, &options)?;
 //!
 //!     // Create frame-sync from receiver
@@ -65,9 +65,10 @@
 //!     }
 //!
 //!     // Capture audio at your sound card's rate
-//!     let request = FrameSyncAudioRequest::capture_with(Some(48_000), 2, 1_024)?;
-//!     let audio = framesync.capture_audio(request)?;
-//!     println!("{} audio samples", audio.num_samples());
+//!     let request = FrameSyncAudioRequest::capture_at(48_000, 2, 1_024)?;
+//!     if let Some(audio) = framesync.capture_audio(request)? {
+//!         println!("{} audio samples", audio.num_samples());
+//!     }
 //!
 //!     Ok(())
 //! }
@@ -78,11 +79,12 @@ use std::fmt;
 use crate::{
     capture::{FrameSyncAudioFree, FrameSyncVideoFree, Guard},
     frames::{
-        validate_packed_audio_dimensions, AudioFrame, AudioRef, ScanType, VideoFrame, VideoRef,
+        validate_audio_sample_rate, validate_packed_audio_dimensions, AudioFrame, AudioRef,
+        ScanType, VideoFrame, VideoRef,
     },
     receiver::{FrameSyncAttached, Receiver},
     sys::bindings::*,
-    Error, Result,
+    Error, Rejected, Result,
 };
 
 /// A zero-copy borrowed video frame from a [`FrameSync`] capture.
@@ -103,14 +105,14 @@ pub type FrameSyncVideoRef<'fs> = VideoRef<'fs, FrameSyncVideoFree>;
 /// spelling is [`AudioFrameRef`](crate::AudioFrameRef). The FrameSync path can
 /// produce a validated empty query/no-source state, so
 /// [`is_empty`](AudioRef::is_empty) and an `Option`-returning
-/// [`format`](AudioRef::format)/[`to_owned`](AudioRef::to_owned) are available.
+/// [`format`](AudioRef::format)/[`try_to_owned`](AudioRef::try_to_owned) are available.
 /// The frame is automatically freed when dropped via
 /// `NDIlib_framesync_free_audio_v2`.
 pub type FrameSyncAudioRef<'fs> = AudioRef<'fs, FrameSyncAudioFree>;
 
 /// A validated, reusable audio operation for [`FrameSync::capture_audio`].
 ///
-/// [`capture`](Self::capture) and [`capture_with`](Self::capture_with) require
+/// [`capture`](Self::capture) and [`capture_at`](Self::capture_at) require
 /// explicit positive output channels and samples per channel. Construction checks
 /// the SDK's signed byte stride and the 64 MiB packed sample payload limit before
 /// any native work. This bounds requested samples, not SDK internal memory use.
@@ -123,55 +125,68 @@ pub type FrameSyncAudioRef<'fs> = AudioRef<'fs, FrameSyncAudioFree>;
 /// channel count, then build a capture request with that concrete count. Re-query
 /// and rebuild when the application chooses to follow format changes. The SDK
 /// converts to the explicit output count even if the source changes meanwhile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FrameSyncAudioRequest {
+    // The SDK's signed arguments: all zero for a query, otherwise checked
+    // positive (the sample rate is zero for the source's rate).
     sample_rate: i32,
-    channels: i32,
-    samples: i32,
+    num_channels: i32,
+    num_samples: i32,
 }
 
 impl FrameSyncAudioRequest {
     /// Query the current incoming audio format without requesting sample data.
     /// The result has zero sample rate and channels if no input format is known.
+    #[must_use]
     pub const fn query_input() -> Self {
         Self {
             sample_rate: 0,
-            channels: 0,
-            samples: 0,
+            num_channels: 0,
+            num_samples: 0,
         }
     }
 
-    /// Capture samples using the source sample rate and explicit output channels.
+    /// Capture samples at the source's sample rate, converted to
+    /// `num_channels` channels of `num_samples` samples each.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidFrame`] for nonpositive dimensions, an
+    /// Returns [`Error::InvalidFrame`] for a zero dimension, an
     /// unrepresentable signed byte stride, arithmetic overflow, or a sample
     /// payload exceeding 64 MiB. Validation does not allocate sample storage.
-    pub fn capture(channels: i32, samples: i32) -> Result<Self> {
-        Self::capture_with(None, channels, samples)
+    pub fn capture(num_channels: u32, num_samples: u32) -> Result<Self> {
+        Self::checked(0, num_channels, num_samples)
     }
 
-    /// Capture samples with an optional source-derived sample rate.
+    /// Capture samples resampled to `sample_rate` Hz, converted to
+    /// `num_channels` channels of `num_samples` samples each.
     ///
-    /// `None` uses the current source rate. `Some(rate)` must be positive.
-    /// Channels and samples per channel must always be explicitly positive.
     /// A request can be copied and reused across borrowed and owned captures.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidFrame`] for a nonpositive explicit sample rate or
-    /// invalid dimensions as described in [`capture`](Self::capture).
-    pub fn capture_with(sample_rate: Option<i32>, channels: i32, samples: i32) -> Result<Self> {
-        if let Some(rate) = sample_rate {
-            crate::frames::validate_audio_sample_rate(rate)?;
-        }
-        validate_packed_audio_dimensions(channels, samples)?;
+    /// Returns [`Error::InvalidFrame`] for a sample rate outside
+    /// `1..=i32::MAX` or invalid dimensions as described in
+    /// [`capture`](Self::capture).
+    pub fn capture_at(sample_rate: u32, num_channels: u32, num_samples: u32) -> Result<Self> {
+        let sample_rate = validate_audio_sample_rate(sample_rate.into())?;
+        Self::checked(sample_rate, num_channels, num_samples)
+    }
+
+    /// A capture request with a checked or zero (source) sample rate.
+    fn checked(sample_rate: u32, num_channels: u32, num_samples: u32) -> Result<Self> {
+        validate_packed_audio_dimensions(num_channels, num_samples)?;
+        // Lossless: the rate and the packed dimensions were checked to fit
+        // the SDK's signed arguments.
         Ok(Self {
-            sample_rate: sample_rate.unwrap_or(0),
-            channels,
-            samples,
+            sample_rate: sample_rate as i32,
+            num_channels: num_channels as i32,
+            num_samples: num_samples as i32,
         })
+    }
+
+    fn is_query(self) -> bool {
+        self.num_samples == 0
     }
 }
 
@@ -190,11 +205,12 @@ impl FrameSyncAudioRequest {
 /// # Thread Safety
 ///
 /// `FrameSync` is `Send + Sync` like `Receiver`, as the underlying NDI SDK
-/// frame-sync functions are thread-safe. Frames returned by capture methods
-/// borrow from the FrameSync and are neither `Send` nor `Sync`. Convert them
-/// to owned frames to transfer ownership to another thread. Immutable video
-/// plane/row views can instead be moved or shared with scoped workers while
-/// the frame guard stays on its capture thread until those workers finish.
+/// frame-sync functions are thread-safe. The `capture_*` methods return owned
+/// frames, which can move to another thread. Frames returned by the
+/// `capture_*_ref` methods borrow from the FrameSync and are neither `Send`
+/// nor `Sync`; their immutable video plane/row views can instead be moved or
+/// shared with scoped workers while the frame guard stays on its capture
+/// thread until those workers finish.
 ///
 /// Raw video capture through the underlying receiver is disabled while this
 /// FrameSync exists. [`Self::into_receiver`] destroys the synchronizer and
@@ -203,23 +219,21 @@ impl FrameSyncAudioRequest {
 /// # Example
 ///
 /// ```no_run
-/// # use grafton_ndi::{NDI, ReceiverOptions, Receiver, FrameSync, FrameSyncAudioRequest, Source, SourceAddress, ScanType};
+/// # use grafton_ndi::{Ndi, ReceiverOptions, Receiver, FrameSync, FrameSyncAudioRequest, Source, SourceAddress, ScanType};
 /// # fn main() -> Result<(), grafton_ndi::Error> {
-/// # let ndi = NDI::new()?;
-/// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-/// # let options = ReceiverOptions::builder(source).build();
+/// # let ndi = Ndi::new()?;
+/// # let source = Source::new("Test");
+/// # let options = ReceiverOptions::new(source);
 /// # let receiver = Receiver::new(&ndi, &options)?;
 /// let framesync = FrameSync::new(receiver)?;
 ///
 /// // Sample available data without waiting for a new network frame
-/// if let Some(video) = framesync.capture_video(ScanType::Progressive)? {
+/// if let Some(video) = framesync.capture_video_ref(ScanType::Progressive)? {
 ///     println!("Video: {}x{}", video.width(), video.height());
 /// }
 ///
 /// // Audio capture fixes the output dimensions before entering the SDK.
-/// let audio = framesync.capture_audio(FrameSyncAudioRequest::capture_with(
-///     Some(48_000), 2, 1_024,
-/// )?)?;
+/// let audio = framesync.capture_audio_ref(FrameSyncAudioRequest::capture_at(48_000, 2, 1_024)?)?;
 /// println!("Audio: {} samples", audio.num_samples());
 /// # Ok(())
 /// # }
@@ -234,7 +248,7 @@ pub struct FrameSync {
 struct FrameSyncResource {
     instance: NDIlib_framesync_instance_t,
     // Retain the runtime directly until after native destruction.
-    _ndi: crate::NDI,
+    _ndi: crate::Ndi,
 }
 
 impl Drop for FrameSyncResource {
@@ -256,22 +270,24 @@ impl FrameSync {
     ///
     /// # Errors
     ///
-    /// Returns an error if the NDI SDK fails to create the frame-sync instance.
+    /// Returns the receiver, unchanged, with
+    /// [`Error::NativeOperationFailed`] if the NDI SDK does not create the
+    /// frame-sync instance.
     ///
     /// # Example
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, ReceiverOptions, Receiver, FrameSync, Source, SourceAddress};
+    /// # use grafton_ndi::{Ndi, ReceiverOptions, Receiver, FrameSync, Source, SourceAddress};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let options = ReceiverOptions::builder(source).build();
+    /// # let ndi = Ndi::new()?;
+    /// # let source = Source::new("Test");
+    /// # let options = ReceiverOptions::new(source);
     /// let receiver = Receiver::new(&ndi, &options)?;
     /// let framesync = FrameSync::new(receiver)?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new(receiver: Receiver) -> Result<Self> {
+    pub fn new(receiver: Receiver) -> std::result::Result<Self, Rejected<Receiver>> {
         // SAFETY: The owned receiver retains a live SDK resource through creation;
         // successful creation transfers both resources into the ordered owners.
         let core = &receiver.core._ndi.api().core;
@@ -283,13 +299,16 @@ impl FrameSync {
     fn new_with(
         receiver: Receiver,
         create: impl FnOnce(NDIlib_recv_instance_t) -> NDIlib_framesync_instance_t,
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, Rejected<Receiver>> {
         let instance = create(receiver.core.instance);
         if instance.is_null() {
-            // The untouched raw receiver drops normally on creation failure.
-            return Err(Error::NativeOperationFailed {
-                operation: "NDIlib_framesync_create",
-            });
+            // The untouched raw receiver goes back to the caller.
+            return Err(Rejected::new(
+                Error::NativeOperationFailed {
+                    operation: "NDIlib_framesync_create",
+                },
+                receiver,
+            ));
         }
         let resource = FrameSyncResource {
             instance,
@@ -322,34 +341,39 @@ impl FrameSync {
         receiver.into_mode()
     }
 
-    /// Capture video with time-base correction.
+    /// Capture video with time-base correction, as an owned frame that can
+    /// be sent across threads.
     ///
     /// This does not wait for a new network frame. It returns the best frame for
     /// the current output timing, handling clock drift and jitter automatically.
     /// The same frame may be returned multiple times when capture rate exceeds
     /// source frame rate. Wrapper synchronization and SDK processing still take time.
+    /// [`Self::capture_video_ref`] borrows the frame instead of copying it.
     ///
     /// # Arguments
     ///
-    /// * `field_type` - The desired field format. Use `ScanType::Progressive` for
+    /// * `scan_type` - The desired field format. Use `ScanType::Progressive` for
     ///   most applications. For interlaced output, use the appropriate field type
     ///   to maintain correct field ordering.
     ///
     /// # Returns
     ///
-    /// * `Ok(Some(FrameSyncVideoRef))` - A validated zero-copy reference to the captured frame
+    /// * `Ok(Some(VideoFrame))` - An owned copy of the captured frame
     /// * `Ok(None)` - The SDK returned the documented all-zero "no video yet" state
-    /// * `Err(_)` - The SDK returned an unsupported format or malformed frame
-    ///   descriptor, including invalid dimensions, stride, buffers, or metadata
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::capture_video_ref`], and when the owned copy is not a
+    /// valid frame.
     ///
     /// # Example
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, ReceiverOptions, Receiver, FrameSync, Source, SourceAddress, ScanType};
+    /// # use grafton_ndi::{Ndi, ReceiverOptions, Receiver, FrameSync, Source, SourceAddress, ScanType};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let options = ReceiverOptions::builder(source).build();
+    /// # let ndi = Ndi::new()?;
+    /// # let source = Source::new("Test");
+    /// # let options = ReceiverOptions::new(source);
     /// # let receiver = Receiver::new(&ndi, &options)?;
     /// let framesync = FrameSync::new(receiver)?;
     ///
@@ -357,9 +381,10 @@ impl FrameSync {
     /// loop {
     ///     if let Some(frame) = framesync.capture_video(ScanType::Progressive)? {
     ///         // Process/display frame
+    ///         let rate = frame.frame_rate();
     ///         println!("{}x{} @ {}/{} fps",
     ///             frame.width(), frame.height(),
-    ///             frame.frame_rate_n(), frame.frame_rate_d());
+    ///             rate.numerator(), rate.denominator());
     ///     } else {
     ///         // No video received yet - display placeholder
     ///         println!("Waiting for video...");
@@ -369,7 +394,28 @@ impl FrameSync {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn capture_video(&self, field_type: ScanType) -> Result<Option<FrameSyncVideoRef<'_>>> {
+    pub fn capture_video(&self, scan_type: ScanType) -> Result<Option<VideoFrame>> {
+        self.capture_video_ref(scan_type)?
+            .map(|frame| frame.try_to_owned())
+            .transpose()
+    }
+
+    /// Capture video with time-base correction, borrowing the SDK's frame
+    /// without copying it.
+    ///
+    /// Timing is as for [`Self::capture_video`].
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(FrameSyncVideoRef))` - A validated zero-copy reference to the captured frame
+    /// * `Ok(None)` - The SDK returned the documented all-zero "no video yet" state
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidFrame`] when the SDK returned an unsupported
+    /// format or malformed frame descriptor, including invalid dimensions,
+    /// stride, buffers, or metadata.
+    pub fn capture_video_ref(&self, scan_type: ScanType) -> Result<Option<FrameSyncVideoRef<'_>>> {
         let mut frame = NDIlib_video_frame_v2_t::default();
 
         // SAFETY: the FrameSync instance is live for this borrow and `frame` is
@@ -378,7 +424,7 @@ impl FrameSync {
             self.core().NDIlib_framesync_capture_video(
                 self.resource.instance,
                 &mut frame,
-                field_type.into(),
+                scan_type.to_sdk(),
             );
         }
 
@@ -398,45 +444,69 @@ impl FrameSync {
         Ok(Some(frame))
     }
 
-    /// Capture video and convert to an owned frame.
-    ///
-    /// This is a convenience method that captures video and immediately converts
-    /// it to an owned [`VideoFrame`] that can be sent across threads.
-    ///
-    /// # Arguments
-    ///
-    /// * `field_type` - The desired field format.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Some(VideoFrame))` - An owned copy of the captured frame
-    /// * `Ok(None)` - No video has been received yet
-    ///
-    /// # Errors
-    ///
-    /// Propagates format and frame-validation errors from [`Self::capture_video`]
-    /// or conversion to an owned frame.
-    pub fn capture_video_owned(&self, field_type: ScanType) -> Result<Option<VideoFrame>> {
-        self.capture_video(field_type)?
-            .map(|frame| frame.to_owned())
-            .transpose()
-    }
-
-    /// Capture audio with dynamic resampling.
+    /// Capture audio with dynamic resampling, as an owned frame that can be
+    /// sent across threads.
     ///
     /// This does not wait for new network audio. Capture requests ask the NDI
     /// SDK to resample incoming audio to match the requested sample rate,
-    /// channel count, and sample count. Query requests return the current input
-    /// format without requesting samples. Wrapper synchronization and resampling
-    /// still take time.
+    /// channel count, and sample count. Wrapper synchronization and resampling
+    /// still take time. [`Self::capture_audio_ref`] borrows the samples
+    /// instead of copying them.
     ///
     /// Call this at the rate you need audio - the SDK will adapt the incoming
     /// signal to match your output timing using dynamic audio sampling.
     ///
     /// # Arguments
     ///
-    /// * `request` - Explicit capture or query operation. For capture requests,
-    ///   `None` sample rate means "use the current source rate"; channels are explicit.
+    /// * `request` - Explicit capture or query operation; see
+    ///   [`FrameSyncAudioRequest`].
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(AudioFrame))` - An owned copy of the captured samples
+    /// * `Ok(None)` - A query request, which returns the input format but no
+    ///   samples; use [`Self::capture_audio_ref`] to read that format
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::capture_audio_ref`], and when the owned copy is not a
+    /// valid frame.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{Ndi, ReceiverOptions, Receiver, FrameSync, FrameSyncAudioRequest, Source, SourceAddress};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = Ndi::new()?;
+    /// # let source = Source::new("Test");
+    /// # let options = ReceiverOptions::new(source);
+    /// # let receiver = Receiver::new(&ndi, &options)?;
+    /// let framesync = FrameSync::new(receiver)?;
+    ///
+    /// // Audio callback - called by sound card at its rate
+    /// let request = FrameSyncAudioRequest::capture_at(48_000, 2, 1_024)?;
+    ///
+    /// loop {
+    ///     // Request 1024 stereo samples at 48kHz
+    ///     if let Some(audio) = framesync.capture_audio(request)? {
+    ///         // Process each channel.
+    ///         for samples in audio.channels() {
+    ///             println!("Got {} samples in a channel", samples.len());
+    ///         }
+    ///     }
+    ///     # break;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn capture_audio(&self, request: FrameSyncAudioRequest) -> Result<Option<AudioFrame>> {
+        self.capture_audio_ref(request)?.try_to_owned()
+    }
+
+    /// Capture audio with dynamic resampling, borrowing the SDK's samples
+    /// without copying them.
+    ///
+    /// Resampling is as for [`Self::capture_audio`].
     ///
     /// # Querying Input Format
     ///
@@ -454,36 +524,27 @@ impl FrameSync {
     /// # Example
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, ReceiverOptions, Receiver, FrameSync, FrameSyncAudioRequest, Source, SourceAddress};
+    /// # use grafton_ndi::{Ndi, ReceiverOptions, Receiver, FrameSync, FrameSyncAudioRequest, Source, SourceAddress};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let options = ReceiverOptions::builder(source).build();
+    /// # let ndi = Ndi::new()?;
+    /// # let source = Source::new("Test");
+    /// # let options = ReceiverOptions::new(source);
     /// # let receiver = Receiver::new(&ndi, &options)?;
     /// let framesync = FrameSync::new(receiver)?;
     ///
-    /// // Audio callback - called by sound card at its rate
-    /// let request = FrameSyncAudioRequest::capture_with(Some(48_000), 2, 1_024)?;
-    ///
-    /// loop {
-    ///     // Request 1024 stereo samples at 48kHz
-    ///     let audio = framesync.capture_audio(request)?;
-    ///
-    ///     // Process each channel without reading inter-channel padding.
-    ///     for samples in audio.channels() {
-    ///         println!("Got {} samples in a channel", samples.len());
-    ///     }
-    ///
-    ///     // Check for a validated query/no-source empty state
-    ///     if audio.is_empty() {
-    ///         println!("No audio source yet");
-    ///     }
-    ///     # break;
+    /// let input = framesync.capture_audio_ref(FrameSyncAudioRequest::query_input())?;
+    /// if input.is_empty() && input.num_channels() == 0 {
+    ///     println!("No audio source yet");
+    /// } else {
+    ///     println!("{} channels at {} Hz", input.num_channels(), input.sample_rate());
     /// }
     /// # Ok(())
     /// # }
     /// ```
-    pub fn capture_audio(&self, request: FrameSyncAudioRequest) -> Result<FrameSyncAudioRef<'_>> {
+    pub fn capture_audio_ref(
+        &self,
+        request: FrameSyncAudioRequest,
+    ) -> Result<FrameSyncAudioRef<'_>> {
         let mut frame = NDIlib_audio_frame_v3_t::default();
 
         #[cfg(test)]
@@ -500,8 +561,8 @@ impl FrameSync {
                 self.resource.instance,
                 &mut frame,
                 request.sample_rate,
-                request.channels,
-                request.samples,
+                request.num_channels,
+                request.num_samples,
             );
         }
 
@@ -510,28 +571,7 @@ impl FrameSync {
         let guard = unsafe {
             Guard::<FrameSyncAudioFree>::new(&self.resource._ndi, self.resource.instance, frame)
         };
-        unsafe { FrameSyncAudioRef::new(guard, request.samples == 0) }
-    }
-
-    /// Capture audio and convert to an owned frame.
-    ///
-    /// This is a convenience method that captures audio and immediately converts
-    /// it to an owned [`AudioFrame`] that can be sent across threads. Query or
-    /// no-source states that contain no sample buffer return `Ok(None)`.
-    ///
-    /// # Arguments
-    ///
-    /// * `request` - Explicit capture or query operation.
-    ///
-    /// # Errors
-    ///
-    /// Propagates returned-frame validation and owned-copy errors from
-    /// [`Self::capture_audio`] and [`AudioRef::to_owned`].
-    pub fn capture_audio_owned(
-        &self,
-        request: FrameSyncAudioRequest,
-    ) -> Result<Option<AudioFrame>> {
-        self.capture_audio(request)?.to_owned()
+        unsafe { FrameSyncAudioRef::new(guard, request.is_query()) }
     }
 
     /// Query the current audio queue depth.
@@ -546,11 +586,11 @@ impl FrameSync {
     /// # Example
     ///
     /// ```no_run
-    /// # use grafton_ndi::{NDI, ReceiverOptions, Receiver, FrameSync, Source, SourceAddress};
+    /// # use grafton_ndi::{Ndi, ReceiverOptions, Receiver, FrameSync, Source, SourceAddress};
     /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// # let ndi = NDI::new()?;
-    /// # let source = Source { name: "Test".into(), address: SourceAddress::None };
-    /// # let options = ReceiverOptions::builder(source).build();
+    /// # let ndi = Ndi::new()?;
+    /// # let source = Source::new("Test");
+    /// # let options = ReceiverOptions::new(source);
     /// # let receiver = Receiver::new(&ndi, &options)?;
     /// let framesync = FrameSync::new(receiver)?;
     ///
@@ -560,12 +600,15 @@ impl FrameSync {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn audio_queue_depth(&self) -> i32 {
+    pub fn audio_queue_depth(&self) -> u32 {
         // SAFETY: the FrameSync instance is live for this borrow.
-        unsafe {
+        let depth = unsafe {
             self.core()
                 .NDIlib_framesync_audio_queue_depth(self.resource.instance)
-        }
+        };
+        // A sample count is never negative; one that broke that contract
+        // would mean no samples to request.
+        u32::try_from(depth).unwrap_or(0)
     }
 
     /// The entry points of the runtime this FrameSync was created through.
@@ -642,7 +685,10 @@ pub(crate) mod audio_test_calls {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frames::{AudioFormat, PixelFormat};
+    use crate::{
+        frames::{AudioFormat, PixelFormat},
+        FourCc,
+    };
     use std::ptr;
 
     #[test]
@@ -654,7 +700,9 @@ mod tests {
         for recover in [false, true] {
             let events = track(|| {
                 let ndi = runtime.clone();
-                let mut receiver = Receiver::new(&ndi, &crate::ReceiverOptions::default()).unwrap();
+                let mut receiver =
+                    Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new("")))
+                        .unwrap();
                 let original = receiver.core.instance;
                 drop(ndi);
                 for _ in 0..3 {
@@ -662,10 +710,7 @@ mod tests {
                     assert_eq!(fs.receiver().core.instance, original);
                     receiver = fs.into_receiver();
                     assert_eq!(receiver.core.instance, original);
-                    assert!(receiver
-                        .video()
-                        .try_capture(std::time::Duration::ZERO)
-                        .is_ok());
+                    assert!(receiver.video().capture(std::time::Duration::ZERO).is_ok());
                 }
                 let fs = FrameSync::new(receiver).unwrap();
                 if recover {
@@ -687,37 +732,46 @@ mod tests {
         }
         let events = track(|| {
             let ndi = runtime.clone();
-            let receiver = Receiver::new(&ndi, &crate::ReceiverOptions::default()).unwrap();
+            let receiver =
+                Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new(""))).unwrap();
             drop(ndi);
+            let rejected = match FrameSync::new_with(receiver, |_| ptr::null_mut()) {
+                Err(rejected) => rejected,
+                Ok(_) => panic!("a null instance must be rejected"),
+            };
             assert!(matches!(
-                FrameSync::new_with(receiver, |_| ptr::null_mut()),
-                Err(Error::NativeOperationFailed {
+                rejected.error(),
+                Error::NativeOperationFailed {
                     operation: "NDIlib_framesync_create"
-                })
+                }
             ));
+            // The receiver comes back usable, and is dropped exactly once.
+            let receiver = rejected.into_inner();
+            assert!(receiver.video().capture(std::time::Duration::ZERO).is_ok());
         });
         assert_eq!(events, ["receiver"]);
     }
 
     #[test]
     fn audio_requests_reject_invalid_rates_and_dimensions_at_construction() {
-        for rate in [i32::MIN, -48_000, -1, 0] {
-            assert!(FrameSyncAudioRequest::capture_with(Some(rate), 2, 1024).is_err());
+        for rate in [0, 1 << 31, u32::MAX] {
+            assert!(FrameSyncAudioRequest::capture_at(rate, 2, 1024).is_err());
         }
+        assert!(FrameSyncAudioRequest::capture_at(i32::MAX.unsigned_abs(), 2, 1024).is_ok());
         for (channels, samples) in [
             (0, 1024),
-            (-1, 1024),
+            (u32::MAX, 1024),
             (2, 0),
-            (2, -1),
-            (i32::MIN, i32::MIN),
+            (2, u32::MAX),
+            (0, 0),
             (2, 8_388_609),
             (2, 536_870_912),
             (1, 1_073_741_825),
-            (i32::MAX, 1),
-            (i32::MAX, i32::MAX),
+            (i32::MAX.unsigned_abs(), 1),
+            (u32::MAX, u32::MAX),
         ] {
             assert!(FrameSyncAudioRequest::capture(channels, samples).is_err());
-            assert!(FrameSyncAudioRequest::capture_with(Some(48_000), channels, samples).is_err());
+            assert!(FrameSyncAudioRequest::capture_at(48_000, channels, samples).is_err());
         }
         // Exact cap, with no sample allocation or native call.
         assert!(FrameSyncAudioRequest::capture(2, 8_388_608).is_ok());
@@ -730,29 +784,22 @@ mod tests {
         let Some(ndi) = crate::test_support::ndi() else {
             return;
         };
-        let receiver = Receiver::new(
-            &ndi,
-            &crate::ReceiverOptions::builder(crate::Source::default()).build(),
-        )
-        .unwrap();
+        let receiver =
+            Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new(""))).unwrap();
         let fs = FrameSync::new(receiver).unwrap();
         audio_test_calls::take();
         for (channels, samples) in [
             (2, 8_388_609),
             (2, 536_870_912),
             (1, 1_073_741_825),
-            (i32::MAX, 1),
+            (i32::MAX.unsigned_abs(), 1),
         ] {
-            assert!(
-                FrameSyncAudioRequest::capture_with(Some(48_000), channels, samples)
-                    .and_then(|request| fs.capture_audio(request))
-                    .is_err()
-            );
-            assert!(
-                FrameSyncAudioRequest::capture_with(Some(48_000), channels, samples)
-                    .and_then(|request| fs.capture_audio_owned(request))
-                    .is_err()
-            );
+            assert!(FrameSyncAudioRequest::capture_at(48_000, channels, samples)
+                .and_then(|request| fs.capture_audio_ref(request).map(drop))
+                .is_err());
+            assert!(FrameSyncAudioRequest::capture_at(48_000, channels, samples)
+                .and_then(|request| fs.capture_audio(request))
+                .is_err());
             assert_eq!(audio_test_calls::take(), (0, 0));
         }
 
@@ -764,12 +811,12 @@ mod tests {
         });
         assert_eq!(allocations, 0);
         let (request, allocations) = crate::test_alloc::allocation_count(|| {
-            FrameSyncAudioRequest::capture_with(Some(48_000), 2, 1024).unwrap()
+            FrameSyncAudioRequest::capture_at(48_000, 2, 1024).unwrap()
         });
         assert_eq!(allocations, 0);
         for _ in 0..3 {
             let ((), allocations) = crate::test_alloc::allocation_count(|| {
-                let frame = fs.capture_audio(std::hint::black_box(request)).unwrap();
+                let frame = fs.capture_audio_ref(std::hint::black_box(request)).unwrap();
                 assert_eq!(
                     (
                         frame.sample_rate(),
@@ -784,24 +831,24 @@ mod tests {
             });
             assert_eq!(allocations, 0);
             assert_eq!(audio_test_calls::take(), (1, 1));
-            assert!(fs.capture_audio_owned(request).unwrap().is_some());
+            assert!(fs.capture_audio(request).unwrap().is_some());
             assert_eq!(audio_test_calls::take(), (1, 1));
         }
 
         // No source rate is known: response validation must still run and free
         // the SDK descriptor on its error path, for both entry points.
         let unknown_rate = FrameSyncAudioRequest::capture(2, 1024).unwrap();
+        assert!(fs.capture_audio_ref(unknown_rate).is_err());
+        assert_eq!(audio_test_calls::take(), (1, 1));
         assert!(fs.capture_audio(unknown_rate).is_err());
         assert_eq!(audio_test_calls::take(), (1, 1));
-        assert!(fs.capture_audio_owned(unknown_rate).is_err());
-        assert_eq!(audio_test_calls::take(), (1, 1));
         assert!(fs
-            .capture_audio(FrameSyncAudioRequest::query_input())
+            .capture_audio_ref(FrameSyncAudioRequest::query_input())
             .unwrap()
             .is_empty());
         assert_eq!(audio_test_calls::take(), (1, 1));
         assert!(fs
-            .capture_audio_owned(FrameSyncAudioRequest::query_input())
+            .capture_audio(FrameSyncAudioRequest::query_input())
             .unwrap()
             .is_none());
         assert_eq!(audio_test_calls::take(), (1, 1));
@@ -813,7 +860,7 @@ mod tests {
         assert_eq!(
             std::mem::size_of::<FrameSync>(),
             std::mem::size_of::<NDIlib_framesync_instance_t>()
-                + std::mem::size_of::<crate::NDI>()
+                + std::mem::size_of::<crate::Ndi>()
                 + std::mem::size_of::<Receiver>()
         );
     }
@@ -863,11 +910,11 @@ mod tests {
         let raw = NDIlib_video_frame_v2_t {
             xres: width,
             yres: height,
-            FourCC: PixelFormat::BGRA.into(),
+            FourCC: FourCc::from(PixelFormat::Bgra).raw(),
             frame_rate_N: 60,
             frame_rate_D: 1,
             picture_aspect_ratio: 16.0 / 9.0,
-            frame_format_type: ScanType::Progressive.into(),
+            frame_format_type: ScanType::Progressive.to_sdk(),
             timecode: 0,
             p_data: data.as_mut_ptr(),
             __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
@@ -884,7 +931,7 @@ mod tests {
         assert_eq!(frame.metadata(), Some("framesync video"));
         assert_eq!(frame.data().unwrap().len(), expected_len);
         assert_eq!(frame.line_stride_bytes(), stride as usize);
-        let owned = frame.to_owned().expect("owned conversion");
+        let owned = frame.try_to_owned().expect("owned conversion");
         assert_eq!(owned.metadata(), Some("framesync video"));
         assert!(format!("{frame:?}").contains("FrameSyncVideoRef"));
     }
@@ -901,11 +948,11 @@ mod tests {
         let raw = NDIlib_video_frame_v2_t {
             xres: width,
             yres: height,
-            FourCC: PixelFormat::BGRA.into(),
+            FourCC: FourCc::from(PixelFormat::Bgra).raw(),
             frame_rate_N: 60,
             frame_rate_D: 1,
             picture_aspect_ratio: 16.0 / 9.0,
-            frame_format_type: ScanType::Progressive.into(),
+            frame_format_type: ScanType::Progressive.to_sdk(),
             timecode: 0,
             p_data: data.as_mut_ptr(),
             __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
@@ -928,11 +975,11 @@ mod tests {
         let raw = NDIlib_video_frame_v2_t {
             xres: 16,
             yres: 8,
-            FourCC: PixelFormat::BGRA.into(),
+            FourCC: FourCc::from(PixelFormat::Bgra).raw(),
             frame_rate_N: 60,
             frame_rate_D: 1,
             picture_aspect_ratio: 16.0 / 9.0,
-            frame_format_type: ScanType::Progressive.into(),
+            frame_format_type: ScanType::Progressive.to_sdk(),
             timecode: 0,
             p_data: ptr::null_mut(),
             __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
@@ -959,7 +1006,7 @@ mod tests {
         assert_eq!(frame.metadata(), None);
         assert!(frame.data().unwrap().is_empty());
         assert_eq!(frame.format(), None);
-        assert!(frame.to_owned().expect("owned conversion").is_none());
+        assert!(frame.try_to_owned().expect("owned conversion").is_none());
         assert!(format!("{frame:?}").contains("FrameSyncAudioRef"));
     }
 
@@ -986,7 +1033,7 @@ mod tests {
         assert!(frame.is_empty());
         assert_eq!(frame.sample_rate(), 48000);
         assert_eq!(frame.num_channels(), 2);
-        assert_eq!(frame.format(), Some(AudioFormat::FLTP));
+        assert_eq!(frame.format(), Some(AudioFormat::Fltp));
     }
 
     #[test]
@@ -1031,15 +1078,15 @@ mod tests {
         assert!(frame.data().is_none());
         assert_eq!(frame.channel_data(0), Some(&[1.0, 2.0, 3.0, 4.0][..]));
         assert_eq!(frame.channel_data(1), Some(&[10.0, 20.0, 30.0, 40.0][..]));
-        assert_eq!(frame.channel_stride_in_bytes(), stride_samples * 4);
+        assert_eq!(frame.channel_stride_bytes(), stride_samples as usize * 4);
 
         let owned = frame
-            .to_owned()
+            .try_to_owned()
             .expect("owned conversion")
             .expect("samples");
         assert_eq!(owned.metadata(), Some("framesync audio"));
         assert_eq!(owned.data().len(), 8);
-        assert_eq!(owned.channel_stride_in_bytes(), 16);
+        assert_eq!(owned.channel_stride_bytes(), 16);
         assert_eq!(owned.channel_data(1), Some(&[10.0, 20.0, 30.0, 40.0][..]));
     }
 

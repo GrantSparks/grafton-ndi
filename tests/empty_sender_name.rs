@@ -7,7 +7,7 @@ fn empty_name_uses_sdk_generated_sender_name() -> Result<(), grafton_ndi::Error>
     let Some(ndi) = common::ndi() else {
         return Ok(());
     };
-    let sender = Sender::new(&ndi, &SenderOptions::builder("").build())?;
-    assert!(!sender.source()?.name.is_empty());
+    let sender = Sender::new(&ndi, &SenderOptions::new(""))?;
+    assert!(!sender.source()?.name().is_empty());
     Ok(())
 }

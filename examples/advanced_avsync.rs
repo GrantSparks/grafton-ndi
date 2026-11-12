@@ -16,7 +16,7 @@ use std::{env, time::Duration};
 
 use grafton_ndi::{
     advanced::{AvSync, AvSyncOutcome, AvSyncRequest},
-    Error, Receiver, ReceiverOptions, NDI,
+    Error, Ndi, Receiver, ReceiverOptions,
 };
 
 #[path = "common/mod.rs"]
@@ -26,7 +26,7 @@ fn main() -> Result<(), Error> {
     let args: Vec<String> = env::args().collect();
     let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
 
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
     let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
     let Some(source) = finder
         .find_sources(Duration::from_secs(5))?
@@ -38,21 +38,12 @@ fn main() -> Result<(), Error> {
     };
     println!("Synchronizing {source}");
 
-    let receiver = Receiver::new(
-        &ndi,
-        &ReceiverOptions::builder(source)
-            .name("AVSync Example")
-            .build(),
-    )?;
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source).name("AVSync Example"))?;
     // On failure the receiver comes back inside the error; `?` drops it here.
     let mut sync = AvSync::new(receiver)?;
 
     for _ in 0..120 {
-        let Some(video) = sync
-            .receiver()
-            .video()
-            .try_capture(Duration::from_secs(1))?
-        else {
+        let Some(video) = sync.receiver().video().capture(Duration::from_secs(1))? else {
             println!("No video yet...");
             continue;
         };
