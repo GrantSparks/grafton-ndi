@@ -11,7 +11,13 @@ multicast group that NDI discovery uses. An attempt that times out, or that a
 remote host answers in any way, does not count as refused.
 
 With --online the same attempts must succeed, which shows that a refusal inside
-the runner is the runner's doing and not the state of the machine.
+the runner is the runner's doing and not the state of the machine. One outcome
+is a limitation of the control and not a failure: when the unconfined process is
+itself refused the multicast datagram (the hosted macOS machines do this), the
+control cannot attribute an in-runner refusal of the mDNS group to the wrapper.
+That is printed on stdout, and the refusal of the group inside the runner then
+shows nothing about the wrapper. A timeout or any other outcome still fails, and
+so does a refused public TCP connection.
 
 Only the calling process is exercised. What each runner confines beyond that,
 and what it does not, is described in ci/README.md.
@@ -25,6 +31,8 @@ EXTERNAL = (('1.1.1.1', 443), ('8.8.8.8', 53), ('2606:4700:4700::1111', 443))
 MDNS = ('224.0.0.251', 5353)
 # How an operating system refuses traffic it will not carry: there is no route
 # (a network namespace) or no permission (a sandbox profile, a firewall rule).
+LIMITATION = ('the unconfined process is itself refused the mDNS group, so a refusal of the group inside the '
+              'runner shows nothing about the wrapper')
 REFUSED = {errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EPERM, errno.EACCES}
 
 
@@ -71,7 +79,11 @@ def loopback_udp():
 
 
 def problems(online):
-    """What differs from the expected state: everything reachable online, loopback only otherwise."""
+    """What differs from the expected state, and what the check could not show.
+
+    Returns (failures, limitations): everything must be reachable online and
+    only loopback otherwise. A limitation is printed but does not fail the check.
+    """
     leaving = {f'TCP to {host}:{port}': outcome(lambda address=(host, port): connect(address))
                for host, port in EXTERNAL}
     leaving[f'UDP to the mDNS group {MDNS[0]}:{MDNS[1]}'] = outcome(send_multicast)
@@ -79,21 +91,26 @@ def problems(online):
         # One public IPv4 address is enough, and a build machine need not have IPv6.
         *tcp, udp = leaving.values()
         found = [] if 'reached' in tcp[:2] else ['no public IPv4 address was reached: ' + ', '.join(tcp[:2])]
-        return found if udp == 'reached' else found + [f'the mDNS group was not reached: {udp}']
+        if udp == 'refused':
+            return found, [LIMITATION]
+        return (found if udp == 'reached' else found + [f'the mDNS group was not reached: {udp}']), []
     found = [f'IPv4 loopback {name}: {result}' for name, result in
              (('TCP', outcome(loopback_tcp)), ('UDP', outcome(loopback_udp))) if result != 'reached']
-    return found + [f'{name} was not refused: {result}' for name, result in leaving.items() if result != 'refused']
+    return found + [f'{name} was not refused: {result}' for name, result in leaving.items() if result != 'refused'], []
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--online', action='store_true', help='expect the network to be reachable instead')
     online = parser.parse_args(argv).online
-    found = problems(online)
+    found, limitations = problems(online)
+    for limitation in limitations:
+        print(f'limitation of this control: {limitation}')
     for problem in found:
         print(f'network check failed: {problem}', file=sys.stderr)
     if not found:
-        print('online: a public address and the mDNS group can be reached' if online
+        print(('online: a public address can be reached; the mDNS group could not be checked' if limitations
+               else 'online: a public address and the mDNS group can be reached') if online
               else 'offline: loopback works and every attempt to leave the machine is refused')
     return 1 if found else 0
 

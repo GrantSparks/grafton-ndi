@@ -13,7 +13,12 @@
 # isolates have only been observed on Linux.
 $ErrorActionPreference = 'Stop'
 
-$program, $arguments = $args
+# `$program, $arguments = $args` would make $arguments a scalar string when exactly
+# one argument follows the program, and `@arguments` then splats a string one
+# character at a time (python.exe: can't open file '...\c'). Selecting into an
+# array keeps zero, one and many arguments a list.
+$program = $args[0]
+$arguments = @($args | Select-Object -Skip 1)
 $program = (Resolve-Path -LiteralPath $program).Path
 $rule = 'grafton-ndi-ci-' + [guid]::NewGuid().ToString('N')
 $result = 1

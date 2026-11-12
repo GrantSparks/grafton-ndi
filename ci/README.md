@@ -240,8 +240,14 @@ operating system must refuse at once a TCP connection to each of three public
 addresses and a UDP datagram to the mDNS multicast group that NDI discovery
 uses; a timeout, or any answer from a remote host, fails the check. Outside, the
 same attempts must succeed, which shows that the refusals are the wrapper's
-doing. The check exercises the one process the wrapper starts. It does not show
-what the points above say a wrapper leaves open.
+doing. There is one exception: the hosted macOS machines refuse the multicast
+datagram of the unconfined process itself (`refused`, as inside the wrapper). The
+control then prints, on stdout, that this is a limitation and does not fail;
+the refusal of the mDNS group inside the runner shows nothing about the wrapper
+on such a machine, and only the public TCP connections attribute the refusals to
+it. A timeout or any other outcome of the datagram still fails the control. The
+check exercises the one process the wrapper starts. It does not show what the
+points above say a wrapper leaves open.
 
 Two parts of the wrappers exist because of how the SDK behaves:
 
@@ -413,8 +419,10 @@ New, and so unverified anywhere but Linux x86_64:
   runners (`pwsh -File` on Windows, `sandbox-exec` without a packet filter on
   macOS) and the build against Xcode's libclang;
 - the network check on macOS and Windows: that a refused connection or datagram
-  fails at once there (with a permission error) instead of timing out, and that
-  the unconfined runner can send to the mDNS group;
+  fails at once there (with a permission error) instead of timing out. The first
+  hosted run showed that the unconfined macOS runner cannot send to the mDNS
+  group (the datagram is refused), which the `--online` control now reports as a
+  limitation; whether the unconfined Windows runner can is not yet known;
 - every promise of the Windows and macOS rows, in particular `file` beside a
   Standard runtime in the Windows x64 Standard 6.4 row;
 - the Advanced lint on Windows and macOS;

@@ -5,6 +5,7 @@ import json
 import http.client
 import os
 from pathlib import Path
+import shutil
 import ssl
 import stat
 import subprocess
@@ -416,6 +417,75 @@ URL_ENTRY = {'url_env': 'URL_ENV_SENTINEL'}
 
 def refusal(code):
     return urllib.error.HTTPError(URL, code, f'refused for {URL} with {TOKEN}', {}, None)
+
+
+class Publish(Workspace):
+    def source(self):
+        source = mock.Mock(spec=Path)
+        return source
+
+    def attempt(self, outcomes, **options):
+        source, sleeps = self.source(), []
+        source.rename.side_effect = outcomes
+        try:
+            sdk.publish(source, self.work / 'dest', sleep=sleeps.append, **options)
+        finally:
+            self.renames, self.sleeps = source.rename.call_count, sleeps
+
+    def test_windows_retries_a_transient_lock_with_growing_delays(self):
+        self.attempt([PermissionError(13, 'locked'), PermissionError(13, 'locked'), None], windows=True)
+        self.assertEqual((self.renames, self.sleeps), (3, list(sdk.RENAME_DELAYS[:2])))
+
+    def test_windows_gives_up_after_about_thirty_seconds_and_says_so(self):
+        with self.assertRaises(sdk.SdkError) as failure:
+            self.attempt(PermissionError(13, 'locked'), windows=True)
+        self.assertEqual(self.sleeps, list(sdk.RENAME_DELAYS))
+        self.assertEqual(self.renames, len(sdk.RENAME_DELAYS) + 1)
+        self.assertEqual(sum(sdk.RENAME_DELAYS), 30)
+        self.assertIn('could not be moved into place', str(failure.exception))
+        self.assertNotIn(str(self.work), str(failure.exception))
+
+    def test_other_errors_are_not_retried(self):
+        with self.assertRaises(FileNotFoundError):
+            self.attempt(FileNotFoundError(2, 'gone'), windows=True)
+        self.assertEqual((self.renames, self.sleeps), (1, []))
+
+    def test_other_platforms_do_not_retry(self):
+        with self.assertRaises(PermissionError):
+            self.attempt(PermissionError(13, 'denied'), windows=False)
+        self.assertEqual((self.renames, self.sleeps), (1, []))
+
+    def test_the_platform_is_detected_by_default(self):
+        for platform, retried in (('win32', True), ('linux', False), ('darwin', False)):
+            with self.subTest(platform=platform), mock.patch.object(sdk.sys, 'platform', platform):
+                with self.assertRaises((sdk.SdkError, PermissionError)):
+                    self.attempt(PermissionError(13, 'denied'))
+                self.assertEqual(self.renames > 1, retried)
+
+    def test_install_goes_through_publish_and_cleanup_errors_are_ignored(self):
+        data = linux_download()
+        real = tempfile.TemporaryDirectory
+        options = {}
+
+        def recording(*args, **kwargs):
+            options.update(kwargs)
+            return real(*args, **kwargs)
+        with mock.patch.object(sdk.tempfile, 'TemporaryDirectory', recording):
+            self.install(data)
+        self.assertIs(options.get('ignore_cleanup_errors'), True)
+
+    def test_a_failed_cleanup_neither_fails_an_install_nor_hides_its_error(self):
+        data = linux_download()
+        real_rmtree = shutil.rmtree
+
+        def locked(path, *args, **kwargs):
+            if Path(path).name.startswith('.ndi-sdk-'):
+                raise PermissionError(13, 'locked')
+            return real_rmtree(path, *args, **kwargs)
+        with mock.patch('shutil.rmtree', locked):
+            with self.assertRaisesRegex(sdk.SdkError, 'Version.txt'):
+                self.install(data, pins=self.pins(data, version='6.9.2'))
+            self.assertIn('NDI_SDK_DIR', self.install(data))
 
 
 class NothingPrivateIsPrinted(Workspace):

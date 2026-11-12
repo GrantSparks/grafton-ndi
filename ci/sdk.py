@@ -54,6 +54,9 @@ RUNTIMES = {
 }
 DEFAULT_TOKEN_ENV = 'NDI_SDK_ARCHIVE_TOKEN'
 RETRY_DELAYS = (2, 5)
+# Seconds to wait after each refused attempt to move the finished tree into
+# place on Windows, about 30 in all; nothing else retries.
+RENAME_DELAYS = (1, 2, 4, 8, 15)
 TRANSIENT_STATUS = {408, 500, 502, 503, 504}
 INSTALLER_MARKER = re.compile(rb'^__NDI_ARCHIVE_BEGIN__\r?\n', re.MULTILINE)
 VERSION = re.compile(r'(?<![0-9])v(\d+(?:\.\d+){1,3})(?![0-9.])')
@@ -350,6 +353,31 @@ def runtime_library(pin, target):
     return Path(directory) / (advanced if pin['edition'] == 'advanced' else standard)
 
 
+def publish(unpacked, dest, *, windows=None, sleep=time.sleep):
+    """Move the finished tree to `dest`.
+
+    Right after the silent vendor installer on Windows its executables can stay
+    locked for a while (a virus scanner reading what it wrote, a child process
+    still exiting), and renaming a directory that holds them then fails with
+    PermissionError. That is retried with a growing delay, on Windows only; any
+    other platform, and any other error, fails at once.
+    """
+    windows = sys.platform == 'win32' if windows is None else windows
+    for delay in (RENAME_DELAYS if windows else ()):
+        try:
+            unpacked.rename(dest)
+            return
+        except PermissionError:
+            sleep(delay)
+    try:
+        unpacked.rename(dest)
+    except PermissionError as error:
+        if not windows:
+            raise
+        raise SdkError(f'the unpacked SDK could not be moved into place; access stayed denied for '
+                       f'{sum(RENAME_DELAYS)} s (a virus scanner or the installer may still hold its files)') from error
+
+
 def install(package, dest, *, archive=None, target=None, environ=None, pins=None):
     """Install `package` into `dest` and return the environment that selects it."""
     environ = os.environ if environ is None else environ
@@ -366,7 +394,10 @@ def install(package, dest, *, archive=None, target=None, environ=None, pins=None
     secret = secret_variables(environ)
     tool_env = {name: value for name, value in environ.items() if name not in secret}
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='.ndi-sdk-', dir=dest.parent) as staging:
+    # Removing the staging directory must never decide the outcome: on Windows the
+    # installer's own files can still be locked then, and the error would replace
+    # the real one, or fail an installation that has already succeeded.
+    with tempfile.TemporaryDirectory(prefix='.ndi-sdk-', dir=dest.parent, ignore_cleanup_errors=True) as staging:
         staging = Path(staging)
         local = staging / ARCHIVE_NAME[pin['platform']]
         if isinstance(source, Download):
@@ -392,7 +423,7 @@ def install(package, dest, *, archive=None, target=None, environ=None, pins=None
             values['GRAFTON_NDI_EXPECTED_VERSION'] = '.'.join(map(str, version_tuple(pin['version'])))
             values['GRAFTON_NDI_EXPECTED_EDITION'] = pin['edition']
         # The destination appears only once every check has passed.
-        unpacked.rename(dest)
+        publish(unpacked, dest)
     return {name: str(path) for name, path in values.items()}
 
 
