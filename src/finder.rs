@@ -134,6 +134,17 @@ pub struct Finder {
     _ndi: Ndi,
 }
 
+/// One entry of a [`Finder::current_sources`] snapshot, or `None` for a
+/// descriptor the SDK should not produce, which the snapshot leaves out.
+///
+/// # Safety
+///
+/// As for [`Source::try_from_raw`].
+unsafe fn snapshot_entry(source: *const NDIlib_source_t) -> Option<Source> {
+    // SAFETY: forwarded to the caller's obligations.
+    unsafe { Source::try_from_raw(source, "NDIlib_find_get_current_sources") }.ok()
+}
+
 impl Finder {
     /// Creates a new source finder with the specified settings.
     ///
@@ -339,36 +350,18 @@ impl Finder {
     /// # }
     /// ```
     pub fn current_sources(&self) -> Result<Vec<Source>> {
-        // SAFETY: the SDK returns a live snapshot guarded by sources_lock until
-        // current_sources_with completes its deep copy.
-        unsafe {
-            self.current_sources_with(
-                |num_sources| {
-                    self._ndi
-                        .api()
-                        .core
-                        .NDIlib_find_get_current_sources(self.instance, num_sources)
-                },
-                |source| Source::try_from_raw(source, "NDIlib_find_get_current_sources"),
+        let api = self._ndi.api();
+        // SAFETY: `snapshot` hands the fetch the finder's live instance, for
+        // which the SDK returns null or `count` descriptors whose strings stay
+        // valid until the next snapshot call; the snapshot lock excludes that
+        // call until every descriptor has been copied, and each copy reads
+        // only its own descriptor meanwhile.
+        Ok(unsafe {
+            self.snapshot(
+                |instance, count| api.core.NDIlib_find_get_current_sources(instance, count),
+                |source| snapshot_entry(source),
             )
-        }
-    }
-
-    /// [`Self::snapshot`] of plain source descriptors: an entry `copy` fails
-    /// to convert is left out.
-    ///
-    /// # Safety
-    ///
-    /// As for [`Self::snapshot`]: `fetch` must return null or a live array of
-    /// the count it writes, with readable source descriptors and C strings
-    /// until all copies finish under the lock.
-    unsafe fn current_sources_with(
-        &self,
-        fetch: impl FnOnce(&mut u32) -> *const NDIlib_source_t,
-        mut copy: impl FnMut(*const NDIlib_source_t) -> Result<Source>,
-    ) -> Result<Vec<Source>> {
-        // SAFETY: forwarded to the caller's obligations on `fetch`.
-        Ok(unsafe { self.snapshot(|_, count| fetch(count), |source| copy(source).ok()) })
+        })
     }
 
     /// Poll discovery until `accept` selects a value or `timeout` elapses.
@@ -1710,8 +1703,8 @@ mod tests {
                     start.wait();
                     // SAFETY: raw and both C strings stay live through copying;
                     // this test's snapshot lock serializes their use.
-                    let sources = unsafe { finder.current_sources_with(
-                        |count| {
+                    let sources = unsafe { finder.snapshot(
+                        |_, count| {
                             // Model an SDK snapshot whose buffers remain borrowed
                             // until conversion finishes, not just until fetch returns.
                             assert_eq!(active_snapshot.fetch_add(1, Ordering::SeqCst), 0);
@@ -1725,11 +1718,11 @@ mod tests {
                             // copying, even if competing threads are not scheduled.
                             assert!(matches!(finder.sources_lock.try_lock(), Err(TryLockError::WouldBlock)));
                             std::thread::yield_now();
-                            let owned = Source::try_from_raw(source, "test snapshot");
+                            let owned = snapshot_entry(source);
                             assert_eq!(active_snapshot.fetch_sub(1, Ordering::SeqCst), 1);
                             owned
                         },
-                    ) }.unwrap();
+                    ) };
                     drop(name);
                     drop(address);
                     assert_eq!(sources[0].name(), format!("Camera {index}"));
@@ -1751,9 +1744,11 @@ mod tests {
                 .is_err());
         });
         assert!(unsafe {
-            finder.current_sources_with(|_| ptr::null(), |_| panic!("empty snapshot must not copy"))
+            finder.snapshot(
+                |_, _| ptr::null::<NDIlib_source_t>(),
+                |_| -> Option<Source> { panic!("empty snapshot must not copy") },
+            )
         }
-        .unwrap()
         .is_empty());
     }
 
@@ -1830,15 +1825,14 @@ mod tests {
         ];
         // SAFETY: the array and its strings stay live through the copy.
         let sources = unsafe {
-            finder.current_sources_with(
-                |count| {
+            finder.snapshot(
+                |_, count| {
                     *count = snapshot.len() as u32;
                     snapshot.as_ptr()
                 },
-                |source| Source::try_from_raw(source, "test snapshot"),
+                |source| snapshot_entry(source),
             )
-        }
-        .unwrap();
+        };
         let names: Vec<_> = sources.iter().map(Source::name).collect();
         assert_eq!(names, ["First", "Last"]);
     }
