@@ -278,33 +278,9 @@ fn creation_does_not_wait_for_the_server() {
     }
 }
 
-#[test]
-fn objects_connect_when_their_server_appears() {
-    let Some((ndi, binary)) = discovery_server() else {
-        return;
-    };
-    // The sender is registered, and the listener created, before any server
-    // exists at the address.
-    let port = free_port();
-    let endpoint = format!("127.0.0.1:{port}");
-    let sender = sender(&ndi, "grafton discovery late server sender");
-    let sender_name = sender.source().unwrap().name().to_owned();
-    let mut advertiser = SendAdvertiser::new(
-        &ndi,
-        &AdvertiserOptions::default().servers(endpoint.as_str()),
-    )
-    .unwrap();
-    advertiser
-        .register(&sender, SendAdvertisement::default())
-        .unwrap();
-    let mut listener =
-        SendListener::new(&ndi, &ListenerOptions::default().server(endpoint.as_str())).unwrap();
-    assert!(!listener.is_connected());
-
-    // Once a server appears there, both connect on their own and the
-    // registration made earlier arrives.
-    let _server = Server::start_on_one_of(&binary, [port]);
-    eventually("the earlier registration to arrive", || {
+/// Wait until `listener` lists the sender advertised as `name`.
+fn await_listed(listener: &mut SendListener, what: &str, name: &str) {
+    eventually(what, || {
         listener
             .wait_for_changes(Duration::from_millis(100))
             .unwrap();
@@ -312,10 +288,67 @@ fn objects_connect_when_their_server_appears() {
             .snapshot()
             .unwrap()
             .iter()
-            .any(|advertised| advertised.name() == Some(sender_name.as_str()))
+            .any(|advertised| advertised.name() == Some(name))
             .then_some(())
     });
-    assert!(listener.is_connected());
+}
+
+#[test]
+fn objects_connect_when_their_server_appears() {
+    let Some((ndi, binary)) = discovery_server() else {
+        return;
+    };
+    // A sender is registered, and a listener created, before any server
+    // exists at the address.
+    let port = free_port();
+    let endpoint = format!("127.0.0.1:{port}");
+    let listeners = ListenerOptions::default().server(endpoint.as_str());
+    let earlier = sender(&ndi, "grafton discovery late server sender");
+    let earlier_name = earlier.source().unwrap().name().to_owned();
+    let mut advertiser = SendAdvertiser::new(
+        &ndi,
+        &AdvertiserOptions::default().servers(endpoint.as_str()),
+    )
+    .unwrap();
+    advertiser
+        .register(&earlier, SendAdvertisement::default())
+        .unwrap();
+    let mut early_listener = SendListener::new(&ndi, &listeners).unwrap();
+    assert!(!early_listener.is_connected());
+
+    // Once a server appears there, both connect on their own.
+    let _server = Server::start_on_one_of(&binary, [port]);
+
+    // The registration made before the server existed arrives. A listener
+    // that finds the server on its first attempt lists the whole registry,
+    // whichever of it and the advertiser reaches the server first.
+    let mut listener = SendListener::new(&ndi, &listeners).unwrap();
+    await_listed(
+        &mut listener,
+        "the earlier registration to arrive",
+        &earlier_name,
+    );
+
+    // The listener made before the server connects too, and lists what is
+    // registered from then on. It need not list the earlier registration: a
+    // 6.4.0.2 listener that connects only on a retry never lists what reached
+    // the server before it did, and the advertiser may well get there first.
+    eventually("the earlier listener to connect", || {
+        early_listener
+            .wait_for_changes(Duration::from_millis(100))
+            .unwrap();
+        early_listener.is_connected().then_some(())
+    });
+    let later = sender(&ndi, "grafton discovery late server later sender");
+    let later_name = later.source().unwrap().name().to_owned();
+    advertiser
+        .register(&later, SendAdvertisement::default())
+        .unwrap();
+    await_listed(
+        &mut early_listener,
+        "a later registration to reach the earlier listener",
+        &later_name,
+    );
 }
 
 #[test]

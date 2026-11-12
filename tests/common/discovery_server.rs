@@ -18,6 +18,11 @@ use std::{
 };
 
 /// How long the registry, or a starting server, may take to reflect a change.
+///
+/// An advertiser or listener that finds no server tries again every 10
+/// seconds. The SDK documents no interval; that is what 6.4.0.2 does. One
+/// created before its server serves therefore connects up to 10 seconds
+/// after it does, and this allows twice that.
 pub const SETTLE: Duration = Duration::from_secs(20);
 
 /// How many ports are tried before a server is declared unable to start.

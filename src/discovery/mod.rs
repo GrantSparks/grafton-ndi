@@ -19,7 +19,7 @@
 //!
 //! # SDK defects that remain in 6.4
 //!
-//! Three defects of the NDI 6.4.0.2 runtime involve these objects. The crate
+//! Four defects of the NDI 6.4.0.2 runtime involve these objects. The crate
 //! cannot prevent them, but none needs more than a little care to avoid:
 //!
 //! * Moving one sender or receiver from one advertiser to another on the same
@@ -33,6 +33,11 @@
 //!   the listener; this crate's listeners never unsubscribe on their own.
 //! * Destroying a [`SendAdvertiser`] blocked forever once in about a million
 //!   destroys under heavy load.
+//! * A listener that does not find its server on its first attempt, such as
+//!   one created before the server appeared, connects on a later attempt but
+//!   then never lists the senders or receivers registered before it
+//!   connected: only those registered afterwards. Create listeners once their
+//!   server is up, or replace one that connected late.
 //!
 //! The measurements are in the
 //! [SDK validation record](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/sdk-validation.md#discovery-server-objects).
@@ -82,7 +87,9 @@
 //! there is no address or the SDK cannot parse it. It does not wait for the
 //! server, and a server that cannot be reached is not an error: the object
 //! keeps trying in the background for as long as it lives, and starts working
-//! a few seconds after the server appears.
+//! within about ten seconds of the server appearing, as the 6.4.0.2 runtime
+//! tries again every ten seconds. A listener that connects only on such a
+//! later attempt misses earlier registrations; see the defects above.
 //!
 //! A listener reports its connection through `is_connected`, and its snapshots
 //! are empty until it connects. An advertiser reports nothing; whether its
