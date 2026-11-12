@@ -187,8 +187,12 @@ core SDK, the one in `src/sys/file.rs` for the File library. The File library's
 functions are classified only in a build with `file-io`, so run the test with
 `--all-features`.
 
-Functions of the File library go in the `native_table!` tables of
-`src/sys/file.rs`.
+Functions of the File library go in an entry of the `file_families!`
+invocation in `src/sys/file.rs`, which names the table, the field that holds it
+and the `FileFamily` it is gated and reported under. `FileRuntime::table`,
+which every player, recorder and probe goes through, is the only way to a
+family's table, and refuses one the library lacks with
+`UnsupportedCapability`. A new family also needs a `FileFamily` variant.
 
 Functions that only the Advanced SDK headers declare go in the
 `advanced_tables!` invocation in `src/sys/advanced_tables.rs`. Those headers may

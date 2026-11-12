@@ -166,10 +166,19 @@ as `None`. Most programs need changes; see the
 - `Receiver::metadata` and `poll_event` need the receiver's mode to implement
   the new sealed `MetadataMode`, `Receiver::audio` the new sealed
   `CaptureMode`, which extends it, and `Receiver::video` the new sealed
-  `VideoMode`. `RawCapture` implements all three and `FrameSyncAttached` the
-  first two. Generic code bounded by `M: ReceiverMode` that captures audio
+  `VideoMode`. `RawCapture` implements all three, `FrameSyncAttached` only
+  `MetadataMode`, and the Advanced `AvSyncAttached` `MetadataMode` and
+  `VideoMode`. Generic code bounded by `M: ReceiverMode` that captures audio
   bounds `M: CaptureMode`, code that only captures metadata or polls events
   can bound `M: MetadataMode`, and the common controls keep `ReceiverMode`.
+- A FrameSync's receiver no longer captures audio: `framesync.receiver().audio()`
+  does not compile, as its video capture already did not. The FrameSync reads
+  the same receiver audio, so each audio frame reached only one of them.
+  Measured with NDI 6.3.2 and 6.4, raw capture beside a FrameSync took most of
+  a 30 fps stream's audio, and the FrameSync returned silence in its place.
+  Capture audio with `FrameSync::capture_audio` or `capture_audio_ref`, or
+  recover the receiver with `FrameSync::into_receiver`. Metadata capture and
+  event polling on a FrameSync's receiver are unchanged.
 - FrameSync's owned captures take the short names: `capture_video` and
   `capture_audio` return owned frames, as `capture_video_owned` and
   `capture_audio_owned` did, and the borrowing captures are
@@ -298,8 +307,9 @@ as `None`. Most programs need changes; see the
   `Error::UnexpectedSdkResult`, `Error::ReceiverRequestNotAccepted`,
   `Error::QueueFull` and, with the `file-io` feature, `Error::InvalidState`.
   `QueueFull` carries the `QueueLimit` that was reached, an Advanced
-  `QueuedSender`'s frame or byte limit or an async File handle's command
-  queue, and the same call can succeed once queued work has completed.
+  `QueuedSender`'s frame or byte limit, an async File handle's command queue
+  or the queue of async File probes, and the same call can succeed once
+  queued work has completed.
   `UnsupportedCapability` carries
   the `RuntimeFeature` and the `CapabilityUnavailable` reason that
   `capabilities()` reports, and a `detail` naming the missing entry point, the
@@ -403,9 +413,19 @@ as `None`. Most programs need changes; see the
   letting the SDK end the session. The File API returns the crate's `Error`;
   an operation the current state does not allow is `Error::InvalidState`, whose
   `StateError` says whether a retry can succeed, and an operation an async
-  handle's full command queue refuses is `Error::QueueFull`. On Linux, macOS
-  and Android
-  the File library needs the Advanced SDK runtime. See the
+  handle's full command queue refuses is `Error::QueueFull`. Each request to
+  stop takes a place in that queue, and one more is accepted beyond a full
+  one. Async handles close by reference, so every close made while one is
+  awaited completes with it, and async probes run on one thread that the
+  process shares, at most 64 waiting. `Error::RuntimeLoadFailed` means only
+  that no File library could be selected. A selected library that lacks the
+  playback or the recording entry points refuses that family's operations
+  with `Error::UnsupportedCapability` under `RuntimeFeature::File(FileFamily)`,
+  naming the first missing entry point, and `FileApi::status` and
+  `FileApi::supports` report each family in advance. The runtime's own
+  `Capabilities` report the File families as
+  `CapabilityUnavailable::SeparateLibrary`. On Linux, macOS and Android the
+  File library needs the Advanced SDK runtime. See the
   [File API guide](docs/file-io.md).
 - `FrameSync::audio_input_format` and `AudioInputFormat`: the format of the
   audio a FrameSync is receiving, without capturing samples.
