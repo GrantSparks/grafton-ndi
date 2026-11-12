@@ -21,14 +21,24 @@ Using the module needs three things, in this order:
    headers may not be redistributed, so the crate does not contain their
    declarations. The build script generates them with bindgen from the SDK
    named by `NDI_SDK_DIR`, or from a default installation directory. That step
-   needs a `libclang` shared library.
+   needs a `libclang` shared library; a build that finds an Advanced SDK and no
+   `libclang` fails.
+
+   The build uses the first SDK it finds. On Windows and macOS the Standard
+   SDK's default location is checked before the Advanced SDK's, so when both
+   are installed, name the Advanced SDK in `NDI_SDK_DIR`. An SDK whose
+   `include` directory has no `Processing.NDI.Advanced.h` is a Standard SDK,
+   and a build with it has no Advanced declarations.
 
 3. An Advanced SDK runtime selected when the program runs. A build that found
-   an Advanced SDK searches for the Advanced runtime library by default. See
+   an Advanced SDK searches for the Advanced runtime library by default, unless
+   `NDI_SDK_EDITION` says otherwise. If only a Standard runtime is installed,
+   `NDI::new()` then fails with `Error::RuntimeLoadFailed`. See
    [SDK editions](../README.md#sdk-editions) in the README.
 
 Enabling the feature neither selects an SDK edition nor grants a license
-entitlement.
+entitlement. The Advanced SDK 6.3.2 and 6.4.0.2 have been tested; see
+[SDK validation](sdk-validation.md).
 
 ## When a requirement is missing
 
@@ -37,16 +47,25 @@ an operation returns:
 
 | Situation | Result of a native operation |
 | --- | --- |
-| Built without the Advanced SDK headers | `Error::UnsupportedCapability`; the reason says the crate was built without them |
-| Built with the headers, Standard runtime selected | `Error::UnsupportedCapability`; the reason says the runtime is not an Advanced SDK runtime |
-| Built with the headers, Advanced runtime selected | The operation runs |
+| Built without Advanced SDK headers, or with headers that do not declare the operation's functions | `Error::UnsupportedCapability`; the reason says the crate was built without the declarations the operation needs |
+| Built with headers that do not declare the requested `PassthroughPreset` | `Error::UnsupportedCapability` for the compressed receive preset; the reason names the preset |
+| Standard runtime selected | `Error::UnsupportedCapability`; the reason says the runtime is not an Advanced SDK runtime |
+| Advanced runtime that does not export a function the operation needs | `Error::UnsupportedCapability`; the reason names the function |
+| Every requirement met | The operation runs |
 
-Core operations are unaffected in every case. The module's data types work in
-every build as well: packet formats, compressed frames, packet envelopes,
-scatter frames, options and limits can be constructed, validated and inspected
-without the Advanced SDK.
+Older or partial Advanced SDK headers disable only the operations whose
+functions they do not declare; the rest of the module keeps working. Core
+operations are unaffected in every case. The module's data types work in every
+build as well: packet formats, compressed frames, packet envelopes, scatter
+frames, options and limits can be constructed, validated and inspected without
+the Advanced SDK.
 
-To find out in advance, ask the runtime:
+The Discovery Server advertisers and listeners also need an NDI 6.4.0 or later
+runtime, with or without a configuration, so an Advanced 6.3.2 runtime refuses
+to create them.
+
+To find out in advance, ask the runtime. Each capability is checked
+separately, so a successful check covers only the operations it names:
 
 ```rust
 use grafton_ndi::{capabilities::RuntimeFeature, NDI};
@@ -54,16 +73,21 @@ use grafton_ndi::{capabilities::RuntimeFeature, NDI};
 fn main() -> grafton_ndi::Result<()> {
     let ndi = NDI::new()?;
     match ndi.require_feature(RuntimeFeature::AdvancedSenderConfiguration) {
-        Ok(()) => println!("Advanced SDK operations can be used"),
+        Ok(()) => println!("Advanced sender configuration can be used"),
         Err(error) => println!("{error}"),
     }
     Ok(())
 }
 ```
 
-The types of this module take the functions they need when they are
-constructed, so their constructors report a missing requirement. The Advanced
-methods on the ordinary `Sender` and `Receiver` report it when they are called.
+Types built around one group of functions report a missing requirement when
+they are created: `AvSync`, `Genlock`, `QueuedSender`, `PacketReceiver`,
+`KvmSession` (through `Receiver::kvm`) and the allocator attachments
+(`AllocatorService::attach` and `attach_packets`). `CompressedSender` checks
+sender configuration when it is created, and its scatter sends, encoder
+guidance and keyframe methods check their own functions when they are called.
+The Advanced methods on the ordinary `Sender`, `Receiver` and `Router` report a
+missing requirement when they are called.
 
 ## Ownership
 
@@ -102,9 +126,15 @@ named as a reminder not to log it.
 
 Constructors that take a configuration are named `new_with_config`. `Sender`,
 `Receiver`, `Finder`, `Router`, both advertisers, both listeners,
-`CompressedSender` and `QueuedSender` have one. `PacketReceiver::new` and
-`Genlock::new` take the configuration as a parameter. Each object keeps its
-configuration for as long as it lives.
+`CompressedSender` and `QueuedSender` have one; `QueuedSender::new_with_config`
+also takes its `QueueOptions`. `PacketReceiver::new` takes a passthrough preset
+and a configuration, and `Genlock::new` an optional reference source and an
+optional configuration. Each object keeps its configuration for as long as it
+lives.
+
+`Router::add_connection_metadata` and `clear_connection_metadata` are Advanced
+SDK operations too: a router sends the added metadata to every connected
+receiver, and to each receiver that connects later, until it is cleared.
 
 `Finder::sources_with_metadata` returns each source together with the metadata
 it advertises. A sender advertises metadata through its configuration, and a
@@ -146,14 +176,18 @@ The SDK accepts any compressed frame and silently discards those it will not
 deliver. Construction therefore also refuses frames that would be discarded:
 
 - a SpeedHQ frame whose first byte, its quality, is 100 or more;
-- an H.264 or HEVC picture on the preview stream that is larger than 640 by
+- an H.264 or HEVC picture on the preview stream that is wider or taller than
   640 pixels;
 - Opus at a sample rate other than 8, 12, 16, 24 or 48 kHz, or with a frame
   length other than 2.5, 5, 10, 20, 40 or 60 ms;
-- an AAC frame that does not hold 1024 samples per channel or lacks its codec
-  configuration.
+- an AAC frame that does not hold 1024 samples per channel, lacks its
+  AudioSpecificConfig, or whose configuration names another sample rate or
+  channel layout than the frame's own. AAC is sent at one of the thirteen
+  indexed sample rates from 7350 Hz to 96 kHz, with one to six or eight
+  channels.
 
-These rules were observed with the 6.4.0.2 runtime on Linux.
+These rules were observed with the 6.4.0.2 runtime on Linux. A compressed
+frame holds at most 256 MiB (`MAX_PACKET_BYTES`).
 
 Parsing a received envelope keeps what it does not understand: later header
 versions, unknown flags and the reserved field stay readable. Sending is
@@ -167,16 +201,20 @@ this.
 are independent. The synchronous sends (`send_video`, `send_audio`,
 `send_scatter_video`, `send_scatter_audio`) borrow the frame mutably, because
 the SDK writes to the frame's bytes while it sends them. A frame can be sent
-again afterwards, and a received packet can be relayed. An asynchronous send
-keeps the frame until the next asynchronous send on the same stream, which
-returns the earlier frame for reuse. `close` destroys the native sender, which waits for the SDK to finish
-with pending frames, and returns the frames that were still held as
-`UnsentVideo`.
+again afterwards. A received packet can be relayed when `validate_for_send`
+accepts it; a frame the sender refuses stays with the caller. Video can also be
+sent asynchronously (`send_video_async`, `send_scatter_video_async`): the
+sender keeps the frame until the next asynchronous send on the same stream,
+which returns the earlier frame for reuse. Audio is always sent synchronously.
+`close` destroys the native sender, which waits for the SDK to finish with
+pending frames, and returns the frames that were still held as `UnsentVideo`,
+one field per stream.
 
-`ScatterVideoFrame` and `ScatterAudioFrame` hold one frame in several owned
-blocks, which are sent without being joined. For H.264 and HEVC the first block
-must hold the complete envelope header. `into_contiguous_copy` joins the blocks
-into an ordinary compressed frame.
+`ScatterVideoFrame` and `ScatterAudioFrame` hold one frame in up to 65,536
+owned, non-empty blocks, which are sent without being joined. The first block
+must hold the frame's complete header: the 44-byte envelope header for H.264,
+HEVC and AAC, the first four bytes for SpeedHQ. `into_contiguous_copy` joins the
+blocks into an ordinary compressed frame.
 
 Moving a frame into a sender does not copy it in this crate. The SDK may still
 copy data internally.
@@ -190,11 +228,14 @@ An ordinary asynchronous video send has to wait for the previous frame before
 it accepts the next. `QueuedSender` keeps every submitted frame until the SDK
 reports it sent, so submission does not wait for a slow connection.
 
+- It takes uncompressed `VideoFrame`s and `CompressedVideoFrame`s, both as a
+  `QueuedVideoFrame`.
 - `QueueOptions` bounds the queue by frame count and by bytes. A frame counts
   from submission until the application takes it back. The defaults are 8
   frames and 512 MiB.
 - `try_submit` returns a `SubmissionId`, or returns the frame in a `Rejected`
-  when a limit is reached. Collect completed frames and submit again.
+  when a limit is reached or the frame cannot be sent. Collect completed frames
+  and submit again.
 - `try_take_completed` and `wait_completed` return completed frames on the
   application's thread. No application code runs on an SDK thread.
 - `from_sender` converts an existing `Sender`. It returns the frame the sender
@@ -202,9 +243,9 @@ reports it sent, so submission does not wait for a slow connection.
   sender is registered with an advertiser.
 - `source` returns the source the sender advertises, as it does on
   `CompressedSender`.
-- A `QueuedSender` is used from the thread that owns it. Dropping it destroys
-  the native sender, which waits without a timeout for the SDK to finish with
-  the frames still queued.
+- A `QueuedSender` is neither `Send` nor `Sync`: it stays on the thread that
+  created it. Dropping it destroys the native sender, which waits without a
+  timeout for the SDK to finish with the frames still queued.
 
 Example: `examples/advanced_queued_send.rs`.
 
@@ -247,7 +288,8 @@ holds pointers to the crate's callbacks.
 What to know about allocator policies:
 
 - A policy runs on SDK threads, possibly several at once. It should return
-  quickly. A panic in a policy is contained.
+  quickly. A panic in a policy is contained; like an error it fails that
+  allocation, and the SDK then drops the frame.
 - `AllocationBuffer::zeroed` supplies zeroed, 64-byte-aligned memory.
   `AllocationRequest::with_stride` asks for padded lines. `ExternalAllocation`
   is the `unsafe` trait for memory from another pool; its implementer
@@ -265,7 +307,9 @@ What to know about allocator policies:
 - `set_video_allocator`, `set_audio_allocator` and
   `AllocationBuffer::from_external` return what they were given inside
   `Rejected` when they fail.
-- `attach_packets` does the same for a `PacketReceiver`.
+- `attach_packets` does for a `PacketReceiver` what `attach` does for a
+  `Receiver`, and hands the `PacketReceiver` back inside `Rejected` when it
+  fails.
 
 Example: `examples/advanced_allocator.rs`.
 
@@ -273,13 +317,16 @@ Example: `examples/advanced_allocator.rs`.
 
 `AvSync` returns the audio that belongs to each video frame's timestamp. It
 takes over the receiver's audio, so it owns the receiver: capture video through
-`AvSync::receiver`, then call `synchronize`. `AvSyncRequest::automatic()` takes
-whatever audio belongs to the frame; `AvSyncRequest::new(samples, sample_rate)`
-asks for an exact number of samples. The outcome is the audio, or says
-why there is none: no samples for this frame, a changed audio format, no audio
-stream, no samples matching the frame's time, or an SDK error. Nothing is
-retried or converted. `into_receiver` stops synchronizing and returns the
-receiver.
+`AvSync::receiver`, then call `synchronize`. `AvSync::new` takes the receiver
+and hands it back inside `Rejected` when it fails. `AvSyncRequest::automatic()`
+takes whatever audio belongs to the frame. `AvSyncRequest::new(Some(samples),
+Some(sample_rate))` asks for that many samples per channel, computed for that
+sample rate; each `None` leaves the choice to the SDK. The SDK may return a
+different number of samples to follow the audio that belongs to the frame, and
+then reports the count as adjusted. The outcome is the audio, or says why there
+is none: no samples for this frame, a changed audio format, no audio stream, no
+samples matching the frame's time, or an SDK error. Nothing is retried or
+converted. `into_receiver` stops synchronizing and returns the receiver.
 
 `Genlock` paces a sender from the timing of a reference source. `clocks`
 returns a video clock and an audio clock; wait on the matching one before
@@ -297,7 +344,8 @@ These are methods on the ordinary `Sender` and `Receiver`:
 
 - `Sender::target_frame_bytes`, `target_bit_rate`, `legacy_quality` and
   `quality_plan` report what an encoder should aim for when it produces a given
-  `VideoPacketFormat` for the sender's connections.
+  `VideoPacketFormat` for the sender's connections. `legacy_quality` and
+  `quality_plan` apply to SpeedHQ formats only.
 - `Sender::keyframe_required` reports whether a connected receiver needs a
   keyframe, and `wait_for_keyframe_change` waits for that to change.
   `Receiver::request_keyframe` asks the source for one; the source decides
@@ -305,10 +353,13 @@ These are methods on the ordinary `Sender` and `Receiver`:
 - `Sender::set_external_tally` sets the sender's own contribution to its tally.
 - `Receiver::set_video_quality` switches between the source's program and
   preview streams. `Receiver::set_streams` chooses which streams the source
-  sends. The SDK reports only whether the selection changed, so `StreamChange`
-  cannot tell "already in effect" from "refused". The SDK applies either
-  change only under a vendor ID that licenses the function, and reports no
-  change without one.
+  sends. The SDK reports only whether the selection changed, so the
+  `StreamChange` that `set_streams` returns cannot tell "already in effect"
+  from "refused". The SDK applies either change only under a vendor ID that
+  licenses the function, and reports no change without one.
+
+`CompressedSender` has the same encoder guidance, keyframe and tally methods
+as `Sender`.
 
 ## KVM
 
@@ -316,18 +367,21 @@ These are methods on the ordinary `Sender` and `Receiver`:
 the receiver is connected to. The receiver is borrowed mutably for the session.
 The session sends pointer, button, wheel, key, touch and clipboard messages;
 each method returns whether the SDK accepted the message, which is not a
-confirmation that the source acted on it. The session never reads the local
-clipboard. It remembers what it has pressed and releases it when dropped, on a
-best-effort basis; call `release_all` to learn whether that succeeded.
+confirmation that the source acted on it. `is_supported` reports whether the
+connected source accepts remote control. Pointer and touch positions are fractions of the
+source's screen, `0.0..=1.0` on each axis, and keys are X11 key symbols. The
+session never reads the local clipboard. It remembers what it has pressed and
+touched and releases it when dropped, on a best-effort basis; call
+`release_all` to learn whether that succeeded.
 
 Example: `examples/advanced_kvm.rs`.
 
 ## Running the tests
 
-The Advanced tests compile in every build. Those that need an Advanced runtime
-start with the `advanced_ndi()` test helper and are skipped, with a message,
-when the build has no Advanced SDK declarations or the selected runtime is a
-Standard one.
+The Advanced tests compile in every build with the `advanced` feature. Those
+that need an Advanced runtime start with the `advanced_ndi()` test helper and
+are skipped, with a message, when the build lacks the declarations for sender
+configuration or the selected runtime is a Standard one.
 
 To run them, build with the Advanced SDK and select its runtime. On Linux
 x86_64:
@@ -335,16 +389,19 @@ x86_64:
 ```sh
 export NDI_SDK_DIR="/path/to/NDI Advanced SDK for Linux"
 export NDI_RUNTIME_DIR_V6="$NDI_SDK_DIR/lib/x86_64-linux-gnu"
-GRAFTON_NDI_REQUIRE_RUNTIME=advanced cargo test --features advanced
+GRAFTON_NDI_REQUIRE_RUNTIME=advanced cargo test --locked --config ci/offline.toml --features advanced
 ```
 
 `GRAFTON_NDI_REQUIRE_RUNTIME=advanced` makes a test that would have skipped
 fail instead, so the run cannot pass without exercising the Advanced runtime.
-The tests create their own senders and receivers on the local machine and need
-no hardware.
+The tests create their own senders and receivers and need no hardware. Those
+announce themselves on the network like any NDI program; `--config
+ci/offline.toml` confines them to loopback networking and needs `bubblewrap`.
 
 What the tests establish is limited to what they run. The Advanced runtime
-tests were run on Linux x86_64 with the Advanced SDK 6.4.0.2. They do not
+tests were run on Linux x86_64 with the Advanced SDK 6.3.2 and 6.4.0.2, each
+with its own headers and with the two crossed; see
+[SDK validation](sdk-validation.md). They do not
 cover KVM against a real source, allocator layouts for 4:2:0 and planar 4:4:4
 video, real codec bitstreams, license entitlements, long-running clock
 behavior, or any other platform.

@@ -27,6 +27,8 @@
 //! - IP address to search: `cargo run --example NDIlib_Recv_FrameSync -- 192.168.0.100`
 //! - Frame count: `cargo run --example NDIlib_Recv_FrameSync -- --frames 100`
 //! - Audio sample rate: `cargo run --example NDIlib_Recv_FrameSync -- --audio-rate 44100`
+//! - Audio channels: `cargo run --example NDIlib_Recv_FrameSync -- --audio-channels 1`
+//! - Samples per audio block: `cargo run --example NDIlib_Recv_FrameSync -- --audio-samples 512`
 
 use grafton_ndi::{
     Error, FrameSync, FrameSyncAudioRequest, Receiver, ReceiverColorFormat, ReceiverOptions,

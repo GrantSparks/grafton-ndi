@@ -1,148 +1,196 @@
 # SDK integration validation
 
 This document states what was tested for the current version, what was not, and
-how to repeat the tests on your own machine. The compatibility target is NDI 6.x
-and Rust 1.88.
+how to repeat the tests on your own machine. The
+[README](../README.md#supported-ndi-versions-and-platforms) summarizes it. The
+crate supports NDI 6 runtimes and Rust 1.88 or later.
 
 ## What was tested for 3.0.0
 
-The test suite was run on **Linux x86_64** with `cargo test --locked
---all-features` in these environments. Every run against a real runtime was
-confined to a network namespace with loopback networking only and had a
-private temporary directory. The table records the core/Advanced qualification
-runs; the later cross-version peer checks are described below.
+The test suite was run on **Linux x86_64** with `cargo test --locked`. Every run
+against a real runtime used `--config ci/offline.toml`, which confines each test
+executable to loopback networking and a private temporary directory. Every such
+run also set `GRAFTON_NDI_EXPECTED_RUNTIME`, `GRAFTON_NDI_EXPECTED_VERSION` and
+`GRAFTON_NDI_EXPECTED_EDITION`, so each test that loaded a runtime checked that
+it had loaded exactly the intended file, version and edition. The counts are the
+totals of every test binary and the doctests.
 
-| Build | Runtime | Required to be present | Passed | Failed | Ignored |
+### Runs with one SDK
+
+| Build made with | Runtime | Features | Required to be present | Passed | Failed | Ignored |
+| --- | --- | --- | --- | --- | --- | --- |
+| No NDI SDK | None | all | Nothing | 613 | 0 | 3 |
+| Standard 6.1.1 | Standard 6.1.1 | all | `1` | 613 | 0 | 3 |
+| Standard 6.1.1 | Standard 6.1.1 | none | `1` | 402 | 0 | 2 |
+| Standard 6.3.2 | Standard 6.3.2 | all | `1` | 613 | 0 | 3 |
+| Standard 6.3.2 | Standard 6.3.2 | default | `1` | 428 | 0 | 3 |
+| Standard 6.3.2 | Standard 6.3.2 | none | `1` | 402 | 0 | 2 |
+| Advanced SDK 6.3.2 | Advanced 6.3.2 | all | `advanced` | 616 | 0 | 3 |
+| Advanced SDK 6.3.2 | Advanced 6.3.2 | none | `1` | 402 | 0 | 2 |
+| Standard 6.4.0.2 | Standard 6.4.0.2 | all | `1,discovery-server` | 613 | 0 | 3 |
+| Standard 6.4.0.2 | Standard 6.4.0.2 | none | `1,discovery-server` | 402 | 0 | 2 |
+| Advanced SDK 6.4.0.2 | Advanced 6.4.0.2 | all | `advanced,file,discovery-server` | 616 | 0 | 3 |
+| Advanced SDK 6.4.0.2 | Advanced 6.4.0.2 | none | `1,discovery-server` | 402 | 0 | 2 |
+
+"Build made with" is the SDK that `NDI_SDK_DIR` named when the crate was built.
+It sets the default edition and supplies the Advanced SDK headers; the core
+bindings are always the vendored 6.4.0.2 ones. "Required to be present" is the
+value of `GRAFTON_NDI_REQUIRE_RUNTIME`: what the environment promised, so that a
+test could not pass by skipping. In the first row the tests that need a runtime
+reported skips. The other rows visibly skip the Advanced or File operations
+that their build and runtime cannot provide; the requirements make sure that
+the operations a row promises were not skipped. The ignored tests are two
+manual benchmarks and, with all or default features, one slow stress test.
+
+The Standard 6.4.0.2 and Advanced 6.4.0.2 rows with all features first ran
+while a second test run shared the machine. Each then failed one test,
+`tests/receiver_video_only.rs`: with `ReceiverBandwidth::VideoOnlyLowest`, its
+control receiver received no audio within 15 seconds. Run alone, both rows
+passed, as recorded above, and that test passed ten times in a row. It is
+sensitive to load.
+
+### Runs that cross versions
+
+These are the runs the `sdk` CI job makes on its Linux x64 Advanced 6.4.0.2 row,
+all with every feature enabled. In each, a second process on the "peer" runtime
+sends video, audio and metadata to a receiver on the run's runtime, and
+`tests/sdk_peers.rs` checks the decoded pixels, nonzero audio samples, frame
+timecodes and metadata. Both processes are confined to loopback, and each checks
+the identity of the runtime it loaded.
+
+| Build made with | Runtime | Peer sending | Required to be present | Passed | Failed | Ignored |
+| --- | --- | --- | --- | --- | --- | --- |
+| Advanced SDK 6.4.0.2, `NDI_SDK_EDITION=standard` | Standard 6.1.1 | Advanced 6.4.0.2 | `1` | 616 | 0 | 3 |
+| Advanced SDK 6.4.0.2 | Advanced 6.3.2 | Advanced 6.4.0.2 | `advanced` | 616 | 0 | 3 |
+| Standard 6.1.1, `NDI_SDK_EDITION=advanced` | Advanced 6.4.0.2 | Standard 6.1.1 | `1,file,discovery-server` | 613 | 0 | 3 |
+| Advanced SDK 6.3.2 | Advanced 6.4.0.2 | Advanced 6.3.2 | `advanced,file,discovery-server` | 616 | 0 | 3 |
+
+So 6.1.1 and 6.4 exchanged media in both directions, as did Advanced 6.3.2 and
+6.4, and Advanced builds ran against runtimes of another version in both
+directions.
+
+To require the peer test locally, set `GRAFTON_NDI_PEER_RUNTIME` to the second
+SDK's exact library path, `GRAFTON_NDI_PEER_VERSION` to its four-component
+version, and `GRAFTON_NDI_PEER_EDITION` to `standard` or `advanced`; the peer
+must be a different version from the runtime the tests load. With these set, a
+missing peer, an identity mismatch, a delivery failure or a failed shutdown of
+the child process fails the test. Without them it reports a skip.
+
+### What each runtime provides
+
+The runtimes report their versions as `6.1.1` (for 6.1.1), `6.3.2.0` and
+`6.4.0.2` at the end of their version text. A build with the Advanced SDK
+6.4.0.2 headers reported these capabilities for them:
+
+| Capability | Standard 6.1.1 | Standard 6.3.2 | Advanced 6.3.2 | Standard 6.4.0.2 | Advanced 6.4.0.2 |
 | --- | --- | --- | --- | --- | --- |
-| No NDI SDK | None | Nothing | 612 | 0 | 3 |
-| Standard 6.1.1 headers | Standard 6.1.1 | `1` | 612 | 0 | 3 |
-| Standard 6.4.0.2 headers | Standard 6.4.0.2 | `1,discovery-server` | 612 | 0 | 3 |
-| Advanced SDK 6.3.2 headers | Advanced 6.3.2 | `advanced` | 615 | 0 | 3 |
-| Advanced SDK 6.4.0.2 headers | Advanced 6.4.0.2 | `advanced,file,discovery-server` | 615 | 0 | 3 |
-| Advanced SDK 6.4.0.2 headers | Standard 6.3.2 | `1` | 614 | 0 | 3 |
-| Standard 6.3.2 headers | Advanced 6.4.0.2 | `1` | 612 | 0 | 3 |
-| Advanced SDK 6.3.2 headers | Advanced 6.4.0.2 | `advanced,file,discovery-server` | 615 | 0 | 3 |
-| Advanced SDK 6.4.0.2 headers | Advanced 6.3.2 | `advanced` | 615 | 0 | 3 |
+| `Planar444Video`, `ReceiveBest444`, `ReceiveVideoOnly` | `RuntimeTooOld` | `RuntimeTooOld` | `RuntimeTooOld` | Available | Available |
+| `ReceiveDelay`, `SdkTimestamp` | `SymbolUnavailable` | `SymbolUnavailable` | `SymbolUnavailable` | Available | Available |
+| `ConnectedSourceName` | `SymbolUnavailable` | Available | Available | Available | Available |
+| `SenderAdvertising`, `ReceiverAdvertising`, `SenderDiscovery`, `ReceiverDiscovery` | `SymbolUnavailable` | `RuntimeTooOld` | `RuntimeTooOld` | Available | Available |
+| `AdvancedSenderConfiguration`, `AdvancedReceiverConfiguration` | `WrongEdition` | `WrongEdition` | Available | `WrongEdition` | Available |
+| The other seven capabilities | Available | Available | Available | Available | Available |
+| `FileApi::open` | Refused: Standard runtime | Refused: Standard runtime | No File library | Refused: Standard runtime | Available |
 
-"Required to be present" is the value of `GRAFTON_NDI_REQUIRE_RUNTIME`: what
-the environment promised, so that a test could not pass by skipping. In the
-first row the tests that need a runtime reported skips. Other rows visibly skip
-Advanced or File operations when that build/runtime combination cannot provide
-them. The counts include tests that reported such skips; the requirements
-prevent skipping the operations the row promises. The three ignored tests
-are two manual benchmarks and one slow stress test.
+An operation whose capability is unavailable returns
+`Error::UnsupportedCapability` before any native call is made. The 6.1.1 and
+6.3.2 SDKs include no File library; the File library of the 6.4.0.2 SDK was
+tested only beside the Advanced 6.4.0.2 runtime.
 
-With the Standard 6.3.2 runtime, `cargo test --locked` passed 425 tests with
-default features and 399 with `--no-default-features`, with none failed.
+### Static checks
 
-The Advanced row covers the Advanced SDK operations, the File library of the
-6.4.0.2 SDK, and the advertisers and listeners against the SDK's own Discovery
-Server.
-
-The runtimes report themselves as `6.3.2.0` and `6.4.0.2`. With the Standard
-6.3.2 runtime these capabilities are unavailable, and the operations that
-depend on them return `Error::UnsupportedCapability`:
-
-- `ReceiveDelay` and `SdkTimestamp`, whose functions that runtime does not
-  export;
-- `Planar444Video`, `ReceiveBest444`, `ReceiveVideoOnly`, and the four
-  Discovery Server capabilities, which need NDI 6.4.0.
-
-On the same machine these static checks passed: formatting; clippy with
-warnings denied for the workspace with all features, with default features,
-with no default features, with `advanced` alone and with `file-io` alone, each
-with and without the Advanced SDK headers; rustdoc with warnings denied; the
-examples; a `cargo check` with Rust 1.88; `cargo package`; and the check that
-the generated bindings match the SDK headers.
+On the same machine these checks passed: formatting; clippy with warnings
+denied for the workspace with all features, and for the crate with no features
+and with each of `image-encoding`, `tokio`, `smol`, `advanced`, `file-io` and
+`advanced,file-io`; the same `advanced` lints with the Advanced SDK 6.4.0.2
+headers; rustdoc with warnings denied, with and without those headers; a
+`cargo check` with Rust 1.88; `cargo package`; and the check that the vendored
+bindings match the SDK 6.4.0.2 headers.
 
 ## Compatibility safeguards and additional runtime checks
 
-Advanced availability is derived from the declarations generated from the
-installed SDK. A missing API family disables only that family; absent types
-and newer receive presets do not make older headers fail to compile. A shared
-registry supplies both the build selector and the typed runtime tables. Every
-Advanced function declared by the installed headers must be classified by the
-coverage test. Synthetic partial headers exercise the actual build, including
-capability reporting, with warnings denied. They check fallback behavior and
-are not evidence of a run against a historical vendor SDK.
+Which Advanced operations a build can perform follows from the declarations
+generated from the installed headers. A family of functions that the headers
+lack disables only that family, and types or receive presets that older headers
+lack do not stop them compiling. The build script and the runtime tables take
+the families from one registry, `src/sys/advanced_tables.rs`. The coverage test
+requires every Advanced function the installed headers declare to belong to a
+family or to be listed as deliberately not wrapped. `tests/advanced_headers.rs`
+builds the crate, with warnings denied, against synthetic partial headers and
+checks the capabilities that build reports. That tests the fallback; it is not
+a run against a historical vendor SDK.
 
-Additional Linux x86_64 tests against 6.4 check a real lossless HEVC 4:4:4 frame,
+Further Linux x86_64 tests against 6.4 check a real lossless HEVC 4:4:4 frame,
 including every sample of its three full-resolution planes; audio suppression
-for both video-only bandwidth settings with an ordinary audio receiver as a
-control; AVSync following changes in video size, frame rate, audio sample rate
-and channel count while preserving nonzero samples; and both Genlock clocks
+by both video-only bandwidth settings, with an ordinary receiver as a control;
+AVSync following changes in video size, frame rate, audio sample rate and
+channel count while preserving nonzero samples; and both Genlock clocks
 following a local source and falling back to paced system clocks. The KVM
 boundary test checks failed release, retry on drop, touch coordinates and
 clipboard ownership using stand-in functions; it does not qualify a KVM device.
 
-The recorder's explicit `reset` operation replaces its native instance after
-abandoning an unconfirmed session. It returns the old report without claiming
-finalization, isolates late events from later sessions, and leaves the original
-recorder usable if replacement creation fails.
+Tests of `FileRecorder::reset` check that it returns the old session's report
+without claiming that the files were finalized, that late events of the old
+session do not reach later ones, and that the original recorder stays usable
+when its replacement cannot be created.
 
-Two File API entry points remain explicit safety exceptions:
-`NDIlib_file_recorder_get_source` and
-`NDIlib_file_recorder_get_current_file`. They return borrowed strings that the
-SDK can invalidate on its own recording thread during stopping or rollover.
-Copying immediately does not establish a safe lifetime. The Rust API provides
-`last_accepted_source` and `reported_current_file` from owned state and events,
-and documents the distinction from an instantaneous native query. Complete C
-entry-point coverage is not claimed. These exceptions can be removed when the
-vendor provides a stable lifetime or a caller-owned copy operation; a Rust
-mutex around the getters alone cannot protect against the SDK's thread.
+Two File API functions are deliberately not called:
+`NDIlib_file_recorder_get_source` and `NDIlib_file_recorder_get_current_file`.
+They return borrowed strings that the SDK can invalidate on its own recording
+thread while it stops or rolls over, so copying them at once does not make them
+safe to read, and a Rust mutex around the calls cannot exclude the SDK's thread.
+The Rust API provides `last_accepted_source` and `reported_current_file` from
+its own state and the recorder's events instead, and documents how they differ
+from an instantaneous native query. Complete coverage of the C entry points is
+therefore not claimed. These exceptions can go when the vendor provides a
+stable lifetime or a copying variant.
 
-SDK provisioning exports the expected normalized version, edition and exact
-library path. Tests compare these with the runtime loaded in their own process;
-version, edition and path mismatch fixtures must fail. Archive provenance alone
-cannot satisfy that check. CI includes native Standard 6.1.1 on Linux and
-Standard/Advanced 6.3.2 baselines on Linux, Windows and macOS. Each current
-Advanced row crosses the oldest retained Standard and Advanced headers/runtimes
-in both directions. Linux uses Standard 6.1.1; other retained baselines use
-6.3.2.
+`ci/sdk.py` exports the expected version, edition and exact library path of the
+package it provisions, and the tests compare them with the runtime loaded in
+their own process. `tests/runtime_identity.rs` checks that a mismatch of each
+fails the run, so knowing which archive was unpacked is not enough to pass.
 
-The compatibility runs also launch a second process with the other pinned SDK
-and check decoded video pixels, nonzero audio samples, frame timecodes and
-metadata across the network connection. Both processes inherit the runner's
-network confinement and verify their loaded library identities independently.
-Linux checks passed for 6.1.1 senders with 6.4 receivers, 6.4 senders with 6.1.1
-receivers, and both directions between Advanced 6.3.2 and 6.4. These test different
-native implementations talking to one another, in addition to varying build
-headers.
+## Retained SDK packages
 
-To require this test locally, set `GRAFTON_NDI_PEER_RUNTIME` to the second SDK's
-exact library path, `GRAFTON_NDI_PEER_VERSION` to its four-component normalized
-version, and `GRAFTON_NDI_PEER_EDITION` to `standard` or `advanced`. With these
-set, a missing peer, identity mismatch, delivery failure or failed child-process
-shutdown fails the test. Without a peer configuration it reports a skip.
+[`ci/sdk-packages.json`](../ci/sdk-packages.json) pins the packages the tests
+use: Standard 6.1.1 for Linux, and Standard and Advanced 6.3.2 and 6.4.0.2 for
+Linux, Windows, Apple and Android. The CI matrix runs Standard 6.1.1 on Linux
+and Standard and Advanced 6.3.2 on Linux, Windows and macOS as baselines, and
+crosses the oldest retained Standard and Advanced packages with the current
+Advanced one in both directions: Standard 6.1.1 on Linux, 6.3.2 elsewhere.
 
-The compatibility target remains NDI 6.x. The retained qualification set is
-Standard 6.1.1 on Linux, plus Standard and Advanced 6.3.2 and 6.4.0.2 on Linux,
-Windows, Apple and Android. The older Linux 6.1.1 installer was recovered from
-RPM Fusion's source cache and matches the SHA-512 in its
+The Linux 6.1.1 installer was recovered from RPM Fusion's source cache and
+matches the SHA-512 in its
 [historical source manifest](https://github.com/rpmfusion/ndi-sdk/blob/d0147e01a716c8e27d03894d79c296054e8caf63/sources).
-Its own `Version.txt` reports `NDI 2024-12-20 r143744 v6.1.1`; its runtime
-reports 6.1.1.0. The unmodified vendor installer has its own SHA-256 pin in
-`ci/sdk-packages.json`.
+Its `Version.txt` reads `NDI 2024-12-20 r143744 v6.1.1`. The unmodified vendor
+installer has its own SHA-256 pin in `ci/sdk-packages.json`.
 
-SDK discovery is closed at this retained set. NDI 6.0, older Advanced versions,
-and historical versions on other platforms remain unqualified; this does not
-raise the crate's intended minimum or turn synthetic headers into vendor SDK
-validation. The other recovered packages were checked for version and archive
-identity, and Windows/Apple headers were compiled, but were not executed on
-this machine.
+No other SDK version has been tested: not NDI 6.0 or 6.2, not Advanced SDKs
+before 6.3.2, and not the older versions for other platforms. The crate is
+written for every NDI 6 runtime, and its capability checks keep a runtime from
+being asked for what it lacks, but only the versions above are tested. The
+Windows and Apple 6.3.2 packages were checked for version and archive identity,
+and their headers were compiled, but nothing was run from them.
 
 ## What was compiled but not run
 
-The crate was compiled and linted, with warnings denied, for these targets. No
-test was run on them, and no NDI library was loaded on them:
+The crate was linted with clippy, all features, all targets and warnings
+denied, for these targets with Rust 1.99.1. No test was run on them, and no NDI
+library was loaded on them:
 
+- `i686-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+  `armv7-unknown-linux-gnueabihf`
 - `x86_64-pc-windows-msvc`, `i686-pc-windows-msvc`
 - `x86_64-apple-darwin`, `aarch64-apple-darwin`
-- `aarch64-linux-android`
-- `i686-unknown-linux-gnu`
+- `aarch64-linux-android`, `armv7-linux-androideabi`, `i686-linux-android`,
+  `x86_64-linux-android`
 
-`aarch64-apple-ios` and `x86_64-apple-ios` were compiled and linted against the
-NDI SDK for Apple 6.4. Their static link was not performed and nothing was run.
+The library was linted the same way for `aarch64-apple-ios` and
+`x86_64-apple-ios` against the NDI SDK for Apple 6.4. That selects and checks
+the static archive, but the static link was not performed and nothing was run.
+
+`aarch64-apple-tvos`, `x86_64-apple-tvos` and `aarch64-apple-visionos` were not
+compiled: the CI job that builds them has not yet run.
 
 ## Hosted CI
 
@@ -158,9 +206,10 @@ workflows and keeps the
 - Any behavior on Windows, macOS, Android, iOS, tvOS or visionOS. This includes
   the Windows and macOS branches of the runtime search and the static linking
   of Apple mobile targets, which are covered by compilation only.
-- NDI runtimes other than Linux Standard 6.1.1 and Standard/Advanced 6.3.2
-  and 6.4.0.2. NDI 6.0 remains unqualified.
-- The File library on Windows and macOS.
+- NDI runtimes other than Standard 6.1.1 and Standard and Advanced 6.3.2 and
+  6.4.0.2, all on Linux x86_64. NDI 6.0 and 6.2 were not tested.
+- The File library on Windows, macOS and Android, and beside an Advanced 6.3.2
+  runtime.
 - Linux architectures other than x86_64.
 - Hardware-dependent behavior: PTZ devices, KVM devices, hardware codecs, and
   interoperability of compressed streams with other products.
@@ -200,6 +249,14 @@ and finders. Without that option they announce themselves on the local
 network. The [CI guide](../ci/README.md#loopback-only-test-runs) describes the
 runner and why the tests need a private temporary directory.
 
+[`ci/sdk.py`](../ci/README.md#sdk-packages) installs an SDK package into a
+directory of your choice and prints the variables above, together with the
+`GRAFTON_NDI_EXPECTED_*` values that make the tests check the runtime they
+load. The crossed runs set `NDI_SDK_DIR` to one SDK, `NDI_RUNTIME_DIR_V6` and
+the expected values to another, `NDI_SDK_EDITION` to the runtime's edition, and
+the `GRAFTON_NDI_PEER_*` values to the SDK that is not loaded. The
+[CI workflow](../.github/workflows/rust.yml) shows each step.
+
 To check that the crate still compiles for a target you cannot run:
 
 ```bash
@@ -216,8 +273,6 @@ cargo check --all-features --target aarch64-apple-ios
 
 The static checks, and the check that the generated bindings match an SDK, are
 listed in [CONTRIBUTING.md](../CONTRIBUTING.md#checks-before-review).
-[`ci/sdk.py`](../ci/README.md#sdk-packages) installs an SDK package into a
-directory of your choice.
 
 ## Recording a validation
 

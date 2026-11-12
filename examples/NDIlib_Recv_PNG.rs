@@ -9,8 +9,8 @@
 //!
 //! 1. Using `receiver.video().capture()` for reliable frame capture with
 //!    automatic retry logic (handles NDI SDK timeout quirks internally)
-//! 2. `VideoFrame::encode_png()` for crate-provided image conversion
-//! 3. Correct handling for RGBX/BGRX padding bytes and padded rows
+//! 2. `VideoFrame::encode_png()` for crate-provided image conversion, which
+//!    handles RGBX/BGRX padding bytes and padded rows
 //!
 //! Run with: `cargo run --example NDIlib_Recv_PNG`
 //!

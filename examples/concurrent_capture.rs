@@ -1,3 +1,14 @@
+//! Example: capturing video, audio and metadata from one receiver on three threads.
+//!
+//! Connects to the first source found and shares the receiver between a
+//! video, an audio and a metadata thread, each of which captures a few frames
+//! and reports what it received.
+//!
+//! Run with: `cargo run --example concurrent_capture`
+//!
+//! Optional arguments:
+//! - IP addresses to search: `cargo run --example concurrent_capture -- 192.168.0.100`
+
 use grafton_ndi::{Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions, NDI};
 
 use std::{env, sync::Arc, thread, time::Duration};

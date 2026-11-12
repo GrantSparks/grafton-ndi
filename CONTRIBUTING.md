@@ -8,6 +8,10 @@ the ownership and memory-layout guarantees around the SDK calls.
 
 Building, linting and documenting the crate need only a Rust toolchain. No NDI
 SDK, `libclang` or bindgen is involved: the bindings in `src/sys` are checked in.
+One exception: with `--all-features`, the `advanced` feature looks for an
+Advanced SDK in `NDI_SDK_DIR` or a default installation directory. When it
+finds one it runs bindgen, which needs `libclang`, and the build then searches
+for the Advanced runtime by default. `NDI_SDK_EDITION` overrides that default.
 
 Use current stable Rust for development. [rust-toolchain.toml](rust-toolchain.toml)
 selects stable with `clippy`, `rustfmt`, and `rust-src`. The library's minimum Rust
@@ -36,16 +40,20 @@ export NDI_RUNTIME_DIR_V6="/usr/share/NDI SDK for Linux/lib/x86_64-linux-gnu"
 cargo test --all-features
 ```
 
-`ci/sdk.py` unpacks a downloaded SDK archive into a directory of your choice
-without running the vendor's installer, after checking it against a pinned
-hash, and prints the two variables to export:
+`ci/sdk.py` unpacks a downloaded SDK archive into a new directory of your
+choice without running the vendor's installer, after checking it against a
+pinned hash, and prints the variables to export:
 
 ```bash
 python ci/sdk.py install current-standard-linux --dest ~/ndi/standard-6.4 \
     --archive ~/Downloads/Install_NDI_SDK_v6_Linux.tar.gz --target x86_64-unknown-linux-gnu
 ```
 
-`python ci/sdk.py list` names the packages it knows. See the
+It prints `NDI_SDK_DIR` and, with `--target`, `NDI_RUNTIME_DIR_V6` and
+`GRAFTON_NDI_EXPECTED_RUNTIME`, `GRAFTON_NDI_EXPECTED_VERSION` and
+`GRAFTON_NDI_EXPECTED_EDITION`. With those three set, every test that loads a
+runtime checks that it loaded exactly that one, so unset them before switching
+to another runtime. `python ci/sdk.py list` names the packages it knows. See the
 [CI guide](ci/README.md#sdk-packages).
 
 The [README](README.md#finding-the-runtime) describes the full search order.
@@ -85,12 +93,16 @@ checkout.
 | `src/routing.rs`, `src/discovery/` | Routing sources, Discovery Server advertisers and listeners |
 | `src/advanced/` | Optional Advanced SDK configuration, packets, queues, allocators, synchronization and KVM |
 | `src/file/` | Optional File API recording and playback |
-| `src/rejected.rs` | `Rejected<T>`, the error that hands a consumed value back |
+| `src/rejected.rs`, `src/error.rs` | `Rejected<T>`, the error that hands a consumed value back, and the crate's `Error` |
 | `src/utilities.rs`, `src/video_conversion.rs`, `src/timestamp.rs` | Checked SDK audio/video conversions and SDK timestamps |
-| `build.rs`, `build_support.rs`, `build_apple.rs` | Default edition, Advanced declarations for the `advanced` feature, static linking for Apple mobile targets |
+| `src/sys/advanced.rs`, `src/sys/advanced_tables.rs` | The Advanced SDK's function tables, grouped into families, and the one place that depends on which families the installed headers declare |
+| `build.rs`, `build_support.rs`, `build_apple.rs`, `build_advanced.rs` | Default edition, Advanced declarations for the `advanced` feature and the selection of the families they declare, static linking for Apple mobile targets |
 | `xtask/` | The generator for the checked-in bindings |
-| `.github/workflows/`, `ci/` | The CI and release workflows and their scripts; see the [CI guide](ci/README.md) |
+| `.github/workflows/`, `ci/`, `scripts/` | The CI and release workflows and their scripts; see the [CI guide](ci/README.md) |
+| `src/test_support.rs`, `tests/common/`, `tests/support/` | The skip policy and runtime-identity checks of the tests, shared helpers, and the fake native runtimes the loader tests compile |
+| `tests/sdk_peers.rs` | A sender and a receiver of two different SDK versions, in separate processes, exchanging media |
 | `examples/`, `tests/` | Application workflows, SDK regressions, and public compile contracts |
+| `docs/`, `CHANGELOG.md` | The guides, the migration guides, the record of SDK validation, and release notes |
 
 Keep shared behavior in its existing implementation. For example, owned and
 borrowed image encoding share `ImagePixelSource`; receiver and FrameSync views
@@ -149,19 +161,30 @@ symbol up by name. Every native call goes through a table defined with the
 A test fails when a declared function is unclassified:
 `every_declared_function_is_in_one_table_or_explicitly_unwrapped` in
 `src/sys/coverage_tests.rs`. A function the crate deliberately does not call
-goes into that file's `UNWRAPPED` list with the reason.
+goes into an `UNWRAPPED` list with the reason: the one in that file for the
+core SDK, the one in `src/sys/file.rs` for the File library. The File library's
+functions are classified only in a build with `file-io`, so run the test with
+`--all-features`.
 
 Functions of the File library go in the `native_table!` tables of
 `src/sys/file.rs`.
 
 Functions that only the Advanced SDK headers declare go in the
-`advanced_tables!` invocation in `src/sys/advanced.rs`. Those headers may not be
-redistributed, so their declarations are generated into `OUT_DIR` on machines
-that have an Advanced SDK and are never checked in. Code that uses them is
-written inside `native!(table => ...)`, which compiles the body only when the
-declarations exist. The Advanced coverage test in
-`src/sys/advanced_coverage_tests.rs` runs only in such a build, so lint and test
-Advanced changes with `NDI_SDK_DIR` naming an Advanced SDK.
+`advanced_tables!` invocation in `src/sys/advanced_tables.rs`. Those headers may
+not be redistributed, so their declarations are generated into `OUT_DIR` on
+machines that have an Advanced SDK and are never checked in. Each entry of the
+invocation is a family of functions that are used together. The build script
+reads the same file, through `build_advanced.rs`, and makes a family available
+only when the installed headers declare every one of its functions, so an older
+Advanced SDK that lacks a family still builds the same public API. Code that
+calls a family is written inside `native!(Family, table => ...)`, which compiles
+the body only when that family is declared. The Advanced coverage test in
+`src/sys/advanced_coverage_tests.rs`, which has its own `UNWRAPPED` list, runs
+only in a build with Advanced headers. Lint and test Advanced changes with
+`NDI_SDK_DIR` naming an Advanced SDK, and check them against the oldest
+retained Advanced SDK as well as the newest. `tests/advanced_headers.rs` builds
+the crate against synthetic partial headers to keep older SDKs building; it
+needs `libclang` and runs only in a build with Advanced headers.
 
 ### Regenerating the bindings
 
@@ -174,7 +197,8 @@ cargo xtask bindgen --sdk "/path/to/NDI SDK for Linux"
 ```
 
 The generator needs `libclang` and `rustfmt`, and an SDK whose headers include
-the File API header (NDI 6.4 or later). It reads only headers that carry the
+the File API header (NDI 6.4 or later) and whose root contains its
+`Version.txt`. It reads only headers that carry the
 MIT permission notice, and it generates for eleven targets and requires the
 output to be the same for all of them, so one pair of files serves every
 platform. The files are written already formatted, so `cargo fmt` and `rustfmt`
@@ -303,12 +327,14 @@ The helpers live in `src/test_support.rs`. Unit tests use them as
 | Helper | Returns `None`, and reports a skip, when |
 | --- | --- |
 | `ndi()` | no NDI runtime library can be loaded |
-| `advanced_ndi()` | the runtime is not an Advanced SDK runtime, or the build lacks the Advanced SDK declarations |
+| `advanced_ndi()` | the runtime is not an Advanced SDK runtime, or the build lacks the declarations for Advanced sender configuration |
 | `skip(Requirement::…, reason)` | called directly by a test that found another requirement unmet, such as the File library or the Discovery Server |
 
 A skip is printed to standard error as `skipped: <test> needs <requirement>`,
 with the reason on first use. `#[ignore]` is kept for manual benchmarks and slow
-stress tests only. A test that needs a fixture creates it.
+stress tests only. A test that needs a fixture creates it. `unique_name(label)`
+appends the process id to a sender or router name, so that two test processes
+on one machine do not collide on it (see below).
 
 `GRAFTON_NDI_REQUIRE_RUNTIME` turns skips into failures. Its value is a
 comma-separated list of what the environment provides: `1` for any runtime,
@@ -320,20 +346,37 @@ rejected when a skip consults it. An entry that no test in the build can check
 fails the run as well, for example `advanced` without the `advanced` feature,
 because such a promise could never be broken.
 
+Two more groups of variables make a run check what it ran against:
+
+- `GRAFTON_NDI_EXPECTED_RUNTIME`, `GRAFTON_NDI_EXPECTED_VERSION` and
+  `GRAFTON_NDI_EXPECTED_EDITION`. When they are set, `ndi()` asserts that the
+  loaded runtime is that file, that four-component version and that edition
+  (`standard` or `advanced`). `ci/sdk.py` prints them. A value left over from
+  another runtime fails every test that loads one.
+- `GRAFTON_NDI_PEER_RUNTIME`, `GRAFTON_NDI_PEER_VERSION` and
+  `GRAFTON_NDI_PEER_EDITION`: the exact library path, version and edition of a
+  second SDK, which must be a different version. With them set,
+  `tests/sdk_peers.rs` starts a second process on that runtime, which sends
+  video, audio and metadata to a receiver on the selected runtime; a missing
+  peer or a delivery failure fails the test. Without `GRAFTON_NDI_PEER_RUNTIME`
+  the test prints its own skip, which `GRAFTON_NDI_REQUIRE_RUNTIME` does not
+  turn into a failure.
+
 The NDI runtime reserves every sender and receiver name machine-wide with a
 lock file in `TMPDIR`, named `NTK_SEND_<sender name>` or `NTK_RECV_<receiver
 name>`. Two test runs that share a temporary directory can therefore fail each
 other. Give each run its own `TMPDIR`, or use the loopback-only runner
 described under [Continuous integration](#continuous-integration), which does.
 
-The loader, ownership, Discovery Server and File-library scenarios in
-`tests/runtime_loading.rs`, `tests/runtime_shadowing.rs`,
-`tests/extended_lifetimes.rs`, `tests/discovery.rs` and
-`tests/file_loading.rs` need no SDK. They are Linux-only: they compile a fake
-NDI runtime from `tests/support/fake_runtime.rs` with `rustc` when they run, and
-`tests/runtime_loading.rs` also calls `readelf`. Add a variant to the fake
-runtime when a loader or capability change needs a library that behaves in a
-particular way.
+The loader, identity, ownership, Discovery Server and File-library scenarios
+in `tests/runtime_loading.rs`, `tests/runtime_shadowing.rs`,
+`tests/runtime_identity.rs`, `tests/extended_lifetimes.rs`,
+`tests/discovery.rs` and `tests/file_loading.rs` need no SDK. They are
+Linux-only: they compile a fake NDI runtime from `tests/support/fake_runtime.rs`
+with `rustc` when they run, and `tests/runtime_loading.rs` also calls
+`readelf`. `tests/file_loading.rs` is compiled only with `file-io`. Add a
+variant to the fake runtime when a loader or capability change needs a library
+that behaves in a particular way.
 
 ### Checks before review
 
@@ -362,8 +405,10 @@ cargo test -p xtask
 
 A build without the Advanced SDK headers compiles none of the `advanced`
 module's native code and relaxes the unused-code lints for it. Changes under
-`src/advanced/` or `src/sys/advanced.rs` must therefore also be linted and
-tested with the headers present:
+`src/advanced/`, to `src/sys/advanced.rs` or `src/sys/advanced_tables.rs`, or
+to `build_advanced.rs` must therefore also be linted and tested with the
+headers present, with the newest Advanced SDK and with the oldest retained one,
+whose headers declare fewer families:
 
 ```bash
 export NDI_SDK_DIR="/path/to/NDI Advanced SDK for Linux"
@@ -461,7 +506,9 @@ commands have been run by hand; every macOS and Windows step is unverified
 until the first hosted run. The CI guide keeps the
 [list of what is unproven](ci/README.md#not-yet-run-on-a-hosted-runner).
 
-Before pushing, run what the `lint` and `test` jobs run:
+Before pushing, run the core of what the `lint` and `test` jobs run. The
+feature combinations, the Rust 1.88 check, `cargo package`, the semver check
+and `cargo audit` are listed under [Checks before review](#checks-before-review):
 
 ```bash
 python -m unittest discover -s ci/tests
@@ -495,14 +542,21 @@ To adopt a newer NDI SDK:
 3. Read the SDK's change notes for behavior changes in functions the crate
    already calls. A capability whose functions exist in older runtimes but
    misbehave there needs a minimum version in `RuntimeFeature`.
-4. Run the full test suite against the new runtime and against the oldest
-   runtime the crate has been tested with, and record both in
-   [docs/sdk-validation.md](docs/sdk-validation.md).
+4. Pin the new packages in `ci/sdk-packages.json`, and update the `sdk` matrix
+   in `.github/workflows/rust.yml` and its table in the
+   [CI guide](ci/README.md#the-sdk-job); the script tests check that the two
+   agree. The private source map needs an entry for every package the matrix
+   uses.
+5. Run the full test suite against the new runtime and against the oldest
+   retained runtime of each edition (Standard 6.1.1 and Advanced 6.3.2 on
+   Linux), with the headers and runtimes crossed and with the peer test, and
+   record the results in [docs/sdk-validation.md](docs/sdk-validation.md).
+6. Update the version tables in the [README](README.md#supported-ndi-versions-and-platforms).
 
-The compatibility target is NDI 6.x. Record what was measured for each
-platform: tests run against a real runtime, or compiled and linted only. A
-passing symbol or layout check does not prove callback lifetimes, codec
-interoperability or hardware behavior.
+The crate supports NDI 6 runtimes. Record what was measured for each platform:
+tests run against a real runtime, or compiled and linted only. A passing symbol
+or layout check does not prove callback lifetimes, codec interoperability or
+hardware behavior.
 
 Never commit SDK archives, SDK headers, generated declarations of the Advanced
 SDK headers, or credentials.

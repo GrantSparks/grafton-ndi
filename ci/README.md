@@ -15,7 +15,7 @@ runtimes.
 |---|---|---|
 | `lint` | every event | CI script tests, shellcheck, actionlint, rustfmt, clippy (`-D warnings`) for the workspace with all features and for the crate with no features and with each of `image-encoding`, `tokio`, `smol`, `advanced`, `file-io`, `advanced,file-io`; the bindings generator's tests; rustdoc (`-D warnings`); `cargo check` on Rust 1.88; `cargo package`; the semver check; `cargo audit` |
 | `test` | every event | `cargo test` with all features and with default features on Linux, macOS and Windows. No NDI runtime is installed, so tests that need one print `skipped: <test> needs …` |
-| `cross` | every event | clippy (`-D warnings`, all features, all targets) for every dynamically loaded target: Linux aarch64, armv7 and i686; Android aarch64, armv7, i686 and x86_64; Windows x86_64 and i686; macOS aarch64 and x86_64. Then an Android link of the examples with the runner's NDK ([`scripts/build-android.sh`](../scripts/build-android.sh)) |
+| `cross` | every event | clippy (`-D warnings`, all features, all targets) for every dynamically loaded target: Linux aarch64, armv7 and i686; Android aarch64, armv7, i686 and x86_64; Windows x86_64 and i686; macOS aarch64 and x86_64. Then a link of the examples for `aarch64-linux-android` with the runner's NDK ([`scripts/build-android.sh`](../scripts/build-android.sh)) |
 | `sdk` | runs that are given the secrets | the tests against real runtimes; see below |
 | `required-ci` | every event, `if: always()` | passes only if every job the event requires succeeded ([`gate.py`](gate.py)) |
 
@@ -69,15 +69,19 @@ workflow by the script tests.
 | macos-x64 standard-6.4 | macos-15-intel | x86_64-apple-darwin | current-standard-apple | `1` | `1` | |
 
 On the Linux x64, Windows x64 and macOS ARM64 current Advanced rows, four
-additional runs cross the header/runtime boundary in both directions: current
-Advanced headers with each retained baseline runtime, and baseline headers
-with the current Advanced runtime. The Linux Standard baseline is 6.1.1;
-Windows/macOS Standard and all Advanced baselines are 6.3.2. Each compatibility
-run also launches a peer with the other SDK in a separate confined process and
-checks video pixels, audio samples, timecodes and metadata across versions.
-Each requires the operations its build/runtime combination provides and verifies the runtime's
-identity. Advanced operations without matching build declarations report
-unavailable.
+additional runs, with all features, cross the header/runtime boundary in both
+directions: current Advanced headers with each retained baseline runtime, and
+each baseline's headers with the current Advanced runtime. The Linux Standard
+baseline is 6.1.1; the Windows and macOS Standard baselines and every Advanced
+baseline are 6.3.2. Each compatibility run also starts a peer process on the
+other SDK, under the same network confinement, which sends to a receiver on the
+run's runtime; the test checks video pixels, audio samples, timecodes and
+metadata. A run with a Standard runtime promises `1`, a run with an Advanced
+baseline runtime `advanced`, and a run with the current Advanced runtime the
+row's promise, with `advanced` replaced by `1` when the headers are a Standard
+SDK's. Every run checks the loaded runtime's version, edition and path against
+the values `sdk.py` exported for it. Advanced operations without matching build
+declarations report unavailable.
 
 Each row:
 
@@ -87,10 +91,11 @@ Each row:
 2. provisions the package with [`sdk.py`](sdk.py), which exports `NDI_SDK_DIR`
    and `NDI_RUNTIME_DIR_V6` to the following steps, together with
    `GRAFTON_NDI_EXPECTED_VERSION`, `GRAFTON_NDI_EXPECTED_EDITION` and
-   `GRAFTON_NDI_EXPECTED_RUNTIME`. Every real-runtime test checks the loaded
-   module against those values. Header and runtime selection remain separate
-   for the compatibility runs. This is the only step that
-   is given the secrets in its environment;
+   `GRAFTON_NDI_EXPECTED_RUNTIME`, and also as step outputs. Every real-runtime
+   test checks the loaded module against those values. A row with
+   compatibility runs provisions its two baseline packages too, into separate
+   directories, and writes their values to files under `$RUNNER_TEMP` for those
+   runs. This step is the only one given the secrets in its environment;
 3. proves that the test runner isolates ([`offline/check.py`](offline/check.py)
    outside and inside it);
 4. runs `cargo test --locked --config ci/offline.toml --target <target>` twice,
@@ -102,8 +107,11 @@ Each row:
      Without the Advanced headers the `advanced` feature compiles to stubs, so
      these rows are the only place the real implementation is linted;
    - **Apple mobile builds**: [`apple-mobile.sh`](apple-mobile.sh) builds the
-     library for iOS, tvOS and visionOS, the statically linked targets that
-     need the SDK at build time.
+     library for the statically linked targets that need the SDK at build
+     time: iOS and its x86_64 simulator, tvOS, visionOS, and the x86_64 tvOS
+     simulator, which needs a pinned nightly toolchain and `-Zbuild-std`;
+   - **compatibility runs**: on the rows that have them, the four crossed runs
+     described above.
 
 The job uses no dependency cache and uploads nothing, so SDK files and the
 Advanced bindings generated into the target directory never leave the runner.
@@ -160,8 +168,13 @@ python ci/sdk.py install current-standard-linux --dest ~/ndi/standard-6.4 \
 It copies or downloads the archive into a staging directory, checks the copy
 against the pin before opening it, unpacks it without running the vendor's
 installer script (the Windows installer is the exception: it is the package),
-and prints the `NDI_SDK_DIR` and `NDI_RUNTIME_DIR_V6` values that select the
-installation. Every archive member must stay inside the destination, and the
+and prints the values that select the installation: `NDI_SDK_DIR` and, with
+`--target`, `NDI_RUNTIME_DIR_V6` and the three `GRAFTON_NDI_EXPECTED_*`
+identity values. `--github-env FILE` appends them to a file in the
+`NAME=value` form and `--github-output FILE` appends them as step outputs.
+The `--dest` directory must not exist yet. `--target` accepts the Linux
+x86_64, i686 and aarch64, Windows x64 and x86, and macOS x64 and arm64
+targets. Every archive member must stay inside the destination, and the
 unpacked tree is checked again for links that lead out of it. Apple packages
 unpack on macOS only and Windows packages on Windows only.
 
@@ -176,7 +189,11 @@ An entry is one of `github_release_asset` (read with the token in
 `NDI_SDK_ARCHIVE_TOKEN`, or in the variable named by `token_env`), `url_env`
 (the name of a variable holding an HTTPS URL) or `archive` (an absolute local
 path). The token is sent to `api.github.com` only and a transient HTTP failure
-is retried twice.
+is retried twice. A package's entry is keyed by its id, as above, or by its
+content-qualified name, `ndi-<version>-<edition>-<platform>-<sha256>`, and
+exactly one of the two must be present. The map needs an entry for every
+package the `sdk` matrix uses, including the baseline packages of the
+compatibility runs.
 
 Nothing the script prints contains a value from the source map, from a variable
 the map names, or the token: its own messages are written without them, a
@@ -302,7 +319,7 @@ Used as they exist today:
 
 | Setting | Purpose |
 |---|---|
-| Secret `NDI_SDK_SOURCES_JSON` | source map for the private SDK archives |
+| Secret `NDI_SDK_SOURCES_JSON` | source map for the private SDK archives, with an entry for every package the `sdk` matrix uses, including `6.1.1-standard-linux` and the 6.3.2 baselines |
 | Secret `NDI_SDK_ARCHIVE_TOKEN` | read-only token for the archive repository |
 | Variable `NDI_CI_RELEASED` = `true` | switches the `sdk` job on. With any other value the job is skipped, which fails `required-ci` wherever the secrets exist |
 
@@ -368,11 +385,12 @@ the guards too, and both have a code owner.
 ## Not yet run on a hosted runner
 
 These workflows have not run on GitHub. On Linux x86_64 the commands of `lint`,
-`test` and `cross`, the three Linux x64 `sdk` rows and SDK provisioning from
-local archives have been run by hand, and the shell steps of `verify` and
-`publish` have been run on a local clone with `cargo publish --dry-run`; the
-rest is unproven until the first hosted run. Remove an item from this section
-once a hosted run has exercised it.
+`test` and `cross`, the test commands of the five Linux x64 `sdk` rows and of
+their compatibility runs, and SDK provisioning from local archives have been
+run by hand, and the shell steps of `verify` and `publish` have been run on a
+local clone with `cargo publish --dry-run`; the rest is unproven until the
+first hosted run. Remove an item from this section once a hosted run has
+exercised it.
 
 Carried over from the previous CI, which ran on hosted runners:
 
@@ -400,6 +418,10 @@ New, and so unverified anywhere but Linux x86_64:
   Standard runtime in the Windows x64 Standard 6.4 row;
 - the Advanced lint on Windows and macOS;
 - the Linux x86 and Linux arm64 rows;
+- the compatibility runs on Windows and macOS, including the peer process under
+  their wrappers, and on every platform the hand-off of the baseline values
+  through the files under `$RUNNER_TEMP` and the step outputs;
+- provisioning the 6.1.1 and 6.3.2 baseline packages in CI;
 - building tvOS and visionOS on the stable toolchain;
 - the Android example link in `cross`;
 - access to the secrets and the download from the private store;

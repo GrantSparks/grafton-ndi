@@ -13,14 +13,33 @@ API, see the [README](README.md) and the migration guides for
 
 Version 3.0.0 loads the NDI library when the program selects a runtime instead
 of linking it when the program is built. Building the crate no longer needs an
-NDI SDK. Three public signatures changed and one Cargo feature was removed;
-see the [2.0 to 3.0 migration guide](docs/migration/2.0-to-3.0.md).
+NDI SDK. One public signature changed, two functions and one Cargo feature were
+removed, and the build no longer links the NDI library; see the
+[2.0 to 3.0 migration guide](docs/migration/2.0-to-3.0.md).
 
-The compatibility target remains NDI 6.x and Rust 1.88. The test suite was run
-on Linux x86_64 against Standard 6.1.1 and Standard/Advanced 6.3.2 and
-6.4.0.2 runtimes. Windows, macOS, Android and iOS targets were compiled and
-linted only. NDI 6.0 remains unqualified. See
-[SDK validation](docs/sdk-validation.md).
+### SDK and platform compatibility
+
+- The crate works with NDI 6 runtimes from the Standard and the Advanced SDK.
+  The minimum Rust version remains 1.88; the tvOS and visionOS targets need a
+  later release.
+- The test suite was run on Linux x86_64 against the Standard 6.1.1 runtime and
+  the Standard and Advanced 6.3.2 and 6.4.0.2 runtimes. Builds made with one
+  version's SDK also ran against another version's runtime, and 6.1.1 and
+  Advanced 6.3.2 peers exchanged video, audio and metadata with 6.4 peers in
+  both directions. Other NDI 6 releases, including 6.0, were not tested.
+- The other Linux architectures, Windows, macOS, Android and iOS were compiled
+  and linted only, and tvOS and visionOS were not built. The CI workflows that
+  test the other platforms have not yet run on a hosted runner. See
+  [SDK validation](docs/sdk-validation.md) and the
+  [README](README.md#supported-ndi-versions-and-platforms).
+- The bindings are generated from the NDI SDK 6.4.0.2 headers. A runtime that
+  lacks a newer capability reports it unavailable, and the operations that need
+  it return `Error::UnsupportedCapability`.
+- iOS, tvOS and visionOS are new targets. They link the static archive from the
+  NDI SDK for Apple named by `NDI_SDK_DIR`.
+- The build no longer refuses targets for which the NDI SDK supplies no
+  library, such as musl Linux, `windows-gnu` and Windows on ARM64. They are not
+  supported.
 
 ### Breaking Changes
 
@@ -28,42 +47,39 @@ linted only. NDI 6.0 remains unqualified. See
   missing now starts, and `NDI::new` returns `Error::RuntimeLoadFailed` naming
   every location tried and the reason for each. In 2.0 such a program did not
   start.
+- The build no longer passes the NDI library to the linker for Windows, macOS,
+  Linux and Android targets. Code that declares its own NDI functions, and C or
+  C++ code that calls NDI, must link the library itself. Tools that collect a
+  program's libraries from the executable no longer find it.
+- The library is searched for next to the executable, then in the directory
+  named by `NDI_RUNTIME_DIR_V6`, then by the operating system's loader. A
+  library in either directory is used even where 2.0 loaded another one from
+  the loader's path.
+- The default SDK edition comes from `NDI_SDK_EDITION`, otherwise from an NDI
+  SDK found on the build machine, otherwise it is Standard. A build machine
+  without the Advanced SDK that a 2.0 build used produces a program that
+  searches for the Standard runtime; set `NDI_SDK_EDITION=advanced` there to
+  keep the Advanced one.
 - `SourceCache::find_by_host` takes the `NDI` handle as its first argument. The
   cache no longer starts NDI by itself.
 - `NDI::is_supported_cpu` is removed. Use `Runtime::is_supported_cpu` on a
   selected runtime, or `ndi.runtime().is_supported_cpu()`.
 - `NDI::version` is removed. Use `ndi.info().raw_version()`, or
-  `Runtime::select(..)?.info().raw_version()` before NDI is started.
+  `Runtime::select(&options)?.info().raw_version()` before NDI is started. Both
+  return a `&'static str` instead of a `String`.
 - The `advanced_sdk` Cargo feature, which had no effect, is removed.
 - A runtime that does not start because the CPU lacks instructions it needs is
   reported as `Error::UnsupportedCpu` instead of `Error::InitializationFailed`.
 
 ### Added
 
-- A pinned, retained original Standard 6.1.1 Linux SDK, with native CI coverage
-  and compatibility checks against 6.4. Mixed-version peer tests launch separate
-  SDK implementations and check video pixels, audio samples, timecodes and
-  metadata in both directions.
-
-- Advanced API availability follows individual declaration families, so older
-  or partial Advanced headers preserve the public API and disable only missing
-  operations. The shared table registry drives both build and runtime selection.
-- `FileRecorder::reset` and `AsyncFileRecorder::reset` recover from an unconfirmed
-  session by replacing the native instance while returning its uncertain report.
-- Pinned Advanced 6.3.2 packages for Linux, Windows, Apple and Android, with
-  native baseline rows on Linux, Windows and macOS, and compatibility runs in
-  both directions against current Advanced headers and runtimes.
-- Qualification checks the loaded runtime's exact version, edition and module
-  path, crosses current/baseline headers and runtimes in both directions, and
-  tests real HEVC 4:4:4 pixels, video-only audio suppression, AVSync format
-  changes, Genlock reference/fallback pacing and KVM input-release ownership.
-
-
 - Runtime selection in two explicit steps. `Runtime::select` loads the NDI
   library and pins it for the process without starting NDI;
   `Runtime::initialize` starts NDI and returns an `NDI` handle. `NDI::new` and
   `NDI::with_options` do both, and `NDI::runtime` returns the selected runtime.
-  `RuntimeOptions` chooses an exact library path or an SDK edition.
+  `RuntimeOptions` chooses an exact library path or an SDK edition. The edition
+  of the loaded library is detected from the functions it exports, and an
+  Advanced runtime meets a request for the Standard edition.
 - `Runtime::info` and `NDI::info` return a `RuntimeInfo` with the loaded
   library's path, edition, linkage and version.
 - Capability queries in the new `capabilities` module. `capabilities()` reports
@@ -108,18 +124,20 @@ linted only. NDI 6.0 remains unqualified. See
   (`AllocatorService`), `AvSync`, `Genlock`, encoder and keyframe controls, and
   `KvmSession`. The declarations of the Advanced-only headers are generated on
   the build machine from an installed Advanced SDK. Without one the same API
-  compiles and every native operation returns `Error::UnsupportedCapability`.
-  See the [Advanced SDK guide](docs/advanced.md).
+  compiles and every native operation returns `Error::UnsupportedCapability`,
+  and older or partial Advanced headers disable only the operations they do not
+  declare. See the [Advanced SDK guide](docs/advanced.md).
 - `NDI::process_lifetime`, an explicit opt-in that keeps NDI started until the
   process exits. Custom receive allocators require it.
-- The optional `file-io` feature and `file` module for the NDI File library:
-  `FileApi::open` finds the library, `FileRecorder` records a source to disk
-  with an explicit report of whether the file was finalized, `FilePlayer`
-  plays a recording as an NDI source, and `AsyncFileRecorder` and
-  `AsyncFilePlayer` offer the same operations as futures for any executor. See
-  the [File API guide](docs/file-io.md).
-- iOS, tvOS and visionOS targets, which link the static archive from the NDI
-  SDK for Apple named by `NDI_SDK_DIR`.
+- The optional `file-io` feature and `file` module for the NDI File library of
+  the 6.4 SDK: `FileApi::open` finds the library, `FileRecorder` records a
+  source to disk with an explicit report of whether the file was finalized,
+  `FilePlayer` plays a recording as an NDI source, and `AsyncFileRecorder` and
+  `AsyncFilePlayer` offer the same operations as futures for any executor.
+  `reset` on either recorder replaces one whose session could not be confirmed
+  closed and returns that session's report. On Linux, macOS and Android the
+  File library needs the Advanced SDK runtime. See the
+  [File API guide](docs/file-io.md).
 - `NDI_SDK_EDITION` (`standard` or `advanced`) to set the edition a build
   searches for by default.
 - Examples for runtime selection, routing, the Discovery Server, the File API
@@ -127,41 +145,40 @@ linted only. NDI 6.0 remains unqualified. See
 
 ### Changed
 
-- Building for Windows, macOS, Linux and Android needs no NDI SDK, no
-  `libclang` and no bindgen: the bindings are generated from the SDK headers
-  ahead of time and are part of the crate. The documentation builds without an
-  SDK, and the crate's `documentation` link points to docs.rs.
-- The library is searched for next to the executable, then in the directory
-  named by `NDI_RUNTIME_DIR_V6`, then by the operating system's loader.
-- The selected library stays loaded until the process exits. `NDI` handles
-  still start and stop the SDK by reference count.
-- The default SDK edition comes from `NDI_SDK_EDITION`, otherwise from an NDI
-  SDK found on the build machine, otherwise it is Standard. The edition of the
-  loaded library is detected from the functions it exports, and an Advanced
-  runtime meets a request for the Standard edition.
+- Without the `advanced` feature, building for Windows, macOS, Linux and
+  Android needs no NDI SDK, no `libclang` and no bindgen: the bindings are
+  generated from the SDK headers ahead of time and are part of the crate. The
+  documentation builds without an SDK, and the crate's `documentation` link
+  points to docs.rs.
 - `NDI_SDK_DIR` is read only to choose the default edition, to find the
   Advanced SDK headers for the `advanced` feature, and to find the static
   archive for Apple mobile targets. When it is set it must name an SDK
   installation.
-- Tests that need an NDI runtime run under plain `cargo test` when one can be
-  loaded and are otherwise skipped with a message. `GRAFTON_NDI_REQUIRE_RUNTIME`
-  turns those skips into failures.
 - The published package contains only the sources, examples, build scripts,
-  README, changelog and license. `Cargo.lock` is tracked in the repository.
-- `Debug` for `NDI` prints `NDI { .. }`.
+  README, changelog and license. The tests and the guides under `docs/` are not
+  in it.
+- `Debug` for `NDI` prints `NDI { .. }`, and the derived `Debug` of `Sender`,
+  which holds an `NDI`, changes with it.
+
+### Removed
+
+- The build-time dependency on bindgen for the default feature set. Without
+  the `advanced` feature the build no longer reads `LIBCLANG_PATH`,
+  `CLANG_PATH`, `BINDGEN_EXTRA_CLANG_ARGS` or `SDKROOT`. With it, bindgen and
+  libclang may still read some of them when an Advanced SDK is found, but
+  changing them no longer re-runs the build script.
+- The API documentation is no longer published to GitHub Pages. The reference
+  is on docs.rs.
 
 ### Fixed
 
 - An unchanged Cargo invocation no longer rebuilds the crate and the crates
   that depend on it. In 2.0.0 the build script's own generated file was one of
   its inputs (#121).
-
-### Removed
-
-- The build-time dependency on bindgen for the default feature set. The
-  `LIBCLANG_PATH`, `CLANG_PATH`, `BINDGEN_EXTRA_CLANG_ARGS` and `SDKROOT`
-  variables are no longer inputs of this crate's build script.
-- The API documentation hosted on GitHub Pages. The reference is on docs.rs.
+- On Linux, an Advanced SDK directory in the default location that is not a
+  usable SDK no longer fails the build; the next default location is tried.
+- `NDI::new` no longer writes diagnostics to standard error in Windows debug
+  builds when the `CI` environment variable is set.
 
 ## [2.0.0] - 2026-10-16
 

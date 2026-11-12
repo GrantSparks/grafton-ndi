@@ -14,7 +14,8 @@ grafton-ndi = { version = "3.0", features = ["file-io"] }
 ```
 
 The File library is a separate native library that the NDI SDK installs beside
-the runtime library. Nothing else in the crate depends on it, so its absence
+the runtime library. It first ships with the NDI 6.4 SDK; the 6.1.1 and 6.3.2
+SDKs do not include it. Nothing else in the crate depends on it, so its absence
 never affects sending or receiving. `FileApi::open` finds it when it is first
 needed:
 
@@ -45,6 +46,12 @@ library in this order is selected:
 3. the directory named by the `NDI_RUNTIME_DIR_V6` environment variable;
 4. the platform loader's own search for the library name.
 
+The file is named `libndifile.so.6` on Linux, `libndifile.dylib` on macOS,
+`libndifile.so` on Android and `Processing.NDI.Lib.File.x64.dll` on 64-bit
+Windows. `FileRuntimeOptions::library_path` takes an absolute path and tries
+nothing else. A relative path, or a path other than that of the library already
+selected, fails with `FileError::Core`.
+
 Like the NDI runtime, a File library that was selected stays selected and
 loaded for the life of the process. A library that loads but cannot be used
 also stays loaded. If the platform loader's own search then matches the
@@ -58,7 +65,7 @@ Which NDI runtime the File library works with depends on the platform:
 | --- | --- |
 | Linux, macOS, Android | The File library uses the Advanced SDK runtime. `FileApi::open` refuses it beside a Standard runtime before loading anything. Select the Advanced runtime; see [SDK editions](../README.md#sdk-editions). |
 | Windows | The File library does not depend on the runtime's edition. The SDK ships it for 64-bit Windows only. |
-| iOS, tvOS, visionOS | The File archive is linked at build time; see [Apple mobile targets](../README.md#apple-mobile-targets). |
+| iOS, tvOS, visionOS | The File archive is linked at build time, in place of the core archive, when the NDI SDK for Apple supplies one; without it `FileApi::open` returns `FileError::Unavailable`. See [Apple mobile targets](../README.md#apple-mobile-targets). |
 
 ## Probing a recording
 
@@ -153,11 +160,32 @@ SDK starts a new file by itself when the options ask for it, for example at a
 size limit. `RecorderOptions` also selects the tracks to record and how files
 are named. `inject_metadata` writes a metadata frame into the recording.
 
-`start` and `rollover` check that the target's directory exists and is
-writable before they call the SDK, and return `FileError::Io` when it is not.
-The session, if one is open, goes on. A recorder can start a new session after
-any session has ended, including one the SDK ended by itself, for example at a
+`start` and `rollover` check that the target's directory exists and, on Unix,
+that it is writable before they call the SDK, and return `FileError::Io` when
+it is not. The session, if one is open, goes on.
+
+`start` returns `FileError::InvalidState` while a session is recording or
+stopping. A recorder learns that a session ended only from the events it takes,
+so keep calling `poll_event`, or call `finish`, until `state()` is
+`RecorderState::Closed` or `RecorderState::Indeterminate`. A new session can
+then start, including after a session the SDK ended by itself, for example at a
 format change when the options disable the rollover.
+
+Other recorder operations:
+
+- `state()` follows the events taken so far, and `report()` returns the
+  `RecordingReport` of the current session at any time.
+- `request_stop` asks the SDK to stop without waiting.
+- `last_accepted_source()` is the source the SDK last accepted, and
+  `reported_current_file()` the file named by the events taken so far. The
+  SDK's own getters for these return strings that its recording thread can
+  invalidate, so the crate does not call them; these values can lag behind
+  the SDK.
+- `RecorderOptions` sets a size after which a new file starts at the next
+  keyframe (`with_rollover_size`), whether a format change starts a new file
+  (`with_format_change_rollover`), the file name pattern (`exact_filename`,
+  `with_pattern`) and whether the source's proxy is recorded alongside its
+  full-quality video (`with_proxy`).
 
 ### Finishing a recording
 
@@ -183,12 +211,21 @@ The SDK discards events that are not taken promptly, and a session that lost
 events can no longer be confirmed closed. Call `poll_event` throughout a
 recording; `finish` takes events itself while it waits.
 
+If the SDK stops reporting events and `wait_finished` keeps timing out, `reset`
+gives up on the session. It creates a new idle recorder from the
+`RecorderOptions` it is given, abandons the old native recorder and returns the
+old session's `RecordingReport`, which stays unconfirmed; the old file may be
+truncated. The replacement has its own event queue, so late events from the old
+session cannot affect a new one, and session numbers keep increasing. If the
+replacement cannot be created, `reset` returns the error and the old recorder
+stays as it was.
+
 Dropping a recorder whose session is still open stops it and waits for the
 file to be finalized, for at most `RecorderOptions::with_drop_wait`
 (`RecorderOptions::DEFAULT_DROP_WAIT` is five seconds). The drop cannot report
 the outcome, so call `finish` when the result matters. `abandon` destroys the
-recorder at once without waiting; the file of a session that had not ended may
-be left truncated.
+recorder at once without waiting and returns its report; the file of a session
+that had not ended may be left truncated.
 
 Example: `examples/file_record.rs`.
 
@@ -256,45 +293,57 @@ async fn record(file: FileApi) -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 The async recorder takes its events continuously, so its report stays current
-without polling. Await `finish` to learn whether the recording is complete,
-then await `close`; neither blocks the executor. Dropping the last clone
-instead blocks the dropping thread until the object's thread has finished. For
-a recorder that means stopping an open session, waiting up to the drop wait
-for the file to be finalized, and destroying the recorder. The file is then
-finalized as far as the SDK reported within that wait, but the outcome cannot
-be reported.
+without polling. `next_event(wait)` delivers them to the application; a handle
+keeps up to 256 undelivered events, discards the oldest beyond that and counts
+the discarded ones in `notification_dropped_count`. A discarded notification
+does not change the recording report. `AsyncFileOptions` and
+`create_with_options` change the queue sizes.
+
+Await `finish` to learn whether the recording is complete, then await `close`;
+neither blocks the executor. `close` ends the object for every clone, and later
+calls on other clones fail with `FileError::InvalidState`. Dropping the last
+clone instead blocks the dropping thread until the object's thread has
+finished. For a recorder that means stopping an open session, waiting up to the
+drop wait for the file to be finalized, and destroying the recorder. The file
+is then finalized as far as the SDK reported within that wait, but the outcome
+cannot be reported. `AsyncFileRecorder::reset` replaces the native recorder as
+`FileRecorder::reset` does.
 
 ## Errors
 
-File operations return `FileResult<T>`, whose error is `FileError`:
+File operations return `FileResult<T>`, whose error is `FileError`. The enum
+is `#[non_exhaustive]`:
 
 | Variant | Meaning |
 | --- | --- |
 | `Unavailable` | The File library, or the part of it an operation needs, cannot be used in this process. The text says why. |
 | `InvalidInput` | A value cannot be represented by the native API, for example a path that is not UTF-8. |
-| `InvalidState` | The operation is not permitted in the current session state. |
+| `InvalidState` | The operation is not permitted in the current state, for example `start` during an open session, or a call on an async handle that is closing or whose command queue is full. |
 | `Rejected` | The SDK refused an operation; the recorder's or player's events may say more. |
 | `Protocol` | The SDK returned something that violates the expected contract. |
-| `Core` | An operation of the core NDI API failed. |
+| `Core` | An operation of the core NDI API failed, or `FileApi::open` was given a relative library path or one that conflicts with the library already selected. |
 | `Io` | A filesystem operation failed. |
 
 ## Running the tests
 
 The File tests follow the crate's test policy. Those that need the File library
 are skipped, with a message, when it cannot be used, and they make their own
-recordings. To run them on Linux x86_64, build with the Advanced SDK and select
-its runtime:
+recordings. To run them on Linux x86_64, build with the Advanced SDK, so that
+the crate searches for the Advanced runtime by default, and select its runtime:
 
 ```sh
 export NDI_SDK_DIR="/path/to/NDI Advanced SDK for Linux"
 export NDI_RUNTIME_DIR_V6="$NDI_SDK_DIR/lib/x86_64-linux-gnu"
-GRAFTON_NDI_REQUIRE_RUNTIME=file cargo test --features file-io
+GRAFTON_NDI_REQUIRE_RUNTIME=file cargo test --locked --config ci/offline.toml --features file-io
 ```
 
 `GRAFTON_NDI_REQUIRE_RUNTIME=file` makes a test that would have skipped fail
-instead. The tests that check how the File library is found use stand-in
-libraries and need no SDK; they run on Linux only.
+instead. The tests create NDI senders and receivers; `--config ci/offline.toml`
+confines them to loopback networking, and needs `bubblewrap`. The tests that
+check how the File library is found use stand-in libraries and need no SDK;
+they run on Linux only and need `rustc` on the `PATH`.
 
 The File tests were run on Linux x86_64 against the File library of the NDI
-6.4.0.2 SDK. The Windows and macOS rules above come from the SDK's libraries
-and were not exercised by a test run.
+6.4.0.2 SDK, beside the Advanced 6.4.0.2 runtime. The rules above for Windows,
+macOS, Android and the Apple mobile targets come from the SDK's libraries and
+the crate's code, and were not exercised by a test run.

@@ -5,8 +5,10 @@
 //! - Listing each source with its metadata
 //!
 //! A sender advertises metadata in the `send.metadata` property of its own
-//! configuration, and a finder is told it by a Discovery Server: name the
-//! server in the `networks.discovery` property of the configuration below.
+//! configuration, and a finder is told it by a Discovery Server. The
+//! configuration below is empty, so the finder reports metadata only when a
+//! Discovery Server is configured elsewhere, for example in the machine's NDI
+//! configuration. To name one here, set the `networks.discovery` property.
 //!
 //! Needs the NDI Advanced SDK at build time and an Advanced runtime.
 //!

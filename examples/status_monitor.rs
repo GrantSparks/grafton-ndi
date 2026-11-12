@@ -1,3 +1,16 @@
+//! Example: monitoring a receiver's connection status.
+//!
+//! Connects a metadata-only receiver to the first source found, or to the
+//! first one whose name contains the `--source` text, and prints every status
+//! change it reports: the number of connections and whether the source
+//! supports PTZ. It runs until interrupted.
+//!
+//! Run with: `cargo run --example status_monitor`
+//!
+//! Optional arguments:
+//! - IP addresses to search: `cargo run --example status_monitor -- 192.168.0.100`
+//! - Source to monitor: `cargo run --example status_monitor -- --source "Camera 1"`
+
 use grafton_ndi::{Receiver, ReceiverBandwidth, ReceiverOptions, NDI};
 
 use std::{

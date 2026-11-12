@@ -5,6 +5,34 @@
 //! networks. Building it needs no NDI SDK: the NDI runtime library is loaded
 //! when a runtime is selected.
 //!
+//! # Supported NDI versions and platforms
+//!
+//! The crate works with NDI 6 runtimes from the Standard and the Advanced SDK,
+//! and needs Rust 1.88 or later. Version 3.0 was tested against the Standard
+//! 6.1.1 and the Standard and Advanced 6.3.2 and 6.4.0.2 runtimes on Linux
+//! x86_64, and its bindings are generated from the 6.4.0.2 headers. Other NDI 6
+//! releases have not been tested. A runtime provides only what its version
+//! offers: an operation it cannot perform returns
+//! [`Error::UnsupportedCapability`], and [`NDI::capabilities`] reports each
+//! capability in advance.
+//!
+//! Windows, macOS, Linux and Android load the NDI runtime library when a
+//! runtime is selected, searching next to the executable, then
+//! `NDI_RUNTIME_DIR_V6`, then the platform loader's own path; see the
+//! [`runtime`] module. A library that cannot be found is reported as
+//! [`Error::RuntimeLoadFailed`]. The selected library stays selected, and
+//! loaded, for the life of the process, and [`RuntimeOptions`] can name an
+//! exact library or SDK edition for that selection. NDI itself starts and
+//! stops with the [`NDI`] handles.
+//!
+//! iOS, tvOS and visionOS targets link the static archive of the NDI SDK for
+//! Apple instead, selected from `NDI_SDK_DIR` at build time. With `file-io`,
+//! the File archive replaces the core archive when the SDK supplies one.
+//!
+//! The [README](https://github.com/GrantSparks/grafton-ndi#supported-ndi-versions-and-platforms)
+//! lists the Rust targets, what each NDI version provides, and how each target
+//! was checked.
+//!
 //! # Quick Start
 //!
 //! ```no_run
@@ -85,15 +113,22 @@
 //! missing returns [`Error::UnsupportedCapability`]; the rest of the API keeps
 //! working. See the [`capabilities`] module.
 //!
-//! ## Further modules
+//! ## Further modules and features
 //!
 //! - [`routing`]: a source that redirects its receivers to another source.
 //! - [`discovery`]: registration with, and listing of, an NDI Discovery Server.
 //! - [`utilities`] and [`video_conversion`]: checked audio and video
 //!   conversions.
-//! - `advanced` (Cargo feature `advanced`): NDI Advanced SDK operations.
+//! - `advanced` (Cargo feature `advanced`): NDI Advanced SDK operations. They
+//!   need the Advanced SDK headers at build time (`NDI_SDK_DIR` or a default
+//!   installation); without them the same API compiles and reports that it is
+//!   unavailable.
 //! - `file` (Cargo feature `file-io`): recording and playback through the NDI
 //!   File API.
+//! - `tokio` and `smol` (Cargo features of the same names): receivers for the
+//!   named async runtime.
+//! - PNG, JPEG and data-URL encoding of video frames, with the default
+//!   `image-encoding` feature.
 //!
 //! # Thread Safety
 //!
@@ -136,25 +171,6 @@
 //! using native completion callbacks when the selected runtime supplies them.
 //!
 //! Note: Only video supports async sending in the NDI SDK. Audio and metadata are always synchronous.
-//!
-//! # Runtime and platform support
-//!
-//! Desktop platforms and Android load the NDI runtime library when a runtime
-//! is selected, searching next to the executable, then `NDI_RUNTIME_DIR_V6`,
-//! then the platform loader's own path; see the [`runtime`] module. A library
-//! that cannot be found is reported as [`Error::RuntimeLoadFailed`]. The
-//! selected library stays selected, and loaded, for the life of the process,
-//! and [`RuntimeOptions`] can name an exact library or SDK edition for that
-//! selection. NDI itself starts and stops with the [`NDI`] handles.
-//!
-//! The `advanced` and `file-io` features add optional APIs. The Advanced
-//! wrappers need the Advanced SDK headers at build time (`NDI_SDK_DIR` or a
-//! default installation); without them the same API compiles and reports that
-//! it is unavailable.
-//!
-//! iOS, tvOS and visionOS targets link the vendor's static archive instead,
-//! selected from `NDI_SDK_DIR` at build time, with the File archive as the
-//! sole provider when it embeds the NDI core.
 
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]

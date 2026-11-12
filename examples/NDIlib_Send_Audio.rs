@@ -1,7 +1,8 @@
 //! Example: Sending audio via NDI.
 //!
-//! This example demonstrates sending 4-channel audio at 48kHz.
-//! The audio is clocked to ensure accurate sample timing.
+//! This example sends 50 frames of 4-channel silence at 48kHz, 1920 samples
+//! per frame, and then exits. The audio is clocked to ensure accurate sample
+//! timing.
 //!
 //! Run with: `cargo run --example NDIlib_Send_Audio`
 

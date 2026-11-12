@@ -10,6 +10,71 @@
 
 The crate loads the NDI runtime library when the program selects a runtime and wraps the SDK's objects in Rust ownership types. Building it needs no NDI SDK. Applications supply their renderer, mixer, encoder, storage layer, or UI.
 
+## Supported NDI versions and platforms
+
+`grafton-ndi` 3.0 works with NDI 6 runtimes from the Standard SDK and the Advanced SDK. It needs Rust 1.88 or later.
+
+### NDI versions
+
+| NDI SDK | Status for 3.0 | Editions tested |
+| --- | --- | --- |
+| 6.4.0.2 | Tested. The crate's bindings are generated from its headers. | Standard, Advanced |
+| 6.3.2 | Tested. | Standard, Advanced |
+| 6.1.1 | Tested. | Standard |
+| Other NDI 6 releases, including 6.0 | Not tested. | |
+| NDI 5 and earlier | Not supported. | |
+
+A tested version passed the whole test suite on Linux x86_64. The runs also crossed versions: a build made with one version's SDK ran against another version's runtime, and senders and receivers of different versions exchanged video, audio and metadata. [SDK validation](docs/sdk-validation.md) lists every run.
+
+The crate checks what the selected runtime provides before it calls into it. An operation that the runtime cannot perform returns `Error::UnsupportedCapability`, and the rest of the API keeps working. [Runtime capabilities](#runtime-capabilities-and-optional-apis) shows how to ask in advance. The Linux x86_64 runtimes report:
+
+| Available | 6.1.1 | 6.3.2 | 6.4.0.2 |
+| --- | :---: | :---: | :---: |
+| Every API that 2.0 had: source discovery, receiving, sending, FrameSync, PTZ, tally and status | Yes | Yes | Yes |
+| Routing, receiver connection metadata, the web-control URL, metadata from receivers to a sender, interleaved audio, V210/P216 conversion | Yes | Yes | Yes |
+| `Receiver::poll_source_name_change` | No | Yes | Yes |
+| Receiver video and audio delay, `NDI::timestamp` | No | No | Yes |
+| Planar 4:4:4 video formats, `ReceiverColorFormat::Best444`, the video-only bandwidth modes | No | No | Yes |
+| Discovery Server advertisers and listeners | No | No | Yes |
+| Advanced SDK operations (`advanced` feature), with an Advanced runtime | Not tested | Yes | Yes |
+| File API (`file-io` feature) | No | No | Yes |
+
+The 6.3.2 runtime exports the Discovery Server functions, but runtimes before 6.4.0 can crash when those objects are destroyed, so the crate refuses them there. The File library first ships with the 6.4 SDK. On Linux, macOS and Android it works only beside the Advanced runtime.
+
+### Platforms
+
+| Platform | Rust targets | How NDI is provided | Checked for 3.0 |
+| --- | --- | --- | --- |
+| Linux | `x86_64-unknown-linux-gnu` | Runtime library, loaded at run time | Test suite run against real runtimes |
+| Linux | `i686-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf` | Runtime library, loaded at run time | Compiled and linted |
+| Windows | `x86_64-pc-windows-msvc`, `i686-pc-windows-msvc` | Runtime library, loaded at run time | Compiled and linted |
+| macOS | `aarch64-apple-darwin`, `x86_64-apple-darwin` | Runtime library, loaded at run time | Compiled and linted |
+| Android | `aarch64-linux-android`, `armv7-linux-androideabi`, `i686-linux-android`, `x86_64-linux-android` | Runtime library packaged with the application, loaded at run time | Compiled and linted |
+| iOS | `aarch64-apple-ios`, and `x86_64-apple-ios` for the simulator | Static library from the NDI SDK for Apple, linked at build time | Compiled and linted against the NDI SDK for Apple 6.4 |
+| tvOS | `aarch64-apple-tvos`, and `x86_64-apple-tvos` for the simulator | Static library from the NDI SDK for Apple, linked at build time | Not yet compiled |
+| visionOS | `aarch64-apple-visionos` | Static library from the NDI SDK for Apple, linked at build time | Not yet compiled |
+
+Compiled and linted means that `cargo clippy` with every feature and with warnings denied passed for the target. Nothing ran on it, and no NDI library was loaded. The repository's [CI workflows](ci/README.md) run the tests against real runtimes on Linux, Windows and macOS and build the Apple mobile targets, but they have not yet run on a hosted runner.
+
+Not supported, or not tested:
+
+- Windows on ARM64. The NDI SDK for Windows ships x64 and x86 libraries only.
+- The arm64 simulators: `aarch64-apple-ios-sim`, `aarch64-apple-tvos-sim` and `aarch64-apple-visionos-sim`. The arm64 archives in the NDI SDK for Apple are device builds. visionOS has no simulator target at all: the SDK's visionOS simulator archive is for x86_64, and Rust has no x86_64 visionOS target.
+- Mac Catalyst. The NDI SDK for Apple has no Catalyst build.
+- Every target not in the table, for example the `windows-gnu`, musl and BSD targets, and the Advanced SDK's builds for particular embedded boards. They have not been compiled or tested.
+
+The minimum Rust version, 1.88, applies to every target in the table except tvOS and visionOS, for which Rust 1.88 distributes no standard library; a later stable release does. `x86_64-apple-tvos` has no distributed standard library at all and needs a nightly toolchain with `-Zbuild-std`. [`ci/apple-mobile.sh`](ci/apple-mobile.sh) shows the commands.
+
+### Apple mobile targets
+
+iOS, tvOS and visionOS targets link the vendor's static archive into the application instead of loading a library. For those targets:
+
+- `NDI_SDK_DIR` must name an NDI SDK for Apple. The build fails without it.
+- The build links the archive for the target from the SDK's `lib/iOS`, `lib/tvOS` or `lib/visionOS` directory, together with the system frameworks it needs. With `file-io`, the File archive is linked in its place when the SDK supplies one.
+- The archive must contain a slice for the target's CPU and platform. In the NDI SDK for Apple 6.4 the arm64 slices are device builds and the x86_64 slices are simulator builds.
+- The 6.4 archives need iOS 16.0, tvOS 16.0 or visionOS 1.0. If `IPHONEOS_DEPLOYMENT_TARGET`, `TVOS_DEPLOYMENT_TARGET` or `XROS_DEPLOYMENT_TARGET` is set below the minimum the archive was built for, the build fails.
+- The edition is fixed by the archive. `RuntimeOptions::library_path` is rejected with `Error::RuntimeConflict`, and selecting the runtime loads nothing.
+
 ## What It Covers
 
 - **Runtime lifecycle** - Select the NDI runtime library, inspect it, then start and stop NDI through cheap, reference-counted `NDI` handles.
@@ -23,7 +88,7 @@ The crate loads the NDI runtime library when the program selects a runtime and w
 - **Image snapshots** - Encode captured video frames as PNG, JPEG, or data URLs with the default `image-encoding` feature.
 - **Routing and Discovery Server** - Redirect receivers with a routing source, register senders and receivers with a Discovery Server, list what it reports, and request receiver connections.
 - **Media formats and controls** - Planar 4:4:4 formats, receiver color and bandwidth modes, delay controls, SDK timestamps, and checked audio and video conversions.
-- **Advanced SDK** - Optional compressed and scatter streams, completion queues, custom receive allocation, JSON configuration, AVSync, Genlock, and KVM.
+- **Advanced SDK** - Optional compressed and scatter streams, completion queues, custom receive allocation, JSON configuration, source metadata, encoder and keyframe controls, AVSync, Genlock, and KVM.
 - **File API** - Optional recording of sources to files and playback of files as NDI sources.
 - **Runtime capabilities** - Inspect the selected runtime and check whether each optional operation is available before using it.
 
@@ -75,12 +140,12 @@ Use `default-features = false` for a build without image encoding. Cargo feature
 
 To build:
 
-- Rust 1.88 or later.
+- Rust 1.88 or later. tvOS and visionOS need a later release; see [Platforms](#platforms).
 - Nothing else for Windows, macOS, Linux and Android targets. The crate contains bindings generated from the SDK headers, so a build needs no NDI SDK and no `libclang`.
 
 To run:
 
-- An NDI 6 runtime library that the program can find; see [Finding the runtime](#finding-the-runtime). The [NDI SDK](https://ndi.video/for-developers/ndi-sdk/) contains the runtime library for each platform.
+- An NDI 6 runtime library that the program can find; see [NDI versions](#ndi-versions) and [Finding the runtime](#finding-the-runtime). The [NDI SDK](https://ndi.video/for-developers/ndi-sdk/) contains the runtime library for each platform.
 
 Two cases read an SDK at build time:
 
@@ -107,7 +172,7 @@ The library file names are:
 | Linux | `libndi.so.6` | `libndi_advanced.so.6` |
 | Android | `libndi.so` | `libndi_advanced.so` |
 
-To load one exact file instead, pass its absolute path. No other location is tried:
+To load one exact file instead, pass its absolute path. No other location is tried, and a relative path returns `Error::InvalidConfiguration`:
 
 ```rust
 use grafton_ndi::{RuntimeOptions, NDI};
@@ -123,7 +188,7 @@ When no usable library is found, `NDI::new()` returns `Error::RuntimeLoadFailed`
 Failed to load the NDI runtime: no usable Standard runtime; tried /opt/app/libndi.so.6 (next to the executable): not found; /opt/ndi/libndi.so.6 (NDI_RUNTIME_DIR_V6): not found; libndi.so.6 (system library search): dlopen failed: libndi.so.6: cannot open shared object file: No such file or directory
 ```
 
-A failed selection can be retried. A successful one is permanent: the selected library stays loaded until the process exits, and a later request for a different library returns `Error::RuntimeConflict`.
+A failed selection can be retried. A successful one is permanent: the selected library stays loaded until the process exits. A later request that it cannot meet returns `Error::RuntimeConflict`: one that names a different library, or one that requires the Advanced edition when the selected library is a Standard runtime.
 
 One limit applies to the search. A library that loads but is rejected stays loaded, because a native library cannot be unloaded safely. If the platform loader's own search then matches the library name to that module, it returns the module again instead of looking further. The error names the rejected file. Remove or fix that file, or pass an explicit library path.
 
@@ -154,7 +219,7 @@ NDI ships a Standard SDK and an Advanced SDK with different runtime libraries. A
 - `RuntimeOptions::default().edition(SdkEdition::Standard)` searches for the Standard library. An Advanced runtime also meets a Standard request.
 - Without a request, the default chosen when the crate was built applies: the value of `NDI_SDK_EDITION` (`standard` or `advanced`) if it was set, otherwise the edition of an NDI SDK found on the build machine, otherwise Standard.
 
-The build looks for an SDK in the directory named by `NDI_SDK_DIR`, or else in the vendor installers' default locations, and uses the first one it finds. On Linux the Advanced SDK's location is checked before the Standard SDK's. A build that finds an Advanced SDK therefore searches for the Advanced runtime by default. Set `NDI_SDK_EDITION=standard` for that build, or request `SdkEdition::Standard` at run time, to use the Standard runtime instead. `NDI_SDK_DIR` must name an SDK installation when it is set; any other value fails the build.
+The build looks for an SDK in the directory named by `NDI_SDK_DIR`, or else in the vendor installers' default locations, and uses the first one it finds. On Linux the Advanced SDK's location is checked before the Standard SDK's; on Windows and macOS the Standard SDK's comes first, so name an Advanced SDK in `NDI_SDK_DIR` there when both are installed. A build that finds an Advanced SDK searches for the Advanced runtime by default. Set `NDI_SDK_EDITION=standard` for that build, or request `SdkEdition::Standard` at run time, to use the Standard runtime instead. `NDI_SDK_DIR` must name an SDK installation when it is set, and `NDI_SDK_EDITION` must be `standard` or `advanced`; any other value fails the build.
 
 `ndi.info().edition()` reports the edition of the library that was actually loaded, detected from the functions it exports. An edition says nothing about a license entitlement.
 
@@ -182,7 +247,7 @@ if finder.wait_for_sources(Duration::from_secs(2))? {
 }
 ```
 
-For applications that repeatedly reconnect to known devices, `SourceCache` handles discovery, exact host/IP matching, and cache invalidation. Its lookups take the `NDI` handle. Pass a complete bare hostname or IP address. Hostname ASCII case, an optional final dot, and equivalent numeric IP spellings share one cache entry. `len()` counts distinct host identities; `invalidate()` accepts any equivalent spelling. For searches by partial IP or source label, filter a `Finder` snapshot explicitly.
+For applications that repeatedly reconnect to known devices, `SourceCache` handles discovery and exact host/IP matching, and keeps each source it finds until `invalidate()` or `clear()` removes it. Its lookups take the `NDI` handle. Pass a complete bare hostname or IP address. Hostname ASCII case, an optional final dot, and equivalent numeric IP spellings share one cache entry. `len()` counts distinct host identities; `invalidate()` accepts any equivalent spelling. For searches by partial IP or source label, filter a `Finder` snapshot explicitly.
 
 ```rust
 use grafton_ndi::SourceCache;
@@ -202,7 +267,7 @@ use grafton_ndi::{
 };
 use std::time::Duration;
 
-let options = ReceiverOptions::builder(camera)
+let options = ReceiverOptions::builder(camera.clone())
     .color(ReceiverColorFormat::RGBX_RGBA)
     .bandwidth(ReceiverBandwidth::Highest)
     .build();
@@ -291,11 +356,10 @@ if let Some(video) = frame_sync.capture_video(ScanType::Progressive)? {
     println!("video: {}x{}", video.width(), video.height());
 }
 
+// 1024 stereo samples at 48 kHz, resampled from the source's audio.
 let request = FrameSyncAudioRequest::capture_with(Some(48_000), 2, 1024)?;
 let audio = frame_sync.capture_audio(request)?;
-if !audio.is_empty() {
-    println!("audio: {} channels at {} Hz", audio.num_channels(), audio.sample_rate());
-}
+println!("audio: {} channels at {} Hz", audio.num_channels(), audio.sample_rate());
 ```
 
 `FrameSync` owns its receiver. `frame_sync.receiver()` provides controls, audio,
@@ -347,7 +411,7 @@ The crate's public API is organized around a small set of resource types:
 - `FrameSync` wraps a receiver for clock-corrected pull capture.
 - `VideoFrame`, `AudioFrame`, and `MetadataFrame` represent application-owned frame data.
 
-Most applications can start with owned frame APIs such as `receiver.video().capture()` and `sender.send_video()`. For receive hot paths, borrowed receive refs keep data in SDK buffers without an extra copy. Async `sender.send_video_async(frame)` moves an owned `VideoFrame` into the sender without copying pixels and returns the previous completed frame for reuse. This avoids Rust wrapper pixel copies; SDK encoding and network processing may still copy data. Use two frames and call `finish_video_async()` to recover the final frame. For borrowed buffers, `send_video_async_copy(&frame)` explicitly copies pixels and metadata into sender-owned storage and returns the previous frame as `Result<Option<VideoFrame>>`; the source buffer can immediately be reused.
+Most applications can start with owned frame APIs such as `receiver.video().capture()` and `sender.send_video()`. For receive hot paths, borrowed receive refs keep data in SDK buffers without an extra copy. `sender.send_video_async(frame)`, the SDK's asynchronous video send, takes `&mut Sender` and moves an owned `VideoFrame` into the sender without copying pixels. It returns the previous completed frame for reuse, and `None` on the first call. This avoids Rust wrapper pixel copies; SDK encoding and network processing may still copy data. Use two frames and call `finish_video_async()` to recover the final frame. For borrowed buffers, `send_video_async_copy(&frame)` explicitly copies pixels and metadata into sender-owned storage and returns the previous frame as `Result<Option<VideoFrame>>`; the source buffer can immediately be reused.
 
 Frame layout fields that describe SDK-facing memory are private. Builders, accessors, checked mutation methods, and `PixelFormat` helpers keep dimensions, strides, metadata, and buffer sizes consistent before data crosses the FFI boundary.
 
@@ -355,7 +419,7 @@ Frame layout fields that describe SDK-facing memory are private. Builders, acces
 
 `grafton-ndi` aims to be a predictable Rust layer over NDI, not a replacement for the NDI SDK documentation.
 
-- **Typed function tables**: every native call goes through a table of functions resolved once, when the runtime is selected. Each table's signatures are checked at compile time against bindings generated from the SDK headers.
+- **Typed function tables**: every native call goes through a table of functions resolved once: when the runtime is selected, or when `FileApi::open` loads the File library. Each table's signatures are checked at compile time against bindings generated from the SDK headers.
 - **One runtime per process**: the selected library stays loaded until the process exits, while `NDI` handles start and stop the SDK by reference count.
 - **RAII lifecycle**: NDI handles, senders, receivers, frames, and pending async sends clean up through ownership.
 - **Initialized receive views**: borrowed video rows and audio channels expose active payload only; `data()` is optional for padded layouts. Owned capture packs active payload without reading SDK padding.
@@ -386,6 +450,8 @@ let jpeg = video.encode_jpeg(85)?;
 let data_url = video.encode_data_url(ImageFormat::Png)?;
 ```
 
+Encoding accepts RGBA, RGBX, BGRA and BGRX frames, and returns an error for other formats. Ask a receiver for `ReceiverColorFormat::RGBX_RGBA` or `BGRX_BGRA` when its frames are to be encoded. JPEG quality is 1 to 100.
+
 ## Runtime capabilities and optional APIs
 
 `runtime.info()`, or `ndi.info()` on a handle, gives the identity of the selected library: its path, edition, version and whether it is shared or statically linked.
@@ -413,23 +479,22 @@ An operation whose capability is unavailable returns `Error::UnsupportedCapabili
 | `RuntimeTooOld` | The runtime's version is below the capability's minimum. |
 | `RuntimeVersionUnknown` | The capability has a minimum version and the runtime's version text was not recognized. |
 | `WrongEdition` | The capability belongs to the Advanced SDK and the runtime is a Standard one. |
-| `BuildAbiUnavailable` | The capability belongs to the Advanced SDK and the crate was built without the Advanced SDK headers. |
+| `BuildAbiUnavailable` | The capability belongs to the Advanced SDK, and the crate was built without the `advanced` feature or without Advanced SDK headers that declare it. |
 
 The capabilities with a minimum version need NDI 6.4.0:
 
 - `Planar444Video`, `ReceiveBest444` and `ReceiveVideoOnly`, because an older runtime does not know those values.
 - `SenderAdvertising`, `ReceiverAdvertising`, `SenderDiscovery` and `ReceiverDiscovery`, because older runtimes can crash when those objects are destroyed.
 
-The other capabilities depend only on what the runtime exports. The Standard 6.3.2 runtime does not export the functions behind `ReceiveDelay` and `SdkTimestamp`. The Standard 6.4.0.2 runtime provides every capability except the two Advanced SDK ones. Availability says nothing about hardware or license requirements.
+Apart from the two Advanced SDK capabilities, the others depend only on what the runtime exports. The [table of NDI versions](#ndi-versions) shows what each tested runtime provides. Availability says nothing about hardware or license requirements.
 
 Planar `NA48`, `NB48`, `NA4G`, and `NB4G` frames need a runtime with `Planar444Video`. Construct them with
 `VideoFrame::builder().pixel_format(format).build_for(&ndi)` or the borrowed-frame
-equivalent. The frame keeps the runtime alive, including when captured or copied. `build()` works without a runtime for every other format, and returns `Error::RuntimeRequired` for these four. Delay setters accept at most 2000 ms,
-round positive fractional milliseconds upward, and report whether the native value
-changed. Standard encoding may convert 4:4:4 inputs to 4:2:2.
+equivalent. The frame keeps the runtime alive, including when captured or copied. `build()` works without a runtime for every other format, and returns `Error::RuntimeRequired` for these four. Standard encoding may convert 4:4:4 inputs to 4:2:2.
 
-`utilities` provides checked interleaved audio conversions with explicit integer reference levels. `video_conversion`
-provides V210/P216 conversions for complete six-pixel V210 groups.
+`Receiver::set_video_delay` and `set_audio_delay` need `ReceiveDelay`. They accept at most 2000 ms, round positive fractional milliseconds upward, and report whether the native value changed.
+
+`utilities` provides checked conversions between planar and interleaved audio, with explicit reference levels for integer samples, and `Sender::send_audio_interleaved_i16`, `_i32` and `_f32`. `video_conversion` provides V210/P216 conversions for complete six-pixel V210 groups.
 
 ### Routing
 
@@ -443,6 +508,8 @@ router.change(&camera)?;
 // Later: stop routing.
 router.clear()?;
 ```
+
+`Router::new` returns `Error::UnsupportedCapability` when the runtime does not export the routing functions.
 
 ### Discovery Server
 
@@ -464,21 +531,21 @@ for receiver in listener.snapshot()? {
 }
 ```
 
-Each object is created for a server address: the one in its options, or else the one in the NDI configuration. Creation fails only when there is no address or the SDK cannot parse it. A server that cannot be reached is not an error. The object keeps trying in the background and starts working a few seconds after the server appears. A listener reports its connection through `is_connected`, and its snapshots are empty until it connects. An advertiser reports nothing.
+Each object is created for a server address: the one in its options, or else the one in the NDI configuration. Apart from an older runtime and invalid option text, creation fails only when there is no address or the SDK cannot parse it. A server that cannot be reached is not an error. The object keeps trying in the background and starts working a few seconds after the server appears. A listener reports its connection through `is_connected`, and its snapshots are empty until it connects. An advertiser reports nothing.
 
 An advertiser owns its registrations. `register` returns a token, and the registered sender or receiver stays alive until `unregister` is called with that token or the advertiser is dropped, even if the application drops its own handle first. A token given to an advertiser that did not issue it comes back inside `Rejected`.
 
-Names and metadata from the network are decoded lossily, so one malformed peer cannot fail a snapshot. Identifiers are the exception: a `SenderId`, `ReceiverId` or `InputGroupId` keeps the server's exact bytes, so passing one back always names the same peer, and each kind is its own type. One snapshot or event batch is limited to 16 MiB, and one string to 4 MiB. `Router`, the advertisers and the listeners are `Send` and not `Sync`.
+Names and metadata from the network are decoded lossily, so one malformed peer cannot fail a snapshot. Identifiers are the exception: a `SenderId`, `ReceiverId` or `InputGroupId` keeps the server's exact bytes, so passing one back always names the same peer, and each kind is its own type. One snapshot or event batch is limited to 16 MiB, and one string to less than 4 MiB. A larger one returns `Error::InvalidFrame`, and the events of a refused batch are lost. `Router`, the advertisers and the listeners are `Send` and not `Sync`.
 
 ### Advanced SDK
 
 The `advanced` feature adds the `advanced` module. Using it needs three things:
 
 1. The `advanced` Cargo feature.
-2. An NDI Advanced SDK on the build machine, in `NDI_SDK_DIR` or a default installation directory. The Advanced SDK headers may not be redistributed, so the build generates their declarations locally with bindgen, which needs `libclang`.
+2. An NDI Advanced SDK on the build machine, in `NDI_SDK_DIR` or a default installation directory. The Advanced SDK headers may not be redistributed, so the build generates their declarations locally with bindgen, which needs `libclang`. A build that finds an Advanced SDK and no `libclang` fails.
 3. An Advanced SDK runtime selected when the program runs.
 
-The module's API is the same whether or not the build found the Advanced SDK. Without it, or with a Standard runtime, each native operation returns `Error::UnsupportedCapability` with the reason. The data types in the module, such as packets, envelopes and options, work in every build.
+The module's API is the same whether or not the build found the Advanced SDK. Without it, or with a Standard runtime, each native operation returns `Error::UnsupportedCapability` with the reason. Older Advanced SDK headers disable only the operations they do not declare. The data types in the module, such as packets, envelopes and options, work in every build. The Advanced SDK 6.3.2 and 6.4.0.2 were tested; see [NDI versions](#ndi-versions).
 
 An operation that takes ownership of a receiver, a sender or a frame hands it back inside `grafton_ndi::Rejected<T>` when it fails. Custom receive allocators require `ndi.process_lifetime()`, an explicit opt-in that keeps NDI started until the process exits. See the [Advanced SDK guide](docs/advanced.md).
 
@@ -497,31 +564,7 @@ let mut player = file.create_player(PlayerOptions::new("Replay")?)?;
 player.start("take_001.mkv")?;
 ```
 
-On Linux, macOS and Android the File library works only with the Advanced SDK runtime, and `FileApi::open` refuses it beside a Standard runtime before loading anything. A recorder stores a source's compressed data as it arrives and takes no frames from Rust. Treat a recording as complete only when `FileRecorder::finish` returns `FinishStatus::Closed`. See the [File API guide](docs/file-io.md).
-
-### Apple mobile targets
-
-iOS, tvOS and visionOS targets link the vendor's static archive into the application instead of loading a library. For those targets:
-
-- `NDI_SDK_DIR` must name an NDI SDK for Apple. The build fails without it.
-- The build links the archive for the target from the SDK's `lib/iOS`, `lib/tvOS` or `lib/visionOS` directory, together with the system frameworks it needs. With `file-io`, the File archive is linked in its place when the SDK supplies one.
-- The archive must contain a slice for the target's CPU and platform. The SDK does not supply every device and simulator combination.
-- If `IPHONEOS_DEPLOYMENT_TARGET`, `TVOS_DEPLOYMENT_TARGET` or `XROS_DEPLOYMENT_TARGET` is set below the minimum the archive was built for, the build fails.
-- The edition is fixed by the archive. `RuntimeOptions::library_path` is rejected with `Error::RuntimeConflict`, and selecting the runtime loads nothing.
-
-## Platform Support
-
-The compatibility target is NDI 6.x and Rust 1.88.
-
-| Target family | How NDI is provided |
-| --- | --- |
-| Linux | Shared library, loaded at run time. |
-| Windows MSVC x86/x64 | Shared library, loaded at run time. |
-| macOS Intel/Apple Silicon | Shared library, loaded at run time. |
-| Android | Shared library packaged with the application, loaded at run time. |
-| iOS/tvOS/visionOS | Static archive from the NDI SDK for Apple, linked at build time. |
-
-For this release the test suite was run on Linux x86_64 against Standard 6.1.1 and Standard/Advanced 6.3.2 and 6.4.0.2 runtimes. Cross-version peers were also tested between 6.1.1/6.3.2 and 6.4. Windows, macOS, Android and iOS targets were compiled and linted but their tests were not run. NDI 6.0 remains unqualified. The CI workflows in this repository have not yet run on a hosted runner. See [SDK validation](docs/sdk-validation.md) for the results and their limits.
+The File library ships with the NDI 6.4 SDK. On Linux, macOS and Android it works only with the Advanced SDK runtime, and `FileApi::open` refuses it beside a Standard runtime before loading anything. On Windows it ships for x64 only and works with either edition. A recorder stores a source's compressed data as it arrives and takes no frames from Rust. Treat a recording as complete only when `FileRecorder::finish` returns `FinishStatus::Closed`. See the [File API guide](docs/file-io.md).
 
 ## Documentation
 
@@ -533,11 +576,11 @@ For this release the test suite was run on Linux x86_64 against Standard 6.1.1 a
 - [File API guide](docs/file-io.md) - Recording, playback and how a recording is finished.
 - [SDK validation](docs/sdk-validation.md) - What was tested, and how to reproduce it.
 - [CI guide](ci/README.md) - The workflows, the SDK test matrix and the release procedure.
-- [Image encoding resources](docs/image-encoding-performance.md) - Conversion scratch bounds, codec/output peak memory, and reproducible timing comparisons.
+- [Image encoding resources](docs/image-encoding-performance.md) - Conversion scratch bounds, codec/output peak memory, and timing comparisons, measured for 2.0.0.
 
 ## Examples
 
-Run an example with `cargo run --example <name>`. Most accept the IP addresses to search as arguments; each file's header lists its options.
+Run an example with `cargo run --example <name>`. Most accept extra IP addresses to search as arguments. The comment at the top of each file says what it does and lists its options.
 
 Discovery and monitoring:
 
@@ -545,7 +588,7 @@ Discovery and monitoring:
 | --- | --- | --- |
 | `runtime_selection.rs` | `cargo run --example runtime_selection` | Select a runtime, inspect it, then start NDI. |
 | `NDIlib_Find.rs` | `cargo run --example NDIlib_Find` | Discover NDI sources on the network. |
-| `status_monitor.rs` | `cargo run --example status_monitor` | Monitor receiver connection status and frame drops. |
+| `status_monitor.rs` | `cargo run --example status_monitor` | Print a receiver's connection status changes. |
 | `routing.rs` | `cargo run --example routing` | Route receivers to each discovered source in turn. |
 | `discovery_server.rs` | `cargo run --example discovery_server -- 127.0.0.1:5959` | Register a sender with a Discovery Server and list what the server reports. Needs a Discovery Server and an NDI 6.4.0 or later runtime. |
 
@@ -582,7 +625,7 @@ Advanced SDK. These need the `advanced` feature, an Advanced SDK at build time a
 | `advanced_genlock.rs` | `cargo run --features advanced --example advanced_genlock` | Pace a sender from another source's clock. |
 | `advanced_kvm.rs` | `cargo run --features advanced --example advanced_kvm` | Remote keyboard and mouse control of a source that offers it. |
 
-File API. These need the `file-io` feature and the NDI File library; on Linux and macOS that means the Advanced SDK runtime:
+File API. These need the `file-io` feature and the NDI File library of the 6.4 SDK; on Linux and macOS that means the Advanced SDK runtime:
 
 | Example | Command | What it shows |
 | --- | --- | --- |
@@ -617,7 +660,7 @@ Set `GRAFTON_NDI_REQUIRE_RUNTIME` to turn skips into failures. Its value is a co
 | `file` | An NDI File library that the selected runtime can use. |
 | `discovery-server` | The SDK's `ndi-discovery-server` program beside the selected runtime, and an NDI 6.4.0 or later runtime. |
 
-An entry that no test in the build can check fails the run too, for example `advanced` without the `advanced` feature.
+An entry that is not in this table fails the run. So does an entry that no test in the build can check, for example `advanced` without the `advanced` feature, or `discovery-server` on a target other than Linux.
 
 For example, with an NDI SDK installed on Linux x86_64:
 
@@ -626,7 +669,7 @@ export NDI_RUNTIME_DIR_V6="/usr/share/NDI SDK for Linux/lib/x86_64-linux-gnu"
 GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --all-features
 ```
 
-Adding `--config ci/offline.toml` runs every test executable with loopback networking only, so nothing is announced on the network the machine is attached to. The [CI guide](ci/README.md#loopback-only-test-runs) describes what that needs on each operating system.
+Adding `--config ci/offline.toml` starts every test executable through a wrapper that confines its networking. On Linux, where it needs `bubblewrap`, the tests get loopback networking only, so nothing is announced on the network the machine is attached to. The macOS and Windows wrappers confine less; the [CI guide](ci/README.md#loopback-only-test-runs) describes each one.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, the bindings generator and contribution guidelines.
 
