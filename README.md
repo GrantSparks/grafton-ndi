@@ -10,6 +10,34 @@
 
 The crate loads the NDI runtime library when the program selects a runtime and wraps the SDK's objects in Rust ownership types. Building it needs no NDI SDK. Applications supply their renderer, mixer, encoder, storage layer, or UI.
 
+## Documentation
+
+**Evaluating the crate**
+
+- [What it covers](#what-it-covers) - The SDK functionality the crate wraps, area by area.
+- [Supported NDI versions and platforms](#supported-ndi-versions-and-platforms) - Which runtimes and targets were tested, which were only compiled, and which are unsupported.
+- [Known issues](#known-issues) - Defects and limits of the NDI SDK, and what the crate does about each.
+- [Design approach](#design-approach) - How the crate wraps the SDK: checked function tables, one runtime per process, cleanup through ownership and validated frames.
+- [Performance and safety](#performance-and-safety) - Which frame APIs to use for which job, and the lifetime rules the compile-contract tests check.
+- [SDK validation](docs/sdk-validation.md) - What was run against which runtime, the measurements behind the version requirements, and how to repeat them.
+- [Changelog](CHANGELOG.md) - What 3.0 changes: compatibility, breaking changes, additions and fixes.
+
+**Using the crate**
+
+- [Quick start](#quick-start), [installation](#installation) and [core workflows](#core-workflows) - Finding and selecting the NDI runtime, then discovering, receiving and publishing.
+- [API documentation](https://docs.rs/grafton-ndi) - Reference for every module and feature. Generate it for a checkout with `cargo doc --no-deps --all-features`.
+- [Examples](#examples) - Runnable programs for each workflow.
+- [Runtime capabilities and optional APIs](#runtime-capabilities-and-optional-apis) - What each runtime provides, and the routing, Discovery Server, Advanced and File APIs.
+- [Advanced SDK guide](docs/advanced.md) - Requirements, ownership, compressed packets, queues, allocators, synchronization and KVM.
+- [File API guide](docs/file-io.md) - Recording, playback, how a recording is finished, and the File library's limits.
+- [Migrating from 2.0 to 3.0](docs/migration/2.0-to-3.0.md) - Every change existing code must make. [Guides for earlier versions](docs/migration/) are kept too.
+- [Image encoding resources](docs/image-encoding-performance.md) - Scratch bounds, peak memory and timing of PNG and JPEG encoding, measured for 2.0.0.
+
+**Contributing**
+
+- [Contributing guide](CONTRIBUTING.md) - Setup, where changes belong, the SDK contracts the code relies on, and the checks before review.
+- [CI guide](ci/README.md) - The workflows, the SDK test matrix, the loopback-only test runners and the release procedure.
+
 ## Supported NDI versions and platforms
 
 `grafton-ndi` 3.0 works with NDI 6 runtimes from the Standard SDK and the Advanced SDK. It needs Rust 1.88 or later.
@@ -654,18 +682,6 @@ player.start("take_001.mkv")?;
 ```
 
 The File library ships with the NDI 6.4 SDK. On Linux, macOS and Android it works only with the Advanced SDK runtime, and `FileApi::open` refuses it beside a Standard runtime before loading anything. On Windows it ships for x64 only and works with either edition. A library that provides only one of the two families of File entry points, playback and recording, is selected for that one: `FileApi::supports(FileFamily::Recording)` says whether it records, and an operation of a family it lacks returns `Error::UnsupportedCapability`. A recorder stores a source's compressed data as it arrives and takes no frames from Rust. Treat a recording as complete only when `FileRecorder::finish` returns `FinishStatus::Closed`. See the [File API guide](docs/file-io.md).
-
-## Documentation
-
-- [API documentation](https://docs.rs/grafton-ndi) - Reference for every module and feature. Generate it for a checkout with `cargo doc --no-deps --all-features`.
-- [Examples](examples/) - Runnable programs, listed below.
-- [CHANGELOG.md](CHANGELOG.md) - Release notes.
-- [Migration guides](docs/migration/) - Guidance for upgrading between crate versions, including [2.0 to 3.0](docs/migration/2.0-to-3.0.md).
-- [Advanced SDK guide](docs/advanced.md) - Requirements, ownership, packets, queues, allocators and synchronization.
-- [File API guide](docs/file-io.md) - Recording, playback and how a recording is finished.
-- [SDK validation](docs/sdk-validation.md) - What was tested, and how to reproduce it.
-- [CI guide](ci/README.md) - The workflows, the SDK test matrix and the release procedure.
-- [Image encoding resources](docs/image-encoding-performance.md) - Conversion scratch bounds, codec/output peak memory, and timing comparisons, measured for 2.0.0.
 
 ## Examples
 
