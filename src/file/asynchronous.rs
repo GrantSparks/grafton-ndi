@@ -1,9 +1,10 @@
 //! Futures for the File API that work with any executor.
 //!
 //! Each player or recorder lives on a thread of its own, which runs the
-//! commands sent to it and pumps the SDK's events between them. The deadlines
-//! of event futures are kept by one timer thread for the whole process, so
-//! that a command that blocks its owner thread cannot make a wait overrun.
+//! commands sent to it and pumps the SDK's events between them. Probes, which
+//! need no player, share one thread for the whole process. The deadlines of
+//! event futures are kept by one timer thread for the whole process, so that a
+//! command that blocks its owner thread cannot make a wait overrun.
 
 use super::types::resolve_path;
 use super::{
@@ -21,7 +22,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
         Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak,
     },
     task::{Context, Poll, Waker},
@@ -34,6 +35,9 @@ const TICK: Duration = Duration::from_millis(10);
 
 /// The largest command or event queue an owner may be given.
 const MAX_CAPACITY: usize = 4096;
+
+/// How many probes may wait for the thread that runs them.
+const PROBE_CAPACITY: usize = 64;
 
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value.lock().unwrap_or_else(PoisonError::into_inner)
@@ -68,8 +72,9 @@ impl AsyncFileOptions {
 
     /// Set how many commands may wait for the owner thread. A command
     /// submitted to a full queue fails at once with [`Error::QueueFull`] and
-    /// [`QueueLimit::FileCommands`], except a request to stop, which is always
-    /// accepted so that it cannot be lost.
+    /// [`QueueLimit::FileCommands`]. A request to stop is the exception: one
+    /// is accepted beyond a full queue, so that a stop is not lost for want of
+    /// room; see [`FileOperation`].
     #[must_use]
     pub fn command_capacity(mut self, capacity: usize) -> Self {
         self.command_capacity = capacity;
@@ -118,11 +123,25 @@ struct Response<T> {
 /// Requests to stop, finish or close run even if their future is dropped, as
 /// those methods say.
 ///
+/// # The command queue
+///
+/// A handle's commands wait in a queue of
+/// [`AsyncFileOptions::command_capacity`] places, and a command submitted to a
+/// full queue fails at once with [`Error::QueueFull`] and
+/// [`QueueLimit::FileCommands`]. A request to stop is one too
+/// ([`AsyncFilePlayer::stop`], [`AsyncFileRecorder::request_stop`] and
+/// [`AsyncFileRecorder::finish`]), with one exception, so that a stop is not
+/// lost for want of room: when the queue is full, one request to stop is
+/// accepted beyond it. While that one waits, a further request to stop is
+/// refused like any other command, so the queue never holds more than its
+/// capacity and one. [`close`](AsyncFileRecorder::close) does not use the
+/// queue.
+///
 /// # Errors
 ///
-/// Besides the operation's own errors, every operation except a request to
-/// stop fails with [`Error::QueueFull`] and [`QueueLimit::FileCommands`] when
-/// the handle's command queue is full, and every operation can fail with
+/// Besides the operation's own errors, every operation fails with
+/// [`Error::QueueFull`] and [`QueueLimit::FileCommands`] when the queue
+/// refuses it, as described above, and can fail with
 /// [`Error::InvalidState`]: with [`StateError::Closed`] when the handle has
 /// been closed or its thread stopped normally before carrying the
 /// operation out, and with [`StateError::OwnerFailed`] when that thread failed
@@ -645,7 +664,10 @@ impl<E> Drop for FileEventFuture<E> {
 struct Closing {
     complete: bool,
     failed: bool,
-    reply: Option<Reply<()>>,
+    /// Every close still awaited. Each completes once the object is gone; a
+    /// close whose future was dropped is forgotten when the next one arrives,
+    /// so this holds at most the closes still awaited.
+    replies: Vec<Reply<()>>,
 }
 
 struct Control {
@@ -664,11 +686,14 @@ impl Control {
             closing: Mutex::new(Closing {
                 complete: false,
                 failed: false,
-                reply: None,
+                replies: Vec::new(),
             }),
         }
     }
 
+    /// Ask the owner thread to end, and complete once it has destroyed its
+    /// object. Every close, including one made while another is awaited,
+    /// completes then.
     fn request_close(&self) -> FileOperation<()> {
         let (reply, future) = operation();
         {
@@ -681,15 +706,10 @@ impl Control {
                 });
                 return future;
             }
-            if closing
-                .reply
-                .as_ref()
-                .is_some_and(|r| !r.cancelled.load(Ordering::Acquire))
-            {
-                reply.complete(Err(Error::InvalidState(StateError::WaiterPending)));
-                return future;
-            }
-            closing.reply = Some(reply);
+            closing
+                .replies
+                .retain(|reply| !reply.cancelled.load(Ordering::Acquire));
+            closing.replies.push(reply);
         }
         self.shutdown.store(true, Ordering::Release);
         future
@@ -703,13 +723,13 @@ impl Control {
         if failed {
             self.failed.store(true, Ordering::Release);
         }
-        let reply = {
+        let replies = {
             let mut closing = lock(&self.closing);
             closing.complete = true;
             closing.failed = failed;
-            closing.reply.take()
+            std::mem::take(&mut closing.replies)
         };
-        if let Some(reply) = reply {
+        for reply in replies {
             reply.complete(if failed {
                 Err(Error::InvalidState(StateError::OwnerFailed))
             } else {
@@ -755,13 +775,73 @@ impl Owner for FileRecorder {
 
 type Job<H> = Box<dyn FnOnce(&mut H) + Send + 'static>;
 
+/// Admission to an owner thread's command queue: how many commands wait, and
+/// how many may.
+///
+/// Every queued command counts, requests to stop included. When the queue is
+/// full, one request to stop is admitted beyond it, so that a stop is not
+/// lost for want of room; while it waits, a further request to stop is
+/// refused like any other command. The queue therefore never holds more than
+/// `capacity + 1` commands.
+struct Admission {
+    waiting: AtomicUsize,
+    capacity: usize,
+    /// A request to stop is waiting beyond the capacity.
+    reserve_taken: AtomicBool,
+}
+
+impl Admission {
+    fn new(capacity: usize) -> Self {
+        Self {
+            waiting: AtomicUsize::new(0),
+            capacity,
+            reserve_taken: AtomicBool::new(false),
+        }
+    }
+
+    /// A place in the queue for a command, or a request to stop if `stop`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::QueueFull`] with [`QueueLimit::FileCommands`] when the queue
+    /// is full and, for a request to stop, another one already waits beyond it.
+    fn admit(self: &Arc<Self>, stop: bool) -> Result<Place> {
+        let place = |reserve| Place {
+            admission: Arc::clone(self),
+            reserve,
+        };
+        if self.waiting.fetch_add(1, Ordering::AcqRel) < self.capacity {
+            return Ok(place(false));
+        }
+        if stop && !self.reserve_taken.swap(true, Ordering::AcqRel) {
+            return Ok(place(true));
+        }
+        self.waiting.fetch_sub(1, Ordering::AcqRel);
+        Err(Error::QueueFull(QueueLimit::FileCommands))
+    }
+}
+
+/// A command's place in the queue. It is given up when the command starts, or
+/// when the command is dropped without running.
+struct Place {
+    admission: Arc<Admission>,
+    /// The place is the one beyond the capacity.
+    reserve: bool,
+}
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        self.admission.waiting.fetch_sub(1, Ordering::AcqRel);
+        if self.reserve {
+            self.admission.reserve_taken.store(false, Ordering::Release);
+        }
+    }
+}
+
 /// The handle side of an owner thread, shared by every clone of an async handle.
 struct Worker<H: Owner> {
     sender: Sender<Job<H>>,
-    /// How many ordinary commands are waiting, and how many may. Requests to
-    /// stop are not counted: one must never be refused for want of room.
-    waiting: Arc<AtomicUsize>,
-    capacity: usize,
+    admission: Arc<Admission>,
     control: Arc<Control>,
     events: Arc<EventQueue<H::Event>>,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -787,9 +867,13 @@ impl<H: Owner> Drop for Worker<H> {
 }
 
 impl<H: Owner> Worker<H> {
+    /// Queue `work` for the owner thread.
+    ///
+    /// A request to stop (`stop`) runs even if its future is dropped first,
+    /// and is admitted beyond a full queue as [`Admission`] describes.
     fn submit<T: Send + 'static>(
         &self,
-        persistent: bool,
+        stop: bool,
         work: impl FnOnce(&mut H, &OperationContext) -> Result<T> + Send + 'static,
     ) -> FileOperation<T> {
         if self.control.failed() {
@@ -798,13 +882,10 @@ impl<H: Owner> Worker<H> {
         if self.control.shutdown.load(Ordering::Acquire) {
             return FileOperation::failed(stopped(false));
         }
-        let waiting = (!persistent).then(|| Arc::clone(&self.waiting));
-        if let Some(waiting) = &waiting {
-            if waiting.fetch_add(1, Ordering::AcqRel) >= self.capacity {
-                waiting.fetch_sub(1, Ordering::AcqRel);
-                return FileOperation::failed(Error::QueueFull(QueueLimit::FileCommands));
-            }
-        }
+        let place = match self.admission.admit(stop) {
+            Ok(place) => place,
+            Err(error) => return FileOperation::failed(error),
+        };
         let (mut reply, future) = operation();
         reply.owner = Some(Arc::clone(&self.control));
         let context = OperationContext {
@@ -812,10 +893,9 @@ impl<H: Owner> Worker<H> {
             control: Arc::clone(&self.control),
         };
         let job: Job<H> = Box::new(move |owner| {
-            if let Some(waiting) = waiting {
-                waiting.fetch_sub(1, Ordering::AcqRel);
-            }
-            if !persistent && context.cancelled.load(Ordering::Acquire) {
+            // The command leaves the queue as it starts.
+            drop(place);
+            if !stop && context.cancelled.load(Ordering::Acquire) {
                 return;
             }
             reply.complete(work(owner, &context));
@@ -853,8 +933,7 @@ fn spawn_owner<H: Owner, T: Send + 'static>(
     let events = Arc::new(EventQueue::new(options.event_capacity));
     let worker = Arc::new(Worker {
         sender,
-        waiting: Arc::new(AtomicUsize::new(0)),
-        capacity: options.command_capacity,
+        admission: Arc::new(Admission::new(options.command_capacity)),
         control: Arc::clone(&control),
         events: Arc::clone(&events),
         thread: Mutex::new(None),
@@ -935,6 +1014,91 @@ fn run_owner<H: Owner>(
     }
 }
 
+type ProbeJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// The thread that runs async probes, one at a time, and the bounded queue in
+/// front of it.
+///
+/// A probe needs no player, so it has no owner thread of its own to queue on.
+/// One thread serves every probe in the process: it is started by the first
+/// probe, then waits for the next, and ends only once its queue is gone.
+struct ProbeQueue {
+    /// The sending side of the queue, once the thread is running.
+    sender: Mutex<Option<SyncSender<ProbeJob>>>,
+    /// How many probes may wait.
+    capacity: usize,
+}
+
+/// The queue every [`AsyncFilePlayer::probe`] uses.
+static PROBES: ProbeQueue = ProbeQueue::new(PROBE_CAPACITY);
+
+impl ProbeQueue {
+    const fn new(capacity: usize) -> Self {
+        Self {
+            sender: Mutex::new(None),
+            capacity,
+        }
+    }
+
+    /// Probe `path` with `api` once the probes queued before it have run.
+    fn probe(&self, api: &FileApi, path: &Path) -> FileOperation<FileInfo> {
+        // Resolved here, so that the working directory is the one at call
+        // time rather than whenever the probe thread gets to it.
+        let path = match resolve_path(path, "file path") {
+            Ok((path, _)) => path,
+            Err(error) => return FileOperation::failed(error),
+        };
+        let api = api.clone();
+        let (reply, future) = operation();
+        let job: ProbeJob = Box::new(move || {
+            if !reply.cancelled.load(Ordering::Acquire) {
+                reply.complete(api.probe(path));
+            }
+        });
+        if let Err(error) = self.submit(job) {
+            future.immediate_failure(error);
+        }
+        future
+    }
+
+    /// Queue `job`, starting the thread if it is not running.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::QueueFull`] with [`QueueLimit::FileProbes`] when the queue is
+    /// full, and [`Error::Io`] when the thread cannot be started. The job is
+    /// dropped without running.
+    fn submit(&self, job: ProbeJob) -> Result<()> {
+        let mut sender = lock(&self.sender);
+        let queue = match &mut *sender {
+            Some(queue) => queue,
+            idle => {
+                let (queue, jobs) = mpsc::sync_channel::<ProbeJob>(self.capacity);
+                thread::Builder::new()
+                    .name("ndi-file-probe".into())
+                    .spawn(move || {
+                        for job in jobs {
+                            // A probe that panics fails alone: its reply,
+                            // dropped while unwinding, reports a failed owner.
+                            let _ = catch_unwind(AssertUnwindSafe(job));
+                        }
+                    })?;
+                idle.insert(queue)
+            }
+        };
+        match queue.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(Error::QueueFull(QueueLimit::FileProbes)),
+            // The thread outlives every probe, so this needs it to have ended
+            // some other way. The next probe starts another.
+            Err(TrySendError::Disconnected(_)) => {
+                *sender = None;
+                Err(stopped(true))
+            }
+        }
+    }
+}
+
 /// A [`FilePlayer`] on a thread of its own, driven through futures.
 ///
 /// Clones share one player.
@@ -979,29 +1143,24 @@ impl AsyncFilePlayer {
         )
     }
 
-    /// Read a recording's duration and track layout on a temporary thread;
-    /// see [`FileApi::probe`]. No player is created and nothing is
-    /// advertised.
+    /// Read a recording's duration and track layout; see [`FileApi::probe`].
+    /// No player is created and nothing is advertised.
+    ///
+    /// Probes run one at a time, in the order they were made, on one thread
+    /// that every async probe in the process shares; it starts with the first
+    /// probe. At most 64 wait for it. Dropping the future before its probe has
+    /// begun cancels the probe.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`FileApi::probe`], and [`Error::QueueFull`] with
+    /// [`QueueLimit::FileProbes`] when 64 probes are already waiting; the same
+    /// call can succeed once they have run. [`Error::Io`] when the probe
+    /// thread is not running and cannot be started; the next probe tries to
+    /// start it again. [`Error::InvalidState`] with [`StateError::OwnerFailed`]
+    /// when the probe panicked; the thread goes on with the next one.
     pub fn probe(api: &FileApi, path: impl AsRef<Path>) -> FileOperation<FileInfo> {
-        // Resolved here, so that the working directory is the one at call
-        // time rather than whenever the owner thread gets to it.
-        let path = match resolve_path(path.as_ref(), "file path") {
-            Ok((path, _)) => path,
-            Err(error) => return FileOperation::failed(error),
-        };
-        let api = api.clone();
-        let (reply, future) = operation();
-        if let Err(error) = thread::Builder::new()
-            .name("ndi-file-probe".into())
-            .spawn(move || {
-                if !reply.cancelled.load(Ordering::Acquire) {
-                    reply.complete(api.probe(path));
-                }
-            })
-        {
-            future.immediate_failure(Error::Io(error));
-        }
-        future
+        PROBES.probe(api, path.as_ref())
     }
 
     /// Play a file; see [`FilePlayer::start`].
@@ -1100,14 +1259,17 @@ impl AsyncFilePlayer {
     ///
     /// The future completes when the SDK has destroyed the player. Nothing
     /// blocks the calling thread, and the close runs even if the future is
-    /// dropped.
+    /// dropped. Closing again, from this or another clone, while or after it
+    /// runs completes at the same time, with the same outcome; later
+    /// operations fail with [`StateError::Closed`], and dropping the clones
+    /// afterwards does not block. It does not wait in the command queue, so
+    /// a full queue never refuses it.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidState`] with [`StateError::WaiterPending`] while
-    /// another close of this object is awaited, and with
-    /// [`StateError::OwnerFailed`] when the object's thread failed.
-    pub fn close(self) -> FileOperation<()> {
+    /// [`Error::InvalidState`] with [`StateError::OwnerFailed`] when the
+    /// object's thread failed.
+    pub fn close(&self) -> FileOperation<()> {
         self.worker.control.request_close()
     }
 }
@@ -1310,14 +1472,17 @@ impl AsyncFileRecorder {
     /// completes when the SDK has destroyed the recorder, and does not say
     /// whether the file was finalized: await [`finish`](Self::finish) first to
     /// learn that. Nothing blocks the calling thread, and the close runs even
-    /// if the future is dropped.
+    /// if the future is dropped. Closing again, from this or another clone,
+    /// while or after it runs completes at the same time, with the same
+    /// outcome; later operations fail with [`StateError::Closed`], and
+    /// dropping the clones afterwards does not block. It does not wait in the
+    /// command queue, so a full queue never refuses it.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidState`] with [`StateError::WaiterPending`] while
-    /// another close of this object is awaited, and with
-    /// [`StateError::OwnerFailed`] when the object's thread failed.
-    pub fn close(self) -> FileOperation<()> {
+    /// [`Error::InvalidState`] with [`StateError::OwnerFailed`] when the
+    /// object's thread failed.
+    pub fn close(&self) -> FileOperation<()> {
         self.worker.control.request_close()
     }
 }
@@ -1701,18 +1866,191 @@ mod tests {
         ));
         // A stop is not: it must not be lost, even if nobody waits for it.
         drop(recorder.request_stop());
-        let stopping = recorder.request_stop();
+        // One stop beyond the full queue is all it takes: another, of any
+        // kind, is refused while that one waits.
+        assert!(matches!(
+            block_on(recorder.request_stop()),
+            Err(Error::QueueFull(QueueLimit::FileCommands))
+        ));
+        assert!(matches!(
+            block_on(recorder.finish(Duration::ZERO)),
+            Err(Error::QueueFull(QueueLimit::FileCommands))
+        ));
         release_tx.send(()).unwrap();
         block_on(blocker).unwrap();
         assert!(block_on(queued).unwrap());
-        // The first request did the stopping; this one found it done, and
-        // possibly the file already reported closed.
+        // The stop beyond the queue runs next, though nobody waits for it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while device.stops.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline, "the stop was lost");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // It did the stopping; a later request finds it done, and possibly
+        // the file already reported closed.
         assert!(matches!(
-            block_on(stopping).unwrap(),
+            block_on(recorder.request_stop()).unwrap(),
             StopRequest::AlreadyStopping | StopRequest::AlreadyClosed
         ));
         assert_eq!(device.stops.load(Ordering::Acquire), 1);
         block_on(recorder.close()).unwrap();
+    }
+
+    #[test]
+    fn a_full_queue_holds_its_capacity_and_one_stop_at_most() {
+        let options = AsyncFileOptions::new().command_capacity(2);
+        let (worker, dropped) = local_worker_with_options(options);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker = worker.call(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(())
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let add = |amount| {
+            move |owner: &mut LocalOwner, _: &OperationContext| {
+                owner.counter += amount;
+                Ok::<(), Error>(())
+            }
+        };
+        // Requests to stop take places like any command, and run even when
+        // nobody waits for them.
+        drop(worker.submit(true, add(1)));
+        drop(worker.submit(true, add(10)));
+        // The queue is full: one more stop is admitted beyond it.
+        let beyond = worker.submit(true, add(100));
+        // That is the most it holds.
+        for refused in [
+            worker.submit(true, add(1000)),
+            worker.submit(false, add(1000)),
+        ] {
+            assert!(matches!(
+                block_on(refused),
+                Err(Error::QueueFull(QueueLimit::FileCommands))
+            ));
+        }
+        release_tx.send(()).unwrap();
+        block_on(blocker).unwrap();
+        // The queue runs in order, so the stop beyond it runs last.
+        block_on(beyond).unwrap();
+        assert_eq!(
+            block_on(worker.call(|owner| Ok(owner.counter))).unwrap(),
+            111
+        );
+        // Every place was given back, the one beyond the capacity too.
+        assert_eq!(worker.admission.waiting.load(Ordering::Acquire), 0);
+        assert!(!worker.admission.reserve_taken.load(Ordering::Acquire));
+        drop(worker);
+        dropped.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn closes_made_while_one_is_awaited_complete_with_it() {
+        let (device, recorder) = mock_recorder(Closing::After(Duration::from_millis(150)));
+        let clone = recorder.clone();
+        let first = recorder.close();
+        let second = clone.close();
+        // A close whose future is dropped neither blocks nor cancels the others.
+        drop(recorder.close());
+        block_on(second).unwrap();
+        block_on(first).unwrap();
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
+        // The handles stay usable for what a closed handle can do.
+        block_on(recorder.close()).unwrap();
+        closed(block_on(clone.state()));
+        // No clone blocks when dropped once the object is closed.
+        let begun = Instant::now();
+        drop((recorder, clone));
+        assert!(begun.elapsed() < Duration::from_millis(100));
+    }
+
+    /// A probe of a [`gated_api`] waits here until a test opens the gate.
+    static PROBE_GATE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+    /// How many probes of a [`gated_api`] have begun.
+    static PROBES_BEGUN: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn gated_probe(
+        _: *const std::ffi::c_char,
+        _: *mut crate::sys::bindings::NDIlib_file_player_file_info_t,
+    ) -> bool {
+        PROBES_BEGUN.fetch_add(1, Ordering::AcqRel);
+        let mut open = lock(&PROBE_GATE.0);
+        while !*open {
+            open = PROBE_GATE
+                .1
+                .wait(open)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        // The file cannot be read, so the probe fails as the SDK reports it.
+        false
+    }
+
+    /// An API whose probes wait for [`PROBE_GATE`].
+    fn gated_api() -> FileApi {
+        FileApi::with_tables(
+            crate::sys::FilePlayback {
+                NDIlib_file_player_probe_file: gated_probe,
+                ..mock::playback()
+            },
+            mock::recording(),
+        )
+    }
+
+    #[test]
+    fn probes_run_one_at_a_time_and_a_full_queue_refuses_more() {
+        let api = gated_api();
+        let queue = ProbeQueue::new(2);
+        let running = queue.probe(&api, Path::new("running.mkv"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while PROBES_BEGUN.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline, "the first probe never began");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Two wait behind the running one; a third does not fit.
+        let waiting = queue.probe(&api, Path::new("waiting.mkv"));
+        let cancelled = queue.probe(&api, Path::new("cancelled.mkv"));
+        let refused = block_on(queue.probe(&api, Path::new("refused.mkv")));
+        assert!(
+            matches!(refused, Err(Error::QueueFull(QueueLimit::FileProbes))),
+            "{refused:?}"
+        );
+        // Only one runs at a time.
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(PROBES_BEGUN.load(Ordering::Acquire), 1);
+        // A probe dropped before it begins is not carried out.
+        drop(cancelled);
+        *lock(&PROBE_GATE.0) = true;
+        PROBE_GATE.1.notify_all();
+        for probed in [running, waiting] {
+            assert!(matches!(
+                block_on(probed),
+                Err(Error::NativeOperationFailed { .. })
+            ));
+        }
+        // The thread has room again once they have run.
+        assert!(matches!(
+            block_on(queue.probe(&api, Path::new("later.mkv"))),
+            Err(Error::NativeOperationFailed { .. })
+        ));
+        assert_eq!(PROBES_BEGUN.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn a_probe_that_panics_fails_alone() {
+        let queue = ProbeQueue::new(1);
+        let (reply, failing) = operation::<FileInfo>();
+        queue
+            .submit(Box::new(move || {
+                let _unanswered = reply;
+                panic!("probe failure");
+            }))
+            .unwrap();
+        owner_failed(block_on(failing));
+        // The thread goes on with the next probe.
+        assert!(matches!(
+            block_on(queue.probe(&mock::recorder_api(), Path::new("b.mkv"))),
+            Err(Error::NativeOperationFailed { .. })
+        ));
     }
 
     #[test]

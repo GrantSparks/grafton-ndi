@@ -37,8 +37,9 @@ pub enum StateError {
     /// during a session: the next file would have the same name. Use a
     /// filename pattern with `{index}`.
     ExactFileName,
-    /// Another waiter is already pending on the async handle: another event
-    /// future, or another close.
+    /// Another event future is already waiting on the async handle, which
+    /// delivers each event to one waiter. A close never reports this: closes
+    /// made while one is awaited complete with it.
     WaiterPending,
     /// The async handle's object has been closed, or its thread stopped
     /// normally before it carried out the operation. A thread that failed
@@ -77,7 +78,7 @@ impl std::fmt::Display for StateError {
             Self::ExactFileName => {
                 "a recorder with an exact file name cannot switch to a new file during a session"
             }
-            Self::WaiterPending => "another File waiter is already pending",
+            Self::WaiterPending => "another File event waiter is already pending",
             Self::Closed => "File owner has closed",
             Self::OwnerFailed => "File owner thread failed",
         })

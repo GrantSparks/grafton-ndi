@@ -404,13 +404,30 @@ thread failed instead (it panicked, or could not be started), the wait fails
 with `StateError::OwnerFailed`.
 
 Await `finish` to learn whether the recording is complete, then await `close`;
-neither blocks the executor. `close` ends the object for every clone, and later
-calls on other clones fail with `Error::InvalidState(StateError::Closed)`.
-After the object's thread has failed, the command it was running, every queued
-and later command, every event wait and `close` fail with
-`StateError::OwnerFailed` instead, so a failure is never mistaken for a close.
-`AsyncFileRecorder::reset` replaces the native recorder as `FileRecorder::reset`
-does.
+neither blocks the executor. `close` borrows the handle and ends the object for
+every clone. Any number of closes, from any clones, can be awaited at once: each
+completes when the object has been destroyed. Later calls on any clone fail
+with `Error::InvalidState(StateError::Closed)`. After the object's thread has
+failed, the command it was running, every queued and later command, every event
+wait and `close` fail with `StateError::OwnerFailed` instead, so a failure is
+never mistaken for a close. `AsyncFileRecorder::reset` replaces the native
+recorder as `FileRecorder::reset` does.
+
+Each handle's commands wait in a queue of `AsyncFileOptions::command_capacity`
+places (64 by default), and a command that finds it full fails at once with
+`Error::QueueFull(QueueLimit::FileCommands)`. A request to stop (the player's
+`stop`, the recorder's `request_stop` and `finish`) runs even if its future is
+dropped, and takes a place like any other command, except that one request to
+stop is accepted beyond a full queue, so that a stop is not lost for want of
+room. While that one waits, a further request to stop is refused like any other
+command, so a queue never holds more than its capacity and one. `close` does not
+use the queue.
+
+`AsyncFilePlayer::probe` needs no player. Every async probe in the process runs
+on one thread, started by the first probe, one at a time and in order; up to 64
+can wait, and one more fails with `Error::QueueFull(QueueLimit::FileProbes)`.
+Dropping a probe's future before it has begun cancels it. To probe several
+files at once, call `FileApi::probe` on threads of your own.
 
 **Dropping the last clone blocks the dropping thread** until the object's
 thread has finished. For a recorder that means stopping an open session,
@@ -435,11 +452,11 @@ reports:
 | `RuntimeConflict` | The File library cannot accompany the selected runtime, or `FileRuntimeOptions::library_path` names a library other than the one already selected. |
 | `InvalidInput` | A value cannot be represented by the native API, for example a path that is empty or is not UTF-8, or options that are out of range or conflict, which are refused when the player, recorder or async handle is created. The text names what the value is, such as the file path of a player or probe, or a recording target. |
 | `InvalidCString` | A string for the SDK contains a NUL: a path, a source name or URL, a player's name or groups, or a filename pattern. |
-| `InvalidState` | The operation is not permitted in the current state. The `StateError` it carries says which, for example `PreviousSessionOpen` for `start` during an open session, `ExactFileName` for `set_source` during a session with an exact file name, `WaiterPending` for a second event wait or close on an async handle, or `Closed` and `OwnerFailed` for an async handle that has been closed or whose thread failed. `StateError::is_retryable` is true only for `WaiterPending`, which can succeed later without anything else changing. |
-| `QueueFull` | An async handle's command queue is full (`QueueLimit::FileCommands`). The same call can succeed once queued commands have run. A request to stop is never refused this way. |
+| `InvalidState` | The operation is not permitted in the current state. The `StateError` it carries says which, for example `PreviousSessionOpen` for `start` during an open session, `ExactFileName` for `set_source` during a session with an exact file name, `WaiterPending` for a second event wait on an async handle, or `Closed` and `OwnerFailed` for an async handle that has been closed or whose thread failed. `StateError::is_retryable` is true only for `WaiterPending`, which can succeed later without anything else changing. |
+| `QueueFull` | An async handle's command queue is full (`QueueLimit::FileCommands`), or so is the queue of async probes (`QueueLimit::FileProbes`). The same call can succeed once queued work has run. A request to stop is refused only while another waits beyond the full queue. |
 | `NativeOperationFailed` | The SDK refused an operation, which `operation` names; the recorder's or player's events may say more. |
 | `UnexpectedSdkResult` | The SDK returned something that violates the expected contract. |
-| `Io` | A filesystem operation failed, or a thread for an async handle could not be started. |
+| `Io` | A filesystem operation failed, or a thread for an async handle or for async probes could not be started. |
 
 ## Running the tests
 

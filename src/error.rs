@@ -218,9 +218,11 @@ pub enum Error {
     ///   queue past its frame limit ([`QueueLimit::Frames`]) or its byte limit
     ///   ([`QueueLimit::Bytes`]). The frame comes back in the `Rejected`;
     ///   collect completed frames and submit it again.
-    /// * Every operation of an async File handle except a request to stop,
-    ///   when the handle's command queue is full
-    ///   ([`QueueLimit::FileCommands`]).
+    /// * An operation of an async File handle, when the handle's command
+    ///   queue is full ([`QueueLimit::FileCommands`]). A request to stop is
+    ///   refused only when another one already waits beyond the full queue.
+    /// * `file::AsyncFilePlayer::probe`, when the probes waiting for the
+    ///   process's probe thread fill its queue ([`QueueLimit::FileProbes`]).
     #[error("Queue full: {0}")]
     QueueFull(QueueLimit),
 
@@ -343,8 +345,12 @@ pub enum QueueLimit {
     /// `QueueOptions::max_bytes`.
     Bytes,
     /// An async File handle already has as many commands waiting as its
-    /// `AsyncFileOptions::command_capacity` allows.
+    /// `AsyncFileOptions::command_capacity` allows, and, for a request to
+    /// stop, another request to stop waits beyond them.
     FileCommands,
+    /// The 64 async File probes that may wait for the process's probe thread
+    /// are already waiting.
+    FileProbes,
 }
 
 impl fmt::Display for QueueLimit {
@@ -353,6 +359,7 @@ impl fmt::Display for QueueLimit {
             Self::Frames => "queued video frame limit reached",
             Self::Bytes => "queued video byte limit reached",
             Self::FileCommands => "File command queue is full",
+            Self::FileProbes => "File probe queue is full",
         })
     }
 }
@@ -456,6 +463,7 @@ mod tests {
             (QueueLimit::Frames, "queued video frame limit reached"),
             (QueueLimit::Bytes, "queued video byte limit reached"),
             (QueueLimit::FileCommands, "File command queue is full"),
+            (QueueLimit::FileProbes, "File probe queue is full"),
         ] {
             assert_eq!(
                 Error::QueueFull(limit).to_string(),
