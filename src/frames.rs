@@ -1169,12 +1169,7 @@ impl AudioFrame {
 
         // Only channel samples are initialized audio. Never form a typed slice
         // over inter-channel padding supplied by the SDK.
-        let packed_layout = validate_outbound_audio_layout(
-            layout.sample_rate,
-            layout.no_channels as i32,
-            layout.no_samples as i32,
-            layout.format().expect("non-empty audio has a format"),
-        )?;
+        let packed_layout = layout.packed()?;
         let mut data = Vec::with_capacity(packed_layout.sample_count);
         for channel in 0..layout.no_channels {
             let range = layout.channel_range(channel).expect("validated channel");
@@ -2707,6 +2702,40 @@ pub(crate) struct ValidatedAudioLayout {
 }
 
 impl ValidatedAudioLayout {
+    fn from_packed(
+        format: Option<AudioFormat>,
+        sample_rate: i32,
+        packed: &PackedAudioDimensions,
+    ) -> Self {
+        Self {
+            format,
+            sample_rate,
+            no_channels: packed.no_channels,
+            no_samples: packed.no_samples,
+            channel_stride_in_bytes: packed.channel_stride_in_bytes,
+            channel_stride_samples: packed.no_samples,
+            sample_count: packed.sample_count,
+        }
+    }
+
+    /// The same frame with channels stored back to back, without padding.
+    /// Only meaningful for an already validated, non-empty layout.
+    fn packed(self) -> Result<Self> {
+        let stride_bytes =
+            i32::try_from(self.no_samples * std::mem::size_of::<f32>()).map_err(|_| {
+                Error::InvalidFrame(format!(
+                    "Audio channel stride exceeds i32 range: {} samples",
+                    self.no_samples
+                ))
+            })?;
+        Ok(Self {
+            channel_stride_in_bytes: stride_bytes,
+            channel_stride_samples: self.no_samples,
+            sample_count: self.no_channels * self.no_samples,
+            ..self
+        })
+    }
+
     pub(crate) fn is_empty(self) -> bool {
         self.sample_count == 0
     }
@@ -2733,23 +2762,79 @@ fn validate_outbound_audio_layout(
     no_samples: i32,
     format: AudioFormat,
 ) -> Result<ValidatedAudioLayout> {
+    validate_audio_sample_rate(sample_rate)?;
+    let packed = validate_packed_audio_dimensions(no_channels, no_samples)?;
+
+    Ok(ValidatedAudioLayout::from_packed(
+        Some(format),
+        sample_rate,
+        &packed,
+    ))
+}
+
+/// The one sample-rate check for every audio path.
+pub(crate) fn validate_audio_sample_rate(sample_rate: i32) -> Result<()> {
     if sample_rate <= 0 {
         return Err(Error::InvalidFrame(format!(
             "Invalid sample rate: {sample_rate}"
         )));
     }
-    validate_audio_format(format.into())?;
-    let packed = validate_packed_audio_dimensions(no_channels, no_samples)?;
+    Ok(())
+}
 
-    Ok(ValidatedAudioLayout {
-        format: Some(format),
-        sample_rate,
-        no_channels: packed.no_channels,
-        no_samples: packed.no_samples,
-        channel_stride_in_bytes: packed.channel_stride_in_bytes,
-        channel_stride_samples: packed.no_samples,
-        sample_count: packed.sample_count,
-    })
+/// Require a positive channel and sample count and widen both to `usize`.
+fn validate_positive_audio_counts(no_channels: i32, no_samples: i32) -> Result<(usize, usize)> {
+    if no_channels <= 0 {
+        return Err(Error::InvalidFrame(format!(
+            "Invalid number of channels: {no_channels}"
+        )));
+    }
+    if no_samples <= 0 {
+        return Err(Error::InvalidFrame(format!(
+            "Invalid number of samples: {no_samples}"
+        )));
+    }
+    Ok((no_channels as usize, no_samples as usize))
+}
+
+/// The one audio extent calculation. Returns the backing sample count from the
+/// first sample of the first channel to the last sample of the last channel
+/// when channels start `stride_samples` apart, enforcing `MAX_AUDIO_BYTES`.
+/// Packed audio is the case `stride_samples == no_samples`.
+fn checked_audio_extent(
+    no_channels: usize,
+    no_samples: usize,
+    stride_samples: usize,
+) -> Result<usize> {
+    let last_channel_offset = no_channels
+        .checked_sub(1)
+        .and_then(|last| last.checked_mul(stride_samples))
+        .ok_or_else(|| {
+            Error::InvalidFrame(format!(
+                "Audio channel offset overflow: {no_channels} channels × {stride_samples} stride samples"
+            ))
+        })?;
+    let sample_count = last_channel_offset.checked_add(no_samples).ok_or_else(|| {
+        Error::InvalidFrame(format!(
+            "Audio backing sample count overflow: channel offset {last_channel_offset} + {no_samples} samples"
+        ))
+    })?;
+    let byte_size = sample_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            Error::InvalidFrame(format!(
+                "Audio byte size overflow: {sample_count} samples × {} bytes",
+                std::mem::size_of::<f32>()
+            ))
+        })?;
+
+    if byte_size > MAX_AUDIO_BYTES {
+        return Err(Error::InvalidFrame(format!(
+            "Audio frame exceeds maximum size: {byte_size} bytes > {MAX_AUDIO_BYTES} bytes"
+        )));
+    }
+
+    Ok(sample_count)
 }
 
 /// Packed FLTP dimensions shared by owned frames and FrameSync requests.
@@ -2761,62 +2846,27 @@ pub(crate) struct PackedAudioDimensions {
     sample_count: usize,
 }
 
+impl PackedAudioDimensions {
+    /// The validated total `f32` sample count (`channels * samples`).
+    pub(crate) fn sample_count(&self) -> usize {
+        self.sample_count
+    }
+}
+
 pub(crate) fn validate_packed_audio_dimensions(
     no_channels: i32,
     no_samples: i32,
 ) -> Result<PackedAudioDimensions> {
-    if no_channels <= 0 {
-        return Err(Error::InvalidFrame(format!(
-            "Invalid number of channels: {no_channels}"
-        )));
-    }
-    if no_samples <= 0 {
-        return Err(Error::InvalidFrame(format!(
-            "Invalid number of samples: {no_samples}"
-        )));
-    }
-
-    let no_channels = usize::try_from(no_channels)
-        .map_err(|_| Error::InvalidFrame(format!("Invalid no_channels value: {no_channels}")))?;
-    let no_samples = usize::try_from(no_samples)
-        .map_err(|_| Error::InvalidFrame(format!("Invalid no_samples value: {no_samples}")))?;
-
-    let channel_stride_bytes = no_samples
+    let (no_channels, no_samples) = validate_positive_audio_counts(no_channels, no_samples)?;
+    let channel_stride_in_bytes = no_samples
         .checked_mul(std::mem::size_of::<f32>())
+        .and_then(|bytes| i32::try_from(bytes).ok())
         .ok_or_else(|| {
             Error::InvalidFrame(format!(
-                "Audio channel stride overflow: {} samples × {} bytes",
-                no_samples,
-                std::mem::size_of::<f32>()
+                "Audio channel stride exceeds i32 range: {no_samples} samples"
             ))
         })?;
-    let channel_stride_in_bytes = i32::try_from(channel_stride_bytes).map_err(|_| {
-        Error::InvalidFrame(format!(
-            "Audio channel stride {channel_stride_bytes} exceeds i32 range"
-        ))
-    })?;
-
-    let sample_count = no_channels.checked_mul(no_samples).ok_or_else(|| {
-        Error::InvalidFrame(format!(
-            "Audio sample count overflow: {no_channels} channels × {no_samples} samples"
-        ))
-    })?;
-    let byte_size = sample_count
-        .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| {
-            Error::InvalidFrame(format!(
-                "Audio byte size overflow: {} samples × {} bytes",
-                sample_count,
-                std::mem::size_of::<f32>()
-            ))
-        })?;
-
-    if byte_size > MAX_AUDIO_BYTES {
-        return Err(Error::InvalidFrame(format!(
-            "Audio frame exceeds maximum size: {} bytes > {} bytes",
-            byte_size, MAX_AUDIO_BYTES
-        )));
-    }
+    let sample_count = checked_audio_extent(no_channels, no_samples, no_samples)?;
 
     Ok(PackedAudioDimensions {
         no_channels,
@@ -2878,26 +2928,9 @@ fn validate_audio_layout_inner(
         ));
     }
 
-    if raw.sample_rate <= 0 {
-        return Err(Error::InvalidFrame(format!(
-            "Invalid sample rate: {}",
-            raw.sample_rate
-        )));
-    }
-
-    if raw.no_channels <= 0 {
-        return Err(Error::InvalidFrame(format!(
-            "Invalid number of channels: {}",
-            raw.no_channels
-        )));
-    }
-
-    if raw.no_samples <= 0 {
-        return Err(Error::InvalidFrame(format!(
-            "Invalid number of samples: {}",
-            raw.no_samples
-        )));
-    }
+    validate_audio_sample_rate(raw.sample_rate)?;
+    let (no_channels, no_samples) =
+        validate_positive_audio_counts(raw.no_channels, raw.no_samples)?;
 
     let format = validate_audio_format(raw.FourCC)?;
     let channel_stride_in_bytes = unsafe { raw.__bindgen_anon_1.channel_stride_in_bytes };
@@ -2907,15 +2940,6 @@ fn validate_audio_layout_inner(
             channel_stride_in_bytes
         )));
     }
-
-    // Use checked math to prevent overflow when computing sample count
-    let no_samples = usize::try_from(raw.no_samples).map_err(|_| {
-        Error::InvalidFrame(format!("Invalid no_samples value: {}", raw.no_samples))
-    })?;
-
-    let no_channels = usize::try_from(raw.no_channels).map_err(|_| {
-        Error::InvalidFrame(format!("Invalid no_channels value: {}", raw.no_channels))
-    })?;
 
     let channel_stride_bytes = usize::try_from(channel_stride_in_bytes).map_err(|_| {
         Error::InvalidFrame(format!(
@@ -2950,40 +2974,7 @@ fn validate_audio_layout_inner(
     }
 
     let channel_stride_samples = channel_stride_bytes / std::mem::size_of::<f32>();
-    let last_channel_offset = no_channels
-        .checked_sub(1)
-        .and_then(|last| last.checked_mul(channel_stride_samples))
-        .ok_or_else(|| {
-            Error::InvalidFrame(format!(
-                "Audio channel offset overflow: {} channels × {} stride samples",
-                no_channels, channel_stride_samples
-            ))
-        })?;
-
-    let sample_count = last_channel_offset.checked_add(no_samples).ok_or_else(|| {
-        Error::InvalidFrame(format!(
-            "Audio backing sample count overflow: channel offset {} + {} samples",
-            last_channel_offset, no_samples
-        ))
-    })?;
-
-    // Check total byte size against limit
-    let byte_size = sample_count
-        .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| {
-            Error::InvalidFrame(format!(
-                "Audio byte size overflow: {} samples × {} bytes",
-                sample_count,
-                std::mem::size_of::<f32>()
-            ))
-        })?;
-
-    if byte_size > MAX_AUDIO_BYTES {
-        return Err(Error::InvalidFrame(format!(
-            "Audio frame exceeds maximum size: {} bytes > {} bytes",
-            byte_size, MAX_AUDIO_BYTES
-        )));
-    }
+    let sample_count = checked_audio_extent(no_channels, no_samples, channel_stride_samples)?;
 
     Ok(ValidatedAudioLayout {
         format: Some(format),
@@ -4008,6 +3999,54 @@ mod tests {
         drop(frame);
         assert!(NDI::is_running());
         assert!(copy.runtime_proof().is_some());
+    }
+
+    /// Every audio path reports a bad sample rate with the same message.
+    #[test]
+    fn audio_sample_rate_check_is_shared_with_one_message() {
+        for rate in [0, -48_000] {
+            let expected = format!("Invalid sample rate: {rate}");
+            let message = |result: Result<()>| match result {
+                Err(Error::InvalidFrame(msg)) => msg,
+                other => panic!("expected InvalidFrame, got {other:?}"),
+            };
+            assert_eq!(message(validate_audio_sample_rate(rate)), expected);
+            assert_eq!(
+                message(validate_outbound_audio_layout(rate, 2, 8, AudioFormat::FLTP).map(|_| ())),
+                expected
+            );
+            assert_eq!(
+                message(
+                    crate::framesync::FrameSyncAudioRequest::capture_with(Some(rate), 2, 8)
+                        .map(|_| ())
+                ),
+                expected
+            );
+            assert_eq!(
+                message(
+                    crate::utilities::InterleavedAudioF32::new(rate, 2, 1, &[0.0; 2]).map(|_| ())
+                ),
+                expected
+            );
+        }
+        assert!(validate_audio_sample_rate(1).is_ok());
+    }
+
+    /// The extent helper gives packed and strided audio the same sample count
+    /// and size cap.
+    #[test]
+    fn audio_extent_is_shared_by_packed_and_strided_layouts() {
+        let packed = validate_packed_audio_dimensions(3, 5).unwrap();
+        assert_eq!(packed.sample_count(), 15);
+        assert_eq!(checked_audio_extent(3, 5, 5).unwrap(), 15);
+        // Padding between channels counts, trailing padding does not.
+        assert_eq!(checked_audio_extent(3, 5, 8).unwrap(), 2 * 8 + 5);
+        let limit = MAX_AUDIO_BYTES / 4;
+        assert_eq!(checked_audio_extent(1, limit, limit).unwrap(), limit);
+        assert!(checked_audio_extent(1, limit + 1, limit + 1).is_err());
+        assert!(checked_audio_extent(2, limit, limit).is_err());
+        assert!(checked_audio_extent(2, 1, limit).is_err());
+        assert!(checked_audio_extent(2, 1, usize::MAX).is_err());
     }
 
     #[test]

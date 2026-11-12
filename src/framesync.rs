@@ -164,9 +164,7 @@ impl FrameSyncAudioRequest {
     /// invalid dimensions as described in [`capture`](Self::capture).
     pub fn capture_with(sample_rate: Option<i32>, channels: i32, samples: i32) -> Result<Self> {
         if let Some(rate) = sample_rate {
-            if rate <= 0 {
-                return Err(Error::InvalidFrame(format!("Invalid sample rate: {rate}")));
-            }
+            crate::frames::validate_audio_sample_rate(rate)?;
         }
         validate_packed_audio_dimensions(channels, samples)?;
         Ok(Self {

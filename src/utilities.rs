@@ -45,17 +45,10 @@ struct AudioShape {
 
 impl AudioShape {
     fn new(rate: i32, channels: i32, samples: i32) -> Result<Self> {
-        if rate <= 0 {
-            return Err(Error::InvalidFrame(
-                "audio sample rate must be positive".into(),
-            ));
-        }
+        crate::frames::validate_audio_sample_rate(rate)?;
         // Share FLTP's checked stride and 64 MiB payload ceiling. This also
         // bounds conversion destinations for 16-bit source data.
-        validate_packed_audio_dimensions(channels, samples)?;
-        let count = (channels as usize)
-            .checked_mul(samples as usize)
-            .ok_or_else(|| Error::InvalidFrame("interleaved sample count overflow".into()))?;
+        let count = validate_packed_audio_dimensions(channels, samples)?.sample_count();
         Ok(Self {
             rate,
             channels,
