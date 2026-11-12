@@ -270,18 +270,27 @@ this.
 
 ### Sending packets
 
-`CompressedSender` owns its sender exclusively. Its program and preview streams
-are independent. The synchronous sends (`send_video`, `send_audio`,
-`send_scatter_video`, `send_scatter_audio`) borrow the frame mutably, because
-the SDK writes to the frame's bytes while it sends them. A frame can be sent
-again afterwards. A received packet can be relayed when `validate_for_send`
-accepts it; a frame the sender refuses stays with the caller. Video can also be
-sent asynchronously (`send_video_async`, `send_scatter_video_async`): the
-sender keeps the frame until the next asynchronous send on the same stream,
-which returns the earlier frame for reuse. Audio is always sent synchronously.
-`close` destroys the native sender, which waits for the SDK to finish with
-pending frames, and returns the frames that were still held as `UnsentVideo`,
-one field per stream.
+`CompressedSender` owns its sender exclusively. `sender()` lends it as a
+`Sender<CompressedAttached>`, which has every operation the sender modes
+share: the source, `send_metadata` and `capture_metadata` (a camera source
+receives PTZ and KVM requests this way), tally, connection count and
+connection metadata, failover, and the encoder guidance, keyframe and external
+tally controls. It has none of the uncompressed sends, and
+`SendAdvertiser::register` does not accept it: a registration would keep the
+native sender alive after `CompressedSender` has released the frames the SDK
+was still sending.
+
+Its program and preview streams are independent. The synchronous sends
+(`send_video`, `send_audio`, `send_scatter_video`, `send_scatter_audio`) borrow
+the frame mutably, because the SDK writes to the frame's bytes while it sends
+them. A frame can be sent again afterwards. A received packet can be relayed
+when `validate_for_send` accepts it; a frame the sender refuses stays with the
+caller. Video can also be sent asynchronously (`send_video_async`,
+`send_scatter_video_async`): the sender keeps the frame until the next
+asynchronous send on the same stream, which returns the earlier frame for
+reuse. Audio is always sent synchronously. `close` destroys the native sender,
+which waits for the SDK to finish with pending frames, and returns the frames
+that were still held as `UnsentVideo`, one field per stream.
 
 `ScatterVideoFrame` and `ScatterAudioFrame` hold one frame in up to 65,536
 owned, non-empty blocks, which are sent without being joined. The first block
@@ -315,8 +324,11 @@ reports it sent, so submission does not wait for a slow connection.
 - `from_sender` converts an existing `Sender`. It returns the frame the sender
   was still holding, if any. It refuses, and returns the sender, when the
   sender is registered with an advertiser.
-- `source` returns the source the sender advertises, as it does on
-  `CompressedSender`.
+- `sender()` lends the sender as a `Sender<QueueAttached>`: the source,
+  `send_audio`, metadata in both directions, tally, connections, failover and
+  the Advanced controls. It has no video sends, which would bypass the queue,
+  and `SendAdvertiser::register` does not accept it, so the native sender never
+  outlives the completion state.
 - A `QueuedSender` is neither `Send` nor `Sync`: it stays on the thread that
   created it. Dropping it destroys the native sender, which waits without a
   timeout for the SDK to finish with the frames still queued.
@@ -437,8 +449,8 @@ These are methods on the ordinary `Sender` and `Receiver`:
   in effect" from "refused". The SDK applies either change only under a vendor
   ID that licenses the function, and reports no change without one.
 
-`CompressedSender` has the same encoder guidance, keyframe and tally methods
-as `Sender`.
+The senders that `CompressedSender::sender` and `QueuedSender::sender` lend
+have the same encoder guidance, keyframe and tally methods as `Sender`.
 
 ## KVM
 

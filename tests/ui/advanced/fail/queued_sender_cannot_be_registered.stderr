@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+ --> tests/ui/advanced/fail/queued_sender_cannot_be_registered.rs:6:33
+  |
+6 |     let _ = advertiser.register(sender.sender(), SendAdvertisement::default());
+  |                        -------- ^^^^^^^^^^^^^^^ expected `&Sender`, found `&Sender<QueueAttached>`
+  |                        |
+  |                        arguments to this method are incorrect
+  |
+  = note: expected reference `&Sender<RawSend>`
+             found reference `&Sender<QueueAttached>`
+note: method defined here
+ --> src/discovery/advertiser.rs
+  |
+  |     pub fn register(
+  |            ^^^^^^^^

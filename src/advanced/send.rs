@@ -1,6 +1,6 @@
 //! Sending compressed frames, held in one buffer or in several.
 
-use std::{ptr, time::Duration};
+use std::ptr;
 
 use super::{
     aliasable::AliasableBox,
@@ -10,15 +10,14 @@ use super::{
         ENVELOPE_HEADER_BYTES,
     },
     AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedVideoFrame, EnvelopeCodec,
-    QualityPlan, VideoPacketFormat, MAX_PACKET_BYTES,
+    VideoPacketFormat, MAX_PACKET_BYTES,
 };
 use crate::{
     sys::{
-        self,
         advanced::{native, FrameScatter, ScatterSend},
         bindings::*,
     },
-    Ndi, Rejected, Result, Sender, SenderOptions, Source, StreamTier, Tally, Timecode,
+    CompressedAttached, Ndi, Rejected, Result, Sender, SenderOptions, StreamTier, Timecode,
 };
 
 /// Maximum number of blocks in one scatter frame.
@@ -555,8 +554,13 @@ impl PendingStreams {
 /// returns the earlier frame for reuse. Which streams a codec needs, and how
 /// they must relate, is defined by the NDI Advanced SDK documentation.
 ///
-/// The sender is owned exclusively by this value; it is not registered with
-/// advertisers or shared.
+/// The native sender is owned exclusively by this value.
+/// [`sender`](Self::sender) lends it in the [`CompressedAttached`] mode, which
+/// has the operations every sender shares (the source, metadata in both
+/// directions, tally, connections, failover, and the Advanced encoder
+/// guidance, keyframe and tally controls) but none of the uncompressed sends,
+/// and which cannot be registered with a
+/// [`SendAdvertiser`](crate::discovery::SendAdvertiser).
 ///
 /// # Sending lends the frame
 ///
@@ -590,8 +594,8 @@ impl PendingStreams {
 ///   low-bandwidth one. The SDK documentation asks a source to send both.
 /// * An H.264 or HEVC stream starts with a keyframe. Until a receiver has had
 ///   one, the frames that depend on it are not delivered;
-///   [`keyframe_required`](Self::keyframe_required) says when a receiver is
-///   waiting.
+///   [`keyframe_required`](Sender::keyframe_required) on
+///   [`sender`](Self::sender) says when a receiver is waiting.
 ///
 /// # Examples
 ///
@@ -621,10 +625,11 @@ impl PendingStreams {
 /// ```
 pub struct CompressedSender {
     // Declared first so that it is destroyed first: destroying the native
-    // sender is what ends the SDK's use of the pending frames.
-    sender: Sender,
+    // sender is what ends the SDK's use of the pending frames. Its mode keeps
+    // any other owner, such as an advertiser registration, from keeping it
+    // alive after they are freed.
+    sender: Sender<CompressedAttached>,
     pending: PendingStreams,
-    core: &'static sys::Core,
 }
 
 impl CompressedSender {
@@ -640,23 +645,29 @@ impl CompressedSender {
     pub fn new(ndi: &Ndi, options: &SenderOptions) -> Result<Self> {
         let config = AdvancedConfig::or_empty(options.config.as_ref());
         Ok(Self {
-            sender: Sender::new_configured(ndi, options, &config)?,
+            sender: Sender::new_configured(ndi, options, &config)?.into_mode(),
             pending: PendingStreams::default(),
-            core: &ndi.api().core,
         })
+    }
+
+    /// The sender this value sends through, for the operations that do not
+    /// send video or audio: [`source`](Sender::source),
+    /// [`send_metadata`](Sender::send_metadata) and
+    /// [`capture_metadata`](Sender::capture_metadata),
+    /// [`tally`](Sender::tally), [`connection_count`](Sender::connection_count),
+    /// connection metadata, failover, and the Advanced controls such as
+    /// [`keyframe_required`](Sender::keyframe_required) and
+    /// [`set_external_tally`](Sender::set_external_tally).
+    ///
+    /// Its mode has none of the uncompressed sends, and it cannot be
+    /// registered with an advertiser. It is `Sync`, but it borrows this value,
+    /// so it is used between sends rather than during one.
+    pub fn sender(&self) -> &Sender<CompressedAttached> {
+        &self.sender
     }
 
     fn instance(&self) -> NDIlib_send_instance_t {
         self.sender.native_instance()
-    }
-
-    /// The source this sender advertises; see [`Sender::source`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`Sender::source`].
-    pub fn source(&self) -> Result<Source> {
-        self.sender.source()
     }
 
     /// Send a video frame and return when the SDK has finished with it.
@@ -673,7 +684,8 @@ impl CompressedSender {
         // SAFETY: the sender is live, and the descriptor lends `frame`, which
         // is borrowed exclusively for longer than this synchronous call.
         unsafe {
-            self.core
+            self.sender
+                .core()
                 .NDIlib_send_send_video_v2(self.instance(), &descriptor)
         };
         Ok(())
@@ -696,7 +708,7 @@ impl CompressedSender {
         if let Err(error) = frame.validate_for_send() {
             return Err(Rejected::new(error, frame));
         }
-        let (core, instance) = (self.core, self.instance());
+        let (core, instance) = (self.sender.core(), self.instance());
         Ok(self
             .pending
             .submit(PendingVideo::contiguous(frame), |next| {
@@ -726,7 +738,8 @@ impl CompressedSender {
         // SAFETY: the sender is live, and the descriptor lends `frame`, which
         // is borrowed exclusively for longer than this synchronous call.
         unsafe {
-            self.core
+            self.sender
+                .core()
                 .NDIlib_send_send_audio_v3(self.instance(), &descriptor)
         };
         Ok(())
@@ -806,80 +819,6 @@ impl CompressedSender {
         Ok(())
     }
 
-    /// Set this sender's own tally contribution; see
-    /// [`Sender::set_external_tally`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`Sender::set_external_tally`].
-    pub fn set_external_tally(&self, tally: Tally) -> Result<()> {
-        self.sender.set_external_tally(tally)
-    }
-
-    /// The frame size an encoder should aim for; see
-    /// [`Sender::target_frame_bytes`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`Sender::target_frame_bytes`].
-    pub fn target_frame_bytes(&self, format: VideoPacketFormat) -> Result<u32> {
-        self.sender.target_frame_bytes(format)
-    }
-
-    /// The bit rate an encoder should aim for; see [`Sender::target_bit_rate`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`Sender::target_bit_rate`].
-    pub fn target_bit_rate(&self, format: VideoPacketFormat) -> Result<u32> {
-        self.sender.target_bit_rate(format)
-    }
-
-    /// The SpeedHQ quality factor; see [`Sender::legacy_quality`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`Sender::legacy_quality`].
-    pub fn legacy_quality(&self, format: VideoPacketFormat) -> Result<u32> {
-        self.sender.legacy_quality(format)
-    }
-
-    /// The SpeedHQ quality and permitted format; see [`Sender::quality_plan`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`Sender::quality_plan`].
-    pub fn quality_plan(
-        &self,
-        format: VideoPacketFormat,
-        supports_new_format: bool,
-    ) -> Result<QualityPlan> {
-        self.sender.quality_plan(format, supports_new_format)
-    }
-
-    /// Whether a receiver needs a keyframe; see [`Sender::keyframe_required`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`Sender::keyframe_required`].
-    pub fn keyframe_required(&self, format: Option<VideoPacketFormat>) -> Result<bool> {
-        self.sender.keyframe_required(format)
-    }
-
-    /// Wait for keyframe demand to change; see
-    /// [`Sender::wait_for_keyframe_change`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`Sender::wait_for_keyframe_change`].
-    pub fn wait_for_keyframe_change(
-        &self,
-        timeout: Duration,
-        format: Option<VideoPacketFormat>,
-    ) -> Result<bool> {
-        self.sender.wait_for_keyframe_change(timeout, format)
-    }
-
     /// Destroy the sender and take back the frames it still held.
     ///
     /// Destroying the native sender waits for the SDK to finish with every
@@ -888,7 +827,6 @@ impl CompressedSender {
         let Self {
             sender,
             mut pending,
-            ..
         } = self;
         drop(sender);
         pending.take()

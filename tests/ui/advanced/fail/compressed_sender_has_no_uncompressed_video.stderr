@@ -1,0 +1,7 @@
+error[E0599]: no method named `send_video` found for reference `&grafton_ndi::Sender<CompressedAttached>` in the current scope
+ --> tests/ui/advanced/fail/compressed_sender_has_no_uncompressed_video.rs:3:29
+  |
+3 |     let _ = sender.sender().send_video(frame);
+  |             ------          ^^^^^^^^^^ method not found in `&grafton_ndi::Sender<CompressedAttached>`
+  |             |
+  |             method `send_video` is available on `&CompressedSender`

@@ -2,7 +2,9 @@
 
 use std::{
     ffi::{CStr, CString},
-    fmt, ptr,
+    fmt,
+    marker::PhantomData,
+    ptr,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -47,11 +49,41 @@ fn flush_null_frame(core: &sys::Core, instance: NDIlib_send_instance_t) {
     unsafe { core.NDIlib_send_send_video_async_v2(instance, async_flush_frame_ptr()) };
 }
 
+/// The handle of a native sender: the one value through which this crate
+/// reaches an SDK sender, and the one place where the sender types' thread
+/// safety rests on the SDK's contract rather than on their Rust fields.
+///
+/// A copy is a borrowed handle. [`SenderResource`] owns the sender and
+/// destroys it.
+#[derive(Clone, Copy, Debug)]
+struct SendInstance(NDIlib_send_instance_t);
+
+// SAFETY: the handle is an opaque pointer with no thread affinity, and the SDK
+// lets one sender be used from several threads at once. Its documentation of
+// sending (the NDI-Send section) allows video, audio and metadata to be sent
+// at any time, from any thread and in any order, and `Processing.NDI.Send.h`
+// allows for audio and video submitted from separate threads when it
+// describes their clocking. Nothing requires a sender to be destroyed on the
+// thread that created it. A copy grants nothing by itself: every use is an
+// `unsafe` SDK call made through an owner that keeps the sender alive, and
+// `SenderResource` destroys it only when the last owner is released, so no
+// call overlaps `NDIlib_send_destroy`. The operations this crate does not
+// overlap are serialized by the Rust state around the handle, whose own types
+// decide the auto traits of the types that hold it: the ownership and
+// synchronization of asynchronous video (`Inner::video`), metadata capture
+// with its matching free (`Inner::metadata_capture`), and the Advanced
+// queue's completion state, which `QueuedSender` registers before it returns.
+unsafe impl Send for SendInstance {}
+// SAFETY: as for `Send`.
+unsafe impl Sync for SendInstance {}
+
 /// SDK instance and the owned storage retained while it sends video.
 struct Inner {
-    instance: NDIlib_send_instance_t,
+    // A copy of the handle that `resource` owns.
+    instance: SendInstance,
     // The entry points of the runtime that created `instance`.
     core: &'static sys::Core,
+    // `None` only while `Inner::drop` runs.
     resource: Option<Arc<SenderResource>>,
     metadata_capture: parking_lot::Mutex<()>,
     video_callback: Option<AsyncCallback>,
@@ -61,7 +93,7 @@ struct Inner {
 
 /// A private ownership token; advertisements retain this without access to sends.
 pub(crate) struct SenderResource {
-    pub(crate) instance: NDIlib_send_instance_t,
+    instance: SendInstance,
     _name: CString,
     _groups: Option<CString>,
     #[cfg(feature = "advanced")]
@@ -69,17 +101,70 @@ pub(crate) struct SenderResource {
     _ndi: Ndi,
 }
 
-// SAFETY: Same documented native ownership/transfer contract as Sender. Tokens
-// expose no public operations and only destroy after the final owner is released.
-unsafe impl Send for SenderResource {}
-unsafe impl Sync for SenderResource {}
+impl SenderResource {
+    /// The native sender this token keeps alive.
+    pub(crate) fn instance(&self) -> NDIlib_send_instance_t {
+        self.instance.0
+    }
+}
 
 impl Drop for SenderResource {
     fn drop(&mut self) {
         // SAFETY: this token is the instance's final owner.
-        unsafe { self._ndi.api().core.NDIlib_send_destroy(self.instance) };
+        unsafe { self._ndi.api().core.NDIlib_send_destroy(self.instance.0) };
     }
 }
+
+mod mode_sealed {
+    pub trait Sealed {}
+}
+
+/// Sealed sender capability mode.
+///
+/// Every mode has the operations that do not depend on how video is sent:
+/// the source, metadata in both directions, tally, connection count and
+/// metadata, failover, and the Advanced encoder guidance, keyframe and tally
+/// controls. [`RawSend`] alone sends uncompressed video; the modes that also
+/// send uncompressed audio implement [`AudioSendMode`].
+pub trait SenderMode: mode_sealed::Sealed + Send + Sync {}
+
+/// Sealed sender modes that send uncompressed audio with
+/// [`Sender::send_audio`]: [`RawSend`] and the queued mode.
+pub trait AudioSendMode: SenderMode {}
+
+/// Ordinary sender mode: uncompressed video, including the owned asynchronous
+/// pipeline, audio and metadata. Only a sender in this mode can be registered
+/// with a [`SendAdvertiser`](crate::discovery::SendAdvertiser).
+#[derive(Debug)]
+pub enum RawSend {}
+
+/// Sender mode held exclusively by
+/// [`CompressedSender`](crate::advanced::CompressedSender), which sends the
+/// video and audio itself.
+#[cfg(feature = "advanced")]
+#[derive(Debug)]
+pub enum CompressedAttached {}
+
+/// Sender mode held exclusively by
+/// [`QueuedSender`](crate::advanced::QueuedSender), which sends the video
+/// itself. It sends uncompressed audio.
+#[cfg(feature = "advanced")]
+#[derive(Debug)]
+pub enum QueueAttached {}
+
+impl mode_sealed::Sealed for RawSend {}
+impl SenderMode for RawSend {}
+impl AudioSendMode for RawSend {}
+#[cfg(feature = "advanced")]
+impl mode_sealed::Sealed for CompressedAttached {}
+#[cfg(feature = "advanced")]
+impl SenderMode for CompressedAttached {}
+#[cfg(feature = "advanced")]
+impl mode_sealed::Sealed for QueueAttached {}
+#[cfg(feature = "advanced")]
+impl SenderMode for QueueAttached {}
+#[cfg(feature = "advanced")]
+impl AudioSendMode for QueueAttached {}
 
 /// An NDI source that sends video, audio and metadata.
 ///
@@ -88,10 +173,21 @@ impl Drop for SenderResource {
 /// unless a [`SendAdvertiser`](crate::discovery::SendAdvertiser) registration
 /// still holds it: a registered sender stays on the network until that
 /// registration is removed or its advertiser is dropped.
+///
+/// The default mode, [`RawSend`], has every operation. The Advanced
+/// `CompressedSender` and `QueuedSender` hold their sender in another
+/// [`SenderMode`] and lend it through their `sender` method: it keeps the
+/// operations every mode shares, but not the video sends its owner makes
+/// itself, and it cannot be registered with an advertiser.
+///
+/// A sender is `Send` and `Sync`. Its operations take `&self` and may run on
+/// several threads at once, except the asynchronous video submissions and the
+/// completion handler setters, which take `&mut self`.
 #[derive(Debug)]
-pub struct Sender {
+pub struct Sender<M: SenderMode = RawSend> {
     inner: Inner,
     _ndi: Ndi,
+    _mode: PhantomData<M>,
 }
 
 type AsyncCallback = Box<dyn Fn(usize) + Send + Sync>;
@@ -168,7 +264,7 @@ impl Inner {
         let len = {
             let mut video = self.video.lock().unwrap_or_else(|e| e.into_inner());
             if video.is_in_flight() {
-                flush_null_frame(self.core, self.instance);
+                flush_null_frame(self.core, self.instance.0);
             }
             video.completed()
         };
@@ -179,16 +275,11 @@ impl Inner {
 impl fmt::Debug for Inner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Inner")
-            .field("instance", &self.instance)
+            .field("instance", &self.instance.0)
             .field("video_callback_set", &self.video_callback.is_some())
             .finish()
     }
 }
-
-// SAFETY: SDK access is thread-safe; video ownership and synchronization are
-// serialized by the mutex. Other fields are owned strings and a Send + Sync callback.
-unsafe impl Send for Inner {}
-unsafe impl Sync for Inner {}
 
 /// A borrowed video frame that references external pixel data.
 ///
@@ -548,6 +639,7 @@ impl Sender {
         if instance.is_null() {
             return Err(Error::NativeOperationFailed { operation });
         }
+        let instance = SendInstance(instance);
         Ok(Self {
             inner: Inner {
                 instance,
@@ -565,13 +657,14 @@ impl Sender {
                 video: Mutex::new(VideoState::default()),
             },
             _ndi: ndi.clone(),
+            _mode: PhantomData,
         })
     }
 
-    pub(crate) fn native_instance(&self) -> NDIlib_send_instance_t {
-        self.inner.instance
-    }
-
+    /// A new owner of the native sender, which keeps it alive after this
+    /// value is dropped. Only an ordinary sender hands one out: the wrappers
+    /// that hold a sender in another mode free what the SDK reads once their
+    /// native sender is gone, so it must not outlive them.
     pub(crate) fn native_owner(&self) -> Arc<SenderResource> {
         Arc::clone(
             self.inner
@@ -589,70 +682,6 @@ impl Sender {
                 .as_ref()
                 .expect("live sender owns its resource"),
         ) == 1
-    }
-
-    pub(crate) fn runtime(&self) -> &Ndi {
-        &self._ndi
-    }
-
-    /// Capture metadata sent back by connected receivers.
-    ///
-    /// The result owns its data. The wait budget includes contention with other
-    /// metadata captures and does not block the video-send synchronization lock.
-    pub fn capture_metadata(&self, timeout: Duration) -> Result<Option<MetadataFrame>> {
-        let metadata = self._ndi.table::<sys::SenderMetadata>()?;
-        let deadline = Deadline::after(timeout)?;
-        let Some(_lock) = self.inner.metadata_capture.try_lock_until(deadline.end()) else {
-            return Ok(None);
-        };
-        let mut raw = NDIlib_metadata_frame_t {
-            length: 0,
-            timecode: 0,
-            p_data: ptr::null_mut(),
-        };
-        let remaining = deadline.remaining_ms();
-        // SAFETY: the sender instance is live for this borrow and `raw` is
-        // writable storage for one metadata descriptor.
-        let kind =
-            unsafe { metadata.NDIlib_send_capture(self.inner.instance, &mut raw, remaining) };
-        if kind == NDIlib_frame_type_e_NDIlib_frame_type_metadata {
-            struct Release {
-                instance: NDIlib_send_instance_t,
-                raw: NDIlib_metadata_frame_t,
-                metadata: &'static sys::SenderMetadata,
-            }
-            impl Drop for Release {
-                fn drop(&mut self) {
-                    // SAFETY: `raw` was filled by NDIlib_send_capture on this
-                    // instance and is released exactly once.
-                    unsafe {
-                        self.metadata
-                            .NDIlib_send_free_metadata(self.instance, &self.raw)
-                    };
-                }
-            }
-            let guard = Release {
-                instance: self.inner.instance,
-                raw,
-                metadata,
-            };
-            let layout = unsafe { crate::frames::validate_metadata_layout(&guard.raw)? };
-            Ok(Some(unsafe {
-                MetadataFrame::from_raw_validated(&guard.raw, layout)
-            }))
-        } else if kind == NDIlib_frame_type_e_NDIlib_frame_type_none {
-            Ok(None)
-        } else {
-            Err(Error::CaptureFailed(format!(
-                "sender metadata capture returned {kind}"
-            )))
-        }
-    }
-
-    /// Check that this sender's runtime can send `pixel_format`: the one
-    /// check every video send makes before anything reaches the SDK.
-    pub(crate) fn require_video_format(&self, pixel_format: PixelFormat) -> Result<()> {
-        pixel_format.require_sendable(&self._ndi)
     }
 
     /// Send a video frame synchronously.
@@ -676,7 +705,7 @@ impl Sender {
             unsafe {
                 self.inner
                     .core
-                    .NDIlib_send_send_video_v2(self.inner.instance, &video_frame.to_raw());
+                    .NDIlib_send_send_video_v2(self.inner.instance.0, &video_frame.to_raw());
             }
             video.completed()
         };
@@ -729,7 +758,7 @@ impl Sender {
             unsafe {
                 self.inner
                     .core
-                    .NDIlib_send_send_video_async_v2(self.inner.instance, &raw);
+                    .NDIlib_send_send_video_async_v2(self.inner.instance.0, &raw);
             }
             (previous, len)
         };
@@ -749,7 +778,7 @@ impl Sender {
         let (previous, len) = {
             let mut video = self.inner.video.lock().unwrap_or_else(|e| e.into_inner());
             if video.is_in_flight() {
-                flush_null_frame(self.inner.core, self.inner.instance);
+                flush_null_frame(self.inner.core, self.inner.instance.0);
             }
             let len = video.completed();
             (video.take_frame(), len)
@@ -780,10 +809,50 @@ impl Sender {
         Ok(self.submit_video_async(owned))
     }
 
+    /// Replace the completion handler receiving the submitted pixel-buffer length.
+    ///
+    /// It runs on the calling thread after SDK synchronization, outside internal
+    /// locks, at most once per submitted frame. Completion is observed by the
+    /// next video send, flush, finish, or sender destruction. Owned and copied sends share
+    /// this handler. State is updated before invocation, so panic or reentry cannot
+    /// repeat a notification. If sender destruction runs during unwinding, a
+    /// handler panic is suppressed to avoid a second panic.
+    ///
+    /// Replaces the previous handler. The current handler observes completion of
+    /// a frame still in flight, including one submitted before registration.
+    /// Frames completed before registration are not notified retroactively.
+    pub fn on_async_video_done<F>(&mut self, handler: F)
+    where
+        F: Fn(usize) + Send + Sync + 'static,
+    {
+        self.inner.video_callback = Some(Box::new(handler));
+    }
+
+    /// Remove the completion handler. Pending frame ownership is unchanged.
+    pub fn clear_async_video_done(&mut self) {
+        self.inner.video_callback = None;
+    }
+
+    /// Flush pending async video operations synchronously.
+    ///
+    /// Sends a true NULL video frame pointer to the SDK, blocking until all
+    /// pending async video operations are complete.
+    ///
+    /// After this returns, the SDK has released the pending buffer. The sender
+    /// retains the frame; use [`Self::finish_video_async`] or the next async
+    /// submission to recover it without copying.
+    pub fn flush_async_blocking(&self) {
+        self.inner.complete();
+    }
+}
+
+impl<M: AudioSendMode> Sender<M> {
     /// Sends an audio frame synchronously.
     ///
     /// The SDK has released the input buffer when this returns, so the caller
     /// may then reuse or release it. This calls `NDIlib_send_send_audio_v3`.
+    /// It is available in the modes that implement [`AudioSendMode`]: on an
+    /// ordinary sender and on the one a `QueuedSender` lends.
     ///
     /// See the NDI SDK documentation section on `NDIlib_send_send_audio_v3` for more details.
     ///
@@ -824,7 +893,94 @@ impl Sender {
         unsafe {
             self.inner
                 .core
-                .NDIlib_send_send_audio_v3(self.inner.instance, &audio_frame.to_raw());
+                .NDIlib_send_send_audio_v3(self.inner.instance.0, &audio_frame.to_raw());
+        }
+    }
+}
+
+impl<M: SenderMode> Sender<M> {
+    /// The same sender in mode `T`. The native sender, its options and its
+    /// asynchronous video state are unchanged.
+    #[cfg(feature = "advanced")]
+    pub(crate) fn into_mode<T: SenderMode>(self) -> Sender<T> {
+        Sender {
+            inner: self.inner,
+            _ndi: self._ndi,
+            _mode: PhantomData,
+        }
+    }
+
+    pub(crate) fn native_instance(&self) -> NDIlib_send_instance_t {
+        self.inner.instance.0
+    }
+
+    /// The core entry points of the runtime that created this sender.
+    #[cfg(feature = "advanced")]
+    pub(crate) fn core(&self) -> &'static sys::Core {
+        self.inner.core
+    }
+
+    pub(crate) fn runtime(&self) -> &Ndi {
+        &self._ndi
+    }
+
+    /// Check that this sender's runtime can send `pixel_format`: the one
+    /// check every video send makes before anything reaches the SDK.
+    pub(crate) fn require_video_format(&self, pixel_format: PixelFormat) -> Result<()> {
+        pixel_format.require_sendable(&self._ndi)
+    }
+
+    /// Capture metadata sent back by connected receivers.
+    ///
+    /// The result owns its data. The wait budget includes contention with other
+    /// metadata captures and does not block the video-send synchronization lock.
+    pub fn capture_metadata(&self, timeout: Duration) -> Result<Option<MetadataFrame>> {
+        let metadata = self._ndi.table::<sys::SenderMetadata>()?;
+        let deadline = Deadline::after(timeout)?;
+        let Some(_lock) = self.inner.metadata_capture.try_lock_until(deadline.end()) else {
+            return Ok(None);
+        };
+        let mut raw = NDIlib_metadata_frame_t {
+            length: 0,
+            timecode: 0,
+            p_data: ptr::null_mut(),
+        };
+        let remaining = deadline.remaining_ms();
+        // SAFETY: the sender instance is live for this borrow and `raw` is
+        // writable storage for one metadata descriptor.
+        let kind =
+            unsafe { metadata.NDIlib_send_capture(self.inner.instance.0, &mut raw, remaining) };
+        if kind == NDIlib_frame_type_e_NDIlib_frame_type_metadata {
+            struct Release {
+                instance: NDIlib_send_instance_t,
+                raw: NDIlib_metadata_frame_t,
+                metadata: &'static sys::SenderMetadata,
+            }
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    // SAFETY: `raw` was filled by NDIlib_send_capture on this
+                    // instance and is released exactly once.
+                    unsafe {
+                        self.metadata
+                            .NDIlib_send_free_metadata(self.instance, &self.raw)
+                    };
+                }
+            }
+            let guard = Release {
+                instance: self.inner.instance.0,
+                raw,
+                metadata,
+            };
+            let layout = unsafe { crate::frames::validate_metadata_layout(&guard.raw)? };
+            Ok(Some(unsafe {
+                MetadataFrame::from_raw_validated(&guard.raw, layout)
+            }))
+        } else if kind == NDIlib_frame_type_e_NDIlib_frame_type_none {
+            Ok(None)
+        } else {
+            Err(Error::CaptureFailed(format!(
+                "sender metadata capture returned {kind}"
+            )))
         }
     }
 
@@ -838,7 +994,7 @@ impl Sender {
         unsafe {
             self.inner
                 .core
-                .NDIlib_send_send_metadata(self.inner.instance, &raw);
+                .NDIlib_send_send_metadata(self.inner.instance.0, &raw);
         }
     }
 
@@ -884,7 +1040,7 @@ impl Sender {
         let success = unsafe {
             self.inner
                 .core
-                .NDIlib_send_get_tally(self.inner.instance, &mut raw_tally, timeout_ms)
+                .NDIlib_send_get_tally(self.inner.instance.0, &mut raw_tally, timeout_ms)
         };
 
         if success {
@@ -933,7 +1089,7 @@ impl Sender {
         let count = unsafe {
             self.inner
                 .core
-                .NDIlib_send_get_no_connections(self.inner.instance, timeout_ms)
+                .NDIlib_send_get_no_connections(self.inner.instance.0, timeout_ms)
         };
 
         u32::try_from(count).map_err(|_| {
@@ -950,7 +1106,7 @@ impl Sender {
         unsafe {
             self.inner
                 .core
-                .NDIlib_send_clear_connection_metadata(self.inner.instance)
+                .NDIlib_send_clear_connection_metadata(self.inner.instance.0)
         }
     }
 
@@ -964,7 +1120,7 @@ impl Sender {
         unsafe {
             self.inner
                 .core
-                .NDIlib_send_add_connection_metadata(self.inner.instance, &raw)
+                .NDIlib_send_add_connection_metadata(self.inner.instance.0, &raw)
         }
     }
 
@@ -980,7 +1136,7 @@ impl Sender {
         unsafe {
             self.inner
                 .core
-                .NDIlib_send_set_failover(self.inner.instance, &raw_source.raw)
+                .NDIlib_send_set_failover(self.inner.instance.0, &raw_source.raw)
         }
         Ok(())
     }
@@ -992,7 +1148,7 @@ impl Sender {
         unsafe {
             self.inner
                 .core
-                .NDIlib_send_set_failover(self.inner.instance, ptr::null())
+                .NDIlib_send_set_failover(self.inner.instance.0, ptr::null())
         }
     }
 
@@ -1022,47 +1178,11 @@ impl Sender {
         let source_ptr = unsafe {
             self.inner
                 .core
-                .NDIlib_send_get_source_name(self.inner.instance)
+                .NDIlib_send_get_source_name(self.inner.instance.0)
         };
         // SAFETY: the SDK sender owns this live descriptor and its strings
         // through the synchronous copy performed here.
         unsafe { Source::try_from_raw(source_ptr, "NDIlib_send_get_source_name") }
-    }
-
-    /// Replace the completion handler receiving the submitted pixel-buffer length.
-    ///
-    /// It runs on the calling thread after SDK synchronization, outside internal
-    /// locks, at most once per submitted frame. Completion is observed by the
-    /// next video send, flush, finish, or sender destruction. Owned and copied sends share
-    /// this handler. State is updated before invocation, so panic or reentry cannot
-    /// repeat a notification. If sender destruction runs during unwinding, a
-    /// handler panic is suppressed to avoid a second panic.
-    ///
-    /// Replaces the previous handler. The current handler observes completion of
-    /// a frame still in flight, including one submitted before registration.
-    /// Frames completed before registration are not notified retroactively.
-    pub fn on_async_video_done<F>(&mut self, handler: F)
-    where
-        F: Fn(usize) + Send + Sync + 'static,
-    {
-        self.inner.video_callback = Some(Box::new(handler));
-    }
-
-    /// Remove the completion handler. Pending frame ownership is unchanged.
-    pub fn clear_async_video_done(&mut self) {
-        self.inner.video_callback = None;
-    }
-
-    /// Flush pending async video operations synchronously.
-    ///
-    /// Sends a true NULL video frame pointer to the SDK, blocking until all
-    /// pending async video operations are complete.
-    ///
-    /// After this returns, the SDK has released the pending buffer. The sender
-    /// retains the frame; use [`Self::finish_video_async`] or the next async
-    /// submission to recover it without copying.
-    pub fn flush_async_blocking(&self) {
-        self.inner.complete();
     }
 }
 
@@ -1070,7 +1190,7 @@ impl Drop for Inner {
     fn drop(&mut self) {
         let video = self.video.get_mut().unwrap_or_else(|e| e.into_inner());
         if video.is_in_flight() {
-            flush_null_frame(self.core, self.instance);
+            flush_null_frame(self.core, self.instance.0);
         }
         let len = video.completed();
         // Destroy before running user code, so a callback panic cannot leak the
@@ -1085,35 +1205,6 @@ impl Drop for Inner {
         }
     }
 }
-
-/// # Safety
-///
-/// The NDI 6 SDK documentation specifically marks these send functions as thread-safe:
-/// - `NDIlib_send_send_video_v2` and `NDIlib_send_send_video_async_v2`
-/// - `NDIlib_send_send_audio_v3` (no async variant exists)
-/// - `NDIlib_send_send_metadata` (no async variant exists)
-/// - `NDIlib_send_get_tally`
-/// - `NDIlib_send_get_no_connections`
-///
-/// `Inner` holds an opaque NDI pointer and owned CStrings that are automatically
-/// freed in Drop, making it safe to move between threads.
-///
-/// Ownership prevents destruction while SDK calls still borrow the sender;
-/// creation and destruction may occur on different threads.
-unsafe impl Send for Sender {}
-
-/// # Safety
-///
-/// The NDI 6 SDK guarantees that multiple threads can safely call send methods
-/// concurrently. The SDK uses internal synchronization for:
-/// - Video sending (both sync and async)
-/// - Audio sending (sync only)
-/// - Metadata sending
-/// - Status queries (tally, connections)
-///
-/// Video ownership and synchronizing SDK calls are serialized by the mutex.
-/// Exclusive ownership prevents concurrent instance destruction.
-unsafe impl Sync for Sender {}
 
 /// Configuration for creating a [`Sender`].
 ///

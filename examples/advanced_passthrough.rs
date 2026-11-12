@@ -59,7 +59,7 @@ fn main() -> Result<(), Error> {
     let (mut video, mut audio) = (0u32, 0u32);
     for _ in 0..600 {
         // A viewer that has just connected cannot decode until it sees a keyframe.
-        if sender.keyframe_required(None)? {
+        if sender.sender().keyframe_required(None)? {
             receiver.request_keyframe()?;
         }
         match receiver.capture(Duration::from_secs(1))? {

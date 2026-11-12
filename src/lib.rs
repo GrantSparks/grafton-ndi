@@ -229,8 +229,14 @@ pub use {
         SettingChange, SourceNameChange, Tally,
     },
     runtime::{Ndi, ProcessLifetimeRuntime, Runtime, RuntimeOptions},
-    sender::{BorrowedVideoFrame, BorrowedVideoFrameBuilder, Sender, SenderOptions},
+    sender::{
+        AudioSendMode, BorrowedVideoFrame, BorrowedVideoFrameBuilder, RawSend, Sender, SenderMode,
+        SenderOptions,
+    },
 };
+
+#[cfg(feature = "advanced")]
+pub use sender::{CompressedAttached, QueueAttached};
 
 pub use media::{FourCc, FrameRate, MediaTypes, StreamTier};
 pub use rejected::Rejected;

@@ -1,0 +1,5 @@
+error[E0599]: no method named `send_video_async` found for reference `&grafton_ndi::Sender<QueueAttached>` in the current scope
+ --> tests/ui/advanced/fail/queued_sender_has_no_async_video.rs:3:29
+  |
+3 |     let _ = sender.sender().send_video_async(frame);
+  |                             ^^^^^^^^^^^^^^^^ method not found in `&grafton_ndi::Sender<QueueAttached>`

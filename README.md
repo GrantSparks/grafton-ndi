@@ -314,7 +314,7 @@ an RGB staging frame. Codec storage and encoded output require additional memory
 
 ### Publish Sources
 
-`Sender` publishes a named NDI source and sends video, audio, and metadata. It also exposes connection count, tally, failover, and connection metadata APIs.
+`Sender` publishes a named NDI source and sends video, audio, and metadata. It also exposes connection count, tally, failover, and connection metadata APIs. The Advanced `CompressedSender` and `QueuedSender` lend the same shared operations through `sender()`, as a `Sender` in another mode that has no uncompressed video sends and cannot be registered with an advertiser.
 
 ```rust
 use grafton_ndi::{FrameRate, PixelFormat, Sender, SenderOptions, VideoFrame};

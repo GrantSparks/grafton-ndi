@@ -7,6 +7,7 @@
 
 use crate::{
     frames::validate_packed_audio_dimensions,
+    sender::AudioSendMode,
     sys::{self, bindings::*},
     AudioFrame, Error, Ndi, Result, Sender, Timecode,
 };
@@ -333,7 +334,9 @@ macro_rules! send_interleaved {
     };
 }
 
-impl Sender {
+/// Interleaved audio goes through the SDK's audio send, so every mode that
+/// sends uncompressed audio has it.
+impl<M: AudioSendMode> Sender<M> {
     send_interleaved!(
         send_audio_interleaved_i16,
         InterleavedAudioI16,

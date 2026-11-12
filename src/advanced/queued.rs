@@ -16,12 +16,11 @@ use std::{
 use super::CompressedVideoFrame;
 use crate::{
     sys::{
-        self,
         advanced::{native, SendCompletion},
         bindings::*,
     },
     timeout::Deadline,
-    Error, Ndi, Rejected, Result, Sender, SenderOptions, Source, VideoFrame,
+    Error, Ndi, QueueAttached, Rejected, Result, Sender, SenderOptions, VideoFrame,
 };
 
 use super::aliasable::AliasableBox;
@@ -131,7 +130,7 @@ impl QueuedVideoFrame {
     }
 
     /// Check that `sender` can send this frame, as its own send methods do.
-    fn validate(&self, sender: &Sender) -> Result<()> {
+    fn validate(&self, sender: &Sender<QueueAttached>) -> Result<()> {
         match self {
             Self::Pixels(v) => sender.require_video_format(v.pixel_format()),
             Self::Compressed(v) => v.validate_for_send(),
@@ -273,6 +272,13 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
 /// native sender, which waits, without a timeout, for the SDK to finish with
 /// every frame still queued.
 ///
+/// [`sender`](Self::sender) lends the native sender in the [`QueueAttached`]
+/// mode, which has the operations every sender shares (the source, metadata
+/// in both directions, tally, connections, failover, and the Advanced
+/// controls) and [`send_audio`](Sender::send_audio), but none of the video
+/// sends, and which cannot be registered with a
+/// [`SendAdvertiser`](crate::discovery::SendAdvertiser).
+///
 /// # Examples
 ///
 /// ```no_run
@@ -298,11 +304,12 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
 /// ```
 pub struct QueuedSender {
     // Declared first so that it is destroyed first: destroying the native
-    // sender is what ends the SDK's completion callbacks.
-    sender: Sender,
+    // sender is what ends the SDK's completion callbacks. Its mode keeps any
+    // other owner, such as an advertiser registration, from keeping it alive
+    // after the callback state is freed.
+    sender: Sender<QueueAttached>,
     // The SDK holds this address for as long as the sender exists.
     callback: AliasableBox<CallbackState>,
-    core: &'static sys::Core,
     _thread: PhantomData<Rc<()>>,
 }
 
@@ -360,11 +367,15 @@ impl QueuedSender {
     }
 
     /// Register the completion callback before anything can be submitted.
+    ///
+    /// The sender must have no other owner and nothing in flight: its mode
+    /// changes here, and only the queue sends video on it from now on.
     fn install(
         sender: Sender,
         callback: Box<CallbackState>,
         table: &'static SendCompletion,
     ) -> Self {
+        let sender = sender.into_mode::<QueueAttached>();
         let callback = AliasableBox::new(callback);
         let state = callback.as_ptr();
         // SAFETY: the sender is live. The state is heap-allocated, the callback
@@ -378,20 +389,26 @@ impl QueuedSender {
             )
         });
         Self {
-            core: &sender.runtime().api().core,
             sender,
             callback,
             _thread: PhantomData,
         }
     }
 
-    /// The source this sender advertises; see [`Sender::source`].
+    /// The sender this queue sends through, for the operations that do not
+    /// send video: [`source`](Sender::source),
+    /// [`send_audio`](Sender::send_audio),
+    /// [`send_metadata`](Sender::send_metadata) and
+    /// [`capture_metadata`](Sender::capture_metadata),
+    /// [`tally`](Sender::tally), [`connection_count`](Sender::connection_count),
+    /// connection metadata, failover, and the Advanced controls.
     ///
-    /// # Errors
-    ///
-    /// As for [`Sender::source`].
-    pub fn source(&self) -> Result<Source> {
-        self.sender.source()
+    /// Its mode has none of the video sends, which would bypass the queue, and
+    /// it cannot be registered with an advertiser. It is `Sync`, but it
+    /// borrows this queue, so it is used between submissions rather than
+    /// during one.
+    pub fn sender(&self) -> &Sender<QueueAttached> {
+        &self.sender
     }
 
     /// Queue a frame for sending, without copying it and without waiting.
@@ -487,7 +504,8 @@ impl QueuedSender {
         // SAFETY: the sender is live, and the queue owns the descriptor and
         // the frame it lends until the SDK reports completion.
         unsafe {
-            self.core
+            self.sender
+                .core()
                 .NDIlib_send_send_video_async_v2(self.sender.native_instance(), pointer)
         };
         Ok(id)

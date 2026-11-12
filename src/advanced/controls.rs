@@ -1,4 +1,4 @@
-//! Advanced SDK controls on the ordinary sender and receiver.
+//! Advanced SDK controls on senders and receivers of every mode.
 
 use std::time::Duration;
 
@@ -11,7 +11,8 @@ use crate::{
         },
         bindings::*,
     },
-    Error, MediaTypes, Receiver, ReceiverMode, Result, Sender, SettingChange, StreamTier, Tally,
+    Error, MediaTypes, Receiver, ReceiverMode, Result, Sender, SenderMode, SettingChange,
+    StreamTier, Tally,
 };
 
 /// Encoder guidance that `operation` returned, which `Processing.NDI.Advanced.h`
@@ -40,7 +41,7 @@ fn stream(format: Option<&NDIlib_video_frame_v2_t>) -> *const NDIlib_video_frame
     format.map_or(std::ptr::null(), |format| format)
 }
 
-impl Sender {
+impl<M: SenderMode> Sender<M> {
     /// Set this sender's own contribution to its tally state, which is
     /// otherwise the combination of what its receivers report: for instance,
     /// that it is known to be on air. The SDK reflects the state to the

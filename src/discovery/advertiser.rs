@@ -163,7 +163,7 @@ impl AdvertiserApi for sys::SenderAdvertising {
     unsafe fn remove(&self, instance: Self::Instance, member: &Self::Member) -> bool {
         // SAFETY: the caller supplies a live advertiser, and `member` owns a
         // live sender.
-        unsafe { self.NDIlib_send_advertiser_del_sender(instance, member.instance) }
+        unsafe { self.NDIlib_send_advertiser_del_sender(instance, member.instance()) }
     }
 }
 
@@ -463,6 +463,13 @@ impl SendAdvertiser {
     /// The sender is not borrowed: it stays fully usable, and may even be
     /// dropped, while it is registered.
     ///
+    /// Only an ordinary sender, in the [`RawSend`](crate::RawSend) mode, can
+    /// be registered. The Advanced `CompressedSender` and `QueuedSender` lend
+    /// their sender in another [`SenderMode`](crate::SenderMode), which this
+    /// method does not take: they free the frames or completion state the SDK
+    /// uses as soon as their native sender is destroyed, and a registration
+    /// would keep it alive past that.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidInput`] when this advertiser already
@@ -487,7 +494,7 @@ impl SendAdvertiser {
         if !unsafe {
             self.inner.api.NDIlib_send_advertiser_add_sender(
                 self.inner.instance,
-                owner.instance,
+                owner.instance(),
                 options.monitoring,
             )
         } {

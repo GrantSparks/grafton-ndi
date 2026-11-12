@@ -12,9 +12,9 @@ mod common;
 use grafton_ndi::{
     advanced::*,
     capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, SdkEdition},
-    AudioFrame, Error, Finder, FinderOptions, FrameRate, MediaTypes, Ndi, Receiver,
-    ReceiverBandwidth, ReceiverOptions, ScanType, Sender, SenderOptions, SettingChange, Source,
-    StreamTier, Tally, Timecode, VideoFrame,
+    AudioFrame, Error, Finder, FinderOptions, FrameRate, MediaTypes, MetadataFrame, Ndi, Receiver,
+    ReceiverBandwidth, ReceiverOptions, ScanType, Sender, SenderMode, SenderOptions, SettingChange,
+    Source, StreamTier, Tally, Timecode, VideoFrame,
 };
 use std::{
     sync::{
@@ -771,7 +771,7 @@ fn compressed_video_arrives_as_sent_by_every_kind_of_send() {
     };
     let _turn = sockets();
     let mut sender = CompressedSender::new(&ndi, &options("video-matrix")).unwrap();
-    let source = sender.source().unwrap();
+    let source = sender.sender().source().unwrap();
     let mut program = packet_receiver(&ndi, &source, ReceiverBandwidth::Highest);
     let mut preview = packet_receiver(&ndi, &source, ReceiverBandwidth::Lowest);
     for (receiver, tier) in [
@@ -980,7 +980,11 @@ fn every_audio_frame_the_wrapper_admits_is_delivered_as_sent() {
     };
     let _turn = sockets();
     let mut sender = CompressedSender::new(&ndi, &options("audio-matrix")).unwrap();
-    let mut receiver = packet_receiver(&ndi, &sender.source().unwrap(), ReceiverBandwidth::Highest);
+    let mut receiver = packet_receiver(
+        &ndi,
+        &sender.sender().source().unwrap(),
+        ReceiverBandwidth::Highest,
+    );
     connect(&mut receiver, |timecode| {
         let mut probe = CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 64])
             .unwrap()
@@ -1130,7 +1134,7 @@ fn every_video_frame_the_wrapper_admits_is_delivered() {
     };
     let _turn = sockets();
     let mut sender = CompressedSender::new(&ndi, &options("video-grid")).unwrap();
-    let source = sender.source().unwrap();
+    let source = sender.sender().source().unwrap();
     let mut program = packet_receiver(&ndi, &source, ReceiverBandwidth::Highest);
     let mut preview = packet_receiver(&ndi, &source, ReceiverBandwidth::Lowest);
     for (receiver, tier) in [
@@ -1242,10 +1246,17 @@ fn a_relay_delivers_every_packet_it_receives() {
     };
     let _turn = sockets();
     let mut origin = CompressedSender::new(&ndi, &options("relay-origin")).unwrap();
-    let mut upstream = packet_receiver(&ndi, &origin.source().unwrap(), ReceiverBandwidth::Highest);
+    let mut upstream = packet_receiver(
+        &ndi,
+        &origin.sender().source().unwrap(),
+        ReceiverBandwidth::Highest,
+    );
     let mut relay = CompressedSender::new(&ndi, &options("relay")).unwrap();
-    let mut downstream =
-        packet_receiver(&ndi, &relay.source().unwrap(), ReceiverBandwidth::Highest);
+    let mut downstream = packet_receiver(
+        &ndi,
+        &relay.sender().source().unwrap(),
+        ReceiverBandwidth::Highest,
+    );
     for (sender, receiver) in [(&mut origin, &mut upstream), (&mut relay, &mut downstream)] {
         connect(receiver, |timecode| {
             sender
@@ -1335,7 +1346,11 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
     };
     let _turn = sockets();
     let mut sender = CompressedSender::new(&ndi, &options("resend")).unwrap();
-    let mut receiver = packet_receiver(&ndi, &sender.source().unwrap(), ReceiverBandwidth::Highest);
+    let mut receiver = packet_receiver(
+        &ndi,
+        &sender.sender().source().unwrap(),
+        ReceiverBandwidth::Highest,
+    );
     connect(&mut receiver, |timecode| {
         sender
             .send_video(&mut keyframe(
@@ -1434,7 +1449,11 @@ fn a_frame_returned_by_a_queued_sender_can_be_resubmitted() {
     };
     let _turn = sockets();
     let mut queue = QueuedSender::new(&ndi, &options("requeue"), QueueOptions::default()).unwrap();
-    let mut receiver = packet_receiver(&ndi, &queue.source().unwrap(), ReceiverBandwidth::Highest);
+    let mut receiver = packet_receiver(
+        &ndi,
+        &queue.sender().source().unwrap(),
+        ReceiverBandwidth::Highest,
+    );
     connect(&mut receiver, |timecode| {
         queue
             .try_submit(keyframe(VideoCodec::H264, StreamTier::Program, timecode))
@@ -1470,6 +1489,89 @@ fn a_frame_returned_by_a_queued_sender_can_be_resubmitted() {
     }
     assert_eq!(queue.retained_frames(), 0);
     assert!(!queue.completion_protocol_failed());
+}
+
+/// Connect a receiver to the source `sender` advertises and exchange
+/// metadata with it in both directions, using only the operations every
+/// sender mode shares: connection metadata reaches the receiver when it
+/// connects, sent metadata reaches it afterwards, and metadata the receiver
+/// sends upstream is captured by the sender.
+fn exchange_metadata<M: SenderMode>(ndi: &Ndi, sender: &Sender<M>, kind: &str) -> Receiver {
+    let connection = MetadataFrame::new(format!("<connection kind=\"{kind}\"/>")).unwrap();
+    sender.add_connection_metadata(&connection);
+    let receiver = Receiver::new(
+        ndi,
+        &ReceiverOptions::new(loopback(ndi, &sender.source().unwrap())),
+    )
+    .unwrap();
+    let downstream = MetadataFrame::new(format!("<to-receiver kind=\"{kind}\"/>")).unwrap();
+    let upstream = MetadataFrame::new(format!("<to-sender kind=\"{kind}\"/>")).unwrap();
+    let (mut connected, mut delivered, mut returned) = (false, false, false);
+    let deadline = Instant::now() + PATIENCE;
+    while !(connected && delivered && returned) {
+        assert!(
+            Instant::now() < deadline,
+            "{kind}: connection metadata {connected}, sent {delivered}, returned {returned}"
+        );
+        sender.send_metadata(&downstream);
+        if let Some(frame) = receiver.metadata().capture(SLICE).unwrap() {
+            connected |= frame.data() == connection.data();
+            delivered |= frame.data() == downstream.data();
+        }
+        match receiver.send_metadata(&upstream) {
+            Ok(()) | Err(Error::NotConnected) => {}
+            Err(error) => panic!("{kind}: {error}"),
+        }
+        if let Some(frame) = sender.capture_metadata(SLICE).unwrap() {
+            returned |= frame.data() == upstream.data();
+        }
+    }
+    assert!(sender.connection_count(Duration::ZERO).unwrap() >= 1);
+    sender.clear_connection_metadata();
+    receiver
+}
+
+/// The sender a `CompressedSender` or a `QueuedSender` lends exchanges
+/// metadata with its receivers as an ordinary one does, and a queued source
+/// carries uncompressed audio beside the video it queues.
+#[test]
+fn wrapped_senders_exchange_metadata_and_audio_through_the_sender_they_lend() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let compressed = CompressedSender::new(&ndi, &options("lent-compressed")).unwrap();
+    drop(exchange_metadata(&ndi, compressed.sender(), "compressed"));
+    assert!(compressed.close().program.is_none());
+
+    let queue = QueuedSender::new(&ndi, &options("lent-queue"), QueueOptions::default()).unwrap();
+    let receiver = exchange_metadata(&ndi, queue.sender(), "queued");
+    let samples = 1_600;
+    let sound = AudioFrame::builder()
+        .sample_rate(48_000)
+        .num_channels(2)
+        .num_samples(samples)
+        .data(vec![0.25; 2 * samples as usize])
+        .build()
+        .unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    let received = loop {
+        queue.sender().send_audio(&sound);
+        if let Some(frame) = receiver.audio().capture(SLICE).unwrap() {
+            break frame;
+        }
+        assert!(Instant::now() < deadline, "queued audio did not arrive");
+    };
+    assert_eq!(
+        (
+            received.sample_rate(),
+            received.num_channels(),
+            received.num_samples()
+        ),
+        (48_000, 2, samples)
+    );
+    assert!(received.data().iter().all(|&sample| sample == 0.25));
+    assert_eq!(queue.retained_frames(), 0);
 }
 
 /// Sets a flag when it goes out of scope, so that a thread that runs until
@@ -1812,7 +1914,7 @@ fn hevc_444_decodes_to_the_original_full_resolution_chroma_planes() {
     let mut sender = CompressedSender::new(&ndi, &options("hevc-444")).unwrap();
     let receiver = Receiver::new(
         &ndi,
-        &ReceiverOptions::new(loopback(&ndi, &sender.source().unwrap()))
+        &ReceiverOptions::new(loopback(&ndi, &sender.sender().source().unwrap()))
             .color_format(grafton_ndi::ReceiverColorFormat::Best444),
     )
     .unwrap();

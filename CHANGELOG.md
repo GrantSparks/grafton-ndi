@@ -185,6 +185,13 @@ as `None`. Most programs need changes; see the
   hands a refused frame back in a `Rejected`. Every video send checks that the
   sender's runtime supports the frame's pixel format before anything reaches
   the SDK.
+- `Sender` has sealed modes, as receivers do: `Sender<M: SenderMode = RawSend>`,
+  and `Sender` still names the ordinary sender with every operation. The
+  source, metadata in both directions, tally, connection count and connection
+  metadata, failover and the Advanced encoder guidance, keyframe and external
+  tally controls work in every mode; `send_audio` and the interleaved audio
+  sends in the modes that implement `AudioSendMode`; the uncompressed video
+  sends, completion handlers and flush in `RawSend` only.
 - `BorrowedVideoFrame::try_from_uncompressed`, `with_picture_aspect_ratio`,
   `fourcc` and `validated_data_len` are removed. Use
   `BorrowedVideoFrame::builder` with its `frame_rate` and
@@ -297,6 +304,12 @@ as `None`. Most programs need changes; see the
   compiles and every native operation returns `Error::UnsupportedCapability`,
   and older or partial Advanced headers disable only the operations they do not
   declare. See the [Advanced SDK guide](docs/advanced.md).
+- `advanced::CompressedSender::sender` and `advanced::QueuedSender::sender`
+  lend their native sender as `Sender<CompressedAttached>` and
+  `Sender<QueueAttached>`, with every operation the modes share, so a
+  compressed source receives metadata such as PTZ and KVM requests and a
+  queued source also carries audio. `SendAdvertiser::register` takes only
+  `Sender<RawSend>`, so a wrapped sender cannot be registered.
 - `Ndi::process_lifetime`, an explicit opt-in that keeps NDI started until the
   process exits. Custom receive allocators require it.
 - The optional `file-io` feature and `file` module for the NDI File library of
