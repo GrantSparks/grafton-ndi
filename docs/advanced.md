@@ -372,9 +372,13 @@ reports it sent, so submission does not wait for a slow connection.
   the Advanced controls. It has no video sends, which would bypass the queue,
   and `SendAdvertiser::register` does not accept it, so the native sender never
   outlives the completion state.
-- A `QueuedSender` is neither `Send` nor `Sync`: it stays on the thread that
-  created it. Dropping it destroys the native sender, which waits without a
-  timeout for the SDK to finish with the frames still queued.
+- A `QueuedSender`, like a `CompressedSender`, is `Send` and `Sync`, with or
+  without the Advanced headers in the build: it can be moved to another
+  thread, such as an async task, and its read-only methods called from any
+  thread, while submitting and collecting frames take it mutably. The SDK
+  calls the completion handler on threads of its own and ties the sender to
+  none. Dropping it destroys the native sender, which waits without a timeout
+  for the SDK to finish with the frames still queued.
 
 Example: `examples/advanced_queued_send.rs`.
 

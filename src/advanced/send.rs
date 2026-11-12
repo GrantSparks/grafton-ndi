@@ -479,6 +479,13 @@ enum PendingVideo {
 // takes the frame back, once the SDK has finished with it, only the SDK reads
 // or writes those allocations.
 unsafe impl Send for PendingVideo {}
+// SAFETY: a shared reference to an entry reads only its frame's format, which
+// the SDK never writes; it never dereferences the scatter list's pointers.
+// Everything that lends the entry to the SDK or takes it back goes through
+// `&mut` or by value. The generated `NDIlib_frame_scatter_t` holds raw
+// pointers, which would otherwise make this entry, and with it
+// `CompressedSender`, `Sync` only in builds without the Advanced headers.
+unsafe impl Sync for PendingVideo {}
 
 impl PendingVideo {
     /// The entry for a scatter frame, sent through `table`, with a scatter
@@ -886,8 +893,8 @@ mod tests {
         send_sync::<ScatterAudioFrame>();
         send_sync::<CompressedVideoFrame>();
         send_sync::<CompressedAudioFrame>();
-        fn send<T: Send>() {}
-        send::<CompressedSender>();
+        // With and without the Advanced headers alike.
+        send_sync::<CompressedSender>();
     }
 
     #[test]

@@ -1602,6 +1602,72 @@ fn a_frame_returned_by_a_queued_sender_can_be_resubmitted() {
     assert!(!queue.completion_protocol_failed());
 }
 
+/// A queue works on threads other than the one that created it: it submits
+/// and collects completions after a move, is read through a shared reference
+/// from a third thread, and is destroyed on a fourth, where destruction waits
+/// for the SDK's last completions.
+#[test]
+fn a_queued_sender_moves_between_threads() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let mut queue =
+        QueuedSender::new(&ndi, &options("moved-queue"), QueueOptions::default()).unwrap();
+    // A packet receiver stays on the thread that created it.
+    let mut receiver = packet_receiver(
+        &ndi,
+        &queue.sender().source().unwrap(),
+        ReceiverBandwidth::Highest,
+    );
+    connect(&mut receiver, |timecode| {
+        queue
+            .try_submit(keyframe(VideoCodec::H264, StreamTier::Program, timecode))
+            .unwrap();
+        queue
+            .wait_completed(PATIENCE)
+            .unwrap()
+            .expect("the SDK completes a frame it was given");
+    });
+
+    let (submitted, sent) = std::sync::mpsc::channel();
+    let (received, delivered) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        for timecode in FIRST_TIMECODE + 1..FIRST_TIMECODE + 5 {
+            let id = queue
+                .try_submit(keyframe(VideoCodec::H264, StreamTier::Program, timecode))
+                .unwrap();
+            submitted.send(timecode).unwrap();
+            delivered.recv().unwrap();
+            let completed = queue
+                .wait_completed(PATIENCE)
+                .unwrap()
+                .expect("the SDK completes a frame it has sent");
+            assert_eq!(completed.id(), id);
+        }
+        queue
+    });
+    for timecode in sent {
+        let frame = await_video(&mut receiver, timecode);
+        assert_same_packet(
+            frame.data(),
+            &video_bytes(VideoCodec::H264, timecode, true),
+            Some(EnvelopeCodec::H264),
+        );
+        received.send(()).unwrap();
+    }
+    let queue = worker.join().unwrap();
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            assert_eq!(queue.retained_frames(), 0);
+            assert!(!queue.completion_protocol_failed());
+            assert!(queue.sender().source().is_ok());
+        });
+    });
+    std::thread::spawn(move || drop(queue)).join().unwrap();
+}
+
 /// Connect a receiver to the source `sender` advertises and exchange
 /// metadata with it in both directions, using only the operations every
 /// sender mode shares: connection metadata reaches the receiver when it

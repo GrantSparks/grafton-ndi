@@ -4,8 +4,6 @@
 use std::{
     collections::{HashMap, VecDeque},
     ffi::c_void,
-    marker::PhantomData,
-    rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
         Condvar, Mutex,
@@ -303,9 +301,10 @@ unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_
 /// [`try_take_completed`](Self::try_take_completed) or
 /// [`wait_completed`](Self::wait_completed) and can be reused.
 ///
-/// The sender is used from the thread that owns it. Dropping it destroys the
-/// native sender, which waits, without a timeout, for the SDK to finish with
-/// every frame still queued.
+/// It is [`Send`] and [`Sync`]: it can be moved to, and its read-only methods
+/// called from, any thread, while submitting and collecting frames takes it
+/// mutably. Dropping it destroys the native sender, which waits, without a
+/// timeout, for the SDK to finish with every frame still queued.
 ///
 /// [`sender`](Self::sender) lends the native sender in the [`QueueAttached`]
 /// mode, which has the operations every sender shares (the source, metadata
@@ -345,8 +344,23 @@ pub struct QueuedSender {
     sender: Sender<QueueAttached>,
     // The SDK holds this address for as long as the sender exists.
     callback: AliasableBox<CallbackState>,
-    _thread: PhantomData<Rc<()>>,
 }
+
+// `QueuedSender` is `Send` and `Sync` from its fields, with no impl of its
+// own. The Advanced SDK manual's section on asynchronous sending completions
+// (25.4.1.1) has the SDK call the handler on threads of its own, possibly
+// several at once, lets it be replaced at any time, and has
+// `NDIlib_send_destroy` call every outstanding completion before it returns;
+// it puts no thread requirement on the sender or on its completion
+// registration. The lent sender is the crate's ordinary `Send + Sync` native
+// sender, all state the callback shares is behind `CallbackState`'s mutex
+// and atomic, and every operation that changes the queue takes `&mut self`.
+// The runtime test `a_queued_sender_moves_between_threads` sends, completes,
+// reads and drops one on threads other than the one that created it.
+const _: () = {
+    const fn send_and_sync<T: Send + Sync>() {}
+    send_and_sync::<QueuedSender>();
+};
 
 impl QueuedSender {
     /// Create a sender, with the options' Advanced SDK
@@ -427,11 +441,7 @@ impl QueuedSender {
                 Some(completion),
             )
         });
-        Self {
-            sender,
-            callback,
-            _thread: PhantomData,
-        }
+        Self { sender, callback }
     }
 
     /// The sender this queue sends through, for the operations that do not
