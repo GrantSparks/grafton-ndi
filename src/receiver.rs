@@ -33,7 +33,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
@@ -45,7 +45,7 @@ use crate::{
     },
     finder::{RawSource, Source},
     sys::{self, bindings::*},
-    timeout::Deadline,
+    timeout::{self, Deadline},
     Error, MetadataFrame, Ndi, Result,
 };
 
@@ -112,86 +112,103 @@ impl Drop for RecvStringGuard<'_> {
     }
 }
 
-/// Convert a delay the SDK reported, rejecting values outside its documented range.
+/// The longest receive delay, in milliseconds, that a receiver sets or
+/// accepts from the SDK, for video and audio alike.
+///
+/// The NDI SDK documentation of receiver video and audio delay clamps both
+/// to 0 through 2000 ms; a longer delay is refused here rather than clamped.
+const MAX_RECEIVE_DELAY_MILLIS: u32 = 2000;
+
+/// Convert a delay the SDK reported, rejecting values outside
+/// 0..=[`MAX_RECEIVE_DELAY_MILLIS`].
 fn receiver_delay(millis: i32) -> Result<Duration> {
-    u64::try_from(millis)
+    u32::try_from(millis)
         .ok()
-        .filter(|millis| *millis <= 2000)
-        .map(Duration::from_millis)
+        .filter(|millis| *millis <= MAX_RECEIVE_DELAY_MILLIS)
+        .map(|millis| Duration::from_millis(millis.into()))
         .ok_or_else(|| {
             Error::UnexpectedSdkResult(format!("SDK returned invalid receive delay: {millis} ms"))
         })
 }
 
+/// The SDK's millisecond count for a receive delay, rounded up by the one
+/// timeout rule, [`timeout::sdk_millis`], and refused above
+/// [`MAX_RECEIVE_DELAY_MILLIS`].
 fn receiver_delay_millis(delay: Duration) -> Result<i32> {
-    if delay > Duration::from_secs(2) {
-        return Err(Error::InvalidInput(
-            "receive delay must not exceed two seconds".into(),
-        ));
-    }
-    // Range validation makes this conversion bounded by 2000, including rounding.
-    Ok(delay.as_nanos().div_ceil(1_000_000) as i32)
+    timeout::sdk_millis(delay)
+        .filter(|millis| *millis <= MAX_RECEIVE_DELAY_MILLIS)
+        .and_then(|millis| i32::try_from(millis).ok())
+        .ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "receive delay {delay:?} exceeds {MAX_RECEIVE_DELAY_MILLIS} ms"
+            ))
+        })
 }
 
-/// The timing of the retry loop behind every receiver capture, for all frame
-/// kinds, for both [`Capture`] verbs and the async ones, and for
-/// [`Receiver::poll_event`].
-struct RetryPolicy {
-    /// Timeout per individual capture attempt.
-    poll_interval: Duration,
-    /// Pause after an attempt that returned before its timeout without a
-    /// frame, so that early returns do not busy-wait.
-    sleep_between: Duration,
-}
+/// The longest one capture attempt waits: in the SDK, and for the receiver's
+/// shared capture guard. No capture therefore holds that guard for longer.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            poll_interval: Duration::from_millis(100),
-            sleep_between: Duration::from_millis(10),
-        }
-    }
-}
+/// The pause after an attempt that returned before its own end without a
+/// value: the SDK's early return, which would otherwise busy-wait.
+const EARLY_RETURN_PAUSE: Duration = Duration::from_millis(10);
 
-/// Retry `capture_fn` until it returns a frame or `deadline` is spent.
+/// Run `attempt` until it returns a value or `deadline` is spent: the one
+/// capture loop behind every receiver capture, for all frame kinds, for both
+/// [`Capture`] verbs and the async ones, and behind [`Receiver::poll_event`]
+/// and the Advanced packet receivers' capture.
 ///
 /// The SDK returns from a capture early, without a frame, while a new
 /// connection synchronizes and whenever it reports a status or source change,
 /// so one SDK call does not wait out the caller's timeout. Each attempt is
-/// handed at most the policy's poll interval of what is left of the budget,
-/// which may have started before this call.
+/// handed what is left of `deadline`, which may have started before this
+/// call, narrowed to [`POLL_INTERVAL`].
 ///
-/// Returns `Ok(None)` once the budget is spent without a frame. An error from
+/// Returns `Ok(None)` once the budget is spent without a value. An error from
 /// an attempt ends the loop.
-fn retry_capture<T, F>(deadline: Deadline, policy: &RetryPolicy, capture_fn: F) -> Result<Option<T>>
-where
-    F: FnMut(Duration) -> Result<Option<T>>,
-{
-    retry_capture_with_clock(
-        deadline.budget(),
-        policy,
-        capture_fn,
-        || deadline.elapsed(),
-        std::thread::sleep,
-    )
-}
-
-/// Run `attempt` under the default [`RetryPolicy`] until it returns a value or
-/// `deadline` is spent, handing each attempt what is left of `deadline`
-/// narrowed to the policy's poll interval: the one capture loop behind every
-/// receiver capture and [`Receiver::poll_event`], the Advanced packet
-/// receivers' included.
 pub(crate) fn capture_within<T>(
     deadline: Deadline,
-    mut attempt: impl FnMut(Attempt) -> Result<Option<T>>,
+    attempt: impl FnMut(Attempt) -> Result<Option<T>>,
 ) -> Result<Option<T>> {
-    retry_capture(deadline, &RetryPolicy::default(), |poll| {
-        attempt(Attempt(deadline.within(poll)))
-    })
+    capture_within_clock(deadline, attempt, Instant::now, std::thread::sleep)
 }
 
-/// One attempt of [`capture_within`]: the caller's deadline, narrowed to the
-/// poll interval of the default [`RetryPolicy`].
+/// [`capture_within`] with `now` reading the clock and `sleep` pausing, so
+/// that a test can drive the loop with a clock of its own.
+///
+/// The first attempt is made even when nothing is left of `deadline`, so a
+/// spent or zero budget makes exactly one attempt, with a zero timeout.
+///
+/// Only an attempt that returned before its own end is followed by
+/// [`EARLY_RETURN_PAUSE`], never past the end of `deadline`: that is the
+/// SDK's early return, which would otherwise spin. An attempt that waited
+/// until its end is followed at once by the next, so that a frame arriving in
+/// between is not delayed by a pause.
+fn capture_within_clock<T>(
+    deadline: Deadline,
+    mut attempt: impl FnMut(Attempt) -> Result<Option<T>>,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+) -> Result<Option<T>> {
+    loop {
+        let this = Attempt(deadline.within_at(now(), POLL_INTERVAL));
+        if let Some(value) = attempt(this)? {
+            return Ok(Some(value));
+        }
+        let mut returned = now();
+        if returned < this.0.end() {
+            // Before the attempt's end, and so before the deadline's.
+            sleep(EARLY_RETURN_PAUSE.min(deadline.remaining_at(returned)));
+            returned = now();
+        }
+        if deadline.remaining_at(returned).is_zero() {
+            return Ok(None);
+        }
+    }
+}
+
+/// One attempt of [`capture_within`]: the caller's deadline, narrowed to
+/// [`POLL_INTERVAL`] from when the attempt began.
 ///
 /// Only [`capture_within`] makes one, and the shared capture guard is taken
 /// only within one ([`ReceiverCore::capture_lock`]), with the SDK waiting only
@@ -200,51 +217,6 @@ pub(crate) fn capture_within<T>(
 /// most, however long the timeout of a capture in flight.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Attempt(Deadline);
-
-/// [`retry_capture`] for a budget of `budget`, with `elapsed` reporting the
-/// time since the budget started and `sleep` pausing between attempts.
-///
-/// The first attempt is made even when nothing is left of the budget, so a
-/// zero budget makes exactly one attempt, with a zero timeout.
-///
-/// Only an attempt that returned before its own timeout is followed by the
-/// policy's pause: that is the SDK's early return, which would otherwise spin.
-/// An attempt that waited out its timeout is followed at once by the next, so
-/// that a frame arriving in between is not delayed by a pause.
-fn retry_capture_with_clock<T, F, E, S>(
-    budget: Duration,
-    policy: &RetryPolicy,
-    mut capture_fn: F,
-    mut elapsed: E,
-    mut sleep: S,
-) -> Result<Option<T>>
-where
-    F: FnMut(Duration) -> Result<Option<T>>,
-    E: FnMut() -> Duration,
-    S: FnMut(Duration),
-{
-    let time_left =
-        |spent: Duration| Some(budget.saturating_sub(spent)).filter(|left| !left.is_zero());
-    let mut started = elapsed();
-    let mut poll = policy.poll_interval.min(budget.saturating_sub(started));
-    loop {
-        if let Some(frame) = capture_fn(poll)? {
-            return Ok(Some(frame));
-        }
-        let mut now = elapsed();
-        if now.saturating_sub(started) < poll {
-            if let Some(left) = time_left(now) {
-                sleep(policy.sleep_between.min(left));
-                now = elapsed();
-            }
-        }
-        let Some(left) = time_left(now) else {
-            return Ok(None);
-        };
-        started = now;
-        poll = policy.poll_interval.min(left);
-    }
-}
 
 fn validate_ptz_value(name: &str, value: f32, min: f32, max: f32) -> Result<()> {
     if value.is_finite() && (min..=max).contains(&value) {
@@ -1484,7 +1456,7 @@ impl ReceiverCore {
     }
 
     /// The one capture loop, behind [`Capture::capture_ref`] and every owned
-    /// capture: SDK captures under the default [`RetryPolicy`] until one
+    /// capture: SDK captures in [`capture_within`]'s attempts until one
     /// delivers a frame of kind `K` or `deadline` is spent.
     pub(crate) fn capture_ref_until<K: CaptureKind>(
         &self,
@@ -2292,6 +2264,17 @@ mod tests {
         }
         assert!(receiver_delay_millis(Duration::from_secs(2) + Duration::from_nanos(1)).is_err());
         assert!(receiver_delay_millis(Duration::MAX).is_err());
+        // Both directions share one bound: what may be set may be reported.
+        for millis in [0, 1, 1999, 2000] {
+            let delay = receiver_delay(millis).unwrap();
+            assert_eq!(receiver_delay_millis(delay).unwrap(), millis);
+        }
+        for millis in [-1, 2001, i32::MIN, i32::MAX] {
+            assert!(matches!(
+                receiver_delay(millis),
+                Err(Error::UnexpectedSdkResult(_))
+            ));
+        }
     }
 
     #[test]
@@ -2570,18 +2553,42 @@ mod tests {
         ReceiverOptions::new(test_source())
     }
 
-    #[derive(Default)]
+    /// A clock that moves only when a test advances it, to drive
+    /// [`capture_within_clock`].
     struct FakeClock {
+        start: Instant,
         elapsed: Cell<Duration>,
     }
 
     impl FakeClock {
+        fn new() -> Self {
+            Self {
+                start: Instant::now(),
+                elapsed: Cell::new(Duration::ZERO),
+            }
+        }
+
+        fn now(&self) -> Instant {
+            self.start + self.elapsed.get()
+        }
+
         fn elapsed(&self) -> Duration {
             self.elapsed.get()
         }
 
         fn advance(&self, duration: Duration) {
             self.elapsed.set(self.elapsed.get() + duration);
+        }
+
+        /// A caller's budget that started when this clock did.
+        fn deadline(&self, budget: Duration) -> Deadline {
+            Deadline::starting(self.start, budget).unwrap()
+        }
+
+        /// What is left of `attempt` now: the timeout its SDK call would get,
+        /// and the longest it would wait for the capture guard.
+        fn timeout(&self, attempt: Attempt) -> Duration {
+            attempt.0.remaining_at(self.now())
         }
     }
 
@@ -3088,21 +3095,16 @@ mod tests {
 
     #[test]
     fn retry_caps_sub_poll_timeout_to_total_budget() {
-        let clock = FakeClock::default();
-        let policy = RetryPolicy {
-            poll_interval: Duration::from_millis(100),
-            sleep_between: Duration::from_millis(10),
-        };
+        let clock = FakeClock::new();
         let mut polls = Vec::new();
 
-        let result = retry_capture_with_clock(
-            Duration::from_millis(25),
-            &policy,
-            |poll| {
-                polls.push(poll);
+        let result = capture_within_clock(
+            clock.deadline(Duration::from_millis(25)),
+            |attempt| {
+                polls.push(clock.timeout(attempt));
                 Ok(Some(42))
             },
-            || clock.elapsed(),
+            || clock.now(),
             |_| {},
         );
 
@@ -3112,18 +3114,14 @@ mod tests {
 
     #[test]
     fn retry_shrinks_later_poll_to_remaining_budget() {
-        let clock = FakeClock::default();
-        let policy = RetryPolicy {
-            poll_interval: Duration::from_millis(40),
-            sleep_between: Duration::from_millis(10),
-        };
+        let clock = FakeClock::new();
         let mut polls = Vec::new();
         let mut sleeps = Vec::new();
 
-        let result: Result<Option<i32>> = retry_capture_with_clock(
-            Duration::from_millis(50),
-            &policy,
-            |poll| {
+        let result: Result<Option<i32>> = capture_within_clock(
+            clock.deadline(Duration::from_millis(110)),
+            |attempt| {
+                let poll = clock.timeout(attempt);
                 polls.push(poll);
                 if polls.len() == 1 {
                     clock.advance(Duration::from_millis(5));
@@ -3132,7 +3130,7 @@ mod tests {
                 }
                 Ok(None)
             },
-            || clock.elapsed(),
+            || clock.now(),
             |sleep| {
                 sleeps.push(sleep);
                 clock.advance(sleep);
@@ -3142,24 +3140,23 @@ mod tests {
         assert!(result.unwrap().is_none());
         assert_eq!(
             polls,
-            [Duration::from_millis(40), Duration::from_millis(35)]
+            [Duration::from_millis(100), Duration::from_millis(95)]
         );
         assert_eq!(sleeps, [Duration::from_millis(10)]);
     }
 
     #[test]
     fn retry_zero_timeout_success_makes_one_nonblocking_attempt() {
-        let clock = FakeClock::default();
+        let clock = FakeClock::new();
         let mut polls = Vec::new();
 
-        let result = retry_capture_with_clock(
-            Duration::ZERO,
-            &RetryPolicy::default(),
-            |poll| {
-                polls.push(poll);
+        let result = capture_within_clock(
+            clock.deadline(Duration::ZERO),
+            |attempt| {
+                polls.push(clock.timeout(attempt));
                 Ok(Some(42))
             },
-            || clock.elapsed(),
+            || clock.now(),
             |_| panic!("zero-timeout success should not sleep"),
         );
 
@@ -3169,17 +3166,16 @@ mod tests {
 
     #[test]
     fn retry_zero_timeout_miss_gives_up_after_one_attempt() {
-        let clock = FakeClock::default();
+        let clock = FakeClock::new();
         let mut polls = Vec::new();
 
-        let result: Result<Option<i32>> = retry_capture_with_clock(
-            Duration::ZERO,
-            &RetryPolicy::default(),
-            |poll| {
-                polls.push(poll);
+        let result: Result<Option<i32>> = capture_within_clock(
+            clock.deadline(Duration::ZERO),
+            |attempt| {
+                polls.push(clock.timeout(attempt));
                 Ok(None)
             },
-            || clock.elapsed(),
+            || clock.now(),
             |_| panic!("zero-timeout miss should not sleep"),
         );
 
@@ -3189,51 +3185,42 @@ mod tests {
 
     #[test]
     fn retry_stops_when_an_attempt_spends_the_budget() {
-        let clock = FakeClock::default();
-        let policy = RetryPolicy {
-            poll_interval: Duration::from_millis(8),
-            sleep_between: Duration::from_millis(5),
-        };
+        let clock = FakeClock::new();
         let mut polls = Vec::new();
 
-        let result: Result<Option<i32>> = retry_capture_with_clock(
-            Duration::from_millis(10),
-            &policy,
-            |poll| {
-                polls.push(poll);
-                clock.advance(Duration::from_millis(10));
+        let result: Result<Option<i32>> = capture_within_clock(
+            clock.deadline(Duration::from_millis(120)),
+            |attempt| {
+                polls.push(clock.timeout(attempt));
+                // The SDK overran the attempt's timeout and the budget.
+                clock.advance(Duration::from_millis(120));
                 Ok(None)
             },
-            || clock.elapsed(),
+            || clock.now(),
             |_| panic!("expired timeout should not sleep"),
         );
 
         assert!(result.unwrap().is_none());
-        assert_eq!(polls, [Duration::from_millis(8)]);
+        assert_eq!(polls, [POLL_INTERVAL]);
     }
 
     #[test]
     fn retry_caps_sleep_to_remaining_budget() {
-        let clock = FakeClock::default();
-        let policy = RetryPolicy {
-            poll_interval: Duration::from_millis(8),
-            sleep_between: Duration::from_millis(5),
-        };
+        let clock = FakeClock::new();
         let mut sleeps = Vec::new();
 
         let mut attempts = 0;
 
-        let result: Result<Option<i32>> = retry_capture_with_clock(
-            Duration::from_millis(10),
-            &policy,
-            |poll| {
+        let result: Result<Option<i32>> = capture_within_clock(
+            clock.deadline(Duration::from_millis(105)),
+            |attempt| {
                 attempts += 1;
-                assert_eq!(poll, Duration::from_millis(8));
+                assert_eq!(clock.timeout(attempt), POLL_INTERVAL);
                 // An early return, 1 ms short of the attempt's timeout.
-                clock.advance(Duration::from_millis(7));
+                clock.advance(Duration::from_millis(99));
                 Ok(None)
             },
-            || clock.elapsed(),
+            || clock.now(),
             |sleep| {
                 sleeps.push(sleep);
                 clock.advance(sleep);
@@ -3242,7 +3229,7 @@ mod tests {
 
         assert!(result.unwrap().is_none());
         assert_eq!(attempts, 1);
-        assert_eq!(sleeps, [Duration::from_millis(3)]);
+        assert_eq!(sleeps, [Duration::from_millis(6)]);
     }
 
     #[test]
@@ -3250,18 +3237,18 @@ mod tests {
         // Every attempt waits out its timeout, as when no frame is sent: the
         // next attempt starts at once, so a frame arriving in between is taken
         // without a pause.
-        let clock = FakeClock::default();
+        let clock = FakeClock::new();
         let mut polls = Vec::new();
 
-        let result: Result<Option<i32>> = retry_capture_with_clock(
-            Duration::from_millis(250),
-            &RetryPolicy::default(),
-            |poll| {
+        let result: Result<Option<i32>> = capture_within_clock(
+            clock.deadline(Duration::from_millis(250)),
+            |attempt| {
+                let poll = clock.timeout(attempt);
                 polls.push(poll);
                 clock.advance(poll);
                 Ok(None)
             },
-            || clock.elapsed(),
+            || clock.now(),
             |_| panic!("an attempt that waited out its timeout must not be followed by a pause"),
         );
 
@@ -3281,23 +3268,22 @@ mod tests {
     fn retry_pauses_only_after_an_early_return() {
         // Warm-up: the SDK returns 3 ms into the first attempt and at once on
         // the second, then waits out the third, and the fourth delivers.
-        let clock = FakeClock::default();
+        let clock = FakeClock::new();
         let mut polls = Vec::new();
         let mut sleeps = Vec::new();
         let waits = [3, 0, 100].map(Duration::from_millis);
 
-        let result = retry_capture_with_clock(
-            Duration::from_secs(1),
-            &RetryPolicy::default(),
-            |poll| {
+        let result = capture_within_clock(
+            clock.deadline(Duration::from_secs(1)),
+            |attempt| {
                 let Some(wait) = waits.get(polls.len()).copied() else {
                     return Ok(Some(42));
                 };
-                polls.push(poll);
+                polls.push(clock.timeout(attempt));
                 clock.advance(wait);
                 Ok(None)
             },
-            || clock.elapsed(),
+            || clock.now(),
             |sleep| {
                 sleeps.push(sleep);
                 clock.advance(sleep);
@@ -3306,28 +3292,57 @@ mod tests {
 
         assert_eq!(result.unwrap(), Some(42));
         assert_eq!(polls, [Duration::from_millis(100); 3]);
-        assert_eq!(sleeps, [Duration::from_millis(10); 2]);
+        assert_eq!(sleeps, [EARLY_RETURN_PAUSE; 2]);
         // One deadline for the whole call: 3 + 10 + 0 + 10 + 100 ms.
         assert_eq!(clock.elapsed(), Duration::from_millis(123));
+    }
+
+    #[test]
+    fn every_attempt_ends_within_one_poll_interval_and_the_callers_deadline() {
+        // Early returns, full waits and overruns alike: no attempt may hold
+        // the capture guard longer than one poll interval, nor past the end
+        // of the caller's budget.
+        let clock = FakeClock::new();
+        let deadline = clock.deadline(Duration::from_millis(1000));
+        let waits = [3, 100, 0, 130, 100, 40].map(Duration::from_millis);
+        let mut attempts = 0;
+
+        let result: Result<Option<i32>> = capture_within_clock(
+            deadline,
+            |attempt| {
+                assert!(attempt.0.end() <= deadline.end());
+                assert!(attempt.0.end() <= clock.now() + POLL_INTERVAL);
+                clock.advance(waits[attempts % waits.len()]);
+                attempts += 1;
+                Ok(None)
+            },
+            || clock.now(),
+            |sleep| clock.advance(sleep),
+        );
+
+        assert!(result.unwrap().is_none());
+        assert!(attempts > waits.len(), "{attempts} attempts");
+        assert!(clock.elapsed() >= Duration::from_millis(1000));
     }
 
     #[test]
     fn retry_timeout_counts_time_spent_before_the_first_attempt() {
         // A caller's 50 ms budget of which 30 ms went before the retry began,
         // as when an async capture waited for a blocking-pool thread.
-        let clock = FakeClock::default();
+        let clock = FakeClock::new();
+        let deadline = clock.deadline(Duration::from_millis(50));
         clock.advance(Duration::from_millis(30));
         let mut polls = Vec::new();
 
-        let result: Result<Option<i32>> = retry_capture_with_clock(
-            Duration::from_millis(50),
-            &RetryPolicy::default(),
-            |poll| {
+        let result: Result<Option<i32>> = capture_within_clock(
+            deadline,
+            |attempt| {
+                let poll = clock.timeout(attempt);
                 polls.push(poll);
                 clock.advance(poll);
                 Ok(None)
             },
-            || clock.elapsed(),
+            || clock.now(),
             |_| panic!("an expired budget should not sleep"),
         );
 
@@ -3338,18 +3353,18 @@ mod tests {
 
     #[test]
     fn retry_with_a_spent_budget_makes_one_nonblocking_attempt() {
-        let clock = FakeClock::default();
+        let clock = FakeClock::new();
+        let deadline = clock.deadline(Duration::from_millis(50));
         clock.advance(Duration::from_millis(70));
         let mut polls = Vec::new();
 
-        let result: Result<Option<i32>> = retry_capture_with_clock(
-            Duration::from_millis(50),
-            &RetryPolicy::default(),
-            |poll| {
-                polls.push(poll);
+        let result: Result<Option<i32>> = capture_within_clock(
+            deadline,
+            |attempt| {
+                polls.push(clock.timeout(attempt));
                 Ok(None)
             },
-            || clock.elapsed(),
+            || clock.now(),
             |_| panic!("a spent budget should not sleep"),
         );
 
@@ -3358,16 +3373,15 @@ mod tests {
     }
 
     #[test]
-    fn retry_capture_measures_the_callers_budget() {
+    fn capture_within_measures_the_callers_budget() {
         let deadline = Deadline::after(Duration::from_millis(20)).unwrap();
         std::thread::sleep(Duration::from_millis(5));
         let mut polls = Vec::new();
 
-        let result: Result<Option<i32>> =
-            retry_capture(deadline, &RetryPolicy::default(), |poll| {
-                polls.push(poll);
-                Ok(None)
-            });
+        let result: Result<Option<i32>> = capture_within(deadline, |attempt| {
+            polls.push(attempt.0.remaining());
+            Ok(None)
+        });
 
         assert!(result.unwrap().is_none());
         assert!(!polls.is_empty());
@@ -3379,12 +3393,11 @@ mod tests {
 
     #[test]
     fn retry_succeeds_after_retry_before_timeout() {
-        let clock = FakeClock::default();
+        let clock = FakeClock::new();
         let attempts = Cell::new(0);
 
-        let result = retry_capture_with_clock(
-            Duration::from_millis(50),
-            &RetryPolicy::default(),
+        let result = capture_within_clock(
+            clock.deadline(Duration::from_millis(50)),
             |_| {
                 attempts.set(attempts.get() + 1);
                 if attempts.get() == 1 {
@@ -3393,7 +3406,7 @@ mod tests {
                     Ok(Some(42))
                 }
             },
-            || clock.elapsed(),
+            || clock.now(),
             |sleep| clock.advance(sleep),
         );
 
@@ -3403,18 +3416,17 @@ mod tests {
 
     #[test]
     fn retry_propagates_error() {
-        let clock = FakeClock::default();
+        let clock = FakeClock::new();
         let attempts = Cell::new(0);
         let mut sleeps = Vec::new();
 
-        let result: Result<Option<i32>> = retry_capture_with_clock(
-            Duration::from_secs(1),
-            &RetryPolicy::default(),
+        let result: Result<Option<i32>> = capture_within_clock(
+            clock.deadline(Duration::from_secs(1)),
             |_| {
                 attempts.set(attempts.get() + 1);
                 Err(Error::CaptureFailed("test error".into()))
             },
-            || clock.elapsed(),
+            || clock.now(),
             |sleep| sleeps.push(sleep),
         );
 
