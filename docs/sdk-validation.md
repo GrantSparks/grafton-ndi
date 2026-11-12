@@ -168,6 +168,72 @@ torn video frame, no invalid audio sample and no error.
 multi-thread run against every runtime the tests use. Runtimes for other
 platforms were not measured.
 
+### Discovery Server objects
+
+The Discovery Server advertisers and listeners need NDI 6.4.0 because of a
+measured defect of the 6.3.2 runtime, not only because the vendor's change
+notes list a fix. On Linux x86_64, in a private network namespace with the
+SDK's own Discovery Server on loopback, a C harness created and destroyed each
+of the four objects repeatedly in seven scenarios:
+- with no server;
+- connected;
+- destroyed within 2 ms of creation;
+- advertisers with registered senders or receivers, removed first or not;
+- listeners with subscriptions and events flowing;
+- eight threads destroying at once;
+- the server killed or restarted first.
+
+| Runtime | Destroys | Process aborted |
+| --- | --- | --- |
+| Standard 6.3.2 | 454,194 | 2,486 |
+| Advanced 6.3.2 | 202,750 | 2,250 |
+| Standard 6.4.0.2 | 847,530 | 0 |
+| Advanced 6.4.0.2 | 838,487 | 0 |
+
+Every abort on 6.3.2 was "pure virtual method called", raised on an SDK thread
+while the destroy call was in progress:
+- it happened with every object type and in every scenario that had a live
+  server connection;
+- it never happened without a server;
+- destroying an object soon after creating it is enough.
+
+None of these workarounds made it safe:
+- removing registrations first;
+- waiting for a settled connection;
+- serializing every destroy;
+- destroying on a dedicated thread;
+- delaying the destroy;
+- keeping objects for reuse instead of destroying them. This one fails
+  differently: an exit with live objects can itself crash 6.3.2.
+
+Never destroying them leaks about three threads and four descriptors per
+object. The crate therefore refuses the four objects before 6.4.0.
+
+Three defects remain in 6.4.0.2, observed the same way. The crate cannot
+prevent them; the documentation of the affected methods says how to stay clear
+of them.
+- **Listener crash on a quick move.** A listener on the server crashes when
+  the same sender or receiver is removed from one advertiser and added to
+  another on the same server within about 20 ms.
+  - With the listener in a second process, it crashed in 10 of 12 runs on
+    6.4.0.2 and 4 of 6 on 6.3.2.
+  - No crash with moves 200 ms or 1 s apart (about 4,800 and 970 moves), nor
+    when the first advertiser was dropped before the second registration
+    (17,390 moves).
+- **Receiver connect blocked by an unsubscribe.** `NDIlib_recv_connect` can
+  block for good in a receiver registered with a receiver advertiser when a
+  listener unsubscribes from that receiver's events while it connects. The
+  listener can be in the same process or another.
+  - There were 15 permanent blocks in 12 campaigns across 6.3.2 and 6.4.0.2.
+  - None occurred in about 15,400 connects when the listeners were dropped
+    without unsubscribing.
+  - A listener of this crate unsubscribes only when asked to.
+- **Rare send-advertiser destroy hang.** `NDIlib_send_advertiser_destroy`
+  blocked for good once, waiting on one of the advertiser's own threads, in
+  about 1.1 million destroys on 6.4.0.2 under heavy load.
+
+No test repeats these measurements.
+
 Tests of `FileRecorder::reset` check that it returns the old session's report
 without claiming that the files were finalized, that late events of the old
 session do not reach later ones, and that the original recorder stays usable

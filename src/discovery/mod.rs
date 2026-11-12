@@ -10,10 +10,32 @@
 //! * [`SendListener`] and [`RecvListener`] list what is registered, subscribe
 //!   to events, and — for receivers that allow it — request a source change.
 //!
-//! All four need an NDI 6.4.0 or later runtime; earlier runtimes can crash
-//! when these objects are destroyed, so their constructors return
+//! All four need an NDI 6.4.0 or later runtime, so their constructors return
 //! [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
-//! there. [`Ndi::capabilities`](crate::Ndi::capabilities) reports each one.
+//! before that. [`Ndi::capabilities`](crate::Ndi::capabilities) reports each
+//! one. A 6.3.2 runtime exports their functions, but destroying any of them
+//! while it is connected to a server aborts the process, and no order of
+//! calls avoids it.
+//!
+//! # SDK defects that remain in 6.4
+//!
+//! Three defects of the NDI 6.4.0.2 runtime involve these objects. The crate
+//! cannot prevent them, but none needs more than a little care to avoid:
+//!
+//! * Moving one sender or receiver from one advertiser to another on the same
+//!   server within a few tens of milliseconds can crash a listener on that
+//!   server, in any process. Wait a second between unregistering and
+//!   registering again, or drop the first advertiser before registering with
+//!   the second.
+//! * A [`RecvListener::unsubscribe`] can permanently block the connect of the
+//!   receiver it names, in this process or another, when that receiver
+//!   connects at the same moment. To stop receiving a receiver's events, drop
+//!   the listener; this crate's listeners never unsubscribe on their own.
+//! * Destroying a [`SendAdvertiser`] blocked forever once in about a million
+//!   destroys under heavy load.
+//!
+//! The measurements are in the
+//! [SDK validation record](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/sdk-validation.md#discovery-server-objects).
 //!
 //! The native owners are [`Send`] but not [`Sync`]. Snapshots and events are
 //! plain owned data.

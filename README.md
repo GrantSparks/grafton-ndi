@@ -39,7 +39,7 @@ The crate checks what the selected runtime provides before it calls into it. An 
 | Advanced SDK operations (`advanced` feature), with an Advanced runtime | Not tested | Yes | Yes |
 | File API (`file-io` feature) | No | No | Yes |
 
-The 6.3.2 runtime exports the Discovery Server functions, but runtimes before 6.4.0 can crash when those objects are destroyed, so the crate refuses them there. The File library first ships with the 6.4 SDK. On Linux, macOS and Android it works only beside the Advanced runtime.
+The 6.3.2 runtime exports the Discovery Server functions, but destroying an advertiser or listener there while it is connected to a server aborts the process, measured in every object type and with no call order that avoids it, so the crate refuses them before 6.4.0. [SDK validation](docs/sdk-validation.md#discovery-server-objects) records the measurement and three rarer defects that 6.4 still has. The File library first ships with the 6.4 SDK. On Linux, macOS and Android it works only beside the Advanced runtime.
 
 ### Platforms
 

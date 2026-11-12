@@ -898,6 +898,13 @@ macro_rules! listener_methods {
             self.inner.subscription(id, true)
         }
         /// Ask to stop receiving the events of the peer `id` names.
+        ///
+        /// With the NDI 6.3.2 and 6.4.0.2 runtimes, unsubscribing from a
+        /// receiver can permanently block that receiver's connect, in this
+        /// process or another, when it connects at the same moment: an SDK
+        /// defect the crate cannot prevent. Dropping the listener ends its
+        /// subscriptions without that risk. See the
+        /// [module documentation](super#sdk-defects-that-remain-in-64).
         pub fn unsubscribe(&mut self, id: &$Id) {
             self.inner.subscription(id, false)
         }

@@ -541,6 +541,12 @@ impl SendAdvertiser {
     /// uses as soon as their native sender is destroyed, and a registration
     /// would keep it alive past that.
     ///
+    /// Registering a sender within a few tens of milliseconds of removing it
+    /// from another advertiser on the same server can crash a listener on
+    /// that server, through an SDK defect of NDI 6.3.2 and 6.4.0.2. Wait a
+    /// second, or drop the other advertiser first. See the
+    /// [module documentation](super#sdk-defects-that-remain-in-64).
+    ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidInput`] when this advertiser already
@@ -623,6 +629,14 @@ impl RecvAdvertiser {
     ///
     /// The receiver is not borrowed: it stays fully usable, and may even be
     /// dropped, while it is registered.
+    ///
+    /// Two SDK defects of NDI 6.3.2 and 6.4.0.2 concern a registered receiver.
+    /// Registering it within a few tens of milliseconds of removing it from
+    /// another advertiser on the same server can crash a listener on that
+    /// server; wait a second, or drop the other advertiser first. And a
+    /// listener anywhere that unsubscribes from it while it connects can block
+    /// that connect for good. See the
+    /// [module documentation](super#sdk-defects-that-remain-in-64).
     ///
     /// # Errors
     ///
