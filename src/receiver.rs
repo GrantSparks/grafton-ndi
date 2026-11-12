@@ -2004,6 +2004,15 @@ unsafe impl Send for ReceiverCore {}
 /// Borrowed frame guards retain the receiver borrow until they free their buffers.
 unsafe impl Sync for ReceiverCore {}
 
+// A panic cannot leave a receiver's shared state half-changed: of its locks,
+// two guard `()` and the third one `Option<u32>` that is replaced whole, the
+// rest of its mutable state is atomic, and no application code runs while a
+// lock is held. The `parking_lot` locks do not poison and so do not declare
+// this themselves, which would otherwise leave `Receiver` short of
+// `RefUnwindSafe` and a `RecvAdvertiser`, which keeps registered receivers
+// alive, short of the unwind safety a `SendAdvertiser` has.
+impl std::panic::RefUnwindSafe for ReceiverCore {}
+
 /// A source-name change observed by the native receiver.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
