@@ -1362,12 +1362,12 @@ impl CompressedAudioFrame {
 /// `pointer` is null or a readable NUL-terminated string.
 unsafe fn copy_metadata(pointer: *const c_char) -> Result<Option<CString>> {
     // SAFETY: forwarded to the caller's obligation.
-    let layout = unsafe { crate::frames::validate_frame_metadata(pointer)? };
-    Ok(
-        // SAFETY: the layout was validated for this pointer just above.
-        unsafe { crate::frames::frame_metadata_str(pointer, layout) }
-            .map(|s| CString::new(s).expect("validated frame metadata")),
-    )
+    let text = unsafe { crate::frames::validate_frame_metadata(pointer)? };
+    Ok(text.map(|text| {
+        // SAFETY: the text was validated for this pointer just above.
+        let text = unsafe { text.text(pointer) };
+        CString::new(text).expect("validated frame metadata")
+    }))
 }
 
 /// The bytes of a compressed native frame.

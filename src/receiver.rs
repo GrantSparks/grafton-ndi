@@ -67,7 +67,10 @@ impl RecvStringGuard<'_> {
         }
         // SAFETY: the SDK returned a readable NUL-terminated string, which
         // this guard keeps allocated for as long as it is borrowed.
-        let bytes = unsafe { crate::frames::bounded_sdk_text(self.pointer) }.ok_or_else(|| {
+        let bytes = unsafe {
+            crate::frames::bounded_sdk_text(self.pointer, crate::frames::MAX_METADATA_BYTES)
+        }
+        .ok_or_else(|| {
             Error::UnexpectedSdkResult(format!(
                 "SDK string is missing a NUL terminator within {} bytes",
                 crate::frames::MAX_METADATA_BYTES

@@ -493,8 +493,9 @@ impl Budget {
         // Find the terminator first, so that no reference ever covers bytes
         // beyond the limit.
         let limit = self.0.min(STRING_LIMIT);
-        // SAFETY: every byte before the terminator is readable.
-        let Some(len) = (0..limit).find(|&len| unsafe { *value.add(len) } == 0) else {
+        // SAFETY: every byte up to the terminator is readable for `'a`, and
+        // the scan stops at the terminator or the limit.
+        let Some(bytes) = (unsafe { crate::frames::bounded_sdk_text(value, limit) }) else {
             return Err(if limit == STRING_LIMIT {
                 Error::UnexpectedSdkResult(
                     "a Discovery Server string is longer than the 4 MiB one string may be".into(),
@@ -503,7 +504,7 @@ impl Budget {
                 Self::exceeded()
             });
         };
-        self.take(len + 1)?;
+        self.take(bytes.len() + 1)?;
         // SAFETY: the terminator was found, and the caller keeps the string
         // readable for `'a`.
         Ok(Some(unsafe { CStr::from_ptr(value) }))
@@ -1150,6 +1151,41 @@ mod tests {
                 budget.text(c"a".as_ptr()),
                 Err(Error::UnexpectedSdkResult(_))
             ));
+        }
+    }
+    #[test]
+    fn a_string_is_bounded_by_the_string_limit_and_the_budget() {
+        // The longest string that fits: its terminator is the last byte the
+        // scan may read.
+        let mut longest = vec![b'x'; STRING_LIMIT];
+        longest[STRING_LIMIT - 1] = 0;
+        // One byte longer: its terminator lies just past the limit.
+        let mut too_long = vec![b'x'; STRING_LIMIT + 1];
+        too_long[STRING_LIMIT] = 0;
+
+        // SAFETY: every pointer is a live NUL-terminated string.
+        unsafe {
+            let mut budget = Budget::new();
+            let text = budget.c_str(longest.as_ptr().cast()).unwrap().unwrap();
+            assert_eq!(text.to_bytes().len(), STRING_LIMIT - 1);
+            assert_eq!(budget.0, COPY_LIMIT - STRING_LIMIT);
+
+            let Err(Error::UnexpectedSdkResult(reason)) =
+                Budget::new().c_str(too_long.as_ptr().cast())
+            else {
+                panic!("a string longer than the string limit must be refused");
+            };
+            assert!(reason.contains("4 MiB"), "{reason}");
+
+            // Within a smaller budget, the budget bounds the scan and its
+            // error is the budget's.
+            let mut budget = Budget(4);
+            assert_eq!(budget.c_str(c"abc".as_ptr()).unwrap(), Some(c"abc"));
+            assert_eq!(budget.0, 0);
+            let Err(Error::UnexpectedSdkResult(reason)) = Budget(3).c_str(c"abc".as_ptr()) else {
+                panic!("a string larger than the budget must be refused");
+            };
+            assert!(reason.contains("16 MiB"), "{reason}");
         }
     }
     #[test]

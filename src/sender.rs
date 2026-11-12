@@ -12,8 +12,8 @@ use std::{
 use crate::{
     finder::Source,
     frames::{
-        AudioFrame, MetadataFrame, PixelFormat, ScanType, ValidatedFrameMetadata,
-        ValidatedVideoLayout, VideoFrame, VideoHeader,
+        AudioFrame, MetadataFrame, MetadataText, PixelFormat, ScanType, ValidatedVideoLayout,
+        VideoFrame, VideoHeader,
     },
     receiver::Tally,
     sys::{self, bindings::*},
@@ -296,7 +296,7 @@ pub struct BorrowedVideoFrame<'buf> {
     /// Exactly the validated storage extent.
     data: &'buf [u8],
     metadata: Option<&'buf CStr>,
-    metadata_layout: ValidatedFrameMetadata,
+    metadata_layout: Option<MetadataText>,
 }
 
 impl fmt::Debug for BorrowedVideoFrame<'_> {
@@ -430,13 +430,10 @@ impl<'buf> BorrowedVideoFrame<'buf> {
 
     /// Get cached UTF-8 metadata text, preserving absent versus present-empty.
     pub fn metadata(&self) -> Option<&str> {
-        // SAFETY: Construction validates UTF-8 and retains the same immutable CStr.
-        unsafe {
-            crate::frames::frame_metadata_str(
-                self.metadata.map_or(ptr::null(), CStr::as_ptr),
-                self.metadata_layout,
-            )
-        }
+        let (metadata, text) = self.metadata.zip(self.metadata_layout)?;
+        // SAFETY: Construction validated `text` from this same immutable CStr,
+        // which stays borrowed for `'buf`.
+        Some(unsafe { text.text(metadata.as_ptr()) })
     }
 
     /// Return this frame with `timecode`.
@@ -552,7 +549,7 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
                 layout.data_len_bytes,
             )));
         };
-        let metadata_layout = ValidatedFrameMetadata::from_cstr(self.metadata)?;
+        let metadata_layout = MetadataText::from_cstr(self.metadata)?;
         Ok(BorrowedVideoFrame {
             layout,
             header: VideoHeader {
