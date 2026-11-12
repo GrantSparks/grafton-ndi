@@ -20,7 +20,7 @@ use crate::{
         bindings::*,
     },
     timeout::Deadline,
-    Error, Ndi, QueueAttached, Rejected, Result, Sender, SenderOptions, VideoFrame,
+    Error, Ndi, QueueAttached, QueueLimit, Rejected, Result, Sender, SenderOptions, VideoFrame,
 };
 
 use super::aliasable::AliasableBox;
@@ -419,8 +419,9 @@ impl QueuedSender {
     ///
     /// # Errors
     ///
-    /// Returns the frame with [`Error::InvalidInput`] when a limit in
-    /// [`QueueOptions`] is reached (collect completed frames and try again),
+    /// Returns the frame with [`Error::QueueFull`] when the frame would take
+    /// the queue past a limit in [`QueueOptions`] ([`QueueLimit::Frames`] or
+    /// [`QueueLimit::Bytes`]; collect completed frames and submit it again),
     /// with [`Error::UnexpectedSdkResult`] when the queue has failed (see
     /// [`completion_protocol_failed`](Self::completion_protocol_failed)),
     /// with [`Error::UnsupportedCapability`] when the runtime cannot send an
@@ -459,16 +460,10 @@ impl QueuedSender {
                 .checked_add(bytes)
                 .filter(|total| *total <= state.options.bytes)
             else {
-                return Err(failure(
-                    Error::InvalidInput("queued video byte limit reached".into()),
-                    frame,
-                ));
+                return Err(failure(Error::QueueFull(QueueLimit::Bytes), frame));
             };
             if state.entries.len() >= state.options.frames {
-                return Err(failure(
-                    Error::InvalidInput("queued video frame limit reached".into()),
-                    frame,
-                ));
+                return Err(failure(Error::QueueFull(QueueLimit::Frames), frame));
             }
             if key == 0 || state.entries.contains_key(&key) {
                 return Err(failure(

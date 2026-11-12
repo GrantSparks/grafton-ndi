@@ -195,16 +195,30 @@ pub enum Error {
     /// library path, a receive delay above two seconds, a PTZ value outside
     /// its range, malformed Advanced configuration JSON, more than one
     /// Discovery Server for a listener, allocator limits that cannot all be
-    /// reached, a queue limit that has been reached, a registration handed to
-    /// an advertiser that did not issue it, a compressed video format, an
-    /// allocation stride or buffer, an AV sync or clock quantity or a remote
-    /// control value out of the range the SDK accepts, or a File API name,
-    /// path or option the File library cannot take. The message says which value and why, and nothing reaches the
+    /// reached, a registration handed to an advertiser that did not issue it,
+    /// a compressed video format, an allocation stride or buffer, an AV sync
+    /// or clock quantity or a remote control value out of the range the SDK
+    /// accepts, or a File API name, path or option the File library cannot
+    /// take. The message says which value and why, and nothing reaches the
     /// SDK, with one exception: the SDK creates a Discovery Server advertiser
     /// or listener for any address it can parse, so when it creates none, the
     /// address it was given, or the lack of one, is reported here.
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    /// A bounded queue is full. The same call can succeed once queued work
+    /// has completed, with nothing else changed; the [`QueueLimit`] says
+    /// which queue and limit.
+    ///
+    /// * `advanced::QueuedSender::try_submit`, when the frame would take the
+    ///   queue past its frame limit ([`QueueLimit::Frames`]) or its byte limit
+    ///   ([`QueueLimit::Bytes`]). The frame comes back in the `Rejected`;
+    ///   collect completed frames and submit it again.
+    /// * Every operation of an async File handle except a request to stop,
+    ///   when the handle's command queue is full
+    ///   ([`QueueLimit::FileCommands`]).
+    #[error("Queue full: {0}")]
+    QueueFull(QueueLimit),
 
     /// A value the SDK returned, other than a frame, breaks the SDK's
     /// documented contract, or exceeds a limit this crate places on what it
@@ -311,6 +325,34 @@ pub enum Error {
     Io(#[from] std::io::Error),
 }
 
+/// Which bounded queue was full, carried by [`Error::QueueFull`].
+///
+/// Its `Display` text is for diagnostics; match on the variant rather than
+/// the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum QueueLimit {
+    /// An Advanced `QueuedSender` already holds as many frames as its
+    /// `QueueOptions::max_frames` allows.
+    Frames,
+    /// The frame would take an Advanced `QueuedSender` past its
+    /// `QueueOptions::max_bytes`.
+    Bytes,
+    /// An async File handle already has as many commands waiting as its
+    /// `AsyncFileOptions::command_capacity` allows.
+    FileCommands,
+}
+
+impl fmt::Display for QueueLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Frames => "queued video frame limit reached",
+            Self::Bytes => "queued video byte limit reached",
+            Self::FileCommands => "File command queue is full",
+        })
+    }
+}
+
 /// Why a capability is unavailable, followed by its evidence when there is any.
 struct Unavailability<'a>(&'a CapabilityUnavailable, &'a str);
 
@@ -398,5 +440,19 @@ mod tests {
         assert!(listed.ends_with("the receiver it lists does not accept this request"));
         assert!(unlisted.contains("no receiver with this identifier"));
         assert!(!listed.contains("capability") && !unlisted.contains("capability"));
+    }
+
+    #[test]
+    fn a_full_queue_names_its_limit() {
+        for (limit, text) in [
+            (QueueLimit::Frames, "queued video frame limit reached"),
+            (QueueLimit::Bytes, "queued video byte limit reached"),
+            (QueueLimit::FileCommands, "File command queue is full"),
+        ] {
+            assert_eq!(
+                Error::QueueFull(limit).to_string(),
+                format!("Queue full: {text}")
+            );
+        }
     }
 }

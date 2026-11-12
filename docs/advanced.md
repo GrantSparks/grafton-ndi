@@ -342,10 +342,12 @@ reports it sent, so submission does not wait for a slow connection.
 - `QueueOptions` bounds the queue by frame count and by bytes. A frame counts
   from submission until the application takes it back. The defaults are 8
   frames and 512 MiB.
-- `try_submit` returns a `SubmissionId`, or returns the frame in a `Rejected`
-  when a limit is reached or the frame cannot be sent, including an
-  uncompressed pixel format the runtime cannot send, which it checks as
-  `Sender::send_video` does. Collect completed frames and submit again.
+- `try_submit` returns a `SubmissionId`, or returns the frame in a `Rejected`.
+  Its error is `Error::QueueFull` when the frame would take the queue past its
+  frame or byte limit (`QueueLimit::Frames` or `QueueLimit::Bytes`): collect
+  completed frames and submit it again. Any other error means the frame cannot
+  be sent, for example an uncompressed pixel format the runtime cannot send,
+  which it checks as `Sender::send_video` does.
 - `try_take_completed` and `wait_completed` return completed frames on the
   application's thread. No application code runs on an SDK thread.
 - `from_sender` converts an existing `Sender`. It returns the frame the sender

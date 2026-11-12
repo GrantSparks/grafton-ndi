@@ -356,7 +356,10 @@ fn child(case: &str) {
         }
         #[cfg(feature = "advanced")]
         "queue_immediate" => {
-            use grafton_ndi::advanced::{QueueOptions, QueuedSender};
+            use grafton_ndi::{
+                advanced::{QueueOptions, QueuedSender},
+                QueueLimit,
+            };
             let mut queue = QueuedSender::new(
                 &ndi,
                 &SenderOptions::new("queue"),
@@ -366,7 +369,8 @@ fn child(case: &str) {
             let id = queue.try_submit(frame()).unwrap();
             assert_eq!(queue.retained_frames(), 1);
             let rejected = queue.try_submit(frame()).unwrap_err();
-            let (_, rejected_frame) = rejected.into_parts();
+            let (error, rejected_frame) = rejected.into_parts();
+            assert!(matches!(error, Error::QueueFull(QueueLimit::Frames)));
             let completed = queue.wait_completed(Duration::ZERO).unwrap().unwrap();
             assert_eq!(completed.id(), id);
             assert_eq!(queue.retained_frames(), 0);
@@ -377,6 +381,20 @@ fn child(case: &str) {
             assert_eq!(log().matches("sender-completion\n").count(), 2);
             assert_eq!(log().matches("sender-submit-return\n").count(), 2);
             assert_eq!(log().matches("sender-destroy\n").count(), 1);
+            // A frame larger than the byte limit is handed back unsent.
+            let mut small = QueuedSender::new(
+                &ndi,
+                &SenderOptions::new("queue"),
+                QueueOptions::default().max_bytes(1),
+            )
+            .unwrap();
+            let rejected = small.try_submit(frame()).unwrap_err();
+            assert!(matches!(
+                rejected.error(),
+                Error::QueueFull(QueueLimit::Bytes)
+            ));
+            assert_eq!(small.retained_frames(), 0);
+            assert_eq!(log().matches("sender-submit-return\n").count(), 2);
         }
         #[cfg(feature = "advanced")]
         "queue_destroy" => {

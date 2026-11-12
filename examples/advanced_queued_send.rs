@@ -36,7 +36,7 @@ fn main() -> Result<(), Error> {
         };
         match sender.try_submit(frame) {
             Ok(id) => println!("Frame {number} queued as submission {}", id.get()),
-            Err(rejected) => {
+            Err(rejected) if matches!(rejected.error(), Error::QueueFull(_)) => {
                 // The queue is full: the frame comes back, and is kept for later.
                 println!("Frame {number} not queued: {rejected}");
                 spare.push(rejected.into_inner());
@@ -44,6 +44,8 @@ fn main() -> Result<(), Error> {
                     spare.push(done.into_frame());
                 }
             }
+            // Any other rejection would not succeed by waiting.
+            Err(rejected) => return Err(rejected.into_error()),
         }
         thread::sleep(Duration::from_millis(16));
     }

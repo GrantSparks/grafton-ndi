@@ -37,8 +37,6 @@ pub enum StateError {
     /// during a session: the next file would have the same name. Use a
     /// filename pattern with `{index}`.
     ExactFileName,
-    /// The async handle's command queue is full.
-    QueueFull,
     /// Another waiter is already pending on the async handle: another event
     /// future, or another close.
     WaiterPending,
@@ -55,14 +53,14 @@ pub enum StateError {
 
 impl StateError {
     /// Whether the same call can succeed later without anything else changing
-    /// on this handle: true only for [`QueueFull`](Self::QueueFull), once
-    /// queued commands have run, and [`WaiterPending`](Self::WaiterPending),
-    /// once the other waiter has finished.
+    /// on this handle: true only for [`WaiterPending`](Self::WaiterPending),
+    /// once the other waiter has finished. A full command queue, which can
+    /// also succeed later, is [`Error::QueueFull`](crate::Error::QueueFull).
     ///
     /// The other states change only through another call, such as finishing a
     /// session, or never, for a handle that is closed.
     pub fn is_retryable(self) -> bool {
-        matches!(self, Self::QueueFull | Self::WaiterPending)
+        matches!(self, Self::WaiterPending)
     }
 }
 
@@ -79,7 +77,6 @@ impl std::fmt::Display for StateError {
             Self::ExactFileName => {
                 "a recorder with an exact file name cannot switch to a new file during a session"
             }
-            Self::QueueFull => "File command queue is full",
             Self::WaiterPending => "another File waiter is already pending",
             Self::Closed => "File owner has closed",
             Self::OwnerFailed => "File owner thread failed",
@@ -1651,7 +1648,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_full_queue_or_a_pending_waiter_is_retryable() {
+    fn only_a_pending_waiter_is_retryable() {
         use StateError::*;
         for (state, retryable) in [
             (PreviousSessionOpen, false),
@@ -1660,7 +1657,6 @@ mod tests {
             (Stopping, false),
             (NotRecording, false),
             (ExactFileName, false),
-            (QueueFull, true),
             (WaiterPending, true),
             (Closed, false),
             (OwnerFailed, false),
@@ -1674,10 +1670,6 @@ mod tests {
         assert_eq!(
             StateError::PreviousSessionOpen.to_string(),
             "finish the previous session before starting another"
-        );
-        assert_eq!(
-            StateError::QueueFull.to_string(),
-            "File command queue is full"
         );
         assert_eq!(
             Error::InvalidState(StateError::Stopping).to_string(),

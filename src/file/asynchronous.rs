@@ -12,7 +12,7 @@ use super::{
     RecorderState, RecorderStats, RecordingReport, RecordingTarget, RecordingTimecode,
     SourceFormat, SourceSpec, StateError, StopRequest,
 };
-use crate::{timeout::Deadline, Error, MetadataFrame, Result, Source, Timecode};
+use crate::{timeout::Deadline, Error, MetadataFrame, QueueLimit, Result, Source, Timecode};
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
@@ -67,8 +67,8 @@ impl AsyncFileOptions {
     }
 
     /// Set how many commands may wait for the owner thread. A command
-    /// submitted to a full queue fails at once with
-    /// [`StateError::QueueFull`], except a request to stop, which is always
+    /// submitted to a full queue fails at once with [`Error::QueueFull`] and
+    /// [`QueueLimit::FileCommands`], except a request to stop, which is always
     /// accepted so that it cannot be lost.
     #[must_use]
     pub fn command_capacity(mut self, capacity: usize) -> Self {
@@ -120,10 +120,11 @@ struct Response<T> {
 ///
 /// # Errors
 ///
-/// Besides the operation's own errors, every operation can fail with
-/// [`Error::InvalidState`]: with [`StateError::QueueFull`] when the
-/// handle's command queue is full, with [`StateError::Closed`] when the
-/// handle has been closed or its thread stopped normally before carrying the
+/// Besides the operation's own errors, every operation except a request to
+/// stop fails with [`Error::QueueFull`] and [`QueueLimit::FileCommands`] when
+/// the handle's command queue is full, and every operation can fail with
+/// [`Error::InvalidState`]: with [`StateError::Closed`] when the handle has
+/// been closed or its thread stopped normally before carrying the
 /// operation out, and with [`StateError::OwnerFailed`] when that thread failed
 /// instead. Once the thread has failed, the operation it was running, every
 /// operation queued behind it and every later one report
@@ -801,7 +802,7 @@ impl<H: Owner> Worker<H> {
         if let Some(waiting) = &waiting {
             if waiting.fetch_add(1, Ordering::AcqRel) >= self.capacity {
                 waiting.fetch_sub(1, Ordering::AcqRel);
-                return FileOperation::failed(Error::InvalidState(StateError::QueueFull));
+                return FileOperation::failed(Error::QueueFull(QueueLimit::FileCommands));
             }
         }
         let (mut reply, future) = operation();
@@ -1488,7 +1489,7 @@ mod tests {
                 owner.counter += 100;
                 Ok(())
             })),
-            Err(Error::InvalidState(StateError::QueueFull))
+            Err(Error::QueueFull(QueueLimit::FileCommands))
         ));
         release_tx.send(()).unwrap();
         block_on(blocker).unwrap();
@@ -1696,7 +1697,7 @@ mod tests {
         let queued = recorder.is_recording();
         assert!(matches!(
             block_on(recorder.is_recording()),
-            Err(Error::InvalidState(StateError::QueueFull))
+            Err(Error::QueueFull(QueueLimit::FileCommands))
         ));
         // A stop is not: it must not be lost, even if nobody waits for it.
         drop(recorder.request_stop());

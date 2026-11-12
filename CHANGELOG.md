@@ -249,8 +249,12 @@ as `None`. Most programs need changes; see the
 - `Error::RuntimeLoadFailed`, `Error::RuntimeConflict`,
   `Error::UnsupportedCpu`, `Error::UnsupportedCapability`,
   `Error::NativeOperationFailed`, `Error::NotConnected`,
-  `Error::UnexpectedSdkResult`, `Error::ReceiverRequestNotAccepted` and, with
-  the `file-io` feature, `Error::InvalidState`. `UnsupportedCapability` carries
+  `Error::UnexpectedSdkResult`, `Error::ReceiverRequestNotAccepted`,
+  `Error::QueueFull` and, with the `file-io` feature, `Error::InvalidState`.
+  `QueueFull` carries the `QueueLimit` that was reached, an Advanced
+  `QueuedSender`'s frame or byte limit or an async File handle's command
+  queue, and the same call can succeed once queued work has completed.
+  `UnsupportedCapability` carries
   the `RuntimeFeature` and the `CapabilityUnavailable` reason that
   `capabilities()` reports, and a `detail` naming the missing entry point, the
   version the runtime reports against the one required, or the declaration the
@@ -334,7 +338,9 @@ as `None`. Most programs need changes; see the
   operations that would need a second file of the same name, instead of
   letting the SDK end the session. The File API returns the crate's `Error`;
   an operation the current state does not allow is `Error::InvalidState`, whose
-  `StateError` says whether a retry can succeed. On Linux, macOS and Android
+  `StateError` says whether a retry can succeed, and an operation an async
+  handle's full command queue refuses is `Error::QueueFull`. On Linux, macOS
+  and Android
   the File library needs the Advanced SDK runtime. See the
   [File API guide](docs/file-io.md).
 - `FrameSync::audio_input_format` and `AudioInputFormat`: the format of the
