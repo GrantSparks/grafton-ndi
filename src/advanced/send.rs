@@ -433,33 +433,43 @@ pub struct UnsentVideo {
     pub preview: Option<SubmittedVideo>,
 }
 
-/// A frame the SDK may still be using, with the descriptors it was given.
+/// A frame the SDK may still be using, with what it accesses through the
+/// descriptor it was given.
 ///
-/// The entry owns the frame it lent, so nothing can read the frame's bytes
-/// while the SDK may still write to them.
+/// `NDIlib_send_send_video_async_v2` (Processing.NDI.Send.h), whose rules the
+/// scatter variant (Processing.NDI.Advanced.h) follows, reads the video
+/// descriptor during the call: the SDK's own asynchronous sending example
+/// rewrites one descriptor while the previous frame is still in flight. What
+/// the descriptor points to must not be freed or reused until the next
+/// synchronizing event. For a contiguous frame that is its bytes and
+/// metadata. For a scatter frame it is also the scatter list, which no header
+/// says is copied: the `NDIlib_frame_scatter_t` and the pointer and size
+/// arrays it refers to.
+///
+/// The entry owns all of these, so nothing can read the frame's bytes while
+/// the SDK may still write to them.
 struct PendingVideo {
     frame: SubmittedVideo,
-    descriptor: AliasableBox<NDIlib_video_frame_v2_t>,
-    // Kept only so that the address given to the SDK stays valid.
+    // The scatter list of a scatter frame, kept only so that the address
+    // given to the SDK stays valid. Its arrays belong to the frame.
     _scatter: Option<AliasableBox<FrameScatter>>,
 }
 
-// SAFETY: the descriptors point only into allocations this entry owns, and
+// SAFETY: the scatter list points only into allocations this entry owns, and
 // moving the entry moves none of them. Until the sender that owns the entry
 // takes the frame back, once the SDK has finished with it, only the SDK reads
 // or writes those allocations.
 unsafe impl Send for PendingVideo {}
 
 impl PendingVideo {
-    fn contiguous(mut frame: CompressedVideoFrame) -> Self {
+    fn contiguous(frame: CompressedVideoFrame) -> Self {
         Self {
-            descriptor: AliasableBox::new(Box::new(frame.raw())),
-            _scatter: None,
             frame: SubmittedVideo::Contiguous(frame),
+            _scatter: None,
         }
     }
 
-    /// The entry for a scatter frame, and the address of its block descriptor,
+    /// The entry for a scatter frame, and the address of its scatter list,
     /// which stays valid for as long as the entry does.
     fn scatter(
         mut frame: ScatterVideoFrame,
@@ -468,11 +478,21 @@ impl PendingVideo {
         let scatter = AliasableBox::new(Box::new(frame.storage.descriptor(table)));
         let address = scatter.as_ptr();
         let pending = Self {
-            descriptor: AliasableBox::new(Box::new(frame.descriptor())),
-            _scatter: Some(scatter),
             frame: SubmittedVideo::Scatter(frame),
+            _scatter: Some(scatter),
         };
         (pending, address)
+    }
+
+    /// The video descriptor to submit this entry with, which the SDK reads
+    /// only during the call. It lends the frame's bytes, or for a scatter
+    /// frame only its metadata, so the entry must be kept for as long as the
+    /// SDK may access them.
+    fn descriptor(&mut self) -> NDIlib_video_frame_v2_t {
+        match &mut self.frame {
+            SubmittedVideo::Contiguous(frame) => frame.raw(),
+            SubmittedVideo::Scatter(frame) => frame.descriptor(),
+        }
     }
 }
 
@@ -491,12 +511,12 @@ impl PendingStreams {
     /// replaces on the same stream.
     fn submit(
         &mut self,
-        next: PendingVideo,
-        submit: impl FnOnce(&PendingVideo),
+        mut next: PendingVideo,
+        submit: impl FnOnce(&mut PendingVideo),
     ) -> Option<SubmittedVideo> {
         // Both streams' earlier frames stay alive throughout the native call;
         // only the matching stream's frame is released once it has returned.
-        submit(&next);
+        submit(&mut next);
         let slot = match next.frame.format().stream_tier() {
             StreamTier::Program => &mut self.program,
             StreamTier::Preview => &mut self.preview,
@@ -670,10 +690,15 @@ impl CompressedSender {
         Ok(self
             .pending
             .submit(PendingVideo::contiguous(frame), |next| {
-                // SAFETY: the sender is live, and the pending entry owns the
-                // descriptor and the bytes it lends until the SDK has finished
-                // with them.
-                unsafe { core.NDIlib_send_send_video_async_v2(instance, next.descriptor.as_ptr()) }
+                let descriptor = next.descriptor();
+                // SAFETY: the sender is live. The SDK reads the video
+                // descriptor only during this call, so it may be a stack
+                // value. What it points to, the frame's bytes and metadata,
+                // belongs to the pending entry, which the sender keeps until
+                // the SDK has synchronized the frame: until the next
+                // asynchronous send on the same stream has returned, or the
+                // native sender has been destroyed.
+                unsafe { core.NDIlib_send_send_video_async_v2(instance, &descriptor) }
             }))
     }
 
@@ -735,15 +760,17 @@ impl CompressedSender {
         let instance = self.instance();
         let (pending, scatter) = PendingVideo::scatter(frame, table);
         Ok(self.pending.submit(pending, |next| {
-            // SAFETY: the sender is live, and the pending entry owns both
-            // descriptors and the blocks they lend until the SDK has finished
-            // with them.
+            let descriptor = next.descriptor();
+            // SAFETY: the sender is live. The SDK reads the video descriptor
+            // only during this call, so it may be a stack value. What the two
+            // descriptors point to, the frame's metadata and the scatter list
+            // at `scatter` with its pointer and size arrays and the blocks
+            // they name, belongs to the pending entry, which the sender keeps
+            // until the SDK has synchronized the frame: until the next
+            // asynchronous send on the same stream has returned, or the
+            // native sender has been destroyed.
             native!(ScatterSend, table => unsafe {
-                table.NDIlib_send_send_video_scatter_async(
-                    instance,
-                    next.descriptor.as_ptr(),
-                    scatter,
-                )
+                table.NDIlib_send_send_video_scatter_async(instance, &descriptor, scatter)
             })
         }))
     }
@@ -1071,6 +1098,48 @@ mod tests {
         assert_eq!(bytes_at::<1>(&blocks, 6), None);
     }
 
+    /// The SDK reads an asynchronous send's video descriptor during the call,
+    /// so a submission retains what the descriptor points to and not the
+    /// descriptor: the frame, and for a scatter frame its scatter list.
+    #[test]
+    fn async_submission_retains_what_the_descriptor_points_to() {
+        let (format, bytes) = h264();
+        let frame = CompressedVideoFrame::new(format, bytes.clone()).unwrap();
+        let data = frame.data().as_ptr();
+        let mut streams = PendingStreams::default();
+        let (returned, allocations) = crate::test_alloc::allocation_count(|| {
+            streams.submit(PendingVideo::contiguous(frame), |next| {
+                assert_eq!(next.descriptor().p_data.cast_const(), data);
+            })
+        });
+        assert!(returned.is_none());
+        assert_eq!(allocations, 0);
+
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
+        };
+        let table = ndi.table::<ScatterSend>().unwrap();
+        let frame = ScatterVideoFrame::new(format, split(&bytes, &[44])).unwrap();
+        let pointers = frame.storage.pointers.as_ptr().cast::<*const u8>();
+        let sizes = frame.storage.sizes.as_ptr().cast::<i32>();
+        let ((pending, scatter), allocations) =
+            crate::test_alloc::allocation_count(|| PendingVideo::scatter(frame, table));
+        // The scatter list is the only new allocation: its arrays belong to
+        // the frame.
+        assert_eq!(allocations, 1);
+        let mut streams = PendingStreams::default();
+        assert!(streams.submit(pending, |_| {}).is_none());
+        assert!(streams.program.is_some());
+        // Moving the entry into its stream leaves the list where the SDK was
+        // told it is, still naming the frame's arrays.
+        native!(ScatterSend, table => {
+            // SAFETY: the stream retains the entry, which owns the list.
+            let list = unsafe { &*scatter };
+            assert_eq!(list.p_data_blocks.cast::<*const u8>(), pointers);
+            assert_eq!(list.p_data_blocks_size.cast::<i32>(), sizes);
+        });
+    }
+
     #[test]
     fn async_storage_is_retained_per_tier_through_native_submission() {
         let (format, bytes) = h264();
@@ -1080,19 +1149,20 @@ mod tests {
             )
         };
         let mut streams = PendingStreams::default();
-        let first = make(StreamTier::Program);
-        let old_program_data = first.descriptor.p_data;
-        let old_program_header = first.descriptor.as_ptr();
-        assert!(streams.submit(first, |_| {}).is_none());
+        let mut old_program_data = ptr::null_mut();
+        assert!(streams
+            .submit(make(StreamTier::Program), |next| {
+                old_program_data = next.descriptor().p_data;
+            })
+            .is_none());
         assert!(streams
             .submit(make(StreamTier::Preview), |_| {
-                // The earlier program descriptor and bytes survive both moving
-                // their owners and a preview submission, as the SDK requires,
-                // and the SDK can still write to the bytes.
-                unsafe {
-                    assert_eq!((*old_program_header).p_data, old_program_data);
-                    old_program_data.add(24).write(9);
-                }
+                // The earlier program bytes survive both moving their owner
+                // and a preview submission, as the SDK requires of what an
+                // asynchronous frame accesses, and the SDK can still write to
+                // them. The descriptor itself is not kept: the SDK read it
+                // during its call.
+                unsafe { old_program_data.add(24).write(9) };
             })
             .is_none());
         let returned = streams.submit(make(StreamTier::Program), |_| {}).unwrap();
@@ -1100,6 +1170,8 @@ mod tests {
         let SubmittedVideo::Contiguous(returned) = returned else {
             panic!("a contiguous frame was submitted");
         };
+        // The same allocation the SDK was lent comes back.
+        assert_eq!(returned.data().as_ptr(), old_program_data.cast_const());
         assert_eq!(returned.data()[24], 9);
         assert_eq!(returned.data()[..24], bytes[..24]);
         assert_eq!(returned.data()[25..], bytes[25..]);

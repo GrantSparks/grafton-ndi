@@ -55,6 +55,7 @@ struct RecvStringGuard<'a> {
     strings: &'a sys::ReceiverStrings,
 }
 impl RecvStringGuard<'_> {
+    /// Copy the string, failing with [`Error::InvalidUtf8`] when it is not UTF-8.
     fn copy(&self) -> Result<Option<String>> {
         // SDK-returned strings are readable and NUL terminated. Reuse the
         // bounded UTF-8 validator; this guard releases even on validation error.
@@ -63,6 +64,26 @@ impl RecvStringGuard<'_> {
             unsafe { crate::frames::FrameMetadata::copy_from_raw_validated(self.pointer, layout) }
                 .map(crate::frames::FrameMetadata::into_string),
         )
+    }
+
+    /// Copy the string, replacing invalid UTF-8 with U+FFFD.
+    ///
+    /// For a value the SDK reports only once, where an error would lose it.
+    /// The scan for the terminator has the same bound as [`Self::copy`], and a
+    /// string without one within it is still an error.
+    fn copy_lossy(&self) -> Result<Option<String>> {
+        if self.pointer.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: the SDK returned a readable NUL-terminated string, which
+        // this guard keeps allocated for as long as it is borrowed.
+        let bytes = unsafe { crate::frames::bounded_sdk_text(self.pointer) }.ok_or_else(|| {
+            Error::InvalidFrame(format!(
+                "SDK string is missing a NUL terminator within {} bytes",
+                crate::frames::MAX_METADATA_BYTES
+            ))
+        })?;
+        Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
     }
 }
 impl Drop for RecvStringGuard<'_> {
@@ -950,6 +971,10 @@ impl<M: ReceiverMode> Receiver<M> {
     /// `None` means no change within the wait budget; `Disconnected` is an
     /// observed change to no source. Concurrent pollers compete for notifications.
     /// This differs from [`Self::source`], the immutable original connection target.
+    ///
+    /// The SDK reports each change once, so a name that is not valid UTF-8 is
+    /// not an error: invalid sequences are replaced with U+FFFD, as
+    /// [`Finder`](crate::Finder) does for discovered source names.
     pub fn poll_source_name_change(&self, timeout: Duration) -> Result<Option<SourceNameChange>> {
         to_ms_checked(timeout)?;
         let deadline = Instant::now() + timeout;
@@ -958,6 +983,15 @@ impl<M: ReceiverMode> Receiver<M> {
             .core
             ._ndi
             .table::<(sys::ReceiverSourceName, sys::ReceiverStrings)>()?;
+        self.poll_source_name_change_until(source_name, strings, deadline)
+    }
+
+    fn poll_source_name_change_until(
+        &self,
+        source_name: &sys::ReceiverSourceName,
+        strings: &sys::ReceiverStrings,
+        deadline: Instant,
+    ) -> Result<Option<SourceNameChange>> {
         let Some(_query) = self.core.source_query_guard.try_lock_until(deadline) else {
             return Ok(None);
         };
@@ -976,7 +1010,9 @@ impl<M: ReceiverMode> Receiver<M> {
         if !changed {
             return Ok(None);
         }
-        Ok(Some(match guard.copy()? {
+        // The SDK reports a change only once, since the previous call, so a
+        // strict decoding error here would lose the name for good.
+        Ok(Some(match guard.copy_lossy()? {
             Some(name) => SourceNameChange::Connected(name),
             None => SourceNameChange::Disconnected,
         }))
@@ -1529,8 +1565,17 @@ impl ReceiverCore {
     }
 
     /// Acquire only within the caller's existing budget, including contention.
-    fn capture_lock_until(&self, deadline: Instant) -> Option<RwLockReadGuard<'_, ()>> {
+    ///
+    /// Every `NDIlib_recv_capture_v3` call on this instance holds this guard,
+    /// so that none overlaps a connect or reconnect.
+    pub(crate) fn capture_lock_until(&self, deadline: Instant) -> Option<RwLockReadGuard<'_, ()>> {
         self.capture_guard.try_read_until(deadline)
+    }
+
+    /// Hold the lock a reconnect holds, so that a test can contend with capture.
+    #[cfg(all(test, feature = "advanced"))]
+    pub(crate) fn reconnect_lock(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
+        self.capture_guard.write()
     }
 
     /// Single zero-copy poll backing every [`Capture::try_capture_ref`].
@@ -2205,8 +2250,103 @@ mod tests {
             strings: &strings,
         };
         assert_eq!(empty.copy().unwrap(), None);
+        assert_eq!(empty.copy_lossy().unwrap(), None);
         drop(empty);
         assert_eq!(FREES.load(Ordering::Relaxed) - before, 3);
+    }
+
+    #[test]
+    fn lossy_receiver_strings_keep_the_terminator_bound() {
+        unsafe extern "C" fn keep(_instance: NDIlib_recv_instance_t, _pointer: *const c_char) {}
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let strings = sys::ReceiverStrings {
+            NDIlib_recv_free_string: keep,
+        };
+        let max = crate::frames::MAX_METADATA_BYTES;
+        let copy = |bytes: &[u8]| {
+            RecvStringGuard {
+                core: &receiver.core,
+                pointer: bytes.as_ptr().cast(),
+                strings: &strings,
+            }
+            .copy_lossy()
+        };
+        assert_eq!(copy(b"\0").unwrap().as_deref(), Some(""));
+        assert_eq!(copy(b"a\xffb\0").unwrap().as_deref(), Some("a\u{FFFD}b"));
+        // Stops at the first terminator.
+        assert_eq!(copy(b"a\0\xff\0").unwrap().as_deref(), Some("a"));
+        // A terminator in the last byte the scan may read is accepted.
+        let mut longest = vec![b'x'; max];
+        longest[max - 1] = 0;
+        assert_eq!(copy(&longest).unwrap().unwrap().len(), max - 1);
+        // Without one, the scan stops at the bound and reports an error.
+        let unterminated = vec![b'x'; max];
+        assert!(matches!(copy(&unterminated), Err(Error::InvalidFrame(_))));
+    }
+
+    #[test]
+    fn a_changed_source_name_that_is_not_utf8_is_still_reported_and_freed_once() {
+        use std::{cell::RefCell, sync::atomic::AtomicUsize};
+        static FREES: AtomicUsize = AtomicUsize::new(0);
+        std::thread_local! {
+            // What the fake SDK reports next: whether the name changed, and
+            // the new name, if any.
+            static NEXT: RefCell<(bool, Option<Vec<u8>>)> = const { RefCell::new((false, None)) };
+        }
+        unsafe extern "C" fn free(_instance: NDIlib_recv_instance_t, pointer: *const c_char) {
+            FREES.fetch_add(1, Ordering::Relaxed);
+            drop(unsafe { CString::from_raw(pointer.cast_mut()) });
+        }
+        unsafe extern "C" fn get_source_name(
+            _instance: NDIlib_recv_instance_t,
+            name: *mut *const c_char,
+            _timeout_in_ms: u32,
+        ) -> bool {
+            let (changed, next) = NEXT.with(|next| next.take());
+            let pointer = next.map_or(ptr::null(), |bytes| {
+                CString::new(bytes).unwrap().into_raw().cast_const()
+            });
+            // SAFETY: the caller passes writable storage for the pointer.
+            unsafe { name.write(pointer) };
+            changed
+        }
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let source_name = sys::ReceiverSourceName {
+            NDIlib_recv_get_source_name: get_source_name,
+        };
+        let strings = sys::ReceiverStrings {
+            NDIlib_recv_free_string: free,
+        };
+        let poll = |changed, name: Option<&[u8]>| {
+            NEXT.with(|next| *next.borrow_mut() = (changed, name.map(<[u8]>::to_vec)));
+            let before = FREES.load(Ordering::Relaxed);
+            let change =
+                receiver.poll_source_name_change_until(&source_name, &strings, Instant::now());
+            (change.unwrap(), FREES.load(Ordering::Relaxed) - before)
+        };
+        assert_eq!(
+            poll(true, Some(b"Studio \xff\xfe camera")),
+            (
+                Some(SourceNameChange::Connected(
+                    "Studio \u{FFFD}\u{FFFD} camera".into()
+                )),
+                1
+            )
+        );
+        assert_eq!(
+            poll(true, Some("Studio é".as_bytes())),
+            (Some(SourceNameChange::Connected("Studio é".into())), 1)
+        );
+        assert_eq!(poll(true, None), (Some(SourceNameChange::Disconnected), 0));
+        // A string returned without a change is still released.
+        assert_eq!(poll(false, Some(b"\xff")), (None, 1));
+        assert_eq!(poll(false, None), (None, 0));
     }
 
     fn test_source() -> Source {

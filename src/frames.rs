@@ -1967,25 +1967,37 @@ pub(crate) unsafe fn validate_frame_metadata(
         });
     }
 
-    let metadata = p_metadata.cast::<u8>();
-    for text_len in 0..MAX_METADATA_BYTES {
-        let byte = unsafe { metadata.add(text_len).read() };
-        if byte == 0 {
-            if text_len > 0 {
-                let payload = unsafe { slice::from_raw_parts(metadata, text_len) };
-                str::from_utf8(payload).map_err(|err| Error::InvalidUtf8(err.to_string()))?;
-            }
+    // SAFETY: forwarded to the caller's obligation for a non-null pointer.
+    let Some(payload) = (unsafe { bounded_sdk_text(p_metadata) }) else {
+        return Err(Error::InvalidFrame(format!(
+            "Frame metadata is missing a NUL terminator within {MAX_METADATA_BYTES} bytes"
+        )));
+    };
+    str::from_utf8(payload).map_err(|err| Error::InvalidUtf8(err.to_string()))?;
+    Ok(ValidatedFrameMetadata {
+        len_with_nul: NonZeroUsize::new(payload.len() + 1),
+        text_len: payload.len(),
+    })
+}
 
-            return Ok(ValidatedFrameMetadata {
-                len_with_nul: NonZeroUsize::new(text_len + 1),
-                text_len,
-            });
-        }
-    }
-
-    Err(Error::InvalidFrame(format!(
-        "Frame metadata is missing a NUL terminator within {MAX_METADATA_BYTES} bytes"
-    )))
+/// The bytes of an SDK string before its first NUL, or `None` when there is
+/// no NUL within the first [`MAX_METADATA_BYTES`] bytes.
+///
+/// The scan reads one byte at a time and stops at the first NUL, so it never
+/// reads past the string, and it reads at most `MAX_METADATA_BYTES` bytes.
+///
+/// # Safety
+///
+/// `text` must be non-null and readable byte-by-byte for `'a` until either
+/// its first NUL or `MAX_METADATA_BYTES` bytes have been read.
+pub(crate) unsafe fn bounded_sdk_text<'a>(text: *const c_char) -> Option<&'a [u8]> {
+    let bytes = text.cast::<u8>();
+    // SAFETY: each byte read is at or before the first NUL and within the
+    // bound, which the caller guarantees readable.
+    let len = (0..MAX_METADATA_BYTES).find(|&len| unsafe { bytes.add(len).read() } == 0)?;
+    // SAFETY: the `len` bytes before the NUL were just read, and the caller
+    // keeps them readable for `'a`.
+    Some(unsafe { slice::from_raw_parts(bytes, len) })
 }
 
 /// Expose validated per-frame metadata as borrowed UTF-8 text.

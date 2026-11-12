@@ -808,15 +808,26 @@ impl AllocatorService {
         receiver: PacketReceiver,
     ) -> std::result::Result<AllocatedPacketReceiver, Rejected<PacketReceiver>> {
         match self.attach(receiver.receiver) {
-            Ok(inner) => Ok(AllocatedPacketReceiver { inner }),
+            Ok(inner) => Ok(AllocatedPacketReceiver {
+                inner,
+                _thread_affinity: std::marker::PhantomData,
+            }),
             Err(rejected) => Err(rejected.map(PacketReceiver::from_receiver)),
         }
     }
 }
 
 /// A [`PacketReceiver`] whose frames can be received into application memory.
+///
+/// It keeps the packet receiver's threading rule: it is used from the thread
+/// that owns it, one call at a time, so it is neither [`Send`] nor [`Sync`].
+/// [`into_packet_receiver`](Self::into_packet_receiver) gives the receiver
+/// back on that same thread.
 pub struct AllocatedPacketReceiver {
     inner: AllocatedReceiver,
+    // The thread restriction of the PacketReceiver this was made from, which
+    // would otherwise be lost: an AllocatedReceiver is Send and Sync.
+    _thread_affinity: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl AllocatedPacketReceiver {
