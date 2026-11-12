@@ -705,24 +705,8 @@ impl RecordingTarget {
     /// contains a NUL, and [`FileError::Io`] when a relative path cannot be
     /// resolved because the current directory is unavailable.
     pub fn new(path: impl AsRef<Path>) -> FileResult<Self> {
-        let path = path.as_ref();
-        if path.as_os_str().is_empty() {
-            return Err(FileError::InvalidInput(
-                "recording target must not be empty".into(),
-            ));
-        }
-        let absolute = if path.is_absolute() {
-            path.to_owned()
-        } else {
-            std::env::current_dir()?.join(path)
-        };
-        let text = absolute.to_str().ok_or_else(|| {
-            FileError::InvalidInput("recording target is not lossless UTF-8".into())
-        })?;
-        Ok(Self {
-            prefix: cstring(text, "recording target", false)?,
-            path: absolute,
-        })
+        let (path, prefix) = resolve_path(path.as_ref(), "recording target")?;
+        Ok(Self { prefix, path })
     }
 
     /// The frozen absolute path/prefix, without filesystem canonicalization.
@@ -731,8 +715,34 @@ impl RecordingTarget {
     }
 }
 
+/// Make `path` absolute against the current directory and convert it for the
+/// SDK. `what` names the path in the errors: a recording target and a file to
+/// play are different things to the caller.
+///
+/// # Errors
+///
+/// [`FileError::InvalidInput`] when the path is empty, is not UTF-8 or
+/// contains a NUL, and [`FileError::Io`] when a relative path cannot be
+/// resolved because the current directory is unavailable.
+pub(super) fn resolve_path(path: &Path, what: &str) -> FileResult<(PathBuf, CString)> {
+    if path.as_os_str().is_empty() {
+        return Err(FileError::InvalidInput(format!("{what} must not be empty")));
+    }
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let text = absolute
+        .to_str()
+        .ok_or_else(|| FileError::InvalidInput(format!("{what} is not lossless UTF-8")))?;
+    let text = cstring(text, what, false)?;
+    Ok((absolute, text))
+}
+
+/// A path to play or probe, as the SDK takes it.
 pub(super) fn path_string(path: &Path) -> FileResult<CString> {
-    Ok(RecordingTarget::new(path)?.prefix)
+    Ok(resolve_path(path, "file path")?.1)
 }
 
 /// Original SDK event bytes, retaining invalid UTF-8 and truncation evidence.
@@ -1461,6 +1471,61 @@ impl From<&NDIlib_file_recorder_stats_t> for RecorderStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn invalid_text<T: std::fmt::Debug>(result: FileResult<T>) -> String {
+        match result {
+            Err(FileError::InvalidInput(text)) => text,
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_errors_name_what_the_path_is() {
+        let empty = Path::new("");
+        assert_eq!(
+            invalid_text(path_string(empty)),
+            "file path must not be empty"
+        );
+        assert_eq!(
+            invalid_text(RecordingTarget::new(empty)),
+            "recording target must not be empty"
+        );
+        let nul = Path::new("/take\0.mkv");
+        assert_eq!(
+            invalid_text(path_string(nul)),
+            "file path contains an embedded NUL"
+        );
+        assert_eq!(
+            invalid_text(RecordingTarget::new(nul)),
+            "recording target contains an embedded NUL"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_are_named_by_their_use() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+        let path = Path::new(OsStr::from_bytes(b"/take-\xff.mkv"));
+        assert_eq!(
+            invalid_text(path_string(path)),
+            "file path is not lossless UTF-8"
+        );
+        assert_eq!(
+            invalid_text(RecordingTarget::new(path)),
+            "recording target is not lossless UTF-8"
+        );
+    }
+
+    #[test]
+    fn relative_paths_are_made_absolute_once() {
+        let (absolute, text) = resolve_path(Path::new("take.mkv"), "file path").unwrap();
+        assert!(absolute.is_absolute());
+        assert_eq!(text.to_str().unwrap(), absolute.to_str().unwrap());
+        assert_eq!(
+            RecordingTarget::new("take.mkv").unwrap().path(),
+            absolute.as_path()
+        );
+    }
 
     #[test]
     fn source_selection_is_explicit_and_rejects_nul() {

@@ -401,7 +401,7 @@ is `#[non_exhaustive]`:
 | Variant | Meaning |
 | --- | --- |
 | `Unavailable` | The File library, or the part of it an operation needs, cannot be used in this process. The text says why. |
-| `InvalidInput` | A value cannot be represented by the native API, for example a path that is not UTF-8. |
+| `InvalidInput` | A value cannot be represented by the native API, for example a path that is empty, is not UTF-8 or contains a NUL. The text names what the value is, such as the file path of a player or probe, or a recording target. |
 | `InvalidState` | The operation is not permitted in the current state. The `StateError` it carries says which, for example `PreviousSessionOpen` for `start` during an open session, `ExactFileName` for `set_source` during a session with an exact file name, or `QueueFull`, `Closed` and `OwnerFailed` for an async handle whose command queue is full, that has been closed, or whose thread failed. `StateError::is_retryable` is true only for `QueueFull` and `WaiterPending`, which can succeed later without anything else changing. |
 | `Rejected` | The SDK refused an operation; the recorder's or player's events may say more. |
 | `Protocol` | The SDK returned something that violates the expected contract. |

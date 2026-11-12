@@ -5,6 +5,7 @@
 //! of event futures are kept by one timer thread for the whole process, so
 //! that a command that blocks its owner thread cannot make a wait overrun.
 
+use super::types::resolve_path;
 use super::{
     timeout_ms, EventText, FileApi, FileDuration, FileError, FileInfo, FilePlayer, FilePosition,
     FileRecorder, FileResult, FinishStatus, PlayerEvent, PlayerOptions, PlayerStats, RecorderEvent,
@@ -958,8 +959,10 @@ impl AsyncFilePlayer {
     /// Read a recording's duration and track layout on a temporary thread.
     /// No player is created and nothing is advertised.
     pub fn probe(api: FileApi, path: impl Into<PathBuf>) -> FileOperation<FileInfo> {
-        let path = match RecordingTarget::new(path.into()) {
-            Ok(target) => target.path().to_owned(),
+        // Resolved here, so that the working directory is the one at call
+        // time rather than whenever the owner thread gets to it.
+        let path = match resolve_path(&path.into(), "file path") {
+            Ok((path, _)) => path,
             Err(error) => return FileOperation::failed(error),
         };
         let (reply, future) = operation();
@@ -978,8 +981,10 @@ impl AsyncFilePlayer {
 
     /// Play a file; see [`FilePlayer::start`].
     pub fn start(&self, path: impl Into<PathBuf>) -> FileOperation<()> {
-        let path = match RecordingTarget::new(path.into()) {
-            Ok(target) => target.path().to_owned(),
+        // Resolved here, so that the working directory is the one at call
+        // time rather than whenever the owner thread gets to it.
+        let path = match resolve_path(&path.into(), "file path") {
+            Ok((path, _)) => path,
             Err(error) => return FileOperation::failed(error),
         };
         self.worker.call(move |p| p.start(path))
