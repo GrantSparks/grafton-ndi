@@ -219,7 +219,8 @@ copy, never a path from the map, and none of those variables.
 On Linux the NDI runtime decodes NDI|HX video (H.264 and HEVC) only through a
 decoder it finds when it runs. NDI ships one separately as the NDI|HX Driver
 for Linux: `libndihx.so` and the FFmpeg 7 libraries it bundles under `-ndi`
-names, which the runtime loads when they are in its own directory. `current-hx-driver-linux` pins that download.
+names, which the runtime loads from its own directory or, failing that, by name
+through the loader. `current-hx-driver-linux` pins that download.
 Its pin has `driver` where an SDK's has `edition`, and its version is the SDK
 release it was built with: the driver's `Version.txt` carries no version
 number, only the vendor build (`git-…`).

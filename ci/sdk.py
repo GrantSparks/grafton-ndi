@@ -74,7 +74,7 @@ BUILD = re.compile(r'(?<![\w-])git-([0-9a-f]+)(?![\w-])')
 
 
 class Driver(NamedTuple):
-    """A library the runtime loads from its own directory when it is there."""
+    """A library the runtime loads from its own directory, or by name through the loader."""
     platform: str
     installer: str  # the self-extracting script in the download
     library: str  # the library the runtime loads
@@ -569,7 +569,7 @@ def install_driver(package, sdk, *, target, archive=None, environ=None, pins=Non
         driver_build = build_of(driver_root / 'Version.txt', 'the driver\'s')
         if driver_build != sdk_build:
             raise SdkError(f'the driver is build git-{driver_build} and the SDK build git-{sdk_build}; '
-                           f'a driver works only with the runtime of its own build')
+                           f'a driver pin installs only beside the SDK release of its own build')
         present = [name for name in names if os.path.lexists(runtime / name)]
         if present:
             raise SdkError(f'the runtime directory already has {", ".join(present)}')

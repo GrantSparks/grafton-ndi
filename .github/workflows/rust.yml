@@ -310,7 +310,8 @@ jobs:
       # The only step that is given the acquisition secrets. It exports
       # NDI_SDK_DIR and NDI_RUNTIME_DIR_V6 for the steps that follow, and copies
       # a row's `hx-driver` beside that runtime. The compatibility runs' baseline
-      # runtimes get none: a driver works only with the runtime of its own build.
+      # runtimes get none: their builds cannot check `hx-decoder`, and a driver
+      # is pinned together with the SDK release of its own build.
       - name: Provision the SDK
         id: sdk
         env:

@@ -766,6 +766,7 @@ Set `GRAFTON_NDI_REQUIRE_RUNTIME` to turn skips into failures. Its value is a co
 | `advanced` | An Advanced SDK runtime, and a build made with the Advanced SDK headers. |
 | `file` | An NDI File library that the selected runtime can use. |
 | `discovery-server` | The SDK's `ndi-discovery-server` program beside the selected runtime, and an NDI 6.4.0 or later runtime. |
+| `hx-decoder` | A decoder for NDI\|HX video: built into the runtime on Windows and macOS; on Linux, the NDI\|HX Driver for Linux or FFmpeg 7's `libavcodec` beside the runtime or on the loader's path. |
 
 An entry that is not in this table fails the run. So does an entry that no test in the build can check, for example `advanced` without the `advanced` feature, or `discovery-server` on a target other than Linux.
 
