@@ -323,7 +323,9 @@ impl FilePlayer {
     /// # Errors
     ///
     /// [`Error::NativeOperationFailed`] when the SDK returns no source, or one
-    /// that names neither a source nor an address.
+    /// that names neither a source nor an address, and
+    /// [`Error::UnexpectedSdkResult`] when its name or address is longer than
+    /// the 4 MiB one SDK string may be.
     pub fn advertised_source(&self) -> Result<Source> {
         // SAFETY: the player is live. The descriptor the SDK returns, and its
         // strings, stay valid until the player is destroyed, which this borrow

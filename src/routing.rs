@@ -250,7 +250,9 @@ impl Router {
     /// # Errors
     ///
     /// Returns [`Error::NativeOperationFailed`] when the SDK supplies no
-    /// descriptor, or one that names neither a source nor an address.
+    /// descriptor, or one that names neither a source nor an address, and
+    /// [`Error::UnexpectedSdkResult`] when its name or address is longer than
+    /// the 4 MiB one SDK string may be.
     pub fn source(&self) -> Result<Source> {
         // SAFETY: the router is live, and the descriptor the SDK returns stays
         // valid until the router is destroyed, after this copy completes.

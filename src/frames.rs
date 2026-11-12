@@ -1925,6 +1925,33 @@ pub(crate) unsafe fn bounded_sdk_text<'a>(text: *const c_char, limit: usize) -> 
     Some(unsafe { slice::from_raw_parts(bytes, len) })
 }
 
+/// The most one SDK string other than frame metadata may take, terminator
+/// included: a Discovery Server string, or a source's name, address or
+/// advertised metadata.
+pub(crate) const MAX_SDK_STRING_BYTES: usize = 4 * 1024 * 1024;
+
+/// Copy an SDK string of at most [`MAX_SDK_STRING_BYTES`], terminator
+/// included, replacing bytes that are not UTF-8.
+///
+/// # Errors
+///
+/// [`Error::UnexpectedSdkResult`] naming `operation`, the SDK function that
+/// returned the string, when there is no terminator within the limit.
+///
+/// # Safety
+///
+/// `text` must be non-null and readable byte-by-byte until either its first
+/// NUL or [`MAX_SDK_STRING_BYTES`] bytes have been read.
+pub(crate) unsafe fn copy_sdk_string(text: *const c_char, operation: &str) -> Result<String> {
+    // SAFETY: forwarded to the caller's obligation.
+    let bytes = unsafe { bounded_sdk_text(text, MAX_SDK_STRING_BYTES) }.ok_or_else(|| {
+        Error::UnexpectedSdkResult(format!(
+            "{operation} returned a string longer than the 4 MiB one string may be"
+        ))
+    })?;
+    Ok(String::from_utf8_lossy(bytes).into_owned())
+}
+
 /// Image format specification for encoding video frames.
 ///
 /// Used with [`VideoFrame::encode_data_url`] to specify the desired output format.

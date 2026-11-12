@@ -400,6 +400,14 @@ as `None`. Most programs need changes; see the
   Advanced declarations, as when no SDK is installed.
 - `Ndi::new` no longer writes diagnostics to standard error in Windows debug
   builds when the `CI` environment variable is set.
+- `Finder` no longer writes a warning to standard error in debug builds when
+  it leaves a malformed source out of a snapshot.
+- Source names, addresses and advertised metadata are read from the SDK only
+  up to the 4 MiB that a Discovery Server string may take, instead of until a
+  terminator however far away. A `Finder` snapshot or `sources_with_metadata`
+  leaves out a source with a longer string, as it leaves out a malformed one,
+  and `Sender::source`, `Router::source` and `FilePlayer::advertised_source`
+  report it as `Error::UnexpectedSdkResult`.
 - Every SDK wait rounds its `Duration` up to whole milliseconds, so only
   `Duration::ZERO` polls without blocking. A wait shorter than a millisecond
   was a non-blocking poll, and the finder's, receiver's and packet receiver's

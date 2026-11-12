@@ -3,6 +3,7 @@
 
 use super::{not_created, Handle};
 use crate::{
+    frames::{bounded_sdk_text, MAX_SDK_STRING_BYTES},
     sys::{self, bindings::*},
     to_ms_checked, Error, Ndi, Result,
 };
@@ -455,8 +456,6 @@ impl AdvertisedReceiver {
 
 /// The most one snapshot or event batch copies out of the SDK.
 const COPY_LIMIT: usize = 16 * 1024 * 1024;
-/// The longest single string copied out of the SDK.
-const STRING_LIMIT: usize = 4 * 1024 * 1024;
 
 /// Bounds what one snapshot or event batch copies, as a whole rather than field
 /// by field: how much there is to copy is decided by peers on the network.
@@ -492,11 +491,11 @@ impl Budget {
         }
         // Find the terminator first, so that no reference ever covers bytes
         // beyond the limit.
-        let limit = self.0.min(STRING_LIMIT);
+        let limit = self.0.min(MAX_SDK_STRING_BYTES);
         // SAFETY: every byte up to the terminator is readable for `'a`, and
         // the scan stops at the terminator or the limit.
-        let Some(bytes) = (unsafe { crate::frames::bounded_sdk_text(value, limit) }) else {
-            return Err(if limit == STRING_LIMIT {
+        let Some(bytes) = (unsafe { bounded_sdk_text(value, limit) }) else {
+            return Err(if limit == MAX_SDK_STRING_BYTES {
                 Error::UnexpectedSdkResult(
                     "a Discovery Server string is longer than the 4 MiB one string may be".into(),
                 )
@@ -1157,18 +1156,18 @@ mod tests {
     fn a_string_is_bounded_by_the_string_limit_and_the_budget() {
         // The longest string that fits: its terminator is the last byte the
         // scan may read.
-        let mut longest = vec![b'x'; STRING_LIMIT];
-        longest[STRING_LIMIT - 1] = 0;
+        let mut longest = vec![b'x'; MAX_SDK_STRING_BYTES];
+        longest[MAX_SDK_STRING_BYTES - 1] = 0;
         // One byte longer: its terminator lies just past the limit.
-        let mut too_long = vec![b'x'; STRING_LIMIT + 1];
-        too_long[STRING_LIMIT] = 0;
+        let mut too_long = vec![b'x'; MAX_SDK_STRING_BYTES + 1];
+        too_long[MAX_SDK_STRING_BYTES] = 0;
 
         // SAFETY: every pointer is a live NUL-terminated string.
         unsafe {
             let mut budget = Budget::new();
             let text = budget.c_str(longest.as_ptr().cast()).unwrap().unwrap();
-            assert_eq!(text.to_bytes().len(), STRING_LIMIT - 1);
-            assert_eq!(budget.0, COPY_LIMIT - STRING_LIMIT);
+            assert_eq!(text.to_bytes().len(), MAX_SDK_STRING_BYTES - 1);
+            assert_eq!(budget.0, COPY_LIMIT - MAX_SDK_STRING_BYTES);
 
             let Err(Error::UnexpectedSdkResult(reason)) =
                 Budget::new().c_str(too_long.as_ptr().cast())

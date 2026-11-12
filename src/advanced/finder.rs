@@ -1,8 +1,9 @@
 //! The metadata sources advertise to a finder.
 
-use std::ffi::{c_char, CStr};
+use std::ffi::c_char;
 
 use crate::{
+    frames::copy_sdk_string,
     sys::{
         advanced::{native, SourceMetadata},
         bindings::*,
@@ -40,8 +41,9 @@ impl ExtendedSource {
     }
 }
 
-/// Copy one descriptor of a metadata snapshot. A descriptor that names no
-/// source is skipped, as the plain snapshot does.
+/// Copy one descriptor of a metadata snapshot. A descriptor the plain
+/// snapshot would leave out is skipped, as is one whose metadata is longer
+/// than the 4 MiB one SDK string may be.
 ///
 /// # Safety
 ///
@@ -52,20 +54,22 @@ unsafe fn extended_source(
     address: *const c_char,
     metadata: *const c_char,
 ) -> Option<ExtendedSource> {
+    const OPERATION: &str = "NDIlib_find_get_current_sources_v2";
     let mut descriptor = NDIlib_source_t {
         p_ndi_name: name,
         ..Default::default()
     };
     descriptor.__bindgen_anon_1.p_url_address = address;
     // SAFETY: the descriptor points to the caller's readable strings.
-    let source =
-        unsafe { Source::try_from_raw(&descriptor, "NDIlib_find_get_current_sources_v2") }.ok()?;
-    let metadata = (!metadata.is_null())
+    let source = unsafe { Source::try_from_raw(&descriptor, OPERATION) }.ok()?;
+    let metadata = if metadata.is_null() {
+        None
+    } else {
         // SAFETY: non-null was checked; the caller guarantees the terminator.
-        .then(|| unsafe { CStr::from_ptr(metadata) })
+        let text = unsafe { copy_sdk_string(metadata, OPERATION) }.ok()?;
         // The SDK gives a source that advertises nothing an empty string.
-        .filter(|text| !text.is_empty())
-        .map(|text| text.to_string_lossy().into_owned());
+        (!text.is_empty()).then_some(text)
+    };
     Some(ExtendedSource { source, metadata })
 }
 
@@ -114,7 +118,10 @@ impl Finder {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CStr;
+
     use super::*;
+    use crate::frames::MAX_SDK_STRING_BYTES;
 
     #[test]
     fn one_unusable_descriptor_does_not_hide_the_others() {
@@ -141,5 +148,12 @@ mod tests {
 
         // Neither a name nor an address: there is nothing to connect to.
         assert!(copy(None, None, Some(invalid_utf8)).is_none());
+
+        // A name or metadata whose terminator lies past the string limit.
+        let mut too_long = vec![b'x'; MAX_SDK_STRING_BYTES + 1];
+        too_long[MAX_SDK_STRING_BYTES] = 0;
+        let too_long = CStr::from_bytes_with_nul(&too_long).unwrap();
+        assert!(copy(Some(too_long), Some(address), None).is_none());
+        assert!(copy(Some(name), Some(address), Some(too_long)).is_none());
     }
 }
