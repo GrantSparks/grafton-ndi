@@ -343,7 +343,7 @@ impl RecorderOptions {
     ///
     /// # Errors
     ///
-    /// [`FileError::InvalidInput`] when `wait` is `u32::MAX` milliseconds or more.
+    /// [`FileError::InvalidInput`] when `wait` exceeds [`crate::MAX_TIMEOUT`].
     pub fn with_drop_wait(mut self, wait: Duration) -> FileResult<Self> {
         super::timeout_ms(wait)?;
         self.drop_wait = wait;

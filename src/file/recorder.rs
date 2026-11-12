@@ -605,8 +605,8 @@ impl FileRecorder {
     ///
     /// # Errors
     ///
-    /// [`FileError::InvalidInput`] when `wait` is `u32::MAX` milliseconds or
-    /// more, and [`FileError::Protocol`] when the SDK's event is malformed.
+    /// [`FileError::InvalidInput`] when `wait` exceeds [`crate::MAX_TIMEOUT`],
+    /// and [`FileError::Protocol`] when the SDK's event is malformed.
     pub fn poll_event(&mut self, wait: Duration) -> FileResult<Option<RecorderEvent>> {
         let wait = timeout_ms(wait)?;
         let event = self.capture(wait);
@@ -670,8 +670,8 @@ impl FileRecorder {
     ///
     /// # Errors
     ///
-    /// [`FileError::InvalidInput`] when `wait` is `u32::MAX` milliseconds or
-    /// more, and [`FileError::InvalidState`] with
+    /// [`FileError::InvalidInput`] when `wait` exceeds [`crate::MAX_TIMEOUT`],
+    /// and [`FileError::InvalidState`] with
     /// [`StateError::StopNotRequested`] when no session was started. Neither
     /// is returned once the wait has begun: whatever the SDK's events hold,
     /// the outcome is a [`FinishStatus`].
@@ -691,8 +691,8 @@ impl FileRecorder {
     ///
     /// # Errors
     ///
-    /// [`FileError::InvalidInput`] when `wait` is `u32::MAX` milliseconds or
-    /// more, and [`FileError::InvalidState`] with
+    /// [`FileError::InvalidInput`] when `wait` exceeds [`crate::MAX_TIMEOUT`],
+    /// and [`FileError::InvalidState`] with
     /// [`StateError::StopNotRequested`] when no session was started or the
     /// session has not been asked to stop. Neither is returned once the wait
     /// has begun.

@@ -109,8 +109,8 @@ impl FilePlayer {
     ///
     /// # Errors
     ///
-    /// [`FileError::InvalidInput`] when `wait` is `u32::MAX` milliseconds or
-    /// more, and [`FileError::Protocol`] when the SDK's event is malformed.
+    /// [`FileError::InvalidInput`] when `wait` exceeds [`crate::MAX_TIMEOUT`],
+    /// and [`FileError::Protocol`] when the SDK's event is malformed.
     pub fn poll_event(&mut self, wait: Duration) -> FileResult<Option<PlayerEvent>> {
         let wait = timeout_ms(wait)?;
         let mut event = OutParam::<NDIlib_file_player_event_t>::new();

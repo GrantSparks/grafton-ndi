@@ -142,10 +142,11 @@ pub enum Error {
 
     /// The capture wait budget expired without a frame.
     ///
-    /// Includes the number of capture attempts and elapsed time in the retry
-    /// loop. The attempt count can be zero or one; retries are not guaranteed.
-    /// For async capture, `elapsed`
-    /// excludes time queued before that loop begins.
+    /// Includes the number of capture attempts and the time since the caller's
+    /// timeout budget started. At least one attempt is made, even when the
+    /// budget is zero or already spent; further retries are not guaranteed.
+    /// For async capture, the budget starts on the future's first poll, so
+    /// `elapsed` includes time spent waiting for a blocking-pool thread.
     ///
     /// # Example
     ///
@@ -166,7 +167,7 @@ pub enum Error {
     FrameTimeout {
         /// Number of capture attempts made before timing out
         attempts: usize,
-        /// Total elapsed time during capture attempts
+        /// Time since the caller's timeout budget started
         elapsed: Duration,
     },
 

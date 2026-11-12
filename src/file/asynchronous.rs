@@ -512,8 +512,8 @@ impl<E: Send> Expire for EventQueue<E> {
 ///
 /// # Errors
 ///
-/// Besides those above, [`FileError::InvalidInput`] when the wait is
-/// `u32::MAX` milliseconds or more, [`FileError::Protocol`] for an event the
+/// Besides those above, [`FileError::InvalidInput`] when the wait exceeds
+/// [`crate::MAX_TIMEOUT`], [`FileError::Protocol`] for an event the
 /// SDK delivered malformed, and [`FileError::Io`] when the wait has to be
 /// timed and the timer thread cannot be started; a later wait tries to start
 /// it again.

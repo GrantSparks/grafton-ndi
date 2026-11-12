@@ -243,7 +243,9 @@ impl FileApi {
     /// # Errors
     ///
     /// [`FileError::Rejected`] when the SDK cannot read the file,
-    /// [`FileError::InvalidInput`] when the path is not UTF-8, and
+    /// [`FileError::InvalidInput`] when the path is empty, is not UTF-8 or
+    /// contains a NUL, [`FileError::Io`] when a relative path cannot be
+    /// resolved because the current directory is unavailable, and
     /// [`FileError::Unavailable`] when the library provides no playback.
     pub fn probe(&self, path: impl AsRef<Path>) -> FileResult<FileInfo> {
         let playback = self.playback()?;

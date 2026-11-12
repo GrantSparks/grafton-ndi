@@ -105,6 +105,10 @@ removed, and the build no longer links the NDI library; see the
 - The `tokio` feature enables only Tokio's `rt` feature. A program that uses
   `#[tokio::main]` or the multi-threaded runtime enables those features in its
   own Tokio dependency.
+- `MAX_TIMEOUT` is `u32::MAX - 1` milliseconds, one millisecond less than in
+  2.0, and a timeout of exactly the old value is refused. The SDK reads
+  0xFFFFFFFF as a wait without a limit, so no finite timeout is passed to it as
+  that value any more.
 
 ### Added
 
@@ -206,6 +210,16 @@ removed, and the build no longer links the NDI library; see the
   in it.
 - `Debug` for `NDI` prints `NDI { .. }`, and the derived `Debug` of `Sender`,
   which holds an `NDI`, changes with it.
+- `Error::FrameTimeout::elapsed` counts from the start of the caller's timeout
+  budget. For async capture that includes the wait for a blocking-pool thread,
+  which 2.0 left out.
+- An SDK error frame, which the SDK reports for a lost connection, gives the
+  same `Error::CaptureFailed` message from `Receiver` capture,
+  `Receiver::poll_event` and `advanced::PacketReceiver::capture`, and every
+  audio path reports an invalid sample rate with the same message.
+- The derived `Debug` of `ScatterVideoFrame`, `ScatterAudioFrame`,
+  `CompressedVideoFrame` and `CompressedAudioFrame` shows the timecode and
+  metadata inside an `extras` field.
 
 ### Removed
 
@@ -227,6 +241,24 @@ removed, and the build no longer links the NDI library; see the
   Advanced declarations, as when no SDK is installed.
 - `NDI::new` no longer writes diagnostics to standard error in Windows debug
   builds when the `CI` environment variable is set.
+- Every SDK wait rounds its `Duration` up to whole milliseconds, so only
+  `Duration::ZERO` polls without blocking. A wait shorter than a millisecond
+  was a non-blocking poll, and the finder's, receiver's and packet receiver's
+  deadline loops repeated 0 ms SDK calls through the last fraction of every
+  budget instead of waiting it out. The File API and the Discovery Server
+  listener already rounded up; all three now share one rule.
+- NV12 frames with an odd line stride are accepted by every path, as
+  `PixelFormat::NV12.info().try_buffer_len` already accepted them: received
+  frames, `BorrowedVideoFrame` and the Advanced allocators refused them. YV12
+  and I420 still need an even stride and height, and NV12 an even height.
+- After the thread of an async File player or recorder fails, the command it
+  was running, commands queued or submitted later, event waits and `close()`
+  all report `StateError::OwnerFailed`, as documented. Only `close()` did;
+  the others reported `StateError::Closed`, which now means only a handle that
+  was closed or whose thread stopped normally.
+- `FilePlayer::start`, `FileApi::probe` and the async player's `start` and
+  `probe` describe an empty, non-UTF-8 or NUL-containing path as a "file
+  path"; their errors called it a "recording target".
 
 ## [2.0.0] - 2026-10-16
 
