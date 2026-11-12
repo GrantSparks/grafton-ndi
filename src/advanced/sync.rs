@@ -718,11 +718,11 @@ impl Genlock {
         (
             VideoClock {
                 resource: &self.resource,
-                _not_sync: PhantomData,
+                _not_sync: NotSync(PhantomData),
             },
             AudioClock {
                 resource: &self.resource,
-                _not_sync: PhantomData,
+                _not_sync: NotSync(PhantomData),
             },
         )
     }
@@ -732,7 +732,7 @@ impl Genlock {
 pub struct VideoClock<'a> {
     resource: &'a GenResource,
     // One thread at a time waits on a clock.
-    _not_sync: PhantomData<Cell<()>>,
+    _not_sync: NotSync,
 }
 
 impl VideoClock<'_> {
@@ -753,7 +753,7 @@ impl VideoClock<'_> {
 pub struct AudioClock<'a> {
     resource: &'a GenResource,
     // One thread at a time waits on a clock.
-    _not_sync: PhantomData<Cell<()>>,
+    _not_sync: NotSync,
 }
 
 impl AudioClock<'_> {

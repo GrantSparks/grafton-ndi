@@ -86,6 +86,14 @@ struct Inner {
     metadata_capture: parking_lot::Mutex<()>,
 }
 
+// A panic cannot leave this half-changed: its one lock guards `()`, and no
+// application code runs while it is held. The `parking_lot` lock does not
+// poison and so does not declare this itself, which would otherwise leave
+// even the Advanced senders, which hold no application callback, short of
+// `RefUnwindSafe`. An ordinary sender's completion handler still decides
+// that sender's unwind traits.
+impl std::panic::RefUnwindSafe for Inner {}
+
 /// The owner of a native sender, which destroys it when dropped:
 /// advertisements retain one without access to sends.
 ///

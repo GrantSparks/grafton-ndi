@@ -11,6 +11,11 @@ note: required because it appears within the type `PhantomData<Cell<()>>`
   |
   | pub struct PhantomData<T: PointeeSized>;
   |            ^^^^^^^^^^^
+note: required because it appears within the type `advanced::sync::NotSync`
+ --> src/advanced/sync.rs
+  |
+  | struct NotSync(PhantomData<Cell<()>>);
+  |        ^^^^^^^
 note: required because it appears within the type `VideoClock<'static>`
  --> src/advanced/sync.rs
   |

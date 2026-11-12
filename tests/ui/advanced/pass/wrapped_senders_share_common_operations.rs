@@ -46,16 +46,12 @@ fn queued(
     let _ = sender.target_bit_rate(format);
 }
 fn assert_send_sync_unpin<T: Send + Sync + Unpin>() {}
-fn assert_send_unpin<T: Send + Unpin>() {}
-fn assert_unpin<T: Unpin>() {}
 fn main() {
     let _ = (compressed, queued);
-    // Every mode keeps the ordinary sender's auto traits.
+    // Every mode keeps the ordinary sender's auto traits, and both wrapping
+    // senders have them too, with or without the Advanced SDK headers.
     assert_send_sync_unpin::<Sender<CompressedAttached>>();
     assert_send_sync_unpin::<Sender<QueueAttached>>();
-    // `CompressedSender` is `Sync` only in a build without the Advanced SDK
-    // headers, so that is not asserted here; `QueuedSender` is neither `Send`
-    // nor `Sync` (see the failing contracts).
-    assert_send_unpin::<CompressedSender>();
-    assert_unpin::<QueuedSender>();
+    assert_send_sync_unpin::<CompressedSender>();
+    assert_send_sync_unpin::<QueuedSender>();
 }
