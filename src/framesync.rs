@@ -285,9 +285,11 @@ impl FrameSyncAudioRequest {
 /// shared with scoped workers while the frame guard stays on its capture
 /// thread until those workers finish.
 ///
-/// Raw video capture through the underlying receiver is disabled while this
-/// FrameSync exists. [`Self::into_receiver`] destroys the synchronizer and
-/// restores raw video capture before returning the receiver.
+/// Raw video and audio capture through the underlying receiver are disabled
+/// while this FrameSync exists, because the synchronizer takes the receiver's
+/// video and audio; see [`FrameSyncAttached`]. [`Self::into_receiver`]
+/// destroys the synchronizer and restores raw video and audio capture before
+/// returning the receiver.
 ///
 /// # Example
 ///
@@ -480,11 +482,23 @@ impl FrameSync {
 
     /// Access the underlying receiver.
     ///
-    /// Use this to access receiver functionality like tally, PTZ, or status
-    /// queries while the FrameSync is active. Tally control publishes state
-    /// upstream; it does not query incoming tally. This receiver mode has no
-    /// raw-video method; use FrameSync capture methods or
-    /// recover the receiver with [`Self::into_receiver`] first.
+    /// Use this to access receiver functionality like tally, PTZ, status
+    /// queries, metadata capture or event polling while the FrameSync is
+    /// active. Tally control publishes state upstream; it does not query
+    /// incoming tally.
+    ///
+    /// This receiver mode has no raw video or audio capture, because the
+    /// synchronizer takes the receiver's video and audio: raw audio capture
+    /// would take frames the FrameSync then replaces with silence (see
+    /// [`FrameSyncAttached`]). Use the FrameSync capture methods, or recover
+    /// the receiver with [`Self::into_receiver`] first.
+    ///
+    /// ```compile_fail,E0277
+    /// use grafton_ndi::FrameSync;
+    /// fn capture(framesync: &FrameSync) {
+    ///     let _ = framesync.receiver().audio();
+    /// }
+    /// ```
     pub fn receiver(&self) -> &Receiver<FrameSyncAttached> {
         &self.receiver
     }
@@ -800,8 +814,9 @@ unsafe impl Send for FrameSync {}
 ///
 /// The NDI SDK guarantees that framesync capture functions are internally
 /// synchronized and can be called concurrently from multiple threads. Receiver
-/// attachment disables raw video capture until the synchronizer is destroyed,
-/// including when the receiver is accessed through [`FrameSync::receiver`].
+/// attachment disables raw video and audio capture until the synchronizer is
+/// destroyed, including when the receiver is accessed through
+/// [`FrameSync::receiver`].
 unsafe impl Sync for FrameSync {}
 
 impl fmt::Debug for FrameSync {

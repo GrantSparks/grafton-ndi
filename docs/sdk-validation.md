@@ -138,6 +138,19 @@ following a local source and falling back to paced system clocks. The KVM
 boundary test checks failed release, retry on drop, touch coordinates and
 clipboard ownership using stand-in functions; it does not qualify a KVM device.
 
+A FrameSync and raw audio capture on its receiver compete for the receiver's
+audio, which is why `Receiver<FrameSyncAttached>` has no audio capture. This
+was measured by hand, on Linux x86_64 over loopback with Standard 6.3.2 and
+6.4, and no test repeats it. A clocked sender sent 30 fps video, each frame
+with 1600 sequence-coded samples of 48 kHz stereo audio, while a FrameSync
+pulled 480 samples every 10 ms for 8 s. Without raw capture, every frame in the
+window reached the FrameSync and it returned no silence. With raw audio capture
+on the attached receiver, interleaved with the pulls or on a second thread,
+each audio frame reached exactly one of the two: raw capture took 131 to 216 of
+the 196 to 239 frames in the window, and the FrameSync returned silence for 65
+to 90 per cent of the samples it pulled. Every metadata frame still reached the
+attached receiver's own metadata capture.
+
 Tests of `FileRecorder::reset` check that it returns the old session's report
 without claiming that the files were finalized, that late events of the old
 session do not reach later ones, and that the original recorder stays usable

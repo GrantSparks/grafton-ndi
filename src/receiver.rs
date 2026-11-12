@@ -677,7 +677,8 @@ mod mode_sealed {
 /// connection statistics, delays, source-name changes, connecting and
 /// reconnecting. A [`MetadataMode`] adds the receiver's own metadata capture
 /// and event polling, a [`CaptureMode`] adds audio capture to those, and a
-/// [`VideoMode`] adds video capture. Only [`RawCapture`] is all three.
+/// [`VideoMode`] adds video capture. Only [`RawCapture`] is all three, and
+/// only it is a [`CaptureMode`].
 pub trait ReceiverMode: mode_sealed::Sealed + Send + Sync {}
 
 /// Sealed receiver mode in which the receiver's own metadata capture and
@@ -690,10 +691,12 @@ pub trait ReceiverMode: mode_sealed::Sealed + Send + Sync {}
 pub trait MetadataMode: ReceiverMode + mode_sealed::MetadataSealed {}
 
 /// Sealed receiver mode in which the receiver's own audio, metadata and event
-/// capture are available: [`RawCapture`] and [`FrameSyncAttached`].
+/// capture are available: [`RawCapture`].
 ///
 /// A [`MetadataMode`] without it hands the receiver's audio to the object
-/// that holds the receiver.
+/// that holds the receiver: [`FrameSyncAttached`] to a
+/// [`FrameSync`](crate::FrameSync) and, with the `advanced` feature,
+/// `AvSyncAttached` to an Advanced `AvSync`.
 pub trait CaptureMode: MetadataMode + mode_sealed::CaptureSealed {}
 
 /// Sealed receiver mode in which the receiver's own video capture is
@@ -707,7 +710,23 @@ pub trait VideoMode: ReceiverMode + mode_sealed::VideoSealed {}
 /// Ordinary receiver mode, permitting raw video capture.
 #[derive(Debug)]
 pub enum RawCapture {}
-/// Receiver mode held exclusively by [`crate::FrameSync`], without raw video access.
+/// Receiver mode held exclusively by [`crate::FrameSync`], whose synchronizer
+/// takes the receiver's video and audio.
+///
+/// The receiver's own metadata capture and event polling are available in
+/// this mode, as are the common controls. Its video and audio capture are
+/// not: the FrameSync returns them clock-corrected through
+/// [`FrameSync::capture_video`](crate::FrameSync::capture_video) and
+/// [`FrameSync::capture_audio`](crate::FrameSync::capture_audio).
+///
+/// Raw audio capture on the attached receiver would compete with the
+/// synchronizer for the receiver's audio: each audio frame reaches only one
+/// of them. Measured with NDI 6.3.2 and 6.4 over loopback, raw capture
+/// interleaved with FrameSync pulls took most of a 30 fps stream's audio
+/// frames, none of which then reached the FrameSync, which returned silence
+/// in their place. Metadata is not taken that way: every metadata frame still
+/// reached the receiver's own capture while the FrameSync pulled video and
+/// audio.
 #[derive(Debug)]
 pub enum FrameSyncAttached {}
 /// Receiver mode held by
@@ -735,14 +754,12 @@ impl mode_sealed::Sealed for FrameSyncAttached {}
 impl mode_sealed::MetadataSealed for RawCapture {}
 impl mode_sealed::MetadataSealed for FrameSyncAttached {}
 impl mode_sealed::CaptureSealed for RawCapture {}
-impl mode_sealed::CaptureSealed for FrameSyncAttached {}
 impl mode_sealed::VideoSealed for RawCapture {}
 impl ReceiverMode for RawCapture {}
 impl ReceiverMode for FrameSyncAttached {}
 impl MetadataMode for RawCapture {}
 impl MetadataMode for FrameSyncAttached {}
 impl CaptureMode for RawCapture {}
-impl CaptureMode for FrameSyncAttached {}
 impl VideoMode for RawCapture {}
 #[cfg(feature = "advanced")]
 impl mode_sealed::Sealed for PacketAttached {}
@@ -1328,8 +1345,8 @@ impl<M: MetadataMode> Receiver<M> {
     ///
     /// Returns a [`Capture`] view; see [`Receiver::video`] for its two verbs,
     /// [`capture`](Capture::capture) and [`capture_ref`](Capture::capture_ref).
-    /// It exists in each [`CaptureMode`]; an Advanced `AvSync` takes the
-    /// audio of the receiver it holds.
+    /// It exists in each [`CaptureMode`]: a [`FrameSync`](crate::FrameSync)
+    /// and an Advanced `AvSync` take the audio of the receiver they hold.
     ///
     /// # Examples
     ///
@@ -1724,9 +1741,9 @@ pub(crate) mod native_capture_calls {
 ///
 /// A video view exists in each [`VideoMode`], an audio view in each
 /// [`CaptureMode`] and a metadata view in each [`MetadataMode`]. FrameSync
-/// owns video capture until [`crate::FrameSync::into_receiver`] restores the
-/// ordinary mode, and an Advanced `AvSync` owns audio capture until its
-/// `into_receiver` does.
+/// owns video and audio capture until [`crate::FrameSync::into_receiver`]
+/// restores the ordinary mode, and an Advanced `AvSync` owns audio capture
+/// until its `into_receiver` does.
 pub struct Capture<'rx, K: CaptureKind> {
     rx: &'rx ReceiverCore,
     _kind: PhantomData<K>,
@@ -2010,8 +2027,8 @@ unsafe impl Send for ReceiverCore {}
 /// [`Receiver::video`], [`Receiver::audio`], and [`Receiver::metadata`]) can be
 /// safely called from multiple threads simultaneously. The wrapper's capture
 /// guard excludes reconnect calls from receiver capture calls. Receiver modes
-/// prevent raw video capture while a FrameSync owns this core, and raw audio
-/// capture while an Advanced AvSync, which takes the audio, owns it.
+/// prevent raw video and audio capture while a FrameSync owns this core, and
+/// raw audio capture while an Advanced AvSync, which takes the audio, owns it.
 /// Borrowed frame guards retain the receiver borrow until they free their buffers.
 unsafe impl Sync for ReceiverCore {}
 

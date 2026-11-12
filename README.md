@@ -406,10 +406,13 @@ follow the source's format, wait for `Some` and build the request with
 follow later changes.
 
 `FrameSync::new` hands the receiver back inside `Rejected` when the SDK creates no
-synchronizer. `FrameSync` owns its receiver. `frame_sync.receiver()` provides controls, audio,
-metadata, and status through `Receiver<FrameSyncAttached>`. Use
+synchronizer. `FrameSync` owns its receiver. `frame_sync.receiver()` provides controls,
+metadata capture, events, and status through `Receiver<FrameSyncAttached>`. The
+synchronizer takes the receiver's video and audio, so that receiver has no raw
+video or audio capture: a raw audio capture beside a FrameSync would take audio
+frames that the FrameSync then replaces with silence. Use
 `frame_sync.into_receiver()` to recover an ordinary `Receiver` with raw video
-capture. The type system prevents raw-video capture while FrameSync owns it.
+and audio capture.
 
 ### Monitor and Control
 

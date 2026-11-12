@@ -24,8 +24,9 @@ fn workflow(receiver: Receiver) {
     capturing(&receiver);
     video(&receiver);
     let fs = FrameSync::new(receiver).unwrap();
-    capturing(fs.receiver());
+    metadata_and_events(fs.receiver());
     let receiver = fs.into_receiver();
+    capturing(&receiver);
     let _ = receiver.video().capture(Duration::ZERO);
 }
 fn assert_send_sync<T: Send + Sync>() {}
