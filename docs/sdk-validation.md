@@ -151,6 +151,23 @@ the 196 to 239 frames in the window, and the FrameSync returned silence for 65
 to 90 per cent of the samples it pulled. Every metadata frame still reached the
 attached receiver's own metadata capture.
 
+`FrameSync` is `Sync`, although neither its header nor the SDK documentation
+of 6.1.1, 6.3.2 or 6.4 says whether one FrameSync may be used from several
+threads at once. That was measured by hand on Linux x86_64 over loopback. In
+the runtimes of all three versions, video capture, audio capture and the video
+free take the instance's exclusive lock, the audio free returns its buffer
+through atomic operations, and the audio queue depth is read without the lock.
+With a clocked sender of uniform gray 30 fps frames and audio, four threads
+made every `&FrameSync` call on one FrameSync under helgrind on 6.3.2 and 6.4:
+the only conflicts between two of those threads were the unlocked queue-depth
+read and the atomic audio free, and a single-thread control showed none.
+Sixteen threads made the same calls for 120 s on each of the three runtimes,
+about 30 million video and 60 million audio captures each, and received no
+torn video frame, no invalid audio sample and no error.
+`tests/framesync_capture_boundary.rs` repeats a short version of the
+multi-thread run against every runtime the tests use. Runtimes for other
+platforms were not measured.
+
 Tests of `FileRecorder::reset` check that it returns the old session's report
 without claiming that the files were finalized, that late events of the old
 session do not reach later ones, and that the original recorder stays usable

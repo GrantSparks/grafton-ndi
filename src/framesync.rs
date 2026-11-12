@@ -277,13 +277,18 @@ impl FrameSyncAudioRequest {
 ///
 /// # Thread Safety
 ///
-/// `FrameSync` is `Send + Sync` like `Receiver`, as the underlying NDI SDK
-/// frame-sync functions are thread-safe. The `capture_*` methods return owned
-/// frames, which can move to another thread. Frames returned by the
-/// `capture_*_ref` methods borrow from the FrameSync and are neither `Send`
-/// nor `Sync`; their immutable video plane/row views can instead be moved or
-/// shared with scoped workers while the frame guard stays on its capture
-/// thread until those workers finish.
+/// `FrameSync` is `Send + Sync` like `Receiver`: it may move to another
+/// thread, and one FrameSync may be shared, for example by a video render
+/// thread and an audio callback, whose captures may overlap. The SDK does not
+/// document this; it rests on how the supported runtimes behave, measured as
+/// recorded beside the `Sync` implementation. [`Self::audio_queue_depth`] is
+/// read without the SDK's lock and is approximate.
+///
+/// The `capture_*` methods return owned frames, which can move to another
+/// thread. Frames returned by the `capture_*_ref` methods borrow from the
+/// FrameSync and are neither `Send` nor `Sync`; their immutable video
+/// plane/row views can instead be moved or shared with scoped workers while
+/// the frame guard stays on its capture thread until those workers finish.
 ///
 /// Raw video and audio capture through the underlying receiver are disabled
 /// while this FrameSync exists, because the synchronizer takes the receiver's
@@ -765,8 +770,10 @@ impl FrameSync {
     /// This can be useful when using an inaccurate timer for audio playback.
     ///
     /// **Note:** This value may change immediately after being read as new
-    /// samples are continuously received. For most applications, simply call
-    /// `capture_audio` at your desired rate and let the SDK handle timing.
+    /// samples are continuously received, and the SDK reads it without the
+    /// lock its captures take, so a capture on another thread may be under
+    /// way. For most applications, simply call `capture_audio` at your desired
+    /// rate and let the SDK handle timing.
     ///
     /// # Example
     ///
@@ -804,19 +811,40 @@ impl FrameSync {
 
 /// # Safety
 ///
-/// The NDI SDK documentation states that framesync operations are thread-safe.
-/// The FrameSync owns its receiver, keeping the SDK runtime alive. Borrowed
-/// frame guards cannot be moved between threads and keep this owner borrowed
-/// until their buffers are freed; destruction requires exclusive ownership.
+/// The FrameSync instance has no affinity to the thread that created it: the
+/// SDK's own FrameSync audio examples create it on one thread and capture
+/// from an audio device's callback thread. The FrameSync owns its receiver,
+/// keeping the SDK runtime alive. Borrowed frame guards cannot be moved
+/// between threads and keep this owner borrowed until their buffers are
+/// freed; destruction requires exclusive ownership.
 unsafe impl Send for FrameSync {}
 
 /// # Safety
 ///
-/// The NDI SDK guarantees that framesync capture functions are internally
-/// synchronized and can be called concurrently from multiple threads. Receiver
-/// attachment disables raw video and audio capture until the synchronizer is
-/// destroyed, including when the receiver is accessed through
-/// [`FrameSync::receiver`].
+/// Every `&self` method may run on several threads at once: video and audio
+/// capture, the input-format query, the queue depth, and the frees of
+/// borrowed frames. Neither `Processing.NDI.FrameSync.h` nor the SDK
+/// documentation of NDI 6.1.1, 6.3.2 or 6.4 says whether that is safe (the
+/// one threading statement, in `Processing.NDI.Recv.h`, covers receiver
+/// capture), so this rests on measurement, recorded in docs/sdk-validation.md:
+///
+/// - In the Linux x86_64 runtimes of all three versions, video capture, audio
+///   capture (and with it the input-format query) and the video free take the
+///   instance's exclusive lock, and the audio free returns its buffer through
+///   atomic operations. The queue depth is read without the lock, so it is
+///   approximate, which [`FrameSync::audio_queue_depth`] documents.
+/// - Under helgrind, four threads making all of these calls on one FrameSync
+///   of a live source showed no conflict between two of them other than
+///   those two lock-free paths, on 6.3.2 and 6.4.
+/// - Sixteen threads making them for 120 s on each of 6.1.1, 6.3.2 and 6.4
+///   received no torn video frame, no invalid audio and no error.
+///
+/// `one_framesync_serves_captures_from_several_threads_at_once` in
+/// tests/framesync_capture_boundary.rs repeats the last check briefly with
+/// every runtime the tests run against. Other platforms' runtimes were not
+/// measured. Receiver attachment disables raw video and audio capture until
+/// the synchronizer is destroyed, including when the receiver is accessed
+/// through [`FrameSync::receiver`].
 unsafe impl Sync for FrameSync {}
 
 impl fmt::Debug for FrameSync {
