@@ -25,7 +25,10 @@ fn compile_contract() -> Result<(), grafton_ndi::Error> {
                 .map(|row| row.len())
                 .sum::<usize>(),
         );
-        let _owned = video.try_to_owned()?;
+        let mut owned = video.try_to_owned()?;
+        // A receiver frame can be copied into a reused frame on a scoped worker.
+        std::thread::scope(|scope| scope.spawn(|| video.copy_into(&mut owned)).join())
+            .expect("copy worker")?;
     }
 
     if let Some(audio) = receiver.audio().capture_ref(Duration::from_millis(1))? {
@@ -34,7 +37,9 @@ fn compile_contract() -> Result<(), grafton_ndi::Error> {
             audio.num_samples(),
             audio.channels().len(),
         );
-        let _owned = audio.try_to_owned()?;
+        let mut owned = audio.try_to_owned()?;
+        std::thread::scope(|scope| scope.spawn(|| audio.copy_into(&mut owned)).join())
+            .expect("copy worker")?;
     }
 
     if let Some(metadata) = receiver.metadata().capture_ref(Duration::from_millis(1))? {

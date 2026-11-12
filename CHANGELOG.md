@@ -259,6 +259,15 @@ as `None`. Most programs need changes; see the
   one with padded rows, is sent without being copied, and can be reused when
   the call returns. In 2.0 a borrowed frame reached the SDK only through
   `send_video_async_copy`, which copies the whole frame on every call.
+- `copy_into(&mut destination)` on `VideoFrameRef`, `FrameSyncVideoRef`,
+  `AudioFrameRef`, `FrameSyncAudioRef` and `BorrowedVideoFrame` copies the
+  frame into an existing `VideoFrame` or `AudioFrame`, which ends up exactly as
+  `try_to_owned` would have made it but keeps its pixel or sample buffer when
+  that is large enough, and its metadata string when the text has the same
+  length. Copying frames of one shape into the same destination allocates
+  nothing after the first copy, so copying borrowed pixels into the frame
+  `send_video_async` returns makes an asynchronous send loop that allocates no
+  frames. A video copy that fails leaves the destination unchanged.
 - Runtime selection in two explicit steps. `Runtime::select` loads the NDI
   library and pins it for the process without starting NDI;
   `Runtime::initialize` starts NDI and returns an `Ndi` handle. `Ndi::new` and

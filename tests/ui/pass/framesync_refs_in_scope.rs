@@ -25,7 +25,9 @@ fn compile_contract() -> Result<(), grafton_ndi::Error> {
                 .map(|row| row.len())
                 .sum::<usize>(),
         );
-        let _owned = video.try_to_owned()?;
+        let mut owned = video.try_to_owned()?;
+        // A FrameSync frame is copied on its capture thread.
+        video.copy_into(&mut owned)?;
     }
 
     let audio = framesync.capture_audio_ref(FrameSyncAudioRequest::capture_at(48_000, 2, 1024)?)?;
@@ -34,7 +36,8 @@ fn compile_contract() -> Result<(), grafton_ndi::Error> {
         audio.num_channels(),
         audio.channels().len(),
     );
-    let _owned = audio.try_to_owned()?;
+    let mut owned = audio.try_to_owned()?;
+    audio.copy_into(&mut owned)?;
 
     Ok(())
 }

@@ -168,6 +168,17 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
         }
         let owned = borrowed.try_to_owned().unwrap();
         verify_owned(&owned);
+        // A copy into a larger frame of another format reuses its pixels.
+        let mut reused = VideoFrame::builder()
+            .resolution(1280, 720)
+            .pixel_format(PixelFormat::Uyvy)
+            .build()
+            .unwrap();
+        let reused_pixels = reused.data().as_ptr();
+        borrowed.copy_into(&mut reused).unwrap();
+        verify_owned(&reused);
+        assert_eq!(reused.data(), owned.data());
+        assert_eq!(reused.data().as_ptr(), reused_pixels);
         drop(borrowed);
         let owned_capture = receiver
             .video()
@@ -221,6 +232,9 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
                     std::fs::write("/dev/null", frame.encode_jpeg(85).unwrap()).unwrap();
                 }
                 verify_owned(&frame.try_to_owned().unwrap());
+                frame.copy_into(&mut reused).unwrap();
+                verify_owned(&reused);
+                assert_eq!(reused.data().as_ptr(), reused_pixels);
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -261,6 +275,15 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
             .unwrap();
         assert_eq!(recovered.data().as_ptr(), original);
         verify_owned(&recovered);
-        verify_owned(&resend.finish_video_async().unwrap());
+        // The recovered frame is the next copy's destination, as in the loop
+        // `BorrowedVideoFrame::copy_into` documents: the copied frame comes
+        // back from the next send and the recovered one from the finish.
+        let mut recovered = recovered;
+        borrowed_send.copy_into(&mut recovered).unwrap();
+        let copied = resend.send_video_async(recovered).unwrap().unwrap();
+        verify_owned(&copied);
+        let last = resend.finish_video_async().unwrap();
+        assert_eq!(last.data().as_ptr(), original);
+        verify_owned(&last);
     });
 }

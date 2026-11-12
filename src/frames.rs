@@ -915,58 +915,126 @@ impl VideoFrame {
     #[cfg(test)]
     pub(crate) unsafe fn from_raw(c_frame: &NDIlib_video_frame_v2_t) -> Result<VideoFrame> {
         let (layout, header) = validate_video_frame(c_frame)?;
-        let metadata_layout = unsafe { validate_frame_metadata(c_frame.p_metadata)? };
-        unsafe { Self::from_raw_validated(c_frame, layout, header, metadata_layout) }
+        // SAFETY: forwarded to the caller, and the layout, header and
+        // metadata text are validated from this descriptor.
+        unsafe {
+            let metadata = validate_frame_metadata(c_frame.p_metadata)?;
+            VideoCopySource::new(*c_frame, layout, header, metadata).to_frame()
+        }
     }
+}
 
-    /// Copy a validated SDK frame into tightly packed owned storage.
-    ///
+/// A validated uncompressed SDK video frame: the source of every owned video
+/// copy, whether into a new frame or into one whose allocations are reused.
+///
+/// [`Self::new`] establishes the invariant that makes copying safe: the
+/// layout, header and metadata text were validated from the descriptor, and
+/// its pixels and metadata stay live, initialized and unchanged for `'a`.
+#[derive(Clone, Copy)]
+pub(crate) struct VideoCopySource<'a> {
+    raw: NDIlib_video_frame_v2_t,
+    layout: ValidatedVideoLayout,
+    header: VideoHeader,
+    metadata: Option<MetadataText>,
+    storage: PhantomData<&'a [u8]>,
+}
+
+impl VideoCopySource<'_> {
     /// # Safety
     ///
-    /// `layout` and `header` must have been validated from `c_frame`, and
-    /// `metadata_layout` from its metadata pointer. Its allocation must cover
-    /// the layout, with every active row initialized and immutable throughout
-    /// this call; row padding may be uninitialized.
-    pub(crate) unsafe fn from_raw_validated(
-        c_frame: &NDIlib_video_frame_v2_t,
+    /// `layout` and `header` must have been validated from `raw`, and
+    /// `metadata` from its metadata pointer. Its allocation must cover the
+    /// layout, with every active row initialized, and it and the metadata
+    /// must stay live and unchanged for the source's lifetime; row padding
+    /// may be uninitialized.
+    pub(crate) unsafe fn new(
+        raw: NDIlib_video_frame_v2_t,
         layout: ValidatedVideoLayout,
         header: VideoHeader,
-        metadata_layout: Option<MetadataText>,
-    ) -> Result<VideoFrame> {
-        let owned_layout = ValidatedVideoLayout::new_uncompressed(
+        metadata: Option<MetadataText>,
+    ) -> Self {
+        Self {
+            raw,
+            layout,
+            header,
+            metadata,
+            storage: PhantomData,
+        }
+    }
+
+    /// Copy into a new frame, which is a copy into empty storage: one pixel
+    /// allocation, and one metadata allocation when there is metadata.
+    pub(crate) fn to_frame(self) -> Result<VideoFrame> {
+        // Placeholder storage that `copy_into` replaces field by field. It is
+        // returned only once the copy has filled it, and dropped otherwise.
+        let mut frame = VideoFrame {
+            layout: self.layout,
+            header: self.header,
+            data: Vec::new(),
+            metadata: None,
+            timestamp: None,
+        };
+        self.copy_into(&mut frame)?;
+        Ok(frame)
+    }
+
+    /// Copy into `destination`, packing every plane's active rows tightly and
+    /// reusing its pixel and metadata allocations. Every owned video copy is
+    /// made here.
+    ///
+    /// `destination` becomes exactly the frame [`Self::to_frame`] returns,
+    /// whatever it held before. Its pixel buffer is reused when its capacity
+    /// holds the packed frame, and otherwise replaced without copying its old
+    /// contents; its metadata string is reused as
+    /// [`FrameMetadata::copy_from_raw_validated`] describes.
+    ///
+    /// Fails, leaving `destination` unchanged, only if the packed layout is
+    /// not valid. After validation nothing can fail part-way: any allocation
+    /// happens while `destination` is still a whole frame, and the only
+    /// moment its buffer and layout disagree spans copies into reserved
+    /// capacity, which neither allocate nor panic.
+    pub(crate) fn copy_into(self, destination: &mut VideoFrame) -> Result<()> {
+        let layout = self.layout;
+        let packed = ValidatedVideoLayout::new_uncompressed(
             layout.pixel_format,
             layout.width,
             layout.height,
             None,
         )?;
-        let mut data = Vec::with_capacity(layout.payload_len_bytes);
-        // SAFETY: The caller retains the source allocation through this copy.
-        // Only active rows are initialized by the SDK; never read stride padding.
-        if layout.is_contiguous() {
-            data.extend_from_slice(unsafe {
-                slice::from_raw_parts(c_frame.p_data, layout.payload_len_bytes)
-            });
-        } else {
-            for plane in unsafe { layout.view_planes(c_frame.p_data) } {
-                for row in plane.rows() {
-                    data.extend_from_slice(row);
-                }
+        let len = packed.data_len_bytes;
+        let replacement = (destination.data.capacity() < len).then(|| Vec::with_capacity(len));
+        let metadata = self.metadata.map(|text| {
+            // SAFETY: `new` requires `text` to have been validated from this
+            // live `p_metadata`.
+            unsafe {
+                FrameMetadata::copy_from_raw_validated(
+                    self.raw.p_metadata,
+                    text,
+                    destination.metadata.take(),
+                )
+            }
+        });
+
+        let mut data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
+        data.clear();
+        // SAFETY: `new` requires the allocation to cover `layout` with every
+        // active row initialized and unchanged while this source lives. The
+        // views read active rows only, never the SDK's row padding.
+        for plane in unsafe { layout.view_planes(self.raw.p_data) } {
+            match plane.data() {
+                Some(active) => data.extend_from_slice(active),
+                None => plane.rows().for_each(|row| data.extend_from_slice(row)),
             }
         }
 
-        let metadata = metadata_layout.map(|text| {
-            // SAFETY: the caller guarantees `text` was validated from this
-            // live `p_metadata`.
-            unsafe { FrameMetadata::copy_from_raw_validated(c_frame.p_metadata, text) }
-        });
-
-        Ok(VideoFrame {
-            layout: owned_layout,
-            header,
+        *destination = VideoFrame {
+            layout: packed,
+            header: self.header,
             data,
             metadata,
-            timestamp: SdkTimestamp::from_sdk(c_frame.timestamp),
-        })
+            timestamp: SdkTimestamp::from_sdk(self.raw.timestamp),
+        };
+        Ok(())
     }
 }
 
@@ -1150,47 +1218,28 @@ impl AudioFrame {
     pub(crate) unsafe fn from_raw(raw: NDIlib_audio_frame_v3_t) -> Result<AudioFrame> {
         // Use the shared validation helper to validate and compute layout
         let layout = validate_audio_layout(&raw)?;
-        let metadata_layout = unsafe { validate_frame_metadata(raw.p_metadata)? };
-
-        Ok(unsafe { Self::from_raw_validated(raw, layout, metadata_layout) })
+        // SAFETY: forwarded to the caller, and the layout and metadata text
+        // are validated from this descriptor.
+        unsafe {
+            let metadata_layout = validate_frame_metadata(raw.p_metadata)?;
+            Ok(Self::from_raw_validated(raw, layout, metadata_layout))
+        }
     }
 
-    /// Copy validated SDK audio into an owned frame. Validation already
-    /// established everything the copy relies on, so it cannot fail.
+    /// Copy validated SDK audio into a new owned frame, for AvSync, which
+    /// validates the SDK's descriptor itself. Validation already established
+    /// everything the copy relies on, so it cannot fail.
     ///
     /// # Safety
-    /// `layout` must have been validated from this exact `raw` descriptor.
-    /// Its active samples must remain live, aligned, and initialized through
-    /// copying; `metadata_layout` must describe its live metadata pointer.
+    /// As for [`AudioCopySource::new`].
+    #[cfg(any(test, feature = "advanced"))]
     pub(crate) unsafe fn from_raw_validated(
         raw: NDIlib_audio_frame_v3_t,
         layout: ValidatedAudioLayout,
         metadata_layout: Option<MetadataText>,
     ) -> AudioFrame {
-        // Only channel samples are initialized audio. Never form a typed slice
-        // over inter-channel padding supplied by the SDK.
-        let packed_layout = layout.packed();
-        let mut data = Vec::with_capacity(packed_layout.sample_count);
-        // SAFETY: the SDK owns an aligned FLTP buffer with no_samples
-        // initialized floats at each validated channel offset.
-        for samples in unsafe { layout.channels(raw.p_data.cast::<f32>()) } {
-            data.extend_from_slice(samples);
-        }
-
-        // Copy the string, don't take ownership - SDK will free the original.
-        let metadata = metadata_layout.map(|text| {
-            // SAFETY: the caller guarantees `text` describes this live
-            // `p_metadata`.
-            unsafe { FrameMetadata::copy_from_raw_validated(raw.p_metadata, text) }
-        });
-
-        AudioFrame {
-            layout: packed_layout,
-            timecode: Timecode::from_ticks(raw.timecode),
-            data,
-            metadata,
-            timestamp: SdkTimestamp::from_sdk(raw.timestamp),
-        }
+        // SAFETY: forwarded to the caller.
+        unsafe { AudioCopySource::new(raw, layout, metadata_layout) }.to_frame()
     }
 
     /// Get the sample rate in Hz.
@@ -1306,6 +1355,108 @@ impl AudioFrame {
         // SAFETY: the frame's buffer holds every sample of its packed layout,
         // initialized, and stays immutable while `self` is borrowed.
         unsafe { self.layout.channels(self.data.as_ptr()) }
+    }
+}
+
+/// Validated SDK audio: the source of every owned audio copy, whether into a
+/// new frame or into one whose allocations are reused.
+///
+/// [`Self::new`] establishes the invariant that makes copying safe: the
+/// layout and metadata text were validated from the descriptor, and its
+/// channel samples and metadata stay live, initialized and unchanged for `'a`.
+#[derive(Clone, Copy)]
+pub(crate) struct AudioCopySource<'a> {
+    raw: NDIlib_audio_frame_v3_t,
+    layout: ValidatedAudioLayout,
+    metadata: Option<MetadataText>,
+    storage: PhantomData<&'a [f32]>,
+}
+
+impl AudioCopySource<'_> {
+    /// # Safety
+    ///
+    /// `layout` must have been validated from this exact `raw` descriptor,
+    /// and `metadata` from its metadata pointer. Its channel samples must be
+    /// aligned and initialized, and they and the metadata must stay live and
+    /// unchanged for the source's lifetime; inter-channel padding may be
+    /// uninitialized.
+    pub(crate) unsafe fn new(
+        raw: NDIlib_audio_frame_v3_t,
+        layout: ValidatedAudioLayout,
+        metadata: Option<MetadataText>,
+    ) -> Self {
+        Self {
+            raw,
+            layout,
+            metadata,
+            storage: PhantomData,
+        }
+    }
+
+    /// Copy into a new frame, which is a copy into empty storage: one sample
+    /// allocation, and one metadata allocation when there is metadata.
+    pub(crate) fn to_frame(self) -> AudioFrame {
+        // Placeholder storage that `copy_into` replaces field by field before
+        // the frame is returned.
+        let mut frame = AudioFrame {
+            layout: self.layout,
+            timecode: Timecode::SYNTHESIZE,
+            data: Vec::new(),
+            metadata: None,
+            timestamp: None,
+        };
+        self.copy_into(&mut frame);
+        frame
+    }
+
+    /// Copy into `destination`, packing the channels back to back and reusing
+    /// its sample and metadata allocations. Every owned audio copy is made
+    /// here.
+    ///
+    /// `destination` becomes exactly the frame [`Self::to_frame`] returns,
+    /// whatever it held before. Its sample buffer is reused when its capacity
+    /// holds the packed samples, and otherwise replaced without copying its
+    /// old contents; its metadata string is reused as
+    /// [`FrameMetadata::copy_from_raw_validated`] describes. Validation
+    /// already established everything the copy relies on, so it cannot fail,
+    /// and as for video, any allocation happens while `destination` is still
+    /// a whole frame.
+    pub(crate) fn copy_into(self, destination: &mut AudioFrame) {
+        let layout = self.layout;
+        let packed = layout.packed();
+        let len = packed.sample_count;
+        let replacement = (destination.data.capacity() < len).then(|| Vec::with_capacity(len));
+        // Copy the string, don't take ownership - SDK will free the original.
+        let metadata = self.metadata.map(|text| {
+            // SAFETY: `new` requires `text` to describe this live
+            // `p_metadata`.
+            unsafe {
+                FrameMetadata::copy_from_raw_validated(
+                    self.raw.p_metadata,
+                    text,
+                    destination.metadata.take(),
+                )
+            }
+        });
+
+        let mut data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
+        data.clear();
+        // Only channel samples are initialized audio. Never form a typed slice
+        // over inter-channel padding supplied by the SDK.
+        // SAFETY: `new` requires an aligned FLTP buffer with `no_samples`
+        // initialized floats at each validated channel offset, unchanged
+        // while this source lives.
+        for samples in unsafe { layout.channels(self.raw.p_data.cast::<f32>()) } {
+            data.extend_from_slice(samples);
+        }
+
+        *destination = AudioFrame {
+            layout: packed,
+            timecode: Timecode::from_ticks(self.raw.timecode),
+            data,
+            metadata,
+            timestamp: SdkTimestamp::from_sdk(self.raw.timestamp),
+        };
     }
 }
 
@@ -1649,7 +1800,7 @@ impl MetadataFrame {
         let data = match text {
             // SAFETY: the caller guarantees `text` was validated from this
             // live `raw.p_data` allocation.
-            Some(text) => unsafe { FrameMetadata::copy_from_raw_validated(raw.p_data, text) },
+            Some(text) => unsafe { FrameMetadata::copy_from_raw_validated(raw.p_data, text, None) },
             // The empty null frame carries no text; it is empty metadata.
             None => FrameMetadata {
                 inner: CString::default(),
@@ -1844,16 +1995,30 @@ impl FrameMetadata {
         self.inner.as_ptr()
     }
 
-    /// Copy validated SDK text into owned metadata with one allocation.
+    /// Copy validated SDK text into owned metadata, reusing the allocation of
+    /// `storage` when there is one.
+    ///
+    /// Without `storage` this allocates once. With it, it allocates nothing
+    /// when the old and new texts have the same length, and otherwise
+    /// resizes the old string's buffer once, since a C string's storage is
+    /// exactly its length.
     ///
     /// # Safety
     ///
     /// As for [`MetadataText::text`]: `text` must have been validated from
     /// this `data` pointer while the pointed-to allocation is still valid.
-    unsafe fn copy_from_raw_validated(data: *const c_char, text: MetadataText) -> Self {
+    unsafe fn copy_from_raw_validated(
+        data: *const c_char,
+        text: MetadataText,
+        storage: Option<Self>,
+    ) -> Self {
         // SAFETY: forwarded to the caller's obligation.
         let text = unsafe { text.text(data) };
-        let mut bytes = Vec::with_capacity(text.len() + 1);
+        let mut bytes = storage.map_or_else(Vec::new, |old| old.inner.into_bytes_with_nul());
+        bytes.clear();
+        // Exactly the string's size: the conversion below keeps a buffer of
+        // that capacity and shrinks a larger one.
+        bytes.reserve_exact(text.len() + 1);
         bytes.extend_from_slice(text.as_bytes());
         bytes.push(0);
 
@@ -3420,20 +3585,50 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
     /// Copies only active rows into one tightly packed pixel allocation and
     /// copies metadata separately. The owned stride can be smaller than the
     /// SDK stride. Preserves format, timing, aspect ratio, and scan type.
+    /// [`Self::copy_into`] makes the same copy into an existing frame,
+    /// reusing its allocations.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidFrame`] if the packed copy is not a valid
     /// frame.
     pub fn try_to_owned(&self) -> Result<VideoFrame> {
-        // SAFETY: the guard owns the exact validated frame through copying.
+        self.copy_source().to_frame()
+    }
+
+    /// Copy this borrowed frame into `destination`, reusing its allocations.
+    ///
+    /// `destination` ends up exactly as [`Self::try_to_owned`] would have
+    /// returned it, whatever it held before: tightly packed active rows,
+    /// format, dimensions, frame rate, aspect ratio, scan type, timecode,
+    /// timestamp and metadata.
+    ///
+    /// Its pixel buffer is reused when its capacity holds the packed frame,
+    /// and otherwise replaced by one allocation of exactly that size. Its
+    /// metadata string is reused when the new text has the same length, and
+    /// otherwise the text takes one allocation. Copying frames of one shape
+    /// into the same destination therefore allocates nothing after the first
+    /// copy.
+    ///
+    /// The copy makes no SDK call. It runs wherever this reference may be
+    /// used: a receiver frame can be copied on a scoped worker thread, while a
+    /// FrameSync frame stays on its capture thread. The destination is an
+    /// ordinary owned frame either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidFrame`] if the packed copy is not a valid
+    /// frame. `destination` is then unchanged.
+    pub fn copy_into(&self, destination: &mut VideoFrame) -> Result<()> {
+        self.copy_source().copy_into(destination)
+    }
+
+    fn copy_source(&self) -> VideoCopySource<'_> {
+        // SAFETY: `new` validated the layout, header and metadata text from
+        // the frame this guard owns, and the guard keeps the SDK's pixels and
+        // metadata live and unchanged while `self` is borrowed.
         unsafe {
-            VideoFrame::from_raw_validated(
-                self.guard.frame(),
-                self.layout,
-                self.header,
-                self.metadata,
-            )
+            VideoCopySource::new(*self.guard.frame(), self.layout, self.header, self.metadata)
         }
     }
 }
@@ -3616,16 +3811,52 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
     /// Copies channel samples into tightly packed planar storage and copies
     /// metadata, allowing the frame to outlive the SDK buffer. Padding is omitted.
     /// Allocates one sample buffer, and one metadata string when present.
+    /// [`Self::copy_into`] makes the same copy into an existing frame,
+    /// reusing its allocations.
     ///
     /// # Errors
     ///
     /// None at present: capture validated everything the copy relies on. The
     /// `Result` matches [`VideoRef::try_to_owned`], whose copy can fail.
     pub fn try_to_owned(&self) -> Result<AudioFrame> {
-        // SAFETY: the guard owns the exact validated frame through copying.
-        Ok(unsafe {
-            AudioFrame::from_raw_validated(*self.guard.frame(), self.layout, self.metadata)
-        })
+        Ok(self.copy_source().to_frame())
+    }
+
+    /// Copy this borrowed frame into `destination`, reusing its allocations.
+    ///
+    /// `destination` ends up exactly as [`Self::try_to_owned`] would have
+    /// returned it, whatever it held before: the channels' samples packed
+    /// back to back without inter-channel padding, format, sample rate,
+    /// channel and sample counts, timecode, timestamp and metadata.
+    ///
+    /// Its sample buffer is reused when its capacity holds the packed
+    /// samples, and otherwise replaced by one allocation of exactly that
+    /// size. Its metadata string is reused when the new text has the same
+    /// length, and otherwise the text takes one allocation. Copying frames of
+    /// one shape into the same destination therefore allocates nothing after
+    /// the first copy.
+    ///
+    /// The copy makes no SDK call. It runs wherever this reference may be
+    /// used: a receiver frame can be copied on a scoped worker thread, while a
+    /// FrameSync frame stays on its capture thread. The destination is an
+    /// ordinary owned frame either way.
+    ///
+    /// # Errors
+    ///
+    /// None at present: capture validated everything the copy relies on, and
+    /// `destination` is always overwritten. The `Result` matches
+    /// [`VideoRef::copy_into`], whose copy can fail.
+    pub fn copy_into(&self, destination: &mut AudioFrame) -> Result<()> {
+        self.copy_source().copy_into(destination);
+        Ok(())
+    }
+
+    fn copy_source(&self) -> AudioCopySource<'_> {
+        // SAFETY: `from_guard` validated the layout, including sample
+        // alignment, and the metadata text from the frame this guard owns,
+        // and the guard keeps the SDK's samples and metadata live and
+        // unchanged while `self` is borrowed.
+        unsafe { AudioCopySource::new(*self.guard.frame(), self.layout, self.metadata) }
     }
 }
 
@@ -4435,6 +4666,18 @@ mod tests {
                 assert_eq!(normalized.timestamp(), None);
                 assert_eq!(normalized.line_stride_bytes(), copied.line_stride_bytes());
                 assert_eq!(normalized.metadata(), Some("<video-padding/>"));
+                // Copies into existing frames pack the same rows from the
+                // FrameSync view, over uninitialized padding, and from padded
+                // borrowed frames with and without metadata.
+                let bare = crate::BorrowedVideoFrame::builder(&initialized, 4, 4, format)
+                    .line_stride(stride)
+                    .build()
+                    .unwrap();
+                let sources: [&dyn CopySource<VideoFrame>; 3] = [&second, &send, &bare];
+                for source in sources {
+                    assert_eq!(source.owned().data(), expected);
+                    assert_copies_reuse(source, video_destinations("<video-padding/>".len()));
+                }
             }
         }
     }
@@ -6276,7 +6519,7 @@ mod tests {
             len: bytes.len() - 1,
         };
         let (copy, allocations) = crate::test_alloc::allocation_count(|| unsafe {
-            FrameMetadata::copy_from_raw_validated(bytes.as_ptr().cast(), layout)
+            FrameMetadata::copy_from_raw_validated(bytes.as_ptr().cast(), layout, None)
         });
         assert_eq!(allocations, 1);
         assert_eq!(copy.as_str(), frame.data());
@@ -7746,5 +7989,328 @@ mod tests {
             frame_ref.layout.sample_count, sample_count,
             "Cached sample_count should match expected"
         );
+    }
+
+    /// A borrowed frame's two owned copies: a new frame, and a copy into an
+    /// existing one.
+    trait CopySource<F> {
+        fn owned(&self) -> F;
+        fn copy(&self, destination: &mut F);
+    }
+
+    impl<S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> CopySource<VideoFrame> for VideoRef<'_, S> {
+        fn owned(&self) -> VideoFrame {
+            self.try_to_owned().unwrap()
+        }
+        fn copy(&self, destination: &mut VideoFrame) {
+            self.copy_into(destination).unwrap();
+        }
+    }
+
+    impl CopySource<VideoFrame> for crate::BorrowedVideoFrame<'_> {
+        fn owned(&self) -> VideoFrame {
+            self.try_to_owned().unwrap()
+        }
+        fn copy(&self, destination: &mut VideoFrame) {
+            self.copy_into(destination).unwrap();
+        }
+    }
+
+    impl<S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> CopySource<AudioFrame> for AudioRef<'_, S> {
+        fn owned(&self) -> AudioFrame {
+            self.try_to_owned().unwrap()
+        }
+        fn copy(&self, destination: &mut AudioFrame) {
+            self.copy_into(destination).unwrap();
+        }
+    }
+
+    /// An owned frame as a copy destination: the storage a copy can reuse,
+    /// and every field a copy sets.
+    trait CopyDestination {
+        /// The sample buffer's address, capacity and length, in elements.
+        fn buffer(&self) -> (*const (), usize, usize);
+        fn text(&self) -> Option<&str>;
+        /// Require the same layout, header, samples, metadata and timestamp,
+        /// and the frame's own buffer to fill its layout exactly.
+        fn assert_same(&self, expected: &Self);
+    }
+
+    impl CopyDestination for VideoFrame {
+        fn buffer(&self) -> (*const (), usize, usize) {
+            (
+                self.data.as_ptr().cast(),
+                self.data.capacity(),
+                self.data.len(),
+            )
+        }
+        fn text(&self) -> Option<&str> {
+            self.metadata()
+        }
+        fn assert_same(&self, expected: &Self) {
+            assert_eq!(self.data.len(), self.layout.data_len_bytes);
+            assert_eq!(
+                format!("{:?}", self.layout),
+                format!("{:?}", expected.layout)
+            );
+            assert_eq!(
+                format!("{:?}", self.header),
+                format!("{:?}", expected.header)
+            );
+            assert_eq!(self.data(), expected.data());
+            assert_eq!(self.metadata(), expected.metadata());
+            assert_eq!(self.timestamp(), expected.timestamp());
+        }
+    }
+
+    impl CopyDestination for AudioFrame {
+        fn buffer(&self) -> (*const (), usize, usize) {
+            (
+                self.data.as_ptr().cast(),
+                self.data.capacity(),
+                self.data.len(),
+            )
+        }
+        fn text(&self) -> Option<&str> {
+            self.metadata()
+        }
+        fn assert_same(&self, expected: &Self) {
+            assert_eq!(self.data.len(), self.layout.sample_count);
+            assert_eq!(
+                format!("{:?}", self.layout),
+                format!("{:?}", expected.layout)
+            );
+            assert_eq!(self.timecode(), expected.timecode());
+            assert_eq!(self.data(), expected.data());
+            assert_eq!(self.metadata(), expected.metadata());
+            assert_eq!(self.timestamp(), expected.timestamp());
+        }
+    }
+
+    /// Require `copy_into` to make each destination exactly the frame
+    /// `try_to_owned` returns, whatever it held, allocating only what the
+    /// destination lacks: a buffer too small for the packed copy, and a
+    /// metadata string of another length. Copying again into the result, a
+    /// copy loop's steady state, must allocate nothing and keep both
+    /// allocations.
+    fn assert_copies_reuse<F: CopyDestination>(source: &dyn CopySource<F>, destinations: Vec<F>) {
+        let expected = source.owned();
+        let needed = expected.buffer().2;
+        for mut destination in destinations {
+            let (pixels, capacity, _) = destination.buffer();
+            let fits = capacity >= needed;
+            let resized_text = expected
+                .text()
+                .is_some_and(|text| destination.text().map(str::len) != Some(text.len()));
+            let ((), allocations) =
+                crate::test_alloc::allocation_count(|| source.copy(&mut destination));
+            assert_eq!(allocations, usize::from(!fits) + usize::from(resized_text));
+            assert_eq!(destination.buffer().0 == pixels, fits);
+            destination.assert_same(&expected);
+
+            let (pixels, capacity, _) = destination.buffer();
+            let text = destination.text().map(str::as_ptr);
+            let ((), allocations) =
+                crate::test_alloc::allocation_count(|| source.copy(&mut destination));
+            assert_eq!(allocations, 0);
+            assert_eq!(destination.buffer().0, pixels);
+            assert_eq!(destination.buffer().1, capacity);
+            assert_eq!(destination.text().map(str::as_ptr), text);
+            destination.assert_same(&expected);
+        }
+    }
+
+    /// Frames a copy of a 4x4 video frame must overwrite completely, with
+    /// metadata of `metadata_len` bytes: larger, of another format and with
+    /// longer metadata; too small, without metadata; and planar, large
+    /// enough, with a timestamp and metadata of the same length.
+    fn video_destinations(metadata_len: usize) -> Vec<VideoFrame> {
+        let built = |width, height, format, metadata: Option<String>| {
+            let mut builder = VideoFrame::builder()
+                .resolution(width, height)
+                .pixel_format(format)
+                .timecode(Timecode::from_ticks(1));
+            if let Some(metadata) = metadata {
+                builder = builder.metadata(metadata);
+            }
+            builder.build().unwrap()
+        };
+        let mut planar = built(16, 8, PixelFormat::I420, Some("m".repeat(metadata_len)));
+        planar.timestamp = Some(SdkTimestamp::from_ticks(1));
+        vec![
+            built(
+                64,
+                32,
+                PixelFormat::Uyvy,
+                Some("<longer metadata/>".repeat(8)),
+            ),
+            built(2, 2, PixelFormat::Bgra, None),
+            planar,
+        ]
+    }
+
+    /// Frames a copy of fifteen samples must overwrite completely, with
+    /// metadata of `metadata_len` bytes: larger, with longer metadata; too
+    /// small, without metadata; and of another shape that holds exactly as
+    /// many samples, with a timestamp and metadata of the same length.
+    fn audio_destinations(metadata_len: usize) -> Vec<AudioFrame> {
+        let built = |channels, samples, metadata: Option<String>| {
+            let mut builder = AudioFrame::builder()
+                .sample_rate(44_100)
+                .num_channels(channels)
+                .num_samples(samples)
+                .timecode(Timecode::from_ticks(1));
+            if let Some(metadata) = metadata {
+                builder = builder.metadata(metadata);
+            }
+            builder.build().unwrap()
+        };
+        let mut reshaped = built(5, 3, Some("m".repeat(metadata_len)));
+        reshaped.timestamp = Some(SdkTimestamp::from_ticks(1));
+        vec![
+            built(8, 1024, Some("<longer metadata/>".repeat(8))),
+            built(1, 1, None),
+            reshaped,
+        ]
+    }
+
+    #[test]
+    fn audio_copy_into_skips_channel_padding_and_reuses_storage() {
+        use std::mem::MaybeUninit;
+        // Three channels of five samples, eight samples apart. Only samples
+        // are initialized; the slots between channels are not audio data.
+        let (channels, samples, stride) = (3, 5, 8);
+        let mut storage = [MaybeUninit::<f32>::uninit(); 21];
+        let mut expected = Vec::new();
+        for channel in 0..channels {
+            for sample in 0..samples {
+                let value = (10 * channel + sample) as f32 + 0.5;
+                storage[channel * stride + sample].write(value);
+                expected.push(value);
+            }
+        }
+        let metadata = CString::new("<audio-copy/>").unwrap();
+        let raw = NDIlib_audio_frame_v3_t {
+            sample_rate: 48_000,
+            no_channels: channels as i32,
+            no_samples: samples as i32,
+            FourCC: AudioFormat::Fltp.to_sdk(),
+            p_data: storage.as_mut_ptr().cast(),
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: (stride * 4) as i32,
+            },
+            timecode: 123,
+            timestamp: 456,
+            p_metadata: metadata.as_ptr(),
+        };
+        let bare = NDIlib_audio_frame_v3_t {
+            p_metadata: ptr::null(),
+            ..raw
+        };
+        // Null guards with no-op frees skip SDK calls; the samples and the
+        // metadata outlive every reference.
+        let (framesync, received, bare) = unsafe {
+            (
+                AudioRef::<FrameSyncAudioFree>::new(Guard::with_test_free(
+                    ptr::null_mut(),
+                    raw,
+                    |_, _| {},
+                )),
+                AudioFrameRef::new(RecvAudioGuard::with_test_free(
+                    ptr::null_mut(),
+                    raw,
+                    |_, _| {},
+                )),
+                AudioFrameRef::new(RecvAudioGuard::with_test_free(
+                    ptr::null_mut(),
+                    bare,
+                    |_, _| {},
+                )),
+            )
+        };
+        let (framesync, received, bare) = (framesync.unwrap(), received.unwrap(), bare.unwrap());
+        assert!(framesync.data().is_none());
+        let sources: [(&dyn CopySource<AudioFrame>, _); 3] = [
+            (&framesync, Some("<audio-copy/>")),
+            (&received, Some("<audio-copy/>")),
+            (&bare, None),
+        ];
+        for (source, metadata) in sources {
+            let owned = source.owned();
+            assert_eq!(owned.data(), expected);
+            assert_eq!(owned.channel_stride_bytes(), samples * 4);
+            assert_eq!(owned.metadata(), metadata);
+            assert_eq!(
+                (owned.sample_rate(), owned.timecode(), owned.timestamp()),
+                (
+                    48_000,
+                    Timecode::from_ticks(123),
+                    Some(SdkTimestamp::from_ticks(456))
+                )
+            );
+            assert_copies_reuse(source, audio_destinations("<audio-copy/>".len()));
+        }
+    }
+
+    /// One pass of the copy-and-send loop `BorrowedVideoFrame::copy_into`
+    /// documents, returning the address of the pixels it sent.
+    fn copy_and_send(
+        sender: &mut crate::Sender,
+        spare: &mut Option<VideoFrame>,
+        pixels: &[u8],
+    ) -> *const u8 {
+        let frame = crate::BorrowedVideoFrame::builder(pixels, 64, 32, PixelFormat::Bgra)
+            .line_stride(512)
+            .metadata(c"<copy-loop/>")
+            .build()
+            .unwrap();
+        let owned = match spare.take() {
+            Some(mut reused) => {
+                frame.copy_into(&mut reused).unwrap();
+                reused
+            }
+            None => frame.try_to_owned().unwrap(),
+        };
+        let sent = owned.data().as_ptr();
+        *spare = sender.send_video_async(owned).unwrap();
+        sent
+    }
+
+    #[test]
+    fn copy_and_send_loop_allocates_nothing_once_two_frames_exist() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let options =
+            crate::SenderOptions::new(crate::test_support::unique_name("frame copy loop"))
+                .clock_video(false);
+        let mut sender = crate::Sender::new(&ndi, &options).unwrap();
+        // 64 pixels per row, padded to a 512-byte stride.
+        let mut buffer = vec![0u8; 512 * 32];
+        let mut spare = None;
+        // The first two passes make the two frames that then alternate.
+        let first = copy_and_send(&mut sender, &mut spare, &buffer);
+        assert!(spare.is_none());
+        buffer.fill(1);
+        let second = copy_and_send(&mut sender, &mut spare, &buffer);
+        assert_eq!(spare.as_ref().unwrap().data().as_ptr(), first);
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            for shade in 2..10 {
+                buffer.fill(shade);
+                copy_and_send(&mut sender, &mut spare, &buffer);
+            }
+        });
+        assert_eq!(allocations, 0);
+        let last = sender.finish_video_async().unwrap();
+        let previous = spare.unwrap();
+        assert_eq!(
+            (last.data().as_ptr(), previous.data().as_ptr()),
+            (second, first)
+        );
+        for (frame, shade) in [(last, 9), (previous, 8)] {
+            assert_eq!(frame.data().len(), 64 * 32 * 4);
+            assert!(frame.data().iter().all(|&byte| byte == shade));
+            assert_eq!(frame.metadata(), Some("<copy-loop/>"));
+        }
     }
 }

@@ -461,7 +461,8 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     ///
     /// Active pixels are copied into tightly packed planes; row padding is
     /// skipped and the owned stride can shrink. Metadata is copied separately;
-    /// no reference to the source is retained.
+    /// no reference to the source is retained. [`Self::copy_into`] makes the
+    /// same copy into an existing frame, reusing its allocations.
     ///
     /// # Errors
     ///
@@ -471,13 +472,81 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         // SAFETY: The immutable slices retain initialized pixels and bounded UTF-8
         // metadata for these cached proofs throughout the active-row copy.
         unsafe {
-            VideoFrame::from_raw_validated(
-                &self.to_raw(),
+            crate::frames::VideoCopySource::new(
+                self.to_raw(),
                 self.layout,
                 self.header,
                 self.metadata_layout,
             )
         }
+        .to_frame()
+    }
+
+    /// Copy this borrowed frame into `destination`, reusing its allocations.
+    ///
+    /// `destination` ends up exactly as [`Self::try_to_owned`] would have
+    /// returned it, whatever it held before: tightly packed active rows,
+    /// format, dimensions, frame rate, aspect ratio, scan type, timecode and
+    /// metadata, and no timestamp. No reference to the source is retained.
+    ///
+    /// Its pixel buffer is reused when its capacity holds the packed frame,
+    /// and otherwise replaced by one allocation of exactly that size. Its
+    /// metadata string is reused when the new text has the same length, and
+    /// otherwise the text takes one allocation. Copying frames of one shape
+    /// into the same destination therefore allocates nothing after the first
+    /// copy. The copy makes no SDK call and can run on any thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidFrame`] if the packed copy is not a valid
+    /// frame. `destination` is then unchanged.
+    ///
+    /// # Example
+    ///
+    /// A copy-and-send loop that stops allocating once two frames exist.
+    /// [`Sender::send_video_async`] keeps the frame it is given until the next
+    /// send, and returns the previous one, which the SDK has finished with:
+    /// that frame is the destination of the next copy.
+    /// [`Sender::send_video_async_copy`] makes the same copy into a new frame
+    /// on every call instead.
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{BorrowedVideoFrame, Ndi, PixelFormat, Sender, SenderOptions, VideoFrame};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = Ndi::new()?;
+    /// let mut sender = Sender::new(&ndi, &SenderOptions::new("Copied"))?;
+    /// // 64 pixels per row, padded to a 512-byte stride.
+    /// let mut buffer = vec![0u8; 512 * 32];
+    /// let mut spare: Option<VideoFrame> = None;
+    /// for shade in 0..=255u8 {
+    ///     buffer.fill(shade); // the application draws into its own buffer
+    ///     let frame = BorrowedVideoFrame::builder(&buffer, 64, 32, PixelFormat::Bgra)
+    ///         .line_stride(512)
+    ///         .build()?;
+    ///     let owned = match spare.take() {
+    ///         Some(mut reused) => {
+    ///             frame.copy_into(&mut reused)?; // no allocation
+    ///             reused
+    ///         }
+    ///         None => frame.try_to_owned()?, // the first two frames only
+    ///     };
+    ///     spare = sender.send_video_async(owned)?;
+    /// }
+    /// sender.finish_video_async();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn copy_into(&self, destination: &mut VideoFrame) -> Result<()> {
+        // SAFETY: as for `try_to_owned`.
+        unsafe {
+            crate::frames::VideoCopySource::new(
+                self.to_raw(),
+                self.layout,
+                self.header,
+                self.metadata_layout,
+            )
+        }
+        .copy_into(destination)
     }
 
     /// Get the frame width in pixels.

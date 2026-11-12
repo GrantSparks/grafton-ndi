@@ -302,6 +302,14 @@ source stride. Format, plane order, metadata, timing, aspect ratio, and scan typ
 are preserved. Owned frames expose the same `planes()` views, without padding.
 Borrowed PNG/JPEG encoding reads active rows directly.
 
+`copy_into(&mut owned)` makes the same copy into an existing `VideoFrame` or
+`AudioFrame`, on receiver and FrameSync references and on `BorrowedVideoFrame`.
+The destination ends up exactly as `try_to_owned` would have made it, whatever
+it held before, but keeps its pixel or sample buffer when that is large enough
+and its metadata string when the text has the same length. A loop that copies
+frames of one shape into the same destination allocates nothing after the
+first copy.
+
 `VideoPlane`, `VideoRows`, and `VideoPlanes` implement `Send + Sync`. You can
 move preconstructed views into scoped workers or share them for immutable reads,
 including views from FrameSync. The frame stays borrowed until the workers
@@ -336,6 +344,36 @@ sender.send_video(&frame)?;
 
 let connections = sender.connection_count(Duration::from_millis(500))?;
 println!("connected receivers: {connections}");
+```
+
+To send pixels owned by another subsystem asynchronously without allocating a
+frame each time, copy them into a frame the sender has returned.
+`send_video_async` keeps the frame it is given until the next send, which
+returns the previous frame once the SDK has finished with it; that frame is the
+next copy's destination. Once the loop has made its two frames, the wrapper
+allocates nothing more. `send_video_async_copy` makes the same copy into a new
+frame on every call.
+
+```rust
+use grafton_ndi::{BorrowedVideoFrame, PixelFormat, Sender, SenderOptions, VideoFrame};
+
+let mut sender = Sender::new(&ndi, &SenderOptions::new("Copied Output"))?;
+let mut spare: Option<VideoFrame> = None;
+// BGRA rows of 1920 pixels, padded to an 8192-byte stride.
+while let Some(pixels) = renderer.next_frame() {
+    let frame = BorrowedVideoFrame::builder(pixels, 1920, 1080, PixelFormat::Bgra)
+        .line_stride(8192)
+        .build()?;
+    let owned = match spare.take() {
+        Some(mut reused) => {
+            frame.copy_into(&mut reused)?; // reuses its pixels and metadata
+            reused
+        }
+        None => frame.try_to_owned()?, // only the first two frames allocate
+    };
+    spare = sender.send_video_async(owned)?;
+}
+sender.finish_video_async();
 ```
 
 ### Use FrameSync
@@ -429,7 +467,7 @@ The crate's public API is organized around a small set of resource types:
 - `FrameSync` wraps a receiver for clock-corrected pull capture.
 - `VideoFrame`, `AudioFrame`, and `MetadataFrame` represent application-owned frame data.
 
-Most applications can start with owned frame APIs such as `receiver.video().capture()` and `sender.send_video()`. For receive hot paths, borrowed receive refs keep data in SDK buffers without an extra copy. `sender.send_video_async(frame)`, the SDK's asynchronous video send, takes `&mut Sender` and moves an owned `VideoFrame` into the sender without copying pixels. It returns the previous completed frame for reuse, and `Ok(None)` on the first call; a frame the sender refuses comes back inside `Rejected`. This avoids Rust wrapper pixel copies; SDK encoding and network processing may still copy data. Use two frames and call `finish_video_async()` to recover the final frame. For borrowed or padded-stride buffers, build a `BorrowedVideoFrame` and call `send_video(frame)`: the synchronous send reads the pixels and metadata in place without allocating or copying, and the SDK has released the buffer when the call returns, so it can be reused immediately. `send_video_async_copy(&frame)` is for the asynchronous pipeline: it copies pixels and metadata into sender-owned storage and returns the previous frame as `Result<Option<VideoFrame>>`. Owned frames are `Clone`; cloning copies their pixels.
+Most applications can start with owned frame APIs such as `receiver.video().capture()` and `sender.send_video()`. For receive hot paths, borrowed receive refs keep data in SDK buffers without an extra copy. `sender.send_video_async(frame)`, the SDK's asynchronous video send, takes `&mut Sender` and moves an owned `VideoFrame` into the sender without copying pixels. It returns the previous completed frame for reuse, and `Ok(None)` on the first call; a frame the sender refuses comes back inside `Rejected`. This avoids Rust wrapper pixel copies; SDK encoding and network processing may still copy data. Use two frames and call `finish_video_async()` to recover the final frame. For borrowed or padded-stride buffers, build a `BorrowedVideoFrame` and call `send_video(frame)`: the synchronous send reads the pixels and metadata in place without allocating or copying, and the SDK has released the buffer when the call returns, so it can be reused immediately. `send_video_async_copy(&frame)` is for the asynchronous pipeline: it copies pixels and metadata into sender-owned storage and returns the previous frame as `Result<Option<VideoFrame>>`. To copy without allocating, call `frame.copy_into(&mut previous)` on the frame the last send returned and submit it with `send_video_async`. Owned frames are `Clone`; cloning copies their pixels.
 
 Frames carry time as typed values in 100-nanosecond ticks: `Timecode` is the editorial timecode, which starts at `Timecode::SYNTHESIZE` (the SDK generates one) on every frame built for sending, and `SdkTimestamp` is the time the sender submitted a frame, which received frames report as `Option<SdkTimestamp>`. Frame rates are `FrameRate` values, and a pixel format converts to and from its `FourCc`.
 
@@ -451,7 +489,7 @@ Frame layout fields that describe SDK-facing memory are private. Builders, acces
 
 - Use owned frame APIs when clarity matters or when frame data must outlive the SDK capture buffer.
 - Use borrowed receive refs when you need direct access to SDK-owned buffers during a tight capture loop.
-- Use two owned video frames with `send_video_async` to reuse pixel allocations without per-send copies; send a `BorrowedVideoFrame` over an external or padded buffer with the synchronous `send_video`, which copies nothing, and use `send_video_async_copy` only when the asynchronous pipeline is wanted for a borrowed buffer, accepting the copy.
+- Use two owned video frames with `send_video_async` to reuse pixel allocations without per-send copies; send a `BorrowedVideoFrame` over an external or padded buffer with the synchronous `send_video`, which copies nothing, and use `send_video_async_copy` only when the asynchronous pipeline is wanted for a borrowed buffer, accepting the copy. `copy_into` copies a borrowed, received or FrameSync frame into an existing owned frame, reusing its storage, so copy loops into the frames `send_video_async` returns allocate nothing once two frames exist.
 - Use `FrameSync` when capture timing is driven by an external output clock.
 - Use lower bandwidth modes for previews and monitoring surfaces.
 - Keep image encoding off real-time paths unless the workload is sized for compression.
@@ -628,7 +666,7 @@ Sending:
 | `NDIlib_Send_Audio.rs` | `cargo run --example NDIlib_Send_Audio` | Send audio. |
 | `NDIlib_Send_Video.rs` | `cargo run --example NDIlib_Send_Video` | Send video. |
 | `async_send.rs` | `cargo run --example async_send` | Reuse two owned frames for async sending and recover completed frames. |
-| `async_send_copy.rs` | `cargo run --example async_send_copy` | Copy borrowed pixels into an async send. |
+| `async_send_copy.rs` | `cargo run --example async_send_copy` | Copy borrowed pixels into async sends, then into the frames they return. |
 | `zero_copy_send.rs` | `cargo run --example zero_copy_send` | Render into two reusable owned frames without per-send pixel copies. |
 
 Advanced SDK. These need the `advanced` feature, an Advanced SDK at build time and an Advanced runtime:
