@@ -396,9 +396,11 @@ def install(package, dest, *, archive=None, target=None, environ=None, pins=None
     dest.parent.mkdir(parents=True, exist_ok=True)
     # Removing the staging directory must never decide the outcome: on Windows the
     # installer's own files can still be locked then, and the error would replace
-    # the real one, or fail an installation that has already succeeded.
-    with tempfile.TemporaryDirectory(prefix='.ndi-sdk-', dir=dest.parent, ignore_cleanup_errors=True) as staging:
-        staging = Path(staging)
+    # the real one, or fail an installation that has already succeeded. The
+    # directory is made and removed here and not by tempfile.TemporaryDirectory,
+    # whose handling of cleanup errors differs between Python versions.
+    staging = Path(tempfile.mkdtemp(prefix='.ndi-sdk-', dir=dest.parent))
+    try:
         local = staging / ARCHIVE_NAME[pin['platform']]
         if isinstance(source, Download):
             download(source, local)
@@ -424,6 +426,11 @@ def install(package, dest, *, archive=None, target=None, environ=None, pins=None
             values['GRAFTON_NDI_EXPECTED_EDITION'] = pin['edition']
         # The destination appears only once every check has passed.
         publish(unpacked, dest)
+    finally:
+        try:
+            shutil.rmtree(staging)
+        except OSError:
+            pass  # a leftover directory is harmless; the outcome above stands
     return {name: str(path) for name, path in values.items()}
 
 

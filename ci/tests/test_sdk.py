@@ -462,17 +462,10 @@ class Publish(Workspace):
                     self.attempt(PermissionError(13, 'denied'))
                 self.assertEqual(self.renames > 1, retried)
 
-    def test_install_goes_through_publish_and_cleanup_errors_are_ignored(self):
+    def test_the_staging_directory_is_removed_after_an_install(self):
         data = linux_download()
-        real = tempfile.TemporaryDirectory
-        options = {}
-
-        def recording(*args, **kwargs):
-            options.update(kwargs)
-            return real(*args, **kwargs)
-        with mock.patch.object(sdk.tempfile, 'TemporaryDirectory', recording):
-            self.install(data)
-        self.assertIs(options.get('ignore_cleanup_errors'), True)
+        self.install(data)
+        self.assertEqual([p.name for p in self.work.iterdir() if p.name.startswith('.ndi-sdk-')], [])
 
     def test_a_failed_cleanup_neither_fails_an_install_nor_hides_its_error(self):
         data = linux_download()
@@ -485,7 +478,9 @@ class Publish(Workspace):
         with mock.patch('shutil.rmtree', locked):
             with self.assertRaisesRegex(sdk.SdkError, 'Version.txt'):
                 self.install(data, pins=self.pins(data, version='6.9.2'))
-            self.assertIn('NDI_SDK_DIR', self.install(data))
+            values = self.install(data)
+            self.assertIn('NDI_SDK_DIR', values)
+            self.assertTrue(Path(values['NDI_SDK_DIR']).is_dir())
 
 
 class NothingPrivateIsPrinted(Workspace):
