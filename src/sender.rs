@@ -95,20 +95,63 @@ pub struct Sender {
 
 type AsyncCallback = Box<dyn Fn(usize) + Send + Sync>;
 
+/// The sender's owned async video frame and whether the SDK may still read it.
+///
+/// A frame in flight always exists, so the state cannot say "in flight" without
+/// the allocation the SDK is reading.
 #[derive(Default)]
-struct VideoState {
-    pending: Option<VideoFrame>,
-    in_flight: bool,
+enum VideoState {
+    /// No frame is held.
+    #[default]
+    Idle,
+    /// The SDK has released the frame; it awaits recovery.
+    Retained(VideoFrame),
+    /// The SDK may still be reading the frame.
+    InFlight(VideoFrame),
 }
 
 impl VideoState {
+    fn is_in_flight(&self) -> bool {
+        matches!(self, Self::InFlight(_))
+    }
+
     // Claim notification before invoking user code so panic/reentry cannot
     // notify twice. The caller must first synchronize the SDK.
     fn completed(&mut self) -> Option<usize> {
-        if std::mem::take(&mut self.in_flight) {
-            self.pending.as_ref().map(|frame| frame.data().len())
-        } else {
-            None
+        match std::mem::take(self) {
+            Self::InFlight(frame) => {
+                let len = frame.data().len();
+                *self = Self::Retained(frame);
+                Some(len)
+            }
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+
+    /// Store a newly submitted frame and return the previous one, if any.
+    fn submit(&mut self, frame: VideoFrame) -> Option<VideoFrame> {
+        match std::mem::replace(self, Self::InFlight(frame)) {
+            Self::Idle => None,
+            Self::Retained(previous) | Self::InFlight(previous) => Some(previous),
+        }
+    }
+
+    /// Remove the held frame, leaving the state idle.
+    fn take_frame(&mut self) -> Option<VideoFrame> {
+        match std::mem::take(self) {
+            Self::Idle => None,
+            Self::Retained(frame) | Self::InFlight(frame) => Some(frame),
+        }
+    }
+
+    #[cfg(test)]
+    fn frame(&self) -> Option<&VideoFrame> {
+        match self {
+            Self::Idle => None,
+            Self::Retained(frame) | Self::InFlight(frame) => Some(frame),
         }
     }
 }
@@ -123,7 +166,7 @@ impl Inner {
     fn complete(&self) {
         let len = {
             let mut video = self.video.lock().unwrap_or_else(|e| e.into_inner());
-            if video.in_flight {
+            if video.is_in_flight() {
                 flush_null_frame(self.core, self.instance);
             }
             video.completed()
@@ -725,8 +768,7 @@ impl Sender {
             // Store the new owner before FFI, retaining the old owner locally
             // until this call synchronizes its SDK access. Moving a frame does
             // not move its Vec/CString allocations.
-            let previous = video.pending.replace(frame);
-            video.in_flight = true;
+            let previous = video.submit(frame);
             // SAFETY: the sender instance is live for this borrow, and every pointer
             // passed outlives the synchronous call.
             unsafe {
@@ -751,11 +793,11 @@ impl Sender {
     pub fn finish_video_async(&mut self) -> Option<VideoFrame> {
         let (previous, len) = {
             let mut video = self.inner.video.lock().unwrap_or_else(|e| e.into_inner());
-            if video.in_flight {
+            if video.is_in_flight() {
                 flush_null_frame(self.inner.core, self.inner.instance);
             }
             let len = video.completed();
-            (video.pending.take(), len)
+            (video.take_frame(), len)
         };
         self.inner.notify(len);
         previous
@@ -1074,7 +1116,7 @@ impl Sender {
 impl Drop for Inner {
     fn drop(&mut self) {
         let video = self.video.get_mut().unwrap_or_else(|e| e.into_inner());
-        if video.in_flight {
+        if video.is_in_flight() {
             flush_null_frame(self.core, self.instance);
         }
         let len = video.completed();
@@ -1275,7 +1317,7 @@ mod tests {
         assert!(sender.send_video_async(first).is_none());
         {
             let video = sender.inner.video.lock().unwrap();
-            let Some(frame) = &video.pending else {
+            let Some(frame) = video.frame() else {
                 panic!("missing owned frame")
             };
             assert_eq!(frame.to_raw().p_data, pixels as *mut u8);
@@ -1333,7 +1375,7 @@ mod tests {
         }
         {
             let video = sender.inner.video.lock().unwrap();
-            let Some(copy) = &video.pending else {
+            let Some(copy) = video.frame() else {
                 panic!("missing copied snapshot")
             };
             assert_ne!(copy.data().as_ptr(), data.as_ptr());
@@ -1343,7 +1385,7 @@ mod tests {
         drop(metadata);
         {
             let video = sender.inner.video.lock().unwrap();
-            let Some(copy) = &video.pending else {
+            let Some(copy) = video.frame() else {
                 panic!("missing copied snapshot")
             };
             assert_eq!(copy.data(), vec![3; 1024]);
