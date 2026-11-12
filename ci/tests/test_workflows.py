@@ -6,6 +6,7 @@ actionlint, in the same job, checks that the files are valid workflows at all.
 """
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tomllib
 import unittest
@@ -257,25 +258,48 @@ class Rules(unittest.TestCase):
                 workflows.load(text)
 
 
-def checkable(target, pin, *, all_features):
+def checkable(target, pin, *, all_features, headers=None):
     """What tests can check in a build for `target` running against the package `pin`.
 
-    This restates the crate's test policy: the Discovery Server tests are Linux
-    only and need a 6.4 runtime; the Advanced tests need the `advanced` feature
-    and an Advanced SDK; the File tests need the `file-io` feature and a File
-    library the runtime can drive, which is an Advanced runtime everywhere
-    except Windows, where the library is edition-neutral and ships for x64.
+    `headers` is the package the build reads its headers from, `pin` itself
+    unless given. This restates the crate's test policy: the Discovery Server
+    tests are Linux only and need a 6.4 runtime; the Advanced tests need the
+    `advanced` feature, an Advanced runtime and Advanced headers; the File tests
+    need the `file-io` feature and a File library the runtime can drive, which
+    is an Advanced runtime everywhere except Windows, where the library is
+    edition-neutral and ships for x64. The HEVC decode test is an Advanced test
+    that also needs a 6.4 runtime and an NDI|HX decoder, which is built into the
+    runtime on Windows and macOS; no Linux row installs one.
     """
     platform, advanced = pin['platform'], pin['edition'] == 'advanced'
+    declared = (headers or pin)['edition'] == 'advanced'
     current = sdk.version_tuple(pin['version']) >= (6, 4, 0, 0)
     found = {'1'}
     if platform == 'linux' and current:
         found.add('discovery-server')
-    if all_features and advanced:
+    if all_features and advanced and declared:
         found.add('advanced')
+        if current and platform in ('windows', 'apple'):
+            found.add('hx-decoder')
     if all_features and current and (target == 'x86_64-pc-windows-msvc' if platform == 'windows' else advanced):
         found.add('file')
     return found
+
+
+def exported_promises(step, require):
+    """The GRAFTON_NDI_REQUIRE_RUNTIME that each edition's pass of a compatibility step exports.
+
+    Bash runs the step's loop with only its lines that set the promise, `matrix.require` replaced by `require`.
+    """
+    lines = [line for line in step['run'].splitlines()
+             if line.lstrip().startswith('for edition in') or 'require' in line.lower()]
+    script = '\n'.join(lines + ['  echo "$edition $GRAFTON_NDI_REQUIRE_RUNTIME"', 'done'])
+    script = script.replace('${{ matrix.require }}', require)
+    if '${{' in script:
+        raise AssertionError(f'a promise line reads another expression:\n{script}')
+    output = subprocess.run(['bash', '-eo', 'pipefail', '-c', script], capture_output=True, text=True, check=True)
+    return {edition: set(promise.split(',')) | {'1'}
+            for edition, promise in (line.split(' ', 1) for line in output.stdout.splitlines())}
 
 
 class SdkJob(unittest.TestCase):
@@ -342,6 +366,22 @@ class SdkJob(unittest.TestCase):
         for name in ('NDI_RUNTIME_DIR_V6', 'GRAFTON_NDI_EXPECTED_VERSION',
                      'GRAFTON_NDI_EXPECTED_EDITION', 'GRAFTON_NDI_EXPECTED_RUNTIME'):
             self.assertIn(f'export {name}="${{{{ steps.sdk.outputs.{name} }}}}"', steps[1]['run'])
+
+    def test_each_compatibility_pass_promises_exactly_what_it_can_check(self):
+        """The first step builds with the row's headers against each baseline runtime, the second with each
+        baseline's headers against the row's runtime; a Standard baseline has no headers a build reads."""
+        baseline_runtimes, baseline_headers = [step for step in self.job['steps'] if step.get('if') == 'matrix.compatibility']
+        for row in (row for row in self.rows if 'compatibility' in row):
+            current, target = self.pins[row['package']], row['target']
+            baselines = {'standard': self.pins[row['compatibility']], 'advanced': self.pins[row['compatibility-advanced']]}
+            with self.subTest(row=row['name'], step=baseline_runtimes['name']):
+                self.assertEqual(exported_promises(baseline_runtimes, row['require']),
+                                 {edition: checkable(target, pin, all_features=True, headers=current)
+                                  for edition, pin in baselines.items()})
+            with self.subTest(row=row['name'], step=baseline_headers['name']):
+                self.assertEqual(exported_promises(baseline_headers, row['require']),
+                                 {edition: checkable(target, current, all_features=True, headers=pin)
+                                  for edition, pin in baselines.items()})
 
     def test_readme_matrix_table_matches_the_workflow(self):
         readme = (ROOT / 'ci' / 'README.md').read_text(encoding='utf-8')

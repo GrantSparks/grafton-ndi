@@ -2348,6 +2348,10 @@ fn hevc_444_decodes_to_the_original_full_resolution_chroma_planes() {
     if ndi.require_feature(RuntimeFeature::ReceiveBest444).is_err() {
         return;
     }
+    // Without a decoder the runtime delivers black full-HD frames instead.
+    if !common::hx_decoder(&ndi) {
+        return;
+    }
     let _turn = sockets();
     let mut sender = CompressedSender::new(&ndi, &options("hevc-444")).unwrap();
     let receiver = Receiver::new(

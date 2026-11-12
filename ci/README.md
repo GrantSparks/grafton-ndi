@@ -59,12 +59,12 @@ workflow by the script tests.
 | windows-x64 standard-6.3.2 | windows-2025 | x86_64-pc-windows-msvc | 6.3.2-standard-windows | `1` | `1` | |
 | windows-x64 advanced-6.3.2 | windows-2025 | x86_64-pc-windows-msvc | 6.3.2-advanced-windows | `advanced` | `1` | Advanced lint |
 | windows-x64 standard-6.4 | windows-2025 | x86_64-pc-windows-msvc | current-standard-windows | `1,file` | `1` | |
-| windows-x64 advanced-6.4 | windows-2025 | x86_64-pc-windows-msvc | current-advanced-windows | `advanced,file` | `1` | Advanced lint |
-| windows-x86 advanced-6.4 | windows-2025 | i686-pc-windows-msvc | current-advanced-windows | `advanced` | `1` | Advanced lint |
+| windows-x64 advanced-6.4 | windows-2025 | x86_64-pc-windows-msvc | current-advanced-windows | `advanced,file,hx-decoder` | `1` | Advanced lint |
+| windows-x86 advanced-6.4 | windows-2025 | i686-pc-windows-msvc | current-advanced-windows | `advanced,hx-decoder` | `1` | Advanced lint |
 | macos-arm64 standard-6.3.2 | macos-15 | aarch64-apple-darwin | 6.3.2-standard-apple | `1` | `1` | |
 | macos-arm64 advanced-6.3.2 | macos-15 | aarch64-apple-darwin | 6.3.2-advanced-apple | `advanced` | `1` | Advanced lint |
 | macos-arm64 standard-6.4 | macos-15 | aarch64-apple-darwin | current-standard-apple | `1` | `1` | Apple mobile builds |
-| macos-arm64 advanced-6.4 | macos-15 | aarch64-apple-darwin | current-advanced-apple | `advanced,file` | `1` | Advanced lint, Apple mobile builds |
+| macos-arm64 advanced-6.4 | macos-15 | aarch64-apple-darwin | current-advanced-apple | `advanced,file,hx-decoder` | `1` | Advanced lint, Apple mobile builds |
 | macos-x64 standard-6.4 | macos-15-intel | x86_64-apple-darwin | current-standard-apple | `1` | `1` | |
 
 On the Linux x64, Windows x64 and macOS ARM64 current Advanced rows, four
@@ -79,10 +79,10 @@ other SDK, under the same network confinement, which sends to a receiver on the
 run's runtime; the test checks video pixels, audio samples, timecodes and
 metadata. A run with a Standard runtime promises `1`, a run with an Advanced
 baseline runtime `advanced`, and a run with the current Advanced runtime the
-row's promise, with `advanced` replaced by `1` when the build has no Advanced
-declarations. Every run checks the loaded runtime's version, edition and path against
-the values `sdk.py` exported for it. Advanced operations without matching build
-declarations report unavailable.
+row's promise, with `advanced` replaced by `1` and `hx-decoder` dropped when
+the build has no Advanced declarations. Every run checks the loaded runtime's
+version, edition and path against the values `sdk.py` exported for it. Advanced
+operations without matching build declarations report unavailable.
 
 Each row:
 
@@ -148,12 +148,19 @@ mistake cannot pass as a skip:
 | `advanced` | an Advanced runtime, compiled with its headers | the `advanced` feature is on |
 | `file` | a File library the selected runtime can drive: an Advanced runtime on Linux and macOS, any 6.4 runtime on 64-bit Windows | the `file-io` feature is on |
 | `discovery-server` | the SDK's Discovery Server program and a 6.4 runtime, whose advertisers and listeners can use it | the target is Linux |
+| `hx-decoder` | an NDI\|HX video decoder the selected runtime can use. It is built into the runtime on Windows and macOS. On Linux the runtime needs the NDI\|HX Driver or FFmpeg 7, and the runner has neither | the `advanced` feature is on |
 
 A promise that no test in a build can check is itself a failure, and a missing
 one lets a test skip, so each step promises exactly what its build can check:
 the all-features step everything the row's package provides, the
 no-default-features step only `1` and, on Linux with a 6.4 package,
 `discovery-server`. The script tests hold every row to this rule.
+
+The only test of `hx-decoder` sends HEVC 4:4:4 from an Advanced sender and
+decodes it with the 6.4 Best444 receiver mode, so only the Windows and macOS
+Advanced 6.4 rows promise it. Without a decoder the runtime delivers black
+1920x1080 frames instead of the picture, so the test looks for one first:
+`hx_decoder()` in `src/test_support.rs` lists where.
 
 ## SDK packages
 

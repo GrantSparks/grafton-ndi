@@ -160,6 +160,8 @@ jobs:
       #   advanced          an Advanced runtime, compiled with its headers
       #   file              a File library the selected runtime can drive
       #   discovery-server  the SDK's Discovery Server program (Linux, 6.4)
+      #   hx-decoder        an NDI|HX video decoder (built into the runtime on
+      #                     Windows and macOS; no Linux row installs one)
       # Each step promises exactly what its build can check. A build without the
       # advanced and file-io features can check only the first and the last, so
       # the no-default-features step promises `require-no-default`, or `1` in a
@@ -229,12 +231,12 @@ jobs:
             package: current-advanced-windows
             compatibility: 6.3.2-standard-windows
             compatibility-advanced: 6.3.2-advanced-windows
-            require: advanced,file
+            require: advanced,file,hx-decoder
           - name: windows-x86 advanced-6.4
             runner: windows-2025
             target: i686-pc-windows-msvc
             package: current-advanced-windows
-            require: advanced
+            require: advanced,hx-decoder
           - name: macos-arm64 standard-6.3.2
             runner: macos-15
             target: aarch64-apple-darwin
@@ -257,7 +259,7 @@ jobs:
             package: current-advanced-apple
             compatibility: 6.3.2-standard-apple
             compatibility-advanced: 6.3.2-advanced-apple
-            require: advanced,file
+            require: advanced,file,hx-decoder
             apple-mobile: true
           - name: macos-x64 standard-6.4
             runner: macos-15-intel
@@ -363,7 +365,8 @@ jobs:
             cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features
           done
       # A Standard baseline SDK has no headers a build reads, so its pass is a
-      # build without Advanced declarations.
+      # build without Advanced declarations. That build can check neither
+      # `advanced` nor `hx-decoder`, whose only test sends from an Advanced sender.
       - name: Baseline SDK builds with the current Advanced runtime
         if: matrix.compatibility
         run: |
@@ -377,7 +380,7 @@ jobs:
             export GRAFTON_NDI_EXPECTED_VERSION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_VERSION }}"
             export GRAFTON_NDI_EXPECTED_EDITION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_EDITION }}"
             require="${{ matrix.require }}"
-            if [ "$edition" = standard ]; then require="${require/advanced/1}"; fi
+            if [ "$edition" = standard ]; then require="${require/advanced/1}"; require="${require/,hx-decoder/}"; fi
             export GRAFTON_NDI_REQUIRE_RUNTIME="$require"
             cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features
           done

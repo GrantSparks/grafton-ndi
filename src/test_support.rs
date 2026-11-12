@@ -35,14 +35,33 @@ pub enum Requirement {
     /// selected runtime belongs to, and a runtime whose advertisers and
     /// listeners can use it. Listed as `discovery-server`.
     DiscoveryServer,
+    /// An NDI|HX video decoder the selected runtime can use, which a test that
+    /// receives HEVC or H.264 video as pictures needs. Listed as `hx-decoder`.
+    ///
+    /// The runtime finds its decoder when it runs and has no query for it.
+    /// Without one, a receiver is given black 1920x1080 UYVY frames in place of
+    /// the picture. The Advanced SDK manual documents the decoder as built in
+    /// on Windows and macOS. On Linux, NDI 6.4.0.2 was measured, with strace,
+    /// to decode only through:
+    ///
+    /// * the NDI|HX Driver for Linux, `libndihx.so` with its bundled
+    ///   `libavcodec-ndi.so.61` and the other `-ndi` FFmpeg 7 libraries,
+    ///   copied beside `libndi.so.6` or `libndi_advanced.so.6`; or
+    /// * FFmpeg 7's `libavcodec-ndi.so.61` or `libavcodec.so.61` wherever the
+    ///   dynamic loader finds it.
+    ///
+    /// An older FFmpeg, such as the 6.x of Ubuntu 24.04, does not count.
+    /// [`hx_decoder`] looks in those places.
+    HxDecoder,
 }
 
 impl Requirement {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Runtime,
         Self::Advanced,
         Self::File,
         Self::DiscoveryServer,
+        Self::HxDecoder,
     ];
 
     /// Its spelling in `GRAFTON_NDI_REQUIRE_RUNTIME`.
@@ -52,6 +71,7 @@ impl Requirement {
             Self::Advanced => "advanced",
             Self::File => "file",
             Self::DiscoveryServer => "discovery-server",
+            Self::HxDecoder => "hx-decoder",
         }
     }
 
@@ -62,6 +82,7 @@ impl Requirement {
             Self::Advanced => "the Advanced SDK",
             Self::File => "the NDI File library",
             Self::DiscoveryServer => "the SDK's Discovery Server",
+            Self::HxDecoder => "an NDI|HX video decoder",
         }
     }
 
@@ -80,6 +101,9 @@ impl Requirement {
                 cfg!(all(target_os = "linux", not(ndi_link_static))),
                 "a Linux target that loads the runtime dynamically",
             ),
+            // The only test that decodes NDI|HX sends it from an Advanced
+            // compressed sender.
+            Self::HxDecoder => missing(cfg!(feature = "advanced"), "the `advanced` feature"),
         }
     }
 
@@ -103,8 +127,8 @@ impl Requirement {
                     .find(|requirement| requirement.token() == entry)
                     .unwrap_or_else(|| {
                         panic!(
-                            "{REQUIRE_RUNTIME} lists {entry:?}; expected 1, advanced, file or \
-                             discovery-server"
+                            "{REQUIRE_RUNTIME} lists {entry:?}; expected 1, advanced, file, \
+                             discovery-server or hx-decoder"
                         )
                     })
             })
@@ -215,6 +239,102 @@ pub fn advanced_ndi() -> Option<Ndi> {
             None
         }
     }
+}
+
+/// Whether the selected runtime has an NDI|HX video decoder. When it has none,
+/// the calling test is reported as skipped.
+///
+/// The runtime has no query for its decoder, so this looks where
+/// [`Requirement::HxDecoder`] says the runtime does. The answer restates the
+/// vendor's documentation for Windows and macOS and, on Linux, what NDI
+/// 6.4.0.2 was measured with strace to open. It is not a vendor API: a runtime
+/// that looks elsewhere needs this updated.
+///
+/// # Panics
+///
+/// Panics when no decoder is found and `GRAFTON_NDI_REQUIRE_RUNTIME` promises
+/// `hx-decoder`.
+pub fn hx_decoder(ndi: &Ndi) -> bool {
+    match missing_hx_decoder(ndi) {
+        None => true,
+        Some(reason) => {
+            skip(Requirement::HxDecoder, &reason);
+            false
+        }
+    }
+}
+
+/// The NDI|HX decoder is part of the runtime on Windows and macOS.
+#[cfg(any(windows, target_os = "macos"))]
+fn missing_hx_decoder(_: &Ndi) -> Option<String> {
+    None
+}
+
+/// Why the runtime has no NDI|HX decoder on Linux, or `None` when it has one.
+///
+/// The runtime library's search path is `$ORIGIN`, and it asks the dynamic
+/// loader for each name below. So a decoder counts when the copy in the
+/// directory the runtime was loaded from loads, or when the loader of this
+/// process can load it by name. A copy that is present but cannot load, for
+/// want of `libcurl.so.4` for example, decodes nothing. Loading runs only the
+/// library's initializers, which the runtime would run too, and it is
+/// unloaded again at once.
+#[cfg(target_os = "linux")]
+fn missing_hx_decoder(ndi: &Ndi) -> Option<String> {
+    use std::{ffi::OsString, path::Path};
+
+    /// The NDI|HX Driver, then FFmpeg 7's decoder under the name of the
+    /// driver's copy and under its own.
+    const DECODERS: [&str; 3] = ["libndihx.so", "libavcodec-ndi.so.61", "libavcodec.so.61"];
+
+    let directory = ndi.info().library_path().and_then(Path::parent);
+    let mut failures = Vec::new();
+    for name in DECODERS {
+        let beside = directory
+            .map(|directory| directory.join(name))
+            .filter(|path| path.is_file());
+        for candidate in beside
+            .map(OsString::from)
+            .into_iter()
+            .chain([OsString::from(name)])
+        {
+            // SAFETY: loading runs the library's initializers. These are the
+            // libraries the NDI runtime itself loads to decode NDI|HX; nothing
+            // in them is called, and the handle is closed when it is dropped.
+            match unsafe { libloading::Library::new(&candidate) } {
+                Ok(_) => return None,
+                // The loader's own message, which names the file it tried, is
+                // the source of libloading's error.
+                Err(error) => failures.push(match std::error::Error::source(&error) {
+                    Some(cause) => cause.to_string(),
+                    None => error.to_string(),
+                }),
+            }
+        }
+    }
+    let places = directory.map_or_else(
+        || "by name (a statically linked runtime has no directory)".to_owned(),
+        |directory| {
+            format!(
+                "from beside the runtime in {} or by name",
+                directory.display()
+            )
+        },
+    );
+    Some(format!(
+        "the NDI runtime has no NDI|HX video decoder: none of {} loads {places} ({})",
+        DECODERS.join(", "),
+        failures.join("; ")
+    ))
+}
+
+/// No NDI|HX decoder is documented for other targets.
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn missing_hx_decoder(_: &Ndi) -> Option<String> {
+    Some(format!(
+        "no NDI|HX video decoder is documented for {}",
+        std::env::consts::OS
+    ))
 }
 
 /// Assert the identity promised by SDK provisioning against the module loaded

@@ -355,10 +355,11 @@ fn sender_reports_its_source() {
 The helpers live in `src/test_support.rs`. Unit tests use them as
 `crate::test_support`, and integration tests through `mod common;`:
 
-| Helper | Returns `None`, and reports a skip, when |
+| Helper | Reports a skip, and returns `None` or `false`, when |
 | --- | --- |
 | `ndi()` | no NDI runtime library can be loaded |
 | `advanced_ndi()` | the runtime is not an Advanced SDK runtime, or the build lacks the declarations for Advanced sender configuration |
+| `hx_decoder(&ndi)` | the runtime has no NDI\|HX video decoder. Windows and macOS runtimes have one built in. On Linux the helper loads `libndihx.so`, `libavcodec-ndi.so.61` or `libavcodec.so.61` from beside the runtime library or by name through the dynamic loader, which is where NDI 6.4.0.2 was measured to look |
 | `skip(Requirement::…, reason)` | called directly by a test that found another requirement unmet, such as the File library or the Discovery Server |
 
 A skip is printed to standard error as `skipped: <test> needs <requirement>`,
@@ -369,13 +370,14 @@ on one machine do not collide on it (see below).
 
 `GRAFTON_NDI_REQUIRE_RUNTIME` turns skips into failures. Its value is a
 comma-separated list of what the environment provides: `1` for any runtime,
-`advanced`, `file`, and `discovery-server`. An environment that sets
+`advanced`, `file`, `discovery-server`, and `hx-decoder` for an NDI|HX video
+decoder. An environment that sets
 `GRAFTON_NDI_REQUIRE_RUNTIME=advanced` fails every test that would have skipped
 for lack of an Advanced runtime, so a run that was meant to cover the Advanced
-paths cannot pass without them. An entry that is not one of the four is
+paths cannot pass without them. An entry that is not one of the five is
 rejected when a skip consults it. An entry that no test in the build can check
-fails the run as well, for example `advanced` without the `advanced` feature,
-because such a promise could never be broken.
+fails the run as well, for example `advanced` or `hx-decoder` without the
+`advanced` feature, because such a promise could never be broken.
 
 Two more groups of variables make a run check what it ran against:
 
