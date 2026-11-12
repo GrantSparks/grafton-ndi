@@ -5,5 +5,5 @@ fn main() {
         .build()
         .unwrap();
     pixels.fill(1);
-    let _ = frame.try_to_owned();
+    let _ = frame.to_owned();
 }

@@ -328,7 +328,7 @@ fn decoded<K: CaptureKind>(frame: Guard<'_, K>) -> Result<K::Owned> {
     // SAFETY: a receiver guard of kind `K` holds a frame its capture delivered
     // as that kind; the view validates the rest before reading through it.
     let frame = unsafe { K::make_ref(frame)? };
-    K::ref_to_owned(&frame)
+    Ok(K::ref_to_owned(&frame))
 }
 
 #[cfg(test)]

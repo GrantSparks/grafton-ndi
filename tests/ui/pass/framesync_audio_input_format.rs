@@ -17,7 +17,7 @@ fn follow_source_channels(fs: &FrameSync) -> Result<(), grafton_ndi::Error> {
     // A capture is always a frame of samples, borrowed or owned.
     let borrowed = fs.capture_audio_ref(request)?;
     let _: AudioFormat = borrowed.format();
-    let _: AudioFrame = borrowed.try_to_owned()?;
+    let _: AudioFrame = borrowed.to_owned();
     let _: AudioFrame = fs.capture_audio(request)?;
     Ok(())
 }

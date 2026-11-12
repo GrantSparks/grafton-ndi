@@ -4,5 +4,5 @@ fn main() {
     // A copy reads its source while it rewrites its destination, so a view
     // of a frame cannot be copied into that frame.
     let view = BorrowedVideoFrame::from(&frame);
-    view.copy_into(&mut frame).unwrap();
+    view.copy_into(&mut frame);
 }

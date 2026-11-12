@@ -7,5 +7,5 @@ fn main() {
         .build()
         .unwrap();
     drop(metadata);
-    let _ = frame.try_to_owned();
+    let _ = frame.to_owned();
 }

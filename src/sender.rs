@@ -493,11 +493,9 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// no reference to the source is retained. [`Self::copy_into`] makes the
     /// same copy into an existing frame, reusing its allocations.
     ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidFrame`] if the packed copy is not a valid
-    /// frame.
-    pub fn try_to_owned(&self) -> Result<VideoFrame> {
+    /// The copy cannot fail: building the frame validated everything it
+    /// relies on, and the packed layout of a valid frame is valid.
+    pub fn to_owned(&self) -> VideoFrame {
         // SAFETY: The immutable slices retain initialized pixels and bounded UTF-8
         // metadata for these cached proofs throughout the active-row copy.
         unsafe {
@@ -513,7 +511,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
 
     /// Copy this borrowed frame into `destination`, reusing its allocations.
     ///
-    /// `destination` ends up exactly as [`Self::try_to_owned`] would have
+    /// `destination` ends up exactly as [`Self::to_owned`] would have
     /// returned it, whatever it held before: tightly packed active rows,
     /// format, dimensions, frame rate, aspect ratio, scan type, timecode and
     /// metadata, and no timestamp. No reference to the source is retained.
@@ -524,11 +522,6 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// otherwise the text takes one allocation. Copying frames of one shape
     /// into the same destination therefore allocates nothing after the first
     /// copy. The copy makes no SDK call and can run on any thread.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidFrame`] if the packed copy is not a valid
-    /// frame. `destination` is then unchanged.
     ///
     /// # Example
     ///
@@ -554,10 +547,10 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     ///         .build()?;
     ///     let owned = match spare.take() {
     ///         Some(mut reused) => {
-    ///             frame.copy_into(&mut reused)?; // no allocation
+    ///             frame.copy_into(&mut reused); // no allocation
     ///             reused
     ///         }
-    ///         None => frame.try_to_owned()?, // the first two frames only
+    ///         None => frame.to_owned(), // the first two frames only
     ///     };
     ///     spare = sender.send_video_async(owned)?;
     /// }
@@ -565,8 +558,8 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn copy_into(&self, destination: &mut VideoFrame) -> Result<()> {
-        // SAFETY: as for `try_to_owned`.
+    pub fn copy_into(&self, destination: &mut VideoFrame) {
+        // SAFETY: as for `to_owned`.
         unsafe {
             crate::frames::VideoCopySource::new(
                 self.to_raw(),
@@ -575,7 +568,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
                 self.metadata_layout,
             )
         }
-        .copy_into(destination)
+        .copy_into(destination);
     }
 
     /// Get the pixel data: exactly the frame's validated storage, including
@@ -963,14 +956,13 @@ impl Sender {
     ///
     /// Returns [`Error::UnsupportedCapability`] if this sender's runtime
     /// cannot send the frame's pixel format, checked before anything is
-    /// copied, or an error if the borrowed frame cannot be represented as a
-    /// supported owned video layout. No pending send is changed on failure.
+    /// copied. No pending send is changed on failure.
     pub fn send_video_async_copy(
         &mut self,
         frame: &BorrowedVideoFrame<'_>,
     ) -> Result<Option<VideoFrame>> {
         self.require_video_format(frame.pixel_format())?;
-        let owned = frame.try_to_owned()?;
+        let owned = frame.to_owned();
         Ok(self.submit_video_async(owned))
     }
 
@@ -1984,7 +1976,7 @@ mod tests {
                 });
                 assert_eq!(allocations, 0);
                 let (owned, allocations) =
-                    crate::test_alloc::allocation_count(|| borrowed.try_to_owned().unwrap());
+                    crate::test_alloc::allocation_count(|| borrowed.to_owned());
                 assert_eq!(allocations, 2);
                 assert_eq!(owned.frame_rate(), rate);
                 assert_eq!(owned.picture_aspect_ratio(), 1.25);
@@ -2029,8 +2021,7 @@ mod tests {
                 builder = builder.metadata(metadata);
             }
             let frame = builder.build().unwrap();
-            let (owned, allocations) =
-                crate::test_alloc::allocation_count(|| frame.try_to_owned().unwrap());
+            let (owned, allocations) = crate::test_alloc::allocation_count(|| frame.to_owned());
             assert_eq!(allocations, 1 + usize::from(metadata.is_some()));
             assert_eq!(owned.metadata(), metadata.map(|_| ""));
         }

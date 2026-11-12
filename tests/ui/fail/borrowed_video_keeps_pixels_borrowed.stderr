@@ -6,5 +6,5 @@ error[E0502]: cannot borrow `pixels` as mutable because it is also borrowed as i
 ...
 7 |     pixels.fill(1);
   |     ^^^^^^ mutable borrow occurs here
-8 |     let _ = frame.try_to_owned();
+8 |     let _ = frame.to_owned();
   |             ----- immutable borrow later used here

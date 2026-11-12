@@ -19,7 +19,7 @@ fn main() {
         scope.spawn(move || plane.rows().count());
         scope.spawn(move || planes.flat_map(|plane| plane.rows()).count());
     });
-    let owned = frame.try_to_owned().unwrap();
+    let owned = frame.to_owned();
     assert!(frame
         .planes()
         .zip(owned.planes())

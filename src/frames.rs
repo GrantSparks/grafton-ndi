@@ -1111,7 +1111,7 @@ impl VideoFrame {
         // metadata text are validated from this descriptor.
         unsafe {
             let metadata = validate_frame_metadata(c_frame.p_metadata)?;
-            VideoCopySource::new(*c_frame, layout, header, metadata).to_frame()
+            Ok(VideoCopySource::new(*c_frame, layout, header, metadata).to_frame())
         }
     }
 }
@@ -1154,25 +1154,15 @@ impl VideoCopySource<'_> {
         }
     }
 
-    /// Copy into a new frame, which is a copy into empty storage: one pixel
-    /// allocation, and one metadata allocation when there is metadata.
-    pub(crate) fn to_frame(self) -> Result<VideoFrame> {
-        // Placeholder storage that `copy_into` replaces field by field. It is
-        // returned only once the copy has filled it, and dropped otherwise.
-        let mut frame = VideoFrame {
-            layout: self.layout,
-            header: self.header,
-            data: Vec::new(),
-            metadata: None,
-            timestamp: None,
-        };
-        self.copy_into(&mut frame)?;
-        Ok(frame)
+    /// Copy into a new frame: one pixel allocation, and one metadata
+    /// allocation when there is metadata.
+    pub(crate) fn to_frame(self) -> VideoFrame {
+        let packed = self.layout.packed();
+        let metadata = self.copy_metadata(None);
+        self.into_frame(packed, Vec::with_capacity(packed.data_len_bytes), metadata)
     }
 
-    /// Copy into `destination`, packing every plane's active rows tightly and
-    /// reusing its pixel and metadata allocations. Every owned video copy is
-    /// made here.
+    /// Copy into `destination`, reusing its pixel and metadata allocations.
     ///
     /// `destination` becomes exactly the frame [`Self::to_frame`] returns,
     /// whatever it held before. Its pixel buffer is reused when its capacity
@@ -1180,53 +1170,56 @@ impl VideoCopySource<'_> {
     /// contents; its metadata string is reused as
     /// [`FrameMetadata::copy_from_raw_validated`] describes.
     ///
-    /// Fails, leaving `destination` unchanged, only if the packed layout is
-    /// not valid. After validation nothing can fail part-way: any allocation
-    /// happens while `destination` is still a whole frame, and the only
-    /// moment its buffer and layout disagree spans copies into reserved
-    /// capacity, which neither allocate nor panic.
-    pub(crate) fn copy_into(self, destination: &mut VideoFrame) -> Result<()> {
-        let layout = self.layout;
-        let packed = ValidatedVideoLayout::new_uncompressed(
-            layout.pixel_format,
-            layout.width,
-            layout.height,
-            None,
-        )?;
+    /// Nothing can fail part-way: any allocation happens while `destination`
+    /// is still a whole frame, and the only moment its buffer and layout
+    /// disagree spans copies into reserved capacity, which neither allocate
+    /// nor panic.
+    pub(crate) fn copy_into(self, destination: &mut VideoFrame) {
+        let packed = self.layout.packed();
         let len = packed.data_len_bytes;
         let replacement = (destination.data.capacity() < len).then(|| Vec::with_capacity(len));
-        let metadata = self.metadata.map(|text| {
+        let metadata = self.copy_metadata(destination.metadata.take());
+        let data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
+        *destination = self.into_frame(packed, data, metadata);
+    }
+
+    /// The metadata text, copied into `storage` when there is one.
+    fn copy_metadata(self, storage: Option<FrameMetadata>) -> Option<FrameMetadata> {
+        self.metadata.map(|text| {
             // SAFETY: `new` requires `text` to have been validated from this
             // live `p_metadata`.
-            unsafe {
-                FrameMetadata::copy_from_raw_validated(
-                    self.raw.p_metadata,
-                    text,
-                    destination.metadata.take(),
-                )
-            }
-        });
+            unsafe { FrameMetadata::copy_from_raw_validated(self.raw.p_metadata, text, storage) }
+        })
+    }
 
-        let mut data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
+    /// The owned frame: `packed`, with `data`, whose capacity holds
+    /// `packed`, filled with every plane's active rows. Every owned video
+    /// copy is made here. Filling reserved capacity neither allocates nor
+    /// panics.
+    fn into_frame(
+        self,
+        packed: ValidatedVideoLayout,
+        mut data: Vec<u8>,
+        metadata: Option<FrameMetadata>,
+    ) -> VideoFrame {
         data.clear();
         // SAFETY: `new` requires the allocation to cover `layout` with every
         // active row initialized and unchanged while this source lives. The
         // views read active rows only, never the SDK's row padding.
-        for plane in unsafe { layout.view_planes(self.raw.p_data) } {
+        for plane in unsafe { self.layout.view_planes(self.raw.p_data) } {
             match plane.data() {
                 Some(active) => data.extend_from_slice(active),
                 None => plane.rows().for_each(|row| data.extend_from_slice(row)),
             }
         }
 
-        *destination = VideoFrame {
+        VideoFrame {
             layout: packed,
             header: self.header,
             data,
             metadata,
             timestamp: SdkTimestamp::from_sdk(self.raw.timestamp),
-        };
-        Ok(())
+        }
     }
 }
 
@@ -1669,15 +1662,9 @@ impl AudioFrame {
     /// Returns `data`, unused, with [`Error::InvalidFrame`] if it is not
     /// exactly the validated sample count. The frame is unchanged.
     pub fn replace_data(&mut self, data: Vec<f32>) -> std::result::Result<(), Rejected<Vec<f32>>> {
-        if data.len() != self.layout.sample_count {
-            let error = Error::InvalidFrame(format!(
-                "Audio data length {}, expected {} samples for validated layout",
-                data.len(),
-                self.layout.sample_count
-            ));
+        if let Err(error) = check_audio_data_len(&self.layout, data.len()) {
             return Err(Rejected::new(error, data));
         }
-
         self.data = data;
         Ok(())
     }
@@ -1736,70 +1723,68 @@ impl AudioCopySource<'_> {
         }
     }
 
-    /// Copy into a new frame, which is a copy into empty storage: one sample
-    /// allocation, and one metadata allocation when there is metadata.
+    /// Copy into a new frame: one sample allocation, and one metadata
+    /// allocation when there is metadata.
     pub(crate) fn to_frame(self) -> AudioFrame {
-        // Placeholder storage that `copy_into` replaces field by field before
-        // the frame is returned.
-        let mut frame = AudioFrame {
-            layout: self.layout,
-            timecode: Timecode::SYNTHESIZE,
-            data: Vec::new(),
-            metadata: None,
-            timestamp: None,
-        };
-        self.copy_into(&mut frame);
-        frame
+        let packed = self.layout.packed();
+        let metadata = self.copy_metadata(None);
+        self.into_frame(packed, Vec::with_capacity(packed.sample_count), metadata)
     }
 
-    /// Copy into `destination`, packing the channels back to back and reusing
-    /// its sample and metadata allocations. Every owned audio copy is made
-    /// here.
+    /// Copy into `destination`, reusing its sample and metadata allocations.
     ///
     /// `destination` becomes exactly the frame [`Self::to_frame`] returns,
     /// whatever it held before. Its sample buffer is reused when its capacity
     /// holds the packed samples, and otherwise replaced without copying its
     /// old contents; its metadata string is reused as
-    /// [`FrameMetadata::copy_from_raw_validated`] describes. Validation
-    /// already established everything the copy relies on, so it cannot fail,
-    /// and as for video, any allocation happens while `destination` is still
-    /// a whole frame.
+    /// [`FrameMetadata::copy_from_raw_validated`] describes. As for video,
+    /// any allocation happens while `destination` is still a whole frame.
     pub(crate) fn copy_into(self, destination: &mut AudioFrame) {
-        let layout = self.layout;
-        let packed = layout.packed();
+        let packed = self.layout.packed();
         let len = packed.sample_count;
         let replacement = (destination.data.capacity() < len).then(|| Vec::with_capacity(len));
-        // Copy the string, don't take ownership - SDK will free the original.
-        let metadata = self.metadata.map(|text| {
+        let metadata = self.copy_metadata(destination.metadata.take());
+        let data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
+        *destination = self.into_frame(packed, data, metadata);
+    }
+
+    /// The metadata text, copied into `storage` when there is one. The SDK
+    /// keeps and frees its own string.
+    fn copy_metadata(self, storage: Option<FrameMetadata>) -> Option<FrameMetadata> {
+        self.metadata.map(|text| {
             // SAFETY: `new` requires `text` to describe this live
             // `p_metadata`.
-            unsafe {
-                FrameMetadata::copy_from_raw_validated(
-                    self.raw.p_metadata,
-                    text,
-                    destination.metadata.take(),
-                )
-            }
-        });
+            unsafe { FrameMetadata::copy_from_raw_validated(self.raw.p_metadata, text, storage) }
+        })
+    }
 
-        let mut data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
+    /// The owned frame: `packed`, with `data`, whose capacity holds
+    /// `packed`, filled with the channels back to back. Every owned audio
+    /// copy is made here. Filling reserved capacity neither allocates nor
+    /// panics.
+    fn into_frame(
+        self,
+        packed: ValidatedAudioLayout,
+        mut data: Vec<f32>,
+        metadata: Option<FrameMetadata>,
+    ) -> AudioFrame {
         data.clear();
         // Only channel samples are initialized audio. Never form a typed slice
         // over inter-channel padding supplied by the SDK.
         // SAFETY: `new` requires an aligned FLTP buffer with `no_samples`
         // initialized floats at each validated channel offset, unchanged
         // while this source lives.
-        for samples in unsafe { layout.channels(self.raw.p_data.cast::<f32>()) } {
+        for samples in unsafe { self.layout.channels(self.raw.p_data.cast::<f32>()) } {
             data.extend_from_slice(samples);
         }
 
-        *destination = AudioFrame {
+        AudioFrame {
             layout: packed,
             timecode: Timecode::from_ticks(self.raw.timecode),
             data,
             metadata,
             timestamp: SdkTimestamp::from_sdk(self.raw.timestamp),
-        };
+        }
     }
 }
 
@@ -1911,16 +1896,7 @@ impl AudioFrameBuilder {
         let sample_count = audio_layout.sample_count;
 
         let data = if let Some(input_data) = self.data {
-            if input_data.len() != sample_count {
-                return Err(Error::InvalidFrame(format!(
-                    "Audio data length {}, expected {} ({}ch x {}samples)",
-                    input_data.len(),
-                    sample_count,
-                    self.num_channels,
-                    self.num_samples
-                )));
-            }
-
+            check_audio_data_len(&audio_layout, input_data.len())?;
             match self.layout {
                 AudioLayout::Planar => input_data,
                 AudioLayout::Interleaved => {
@@ -2868,6 +2844,35 @@ impl ValidatedVideoLayout {
         )
     }
 
+    /// This layout with every plane's rows packed, without padding: the
+    /// layout of an owned copy of the frame.
+    ///
+    /// It shares [`video_plane_layouts`] with validation, and cannot fail
+    /// for a valid layout. The packed storage is the active payload, which
+    /// is at most the storage already checked for overflow and against
+    /// [`MAX_VIDEO_BYTES`], and is not zero. The packed stride is the width
+    /// times the bytes per pixel, even because every valid width is even,
+    /// and the height is unchanged, so every parity rule still holds.
+    pub(crate) fn packed(&self) -> Self {
+        // The first plane's active row is the minimum, packed stride.
+        let stride = self.plane_layouts[0].active_row_bytes;
+        let (plane_layouts, plane_count, data_len_bytes, payload_len_bytes) = video_plane_layouts(
+            self.pixel_format.info(),
+            stride,
+            stride,
+            self.height as usize,
+        )
+        .expect("a valid video layout packs into a valid layout");
+        Self {
+            data_len_bytes,
+            payload_len_bytes,
+            plane_layouts,
+            plane_count,
+            line_stride_bytes: stride,
+            ..*self
+        }
+    }
+
     /// The SDK's `xres`.
     pub(crate) fn sdk_width(&self) -> i32 {
         self.width as i32
@@ -3256,6 +3261,17 @@ fn validate_outbound_audio_layout(
         sample_rate,
         &packed,
     ))
+}
+
+/// Require supplied samples to fill the packed `layout` exactly.
+fn check_audio_data_len(layout: &ValidatedAudioLayout, len: usize) -> Result<()> {
+    if len != layout.sample_count {
+        return Err(Error::InvalidFrame(format!(
+            "Audio data length {len}, expected {} samples ({} channels x {} samples) for validated layout",
+            layout.sample_count, layout.no_channels, layout.no_samples
+        )));
+    }
+    Ok(())
 }
 
 /// The one sample-rate check for every audio path, for values from the API
@@ -3808,7 +3824,7 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
     ///
     /// Returns `None` if padding separates active rows or planes. Use
     /// [`Self::planes`] / [`Self::plane`] for zero-copy padded access, or
-    /// [`Self::try_to_owned`] for a tightly packed owned buffer. A single packed
+    /// [`Self::to_owned`] for a tightly packed owned buffer. A single packed
     /// row can be borrowed even when its stride includes trailing padding.
     pub fn data(&self) -> Option<&[u8]> {
         if !self.layout.is_contiguous() {
@@ -3830,17 +3846,15 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
     /// [`Self::copy_into`] makes the same copy into an existing frame,
     /// reusing its allocations.
     ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidFrame`] if the packed copy is not a valid
-    /// frame.
-    pub fn try_to_owned(&self) -> Result<VideoFrame> {
+    /// The copy cannot fail: capture validated everything it relies on, and
+    /// the packed layout of a valid frame is valid.
+    pub fn to_owned(&self) -> VideoFrame {
         self.copy_source().to_frame()
     }
 
     /// Copy this borrowed frame into `destination`, reusing its allocations.
     ///
-    /// `destination` ends up exactly as [`Self::try_to_owned`] would have
+    /// `destination` ends up exactly as [`Self::to_owned`] would have
     /// returned it, whatever it held before: tightly packed active rows,
     /// format, dimensions, frame rate, aspect ratio, scan type, timecode,
     /// timestamp and metadata.
@@ -3856,13 +3870,8 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
     /// used: a receiver frame can be copied on a scoped worker thread, while a
     /// FrameSync frame stays on its capture thread. The destination is an
     /// ordinary owned frame either way.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidFrame`] if the packed copy is not a valid
-    /// frame. `destination` is then unchanged.
-    pub fn copy_into(&self, destination: &mut VideoFrame) -> Result<()> {
-        self.copy_source().copy_into(destination)
+    pub fn copy_into(&self, destination: &mut VideoFrame) {
+        self.copy_source().copy_into(destination);
     }
 
     fn copy_source(&self) -> VideoCopySource<'_> {
@@ -4022,17 +4031,14 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
     /// [`Self::copy_into`] makes the same copy into an existing frame,
     /// reusing its allocations.
     ///
-    /// # Errors
-    ///
-    /// None at present: capture validated everything the copy relies on. The
-    /// `Result` matches [`VideoRef::try_to_owned`], whose copy can fail.
-    pub fn try_to_owned(&self) -> Result<AudioFrame> {
-        Ok(self.copy_source().to_frame())
+    /// The copy cannot fail: capture validated everything it relies on.
+    pub fn to_owned(&self) -> AudioFrame {
+        self.copy_source().to_frame()
     }
 
     /// Copy this borrowed frame into `destination`, reusing its allocations.
     ///
-    /// `destination` ends up exactly as [`Self::try_to_owned`] would have
+    /// `destination` ends up exactly as [`Self::to_owned`] would have
     /// returned it, whatever it held before: the channels' samples packed
     /// back to back without inter-channel padding, format, sample rate,
     /// channel and sample counts, timecode, timestamp and metadata.
@@ -4048,15 +4054,8 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
     /// used: a receiver frame can be copied on a scoped worker thread, while a
     /// FrameSync frame stays on its capture thread. The destination is an
     /// ordinary owned frame either way.
-    ///
-    /// # Errors
-    ///
-    /// None at present: capture validated everything the copy relies on, and
-    /// `destination` is always overwritten. The `Result` matches
-    /// [`VideoRef::copy_into`], whose copy can fail.
-    pub fn copy_into(&self, destination: &mut AudioFrame) -> Result<()> {
+    pub fn copy_into(&self, destination: &mut AudioFrame) {
         self.copy_source().copy_into(destination);
-        Ok(())
     }
 
     fn copy_source(&self) -> AudioCopySource<'_> {
@@ -4296,6 +4295,42 @@ mod tests {
         }
     }
 
+    /// The packed layout of every valid layout, padded or not, is the one
+    /// validation gives the same format and dimensions without padding, so
+    /// an owned copy, which packs, cannot meet a layout validation refuses.
+    #[test]
+    fn every_valid_layout_packs_into_the_validated_packed_layout() {
+        for format in PixelFormat::ALL {
+            let bytes = format.info().bytes_per_pixel() as usize;
+            let mut packed_layouts = 0;
+            for (width, height) in [
+                (2u32, 1u32),
+                (2, 2),
+                (642, 4),
+                (1920, 1080),
+                (3840, 2160),
+                (16_384, 8_192),
+            ] {
+                for padding in [0, 2, 64, 4096] {
+                    let stride = width as usize * bytes + padding;
+                    let Ok(layout) =
+                        ValidatedVideoLayout::new_uncompressed(format, width, height, Some(stride))
+                    else {
+                        continue;
+                    };
+                    let expected =
+                        ValidatedVideoLayout::new_uncompressed(format, width, height, None)
+                            .unwrap();
+                    let packed = layout.packed();
+                    assert_eq!(format!("{packed:?}"), format!("{expected:?}"));
+                    assert_eq!(packed.data_len_bytes, layout.payload_len_bytes);
+                    packed_layouts += 1;
+                }
+            }
+            assert!(packed_layouts > 0, "{format:?}");
+        }
+    }
+
     #[test]
     fn planar_444_rows_copy_without_padding_through_every_owned_path() {
         use crate::capture::FrameSyncVideoFree;
@@ -4352,7 +4387,7 @@ mod tests {
                 expected
             );
             assert!(frame.plane(count).is_none());
-            let captured = frame.try_to_owned().unwrap();
+            let captured = frame.to_owned();
             let copied = unsafe { VideoFrame::from_raw(&raw) }.unwrap();
             let built = VideoFrame::builder()
                 .resolution(4, 3)
@@ -4372,9 +4407,7 @@ mod tests {
                         .collect::<Vec<_>>(),
                     expected
                 );
-                let recopy = crate::BorrowedVideoFrame::from(&owned)
-                    .try_to_owned()
-                    .unwrap();
+                let recopy = crate::BorrowedVideoFrame::from(&owned).to_owned();
                 assert_eq!(recopy.data(), expected);
             }
         }
@@ -4652,7 +4685,7 @@ mod tests {
                 let iterations = 100;
                 // Warm allocation and page caches for both implementations.
                 black_box(storage.clone());
-                black_box(frame.try_to_owned().unwrap());
+                black_box(frame.to_owned());
                 let start = Instant::now();
                 for _ in 0..iterations {
                     black_box(black_box(&storage).clone());
@@ -4660,7 +4693,7 @@ mod tests {
                 let baseline = start.elapsed();
                 let start = Instant::now();
                 for _ in 0..iterations {
-                    black_box(black_box(&frame).try_to_owned().unwrap());
+                    black_box(black_box(&frame).to_owned());
                 }
                 let packed = start.elapsed();
                 let start = Instant::now();
@@ -4826,7 +4859,7 @@ mod tests {
                 }
                 assert_eq!(frame.layout.data_len_bytes, offset);
                 assert_eq!(frame.layout.payload_len_bytes, expected.len());
-                let owned = frame.try_to_owned().unwrap();
+                let owned = frame.to_owned();
                 let raw_owned = unsafe { VideoFrame::from_raw(&raw) }.unwrap();
                 assert_eq!(owned.data(), expected);
                 assert_eq!(raw_owned.data(), expected);
@@ -4895,7 +4928,7 @@ mod tests {
                     .metadata(&metadata)
                     .build()
                     .unwrap();
-                let normalized = send.try_to_owned().unwrap();
+                let normalized = send.to_owned();
                 assert_eq!(normalized.data(), expected);
                 assert_eq!(normalized.timecode(), Timecode::from_ticks(12345));
                 // A borrowed frame carries no timestamp.
@@ -4993,7 +5026,7 @@ mod tests {
                 assert_eq!(rows_of(frame.planes()), expected);
                 // The owned copy holds the same rows, packed without padding,
                 // and a frame borrowing that copy views them unchanged.
-                let owned = frame.try_to_owned().unwrap();
+                let owned = frame.to_owned();
                 assert_eq!(rows_of(owned.planes()), expected);
                 assert_eq!(
                     rows_of(crate::BorrowedVideoFrame::from(&owned).planes()),
@@ -5054,10 +5087,7 @@ mod tests {
             for plane in frame.planes() {
                 assert_eq!(plane.data().unwrap(), vec![42; plane.active_row_bytes()]);
             }
-            assert_eq!(
-                frame.try_to_owned().unwrap().data(),
-                vec![42; tight.payload_len_bytes]
-            );
+            assert_eq!(frame.to_owned().data(), vec![42; tight.payload_len_bytes]);
         }
         for format in [PixelFormat::Yv12, PixelFormat::I420, PixelFormat::Nv12] {
             let tight = ValidatedVideoLayout::new_uncompressed(format, 4, 2, Some(0)).unwrap();
@@ -5120,7 +5150,7 @@ mod tests {
                 borrowed.encode_data_url(ImageFormat::Png).unwrap(),
                 packed.encode_data_url(ImageFormat::Png).unwrap()
             );
-            assert_eq!(borrowed.try_to_owned().unwrap().data(), pixels);
+            assert_eq!(borrowed.to_owned().data(), pixels);
         }
     }
 
@@ -5156,7 +5186,7 @@ mod tests {
         }
         .unwrap();
         assert!(frame.data().is_none());
-        let owned = frame.try_to_owned().unwrap();
+        let owned = frame.to_owned();
         assert_eq!(owned.data().len(), 82_176);
         assert_eq!(owned.line_stride_bytes(), 2568);
         assert!(owned.data().iter().all(|&byte| byte == 17));
@@ -7082,7 +7112,7 @@ mod tests {
         assert_eq!(frame_ref.metadata(), Some("cached"));
         assert!(format!("{frame_ref:?}").contains("metadata: Some(\"cached\")"));
 
-        let owned = frame_ref.try_to_owned().expect("owned conversion");
+        let owned = frame_ref.to_owned();
         assert_eq!(owned.metadata(), Some("cached"));
         assert_eq!(owned.data().len(), expected_len);
         assert_eq!(owned.timecode(), Timecode::from_ticks(123));
@@ -7119,7 +7149,7 @@ mod tests {
         assert_eq!(frame_ref.metadata(), Some("audio meta"));
         assert_eq!(frame_ref.timecode(), Timecode::from_ticks(123));
         assert_eq!(frame_ref.timestamp(), Some(SdkTimestamp::from_ticks(456)));
-        let owned = frame_ref.try_to_owned().expect("owned conversion");
+        let owned = frame_ref.to_owned();
         assert_eq!(owned.metadata(), Some("audio meta"));
         assert_eq!(owned.data().len(), sample_count);
         assert_eq!(owned.timecode(), Timecode::from_ticks(123));
@@ -7870,7 +7900,7 @@ mod tests {
             frame.channels().flatten().copied().collect::<Vec<_>>(),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
         );
-        let mut owned = frame.try_to_owned().unwrap();
+        let mut owned = frame.to_owned();
         assert_eq!(owned.channel_stride_bytes(), 12);
         assert_eq!(owned.data(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(
@@ -8339,28 +8369,28 @@ mod tests {
 
     impl<S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> CopySource<VideoFrame> for VideoRef<'_, S> {
         fn owned(&self) -> VideoFrame {
-            self.try_to_owned().unwrap()
+            self.to_owned()
         }
         fn copy(&self, destination: &mut VideoFrame) {
-            self.copy_into(destination).unwrap();
+            self.copy_into(destination);
         }
     }
 
     impl CopySource<VideoFrame> for crate::BorrowedVideoFrame<'_> {
         fn owned(&self) -> VideoFrame {
-            self.try_to_owned().unwrap()
+            self.to_owned()
         }
         fn copy(&self, destination: &mut VideoFrame) {
-            self.copy_into(destination).unwrap();
+            self.copy_into(destination);
         }
     }
 
     impl<S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> CopySource<AudioFrame> for AudioRef<'_, S> {
         fn owned(&self) -> AudioFrame {
-            self.try_to_owned().unwrap()
+            self.to_owned()
         }
         fn copy(&self, destination: &mut AudioFrame) {
-            self.copy_into(destination).unwrap();
+            self.copy_into(destination);
         }
     }
 
@@ -8427,7 +8457,7 @@ mod tests {
     }
 
     /// Require `copy_into` to make each destination exactly the frame
-    /// `try_to_owned` returns, whatever it held, allocating only what the
+    /// `to_owned` returns, whatever it held, allocating only what the
     /// destination lacks: a buffer too small for the packed copy, and a
     /// metadata string of another length. Copying again into the result, a
     /// copy loop's steady state, must allocate nothing and keep both
@@ -8605,10 +8635,10 @@ mod tests {
             .unwrap();
         let owned = match spare.take() {
             Some(mut reused) => {
-                frame.copy_into(&mut reused).unwrap();
+                frame.copy_into(&mut reused);
                 reused
             }
-            None => frame.try_to_owned().unwrap(),
+            None => frame.to_owned(),
         };
         let sent = owned.data().as_ptr();
         *spare = sender.send_video_async(owned).unwrap();

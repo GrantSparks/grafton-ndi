@@ -3,7 +3,7 @@ error[E0502]: cannot borrow `frame` as mutable because it is also borrowed as im
   |
 6 |     let view = BorrowedVideoFrame::from(&frame);
   |                                         ------ immutable borrow occurs here
-7 |     view.copy_into(&mut frame).unwrap();
+7 |     view.copy_into(&mut frame);
   |          --------- ^^^^^^^^^^ mutable borrow occurs here
   |          |
   |          immutable borrow later used by call

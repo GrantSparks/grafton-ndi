@@ -540,8 +540,8 @@ impl FrameSync {
     ///
     /// # Errors
     ///
-    /// As for [`Self::capture_video_ref`], and when the owned copy is not a
-    /// valid frame.
+    /// As for [`Self::capture_video_ref`]. The owned copy itself cannot
+    /// fail.
     ///
     /// # Example
     ///
@@ -572,9 +572,9 @@ impl FrameSync {
     /// # }
     /// ```
     pub fn capture_video(&self, scan_type: ScanType) -> Result<Option<VideoFrame>> {
-        self.capture_video_ref(scan_type)?
-            .map(|frame| frame.try_to_owned())
-            .transpose()
+        Ok(self
+            .capture_video_ref(scan_type)?
+            .map(|frame| frame.to_owned()))
     }
 
     /// Capture video with time-base correction, borrowing the SDK's frame
@@ -658,7 +658,7 @@ impl FrameSync {
     /// # }
     /// ```
     pub fn capture_audio(&self, request: FrameSyncAudioRequest) -> Result<AudioFrame> {
-        self.capture_audio_ref(request)?.try_to_owned()
+        Ok(self.capture_audio_ref(request)?.to_owned())
     }
 
     /// Capture audio with dynamic resampling, borrowing the SDK's samples
@@ -1192,7 +1192,7 @@ mod tests {
         assert_eq!(frame.metadata(), Some("framesync video"));
         assert_eq!(frame.data().unwrap().len(), expected_len);
         assert_eq!(frame.line_stride_bytes(), stride as usize);
-        let owned = frame.try_to_owned().expect("owned conversion");
+        let owned = frame.to_owned();
         assert_eq!(owned.metadata(), Some("framesync video"));
         assert!(format!("{frame:?}").contains("FrameSyncVideoRef"));
     }
@@ -1383,7 +1383,7 @@ mod tests {
         assert_eq!(frame.channel_stride_bytes(), stride_samples as usize * 4);
         assert!(format!("{frame:?}").contains("FrameSyncAudioRef"));
 
-        let owned = frame.try_to_owned().expect("owned conversion");
+        let owned = frame.to_owned();
         assert_eq!(owned.metadata(), Some("framesync audio"));
         assert_eq!(owned.data().len(), 8);
         assert_eq!(owned.channel_stride_bytes(), 16);

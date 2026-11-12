@@ -293,7 +293,7 @@ if let Some(frame) = receiver.video().capture_ref(Duration::from_secs(1))? {
             println!("{} active bytes", row.len());
         }
     }
-    let packed = frame.try_to_owned()?; // one pixel allocation; active rows only
+    let packed = frame.to_owned(); // one pixel allocation; active rows only
 }
 ```
 
@@ -306,7 +306,7 @@ Borrowed PNG/JPEG encoding reads active rows directly.
 
 `copy_into(&mut owned)` makes the same copy into an existing `VideoFrame` or
 `AudioFrame`, on receiver and FrameSync references and on `BorrowedVideoFrame`.
-The destination ends up exactly as `try_to_owned` would have made it, whatever
+The destination ends up exactly as `to_owned` would have made it, whatever
 it held before, but keeps its pixel or sample buffer when that is large enough
 and its metadata string when the text has the same length. A loop that copies
 frames of one shape into the same destination allocates nothing after the
@@ -368,10 +368,10 @@ while let Some(pixels) = renderer.next_frame() {
         .build()?;
     let owned = match spare.take() {
         Some(mut reused) => {
-            frame.copy_into(&mut reused)?; // reuses its pixels and metadata
+            frame.copy_into(&mut reused); // reuses its pixels and metadata
             reused
         }
-        None => frame.try_to_owned()?, // only the first two frames allocate
+        None => frame.to_owned(), // only the first two frames allocate
     };
     spare = sender.send_video_async(owned)?;
 }

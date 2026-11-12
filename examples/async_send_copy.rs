@@ -32,10 +32,10 @@ fn main() -> Result<(), grafton_ndi::Error> {
         let frame = borrow(&pixels)?;
         let owned = match spare.take() {
             Some(mut reused) => {
-                frame.copy_into(&mut reused)?;
+                frame.copy_into(&mut reused);
                 reused
             }
-            None => frame.try_to_owned()?,
+            None => frame.to_owned(),
         };
         spare = sender.send_video_async(owned)?;
     }

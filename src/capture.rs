@@ -141,8 +141,9 @@ pub(crate) trait CaptureStrategy:
     where
         Self: CaptureKind;
 
-    /// Copy a borrowed view into an owned frame.
-    fn ref_to_owned(frame: &<Self as CaptureKind>::Ref<'_>) -> Result<<Self as CaptureKind>::Owned>
+    /// Copy a borrowed view into an owned frame. A view that `make_ref`
+    /// validated always copies.
+    fn ref_to_owned(frame: &<Self as CaptureKind>::Ref<'_>) -> <Self as CaptureKind>::Owned
     where
         Self: CaptureKind;
 }
@@ -176,8 +177,8 @@ impl CaptureStrategy for VideoKind {
         VideoFrameRef::new(guard)
     }
 
-    fn ref_to_owned(frame: &VideoFrameRef<'_>) -> Result<VideoFrame> {
-        frame.try_to_owned()
+    fn ref_to_owned(frame: &VideoFrameRef<'_>) -> VideoFrame {
+        frame.to_owned()
     }
 }
 
@@ -210,8 +211,8 @@ impl CaptureStrategy for AudioKind {
         AudioFrameRef::new(guard)
     }
 
-    fn ref_to_owned(frame: &AudioFrameRef<'_>) -> Result<AudioFrame> {
-        frame.try_to_owned()
+    fn ref_to_owned(frame: &AudioFrameRef<'_>) -> AudioFrame {
+        frame.to_owned()
     }
 }
 
@@ -244,9 +245,8 @@ impl CaptureStrategy for MetadataKind {
         MetadataFrameRef::new(guard)
     }
 
-    fn ref_to_owned(frame: &MetadataFrameRef<'_>) -> Result<MetadataFrame> {
-        // Metadata `to_owned` is infallible; lift it into the shared `Result` shape.
-        Ok(frame.to_owned())
+    fn ref_to_owned(frame: &MetadataFrameRef<'_>) -> MetadataFrame {
+        frame.to_owned()
     }
 }
 

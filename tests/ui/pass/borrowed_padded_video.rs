@@ -11,5 +11,5 @@ fn main() {
         .unwrap();
     let _: PixelFormat = frame.pixel_format();
     let _: &[u8] = frame.data();
-    let _ = frame.try_to_owned().unwrap();
+    let _: grafton_ndi::VideoFrame = frame.to_owned();
 }

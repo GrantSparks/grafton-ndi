@@ -17,7 +17,7 @@ error[E0624]: associated function `ref_to_owned` is private
   |
  ::: src/capture.rs
   |
-  | /     fn ref_to_owned(frame: &<Self as CaptureKind>::Ref<'_>) -> Result<<Self as CaptureKind>::Owned>
+  | /     fn ref_to_owned(frame: &<Self as CaptureKind>::Ref<'_>) -> <Self as CaptureKind>::Owned
   | |     where
   | |         Self: CaptureKind;
   | |__________________________- private associated function defined here

@@ -166,7 +166,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
             std::fs::write("/dev/null", borrowed.encode_png().unwrap()).unwrap();
             std::fs::write("/dev/null", borrowed.encode_jpeg(85).unwrap()).unwrap();
         }
-        let owned = borrowed.try_to_owned().unwrap();
+        let owned = borrowed.to_owned();
         verify_owned(&owned);
         // A copy into a larger frame of another format reuses its pixels.
         let mut reused = VideoFrame::builder()
@@ -175,7 +175,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
             .build()
             .unwrap();
         let reused_pixels = reused.data().as_ptr();
-        borrowed.copy_into(&mut reused).unwrap();
+        borrowed.copy_into(&mut reused);
         verify_owned(&reused);
         assert_eq!(reused.data(), owned.data());
         assert_eq!(reused.data().as_ptr(), reused_pixels);
@@ -231,8 +231,8 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
                     std::fs::write("/dev/null", frame.encode_png().unwrap()).unwrap();
                     std::fs::write("/dev/null", frame.encode_jpeg(85).unwrap()).unwrap();
                 }
-                verify_owned(&frame.try_to_owned().unwrap());
-                frame.copy_into(&mut reused).unwrap();
+                verify_owned(&frame.to_owned());
+                frame.copy_into(&mut reused);
                 verify_owned(&reused);
                 assert_eq!(reused.data().as_ptr(), reused_pixels);
                 break;
@@ -279,7 +279,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
         // `BorrowedVideoFrame::copy_into` documents: the copied frame comes
         // back from the next send and the recovered one from the finish.
         let mut recovered = recovered;
-        borrowed_send.copy_into(&mut recovered).unwrap();
+        borrowed_send.copy_into(&mut recovered);
         let copied = resend.send_video_async(recovered).unwrap().unwrap();
         verify_owned(&copied);
         let last = resend.finish_video_async().unwrap();

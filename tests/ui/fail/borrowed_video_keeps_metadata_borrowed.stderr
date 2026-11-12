@@ -9,7 +9,7 @@ error[E0505]: cannot move out of `metadata` because it is borrowed
 ...
  9 |     drop(metadata);
    |          ^^^^^^^^ move out of `metadata` occurs here
-10 |     let _ = frame.try_to_owned();
+10 |     let _ = frame.to_owned();
    |             ----- borrow later used here
    |
 help: consider cloning the value if the performance cost is acceptable

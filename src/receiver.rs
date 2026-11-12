@@ -1471,10 +1471,10 @@ impl ReceiverCore {
         &self,
         deadline: Deadline,
     ) -> Result<Option<K::Owned>> {
-        self.capture_ref_until::<K>(deadline)?
+        Ok(self
+            .capture_ref_until::<K>(deadline)?
             .as_ref()
-            .map(K::ref_to_owned)
-            .transpose()
+            .map(K::ref_to_owned))
     }
 
     fn take_pending_status(&self) -> Option<ReceiverStatus> {
@@ -1691,7 +1691,7 @@ pub(crate) mod native_capture_calls {
 /// - [`capture_ref`](Self::capture_ref) borrows the SDK's buffer in place,
 ///   with no allocation and no copy. It is the one for in-place processing:
 ///   for a 1920×1080 BGRA frame it avoids ~8.3 MB of copying per frame
-///   (~475 MB/s at 60 fps). Convert it with `try_to_owned` when you need to
+///   (~475 MB/s at 60 fps). Convert it with `to_owned` when you need to
 ///   keep or send it.
 ///
 /// Both wait up to their timeout for a frame. The SDK returns from a capture

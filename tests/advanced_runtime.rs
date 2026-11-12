@@ -1728,7 +1728,7 @@ fn synchronized_audio(
         };
         let outcome = match pass {
             Pass::Captured => sync.synchronize(Some(&video), request),
-            Pass::Owned => sync.synchronize(Some(&video.try_to_owned().unwrap()), request),
+            Pass::Owned => sync.synchronize(Some(&video.to_owned()), request),
             Pass::Nothing => sync.synchronize(None, request),
         };
         match outcome.unwrap() {
