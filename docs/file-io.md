@@ -370,11 +370,16 @@ every async handle in the process keeps the deadlines; it starts with the first
 wait that needs it. If that thread cannot be started, the wait fails with
 `FileError::Io`, and the next wait tries again. A pending `next_event` fails
 with `FileError::InvalidState(StateError::Closed)` as soon as the object's
-thread stops taking events, without waiting for a recorder's drop wait.
+thread stops taking events, without waiting for a recorder's drop wait. If the
+thread failed instead (it panicked, or could not be started), the wait fails
+with `StateError::OwnerFailed`.
 
 Await `finish` to learn whether the recording is complete, then await `close`;
 neither blocks the executor. `close` ends the object for every clone, and later
 calls on other clones fail with `FileError::InvalidState(StateError::Closed)`.
+After the object's thread has failed, the command it was running, every queued
+and later command, every event wait and `close` fail with
+`StateError::OwnerFailed` instead, so a failure is never mistaken for a close.
 `AsyncFileRecorder::reset` replaces the native recorder as `FileRecorder::reset`
 does.
 
@@ -397,7 +402,7 @@ is `#[non_exhaustive]`:
 | --- | --- |
 | `Unavailable` | The File library, or the part of it an operation needs, cannot be used in this process. The text says why. |
 | `InvalidInput` | A value cannot be represented by the native API, for example a path that is not UTF-8. |
-| `InvalidState` | The operation is not permitted in the current state. The `StateError` it carries says which, for example `PreviousSessionOpen` for `start` during an open session, `ExactFileName` for `set_source` during a session with an exact file name, or `QueueFull` and `Closed` for an async handle whose command queue is full or that has been closed. `StateError::is_retryable` is true only for `QueueFull` and `WaiterPending`, which can succeed later without anything else changing. |
+| `InvalidState` | The operation is not permitted in the current state. The `StateError` it carries says which, for example `PreviousSessionOpen` for `start` during an open session, `ExactFileName` for `set_source` during a session with an exact file name, or `QueueFull`, `Closed` and `OwnerFailed` for an async handle whose command queue is full, that has been closed, or whose thread failed. `StateError::is_retryable` is true only for `QueueFull` and `WaiterPending`, which can succeed later without anything else changing. |
 | `Rejected` | The SDK refused an operation; the recorder's or player's events may say more. |
 | `Protocol` | The SDK returned something that violates the expected contract. |
 | `Core` | An operation of the core NDI API failed, or `FileApi::open` was given a relative library path or one that conflicts with the library already selected. |

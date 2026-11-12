@@ -116,8 +116,11 @@ struct Response<T> {
 /// Besides the operation's own errors, every operation can fail with
 /// [`FileError::InvalidState`]: with [`StateError::QueueFull`] when the
 /// handle's command queue is full, with [`StateError::Closed`] when the
-/// handle has been closed or its thread stopped before carrying the operation
-/// out, and with [`StateError::OwnerFailed`] when that thread failed.
+/// handle has been closed or its thread stopped normally before carrying the
+/// operation out, and with [`StateError::OwnerFailed`] when that thread failed
+/// instead. Once the thread has failed, the operation it was running, every
+/// operation queued behind it and every later one report
+/// [`StateError::OwnerFailed`], never [`StateError::Closed`].
 ///
 /// # Panics
 ///
@@ -171,6 +174,10 @@ struct Reply<T> {
     response: Arc<Mutex<Response<T>>>,
     cancelled: Arc<AtomicBool>,
     delivered: bool,
+    /// The owner thread's control, for a command sent to it. A command that is
+    /// dropped without a result reports a failed owner if the thread has
+    /// failed.
+    owner: Option<Arc<Control>>,
 }
 
 fn operation<T>() -> (Reply<T>, FileOperation<T>) {
@@ -185,6 +192,7 @@ fn operation<T>() -> (Reply<T>, FileOperation<T>) {
             response: Arc::clone(&response),
             cancelled: Arc::clone(&cancelled),
             delivered: false,
+            owner: None,
         },
         FileOperation {
             response,
@@ -207,6 +215,16 @@ fn deliver<T>(response: &Mutex<Response<T>>, value: FileResult<T>, replace: bool
     if let Some(wake) = wake {
         wake.wake();
     }
+}
+
+/// The error for an operation that did not run because its owner thread is
+/// gone: a failed thread, or one that stopped normally.
+fn stopped(failed: bool) -> FileError {
+    FileError::InvalidState(if failed {
+        StateError::OwnerFailed
+    } else {
+        StateError::Closed
+    })
 }
 
 impl<T> FileOperation<T> {
@@ -235,11 +253,11 @@ impl<T> Reply<T> {
 impl<T> Drop for Reply<T> {
     fn drop(&mut self) {
         if !self.delivered && !self.cancelled.load(Ordering::Acquire) {
-            deliver(
-                &self.response,
-                Err(FileError::InvalidState(StateError::Closed)),
-                false,
-            );
+            // Unwinding means the owner thread is failing right now, before
+            // it can record that; a command left in the queue sees the record.
+            let failed =
+                std::thread::panicking() || self.owner.as_ref().is_some_and(|owner| owner.failed());
+            deliver(&self.response, Err(stopped(failed)), false);
         }
     }
 }
@@ -393,6 +411,8 @@ struct Events<E> {
     capacity: usize,
     dropped: u64,
     closed: bool,
+    /// The queue closed because the owner thread failed.
+    failed: bool,
     waiter: Option<EventWaiter>,
 }
 
@@ -405,6 +425,7 @@ impl<E> EventQueue<E> {
             capacity,
             dropped: 0,
             closed: false,
+            failed: false,
             waiter: None,
         }))
     }
@@ -424,11 +445,14 @@ impl<E> EventQueue<E> {
         }
     }
 
-    /// End every wait: nothing more will be pushed. Idempotent.
-    fn close(&self) {
+    /// End every wait: nothing more will be pushed. Idempotent. `failed`
+    /// records that the owner thread failed, so waits report that; once
+    /// recorded it stays.
+    fn close(&self, failed: bool) {
         let wake = {
             let mut events = lock(&self.0);
             events.closed = true;
+            events.failed |= failed;
             events.waiter.take().map(|w| w.waker)
         };
         if let Some(wake) = wake {
@@ -480,8 +504,9 @@ impl<E: Send> Expire for EventQueue<E> {
 /// deadline. One future may wait on a handle at a time; a second fails with
 /// [`FileError::InvalidState`] and [`StateError::WaiterPending`]. Once the
 /// handle is closed and every queued event has been taken, the future fails
-/// with [`StateError::Closed`]; that happens as soon as the handle's thread
-/// stops taking events, before the native object is destroyed. Dropping the
+/// with [`StateError::Closed`], or with [`StateError::OwnerFailed`] when the
+/// thread failed; that happens as soon as the handle's thread stops taking
+/// events, before the native object is destroyed. Dropping the
 /// future does not stop events from being pumped.
 ///
 /// # Errors
@@ -561,7 +586,7 @@ impl<E> Future for FileEventFuture<E> {
                 let ready = if let Some(event) = events.queue.pop_front() {
                     Some(event.map(Some))
                 } else if events.closed {
-                    Some(Err(FileError::InvalidState(StateError::Closed)))
+                    Some(Err(stopped(events.failed)))
                 } else if deadline <= Instant::now() {
                     Some(Ok(None))
                 } else {
@@ -614,6 +639,9 @@ struct Closing {
 
 struct Control {
     shutdown: AtomicBool,
+    /// The owner thread has failed. Set before the thread's command queue is
+    /// dropped, so a command left in it can tell.
+    failed: AtomicBool,
     closing: Mutex<Closing>,
 }
 
@@ -621,6 +649,7 @@ impl Control {
     fn new() -> Self {
         Self {
             shutdown: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
             closing: Mutex::new(Closing {
                 complete: false,
                 failed: false,
@@ -655,7 +684,14 @@ impl Control {
         future
     }
 
+    fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
     fn completed(&self, failed: bool) {
+        if failed {
+            self.failed.store(true, Ordering::Release);
+        }
         let reply = {
             let mut closing = lock(&self.closing);
             closing.complete = true;
@@ -745,8 +781,11 @@ impl<H: Owner> Worker<H> {
         persistent: bool,
         work: impl FnOnce(&mut H, &OperationContext) -> FileResult<T> + Send + 'static,
     ) -> FileOperation<T> {
+        if self.control.failed() {
+            return FileOperation::failed(stopped(true));
+        }
         if self.control.shutdown.load(Ordering::Acquire) {
-            return FileOperation::failed(FileError::InvalidState(StateError::Closed));
+            return FileOperation::failed(stopped(false));
         }
         let waiting = (!persistent).then(|| Arc::clone(&self.waiting));
         if let Some(waiting) = &waiting {
@@ -755,7 +794,8 @@ impl<H: Owner> Worker<H> {
                 return FileOperation::failed(FileError::InvalidState(StateError::QueueFull));
             }
         }
-        let (reply, future) = operation();
+        let (mut reply, future) = operation();
+        reply.owner = Some(Arc::clone(&self.control));
         let context = OperationContext {
             cancelled: Arc::clone(&reply.cancelled),
             control: Arc::clone(&self.control),
@@ -770,7 +810,7 @@ impl<H: Owner> Worker<H> {
             reply.complete(work(owner, &context));
         });
         if self.sender.send(job).is_err() {
-            future.immediate_failure(FileError::InvalidState(StateError::Closed));
+            future.immediate_failure(stopped(self.control.failed()));
         }
         future
     }
@@ -819,24 +859,28 @@ fn spawn_owner<H: Owner, T: Send + 'static>(
                 }
             };
             ready.complete(Ok(wrap(thread_worker)));
-            run_owner(&mut owner, receiver, &thread_control, &thread_events);
+            run_owner(&mut owner, &receiver, &thread_control, &thread_events);
             // No event is pumped from here on, so waits for one end now
             // rather than after the destruction below, which for a recorder
             // can take its whole drop wait.
-            thread_events.close();
+            thread_events.close(false);
             // Destroyed here, before the close is reported complete. `H` need
             // not be `Send`: it is created, used and dropped on this thread.
             drop(owner);
         }));
-        // Again for the paths above that return early or panic.
-        thread_events.close();
-        thread_control.completed(outcome.is_err());
+        // Again for the paths above that return early or panic. The failure
+        // is recorded before `receiver` drops, which drops the commands still
+        // queued: they report it.
+        let failed = outcome.is_err();
+        thread_events.close(failed);
+        thread_control.completed(failed);
+        drop(receiver);
     });
     match spawned {
         Ok(thread) => *lock(&worker.thread) = Some(thread),
         Err(error) => {
             future.immediate_failure(FileError::Io(error));
-            events.close();
+            events.close(true);
             control.completed(true);
         }
     }
@@ -845,7 +889,7 @@ fn spawn_owner<H: Owner, T: Send + 'static>(
 
 fn run_owner<H: Owner>(
     owner: &mut H,
-    receiver: Receiver<Job<H>>,
+    receiver: &Receiver<Job<H>>,
     control: &Control,
     events: &EventQueue<H::Event>,
 ) {
@@ -1414,24 +1458,71 @@ mod tests {
         dropped.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
+    fn owner_failed<T: std::fmt::Debug>(result: FileResult<T>) {
+        assert!(
+            matches!(
+                result,
+                Err(FileError::InvalidState(StateError::OwnerFailed))
+            ),
+            "expected OwnerFailed, got {result:?}"
+        );
+    }
+
+    fn closed<T: std::fmt::Debug>(result: FileResult<T>) {
+        assert!(
+            matches!(result, Err(FileError::InvalidState(StateError::Closed))),
+            "expected Closed, got {result:?}"
+        );
+    }
+
     #[test]
     fn worker_panic_replies_with_failure_and_destroys_owner_locally() {
         let (worker, dropped) = local_worker();
         let created = block_on(worker.call(|owner| Ok(owner.created))).unwrap();
-        let failed: FileOperation<()> = worker.call(|_| panic!("mock owner failure"));
-        assert!(matches!(
-            block_on(failed),
-            Err(FileError::InvalidState(StateError::Closed))
-        ));
+        // A wait that is already pending when the thread fails.
+        let mut pending = worker.events.wait(Duration::from_secs(30));
+        let signal = Arc::new(Signal(Mutex::new(false), Condvar::new()));
+        let waker = Waker::from(Arc::clone(&signal));
+        assert!(Pin::new(&mut pending)
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker = worker.call(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            panic!("mock owner failure");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        // Queued behind the command that fails.
+        let queued: FileOperation<()> = worker.call(|_| Ok(()));
+        release_tx.send(()).unwrap();
+        owner_failed(block_on(blocker));
+        owner_failed(block_on(queued));
+        owner_failed(block_on(pending));
         assert_eq!(
             dropped.recv_timeout(Duration::from_secs(1)).unwrap(),
             created
         );
-        assert!(matches!(
-            block_on(worker.control.request_close()),
-            Err(FileError::InvalidState(StateError::OwnerFailed))
-        ));
-        assert!(block_on(worker.call(|_| Ok(()))).is_err());
+        owner_failed(block_on(worker.control.request_close()));
+        owner_failed(block_on(worker.call(|_| Ok(()))));
+        owner_failed(block_on(worker.submit(true, |_, _| Ok(()))));
+        owner_failed(block_on(worker.events.wait(Duration::from_millis(10))));
+    }
+
+    #[test]
+    fn ordinary_close_reports_closed_to_later_operations_and_waits() {
+        let (worker, dropped) = local_worker();
+        let pending_wait = worker.events.wait(Duration::from_secs(30));
+        block_on(worker.control.request_close()).unwrap();
+        dropped.recv_timeout(Duration::from_secs(1)).unwrap();
+        closed(block_on(worker.call(|_| Ok(()))));
+        closed(block_on(worker.submit(true, |_, _| Ok(()))));
+        closed(block_on(pending_wait));
+        closed(block_on(worker.events.wait(Duration::from_millis(10))));
+        block_on(worker.control.request_close()).unwrap();
     }
 
     #[test]

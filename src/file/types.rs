@@ -75,9 +75,13 @@ pub enum StateError {
     /// future, or another close.
     WaiterPending,
     /// The async handle's object has been closed, or its thread stopped
-    /// before it carried out the operation.
+    /// normally before it carried out the operation. A thread that failed
+    /// reports [`OwnerFailed`](Self::OwnerFailed) instead.
     Closed,
-    /// The async handle's thread failed.
+    /// The async handle's thread failed, for example by panicking. The
+    /// operation it was running, every command queued behind it, every later
+    /// command, every event wait and the close report this, not
+    /// [`Closed`](Self::Closed).
     OwnerFailed,
 }
 
