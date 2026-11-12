@@ -361,12 +361,24 @@ impl Inner {
         }
     }
 
-    fn complete(&self) {
-        let len = {
+    /// Lock the video state, make one synchronizing SDK call through `call`,
+    /// which returns its result and the pixel-buffer length of the frame it
+    /// completed, then unlock and notify the completion handler.
+    ///
+    /// Every video operation follows this order, so the handler runs once the
+    /// state is consistent and outside the lock: it may panic or reenter the
+    /// sender without freeing a frame in flight or being notified twice.
+    /// Destruction follows it too, without the lock, in `Drop for Inner`.
+    fn synchronize<R>(
+        &self,
+        call: impl FnOnce(&mut VideoState, &sys::Core, SendInstance) -> (R, Option<usize>),
+    ) -> R {
+        let (result, completed) = {
             let mut video = self.video.lock().unwrap_or_else(|e| e.into_inner());
-            video.synchronize_and_complete(self.core, self.instance)
+            call(&mut video, self.core, self.instance)
         };
-        self.notify(len);
+        self.notify(completed);
+        result
     }
 }
 
@@ -844,14 +856,12 @@ impl Sender {
     pub fn send_video<'a>(&self, frame: impl Into<BorrowedVideoFrame<'a>>) -> Result<()> {
         let frame: BorrowedVideoFrame<'a> = frame.into();
         self.require_video_format(frame.pixel_format())?;
-        let len = {
-            let mut video = self.inner.video.lock().unwrap_or_else(|e| e.into_inner());
+        self.inner.synchronize(|video, core, instance| {
             // A synchronous video send also releases the previous async frame,
             // which completes once the send has returned.
-            let synchronized = video.send(self.inner.core, self.inner.instance, frame);
-            video.completed(synchronized)
-        };
-        self.inner.notify(len);
+            let synchronized = video.send(core, instance, frame);
+            ((), video.completed(synchronized))
+        });
         Ok(())
     }
 
@@ -887,22 +897,17 @@ impl Sender {
 
     /// Hand a checked frame to the SDK and return the previous one, if any.
     fn submit_video_async(&mut self, frame: VideoFrame) -> Option<VideoFrame> {
-        let (previous, len) = {
-            let mut video = self.inner.video.lock().unwrap_or_else(|e| e.into_inner());
+        // If the handler panics, the synchronized previous frame is safe to
+        // drop and the sender retains the new frame.
+        self.inner.synchronize(|video, core, instance| {
             // The sender owns the new frame before the SDK sees it. The
             // previous frame stays owned by `displaced` until the submission,
             // which synchronizes the SDK's access to it, has returned; only
             // the proof of that return completes it.
-            let (mut displaced, synchronized) =
-                video.submit(self.inner.core, self.inner.instance, frame);
+            let (mut displaced, synchronized) = video.submit(core, instance, frame);
             let len = displaced.completed(synchronized);
             (displaced.take_retained(), len)
-        };
-        // State is consistent and the mutex unlocked before user code. If it
-        // panics, the synchronized previous frame is safe to drop and the
-        // sender retains the new frame.
-        self.inner.notify(len);
-        previous
+        })
     }
 
     /// Drain the SDK and return the final owned frame, if any.
@@ -912,13 +917,10 @@ impl Sender {
     /// If the completion handler panics, the completed frame is dropped instead
     /// of returned.
     pub fn finish_video_async(&mut self) -> Option<VideoFrame> {
-        let (previous, len) = {
-            let mut video = self.inner.video.lock().unwrap_or_else(|e| e.into_inner());
-            let len = video.synchronize_and_complete(self.inner.core, self.inner.instance);
+        self.inner.synchronize(|video, core, instance| {
+            let len = video.synchronize_and_complete(core, instance);
             (video.take_retained(), len)
-        };
-        self.inner.notify(len);
-        previous
+        })
     }
 
     /// Copy borrowed pixels and metadata, then submit the owned copy asynchronously.
@@ -975,7 +977,9 @@ impl Sender {
     /// retains the frame; use [`Self::finish_video_async`] or the next async
     /// submission to recover it without copying.
     pub fn flush_async_blocking(&self) {
-        self.inner.complete();
+        self.inner.synchronize(|video, core, instance| {
+            ((), video.synchronize_and_complete(core, instance))
+        });
     }
 }
 
@@ -1365,6 +1369,9 @@ impl<M: SenderMode> Sender<M> {
 }
 
 impl Drop for Inner {
+    /// The destruction variant of [`Inner::synchronize`]: dropping holds the
+    /// state exclusively, so it takes no lock, and it contains a handler
+    /// panic while the thread is already unwinding.
     fn drop(&mut self) {
         let len = self
             .video
