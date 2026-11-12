@@ -1,12 +1,16 @@
 // Shared by the build-time declaration selector and the runtime tables.
+//
+// Each entry names its table, the field of `AdvancedApi` that holds it, and
+// either the `RuntimeFeature` it is gated and reported under or, for a table
+// that is its own gate, the name it is reported under.
 advanced_tables! {
     /// Sender creation with a per-instance JSON configuration.
-    struct SenderConfiguration in sender_configuration: "Advanced sender configuration" {
+    struct SenderConfiguration in sender_configuration: AdvancedSenderConfiguration {
         fn NDIlib_send_create_v2(p_create_settings: *const NDIlib_send_create_t, p_config_data: *const ::std::os::raw::c_char) -> NDIlib_send_instance_t;
     }
 
     /// Receiver creation with a per-instance JSON configuration.
-    struct ReceiverConfiguration in receiver_configuration: "Advanced receiver configuration" {
+    struct ReceiverConfiguration in receiver_configuration: AdvancedReceiverConfiguration {
         fn NDIlib_recv_create_v4(p_create_settings: *const NDIlib_recv_create_v3_t, p_config_data: *const ::std::os::raw::c_char) -> NDIlib_recv_instance_t;
     }
 

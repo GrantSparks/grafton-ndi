@@ -155,24 +155,31 @@ fn server() -> (AdvertiserOptions, ListenerOptions) {
     )
 }
 
-/// Every Discovery Server capability is unavailable for `reason`, and every
-/// constructor says so, under the capability's name, without calling the SDK.
-fn assert_refused(ndi: &NDI, reason: CapabilityUnavailable, explanation: &str) {
+/// Every Discovery Server capability is unavailable for `expected`, and every
+/// constructor says so, under the capability's name and with `evidence`,
+/// without calling the SDK. `NDI::require_feature` gives the same error.
+fn assert_refused(ndi: &NDI, expected: CapabilityUnavailable, evidence: &str) {
     let (advertisers, listeners) = server();
     let errors = constructor_errors(ndi, &advertisers, &listeners);
     for ((feature, name), error) in DISCOVERY_SERVER.into_iter().zip(errors) {
         assert_eq!(
             ndi.capabilities().status(feature),
-            CapabilityStatus::Unavailable(reason),
+            CapabilityStatus::Unavailable(expected),
             "{feature:?}"
         );
-        match error {
-            Some(Error::UnsupportedCapability { capability, reason }) => {
-                assert_eq!(capability, name);
-                assert!(reason.contains(explanation), "{name}: {reason}");
+        for error in [error, ndi.require_feature(feature).err()] {
+            match error {
+                Some(Error::UnsupportedCapability {
+                    capability,
+                    reason,
+                    detail,
+                }) => {
+                    assert_eq!((capability, reason), (name, expected));
+                    assert_eq!(detail, evidence, "{name}");
+                }
+                Some(other) => panic!("{name}: unexpected error {other}"),
+                None => panic!("{name}: the capability was not refused"),
             }
-            Some(other) => panic!("{name}: unexpected error {other}"),
-            None => panic!("{name}: the constructor succeeded"),
         }
     }
     assert!(!log().contains("-create\n"), "{}", log());
@@ -223,19 +230,32 @@ fn child(scenario: &str) {
                     ndi.capabilities().status(feature),
                     CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
                 );
-                let Some(Error::UnsupportedCapability { capability, reason }) = error else {
-                    panic!("{name}: expected an unsupported capability");
-                };
-                assert_eq!(capability, name);
-                assert!(reason.ends_with(symbol), "{name}: {reason}");
+                // The capability's own gate names the function too.
+                for error in [error, ndi.require_feature(feature).err()] {
+                    let Some(Error::UnsupportedCapability {
+                        capability,
+                        reason,
+                        detail,
+                    }) = error
+                    else {
+                        panic!("{name}: expected an unsupported capability");
+                    };
+                    assert_eq!(capability, name);
+                    assert_eq!(reason, CapabilityUnavailable::SymbolUnavailable);
+                    assert_eq!(detail, symbol, "{name}");
+                }
             }
-            let Err(Error::UnsupportedCapability { capability, reason }) =
-                Router::new(&ndi, &RouterOptions::new("bare"))
+            let Err(Error::UnsupportedCapability {
+                capability,
+                reason,
+                detail,
+            }) = Router::new(&ndi, &RouterOptions::new("bare"))
             else {
                 panic!("routing needs its functions");
             };
             assert_eq!(capability, "source routing");
-            assert!(reason.ends_with("NDIlib_routing_create"), "{reason}");
+            assert_eq!(reason, CapabilityUnavailable::SymbolUnavailable);
+            assert_eq!(detail, "NDIlib_routing_create");
         }
         "fixed_runtime_is_accepted" => {
             for (feature, _) in DISCOVERY_SERVER {
@@ -437,15 +457,23 @@ fn child(scenario: &str) {
 
             // The decoded text is for display: it names no advertised peer.
             // Neither does a receiver that is absent, and one that does not
-            // accept the command is refused. None of these reaches the SDK.
+            // accept the command is refused. None of these reaches the SDK,
+            // and none is blamed on the runtime.
             let displayed = ReceiverId::new(controllable.to_string()).unwrap();
             let absent = ReceiverId::new("absent").unwrap();
             let fixed = snapshot[1].id().unwrap();
-            for id in [&displayed, &absent, fixed] {
-                assert!(matches!(
+            for (id, listed) in [(&displayed, false), (&absent, false), (fixed, true)] {
+                for refused in [
                     receivers.request_connect(id, "STUDIO (Camera 2)"),
-                    Err(Error::UnsupportedCapability { .. })
-                ));
+                    receivers.request_disconnect(id),
+                ] {
+                    match refused {
+                        Err(Error::ReceiverRequestNotAccepted { advertised }) => {
+                            assert_eq!(advertised, listed, "{id}");
+                        }
+                        other => panic!("{id}: expected a refused request, got {other:?}"),
+                    }
+                }
             }
             assert_eq!(log().matches("recv-listener-connect ").count(), 2);
         }

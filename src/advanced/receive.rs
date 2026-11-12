@@ -68,11 +68,13 @@ impl PassthroughPreset {
     ) -> Result<NDIlib_recv_color_format_e> {
         native!(ReceiverConfiguration, table => {
             use sys::advanced_bindings::*;
+            // The value of a constant, or its name when the headers this
+            // build was made with do not declare it.
             macro_rules! optional_format {
                 ($constant:ident) => {
                     declared! { $constant {
-                        Some(u32::from_ne_bytes($constant.to_ne_bytes()))
-                    } else { None } }
+                        Ok(u32::from_ne_bytes($constant.to_ne_bytes()))
+                    } else { Err(stringify!($constant)) } }
                 };
             }
             let format: u32 = match self {
@@ -121,9 +123,15 @@ impl PassthroughPreset {
                 Self::ProtectedWithAudio => {
                     optional_format!(NDIlib_recv_color_format_ex_e_NDIlib_recv_color_format_ex_compressed_v6_with_audio)
                 }
-            }.ok_or_else(|| Error::UnsupportedCapability {
-                capability: "compressed receive preset".into(),
-                reason: format!("the installed Advanced SDK headers do not declare {self:?}"),
+            }.map_err(|constant: &'static str| Error::UnsupportedCapability {
+                capability: "compressed receive preset",
+                reason: crate::capabilities::CapabilityUnavailable::BuildAbiUnavailable,
+                // The headers declare the constant without the enumeration's
+                // name, which the generated binding prefixes it with.
+                detail: constant
+                    .strip_prefix("NDIlib_recv_color_format_ex_e_")
+                    .unwrap_or(constant)
+                    .to_owned(),
             })?;
             // The extended color formats take the target's C enum type; the
             // creation settings carry the same bits.

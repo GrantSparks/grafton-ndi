@@ -4,15 +4,16 @@
 //! Missing declaration families have uninhabited stand-ins; wrappers preserve
 //! their public API and return a typed capability error before reaching them.
 
-use super::{table::Resolver, Runtime, Table};
-use crate::{Error, Result};
+use super::{table::Resolver, Evidence, Table};
+use crate::{
+    capabilities::{CapabilityUnavailable, RuntimeFeature, SdkEdition},
+    Error, Result,
+};
 use std::ffi::CStr;
 
 #[cfg(ndi_has_advanced_header)]
 #[allow(unused_imports)]
 use super::{advanced_bindings::*, bindings::*, table::native_table};
-#[cfg(ndi_has_advanced_header)]
-use crate::capabilities::SdkEdition;
 
 include!(concat!(env!("OUT_DIR"), "/ndi_advanced_selection.rs"));
 pub(crate) use declared;
@@ -47,38 +48,72 @@ macro_rules! native {
 }
 pub(crate) use native;
 
-#[cfg(ndi_has_advanced_header)]
-#[cfg_attr(not(ndi_has_complete_advanced_header), allow(dead_code))]
-fn not_exported(capability: &str, runtime: &Runtime, symbol: &CStr) -> Error {
-    let symbol = symbol.to_string_lossy();
-    let reason = if runtime.info.edition() == SdkEdition::Advanced {
-        format!("the selected NDI runtime does not export {symbol}")
+/// The error for an Advanced table, reported under `capability`, that did not
+/// resolve for want of `symbol`: a function this build does not declare when
+/// the family is not `declared`, and otherwise one the runtime does not export.
+///
+/// The reasons are tried in the order [`Capabilities`] derives them in.
+///
+/// [`Capabilities`]: crate::capabilities::Capabilities
+fn unresolved(
+    capability: &'static str,
+    edition: SdkEdition,
+    declared: bool,
+    symbol: &CStr,
+) -> Error {
+    let reason = if !declared {
+        CapabilityUnavailable::BuildAbiUnavailable
+    } else if edition == SdkEdition::Advanced {
+        CapabilityUnavailable::SymbolUnavailable
     } else {
-        format!(
-            "the selected NDI runtime is not an Advanced SDK runtime: it does not export {symbol}"
-        )
+        CapabilityUnavailable::WrongEdition
     };
     Error::UnsupportedCapability {
-        capability: capability.into(),
+        capability,
         reason,
+        detail: symbol.to_string_lossy().into_owned(),
     }
 }
 
-#[cfg(not(ndi_has_complete_advanced_header))]
-fn not_built(capability: &str) -> Error {
-    Error::UnsupportedCapability {
-        capability: capability.into(),
-        reason: format!(
-            "grafton-ndi was built without the Advanced SDK declarations required for {capability}; \
-             rebuild with NDI_SDK_DIR naming an NDI Advanced SDK that declares this API"
-        ),
-    }
+/// How an `advanced_tables!` entry is gated.
+///
+/// An entry names either the [`RuntimeFeature`] it is gated and reported
+/// under, as an `optional_tables!` entry does, or the name it is reported
+/// under when the table alone is its gate.
+macro_rules! gate {
+    // Handed out under the feature's status, as a core table is, so that
+    // `NDI::require_feature` and the table always agree.
+    (of $Table:ident in $field:ident: $feature:ident, $evidence:ident) => {
+        $evidence.capability(RuntimeFeature::$feature, &$evidence.advanced.$field)
+    };
+    (of $Table:ident in $field:ident: $capability:literal, $evidence:ident) => {
+        $evidence.advanced.$field.as_ref().map_err(|symbol| {
+            unresolved(
+                $capability,
+                $evidence.info.edition(),
+                declared! { $Table { true } else { false } },
+                symbol,
+            )
+        })
+    };
+    (missing $field:ident: $feature:ident, $api:ident, $requested:ident) => {
+        if $requested == RuntimeFeature::$feature {
+            return $api.$field.as_ref().err().copied();
+        }
+    };
+    (missing $field:ident: $capability:literal, $api:ident, $requested:ident) => {};
+    (declares $Table:ident: $feature:ident, $requested:ident) => {
+        if $requested == RuntimeFeature::$feature {
+            return declared! { $Table { true } else { false } };
+        }
+    };
+    (declares $Table:ident: $capability:literal, $requested:ident) => {};
 }
 
 macro_rules! advanced_tables {
     ($(
         $(#[$meta:meta])*
-        struct $Table:ident in $field:ident: $capability:literal {
+        struct $Table:ident in $field:ident: $gate:tt {
             $(fn $name:ident($($argument:ident: $type:ty),* $(,)?) $(-> $return:ty)?;)+
         }
     )+) => {
@@ -99,21 +134,27 @@ macro_rules! advanced_tables {
                         $(super::table::symbol_name(concat!(stringify!($name), "\0"))),+
                     ];
 
+                    /// The first of the family's functions this build does
+                    /// not declare. Some function is undeclared, or the family
+                    /// would be, so the search ends within the table.
+                    const UNDECLARED: &'static CStr = {
+                        let declared = [$(declared! { $name { true } else { false } }),+];
+                        let mut index = 0;
+                        while declared[index] {
+                            index += 1;
+                        }
+                        Self::SYMBOLS[index]
+                    };
+
                     fn load(_: &dyn Resolver) -> Result<std::result::Result<Self, &'static CStr>> {
-                        Ok(Err(Self::SYMBOLS[0]))
+                        Ok(Err(Self::UNDECLARED))
                     }
                 }
             }}
 
             impl Table for $Table {
-                fn of(runtime: &'static Runtime) -> Result<&'static Self> {
-                    runtime.advanced.$field.as_ref().map_err(|_symbol| {
-                        declared! { $Table {
-                            not_exported($capability, runtime, _symbol)
-                        } else {
-                            not_built($capability)
-                        }}
-                    })
+                fn within(evidence: Evidence<'_>) -> Result<&'_ Self> {
+                    gate!(of $Table in $field: $gate, evidence)
                 }
             }
         )+
@@ -126,6 +167,23 @@ macro_rules! advanced_tables {
         impl AdvancedApi {
             pub(crate) fn load(resolver: &dyn Resolver) -> Result<Self> {
                 Ok(Self { $($field: $Table::load(resolver)?,)+ })
+            }
+
+            /// The first function of the table gated by `feature` that did not
+            /// resolve: one the implementation does not export or, when its
+            /// family is not declared, one this build does not declare. `None`
+            /// when the table resolved, and for a feature that gates no table
+            /// here.
+            pub(crate) fn missing(&self, feature: RuntimeFeature) -> Option<&'static CStr> {
+                $(gate!(missing $field: $gate, self, feature);)+
+                None
+            }
+
+            /// Whether this build declares the table gated by `feature`.
+            /// `false` for a feature that gates no table here.
+            pub(crate) fn declares(feature: RuntimeFeature) -> bool {
+                $(gate!(declares $Table: $gate, feature);)+
+                false
             }
         }
 

@@ -2,7 +2,9 @@
 
 use thiserror::Error;
 
-use std::{ffi::NulError, time::Duration};
+use std::{ffi::NulError, fmt, time::Duration};
+
+use crate::capabilities::CapabilityUnavailable;
 
 /// The main error type for NDI operations.
 ///
@@ -24,13 +26,43 @@ pub enum Error {
     #[error("Failed to load the NDI runtime: {0}")]
     RuntimeLoadFailed(String),
 
-    /// An optional operation is unavailable in this build or selected runtime.
-    #[error("NDI capability {capability} is unavailable: {reason}")]
+    /// An optional operation is unavailable in this build or with the
+    /// selected runtime.
+    ///
+    /// For a capability a [`RuntimeFeature`] describes, `reason` is the one
+    /// [`Capabilities::status`] reports for it, so a caller can branch on it
+    /// without reading text. The condition lasts for the life of the process:
+    /// the runtime is selected once, and a build that lacks a declaration has
+    /// to be rebuilt, with the `advanced` feature and with `NDI_SDK_DIR`
+    /// naming an NDI Advanced SDK whose headers declare it.
+    ///
+    /// [`RuntimeFeature`]: crate::capabilities::RuntimeFeature
+    /// [`Capabilities::status`]: crate::capabilities::Capabilities::status
+    #[error("NDI capability {capability} is unavailable: {}", Unavailability(.reason, .detail))]
     UnsupportedCapability {
-        /// Requested capability.
-        capability: String,
-        /// Build, module, target, or symbol evidence explaining unavailability.
-        reason: String,
+        /// The capability's name. For one a [`RuntimeFeature`] describes, it
+        /// is the same whichever operation the capability gates.
+        ///
+        /// [`RuntimeFeature`]: crate::capabilities::RuntimeFeature
+        capability: &'static str,
+        /// Why it is unavailable.
+        reason: CapabilityUnavailable,
+        /// The evidence: the entry point the runtime lacks (for
+        /// [`SymbolUnavailable`] and [`WrongEdition`]), the version it reports
+        /// against the version required (for [`RuntimeTooOld`] and
+        /// [`RuntimeVersionUnknown`]), or the declaration this build lacks (for
+        /// [`BuildAbiUnavailable`]).
+        ///
+        /// Empty when there is no evidence beyond `reason`: for example, for a
+        /// runtime that exports the capability's entry point but is not an
+        /// Advanced SDK runtime, or a build without the `advanced` feature.
+        ///
+        /// [`SymbolUnavailable`]: CapabilityUnavailable::SymbolUnavailable
+        /// [`WrongEdition`]: CapabilityUnavailable::WrongEdition
+        /// [`RuntimeTooOld`]: CapabilityUnavailable::RuntimeTooOld
+        /// [`RuntimeVersionUnknown`]: CapabilityUnavailable::RuntimeVersionUnknown
+        /// [`BuildAbiUnavailable`]: CapabilityUnavailable::BuildAbiUnavailable
+        detail: String,
     },
 
     /// The request cannot be met by the runtime already selected for this
@@ -163,6 +195,21 @@ pub enum Error {
         criteria: String,
     },
 
+    /// A Discovery Server listener did not send a request, because no receiver
+    /// it lists accepts it.
+    ///
+    /// Unlike [`Error::UnsupportedCapability`], this says nothing about the
+    /// build or the runtime. A listener lists nothing until it has connected
+    /// to its server, so a request made right after it was created can be
+    /// refused with `advertised` false and succeed later.
+    #[error("The Discovery Server listener sent no request: {}", request_refusal(.advertised))]
+    ReceiverRequestNotAccepted {
+        /// Whether a receiver with the identifier is listed. When it is not, it
+        /// may not have registered with the server yet, and a later request can
+        /// succeed; when it is, the receiver does not accept this command.
+        advertised: bool,
+    },
+
     /// An async blocking operation could not run or finish normally.
     ///
     /// Covers a missing Tokio runtime context, task cancellation or join failure,
@@ -186,4 +233,94 @@ pub enum Error {
     /// ```
     #[error("Failed to spawn blocking task: {0}")]
     SpawnFailed(String),
+}
+
+/// Why a capability is unavailable, followed by its evidence when there is any.
+struct Unavailability<'a>(&'a CapabilityUnavailable, &'a str);
+
+impl fmt::Display for Unavailability<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self(reason, detail) = *self;
+        if detail.is_empty() {
+            return write!(f, "{reason}");
+        }
+        match reason {
+            CapabilityUnavailable::WrongEdition => {
+                write!(f, "{reason}: it does not export {detail}")
+            }
+            CapabilityUnavailable::BuildAbiUnavailable => {
+                write!(f, "{reason}: it does not declare {detail}")
+            }
+            CapabilityUnavailable::SymbolUnavailable
+            | CapabilityUnavailable::RuntimeTooOld
+            | CapabilityUnavailable::RuntimeVersionUnknown => write!(f, "{reason}: {detail}"),
+        }
+    }
+}
+
+/// Why a listener refused to send a receiver request.
+fn request_refusal(advertised: &bool) -> &'static str {
+    if *advertised {
+        "the receiver it lists does not accept this request"
+    } else {
+        "it lists no receiver with this identifier, perhaps because it has not connected \
+         or the receiver has not registered yet"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unsupported(reason: CapabilityUnavailable, detail: &str) -> String {
+        Error::UnsupportedCapability {
+            capability: "source routing",
+            reason,
+            detail: detail.into(),
+        }
+        .to_string()
+    }
+
+    #[test]
+    fn capability_errors_name_their_evidence_and_never_end_in_empty_punctuation() {
+        use CapabilityUnavailable::*;
+        let prefix = "NDI capability source routing is unavailable: ";
+        for reason in [
+            RuntimeVersionUnknown,
+            RuntimeTooOld,
+            SymbolUnavailable,
+            BuildAbiUnavailable,
+            WrongEdition,
+        ] {
+            assert_eq!(unsupported(reason, ""), format!("{prefix}{reason}"));
+        }
+        assert_eq!(
+            unsupported(SymbolUnavailable, "NDIlib_routing_create"),
+            format!("{prefix}the selected runtime does not export a required function: NDIlib_routing_create")
+        );
+        assert_eq!(
+            unsupported(WrongEdition, "NDIlib_routing_create_v2"),
+            format!("{prefix}the selected runtime is not an Advanced SDK runtime: it does not export NDIlib_routing_create_v2")
+        );
+        assert_eq!(
+            unsupported(BuildAbiUnavailable, "NDIlib_routing_create_v2"),
+            format!("{prefix}this build was made without the Advanced SDK declarations: it does not declare NDIlib_routing_create_v2")
+        );
+        assert_eq!(
+            unsupported(
+                RuntimeTooOld,
+                "it needs NDI 6.4.0.0 or later and the runtime reports \"6.3.2.0\""
+            ),
+            format!("{prefix}the selected runtime is too old: it needs NDI 6.4.0.0 or later and the runtime reports \"6.3.2.0\"")
+        );
+    }
+
+    #[test]
+    fn a_refused_receiver_request_says_whether_the_receiver_is_listed() {
+        let listed = Error::ReceiverRequestNotAccepted { advertised: true }.to_string();
+        let unlisted = Error::ReceiverRequestNotAccepted { advertised: false }.to_string();
+        assert!(listed.ends_with("the receiver it lists does not accept this request"));
+        assert!(unlisted.contains("no receiver with this identifier"));
+        assert!(!listed.contains("capability") && !unlisted.contains("capability"));
+    }
 }

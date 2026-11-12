@@ -53,11 +53,14 @@ an operation returns:
 
 | Situation | Result of a native operation |
 | --- | --- |
-| Built without Advanced SDK headers, or with headers that do not declare the operation's functions | `Error::UnsupportedCapability`; the reason says the crate was built without the declarations the operation needs |
-| Built with headers that do not declare the requested `PassthroughPreset` | `Error::UnsupportedCapability` for the compressed receive preset; the reason names the preset |
-| Standard runtime selected | `Error::UnsupportedCapability`; the reason says the runtime is not an Advanced SDK runtime |
-| Advanced runtime that does not export a function the operation needs | `Error::UnsupportedCapability`; the reason names the function |
+| Built without Advanced SDK headers, or with headers that do not declare the operation's functions | `Error::UnsupportedCapability` with `reason` `BuildAbiUnavailable`; `detail` names the first function the build does not declare. Rebuild with `NDI_SDK_DIR` naming an Advanced SDK whose headers declare it |
+| Built with headers that do not declare the requested `PassthroughPreset` | `Error::UnsupportedCapability` for the compressed receive preset, with `reason` `BuildAbiUnavailable`; `detail` names the receiver color format the headers lack |
+| Standard runtime selected | `Error::UnsupportedCapability` with `reason` `WrongEdition`; `detail` names the operation's function when the runtime does not export it |
+| Advanced runtime that does not export a function the operation needs | `Error::UnsupportedCapability` with `reason` `SymbolUnavailable`; `detail` names the function |
 | Every requirement met | The operation runs |
+
+`reason` is a `CapabilityUnavailable`, so a program can branch on it without
+reading the message.
 
 Older or partial Advanced SDK headers disable only the operations whose
 functions they do not declare; the rest of the module keeps working. Core
@@ -71,7 +74,13 @@ runtime, with or without a configuration, so an Advanced 6.3.2 runtime refuses
 to create them.
 
 To find out in advance, ask the runtime. Each capability is checked
-separately, so a successful check covers only the operations it names:
+separately, so a successful check covers only the operations it names.
+Creating a sender or a receiver with a configuration is gated by
+`RuntimeFeature::AdvancedSenderConfiguration` and
+`RuntimeFeature::AdvancedReceiverConfiguration`: those constructors are refused
+exactly when `require_feature` refuses the feature, with the same error. A
+runtime that exports only one of the two creation functions is not an Advanced
+SDK runtime, so both are refused:
 
 ```rust
 use grafton_ndi::{capabilities::RuntimeFeature, NDI};

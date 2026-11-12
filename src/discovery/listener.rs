@@ -978,25 +978,31 @@ impl RecvListener {
     /// Ask the receiver `id` names to connect to the NDI source called
     /// `source`.
     ///
-    /// The request is sent only to a receiver that currently advertises
+    /// The request is sent only to a receiver that the listener lists, in a
+    /// snapshot taken by this call, as advertising
     /// [`ReceiverCommand::Connect`]. Success means the request was sent, not
     /// that the receiver acted on it.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidCString`] when `source` contains a NUL byte,
-    /// [`Error::UnsupportedCapability`] when no advertised receiver has this
-    /// identifier or the receiver does not accept connection requests,
-    /// [`Error::NativeOperationFailed`] when the SDK cannot send the request,
-    /// and the errors of [`Self::snapshot`].
+    /// Returns [`Error::InvalidCString`] when `source` contains a NUL byte;
+    /// [`Error::ReceiverRequestNotAccepted`] when no receiver the listener
+    /// lists has this identifier (`advertised` is false: the listener may not
+    /// have connected yet, or the receiver not registered, and a later request
+    /// can succeed) or the receiver does not accept connection requests
+    /// (`advertised` is true); [`Error::NativeOperationFailed`] when the SDK
+    /// cannot send the request; and the errors of [`Self::snapshot`].
     pub fn request_connect(&mut self, id: &ReceiverId, source: &str) -> Result<()> {
         self.request(id, Some(source))
     }
     /// Ask the receiver `id` names to disconnect from its current source.
     ///
+    /// This is the connection request without a source, so it too is sent
+    /// only to a receiver that advertises [`ReceiverCommand::Connect`].
+    ///
     /// # Errors
     ///
-    /// As for [`Self::request_connect`].
+    /// As for [`Self::request_connect`], without the NUL check.
     pub fn request_disconnect(&mut self, id: &ReceiverId) -> Result<()> {
         self.request(id, None)
     }
@@ -1004,21 +1010,13 @@ impl RecvListener {
         let source = source.map(CString::new).transpose()?;
         // The SDK accepts this command only for a receiver that advertises it.
         // Check a fresh snapshot rather than trust what the caller last saw.
-        let refusal = match self
-            .snapshot()?
+        let receivers = self.snapshot()?;
+        let listed = receivers
             .iter()
-            .find(|receiver| receiver.id.as_ref() == Some(id))
-        {
-            None => Some("no advertised receiver has this identifier"),
-            Some(receiver) if !receiver.commands.contains(&ReceiverCommand::Connect) => {
-                Some("the receiver does not accept connection requests")
-            }
-            Some(_) => None,
-        };
-        if let Some(reason) = refusal {
-            return Err(Error::UnsupportedCapability {
-                capability: "remote receiver source control".into(),
-                reason: reason.into(),
+            .find(|receiver| receiver.id.as_ref() == Some(id));
+        if !listed.is_some_and(|receiver| receiver.commands.contains(&ReceiverCommand::Connect)) {
+            return Err(Error::ReceiverRequestNotAccepted {
+                advertised: listed.is_some(),
             });
         }
         // SAFETY: the listener instance is live and both strings outlive the call.

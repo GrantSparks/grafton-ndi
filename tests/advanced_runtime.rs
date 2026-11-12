@@ -10,9 +10,10 @@
 mod common;
 
 use grafton_ndi::{
-    advanced::*, capabilities::RuntimeFeature, AudioFrame, Error, Finder, FinderOptions, Receiver,
-    ReceiverBandwidth, ReceiverOptions, ScanType, Sender, SenderOptions, Source, Tally, VideoFrame,
-    NDI,
+    advanced::*,
+    capabilities::{CapabilityUnavailable, RuntimeFeature, SdkEdition},
+    AudioFrame, Error, Finder, FinderOptions, Receiver, ReceiverBandwidth, ReceiverOptions,
+    ScanType, Sender, SenderOptions, Source, Tally, VideoFrame, NDI,
 };
 use std::{
     sync::{
@@ -340,11 +341,29 @@ fn operations_report_why_the_advanced_sdk_is_unavailable() {
         return;
     }
     let config = AdvancedConfig::parse("{}").unwrap();
+    let edition = ndi.info().edition();
     let unsupported = |error: Error| {
-        let Error::UnsupportedCapability { capability, reason } = error else {
+        let Error::UnsupportedCapability {
+            capability,
+            reason,
+            detail,
+        } = error
+        else {
             panic!("expected an unsupported capability, got {error:?}");
         };
-        assert!(!capability.is_empty() && !reason.is_empty());
+        assert!(!capability.is_empty());
+        // The runtime is refused for its edition, or the build for the
+        // declarations it lacks, which it names; nothing here is a version
+        // gate.
+        match reason {
+            CapabilityUnavailable::WrongEdition => {
+                assert_eq!(edition, SdkEdition::Standard, "{capability}");
+            }
+            CapabilityUnavailable::BuildAbiUnavailable => {
+                assert!(detail.starts_with("NDIlib_"), "{capability}: {detail}");
+            }
+            other => panic!("{capability}: unexpected reason {other:?}"),
+        }
     };
 
     unsupported(

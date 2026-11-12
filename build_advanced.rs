@@ -7,10 +7,12 @@
 
 use std::collections::BTreeSet;
 
+// Only the families and their functions matter here, not how each is gated:
+// `$gate` is a `RuntimeFeature` variant or the name the table is reported under.
 macro_rules! advanced_tables {
     ($(
         $(#[$meta:meta])*
-        struct $Table:ident in $field:ident: $capability:literal {
+        struct $Table:ident in $field:ident: $gate:tt {
             $(fn $name:ident($($argument:ident: $type:ty),* $(,)?) $(-> $return:ty)?;)+
         }
     )+) => {

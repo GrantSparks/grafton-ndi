@@ -345,17 +345,12 @@ impl Capabilities {
                 CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
             }
         };
+        // The order is the one an Advanced table that is its own gate reports
+        // in, so that every Advanced capability is refused alike.
         let advanced_entry = |feature: RuntimeFeature, available: bool| {
+            // The table the feature gates states which declarations it needs.
             #[cfg(feature = "advanced")]
-            let declared = match feature {
-                RuntimeFeature::AdvancedSenderConfiguration => {
-                    crate::sys::advanced::declared! { SenderConfiguration { true } else { false } }
-                }
-                RuntimeFeature::AdvancedReceiverConfiguration => {
-                    crate::sys::advanced::declared! { ReceiverConfiguration { true } else { false } }
-                }
-                _ => unreachable!("an Advanced creation feature"),
-            };
+            let declared = crate::sys::advanced::AdvancedApi::declares(feature);
             #[cfg(not(feature = "advanced"))]
             let declared = false;
             if !declared {
@@ -375,7 +370,7 @@ impl Capabilities {
             }
             // Which entry points a feature needs is stated with its table. A
             // feature without any of its own is only a version gate.
-            _ => exported(feature, api.exports(feature).unwrap_or(true)),
+            _ => exported(feature, api.missing(feature).is_none()),
         };
         Self {
             planar_444_video: status(RuntimeFeature::Planar444Video),
@@ -605,17 +600,14 @@ mod tests {
 
     #[test]
     fn advanced_configuration_needs_the_build_abi_and_the_advanced_edition() {
-        #[cfg(feature = "advanced")]
-        let built = [
-            crate::sys::advanced::declared! { SenderConfiguration { true } else { false } },
-            crate::sys::advanced::declared! { ReceiverConfiguration { true } else { false } },
-        ];
-        #[cfg(not(feature = "advanced"))]
-        let built = [false, false];
         let features = [
             RuntimeFeature::AdvancedSenderConfiguration,
             RuntimeFeature::AdvancedReceiverConfiguration,
         ];
+        #[cfg(feature = "advanced")]
+        let built = features.map(crate::sys::advanced::AdvancedApi::declares);
+        #[cfg(not(feature = "advanced"))]
+        let built = [false, false];
         let standard = detect(|_| true, Some("6.4.0.2"), SdkEdition::Standard);
         let advanced = detect(|_| true, Some("6.4.0.2"), SdkEdition::Advanced);
         for (feature, built) in features.into_iter().zip(built) {
@@ -632,6 +624,130 @@ mod tests {
                         CapabilityStatus::Unavailable(CapabilityUnavailable::BuildAbiUnavailable)
                     );
                 }
+            }
+        }
+    }
+
+    /// `NDI::require_feature` and the table an Advanced configuration feature
+    /// gates are one gate: for every reason the loader can give, both accept
+    /// the feature or both refuse it with the same error.
+    #[cfg(feature = "advanced")]
+    #[test]
+    fn advanced_configuration_tables_and_their_features_agree() {
+        use crate::sys::{
+            advanced::{declared, AdvancedApi, ReceiverConfiguration, SenderConfiguration},
+            table::ExportsWhere,
+            Evidence, Table,
+        };
+        use CapabilityUnavailable::{BuildAbiUnavailable, SymbolUnavailable, WrongEdition};
+
+        const SENDER: &str = "NDIlib_send_create_v2";
+        const RECEIVER: &str = "NDIlib_recv_create_v4";
+        type Outcome = std::result::Result<(), (&'static str, CapabilityUnavailable, String)>;
+        fn outcome<T>(result: crate::Result<T>) -> Outcome {
+            match result {
+                Ok(_) => Ok(()),
+                Err(crate::Error::UnsupportedCapability {
+                    capability,
+                    reason,
+                    detail,
+                }) => Err((capability, reason, detail)),
+                Err(other) => panic!("unexpected error: {other}"),
+            }
+        }
+
+        let features = [
+            (RuntimeFeature::AdvancedSenderConfiguration, SENDER),
+            (RuntimeFeature::AdvancedReceiverConfiguration, RECEIVER),
+        ];
+        // Each feature states the family it gates once, in the table registry.
+        assert_eq!(
+            features.map(|(feature, _)| AdvancedApi::declares(feature)),
+            [
+                declared! { SenderConfiguration { true } else { false } },
+                declared! { ReceiverConfiguration { true } else { false } },
+            ]
+        );
+        // A shared runtime is an Advanced runtime when it exports both entry
+        // points; a linked archive has the edition the build chose, and may
+        // lack one of them.
+        let scenarios: [(&[&str], SdkEdition); 6] = [
+            (&[SENDER, RECEIVER], SdkEdition::Advanced),
+            (&[], SdkEdition::Standard),
+            (&[SENDER], SdkEdition::Standard),
+            (&[RECEIVER], SdkEdition::Standard),
+            (&[SENDER], SdkEdition::Advanced),
+            (&[RECEIVER], SdkEdition::Advanced),
+        ];
+        let mut reached = Vec::new();
+        for (exported, edition) in scenarios {
+            let resolver = ExportsWhere(|name: &str| {
+                ![SENDER, RECEIVER].contains(&name) || exported.contains(&name)
+            });
+            let api = Api::load(&resolver).unwrap();
+            let advanced = AdvancedApi::load(&resolver).unwrap();
+            let info = RuntimeInfo {
+                edition,
+                linkage: SdkLinkage::Shared,
+                library_path: None,
+                raw_version: "NDI SDK TEST 6.4.0.2".into(),
+                version: SdkVersion::parse("6.4.0.2"),
+            };
+            let capabilities = Capabilities::detect(
+                &api,
+                info.version,
+                edition,
+                AdvancedEntryPoints {
+                    sender_configuration: exported.contains(&SENDER),
+                    receiver_configuration: exported.contains(&RECEIVER),
+                },
+            );
+            let evidence = Evidence {
+                api: &api,
+                advanced: &advanced,
+                info: &info,
+                capabilities: &capabilities,
+            };
+            let tables = [
+                outcome(SenderConfiguration::within(evidence)),
+                outcome(ReceiverConfiguration::within(evidence)),
+            ];
+            for ((feature, entry_point), table) in features.into_iter().zip(tables) {
+                let context = format!("{feature:?} with {exported:?} exported by {edition:?}");
+                let status = capabilities.status(feature);
+                let required = outcome(evidence.require(feature));
+                assert_eq!(table, required, "{context}");
+                let expected = match status {
+                    CapabilityStatus::Available => Ok(()),
+                    CapabilityStatus::Unavailable(reason) => {
+                        // The evidence is the entry point the runtime lacks,
+                        // or the declaration the build lacks; a runtime that
+                        // exports it but is not Advanced has none to give.
+                        let lacks =
+                            reason == BuildAbiUnavailable || !exported.contains(&entry_point);
+                        let detail = if lacks { entry_point } else { "" };
+                        Err((feature.name(), reason, detail.to_owned()))
+                    }
+                };
+                assert_eq!(required, expected, "{context}");
+                reached.push((feature, status));
+            }
+        }
+        for (feature, _) in features {
+            let expected: &[_] = if AdvancedApi::declares(feature) {
+                &[
+                    CapabilityStatus::Available,
+                    CapabilityStatus::Unavailable(WrongEdition),
+                    CapabilityStatus::Unavailable(SymbolUnavailable),
+                ]
+            } else {
+                &[CapabilityStatus::Unavailable(BuildAbiUnavailable)]
+            };
+            for status in expected {
+                assert!(
+                    reached.contains(&(feature, *status)),
+                    "{feature:?}: {status:?}"
+                );
             }
         }
     }

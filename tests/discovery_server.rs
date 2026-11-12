@@ -202,7 +202,7 @@ fn advertised_senders_and_receivers_reach_listeners() {
     recv_listener.request_disconnect(&controllable_id).unwrap();
     assert!(matches!(
         recv_listener.request_connect(monitored.id().unwrap(), &sender_name),
-        Err(Error::UnsupportedCapability { .. })
+        Err(Error::ReceiverRequestNotAccepted { advertised: true })
     ));
 
     // Removing a registration removes the peer from the registry.

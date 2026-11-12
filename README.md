@@ -473,7 +473,7 @@ match ndi.capabilities().status(RuntimeFeature::ReceiveDelay) {
 ndi.require_feature(RuntimeFeature::SenderDiscovery)?;
 ```
 
-An operation whose capability is unavailable returns `Error::UnsupportedCapability` with the capability's name and the reason. Other operations keep working. A capability is unavailable for one of these reasons:
+An operation whose capability is unavailable returns `Error::UnsupportedCapability` with the capability's name, the reason, which is the `CapabilityUnavailable` that `capabilities().status(...)` reports, and the evidence in `detail`: the function the runtime does not export, the version it reports against the one required, or the declaration the build lacks. Other operations keep working. A capability is unavailable for one of these reasons:
 
 | Reason | Meaning |
 | --- | --- |
@@ -533,7 +533,7 @@ for receiver in listener.snapshot()? {
 }
 ```
 
-Each object is created for a server address: the one in its options, or else the one in the NDI configuration. Apart from an older runtime and invalid option text, creation fails only when there is no address or the SDK cannot parse it. A server that cannot be reached is not an error. The object keeps trying in the background and starts working a few seconds after the server appears. A listener reports its connection through `is_connected`, and its snapshots are empty until it connects. An advertiser reports nothing.
+Each object is created for a server address: the one in its options, or else the one in the NDI configuration. Apart from an older runtime and invalid option text, creation fails only when there is no address or the SDK cannot parse it. A server that cannot be reached is not an error. The object keeps trying in the background and starts working a few seconds after the server appears. A listener reports its connection through `is_connected`, and its snapshots are empty until it connects. An advertiser reports nothing. `RecvListener::request_connect` and `request_disconnect` send a request only to a receiver the listener lists as accepting it, and otherwise return `Error::ReceiverRequestNotAccepted`. Its `advertised` field is `false` when no listed receiver has the identifier, which a later request can change, for example once the listener has connected.
 
 An advertiser owns its registrations. `register` returns a token, and the registered sender or receiver stays alive until `unregister` is called with that token or the advertiser is dropped, even if the application drops its own handle first. A token given to an advertiser that did not issue it comes back inside `Rejected`.
 

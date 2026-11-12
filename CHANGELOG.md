@@ -123,7 +123,11 @@ removed, and the build no longer links the NDI library; see the
   on `NDI`.
 - `Error::RuntimeLoadFailed`, `Error::RuntimeConflict`,
   `Error::UnsupportedCpu`, `Error::UnsupportedCapability`,
-  `Error::RuntimeRequired` and `Error::NativeOperationFailed`.
+  `Error::RuntimeRequired`, `Error::NativeOperationFailed` and
+  `Error::ReceiverRequestNotAccepted`. `UnsupportedCapability` carries the
+  `CapabilityUnavailable` reason that `capabilities()` reports, and a `detail`
+  naming the missing entry point, the version the runtime reports against the
+  one required, or the declaration the build lacks.
 - `Rejected<T>`, the error of an operation that takes ownership of a value and
   hands it back when it fails.
 - NDI 6.4 media support: the planar 4:4:4 formats `NA48`, `NB48`, `NA4G` and
@@ -146,7 +150,8 @@ removed, and the build no longer links the NDI library; see the
 - The `discovery` module for NDI Discovery Servers. `SendAdvertiser` and
   `RecvAdvertiser` register senders and receivers; `SendListener` and
   `RecvListener` return owned snapshots and events and can request a receiver
-  connection. These need NDI 6.4.0 or later, because earlier runtimes can crash
+  connection, which is refused with `Error::ReceiverRequestNotAccepted` when
+  the listener lists no receiver that accepts it. These need NDI 6.4.0 or later, because earlier runtimes can crash
   when the objects are destroyed. An advertiser keeps its registered senders
   and receivers alive until they are unregistered or it is dropped. Text from
   the network is decoded lossily, and the identifier types `SenderId`,
