@@ -50,6 +50,7 @@ workflow by the script tests.
 
 | Row | Runner | Target | Package | Promise, all features | Promise, no default features | Also runs |
 |---|---|---|---|---|---|---|
+| linux-x64 standard-6.1.1 | ubuntu-24.04 | x86_64-unknown-linux-gnu | 6.1.1-standard-linux | `1` | `1` | |
 | linux-x64 standard-6.3.2 | ubuntu-24.04 | x86_64-unknown-linux-gnu | 6.3.2-standard-linux | `1` | `1` | |
 | linux-x64 advanced-6.3.2 | ubuntu-24.04 | x86_64-unknown-linux-gnu | 6.3.2-advanced-linux | `advanced` | `1` | Advanced lint |
 | linux-x64 standard-6.4 | ubuntu-24.04 | x86_64-unknown-linux-gnu | current-standard-linux | `1,discovery-server` | `1,discovery-server` | vendored bindings check |
@@ -69,9 +70,12 @@ workflow by the script tests.
 
 On the Linux x64, Windows x64 and macOS ARM64 current Advanced rows, four
 additional runs cross the header/runtime boundary in both directions: current
-Advanced headers with each pinned 6.3.2 runtime (Standard and Advanced), and
-both 6.3.2 header editions with the current Advanced runtime. Each requires the
-operations its build/runtime combination provides and verifies the runtime's
+Advanced headers with each retained baseline runtime, and baseline headers
+with the current Advanced runtime. The Linux Standard baseline is 6.1.1;
+Windows/macOS Standard and all Advanced baselines are 6.3.2. Each compatibility
+run also launches a peer with the other SDK in a separate confined process and
+checks video pixels, audio samples, timecodes and metadata across versions.
+Each requires the operations its build/runtime combination provides and verifies the runtime's
 identity. Advanced operations without matching build declarations report
 unavailable.
 

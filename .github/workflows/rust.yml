@@ -167,6 +167,11 @@ jobs:
       # row that does not set it.
       matrix:
         include:
+          - name: linux-x64 standard-6.1.1
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            package: 6.1.1-standard-linux
+            require: '1'
           - name: linux-x64 standard-6.3.2
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
@@ -188,7 +193,7 @@ jobs:
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             package: current-advanced-linux
-            compatibility: 6.3.2-standard-linux
+            compatibility: 6.1.1-standard-linux
             compatibility-advanced: 6.3.2-advanced-linux
             require: advanced,file,discovery-server
             require-no-default: 1,discovery-server
@@ -347,6 +352,9 @@ jobs:
         env:
           GRAFTON_NDI_REQUIRE_RUNTIME: '1'
         run: |
+          export GRAFTON_NDI_PEER_RUNTIME="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_RUNTIME }}"
+          export GRAFTON_NDI_PEER_VERSION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_VERSION }}"
+          export GRAFTON_NDI_PEER_EDITION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_EDITION }}"
           for edition in standard advanced; do
             while IFS='=' read -r name value; do export "$name=$value"; done < "$RUNNER_TEMP/ndi-compat-$edition.env"
             export NDI_SDK_DIR="${{ steps.sdk.outputs.NDI_SDK_DIR }}"
@@ -361,6 +369,9 @@ jobs:
         run: |
           for edition in standard advanced; do
             while IFS='=' read -r name value; do export "$name=$value"; done < "$RUNNER_TEMP/ndi-compat-$edition.env"
+            export GRAFTON_NDI_PEER_RUNTIME="$GRAFTON_NDI_EXPECTED_RUNTIME"
+            export GRAFTON_NDI_PEER_VERSION="$GRAFTON_NDI_EXPECTED_VERSION"
+            export GRAFTON_NDI_PEER_EDITION="$GRAFTON_NDI_EXPECTED_EDITION"
             export NDI_RUNTIME_DIR_V6="${{ steps.sdk.outputs.NDI_RUNTIME_DIR_V6 }}"
             export GRAFTON_NDI_EXPECTED_RUNTIME="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_RUNTIME }}"
             export GRAFTON_NDI_EXPECTED_VERSION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_VERSION }}"

@@ -1,4 +1,11 @@
 {
+  "6.1.1-standard-linux": {
+    "version": "6.1.1",
+    "edition": "standard",
+    "platform": "linux",
+    "size": 55663144,
+    "sha256": "ea2aa37b1c082ed8769ae2e95d64230d54ef3ae32ae2333c281627a4f995894f"
+  },
   "6.3.2-advanced-android": {
     "version": "6.3.2",
     "edition": "advanced",

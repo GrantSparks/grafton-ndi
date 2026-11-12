@@ -17,9 +17,9 @@ NDI SDK. Three public signatures changed and one Cargo feature was removed;
 see the [2.0 to 3.0 migration guide](docs/migration/2.0-to-3.0.md).
 
 The compatibility target remains NDI 6.x and Rust 1.88. The test suite was run
-on Linux x86_64 against the Standard 6.3.2, Standard 6.4.0.2 and Advanced
+on Linux x86_64 against Standard 6.1.1 and Standard/Advanced 6.3.2 and
 6.4.0.2 runtimes. Windows, macOS, Android and iOS targets were compiled and
-linted only. NDI 6.0 and 6.1.1 were not tested. See
+linted only. NDI 6.0 remains unqualified. See
 [SDK validation](docs/sdk-validation.md).
 
 ### Breaking Changes
@@ -39,6 +39,11 @@ linted only. NDI 6.0 and 6.1.1 were not tested. See
   reported as `Error::UnsupportedCpu` instead of `Error::InitializationFailed`.
 
 ### Added
+
+- A pinned, retained original Standard 6.1.1 Linux SDK, with native CI coverage
+  and compatibility checks against 6.4. Mixed-version peer tests launch separate
+  SDK implementations and check video pixels, audio samples, timecodes and
+  metadata in both directions.
 
 - Advanced API availability follows individual declaration families, so older
   or partial Advanced headers preserve the public API and disable only missing

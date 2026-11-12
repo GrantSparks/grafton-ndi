@@ -11,7 +11,9 @@ pub mod discovery_server;
 
 #[path = "../../src/test_support.rs"]
 mod test_support;
-pub use test_support::{advanced_ndi, ndi, skip, unique_name, Requirement};
+pub use test_support::{
+    advanced_ndi, assert_expected_identity, ndi, skip, unique_name, Requirement,
+};
 
 /// Discover the sender's actual advertised endpoint. The send API can return a
 /// name without an address, and the first media port is not always 5961 (e.g.

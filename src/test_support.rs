@@ -220,7 +220,7 @@ pub fn advanced_ndi() -> Option<NDI> {
 /// Assert the identity promised by SDK provisioning against the module loaded
 /// in this process. These values are separate from header selection, allowing
 /// builds with newer headers to be tested against an older runtime.
-fn assert_expected_identity(info: &capabilities::RuntimeInfo) {
+pub fn assert_expected_identity(info: &capabilities::RuntimeInfo) {
     let expected =
         |name: &str| std::env::var(name).unwrap_or_else(|error| panic!("{name}: {error}"));
     if std::env::var_os("GRAFTON_NDI_EXPECTED_VERSION").is_some() {

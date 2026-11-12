@@ -9,11 +9,13 @@ and Rust 1.88.
 The test suite was run on **Linux x86_64** with `cargo test --locked
 --all-features` in these environments. Every run against a real runtime was
 confined to a network namespace with loopback networking only and had a
-private temporary directory.
+private temporary directory. The table records the core/Advanced qualification
+runs; the later cross-version peer checks are described below.
 
 | Build | Runtime | Required to be present | Passed | Failed | Ignored |
 | --- | --- | --- | --- | --- | --- |
 | No NDI SDK | None | Nothing | 612 | 0 | 3 |
+| Standard 6.1.1 headers | Standard 6.1.1 | `1` | 612 | 0 | 3 |
 | Standard 6.4.0.2 headers | Standard 6.4.0.2 | `1,discovery-server` | 612 | 0 | 3 |
 | Advanced SDK 6.3.2 headers | Advanced 6.3.2 | `advanced` | 615 | 0 | 3 |
 | Advanced SDK 6.4.0.2 headers | Advanced 6.4.0.2 | `advanced,file,discovery-server` | 615 | 0 | 3 |
@@ -92,21 +94,42 @@ mutex around the getters alone cannot protect against the SDK's thread.
 SDK provisioning exports the expected normalized version, edition and exact
 library path. Tests compare these with the runtime loaded in their own process;
 version, edition and path mismatch fixtures must fail. Archive provenance alone
-cannot satisfy that check. Hosted CI includes native Standard and Advanced 6.3.2 baselines, and both
-directions of each 6.3.2/current Advanced header/runtime combination on Linux,
-Windows and macOS.
+cannot satisfy that check. CI includes native Standard 6.1.1 on Linux and
+Standard/Advanced 6.3.2 baselines on Linux, Windows and macOS. Each current
+Advanced row crosses the oldest retained Standard and Advanced headers/runtimes
+in both directions. Linux uses Standard 6.1.1; other retained baselines use
+6.3.2.
 
-The historical compatibility target remains NDI 6.x, including 6.0 and the
-previously measured 6.1.1; these are qualification gaps, not a raised minimum.
-The retained vendor packages cover Standard and Advanced 6.3.2 and 6.4.0.2 on
-Linux, Windows, Apple and Android. The recovered Advanced 6.3.2 Linux headers
-and runtime passed the full suite; the other recovered packages were checked
-for version and archive identity, not executed on this machine.
-A historical download link recovered during this review served the exact pinned
-6.3.2 archive, demonstrating why a link's age cannot establish a version. Older
-vendor archives must be recovered, identified from their contents, pinned in
-`ci/sdk-packages.json` and added to the native CI matrix before those versions
-can be called qualified. Advanced runtimes older than 6.3.2 remain unqualified.
+The compatibility runs also launch a second process with the other pinned SDK
+and check decoded video pixels, nonzero audio samples, frame timecodes and
+metadata across the network connection. Both processes inherit the runner's
+network confinement and verify their loaded library identities independently.
+Linux checks passed for 6.1.1 senders with 6.4 receivers, 6.4 senders with 6.1.1
+receivers, and both directions between Advanced 6.3.2 and 6.4. These test different
+native implementations talking to one another, in addition to varying build
+headers.
+
+To require this test locally, set `GRAFTON_NDI_PEER_RUNTIME` to the second SDK's
+exact library path, `GRAFTON_NDI_PEER_VERSION` to its four-component normalized
+version, and `GRAFTON_NDI_PEER_EDITION` to `standard` or `advanced`. With these
+set, a missing peer, identity mismatch, delivery failure or failed child-process
+shutdown fails the test. Without a peer configuration it reports a skip.
+
+The compatibility target remains NDI 6.x. The retained qualification set is
+Standard 6.1.1 on Linux, plus Standard and Advanced 6.3.2 and 6.4.0.2 on Linux,
+Windows, Apple and Android. The older Linux 6.1.1 installer was recovered from
+RPM Fusion's source cache and matches the SHA-512 in its
+[historical source manifest](https://github.com/rpmfusion/ndi-sdk/blob/d0147e01a716c8e27d03894d79c296054e8caf63/sources).
+Its own `Version.txt` reports `NDI 2024-12-20 r143744 v6.1.1`; its runtime
+reports 6.1.1.0. The unmodified vendor installer has its own SHA-256 pin in
+`ci/sdk-packages.json`.
+
+SDK discovery is closed at this retained set. NDI 6.0, older Advanced versions,
+and historical versions on other platforms remain unqualified; this does not
+raise the crate's intended minimum or turn synthetic headers into vendor SDK
+validation. The other recovered packages were checked for version and archive
+identity, and Windows/Apple headers were compiled, but were not executed on
+this machine.
 
 ## What was compiled but not run
 
@@ -135,8 +158,8 @@ workflows and keeps the
 - Any behavior on Windows, macOS, Android, iOS, tvOS or visionOS. This includes
   the Windows and macOS branches of the runtime search and the static linking
   of Apple mobile targets, which are covered by compilation only.
-- NDI runtimes other than 6.3.2 and 6.4.0.2. Versions 6.0 and 6.1.1 in
-  particular were not tested.
+- NDI runtimes other than Linux Standard 6.1.1 and Standard/Advanced 6.3.2
+  and 6.4.0.2. NDI 6.0 remains unqualified.
 - The File library on Windows and macOS.
 - Linux architectures other than x86_64.
 - Hardware-dependent behavior: PTZ devices, KVM devices, hardware codecs, and

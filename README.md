@@ -521,7 +521,7 @@ The compatibility target is NDI 6.x and Rust 1.88.
 | Android | Shared library packaged with the application, loaded at run time. |
 | iOS/tvOS/visionOS | Static archive from the NDI SDK for Apple, linked at build time. |
 
-For this release the test suite was run on Linux x86_64 against the Standard 6.3.2, Standard 6.4.0.2 and Advanced 6.4.0.2 runtimes. Windows, macOS, Android and iOS targets were compiled and linted but their tests were not run. NDI 6.0 and 6.1.1 runtimes were not tested. The CI workflows in this repository have not yet run on a hosted runner. See [SDK validation](docs/sdk-validation.md) for the results and their limits.
+For this release the test suite was run on Linux x86_64 against Standard 6.1.1 and Standard/Advanced 6.3.2 and 6.4.0.2 runtimes. Cross-version peers were also tested between 6.1.1/6.3.2 and 6.4. Windows, macOS, Android and iOS targets were compiled and linted but their tests were not run. NDI 6.0 remains unqualified. The CI workflows in this repository have not yet run on a hosted runner. See [SDK validation](docs/sdk-validation.md) for the results and their limits.
 
 ## Documentation
 
