@@ -42,8 +42,8 @@ impl std::fmt::Debug for FilePlayer {
 
 impl FilePlayer {
     pub(super) fn create(api: FileApi, options: &PlayerOptions) -> Result<Self> {
+        let playback = api.table::<sys::FilePlayback>()?;
         let resolved = options.resolve()?;
-        let playback = api.playback()?;
         let settings = NDIlib_file_player_create_t {
             p_ndi_send_name: resolved.name.as_ptr(),
             p_groups: resolved

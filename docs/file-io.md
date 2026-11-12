@@ -77,6 +77,30 @@ Which NDI runtime the File library works with depends on the platform:
 | Windows | The File library does not depend on the runtime's edition. The SDK ships it for 64-bit Windows only. |
 | iOS, tvOS, visionOS | The File archive is linked at build time, in place of the core archive, when the NDI SDK for Apple supplies one; without it `FileApi::open` returns `Error::RuntimeLoadFailed`. See [Apple mobile targets](../README.md#apple-mobile-targets). |
 
+### What the selected library provides
+
+The File library's entry points come in two families, each a `FileFamily`:
+`Playback`, for `FileApi::probe` and the players, and `Recording`, for the
+recorders. A library is selected when it provides at least one of them
+completely, and `FileApi::status` or `FileApi::supports` says which:
+
+```rust
+use grafton_ndi::file::{FileApi, FileFamily};
+
+fn can_record(file: &FileApi) -> bool {
+    file.supports(FileFamily::Recording)
+}
+```
+
+An operation that needs a family the selected library lacks fails, before it
+calls anything, with `Error::UnsupportedCapability` whose `feature` is
+`RuntimeFeature::File` with that family, whose `reason` is
+`CapabilityUnavailable::SymbolUnavailable` and whose `detail` names the first
+entry point the library does not export. The library stays selected, so this
+lasts for the life of the process. The runtime's own `Capabilities` do not know
+what the File library provides, which is loaded apart from it: they report
+every family as `CapabilityUnavailable::SeparateLibrary`.
+
 ## Probing a recording
 
 `FileApi::probe` reads a recording's duration and track layout without
@@ -406,7 +430,8 @@ reports:
 
 | Variant | Meaning |
 | --- | --- |
-| `RuntimeLoadFailed` | No usable File library was found (the text lists every location tried and why each failed), or the selected library lacks the playback or recording entry points an operation needs (the text names the first one missing). |
+| `RuntimeLoadFailed` | No usable File library was found; the text lists every location tried and why each failed. Nothing was selected, so `FileApi::open` can be called again. |
+| `UnsupportedCapability` | The selected File library does not provide the `FileFamily` an operation needs: `feature` is `RuntimeFeature::File` with the family, `reason` is `SymbolUnavailable`, and `detail` names the first entry point missing. `FileApi::status` reports it in advance. |
 | `RuntimeConflict` | The File library cannot accompany the selected runtime, or `FileRuntimeOptions::library_path` names a library other than the one already selected. |
 | `InvalidInput` | A value cannot be represented by the native API, for example a path that is empty or is not UTF-8, or options that are out of range or conflict, which are refused when the player, recorder or async handle is created. The text names what the value is, such as the file path of a player or probe, or a recording target. |
 | `InvalidCString` | A string for the SDK contains a NUL: a path, a source name or URL, a player's name or groups, or a filename pattern. |

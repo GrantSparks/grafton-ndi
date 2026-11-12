@@ -8,8 +8,8 @@ mod fixture;
 
 use fixture::{FakeRuntime, FixtureDir};
 use grafton_ndi::{
-    capabilities::SdkEdition,
-    file::{FileApi, FileRuntimeOptions, PlayerOptions, RecorderOptions, SourceSpec},
+    capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, SdkEdition},
+    file::{FileApi, FileFamily, FileRuntimeOptions, PlayerOptions, RecorderOptions, SourceSpec},
     runtime::RuntimeOptions,
     Error, Ndi,
 };
@@ -371,14 +371,39 @@ fn child(name: &str, fixtures: &Fixtures) {
         }
         "incomplete_family_is_unavailable_alone" => {
             let ndi = select(fixtures, &PAIRED);
+            // A library that lacks one family is selected for the other.
             let api = FileApi::open(&ndi, &explicit(fixtures.file("partial"))).unwrap();
+            assert_eq!(
+                api.status(FileFamily::Recording),
+                CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
+            );
+            assert!(api.supports(FileFamily::Playback));
             let options = RecorderOptions::new(SourceSpec::new("a source").unwrap());
             match api.create_recorder(&options) {
-                Err(Error::RuntimeLoadFailed(reason)) => {
-                    assert!(reason.contains("NDIlib_file_recorder_rollover"), "{reason}");
+                Err(Error::UnsupportedCapability {
+                    feature,
+                    reason,
+                    detail,
+                }) => {
+                    assert_eq!(feature, RuntimeFeature::File(FileFamily::Recording));
+                    assert_eq!(reason, CapabilityUnavailable::SymbolUnavailable);
+                    assert_eq!(detail, "NDIlib_file_recorder_rollover");
                 }
                 other => panic!("expected recording to be unavailable: {other:?}"),
             }
+            // The library stays selected, and the family stays unavailable.
+            let reopened = FileApi::open(&ndi, &defaults).unwrap();
+            assert_eq!(
+                reopened.library_path(),
+                Some(fixtures.file("partial").as_path())
+            );
+            assert!(!reopened.supports(FileFamily::Recording));
+            // The runtime's own capabilities claim nothing about the library.
+            assert_eq!(
+                ndi.capabilities()
+                    .status(RuntimeFeature::File(FileFamily::Playback)),
+                CapabilityStatus::Unavailable(CapabilityUnavailable::SeparateLibrary)
+            );
             // Playback is complete in this library and still reaches it.
             assert_eq!(bound_runtime(&api), PAIRED.build);
             assert!(matches!(

@@ -7,6 +7,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(feature = "file-io")]
+use crate::file::FileFamily;
 use crate::sys::Api;
 #[cfg(feature = "advanced")]
 use crate::{advanced::PassthroughPreset, sys::advanced::AdvancedApi};
@@ -170,7 +172,8 @@ impl RuntimeInfo {
 /// The enum, its `name`, `minimum_version`, `requirements` and `is_advanced`,
 /// [`RuntimeFeature::UNIT`] and the place [`Capabilities`] keeps each status
 /// are all generated from the list, so none of them can leave a capability
-/// out. `Passthrough`, the one variant with a field, is written out here.
+/// out. The variants with a field are written out here: `Passthrough`, and
+/// `File`, whose status the File library reports rather than [`Capabilities`].
 macro_rules! runtime_features {
     (@advanced core) => {
         false
@@ -205,7 +208,10 @@ macro_rules! runtime_features {
         /// [`Capabilities::status`] reports each one in advance, and every operation
         /// that needs one that is unavailable fails with
         /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
-        /// naming it, before anything reaches the SDK.
+        /// naming it, before anything reaches the SDK. The families of the NDI File
+        /// library, [`File`](Self::File), are the exception: that library is loaded
+        /// apart from the runtime, and its own
+        /// [`FileApi::status`](crate::file::FileApi::status) reports them.
         ///
         /// A core capability depends on the functions the runtime exports and, for
         /// some, on its version: an older runtime would misread newer input values, or
@@ -235,6 +241,20 @@ macro_rules! runtime_features {
             /// format that selects the preset.
             #[cfg(feature = "advanced")]
             Passthrough(PassthroughPreset),
+            /// A family of the NDI File library's entry points.
+            ///
+            /// The File library is loaded apart from the runtime, by
+            /// [`FileApi::open`](crate::file::FileApi::open), and the runtime's
+            /// [`Capabilities`] cannot know what it provides: they report every
+            /// family as [`CapabilityUnavailable::SeparateLibrary`]. The
+            /// selected library's
+            /// [`FileApi::status`](crate::file::FileApi::status) reports it, and
+            /// an operation that needs a family the library lacks fails with
+            /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
+            /// naming it, with [`CapabilityUnavailable::SymbolUnavailable`] and
+            /// the entry point the library does not export.
+            #[cfg(feature = "file-io")]
+            File(FileFamily),
         }
 
         /// The variants of [`RuntimeFeature`] without a field, numbered in
@@ -263,6 +283,9 @@ macro_rules! runtime_features {
             /// Derived from the configured receiver's, for a passthrough preset.
             #[cfg(feature = "advanced")]
             Passthrough,
+            /// Kept by the File library, for a File family.
+            #[cfg(feature = "file-io")]
+            File,
         }
 
         impl RuntimeFeature {
@@ -277,6 +300,8 @@ macro_rules! runtime_features {
                     $(Self::$Variant => Slot::Unit(Index::$Variant as usize),)+
                     #[cfg(feature = "advanced")]
                     Self::Passthrough(_) => Slot::Passthrough,
+                    #[cfg(feature = "file-io")]
+                    Self::File(_) => Slot::File,
                 }
             }
 
@@ -286,6 +311,8 @@ macro_rules! runtime_features {
                     $(Self::$Variant => $name,)+
                     #[cfg(feature = "advanced")]
                     Self::Passthrough(_) => "compressed passthrough preset",
+                    #[cfg(feature = "file-io")]
+                    Self::File(family) => family.name(),
                 }
             }
 
@@ -303,6 +330,8 @@ macro_rules! runtime_features {
                     $(Self::$Variant => runtime_features!(@minimum $($minimum)?),)+
                     #[cfg(feature = "advanced")]
                     Self::Passthrough(_) => None,
+                    #[cfg(feature = "file-io")]
+                    Self::File(_) => None,
                 }
             }
 
@@ -315,6 +344,8 @@ macro_rules! runtime_features {
                     $(Self::$Variant => &[$($(Self::$required),+)?],)+
                     #[cfg(feature = "advanced")]
                     Self::Passthrough(_) => &[],
+                    #[cfg(feature = "file-io")]
+                    Self::File(_) => &[],
                 }
             }
 
@@ -326,6 +357,8 @@ macro_rules! runtime_features {
                     $(Self::$Variant => runtime_features!(@ungated $edition $($why)?),)+
                     #[cfg(feature = "advanced")]
                     Self::Passthrough(_) => false,
+                    #[cfg(feature = "file-io")]
+                    Self::File(_) => false,
                 }
             }
 
@@ -339,6 +372,8 @@ macro_rules! runtime_features {
                     $(Self::$Variant => runtime_features!(@advanced $edition),)+
                     #[cfg(feature = "advanced")]
                     Self::Passthrough(_) => true,
+                    #[cfg(feature = "file-io")]
+                    Self::File(_) => false,
                 }
             }
         }
@@ -467,6 +502,12 @@ pub enum CapabilityUnavailable {
     BuildAbiUnavailable,
     /// The selected native SDK edition does not implement this API family.
     WrongEdition,
+    /// The capability belongs to the NDI File library, which is loaded apart
+    /// from the runtime, so the runtime's [`Capabilities`] cannot say whether
+    /// it is available. [`FileApi::status`](crate::file::FileApi::status)
+    /// reports it.
+    #[cfg(feature = "file-io")]
+    SeparateLibrary,
 }
 
 impl fmt::Display for CapabilityUnavailable {
@@ -474,11 +515,15 @@ impl fmt::Display for CapabilityUnavailable {
         f.write_str(match self {
             Self::RuntimeVersionUnknown => "the selected runtime's version is not recognized",
             Self::RuntimeTooOld => "the selected runtime is too old",
-            Self::SymbolUnavailable => "the selected runtime does not export a required function",
+            Self::SymbolUnavailable => "the selected library does not export a required function",
             Self::BuildAbiUnavailable => {
                 "this build was made without the Advanced SDK declarations"
             }
             Self::WrongEdition => "the selected runtime is not an Advanced SDK runtime",
+            #[cfg(feature = "file-io")]
+            Self::SeparateLibrary => {
+                "it belongs to the separately loaded NDI File library, whose FileApi reports it"
+            }
         })
     }
 }
@@ -616,6 +661,10 @@ impl Capabilities {
                     CapabilityStatus::Unavailable(CapabilityUnavailable::BuildAbiUnavailable)
                 }
             }
+            // The runtime knows nothing of the File library; see
+            // `RuntimeFeature::File`.
+            #[cfg(feature = "file-io")]
+            Slot::File => CapabilityStatus::Unavailable(CapabilityUnavailable::SeparateLibrary),
         }
     }
 
@@ -634,6 +683,8 @@ impl Capabilities {
             Slot::Unit(index) => self.refused_by[index],
             #[cfg(feature = "advanced")]
             Slot::Passthrough => feature,
+            #[cfg(feature = "file-io")]
+            Slot::File => feature,
         }
     }
 }
@@ -724,6 +775,8 @@ mod tests {
         let features = RuntimeFeature::UNIT.into_iter();
         #[cfg(feature = "advanced")]
         let features = features.chain(PassthroughPreset::ALL.map(RuntimeFeature::Passthrough));
+        #[cfg(feature = "file-io")]
+        let features = features.chain(FileFamily::ALL.map(RuntimeFeature::File));
         features.collect()
     }
 
@@ -797,6 +850,10 @@ mod tests {
         edition: SdkEdition,
     ) -> CapabilityStatus {
         use CapabilityUnavailable::*;
+        #[cfg(feature = "file-io")]
+        if let RuntimeFeature::File(_) = feature {
+            return CapabilityStatus::Unavailable(SeparateLibrary);
+        }
         let own = if !declared(feature) {
             Some(BuildAbiUnavailable)
         } else if feature.is_advanced() && edition != SdkEdition::Advanced {
@@ -845,6 +902,15 @@ mod tests {
         for preset in PassthroughPreset::ALL {
             let name = RuntimeFeature::Passthrough(preset).name();
             assert!(!names.contains(name), "{preset:?}: {name}");
+        }
+        #[cfg(feature = "file-io")]
+        {
+            let families: HashSet<_> = FileFamily::ALL
+                .into_iter()
+                .map(|family| RuntimeFeature::File(family).name())
+                .collect();
+            assert_eq!(families.len(), FileFamily::ALL.len());
+            assert!(families.is_disjoint(&names), "{families:?}");
         }
 
         // As the enum's documentation says, every capability from
@@ -1212,6 +1278,10 @@ mod tests {
                             // The version gate of the feature or of the one it
                             // requires.
                             RuntimeTooOld | RuntimeVersionUnknown => too_old,
+                            #[cfg(feature = "file-io")]
+                            SeparateLibrary => {
+                                panic!("{context}: an Advanced table is not a File family")
+                            }
                         };
                         Err((feature, reason, detail))
                     }
@@ -1323,6 +1393,67 @@ mod tests {
         assert!(SdkVersion::parse("6.3.2.0").unwrap() < NDI_6_4);
         for later in ["6.4.0", "6.4.0.2", "6.5.1", "7.0.0"] {
             assert!(SdkVersion::parse(later).unwrap() >= NDI_6_4, "{later}");
+        }
+    }
+}
+
+#[cfg(all(test, feature = "file-io"))]
+mod file_tests {
+    use super::*;
+
+    /// The runtime's capabilities claim nothing about the File library: they
+    /// report every family as belonging to it, with no evidence, whatever the
+    /// runtime exports, and `require_feature` refuses it the same way.
+    #[test]
+    fn the_runtime_reports_file_families_as_the_file_librarys_to_report() {
+        for (version, edition) in [
+            (Some("6.4.0.2"), SdkEdition::Advanced),
+            (Some("6.4.0.2"), SdkEdition::Standard),
+            (None, SdkEdition::Advanced),
+        ] {
+            let resolver = crate::sys::table::ExportsWhere(|_| true);
+            let api = Api::load(&resolver).unwrap();
+            let version = version.map(|text| SdkVersion::parse(text).unwrap());
+            #[cfg(feature = "advanced")]
+            let advanced = AdvancedApi::load(&resolver).unwrap();
+            #[cfg(feature = "advanced")]
+            let capabilities = Capabilities::detect(&api, &advanced, version, edition);
+            #[cfg(not(feature = "advanced"))]
+            let capabilities = Capabilities::detect(&api, version, edition);
+            let info = RuntimeInfo {
+                edition,
+                linkage: SdkLinkage::Shared,
+                library_path: None,
+                raw_version: "NDI SDK TEST".into(),
+                version,
+            };
+            let evidence = crate::sys::Evidence {
+                api: &api,
+                #[cfg(feature = "advanced")]
+                advanced: &advanced,
+                info: &info,
+                capabilities: &capabilities,
+            };
+            for family in FileFamily::ALL {
+                let feature = RuntimeFeature::File(family);
+                assert_eq!(
+                    capabilities.status(feature),
+                    CapabilityStatus::Unavailable(CapabilityUnavailable::SeparateLibrary)
+                );
+                assert!(!feature.is_advanced() && !feature.is_ungated());
+                let Err(crate::Error::UnsupportedCapability {
+                    feature: refused,
+                    reason,
+                    detail,
+                }) = evidence.require(feature)
+                else {
+                    panic!("{feature:?} was not refused");
+                };
+                assert_eq!(
+                    (refused, reason, detail.as_str()),
+                    (feature, CapabilityUnavailable::SeparateLibrary, "")
+                );
+            }
         }
     }
 }

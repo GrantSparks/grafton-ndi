@@ -434,8 +434,8 @@ impl std::fmt::Debug for FileRecorder {
 
 impl FileRecorder {
     pub(super) fn create(api: FileApi, options: &RecorderOptions) -> Result<Self> {
+        let recording = api.table::<sys::FileRecording>()?;
         let resolved = options.resolve()?;
-        let recording = api.recording()?;
         let settings = NDIlib_file_recorder_create_t {
             source_to_connect_to: raw_source(&options.source),
             track_flags: track_flags(options.tracks),

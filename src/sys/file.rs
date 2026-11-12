@@ -4,6 +4,12 @@
 //! core runtime's own search, starting beside the selected core module, and pin
 //! it for the life of the process. Statically linked targets resolve the same
 //! tables from the archive linked at build time.
+//!
+//! Its entry points come in families, one for each [`FileFamily`], and each
+//! family resolves all-or-nothing. A family's table is handed out only by
+//! [`FileRuntime::table`], which refuses it under that family when the library
+//! lacks one of its entry points, so a wrapper holding the table can call
+//! everything in it.
 
 use std::{ffi::CStr, path::Path};
 
@@ -18,11 +24,100 @@ use super::{
     table::{native_table, Resolver},
     Api,
 };
-use crate::{capabilities::RuntimeInfo, Error, Result};
+use crate::{
+    capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, RuntimeInfo},
+    file::FileFamily,
+    Error, Result,
+};
 
-native_table! {
+/// A family's table as one library resolved it, or the first of its entry
+/// points the library lacks.
+type Resolved<T> = std::result::Result<T, &'static CStr>;
+
+/// The table of one family of File entry points.
+pub(crate) trait FileTable: Sized + 'static {
+    /// The family the table holds, under which it is gated and reported.
+    const FAMILY: FileFamily;
+
+    /// The table as `runtime` resolved it. Callers use
+    /// [`FileRuntime::table`], which reports a missing entry point as the
+    /// family's error.
+    fn resolved(runtime: &FileRuntime) -> &Resolved<Self>;
+}
+
+/// Define the families of the File library's entry points.
+///
+/// Each entry states, once, everything about one family: its table, the
+/// field of [`Families`] that holds it and the [`FileFamily`] it is gated and
+/// reported under. Every family needs an entry, because
+/// [`Families::missing`] matches each one.
+macro_rules! file_families {
+    ($(
+        $(#[$meta:meta])*
+        struct $Table:ident in $field:ident: $Family:ident {
+            $(fn $name:ident($($argument:ident: $type:ty),* $(,)?) $(-> $return:ty)?;)+
+        }
+    )+) => {
+        $(
+            native_table! {
+                $(#[$meta])*
+                pub(crate) struct $Table from crate::sys::declarations {
+                    $(fn $name($($argument: $type),*) $(-> $return)?;)+
+                }
+            }
+
+            impl FileTable for $Table {
+                const FAMILY: FileFamily = FileFamily::$Family;
+
+                fn resolved(runtime: &FileRuntime) -> &Resolved<Self> {
+                    &runtime.families.$field
+                }
+            }
+        )+
+
+        /// Every family resolved from one File library.
+        struct Families {
+            $($field: Resolved<$Table>,)+
+        }
+
+        impl Families {
+            /// Resolve every family from `resolver`.
+            ///
+            /// The error is the reason this implementation cannot be used at
+            /// all: an entry point resolves outside it, or it provides no
+            /// family.
+            fn load(resolver: &dyn Resolver) -> std::result::Result<Self, String> {
+                let families = Self {
+                    $($field: $Table::load(resolver).map_err(reason)?,)+
+                };
+                // The first entry point each family lacks, in declaration order.
+                let missing = [$(families.$field.as_ref().err().copied()),+];
+                if let [Some(first), ..] = missing {
+                    if missing.iter().all(Option::is_some) {
+                        return Err(format!(
+                            "it provides no family of NDI File entry points (it does not \
+                             export {})",
+                            first.to_string_lossy()
+                        ));
+                    }
+                }
+                Ok(families)
+            }
+
+            /// The first entry point of `family` that the library does not
+            /// export, or `None` when it exports them all.
+            fn missing(&self, family: FileFamily) -> Option<&'static CStr> {
+                match family {
+                    $(FileFamily::$Family => self.$field.as_ref().err().copied(),)+
+                }
+            }
+        }
+    };
+}
+
+file_families! {
     /// Probing a recording, and the player that re-publishes one as an NDI source.
-    pub(crate) struct FilePlayback from crate::sys::declarations {
+    struct FilePlayback in playback: Playback {
         fn NDIlib_file_player_probe_file(p_file_path: *const ::std::os::raw::c_char, p_out_info: *mut NDIlib_file_player_file_info_t) -> bool;
         fn NDIlib_file_player_create(p_create_settings: *const NDIlib_file_player_create_t) -> NDIlib_file_player_instance_t;
         fn NDIlib_file_player_destroy(p_instance: NDIlib_file_player_instance_t);
@@ -44,11 +139,9 @@ native_table! {
         fn NDIlib_file_player_get_source_format(p_instance: NDIlib_file_player_instance_t, p_out_format: *mut NDIlib_file_source_format_t) -> bool;
         fn NDIlib_file_player_get_advertised_source(p_instance: NDIlib_file_player_instance_t) -> *const NDIlib_source_t;
     }
-}
 
-native_table! {
     /// The recorder that writes an NDI source to disk.
-    pub(crate) struct FileRecording from crate::sys::declarations {
+    struct FileRecording in recording: Recording {
         fn NDIlib_file_recorder_create(p_create_settings: *const NDIlib_file_recorder_create_t) -> NDIlib_file_recorder_instance_t;
         fn NDIlib_file_recorder_destroy(p_instance: NDIlib_file_recorder_instance_t);
         fn NDIlib_file_recorder_start(p_instance: NDIlib_file_recorder_instance_t, p_output_prefix: *const ::std::os::raw::c_char) -> bool;
@@ -82,16 +175,9 @@ pub(crate) const UNWRAPPED: &[(&str, &str)] = &[
     ),
 ];
 
-/// One family of entry points, or the first of them an implementation lacks.
-///
-/// A family resolves all-or-nothing: an implementation without one of its
-/// entry points provides none of it.
-type Family<T> = std::result::Result<T, &'static CStr>;
-
 /// The File library selected for this process.
 pub(crate) struct FileRuntime {
-    playback: Family<FilePlayback>,
-    recording: Family<FileRecording>,
+    families: Families,
     #[cfg(not(ndi_link_static))]
     path: std::path::PathBuf,
 }
@@ -120,31 +206,35 @@ pub(crate) fn select_file(
 }
 
 impl FileRuntime {
-    /// The playback family, or the first of its entry points the library lacks.
-    pub(crate) fn playback(&self) -> Family<&FilePlayback> {
-        self.playback.as_ref().map_err(|symbol| *symbol)
-    }
-
-    /// The recording family, or the first of its entry points the library lacks.
-    pub(crate) fn recording(&self) -> Family<&FileRecording> {
-        self.recording.as_ref().map_err(|symbol| *symbol)
-    }
-
-    /// Resolve both families from `resolver`.
+    /// The table of the family `T` holds, once the library is known to
+    /// export every one of its entry points.
     ///
-    /// The error is the reason this implementation cannot be used at all.
-    fn resolve(
-        resolver: &dyn Resolver,
-    ) -> std::result::Result<(Family<FilePlayback>, Family<FileRecording>), String> {
-        let playback = FilePlayback::load(resolver).map_err(reason)?;
-        let recording = FileRecording::load(resolver).map_err(reason)?;
-        if let (Err(symbol), Err(_)) = (&playback, &recording) {
-            return Err(format!(
-                "it provides neither file playback nor file recording (no {})",
-                symbol.to_string_lossy()
-            ));
+    /// This is the only way to a family's table, so a table is never used
+    /// without the gate of its family, or reported as another one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnsupportedCapability`] for [`RuntimeFeature::File`] with the
+    /// family, [`CapabilityUnavailable::SymbolUnavailable`] and the first
+    /// entry point the library does not export, exactly when
+    /// [`Self::status`] reports the family unavailable.
+    pub(crate) fn table<T: FileTable>(&self) -> Result<&T> {
+        T::resolved(self)
+            .as_ref()
+            .map_err(|symbol| Error::UnsupportedCapability {
+                feature: RuntimeFeature::File(T::FAMILY),
+                reason: CapabilityUnavailable::SymbolUnavailable,
+                detail: symbol.to_string_lossy().into_owned(),
+            })
+    }
+
+    /// Whether the library provides `family`: unavailable exactly when
+    /// [`Self::table`] refuses the family's table.
+    pub(crate) fn status(&self, family: FileFamily) -> CapabilityStatus {
+        match self.families.missing(family) {
+            None => CapabilityStatus::Available,
+            Some(_) => CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable),
         }
-        Ok((playback, recording))
     }
 }
 
@@ -226,15 +316,11 @@ impl FileRuntime {
                 return Err("it is bound to an NDI runtime other than the selected one".into());
             }
         }
-        let (playback, recording) = Self::resolve(&module)?;
+        let families = Families::load(&module)?;
         let path = module
             .path()
             .ok_or("the loader did not report where it was loaded from")?;
-        Ok(Self {
-            playback,
-            recording,
-            path,
-        })
+        Ok(Self { families, path })
     }
 
     fn accepts(&self, requested: Option<&Path>) -> Result<()> {
@@ -277,13 +363,10 @@ impl FileRuntime {
 
     fn load(_core: &RuntimeInfo, _api: &Api, explicit: Option<&Path>) -> Result<Self> {
         Self::reject_path(explicit)?;
-        let (playback, recording) = Self::resolve(&Linked).map_err(|reason| {
+        let families = Families::load(&Linked).map_err(|reason| {
             Error::RuntimeLoadFailed(format!("the linked NDI SDK archive: {reason}"))
         })?;
-        Ok(Self {
-            playback,
-            recording,
-        })
+        Ok(Self { families })
     }
 
     fn accepts(&self, requested: Option<&Path>) -> Result<()> {
@@ -302,28 +385,113 @@ impl FileRuntime {
 }
 
 #[cfg(test)]
+impl FileRuntime {
+    /// A library whose families are the given test doubles, or lack the
+    /// entry point an `Err` names. It is never freed, as a selected library
+    /// is never unloaded.
+    pub(crate) fn test_double(
+        playback: Resolved<FilePlayback>,
+        recording: Resolved<FileRecording>,
+    ) -> &'static Self {
+        Box::leak(Box::new(Self {
+            families: Families {
+                playback,
+                recording,
+            },
+            #[cfg(not(ndi_link_static))]
+            path: "test double".into(),
+        }))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::sys::table::ExportsWhere;
 
+    /// A library that exports the names `exported` accepts.
+    fn library(exported: impl Fn(&str) -> bool) -> std::result::Result<FileRuntime, String> {
+        Ok(FileRuntime {
+            families: Families::load(&ExportsWhere(exported))?,
+            #[cfg(not(ndi_link_static))]
+            path: "test".into(),
+        })
+    }
+
+    /// A refusal's feature, reason and detail.
+    fn refusal<T>(result: Result<T>) -> Option<(RuntimeFeature, CapabilityUnavailable, String)> {
+        match result {
+            Ok(_) => None,
+            Err(Error::UnsupportedCapability {
+                feature,
+                reason,
+                detail,
+            }) => Some((feature, reason, detail)),
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
+
     #[test]
-    fn each_family_resolves_independently() {
-        let (playback, recording) = FileRuntime::resolve(&ExportsWhere(|name| {
-            name != "NDIlib_file_recorder_rollover"
-        }))
-        .unwrap();
-        assert!(playback.is_ok());
-        assert_eq!(recording.err(), Some(c"NDIlib_file_recorder_rollover"));
+    fn each_family_resolves_independently_and_is_refused_as_itself() {
+        let library = library(|name| name != "NDIlib_file_recorder_rollover").unwrap();
+        assert_eq!(
+            library.status(FileFamily::Playback),
+            CapabilityStatus::Available
+        );
+        assert!(library.table::<FilePlayback>().is_ok());
+        assert_eq!(
+            library.status(FileFamily::Recording),
+            CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
+        );
+        assert_eq!(
+            refusal(library.table::<FileRecording>()),
+            Some((
+                RuntimeFeature::File(FileFamily::Recording),
+                CapabilityUnavailable::SymbolUnavailable,
+                "NDIlib_file_recorder_rollover".into()
+            ))
+        );
+    }
+
+    /// The status of each family and the gate of its table are one decision,
+    /// whichever entry point the library lacks.
+    #[test]
+    fn every_family_has_a_table_whose_gate_agrees_with_its_status() {
+        let every_symbol = FilePlayback::SYMBOLS
+            .iter()
+            .chain(FileRecording::SYMBOLS)
+            .map(|symbol| symbol.to_str().unwrap());
+        for lacking in std::iter::once(None).chain(every_symbol.map(Some)) {
+            let library = library(|name| Some(name) != lacking).unwrap();
+            for family in FileFamily::ALL {
+                let refused = match family {
+                    FileFamily::Playback => refusal(library.table::<FilePlayback>()),
+                    FileFamily::Recording => refusal(library.table::<FileRecording>()),
+                };
+                let context = format!("{family:?} lacking {lacking:?}");
+                match library.status(family) {
+                    CapabilityStatus::Available => assert_eq!(refused, None, "{context}"),
+                    CapabilityStatus::Unavailable(reason) => {
+                        let (feature, refused_for, detail) = refused.expect(&context);
+                        assert_eq!(feature, RuntimeFeature::File(family), "{context}");
+                        assert_eq!(refused_for, reason, "{context}");
+                        assert_eq!(Some(detail.as_str()), lacking, "{context}");
+                    }
+                }
+            }
+        }
+        assert_eq!(FilePlayback::FAMILY, FileFamily::Playback);
+        assert_eq!(FileRecording::FAMILY, FileFamily::Recording);
     }
 
     #[test]
     fn a_library_with_neither_family_is_not_a_file_library() {
-        let reason = FileRuntime::resolve(&ExportsWhere(|name| {
+        let Err(reason) = library(|name| {
             !name.starts_with("NDIlib_file_player_create")
                 && !name.starts_with("NDIlib_file_recorder_create")
-        }))
-        .err()
-        .unwrap();
+        }) else {
+            panic!("a library without any family was accepted");
+        };
         assert!(reason.contains("NDIlib_file_player_create"), "{reason}");
     }
 }

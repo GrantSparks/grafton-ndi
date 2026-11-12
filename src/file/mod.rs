@@ -47,6 +47,18 @@
 //! and [`FileRecorder::reported_current_file`] for the owned event view of the
 //! file. These can lag or differ from the native state as their docs describe.
 //!
+//! # What the File library provides
+//!
+//! Its entry points come in [`FileFamily`] groups: playback, which also
+//! probes recordings, and recording. A library is selected when it provides
+//! at least one family completely. [`FileApi::status`] reports each family,
+//! and an operation that needs a family the selected library lacks fails with
+//! [`Error::UnsupportedCapability`] for
+//! [`RuntimeFeature::File`](crate::capabilities::RuntimeFeature::File), naming
+//! the entry point the library does not export. The runtime's own
+//! [`Capabilities`](crate::capabilities::Capabilities) do not know what the
+//! File library provides.
+//!
 //! # Finishing a recording
 //!
 //! The SDK finalizes a file asynchronously after a stop request and reports it
@@ -149,16 +161,46 @@ pub use player::FilePlayer;
 pub use recorder::{FileRecorder, FinishStatus, RecorderState, RecordingReport, StopRequest};
 pub use types::*;
 
-use std::{
-    ffi::CStr,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use crate::{
+    capabilities::CapabilityStatus,
     sys::{self, bindings::NDIlib_file_player_file_info_t},
     Error, Ndi, Result,
 };
 use out_param::OutParam;
+
+/// A family of the NDI File library's entry points, which a library provides
+/// completely or not at all.
+///
+/// [`FileApi::status`] reports whether the selected library provides one, and
+/// an operation that needs a family the library lacks fails with
+/// [`Error::UnsupportedCapability`] for
+/// [`RuntimeFeature::File`](crate::capabilities::RuntimeFeature::File) and
+/// that family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum FileFamily {
+    /// Probing recordings ([`FileApi::probe`]) and playing them back as an
+    /// NDI source ([`FilePlayer`], [`AsyncFilePlayer`]).
+    Playback,
+    /// Recording NDI sources to disk ([`FileRecorder`], [`AsyncFileRecorder`]).
+    Recording,
+}
+
+impl FileFamily {
+    /// Every family.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 2] = [Self::Playback, Self::Recording];
+
+    /// The name the family is reported under.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Playback => "file playback",
+            Self::Recording => "file recording",
+        }
+    }
+}
 
 /// How the File library is located. Creating this value loads nothing.
 #[derive(Clone, Debug, Default)]
@@ -192,9 +234,7 @@ impl FileRuntimeOptions {
 /// one, keeps the NDI runtime initialized.
 #[derive(Clone)]
 pub struct FileApi {
-    playback: std::result::Result<&'static sys::FilePlayback, &'static CStr>,
-    recording: std::result::Result<&'static sys::FileRecording, &'static CStr>,
-    library_path: Option<&'static Path>,
+    runtime: &'static sys::FileRuntime,
     // Absent only when the entry points are test doubles, which need no runtime.
     _ndi: Option<Ndi>,
 }
@@ -202,7 +242,9 @@ pub struct FileApi {
 impl std::fmt::Debug for FileApi {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileApi")
-            .field("library_path", &self.library_path)
+            .field("library_path", &self.library_path())
+            .field("playback", &self.status(FileFamily::Playback))
+            .field("recording", &self.status(FileFamily::Recording))
             .finish_non_exhaustive()
     }
 }
@@ -225,9 +267,7 @@ impl FileApi {
     pub fn open(ndi: &Ndi, options: &FileRuntimeOptions) -> Result<Self> {
         let runtime = sys::select_file(ndi.info(), ndi.api(), options.library_path.as_deref())?;
         Ok(Self {
-            playback: runtime.playback(),
-            recording: runtime.recording(),
-            library_path: runtime.path(),
+            runtime,
             _ndi: Some(ndi.clone()),
         })
     }
@@ -235,7 +275,25 @@ impl FileApi {
     /// The file the library was loaded from, or `None` when the SDK is linked
     /// statically.
     pub fn library_path(&self) -> Option<&Path> {
-        self.library_path
+        self.runtime.path()
+    }
+
+    /// Whether the selected library provides `family`.
+    ///
+    /// [`CapabilityStatus::Unavailable`] with
+    /// [`SymbolUnavailable`](crate::capabilities::CapabilityUnavailable::SymbolUnavailable)
+    /// when it does not export one of the family's entry points. Every
+    /// operation that needs the family then fails with
+    /// [`Error::UnsupportedCapability`], and keeps failing: the library stays
+    /// selected for the life of the process.
+    pub fn status(&self, family: FileFamily) -> CapabilityStatus {
+        self.runtime.status(family)
+    }
+
+    /// Whether the selected library provides `family`; see
+    /// [`status`](Self::status).
+    pub fn supports(&self, family: FileFamily) -> bool {
+        self.status(family) == CapabilityStatus::Available
     }
 
     /// Read a recording's duration and track layout.
@@ -248,10 +306,10 @@ impl FileApi {
     /// [`Error::InvalidInput`] when the path is empty or is not UTF-8,
     /// [`Error::InvalidCString`] when it contains a NUL, [`Error::Io`] when a
     /// relative path cannot be resolved because the current directory is
-    /// unavailable, and [`Error::RuntimeLoadFailed`] when the library
-    /// provides no playback.
+    /// unavailable, and [`Error::UnsupportedCapability`] when the library
+    /// does not provide [`FileFamily::Playback`].
     pub fn probe(&self, path: impl AsRef<Path>) -> Result<FileInfo> {
-        let playback = self.playback()?;
+        let playback = self.table::<sys::FilePlayback>()?;
         let path = types::path_string(path.as_ref())?;
         let mut info = OutParam::<NDIlib_file_player_file_info_t>::new();
         // SAFETY: `path` is a NUL-terminated string that outlives the call and
@@ -278,8 +336,8 @@ impl FileApi {
     /// [`Error::InvalidInput`] when the player's name is empty, and
     /// [`Error::InvalidCString`] when its name or groups contain a NUL.
     /// [`Error::NativeOperationFailed`] when the SDK cannot create the player
-    /// and [`Error::RuntimeLoadFailed`] when the library provides no
-    /// playback.
+    /// and [`Error::UnsupportedCapability`] when the library does not provide
+    /// [`FileFamily::Playback`].
     pub fn create_player(&self, options: &PlayerOptions) -> Result<FilePlayer> {
         FilePlayer::create(self.clone(), options)
     }
@@ -299,41 +357,31 @@ impl FileApi {
     /// format-change rollover switched on or a nonzero rollover size.
     /// [`Error::InvalidCString`] when the filename pattern contains a NUL.
     /// [`Error::NativeOperationFailed`] when the SDK cannot create the
-    /// recorder and [`Error::RuntimeLoadFailed`] when the library provides no
-    /// recording.
+    /// recorder and [`Error::UnsupportedCapability`] when the library does not
+    /// provide [`FileFamily::Recording`].
     pub fn create_recorder(&self, options: &RecorderOptions) -> Result<FileRecorder> {
         FileRecorder::create(self.clone(), options)
     }
 
-    /// The playback entry points, or why the library provides none.
-    fn playback(&self) -> Result<&'static sys::FilePlayback> {
-        self.playback
-            .map_err(|symbol| missing("file playback", symbol))
+    /// The table of a family, or the error for the first of its entry points
+    /// the library does not export. A player, recorder or probe takes its
+    /// table here, before it calls anything, so none runs without its family.
+    fn table<T: sys::FileTable>(&self) -> Result<&'static T> {
+        self.runtime.table()
     }
-
-    /// The recording entry points, or why the library provides none.
-    fn recording(&self) -> Result<&'static sys::FileRecording> {
-        self.recording
-            .map_err(|symbol| missing("file recording", symbol))
-    }
-}
-
-/// The error for a family of entry points the selected library lacks.
-fn missing(family: &str, symbol: &CStr) -> Error {
-    Error::RuntimeLoadFailed(format!(
-        "the selected NDI File library provides no {family}: it does not export {}",
-        symbol.to_string_lossy()
-    ))
 }
 
 #[cfg(test)]
 impl FileApi {
     /// An API whose entry points are the given test doubles.
     fn with_tables(playback: sys::FilePlayback, recording: sys::FileRecording) -> Self {
+        Self::with_runtime(sys::FileRuntime::test_double(Ok(playback), Ok(recording)))
+    }
+
+    /// An API for a library of test doubles, which needs no runtime.
+    fn with_runtime(runtime: &'static sys::FileRuntime) -> Self {
         Self {
-            playback: Ok(Box::leak(Box::new(playback))),
-            recording: Ok(Box::leak(Box::new(recording))),
-            library_path: None,
+            runtime,
             _ndi: None,
         }
     }

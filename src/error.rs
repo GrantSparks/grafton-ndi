@@ -18,22 +18,21 @@ use crate::capabilities::{CapabilityUnavailable, RuntimeFeature};
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// No usable NDI library could be loaded, or the selected File library
-    /// lacks entry points an operation needs.
+    /// No usable NDI library could be selected.
     ///
     /// * Selecting the NDI runtime ([`Runtime::select`] and every constructor
     ///   that selects one): no usable runtime library was found. The message
     ///   names every location tried and why each was rejected: the file was
     ///   absent, the operating system could not load it, or it lacks a
-    ///   required entry point. Nothing is selected, so the call can be
-    ///   repeated.
+    ///   required entry point.
     /// * Opening the File API (`file::FileApi::open`): no usable File library
-    ///   was found, with every location tried and the reason for each.
-    ///   Nothing is selected, so the call can be repeated.
-    /// * A File API operation that needs the File library's playback or
-    ///   recording entry points, when the selected library does not export
-    ///   them. The message names the first one missing. The library stays
-    ///   selected, so the operation keeps failing.
+    ///   was found, with every location tried and the reason for each. A
+    ///   library that provides no family of File entry points is not usable.
+    ///
+    /// Nothing is selected, so the call can be repeated, for example once the
+    /// library is installed. A selected File library that lacks the entry
+    /// points of one family is reported as [`Error::UnsupportedCapability`]
+    /// instead, by every operation that needs that family.
     ///
     /// [`Runtime::select`]: crate::Runtime::select
     #[error("Failed to load an NDI library: {0}")]
@@ -46,11 +45,15 @@ pub enum Error {
     /// [`Capabilities::status`] reports for it, so a caller can branch on
     /// either without reading text. Every operation that needs the capability
     /// is refused this way before anything reaches the SDK, and
-    /// [`Ndi::require_feature`] reports the same error in advance. The
-    /// condition lasts for the life of the process: the runtime is selected
-    /// once, and a build that lacks a declaration has to be rebuilt, with the
-    /// `advanced` feature and with `NDI_SDK_DIR` naming an NDI Advanced SDK
-    /// whose headers declare it.
+    /// [`Ndi::require_feature`] reports the same error in advance. A family
+    /// of the NDI File library (`RuntimeFeature::File`) is refused by the File
+    /// API operations that need it, when the selected File library does not
+    /// export one of its entry points, and `file::FileApi::status` reports its
+    /// status in advance. The condition lasts for the life of the process:
+    /// the runtime and the File library are each selected once, and a build
+    /// that lacks a declaration has to be rebuilt, with the `advanced` feature
+    /// and with `NDI_SDK_DIR` naming an NDI Advanced SDK whose headers declare
+    /// it.
     ///
     /// [`Capabilities::status`]: crate::capabilities::Capabilities::status
     /// [`Ndi::require_feature`]: crate::Ndi::require_feature
@@ -64,8 +67,9 @@ pub enum Error {
         feature: RuntimeFeature,
         /// Why it is unavailable.
         reason: CapabilityUnavailable,
-        /// The evidence: the entry point the runtime lacks (for
-        /// [`SymbolUnavailable`] and [`WrongEdition`]), the version it reports
+        /// The evidence: the entry point the runtime, or for a File family
+        /// the File library, lacks (for [`SymbolUnavailable`] and
+        /// [`WrongEdition`]), the version the runtime reports
         /// against the version required (for [`RuntimeTooOld`] and
         /// [`RuntimeVersionUnknown`]), or the declaration this build lacks (for
         /// [`BuildAbiUnavailable`]).
@@ -372,6 +376,8 @@ impl fmt::Display for Unavailability<'_> {
             CapabilityUnavailable::SymbolUnavailable
             | CapabilityUnavailable::RuntimeTooOld
             | CapabilityUnavailable::RuntimeVersionUnknown => write!(f, "{reason}: {detail}"),
+            #[cfg(feature = "file-io")]
+            CapabilityUnavailable::SeparateLibrary => write!(f, "{reason}: {detail}"),
         }
     }
 }
@@ -409,12 +415,14 @@ mod tests {
             SymbolUnavailable,
             BuildAbiUnavailable,
             WrongEdition,
+            #[cfg(feature = "file-io")]
+            SeparateLibrary,
         ] {
             assert_eq!(unsupported(reason, ""), format!("{prefix}{reason}"));
         }
         assert_eq!(
             unsupported(SymbolUnavailable, "NDIlib_routing_create"),
-            format!("{prefix}the selected runtime does not export a required function: NDIlib_routing_create")
+            format!("{prefix}the selected library does not export a required function: NDIlib_routing_create")
         );
         assert_eq!(
             unsupported(WrongEdition, "NDIlib_routing_create_v2"),

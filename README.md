@@ -625,7 +625,7 @@ let mut player = file.create_player(&PlayerOptions::new("Replay"))?;
 player.start("take_001.mkv")?;
 ```
 
-The File library ships with the NDI 6.4 SDK. On Linux, macOS and Android it works only with the Advanced SDK runtime, and `FileApi::open` refuses it beside a Standard runtime before loading anything. On Windows it ships for x64 only and works with either edition. A recorder stores a source's compressed data as it arrives and takes no frames from Rust. Treat a recording as complete only when `FileRecorder::finish` returns `FinishStatus::Closed`. See the [File API guide](docs/file-io.md).
+The File library ships with the NDI 6.4 SDK. On Linux, macOS and Android it works only with the Advanced SDK runtime, and `FileApi::open` refuses it beside a Standard runtime before loading anything. On Windows it ships for x64 only and works with either edition. A library that provides only one of the two families of File entry points, playback and recording, is selected for that one: `FileApi::supports(FileFamily::Recording)` says whether it records, and an operation of a family it lacks returns `Error::UnsupportedCapability`. A recorder stores a source's compressed data as it arrives and takes no frames from Rust. Treat a recording as complete only when `FileRecorder::finish` returns `FinishStatus::Closed`. See the [File API guide](docs/file-io.md).
 
 ## Documentation
 

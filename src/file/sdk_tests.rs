@@ -861,7 +861,7 @@ fn the_library_copies_every_string_a_recorder_gives_it() {
     };
     let scratch = Scratch::new("recorder-strings");
     let source = LiveSource::start(&ndi, "recorder-strings");
-    let recording = api.recording().unwrap();
+    let recording = api.table::<crate::sys::FileRecording>().unwrap();
     let address = source.spec.url().unwrap().to_owned();
     let file = |name: &str| scratch.path(name).to_str().unwrap().to_owned();
 
@@ -954,7 +954,7 @@ fn the_library_copies_every_string_a_player_gives_it() {
     let scratch = Scratch::new("player-strings");
     let clip = scratch.path("clip.mkv");
     record_clip(&api, &LiveSource::start(&ndi, "player-strings"), &clip);
-    let playback = api.playback().unwrap();
+    let playback = api.table::<crate::sys::FilePlayback>().unwrap();
 
     let advertised = format!("grafton-file-strings-{}", std::process::id());
     let mut name = c_buffer(&advertised);

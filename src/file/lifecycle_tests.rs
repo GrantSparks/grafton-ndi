@@ -515,24 +515,45 @@ fn malformed_player_options_are_refused_before_the_sdk_creates_a_player() {
 }
 
 #[test]
-fn a_family_the_library_lacks_is_reported_by_the_entry_point_it_is_missing() {
-    let api = FileApi {
-        playback: Err(c"NDIlib_file_player_seek_to_frame"),
-        ..mock::recorder_api()
-    };
+fn a_family_the_library_lacks_is_refused_as_that_capability_by_the_entry_point_it_is_missing() {
+    use crate::capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature};
+    let api = FileApi::with_runtime(sys::FileRuntime::test_double(
+        Err(c"NDIlib_file_player_seek_to_frame"),
+        Ok(mock::recording()),
+    ));
+    assert_eq!(
+        api.status(FileFamily::Playback),
+        CapabilityStatus::Unavailable(CapabilityUnavailable::SymbolUnavailable)
+    );
+    assert!(!api.supports(FileFamily::Playback));
+    assert!(api.supports(FileFamily::Recording));
+    // Refused before anything is checked or called, even for a path that
+    // would be refused too.
     for error in [
         api.probe("recording.mkv").unwrap_err(),
+        api.probe("").unwrap_err(),
         api.create_player(&PlayerOptions::new("mock player"))
             .unwrap_err(),
+        api.create_player(&PlayerOptions::new("")).unwrap_err(),
     ] {
-        let Error::RuntimeLoadFailed(reason) = error else {
+        let Error::UnsupportedCapability {
+            feature,
+            reason,
+            detail,
+        } = error
+        else {
             panic!("expected the playback family to be unavailable: {error}");
         };
-        assert!(
-            reason.contains("NDIlib_file_player_seek_to_frame"),
-            "{reason}"
-        );
+        assert_eq!(feature, RuntimeFeature::File(FileFamily::Playback));
+        assert_eq!(reason, CapabilityUnavailable::SymbolUnavailable);
+        assert_eq!(detail, "NDIlib_file_player_seek_to_frame");
     }
+    // The family the library provides is unaffected.
+    let options = RecorderOptions::new(SourceSpec::new("mock source").unwrap());
+    assert!(!matches!(
+        api.create_recorder(&options),
+        Err(Error::UnsupportedCapability { .. })
+    ));
 }
 
 /// Take every queued event, so the session's state follows what the device did.
