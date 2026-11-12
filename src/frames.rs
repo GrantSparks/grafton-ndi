@@ -588,6 +588,14 @@ pub(crate) trait VideoParts {
         unsafe { self.layout().view_planes(self.pixels()) }
     }
 
+    /// Every active byte in SDK plane order, or `None` when padding
+    /// separates rows or planes: the view behind a received frame's `data`.
+    #[inline]
+    fn active_data(&self) -> Option<&[u8]> {
+        // SAFETY: as for `plane_view`.
+        unsafe { self.layout().view_data(self.pixels()) }
+    }
+
     /// Copy the frame into a new owned frame: one pixel allocation, and one
     /// metadata allocation when there is metadata.
     fn owned_copy(&self) -> VideoFrame {
@@ -1350,6 +1358,14 @@ pub(crate) trait AudioParts {
     fn channel_views(&self) -> impl ExactSizeIterator<Item = &[f32]> + '_ {
         // SAFETY: as for `channel_view`.
         unsafe { self.layout().channels(self.samples()) }
+    }
+
+    /// Every sample, channels back to back, or `None` when padding separates
+    /// channels: the view behind a received frame's `data`.
+    #[inline]
+    fn contiguous_samples(&self) -> Option<&[f32]> {
+        // SAFETY: as for `channel_view`.
+        unsafe { self.layout().view_samples(self.samples()) }
     }
 
     /// Copy the frame into a new owned frame: one sample allocation, and one
@@ -2792,15 +2808,6 @@ impl ValidatedVideoLayout {
         &self.plane_layouts[..self.plane_count]
     }
 
-    fn is_contiguous(&self) -> bool {
-        // Validated planes are adjacent storage regions with active <= stride.
-        // Their last active endpoint equals payload length exactly when there
-        // are no intervening gaps. Trailing padding need not be included.
-        let last = self.planes().last().expect("validated video has a plane");
-        last.offset + (last.row_count - 1) * last.row_stride + last.active_row_bytes
-            == self.payload_len_bytes
-    }
-
     /// One plane of the frame stored at `data`, or `None` for an invalid
     /// index. Owned, borrowed and received frames share this view.
     ///
@@ -2824,6 +2831,26 @@ impl ValidatedVideoLayout {
             data,
             layouts: self.planes().iter(),
         }
+    }
+
+    /// Every active byte of the frame stored at `data`, in SDK plane order,
+    /// or `None` when padding separates rows or planes. A single row may
+    /// have padding after it, which is not part of the bytes.
+    ///
+    /// The bytes are the one row of the span [`VideoPlaneLayout::contiguous`]
+    /// finds, read as [`VideoPlane::data`] reads a plane's, so a frame and
+    /// each of its planes share one contiguity rule and one slice.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::view_plane`].
+    unsafe fn view_data<'a>(&self, data: *const u8) -> Option<&'a [u8]> {
+        let span = VideoPlaneLayout::contiguous(self.planes())?;
+        // SAFETY: the span is one row of active bytes, from the first plane's
+        // offset to the end of the last plane's last active row, within the
+        // storage this layout describes. The caller keeps every active row
+        // initialized and immutable for `'a`.
+        unsafe { VideoPlane::new(data, span) }.data()
     }
 }
 
@@ -2953,6 +2980,32 @@ struct VideoPlaneLayout {
     row_stride: usize,
     active_row_bytes: usize,
     row_count: usize,
+}
+
+impl VideoPlaneLayout {
+    /// The active rows of `planes`, consecutive planes of one validated
+    /// frame, as one row, or `None` when padding separates their rows or the
+    /// planes: the one contiguity rule, for a frame and for each of its
+    /// planes. Padding after the last row is not part of the span.
+    fn contiguous(planes: &[Self]) -> Option<Self> {
+        let start = planes.first()?.offset;
+        let mut end = start;
+        for plane in planes {
+            let rows_adjacent = plane.row_count == 1 || plane.row_stride == plane.active_row_bytes;
+            if plane.offset != end || !rows_adjacent {
+                return None;
+            }
+            // At most the plane's storage, which validation bounded.
+            end = plane.offset + plane.row_count * plane.active_row_bytes;
+        }
+        let len = end - start;
+        Some(Self {
+            offset: start,
+            row_stride: len,
+            active_row_bytes: len,
+            row_count: 1,
+        })
+    }
 }
 
 /// Derive SDK plane offsets and active row sizes together. See
@@ -3144,6 +3197,25 @@ impl ValidatedAudioLayout {
         // SAFETY: forwarded to the caller, for channels that all exist.
         (0..self.no_channels)
             .map(move |channel| unsafe { self.channel(data, channel) }.expect("validated channel"))
+    }
+
+    /// Every sample of the frame stored at `data`, channels back to back, or
+    /// `None` when padding separates channels: the one contiguity rule for
+    /// audio, beside the channel views. An owned frame's channels are always
+    /// back to back.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::channel`].
+    unsafe fn view_samples<'a>(self, data: *const f32) -> Option<&'a [f32]> {
+        if self.no_channels > 1 && self.channel_stride_samples != self.no_samples {
+            return None;
+        }
+        // SAFETY: with one channel, or channels back to back, the
+        // `sample_count` samples from `data` are every channel's samples and
+        // nothing else, which the caller keeps aligned, initialized and
+        // immutable for `'a`.
+        Some(unsafe { slice::from_raw_parts(data, self.sample_count) })
     }
 }
 
@@ -3827,17 +3899,11 @@ impl<'a> VideoPlane<'a> {
     /// Borrow all active bytes when contiguous, excluding trailing padding.
     /// Returns `None` when padding separates rows.
     pub fn data(&self) -> Option<&'a [u8]> {
-        if self.row_count() != 1 && self.row_stride() != self.active_row_bytes() {
-            return None;
-        }
-        // SAFETY: All rows are adjacent initialized ranges in the retained
-        // allocation; the final row's padding is excluded.
-        Some(unsafe {
-            slice::from_raw_parts(
-                self.data.add(self.layout.offset),
-                self.row_count() * self.active_row_bytes(),
-            )
-        })
+        let span = VideoPlaneLayout::contiguous(slice::from_ref(&self.layout))?;
+        // SAFETY: Construction ties the allocation to 'a. The span is this
+        // plane's rows, adjacent and active, so every byte is initialized and
+        // within its checked storage; the final row's padding is excluded.
+        Some(unsafe { slice::from_raw_parts(self.data.add(span.offset), span.active_row_bytes) })
     }
 }
 
@@ -3986,14 +4052,7 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
     /// [`Self::to_owned`] for a tightly packed owned buffer. A single packed
     /// row can be borrowed even when its stride includes trailing padding.
     pub fn data(&self) -> Option<&[u8]> {
-        let layout = VideoParts::layout(self);
-        if !layout.is_contiguous() {
-            return None;
-        }
-        // SAFETY: The guard retains the SDK allocation for this borrow. Layout
-        // validation bounds the range; contiguity proves every byte is active,
-        // initialized payload, with no intervening or trailing padding.
-        Some(unsafe { slice::from_raw_parts(self.pixels(), layout.payload_len_bytes) })
+        self.frame.active_data()
     }
 
     /// Copy this borrowed frame into an owned `VideoFrame`.
@@ -4145,13 +4204,7 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
     /// Use [`channel_data`](Self::channel_data) or [`channels`](Self::channels)
     /// for those buffers.
     pub fn data(&self) -> Option<&[f32]> {
-        let layout = AudioParts::layout(self);
-        if layout.no_channels > 1 && layout.channel_stride_samples != layout.no_samples {
-            return None;
-        }
-        // SAFETY: a packed FLTP buffer contains only initialized samples;
-        // construction checked dimensions, byte bounds, and float alignment.
-        Some(unsafe { slice::from_raw_parts(self.samples(), layout.sample_count) })
+        self.frame.contiguous_samples()
     }
 
     /// Copy this borrowed frame into an owned `AudioFrame`.
@@ -4438,6 +4491,78 @@ mod tests {
                 }
             }
             assert!(packed_layouts > 0, "{format:?}");
+        }
+    }
+
+    /// A frame's `data` and each plane's follow one contiguity rule: active
+    /// rows are one span when no padding separates the rows of a plane or
+    /// the planes, and a single row may have padding after it. Audio is one
+    /// span with one channel or with channels back to back.
+    #[test]
+    fn frames_planes_and_audio_share_one_contiguity_rule() {
+        let rows_adjacent = |plane: &VideoPlaneLayout| {
+            plane.row_count == 1 || plane.row_stride == plane.active_row_bytes
+        };
+        let storage = vec![7u8; 4096];
+        for format in PixelFormat::ALL {
+            let bytes = format.info().bytes_per_pixel() as usize;
+            for (height, padding) in [(1u32, 0usize), (1, 8), (2, 0), (2, 8), (4, 2), (4, 64)] {
+                let Ok(layout) = ValidatedVideoLayout::new_uncompressed(
+                    format,
+                    4,
+                    height,
+                    Some(4 * bytes + padding),
+                ) else {
+                    continue;
+                };
+                let planes = layout.planes();
+                let (last, before) = planes.split_last().unwrap();
+                let contiguous = before
+                    .iter()
+                    .all(|plane| plane.row_stride == plane.active_row_bytes)
+                    && rows_adjacent(last);
+                // SAFETY: the storage is initialized and covers every layout
+                // here, and nothing writes it while the views live.
+                let data = unsafe { layout.view_data(storage.as_ptr()) };
+                assert_eq!(
+                    data.map(<[u8]>::len),
+                    contiguous.then_some(layout.payload_len_bytes),
+                    "{format:?} height {height} padding {padding}"
+                );
+                for (index, plane) in planes.iter().enumerate() {
+                    // SAFETY: as above.
+                    let view = unsafe { layout.view_plane(storage.as_ptr(), index) }.unwrap();
+                    assert_eq!(
+                        view.data().map(<[u8]>::len),
+                        rows_adjacent(plane).then_some(plane.row_count * plane.active_row_bytes)
+                    );
+                }
+            }
+        }
+
+        let samples = [0.5f32; 24];
+        for (channels, stride, contiguous) in [(1, 8, true), (3, 5, true), (3, 8, false)] {
+            let raw = NDIlib_audio_frame_v3_t {
+                sample_rate: 48_000,
+                no_channels: channels,
+                no_samples: 5,
+                FourCC: AudioFormat::Fltp.to_sdk(),
+                p_data: samples.as_ptr().cast_mut().cast(),
+                __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                    channel_stride_in_bytes: stride * 4,
+                },
+                timecode: 0,
+                timestamp: 0,
+                p_metadata: ptr::null(),
+            };
+            let layout = validate_audio_layout(&raw).unwrap();
+            // SAFETY: the samples are initialized, aligned and cover the
+            // layout, and nothing writes them while the view lives.
+            let view = unsafe { layout.view_samples(samples.as_ptr()) };
+            assert_eq!(
+                view.map(<[f32]>::len),
+                contiguous.then_some(layout.sample_count)
+            );
         }
     }
 
@@ -5162,7 +5287,7 @@ mod tests {
             PixelFormat::Pa16,
         ] {
             let tight = ValidatedVideoLayout::new_uncompressed(format, 2, 1, Some(0)).unwrap();
-            assert!(tight.is_contiguous());
+            assert!(VideoPlaneLayout::contiguous(tight.planes()).is_some());
             let active = format.line_stride(2).unwrap();
             let padded =
                 ValidatedVideoLayout::new_uncompressed(format, 2, 1, Some(active + 4)).unwrap();
@@ -5201,9 +5326,9 @@ mod tests {
         }
         for format in [PixelFormat::Yv12, PixelFormat::I420, PixelFormat::Nv12] {
             let tight = ValidatedVideoLayout::new_uncompressed(format, 4, 2, Some(0)).unwrap();
-            assert!(tight.is_contiguous());
+            assert!(VideoPlaneLayout::contiguous(tight.planes()).is_some());
             let padded = ValidatedVideoLayout::new_uncompressed(format, 4, 2, Some(8)).unwrap();
-            assert!(!padded.is_contiguous()); // Chroma is one row, but plane gaps remain.
+            assert!(VideoPlaneLayout::contiguous(padded.planes()).is_none()); // Chroma is one row, but plane gaps remain.
         }
     }
 
