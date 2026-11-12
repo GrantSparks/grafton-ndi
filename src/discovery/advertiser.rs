@@ -429,7 +429,11 @@ impl<A: AdvertiserApi> Drop for Advertiser<A> {
 /// # Threading
 ///
 /// An advertiser is [`Send`] but not [`Sync`]: it may be moved to another
-/// thread, and is used by one thread at a time.
+/// thread, and is used by one thread at a time. Every method takes it
+/// exclusively, so `Sync` would give a shared reference nothing to do today.
+/// It is withheld, as from the listeners, because the SDK does not say
+/// whether calls on one advertiser may overlap, so that a shared query such
+/// as the listeners' connection state can be added without that guarantee.
 ///
 /// [`SendListener`]: super::SendListener
 pub struct SendAdvertiser {
@@ -460,7 +464,11 @@ pub struct SendAdvertiser {
 /// # Threading
 ///
 /// An advertiser is [`Send`] but not [`Sync`]: it may be moved to another
-/// thread, and is used by one thread at a time.
+/// thread, and is used by one thread at a time. Every method takes it
+/// exclusively, so `Sync` would give a shared reference nothing to do today.
+/// It is withheld, as from the listeners, because the SDK does not say
+/// whether calls on one advertiser may overlap, so that a shared query such
+/// as the listeners' connection state can be added without that guarantee.
 ///
 /// [`RecvListener`]: super::RecvListener
 pub struct RecvAdvertiser {

@@ -819,8 +819,11 @@ impl<A: ListenerApi> crate::advanced::Configurable for Listener<A> {
 /// # Threading
 ///
 /// A listener is [`Send`] but not [`Sync`]: it may be moved to another thread,
-/// and is used by one thread at a time. Snapshots and events are plain owned
-/// data and can be shared freely.
+/// and is used by one thread at a time. [`is_connected`](Self::is_connected)
+/// and [`server_url`](Self::server_url) take a shared reference, and the SDK
+/// documents neither as safe to call on one listener from several threads at
+/// once; it forbids overlapping membership queries on one listener. Snapshots
+/// and events are plain owned data and can be shared freely.
 pub struct SendListener {
     inner: Listener<sys::SenderDiscovery>,
 }
@@ -838,8 +841,11 @@ pub struct SendListener {
 /// # Threading
 ///
 /// A listener is [`Send`] but not [`Sync`]: it may be moved to another thread,
-/// and is used by one thread at a time. Snapshots and events are plain owned
-/// data and can be shared freely.
+/// and is used by one thread at a time. [`is_connected`](Self::is_connected)
+/// and [`server_url`](Self::server_url) take a shared reference, and the SDK
+/// documents neither as safe to call on one listener from several threads at
+/// once; it forbids overlapping membership queries on one listener. Snapshots
+/// and events are plain owned data and can be shared freely.
 pub struct RecvListener {
     inner: Listener<sys::ReceiverDiscovery>,
 }
