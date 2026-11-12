@@ -687,6 +687,76 @@ pub(crate) fn frame_metadata(value: String) -> Result<CString> {
     Ok(CString::new(value)?)
 }
 
+/// The per-frame timecode and metadata every compressed and scatter frame
+/// carries, with the single checked way to set the metadata.
+#[derive(Debug)]
+pub(crate) struct FrameExtras {
+    timecode: i64,
+    metadata: Option<CString>,
+}
+
+impl FrameExtras {
+    /// A frame built for sending: the SDK synthesizes the timecode.
+    pub(crate) fn new() -> Self {
+        Self::received(NDIlib_send_timecode_synthesize, None)
+    }
+
+    /// The values the SDK delivered with a received frame.
+    pub(crate) fn received(timecode: i64, metadata: Option<CString>) -> Self {
+        Self { timecode, metadata }
+    }
+
+    pub(crate) fn timecode(&self) -> i64 {
+        self.timecode
+    }
+
+    /// The metadata text, if any.
+    pub(crate) fn metadata(&self) -> Option<&str> {
+        // Metadata is only ever stored from a `String` or from validated UTF-8.
+        self.metadata.as_deref().and_then(|text| text.to_str().ok())
+    }
+
+    /// Bytes the metadata keeps allocated, terminator included.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.as_bytes_with_nul().len())
+    }
+
+    /// The pointer a native descriptor lends to the SDK, null without
+    /// metadata. It is valid for as long as these extras are.
+    pub(crate) fn metadata_ptr(&self) -> *const std::ffi::c_char {
+        self.metadata
+            .as_ref()
+            .map_or(std::ptr::null(), |metadata| metadata.as_ptr())
+    }
+}
+
+/// A frame that carries [`FrameExtras`].
+pub(crate) trait HasExtras: Sized {
+    fn extras_mut(&mut self) -> &mut FrameExtras;
+}
+
+/// Set a frame's timecode.
+pub(crate) fn attach_timecode<T: HasExtras>(mut frame: T, timecode: i64) -> T {
+    frame.extras_mut().timecode = timecode;
+    frame
+}
+
+/// Attach checked metadata, returning the frame unchanged when it is refused.
+pub(crate) fn attach_metadata<T: HasExtras>(
+    mut frame: T,
+    value: String,
+) -> std::result::Result<T, Rejected<T>> {
+    match frame_metadata(value) {
+        Ok(metadata) => {
+            frame.extras_mut().metadata = Some(metadata);
+            Ok(frame)
+        }
+        Err(error) => Err(Rejected::new(error, frame)),
+    }
+}
+
 /// One owned compressed video frame: a [`VideoPacketFormat`] and the codec
 /// bytes, with optional metadata.
 ///
@@ -701,8 +771,13 @@ pub(crate) fn frame_metadata(value: String) -> Result<CString> {
 pub struct CompressedVideoFrame {
     pub(crate) format: VideoPacketFormat,
     pub(crate) bytes: AliasableBox<[u8]>,
-    pub(crate) metadata: Option<CString>,
-    pub(crate) timecode: i64,
+    pub(crate) extras: FrameExtras,
+}
+
+impl HasExtras for CompressedVideoFrame {
+    fn extras_mut(&mut self) -> &mut FrameExtras {
+        &mut self.extras
+    }
 }
 
 impl CompressedVideoFrame {
@@ -726,8 +801,7 @@ impl CompressedVideoFrame {
             Ok(()) => Ok(Self {
                 format,
                 bytes: AliasableBox::new(bytes.into_boxed_slice()),
-                metadata: None,
-                timecode: NDIlib_send_timecode_synthesize,
+                extras: FrameExtras::new(),
             }),
             Err(error) => Err(Rejected::new(error, bytes)),
         }
@@ -739,22 +813,15 @@ impl CompressedVideoFrame {
     ///
     /// Returns the frame unchanged when the text is too long or contains a NUL.
     pub fn with_metadata(
-        mut self,
+        self,
         value: impl Into<String>,
     ) -> std::result::Result<Self, Rejected<Self>> {
-        match frame_metadata(value.into()) {
-            Ok(metadata) => {
-                self.metadata = Some(metadata);
-                Ok(self)
-            }
-            Err(error) => Err(Rejected::new(error, self)),
-        }
+        attach_metadata(self, value.into())
     }
 
     /// Set the timecode, in 100-nanosecond units.
-    pub fn with_timecode(mut self, timecode: i64) -> Self {
-        self.timecode = timecode;
-        self
+    pub fn with_timecode(self, timecode: i64) -> Self {
+        attach_timecode(self, timecode)
     }
 
     /// The codec bytes.
@@ -770,13 +837,12 @@ impl CompressedVideoFrame {
     /// The timecode in 100-nanosecond units, or the SDK's "synthesize" value
     /// on a frame built for sending without one.
     pub fn timecode(&self) -> i64 {
-        self.timecode
+        self.extras.timecode()
     }
 
     /// The per-frame metadata, if any.
     pub fn metadata(&self) -> Option<&str> {
-        // Metadata is only ever stored from a `String` or from validated UTF-8.
-        self.metadata.as_deref().and_then(|text| text.to_str().ok())
+        self.extras.metadata()
     }
 
     /// Take the codec bytes.
@@ -800,11 +866,7 @@ impl CompressedVideoFrame {
 
     /// Bytes this frame keeps allocated.
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.bytes.len()
-            + self
-                .metadata
-                .as_ref()
-                .map_or(0, |metadata| metadata.as_bytes_with_nul().len())
+        self.bytes.len() + self.extras.retained_bytes()
     }
 
     /// A native descriptor that lends this frame's bytes and metadata to the
@@ -815,11 +877,8 @@ impl CompressedVideoFrame {
         // Construction bounds the length by MAX_PACKET_BYTES, below i32::MAX.
         raw.__bindgen_anon_1.data_size_in_bytes = self.bytes.len() as i32;
         raw.p_data = self.bytes.as_mut_ptr().cast();
-        raw.p_metadata = self
-            .metadata
-            .as_ref()
-            .map_or(std::ptr::null(), |s| s.as_ptr());
-        raw.timecode = self.timecode;
+        raw.p_metadata = self.extras.metadata_ptr();
+        raw.timecode = self.extras.timecode();
         raw
     }
 }
@@ -994,8 +1053,13 @@ pub struct CompressedAudioFrame {
     pub(crate) sample_rate: i32,
     pub(crate) channels: i32,
     pub(crate) samples: i32,
-    pub(crate) timecode: i64,
-    pub(crate) metadata: Option<CString>,
+    pub(crate) extras: FrameExtras,
+}
+
+impl HasExtras for CompressedAudioFrame {
+    fn extras_mut(&mut self) -> &mut FrameExtras {
+        &mut self.extras
+    }
 }
 
 impl CompressedAudioFrame {
@@ -1023,8 +1087,7 @@ impl CompressedAudioFrame {
             sample_rate,
             channels,
             samples,
-            timecode: NDIlib_send_timecode_synthesize,
-            metadata: None,
+            extras: FrameExtras::new(),
         };
         match frame.validate_for_send() {
             Ok(()) => Ok(frame),
@@ -1033,9 +1096,8 @@ impl CompressedAudioFrame {
     }
 
     /// Set the timecode, in 100-nanosecond units.
-    pub fn with_timecode(mut self, timecode: i64) -> Self {
-        self.timecode = timecode;
-        self
+    pub fn with_timecode(self, timecode: i64) -> Self {
+        attach_timecode(self, timecode)
     }
 
     /// Attach per-frame metadata.
@@ -1044,16 +1106,10 @@ impl CompressedAudioFrame {
     ///
     /// Returns the frame unchanged when the text is too long or contains a NUL.
     pub fn with_metadata(
-        mut self,
+        self,
         metadata: impl Into<String>,
     ) -> std::result::Result<Self, Rejected<Self>> {
-        match frame_metadata(metadata.into()) {
-            Ok(metadata) => {
-                self.metadata = Some(metadata);
-                Ok(self)
-            }
-            Err(error) => Err(Rejected::new(error, self)),
-        }
+        attach_metadata(self, metadata.into())
     }
 
     /// Mark the stream as protected.
@@ -1095,13 +1151,12 @@ impl CompressedAudioFrame {
     /// The timecode in 100-nanosecond units, or the SDK's "synthesize" value
     /// on a frame built for sending without one.
     pub fn timecode(&self) -> i64 {
-        self.timecode
+        self.extras.timecode()
     }
 
     /// The per-frame metadata, if any.
     pub fn metadata(&self) -> Option<&str> {
-        // Metadata is only ever stored from a `String` or from validated UTF-8.
-        self.metadata.as_deref().and_then(|text| text.to_str().ok())
+        self.extras.metadata()
     }
 
     /// Take the codec bytes.
@@ -1160,13 +1215,10 @@ impl CompressedAudioFrame {
             sample_rate: self.sample_rate,
             no_channels: self.channels,
             no_samples: self.samples,
-            timecode: self.timecode,
+            timecode: self.extras.timecode(),
             FourCC: self.codec.outer(self.protected),
             p_data: self.bytes.as_mut_ptr().cast(),
-            p_metadata: self
-                .metadata
-                .as_ref()
-                .map_or(std::ptr::null(), |m| m.as_ptr()),
+            p_metadata: self.extras.metadata_ptr(),
             ..descriptors::audio_frame()
         };
         // Validation bounds the length by MAX_PACKET_BYTES, below i32::MAX.
@@ -1233,8 +1285,7 @@ pub(crate) unsafe fn copy_video_packet(
         format,
         bytes: AliasableBox::new(bytes.into()),
         // SAFETY: forwarded to the caller's obligation.
-        metadata: unsafe { copy_metadata(raw.p_metadata)? },
-        timecode: raw.timecode,
+        extras: FrameExtras::received(raw.timecode, unsafe { copy_metadata(raw.p_metadata)? }),
     })
 }
 
@@ -1258,9 +1309,8 @@ pub(crate) unsafe fn copy_audio_packet(
         sample_rate: raw.sample_rate,
         channels: raw.no_channels,
         samples: raw.no_samples,
-        timecode: raw.timecode,
         // SAFETY: forwarded to the caller's obligation.
-        metadata: unsafe { copy_metadata(raw.p_metadata)? },
+        extras: FrameExtras::received(raw.timecode, unsafe { copy_metadata(raw.p_metadata)? }),
     };
     frame.validate()?;
     Ok(frame)
@@ -1787,8 +1837,7 @@ mod tests {
             sample_rate: 48_000,
             channels: 2,
             samples: 1024,
-            timecode: 0,
-            metadata: None,
+            extras: FrameExtras::received(0, None),
         };
         assert!(received.validate().is_ok());
         assert!(reason(received.validate_for_send()).contains("keyframe flag"));

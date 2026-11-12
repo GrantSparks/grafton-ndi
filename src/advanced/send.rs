@@ -1,10 +1,13 @@
 //! Sending compressed frames, held in one buffer or in several.
 
-use std::{ffi::CString, ptr, time::Duration};
+use std::{ptr, time::Duration};
 
 use super::{
     invalid,
-    packets::{frame_metadata, EnvelopeHeader, ENVELOPE_HEADER_BYTES},
+    packets::{
+        attach_metadata, attach_timecode, EnvelopeHeader, FrameExtras, HasExtras,
+        ENVELOPE_HEADER_BYTES,
+    },
     AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedVideoFrame, EnvelopeCodec,
     QualityPlan, StreamTier, VideoPacketFormat, MAX_PACKET_BYTES,
 };
@@ -162,8 +165,13 @@ fn bytes_at<const N: usize>(blocks: &[Vec<u8>], offset: usize) -> Option<[u8; N]
 pub struct ScatterVideoFrame {
     format: VideoPacketFormat,
     storage: ScatterStorage,
-    timecode: i64,
-    metadata: Option<CString>,
+    extras: FrameExtras,
+}
+
+impl HasExtras for ScatterVideoFrame {
+    fn extras_mut(&mut self) -> &mut FrameExtras {
+        &mut self.extras
+    }
 }
 
 impl ScatterVideoFrame {
@@ -189,8 +197,7 @@ impl ScatterVideoFrame {
             Ok(total) => Ok(Self {
                 format,
                 storage: ScatterStorage::new(blocks, total),
-                timecode: NDIlib_send_timecode_synthesize,
-                metadata: None,
+                extras: FrameExtras::new(),
             }),
             Err(error) => Err(Rejected::new(error, blocks)),
         }
@@ -212,9 +219,8 @@ impl ScatterVideoFrame {
     }
 
     /// Set the timecode, in 100-nanosecond units.
-    pub fn with_timecode(mut self, timecode: i64) -> Self {
-        self.timecode = timecode;
-        self
+    pub fn with_timecode(self, timecode: i64) -> Self {
+        attach_timecode(self, timecode)
     }
 
     /// Attach per-frame metadata.
@@ -223,16 +229,10 @@ impl ScatterVideoFrame {
     ///
     /// Returns the frame unchanged when the text is too long or contains a NUL.
     pub fn with_metadata(
-        mut self,
+        self,
         value: impl Into<String>,
     ) -> std::result::Result<Self, Rejected<Self>> {
-        match frame_metadata(value.into()) {
-            Ok(metadata) => {
-                self.metadata = Some(metadata);
-                Ok(self)
-            }
-            Err(error) => Err(Rejected::new(error, self)),
-        }
+        attach_metadata(self, value.into())
     }
 
     /// Join the blocks into one newly allocated contiguous frame.
@@ -240,8 +240,7 @@ impl ScatterVideoFrame {
         CompressedVideoFrame {
             format: self.format,
             bytes: AliasableBox::new(self.storage.copy_contiguous().into_boxed_slice()),
-            timecode: self.timecode,
-            metadata: self.metadata,
+            extras: self.extras,
         }
     }
 
@@ -249,8 +248,8 @@ impl ScatterVideoFrame {
     /// from the block arrays and ignores the frame's own data fields.
     fn descriptor(&self) -> NDIlib_video_frame_v2_t {
         let mut raw = self.format.raw();
-        raw.timecode = self.timecode;
-        raw.p_metadata = self.metadata.as_ref().map_or(ptr::null(), |m| m.as_ptr());
+        raw.timecode = self.extras.timecode();
+        raw.p_metadata = self.extras.metadata_ptr();
         raw
     }
 }
@@ -267,8 +266,13 @@ pub struct ScatterAudioFrame {
     channels: i32,
     samples: i32,
     protected: bool,
-    timecode: i64,
-    metadata: Option<CString>,
+    extras: FrameExtras,
+}
+
+impl HasExtras for ScatterAudioFrame {
+    fn extras_mut(&mut self) -> &mut FrameExtras {
+        &mut self.extras
+    }
 }
 
 impl ScatterAudioFrame {
@@ -308,8 +312,7 @@ impl ScatterAudioFrame {
                 channels,
                 samples,
                 protected: false,
-                timecode: NDIlib_send_timecode_synthesize,
-                metadata: None,
+                extras: FrameExtras::new(),
             }),
             Err(error) => Err(Rejected::new(error, blocks)),
         }
@@ -346,9 +349,8 @@ impl ScatterAudioFrame {
     }
 
     /// Set the timecode, in 100-nanosecond units.
-    pub fn with_timecode(mut self, timecode: i64) -> Self {
-        self.timecode = timecode;
-        self
+    pub fn with_timecode(self, timecode: i64) -> Self {
+        attach_timecode(self, timecode)
     }
 
     /// Attach per-frame metadata.
@@ -357,16 +359,10 @@ impl ScatterAudioFrame {
     ///
     /// Returns the frame unchanged when the text is too long or contains a NUL.
     pub fn with_metadata(
-        mut self,
+        self,
         value: impl Into<String>,
     ) -> std::result::Result<Self, Rejected<Self>> {
-        match frame_metadata(value.into()) {
-            Ok(metadata) => {
-                self.metadata = Some(metadata);
-                Ok(self)
-            }
-            Err(error) => Err(Rejected::new(error, self)),
-        }
+        attach_metadata(self, value.into())
     }
 
     /// Mark the stream as protected.
@@ -384,8 +380,7 @@ impl ScatterAudioFrame {
             sample_rate: self.sample_rate,
             channels: self.channels,
             samples: self.samples,
-            timecode: self.timecode,
-            metadata: self.metadata,
+            extras: self.extras,
         }
     }
 
@@ -395,9 +390,9 @@ impl ScatterAudioFrame {
             sample_rate: self.sample_rate,
             no_channels: self.channels,
             no_samples: self.samples,
-            timecode: self.timecode,
+            timecode: self.extras.timecode(),
             FourCC: self.codec.outer(self.protected),
-            p_metadata: self.metadata.as_ref().map_or(ptr::null(), |m| m.as_ptr()),
+            p_metadata: self.extras.metadata_ptr(),
             ..descriptors::audio_frame()
         }
     }
