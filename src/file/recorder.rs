@@ -434,7 +434,7 @@ impl std::fmt::Debug for FileRecorder {
 }
 
 impl FileRecorder {
-    pub(super) fn create(api: FileApi, options: RecorderOptions) -> FileResult<Self> {
+    pub(super) fn create(api: FileApi, options: &RecorderOptions) -> FileResult<Self> {
         let resolved = options.resolve()?;
         let recording = api.recording()?;
         let settings = NDIlib_file_recorder_create_t {
@@ -459,7 +459,7 @@ impl FileRecorder {
             handle,
             records_media: options.tracks.bits() & media != 0,
             drop_wait: options.drop_wait,
-            accepted_source: Some(options.source),
+            accepted_source: Some(options.source.clone()),
             naming: resolved.naming,
             ledger: Ledger::idle(),
             native_stop_owed: false,
@@ -490,6 +490,9 @@ impl FileRecorder {
     /// already exists is refused. Nothing is overwritten or removed, and the
     /// directory the pattern names must exist.
     ///
+    /// The target is only read, so it stays with the caller whatever the
+    /// outcome, for example to start again once a missing directory exists.
+    ///
     /// # Errors
     ///
     /// * [`FileError::InvalidState`] with [`StateError::PreviousSessionOpen`]
@@ -507,13 +510,13 @@ impl FileRecorder {
     ///   session's report.
     pub fn start(
         &mut self,
-        target: RecordingTarget,
+        target: &RecordingTarget,
         timecode: RecordingTimecode,
     ) -> FileResult<u64> {
         if self.ledger.session_open() {
             return Err(FileError::InvalidState(StateError::PreviousSessionOpen));
         }
-        self.naming.check(&target)?;
+        self.naming.check(target)?;
         // Events left over from an earlier session must not be counted in this one.
         self.discard_stale_events()?;
         let session =
@@ -523,7 +526,7 @@ impl FileRecorder {
         let dropped = self.dropped_event_count();
         let prefix = target.prefix.as_ptr();
         // SAFETY: the recorder is live, and `prefix` points into `target`,
-        // which outlives the call.
+        // which the caller lends for longer than the call.
         let accepted = unsafe {
             match timecode {
                 RecordingTimecode::Preserve => self
@@ -654,7 +657,10 @@ impl FileRecorder {
     /// Stop the session and wait up to `wait` for its last file to be closed.
     ///
     /// Events that arrive during the wait are consumed; their effect is in
-    /// the returned report.
+    /// the returned report. A malformed event is consumed too: what it showed
+    /// about the session is recorded as [`poll_event`](Self::poll_event)
+    /// records it, and the wait goes on. One that could not be read at all
+    /// makes the outcome [`FinishStatus::Indeterminate`] rather than an error.
     ///
     /// The wait covers taking the closure's event, not the stop itself, which
     /// the SDK may carry out before it returns. Events already queued are
@@ -664,9 +670,11 @@ impl FileRecorder {
     ///
     /// # Errors
     ///
-    /// [`FileError::InvalidState`] with [`StateError::StopNotRequested`] when
-    /// no session was started, and the errors of
-    /// [`poll_event`](Self::poll_event).
+    /// [`FileError::InvalidInput`] when `wait` is `u32::MAX` milliseconds or
+    /// more, and [`FileError::InvalidState`] with
+    /// [`StateError::StopNotRequested`] when no session was started. Neither
+    /// is returned once the wait has begun: whatever the SDK's events hold,
+    /// the outcome is a [`FinishStatus`].
     pub fn finish(&mut self, wait: Duration) -> FileResult<FinishStatus> {
         timeout_ms(wait)?;
         self.request_stop();
@@ -677,21 +685,28 @@ impl FileRecorder {
     ///
     /// Use this to keep waiting after [`FinishStatus::TimedOut`]. Events
     /// already queued are taken even when `wait` is over, so a closure that
-    /// has been reported is never missed.
+    /// has been reported is never missed. Malformed events are taken and
+    /// recorded as [`finish`](Self::finish) describes, without ending the
+    /// wait.
     ///
     /// # Errors
     ///
-    /// [`FileError::InvalidState`] with [`StateError::StopNotRequested`] when
-    /// no session was started or the session has not been asked to stop, and
-    /// the errors of [`poll_event`](Self::poll_event).
+    /// [`FileError::InvalidInput`] when `wait` is `u32::MAX` milliseconds or
+    /// more, and [`FileError::InvalidState`] with
+    /// [`StateError::StopNotRequested`] when no session was started or the
+    /// session has not been asked to stop. Neither is returned once the wait
+    /// has begun.
     pub fn wait_finished(&mut self, wait: Duration) -> FileResult<FinishStatus> {
         self.wait_finished_from(Instant::now(), wait, |_| false)
     }
 
     /// Wait until `wait` after `started` for a stopping session to end.
     ///
-    /// `each` is called after every poll with the event it returned, if any,
-    /// and ends the wait early by returning true.
+    /// `each` is called after every poll with what the poll returned,
+    /// including a malformed event's error, and ends the wait early by
+    /// returning true. A poll that fails has still taken an event, whose
+    /// effect is in the ledger, so the wait goes on to the outcome the ledger
+    /// then shows.
     ///
     /// Once the deadline has passed, events already queued are still taken,
     /// without waiting, until the queue is found empty: the deadline may have
@@ -700,7 +715,7 @@ impl FileRecorder {
         &mut self,
         started: Instant,
         wait: Duration,
-        mut each: impl FnMut(Option<RecorderEvent>) -> bool,
+        mut each: impl FnMut(FileResult<Option<RecorderEvent>>) -> bool,
     ) -> FileResult<FinishStatus> {
         timeout_ms(wait)?;
         if matches!(self.state(), RecorderState::Idle | RecorderState::Recording) {
@@ -732,9 +747,13 @@ impl FileRecorder {
             } else {
                 FINISH_POLL
             });
-            let event = self.poll_event(budget)?;
-            let drained = event.is_none();
-            interrupted = each(event);
+            // `budget` is within `wait`, which was checked above, so a failed
+            // poll is an event that was taken but could not be decoded, or
+            // could not be read at all. Either way its effect is already in
+            // the ledger, which the loop goes on to settle.
+            let polled = self.poll_event(budget);
+            let drained = matches!(polled, Ok(None));
+            interrupted = each(polled);
             if remaining.is_zero() && drained {
                 // The queue was empty and its state recorded: what it shows
                 // now is the outcome.
@@ -766,12 +785,13 @@ impl FileRecorder {
     /// session numbers continue increasing across resets.
     ///
     /// The replacement is created first. If creation fails, this recorder and
-    /// its report are kept and can still be polled or finalized.
+    /// its report are kept and can still be polled or finalized. The options
+    /// are only read, as by [`FileApi::create_recorder`].
     ///
     /// # Errors
     ///
     /// The errors of [`FileApi::create_recorder`].
-    pub fn reset(&mut self, options: RecorderOptions) -> FileResult<RecordingReport> {
+    pub fn reset(&mut self, options: &RecorderOptions) -> FileResult<RecordingReport> {
         let mut replacement = Self::create(self._api.clone(), options)?;
         replacement.ledger.report = self.report();
         Ok(std::mem::replace(self, replacement).abandon())
@@ -810,6 +830,10 @@ impl FileRecorder {
     /// and the session goes on. Before a session the change works as for any
     /// recorder.
     ///
+    /// The source stays with the caller; the recorder keeps a copy of it
+    /// when the SDK accepts it, for
+    /// [`last_accepted_source`](Self::last_accepted_source).
+    ///
     /// # Errors
     ///
     /// * [`FileError::InvalidState`] with [`StateError::ExactFileName`]
@@ -820,21 +844,22 @@ impl FileRecorder {
     ///   SDK does not say which source is then in effect, so
     ///   [`last_accepted_source`](Self::last_accepted_source) returns `None`
     ///   until a later change succeeds.
-    pub fn set_source(&mut self, source: SourceSpec) -> FileResult<()> {
+    pub fn set_source(&mut self, source: &SourceSpec) -> FileResult<()> {
         if self.naming.is_exact() && self.ledger.session_open() {
             return Err(FileError::InvalidState(StateError::ExactFileName));
         }
         if self.state() == RecorderState::Stopping {
             return Err(FileError::InvalidState(StateError::Stopping));
         }
-        let raw = raw_source(&source);
+        let raw = raw_source(source);
         // SAFETY: the recorder is live, and `raw` and the strings it points
         // to, owned by `source`, are valid for the call.
         let accepted = unsafe {
             self.recording
                 .NDIlib_file_recorder_set_source(self.handle.as_ptr(), &raw)
         };
-        self.accepted_source = accepted.then_some(source);
+        // Kept only once accepted: the copy is what the recorder retains.
+        self.accepted_source = accepted.then(|| source.clone());
         if accepted {
             Ok(())
         } else {
@@ -872,7 +897,8 @@ impl FileRecorder {
     /// closes the old file and reports an error. The file the pattern names
     /// for the target is therefore checked first: its directory must exist
     /// and be writable, and with an exact file name the file must not exist.
-    /// The usual mistakes then leave the session running.
+    /// The usual mistakes then leave the session running, and the target,
+    /// which is only read, stays with the caller to correct and try again.
     ///
     /// # Errors
     ///
@@ -883,13 +909,13 @@ impl FileRecorder {
     ///   with kind [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) when
     ///   that file exists. The SDK is not called and the session goes on.
     /// * [`FileError::Rejected`] when the SDK refuses the target.
-    pub fn rollover(&mut self, target: RecordingTarget) -> FileResult<()> {
+    pub fn rollover(&mut self, target: &RecordingTarget) -> FileResult<()> {
         if self.state() != RecorderState::Recording {
             return Err(FileError::InvalidState(StateError::NotRecording));
         }
-        self.naming.check(&target)?;
+        self.naming.check(target)?;
         // SAFETY: the recorder is live, and the prefix points into `target`,
-        // which outlives the call.
+        // which the caller lends for longer than the call. The SDK copies it.
         let accepted = unsafe {
             self.recording
                 .NDIlib_file_recorder_rollover(self.handle.as_ptr(), target.prefix.as_ptr())
@@ -983,7 +1009,10 @@ impl Drop for FileRecorder {
         if self.ledger.session_open() {
             self.request_stop();
             if !self.drop_wait.is_zero() {
-                // The outcome cannot be reported from here. An error ends the wait.
+                // The outcome cannot be reported from here. The wait itself
+                // cannot fail: the session is stopping and `drop_wait` was
+                // checked when the options were built, and a malformed event
+                // does not end it.
                 let _ = self.wait_finished(self.drop_wait);
             }
         }

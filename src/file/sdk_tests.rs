@@ -195,10 +195,10 @@ fn await_event(recorder: &mut FileRecorder, kind: RecorderEventKind) -> Recorder
 
 /// Record a short clip of `source` to `file` and return its report.
 fn record_clip(api: &FileApi, source: &LiveSource, file: &PathBuf) -> RecordingReport {
-    let mut recorder = api.create_recorder(exact_video(source)).unwrap();
+    let mut recorder = api.create_recorder(&exact_video(source)).unwrap();
     recorder
         .start(
-            RecordingTarget::new(file).unwrap(),
+            &RecordingTarget::new(file).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
@@ -239,12 +239,12 @@ fn a_recording_is_finalized_and_probes_with_its_video_track() {
     let source = LiveSource::start(&ndi, "record");
     let file = scratch.path("take.mkv");
 
-    let mut recorder = api.create_recorder(exact_video(&source)).unwrap();
+    let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
     assert_eq!(recorder.state(), RecorderState::Idle);
     assert_eq!(recorder.last_accepted_source(), Some(&source.spec));
     let session = recorder
         .start(
-            RecordingTarget::new(&file).unwrap(),
+            &RecordingTarget::new(&file).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
@@ -292,16 +292,16 @@ fn a_rollover_requested_just_before_the_stop_still_ends_in_a_confirmed_close() {
     let options = RecorderOptions::new(source.spec.clone())
         .with_proxy(false)
         .with_tracks(TrackSelection::VIDEO);
-    let mut recorder = api.create_recorder(options).unwrap();
+    let mut recorder = api.create_recorder(&options).unwrap();
     recorder
         .start(
-            RecordingTarget::new(scratch.path("first")).unwrap(),
+            &RecordingTarget::new(scratch.path("first")).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
     await_event(&mut recorder, RecorderEventKind::FirstFrame);
     recorder
-        .rollover(RecordingTarget::new(scratch.path("second")).unwrap())
+        .rollover(&RecordingTarget::new(scratch.path("second")).unwrap())
         .unwrap();
     let outcome = recorder.finish(PATIENCE).unwrap();
     let FinishStatus::Closed(report) = outcome else {
@@ -320,20 +320,20 @@ fn rollovers_and_a_source_switch_end_in_a_confirmed_close_of_every_file() {
     let options = RecorderOptions::new(source.spec.clone())
         .with_proxy(false)
         .with_tracks(TrackSelection::VIDEO);
-    let mut recorder = api.create_recorder(options).unwrap();
+    let mut recorder = api.create_recorder(&options).unwrap();
     recorder
         .start(
-            RecordingTarget::new(scratch.path("first")).unwrap(),
+            &RecordingTarget::new(scratch.path("first")).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
     await_event(&mut recorder, RecorderEventKind::FirstFrame);
 
     recorder
-        .rollover(RecordingTarget::new(scratch.path("second")).unwrap())
+        .rollover(&RecordingTarget::new(scratch.path("second")).unwrap())
         .unwrap();
     await_event(&mut recorder, RecorderEventKind::FirstFrame);
-    recorder.set_source(source.spec.clone()).unwrap();
+    recorder.set_source(&source.spec).unwrap();
     await_event(&mut recorder, RecorderEventKind::FirstFrame);
     assert_eq!(recorder.state(), RecorderState::Recording);
 
@@ -360,7 +360,7 @@ fn injected_metadata_is_recorded_on_the_metadata_track() {
         .exact_filename()
         .with_proxy(false)
         .with_tracks(TrackSelection::VIDEO | TrackSelection::METADATA);
-    let mut recorder = api.create_recorder(options).unwrap();
+    let mut recorder = api.create_recorder(&options).unwrap();
     let marker = crate::MetadataFrame::with_data("<marker cue=\"intro\"/>", 0).unwrap();
     assert!(matches!(
         recorder.inject_metadata(&marker),
@@ -368,7 +368,7 @@ fn injected_metadata_is_recorded_on_the_metadata_track() {
     ));
     recorder
         .start(
-            RecordingTarget::new(&file).unwrap(),
+            &RecordingTarget::new(&file).unwrap(),
             RecordingTimecode::GenerateFrom(SourceTimecode::from_ticks(36_000_000_000)),
         )
         .unwrap();
@@ -397,10 +397,10 @@ fn dropping_a_recorder_leaves_a_finalized_file() {
     let scratch = Scratch::new("drop");
     let source = LiveSource::start(&ndi, "drop");
     let file = scratch.path("dropped.mkv");
-    let mut recorder = api.create_recorder(exact_video(&source)).unwrap();
+    let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
     recorder
         .start(
-            RecordingTarget::new(&file).unwrap(),
+            &RecordingTarget::new(&file).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
@@ -513,7 +513,7 @@ fn a_player_plays_a_recording_and_keeps_its_source_between_files() {
 
     let name = format!("grafton-file-player-{}", std::process::id());
     let mut player = api
-        .create_player(PlayerOptions::new(&name).unwrap())
+        .create_player(&PlayerOptions::new(&name).unwrap())
         .unwrap();
     let source = player.advertised_source().unwrap();
     assert!(source.name.contains(&name), "{source:?}");
@@ -661,10 +661,12 @@ fn a_session_the_library_ended_on_a_format_change_can_be_followed_by_another() {
     };
     let scratch = Scratch::new("format-stop");
     let source = LiveSource::start(&ndi, "format-stop");
-    let mut recorder = api.create_recorder(stop_on_format_change(&source)).unwrap();
+    let mut recorder = api
+        .create_recorder(&stop_on_format_change(&source))
+        .unwrap();
     recorder
         .start(
-            RecordingTarget::new(scratch.path("first")).unwrap(),
+            &RecordingTarget::new(scratch.path("first")).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
@@ -686,7 +688,7 @@ fn a_session_the_library_ended_on_a_format_change_can_be_followed_by_another() {
 
     let session = recorder
         .start(
-            RecordingTarget::new(scratch.path("second")).unwrap(),
+            &RecordingTarget::new(scratch.path("second")).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
@@ -763,22 +765,22 @@ fn a_rollover_into_a_missing_directory_is_refused_and_the_session_goes_on() {
         Err(FileError::Io(error)) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
         other => panic!("expected the directory to be reported missing: {other:?}"),
     };
-    let mut recorder = api.create_recorder(exact_video(&source)).unwrap();
+    let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
     not_found(
         recorder
-            .start(missing(), RecordingTimecode::Preserve)
+            .start(&missing(), RecordingTimecode::Preserve)
             .map(drop),
     );
     recorder
         .start(
-            RecordingTarget::new(scratch.path("take.mkv")).unwrap(),
+            &RecordingTarget::new(scratch.path("take.mkv")).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
     await_event(&mut recorder, RecorderEventKind::FirstFrame);
 
     // Passed on, the library would accept this and then end the session.
-    not_found(recorder.rollover(missing()));
+    not_found(recorder.rollover(&missing()));
     assert_eq!(recorder.state(), RecorderState::Recording);
     assert!(recorder.is_recording());
     thread::sleep(Duration::from_millis(200));
@@ -799,17 +801,17 @@ fn a_file_that_received_nothing_is_reported_as_empty() {
     let options = RecorderOptions::new(source.spec.clone())
         .with_proxy(false)
         .with_tracks(TrackSelection::VIDEO);
-    let mut recorder = api.create_recorder(options).unwrap();
+    let mut recorder = api.create_recorder(&options).unwrap();
     recorder
         .start(
-            RecordingTarget::new(scratch.path("take")).unwrap(),
+            &RecordingTarget::new(scratch.path("take")).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
     await_event(&mut recorder, RecorderEventKind::FirstFrame);
     // Nothing answers at this address, so the file rolled over to stays empty.
     recorder
-        .set_source(SourceSpec::from_url("127.0.0.1:9").unwrap())
+        .set_source(&SourceSpec::from_url("127.0.0.1:9").unwrap())
         .unwrap();
     await_event(&mut recorder, RecorderEventKind::Rollover);
 
@@ -1000,10 +1002,10 @@ fn an_exact_recording_ends_at_a_format_change_with_its_file_finalized() {
     let scratch = Scratch::new("exact-format");
     let source = LiveSource::start(&ndi, "exact-format");
     let file = scratch.path("take.mkv");
-    let mut recorder = api.create_recorder(exact_video(&source)).unwrap();
+    let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
     recorder
         .start(
-            RecordingTarget::new(&file).unwrap(),
+            &RecordingTarget::new(&file).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
@@ -1035,17 +1037,17 @@ fn an_exact_session_refuses_a_change_of_source_and_keeps_recording() {
     let scratch = Scratch::new("exact-source");
     let source = LiveSource::start(&ndi, "exact-source");
     let file = scratch.path("take.mkv");
-    let mut recorder = api.create_recorder(exact_video(&source)).unwrap();
+    let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
     recorder
         .start(
-            RecordingTarget::new(&file).unwrap(),
+            &RecordingTarget::new(&file).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
     await_event(&mut recorder, RecorderEventKind::FirstFrame);
 
     assert!(matches!(
-        recorder.set_source(source.spec.clone()),
+        recorder.set_source(&source.spec),
         Err(FileError::InvalidState(StateError::ExactFileName))
     ));
     let before = recorder.stats().unwrap().unwrap().video_frames();
@@ -1083,9 +1085,9 @@ fn an_exact_target_that_exists_is_refused_before_the_library_sees_it() {
     let source = LiveSource::start(&ndi, "exact-exists");
     let file = scratch.path("taken.mkv");
     std::fs::write(&file, b"kept").unwrap();
-    let mut recorder = api.create_recorder(exact_video(&source)).unwrap();
+    let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
     match recorder.start(
-        RecordingTarget::new(&file).unwrap(),
+        &RecordingTarget::new(&file).unwrap(),
         RecordingTimecode::Preserve,
     ) {
         Err(FileError::Io(error)) => {
@@ -1111,10 +1113,10 @@ fn finishing_without_a_wait_reports_the_close_the_stop_queued() {
     let scratch = Scratch::new("finish-now");
     let source = LiveSource::start(&ndi, "finish-now");
     let file = scratch.path("take.mkv");
-    let mut recorder = api.create_recorder(exact_video(&source)).unwrap();
+    let mut recorder = api.create_recorder(&exact_video(&source)).unwrap();
     recorder
         .start(
-            RecordingTarget::new(&file).unwrap(),
+            &RecordingTarget::new(&file).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();

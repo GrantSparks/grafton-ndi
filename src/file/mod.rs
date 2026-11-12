@@ -120,8 +120,9 @@
 //! let ndi = NDI::new()?;
 //! let file = FileApi::open(&ndi, &FileRuntimeOptions::default())?;
 //!
-//! let mut recorder = file.create_recorder(RecorderOptions::new(SourceSpec::new("STUDIO (Camera 1)")?))?;
-//! recorder.start(RecordingTarget::new("take")?, RecordingTimecode::Preserve)?;
+//! let options = RecorderOptions::new(SourceSpec::new("STUDIO (Camera 1)")?);
+//! let mut recorder = file.create_recorder(&options)?;
+//! recorder.start(&RecordingTarget::new("take")?, RecordingTimecode::Preserve)?;
 //! std::thread::sleep(Duration::from_secs(10));
 //!
 //! match recorder.finish(Duration::from_secs(5))? {
@@ -262,19 +263,22 @@ impl FileApi {
     /// Create a player and advertise its NDI source.
     ///
     /// The source is advertised from this call until the player is dropped,
-    /// whether or not a file is playing.
+    /// whether or not a file is playing. The options are only read, so they
+    /// stay with the caller whatever the outcome.
     ///
     /// # Errors
     ///
     /// [`FileError::Rejected`] when the SDK cannot create the player and
     /// [`FileError::Unavailable`] when the library provides no playback.
-    pub fn create_player(&self, options: PlayerOptions) -> FileResult<FilePlayer> {
+    pub fn create_player(&self, options: &PlayerOptions) -> FileResult<FilePlayer> {
         FilePlayer::create(self.clone(), options)
     }
 
     /// Create a recorder for the source named in `options`.
     ///
-    /// Nothing is written until [`FileRecorder::start`].
+    /// Nothing is written until [`FileRecorder::start`]. The options are only
+    /// read, so they stay with the caller whatever the outcome; the recorder
+    /// keeps its own copy of the source they name.
     ///
     /// # Errors
     ///
@@ -284,7 +288,7 @@ impl FileApi {
     /// rollover size. [`FileError::Rejected`] when the SDK cannot create the
     /// recorder and [`FileError::Unavailable`] when the library provides no
     /// recording.
-    pub fn create_recorder(&self, options: RecorderOptions) -> FileResult<FileRecorder> {
+    pub fn create_recorder(&self, options: &RecorderOptions) -> FileResult<FileRecorder> {
         FileRecorder::create(self.clone(), options)
     }
 

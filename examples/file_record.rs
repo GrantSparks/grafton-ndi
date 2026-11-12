@@ -51,8 +51,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         SourceSpec::from_url(&source)?
     };
-    let mut recorder = file.create_recorder(RecorderOptions::new(spec))?;
-    recorder.start(RecordingTarget::new(&prefix)?, RecordingTimecode::Preserve)?;
+    let mut recorder = file.create_recorder(&RecorderOptions::new(spec))?;
+    recorder.start(&RecordingTarget::new(&prefix)?, RecordingTimecode::Preserve)?;
     println!("Recording {source} for {seconds} s...");
 
     // Take events throughout: the SDK discards those left waiting, and a

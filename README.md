@@ -562,7 +562,7 @@ let file = FileApi::open(&ndi, &FileRuntimeOptions::default())?;
 let info = file.probe("take_001.mkv")?;
 println!("{} track(s)", info.track_count());
 
-let mut player = file.create_player(PlayerOptions::new("Replay")?)?;
+let mut player = file.create_player(&PlayerOptions::new("Replay")?)?;
 player.start("take_001.mkv")?;
 ```
 

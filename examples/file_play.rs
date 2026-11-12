@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // The source is advertised from here until the player is dropped.
-    let mut player = file.create_player(PlayerOptions::new(&name)?)?;
+    let mut player = file.create_player(&PlayerOptions::new(&name)?)?;
     println!("Advertising {}", player.advertised_source()?);
     player.start(&recording)?;
 

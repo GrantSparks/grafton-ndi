@@ -105,7 +105,7 @@ use grafton_ndi::file::{FileApi, PlayerEventKind, PlayerOptions};
 use std::time::Duration;
 
 fn play(file: &FileApi) -> Result<(), Box<dyn std::error::Error>> {
-    let mut player = file.create_player(PlayerOptions::new("Replay")?)?;
+    let mut player = file.create_player(&PlayerOptions::new("Replay")?)?;
     println!("advertising {}", player.advertised_source()?);
     player.start("take_001.mkv")?;
     loop {
@@ -143,8 +143,8 @@ use std::time::Duration;
 
 fn record(file: &FileApi) -> Result<(), Box<dyn std::error::Error>> {
     let options = RecorderOptions::new(SourceSpec::new("STUDIO (Camera 1)")?);
-    let mut recorder = file.create_recorder(options)?;
-    recorder.start(RecordingTarget::new("take")?, RecordingTimecode::Preserve)?;
+    let mut recorder = file.create_recorder(&options)?;
+    recorder.start(&RecordingTarget::new("take")?, RecordingTimecode::Preserve)?;
 
     // Take the recorder's events while it records.
     for _ in 0..20 {
@@ -177,6 +177,11 @@ they return `FileError::Io`, of kind `AlreadyExists` for an exact file that
 exists, and the session, if one is open, goes on. A pattern can name a
 directory of its own, such as `{prefix}/{index:03}.mkv`; that directory is the
 one checked.
+
+The methods of `FileApi`, `FileRecorder` and `FilePlayer` borrow the options,
+targets and sources they are given, so a value stays with the caller when the
+call fails and can be corrected and passed again. The async handles take them
+by value, because their work runs on another thread.
 
 `start` returns `FileError::InvalidState(StateError::PreviousSessionOpen)`
 while a session is recording or stopping. A recorder learns that a session ended only from the events it takes,
@@ -260,7 +265,12 @@ about the data having reached the disk; see
 
 The SDK discards events that are not taken promptly, and a session that lost
 events can no longer be confirmed closed. Call `poll_event` throughout a
-recording; `finish` takes events itself while it waits.
+recording; `finish` takes events itself while it waits. A malformed event does
+not end that wait: what it showed about the session is recorded as `poll_event`
+records it, and an event that could not be read at all makes the outcome
+`Indeterminate`. Once the wait has begun, `finish` and `wait_finished` always
+return a `FinishStatus`, and a malformed event cannot cut short the wait of a
+drop either.
 
 If the SDK stops reporting events and `wait_finished` keeps timing out, `reset`
 gives up on the session. It creates a new idle recorder from the
@@ -346,11 +356,21 @@ async fn record(file: FileApi) -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 The async recorder takes its events continuously, so its report stays current
-without polling. `next_event(wait)` delivers them to the application; a handle
-keeps up to 256 undelivered events, discards the oldest beyond that and counts
-the discarded ones in `notification_dropped_count`. A discarded notification
-does not change the recording report. `AsyncFileOptions` and
-`create_with_options` change the queue sizes.
+without polling. `next_event(wait)` delivers them to the application, including
+those `finish` takes while it waits, with a malformed event as
+`FileError::Protocol`; a handle keeps up to 256 undelivered events, discards
+the oldest beyond that and counts the discarded ones in
+`notification_dropped_count`. A discarded notification does not change the
+recording report. `AsyncFileOptions` and `create_with_options` change the queue
+sizes.
+
+`next_event(wait)` returns `Ok(None)` when `wait` runs out, even while the
+object's thread is blocked in a command, because one timer thread shared by
+every async handle in the process keeps the deadlines; it starts with the first
+wait that needs it. If that thread cannot be started, the wait fails with
+`FileError::Io`, and the next wait tries again. A pending `next_event` fails
+with `FileError::InvalidState(StateError::Closed)` as soon as the object's
+thread stops taking events, without waiting for a recorder's drop wait.
 
 Await `finish` to learn whether the recording is complete, then await `close`;
 neither blocks the executor. `close` ends the object for every clone, and later

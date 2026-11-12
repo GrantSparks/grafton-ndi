@@ -363,7 +363,7 @@ fn child(name: &str, fixtures: &Fixtures) {
             let ndi = select(fixtures, &PAIRED);
             let api = FileApi::open(&ndi, &explicit(fixtures.file("partial"))).unwrap();
             let options = RecorderOptions::new(SourceSpec::new("a source").unwrap());
-            match api.create_recorder(options) {
+            match api.create_recorder(&options) {
                 Err(FileError::Unavailable(reason)) => {
                     assert!(reason.contains("NDIlib_file_recorder_rollover"), "{reason}");
                 }
@@ -372,7 +372,7 @@ fn child(name: &str, fixtures: &Fixtures) {
             // Playback is complete in this library and still reaches it.
             assert_eq!(bound_runtime(&api), PAIRED.build);
             assert!(matches!(
-                api.create_player(PlayerOptions::new("a player").unwrap()),
+                api.create_player(&PlayerOptions::new("a player").unwrap()),
                 Err(FileError::Rejected(_))
             ));
         }

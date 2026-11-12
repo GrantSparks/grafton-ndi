@@ -25,8 +25,8 @@ pub struct FilePlayer {
     playback: &'static sys::FilePlayback,
     handle: NonNull<NDIlib_file_player_instance_type>,
     // Strings passed to the SDK are needed only for the call that receives
-    // them; see the note in `recorder.rs`. The options are kept for `Debug`.
-    options: PlayerOptions,
+    // them; see the note in `recorder.rs`. The name is kept for `Debug`.
+    name: String,
     // Keeps the NDI runtime initialized.
     _api: FileApi,
     _thread: PhantomData<Rc<()>>,
@@ -35,13 +35,13 @@ pub struct FilePlayer {
 impl std::fmt::Debug for FilePlayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FilePlayer")
-            .field("name", &self.options.name())
+            .field("name", &self.name)
             .finish_non_exhaustive()
     }
 }
 
 impl FilePlayer {
-    pub(super) fn create(api: FileApi, options: PlayerOptions) -> FileResult<Self> {
+    pub(super) fn create(api: FileApi, options: &PlayerOptions) -> FileResult<Self> {
         let playback = api.playback()?;
         let settings = NDIlib_file_player_create_t {
             p_ndi_send_name: options.name.as_ptr(),
@@ -56,7 +56,7 @@ impl FilePlayer {
         Ok(Self {
             playback,
             handle,
-            options,
+            name: options.name().to_owned(),
             _api: api,
             _thread: PhantomData,
         })
