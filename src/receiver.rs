@@ -1645,8 +1645,9 @@ impl<'rx> CaptureLock<'rx> {
         audio: Option<&mut NDIlib_audio_frame_v3_t>,
         metadata: Option<&mut NDIlib_metadata_frame_t>,
     ) -> NDIlib_frame_type_e {
+        // Read before the call below, so it is at least the wait the SDK gets.
         #[cfg(test)]
-        native_capture_calls::record();
+        native_capture_calls::record(self.attempt.0.remaining_ms());
         // SAFETY: the receiver instance is live for 'rx, which this lock
         // borrows it for. Each descriptor is null or exclusively borrowed,
         // writable storage that outlives the synchronous call. The lock holds
@@ -1665,18 +1666,32 @@ impl<'rx> CaptureLock<'rx> {
 }
 
 /// Counts native capture calls on the calling thread, so that tests can tell
-/// a capture that was skipped from one that found nothing.
+/// a capture that was skipped from one that found nothing, and keeps the
+/// longest wait any of them was given, so that they can tell how long the SDK
+/// was allowed to block whatever it then took.
 #[cfg(test)]
 pub(crate) mod native_capture_calls {
     use std::cell::Cell;
     std::thread_local! {
         static CALLS: Cell<usize> = const { Cell::new(0) };
+        static LONGEST_WAIT_MS: Cell<u32> = const { Cell::new(0) };
     }
-    pub(crate) fn record() {
+    /// Count a call that the SDK is allowed to block for `wait_ms` at most.
+    pub(crate) fn record(wait_ms: u32) {
         CALLS.with(|calls| calls.set(calls.get() + 1));
+        LONGEST_WAIT_MS.with(|longest| longest.set(longest.get().max(wait_ms)));
     }
+    /// The calls made since the last take.
     pub(crate) fn take() -> usize {
-        CALLS.with(|calls| calls.replace(0))
+        take_with_longest_wait().0
+    }
+    /// The calls made since the last take, and the longest wait, in
+    /// milliseconds, that any of them was given.
+    pub(crate) fn take_with_longest_wait() -> (usize, u32) {
+        (
+            CALLS.with(|calls| calls.replace(0)),
+            LONGEST_WAIT_MS.with(|longest| longest.replace(0)),
+        )
     }
 }
 
@@ -2977,6 +2992,15 @@ mod tests {
         });
     }
 
+    /// `poll_event` gives each SDK call one poll interval of its timeout at
+    /// most, where one call used to be given all of it.
+    ///
+    /// What each call is given, and that the poll ends only once the budget
+    /// is spent, hold however long the SDK then takes. How many calls fit in
+    /// the budget does not: on a loaded runner the SDK overran its waits, and
+    /// only two fitted. The count is the capture loop's, which the
+    /// clock-driven tests below check, such as
+    /// `retry_follows_a_full_wait_at_once`.
     #[test]
     fn poll_event_spends_its_timeout_in_bounded_attempts() {
         use std::time::Instant;
@@ -2986,18 +3010,20 @@ mod tests {
         let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
         // A zero timeout makes exactly one attempt, with a zero SDK wait.
         native_capture_calls::take();
-        let began = Instant::now();
         assert!(receiver.poll_event(Duration::ZERO).unwrap().is_none());
-        assert!(began.elapsed() < Duration::from_millis(500));
-        assert_eq!(native_capture_calls::take(), 1);
+        assert_eq!(native_capture_calls::take_with_longest_wait(), (1, 0));
         // Nothing is connected: the whole budget is spent, in attempts of at
-        // most one poll interval each, where one SDK call used to take it all.
+        // most one poll interval each.
         let budget = Duration::from_millis(450);
         let began = Instant::now();
         assert!(receiver.poll_event(budget).unwrap().is_none());
         assert!(began.elapsed() >= budget, "{:?}", began.elapsed());
-        let calls = native_capture_calls::take();
-        assert!(calls >= 3, "{calls} SDK calls");
+        let (calls, longest_wait) = native_capture_calls::take_with_longest_wait();
+        assert!(calls >= 1, "{calls} SDK calls");
+        assert!(
+            u128::from(longest_wait) <= POLL_INTERVAL.as_millis(),
+            "an SDK call was given {longest_wait} ms"
+        );
     }
 
     #[test]
