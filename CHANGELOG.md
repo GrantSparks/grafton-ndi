@@ -28,6 +28,12 @@ API, see the [README](README.md) and the migration guides for
 
 ### Added
 
+- Lossy WebP with `ImageFormat::WebpLossy(quality)`, quality 0 to 100,
+  SharpYUV color conversion and exact alpha, through a pure Rust encoder.
+  All image methods, pixel formats, color policies and downscaling support it.
+- CI tests the File API with `file-io` alone. Its independent Cargo feature
+  and platform-specific native runtime requirements are documented explicitly.
+
 - Tokio and smol `AsyncCapture::capture_with` and
   `AsyncReceiver::capture_any_with` process validated borrowed media in the
   capture's blocking task without wrapper payload allocations or copies. Only

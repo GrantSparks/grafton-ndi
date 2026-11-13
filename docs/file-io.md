@@ -11,6 +11,27 @@ library.
 grafton-ndi = { version = "3.0", features = ["file-io"] }
 ```
 
+`file-io` does not enable or require the `advanced` Cargo feature. The File ABI
+is included in the crate, so desktop and Android builds need neither Advanced
+headers nor `libclang`. Enable `advanced` as well when using the Rust
+`advanced` module.
+
+Both the Standard and Advanced NDI 6.4 SDKs distribute the File API headers,
+manual and native libraries. Distribution and runtime compatibility differ:
+the Linux, macOS and Android File libraries in the pinned 6.4.0.2 packages
+import the Advanced runtime by name, including those shipped in the Standard
+SDK. Windows x64's File DLL imports no NDI runtime DLL and supports either
+edition. The Linux File implementation actually calls Advanced-only functions
+for receiver creation, custom allocation, keyframes and scatter sending, so
+its dependency is functional as well as a library-name dependency. These calls
+happen inside the native File library; applications need no Rust `advanced`
+wrappers to use it. This is independent of
+Cargo features; see the [package inspection evidence](sdk-validation.md#file-api-distribution-and-runtime-dependencies).
+
+A build with `file-io` prefers Advanced during default runtime discovery on
+Linux, macOS and Android, and rejects a Standard runtime when opening the File
+library. See [runtime selection](setup.md#sdk-editions).
+
 The File library is a separate native library that the NDI SDK installs beside
 the runtime library. It requires NDI 6.4. Sending and receiving do not depend on it. `FileApi::open` finds it when it is first
 needed:
@@ -85,7 +106,7 @@ Which NDI runtime the File library works with depends on the platform:
 
 | Platform | Rule |
 | --- | --- |
-| Linux, macOS, Android | The File library uses the Advanced SDK runtime. `FileApi::open` refuses it beside a Standard runtime with `Error::RuntimeConflict`, before loading anything. Select the Advanced runtime; see [SDK editions](setup.md#sdk-editions). |
+| Linux, macOS, Android | The shipped 6.4.0.2 File library uses the Advanced SDK runtime, in both SDK editions. `FileApi::open` refuses it beside a Standard runtime with `Error::RuntimeConflict`, before loading anything. Select the Advanced runtime; see [SDK editions](setup.md#sdk-editions). |
 | Windows | The File library does not depend on the runtime's edition. The SDK ships it for 64-bit Windows only. |
 | iOS, tvOS, visionOS | The File archive is linked at build time, in place of the core archive, when the NDI SDK for Apple supplies one; without it `FileApi::open` returns `Error::RuntimeLoadFailed`. See [Apple mobile targets](setup.md#apple-mobile-targets). |
 

@@ -12,15 +12,18 @@ use crate::YuvMatrix;
 /// // PNG: lossless, any bit depth, carries an HDR tag.
 /// let png = ImageFormat::Png;
 ///
-/// // JPEG at quality 85: lossy and the smallest.
+/// // JPEG at quality 85: lossy, without alpha.
 /// let jpeg = ImageFormat::Jpeg(85);
 ///
 /// // Lossless WebP: smaller and far faster than PNG on camera video.
 /// let webp = ImageFormat::WebpLossless;
+///
+/// // Lossy WebP at quality 80, preserving alpha exactly.
+/// let preview = ImageFormat::WebpLossy(80);
 /// ```
 ///
-/// This enum is marked `#[non_exhaustive]` so that encoders, lossy WebP
-/// among them, can be added without a breaking change. Match arms should
+/// This enum is marked `#[non_exhaustive]` so that encoders
+/// can be added without a breaking change. Match arms should
 /// include a wildcard `_` pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -33,6 +36,11 @@ pub enum ImageFormat {
     Jpeg(u8),
     /// Lossless WebP: 8 bits a channel, with or without alpha.
     WebpLossless,
+    /// Lossy WebP at a quality from 0, the lowest, to 100, the highest;
+    /// 8 bits a channel, with or without alpha. Alpha is preserved exactly.
+    /// Color uses 4:2:0 chroma sampling and SharpYUV conversion; even quality
+    /// 100 can change RGB values. Use [`Self::WebpLossless`] for exact pixels.
+    WebpLossy(u8),
 }
 
 impl ImageFormat {
@@ -41,7 +49,7 @@ impl ImageFormat {
         match self {
             Self::Png => "PNG",
             Self::Jpeg(_) => "JPEG",
-            Self::WebpLossless => "WebP",
+            Self::WebpLossless | Self::WebpLossy(_) => "WebP",
         }
     }
 
@@ -50,7 +58,7 @@ impl ImageFormat {
         match self {
             Self::Png => "image/png",
             Self::Jpeg(_) => "image/jpeg",
-            Self::WebpLossless => "image/webp",
+            Self::WebpLossless | Self::WebpLossy(_) => "image/webp",
         }
     }
 }
@@ -98,6 +106,7 @@ impl ImageFormat {
 /// | PNG, [`AlphaMode::Discard`] | RGB | 8 or 16 |
 /// | JPEG | YCbCr; alpha is dropped | 8 |
 /// | Lossless WebP | RGBA, or RGB with [`AlphaMode::Discard`] | 8 |
+/// | Lossy WebP | Lossy color, exact alpha unless discarded | 8 |
 ///
 /// An untagged frame, or one tagged BT.601 or BT.709 SDR, in one of the four
 /// RGB formats encodes, with the default options, to the same bytes as in
@@ -126,7 +135,7 @@ impl ImageFormat {
 /// RGBA frame: 554 ms as PNG at [`PngCompression::Balanced`], the default,
 /// 24 ms at [`PngCompression::Fast`], 19 ms as lossless WebP and 21 ms as
 /// JPEG at quality 85. Converting a YUV frame adds about 6 ms. A snapshot loop
-/// of camera video should use `Fast` or WebP; see [`PngCompression`].
+/// of camera video should use `Fast` or lossless WebP; see [`PngCompression`].
 ///
 /// Async code runs the encoder on a blocking thread, with an owned frame:
 ///
@@ -146,9 +155,11 @@ impl ImageFormat {
 /// conversion scratch does not grow with the frame's height: none for a PNG
 /// of an RGBA frame, whose rows the codec reads in place, or for a JPEG,
 /// whose pixels convert straight into the codec's rows; one row otherwise.
-/// Lossless WebP encodes from one buffer, so it holds the whole converted
+/// WebP encodes from one buffer, so it holds the whole converted
 /// image, unless the frame is RGBA with contiguous rows, which it reads in
-/// place. Codec state and the encoded output take memory besides.
+/// place. Lossless WebP uses three channels with alpha discarded; lossy WebP
+/// uses four with opaque alpha. Lossy WebP also buffers the complete encoded
+/// image before writing it. Codec state and encoded output take memory besides.
 ///
 /// # Errors
 ///
@@ -158,11 +169,12 @@ impl ImageFormat {
 /// | Problem | Error |
 /// |---|---|
 /// | A JPEG quality outside 1 to 100 | [`Error::InvalidInput`] |
+/// | A lossy WebP quality outside 0 to 100 | [`Error::InvalidInput`] |
 /// | JPEG or WebP with [`SampleDepth::Sixteen`] | [`Error::InvalidInput`] |
 /// | JPEG or WebP with [`HdrPolicy::CodeValues`] for a PQ or HLG frame | [`Error::InvalidInput`] |
 /// | A PQ or HLG frame with [`HdrPolicy::Refuse`] | [`Error::InvalidFrame`] |
 /// | Unreadable `ndi_color_info` with [`ColorPolicy::Sdk`] | [`Error::InvalidFrame`] |
-/// | An image wider or taller than JPEG's 65,535 or WebP's 16,384 pixels | [`Error::InvalidFrame`] |
+/// | An image wider or taller than JPEG's 65,535, lossless WebP's 16,384 or lossy WebP's 16,383 pixels | [`Error::InvalidFrame`] |
 /// | The writer given to `encode_image_to` fails | [`Error::Io`] |
 /// | The codec fails for another reason | [`Error::InvalidFrame`] |
 ///

@@ -4,6 +4,13 @@ Time and peak memory of image encoding for 3.0, by source pixel format, image
 size, content and output. The [image encoding guide](image-encoding.md) says
 what each setting does; this page says what it costs.
 
+These measurements cover PNG, JPEG and lossless WebP. Lossy WebP uses
+`libwebpop` and is included in the measurement command below, but the tables
+have not been measured for that backend. It buffers both the complete encoded
+image and, unless contiguous RGBA can be borrowed, four converted bytes per
+output pixel, plus codec state and reduction scratch. Alpha discard makes those
+four-channel pixels opaque. Compare quality, size and time on your own content.
+
 Measured on Debian 12 x86_64, Intel Xeon w7-2475X, Rust 1.100.0, release
 build for the default x86-64 target, with `png` 0.18.1, `jpeg-encoder` 0.7.1
 and `image-webp` 0.2.4. One encode at a time on one thread; treat differences

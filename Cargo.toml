@@ -40,6 +40,7 @@ serde_json = { version = "1.0", optional = true }
 # Keep the scalar base64 0.22 engine; SIMD adoption needs separate validation.
 base64 = { version = "0.22", optional = true }
 image-webp = { version = "0.2.4", optional = true }
+libwebpop = { version = "0.1.0", optional = true }
 jpeg-encoder = { version = "0.7.1", optional = true }
 png = { version = "0.18.1", optional = true }
 
@@ -65,12 +66,14 @@ default = []
 # time from an installed Advanced SDK (NDI_SDK_DIR or a default location); without
 # one the API still compiles and every operation reports that it is unavailable.
 advanced = ["dep:serde_json", "dep:bindgen", "dep:syn"]
-# Optional source recording and file-to-network playback API.
+# Optional source recording and file-to-network playback API. Independent of
+# `advanced`: the File ABI is included; runtime edition requirements are checked
+# when loading its separate native library.
 file-io = []
-# Enable image encoding support: PNG, JPEG, lossless WebP and data URLs of
+# Enable image encoding support: PNG, JPEG, lossless/lossy WebP and data URLs of
 # every uncompressed video format. Opt-in; adds the base64, image-webp,
-# jpeg-encoder and png dependencies.
-image-encoding = ["dep:base64", "dep:image-webp", "dep:jpeg-encoder", "dep:png"]
+# jpeg-encoder, libwebpop and png dependencies (all pure Rust).
+image-encoding = ["dep:base64", "dep:image-webp", "dep:jpeg-encoder", "dep:libwebpop", "dep:png"]
 # Enable async runtime integration for Tokio
 # Adds dependency: tokio
 tokio = ["dep:tokio"]

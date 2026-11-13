@@ -1124,7 +1124,7 @@ macro_rules! video_accessors {
             /// Encode the frame as an image, as `options` describe.
             ///
             /// Every uncompressed pixel format encodes, as PNG, JPEG or
-            /// lossless WebP. YUV is converted to RGB as the NDI SDK converts
+            /// lossless or lossy WebP. YUV is converted to RGB as the NDI SDK converts
             /// it, with BT.709, limited range and repeated chroma, unless the
             /// frame's `ndi_color_info` metadata names another matrix; a frame
             /// tagged PQ or HLG is refused unless the options ask for its code
@@ -1141,7 +1141,8 @@ macro_rules! video_accessors {
             /// # Errors
             ///
             /// [`Error::InvalidInput`](crate::Error::InvalidInput) for options
-            /// that conflict: a JPEG quality outside 1 to 100, 16 bits or HDR
+            /// that conflict: a JPEG quality outside 1 to 100, a WebP quality
+            /// outside 0 to 100, 16 bits or HDR
             /// code values for JPEG or WebP.
             /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) for a frame
             /// the options cannot encode: a PQ or HLG frame under
@@ -1168,13 +1169,14 @@ macro_rules! video_accessors {
             }
 
             /// Encode the frame as an image, as `options` describe, writing it
-            /// into `out` as it encodes.
+            /// into `out`.
             ///
             /// It encodes as [`encode_image`](Self::encode_image) does, into
             /// any writer, so a program that takes snapshots on a timer can
             /// reuse one output buffer. A file or socket should be wrapped in
             /// a [`BufWriter`](std::io::BufWriter): the codecs write in small
-            /// pieces.
+            /// pieces. Lossy WebP buffers its complete encoded image before
+            /// writing it; other codecs write as they encode.
             ///
             /// # Errors
             ///
@@ -6142,6 +6144,8 @@ mod tests {
             ImageOptions::new(ImageFormat::Png).downscale(Downscale::Half),
             ImageOptions::new(ImageFormat::Jpeg(85)),
             ImageOptions::new(ImageFormat::WebpLossless).alpha(AlphaMode::Discard),
+            ImageOptions::new(ImageFormat::WebpLossy(75)),
+            ImageOptions::new(ImageFormat::WebpLossy(75)).alpha(AlphaMode::Discard),
         ];
         for format in PixelFormat::ALL {
             let (width, height) = (4, 2);

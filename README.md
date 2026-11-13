@@ -90,10 +90,10 @@ fn main() -> grafton_ndi::Result<()> {
 
 | Feature | Effect |
 | --- | --- |
-| `image-encoding` | PNG, JPEG, lossless WebP and data-URL encoding of video frames in every uncompressed format. Off by default. See the [image encoding guide](docs/image-encoding.md). |
+| `image-encoding` | PNG, JPEG, lossless and lossy WebP with quality control, and data-URL encoding of video frames in every uncompressed format. Off by default. See the [image encoding guide](docs/image-encoding.md). |
 | `tokio`, `smol` | Receiver adapters for the named async runtime. Each is independent. |
 | `advanced` | The `advanced` module: NDI Advanced SDK operations. See [Advanced SDK](docs/advanced.md). |
-| `file-io` | The `file` module: recording and playback through the NDI File API. See the [File API guide](docs/file-io.md). |
+| `file-io` | The `file` module: recording and playback through the NDI File API. Independent of the `advanced` Cargo feature; requires the Advanced runtime on Linux, macOS and Android. See the [File API guide](docs/file-io.md). |
 
 No feature is enabled by default; enable each one you need, for example `features = ["image-encoding"]`. Cargo features select Rust APIs only. They do not choose an SDK edition or a runtime library; see [SDK editions](docs/setup.md#sdk-editions).
 

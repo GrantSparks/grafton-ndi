@@ -265,8 +265,9 @@ impl FileRuntime {
     }
 
     fn load(core: &RuntimeInfo, api: &Api, explicit: Option<&Path>) -> Result<Self> {
-        // The POSIX File library imports the core entry points from the
-        // Advanced runtime by name. Opened beside a Standard core it would make
+        // The 6.4.0.2 POSIX File library, including Standard SDK copies,
+        // imports the core entry points from the Advanced runtime by name.
+        // Opened beside a Standard core it would make
         // the platform loader bring a second NDI implementation into the
         // process, so it is refused before anything is opened. The Windows
         // File library carries its own implementation and imports none.

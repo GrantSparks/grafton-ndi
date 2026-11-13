@@ -1,7 +1,7 @@
 # Image encoding
 
 With the `image-encoding` feature, every video frame type encodes itself as a
-PNG, JPEG or lossless WebP image, or as a data URL of one: frames you capture
+PNG, JPEG or WebP image, or as a data URL of one: frames you capture
 from a receiver or a FrameSync, owned frames, and frames you build to send.
 Every uncompressed pixel format is supported. YUV is converted to RGB as the
 NDI SDK converts it, with BT.709, limited range and repeated chroma, unless a
@@ -13,7 +13,7 @@ ask for their code values, and images can be reduced by 2, 4 or 8 on the way.
 grafton-ndi = { version = "3.0", features = ["image-encoding"] }
 ```
 
-The feature adds the `png`, `jpeg-encoder`, `image-webp` and `base64` crates,
+The feature adds the `png`, `jpeg-encoder`, `image-webp`, `libwebpop` and `base64` crates,
 all pure Rust. The `ColorInfo` color description and every frame's
 `color_info()` need no feature.
 
@@ -24,7 +24,7 @@ all pure Rust. The `ColorInfo` color description and every frame's
 | Method | Returns |
 | --- | --- |
 | `encode_image(&options)` | The image, in a new `Vec<u8>` |
-| `encode_image_to(&options, writer)` | `()`, having written the image into any `io::Write` as it encoded |
+| `encode_image_to(&options, writer)` | `()`, having written the image into any `io::Write` |
 | `encode_image_data_url(&options)` | A `data:image/...;base64,` URL, allocated at its final length |
 | `encode_png()`, `encode_jpeg(quality)`, `encode_data_url(format)` | The same, with `ImageOptions::new(format)` |
 
@@ -38,6 +38,10 @@ let png = frame.encode_image(&options)?;
 // A quarter-size JPEG thumbnail as a data URL.
 let thumbnail = ImageOptions::new(ImageFormat::Jpeg(85)).downscale(Downscale::Quarter);
 let url = frame.encode_image_data_url(&thumbnail)?;
+
+// Lossy WebP for a bandwidth-sensitive preview, keeping transparency exact.
+let preview = ImageOptions::new(ImageFormat::WebpLossy(75)).downscale(Downscale::Half);
+let webp = frame.encode_image(&preview)?;
 ```
 
 A loop that takes a snapshot on a timer can reuse one buffer:
@@ -52,8 +56,9 @@ while let Some(frame) = receiver.video().capture_ref(timeout)? {
 }
 ```
 
-`encode_image_to` writes as it encodes: wrap a file or socket in a
-`BufWriter`, because the codecs write in small pieces. Every check of the
+PNG, JPEG and lossless WebP write as they encode: wrap a file or socket in a
+`BufWriter`, because those codecs write in small pieces. Lossy WebP buffers
+the complete encoded image before writing it. Every check of the
 options and the frame happens before anything is written. After a later error,
 which is a failing writer or codec, the writer may hold part of an image.
 
@@ -95,6 +100,14 @@ the SDK's padded stride encodes exactly as its packed copy does.
 | PNG, `AlphaMode::Discard` | RGB | 8 or 16 | As above |
 | JPEG | YCbCr; alpha is dropped | 8 | Quality 1 to 100; chroma halved both ways below 90, whole from 90 |
 | Lossless WebP | RGBA, or RGB with `AlphaMode::Discard` | 8 | None |
+| Lossy WebP | 4:2:0 color; exact alpha unless discarded | 8 | `ImageFormat::WebpLossy(quality)`, quality 0 to 100 |
+
+Lossy WebP trades color fidelity for fewer bytes. Lower quality values generally
+produce smaller images; 100 still changes color, so choose `WebpLossless` when
+pixels must be exact. The encoder uses `libwebpop`, a scalar Rust port of
+libwebp, at method 4 with SharpYUV conversion and alpha quality 100. SharpYUV
+falls back to ordinary conversion for images narrower or shorter than four
+pixels. `AlphaMode::Discard` makes the image opaque before any reduction.
 
 `SampleDepth::Sixteen` writes a 16-bit PNG: P216, PA16, NA4G and NB4G frames
 keep their precision, and 8-bit sources scale exactly (times 257). JPEG and
@@ -201,7 +214,10 @@ Encoding can take tens to hundreds of milliseconds per 1080p frame. Keep it off
 capture and executor threads. Choose `PngCompression::Fast` or lossless WebP for
 camera snapshots; compare output sizes on your content.
 
-PNG and JPEG convert rows incrementally. WebP may hold a whole converted image.
+PNG and JPEG convert rows incrementally. Both WebP codecs may hold a whole
+converted image. Lossless WebP uses RGB with alpha discarded, while lossy WebP's
+backend always takes RGBA, with alpha set to 255 when discarded. Lossy WebP
+also holds a complete encoded image before writing, even with `encode_image_to`.
 Codec state and encoded output use additional memory. See the
 [performance measurements](image-encoding-performance.md) for timings, memory bounds
 and the hardware and inputs used.
@@ -211,11 +227,12 @@ and the hardware and inputs used.
 | Problem | Error |
 | --- | --- |
 | A JPEG quality outside 1 to 100, from `encode_jpeg` or `ImageOptions` | `InvalidInput` |
+| A lossy WebP quality outside 0 to 100 | `InvalidInput` |
 | JPEG or WebP with `SampleDepth::Sixteen` | `InvalidInput` |
 | JPEG or WebP with `HdrPolicy::CodeValues` for a PQ or HLG frame | `InvalidInput` |
 | A PQ or HLG frame under `HdrPolicy::Refuse`, in any pixel format | `InvalidFrame`, naming the transfer and `HdrPolicy::CodeValues` |
 | Unreadable `ndi_color_info` under `ColorPolicy::Sdk` | `InvalidFrame`, naming the attribute and value |
-| An image wider or taller than JPEG's 65,535 or WebP's 16,384 pixels | `InvalidFrame`, naming the dimension; `Downscale` can bring it within |
+| An image wider or taller than JPEG's 65,535, lossless WebP's 16,384 or lossy WebP's 16,383 pixels | `InvalidFrame`, naming the dimension; `Downscale` can bring it within |
 | The writer given to `encode_image_to` fails | `Io`, the writer's own error |
 | The codec fails for another reason | `InvalidFrame`: "PNG encoding failed", "JPEG encoding failed" or "WebP encoding failed" |
 

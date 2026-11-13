@@ -14,7 +14,7 @@ runtimes.
 | Job | Runs for | What it checks |
 |---|---|---|
 | `lint` | every event | CI script tests, shellcheck, actionlint, rustfmt, clippy (`-D warnings`) for the workspace with all features and for the crate with no features and with each of `image-encoding`, `tokio`, `smol`, `advanced`, `file-io`, `advanced,file-io`; the bindings generator's tests; rustdoc (`-D warnings`); `cargo check` on Rust 1.88; `cargo package`; the semver check; `cargo audit` |
-| `test` | every event | `cargo test` with all features and with default features on Linux, macOS and Windows. No NDI runtime is installed, so tests that need one print `skipped: <test> needs …` |
+| `test` | every event | `cargo test` with all features, with default features, and with `file-io` alone on Linux, macOS and Windows. No NDI runtime is installed, so tests that need one print `skipped: <test> needs …` |
 | `cross` | every event | clippy (`-D warnings`, all features, all targets) for every dynamically loaded target: Linux aarch64, armv7 and i686; Android aarch64, armv7, i686 and x86_64; Windows x86_64 and i686; macOS aarch64 and x86_64. Then a link of the examples for `aarch64-linux-android` with the runner's NDK ([`scripts/build-android.sh`](../scripts/build-android.sh)) |
 | `sdk` | runs that are given the secrets | the tests against real runtimes; see below |
 | `required-ci` | every event, `if: always()` | passes only if every job the event requires succeeded ([`gate.py`](gate.py)) |
@@ -159,7 +159,7 @@ mistake cannot pass as a skip:
 |---|---|---|
 | `1` | an NDI runtime (implied by every other entry) | always |
 | `advanced` | an Advanced runtime, compiled with its headers | the `advanced` feature is on |
-| `file` | a File library the selected runtime can drive: an Advanced runtime on Linux and macOS, any 6.4 runtime on 64-bit Windows | the `file-io` feature is on |
+| `file` | a File library the selected runtime can drive: the shipped 6.4.0.2 binaries need an Advanced runtime on Linux and macOS, and support either 6.4 runtime on 64-bit Windows | the `file-io` feature is on; the independent `advanced` feature is unnecessary |
 | `discovery-server` | the SDK's Discovery Server program and a 6.4 runtime, whose advertisers and listeners can use it | the target is Linux |
 | `h264-decoder` | an NDI\|HX decoder for H.264 the selected runtime can use. It is built into the runtime on macOS and Windows. On Linux the runtime needs the NDI\|HX Driver for Linux or FFmpeg 7; the runner has no FFmpeg 7, so a row provides the driver through `hx-driver` | the `advanced` feature is on |
 | `hevc-444-decoder` | the same for HEVC 4:4:4, with a 6.4 runtime. No Windows row provides one: the hosted Windows Server 2025 runners delivered black placeholder frames for HEVC 4:4:4 | the `advanced` feature is on |

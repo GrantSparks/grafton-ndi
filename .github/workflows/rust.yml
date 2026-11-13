@@ -102,6 +102,8 @@ jobs:
         run: cargo test --locked --all-features
       - name: Tests, default features
         run: cargo test --locked
+      - name: Tests, File API without Advanced wrappers
+        run: cargo test --locked --no-default-features --features file-io
 
   cross:
     name: cross

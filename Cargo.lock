@@ -397,6 +397,7 @@ dependencies = [
  "jpeg-encoder",
  "libc",
  "libloading 0.9.0",
+ "libwebpop",
  "parking_lot",
  "png",
  "serde_json",
@@ -485,6 +486,15 @@ checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
 dependencies = [
  "cfg-if",
  "windows-link",
+]
+
+[[package]]
+name = "libwebpop"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdbf9b5eaf47051badc713ec76ee552113e37d01dedcbe6dad6aecdad0815947"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]

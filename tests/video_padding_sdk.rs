@@ -306,6 +306,7 @@ fn live_yuv_frames_encode_from_sdk_rows() {
             .downscale(Downscale::Quarter),
         ImageOptions::new(ImageFormat::Jpeg(85)),
         ImageOptions::new(ImageFormat::WebpLossless),
+        ImageOptions::new(ImageFormat::WebpLossy(75)),
     ];
     let (width, height) = (642usize, 32usize);
     // Levels that change slowly, as a picture's do: every byte of a row

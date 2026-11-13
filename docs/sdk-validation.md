@@ -85,6 +85,46 @@ An operation whose capability is unavailable returns
 `Error::UnsupportedCapability` before any native call is made. The 6.1.1 and
 6.3.2 SDKs include no File library.
 
+### File API distribution and runtime dependencies
+
+Direct inspection of the Standard 6.4.0.2 SDK archives, verified against the
+size and SHA-256 pins in [`ci/sdk-packages.json`](../ci/sdk-packages.json),
+shows that all four platform packages include `Processing.NDI.Lib.File.h`,
+the File API manual and native File libraries. The manual's introduction
+describes the API as part of the NDI SDK. It is distributed in both SDK editions.
+
+The runtime dependencies of those Standard SDK binaries are:
+
+| Package | File binary inspected | NDI runtime import |
+| --- | --- | --- |
+| Linux, x86_64 | `lib/x86_64-linux-gnu/libndifile.so.6.4.0` | ELF `DT_NEEDED`: `libndi_advanced.so.6` |
+| Android, ARMv7 | `lib/armeabi-v7a/libndifile.so` | ELF `DT_NEEDED`: `libndi_advanced.so` |
+| Apple, macOS x86_64 and ARM64 | `lib/macOS/libndifile.dylib` | Mach-O `LC_LOAD_DYLIB`: `@rpath/libndi_advanced.dylib` |
+| Windows, x64 | `Bin/x64/Processing.NDI.Lib.File.x64.dll` | No NDI runtime DLL in its import table |
+
+The Linux x86_64 File binary is identical in the Standard and Advanced packages:
+SHA-256 `12c77405563542eadee2509a040906b3afc07737d5b5f38e69b239710461d850`.
+Loading the Standard package's File library on Linux without the Advanced
+runtime fails with `libndi_advanced.so.6: cannot open shared object file`.
+This is a dependency of the shipped 6.4.0.2 binaries, rather than absence of
+the File API from the Standard SDK.
+
+The Linux File library's undefined dynamic symbols also demonstrate a
+functional dependency: nine of its 30 `NDIlib_*` imports are absent from the
+Standard runtime's exports. These include `NDIlib_recv_create_v4`,
+`NDIlib_recv_set_video_allocator`, `NDIlib_recv_request_keyframe` and
+`NDIlib_send_send_video_scatter`. Its implementation uses Advanced operations
+internally even though applications call the separate File API. Merely
+renaming a Standard runtime library would not supply those missing functions.
+Compare `nm -D --undefined-only libndifile.so.6.4.0` with
+`nm -D --defined-only libndi.so.6.4.0` to reproduce this check.
+
+Reproduce the inspection with `readelf -d` on ELF libraries, `otool -L` on
+macOS and `dumpbin /DEPENDENTS` on Windows. These checks establish native
+dependencies, not playback or recording behavior on platforms not executed here.
+The crate's `file-io` feature uses its included File ABI independently of
+`advanced`; the loader enforces native compatibility separately.
+
 ### Sender-captured metadata counts
 
 `Sender::capture_metadata` validates the NUL-terminated text that

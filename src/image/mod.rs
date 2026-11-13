@@ -3,7 +3,7 @@
 //! An encode reads the frame a row at a time through one of five readers
 //! ([`read`]), converts YUV to RGB in the color stage ([`color`]), averages
 //! blocks when asked to reduce the image ([`downscale`]), and hands the rows
-//! to PNG, JPEG or lossless WebP. Every check of the options and the frame
+//! to PNG, JPEG or WebP. Every check of the options and the frame
 //! happens in [`Plan::new`], before anything is written.
 
 mod color;
@@ -56,20 +56,26 @@ impl<'a> Source<'a> {
     }
 }
 
-/// Encode `source` as `options` describes into `out`, writing as it encodes.
+/// Encode `source` as `options` describes into `out`.
 pub(crate) fn encode_to(
     source: Source<'_>,
     options: &ImageOptions,
     out: &mut dyn Write,
 ) -> Result<()> {
     let plan = Plan::new(&source, options)?;
+    write_image(&source, plan, out)
+}
+
+/// Write a validated image. Lossy WebP buffers its output; the other codecs
+/// write as they encode.
+fn write_image(source: &Source<'_>, plan: Plan, out: &mut dyn Write) -> Result<()> {
     match plan.codec {
         Codec::Png {
             depth: SampleDepth::Eight,
             compression,
             cicp,
         } => png::encode(
-            &mut plan.pixels::<u8>(&source),
+            &mut plan.pixels::<u8>(source),
             plan.channels(),
             compression,
             cicp,
@@ -80,21 +86,33 @@ pub(crate) fn encode_to(
             compression,
             cicp,
         } => png::encode(
-            &mut plan.pixels::<u16>(&source),
+            &mut plan.pixels::<u16>(source),
             plan.channels(),
             compression,
             cicp,
             out,
         ),
-        Codec::Jpeg { quality } => jpeg::encode(&mut plan.pixels::<u8>(&source), quality, out),
-        Codec::WebpLossless => webp::encode(&mut plan.pixels::<u8>(&source), plan.channels(), out),
+        Codec::Jpeg { quality } => jpeg::encode(&mut plan.pixels::<u8>(source), quality, out),
+        Codec::WebpLossless => {
+            webp::encode_lossless(&mut plan.pixels::<u8>(source), plan.channels(), out)
+        }
+        Codec::WebpLossy { quality } => {
+            let image = webp::encode_lossy(&mut plan.pixels::<u8>(source), quality)?;
+            out.write_all(&image).map_err(Error::Io)
+        }
     }
 }
 
 /// Encode `source` into a new buffer.
 pub(crate) fn encode(source: Source<'_>, options: &ImageOptions) -> Result<Vec<u8>> {
+    let plan = Plan::new(&source, options)?;
+    // Take the backend's complete buffer directly, avoiding a second output
+    // allocation and copy for Vec and data URL callers.
+    if let Codec::WebpLossy { quality } = plan.codec {
+        return webp::encode_lossy(&mut plan.pixels::<u8>(&source), quality);
+    }
     let mut image = Vec::new();
-    encode_to(source, options, &mut image)?;
+    write_image(&source, plan, &mut image)?;
     Ok(image)
 }
 
@@ -143,6 +161,8 @@ enum Codec {
     Jpeg { quality: u8 },
     /// Dimensions within WebP's limit.
     WebpLossless,
+    /// Quality in 0 to 100, dimensions within lossy WebP's limit.
+    WebpLossy { quality: u8 },
 }
 
 impl Plan {
@@ -150,10 +170,16 @@ impl Plan {
     /// the frame's color description, its HDR transfer, and the image's size.
     fn new(source: &Source<'_>, options: &ImageOptions) -> Result<Self> {
         let format = options.format;
-        if let ImageFormat::Jpeg(quality) = format {
-            if !(1..=100).contains(&quality) {
+        let quality_range = match format {
+            ImageFormat::Jpeg(quality) => Some((quality, 1)),
+            ImageFormat::WebpLossy(quality) => Some((quality, 0)),
+            _ => None,
+        };
+        if let Some((quality, min)) = quality_range {
+            if !(min..=100).contains(&quality) {
                 return Err(Error::InvalidInput(format!(
-                    "JPEG quality must be in 1..=100, got {quality}"
+                    "{} quality must be in {min}..=100, got {quality}",
+                    format.name()
                 )));
             }
         }
@@ -211,8 +237,12 @@ impl Plan {
                 Codec::Jpeg { quality }
             }
             ImageFormat::WebpLossless => {
-                check_size("WebP", width, height, webp::MAX_DIMENSION)?;
+                check_size("WebP", width, height, webp::MAX_LOSSLESS_DIMENSION)?;
                 Codec::WebpLossless
+            }
+            ImageFormat::WebpLossy(quality) => {
+                check_size("WebP", width, height, webp::MAX_LOSSY_DIMENSION)?;
+                Codec::WebpLossy { quality }
             }
         };
         Ok(Self {

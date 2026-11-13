@@ -1,6 +1,12 @@
 //! Recording NDI sources to disk and playing recordings back, through the NDI
 //! File library.
 //!
+//! Enabled by `file-io`, independently of the `advanced` Cargo feature. The
+//! File ABI is included, so desktop and Android builds need no Advanced
+//! headers or `libclang`. Linux, macOS and Android still require the native
+//! Advanced runtime with the shipped 6.4.0.2 File binaries; 64-bit Windows
+//! supports either runtime edition. Both SDK editions distribute the File API.
+//!
 //! The File library is a separate native library that accompanies the NDI
 //! runtime. [`FileApi::open`] finds it when it is first needed; nothing else in
 //! this crate depends on it, so its absence never affects sending or receiving.
@@ -27,7 +33,7 @@
 //! tried and the operating system's reason for each. Like the NDI runtime, a
 //! loaded File library stays selected and loaded for the life of the process.
 //!
-//! On Linux, macOS and Android the File library imports the NDI runtime's entry
+//! On Linux, macOS and Android the 6.4.0.2 File library imports the NDI runtime's entry
 //! points from the **Advanced** SDK runtime, so it can only be used when that is
 //! the selected runtime (see [`RuntimeOptions::edition`](crate::RuntimeOptions::edition)).
 //! Beside a Standard runtime it is refused with [`Error::RuntimeConflict`]

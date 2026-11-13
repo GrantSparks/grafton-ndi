@@ -659,6 +659,10 @@ fn every_output() -> Vec<ImageOptions> {
         options(ImageFormat::Jpeg(90)).downscale(Downscale::Quarter),
         options(ImageFormat::WebpLossless),
         options(ImageFormat::WebpLossless).alpha(AlphaMode::Discard),
+        options(ImageFormat::WebpLossy(75)),
+        options(ImageFormat::WebpLossy(90))
+            .alpha(AlphaMode::Discard)
+            .downscale(Downscale::Quarter),
     ]
 }
 
@@ -1203,6 +1207,128 @@ fn every_png_level_and_lossless_webp_decode_to_the_converted_pixels() {
 }
 
 #[test]
+fn lossy_webp_reduces_every_pixel_format_and_preserves_alpha() {
+    for format in PixelFormat::ALL {
+        let frame = VideoFrame::builder()
+            .resolution(18, 10)
+            .pixel_format(format)
+            .data(any_frame_bytes(format, 18, 10, 21))
+            .build()
+            .unwrap();
+        for alpha in [AlphaMode::Keep, AlphaMode::Discard] {
+            for downscale in [
+                Downscale::Off,
+                Downscale::Half,
+                Downscale::Quarter,
+                Downscale::Eighth,
+            ] {
+                let reference = decode_png(
+                    &frame
+                        .encode_image(&options(ImageFormat::Png).alpha(alpha).downscale(downscale))
+                        .unwrap(),
+                );
+                let rgba: Vec<u8> = reference
+                    .samples
+                    .chunks_exact(reference.channels)
+                    .flat_map(|p| {
+                        [
+                            p[0] as u8,
+                            p[1] as u8,
+                            p[2] as u8,
+                            if reference.channels == 4 {
+                                p[3] as u8
+                            } else {
+                                255
+                            },
+                        ]
+                    })
+                    .collect();
+                let image = frame
+                    .encode_image(
+                        &options(ImageFormat::WebpLossy(75))
+                            .alpha(alpha)
+                            .downscale(downscale),
+                    )
+                    .unwrap();
+                let decoded = decode_webp(&image);
+                assert_eq!(
+                    (decoded.width, decoded.height),
+                    (reference.width, reference.height)
+                );
+                let transparent = rgba.as_chunks::<4>().0.iter().any(|p| p[3] != 255);
+                assert_eq!(decoded.channels, if transparent { 4 } else { 3 });
+                if transparent {
+                    let actual: Vec<u16> = decoded
+                        .samples
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|p| p[3])
+                        .collect();
+                    let expected: Vec<u16> = rgba
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|p| u16::from(p[3]))
+                        .collect();
+                    assert_eq!(actual, expected, "{format:?} {downscale:?} alpha");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn lossy_webp_quality_controls_size_and_color_fidelity() {
+    let (width, height) = (128, 96);
+    let rgba = content_rgba("photographic", width, height, None);
+    let frame = frame_from_rgba(PixelFormat::Rgba, width, height, &rgba);
+    let rgb: Vec<u16> = rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|p| p[..3].iter().copied().map(u16::from))
+        .collect();
+    let mut measurements = Vec::new();
+    for quality in [0, 1, 50, 75, 100] {
+        let options = options(ImageFormat::WebpLossy(quality));
+        let image = frame.encode_image(&options).unwrap();
+        assert!(image_webp::WebPDecoder::new(std::io::Cursor::new(&image))
+            .unwrap()
+            .is_lossy());
+        let mut streamed = Vec::new();
+        frame.encode_image_to(&options, &mut streamed).unwrap();
+        assert_eq!(image, streamed);
+        let decoded = decode_webp(&image);
+        assert_eq!(
+            (decoded.width, decoded.height, decoded.channels),
+            (width as u32, height as u32, 3)
+        );
+        let error: u64 = decoded
+            .samples
+            .iter()
+            .zip(&rgb)
+            .map(|(&a, &b)| {
+                let difference = i64::from(a) - i64::from(b);
+                (difference * difference) as u64
+            })
+            .sum();
+        measurements.push((image.len(), error));
+    }
+    let (small, inaccurate) = measurements[0];
+    let (large, accurate) = measurements[4];
+    assert!(small < large && accurate < inaccurate, "{measurements:?}");
+    assert!(accurate > 0, "quality 100 is still lossy");
+    assert!(
+        small
+            < frame
+                .encode_image(&options(ImageFormat::WebpLossless))
+                .unwrap()
+                .len()
+    );
+}
+
+#[test]
 fn data_urls_carry_the_image_and_are_allocated_once() {
     use base64::{engine::general_purpose::STANDARD, Engine};
     let frame = random_codes(PixelFormat::Uyvy, 18, 6, 1).frame(None);
@@ -1210,6 +1336,7 @@ fn data_urls_carry_the_image_and_are_allocated_once() {
         (ImageFormat::Png, "data:image/png;base64,"),
         (ImageFormat::Jpeg(70), "data:image/jpeg;base64,"),
         (ImageFormat::WebpLossless, "data:image/webp;base64,"),
+        (ImageFormat::WebpLossy(75), "data:image/webp;base64,"),
     ] {
         let url = frame.encode_image_data_url(&options(format)).unwrap();
         assert_eq!(url.capacity(), url.len());
@@ -1290,6 +1417,7 @@ fn hdr_frames_are_refused_by_default_in_every_format() {
                 frame.encode_png(),
                 frame.encode_jpeg(85),
                 frame.encode_image(&options(ImageFormat::WebpLossless)),
+                frame.encode_image(&options(ImageFormat::WebpLossy(75))),
             ] {
                 let message = invalid_frame(shortcut);
                 assert!(
@@ -1298,7 +1426,11 @@ fn hdr_frames_are_refused_by_default_in_every_format() {
                 );
             }
             let hdr = |format| options(format).hdr(HdrPolicy::CodeValues);
-            for refused in [ImageFormat::Jpeg(85), ImageFormat::WebpLossless] {
+            for refused in [
+                ImageFormat::Jpeg(85),
+                ImageFormat::WebpLossless,
+                ImageFormat::WebpLossy(75),
+            ] {
                 let message = invalid_input(frame.encode_image(&hdr(refused)));
                 assert!(
                     message.contains(name) && message.contains("ImageFormat::Png"),
@@ -1423,6 +1555,7 @@ fn processing_instructions_do_not_change_image_color_or_hdr_policy() {
             ImageFormat::Png,
             ImageFormat::Jpeg(90),
             ImageFormat::WebpLossless,
+            ImageFormat::WebpLossy(75),
         ];
         let expected = formats.map(|format| frame.encode_image(&options(format)).unwrap());
         for metadata in [
@@ -1511,12 +1644,18 @@ fn conflicting_options_are_refused_before_anything_is_written() {
         (options(ImageFormat::Jpeg(0)), "quality"),
         (options(ImageFormat::Jpeg(101)), "quality"),
         (options(ImageFormat::Jpeg(255)), "quality"),
+        (options(ImageFormat::WebpLossy(101)), "WebP quality"),
+        (options(ImageFormat::WebpLossy(255)), "WebP quality"),
         (
             options(ImageFormat::Jpeg(85)).depth(SampleDepth::Sixteen),
             "SampleDepth::Sixteen",
         ),
         (
             options(ImageFormat::WebpLossless).depth(SampleDepth::Sixteen),
+            "SampleDepth::Sixteen",
+        ),
+        (
+            options(ImageFormat::WebpLossy(75)).depth(SampleDepth::Sixteen),
             "SampleDepth::Sixteen",
         ),
     ];
@@ -1542,8 +1681,13 @@ fn conflicting_options_are_refused_before_anything_is_written() {
         .build()
         .unwrap();
     invalid_input(hdr.encode_jpeg(0));
+    invalid_input(hdr.encode_image(&options(ImageFormat::WebpLossy(101))));
     // The PNG compression level is no error for JPEG or WebP.
-    for format in [ImageFormat::Jpeg(85), ImageFormat::WebpLossless] {
+    for format in [
+        ImageFormat::Jpeg(85),
+        ImageFormat::WebpLossless,
+        ImageFormat::WebpLossy(75),
+    ] {
         frame
             .encode_image(&options(format).png_compression(PngCompression::High))
             .unwrap();
@@ -1580,6 +1724,35 @@ fn images_larger_than_their_codec_allows_are_refused_naming_the_dimension() {
     );
     webp.encode_image(&options(ImageFormat::WebpLossless).downscale(Downscale::Half))
         .unwrap();
+    // Lossless permits 16384; VP8's 14-bit dimension stops at 16383.
+    for (width, height, dimension) in [(16_384, 1, "width"), (2, 16_384, "height")] {
+        let frame = VideoFrame::builder()
+            .resolution(width, height)
+            .build()
+            .unwrap();
+        let mut out = Recorder {
+            written: 0,
+            fail_after: None,
+        };
+        let message =
+            invalid_frame(frame.encode_image_to(&options(ImageFormat::WebpLossy(75)), &mut out));
+        assert!(
+            message.contains(&format!("WebP {dimension} 16384")),
+            "{message}"
+        );
+        assert_eq!(out.written, 0);
+        frame
+            .encode_image(&options(ImageFormat::WebpLossless))
+            .unwrap();
+        frame
+            .encode_image(&options(ImageFormat::WebpLossy(75)).downscale(Downscale::Half))
+            .unwrap();
+    }
+    let frame = VideoFrame::builder().resolution(32_766, 2).build().unwrap();
+    let image = frame
+        .encode_image(&options(ImageFormat::WebpLossy(75)).downscale(Downscale::Half))
+        .unwrap();
+    assert_eq!(decode_webp(&image).width, 16_383);
 }
 
 #[test]
@@ -1589,6 +1762,7 @@ fn a_failing_writer_is_reported_as_its_own_io_error() {
         ImageFormat::Png,
         ImageFormat::Jpeg(85),
         ImageFormat::WebpLossless,
+        ImageFormat::WebpLossy(75),
     ] {
         // In the header, and halfway through the image data.
         let len = frame.encode_image(&options(format)).unwrap().len();
@@ -1780,25 +1954,29 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                     }
                     // WebP: one buffer of exactly the image, unless the
                     // frame's RGBA is read in place.
-                    let options = options(ImageFormat::WebpLossless)
-                        .alpha(alpha)
-                        .downscale(downscale);
-                    let plan = Plan::new(&source(), &options).unwrap();
-                    let source = source();
-                    let mut pixels = plan.pixels::<u8>(&source);
-                    if pixels.rgba_rows().and_then(|plane| plane.data()).is_none() {
-                        let ((image, allocations), peak) = peak_bytes(|| {
-                            allocation_count(|| webp::image_buffer(&mut pixels, channels))
-                        });
+                    for (format, channels) in [
+                        (ImageFormat::WebpLossless, channels),
+                        (ImageFormat::WebpLossy(75), 4),
+                    ] {
+                        let options = options(format).alpha(alpha).downscale(downscale);
+                        let plan = Plan::new(&source(), &options).unwrap();
+                        let source = source();
+                        let mut pixels = plan.pixels::<u8>(&source);
+                        let ((image, allocations), peak) =
+                            peak_bytes(|| allocation_count(|| webp::image(&mut pixels, channels)));
                         let len = reduced.0 * reduced.1 * channels;
+                        let borrowed = matches!(image, std::borrow::Cow::Borrowed(_));
+                        let expected_allocation = if borrowed { 0 } else { len };
                         assert_eq!(
-                            (allocations, peak, image.len(), image.capacity()),
-                            (1, len, len, len),
+                            (allocations, peak, image.len()),
+                            (usize::from(!borrowed), expected_allocation, len),
                             "{format:?} {height} {options:?}"
                         );
-                    } else {
                         assert!(
-                            format == PixelFormat::Rgba && alpha == AlphaMode::Keep && shift == 0
+                            !borrowed
+                                || source.format == PixelFormat::Rgba
+                                    && alpha == AlphaMode::Keep
+                                    && shift == 0
                         );
                     }
                 }
@@ -1866,7 +2044,7 @@ fn image_encoding_resources() {
                 PixelFormat::Na4g,
             ] {
                 let frame = frame_from_rgba(format, width, height, &rgba);
-                let outputs: [(&str, ImageOptions); 10] = [
+                let outputs = [
                     (
                         "png-fast",
                         options(ImageFormat::Png).png_compression(PngCompression::Fast),
@@ -1888,6 +2066,7 @@ fn image_encoding_resources() {
                     ),
                     ("jpeg85", options(ImageFormat::Jpeg(85))),
                     ("webp", options(ImageFormat::WebpLossless)),
+                    ("webp-lossy75", options(ImageFormat::WebpLossy(75))),
                     (
                         "png-fast-quarter",
                         options(ImageFormat::Png)
@@ -1901,6 +2080,10 @@ fn image_encoding_resources() {
                     (
                         "webp-quarter",
                         options(ImageFormat::WebpLossless).downscale(Downscale::Quarter),
+                    ),
+                    (
+                        "webp-lossy75-quarter",
+                        options(ImageFormat::WebpLossy(75)).downscale(Downscale::Quarter),
                     ),
                 ];
                 for (name, options) in outputs {
