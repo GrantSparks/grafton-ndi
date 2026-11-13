@@ -28,8 +28,14 @@ fn video_only_modes_deliver_video_while_an_ordinary_receiver_also_gets_audio() {
             .clock_audio(false),
     )
     .unwrap();
-    let source = common::loopback_source(&ndi, &sender).unwrap();
-    let ordinary = Receiver::new(&ndi, &ReceiverOptions::new(source.clone())).unwrap();
+    // Each receiver is given an endpoint of its own: on Windows the helper
+    // names a different loopback address each time (see
+    // `common::loopback_host`).
+    let ordinary = Receiver::new(
+        &ndi,
+        &ReceiverOptions::new(common::loopback_source(&ndi, &sender).unwrap()),
+    )
+    .unwrap();
     let video = VideoFrame::builder()
         .resolution(64, 32)
         .frame_rate(FrameRate::new(30, 1).unwrap())
@@ -47,7 +53,8 @@ fn video_only_modes_deliver_video_while_an_ordinary_receiver_also_gets_audio() {
     ] {
         let receiver = Receiver::new(
             &ndi,
-            &ReceiverOptions::new(source.clone()).bandwidth(bandwidth),
+            &ReceiverOptions::new(common::loopback_source(&ndi, &sender).unwrap())
+                .bandwidth(bandwidth),
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -80,16 +87,20 @@ fn video_only_modes_deliver_video_while_an_ordinary_receiver_also_gets_audio() {
             }
             // What the video-only receiver, the ordinary one and the sender
             // report tells a receiver that never connected from one that was
-            // given no stream at this bandwidth.
+            // given no stream at this bandwidth; on Windows the TCP table of
+            // the sender's port shows whether it has a connection.
             assert!(
                 Instant::now() < deadline,
                 "{bandwidth:?}: received {videos} video frames and {ordinary_audio} ordinary \
                  audio frames; the {bandwidth:?} receiver of {:?} reports {:?}, the ordinary \
-                 one {:?}, and the sender counts {:?} connections",
+                 one {:?}, and the sender counts {:?} connections{}",
                 receiver.source(),
                 receiver.connection_stats(),
                 ordinary.connection_stats(),
-                sender.connection_count(Duration::ZERO)
+                sender.connection_count(Duration::ZERO),
+                common::port_of(receiver.source())
+                    .and_then(common::socket_table)
+                    .map_or_else(String::new, |table| format!("\n{table}"))
             );
         }
     }

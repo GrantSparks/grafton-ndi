@@ -59,13 +59,23 @@ fn unconnected_receiver(ndi: &Ndi) -> Receiver {
 /// What `receiver` says about its connection, for the message of a test that
 /// waited for media in vain: the source it was given, and its connection
 /// count and frame counters, which tell a receiver that never connected from
-/// one that connected and was given nothing.
+/// one that connected and was given nothing. On Windows the TCP table of the
+/// sender's port follows (see `common::socket_table`).
 fn link<M: ReceiverMode>(receiver: &Receiver<M>) -> String {
     format!(
-        "the receiver of {:?} reports {:?}",
+        "the receiver of {:?} reports {:?}{}",
         receiver.source(),
-        receiver.connection_stats()
+        receiver.connection_stats(),
+        tcp_table(receiver.source())
     )
+}
+
+/// The TCP table of the port `source` names, on a line of its own, or nothing
+/// where [`common::socket_table`] collects none.
+fn tcp_table(source: &Source) -> String {
+    common::port_of(source)
+        .and_then(common::socket_table)
+        .map_or_else(String::new, |table| format!("\n{table}"))
 }
 
 /// How many receivers `sender` counts, for the same messages.
@@ -2794,7 +2804,7 @@ fn genlock_follows_a_local_reference_and_returns_to_the_system_clock() {
                 sender.send_audio(&audio);
             }
         });
-        await_reference(&mut genlock, &sender);
+        await_reference(&mut genlock, &sender, &source);
         let (mut video, mut audio) = genlock.clocks();
         let deadline = Instant::now() + PATIENCE;
         loop {
@@ -2826,16 +2836,18 @@ fn genlock_follows_a_local_reference_and_returns_to_the_system_clock() {
 }
 
 /// Wait on `genlock`'s video clock until the genlock receives the reference
-/// that `sender` sends.
-fn await_reference(genlock: &mut Genlock, sender: &Sender) {
+/// that `sender` sends, which it was connected to at `source`.
+fn await_reference(genlock: &mut Genlock, sender: &Sender, source: &Source) {
     let thirty = FrameRate::new(30, 1).unwrap();
     let deadline = Instant::now() + PATIENCE;
     let mut waits = 0;
     while !genlock.is_active() {
         assert!(
             Instant::now() < deadline,
-            "genlock did not acquire the reference in {waits} waits on its video clock; {}",
-            served(sender)
+            "genlock did not acquire the reference of {source:?} in {waits} waits on its video \
+             clock; {}{}",
+            served(sender),
+            tcp_table(source)
         );
         let (mut video, _) = genlock.clocks();
         video.wait(thirty, ScanType::Progressive);
@@ -2897,7 +2909,7 @@ fn a_genlock_moves_between_threads() {
             .spawn(move || {
                 let mut genlock = genlock;
                 genlock.connect(Some(source)).unwrap();
-                await_reference(&mut genlock, sender);
+                await_reference(&mut genlock, sender, source);
                 let (mut video, mut audio) = genlock.clocks();
                 std::thread::scope(|clocks| {
                     clocks.spawn(move || {
