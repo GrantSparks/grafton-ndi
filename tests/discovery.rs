@@ -80,6 +80,8 @@ const VARIANTS: &[Variant] = &[
             "identifiers_round_trip_exactly",
             "event_batches",
             "large_event_batches",
+            "null_event_batch_with_a_count_is_refused",
+            "nested_snapshot_arrays_include_owned_storage",
             "owners_move_between_threads",
             "routing",
         ],
@@ -526,16 +528,87 @@ fn child(scenario: &str) {
             assert_eq!(events[69_998].name(), Some("tally"));
             assert!(events[69_999].name().is_none());
 
+            // Native descriptors fit, but owned event storage and strings
+            // together exceed the same budget. Both listener kinds free a
+            // rejected batch exactly once and remain usable.
+            std::env::set_var("GRAFTON_FAKE_EVENT_COUNT", "250000");
+            assert!(matches!(
+                listener.capture_events(wait),
+                Err(Error::UnexpectedSdkResult(_))
+            ));
+            let mut receivers = RecvListener::new(&ndi, &listeners).unwrap();
+            assert!(matches!(
+                receivers.capture_events(wait),
+                Err(Error::UnexpectedSdkResult(_))
+            ));
+            assert_eq!(log().matches("recv-listener-free-events\n").count(), 1);
+
             // A batch whose descriptors alone exceed 16 MiB is refused for its
             // size, and released: the listener keeps working afterwards.
-            std::env::set_var("GRAFTON_FAKE_EVENT_COUNT", "700000");
+            std::env::set_var("GRAFTON_FAKE_EVENT_COUNT", "1500000");
             let Err(Error::UnexpectedSdkResult(reason)) = listener.capture_events(wait) else {
                 panic!("a batch larger than the copy limit must be refused");
             };
             assert!(reason.contains("16 MiB"), "{reason}");
-            assert_eq!(log().matches("send-listener-free-events\n").count(), 2);
+            assert_eq!(log().matches("send-listener-free-events\n").count(), 3);
             std::env::remove_var("GRAFTON_FAKE_EVENT_COUNT");
             assert_eq!(listener.capture_events(wait).unwrap().len(), 2);
+            assert_eq!(receivers.capture_events(wait).unwrap().len(), 2);
+        }
+        "null_event_batch_with_a_count_is_refused" => {
+            let mut listener = SendListener::new(&ndi, &listeners).unwrap();
+            std::env::set_var("GRAFTON_FAKE_NULL_EVENT_BATCH", "1");
+            assert!(matches!(
+                listener.capture_events(Duration::from_millis(5)),
+                Err(Error::UnexpectedSdkResult(_))
+            ));
+            assert_eq!(log().matches("send-listener-free-events\n").count(), 0);
+            std::env::remove_var("GRAFTON_FAKE_NULL_EVENT_BATCH");
+            assert_eq!(
+                listener
+                    .capture_events(Duration::from_millis(5))
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(log().matches("send-listener-free-events\n").count(), 1);
+        }
+        "nested_snapshot_arrays_include_owned_storage" => {
+            for array in ["groups", "streams", "commands"] {
+                std::env::set_var("GRAFTON_FAKE_DISCOVERY_ARRAY", array);
+                let result = if array == "groups" {
+                    SendListener::new(&ndi, &listeners)
+                        .unwrap()
+                        .snapshot()
+                        .map(drop)
+                } else {
+                    RecvListener::new(&ndi, &listeners)
+                        .unwrap()
+                        .snapshot()
+                        .map(drop)
+                };
+                let Err(Error::UnexpectedSdkResult(reason)) = result else {
+                    panic!("the owned {array} must spend the snapshot budget");
+                };
+                assert!(reason.contains("16 MiB"), "{reason}");
+            }
+            std::env::remove_var("GRAFTON_FAKE_DISCOVERY_ARRAY");
+            assert_eq!(
+                SendListener::new(&ndi, &listeners)
+                    .unwrap()
+                    .snapshot()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(
+                RecvListener::new(&ndi, &listeners)
+                    .unwrap()
+                    .snapshot()
+                    .unwrap()
+                    .len(),
+                2
+            );
         }
         "owners_move_between_threads" => {
             let sender = Sender::new(&ndi, &SenderOptions::new("moved")).unwrap();

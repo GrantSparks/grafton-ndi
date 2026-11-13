@@ -13,6 +13,10 @@ API, see the [README](README.md) and the migration guides for
 
 ### Security
 
+- Discovery Server snapshots and event batches charge native scans, complete
+  owned collection storage, identifier copies and lossy UTF-8 expansion to
+  their shared 16 MiB budget before fallible allocation. Malformed null event
+  batches with nonzero counts are rejected.
 - Borrowed UYVY/UYVA sends pack active rows and zero trailing SDK room by default
   on targets that need it. Direct sending from caller padding and trailing
   memory requires `allow_send_from_padding_and_tail(true)`; `readable_after`

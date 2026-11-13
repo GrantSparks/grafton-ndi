@@ -16,7 +16,10 @@
 //! * `fake_discovery` — export the sender and receiver listener functions over
 //!   a fixed membership whose identifiers and text are partly not UTF-8, and
 //!   log every identifier passed back, byte for byte. An event batch holds
-//!   `GRAFTON_FAKE_EVENT_COUNT` events (two by default);
+//!   `GRAFTON_FAKE_EVENT_COUNT` events (two by default), or reports a null
+//!   pointer with a positive count with `GRAFTON_FAKE_NULL_EVENT_BATCH=1`.
+//!   `GRAFTON_FAKE_DISCOVERY_ARRAY=groups|streams|commands` supplies a nested
+//!   snapshot array whose native storage fits but whose owned copy does not;
 //! * `fake_advanced` — also export the Advanced SDK entry points;
 //! * `fake_finder` — return the bounded-resource Finder fixtures in
 //!   `fake_finder.rs`, selected by `GRAFTON_FAKE_FINDER_CASE`;
@@ -497,14 +500,14 @@ mod discovery {
 
     struct SendListener {
         senders: [NDIlib_sender_t; 2],
-        _groups: Box<[*const c_char; 3]>,
+        _groups: Box<[*const c_char]>,
         batch: Batch,
     }
 
     struct RecvListener {
         receivers: [NDIlib_receiver_t; 2],
-        _streams: Box<[NDIlib_receiver_type_e; 3]>,
-        _commands: Box<[NDIlib_receiver_command_e; 2]>,
+        _streams: Box<[NDIlib_receiver_type_e]>,
+        _commands: Box<[NDIlib_receiver_command_e]>,
         batch: Batch,
     }
 
@@ -517,6 +520,10 @@ mod discovery {
         p_num_events: *mut u32,
         timeout_in_ms: u32,
     ) -> *const NDIlib_listener_event {
+        if std::env::var_os("GRAFTON_FAKE_NULL_EVENT_BATCH").is_some() {
+            unsafe { *p_num_events = 1 };
+            return ptr::null();
+        }
         if timeout_in_ms == 0 {
             return ptr::null();
         }
@@ -558,7 +565,12 @@ mod discovery {
                 return ptr::null_mut();
             }
             log("send-listener-create");
-            let mut groups = Box::new([c"public".as_ptr(), SENDER_GROUP.as_ptr(), ptr::null()]);
+            let large = std::env::var("GRAFTON_FAKE_DISCOVERY_ARRAY").as_deref() == Ok("groups");
+            let mut groups: Box<[_]> = if large {
+                vec![c"".as_ptr(); 1_100_000].into_boxed_slice()
+            } else {
+                Box::new([c"public".as_ptr(), SENDER_GROUP.as_ptr(), ptr::null()])
+            };
             let senders = [
                 NDIlib_sender_t {
                     p_uuid: SENDER_ID.as_ptr(),
@@ -567,7 +579,7 @@ mod discovery {
                     p_address: c"192.0.2.10".as_ptr(),
                     port: 5961,
                     p_groups: groups.as_mut_ptr(),
-                    num_groups: 2,
+                    num_groups: if large { groups.len() as u32 } else { 2 },
                     events_subscribed: false,
                 },
                 NDIlib_sender_t {
@@ -632,15 +644,20 @@ mod discovery {
                 return ptr::null_mut();
             }
             log("recv-listener-create");
-            let mut streams = Box::new([
+            let large = std::env::var("GRAFTON_FAKE_DISCOVERY_ARRAY").unwrap_or_default();
+            let mut streams: Box<[_]> = if large == "streams" {
+                vec![NDIlib_receiver_type_e_NDIlib_receiver_type_video; 1_500_000].into_boxed_slice()
+            } else { Box::new([
                 NDIlib_receiver_type_e_NDIlib_receiver_type_video,
                 NDIlib_receiver_type_e_NDIlib_receiver_type_audio,
                 NDIlib_receiver_type_e_NDIlib_receiver_type_none,
-            ]);
-            let mut commands = Box::new([
+            ]) };
+            let mut commands: Box<[_]> = if large == "commands" {
+                vec![NDIlib_receiver_command_e_NDIlib_receiver_command_connect; 1_500_000].into_boxed_slice()
+            } else { Box::new([
                 NDIlib_receiver_command_e_NDIlib_receiver_command_connect,
                 NDIlib_receiver_command_e_NDIlib_receiver_command_none,
-            ]);
+            ]) };
             let receivers = [
                 NDIlib_receiver_t {
                     p_uuid: RECEIVER_ID.as_ptr(),
@@ -649,9 +666,9 @@ mod discovery {
                     p_input_name: c"Program".as_ptr(),
                     p_address: c"192.0.2.20".as_ptr(),
                     p_streams: streams.as_mut_ptr(),
-                    num_streams: 2,
+                    num_streams: if large == "streams" { streams.len() as u32 } else { 2 },
                     p_commands: commands.as_mut_ptr(),
-                    num_commands: 1,
+                    num_commands: if large == "commands" { commands.len() as u32 } else { 1 },
                     events_subscribed: false,
                 },
                 NDIlib_receiver_t {

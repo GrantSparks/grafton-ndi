@@ -101,12 +101,21 @@
 //! # Text from the network
 //!
 //! Names, metadata and event values are whatever a peer advertised. They are
-//! decoded lossily, replacing bytes that are not UTF-8 with U+FFFD, so one
-//! malformed peer cannot make a snapshot fail. Identifiers are the exception:
+//! decoded lossily, replacing bytes that are not UTF-8 with U+FFFD, within the
+//! resource limits below. Identifiers are the exception:
 //! a [`SenderId`], [`ReceiverId`] or [`InputGroupId`] keeps the server's exact
 //! bytes, so handing one back in a subscription or a connection request always
 //! names the same peer. Each kind is its own type, so a sender's identifier
 //! cannot be used where a receiver's is meant.
+//!
+//! Each snapshot or event batch has one 16 MiB budget covering native arrays
+//! and strings scanned plus owned Rust storage reserved, including UTF-8
+//! replacement bytes and identifier terminators. Array storage is reserved
+//! for every reported element, even when null fields or list terminators are
+//! omitted from the result. A single native string must be shorter than 4 MiB.
+//! Exceeding either limit returns [`Error::UnexpectedSdkResult`](crate::Error::UnexpectedSdkResult)
+//! before reserving the offending output; a rejected event batch is freed and
+//! its events are lost. Allocation failures return the same error variant.
 //!
 //! # Example
 //!

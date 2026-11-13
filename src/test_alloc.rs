@@ -45,7 +45,6 @@ unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
 /// Includes codec/output buffers, excludes previously allocated source storage
 /// and allocator overhead. `f` must not drop preexisting allocations or move
 /// measured allocations across threads.
-#[cfg(feature = "image-encoding")]
 pub(crate) fn peak_bytes<T>(f: impl FnOnce() -> T) -> (T, usize) {
     struct Reset;
     impl Drop for Reset {

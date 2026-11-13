@@ -4,6 +4,7 @@
 use super::{not_created, Handle};
 use crate::{
     frames::{bounded_sdk_text, MAX_SDK_STRING_BYTES},
+    sdk_copy::LossyText,
     sys::{self, bindings::*},
     to_ms_checked, Error, Ndi, Result,
 };
@@ -240,7 +241,7 @@ impl ListenerOptions {
 /// another is meant.
 trait Identifier: Sized {
     /// The identifier with exactly the bytes the server supplied.
-    fn from_exact(bytes: &CStr) -> Self;
+    fn from_exact(bytes: CString) -> Self;
     /// Those bytes, as the SDK takes them back.
     fn as_c_str(&self) -> &CStr;
 }
@@ -284,8 +285,8 @@ macro_rules! identifier {
         }
 
         impl Identifier for $Id {
-            fn from_exact(bytes: &CStr) -> Self {
-                Self(bytes.to_owned())
+            fn from_exact(bytes: CString) -> Self {
+                Self(bytes)
             }
             fn as_c_str(&self) -> &CStr {
                 &self.0
@@ -499,11 +500,11 @@ impl AdvertisedReceiver {
 /// The most one snapshot or event batch copies out of the SDK.
 const COPY_LIMIT: usize = 16 * 1024 * 1024;
 
-/// Bounds what one snapshot or event batch copies, as a whole rather than field
-/// by field: how much there is to copy is decided by peers on the network.
+/// Bounds native bytes scanned and owned storage reserved for one snapshot or
+/// event batch: both the descriptors and their peer-controlled contents count.
 ///
-/// The bytes are the only limit. Arrays and strings of any length are copied
-/// as long as the whole stays within it.
+/// Arrays have no separate count limit; individual strings retain the shared
+/// SDK string limit.
 struct Budget(usize);
 impl Budget {
     fn new() -> Self {
@@ -520,6 +521,38 @@ impl Budget {
     fn take(&mut self, len: usize) -> Result<()> {
         self.0 = self.0.checked_sub(len).ok_or_else(Self::exceeded)?;
         Ok(())
+    }
+    fn allocation_failed() -> Error {
+        Error::UnexpectedSdkResult("could not reserve memory for Discovery Server results".into())
+    }
+    /// Charge complete owned element storage before reserving it, including
+    /// elements whose contents may be omitted during conversion.
+    fn reserve<T>(&mut self, count: usize) -> Result<Vec<T>> {
+        let bytes = count
+            .checked_mul(size_of::<T>())
+            .filter(|bytes| *bytes <= isize::MAX as usize)
+            .ok_or_else(Self::exceeded)?;
+        self.take(bytes)?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(count)
+            .map_err(|_| Self::allocation_failed())?;
+        Ok(values)
+    }
+    /// Copy a bounded array without geometric vector growth or uncharged
+    /// allocation. Nested arrays and text spend this same budget.
+    fn collect<S, T>(
+        &mut self,
+        source: &[S],
+        mut copy: impl FnMut(&S, &mut Self) -> Result<Option<T>>,
+    ) -> Result<Vec<T>> {
+        let mut values = self.reserve(source.len())?;
+        for value in source {
+            if let Some(value) = copy(value, self)? {
+                values.push(value);
+            }
+        }
+        Ok(values)
     }
     /// Borrow a string the SDK supplied, or `None` for a null pointer.
     ///
@@ -546,9 +579,13 @@ impl Budget {
             });
         };
         self.take(bytes.len() + 1)?;
-        // SAFETY: the terminator was found, and the caller keeps the string
-        // readable for `'a`.
-        Ok(Some(unsafe { CStr::from_ptr(value) }))
+        // SAFETY: the scan found the first NUL, and the caller keeps that
+        // complete prefix readable for `'a`. Reuse its length rather than
+        // scanning the string again.
+        let terminated = unsafe { std::slice::from_raw_parts(value.cast(), bytes.len() + 1) };
+        Ok(Some(unsafe {
+            CStr::from_bytes_with_nul_unchecked(terminated)
+        }))
     }
     /// Copy text for display. Bytes that are not UTF-8 become U+FFFD, so
     /// nothing a peer advertises can make a snapshot or event undecodable.
@@ -559,7 +596,12 @@ impl Budget {
     unsafe fn text(&mut self, value: *const c_char) -> Result<Option<String>> {
         // SAFETY: forwarded to the caller's obligations.
         let text = unsafe { self.c_str(value)? };
-        Ok(text.map(|text| text.to_string_lossy().into_owned()))
+        text.map(|text| {
+            let text = LossyText::new(text.to_bytes());
+            self.take(text.len())?;
+            text.copy().map_err(|_| Self::allocation_failed())
+        })
+        .transpose()
     }
     /// Copy an identifier byte for byte, so it can be passed back unchanged.
     ///
@@ -569,7 +611,16 @@ impl Budget {
     unsafe fn id<I: Identifier>(&mut self, value: *const c_char) -> Result<Option<I>> {
         // SAFETY: forwarded to the caller's obligations.
         let id = unsafe { self.c_str(value)? };
-        Ok(id.map(I::from_exact))
+        id.map(|id| {
+            let mut bytes = self.reserve(id.to_bytes_with_nul().len())?;
+            bytes.extend_from_slice(id.to_bytes_with_nul());
+            // SAFETY: these are the exact bytes of a validated C string,
+            // including its sole trailing NUL.
+            Ok(I::from_exact(unsafe {
+                CString::from_vec_with_nul_unchecked(bytes)
+            }))
+        })
+        .transpose()
     }
     /// Borrow an array the SDK supplied.
     ///
@@ -772,30 +823,31 @@ impl<A: ListenerApi> Listener<A> {
         let mut count = 0;
         // SAFETY: the listener instance is live for this borrow.
         let events = unsafe { self.api.events(self.instance, &mut count, timeout) };
+        let mut budget = Budget::new();
         if events.is_null() {
-            // No event arrived within the wait.
+            // No event arrived only if the count agrees. A null batch with
+            // a positive count is malformed, as a membership snapshot is.
+            // SAFETY: null is permitted and checked without dereferencing.
+            unsafe { budget.slice(events, count)? };
             return Ok(Vec::new());
         }
         let batch = Batch {
             listener: self,
             events,
         };
-        let mut budget = Budget::new();
         // SAFETY: the batch stays allocated until `batch` is dropped below.
         let raw = unsafe { budget.slice(batch.events, count)? };
-        raw.iter()
-            .map(|event| {
-                // SAFETY: the strings belong to the batch, which is still
-                // allocated.
-                unsafe {
-                    Ok(ListenerEvent {
-                        id: budget.id(event.p_uuid)?,
-                        name: budget.text(event.p_name)?,
-                        value: budget.text(event.p_value)?,
-                    })
-                }
-            })
-            .collect()
+        budget.collect(raw, |event, budget| {
+            // SAFETY: the strings belong to the batch, which is still
+            // allocated.
+            unsafe {
+                Ok(Some(ListenerEvent {
+                    id: budget.id(event.p_uuid)?,
+                    name: budget.text(event.p_name)?,
+                    value: budget.text(event.p_value)?,
+                }))
+            }
+        })
     }
 }
 
@@ -976,33 +1028,28 @@ impl SendListener {
     ///
     /// Returns [`Error::UnexpectedSdkResult`] when the SDK's snapshot is malformed,
     /// when copying it would take more than 16 MiB, or when one of its strings
-    /// is 4 MiB or longer. Text that is not valid UTF-8 is decoded lossily and
-    /// never fails the snapshot.
+    /// is 4 MiB or longer. Text that is not valid UTF-8 is decoded lossily
+    /// within the same budget; see the [module documentation](super).
     pub fn snapshot(&mut self) -> Result<Vec<AdvertisedSender>> {
         let mut budget = Budget::new();
         let raw = self.inner.entries(&mut budget)?;
-        raw.iter()
-            .map(|sender| {
-                // SAFETY: the snapshot and everything it points to stay valid
-                // until the next call on this listener, after this copy.
-                unsafe {
-                    let groups = budget
-                        .slice(sender.p_groups.cast_const(), sender.num_groups)?
-                        .iter()
-                        .filter_map(|group| budget.text(*group).transpose())
-                        .collect::<Result<_>>()?;
-                    Ok(AdvertisedSender {
-                        id: budget.id(sender.p_uuid)?,
-                        name: budget.text(sender.p_name)?,
-                        metadata: budget.text(sender.p_metadata)?,
-                        address: budget.text(sender.p_address)?,
-                        port: u16::try_from(sender.port).ok(),
-                        groups,
-                        subscribed: sender.events_subscribed,
-                    })
-                }
-            })
-            .collect()
+        budget.collect(raw, |sender, budget| {
+            // SAFETY: the snapshot and everything it points to stay valid
+            // until the next call on this listener, after this copy.
+            unsafe {
+                let groups = budget.slice(sender.p_groups.cast_const(), sender.num_groups)?;
+                let groups = budget.collect(groups, |group, budget| budget.text(*group))?;
+                Ok(Some(AdvertisedSender {
+                    id: budget.id(sender.p_uuid)?,
+                    name: budget.text(sender.p_name)?,
+                    metadata: budget.text(sender.p_metadata)?,
+                    address: budget.text(sender.p_address)?,
+                    port: u16::try_from(sender.port).ok(),
+                    groups,
+                    subscribed: sender.events_subscribed,
+                }))
+            }
+        })
     }
 }
 impl RecvListener {
@@ -1036,41 +1083,36 @@ impl RecvListener {
     ///
     /// Returns [`Error::UnexpectedSdkResult`] when the SDK's snapshot is malformed,
     /// when copying it would take more than 16 MiB, or when one of its strings
-    /// is 4 MiB or longer. Text that is not valid UTF-8 is decoded lossily and
-    /// never fails the snapshot.
+    /// is 4 MiB or longer. Text that is not valid UTF-8 is decoded lossily
+    /// within the same budget; see the [module documentation](super).
     pub fn snapshot(&mut self) -> Result<Vec<AdvertisedReceiver>> {
         let mut budget = Budget::new();
         let raw = self.inner.entries(&mut budget)?;
-        raw.iter()
-            .map(|receiver| {
-                // SAFETY: the snapshot and everything it points to stay valid
-                // until the next call on this listener, after this copy.
-                unsafe {
-                    let streams = budget
-                        .slice(receiver.p_streams.cast_const(), receiver.num_streams)?
-                        .iter()
-                        .copied()
-                        .filter_map(ReceiverStream::from_sdk)
-                        .collect();
-                    let commands = budget
-                        .slice(receiver.p_commands.cast_const(), receiver.num_commands)?
-                        .iter()
-                        .copied()
-                        .filter_map(ReceiverCommand::from_sdk)
-                        .collect();
-                    Ok(AdvertisedReceiver {
-                        id: budget.id(receiver.p_uuid)?,
-                        name: budget.text(receiver.p_name)?,
-                        input_id: budget.id(receiver.p_input_uuid)?,
-                        input_name: budget.text(receiver.p_input_name)?,
-                        address: budget.text(receiver.p_address)?,
-                        streams,
-                        commands,
-                        subscribed: receiver.events_subscribed,
-                    })
-                }
-            })
-            .collect()
+        budget.collect(raw, |receiver, budget| {
+            // SAFETY: the snapshot and everything it points to stay valid
+            // until the next call on this listener, after this copy.
+            unsafe {
+                let streams =
+                    budget.slice(receiver.p_streams.cast_const(), receiver.num_streams)?;
+                let streams =
+                    budget.collect(streams, |stream, _| Ok(ReceiverStream::from_sdk(*stream)))?;
+                let commands =
+                    budget.slice(receiver.p_commands.cast_const(), receiver.num_commands)?;
+                let commands = budget.collect(commands, |command, _| {
+                    Ok(ReceiverCommand::from_sdk(*command))
+                })?;
+                Ok(Some(AdvertisedReceiver {
+                    id: budget.id(receiver.p_uuid)?,
+                    name: budget.text(receiver.p_name)?,
+                    input_id: budget.id(receiver.p_input_uuid)?,
+                    input_name: budget.text(receiver.p_input_name)?,
+                    address: budget.text(receiver.p_address)?,
+                    streams,
+                    commands,
+                    subscribed: receiver.events_subscribed,
+                }))
+            }
+        })
     }
     /// Ask the receiver `id` names to connect to the NDI source called
     /// `source`.
@@ -1198,7 +1240,8 @@ mod tests {
     }
     #[test]
     fn copies_are_charged_to_one_budget() {
-        let mut budget = Budget(8);
+        // Each copy scans four bytes and reserves three output bytes.
+        let mut budget = Budget(14);
         // SAFETY: the pointer is a live NUL-terminated string.
         unsafe {
             assert_eq!(
@@ -1209,11 +1252,113 @@ mod tests {
                 budget.text(c"abc".as_ptr()).unwrap().as_deref(),
                 Some("abc")
             );
+            assert_eq!(budget.0, 0);
             assert!(matches!(
                 budget.text(c"a".as_ptr()),
                 Err(Error::UnexpectedSdkResult(_))
             ));
         }
+    }
+    #[test]
+    fn lossy_expansion_is_charged_before_copying() {
+        // One invalid byte becomes three UTF-8 bytes. The scan (including
+        // its NUL) and the owned text therefore need five bytes together.
+        let mut budget = Budget(5);
+        // SAFETY: the pointer is a live NUL-terminated string.
+        let text = unsafe { budget.text(c"\xff".as_ptr()) }.unwrap().unwrap();
+        assert_eq!(text, "\u{fffd}");
+        assert_eq!(budget.0, 0);
+
+        // SAFETY: as above. Refuse the copy before allocating its output.
+        let (result, allocations) =
+            crate::test_alloc::allocation_count(|| unsafe { Budget(4).text(c"\xff".as_ptr()) });
+        assert!(matches!(result, Err(Error::UnexpectedSdkResult(_))));
+        assert_eq!(allocations, 1, "only the error message is allocated");
+    }
+    #[test]
+    fn identifiers_charge_the_exact_owned_bytes_including_the_nul() {
+        for id in [c"", c"sender-\xff"] {
+            let bytes = id.to_bytes_with_nul().len();
+            let mut budget = Budget(2 * bytes);
+            // SAFETY: `id` stays live and NUL-terminated through the copy.
+            let (copy, allocations) = crate::test_alloc::allocation_count(|| unsafe {
+                budget.id::<SenderId>(id.as_ptr()).unwrap().unwrap()
+            });
+            assert_eq!(copy.as_bytes(), id.to_bytes());
+            assert_eq!(budget.0, 0);
+            assert_eq!(allocations, 1);
+
+            // SAFETY: as above. Only the error may allocate on rejection.
+            let (result, allocations) = crate::test_alloc::allocation_count(|| unsafe {
+                Budget(2 * bytes - 1).id::<SenderId>(id.as_ptr())
+            });
+            assert!(matches!(result, Err(Error::UnexpectedSdkResult(_))));
+            assert_eq!(allocations, 1);
+        }
+    }
+    #[test]
+    fn collections_charge_owned_storage_before_converting_elements() {
+        let source = [1u8, 2, 3];
+        let bytes = size_of_val(&source) + source.len() * size_of::<u64>();
+        let mut budget = Budget(bytes);
+        let (copy, allocations) = crate::test_alloc::allocation_count(|| {
+            // SAFETY: the array and count describe initialized live storage.
+            let raw = unsafe { budget.slice(source.as_ptr(), source.len() as u32) }.unwrap();
+            budget
+                .collect(raw, |value, _| Ok(Some(u64::from(*value))))
+                .unwrap()
+        });
+        assert_eq!(copy, [1, 2, 3]);
+        assert_eq!(copy.capacity(), source.len());
+        assert_eq!(budget.0, 0);
+        assert_eq!(allocations, 1);
+
+        let (result, allocations) = crate::test_alloc::allocation_count(|| {
+            let mut budget = Budget(bytes - 1);
+            // SAFETY: as above.
+            let raw = unsafe { budget.slice(source.as_ptr(), source.len() as u32) }.unwrap();
+            budget.collect::<_, u64>(raw, |_, _| panic!("must reject before conversion"))
+        });
+        assert!(matches!(result, Err(Error::UnexpectedSdkResult(_))));
+        assert_eq!(allocations, 1);
+        assert!(Budget::new().reserve::<u64>(usize::MAX).is_err());
+    }
+    #[test]
+    fn nested_collections_and_text_share_the_outer_budget() {
+        let pointers = [c"\xff".as_ptr(), ptr::null(), c"".as_ptr()];
+        let bytes = size_of_val(&pointers) + pointers.len() * size_of::<String>() + 5 + 1;
+        for limit in [bytes, bytes - 1] {
+            let mut budget = Budget(limit);
+            // SAFETY: the pointer array and all non-null strings stay live.
+            let result = unsafe {
+                let raw = budget
+                    .slice(pointers.as_ptr(), pointers.len() as u32)
+                    .unwrap();
+                budget.collect(raw, |pointer, budget| budget.text(*pointer))
+            };
+            if limit == bytes {
+                assert_eq!(result.unwrap(), ["\u{fffd}", ""]);
+                assert_eq!(budget.0, 0);
+            } else {
+                assert!(matches!(result, Err(Error::UnexpectedSdkResult(_))));
+            }
+        }
+    }
+    #[test]
+    fn expanded_text_cannot_allocate_past_the_snapshot_limit() {
+        let text = CString::new(vec![0xff; 2048]).unwrap();
+        // These strings occupy 8 MiB natively but expand to 24 MiB of UTF-8.
+        let pointers = [text.as_ptr(); 4096];
+        let (result, peak) = crate::test_alloc::peak_bytes(|| {
+            let mut budget = Budget::new();
+            // SAFETY: the array and all strings stay live through the copy.
+            unsafe {
+                let raw = budget.slice(pointers.as_ptr(), pointers.len() as u32)?;
+                budget.collect(raw, |pointer, budget| budget.text(*pointer))
+            }
+        });
+        assert!(matches!(result, Err(Error::UnexpectedSdkResult(_))));
+        assert!(peak <= COPY_LIMIT, "allocated {peak} bytes");
     }
     #[test]
     fn a_string_is_bounded_by_the_string_limit_and_the_budget() {

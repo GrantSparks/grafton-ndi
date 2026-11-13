@@ -4,6 +4,7 @@ use std::{ffi::c_char, mem::size_of};
 
 use crate::{
     frames::{bounded_sdk_text, MAX_SDK_STRING_BYTES},
+    sdk_copy::LossyText,
     Error, Result,
 };
 
@@ -72,28 +73,10 @@ impl SnapshotBudget {
             };
         };
         self.take(bytes.len() + 1)?;
-        // Determine the exact lossy UTF-8 size without allocating. Every
-        // invalid chunk becomes one three-byte replacement character.
-        let output_len = bytes
-            .utf8_chunks()
-            .map(|chunk| chunk.valid().len() + usize::from(!chunk.invalid().is_empty()) * 3)
-            .sum();
-        self.take(output_len)?;
-        Ok(Some(copy_lossy(bytes, output_len)?))
+        let text = LossyText::new(bytes);
+        self.take(text.len())?;
+        Ok(Some(text.copy().map_err(|_| allocation_failed())?))
     }
-}
-
-fn copy_lossy(bytes: &[u8], output_len: usize) -> Result<String> {
-    let mut text = String::new();
-    text.try_reserve_exact(output_len)
-        .map_err(|_| allocation_failed())?;
-    for chunk in bytes.utf8_chunks() {
-        text.push_str(chunk.valid());
-        if !chunk.invalid().is_empty() {
-            text.push('\u{fffd}');
-        }
-    }
-    Ok(text)
 }
 
 /// Deep-copy one SDK snapshot. Used under the Finder snapshot lock; kept
