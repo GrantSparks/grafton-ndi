@@ -124,8 +124,8 @@ const QUOTED_LIMIT: usize = 40;
 /// Returns `Ok(None)` when there is no metadata or no element, and the color
 /// description when every element in the text gives the same one. The
 /// element may stand anywhere in the text, alone or inside an
-/// `ndi_metadata_group`; comments and CDATA sections are skipped, and an
-/// unterminated one runs to the end of the text, as in XML.
+/// `ndi_metadata_group`; comments, CDATA sections and processing instructions
+/// are skipped, and an unterminated one runs to the end of the text, as in XML.
 ///
 /// # Errors
 ///
@@ -150,6 +150,11 @@ pub(crate) fn parse(metadata: Option<&str>) -> Result<Option<ColorInfo>> {
             } else if let Some(body) = tag.strip_prefix(b"<![CDATA[") {
                 match find(body, b"]]>") {
                     Some(end) => 9 + end + 3,
+                    None => break,
+                }
+            } else if let Some(body) = tag.strip_prefix(b"<?") {
+                match find(body, b"?>") {
+                    Some(end) => 2 + end + 2,
                     None => break,
                 }
             } else if let Some(attributes) = start_tag(tag) {
@@ -373,6 +378,25 @@ mod tests {
     }
 
     #[test]
+    fn processing_instruction_text_does_not_describe_the_frame() {
+        for text in [
+            "<?camera <ndi_color_info transfer='bt_2100_pq'/> ?>",
+            "<?camera <ndi_color_info matrix='unknown'/> ?>",
+            "<?camera <ndi_color_info transfer='bt_2100_pq'/>",
+        ] {
+            assert_eq!(read(text).unwrap(), None, "{text:?}");
+        }
+        let sdr = "<ndi_color_info transfer='bt_709'/>";
+        let instruction = "<?camera <ndi_color_info transfer='bt_2100_pq'/> ?>";
+        for text in [format!("{instruction}{sdr}"), format!("{sdr}{instruction}")] {
+            assert_eq!(read(&text).unwrap(), read(sdr).unwrap(), "{text:?}");
+        }
+        // XML ends an instruction at its first ?>, even inside quotes.
+        let text = format!("<?camera value='?>{sdr}");
+        assert_eq!(read(&text).unwrap(), read(sdr).unwrap());
+    }
+
+    #[test]
     fn the_sdk_example_reads_in_any_attribute_order_and_quote_style() {
         // As the 6.4 SDK's HDR sender example writes it.
         let sdk = "<ndi_color_info \t transfer=\"bt_2100_hlg\" \t matrix=\"bt_2100\" \t primaries=\"bt_2100\" /> ";
@@ -522,8 +546,10 @@ mod tests {
                 "{filler:?}"
             );
         }
-        let unterminated = format!("<!--{}", "<ndi_color_info/>".repeat(limit / 20));
-        assert_eq!(read(&unterminated).unwrap(), None);
+        for prefix in ["<!--", "<![CDATA[", "<?camera "] {
+            let unterminated = format!("{prefix}{}", "<ndi_color_info/>".repeat(limit / 20));
+            assert_eq!(read(&unterminated).unwrap(), None);
+        }
     }
 
     #[test]
@@ -532,8 +558,9 @@ mod tests {
             "<ndi_color_info transfer=\"bt_2100_hlg\" matrix=\"bt_2100\" primaries=\"bt_2100\"/>",
             "<ndi_metadata_group><!-- c --><ndi_color_info primaries='bt_709'></ndi_color_info><![CDATA[x]]></ndi_metadata_group>",
             "<ndi_color_info matrix=\"bt_601\" />é<ndi_color_info matrix=\"bt_601\"/>",
+            "<?camera <ndi_color_info matrix='unknown'/> ?>é<ndi_color_info matrix='bt_601'/>",
         ];
-        let alphabet = "<>/=\"' \t!-[]CDATAndi_color_infobt_2100_pqé";
+        let alphabet = "<>?/=\"' \t!-[]CDATAndi_color_infobt_2100_pqé";
         let alphabet: Vec<char> = alphabet.chars().collect();
         let mut seed = 0x2545_F491_4F6C_DD1Du64;
         let mut next = move || {

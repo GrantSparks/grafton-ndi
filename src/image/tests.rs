@@ -1412,6 +1412,33 @@ fn cicp_tags_bt2020_and_hdr_pngs_before_their_image_data() {
 }
 
 #[test]
+fn processing_instructions_do_not_change_image_color_or_hdr_policy() {
+    for format in [PixelFormat::Uyvy, PixelFormat::Rgba] {
+        let mut frame = VideoFrame::builder()
+            .resolution(2, 2)
+            .pixel_format(format)
+            .build()
+            .unwrap();
+        let formats = [
+            ImageFormat::Png,
+            ImageFormat::Jpeg(90),
+            ImageFormat::WebpLossless,
+        ];
+        let expected = formats.map(|format| frame.encode_image(&options(format)).unwrap());
+        for metadata in [
+            "<ndi_metadata_group><?camera <ndi_color_info transfer='bt_2100_pq'/> ?></ndi_metadata_group>",
+            "<ndi_metadata_group><?camera <ndi_color_info matrix='unknown'/> ?></ndi_metadata_group>",
+        ] {
+            frame.set_metadata(metadata).unwrap();
+            for (format, expected) in formats.into_iter().zip(&expected) {
+                assert_eq!(frame.encode_image(&options(format)).unwrap(), *expected);
+            }
+            assert_eq!(frame.color_info().unwrap(), None);
+        }
+    }
+}
+
+#[test]
 fn unreadable_color_metadata_is_refused_unless_the_caller_overrides() {
     for format in [PixelFormat::Uyvy, PixelFormat::Rgba] {
         let frame = VideoFrame::builder()

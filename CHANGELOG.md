@@ -32,6 +32,11 @@ API, see the [README](README.md) and the migration guides for
   malformed input, and file examples report unsuccessful playback or recording
   as failures.
 
+### Fixed
+
+- Color metadata ignores XML processing instructions, so text inside them
+  cannot trigger false HDR detection or image-encoding errors.
+
 ## [3.0.0] - 2026-11-13
 
 Version 3.0.0 loads the NDI library when the program selects a runtime instead

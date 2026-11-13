@@ -124,8 +124,8 @@ match frame.color_info()? {
 }
 ```
 
-- The element may stand alone or inside `ndi_metadata_group`. Comments and
-  CDATA sections are skipped.
+- The element may stand alone or inside `ndi_metadata_group`. Comments,
+  CDATA sections and processing instructions are skipped.
 - `primaries`, `transfer` and `matrix` may come in any order, quoted with `"`
   or `'`, and each may be missing: a missing `matrix` means BT.709, a missing
   `transfer` SDR, and missing `primaries` unknown.
