@@ -112,6 +112,10 @@ pub(super) enum Closing {
     /// `After` with the delay in the test's hands, so that it can look at the
     /// stopping session first however slowly its threads run.
     WhenTold,
+    /// After the stop returns, to the first capture that waits for an event:
+    /// a wait that is already spent, and so takes only the events already
+    /// queued, never sees it.
+    WhenWaitedFor,
     /// Before the stop returns, which takes this long, as the 6.4 SDK's stop
     /// does while it finalizes a file.
     DuringSlowStop(std::time::Duration),
@@ -171,6 +175,8 @@ pub(super) struct Recorder {
     /// Whether the file-closed event had been captured when the recorder was destroyed.
     pub(super) closed_before_destroy: std::sync::atomic::AtomicBool,
     close_captured: std::sync::atomic::AtomicBool,
+    /// A stop under [`Closing::WhenWaitedFor`] has yet to report its close.
+    close_owed_to_a_wait: std::sync::atomic::AtomicBool,
 }
 
 /// The path every [`Recorder`] session opens first.
@@ -207,6 +213,7 @@ impl Recorder {
             destroys: Default::default(),
             closed_before_destroy: Default::default(),
             close_captured: Default::default(),
+            close_owed_to_a_wait: Default::default(),
         })
     }
 
@@ -338,6 +345,9 @@ unsafe extern "C" fn recorder_capture(
     use std::sync::atomic::Ordering;
     // SAFETY: the wrapper passes a live handle.
     let recorder = unsafe { Recorder::from_handle(handle) };
+    if wait_ms != 0 && recorder.close_owed_to_a_wait.swap(false, Ordering::AcqRel) {
+        recorder.close();
+    }
     let mut events = recorder.events.lock().unwrap();
     if events.is_empty() && wait_ms != 0 {
         let wait = std::time::Duration::from_millis(wait_ms.into());
@@ -373,6 +383,7 @@ unsafe extern "C" fn recorder_stop(handle: NDIlib_file_recorder_instance_t) {
         Closing::AtStop => recorder.close(),
         Closing::After(delay) => recorder.close_after(delay),
         Closing::WhenTold => {}
+        Closing::WhenWaitedFor => recorder.close_owed_to_a_wait.store(true, Ordering::Release),
         Closing::DuringSlowStop(delay) => {
             std::thread::sleep(delay);
             recorder.close();

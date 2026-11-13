@@ -2153,23 +2153,31 @@ mod tests {
 
     #[test]
     fn an_async_finish_measures_its_wait_from_the_call() {
-        // The command waits behind another for longer than its whole wait,
-        // so once it runs only the events already queued are taken, and the
-        // close comes after them.
-        let (device, recorder) = mock_recorder(Closing::After(Duration::from_millis(50)));
+        // The command waits behind another until its whole wait has passed,
+        // so once it runs only the events already queued are taken. The close
+        // is reported only to a capture that waits for it: a wait measured
+        // from when the command ran would take it and end Closed.
+        let (device, recorder) = mock_recorder(Closing::WhenWaitedFor);
         let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
         let blocker = recorder.worker.call(move |_| {
             entered_tx.send(()).unwrap();
-            thread::sleep(Duration::from_millis(400));
+            release_rx.recv().unwrap();
             Ok(())
         });
         entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        let finishing = recorder.finish(Duration::from_millis(200));
+        let wait = Duration::from_millis(200);
+        let finishing = recorder.finish(wait);
+        // At least the whole wait has passed since the call once this returns.
+        thread::sleep(wait);
+        release_tx.send(()).unwrap();
         block_on(blocker).unwrap();
         let outcome = block_on(finishing).unwrap();
         assert!(matches!(outcome, FinishStatus::TimedOut(_)), "{outcome:?}");
         assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        // The close was there for a wait to take: the drop wait takes it.
         block_on(recorder.close()).unwrap();
+        assert!(device.closed_before_destroy.load(Ordering::Acquire));
     }
 
     #[test]
