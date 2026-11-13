@@ -401,7 +401,21 @@ fn the_sdk_converts_with_bt709_at_every_size_whatever_the_tag_says() {
                 sent.color_info().unwrap(),
                 "{case}"
             );
-            assert_eq!(rgbx.pixel_format(), PixelFormat::Rgbx, "{case}");
+            // RgbxRgba gives RGBX for a source without alpha on every runtime
+            // measured except the Windows Standard 6.3.2 one, which gave RGBA,
+            // opaque (run 43366775596). Either carries the SDK's RGB.
+            match rgbx.pixel_format() {
+                PixelFormat::Rgbx => {}
+                PixelFormat::Rgba => assert!(
+                    rgbx.data()
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|pixel| pixel[3] == 255),
+                    "{case}: the SDK's RGBA frame of a source without alpha is not opaque"
+                ),
+                other => panic!("{case}: RgbxRgba gave {other:?}"),
+            }
             // The SDK used BT.709 limited range: the encoder, told to do the
             // same, stays within the measured gap between exact BT.709 and the
             // SDK's fixed-point approximation of it.
