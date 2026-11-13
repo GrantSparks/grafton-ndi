@@ -122,7 +122,12 @@ Each row:
      time: iOS and its x86_64 simulator, tvOS, visionOS, and the x86_64 tvOS
      simulator, which needs a pinned nightly toolchain and `-Zbuild-std`;
    - **compatibility runs**: on the rows that have them, the four crossed runs
-     described above.
+     described above;
+6. on Windows, while the receiver stall is open, runs `tests/peer_recreation.rs`
+   twice more in one step, under the loopback-only runner and then with the
+   firewall off and without it (see
+   [Receivers that never connect on Windows](#receivers-that-never-connect-on-windows)).
+   It runs whatever the steps before it did.
 
 The job uses no dependency cache and uploads nothing, so SDK files and the
 Advanced bindings generated into the target directory never leave the runner.
@@ -418,55 +423,72 @@ sender counted two, its ordinary receiver and one more. In
 43342188690 the genlock's receiver connected and received, and the genlock
 never acquired the reference: a third failure, not one of a connection.
 
-`tests/common` therefore gives every receiver on Windows a loopback address no
-receiver of its process was given before: `loopback_endpoint` names
-127.0.0.2, 127.0.0.3 and so on with the port the SDK advertises (see
-`loopback_host`). Every address in 127.0.0.0/8 reaches a sender's listener on
-`0.0.0.0`, so a receiver never connects to a destination that a torn-down
-connection used, whatever the SDK or the operating system keeps for one.
-Linux and macOS keep 127.0.0.1: neither has shown the failure, and macOS has
-no other loopback address. The helper first checks that 127.0.0.2 reaches a
-listener on `0.0.0.0`, and otherwise keeps 127.0.0.1 and says why on standard
-error. Tests that open several receivers resolve the endpoint once for each.
+Run 43352460772 gave every receiver on Windows a loopback address no receiver
+of its process had been given, 127.0.0.2 and on, so that none connected to a
+destination a torn-down connection had used. It changed nothing: 13 of the 115
+receivers that `tests/advanced_runtime.rs` opened to an address on the three
+Windows Advanced rows never connected, against 15 of 70 before, and two more
+connected and were given nothing (the H.264 test on 6.3.2, and on 6.4 the
+genlock test's reference, whose sender counted the connection). The receivers
+that never connected and those that did had opened alike, about 4 ms after
+their sender started and 65 ms after the previous test's receiver closed, so
+the teardown that the table above points to does not tell them apart either.
+The SDK log names `127.0.0.1:<port>` as the address of every connection,
+whatever address the receiver was given; on Linux the runtime dials the
+address it is given (a receiver given a wrong name and the right address
+connects, one given the right name and a wrong port does not), and its log
+line names `127.0.0.1` there too. `tests/common` gives every receiver
+`127.0.0.1:<port>` again.
 
-`tests/peer_recreation.rs` asserts that receivers connect to senders and as
-receivers that are recreated in quick succession, and prints a line for each
-receiver: the sender's port and the one before, the address, when the receiver
-first counted a connection and when it was given a frame, and both ends'
-connection counts. On Windows each arm also runs as an unasserted control whose
-receivers are given `127.0.0.1:<port>`. Read with this table, its report
-separates the explanations:
+What every receiver of the suites does follow, by a millisecond or two, is
+the destruction of the finder that `common::loopback_endpoint` creates to find
+its sender's port. `tests/peer_recreation.rs` tests that and the remaining
+explanations against each other in one run. Each cycle creates a sender, looks
+it up in one of four ways, opens a receiver to `127.0.0.1:<port>`, sends video
+until the receiver is given a frame and drops both; the arms take turns, 25
+cycles each:
 
-| The report shows | A listener that outlives its sender | State per destination, left by a connection's teardown | State per process, left by a receiver's teardown |
-| --- | --- | --- | --- |
-| control `sender` arm, gaps of 0 and 50 ms | failures | failures | failures |
-| helper `sender` arm, gaps of 0 and 50 ms | failures | none | failures |
-| `settled` arms, receiver dropped 500 ms before its sender | failures | none | none |
-| control `receiver` arm | none | failures | failures |
-| helper `receiver` arm | none | none | failures |
+- `dropped`: as the suites, the finder is dropped and the receiver created at
+  once;
+- `rested`: the receiver is created 250 ms after the finder was dropped;
+- `held`: the finder lives until the cycle ends;
+- `unfound`, on Windows only: no finder; the port is the one the process
+  listens on besides 5960, from `netstat`.
 
-The gaps of 250 ms and 1 s show how long whatever the failure needs lasts. The
-port probe, which runs first, says whether the first explanation is possible
-at all: it needs the SDK's listener to share a port with another socket, which
-the probe shows as a sender given the port it holds, and a port that cannot be
-bound as soon as its sender is dropped is a socket that outlived it. A
-receiver that has not connected after 2 s is diagnosed with the Windows TCP
-table of its port (`common::socket_table`, also added to the failure messages
-of `tests/advanced_runtime.rs` and `tests/receiver_video_only.rs`): two
-`LISTENING` rows for `0.0.0.0:<port>` owned by the test, told apart by their
-`CreationTime`, are a listener that outlived its sender; a row from the
-receiver to the port that is `ESTABLISHED` while the sender counts no
-connection is a connection nobody services; `SYN_SENT` is a connection
-attempt nobody answers; and no row at all is a receiver that has not tried,
-which is state in the SDK rather than in TCP. A second receiver is then opened
-to the same address, which shows whether the sender takes connections at that
-moment.
+The test asserts that every receiver is given a frame within 2 s, and prints a
+summary line per arm and a line for each receiver that was not. On Windows the
+job's last step, **Peer recreation, confined and with the firewall off**, runs
+it twice in a row, under the loopback-only runner and then with the firewall
+off and without the runner, whatever the steps before it did. The reports
+separate the explanations:
+
+| The report shows | Explanation |
+| --- | --- |
+| `dropped` fails, `held` and `unfound` do not | a finder's destruction stops a receiver created just after it from connecting; `rested` shows whether that lasts 250 ms |
+| every arm fails alike, also with the firewall off | the Windows runtime's receiver, whatever the test does before it |
+| failures in the confined run only | the confinement (`ci/offline/windows.ps1`) |
+
+For each arm's first three receivers that miss 2 s, the TCP table of the port
+is taken (`common::socket_table`, also in the failure messages of
+`tests/advanced_runtime.rs` and `tests/receiver_video_only.rs`), and a second
+receiver is opened to the same address: one that connects shows that the
+sender takes connections and the state is the first receiver's own. In the
+table, two `LISTENING` rows for `0.0.0.0:<port>` owned by the test, told apart
+by their `CreationTime`, are a listener that outlived its sender; a row from
+the receiver to the port that is `ESTABLISHED` while the sender counts no
+connection is a connection nobody services; `SYN_SENT` is a connection attempt
+nobody answers; and no row at all, as in every failure so far, is a receiver
+that has not tried. The first such receiver of each arm is then left alone
+until 15 s have passed, which shows whether it connects by itself, and after
+that, and for every other one at once, `Receiver::reconnect` is called, which
+shows whether asking again revives it: that is the workaround the known issue
+would give.
 
 On Linux the same run works locally:
 
 ```sh
 export NDI_RUNTIME_DIR_V6="$HOME/ndi/standard-6.4/NDI SDK for Linux/lib/x86_64-linux-gnu"
-GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --config ci/offline.toml --all-features
+GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --config ci/offline.toml --all-features --test peer_recreation
 ```
 
 ## Releasing

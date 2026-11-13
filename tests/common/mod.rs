@@ -23,18 +23,16 @@ pub use test_support::{
 /// name without an address, and the first media port is not always 5961 (e.g.
 /// a previous test's sockets may still occupy it). Query the local discovery
 /// service explicitly, then retain its port while routing media over loopback.
-///
-/// Call it once for each receiver: on Windows every call returns a loopback
-/// address of its own (see [`loopback_host`]).
 pub fn loopback_source(ndi: &Ndi, sender: &Sender) -> grafton_ndi::Result<Source> {
     loopback_endpoint(ndi, sender.source()?.name())
 }
 
-/// The loopback endpoint of the source this process advertises as `name`; see
-/// [`loopback_source`]. Some senders expose only their source, not themselves.
+/// The loopback endpoint, `127.0.0.1:<port>`, of the source this process
+/// advertises as `name`; see [`loopback_source`]. Some senders expose only
+/// their source, not themselves.
 pub fn loopback_endpoint(ndi: &Ndi, name: &str) -> grafton_ndi::Result<Source> {
     let (source, port) = advertised_endpoint(ndi, name)?;
-    let loopback = SourceAddress::Ip(format!("{}:{port}", loopback_host()));
+    let loopback = SourceAddress::Ip(format!("{}:{port}", Ipv4Addr::LOCALHOST));
     Ok(source.with_address(loopback))
 }
 
@@ -42,7 +40,17 @@ pub fn loopback_endpoint(ndi: &Ndi, name: &str) -> grafton_ndi::Result<Source> {
 /// reports it, and the port it is reached on. [`loopback_endpoint`] is what
 /// a receiver is given; this is for a test that needs the port itself.
 pub fn advertised_endpoint(ndi: &Ndi, name: &str) -> grafton_ndi::Result<(Source, u16)> {
-    let finder = Finder::new(ndi, &FinderOptions::new().extra_ips("127.0.0.1"))?;
+    advertised_endpoint_by(&loopback_finder(ndi)?, name)
+}
+
+/// A finder that also asks this machine's loopback address for sources, as
+/// [`advertised_endpoint`] looks senders up.
+pub fn loopback_finder(ndi: &Ndi) -> grafton_ndi::Result<Finder> {
+    Finder::new(ndi, &FinderOptions::new().extra_ips("127.0.0.1"))
+}
+
+/// [`advertised_endpoint`], through `finder`, which the caller keeps.
+pub fn advertised_endpoint_by(finder: &Finder, name: &str) -> grafton_ndi::Result<(Source, u16)> {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         for source in finder.current_sources()? {
@@ -72,112 +80,6 @@ pub fn port_of(source: &Source) -> Option<u16> {
         SourceAddress::Ip(address) => address.rsplit(':').next()?.parse().ok(),
         _ => None,
     }
-}
-
-/// The loopback address the next endpoint from [`loopback_endpoint`] names.
-///
-/// On Windows it is a different one each time, 127.0.0.2, 127.0.0.3 and so
-/// on, so that no receiver of a test process is given a destination that a
-/// receiver before it used. Every address in 127.0.0.0/8 reaches a sender,
-/// which listens on all interfaces, and the port stays the one the SDK chose.
-/// Elsewhere it is always 127.0.0.1: Linux and macOS do not need it, and
-/// macOS has no loopback address but 127.0.0.1.
-///
-/// On the hosted Windows runners (run 43342188690), a receiver given
-/// `127.0.0.1:5961` sometimes never connected to the sender listening there,
-/// for the whole 15 s a test waits, while a receiver opened 3 ms later to the
-/// same address connected in 1 ms. 12 of 43 receivers opened within 150 ms of
-/// another receiver's teardown never connected, against 1 of 15 whose SDK log
-/// showed no receiver closing in the 300 ms before, although a sender had shut
-/// down less than 150 ms before in both groups. The failures follow the
-/// teardown of receivers more closely than the reuse of the port. A
-/// destination that no connection has used leaves nothing the SDK or the
-/// operating system keeps for a destination to get in the way; whether that
-/// is enough is what `tests/peer_recreation.rs` measures, against a control
-/// at 127.0.0.1. `ci/README.md` has the evidence.
-///
-/// When 127.0.0.2 does not reach a listener on this machine, the address stays
-/// 127.0.0.1 and [`loopback_mitigation`] says why.
-pub fn loopback_host() -> Ipv4Addr {
-    match rotation() {
-        Ok(next) => next(),
-        Err(_) => Ipv4Addr::LOCALHOST,
-    }
-}
-
-/// How [`loopback_host`] addresses senders in this process, for the reports
-/// of tests that depend on it: `Ok` with what it does, or `Err` with why it
-/// gives every endpoint 127.0.0.1.
-pub fn loopback_mitigation() -> Result<&'static str, String> {
-    match rotation() {
-        Ok(_) => Ok("each endpoint has a loopback address of its own, from 127.0.0.2"),
-        Err(why) => Err(why.clone()),
-    }
-}
-
-/// The source of distinct loopback addresses, when this platform uses them.
-#[cfg(windows)]
-fn rotation() -> &'static Result<fn() -> Ipv4Addr, String> {
-    use std::sync::{
-        atomic::{AtomicU32, Ordering},
-        OnceLock,
-    };
-
-    /// The low 24 bits of the next address in 127.0.0.0/8.
-    static NEXT: AtomicU32 = AtomicU32::new(2);
-    static ROTATION: OnceLock<Result<fn() -> Ipv4Addr, String>> = OnceLock::new();
-
-    fn next() -> Ipv4Addr {
-        loop {
-            let host = NEXT.fetch_add(1, Ordering::Relaxed) & 0x00ff_ffff;
-            // Skip the network and broadcast forms of each /24.
-            if !matches!(host & 0xff, 0 | 0xff) {
-                return Ipv4Addr::from(0x7f00_0000 | host);
-            }
-        }
-    }
-
-    ROTATION.get_or_init(|| {
-        let reachable = reaches_listener(Ipv4Addr::new(127, 0, 0, 2));
-        if let Err(why) = &reachable {
-            // Written directly: the harness captures `eprintln!`.
-            use std::io::Write;
-            let _ = writeln!(
-                std::io::stderr(),
-                "tests/common: every endpoint names 127.0.0.1, because {why}"
-            );
-        }
-        reachable.map(|()| next as fn() -> Ipv4Addr)
-    })
-}
-
-#[cfg(not(windows))]
-fn rotation() -> &'static Result<fn() -> Ipv4Addr, String> {
-    static UNNEEDED: std::sync::OnceLock<Result<fn() -> Ipv4Addr, String>> =
-        std::sync::OnceLock::new();
-    UNNEEDED.get_or_init(|| {
-        Err(format!(
-            "{} has not shown the failure the distinct addresses avoid",
-            std::env::consts::OS
-        ))
-    })
-}
-
-/// Whether a connection to `host` reaches a listener on all interfaces, as
-/// the SDK's senders listen.
-#[cfg(windows)]
-fn reaches_listener(host: Ipv4Addr) -> Result<(), String> {
-    use std::net::{SocketAddr, TcpListener, TcpStream};
-
-    let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
-        .map_err(|error| format!("a listener on 0.0.0.0 could not be opened: {error}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|error| format!("the listener has no address: {error}"))?
-        .port();
-    TcpStream::connect_timeout(&SocketAddr::from((host, port)), Duration::from_secs(2))
-        .map(drop)
-        .map_err(|error| format!("{host}:{port} did not reach a listener on 0.0.0.0: {error}"))
 }
 
 /// What the operating system's TCP table holds for `port`, for the message of

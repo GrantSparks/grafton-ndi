@@ -404,6 +404,25 @@ jobs:
             export GRAFTON_NDI_REQUIRE_RUNTIME="$require"
             cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features
           done
+      # While the Windows receiver stall is open (ci/README.md, "Receivers that
+      # never connect on Windows"): the peer recreation experiment twice in a
+      # row, under the loopback-only runner and then with the firewall off and
+      # without it, so that the two compare under the same conditions and a
+      # receiver that stalls in the second does so without the confinement.
+      # It runs whatever the steps before it did, so a test that hung there
+      # does not keep it from reporting, and last, since it leaves the firewall
+      # off.
+      - name: Peer recreation, confined and with the firewall off
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        timeout-minutes: 15
+        env:
+          GRAFTON_NDI_REQUIRE_RUNTIME: '1'
+        run: |
+          status=0
+          cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features --test peer_recreation || status=1
+          pwsh -NoProfile -Command 'Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled False'
+          cargo test --locked --target "$TARGET" --no-fail-fast --all-features --test peer_recreation || status=1
+          exit "$status"
 
   required-ci:
     name: required-ci

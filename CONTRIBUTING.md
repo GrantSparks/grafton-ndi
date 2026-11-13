@@ -392,13 +392,12 @@ on one machine do not collide on it (see below).
 
 A test that connects a receiver to a sender of its own process addresses the
 sender through `common::loopback_source(&ndi, &sender)`, or
-`common::loopback_endpoint(&ndi, name)` for a source it knows only by name, and
-looks the endpoint up again for each receiver it creates. On Windows each
-lookup returns a loopback address no earlier receiver used, which keeps
-receivers clear of a stall seen on the hosted runners (see "Receivers that
-never connect on Windows" in the [CI guide](ci/README.md)); elsewhere it is
-127.0.0.1. When a receiver does not connect, `common::socket_table(port)` adds
-the operating system's view of that port to the failure message on Windows.
+`common::loopback_endpoint(&ndi, name)` for a source it knows only by name.
+Both find the sender's port with a finder and name `127.0.0.1:<port>`. On the
+hosted Windows runners some receivers never connect to such an endpoint; "Receivers
+that never connect on Windows" in the [CI guide](ci/README.md) has what is known.
+When a receiver does not connect, `common::socket_table(port)` adds the operating
+system's view of that port to the failure message on Windows.
 
 `GRAFTON_NDI_REQUIRE_RUNTIME` turns skips into failures. Its value is a
 comma-separated list of what the environment provides: `1` for any runtime,

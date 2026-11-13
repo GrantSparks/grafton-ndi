@@ -28,14 +28,8 @@ fn video_only_modes_deliver_video_while_an_ordinary_receiver_also_gets_audio() {
             .clock_audio(false),
     )
     .unwrap();
-    // Each receiver is given an endpoint of its own: on Windows the helper
-    // names a different loopback address each time (see
-    // `common::loopback_host`).
-    let ordinary = Receiver::new(
-        &ndi,
-        &ReceiverOptions::new(common::loopback_source(&ndi, &sender).unwrap()),
-    )
-    .unwrap();
+    let source = common::loopback_source(&ndi, &sender).unwrap();
+    let ordinary = Receiver::new(&ndi, &ReceiverOptions::new(source.clone())).unwrap();
     let video = VideoFrame::builder()
         .resolution(64, 32)
         .frame_rate(FrameRate::new(30, 1).unwrap())
@@ -53,8 +47,7 @@ fn video_only_modes_deliver_video_while_an_ordinary_receiver_also_gets_audio() {
     ] {
         let receiver = Receiver::new(
             &ndi,
-            &ReceiverOptions::new(common::loopback_source(&ndi, &sender).unwrap())
-                .bandwidth(bandwidth),
+            &ReceiverOptions::new(source.clone()).bandwidth(bandwidth),
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
