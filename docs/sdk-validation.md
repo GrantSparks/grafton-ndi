@@ -397,34 +397,37 @@ later selection; a native source-list wait by itself holds no snapshot mutex.
 All paths retain the same bounded descriptor-copy kernel.
 
 On Linux x86_64 with Advanced 6.4.0.2 and its File library, under the loopback-only
-runner, `configured_exact_selection_records_the_selected_endpoint_and_explicit_name_policy`
-selects a feed through a finder with a unique nondefault group and a loopback IP
-hint. Converting that named, addressed source to `SourceSpec` preserves the
-native URL field alone, as required by `Processing.NDI.Lib.File.Recorder.h`'s name
-precedence rule. Recording and probing the finalized file confirms the selected
-640×360 feed rather than the available 320×180 distractor. A selected source whose
-address is replaced with unavailable `127.0.0.1:9` records no video despite its
-valid source name, demonstrating no hidden name fallback.
+runner, `tests/file_source_selection.rs` selects a feed through a finder with a
+unique nondefault group and a loopback IP hint. Converting that named, addressed
+source to `SourceSpec` preserves the native URL field alone, as required by
+`Processing.NDI.Lib.File.Recorder.h`'s name precedence rule. Recording and probing
+the finalized file confirms the selected 640×360 feed rather than the available
+320×180 distractor.
 
-The same native regression also requires deliberate name-only recording of a
-separate default-group 480×270 source. It starts a fresh child process with a
-private `NDI_CONFIG_DIR`, setting the SDK's documented `ndi.networks.ips` to
-loopback and default send/receive groups to `Public` before initialization.
-The child pins the parent's selected runtime and File library, so its native
-default finder and name-only recorder use controlled discovery without changing
-system configuration or other tests. Both recordings must contain video and probe
-with the expected distinct dimensions. The unavailable endpoint is paired with
-the proven reachable public source name; it must record no frames rather than
-silently fall back. A completion marker requires all three native cases to finish,
-so an empty child test filter or premature skip cannot count as coverage.
-SDK-independent recorder-boundary and async-command tests also verify the
-native name/URL fields and endpoint copies after caller inputs are dropped.
+This single-test executable installs a private `NDI_CONFIG_DIR` before loading
+NDI, with loopback IP queries and `Public` send/receive defaults. On macOS only,
+it retains the offline runner's loopback discovery setting to suppress sender
+mDNS. Linux and Windows leave the Discovery Server unset, avoiding the
+[known Windows failure with an unreachable server](troubleshooting.md#receiving-and-sending).
+It also uses a private temporary directory for native state. Its native runtime
+runs apart from the concurrent File unit tests: running a second SDK process beside those
+tests produced source-discovery timeouts, even with a private child configuration.
+No system configuration or CI network policy is changed.
 
-Reproduce the native case with `NDI_RUNTIME_DIR_V6` selecting the 6.4 Advanced
-runtime and `GRAFTON_NDI_REQUIRE_RUNTIME=file`:
+The test requires deliberate name-only recording of a separate default-group
+480×270 source. Both recordings must contain video and probe with the expected
+distinct dimensions. An unavailable `127.0.0.1:9` endpoint paired with that proven
+reachable public name must record no video, demonstrating no hidden name fallback.
+The shared prerequisite helper reports missing runtimes/File libraries and applies
+`GRAFTON_NDI_REQUIRE_RUNTIME`; once those exist, every native assertion is required.
+SDK-independent recorder-boundary and async-command tests also verify the native
+name/URL fields and endpoint copies after caller inputs are dropped.
+
+Reproduce with `NDI_RUNTIME_DIR_V6` selecting the 6.4 Advanced runtime and
+`GRAFTON_NDI_REQUIRE_RUNTIME=file`:
 
 ```sh
-cargo test --config ci/offline.toml --features file-io --lib configured_exact_selection_records -- --nocapture
+cargo test --config ci/offline.toml --features file-io --test file_source_selection -- --nocapture
 ```
 
 Tests of `FileRecorder::reset` check that it returns the old session's report

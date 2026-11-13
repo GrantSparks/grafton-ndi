@@ -15,7 +15,7 @@ fn non_widescreen_video_arrives_with_its_requested_display_geometry() -> grafton
     let sender = Sender::new(
         &ndi,
         &SenderOptions::new(common::unique_name("aspect regression"))
-            .clock_video(false)
+            .clock_video(true)
             .clock_audio(false),
     )?;
     let receiver = Receiver::new(
@@ -37,17 +37,23 @@ fn non_widescreen_video_arrives_with_its_requested_display_geometry() -> grafton
             let video = builder.build()?;
             let mut borrowed =
                 BorrowedVideoFrame::builder(video.data(), width, height, PixelFormat::Bgra)
+                    .frame_rate(video.frame_rate())
                     .timecode(timecode);
             if let Some(ratio) = ratio {
                 borrowed = borrowed.picture_aspect_ratio(ratio);
             }
             let borrowed = borrowed.build()?;
             let deadline = Instant::now() + Duration::from_secs(10);
+            let mut last_received = None;
             loop {
-                // Exercise both construction paths on the native boundary.
+                // Exercise both construction paths at the same clocked rate:
+                // draining stale frames must not turn format changes into an
+                // unpaced burst that overloads the native receiver.
                 sender.send_video(&video)?;
                 sender.send_video(&borrowed)?;
                 if let Some(received) = receiver.video().capture_ref(Duration::from_millis(100))? {
+                    last_received =
+                        Some((received.width(), received.height(), received.timecode()));
                     if received.timecode() == timecode {
                         assert_eq!((received.width(), received.height()), (width, height));
                         // A runtime may resolve the zero sentinel to the dimension ratio.
@@ -71,7 +77,8 @@ fn non_widescreen_video_arrives_with_its_requested_display_geometry() -> grafton
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "aspect case {case}/{mode} was not received"
+                    "aspect case {case}/{mode} was not received; last={last_received:?}, stats={:?}",
+                    receiver.connection_stats()
                 );
             }
         }
