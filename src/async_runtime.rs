@@ -18,6 +18,10 @@
 //! continues, including waiting for receiver access; it cannot be interrupted by
 //! dropping the future.
 //!
+//! Status notifications consumed during capture are retained by the underlying
+//! receiver, but the 2.x async wrapper has no status-polling accessor. Applications
+//! that need those notifications should use the synchronous receiver API.
+//!
 //! # Features
 //!
 //! - `tokio` - Enable Tokio runtime support

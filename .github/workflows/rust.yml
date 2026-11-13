@@ -2,10 +2,10 @@ name: Rust CI/CD
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "release/2.x-maintenance"]
     tags: ["*"]
   pull_request:
-    branches: ["main"]
+    branches: ["main", "release/2.x-maintenance"]
   workflow_dispatch:
 
 concurrency:
@@ -90,6 +90,26 @@ jobs:
           # Only save cache on main branch to avoid cache thrashing
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Check unchanged builds stay fresh
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          cargo build
+          build_log=$(mktemp)
+          cargo build 2>&1 | tee "$build_log"
+          if grep -Eq '^[[:space:]]*Compiling grafton-ndi v' "$build_log"; then
+            echo "Unchanged cargo build recompiled grafton-ndi"
+            exit 1
+          fi
+          cargo test --no-run
+          cargo test --no-run 2>&1 | tee "$build_log"
+          if grep -Eq '^[[:space:]]*Compiling grafton-ndi v' "$build_log"; then
+            echo "Unchanged cargo test --no-run recompiled grafton-ndi"
+            exit 1
+          fi
+          rm "$build_log"
+
       - name: Run receiver status SDK regression
         run: cargo test --all-features --test receiver_status_notifications -- --ignored --nocapture
 
@@ -120,7 +140,6 @@ jobs:
           cargo test --examples --all-features
 
       - name: Run SDK lifecycle regressions
-        if: runner.os == 'Linux'
         run: cargo test --all-features --test async_send_lifecycle --test sender_lifecycle_stress -- --ignored
 
       - name: Run video padding and FrameSync recovery SDK regression
@@ -217,6 +236,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
 
       # Setup NDI SDK (Windows)
       - uses: ./.github/actions/setup-ndi-windows
@@ -246,6 +267,9 @@ jobs:
           save-if: false  # Let test-and-lint job handle saving
 
       - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          baseline-rev: v2.0.0
+          release-type: minor
 
   # Build and publish API documentation to GitHub Pages.
   #

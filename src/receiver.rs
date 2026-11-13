@@ -38,7 +38,7 @@ use crate::{
     capture::{capture_raw, AudioKind, CaptureKind, CaptureResult, MetadataKind, VideoKind},
     finder::{RawSource, Source},
     ndi_lib::*,
-    to_ms_checked, Error, MetadataFrame, Result, NDI,
+    timeout_deadline, to_ms_checked, Error, MetadataFrame, Result, NDI,
 };
 
 /// Retry policy configuration for frame capture operations.
@@ -1222,6 +1222,8 @@ impl<M: ReceiverMode> Receiver<M> {
     /// Returns [`Error::InvalidConfiguration`] if `timeout` exceeds [`crate::MAX_TIMEOUT`],
     /// or [`Error::CaptureFailed`] if the SDK reports a lost connection.
     /// The budget includes lock contention; SDK calls may overshoot it.
+    /// The capture guard is released between SDK waits of at most 100 ms, so
+    /// a reconnect need not wait for this method's entire timeout.
     pub fn poll_status_change(&self, timeout: Duration) -> Result<Option<ReceiverStatus>> {
         self.core.poll_status_change(timeout)
     }
@@ -1239,8 +1241,7 @@ impl ReceiverCore {
     /// `NDIlib_recv_capture_v3` call, so it runs concurrently with other
     /// captures but never overlaps a [`reconnect`](Receiver::reconnect).
     fn capture_ref_kind<K: CaptureKind>(&self, timeout: Duration) -> Result<Option<K::Ref<'_>>> {
-        to_ms_checked(timeout)?;
-        self.capture_ref_kind_until::<K>(Instant::now() + timeout)
+        self.capture_ref_kind_until::<K>(timeout_deadline(timeout)?)
     }
 
     fn capture_ref_kind_until<K: CaptureKind>(
@@ -1301,15 +1302,20 @@ impl ReceiverCore {
     /// [`RetryPolicy`], absorbing the SDK's initial-sync misses where it returns
     /// `none` immediately instead of blocking for the full timeout.
     pub(crate) fn capture_kind<K: CaptureKind>(&self, timeout: Duration) -> Result<K::Owned> {
-        to_ms_checked(timeout)?;
-        self.capture_kind_until::<K>(Instant::now() + timeout)
+        self.capture_kind_until::<K>(timeout_deadline(timeout)?)
     }
 
     pub(crate) fn capture_kind_until<K: CaptureKind>(&self, deadline: Instant) -> Result<K::Owned> {
         retry_capture(
             deadline.saturating_duration_since(Instant::now()),
             &RetryPolicy::default(),
-            |poll| self.try_capture_kind_until::<K>(deadline.min(Instant::now() + poll)),
+            |poll| {
+                self.try_capture_kind_until::<K>(
+                    Instant::now()
+                        .checked_add(poll)
+                        .map_or(deadline, |end| deadline.min(end)),
+                )
+            },
         )
     }
 
@@ -1349,22 +1355,60 @@ impl ReceiverCore {
     fn poll_status_with(
         &self,
         timeout: Duration,
-        capture: impl FnOnce(Instant) -> Option<NDIlib_frame_type_e>,
+        capture: impl FnMut(Instant) -> Option<NDIlib_frame_type_e>,
+    ) -> Result<Option<ReceiverStatus>> {
+        self.poll_status_with_clock(timeout, capture, Instant::now, std::thread::sleep)
+    }
+
+    fn poll_status_with_clock(
+        &self,
+        timeout: Duration,
+        mut capture: impl FnMut(Instant) -> Option<NDIlib_frame_type_e>,
+        mut now: impl FnMut() -> Instant,
+        mut sleep: impl FnMut(Duration),
     ) -> Result<Option<ReceiverStatus>> {
         to_ms_checked(timeout)?;
-        let deadline = Instant::now() + timeout;
-        if let Some(status) = self.take_pending_status() {
-            return Ok(Some(status));
-        }
-        match capture(deadline) {
-            Some(NDIlib_frame_type_e_NDIlib_frame_type_error) => {
-                // Errors must not consume notifications published during the wait.
-                Err(Error::CaptureFailed("Received an error frame".into()))
+        let deadline = now().checked_add(timeout).ok_or_else(|| {
+            Error::InvalidConfiguration("Timeout deadline cannot be represented".into())
+        })?;
+        let policy = RetryPolicy::default();
+        let mut first = true;
+        loop {
+            if let Some(status) = self.take_pending_status() {
+                return Ok(Some(status));
             }
-            Some(NDIlib_frame_type_e_NDIlib_frame_type_status_change) => {
-                Ok(Some(self.current_status()))
+            // Release the capture guard after each short SDK wait so a queued
+            // reconnect writer can proceed. This is still one caller budget.
+            let before = now();
+            if !first && before >= deadline {
+                return Ok(None);
             }
-            _ => Ok(self.take_pending_status()),
+            first = false;
+            let attempt_end = before
+                .checked_add(policy.poll_interval)
+                .map_or(deadline, |end| deadline.min(end));
+            match capture(attempt_end) {
+                Some(NDIlib_frame_type_e_NDIlib_frame_type_error) => {
+                    // Errors must not consume notifications published during the wait.
+                    return Err(Error::CaptureFailed("Received an error frame".into()));
+                }
+                Some(NDIlib_frame_type_e_NDIlib_frame_type_status_change) => {
+                    return Ok(Some(self.current_status()));
+                }
+                _ => {}
+            }
+            if let Some(status) = self.take_pending_status() {
+                return Ok(Some(status));
+            }
+            let after = now();
+            if after >= deadline {
+                return Ok(None);
+            }
+            // The SDK can return early during synchronization. Avoid spinning,
+            // without holding the guard or extending the original budget.
+            if after < attempt_end {
+                sleep(policy.sleep_between.min(deadline - after));
+            }
         }
     }
 }
@@ -1703,6 +1747,81 @@ mod tests {
             raw.raw.bandwidth,
             NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_max
         );
+    }
+
+    #[test]
+    fn status_wait_bounds_each_attempt_and_keeps_one_budget() {
+        let ndi = NDI::new().unwrap();
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        for early_return in [false, true] {
+            let start = Instant::now();
+            let clock = FakeClock::default();
+            let budget = Duration::from_millis(235);
+            let mut attempts = 0;
+            assert!(receiver
+                .core
+                .poll_status_with_clock(
+                    budget,
+                    |end| {
+                        let remaining = end.saturating_duration_since(start + clock.elapsed());
+                        assert!(remaining <= Duration::from_millis(100));
+                        assert!(end <= start + budget);
+                        assert!(!remaining.is_zero());
+                        // No guard from the previous attempt may exclude reconnect.
+                        assert!(receiver.core.capture_guard.try_write().is_some());
+                        attempts += 1;
+                        if !early_return {
+                            clock.advance(remaining);
+                        }
+                        Some(NDIlib_frame_type_e_NDIlib_frame_type_none)
+                    },
+                    || start + clock.elapsed(),
+                    |wait| clock.advance(wait),
+                )
+                .unwrap()
+                .is_none());
+            assert_eq!(clock.elapsed(), budget);
+            assert!(attempts > 1);
+        }
+    }
+
+    #[test]
+    fn queued_reconnect_can_run_between_status_attempts() {
+        let ndi = NDI::new().unwrap();
+        let receiver = Receiver::new(&ndi, &ReceiverOptions::default()).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let rx = &receiver;
+            scope.spawn(move || {
+                entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                queued_tx.send(()).unwrap();
+                // Reconnect takes the same exclusive guard. Its acquisition
+                // must complete before the poll's next SDK attempt.
+                let _writer = rx.core.capture_guard.write();
+                rx.core.pending_status.store(true, Ordering::Release);
+                done_tx.send(()).unwrap();
+            });
+            let mut first = true;
+            assert!(receiver
+                .core
+                .poll_status_with(Duration::from_secs(3), |end| {
+                    let _guard = receiver.core.capture_lock_until(end)?;
+                    assert!(
+                        end.saturating_duration_since(Instant::now()) <= Duration::from_millis(100)
+                    );
+                    if first {
+                        first = false;
+                        entered_tx.send(()).unwrap();
+                        queued_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                    }
+                    Some(NDIlib_frame_type_e_NDIlib_frame_type_none)
+                })
+                .unwrap()
+                .is_some());
+            done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        });
     }
 
     #[test]

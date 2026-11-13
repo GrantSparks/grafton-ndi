@@ -130,6 +130,7 @@ mod capture;
 mod error;
 mod ndi_lib;
 mod recv_guard;
+mod sdk_text;
 
 pub mod framesync;
 
@@ -179,7 +180,9 @@ pub type Result<T> = std::result::Result<T, crate::error::Error>;
 ///
 /// The NDI SDK uses `u32` milliseconds for timeout values, which limits the maximum
 /// timeout to approximately 49.7 days. Attempting to use a larger `Duration` will
-/// result in an error.
+/// result in an error. Positive waits round up to whole milliseconds. An
+/// individual native wait is capped at one millisecond below this maximum to
+/// avoid the SDK's indefinite-wait sentinel; the full input range is accepted.
 pub const MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(u32::MAX as u64);
 
 /// Converts a `Duration` to milliseconds for FFI, checking for overflow.
@@ -195,8 +198,20 @@ pub(crate) fn to_ms_checked(d: std::time::Duration) -> Result<u32> {
             d
         )))
     } else {
-        Ok(d.as_millis() as u32)
+        // u32::MAX can mean an indefinite wait. Preserve the 2.x accepted
+        // range while capping a native call at a finite wait.
+        Ok(d.as_nanos()
+            .div_ceil(1_000_000)
+            .min(u128::from(u32::MAX - 1)) as u32)
     }
+}
+
+/// Validate one caller's timeout and form its deadline without overflowing.
+pub(crate) fn timeout_deadline(timeout: std::time::Duration) -> Result<std::time::Instant> {
+    to_ms_checked(timeout)?;
+    std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| Error::InvalidConfiguration("Timeout deadline cannot be represented".into()))
 }
 
 #[cfg(test)]

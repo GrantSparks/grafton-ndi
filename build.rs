@@ -131,7 +131,12 @@ fn main() {
         .header(main_header)
         .clang_arg(format!("-I{ndi_include_path}"))
         .clang_arg(format!("--target={target}"))
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        // wrapper.h is generated above, so tracking it would make every build stale.
+        // In bindgen 0.72.1 this skips only the main header; include_file still
+        // tracks the SDK headers, and NDI_SDK_DIR is tracked explicitly above.
+        .parse_callbacks(Box::new(
+            bindgen::CargoCallbacks::new().rerun_on_header_files(false),
+        ))
         .derive_default(true)
         .generate()
         .unwrap_or_else(|error| panic!("Unable to generate NDI bindings for {target}: {error}. For cross builds, configure target C headers and sysroot via BINDGEN_EXTRA_CLANG_ARGS."));
