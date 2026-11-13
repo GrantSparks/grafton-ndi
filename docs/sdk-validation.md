@@ -206,6 +206,14 @@ user-mode emulation, with the same program. None read past a frame: Standard
 scan types, each at four positions, and 48 cases of six other formats;
 Standard 6.1.1 and 6.3.2 and Advanced 6.4.0.2 over 300 cases each.
 
+#### 32-bit x86
+
+The 32-bit x86 Linux build of Standard 6.4.0.2 was not run here, where 32-bit
+programs cannot be linked. On GitHub's hosted Ubuntu 24.04 runner, in run
+43365028704, `tests/send_tail_room_sdk.rs` found that it reads a progressive
+642×32 UYVY frame exactly, where the x86-64 builds read past it. No other size
+was measured, so the crate keeps the x86 room for it.
+
 #### What the crate does
 
 `PixelFormat::send_tail_room` is the room the crate gives the SDK after a

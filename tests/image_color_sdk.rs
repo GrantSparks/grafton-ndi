@@ -215,6 +215,71 @@ fn byte_difference(a: &[u8], b: &[u8]) -> (u8, f64) {
     (largest, total as f64 / a.len() as f64)
 }
 
+/// Where two UYVY pictures of 64x64 flat patches, of one size, differ, for
+/// a failure message: how many bytes, the rectangle of pixels that holds
+/// them, the largest difference, and the patches that differ most. The
+/// patches lie on the codec's block boundaries, so its loss alone leaves
+/// every patch close to flat and spreads evenly; a region that differs much
+/// more than the rest is a frame that is wrong there.
+fn where_they_differ(sent: &[u8], received: &[u8], width: usize) -> String {
+    let row = width * 2;
+    let height = sent.len() / row;
+    let (columns, rows) = (width.div_ceil(64), height.div_ceil(64));
+    // The sum and the largest of the differences in each patch.
+    let mut patches = vec![(0u64, 0u8); columns * rows];
+    let mut differing = 0;
+    let (mut left, mut right, mut top, mut bottom) = (usize::MAX, 0, usize::MAX, 0);
+    let mut largest = (0, 0);
+    for (i, (s, r)) in sent.iter().zip(received).enumerate() {
+        let d = s.abs_diff(*r);
+        if d == 0 {
+            continue;
+        }
+        differing += 1;
+        let (x, y) = (i % row / 2, i / row);
+        (left, right, top, bottom) = (left.min(x), right.max(x), top.min(y), bottom.max(y));
+        let patch = &mut patches[(y / 64) * columns + x / 64];
+        patch.0 += u64::from(d);
+        patch.1 = patch.1.max(d);
+        if d > largest.0 {
+            largest = (d, i);
+        }
+    }
+    if differing == 0 {
+        return "they are identical".to_owned();
+    }
+    let mean = |index: usize, total: u64| {
+        let (px, py) = (index % columns, index / columns);
+        let bytes = 64.min(width - px * 64) * 2 * 64.min(height - py * 64);
+        total as f64 / bytes as f64
+    };
+    let mut worst: Vec<_> = patches
+        .iter()
+        .enumerate()
+        .filter(|(_, (total, _))| *total > 0)
+        .map(|(index, &(total, max))| (index, mean(index, total), max))
+        .collect();
+    let affected = worst.len();
+    worst.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let (d, i) = largest;
+    let mut text = format!(
+        "{differing} of {} bytes differ, in pixels {left}..={right} of rows {top}..={bottom}; \
+         {affected} of {} patches differ; the largest difference, {d}, is at byte {} of row {} \
+         (sent {}, received {}); the patches that differ most, by mean:",
+        sent.len(),
+        columns * rows,
+        i % row,
+        i / row,
+        sent[i],
+        received[i]
+    );
+    for (index, mean, max) in worst.iter().take(6) {
+        let (px, py) = (index % columns, index / columns);
+        text += &format!(" ({px}, {py}) {mean:.2} up to {max};");
+    }
+    text
+}
+
 /// The largest and the mean difference between two images.
 fn difference(a: &[[u8; 3]], b: &[[u8; 3]]) -> (u8, f64) {
     assert_eq!(a.len(), b.len());
@@ -257,7 +322,12 @@ fn the_sdk_converts_with_bt709_at_every_size_whatever_the_tag_says() {
             // where that was measured.
             assert_eq!(uyvy.pixel_format(), PixelFormat::Uyvy, "{case}");
             let (largest, mean) = byte_difference(uyvy.data(), sent.data());
-            assert!(mean <= 2.0, "{case}: the received UYVY is not the frame sent: it differs by up to {largest}, {mean:.3} on average");
+            assert!(
+                mean <= 2.0,
+                "{case}: the received UYVY is not the frame sent: it differs by up to {largest}, \
+                 {mean:.3} on average; {}",
+                where_they_differ(sent.data(), uyvy.data(), width)
+            );
             if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
                 assert_eq!(
                     (largest, mean),

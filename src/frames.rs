@@ -351,7 +351,8 @@ impl PixelFormat {
     /// measured, on 2026-11-13, with the Linux runtimes 6.1.1, 6.3.2 and
     /// 6.4.0.2; the SDK validation notes in the repository's `docs`
     /// directory have the method and the numbers. Where nothing was
-    /// measured, the crate takes the x86 figure.
+    /// measured, the crate takes the x86 figure: so does the 32-bit x86
+    /// Linux build, which read the one frame it was measured with exactly.
     ///
     /// The crate keeps this room for the SDK, and fills it with zeros, so a
     /// program needs the number only to avoid a copy or a reallocation:
