@@ -258,7 +258,7 @@ class Rules(unittest.TestCase):
                 workflows.load(text)
 
 
-def checkable(target, pin, *, all_features, headers=None, driver=None):
+def checkable(target, pin, *, all_features, headers=None, driver=None, decoders=True):
     """What tests can check in a build for `target` running against the package `pin`.
 
     `headers` is the package the build reads its headers from, `pin` itself
@@ -268,25 +268,29 @@ def checkable(target, pin, *, all_features, headers=None, driver=None):
     an Advanced runtime and Advanced headers; the File tests need the `file-io`
     feature and a File library the runtime can drive, which is an Advanced
     runtime everywhere except Windows, where the library is edition-neutral and
-    ships for x64. The HEVC decode test is an Advanced test that also needs a
-    6.4 runtime and an NDI|HX decoder, which is built into the runtime on
-    macOS; on Linux it is the NDI|HX driver of the runtime's release. On
-    Windows the test runs but cannot be promised: the hosted Windows runners
-    delivered the runtime's black placeholder frames instead of HEVC 4:4:4.
+    ships for x64. The H.264 and HEVC 4:4:4 decode tests are Advanced tests that
+    need an NDI|HX decoder, and the HEVC one a 6.4 runtime for its Best444
+    receiver. The macOS runtime decodes both itself; on Linux the decoder is the
+    NDI|HX driver of the runtime's release. On Windows the tests run but are not
+    counted: the hosted Windows runners delivered the runtime's black
+    placeholder frames instead of HEVC 4:4:4, and H.264 has not been measured
+    there yet. `decoders=False` leaves both out, as the compatibility runs do.
     """
     platform, advanced = pin['platform'], pin['edition'] == 'advanced'
     declared = (headers or pin)['edition'] == 'advanced'
     current = sdk.version_tuple(pin['version']) >= (6, 4, 0, 0)
-    decoder = platform == 'apple' or (
+    decoder = decoders and (platform == 'apple' or (
         driver is not None and driver['driver'] == 'hx' and driver['platform'] == platform
-        and driver['version'] == pin['version'])
+        and driver['version'] == pin['version']))
     found = {'1'}
     if platform == 'linux' and current:
         found.add('discovery-server')
     if all_features and advanced and declared:
         found.add('advanced')
-        if current and decoder:
-            found.add('hx-decoder')
+        if decoder:
+            found.add('h264-decoder')
+            if current:
+                found.add('hevc-444-decoder')
     if all_features and current and (target == 'x86_64-pc-windows-msvc' if platform == 'windows' else advanced):
         found.add('file')
     return found
@@ -388,18 +392,20 @@ class SdkJob(unittest.TestCase):
     def test_each_compatibility_pass_promises_exactly_what_it_can_check(self):
         """The first step builds with the row's headers against each baseline runtime, the second with each
         baseline's headers against the row's runtime; a Standard baseline has no headers a build reads. Only
-        the row's own runtime has the row's driver beside it."""
+        the row's own runtime has the row's driver beside it. Neither step promises an NDI|HX decoder: the
+        row's own runs do, and the decode tests still run, and pass or skip visibly, in the crossed builds."""
         baseline_runtimes, baseline_headers = [step for step in self.job['steps'] if step.get('if') == 'matrix.compatibility']
         for row in (row for row in self.rows if 'compatibility' in row):
             current, target, driver = self.pins[row['package']], row['target'], self.pins.get(row.get('hx-driver'))
             baselines = {'standard': self.pins[row['compatibility']], 'advanced': self.pins[row['compatibility-advanced']]}
             with self.subTest(row=row['name'], step=baseline_runtimes['name']):
                 self.assertEqual(exported_promises(baseline_runtimes, row['require']),
-                                 {edition: checkable(target, pin, all_features=True, headers=current)
+                                 {edition: checkable(target, pin, all_features=True, headers=current, decoders=False)
                                   for edition, pin in baselines.items()})
             with self.subTest(row=row['name'], step=baseline_headers['name']):
                 self.assertEqual(exported_promises(baseline_headers, row['require']),
-                                 {edition: checkable(target, current, all_features=True, headers=pin, driver=driver)
+                                 {edition: checkable(target, current, all_features=True, headers=pin, driver=driver,
+                                                     decoders=False)
                                   for edition, pin in baselines.items()})
 
     def test_readme_matrix_table_matches_the_workflow(self):

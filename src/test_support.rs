@@ -35,19 +35,25 @@ pub enum Requirement {
     /// selected runtime belongs to, and a runtime whose advertisers and
     /// listeners can use it. Listed as `discovery-server`.
     DiscoveryServer,
-    /// An NDI|HX video decoder the selected runtime can use, which a test that
-    /// receives HEVC or H.264 video as pictures needs. Listed as `hx-decoder`.
+    /// An NDI|HX decoder the selected runtime can use for H.264 4:2:0 video,
+    /// which a test that receives such video as pictures needs. Listed as
+    /// `h264-decoder`. See [`Requirement::Hevc444Decoder`] for how the runtime
+    /// finds a decoder.
+    H264Decoder,
+    /// An NDI|HX decoder the selected runtime can use for HEVC 4:4:4 video,
+    /// which a test that receives such video as pictures needs. Listed as
+    /// `hevc-444-decoder`.
     ///
     /// The runtime finds its decoder when it runs and has no query for it.
     /// Without one, a receiver is given black 1920x1080 frames in place of
     /// the picture (UYVY on Linux); [`is_hx_placeholder`] recognizes them. The
     /// Advanced SDK manual documents H.264 decoding on Windows and macOS
-    /// without plugins, and H.265 only in 4:2:0 and where decoding hardware
+    /// without plugins, but H.265 only in 4:2:0 and where decoding hardware
     /// supports it. A hosted macOS runner decoded HEVC 4:4:4; the hosted Windows
     /// Server 2025 runners, which have no GPU, delivered the black frames for
     /// it, probably for want of a decoder in hardware or in the operating
     /// system, which is not confirmed. On Linux, NDI 6.4.0.2 was measured, with
-    /// strace, to decode only through:
+    /// strace, to decode either codec only through:
     ///
     /// * the NDI|HX Driver for Linux, `libndihx.so` with its bundled
     ///   `libavcodec-ndi.so.61` and the other `-ndi` FFmpeg 7 libraries,
@@ -57,16 +63,17 @@ pub enum Requirement {
     ///
     /// An older FFmpeg, such as the 6.x of Ubuntu 24.04, does not count.
     /// [`hx_decoder`] looks in those places.
-    HxDecoder,
+    Hevc444Decoder,
 }
 
 impl Requirement {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Runtime,
         Self::Advanced,
         Self::File,
         Self::DiscoveryServer,
-        Self::HxDecoder,
+        Self::H264Decoder,
+        Self::Hevc444Decoder,
     ];
 
     /// Its spelling in `GRAFTON_NDI_REQUIRE_RUNTIME`.
@@ -76,7 +83,8 @@ impl Requirement {
             Self::Advanced => "advanced",
             Self::File => "file",
             Self::DiscoveryServer => "discovery-server",
-            Self::HxDecoder => "hx-decoder",
+            Self::H264Decoder => "h264-decoder",
+            Self::Hevc444Decoder => "hevc-444-decoder",
         }
     }
 
@@ -87,7 +95,8 @@ impl Requirement {
             Self::Advanced => "the Advanced SDK",
             Self::File => "the NDI File library",
             Self::DiscoveryServer => "the SDK's Discovery Server",
-            Self::HxDecoder => "an NDI|HX video decoder",
+            Self::H264Decoder => "an NDI|HX decoder for H.264",
+            Self::Hevc444Decoder => "an NDI|HX decoder for HEVC 4:4:4",
         }
     }
 
@@ -106,9 +115,11 @@ impl Requirement {
                 cfg!(all(target_os = "linux", not(ndi_link_static))),
                 "a Linux target that loads the runtime dynamically",
             ),
-            // The only test that decodes NDI|HX sends it from an Advanced
-            // compressed sender.
-            Self::HxDecoder => missing(cfg!(feature = "advanced"), "the `advanced` feature"),
+            // The tests that decode NDI|HX send it from an Advanced compressed
+            // sender.
+            Self::H264Decoder | Self::Hevc444Decoder => {
+                missing(cfg!(feature = "advanced"), "the `advanced` feature")
+            }
         }
     }
 
@@ -133,7 +144,7 @@ impl Requirement {
                     .unwrap_or_else(|| {
                         panic!(
                             "{REQUIRE_RUNTIME} lists {entry:?}; expected 1, advanced, file, \
-                             discovery-server or hx-decoder"
+                             discovery-server, h264-decoder or hevc-444-decoder"
                         )
                     })
             })
@@ -246,14 +257,16 @@ pub fn advanced_ndi() -> Option<Ndi> {
     }
 }
 
-/// Whether a test of NDI|HX video can go ahead: `false`, with the calling test
-/// reported as skipped, when the selected runtime is known to have no decoder.
+/// Whether a test of NDI|HX video that needs `decoder` can go ahead: `false`,
+/// with the calling test reported as skipped, when the selected runtime is
+/// known to have no decoder.
 ///
 /// The runtime has no query for its decoder, so this looks where
-/// [`Requirement::HxDecoder`] says the runtime does. On Linux that is what NDI
-/// 6.4.0.2 was measured with strace to open. It is not a vendor API: a runtime
-/// that looks elsewhere needs this updated. On macOS and Windows there is
-/// nothing to look at beforehand, so the answer there is `true`.
+/// [`Requirement::Hevc444Decoder`] says the runtime does. On Linux that is what
+/// NDI 6.4.0.2 was measured with strace to open, the same for both codecs. It
+/// is not a vendor API: a runtime that looks elsewhere needs this updated. On
+/// macOS and Windows there is nothing to look at beforehand, so the answer
+/// there is `true`.
 ///
 /// `true` is therefore no proof of a decoder. A test that receives NDI|HX video
 /// also passes each frame to [`is_hx_placeholder`], and reports the decoder
@@ -261,13 +274,21 @@ pub fn advanced_ndi() -> Option<Ndi> {
 ///
 /// # Panics
 ///
-/// Panics when no decoder is found and `GRAFTON_NDI_REQUIRE_RUNTIME` promises
-/// `hx-decoder`.
-pub fn hx_decoder(ndi: &Ndi) -> bool {
+/// Panics when `decoder` is not [`Requirement::H264Decoder`] or
+/// [`Requirement::Hevc444Decoder`], and when no decoder is found and
+/// `GRAFTON_NDI_REQUIRE_RUNTIME` promises `decoder`.
+pub fn hx_decoder(ndi: &Ndi, decoder: Requirement) -> bool {
+    assert!(
+        matches!(
+            decoder,
+            Requirement::H264Decoder | Requirement::Hevc444Decoder
+        ),
+        "{decoder:?} is not an NDI|HX decoder"
+    );
     match missing_hx_decoder(ndi) {
         None => true,
         Some(reason) => {
-            skip(Requirement::HxDecoder, &reason);
+            skip(decoder, &reason);
             false
         }
     }
@@ -283,8 +304,9 @@ const HX_PLACEHOLDER: (u32, u32) = (1920, 1080);
 /// Measured on Linux without a decoder, and on the hosted Windows Server 2025
 /// runners with HEVC 4:4:4: the runtime delivers 1920x1080 frames, and no
 /// error, in place of the picture. A test that receives NDI|HX video counts
-/// these and, when nothing else arrived, reports the decoder missing with
-/// [`skip`]; any other frame is the decoded picture and is checked as such.
+/// these and, when nothing else arrived, reports the decoder for its codec
+/// missing with [`skip`]; any other frame is the decoded picture and is
+/// checked as such.
 ///
 /// # Panics
 ///
@@ -299,10 +321,10 @@ pub fn is_hx_placeholder(sent: (u32, u32), received: (u32, u32)) -> bool {
 }
 
 /// The macOS and Windows runtimes decode NDI|HX themselves, through what the
-/// machine offers (see [`Requirement::HxDecoder`]): a hosted macOS runner
+/// machine offers (see [`Requirement::Hevc444Decoder`]): a hosted macOS runner
 /// decoded HEVC 4:4:4, and the hosted Windows Server 2025 runners delivered
-/// placeholders for it. Neither runtime shows beforehand whether it can decode,
-/// so the receiving test decides from what it is given.
+/// placeholders for it. Neither runtime shows beforehand whether it can decode
+/// a codec, so the receiving test decides from what it is given.
 #[cfg(any(windows, target_os = "macos"))]
 fn missing_hx_decoder(_: &Ndi) -> Option<String> {
     None

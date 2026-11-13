@@ -379,7 +379,7 @@ The helpers live in `src/test_support.rs`. Unit tests use them as
 | --- | --- |
 | `ndi()` | no NDI runtime library can be loaded |
 | `advanced_ndi()` | the runtime is not an Advanced SDK runtime, or the build lacks the declarations for Advanced sender configuration |
-| `hx_decoder(&ndi)` | the runtime is known to have no NDI\|HX video decoder. On Linux the helper loads `libndihx.so`, `libavcodec-ndi.so.61` or `libavcodec.so.61` from beside the runtime library or by name through the dynamic loader, which is where NDI 6.4.0.2 was measured to look. On Windows and macOS nothing shows it beforehand, so the helper answers `true` there. A test that receives NDI\|HX video therefore also passes each frame's size to `is_hx_placeholder`, and calls `skip(Requirement::HxDecoder, …)` when the runtime delivered nothing but its black 1920×1080 placeholder |
+| `hx_decoder(&ndi, decoder)` | the runtime is known to have no NDI\|HX video decoder; `decoder` is `Requirement::H264Decoder` or `Requirement::Hevc444Decoder`, the codec the test sends. On Linux the helper loads `libndihx.so`, `libavcodec-ndi.so.61` or `libavcodec.so.61` from beside the runtime library or by name through the dynamic loader, which is where NDI 6.4.0.2 was measured to look. On Windows and macOS nothing shows it beforehand, so the helper answers `true` there. A test that receives NDI\|HX video therefore also passes each frame's size to `is_hx_placeholder`, and calls `skip(decoder, …)` when the runtime delivered nothing but its black 1920×1080 placeholder |
 | `skip(Requirement::…, reason)` | called directly by a test that found another requirement unmet, such as the File library or the Discovery Server |
 
 A skip is printed to standard error as `skipped: <test> needs <requirement>`,
@@ -390,13 +390,14 @@ on one machine do not collide on it (see below).
 
 `GRAFTON_NDI_REQUIRE_RUNTIME` turns skips into failures. Its value is a
 comma-separated list of what the environment provides: `1` for any runtime,
-`advanced`, `file`, `discovery-server`, and `hx-decoder` for an NDI|HX video
-decoder. An environment that sets
+`advanced`, `file`, `discovery-server`, and `h264-decoder` and
+`hevc-444-decoder` for an NDI|HX decoder of H.264 and of HEVC 4:4:4. An
+environment that sets
 `GRAFTON_NDI_REQUIRE_RUNTIME=advanced` fails every test that would have skipped
 for lack of an Advanced runtime, so a run that was meant to cover the Advanced
-paths cannot pass without them. An entry that is not one of the five is
+paths cannot pass without them. An entry that is not one of the six is
 rejected when a skip consults it. An entry that no test in the build can check
-fails the run as well, for example `advanced` or `hx-decoder` without the
+fails the run as well, for example `advanced` or `h264-decoder` without the
 `advanced` feature, because such a promise could never be broken.
 
 Two more groups of variables make a run check what it ran against:

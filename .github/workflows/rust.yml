@@ -160,13 +160,14 @@ jobs:
       #   advanced          an Advanced runtime, compiled with its headers
       #   file              a File library the selected runtime can drive
       #   discovery-server  the SDK's Discovery Server program (Linux, 6.4)
-      #   hx-decoder        an NDI|HX video decoder (built into the runtime on
-      #                     macOS; on Linux, the driver package a row names in
-      #                     `hx-driver`, copied beside its runtime). No Windows
-      #                     row promises one: the hosted Windows runners gave
-      #                     black placeholder frames for HEVC 4:4:4
+      #   h264-decoder      an NDI|HX decoder for H.264 (built into the runtime
+      #                     on macOS; on Linux, the driver package a row names
+      #                     in `hx-driver`, copied beside its runtime)
+      #   hevc-444-decoder  the same for HEVC 4:4:4, with a 6.4 runtime
+      # No Windows row promises a decoder yet: the hosted Windows runners gave
+      # black placeholder frames for HEVC 4:4:4, and H.264 is unmeasured there.
       # Each step promises exactly what its build can check. A build without the
-      # advanced and file-io features can check only the first and the last, so
+      # advanced and file-io features can check only `1` and `discovery-server`, so
       # the no-default-features step promises `require-no-default`, or `1` in a
       # row that does not set it.
       matrix:
@@ -200,7 +201,7 @@ jobs:
             hx-driver: current-hx-driver-linux
             compatibility: 6.1.1-standard-linux
             compatibility-advanced: 6.3.2-advanced-linux
-            require: advanced,file,discovery-server,hx-decoder
+            require: advanced,file,discovery-server,h264-decoder,hevc-444-decoder
             require-no-default: 1,discovery-server
           - name: linux-x86 standard-6.4
             runner: ubuntu-24.04
@@ -250,7 +251,7 @@ jobs:
             runner: macos-15
             target: aarch64-apple-darwin
             package: 6.3.2-advanced-apple
-            require: advanced
+            require: advanced,h264-decoder
           - name: macos-arm64 standard-6.4
             runner: macos-15
             target: aarch64-apple-darwin
@@ -263,7 +264,7 @@ jobs:
             package: current-advanced-apple
             compatibility: 6.3.2-standard-apple
             compatibility-advanced: 6.3.2-advanced-apple
-            require: advanced,file,hx-decoder
+            require: advanced,file,h264-decoder,hevc-444-decoder
             apple-mobile: true
           - name: macos-x64 standard-6.4
             runner: macos-15-intel
@@ -312,8 +313,8 @@ jobs:
       # The only step that is given the acquisition secrets. It exports
       # NDI_SDK_DIR and NDI_RUNTIME_DIR_V6 for the steps that follow, and copies
       # a row's `hx-driver` beside that runtime. The compatibility runs' baseline
-      # runtimes get none: their builds cannot check `hx-decoder`, and a driver
-      # is pinned together with the SDK release of its own build.
+      # runtimes get none: those runs promise no decoder, and a driver is pinned
+      # together with the SDK release of its own build.
       - name: Provision the SDK
         id: sdk
         env:
@@ -375,8 +376,8 @@ jobs:
             cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features
           done
       # A Standard baseline SDK has no headers a build reads, so its pass is a
-      # build without Advanced declarations. That build can check neither
-      # `advanced` nor `hx-decoder`, whose only test sends from an Advanced sender.
+      # build without Advanced declarations, which cannot check `advanced`. No
+      # compatibility pass promises an NDI|HX decoder; the row's own runs do.
       - name: Baseline SDK builds with the current Advanced runtime
         if: matrix.compatibility
         run: |
@@ -390,7 +391,8 @@ jobs:
             export GRAFTON_NDI_EXPECTED_VERSION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_VERSION }}"
             export GRAFTON_NDI_EXPECTED_EDITION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_EDITION }}"
             require="${{ matrix.require }}"
-            if [ "$edition" = standard ]; then require="${require/advanced/1}"; require="${require/,hx-decoder/}"; fi
+            require="${require/,h264-decoder/}"; require="${require/,hevc-444-decoder/}"
+            if [ "$edition" = standard ]; then require="${require/advanced/1}"; fi
             export GRAFTON_NDI_REQUIRE_RUNTIME="$require"
             cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features
           done

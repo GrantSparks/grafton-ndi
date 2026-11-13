@@ -9,6 +9,7 @@
 
 mod common;
 
+use common::Requirement::{H264Decoder, Hevc444Decoder};
 use grafton_ndi::{
     advanced::*,
     capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, SdkEdition},
@@ -2350,7 +2351,7 @@ fn hevc_444_decodes_to_the_original_full_resolution_chroma_planes() {
     }
     // A decoder known to be missing skips here, and one that is missing
     // although nothing showed it beforehand is told by its placeholders below.
-    if !common::hx_decoder(&ndi) {
+    if !common::hx_decoder(&ndi, Hevc444Decoder) {
         return;
     }
     let _turn = sockets();
@@ -2362,36 +2363,21 @@ fn hevc_444_decodes_to_the_original_full_resolution_chroma_planes() {
     )
     .unwrap();
     let bitstream = include_bytes!("data/chroma-444.hevc");
-    // This encoder emits VPS, SPS and PPS before the IDR. Keep those exact
-    // Annex B units inline and in the envelope's extra data, as the SDK asks.
-    let end = bitstream
-        .windows(4)
-        .enumerate()
-        .find_map(|(i, bytes)| {
-            // The slice uses a three-byte start code, while the parameter sets
-            // use four. For both, `header` is the NAL header after the start code.
-            let (start, header) = if bytes == [0, 0, 0, 1] {
-                (i, *bitstream.get(i + 4)?)
-            } else if bytes[..3] == [0, 0, 1] {
-                (i, bytes[3])
-            } else {
-                return None;
-            };
-            (((header >> 1) & 0x3f) < 32).then_some(start)
-        })
-        .expect("the fixture has an IDR slice after VPS, SPS and PPS");
+    // This encoder emits VPS, SPS and PPS before the IDR. A NAL header's type
+    // is its first byte's bits 1 to 6, and types below 32 are slices.
+    let parameter_sets = parameter_sets(bitstream, |header| ((header >> 1) & 0x3f) < 32);
     let format = VideoPacketFormat::new(VideoCodec::Hevc, 64, 32)
         .unwrap()
         .with_frame_rate(FrameRate::new(30, 1).unwrap());
     let mut pts = 0;
-    let Some(frame) = decoded_hx_frame(&receiver, &format, "HEVC 4:4:4", || {
+    let Some(frame) = decoded_hx_frame(&receiver, &format, Hevc444Decoder, "HEVC 4:4:4", || {
         let bytes = PacketEnvelope::encode(
             EnvelopeCodec::Hevc,
             pts,
             pts,
             true,
             bitstream,
-            &bitstream[..end],
+            parameter_sets,
         )
         .unwrap();
         let mut packet = CompressedVideoFrame::new(format, bytes).unwrap();
@@ -2419,6 +2405,108 @@ fn hevc_444_decodes_to_the_original_full_resolution_chroma_planes() {
     }
 }
 
+/// The H.264 test picture's quadrants as (luma, Cb, Cr): top left, top right,
+/// bottom left, bottom right. `tests/data/generate.py` states the same.
+const H264_QUADRANTS: [[u8; 3]; 4] = [[48, 96, 176], [96, 176, 96], [160, 64, 128], [208, 160, 64]];
+
+/// H.264 is the NDI|HX codec the Advanced SDK manual documents as decoded
+/// without plugins on Windows and macOS, and it needs no 6.4 receiver mode.
+/// Flat quadrants, each with its own luma and chroma, come through 4:2:0 and
+/// QP 1 coding unchanged; none of them is the placeholder's black, and a
+/// swapped, shifted or desaturated picture fails.
+#[test]
+fn h264_420_decodes_to_the_original_quadrants() {
+    /// How far a decoded sample may stray from the coded picture. Through the
+    /// runtime and FFmpeg 7 on Linux every sample is exact; the margin is for
+    /// decoders and conversions that round differently.
+    const TOLERANCE: u8 = 4;
+
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    if !common::hx_decoder(&ndi, H264Decoder) {
+        return;
+    }
+    let _turn = sockets();
+    let mut sender = CompressedSender::new(&ndi, &options("h264-420")).unwrap();
+    let receiver = Receiver::new(
+        &ndi,
+        &ReceiverOptions::new(loopback(&ndi, &sender.sender().source().unwrap()))
+            .color_format(ReceiverColorFormat::UyvyBgra),
+    )
+    .unwrap();
+    let bitstream = include_bytes!("data/quadrants-420.h264");
+    // x264 emits SPS and PPS before the IDR. A NAL header's type is its first
+    // byte's low five bits, and types 1 to 5 are slices.
+    let parameter_sets = parameter_sets(bitstream, |header| matches!(header & 0x1f, 1..=5));
+    let format = VideoPacketFormat::new(VideoCodec::H264, 64, 64)
+        .unwrap()
+        .with_frame_rate(FrameRate::new(30, 1).unwrap());
+    let mut pts = 0;
+    let Some(frame) = decoded_hx_frame(&receiver, &format, H264Decoder, "H.264 4:2:0", || {
+        let bytes = PacketEnvelope::encode(
+            EnvelopeCodec::H264,
+            pts,
+            pts,
+            true,
+            bitstream,
+            parameter_sets,
+        )
+        .unwrap();
+        let mut packet = CompressedVideoFrame::new(format, bytes).unwrap();
+        sender.send_video(&mut packet).unwrap();
+        pts += 3000;
+    }) else {
+        return;
+    };
+    assert_eq!(frame.pixel_format(), grafton_ndi::PixelFormat::Uyvy);
+    assert_eq!(frame.planes().len(), 1);
+    let plane = frame.plane(0).unwrap();
+    assert_eq!(plane.row_count(), 64);
+    for (y, row) in plane.rows().enumerate() {
+        // Each pair of pixels is Cb, Y, Cr, Y.
+        let (pairs, rest) = row.as_chunks::<4>();
+        assert_eq!((pairs.len(), rest.len()), (32, 0));
+        for (x, &[cb_value, left, cr_value, right]) in pairs.iter().enumerate() {
+            let [luma, cb, cr] = H264_QUADRANTS[2 * usize::from(y >= 32) + usize::from(x >= 16)];
+            for (sample, pixel, value, expected) in [
+                ("Cb", 2 * x, cb_value, cb),
+                ("Y", 2 * x, left, luma),
+                ("Cr", 2 * x, cr_value, cr),
+                ("Y", 2 * x + 1, right, luma),
+            ] {
+                assert!(
+                    value.abs_diff(expected) <= TOLERANCE,
+                    "{sample} at ({pixel}, {y}) is {value}, coded as {expected}"
+                );
+            }
+        }
+    }
+}
+
+/// The Annex B units before the first slice of `bitstream`, start codes
+/// included: its parameter sets, which the SDK asks for both inline and in
+/// the envelope's extra data. `is_slice` tells a slice by its NAL header's
+/// first byte.
+fn parameter_sets(bitstream: &[u8], is_slice: impl Fn(u8) -> bool) -> &[u8] {
+    let end = bitstream
+        .windows(4)
+        .enumerate()
+        .find_map(|(i, bytes)| {
+            // A start code is three or four bytes; the NAL header follows it.
+            let header = if bytes == [0, 0, 0, 1] {
+                *bitstream.get(i + 4)?
+            } else if bytes[..3] == [0, 0, 1] {
+                bytes[3]
+            } else {
+                return None;
+            };
+            is_slice(header).then_some(i)
+        })
+        .expect("the fixture has a slice after its parameter sets");
+    &bitstream[..end]
+}
+
 /// The first decoded frame `receiver` delivers while `send` sends NDI|HX
 /// video of `format`, once per capture slice.
 ///
@@ -2426,11 +2514,12 @@ fn hevc_444_decodes_to_the_original_full_resolution_chroma_planes() {
 /// black 1920x1080 placeholder instead (see [`common::is_hx_placeholder`]).
 /// Any other frame is the decoded picture, is asserted to have the size that
 /// was sent, and is returned. Returns `None`, with the calling test reported
-/// as skipped for want of a decoder, when every frame delivered within
+/// as skipped for want of `decoder`, when every frame delivered within
 /// [`PATIENCE`] was the placeholder. Fails when no frame arrived at all.
 fn decoded_hx_frame<'rx>(
     receiver: &'rx Receiver,
     format: &VideoPacketFormat,
+    decoder: common::Requirement,
     video: &str,
     mut send: impl FnMut(),
 ) -> Option<VideoFrameRef<'rx>> {
@@ -2455,7 +2544,7 @@ fn decoded_hx_frame<'rx>(
                 "no {video} video arrived within {PATIENCE:?}"
             );
             common::skip(
-                common::Requirement::HxDecoder,
+                decoder,
                 &format!(
                     "the NDI runtime has no NDI|HX decoder for {video}: all {placeholders} frames \
                      it delivered in place of the {}x{} picture within {PATIENCE:?} were its \
