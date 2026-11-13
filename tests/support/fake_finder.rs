@@ -50,6 +50,15 @@ impl Snapshot {
             }
             return;
         }
+        if scenario == "deadline" {
+            self.plain = vec![NDIlib_source_t {
+                p_ndi_name: c"STUDIO (Camera)".as_ptr(),
+                __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
+                    p_url_address: c"192.0.2.10:5962".as_ptr(),
+                },
+            }];
+            return;
+        }
         let (count, len, byte) = match scenario.as_str() {
             "count" => (16_385, 4, b'x'),
             "many-short" => (16_384, 8, b'x'),
@@ -92,6 +101,21 @@ impl Snapshot {
     }
 }
 
+/// A deterministic gate used only by the deadline regression. Removing the
+/// trigger claims it once; tests release it even when an assertion panics.
+fn deadline_gate(trigger: &str, entered: &str, release: &str) {
+    let Some(directory) = std::env::var_os("GRAFTON_FAKE_FINDER_GATE") else {
+        return;
+    };
+    let directory = std::path::PathBuf::from(directory);
+    if std::fs::remove_file(directory.join(trigger)).is_ok() {
+        std::fs::write(directory.join(entered), b"entered").unwrap();
+        while !directory.join(release).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
 export! {
     fn NDIlib_find_create_v2(p_create_settings: *const NDIlib_find_create_t) -> NDIlib_find_instance_t {
         let settings = unsafe { &*p_create_settings };
@@ -108,12 +132,18 @@ export! {
         unsafe { drop(Box::from_raw(p_instance.cast::<Snapshot>())) };
     }
     fn NDIlib_find_get_current_sources(p_instance: NDIlib_find_instance_t, p_no_sources: *mut u32) -> *const NDIlib_source_t {
+        log("finder-snapshot");
+        deadline_gate("block", "entered", "release");
         let snapshot = unsafe { &mut *p_instance.cast::<Snapshot>() };
         snapshot.refresh();
         unsafe { *p_no_sources = snapshot.plain.len() as u32 };
         snapshot.plain.as_ptr()
     }
     fn NDIlib_find_wait_for_sources(p_instance: NDIlib_find_instance_t, timeout_in_ms: u32) -> bool {
+        if std::env::var("GRAFTON_FAKE_FINDER_CASE").unwrap() == "deadline" {
+            deadline_gate("hold-wait", "waiting", "wait-release");
+            return false;
+        }
         if std::env::var("GRAFTON_FAKE_FINDER_CASE").unwrap().starts_with("selection") {
             std::thread::sleep(std::time::Duration::from_millis(u64::from(timeout_in_ms.min(20))));
         }

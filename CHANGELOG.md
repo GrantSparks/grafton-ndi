@@ -77,6 +77,8 @@ API, see the [README](README.md) and the migration guides for
 - Owned and borrowed video builders default to the SDK's square-pixel aspect
   sentinel (`0.0`), so non-16:9 images display according to their dimensions.
   Explicit anamorphic overrides and captured aspect values are preserved.
+- Finder selection and enumeration spend their discovery deadline while waiting
+  for the snapshot lock; a zero-timeout lookup makes a non-waiting attempt.
 
 - Receiver video, audio and metadata drop percentages now divide native drops
   by the native received total, which already includes those drops. Existing

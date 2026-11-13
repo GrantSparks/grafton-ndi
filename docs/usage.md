@@ -24,8 +24,9 @@ if finder.wait_for_sources(Duration::from_secs(2))? {
 }
 ```
 
-Select a specific feed on the configured finder. Selection checks the current
-snapshot immediately, then waits within one budget until a match appears:
+Select a specific feed on the configured finder. Selection attempts a current
+snapshot immediately, then waits within one budget until a match appears. Waiting
+for another snapshot on this finder spends the same budget:
 
 ```rust
 let camera = finder
@@ -38,9 +39,12 @@ let camera = finder
 Exact names are case-sensitive. Duplicate names at different addresses select the
 first match in the snapshot; disambiguate with `find_source(timeout, |source|
 ...)`, inspecting both name and address. Predicates run outside the SDK snapshot
-lock. A zero timeout checks once; an oversized timeout is refused even when an
-immediate match exists. Neither selection nor enumeration guarantees continued
-availability.
+lock. A zero timeout makes one non-waiting snapshot attempt and returns no
+selection if another snapshot holds the mutex. An oversized timeout is refused
+even when an immediate match exists. Native snapshot execution, bounded descriptor
+copies and caller predicates cannot be interrupted and may finish after the wait
+budget. `current_sources()` itself retains ordinary blocking snapshot serialization.
+Neither selection nor enumeration guarantees continued availability.
 
 A host can publish several feeds. `SourceCache::new(&finder)` binds a cache to
 that finder's groups, IP hints and configuration. `sources_by_host` observes the
@@ -57,7 +61,9 @@ for feed in feeds { println!("{feed}"); }
 Entries remain stale until `invalidate(host)` or `clear()` removes them, and an
 empty result is not cached. Configure IP hints on the finder itself. Lookup never
 creates another finder or changes scope. Cache hits return owned descriptor
-copies; misses use the same bounded allocations as full-window enumeration.
+copies; misses use the same bounded allocations and snapshot-lock wait budget as
+full-window enumeration. Cache access and descriptor copies can briefly serialize
+on the cache mutex; this time is outside a miss's discovery observation window.
 
 ## Receive streams
 

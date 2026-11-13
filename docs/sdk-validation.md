@@ -388,7 +388,13 @@ snapshot before running the caller's predicate. Deterministic fake-runtime tests
 in `tests/finder_selection.rs` cover staggered and reversed discovery, duplicate
 names at different endpoints, predicate reentry, full-window host result sets,
 and cache isolation between configured finders. Existing snapshot and accumulated
-result budget tests also cover the public selection/cache paths.
+result budget tests also cover the public selection/cache paths. The gated fake
+runtime in `tests/finder_deadlines.rs` holds a native snapshot open while other
+lookups make zero, bounded, and already-expired attempts: they finish within their
+own lock-wait budgets without another native fetch. Enumeration and host-cache
+misses return observations accumulated before expiry. Releasing the gate permits
+later selection; a native source-list wait by itself holds no snapshot mutex.
+All paths retain the same bounded descriptor-copy kernel.
 
 On Linux x86_64 with Advanced 6.4.0.2 and its File library, under the loopback-only
 runner, `configured_exact_selection_records_the_selected_endpoint_and_explicit_name_policy`

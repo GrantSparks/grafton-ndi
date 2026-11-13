@@ -10,7 +10,7 @@ use std::{
     fmt::{self, Display, Formatter},
     net::IpAddr,
     ptr,
-    sync::Mutex,
+    sync::{Mutex, MutexGuard, TryLockError},
     time::Duration,
 };
 
@@ -303,6 +303,22 @@ impl Finder {
             .sources_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: this guard excludes replacement of the SDK's buffers through
+        // the entire shared fetch/copy kernel; caller supplies readable strings.
+        unsafe { self.snapshot_locked(_snapshot, fetch, copy) }
+    }
+
+    /// The shared native fetch and bounded copy, with the lifetime lock held.
+    ///
+    /// # Safety
+    ///
+    /// As for `snapshot`; `snapshot_lock` must guard this finder's sources lock.
+    unsafe fn snapshot_locked<D, T>(
+        &self,
+        _snapshot_lock: MutexGuard<'_, ()>,
+        fetch: impl FnOnce(NDIlib_find_instance_t, &mut u32) -> *const D,
+        copy: impl FnMut(&D, &mut SnapshotBudget) -> Result<Option<T>>,
+    ) -> Result<Vec<T>> {
         let mut count = 0;
         let descriptors = fetch(self.instance, &mut count);
         // SAFETY: fetch's contract supplies the array; the lock keeps it
@@ -415,6 +431,45 @@ impl Finder {
         }
     }
 
+    /// Acquire the snapshot lock within a lookup's existing wait budget.
+    ///
+    /// The standard mutex preserves the finder's poisoning and unwind contracts.
+    /// It has no timed lock, so contended attempts sleep for at most one
+    /// millisecond of the remaining budget; zero/expired budgets only try once.
+    fn snapshot_lock_until(&self, deadline: Deadline) -> Option<MutexGuard<'_, ()>> {
+        loop {
+            match self.sources_lock.try_lock() {
+                Ok(guard) => return Some(guard),
+                Err(TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+                Err(TryLockError::WouldBlock) => {}
+            }
+            let remaining = deadline.remaining();
+            if remaining.is_zero() {
+                return None;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(1)));
+        }
+    }
+
+    /// The lookup's next snapshot, or none when contention exhausts its budget.
+    fn current_sources_until(&self, deadline: Deadline) -> Result<Option<Vec<Source>>> {
+        let Some(snapshot_lock) = self.snapshot_lock_until(deadline) else {
+            return Ok(None);
+        };
+        let api = self._ndi.api();
+        // SAFETY: the guard excludes snapshot replacement through the same
+        // bounded fetch/copy kernel as `current_sources`; the SDK owns live
+        // descriptors and strings until that guard is released.
+        unsafe {
+            self.snapshot_locked(
+                snapshot_lock,
+                |instance, count| api.core.NDIlib_find_get_current_sources(instance, count),
+                |source, budget| snapshot_entry(source, budget),
+            )
+            .map(Some)
+        }
+    }
+
     /// Poll discovery until `accept` selects a value or `timeout` elapses.
     ///
     /// After each source-list snapshot, `accept` is handed the current sources
@@ -437,7 +492,10 @@ impl Finder {
         // first snapshot already satisfies `accept`.
         let deadline = Deadline::after(timeout)?;
         loop {
-            if let Some(selected) = accept(self.current_sources()?)? {
+            let Some(sources) = self.current_sources_until(deadline)? else {
+                return Ok(None);
+            };
+            if let Some(selected) = accept(sources)? {
                 return Ok(Some(selected));
             }
             if deadline.is_expired() {
@@ -452,17 +510,22 @@ impl Finder {
 
     /// Wait until a source satisfies `select`, using this finder's discovery scope.
     ///
-    /// Checks the current snapshot immediately, then waits for source-list changes
-    /// within one total budget. `Duration::ZERO` checks one snapshot. Returns the
-    /// first matching complete descriptor in a snapshot, or `None` when the budget
-    /// expires. Predicates run after releasing the snapshot lock, may inspect name
-    /// and address together, and may call this finder's snapshot APIs. No source's
+    /// Attempts a current snapshot immediately, then waits for source-list changes
+    /// within one total wait budget, including snapshot-lock contention.
+    /// `Duration::ZERO` makes one non-waiting snapshot attempt; a busy snapshot lock
+    /// returns `None`. Returns the first matching complete descriptor in a snapshot,
+    /// or `None` when the budget expires without a match. Predicates run after
+    /// releasing the snapshot lock, may inspect name and address together, and may
+    /// call this finder's snapshot APIs. No source's
     /// continued availability is guaranteed.
     ///
     /// This blocks the calling thread and allocates bounded owned snapshots as
     /// [`Self::current_sources`] describes. It retains this finder's groups, IP
     /// hints, local-source policy, configuration and runtime; it creates no finder.
-    /// Concurrent selection operations can use the same finder.
+    /// Concurrent selection operations can use the same finder. Native snapshot
+    /// execution, bounded descriptor copies, and caller predicates cannot be
+    /// interrupted and may finish after the wait budget; `current_sources` itself
+    /// keeps its ordinary blocking snapshot-lock behavior.
     ///
     /// # Errors
     ///
@@ -512,8 +575,11 @@ impl Finder {
     ///
     /// # Arguments
     ///
-    /// * `timeout` - Discovery window. [`Duration::ZERO`] returns an immediate
-    ///   snapshot. Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+    /// * `timeout` - Discovery window, including waits for the snapshot lock.
+    ///   [`Duration::ZERO`] makes one non-waiting snapshot attempt, returning no
+    ///   sources if the lock is busy. Must not exceed [`crate::MAX_TIMEOUT`]
+    ///   (~49.7 days). Native snapshot execution and descriptor copies can finish
+    ///   after the wait budget; lock contention returns the results observed so far.
     ///
     /// # Returns
     ///
@@ -1211,13 +1277,16 @@ impl<'finder> SourceCache<'finder> {
     /// All feeds observed on a complete hostname or IP within `timeout`.
     ///
     /// A cache hit returns owned descriptor copies without an SDK call. On a
-    /// miss, observes the full window using the configured finder; zero checks
-    /// one snapshot. Results retain first-observed order and distinguish names,
+    /// miss, observes the full window using the configured finder; zero makes
+    /// one non-waiting snapshot attempt. Results retain first-observed order and distinguish names,
     /// full addresses, and address variants. Select the desired feed explicitly.
     /// Empty results return an empty vector and are not retained.
     ///
-    /// Blocks on discovery only, outside the cache lock. Discovery uses the same
-    /// bounded, fallible snapshot and accumulated-result allocations as
+    /// Discovery runs outside the cache lock; its window includes snapshot-lock
+    /// contention. Access to cached descriptor copies can briefly serialize on the
+    /// cache mutex. Copying and native snapshot execution can finish after the
+    /// discovery wait budget. Discovery uses the same bounded, fallible snapshot
+    /// and accumulated-result allocations as
     /// [`Finder::find_sources`]. Returned cached descriptors are fallibly copied.
     /// Entries have the explicit stale-data policy described on [`SourceCache`].
     ///
