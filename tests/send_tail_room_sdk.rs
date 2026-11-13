@@ -241,9 +241,9 @@ fn received(ndi: &Ndi, label: &str, frame: BorrowedVideoFrame<'_>) -> Vec<u8> {
 ///
 /// Which builds read past is measured, and is not the same question as which
 /// get room: the x86-64 build reads past this frame; the 64-bit ARM build
-/// reads it exactly and gets no room; the 32-bit x86 build read it exactly in
-/// run 43365028704, but has been measured at no other size, so it keeps the
-/// x86 room that the crate gives every build it has not measured.
+/// reads it exactly and gets no room; the 32-bit x86 build reads it exactly
+/// too, but has been measured at no other size, so it keeps the x86 room that
+/// the crate gives every build it has not measured.
 #[test]
 fn bytes_after_a_buffer_reach_the_picture_only_as_room() {
     let Some(ndi) = common::ndi() else {

@@ -14,19 +14,18 @@
 //! Every conversion is judged against the UYVY frame a second receiver got
 //! from the same stream, so the tests do not depend on the transport being
 //! lossless. It is for these frames on Linux x86-64, which the first test
-//! pins; the 32-bit x86 and the Windows runtimes were seen not to return a
-//! 3840x2160 frame exactly.
+//! pins; the 32-bit x86 and the Windows runtimes do not return a 3840x2160
+//! frame exactly.
 #![cfg(feature = "image-encoding")]
 
 mod common;
 
 use grafton_ndi::{
-    ColorInfo, ColorPolicy, Error, FrameSync, ImageFormat, ImageOptions, Ndi, PixelFormat,
-    Receiver, ReceiverColorFormat, ReceiverOptions, ScanType, Sender, SenderOptions, VideoFrame,
-    YuvMatrix, YuvRange,
+    capabilities::SdkEdition, ColorInfo, ColorPolicy, Error, FrameSync, ImageFormat, ImageOptions,
+    Ndi, PixelFormat, Receiver, ReceiverColorFormat, ReceiverOptions, ScanType, Sender,
+    SenderOptions, VideoFrame, YuvMatrix, YuvRange,
 };
 use std::{
-    fmt,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
@@ -145,9 +144,6 @@ fn round_trip(
     })
 }
 
-/// A received frame's size, pixel format and metadata.
-type Kind = (u32, u32, PixelFormat, Option<String>);
-
 /// Capture until a frame like each of `frames`, by metadata and size, has
 /// arrived.
 fn collect(
@@ -156,39 +152,12 @@ fn collect(
     what: &str,
 ) -> Vec<VideoFrame> {
     let mut found: Vec<Option<VideoFrame>> = vec![None; frames.len()];
-    // What arrived that matched no frame sent, with how many of each: for the
-    // message of a run where a frame never did.
-    let mut others: Vec<(Kind, usize)> = Vec::new();
-    let mut arrived = 0;
     let deadline = Instant::now() + Duration::from_secs(60);
     while found.iter().any(Option::is_none) {
-        assert!(
-            Instant::now() < deadline,
-            "{what}: not every frame arrived: {arrived} frames arrived, {} of the {} sent \
-             among them, and these that match none: {others:?}",
-            found.iter().flatten().count(),
-            frames.len()
-        );
+        assert!(Instant::now() < deadline, "{what}: not every frame arrived");
         let Some(frame) = capture(Duration::from_millis(500)) else {
             continue;
         };
-        arrived += 1;
-        let matched = frames.iter().any(|sent| {
-            (sent.width(), sent.height(), sent.metadata())
-                == (frame.width(), frame.height(), frame.metadata())
-        });
-        if !matched {
-            let key = (
-                frame.width(),
-                frame.height(),
-                frame.pixel_format(),
-                frame.metadata().map(str::to_owned),
-            );
-            match others.iter_mut().find(|(seen, _)| *seen == key) {
-                Some((_, count)) => *count += 1,
-                None => others.push((key, 1)),
-            }
-        }
         for (sent, slot) in frames.iter().zip(&mut found) {
             if (sent.width(), sent.height(), sent.metadata())
                 == (frame.width(), frame.height(), frame.metadata())
@@ -246,116 +215,18 @@ fn byte_difference(a: &[u8], b: &[u8]) -> (u8, f64) {
     (largest, total as f64 / a.len() as f64)
 }
 
-/// Where two UYVY pictures of 64x64 flat patches, of one size, differ, for
-/// a failure message: how many bytes, the rectangle of pixels that holds
-/// them, the largest difference, and the patches that differ most. The
-/// patches lie on the codec's block boundaries, so its loss alone leaves
-/// every patch close to flat and spreads evenly; a region that differs much
-/// more than the rest is a frame that is wrong there.
-fn where_they_differ(sent: &[u8], received: &[u8], width: usize) -> String {
-    let row = width * 2;
-    let height = sent.len() / row;
-    let (columns, rows) = (width.div_ceil(64), height.div_ceil(64));
-    // The sum and the largest of the differences in each patch.
-    let mut patches = vec![(0u64, 0u8); columns * rows];
-    let mut differing = 0;
-    let (mut left, mut right, mut top, mut bottom) = (usize::MAX, 0, usize::MAX, 0);
-    let mut largest = (0, 0);
-    for (i, (s, r)) in sent.iter().zip(received).enumerate() {
-        let d = s.abs_diff(*r);
-        if d == 0 {
-            continue;
-        }
-        differing += 1;
-        let (x, y) = (i % row / 2, i / row);
-        (left, right, top, bottom) = (left.min(x), right.max(x), top.min(y), bottom.max(y));
-        let patch = &mut patches[(y / 64) * columns + x / 64];
-        patch.0 += u64::from(d);
-        patch.1 = patch.1.max(d);
-        if d > largest.0 {
-            largest = (d, i);
-        }
-    }
-    if differing == 0 {
-        return "they are identical".to_owned();
-    }
-    let mean = |index: usize, total: u64| {
-        let (px, py) = (index % columns, index / columns);
-        let bytes = 64.min(width - px * 64) * 2 * 64.min(height - py * 64);
-        total as f64 / bytes as f64
-    };
-    let mut worst: Vec<_> = patches
-        .iter()
-        .enumerate()
-        .filter(|(_, (total, _))| *total > 0)
-        .map(|(index, &(total, max))| (index, mean(index, total), max))
-        .collect();
-    let affected = worst.len();
-    worst.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let (d, i) = largest;
-    let mut text = format!(
-        "{differing} of {} bytes differ, in pixels {left}..={right} of rows {top}..={bottom}; \
-         {affected} of {} patches differ; the largest difference, {d}, is at byte {} of row {} \
-         (sent {}, received {}); the patches that differ most, by mean:",
-        sent.len(),
-        columns * rows,
-        i % row,
-        i / row,
-        sent[i],
-        received[i]
-    );
-    for (index, mean, max) in worst.iter().take(6) {
-        let (px, py) = (index % columns, index / columns);
-        text += &format!(" ({px}, {py}) {mean:.2} up to {max};");
-    }
-    text
-}
-
 /// How far two UYVY pictures of 64x64 flat patches, of one size, are apart
-/// where codec loss leaves a flat patch flat: the means of each patch's
-/// interior, the pixels at least 8 from its edges, compared component by
-/// component. A wrong frame, or the SDK's black placeholder, differs there by
-/// tens of code values; loss at the patches' edges, which can be large, does
-/// not.
-#[derive(Debug)]
-struct Interiors {
-    /// The largest difference of a luma mean, and where it is.
-    luma: (f64, String),
-    /// The largest difference of a Cb or Cr mean, and where it is.
-    chroma: (f64, String),
-    /// The patches whose Cb or Cr mean differs by more than 2.
-    chroma_patches: usize,
-    patches: usize,
-}
-
-impl fmt::Display for Interiors {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "the largest difference of a patch interior's mean is {:.2} in luma ({}) and {:.2} \
-             in chroma ({}); the chroma of {} of {} patch interiors differs by more than 2",
-            self.luma.0,
-            self.luma.1,
-            self.chroma.0,
-            self.chroma.1,
-            self.chroma_patches,
-            self.patches
-        )
-    }
-}
-
-fn interior_difference(sent: &[u8], received: &[u8], width: usize) -> Interiors {
+/// where codec loss leaves a flat patch flat: the largest difference, over
+/// every patch and component, between the means of a patch's interior, the
+/// pixels at least 8 from its edges. A wrong frame, or the SDK's black
+/// placeholder, differs there by tens of code values; loss at the patches'
+/// edges, which can be large, does not.
+fn interior_difference(sent: &[u8], received: &[u8], width: usize) -> f64 {
     const INSET: usize = 8;
     let row = width * 2;
     let height = sent.len() / row;
     let (columns, rows) = (width.div_ceil(64), height.div_ceil(64));
-    let none = || (0.0, "none".to_owned());
-    let mut found = Interiors {
-        luma: none(),
-        chroma: none(),
-        chroma_patches: 0,
-        patches: 0,
-    };
+    let mut worst: f64 = 0.0;
     for (py, px) in (0..rows).flat_map(|py| (0..columns).map(move |px| (py, px))) {
         let (x0, y0) = (px * 64 + INSET, py * 64 + INSET);
         let (x1, y1) = (
@@ -365,7 +236,6 @@ fn interior_difference(sent: &[u8], received: &[u8], width: usize) -> Interiors 
         if x0 >= x1 || y0 >= y1 {
             continue;
         }
-        found.patches += 1;
         // Sums of Cb, Y and Cr, sent and received, over the pixel pairs
         // inside; a pair is Cb, Y, Cr, Y.
         let mut sums = [[0u64; 3]; 2];
@@ -384,23 +254,13 @@ fn interior_difference(sent: &[u8], received: &[u8], width: usize) -> Interiors 
                 counts[2] += 1;
             }
         }
-        let mut chroma_off = false;
-        for (component, name) in ["Cb", "Y", "Cr"].into_iter().enumerate() {
+        for component in 0..3 {
             let count = counts[component] as f64;
             let gap = (sums[0][component] as f64 - sums[1][component] as f64).abs() / count;
-            let worst = if component == 1 {
-                &mut found.luma
-            } else {
-                chroma_off |= gap > 2.0;
-                &mut found.chroma
-            };
-            if gap > worst.0 {
-                *worst = (gap, format!("{name} inside patch ({px}, {py})"));
-            }
+            worst = worst.max(gap);
         }
-        found.chroma_patches += usize::from(chroma_off);
     }
-    found
+    worst
 }
 
 /// The largest and the mean difference between two images.
@@ -427,6 +287,12 @@ fn the_sdk_converts_with_bt709_at_every_size_whatever_the_tag_says() {
     let bt601 = "<ndi_color_info matrix=\"bt_601\" primaries=\"bt_601\" transfer=\"bt_601\"/>";
     let bt2020 = "<ndi_metadata_group><ndi_color_info matrix=\"bt_2020\" primaries=\"bt_2020\" transfer=\"bt_2020\"/></ndi_metadata_group>";
     for (width, height) in [(720, 576), (1920, 1080), (3840, 2160)] {
+        if width == 3840 && cfg!(target_arch = "x86") {
+            common::unsupported(
+                "3840x2160, which the 32-bit x86 runtime returns with wrong chroma",
+            );
+            continue;
+        }
         let sent: Vec<VideoFrame> = [untagged, bt601, bt2020]
             .into_iter()
             .map(|metadata| uyvy_patches(width, height, metadata))
@@ -441,25 +307,16 @@ fn the_sdk_converts_with_bt709_at_every_size_whatever_the_tag_says() {
             let case = format!("{width}x{height} {:?}", sent.metadata());
             // Both receivers decode one stream, so the UYVY frame is what the
             // SDK converted to RGBX, whether or not it is the frame sent. It
-            // is the picture sent, each patch keeping its value away from its
-            // edges, where codec loss alone can be large. The 32-bit x86
-            // runtime returned this picture at 3840x2160 with the chroma of
-            // some patch interiors wrong as well, by up to 40.8 code values,
-            // those of the leftmost column the most (runs 43366775596 and
-            // 43369298234), while its luma held: there its chroma is bounded
-            // by what was measured rather than by codec loss.
+            // is the picture sent: each patch keeps its value away from its
+            // edges, where the codec's loss can be large.
             assert_eq!(uyvy.pixel_format(), PixelFormat::Uyvy, "{case}");
             let (largest, mean) = byte_difference(uyvy.data(), sent.data());
-            let interiors = interior_difference(sent.data(), uyvy.data(), width);
-            // The 32-bit x86 runtime's 3840x2160 delivery is wrong in places
-            // (see above), and not the same twice.
-            let defective = cfg!(target_arch = "x86") && width == 3840;
-            let chroma_bound = if defective { 48.0 } else { 2.0 };
+            let interior = interior_difference(sent.data(), uyvy.data(), width);
             assert!(
-                interiors.luma.0 <= 2.0 && interiors.chroma.0 <= chroma_bound,
-                "{case}: the received UYVY is not the picture sent: {interiors}; the frame differs \
-                 by up to {largest}, {mean:.3} on average; {}",
-                where_they_differ(sent.data(), uyvy.data(), width)
+                interior <= 2.0,
+                "{case}: the received UYVY is not the picture sent: a patch interior's mean \
+                 differs by {interior:.2}; the frame differs by up to {largest}, {mean:.3} on \
+                 average"
             );
             if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
                 assert_eq!(
@@ -479,9 +336,9 @@ fn the_sdk_converts_with_bt709_at_every_size_whatever_the_tag_says() {
                 sent.color_info().unwrap(),
                 "{case}"
             );
-            // RgbxRgba gives RGBX for a source without alpha on every runtime
-            // measured except the Windows Standard 6.3.2 one, which gave RGBA,
-            // opaque (run 43366775596). Either carries the SDK's RGB.
+            // RgbxRgba gives RGBX for a source without alpha, except on the
+            // Windows Standard 6.3.2 runtime, which gives opaque RGBA. Either
+            // carries the SDK's RGB.
             match rgbx.pixel_format() {
                 PixelFormat::Rgbx => {}
                 PixelFormat::Rgba => assert!(
@@ -501,22 +358,14 @@ fn the_sdk_converts_with_bt709_at_every_size_whatever_the_tag_says() {
                 matrix: YuvMatrix::Bt709,
                 range: YuvRange::Limited,
             });
-            // That needs both receivers to have been given one picture. On the
-            // 32-bit x86 runtime at 3840x2160 they were not: the SDK's RGB of
-            // one differed from the BT.709 of the other's UYVY by up to 255,
-            // 1.14 on average, where the smaller sizes agreed (run
-            // 43371812571). There the conversion is pinned by those sizes.
-            if !defective {
-                let (largest, mean) = difference(
-                    &png_rgb(&uyvy.encode_image(&bt709).unwrap()),
-                    &frame_rgb(rgbx),
-                );
-                assert!(
-                    largest <= 10 && mean <= 1.5,
-                    "{case}: the SDK's RGB differs from BT.709 by up to {largest}, {mean:.2} on \
-                     average"
-                );
-            }
+            let (largest, mean) = difference(
+                &png_rgb(&uyvy.encode_image(&bt709).unwrap()),
+                &frame_rgb(rgbx),
+            );
+            assert!(
+                largest <= 10 && mean <= 1.5,
+                "{case}: the SDK's RGB differs from BT.709 by up to {largest}, {mean:.2} on average"
+            );
             // The default policy follows a tag and otherwise takes BT.709.
             let default = uyvy.encode_png().unwrap();
             if sent
@@ -674,17 +523,12 @@ fn the_sdk_sends_rgb_as_bt709_limited_range() {
     }
 }
 
-#[test]
-fn a_pq_tag_reaches_rgb_receivers_and_their_frames_are_refused() {
-    let Some(ndi) = common::ndi() else {
-        return;
-    };
-    let (width, height) = (64, 16);
-    let tag = "<ndi_color_info transfer=\"bt_2100_pq\" matrix=\"bt_2100\" primaries=\"bt_2100\"/>";
+/// A P216 frame whose luma rises from left to right, with neutral chroma.
+fn p216_ramp(width: usize, height: usize, metadata: &str) -> VideoFrame {
     let mut data = Vec::new();
     for _ in 0..height {
         for x in 0..width {
-            data.extend_from_slice(&((x as u16) << 10).to_ne_bytes());
+            data.extend_from_slice(&(((x * 64 / width) as u16) << 10).to_ne_bytes());
         }
     }
     for _ in 0..height {
@@ -693,7 +537,23 @@ fn a_pq_tag_reaches_rgb_receivers_and_their_frames_are_refused() {
             data.extend_from_slice(&0x8000u16.to_ne_bytes());
         }
     }
-    let p216 = frame(PixelFormat::P216, width, height, data, tag);
+    frame(PixelFormat::P216, width, height, data, metadata)
+}
+
+#[test]
+fn a_pq_tag_reaches_rgb_receivers_and_their_frames_are_refused() {
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
+    if cfg!(windows) && ndi.info().edition() == SdkEdition::Standard {
+        common::unsupported(
+            "the Windows Standard runtime gives an RGB receiver nothing of a P216 frame tagged PQ",
+        );
+        return;
+    }
+    let (width, height) = (64, 16);
+    let tag = "<ndi_color_info transfer=\"bt_2100_pq\" matrix=\"bt_2100\" primaries=\"bt_2100\"/>";
+    let p216 = p216_ramp(width, height, tag);
     let received = round_trip(
         &ndi,
         "image color pq",
