@@ -6,10 +6,10 @@
 //! dropped. A receiver not given a frame within [`GRACE`], where those that
 //! connect are given one in milliseconds, has stalled.
 //!
-//! Under the Windows test runner about half of such receivers stall, and with
-//! the firewall off none does (`ci/README.md`, "Windows"). The report this
-//! test prints is what that is diagnosed with. For the first [`DIAGNOSED`]
-//! stalled receivers the Windows TCP table for the port is taken
+//! On Windows, with a Discovery Server configured that the SDK cannot reach,
+//! about half of such receivers stall (the README's known issues). The report
+//! this test prints is what a stall is diagnosed with. For the first
+//! [`DIAGNOSED`] stalled receivers the Windows TCP table for the port is taken
 //! ([`common::socket_table`]) and a second receiver is opened to the same
 //! endpoint; the first is then left alone until the suites' [`PATIENCE`] has
 //! passed, to show whether it connects by itself; after that, and for every
@@ -31,9 +31,9 @@ use std::{
 /// How long the suites wait for a receiver to deliver.
 const PATIENCE: Duration = Duration::from_secs(15);
 
-/// How long a receiver may take before it has stalled. Under the runners
-/// receivers that connect are given a frame within milliseconds; with the
-/// Windows firewall off, within about 2 s.
+/// How long a receiver may take before it has stalled. Receivers that connect
+/// are given a frame within milliseconds under the loopback-only runners, and
+/// within about 2 s on Windows, where multicast DNS is in use.
 const GRACE: Duration = Duration::from_secs(5);
 
 /// The receivers created, unless [`ENOUGH`] stall first.

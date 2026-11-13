@@ -272,7 +272,7 @@ jobs:
             package: current-standard-apple
             require: '1'
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 60
     env:
       TARGET: ${{ matrix.target }}
       PACKAGE: ${{ matrix.package }}
@@ -329,14 +329,15 @@ jobs:
             python ci/sdk.py install "${{ matrix.compatibility }}" --dest "$RUNNER_TEMP/ndi-compat" --target "$TARGET" --github-env "$RUNNER_TEMP/ndi-compat-standard.env"
             python ci/sdk.py install "${{ matrix.compatibility-advanced }}" --dest "$RUNNER_TEMP/ndi-compat-advanced" --target "$TARGET" --github-env "$RUNNER_TEMP/ndi-compat-advanced.env"
           fi
+      # Windows has no test runner to check: its tests run unconfined
+      # (ci/README.md, "Windows").
       - name: Test runner leaves loopback networking only
         id: isolation
         run: |
-          python ci/offline/check.py --online
           case "$RUNNER_OS" in
-            Linux) ci/offline/linux.sh python3 ci/offline/check.py ;;
-            macOS) ci/offline/macos.sh python3 ci/offline/check.py ;;
-            Windows) pwsh -NoProfile -File ci/offline/windows.ps1 "$(python -c 'import sys; sys.stdout.write(sys.executable)')" ci/offline/check.py ;;
+            Linux) python ci/offline/check.py --online && ci/offline/linux.sh python3 ci/offline/check.py ;;
+            macOS) python ci/offline/check.py --online && ci/offline/macos.sh python3 ci/offline/check.py ;;
+            Windows) echo 'Windows runs the runtime tests without a loopback-only runner.' ;;
           esac
       # Each runtime step is bounded well inside the job's limit (it takes 7
       # minutes at most when it passes), so that a test that never returns
@@ -357,22 +358,6 @@ jobs:
         env:
           GRAFTON_NDI_REQUIRE_RUNTIME: ${{ matrix.require-no-default || '1' }}
         run: cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --no-default-features
-      # Temporary: the receiver recreation test under the Windows runner with
-      # each choice of firewall rules, to pick rules that do not stall
-      # receivers (ci/README.md, "Windows"). The steps after it restore the
-      # runner's own.
-      - name: Windows receiver stall, by firewall rule
-        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && runner.os == 'Windows' }}
-        timeout-minutes: 15
-        env:
-          GRAFTON_NDI_REQUIRE_RUNTIME: '1'
-        run: |
-          status=0
-          for rules in outbound inbound none off; do
-            echo "receiver recreation under the Windows runner, GRAFTON_NDI_CI_FIREWALL=$rules"
-            GRAFTON_NDI_CI_FIREWALL=$rules cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features --test peer_recreation || status=1
-          done
-          exit "$status"
       # Without the Advanced headers the advanced feature compiles to stubs, so
       # only a build that has them lints and documents the real implementation.
       - name: Lint and document the Advanced implementation

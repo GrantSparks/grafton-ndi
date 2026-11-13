@@ -102,11 +102,11 @@ Each row:
    compatibility runs provisions its two baseline packages too, into separate
    directories, and writes their values to files under `$RUNNER_TEMP` for those
    runs. This step is the only one given the secrets in its environment;
-3. proves that the test runner isolates ([`offline/check.py`](offline/check.py)
-   outside and inside it). Every step after this one runs whenever this one
-   passed, whatever the steps in between did, so a run reports everything that
-   is wrong with a row and not only the first thing; none runs when the runner
-   was not shown to isolate;
+3. on Linux and macOS, proves that the test runner isolates
+   ([`offline/check.py`](offline/check.py) outside and inside it). Every step
+   after this one runs whenever this one passed, whatever the steps in between
+   did, so a run reports everything that is wrong with a row and not only the
+   first thing; none runs when the runner was not shown to isolate;
 4. runs `cargo test --locked --config ci/offline.toml --target <target>
    --no-fail-fast` twice, with `--all-features` and with
    `--no-default-features`. Every test binary runs, so a failing one does not
@@ -126,8 +126,6 @@ Each row:
      simulator, which needs a pinned nightly toolchain and `-Zbuild-std`;
    - **compatibility runs**: on the rows that have them, the four crossed runs
      described above;
-6. on Windows, runs the temporary step that diagnoses the runner's open
-   failure (see [Windows](#windows)).
 
 The job uses no dependency cache and uploads nothing, so SDK files and the
 Advanced bindings generated into the target directory never leave the runner.
@@ -275,23 +273,22 @@ libraries carry their own licence too.
 
 ## Loopback-only test runs
 
-Tests against a real runtime create NDI senders and finders. `ci/offline.toml`
-makes Cargo start every test executable through a wrapper in
-[`offline/`](offline) that leaves it loopback networking only, so nothing is
-announced on, or reached over, the network the machine is attached to.
-Doctests are included: the current stable Cargo hands the same runner to
+Tests against a real runtime create NDI senders and finders. On Linux and
+macOS, `ci/offline.toml` makes Cargo start every test executable through a
+wrapper in [`offline/`](offline) that leaves it loopback networking only, so
+nothing is announced on, or reached over, the network the machine is attached
+to. Doctests are included: the current stable Cargo hands the same runner to
 rustdoc, which starts each compiled doctest through it, with or without
-`--target`.
+`--target`. Windows has no such wrapper (see [Windows](#windows)).
 
-| | Linux ([`linux.sh`](offline/linux.sh)) | macOS ([`macos.sh`](offline/macos.sh)) | Windows ([`windows.ps1`](offline/windows.ps1)) |
-|---|---|---|---|
-| Network | own network namespace (`bwrap --unshare-net`) holding only `lo` | Seatbelt profile allowing only binding, loopback connections and traffic arriving on a local address | Defender Firewall block rules for the test executable, both directions; the firewall never filters loopback |
-| Host daemons | `/run` replaced by an empty tmpfs: no D-Bus, no Avahi | mDNSResponder socket denied; the SDK is given a loopback discovery address through `NDI_CONFIG_DIR` | untouched |
-| SDK networks | only `lo` exists | loopback discovery address instead of multicast DNS | loopback discovery address instead of multicast DNS, through `NDI_CONFIG_DIR` (see [Windows](#windows)) |
-| Machine's own name | resolves to `127.0.0.1` through a private `/etc/hosts` | cannot be relied on to resolve | resolves as usual |
-| `TMPDIR` | private tmpfs (`/run/tmp`) | private directory, removed afterwards | untouched |
-| SDK log | off | off | on, through `NDI_CONFIG_DIR`; printed when the executable fails |
-| Needs | `bubblewrap`, unprivileged user namespaces | nothing | an elevated shell |
+| | Linux ([`linux.sh`](offline/linux.sh)) | macOS ([`macos.sh`](offline/macos.sh)) |
+|---|---|---|
+| Network | own network namespace (`bwrap --unshare-net`) holding only `lo` | Seatbelt profile allowing only binding, loopback connections and traffic arriving on a local address |
+| Host daemons | `/run` replaced by an empty tmpfs: no D-Bus, no Avahi | mDNSResponder socket denied |
+| SDK networks | only `lo` exists | a loopback discovery address instead of multicast DNS, through `NDI_CONFIG_DIR` |
+| Machine's own name | resolves to `127.0.0.1` through a private `/etc/hosts` | cannot be relied on to resolve |
+| `TMPDIR` | private tmpfs (`/run/tmp`) | private directory, removed afterwards |
+| Needs | `bubblewrap`, unprivileged user namespaces | nothing |
 
 What each wrapper confines, and what it does not:
 
@@ -305,17 +302,9 @@ What each wrapper confines, and what it does not:
   other machines send to a listener the tests open on a wildcard address is
   still delivered, because the profile language cannot restrict the peer of
   inbound traffic.
-- **Windows.** The two firewall rules name one program, the test executable.
-  Its traffic to and from anything but loopback is blocked for as long as it
-  runs. A process it starts from a different program file is not covered, and
-  nothing else on the machine is affected. The rules name the program by its
-  long path, which the wrapper gets from `GetLongPathNameW`:
-  `New-NetFirewallRule` refuses a path with an 8.3 short component, and rustdoc
-  starts each doctest from a directory under `%TEMP%`, which the hosted images
-  set to the short form `C:\Users\RUNNER~1\AppData\Local\Temp`.
 
-Each `sdk` row runs [`offline/check.py`](offline/check.py) outside and then
-inside the wrapper. Inside, IPv4 loopback TCP and UDP must work, and the
+The Linux and macOS rows run [`offline/check.py`](offline/check.py) outside and
+then inside the wrapper. Inside, IPv4 loopback TCP and UDP must work, and the
 operating system must refuse at once a TCP connection to each of three public
 addresses and a UDP datagram to the mDNS multicast group that NDI discovery
 uses; a timeout, or any answer from a remote host, fails the check. Outside, the
@@ -325,14 +314,8 @@ datagram of the unconfined process itself (`refused`, as inside the wrapper). Th
 control then prints, on stdout, that this is a limitation and does not fail;
 the refusal of the mDNS group inside the runner shows nothing about the wrapper
 on such a machine, and only the public TCP connections attribute the refusals to
-it. A timeout or any other outcome of the datagram still fails the control.
-Inside the Windows wrapper there is a second exception: Defender Firewall drops
-a blocked outbound datagram without failing the send, so `sendto` succeeds and
-the check cannot observe the refusal (Linux and macOS report it at once). When
-every public TCP connection was refused, which shows that the block rules apply
-to the program, a datagram that reports `reached` is printed as a limitation and
-does not fail; with any TCP connection not refused, or any other datagram
-outcome, the check fails as on every other platform. The check exercises the one process the wrapper starts. It does not show what the
+it. A timeout or any other outcome of the datagram still fails the control. The
+check exercises the one process the wrapper starts. It does not show what the
 points above say a wrapper leaves open.
 
 Two parts of the wrappers exist because of how the SDK behaves:
@@ -345,34 +328,23 @@ Two parts of the wrappers exist because of how the SDK behaves:
   therefore binds a private `/etc/hosts` that maps the name, and the name with
   a trailing dot, to loopback. One test depends on this,
   `tests/video_padding_sdk.rs`, and it is compiled for Linux only; every other
-  test addresses its sender as `127.0.0.1:<port>`. The macOS and Windows
-  wrappers therefore do nothing about name resolution. A test that looks
-  sources up by host name on macOS would need more than that wrapper offers.
+  test addresses its sender as `127.0.0.1:<port>`. The macOS wrapper does
+  nothing about name resolution.
 - **`TMPDIR`.** The SDK reserves every sender and receiver name machine-wide
   with a lock file, `$TMPDIR/NTK_SEND_<sender name>`. In a shared directory two
   unrelated processes that use the same sender name fail each other with
-  "Failed to create NDI send instance", and the files are left behind. This was
-  observed on Linux; the macOS wrapper isolates `TMPDIR` as a precaution and
-  the Windows wrapper leaves it alone.
-
-The Windows wrapper also turns on the SDK's own log, at level `info`, in the
-configuration it gives the SDK, and prints the log after an executable that
-failed. The log names the port each sender listens on, the address each
-receiver opens and whether it connected, and the transport it receives over,
-none of which a test's own messages can show.
+  "Failed to create NDI send instance", and the files are left behind. Both
+  wrappers give each run a `TMPDIR` of its own.
 
 ### Windows
 
-Under the Windows runner the SDK is given a loopback discovery address, as
-under the macOS one. With multicast DNS blocked, a Windows receiver may never
-connect, even to an explicit loopback address.
-
-One failure of the runner is open. Under its rules, about half of the
-receivers of a source that a receiver of the same process connected to before
-never connect; with the firewall off every one connects.
-`tests/peer_recreation.rs` measures it, and the temporary step **Windows
-receiver stall, by firewall rule** runs that test with each choice of rules
-(`GRAFTON_NDI_CI_FIREWALL`), to pick rules that do not cause it.
+The Windows rows run the tests against the real runtime without a wrapper, as
+on any Windows machine. Confining them would change what the SDK does: a
+Windows receiver needs multicast DNS, and with multicast DNS blocked, or with
+a discovery server it cannot reach configured in its place, receivers may
+never connect, even to an explicit loopback address. The tests are the same on
+every platform, and the Linux and macOS wrappers show that they need no
+network.
 
 Tests leave out what a Windows runtime cannot do, and print that they did: the
 genlock tests on the 6.4 Advanced runtimes, whose genlock acquires no
@@ -387,12 +359,6 @@ When a receiver does not connect, the failure messages of
 services; `SYN_SENT` is a connection attempt nobody answers; and no row at all
 is a receiver that has not tried.
 
-On Linux the same run works locally:
-
-```sh
-export NDI_RUNTIME_DIR_V6="$HOME/ndi/standard-6.4/NDI SDK for Linux/lib/x86_64-linux-gnu"
-GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --config ci/offline.toml --all-features --test peer_recreation
-```
 
 ## Releasing
 

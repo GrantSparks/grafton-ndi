@@ -393,9 +393,7 @@ on one machine do not collide on it (see below).
 A test that connects a receiver to a sender of its own process addresses the
 sender through `common::loopback_source(&ndi, &sender)`, or
 `common::loopback_endpoint(&ndi, name)` for a source it knows only by name.
-Both find the sender's port with a finder and name `127.0.0.1:<port>`. What
-the Windows runner does to keep receivers connecting is under "Windows" in the
-[CI guide](ci/README.md#windows).
+Both find the sender's port with a finder and name `127.0.0.1:<port>`.
 When a receiver does not connect, `common::socket_table(port)` adds the operating
 system's view of that port to the failure message on Windows.
 
@@ -430,8 +428,9 @@ Two more groups of variables make a run check what it ran against:
 The NDI runtime reserves every sender and receiver name machine-wide with a
 lock file in `TMPDIR`, named `NTK_SEND_<sender name>` or `NTK_RECV_<receiver
 name>`. Two test runs that share a temporary directory can therefore fail each
-other. Give each run its own `TMPDIR`, or use the loopback-only runner
-described under [Continuous integration](#continuous-integration), which does.
+other. Give each run its own `TMPDIR`, or, on Linux and macOS, use the
+loopback-only runner described under
+[Continuous integration](#continuous-integration), which does.
 
 The loader, identity, ownership, Discovery Server and File-library scenarios
 in `tests/runtime_loading.rs`, `tests/runtime_shadowing.rs`,

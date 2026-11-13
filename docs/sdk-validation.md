@@ -10,8 +10,8 @@ crate supports NDI 6 runtimes and Rust 1.88 or later.
 
 The test suite runs with `cargo test --locked` on the platforms and runtimes
 listed under [Platform coverage](#platform-coverage). Every run against a real
-runtime uses `--config ci/offline.toml`, which confines each test executable
-to loopback networking, and sets `GRAFTON_NDI_EXPECTED_RUNTIME`,
+runtime uses `--config ci/offline.toml`, which on Linux and macOS confines each
+test executable to loopback networking, and sets `GRAFTON_NDI_EXPECTED_RUNTIME`,
 `GRAFTON_NDI_EXPECTED_VERSION` and `GRAFTON_NDI_EXPECTED_EDITION`, so each test
 that loads a runtime checks that it has loaded exactly the intended file,
 version and edition.
