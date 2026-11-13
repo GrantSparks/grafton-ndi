@@ -204,7 +204,8 @@ Choose typed capture for dedicated media workers, combined capture for one
 mixed-media loop, and FrameSync when output must follow a playback clock.
 [`mixed_media_relay`](../examples/mixed_media_relay.rs) is a complete synchronous
 relay using borrowed sends; [`mixed_media_async`](../examples/mixed_media_async.rs)
-shows owned analysis with either async runtime.
+shows scoped inspection with either async runtime; see
+[async processing](#integrate-with-async-runtimes) for costs and callback rules.
 
 ## Publish sources
 
@@ -506,6 +507,30 @@ waits from the future's first poll, but do not guarantee a completion deadline.
 Dropping a future cancels work only before its cancellation gate; work that has
 passed the gate can still consume a frame or event.
 
+For immediate inspection, use `video().capture_with(timeout, callback)` (also
+`audio()` and `metadata()`) or `capture_any_with(timeout, callback)` for mixed
+media and events. The synchronous callback borrows the validated frame/item on
+the same blocking worker after internal capture locks have been released. It
+runs once for a delivered value, and never on timeout or capture error. The
+wrapper retains and frees the SDK guard there, including if the callback panics;
+a panic reports `Error::SpawnFailed`. Only the computed `Send + 'static` result
+crosses the task boundary. The callback and its captures must also be
+`Send + 'static`; borrowed frames, rows, channels and text cannot escape it.
+
+Scoped processing adds no wrapper payload allocation or copy, including padded
+video, strided audio and metadata. Task/runtime allocations and allocations
+inside your callback still apply. Owned `capture` and `capture_any` copy active
+pixels/samples and present metadata into new storage: a 3840×2160 BGRA frame
+alone copies 33,177,600 pixel bytes (about 1.99 GB/s at 60 frames/s). Use owned
+capture or explicitly call `to_owned()` inside a callback to retain media across
+awaits.
+
+Keep callbacks bounded: they occupy a blocking worker and hold an SDK buffer
+until they return. The capture timeout limits waiting, not callback duration or
+side effects. After the cancellation gate a callback may execute even if its
+future was dropped. Typed callbacks retain notifications for event readers;
+mixed callbacks consume events under the usual combined-capture rules.
+
 Use async methods for capture, events and reconnects. `receiver()` exposes the
 synchronous receiver; calling its waiting methods blocks the calling thread.
 For `#[tokio::main]`, enable Tokio's `macros` and runtime features in your own dependency.
@@ -516,8 +541,10 @@ use std::time::Duration;
 
 let async_receiver = AsyncReceiver::new(receiver);
 async_receiver.receiver().set_tally(Tally::new(true, false));
-if let Some(frame) = async_receiver.video().capture(Duration::from_secs(5)).await? {
-    println!("{}x{}", frame.width(), frame.height());
+if let Some((width, height)) = async_receiver.video().capture_with(Duration::from_secs(5), |frame| {
+    (frame.width(), frame.height())
+}).await? {
+    println!("{width}x{height}");
 }
 if let Some(ReceiverEvent::StatusChanged(status)) = async_receiver.poll_event(Duration::ZERO).await? {
     println!("Active connections: {}", status.connections());

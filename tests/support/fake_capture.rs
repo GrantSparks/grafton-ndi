@@ -47,6 +47,7 @@ export! {
                     }
                 }
                 let data = Box::into_raw(pixels).cast::<u8>();
+                log(&format!("video-data:{}", data as usize));
                 unsafe { *p_video_data = NDIlib_video_frame_v2_t {
                     xres: if kind == "bad-video" { -1 } else { 4 }, yres: height, FourCC: format,
                     frame_rate_N: 30_000, frame_rate_D: 1001,
@@ -61,19 +62,23 @@ export! {
             "audio" | "bad-audio" if !p_audio_data.is_null() => {
                 let mut samples = Box::new([MaybeUninit::<f32>::uninit(); 16]);
                 for (index, value) in [(0, 0.25), (1, 0.5), (4, -0.25), (5, -0.5)] { samples[index].write(value); }
+                let data = Box::into_raw(samples).cast::<u8>();
+                log(&format!("audio-data:{}", data as usize));
                 unsafe { *p_audio_data = NDIlib_audio_frame_v3_t {
                     sample_rate: 48_000, no_channels: 2, no_samples: if kind == "bad-audio" { -1 } else { 2 },
                     timecode: 2345, FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
-                    p_data: Box::into_raw(samples).cast::<u8>(),
+                    p_data: data,
                     __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 { channel_stride_in_bytes: 16 },
                     p_metadata: c"<audio/>".as_ptr(), timestamp: 6789,
                 }};
                 NDIlib_frame_type_e_NDIlib_frame_type_audio
             }
             "metadata" | "bad-metadata" if !p_metadata.is_null() => {
+                let data = CString::new("<metadata/>").unwrap().into_raw();
+                log(&format!("metadata-data:{}", data as usize));
                 unsafe { *p_metadata = NDIlib_metadata_frame_t {
                     length: if kind == "bad-metadata" { -1 } else { 0 }, timecode: 3456,
-                    p_data: CString::new("<metadata/>").unwrap().into_raw(),
+                    p_data: data,
                 }};
                 NDIlib_frame_type_e_NDIlib_frame_type_metadata
             }

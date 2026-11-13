@@ -1,0 +1,25 @@
+error[E0277]: `Rc<i32>` cannot be sent between threads safely
+ --> tests/ui/async/fail/async_scoped_nonsend_capture.rs:9:39
+  |
+9 |         .capture_with(Duration::ZERO, move |_| *local)
+  |          ------------                 --------^^^^^^^
+  |          |                            |
+  |          |                            `Rc<i32>` cannot be sent between threads safely
+  |          |                            within this `{closure@$DIR/tests/ui/async/fail/async_scoped_nonsend_capture.rs:9:39: 9:47}`
+  |          required by a bound introduced by this call
+  |
+  = help: within `{closure@$DIR/tests/ui/async/fail/async_scoped_nonsend_capture.rs:9:39: 9:47}`, the trait `Send` is not implemented for `Rc<i32>`
+note: required because `local` is used within this closure
+ --> tests/ui/async/fail/async_scoped_nonsend_capture.rs:9:49
+  |
+9 |         .capture_with(Duration::ZERO, move |_| *local)
+  |                                                 ^^^^^
+note: required by a bound in `AsyncCapture::<'rx, R, K>::capture_with`
+ --> src/asynchronous.rs
+  |
+  | impl<'rx, R: AsyncRuntime, K: CaptureKind> AsyncCapture<'rx, R, K>
+...
+  |     pub async fn capture_with<F, T>(&self, timeout: Duration, process: F) -> Result<Option<T>>
+  |     where
+  |         F: for<'frame> FnOnce(&K::Ref<'frame>) -> T + Send + 'static,
+  |                                                       ^^^^ required by this bound in `AsyncCapture::<'rx, R, K>::capture_with`

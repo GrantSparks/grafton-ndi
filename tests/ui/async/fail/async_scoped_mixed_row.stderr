@@ -1,0 +1,21 @@
+error: lifetime may not live long enough
+ --> tests/ui/async/fail/async_scoped_mixed_row.rs:9:17
+  |
+7 |         .capture_any_with(Duration::ZERO, |item| match item {
+  |                                            ----- return type of closure is &'2 [u8]
+  |                                            |
+  |                                            has type `&'1 ReceiverItemRef<'_>`
+8 |             grafton_ndi::ReceiverItemRef::Video(frame) => {
+9 |                 frame.planes().next().unwrap().rows().next().unwrap()
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'1` must outlive `'2`
+
+error: lifetime may not live long enough
+ --> tests/ui/async/fail/async_scoped_mixed_row.rs:9:17
+  |
+7 |         .capture_any_with(Duration::ZERO, |item| match item {
+  |                                            ----- return type of closure is &'2 [u8]
+  |                                            |
+  |                                            has type `&ReceiverItemRef<'3>`
+8 |             grafton_ndi::ReceiverItemRef::Video(frame) => {
+9 |                 frame.planes().next().unwrap().rows().next().unwrap()
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'3` must outlive `'2`

@@ -50,7 +50,7 @@ async senders recover completed frames before reusing them.
 | `NDIlib_Recv_PTZ.rs` | `cargo run --example NDIlib_Recv_PTZ` | Control PTZ cameras. |
 | `concurrent_capture.rs` | `cargo run --example concurrent_capture` | Capture video, audio and metadata from one receiver on separate threads. |
 | `mixed_media_relay.rs` | `cargo run --example mixed_media_relay -- "HOST (Camera)" "Relay"` | Relay borrowed video/audio and metadata from one mixed-media wait; Ctrl-C stops it. |
-| `mixed_media_async.rs` | `cargo run --features tokio --example mixed_media_async -- "HOST (Camera)"` | Analyze owned mixed-media items on Tokio; use `--features smol` for smol. |
+| `mixed_media_async.rs` | `cargo run --features tokio --example mixed_media_async -- "HOST (Camera)"` | Inspect borrowed mixed media on a blocking worker and return small owned summaries without payload copies; use `--features smol` for smol. |
 
 ## Sending
 

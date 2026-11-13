@@ -1,4 +1,4 @@
-//! Analyze owned mixed-media items on Tokio or smol without blocking executor threads.
+//! Inspect borrowed mixed media on a blocking worker and return small owned summaries.
 //!
 //! Run: cargo run --features tokio --example mixed_media_async -- "HOST (Camera)"
 //! Or: cargo run --features smol --example mixed_media_async -- "HOST (Camera)"
@@ -8,31 +8,48 @@
 async fn analyze<R: grafton_ndi::asynchronous::AsyncRuntime>(
     receiver: grafton_ndi::asynchronous::AsyncReceiver<R>,
 ) -> grafton_ndi::Result<()> {
-    use grafton_ndi::ReceiverItem;
+    use grafton_ndi::{ReceiverEvent, ReceiverItemRef, Timecode};
     use std::time::Duration;
+    enum Summary {
+        Video(u32, u32, Timecode),
+        Audio(u32, u32),
+        Metadata(usize),
+        Event(ReceiverEvent),
+        Other,
+    }
     let mut received = 0;
     let mut silent = 0;
     while received < 100 && silent < 10 {
-        let Some(item) = receiver.capture_any(Duration::from_secs(1)).await? else {
+        // The callback retains the SDK buffer only during this bounded,
+        // synchronous inspection. Only the summary crosses the task boundary.
+        let Some(item) = receiver
+            .capture_any_with(Duration::from_secs(1), |item| match item {
+                ReceiverItemRef::Video(frame) => {
+                    Summary::Video(frame.width(), frame.height(), frame.timecode())
+                }
+                ReceiverItemRef::Audio(frame) => {
+                    Summary::Audio(frame.num_channels(), frame.num_samples())
+                }
+                ReceiverItemRef::Metadata(frame) => Summary::Metadata(frame.data().len()),
+                ReceiverItemRef::Event(event) => Summary::Event(*event),
+                _ => Summary::Other,
+            })
+            .await?
+        else {
             silent += 1;
             continue;
         };
         silent = 0;
         received += 1;
         match item {
-            ReceiverItem::Video(frame) => println!(
-                "video {}x{} at {:?}",
-                frame.width(),
-                frame.height(),
-                frame.timecode()
-            ),
-            ReceiverItem::Audio(frame) => println!(
-                "audio {} channels, {} samples/channel",
-                frame.num_channels(),
-                frame.num_samples()
-            ),
-            ReceiverItem::Metadata(frame) => println!("metadata {} bytes", frame.data().len()),
-            ReceiverItem::Event(event) => println!("event {event:?}"),
+            Summary::Video(width, height, timecode) => {
+                println!("video {width}x{height} at {timecode:?}")
+            }
+            Summary::Audio(channels, samples) => {
+                println!("audio {channels} channels, {samples} samples/channel")
+            }
+            Summary::Metadata(bytes) => println!("metadata {bytes} bytes"),
+            Summary::Event(event) => println!("event {event:?}"),
             _ => {}
         }
     }
