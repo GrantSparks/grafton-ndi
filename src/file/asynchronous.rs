@@ -2277,7 +2277,9 @@ mod tests {
 
     #[test]
     fn a_pending_event_wait_ends_at_close_without_waiting_for_the_drop_wait() {
-        let (device, recorder) = mock_recorder(Closing::After(Duration::from_secs(3)));
+        // The file is reported closed only when the test says so: until
+        // then, the drop wait can end only by running out its default 5 s.
+        let (device, recorder) = mock_recorder(Closing::WhenTold);
         let started = block_on(recorder.next_event(Duration::from_secs(1)))
             .unwrap()
             .unwrap();
@@ -2304,6 +2306,9 @@ mod tests {
             0,
             "the drop wait was still running"
         );
+        // The drop wait stopped the session; the close it waits for follows.
+        await_stop(&device);
+        device.close();
         block_on(closed).unwrap();
         assert_eq!(device.destroys.load(Ordering::Acquire), 1);
         assert!(device.closed_before_destroy.load(Ordering::Acquire));
