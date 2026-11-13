@@ -2804,7 +2804,7 @@ fn genlock_follows_a_local_reference_and_returns_to_the_system_clock() {
                 sender.send_audio(&audio);
             }
         });
-        await_reference(&mut genlock, &sender, &source);
+        await_reference(&ndi, &mut genlock, &sender, &source);
         let (mut video, mut audio) = genlock.clocks();
         let deadline = Instant::now() + PATIENCE;
         loop {
@@ -2836,8 +2836,10 @@ fn genlock_follows_a_local_reference_and_returns_to_the_system_clock() {
 }
 
 /// Wait on `genlock`'s video clock until the genlock receives the reference
-/// that `sender` sends, which it was connected to at `source`.
-fn await_reference(genlock: &mut Genlock, sender: &Sender, source: &Source) {
+/// that `sender` sends, which it was connected to at `source`. When it does
+/// not, the message says what the genlock did with other references
+/// ([`reference_trials`]).
+fn await_reference(ndi: &Ndi, genlock: &mut Genlock, sender: &Sender, source: &Source) {
     let thirty = FrameRate::new(30, 1).unwrap();
     let deadline = Instant::now() + PATIENCE;
     let mut waits = 0;
@@ -2845,14 +2847,115 @@ fn await_reference(genlock: &mut Genlock, sender: &Sender, source: &Source) {
         assert!(
             Instant::now() < deadline,
             "genlock did not acquire the reference of {source:?} in {waits} waits on its video \
-             clock; {}{}",
+             clock; {}{}\nthe same genlock given other references, each a sender of its own:\n{}",
             served(sender),
-            tcp_table(source)
+            tcp_table(source),
+            reference_trials(ndi, genlock)
         );
         let (mut video, _) = genlock.clocks();
         video.wait(thirty, ScanType::Progressive);
         waits += 1;
     }
+}
+
+/// What `genlock` does with references of other kinds, for the message of a
+/// test whose genlock never acquired its reference: for each, a new sender
+/// sending video of that kind, and how long the genlock, connected to it,
+/// took to become active, within 5 s. On the Windows 6.4 runtimes the
+/// genlock never acquired the tests' reference, also with the firewall off
+/// (run 43369298234), where it did on 6.3.2 and on Linux and macOS.
+fn reference_trials(ndi: &Ndi, genlock: &mut Genlock) -> String {
+    use std::fmt::Write as _;
+
+    let thirty = FrameRate::new(30, 1).unwrap();
+    let at = |width, height| {
+        VideoFrame::builder()
+            .resolution(width, height)
+            .frame_rate(thirty)
+            .build()
+            .unwrap()
+    };
+    // What each sends: its video, whether the SDK clocks it, and whether
+    // audio goes with it.
+    let trials = [
+        ("the tests' video, clocked, with audio", video(), true, true),
+        (
+            "64x32 at 30 fps, clocked, with audio",
+            at(64, 32),
+            true,
+            true,
+        ),
+        (
+            "64x32 at 30 fps, clocked, no audio",
+            at(64, 32),
+            true,
+            false,
+        ),
+        (
+            "64x32 at 30 fps, paced by the sending thread",
+            at(64, 32),
+            false,
+            false,
+        ),
+        (
+            "1920x1080 at 30 fps, clocked, no audio",
+            at(1920, 1080),
+            true,
+            false,
+        ),
+    ];
+    let audio = AudioFrame::builder()
+        .sample_rate(48_000)
+        .num_channels(2)
+        .num_samples(1600)
+        .build()
+        .unwrap();
+    let mut report = String::new();
+    for (label, frame, clocked, with_audio) in trials {
+        let sender = Sender::new(
+            ndi,
+            &SenderOptions::new(common::unique_name("genlock trial"))
+                .clock_video(clocked)
+                .clock_audio(false),
+        )
+        .unwrap();
+        let source = common::loopback_source(ndi, &sender).unwrap();
+        let stop = AtomicBool::new(false);
+        let active = std::thread::scope(|scope| {
+            let _stop = StopOnDrop(&stop);
+            scope.spawn(|| {
+                while !stop.load(Ordering::Acquire) {
+                    sender.send_video(&frame).unwrap();
+                    if with_audio {
+                        sender.send_audio(&audio);
+                    }
+                    if !clocked {
+                        std::thread::sleep(Duration::from_millis(33));
+                    }
+                }
+            });
+            genlock.connect(Some(&source)).unwrap();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(5) {
+                if genlock.is_active() {
+                    return Some(start.elapsed());
+                }
+                let (mut video, _) = genlock.clocks();
+                video.wait(thirty, ScanType::Progressive);
+            }
+            None
+        });
+        let _ = writeln!(
+            report,
+            "  {label}: {}; {}",
+            active.map_or_else(
+                || "not active within 5s".to_owned(),
+                |after| format!("active after {after:.1?}")
+            ),
+            served(&sender)
+        );
+    }
+    report
 }
 
 /// Wait with `wait` until what it reports is `wanted`, on whatever thread
@@ -2904,12 +3007,12 @@ fn a_genlock_moves_between_threads() {
                 sender.send_audio(&audio);
             }
         });
-        let (source, sender) = (&source, &sender);
+        let (ndi, source, sender) = (&ndi, &source, &sender);
         let genlock = scope
             .spawn(move || {
                 let mut genlock = genlock;
                 genlock.connect(Some(source)).unwrap();
-                await_reference(&mut genlock, sender, source);
+                await_reference(ndi, &mut genlock, sender, source);
                 let (mut video, mut audio) = genlock.clocks();
                 std::thread::scope(|clocks| {
                     clocks.spawn(move || {
