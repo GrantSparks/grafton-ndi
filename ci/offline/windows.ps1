@@ -1,19 +1,11 @@
-# Cargo test runner for Windows: block the test executable's traffic to and
-# from every address but the machine's own, in both directions, for as long as
-# it runs.
+# Cargo test runner for Windows: block all non-loopback traffic of the test
+# executable, in both directions, for as long as it runs.
 #
 #   cargo test --config ci/offline.toml ...
 #
-# Windows Defender Firewall never filters loopback, and Windows delivers
-# traffic to one of the machine's own addresses as it delivers loopback, so
-# nothing the executable sends leaves the machine and nothing from another
-# machine reaches it. Needs an elevated shell (GitHub-hosted runners are).
-#
-# The rules leave the machine's own addresses alone because the SDK uses them:
-# blocked as well, as every address but loopback was before, they stopped a
-# receiver connecting to a sender that had already served another receiver,
-# 11 to 18 of 25 times on every Windows row of run 43369298234, against none
-# with the firewall off.
+# Windows Defender Firewall never filters loopback, so program-scoped block
+# rules leave the executable with loopback networking only. Needs an elevated
+# shell (GitHub-hosted runners are).
 #
 # Name resolution and the temporary directory are left alone. The rules do not
 # change how the machine's own name resolves, tests address their senders as
@@ -21,12 +13,16 @@
 # isolates have only been observed on Linux.
 #
 # The SDK is given a configuration, through NDI_CONFIG_DIR, that points it at
-# a loopback discovery address instead of multicast DNS, as macos.sh does. The
-# rules block multicast DNS, and without the address receivers stalled: in run
-# 43366775596, under the rules, 43 to 54 of 100 receivers of
-# tests/peer_recreation.rs never connected to a sender of their own process on
-# 127.0.0.1 with loopback as the SDK's only adapter, and none with the address,
-# or with the firewall off.
+# a loopback discovery address instead of multicast DNS, as macos.sh does:
+# with multicast DNS blocked, a Windows receiver may never connect, even to an
+# explicit loopback address.
+#
+# Under the rules, a receiver of a source that a receiver of the same process
+# connected to before stalls about half the time, and with the firewall off
+# none does. To choose rules that do not cause it, GRAFTON_NDI_CI_FIREWALL
+# selects them for tests/peer_recreation.rs: `outbound` or `inbound` alone,
+# `none` (the firewall on, with no rule for the program) or `off` (the firewall
+# off); and the drops the firewall logs are printed when the executable fails.
 #
 # The configuration also turns on the SDK's own log, which names the port each
 # sender listens on, the address each receiver connects to and whether it
@@ -41,15 +37,13 @@ $ErrorActionPreference = 'Stop'
 $program = $args[0]
 $arguments = @($args | Select-Object -Skip 1)
 
-# The rules name the program by its long path. rustdoc starts each doctest as
-# rust_out.exe in a directory under %TEMP%, which GitHub's hosted Windows
-# images set to the 8.3 form C:\Users\RUNNER~1\AppData\Local\Temp. In run
-# 43332050213 New-NetFirewallRule refused every doctest's program with "The
-# parameter is incorrect", while the test executables under target\ and
-# python.exe got their rules. The log prints none of those paths, so the short
-# name is the probable cause rather than an observed one. Resolve-Path keeps
-# short names; GetLongPathNameW replaces each short component with its long
-# name, and returns a path that has none unchanged.
+# The rules name the program by its long path: New-NetFirewallRule refuses a
+# path with an 8.3 short component ("The parameter is incorrect"), and rustdoc
+# starts each doctest as rust_out.exe in a directory under %TEMP%, which
+# GitHub's hosted Windows images set to the short form
+# C:\Users\RUNNER~1\AppData\Local\Temp. Resolve-Path keeps short names;
+# GetLongPathNameW replaces each short component with its long name, and
+# returns a path that has none unchanged.
 $program = (Resolve-Path -LiteralPath $program).Path
 # Only a path with a short component needs expanding: compiling the helper
 # costs every test executable's start, and those under target\ have none.
@@ -83,38 +77,60 @@ public static class GraftonNdiLongPath
 '@
     $program = [GraftonNdiLongPath]::Of($program)
 }
-# An IPv4 address as a number, and back.
-function ConvertTo-Number([string] $address) {
-    $bytes = [System.Net.IPAddress]::Parse($address).GetAddressBytes()
-    [Array]::Reverse($bytes)
-    [uint64] [BitConverter]::ToUInt32($bytes, 0)
-}
-function ConvertTo-Address([uint64] $number) {
-    $bytes = [BitConverter]::GetBytes([uint32] $number)
-    [Array]::Reverse($bytes)
-    [System.Net.IPAddress]::new($bytes).ToString()
+# Where the firewall logs the packets it drops, once told to.
+$drops = Join-Path $env:SystemRoot 'System32\LogFiles\Firewall\pfirewall.log'
+
+# Print what the firewall dropped since its log was `$from` bytes long: the
+# drops by protocol, source, destination, port, direction and process, most
+# frequent first. The log's fields are: date time action protocol src-ip dst-ip
+# src-port dst-port size tcpflags tcpsyn tcpack tcpwin icmptype icmpcode info
+# path pid.
+function Write-FirewallDrops([long] $from) {
+    if (-not (Test-Path -LiteralPath $drops)) {
+        Write-Output "Windows Firewall wrote no log at $drops."
+        return
+    }
+    # The firewall writes its log in batches: wait until it stops growing.
+    $size = -1
+    for ($second = 0; $second -lt 15; $second++) {
+        Start-Sleep -Seconds 1
+        $now = (Get-Item -LiteralPath $drops).Length
+        if ($now -eq $size -and $second -ge 3) { break }
+        $size = $now
+    }
+    $stream = [System.IO.File]::Open($drops, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+        # A log that was rotated since is read from its start.
+        if ($stream.Length -ge $from) { $stream.Position = $from }
+        $text = [System.IO.StreamReader]::new($stream).ReadToEnd()
+    }
+    finally {
+        $stream.Dispose()
+    }
+    $dropped = @($text -split "`r?`n" | Where-Object { $_ -match '^\S+ \S+ DROP ' })
+    Write-Output "Windows Firewall dropped $($dropped.Count) packets while $program ran, here by protocol, source, destination, direction and process:"
+    $dropped |
+        ForEach-Object {
+            $field = $_ -split ' '
+            $process = if ($field.Count -gt 17) { $field[17] } else { '?' }
+            '{0} {1}:{2} -> {3}:{4} {5} pid {6}' -f $field[3], $field[4], $field[6], $field[5], $field[7], $field[16], $process
+        } |
+        Group-Object |
+        Sort-Object -Property Count -Descending |
+        Select-Object -First 40 |
+        ForEach-Object { Write-Output ('  {0,6} x {1}' -f $_.Count, $_.Name) }
+    $dropped | Select-Object -First 3 | ForEach-Object { Write-Output "  first lines: $_" }
 }
 
-# The remote addresses the rules block, as New-NetFirewallRule takes them:
-# every IPv4 address but `$own`, in ranges, and every IPv6 address. Loopback
-# is in neither list's reach, since the firewall never filters it.
-function Get-RemoteAddresses([string[]] $own) {
-    $ranges = [System.Collections.Generic.List[string]]::new()
-    [uint64] $next = 0
-    foreach ($address in @($own | ForEach-Object { ConvertTo-Number $_ } | Sort-Object -Unique)) {
-        if ($address -gt $next) {
-            # Built apart: inside Add's parentheses the comma would end its argument.
-            $range = '{0}-{1}' -f (ConvertTo-Address $next), (ConvertTo-Address ($address - 1))
-            $ranges.Add($range)
-        }
-        $next = $address + 1
-    }
-    if ($next -le [uint32]::MaxValue) {
-        $range = '{0}-255.255.255.255' -f (ConvertTo-Address $next)
-        $ranges.Add($range)
-    }
-    $ranges.Add('::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff')
-    , $ranges.ToArray()
+# The rules for this run: both directions, unless the experiment selects.
+$confinement = if ($env:GRAFTON_NDI_CI_FIREWALL) { $env:GRAFTON_NDI_CI_FIREWALL } else { 'all' }
+$rules = switch ($confinement) {
+    'all' { @{ Direction = 'Outbound' }; @{ Direction = 'Inbound' } }
+    'outbound' { @{ Direction = 'Outbound' } }
+    'inbound' { @{ Direction = 'Inbound' } }
+    'none' { }
+    'off' { }
+    default { throw "GRAFTON_NDI_CI_FIREWALL is '$confinement', not all, outbound, inbound, none or off" }
 }
 
 $rule = 'grafton-ndi-ci-' + [guid]::NewGuid().ToString('N')
@@ -125,24 +141,31 @@ $result = 1
 try {
     New-Item -ItemType Directory -Path $config, $log | Out-Null
     $ndi = @{
-        log = @{ enable = $true; level = 'info'; dir = $log }
+        # The experiment's runs also log what the SDK's sends cost and whom
+        # they reach.
+        log = @{ enable = $true; level = $(if ($env:GRAFTON_NDI_CI_FIREWALL) { 'debug' } else { 'info' }); dir = $log }
         networks = @{ discovery = '127.0.0.1' }
     }
     @{ ndi = $ndi } |
         ConvertTo-Json -Depth 5 |
         Set-Content -LiteralPath (Join-Path $config 'ndi-config.v1.json') -Encoding utf8NoBOM
     $env:NDI_CONFIG_DIR = $config
-    Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled True
-    $remote = Get-RemoteAddresses @(Get-NetIPAddress -AddressFamily IPv4 | ForEach-Object IPAddress)
-    foreach ($direction in 'Outbound', 'Inbound') {
+    if ($confinement -eq 'off') {
+        Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled False
+    }
+    else {
+        Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled True -LogBlocked True -LogMaxSizeKilobytes 32767 -LogFileName '%systemroot%\system32\LogFiles\Firewall\pfirewall.log'
+    }
+    foreach ($parameters in @($rules)) {
         try {
-            New-NetFirewallRule -DisplayName $rule -Direction $direction -Action Block -Program $program -Profile Any -RemoteAddress $remote | Out-Null
+            New-NetFirewallRule -DisplayName $rule -Action Block -Program $program -Profile Any @parameters | Out-Null
         }
         catch {
             # The cmdlet's message does not name the program it refused.
             throw ('New-NetFirewallRule refused the program {0}: {1}' -f $program, $_)
         }
     }
+    $dropsBefore = if (Test-Path -LiteralPath $drops) { (Get-Item -LiteralPath $drops).Length } else { 0 }
     $env:CARGO_NET_OFFLINE = 'true'
     & $program @arguments
     $result = $LASTEXITCODE
@@ -151,6 +174,7 @@ try {
             Write-Output "NDI SDK log $($file.Name), written while $program ran:"
             Get-Content -LiteralPath $file.FullName | Write-Output
         }
+        Write-FirewallDrops $dropsBefore
     }
 }
 finally {
