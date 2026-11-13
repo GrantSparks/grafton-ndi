@@ -117,7 +117,7 @@ These are defects and limits of the NDI SDK, not of this crate: measured on Linu
 
 ### Receiving and sending
 
-- **NDI|HX video needs an extra decoder on Linux (6.4).** The Windows and macOS runtimes decode NDI|HX (H.264 and HEVC) themselves. On Linux the runtime decodes it only with the NDI|HX Driver for Linux, `libndihx.so` and its bundled FFmpeg libraries copied beside the runtime library, or with FFmpeg 7's `libavcodec` on the loader's path. Without either, a receiver of an NDI|HX source gets black 1920×1080 frames instead of the picture, and no error; the hosted Ubuntu 24.04 runners of GitHub Actions had neither. The driver's licence notes that on Linux NDI grants no H.264 or AAC licence.
+- **NDI|HX video needs a decoder the runtime can find (6.4).** Without one, a receiver of an NDI|HX source gets black 1920×1080 frames instead of the picture, and no error. On Linux the runtime decodes NDI|HX (H.264 and HEVC) only with the NDI|HX Driver for Linux, `libndihx.so` and its bundled FFmpeg libraries copied beside the runtime library, or with FFmpeg 7's `libavcodec` on the loader's path; the hosted Ubuntu 24.04 runners of GitHub Actions had neither. The Windows and macOS runtimes decode NDI|HX themselves: the Advanced SDK manual documents H.264 there without plugins, and H.265 only in 4:2:0 and where decoding hardware supports it. On GitHub's hosted runners the macOS runtime decoded HEVC 4:4:4, while on Windows Server 2025 the Windows runtime delivered the black 1920×1080 frames for it, probably because those runners have no GPU to decode it with. The driver's licence notes that on Linux NDI grants no H.264 or AAC licence.
 - **A FrameSync takes its receiver's audio.** Raw audio capture beside a FrameSync (measured with 6.3.2 and 6.4) takes the frames the FrameSync needs, and the FrameSync returns silence in their place. A FrameSync's receiver therefore has no audio capture.
 - **Standard encoding may convert 4:4:4 video to 4:2:2.** Sending a planar 4:4:4 frame does not guarantee that a receiver gets 4:4:4.
 - **Sender and receiver names are reserved machine-wide** through lock files in the temporary directory (`NTK_SEND_<name>`, `NTK_RECV_<name>`). Two processes that share `TMPDIR` cannot each create a sender, or a receiver, of the same name at the same time.
@@ -766,7 +766,7 @@ Set `GRAFTON_NDI_REQUIRE_RUNTIME` to turn skips into failures. Its value is a co
 | `advanced` | An Advanced SDK runtime, and a build made with the Advanced SDK headers. |
 | `file` | An NDI File library that the selected runtime can use. |
 | `discovery-server` | The SDK's `ndi-discovery-server` program beside the selected runtime, and an NDI 6.4.0 or later runtime. |
-| `hx-decoder` | A decoder for NDI\|HX video: built into the runtime on Windows and macOS; on Linux, the NDI\|HX Driver for Linux or FFmpeg 7's `libavcodec` beside the runtime or on the loader's path. |
+| `hx-decoder` | A decoder for NDI\|HX video: on macOS, the runtime's own; on Linux, the NDI\|HX Driver for Linux or FFmpeg 7's `libavcodec` beside the runtime or on the loader's path. On Windows the runtime's own decoding depends on the machine, and GitHub's hosted Windows Server 2025 runners lacked it for HEVC 4:4:4. A runtime that delivers only its black 1920×1080 placeholder frames counts as having none. |
 
 An entry that is not in this table fails the run. So does an entry that no test in the build can check, for example `advanced` without the `advanced` feature, or `discovery-server` on a target other than Linux.
 

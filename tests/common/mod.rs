@@ -12,7 +12,8 @@ pub mod discovery_server;
 #[path = "../../src/test_support.rs"]
 mod test_support;
 pub use test_support::{
-    advanced_ndi, assert_expected_identity, hx_decoder, ndi, skip, unique_name, Requirement,
+    advanced_ndi, assert_expected_identity, hx_decoder, is_hx_placeholder, ndi, skip, unique_name,
+    Requirement,
 };
 
 /// Discover the sender's actual advertised endpoint. The send API can return a

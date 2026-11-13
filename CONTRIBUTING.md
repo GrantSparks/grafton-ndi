@@ -379,7 +379,7 @@ The helpers live in `src/test_support.rs`. Unit tests use them as
 | --- | --- |
 | `ndi()` | no NDI runtime library can be loaded |
 | `advanced_ndi()` | the runtime is not an Advanced SDK runtime, or the build lacks the declarations for Advanced sender configuration |
-| `hx_decoder(&ndi)` | the runtime has no NDI\|HX video decoder. Windows and macOS runtimes have one built in. On Linux the helper loads `libndihx.so`, `libavcodec-ndi.so.61` or `libavcodec.so.61` from beside the runtime library or by name through the dynamic loader, which is where NDI 6.4.0.2 was measured to look |
+| `hx_decoder(&ndi)` | the runtime is known to have no NDI\|HX video decoder. On Linux the helper loads `libndihx.so`, `libavcodec-ndi.so.61` or `libavcodec.so.61` from beside the runtime library or by name through the dynamic loader, which is where NDI 6.4.0.2 was measured to look. On Windows and macOS nothing shows it beforehand, so the helper answers `true` there. A test that receives NDI\|HX video therefore also passes each frame's size to `is_hx_placeholder`, and calls `skip(Requirement::HxDecoder, …)` when the runtime delivered nothing but its black 1920×1080 placeholder |
 | `skip(Requirement::…, reason)` | called directly by a test that found another requirement unmet, such as the File library or the Discovery Server |
 
 A skip is printed to standard error as `skipped: <test> needs <requirement>`,

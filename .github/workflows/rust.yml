@@ -161,8 +161,10 @@ jobs:
       #   file              a File library the selected runtime can drive
       #   discovery-server  the SDK's Discovery Server program (Linux, 6.4)
       #   hx-decoder        an NDI|HX video decoder (built into the runtime on
-      #                     Windows and macOS; on Linux, the driver package a
-      #                     row names in `hx-driver`, copied beside its runtime)
+      #                     macOS; on Linux, the driver package a row names in
+      #                     `hx-driver`, copied beside its runtime). No Windows
+      #                     row promises one: the hosted Windows runners gave
+      #                     black placeholder frames for HEVC 4:4:4
       # Each step promises exactly what its build can check. A build without the
       # advanced and file-io features can check only the first and the last, so
       # the no-default-features step promises `require-no-default`, or `1` in a
@@ -233,12 +235,12 @@ jobs:
             package: current-advanced-windows
             compatibility: 6.3.2-standard-windows
             compatibility-advanced: 6.3.2-advanced-windows
-            require: advanced,file,hx-decoder
+            require: advanced,file
           - name: windows-x86 advanced-6.4
             runner: windows-2025
             target: i686-pc-windows-msvc
             package: current-advanced-windows
-            require: advanced,hx-decoder
+            require: advanced
           - name: macos-arm64 standard-6.3.2
             runner: macos-15
             target: aarch64-apple-darwin

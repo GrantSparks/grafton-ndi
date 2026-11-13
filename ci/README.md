@@ -59,8 +59,8 @@ workflow by the script tests.
 | windows-x64 standard-6.3.2 | windows-2025 | x86_64-pc-windows-msvc | 6.3.2-standard-windows | `1` | `1` | |
 | windows-x64 advanced-6.3.2 | windows-2025 | x86_64-pc-windows-msvc | 6.3.2-advanced-windows | `advanced` | `1` | Advanced lint |
 | windows-x64 standard-6.4 | windows-2025 | x86_64-pc-windows-msvc | current-standard-windows | `1,file` | `1` | |
-| windows-x64 advanced-6.4 | windows-2025 | x86_64-pc-windows-msvc | current-advanced-windows | `advanced,file,hx-decoder` | `1` | Advanced lint |
-| windows-x86 advanced-6.4 | windows-2025 | i686-pc-windows-msvc | current-advanced-windows | `advanced,hx-decoder` | `1` | Advanced lint |
+| windows-x64 advanced-6.4 | windows-2025 | x86_64-pc-windows-msvc | current-advanced-windows | `advanced,file` | `1` | Advanced lint |
+| windows-x86 advanced-6.4 | windows-2025 | i686-pc-windows-msvc | current-advanced-windows | `advanced` | `1` | Advanced lint |
 | macos-arm64 standard-6.3.2 | macos-15 | aarch64-apple-darwin | 6.3.2-standard-apple | `1` | `1` | |
 | macos-arm64 advanced-6.3.2 | macos-15 | aarch64-apple-darwin | 6.3.2-advanced-apple | `advanced` | `1` | Advanced lint |
 | macos-arm64 standard-6.4 | macos-15 | aarch64-apple-darwin | current-standard-apple | `1` | `1` | Apple mobile builds |
@@ -151,7 +151,7 @@ mistake cannot pass as a skip:
 | `advanced` | an Advanced runtime, compiled with its headers | the `advanced` feature is on |
 | `file` | a File library the selected runtime can drive: an Advanced runtime on Linux and macOS, any 6.4 runtime on 64-bit Windows | the `file-io` feature is on |
 | `discovery-server` | the SDK's Discovery Server program and a 6.4 runtime, whose advertisers and listeners can use it | the target is Linux |
-| `hx-decoder` | an NDI\|HX video decoder the selected runtime can use. It is built into the runtime on Windows and macOS. On Linux the runtime needs the NDI\|HX Driver for Linux or FFmpeg 7; the runner has no FFmpeg 7, so a row provides the driver through `hx-driver` | the `advanced` feature is on |
+| `hx-decoder` | an NDI\|HX video decoder the selected runtime can use. It is built into the runtime on macOS. On Linux the runtime needs the NDI\|HX Driver for Linux or FFmpeg 7; the runner has no FFmpeg 7, so a row provides the driver through `hx-driver`. No Windows row provides one: the hosted Windows Server 2025 runners delivered black placeholder frames for HEVC 4:4:4 | the `advanced` feature is on |
 
 A promise that no test in a build can check is itself a failure, and a missing
 one lets a test skip, so each step promises exactly what its build can check:
@@ -161,10 +161,17 @@ no-default-features step only `1` and, on Linux with a 6.4 package,
 
 The only test of `hx-decoder` sends HEVC 4:4:4 from an Advanced sender and
 decodes it with the 6.4 Best444 receiver mode, so the rows that promise it are
-the Windows and macOS Advanced 6.4 rows and the Linux x64 Advanced 6.4 row,
-which installs the driver. Without a decoder the runtime delivers black
-1920x1080 frames instead of the picture, so the test looks for one first:
-`hx_decoder()` in `src/test_support.rs` lists where.
+the macOS Advanced 6.4 row and the Linux x64 Advanced 6.4 row, which installs
+the driver. Without a decoder the runtime delivers black 1920x1080 frames
+instead of the picture, and no error. On Linux the test looks for a decoder
+first: `hx_decoder()` in `src/test_support.rs` lists where. Everywhere, it then
+reports the decoder missing, as a skip or as a broken promise, when every
+frame it receives is that placeholder. In run 43332050213 both Windows
+Advanced 6.4 rows received only placeholders, so they no longer promise it
+and the test skips there with that reason. The Advanced SDK manual documents
+H.265 decoding only in 4:2:0 and where decoding hardware supports it, and the
+hosted Windows runners have no GPU; that is the probable cause, not a
+confirmed one.
 
 ## SDK packages
 

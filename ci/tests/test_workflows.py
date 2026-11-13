@@ -270,12 +270,14 @@ def checkable(target, pin, *, all_features, headers=None, driver=None):
     runtime everywhere except Windows, where the library is edition-neutral and
     ships for x64. The HEVC decode test is an Advanced test that also needs a
     6.4 runtime and an NDI|HX decoder, which is built into the runtime on
-    Windows and macOS; on Linux it is the NDI|HX driver of the runtime's release.
+    macOS; on Linux it is the NDI|HX driver of the runtime's release. On
+    Windows the test runs but cannot be promised: the hosted Windows runners
+    delivered the runtime's black placeholder frames instead of HEVC 4:4:4.
     """
     platform, advanced = pin['platform'], pin['edition'] == 'advanced'
     declared = (headers or pin)['edition'] == 'advanced'
     current = sdk.version_tuple(pin['version']) >= (6, 4, 0, 0)
-    decoder = platform in ('windows', 'apple') or (
+    decoder = platform == 'apple' or (
         driver is not None and driver['driver'] == 'hx' and driver['platform'] == platform
         and driver['version'] == pin['version'])
     found = {'1'}

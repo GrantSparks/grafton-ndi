@@ -14,7 +14,7 @@ use grafton_ndi::{
     capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, SdkEdition},
     AudioFrame, Error, Finder, FinderOptions, FrameRate, MediaTypes, MetadataFrame, Ndi, Receiver,
     ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions, ScanType, Sender, SenderMode,
-    SenderOptions, SettingChange, Source, StreamTier, Tally, Timecode, VideoFrame,
+    SenderOptions, SettingChange, Source, StreamTier, Tally, Timecode, VideoFrame, VideoFrameRef,
 };
 use std::{
     sync::{
@@ -2348,7 +2348,8 @@ fn hevc_444_decodes_to_the_original_full_resolution_chroma_planes() {
     if ndi.require_feature(RuntimeFeature::ReceiveBest444).is_err() {
         return;
     }
-    // Without a decoder the runtime delivers black full-HD frames instead.
+    // A decoder known to be missing skips here, and one that is missing
+    // although nothing showed it beforehand is told by its placeholders below.
     if !common::hx_decoder(&ndi) {
         return;
     }
@@ -2382,9 +2383,8 @@ fn hevc_444_decodes_to_the_original_full_resolution_chroma_planes() {
     let format = VideoPacketFormat::new(VideoCodec::Hevc, 64, 32)
         .unwrap()
         .with_frame_rate(FrameRate::new(30, 1).unwrap());
-    let deadline = Instant::now() + PATIENCE;
     let mut pts = 0;
-    loop {
+    let Some(frame) = decoded_hx_frame(&receiver, &format, "HEVC 4:4:4", || {
         let bytes = PacketEnvelope::encode(
             EnvelopeCodec::Hevc,
             pts,
@@ -2396,29 +2396,75 @@ fn hevc_444_decodes_to_the_original_full_resolution_chroma_planes() {
         .unwrap();
         let mut packet = CompressedVideoFrame::new(format, bytes).unwrap();
         sender.send_video(&mut packet).unwrap();
-        if let Some(frame) = receiver.video().capture_ref(SLICE).unwrap() {
-            assert_eq!((frame.width(), frame.height()), (64, 32));
-            assert_eq!(frame.pixel_format(), grafton_ndi::PixelFormat::Na48);
-            assert_eq!(frame.planes().len(), 3);
-            for (plane_index, plane) in frame.planes().enumerate() {
-                assert_eq!(plane.row_count(), 32);
-                for (y, row) in plane.rows().enumerate() {
-                    assert_eq!(row.len(), 64);
-                    for (x, value) in row.iter().copied().enumerate() {
-                        let expected = match plane_index {
-                            0 => 64 + (x + y) % 64,
-                            1 => 64 + 64 * (x % 2),
-                            2 => 80 + 64 * (y % 2),
-                            _ => unreachable!(),
-                        } as u8;
-                        assert_eq!(value, expected, "plane {plane_index}, ({x}, {y})");
-                    }
-                }
-            }
-            break;
-        }
         pts += 3000;
-        assert!(Instant::now() < deadline, "HEVC 4:4:4 video did not decode");
+    }) else {
+        return;
+    };
+    assert_eq!(frame.pixel_format(), grafton_ndi::PixelFormat::Na48);
+    assert_eq!(frame.planes().len(), 3);
+    for (plane_index, plane) in frame.planes().enumerate() {
+        assert_eq!(plane.row_count(), 32);
+        for (y, row) in plane.rows().enumerate() {
+            assert_eq!(row.len(), 64);
+            for (x, value) in row.iter().copied().enumerate() {
+                let expected = match plane_index {
+                    0 => 64 + (x + y) % 64,
+                    1 => 64 + 64 * (x % 2),
+                    2 => 80 + 64 * (y % 2),
+                    _ => unreachable!(),
+                } as u8;
+                assert_eq!(value, expected, "plane {plane_index}, ({x}, {y})");
+            }
+        }
+    }
+}
+
+/// The first decoded frame `receiver` delivers while `send` sends NDI|HX
+/// video of `format`, once per capture slice.
+///
+/// The runtime reports no error for video it cannot decode: it delivers its
+/// black 1920x1080 placeholder instead (see [`common::is_hx_placeholder`]).
+/// Any other frame is the decoded picture, is asserted to have the size that
+/// was sent, and is returned. Returns `None`, with the calling test reported
+/// as skipped for want of a decoder, when every frame delivered within
+/// [`PATIENCE`] was the placeholder. Fails when no frame arrived at all.
+fn decoded_hx_frame<'rx>(
+    receiver: &'rx Receiver,
+    format: &VideoPacketFormat,
+    video: &str,
+    mut send: impl FnMut(),
+) -> Option<VideoFrameRef<'rx>> {
+    let sent = (format.width(), format.height());
+    let deadline = Instant::now() + PATIENCE;
+    let mut placeholders = 0;
+    loop {
+        send();
+        match receiver.video().capture_ref(SLICE).unwrap() {
+            Some(frame) if common::is_hx_placeholder(sent, (frame.width(), frame.height())) => {
+                placeholders += 1;
+            }
+            Some(frame) => {
+                assert_eq!((frame.width(), frame.height()), sent, "{video}");
+                return Some(frame);
+            }
+            None => {}
+        }
+        if Instant::now() >= deadline {
+            assert!(
+                placeholders > 0,
+                "no {video} video arrived within {PATIENCE:?}"
+            );
+            common::skip(
+                common::Requirement::HxDecoder,
+                &format!(
+                    "the NDI runtime has no NDI|HX decoder for {video}: all {placeholders} frames \
+                     it delivered in place of the {}x{} picture within {PATIENCE:?} were its \
+                     1920x1080 placeholder",
+                    sent.0, sent.1
+                ),
+            );
+            return None;
+        }
     }
 }
 

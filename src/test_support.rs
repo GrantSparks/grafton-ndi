@@ -39,10 +39,15 @@ pub enum Requirement {
     /// receives HEVC or H.264 video as pictures needs. Listed as `hx-decoder`.
     ///
     /// The runtime finds its decoder when it runs and has no query for it.
-    /// Without one, a receiver is given black 1920x1080 UYVY frames in place of
-    /// the picture. The Advanced SDK manual documents the decoder as built in
-    /// on Windows and macOS. On Linux, NDI 6.4.0.2 was measured, with strace,
-    /// to decode only through:
+    /// Without one, a receiver is given black 1920x1080 frames in place of
+    /// the picture (UYVY on Linux); [`is_hx_placeholder`] recognizes them. The
+    /// Advanced SDK manual documents H.264 decoding on Windows and macOS
+    /// without plugins, and H.265 only in 4:2:0 and where decoding hardware
+    /// supports it. A hosted macOS runner decoded HEVC 4:4:4; the hosted Windows
+    /// Server 2025 runners, which have no GPU, delivered the black frames for
+    /// it, probably for want of a decoder in hardware or in the operating
+    /// system, which is not confirmed. On Linux, NDI 6.4.0.2 was measured, with
+    /// strace, to decode only through:
     ///
     /// * the NDI|HX Driver for Linux, `libndihx.so` with its bundled
     ///   `libavcodec-ndi.so.61` and the other `-ndi` FFmpeg 7 libraries,
@@ -241,14 +246,18 @@ pub fn advanced_ndi() -> Option<Ndi> {
     }
 }
 
-/// Whether the selected runtime has an NDI|HX video decoder. When it has none,
-/// the calling test is reported as skipped.
+/// Whether a test of NDI|HX video can go ahead: `false`, with the calling test
+/// reported as skipped, when the selected runtime is known to have no decoder.
 ///
 /// The runtime has no query for its decoder, so this looks where
-/// [`Requirement::HxDecoder`] says the runtime does. The answer restates the
-/// vendor's documentation for Windows and macOS and, on Linux, what NDI
+/// [`Requirement::HxDecoder`] says the runtime does. On Linux that is what NDI
 /// 6.4.0.2 was measured with strace to open. It is not a vendor API: a runtime
-/// that looks elsewhere needs this updated.
+/// that looks elsewhere needs this updated. On macOS and Windows there is
+/// nothing to look at beforehand, so the answer there is `true`.
+///
+/// `true` is therefore no proof of a decoder. A test that receives NDI|HX video
+/// also passes each frame to [`is_hx_placeholder`], and reports the decoder
+/// missing through [`skip`] when the runtime delivered nothing else.
 ///
 /// # Panics
 ///
@@ -264,7 +273,36 @@ pub fn hx_decoder(ndi: &Ndi) -> bool {
     }
 }
 
-/// The NDI|HX decoder is part of the runtime on Windows and macOS.
+/// The size of the black frames the runtime delivers in place of NDI|HX video
+/// it has no decoder for, whatever the size of the video.
+const HX_PLACEHOLDER: (u32, u32) = (1920, 1080);
+
+/// Whether a frame of size `received`, captured from NDI|HX video sent at size
+/// `sent`, is the runtime's black placeholder for a picture it cannot decode.
+///
+/// Measured on Linux without a decoder, and on the hosted Windows Server 2025
+/// runners with HEVC 4:4:4: the runtime delivers 1920x1080 frames, and no
+/// error, in place of the picture. A test that receives NDI|HX video counts
+/// these and, when nothing else arrived, reports the decoder missing with
+/// [`skip`]; any other frame is the decoded picture and is checked as such.
+///
+/// # Panics
+///
+/// Panics when `sent` is itself 1920x1080: the placeholder could not then be
+/// told from the picture.
+pub fn is_hx_placeholder(sent: (u32, u32), received: (u32, u32)) -> bool {
+    assert_ne!(
+        sent, HX_PLACEHOLDER,
+        "NDI|HX video sent at 1920x1080 cannot be told from the runtime's placeholder"
+    );
+    received == HX_PLACEHOLDER
+}
+
+/// The macOS and Windows runtimes decode NDI|HX themselves, through what the
+/// machine offers (see [`Requirement::HxDecoder`]): a hosted macOS runner
+/// decoded HEVC 4:4:4, and the hosted Windows Server 2025 runners delivered
+/// placeholders for it. Neither runtime shows beforehand whether it can decode,
+/// so the receiving test decides from what it is given.
 #[cfg(any(windows, target_os = "macos"))]
 fn missing_hx_decoder(_: &Ndi) -> Option<String> {
     None

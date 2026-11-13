@@ -22,6 +22,28 @@ fn every_promised_requirement_has_a_test_in_this_build() {
     );
 }
 
+/// The runtime's black 1920x1080 stand-in for NDI|HX video it cannot decode is
+/// told apart from a decoded picture by its size alone.
+#[test]
+fn only_a_full_hd_frame_in_place_of_smaller_hx_video_is_the_no_decoder_placeholder() {
+    use crate::test_support::is_hx_placeholder;
+
+    assert!(is_hx_placeholder((64, 32), (1920, 1080)));
+    assert!(!is_hx_placeholder((64, 32), (64, 32)));
+    // A frame of any other size is not the placeholder: the caller checks it
+    // as the decoded picture, and its size assertion fails.
+    for received in [(1920, 1088), (1080, 1920), (1280, 720), (32, 64), (0, 0)] {
+        assert!(!is_hx_placeholder((64, 32), received), "{received:?}");
+    }
+}
+
+/// NDI|HX video sent at the placeholder's own size could never be told from it.
+#[test]
+#[should_panic(expected = "cannot be told from the runtime's placeholder")]
+fn hx_video_sent_at_the_placeholder_size_is_refused() {
+    crate::test_support::is_hx_placeholder((1920, 1080), (1920, 1080));
+}
+
 fn create_test_video_frame(
     width: i32,
     height: i32,
