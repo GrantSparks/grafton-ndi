@@ -313,7 +313,7 @@ fn advanced_native_allocator_replacement_and_capture() {
     receiver
         .set_audio_allocator(move |request: AllocationRequest| {
             count.fetch_add(1, Ordering::Relaxed);
-            AllocationBuffer::zeroed(request.with_stride(request.stride() + 64)?)
+            AllocationBuffer::zeroed(request.with_stride_bytes(request.stride_bytes() + 64)?)
         })
         .unwrap();
     let audio = AudioFrame::builder()
@@ -332,7 +332,7 @@ fn advanced_native_allocator_replacement_and_capture() {
         receiver
             .set_video_allocator(move |request: AllocationRequest| {
                 allocation_count.fetch_add(1, Ordering::Relaxed);
-                AllocationBuffer::zeroed(request.with_stride(request.stride() + 64)?)
+                AllocationBuffer::zeroed(request.with_stride_bytes(request.stride_bytes() + 64)?)
             })
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);

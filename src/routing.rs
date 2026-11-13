@@ -39,6 +39,28 @@ pub struct RouterOptions {
     config: Option<crate::advanced::AdvancedConfig>,
 }
 impl RouterOptions {
+    /// Replace the advertised routing-source name, preserving other settings.
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// Inherit discovery groups from the NDI configuration.
+    #[must_use]
+    pub fn clear_groups(mut self) -> Self {
+        self.groups = None;
+        self
+    }
+
+    /// Remove the per-instance Advanced configuration override.
+    #[cfg(feature = "advanced")]
+    #[must_use]
+    pub fn clear_config(mut self) -> Self {
+        self.config = None;
+        self
+    }
+
     /// Requested advertised name.
     #[must_use]
     pub fn configured_name(&self) -> &str {

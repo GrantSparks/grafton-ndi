@@ -28,6 +28,21 @@ pub struct AdvertiserOptions {
     config: Option<crate::advanced::AdvancedConfig>,
 }
 impl AdvertiserOptions {
+    /// Inherit Discovery Server endpoints from the NDI configuration.
+    #[must_use]
+    pub fn clear_servers(mut self) -> Self {
+        self.servers = None;
+        self
+    }
+
+    /// Remove the per-instance Advanced configuration override.
+    #[cfg(feature = "advanced")]
+    #[must_use]
+    pub fn clear_config(mut self) -> Self {
+        self.config = None;
+        self
+    }
+
     /// Requested server endpoints, or `None` to inherit the NDI configuration.
     #[must_use]
     pub fn configured_servers(&self) -> Option<&str> {
@@ -99,6 +114,13 @@ pub struct RecvAdvertisement {
     input_group: Option<String>,
 }
 impl RecvAdvertisement {
+    /// Remove the explicitly requested receiver input group.
+    #[must_use]
+    pub fn clear_input_group(mut self) -> Self {
+        self.input_group = None;
+        self
+    }
+
     /// Whether remote monitoring was requested.
     #[must_use]
     pub fn configured_monitoring(&self) -> bool {

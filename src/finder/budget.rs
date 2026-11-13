@@ -5,13 +5,13 @@ use std::{ffi::c_char, mem::size_of};
 use crate::{
     frames::{bounded_sdk_text, MAX_SDK_STRING_BYTES},
     sdk_copy::LossyText,
-    Error, Result,
+    Error, ResourceKind, Result,
 };
 
 pub(super) const MAX_SOURCES: usize = 16_384;
 pub(super) const MAX_BYTES: usize = 16 * 1024 * 1024;
 
-pub(super) fn limit(resource: &'static str, limit: usize) -> Error {
+pub(super) fn limit(resource: ResourceKind, limit: usize) -> Error {
     Error::ResourceLimit { resource, limit }
 }
 
@@ -21,13 +21,13 @@ pub(super) fn allocation_failed() -> Error {
 
 /// Check the native span before pointer arithmetic, even on 32-bit targets.
 pub(super) fn descriptor_bytes(count: usize, element_size: usize) -> Result<usize> {
+    if count > MAX_SOURCES {
+        return Err(limit(ResourceKind::FinderSnapshotSources, MAX_SOURCES));
+    }
     let bytes = count
         .checked_mul(element_size)
         .filter(|&bytes| bytes <= isize::MAX as usize)
-        .ok_or_else(|| limit("Finder descriptor span", isize::MAX as usize))?;
-    if count > MAX_SOURCES {
-        return Err(limit("Finder snapshot source count", MAX_SOURCES));
-    }
+        .ok_or_else(|| Error::UnexpectedSdkResult("Finder descriptor span overflow".into()))?;
     Ok(bytes)
 }
 
@@ -46,7 +46,7 @@ impl SnapshotBudget {
         self.remaining = self
             .remaining
             .checked_sub(bytes)
-            .ok_or_else(|| limit("Finder snapshot bytes", MAX_BYTES))?;
+            .ok_or_else(|| limit(ResourceKind::FinderSnapshotBytes, MAX_BYTES))?;
         Ok(())
     }
 
@@ -67,7 +67,7 @@ impl SnapshotBudget {
         let Some(bytes) = bytes else {
             self.take(scan_limit)?;
             return if scan_limit < MAX_SDK_STRING_BYTES {
-                Err(limit("Finder snapshot bytes", MAX_BYTES))
+                Err(limit(ResourceKind::FinderSnapshotBytes, MAX_BYTES))
             } else {
                 Ok(None)
             };
@@ -152,16 +152,19 @@ mod tests {
     #[test]
     fn count_and_span_are_checked_before_dereferencing_or_reserving() {
         assert_eq!(descriptor_bytes(MAX_SOURCES, 16).unwrap(), MAX_SOURCES * 16);
-        for (count, size) in [
-            (MAX_SOURCES + 1, 16),
-            (usize::MAX, 2),
-            (2, isize::MAX as usize),
-        ] {
+        for (count, size) in [(MAX_SOURCES + 1, 16), (usize::MAX, 2)] {
             assert!(matches!(
                 descriptor_bytes(count, size),
-                Err(Error::ResourceLimit { .. })
+                Err(Error::ResourceLimit {
+                    resource: ResourceKind::FinderSnapshotSources,
+                    limit: MAX_SOURCES
+                })
             ));
         }
+        assert!(matches!(
+            descriptor_bytes(2, isize::MAX as usize),
+            Err(Error::UnexpectedSdkResult(_))
+        ));
         // SAFETY: a null array is allowed; the excessive count is rejected
         // before the copier is called or any storage is reserved.
         let (result, allocations) = crate::test_alloc::allocation_count(|| unsafe {

@@ -48,8 +48,8 @@ fn main() -> Result<(), Error> {
 
     // Called on SDK threads: pad every video line to a multiple of 256 bytes.
     receiver.set_video_allocator(|request: AllocationRequest| {
-        let stride = request.stride().next_multiple_of(256);
-        AllocationBuffer::zeroed(request.with_stride(stride)?)
+        let stride = request.stride_bytes().next_multiple_of(256);
+        AllocationBuffer::zeroed(request.with_stride_bytes(stride)?)
     })?;
 
     for _ in 0..120 {

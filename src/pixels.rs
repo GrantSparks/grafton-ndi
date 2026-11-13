@@ -94,6 +94,11 @@ impl Pixels {
         self.tail = tail;
     }
 
+    /// Recover pixels without shrinking their allocation or exposing tail bytes.
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        self.bytes
+    }
+
     pub(crate) fn as_slice(&self) -> &[u8] {
         &self.bytes
     }

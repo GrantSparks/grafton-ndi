@@ -4,7 +4,7 @@ use grafton_ndi::{BorrowedVideoFrame, PixelFormat, Sender, VideoFrame};
 // and the SDK has released the buffer when `send_video` returns.
 fn borrowed(sender: &Sender, buffer: &mut Vec<u8>) {
     let frame = BorrowedVideoFrame::builder(buffer, 64, 32, PixelFormat::Bgra)
-        .line_stride(512)
+        .line_stride_bytes(512)
         .build()
         .unwrap();
     sender.send_video(&frame).unwrap();

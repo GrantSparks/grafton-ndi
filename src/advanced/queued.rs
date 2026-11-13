@@ -27,7 +27,9 @@ use super::aliasable::AliasableBox;
 ///
 /// A frame counts from submission until the application takes it back, so a
 /// frame the SDK has finished with but that has not been collected still uses
-/// its share. The defaults are 8 frames and 512 MiB.
+/// its share. The byte budget includes retained payload capacity, even when a
+/// compressed frame uses only part of a pooled vector. The defaults are 8 frames
+/// and 512 MiB.
 #[derive(Debug, Clone, Copy)]
 pub struct QueueOptions {
     frames: usize,
@@ -68,7 +70,8 @@ impl QueueOptions {
         self
     }
 
-    /// Set the maximum number of bytes of frame data and metadata held.
+    /// Set the maximum retained bytes of frame data and metadata, including
+    /// unused payload capacity reserved by pooled vectors.
     #[must_use]
     pub fn max_bytes(mut self, bytes: usize) -> Self {
         self.bytes = bytes;
@@ -101,6 +104,10 @@ impl SubmissionId {
 }
 
 /// A video frame a [`QueuedSender`] can send.
+///
+/// Each variant owns its complete, nonempty video allocation. Cloning copies
+/// the bytes into independent storage; submission moves that storage into the
+/// queue until it is collected.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum QueuedVideoFrame {
@@ -179,16 +186,9 @@ struct Entry {
     id: SubmissionId,
     // Kept so that the address given to the SDK stays valid. Its data
     // pointer identifies the submission.
-    header: AliasableBox<NDIlib_video_frame_v2_t>,
+    _header: AliasableBox<NDIlib_video_frame_v2_t>,
     frame: QueuedVideoFrame,
     bytes: usize,
-}
-
-impl Entry {
-    /// The address of the frame's data, by which a completion names it.
-    fn key(&self) -> usize {
-        self.header.p_data as usize
-    }
 }
 
 // SAFETY: the descriptor points only into allocations this entry owns, and
@@ -215,11 +215,6 @@ impl State {
     /// The frames held, in flight or ready.
     fn retained(&self) -> usize {
         self.in_flight.len() + self.ready.len()
-    }
-
-    /// Whether a frame held, in flight or ready, has its data at `key`.
-    fn holds(&self, key: usize) -> bool {
-        self.in_flight.contains_key(&key) || self.ready.iter().any(|entry| entry.key() == key)
     }
 }
 
@@ -480,11 +475,14 @@ impl QueuedSender {
         &self.sender
     }
 
-    /// Queue a frame for sending, without copying it and without waiting.
+    /// Queue a frame without waiting for an earlier submission to complete.
     ///
     /// The queue owns the frame until it is collected: the SDK writes to a
     /// compressed frame's bytes while it sends them. A collected frame can be
-    /// submitted again.
+    /// submitted again. Submission does not scan previously submitted frames.
+    /// It allocates one retained native descriptor. Lending an uncompressed
+    /// frame can also grow its pixel allocation to provide the SDK tail room
+    /// its scan type needs; otherwise pixels and metadata move without copies.
     ///
     /// # Errors
     ///
@@ -495,8 +493,7 @@ impl QueuedSender {
     /// [`completion_protocol_failed`](Self::completion_protocol_failed)),
     /// with [`Error::UnsupportedCapability`] when the runtime cannot send an
     /// uncompressed frame's pixel format (as [`Sender::send_video`] checks),
-    /// and with [`Error::InvalidFrame`] when the frame is not sendable or
-    /// shares its data with a frame already queued.
+    /// and with [`Error::InvalidFrame`] when the frame is not sendable.
     pub fn try_submit(
         &mut self,
         frame: impl Into<QueuedVideoFrame>,
@@ -535,14 +532,6 @@ impl QueuedSender {
             if state.retained() >= state.options.frames {
                 return Err(failure(Error::QueueFull(QueueLimit::Frames), frame));
             }
-            if key == 0 || state.holds(key) {
-                return Err(failure(
-                    Error::InvalidFrame(
-                        "queued frames require distinct owned data allocations".into(),
-                    ),
-                    frame,
-                ));
-            }
             let Some(next) = state.next.checked_add(1) else {
                 return Err(failure(
                     Error::InvalidInput("queue submission identifiers exhausted".into()),
@@ -552,11 +541,17 @@ impl QueuedSender {
             let id = SubmissionId(state.next);
             state.next = next;
             state.bytes = total;
+            // Both QueuedVideoFrame variants own nonempty allocations:
+            // VideoFrame's validated Pixels and CompressedVideoFrame's
+            // AliasableVec<u8>. Neither exposes shared ownership, cloning
+            // copies the bytes, and submission moves the frame here until
+            // collection. Its data address is therefore non-null and distinct
+            // from every retained frame, without searching either collection.
             state.in_flight.insert(
                 key,
                 Entry {
                     id,
-                    header,
+                    _header: header,
                     frame,
                     bytes,
                 },
@@ -655,6 +650,63 @@ fn take_completed(state: &mut State) -> Option<CompletedVideo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Measure submission with a completed backlog, reusing each collected
+    /// frame. No receiver is needed: the SDK completes sends with no peers.
+    #[test]
+    #[ignore = "manual release-mode queue submission benchmark"]
+    fn benchmark_queued_submission_backlog() {
+        use std::{hint::black_box, time::Instant};
+
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
+        };
+        for backlog in [8, 512, 4096] {
+            let options = SenderOptions::new(crate::test_support::unique_name(&format!(
+                "queue benchmark {backlog}"
+            )))
+            .clock_video(false);
+            let mut queue =
+                QueuedSender::new(&ndi, &options, QueueOptions::new().max_frames(backlog + 1))
+                    .unwrap();
+            for _ in 0..backlog {
+                queue
+                    .try_submit(VideoFrame::builder().resolution(2, 2).build().unwrap())
+                    .unwrap();
+            }
+            let deadline = Deadline::after(Duration::from_secs(5)).unwrap();
+            let mut state = queue.callback.state.lock().unwrap();
+            while state.ready.len() < backlog {
+                assert!(!deadline.is_expired(), "the SDK must complete every frame");
+                state = queue
+                    .callback
+                    .changed
+                    .wait_timeout(state, deadline.remaining())
+                    .unwrap()
+                    .0;
+            }
+            drop(state);
+
+            let mut frame =
+                QueuedVideoFrame::from(VideoFrame::builder().resolution(2, 2).build().unwrap());
+            let iterations = 10_000;
+            let start = Instant::now();
+            for _ in 0..iterations {
+                black_box(queue.try_submit(frame).unwrap());
+                frame = queue
+                    .try_take_completed()
+                    .or_else(|| queue.wait_completed(Duration::from_secs(5)).unwrap())
+                    .expect("the SDK must complete every frame")
+                    .into_frame();
+            }
+            eprintln!(
+                "{backlog} retained frames: {:.0} ns per submit/collect",
+                start.elapsed().as_nanos() as f64 / f64::from(iterations)
+            );
+            assert!(!queue.completion_protocol_failed());
+        }
+    }
+
     fn insert(state: &CallbackState, id: u64) -> usize {
         let mut frame =
             QueuedVideoFrame::Pixels(VideoFrame::builder().resolution(2, 2).build().unwrap());
@@ -667,7 +719,7 @@ mod tests {
             key,
             Entry {
                 id: SubmissionId(id),
-                header,
+                _header: header,
                 frame,
                 bytes,
             },

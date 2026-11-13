@@ -136,6 +136,20 @@ pub struct RuntimeOptions {
 }
 
 impl RuntimeOptions {
+    /// Restore the normal library search instead of an explicit path.
+    #[must_use]
+    pub fn clear_library_path(mut self) -> Self {
+        self.library_path = None;
+        self
+    }
+
+    /// Accept either SDK edition instead of requiring one.
+    #[must_use]
+    pub fn clear_edition(mut self) -> Self {
+        self.edition = None;
+        self
+    }
+
     /// Requested exact library path, or `None` for the normal search.
     #[must_use]
     pub fn configured_library_path(&self) -> Option<&std::path::Path> {

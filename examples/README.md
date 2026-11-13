@@ -61,6 +61,7 @@ async senders recover completed frames before reusing them.
 | `async_send.rs` | `cargo run --example async_send` | Reuse two owned frames for async sending and recover completed frames. |
 | `async_send_copy.rs` | `cargo run --example async_send_copy` | Copy borrowed pixels into async sends, then into the frames they return. |
 | `zero_copy_send.rs` | `cargo run --example zero_copy_send` | Render into two reusable owned frames without per-send pixel copies. |
+| `media_buffers.rs` | `cargo run --example media_buffers` | Recover and swap pooled buffers, borrow planar audio, inspect trait objects and convert borrowed P216. |
 
 ## Advanced SDK
 

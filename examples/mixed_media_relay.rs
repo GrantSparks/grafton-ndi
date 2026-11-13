@@ -41,7 +41,7 @@ fn main() -> grafton_ndi::Result<()> {
         match receiver.capture_any_ref(Duration::from_millis(100))? {
             Some(ReceiverItemRef::Video(frame)) => sender.send_video(&frame)?,
             Some(ReceiverItemRef::Audio(frame)) => sender.send_audio(&frame),
-            Some(ReceiverItemRef::Metadata(frame)) => sender.send_metadata(&frame.to_owned()),
+            Some(ReceiverItemRef::Metadata(frame)) => sender.send_metadata(&frame),
             Some(ReceiverItemRef::Event(event)) => eprintln!("receiver event: {event:?}"),
             _ => {}
         }

@@ -6,7 +6,7 @@ use crate::{
     frames::{bounded_sdk_text, MAX_SDK_STRING_BYTES},
     sdk_copy::LossyText,
     sys::{self, bindings::*},
-    to_ms_checked, Error, Ndi, Result,
+    to_ms_checked, Error, Ndi, ResourceKind, Result,
 };
 use std::{
     borrow::Cow,
@@ -195,6 +195,21 @@ pub struct ListenerOptions {
     config: Option<crate::advanced::AdvancedConfig>,
 }
 impl ListenerOptions {
+    /// Inherit the Discovery Server endpoint from the NDI configuration.
+    #[must_use]
+    pub fn clear_server(mut self) -> Self {
+        self.server = None;
+        self
+    }
+
+    /// Remove the per-instance Advanced configuration override.
+    #[cfg(feature = "advanced")]
+    #[must_use]
+    pub fn clear_config(mut self) -> Self {
+        self.config = None;
+        self
+    }
+
     /// Requested server endpoint, or `None` to inherit the NDI configuration.
     #[must_use]
     pub fn configured_server(&self) -> Option<&str> {
@@ -512,11 +527,10 @@ impl Budget {
     }
     /// The error for data that does not fit in what is left of the budget.
     fn exceeded() -> Error {
-        Error::UnexpectedSdkResult(
-            "the Discovery Server data is larger than the 16 MiB one snapshot or event batch \
-             may copy"
-                .into(),
-        )
+        Error::ResourceLimit {
+            resource: ResourceKind::DiscoveryServerCopyBytes,
+            limit: COPY_LIMIT,
+        }
     }
     fn take(&mut self, len: usize) -> Result<()> {
         self.0 = self.0.checked_sub(len).ok_or_else(Self::exceeded)?;
@@ -531,7 +545,9 @@ impl Budget {
         let bytes = count
             .checked_mul(size_of::<T>())
             .filter(|bytes| *bytes <= isize::MAX as usize)
-            .ok_or_else(Self::exceeded)?;
+            .ok_or_else(|| {
+                Error::UnexpectedSdkResult("Discovery Server owned array span overflow".into())
+            })?;
         self.take(bytes)?;
         let mut values = Vec::new();
         values
@@ -643,7 +659,9 @@ impl Budget {
             .ok()
             .and_then(|count| count.checked_mul(std::mem::size_of::<T>()))
             .filter(|bytes| *bytes <= isize::MAX as usize)
-            .ok_or_else(Self::exceeded)?;
+            .ok_or_else(|| {
+                Error::UnexpectedSdkResult("Discovery Server native array span overflow".into())
+            })?;
         self.take(bytes)?;
         // SAFETY: the pointer is non-null and the caller vouches for `count`
         // elements, whose total size was just checked.
@@ -987,9 +1005,11 @@ macro_rules! listener_methods {
         /// # Errors
         ///
         /// Returns [`Error::InvalidInput`] when `timeout` exceeds
-        /// [`crate::MAX_TIMEOUT`], and [`Error::UnexpectedSdkResult`] when the
-        /// batch is malformed, copying it would take more than 16 MiB, or one
-        /// of its strings is 4 MiB or longer. The SDK has already handed such a
+        /// [`crate::MAX_TIMEOUT`], [`Error::ResourceLimit`] when copying the
+        /// batch would exceed its 16 MiB budget, and
+        /// [`Error::UnexpectedSdkResult`] when the batch is malformed, a string
+        /// is 4 MiB or longer, or storage cannot be reserved. The SDK has
+        /// already handed such a
         /// batch over, so it is released without being returned and its events
         /// are lost.
         pub fn capture_events(&mut self, timeout: Duration) -> Result<Vec<ListenerEvent<$Id>>> {
@@ -1026,9 +1046,10 @@ impl SendListener {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::UnexpectedSdkResult`] when the SDK's snapshot is malformed,
-    /// when copying it would take more than 16 MiB, or when one of its strings
-    /// is 4 MiB or longer. Text that is not valid UTF-8 is decoded lossily
+    /// Returns [`Error::ResourceLimit`] when copying would exceed the 16 MiB
+    /// budget; [`Error::UnexpectedSdkResult`] when the SDK's snapshot is malformed,
+    /// one of its strings is 4 MiB or longer, or storage cannot be reserved.
+    /// Text that is not valid UTF-8 is decoded lossily
     /// within the same budget; see the [module documentation](super).
     pub fn snapshot(&mut self) -> Result<Vec<AdvertisedSender>> {
         let mut budget = Budget::new();
@@ -1081,9 +1102,10 @@ impl RecvListener {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::UnexpectedSdkResult`] when the SDK's snapshot is malformed,
-    /// when copying it would take more than 16 MiB, or when one of its strings
-    /// is 4 MiB or longer. Text that is not valid UTF-8 is decoded lossily
+    /// Returns [`Error::ResourceLimit`] when copying would exceed the 16 MiB
+    /// budget; [`Error::UnexpectedSdkResult`] when the SDK's snapshot is malformed,
+    /// one of its strings is 4 MiB or longer, or storage cannot be reserved.
+    /// Text that is not valid UTF-8 is decoded lossily
     /// within the same budget; see the [module documentation](super).
     pub fn snapshot(&mut self) -> Result<Vec<AdvertisedReceiver>> {
         let mut budget = Budget::new();
@@ -1186,7 +1208,10 @@ mod tests {
             assert_eq!(budget.text(ptr::null()).unwrap(), None);
             assert_eq!(budget.text(c"".as_ptr()).unwrap(), Some(String::new()));
             assert_eq!(budget.id::<SenderId>(ptr::null()).unwrap(), None);
-            assert!(budget.slice::<u32>(ptr::null(), 1).is_err());
+            assert!(matches!(
+                budget.slice::<u32>(ptr::null(), 1),
+                Err(Error::UnexpectedSdkResult(_))
+            ));
             assert!(budget.slice::<u32>(ptr::null(), 0).unwrap().is_empty());
         }
     }
@@ -1255,7 +1280,10 @@ mod tests {
             assert_eq!(budget.0, 0);
             assert!(matches!(
                 budget.text(c"a".as_ptr()),
-                Err(Error::UnexpectedSdkResult(_))
+                Err(Error::ResourceLimit {
+                    resource: ResourceKind::DiscoveryServerCopyBytes,
+                    limit: COPY_LIMIT
+                })
             ));
         }
     }
@@ -1272,8 +1300,17 @@ mod tests {
         // SAFETY: as above. Refuse the copy before allocating its output.
         let (result, allocations) =
             crate::test_alloc::allocation_count(|| unsafe { Budget(4).text(c"\xff".as_ptr()) });
-        assert!(matches!(result, Err(Error::UnexpectedSdkResult(_))));
-        assert_eq!(allocations, 1, "only the error message is allocated");
+        assert!(matches!(
+            result,
+            Err(Error::ResourceLimit {
+                resource: ResourceKind::DiscoveryServerCopyBytes,
+                limit: COPY_LIMIT
+            })
+        ));
+        assert_eq!(
+            allocations, 0,
+            "resource-limit rejection allocates no error text"
+        );
     }
     #[test]
     fn identifiers_charge_the_exact_owned_bytes_including_the_nul() {
@@ -1288,12 +1325,18 @@ mod tests {
             assert_eq!(budget.0, 0);
             assert_eq!(allocations, 1);
 
-            // SAFETY: as above. Only the error may allocate on rejection.
+            // SAFETY: as above. Rejection happens before allocating any output.
             let (result, allocations) = crate::test_alloc::allocation_count(|| unsafe {
                 Budget(2 * bytes - 1).id::<SenderId>(id.as_ptr())
             });
-            assert!(matches!(result, Err(Error::UnexpectedSdkResult(_))));
-            assert_eq!(allocations, 1);
+            assert!(matches!(
+                result,
+                Err(Error::ResourceLimit {
+                    resource: ResourceKind::DiscoveryServerCopyBytes,
+                    limit: COPY_LIMIT
+                })
+            ));
+            assert_eq!(allocations, 0);
         }
     }
     #[test]
@@ -1319,9 +1362,18 @@ mod tests {
             let raw = unsafe { budget.slice(source.as_ptr(), source.len() as u32) }.unwrap();
             budget.collect::<_, u64>(raw, |_, _| panic!("must reject before conversion"))
         });
-        assert!(matches!(result, Err(Error::UnexpectedSdkResult(_))));
-        assert_eq!(allocations, 1);
-        assert!(Budget::new().reserve::<u64>(usize::MAX).is_err());
+        assert!(matches!(
+            result,
+            Err(Error::ResourceLimit {
+                resource: ResourceKind::DiscoveryServerCopyBytes,
+                limit: COPY_LIMIT
+            })
+        ));
+        assert_eq!(allocations, 0);
+        assert!(matches!(
+            Budget::new().reserve::<u64>(usize::MAX),
+            Err(Error::UnexpectedSdkResult(_))
+        ));
     }
     #[test]
     fn nested_collections_and_text_share_the_outer_budget() {
@@ -1340,7 +1392,13 @@ mod tests {
                 assert_eq!(result.unwrap(), ["\u{fffd}", ""]);
                 assert_eq!(budget.0, 0);
             } else {
-                assert!(matches!(result, Err(Error::UnexpectedSdkResult(_))));
+                assert!(matches!(
+                    result,
+                    Err(Error::ResourceLimit {
+                        resource: ResourceKind::DiscoveryServerCopyBytes,
+                        limit: COPY_LIMIT
+                    })
+                ));
             }
         }
     }
@@ -1357,7 +1415,13 @@ mod tests {
                 budget.collect(raw, |pointer, budget| budget.text(*pointer))
             }
         });
-        assert!(matches!(result, Err(Error::UnexpectedSdkResult(_))));
+        assert!(matches!(
+            result,
+            Err(Error::ResourceLimit {
+                resource: ResourceKind::DiscoveryServerCopyBytes,
+                limit: COPY_LIMIT
+            })
+        ));
         assert!(peak <= COPY_LIMIT, "allocated {peak} bytes");
     }
     #[test]
@@ -1389,10 +1453,13 @@ mod tests {
             let mut budget = Budget(4);
             assert_eq!(budget.c_str(c"abc".as_ptr()).unwrap(), Some(c"abc"));
             assert_eq!(budget.0, 0);
-            let Err(Error::UnexpectedSdkResult(reason)) = Budget(3).c_str(c"abc".as_ptr()) else {
+            let Err(Error::ResourceLimit {
+                resource: ResourceKind::DiscoveryServerCopyBytes,
+                limit: COPY_LIMIT,
+            }) = Budget(3).c_str(c"abc".as_ptr())
+            else {
                 panic!("a string larger than the budget must be refused");
             };
-            assert!(reason.contains("16 MiB"), "{reason}");
         }
     }
     #[test]
@@ -1433,21 +1500,22 @@ mod tests {
             assert_eq!(budget.0, COPY_LIMIT - many.len());
 
             // One element more than the budget holds is refused by size.
-            let wide = vec![0u64; COPY_LIMIT / 8];
+            let wide = vec![0u64; COPY_LIMIT / 8 + 1];
             let mut budget = Budget::new();
             assert_eq!(
                 budget
-                    .slice(wide.as_ptr(), wide.len() as u32)
+                    .slice(wide.as_ptr(), (wide.len() - 1) as u32)
                     .unwrap()
                     .len(),
-                wide.len()
+                wide.len() - 1
             );
-            let Err(Error::UnexpectedSdkResult(reason)) =
-                Budget::new().slice(wide.as_ptr(), u32::MAX)
+            let Err(Error::ResourceLimit {
+                resource: ResourceKind::DiscoveryServerCopyBytes,
+                limit: COPY_LIMIT,
+            }) = Budget::new().slice(wide.as_ptr(), wide.len() as u32)
             else {
                 panic!("an array larger than the budget must be refused");
             };
-            assert!(reason.contains("16 MiB"), "{reason}");
         }
     }
 }

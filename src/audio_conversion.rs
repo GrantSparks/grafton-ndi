@@ -121,6 +121,7 @@ impl AudioShape {
             .num_samples(self.num_samples)
             .timecode(timecode)
             .build()
+            .map_err(crate::Rejected::into_error)
     }
 
     /// The SDK's `sample_rate`, `no_channels` and `no_samples`.
@@ -360,6 +361,7 @@ impl<M: AudioSendMode> Sender<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frames::AudioParts;
 
     #[test]
     fn captured_audio_sources_lend_the_original_strided_descriptor() {
@@ -537,6 +539,19 @@ mod tests {
         }
         verify(&converter, &receiver);
         verify(&converter, &framesync);
+        let (borrowed, allocations) = crate::test_alloc::allocation_count(|| {
+            crate::BorrowedAudioFrame::builder(&samples, 44_100, 2, 3)
+                .channel_stride_bytes(32)
+                .metadata(c"<audio/>")
+                .timecode(Timecode::from_ticks(1234))
+                .build()
+                .unwrap()
+        });
+        assert_eq!(allocations, 0);
+        assert_eq!(borrowed.audio_descriptor().p_data, raw.p_data);
+        assert_eq!(borrowed.audio_descriptor().p_metadata, raw.p_metadata);
+        verify(&converter, &borrowed);
+        verify(&converter, &borrowed as &dyn AudioSource);
     }
 
     #[test]

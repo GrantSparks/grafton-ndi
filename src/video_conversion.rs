@@ -10,7 +10,7 @@ use std::ptr;
 use crate::{
     frames::{sdk_video_frame, ValidatedVideoLayout, VideoHeader, MAX_VIDEO_BYTES},
     sys::{self, bindings::NDIlib_video_frame_v2_t},
-    Error, FrameRate, Ndi, PixelFormat, Result, ScanType, Timecode, VideoFrame,
+    Error, FrameRate, Ndi, PixelFormat, Result, ScanType, Timecode, VideoFrame, VideoSource,
 };
 
 /// Validated V210 storage geometry, including optional initialized row padding.
@@ -37,7 +37,7 @@ impl V210Layout {
         let stride = Self::active_words_checked(width)?
             .checked_mul(4)
             .ok_or_else(|| Error::InvalidFrame("V210 active row size overflow".into()))?;
-        Self::with_line_stride(width, height, stride)
+        Self::with_line_stride_bytes(width, height, stride)
     }
 
     /// Create a layout with a byte stride that may include row padding.
@@ -46,7 +46,7 @@ impl V210Layout {
     ///
     /// As for [`Self::new`], and for a stride that is not a multiple of four
     /// or does not cover every complete pixel group.
-    pub fn with_line_stride(width: u32, height: u32, stride_bytes: usize) -> Result<Self> {
+    pub fn with_line_stride_bytes(width: u32, height: u32, stride_bytes: usize) -> Result<Self> {
         let active_words = Self::active_words_checked(width)?;
         // Reuse the established even-width/height/extent validation for the
         // corresponding two full-height, 16-bit P216 planes.
@@ -118,10 +118,8 @@ impl V210Layout {
         Ok(())
     }
 
-    /// Require `frame` to be P216 with this layout's dimensions. Its samples
-    /// are then exactly the packed P216 frame [`Self::p216_descriptor`]
-    /// describes.
-    fn check_p216(self, frame: &VideoFrame) -> Result<()> {
+    /// Require validated P216 input with this layout's dimensions.
+    fn check_p216(self, frame: &(impl VideoSource + ?Sized)) -> Result<()> {
         if frame.pixel_format() != PixelFormat::P216
             || frame.width() != self.width
             || frame.height() != self.height
@@ -146,7 +144,7 @@ impl V210Layout {
     ///
     /// [`Error::InvalidFrame`] when `len` is not exactly that frame's size.
     fn p216_descriptor(self, data: *const u8, len: usize) -> Result<NDIlib_video_frame_v2_t> {
-        // `with_line_stride` validated this layout for these dimensions.
+        // `with_line_stride_bytes` validated this layout for these dimensions.
         let p216 = ValidatedVideoLayout::new_uncompressed(
             PixelFormat::P216,
             self.width,
@@ -190,7 +188,8 @@ impl V210Layout {
 /// Native V210/P216 conversion helpers retained with their selected runtime.
 ///
 /// Both exports are resolved before construction succeeds. Operations use
-/// caller-owned initialized storage and do not allocate pixel buffers.
+/// caller-owned initialized storage and do not allocate pixel buffers. Borrowed
+/// P216 inputs retain their original validated row and plane strides.
 pub struct VideoConverter {
     _ndi: Ndi,
     conversion: &'static sys::VideoConversion,
@@ -252,6 +251,11 @@ impl VideoConverter {
     /// two unused high bits therefore remain zero. Row padding and extra trailing
     /// words are unchanged. V210 utility buffers carry no frame metadata.
     ///
+    /// Accepts owned, captured, FrameSync and external borrowed [`VideoSource`]
+    /// inputs, including padded P216 planes. The native utility reads the original
+    /// active rows with their validated stride; no intermediate pixel copy or
+    /// wrapper allocation is made. The source borrow lasts through the call.
+    ///
     /// # Errors
     ///
     /// [`Error::InvalidFrame`] when `source` is not a P216 frame of the
@@ -259,18 +263,30 @@ impl VideoConverter {
     /// storage. `destination` is then unchanged.
     pub fn p216_to_v210(
         &self,
-        source: &VideoFrame,
+        source: &(impl VideoSource + ?Sized),
         layout: V210Layout,
         destination: &mut [u32],
     ) -> Result<()> {
         layout.check_p216(source)?;
-        self.pack(layout, source.data(), destination)
+        self.pack_descriptor(layout, source.video_descriptor(), destination)
     }
 
     /// Pack `p216`, the samples of the packed P216 frame of `layout`'s
     /// dimensions, which may start at any address, into `destination`.
+    #[cfg(test)]
     fn pack(&self, layout: V210Layout, p216: &[u8], destination: &mut [u32]) -> Result<()> {
         let input = layout.p216_descriptor(p216.as_ptr(), p216.len())?;
+        self.pack_descriptor(layout, input, destination)
+    }
+
+    /// `input` borrows a validated P216 source, packed or strided, with the
+    /// dimensions of `layout`, for this entire synchronous native call.
+    fn pack_descriptor(
+        &self,
+        layout: V210Layout,
+        input: NDIlib_video_frame_v2_t,
+        destination: &mut [u32],
+    ) -> Result<()> {
         layout.check_storage(destination.len())?;
         let stride_words = layout.stride / 4;
         let active = layout.active_words_per_row();
@@ -278,9 +294,12 @@ impl VideoConverter {
             row[..active].fill(0);
         }
         let mut output = layout.v210_descriptor(input, destination.as_mut_ptr());
-        // SAFETY: `p216` holds exactly the P216 frame `input` describes and
-        // `destination` every word of the layout's rows, both initialized and
-        // borrowed apart for the call, which keeps no reference. The V210
+        // SAFETY: The sealed source lends the validated P216 planes `input`
+        // describes, with every active row initialized. Width is a complete
+        // six-pixel group; Processing.NDI.utilities.h P216_to_V210 consumes
+        // the source's row stride, so no row padding or extra pixels need be
+        // initialized. `destination` holds every word of its checked rows,
+        // borrowed apart for this call, which keeps no reference. The V210
         // words are aligned `u32`s, and the NDI SDK documentation requires
         // no alignment of a video frame's data, so the P216 bytes need none.
         unsafe {
@@ -305,13 +324,13 @@ mod tests {
             assert!(V210Layout::new(6, height).is_err());
         }
         for stride in [0, 12, 17, 18, i32::MAX.unsigned_abs() as usize, usize::MAX] {
-            assert!(V210Layout::with_line_stride(6, 1, stride).is_err());
+            assert!(V210Layout::with_line_stride_bytes(6, 1, stride).is_err());
         }
         for width in [6u32, 12, 18, 48, 1920, 3840, 12_288] {
             for height in [1u32, 3, 1080, 2160, 65_536] {
                 for padding in [0, 4, 128] {
                     let stride = width as usize / 6 * 16 + padding;
-                    let actual = V210Layout::with_line_stride(width, height, stride);
+                    let actual = V210Layout::with_line_stride_bytes(width, height, stride);
                     let packed = stride as i128 * i128::from(height);
                     let planar = i128::from(width) * i128::from(height) * 4;
                     assert_eq!(
@@ -346,7 +365,7 @@ mod tests {
         for width in [6, 12, 18, 48, 1920] {
             for height in [1, 3] {
                 for padding_words in [0, 1, 4] {
-                    let layout = V210Layout::with_line_stride(
+                    let layout = V210Layout::with_line_stride_bytes(
                         width,
                         height,
                         width as usize / 6 * 16 + padding_words * 4,
@@ -502,5 +521,85 @@ mod tests {
             .v210_to_p216(other_size, &[0; 8], &mut frame)
             .is_err());
         assert!(frame.data().iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn strided_borrowed_and_captured_p216_convert_without_pixel_copies() {
+        use crate::{
+            capture::{FrameSyncVideoFree, Guard, VideoKind},
+            frames::{VideoParts, VideoRef},
+            BorrowedVideoFrame,
+        };
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let converter = VideoConverter::new(&ndi).unwrap();
+        for width in [6, 12, 48] {
+            for height in [1, 3] {
+                for padding in [0, 2, 8, 32] {
+                    let stride = width as usize * 2 + padding;
+                    let mut storage = vec![0xabu8; stride * height as usize * 2];
+                    for plane in 0..2 {
+                        for row in 0..height as usize {
+                            for sample in 0..width as usize {
+                                let offset = (plane * height as usize + row) * stride + sample * 2;
+                                let value =
+                                    ((plane * 97 + row * 53 + sample * 29) as u16 & 1023) << 6;
+                                storage[offset..offset + 2].copy_from_slice(&value.to_ne_bytes());
+                            }
+                        }
+                    }
+                    let borrowed =
+                        BorrowedVideoFrame::builder(&storage, width, height, PixelFormat::P216)
+                            .line_stride_bytes(stride)
+                            .metadata(c"<p216/>")
+                            .build()
+                            .unwrap();
+                    let raw = borrowed.video_descriptor();
+                    // SAFETY: Both synthetic guards borrow storage and static
+                    // metadata for this test, and neither callback frees them.
+                    let receiver = unsafe {
+                        VideoRef::<VideoKind>::new(Guard::with_test_free(
+                            ptr::null_mut(),
+                            raw,
+                            |_, _| {},
+                        ))
+                    }
+                    .unwrap();
+                    let framesync = unsafe {
+                        VideoRef::<FrameSyncVideoFree>::new(Guard::with_test_free(
+                            ptr::null_mut(),
+                            raw,
+                            |_, _| {},
+                        ))
+                    }
+                    .unwrap();
+                    let layout = V210Layout::with_line_stride_bytes(
+                        width,
+                        height,
+                        width as usize / 6 * 16 + 4,
+                    )
+                    .unwrap();
+                    let owned = VideoSource::to_owned(&borrowed);
+                    let mut expected = vec![0x9e37_79b9; layout.required_words() + 2];
+                    converter
+                        .p216_to_v210(&owned, layout, &mut expected[1..])
+                        .unwrap();
+                    for source in [&borrowed as &dyn VideoSource, &receiver, &framesync] {
+                        assert_eq!(source.video_descriptor().p_data, raw.p_data);
+                        let mut destination = vec![0x9e37_79b9; layout.required_words() + 2];
+                        let (result, allocations) = crate::test_alloc::allocation_count(|| {
+                            converter.p216_to_v210(source, layout, &mut destination[1..])
+                        });
+                        result.unwrap();
+                        assert_eq!(allocations, 0);
+                        assert_eq!(
+                            destination, expected,
+                            "width {width}, height {height}, padding {padding}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

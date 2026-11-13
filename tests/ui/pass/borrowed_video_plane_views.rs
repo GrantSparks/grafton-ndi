@@ -6,7 +6,7 @@ fn main() {
     // Two BGRA rows of two pixels, each padded from 8 to 12 bytes.
     let pixels = [7; 24];
     let frame = BorrowedVideoFrame::builder(&pixels, 2, 2, PixelFormat::Bgra)
-        .line_stride(12)
+        .line_stride_bytes(12)
         .build()
         .unwrap();
     let plane: VideoPlane<'_> = frame.plane(0).unwrap();

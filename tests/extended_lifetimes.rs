@@ -78,10 +78,12 @@ fn native_resource_ownership() {
         "foreign_registration",
         "refused_unregistration",
         "malformed_metadata",
+        "metadata_count",
     ];
     if cfg!(feature = "advanced") {
         scenarios.extend([
             "queue_immediate",
+            "queue_backlog",
             "queue_destroy",
             "queue_registered_sender",
         ]);
@@ -101,7 +103,7 @@ fn native_resource_ownership() {
             )
             .env(
                 "GRAFTON_FAKE_CALLBACK_MODE",
-                if case == "queue_immediate" {
+                if matches!(case, "queue_immediate" | "queue_backlog") {
                     "immediate"
                 } else {
                     "delayed"
@@ -352,7 +354,20 @@ fn child(case: &str) {
             let sender = sender(&ndi);
             assert!(sender.capture_metadata(Duration::ZERO).is_err());
             assert_eq!(log().matches("sender-metadata-free\n").count(), 1);
+            assert!(log().contains("sender-metadata-free-count=2\n"));
             drop(sender);
+        }
+        "metadata_count" => {
+            std::env::set_var("GRAFTON_FAKE_SENDER_METADATA_COUNT", "exclude-nul");
+            let sender = sender(&ndi);
+            let frame = sender.capture_metadata(Duration::ZERO).unwrap().unwrap();
+            assert_eq!(frame.data(), "x");
+            assert_eq!(frame.timecode().ticks(), 123);
+            let events = log();
+            assert_eq!(events.matches("sender-metadata-free\n").count(), 1);
+            assert!(events.contains("sender-metadata-free-count=1\n"));
+            drop(sender);
+            assert_eq!(frame.data(), "x", "the copy outlives the SDK allocation");
         }
         #[cfg(feature = "advanced")]
         "queue_immediate" => {
@@ -395,6 +410,67 @@ fn child(case: &str) {
             ));
             assert_eq!(small.retained_frames(), 0);
             assert_eq!(log().matches("sender-submit-return\n").count(), 2);
+        }
+        #[cfg(feature = "advanced")]
+        "queue_backlog" => {
+            use grafton_ndi::advanced::{
+                CompressedVideoFrame, QueueOptions, QueuedSender, QueuedVideoFrame, VideoCodec,
+                VideoPacketFormat,
+            };
+            let pixels = QueuedVideoFrame::from(frame());
+            let packet = QueuedVideoFrame::from(
+                CompressedVideoFrame::new(
+                    VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16).unwrap(),
+                    vec![0, 1, 2, 3],
+                )
+                .unwrap(),
+            );
+            let address = |frame: &QueuedVideoFrame| match frame {
+                QueuedVideoFrame::Pixels(frame) => frame.data().as_ptr(),
+                QueuedVideoFrame::Compressed(frame) => frame.data().as_ptr(),
+                _ => unreachable!("the test constructs only pixels and packets"),
+            };
+            let mut queue = QueuedSender::new(
+                &ndi,
+                &SenderOptions::new("queue backlog"),
+                QueueOptions::new().max_frames(64),
+            )
+            .unwrap();
+            let mut submitted = Vec::new();
+            let mut addresses = std::collections::HashSet::new();
+            for _ in 0..32 {
+                for original in [&pixels, &packet] {
+                    let frame = original.clone();
+                    let pointer = address(&frame);
+                    assert!(!pointer.is_null());
+                    assert_ne!(pointer, address(original));
+                    assert!(addresses.insert(pointer));
+                    let id = queue.try_submit(frame).unwrap();
+                    submitted.push((id, pointer));
+                }
+            }
+            // Immediate callbacks have moved all 64 entries into ready; none
+            // has been collected, so their allocations must still be distinct.
+            assert_eq!(queue.retained_frames(), 64);
+            let mut resubmitted = Vec::new();
+            for (id, pointer) in submitted {
+                let completed = queue.try_take_completed().unwrap();
+                assert_eq!(completed.id(), id);
+                assert_eq!(address(completed.frame()), pointer);
+                let next = queue.try_submit(completed.into_frame()).unwrap();
+                assert!(next.get() > id.get());
+                resubmitted.push((next, pointer));
+            }
+            for (id, pointer) in resubmitted {
+                let completed = queue.try_take_completed().unwrap();
+                assert_eq!(completed.id(), id);
+                assert_eq!(address(completed.frame()), pointer);
+            }
+            assert_eq!(queue.retained_frames(), 0);
+            assert!(!queue.completion_protocol_failed());
+            drop(queue);
+            assert_eq!(log().matches("sender-completion\n").count(), 128);
+            assert_eq!(log().matches("sender-submit-return\n").count(), 128);
         }
         #[cfg(feature = "advanced")]
         "queue_destroy" => {

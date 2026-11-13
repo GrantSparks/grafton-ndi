@@ -3,7 +3,7 @@
 
 use std::ffi::{c_char, CString};
 
-use super::{aliasable::AliasableBox, descriptors, invalid_frame, sdk_quantity};
+use super::{aliasable::AliasableVec, descriptors, invalid_frame, sdk_quantity};
 use crate::{
     sys::bindings::*, Error, FourCc, FrameRate, Rejected, Result, ScanType, SdkTimestamp,
     StreamTier, Timecode,
@@ -829,7 +829,7 @@ pub(crate) fn attach_metadata<T: HasExtras>(
 #[derive(Clone, Debug)]
 pub struct CompressedVideoFrame {
     pub(crate) format: VideoPacketFormat,
-    pub(crate) bytes: AliasableBox<[u8]>,
+    pub(crate) bytes: AliasableVec<u8>,
     pub(crate) extras: FrameExtras,
 }
 
@@ -859,7 +859,7 @@ impl CompressedVideoFrame {
         match validate_video_packet(format, &bytes, Use::Send) {
             Ok(()) => Ok(Self {
                 format,
-                bytes: AliasableBox::new(bytes.into_boxed_slice()),
+                bytes: AliasableVec::new(bytes),
                 extras: FrameExtras::default(),
             }),
             Err(error) => Err(Rejected::new(error, bytes)),
@@ -911,9 +911,9 @@ impl CompressedVideoFrame {
         self.extras.metadata()
     }
 
-    /// Take the codec bytes.
+    /// Take the codec bytes, retaining the original allocation and capacity.
     pub fn into_data(self) -> Vec<u8> {
-        self.bytes.into_box().into_vec()
+        self.bytes.into_vec()
     }
 
     /// Check that this frame can be sent.
@@ -932,7 +932,7 @@ impl CompressedVideoFrame {
 
     /// Bytes this frame keeps allocated.
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.bytes.len() + self.extras.retained_bytes()
+        self.bytes.capacity() + self.extras.retained_bytes()
     }
 
     /// A native descriptor that lends this frame's bytes and metadata to the
@@ -1215,7 +1215,7 @@ impl AudioCodec {
 pub struct CompressedAudioFrame {
     pub(crate) codec: AudioCodec,
     pub(crate) protected: bool,
-    pub(crate) bytes: AliasableBox<[u8]>,
+    pub(crate) bytes: AliasableVec<u8>,
     pub(crate) parameters: AudioParameters,
     pub(crate) extras: FrameExtras,
 }
@@ -1252,7 +1252,7 @@ impl CompressedAudioFrame {
         let frame = Self {
             codec,
             protected: false,
-            bytes: AliasableBox::new(bytes.into_boxed_slice()),
+            bytes: AliasableVec::new(bytes),
             parameters,
             extras: FrameExtras::default(),
         };
@@ -1333,9 +1333,9 @@ impl CompressedAudioFrame {
         self.extras.metadata()
     }
 
-    /// Take the codec bytes.
+    /// Take the codec bytes, retaining the original allocation and capacity.
     pub fn into_data(self) -> Vec<u8> {
-        self.bytes.into_box().into_vec()
+        self.bytes.into_vec()
     }
 
     /// Check that this frame can be sent.
@@ -1428,7 +1428,7 @@ pub(crate) unsafe fn copy_video_packet(
     validate_video_packet(format, bytes, Use::Receive)?;
     Ok(CompressedVideoFrame {
         format,
-        bytes: AliasableBox::new(bytes.into()),
+        bytes: AliasableVec::new(bytes.to_vec()),
         // SAFETY: forwarded to the caller's obligation.
         extras: unsafe { FrameExtras::received(raw.timecode, raw.timestamp, raw.p_metadata)? },
     })
@@ -1451,7 +1451,7 @@ pub(crate) unsafe fn copy_audio_packet(
     let frame = CompressedAudioFrame {
         codec,
         protected,
-        bytes: AliasableBox::new(bytes.into()),
+        bytes: AliasableVec::new(bytes.to_vec()),
         parameters,
         // SAFETY: forwarded to the caller's obligation.
         extras: unsafe { FrameExtras::received(raw.timecode, raw.timestamp, raw.p_metadata)? },
@@ -2094,7 +2094,7 @@ mod tests {
         let received = CompressedAudioFrame {
             codec: AudioCodec::Aac,
             protected: false,
-            bytes: AliasableBox::new(packet.clone().into_boxed_slice()),
+            bytes: AliasableVec::new(packet.clone()),
             parameters: AudioParameters::new(48_000, 2, 1024).unwrap(),
             extras: FrameExtras::default(),
         };

@@ -18,7 +18,7 @@ use crate::{
     frames::copy_sdk_string,
     sys::{self, bindings::*},
     timeout::Deadline,
-    to_ms_checked, Error, Ndi, Result,
+    to_ms_checked, Error, Ndi, ResourceKind, Result,
 };
 
 /// Configuration for NDI source discovery.
@@ -55,6 +55,28 @@ impl Default for FinderOptions {
 }
 
 impl FinderOptions {
+    /// Inherit discovery groups from the NDI configuration.
+    #[must_use]
+    pub fn clear_groups(mut self) -> Self {
+        self.groups = None;
+        self
+    }
+
+    /// Remove the explicitly requested direct IP addresses.
+    #[must_use]
+    pub fn clear_extra_ips(mut self) -> Self {
+        self.extra_ips = None;
+        self
+    }
+
+    /// Remove the per-instance Advanced configuration override.
+    #[cfg(feature = "advanced")]
+    #[must_use]
+    pub fn clear_config(mut self) -> Self {
+        self.config = None;
+        self
+    }
+
     /// Whether local sources were requested.
     #[must_use]
     pub fn configured_show_local_sources(&self) -> bool {
@@ -662,7 +684,7 @@ fn accumulate_sources(
         }
         if discovered.len() == budget::MAX_SOURCES {
             return Err(budget::limit(
-                "Finder discovery source count",
+                ResourceKind::FinderDiscoverySources,
                 budget::MAX_SOURCES,
             ));
         }
@@ -672,14 +694,17 @@ fn accumulate_sources(
             });
         let bytes = retained_bytes
             .checked_add(text_bytes * 2)
-            .ok_or_else(|| budget::limit("Finder discovery bytes", budget::MAX_BYTES))?;
+            .ok_or_else(|| budget::limit(ResourceKind::FinderDiscoveryBytes, budget::MAX_BYTES))?;
         // Check before growing either container or copying strings. Round
         // up for vector growth, hash buckets and control bytes; the actual
         // capacities are checked as well before retaining the source.
         let next_capacity = (discovered.len() + 1).max(4).next_power_of_two();
         let growth_bound = next_capacity * 4 * (std::mem::size_of::<Source>() + 1);
         if bytes + growth_bound > budget::MAX_BYTES {
-            return Err(budget::limit("Finder discovery bytes", budget::MAX_BYTES));
+            return Err(budget::limit(
+                ResourceKind::FinderDiscoveryBytes,
+                budget::MAX_BYTES,
+            ));
         }
         discovered
             .try_reserve(1)
@@ -691,7 +716,10 @@ fn accumulate_sources(
         let containers = discovered.capacity() * std::mem::size_of::<Source>()
             + seen.capacity() * 2 * (std::mem::size_of::<Source>() + 1);
         if bytes + containers > budget::MAX_BYTES {
-            return Err(budget::limit("Finder discovery bytes", budget::MAX_BYTES));
+            return Err(budget::limit(
+                ResourceKind::FinderDiscoveryBytes,
+                budget::MAX_BYTES,
+            ));
         }
         let name = budget::copy_string(&source.name)?;
         let address = source
@@ -882,13 +910,13 @@ impl SourceAddress {
     /// use grafton_ndi::SourceAddress;
     ///
     /// let addr = SourceAddress::Ip("192.168.1.100:5960".to_string());
-    /// assert!(addr.contains_host("192.168.1.100"));
-    /// assert!(!addr.contains_host("192.168.1"));
+    /// assert!(addr.matches_host("192.168.1.100"));
+    /// assert!(!addr.matches_host("192.168.1"));
     ///
     /// let url = SourceAddress::Url("http://camera.local:8080".to_string());
-    /// assert!(url.contains_host("camera.local"));
+    /// assert!(url.matches_host("camera.local"));
     /// ```
-    pub fn contains_host(&self, host: &str) -> bool {
+    pub fn matches_host(&self, host: &str) -> bool {
         HostQuery::parse(host).is_some_and(|query| self.matches_query(query))
     }
 
@@ -1590,8 +1618,8 @@ mod tests {
         assert!(!exact.matches_host("192.0.2.1"));
         assert!(!exact.matches_host("Program"));
         let ipv6 = SourceAddress::Ip("[2001:0db8:0:0:0:0:0:1]:5960".into());
-        assert!(ipv6.contains_host("2001:db8::1"));
-        assert!(ipv6.contains_host("[2001:db8::1]"));
+        assert!(ipv6.matches_host("2001:db8::1"));
+        assert!(ipv6.matches_host("[2001:db8::1]"));
         for invalid in [
             "",
             "camera:5960",
@@ -1606,7 +1634,7 @@ mod tests {
         let (_, allocations) = crate::test_alloc::allocation_count(|| {
             for _ in 0..100 {
                 assert!(exact.matches_host("CAMERA.LOCAL"));
-                assert!(ipv6.contains_host("2001:db8::1"));
+                assert!(ipv6.matches_host("2001:db8::1"));
             }
         });
         assert_eq!(allocations, 0);

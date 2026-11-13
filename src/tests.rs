@@ -205,7 +205,7 @@ fn test_audio_frame_builder_data_length_validation() {
         .build();
 
     assert!(result.is_err());
-    match result {
+    match result.map_err(crate::Rejected::into_error) {
         Err(Error::InvalidFrame(msg)) => {
             assert!(msg.contains("Audio data length 3"));
             assert!(msg.contains("expected 6"));
@@ -222,7 +222,7 @@ fn test_audio_frame_builder_data_length_validation() {
         .build();
 
     assert!(result.is_err());
-    match result {
+    match result.map_err(crate::Rejected::into_error) {
         Err(Error::InvalidFrame(msg)) => {
             assert!(msg.contains("Audio data length 10"));
             assert!(msg.contains("expected 6"));
@@ -368,17 +368,17 @@ fn test_source_address_contains_host() {
     use crate::finder::SourceAddress;
 
     let ip_addr = SourceAddress::Ip("192.168.1.100:5960".to_string());
-    assert!(ip_addr.contains_host("192.168.1.100"));
-    assert!(!ip_addr.contains_host("192.168.1"));
-    assert!(!ip_addr.contains_host("5960"));
-    assert!(!ip_addr.contains_host("192.168.2"));
+    assert!(ip_addr.matches_host("192.168.1.100"));
+    assert!(!ip_addr.matches_host("192.168.1"));
+    assert!(!ip_addr.matches_host("5960"));
+    assert!(!ip_addr.matches_host("192.168.2"));
 
     let url_addr = SourceAddress::Url("http://camera.local:8080".to_string());
-    assert!(url_addr.contains_host("camera.local"));
-    assert!(!url_addr.contains_host("camera"));
-    assert!(!url_addr.contains_host("8080"));
-    assert!(url_addr.contains_host("CAMERA.LOCAL."));
-    assert!(!url_addr.contains_host("other.local"));
+    assert!(url_addr.matches_host("camera.local"));
+    assert!(!url_addr.matches_host("camera"));
+    assert!(!url_addr.matches_host("8080"));
+    assert!(url_addr.matches_host("CAMERA.LOCAL."));
+    assert!(!url_addr.matches_host("other.local"));
 }
 
 #[test]

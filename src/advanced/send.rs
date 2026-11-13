@@ -3,7 +3,7 @@
 use std::ptr;
 
 use super::{
-    aliasable::AliasableBox,
+    aliasable::{AliasableBox, AliasableVec},
     invalid_frame,
     packets::{attach_metadata, attach_timecode, AudioParameters, FrameExtras, HasExtras},
     AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedVideoFrame, VideoPacketFormat,
@@ -32,7 +32,7 @@ pub const MAX_SCATTER_BLOCKS: usize = 65_536;
 /// asynchronous send is pending.
 #[derive(Debug)]
 struct ScatterStorage {
-    blocks: Box<[AliasableBox<[u8]>]>,
+    blocks: Box<[AliasableVec<u8>]>,
     pointers: AliasableBox<[*const u8]>,
     sizes: AliasableBox<[i32]>,
     total: usize,
@@ -74,10 +74,7 @@ impl ScatterStorage {
 
     /// Take ownership of blocks that [`total`](Self::total) accepted.
     fn new(blocks: Vec<Vec<u8>>, total: usize) -> Self {
-        let mut blocks: Box<[_]> = blocks
-            .into_iter()
-            .map(|block| AliasableBox::new(block.into_boxed_slice()))
-            .collect();
+        let mut blocks: Box<[_]> = blocks.into_iter().map(AliasableVec::new).collect();
         // The SDK writes through these, whatever its declaration says.
         let pointers = blocks
             .iter_mut()
@@ -110,6 +107,14 @@ impl ScatterStorage {
 
     fn blocks(&self) -> impl ExactSizeIterator<Item = &[u8]> {
         self.blocks.iter().map(|block| &**block)
+    }
+
+    fn into_blocks(self) -> Vec<Vec<u8>> {
+        self.blocks
+            .into_vec()
+            .into_iter()
+            .map(AliasableVec::into_vec)
+            .collect()
     }
 
     fn copy_contiguous(&self) -> Vec<u8> {
@@ -220,6 +225,14 @@ impl ScatterVideoFrame {
         self.storage.blocks()
     }
 
+    /// Recover each original block, preserving order, allocation and capacity.
+    ///
+    /// The outer vector may be newly allocated; block payloads are not copied.
+    /// Any SDK envelope stamping performed during sending is retained.
+    pub fn into_blocks(self) -> Vec<Vec<u8>> {
+        self.storage.into_blocks()
+    }
+
     /// The size of the whole frame in bytes.
     pub fn total_bytes(&self) -> usize {
         self.storage.total
@@ -258,7 +271,7 @@ impl ScatterVideoFrame {
     pub fn into_contiguous_copy(self) -> CompressedVideoFrame {
         CompressedVideoFrame {
             format: self.format,
-            bytes: AliasableBox::new(self.storage.copy_contiguous().into_boxed_slice()),
+            bytes: AliasableVec::new(self.storage.copy_contiguous()),
             extras: self.extras,
         }
     }
@@ -369,6 +382,14 @@ impl ScatterAudioFrame {
         self.storage.blocks()
     }
 
+    /// Recover each original block, preserving order, allocation and capacity.
+    ///
+    /// The outer vector may be newly allocated; block payloads are not copied.
+    /// Any SDK envelope stamping performed during sending is retained.
+    pub fn into_blocks(self) -> Vec<Vec<u8>> {
+        self.storage.into_blocks()
+    }
+
     /// The size of the whole frame in bytes.
     pub fn total_bytes(&self) -> usize {
         self.storage.total
@@ -403,7 +424,7 @@ impl ScatterAudioFrame {
         CompressedAudioFrame {
             codec: self.codec,
             protected: self.protected,
-            bytes: AliasableBox::new(self.storage.copy_contiguous().into_boxed_slice()),
+            bytes: AliasableVec::new(self.storage.copy_contiguous()),
             parameters: self.parameters,
             extras: self.extras,
         }

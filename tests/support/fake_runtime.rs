@@ -366,10 +366,13 @@ mod objects {
         }
 
         fn NDIlib_send_capture(p_instance: NDIlib_send_instance_t, p_metadata: *mut NDIlib_metadata_frame_t, timeout_in_ms: u32) -> NDIlib_frame_type_e {
-            // Deliberately not UTF-8, so the crate must free it on rejection.
-            let text = Box::into_raw(Box::new([0xffu8, 0]));
+            // Default text is not UTF-8, so capture must free it on rejection.
+            // The alternate valid C string deliberately reports a count that
+            // excludes the terminator; SDK freeing still gets that exact count.
+            let excludes_nul = std::env::var_os("GRAFTON_FAKE_SENDER_METADATA_COUNT").is_some();
+            let text = Box::into_raw(Box::new([if excludes_nul { b'x' } else { 0xffu8 }, 0]));
             unsafe {
-                (*p_metadata).length = 2;
+                (*p_metadata).length = if excludes_nul { 1 } else { 2 };
                 (*p_metadata).timecode = 123;
                 (*p_metadata).p_data = text.cast();
             }
@@ -379,6 +382,7 @@ mod objects {
 
         fn NDIlib_send_free_metadata(p_instance: NDIlib_send_instance_t, p_metadata: *const NDIlib_metadata_frame_t) {
             log("sender-metadata-free");
+            log(&format!("sender-metadata-free-count={}", unsafe { (*p_metadata).length }));
             drop(unsafe { Box::from_raw((*p_metadata).p_data.cast::<[u8; 2]>()) });
         }
 

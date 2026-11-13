@@ -17,7 +17,7 @@ use super::{
 use crate::{
     sys::{self, bindings::*},
     timeout::Deadline,
-    Error, MediaTypes, Result,
+    Error, MediaTypes, MetadataSource, Result,
 };
 
 /// The longest single wait for an event while finalization is pending. Short
@@ -1059,7 +1059,8 @@ impl FileRecorder {
     ///
     /// The frame's timecode is stored and re-published on playback; it does
     /// not move the frame on the file's timeline. The frame's text is handed
-    /// to the SDK as it is, without a copy.
+    /// to the SDK as it is, without a wrapper copy. Owned and captured
+    /// metadata are accepted, and need only outlive this synchronous call.
     ///
     /// # Errors
     ///
@@ -1067,11 +1068,11 @@ impl FileRecorder {
     /// session is recording, and [`Error::NativeOperationFailed`] when the
     /// SDK refuses it, for example because the metadata track is not being
     /// recorded.
-    pub fn inject_metadata(&mut self, metadata: &crate::MetadataFrame) -> Result<()> {
+    pub fn inject_metadata<S: MetadataSource + ?Sized>(&mut self, metadata: &S) -> Result<()> {
         if self.state() != RecorderState::Recording {
             return Err(Error::InvalidState(StateError::NotRecording));
         }
-        let frame = metadata.to_raw();
+        let frame = metadata.metadata_raw();
         // SAFETY: the recorder is live. `frame.p_data` points to the
         // NUL-terminated text that `metadata` owns, `frame.length` bytes with
         // the terminator, within the crate's metadata cap. `metadata` is

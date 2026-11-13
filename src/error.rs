@@ -227,36 +227,38 @@ pub enum Error {
     QueueFull(QueueLimit),
 
     /// A value the SDK returned, other than a frame, breaks the SDK's
-    /// documented contract, or exceeds a limit this crate places on what it
-    /// copies.
+    /// documented contract, or owned storage could not be reserved for it.
     ///
     /// For example a negative connection count, a receive delay outside the
     /// range the SDK accepts, a string without a terminator within its limit,
-    /// a Discovery Server snapshot or event batch that is malformed or larger
-    /// than one copy may be, a send-completion callback for a frame the SDK
+    /// a Discovery Server snapshot or event batch that is malformed, a
+    /// send-completion callback for a frame the SDK
     /// was not handed or had already returned, negative encoder guidance, an
     /// AV sync format change to a sample rate or channel count that is not
     /// positive, or a File SDK result that cannot be represented. Malformed
     /// frames are reported as [`Error::InvalidFrame`], and text that is not
-    /// UTF-8 as [`Error::InvalidUtf8`].
+    /// UTF-8 as [`Error::InvalidUtf8`]. Ordinary resource-budget ceilings are
+    /// [`Error::ResourceLimit`] instead.
     #[error("Unexpected NDI SDK result: {0}")]
     UnexpectedSdkResult(String),
 
-    /// Finder data exceeded a per-snapshot or whole-discovery resource limit.
+    /// Discovery data exceeded a per-copy or whole-discovery resource limit.
     /// No partial result is returned. `resource` identifies the exhausted
     /// count or byte budget; `limit` is its maximum.
     #[error("NDI resource limit exceeded: {resource} (limit {limit})")]
     ResourceLimit {
         /// The resource whose budget was exhausted.
-        resource: &'static str,
+        resource: ResourceKind,
         /// Maximum number of entries or bytes for that resource.
         limit: usize,
     },
 
-    /// Source discovery finished without a source that matches.
+    /// A caller-defined discovery operation finished without a matching source.
     ///
-    /// Returned by the finder's host lookups when no source on the requested
-    /// host was discovered within the wait.
+    /// This convenience error is constructed by callers when an empty discovery
+    /// result is an application error. Finder selection returns `Ok(None)` and
+    /// source enumeration returns an empty vector when nothing matches; neither
+    /// constructs this error automatically.
     ///
     /// # Example
     ///
@@ -342,6 +344,44 @@ pub enum Error {
     #[cfg(any(feature = "file-io", feature = "image-encoding"))]
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+/// The resource budget exhausted by a discovery operation.
+///
+/// Each variant specifies both the scope and the unit of the `limit` field in
+/// [`Error::ResourceLimit`]. Byte budgets cover native data inspected and owned
+/// storage retained, as documented by the operation. Match this value rather
+/// than diagnostic text; additional budgets may be introduced in 3.x.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ResourceKind {
+    /// Source descriptors in one plain or Advanced Finder snapshot; the limit
+    /// is a number of sources.
+    FinderSnapshotSources,
+    /// Aggregate bytes scanned or copied for one plain or Advanced Finder
+    /// snapshot; the limit is in bytes.
+    FinderSnapshotBytes,
+    /// Distinct sources retained over one Finder discovery window; the limit
+    /// is a number of sources.
+    FinderDiscoverySources,
+    /// Aggregate owned storage retained over one Finder discovery window;
+    /// the limit is in bytes.
+    FinderDiscoveryBytes,
+    /// Aggregate bytes scanned or copied for one Discovery Server snapshot or
+    /// event batch, including nested arrays and strings; the limit is in bytes.
+    DiscoveryServerCopyBytes,
+}
+
+impl fmt::Display for ResourceKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::FinderSnapshotSources => "Finder snapshot sources",
+            Self::FinderSnapshotBytes => "Finder snapshot bytes",
+            Self::FinderDiscoverySources => "Finder discovery sources",
+            Self::FinderDiscoveryBytes => "Finder discovery bytes",
+            Self::DiscoveryServerCopyBytes => "Discovery Server snapshot or event batch bytes",
+        })
+    }
 }
 
 /// Which bounded queue was full, carried by [`Error::QueueFull`].

@@ -6,12 +6,12 @@ fn main() -> Result<(), grafton_ndi::Error> {
     let ndi = Ndi::new()?;
     let options = SenderOptions::new("Zero Copy Async Sender").clock_video(true);
     let mut sender = grafton_ndi::Sender::new(&ndi, &options)?;
-    let make_frame = || {
-        VideoFrame::builder()
+    let make_frame = || -> grafton_ndi::Result<VideoFrame> {
+        Ok(VideoFrame::builder()
             .resolution(1920, 1080)
             .pixel_format(PixelFormat::Bgra)
             .frame_rate(FrameRate::new(60, 1)?)
-            .build()
+            .build()?)
     };
     let first = make_frame()?;
     let mut available = make_frame()?;

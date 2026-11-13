@@ -452,7 +452,7 @@ fn default_yuv_sends_depend_only_on_active_pixels() {
             let frame = |data: &[u8], name: &str| {
                 let slice = if vouched { &data[..len] } else { data };
                 let builder = BorrowedVideoFrame::builder(slice, width, height, format)
-                    .line_stride(stride)
+                    .line_stride_bytes(stride)
                     .scan_type(scan);
                 // SAFETY: `extra` initialized bytes follow the slice within
                 // the same allocation when vouched; all data stays stable.

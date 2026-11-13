@@ -104,10 +104,10 @@ pub use {
     error::*,
     finder::{Finder, FinderOptions, Source, SourceAddress, SourceCache},
     frames::{
-        AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout, AudioSource,
-        FormatCategory, MetadataFrame, MetadataFrameRef, PixelFormat, PixelFormatInfo, ScanType,
-        VideoFrame, VideoFrameBuilder, VideoFrameRef, VideoPlane, VideoPlanes, VideoRows,
-        VideoSource,
+        AudioChannels, AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout,
+        AudioSource, BorrowedAudioFrame, BorrowedAudioFrameBuilder, FormatCategory, MetadataFrame,
+        MetadataFrameRef, MetadataSource, PixelFormat, PixelFormatInfo, ScanType, VideoFrame,
+        VideoFrameBuilder, VideoFrameRef, VideoPlane, VideoPlanes, VideoRows, VideoSource,
     },
     framesync::{
         AudioInputFormat, FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncCapture,
