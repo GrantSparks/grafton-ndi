@@ -321,8 +321,14 @@ Example: `examples/file_record.rs`.
 
 ## Limits of the NDI 6.4 File library
 
-These were observed with the NDI 6.4 File library on Linux. They lie inside the
-library, and this crate cannot correct them.
+These were observed with the NDI 6.4 File library on Linux, except where a
+platform is named. They lie inside the library, and this crate cannot correct
+them.
+
+- **On macOS a file that a source switch closes can be left unfinalized.** The
+  library reports the file closed, but it holds only its header, and
+  `FileApi::probe` finds no final duration. Files that a rollover or a stop
+  closes are finalized.
 
 - **A file reported closed is not proof that its data was written.** When the
   disk fills while a session is being stopped, a write comes up short, and the

@@ -137,6 +137,7 @@ These are defects and limits of the NDI SDK, not of this crate: measured where a
 - A file reported closed is not proof that its data was written: when the disk fills while a session stops, the library still reports the file closed without an error.
 - A write that fails while recording, for example on a full disk, crashes the process inside the library.
 - A file can be closed with nothing in it, after a stop or a source switch before any frame arrived. `RecordingReport::empty_files` counts these.
+- On macOS a file that a source switch closes can be left unfinalized: the library reports it closed, but it holds only its header and `FileApi::probe` finds no final duration.
 - A rollover the library cannot carry out ends the session. `rollover` refuses the cases it can check first.
 - The recorder's own getters for its source and its current file return strings that the library's recording thread can invalidate, so the crate does not call them, and `last_accepted_source` and `reported_current_file` follow the recorder's events instead.
 

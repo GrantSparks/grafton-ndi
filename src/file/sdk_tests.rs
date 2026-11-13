@@ -476,6 +476,7 @@ fn rollovers_and_a_source_switch_end_in_a_confirmed_close_of_every_file() {
     let since = timeline.mark();
     recorder.set_source(&source.spec).unwrap();
     let third = timeline.await_change(&mut recorder, since, &second);
+    let switched = second.clone();
     let files = [first, second, third];
 
     let outcome = recorder.finish(PATIENCE).unwrap();
@@ -493,9 +494,19 @@ fn rollovers_and_a_source_switch_end_in_a_confirmed_close_of_every_file() {
     assert_eq!(written, reported, "the files on disk:\n{timeline}");
     for file in &files {
         let info = api.probe(file).unwrap();
-        if !info.duration().is_final() {
-            panic_unfinalized(&api, file, &info, &timeline);
+        if info.duration().is_final() {
+            continue;
         }
+        // The macOS File library can leave the file that a source switch
+        // closes unfinalized (the README's known issues).
+        if cfg!(target_os = "macos") && *file == switched {
+            test_support::unsupported(
+                "finalizing a file that a source switch closes, which the macOS File library can \
+                 leave undone",
+            );
+            continue;
+        }
+        panic_unfinalized(&api, file, &info, &timeline);
     }
 }
 
