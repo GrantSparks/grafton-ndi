@@ -1297,9 +1297,67 @@ fn finishing_without_a_wait_reports_the_close_the_stop_queued() {
 
 #[test]
 fn configured_exact_selection_records_the_selected_endpoint_and_explicit_name_policy() {
-    let Some((ndi, api)) = file_api() else {
+    const CHILD: &str = "GRAFTON_NDI_FILE_SELECTION_CHILD";
+    const RUNTIME: &str = "GRAFTON_NDI_FILE_SELECTION_RUNTIME";
+    const FILE_LIBRARY: &str = "GRAFTON_NDI_FILE_SELECTION_LIBRARY";
+    const COMPLETED: &str = "GRAFTON_NDI_FILE_SELECTION_COMPLETED";
+    if std::env::var_os(CHILD).is_none() {
+        // Keep the normal missing-runtime/File skip contract in the parent. Once
+        // availability is established, the child must exercise every native case.
+        let Some((ndi, api)) = file_api() else {
+            return;
+        };
+        let fixture = Scratch::new("selected-discovery-config");
+        let configuration = fixture.path("config");
+        std::fs::create_dir(&configuration).unwrap();
+        // The installed SDK documents NDI_CONFIG_DIR before initialization and
+        // ndi.networks.ips as default IP hints. The fresh child isolates these
+        // process-wide defaults from the test process and every other test.
+        std::fs::write(configuration.join("ndi-config.v1.json"),
+            r#"{"ndi":{"networks":{"ips":"127.0.0.1"},"groups":{"send":"Public","recv":"Public"}}}"#).unwrap();
+        let completed = fixture.path("completed");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "file::sdk_tests::configured_exact_selection_records_the_selected_endpoint_and_explicit_name_policy", "--nocapture"])
+            .env(CHILD, "1")
+            .env("NDI_CONFIG_DIR", &configuration)
+            .env(COMPLETED, &completed)
+            .env_remove(RUNTIME)
+            .env_remove(FILE_LIBRARY);
+        if let Some(path) = ndi.info().library_path() {
+            command.env(RUNTIME, path);
+        }
+        if let Some(path) = api.library_path() {
+            command.env(FILE_LIBRARY, path);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "selection child failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(&completed).ok().as_deref(),
+            Some(b"endpoint,name,unavailable".as_slice()),
+            "selection child did not complete every native assertion:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
         return;
-    };
+    }
+    // Pin the selected dynamic libraries; leave absent paths unset in static builds.
+    let mut runtime_options = crate::RuntimeOptions::new();
+    if let Some(path) = std::env::var_os(RUNTIME) {
+        runtime_options = runtime_options.library_path(PathBuf::from(path));
+    }
+    let ndi = crate::Ndi::with_options(&runtime_options).unwrap();
+    test_support::assert_expected_identity(ndi.info());
+    let mut file_options = FileRuntimeOptions::new();
+    if let Some(path) = std::env::var_os(FILE_LIBRARY) {
+        file_options = file_options.library_path(PathBuf::from(path));
+    }
+    let api = FileApi::open(&ndi, &file_options).unwrap();
     let scratch = Scratch::new("selected-endpoint");
     let group = format!("grafton-selected-{}", std::process::id());
     let mut senders = Vec::new();
@@ -1357,24 +1415,22 @@ fn configured_exact_selection_records_the_selected_endpoint_and_explicit_name_po
         let spec = SourceSpec::try_from(&selected).unwrap();
         assert_eq!(spec.name(), None);
         assert_eq!(spec.url(), Some(address.as_str()));
-        // Name-only File selection uses native default discovery, which has no
-        // IP hints on the isolated runner. Exercise positive name delivery only
-        // when a default finder independently proves that prerequisite exists.
+        // The child config gives native default discovery a loopback IP hint;
+        // deliberate name selection must work without per-Finder configuration.
         let default_finder = crate::Finder::new(&ndi, &crate::FinderOptions::new()).unwrap();
-        let name_visible = default_finder
-            .find_source_by_name(&logical_name, Duration::from_secs(1))
+        let named = default_finder
+            .find_source_by_name(&logical_name, PATIENCE)
             .unwrap()
-            .is_some();
-        let mut policies = vec![("endpoint", spec, (640, 360))];
-        if name_visible {
-            policies.push((
+            .expect("default discovery did not find the logical sender");
+        assert_eq!(named.name(), logical_name);
+        let policies = [
+            ("endpoint", spec, (640, 360)),
+            (
                 "logical",
                 SourceSpec::new(&logical_name).unwrap(),
                 (480, 270),
-            ));
-        } else {
-            eprintln!("not exercised: positive name-only File delivery; a default finder without IP hints could not discover the source on this test network");
-        }
+            ),
+        ];
         // Distinguishable recorded dimensions establish which feed delivered the
         // media, rather than merely checking that native creation succeeded.
         for (label, spec, expected) in policies {
@@ -1407,12 +1463,18 @@ fn configured_exact_selection_records_the_selected_endpoint_and_explicit_name_po
             let track = &info.source_format().video_tracks()[0];
             assert_eq!((track.width(), track.height()), expected);
             assert!(info.duration().is_final());
+            eprintln!(
+                "verified {label} recording: {}x{} with video frames and a finalized probe",
+                expected.0, expected.1
+            );
         }
-        // A stale pinned endpoint remains explicit; the wrapper never substitutes
-        // its diagnostic name and accidentally records the available feed.
-        let unavailable = crate::Source::new(&selected_name)
+        // Pair an unavailable endpoint with the public name that just delivered
+        // media, so a hidden name fallback would record the logical feed.
+        let unavailable = crate::Source::new(&logical_name)
             .with_address(crate::SourceAddress::Ip("127.0.0.1:9".into()));
         let spec = SourceSpec::try_from(&unavailable).unwrap();
+        assert_eq!(spec.name(), None);
+        assert_eq!(spec.url(), Some("127.0.0.1:9"));
         let mut recorder = api
             .create_recorder(
                 &RecorderOptions::new(spec.clone())
@@ -1428,7 +1490,7 @@ fn configured_exact_selection_records_the_selected_endpoint_and_explicit_name_po
                 RecordingTimecode::Preserve,
             )
             .unwrap();
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(Duration::from_millis(500));
         assert!(recorder
             .stats()
             .unwrap()
@@ -1437,5 +1499,13 @@ fn configured_exact_selection_records_the_selected_endpoint_and_explicit_name_po
             panic!("the unavailable endpoint recording was not finalized");
         };
         assert_eq!(report.empty_files(), 1);
+        eprintln!("verified unavailable endpoint: no fallback to the reachable logical sender");
     });
+    // A successful test-harness exit with zero matching tests, or a premature
+    // skip/return, must not count as native acceptance coverage.
+    std::fs::write(
+        std::env::var_os(COMPLETED).expect("parent completion path"),
+        b"endpoint,name,unavailable",
+    )
+    .unwrap();
 }

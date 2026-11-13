@@ -406,12 +406,19 @@ precedence rule. Recording and probing the finalized file confirms the selected
 address is replaced with unavailable `127.0.0.1:9` records no video despite its
 valid source name, demonstrating no hidden name fallback.
 
-Positive name-only recording is conditional on an independently configured
-default finder first discovering that name. That prerequisite was absent on this
-isolated network without IP hints, so positive name rediscovery was not exercised
-there. This does not qualify default discovery or other networks. SDK-independent
-recorder-boundary and async-command tests verify the deliberate name-only native
-fields and endpoint copies after caller inputs are dropped.
+The same native regression also requires deliberate name-only recording of a
+separate default-group 480×270 source. It starts a fresh child process with a
+private `NDI_CONFIG_DIR`, setting the SDK's documented `ndi.networks.ips` to
+loopback and default send/receive groups to `Public` before initialization.
+The child pins the parent's selected runtime and File library, so its native
+default finder and name-only recorder use controlled discovery without changing
+system configuration or other tests. Both recordings must contain video and probe
+with the expected distinct dimensions. The unavailable endpoint is paired with
+the proven reachable public source name; it must record no frames rather than
+silently fall back. A completion marker requires all three native cases to finish,
+so an empty child test filter or premature skip cannot count as coverage.
+SDK-independent recorder-boundary and async-command tests also verify the
+native name/URL fields and endpoint copies after caller inputs are dropped.
 
 Reproduce the native case with `NDI_RUNTIME_DIR_V6` selecting the 6.4 Advanced
 runtime and `GRAFTON_NDI_REQUIRE_RUNTIME=file`:
