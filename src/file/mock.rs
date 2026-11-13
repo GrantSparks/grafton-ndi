@@ -108,6 +108,10 @@ pub(super) enum Closing {
     AtStop,
     /// This long after the stop returns, as its documentation allows.
     After(std::time::Duration),
+    /// After the stop returns, once the test calls [`Recorder::close`]:
+    /// `After` with the delay in the test's hands, so that it can look at the
+    /// stopping session first however slowly its threads run.
+    WhenTold,
     /// Before the stop returns, which takes this long, as the 6.4 SDK's stop
     /// does while it finalizes a file.
     DuringSlowStop(std::time::Duration),
@@ -232,8 +236,9 @@ impl Recorder {
         self.push(ERROR, TAKE);
     }
 
-    /// Stop recording and report the first file closed.
-    fn close(&self) {
+    /// Stop recording and report the first file closed: what a stop leads
+    /// to, and what a test calls itself under [`Closing::WhenTold`].
+    pub(super) fn close(&self) {
         self.recording
             .store(false, std::sync::atomic::Ordering::Release);
         self.push(FILE_CLOSED, TAKE);
@@ -367,6 +372,7 @@ unsafe extern "C" fn recorder_stop(handle: NDIlib_file_recorder_instance_t) {
     match recorder.closing {
         Closing::AtStop => recorder.close(),
         Closing::After(delay) => recorder.close_after(delay),
+        Closing::WhenTold => {}
         Closing::DuringSlowStop(delay) => {
             std::thread::sleep(delay);
             recorder.close();

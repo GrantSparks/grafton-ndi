@@ -1786,17 +1786,29 @@ mod tests {
         (device, recorder)
     }
 
-    #[test]
-    fn cancelled_finish_retains_recorder_and_notification_loss_preserves_closure_evidence() {
-        let (device, recorder) = mock_recorder(Closing::After(Duration::from_millis(150)));
-        let finishing = recorder.finish(Duration::from_secs(5));
+    /// Wait until the owner thread has stopped `device`'s session.
+    fn await_stop(device: &mock::Recorder) {
+        let deadline = Instant::now() + Duration::from_secs(5);
         while device.stops.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline, "the recorder was never stopped");
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn cancelled_finish_retains_recorder_and_notification_loss_preserves_closure_evidence() {
+        // The file is reported closed only once the test has seen the session
+        // still stopping: a close on a timer came first whenever the owner
+        // thread was slow to answer.
+        let (device, recorder) = mock_recorder(Closing::WhenTold);
+        let finishing = recorder.finish(Duration::from_secs(5));
+        await_stop(&device);
         drop(finishing);
         assert_eq!(block_on(recorder.state()).unwrap(), RecorderState::Stopping);
         assert_eq!(device.destroys.load(Ordering::Acquire), 0);
-        let outcome = block_on(recorder.wait_finished(Duration::from_secs(5))).unwrap();
+        let waiting = recorder.wait_finished(Duration::from_secs(5));
+        device.close();
+        let outcome = block_on(waiting).unwrap();
         let FinishStatus::Closed(report) = outcome else {
             panic!("expected confirmed closure after the later close event: {outcome:?}")
         };
