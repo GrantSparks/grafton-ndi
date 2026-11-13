@@ -4,12 +4,10 @@ Time and peak memory of image encoding for 3.0, by source pixel format, image
 size, content and output. The [image encoding guide](image-encoding.md) says
 what each setting does; this page says what it costs.
 
-These measurements cover PNG, JPEG and lossless WebP. Lossy WebP uses
-`libwebpop` and is included in the measurement command below, but the tables
-have not been measured for that backend. It buffers both the complete encoded
-image and, unless contiguous RGBA can be borrowed, four converted bytes per
-output pixel, plus codec state and reduction scratch. Alpha discard makes those
-four-channel pixels opaque. Compare quality, size and time on your own content.
+The original single-encode tables below cover PNG, JPEG and lossless WebP.
+The lossy WebP sections add downstream snapshot batch measurements and a
+reproducible comparison of encoding effort. These have different inputs and
+measurement boundaries; compare results within each experiment.
 
 Measured on Debian 12 x86_64, Intel Xeon w7-2475X, Rust 1.100.0, release
 build for the default x86-64 target, with `png` 0.18.1, `jpeg-encoder` 0.7.1
@@ -30,6 +28,107 @@ and a graphics frame of flat boxes, a gradient and text. Without them the test
 uses synthetic stand-ins, which compress differently. YUV sources are the same
 pictures converted to each format with BT.709 limited range.
 `GRAFTON_NDI_SIZES=1920x1080` limits the run to one size.
+
+## Lossy WebP for snapshot consumers
+
+Quality controls color fidelity. `webp_effort(level)` controls compression work
+separately, from 0 to 6 (default 4), and `webp_sharp_yuv(false)` trades sharper chroma
+conversion for less CPU work (default true). Alpha remains exact. For a latency
+comparison, hold quality fixed and measure both settings on your content.
+
+### Five concurrent snapshot round trips
+
+Synemantic's downstream evaluation used two photographic proxies resized to
+preserve aspect ratio, five CPU worker threads encoding the same scene
+independently, and no GPU. Host: Intel Xeon w7-2475X, Linux x86-64, Rust 1.95.0,
+optimized release build with the default CPU target. Each codec had a warmup
+followed by three measured rounds; the figures are medians of elapsed batch
+wall time, including encoding, final RGB decoding, synchronization and joins.
+They exclude thread, frame and options setup. They are neither sums of five
+encodes nor per-frame encoding times.
+
+The JPEG comparator reproduces JPEG 80 capture → RGB decode → canonical JPEG
+90, then final RGB decode. WebP uses quality 75, effort 4 and SharpYUV, with
+alpha discarded. Quality numbers do not imply equal visual quality. The
+evaluation pins grafton-ndi `908a441`, `libwebpop` 0.1.0, `image` 0.25.10 and
+`image-webp` 0.2.4; the new effort controls preserve those WebP defaults.
+
+| Scene | Dimensions | JPEG pipeline batch ms | WebP 75 batch ms | JPEG bytes/image | WebP bytes/image |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Audience preview | 560×360 | 12.712 | 56.632 | 52,359 | 21,900 |
+| Lobby preview | 624×360 | 14.564 | 65.268 | 53,307 | 18,686 |
+| Audience larger | 1680×1080 | 105.222 | 412.551 | 388,353 | 134,464 |
+| Lobby larger | 1500×864 | 75.496 | 283.168 | 223,758 | 65,600 |
+
+The [96 recorded rows](benchmarks/image-formats-2026-11-13.csv) include one-
+and five-worker runs, other quality levels, lossless WebP and reconstruction
+error. Inputs were the JPEG photographs
+[Audience](https://www.nasa.gov/wp-content/uploads/2025/05/grc-1977-c-01735.jpg)
+and [Lobby](https://www.nasa.gov/wp-content/uploads/2025/05/grc-2019-c-03388.jpg),
+decoded before comparison. These are photographic proxies, not live camera
+feeds or original raw pixels. The CSV's source paths name temporary inputs.
+
+The harness excludes NDI wait, YUV conversion, network transfer, filesystem
+publication, peak memory and GPU inference. Five workers processing the same
+scene do not qualify sustained camera scheduling. The larger WebP batches
+already exceed a 200 ms batch budget before those additional costs. The
+smaller payloads can suit bandwidth-constrained snapshots; they do not justify
+changing a latency-sensitive JPEG default without measuring the complete path.
+
+### Whole-image buffering and concurrency
+
+Lossy WebP holds a complete encoded image before writing, including with
+`encode_image_to`. Unless an unchanged contiguous RGBA image can be borrowed,
+the wrapper also holds four converted bytes per output pixel. Alpha discard
+still uses opaque RGBA. The backend's image planes, compression state and
+output, any reduction scratch, retained source frames, and the consumer's RGB
+decode buffers add to that storage.
+
+For example, five 1500×864 encodes that need conversion use about 24.7 MiB for
+the wrapper's converted images alone; this is not their peak memory. Concurrent
+jobs have independent buffers, so bound active workers and pending requests
+as well as measuring end-to-end latency. Reducing effort does not turn WebP
+into a row-streaming codec or impose a memory limit. PNG and JPEG convert rows
+incrementally; their codec state and encoded output still consume memory.
+
+### Encoding effort on a synthetic input
+
+The crate's resource harness below measures a single encode at a time, without
+RGB decoding or NDI. These additional measurements use its built-in synthetic
+`photographic` stand-in, not the photographs used in either table above or
+below. Host: the same Xeon w7-2475X and Debian 12 as the original single-encode
+tables, Rust 1.100.0, optimized release build, default CPU target, `libwebpop`
+0.1.0. Each time is the median of five encodes, with no separate warmup. Peak
+is live heap allocation during encoding, excluding the preexisting source
+frame and allocator overhead; it is not process RSS.
+
+| Dimensions | Output | RGBA ms | UYVY ms | RGBA bytes/image | RGBA peak MiB |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 640×360 | JPEG 85 | 2.6 | 3.2 | 59,480 | 0.09 |
+| 640×360 | WebP 75, effort 4, SharpYUV | 58.0 | 58.6 | 30,854 | 2.21 |
+| 640×360 | WebP 75, effort 0, SharpYUV | 24.2 | 24.6 | 38,184 | 2.21 |
+| 640×360 | WebP 75, effort 0, standard conversion | 8.8 | 9.5 | 38,904 | 0.44 |
+| 1920×1080 | JPEG 85 | 22.9 | 28.2 | 491,480 | 0.59 |
+| 1920×1080 | WebP 75, effort 4, SharpYUV | 506.9 | 509.9 | 251,334 | 19.81 |
+| 1920×1080 | WebP 75, effort 0, SharpYUV | 212.0 | 215.6 | 286,794 | 19.81 |
+| 1920×1080 | WebP 75, effort 0, standard conversion | 73.8 | 79.1 | 298,056 | 3.92 |
+
+These peaks use borrowed contiguous RGBA for that source; a converted UYVY
+image adds width × height × 4 bytes. Lower effort and standard conversion
+reduce work here but still buffer the full encoded image. Payload size and
+reconstructed pixels can both change when effort or conversion changes; equal
+quality settings do not imply identical output. Synthetic results demonstrate
+the controls, and do not select a photographic production default.
+
+[All 80 rows](benchmarks/image-effort-2026-11-13.csv) also cover the synthetic
+graphics input and NV12, P216 and NA4G sources. Reproduce without image files:
+
+```bash
+GRAFTON_NDI_SIZES=640x360,1920x1080 \
+GRAFTON_NDI_OUTPUTS=jpeg85,webp-lossy75,webp-lossy75-effort0,webp-lossy75-fast \
+  cargo test --release --locked --lib --features image-encoding \
+  image_encoding_resources -- --ignored --nocapture
+```
 
 ## 1920×1080
 
@@ -116,8 +215,11 @@ converting every frame instead of only the ones encoded.
 ## Memory
 
 PNG and JPEG convert one row at a time, so their conversion scratch does not
-grow with the frame's height; lossless WebP alone holds the whole converted
-image. The unit tests count these allocations for every format, depth and
+grow with the frame's height; both WebP codecs may hold a whole converted
+image. The following table describes lossless WebP; lossy WebP always uses
+four converted bytes per pixel when it cannot borrow RGBA, even with alpha
+discarded, and also buffers its complete encoded output. The unit tests count
+these allocations for every format, depth and
 reduction, with the height varied at a fixed width, and check the WebP buffer's
 exact size.
 

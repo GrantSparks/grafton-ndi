@@ -96,8 +96,13 @@ fn write_image(source: &Source<'_>, plan: Plan, out: &mut dyn Write) -> Result<(
         Codec::WebpLossless => {
             webp::encode_lossless(&mut plan.pixels::<u8>(source), plan.channels(), out)
         }
-        Codec::WebpLossy { quality } => {
-            let image = webp::encode_lossy(&mut plan.pixels::<u8>(source), quality)?;
+        Codec::WebpLossy {
+            quality,
+            effort,
+            sharp_yuv,
+        } => {
+            let image =
+                webp::encode_lossy(&mut plan.pixels::<u8>(source), quality, effort, sharp_yuv)?;
             out.write_all(&image).map_err(Error::Io)
         }
     }
@@ -108,8 +113,13 @@ pub(crate) fn encode(source: Source<'_>, options: &ImageOptions) -> Result<Vec<u
     let plan = Plan::new(&source, options)?;
     // Take the backend's complete buffer directly, avoiding a second output
     // allocation and copy for Vec and data URL callers.
-    if let Codec::WebpLossy { quality } = plan.codec {
-        return webp::encode_lossy(&mut plan.pixels::<u8>(&source), quality);
+    if let Codec::WebpLossy {
+        quality,
+        effort,
+        sharp_yuv,
+    } = plan.codec
+    {
+        return webp::encode_lossy(&mut plan.pixels::<u8>(&source), quality, effort, sharp_yuv);
     }
     let mut image = Vec::new();
     write_image(&source, plan, &mut image)?;
@@ -162,7 +172,11 @@ enum Codec {
     /// Dimensions within WebP's limit.
     WebpLossless,
     /// Quality in 0 to 100, dimensions within lossy WebP's limit.
-    WebpLossy { quality: u8 },
+    WebpLossy {
+        quality: u8,
+        effort: u8,
+        sharp_yuv: bool,
+    },
 }
 
 impl Plan {
@@ -182,6 +196,12 @@ impl Plan {
                     format.name()
                 )));
             }
+        }
+        if matches!(format, ImageFormat::WebpLossy(_)) && options.webp_effort > 6 {
+            return Err(Error::InvalidInput(format!(
+                "WebP effort must be in 0..=6, got {}",
+                options.webp_effort
+            )));
         }
         if options.depth == SampleDepth::Sixteen && format != ImageFormat::Png {
             return Err(Error::InvalidInput(format!(
@@ -242,7 +262,11 @@ impl Plan {
             }
             ImageFormat::WebpLossy(quality) => {
                 check_size("WebP", width, height, webp::MAX_LOSSY_DIMENSION)?;
-                Codec::WebpLossy { quality }
+                Codec::WebpLossy {
+                    quality,
+                    effort: options.webp_effort,
+                    sharp_yuv: options.webp_sharp_yuv,
+                }
             }
         };
         Ok(Self {

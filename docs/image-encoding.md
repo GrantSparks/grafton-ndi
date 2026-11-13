@@ -42,6 +42,10 @@ let url = frame.encode_image_data_url(&thumbnail)?;
 // Lossy WebP for a bandwidth-sensitive preview, keeping transparency exact.
 let preview = ImageOptions::new(ImageFormat::WebpLossy(75)).downscale(Downscale::Half);
 let webp = frame.encode_image(&preview)?;
+
+// Prioritize latency at the same color quality, keeping transparency exact.
+let fast_preview = preview.clone().webp_effort(0).webp_sharp_yuv(false);
+let fast_webp = frame.encode_image(&fast_preview)?;
 ```
 
 A loop that takes a snapshot on a timer can reuse one buffer:
@@ -105,7 +109,12 @@ the SDK's padded stride encodes exactly as its packed copy does.
 Lossy WebP trades color fidelity for fewer bytes. Lower quality values generally
 produce smaller images; 100 still changes color, so choose `WebpLossless` when
 pixels must be exact. The encoder uses `libwebpop`, a scalar Rust port of
-libwebp, at method 4 with SharpYUV conversion and alpha quality 100. SharpYUV
+libwebp. `webp_effort(level)` accepts 0 to 6 and controls compression effort
+independently of quality: 0 is fastest, 6 spends the most effort, and the default is 4.
+`webp_sharp_yuv(true)`, the default, uses sharper RGB-to-YUV chroma conversion;
+false uses the faster standard conversion. Alpha quality remains 100 with every
+effort and conversion setting. Neither setting provides a latency or memory
+limit, and neither affects PNG, JPEG or lossless WebP. SharpYUV
 falls back to ordinary conversion for images narrower or shorter than four
 pixels. `AlphaMode::Discard` makes the image opaque before any reduction.
 
@@ -222,12 +231,22 @@ Codec state and encoded output use additional memory. See the
 [performance measurements](image-encoding-performance.md) for timings, memory bounds
 and the hardware and inputs used.
 
+The [five-worker snapshot measurements](image-encoding-performance.md#five-concurrent-snapshot-round-trips)
+include lossy WebP 75 taking 56.6–65.3 ms at preview sizes and 283.2–412.6 ms
+at larger sizes, including final RGB decode. These are concurrent batch times,
+not per-frame encode times. Smaller files can therefore cost more CPU and
+latency than an existing JPEG pipeline. Keep pending snapshots and active
+encoding workers bounded: each lossy WebP worker owns codec state, a complete
+encoded result and, when conversion is needed, four bytes per output pixel.
+`encode_image_to` still buffers that encoded result before the first write.
+
 ## Errors
 
 | Problem | Error |
 | --- | --- |
 | A JPEG quality outside 1 to 100, from `encode_jpeg` or `ImageOptions` | `InvalidInput` |
 | A lossy WebP quality outside 0 to 100 | `InvalidInput` |
+| A lossy WebP effort outside 0 to 6 | `InvalidInput` |
 | JPEG or WebP with `SampleDepth::Sixteen` | `InvalidInput` |
 | JPEG or WebP with `HdrPolicy::CodeValues` for a PQ or HLG frame | `InvalidInput` |
 | A PQ or HLG frame under `HdrPolicy::Refuse`, in any pixel format | `InvalidFrame`, naming the transfer and `HdrPolicy::CodeValues` |

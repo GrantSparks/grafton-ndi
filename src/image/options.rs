@@ -38,8 +38,9 @@ pub enum ImageFormat {
     WebpLossless,
     /// Lossy WebP at a quality from 0, the lowest, to 100, the highest;
     /// 8 bits a channel, with or without alpha. Alpha is preserved exactly.
-    /// Color uses 4:2:0 chroma sampling and SharpYUV conversion; even quality
-    /// 100 can change RGB values. Use [`Self::WebpLossless`] for exact pixels.
+    /// Color uses 4:2:0 chroma sampling and, by default, SharpYUV conversion;
+    /// even quality 100 can change RGB values. Use [`Self::WebpLossless`]
+    /// for exact pixels.
     WebpLossy(u8),
 }
 
@@ -64,7 +65,7 @@ impl ImageFormat {
 }
 
 /// How a video frame is encoded as a still image: its format, color
-/// handling, bit depth, alpha, HDR policy, size and PNG compression.
+/// handling, bit depth, alpha, HDR policy, size and codec effort.
 ///
 /// Every video frame type encodes with it, whether owned, captured or
 /// borrowed for sending, through `encode_image`, `encode_image_to` and
@@ -136,6 +137,10 @@ impl ImageFormat {
 /// 24 ms at [`PngCompression::Fast`], 19 ms as lossless WebP and 21 ms as
 /// JPEG at quality 85. Converting a YUV frame adds about 6 ms. A snapshot loop
 /// of camera video should use `Fast` or lossless WebP; see [`PngCompression`].
+/// Lossy WebP can cost substantially more CPU than JPEG. Lower
+/// [`Self::webp_effort`] and disable [`Self::webp_sharp_yuv`] to prioritize
+/// latency independently of quality; measure your content and bound concurrent
+/// encoding jobs. Neither setting provides a time or memory limit.
 ///
 /// Async code runs the encoder on a blocking thread, with an owned frame:
 ///
@@ -156,10 +161,12 @@ impl ImageFormat {
 /// of an RGBA frame, whose rows the codec reads in place, or for a JPEG,
 /// whose pixels convert straight into the codec's rows; one row otherwise.
 /// WebP encodes from one buffer, so it holds the whole converted
-/// image, unless the frame is RGBA with contiguous rows, which it reads in
-/// place. Lossless WebP uses three channels with alpha discarded; lossy WebP
+/// image, unless full-size contiguous RGBA can be borrowed with alpha kept.
+/// Lossless WebP uses three channels with alpha discarded; lossy WebP
 /// uses four with opaque alpha. Lossy WebP also buffers the complete encoded
 /// image before writing it. Codec state and encoded output take memory besides.
+/// Each concurrent encode owns its own buffers, so worker and queue limits
+/// matter alongside compressed image size.
 ///
 /// # Errors
 ///
@@ -170,6 +177,7 @@ impl ImageFormat {
 /// |---|---|
 /// | A JPEG quality outside 1 to 100 | [`Error::InvalidInput`] |
 /// | A lossy WebP quality outside 0 to 100 | [`Error::InvalidInput`] |
+/// | A lossy WebP effort outside 0 to 6 | [`Error::InvalidInput`] |
 /// | JPEG or WebP with [`SampleDepth::Sixteen`] | [`Error::InvalidInput`] |
 /// | JPEG or WebP with [`HdrPolicy::CodeValues`] for a PQ or HLG frame | [`Error::InvalidInput`] |
 /// | A PQ or HLG frame with [`HdrPolicy::Refuse`] | [`Error::InvalidFrame`] |
@@ -194,6 +202,8 @@ pub struct ImageOptions {
     pub(super) hdr: HdrPolicy,
     pub(super) downscale: Downscale,
     pub(super) png_compression: PngCompression,
+    pub(super) webp_effort: u8,
+    pub(super) webp_sharp_yuv: bool,
 }
 
 impl ImageOptions {
@@ -246,10 +256,22 @@ impl ImageOptions {
         self.png_compression
     }
 
+    /// Requested lossy WebP compression effort (default 4).
+    #[must_use]
+    pub fn configured_webp_effort(&self) -> u8 {
+        self.webp_effort
+    }
+
+    /// Whether lossy WebP uses SharpYUV color conversion (default true).
+    #[must_use]
+    pub fn configured_webp_sharp_yuv(&self) -> bool {
+        self.webp_sharp_yuv
+    }
+
     /// Options for `format`, with every other setting at its default:
     /// [`ColorPolicy::Sdk`], [`SampleDepth::Eight`], [`AlphaMode::Keep`],
-    /// [`HdrPolicy::Refuse`], [`Downscale::Off`] and
-    /// [`PngCompression::Balanced`].
+    /// [`HdrPolicy::Refuse`], [`Downscale::Off`],
+    /// [`PngCompression::Balanced`], lossy WebP effort 4 and SharpYUV enabled.
     #[must_use]
     pub fn new(format: ImageFormat) -> Self {
         Self {
@@ -260,6 +282,8 @@ impl ImageOptions {
             hdr: HdrPolicy::default(),
             downscale: Downscale::default(),
             png_compression: PngCompression::default(),
+            webp_effort: 4,
+            webp_sharp_yuv: true,
         }
     }
 
@@ -308,6 +332,33 @@ impl ImageOptions {
     #[must_use]
     pub fn png_compression(mut self, level: PngCompression) -> Self {
         self.png_compression = level;
+        self
+    }
+
+    /// Choose lossy WebP's compression effort, independently of color quality:
+    /// 0 is fastest, 6 spends the most effort, and the default is 4. Higher
+    /// effort generally trades CPU time for smaller output; measure your content.
+    /// Alpha remains exact at every effort.
+    ///
+    /// Values outside 0 to 6 return [`Error::InvalidInput`](crate::Error::InvalidInput)
+    /// when encoding lossy WebP, before anything is written. This setting has
+    /// no effect on PNG, JPEG or lossless WebP.
+    #[must_use]
+    pub fn webp_effort(mut self, effort: u8) -> Self {
+        self.webp_effort = effort;
+        self
+    }
+
+    /// Choose lossy WebP's RGB-to-YUV conversion. The default, true, uses
+    /// SharpYUV for sharper chroma edges at an additional CPU cost. False
+    /// uses the faster standard conversion; alpha remains exact.
+    ///
+    /// Combine `webp_effort(0)` and `webp_sharp_yuv(false)` when prioritizing
+    /// encoding latency. Neither setting imposes a time or memory limit.
+    /// This setting has no effect on PNG, JPEG or lossless WebP.
+    #[must_use]
+    pub fn webp_sharp_yuv(mut self, enabled: bool) -> Self {
+        self.webp_sharp_yuv = enabled;
         self
     }
 }

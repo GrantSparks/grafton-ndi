@@ -1279,6 +1279,70 @@ fn lossy_webp_reduces_every_pixel_format_and_preserves_alpha() {
 }
 
 #[test]
+fn lossy_webp_effort_and_color_conversion_preserve_alpha() {
+    let (width, height) = (64, 48);
+    let mut rgba = content_rgba("photographic", width, height, None);
+    for (i, pixel) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        pixel[3] = (i % 256) as u8;
+    }
+    let expected_alpha: Vec<_> = rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|pixel| u16::from(pixel[3]))
+        .collect();
+    let frame = frame_from_rgba(PixelFormat::Rgba, width, height, &rgba);
+    let defaults = options(ImageFormat::WebpLossy(75));
+    let default_image = frame.encode_image(&defaults).unwrap();
+    assert_eq!(
+        default_image,
+        frame
+            .encode_image(&defaults.clone().webp_effort(4).webp_sharp_yuv(true))
+            .unwrap()
+    );
+    assert_ne!(
+        default_image,
+        frame
+            .encode_image(&defaults.clone().webp_effort(0))
+            .unwrap()
+    );
+    assert_ne!(
+        default_image,
+        frame
+            .encode_image(&defaults.clone().webp_sharp_yuv(false))
+            .unwrap()
+    );
+    for effort in 0..=6 {
+        for sharp_yuv in [false, true] {
+            let options = defaults
+                .clone()
+                .webp_effort(effort)
+                .webp_sharp_yuv(sharp_yuv);
+            let image = frame.encode_image(&options).unwrap();
+            let mut streamed = Vec::new();
+            frame.encode_image_to(&options, &mut streamed).unwrap();
+            assert_eq!(image, streamed);
+            let decoded = decode_webp(&image);
+            assert_eq!(
+                (decoded.width, decoded.height, decoded.channels),
+                (width as u32, height as u32, 4)
+            );
+            let alpha: Vec<_> = decoded
+                .samples
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|pixel| pixel[3])
+                .collect();
+            assert_eq!(
+                alpha, expected_alpha,
+                "effort {effort}, SharpYUV {sharp_yuv}"
+            );
+        }
+    }
+}
+
+#[test]
 fn lossy_webp_quality_controls_size_and_color_fidelity() {
     let (width, height) = (128, 96);
     let rgba = content_rgba("photographic", width, height, None);
@@ -1647,6 +1711,14 @@ fn conflicting_options_are_refused_before_anything_is_written() {
         (options(ImageFormat::WebpLossy(101)), "WebP quality"),
         (options(ImageFormat::WebpLossy(255)), "WebP quality"),
         (
+            options(ImageFormat::WebpLossy(75)).webp_effort(7),
+            "WebP effort",
+        ),
+        (
+            options(ImageFormat::WebpLossy(75)).webp_effort(255),
+            "WebP effort",
+        ),
+        (
             options(ImageFormat::Jpeg(85)).depth(SampleDepth::Sixteen),
             "SampleDepth::Sixteen",
         ),
@@ -1682,6 +1754,17 @@ fn conflicting_options_are_refused_before_anything_is_written() {
         .unwrap();
     invalid_input(hdr.encode_jpeg(0));
     invalid_input(hdr.encode_image(&options(ImageFormat::WebpLossy(101))));
+    invalid_input(hdr.encode_image(&options(ImageFormat::WebpLossy(75)).webp_effort(7)));
+    // Codec-specific settings remain available when switching formats.
+    for format in [
+        ImageFormat::Png,
+        ImageFormat::Jpeg(85),
+        ImageFormat::WebpLossless,
+    ] {
+        frame
+            .encode_image(&options(format).webp_effort(255).webp_sharp_yuv(false))
+            .unwrap();
+    }
     // The PNG compression level is no error for JPEG or WebP.
     for format in [
         ImageFormat::Jpeg(85),
@@ -2016,6 +2099,8 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
 /// graphics. Without them synthetic stand-ins are used, which compress
 /// differently. `GRAFTON_NDI_SIZES` may limit the sizes, as
 /// `1920x1080,3840x2160`.
+/// `GRAFTON_NDI_OUTPUTS` may select comma-separated output names, for example
+/// `jpeg85,webp-lossy75,webp-lossy75-effort0,webp-lossy75-fast`.
 #[test]
 #[ignore = "Manual image encoding time and peak-allocation measurement"]
 fn image_encoding_resources() {
@@ -2024,6 +2109,7 @@ fn image_encoding_resources() {
 
     let input = |name: &str| std::env::var_os(name).map(|path| std::fs::read(path).unwrap());
     let (photo, graphics) = (input("GRAFTON_NDI_PHOTO"), input("GRAFTON_NDI_GRAPHICS"));
+    let selected = std::env::var("GRAFTON_NDI_OUTPUTS").ok();
     let sizes: Vec<(usize, usize)> = std::env::var("GRAFTON_NDI_SIZES")
         .unwrap_or_else(|_| "1920x1080,3840x2160,7680x4320".into())
         .split(',')
@@ -2068,6 +2154,16 @@ fn image_encoding_resources() {
                     ("webp", options(ImageFormat::WebpLossless)),
                     ("webp-lossy75", options(ImageFormat::WebpLossy(75))),
                     (
+                        "webp-lossy75-effort0",
+                        options(ImageFormat::WebpLossy(75)).webp_effort(0),
+                    ),
+                    (
+                        "webp-lossy75-fast",
+                        options(ImageFormat::WebpLossy(75))
+                            .webp_effort(0)
+                            .webp_sharp_yuv(false),
+                    ),
+                    (
                         "png-fast-quarter",
                         options(ImageFormat::Png)
                             .png_compression(PngCompression::Fast)
@@ -2087,6 +2183,12 @@ fn image_encoding_resources() {
                     ),
                 ];
                 for (name, options) in outputs {
+                    if selected
+                        .as_ref()
+                        .is_some_and(|selected| !selected.split(',').any(|output| output == name))
+                    {
+                        continue;
+                    }
                     let slow = name.contains("balanced") || name.contains("high");
                     let runs = if slow || width > 3840 { 1 } else { 5 };
                     let mut times = Vec::new();

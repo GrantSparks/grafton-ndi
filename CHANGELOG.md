@@ -11,16 +11,6 @@ API, see the [README](README.md) and the migration guides for
 
 ## [Unreleased]
 
-### Fixed
-
-- Owned video frames keep complete scan-dependent SDK tail room after
-  construction, copying, pixel replacement and scan-type changes. Synchronous
-  sends avoid full-frame staging, and asynchronous sends no longer grow pixels
-  during submission.
-- Video/audio builders and standalone, compressed and scatter metadata retain
-  owned string capacity. Advanced frames reuse validated metadata without UTF-8
-  rescans; queued sends charge its full retained capacity to their byte budget.
-
 ## [3.0.0] - 2026-11-13
 
 Version 3.0.0 loads the NDI library when the program selects a runtime instead
@@ -305,6 +295,10 @@ as `None`. Most programs need changes; see the
 - Lossy WebP with `ImageFormat::WebpLossy(quality)`, quality 0 to 100,
   SharpYUV color conversion and exact alpha, through a pure Rust encoder.
   All image methods, pixel formats, color policies and downscaling support it.
+- Lossy WebP effort (0 to 6, default 4) and SharpYUV conversion controls on
+  `ImageOptions` trade CPU work for compression and chroma fidelity separately
+  from quality, with exact alpha. The performance guide includes concurrent
+  snapshot latency, payload measurements and whole-image buffering costs.
 - CI tests the File API with `file-io` alone. Its independent Cargo feature
   and platform-specific native runtime requirements are documented explicitly.
 
@@ -661,6 +655,14 @@ as `None`. Most programs need changes; see the
   is on docs.rs.
 
 ### Fixed
+
+- Owned video frames keep complete scan-dependent SDK tail room after
+  construction, copying, pixel replacement and scan-type changes. Synchronous
+  sends avoid full-frame staging, and asynchronous sends no longer grow pixels
+  during submission.
+- Video/audio builders and standalone, compressed and scatter metadata retain
+  owned string capacity. Advanced frames reuse validated metadata without UTF-8
+  rescans; queued sends charge its full retained capacity to their byte budget.
 
 - File paths, recording targets and recorder filename preflight resolve Windows
   drive-relative paths such as `C:take.mkv` to absolute paths before use.

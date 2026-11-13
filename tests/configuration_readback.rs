@@ -158,7 +158,9 @@ fn image_settings_report_stored_choices() {
         .alpha(AlphaMode::Keep)
         .hdr(HdrPolicy::Refuse)
         .downscale(Downscale::Half)
-        .png_compression(PngCompression::Fast);
+        .png_compression(PngCompression::Fast)
+        .webp_effort(0)
+        .webp_sharp_yuv(false);
     assert_eq!(options.configured_format(), ImageFormat::Png);
     assert_eq!(options.configured_color(), ColorPolicy::Sdk);
     assert_eq!(options.configured_depth(), SampleDepth::Sixteen);
@@ -166,6 +168,11 @@ fn image_settings_report_stored_choices() {
     assert_eq!(options.configured_hdr(), HdrPolicy::Refuse);
     assert_eq!(options.configured_downscale(), Downscale::Half);
     assert_eq!(options.configured_png_compression(), PngCompression::Fast);
+    assert_eq!(options.configured_webp_effort(), 0);
+    assert!(!options.configured_webp_sharp_yuv());
+    let defaults = ImageOptions::new(ImageFormat::WebpLossy(75));
+    assert_eq!(defaults.configured_webp_effort(), 4);
+    assert!(defaults.configured_webp_sharp_yuv());
 }
 
 #[cfg(feature = "advanced")]

@@ -37,19 +37,25 @@ pub(super) fn encode_lossless(
         })
 }
 
-/// Lossy color with exact alpha and SharpYUV conversion. `Plan` validated
-/// quality and dimensions. The backend takes RGBA, including opaque alpha
+/// Lossy color with exact alpha and optional SharpYUV conversion. `Plan` validated
+/// quality, effort and dimensions. The backend takes RGBA, including opaque alpha
 /// when discarded, and returns a complete image.
-pub(super) fn encode_lossy(pixels: &mut Pixels<'_, u8>, quality: u8) -> Result<Vec<u8>> {
+pub(super) fn encode_lossy(
+    pixels: &mut Pixels<'_, u8>,
+    quality: u8,
+    effort: u8,
+    sharp_yuv: bool,
+) -> Result<Vec<u8>> {
     use libwebpop::{OpConfig, OpImage, OpQuality};
 
     let (width, height) = (to_u32(pixels.width()), to_u32(pixels.height()));
     let image = image(pixels, 4);
-    let config = OpConfig::new(OpQuality::Lossy {
+    let mut config = OpConfig::new(OpQuality::Lossy {
         quality: f32::from(quality),
         alpha_quality: 100,
-        sharp_yuv: true,
+        sharp_yuv,
     });
+    config.method = effort;
     libwebpop::encode(
         OpImage::Rgba {
             pixels: &image,
