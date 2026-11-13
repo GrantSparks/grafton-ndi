@@ -390,6 +390,16 @@ stress tests only. A test that needs a fixture creates it. `unique_name(label)`
 appends the process id to a sender or router name, so that two test processes
 on one machine do not collide on it (see below).
 
+A test that connects a receiver to a sender of its own process addresses the
+sender through `common::loopback_source(&ndi, &sender)`, or
+`common::loopback_endpoint(&ndi, name)` for a source it knows only by name, and
+looks the endpoint up again for each receiver it creates. On Windows each
+lookup returns a loopback address no earlier receiver used, which keeps
+receivers clear of a stall seen on the hosted runners (see "Receivers that
+never connect on Windows" in the [CI guide](ci/README.md)); elsewhere it is
+127.0.0.1. When a receiver does not connect, `common::socket_table(port)` adds
+the operating system's view of that port to the failure message on Windows.
+
 `GRAFTON_NDI_REQUIRE_RUNTIME` turns skips into failures. Its value is a
 comma-separated list of what the environment provides: `1` for any runtime,
 `advanced`, `file`, `discovery-server`, and `h264-decoder` and
