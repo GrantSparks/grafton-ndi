@@ -78,6 +78,7 @@ fn native_resource_ownership() {
         "foreign_registration",
         "refused_unregistration",
         "malformed_metadata",
+        "metadata_count",
     ];
     if cfg!(feature = "advanced") {
         scenarios.extend([
@@ -353,7 +354,20 @@ fn child(case: &str) {
             let sender = sender(&ndi);
             assert!(sender.capture_metadata(Duration::ZERO).is_err());
             assert_eq!(log().matches("sender-metadata-free\n").count(), 1);
+            assert!(log().contains("sender-metadata-free-count=2\n"));
             drop(sender);
+        }
+        "metadata_count" => {
+            std::env::set_var("GRAFTON_FAKE_SENDER_METADATA_COUNT", "exclude-nul");
+            let sender = sender(&ndi);
+            let frame = sender.capture_metadata(Duration::ZERO).unwrap().unwrap();
+            assert_eq!(frame.data(), "x");
+            assert_eq!(frame.timecode().ticks(), 123);
+            let events = log();
+            assert_eq!(events.matches("sender-metadata-free\n").count(), 1);
+            assert!(events.contains("sender-metadata-free-count=1\n"));
+            drop(sender);
+            assert_eq!(frame.data(), "x", "the copy outlives the SDK allocation");
         }
         #[cfg(feature = "advanced")]
         "queue_immediate" => {

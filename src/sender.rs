@@ -1706,6 +1706,10 @@ impl<M: SenderMode> Sender<M> {
     ///
     /// The result owns its data. The wait budget includes contention with other
     /// metadata captures and does not block the video-send synchronization lock.
+    /// Captured text uses the SDK's guaranteed NUL termination, bounded to
+    /// 4 MiB, rather than assuming every positive native length is the exact
+    /// UTF-8 byte count including its terminator. Invalid descriptor counts and
+    /// invalid UTF-8 still return an error, and every captured frame is freed.
     pub fn capture_metadata(&self, timeout: Duration) -> Result<Option<MetadataFrame>> {
         let metadata = self._ndi.table::<sys::SenderMetadata>()?;
         let deadline = Deadline::after(timeout)?;
@@ -1756,13 +1760,15 @@ impl<M: SenderMode> Sender<M> {
             };
             // SAFETY: `NDIlib_send_capture` filled `guard.raw` on this sender
             // and reported a metadata frame, which stays allocated until the
-            // guard frees it. Its `p_data` is null or SDK storage of `length`
-            // bytes ending in the NUL terminator, or a NUL-terminated string
-            // when `length` is zero, as `Processing.NDI.structs.h` describes a
-            // metadata frame; validation reads no further than that. The
-            // text borrows `guard.raw`, so it is copied before the guard frees
-            // it.
-            let text = unsafe { crate::frames::validate_metadata_layout(&guard.raw)? };
+            // guard frees it. Processing.NDI.structs.h independently guarantees
+            // `p_data` is a NUL-terminated UTF-8 string, and the SDK's
+            // Send_VirtualPTZ example reads captured sender metadata as that
+            // string, without using `length` as its byte extent. The bounded
+            // scan relies on this native C-string contract for positive counts
+            // too; generic raw descriptors retain their stricter validation.
+            // The text borrows `guard.raw`, so it is copied before the guard
+            // frees the original, unchanged descriptor.
+            let text = unsafe { crate::frames::validate_sender_metadata(&guard.raw)? };
             let timecode = Timecode::from_ticks(guard.raw.timecode);
             Ok(Some(MetadataFrame::copied(text, timecode)))
         } else if kind == NDIlib_frame_type_e_NDIlib_frame_type_none {

@@ -85,6 +85,22 @@ An operation whose capability is unavailable returns
 `Error::UnsupportedCapability` before any native call is made. The 6.1.1 and
 6.3.2 SDKs include no File library.
 
+### Sender-captured metadata counts
+
+`Sender::capture_metadata` validates the NUL-terminated text that
+`Processing.NDI.structs.h` guarantees for metadata `p_data`. The SDK's
+`NDIlib_Send_VirtualPTZ` sample likewise reads sender-captured metadata as a C
+string. Positive reported lengths are checked for invalid values and the 4 MiB
+cap, but are not assumed to equal the UTF-8 byte count including the terminator.
+This accommodates native counts that omit the terminator or count Unicode
+characters; validation still stops at the first NUL within the same cap and
+rejects invalid UTF-8. The SDK receives the original descriptor when the frame
+is freed, on both success and rejection. Generic raw-descriptor validation stays
+strictly bounded by its declared byte extent and still rejects a missing
+terminator within that extent. `tests/metadata_roundtrip.rs` exercises UTF-8
+borrowed metadata in both directions through a real sender/receiver; unit and
+native-fixture tests cover inconsistent counts, bounds and release behavior.
+
 ### Image encoding
 
 `tests/image_color_sdk.rs` pins the SDK's color conversion: BT.709 at 720×576,

@@ -3091,14 +3091,9 @@ impl From<MetadataText<'_>> for CString {
 pub(crate) unsafe fn validate_metadata_layout(
     raw: &NDIlib_metadata_frame_t,
 ) -> Result<Option<MetadataText<'_>>> {
-    if raw.length < 0 {
-        return Err(Error::InvalidFrame(format!(
-            "Metadata frame has negative length: {}",
-            raw.length
-        )));
-    }
+    let len_with_nul = validate_metadata_prefix(raw)?;
 
-    if raw.length == 0 {
+    if len_with_nul == 0 {
         if raw.p_data.is_null() {
             return Ok(None);
         }
@@ -3111,17 +3106,6 @@ pub(crate) unsafe fn validate_metadata_layout(
         // while `raw` is borrowed.
         return unsafe { validate_frame_metadata(raw.p_data) };
     }
-
-    if raw.p_data.is_null() {
-        return Err(Error::InvalidFrame(
-            "Metadata frame has non-zero length with null data pointer".into(),
-        ));
-    }
-
-    let len_with_nul = usize::try_from(raw.length).map_err(|_| {
-        Error::InvalidFrame(format!("Invalid metadata length value: {}", raw.length))
-    })?;
-    validate_metadata_len_with_nul(len_with_nul)?;
 
     // SAFETY: `p_data` is non-null, and the caller keeps the declared
     // `len_with_nul` bytes at it readable and unchanged while `raw` is
@@ -3142,6 +3126,59 @@ pub(crate) unsafe fn validate_metadata_layout(
     // The bytes end in their only NUL and are within the cap.
     let with_nul = str::from_utf8(bytes).map_err(|err| Error::InvalidUtf8(err.to_string()))?;
     Ok(Some(MetadataText { with_nul }))
+}
+
+/// Validate metadata returned specifically by `NDIlib_send_capture`.
+///
+/// `Processing.NDI.structs.h` independently guarantees NUL-terminated UTF-8
+/// `p_data`, and the SDK's Send_VirtualPTZ sample reads captured sender metadata
+/// as a C string. Positive reported counts are checked for invalid values and
+/// excessive size, but are not treated as exact byte extents: native captures
+/// can report a count that does not include the string's terminator.
+///
+/// Unlike [`validate_metadata_layout`], this function requires the SDK's full
+/// C-string guarantee even for positive lengths. The declared-length validator
+/// remains strict for descriptors promising only that many readable bytes.
+///
+/// # Safety
+///
+/// A non-null `p_data` must be readable byte-by-byte through its first NUL
+/// terminator or the metadata cap, live and unchanged while `raw` is borrowed.
+/// In particular, `length` readable bytes alone do not satisfy this contract.
+pub(crate) unsafe fn validate_sender_metadata(
+    raw: &NDIlib_metadata_frame_t,
+) -> Result<Option<MetadataText<'_>>> {
+    validate_metadata_prefix(raw)?;
+    // SAFETY: the caller supplies the stronger SDK C-string contract regardless
+    // of the reported count. The shared scan stops at the first NUL or the cap.
+    unsafe { validate_frame_metadata(raw.p_data) }
+}
+
+/// Check descriptor fields before either bounded-byte or native C-string
+/// validation reads a pointer. Zero retains the SDK's lengthless sentinel.
+fn validate_metadata_prefix(raw: &NDIlib_metadata_frame_t) -> Result<usize> {
+    if raw.length < 0 {
+        return Err(Error::InvalidFrame(format!(
+            "Metadata frame has negative length: {}",
+            raw.length
+        )));
+    }
+
+    if raw.length == 0 {
+        return Ok(0);
+    }
+
+    if raw.p_data.is_null() {
+        return Err(Error::InvalidFrame(
+            "Metadata frame has non-zero length with null data pointer".into(),
+        ));
+    }
+
+    let len_with_nul = usize::try_from(raw.length).map_err(|_| {
+        Error::InvalidFrame(format!("Invalid metadata length value: {}", raw.length))
+    })?;
+    validate_metadata_len_with_nul(len_with_nul)?;
+    Ok(len_with_nul)
 }
 
 fn validate_metadata_len_with_nul(len_with_nul: usize) -> Result<i32> {
@@ -7319,6 +7356,77 @@ mod tests {
         assert!(matches!(
             unsafe { validate_metadata_layout(&raw) },
             Err(Error::InvalidUtf8(_))
+        ));
+    }
+
+    #[test]
+    fn sender_metadata_uses_terminated_text_with_different_reported_counts() {
+        for text in ["<ascii/>", "<payload>é🎥</payload>", ""] {
+            let mut bytes = text.as_bytes().to_vec();
+            bytes.push(0);
+            for count in [0, text.len(), text.len() + 1, text.chars().count() + 1] {
+                let raw = metadata_raw_from_bytes(&mut bytes, count as i32);
+                // SAFETY: bytes retains the full NUL-terminated string,
+                // independent of the descriptor's reported count.
+                let actual = unsafe { validate_sender_metadata(&raw) }.unwrap().unwrap();
+                assert_eq!(actual.as_str(), text);
+                assert_eq!(actual.as_ptr(), raw.p_data.cast_const());
+                assert_eq!(actual.len_with_nul(), bytes.len());
+                assert_eq!(
+                    raw.length, count as i32,
+                    "the SDK free descriptor is unchanged"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sender_metadata_rejects_invalid_fields_utf8_and_unbounded_text() {
+        // SAFETY: null pointers are checked without reading, and zero means
+        // the documented empty-null metadata representation.
+        assert!(unsafe { validate_sender_metadata(&null_metadata_raw(0)) }
+            .unwrap()
+            .is_none());
+        for count in [-1, 1, i32::MAX] {
+            assert!(matches!(
+                unsafe { validate_sender_metadata(&null_metadata_raw(count)) },
+                Err(Error::InvalidFrame(_)),
+            ));
+        }
+        let mut empty = [0];
+        let excessive = metadata_raw_from_bytes(&mut empty, (MAX_METADATA_BYTES + 1) as i32);
+        // SAFETY: the pointed-to C string is complete, even though its
+        // descriptor's excessive count is rejected before scanning it.
+        assert!(matches!(
+            unsafe { validate_sender_metadata(&excessive) },
+            Err(Error::InvalidFrame(_))
+        ));
+
+        let mut invalid = [0xff, 0];
+        let raw = metadata_raw_from_bytes(&mut invalid, 1);
+        // SAFETY: full NUL-terminated storage is retained; UTF-8 is checked.
+        assert!(matches!(
+            unsafe { validate_sender_metadata(&raw) },
+            Err(Error::InvalidUtf8(_))
+        ));
+
+        let mut boundary = vec![b'x'; MAX_METADATA_BYTES];
+        boundary[MAX_METADATA_BYTES - 1] = 0;
+        let raw = metadata_raw_from_bytes(&mut boundary, 1);
+        // SAFETY: storage covers the entire string through its terminator.
+        assert_eq!(
+            unsafe { validate_sender_metadata(&raw) }
+                .unwrap()
+                .unwrap()
+                .len_with_nul(),
+            MAX_METADATA_BYTES
+        );
+        boundary[MAX_METADATA_BYTES - 1] = b'x';
+        let raw = metadata_raw_from_bytes(&mut boundary, 1);
+        // SAFETY: the entire capped scan is readable even without a terminator.
+        assert!(matches!(
+            unsafe { validate_sender_metadata(&raw) },
+            Err(Error::InvalidFrame(_))
         ));
     }
 

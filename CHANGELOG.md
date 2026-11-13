@@ -58,6 +58,10 @@ API, see the [README](README.md) and the migration guides for
 
 ### Changed
 
+- Sender metadata capture follows the SDK's guaranteed NUL-terminated text when
+  native positive lengths omit the terminator, retaining bounded UTF-8 validation
+  and releasing the original descriptor. Strict declared-length frame validation
+  remains unchanged.
 - Async File operations start on first poll. `FileOperation::submit()` explicitly
   submits eagerly. Once submitted, stop/finish/close retain their cancellation
   guarantees; dropping the last handle still waits for native finalization.
