@@ -12,7 +12,7 @@ fn retain(state: &CallbackState, id: u64) -> usize {
         key,
         Entry {
             id: SubmissionId(id),
-            header,
+            _header: header,
             frame,
             bytes,
         },

@@ -1,0 +1,29 @@
+error[E0382]: borrow of moved value: `frame`
+ --> tests/ui/advanced/fail/queued_submission_moves_storage.rs:8:13
+  |
+6 | fn pixels(queue: &mut QueuedSender, frame: VideoFrame) {
+  |                                     ----- move occurs because `frame` has type `VideoFrame`, which does not implement the `Copy` trait
+7 |     let _ = queue.try_submit(frame);
+  |                              ----- value moved here
+8 |     let _ = frame.data();
+  |             ^^^^^ value borrowed here after move
+  |
+help: consider cloning the value if the performance cost is acceptable
+  |
+7 |     let _ = queue.try_submit(frame.clone());
+  |                                   ++++++++
+
+error[E0382]: borrow of moved value: `frame`
+  --> tests/ui/advanced/fail/queued_submission_moves_storage.rs:13:13
+   |
+11 | fn packet(queue: &mut QueuedSender, frame: CompressedVideoFrame) {
+   |                                     ----- move occurs because `frame` has type `CompressedVideoFrame`, which does not implement the `Copy` trait
+12 |     let _ = queue.try_submit(frame);
+   |                              ----- value moved here
+13 |     let _ = frame.data();
+   |             ^^^^^ value borrowed here after move
+   |
+help: consider cloning the value if the performance cost is acceptable
+   |
+12 |     let _ = queue.try_submit(frame.clone());
+   |                                   ++++++++

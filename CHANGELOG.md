@@ -45,6 +45,8 @@ API, see the [README](README.md) and the migration guides for
 
 ### Changed
 
+- Advanced queued video submission uses exclusive frame ownership to guarantee
+  distinct pixel allocations, removing a scan of completed frames on every send.
 - Synchronous video/audio sends and planar-to-interleaved audio conversion
   consume shared references to validated `VideoSource`/`AudioSource` inputs,
   including receiver and FrameSync captures. Eligible video sends and strided

@@ -24,9 +24,8 @@ features and with no default features; the
 `GRAFTON_NDI_REQUIRE_RUNTIME` states what the row's runtime provides, so that
 a test cannot pass by skipping, and each row visibly skips the Advanced or
 File operations that its build and runtime cannot provide. Without a runtime,
-the tests that need one report skips. The ignored tests are a manual
-benchmark, a slow stress test and, with all features or `image-encoding`, a
-second manual benchmark.
+the tests that need one report skips. The ignored tests are manual benchmarks
+and a slow stress test.
 
 `tests/receiver_video_only.rs` sends in real time, clocked 30 fps video with
 1/30 s of audio per frame. A sender that sends as fast as its loop turns, some
@@ -321,6 +320,29 @@ audio free, on 6.3.2 and 6.4. Sixteen threads making the same calls on each of
 the three runtimes receive no torn video frame, no invalid audio sample and no
 error. `tests/framesync_capture_boundary.rs` repeats a short version of the
 multi-thread check against every runtime the tests use.
+
+### Queued video submission
+
+`tests/extended_lifetimes.rs` uses the existing fake runtime's immediate
+completion callbacks to retain cloned pixel and compressed frames together,
+then collect and resubmit them. It checks distinct allocations while retained,
+original allocation identity after collection, submission identifiers and exact
+completion counts. The queue's unit tests cover concurrent, out-of-order,
+duplicate and unknown completions; compile contracts reject use of either frame
+type after submission.
+
+With Advanced headers and a runtime [selected for the tests](#repeating-the-tests),
+measure submission with 8, 512 and 4096 completed but uncollected frames:
+
+```bash
+GRAFTON_NDI_REQUIRE_RUNTIME=advanced cargo test --locked --release --config ci/offline.toml \
+  --lib --features advanced benchmark_queued_submission_backlog -- --ignored --nocapture
+```
+
+The benchmark reuses collected frames for 10,000 submit/collect cycles at each
+backlog size, with no receiver. Results include SDK work and completion waits.
+To isolate wrapper costs, select the test-owned `fake_objects,fake_advanced`
+runtime with `GRAFTON_FAKE_CALLBACK_MODE=immediate` and logging disabled instead.
 
 ### Discovery Server objects
 

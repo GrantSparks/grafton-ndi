@@ -261,6 +261,9 @@ reports it sent, so submission does not wait for a slow connection.
 
 - It takes uncompressed `VideoFrame`s and `CompressedVideoFrame`s, both as a
   `QueuedVideoFrame`.
+- Submission moves owned pixels and metadata and does not scan retained frames.
+  It allocates a native descriptor; an uncompressed frame can also grow its
+  pixel allocation when its scan type requires extra SDK tail room.
 - `QueueOptions` bounds the queue by frame count and by bytes. A frame counts
   from submission until the application takes it back. The defaults are 8
   frames and 512 MiB.
