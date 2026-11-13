@@ -394,10 +394,11 @@ A test that connects a receiver to a sender of its own process addresses the
 sender through `common::loopback_source(&ndi, &sender)`, or
 `common::loopback_endpoint(&ndi, name)` for a source it knows only by name.
 Both find the sender's port with a finder and name `127.0.0.1:<port>`. On
-Windows a firewall that blocks the test program stops some receivers connecting
-even to such an endpoint, unless the SDK is kept on loopback, as the CI runner
-keeps it; "Receivers that never connect on Windows" in the
-[CI guide](ci/README.md) has the measurements.
+Windows, while a firewall blocks multicast DNS for the test program, some
+receivers never connect even to such an endpoint, unless the SDK is given a
+discovery address, as the CI runner gives it; "Receivers that never connect on
+Windows" in the [CI guide](ci/README.md) has the measurements and the failures
+that remain.
 When a receiver does not connect, `common::socket_table(port)` adds the operating
 system's view of that port to the failure message on Windows.
 
