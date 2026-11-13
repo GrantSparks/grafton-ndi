@@ -198,6 +198,15 @@ if ptz.is_supported() {
 also available through the receiver attached to a FrameSync or Advanced wrapper;
 each mode exposes only the capture operations it supports.
 
+`connect_to(&source)` requests a new source and remembers it as the connection
+target. `connection_target()` returns an owned snapshot of that target.
+`disconnect()` retains it, and `reconnect()` retries it. A successful request
+does not mean the source has connected yet; observe actual changes with
+`poll_source_name_change` and connection statistics.
+
+Owned audio and video frames use `set_metadata(text)?` to replace metadata and
+`clear_metadata()` to remove it. An invalid replacement preserves existing text.
+
 ## Integrate with async runtimes
 
 Enable `tokio` or `smol` to use `asynchronous::AsyncReceiver`. These adapters

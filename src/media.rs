@@ -1,11 +1,19 @@
 //! Media values shared by frames, packets, receivers and recorded files.
 
-use std::ops::{BitOr, BitOrAssign};
+use std::{
+    hash::{Hash, Hasher},
+    ops::{BitOr, BitOrAssign},
+};
 
 use crate::{Error, PixelFormat, Result};
 
 /// A frame rate in frames per second, as the fraction
 /// `numerator / denominator`.
+///
+/// Equality and hashing compare the rate: `30/1` and `60/2` are equal.
+/// The supplied numerator and denominator are preserved by the accessors and
+/// when submitted to the SDK. Compare both components explicitly when their
+/// exact representation matters.
 ///
 /// # Examples
 ///
@@ -18,11 +26,29 @@ use crate::{Error, PixelFormat, Result};
 /// assert!(FrameRate::new(30, 0).is_err());
 /// # Ok::<(), grafton_ndi::Error>(())
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Eq)]
 pub struct FrameRate {
     // Both in 1..=i32::MAX, the range of the SDK's signed fields.
     numerator: u32,
     denominator: u32,
+}
+
+impl PartialEq for FrameRate {
+    fn eq(&self, other: &Self) -> bool {
+        // Each component is at most i32::MAX, so either product fits in u64.
+        u64::from(self.numerator) * u64::from(other.denominator)
+            == u64::from(other.numerator) * u64::from(self.denominator)
+    }
+}
+
+impl Hash for FrameRate {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let (mut a, mut b) = (self.numerator, self.denominator);
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        (self.numerator / a, self.denominator / a).hash(state);
+    }
 }
 
 impl FrameRate {
@@ -255,6 +281,30 @@ mod tests {
                 Err(Error::InvalidFrame(message)) if message.contains(&format!("{numerator}/{denominator}"))
             ));
         }
+    }
+
+    #[test]
+    fn equivalent_frame_rates_compare_and_hash_equally_without_losing_components() {
+        use std::collections::{HashMap, HashSet};
+        let rate = |n, d| FrameRate::new(n, d).unwrap();
+        let max = i32::MAX as u32;
+        for (left, right) in [
+            (rate(30, 1), rate(60, 2)),
+            (rate(30_000, 1001), rate(60_000, 2002)),
+            (rate(1, 1), rate(max, max)),
+        ] {
+            assert_eq!(left, right);
+            assert_eq!(HashSet::from([left, right]).len(), 1);
+            assert_eq!(HashMap::from([(left, "rate")]).get(&right), Some(&"rate"));
+        }
+        assert_ne!(rate(30, 1), rate(30_000, 1001));
+        assert_ne!(rate(max, max - 1), rate(max - 1, max - 2));
+        assert_eq!(
+            (rate(60, 2).numerator(), rate(60, 2).denominator()),
+            (60, 2)
+        );
+        assert_eq!(rate(60, 2).to_sdk(), (60, 2));
+        assert_eq!(FrameRate::from_sdk(60, 2).unwrap().to_sdk(), (60, 2));
     }
 
     #[test]

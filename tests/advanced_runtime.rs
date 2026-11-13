@@ -64,9 +64,9 @@ fn unconnected_receiver(ndi: &Ndi) -> Receiver {
 fn link<M: ReceiverMode>(receiver: &Receiver<M>) -> String {
     format!(
         "the receiver of {:?} reports {:?}{}",
-        receiver.source(),
+        receiver.connection_target(),
         receiver.connection_stats(),
-        tcp_table(receiver.source())
+        tcp_table(&receiver.connection_target())
     )
 }
 
@@ -274,8 +274,8 @@ fn advanced_native_constructors_controls_and_queue() {
     ));
     let compressed =
         CompressedSender::new(&ndi, &options("compressed").config(config.clone())).unwrap();
-    let unsent = compressed.close();
-    assert!(unsent.program.is_none() && unsent.preview.is_none());
+    let reclaimed = compressed.close();
+    assert!(reclaimed.program.is_none() && reclaimed.preview.is_none());
     let mut queue = QueuedSender::new(
         &ndi,
         &options("queue").config(config),
@@ -1046,8 +1046,8 @@ fn compressed_video_arrives_as_sent_by_every_kind_of_send() {
         })
         .sum::<usize>();
     assert_eq!(returned, asynchronous - 2);
-    let unsent = sender.close();
-    assert!(unsent.program.is_some() && unsent.preview.is_some());
+    let reclaimed = sender.close();
+    assert!(reclaimed.program.is_some() && reclaimed.preview.is_some());
 }
 
 /// One compressed audio frame a test offers to the wrapper.

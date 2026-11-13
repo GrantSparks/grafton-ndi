@@ -231,7 +231,8 @@ caller. Video can also be sent asynchronously (`send_video_async`,
 asynchronous send on the same stream, which returns the earlier frame for
 reuse. Audio is always sent synchronously. `close` destroys the native sender,
 which waits for the SDK to finish with pending frames, and returns the frames
-that were still held as `UnsentVideo`, one field per stream.
+that were still held as `ReclaimedVideo`, one field per stream. These frames
+are ready for reuse; their return does not report delivery to a receiver.
 
 `ScatterVideoFrame` and `ScatterAudioFrame` hold one frame in up to 65,536
 owned, non-empty blocks, which are sent without being joined. The first block

@@ -4,7 +4,7 @@ fn common<M: ReceiverMode>(receiver: &Receiver<M>) {
     receiver.set_tally(Tally::new(false, true));
     let _ = receiver.ptz().is_supported();
     let _ = receiver.connection_stats();
-    let _ = receiver.source();
+    let _ = receiver.connection_target();
     let _ = receiver.reconnect();
 }
 fn metadata_and_events<M: MetadataMode>(receiver: &Receiver<M>) {

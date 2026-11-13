@@ -13,4 +13,4 @@ error[E0505]: cannot move out of `owner` because it is borrowed
    |              ----- move occurs due to use in closure
 ...
 20 | }
-   | - borrow might be used here, when `frame` is dropped and runs the destructor for type `VideoRef<'_, VideoKind>`
+   | - borrow might be used here, when `frame` is dropped and runs the destructor for type `frames::borrowed::VideoRef<'_, VideoKind>`

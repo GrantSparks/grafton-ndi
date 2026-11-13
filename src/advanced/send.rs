@@ -437,9 +437,12 @@ impl SubmittedVideo {
     }
 }
 
-/// The frames a [`CompressedSender`] still held when it was closed.
+/// Frames reclaimed from a [`CompressedSender`] when it closes.
+///
+/// The SDK has finished accessing these frames, so their storage can be reused.
+/// Reclaiming them does not report whether they were delivered to a receiver.
 #[derive(Clone, Debug, Default)]
-pub struct UnsentVideo {
+pub struct ReclaimedVideo {
     /// The last frame submitted asynchronously on the program stream.
     pub program: Option<SubmittedVideo>,
     /// The last frame submitted asynchronously on the preview stream.
@@ -556,12 +559,12 @@ impl PendingStreams {
     }
 
     /// Both streams' frames, once their native sender has been destroyed.
-    fn into_unsent(self, destroyed: &Destroyed) -> UnsentVideo {
+    fn into_reclaimed(self, destroyed: &Destroyed) -> ReclaimedVideo {
         let release = |slot: InFlight<PendingVideo>| {
             slot.into_released(destroyed)
                 .map(PendingVideo::into_submitted)
         };
-        UnsentVideo {
+        ReclaimedVideo {
             program: release(self.program),
             preview: release(self.preview),
         }
@@ -820,9 +823,9 @@ impl CompressedSender {
     ///
     /// Destroying the native sender waits for the SDK to finish with every
     /// pending frame, without a timeout.
-    pub fn close(self) -> UnsentVideo {
+    pub fn close(self) -> ReclaimedVideo {
         let Self { sender, pending } = self;
-        pending.into_unsent(&in_flight::destroy(sender))
+        pending.into_reclaimed(&in_flight::destroy(sender))
     }
 }
 
@@ -1155,8 +1158,14 @@ mod tests {
         assert_eq!(returned.data()[..24], bytes[..24]);
         assert_eq!(returned.data()[32..], bytes[32..]);
         returned.validate_for_send().unwrap();
-        let unsent = sender.close();
-        assert_eq!(unsent.program.unwrap().format().tier(), StreamTier::Program);
-        assert_eq!(unsent.preview.unwrap().format().tier(), StreamTier::Preview);
+        let reclaimed = sender.close();
+        assert_eq!(
+            reclaimed.program.unwrap().format().tier(),
+            StreamTier::Program
+        );
+        assert_eq!(
+            reclaimed.preview.unwrap().format().tier(),
+            StreamTier::Preview
+        );
     }
 }

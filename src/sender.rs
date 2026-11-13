@@ -95,33 +95,106 @@ struct Inner {
 // that sender's unwind traits.
 impl std::panic::RefUnwindSafe for Inner {}
 
-/// The owner of a native sender, which destroys it when dropped:
-/// advertisements retain one without access to sends.
-///
-/// Nominally public only so that [`NativeOwner`] can name it; nothing outside
-/// this module can reach it.
-pub struct SenderResource {
-    instance: SendInstance,
-    _name: CString,
-    _groups: Option<CString>,
+mod ownership {
+    use super::*;
+
+    /// The owner of a native sender, which destroys it when dropped:
+    /// advertisements retain one without access to sends.
+    ///
+    /// Nominally public only so that [`NativeOwner`] can name it; its implementation stays private.
+    pub struct SenderResource {
+        pub(super) instance: SendInstance,
+        pub(super) _name: CString,
+        pub(super) _groups: Option<CString>,
+        #[cfg(feature = "advanced")]
+        pub(super) _config: Option<crate::advanced::AdvancedConfig>,
+        pub(super) _ndi: Ndi,
+    }
+
+    impl SenderResource {
+        /// The native sender this token keeps alive.
+        pub(crate) fn instance(&self) -> NDIlib_send_instance_t {
+            self.instance.0
+        }
+    }
+
+    impl Drop for SenderResource {
+        fn drop(&mut self) {
+            // SAFETY: this token is the instance's final owner.
+            unsafe { self._ndi.api().core.NDIlib_send_destroy(self.instance.0) };
+        }
+    }
+
+    /// How a [`Sender`] owns its native sender: [`Shared`] or `Exclusive`, as
+    /// the associated type of its sealed mode trait says.
+    ///
+    /// The trait and both owners are nominally public, so that the sealed mode
+    /// trait can name them, but their implementation stays private.
+    pub trait NativeOwner: Send + Sync + fmt::Debug {
+        /// Own a native sender that was just created.
+        fn new(resource: SenderResource) -> Self;
+    }
+
+    /// The native sender of a [`RawSend`] sender, which advertiser registrations
+    /// may share, and the asynchronous video pipeline that sends through it.
+    pub struct Shared {
+        // Declared first, so that it is dropped first: dropping the pipeline
+        // drains the SDK while `owner` still keeps the native sender alive.
+        pub(super) video: VideoPipeline,
+        pub(super) owner: Arc<SenderResource>,
+    }
+
+    impl NativeOwner for Shared {
+        fn new(resource: SenderResource) -> Self {
+            let sender = SendHandle {
+                instance: resource.instance,
+                core: &resource._ndi.api().core,
+            };
+            Self {
+                video: VideoPipeline::new(sender),
+                owner: Arc::new(resource),
+            }
+        }
+    }
+
+    impl fmt::Debug for Shared {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Shared")
+                .field("video_callback_set", &self.video.callback.is_some())
+                .finish_non_exhaustive()
+        }
+    }
+
+    /// The native sender of a sender in one of the modes the Advanced senders
+    /// hold, which nothing else owns: dropping it destroys the native sender.
+    ///
+    /// A sender is created in such a mode, or converted into one only when no
+    /// registration shares its native sender (`Sender::into_attached`), and
+    /// such a mode hands out no other owner. So the frames an Advanced sender
+    /// keeps for the SDK are never freed while a registration keeps its native
+    /// sender alive.
     #[cfg(feature = "advanced")]
-    _config: Option<crate::advanced::AdvancedConfig>,
-    _ndi: Ndi,
-}
+    pub struct Exclusive(pub(super) SenderResource);
 
-impl SenderResource {
-    /// The native sender this token keeps alive.
-    pub(crate) fn instance(&self) -> NDIlib_send_instance_t {
-        self.instance.0
+    #[cfg(feature = "advanced")]
+    impl NativeOwner for Exclusive {
+        fn new(resource: SenderResource) -> Self {
+            Self(resource)
+        }
+    }
+
+    #[cfg(feature = "advanced")]
+    impl fmt::Debug for Exclusive {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Exclusive").finish_non_exhaustive()
+        }
     }
 }
 
-impl Drop for SenderResource {
-    fn drop(&mut self) {
-        // SAFETY: this token is the instance's final owner.
-        unsafe { self._ndi.api().core.NDIlib_send_destroy(self.instance.0) };
-    }
-}
+#[cfg(feature = "advanced")]
+use ownership::Exclusive;
+pub(crate) use ownership::SenderResource;
+use ownership::{NativeOwner, Shared};
 
 mod mode_sealed {
     /// The sealed half of [`SenderMode`](super::SenderMode).
@@ -131,71 +204,6 @@ mod mode_sealed {
         /// uncompressed video, `Exclusive` for the modes
         /// the Advanced senders hold.
         type Native: super::NativeOwner;
-    }
-}
-
-/// How a [`Sender`] owns its native sender: [`Shared`] or `Exclusive`, as
-/// the associated type of its sealed mode trait says.
-///
-/// The trait and both owners are nominally public, so that the sealed mode
-/// trait can name them, but nothing outside this module can reach them.
-pub trait NativeOwner: Send + Sync + fmt::Debug {
-    /// Own a native sender that was just created.
-    fn new(resource: SenderResource) -> Self;
-}
-
-/// The native sender of a [`RawSend`] sender, which advertiser registrations
-/// may share, and the asynchronous video pipeline that sends through it.
-pub struct Shared {
-    // Declared first, so that it is dropped first: dropping the pipeline
-    // drains the SDK while `owner` still keeps the native sender alive.
-    video: VideoPipeline,
-    owner: Arc<SenderResource>,
-}
-
-impl NativeOwner for Shared {
-    fn new(resource: SenderResource) -> Self {
-        let sender = SendHandle {
-            instance: resource.instance,
-            core: &resource._ndi.api().core,
-        };
-        Self {
-            video: VideoPipeline::new(sender),
-            owner: Arc::new(resource),
-        }
-    }
-}
-
-impl fmt::Debug for Shared {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Shared")
-            .field("video_callback_set", &self.video.callback.is_some())
-            .finish_non_exhaustive()
-    }
-}
-
-/// The native sender of a sender in one of the modes the Advanced senders
-/// hold, which nothing else owns: dropping it destroys the native sender.
-///
-/// A sender is created in such a mode, or converted into one only when no
-/// registration shares its native sender (`Sender::into_attached`), and
-/// such a mode hands out no other owner. So the frames an Advanced sender
-/// keeps for the SDK are never freed while a registration keeps its native
-/// sender alive.
-#[cfg(feature = "advanced")]
-pub struct Exclusive(SenderResource);
-
-#[cfg(feature = "advanced")]
-impl NativeOwner for Exclusive {
-    fn new(resource: SenderResource) -> Self {
-        Self(resource)
-    }
-}
-
-#[cfg(feature = "advanced")]
-impl fmt::Debug for Exclusive {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Exclusive").finish_non_exhaustive()
     }
 }
 

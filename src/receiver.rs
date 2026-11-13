@@ -36,7 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::{
     capabilities::RuntimeFeature,
@@ -775,8 +775,7 @@ impl<M: ReceiverMode + std::panic::UnwindSafe> std::panic::UnwindSafe for Receiv
 pub(crate) struct ReceiverCore {
     pub(crate) instance: NDIlib_recv_instance_t,
     pub(crate) _ndi: Ndi,
-    source: Source,
-    /// Serializes connection changes against in-flight captures.
+    /// The latest requested target; serializes connection changes against captures.
     ///
     /// Capture calls take this lock *shared* (so video, audio, and metadata
     /// captures still run concurrently), while [`Receiver::reconnect`] takes it
@@ -786,7 +785,7 @@ pub(crate) struct ReceiverCore {
     ///
     /// A shared hold is a [`CaptureLock`], taken for one [`Attempt`] only, and
     /// the native capture cannot be called without one.
-    capture_guard: RwLock<()>,
+    capture_guard: RwLock<Source>,
     pending_status: AtomicBool,
     pending_source: AtomicBool,
     pending_unknown: Mutex<Option<u32>>,
@@ -850,8 +849,7 @@ impl Receiver {
             core: Arc::new(ReceiverCore {
                 instance,
                 _ndi: ndi.clone(),
-                source: options.source.clone(),
-                capture_guard: RwLock::new(()),
+                capture_guard: RwLock::new(options.source.clone()),
                 pending_status: AtomicBool::new(false),
                 pending_source: AtomicBool::new(false),
                 pending_unknown: Mutex::new(None),
@@ -1013,7 +1011,7 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// `None` means no change within the wait budget; `Disconnected` is an
     /// observed change to no source. Concurrent pollers compete for notifications.
-    /// This differs from [`Self::source`], the immutable original connection target.
+    /// This differs from [`Self::connection_target`], the latest requested target.
     ///
     /// The SDK reports each change once, so a name that is not valid UTF-8 is
     /// not an error: invalid sequences are replaced with U+FFFD, as
@@ -1023,23 +1021,28 @@ impl<M: ReceiverMode> Receiver<M> {
             .poll_source_name_change_until(Deadline::after(timeout)?)
     }
 
-    /// Request a different native source without changing the original target.
+    /// Request a different source and remember it as the connection target.
     ///
-    /// [`Self::reconnect`] continues to reconnect to [`Self::source`]. This call
-    /// waits for the capture attempts in flight, as [`Self::reconnect`] does,
-    /// then issues the request; success does not imply the source is already
-    /// available. Existing FrameSync ownership remains.
+    /// Waits for capture attempts in flight, as [`Self::reconnect`] does, then
+    /// issues the request and updates [`Self::connection_target`] together.
+    /// Success means the request was issued, not that the source is available.
+    /// Invalid input leaves the target unchanged. Existing FrameSync ownership
+    /// remains.
     pub fn connect_to(&self, source: &Source) -> Result<()> {
         let raw = source.to_raw()?;
-        self.core.connect(Some(&raw));
+        let source = source.clone();
+        let mut target = self.core.capture_guard.write();
+        self.core.connect_raw(Some(&raw), &target);
+        *target = source;
         Ok(())
     }
 
-    /// Disconnect the native receiver while retaining its original reconnect
-    /// target, once the capture attempts in flight have returned, as for
-    /// [`Self::reconnect`].
+    /// Disconnect while retaining the target for [`Self::reconnect`].
+    ///
+    /// Waits for capture attempts in flight, as [`Self::reconnect`] does.
     pub fn disconnect(&self) {
-        self.core.connect(None);
+        let target = self.core.capture_guard.write();
+        self.core.connect_raw(None, &target);
     }
 
     /// Publish this receiver's program and preview tally to its source.
@@ -1139,11 +1142,12 @@ impl<M: ReceiverMode> Receiver<M> {
         }
     }
 
-    /// Re-establish this receiver's connection to its original source,
+    /// Re-establish this receiver's connection to its latest requested target,
     /// in place.
     ///
     /// Re-points the existing NDI receiver instance at the [`Source`] it
-    /// was created for **without** destroying and recreating the
+    /// most recently requested through [`Self::connect_to`] (or its initial
+    /// source) without destroying and recreating the
     /// receiver. This is intended for mid-session recovery: when a
     /// source's feed has gone silent (for example an encoder-bound
     /// NDI|HX camera that dropped its proxy stream under load), a
@@ -1180,34 +1184,34 @@ impl<M: ReceiverMode> Receiver<M> {
     /// *issued*, not that the feed has recovered — confirm recovery via
     /// [`Self::connection_stats`].
     pub fn reconnect(&self) -> Result<()> {
-        // Marshal before locking; this touches only `self.core.source`, not the
-        // instance, so it need not hold off captures.
-        let raw = self.core.source.to_raw()?;
-        self.core.connect(Some(&raw));
+        // Read the target under the same exclusive lock as the native call,
+        // so a concurrent connect_to cannot be overwritten by a stale retry.
+        let target = self.core.capture_guard.write();
+        let raw = target.to_raw()?;
+        self.core.connect_raw(Some(&raw), &target);
         Ok(())
     }
 
-    /// Get the original source target specified when this receiver was created.
+    /// An owned snapshot of the latest requested connection target.
     ///
-    /// Returns a reference to the [`Source`] that was specified when creating
-    /// this receiver. [`Self::reconnect`] returns to this target even after
-    /// [`Self::connect_to`] or [`Self::disconnect`]. Actual native source changes
-    /// can be observed with [`Self::poll_source_name_change`].
-    ///
-    /// # Examples
+    /// Initially the source specified in [`ReceiverOptions`], updated by each
+    /// successful [`Self::connect_to`]. [`Self::disconnect`] retains it, and
+    /// [`Self::reconnect`] requests it again. This is the requested target;
+    /// observe actual connection changes with [`Self::poll_source_name_change`].
+    /// The snapshot clones the source's name and address. It briefly waits for
+    /// capture-lock access if a connection change is in progress.
     ///
     /// ```no_run
     /// # use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # fn main() -> grafton_ndi::Result<()> {
     /// # let ndi = Ndi::new()?;
     /// # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("CAMERA (Program)")))?;
-    /// let source = receiver.source();
-    /// println!("Original target: {name}", name = source.name());
+    /// println!("Requested target: {}", receiver.connection_target());
     /// # Ok(())
     /// # }
     /// ```
-    pub fn source(&self) -> &Source {
-        &self.core.source
+    pub fn connection_target(&self) -> Source {
+        self.core.capture_guard.read().clone()
     }
 
     /// Get connection and performance statistics for this receiver.
@@ -1384,14 +1388,13 @@ impl ReceiverCore {
     /// Point the native receiver at `source`, or at no source, once no capture
     /// is in flight.
     ///
-    /// The capture guard is held exclusively for the call: it waits for the
-    /// capture attempts in flight to return and holds off new ones, so
+    /// The caller holds the capture guard exclusively for the call, waiting for
+    /// capture attempts in flight to return and holding off new ones, so
     /// `NDIlib_recv_connect` never overlaps `NDIlib_recv_capture_v3` on this
     /// instance, the one combination `Processing.NDI.Recv.h` does not make safe.
     /// Each attempt holds the guard for one [`Attempt`] at most, so this waits
     /// about one poll interval at most.
-    fn connect(&self, source: Option<&RawSource>) {
-        let _exclusive = self.capture_guard.write();
+    fn connect_raw(&self, source: Option<&RawSource>, _exclusive: &RwLockWriteGuard<'_, Source>) {
         let source = source.map_or(ptr::null(), |raw| ptr::from_ref(&raw.raw));
         // SAFETY: the receiver instance is live for this borrow. `source` is
         // null or points into a `RawSource`, which owns the strings its
@@ -1417,7 +1420,7 @@ impl ReceiverCore {
 
     /// Hold the lock a reconnect holds, so that a test can contend with capture.
     #[cfg(all(test, feature = "advanced"))]
-    pub(crate) fn reconnect_lock(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
+    pub(crate) fn reconnect_lock(&self) -> parking_lot::RwLockWriteGuard<'_, Source> {
         self.capture_guard.write()
     }
 
@@ -1616,7 +1619,7 @@ impl ReceiverCore {
 pub(crate) struct CaptureLock<'rx> {
     core: &'rx ReceiverCore,
     attempt: Attempt,
-    _shared: RwLockReadGuard<'rx, ()>,
+    _shared: RwLockReadGuard<'rx, Source>,
 }
 
 impl<'rx> CaptureLock<'rx> {
@@ -2020,8 +2023,9 @@ unsafe impl Send for ReceiverCore {}
 unsafe impl Sync for ReceiverCore {}
 
 // A panic cannot leave a receiver's shared state half-changed: of its locks,
-// two guard `()` and the third one `Option<u32>` that is replaced whole, the
-// rest of its mutable state is atomic, and no application code runs while a
+// the target and pending unknown event are replaced whole; the string-query
+// lock guards `()`. The rest of its mutable state is atomic, and no
+// application code runs while a
 // lock is held. The `parking_lot` locks do not poison and so do not declare
 // this themselves, which would otherwise leave `Receiver` short of
 // `RefUnwindSafe` and a `RecvAdvertiser`, which keeps registered receivers

@@ -111,9 +111,8 @@ async fn async_capture_retains_capability_notifications<R: AsyncRuntime>(
     Ok(())
 }
 
-/// `connect_to`, `disconnect` and `reconnect` reach the receiver and leave its
-/// original target alone; the new connection's name is reported where the
-/// runtime can report it.
+/// Connection changes remember the latest target and reach the native receiver.
+/// The actual connection name is reported where the runtime can report it.
 async fn async_connection_changes_reach_the_receiver<R: AsyncRuntime>(
     ndi: &Ndi,
     runtime: &str,
@@ -153,12 +152,10 @@ async fn async_connection_changes_reach_the_receiver<R: AsyncRuntime>(
 
     media.disconnect().await?;
     wait_until("disconnect", || !media.is_connected());
-    media.connect_to(&source).await?;
-    wait_until("connect_to after disconnect", || media.is_connected());
-    // `reconnect` returns to the original target, which is no source.
+    assert_eq!(media.receiver().connection_target(), source);
     media.reconnect().await?;
-    wait_until("reconnect to the original target", || !media.is_connected());
-    assert_eq!(media.receiver().source(), &nowhere);
+    wait_until("reconnect to the latest target", || media.is_connected());
+    assert_eq!(media.receiver().connection_target(), source);
     Ok(())
 }
 

@@ -13,6 +13,19 @@ API, see the [README](README.md) and the migration guides for
 
 ### Changed
 
+- Receiver connection targets now follow the latest successful `connect_to`
+  request. `connection_target()` replaces `source()` and returns an owned
+  snapshot; `disconnect` retains the target and `reconnect` retries it. The
+  async adapters follow the same rules.
+- `FrameRate` compares and hashes equivalent fractions equally while retaining
+  the supplied components for accessors and SDK submission.
+- Owned audio and video frames set metadata with `set_metadata(text)` and
+  remove it with the infallible `clear_metadata()`.
+- `advanced::UnsentVideo` is renamed `ReclaimedVideo`: returned frames are
+  ready for reuse, without reporting whether they were delivered.
+- Sender ownership types and generic borrowed-frame implementations no longer
+  have public paths. Use the supported receiver and FrameSync frame aliases.
+
 - Examples use the native v3 audio converter, borrowed capture views where
   appropriate, reusable send buffers, and application pacing for queued sends.
   Concurrent capture propagates worker errors, command-line options reject

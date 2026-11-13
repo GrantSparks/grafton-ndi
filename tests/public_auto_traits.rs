@@ -254,7 +254,7 @@ fn advanced_types_keep_their_auto_traits() {
         ScatterVideoFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
         SubmissionId: Send, Sync, UnwindSafe, RefUnwindSafe;
         SubmittedVideo: Send, Sync, UnwindSafe, RefUnwindSafe;
-        UnsentVideo: Send, Sync, UnwindSafe, RefUnwindSafe;
+        ReclaimedVideo: Send, Sync, UnwindSafe, RefUnwindSafe;
         VideoClock<'static>: Send, UnwindSafe, RefUnwindSafe;
         VideoCodec: Send, Sync, UnwindSafe, RefUnwindSafe;
         VideoPacketFormat: Send, Sync, UnwindSafe, RefUnwindSafe;

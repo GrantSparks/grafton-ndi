@@ -56,7 +56,6 @@ mod declarations;
 use bindings::*;
 #[cfg(fake_objects)]
 use std::ffi::c_void;
-#[cfg(any(fake_objects, fake_discovery))]
 use std::ffi::CStr;
 use std::{
     ffi::{c_char, CString},
@@ -153,12 +152,29 @@ export! {
     }
 }
 
+// Record native connection requests so tests can compare the remembered target
+// with what actually crossed the FFI boundary, including concurrent requests.
+export! {
+    fn NDIlib_recv_connect(p_instance: NDIlib_recv_instance_t, p_src: *const NDIlib_source_t) {
+        let name = if p_src.is_null() {
+            "<disconnected>".into()
+        } else {
+            let source = unsafe { &*p_src };
+            if source.p_ndi_name.is_null() {
+                "".into()
+            } else {
+                unsafe { CStr::from_ptr(source.p_ndi_name) }.to_string_lossy()
+            }
+        };
+        log(&format!("receiver-connect:{name}"));
+    }
+}
+
 stub! {
     fn NDIlib_find_create_v2(p_create_settings: *const NDIlib_find_create_t) -> NDIlib_find_instance_t;
     fn NDIlib_find_destroy(p_instance: NDIlib_find_instance_t);
     fn NDIlib_find_get_current_sources(p_instance: NDIlib_find_instance_t, p_no_sources: *mut u32) -> *const NDIlib_source_t;
     fn NDIlib_find_wait_for_sources(p_instance: NDIlib_find_instance_t, timeout_in_ms: u32) -> bool;
-    fn NDIlib_recv_connect(p_instance: NDIlib_recv_instance_t, p_src: *const NDIlib_source_t);
     fn NDIlib_recv_capture_v3(p_instance: NDIlib_recv_instance_t, p_video_data: *mut NDIlib_video_frame_v2_t, p_audio_data: *mut NDIlib_audio_frame_v3_t, p_metadata: *mut NDIlib_metadata_frame_t, timeout_in_ms: u32) -> NDIlib_frame_type_e;
     fn NDIlib_recv_free_video_v2(p_instance: NDIlib_recv_instance_t, p_video_data: *const NDIlib_video_frame_v2_t);
     fn NDIlib_recv_free_audio_v3(p_instance: NDIlib_recv_instance_t, p_audio_data: *const NDIlib_audio_frame_v3_t);

@@ -88,9 +88,7 @@ use crate::{
 
 /// A zero-copy borrowed video frame from a [`FrameSync`] capture.
 ///
-/// This is the FrameSync spelling of the generic
-/// [`VideoRef`]; the [`Receiver`]
-/// spelling is [`VideoFrameRef`](crate::VideoFrameRef). Both share one accessor
+/// The [`Receiver`] equivalent is [`VideoFrameRef`](crate::VideoFrameRef). Both share one accessor
 /// and `Debug` implementation. The frame is automatically freed when dropped via
 /// `NDIlib_framesync_free_video`.
 /// This owning reference is neither `Send` nor `Sync`; its immutable plane/row
@@ -99,9 +97,7 @@ pub type FrameSyncVideoRef<'fs> = VideoRef<'fs, FrameSyncVideoFree>;
 
 /// A zero-copy borrowed audio frame from a [`FrameSync`] capture.
 ///
-/// This is the FrameSync spelling of the generic
-/// [`AudioRef`]; the [`Receiver`]
-/// spelling is [`AudioFrameRef`](crate::AudioFrameRef). Both share one accessor
+/// The [`Receiver`] equivalent is [`AudioFrameRef`](crate::AudioFrameRef). Both share one accessor
 /// and `Debug` implementation, and both always hold samples. The frame is
 /// automatically freed when dropped via `NDIlib_framesync_free_audio_v2`.
 /// This owning reference is neither `Send` nor `Sync`.

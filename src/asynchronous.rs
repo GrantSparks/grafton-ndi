@@ -299,8 +299,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     }
 
     /// The receiver this wraps, lent for its controls: tally, PTZ, upstream
-    /// and connection metadata, delays, the web-control URL and the original
-    /// [`source`](Receiver::source).
+    /// and connection metadata, delays, the web-control URL and the latest
+    /// [`connection_target`](Receiver::connection_target).
     ///
     /// The receiver is shared with every clone of this `AsyncReceiver` and
     /// with the async operations they have in flight. Its methods run on the
@@ -488,8 +488,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
         self.inner.connection_stats()
     }
 
-    /// Point the underlying receiver at a different source, without changing
-    /// the original target that [`Self::reconnect`] returns to. See
+    /// Point the underlying receiver at a different source and remember it as
+    /// the target that [`Self::reconnect`] retries. See
     /// [`Receiver::connect_to`].
     ///
     /// Like [`Self::reconnect`], this takes the receiver's capture guard
@@ -521,7 +521,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     }
 
     /// Disconnect the underlying receiver from its source, retaining the
-    /// original target that [`Self::reconnect`] returns to. See
+    /// latest target that [`Self::reconnect`] retries. See
     /// [`Receiver::disconnect`].
     ///
     /// Like [`Self::reconnect`], this waits for the capture attempts in
@@ -1046,7 +1046,7 @@ mod receiver_tests {
     ) {
         // The lent receiver is the one the operations use.
         assert!(std::ptr::eq(receiver.receiver(), &*receiver.inner));
-        assert_eq!(receiver.receiver().source(), &Source::new(""));
+        assert_eq!(receiver.receiver().connection_target(), Source::new(""));
 
         let excessive = crate::MAX_TIMEOUT + Duration::from_nanos(1);
         assert!(matches!(
@@ -1075,11 +1075,13 @@ mod receiver_tests {
             receiver.connect_to(&Source::new("NUL\0in name")).await,
             Err(Error::InvalidCString(_))
         ));
-        receiver.connect_to(&Source::new("")).await.unwrap();
+        assert_eq!(receiver.receiver().connection_target(), Source::new(""));
+        let target = Source::new("changed target");
+        receiver.connect_to(&target).await.unwrap();
         receiver.disconnect().await.unwrap();
         receiver.reconnect().await.unwrap();
-        // The original target is unchanged by connect_to and disconnect.
-        assert_eq!(receiver.receiver().source(), &Source::new(""));
+        // Disconnect and reconnect retain the latest requested target.
+        assert_eq!(receiver.receiver().connection_target(), target);
     }
 
     #[cfg(feature = "smol")]
@@ -1139,6 +1141,28 @@ mod receiver_tests {
             };
             let receiver = unconnected::<Tokio>(&ndi);
             runtime().block_on(operations_of_an_unconnected_receiver(&ndi, &receiver));
+        }
+
+        #[test]
+        fn dropping_a_queued_connect_preserves_the_target() {
+            let Some(ndi) = crate::test_support::ndi() else {
+                return;
+            };
+            let receiver = unconnected::<Tokio>(&ndi);
+            runtime().block_on(async {
+                let initial = receiver.receiver().connection_target();
+                let (release, blocker) = occupy_worker();
+                let target = Source::new("cancelled target");
+                let mut connect = Box::pin(receiver.connect_to(&target));
+                let mut context = Context::from_waker(Waker::noop());
+                assert!(matches!(connect.as_mut().poll(&mut context), Poll::Pending));
+                drop(connect);
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                // A sentinel on the sole worker follows the cancelled closure.
+                ::tokio::task::spawn_blocking(|| {}).await.unwrap();
+                assert_eq!(receiver.receiver().connection_target(), initial);
+            });
         }
 
         #[test]

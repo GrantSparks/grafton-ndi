@@ -87,11 +87,11 @@ fn video_only_modes_deliver_video_while_an_ordinary_receiver_also_gets_audio() {
                 "{bandwidth:?}: received {videos} video frames and {ordinary_audio} ordinary \
                  audio frames; the {bandwidth:?} receiver of {:?} reports {:?}, the ordinary \
                  one {:?}, and the sender counts {:?} connections{}",
-                receiver.source(),
+                receiver.connection_target(),
                 receiver.connection_stats(),
                 ordinary.connection_stats(),
                 sender.connection_count(Duration::ZERO),
-                common::port_of(receiver.source())
+                common::port_of(&receiver.connection_target())
                     .and_then(common::socket_table)
                     .map_or_else(String::new, |table| format!("\n{table}"))
             );

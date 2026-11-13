@@ -1,0 +1,15 @@
+error[E0603]: struct `Exclusive` is private
+ --> tests/ui/advanced/fail/sender_exclusive_owner_is_private.rs:1:26
+  |
+1 | use grafton_ndi::sender::Exclusive;
+  |                          ^^^^^^^^^ private struct
+  |
+note: the struct `Exclusive` is defined here
+ --> src/sender.rs
+  |
+  | use ownership::Exclusive;
+  |     ^^^^^^^^^^^^^^^^^^^^
+help: import `Exclusive` directly
+  |
+1 | use grafton_ndi::sender::ownership::Exclusive;
+  |                          +++++++++++

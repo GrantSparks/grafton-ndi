@@ -11,10 +11,10 @@ use std::{
 
 use crate::{
     capture::{
-        AudioKind, FrameFree, FrameSyncAudioFree, Guard, RecvAudioGuard, RecvMetadataGuard,
-        VideoKind,
+        AudioKind, FrameFree, FrameSyncAudioFree, FrameSyncVideoFree, Guard, RecvAudioGuard,
+        RecvMetadataGuard, VideoKind,
     },
-    framesync::AudioInputFormat,
+    framesync::{AudioInputFormat, FrameSyncAudioRef, FrameSyncVideoRef},
     pixels::Pixels,
     sys::{self, bindings::*},
     Error, FourCc, FrameRate, Rejected, Result, SdkTimestamp, Timecode,
@@ -623,7 +623,7 @@ pub(crate) fn sdk_video_frame(
 /// read.
 ///
 /// [`VideoFrame`], a received frame's [`ValidatedFrame`] and its
-/// [`VideoRef`], and [`BorrowedVideoFrame`](crate::BorrowedVideoFrame) lend
+/// [`VideoFrameRef`], and [`BorrowedVideoFrame`](crate::BorrowedVideoFrame) lend
 /// their validated layout, header, pixels and metadata through it, and
 /// [`video_accessors!`] generates their public accessors and `Debug` from
 /// it, so that each is written and documented once. Each implementation
@@ -1358,16 +1358,23 @@ impl VideoFrame {
             .map(|metadata| metadata.inner.as_c_str())
     }
 
-    /// Replace frame metadata.
+    /// Replace frame metadata. Use [`Self::clear_metadata`] to remove it.
+    ///
+    /// Invalid replacement text leaves the existing metadata unchanged.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidCString`] if `metadata` contains an interior NUL
     /// byte, or [`Error::InvalidFrame`] if the emitted C string would exceed
     /// the metadata size cap.
-    pub fn set_metadata<S: Into<String>>(&mut self, metadata: Option<S>) -> Result<()> {
-        self.metadata = metadata.map(FrameMetadata::new).transpose()?;
+    pub fn set_metadata(&mut self, metadata: impl Into<String>) -> Result<()> {
+        self.metadata = Some(FrameMetadata::new(metadata)?);
         Ok(())
+    }
+
+    /// Remove the frame metadata.
+    pub fn clear_metadata(&mut self) {
+        self.metadata = None;
     }
 
     /// # Safety
@@ -1558,7 +1565,7 @@ impl VideoFrameBuilder {
 /// read.
 ///
 /// [`AudioFrame`], and a received frame's [`ValidatedFrame`] and its
-/// [`AudioRef`], lend their validated layout, timing, samples and metadata
+/// [`AudioFrameRef`], lend their validated layout, timing, samples and metadata
 /// through it, and [`audio_accessors!`] generates their public accessors and
 /// `Debug` from it, so that each is written and documented once. Each
 /// implementation takes every part from one value that was validated as a
@@ -1931,16 +1938,23 @@ impl AudioFrame {
         Ok(())
     }
 
-    /// Replace frame metadata.
+    /// Replace frame metadata. Use [`Self::clear_metadata`] to remove it.
+    ///
+    /// Invalid replacement text leaves the existing metadata unchanged.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidCString`] if `metadata` contains an interior NUL
     /// byte, or [`Error::InvalidFrame`] if the emitted C string would exceed
     /// the metadata size cap.
-    pub fn set_metadata<S: Into<String>>(&mut self, metadata: Option<S>) -> Result<()> {
-        self.metadata = metadata.map(FrameMetadata::new).transpose()?;
+    pub fn set_metadata(&mut self, metadata: impl Into<String>) -> Result<()> {
+        self.metadata = Some(FrameMetadata::new(metadata)?);
         Ok(())
+    }
+
+    /// Remove the frame metadata.
+    pub fn clear_metadata(&mut self) {
+        self.metadata = None;
     }
 
     /// Get mutable samples for one channel without allocating.
@@ -3920,52 +3934,34 @@ impl<'a> Iterator for VideoPlanes<'a> {
 impl ExactSizeIterator for VideoPlanes<'_> {}
 impl std::iter::FusedIterator for VideoPlanes<'_> {}
 
-/// A zero-copy borrowed video frame, generic over its free strategy `S`.
-///
-/// This type wraps an RAII `Guard` that owns the NDI frame buffer lifetime,
-/// exposing a safe, zero-copy view of the video data. The frame is automatically
-/// freed when dropped, via whichever `NDIlib_*_free_video*` call the strategy `S`
-/// encodes.
-///
-/// The two public spellings are type aliases over this one core, so every
-/// accessor and the `Debug` impl are written exactly once:
-/// - [`VideoFrameRef<'rx>`] — frames captured from a [`Receiver`](crate::Receiver)
-///   (freed via `NDIlib_recv_free_video_v2`).
-/// - [`FrameSyncVideoRef<'fs>`](crate::FrameSyncVideoRef) — frames captured from a
-///   [`FrameSync`](crate::FrameSync) (freed via `NDIlib_framesync_free_video`).
-///
-/// **Key characteristics:**
-/// - Zero allocations: References NDI SDK buffers directly
-/// - Zero copies: No memcpy of pixel data
-/// - RAII lifetime: Exactly one free per frame, enforced at compile time
-/// - Receiver refs are `Send + Sync`; FrameSync refs stay on their capture thread
-/// - Immutable plane/row views support scoped worker reads from either family
-///
-/// # Lifetime
-///
-/// The lifetime parameter `'a` ties this frame to the owner (a `Receiver` or a
-/// `FrameSync`) that created it. The borrow checker ensures the owner cannot be
-/// dropped while any frame references are alive, preventing use-after-free at
-/// compile time with zero runtime cost. The underlying NDI buffer is freed when
-/// the frame ref is dropped.
-///
-/// # Performance
-///
-/// For a 1920×1080 BGRA frame, this eliminates ~8.3 MB of memcpy compared to
-/// the owned [`VideoFrame`]. At 60 fps, this saves ~475 MB/s of memory bandwidth.
-#[allow(private_bounds)]
-pub struct VideoRef<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> {
-    /// The captured frame and the layout, header and metadata text validated
-    /// from it once, when it was captured; accessors read the cached values.
-    frame: ValidatedVideo<Guard<'a, S>>,
+mod borrowed {
+    use super::*;
+
+    #[allow(private_bounds)]
+    pub struct VideoRef<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> {
+        /// The captured frame and the layout, header and metadata text validated
+        /// from it once, when it was captured; accessors read the cached values.
+        pub(super) frame: ValidatedVideo<Guard<'a, S>>,
+    }
+
+    #[allow(private_bounds)]
+    pub struct AudioRef<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> {
+        /// The captured frame and the layout and metadata text validated from it
+        /// once, when it was captured; accessors read the cached values.
+        pub(super) frame: ValidatedAudio<Guard<'a, S>>,
+    }
 }
 
-/// A zero-copy borrowed video frame from a [`Receiver`](crate::Receiver) capture.
+pub(crate) use borrowed::{AudioRef, VideoRef};
+
+/// A zero-copy video frame captured from a [`Receiver`](crate::Receiver).
 ///
-/// This is the receiver spelling of the generic [`VideoRef`]; the
-/// [`FrameSync`](crate::FrameSync) spelling is
-/// [`FrameSyncVideoRef`](crate::FrameSyncVideoRef). Both share one accessor and
-/// `Debug` implementation.
+/// Borrows its receiver and frees the SDK buffer when dropped. It can be moved
+/// or shared with scoped worker threads (`Send + Sync`). Converting with
+/// `to_owned` copies the active pixels into an owned frame. No pixels are
+/// copied by capture itself. For padded buffers, `data()` returns `None`; use
+/// `planes()` and each plane's rows to read initialized active pixels.
+/// See [`crate::FrameSyncVideoRef`] for clock-driven capture.
 pub type VideoFrameRef<'rx> = VideoRef<'rx, VideoKind>;
 
 #[allow(private_bounds)]
@@ -4003,54 +3999,64 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoRef<'a, S> {
     pub(crate) fn raw(&self) -> &NDIlib_video_frame_v2_t {
         self.frame.descriptor()
     }
-
-    /// Borrow all active pixels when contiguous, in SDK plane order.
-    ///
-    /// Returns `None` if padding separates active rows or planes. Use
-    /// [`Self::planes`] / [`Self::plane`] for zero-copy padded access, or
-    /// [`Self::to_owned`] for a tightly packed owned buffer. A single packed
-    /// row can be borrowed even when its stride includes trailing padding.
-    pub fn data(&self) -> Option<&[u8]> {
-        self.frame.active_data()
-    }
-
-    /// Copy this borrowed frame into an owned `VideoFrame`.
-    ///
-    /// Copies only active rows into one tightly packed pixel allocation and
-    /// copies metadata separately. The owned stride can be smaller than the
-    /// SDK stride. Preserves format, timing, aspect ratio, and scan type.
-    /// [`Self::copy_into`] makes the same copy into an existing frame,
-    /// reusing its allocations.
-    ///
-    /// The copy cannot fail: capture validated everything it relies on, and
-    /// the packed layout of a valid frame is valid.
-    pub fn to_owned(&self) -> VideoFrame {
-        self.frame.owned_copy()
-    }
-
-    /// Copy this borrowed frame into `destination`, reusing its allocations.
-    ///
-    /// `destination` ends up exactly as [`Self::to_owned`] would have
-    /// returned it, whatever it held before: tightly packed active rows,
-    /// format, dimensions, frame rate, aspect ratio, scan type, timecode,
-    /// timestamp and metadata.
-    ///
-    /// Its pixel buffer is reused when its capacity holds the packed frame
-    /// and its format's [room](PixelFormat::send_tail_room), and otherwise
-    /// replaced by one allocation of exactly that size. Its
-    /// metadata string is reused when the new text has the same length, and
-    /// otherwise the text takes one allocation. Copying frames of one shape
-    /// into the same destination therefore allocates nothing after the first
-    /// copy.
-    ///
-    /// The copy makes no SDK call. It runs wherever this reference may be
-    /// used: a receiver frame can be copied on a scoped worker thread, while a
-    /// FrameSync frame stays on its capture thread. The destination is an
-    /// ordinary owned frame either way.
-    pub fn copy_into(&self, destination: &mut VideoFrame) {
-        self.frame.copy_into_owned(destination);
-    }
 }
+
+// Specialize methods on the public aliases so rustdoc shows their full API
+// even though the generic frame core has no public path.
+macro_rules! borrowed_video_methods {
+    ($name:ident) => {
+        impl<'a> $name<'a> {
+            /// Borrow all active pixels when contiguous, in SDK plane order.
+            ///
+            /// Returns `None` if padding separates active rows or planes. Use
+            /// [`Self::planes`] / [`Self::plane`] for zero-copy padded access, or
+            /// [`Self::to_owned`] for a tightly packed owned buffer. A single packed
+            /// row can be borrowed even when its stride includes trailing padding.
+            pub fn data(&self) -> Option<&[u8]> {
+                self.frame.active_data()
+            }
+
+            /// Copy this borrowed frame into an owned `VideoFrame`.
+            ///
+            /// Copies only active rows into one tightly packed pixel allocation and
+            /// copies metadata separately. The owned stride can be smaller than the
+            /// SDK stride. Preserves format, timing, aspect ratio, and scan type.
+            /// [`Self::copy_into`] makes the same copy into an existing frame,
+            /// reusing its allocations.
+            ///
+            /// The copy cannot fail: capture validated everything it relies on, and
+            /// the packed layout of a valid frame is valid.
+            pub fn to_owned(&self) -> VideoFrame {
+                self.frame.owned_copy()
+            }
+
+            /// Copy this borrowed frame into `destination`, reusing its allocations.
+            ///
+            /// `destination` ends up exactly as [`Self::to_owned`] would have
+            /// returned it, whatever it held before: tightly packed active rows,
+            /// format, dimensions, frame rate, aspect ratio, scan type, timecode,
+            /// timestamp and metadata.
+            ///
+            /// Its pixel buffer is reused when its capacity holds the packed frame
+            /// and its format's [room](PixelFormat::send_tail_room), and otherwise
+            /// replaced by one allocation of exactly that size. Its
+            /// metadata string is reused when the new text has the same length, and
+            /// otherwise the text takes one allocation. Copying frames of one shape
+            /// into the same destination therefore allocates nothing after the first
+            /// copy.
+            ///
+            /// The copy makes no SDK call. It runs wherever this reference may be
+            /// used: a receiver frame can be copied on a scoped worker thread, while a
+            /// FrameSync frame stays on its capture thread. The destination is an
+            /// ordinary owned frame either way.
+            pub fn copy_into(&self, destination: &mut VideoFrame) {
+                self.frame.copy_into_owned(destination);
+            }
+        }
+    };
+}
+borrowed_video_methods!(VideoFrameRef);
+borrowed_video_methods!(FrameSyncVideoRef);
 
 /// Every part comes from the one [`ValidatedFrame`].
 impl<S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoParts for VideoRef<'_, S> {
@@ -4076,20 +4082,21 @@ impl<S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoParts for VideoRef<'
     }
 }
 
-video_accessors! {
-    #[allow(private_bounds)]
-    impl['a, S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>] VideoRef<'a, S>;
-    debug(S::REF_DEBUG_NAME, "active data (bytes)" = payload_len_bytes);
-    timecode {}
-    line_stride_bytes {
-        /// It is the SDK's stride, which can include row padding, cached and
-        /// validated when the frame was captured.
-    }
-    plane {}
-    timestamp {
-        /// It is `None` when the SDK does not know it.
-    }
-    images("no_run", "\
+macro_rules! borrowed_video_accessors {
+    ($name:ident, $strategy:ty) => {
+        video_accessors! {
+            impl['a] $name<'a>;
+            debug(<$strategy as FrameFree>::REF_DEBUG_NAME, "active data (bytes)" = payload_len_bytes);
+            timecode {}
+            line_stride_bytes {
+                /// It is the SDK's stride, which can include row padding, cached and
+                /// validated when the frame was captured.
+            }
+            plane {}
+            timestamp {
+                /// It is `None` when the SDK does not know it.
+            }
+            images("no_run", "\
  # use grafton_ndi::{Finder, FinderOptions, Ndi, Receiver, ReceiverOptions};
  # use std::time::Duration;
  # let ndi = Ndi::new()?;
@@ -4098,46 +4105,24 @@ video_accessors! {
  # let Some(source) = finder.current_sources()?.into_iter().next() else { return Ok(()) };
  # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source))?;
  # let Some(frame) = receiver.video().capture_ref(Duration::from_secs(5))? else { return Ok(()) };") {
-        /// It encodes directly from the borrowed SDK pixels, without first
-        /// copying the frame into an owned [`VideoFrame`].
-    }
+                /// It encodes directly from the borrowed SDK pixels, without first
+                /// copying the frame into an owned [`VideoFrame`].
+            }
+        }
+    };
 }
+borrowed_video_accessors!(VideoFrameRef, VideoKind);
+borrowed_video_accessors!(FrameSyncVideoRef, FrameSyncVideoFree);
 
-/// A zero-copy borrowed audio frame, generic over its free strategy `S`.
+/// A zero-copy audio frame captured from a [`Receiver`](crate::Receiver).
 ///
-/// This type wraps an RAII `Guard` that owns the NDI frame buffer lifetime,
-/// exposing a safe, zero-copy view of the audio data. The frame is automatically
-/// freed when dropped, via whichever `NDIlib_*_free_audio*` call the strategy `S`
-/// encodes.
-///
-/// The two public spellings are type aliases over this one core, so every
-/// accessor and the `Debug` impl are written exactly once:
-/// - [`AudioFrameRef<'rx>`] — frames captured from a [`Receiver`](crate::Receiver)
-///   (freed via `NDIlib_recv_free_audio_v3`).
-/// - [`FrameSyncAudioRef<'fs>`](crate::FrameSyncAudioRef) — frames captured from a
-///   [`FrameSync`](crate::FrameSync) (freed via `NDIlib_framesync_free_audio_v2`).
-///
-/// Every frame holds samples: at least one channel of at least one sample, in
-/// a supported format.
-///
-/// **Key characteristics:**
-/// - Zero allocations: References NDI SDK buffers directly
-/// - Zero copies: No memcpy of audio samples
-/// - RAII lifetime: Exactly one free per frame, enforced at compile time
-/// - Receiver refs are `Send + Sync`; FrameSync refs stay on their capture thread
-#[allow(private_bounds)]
-pub struct AudioRef<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> {
-    /// The captured frame and the layout and metadata text validated from it
-    /// once, when it was captured; accessors read the cached values.
-    frame: ValidatedAudio<Guard<'a, S>>,
-}
-
-/// A zero-copy borrowed audio frame from a [`Receiver`](crate::Receiver) capture.
-///
-/// This is the receiver spelling of the generic [`AudioRef`]; the
-/// [`FrameSync`](crate::FrameSync) spelling is
-/// [`FrameSyncAudioRef`](crate::FrameSyncAudioRef). Both share one accessor and
-/// `Debug` implementation.
+/// Borrows its receiver and frees the SDK buffer when dropped. It can be moved
+/// or shared with scoped worker threads (`Send + Sync`). Converting with
+/// `to_owned` copies the active samples into an owned frame. No samples are
+/// copied by capture itself. For padded channels, `data()` returns `None`; use
+/// `channel_data()` or `channels()` to read initialized samples. Every captured
+/// audio frame has at least one channel and one sample per channel.
+/// See [`crate::FrameSyncAudioRef`] for clock-driven capture.
 pub type AudioFrameRef<'rx> = AudioRef<'rx, AudioKind>;
 
 #[allow(private_bounds)]
@@ -4165,51 +4150,61 @@ impl<'a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioRef<'a, S> {
         let frame = unsafe { ValidatedAudio::audio(guard)? };
         Ok(Self { frame })
     }
-
-    /// Get a zero-copy slice when channels are tightly packed.
-    ///
-    /// Returns `None` for multi-channel buffers with padding between channels.
-    /// Use [`channel_data`](Self::channel_data) or [`channels`](Self::channels)
-    /// for those buffers.
-    pub fn data(&self) -> Option<&[f32]> {
-        self.frame.contiguous_samples()
-    }
-
-    /// Copy this borrowed frame into an owned `AudioFrame`.
-    ///
-    /// Copies channel samples into tightly packed planar storage and copies
-    /// metadata, allowing the frame to outlive the SDK buffer. Padding is omitted.
-    /// Allocates one sample buffer, and one metadata string when present.
-    /// [`Self::copy_into`] makes the same copy into an existing frame,
-    /// reusing its allocations.
-    ///
-    /// The copy cannot fail: capture validated everything it relies on.
-    pub fn to_owned(&self) -> AudioFrame {
-        self.frame.owned_copy()
-    }
-
-    /// Copy this borrowed frame into `destination`, reusing its allocations.
-    ///
-    /// `destination` ends up exactly as [`Self::to_owned`] would have
-    /// returned it, whatever it held before: the channels' samples packed
-    /// back to back without inter-channel padding, format, sample rate,
-    /// channel and sample counts, timecode, timestamp and metadata.
-    ///
-    /// Its sample buffer is reused when its capacity holds the packed
-    /// samples, and otherwise replaced by one allocation of exactly that
-    /// size. Its metadata string is reused when the new text has the same
-    /// length, and otherwise the text takes one allocation. Copying frames of
-    /// one shape into the same destination therefore allocates nothing after
-    /// the first copy.
-    ///
-    /// The copy makes no SDK call. It runs wherever this reference may be
-    /// used: a receiver frame can be copied on a scoped worker thread, while a
-    /// FrameSync frame stays on its capture thread. The destination is an
-    /// ordinary owned frame either way.
-    pub fn copy_into(&self, destination: &mut AudioFrame) {
-        self.frame.copy_into_owned(destination);
-    }
 }
+
+// Specialize methods on the public aliases so rustdoc shows their full API
+// even though the generic frame core has no public path.
+macro_rules! borrowed_audio_methods {
+    ($name:ident) => {
+        impl<'a> $name<'a> {
+            /// Get a zero-copy slice when channels are tightly packed.
+            ///
+            /// Returns `None` for multi-channel buffers with padding between channels.
+            /// Use [`channel_data`](Self::channel_data) or [`channels`](Self::channels)
+            /// for those buffers.
+            pub fn data(&self) -> Option<&[f32]> {
+                self.frame.contiguous_samples()
+            }
+
+            /// Copy this borrowed frame into an owned `AudioFrame`.
+            ///
+            /// Copies channel samples into tightly packed planar storage and copies
+            /// metadata, allowing the frame to outlive the SDK buffer. Padding is omitted.
+            /// Allocates one sample buffer, and one metadata string when present.
+            /// [`Self::copy_into`] makes the same copy into an existing frame,
+            /// reusing its allocations.
+            ///
+            /// The copy cannot fail: capture validated everything it relies on.
+            pub fn to_owned(&self) -> AudioFrame {
+                self.frame.owned_copy()
+            }
+
+            /// Copy this borrowed frame into `destination`, reusing its allocations.
+            ///
+            /// `destination` ends up exactly as [`Self::to_owned`] would have
+            /// returned it, whatever it held before: the channels' samples packed
+            /// back to back without inter-channel padding, format, sample rate,
+            /// channel and sample counts, timecode, timestamp and metadata.
+            ///
+            /// Its sample buffer is reused when its capacity holds the packed
+            /// samples, and otherwise replaced by one allocation of exactly that
+            /// size. Its metadata string is reused when the new text has the same
+            /// length, and otherwise the text takes one allocation. Copying frames of
+            /// one shape into the same destination therefore allocates nothing after
+            /// the first copy.
+            ///
+            /// The copy makes no SDK call. It runs wherever this reference may be
+            /// used: a receiver frame can be copied on a scoped worker thread, while a
+            /// FrameSync frame stays on its capture thread. The destination is an
+            /// ordinary owned frame either way.
+            pub fn copy_into(&self, destination: &mut AudioFrame) {
+                self.frame.copy_into_owned(destination);
+            }
+        }
+    };
+}
+borrowed_audio_methods!(AudioFrameRef);
+borrowed_audio_methods!(FrameSyncAudioRef);
 
 /// Every part comes from the one [`ValidatedFrame`].
 impl<S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioParts for AudioRef<'_, S> {
@@ -4235,19 +4230,24 @@ impl<S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioParts for AudioRef<'
     }
 }
 
-audio_accessors! {
-    #[allow(private_bounds)]
-    impl['a, S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>] AudioRef<'a, S>;
-    debug(S::REF_DEBUG_NAME);
-    timecode {}
-    timestamp {
-        /// It is `None` when the SDK does not know it.
-    }
-    channel_stride_bytes {
-        /// It includes any padding between channels.
-    }
-    channel_data {}
+macro_rules! borrowed_audio_accessors {
+    ($name:ident, $strategy:ty) => {
+        audio_accessors! {
+            impl['a] $name<'a>;
+            debug(<$strategy as FrameFree>::REF_DEBUG_NAME);
+            timecode {}
+            timestamp {
+                /// It is `None` when the SDK does not know it.
+            }
+            channel_stride_bytes {
+                /// It includes any padding between channels.
+            }
+            channel_data {}
+        }
+    };
 }
+borrowed_audio_accessors!(AudioFrameRef, AudioKind);
+borrowed_audio_accessors!(FrameSyncAudioRef, FrameSyncAudioFree);
 
 impl<'rx> AudioRef<'rx, AudioKind> {
     /// Create a borrowed audio frame from a receiver RAII guard, validated
@@ -6236,7 +6236,7 @@ mod tests {
 
     /// The receiver and FrameSync video refs agree: given byte-identical raw
     /// frames, every shared accessor, `scan_type` included, returns identical
-    /// results, as both spellings share one [`VideoRef`] core.
+    /// results, as both spellings share one [`VideoFrameRef`] core.
     #[test]
     fn test_receiver_and_framesync_video_refs_agree() {
         use crate::capture::{FrameSyncVideoFree, Guard, VideoKind};
@@ -6931,7 +6931,7 @@ mod tests {
             b"\0"
         );
 
-        video.set_metadata(Some("video meta")).unwrap();
+        video.set_metadata("video meta").unwrap();
         assert_eq!(video.metadata(), Some("video meta"));
         let raw = video.to_raw();
         assert_eq!(
@@ -6939,14 +6939,14 @@ mod tests {
             b"video meta\0"
         );
 
-        video.set_metadata(Option::<String>::None).unwrap();
+        video.clear_metadata();
         assert!(video.metadata().is_none());
         assert!(video.to_raw().p_metadata.is_null());
 
         let mut audio = AudioFrame::builder().metadata("").build().unwrap();
         assert_eq!(audio.metadata(), Some(""));
         assert!(!audio.to_raw().p_metadata.is_null());
-        audio.set_metadata(Some("audio meta")).unwrap();
+        audio.set_metadata("audio meta").unwrap();
         assert_eq!(audio.metadata(), Some("audio meta"));
 
         assert!(matches!(
@@ -6957,15 +6957,18 @@ mod tests {
             AudioFrame::builder().metadata("bad\0metadata").build(),
             Err(Error::InvalidCString(_))
         ));
+        video.set_metadata("preserved video").unwrap();
         assert!(matches!(
-            video.set_metadata(Some("bad\0metadata")),
+            video.set_metadata("bad\0metadata"),
             Err(Error::InvalidCString(_))
         ));
         assert!(matches!(
-            audio.set_metadata(Some("bad\0metadata")),
+            audio.set_metadata("bad\0metadata"),
             Err(Error::InvalidCString(_))
         ));
 
+        assert_eq!(video.metadata(), Some("preserved video"));
+        assert_eq!(audio.metadata(), Some("audio meta"));
         let oversized = "x".repeat(MAX_METADATA_BYTES);
         assert!(matches!(
             VideoFrame::builder().metadata(oversized.clone()).build(),
@@ -6976,13 +6979,24 @@ mod tests {
             Err(Error::InvalidFrame(_))
         ));
         assert!(matches!(
-            video.set_metadata(Some(oversized.clone())),
+            video.set_metadata(oversized.clone()),
             Err(Error::InvalidFrame(_))
         ));
         assert!(matches!(
-            audio.set_metadata(Some(oversized)),
+            audio.set_metadata(oversized),
             Err(Error::InvalidFrame(_))
         ));
+        assert_eq!(video.metadata(), Some("preserved video"));
+        assert_eq!(audio.metadata(), Some("audio meta"));
+        // Clearing an already empty frame is also infallible.
+        for _ in 0..2 {
+            video.clear_metadata();
+            audio.clear_metadata();
+            assert_eq!(video.metadata(), None);
+            assert_eq!(audio.metadata(), None);
+            assert!(video.to_raw().p_metadata.is_null());
+            assert!(audio.to_raw().p_metadata.is_null());
+        }
     }
 
     /// Test that audio frames with overflow in checked_mul are rejected
@@ -8096,10 +8110,10 @@ mod tests {
 
     impl<S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> CopySource<VideoFrame> for VideoRef<'_, S> {
         fn owned(&self) -> VideoFrame {
-            self.to_owned()
+            self.frame.owned_copy()
         }
         fn copy(&self, destination: &mut VideoFrame) {
-            self.copy_into(destination);
+            self.frame.copy_into_owned(destination);
         }
     }
 
@@ -8114,10 +8128,10 @@ mod tests {
 
     impl<S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> CopySource<AudioFrame> for AudioRef<'_, S> {
         fn owned(&self) -> AudioFrame {
-            self.to_owned()
+            self.frame.owned_copy()
         }
         fn copy(&self, destination: &mut AudioFrame) {
-            self.copy_into(destination);
+            self.frame.copy_into_owned(destination);
         }
     }
 

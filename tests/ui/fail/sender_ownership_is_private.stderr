@@ -1,0 +1,35 @@
+error[E0603]: trait `NativeOwner` is private
+ --> tests/ui/fail/sender_ownership_is_private.rs:1:27
+  |
+1 | use grafton_ndi::sender::{NativeOwner, SenderResource, Shared};
+  |                           ^^^^^^^^^^^ private trait
+  |
+note: the trait `NativeOwner` is defined here
+ --> src/sender.rs
+  |
+  | use ownership::{NativeOwner, Shared};
+  |                 ^^^^^^^^^^^
+
+error[E0603]: struct `SenderResource` is private
+ --> tests/ui/fail/sender_ownership_is_private.rs:1:40
+  |
+1 | use grafton_ndi::sender::{NativeOwner, SenderResource, Shared};
+  |                                        ^^^^^^^^^^^^^^ private struct
+  |
+note: the struct `SenderResource` is defined here
+ --> src/sender.rs
+  |
+  | pub(crate) use ownership::SenderResource;
+  |                ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: struct `Shared` is private
+ --> tests/ui/fail/sender_ownership_is_private.rs:1:56
+  |
+1 | use grafton_ndi::sender::{NativeOwner, SenderResource, Shared};
+  |                                                        ^^^^^^ private struct
+  |
+note: the struct `Shared` is defined here
+ --> src/sender.rs
+  |
+  | use ownership::{NativeOwner, Shared};
+  |                              ^^^^^^
