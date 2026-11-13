@@ -104,8 +104,13 @@ Each row:
    runs. This step is the only one given the secrets in its environment;
 3. proves that the test runner isolates ([`offline/check.py`](offline/check.py)
    outside and inside it);
-4. runs `cargo test --locked --config ci/offline.toml --target <target>` twice,
-   with `--all-features` and with `--no-default-features`;
+4. runs `cargo test --locked --config ci/offline.toml --target <target>
+   --no-fail-fast` twice, with `--all-features` and with
+   `--no-default-features`. Every test binary runs, so a failing one does not
+   hide the outcomes of the rest, and every step that runs tests has a timeout
+   of its own, well inside the job's (20 minutes for the all-features run,
+   which passes in 7), so a test that never returns fails its step with the
+   binaries before it reported;
 5. runs the row's extra steps:
    - **vendored bindings check**: `cargo xtask bindgen --check --sdk "$NDI_SDK_DIR"`;
    - **Advanced lint**: clippy (`-D warnings`) with all features, with

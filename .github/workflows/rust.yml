@@ -337,14 +337,20 @@ jobs:
             macOS) ci/offline/macos.sh python3 ci/offline/check.py ;;
             Windows) pwsh -NoProfile -File ci/offline/windows.ps1 "$(python -c 'import sys; sys.stdout.write(sys.executable)')" ci/offline/check.py ;;
           esac
+      # Each runtime step is bounded well inside the job's 60 minutes (it takes
+      # 7 at most when it passes), so that a test that never returns fails its
+      # step, and every test binary runs, so that one failing does not hide the
+      # outcomes of the rest.
       - name: Tests against the real runtime, all features
+        timeout-minutes: 20
         env:
           GRAFTON_NDI_REQUIRE_RUNTIME: ${{ matrix.require }}
-        run: cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features
+        run: cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features
       - name: Tests against the real runtime, no default features
+        timeout-minutes: 10
         env:
           GRAFTON_NDI_REQUIRE_RUNTIME: ${{ matrix.require-no-default || '1' }}
-        run: cargo test --locked --config ci/offline.toml --target "$TARGET" --no-default-features
+        run: cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --no-default-features
       # Without the Advanced headers the advanced feature compiles to stubs, so
       # only a build that has them lints and documents the real implementation.
       - name: Lint and document the Advanced implementation
@@ -365,6 +371,7 @@ jobs:
 
       - name: Current Advanced headers with baseline runtimes
         if: matrix.compatibility
+        timeout-minutes: 25
         run: |
           export GRAFTON_NDI_PEER_RUNTIME="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_RUNTIME }}"
           export GRAFTON_NDI_PEER_VERSION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_VERSION }}"
@@ -373,13 +380,14 @@ jobs:
             while IFS='=' read -r name value; do export "$name=$value"; done < "$RUNNER_TEMP/ndi-compat-$edition.env"
             export NDI_SDK_DIR="${{ steps.sdk.outputs.NDI_SDK_DIR }}"
             if [ "$edition" = advanced ]; then export GRAFTON_NDI_REQUIRE_RUNTIME=advanced; else export GRAFTON_NDI_REQUIRE_RUNTIME=1; fi
-            cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features
+            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features
           done
       # A Standard baseline SDK has no headers a build reads, so its pass is a
       # build without Advanced declarations, which cannot check `advanced`. No
       # compatibility pass promises an NDI|HX decoder; the row's own runs do.
       - name: Baseline SDK builds with the current Advanced runtime
         if: matrix.compatibility
+        timeout-minutes: 25
         run: |
           for edition in standard advanced; do
             while IFS='=' read -r name value; do export "$name=$value"; done < "$RUNNER_TEMP/ndi-compat-$edition.env"
@@ -394,7 +402,7 @@ jobs:
             require="${require/,h264-decoder/}"; require="${require/,hevc-444-decoder/}"
             if [ "$edition" = standard ]; then require="${require/advanced/1}"; fi
             export GRAFTON_NDI_REQUIRE_RUNTIME="$require"
-            cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features
+            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features
           done
 
   required-ci:

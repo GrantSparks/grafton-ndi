@@ -351,13 +351,27 @@ class SdkJob(unittest.TestCase):
                     # `1` is implied by every other entry, so it is spelt out only when it stands alone.
                     self.assertEqual(set(promise.split(',')) | {'1'},
                                      checkable(target, pin, all_features=all_features, driver=driver))
+        # A step that may fail without failing the job is a diagnostic, and promises nothing.
         tests = {step['run']: step['env'] for step in self.job['steps']
-                 if step.get('run', '').startswith('cargo test')}
-        command = 'cargo test --locked --config ci/offline.toml --target "$TARGET" '
+                 if step.get('run', '').startswith('cargo test') and 'continue-on-error' not in step}
+        command = 'cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast '
         self.assertEqual(tests, {
             command + '--all-features': {'GRAFTON_NDI_REQUIRE_RUNTIME': '${{ matrix.require }}'},
             command + '--no-default-features': {
                 'GRAFTON_NDI_REQUIRE_RUNTIME': "${{ matrix.require-no-default || '1' }}"}})
+
+    def test_every_test_step_is_bounded_inside_the_job(self):
+        """A test that never returns fails its own step, well before the job's limit, and a failing test binary
+        does not keep the ones after it from running."""
+        job = int(self.job['timeout-minutes'])
+        steps = [step for step in self.job['steps'] if 'cargo test' in step.get('run', '')]
+        self.assertGreaterEqual(len(steps), 4)
+        for step in steps:
+            with self.subTest(step=step['name']):
+                self.assertRegex(step.get('timeout-minutes', ''), r'^\d+$')
+                self.assertLess(int(step['timeout-minutes']), job)
+                if 'continue-on-error' not in step:
+                    self.assertIn('--no-fail-fast', step['run'])
 
     def test_compatibility_runs_use_independent_headers_and_runtime_identity(self):
         rows = [row for row in self.rows if 'compatibility' in row]
@@ -378,7 +392,8 @@ class SdkJob(unittest.TestCase):
         for step in steps:
             self.assertNotIn('env', step)
             self.assertIn('export GRAFTON_NDI_REQUIRE_RUNTIME=', step['run'])
-            self.assertIn('cargo test --locked --config ci/offline.toml --target "$TARGET" --all-features', step['run'])
+            self.assertIn('cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features',
+                          step['run'])
             self.assertIn('ndi-compat-$edition.env', step['run'])
             self.assertIn('for edition in standard advanced; do', step['run'])
         self.assertIn('export NDI_SDK_DIR="${{ steps.sdk.outputs.NDI_SDK_DIR }}"', steps[0]['run'])
