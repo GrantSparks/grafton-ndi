@@ -282,7 +282,14 @@ What each wrapper confines, and what it does not:
 - **Windows.** The two firewall rules name one program, the test executable.
   Its traffic to and from anything but loopback is blocked for as long as it
   runs. A process it starts from a different program file is not covered, and
-  nothing else on the machine is affected.
+  nothing else on the machine is affected. The rules name the program by its
+  long path, which the wrapper gets from `GetLongPathNameW`: rustdoc starts
+  each doctest from a directory under `%TEMP%`, which the hosted images set to
+  the 8.3 form `C:\Users\RUNNER~1\AppData\Local\Temp`, and in run 43332050213
+  `New-NetFirewallRule` refused every doctest's program with "The parameter is
+  incorrect" while the executables under `target\` got their rules. The log
+  prints none of those paths, so the short name is the probable cause, not an
+  observed one.
 
 Each `sdk` row runs [`offline/check.py`](offline/check.py) outside and then
 inside the wrapper. Inside, IPv4 loopback TCP and UDP must work, and the
@@ -473,17 +480,21 @@ New, and so unverified anywhere but Linux x86_64:
 
 - every macOS and Windows step as a whole, including the wrappers used as Cargo
   runners (`pwsh -File` on Windows, `sandbox-exec` without a packet filter on
-  macOS) and the build against Xcode's libclang;
+  macOS) and the build against Xcode's libclang. In run 43332050213 the Windows
+  wrapper started `check.py` and the integration-test executables under
+  `target\`, but no doctest (see the Windows point under
+  [Loopback-only test runs](#loopback-only-test-runs)); the long-path
+  expansion that answers this has not yet run on a hosted runner;
 - the network check on macOS and Windows: that a refused connection or datagram
   fails at once there (with a permission error) instead of timing out. The first
   hosted run showed that the unconfined macOS runner cannot send to the mDNS
   group (the datagram is refused), which the `--online` control now reports as a
-  limitation; whether the unconfined Windows runner can is not yet known. The
-  Windows run of the loopback-only check (run 43318507917) showed that the
-  public TCP connections are refused at once inside the wrapper but that the
-  mDNS datagram is `reached`, because the firewall discards it silently; the
-  check now reports that as a limitation on Windows, and that report itself is
-  not yet confirmed by a hosted run;
+  limitation; the unconfined Windows runner reached both the public address
+  and the mDNS group in run 43332050213. The Windows run of the loopback-only
+  check (run 43318507917) showed that the public TCP connections are refused at
+  once inside the wrapper but that the mDNS datagram is `reached`, because the
+  firewall discards it silently; the check reports that as a limitation on
+  Windows, and run 43332050213 passed that way on every Windows row;
 - every promise of the Windows and macOS rows, in particular `file` beside a
   Standard runtime in the Windows x64 Standard 6.4 row;
 - the Advanced lint on Windows and macOS;

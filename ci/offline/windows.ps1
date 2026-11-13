@@ -19,13 +19,56 @@ $ErrorActionPreference = 'Stop'
 # array keeps zero, one and many arguments a list.
 $program = $args[0]
 $arguments = @($args | Select-Object -Skip 1)
-$program = (Resolve-Path -LiteralPath $program).Path
+
+# The rules name the program by its long path. rustdoc starts each doctest as
+# rust_out.exe in a directory under %TEMP%, which GitHub's hosted Windows
+# images set to the 8.3 form C:\Users\RUNNER~1\AppData\Local\Temp. In run
+# 43332050213 New-NetFirewallRule refused every doctest's program with "The
+# parameter is incorrect", while the test executables under target\ and
+# python.exe got their rules. The log prints none of those paths, so the short
+# name is the probable cause rather than an observed one. Resolve-Path keeps
+# short names; GetLongPathNameW replaces each short component with its long
+# name, and returns a path that has none unchanged.
+Add-Type -TypeDefinition @'
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class GraftonNdiLongPath
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetLongPathNameW(string shortPath, StringBuilder longPath, uint length);
+
+    public static string Of(string path)
+    {
+        // Room for the longest path the Unicode file functions accept.
+        var buffer = new StringBuilder(32768);
+        uint length = GetLongPathNameW(path, buffer, (uint)buffer.Capacity);
+        if (length == 0)
+        {
+            throw new IOException("GetLongPathNameW failed for " + path + " with Win32 error " + Marshal.GetLastWin32Error());
+        }
+        if (length >= buffer.Capacity)
+        {
+            throw new PathTooLongException("the long form of " + path + " needs " + length + " characters");
+        }
+        return buffer.ToString();
+    }
+}
+'@
+$program = [GraftonNdiLongPath]::Of((Resolve-Path -LiteralPath $program).Path)
 $rule = 'grafton-ndi-ci-' + [guid]::NewGuid().ToString('N')
 $result = 1
 try {
     Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled True
     foreach ($direction in 'Outbound', 'Inbound') {
-        New-NetFirewallRule -DisplayName $rule -Direction $direction -Action Block -Program $program -Profile Any | Out-Null
+        try {
+            New-NetFirewallRule -DisplayName $rule -Direction $direction -Action Block -Program $program -Profile Any | Out-Null
+        }
+        catch {
+            # The cmdlet's message does not name the program it refused.
+            throw ('New-NetFirewallRule refused the program {0}: {1}' -f $program, $_)
+        }
     }
     $env:CARGO_NET_OFFLINE = 'true'
     & $program @arguments
