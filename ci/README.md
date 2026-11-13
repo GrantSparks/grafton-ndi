@@ -126,11 +126,8 @@ Each row:
      simulator, which needs a pinned nightly toolchain and `-Zbuild-std`;
    - **compatibility runs**: on the rows that have them, the four crossed runs
      described above;
-6. on Windows, while the failures that remain there are being told apart, runs
-   the tests that show them again with the firewall off and without the
-   loopback-only runner (see
-   [Receivers that never connect on Windows](#receivers-that-never-connect-on-windows)).
-   It runs whatever the steps before it did.
+6. on Windows, runs the temporary step that diagnoses the runner's open
+   failure (see [Windows](#windows)).
 
 The job uses no dependency cache and uploads nothing, so SDK files and the
 Advanced bindings generated into the target directory never leave the runner.
@@ -187,13 +184,11 @@ where. Everywhere, it then reports its decoder missing, as a skip or as a
 broken promise, when every frame it receives is that placeholder.
 
 The Advanced SDK manual documents H.264 decoding on Windows and macOS without
-plugins, but H.265 only in 4:2:0 and where decoding hardware supports it. In
-run 43332050213 both Windows Advanced 6.4 rows received only placeholders for
-HEVC 4:4:4, while the macOS Advanced 6.4 row decoded it; the hosted Windows
-runners have no GPU, which is the probable cause, not a confirmed one. So no
-Windows row promises `hevc-444-decoder`. H.264 is another matter: in run
-43342188690 the H.264 test decoded on every Windows Advanced row, 6.3.2 and
-6.4, x64 and x86, so those rows promise `h264-decoder`.
+plugins, but H.265 only in 4:2:0 and where decoding hardware supports it. On
+the hosted runners the Windows runtimes decode H.264, 6.3.2 and 6.4, x64 and
+x86, and deliver only placeholders for HEVC 4:4:4, probably for want of a GPU;
+the macOS runtime decodes both. So the Windows Advanced rows promise
+`h264-decoder`, and no Windows row promises `hevc-444-decoder`.
 
 ## SDK packages
 
@@ -290,9 +285,9 @@ rustdoc, which starts each compiled doctest through it, with or without
 
 | | Linux ([`linux.sh`](offline/linux.sh)) | macOS ([`macos.sh`](offline/macos.sh)) | Windows ([`windows.ps1`](offline/windows.ps1)) |
 |---|---|---|---|
-| Network | own network namespace (`bwrap --unshare-net`) holding only `lo` | Seatbelt profile allowing only binding, loopback connections and traffic arriving on a local address | Defender Firewall block rules for the test executable, both directions, for every address but the machine's own; the firewall never filters loopback, and Windows delivers traffic to the machine's own addresses as loopback |
+| Network | own network namespace (`bwrap --unshare-net`) holding only `lo` | Seatbelt profile allowing only binding, loopback connections and traffic arriving on a local address | Defender Firewall block rules for the test executable, both directions; the firewall never filters loopback |
 | Host daemons | `/run` replaced by an empty tmpfs: no D-Bus, no Avahi | mDNSResponder socket denied; the SDK is given a loopback discovery address through `NDI_CONFIG_DIR` | untouched |
-| SDK networks | only `lo` exists | loopback discovery address instead of multicast DNS | loopback discovery address instead of multicast DNS, through `NDI_CONFIG_DIR` (see [Receivers that never connect on Windows](#receivers-that-never-connect-on-windows)) |
+| SDK networks | only `lo` exists | loopback discovery address instead of multicast DNS | loopback discovery address instead of multicast DNS, through `NDI_CONFIG_DIR` (see [Windows](#windows)) |
 | Machine's own name | resolves to `127.0.0.1` through a private `/etc/hosts` | cannot be relied on to resolve | resolves as usual |
 | `TMPDIR` | private tmpfs (`/run/tmp`) | private directory, removed afterwards | untouched |
 | SDK log | off | off | on, through `NDI_CONFIG_DIR`; printed when the executable fails |
@@ -311,19 +306,13 @@ What each wrapper confines, and what it does not:
   still delivered, because the profile language cannot restrict the peer of
   inbound traffic.
 - **Windows.** The two firewall rules name one program, the test executable.
-  Its traffic to and from anything but loopback and the machine's own
-  addresses is blocked for as long as it runs. Traffic to the machine's own
-  addresses does not leave it, and the SDK needs them: blocked too, they
-  stopped receivers connecting to a sender that had already served one (see
-  [Receivers that never connect on Windows](#receivers-that-never-connect-on-windows)). A process it starts from a different program file is not covered, and
+  Its traffic to and from anything but loopback is blocked for as long as it
+  runs. A process it starts from a different program file is not covered, and
   nothing else on the machine is affected. The rules name the program by its
-  long path, which the wrapper gets from `GetLongPathNameW`: rustdoc starts
-  each doctest from a directory under `%TEMP%`, which the hosted images set to
-  the 8.3 form `C:\Users\RUNNER~1\AppData\Local\Temp`, and in run 43332050213
-  `New-NetFirewallRule` refused every doctest's program with "The parameter is
-  incorrect" while the executables under `target\` got their rules. The log
-  prints none of those paths, so the short name is the probable cause, not an
-  observed one.
+  long path, which the wrapper gets from `GetLongPathNameW`:
+  `New-NetFirewallRule` refuses a path with an 8.3 short component, and rustdoc
+  starts each doctest from a directory under `%TEMP%`, which the hosted images
+  set to the short form `C:\Users\RUNNER~1\AppData\Local\Temp`.
 
 Each `sdk` row runs [`offline/check.py`](offline/check.py) outside and then
 inside the wrapper. Inside, IPv4 loopback TCP and UDP must work, and the
@@ -366,188 +355,37 @@ Two parts of the wrappers exist because of how the SDK behaves:
   observed on Linux; the macOS wrapper isolates `TMPDIR` as a precaution and
   the Windows wrapper leaves it alone.
 
-The Windows wrapper also turns on the SDK's own log, at level `info`, through
-an `NDI_CONFIG_DIR` whose configuration sets nothing else, and prints the log
-after an executable that failed. The log names the port each sender listens
-on, the address each receiver opens and whether it connected, and the
-transport it receives over (`single-TCP` over loopback on Linux with 6.4.0.2).
-It exists because the first Windows runs (run 43332050213) failed tests that
-wait for media from a sender of their own: in a different set of tests on each
-row, a receiver got nothing for 15 seconds, and the tests could not say whether
-it had connected. On Linux the namespace leaves the SDK no address but
-loopback, and on macOS it is given a loopback discovery address; on Windows it
-sees the machine's network adapter and is given nothing, and the log shows
-which addresses it used. In run 43342188690 the three Windows Advanced rows
-printed it; the Windows Standard 6.4 row's failed executable printed none,
-although the Linux Standard 6.4 runtime writes the log with the same
-configuration.
+The Windows wrapper also turns on the SDK's own log, at level `info`, in the
+configuration it gives the SDK, and prints the log after an executable that
+failed. The log names the port each sender listens on, the address each
+receiver opens and whether it connected, and the transport it receives over,
+none of which a test's own messages can show.
 
-### Receivers that never connect on Windows
+### Windows
 
-In run 43342188690 the SDK logs of the three Windows Advanced rows show 70
-receivers that `tests/advanced_runtime.rs` opened at `127.0.0.1:<port>` to a
-sender of its own (one test's 16 simultaneous receivers counted once). 15
-never connected: the receiver reported no connection for the whole 15 s, and
-its sender logged no `connection opened`. Where a test opened a second receiver
-3 to 10 ms later to the same address, that one connected within 2 ms; every
-receiver that connected did so within 4 ms. The failures move between tests
-and rows from run to run. What preceded each receiver:
+Under the Windows runner the SDK is given a loopback discovery address, as
+under the macOS one. With multicast DNS blocked, a Windows receiver may never
+connect, even to an explicit loopback address.
 
-| Within 150 ms before the receiver was opened | Receivers | Never connected |
-| --- | --- | --- |
-| a receiver of the process closed, and a sender shut down | 43 | 12 |
-| a sender shut down, but no receiver the log shows closed within 300 ms | 15 | 1 |
-| neither | 12 | 2 |
+One failure of the runner is open. Under its rules, about half of the
+receivers of a source that a receiver of the same process connected to before
+never connect; with the firewall off every one connects.
+`tests/peer_recreation.rs` measures it, and the temporary step **Windows
+receiver stall, by firewall rule** runs that test with each choice of rules
+(`GRAFTON_NDI_CI_FIREWALL`), to pick rules that do not cause it.
 
-The three in the last two rows each followed a test whose receivers' teardown
-the log does not show: one had created receivers by name only and with no
-source, and in the other two rows the test just before had no sender and only
-a genlock without a reference. So the failures follow the teardown of
-receivers in the same process more closely than they follow the reuse of the
-port. Two more things count against a listener of the previous sender that
-outlives it and takes the next connection, which a socket of the new sender
-would have to share the port with:
+Tests leave out what a Windows runtime cannot do, and print that they did: the
+genlock tests on the 6.4 Advanced runtimes, whose genlock acquires no
+reference, and the PQ test of `tests/image_color_sdk.rs` on the Standard
+runtimes, which give an RGB receiver nothing of a P216 frame tagged PQ.
 
-- On Linux, `strace` of the Advanced 6.4 runtime shows that a sender binds its
-  listener on `0.0.0.0` without `SO_REUSEADDR`, and a sender created while
-  another socket holds 5961 is given 5962 (both measured with
-  `ci/offline/linux.sh`). If the Windows runtime binds the same way, a
-  listener that outlived its sender would have moved the next sender off 5961;
-  on Windows every such sender was given 5961.
-- On the Advanced 6.3.2 row, the 15 receivers opened within 100 ms after the
-  one that failed in the 16-receiver test all connected to the same sender, as
-  did the second receivers above: the sender's listener accepted connections
-  throughout.
-
-`tests/receiver_video_only.rs` failed differently, on the Windows Standard 6.4
-row of runs 43332050213 and 43342188690 (no other Windows row has run it with a
-runtime that has video-only receiving): both times its `VideoOnlyLowest`
-receiver, opened as soon as the `VideoOnlyHighest` one was dropped, was given
-no video in 15 s while the ordinary receiver was given audio throughout, and in
-the second run, which reported the counts, it counted no connection while the
-sender counted two, its ordinary receiver and one more. In
-`a_genlock_moves_between_threads` on the x64 Advanced 6.4 row of run
-43342188690 the genlock's receiver connected and received, and the genlock
-never acquired the reference: a third failure, not one of a connection.
-
-Run 43352460772 gave every receiver on Windows a loopback address no receiver
-of its process had been given, 127.0.0.2 and on, so that none connected to a
-destination a torn-down connection had used. It changed nothing: 13 of the 115
-receivers that `tests/advanced_runtime.rs` opened to an address on the three
-Windows Advanced rows never connected, against 15 of 70 before, and two more
-connected and were given nothing (the H.264 test on 6.3.2, and on 6.4 the
-genlock test's reference, whose sender counted the connection). The receivers
-that never connected and those that did had opened alike, about 4 ms after
-their sender started and 65 ms after the previous test's receiver closed, so
-the teardown that the table above points to does not tell them apart either.
-The SDK log names `127.0.0.1:<port>` as the address of every connection,
-whatever address the receiver was given; on Linux the runtime dials the
-address it is given (a receiver given a wrong name and the right address
-connects, one given the right name and a wrong port does not), and its log
-line names `127.0.0.1` there too. `tests/common` gives every receiver
-`127.0.0.1:<port>` again.
-
-What every receiver of the suites did follow, by a millisecond or two, is the
-destruction of the finder that `common::loopback_endpoint` creates to find its
-sender's port. In run 43362984849 `tests/peer_recreation.rs` tested that, with
-arms that took turns, 25 receivers each, each receiver of a new sender: the
-finder dropped just before the receiver was created (`dropped`), 250 ms before
-(`rested`), kept alive (`held`), or never created, the port read from
-`netstat` (`unfound`). On the x64 Advanced 6.3.2 row:
-
-| Run | Not given a frame within 2 s (`dropped`, `rested`, `held`, `unfound`) | Slowest frame |
-| --- | --- | --- |
-| runtime step, under the loopback-only runner | 44 of 100 (4, 5, 15, 20) | 21 ms |
-| last step, under the loopback-only runner | 49 of 100 (9, 8, 14, 18) | 21 ms |
-| last step, firewall off and no runner | 0 of 100 | 513 ms |
-
-No receiver that missed 2 s counted a connection. The finder made no
-difference, or the opposite one. The failure was the confinement's: its rules
-block the program on every interface but loopback and left the SDK the
-machine's network adapter and multicast DNS to try, where under the Linux and
-macOS runners it has neither (the Linux runner's namespace has only loopback,
-and `macos.sh` gives the SDK a loopback discovery address).
-
-Run 43366775596 told the two apart. The runner gave the SDK both settings that
-keep it on loopback in the runtime steps, and each alone in the last step:
-
-| Row | Both | Loopback discovery address only | Loopback adapter only | Firewall off, no runner |
-| --- | --- | --- | --- | --- |
-| x64 Advanced 6.4 | 0 of 100 | 0 | 43 | 0 |
-| x64 Advanced 6.3.2 | 0 | 0 | 40 | 0 |
-| x86 Advanced 6.4 | 0 | 0 | 54 | 0 |
-
-(The `unfound` arm, which read the port from `netstat`, failed on the Standard
-rows, where its receivers connected to a port that was not the sender's; the
-other three arms there agree with the table.) Multicast DNS is the cause: with
-the firewall blocking it, a Windows receiver sometimes never connects, even to
-an explicit address, and with a discovery address configured, or the firewall
-off, none failed. `ci/offline/windows.ps1` gives the SDK the loopback
-discovery address, as `macos.sh` does, and nothing else.
-
-With multicast DNS out of the way, the receivers that still stalled had been
-created as soon as another receiver of the same sender was dropped: the
-`VideoOnlyLowest` receiver of `tests/receiver_video_only.rs`, created as its
-`VideoOnlyHighest` one was dropped, on every 6.4 row, and the second receiver
-of the image colour tests' `round_trip`, on four of the five rows. In run
-43369298234 `tests/peer_recreation.rs` measured that: one sender, and receivers
-created one after another, each as soon as the one before was given a frame and
-dropped, in three arms that took turns, 25 receivers each: the default name,
-which the receiver just dropped had too (`same name`); a name no receiver had
-(`own name`); and the default name 250 ms after the drop (`rested`).
-
-| Row | Under the runner (`same name`, `own name`, `rested`) | Firewall off, no runner |
-| --- | --- | --- |
-| x64 Standard 6.3.2 | 13, 12, 12 of 25 | 0 of 75 |
-| x64 Standard 6.4 | 13, 14, 13 | 0 |
-| x64 Advanced 6.3.2 | 11, 17, 14 | 0 |
-| x64 Advanced 6.4 | 17, 17, 20 | 0 |
-| x86 Advanced 6.4 | 18, 15, 12 | 0 |
-
-The name made no difference, nor did waiting 250 ms; the confinement did. No
-receiver that missed 5 s counted a connection, a second receiver opened then
-connected in 43 of 45 tries, and `Receiver::reconnect` revived 178 of 218. With
-the firewall off every receiver connected, the slowest in half a second on the
-Advanced rows and in 2 s on the Standard ones: the SDK takes some other route
-first, which the rules blocked. The rules had blocked every address but
-loopback, the machine's own adapter addresses included, although traffic to
-those never leaves the machine. They now leave the machine's own addresses
-alone and block every other: nothing still leaves the machine or arrives from
-another, and `offline/check.py` still finds the public addresses and the
-multicast DNS group refused.
-
-The firewall-off step also showed two failures that are not the confinement's:
-
-- On the Windows 6.4 runtimes, x64 and x86, a genlock connected to its
-  reference, whose sender counted the connection, never became active, with the
-  firewall off too; on 6.3.2, and on Linux and macOS, it did. When it does not,
-  `tests/advanced_runtime.rs` now tries the genlock with references of other
-  kinds (unclocked, without audio, 1920x1080) and reports which it acquires.
-- On both Windows Standard rows the RGBX receiver of
-  `a_pq_tag_reaches_rgb_receivers_and_their_frames_are_refused` was given no
-  frame that matched the PQ-tagged frames sent, with the firewall off too. The
-  image colour tests now report what arrived when a frame never does.
-
-The Windows Standard 6.3.2 runtime also delivers an `RgbxRgba` receiver's
-frame of a source without alpha as opaque RGBA, where every other runtime
-measured delivers RGBX; the image colour test accepts either.
-
-The job's last Windows step, **Windows failures with the firewall off**, runs
-`tests/peer_recreation.rs`, `tests/receiver_video_only.rs`,
-`tests/image_color_sdk.rs` and the genlock tests of `tests/advanced_runtime.rs`
-again with the firewall off and without the runner, whatever the steps before
-it did, so that a failure there is not the confinement's.
-
-For each arm's first three receivers that miss the experiment's 5 s, the TCP
-table of the port is taken (`common::socket_table`, also in the failure
-messages of `tests/advanced_runtime.rs` and `tests/receiver_video_only.rs`),
-and a second receiver, of a name of its own, is opened to the same address. In
-the table, a row from the receiver to the port that is `ESTABLISHED` while the
-sender counts no connection is a connection nobody services; `SYN_SENT` is a
-connection attempt nobody answers; and no row at all, as in every failure so
-far, is a receiver that has not tried. The first such receiver of each arm is
-then left alone until 15 s have passed, and after that, and for every other
-one at once, `Receiver::reconnect` is called.
+When a receiver does not connect, the failure messages of
+`tests/peer_recreation.rs`, `tests/advanced_runtime.rs` and
+`tests/receiver_video_only.rs` carry the Windows TCP table of the sender's port
+(`common::socket_table`). A row from the receiver to the port that is
+`ESTABLISHED` while the sender counts no connection is a connection nobody
+services; `SYN_SENT` is a connection attempt nobody answers; and no row at all
+is a receiver that has not tried.
 
 On Linux the same run works locally:
 
@@ -562,7 +400,7 @@ GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --config ci/offline.toml --all-features
 2. Tag that commit `v<version>` and push the tag.
 
 `publish.yml` runs for `v*` tags only, in four jobs that each need the one
-before:
+before. It has not run yet: the 3.0.0 release is its first run.
 
 | Job | What it does |
 |---|---|
@@ -668,76 +506,3 @@ secrets, the jobs `required-ci` waits for, the actions each job uses, and how
 the `publish` job starts Cargo. They also list wrong edits that must be
 reported. A change to a workflow that touches one of these rules has to change
 the guards too, and both have a code owner.
-
-## Not yet run on a hosted runner
-
-These workflows have not run on GitHub. On Linux x86_64 the commands of `lint`,
-`test` and `cross`, the test commands of the five Linux x64 `sdk` rows and of
-their compatibility runs, and SDK provisioning from local archives have been
-run by hand, and the shell steps of `verify` and `publish` have been run on a
-local clone with `cargo publish --dry-run`; the rest is unproven until the
-first hosted run. Remove an item from this section once a hosted run has
-exercised it.
-
-Carried over from the previous CI, which ran on hosted runners:
-
-- the source-map schema, the GitHub asset request and its headers (the code
-  around them is rewritten);
-- the installer invocations: `pkgutil --expand-full` on macOS and the silent
-  Windows installer flags;
-- the Seatbelt policy and the loopback discovery configuration;
-- the Windows firewall cmdlets;
-- the Linux network namespace with a private `/etc/hosts` (its other `bwrap`
-  options differ), the user-namespace `sysctl` and the i386 packages;
-- the Windows LLVM installation, the Apple mobile deployment targets and SDK
-  roots, and the nightly pin for the tvOS simulator;
-- the crates.io authentication action.
-
-New, and so unverified anywhere but Linux x86_64:
-
-- every macOS and Windows step as a whole, including the wrappers used as Cargo
-  runners (`pwsh -File` on Windows, `sandbox-exec` without a packet filter on
-  macOS) and the build against Xcode's libclang. In run 43332050213 the Windows
-  wrapper started `check.py` and the integration-test executables under
-  `target\`, but no doctest (see the Windows point under
-  [Loopback-only test runs](#loopback-only-test-runs)); the long-path
-  expansion that answers this has not yet run on a hosted runner;
-- the network check on macOS and Windows: that a refused connection or datagram
-  fails at once there (with a permission error) instead of timing out. The first
-  hosted run showed that the unconfined macOS runner cannot send to the mDNS
-  group (the datagram is refused), which the `--online` control now reports as a
-  limitation; the unconfined Windows runner reached both the public address
-  and the mDNS group in run 43332050213. The Windows run of the loopback-only
-  check (run 43318507917) showed that the public TCP connections are refused at
-  once inside the wrapper but that the mDNS datagram is `reached`, because the
-  firewall discards it silently; the check reports that as a limitation on
-  Windows, and run 43332050213 passed that way on every Windows row;
-- the Windows wrapper's SDK log with the Standard runtime: run 43342188690
-  printed the Advanced runtime's log after a failed executable, but the
-  Standard 6.4 row's failed executable printed none;
-- the distinct loopback addresses that `tests/common` gives receivers on
-  Windows, and `tests/peer_recreation.rs` with its control, port probe and TCP
-  tables there (see
-  [Receivers that never connect on Windows](#receivers-that-never-connect-on-windows));
-- every promise of the Windows and macOS rows, in particular `file` beside a
-  Standard runtime in the Windows x64 Standard 6.4 row;
-- the Advanced lint on Windows and macOS;
-- the Linux x86 and Linux arm64 rows;
-- the compatibility runs on Windows and macOS, including the peer process under
-  their wrappers, and on every platform the hand-off of the baseline values
-  through the files under `$RUNNER_TEMP` and the step outputs;
-- provisioning the 6.1.1 and 6.3.2 baseline packages in CI;
-- installing the NDI|HX driver in CI, from its source-map entry, and the
-  `h264-decoder` and `hevc-444-decoder` promises on Linux, which have passed by
-  hand against a local copy of the Advanced 6.4 runtime with the driver beside
-  it and the system FFmpeg hidden;
-- building tvOS and visionOS on the stable toolchain;
-- the Android example link in `cross`;
-- access to the secrets and the download from the private store;
-- how Dependabot's runs appear to the workflow (`github.actor`), and the skip
-  of the `sdk` job for them;
-- the semver check once a release with the crate's major version exists (until
-  then it is skipped);
-- the release path: the `crates-io` environment, trusted publishing, passing
-  the digest and toolchain between jobs, and reproducing the package in the
-  `publish` job.

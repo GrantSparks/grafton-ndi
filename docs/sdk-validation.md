@@ -461,17 +461,18 @@ The library was linted the same way for `aarch64-apple-ios` and
 `x86_64-apple-ios` against the NDI SDK for Apple 6.4. That selects and checks
 the static archive, but the static link was not performed and nothing was run.
 
-`aarch64-apple-tvos`, `x86_64-apple-tvos` and `aarch64-apple-visionos` were not
-compiled: the CI job that builds them has not yet run.
+`aarch64-apple-tvos`, `x86_64-apple-tvos` and `aarch64-apple-visionos` are
+built in hosted CI, with the iOS targets; nothing is run on them.
 
 ## Hosted CI
 
-The workflows in `.github/workflows/` have not yet run on a hosted runner.
-Everything above was measured on one Linux x86_64 machine. The macOS and
-Windows jobs, the other Linux architectures and the release path are unproven
-until the first hosted run. The [CI guide](../ci/README.md) describes the
-workflows and keeps the
-[list of what is unproven](../ci/README.md#not-yet-run-on-a-hosted-runner).
+The `sdk` job of `.github/workflows/rust.yml` runs the test suite against real
+runtimes on GitHub's hosted runners: Linux x86-64 with Standard 6.1.1, 6.3.2
+and 6.4 and Advanced 6.3.2 and 6.4; Linux x86 and arm64 with Standard 6.4;
+macOS arm64 with Standard and Advanced 6.3.2 and 6.4, and macOS x86-64 with
+Standard 6.4; Windows x64 with Standard and Advanced 6.3.2 and 6.4, and Windows
+x86 with Advanced 6.4. The [CI guide](../ci/README.md) describes the rows and
+what each one checks.
 
 ## What was not tested
 

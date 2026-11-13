@@ -393,12 +393,9 @@ on one machine do not collide on it (see below).
 A test that connects a receiver to a sender of its own process addresses the
 sender through `common::loopback_source(&ndi, &sender)`, or
 `common::loopback_endpoint(&ndi, name)` for a source it knows only by name.
-Both find the sender's port with a finder and name `127.0.0.1:<port>`. On
-Windows, while a firewall blocks multicast DNS for the test program, some
-receivers never connect even to such an endpoint, unless the SDK is given a
-discovery address, as the CI runner gives it; "Receivers that never connect on
-Windows" in the [CI guide](ci/README.md) has the measurements and the failures
-that remain.
+Both find the sender's port with a finder and name `127.0.0.1:<port>`. What
+the Windows runner does to keep receivers connecting, and what is still open
+there, is under "Windows" in the [CI guide](ci/README.md#windows).
 When a receiver does not connect, `common::socket_table(port)` adds the operating
 system's view of that port to the failure message on Windows.
 
@@ -569,11 +566,6 @@ Windows, cross-target lint, and tests against real runtimes in an SDK matrix.
 One check, `required-ci`, summarizes them. A pull request from a fork cannot
 read the secrets that provide the SDK packages, so its SDK jobs are skipped and
 the other jobs decide. `.github/workflows/publish.yml` releases a version.
-
-These workflows have not yet run on a hosted runner. Their Linux x86_64
-commands have been run by hand; every macOS and Windows step is unverified
-until the first hosted run. The CI guide keeps the
-[list of what is unproven](ci/README.md#not-yet-run-on-a-hosted-runner).
 
 Before pushing, run the core of what the `lint` and `test` jobs run. The
 feature combinations, the Rust 1.88 check, `cargo package`, the semver check
