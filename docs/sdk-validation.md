@@ -114,14 +114,128 @@ not include its tests. On 2026-11-13, on the same machine:
 | Test | Runtimes | Result |
 | --- | --- | --- |
 | `tests/image_color_sdk.rs`, the SDK's color conversion pinned (BT.709 at 720×576, 1920×1080 and 3840×2160 whatever the tag, tags passed through, repeated chroma, RGB sent as BT.709 limited range, a PQ tag reaching an RGB receiver, FrameSync frames) | Standard 6.1.1, 6.3.2 and 6.4.0.2; Advanced 6.4.0.2 | 5 of 5 passed on each |
-| `tests/video_padding_sdk.rs`, UYVY and P216 frames encoded in place from the SDK's padded rows | Standard 6.4.0.2 | 2 of 2 passed |
+| `tests/video_padding_sdk.rs`, UYVY and P216 frames encoded in place from the SDK's padded rows | Standard 6.1.1, 6.3.2 and 6.4.0.2; Advanced 6.3.2 and 6.4.0.2 | 2 of 2 passed on each |
 | The same under Valgrind Memcheck | Standard 6.3.2 and 6.4.0.2 | No errors in the crate's code; four in glibc's dynamic loader with 6.3.2, none with 6.4.0.2 |
 
-Memcheck also found that the 6.3.2 runtime reads up to 28 bytes past the end
-of a UYVY frame it sends from a buffer that holds the frame exactly. The test
-sends from a buffer with slack; the 6.4.0.2 runtime was not run against an
-exact buffer. See the [image encoding guide](image-encoding.md) and its
+An earlier Memcheck run of that test found the SDK reading past the end of the
+UYVY frame it was sending, which the next section measures. See the
+[image encoding guide](image-encoding.md) and its
 [performance notes](image-encoding-performance.md).
+
+### Reads past the end of sent video
+
+The x86 builds of the SDK read past the last pixel of many UYVY and UYVA
+frames they send. The SDK's documentation gives a UYVY frame as its line
+stride times its height, asks for no alignment and no padding, and asks only
+that widths be even; its own examples allocate exactly that. The builds for
+64-bit ARM Linux read every frame exactly.
+
+#### x86-64
+
+The reads were measured on 2026-11-13, on the same machine, with C programs
+that call only the SDK. The main one sends frames from a buffer that ends
+where an inaccessible page begins, and moves the frame back from the page a
+byte at a time until no read reaches it. The frames held a slow ramp, and in
+the first two runs below also uniform random bytes, with the same result.
+
+Progressive frames, by size:
+
+| Runtimes | Formats | Sizes | Result |
+| --- | --- | --- | --- |
+| Standard 6.1.1, 6.3.2 and 6.4.0.2; Advanced 6.3.2 and 6.4.0.2 | UYVY | 640×480, 720×480, 720×576, 854×480, 1280×720, 1366×768, 1920×1080, 1918×1080, 1080×1920, 640×1080, 642×32, 3840×2160 | The same on every runtime. No read past 640×480, 1280×720, 1920×1080 and 3840×2160. 4 bytes past 720×480, 720×576 and 1918×1080, 12 past 640×1080, 16 past 1080×1920, 20 past 854×480 and 1366×768, 28 past 642×32 |
+| The same | UYVA | The same | The same on every runtime. 5 bytes past 854×480, 7 past 720×480, 720×576 and 642×32, 8 past 1366×768, 12 past 640×1080; none past the others |
+| The same | P216, PA16, NV12, I420, YV12, BGRA, BGRX, RGBA, RGBX | The same; 3840×2160 PA16 as a ramp only | No read past the frame |
+| Standard and Advanced 6.4.0.2 | NA48, NB48, NA4G, NB4G | Eight, from 18×32 to 3840×2160 | No read past the frame |
+| Standard 6.4.0.2 | UYVY | 605: every even width to 200 at heights of 32 and 480, and 135 wider ones to 4096 at heights of 32, 480 and 1080 | Reads past 443 of them, 28 bytes at most. Whenever the width is not a multiple of 16, by at least the bytes that would complete the row's last 16 pixels. At 231 of the 393 sizes whose width is a multiple of 16, by up to 12 |
+| Standard 6.4.0.2 | UYVA | The same 605 | Reads past 244 of them, 14 bytes at most |
+
+The scan type changes the answer. With Standard 6.4.0.2, in bytes past the
+frame, for progressive, interlaced and single-field frames:
+
+| Size | UYVY | UYVA |
+| --- | --- | --- |
+| 1920×1080 | 0, 4, 12 | 0, 5, 14 |
+| 1280×720 | 0, 0, 12 | 0, 0, 14 |
+| 3840×2160 | 0, 0, 0 | 0, 0, 0 |
+| 720×480 | 4, 4, 4 | 7, 7, 4 |
+| 720×576 | 4, 4, 8 | 7, 7, 14 |
+| 720×486 | 4, 4, 12 | 7, 7, 13 |
+| 640×480 | 0, 0, 12 | 0, 0, 14 |
+| 642×32 | 28, 28, 28 | 7, 7, 7 |
+
+Standard 6.1.1 and 6.3.2 and Advanced 6.4.0.2 gave the same figures at the
+four of these sizes they were run at. Over 51 widths from 2 to 3840,
+interlaced and single-field UYVY frames 32, 480 and 1080 rows high, 441 cases,
+were read at most 28 bytes past.
+
+A height that is not a multiple of four is read further when the frame is
+interlaced or a single field. At 1920×1082, 1920×1086, 2560×1442, 3840×2162
+and 26 other sizes, all larger in area than 1920×1080, an interlaced UYVY
+frame was read to the end of the row after next, two line strides past the
+frame, on every runtime it was run on; single fields of 2560×1083 and
+3840×1083 were read one row past. No progressive frame was, no frame whose
+height is a multiple of four, and no UYVA frame of those sizes. Frames of the
+other formats at those sizes are converted by the SDK first, and those runs
+ended in a fault inside the SDK, outside the buffers it was given.
+
+Three more observations bear on what a program sees:
+
+- The reads happen on every frame, whether or not a receiver is connected.
+- Where a frame ends within its page matters. In 7,715 runs on the five
+  runtimes, of 275 sizes with a width that is a multiple of 16 in three scan
+  modes, a frame that ends exactly on a page boundary was read exactly. Under
+  Valgrind Memcheck, which can mark the bytes after a frame anywhere in a
+  page, a 720×480 frame that ends elsewhere was read 4 bytes past. The
+  method above keeps the frame's end near a page boundary, so a size's
+  figure is the furthest read seen and not a bound.
+- What the SDK reads is compressed into the picture. A 642×32 UYVY frame
+  followed by bytes of 16, and the same frame followed by bytes of 235,
+  arrived with 12 samples different, by up to 3, all in the last two columns
+  of the last eight rows.
+
+The SDK's own `NDIlib_Send_Latency` example, built with the 6.4.0.2 SDK and
+changed only in its width, shows the reads under Valgrind Memcheck: no error
+at its own 640×480, one read 4 bytes past its buffer per frame at 720×480,
+and reads 28 and 4 bytes past it at 642×480.
+
+#### 64-bit ARM
+
+The Linux builds for 64-bit ARM were run on the same machine under QEMU 7.2
+user-mode emulation, with the same program. None read past a frame: Standard
+6.4.0.2 over 1,743 UYVY and UYVA cases of 38 widths, six heights and the four
+scan types, each at four positions, and 48 cases of six other formats;
+Standard 6.1.1 and 6.3.2 and Advanced 6.4.0.2 over 300 cases each.
+
+#### What the crate does
+
+`PixelFormat::send_tail_room` is the room the crate gives the SDK after a
+frame: 64 zero bytes for UYVY and UYVA, none for the other formats, and none
+at all on 64-bit ARM Linux. An interlaced or single-field UYVY or UYVA frame
+whose height is not a multiple of four gets two line strides more. An owned
+frame's allocation holds the room; `Sender::send_video` sends a borrowed
+frame in place when its buffer has the room, or the caller vouches for it
+with `BorrowedVideoFrameBuilder::readable_after`, and from a copy in a buffer
+the sender keeps when it does not. On other architectures and operating
+systems, where nothing was measured, the crate takes the x86 figures.
+
+The copy costs time. Sending a UYVY frame from a buffer that ends with it,
+against the same frame with room, took 0.15 ms longer at 1280×720, 0.28 ms at
+1920×1080 and 1.1 ms at 3840×2160 with the 6.3.2 and 6.4.0.2 runtimes, in a
+release build on the same machine: 18%, 15% and 54% of the send.
+
+| Test | Runtimes | Result |
+| --- | --- | --- |
+| `tests/send_tail_room_sdk.rs`: UYVY and UYVA frames of nine sizes and the four scan types in memory that ends at an inaccessible page, with exactly the crate's room and with none, through every video send; and what the bytes after a frame do to the picture, as room, after a buffer and vouched for, with the SDK's reading of them pinned | Standard 6.1.1, 6.3.2 and 6.4.0.2 and Advanced 6.3.2 and 6.4.0.2 on x86-64; Standard 6.4.0.2 for 64-bit ARM under emulation | 2 of 2 passed on each |
+| The same, and `tests/video_padding_sdk.rs` sending from vectors that end with the frame, under Valgrind Memcheck | Standard 6.3.2 and 6.4.0.2 on x86-64 | No read or write outside an allocation with either runtime, apart from the four reports in glibc's dynamic loader with 6.3.2. The first test also draws reports of uninitialised values, 82 with 6.3.2 and 140 with 6.4.0.2, every one of them in memory the SDK allocated; the second draws none |
+
+With the room cut to one row, or to 24 bytes, or the copy disabled, the first
+test ends in a segmentation fault on x86-64.
+
+Programs of the same kind found nothing outside their buffers on any of the
+five x86-64 runtimes in the audio sends, planar and interleaved, over 644
+shapes of 1 to 16 channels and 1 to 1,920 samples, or in the V210, P216 and
+audio conversion utilities, over 1,218 cases with a guard before and after
+both buffers.
 
 ### Static checks
 
@@ -350,6 +464,12 @@ workflows and keeps the
 - Linux architectures other than x86_64.
 - Hardware-dependent behavior: PTZ devices, KVM devices, hardware codecs, and
   interoperability of compressed streams with other products.
+- How far the SDK reads past sent video on x86 processors without AVX2, on
+  32-bit x86 and 32-bit ARM, and on Windows, macOS, Android and iOS, where
+  its compressor may run other code. The crate gives those the room it
+  measured for x86-64 Linux, more than twice the furthest ordinary read.
+- Whether the SDK reads past the compressed frames an Advanced sender is
+  given, or writes past the buffers of a custom receive allocator.
 - License entitlements. A capability reported as available says only that the
   runtime exports the functions and has the required version.
 

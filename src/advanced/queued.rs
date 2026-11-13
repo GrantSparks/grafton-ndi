@@ -115,7 +115,7 @@ impl QueuedVideoFrame {
     /// to a compressed frame's bytes for as long as it holds the descriptor.
     fn raw(&mut self) -> NDIlib_video_frame_v2_t {
         match self {
-            Self::Pixels(v) => v.to_raw(),
+            Self::Pixels(v) => v.lend_raw(),
             Self::Compressed(v) => v.raw(),
         }
     }
@@ -502,8 +502,9 @@ impl QueuedSender {
                 frame,
             ));
         }
-        let bytes = frame.retained_bytes();
+        // Lending can grow a frame's pixel allocation: count it afterwards.
         let header = AliasableBox::new(Box::new(frame.raw()));
+        let bytes = frame.retained_bytes();
         let key = header.p_data as usize;
         let pointer = header.as_ptr();
         let id = {

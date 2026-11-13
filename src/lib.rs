@@ -193,6 +193,7 @@ mod capture;
 mod color_info;
 mod error;
 mod media;
+mod pixels;
 mod rejected;
 mod sys;
 mod time;

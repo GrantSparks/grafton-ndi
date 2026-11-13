@@ -10,9 +10,12 @@
 //! later SDK that changes any of this fails here, instead of silently
 //! changing snapshots.
 //!
-//! Run with `--config ci/offline.toml`, which keeps the SDK on loopback; the
-//! transport there is lossless, which the first check confirms before any
-//! conversion is judged.
+//! Run with `--config ci/offline.toml`, which keeps the SDK on loopback.
+//! Every conversion is judged against the UYVY frame a second receiver got
+//! from the same stream, so the tests do not depend on the transport being
+//! lossless. It is for these frames on Linux x86-64, which the first test
+//! pins; the 32-bit x86 and the Windows runtimes were seen not to return a
+//! 3840x2160 frame exactly.
 #![cfg(feature = "image-encoding")]
 
 mod common;
@@ -84,6 +87,17 @@ fn frame(
         .unwrap()
 }
 
+/// Stops a sending loop when the scope that waits for it ends, by return or
+/// by panic: a scope joins its threads either way, so a loop that only a
+/// later statement stops would hang a failed test instead of reporting it.
+struct StopOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Send `frames` in rotation from one new sender, and receive from it in
 /// each of `formats` until every receiver holds a copy of each frame, which
 /// its metadata identifies. Returns one list a receiver, in `frames`' order.
@@ -110,7 +124,8 @@ fn round_trip(
                 std::thread::sleep(Duration::from_millis(40));
             }
         });
-        let received = formats
+        let _stop = StopOnDrop(&stop);
+        let received: Vec<Vec<VideoFrame>> = formats
             .iter()
             .map(|&format| {
                 let receiver = Receiver::new(
@@ -125,7 +140,6 @@ fn round_trip(
                 )
             })
             .collect();
-        stop.store(true, Ordering::Relaxed);
         received
     })
 }
@@ -189,6 +203,18 @@ fn frame_rgb(frame: &VideoFrame) -> Vec<[u8; 3]> {
         .collect()
 }
 
+/// The largest and the mean difference between two buffers of one length.
+fn byte_difference(a: &[u8], b: &[u8]) -> (u8, f64) {
+    assert_eq!(a.len(), b.len());
+    let (mut largest, mut total) = (0, 0u64);
+    for (a, b) in a.iter().zip(b) {
+        let d = a.abs_diff(*b);
+        largest = largest.max(d);
+        total += u64::from(d);
+    }
+    (largest, total as f64 / a.len() as f64)
+}
+
 /// The largest and the mean difference between two images.
 fn difference(a: &[[u8; 3]], b: &[[u8; 3]]) -> (u8, f64) {
     assert_eq!(a.len(), b.len());
@@ -225,10 +251,20 @@ fn the_sdk_converts_with_bt709_at_every_size_whatever_the_tag_says() {
         );
         for ((sent, uyvy), rgbx) in sent.iter().zip(&received[0]).zip(&received[1]) {
             let case = format!("{width}x{height} {:?}", sent.metadata());
-            // The loopback transport is lossless, or nothing below can be
-            // judged.
+            // Both receivers decode one stream, so the UYVY frame is what the
+            // SDK converted to RGBX, whether or not it is the frame sent. It
+            // is the picture sent to within the codec's loss, which is none
+            // where that was measured.
             assert_eq!(uyvy.pixel_format(), PixelFormat::Uyvy, "{case}");
-            assert!(uyvy.data() == sent.data(), "{case}: the loopback assumption failed: the received UYVY differs from the sent frame");
+            let (largest, mean) = byte_difference(uyvy.data(), sent.data());
+            assert!(mean <= 2.0, "{case}: the received UYVY is not the frame sent: it differs by up to {largest}, {mean:.3} on average");
+            if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                assert_eq!(
+                    (largest, mean),
+                    (0, 0.0),
+                    "{case}: the loopback transport was lossless for this frame on Linux x86-64"
+                );
+            }
             // The tag reaches both receivers unchanged.
             assert_eq!(
                 uyvy.color_info().unwrap(),
@@ -469,6 +505,7 @@ fn framesync_frames_encode_like_the_frames_sent() {
                 std::thread::sleep(Duration::from_millis(40));
             }
         });
+        let _stop = StopOnDrop(&stop);
         let receiver = Receiver::new(
             &ndi,
             &ReceiverOptions::new(source).color_format(ReceiverColorFormat::UyvyBgra),
@@ -490,6 +527,5 @@ fn framesync_frames_encode_like_the_frames_sent() {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        stop.store(true, Ordering::Relaxed);
     });
 }

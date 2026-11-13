@@ -309,11 +309,13 @@ fn live_yuv_frames_encode_from_sdk_rows() {
         ImageOptions::new(ImageFormat::WebpLossless),
     ];
     let (width, height) = (642usize, 32usize);
+    // Levels that change slowly, as a picture's do: every byte of a row
+    // differs from its neighbours' rows, which is all the comparison needs.
     let uyvy: Vec<u8> = (0..width * height * 2)
-        .map(|i| (i * 7 % 200 + 16) as u8)
+        .map(|i| (64 + (i >> 10) % 128) as u8)
         .collect();
     let p216: Vec<u8> = (0..width * height * 2)
-        .flat_map(|i| (((i * 13 % 200 + 16) as u16) << 8).to_ne_bytes())
+        .flat_map(|i| (((64 + (i >> 9) % 128) as u16) << 8).to_ne_bytes())
         .collect();
     for (format, data, color_formats) in [
         (
@@ -327,13 +329,13 @@ fn live_yuv_frames_encode_from_sdk_rows() {
             [ReceiverColorFormat::Best, ReceiverColorFormat::UyvyBgra],
         ),
     ] {
-        // The 6.3.2 SDK's UYVY sender was measured under Memcheck to read up
-        // to 28 bytes past the end of a frame whose buffer holds it exactly.
-        // Slack after the frame keeps this test about the encoders.
-        let len = data.len();
-        let mut buffer = data;
-        buffer.resize(len + 64, 0);
-        let sent = BorrowedVideoFrame::builder(&buffer[..len], width as u32, height as u32, format)
+        // The vector ends with the frame. The SDK reads up to 28 bytes past
+        // a UYVY frame of this width, which the owned frame gives it room
+        // for: under Memcheck, a read past the room is an error.
+        let sent = VideoFrame::builder()
+            .resolution(width as u32, height as u32)
+            .pixel_format(format)
+            .data(data)
             .build()
             .unwrap();
         let sender = Sender::new(
@@ -347,10 +349,19 @@ fn live_yuv_frames_encode_from_sdk_rows() {
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 while !stop.load(Ordering::Relaxed) {
-                    sender.send_video(sent).unwrap();
+                    sender.send_video(&sent).unwrap();
                     std::thread::sleep(Duration::from_millis(20));
                 }
             });
+            // A scope joins its threads even when it unwinds: stop the loop
+            // then too, or a failed test would hang instead of reporting.
+            struct StopOnDrop<'a>(&'a AtomicBool);
+            impl Drop for StopOnDrop<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Relaxed);
+                }
+            }
+            let _stop = StopOnDrop(&stop);
             for color_format in color_formats {
                 let receiver = Receiver::new(
                     &ndi,
@@ -390,7 +401,6 @@ fn live_yuv_frames_encode_from_sdk_rows() {
                     );
                 }
             }
-            stop.store(true, Ordering::Relaxed);
         });
     }
 }
