@@ -8,13 +8,14 @@
 //! # Supported NDI versions and platforms
 //!
 //! The crate works with NDI 6 runtimes from the Standard and the Advanced SDK,
-//! and needs Rust 1.88 or later. Version 3.0 was tested against the Standard
-//! 6.1.1 and the Standard and Advanced 6.3.2 and 6.4.0.2 runtimes on Linux
-//! x86_64, and its bindings are generated from the 6.4.0.2 headers. Other NDI 6
-//! releases have not been tested. A runtime provides only what its version
-//! offers: an operation it cannot perform returns
-//! [`Error::UnsupportedCapability`], and [`Ndi::capabilities`] reports each
-//! capability in advance.
+//! and needs Rust 1.88 or later. Its bindings are generated from the 6.4.0.2
+//! headers. CI tests it against real runtimes: the Standard 6.1.1 and the
+//! Standard and Advanced 6.3.2 and 6.4.0.2 on Linux x86_64, the same 6.3.2 and
+//! 6.4.0.2 runtimes on macOS arm64 and Windows x64, and 6.4.0.2 on Linux x86
+//! and arm64, macOS x86_64 and Windows x86. Other NDI 6 releases are not
+//! tested. A runtime provides only what its version offers: an operation it
+//! cannot perform returns [`Error::UnsupportedCapability`], and
+//! [`Ndi::capabilities`] reports each capability in advance.
 //!
 //! Windows, macOS, Linux and Android load the NDI runtime library when a
 //! runtime is selected, searching next to the executable, then
@@ -31,7 +32,7 @@
 //!
 //! The [README](https://github.com/GrantSparks/grafton-ndi#supported-ndi-versions-and-platforms)
 //! lists the Rust targets, what each NDI version provides, and how each target
-//! was checked.
+//! is checked.
 //!
 //! # Quick Start
 //!

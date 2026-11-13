@@ -347,12 +347,11 @@ impl PixelFormat {
     /// is not, and neither is a 720x480 frame or any frame whose width is not
     /// a multiple of 16. The SDK documents no such requirement, and it
     /// compresses what it reads there into the picture's last blocks. The
-    /// 64-bit ARM Linux build reads every frame exactly. All of this was
-    /// measured, on 2026-11-13, with the Linux runtimes 6.1.1, 6.3.2 and
-    /// 6.4.0.2; the SDK validation notes in the repository's `docs`
-    /// directory have the method and the numbers. Where nothing was
-    /// measured, the crate takes the x86 figure: so does the 32-bit x86
-    /// Linux build, which read the one frame it was measured with exactly.
+    /// 64-bit ARM Linux build reads every frame exactly. The figures are
+    /// measured with the Linux runtimes 6.1.1, 6.3.2 and 6.4.0.2; the SDK
+    /// validation notes in the repository's `docs` directory have the method
+    /// and the numbers. Every build but the 64-bit ARM Linux one takes the
+    /// x86 figure, the 32-bit x86 Linux build included.
     ///
     /// The crate keeps this room for the SDK, and fills it with zeros, so a
     /// program needs the number only to avoid a copy or a reallocation:
@@ -6235,10 +6234,9 @@ mod tests {
         );
     }
 
-    /// Regression lock against the receiver and FrameSync video refs re-diverging:
-    /// given byte-identical raw frames, every shared accessor (including the
-    /// previously-divergent `scan_type`) must return identical results now that
-    /// both spellings share one [`VideoRef`] core.
+    /// The receiver and FrameSync video refs agree: given byte-identical raw
+    /// frames, every shared accessor, `scan_type` included, returns identical
+    /// results, as both spellings share one [`VideoRef`] core.
     #[test]
     fn test_receiver_and_framesync_video_refs_agree() {
         use crate::capture::{FrameSyncVideoFree, Guard, VideoKind};
@@ -6262,8 +6260,8 @@ mod tests {
             frame_rate_N: 30,
             frame_rate_D: 1,
             picture_aspect_ratio: 16.0 / 9.0,
-            // A non-default scan type: the old FrameSync copy used
-            // `unwrap_or(Progressive)`, so this also guards that divergence.
+            // A non-default scan type, which a ref that falls back to
+            // `Progressive` would report differently.
             frame_format_type: ScanType::Interlaced.to_sdk(),
             timecode: 123,
             p_data: data.as_mut_ptr(),

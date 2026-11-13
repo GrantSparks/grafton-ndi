@@ -694,10 +694,10 @@ pub enum RawCapture {}
 /// Raw audio capture on the attached receiver would compete with the
 /// synchronizer for the receiver's audio: each audio frame reaches only one
 /// of them. Measured with NDI 6.3.2 and 6.4 over loopback, raw capture
-/// interleaved with FrameSync pulls took most of a 30 fps stream's audio
-/// frames, none of which then reached the FrameSync, which returned silence
-/// in their place. Metadata is not taken that way: every metadata frame still
-/// reached the receiver's own capture while the FrameSync pulled video and
+/// interleaved with FrameSync pulls takes most of a 30 fps stream's audio
+/// frames, none of which then reach the FrameSync, which returns silence in
+/// their place. Metadata is not taken that way: every metadata frame still
+/// reaches the receiver's own capture while the FrameSync pulls video and
 /// audio.
 #[derive(Debug)]
 pub enum FrameSyncAttached {}
@@ -2993,12 +2993,12 @@ mod tests {
     }
 
     /// `poll_event` gives each SDK call one poll interval of its timeout at
-    /// most, where one call used to be given all of it.
+    /// most.
     ///
     /// What each call is given, and that the poll ends only once the budget
     /// is spent, hold however long the SDK then takes. How many calls fit in
-    /// the budget does not: on a loaded runner the SDK overran its waits, and
-    /// only two fitted. The count is the capture loop's, which the
+    /// the budget does not: on a loaded runner the SDK can overrun its waits,
+    /// so that only two fit. The count is the capture loop's, which the
     /// clock-driven tests below check, such as
     /// `retry_follows_a_full_wait_at_once`.
     #[test]

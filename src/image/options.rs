@@ -106,9 +106,9 @@ impl ImageFormat {
 /// # Color
 ///
 /// YUV frames are converted with BT.709, limited range and repeated chroma,
-/// as the NDI 6.4 SDK was measured to convert at every frame size, unless the
-/// frame's `ndi_color_info` metadata ([`ColorInfo`](crate::ColorInfo)) names
-/// another matrix: the encoder then follows the tag, which the SDK ignores.
+/// as the NDI 6.4 SDK converts at every frame size, unless the frame's
+/// `ndi_color_info` metadata ([`ColorInfo`](crate::ColorInfo)) names another
+/// matrix: the encoder then follows the tag, which the SDK ignores.
 /// [`ColorPolicy::Override`] replaces the matrix and range. The coefficients
 /// are exact, so white is 255 where the SDK's own RGB output gives 253. See
 /// [`ColorPolicy`].
@@ -265,13 +265,13 @@ pub enum ColorPolicy {
     /// unless the frame's `ndi_color_info` metadata names another matrix,
     /// which is then used.
     ///
-    /// The NDI 6.4 SDK was measured to use BT.709 limited range for every
-    /// frame size, in both directions, whatever the frame's metadata says,
-    /// although its manual describes BT.601 for SD and BT.2020 for UHD. A
-    /// frame tagged with another matrix, BT.2020 for example, therefore
-    /// encodes correctly here but shows BT.709 coefficients in an RGB
-    /// receiver of the same source. An untagged BT.601 source, such as older
-    /// SD hardware, needs [`ColorPolicy::Override`].
+    /// The NDI 6.4 SDK uses BT.709 limited range for every frame size, in
+    /// both directions, whatever the frame's metadata says, although its
+    /// manual describes BT.601 for SD and BT.2020 for UHD. A frame tagged
+    /// with another matrix, BT.2020 for example, therefore encodes correctly
+    /// here but shows BT.709 coefficients in an RGB receiver of the same
+    /// source. An untagged BT.601 source, such as older SD hardware, needs
+    /// [`ColorPolicy::Override`].
     ///
     /// A frame whose `ndi_color_info` cannot be read is refused with
     /// [`Error::InvalidFrame`](crate::Error::InvalidFrame), so the encoder
@@ -353,11 +353,11 @@ pub enum AlphaMode {
 /// | `bt_2100_hlg` | [`Error::InvalidFrame`] | PNG of the HLG code values, tagged |
 ///
 /// The check applies to every pixel format, RGB as well as YUV: an RGB
-/// receiver of a PQ source was measured to get the PQ code values, with the
-/// tag still attached. Nothing tone-maps. A program that wants an SDR
-/// rendering of HDR video makes it itself, from a 16-bit PNG or from the
-/// frame, and [`color_info`](crate::VideoFrame::color_info) lets it check a
-/// frame before encoding it.
+/// receiver of a PQ source gets the PQ code values, with the tag still
+/// attached. Nothing tone-maps. A program that wants an SDR rendering of HDR
+/// video makes it itself, from a 16-bit PNG or from the frame, and
+/// [`color_info`](crate::VideoFrame::color_info) lets it check a frame before
+/// encoding it.
 ///
 /// This enum is marked `#[non_exhaustive]` so that policies can be added
 /// without a breaking change.

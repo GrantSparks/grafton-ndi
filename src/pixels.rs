@@ -17,11 +17,11 @@ use crate::{frames::ValidatedVideoLayout, ScanType};
 ///
 /// It is the format's [room](crate::PixelFormat::send_tail_room), and two
 /// rows more for an interlaced or single-field frame whose height is not a
-/// multiple of four: the x86 SDK was measured to read as far as the end of
-/// the row after next past such UYVY frames, and never past a height that is
-/// a multiple of four by more than the format's room. The conditions it does
-/// so under, which include the frame's area, are not modeled: every such
-/// frame gets the rows.
+/// multiple of four: the x86 SDK reads as far as the end of the row after
+/// next past such UYVY frames, and never past a height that is a multiple of
+/// four by more than the format's room. The conditions it does so under,
+/// which include the frame's area, are not modeled: every such frame gets the
+/// rows.
 pub(crate) fn send_room(layout: &ValidatedVideoLayout, scan: ScanType) -> usize {
     let room = layout.pixel_format.send_tail_room();
     if room == 0 || scan == ScanType::Progressive || layout.height.is_multiple_of(4) {

@@ -106,11 +106,9 @@ formats encodes, with the default options, to the same bytes as in
 grafton-ndi 2.0. Unit tests hold
 SHA-256 hashes of 2.0's PNG and JPEG output to keep it so.
 
-Lossy WebP is not offered. No pure-Rust encoder met the crate's constraints
-when 3.0 was made: a permissive licence, no `unsafe`, and Rust 1.88. At JPEG
-85's quality it measured 17 to 36% smaller than JPEG on camera content and
-about 80% smaller on graphics, so it can be added in a 3.x release once one
-exists; `ImageFormat` is `#[non_exhaustive]`.
+Lossy WebP is not offered: no pure-Rust encoder meets the crate's
+constraints, a permissive licence, no `unsafe`, and Rust 1.88. It can be added
+in a 3.x release once one exists; `ImageFormat` is `#[non_exhaustive]`.
 
 ## Color
 
@@ -138,8 +136,7 @@ flat content exactly:
 The NDI manual's table, BT.601 for SD, BT.709 for HD and BT.2020 for UHD,
 describes neither conversion the 6.4 SDK performs, so the encoder does not
 follow it. `tests/image_color_sdk.rs` pins these findings against a real
-runtime; it passed on the Standard 6.1.1, 6.3.2 and 6.4.0.2 runtimes and the
-Advanced 6.4.0.2 runtime.
+runtime.
 
 What follows:
 
@@ -217,9 +214,9 @@ match frame.color_info()? {
   `Error::InvalidInput`: neither can say what its numbers mean.
 - Nothing tone-maps. A program that wants an SDR rendering of HDR video makes
   it itself, from a 16-bit PNG or from the frame.
-- The Standard 6.4 runtime passed PQ-tagged P216 frames, tag intact, from its
-  sender to its receivers on loopback, although the manual says the Standard
-  SDK cannot send HDR metadata.
+- On Linux the Standard 6.4 runtime passes PQ-tagged P216 frames, tag intact,
+  from its sender to its receivers on loopback, although the manual says the
+  Standard SDK cannot send HDR metadata.
 
 ### Tagging a PNG
 
@@ -325,8 +322,8 @@ recording of a 1280×720 source:
 
 | Question | Finding |
 | --- | --- |
-| Does a played frame keep its sender's timecode? | Yes: the `FirstFrame` event's source timecode equalled the next frame's, at the start and after each of 15 seeks |
-| Which frame arrives first after a seek? | Whatever the receiver had queued; the target frame followed within milliseconds |
+| Does a played frame keep its sender's timecode? | Yes: the `FirstFrame` event's source timecode equals the next frame's, at the start and after a seek |
+| Which frame arrives first after a seek? | Whatever the receiver has queued; the target frame follows within milliseconds |
 | Can a receiver use `player.advertised_source()`? | No: it has no address. A `Finder` in the player's groups lists the source with one |
 | Does a `Lowest`-bandwidth receiver get video? | Only from a recording with a proxy track |
 

@@ -112,8 +112,8 @@ fn room(format: PixelFormat, width: u32, height: u32, scan: ScanType) -> usize {
 
 /// Frames whose buffers end at the last byte the process can read are sent
 /// by every path that takes one, in every scan type, at sizes where the x86
-/// SDK was measured to read from 4 bytes to two rows past the frame: first
-/// with exactly the room the crate keeps, in place, and then with none.
+/// SDK reads from 4 bytes to two rows past the frame: first with exactly the
+/// room the crate keeps, in place, and then with none.
 ///
 /// Where the SDK needs room, the first pins how much. Where it needs none,
 /// both send in place and pin that it reads frames exactly.
@@ -236,14 +236,13 @@ fn received(ndi: &Ndi, label: &str, frame: BorrowedVideoFrame<'_>) -> Vec<u8> {
 /// that ends with its frame, the sender's copy puts zeros there.
 ///
 /// The first assertion pins the SDK's behavior on this architecture. When it
-/// fails, the SDK reads a 642-pixel UYVY row differently than it was measured
-/// to, and `PixelFormat::send_tail_room` must be measured again.
+/// fails, the SDK reads a 642-pixel UYVY row differently than the crate
+/// assumes, and `PixelFormat::send_tail_room` must be measured again.
 ///
-/// Which builds read past is measured, and is not the same question as which
-/// get room: the x86-64 build reads past this frame; the 64-bit ARM build
-/// reads it exactly and gets no room; the 32-bit x86 build reads it exactly
-/// too, but has been measured at no other size, so it keeps the x86 room that
-/// the crate gives every build it has not measured.
+/// Which builds read past is not the same question as which get room: the
+/// x86-64 build reads past this frame; the 64-bit ARM build reads it exactly
+/// and gets no room; the 32-bit x86 build reads it exactly too, but keeps the
+/// x86 room, which the crate gives every build but 64-bit ARM Linux.
 #[test]
 fn bytes_after_a_buffer_reach_the_picture_only_as_room() {
     let Some(ndi) = common::ndi() else {

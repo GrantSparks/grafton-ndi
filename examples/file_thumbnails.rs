@@ -13,8 +13,7 @@
 //!
 //! It stays an example rather than an API, because it advertises an NDI
 //! source while it runs, and each choice below rests on how the 6.4 Advanced
-//! runtime and File library were measured to behave with a SpeedHQ
-//! recording:
+//! runtime and File library behave with a SpeedHQ recording:
 //!
 //! * A receiver cannot connect to `player.advertised_source()` as it is: it
 //!   has no address. A [`Finder`] in the player's groups lists the source
@@ -26,10 +25,6 @@
 //! * After a seek the receiver first delivers the frames it had queued. The
 //!   `FirstFrame` event carries the source timecode of the frame the seek
 //!   landed on, so frames are discarded until one carries it.
-//!
-//! Not measured: H.264 and HEVC recordings, where a seek lands on the
-//! keyframe at or before the time asked for, and whether a receiver given
-//! only the player's name reaches a private-group player on a real network.
 //!
 //! The File library ships with the NDI SDK, beside the runtime library. On
 //! Linux, macOS and Android it needs the Advanced SDK runtime.

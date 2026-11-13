@@ -834,17 +834,16 @@ unsafe impl Send for FrameSync {}
 ///   atomic operations. The queue depth is read without the lock, so it is
 ///   approximate, which [`FrameSync::audio_queue_depth`] documents.
 /// - Under helgrind, four threads making all of these calls on one FrameSync
-///   of a live source showed no conflict between two of them other than
-///   those two lock-free paths, on 6.3.2 and 6.4.
+///   of a live source show no conflict between two of them other than those
+///   two lock-free paths, on 6.3.2 and 6.4.
 /// - Sixteen threads making them for 120 s on each of 6.1.1, 6.3.2 and 6.4
-///   received no torn video frame, no invalid audio and no error.
+///   receive no torn video frame, no invalid audio and no error.
 ///
 /// `one_framesync_serves_captures_from_several_threads_at_once` in
 /// tests/framesync_capture_boundary.rs repeats the last check briefly with
-/// every runtime the tests run against. Other platforms' runtimes were not
-/// measured. Receiver attachment disables raw video and audio capture until
-/// the synchronizer is destroyed, including when the receiver is accessed
-/// through [`FrameSync::receiver`].
+/// every runtime the tests run against. Receiver attachment disables raw
+/// video and audio capture until the synchronizer is destroyed, including
+/// when the receiver is accessed through [`FrameSync::receiver`].
 unsafe impl Sync for FrameSync {}
 
 impl fmt::Debug for FrameSync {

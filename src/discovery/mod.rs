@@ -31,8 +31,8 @@
 //!   receiver it names, in this process or another, when that receiver
 //!   connects at the same moment. To stop receiving a receiver's events, drop
 //!   the listener; this crate's listeners never unsubscribe on their own.
-//! * Destroying a [`SendAdvertiser`] blocked forever once in about a million
-//!   destroys under heavy load.
+//! * Destroying a [`SendAdvertiser`] can block forever, about once in a
+//!   million destroys under heavy load.
 //! * A listener that does not find its server on its first attempt, such as
 //!   one created before the server appeared, connects on a later attempt but
 //!   then never lists the senders or receivers registered before it

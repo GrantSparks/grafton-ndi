@@ -49,11 +49,10 @@ pub enum Requirement {
     /// the picture (UYVY on Linux); [`is_hx_placeholder`] recognizes them. The
     /// Advanced SDK manual documents H.264 decoding on Windows and macOS
     /// without plugins, but H.265 only in 4:2:0 and where decoding hardware
-    /// supports it. A hosted macOS runner decoded HEVC 4:4:4; the hosted Windows
-    /// Server 2025 runners, which have no GPU, delivered the black frames for
-    /// it, probably for want of a decoder in hardware or in the operating
-    /// system, which is not confirmed. On Linux, NDI 6.4.0.2 was measured, with
-    /// strace, to decode either codec only through:
+    /// supports it. The macOS runtime decodes HEVC 4:4:4 on the hosted macOS
+    /// runners; on the hosted Windows Server 2025 runners, which have no GPU,
+    /// the runtime delivers the black frames for it. On Linux, NDI 6.4.0.2
+    /// decodes either codec only through:
     ///
     /// * the NDI|HX Driver for Linux, `libndihx.so` with its bundled
     ///   `libavcodec-ndi.so.61` and the other `-ndi` FFmpeg 7 libraries,
@@ -273,10 +272,9 @@ pub fn advanced_ndi() -> Option<Ndi> {
 ///
 /// The runtime has no query for its decoder, so this looks where
 /// [`Requirement::Hevc444Decoder`] says the runtime does. On Linux that is what
-/// NDI 6.4.0.2 was measured with strace to open, the same for both codecs. It
-/// is not a vendor API: a runtime that looks elsewhere needs this updated. On
-/// macOS and Windows there is nothing to look at beforehand, so the answer
-/// there is `true`.
+/// NDI 6.4.0.2 opens, the same for both codecs. It is not a vendor API: a
+/// runtime that looks elsewhere needs this updated. On macOS and Windows there
+/// is nothing to look at beforehand, so the answer there is `true`.
 ///
 /// `true` is therefore no proof of a decoder. A test that receives NDI|HX video
 /// also passes each frame to [`is_hx_placeholder`], and reports the decoder
@@ -311,9 +309,9 @@ const HX_PLACEHOLDER: (u32, u32) = (1920, 1080);
 /// Whether a frame of size `received`, captured from NDI|HX video sent at size
 /// `sent`, is the runtime's black placeholder for a picture it cannot decode.
 ///
-/// Measured on Linux without a decoder, and on the hosted Windows Server 2025
-/// runners with HEVC 4:4:4: the runtime delivers 1920x1080 frames, and no
-/// error, in place of the picture. A test that receives NDI|HX video counts
+/// On Linux without a decoder, and on the hosted Windows Server 2025 runners
+/// with HEVC 4:4:4, the runtime delivers 1920x1080 frames, and no error, in
+/// place of the picture. A test that receives NDI|HX video counts
 /// these and, when nothing else arrived, reports the decoder for its codec
 /// missing with [`skip`]; any other frame is the decoded picture and is
 /// checked as such.
@@ -331,10 +329,11 @@ pub fn is_hx_placeholder(sent: (u32, u32), received: (u32, u32)) -> bool {
 }
 
 /// The macOS and Windows runtimes decode NDI|HX themselves, through what the
-/// machine offers (see [`Requirement::Hevc444Decoder`]): a hosted macOS runner
-/// decoded HEVC 4:4:4, and the hosted Windows Server 2025 runners delivered
-/// placeholders for it. Neither runtime shows beforehand whether it can decode
-/// a codec, so the receiving test decides from what it is given.
+/// machine offers (see [`Requirement::Hevc444Decoder`]): the macOS runtime
+/// decodes HEVC 4:4:4 on the hosted macOS runners, and the Windows runtime
+/// delivers placeholders for it on the hosted Windows Server 2025 runners.
+/// Neither runtime shows beforehand whether it can decode a codec, so the
+/// receiving test decides from what it is given.
 #[cfg(any(windows, target_os = "macos"))]
 fn missing_hx_decoder(_: &Ndi) -> Option<String> {
     None

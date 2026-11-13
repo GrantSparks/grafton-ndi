@@ -272,9 +272,9 @@ def checkable(target, pin, *, all_features, headers=None, driver=None, decoders=
     need an NDI|HX decoder, and the HEVC one a 6.4 runtime for its Best444
     receiver. The macOS runtime decodes both itself; on Linux the decoder is the
     NDI|HX driver of the runtime's release. The Windows runtime decodes H.264
-    itself (every hosted Windows Advanced row decoded it in run 43342188690), but
-    the hosted Windows runners delivered the runtime's black placeholder frames
-    instead of HEVC 4:4:4, so the HEVC test runs there without being counted.
+    itself, but on the hosted Windows runners it delivers its black placeholder
+    frames instead of HEVC 4:4:4, so the HEVC test runs there without being
+    counted.
     `decoders=False` leaves both out, as the compatibility runs do.
     """
     platform, advanced = pin['platform'], pin['edition'] == 'advanced'

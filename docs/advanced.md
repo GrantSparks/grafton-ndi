@@ -613,10 +613,6 @@ The tests create their own senders and receivers and need no hardware. Those
 announce themselves on the network like any NDI program; `--config
 ci/offline.toml` confines them to loopback networking and needs `bubblewrap`.
 
-What the tests establish is limited to what they run. The Advanced runtime
-tests were run on Linux x86_64 with the Advanced SDK 6.3.2 and 6.4.0.2, each
-with its own headers and with the two crossed; see
-[SDK validation](sdk-validation.md). They do not
-cover KVM against a real source, allocator layouts for 4:2:0 and planar 4:4:4
-video, real codec bitstreams, license entitlements, long-running clock
-behavior, or any other platform.
+CI runs them against the Advanced runtimes that the README's
+[Platforms](../README.md#platforms) table lists. They do not cover KVM against
+a real source, real codec bitstreams or license entitlements.

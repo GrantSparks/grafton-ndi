@@ -381,7 +381,7 @@ The helpers live in `src/test_support.rs`. Unit tests use them as
 | --- | --- |
 | `ndi()` | no NDI runtime library can be loaded |
 | `advanced_ndi()` | the runtime is not an Advanced SDK runtime, or the build lacks the declarations for Advanced sender configuration |
-| `hx_decoder(&ndi, decoder)` | the runtime is known to have no NDI\|HX video decoder; `decoder` is `Requirement::H264Decoder` or `Requirement::Hevc444Decoder`, the codec the test sends. On Linux the helper loads `libndihx.so`, `libavcodec-ndi.so.61` or `libavcodec.so.61` from beside the runtime library or by name through the dynamic loader, which is where NDI 6.4.0.2 was measured to look. On Windows and macOS nothing shows it beforehand, so the helper answers `true` there. A test that receives NDI\|HX video therefore also passes each frame's size to `is_hx_placeholder`, and calls `skip(decoder, …)` when the runtime delivered nothing but its black 1920×1080 placeholder |
+| `hx_decoder(&ndi, decoder)` | the runtime is known to have no NDI\|HX video decoder; `decoder` is `Requirement::H264Decoder` or `Requirement::Hevc444Decoder`, the codec the test sends. On Linux the helper loads `libndihx.so`, `libavcodec-ndi.so.61` or `libavcodec.so.61` from beside the runtime library or by name through the dynamic loader, which is where NDI 6.4.0.2 looks. On Windows and macOS nothing shows it beforehand, so the helper answers `true` there. A test that receives NDI\|HX video therefore also passes each frame's size to `is_hx_placeholder`, and calls `skip(decoder, …)` when the runtime delivered nothing but its black 1920×1080 placeholder |
 | `skip(Requirement::…, reason)` | called directly by a test that found another requirement unmet, such as the File library or the Discovery Server |
 
 A skip is printed to standard error as `skipped: <test> needs <requirement>`,
@@ -394,8 +394,8 @@ A test that connects a receiver to a sender of its own process addresses the
 sender through `common::loopback_source(&ndi, &sender)`, or
 `common::loopback_endpoint(&ndi, name)` for a source it knows only by name.
 Both find the sender's port with a finder and name `127.0.0.1:<port>`. What
-the Windows runner does to keep receivers connecting, and what is still open
-there, is under "Windows" in the [CI guide](ci/README.md#windows).
+the Windows runner does to keep receivers connecting is under "Windows" in the
+[CI guide](ci/README.md#windows).
 When a receiver does not connect, `common::socket_table(port)` adds the operating
 system's view of that port to the failure message on Windows.
 
@@ -610,14 +610,15 @@ To adopt a newer NDI SDK:
    uses.
 5. Run the full test suite against the new runtime and against the oldest
    retained runtime of each edition (Standard 6.1.1 and Advanced 6.3.2 on
-   Linux), with the headers and runtimes crossed and with the peer test, and
-   record the results in [docs/sdk-validation.md](docs/sdk-validation.md).
-6. Update the version tables in the [README](README.md#supported-ndi-versions-and-platforms).
+   Linux), with the headers and runtimes crossed and with the peer test.
+6. Update the version and platform tables in the
+   [README](README.md#supported-ndi-versions-and-platforms), stating for each
+   platform whether the tests run against a real runtime or the crate is only
+   compiled and linted, and list each new SDK defect under its
+   [known issues](README.md#known-issues).
 
-The crate supports NDI 6 runtimes. Record what was measured for each platform:
-tests run against a real runtime, or compiled and linted only. A passing symbol
-or layout check does not prove callback lifetimes, codec interoperability or
-hardware behavior.
+The crate supports NDI 6 runtimes. A passing symbol or layout check does not
+prove callback lifetimes, codec interoperability or hardware behavior.
 
 Never commit SDK archives, SDK headers, generated declarations of the Advanced
 SDK headers, or credentials.

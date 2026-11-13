@@ -476,7 +476,6 @@ confines them to loopback networking, and needs `bubblewrap`. The tests that
 check how the File library is found use stand-in libraries and need no SDK;
 they run on Linux only and need `rustc` on the `PATH`.
 
-The File tests were run on Linux x86_64 against the File library of the NDI
-6.4.0.2 SDK, beside the Advanced 6.4.0.2 runtime. The rules above for Windows,
-macOS, Android and the Apple mobile targets come from the SDK's libraries and
-the crate's code, and were not exercised by a test run.
+CI runs them against the File library of the NDI 6.4.0.2 SDK on Linux x86_64
+and macOS arm64 beside the Advanced runtime, and on Windows x64 beside either
+edition.

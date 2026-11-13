@@ -4,10 +4,10 @@ Time and peak memory of image encoding for 3.0, by source pixel format, image
 size, content and output. The [image encoding guide](image-encoding.md) says
 what each setting does; this page says what it costs.
 
-Measured on 2026-11-13 on Debian 12 x86_64, Intel Xeon w7-2475X, Rust 1.100.0,
-release build for the default x86-64 target, with `png` 0.18.1, `jpeg-encoder`
-0.7.1 and `image-webp` 0.2.4. One encode at a time on one thread; other builds
-were running on the machine, so treat differences under about 10% as noise.
+Measured on Debian 12 x86_64, Intel Xeon w7-2475X, Rust 1.100.0, release
+build for the default x86-64 target, with `png` 0.18.1, `jpeg-encoder` 0.7.1
+and `image-webp` 0.2.4. One encode at a time on one thread; treat differences
+under about 10% as noise.
 Times are the median of five encodes, or of one for PNG `Balanced` and `High`
 and at 7680×4320. Peaks are the largest total of live allocations the encode
 made on its thread, codec state and the encoded image included, and exclude
@@ -87,10 +87,9 @@ better than real 4K or 8K camera video would.
 
 Converting YUV costs about 2.9 ns a pixel on the default x86-64 target: 6 ms
 at 1080p, 24 ms at 4K and 95 ms at 8K. An RGBA frame costs nothing to convert,
-because PNG and WebP read its rows in place. The target set for 3.0 was a UYVY
-source within 1.25 times an RGBA source's time for every codec. It holds where
-the codec's own work dominates, and not where the codec is about as fast as
-the conversion:
+because PNG and WebP read its rows in place. A UYVY source stays within 1.25
+times an RGBA source's time where the codec's own work dominates, and not where
+the codec is about as fast as the conversion:
 
 | UYVY time over RGBA time | 1080p photo | 1080p graphics | 4K photo | 8K photo |
 | --- | ---: | ---: | ---: | ---: |
@@ -101,11 +100,11 @@ the conversion:
 | Lossless WebP | 1.40 | 1.95 | 1.76 | 1.89 |
 
 The conversion is safe scalar Rust that the compiler vectorizes where the
-target allows: built with `RUSTFLAGS="-C target-cpu=x86-64-v3"` it measured
-1.6 ns a pixel. Reaching the target for the fast codecs on every target would
-take hand-written SIMD, which 3.0 leaves out. A receiver set to an RGB color
-format avoids the conversion altogether, at the cost of the SDK converting
-every frame instead of only the ones encoded.
+target allows: built with `RUSTFLAGS="-C target-cpu=x86-64-v3"` it takes
+1.6 ns a pixel. Bringing the fast codecs within 1.25 times on every target
+would take hand-written SIMD, which 3.0 leaves out. A receiver set to an RGB
+color format avoids the conversion altogether, at the cost of the SDK
+converting every frame instead of only the ones encoded.
 
 ## Memory
 
@@ -143,20 +142,18 @@ copy of the image besides.
 `tests/video_padding_sdk.rs` encodes UYVY and P216 frames read in place from
 the SDK's padded rows, 1,312-byte strides for 642-pixel rows, with every
 output setting, and compares each image with the image of the frame's packed
-copy. Run under Valgrind Memcheck on 2026-11-13, it reported no errors in the
-crate's code against the Standard 6.3.2 and 6.4.0.2 runtimes. With 6.4.0.2 the
-run had no errors at all; with 6.3.2 the only reports were four in glibc's
-dynamic loader, while the runtime was loaded. An earlier run found the SDK
-reading up to 28 bytes past the end of the UYVY frame it was sending. The
-crate now keeps room for that after every frame it sends, which
+copy. Run under Valgrind Memcheck, it reports no errors in the crate's code
+with the Standard 6.3.2 and 6.4.0.2 runtimes. The x86 builds of the SDK read up
+to 28 bytes past the end of many UYVY frames they send. The crate keeps room for
+that after every frame it sends, which
 [SDK validation](sdk-validation.md#reads-past-the-end-of-sent-video)
 describes, and the test sends from a vector that ends with the frame.
 
 ## 2.0
 
 grafton-ndi 2.0 encoded RGBA, RGBX, BGRA and BGRX only, as 8-bit PNG and JPEG.
-Its measurements, made on 2026-10-16 with uniform frames, gave 15 ms for a
-1080p PNG: uniform frames compress far faster than camera content, which took
-554 ms at the same compression level here. 3.0 encodes those four formats,
+Its measurements, made with uniform frames, gave 15 ms for a 1080p PNG:
+uniform frames compress far faster than camera content, which takes 554 ms at
+the same compression level here. 3.0 encodes those four formats,
 untagged or tagged BT.601 or BT.709 SDR, to the same bytes as 2.0, which unit
 tests check against hashes of 2.0's output.

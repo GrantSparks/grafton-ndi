@@ -271,7 +271,7 @@ fn a_malformed_close_taken_by_finish_still_closes_the_session() {
 
 #[test]
 fn a_malformed_event_during_finish_does_not_end_the_wait_for_the_close() {
-    // The close comes well after the malformed event, which used to end the
+    // The close comes well after the malformed event, which must not end the
     // wait with an error.
     let device = mock::Recorder::new(Closing::After(Duration::from_millis(100)));
     let mut recorder = recording_on(&device);

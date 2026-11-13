@@ -193,9 +193,8 @@ as `None`. Most programs need changes; see the
   can bound `M: MetadataMode`, and the common controls keep `ReceiverMode`.
 - A FrameSync's receiver no longer captures audio: `framesync.receiver().audio()`
   does not compile, as its video capture already did not. The FrameSync reads
-  the same receiver audio, so each audio frame reached only one of them.
-  Measured with NDI 6.3.2 and 6.4, raw capture beside a FrameSync took most of
-  a 30 fps stream's audio, and the FrameSync returned silence in its place.
+  the same receiver audio, so each audio frame reached only one of them, and
+  the FrameSync returned silence for every frame the raw capture took.
   Capture audio with `FrameSync::capture_audio` or `capture_audio_ref`, or
   recover the receiver with `FrameSync::into_receiver`. Metadata capture and
   event polling on a FrameSync's receiver are unchanged.
@@ -530,9 +529,7 @@ as `None`. Most programs need changes; see the
   audio path reports an invalid sample rate with the same message.
 - On Windows, flushing one sender's async video (`flush_async_blocking`,
   `finish_video_async`, or dropping it with a frame in flight) no longer
-  waits for other senders' flushes. The process-wide lock that serialized
-  them dates from flushes that passed an empty frame instead of the null
-  frame pointer the SDK documents. Flushes of one sender were already
+  waits for other senders' flushes. Flushes of one sender were already
   serialized by that sender.
 
 ### Removed
@@ -572,9 +569,7 @@ as `None`. Most programs need changes; see the
     multiple of four, which the SDK reads up to two rows past, gets two line
     strides more room.
 
-  The measurements, on five x86-64 and four 64-bit ARM runtimes from 6.1.1
-  to 6.4.0.2, are in
-  [SDK validation](docs/sdk-validation.md#reads-past-the-end-of-sent-video).
+  See [SDK validation](docs/sdk-validation.md#reads-past-the-end-of-sent-video).
 - A status or source change that an `AsyncReceiver` capture passed over was
   kept for `Receiver::poll_event`, which async code could not reach, so it was
   never read. `AsyncReceiver::poll_event` returns it.
@@ -598,8 +593,7 @@ as `None`. Most programs need changes; see the
   `Duration::ZERO` polls without blocking. A wait shorter than a millisecond
   was a non-blocking poll, and the finder's, receiver's and packet receiver's
   deadline loops repeated 0 ms SDK calls through the last fraction of every
-  budget instead of waiting it out. The File API and the Discovery Server
-  listener already rounded up; all three now share one rule.
+  budget instead of waiting it out.
 - NV12 frames with an odd line stride are accepted by every path, as 2.0's
   `PixelFormatInfo::try_buffer_len`, now `buffer_len`, already accepted them:
   received frames, `BorrowedVideoFrame` and the Advanced allocators refused
@@ -613,26 +607,6 @@ as `None`. Most programs need changes; see the
   returns `None` only once its whole timeout is spent; `Duration::ZERO` still
   makes one non-blocking attempt. Every native receiver capture now takes the
   guard's proof as an argument, so none can be made without it.
-- After the thread of an async File player or recorder fails, the command it
-  was running, commands queued or submitted later, event waits and `close()`
-  all report `StateError::OwnerFailed`, as documented. Only `close()` did;
-  the others reported `StateError::Closed`, which now means only a handle that
-  was closed or whose thread stopped normally.
-- `FilePlayer::start`, `FileApi::probe` and the async player's `start` and
-  `probe` describe an empty or non-UTF-8 path as a "file path"; their errors
-  called it a "recording target".
-- A NUL in a string the File API passes to the SDK (a path, a source name or
-  URL, a player's name or groups, a filename pattern) is reported as
-  `Error::InvalidCString`, as everywhere else in the crate. It was
-  `Error::InvalidInput`.
-- `FileRecorder::inject_metadata` and the async recorder's `inject_metadata`
-  hand the SDK the `MetadataFrame`'s own text instead of a copy made for each
-  call, and no longer list `Error::InvalidInput`, which no `MetadataFrame`
-  could cause.
-- The File API's waits that poll more than once take every poll from one
-  budget, as the receiver's and sender's do. An async event wait whose end
-  cannot be represented on the platform fails with `Error::InvalidInput`
-  instead of panicking.
 
 ## [2.1.0] - 2026-11-13
 

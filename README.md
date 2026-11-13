@@ -15,11 +15,11 @@ The crate loads the NDI runtime library when the program selects a runtime and w
 **Evaluating the crate**
 
 - [What it covers](#what-it-covers) - The SDK functionality the crate wraps, area by area.
-- [Supported NDI versions and platforms](#supported-ndi-versions-and-platforms) - Which runtimes and targets were tested, which were only compiled, and which are unsupported.
+- [Supported NDI versions and platforms](#supported-ndi-versions-and-platforms) - Which runtimes and targets are tested, which are only compiled, and which are unsupported.
 - [Known issues](#known-issues) - Defects and limits of the NDI SDK, and what the crate does about each.
 - [Design approach](#design-approach) - How the crate wraps the SDK: checked function tables, one runtime per process, cleanup through ownership and validated frames.
 - [Performance and safety](#performance-and-safety) - Which frame APIs to use for which job, and the lifetime rules the compile-contract tests check.
-- [SDK validation](docs/sdk-validation.md) - What was run against which runtime, the measurements behind the version requirements, and how to repeat them.
+- [SDK validation](docs/sdk-validation.md) - What runs against which runtime, the measurements behind the version requirements, and how to repeat them.
 - [Changelog](CHANGELOG.md) - What 3.0 changes: compatibility, breaking changes, additions and fixes.
 
 **Using the crate**
@@ -53,7 +53,7 @@ The crate loads the NDI runtime library when the program selects a runtime and w
 | Other NDI 6 releases, including 6.0 | Not tested. | |
 | NDI 5 and earlier | Not supported. | |
 
-A tested version passed the whole test suite on Linux x86_64. The runs also crossed versions: a build made with one version's SDK ran against another version's runtime, and senders and receivers of different versions exchanged video, audio and metadata. [SDK validation](docs/sdk-validation.md) lists every run.
+CI runs the whole test suite against each tested version on the platforms that the [Platforms](#platforms) table lists for it. It also crosses versions: a build made with one version's SDK runs against another version's runtime, and senders and receivers of different versions exchange video, audio and metadata. See [SDK validation](docs/sdk-validation.md).
 
 The crate checks what the selected runtime provides before it calls into it. An operation that the runtime cannot perform returns `Error::UnsupportedCapability`, and the rest of the API keeps working. [Runtime capabilities](#runtime-capabilities-and-optional-apis) shows how to ask in advance. The Linux x86_64 runtimes report:
 
@@ -68,7 +68,7 @@ The crate checks what the selected runtime provides before it calls into it. An 
 | Advanced SDK operations (`advanced` feature), with an Advanced runtime | Not tested | Yes | Yes |
 | File API (`file-io` feature) | No | No | Yes |
 
-The 6.3.2 runtime exports the Discovery Server functions, but destroying an advertiser or listener there while it is connected to a server aborts the process, measured in every object type and with no call order that avoids it, so the crate refuses them before 6.4.0. [Known issues](#known-issues) lists this and the defects that 6.4 still has. The File library first ships with the 6.4 SDK. On Linux, macOS and Android it works only beside the Advanced runtime.
+The 6.3.2 runtime exports the Discovery Server functions, but destroying an advertiser or listener there while it is connected to a server aborts the process, whatever the order of calls, so the crate refuses them before 6.4.0. [Known issues](#known-issues) lists this and the defects that 6.4 still has. The File library first ships with the 6.4 SDK. On Linux, macOS and Android it works only beside the Advanced runtime.
 
 ### Platforms
 
@@ -109,14 +109,14 @@ iOS, tvOS and visionOS targets link the vendor's static archive into the applica
 
 ## Known issues
 
-These are defects and limits of the NDI SDK, not of this crate: measured on Linux x86_64 where a version is named, otherwise stated by the SDK's own documentation or API. None can be corrected from outside the SDK. Where a type or a check can keep an application clear of one, the crate does so; otherwise this list and the documentation of the affected methods say how to stay clear of it. [SDK validation](docs/sdk-validation.md#discovery-server-objects) and the [File API guide](docs/file-io.md#limits-of-the-ndi-64-file-library) record the measurements.
+These are defects and limits of the NDI SDK, not of this crate: measured where a version is named, on Linux x86_64 unless another platform is named, and otherwise stated by the SDK's own documentation or API. None can be corrected from outside the SDK. Where a type or a check can keep an application clear of one, the crate does so; otherwise this list and the documentation of the affected methods say how to stay clear of it. [SDK validation](docs/sdk-validation.md#discovery-server-objects) and the [File API guide](docs/file-io.md#limits-of-the-ndi-64-file-library) give details.
 
 ### Discovery Server
 
-- **Destroying an object aborts the process on 6.3.x.** On a 6.3.2 runtime, destroying a `SendAdvertiser`, `RecvAdvertiser`, `SendListener` or `RecvListener` while it is connected to a server aborts the process ("pure virtual method called"). No order of calls avoids it, so the crate refuses all four before NDI 6.4.0 with `Error::UnsupportedCapability`. 6.4.0.2 never aborted in the same tests.
+- **Destroying an object aborts the process on 6.3.x.** On a 6.3.2 runtime, destroying a `SendAdvertiser`, `RecvAdvertiser`, `SendListener` or `RecvListener` while it is connected to a server aborts the process ("pure virtual method called"). No order of calls avoids it, so the crate refuses all four before NDI 6.4.0 with `Error::UnsupportedCapability`. 6.4.0.2 does not abort.
 - **A quick re-registration crashes listeners (6.3.2 and 6.4.0.2).** Moving one sender or receiver from one advertiser to another on the same server within a few tens of milliseconds can crash a listener on that server, in any process. Wait about a second between unregistering and registering again, or drop the first advertiser before registering with the second.
 - **An unsubscribe can block a receiver's connect for good (6.3.2 and 6.4.0.2).** When a listener, in this process or another, unsubscribes from a receiver that a `RecvAdvertiser` registers while that receiver connects, its connect can block forever. Drop the listener to stop receiving a receiver's events; this crate's listeners never unsubscribe on their own.
-- **A send advertiser's destroy can hang (6.4.0.2).** Dropping a `SendAdvertiser` never returned once in about a million destroys under heavy load.
+- **A send advertiser's destroy can hang (6.4.0.2).** Dropping a `SendAdvertiser` can block for good, about once in a million drops under heavy load.
 - **A listener that connects late misses earlier registrations (6.4.0.2).** An advertiser or listener that finds no server tries again every 10 seconds. A listener that connects on such a later attempt lists only the senders and receivers registered after it connected. Create listeners once their server is up, or replace a listener that took ten seconds or more to report `is_connected`.
 
 ### Receiving and sending
@@ -585,7 +585,7 @@ let thumbnail = ImageOptions::new(ImageFormat::Jpeg(80)).downscale(Downscale::Qu
 let data_url = video.encode_image_data_url(&thumbnail)?;
 ```
 
-YUV frames are converted the way the NDI SDK was measured to convert: BT.709,
+YUV frames are converted as the NDI SDK converts them: BT.709,
 limited range and repeated chroma, unless the frame's `ndi_color_info`
 metadata names another matrix, which the encoder then follows. `ColorPolicy::Override` replaces the matrix
 and range. A frame tagged PQ or HLG is refused unless `HdrPolicy::CodeValues`
@@ -686,7 +686,7 @@ The `advanced` feature adds the `advanced` module. Using it needs three things:
 2. An NDI Advanced SDK on the build machine, in `NDI_SDK_DIR` or a default installation directory. The Advanced SDK headers may not be redistributed, so the build generates their declarations, types and constants locally with bindgen, which needs `libclang`; the crate itself carries only the signatures of the Advanced functions it calls. A build that finds an Advanced SDK and no `libclang` fails.
 3. An Advanced SDK runtime selected when the program runs.
 
-The module's API is the same whether or not the build found the Advanced SDK. Without it, or with a Standard runtime, each native operation returns `Error::UnsupportedCapability` with the reason. Older Advanced SDK headers disable only the operations they do not declare. The data types in the module, such as packets, envelopes and options, work in every build. The Advanced SDK 6.3.2 and 6.4.0.2 were tested; see [NDI versions](#ndi-versions).
+The module's API is the same whether or not the build found the Advanced SDK. Without it, or with a Standard runtime, each native operation returns `Error::UnsupportedCapability` with the reason. Older Advanced SDK headers disable only the operations they do not declare. The data types in the module, such as packets, envelopes and options, work in every build. The Advanced SDK 6.3.2 and 6.4.0.2 are tested; see [NDI versions](#ndi-versions).
 
 An operation that takes ownership of a receiver, a sender or a frame hands it back inside `grafton_ndi::Rejected<T>` when it fails. Custom receive allocators require `ndi.process_lifetime()`, an explicit opt-in that keeps NDI started until the process exits. See the [Advanced SDK guide](docs/advanced.md).
 
@@ -790,7 +790,7 @@ Set `GRAFTON_NDI_REQUIRE_RUNTIME` to turn skips into failures. Its value is a co
 | `file` | An NDI File library that the selected runtime can use. |
 | `discovery-server` | The SDK's `ndi-discovery-server` program beside the selected runtime, and an NDI 6.4.0 or later runtime. |
 | `h264-decoder` | A decoder for NDI\|HX H.264 video: on macOS and Windows, the runtime's own; on Linux, the NDI\|HX Driver for Linux or FFmpeg 7's `libavcodec` beside the runtime or on the loader's path. A runtime that delivers only its black 1920×1080 placeholder frames counts as having none. |
-| `hevc-444-decoder` | A decoder for NDI\|HX HEVC 4:4:4 video, as for `h264-decoder`, and an NDI 6.4.0 or later runtime. On Windows the runtime's own HEVC decoding depends on the machine, and GitHub's hosted Windows Server 2025 runners lacked it. |
+| `hevc-444-decoder` | A decoder for NDI\|HX HEVC 4:4:4 video, as for `h264-decoder`, and an NDI 6.4.0 or later runtime. On Windows the runtime's own HEVC decoding depends on the machine, and GitHub's hosted Windows Server 2025 runners lack it. |
 
 An entry that is not in this table fails the run. So does an entry that no test in the build can check, for example `advanced` without the `advanced` feature, or `discovery-server` on a target other than Linux.
 
