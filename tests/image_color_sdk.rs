@@ -145,6 +145,9 @@ fn round_trip(
     })
 }
 
+/// A received frame's size, pixel format and metadata.
+type Kind = (u32, u32, PixelFormat, Option<String>);
+
 /// Capture until a frame like each of `frames`, by metadata and size, has
 /// arrived.
 fn collect(
@@ -153,12 +156,39 @@ fn collect(
     what: &str,
 ) -> Vec<VideoFrame> {
     let mut found: Vec<Option<VideoFrame>> = vec![None; frames.len()];
+    // What arrived that matched no frame sent, with how many of each: for the
+    // message of a run where a frame never did.
+    let mut others: Vec<(Kind, usize)> = Vec::new();
+    let mut arrived = 0;
     let deadline = Instant::now() + Duration::from_secs(60);
     while found.iter().any(Option::is_none) {
-        assert!(Instant::now() < deadline, "{what}: not every frame arrived");
+        assert!(
+            Instant::now() < deadline,
+            "{what}: not every frame arrived: {arrived} frames arrived, {} of the {} sent \
+             among them, and these that match none: {others:?}",
+            found.iter().flatten().count(),
+            frames.len()
+        );
         let Some(frame) = capture(Duration::from_millis(500)) else {
             continue;
         };
+        arrived += 1;
+        let matched = frames.iter().any(|sent| {
+            (sent.width(), sent.height(), sent.metadata())
+                == (frame.width(), frame.height(), frame.metadata())
+        });
+        if !matched {
+            let key = (
+                frame.width(),
+                frame.height(),
+                frame.pixel_format(),
+                frame.metadata().map(str::to_owned),
+            );
+            match others.iter_mut().find(|(seen, _)| *seen == key) {
+                Some((_, count)) => *count += 1,
+                None => others.push((key, 1)),
+            }
+        }
         for (sent, slot) in frames.iter().zip(&mut found) {
             if (sent.width(), sent.height(), sent.metadata())
                 == (frame.width(), frame.height(), frame.metadata())
