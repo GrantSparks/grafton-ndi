@@ -12,12 +12,22 @@
 # 127.0.0.1:<port> in any case, and the name-lock files that the Linux runner
 # isolates have only been observed on Linux.
 #
-# The SDK is given a configuration, through NDI_CONFIG_DIR, that only turns on
-# its own log. The log names the port each sender listens on, the address each
-# receiver connects to and whether it connected, and the transport it receives
-# over. It is printed when the executable fails: here the SDK sees the machine's
-# network adapter and, unlike under the Linux and macOS runners, is given no
-# loopback-only address to use, and a test's messages cannot show which it used.
+# The SDK is given a configuration, through NDI_CONFIG_DIR, that keeps it on
+# loopback as the Linux and macOS runners do: discovery through a loopback
+# discovery address instead of multicast DNS, as macos.sh configures it, and no
+# network adapter but loopback. The rules alone leave the SDK the machine's
+# network adapter, and its multicast DNS, to try and be blocked on: in run
+# 43362984849, under the rules and with the log as the only setting, 44 and 49
+# of 100 receivers of tests/peer_recreation.rs never connected to a sender of
+# their own process on 127.0.0.1, against none of 100 with the firewall off.
+# GRAFTON_NDI_CI_SDK_NETWORK selects part of that configuration, to tell the
+# two settings apart: `loopback` (both, the default), `discovery` or `adapters`
+# (one of them), or `unrestricted` (neither).
+#
+# The configuration also turns on the SDK's own log, which names the port each
+# sender listens on, the address each receiver connects to and whether it
+# connected, and the transport it receives over. It is printed when the
+# executable fails.
 $ErrorActionPreference = 'Stop'
 
 # `$program, $arguments = $args` would make $arguments a scalar string when exactly
@@ -76,8 +86,20 @@ $log = Join-Path $scratch 'log'
 $result = 1
 try {
     New-Item -ItemType Directory -Path $config, $log | Out-Null
-    @{ ndi = @{ log = @{ enable = $true; level = 'info'; dir = $log } } } |
-        ConvertTo-Json -Depth 4 |
+    $network = if ($env:GRAFTON_NDI_CI_SDK_NETWORK) { $env:GRAFTON_NDI_CI_SDK_NETWORK } else { 'loopback' }
+    if ($network -notin 'loopback', 'discovery', 'adapters', 'unrestricted') {
+        throw "GRAFTON_NDI_CI_SDK_NETWORK is '$network', not loopback, discovery, adapters or unrestricted"
+    }
+    $ndi = @{ log = @{ enable = $true; level = 'info'; dir = $log } }
+    if ($network -in 'loopback', 'discovery') {
+        $ndi.networks = @{ discovery = '127.0.0.1' }
+    }
+    if ($network -in 'loopback', 'adapters') {
+        # An array of one, which ConvertTo-Json keeps a list.
+        $ndi.adapters = @{ allowed = @('127.0.0.1') }
+    }
+    @{ ndi = $ndi } |
+        ConvertTo-Json -Depth 5 |
         Set-Content -LiteralPath (Join-Path $config 'ndi-config.v1.json') -Encoding utf8NoBOM
     $env:NDI_CONFIG_DIR = $config
     Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled True

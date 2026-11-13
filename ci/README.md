@@ -123,10 +123,10 @@ Each row:
      simulator, which needs a pinned nightly toolchain and `-Zbuild-std`;
    - **compatibility runs**: on the rows that have them, the four crossed runs
      described above;
-6. on Windows, while the receiver stall is open, runs `tests/peer_recreation.rs`
-   twice more in one step, under the loopback-only runner and then with the
-   firewall off and without it (see
-   [Receivers that never connect on Windows](#receivers-that-never-connect-on-windows)).
+6. on Windows, while the cause of the receiver stall is being pinned down, runs
+   `tests/peer_recreation.rs` under the loopback-only runner with each half of
+   the SDK configuration it gives, and then with the firewall off and without it
+   (see [Receivers that never connect on Windows](#receivers-that-never-connect-on-windows)).
    It runs whatever the steps before it did.
 
 The job uses no dependency cache and uploads nothing, so SDK files and the
@@ -289,6 +289,7 @@ rustdoc, which starts each compiled doctest through it, with or without
 |---|---|---|---|
 | Network | own network namespace (`bwrap --unshare-net`) holding only `lo` | Seatbelt profile allowing only binding, loopback connections and traffic arriving on a local address | Defender Firewall block rules for the test executable, both directions; the firewall never filters loopback |
 | Host daemons | `/run` replaced by an empty tmpfs: no D-Bus, no Avahi | mDNSResponder socket denied; the SDK is given a loopback discovery address through `NDI_CONFIG_DIR` | untouched |
+| SDK networks | only `lo` exists | loopback discovery address instead of multicast DNS | through `NDI_CONFIG_DIR`, a loopback discovery address and loopback as the only adapter (see [Receivers that never connect on Windows](#receivers-that-never-connect-on-windows)) |
 | Machine's own name | resolves to `127.0.0.1` through a private `/etc/hosts` | cannot be relied on to resolve | resolves as usual |
 | `TMPDIR` | private tmpfs (`/run/tmp`) | private directory, removed afterwards | untouched |
 | SDK log | off | off | on, through `NDI_CONFIG_DIR`; printed when the executable fails |
@@ -440,13 +441,12 @@ connects, one given the right name and a wrong port does not), and its log
 line names `127.0.0.1` there too. `tests/common` gives every receiver
 `127.0.0.1:<port>` again.
 
-What every receiver of the suites does follow, by a millisecond or two, is
-the destruction of the finder that `common::loopback_endpoint` creates to find
-its sender's port. `tests/peer_recreation.rs` tests that and the remaining
-explanations against each other in one run. Each cycle creates a sender, looks
-it up in one of four ways, opens a receiver to `127.0.0.1:<port>`, sends video
-until the receiver is given a frame and drops both; the arms take turns, 25
-cycles each:
+What every receiver of the suites did follow, by a millisecond or two, is the
+destruction of the finder that `common::loopback_endpoint` creates to find its
+sender's port. `tests/peer_recreation.rs` tests that against the other
+explanations. Each cycle creates a sender, looks it up in one of four ways,
+opens a receiver to `127.0.0.1:<port>`, sends video until the receiver is
+given a frame and drops both; the arms take turns, 25 cycles each:
 
 - `dropped`: as the suites, the finder is dropped and the receiver created at
   once;
@@ -455,34 +455,49 @@ cycles each:
 - `unfound`, on Windows only: no finder; the port is the one the process
   listens on besides 5960, from `netstat`.
 
-The test asserts that every receiver is given a frame within 2 s, and prints a
-summary line per arm and a line for each receiver that was not. On Windows the
-job's last step, **Peer recreation, confined and with the firewall off**, runs
-it twice in a row, under the loopback-only runner and then with the firewall
-off and without the runner, whatever the steps before it did. The reports
-separate the explanations:
+In run 43362984849 it ran three times on the x64 Advanced 6.3.2 row:
 
-| The report shows | Explanation |
-| --- | --- |
-| `dropped` fails, `held` and `unfound` do not | a finder's destruction stops a receiver created just after it from connecting; `rested` shows whether that lasts 250 ms |
-| every arm fails alike, also with the firewall off | the Windows runtime's receiver, whatever the test does before it |
-| failures in the confined run only | the confinement (`ci/offline/windows.ps1`) |
+| Run | Not given a frame within 2 s (`dropped`, `rested`, `held`, `unfound`) | Slowest frame |
+| --- | --- | --- |
+| runtime step, under the loopback-only runner | 44 of 100 (4, 5, 15, 20) | 21 ms |
+| last step, under the loopback-only runner | 49 of 100 (9, 8, 14, 18) | 21 ms |
+| last step, firewall off and no runner | 0 of 100 | 513 ms |
+
+No receiver that missed 2 s counted a connection, and none of the eight left
+alone connected by 15 s. `Receiver::reconnect` revived 27 of the 44 and 36 of
+the 49 within 2 s, and a second receiver opened to the same address connected
+in 21 of 24 tries. The finder made no difference, or the opposite one:
+receivers looked up through a finder kept alive, or with none, stalled more
+often. The failure is the confinement's. Its rules block the program on every
+interface but loopback and leave the SDK the machine's network adapter and
+multicast DNS to try, while under the Linux and macOS runners it has neither:
+the Linux runner's namespace has only loopback, and `macos.sh` gives the SDK a
+loopback discovery address. The half-second frames with the firewall off
+suggest that a receiver there tries a route through the adapter before
+loopback.
+
+`ci/offline/windows.ps1` therefore gives the SDK the configuration that keeps
+it on loopback: `networks.discovery` set to `127.0.0.1`, as `macos.sh` sets it,
+and `adapters.allowed` set to `["127.0.0.1"]`. Locally on Linux the Standard and
+Advanced 6.4 suites pass with that configuration, except a Linux-only Discovery
+Server test that expects an empty server address to be refused, which the
+configured discovery address then fills. The job's last step runs the
+experiment under the runner with each half alone (`GRAFTON_NDI_CI_SDK_NETWORK`
+set to `discovery` and to `adapters`) and then with the firewall off, so that a
+run shows which half the receivers need. The report's first lines name the
+configuration it ran with.
 
 For each arm's first three receivers that miss 2 s, the TCP table of the port
 is taken (`common::socket_table`, also in the failure messages of
 `tests/advanced_runtime.rs` and `tests/receiver_video_only.rs`), and a second
-receiver is opened to the same address: one that connects shows that the
-sender takes connections and the state is the first receiver's own. In the
-table, two `LISTENING` rows for `0.0.0.0:<port>` owned by the test, told apart
-by their `CreationTime`, are a listener that outlived its sender; a row from
-the receiver to the port that is `ESTABLISHED` while the sender counts no
-connection is a connection nobody services; `SYN_SENT` is a connection attempt
-nobody answers; and no row at all, as in every failure so far, is a receiver
-that has not tried. The first such receiver of each arm is then left alone
-until 15 s have passed, which shows whether it connects by itself, and after
-that, and for every other one at once, `Receiver::reconnect` is called, which
-shows whether asking again revives it: that is the workaround the known issue
-would give.
+receiver is opened to the same address. In the table, two `LISTENING` rows for
+`0.0.0.0:<port>` owned by the test, told apart by their `CreationTime`, are a
+listener that outlived its sender; a row from the receiver to the port that is
+`ESTABLISHED` while the sender counts no connection is a connection nobody
+services; `SYN_SENT` is a connection attempt nobody answers; and no row at all,
+as in every failure so far, is a receiver that has not tried. The first such
+receiver of each arm is then left alone until 15 s have passed, and after
+that, and for every other one at once, `Receiver::reconnect` is called.
 
 On Linux the same run works locally:
 

@@ -14,7 +14,14 @@
 //!
 //! What every one of those receivers did follow, by a millisecond or two, is
 //! the destruction of the finder that had just looked its sender up
-//! ([`common::loopback_endpoint`]). Each cycle of this test creates a sender,
+//! ([`common::loopback_endpoint`]). In run 43362984849 this test ruled that
+//! out: under the Windows runner's firewall rules 44 and 49 of 100 receivers
+//! stalled, those looked up through a finder kept alive or with none at all
+//! more often than the rest, and with the firewall off none did. The rules
+//! left the SDK the machine's adapter and multicast DNS to try, which the
+//! Linux and macOS runners do not, and the Windows runner now gives the SDK a
+//! configuration that keeps it on loopback. The report names the
+//! configuration the SDK was given. Each cycle of this test creates a sender,
 //! looks it up in one of the ways below, opens a receiver to
 //! `127.0.0.1:<port>`, sends video until the receiver is given a frame, and
 //! drops both. The arms take turns cycle by cycle, so each follows the
@@ -353,6 +360,20 @@ fn listening_port() -> Result<u16, String> {
     }
 }
 
+/// The configuration file the SDK reads, through `NDI_CONFIG_DIR`, or that
+/// there is none: the CI runners give the SDK one, and what it says decides
+/// which networks the SDK tries.
+fn sdk_configuration() -> String {
+    let Some(directory) = std::env::var_os("NDI_CONFIG_DIR") else {
+        return "none (NDI_CONFIG_DIR is not set)".to_owned();
+    };
+    let file = std::path::Path::new(&directory).join("ndi-config.v1.json");
+    match std::fs::read_to_string(&file) {
+        Ok(text) => text.split_whitespace().collect::<Vec<_>>().join(" "),
+        Err(error) => format!("{} could not be read: {error}", file.display()),
+    }
+}
+
 #[test]
 fn receivers_connect_however_their_sender_was_looked_up() {
     let Some(ndi) = common::ndi() else { return };
@@ -375,6 +396,7 @@ fn receivers_connect_however_their_sender_was_looked_up() {
         info.edition(),
         started.elapsed()
     );
+    let _ = writeln!(report, "SDK configuration: {}", sdk_configuration());
     for &lookup in Lookup::arms() {
         let cycles: Vec<_> = run
             .cycles

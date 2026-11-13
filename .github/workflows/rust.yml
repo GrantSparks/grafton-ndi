@@ -404,23 +404,27 @@ jobs:
             export GRAFTON_NDI_REQUIRE_RUNTIME="$require"
             cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features
           done
-      # While the Windows receiver stall is open (ci/README.md, "Receivers that
-      # never connect on Windows"): the peer recreation experiment twice in a
-      # row, under the loopback-only runner and then with the firewall off and
-      # without it, so that the two compare under the same conditions and a
-      # receiver that stalls in the second does so without the confinement.
-      # It runs whatever the steps before it did, so a test that hung there
-      # does not keep it from reporting, and last, since it leaves the firewall
-      # off.
-      - name: Peer recreation, confined and with the firewall off
+      # While the cause of the Windows receiver stall is being pinned down
+      # (ci/README.md, "Receivers that never connect on Windows"): the peer
+      # recreation experiment under the loopback-only runner with each half of
+      # the SDK configuration it now gives, multicast DNS replaced by a
+      # loopback discovery address or loopback as the only adapter, and then
+      # with the firewall off and without the runner. The runtime steps above
+      # run with both halves. It runs whatever the steps before it did, and
+      # last, since it leaves the firewall off.
+      - name: Peer recreation, by SDK network setting and with the firewall off
         if: ${{ !cancelled() && runner.os == 'Windows' }}
-        timeout-minutes: 15
+        timeout-minutes: 25
         env:
           GRAFTON_NDI_REQUIRE_RUNTIME: '1'
         run: |
           status=0
-          cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features --test peer_recreation || status=1
+          for network in discovery adapters; do
+            echo "peer recreation under the loopback-only runner, GRAFTON_NDI_CI_SDK_NETWORK=$network"
+            GRAFTON_NDI_CI_SDK_NETWORK=$network cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features --test peer_recreation || status=1
+          done
           pwsh -NoProfile -Command 'Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled False'
+          echo "peer recreation with the firewall off and without the runner"
           cargo test --locked --target "$TARGET" --no-fail-fast --all-features --test peer_recreation || status=1
           exit "$status"
 
