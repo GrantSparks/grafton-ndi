@@ -330,6 +330,7 @@ jobs:
             python ci/sdk.py install "${{ matrix.compatibility-advanced }}" --dest "$RUNNER_TEMP/ndi-compat-advanced" --target "$TARGET" --github-env "$RUNNER_TEMP/ndi-compat-advanced.env"
           fi
       - name: Test runner leaves loopback networking only
+        id: isolation
         run: |
           python ci/offline/check.py --online
           case "$RUNNER_OS" in
@@ -340,13 +341,18 @@ jobs:
       # Each runtime step is bounded well inside the job's 60 minutes (it takes
       # 7 at most when it passes), so that a test that never returns fails its
       # step, and every test binary runs, so that one failing does not hide the
-      # outcomes of the rest.
+      # outcomes of the rest. For the same reason every step from here on runs
+      # whatever the steps before it did, once the runner was shown to isolate:
+      # a run then reports everything that is wrong with a row, not the first
+      # thing.
       - name: Tests against the real runtime, all features
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' }}
         timeout-minutes: 20
         env:
           GRAFTON_NDI_REQUIRE_RUNTIME: ${{ matrix.require }}
         run: cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features
       - name: Tests against the real runtime, no default features
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' }}
         timeout-minutes: 10
         env:
           GRAFTON_NDI_REQUIRE_RUNTIME: ${{ matrix.require-no-default || '1' }}
@@ -354,7 +360,7 @@ jobs:
       # Without the Advanced headers the advanced feature compiles to stubs, so
       # only a build that has them lints and documents the real implementation.
       - name: Lint and document the Advanced implementation
-        if: contains(matrix.package, 'advanced')
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && contains(matrix.package, 'advanced') }}
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
@@ -363,14 +369,14 @@ jobs:
           cargo clippy --locked --all-targets --target "$TARGET" --no-default-features --features advanced,file-io -- -D warnings
           cargo doc --locked --no-deps --target "$TARGET" --all-features
       - name: Vendored bindings are current
-        if: matrix.bindings
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.bindings }}
         run: cargo xtask bindgen --check --sdk "$NDI_SDK_DIR"
       - name: Build for the statically linked Apple mobile targets
-        if: matrix.apple-mobile
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.apple-mobile }}
         run: ci/apple-mobile.sh
 
       - name: Current Advanced headers with baseline runtimes
-        if: matrix.compatibility
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.compatibility }}
         timeout-minutes: 25
         run: |
           export GRAFTON_NDI_PEER_RUNTIME="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_RUNTIME }}"
@@ -386,7 +392,7 @@ jobs:
       # build without Advanced declarations, which cannot check `advanced`. No
       # compatibility pass promises an NDI|HX decoder; the row's own runs do.
       - name: Baseline SDK builds with the current Advanced runtime
-        if: matrix.compatibility
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.compatibility }}
         timeout-minutes: 25
         run: |
           for edition in standard advanced; do
@@ -411,7 +417,7 @@ jobs:
       # confinement's. It runs whatever the steps before it did, and last,
       # since it leaves the firewall off.
       - name: Windows failures with the firewall off
-        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && runner.os == 'Windows' }}
         timeout-minutes: 25
         env:
           GRAFTON_NDI_REQUIRE_RUNTIME: '1'

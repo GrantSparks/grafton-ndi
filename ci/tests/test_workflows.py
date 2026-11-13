@@ -314,6 +314,16 @@ def exported_promises(step, require):
             for edition, promise in (line.split(' ', 1) for line in output.stdout.splitlines())}
 
 
+# What every step of the sdk job after the isolation check runs on: the job was not cancelled and the runner
+# was shown to isolate, whatever the steps in between did.
+ROW_READY = "!cancelled() && steps.isolation.outcome == 'success'"
+
+
+def when(condition=None):
+    """The `if` of a step of the sdk job that runs on ROW_READY, and on `condition` when one is given."""
+    return '${{ ' + ROW_READY + (f' && {condition}' if condition else '') + ' }}'
+
+
 class SdkJob(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -360,6 +370,26 @@ class SdkJob(unittest.TestCase):
             command + '--no-default-features': {
                 'GRAFTON_NDI_REQUIRE_RUNTIME': "${{ matrix.require-no-default || '1' }}"}})
 
+    def test_a_failing_step_does_not_hide_the_steps_after_it(self):
+        """Every step after the isolation check runs whenever that check passed, so one run reports everything
+        that is wrong with a row; none runs when the runner was not shown to isolate."""
+        names = [step.get('name') for step in self.job['steps']]
+        check = names.index('Test runner leaves loopback networking only')
+        self.assertEqual(self.job['steps'][check].get('id'), 'isolation')
+        self.assertNotIn('if', self.job['steps'][check])
+        after = self.job['steps'][check + 1:]
+        self.assertGreaterEqual(len(after), 7)
+        for step in after:
+            with self.subTest(step=step['name']):
+                self.assertTrue(step.get('if', '').startswith('${{ ' + ROW_READY),
+                                f"{step['name']} runs on {step.get('if')!r}")
+        self.assertEqual({step['name']: step['if'] for step in after if 'matrix.' in step['if']}, {
+            'Lint and document the Advanced implementation': when("contains(matrix.package, 'advanced')"),
+            'Vendored bindings are current': when('matrix.bindings'),
+            'Build for the statically linked Apple mobile targets': when('matrix.apple-mobile'),
+            'Current Advanced headers with baseline runtimes': when('matrix.compatibility'),
+            'Baseline SDK builds with the current Advanced runtime': when('matrix.compatibility')})
+
     def test_every_test_step_is_bounded_inside_the_job(self):
         """A test that never returns fails its own step, well before the job's limit, and a failing test binary
         does not keep the ones after it from running."""
@@ -387,7 +417,7 @@ class SdkJob(unittest.TestCase):
                             sdk.version_tuple(self.pins[row['package']]['version']))
             self.assertEqual(self.pins[row['compatibility']]['platform'],
                              self.pins[row['package']]['platform'])
-        steps = [step for step in self.job['steps'] if step.get('if') == 'matrix.compatibility']
+        steps = [step for step in self.job['steps'] if step.get('if') == when('matrix.compatibility')]
         self.assertEqual(len(steps), 2)
         for step in steps:
             self.assertNotIn('env', step)
@@ -411,7 +441,8 @@ class SdkJob(unittest.TestCase):
         baseline's headers against the row's runtime; a Standard baseline has no headers a build reads. Only
         the row's own runtime has the row's driver beside it. Neither step promises an NDI|HX decoder: the
         row's own runs do, and the decode tests still run, and pass or skip visibly, in the crossed builds."""
-        baseline_runtimes, baseline_headers = [step for step in self.job['steps'] if step.get('if') == 'matrix.compatibility']
+        baseline_runtimes, baseline_headers = [step for step in self.job['steps']
+                                               if step.get('if') == when('matrix.compatibility')]
         for row in (row for row in self.rows if 'compatibility' in row):
             current, target, driver = self.pins[row['package']], row['target'], self.pins.get(row.get('hx-driver'))
             baselines = {'standard': self.pins[row['compatibility']], 'advanced': self.pins[row['compatibility-advanced']]}

@@ -103,7 +103,10 @@ Each row:
    directories, and writes their values to files under `$RUNNER_TEMP` for those
    runs. This step is the only one given the secrets in its environment;
 3. proves that the test runner isolates ([`offline/check.py`](offline/check.py)
-   outside and inside it);
+   outside and inside it). Every step after this one runs whenever this one
+   passed, whatever the steps in between did, so a run reports everything that
+   is wrong with a row and not only the first thing; none runs when the runner
+   was not shown to isolate;
 4. runs `cargo test --locked --config ci/offline.toml --target <target>
    --no-fail-fast` twice, with `--all-features` and with
    `--no-default-features`. Every test binary runs, so a failing one does not
