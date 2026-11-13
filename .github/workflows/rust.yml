@@ -224,7 +224,7 @@ jobs:
             runner: windows-2025
             target: x86_64-pc-windows-msvc
             package: 6.3.2-advanced-windows
-            require: advanced
+            require: advanced,h264-decoder
           - name: windows-x64 standard-6.4
             runner: windows-2025
             target: x86_64-pc-windows-msvc
@@ -236,12 +236,12 @@ jobs:
             package: current-advanced-windows
             compatibility: 6.3.2-standard-windows
             compatibility-advanced: 6.3.2-advanced-windows
-            require: advanced,file
+            require: advanced,file,h264-decoder
           - name: windows-x86 advanced-6.4
             runner: windows-2025
             target: i686-pc-windows-msvc
             package: current-advanced-windows
-            require: advanced
+            require: advanced,h264-decoder
           - name: macos-arm64 standard-6.3.2
             runner: macos-15
             target: aarch64-apple-darwin

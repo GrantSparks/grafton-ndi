@@ -57,10 +57,10 @@ workflow by the script tests.
 | linux-x86 standard-6.4 | ubuntu-24.04 | i686-unknown-linux-gnu | current-standard-linux | `1,discovery-server` | `1,discovery-server` | |
 | linux-arm64 standard-6.4 | ubuntu-24.04-arm | aarch64-unknown-linux-gnu | current-standard-linux | `1,discovery-server` | `1,discovery-server` | |
 | windows-x64 standard-6.3.2 | windows-2025 | x86_64-pc-windows-msvc | 6.3.2-standard-windows | `1` | `1` | |
-| windows-x64 advanced-6.3.2 | windows-2025 | x86_64-pc-windows-msvc | 6.3.2-advanced-windows | `advanced` | `1` | Advanced lint |
+| windows-x64 advanced-6.3.2 | windows-2025 | x86_64-pc-windows-msvc | 6.3.2-advanced-windows | `advanced,h264-decoder` | `1` | Advanced lint |
 | windows-x64 standard-6.4 | windows-2025 | x86_64-pc-windows-msvc | current-standard-windows | `1,file` | `1` | |
-| windows-x64 advanced-6.4 | windows-2025 | x86_64-pc-windows-msvc | current-advanced-windows | `advanced,file` | `1` | Advanced lint |
-| windows-x86 advanced-6.4 | windows-2025 | i686-pc-windows-msvc | current-advanced-windows | `advanced` | `1` | Advanced lint |
+| windows-x64 advanced-6.4 | windows-2025 | x86_64-pc-windows-msvc | current-advanced-windows | `advanced,file,h264-decoder` | `1` | Advanced lint |
+| windows-x86 advanced-6.4 | windows-2025 | i686-pc-windows-msvc | current-advanced-windows | `advanced,h264-decoder` | `1` | Advanced lint |
 | macos-arm64 standard-6.3.2 | macos-15 | aarch64-apple-darwin | 6.3.2-standard-apple | `1` | `1` | |
 | macos-arm64 advanced-6.3.2 | macos-15 | aarch64-apple-darwin | 6.3.2-advanced-apple | `advanced,h264-decoder` | `1` | Advanced lint |
 | macos-arm64 standard-6.4 | macos-15 | aarch64-apple-darwin | current-standard-apple | `1` | `1` | Apple mobile builds |
@@ -153,7 +153,7 @@ mistake cannot pass as a skip:
 | `advanced` | an Advanced runtime, compiled with its headers | the `advanced` feature is on |
 | `file` | a File library the selected runtime can drive: an Advanced runtime on Linux and macOS, any 6.4 runtime on 64-bit Windows | the `file-io` feature is on |
 | `discovery-server` | the SDK's Discovery Server program and a 6.4 runtime, whose advertisers and listeners can use it | the target is Linux |
-| `h264-decoder` | an NDI\|HX decoder for H.264 the selected runtime can use. It is built into the runtime on macOS. On Linux the runtime needs the NDI\|HX Driver for Linux or FFmpeg 7; the runner has no FFmpeg 7, so a row provides the driver through `hx-driver`. No Windows row promises it until a hosted run shows H.264 decoding there | the `advanced` feature is on |
+| `h264-decoder` | an NDI\|HX decoder for H.264 the selected runtime can use. It is built into the runtime on macOS and Windows. On Linux the runtime needs the NDI\|HX Driver for Linux or FFmpeg 7; the runner has no FFmpeg 7, so a row provides the driver through `hx-driver` | the `advanced` feature is on |
 | `hevc-444-decoder` | the same for HEVC 4:4:4, with a 6.4 runtime. No Windows row provides one: the hosted Windows Server 2025 runners delivered black placeholder frames for HEVC 4:4:4 | the `advanced` feature is on |
 
 A promise that no test in a build can check is itself a failure, and a missing
@@ -178,8 +178,9 @@ plugins, but H.265 only in 4:2:0 and where decoding hardware supports it. In
 run 43332050213 both Windows Advanced 6.4 rows received only placeholders for
 HEVC 4:4:4, while the macOS Advanced 6.4 row decoded it; the hosted Windows
 runners have no GPU, which is the probable cause, not a confirmed one. So no
-Windows row promises `hevc-444-decoder`, and none promises `h264-decoder`
-until a hosted run shows the H.264 test passing there rather than skipping.
+Windows row promises `hevc-444-decoder`. H.264 is another matter: in run
+43342188690 the H.264 test decoded on every Windows Advanced row, 6.3.2 and
+6.4, x64 and x86, so those rows promise `h264-decoder`.
 
 ## SDK packages
 
@@ -539,8 +540,6 @@ New, and so unverified anywhere but Linux x86_64:
   `h264-decoder` and `hevc-444-decoder` promises on Linux, which have passed by
   hand against a local copy of the Advanced 6.4 runtime with the driver beside
   it and the system FFmpeg hidden;
-- the H.264 decode test on Windows and macOS, and so the `h264-decoder`
-  promises of the macOS Advanced rows;
 - building tvOS and visionOS on the stable toolchain;
 - the Android example link in `cross`;
 - access to the secrets and the download from the private store;

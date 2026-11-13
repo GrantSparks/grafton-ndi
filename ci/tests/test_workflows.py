@@ -271,26 +271,28 @@ def checkable(target, pin, *, all_features, headers=None, driver=None, decoders=
     ships for x64. The H.264 and HEVC 4:4:4 decode tests are Advanced tests that
     need an NDI|HX decoder, and the HEVC one a 6.4 runtime for its Best444
     receiver. The macOS runtime decodes both itself; on Linux the decoder is the
-    NDI|HX driver of the runtime's release. On Windows the tests run but are not
-    counted: the hosted Windows runners delivered the runtime's black
-    placeholder frames instead of HEVC 4:4:4, and H.264 has not been measured
-    there yet. `decoders=False` leaves both out, as the compatibility runs do.
+    NDI|HX driver of the runtime's release. The Windows runtime decodes H.264
+    itself (every hosted Windows Advanced row decoded it in run 43342188690), but
+    the hosted Windows runners delivered the runtime's black placeholder frames
+    instead of HEVC 4:4:4, so the HEVC test runs there without being counted.
+    `decoders=False` leaves both out, as the compatibility runs do.
     """
     platform, advanced = pin['platform'], pin['edition'] == 'advanced'
     declared = (headers or pin)['edition'] == 'advanced'
     current = sdk.version_tuple(pin['version']) >= (6, 4, 0, 0)
-    decoder = decoders and (platform == 'apple' or (
-        driver is not None and driver['driver'] == 'hx' and driver['platform'] == platform
-        and driver['version'] == pin['version']))
+    driven = (driver is not None and driver['driver'] == 'hx' and driver['platform'] == platform
+              and driver['version'] == pin['version'])
+    decoder = decoders and (platform == 'apple' or driven)
+    h264 = decoder or (decoders and platform == 'windows')
     found = {'1'}
     if platform == 'linux' and current:
         found.add('discovery-server')
     if all_features and advanced and declared:
         found.add('advanced')
-        if decoder:
+        if h264:
             found.add('h264-decoder')
-            if current:
-                found.add('hevc-444-decoder')
+        if decoder and current:
+            found.add('hevc-444-decoder')
     if all_features and current and (target == 'x86_64-pc-windows-msvc' if platform == 'windows' else advanced):
         found.add('file')
     return found
