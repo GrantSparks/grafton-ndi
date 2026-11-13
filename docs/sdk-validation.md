@@ -219,9 +219,13 @@ The same runtime, in runs 43366775596 and 43369298234, returned
 4% of its bytes changed, by up to 224 at patch edges, and with the chroma
 inside some patches wrong too: the mean of Cb inside one patch of the leftmost
 column was 40.8 code values off, while every patch's luma held within 2. Its
-720×576 and 1920×1080 frames were within 2 inside every patch. The test bounds
-that runtime's 3840×2160 chroma by what was measured, and every other size and
-runtime by 2.
+720×576 and 1920×1080 frames were within 2 inside every patch. In run
+43371812571 two receivers of the same stream were not given the same
+3840×2160 picture: the SDK's RGB frame for one differed from the BT.709
+conversion of the other's UYVY frame by up to 255, 1.14 on average. The test
+bounds that runtime's 3840×2160 chroma by what was measured, and every other
+size and runtime by 2, and pins the SDK's colour conversion on that runtime
+with the smaller sizes only.
 
 #### What the crate does
 
