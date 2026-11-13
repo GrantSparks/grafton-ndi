@@ -24,15 +24,18 @@ as `None`. Most programs need changes; see the
 - The crate works with NDI 6 runtimes from the Standard and the Advanced SDK.
   The minimum Rust version remains 1.88; the tvOS and visionOS targets need a
   later release.
-- The test suite was run on Linux x86_64 against the Standard 6.1.1 runtime and
-  the Standard and Advanced 6.3.2 and 6.4.0.2 runtimes. Builds with one
-  version's Advanced headers also ran against another version's runtime, and
-  6.1.1 and Advanced 6.3.2 peers exchanged video, audio and metadata with 6.4
-  peers in both directions. Other NDI 6 releases, including 6.0, were not tested.
-- The other Linux architectures, Windows, macOS, Android and iOS were compiled
-  and linted only, and tvOS and visionOS were not built. The CI workflows that
-  test the other platforms have not yet run on a hosted runner. See
-  [SDK validation](docs/sdk-validation.md) and the
+- The test suite runs against real runtimes on Linux x86-64 (Standard 6.1.1,
+  and Standard and Advanced 6.3.2 and 6.4.0.2), Linux x86 and arm64 (Standard
+  6.4.0.2), macOS arm64 (Standard and Advanced 6.3.2 and 6.4.0.2) and x86-64
+  (Standard 6.4.0.2), and Windows x64 (Standard and Advanced 6.3.2 and
+  6.4.0.2) and x86 (Advanced 6.4.0.2). On Linux, macOS and Windows, builds with
+  one version's Advanced headers also run against another version's runtime,
+  and peers of the earlier versions exchange video, audio and metadata with 6.4
+  peers in both directions. Other NDI 6 releases, including 6.0, were not
+  tested.
+- 32-bit ARM Linux and Android are compiled and linted, and iOS, tvOS and
+  visionOS are built against the NDI SDK for Apple 6.4; nothing runs on them.
+  See [SDK validation](docs/sdk-validation.md) and the
   [README](README.md#supported-ndi-versions-and-platforms).
 - The bindings are generated from the NDI SDK 6.4.0.2 headers. A runtime that
   lacks a newer capability reports it unavailable, and the operations that need

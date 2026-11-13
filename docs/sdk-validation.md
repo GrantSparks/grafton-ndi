@@ -444,54 +444,30 @@ being asked for what it lacks, but only the versions above are tested. The
 Windows and Apple 6.3.2 packages were checked for version and archive identity,
 and their headers were compiled, but nothing was run from them.
 
-## What was compiled but not run
+## Platform coverage
 
-The crate was linted with clippy, all features, all targets and warnings
-denied, for these targets with Rust 1.99.1. No test was run on them, and no NDI
-library was loaded on them:
+| Platform | Coverage |
+| --- | --- |
+| Linux x86-64 | Test suite against Standard 6.1.1, 6.3.2 and 6.4.0.2 and Advanced 6.3.2 and 6.4.0.2 |
+| Linux x86, Linux arm64 | Test suite against Standard 6.4.0.2 |
+| macOS arm64 | Test suite against Standard and Advanced 6.3.2 and 6.4.0.2 |
+| macOS x86-64 | Test suite against Standard 6.4.0.2 |
+| Windows x64 | Test suite against Standard and Advanced 6.3.2 and 6.4.0.2 |
+| Windows x86 | Test suite against Advanced 6.4.0.2 |
+| 32-bit ARM Linux, Android | Linted with clippy, all features and warnings denied; nothing runs |
+| iOS, tvOS, visionOS | Library built against the NDI SDK for Apple 6.4; nothing runs |
 
-- `i686-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
-  `armv7-unknown-linux-gnueabihf`
-- `x86_64-pc-windows-msvc`, `i686-pc-windows-msvc`
-- `x86_64-apple-darwin`, `aarch64-apple-darwin`
-- `aarch64-linux-android`, `armv7-linux-androideabi`, `i686-linux-android`,
-  `x86_64-linux-android`
+The test suites run in the `sdk` job of `.github/workflows/rust.yml`, on
+GitHub's hosted runners; the [CI guide](../ci/README.md) describes its rows and
+what each one checks. Tests leave out what a platform's runtime cannot do, and
+print that they did; the README's
+[known issues](../README.md#known-issues) list those limits.
 
-The library was linted the same way for `aarch64-apple-ios` and
-`x86_64-apple-ios` against the NDI SDK for Apple 6.4. That selects and checks
-the static archive, but the static link was not performed and nothing was run.
+Not covered:
 
-`aarch64-apple-tvos`, `x86_64-apple-tvos` and `aarch64-apple-visionos` are
-built in hosted CI, with the iOS targets; nothing is run on them.
-
-## Hosted CI
-
-The `sdk` job of `.github/workflows/rust.yml` runs the test suite against real
-runtimes on GitHub's hosted runners: Linux x86-64 with Standard 6.1.1, 6.3.2
-and 6.4 and Advanced 6.3.2 and 6.4; Linux x86 and arm64 with Standard 6.4;
-macOS arm64 with Standard and Advanced 6.3.2 and 6.4, and macOS x86-64 with
-Standard 6.4; Windows x64 with Standard and Advanced 6.3.2 and 6.4, and Windows
-x86 with Advanced 6.4. The [CI guide](../ci/README.md) describes the rows and
-what each one checks.
-
-## What was not tested
-
-- Any behavior on Windows, macOS, Android, iOS, tvOS or visionOS. This includes
-  the Windows and macOS branches of the runtime search and the static linking
-  of Apple mobile targets, which are covered by compilation only.
-- NDI runtimes other than Standard 6.1.1 and Standard and Advanced 6.3.2 and
-  6.4.0.2, all on Linux x86_64. NDI 6.0 and 6.2 were not tested.
-- The File library on Windows, macOS and Android, and beside an Advanced 6.3.2
-  runtime.
-- Linux architectures other than x86_64.
+- NDI 6 releases other than 6.1.1, 6.3.2 and 6.4.0.2.
 - Hardware-dependent behavior: PTZ devices, KVM devices, hardware codecs, and
   interoperability of compressed streams with other products.
-- How far the SDK reads past sent video on x86 processors without AVX2, on
-  32-bit x86 and 32-bit ARM, and on Windows, macOS, Android and iOS, where
-  its compressor may run other code. The crate gives those the room it
-  measured for x86-64 Linux, more than twice the furthest ordinary read.
-- Whether the SDK reads past the compressed frames an Advanced sender is
-  given, or writes past the buffers of a custom receive allocator.
 - License entitlements. A capability reported as available says only that the
   runtime exports the functions and has the required version.
 

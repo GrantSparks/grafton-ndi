@@ -74,16 +74,19 @@ The 6.3.2 runtime exports the Discovery Server functions, but destroying an adve
 
 | Platform | Rust targets | How NDI is provided | Checked for 3.0 |
 | --- | --- | --- | --- |
-| Linux | `x86_64-unknown-linux-gnu` | Runtime library, loaded at run time | Test suite run against real runtimes |
-| Linux | `i686-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf` | Runtime library, loaded at run time | Compiled and linted |
-| Windows | `x86_64-pc-windows-msvc`, `i686-pc-windows-msvc` | Runtime library, loaded at run time | Compiled and linted |
-| macOS | `aarch64-apple-darwin`, `x86_64-apple-darwin` | Runtime library, loaded at run time | Compiled and linted |
+| Linux | `x86_64-unknown-linux-gnu` | Runtime library, loaded at run time | Test suite run against Standard 6.1.1, 6.3.2 and 6.4 and Advanced 6.3.2 and 6.4 runtimes |
+| Linux | `i686-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | Runtime library, loaded at run time | Test suite run against the Standard 6.4 runtime |
+| Linux | `armv7-unknown-linux-gnueabihf` | Runtime library, loaded at run time | Compiled and linted |
+| Windows | `x86_64-pc-windows-msvc` | Runtime library, loaded at run time | Test suite run against Standard and Advanced 6.3.2 and 6.4 runtimes |
+| Windows | `i686-pc-windows-msvc` | Runtime library, loaded at run time | Test suite run against the Advanced 6.4 runtime |
+| macOS | `aarch64-apple-darwin` | Runtime library, loaded at run time | Test suite run against Standard and Advanced 6.3.2 and 6.4 runtimes |
+| macOS | `x86_64-apple-darwin` | Runtime library, loaded at run time | Test suite run against the Standard 6.4 runtime |
 | Android | `aarch64-linux-android`, `armv7-linux-androideabi`, `i686-linux-android`, `x86_64-linux-android` | Runtime library packaged with the application, loaded at run time | Compiled and linted |
-| iOS | `aarch64-apple-ios`, and `x86_64-apple-ios` for the simulator | Static library from the NDI SDK for Apple, linked at build time | Compiled and linted against the NDI SDK for Apple 6.4 |
-| tvOS | `aarch64-apple-tvos`, and `x86_64-apple-tvos` for the simulator | Static library from the NDI SDK for Apple, linked at build time | Not yet compiled |
-| visionOS | `aarch64-apple-visionos` | Static library from the NDI SDK for Apple, linked at build time | Not yet compiled |
+| iOS | `aarch64-apple-ios`, and `x86_64-apple-ios` for the simulator | Static library from the NDI SDK for Apple, linked at build time | Built against the NDI SDK for Apple 6.4 |
+| tvOS | `aarch64-apple-tvos`, and `x86_64-apple-tvos` for the simulator | Static library from the NDI SDK for Apple, linked at build time | Built against the NDI SDK for Apple 6.4 |
+| visionOS | `aarch64-apple-visionos` | Static library from the NDI SDK for Apple, linked at build time | Built against the NDI SDK for Apple 6.4 |
 
-Compiled and linted means that `cargo clippy` with every feature and with warnings denied passed for the target. Nothing ran on it, and no NDI library was loaded. The repository's [CI workflows](ci/README.md) run the tests against real runtimes on Linux, Windows and macOS and build the Apple mobile targets, but they have not yet run on a hosted runner.
+The test suites run in the repository's [CI](ci/README.md), on GitHub's hosted runners. Compiled and linted means that `cargo clippy` with every feature and with warnings denied passes for the target; built means that the library builds for it. Nothing runs on those targets, and no NDI library is loaded.
 
 Not supported, or not tested:
 
