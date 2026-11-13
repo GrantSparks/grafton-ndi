@@ -2067,14 +2067,19 @@ mod tests {
 
     #[test]
     fn an_explicit_close_does_not_block_the_caller() {
-        let (device, recorder) = mock_recorder(Closing::After(Duration::from_millis(300)));
-        let begun = Instant::now();
+        // The file is reported closed only when the test says so: until
+        // then, the close can complete only once the drop wait has run out
+        // its default 5 s.
+        let (device, recorder) = mock_recorder(Closing::WhenTold);
         let closed = recorder.close();
+        // It returned while the owner thread still waits for the file.
+        assert_eq!(device.destroys.load(Ordering::Acquire), 0);
         assert!(
-            begun.elapsed() < Duration::from_millis(150),
-            "close returned only after {:?}",
-            begun.elapsed()
+            !lock(&closed.response).completed,
+            "the close completed before the file was reported closed"
         );
+        await_stop(&device);
+        device.close();
         block_on(closed).unwrap();
         assert_eq!(device.destroys.load(Ordering::Acquire), 1);
         assert!(device.closed_before_destroy.load(Ordering::Acquire));
