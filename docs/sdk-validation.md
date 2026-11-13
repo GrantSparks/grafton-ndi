@@ -3,7 +3,7 @@
 This document states what the tests of the current version cover, the
 measured behavior of the NDI SDK that the crate relies on, and how to repeat
 the tests on your own machine. The
-[README](../README.md#supported-ndi-versions-and-platforms) summarizes it. The
+[setup guide](setup.md#supported-ndi-versions-and-platforms) summarizes it. The
 crate supports NDI 6 runtimes and Rust 1.88 or later.
 
 ## What the tests cover
@@ -368,8 +368,8 @@ runtime from being asked for what it lacks.
 The test suites run in the `sdk` job of `.github/workflows/rust.yml`, on
 GitHub's hosted runners; the [CI guide](../ci/README.md) describes its rows and
 what each one checks. Tests leave out what a platform's runtime cannot do, and
-print that they did; the README's
-[known issues](../README.md#known-issues) list those limits.
+print that they did; the
+[known issues](troubleshooting.md) list those limits.
 
 Not covered:
 
@@ -444,3 +444,59 @@ When an SDK version or platform is added, add it to
 own version text (`ndi.info().raw_version()`), and to
 [Platform coverage](#platform-coverage), saying whether the test suite runs
 there or the target is only compiled.
+
+## Image color conversion
+
+### What the SDK does
+
+Measured on Linux x86_64 with the 6.4.0.2 Standard and Advanced runtimes,
+sender and receivers in one process on loopback, where the transport carried
+flat content exactly:
+
+| Question | Finding |
+| --- | --- |
+| Matrix used to send RGB as YUV | BT.709, limited range, at 720×576, 1920×1080 and 3840×2160: black became Y 16, white Y 235 |
+| Matrix used to deliver YUV as RGB | BT.709 at every size tried, from 720×576 to 3840×2160, across both of the manual's boundaries |
+| Does `ndi_color_info` change either conversion? | No: frames tagged BT.601 or BT.2020, alone or inside `ndi_metadata_group`, converted alike |
+| Does the tag reach receivers? | Yes, unchanged, on UYVY, P216 and RGBX receivers |
+| Chroma upsampling to RGB | Repeated: chroma changes only between the two pixels a sample covers and the next |
+| 4:2:0 to 4:2:2 | Repeated: each NV12 chroma row became two identical rows |
+| Precision of the SDK's RGB | A fixed-point approximation: white comes out 253, saturated blues fall up to 10 codes short, and green alternates by one code between even and odd pixels |
+
+The NDI manual's table, BT.601 for SD, BT.709 for HD and BT.2020 for UHD,
+describes neither conversion the 6.4 SDK performs, so the encoder does not
+follow it. `tests/image_color_sdk.rs` pins these findings against a real
+runtime.
+
+What follows:
+
+- For an untagged frame, matrix and chroma follow the SDK, so a snapshot of a
+  UYVY frame matches what an RGB receiver of the same source shows, within the
+  SDK's approximation: at most 10 code values, 1.5 on average.
+- The coefficients are exact, so white is 255.
+- A tagged frame follows its tag, although the SDK's RGB conversion ignores
+  it: a source tagged BT.2020 encodes correctly here, and with BT.709
+  coefficients in an RGB receiver.
+- An untagged BT.601 source, such as older SD hardware, needs
+  `ColorPolicy::Override`.
+
+### The conversion
+
+Readers hand the color stage 16-bit codes (an 8-bit sample shifted left by 8,
+which keeps limited-range codes exact), so one kernel serves every depth. With
+n the source's bits a sample and s = 2^(16 − n):
+
+- limited range: Y' = (Y − 4096) / 56064, P = (C − 32768) / 57344;
+- full range: Y' = Y / ((2^n − 1)·s), P = (C − 2^15) / ((2^n − 1)·s);
+- R = Y' + 2(1 − K<sub>R</sub>)·P<sub>R</sub>, B = Y' + 2(1 − K<sub>B</sub>)·P<sub>B</sub>,
+  G = (Y' − K<sub>R</sub>·R − K<sub>B</sub>·B) / (1 − K<sub>R</sub> − K<sub>B</sub>).
+
+| Matrix | K<sub>R</sub> | K<sub>B</sub> |
+| --- | --- | --- |
+| BT.601 | 0.299 | 0.114 |
+| BT.709 | 0.2126 | 0.0722 |
+| BT.2020 | 0.2627 | 0.0593 |
+
+R, G and B are clamped to 0 to 1 and rounded to the image's depth. The kernel
+works in fixed point, `i32` for 8-bit images and `i64` for 16-bit ones, and its
+tests hold it within one code of an `f64` reference at both depths.

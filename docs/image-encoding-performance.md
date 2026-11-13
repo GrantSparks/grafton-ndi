@@ -102,7 +102,7 @@ the codec is about as fast as the conversion:
 The conversion is safe scalar Rust that the compiler vectorizes where the
 target allows: built with `RUSTFLAGS="-C target-cpu=x86-64-v3"` it takes
 1.6 ns a pixel. Bringing the fast codecs within 1.25 times on every target
-would take hand-written SIMD, which 3.0 leaves out. A receiver set to an RGB
+would require additional SIMD optimization. A receiver set to an RGB
 color format avoids the conversion altogether, at the cost of the SDK
 converting every frame instead of only the ones encoded.
 
@@ -148,12 +148,3 @@ to 28 bytes past the end of many UYVY frames they send. The crate keeps room for
 that after every frame it sends, which
 [SDK validation](sdk-validation.md#reads-past-the-end-of-sent-video)
 describes, and the test sends from a vector that ends with the frame.
-
-## 2.0
-
-grafton-ndi 2.0 encoded RGBA, RGBX, BGRA and BGRX only, as 8-bit PNG and JPEG.
-Its measurements, made with uniform frames, gave 15 ms for a 1080p PNG:
-uniform frames compress far faster than camera content, which takes 554 ms at
-the same compression level here. 3.0 encodes those four formats,
-untagged or tagged BT.601 or BT.709 SDR, to the same bytes as 2.0, which unit
-tests check against hashes of 2.0's output.

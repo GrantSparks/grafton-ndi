@@ -36,7 +36,7 @@ as `None`. Most programs need changes; see the
 - 32-bit ARM Linux and Android are compiled and linted, and iOS, tvOS and
   visionOS are built against the NDI SDK for Apple 6.4; nothing runs on them.
   See [SDK validation](docs/sdk-validation.md) and the
-  [README](README.md#supported-ndi-versions-and-platforms).
+  [platform support](docs/setup.md#supported-ndi-versions-and-platforms).
 - The bindings are generated from the NDI SDK 6.4.0.2 headers. A runtime that
   lacks a newer capability reports it unavailable, and the operations that need
   it return `Error::UnsupportedCapability`.

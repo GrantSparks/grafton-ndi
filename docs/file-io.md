@@ -2,17 +2,7 @@
 
 The `file-io` Cargo feature adds the `grafton_ndi::file` module. It records NDI
 sources to disk and plays recordings back as NDI sources, through the NDI File
-library. This guide explains what the module needs, how a recording is
-finished, and the threading rules of its types. The rustdoc of each type is the
-reference.
-
-The module is a supported part of the crate and follows its semantic
-versioning like the rest of the API. Its errors are the crate's `Error`, which
-names what went wrong by variant (with `StateError` for an operation the
-current state does not allow), its public structures can gain fields without a
-breaking change, and
-its enums are `#[non_exhaustive]`, so later SDK releases can be supported in
-3.x minor versions.
+library.
 
 ## Requirements
 
@@ -22,9 +12,7 @@ grafton-ndi = { version = "3.0", features = ["file-io"] }
 ```
 
 The File library is a separate native library that the NDI SDK installs beside
-the runtime library. It first ships with the NDI 6.4 SDK; the 6.1.1 and 6.3.2
-SDKs do not include it. Nothing else in the crate depends on it, so its absence
-never affects sending or receiving. `FileApi::open` finds it when it is first
+the runtime library. It requires NDI 6.4. Sending and receiving do not depend on it. `FileApi::open` finds it when it is first
 needed:
 
 ```rust
@@ -73,9 +61,9 @@ Which NDI runtime the File library works with depends on the platform:
 
 | Platform | Rule |
 | --- | --- |
-| Linux, macOS, Android | The File library uses the Advanced SDK runtime. `FileApi::open` refuses it beside a Standard runtime with `Error::RuntimeConflict`, before loading anything. Select the Advanced runtime; see [SDK editions](../README.md#sdk-editions). |
+| Linux, macOS, Android | The File library uses the Advanced SDK runtime. `FileApi::open` refuses it beside a Standard runtime with `Error::RuntimeConflict`, before loading anything. Select the Advanced runtime; see [SDK editions](setup.md#sdk-editions). |
 | Windows | The File library does not depend on the runtime's edition. The SDK ships it for 64-bit Windows only. |
-| iOS, tvOS, visionOS | The File archive is linked at build time, in place of the core archive, when the NDI SDK for Apple supplies one; without it `FileApi::open` returns `Error::RuntimeLoadFailed`. See [Apple mobile targets](../README.md#apple-mobile-targets). |
+| iOS, tvOS, visionOS | The File archive is linked at build time, in place of the core archive, when the NDI SDK for Apple supplies one; without it `FileApi::open` returns `Error::RuntimeLoadFailed`. See [Apple mobile targets](setup.md#apple-mobile-targets). |
 
 ### What the selected library provides
 
@@ -277,7 +265,7 @@ carries out before `NDIlib_file_recorder_stop` returns. Events already queued
 are taken even when the wait is over, so `finish(Duration::ZERO)` reports
 `Closed` when the SDK finalized the file during the stop.
 
-`Closed` means that the files were finalized. `RecordingReport::stopped_by_sdk`
+`Closed` means that the SDK reported the files finalized. `RecordingReport::stopped_by_sdk`
 says whether the recording ran until you stopped it: it is true when the
 session ended without a stop requested through `request_stop`, `finish`,
 `abandon` or a drop, for example after a new file could not be opened or at a
@@ -358,8 +346,8 @@ them.
 
 `FilePlayer` and `FileRecorder` are neither `Send` nor `Sync`. The SDK
 documents no threading contract for them, so each stays on the thread that
-created it. Every method calls into the SDK and can block, including
-destruction; timeouts bound event waits only. The values they return are owned
+created it. Native SDK calls can block, including destruction; timeouts bound event
+waits only. The values they return are owned
 and can be sent anywhere.
 
 `AsyncFilePlayer` and `AsyncFileRecorder` keep each native object on a thread
@@ -382,68 +370,30 @@ async fn record(file: &FileApi) -> Result<(), Box<dyn std::error::Error>> {
 
     // ... record for as long as needed ...
 
-    if let FinishStatus::Closed(report) = recorder.finish(Duration::from_secs(5)).await? {
-        println!("closed {} file(s)", report.closed_files());
+    match recorder.finish(Duration::from_secs(5)).await? {
+        FinishStatus::Closed(report) => println!("closure report: {report:?}"),
+        other => println!("closure unconfirmed: {other:?}"),
     }
     recorder.close().await?;
     Ok(())
 }
 ```
 
-The async recorder takes its events continuously, so its report stays current
-without polling. `next_event(timeout)` delivers them to the application, including
-those `finish` takes while it waits, with a malformed event as
-`Error::UnexpectedSdkResult`; a handle keeps up to 256 undelivered events, discards
-the oldest beyond that and counts the discarded ones in
-`notification_dropped_count`. A discarded notification does not change the
-recording report. `AsyncFileOptions` and `create_with_options` change the queue
-sizes, each from 1 to 4096.
+The async recorder consumes SDK events continuously. Use `next_event(timeout)`
+for application notifications; dropped notifications do not change the recording
+report. Configure bounded queues with `AsyncFileOptions`. A full command queue
+returns `QueueFull`; see the [async API reference](https://docs.rs/grafton-ndi/latest/grafton_ndi/file/struct.AsyncFileRecorder.html)
+for queue limits, cancellation and shutdown behavior.
 
-`next_event(timeout)` returns `Ok(None)` when `timeout` runs out, even while the
-object's thread is blocked in a command, because one timer thread shared by
-every async handle in the process keeps the deadlines; it starts with the first
-wait that needs it. If that thread cannot be started, the wait fails with
-`Error::Io`, and the next wait tries again. A pending `next_event` fails
-with `Error::InvalidState(StateError::Closed)` as soon as the object's
-thread stops taking events, without waiting for a recorder's drop wait. If the
-thread failed instead (it panicked, or could not be started), the wait fails
-with `StateError::OwnerFailed`.
+Await `finish` and inspect its `FinishStatus` and report, then await `close`.
+`close` ends the object for all clones without blocking the executor. Later
+operations return `StateError::Closed`; a failed worker returns `OwnerFailed`.
 
-Await `finish` to learn whether the recording is complete, then await `close`;
-neither blocks the executor. `close` borrows the handle and ends the object for
-every clone. Any number of closes, from any clones, can be awaited at once: each
-completes when the object has been destroyed. Later calls on any clone fail
-with `Error::InvalidState(StateError::Closed)`. After the object's thread has
-failed, the command it was running, every queued and later command, every event
-wait and `close` fail with `StateError::OwnerFailed` instead, so a failure is
-never mistaken for a close. `AsyncFileRecorder::reset` replaces the native
-recorder as `FileRecorder::reset` does.
-
-Each handle's commands wait in a queue of `AsyncFileOptions::command_capacity`
-places (64 by default), and a command that finds it full fails at once with
-`Error::QueueFull(QueueLimit::FileCommands)`. A request to stop (the player's
-`stop`, the recorder's `request_stop` and `finish`) runs even if its future is
-dropped, and takes a place like any other command, except that one request to
-stop is accepted beyond a full queue, so that a stop is not lost for want of
-room. While that one waits, a further request to stop is refused like any other
-command, so a queue never holds more than its capacity and one. `close` does not
-use the queue.
-
-`AsyncFilePlayer::probe` needs no player. Every async probe in the process runs
-on one thread, started by the first probe, one at a time and in order; up to 64
-can wait, and one more fails with `Error::QueueFull(QueueLimit::FileProbes)`.
-Dropping a probe's future before it has begun cancels it. To probe several
-files at once, call `FileApi::probe` on threads of your own.
-
-**Dropping the last clone blocks the dropping thread** until the object's
-thread has finished. For a recorder that means stopping an open session,
-waiting up to the drop wait for the file to be finalized, and destroying the
-recorder; for a player, destroying it and removing its source. This is
-deliberate: a file is finalized by the time the drop returns, even when the
-drop happens as the program exits, although the outcome cannot be reported.
-Code that must not block, such as a task on an async executor, awaits `close()`
-before letting the last clone go; once the object is closed, dropping its clones
-does not block.
+**Dropping the last clone blocks** until its worker exits. A recorder attempts
+to stop and waits up to `drop_wait` for closure events, then destroys the native
+recorder. Drop cannot report or guarantee finalization. The wait budget does
+not bound SDK stop or destruction calls. Await `close()` before dropping the
+last handle on an executor thread.
 
 ## Errors
 
@@ -464,24 +414,7 @@ reports:
 | `UnexpectedSdkResult` | The SDK returned something that violates the expected contract. |
 | `Io` | A filesystem operation failed, or a thread for an async handle or for async probes could not be started. |
 
-## Running the tests
+## Validation
 
-The File tests follow the crate's test policy. Those that need the File library
-are skipped, with a message, when it cannot be used, and they make their own
-recordings. To run them on Linux x86_64, point the runtime search at the
-Advanced SDK's runtime; a `file-io` build tries the Advanced library first:
-
-```sh
-export NDI_RUNTIME_DIR_V6="/path/to/NDI Advanced SDK for Linux/lib/x86_64-linux-gnu"
-GRAFTON_NDI_REQUIRE_RUNTIME=file cargo test --locked --config ci/offline.toml --features file-io
-```
-
-`GRAFTON_NDI_REQUIRE_RUNTIME=file` makes a test that would have skipped fail
-instead. The tests create NDI senders and receivers; `--config ci/offline.toml`
-confines them to loopback networking, and needs `bubblewrap`. The tests that
-check how the File library is found use stand-in libraries and need no SDK;
-they run on Linux only and need `rustc` on the `PATH`.
-
-CI runs them against the File library of the NDI 6.4.0.2 SDK on Linux x86_64
-and macOS arm64 beside the Advanced runtime, and on Windows x64 beside either
-edition.
+See [SDK validation](sdk-validation.md) for tested platforms and
+[CONTRIBUTING.md](../CONTRIBUTING.md) for local test commands.

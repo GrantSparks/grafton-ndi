@@ -19,8 +19,7 @@ all pure Rust. The `ColorInfo` color description and every frame's
 
 ## Encoding a frame
 
-One options value, `ImageOptions`, describes an encode, and three methods on
-every frame type take it:
+`ImageOptions` configures encoding:
 
 | Method | Returns |
 | --- | --- |
@@ -101,15 +100,6 @@ the SDK's padded stride encodes exactly as its packed copy does.
 keep their precision, and 8-bit sources scale exactly (times 257). JPEG and
 WebP are 8-bit only.
 
-An untagged frame, or one tagged BT.601 or BT.709 SDR, in one of the four RGB
-formats encodes, with the default options, to the same bytes as in
-grafton-ndi 2.0. Unit tests hold
-SHA-256 hashes of 2.0's PNG and JPEG output to keep it so.
-
-Lossy WebP is not offered: no pure-Rust encoder meets the crate's
-constraints, a permissive licence, no `unsafe`, and Rust 1.88. It can be added
-in a 3.x release once one exists; `ImageFormat` is `#[non_exhaustive]`.
-
 ## Color
 
 Under the default `ColorPolicy::Sdk`, a YUV frame is converted with the
@@ -117,59 +107,10 @@ matrix its `ndi_color_info` metadata names, or BT.709 when it names none, and
 limited range. `ColorPolicy::Override { matrix, range }` replaces both. RGB
 frames are encoded as they are.
 
-### What the SDK does
-
-Measured on Linux x86_64 with the 6.4.0.2 Standard and Advanced runtimes,
-sender and receivers in one process on loopback, where the transport carried
-flat content exactly:
-
-| Question | Finding |
-| --- | --- |
-| Matrix used to send RGB as YUV | BT.709, limited range, at 720×576, 1920×1080 and 3840×2160: black became Y 16, white Y 235 |
-| Matrix used to deliver YUV as RGB | BT.709 at every size tried, from 720×576 to 3840×2160, across both of the manual's boundaries |
-| Does `ndi_color_info` change either conversion? | No: frames tagged BT.601 or BT.2020, alone or inside `ndi_metadata_group`, converted alike |
-| Does the tag reach receivers? | Yes, unchanged, on UYVY, P216 and RGBX receivers |
-| Chroma upsampling to RGB | Repeated: chroma changes only between the two pixels a sample covers and the next |
-| 4:2:0 to 4:2:2 | Repeated: each NV12 chroma row became two identical rows |
-| Precision of the SDK's RGB | A fixed-point approximation: white comes out 253, saturated blues fall up to 10 codes short, and green alternates by one code between even and odd pixels |
-
-The NDI manual's table, BT.601 for SD, BT.709 for HD and BT.2020 for UHD,
-describes neither conversion the 6.4 SDK performs, so the encoder does not
-follow it. `tests/image_color_sdk.rs` pins these findings against a real
-runtime.
-
-What follows:
-
-- For an untagged frame, matrix and chroma follow the SDK, so a snapshot of a
-  UYVY frame matches what an RGB receiver of the same source shows, within the
-  SDK's approximation: at most 10 code values, 1.5 on average.
-- The coefficients are exact, so white is 255.
-- A tagged frame follows its tag, although the SDK's RGB conversion ignores
-  it: a source tagged BT.2020 encodes correctly here, and with BT.709
-  coefficients in an RGB receiver.
-- An untagged BT.601 source, such as older SD hardware, needs
-  `ColorPolicy::Override`.
-
-### The conversion
-
-Readers hand the color stage 16-bit codes (an 8-bit sample shifted left by 8,
-which keeps limited-range codes exact), so one kernel serves every depth. With
-n the source's bits a sample and s = 2^(16 − n):
-
-- limited range: Y' = (Y − 4096) / 56064, P = (C − 32768) / 57344;
-- full range: Y' = Y / ((2^n − 1)·s), P = (C − 2^15) / ((2^n − 1)·s);
-- R = Y' + 2(1 − K<sub>R</sub>)·P<sub>R</sub>, B = Y' + 2(1 − K<sub>B</sub>)·P<sub>B</sub>,
-  G = (Y' − K<sub>R</sub>·R − K<sub>B</sub>·B) / (1 − K<sub>R</sub> − K<sub>B</sub>).
-
-| Matrix | K<sub>R</sub> | K<sub>B</sub> |
-| --- | --- | --- |
-| BT.601 | 0.299 | 0.114 |
-| BT.709 | 0.2126 | 0.0722 |
-| BT.2020 | 0.2627 | 0.0593 |
-
-R, G and B are clamped to 0 to 1 and rounded to the image's depth. The kernel
-works in fixed point, `i32` for 8-bit images and `i64` for 16-bit ones, and its
-tests hold it within one code of an `f64` reference at both depths.
+Use `ColorPolicy::Override` for an untagged source whose matrix or range differs
+from the default. Tagged frames follow their matrix, even though the SDK's own
+RGB conversion may ignore it. See [color validation](sdk-validation.md#image-color-conversion)
+for measured behavior and conversion equations.
 
 ### `ndi_color_info`
 
@@ -256,38 +197,14 @@ It serves frames that arrive full size: from a FrameSync, from receivers with
 
 ## Cost and memory
 
-Encoding cost is mostly compression. Measured on one thread for a 1920×1080
-RGBA frame, a photograph and a graphics frame of flat boxes, a gradient and
-text:
+Encoding can take tens to hundreds of milliseconds per 1080p frame. Keep it off
+capture and executor threads. Choose `PngCompression::Fast` or lossless WebP for
+camera snapshots; compare output sizes on your content.
 
-| 1920×1080 content | PNG `Balanced` | PNG `Fast` | PNG `High` | Lossless WebP | JPEG 85 |
-| --- | --- | --- | --- | --- | --- |
-| Photographic | 3.38 MB, 554 ms | 3.76 MB, 24 ms | 3.35 MB, 1,198 ms | 2.80 MB, 19 ms | 0.45 MB, 21 ms |
-| Graphics | 150 KB, 40 ms | 492 KB, 8 ms | 135 KB, 104 ms | 329 KB, 8 ms | 97 KB, 16 ms |
-
-- `PngCompression::Fast` is about 23 times faster than `Balanced` for 11%
-  more bytes on the photograph, but 3.3 times the bytes on graphics.
-  `Balanced` stays the default because it suits graphics and keeps 2.0's
-  bytes.
-- Lossless WebP is the lossless choice for camera video: 17% smaller than PNG
-  `Balanced` and about 29 times faster. On graphics it is 2.2 times PNG's
-  size.
-- Converting YUV adds about 6 ms at 1080p, 24 ms at 4K and 95 ms at 8K. The
-  [performance notes](image-encoding-performance.md) give every output by
-  source format and size.
-
-PNG and JPEG convert one row at a time, so their conversion scratch never
-grows with the frame's height:
-
-| Configuration | PNG scratch | JPEG heap scratch | WebP buffer |
-| --- | --- | --- | --- |
-| RGBA, contiguous rows | None: rows are read in place | None | None: the frame is read in place |
-| RGBA with padded rows | None | None | width × height × 4 bytes |
-| Otherwise, 8 bits | One row: width × 4 bytes, × 3 with `AlphaMode::Discard` | None: pixels convert into the codec's rows | width × height × 4 bytes, × 3 with `Discard` |
-| 16 bits, any format | One row: width × 8 bytes, × 6 with `Discard` | — | — |
-| With `Downscale` by f | ceil(width / f) × 16 bytes of sums (× 32 at 16 bits) and one reduced row | The sums | The reduced image, and the sums |
-
-Codec state, the encoded image and data-URL text are extra.
+PNG and JPEG convert rows incrementally. WebP may hold a whole converted image.
+Codec state and encoded output use additional memory. See the
+[performance measurements](image-encoding-performance.md) for timings, memory bounds
+and the hardware and inputs used.
 
 ## Errors
 
@@ -315,38 +232,13 @@ writes a quarter-size JPEG of the frame at each.
 cargo run --example file_thumbnails --features file-io,image-encoding -- take_001.mkv 8
 ```
 
-It is an example rather than an API, because it advertises an NDI source and
-needs the Advanced runtime on Linux, macOS and Android. Its choices rest on
-measurements with the 6.4.0.2 Advanced runtime and File library and a SpeedHQ
-recording of a 1280×720 source:
+The example discovers the player's source in its private group, receives at full
+bandwidth and reduces each image with `Downscale::Quarter`. After seeking, it
+waits for a frame matching the `FirstFrame` event's timecode to avoid queued frames
+from before the seek. This workflow was measured with a SpeedHQ recording;
+H.264 and HEVC seek behavior was not measured.
 
-| Question | Finding |
-| --- | --- |
-| Does a played frame keep its sender's timecode? | Yes: the `FirstFrame` event's source timecode equals the next frame's, at the start and after a seek |
-| Which frame arrives first after a seek? | Whatever the receiver has queued; the target frame follows within milliseconds |
-| Can a receiver use `player.advertised_source()`? | No: it has no address. A `Finder` in the player's groups lists the source with one |
-| Does a `Lowest`-bandwidth receiver get video? | Only from a recording with a proxy track |
+## Validation
 
-So it finds the player with a finder in its group, receives at full bandwidth
-with `Downscale::Quarter` rather than through `snapshot_preset`, and after each
-seek discards frames until one carries the `FirstFrame` event's timecode.
-H.264 and HEVC recordings, where a seek lands on the keyframe at or before the
-time asked for, were not measured.
-
-## Testing
-
-- Unit tests, with no runtime: `cargo test --lib --features image-encoding`.
-  They check every reader, matrix, range and depth against an `f64` reference
-  of the formulas, flat colors through a round trip of every layout, chroma
-  siting, padded and odd-sized layouts, the 2.0 byte-identity hashes,
-  `ndi_color_info` parsing (with a seeded mutation test), the `cICP` chunk, the
-  HDR and option checks, every PNG level and lossless WebP decoding back
-  exactly, and the allocation bounds above.
-- `tests/image_color_sdk.rs` pins the SDK's color behavior on a real runtime,
-  on loopback with `--config ci/offline.toml`.
-- `tests/video_padding_sdk.rs` encodes UYVY and P216 frames read in place from
-  the SDK's padded rows; run it under Valgrind Memcheck by hand to check that
-  no padding is read.
-- `cargo test --release --lib --features image-encoding image_encoding_resources -- --ignored --nocapture`
-  measures time and peak memory; see the
-  [performance notes](image-encoding-performance.md).
+See [SDK validation](sdk-validation.md#image-encoding) and the
+[performance notes](image-encoding-performance.md) for tests and benchmark commands.

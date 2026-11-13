@@ -1,14 +1,11 @@
 # Advanced SDK integration
 
 The `advanced` Cargo feature adds the `grafton_ndi::advanced` module: the parts
-of NDI that only the NDI Advanced SDK provides. This guide explains what the
-module needs, how it reports that something is missing, and the ownership rules
-its types follow. The rustdoc of each type is the reference. Where an example
-program shows a type in use, its section names the file.
+of NDI that only the NDI Advanced SDK provides.
 
 ## Requirements
 
-Using the module needs three things, in this order:
+To run Advanced operations:
 
 1. The `advanced` Cargo feature.
 
@@ -17,22 +14,9 @@ Using the module needs three things, in this order:
    grafton-ndi = { version = "3.0", features = ["advanced"] }
    ```
 
-2. An NDI Advanced SDK on the machine that builds the crate. The Advanced SDK
-   headers may not be redistributed, so the crate does not contain them. Their
-   declarations, types and constants are generated with bindgen at build time
-   from the SDK named by `NDI_SDK_DIR`, or from a default installation
-   directory. The crate itself carries only what it needs to call the SDK: the
-   name and signature of each Advanced function it uses, which the build checks
-   against the generated declarations, and the byte layout of the compressed
-   packet header it reads and writes. The generation step needs a `libclang`
-   shared library; a build that finds an Advanced SDK and no `libclang` fails.
-
-   Without `NDI_SDK_DIR`, the build looks only where the Advanced SDK
-   installer puts the SDK: `/usr/share/NDI Advanced SDK for Linux`,
-   `/Library/NDI Advanced SDK for Apple` or
-   `C:\Program Files\NDI\NDI 6 Advanced SDK`. An SDK whose `include`
-   directory has no `Processing.NDI.Advanced.h` is a Standard SDK, and a build
-   with it has no Advanced declarations.
+2. An installed NDI Advanced SDK and `libclang` on the build machine. Set
+   `NDI_SDK_DIR` to the SDK root, or use the default Advanced SDK installation.
+   The build generates declarations locally because the headers cannot be redistributed.
 
 3. An Advanced SDK runtime when the program runs. Without an edition request
    the search accepts either edition and, in a build with this feature, tries
@@ -40,112 +24,27 @@ Using the module needs three things, in this order:
    runtime, `Ndi::new()` succeeds and the Advanced operations report
    `Error::UnsupportedCapability`. Request `SdkEdition::Advanced` to require
    the Advanced runtime when it is selected. See
-   [SDK editions](../README.md#sdk-editions) in the README.
+   [SDK editions](setup.md#sdk-editions).
 
 Enabling the feature neither selects an SDK edition nor grants a license
 entitlement. The Advanced SDK 6.3.2 and 6.4.0.2 have been tested; see
 [SDK validation](sdk-validation.md).
 
-## When a requirement is missing
+## Check availability
 
-The public API of the module is the same in every build. What differs is what
-an operation returns:
+The public API compiles with or without Advanced headers. Native operations
+report missing requirements at runtime; pure data types remain usable.
 
-| Situation | Result of a native operation |
-| --- | --- |
-| Built without Advanced SDK headers, or with headers that do not declare the operation's functions | `Error::UnsupportedCapability` with `reason` `BuildAbiUnavailable`; `detail` names the first function the build does not declare. Rebuild with `NDI_SDK_DIR` naming an Advanced SDK whose headers declare it |
-| Built with headers that do not declare the requested `PassthroughPreset` | `Error::UnsupportedCapability` for `RuntimeFeature::Passthrough` with that preset, with `reason` `BuildAbiUnavailable`; `detail` names the receiver color format the headers lack |
-| Standard runtime selected | `Error::UnsupportedCapability` with `reason` `WrongEdition`; `detail` names the operation's function when the runtime does not export it |
-| Advanced runtime that does not export a function the operation needs | `Error::UnsupportedCapability` with `reason` `SymbolUnavailable`; `detail` names the function |
-| Advanced runtime without the core capability whose functions the created object goes on to use (`Routing` for a configured router, the advertising or discovery capability for a configured Discovery Server object) | `Error::UnsupportedCapability` for the operation's own `RuntimeFeature`, with the `reason` and `detail` that core capability gives, such as `SymbolUnavailable` and the function the runtime does not export |
-| Every requirement met | The operation runs |
+Call `ndi.require_feature(feature)` before an optional workflow, or inspect
+`ndi.capabilities().status(feature)`. `UnsupportedCapability` reports the feature,
+reason and detail. Missing build declarations produce `BuildAbiUnavailable`; a
+Standard runtime produces `WrongEdition`; missing runtime functions produce
+`SymbolUnavailable`. Older headers disable only the operations they lack.
+Discovery Server objects also require NDI 6.4 or later.
 
-`feature` is the `RuntimeFeature` the operation needs and `reason` a
-`CapabilityUnavailable`, so a program can branch on both without reading the
-message.
-
-Older or partial Advanced SDK headers disable only the operations whose
-functions they do not declare; the rest of the module keeps working. Core
-operations are unaffected in every case. The module's data types work in every
-build as well: packet formats, compressed frames, packet envelopes, scatter
-frames, options and limits can be constructed, validated and inspected without
-the Advanced SDK.
-
-The Discovery Server advertisers and listeners also need an NDI 6.4.0 or later
-runtime, with or without a configuration, so an Advanced 6.3.2 runtime refuses
-to create them, reporting `RuntimeTooOld`: without a configuration for their
-core capability, and with one for their Advanced capability.
-
-## Capabilities
-
-Every group of Advanced functions is one `RuntimeFeature`, which
-`ndi.capabilities().status(feature)` reports in advance. An operation is
-refused exactly when `require_feature` refuses its feature, with the same
-error. Each capability is checked separately, so a successful check covers
-only the operations it names:
-
-| `RuntimeFeature` | Operations |
-| --- | --- |
-| `AdvancedFinderConfiguration` | `Finder::new` with a configuration |
-| `AdvancedSenderConfiguration` | `Sender::new` and `QueuedSender::new` with a configuration, `CompressedSender::new` |
-| `AdvancedReceiverConfiguration` | `Receiver::new` with a configuration |
-| `AdvancedRouterConfiguration` | `Router::new` with a configuration |
-| `AdvancedSenderAdvertiserConfiguration`, `AdvancedReceiverAdvertiserConfiguration` | `SendAdvertiser::new`, `RecvAdvertiser::new` with a configuration |
-| `AdvancedSenderListenerConfiguration`, `AdvancedReceiverListenerConfiguration` | `SendListener::new`, `RecvListener::new` with a configuration |
-| `SourceMetadata` | `Finder::sources_with_metadata` |
-| `RouterConnectionMetadata` | `Router::add_connection_metadata`, `clear_connection_metadata` |
-| `SenderTally` | `Sender::set_external_tally` |
-| `EncoderGuidance` | `target_frame_bytes`, `target_bit_rate`, `legacy_quality` |
-| `EncoderQualityPlanning` | `quality_plan` |
-| `KeyframeDemand` | `keyframe_required`, `wait_for_keyframe_change` |
-| `KeyframeRequest` | `request_keyframe` |
-| `ScatterSend` | the scatter sends of `CompressedSender` |
-| `ReceiverStreamTier` | `set_stream_tier` |
-| `ReceiverStreamSelection` | `set_streams` |
-| `ReceiveAllocators` | `AllocatorService::attach`, `attach_packets` |
-| `SendCompletion` | `QueuedSender::new`, `from_sender` |
-| `AvSync` | `AvSync::new` |
-| `Genlock` | `Genlock::new` |
-| `Kvm` | `Receiver::kvm` |
-| `Passthrough(preset)` | `PacketReceiver::new` with that preset |
-
-A packet receiver is created as a receiver with a configuration is, so
-`Passthrough` needs everything `AdvancedReceiverConfiguration` does, and also
-that the build's headers declare the receiver color format that selects the
-preset. Each configured object that goes on to use the functions of a core
-capability requires it: `AdvancedRouterConfiguration` requires `Routing`, and
-the four advertiser and listener configurations require `SenderAdvertising`,
-`ReceiverAdvertising`, `SenderDiscovery` and `ReceiverDiscovery`, and so NDI
-6.4.0 or later. Once its own functions are in place, such a capability is
-unavailable whenever the one it requires is, and reports that one's reason, so
-creating the object is refused for its own capability, with the core
-capability's evidence, and never for the core one.
-
-A runtime that exports only one of the two creation functions
-`NDIlib_send_create_v2` and `NDIlib_recv_create_v4` is not an Advanced SDK
-runtime, so every Advanced capability is refused for it:
-
-```rust
-use grafton_ndi::{capabilities::RuntimeFeature, Ndi};
-
-fn main() -> grafton_ndi::Result<()> {
-    let ndi = Ndi::new()?;
-    match ndi.require_feature(RuntimeFeature::AdvancedSenderConfiguration) {
-        Ok(()) => println!("Advanced sender configuration can be used"),
-        Err(error) => println!("{error}"),
-    }
-    Ok(())
-}
-```
-
-Types built around one group of functions report a missing requirement when
-they are created: `AvSync`, `Genlock`, `QueuedSender`, `PacketReceiver`,
-`KvmSession` (through `Receiver::kvm`) and the allocator attachments
-(`AllocatorService::attach` and `attach_packets`). `CompressedSender` checks
-sender configuration when it is created, and its scatter sends, encoder
-guidance and keyframe methods check their own functions when they are called.
-The Advanced methods on the ordinary `Sender`, `Receiver` and `Router` report a
-missing requirement when they are called.
+The [capability reference](https://docs.rs/grafton-ndi/latest/grafton_ndi/enum.RuntimeFeature.html)
+lists each feature. Packet formats, envelopes and options work without native
+support. See [runtime setup](setup.md#runtime-capabilities).
 
 ## Ownership
 
@@ -591,28 +490,8 @@ best-effort basis; call `release_all` to learn whether that succeeded.
 
 Example: `examples/advanced_kvm.rs`.
 
-## Running the tests
+## Validation
 
-The Advanced tests compile in every build with the `advanced` feature. Those
-that need an Advanced runtime start with the `advanced_ndi()` test helper and
-are skipped, with a message, when the build lacks the declarations for sender
-configuration or the selected runtime is a Standard one.
-
-To run them, build with the Advanced SDK and select its runtime. On Linux
-x86_64:
-
-```sh
-export NDI_SDK_DIR="/path/to/NDI Advanced SDK for Linux"
-export NDI_RUNTIME_DIR_V6="$NDI_SDK_DIR/lib/x86_64-linux-gnu"
-GRAFTON_NDI_REQUIRE_RUNTIME=advanced cargo test --locked --config ci/offline.toml --features advanced
-```
-
-`GRAFTON_NDI_REQUIRE_RUNTIME=advanced` makes a test that would have skipped
-fail instead, so the run cannot pass without exercising the Advanced runtime.
-The tests create their own senders and receivers and need no hardware. Those
-announce themselves on the network like any NDI program; `--config
-ci/offline.toml` confines them to loopback networking and needs `bubblewrap`.
-
-CI runs them against the Advanced runtimes that the README's
-[Platforms](../README.md#platforms) table lists. They do not cover KVM against
-a real source, real codec bitstreams or license entitlements.
+See [SDK validation](sdk-validation.md) and the [contributor checks](../CONTRIBUTING.md).
+The suite includes H.264 and HEVC decode tests where a decoder is available.
+It does not establish interoperability with arbitrary hardware or license entitlements.

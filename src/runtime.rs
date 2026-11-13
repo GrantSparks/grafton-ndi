@@ -33,7 +33,7 @@
 //! # }
 //! ```
 //!
-//! Building this crate needs no NDI SDK. A selected shared library stays
+//! Default builds on dynamically loaded targets need no NDI SDK. A selected shared library stays
 //! loaded for the life of the process, including after the last [`Ndi`] handle
 //! is dropped. Statically linked targets use the SDK archive linked at build
 //! time, and selecting it loads nothing.

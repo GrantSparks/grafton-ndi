@@ -435,10 +435,6 @@ is pushed:
 5. **Archive token** (optional, see [Who can reach the secrets](#who-can-reach-the-secrets)):
    replace it with a fine-grained, read-only, expiring token.
 
-No longer read by the workflows: the per-package `NDI_SDK_*_URL` secrets and
-`NDI_SDK_*_SHA256` variables. Nothing deploys to the `github-pages` environment
-any more.
-
 ## Running the checks locally
 
 ```sh
