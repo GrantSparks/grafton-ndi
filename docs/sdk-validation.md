@@ -106,6 +106,23 @@ An operation whose capability is unavailable returns
 6.3.2 SDKs include no File library; the File library of the 6.4.0.2 SDK was
 tested only beside the Advanced 6.4.0.2 runtime.
 
+### Image encoding
+
+The image encoding of 3.0 was added after the runs above, so their counts do
+not include its tests. On 2026-11-13, on the same machine:
+
+| Test | Runtimes | Result |
+| --- | --- | --- |
+| `tests/image_color_sdk.rs`, the SDK's color conversion pinned (BT.709 at 720×576, 1920×1080 and 3840×2160 whatever the tag, tags passed through, repeated chroma, RGB sent as BT.709 limited range, a PQ tag reaching an RGB receiver, FrameSync frames) | Standard 6.1.1, 6.3.2 and 6.4.0.2; Advanced 6.4.0.2 | 5 of 5 passed on each |
+| `tests/video_padding_sdk.rs`, UYVY and P216 frames encoded in place from the SDK's padded rows | Standard 6.4.0.2 | 2 of 2 passed |
+| The same under Valgrind Memcheck | Standard 6.3.2 and 6.4.0.2 | No errors in the crate's code; four in glibc's dynamic loader with 6.3.2, none with 6.4.0.2 |
+
+Memcheck also found that the 6.3.2 runtime reads up to 28 bytes past the end
+of a UYVY frame it sends from a buffer that holds the frame exactly. The test
+sends from a buffer with slack; the 6.4.0.2 runtime was not run against an
+exact buffer. See the [image encoding guide](image-encoding.md) and its
+[performance notes](image-encoding-performance.md).
+
 ### Static checks
 
 On the same machine these checks passed: formatting; clippy with warnings

@@ -425,8 +425,8 @@ impl ReceiverOptions {
     ///
     /// Suited to image export, thumbnails and analysis pipelines, and to
     /// networks with little bandwidth to spare:
-    /// - color format [`ReceiverColorFormat::RgbxRgba`], which the image
-    ///   encoders take;
+    /// - color format [`ReceiverColorFormat::RgbxRgba`], which image
+    ///   encoding reads without converting color;
     /// - bandwidth [`ReceiverBandwidth::Lowest`], the source's preview stream;
     /// - video fields not allowed, so interlaced video arrives as whole frames.
     ///

@@ -846,6 +846,14 @@ crate::frames::video_accessors! {
         /// [`Self::data`] includes, so the active pixels of a padded buffer
         /// can be read in place.
     }
+    images("", "\
+ # use grafton_ndi::{BorrowedVideoFrame, PixelFormat};
+ # let pixels = vec![128; 64 * 36 * 2];
+ # let frame = BorrowedVideoFrame::builder(&pixels, 64, 36, PixelFormat::Uyvy).build()?;") {
+        /// It encodes the application's own buffer in place, padded rows
+        /// included, so a program can keep a still of what it sends without
+        /// copying the frame.
+    }
 }
 
 impl<'buf> BorrowedVideoFrame<'buf> {

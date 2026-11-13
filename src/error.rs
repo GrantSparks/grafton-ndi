@@ -316,17 +316,19 @@ pub enum Error {
     #[error("Invalid File API state: {0}")]
     InvalidState(crate::file::StateError),
 
-    /// An operating-system operation of the File API failed.
+    /// An operating-system operation failed.
     ///
-    /// * Resolving a relative path against the current directory, which may
-    ///   be unavailable.
-    /// * Checking, before a recording starts or rolls over, that the
-    ///   directory of its first file exists and can be written to, and that an
-    ///   exact file name does not exist yet
+    /// * File API: resolving a relative path against the current directory,
+    ///   which may be unavailable.
+    /// * File API: checking, before a recording starts or rolls over, that
+    ///   the directory of its first file exists and can be written to, and
+    ///   that an exact file name does not exist yet
     ///   ([`AlreadyExists`](std::io::ErrorKind::AlreadyExists)).
-    /// * Starting the thread of an async File handle or probe, or the timer
-    ///   thread that async event waits share.
-    #[cfg(feature = "file-io")]
+    /// * File API: starting the thread of an async File handle or probe, or
+    ///   the timer thread that async event waits share.
+    /// * Image encoding: the writer given to a frame's `encode_image_to`
+    ///   failed. The error is the writer's own.
+    #[cfg(any(feature = "file-io", feature = "image-encoding"))]
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

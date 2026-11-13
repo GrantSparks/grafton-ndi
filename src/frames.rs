@@ -671,12 +671,14 @@ fn packed_video<P: VideoParts + ?Sized>(
 /// validated parts.
 ///
 /// A frame type passes its `impl` header; its `Debug` name and the layout
-/// field that sizes its pixel data; and, for the accessors whose meaning
-/// differs between types, the type-specific paragraph of their docs. A
-/// frame that can hold received pixels, a capture or an owned frame that
-/// may be a copy of one, also passes `timestamp` and `encoders`, the
-/// receive method its encoder examples capture with: it gets a timestamp
-/// and image encoders. A frame built only for sending has neither.
+/// field that sizes its pixel data; for the accessors whose meaning differs
+/// between types, the type-specific paragraph of their docs; and in `images`
+/// the code-block options and hidden lines that make a `frame` of its type
+/// for the examples of `color_info` and the image encoders, with the
+/// type-specific paragraph of the encoders' docs. A frame that can hold
+/// received pixels, a capture or an owned frame that may be a copy of one,
+/// also passes `timestamp`: it gets a timestamp. A frame built only for
+/// sending has none.
 macro_rules! video_accessors {
     (
         $(#[$attr:meta])*
@@ -686,7 +688,7 @@ macro_rules! video_accessors {
         line_stride_bytes { $(#[$line_stride:meta])* }
         plane { $(#[$plane:meta])* }
         timestamp { $(#[$timestamp:meta])* }
-        encoders($capture:ident) { $(#[$encoders:meta])* }
+        images($fence:literal, $example:literal) { $(#[$images:meta])* }
     ) => {
         $crate::frames::video_accessors! {
             @shared
@@ -696,6 +698,7 @@ macro_rules! video_accessors {
             timecode { $(#[$timecode])* }
             line_stride_bytes { $(#[$line_stride])* }
             plane { $(#[$plane])* }
+            images($fence, $example) { $(#[$images])* }
             items {
                 /// Get the time the sender submitted this frame.
                 ///
@@ -703,157 +706,6 @@ macro_rules! video_accessors {
                 #[inline]
                 pub fn timestamp(&self) -> Option<$crate::SdkTimestamp> {
                     $crate::frames::VideoParts::sdk_timestamp(self)
-                }
-
-                #[cfg(feature = "image-encoding")]
-                fn image_source(&self) -> $crate::Result<$crate::frames::ImagePixelSource<'_>> {
-                    $crate::frames::ImagePixelSource::from_plane(
-                        *$crate::frames::VideoParts::layout(self),
-                        self.plane(0).expect("validated video plane"),
-                    )
-                }
-
-                /// Encode the video frame as PNG bytes.
-                ///
-                $(#[$encoders])*
-                ///
-                /// This method encodes the frame to PNG format, automatically handling color format
-                /// conversion from the NDI frame format (BGRA/RGBA/etc.) to PNG-compatible RGBA.
-                ///
-                /// # Supported Formats
-                ///
-                /// - `RGBA`: Direct active-row encoding without a pixel copy
-                /// - `BGRA`: Swaps red and blue channels and preserves alpha
-                /// - `RGBX`: Treats the fourth byte as padding and writes opaque alpha
-                /// - `BGRX`: Swaps red/blue and writes opaque alpha
-                /// - Other formats: Returns an error (unsupported for now)
-                ///
-                /// # Stride Handling
-                ///
-                /// This method consumes active pixels row-by-row according to the frame's
-                /// validated line stride. Valid row padding is skipped. RGBA rows borrow
-                /// directly; other supported formats reuse at most `width * 4` scratch bytes.
-                /// Codec buffers and encoded output require additional memory.
-                ///
-                /// # Errors
-                ///
-                /// Returns an error if:
-                /// - The frame format is not RGBA/RGBX/BGRA/BGRX
-                /// - PNG encoding fails
-                ///
-                /// # Example
-                ///
-                /// ```no_run
-                /// # use grafton_ndi::{Ndi, Finder, FinderOptions, ReceiverOptions, Receiver, ReceiverColorFormat};
-                /// # use std::time::Duration;
-                /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-                /// # let ndi = Ndi::new()?;
-                /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-                /// # finder.wait_for_sources(Duration::from_millis(1000))?;
-                /// # let sources = finder.current_sources()?;
-                /// # let Some(source) = sources.first() else { return Ok(()); };
-                /// # let options = ReceiverOptions::new(source.clone()).color_format(ReceiverColorFormat::RgbxRgba);
-                /// # let receiver = Receiver::new(&ndi, &options)?;
-                #[doc = concat!(" # let Some(video_frame) = receiver.video().", stringify!($capture), "(Duration::from_secs(5))? else { return Ok(()); };")]
-                /// let png_bytes = video_frame.encode_png()?;
-                /// std::fs::write("frame.png", &png_bytes)?;
-                /// # Ok(())
-                /// # }
-                /// ```
-                #[cfg(feature = "image-encoding")]
-                pub fn encode_png(&self) -> $crate::Result<Vec<u8>> {
-                    self.image_source()?.encode_png()
-                }
-
-                /// Encode the video frame as JPEG bytes with the specified quality.
-                ///
-                $(#[$encoders])*
-                ///
-                /// This method encodes the frame to JPEG format, automatically handling color format
-                /// conversion from the NDI frame format into codec component rows without
-                /// a full-frame RGB staging buffer. Codec/output storage is additional.
-                ///
-                /// # Arguments
-                ///
-                /// * `quality` - JPEG quality from 1 (lowest) to 100 (highest). Typical values are 80-95.
-                ///
-                /// # Supported Formats
-                ///
-                /// - `RGBA` / `RGBX`: Emits RGB
-                /// - `BGRA` / `BGRX`: Swaps red/blue and emits RGB
-                /// - Other formats: Returns an error (unsupported for now)
-                ///
-                /// # Errors
-                ///
-                /// Returns an error if:
-                /// - The frame format is not RGBA/RGBX/BGRA/BGRX
-                /// - The quality is outside `1..=100`
-                /// - The dimensions exceed JPEG's `u16` width/height range
-                /// - JPEG encoding fails
-                ///
-                /// # Example
-                ///
-                /// ```no_run
-                /// # use grafton_ndi::{Ndi, Finder, FinderOptions, ReceiverOptions, Receiver, ReceiverColorFormat};
-                /// # use std::time::Duration;
-                /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-                /// # let ndi = Ndi::new()?;
-                /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-                /// # finder.wait_for_sources(Duration::from_millis(1000))?;
-                /// # let sources = finder.current_sources()?;
-                /// # let Some(source) = sources.first() else { return Ok(()); };
-                /// # let options = ReceiverOptions::new(source.clone()).color_format(ReceiverColorFormat::RgbxRgba);
-                /// # let receiver = Receiver::new(&ndi, &options)?;
-                #[doc = concat!(" # let Some(video_frame) = receiver.video().", stringify!($capture), "(Duration::from_secs(5))? else { return Ok(()); };")]
-                /// let jpeg_bytes = video_frame.encode_jpeg(85)?;
-                /// std::fs::write("frame.jpg", &jpeg_bytes)?;
-                /// # Ok(())
-                /// # }
-                /// ```
-                #[cfg(feature = "image-encoding")]
-                pub fn encode_jpeg(&self, quality: u8) -> $crate::Result<Vec<u8>> {
-                    self.image_source()?.encode_jpeg(quality)
-                }
-
-                /// Encode the video frame as a base64 data URL for embedding in HTML/JSON.
-                ///
-                $(#[$encoders])*
-                ///
-                /// This produces a string in the format: `data:image/png;base64,...` or
-                /// `data:image/jpeg;base64,...` that can be directly used in HTML `<img>` tags
-                /// or stored in JSON.
-                ///
-                /// # Arguments
-                ///
-                /// * `format` - The image format to use (PNG or JPEG with quality)
-                ///
-                /// # Example
-                ///
-                /// ```no_run
-                /// # use grafton_ndi::{Ndi, Finder, FinderOptions, ReceiverOptions, Receiver, ReceiverColorFormat, ImageFormat};
-                /// # use std::time::Duration;
-                /// # fn main() -> Result<(), grafton_ndi::Error> {
-                /// # let ndi = Ndi::new()?;
-                /// # let finder = Finder::new(&ndi, &FinderOptions::default())?;
-                /// # finder.wait_for_sources(Duration::from_millis(1000))?;
-                /// # let sources = finder.current_sources()?;
-                /// # let Some(source) = sources.first() else { return Ok(()); };
-                /// # let options = ReceiverOptions::new(source.clone()).color_format(ReceiverColorFormat::RgbxRgba);
-                /// # let receiver = Receiver::new(&ndi, &options)?;
-                #[doc = concat!(" # let Some(video_frame) = receiver.video().", stringify!($capture), "(Duration::from_secs(5))? else { return Ok(()); };")]
-                ///
-                /// // As PNG
-                /// let data_url = video_frame.encode_data_url(ImageFormat::Png)?;
-                /// println!("<img src=\"{}\">", data_url);
-                ///
-                /// // As JPEG with quality 90
-                /// let data_url = video_frame.encode_data_url(ImageFormat::Jpeg(90))?;
-                /// # Ok(())
-                /// # }
-                /// ```
-                #[cfg(feature = "image-encoding")]
-                pub fn encode_data_url(&self, format: $crate::frames::ImageFormat) -> $crate::Result<String> {
-                    self.image_source()?.encode_data_url(format)
                 }
             }
         }
@@ -865,6 +717,7 @@ macro_rules! video_accessors {
         timecode { $(#[$timecode:meta])* }
         line_stride_bytes { $(#[$line_stride:meta])* }
         plane { $(#[$plane:meta])* }
+        images($fence:literal, $example:literal) { $(#[$images:meta])* }
     ) => {
         $crate::frames::video_accessors! {
             @shared
@@ -874,6 +727,7 @@ macro_rules! video_accessors {
             timecode { $(#[$timecode])* }
             line_stride_bytes { $(#[$line_stride])* }
             plane { $(#[$plane])* }
+            images($fence, $example) { $(#[$images])* }
             items {}
         }
     };
@@ -887,6 +741,7 @@ macro_rules! video_accessors {
         timecode { $(#[$timecode:meta])* }
         line_stride_bytes { $(#[$line_stride:meta])* }
         plane { $(#[$plane:meta])* }
+        images($fence:literal, $example:literal) { $(#[$images:meta])* }
         items { $($items:tt)* }
     ) => {
         $(#[$attr])*
@@ -958,6 +813,38 @@ macro_rules! video_accessors {
                     .map($crate::frames::MetadataText::as_str)
             }
 
+            /// Read the color description in the frame's `ndi_color_info`
+            /// metadata.
+            ///
+            /// Returns `Ok(None)` when the frame has no metadata or no such
+            /// element, which means BT.709 SDR with unknown primaries. See
+            /// [`ColorInfo`](crate::ColorInfo) for what the element holds and
+            /// how the SDK treats it. Image encoding reads the same
+            /// description, so a program can check a frame, for an HDR
+            /// transfer for example, before it encodes it.
+            ///
+            /// # Errors
+            ///
+            /// [`Error::InvalidFrame`](crate::Error::InvalidFrame), naming the
+            /// attribute and its value, when the element is malformed or
+            /// truncated, gives a value outside the SDK's list, or appears more
+            /// than once with different values.
+            ///
+            /// # Example
+            ///
+            #[doc = concat!("```", $fence)]
+            #[doc = $example]
+            /// match frame.color_info()? {
+            ///     Some(color) if color.is_hdr() => println!("HDR: {:?}", color.transfer()),
+            ///     Some(color) => println!("SDR, matrix {:?}", color.matrix()),
+            ///     None => println!("BT.709 SDR"),
+            /// }
+            /// # Ok::<(), Box<dyn std::error::Error>>(())
+            /// ```
+            pub fn color_info(&self) -> $crate::Result<Option<$crate::ColorInfo>> {
+                $crate::color_info::parse(self.metadata())
+            }
+
             /// Get one plane in SDK memory order, or `None` for an invalid index.
             ///
             /// Plane order follows the pixel format, as for
@@ -974,6 +861,194 @@ macro_rules! video_accessors {
             #[inline]
             pub fn planes(&self) -> $crate::VideoPlanes<'_> {
                 $crate::frames::VideoParts::plane_views(self)
+            }
+
+            /// Encode the frame as an image, as `options` describe.
+            ///
+            /// Every uncompressed pixel format encodes, as PNG, JPEG or
+            /// lossless WebP. YUV is converted to RGB as the NDI SDK converts
+            /// it, with BT.709, limited range and repeated chroma, unless the
+            /// frame's `ndi_color_info` metadata names another matrix; a frame
+            /// tagged PQ or HLG is refused unless the options ask for its code
+            /// values. See
+            /// [`ImageOptions`](crate::ImageOptions) for formats, color, HDR,
+            /// bit depth, alpha, reduction, cost and memory.
+            ///
+            $(#[$images])*
+            ///
+            /// Encoding is CPU work, tens to hundreds of milliseconds for a
+            /// 1080p frame: async code runs it on a blocking thread with an
+            /// owned frame.
+            ///
+            /// # Errors
+            ///
+            /// [`Error::InvalidInput`](crate::Error::InvalidInput) for options
+            /// that conflict: a JPEG quality outside 1 to 100, 16 bits or HDR
+            /// code values for JPEG or WebP.
+            /// [`Error::InvalidFrame`](crate::Error::InvalidFrame) for a frame
+            /// the options cannot encode: a PQ or HLG frame under
+            /// [`HdrPolicy::Refuse`](crate::HdrPolicy::Refuse), unreadable
+            /// `ndi_color_info` under [`ColorPolicy::Sdk`](crate::ColorPolicy::Sdk),
+            /// or an image larger than its codec allows; and when the codec
+            /// fails.
+            ///
+            /// # Example
+            ///
+            #[doc = concat!("```", $fence)]
+            #[doc = $example]
+            /// use grafton_ndi::{Downscale, ImageFormat, ImageOptions, PngCompression};
+            ///
+            /// let options = ImageOptions::new(ImageFormat::Png)
+            ///     .png_compression(PngCompression::Fast)
+            ///     .downscale(Downscale::Half);
+            /// let png = frame.encode_image(&options)?;
+            /// # Ok::<(), Box<dyn std::error::Error>>(())
+            /// ```
+            #[cfg(feature = "image-encoding")]
+            pub fn encode_image(&self, options: &$crate::ImageOptions) -> $crate::Result<Vec<u8>> {
+                $crate::image::encode($crate::image::Source::new(self), options)
+            }
+
+            /// Encode the frame as an image, as `options` describe, writing it
+            /// into `out` as it encodes.
+            ///
+            /// It encodes as [`encode_image`](Self::encode_image) does, into
+            /// any writer, so a program that takes snapshots on a timer can
+            /// reuse one output buffer. A file or socket should be wrapped in
+            /// a [`BufWriter`](std::io::BufWriter): the codecs write in small
+            /// pieces.
+            ///
+            /// # Errors
+            ///
+            /// As for [`encode_image`](Self::encode_image), and
+            /// [`Error::Io`](crate::Error::Io) when `out` fails. Every check
+            /// of the options and the frame happens before anything is
+            /// written; after a later error, `out` may hold part of an image,
+            /// which the caller discards.
+            ///
+            /// # Example
+            ///
+            #[doc = concat!("```", $fence)]
+            #[doc = $example]
+            /// use grafton_ndi::{ImageFormat, ImageOptions};
+            ///
+            /// let options = ImageOptions::new(ImageFormat::Jpeg(85));
+            /// let mut jpeg = Vec::new();
+            /// for _ in 0..3 {
+            ///     jpeg.clear();
+            ///     frame.encode_image_to(&options, &mut jpeg)?;
+            ///     // Publish `jpeg`.
+            /// }
+            /// # Ok::<(), Box<dyn std::error::Error>>(())
+            /// ```
+            #[cfg(feature = "image-encoding")]
+            pub fn encode_image_to<W: ::std::io::Write>(
+                &self,
+                options: &$crate::ImageOptions,
+                mut out: W,
+            ) -> $crate::Result<()> {
+                $crate::image::encode_to($crate::image::Source::new(self), options, &mut out)
+            }
+
+            /// Encode the frame as an image, as `options` describe, in a
+            /// base64 data URL for HTML or JSON: `data:image/png;base64,`,
+            /// `data:image/jpeg;base64,` or `data:image/webp;base64,` and the
+            /// image.
+            ///
+            /// The string is allocated once, at its final length.
+            ///
+            /// # Errors
+            ///
+            /// As for [`encode_image`](Self::encode_image).
+            ///
+            /// # Example
+            ///
+            #[doc = concat!("```", $fence)]
+            #[doc = $example]
+            /// use grafton_ndi::{Downscale, ImageFormat, ImageOptions};
+            ///
+            /// let options = ImageOptions::new(ImageFormat::Jpeg(80)).downscale(Downscale::Quarter);
+            /// let url = frame.encode_image_data_url(&options)?;
+            /// println!("<img src=\"{url}\">");
+            /// # Ok::<(), Box<dyn std::error::Error>>(())
+            /// ```
+            #[cfg(feature = "image-encoding")]
+            pub fn encode_image_data_url(&self, options: &$crate::ImageOptions) -> $crate::Result<String> {
+                $crate::image::encode_data_url($crate::image::Source::new(self), options)
+            }
+
+            /// Encode the frame as an 8-bit RGBA PNG at the default
+            /// compression level.
+            ///
+            /// Exactly [`encode_image`](Self::encode_image) with
+            /// `ImageOptions::new(ImageFormat::Png)`, and its checks. A snapshot
+            /// loop of camera video is far faster with
+            /// [`PngCompression::Fast`](crate::PngCompression::Fast) or
+            /// [`ImageFormat::WebpLossless`](crate::ImageFormat::WebpLossless).
+            ///
+            /// # Errors
+            ///
+            /// As for [`encode_image`](Self::encode_image).
+            ///
+            /// # Example
+            ///
+            #[doc = concat!("```", $fence)]
+            #[doc = $example]
+            /// let png = frame.encode_png()?;
+            /// println!("{} bytes of PNG", png.len());
+            /// # Ok::<(), Box<dyn std::error::Error>>(())
+            /// ```
+            #[cfg(feature = "image-encoding")]
+            pub fn encode_png(&self) -> $crate::Result<Vec<u8>> {
+                self.encode_image(&$crate::ImageOptions::new($crate::ImageFormat::Png))
+            }
+
+            /// Encode the frame as a JPEG of `quality`, from 1, the lowest, to
+            /// 100, the highest; 80 to 95 are typical.
+            ///
+            /// Exactly [`encode_image`](Self::encode_image) with
+            /// `ImageOptions::new(ImageFormat::Jpeg(quality))`, and its checks.
+            ///
+            /// # Errors
+            ///
+            /// As for [`encode_image`](Self::encode_image): a quality outside
+            /// 1 to 100 is [`Error::InvalidInput`](crate::Error::InvalidInput).
+            ///
+            /// # Example
+            ///
+            #[doc = concat!("```", $fence)]
+            #[doc = $example]
+            /// let jpeg = frame.encode_jpeg(85)?;
+            /// println!("{} bytes of JPEG", jpeg.len());
+            /// # Ok::<(), Box<dyn std::error::Error>>(())
+            /// ```
+            #[cfg(feature = "image-encoding")]
+            pub fn encode_jpeg(&self, quality: u8) -> $crate::Result<Vec<u8>> {
+                self.encode_image(&$crate::ImageOptions::new($crate::ImageFormat::Jpeg(quality)))
+            }
+
+            /// Encode the frame in `format` as a base64 data URL.
+            ///
+            /// Exactly [`encode_image_data_url`](Self::encode_image_data_url)
+            /// with `ImageOptions::new(format)`, and its checks.
+            ///
+            /// # Errors
+            ///
+            /// As for [`encode_image`](Self::encode_image).
+            ///
+            /// # Example
+            ///
+            #[doc = concat!("```", $fence)]
+            #[doc = $example]
+            /// use grafton_ndi::ImageFormat;
+            ///
+            /// let url = frame.encode_data_url(ImageFormat::Jpeg(90))?;
+            /// println!("<img src=\"{url}\">");
+            /// # Ok::<(), Box<dyn std::error::Error>>(())
+            /// ```
+            #[cfg(feature = "image-encoding")]
+            pub fn encode_data_url(&self, format: $crate::ImageFormat) -> $crate::Result<String> {
+                self.encode_image_data_url(&$crate::ImageOptions::new(format))
             }
 
             $($items)*
@@ -1058,7 +1133,9 @@ video_accessors! {
         /// A frame has one only when it was copied from a received frame
         /// that carries one; frames built for sending have none.
     }
-    encoders(capture) {}
+    images("", "\
+ # use grafton_ndi::{PixelFormat, VideoFrame};
+ # let frame = VideoFrame::builder().resolution(64, 36).pixel_format(PixelFormat::Uyvy).build()?;") {}
 }
 
 impl VideoFrame {
@@ -1185,6 +1262,53 @@ impl VideoFrame {
         // SAFETY: forwarded to the caller; the borrow holds the descriptor.
         let frame = unsafe { ValidatedVideo::video(c_frame)? };
         Ok(frame.owned_copy())
+    }
+}
+
+#[cfg(all(test, feature = "image-encoding"))]
+impl VideoFrame {
+    /// A frame over `data` laid out with `line_stride`, which may pad its
+    /// rows, as received frames' strides do: owned frames are otherwise
+    /// packed.
+    pub(crate) fn with_line_stride(
+        pixel_format: PixelFormat,
+        width: u32,
+        height: u32,
+        line_stride: usize,
+        data: Vec<u8>,
+        metadata: Option<&str>,
+    ) -> Self {
+        let layout =
+            ValidatedVideoLayout::new_uncompressed(pixel_format, width, height, Some(line_stride))
+                .unwrap();
+        assert_eq!(data.len(), layout.data_len_bytes);
+        Self {
+            layout,
+            header: VideoHeader {
+                frame_rate: FrameRate::new(60, 1).unwrap(),
+                picture_aspect_ratio: 16.0 / 9.0,
+                scan_type: ScanType::Progressive,
+                timecode: Timecode::from_ticks(0),
+            },
+            data,
+            metadata: metadata.map(|text| FrameMetadata::new(text).unwrap()),
+            timestamp: None,
+        }
+    }
+
+    /// The frame as a captured reference to its own pixels, as a FrameSync
+    /// capture would lend it; dropping it frees nothing.
+    pub(crate) fn as_test_capture(&self) -> crate::FrameSyncVideoRef<'_> {
+        // SAFETY: the descriptor points into `self`, which the reference
+        // borrows, and the no-op free releases nothing it does not own.
+        unsafe {
+            VideoRef::new(Guard::<crate::capture::FrameSyncVideoFree>::with_test_free(
+                ptr::null_mut(),
+                self.to_raw(),
+                |_, _| {},
+            ))
+        }
+        .unwrap()
     }
 }
 
@@ -2353,316 +2477,6 @@ pub(crate) unsafe fn copy_sdk_string(text: *const c_char, operation: &str) -> Re
         ))
     })?;
     Ok(String::from_utf8_lossy(bytes).into_owned())
-}
-
-/// Image format specification for encoding video frames.
-///
-/// Used with [`VideoFrame::encode_data_url`] to specify the desired output format.
-///
-/// # Examples
-///
-/// ```
-/// use grafton_ndi::ImageFormat;
-///
-/// // PNG format (lossless)
-/// let png = ImageFormat::Png;
-///
-/// // JPEG with quality 85 (lossy, smaller file size)
-/// let jpeg = ImageFormat::Jpeg(85);
-/// ```
-///
-/// This enum is marked `#[non_exhaustive]` so that additional encoders can be
-/// added without a breaking change. Match arms should include a wildcard `_`
-/// pattern.
-#[cfg(feature = "image-encoding")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum ImageFormat {
-    /// PNG format (lossless compression)
-    Png,
-    /// JPEG format with quality setting (1-100, where 100 is highest quality)
-    Jpeg(u8),
-}
-
-#[cfg(feature = "image-encoding")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ImageChannelOrder {
-    Rgba,
-    Bgra,
-}
-
-#[cfg(feature = "image-encoding")]
-impl ImageChannelOrder {
-    fn red_index(self) -> usize {
-        match self {
-            Self::Rgba => 0,
-            Self::Bgra => 2,
-        }
-    }
-
-    fn blue_index(self) -> usize {
-        match self {
-            Self::Rgba => 2,
-            Self::Bgra => 0,
-        }
-    }
-}
-
-#[cfg(feature = "image-encoding")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ImageAlphaPolicy {
-    Preserve,
-    Opaque,
-}
-
-#[cfg(feature = "image-encoding")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ImagePixelFormat {
-    channel_order: ImageChannelOrder,
-    alpha_policy: ImageAlphaPolicy,
-}
-
-#[cfg(feature = "image-encoding")]
-impl ImagePixelFormat {
-    const BYTES_PER_PIXEL: usize = 4;
-
-    fn from_pixel_format(pixel_format: PixelFormat) -> Result<Self> {
-        match pixel_format {
-            PixelFormat::Rgba => Ok(Self {
-                channel_order: ImageChannelOrder::Rgba,
-                alpha_policy: ImageAlphaPolicy::Preserve,
-            }),
-            PixelFormat::Bgra => Ok(Self {
-                channel_order: ImageChannelOrder::Bgra,
-                alpha_policy: ImageAlphaPolicy::Preserve,
-            }),
-            PixelFormat::Rgbx => Ok(Self {
-                channel_order: ImageChannelOrder::Rgba,
-                alpha_policy: ImageAlphaPolicy::Opaque,
-            }),
-            PixelFormat::Bgrx => Ok(Self {
-                channel_order: ImageChannelOrder::Bgra,
-                alpha_policy: ImageAlphaPolicy::Opaque,
-            }),
-            _ => Err(Error::InvalidFrame(format!(
-                "Unsupported format for image encoding: {pixel_format:?}. Only RGBA/RGBX/BGRA/BGRX are supported."
-            ))),
-        }
-    }
-
-    fn can_borrow_png_rows(self) -> bool {
-        self.channel_order == ImageChannelOrder::Rgba
-            && self.alpha_policy == ImageAlphaPolicy::Preserve
-    }
-
-    fn rgba_pixel(self, pixel: &[u8]) -> [u8; 4] {
-        [
-            pixel[self.channel_order.red_index()],
-            pixel[1],
-            pixel[self.channel_order.blue_index()],
-            match self.alpha_policy {
-                ImageAlphaPolicy::Preserve => pixel[3],
-                ImageAlphaPolicy::Opaque => 255,
-            },
-        ]
-    }
-
-    fn rgb_pixel(self, pixel: &[u8]) -> [u8; 3] {
-        [
-            pixel[self.channel_order.red_index()],
-            pixel[1],
-            pixel[self.channel_order.blue_index()],
-        ]
-    }
-}
-
-#[cfg(feature = "image-encoding")]
-#[derive(Debug)]
-struct ImagePixelSource<'a> {
-    plane: VideoPlane<'a>,
-    width: usize,
-    height: usize,
-    pixel_format: ImagePixelFormat,
-}
-
-#[cfg(feature = "image-encoding")]
-impl<'a> ImagePixelSource<'a> {
-    fn encode_png(&self) -> Result<Vec<u8>> {
-        use png::{BitDepth, ColorType, Encoder};
-
-        use std::io::Write;
-
-        let width = u32::try_from(self.width).map_err(|_| {
-            Error::InvalidFrame(format!("PNG width {} exceeds u32 range", self.width))
-        })?;
-        let height = u32::try_from(self.height).map_err(|_| {
-            Error::InvalidFrame(format!("PNG height {} exceeds u32 range", self.height))
-        })?;
-        let mut conversion = self.png_conversion_row()?;
-
-        // Encode to PNG
-        let mut png_data = Vec::new();
-        let mut encoder = Encoder::new(&mut png_data, width, height);
-        encoder.set_color(ColorType::Rgba);
-        encoder.set_depth(BitDepth::Eight);
-
-        let png_error = |e| Error::InvalidFrame(format!("PNG encoding failed: {e}"));
-        let mut writer = encoder.write_header().map_err(png_error)?;
-        {
-            let mut stream = writer.stream_writer().map_err(png_error)?;
-            for row in self.plane.rows() {
-                let rgba = if self.pixel_format.can_borrow_png_rows() {
-                    row
-                } else {
-                    for (out, pixel) in conversion
-                        .as_chunks_mut::<4>()
-                        .0
-                        .iter_mut()
-                        .zip(row.as_chunks::<{ ImagePixelFormat::BYTES_PER_PIXEL }>().0)
-                    {
-                        *out = self.pixel_format.rgba_pixel(pixel);
-                    }
-                    &conversion
-                };
-                stream
-                    .write_all(rgba)
-                    .map_err(|e| Error::InvalidFrame(format!("PNG encoding failed: {e}")))?;
-            }
-            stream.finish().map_err(png_error)?;
-        }
-        writer.finish().map_err(png_error)?;
-
-        Ok(png_data)
-    }
-
-    fn encode_jpeg(&self, quality: u8) -> Result<Vec<u8>> {
-        use jpeg_encoder::Encoder as JpegEncoder;
-
-        let (width, height) = self.jpeg_dimensions(quality)?;
-
-        // Encode to JPEG
-        let mut jpeg_data = Vec::new();
-        let encoder = JpegEncoder::new(&mut jpeg_data, quality);
-        encoder
-            .encode_image(JpegRows {
-                source: self,
-                width,
-                height,
-            })
-            .map_err(|e| Error::InvalidFrame(format!("JPEG encoding failed: {e}")))?;
-
-        Ok(jpeg_data)
-    }
-
-    fn encode_data_url(&self, format: ImageFormat) -> Result<String> {
-        use base64::{engine::general_purpose::STANDARD, Engine};
-
-        let (mime_type, image_bytes) = match format {
-            ImageFormat::Png => ("image/png", self.encode_png()?),
-            ImageFormat::Jpeg(quality) => ("image/jpeg", self.encode_jpeg(quality)?),
-        };
-
-        let base64_data = STANDARD.encode(&image_bytes);
-        Ok(format!("data:{mime_type};base64,{base64_data}"))
-    }
-
-    fn from_plane(layout: ValidatedVideoLayout, plane: VideoPlane<'a>) -> Result<Self> {
-        let pixel_format = ImagePixelFormat::from_pixel_format(layout.pixel_format)?;
-        Ok(Self {
-            plane,
-            width: layout.width as usize,
-            height: layout.height as usize,
-            pixel_format,
-        })
-    }
-
-    fn png_conversion_row(&self) -> Result<Vec<u8>> {
-        if self.pixel_format.can_borrow_png_rows() {
-            return Ok(Vec::new());
-        }
-        let len = self.width.checked_mul(4).ok_or_else(|| {
-            Error::InvalidFrame(format!("PNG row size overflow: {}x4", self.width))
-        })?;
-        Ok(vec![0; len])
-    }
-
-    fn jpeg_dimensions(&self, quality: u8) -> Result<(u16, u16)> {
-        if !(1..=100).contains(&quality) {
-            return Err(Error::InvalidFrame(format!(
-                "JPEG quality must be in 1..=100, got {quality}"
-            )));
-        }
-
-        let width = u16::try_from(self.width).map_err(|_| {
-            Error::InvalidFrame(format!(
-                "JPEG width {} exceeds maximum supported value {}",
-                self.width,
-                u16::MAX
-            ))
-        })?;
-        let height = u16::try_from(self.height).map_err(|_| {
-            Error::InvalidFrame(format!(
-                "JPEG height {} exceeds maximum supported value {}",
-                self.height,
-                u16::MAX
-            ))
-        })?;
-
-        Ok((width, height))
-    }
-}
-
-/// Reads validated active rows directly into the codec's component buffers.
-/// No wrapper RGB staging allocation, including for padded captured frames.
-#[cfg(feature = "image-encoding")]
-struct JpegRows<'s, 'a> {
-    source: &'s ImagePixelSource<'a>,
-    width: u16,
-    height: u16,
-}
-
-#[cfg(feature = "image-encoding")]
-impl jpeg_encoder::ImageBuffer for JpegRows<'_, '_> {
-    fn get_jpeg_color_type(&self) -> jpeg_encoder::JpegColorType {
-        jpeg_encoder::JpegColorType::Ycbcr
-    }
-
-    fn width(&self) -> u16 {
-        self.width
-    }
-    fn height(&self) -> u16 {
-        self.height
-    }
-
-    fn fill_buffers(&self, row: u16, buffers: &mut [Vec<u8>; 4]) {
-        let row = self
-            .source
-            .plane
-            .row(usize::from(row))
-            .expect("codec row is in bounds");
-        // Like the codec's slice adapter, batch 16 pixels so LLVM can vectorize
-        // conversion and append components without per-pixel Vec growth checks.
-        for chunk in row.as_chunks::<64>().0 {
-            let mut components = [[0; 16]; 3];
-            for (i, pixel) in chunk.as_chunks::<4>().0.iter().enumerate() {
-                let [r, g, b] = self.source.pixel_format.rgb_pixel(pixel);
-                let (y, cb, cr) = jpeg_encoder::rgb_to_ycbcr(r, g, b);
-                components[0][i] = y;
-                components[1][i] = cb;
-                components[2][i] = cr;
-            }
-            for (buffer, values) in buffers.iter_mut().zip(components) {
-                buffer.extend_from_slice(&values);
-            }
-        }
-        for pixel in row.as_chunks::<64>().1.as_chunks::<4>().0 {
-            let [r, g, b] = self.source.pixel_format.rgb_pixel(pixel);
-            let (y, cb, cr) = jpeg_encoder::rgb_to_ycbcr(r, g, b);
-            buffers[0].push(y);
-            buffers[1].push(cb);
-            buffers[2].push(cr);
-        }
-    }
 }
 
 // ============================================================================
@@ -4146,7 +3960,15 @@ video_accessors! {
     timestamp {
         /// It is `None` when the SDK does not know it.
     }
-    encoders(capture_ref) {
+    images("no_run", "\
+ # use grafton_ndi::{Finder, FinderOptions, Ndi, Receiver, ReceiverOptions};
+ # use std::time::Duration;
+ # let ndi = Ndi::new()?;
+ # let finder = Finder::new(&ndi, &FinderOptions::default())?;
+ # finder.wait_for_sources(Duration::from_secs(1))?;
+ # let Some(source) = finder.current_sources()?.into_iter().next() else { return Ok(()) };
+ # let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source))?;
+ # let Some(frame) = receiver.video().capture_ref(Duration::from_secs(5))? else { return Ok(()) };") {
         /// It encodes directly from the borrowed SDK pixels, without first
         /// copying the frame into an owned [`VideoFrame`].
     }
@@ -5351,37 +5173,58 @@ mod tests {
         }
     }
 
+    /// Encoders read active bytes only: every format's padding is left
+    /// uninitialized, which Miri and Memcheck would report if read.
     #[cfg(feature = "image-encoding")]
     #[test]
     fn video_padding_encoders_never_read_uninitialized_gaps() {
-        use crate::capture::{FrameSyncVideoFree, Guard};
+        use crate::{
+            capture::{FrameSyncVideoFree, Guard},
+            AlphaMode, Downscale, ImageFormat, ImageOptions, SampleDepth,
+        };
         use std::mem::MaybeUninit;
-        for format in [
-            PixelFormat::Bgra,
-            PixelFormat::Bgrx,
-            PixelFormat::Rgba,
-            PixelFormat::Rgbx,
-        ] {
-            let mut storage = [MaybeUninit::<u8>::uninit(); 24];
-            let pixels = [1, 2, 3, 255, 5, 6, 7, 255, 9, 10, 11, 255, 13, 14, 15, 255];
-            for row in 0..2 {
-                for byte in 0..8 {
-                    storage[row * 12 + byte].write(pixels[row * 8 + byte]);
+        let outputs = [
+            ImageOptions::new(ImageFormat::Png),
+            ImageOptions::new(ImageFormat::Png).depth(SampleDepth::Sixteen),
+            ImageOptions::new(ImageFormat::Png).downscale(Downscale::Half),
+            ImageOptions::new(ImageFormat::Jpeg(85)),
+            ImageOptions::new(ImageFormat::WebpLossless).alpha(AlphaMode::Discard),
+        ];
+        for format in PixelFormat::ALL {
+            let (width, height) = (4, 2);
+            let packed =
+                ValidatedVideoLayout::new_uncompressed(format, width, height, None).unwrap();
+            let stride = packed.line_stride_bytes + 8;
+            let padded =
+                ValidatedVideoLayout::new_uncompressed(format, width, height, Some(stride))
+                    .unwrap();
+            let mut storage = vec![MaybeUninit::<u8>::uninit(); padded.data_len_bytes];
+            let mut active = Vec::new();
+            let mut value = 7u8;
+            for plane in padded.planes() {
+                for row in 0..plane.row_count {
+                    for byte in 0..plane.active_row_bytes {
+                        value = value.wrapping_mul(31).wrapping_add(17);
+                        storage[plane.offset + row * plane.row_stride + byte].write(value);
+                        active.push(value);
+                    }
                 }
             }
             let raw = NDIlib_video_frame_v2_t {
-                xres: 2,
-                yres: 2,
+                xres: width as i32,
+                yres: height as i32,
                 FourCC: FourCc::from(format).raw(),
                 frame_rate_N: 30,
                 frame_rate_D: 1,
                 frame_format_type: ScanType::Progressive.to_sdk(),
                 p_data: storage.as_mut_ptr().cast(),
                 __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
-                    line_stride_in_bytes: 12,
+                    line_stride_in_bytes: stride as i32,
                 },
                 ..Default::default()
             };
+            // SAFETY: the descriptor points into `storage`, which outlives
+            // the reference, and the no-op free releases nothing.
             let borrowed = unsafe {
                 VideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
                     ptr::null_mut(),
@@ -5390,21 +5233,20 @@ mod tests {
                 ))
             }
             .unwrap();
-            let packed = image_test_frame(format, 2, 2, None, pixels.to_vec());
-            let png = borrowed.encode_png().unwrap();
-            assert_eq!(
-                decode_png_rgba(&png),
-                decode_png_rgba(&packed.encode_png().unwrap())
-            );
-            assert_eq!(
-                borrowed.encode_jpeg(85).unwrap(),
-                packed.encode_jpeg(85).unwrap()
-            );
-            assert_eq!(
-                borrowed.encode_data_url(ImageFormat::Png).unwrap(),
-                packed.encode_data_url(ImageFormat::Png).unwrap()
-            );
-            assert_eq!(borrowed.to_owned().data(), pixels);
+            let owned = VideoFrame::builder()
+                .resolution(width, height)
+                .pixel_format(format)
+                .data(active.clone())
+                .build()
+                .unwrap();
+            for options in &outputs {
+                assert_eq!(
+                    borrowed.encode_image(options).unwrap(),
+                    owned.encode_image(options).unwrap(),
+                    "{format:?} {options:?}"
+                );
+            }
+            assert_eq!(borrowed.to_owned().data(), active);
         }
     }
 
@@ -5524,502 +5366,6 @@ mod tests {
                 .data(vec![0; len])
                 .build()
                 .is_err());
-        }
-    }
-
-    #[cfg(feature = "image-encoding")]
-    #[test]
-    fn borrowed_video_encoding_uses_padded_pixels_without_owned_conversion() {
-        use crate::capture::{FrameSyncVideoFree, Guard};
-        let frame = image_test_frame(
-            PixelFormat::Bgra,
-            2,
-            2,
-            Some(12),
-            vec![
-                0, 0, 255, 255, 0, 255, 0, 128, 99, 99, 99, 99, 255, 0, 0, 64, 255, 255, 255, 0,
-                99, 99, 99, 99,
-            ],
-        );
-        // The null-instance FrameSync strategy never frees these test-owned
-        // pixels. The owned source stays alive for the borrowed view's use.
-        let guard = unsafe {
-            Guard::<FrameSyncVideoFree>::with_test_free(ptr::null_mut(), frame.to_raw(), |_, _| {})
-        };
-        let borrowed = unsafe { VideoRef::new(guard) }.unwrap();
-        assert!(borrowed.data().is_none());
-        assert_eq!(
-            borrowed.plane(0).unwrap().row(0).unwrap().as_ptr(),
-            frame.data().as_ptr()
-        );
-        let png = borrowed.encode_png().unwrap();
-        assert_eq!(
-            decode_png_rgba(&png),
-            (
-                2,
-                2,
-                vec![255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 64, 255, 255, 255, 0,]
-            )
-        );
-        assert_eq!(png, frame.encode_png().unwrap());
-        assert_eq!(
-            borrowed.encode_jpeg(85).unwrap(),
-            frame.encode_jpeg(85).unwrap()
-        );
-        assert_eq!(
-            borrowed.encode_data_url(ImageFormat::Png).unwrap(),
-            frame.encode_data_url(ImageFormat::Png).unwrap()
-        );
-        assert_eq!(
-            borrowed.encode_data_url(ImageFormat::Jpeg(85)).unwrap(),
-            frame.encode_data_url(ImageFormat::Jpeg(85)).unwrap()
-        );
-        assert!(borrowed.encode_jpeg(0).is_err());
-
-        let unsupported = VideoFrame::builder()
-            .resolution(2, 2)
-            .pixel_format(PixelFormat::Uyvy)
-            .build()
-            .unwrap();
-        let guard = unsafe {
-            Guard::<FrameSyncVideoFree>::with_test_free(
-                ptr::null_mut(),
-                unsupported.to_raw(),
-                |_, _| {},
-            )
-        };
-        let borrowed = unsafe { VideoRef::new(guard) }.unwrap();
-        assert!(borrowed.encode_png().is_err());
-        assert!(borrowed.encode_jpeg(85).is_err());
-    }
-
-    #[cfg(feature = "image-encoding")]
-    fn image_test_frame(
-        pixel_format: PixelFormat,
-        width: u32,
-        height: u32,
-        line_stride: Option<usize>,
-        data: Vec<u8>,
-    ) -> VideoFrame {
-        let layout =
-            ValidatedVideoLayout::new_uncompressed(pixel_format, width, height, line_stride)
-                .unwrap();
-        assert_eq!(data.len(), layout.data_len_bytes);
-
-        VideoFrame {
-            layout,
-            header: VideoHeader {
-                frame_rate: FrameRate::new(60, 1).unwrap(),
-                picture_aspect_ratio: 16.0 / 9.0,
-                scan_type: ScanType::Progressive,
-                timecode: Timecode::from_ticks(0),
-            },
-            data,
-            metadata: None,
-            timestamp: None,
-        }
-    }
-
-    #[cfg(feature = "image-encoding")]
-    fn decode_png_rgba(png_bytes: &[u8]) -> (u32, u32, Vec<u8>) {
-        let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
-        let mut reader = decoder.read_info().unwrap();
-        let output_size = reader.output_buffer_size().unwrap();
-        let mut output = vec![0; output_size];
-        let info = reader.next_frame(&mut output).unwrap();
-        output.truncate(info.buffer_size());
-
-        assert_eq!(info.color_type, png::ColorType::Rgba);
-        assert_eq!(info.bit_depth, png::BitDepth::Eight);
-
-        (info.width, info.height, output)
-    }
-
-    #[cfg(feature = "image-encoding")]
-    fn assert_jpeg_markers(jpeg_bytes: &[u8]) {
-        assert!(jpeg_bytes.len() >= 4);
-        assert_eq!(&jpeg_bytes[..2], &[0xFF, 0xD8]);
-        assert_eq!(&jpeg_bytes[jpeg_bytes.len() - 2..], &[0xFF, 0xD9]);
-    }
-
-    #[cfg(feature = "image-encoding")]
-    #[test]
-    fn test_encode_png_decodes_exact_supported_pixels() {
-        let cases = [
-            (
-                PixelFormat::Rgba,
-                vec![10, 20, 30, 40, 50, 60, 70, 80],
-                vec![10, 20, 30, 40, 50, 60, 70, 80],
-            ),
-            (
-                PixelFormat::Bgra,
-                vec![30, 20, 10, 40, 70, 60, 50, 80],
-                vec![10, 20, 30, 40, 50, 60, 70, 80],
-            ),
-            (
-                PixelFormat::Rgbx,
-                vec![10, 20, 30, 0, 50, 60, 70, 99],
-                vec![10, 20, 30, 255, 50, 60, 70, 255],
-            ),
-            (
-                PixelFormat::Bgrx,
-                vec![30, 20, 10, 0, 70, 60, 50, 99],
-                vec![10, 20, 30, 255, 50, 60, 70, 255],
-            ),
-        ];
-
-        for (pixel_format, data, expected) in cases {
-            let frame = image_test_frame(pixel_format, 2, 1, None, data);
-            let png = frame.encode_png().unwrap();
-            let (width, height, decoded) = decode_png_rgba(&png);
-
-            assert_eq!((width, height), (2, 1), "{pixel_format:?}");
-            assert_eq!(decoded, expected, "{pixel_format:?}");
-        }
-    }
-
-    #[cfg(feature = "image-encoding")]
-    #[test]
-    fn test_encode_png_skips_padded_rows() {
-        let data = vec![
-            1, 2, 3, 0, 4, 5, 6, 0, 200, 201, 202, 203, 7, 8, 9, 0, 10, 11, 12, 0, 204, 205, 206,
-            207,
-        ];
-        let frame = image_test_frame(PixelFormat::Rgbx, 2, 2, Some(12), data);
-
-        let png = frame.encode_png().unwrap();
-        let (width, height, decoded) = decode_png_rgba(&png);
-
-        assert_eq!((width, height), (2, 2));
-        assert_eq!(
-            decoded,
-            vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255,]
-        );
-    }
-
-    #[cfg(feature = "image-encoding")]
-    #[test]
-    fn test_encode_jpeg_accepts_supported_image_formats() {
-        let cases = [
-            (PixelFormat::Rgba, vec![10, 20, 30, 40]),
-            (PixelFormat::Bgra, vec![30, 20, 10, 40]),
-            (PixelFormat::Rgbx, vec![10, 20, 30, 0]),
-            (PixelFormat::Bgrx, vec![30, 20, 10, 0]),
-        ];
-
-        for (pixel_format, pixel) in cases {
-            let data = pixel.repeat(16);
-            let frame = image_test_frame(pixel_format, 4, 4, None, data);
-            let jpeg = frame.encode_jpeg(90).unwrap();
-            assert_jpeg_markers(&jpeg);
-        }
-    }
-
-    #[cfg(feature = "image-encoding")]
-    #[test]
-    fn test_encode_jpeg_skips_padded_rows() {
-        let data = vec![
-            3, 2, 1, 0, 6, 5, 4, 0, 250, 251, 252, 253, 9, 8, 7, 0, 12, 11, 10, 0, 254, 255, 0, 1,
-        ];
-        let frame = image_test_frame(PixelFormat::Bgrx, 2, 2, Some(12), data);
-
-        let jpeg = frame.encode_jpeg(85).unwrap();
-        assert_jpeg_markers(&jpeg);
-    }
-
-    #[cfg(feature = "image-encoding")]
-    #[test]
-    fn test_encode_jpeg_rejects_invalid_quality() {
-        let frame = image_test_frame(PixelFormat::Rgba, 2, 2, None, vec![0; 16]);
-
-        for quality in [0, 101, 255] {
-            let err = frame.encode_jpeg(quality).unwrap_err();
-            let err_msg = err.to_string();
-            assert!(
-                matches!(&err, Error::InvalidFrame(message) if message.contains("quality")),
-                "unexpected error for quality {quality}: {err_msg}"
-            );
-        }
-    }
-
-    #[cfg(feature = "image-encoding")]
-    #[test]
-    fn test_encode_jpeg_rejects_oversized_dimensions_before_casting() {
-        let wide = image_test_frame(PixelFormat::Rgba, 65_536, 1, None, vec![0; 65_536 * 4]);
-        let err = wide.encode_jpeg(85).unwrap_err();
-        let err_msg = err.to_string();
-        assert!(
-            matches!(&err, Error::InvalidFrame(message) if message.contains("JPEG width")),
-            "unexpected error: {err_msg}"
-        );
-
-        let tall = image_test_frame(PixelFormat::Rgba, 2, 65_536, None, vec![0; 65_536 * 8]);
-        let err = tall.encode_jpeg(85).unwrap_err();
-        let err_msg = err.to_string();
-        assert!(
-            matches!(&err, Error::InvalidFrame(message) if message.contains("JPEG height")),
-            "unexpected error: {err_msg}"
-        );
-    }
-
-    #[cfg(feature = "image-encoding")]
-    #[test]
-    fn test_encode_jpeg_rejects_unsupported_format() {
-        let frame = image_test_frame(PixelFormat::Uyvy, 2, 2, None, vec![0; 8]);
-
-        let err = frame.encode_jpeg(85).unwrap_err();
-        let err_msg = err.to_string();
-        assert!(
-            matches!(&err, Error::InvalidFrame(message) if message.contains("Unsupported format")),
-            "unexpected error: {err_msg}"
-        );
-    }
-
-    #[cfg(feature = "image-encoding")]
-    #[test]
-    fn png_conversion_scratch_is_bounded_by_one_row() {
-        for format in [
-            PixelFormat::Rgba,
-            PixelFormat::Bgra,
-            PixelFormat::Rgbx,
-            PixelFormat::Bgrx,
-        ] {
-            for height in [1, 19, 257] {
-                let frame =
-                    image_test_frame(format, 18, height, Some(84), vec![42; 84 * height as usize]);
-                let source = frame.image_source().unwrap();
-                let (scratch, allocations) =
-                    crate::test_alloc::allocation_count(|| source.png_conversion_row().unwrap());
-                let expected = if format == PixelFormat::Rgba {
-                    0
-                } else {
-                    18 * 4
-                };
-                assert_eq!(scratch.len(), expected);
-                assert_eq!(scratch.capacity(), expected);
-                assert_eq!(allocations, usize::from(expected != 0));
-                // The JPEG adapter borrows only the source; all component buffers
-                // belong to the codec. Pre-reserving them proves conversion itself
-                // allocates nothing, independently of image height.
-                let mut buffers = std::array::from_fn(|_| Vec::with_capacity(18));
-                let adapter = JpegRows {
-                    source: &source,
-                    width: 18,
-                    height: height as u16,
-                };
-                let (_, allocations) = crate::test_alloc::allocation_count(|| {
-                    for row in 0..height as u16 {
-                        for buffer in &mut buffers {
-                            buffer.clear();
-                        }
-                        jpeg_encoder::ImageBuffer::fill_buffers(&adapter, row, &mut buffers);
-                    }
-                });
-                assert_eq!(allocations, 0);
-            }
-        }
-    }
-
-    /// Manual resource comparison with the pre-2.0 row-staging implementation.
-    /// `cargo test --release --lib --features image-encoding image_encoding_resources -- --ignored --nocapture`
-    #[cfg(feature = "image-encoding")]
-    #[test]
-    #[ignore = "Manual optimized image time/peak-allocation comparison"]
-    fn image_encoding_resources() {
-        use std::{hint::black_box, time::Instant};
-        fn staged(source: &ImagePixelSource<'_>, format: ImageFormat) -> Vec<u8> {
-            match format {
-                ImageFormat::Png => {
-                    let mut pixels = Vec::with_capacity(source.width * source.height * 4);
-                    for row in source.plane.rows() {
-                        for pixel in row.as_chunks::<4>().0 {
-                            pixels.extend_from_slice(&source.pixel_format.rgba_pixel(pixel));
-                        }
-                    }
-                    let mut output = Vec::new();
-                    let mut encoder =
-                        png::Encoder::new(&mut output, source.width as u32, source.height as u32);
-                    encoder.set_color(png::ColorType::Rgba);
-                    encoder.set_depth(png::BitDepth::Eight);
-                    encoder
-                        .write_header()
-                        .unwrap()
-                        .write_image_data(&pixels)
-                        .unwrap();
-                    output
-                }
-                ImageFormat::Jpeg(quality) => {
-                    let mut pixels = Vec::with_capacity(source.width * source.height * 3);
-                    for row in source.plane.rows() {
-                        for pixel in row.as_chunks::<4>().0 {
-                            pixels.extend_from_slice(&source.pixel_format.rgb_pixel(pixel));
-                        }
-                    }
-                    let mut output = Vec::new();
-                    jpeg_encoder::Encoder::new(&mut output, quality)
-                        .encode(
-                            &pixels,
-                            source.width as u16,
-                            source.height as u16,
-                            jpeg_encoder::ColorType::Rgb,
-                        )
-                        .unwrap();
-                    output
-                }
-            }
-        }
-        eprintln!(
-            "width,height,padding,entropy,format,path,median_ms,peak_encode_bytes,output_bytes"
-        );
-        for (width, height) in [(1920, 1080), (3840, 2160), (7680, 4320)] {
-            for padding in [0, 64] {
-                for entropy in [false, true] {
-                    let stride = width * 4 + padding;
-                    let mut data = vec![42; stride * height];
-                    if entropy {
-                        let mut seed = 118u64;
-                        for row in data.chunks_exact_mut(stride) {
-                            for pixel in row[..width * 4].as_chunks_mut::<4>().0 {
-                                for byte in &mut pixel[..3] {
-                                    seed ^= seed << 13;
-                                    seed ^= seed >> 7;
-                                    seed ^= seed << 17;
-                                    *byte = seed as u8;
-                                }
-                                pixel[3] = 255;
-                            }
-                        }
-                    }
-                    let frame = image_test_frame(
-                        PixelFormat::Bgra,
-                        width as u32,
-                        height as u32,
-                        Some(stride),
-                        data,
-                    );
-                    let source = frame.image_source().unwrap();
-                    for format in [
-                        ImageFormat::Png,
-                        ImageFormat::Jpeg(1),
-                        ImageFormat::Jpeg(85),
-                        ImageFormat::Jpeg(100),
-                    ] {
-                        for old in [true, false] {
-                            let mut times = [0.0f64; 3];
-                            let mut peak = 0;
-                            let mut output_bytes = 0;
-                            for time in &mut times {
-                                let start = Instant::now();
-                                let (output, bytes) = crate::test_alloc::peak_bytes(|| {
-                                    if old {
-                                        staged(black_box(&source), format)
-                                    } else {
-                                        match format {
-                                            ImageFormat::Png => source.encode_png().unwrap(),
-                                            ImageFormat::Jpeg(q) => source.encode_jpeg(q).unwrap(),
-                                        }
-                                    }
-                                });
-                                *time = start.elapsed().as_secs_f64() * 1000.0;
-                                peak = peak.max(bytes);
-                                output_bytes = output.len();
-                                black_box(output);
-                            }
-                            times.sort_by(f64::total_cmp);
-                            eprintln!("{width},{height},{padding},{entropy},{format:?},{},{:.3},{peak},{output_bytes}", if old { "staged" } else { "rows" }, times[1]);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[cfg(feature = "image-encoding")]
-    #[test]
-    fn streamed_images_match_independently_packed_pixels() {
-        for format in [
-            PixelFormat::Rgba,
-            PixelFormat::Bgra,
-            PixelFormat::Rgbx,
-            PixelFormat::Bgrx,
-        ] {
-            for (width, height) in [(2, 1), (2, 2), (18, 19), (64, 33)] {
-                for padding in [0, 12] {
-                    let stride = width * 4 + padding;
-                    let mut data = vec![0xCD; stride * height];
-                    let mut rgba = Vec::new();
-                    let mut rgb = Vec::new();
-                    for y in 0..height {
-                        for x in 0..width {
-                            let r = (x * 17 + y * 7) as u8;
-                            let g = (x * 31 + y * 13) as u8;
-                            let b = (x * 43 + y * 19) as u8;
-                            let a = (x * 59 + y * 23) as u8;
-                            let pixel = if matches!(format, PixelFormat::Bgra | PixelFormat::Bgrx) {
-                                [b, g, r, a]
-                            } else {
-                                [r, g, b, a]
-                            };
-                            data[y * stride + x * 4..y * stride + x * 4 + 4]
-                                .copy_from_slice(&pixel);
-                            rgba.extend_from_slice(&[
-                                r,
-                                g,
-                                b,
-                                if matches!(format, PixelFormat::Rgbx | PixelFormat::Bgrx) {
-                                    255
-                                } else {
-                                    a
-                                },
-                            ]);
-                            rgb.extend_from_slice(&[r, g, b]);
-                        }
-                    }
-                    let frame =
-                        image_test_frame(format, width as u32, height as u32, Some(stride), data);
-                    assert_eq!(
-                        decode_png_rgba(&frame.encode_png().unwrap()),
-                        (width as u32, height as u32, rgba)
-                    );
-                    for quality in [1, 85, 100] {
-                        let mut baseline = Vec::new();
-                        jpeg_encoder::Encoder::new(&mut baseline, quality)
-                            .encode(
-                                &rgb,
-                                width as u16,
-                                height as u16,
-                                jpeg_encoder::ColorType::Rgb,
-                            )
-                            .unwrap();
-                        assert_eq!(
-                            frame.encode_jpeg(quality).unwrap(),
-                            baseline,
-                            "{format:?} {width}x{height} padding={padding} quality={quality}"
-                        );
-                    }
-                    // X and row padding have no effect on any encoded pixels.
-                    let mut changed = image_test_frame(
-                        format,
-                        width as u32,
-                        height as u32,
-                        Some(stride),
-                        frame.data().to_vec(),
-                    );
-                    for y in 0..height {
-                        changed.data_mut()[y * stride + width * 4..(y + 1) * stride].fill(0x12);
-                        if matches!(format, PixelFormat::Rgbx | PixelFormat::Bgrx) {
-                            for x in 0..width {
-                                changed.data_mut()[y * stride + x * 4 + 3] ^= 0xFF;
-                            }
-                        }
-                    }
-                    assert_eq!(frame.encode_png().unwrap(), changed.encode_png().unwrap());
-                    assert_eq!(
-                        frame.encode_jpeg(85).unwrap(),
-                        changed.encode_jpeg(85).unwrap()
-                    );
-                }
-            }
         }
     }
 

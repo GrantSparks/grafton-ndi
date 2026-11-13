@@ -1,79 +1,161 @@
-# Image encoding resources in 2.0.0
+# Image encoding performance
 
-These archived measurements describe the 2.0.0 implementation. They have not been
-rerun as part of the current SDK 6.4 integration and do not establish its runtime
-or platform coverage. See [SDK validation](sdk-validation.md) for current evidence.
+Time and peak memory of image encoding for 3.0, by source pixel format, image
+size, content and output. The [image encoding guide](image-encoding.md) says
+what each setting does; this page says what it costs.
 
-Measured on 2026-10-16, Debian 12 x86_64, Intel Xeon w7-2475X, Rust 1.99.0,
-`png` 0.18.1, and `jpeg-encoder` 0.7.1. These are local resource comparisons,
-not a throughput guarantee. No live capture is involved in this measurement.
-
-The ignored `image_encoding_resources` library test compares the former
-full-frame BGRA conversion with the production row encoders. It covers
-1920×1080, 3840×2160, and 7680×4320, contiguous and 64-byte-padded strides,
-uniform and pseudorandom RGB pixels, PNG, and JPEG qualities 1, 85, and 100.
-Every reported time is the median of three encodes. The same complete matrix
-was run with the dependency's optional SIMD feature unified into the build.
+Measured on 2026-11-13 on Debian 12 x86_64, Intel Xeon w7-2475X, Rust 1.100.0,
+release build for the default x86-64 target, with `png` 0.18.1, `jpeg-encoder`
+0.7.1 and `image-webp` 0.2.4. One encode at a time on one thread; other builds
+were running on the machine, so treat differences under about 10% as noise.
+Times are the median of five encodes, or of one for PNG `Balanced` and `High`
+and at 7680×4320. Peaks are the largest total of live allocations the encode
+made on its thread, codec state and the encoded image included, and exclude
+the source frame.
 
 ```bash
-cargo test --release --lib --features image-encoding image_encoding_resources -- --ignored --nocapture
-cargo test --release --lib --features image-encoding,jpeg-encoder/simd image_encoding_resources -- --ignored --nocapture
+GRAFTON_NDI_PHOTO=photo.rgba GRAFTON_NDI_GRAPHICS=graphics.rgba \
+  cargo test --release --lib --features image-encoding image_encoding_resources -- --ignored --nocapture
 ```
 
-## Wrapper conversion scratch
+The two inputs are raw 1920×1080 RGBA files, scaled to each size: a photograph,
+and a graphics frame of flat boxes, a gradient and text. Without them the test
+uses synthetic stand-ins, which compress differently. YUV sources are the same
+pictures converted to each format with BT.709 limited range.
+`GRAFTON_NDI_SIZES=1920x1080` limits the run to one size.
 
-PNG forwards initialized RGBA rows directly, including padded sources, with no
-conversion allocation. BGRA/RGBX/BGRX reuse one checked `width * 4` byte row.
-JPEG's private `ImageBuffer` adapter writes Y/Cb/Cr directly into codec-owned
-component rows, using a fixed 48-byte stack batch and no heap staging buffer.
-Codec/component storage, encoded output, and data-URL base64 storage are
-additional to this conversion-scratch bound.
+## 1920×1080
 
-| BGRA dimensions | Former PNG staging | Row PNG scratch | Former JPEG staging | Row JPEG heap scratch |
+Milliseconds, and the image's size for an RGBA source.
+
+| Output | RGBA | UYVY | NV12 | P216 | NA4G | Image from RGBA |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Photographic** | | | | | | |
+| PNG `Fast` | 24.2 | 30.3 | 29.6 | 30.2 | 31.2 | 3.76 MB |
+| PNG `Balanced` | 554 | 550 | 556 | 560 | 562 | 3.38 MB |
+| PNG `High` | 1,198 | 1,046 | 1,038 | 1,201 | 1,224 | 3.35 MB |
+| 16-bit PNG `Fast` | 52.9 | 67.4 | 57.7 | 58.6 | 58.9 | 7.34 MB |
+| 16-bit PNG `Balanced` | 823 | 1,336 | 1,274 | 1,153 | 1,143 | 4.23 MB |
+| JPEG 85 | 20.8 | 26.2 | 25.4 | 25.5 | 26.7 | 0.45 MB |
+| Lossless WebP | 18.8 | 26.3 | 25.4 | 25.6 | 27.3 | 2.80 MB |
+| PNG `Fast`, quarter size | 8.1 | 11.3 | 10.7 | 10.8 | 11.7 | 0.29 MB |
+| JPEG 85, quarter size | 5.9 | 11.0 | 10.4 | 10.5 | 11.4 | 0.04 MB |
+| Lossless WebP, quarter size | 7.5 | 11.2 | 10.6 | 10.7 | 11.7 | 0.23 MB |
+| **Graphics** | | | | | | |
+| PNG `Fast` | 7.7 | 13.7 | 13.1 | 13.1 | 14.2 | 492 KB |
+| PNG `Balanced` | 39.9 | 54.3 | 55.9 | 48.5 | 47.1 | 150 KB |
+| PNG `High` | 104 | 116 | 122 | 111 | 112 | 135 KB |
+| 16-bit PNG `Fast` | 20.8 | 27.5 | 24.7 | 30.8 | 26.7 | 667 KB |
+| 16-bit PNG `Balanced` | 70.4 | 84.6 | 84.4 | 132 | 109 | 220 KB |
+| JPEG 85 | 15.8 | 21.0 | 20.3 | 20.3 | 21.1 | 97 KB |
+| Lossless WebP | 7.9 | 15.4 | 14.2 | 14.0 | 14.9 | 329 KB |
+| PNG `Fast`, quarter size | 7.2 | 10.4 | 9.9 | 9.7 | 10.5 | 92 KB |
+| JPEG 85, quarter size | 5.0 | 10.3 | 9.7 | 9.8 | 10.3 | 15 KB |
+| Lossless WebP, quarter size | 7.2 | 11.2 | 10.6 | 10.4 | 10.5 | 55 KB |
+
+- PNG's cost is compression: `Balanced` takes 23 times as long as `Fast` on
+  the photograph for 10% fewer bytes, and `High` twice as long again.
+- Lossless WebP is 17% smaller than PNG `Balanced` on the photograph and 29
+  times faster; on graphics it is 2.2 times PNG's size.
+- A 16-bit PNG of a YUV source holds real precision in every channel, so it
+  is larger and slower to compress than a 16-bit PNG of an 8-bit RGBA source,
+  whose low bytes repeat its high ones.
+
+## 3840×2160 and 7680×4320
+
+Milliseconds for the photograph and the graphics frame.
+
+| Output | 4K RGBA | 4K UYVY | 8K RGBA | 8K UYVY |
 | --- | ---: | ---: | ---: | ---: |
-| 1920×1080 | 8,294,400 B | 7,680 B | 6,220,800 B | 0 B |
-| 3840×2160 | 33,177,600 B | 15,360 B | 24,883,200 B | 0 B |
-| 7680×4320 | 132,710,400 B | 30,720 B | 99,532,800 B | 0 B |
+| **Photographic** | | | | |
+| PNG `Fast` | 38.9 | 63.3 | 71.8 | 167 |
+| PNG `Balanced` | 697 | 714 | 844 | 937 |
+| JPEG 85 | 77.2 | 98.2 | 275 | 357 |
+| Lossless WebP | 39.8 | 70.2 | 161 | 305 |
+| JPEG 85, quarter size | 21.3 | 43.0 | 83.6 | 168 |
+| **Graphics** | | | | |
+| PNG `Fast` | 15.2 | 40.2 | 43.5 | 141 |
+| PNG `Balanced` | 87.5 | 109 | 260 | 349 |
+| JPEG 85 | 61.1 | 81.7 | 241 | 322 |
+| Lossless WebP | 25.2 | 76.1 | 143 | 298 |
+| JPEG 85, quarter size | 21.8 | 40.8 | 78.3 | 162 |
 
-Unit tests hold width fixed while varying height, count the PNG conversion
-allocation and capacity, and reserve the JPEG codec rows before asserting zero
-allocations during conversion. Differential tests decode exact PNG pixels and
-compare JPEG bytes with independently packed RGB for all four formats,
-non-MCU-aligned sizes, quality boundaries, and padded layouts. The SIMD-enabled
-build exercises the same differential tests.
+The photograph is a 1920×1080 picture scaled up, so its larger sizes compress
+better than real 4K or 8K camera video would.
 
-## Encoding peak and wall time
+## YUV against RGBA
 
-The following `image-encoding` results use contiguous, uniform BGRA. Peak bytes
-are the maximum simultaneously live allocation sizes requested by the encoding
-call on its thread, **including codec and output storage**. They exclude the
-preexisting source frame and allocator overhead; they are not process RSS.
+Converting YUV costs about 2.9 ns a pixel on the default x86-64 target: 6 ms
+at 1080p, 24 ms at 4K and 95 ms at 8K. An RGBA frame costs nothing to convert,
+because PNG and WebP read its rows in place. The target set for 3.0 was a UYVY
+source within 1.25 times an RGBA source's time for every codec. It holds where
+the codec's own work dominates, and not where the codec is about as fast as
+the conversion:
 
-| Dimensions / encoding | Staged time | Row time | Staged encoding peak | Row encoding peak | Source + row encoding peak |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 1920×1080 PNG | 18.60 ms | 14.93 ms | 8,675,416 B | 403,458 B | 8,697,858 B |
-| 1920×1080 JPEG 85 | 16.77 ms | 14.50 ms | 6,378,868 B | 158,068 B | 8,452,468 B |
-| 3840×2160 PNG | 72.01 ms | 57.60 ms | 33,608,886 B | 483,822 B | 33,661,422 B |
-| 3840×2160 JPEG 85 | 64.92 ms | 52.50 ms | 25,198,964 B | 315,764 B | 33,493,364 B |
-| 7680×4320 PNG | 290.92 ms | 231.68 ms | 133,303,646 B | 743,838 B | 133,454,238 B |
-| 7680×4320 JPEG 85 | 292.17 ms | 210.51 ms | 100,426,100 B | 893,300 B | 133,603,700 B |
+| UYVY time over RGBA time | 1080p photo | 1080p graphics | 4K photo | 8K photo |
+| --- | ---: | ---: | ---: | ---: |
+| PNG `Balanced` | 0.99 | 1.36 | 1.02 | 1.11 |
+| PNG `High` | 0.87 | 1.11 | 1.02 | 1.05 |
+| PNG `Fast` | 1.25 | 1.78 | 1.63 | 2.33 |
+| JPEG 85 | 1.26 | 1.33 | 1.27 | 1.30 |
+| Lossless WebP | 1.40 | 1.95 | 1.76 | 1.89 |
 
-Output entropy matters: for contiguous 8K pseudorandom pixels, PNG encoding peak
-fell from 583,862,696 to 136,040,286 B; including the source, the new peak was
-268,750,686 B. Median time was 5772.47 versus 5671.62 ms. Encoded size changed
-from 113,920,228 to 114,253,991 B because streaming changes compression chunking;
-decoded pixels remain exact. JPEG 100 still needs 268,620,148 B of codec/output
-heap for that input, despite eliminating its 99,532,800-byte RGB staging buffer.
+The conversion is safe scalar Rust that the compiler vectorizes where the
+target allows: built with `RUSTFLAGS="-C target-cpu=x86-64-v3"` it measured
+1.6 ns a pixel. Reaching the target for the fast codecs on every target would
+take hand-written SIMD, which 3.0 leaves out. A receiver set to an RGB color
+format avoids the conversion altogether, at the cost of the SDK converting
+every frame instead of only the ones encoded.
 
-Across the complete `image-encoding` matrix, row/staged median time ratios were
-0.796–0.995 for PNG and 0.711–0.933 for JPEG. With JPEG SIMD enabled they were
-0.787–0.978 and 0.753–0.964, respectively. These runs found no repeatable
-throughput regression requiring a separate contiguous path. JPEG output was
-byte-identical to the staged baseline within each feature configuration.
-SIMD versus scalar builds need not produce identical JPEG bitstreams.
+## Memory
 
-The SDK regression `tests/video_padding_sdk.rs` separately exercises receiver
-and FrameSync active rows, scoped worker reads, and encoding before the guard
-frees the allocation on its permitted thread. Under NDI SDK 6.3.2 its Valgrind
-Memcheck run reported zero errors; the synthetic uninitialized-padding tests
-retain the independent deterministic layout checks.
+PNG and JPEG convert one row at a time, so their conversion scratch does not
+grow with the frame's height; lossless WebP alone holds the whole converted
+image. The unit tests count these allocations for every format, depth and
+reduction, with the height varied at a fixed width, and check the WebP buffer's
+exact size.
+
+| Configuration | PNG conversion scratch | JPEG heap scratch | WebP buffer |
+| --- | --- | --- | --- |
+| RGBA, contiguous rows | None | None | None |
+| RGBA with padded rows | None | None | width × height × 4 bytes |
+| Otherwise, 8 bits | width × 4 bytes, × 3 with `AlphaMode::Discard` | None | width × height × 4, × 3 with `Discard` |
+| 16 bits | width × 8 bytes, × 6 with `Discard` | — | — |
+| With `Downscale` by f | ceil(width / f) × 16 bytes of sums (× 32 at 16 bits) and one reduced row | The sums | The reduced image, and the sums |
+
+The measured peaks show the same: a UYVY source's peak exceeds an RGBA
+source's by one row for PNG, by nothing for JPEG, and by exactly the converted
+image for WebP.
+
+| Peak, photograph | 1080p RGBA | 1080p UYVY | 4K RGBA | 4K UYVY | 8K RGBA | 8K UYVY |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| PNG `Fast` | 4,263,424 | 4,271,104 | 8,522,752 | 8,538,112 | 8,568,832 | 8,599,552 |
+| JPEG 85 | 616,820 | 616,820 | 2,281,844 | 2,281,844 | 4,563,316 | 4,563,316 |
+| Lossless WebP | 12,488,704 | 20,783,104 | 37,371,904 | 70,549,504 | 136,904,704 | 269,615,104 |
+| JPEG 85, quarter size | 96,628 | 96,628 | 323,956 | 323,956 | 647,540 | 647,540 |
+
+Bytes. The rest of each peak is the codec's own state and the encoded image,
+growing in a `Vec` that doubles its capacity; lossless WebP's encoder holds a
+copy of the image besides.
+
+## Memory safety
+
+`tests/video_padding_sdk.rs` encodes UYVY and P216 frames read in place from
+the SDK's padded rows, 1,312-byte strides for 642-pixel rows, with every
+output setting, and compares each image with the image of the frame's packed
+copy. Run under Valgrind Memcheck on 2026-11-13, it reported no errors in the
+crate's code against the Standard 6.3.2 and 6.4.0.2 runtimes. With 6.4.0.2 the
+run had no errors at all; with 6.3.2 the only reports were four in glibc's
+dynamic loader, while the runtime was loaded. An earlier run found that the
+6.3.2 runtime reads up to 28 bytes past the end of a UYVY frame it is sending
+when the buffer holds the frame exactly; the test now sends from a buffer with
+slack, to keep its subject the encoders.
+
+## 2.0
+
+grafton-ndi 2.0 encoded RGBA, RGBX, BGRA and BGRX only, as 8-bit PNG and JPEG.
+Its measurements, made on 2026-10-16 with uniform frames, gave 15 ms for a
+1080p PNG: uniform frames compress far faster than camera content, which took
+554 ms at the same compression level here. 3.0 encodes those four formats,
+untagged or tagged BT.601 or BT.709 SDR, to the same bytes as 2.0, which unit
+tests check against hashes of 2.0's output.

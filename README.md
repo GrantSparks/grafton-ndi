@@ -31,7 +31,8 @@ The crate loads the NDI runtime library when the program selects a runtime and w
 - [Advanced SDK guide](docs/advanced.md) - Requirements, ownership, compressed packets, queues, allocators, synchronization and KVM.
 - [File API guide](docs/file-io.md) - Recording, playback, how a recording is finished, and the File library's limits.
 - [Migrating from 2.0 to 3.0](docs/migration/2.0-to-3.0.md) - Every change existing code must make. [Guides for earlier versions](docs/migration/) are kept too.
-- [Image encoding resources](docs/image-encoding-performance.md) - Scratch bounds, peak memory and timing of PNG and JPEG encoding, measured for 2.0.0.
+- [Image encoding guide](docs/image-encoding.md) - Still images of any frame: formats, the SDK's color conversion and how the encoder follows it, HDR, reduction, cost and errors.
+- [Image encoding performance](docs/image-encoding-performance.md) - Time and peak memory of every codec by source format and size, and the conversion scratch bounds.
 
 **Contributing**
 
@@ -143,7 +144,7 @@ These are defects and limits of the NDI SDK, not of this crate: measured on Linu
 - **Monitoring** - Query receiver connection status, frame-drop statistics, tally state, and sender connection counts.
 - **PTZ control** - Drive supported pan, tilt, zoom, focus, exposure, and white-balance commands.
 - **Async integration** - Use optional Tokio or smol wrappers for receive workflows without blocking the async runtime.
-- **Image snapshots** - Encode captured video frames as PNG, JPEG, or data URLs with the `image-encoding` feature.
+- **Image snapshots** - Encode any video frame, in every uncompressed format, as PNG (8 or 16 bits), JPEG, lossless WebP or a data URL, with the SDK's color conversion, HDR tagging and reduction, with the `image-encoding` feature.
 - **Routing and Discovery Server** - Redirect receivers with a routing source, register senders and receivers with a Discovery Server, list what it reports, and request receiver connections.
 - **Media formats and controls** - Planar 4:4:4 formats, receiver color and bandwidth modes, delay controls, SDK timestamps, and checked audio and video conversions.
 - **Advanced SDK** - Optional compressed and scatter streams, completion queues, custom receive allocation, JSON configuration, source metadata, encoder and keyframe controls, AVSync, Genlock, and KVM.
@@ -182,7 +183,7 @@ Feature flags:
 
 | Feature | Effect |
 | --- | --- |
-| `image-encoding` | PNG, JPEG and data-URL encoding of video frames. Off by default. |
+| `image-encoding` | PNG, JPEG, lossless WebP and data-URL encoding of video frames in every uncompressed format. Off by default. See the [image encoding guide](docs/image-encoding.md). |
 | `tokio`, `smol` | Receiver adapters for the named async runtime. Each is independent. |
 | `advanced` | The `advanced` module: NDI Advanced SDK operations. See [Advanced SDK](#advanced-sdk). |
 | `file-io` | The `file` module: recording and playback through the NDI File API. See the [File API guide](docs/file-io.md). |
@@ -360,7 +361,7 @@ source stride. Format, plane order, metadata, timing, aspect ratio, and scan typ
 are preserved. Owned frames expose the same `planes()` views, without padding.
 So does a `BorrowedVideoFrame` built for sending: its views read the active
 rows of a padded buffer in place, while its `data()` includes the padding.
-Borrowed PNG/JPEG encoding reads active rows directly.
+Image encoding reads the active rows of every frame type in place.
 
 `copy_into(&mut owned)` makes the same copy into an existing `VideoFrame` or
 `AudioFrame`, on receiver and FrameSync references and on `BorrowedVideoFrame`.
@@ -375,10 +376,11 @@ move preconstructed views into scoped workers or share them for immutable reads,
 including views from FrameSync. The frame stays borrowed until the workers
 finish; FrameSync frame references keep their capture-thread affinity.
 
-PNG/JPEG conversion uses active rows for owned and captured frames. PNG borrows
-RGBA rows directly and uses at most one `width * 4` conversion row for other
-supported formats. JPEG writes components into the codec's row buffers without
-an RGB staging frame. Codec storage and encoded output require additional memory.
+Image encoding converts one row at a time from the active rows of owned,
+captured and borrowed frames. PNG reads RGBA rows in place and uses at most one
+converted row for anything else; JPEG converts straight into the codec's row
+buffers; lossless WebP alone holds the whole converted image. Codec storage
+and encoded output require additional memory.
 
 ### Publish Sources
 
@@ -561,17 +563,31 @@ The compile-contract tests in `tests/ui` verify the important lifetime rules aro
 
 ## Image Encoding
 
-With the `image-encoding` feature, captured `VideoFrame` values can be encoded directly:
+With the `image-encoding` feature, every video frame type encodes itself as a
+PNG, JPEG or lossless WebP image, or a data URL of one. Every uncompressed
+pixel format is supported:
 
 ```rust
-use grafton_ndi::ImageFormat;
+use grafton_ndi::{Downscale, ImageFormat, ImageOptions, PngCompression};
 
 let png = video.encode_png()?;
 let jpeg = video.encode_jpeg(85)?;
-let data_url = video.encode_data_url(ImageFormat::Png)?;
+
+// Fast lossless snapshots of camera video, and a quarter-size thumbnail.
+let snapshot = video.encode_image(&ImageOptions::new(ImageFormat::WebpLossless))?;
+let thumbnail = ImageOptions::new(ImageFormat::Jpeg(80)).downscale(Downscale::Quarter);
+let data_url = video.encode_image_data_url(&thumbnail)?;
 ```
 
-Encoding accepts RGBA, RGBX, BGRA and BGRX frames, and returns an error for other formats. Ask a receiver for `ReceiverColorFormat::RgbxRgba` or `BgrxBgra` when its frames are to be encoded. JPEG quality is 1 to 100.
+YUV frames are converted the way the NDI SDK was measured to convert: BT.709,
+limited range and repeated chroma, unless the frame's `ndi_color_info`
+metadata names another matrix, which the encoder then follows. `ColorPolicy::Override` replaces the matrix
+and range. A frame tagged PQ or HLG is refused unless `HdrPolicy::CodeValues`
+asks for its code values, which a PNG carries with a `cICP` tag;
+`SampleDepth::Sixteen` keeps a high-bit-depth frame's precision. PNG's default
+compression is slow on camera video, about half a second for a 1080p frame;
+`PngCompression::Fast` and lossless WebP take about 20 ms. See the
+[image encoding guide](docs/image-encoding.md).
 
 ## Runtime capabilities and optional APIs
 
@@ -738,6 +754,7 @@ File API. These need the `file-io` feature and the NDI File library of the 6.4 S
 | --- | --- | --- |
 | `file_record.rs` | `cargo run --example file_record --features file-io -- "MACHINE (Source)" take 10` | Record a source to disk and wait for the file to be finalized. |
 | `file_play.rs` | `cargo run --example file_play --features file-io -- take_001.mkv "Replay"` | Play a recording back as an NDI source. |
+| `file_thumbnails.rs` | `cargo run --example file_thumbnails --features file-io,image-encoding -- take_001.mkv 8` | Seek through a recording and write a quarter-size JPEG thumbnail at each position. |
 
 ## Development
 

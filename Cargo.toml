@@ -39,8 +39,9 @@ serde_json = { version = "1.0", optional = true }
 # Optional dependencies for image-encoding feature
 # Keep the scalar base64 0.22 engine; SIMD adoption needs separate validation.
 base64 = { version = "0.22", optional = true }
+image-webp = { version = "0.2.4", optional = true }
 jpeg-encoder = { version = "0.7.1", optional = true }
-png = { version = "0.18", optional = true }
+png = { version = "0.18.1", optional = true }
 
 # Optional dependencies for async runtime integration
 tokio = { version = "1.53.3", optional = true, features = ["rt"] }
@@ -66,9 +67,10 @@ default = []
 advanced = ["dep:serde_json", "dep:bindgen", "dep:syn"]
 # Optional source recording and file-to-network playback API.
 file-io = []
-# Enable image encoding support (PNG, JPEG, data URLs).
-# Opt-in; adds the base64, jpeg-encoder and png dependencies.
-image-encoding = ["dep:base64", "dep:jpeg-encoder", "dep:png"]
+# Enable image encoding support: PNG, JPEG, lossless WebP and data URLs of
+# every uncompressed video format. Opt-in; adds the base64, image-webp,
+# jpeg-encoder and png dependencies.
+image-encoding = ["dep:base64", "dep:image-webp", "dep:jpeg-encoder", "dep:png"]
 # Enable async runtime integration for Tokio
 # Adds dependency: tokio
 tokio = ["dep:tokio"]
@@ -78,6 +80,9 @@ smol = ["dep:smol"]
 
 [dev-dependencies]
 ctrlc = "3.5"
+# Decodes the images of the image-encoding SDK tests; the same version the
+# feature encodes with.
+png = "0.18.1"
 trybuild = "1.0.122"
 syn = { version = "2", features = ["full"] }
 # Doc examples use `#[tokio::main]`; the library itself needs only `rt`.
@@ -122,3 +127,7 @@ required-features = ["file-io"]
 [[example]]
 name = "file_record"
 required-features = ["file-io"]
+
+[[example]]
+name = "file_thumbnails"
+required-features = ["file-io", "image-encoding"]

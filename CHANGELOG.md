@@ -75,6 +75,22 @@ as `None`. Most programs need changes; see the
 - `image-encoding` is no longer a default feature, and the crate has no
   default features. `encode_png`, `encode_jpeg`, `encode_data_url` and
   `ImageFormat` need it enabled.
+- The image encoders' errors and output follow `ImageOptions`, which
+  `encode_png`, `encode_jpeg` and `encode_data_url` now use with their
+  default settings:
+  - `encode_jpeg` with a quality outside 1 to 100 returns
+    `Error::InvalidInput`; 2.0 returned `InvalidFrame`.
+  - A frame whose `ndi_color_info` metadata gives the PQ or HLG transfer is
+    refused with `Error::InvalidFrame`, in RGB formats too, where 2.0 encoded
+    its code values untagged. `HdrPolicy::CodeValues` encodes them to a
+    tagged PNG.
+  - A frame whose `ndi_color_info` cannot be read is refused with
+    `Error::InvalidFrame` under the default `ColorPolicy::Sdk`.
+  - A PNG of a frame tagged with BT.2020 primaries carries a `cICP` chunk, so
+    its bytes differ from 2.0's. Untagged and BT.601 or BT.709 SDR frames in
+    the four RGB formats encode to 2.0's bytes.
+  - `ImageFormat` is at the crate root only, no longer also in `frames`, and
+    gains `WebpLossless`.
 - The `advanced_sdk` Cargo feature, which had no effect, is removed.
 - The `tokio` feature enables only Tokio's `rt` feature. A program that uses
   `#[tokio::main]` or the multi-threaded runtime enables those features in its
@@ -255,6 +271,35 @@ as `None`. Most programs need changes; see the
   that value any more.
 
 ### Added
+
+- Image encoding covers every uncompressed pixel format and every video frame
+  type, through one options value, `ImageOptions`, and three methods on
+  `VideoFrame`, `VideoFrameRef`, `FrameSyncVideoRef` and, new to encoding,
+  `BorrowedVideoFrame`: `encode_image`, `encode_image_to`, which writes into
+  any `io::Write` as it encodes, and `encode_image_data_url`. See the
+  [image encoding guide](docs/image-encoding.md).
+  - UYVY, UYVA, P216, PA16, NV12, I420, YV12, NA48, NB48, NA4G and NB4G
+    frames encode, where 2.0 returned `InvalidFrame`. YUV is converted as the
+    6.4 SDK was measured to convert: with the frame's `ndi_color_info` matrix
+    or BT.709, limited range and repeated chroma, with exact coefficients.
+    `ColorPolicy::Override` sets the matrix (`YuvMatrix`) and range
+    (`YuvRange`).
+  - `ImageFormat::WebpLossless`: lossless WebP through `image-webp`, about 29
+    times faster than PNG at the default level on camera video and 17%
+    smaller.
+  - `PngCompression::Fast`, `Balanced` (the default) and `High`.
+  - `SampleDepth::Sixteen`: 16-bit PNG, keeping a high-bit-depth frame's
+    precision.
+  - `AlphaMode::Discard`: RGB rather than RGBA PNG and WebP.
+  - `HdrPolicy::CodeValues`: a PNG of a PQ or HLG frame's code values, tagged
+    with a `cICP` chunk.
+  - `Downscale::Half`, `Quarter` and `Eighth`: block averages inside the row
+    loop, weighted by alpha.
+- `ColorInfo`, with `ColorPrimaries`, `TransferFunction` and `YuvMatrix`, and
+  `color_info()` on every video frame type read the frame's `ndi_color_info`
+  metadata, with no feature.
+- `examples/file_thumbnails.rs`, with `file-io` and `image-encoding`, seeks
+  through a recording and writes a thumbnail at each position.
 
 - `AsyncReceiver::receiver` lends the wrapped `Receiver` for its controls:
   tally, PTZ, upstream and connection metadata, delays, `web_control_url` and
@@ -448,6 +493,9 @@ as `None`. Most programs need changes; see the
 
 ### Changed
 
+- The `image-encoding` feature adds the `image-webp` dependency, which is
+  pure Rust with no `unsafe` code. `Error::Io` exists with `image-encoding`
+  as well as `file-io`, for the writer given to `encode_image_to`.
 - `Receiver`, in every mode, and `FrameSync` are `RefUnwindSafe`, so a shared
   reference to one can cross `catch_unwind`. Their shared state has no lock
   that a panic can leave half-changed.

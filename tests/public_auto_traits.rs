@@ -43,6 +43,8 @@ fn crate_root_types_keep_their_auto_traits() {
         Capture<'static, AudioKind>: Send, Sync, UnwindSafe, RefUnwindSafe;
         Capture<'static, MetadataKind>: Send, Sync, UnwindSafe, RefUnwindSafe;
         Capture<'static, VideoKind>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        ColorInfo: Send, Sync, UnwindSafe, RefUnwindSafe;
+        ColorPrimaries: Send, Sync, UnwindSafe, RefUnwindSafe;
         ConnectionStats: Send, Sync, UnwindSafe, RefUnwindSafe;
         Error: Send, Sync;
         Finder: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -90,6 +92,7 @@ fn crate_root_types_keep_their_auto_traits() {
         StreamTier: Send, Sync, UnwindSafe, RefUnwindSafe;
         Tally: Send, Sync, UnwindSafe, RefUnwindSafe;
         Timecode: Send, Sync, UnwindSafe, RefUnwindSafe;
+        TransferFunction: Send, Sync, UnwindSafe, RefUnwindSafe;
         VideoFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
         VideoFrameBuilder: Send, Sync, UnwindSafe, RefUnwindSafe;
         VideoFrameRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -97,6 +100,7 @@ fn crate_root_types_keep_their_auto_traits() {
         VideoPlane<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         VideoPlanes<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         VideoRows<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        YuvMatrix: Send, Sync, UnwindSafe, RefUnwindSafe;
         audio_conversion::AudioConverter: Send, Sync, UnwindSafe, RefUnwindSafe;
         audio_conversion::AudioReferenceLevel: Send, Sync, UnwindSafe, RefUnwindSafe;
         capabilities::CapabilityStatus: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -116,10 +120,20 @@ fn crate_root_types_keep_their_auto_traits() {
 #[cfg(feature = "image-encoding")]
 #[test]
 fn image_encoding_types_keep_their_auto_traits() {
-    #[allow(unused_imports)]
-    use grafton_ndi::ImageFormat;
+    use grafton_ndi::{
+        AlphaMode, ColorPolicy, Downscale, HdrPolicy, ImageFormat, ImageOptions, PngCompression,
+        SampleDepth, YuvRange,
+    };
     has! {
+        AlphaMode: Send, Sync, UnwindSafe, RefUnwindSafe;
+        ColorPolicy: Send, Sync, UnwindSafe, RefUnwindSafe;
+        Downscale: Send, Sync, UnwindSafe, RefUnwindSafe;
+        HdrPolicy: Send, Sync, UnwindSafe, RefUnwindSafe;
         ImageFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
+        ImageOptions: Send, Sync, UnwindSafe, RefUnwindSafe;
+        PngCompression: Send, Sync, UnwindSafe, RefUnwindSafe;
+        SampleDepth: Send, Sync, UnwindSafe, RefUnwindSafe;
+        YuvRange: Send, Sync, UnwindSafe, RefUnwindSafe;
     }
 }
 

@@ -106,7 +106,9 @@ checkout.
 | `src/finder.rs` | Source discovery, owned descriptors, address parsing, and lookup cache |
 | `src/receiver.rs` | Receiver configuration, capture views, reconnect synchronization, status, and controls |
 | `src/capture.rs` | Private SDK capture/free strategies and guards that keep buffers tied to their owners |
-| `src/frames.rs` | Owned and borrowed frames, layout/metadata validation, channel access, and image encoding |
+| `src/frames.rs` | Owned and borrowed frames, layout/metadata validation, channel access, and the `video_accessors!` macro that gives every video frame type its accessors and image encoders |
+| `src/image/` | Image encoding (`image-encoding`): options, the five row readers, the color kernel, reduction, and the PNG, JPEG and WebP codecs, one file each |
+| `src/color_info.rs` | The `ndi_color_info` metadata scanner and `ColorInfo`, with no feature |
 | `src/framesync.rs` | Clock-corrected pull capture and receiver ownership boundaries |
 | `src/sender.rs` | Synchronous sends, owned async video pipeline, copied submissions, and completion handlers |
 | `src/asynchronous.rs` | Tokio/smol blocking adapters, deadlines, task errors, and cancellation |
@@ -125,9 +127,9 @@ checkout.
 | `examples/`, `tests/` | Application workflows, SDK regressions, and public compile contracts |
 | `docs/`, `CHANGELOG.md` | The guides, the migration guides, the record of SDK validation, and release notes |
 
-Keep shared behavior in its existing implementation. For example, owned and
-borrowed image encoding share `ImagePixelSource`; receiver and FrameSync views
-share validated frame layouts. Fix layout arithmetic once rather than adding
+Keep shared behavior in its existing implementation. For example, every video
+frame type encodes images through one `image::Source` view of its validated
+parts; receiver and FrameSync views share validated frame layouts. Fix layout arithmetic once rather than adding
 separate receive, send, and FrameSync calculations.
 
 `CaptureKind` exposes public frame-type associations and owned conversion.
@@ -471,8 +473,9 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 GRAFTON_NDI_REQUIRE_RUNTIME=advanced cargo test --all-features
 ```
 
-The PNG example is skipped without `image-encoding`. `advanced` and `file-io`
-are separate opt-ins. Features never select the runtime edition.
+The PNG and thumbnail examples are skipped without `image-encoding`, and the
+thumbnail example also without `file-io`. `advanced` and `file-io` are
+separate opt-ins. Features never select the runtime edition.
 
 For dependency, build, or language-feature changes, check library compatibility
 separately from contributor tooling:

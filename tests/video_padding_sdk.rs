@@ -287,3 +287,110 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
         verify_owned(&last);
     });
 }
+
+/// The YUV readers on the SDK's own row layout: frames received as UYVY and
+/// P216 encode in place exactly as their packed copies do. Under Memcheck,
+/// writing every image makes a read of row padding observable.
+#[cfg(feature = "image-encoding")]
+#[test]
+fn live_yuv_frames_encode_from_sdk_rows() {
+    use grafton_ndi::{AlphaMode, Downscale, ImageFormat, ImageOptions, SampleDepth};
+
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
+    let outputs = [
+        ImageOptions::new(ImageFormat::Png),
+        ImageOptions::new(ImageFormat::Png).depth(SampleDepth::Sixteen),
+        ImageOptions::new(ImageFormat::Png)
+            .alpha(AlphaMode::Discard)
+            .downscale(Downscale::Quarter),
+        ImageOptions::new(ImageFormat::Jpeg(85)),
+        ImageOptions::new(ImageFormat::WebpLossless),
+    ];
+    let (width, height) = (642usize, 32usize);
+    let uyvy: Vec<u8> = (0..width * height * 2)
+        .map(|i| (i * 7 % 200 + 16) as u8)
+        .collect();
+    let p216: Vec<u8> = (0..width * height * 2)
+        .flat_map(|i| (((i * 13 % 200 + 16) as u16) << 8).to_ne_bytes())
+        .collect();
+    for (format, data, color_formats) in [
+        (
+            PixelFormat::Uyvy,
+            uyvy,
+            [ReceiverColorFormat::UyvyBgra, ReceiverColorFormat::Fastest],
+        ),
+        (
+            PixelFormat::P216,
+            p216,
+            [ReceiverColorFormat::Best, ReceiverColorFormat::UyvyBgra],
+        ),
+    ] {
+        // The 6.3.2 SDK's UYVY sender was measured under Memcheck to read up
+        // to 28 bytes past the end of a frame whose buffer holds it exactly.
+        // Slack after the frame keeps this test about the encoders.
+        let len = data.len();
+        let mut buffer = data;
+        buffer.resize(len + 64, 0);
+        let sent = BorrowedVideoFrame::builder(&buffer[..len], width as u32, height as u32, format)
+            .build()
+            .unwrap();
+        let sender = Sender::new(
+            &ndi,
+            &SenderOptions::new(common::unique_name(&format!("yuv padding {format:?}")))
+                .clock_video(false),
+        )
+        .unwrap();
+        let source = common::loopback_source(&ndi, &sender).unwrap();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    sender.send_video(sent).unwrap();
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+            for color_format in color_formats {
+                let receiver = Receiver::new(
+                    &ndi,
+                    &ReceiverOptions::new(source.clone()).color_format(color_format),
+                )
+                .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let frame = loop {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{format:?} {color_format:?}: no frame"
+                    );
+                    if let Some(frame) = receiver
+                        .video()
+                        .capture_ref(Duration::from_millis(100))
+                        .unwrap()
+                    {
+                        if frame.width() as usize == width {
+                            break frame;
+                        }
+                    }
+                };
+                eprintln!(
+                    "{format:?} to {color_format:?}: {:?}, SDK stride {}",
+                    frame.pixel_format(),
+                    frame.line_stride_bytes()
+                );
+                let owned = frame.to_owned();
+                for options in &outputs {
+                    let image = frame.encode_image(options).unwrap();
+                    std::fs::write("/dev/null", &image).unwrap();
+                    assert_eq!(
+                        image,
+                        owned.encode_image(options).unwrap(),
+                        "{format:?} to {:?} {options:?}",
+                        frame.pixel_format()
+                    );
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+    }
+}

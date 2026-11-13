@@ -126,8 +126,10 @@
 //!   File API.
 //! - `asynchronous` (Cargo features `tokio` and `smol`): receivers for the
 //!   Tokio or smol async runtime.
-//! - PNG, JPEG and data-URL encoding of video frames, with the
-//!   `image-encoding` feature.
+//! - PNG, JPEG, lossless WebP and data-URL encoding of video frames in every
+//!   uncompressed format, with the `image-encoding` feature; see
+//!   `ImageOptions`. Every frame's `color_info` reads its `ndi_color_info`
+//!   metadata without the feature.
 //!
 //! # Thread Safety
 //!
@@ -188,6 +190,7 @@
 )]
 
 mod capture;
+mod color_info;
 mod error;
 mod media;
 mod rejected;
@@ -217,6 +220,9 @@ pub mod file;
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
 pub mod asynchronous;
+
+#[cfg(feature = "image-encoding")]
+mod image;
 
 pub use {
     capabilities::{
@@ -249,12 +255,16 @@ pub use {
 #[cfg(feature = "advanced")]
 pub use sender::{CompressedAttached, QueueAttached};
 
+pub use color_info::{ColorInfo, ColorPrimaries, TransferFunction, YuvMatrix};
 pub use media::{FourCc, FrameRate, MediaTypes, StreamTier};
 pub use rejected::Rejected;
 pub use time::{SdkTimestamp, Timecode};
 
 #[cfg(feature = "image-encoding")]
-pub use frames::ImageFormat;
+pub use image::{
+    AlphaMode, ColorPolicy, Downscale, HdrPolicy, ImageFormat, ImageOptions, PngCompression,
+    SampleDepth, YuvRange,
+};
 
 /// Alias for Result with our Error type
 pub type Result<T> = std::result::Result<T, crate::error::Error>;
