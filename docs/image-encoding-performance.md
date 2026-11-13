@@ -146,10 +146,11 @@ output setting, and compares each image with the image of the frame's packed
 copy. Run under Valgrind Memcheck on 2026-11-13, it reported no errors in the
 crate's code against the Standard 6.3.2 and 6.4.0.2 runtimes. With 6.4.0.2 the
 run had no errors at all; with 6.3.2 the only reports were four in glibc's
-dynamic loader, while the runtime was loaded. An earlier run found that the
-6.3.2 runtime reads up to 28 bytes past the end of a UYVY frame it is sending
-when the buffer holds the frame exactly; the test now sends from a buffer with
-slack, to keep its subject the encoders.
+dynamic loader, while the runtime was loaded. An earlier run found the SDK
+reading up to 28 bytes past the end of the UYVY frame it was sending. The
+crate now keeps room for that after every frame it sends, which
+[SDK validation](sdk-validation.md#reads-past-the-end-of-sent-video)
+describes, and the test sends from a vector that ends with the frame.
 
 ## 2.0
 

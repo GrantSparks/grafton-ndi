@@ -545,6 +545,33 @@ as `None`. Most programs need changes; see the
 
 ### Fixed
 
+- The SDK no longer reads past the buffer of a UYVY or UYVA frame the crate
+  sends. The x86 builds of the SDK read up to 28 bytes after the last pixel
+  of many such frames, a 720×480 or an interlaced 1920×1080 frame among them
+  though not a progressive 1280×720, 1920×1080 or 3840×2160 one, and compress
+  what they find into the picture's last blocks; the SDK documents no such
+  need. `PixelFormat::send_tail_room` is the room the crate now keeps after a
+  frame for it: 64 zero bytes for those two formats, none for the others, and
+  none on 64-bit ARM Linux, whose SDK reads frames exactly.
+  - A `VideoFrame` holds the room in its pixel allocation. A UYVY or UYVA
+    vector given to `VideoFrameBuilder::data` or `VideoFrame::replace_data`
+    without that much spare capacity is grown once, which may move it.
+  - `Sender::send_video` sends a UYVY or UYVA `BorrowedVideoFrame` from a
+    copy when its buffer ends within that many bytes of the frame's last
+    pixel, in one buffer that the sender keeps and reuses. The copy adds
+    about 15% to the time of a 1920×1080 send and 54% to a 3840×2160 one. A
+    buffer that extends further, by padding its last row or by being longer
+    than the frame, is sent in place as before, and so is one whose caller
+    vouches for readable memory after it with the new `unsafe`
+    `BorrowedVideoFrameBuilder::readable_after`.
+    `BorrowedVideoFrame::sends_in_place` tells which a frame is.
+  - An interlaced or single-field UYVY or UYVA frame whose height is not a
+    multiple of four, which the SDK reads up to two rows past, gets two line
+    strides more room.
+
+  The measurements, on five x86-64 and four 64-bit ARM runtimes from 6.1.1
+  to 6.4.0.2, are in
+  [SDK validation](docs/sdk-validation.md#reads-past-the-end-of-sent-video).
 - A status or source change that an `AsyncReceiver` capture passed over was
   kept for `Receiver::poll_event`, which async code could not reach, so it was
   never read. `AsyncReceiver::poll_event` returns it.

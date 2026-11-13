@@ -15,6 +15,7 @@ use crate::{
         AudioFrame, MetadataFrame, MetadataText, PixelFormat, ScanType, ValidatedVideoLayout,
         VideoFrame, VideoHeader,
     },
+    pixels::{send_room, Pixels},
     receiver::Tally,
     sys::{self, bindings::*},
     timeout::Deadline,
@@ -280,23 +281,36 @@ pub struct Sender<M: SenderMode = RawSend> {
 
 type AsyncCallback = Box<dyn Fn(usize) + Send + Sync>;
 
-/// The asynchronous video pipeline of a sender that sends uncompressed video:
-/// the frame the SDK may still be reading, or the one it last released, and
-/// the completion handler.
+/// The video pipeline of a sender that sends uncompressed video: the frame
+/// the SDK may still be reading, or the one it last released, the copy a
+/// synchronous send makes of a frame it cannot send in place, and the
+/// completion handler.
 ///
 /// [`Shared`] owns it beside the native sender and drops it first, so the
 /// pipeline drains the SDK while `sender` is still live.
 struct VideoPipeline {
     sender: SendHandle,
-    state: Mutex<InFlight<VideoFrame>>,
+    state: Mutex<VideoState>,
     callback: Option<AsyncCallback>,
+}
+
+/// What a sender's video operations share, behind one lock.
+#[derive(Default)]
+struct VideoState {
+    /// The frame an asynchronous send lent the SDK.
+    in_flight: InFlight<VideoFrame>,
+    /// The pixels of the last borrowed frame that did not
+    /// [send in place](BorrowedVideoFrame::sends_in_place), which the SDK
+    /// read from here instead. Empty until such a frame is sent, then kept
+    /// for the next one.
+    staging: Pixels,
 }
 
 impl VideoPipeline {
     fn new(sender: SendHandle) -> Self {
         Self {
             sender,
-            state: Mutex::new(InFlight::default()),
+            state: Mutex::new(VideoState::default()),
             callback: None,
         }
     }
@@ -318,7 +332,7 @@ impl VideoPipeline {
     /// VideoPipeline`.
     fn synchronize<R>(
         &self,
-        call: impl FnOnce(&mut InFlight<VideoFrame>, SendHandle) -> (R, Option<usize>),
+        call: impl FnOnce(&mut VideoState, SendHandle) -> (R, Option<usize>),
     ) -> R {
         let (result, completed) = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -331,10 +345,12 @@ impl VideoPipeline {
     /// Send `frame` synchronously, which also releases the frame in flight.
     fn send(&self, frame: BorrowedVideoFrame<'_>) {
         self.synchronize(|state, sender| {
+            // The SDK reads the copy only during the send, under this lock.
+            let frame = frame.staged(&mut state.staging);
             // A synchronous video send also releases the previous async frame,
             // which completes once the send has returned.
-            let synchronized = state.send(sender, frame);
-            ((), completed(state, synchronized))
+            let synchronized = state.in_flight.send(sender, frame);
+            ((), completed(&mut state.in_flight, synchronized))
         });
     }
 
@@ -348,7 +364,7 @@ impl VideoPipeline {
             // previous frame stays owned by `displaced` until the submission,
             // which synchronizes the SDK's access to it, has returned; only
             // the proof of that return completes it.
-            let (mut displaced, synchronized) = state.submit(sender, frame);
+            let (mut displaced, synchronized) = state.in_flight.submit(sender, frame);
             let len = completed(&mut displaced, synchronized);
             (displaced.take_retained(), len)
         })
@@ -356,14 +372,14 @@ impl VideoPipeline {
 
     /// Wait for the SDK to release the frame in flight, which stays retained.
     fn flush(&self) {
-        self.synchronize(|state, sender| ((), drain(state, sender)));
+        self.synchronize(|state, sender| ((), drain(&mut state.in_flight, sender)));
     }
 
     /// Drain the SDK and take the retained frame.
     fn finish(&self) -> Option<VideoFrame> {
         self.synchronize(|state, sender| {
-            let len = drain(state, sender);
-            (state.take_retained(), len)
+            let len = drain(&mut state.in_flight, sender);
+            (state.in_flight.take_retained(), len)
         })
     }
 
@@ -379,8 +395,8 @@ impl VideoPipeline {
         self.callback = None;
         let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
         // The notification `drain` claims has no handler left to run.
-        let _ = drain(state, self.sender);
-        state.take_retained()
+        let _ = drain(&mut state.in_flight, self.sender);
+        state.in_flight.take_retained()
         // Dropping the idle pipeline makes no SDK call and notifies nothing.
     }
 }
@@ -394,7 +410,7 @@ impl Drop for VideoPipeline {
         // registration shares it, so the pipeline drains the SDK itself
         // rather than relying on the sender's destruction.
         let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
-        let len = drain(state, self.sender);
+        let len = drain(&mut state.in_flight, self.sender);
         // A handler that panics here unwinds through the rest of the drop:
         // `Shared` still releases the native sender, and the retained frame
         // is freed after the SDK has released it.
@@ -407,10 +423,11 @@ impl Drop for VideoPipeline {
 }
 
 impl in_flight::Lend for VideoFrame {
-    /// The frame's descriptor. It points into the frame's pixel `Vec` and
-    /// metadata `CString`, which moving the frame does not move.
+    /// The frame's descriptor. It points into the frame's pixel allocation,
+    /// which holds the room the SDK reads after them, and its metadata
+    /// `CString`; moving the frame moves neither.
     fn lend(&mut self) -> in_flight::Lent {
-        in_flight::Lent::Frame(self.to_raw())
+        in_flight::Lent::Frame(self.lend_raw())
     }
 }
 
@@ -704,12 +721,15 @@ pub(crate) mod in_flight {
             sender: SendHandle,
             frame: BorrowedVideoFrame<'_>,
         ) -> Synchronized {
+            debug_assert!(frame.sends_in_place());
             let raw = frame.to_raw();
             // SAFETY: `sender` is the live sender whose stream this slot
             // holds. `raw` points into pixels and metadata that `frame`
-            // borrows for longer than this call; the SDK has finished reading
-            // them when the synchronous send returns and keeps no reference
-            // afterwards.
+            // borrows for longer than this call, and the pixels are followed
+            // by the room the SDK reads after a frame of their format, which
+            // the caller checked or made by staging the frame; the SDK has
+            // finished reading them when the synchronous send returns and
+            // keeps no reference afterwards.
             unsafe {
                 sender
                     .core
@@ -787,10 +807,16 @@ impl fmt::Debug for Inner {
 
 /// A borrowed video frame that references external pixel data.
 ///
-/// [`Sender::send_video`] sends it synchronously without copying, including
-/// with padded rows; the buffer can be reused as soon as the call returns.
-/// [`Sender::send_video_async_copy`] instead copies its pixels and metadata
-/// into an owned frame for the asynchronous pipeline.
+/// [`Sender::send_video`] sends it synchronously from its buffer, without
+/// copying, including with padded rows; the buffer can be reused as soon as
+/// the call returns. [`Sender::send_video_async_copy`] instead copies its
+/// pixels and metadata into an owned frame for the asynchronous pipeline.
+///
+/// The x86 builds of the SDK read a little past the end of many UYVY and
+/// UYVA frames, so the sender copies one first when its buffer ends with the
+/// frame: [`Self::sends_in_place`] tells, and
+/// [`PixelFormat::send_tail_room`] is how much longer a buffer needs to be to
+/// be sent in place.
 ///
 /// Create one with [`Self::builder`]. Construction borrows without
 /// allocation and validates the entire supported uncompressed layout once.
@@ -801,6 +827,11 @@ pub struct BorrowedVideoFrame<'buf> {
     header: VideoHeader,
     /// Exactly the validated storage extent.
     data: &'buf [u8],
+    /// The initialized bytes, borrowed for `'buf` as `data` is, between the
+    /// frame's last active byte and the end of the buffer `data` is a prefix
+    /// of: the last row's padding and whatever the buffer holds after the
+    /// frame.
+    tail_room: usize,
     /// The metadata text, validated with its terminator.
     metadata: Option<MetadataText<'buf>>,
 }
@@ -859,6 +890,12 @@ crate::frames::video_accessors! {
 impl<'buf> BorrowedVideoFrame<'buf> {
     /// Configure a checked borrowed frame over `data`.
     ///
+    /// `data` may be longer than the frame: the frame is its start, and
+    /// [`Self::data`] never includes the rest. A sender may read the rest,
+    /// which is how a UYVY or UYVA buffer with
+    /// [room after the frame](PixelFormat::send_tail_room) is
+    /// [sent in place](Self::sends_in_place).
+    ///
     /// Its defaults are the packed line stride, 30/1 frames per second, a
     /// 16:9 picture aspect ratio, progressive scan, [`Timecode::SYNTHESIZE`]
     /// and no metadata. All validation occurs in
@@ -894,6 +931,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
             scan_type: ScanType::Progressive,
             timecode: Timecode::SYNTHESIZE,
             metadata: None,
+            readable_after: 0,
         }
     }
 
@@ -917,8 +955,9 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// format, dimensions, frame rate, aspect ratio, scan type, timecode and
     /// metadata, and no timestamp. No reference to the source is retained.
     ///
-    /// Its pixel buffer is reused when its capacity holds the packed frame,
-    /// and otherwise replaced by one allocation of exactly that size. Its
+    /// Its pixel buffer is reused when its capacity holds the packed frame
+    /// and its format's [room](PixelFormat::send_tail_room), and otherwise
+    /// replaced by one allocation of exactly that size. Its
     /// metadata string is reused when the new text has the same length, and
     /// otherwise the text takes one allocation. Copying frames of one shape
     /// into the same destination therefore allocates nothing after the first
@@ -971,6 +1010,74 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         self.data
     }
 
+    /// Whether [`Sender::send_video`] sends this frame from its buffer,
+    /// without copying its pixels.
+    ///
+    /// It does unless the SDK would read past the buffer: a UYVY or UYVA
+    /// frame over a buffer that ends within
+    /// [`PixelFormat::send_tail_room`] bytes of the frame's last pixel is
+    /// sent from a copy. The padding of the last row, the bytes of the
+    /// buffer after the frame, and bytes vouched for with
+    /// [`BorrowedVideoFrameBuilder::readable_after`] all count towards the
+    /// room. An interlaced or single-field frame of those formats whose
+    /// height is not a multiple of four needs two line strides more.
+    ///
+    /// Where the SDK reads frames exactly, which is 64-bit ARM Linux, the
+    /// room is zero and every frame sends in place.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use grafton_ndi::{BorrowedVideoFrame, PixelFormat, VideoFrame};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let uyvy = PixelFormat::Uyvy;
+    /// let room = uyvy.send_tail_room();
+    /// let exact = vec![0u8; 720 * 480 * 2];
+    /// let frame = BorrowedVideoFrame::builder(&exact, 720, 480, uyvy).build()?;
+    /// // Copied wherever the SDK needs room after the frame.
+    /// assert_eq!(frame.sends_in_place(), room == 0);
+    ///
+    /// let longer = vec![0u8; 720 * 480 * 2 + room];
+    /// let in_place = BorrowedVideoFrame::builder(&longer, 720, 480, uyvy).build()?;
+    /// assert!(in_place.sends_in_place());
+    /// assert_eq!(in_place.data().len(), 720 * 480 * 2);
+    ///
+    /// let owned = VideoFrame::builder()
+    ///     .resolution(720, 480)
+    ///     .pixel_format(uyvy)
+    ///     .build()?;
+    /// assert!(BorrowedVideoFrame::from(&owned).sends_in_place());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn sends_in_place(&self) -> bool {
+        self.tail_room >= send_room(&self.layout, self.header.scan_type)
+    }
+
+    /// This frame with the room after its pixels that the SDK reads: itself
+    /// when it [sends in place](Self::sends_in_place), and otherwise a copy
+    /// of its storage in `staging`, with the same layout, header and
+    /// metadata. The copy reuses `staging`'s allocation when it is large
+    /// enough.
+    fn staged<'s>(self, staging: &'s mut Pixels) -> BorrowedVideoFrame<'s>
+    where
+        'buf: 's,
+    {
+        if self.sends_in_place() {
+            return self;
+        }
+        let room = send_room(&self.layout, self.header.scan_type);
+        staging.fill(self.data.len(), room, |bytes| {
+            bytes.extend_from_slice(self.data);
+        });
+        BorrowedVideoFrame {
+            data: staging.as_slice(),
+            tail_room: self.layout.trailing_padding() + staging.tail_room(),
+            ..self
+        }
+    }
+
     /// Return this frame with `timecode`.
     ///
     /// # Example
@@ -1017,6 +1124,8 @@ pub struct BorrowedVideoFrameBuilder<'buf> {
     scan_type: ScanType,
     timecode: Timecode,
     metadata: Option<&'buf CStr>,
+    /// Readable bytes the caller vouches for after `data`.
+    readable_after: usize,
 }
 
 impl<'buf> BorrowedVideoFrameBuilder<'buf> {
@@ -1057,6 +1166,50 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
         self
     }
 
+    /// Declare that `bytes` bytes of readable memory follow the builder's
+    /// buffer.
+    ///
+    /// They count towards the [room](PixelFormat::send_tail_room) the SDK
+    /// needs after the frame, so that a buffer which ends with its frame and
+    /// cannot be made longer, such as one another library allocated with
+    /// padding, is [sent in place](BorrowedVideoFrame::sends_in_place)
+    /// instead of copied. The SDK may read those bytes and compress what it
+    /// finds into the picture's last blocks. It writes nothing.
+    ///
+    /// A buffer the program allocates itself needs none of this: make it
+    /// longer, and the frame borrows the room with the pixels.
+    ///
+    /// # Safety
+    ///
+    /// The `bytes` bytes that follow the last byte of the buffer given to
+    /// [`BorrowedVideoFrame::builder`] must be readable memory for as long
+    /// as that buffer is borrowed, and nothing may write them while the
+    /// frame is being sent. They need not be initialized.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use grafton_ndi::{BorrowedVideoFrame, PixelFormat};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// let format = PixelFormat::Uyvy;
+    /// // A capture library's buffer: the frame, then its own padding.
+    /// let capture = vec![0u8; 720 * 480 * 2 + 64];
+    /// let pixels = &capture[..720 * 480 * 2];
+    ///
+    /// let builder = BorrowedVideoFrame::builder(pixels, 720, 480, format);
+    /// // SAFETY: `pixels` is followed by 64 more bytes of `capture`, which
+    /// // outlives the frame and is not written.
+    /// let frame = unsafe { builder.readable_after(64) }.build()?;
+    /// assert!(frame.sends_in_place());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub unsafe fn readable_after(mut self, bytes: usize) -> Self {
+        self.readable_after = bytes;
+        self
+    }
+
     /// Validate dimensions, stride, initialized slice extent, headers, and metadata.
     ///
     /// Successful construction allocates nothing and never loads or queries
@@ -1094,6 +1247,8 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
                 timecode: self.timecode,
             },
             data,
+            tail_room: (layout.trailing_padding() + (self.data.len() - data.len()))
+                .saturating_add(self.readable_after),
             metadata,
         })
     }
@@ -1101,10 +1256,12 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
 
 impl<'buf> From<&'buf VideoFrame> for BorrowedVideoFrame<'buf> {
     fn from(frame: &'buf VideoFrame) -> Self {
+        let layout = *crate::frames::VideoParts::layout(frame);
         BorrowedVideoFrame {
-            layout: *crate::frames::VideoParts::layout(frame),
+            layout,
             header: *crate::frames::VideoParts::header(frame),
             data: frame.data(),
+            tail_room: layout.trailing_padding() + frame.tail_room(),
             metadata: crate::frames::VideoParts::metadata_text(frame),
         }
     }
@@ -1261,13 +1418,22 @@ impl Sender {
         }
     }
 
-    /// Send a video frame synchronously, without copying it.
+    /// Send a video frame synchronously, from its own buffer.
     ///
     /// Accepts `&VideoFrame`, a [`BorrowedVideoFrame`], or `&BorrowedVideoFrame`.
     /// The SDK reads the pixels and metadata in place: nothing is allocated
     /// or copied, including for a borrowed frame with padded rows. This is
     /// the call to use for borrowed or padded buffers; unlike
     /// [`Self::send_video_async_copy`] it needs no owned copy.
+    ///
+    /// One kind of frame is copied first: a UYVY or UYVA
+    /// [`BorrowedVideoFrame`] whose buffer ends with the frame, because the
+    /// SDK reads up to 28 bytes past the last pixel of those formats. The
+    /// sender keeps one buffer for these copies and reuses it, so sending
+    /// such frames allocates only when a frame is larger than any before it.
+    /// A buffer [`PixelFormat::send_tail_room`] bytes longer than the frame,
+    /// and every `&VideoFrame`, is sent in place;
+    /// [`BorrowedVideoFrame::sends_in_place`] tells which a frame is.
     ///
     /// The SDK has released the input buffer when this returns; the caller may
     /// then reuse or release it. This also completes a previous async video send.
@@ -1932,7 +2098,7 @@ mod tests {
         assert!(sender.send_video_async(first).unwrap().is_none());
         {
             let video = sender.native.video.state.lock().unwrap();
-            let Some(frame) = video.frame() else {
+            let Some(frame) = video.in_flight.frame() else {
                 panic!("missing owned frame")
             };
             assert_eq!(frame.to_raw().p_data, pixels as *mut u8);
@@ -1977,6 +2143,262 @@ mod tests {
             sender.send_video(&owned).unwrap();
         });
         assert_eq!(allocations, 0);
+    }
+
+    /// The room the SDK reads after a UYVY or UYVA frame is whatever follows
+    /// the last pixel in the caller's buffer: the last row's padding, the
+    /// bytes after the frame, and the bytes the caller vouches for. Other
+    /// formats need none, and an interlaced or single-field frame whose
+    /// height is not a multiple of four needs two rows more.
+    #[test]
+    fn a_borrowed_frame_sends_in_place_when_room_follows_its_last_pixel() {
+        let buffer = vec![0u8; 8192];
+        let in_place = |format, height, scan, stride: Option<usize>, len: usize, vouched| {
+            let mut builder =
+                BorrowedVideoFrame::builder(&buffer[..len], 18, height, format).scan_type(scan);
+            if let Some(stride) = stride {
+                builder = builder.line_stride(stride);
+            }
+            // SAFETY: `buffer` extends at least `vouched` bytes past every
+            // length used here.
+            unsafe { builder.readable_after(vouched) }
+                .build()
+                .unwrap()
+                .sends_in_place()
+        };
+        let progressive = ScanType::Progressive;
+        // No format but UYVY and UYVA is read past.
+        for format in PixelFormat::ALL {
+            if !matches!(format, PixelFormat::Uyvy | PixelFormat::Uyva) {
+                assert_eq!(format.send_tail_room(), 0, "{format:?}");
+                let len = format.buffer_len(18, 4).unwrap();
+                for scan in ScanType::ALL {
+                    assert!(
+                        in_place(format, 4, scan, None, len, 0),
+                        "{format:?} {scan:?}"
+                    );
+                }
+            }
+        }
+        let (uyvy, uyva) = (PixelFormat::Uyvy, PixelFormat::Uyva);
+        let room = uyvy.send_tail_room();
+        assert_eq!(room, uyva.send_tail_room());
+        if room == 0 {
+            // The SDK reads frames exactly here: nothing needs room.
+            for scan in ScanType::ALL {
+                assert!(in_place(uyvy, 6, scan, None, 216, 0), "{scan:?}");
+                assert!(in_place(uyva, 6, scan, None, 324, 0), "{scan:?}");
+            }
+            return;
+        }
+        assert_eq!(room, 64);
+        // Packed rows of 36 bytes, four rows: the frame is 144 bytes.
+        assert!(!in_place(uyvy, 4, progressive, None, 144, 0));
+        assert!(!in_place(uyvy, 4, progressive, None, 144 + 63, 0));
+        assert!(in_place(uyvy, 4, progressive, None, 144 + 64, 0));
+        // Row padding counts: 64 bytes of it, or 60 and four more bytes.
+        assert!(in_place(uyvy, 4, progressive, Some(100), 400, 0));
+        assert!(!in_place(uyvy, 4, progressive, Some(96), 384, 0));
+        assert!(!in_place(uyvy, 4, progressive, Some(96), 384 + 3, 0));
+        assert!(in_place(uyvy, 4, progressive, Some(96), 384 + 4, 0));
+        // So do bytes the caller vouches for, alone or with the others.
+        assert!(!in_place(uyvy, 4, progressive, None, 144, 63));
+        assert!(in_place(uyvy, 4, progressive, None, 144, 64));
+        assert!(in_place(uyvy, 4, progressive, Some(96), 384 + 2, 2));
+        assert!(in_place(uyvy, 4, progressive, None, 144, usize::MAX));
+        // UYVA ends with its alpha plane, whose rows are half the stride.
+        assert!(!in_place(uyva, 4, progressive, None, 216, 0));
+        assert!(!in_place(uyva, 4, progressive, None, 216 + 63, 0));
+        assert!(in_place(uyva, 4, progressive, None, 216 + 64, 0));
+        assert!(in_place(uyva, 4, progressive, Some(164), 984, 0));
+        assert!(!in_place(uyva, 4, progressive, Some(160), 960, 0));
+        assert!(in_place(uyva, 4, progressive, Some(160), 960 + 2, 0));
+        // Interlaced and single-field frames need the same room when their
+        // height is a multiple of four, and two line strides more when not.
+        for scan in [ScanType::Interlaced, ScanType::Field0, ScanType::Field1] {
+            assert!(!in_place(uyvy, 4, scan, None, 144 + 63, 0), "{scan:?}");
+            assert!(in_place(uyvy, 4, scan, None, 144 + 64, 0), "{scan:?}");
+            // Six rows of 36 bytes: 216 bytes, and 72 + 64 of room.
+            assert!(!in_place(uyvy, 6, scan, None, 216 + 64, 0), "{scan:?}");
+            assert!(!in_place(uyvy, 6, scan, None, 216 + 135, 0), "{scan:?}");
+            assert!(in_place(uyvy, 6, scan, None, 216 + 136, 0), "{scan:?}");
+            assert!(in_place(uyvy, 5, scan, None, 180 + 136, 0), "{scan:?}");
+            // With a 100-byte stride the rows are 200 bytes, less the 64 of
+            // padding that already follow the last pixel.
+            assert!(
+                !in_place(uyvy, 6, scan, Some(100), 600 + 199, 0),
+                "{scan:?}"
+            );
+            assert!(in_place(uyvy, 6, scan, Some(100), 600 + 200, 0), "{scan:?}");
+            assert!(in_place(uyva, 6, scan, None, 324 + 136, 0), "{scan:?}");
+            assert!(!in_place(uyva, 6, scan, None, 324 + 135, 0), "{scan:?}");
+        }
+        assert!(in_place(uyvy, 6, progressive, None, 216 + 64, 0));
+    }
+
+    /// Staging changes where the pixels are and nothing else, reuses its
+    /// allocation, and leaves a frame that sends in place alone.
+    #[test]
+    fn a_frame_without_room_is_staged_as_the_same_frame_with_room() {
+        // 18 pixels per row, padded to a 40-byte stride.
+        let buffer: Vec<u8> = (0..160).map(|i| i as u8).collect();
+        let metadata = c"<staged/>";
+        let frame = BorrowedVideoFrame::builder(&buffer, 18, 4, PixelFormat::Uyvy)
+            .line_stride(40)
+            .frame_rate(FrameRate::new(30000, 1001).unwrap())
+            .picture_aspect_ratio(1.25)
+            .scan_type(ScanType::Interlaced)
+            .timecode(Timecode::from_ticks(12345))
+            .metadata(metadata)
+            .build()
+            .unwrap();
+        if frame.sends_in_place() {
+            // The SDK reads frames exactly here, so nothing is ever staged.
+            assert_eq!(PixelFormat::Uyvy.send_tail_room(), 0);
+            return;
+        }
+        let original = frame.to_raw();
+
+        let mut staging = Pixels::default();
+        let raw = {
+            let staged = frame.staged(&mut staging);
+            assert!(staged.sends_in_place());
+            assert_eq!(staged.data(), frame.data());
+            assert_eq!(format!("{staged:?}"), format!("{frame:?}"));
+            staged.to_raw()
+        };
+        assert_eq!(raw.p_data, staging.as_ptr().cast_mut());
+        assert_ne!(raw.p_data, original.p_data);
+        assert_eq!(staging.as_slice(), buffer);
+        assert_eq!(staging.room(), [0; 64]);
+        assert_eq!(staging.capacity(), 160 + 64);
+        // Everything but the pixel pointer describes the caller's frame.
+        // SAFETY: both descriptors are uncompressed, so the union holds the stride.
+        let strides = unsafe {
+            (
+                raw.__bindgen_anon_1.line_stride_in_bytes,
+                original.__bindgen_anon_1.line_stride_in_bytes,
+            )
+        };
+        assert_eq!(strides, (40, 40));
+        assert_eq!(
+            (raw.xres, raw.yres, raw.FourCC, raw.timecode, raw.p_metadata),
+            (
+                original.xres,
+                original.yres,
+                original.FourCC,
+                original.timecode,
+                original.p_metadata
+            )
+        );
+        assert_eq!(
+            (raw.frame_rate_N, raw.frame_rate_D, raw.frame_format_type),
+            (
+                original.frame_rate_N,
+                original.frame_rate_D,
+                original.frame_format_type
+            )
+        );
+        assert_eq!(raw.picture_aspect_ratio, original.picture_aspect_ratio);
+
+        // The next frame of the same size reuses the allocation.
+        let other = vec![9u8; 160];
+        let next = BorrowedVideoFrame::builder(&other, 18, 4, PixelFormat::Uyvy)
+            .line_stride(40)
+            .build()
+            .unwrap();
+        let address = staging.as_ptr();
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            let _ = next.staged(&mut staging);
+        });
+        assert_eq!(allocations, 0);
+        assert_eq!(
+            (staging.as_ptr(), staging.as_slice()),
+            (address, &other[..])
+        );
+
+        // A frame with room is sent from its own buffer: nothing is staged.
+        let roomy = vec![1u8; 160 + 64];
+        let direct = BorrowedVideoFrame::builder(&roomy, 18, 4, PixelFormat::Uyvy)
+            .line_stride(40)
+            .build()
+            .unwrap();
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            let staged = direct.staged(&mut staging);
+            assert_eq!(staged.data().as_ptr(), roomy.as_ptr());
+        });
+        assert_eq!(allocations, 0);
+        assert_eq!(staging.as_slice(), other);
+    }
+
+    /// A UYVY frame over a buffer that ends with it reaches the SDK from the
+    /// sender's own copy, made in one buffer that later sends reuse.
+    #[test]
+    fn synchronous_send_copies_a_frame_without_room_into_one_reused_buffer() {
+        let Some(sender) = test_sender() else {
+            return;
+        };
+        let staging = |sender: &Sender| {
+            let state = sender.native.video.state.lock().unwrap();
+            (
+                state.staging.as_ptr(),
+                state.staging.as_slice().to_vec(),
+                state.staging.room().to_vec(),
+            )
+        };
+        assert!(staging(&sender).1.is_empty());
+
+        let exact: Vec<u8> = (0..18 * 2 * 16)
+            .map(|i| (64 + (i >> 4) % 128) as u8)
+            .collect();
+        let frame = BorrowedVideoFrame::builder(&exact, 18, 16, PixelFormat::Uyvy)
+            .build()
+            .unwrap();
+        if frame.sends_in_place() {
+            // The SDK reads frames exactly here, so the sender copies none.
+            assert_eq!(PixelFormat::Uyvy.send_tail_room(), 0);
+            sender.send_video(frame).unwrap();
+            assert!(staging(&sender).1.is_empty());
+            return;
+        }
+        sender.send_video(frame).unwrap();
+        let (address, copy, room) = staging(&sender);
+        assert_eq!(copy, exact);
+        assert_eq!(room, [0; 64]);
+
+        // The steady state: the same buffer, and no allocation.
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            sender.send_video(frame).unwrap();
+        });
+        assert_eq!(allocations, 0);
+        assert_eq!(staging(&sender).0, address);
+
+        // Frames that send in place leave the copy alone.
+        let mut roomy = exact.clone();
+        roomy.reverse();
+        roomy.resize(exact.len() + PixelFormat::Uyvy.send_tail_room(), 0);
+        let direct = BorrowedVideoFrame::builder(&roomy, 18, 16, PixelFormat::Uyvy)
+            .build()
+            .unwrap();
+        assert!(direct.sends_in_place());
+        let owned = direct.to_owned();
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            sender.send_video(direct).unwrap();
+            sender.send_video(&owned).unwrap();
+        });
+        assert_eq!(allocations, 0);
+        assert_eq!(staging(&sender), (address, copy, room));
+
+        // A larger frame replaces the buffer once.
+        let larger = vec![128u8; 34 * 2 * 16];
+        let frame = BorrowedVideoFrame::builder(&larger, 34, 16, PixelFormat::Uyvy)
+            .build()
+            .unwrap();
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            sender.send_video(frame).unwrap();
+        });
+        assert_eq!(allocations, 1);
+        assert_eq!(staging(&sender).1, larger);
     }
 
     #[test]
@@ -2055,7 +2477,7 @@ mod tests {
         }
         {
             let video = sender.native.video.state.lock().unwrap();
-            let Some(copy) = video.frame() else {
+            let Some(copy) = video.in_flight.frame() else {
                 panic!("missing copied snapshot")
             };
             assert_ne!(copy.data().as_ptr(), data.as_ptr());
@@ -2065,7 +2487,7 @@ mod tests {
         drop(metadata);
         {
             let video = sender.native.video.state.lock().unwrap();
-            let Some(copy) = video.frame() else {
+            let Some(copy) = video.in_flight.frame() else {
                 panic!("missing copied snapshot")
             };
             assert_eq!(copy.data(), vec![3; 1024]);
@@ -2095,7 +2517,16 @@ mod tests {
             observed.fetch_add(1, Ordering::SeqCst);
         });
         let notified = || count.load(Ordering::SeqCst);
-        let in_flight = |sender: &Sender| sender.native.video.state.lock().unwrap().is_in_flight();
+        let in_flight = |sender: &Sender| {
+            sender
+                .native
+                .video
+                .state
+                .lock()
+                .unwrap()
+                .in_flight
+                .is_in_flight()
+        };
         let frame = |value| {
             let frame = test_owned_frame(value);
             let pixels = frame.data().as_ptr();
@@ -2305,7 +2736,14 @@ mod tests {
             assert!(unsupported(
                 &sender.send_video_async_copy(&borrowed).unwrap_err()
             ));
-            assert!(sender.native.video.state.lock().unwrap().is_in_flight());
+            assert!(sender
+                .native
+                .video
+                .state
+                .lock()
+                .unwrap()
+                .in_flight
+                .is_in_flight());
         }
         assert!(sender.finish_video_async().is_some());
     }
