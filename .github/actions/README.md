@@ -94,3 +94,42 @@ and crates.io authentication use Node 24 action releases. The Pages uploader
 also uses a Node 24 nested artifact action; do not suppress deprecation warnings
 with runtime override variables. The default archive excludes hidden files;
 rustdoc's root redirect and API assets do not require hidden files.
+
+## Preparing and publishing 2.1.0
+
+PR #123 prepares 2.1.0 against the existing 2.x `main`. Obtain explicit approval
+before merging it, creating or pushing a release tag, or publishing the crate.
+The dated changelog is release preparation; no tag or publication is implied.
+If publication happens on a later date, update the changelog date first.
+
+Before approval:
+
+1. Require a successful `Rust CI/CD` run for the PR's final commit. In particular,
+   verify the receiver-status, async-send, independent-sender and FrameSync SDK
+   regressions on Linux, Windows and macOS, plus all four Android example-link
+   jobs, the Rust 1.88 job, audit, formatting and semver checks.
+2. Verify the exact package locally with the installed Standard NDI 6.3.2 SDK:
+   `cargo package`, `cargo publish --dry-run`, and
+   `cargo semver-checks --baseline-rev v2.0.0 --release-type minor --all-features`.
+   Neither packaging nor the dry run publishes anything. Confirm that the
+   manifest says `2.1.0` and no `v2.1.0` tag already exists.
+3. Confirm `main` still contains the 2.x API. This release is intended to precede
+   PR #122's 3.0 merge. If the order changes, re-review the maintenance base,
+   Pages destination and publishing configuration before proceeding.
+
+After explicit merge approval, merge into `main` and wait for its CI and Pages
+deployment. The 2.x API documentation remains at
+`https://grantsparks.github.io/grafton-ndi/grafton_ndi/`, matching `Cargo.toml`;
+the maintenance branch and PR do not deploy Pages. The crate still requires
+installed SDK headers at build time, so this release uses Pages rather than
+relying on a docs.rs build.
+
+After explicit release approval, tag the approved release commit `v2.1.0` and
+push that tag. The publishing workflow is **`.github/workflows/rust.yml`**,
+using the `Publish` job on Windows after all its required jobs succeed. Its
+`rust-lang/crates-io-auth-action` step supplies the publishing token; the
+crates.io trusted-publisher configuration must name this workflow, rather than
+3.0's separate `publish.yml`. No `crates-io` environment is specified in the
+2.x job. Verify the resulting crates.io version and downloadable package after
+publication. Keep SDK installers and private acquisition URLs out of release
+assets and notes.

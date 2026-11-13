@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Entries and examples describe the API of their named release. For the current
 API, see the [README](README.md) and [2.0 migration guide](docs/migration/1.x-to-2.0.md).
 
-## [2.1.0] - Unreleased
+## [2.1.0] - 2026-11-13
 
 A maintenance release retaining the 2.0 API, default features, build-time SDK
 linkage and Rust 1.88 baseline.
