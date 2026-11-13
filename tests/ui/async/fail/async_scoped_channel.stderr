@@ -1,0 +1,17 @@
+error: lifetime may not live long enough
+ --> tests/ui/async/fail/async_scoped_channel.rs:8:47
+  |
+8 |         .capture_with(Duration::ZERO, |frame| frame.channel_data(0).unwrap())
+  |                                        ------ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'1` must outlive `'2`
+  |                                        |    |
+  |                                        |    return type of closure is &'2 [f32]
+  |                                        has type `&'1 frames::borrowed::AudioRef<'_, AudioKind>`
+
+error: lifetime may not live long enough
+ --> tests/ui/async/fail/async_scoped_channel.rs:8:47
+  |
+8 |         .capture_with(Duration::ZERO, |frame| frame.channel_data(0).unwrap())
+  |                                        ------ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ returning this value requires that `'3` must outlive `'2`
+  |                                        |    |
+  |                                        |    return type of closure is &'2 [f32]
+  |                                        has type `&frames::borrowed::AudioRef<'3, AudioKind>`

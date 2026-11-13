@@ -111,6 +111,49 @@ frames in place from the SDK's padded rows. See the
 [image encoding guide](image-encoding.md) and its
 [performance notes](image-encoding-performance.md).
 
+### Scoped async capture
+
+`tests/mixed_capture_boundary.rs` exercises typed and mixed callbacks on Tokio
+and smol against a scripted runtime: padded packed/planar/alpha video, strided
+audio, metadata, invalid descriptors, retained notifications, callback panic and
+reentry, and cancellation after native entry or during processing. Pointer
+identity and exact frees are checked, including dropping the async owner while
+its callback still holds the buffer. Compile contracts reject escaped media
+borrows and accept summaries and explicit owned copies.
+
+`src/asynchronous/scoped_tests.rs` counts allocations in the shared processing
+scope using synthetic validated guards. Seeded padded rows match the owned-copy
+oracle across packed, planar and alpha formats without initializing padding.
+Seeded strided channels also match the owned oracle; channels and metadata retain their
+native pointers. These scopes allocate zero times; task/runtime and SDK
+allocations are outside this measurement.
+
+On Linux x86-64, Xeon w7-2475X, Rust 1.100.0, a release measurement of dimensions
+and first-pixel inspection gave these median/p99 times over 500 samples after
+10 warmups. Both paths return the same summary; the owned path first copies the
+frame and its eight-byte metadata string. Bytes are peak requested allocation
+bytes, excluding allocator overhead and preexisting source storage.
+
+| BGRA dimensions | Row padding | Scoped median / p99 | Owned median / p99 | Scoped / owned bytes |
+| --- | --- | --- | --- | --- |
+| 1920×1080 | 0 | 95 / 111 ns | 525 / 542 µs | 0 / 8,294,409 |
+| 1920×1080 | 64 bytes | 84 / 113 ns | 536 / 541 µs | 0 / 8,294,409 |
+| 3840×2160 | 0 | 110 / 137 ns | 1.96 / 1.99 ms | 0 / 33,177,609 |
+| 3840×2160 | 64 bytes | 179 / 342 ns | 2.82 / 2.97 ms | 0 / 33,177,609 |
+
+This isolates ownership conversion; it measures neither SDK encoding/capture
+nor task scheduling. Reproduce with:
+
+```sh
+cargo test --release --locked --features tokio,smol --lib payload_copy_benchmark -- --ignored --nocapture
+```
+
+`tests/mixed_capture_sdk.rs` also checks scoped typed/mixed loopback video, audio
+and metadata on both runtimes, including reconnect. These tests were exercised
+on Linux x86-64 with Standard 6.3.2 and 6.4.0.2 and Advanced 6.4.0.2; other
+platforms require separate qualification.
+Use `--config ci/offline.toml` and the identity/required-runtime variables above.
+
 ### Reads past the end of sent video
 
 The x86 builds of the SDK read past the last pixel of many UYVY and UYVA

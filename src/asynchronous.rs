@@ -25,17 +25,28 @@
 //! through [`receiver`](AsyncReceiver::receiver), for the controls that do not
 //! wait.
 //!
-//! For `capture`, `capture_any`, `poll_event` and `poll_source_name_change`, the timeout
+//! For owned/scoped captures, `poll_event` and `poll_source_name_change`, the timeout
 //! budget starts when the future is first polled, rather than when it is
 //! constructed. The same deadline covers blocking-pool queue delay, receiver
 //! capture-gate contention, and SDK waits.
 //! This is a wait budget, not a hard completion deadline: scheduling, frame copying,
 //! and other processing can delay the result beyond it.
 //!
+//! [`AsyncCapture::capture_with`] and [`AsyncReceiver::capture_any_with`] run a
+//! synchronous callback over validated borrowed media on the same blocking
+//! worker that captures it, without wrapper payload allocations or copies.
+//! Only its `Send + 'static` result crosses the task boundary. The callback
+//! holds an SDK buffer and occupies a worker until it returns; keep processing
+//! bounded. Use owned capture or explicitly copy in the callback to keep media
+//! across awaits. Owned capture copies all active pixels/samples and present
+//! metadata into new allocations (33,177,600 pixel bytes for 4K BGRA).
+//!
 //! Dropping a future sets a cancellation flag. Work is skipped if the blocking
 //! closure observes that flag at its entry gate. After passing that gate, work
 //! continues, including waiting for receiver access; it cannot be interrupted by
-//! dropping the future.
+//! dropping the future. A scoped callback may therefore execute after the
+//! future was dropped. Its time and side effects are not cancelled by the wait
+//! timeout either; callback panics become [`Error::SpawnFailed`].
 //!
 //! # Features
 //!
@@ -60,9 +71,10 @@
 //!
 //!     let async_receiver = AsyncReceiver::new(receiver);
 //!
-//!     // Capture frame asynchronously without blocking the runtime
-//!     if let Some(frame) = async_receiver.video().capture(std::time::Duration::from_secs(5)).await? {
-//!         println!("Captured {}x{} frame", frame.width(), frame.height());
+//!     if let Some(size) = async_receiver.video().capture_with(std::time::Duration::from_secs(5), |frame| {
+//!         (frame.width(), frame.height())
+//!     }).await? {
+//!         println!("Captured dimensions: {size:?}");
 //!     }
 //!
 //!     Ok(())
@@ -83,7 +95,7 @@ use std::{
 use crate::{
     capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
     timeout::Deadline,
-    ConnectionStats, Error, Receiver, ReceiverEvent, ReceiverItem, Result, Source,
+    ConnectionStats, Error, Receiver, ReceiverEvent, ReceiverItem, ReceiverItemRef, Result, Source,
     SourceNameChange,
 };
 
@@ -264,8 +276,10 @@ impl private::Spawn for Smol {
 ///     let async_receiver = AsyncReceiver::new(receiver);
 ///
 ///     // Capture without blocking the runtime
-///     match async_receiver.video().capture(std::time::Duration::from_millis(100)).await? {
-///         Some(frame) => println!("Got frame: {}x{}", frame.width(), frame.height()),
+///     match async_receiver.video().capture_with(std::time::Duration::from_millis(100), |frame| {
+///         (frame.width(), frame.height())
+///     }).await? {
+///         Some(size) => println!("Got dimensions: {size:?}"),
 ///         None => println!("No frame available"),
 ///     }
 ///
@@ -288,6 +302,12 @@ where
 {
     let deadline = Deadline::after(timeout)?;
     R::spawn_blocking(private::Token, move || operation(deadline)).await?
+}
+
+// Keep ownership of the validated guard throughout application processing.
+// Only the result leaves this scope, including when a task is abandoned.
+fn process_captured<V, T>(captured: Option<V>, process: impl FnOnce(&V) -> T) -> Option<T> {
+    captured.as_ref().map(process)
 }
 
 impl<R: AsyncRuntime> AsyncReceiver<R> {
@@ -341,7 +361,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
 
     /// Capture **video** frames without blocking the async runtime.
     ///
-    /// Returns an [`AsyncCapture`] view; see [`AsyncCapture::capture`].
+    /// Returns an [`AsyncCapture`] view; see [`AsyncCapture::capture`] for
+    /// owned media or [`AsyncCapture::capture_with`] for scoped processing.
     /// Mirrors [`Receiver::video`], running each capture on the blocking pool.
     ///
     /// # Example
@@ -357,8 +378,10 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// # let source = grafton_ndi::Source::new("CAMERA (Program)");
     /// # let receiver = grafton_ndi::Receiver::new(&ndi, &ReceiverOptions::new(source))?;
     /// let async_receiver = AsyncReceiver::new(receiver);
-    /// if let Some(frame) = async_receiver.video().capture(Duration::from_secs(5)).await? {
-    ///     println!("Captured {}x{} frame", frame.width(), frame.height());
+    /// if let Some(size) = async_receiver.video().capture_with(Duration::from_secs(5), |frame| {
+    ///     (frame.width(), frame.height())
+    /// }).await? {
+    ///     println!("Captured dimensions: {size:?}");
     /// }
     /// # Ok(())
     /// # }
@@ -388,9 +411,13 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     }
 
     /// Async version of [`Receiver::capture_any`], delivering owned video,
-    /// audio, metadata, or a receiver event from one native wait on the
+    /// audio, metadata, or a receiver event through the shared capture loop on the
     /// runtime's blocking pool. Borrowed native frames remain on that worker
-    /// and are freed after their validated owned copy has been made.
+    /// and are freed after their validated owned copy has been made. Video/audio
+    /// copy active pixels/samples and present metadata into new allocations;
+    /// standalone metadata copies its text. Use
+    /// [`capture_any_with`](Self::capture_any_with) for immediate inspection
+    /// without these payload allocations and copies.
     ///
     /// The wait budget starts at first poll and includes blocking-pool queue
     /// delay, receiver-lock contention and SDK waits. A spent or zero budget
@@ -410,9 +437,47 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// that passed the gate may still consume an item whose result is then
     /// discarded; a native wait cannot be interrupted by dropping a future.
     pub async fn capture_any(&self, timeout: Duration) -> Result<Option<ReceiverItem>> {
+        self.capture_any_with(timeout, |item| item.to_owned()).await
+    }
+
+    /// Process the next video, audio, metadata or receiver event on the
+    /// blocking worker, without copying its payload into an owned item.
+    ///
+    /// `process` synchronously borrows the validated [`ReceiverItemRef`]. It
+    /// runs once for a delivered item, after internal capture locks have been
+    /// released; timeouts and capture errors do not call it. The wrapper keeps
+    /// the native frame guard until the callback returns (or unwinds), then
+    /// frees it on the same worker. Only the returned `T` crosses the task
+    /// boundary. Borrowed frames, planes, rows, channels and text cannot escape.
+    /// Use an owned result, or explicitly call [`ReceiverItemRef::to_owned`],
+    /// to retain data across awaits.
+    ///
+    /// The callback and its captures must be `Send + 'static`, as must `T`.
+    /// Keep processing bounded: it occupies a blocking worker and retains an
+    /// SDK buffer throughout. No wrapper payload allocation or copy is made;
+    /// runtime/task allocations and allocations by the callback still apply.
+    ///
+    /// The wait budget, event delivery and cancellation rules are those of
+    /// [`capture_any`](Self::capture_any). Callback execution time and side
+    /// effects are not cancelled by the timeout or by dropping the future.
+    /// After the cancellation gate it may run even if the future was dropped.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Receiver::capture_any_ref`], and [`Error::SpawnFailed`]
+    /// for a blocking-task failure or callback panic. Oversize timeouts are
+    /// rejected before submitting work.
+    pub async fn capture_any_with<F, T>(&self, timeout: Duration, process: F) -> Result<Option<T>>
+    where
+        F: for<'frame> FnOnce(&ReceiverItemRef<'frame>) -> T + Send + 'static,
+        T: Send + 'static,
+    {
         let receiver = Arc::clone(&self.inner);
         with_timeout_budget::<R, _, _>(timeout, move |deadline| {
-            receiver.core.capture_any_until(deadline)
+            Ok(process_captured(
+                receiver.core.capture_any_ref_until(deadline)?,
+                process,
+            ))
         })
         .await
     }
@@ -623,10 +688,9 @@ impl<R: AsyncRuntime> Clone for AsyncReceiver<R> {
 /// pool, with the same semantics, and its timeout budget also covers the
 /// time the work waits for a blocking-pool thread.
 ///
-/// There is no zero-copy `capture_ref` here: a borrowed frame is tied to
-/// the receiver and cannot cross the `spawn_blocking` boundary. Use
-/// [`Capture::capture_ref`](crate::Capture::capture_ref) on the synchronous
-/// receiver for in-place processing.
+/// [`capture_with`](Self::capture_with) processes a validated borrowed frame
+/// on that same worker without a payload copy. Only its computed result
+/// crosses the task boundary; the native guard stays on the worker.
 pub struct AsyncCapture<'rx, R: AsyncRuntime, K: CaptureKind> {
     recv: &'rx AsyncReceiver<R>,
     _kind: PhantomData<K>,
@@ -646,6 +710,9 @@ where
     /// Async version of [`Capture::capture`](crate::Capture::capture): wait
     /// up to `timeout` for a frame and return an owned copy of it, or `None`
     /// when none arrived in time, running on the blocking pool.
+    /// Copies all active pixels/samples and present metadata into new storage.
+    /// Use [`capture_with`](Self::capture_with) for immediate inspection
+    /// without that payload allocation and copy.
     ///
     /// # Arguments
     ///
@@ -669,9 +736,62 @@ where
     /// continues, including waiting for receiver access, and can consume a frame
     /// whose result is discarded.
     pub async fn capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
+        self.capture_with(timeout, K::ref_to_owned).await
+    }
+
+    /// Process a validated borrowed frame on the blocking worker without
+    /// copying its payload into an owned frame.
+    ///
+    /// `process` runs synchronously once for a delivered frame, after internal
+    /// capture locks have been released. Timeouts and capture errors do not
+    /// call it. The wrapper retains the guard throughout the callback and frees
+    /// it on that worker before returning `T`, including on callback panic.
+    /// Borrowed frames, planes, rows, channels and metadata text cannot escape.
+    /// The callback, its captures and its result must be `Send + 'static`.
+    /// Return a small summary for immediate inspection, or explicitly copy
+    /// with the frame's `to_owned()` to retain data across awaits.
+    ///
+    /// No wrapper payload allocation or copy is made; runtime/task allocations
+    /// and callback allocations still apply. Keep processing bounded: the
+    /// callback occupies a blocking worker and retains an SDK buffer until it
+    /// returns. Typed captures retain notifications for event readers as usual.
+    ///
+    /// The timeout and cancellation rules of [`capture`](Self::capture) apply.
+    /// Neither the callback's execution time nor its side effects are cancelled
+    /// by the timeout or by dropping the future. Once the task passes its
+    /// cancellation gate, the callback may run even if the future was dropped.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Capture::capture_ref`](crate::Capture::capture_ref), and
+    /// [`Error::SpawnFailed`] for a blocking-task failure or callback panic.
+    /// Oversize timeouts are rejected before submitting work.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "tokio")]
+    /// # async fn inspect(receiver: grafton_ndi::asynchronous::tokio::AsyncReceiver)
+    /// # -> grafton_ndi::Result<()> {
+    /// use std::time::Duration;
+    /// let size = receiver.video().capture_with(Duration::from_secs(1), |frame| {
+    ///     (frame.width(), frame.height())
+    /// }).await?;
+    /// println!("Dimensions: {size:?}");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn capture_with<F, T>(&self, timeout: Duration, process: F) -> Result<Option<T>>
+    where
+        F: for<'frame> FnOnce(&K::Ref<'frame>) -> T + Send + 'static,
+        T: Send + 'static,
+    {
         let receiver = Arc::clone(&self.recv.inner);
         with_timeout_budget::<R, _, _>(timeout, move |deadline| {
-            receiver.core.capture_until::<K>(deadline)
+            Ok(process_captured(
+                receiver.core.capture_ref_until::<K>(deadline)?,
+                process,
+            ))
         })
         .await
     }
@@ -701,8 +821,10 @@ pub mod tokio {
     //!     let async_receiver = AsyncReceiver::new(receiver);
     //!
     //!     // Capture without blocking the runtime
-    //!     match async_receiver.video().capture(std::time::Duration::from_millis(100)).await? {
-    //!         Some(frame) => println!("Got frame: {}x{}", frame.width(), frame.height()),
+    //!     match async_receiver.video().capture_with(std::time::Duration::from_millis(100), |frame| {
+    //!         (frame.width(), frame.height())
+    //!     }).await? {
+    //!         Some(size) => println!("Got dimensions: {size:?}"),
     //!         None => println!("No frame available"),
     //!     }
     //!
@@ -739,8 +861,10 @@ pub mod smol {
     //!         let async_receiver = AsyncReceiver::new(receiver);
     //!
     //!         // Capture without blocking the runtime
-    //!         match async_receiver.video().capture(std::time::Duration::from_millis(100)).await? {
-    //!             Some(frame) => println!("Got frame: {}x{}", frame.width(), frame.height()),
+    //!         match async_receiver.video().capture_with(std::time::Duration::from_millis(100), |frame| {
+    //!             (frame.width(), frame.height())
+    //!         }).await? {
+    //!             Some(size) => println!("Got dimensions: {size:?}"),
     //!             None => println!("No frame available"),
     //!         }
     //!
@@ -1040,6 +1164,26 @@ mod receiver_tests {
         AsyncReceiver::new(Receiver::new(ndi, &ReceiverOptions::new(Source::new(""))).unwrap())
     }
 
+    // Both scoped entry points spend their budget waiting for reconnect and
+    // never call application code when that budget delivers no frame.
+    #[allow(clippy::await_holding_lock)] // Deliberately contend with the worker's capture lock.
+    async fn scoped_reconnect_contention<R: AsyncRuntime>(receiver: &AsyncReceiver<R>) {
+        let _exclusive = receiver.inner.core.reconnect_lock();
+        for timeout in [Duration::ZERO, Duration::from_millis(25)] {
+            assert!(receiver
+                .video()
+                .capture_with(timeout, |_| panic!("no video"))
+                .await
+                .unwrap()
+                .is_none());
+            assert!(receiver
+                .capture_any_with(timeout, |_| panic!("no item"))
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
     /// Lending the receiver added no field: the auto traits are those the
     /// type had before. It is not `UnwindSafe`, because its shared
     /// [`Receiver`] is deliberately not `RefUnwindSafe`.
@@ -1056,7 +1200,23 @@ mod receiver_tests {
     fn futures_are_send<R: AsyncRuntime>(receiver: &AsyncReceiver<R>, source: &Source) {
         fn send<T: Send>(_: T) {}
         send(receiver.video().capture(Duration::ZERO));
+        send(
+            receiver
+                .video()
+                .capture_with(Duration::ZERO, |frame| frame.width()),
+        );
+        send(
+            receiver
+                .audio()
+                .capture_with(Duration::ZERO, |frame| frame.num_samples()),
+        );
+        send(
+            receiver
+                .metadata()
+                .capture_with(Duration::ZERO, |frame| frame.data().len()),
+        );
         send(receiver.capture_any(Duration::ZERO));
+        send(receiver.capture_any_with(Duration::ZERO, |_| ()));
         send(receiver.poll_event(Duration::ZERO));
         send(receiver.poll_source_name_change(Duration::ZERO));
         send(receiver.connect_to(source));
@@ -1135,6 +1295,7 @@ mod receiver_tests {
         };
         let receiver = unconnected::<Smol>(&ndi);
         ::smol::block_on(operations_of_an_unconnected_receiver(&ndi, &receiver));
+        ::smol::block_on(scoped_reconnect_contention(&receiver));
     }
 
     #[cfg(feature = "tokio")]
@@ -1184,6 +1345,45 @@ mod receiver_tests {
             };
             let receiver = unconnected::<Tokio>(&ndi);
             runtime().block_on(operations_of_an_unconnected_receiver(&ndi, &receiver));
+            runtime().block_on(scoped_reconnect_contention(&receiver));
+        }
+
+        #[test]
+        fn scoped_capture_spends_queue_delay_and_skips_cancelled_callbacks() {
+            let Some(ndi) = crate::test_support::ndi() else {
+                return;
+            };
+            let receiver = unconnected::<Tokio>(&ndi);
+            runtime().block_on(async {
+                worker_capture_calls().await;
+                let (release, blocker) = occupy_worker();
+                let budget = Duration::from_millis(25);
+                let view = receiver.video();
+                let mut capture = Box::pin(view.capture_with(budget, |_| panic!("no frame")));
+                let mut context = Context::from_waker(Waker::noop());
+                assert!(matches!(capture.as_mut().poll(&mut context), Poll::Pending));
+                std::thread::sleep(budget + Duration::from_millis(10));
+                release.send(()).unwrap();
+                assert!(capture.await.unwrap().is_none());
+                blocker.await.unwrap();
+                assert_eq!(
+                    ::tokio::task::spawn_blocking(native_capture_calls::take_with_longest_wait)
+                        .await
+                        .unwrap(),
+                    (1, 0)
+                );
+
+                let (release, blocker) = occupy_worker();
+                let mut capture =
+                    Box::pin(receiver.capture_any_with(Duration::from_secs(1), |_| {
+                        panic!("cancelled callback")
+                    }));
+                assert!(matches!(capture.as_mut().poll(&mut context), Poll::Pending));
+                drop(capture);
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                assert_eq!(worker_capture_calls().await, 0);
+            });
         }
 
         #[test]
@@ -1329,3 +1529,6 @@ mod receiver_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod scoped_tests;

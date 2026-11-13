@@ -1,0 +1,17 @@
+error: lifetime may not live long enough
+ --> tests/ui/async/fail/async_scoped_video_metadata.rs:8:47
+  |
+8 |         .capture_with(Duration::ZERO, |frame| frame.metadata())
+  |                                        ------ ^^^^^^^^^^^^^^^^ returning this value requires that `'1` must outlive `'2`
+  |                                        |    |
+  |                                        |    return type of closure is Option<&'2 str>
+  |                                        has type `&'1 frames::borrowed::VideoRef<'_, VideoKind>`
+
+error: lifetime may not live long enough
+ --> tests/ui/async/fail/async_scoped_video_metadata.rs:8:47
+  |
+8 |         .capture_with(Duration::ZERO, |frame| frame.metadata())
+  |                                        ------ ^^^^^^^^^^^^^^^^ returning this value requires that `'3` must outlive `'2`
+  |                                        |    |
+  |                                        |    return type of closure is Option<&'2 str>
+  |                                        has type `&frames::borrowed::VideoRef<'3, VideoKind>`

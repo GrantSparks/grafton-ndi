@@ -1539,7 +1539,7 @@ impl ReceiverCore {
     }
 
     /// Hold the lock a reconnect holds, so that a test can contend with capture.
-    #[cfg(all(test, any(feature = "advanced", feature = "tokio")))]
+    #[cfg(all(test, any(feature = "advanced", feature = "tokio", feature = "smol")))]
     pub(crate) fn reconnect_lock(&self) -> parking_lot::RwLockWriteGuard<'_, Source> {
         self.capture_guard.write()
     }
@@ -1589,7 +1589,7 @@ impl ReceiverCore {
     }
 
     /// [`Self::capture_ref_until`], copied into an owned frame: behind
-    /// [`Capture::capture`] and the async receivers' capture.
+    /// [`Capture::capture`]. Async captures copy inside their scoped callback.
     pub(crate) fn capture_until<K: CaptureKind>(
         &self,
         deadline: Deadline,

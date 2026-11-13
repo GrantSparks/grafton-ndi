@@ -28,6 +28,12 @@ API, see the [README](README.md) and the migration guides for
 
 ### Added
 
+- Tokio and smol `AsyncCapture::capture_with` and
+  `AsyncReceiver::capture_any_with` process validated borrowed media in the
+  capture's blocking task without wrapper payload allocations or copies. Only
+  a `Send + 'static` result leaves the callback. Callbacks retain an SDK buffer
+  and worker until they return, and may execute after future cancellation once
+  the task passes its gate. Owned capture uses the same scoped path.
 - Owned video/audio builders return `Rejected<Builder>` so invalid settings can
   be repaired without losing supplied buffers. Frames expose `into_data` and
   allocation-preserving `swap_data`; compressed and scatter frames retain

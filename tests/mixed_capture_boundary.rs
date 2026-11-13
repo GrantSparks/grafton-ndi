@@ -65,6 +65,18 @@ fn frees(kind: &str) -> usize {
         .count()
 }
 
+#[cfg(any(feature = "tokio", feature = "smol"))]
+fn native_payload(kind: &str) -> usize {
+    let prefix = format!("{kind}-data:");
+    log()
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
 fn exercise(library: std::path::PathBuf) {
     let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(library)).unwrap();
     let receiver = Receiver::new(&ndi, &ReceiverOptions::new(Source::new("fixture"))).unwrap();
@@ -227,7 +239,7 @@ fn exercise(library: std::path::PathBuf) {
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
 fn exercise_async(ndi: &Ndi) {
-    async fn check<R: grafton_ndi::asynchronous::AsyncRuntime>(
+    async fn check<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
         receiver: grafton_ndi::asynchronous::AsyncReceiver<R>,
         serial: usize,
     ) {
@@ -261,6 +273,8 @@ fn exercise_async(ndi: &Ndi) {
             .await
             .unwrap()
             .is_none());
+
+        scoped_checks(&receiver, serial + 200).await;
 
         // Native entry is the observable proof that the cancellation gate
         // was passed. Dropping the pending future must still free the frame
@@ -299,6 +313,7 @@ fn exercise_async(ndi: &Ndi) {
             .await
             .unwrap()
             .is_none());
+        cancel_scoped(receiver, serial + 500, true, true).await;
     }
     let make = || Receiver::new(ndi, &ReceiverOptions::new(Source::new("async fixture"))).unwrap();
     #[cfg(feature = "tokio")]
@@ -314,4 +329,450 @@ fn exercise_async(ndi: &Ndi) {
         grafton_ndi::asynchronous::smol::AsyncReceiver::new(make()),
         21,
     ));
+    for (index, typed, native_entry) in [(0, false, true), (1, true, false), (2, false, false)] {
+        #[cfg(feature = "tokio")]
+        ::tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(cancel_scoped(
+                grafton_ndi::asynchronous::tokio::AsyncReceiver::new(make()),
+                1000 + index,
+                typed,
+                native_entry,
+            ));
+        #[cfg(feature = "smol")]
+        ::smol::block_on(cancel_scoped(
+            grafton_ndi::asynchronous::smol::AsyncReceiver::new(make()),
+            2000 + index,
+            typed,
+            native_entry,
+        ));
+    }
+}
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
+async fn scoped_checks<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
+    receiver: &grafton_ndi::asynchronous::AsyncReceiver<R>,
+    serial: usize,
+) {
+    // Both typed and combined capture see active regions only, with the same
+    // headers and metadata as owned capture. The callback is FnOnce, with an
+    // owned capture, and runs on a different thread from this executor.
+    let caller = std::thread::current().id();
+    for (index, token, bytes) in [(0, "video", 32), (1, "planar", 24), (2, "alpha", 24)] {
+        script(serial + index, &format!("{token},{token},{token},{token}"));
+        let before = frees("video");
+        let once = Box::new(bytes);
+        let summary = receiver
+            .video()
+            .capture_with(Duration::ZERO, move |frame| {
+                assert_ne!(std::thread::current().id(), caller);
+                assert!(frame.data().is_none());
+                assert_eq!(
+                    frame
+                        .planes()
+                        .next()
+                        .unwrap()
+                        .rows()
+                        .next()
+                        .unwrap()
+                        .as_ptr() as usize,
+                    native_payload("video")
+                );
+                let pixels: usize = frame
+                    .planes()
+                    .flat_map(|p| p.rows())
+                    .flatten()
+                    .map(|&b| usize::from(b))
+                    .sum();
+                let expected = *once;
+                drop(once);
+                assert_eq!(pixels, expected * 37);
+                (
+                    frame.width(),
+                    frame.height(),
+                    frame.timecode(),
+                    frame.timestamp(),
+                    frame.metadata().unwrap().len(),
+                    pixels,
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frees("video"), before + 1);
+        let owned = receiver
+            .video()
+            .capture(Duration::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            summary,
+            (
+                owned.width(),
+                owned.height(),
+                owned.timecode(),
+                owned.timestamp(),
+                owned.metadata().unwrap().len(),
+                owned.data().iter().map(|&b| usize::from(b)).sum::<usize>()
+            )
+        );
+        let mixed = receiver
+            .capture_any_with(Duration::ZERO, |item| {
+                let ReceiverItemRef::Video(frame) = item else {
+                    panic!("{item:?}")
+                };
+                assert!(frame.data().is_none());
+                frame.to_owned()
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let ReceiverItem::Video(owned_mixed) =
+            receiver.capture_any(Duration::ZERO).await.unwrap().unwrap()
+        else {
+            panic!("video")
+        };
+        assert_eq!(mixed.data(), owned_mixed.data());
+        assert_eq!(mixed.frame_rate(), owned_mixed.frame_rate());
+        assert_eq!(mixed.scan_type(), owned_mixed.scan_type());
+        assert_eq!(
+            mixed.picture_aspect_ratio(),
+            owned_mixed.picture_aspect_ratio()
+        );
+        assert_eq!(mixed.metadata(), owned_mixed.metadata());
+        assert_eq!(frees("video"), before + 4);
+    }
+    script(
+        serial + 10,
+        "audio,audio,metadata,metadata,status,source,unknown",
+    );
+    let before = frees("audio");
+    let audio = receiver
+        .audio()
+        .capture_with(Duration::ZERO, |frame| {
+            assert!(frame.data().is_none());
+            assert_eq!(
+                frame.channel_data(0).unwrap().as_ptr() as usize,
+                native_payload("audio")
+            );
+            assert_eq!(frame.channel_data(0).unwrap(), [0.25, 0.5]);
+            assert_eq!(frame.channel_data(1).unwrap(), [-0.25, -0.5]);
+            frame.to_owned()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let ReceiverItem::Audio(other) = receiver
+        .capture_any_with(Duration::ZERO, |item| item.to_owned())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("audio")
+    };
+    assert_eq!(audio.data(), other.data());
+    assert_eq!(audio.timecode(), other.timecode());
+    assert_eq!(audio.timestamp(), other.timestamp());
+    assert_eq!(audio.metadata(), other.metadata());
+    assert_eq!(frees("audio"), before + 2);
+    let before = frees("metadata");
+    assert_eq!(
+        receiver
+            .metadata()
+            .capture_with(Duration::ZERO, |frame| {
+                assert_eq!(frame.data().as_ptr() as usize, native_payload("metadata"));
+                (frame.data().len(), frame.timecode())
+            })
+            .await
+            .unwrap(),
+        Some((11, Timecode::from_ticks(3456)))
+    );
+    let ReceiverItem::Metadata(metadata) = receiver
+        .capture_any_with(Duration::ZERO, |item| item.to_owned())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("metadata")
+    };
+    assert_eq!(metadata.data(), "<metadata/>");
+    assert_eq!(frees("metadata"), before + 2);
+    assert!(receiver
+        .video()
+        .capture_with(Duration::ZERO, |_| panic!("notification"))
+        .await
+        .unwrap()
+        .is_none());
+    let calls = captures();
+    assert!(matches!(
+        receiver
+            .capture_any_with(Duration::ZERO, |item| match item {
+                ReceiverItemRef::Event(event) => *event,
+                _ => panic!("{item:?}"),
+            })
+            .await
+            .unwrap(),
+        Some(ReceiverEvent::StatusChanged(_))
+    ));
+    assert_eq!(
+        captures(),
+        calls,
+        "consume retained event without native entry"
+    );
+    for expected in [ReceiverEvent::SourceChanged, ReceiverEvent::Unknown(987)] {
+        assert_eq!(
+            receiver
+                .capture_any_with(Duration::ZERO, |item| match item {
+                    ReceiverItemRef::Event(event) => *event,
+                    _ => panic!("{item:?}"),
+                })
+                .await
+                .unwrap(),
+            Some(expected)
+        );
+    }
+    assert!(receiver.poll_event(Duration::ZERO).await.unwrap().is_none());
+
+    for (index, token, family) in [
+        (20, "bad-video", "video"),
+        (21, "bad-audio", "audio"),
+        (22, "bad-metadata", "metadata"),
+    ] {
+        script(serial + index, &format!("{token},{token}"));
+        let before = frees(family);
+        let typed: grafton_ndi::Result<Option<()>> = match family {
+            "video" => {
+                receiver
+                    .video()
+                    .capture_with(Duration::ZERO, |_| panic!("invalid video"))
+                    .await
+            }
+            "audio" => {
+                receiver
+                    .audio()
+                    .capture_with(Duration::ZERO, |_| panic!("invalid audio"))
+                    .await
+            }
+            _ => {
+                receiver
+                    .metadata()
+                    .capture_with(Duration::ZERO, |_| panic!("invalid text"))
+                    .await
+            }
+        };
+        assert!(matches!(typed, Err(Error::InvalidFrame(_))));
+        assert!(matches!(
+            receiver
+                .capture_any_with(Duration::ZERO, |_| panic!("invalid item"))
+                .await,
+            Err(Error::InvalidFrame(_))
+        ));
+        assert_eq!(frees(family), before + 2);
+    }
+    script(serial + 30, "none,none,error,error");
+    assert!(receiver
+        .video()
+        .capture_with(Duration::ZERO, |_| panic!("miss"))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(receiver
+        .capture_any_with(Duration::ZERO, |_| panic!("miss"))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        receiver.video().capture_with(Duration::ZERO, |_| ()).await,
+        Err(Error::CaptureFailed(_))
+    ));
+    assert!(matches!(
+        receiver.capture_any_with(Duration::ZERO, |_| ()).await,
+        Err(Error::CaptureFailed(_))
+    ));
+    let calls = captures();
+    assert!(matches!(
+        receiver.video().capture_with(Duration::MAX, |_| ()).await,
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        receiver.capture_any_with(Duration::MAX, |_| ()).await,
+        Err(Error::InvalidInput(_))
+    ));
+    assert_eq!(captures(), calls);
+
+    // Unwinding releases all media families, and the worker remains usable.
+    for (index, token, family) in [
+        (40, "video", "video"),
+        (41, "audio", "audio"),
+        (42, "metadata", "metadata"),
+    ] {
+        script(serial + index, &format!("{token},{token}"));
+        let before = frees(family);
+        let result: grafton_ndi::Result<Option<()>> = match family {
+            "video" => {
+                receiver
+                    .video()
+                    .capture_with(Duration::ZERO, |_| panic!("callback panic"))
+                    .await
+            }
+            "audio" => {
+                receiver
+                    .audio()
+                    .capture_with(Duration::ZERO, |_| panic!("callback panic"))
+                    .await
+            }
+            _ => {
+                receiver
+                    .metadata()
+                    .capture_with(Duration::ZERO, |_| panic!("callback panic"))
+                    .await
+            }
+        };
+        assert!(
+            matches!(result, Err(Error::SpawnFailed(message)) if message.contains("callback panic"))
+        );
+        assert!(
+            matches!(receiver.capture_any_with(Duration::ZERO, |_| panic!("mixed panic")).await,
+            Err(Error::SpawnFailed(message)) if message.contains("mixed panic"))
+        );
+        assert_eq!(frees(family), before + 2);
+    }
+
+    // Reentry would deadlock if application code still held the capture lock.
+    script(serial + 50, "video,audio");
+    let reenter = receiver.clone();
+    receiver
+        .video()
+        .capture_with(Duration::ZERO, move |_| {
+            reenter.receiver().reconnect().unwrap();
+            assert!(reenter
+                .receiver()
+                .audio()
+                .capture_ref(Duration::ZERO)
+                .unwrap()
+                .is_some());
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    script(serial + 51, "video");
+    let reenter = receiver.clone();
+    receiver
+        .capture_any_with(Duration::ZERO, move |_| {
+            reenter.receiver().disconnect();
+        })
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
+async fn cancel_scoped<R: grafton_ndi::asynchronous::AsyncRuntime>(
+    receiver: grafton_ndi::asynchronous::AsyncReceiver<R>,
+    serial: usize,
+    typed: bool,
+    native_entry: bool,
+) {
+    use std::{
+        future::Future,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Arc,
+        },
+        task::{Context, Poll, Waker},
+    };
+    struct ResultDrop(Arc<AtomicBool>);
+    impl Drop for ResultDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    script(serial, "video");
+    if native_entry {
+        std::env::set_var("GRAFTON_FAKE_CAPTURE_DELAY_MS", "80");
+    }
+    let calls = captures();
+    let before = frees("video");
+    let destroyed = log()
+        .lines()
+        .filter(|&line| line == "receiver-destroy")
+        .count();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let worker_dropped = Arc::clone(&dropped);
+    let process = move |width| {
+        assert_eq!(width, 4);
+        entered_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        ResultDrop(worker_dropped)
+    };
+    let mut future = Box::pin(async {
+        if typed {
+            receiver
+                .video()
+                .capture_with(Duration::from_millis(200), move |frame| {
+                    process(frame.width())
+                })
+                .await
+        } else {
+            receiver
+                .capture_any_with(Duration::from_millis(200), move |item| {
+                    let ReceiverItemRef::Video(frame) = item else {
+                        panic!("{item:?}")
+                    };
+                    process(frame.width())
+                })
+                .await
+        }
+    });
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    if native_entry {
+        while captures() == calls {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(future);
+        drop(receiver);
+        // Native work passed the gate; the callback still executes after both
+        // its future and the async owner are gone.
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    } else {
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(future);
+        drop(receiver);
+    }
+    assert_eq!(frees("video"), before, "callback retains the native buffer");
+    assert_eq!(
+        log()
+            .lines()
+            .filter(|&line| line == "receiver-destroy")
+            .count(),
+        destroyed
+    );
+    // The wait timeout does not bound callback processing or cancel its effects.
+    std::thread::sleep(Duration::from_millis(220));
+    assert_eq!(frees("video"), before);
+    release_tx.send(()).unwrap();
+    while !dropped.load(Ordering::Acquire)
+        || log()
+            .lines()
+            .filter(|&line| line == "receiver-destroy")
+            .count()
+            == destroyed
+    {
+        assert!(
+            Instant::now() < deadline,
+            "abandoned result/receiver did not drop"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(frees("video"), before + 1);
+    let records = log();
+    assert!(records.rfind("free-video").unwrap() < records.rfind("receiver-destroy").unwrap());
+    std::env::remove_var("GRAFTON_FAKE_CAPTURE_DELAY_MS");
 }

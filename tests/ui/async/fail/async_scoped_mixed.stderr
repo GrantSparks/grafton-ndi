@@ -1,0 +1,17 @@
+error: lifetime may not live long enough
+ --> tests/ui/async/fail/async_scoped_mixed.rs:7:50
+  |
+7 |         .capture_any_with(Duration::ZERO, |item| item)
+  |                                            ----- ^^^^ returning this value requires that `'1` must outlive `'2`
+  |                                            |   |
+  |                                            |   return type of closure is &'2 ReceiverItemRef<'_>
+  |                                            has type `&'1 ReceiverItemRef<'_>`
+
+error: lifetime may not live long enough
+ --> tests/ui/async/fail/async_scoped_mixed.rs:7:50
+  |
+7 |         .capture_any_with(Duration::ZERO, |item| item)
+  |                                            ----- ^^^^ returning this value requires that `'3` must outlive `'4`
+  |                                            |   |
+  |                                            |   return type of closure is &ReceiverItemRef<'4>
+  |                                            has type `&ReceiverItemRef<'3>`
