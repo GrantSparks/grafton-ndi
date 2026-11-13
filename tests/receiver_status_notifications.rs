@@ -16,20 +16,34 @@ fn wait_until(stage: &str, mut condition: impl FnMut() -> bool) {
 fn media_capture_retains_capability_notifications() -> Result<(), Error> {
     let ndi = NDI::new()?;
     eprintln!("SDK: {} on {}", NDI::version()?, std::env::consts::OS);
-    for kind in 0..6 {
-        let sender = Sender::new(
-            &ndi,
-            &SenderOptions::builder(format!("status retention {kind}")).build(),
-        )?;
-        let source = common::loopback_source(&ndi, &sender)?;
+    // Keep the endpoints distinct while exercising each capture API. Immediate
+    // port reuse after sender/receiver teardown can stall the Windows runtime.
+    let senders = (0..6)
+        .map(|kind| {
+            Sender::new(
+                &ndi,
+                &SenderOptions::builder(format!("status retention {} {kind}", std::process::id()))
+                    .build(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (kind, sender) in senders.iter().enumerate() {
+        let source = common::loopback_source(&ndi, sender)?;
         eprintln!("capture case {kind}: connecting to {source:?}");
         let options = ReceiverOptions::builder(source).build();
-        let control = Receiver::new(&ndi, &options)?;
+        // Windows 6.3.2 can fail to deliver a capability update to both idle
+        // receivers. Observe PTZ readiness on the receiver under test there;
+        // the other platforms also use a control for the web-control update.
+        let control = if cfg!(target_os = "windows") {
+            None
+        } else {
+            Some(Receiver::new(&ndi, &options)?)
+        };
         let media = Receiver::new(&ndi, &options)?;
         wait_until("initial receiver connections", || {
-            control.is_connected() && media.is_connected()
+            control.as_ref().is_none_or(Receiver::is_connected) && media.is_connected()
         });
-        for receiver in [&control, &media] {
+        for receiver in control.iter().chain(std::iter::once(&media)) {
             while receiver
                 .poll_status_change(Duration::from_millis(50))?
                 .is_some()
@@ -57,15 +71,18 @@ fn media_capture_retains_capability_notifications() -> Result<(), Error> {
             sender.add_connection_metadata(&MetadataFrame::with_data(capabilities, 0)?);
             if update == 0 {
                 wait_until("PTZ capability enable", || {
-                    control.ptz_is_supported() && media.ptz_is_supported()
+                    control.as_ref().is_none_or(Receiver::ptz_is_supported)
+                        && media.ptz_is_supported()
                 });
             }
-            wait_until("control status notification", || {
-                control
-                    .poll_status_change(Duration::from_millis(10))
-                    .unwrap()
-                    .is_some()
-            });
+            if let Some(control) = &control {
+                wait_until("control status notification", || {
+                    control
+                        .poll_status_change(Duration::from_millis(10))
+                        .unwrap()
+                        .is_some()
+                });
+            }
             // PTZ enable has a public readiness probe above. The independent
             // web-control change has no public getter here, so allow its SDK
             // notification to reach the media receiver during capture. Recv.h permits
