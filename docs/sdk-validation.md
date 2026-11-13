@@ -214,6 +214,15 @@ programs cannot be linked. On GitHub's hosted Ubuntu 24.04 runner, in run
 642×32 UYVY frame exactly, where the x86-64 builds read past it. No other size
 was measured, so the crate keeps the x86 room for it.
 
+The same runtime, in runs 43366775596 and 43369298234, returned
+`tests/image_color_sdk.rs`'s 3840×2160 UYVY picture of flat 64×64 patches with
+4% of its bytes changed, by up to 224 at patch edges, and with the chroma
+inside some patches wrong too: the mean of Cb inside one patch of the leftmost
+column was 40.8 code values off, while every patch's luma held within 2. Its
+720×576 and 1920×1080 frames were within 2 inside every patch. The test bounds
+that runtime's 3840×2160 chroma by what was measured, and every other size and
+runtime by 2.
+
 #### What the crate does
 
 `PixelFormat::send_tail_room` is the room the crate gives the SDK after a
