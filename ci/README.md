@@ -287,7 +287,7 @@ rustdoc, which starts each compiled doctest through it, with or without
 
 | | Linux ([`linux.sh`](offline/linux.sh)) | macOS ([`macos.sh`](offline/macos.sh)) | Windows ([`windows.ps1`](offline/windows.ps1)) |
 |---|---|---|---|
-| Network | own network namespace (`bwrap --unshare-net`) holding only `lo` | Seatbelt profile allowing only binding, loopback connections and traffic arriving on a local address | Defender Firewall block rules for the test executable, both directions; the firewall never filters loopback |
+| Network | own network namespace (`bwrap --unshare-net`) holding only `lo` | Seatbelt profile allowing only binding, loopback connections and traffic arriving on a local address | Defender Firewall block rules for the test executable, both directions, for every address but the machine's own; the firewall never filters loopback, and Windows delivers traffic to the machine's own addresses as loopback |
 | Host daemons | `/run` replaced by an empty tmpfs: no D-Bus, no Avahi | mDNSResponder socket denied; the SDK is given a loopback discovery address through `NDI_CONFIG_DIR` | untouched |
 | SDK networks | only `lo` exists | loopback discovery address instead of multicast DNS | loopback discovery address instead of multicast DNS, through `NDI_CONFIG_DIR` (see [Receivers that never connect on Windows](#receivers-that-never-connect-on-windows)) |
 | Machine's own name | resolves to `127.0.0.1` through a private `/etc/hosts` | cannot be relied on to resolve | resolves as usual |
@@ -308,8 +308,11 @@ What each wrapper confines, and what it does not:
   still delivered, because the profile language cannot restrict the peer of
   inbound traffic.
 - **Windows.** The two firewall rules name one program, the test executable.
-  Its traffic to and from anything but loopback is blocked for as long as it
-  runs. A process it starts from a different program file is not covered, and
+  Its traffic to and from anything but loopback and the machine's own
+  addresses is blocked for as long as it runs. Traffic to the machine's own
+  addresses does not leave it, and the SDK needs them: blocked too, they
+  stopped receivers connecting to a sender that had already served one (see
+  [Receivers that never connect on Windows](#receivers-that-never-connect-on-windows)). A process it starts from a different program file is not covered, and
   nothing else on the machine is affected. The rules name the program by its
   long path, which the wrapper gets from `GetLongPathNameW`: rustdoc starts
   each doctest from a directory under `%TEMP%`, which the hosted images set to
@@ -479,23 +482,52 @@ an explicit address, and with a discovery address configured, or the firewall
 off, none failed. `ci/offline/windows.ps1` gives the SDK the loopback
 discovery address, as `macos.sh` does, and nothing else.
 
-With multicast DNS out of the way, three Windows failures remain:
+With multicast DNS out of the way, the receivers that still stalled had been
+created as soon as another receiver of the same sender was dropped: the
+`VideoOnlyLowest` receiver of `tests/receiver_video_only.rs`, created as its
+`VideoOnlyHighest` one was dropped, on every 6.4 row, and the second receiver
+of the image colour tests' `round_trip`, on four of the five rows. In run
+43369298234 `tests/peer_recreation.rs` measured that: one sender, and receivers
+created one after another, each as soon as the one before was given a frame and
+dropped, in three arms that took turns, 25 receivers each: the default name,
+which the receiver just dropped had too (`same name`); a name no receiver had
+(`own name`); and the default name 250 ms after the drop (`rested`).
 
-- A receiver created a few milliseconds after another receiver of the same
-  sender, with the same name, was dropped never connected: the `VideoOnlyLowest`
-  receiver of `tests/receiver_video_only.rs`, created as its `VideoOnlyHighest`
-  one was dropped, on every 6.4 row, and the second receiver of the image colour
-  tests' `round_trip`, on four of the five rows. `tests/peer_recreation.rs` now measures
-  exactly that: one sender, and receivers created one after another, each as
-  soon as the one before was given a frame and dropped, in three arms that take
-  turns, 25 receivers each: the default name, which the receiver just dropped
-  had too (`same name`); a name no receiver had (`own name`); and the default
-  name 250 ms after the drop (`rested`).
-- On the 6.4 rows, x64 and x86, a genlock connected to its reference, whose
-  sender counted the connection, never became active; on 6.3.2 it did.
-- The Windows Standard 6.3.2 runtime delivers an `RgbxRgba` receiver's frame of
-  a source without alpha as opaque RGBA, where every other runtime measured
-  delivers RGBX; the image colour test accepts either.
+| Row | Under the runner (`same name`, `own name`, `rested`) | Firewall off, no runner |
+| --- | --- | --- |
+| x64 Standard 6.3.2 | 13, 12, 12 of 25 | 0 of 75 |
+| x64 Standard 6.4 | 13, 14, 13 | 0 |
+| x64 Advanced 6.3.2 | 11, 17, 14 | 0 |
+| x64 Advanced 6.4 | 17, 17, 20 | 0 |
+| x86 Advanced 6.4 | 18, 15, 12 | 0 |
+
+The name made no difference, nor did waiting 250 ms; the confinement did. No
+receiver that missed 5 s counted a connection, a second receiver opened then
+connected in 43 of 45 tries, and `Receiver::reconnect` revived 178 of 218. With
+the firewall off every receiver connected, the slowest in half a second on the
+Advanced rows and in 2 s on the Standard ones: the SDK takes some other route
+first, which the rules blocked. The rules had blocked every address but
+loopback, the machine's own adapter addresses included, although traffic to
+those never leaves the machine. They now leave the machine's own addresses
+alone and block every other: nothing still leaves the machine or arrives from
+another, and `offline/check.py` still finds the public addresses and the
+multicast DNS group refused.
+
+The firewall-off step also showed two failures that are not the confinement's:
+
+- On the Windows 6.4 runtimes, x64 and x86, a genlock connected to its
+  reference, whose sender counted the connection, never became active, with the
+  firewall off too; on 6.3.2, and on Linux and macOS, it did. When it does not,
+  `tests/advanced_runtime.rs` now tries the genlock with references of other
+  kinds (unclocked, without audio, 1920x1080) and reports which it acquires.
+- On both Windows Standard rows the RGBX receiver of
+  `a_pq_tag_reaches_rgb_receivers_and_their_frames_are_refused` was given no
+  frame that matched the PQ-tagged frames sent, with the firewall off too. The
+  image colour tests now report what arrived when a frame never does.
+
+The Windows Standard 6.3.2 runtime also delivers an `RgbxRgba` receiver's
+frame of a source without alpha as opaque RGBA, where every other runtime
+measured delivers RGBX; the image colour test accepts either.
 
 The job's last Windows step, **Windows failures with the firewall off**, runs
 `tests/peer_recreation.rs`, `tests/receiver_video_only.rs`,

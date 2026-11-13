@@ -1,11 +1,19 @@
-# Cargo test runner for Windows: block all non-loopback traffic of the test
-# executable, in both directions, for as long as it runs.
+# Cargo test runner for Windows: block the test executable's traffic to and
+# from every address but the machine's own, in both directions, for as long as
+# it runs.
 #
 #   cargo test --config ci/offline.toml ...
 #
-# Windows Defender Firewall never filters loopback, so program-scoped block
-# rules leave the executable with loopback networking only. Needs an elevated
-# shell (GitHub-hosted runners are).
+# Windows Defender Firewall never filters loopback, and Windows delivers
+# traffic to one of the machine's own addresses as it delivers loopback, so
+# nothing the executable sends leaves the machine and nothing from another
+# machine reaches it. Needs an elevated shell (GitHub-hosted runners are).
+#
+# The rules leave the machine's own addresses alone because the SDK uses them:
+# blocked as well, as every address but loopback was before, they stopped a
+# receiver connecting to a sender that had already served another receiver,
+# 11 to 18 of 25 times on every Windows row of run 43369298234, against none
+# with the firewall off.
 #
 # Name resolution and the temporary directory are left alone. The rules do not
 # change how the machine's own name resolves, tests address their senders as
@@ -75,6 +83,40 @@ public static class GraftonNdiLongPath
 '@
     $program = [GraftonNdiLongPath]::Of($program)
 }
+# An IPv4 address as a number, and back.
+function ConvertTo-Number([string] $address) {
+    $bytes = [System.Net.IPAddress]::Parse($address).GetAddressBytes()
+    [Array]::Reverse($bytes)
+    [uint64] [BitConverter]::ToUInt32($bytes, 0)
+}
+function ConvertTo-Address([uint64] $number) {
+    $bytes = [BitConverter]::GetBytes([uint32] $number)
+    [Array]::Reverse($bytes)
+    [System.Net.IPAddress]::new($bytes).ToString()
+}
+
+# The remote addresses the rules block, as New-NetFirewallRule takes them:
+# every IPv4 address but `$own`, in ranges, and every IPv6 address. Loopback
+# is in neither list's reach, since the firewall never filters it.
+function Get-RemoteAddresses([string[]] $own) {
+    $ranges = [System.Collections.Generic.List[string]]::new()
+    [uint64] $next = 0
+    foreach ($address in @($own | ForEach-Object { ConvertTo-Number $_ } | Sort-Object -Unique)) {
+        if ($address -gt $next) {
+            # Built apart: inside Add's parentheses the comma would end its argument.
+            $range = '{0}-{1}' -f (ConvertTo-Address $next), (ConvertTo-Address ($address - 1))
+            $ranges.Add($range)
+        }
+        $next = $address + 1
+    }
+    if ($next -le [uint32]::MaxValue) {
+        $range = '{0}-255.255.255.255' -f (ConvertTo-Address $next)
+        $ranges.Add($range)
+    }
+    $ranges.Add('::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff')
+    , $ranges.ToArray()
+}
+
 $rule = 'grafton-ndi-ci-' + [guid]::NewGuid().ToString('N')
 $scratch = Join-Path ([System.IO.Path]::GetTempPath()) $rule
 $config = Join-Path $scratch 'config'
@@ -91,9 +133,10 @@ try {
         Set-Content -LiteralPath (Join-Path $config 'ndi-config.v1.json') -Encoding utf8NoBOM
     $env:NDI_CONFIG_DIR = $config
     Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled True
+    $remote = Get-RemoteAddresses @(Get-NetIPAddress -AddressFamily IPv4 | ForEach-Object IPAddress)
     foreach ($direction in 'Outbound', 'Inbound') {
         try {
-            New-NetFirewallRule -DisplayName $rule -Direction $direction -Action Block -Program $program -Profile Any | Out-Null
+            New-NetFirewallRule -DisplayName $rule -Direction $direction -Action Block -Program $program -Profile Any -RemoteAddress $remote | Out-Null
         }
         catch {
             # The cmdlet's message does not name the program it refused.
