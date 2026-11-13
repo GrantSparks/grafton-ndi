@@ -450,6 +450,53 @@ impl Finder {
         }
     }
 
+    /// Wait until a source satisfies `select`, using this finder's discovery scope.
+    ///
+    /// Checks the current snapshot immediately, then waits for source-list changes
+    /// within one total budget. `Duration::ZERO` checks one snapshot. Returns the
+    /// first matching complete descriptor in a snapshot, or `None` when the budget
+    /// expires. Predicates run after releasing the snapshot lock, may inspect name
+    /// and address together, and may call this finder's snapshot APIs. No source's
+    /// continued availability is guaranteed.
+    ///
+    /// This blocks the calling thread and allocates bounded owned snapshots as
+    /// [`Self::current_sources`] describes. It retains this finder's groups, IP
+    /// hints, local-source policy, configuration and runtime; it creates no finder.
+    /// Concurrent selection operations can use the same finder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidInput`] for a timeout above [`crate::MAX_TIMEOUT`],
+    /// including immediate matches, and snapshot errors such as
+    /// [`Error::ResourceLimit`]. A panic in `select` propagates outside SDK locks.
+    pub fn find_source(
+        &self,
+        timeout: Duration,
+        mut select: impl FnMut(&Source) -> bool,
+    ) -> Result<Option<Source>> {
+        self.poll_until_deadline(timeout, |sources| {
+            Ok(sources.into_iter().find(|source| select(source)))
+        })
+    }
+
+    /// Wait for an exact, case-sensitive complete NDI source name.
+    ///
+    /// Names normally look like `"STUDIO (Camera 2)"`. Duplicate names at different
+    /// addresses select the first match in the current snapshot; use
+    /// [`Self::find_source`] with an address predicate to disambiguate them.
+    /// Timeout, allocation, concurrency and error behavior match that method.
+    /// An empty name or a name containing a NUL is refused with
+    /// [`Error::InvalidInput`] before inspecting a snapshot.
+    pub fn find_source_by_name(&self, name: &str, timeout: Duration) -> Result<Option<Source>> {
+        to_ms_checked(timeout)?;
+        if name.is_empty() || name.contains('\0') {
+            return Err(Error::InvalidInput(
+                "Source name must be nonempty and contain no NUL".into(),
+            ));
+        }
+        self.find_source(timeout, |source| source.name() == name)
+    }
+
     /// Discovers sources for up to `timeout`, returning the complete set.
     ///
     /// This honors the full `timeout` window and returns every source observed
@@ -461,7 +508,7 @@ impl Finder {
     ///
     /// For an immediate, non-blocking snapshot of already-known sources use
     /// [`current_sources`](Self::current_sources); to resolve a single specific
-    /// host use [`SourceCache::find_by_host`].
+    /// feed use [`Self::find_source`] or [`Self::find_source_by_name`].
     ///
     /// # Arguments
     ///
@@ -1088,57 +1135,61 @@ impl Display for Source {
     }
 }
 
-/// A thread-safe cache of host-to-source lookups.
+/// A thread-safe cache of complete host result sets in one finder's scope.
 ///
-/// Resolving a hostname or IP address to the NDI [`Source`] it advertises
-/// takes a network discovery, which can last seconds. A `SourceCache`
-/// remembers each answer: [`find_by_host`](Self::find_by_host) discovers a
-/// host the first time it is asked for, and afterwards returns the remembered
-/// source without calling the NDI runtime at all.
+/// A host can publish several feeds. [`Self::sources_by_host`] retains every
+/// distinct matching descriptor observed over its discovery window, rather than
+/// choosing a feed by arrival order. Use [`Finder::find_source`] for a selection
+/// that should return as soon as a particular feed appears.
 ///
-/// The cache stores only owned source descriptors. It holds no [`Ndi`] handle,
-/// so it does not keep NDI started, it can be created before a runtime is
-/// selected, and it can outlive every handle. A lookup that has to search the
-/// network uses the handle it is given.
+/// This cache borrows its configured finder, keeping its runtime and discovery
+/// scope fixed. It never substitutes default discovery settings or adds IP hints;
+/// configure those on the finder before constructing the cache.
 ///
-/// An entry stays until [`invalidate`](Self::invalidate) or
-/// [`clear`](Self::clear) removes it: the cache does not notice a source going
-/// offline or changing address.
-/// Equivalent hostname case/final-dot and numeric IP spellings share one entry.
-/// Hostnames, IP addresses, and DNS aliases otherwise remain distinct identities.
+/// Entries remain until [`Self::invalidate`] or [`Self::clear`]; they can contain
+/// offline endpoints and omit feeds announced after the original window. Empty
+/// results are not cached. Equivalent hostname case/final-dot and numeric IP
+/// spellings share an entry. DNS aliases otherwise remain distinct identities.
 ///
-/// # Thread Safety
-///
-/// `SourceCache` is thread-safe and can be shared across threads using `Arc<SourceCache>`.
-/// Lookups of different hosts do not wait for one another's discovery.
-///
-/// # Examples
+/// The cache is `Send + Sync`. Discovery runs outside its mutex so unrelated
+/// lookups and invalidation remain available; SDK snapshots retain their normal
+/// per-finder serialization. Returned vectors own copies of the descriptors.
 ///
 /// ```no_run
-/// use grafton_ndi::{SourceCache, Ndi};
-/// use std::time::Duration;
-///
-/// # fn main() -> Result<(), grafton_ndi::Error> {
+/// # use grafton_ndi::{Ndi, Finder, FinderOptions, SourceCache};
+/// # use std::time::Duration;
+/// # fn main() -> grafton_ndi::Result<()> {
 /// let ndi = Ndi::new()?;
-/// let cache = SourceCache::new();
-///
-/// // The first lookup of a host searches the network.
-/// let source = cache.find_by_host(&ndi, "192.168.0.107", Duration::from_secs(5))?;
-/// println!("Found source: {}", source);
-///
-/// // Later lookups of that host are answered from the cache.
-/// let same_source = cache.find_by_host(&ndi, "192.168.0.107", Duration::from_secs(5))?;
-/// assert_eq!(same_source, source);
+/// let finder = Finder::new(&ndi, &FinderOptions::new().groups("Studio")
+///     .extra_ips("192.168.0.107"))?;
+/// let cache = SourceCache::new(&finder);
+/// let feeds = cache.sources_by_host("192.168.0.107", Duration::from_secs(5))?;
+/// for feed in feeds { println!("{feed}"); }
 /// # Ok(())
 /// # }
 /// ```
-pub struct SourceCache {
+pub struct SourceCache<'finder> {
+    finder: &'finder Finder,
+    entries: CachedSources,
+}
+
+#[derive(Default)]
+struct CachedSources {
     cache: Mutex<CacheState>,
 }
 
 struct CacheState {
-    entries: HashMap<HostKey, Source>,
+    entries: HashMap<HostKey, Vec<Source>>,
     generation: Option<u64>,
+}
+
+impl Default for CacheState {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            generation: Some(0),
+        }
+    }
 }
 
 impl CacheState {
@@ -1147,89 +1198,102 @@ impl CacheState {
     }
 }
 
-impl SourceCache {
-    /// Create an empty cache. This needs no NDI runtime.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use grafton_ndi::SourceCache;
-    ///
-    /// let cache = SourceCache::new();
-    /// assert!(cache.is_empty());
-    /// ```
-    pub fn new() -> Self {
-        Self::default()
+impl<'finder> SourceCache<'finder> {
+    /// Create an empty cache bound to `finder` and its discovery configuration.
+    /// This allocates no source storage and makes no SDK call.
+    pub fn new(finder: &'finder Finder) -> Self {
+        Self {
+            finder,
+            entries: CachedSources::default(),
+        }
     }
 
-    /// Find the source advertised by a host, by IP address or hostname.
+    /// All feeds observed on a complete hostname or IP within `timeout`.
     ///
-    /// A host found before is answered from the cache, without calling the
-    /// NDI runtime. Otherwise a finder is created from `ndi` for the duration
-    /// of the lookup, local sources included and `host` given to it as an
-    /// extra address to query, and the first matching source is cached and
-    /// returned.
+    /// A cache hit returns owned descriptor copies without an SDK call. On a
+    /// miss, observes the full window using the configured finder; zero checks
+    /// one snapshot. Results retain first-observed order and distinguish names,
+    /// full addresses, and address variants. Select the desired feed explicitly.
+    /// Empty results return an empty vector and are not retained.
     ///
-    /// # Arguments
-    ///
-    /// * `ndi` - The runtime handle a discovery is run through. A cache hit
-    ///   does not use it.
-    /// * `host` - The hostname or IP address to search for
-    /// * `timeout` - Maximum time to wait for source discovery.
-    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+    /// Blocks on discovery only, outside the cache lock. Discovery uses the same
+    /// bounded, fallible snapshot and accumulated-result allocations as
+    /// [`Finder::find_sources`]. Returned cached descriptors are fallibly copied.
+    /// Entries have the explicit stale-data policy described on [`SourceCache`].
     ///
     /// # Errors
     ///
-    /// - [`Error::NoSourcesFound`] if no source matching the host is discovered
-    ///   before the timeout expires
-    /// - [`Error::InvalidInput`] if `host` is not a bare hostname or IP,
-    ///   or `timeout` exceeds [`crate::MAX_TIMEOUT`]; both are checked before
-    ///   the cache is consulted
-    /// - [`Error::NativeOperationFailed`] if the finder cannot be created
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use grafton_ndi::{SourceCache, Ndi};
-    /// use std::time::Duration;
-    ///
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = Ndi::new()?;
-    /// let cache = SourceCache::new();
-    ///
-    /// // Find by IP address
-    /// let source = cache.find_by_host(&ndi, "192.168.0.107", Duration::from_secs(5))?;
-    ///
-    /// // Find by the machine component of an SDK source name
-    /// let source = cache.find_by_host(&ndi, "CAMERA1", Duration::from_secs(5))?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn find_by_host(&self, ndi: &Ndi, host: &str, timeout: Duration) -> Result<Source> {
-        self.find_by_host_with(host, timeout, |query| {
-            let hint = host
-                .strip_prefix('[')
-                .and_then(|value| value.strip_suffix(']'))
-                .unwrap_or(host);
-            let options = FinderOptions::new().extra_ips(hint);
-            let finder = Finder::new(ndi, &options)?;
-            finder.poll_until_deadline(timeout, |sources| {
-                Ok(sources
-                    .into_iter()
-                    .find(|source| source.matches_query(query)))
-            })
+    /// [`Error::InvalidInput`] for a non-bare host or a timeout above
+    /// [`crate::MAX_TIMEOUT`], even on a cache hit; discovery/resource errors
+    /// propagate without filling an entry. IP hints must already be configured
+    /// on the finder; this method does not change its discovery scope.
+    pub fn sources_by_host(&self, host: &str, timeout: Duration) -> Result<Vec<Source>> {
+        self.entries.sources_by_host_with(host, timeout, |query| {
+            let mut seen = HashSet::new();
+            let mut discovered = Vec::new();
+            let mut retained_bytes = 0;
+            self.finder.poll_until_deadline(timeout, |mut sources| {
+                sources.retain(|source| source.matches_query(query));
+                accumulate_sources(&mut discovered, &mut seen, &mut retained_bytes, sources)?;
+                Ok(None::<()>)
+            })?;
+            Ok(discovered)
         })
     }
 
-    /// The cache around a discovery: validate the request, answer from the
-    /// cache when possible, and otherwise run `discover` and remember what it
-    /// finds.
-    fn find_by_host_with(
+    /// Remove a host's complete result set and suppress pending fills.
+    /// Equivalent spellings remove the same entry. An invalid host removes no
+    /// entry but still suppresses publication from every pending discovery.
+    pub fn invalidate(&self, host: &str) {
+        self.entries.invalidate(host);
+    }
+
+    /// Remove every result set and suppress publication from pending discovery.
+    pub fn clear(&self) {
+        self.entries.clear();
+    }
+
+    /// Number of cached host identities, including every feed in each identity.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no host result sets are cached.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Fallible owned descriptor copies: discovery has already bounded their total
+/// count and bytes, and each copy keeps that bound rather than growing capacity.
+fn copy_sources(sources: &[Source]) -> Result<Vec<Source>> {
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(sources.len())
+        .map_err(|_| budget::allocation_failed())?;
+    for source in sources {
+        let name = budget::copy_string(&source.name)?;
+        let address = source
+            .address
+            .as_ref()
+            .map(|address| -> Result<SourceAddress> {
+                Ok(match address {
+                    SourceAddress::Ip(text) => SourceAddress::Ip(budget::copy_string(text)?),
+                    SourceAddress::Url(text) => SourceAddress::Url(budget::copy_string(text)?),
+                })
+            })
+            .transpose()?;
+        copy.push(Source { name, address });
+    }
+    Ok(copy)
+}
+
+impl CachedSources {
+    fn sources_by_host_with(
         &self,
         host: &str,
         timeout: Duration,
-        discover: impl FnOnce(HostQuery<'_>) -> Result<Option<Source>>,
-    ) -> Result<Source> {
+        discover: impl FnOnce(HostQuery<'_>) -> Result<Vec<Source>>,
+    ) -> Result<Vec<Source>> {
         let query = HostQuery::parse(host).ok_or_else(|| {
             Error::InvalidInput("Host must be a bare hostname or IP address".into())
         })?;
@@ -1241,62 +1305,34 @@ impl SourceCache {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(cached) = cache.entries.get(key.as_str()) {
-                return Ok(cached.clone());
+                return copy_sources(cached);
             }
             cache.generation
         };
-
-        // Discovery may wait for the SDK. Leave the cache mutex available to
-        // invalidation and unrelated cache hits while this lookup is pending.
-        let source = discover(query)?.ok_or_else(|| Error::NoSourcesFound {
-            criteria: format!("host: {host}"),
-        })?;
-        {
+        // SDK waits and user discovery run outside the cache mutex. Invalidation
+        // changes the generation, so an old result cannot repopulate the cache.
+        let sources = discover(query)?;
+        if !sources.is_empty() {
             let mut cache = self
                 .cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if generation.is_some() && cache.generation == generation {
+            if generation.is_some()
+                && cache.generation == generation
+                && !cache.entries.contains_key(key.as_str())
+            {
+                let copy = copy_sources(&sources)?;
                 cache
                     .entries
-                    .entry(key.into_owned())
-                    .or_insert_with(|| source.clone());
+                    .try_reserve(1)
+                    .map_err(|_| budget::allocation_failed())?;
+                cache.entries.insert(key.into_owned(), copy);
             }
         }
-        Ok(source)
+        Ok(sources)
     }
 
-    /// Invalidate the cache entry for a specific host.
-    ///
-    /// This is useful when a source goes offline or when you want to force
-    /// a fresh discovery on the next lookup. Discovery started before this
-    /// call may return to its caller, but cannot repopulate the cache afterward.
-    /// Any accepted equivalent spelling removes the same host identity.
-    /// Malformed input removes no entry but still invalidates pending discovery.
-    ///
-    /// # Arguments
-    ///
-    /// * `host` - The hostname or IP address to remove from the cache
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use grafton_ndi::{SourceCache, Ndi};
-    /// use std::time::Duration;
-    ///
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = Ndi::new()?;
-    /// let cache = SourceCache::new();
-    /// let source = cache.find_by_host(&ndi, "192.168.0.107", Duration::from_secs(5))?;
-    ///
-    /// // Later, if the source goes offline
-    /// cache.invalidate("192.168.0.107");
-    ///
-    /// // Next lookup will perform fresh discovery
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn invalidate(&self, host: &str) {
+    fn invalidate(&self, host: &str) {
         let mut cache = self
             .cache
             .lock()
@@ -1307,30 +1343,7 @@ impl SourceCache {
         }
     }
 
-    /// Clear all cached sources.
-    ///
-    /// This removes all entries from the cache, forcing fresh discovery
-    /// for all subsequent lookups. Pending discovery cannot repopulate the
-    /// cache after this call returns.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use grafton_ndi::{SourceCache, Ndi};
-    /// use std::time::Duration;
-    ///
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = Ndi::new()?;
-    /// let cache = SourceCache::new();
-    /// cache.find_by_host(&ndi, "192.168.0.107", Duration::from_secs(5))?;
-    /// cache.find_by_host(&ndi, "192.168.0.108", Duration::from_secs(5))?;
-    ///
-    /// // Clear all cached sources
-    /// cache.clear();
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn clear(&self) {
+    fn clear(&self) {
         let mut cache = self
             .cache
             .lock()
@@ -1339,69 +1352,16 @@ impl SourceCache {
         cache.entries.clear();
     }
 
-    /// Get the number of distinct cached host identities.
-    ///
-    /// This can be useful for monitoring cache usage and debugging.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use grafton_ndi::{SourceCache, Ndi};
-    /// use std::time::Duration;
-    ///
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = Ndi::new()?;
-    /// let cache = SourceCache::new();
-    /// assert_eq!(cache.len(), 0);
-    ///
-    /// cache.find_by_host(&ndi, "192.168.0.107", Duration::from_secs(5))?;
-    /// assert_eq!(cache.len(), 1);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn len(&self) -> usize {
-        let cache = self
-            .cache
+    fn len(&self) -> usize {
+        self.cache
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.entries.len()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
+            .len()
     }
 
-    /// Check if the cache is empty.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use grafton_ndi::{SourceCache, Ndi};
-    /// use std::time::Duration;
-    ///
-    /// # fn main() -> Result<(), grafton_ndi::Error> {
-    /// let ndi = Ndi::new()?;
-    /// let cache = SourceCache::new();
-    /// assert!(cache.is_empty());
-    ///
-    /// cache.find_by_host(&ndi, "192.168.0.107", Duration::from_secs(5))?;
-    /// assert!(!cache.is_empty());
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn is_empty(&self) -> bool {
-        let cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.entries.is_empty()
-    }
-}
-
-impl Default for SourceCache {
-    fn default() -> Self {
-        Self {
-            cache: Mutex::new(CacheState {
-                entries: HashMap::new(),
-                generation: Some(0),
-            }),
-        }
+    fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -1491,55 +1451,56 @@ mod tests {
             ("[2001:0db8:0:0:0:0:0:1]", "2001:db8::1"),
         ] {
             for (first, second) in [(a, b), (b, a)] {
-                let cache = SourceCache::new();
+                let cache = CachedSources::default();
                 let old =
                     Source::new("camera").with_address(SourceAddress::Ip("192.0.2.1:5960".into()));
                 let fresh = old
                     .clone()
                     .with_address(SourceAddress::Ip("192.0.2.1:5961".into()));
                 cache
-                    .find_by_host_with(first, Duration::ZERO, |_| Ok(Some(old.clone())))
+                    .sources_by_host_with(first, Duration::ZERO, |_| Ok(vec![old.clone()]))
                     .unwrap();
                 let (identical, identical_allocs) = crate::test_alloc::allocation_count(|| {
                     cache
-                        .find_by_host_with(first, Duration::ZERO, |_| panic!("cache hit"))
+                        .sources_by_host_with(first, Duration::ZERO, |_| panic!("cache hit"))
                         .unwrap()
                 });
                 let (equivalent, equivalent_allocs) = crate::test_alloc::allocation_count(|| {
                     cache
-                        .find_by_host_with(second, Duration::ZERO, |_| {
+                        .sources_by_host_with(second, Duration::ZERO, |_| {
                             panic!("equivalent cache hit")
                         })
                         .unwrap()
                 });
-                assert_eq!(identical, old);
-                assert_eq!(equivalent, old);
-                assert_eq!(identical_allocs, 2); // The two owned descriptor strings.
+                assert_eq!(identical, vec![old.clone()]);
+                assert_eq!(equivalent, vec![old]);
+                assert_eq!(identical_allocs, 3); // Vector plus two descriptor strings.
                 assert_eq!(equivalent_allocs, identical_allocs);
                 assert_eq!(cache.len(), 1);
                 assert!(cache
-                    .find_by_host_with(second, Duration::MAX, |_| panic!("invalid timeout"))
+                    .sources_by_host_with(second, Duration::MAX, |_| panic!("invalid timeout"))
                     .is_err());
                 cache.invalidate(second);
                 assert!(cache.is_empty());
                 assert_eq!(
                     cache
-                        .find_by_host_with(first, Duration::ZERO, |_| Ok(Some(fresh.clone())))
+                        .sources_by_host_with(first, Duration::ZERO, |_| Ok(vec![fresh.clone()]))
                         .unwrap(),
-                    fresh
+                    vec![fresh]
                 );
                 assert_eq!(cache.len(), 1);
                 cache.invalidate("invalid:host:port");
                 assert_eq!(cache.len(), 1);
                 cache.clear();
                 assert!(cache
-                    .find_by_host_with(first, Duration::ZERO, |_| Err(Error::InvalidInput(
+                    .sources_by_host_with(first, Duration::ZERO, |_| Err(Error::InvalidInput(
                         "discovery failed".into()
                     )))
                     .is_err());
                 assert!(cache
-                    .find_by_host_with(second, Duration::ZERO, |_| Ok(None))
-                    .is_err());
+                    .sources_by_host_with(second, Duration::ZERO, |_| Ok(Vec::new()))
+                    .unwrap()
+                    .is_empty());
                 assert!(cache.is_empty());
             }
         }
@@ -1584,30 +1545,31 @@ mod tests {
 
     #[test]
     fn cache_selects_exact_host_and_rejects_invalid_queries_before_discovery() {
-        let cache = SourceCache::new();
+        let cache = CachedSources::default();
         let wrong = Source::new("CAMERA10 (Program)")
             .with_address(SourceAddress::Ip("192.168.1.100:5960".into()));
         let right = Source::new("CAMERA1 (Program)")
             .with_address(SourceAddress::Ip("192.168.1.1:5961".into()));
         let timeout = Duration::ZERO;
         let selected = cache
-            .find_by_host_with("192.168.1.1", timeout, |query| {
+            .sources_by_host_with("192.168.1.1", timeout, |query| {
                 Ok([wrong.clone(), right.clone()]
                     .into_iter()
-                    .find(|s| s.matches_query(query)))
+                    .filter(|s| s.matches_query(query))
+                    .collect())
             })
             .unwrap();
-        assert_eq!(selected, right);
+        assert_eq!(selected, vec![right.clone()]);
         assert_eq!(cache.len(), 1);
         assert_eq!(
             cache
-                .find_by_host_with("192.168.1.1", timeout, |_| panic!("cache hit"))
+                .sources_by_host_with("192.168.1.1", timeout, |_| panic!("cache hit"))
                 .unwrap(),
-            right
+            vec![right]
         );
         for invalid in ["", "192.168.1.1:5961", "camera?query", "foo\0bar"] {
             assert!(matches!(
-                cache.find_by_host_with(invalid, timeout, |_| panic!(
+                cache.sources_by_host_with(invalid, timeout, |_| panic!(
                     "invalid query reached discovery"
                 )),
                 Err(Error::InvalidInput(_))
@@ -1620,7 +1582,7 @@ mod tests {
     fn invalidation_prevents_pending_lookup_from_repopulating_cache() {
         use std::sync::{mpsc, Arc};
         for clear in [false, true] {
-            let cache = Arc::new(SourceCache::new());
+            let cache = Arc::new(CachedSources::default());
             let (started_tx, started_rx) = mpsc::channel();
             let (resume_tx, resume_rx) = mpsc::channel();
             let old = Source::new("old").with_address(SourceAddress::Ip("192.0.2.1:5960".into()));
@@ -1630,10 +1592,10 @@ mod tests {
             let old_result = old.clone();
             let thread = std::thread::spawn(move || {
                 pending
-                    .find_by_host_with("CAMERA.LOCAL.", Duration::ZERO, |_| {
+                    .sources_by_host_with("CAMERA.LOCAL.", Duration::ZERO, |_| {
                         started_tx.send(()).unwrap();
                         resume_rx.recv().unwrap();
-                        Ok(Some(old_result))
+                        Ok(vec![old_result])
                     })
                     .unwrap()
             });
@@ -1645,18 +1607,18 @@ mod tests {
             }
             assert_eq!(cache.len(), 0);
             let found = cache
-                .find_by_host_with("camera.local", Duration::ZERO, |_| Ok(Some(fresh.clone())))
+                .sources_by_host_with("camera.local", Duration::ZERO, |_| Ok(vec![fresh.clone()]))
                 .unwrap();
-            assert_eq!(found, fresh);
+            assert_eq!(found, vec![fresh.clone()]);
             resume_tx.send(()).unwrap();
-            assert_eq!(thread.join().unwrap(), old);
+            assert_eq!(thread.join().unwrap(), vec![old]);
             assert_eq!(
                 cache
-                    .find_by_host_with("Camera.Local.", Duration::ZERO, |_| panic!(
+                    .sources_by_host_with("Camera.Local.", Duration::ZERO, |_| panic!(
                         "fresh entry was overwritten"
                     ))
                     .unwrap(),
-                fresh
+                vec![fresh]
             );
         }
     }
@@ -1665,16 +1627,16 @@ mod tests {
     fn absent_invalidation_and_empty_clear_suppress_pending_fills() {
         use std::sync::{mpsc, Arc};
         for clear in [false, true] {
-            let cache = Arc::new(SourceCache::new());
+            let cache = Arc::new(CachedSources::default());
             let (started_tx, started_rx) = mpsc::channel();
             let (resume_tx, resume_rx) = mpsc::channel();
             let pending = Arc::clone(&cache);
             let thread = std::thread::spawn(move || {
                 pending
-                    .find_by_host_with("camera.local", Duration::ZERO, |_| {
+                    .sources_by_host_with("camera.local", Duration::ZERO, |_| {
                         started_tx.send(()).unwrap();
                         resume_rx.recv().unwrap();
-                        Ok(Some(Source::new("CAMERA (Program)")))
+                        Ok(vec![Source::new("CAMERA (Program)")])
                     })
                     .unwrap()
             });
@@ -1692,15 +1654,15 @@ mod tests {
 
     #[test]
     fn exhausted_generation_suppresses_publication() {
-        let cache = SourceCache::new();
+        let cache = CachedSources::default();
         cache.cache.lock().unwrap().generation = Some(u64::MAX);
         cache.invalidate("absent");
         let source = Source::new("camera").with_address(SourceAddress::Ip("192.0.2.1".into()));
         assert_eq!(
             cache
-                .find_by_host_with("192.0.2.1", Duration::ZERO, |_| Ok(Some(source.clone())))
+                .sources_by_host_with("192.0.2.1", Duration::ZERO, |_| Ok(vec![source.clone()]))
                 .unwrap(),
-            source
+            vec![source]
         );
         assert!(cache.is_empty());
     }
@@ -1768,14 +1730,14 @@ mod tests {
 
     #[test]
     fn cache_validates_timeout_before_returning_cached_source() {
-        let cache = SourceCache::new();
+        let cache = CachedSources::default();
         cache.cache.lock().unwrap().entries.insert(
             HostKeyBuffer::new(HostQuery::parse("camera").unwrap()).into_owned(),
-            Source::new("camera"),
+            vec![Source::new("camera")],
         );
         for host in ["camera", "not_cached"] {
             assert!(matches!(
-                cache.find_by_host_with(host, Duration::MAX, |_| panic!("invalid timeout")),
+                cache.sources_by_host_with(host, Duration::MAX, |_| panic!("invalid timeout")),
                 Err(Error::InvalidInput(_))
             ));
         }
@@ -1783,9 +1745,9 @@ mod tests {
         // uses the runtime.
         assert_eq!(
             cache
-                .find_by_host_with("camera", Duration::ZERO, |_| panic!("cache hit"))
+                .sources_by_host_with("camera", Duration::ZERO, |_| panic!("cache hit"))
                 .unwrap(),
-            Source::new("camera")
+            vec![Source::new("camera")]
         );
     }
 
@@ -2070,7 +2032,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let cache = Arc::new(SourceCache::default());
+        let cache = Arc::new(CachedSources::default());
         let cache_clone = Arc::clone(&cache);
 
         // Spawn a thread that acquires the lock and panics

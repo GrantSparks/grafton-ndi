@@ -21,7 +21,8 @@ use std::{
 };
 
 use super::{
-    invalid_frame, invalid_input, sdk_quantity, AudioCodec, PacketEvent, PacketReceiver, VideoCodec,
+    invalid_frame, invalid_input, sdk_quantity, AudioCodec, PacketEvent, PacketReceiver,
+    ReceiverControls, VideoCodec,
 };
 use crate::{
     frames::ValidatedVideoLayout,
@@ -31,8 +32,7 @@ use crate::{
         advanced::{native, ReceiveAllocators},
         bindings::*,
     },
-    Error, FourCc, MediaTypes, PixelFormat, RawCapture, Receiver, ReceiverMode, Rejected, Result,
-    SettingChange, StreamTier,
+    Error, FourCc, PixelFormat, RawCapture, Receiver, ReceiverMode, Rejected, Result,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -879,8 +879,7 @@ impl AllocatorService {
 /// [`into_packet_receiver`](Self::into_packet_receiver) gives the packet
 /// receiver back. [`receiver`](Self::receiver) reaches the receiver's
 /// controls, as [`PacketReceiver::receiver`] does, and
-/// [`set_stream_tier`](Self::set_stream_tier) and
-/// [`set_streams`](Self::set_streams) the two that borrow it exclusively.
+/// [`controls`](Self::controls) reaches exclusive stream controls and KVM.
 /// There is no `receiver_mut`: the allocators are installed on this
 /// receiver's native instance, so it is never lent out mutably, where it
 /// could be swapped for another packet receiver's.
@@ -920,23 +919,11 @@ impl AllocatedPacketReceiver {
         self.inner.receiver()
     }
 
-    /// Switch between the source's program and preview streams; see
-    /// [`Receiver::set_stream_tier`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`Receiver::set_stream_tier`].
-    pub fn set_stream_tier(&mut self, tier: StreamTier) -> Result<SettingChange> {
-        self.inner.receiver_mut().set_stream_tier(tier)
-    }
-
-    /// Choose which streams the source sends; see [`Receiver::set_streams`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`Receiver::set_streams`].
-    pub fn set_streams(&mut self, streams: MediaTypes) -> Result<SettingChange> {
-        self.inner.receiver_mut().set_streams(streams)
+    /// Borrow exclusive stream controls or start KVM without permitting
+    /// receiver replacement. This allocates nothing and makes no SDK call.
+    /// A KVM session captures packets through its own `capture` method.
+    pub fn controls(&mut self) -> ReceiverControls<'_, PacketAttached> {
+        ReceiverControls::new(self.inner.receiver_mut())
     }
 
     /// Receive video into memory from `policy`; see
@@ -1031,6 +1018,13 @@ impl AllocatedReceiver {
     /// The receiver, for capturing and control.
     pub fn receiver(&self) -> &Receiver {
         self.inner.receiver()
+    }
+
+    /// Borrow exclusive stream controls or start KVM without permitting
+    /// receiver replacement. This allocates nothing and makes no SDK call.
+    /// Capture through the KVM session's lent receiver while inputs are held.
+    pub fn controls(&mut self) -> ReceiverControls<'_, RawCapture> {
+        ReceiverControls::new(self.inner.receiver_mut())
     }
 
     /// Receive video into memory from `policy`.

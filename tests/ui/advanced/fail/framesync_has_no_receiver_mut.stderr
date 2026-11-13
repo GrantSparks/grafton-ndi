@@ -1,0 +1,23 @@
+error[E0599]: no method named `receiver_mut` found for mutable reference `&mut FrameSync` in the current scope
+ --> tests/ui/advanced/fail/framesync_has_no_receiver_mut.rs:3:26
+  |
+3 |     std::mem::swap(first.receiver_mut(), second.receiver_mut());
+  |                          ^^^^^^^^^^^^
+  |
+help: there is a method `receiver` with a similar name
+  |
+3 -     std::mem::swap(first.receiver_mut(), second.receiver_mut());
+3 +     std::mem::swap(first.receiver(), second.receiver_mut());
+  |
+
+error[E0599]: no method named `receiver_mut` found for mutable reference `&mut FrameSync` in the current scope
+ --> tests/ui/advanced/fail/framesync_has_no_receiver_mut.rs:3:49
+  |
+3 |     std::mem::swap(first.receiver_mut(), second.receiver_mut());
+  |                                                 ^^^^^^^^^^^^
+  |
+help: there is a method `receiver` with a similar name
+  |
+3 -     std::mem::swap(first.receiver_mut(), second.receiver_mut());
+3 +     std::mem::swap(first.receiver_mut(), second.receiver());
+  |

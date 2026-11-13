@@ -20,6 +20,10 @@
 //! * `fake_advanced` — also export the Advanced SDK entry points;
 //! * `fake_finder` — return the bounded-resource Finder fixtures in
 //!   `fake_finder.rs`, selected by `GRAFTON_FAKE_FINDER_CASE`;
+//! * `fake_capture` — script native media/notification delivery with
+//!   `GRAFTON_FAKE_CAPTURE_SCRIPT`; only active rows/channels are initialized;
+//! * `fake_receiver_controls` — clocked capture, stream controls and KVM log
+//!   the exact receiver/synchronizer instances, without sending local input;
 //! * `fake_receiver_v4` — also export only `NDIlib_recv_create_v4`, as a newer
 //!   Standard runtime might;
 //! * `fake_omit_required` — omit one required function;
@@ -172,11 +176,19 @@ export! {
     }
 }
 
+#[cfg(not(fake_capture))]
 stub! {
     fn NDIlib_recv_capture_v3(p_instance: NDIlib_recv_instance_t, p_video_data: *mut NDIlib_video_frame_v2_t, p_audio_data: *mut NDIlib_audio_frame_v3_t, p_metadata: *mut NDIlib_metadata_frame_t, timeout_in_ms: u32) -> NDIlib_frame_type_e;
     fn NDIlib_recv_free_video_v2(p_instance: NDIlib_recv_instance_t, p_video_data: *const NDIlib_video_frame_v2_t);
     fn NDIlib_recv_free_audio_v3(p_instance: NDIlib_recv_instance_t, p_audio_data: *const NDIlib_audio_frame_v3_t);
     fn NDIlib_recv_free_metadata(p_instance: NDIlib_recv_instance_t, p_metadata: *const NDIlib_metadata_frame_t);
+}
+
+#[cfg(fake_capture)]
+#[path = "fake_capture.rs"]
+mod capture;
+
+stub! {
     fn NDIlib_recv_send_metadata(p_instance: NDIlib_recv_instance_t, p_metadata: *const NDIlib_metadata_frame_t) -> bool;
     fn NDIlib_recv_set_tally(p_instance: NDIlib_recv_instance_t, p_tally: *const NDIlib_tally_t) -> bool;
     fn NDIlib_recv_get_performance(p_instance: NDIlib_recv_instance_t, p_total: *mut NDIlib_recv_performance_t, p_dropped: *mut NDIlib_recv_performance_t);
@@ -208,6 +220,11 @@ stub! {
     fn NDIlib_send_clear_connection_metadata(p_instance: NDIlib_send_instance_t);
     fn NDIlib_send_add_connection_metadata(p_instance: NDIlib_send_instance_t, p_metadata: *const NDIlib_metadata_frame_t);
     fn NDIlib_send_get_source_name(p_instance: NDIlib_send_instance_t) -> *const NDIlib_source_t;
+
+}
+
+#[cfg(not(fake_receiver_controls))]
+stub! {
     fn NDIlib_framesync_create(p_receiver: NDIlib_recv_instance_t) -> NDIlib_framesync_instance_t;
     fn NDIlib_framesync_destroy(p_instance: NDIlib_framesync_instance_t);
     fn NDIlib_framesync_capture_audio_v2(p_instance: NDIlib_framesync_instance_t, p_audio_data: *mut NDIlib_audio_frame_v3_t, sample_rate: ::std::os::raw::c_int, no_channels: ::std::os::raw::c_int, no_samples: ::std::os::raw::c_int);
@@ -216,6 +233,10 @@ stub! {
     fn NDIlib_framesync_capture_video(p_instance: NDIlib_framesync_instance_t, p_video_data: *mut NDIlib_video_frame_v2_t, field_type: NDIlib_frame_format_type_e);
     fn NDIlib_framesync_free_video(p_instance: NDIlib_framesync_instance_t, p_video_data: *mut NDIlib_video_frame_v2_t);
 }
+
+#[cfg(fake_receiver_controls)]
+#[path = "fake_receiver_controls.rs"]
+mod receiver_controls;
 
 #[cfg(not(fake_omit_required))]
 stub! {

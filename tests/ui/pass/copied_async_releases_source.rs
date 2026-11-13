@@ -2,9 +2,7 @@
 use grafton_ndi::{BorrowedVideoFrame, PixelFormat, Sender, VideoFrame};
 
 fn submit(sender: &mut Sender, mut source: VideoFrame) {
-    let _ = sender
-        .send_video_async_copy(&BorrowedVideoFrame::from(&source))
-        .unwrap();
+    let _ = sender.send_video_async_copy(&source).unwrap();
     source.data_mut().fill(7);
     drop(source);
     let mut bytes = vec![0; 16 * 16 * 4];

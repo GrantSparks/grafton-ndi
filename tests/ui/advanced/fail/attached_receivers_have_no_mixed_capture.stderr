@@ -1,0 +1,23 @@
+error[E0599]: no method named `capture_any_ref` found for reference `&grafton_ndi::Receiver<PacketAttached>` in the current scope
+ --> tests/ui/advanced/fail/attached_receivers_have_no_mixed_capture.rs:8:32
+  |
+8 |     let _ = packets.receiver().capture_any_ref(Duration::ZERO);
+  |                                ^^^^^^^^^^^^^^^ method not found in `&grafton_ndi::Receiver<PacketAttached>`
+
+error[E0599]: no method named `capture_any` found for reference `&grafton_ndi::Receiver<PacketAttached>` in the current scope
+ --> tests/ui/advanced/fail/attached_receivers_have_no_mixed_capture.rs:9:32
+  |
+9 |     let _ = packets.receiver().capture_any(Duration::ZERO);
+  |                                ^^^^^^^^^^^ method not found in `&grafton_ndi::Receiver<PacketAttached>`
+
+error[E0599]: no method named `capture_any_ref` found for reference `&grafton_ndi::Receiver<AvSyncAttached>` in the current scope
+  --> tests/ui/advanced/fail/attached_receivers_have_no_mixed_capture.rs:13:22
+   |
+13 |     let _ = receiver.capture_any_ref(Duration::ZERO);
+   |                      ^^^^^^^^^^^^^^^ method not found in `&grafton_ndi::Receiver<AvSyncAttached>`
+
+error[E0599]: no method named `capture_any` found for reference `&grafton_ndi::Receiver<AvSyncAttached>` in the current scope
+  --> tests/ui/advanced/fail/attached_receivers_have_no_mixed_capture.rs:14:22
+   |
+14 |     let _ = receiver.capture_any(Duration::ZERO);
+   |                      ^^^^^^^^^^^ method not found in `&grafton_ndi::Receiver<AvSyncAttached>`

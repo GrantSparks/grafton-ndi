@@ -159,6 +159,8 @@ pub(super) struct Recorder {
     pub(super) creates: std::sync::atomic::AtomicUsize,
     pub(super) starts: std::sync::atomic::AtomicUsize,
     pub(super) source_changes: std::sync::atomic::AtomicUsize,
+    /// Actual native name/URL fields, at creation and each accepted source change.
+    pub(super) selected_sources: std::sync::Mutex<Vec<(Option<String>, Option<String>)>>,
     /// What creation was told about rolling over: whether a format change
     /// does not roll over, and the size that does.
     pub(super) created_without_format_rollover: std::sync::atomic::AtomicBool,
@@ -203,6 +205,7 @@ impl Recorder {
             creates: Default::default(),
             starts: Default::default(),
             source_changes: Default::default(),
+            selected_sources: Default::default(),
             created_without_format_rollover: Default::default(),
             created_rollover_bytes: Default::default(),
             created_pattern: Default::default(),
@@ -283,6 +286,11 @@ unsafe extern "C" fn recorder_create(
     }
     // SAFETY: the wrapper passes settings that are valid for the call.
     let settings = unsafe { &*settings };
+    recorder
+        .selected_sources
+        .lock()
+        .unwrap()
+        .push(unsafe { selected_source(&settings.source_to_connect_to) });
     recorder.created_without_format_rollover.store(
         settings.disable_auto_rollover_on_format_change,
         Ordering::Release,
@@ -443,13 +451,36 @@ unsafe extern "C" fn recorder_inject_metadata(
 
 unsafe extern "C" fn accept_source(
     handle: NDIlib_file_recorder_instance_t,
-    _: *const NDIlib_file_recorder_source_t,
+    source: *const NDIlib_file_recorder_source_t,
 ) -> bool {
-    // SAFETY: the wrapper passes a live handle.
-    unsafe { Recorder::from_handle(handle) }
+    // SAFETY: the wrapper passes a live handle and a source whose strings remain
+    // initialized and NUL-terminated through the call.
+    let recorder = unsafe { Recorder::from_handle(handle) };
+    recorder
+        .selected_sources
+        .lock()
+        .unwrap()
+        .push(unsafe { selected_source(&*source) });
+    recorder
         .source_changes
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     true
+}
+
+/// Copy native fields while their caller-owned C strings remain live.
+unsafe fn selected_source(
+    source: &NDIlib_file_recorder_source_t,
+) -> (Option<String>, Option<String>) {
+    let text = |pointer: *const std::ffi::c_char| {
+        (!pointer.is_null()).then(|| {
+            // SAFETY: caller guarantees the source strings through this copy.
+            unsafe { std::ffi::CStr::from_ptr(pointer) }
+                .to_str()
+                .unwrap()
+                .to_owned()
+        })
+    };
+    (text(source.p_ndi_name), text(source.p_url_address))
 }
 
 /// An API whose recorders are the [`Recorder`]s installed on the creating thread.

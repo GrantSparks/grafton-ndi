@@ -1,0 +1,11 @@
+error[E0505]: cannot move out of `receiver` because it is borrowed
+ --> tests/ui/fail/mixed_capture_borrows_receiver.rs:6:10
+  |
+4 | fn release(receiver: Receiver) {
+  |            -------- binding `receiver` declared here
+5 |     let item = receiver.capture_any_ref(Duration::ZERO).unwrap();
+  |                -------- borrow of `receiver` occurs here
+6 |     drop(receiver);
+  |          ^^^^^^^^ move out of `receiver` occurs here
+7 |     drop(item);
+  |          ---- borrow later used here

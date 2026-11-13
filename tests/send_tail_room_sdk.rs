@@ -15,6 +15,12 @@
 
 mod common;
 
+// Standard 6.1.1 produces different lossy pixels for identical initialized
+// submissions when this binary's guard-page stress sender runs concurrently.
+// Keep the native workload serial so equality still detects leaked padding;
+// SDK-independent descriptor/initialization tests verify the wrapper directly.
+static NATIVE_WORKLOAD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use grafton_ndi::{
     BorrowedVideoFrame, Ndi, PixelFormat, Receiver, ReceiverColorFormat, ReceiverOptions, ScanType,
     Sender, SenderOptions,
@@ -119,6 +125,9 @@ fn room(format: PixelFormat, width: u32, height: u32, scan: ScanType) -> usize {
 /// both send in place and pin that it reads frames exactly.
 #[test]
 fn frames_that_end_where_memory_ends_are_sent() {
+    let _workload = NATIVE_WORKLOAD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let Some(ndi) = common::ndi() else {
         return;
     };
@@ -163,7 +172,7 @@ fn frames_that_end_where_memory_ends_are_sent() {
                     .unwrap();
                 assert!(frame.sends_in_place(), "{case}");
                 for _ in 0..2 {
-                    sender.send_video(frame).unwrap();
+                    sender.send_video(&frame).unwrap();
                 }
 
                 // The frame, then nothing.
@@ -175,7 +184,7 @@ fn frames_that_end_where_memory_ends_are_sent() {
                     .unwrap();
                 assert_eq!(frame.sends_in_place(), room == 0, "{case}");
                 for _ in 0..2 {
-                    sender.send_video(frame).unwrap();
+                    sender.send_video(&frame).unwrap();
                 }
                 // The copies these make are owned frames, which hold the
                 // room or are given it when lent.
@@ -203,8 +212,13 @@ impl Drop for StopOnDrop<'_> {
 
 /// The active pixels of the first 642x32 frame a new receiver gets while
 /// `frame` is sent.
-fn received(ndi: &Ndi, label: &str, frame: BorrowedVideoFrame<'_>) -> Vec<u8> {
-    let expected_format = if frame.pixel_format() == PixelFormat::Uyva {
+fn received(
+    ndi: &Ndi,
+    label: &str,
+    frame: &(impl grafton_ndi::VideoSource + Sync),
+    format: PixelFormat,
+) -> Vec<u8> {
+    let expected_format = if format == PixelFormat::Uyva {
         PixelFormat::Bgra
     } else {
         PixelFormat::Uyvy
@@ -251,6 +265,9 @@ fn received(ndi: &Ndi, label: &str, frame: BorrowedVideoFrame<'_>) -> Vec<u8> {
 /// x86 room, which the crate gives every build but 64-bit ARM Linux.
 #[test]
 fn bytes_after_a_buffer_reach_the_picture_only_as_room() {
+    let _workload = NATIVE_WORKLOAD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let Some(ndi) = common::ndi() else {
         return;
     };
@@ -275,7 +292,7 @@ fn bytes_after_a_buffer_reach_the_picture_only_as_room() {
             .build()
             .unwrap();
         assert!(frame.sends_in_place());
-        received(&ndi, label, frame)
+        received(&ndi, label, &frame, format)
     };
     let (dark_room, bright_room, zero_room) = (
         in_place(&dark, "dark room"),
@@ -303,7 +320,7 @@ fn bytes_after_a_buffer_reach_the_picture_only_as_room() {
             .build()
             .unwrap();
         assert_eq!(frame.sends_in_place(), room == 0);
-        received(&ndi, label, frame)
+        received(&ndi, label, &frame, format)
     };
     assert_eq!(exact(&dark, "dark after"), zero_room);
     assert_eq!(exact(&bright, "bright after"), zero_room);
@@ -315,31 +332,40 @@ fn bytes_after_a_buffer_reach_the_picture_only_as_room() {
     // writes them.
     let vouched = unsafe { builder.readable_after(after) }.build().unwrap();
     assert!(vouched.sends_in_place());
-    assert_eq!(received(&ndi, "vouched", vouched), bright_room);
+    assert_eq!(received(&ndi, "vouched", &vouched, format), bright_room);
 
     // Declaring initialized room alone must not bypass default staging.
     let builder = BorrowedVideoFrame::builder(&bright[..len], width, height, format);
     // SAFETY: the same initialized allocation extends `after` bytes past
     // the slice and remains stable throughout the send.
     let default = unsafe { builder.readable_after(after) }.build().unwrap();
-    assert_eq!(received(&ndi, "default vouched", default), zero_room);
+    assert_eq!(
+        received(&ndi, "default vouched", &default, format),
+        zero_room
+    );
     let default = BorrowedVideoFrame::builder(&bright, width, height, format)
         .build()
         .unwrap();
-    assert_eq!(received(&ndi, "default trailing slice", default), zero_room);
+    assert_eq!(
+        received(&ndi, "default trailing slice", &default, format),
+        zero_room
+    );
 
     // An owned frame's room is zero too.
     let owned = BorrowedVideoFrame::builder(&bright[..len], width, height, format)
         .build()
         .unwrap()
         .to_owned();
-    assert_eq!(received(&ndi, "owned", (&owned).into()), zero_room);
+    assert_eq!(received(&ndi, "owned", &owned, format), zero_room);
 }
 
 /// Row padding and all forms of trailing room are excluded by default,
 /// including the extra strides needed by interlaced and field frames.
 #[test]
 fn default_yuv_sends_depend_only_on_active_pixels() {
+    let _workload = NATIVE_WORKLOAD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let Some(ndi) = common::ndi() else {
         return;
     };
@@ -434,7 +460,7 @@ fn default_yuv_sends_depend_only_on_active_pixels() {
                     .build()
                     .unwrap();
                 assert!(!frame.sends_in_place());
-                received(&ndi, &format!("{format:?} {label} {name}"), frame)
+                received(&ndi, &format!("{format:?} {label} {name}"), &frame, format)
             };
             assert_eq!(
                 frame(&dark, "dark"),

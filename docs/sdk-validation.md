@@ -381,6 +381,39 @@ documentation of the affected methods says how to stay clear of them.
     registrations at once.
   - `tests/discovery_server.rs` checks the two halves that work.
 
+### Source selection and recording
+
+`Finder::find_source` uses the existing configured finder and copies each SDK
+snapshot before running the caller's predicate. Deterministic fake-runtime tests
+in `tests/finder_selection.rs` cover staggered and reversed discovery, duplicate
+names at different endpoints, predicate reentry, full-window host result sets,
+and cache isolation between configured finders. Existing snapshot and accumulated
+result budget tests also cover the public selection/cache paths.
+
+On Linux x86_64 with Advanced 6.4.0.2 and its File library, under the loopback-only
+runner, `configured_exact_selection_records_the_selected_endpoint_and_explicit_name_policy`
+selects a feed through a finder with a unique nondefault group and a loopback IP
+hint. Converting that named, addressed source to `SourceSpec` preserves the
+native URL field alone, as required by `Processing.NDI.Lib.File.Recorder.h`'s name
+precedence rule. Recording and probing the finalized file confirms the selected
+640×360 feed rather than the available 320×180 distractor. A selected source whose
+address is replaced with unavailable `127.0.0.1:9` records no video despite its
+valid source name, demonstrating no hidden name fallback.
+
+Positive name-only recording is conditional on an independently configured
+default finder first discovering that name. That prerequisite was absent on this
+isolated network without IP hints, so positive name rediscovery was not exercised
+there. This does not qualify default discovery or other networks. SDK-independent
+recorder-boundary and async-command tests verify the deliberate name-only native
+fields and endpoint copies after caller inputs are dropped.
+
+Reproduce the native case with `NDI_RUNTIME_DIR_V6` selecting the 6.4 Advanced
+runtime and `GRAFTON_NDI_REQUIRE_RUNTIME=file`:
+
+```sh
+cargo test --config ci/offline.toml --features file-io --lib configured_exact_selection_records -- --nocapture
+```
+
 Tests of `FileRecorder::reset` check that it returns the old session's report
 without claiming that the files were finalized, that late events of the old
 session do not reach later ones, and that the original recorder stays usable

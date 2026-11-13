@@ -137,19 +137,20 @@ impl LiveSource {
         let name = sender.source().unwrap().name().to_owned();
         let finder =
             crate::Finder::new(ndi, &crate::FinderOptions::new().extra_ips("127.0.0.1")).unwrap();
-        let deadline = Instant::now() + PATIENCE;
-        loop {
-            for source in finder.current_sources().unwrap() {
-                if let (true, Some(crate::SourceAddress::Ip(address))) =
-                    (source.name() == name, source.address())
-                {
-                    let port = address.rsplit(':').next().expect("an address with a port");
-                    return SourceSpec::from_url(format!("127.0.0.1:{port}")).unwrap();
-                }
-            }
-            assert!(Instant::now() < deadline, "{name} was not discovered");
-            finder.wait_for_sources(Duration::from_millis(50)).unwrap();
-        }
+        let source = finder
+            .find_source(PATIENCE, |source| {
+                source.name() == name
+                    && matches!(source.address(), Some(crate::SourceAddress::Ip(_)))
+            })
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name} was not discovered"));
+        let port = source
+            .address()
+            .unwrap()
+            .port()
+            .expect("an address with a port");
+        let selected = source.with_address(crate::SourceAddress::Ip(format!("127.0.0.1:{port}")));
+        SourceSpec::try_from(&selected).unwrap()
     }
 }
 
@@ -1292,4 +1293,149 @@ fn finishing_without_a_wait_reports_the_close_the_stop_queued() {
     assert!(report.closure_confirmed());
     assert!(!report.stopped_by_sdk());
     assert!(api.probe(&file).unwrap().duration().is_final());
+}
+
+#[test]
+fn configured_exact_selection_records_the_selected_endpoint_and_explicit_name_policy() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("selected-endpoint");
+    let group = format!("grafton-selected-{}", std::process::id());
+    let mut senders = Vec::new();
+    for (label, dimensions, groups) in [
+        ("wrong-feed", (320, 180), Some(group.clone())),
+        ("selected-feed", (640, 360), Some(group.clone())),
+        ("logical-feed", (480, 270), None),
+    ] {
+        let mut options =
+            crate::SenderOptions::new(format!("grafton-selected-{}-{label}", std::process::id()));
+        if let Some(groups) = groups {
+            options = options.groups(groups);
+        }
+        let sender = crate::Sender::new(&ndi, &options).unwrap();
+        senders.push((sender, dimensions));
+    }
+    let selected_name = senders[1].0.source().unwrap().name().to_owned();
+    let logical_name = senders[2].0.source().unwrap().name().to_owned();
+    let running = Arc::new(AtomicBool::new(true));
+    thread::scope(|scope| {
+        for (sender, (width, height)) in senders {
+            let running = Arc::clone(&running);
+            scope.spawn(move || {
+                let frame = crate::VideoFrame::builder()
+                    .resolution(width, height)
+                    .build()
+                    .unwrap();
+                while running.load(Ordering::Acquire) {
+                    sender.send_video(&frame).unwrap();
+                    thread::sleep(Duration::from_millis(10));
+                }
+            });
+        }
+        struct Stop(Arc<AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _stop = Stop(Arc::clone(&running));
+        let finder = crate::Finder::new(
+            &ndi,
+            &crate::FinderOptions::new()
+                .groups(&group)
+                .extra_ips("127.0.0.1"),
+        )
+        .unwrap();
+        let selected = finder
+            .find_source_by_name(&selected_name, PATIENCE)
+            .unwrap()
+            .unwrap();
+        let address = match selected.address().expect("discovered endpoint") {
+            crate::SourceAddress::Ip(address) | crate::SourceAddress::Url(address) => address,
+        };
+        let spec = SourceSpec::try_from(&selected).unwrap();
+        assert_eq!(spec.name(), None);
+        assert_eq!(spec.url(), Some(address.as_str()));
+        // Name-only File selection uses native default discovery, which has no
+        // IP hints on the isolated runner. Exercise positive name delivery only
+        // when a default finder independently proves that prerequisite exists.
+        let default_finder = crate::Finder::new(&ndi, &crate::FinderOptions::new()).unwrap();
+        let name_visible = default_finder
+            .find_source_by_name(&logical_name, Duration::from_secs(1))
+            .unwrap()
+            .is_some();
+        let mut policies = vec![("endpoint", spec, (640, 360))];
+        if name_visible {
+            policies.push((
+                "logical",
+                SourceSpec::new(&logical_name).unwrap(),
+                (480, 270),
+            ));
+        } else {
+            eprintln!("not exercised: positive name-only File delivery; a default finder without IP hints could not discover the source on this test network");
+        }
+        // Distinguishable recorded dimensions establish which feed delivered the
+        // media, rather than merely checking that native creation succeeded.
+        for (label, spec, expected) in policies {
+            let file = scratch.path(&format!("{label}.mkv"));
+            let options = RecorderOptions::new(spec.clone())
+                .naming(FileNaming::Exact)
+                .proxy(false)
+                .tracks(MediaTypes::VIDEO);
+            let mut recorder = api.create_recorder(&options).unwrap();
+            assert_eq!(recorder.last_accepted_source(), Some(&spec));
+            recorder.set_source(&spec).unwrap();
+            assert_eq!(recorder.last_accepted_source(), Some(&spec));
+            recorder
+                .start(
+                    &RecordingTarget::new(&file).unwrap(),
+                    RecordingTimecode::Preserve,
+                )
+                .unwrap();
+            let first = await_event(&mut recorder, RecorderEventKind::FirstFrame);
+            let track = &first.source_format().video_tracks()[0];
+            assert_eq!((track.width(), track.height()), expected);
+            thread::sleep(Duration::from_millis(150));
+            assert!(recorder.stats().unwrap().unwrap().video_frames() > 0);
+            let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
+                panic!("the selected recording was not finalized");
+            };
+            assert_eq!(report.error_events(), 0);
+            assert_eq!(report.empty_files(), 0);
+            let info = api.probe(&file).unwrap();
+            let track = &info.source_format().video_tracks()[0];
+            assert_eq!((track.width(), track.height()), expected);
+            assert!(info.duration().is_final());
+        }
+        // A stale pinned endpoint remains explicit; the wrapper never substitutes
+        // its diagnostic name and accidentally records the available feed.
+        let unavailable = crate::Source::new(&selected_name)
+            .with_address(crate::SourceAddress::Ip("127.0.0.1:9".into()));
+        let spec = SourceSpec::try_from(&unavailable).unwrap();
+        let mut recorder = api
+            .create_recorder(
+                &RecorderOptions::new(spec.clone())
+                    .naming(FileNaming::Exact)
+                    .proxy(false)
+                    .tracks(MediaTypes::VIDEO),
+            )
+            .unwrap();
+        assert_eq!(recorder.last_accepted_source(), Some(&spec));
+        recorder
+            .start(
+                &RecordingTarget::new(scratch.path("unavailable.mkv")).unwrap(),
+                RecordingTimecode::Preserve,
+            )
+            .unwrap();
+        thread::sleep(Duration::from_millis(250));
+        assert!(recorder
+            .stats()
+            .unwrap()
+            .is_none_or(|stats| stats.video_frames() == 0));
+        let FinishStatus::Closed(report) = recorder.finish(PATIENCE).unwrap() else {
+            panic!("the unavailable endpoint recording was not finalized");
+        };
+        assert_eq!(report.empty_files(), 1);
+    });
 }

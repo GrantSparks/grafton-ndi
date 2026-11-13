@@ -203,6 +203,33 @@ fn record(file: &FileApi) -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+Carry an explicit discovery selection into a recorder with
+`SourceSpec::try_from(&selected)`. A source with an address becomes a native
+URL/address-only request, preserving its exact IP or URL text; an unaddressed
+source becomes a name request. This avoids the File SDK's precedence rule, where
+a nonempty name overrides a supplied URL. Selection uses the original finder's
+scope:
+
+```rust
+use grafton_ndi::{Finder, FinderOptions, file::{RecorderOptions, SourceSpec}};
+let finder = Finder::new(&ndi, &FinderOptions::new()
+    .groups("Studio").extra_ips("192.168.1.100"))?;
+let selected = finder.find_source_by_name("STUDIO (Camera 2)", Duration::from_secs(5))?
+    .ok_or_else(|| grafton_ndi::Error::NoSourcesFound { criteria: "Camera 2".into() })?;
+let endpoint = SourceSpec::try_from(&selected)?;
+let mut recorder = file.create_recorder(&RecorderOptions::new(endpoint.clone()))?;
+recorder.set_source(&endpoint)?; // the same conversion applies to subsequent requests
+```
+
+Endpoint pinning follows the selected interface/address and can become stale.
+Use `SourceSpec::new(selected.name())` when the deliberate policy is logical
+name rediscovery that may follow an address change. Neither policy silently
+falls back to the other after a failed connection. Empty or NUL-containing
+selected representations are refused before native mutation, including an
+invalid address on an otherwise named source. Async create and `set_source`
+commands copy the same validated selection before queueing it. The
+[`file_record` example](../examples/file_record.rs) demonstrates both policies.
+
 A session runs from `start` until its last file is closed. It can span several
 files: `rollover` starts a new file, `set_source` changes the source, and the
 SDK starts a new file by itself when the options ask for it, for example at a

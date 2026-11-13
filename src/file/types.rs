@@ -102,7 +102,12 @@ fn cstring(value: &str, what: &str, allow_empty: bool) -> Result<CString> {
 /// An owned source name or direct URL used by a recorder.
 ///
 /// Name and URL constructors are separate because the SDK gives a nonempty name
-/// precedence over a URL. No discovery occurs while constructing this value.
+/// precedence over a URL. Converting a discovered [`crate::Source`] pins its
+/// supplied endpoint, falling back to its name only when no address is present.
+/// Endpoint pinning can become stale; [`Self::new`] deliberately selects by name
+/// so the SDK can rediscover an endpoint after it changes. Neither policy silently
+/// falls back to the other after a connection failure. No discovery or SDK call
+/// occurs while constructing this value; constructors allocate one C string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SourceSpec {
     pub(super) name: Option<CString>,
@@ -156,17 +161,11 @@ impl TryFrom<&crate::Source> for SourceSpec {
     type Error = Error;
 
     fn try_from(source: &crate::Source) -> Result<Self> {
-        if !source.name().is_empty() {
-            Self::new(source.name())
-        } else {
-            match source.address() {
-                Some(crate::SourceAddress::Ip(address) | crate::SourceAddress::Url(address)) => {
-                    Self::from_url(address)
-                }
-                None => Err(Error::InvalidInput(
-                    "source has neither a name nor an address".into(),
-                )),
+        match source.address() {
+            Some(crate::SourceAddress::Ip(address) | crate::SourceAddress::Url(address)) => {
+                Self::from_url(address)
             }
+            None => Self::new(source.name()),
         }
     }
 }
@@ -1632,6 +1631,53 @@ mod tests {
         let source = SourceSpec::from_url("ndi://camera").unwrap();
         assert_eq!(source.name(), None);
         assert_eq!(source.url(), Some("ndi://camera"));
+    }
+
+    #[test]
+    fn discovered_sources_pin_the_complete_endpoint_without_name_precedence() {
+        use crate::{Source, SourceAddress};
+        for address in [
+            SourceAddress::Ip("192.0.2.10:5962".into()),
+            SourceAddress::Url("ndi://user@camera.local:5962/path?opaque=1".into()),
+        ] {
+            let text = match &address {
+                SourceAddress::Ip(text) | SourceAddress::Url(text) => text.as_str(),
+            };
+            for name in ["STUDIO (Camera 2)", "", "diagnostic\0name"] {
+                let selected = Source::new(name).with_address(address.clone());
+                let spec = SourceSpec::try_from(&selected).unwrap();
+                assert_eq!(spec.name(), None, "name must not override an endpoint");
+                assert_eq!(spec.url(), Some(text));
+                assert_eq!(spec.clone(), spec);
+            }
+        }
+        let named = Source::new("STUDIO (Camera 2)");
+        let spec = SourceSpec::try_from(&named).unwrap();
+        assert_eq!(spec.name(), Some(named.name()));
+        assert_eq!(spec.url(), None);
+        let addressed = named
+            .clone()
+            .with_address(SourceAddress::Ip("192.0.2.10:5962".into()));
+        let logical = SourceSpec::new(addressed.name()).unwrap();
+        assert_eq!(logical.name(), Some(addressed.name()));
+        assert_eq!(logical.url(), None);
+        for bad in ["", "bad\0endpoint"] {
+            for address in [
+                SourceAddress::Ip(bad.into()),
+                SourceAddress::Url(bad.into()),
+            ] {
+                let selected = named.clone().with_address(address);
+                assert!(
+                    SourceSpec::try_from(&selected).is_err(),
+                    "invalid endpoint must not fall back to name"
+                );
+            }
+        }
+        assert!(SourceSpec::try_from(&Source::new("")).is_err());
+        assert!(matches!(
+            SourceSpec::try_from(&Source::new("bad\0name")),
+            Err(Error::InvalidCString(_))
+        ));
     }
 
     #[test]

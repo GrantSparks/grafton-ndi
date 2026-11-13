@@ -27,7 +27,7 @@ fn drag_across_frames(receiver: &mut Receiver) {
 }
 
 fn packet_session(packets: &mut PacketReceiver) {
-    let mut session = packets.receiver_mut().kvm().unwrap();
+    let mut session = packets.controls().kvm().unwrap();
     session.mouse_down(MouseButton::Left).unwrap();
     let _event = session.capture(Duration::ZERO).unwrap();
     session.mouse_up(MouseButton::Left).unwrap();

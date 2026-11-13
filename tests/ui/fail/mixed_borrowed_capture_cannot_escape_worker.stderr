@@ -1,0 +1,8 @@
+error[E0515]: cannot return value referencing local data `receiver`
+ --> tests/ui/fail/mixed_borrowed_capture_cannot_escape_worker.rs:5:32
+  |
+5 |     std::thread::spawn(move || receiver.capture_any_ref(Duration::ZERO));
+  |                                --------^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |                                |
+  |                                returns a value referencing data owned by the current function
+  |                                `receiver` is borrowed here

@@ -5,8 +5,9 @@
 mod common;
 
 use grafton_ndi::{
-    BorrowedVideoFrame, FrameSync, Ndi, PixelFormat, Receiver, ReceiverColorFormat,
+    Finder, FinderOptions, FrameSync, Ndi, PixelFormat, Receiver, ReceiverColorFormat,
     ReceiverOptions, ScanType, Sender, SenderOptions, Source, SourceCache, VideoFrame, VideoPlanes,
+    VideoSource,
 };
 use std::{
     sync::{
@@ -90,27 +91,26 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
     // Resolve the advertised machine component through equivalent spellings.
     let advertised = sender.source().unwrap();
     let host = advertised.name().split_once(" (").unwrap().0;
-    let cache = SourceCache::new();
+    let finder = Finder::new(&ndi, &FinderOptions::new().extra_ips("127.0.0.1")).unwrap();
+    let cache = SourceCache::new(&finder);
     let first = cache
-        .find_by_host(&ndi, &host.to_ascii_uppercase(), Duration::from_secs(15))
+        .sources_by_host(&host.to_ascii_uppercase(), Duration::from_secs(1))
         .unwrap();
     assert_eq!(
         cache
-            .find_by_host(
-                &ndi,
-                &format!("{}.", host.to_ascii_lowercase()),
-                Duration::ZERO
-            )
+            .sources_by_host(&format!("{}.", host.to_ascii_lowercase()), Duration::ZERO)
             .unwrap(),
         first
     );
     assert_eq!(cache.len(), 1);
     cache.invalidate(&host.to_ascii_lowercase());
     assert!(cache.is_empty());
-    let rediscovered = cache
-        .find_by_host(&ndi, host, Duration::from_secs(15))
+    let rediscovered = cache.sources_by_host(host, Duration::from_secs(1)).unwrap();
+    let selected = rediscovered
+        .into_iter()
+        .find(|s| s.name() == advertised.name())
         .unwrap();
-    let _connected = receiver(&ndi, rediscovered);
+    let _connected = receiver(&ndi, selected);
     let stop = Arc::new(AtomicBool::new(false));
     std::thread::scope(|scope| {
         let worker_stop = stop.clone();
@@ -268,18 +268,17 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
         .unwrap();
         let original = owned.data().as_ptr();
         assert!(resend.send_video_async(owned).unwrap().is_none());
-        let borrowed_send = BorrowedVideoFrame::from(&owned_capture);
         let recovered = resend
-            .send_video_async_copy(&borrowed_send)
+            .send_video_async_copy(&owned_capture)
             .unwrap()
             .unwrap();
         assert_eq!(recovered.data().as_ptr(), original);
         verify_owned(&recovered);
         // The recovered frame is the next copy's destination, as in the loop
-        // `BorrowedVideoFrame::copy_into` documents: the copied frame comes
+        // `VideoSource::copy_into` documents: the copied frame comes
         // back from the next send and the recovered one from the finish.
         let mut recovered = recovered;
-        borrowed_send.copy_into(&mut recovered);
+        owned_capture.copy_into(&mut recovered);
         let copied = resend.send_video_async(recovered).unwrap().unwrap();
         verify_owned(&copied);
         let last = resend.finish_video_async().unwrap();

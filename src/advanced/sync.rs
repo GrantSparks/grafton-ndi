@@ -2,7 +2,7 @@
 
 use std::{cell::Cell, marker::PhantomData, ptr};
 
-use super::{invalid_input, sdk_quantity, AdvancedConfig, KvmSession};
+use super::{invalid_input, sdk_quantity, AdvancedConfig, ReceiverControls};
 use crate::{
     finder::RawSource,
     frames::{AudioParts, ReturnedAudio, ValidatedAudio, MAX_AUDIO_BYTES},
@@ -13,8 +13,8 @@ use crate::{
         },
         bindings::*,
     },
-    AudioFrame, Error, FrameRate, MediaTypes, Ndi, Receiver, Rejected, Result, ScanType,
-    SettingChange, Source, StreamTier, VideoFrame, VideoFrameRef,
+    AudioFrame, Error, FrameRate, Ndi, Receiver, Rejected, Result, ScanType, Source, VideoFrame,
+    VideoFrameRef,
 };
 
 use super::descriptors;
@@ -295,42 +295,35 @@ impl AvSync {
     ///
     /// The synchronizer reads this receiver's native instance, so the
     /// receiver is never lent mutably, where it could be swapped for another
-    /// `AvSync`'s. [`set_stream_tier`](Self::set_stream_tier),
-    /// [`set_streams`](Self::set_streams) and [`kvm`](Self::kvm) reach the
-    /// controls that borrow it exclusively.
+    /// `AvSync`'s. [`controls`](Self::controls) reaches exclusive stream
+    /// controls and KVM; [`split`](Self::split) keeps synchronization usable
+    /// while a KVM session holds the receiver borrow.
     pub fn receiver(&self) -> &Receiver<AvSyncAttached> {
         &self.receiver
     }
 
-    /// Switch between the source's program and preview streams; see
-    /// [`Receiver::set_stream_tier`].
-    ///
-    /// # Errors
-    ///
-    /// As for [`Receiver::set_stream_tier`].
-    pub fn set_stream_tier(&mut self, tier: StreamTier) -> Result<SettingChange> {
-        self.receiver.set_stream_tier(tier)
+    /// Borrow exclusive receiver controls without permitting receiver replacement.
+    /// This allocates nothing and makes no SDK call. Use [`Self::split`] to
+    /// synchronize while a KVM session retains the receiver borrow.
+    pub fn controls(&mut self) -> ReceiverControls<'_, AvSyncAttached> {
+        ReceiverControls::new(&mut self.receiver)
     }
 
-    /// Choose which streams the source sends; see [`Receiver::set_streams`].
-    /// Without audio, there is nothing to synchronize.
+    /// Lend synchronization and exclusive receiver controls independently.
     ///
-    /// # Errors
-    ///
-    /// As for [`Receiver::set_streams`].
-    pub fn set_streams(&mut self, streams: MediaTypes) -> Result<SettingChange> {
-        self.receiver.set_streams(streams)
-    }
-
-    /// Start a remote-control session with the connected source; see
-    /// [`Receiver::kvm`]. The session borrows this exclusively for as long as
-    /// it lasts.
-    ///
-    /// # Errors
-    ///
-    /// As for [`Receiver::kvm`].
-    pub fn kvm(&mut self) -> Result<KvmSession<'_, AvSyncAttached>> {
-        self.receiver.kvm()
+    /// Both views borrow this owner without allocating or making SDK calls.
+    /// A session from the controls lends the receiver for video/metadata
+    /// capture while the synchronization view continues matching audio.
+    /// Release held inputs before changing source, and drop both views before
+    /// recovering the receiver.
+    pub fn split(&mut self) -> (AvSyncCapture<'_>, ReceiverControls<'_, AvSyncAttached>) {
+        (
+            AvSyncCapture {
+                resource: &self.resource,
+                _thread: PhantomData,
+            },
+            ReceiverControls::new(&mut self.receiver),
+        )
     }
 
     /// Stop synchronizing and return the receiver, with its own audio
@@ -370,10 +363,43 @@ impl AvSync {
         video: Option<&dyn AvSyncVideo>,
         request: AvSyncRequest,
     ) -> Result<AvSyncOutcome> {
+        AvSyncCapture {
+            resource: &self.resource,
+            _thread: PhantomData,
+        }
+        .synchronize(video, request)
+    }
+}
+
+/// Synchronization access lent by [`AvSync::split`].
+///
+/// The view borrows only the synchronizer, so a KVM session can hold the
+/// independently lent receiver while this continues matching audio to video.
+/// Creating or copying it allocates nothing and makes no SDK call. Like a
+/// shared `&AvSync`, it is neither `Send` nor `Sync`: overlapping native
+/// synchronizations are not documented as safe. Results own their audio.
+#[derive(Clone, Copy)]
+pub struct AvSyncCapture<'a> {
+    resource: &'a AvResource,
+    _thread: PhantomData<*mut ()>,
+}
+
+impl AvSyncCapture<'_> {
+    /// Match audio to `video`; see [`AvSync::synchronize`] for timing,
+    /// allocation costs, format changes and no-audio results.
+    ///
+    /// # Errors
+    ///
+    /// As for [`AvSync::synchronize`].
+    pub fn synchronize(
+        &self,
+        video: Option<&dyn AvSyncVideo>,
+        request: AvSyncRequest,
+    ) -> Result<AvSyncOutcome> {
         // A copy of the frame's descriptor, pointing into the frame's own
         // buffers, which the borrow keeps allocated for the call.
         let video = video.map(video_sealed::Sealed::descriptor);
-        let AvResource { handle, table } = self.resource;
+        let AvResource { handle, table } = *self.resource;
         let mut returned = Returned {
             audio: request.raw(),
             release: |audio: &mut NDIlib_audio_frame_v3_t| {
@@ -384,7 +410,7 @@ impl AvSync {
         };
         let status = native!(AvSync, table => {
             // SAFETY: the synchronizer is live, and so is the receiver it
-            // reads, which `self` owns and destroys after it. The video
+            // reads, whose owner this view borrows. The video
             // descriptor (if any) describes a frame borrowed for the call: an
             // owned frame's buffers, or the SDK's own descriptor of a captured
             // frame, whose guard keeps its buffers allocated. The SDK takes

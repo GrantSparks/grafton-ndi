@@ -2,8 +2,10 @@
 //!
 //! [`AsyncReceiver`] wraps the synchronous NDI receiver API for an async
 //! runtime, and its `video`, `audio` and `metadata` return an
-//! [`AsyncCapture`] view that captures one kind of frame. Both are generic
-//! over the [`AsyncRuntime`] whose blocking thread pool runs the NDI operations:
+//! [`AsyncCapture`] view that captures one kind of frame.
+//! [`AsyncReceiver::capture_any`] returns whichever owned media item or receiver
+//! event arrives next. Both types select the [`AsyncRuntime`] whose blocking
+//! thread pool runs the NDI operations:
 //! [`Tokio`] with the `tokio` Cargo feature, [`Smol`] with the `smol` feature.
 //! The [`tokio`] and [`smol`] submodules name both types for one runtime, for
 //! example `grafton_ndi::asynchronous::tokio::AsyncReceiver`. This module
@@ -23,7 +25,7 @@
 //! through [`receiver`](AsyncReceiver::receiver), for the controls that do not
 //! wait.
 //!
-//! For `capture`, `poll_event` and `poll_source_name_change`, the timeout
+//! For `capture`, `capture_any`, `poll_event` and `poll_source_name_change`, the timeout
 //! budget starts when the future is first polled, rather than when it is
 //! constructed. The same deadline covers blocking-pool queue delay, receiver
 //! capture-gate contention, and SDK waits.
@@ -81,7 +83,8 @@ use std::{
 use crate::{
     capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
     timeout::Deadline,
-    ConnectionStats, Error, Receiver, ReceiverEvent, Result, Source, SourceNameChange,
+    ConnectionStats, Error, Receiver, ReceiverEvent, ReceiverItem, Result, Source,
+    SourceNameChange,
 };
 
 mod private {
@@ -382,6 +385,36 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     #[must_use = "the AsyncCapture view does nothing until a capture verb is awaited"]
     pub fn metadata(&self) -> AsyncCapture<'_, R, MetadataKind> {
         AsyncCapture::new(self)
+    }
+
+    /// Async version of [`Receiver::capture_any`], delivering owned video,
+    /// audio, metadata, or a receiver event from one native wait on the
+    /// runtime's blocking pool. Borrowed native frames remain on that worker
+    /// and are freed after their validated owned copy has been made.
+    ///
+    /// The wait budget starts at first poll and includes blocking-pool queue
+    /// delay, receiver-lock contention and SDK waits. A spent or zero budget
+    /// makes one non-waiting attempt. Scheduling and copying can finish after
+    /// the budget. Events compete with all other event and combined consumers;
+    /// see [`Receiver::capture_any_ref`] for their coalescing contract.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Receiver::capture_any`], and [`Error::SpawnFailed`]
+    /// when the blocking task panicked or was cancelled. Oversize timeouts
+    /// are rejected before submitting work.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future suppresses work only before its entry gate. Work
+    /// that passed the gate may still consume an item whose result is then
+    /// discarded; a native wait cannot be interrupted by dropping a future.
+    pub async fn capture_any(&self, timeout: Duration) -> Result<Option<ReceiverItem>> {
+        let receiver = Arc::clone(&self.inner);
+        with_timeout_budget::<R, _, _>(timeout, move |deadline| {
+            receiver.core.capture_any_until(deadline)
+        })
+        .await
     }
 
     /// Async version of [`Receiver::poll_event`]: wait up to `timeout` for a
@@ -1023,6 +1056,7 @@ mod receiver_tests {
     fn futures_are_send<R: AsyncRuntime>(receiver: &AsyncReceiver<R>, source: &Source) {
         fn send<T: Send>(_: T) {}
         send(receiver.video().capture(Duration::ZERO));
+        send(receiver.capture_any(Duration::ZERO));
         send(receiver.poll_event(Duration::ZERO));
         send(receiver.poll_source_name_change(Duration::ZERO));
         send(receiver.connect_to(source));
@@ -1054,10 +1088,19 @@ mod receiver_tests {
             Err(Error::InvalidInput(_))
         ));
         assert!(matches!(
+            receiver.capture_any(excessive).await,
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
             receiver.poll_source_name_change(excessive).await,
             Err(Error::InvalidInput(_))
         ));
         assert!(receiver.poll_event(Duration::ZERO).await.unwrap().is_none());
+        assert!(receiver
+            .capture_any(Duration::ZERO)
+            .await
+            .unwrap()
+            .is_none());
         let change = receiver.poll_source_name_change(Duration::ZERO).await;
         if ndi
             .require_feature(RuntimeFeature::ConnectedSourceName)
@@ -1222,6 +1265,65 @@ mod receiver_tests {
                 blocker.await.unwrap();
                 // The one blocking thread runs the cancelled closure before
                 // this count, and the closure stopped at its gate.
+                assert_eq!(worker_capture_calls().await, 0);
+            });
+        }
+
+        #[test]
+        fn combined_capture_counts_queue_delay_and_skips_cancelled_queued_work() {
+            let Some(ndi) = crate::test_support::ndi() else {
+                return;
+            };
+            let receiver = unconnected::<Tokio>(&ndi);
+            runtime().block_on(async {
+                worker_capture_calls().await;
+                let (release, blocker) = occupy_worker();
+                let budget = Duration::from_millis(30);
+                let mut capture = Box::pin(receiver.capture_any(budget));
+                let mut context = Context::from_waker(Waker::noop());
+                assert!(matches!(capture.as_mut().poll(&mut context), Poll::Pending));
+                std::thread::sleep(budget + Duration::from_millis(10));
+                release.send(()).unwrap();
+                assert!(capture.await.unwrap().is_none());
+                blocker.await.unwrap();
+                let (calls, longest) =
+                    ::tokio::task::spawn_blocking(native_capture_calls::take_with_longest_wait)
+                        .await
+                        .unwrap();
+                assert_eq!((calls, longest), (1, 0));
+
+                let (release, blocker) = occupy_worker();
+                let mut capture = Box::pin(receiver.capture_any(Duration::from_secs(5)));
+                assert!(matches!(capture.as_mut().poll(&mut context), Poll::Pending));
+                drop(capture);
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                assert_eq!(worker_capture_calls().await, 0);
+            });
+        }
+
+        #[test]
+        fn combined_capture_counts_reconnect_lock_wait_in_one_budget() {
+            let Some(ndi) = crate::test_support::ndi() else {
+                return;
+            };
+            let receiver = unconnected::<Tokio>(&ndi);
+            let _exclusive = receiver.inner.core.reconnect_lock();
+            runtime().block_on(async {
+                worker_capture_calls().await;
+                assert!(receiver
+                    .capture_any(Duration::ZERO)
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert_eq!(worker_capture_calls().await, 0);
+                let began = Instant::now();
+                assert!(receiver
+                    .capture_any(Duration::from_millis(25))
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert!(began.elapsed() >= Duration::from_millis(25));
                 assert_eq!(worker_capture_calls().await, 0);
             });
         }

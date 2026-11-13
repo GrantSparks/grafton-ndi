@@ -34,6 +34,13 @@ fn finder_enforces_snapshot_and_whole_window_limits() {
         } else {
             limited(finder.current_sources());
             limited(finder.find_sources(Duration::ZERO));
+            assert!(matches!(
+                finder.find_source(Duration::ZERO, |_| true),
+                Err(Error::ResourceLimit { .. })
+            ));
+            let cache = grafton_ndi::SourceCache::new(&finder);
+            limited(cache.sources_by_host("studio", Duration::ZERO));
+            assert!(cache.is_empty());
         }
         #[cfg(feature = "advanced")]
         if !scenario.starts_with("retained")

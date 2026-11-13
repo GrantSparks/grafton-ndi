@@ -1,0 +1,9 @@
+error[E0499]: cannot borrow `*sync` as mutable more than once at a time
+ --> tests/ui/advanced/fail/second_framesync_kvm_session.rs:4:18
+  |
+3 |     let first = sync.controls().kvm().unwrap();
+  |                 ---- first mutable borrow occurs here
+4 |     let second = sync.controls().kvm().unwrap();
+  |                  ^^^^ second mutable borrow occurs here
+5 |     drop((first, second));
+  |           ----- first borrow later used here

@@ -120,6 +120,14 @@ Example: `examples/advanced_source_metadata.rs`.
 
 ### Receiving packets
 
+For ordinary decoded media, Standard `Receiver::capture_any_ref` and
+`Receiver::capture_any` already wait once for video, audio, metadata or receiver
+invalidations. Their async equivalent returns owned items on Tokio or smol.
+Use `PacketReceiver` when the application needs compressed codec packets; its
+all-slot native dispatch is shared, while packet interpretation and capability
+checks remain in the Advanced layer. See the
+[mixed-media receive guide](usage.md#receive-whichever-media-arrives-next).
+
 `PacketReceiver` delivers a frame as the codec packet the source sent when the
 frame's format is one that its `PassthroughPreset` names, and as a decoded frame
 otherwise. One `capture` call returns whichever frame or event arrives first as
@@ -138,9 +146,8 @@ needs NDI 6.4, still make a packet receiver on an older Advanced runtime.
 `receiver()` returns the `Receiver<PacketAttached>` the packet receiver holds,
 with the controls every receiver mode has: `set_tally`, `ptz`,
 `connection_stats`, `send_metadata`, `request_keyframe`, the delays,
-`reconnect` and `poll_source_name_change`. `receiver_mut()` reaches the ones
-that borrow the receiver exclusively: `set_stream_tier`, `set_streams` and
-`kvm`. The receiver's own `video`, `audio`, `metadata` and `poll_event` do not
+`reconnect` and `poll_source_name_change`. `controls()` lends exclusive `set_stream_tier`, `set_streams` and `kvm`
+without permitting replacement of the attached receiver. The receiver's own `video`, `audio`, `metadata` and `poll_event` do not
 exist in this mode, because `capture` takes every frame and event:
 
 ```rust
@@ -154,7 +161,7 @@ fn relay(ndi: &Ndi, source: Source) -> grafton_ndi::Result<()> {
     let mut packets =
         PacketReceiver::new(ndi, &ReceiverOptions::new(source), PassthroughPreset::Hevc)?;
     packets.receiver().set_tally(Tally::new(true, false));
-    packets.receiver_mut().set_stream_tier(StreamTier::Program)?;
+    packets.controls().set_stream_tier(StreamTier::Program)?;
     if let Some(PacketEvent::StatusChanged) = packets.capture(Duration::from_secs(1))? {
         println!("connections: {}", packets.receiver().connection_stats().connections());
     }
@@ -347,9 +354,9 @@ What to know about allocator policies:
 - `attach_packets` does for a `PacketReceiver` what `attach` does for a
   `Receiver`, and hands the `PacketReceiver` back inside `Rejected` when it
   fails. The `AllocatedPacketReceiver` it returns has the packet receiver's
-  `capture` and `receiver()`, and `set_stream_tier` and `set_streams` of its
-  own in place of `receiver_mut()`, which would let its receiver, on which
-  the allocators are installed, be swapped for another. `into_packet_receiver`
+  `capture`, `receiver()` and `controls()`. Both allocated wrappers use the
+  same restricted control view, including KVM, so their receiver cannot be
+  swapped while its allocators remain installed. `into_packet_receiver`
   gives the packet receiver back. Both allocated receivers are `Send` and
   `Sync`: the SDK calls the policies on threads of its own whatever thread
   set them, so a receiver can be attached, given allocators, capture and be
@@ -375,9 +382,10 @@ this mode the receiver keeps its own `video` and `metadata` capture and
 `connect_to`, `reconnect` and `poll_source_name_change`. Its `audio` does not
 exist in this mode, because the synchronizer takes the audio. The receiver is
 never lent mutably, since the synchronizer reads its native instance and a
-mutable receiver could be swapped for another `AvSync`'s; `AvSync` itself has
-`set_stream_tier`, `set_streams` and `kvm`, the controls that borrow the
-receiver exclusively.
+mutable receiver could be swapped for another `AvSync`'s. `controls()` lends
+exclusive stream controls and KVM. `split()` lends `AvSyncCapture` separately
+from those controls, so a KVM session can hold input while `synchronize`
+continues matching audio to video captured through the session's receiver.
 
 `synchronize` takes the frame by reference, either a `VideoFrameRef` captured
 with `capture_ref` or an owned `VideoFrame`, and reads it in place, so the
@@ -466,6 +474,25 @@ These are methods on the ordinary `Sender` and `Receiver`:
 The senders that `CompressedSender::sender` and `QueuedSender::sender` lend
 have the same encoder guidance, keyframe and tally methods as `Sender`.
 
+Receiver ownership determines media access and the route to exclusive controls:
+
+| Owner | Available capture | Stream/tier controls | Capture during KVM |
+| --- | --- | --- | --- |
+| `Receiver` | Typed video/audio/metadata, events, combined media | Direct methods | Session's `receiver()` |
+| `FrameSync` | Clocked video/audio; receiver metadata/events | `controls()` | `split()` capture view |
+| `AvSync` | Matched audio; receiver video/metadata/events | `controls()` | `split()` synchronization view |
+| `PacketReceiver` | Owned packet/decoded media and events | `controls()` | Session's `capture()` |
+| `AllocatedReceiver` | Receiver's typed and combined media/events | `controls()` | Session's `receiver()` |
+| `AllocatedPacketReceiver` | Owned packet/decoded media and events | `controls()` | Session's `capture()` |
+
+Every row retains connection changes, diagnostics, upstream metadata, delays,
+tally, PTZ and keyframe requests, subject to the same runtime capability checks.
+Use the owner directly for a raw receiver, or its shared `receiver()` otherwise.
+The restricted control views also start KVM sessions. They never lend a mutable
+receiver, and reserve no additional capture path in attached modes. Split views
+stay on their borrowing thread; the existing owners retain their documented
+threading contracts. Release held inputs before a source change.
+
 ## KVM
 
 `Receiver::kvm` starts a `KvmSession`, exclusive remote control of the source
@@ -474,7 +501,7 @@ session, so a receiver has one session at a time, and the session lends it back
 as `&Receiver` through `receiver()` for the session's whole lifetime. A video
 frame captured through it can be held while the session sends input, so a key,
 button or touch stays down across captured frames. For a `PacketReceiver`,
-start the session with `receiver_mut().kvm()` and capture with
+start the session with `controls().kvm()` and capture with
 `KvmSession::capture`, which behaves as `PacketReceiver::capture` does. A
 source change through the lent receiver (`connect_to`, `reconnect`,
 `disconnect`) leaves held inputs on the previous source: call `release_all`

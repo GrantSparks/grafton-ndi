@@ -345,6 +345,101 @@ struct FrameSyncResource {
     _ndi: crate::Ndi,
 }
 
+/// Clocked capture access lent by `FrameSync::split` with the `advanced` feature.
+///
+/// This view borrows only the synchronizer, leaving its receiver available
+/// through a separate exclusive control view. A KVM session can therefore hold
+/// a button or key while video and audio continue. Creating or copying the
+/// view allocates nothing and makes no SDK call. Capture has the same costs,
+/// timing, validation and stale-output semantics as [`FrameSync`].
+///
+/// The split view stays on its borrowing thread (`!Send` and `!Sync`) so
+/// exclusive stream changes stay sequenced with split capture. Share the
+/// complete FrameSync for concurrent capture instead. Borrowed output frames
+/// also remain neither `Send` nor `Sync`, retaining the owner's borrow even
+/// if the view itself is dropped.
+#[derive(Clone, Copy)]
+pub struct FrameSyncCapture<'a> {
+    resource: &'a FrameSyncResource,
+    _thread: std::marker::PhantomData<*mut ()>,
+}
+
+impl<'a> FrameSyncCapture<'a> {
+    /// Capture an owned clocked video frame; see [`FrameSync::capture_video`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`FrameSync::capture_video_ref`].
+    pub fn capture_video(&self, scan_type: ScanType) -> Result<Option<VideoFrame>> {
+        Ok(self
+            .capture_video_ref(scan_type)?
+            .map(|frame| frame.to_owned()))
+    }
+
+    /// Borrow clocked video without a wrapper payload copy or allocation.
+    /// The output can repeat previous input; see [`FrameSync::capture_video_ref`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`FrameSync::capture_video_ref`].
+    pub fn capture_video_ref(&self, scan_type: ScanType) -> Result<Option<FrameSyncVideoRef<'a>>> {
+        let Some(guard) = self.resource.capture_video(scan_type) else {
+            return Ok(None);
+        };
+        // SAFETY: the guard owns the frame just returned by this live resource.
+        Ok(Some(unsafe { FrameSyncVideoRef::new(guard)? }))
+    }
+
+    /// Capture owned resampled audio; see [`FrameSync::capture_audio`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`FrameSync::capture_audio_ref`].
+    pub fn capture_audio(&self, request: FrameSyncAudioRequest) -> Result<AudioFrame> {
+        Ok(self.capture_audio_ref(request)?.to_owned())
+    }
+
+    /// Borrow resampled audio without a wrapper payload copy or allocation.
+    /// The SDK can return silence; see [`FrameSync::capture_audio_ref`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`FrameSync::capture_audio_ref`].
+    pub fn capture_audio_ref(
+        &self,
+        request: FrameSyncAudioRequest,
+    ) -> Result<FrameSyncAudioRef<'a>> {
+        let guard = self.resource.capture_audio(AudioCall::Samples(request));
+        // SAFETY: the guard owns the samples this live resource just returned.
+        unsafe { FrameSyncAudioRef::new(guard) }
+    }
+
+    /// Query the cached input audio format; see [`FrameSync::audio_input_format`].
+    /// This does not establish fresh reception and allocates nothing on success.
+    ///
+    /// # Errors
+    ///
+    /// As for [`FrameSync::audio_input_format`].
+    pub fn audio_input_format(&self) -> Result<Option<AudioInputFormat>> {
+        let guard = self.resource.capture_audio(AudioCall::InputFormat);
+        input_format(guard.frame())
+    }
+
+    /// The approximate queued sample count; see [`FrameSync::audio_queue_depth`].
+    /// This makes one native query without allocating or waiting for input.
+    pub fn audio_queue_depth(&self) -> u32 {
+        // SAFETY: the view borrows a live synchronizer for the call.
+        let depth = unsafe {
+            self.resource
+                ._ndi
+                .api()
+                .core
+                .NDIlib_framesync_audio_queue_depth(self.resource.instance)
+        };
+        u32::try_from(depth).unwrap_or(0)
+    }
+}
+
 /// What one `NDIlib_framesync_capture_audio_v2` call asks the SDK for.
 #[derive(Clone, Copy)]
 enum AudioCall {
@@ -522,6 +617,52 @@ impl FrameSync {
         &self.receiver
     }
 
+    /// Borrow the receiver's exclusive Advanced controls without lending the
+    /// receiver mutably. This allocates nothing and makes no native call.
+    /// Use [`Self::split`] to capture while a KVM session holds this borrow.
+    #[cfg(feature = "advanced")]
+    pub fn controls(&mut self) -> crate::advanced::ReceiverControls<'_, FrameSyncAttached> {
+        crate::advanced::ReceiverControls::new(&mut self.receiver)
+    }
+
+    /// Lend clocked capture and exclusive receiver controls independently.
+    ///
+    /// Neither view can replace, recover or destroy either native resource.
+    /// The synchronizer and receiver keep their original instances; creating
+    /// the views allocates nothing and makes no SDK call. Drop held frames
+    /// and both views before recovering the receiver. A source change must be
+    /// preceded by [`KvmSession::release_all`](crate::advanced::KvmSession::release_all).
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{FrameSync, ScanType, Result};
+    /// # use grafton_ndi::advanced::MouseButton;
+    /// fn drag(sync: &mut FrameSync) -> Result<()> {
+    ///     let (capture, controls) = sync.split();
+    ///     let mut session = controls.kvm()?;
+    ///     session.mouse_down(MouseButton::Left)?;
+    ///     let frame = capture.capture_video_ref(ScanType::Progressive)?;
+    ///     session.move_pointer(0.5, 0.5)?;
+    ///     session.release_all()?;
+    ///     drop(frame);
+    ///     Ok(())
+    /// }
+    /// ```
+    #[cfg(feature = "advanced")]
+    pub fn split(
+        &mut self,
+    ) -> (
+        FrameSyncCapture<'_>,
+        crate::advanced::ReceiverControls<'_, FrameSyncAttached>,
+    ) {
+        (
+            FrameSyncCapture {
+                resource: &self.resource,
+                _thread: std::marker::PhantomData,
+            },
+            crate::advanced::ReceiverControls::new(&mut self.receiver),
+        )
+    }
+
     /// Consume the FrameSync and recover the underlying Receiver.
     ///
     /// This destroys the frame synchronizer and returns the receiver for
@@ -608,14 +749,11 @@ impl FrameSync {
     /// format or malformed frame descriptor, including invalid dimensions,
     /// stride, buffers, or metadata.
     pub fn capture_video_ref(&self, scan_type: ScanType) -> Result<Option<FrameSyncVideoRef<'_>>> {
-        // Per SDK docs: a zeroed struct if no video has been received yet.
-        let Some(guard) = self.resource.capture_video(scan_type) else {
-            return Ok(None);
-        };
-        // SAFETY: the guard owns a frame this capture just returned.
-        let frame = unsafe { FrameSyncVideoRef::new(guard)? };
-
-        Ok(Some(frame))
+        FrameSyncCapture {
+            resource: &self.resource,
+            _thread: std::marker::PhantomData,
+        }
+        .capture_video_ref(scan_type)
     }
 
     /// Capture audio with dynamic resampling, as an owned frame that can be
@@ -728,10 +866,11 @@ impl FrameSync {
         &self,
         request: FrameSyncAudioRequest,
     ) -> Result<FrameSyncAudioRef<'_>> {
-        let guard = self.resource.capture_audio(AudioCall::Samples(request));
-        // SAFETY: the guard owns the samples this capture request just
-        // returned.
-        unsafe { FrameSyncAudioRef::new(guard) }
+        FrameSyncCapture {
+            resource: &self.resource,
+            _thread: std::marker::PhantomData,
+        }
+        .capture_audio_ref(request)
     }
 
     /// Query the format of the audio this FrameSync is receiving, without
@@ -777,9 +916,11 @@ impl FrameSync {
     /// # }
     /// ```
     pub fn audio_input_format(&self) -> Result<Option<AudioInputFormat>> {
-        // The guard frees what the query returned when it is dropped here.
-        let guard = self.resource.capture_audio(AudioCall::InputFormat);
-        input_format(guard.frame())
+        FrameSyncCapture {
+            resource: &self.resource,
+            _thread: std::marker::PhantomData,
+        }
+        .audio_input_format()
     }
 
     /// Query the current audio queue depth.
@@ -813,19 +954,11 @@ impl FrameSync {
     /// # }
     /// ```
     pub fn audio_queue_depth(&self) -> u32 {
-        // SAFETY: the FrameSync instance is live for this borrow.
-        let depth = unsafe {
-            self.core()
-                .NDIlib_framesync_audio_queue_depth(self.resource.instance)
-        };
-        // A sample count is never negative; one that broke that contract
-        // would mean no samples to request.
-        u32::try_from(depth).unwrap_or(0)
-    }
-
-    /// The entry points of the runtime this FrameSync was created through.
-    fn core(&self) -> &'static crate::sys::Core {
-        &self.resource._ndi.api().core
+        FrameSyncCapture {
+            resource: &self.resource,
+            _thread: std::marker::PhantomData,
+        }
+        .audio_queue_depth()
     }
 }
 
@@ -833,8 +966,9 @@ impl FrameSync {
 ///
 /// The FrameSync instance has no affinity to the thread that created it: the
 /// SDK's own FrameSync audio examples create it on one thread and capture
-/// from an audio device's callback thread. The FrameSync owns its receiver,
-/// keeping the SDK runtime alive. Borrowed frame guards cannot be moved
+/// from an audio device's callback thread. This private resource is owned by
+/// FrameSync, which destroys it before its receiver; split views only borrow
+/// it. It retains the SDK runtime directly. Borrowed frame guards cannot be moved
 /// between threads and keep this owner borrowed until their buffers are
 /// freed; destruction requires exclusive ownership.
 unsafe impl Send for FrameSync {}
@@ -936,6 +1070,31 @@ pub(crate) mod audio_test_calls {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "advanced")]
+    #[test]
+    fn exclusive_control_views_allocate_nothing_and_keep_the_native_owners() {
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
+        };
+        let receiver =
+            Receiver::new(&ndi, &crate::ReceiverOptions::new(crate::Source::new(""))).unwrap();
+        let mut sync = FrameSync::new(receiver).unwrap();
+        let original = (sync.resource.instance, sync.receiver.core.instance);
+        let (results, allocations) = crate::test_alloc::allocation_count(|| {
+            let tier = sync.controls().set_stream_tier(crate::StreamTier::Preview);
+            let streams = sync.controls().set_streams(crate::MediaTypes::ALL);
+            let (_capture, controls) = sync.split();
+            let session = controls.kvm();
+            (tier, streams, session.map(drop))
+        });
+        assert_eq!(allocations, 0);
+        assert!(results.0.is_ok() && results.1.is_ok() && results.2.is_ok());
+        assert_eq!(
+            (sync.resource.instance, sync.receiver.core.instance),
+            original
+        );
+    }
     use crate::{
         frames::{AudioFormat, PixelFormat},
         FourCc,

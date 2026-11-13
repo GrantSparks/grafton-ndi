@@ -233,15 +233,15 @@ fn advanced_native_constructors_controls_and_queue() {
         receiver.reconnect().unwrap();
     }
     for change in [
-        av.set_stream_tier(StreamTier::Program).unwrap(),
-        av.set_streams(MediaTypes::ALL).unwrap(),
+        av.controls().set_stream_tier(StreamTier::Program).unwrap(),
+        av.controls().set_streams(MediaTypes::ALL).unwrap(),
     ] {
         assert!(matches!(
             change,
             SettingChange::Applied | SettingChange::Unchanged
         ));
     }
-    let _ = av.kvm().unwrap().is_supported();
+    let _ = av.controls().kvm().unwrap().is_supported();
     drop(av.into_receiver());
     let mut genlock = Genlock::new(&ndi, None, Some(&config)).unwrap();
     genlock.connect(None).unwrap();

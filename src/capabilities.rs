@@ -209,9 +209,9 @@ macro_rules! runtime_features {
         /// that needs one that is unavailable fails with
         /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
         /// naming it, before anything reaches the SDK. The families of the NDI File
-        /// library, [`File`](Self::File), are the exception: that library is loaded
-        /// apart from the runtime, and its own
-        /// [`FileApi::status`](crate::file::FileApi::status) reports them.
+        /// library (with `file-io`) are the exception: that library is loaded
+        /// apart from the runtime and reports its own capabilities.
+        #[cfg_attr(feature = "file-io", doc = "See [`File`](Self::File) and [`FileApi::status`](crate::file::FileApi::status).")]
         ///
         /// A core capability depends on the functions the runtime exports and, for
         /// some, on its version: an older runtime would misread newer input values, or

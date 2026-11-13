@@ -37,7 +37,7 @@ use std::{
 use grafton_ndi::{
     file::{FileApi, FilePlayer, FilePosition, FileRuntimeOptions, PlayerEventKind, PlayerOptions},
     Downscale, Finder, FinderOptions, ImageFormat, ImageOptions, Ndi, Receiver, ReceiverOptions,
-    Source, Timecode,
+    Timecode,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -65,8 +65,14 @@ fn main() -> Result<()> {
     let group = format!("thumbnails-{}", std::process::id());
     let mut player =
         file.create_player(&PlayerOptions::new("Thumbnails").groups(group.as_str()))?;
-    let finder = Finder::new(&ndi, &FinderOptions::new().groups(group))?;
-    let source = wait_for_source(&finder, player.advertised_source()?.name())?;
+    let finder = Finder::new(
+        &ndi,
+        &FinderOptions::new().groups(group).extra_ips("127.0.0.1"),
+    )?;
+    let name = player.advertised_source()?.name().to_owned();
+    let source = finder
+        .find_source_by_name(&name, PATIENCE)?
+        .ok_or_else(|| format!("the player's source {name} was not listed"))?;
     let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source))?;
     let options = ImageOptions::new(ImageFormat::Jpeg(85)).downscale(Downscale::Quarter);
 
@@ -100,22 +106,6 @@ fn main() -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// The source this process advertises as `name`, once `finder` lists it.
-fn wait_for_source(finder: &Finder, name: &str) -> Result<Source> {
-    let deadline = Instant::now() + PATIENCE;
-    while Instant::now() < deadline {
-        if let Some(source) = finder
-            .current_sources()?
-            .into_iter()
-            .find(|source| source.name() == name)
-        {
-            return Ok(source);
-        }
-        finder.wait_for_sources(Duration::from_millis(100))?;
-    }
-    Err(format!("the player's source {name} was not listed").into())
 }
 
 /// Wait for the player's next `FirstFrame` event, and return the source

@@ -1,0 +1,11 @@
+error[E0505]: cannot move out of `receiver` because it is borrowed
+ --> tests/ui/fail/mixed_capture_prevents_attachment.rs:6:37
+  |
+4 | fn attach(receiver: Receiver) {
+  |           -------- binding `receiver` declared here
+5 |     let item = receiver.capture_any_ref(Duration::ZERO).unwrap();
+  |                -------- borrow of `receiver` occurs here
+6 |     let _framesync = FrameSync::new(receiver);
+  |                                     ^^^^^^^^ move out of `receiver` occurs here
+7 |     drop(item);
+  |          ---- borrow later used here

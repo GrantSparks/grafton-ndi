@@ -1,8 +1,8 @@
 //! Example: remote control of a source that offers KVM.
 //!
 //! This example demonstrates:
-//! - Starting a [`KvmSession`](grafton_ndi::advanced::KvmSession) on a receiver
-//! - Capturing video through the session while a drag stays held
+//! - Starting KVM through a FrameSync's restricted receiver controls
+//! - Capturing synchronized video and audio while a drag stays held
 //! - Releasing everything that was pressed
 //!
 //! Needs the NDI Advanced SDK at build time and an Advanced runtime.
@@ -14,7 +14,10 @@
 
 use std::{env, thread, time::Duration};
 
-use grafton_ndi::{advanced::MouseButton, Error, Ndi, Receiver, ReceiverOptions};
+use grafton_ndi::{
+    advanced::MouseButton, Error, FrameSync, FrameSyncAudioRequest, Ndi, Receiver, ReceiverOptions,
+    ScanType,
+};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -35,30 +38,33 @@ fn main() -> Result<(), Error> {
     };
     println!("Connecting to {source}");
 
-    let mut receiver = Receiver::new(&ndi, &ReceiverOptions::new(source).name("KVM Example"))?;
+    let receiver = Receiver::new(&ndi, &ReceiverOptions::new(source).name("KVM Example"))?;
+    let mut sync = FrameSync::new(receiver)?;
     // Give the connection a moment to report what the source supports.
     thread::sleep(Duration::from_secs(2));
 
-    let mut session = receiver.kvm()?;
+    let (capture, controls) = sync.split();
+    let mut session = controls.kvm()?;
     if !session.is_supported() {
         println!("This source does not offer remote control");
         return Ok(());
     }
 
     // Drag from the left of the source's screen to the right. The button
-    // stays down across the frames captured through the session's receiver.
+    // stays down while the independent capture view samples clocked output.
+    let audio_request = FrameSyncAudioRequest::capture_at(48_000, 2, 480)?;
     session.move_pointer(0.25, 0.5)?;
     session.mouse_down(MouseButton::Left)?;
     for step in 1..=5u8 {
         // The frame stays borrowed from the receiver while input is sent.
-        let frame = session
-            .receiver()
-            .video()
-            .capture_ref(Duration::from_secs(1))?;
+        let frame = capture.capture_video_ref(ScanType::Progressive)?;
+        let audio = capture.capture_audio_ref(audio_request)?;
         if let Some(frame) = &frame {
             println!("Frame {}x{} while dragging", frame.width(), frame.height());
         }
         session.move_pointer(0.25 + 0.1 * f32::from(step), 0.5)?;
+        println!("{} synchronized audio samples", audio.num_samples());
+        thread::sleep(Duration::from_millis(100));
     }
     session.mouse_up(MouseButton::Left)?;
 

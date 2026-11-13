@@ -1,0 +1,12 @@
+error[E0505]: cannot move out of `sync` because it is borrowed
+ --> tests/ui/advanced/fail/framesync_recovery_with_split_frame.rs:5:20
+  |
+2 | fn recover(mut sync: FrameSync) {
+  |            -------- binding `sync` declared here
+3 |     let (capture, _) = sync.split();
+  |                        ---- borrow of `sync` occurs here
+4 |     let frame = capture.capture_video_ref(ScanType::Progressive).unwrap();
+5 |     let receiver = sync.into_receiver();
+  |                    ^^^^ move out of `sync` occurs here
+6 |     drop((frame, receiver));
+  |           ----- borrow later used here

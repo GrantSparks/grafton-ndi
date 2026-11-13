@@ -1072,3 +1072,41 @@ fn players_borrow_their_options() {
     assert!(format!("{second:?}").contains("mock player"), "{second:?}");
     assert_eq!(options.name, "mock player");
 }
+
+#[test]
+fn selected_endpoints_and_deliberate_names_cross_creation_and_source_change() {
+    use crate::{Source, SourceAddress};
+    let selected =
+        Source::new("STUDIO (Camera 2)").with_address(SourceAddress::Ip("192.0.2.10:5962".into()));
+    let spec = SourceSpec::try_from(&selected).unwrap();
+    let device = mock::Recorder::new(Closing::AtStop);
+    device.install();
+    let mut recorder = mock::recorder_api()
+        .create_recorder(&RecorderOptions::new(spec.clone()))
+        .unwrap();
+    assert_eq!(recorder.last_accepted_source(), Some(&spec));
+    let second = Source::new("STUDIO (Program)").with_address(SourceAddress::Url(
+        "ndi://camera.local:5963/path?opaque=1".into(),
+    ));
+    recorder
+        .set_source(&SourceSpec::try_from(&second).unwrap())
+        .unwrap();
+    recorder
+        .set_source(&SourceSpec::new(selected.name()).unwrap())
+        .unwrap();
+    assert_eq!(
+        *device.selected_sources.lock().unwrap(),
+        vec![
+            (None, Some("192.0.2.10:5962".into())),
+            (None, Some("ndi://camera.local:5963/path?opaque=1".into())),
+            (Some("STUDIO (Camera 2)".into()), None),
+        ]
+    );
+    let before = recorder.last_accepted_source().unwrap().clone();
+    assert!(SourceSpec::try_from(
+        &Source::new("valid name").with_address(SourceAddress::Ip("".into()))
+    )
+    .is_err());
+    assert_eq!(recorder.last_accepted_source(), Some(&before));
+    assert_eq!(device.source_changes.load(Ordering::Acquire), 2);
+}

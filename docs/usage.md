@@ -24,17 +24,40 @@ if finder.wait_for_sources(Duration::from_secs(2))? {
 }
 ```
 
-Use `SourceCache` for repeated lookups by complete hostname or IP address. Entries
-remain until `invalidate()` or `clear()` removes them. For partial names or labels,
-filter a `Finder` snapshot instead.
+Select a specific feed on the configured finder. Selection checks the current
+snapshot immediately, then waits within one budget until a match appears:
+
+```rust
+let camera = finder
+    .find_source_by_name("STUDIO (Camera 2)", Duration::from_secs(5))?
+    .ok_or_else(|| grafton_ndi::Error::NoSourcesFound {
+        criteria: "STUDIO (Camera 2)".into(),
+    })?;
+```
+
+Exact names are case-sensitive. Duplicate names at different addresses select the
+first match in the snapshot; disambiguate with `find_source(timeout, |source|
+...)`, inspecting both name and address. Predicates run outside the SDK snapshot
+lock. A zero timeout checks once; an oversized timeout is refused even when an
+immediate match exists. Neither selection nor enumeration guarantees continued
+availability.
+
+A host can publish several feeds. `SourceCache::new(&finder)` binds a cache to
+that finder's groups, IP hints and configuration. `sources_by_host` observes the
+full window and caches every distinct matching descriptor, leaving feed selection
+explicit:
 
 ```rust
 use grafton_ndi::SourceCache;
-use std::time::Duration;
-
-let cache = SourceCache::new();
-let camera = cache.find_by_host(&ndi, "192.168.1.100", Duration::from_secs(5))?;
+let cache = SourceCache::new(&finder);
+let feeds = cache.sources_by_host("192.168.1.100", Duration::from_secs(5))?;
+for feed in feeds { println!("{feed}"); }
 ```
+
+Entries remain stale until `invalidate(host)` or `clear()` removes them, and an
+empty result is not cached. Configure IP hints on the finder itself. Lookup never
+creates another finder or changes scope. Cache hits return owned descriptor
+copies; misses use the same bounded allocations as full-window enumeration.
 
 ## Receive streams
 
@@ -103,6 +126,63 @@ capture buffer, or `copy_into(&mut frame)` to reuse an owned allocation. Copies
 preserve media properties but may reduce stride. Immutable plane and row views
 support scoped worker threads; FrameSync frame guards remain on their capture thread.
 
+### Receive whichever media arrives next
+
+Use `capture_any_ref` when one event loop should process whichever video, audio,
+metadata or receiver invalidation arrives next. One wait requests every media
+kind, so an absent audio stream does not delay video behind an audio timeout.
+This works with Standard runtimes and no Cargo features:
+
+```rust
+use grafton_ndi::ReceiverItemRef;
+use std::time::Duration;
+
+match receiver.capture_any_ref(Duration::from_millis(100))? {
+    Some(ReceiverItemRef::Video(frame)) => {
+        for plane in frame.planes() {
+            for row in plane.rows() { println!("{} active video bytes", row.len()); }
+        }
+    }
+    Some(ReceiverItemRef::Audio(frame)) => {
+        println!("{} samples per channel", frame.num_samples());
+    }
+    Some(ReceiverItemRef::Metadata(frame)) => println!("{}", frame.data()),
+    Some(ReceiverItemRef::Event(event)) => println!("{event:?}"),
+    _ => {}
+}
+```
+
+Borrowed items retain their receiver borrow, make no wrapper payload copies or
+allocations, and support scoped thread transfer. `item.to_owned()` or
+`receiver.capture_any(timeout)` packs active rows/channels into owned frames,
+preserving timing and metadata. Owned video/audio normally allocate one payload
+buffer and another string when metadata is present; standalone metadata
+allocates its text; events allocate nothing. Raw combined capture is available
+only on an ordinary receiver. FrameSync and Advanced attachment modes reserve
+some or all native media for their own capture methods.
+
+Combined capture consumes pending and native events. Typed capture retains
+events for `poll_event` or combined readers; all of those consumers compete for
+coalesced invalidations. They do not receive a broadcast or ordered history.
+After `SourceChanged`, use `poll_source_name_change` to query the connected name.
+The same wait budget covers reconnect-lock contention and bounded native
+attempts; zero timeout makes one non-waiting attempt. Early SDK misses are
+retried with a pause until the budget is spent. Media may already be queued,
+and a timeout alone does not establish disconnection or freshness.
+
+For async applications, both `asynchronous::tokio::AsyncReceiver` and
+`asynchronous::smol::AsyncReceiver` expose `capture_any(timeout).await`, returning
+owned `ReceiverItem` values. Their worker creates and frees native frame guards
+locally. The budget starts at first poll and includes worker-queue delay and
+receiver-lock waits. Dropping the future suppresses work only before its entry
+gate; work that has started may consume an item whose result is discarded.
+
+Choose typed capture for dedicated media workers, combined capture for one
+mixed-media loop, and FrameSync when output must follow a playback clock.
+[`mixed_media_relay`](../examples/mixed_media_relay.rs) is a complete synchronous
+relay using borrowed sends; [`mixed_media_async`](../examples/mixed_media_async.rs)
+shows owned analysis with either async runtime.
+
 ## Publish sources
 
 Create a `Sender` to publish a source. Use its tally, connection count and
@@ -130,6 +210,11 @@ let connections = sender.connection_count(Duration::from_millis(500))?;
 println!("connected receivers: {connections}");
 ```
 
+Both video builders default to square pixels: their stored picture aspect is
+the SDK's `0.0` sentinel, so display geometry follows width and height. Set a
+positive `picture_aspect_ratio` for intentional anamorphic output. Captures and
+copies preserve their source aspect value.
+
 Choose a send method by buffer ownership:
 
 | Input and timing | Method |
@@ -152,6 +237,34 @@ After `send_video` returns, you can reuse the input buffer.
 
 See [sending examples](../examples/README.md#sending) for allocation reuse.
 
+Synchronous media operations accept sealed, validated source traits.
+`VideoSource` covers owned `VideoFrame`, checked external `BorrowedVideoFrame`,
+`VideoFrameRef` and `FrameSyncVideoRef`; `AudioSource` covers owned `AudioFrame`,
+`AudioFrameRef` and `FrameSyncAudioRef`. Pass a shared reference directly to
+`sender.send_video(&video)`, `sender.send_audio(&audio)`, or any
+`AudioConverter::to_interleaved_*(&audio, destination, ...)` operation. Receiver
+and FrameSync guards keep their existing lifetime and thread restrictions.
+
+Eligible packed video sends use the input pixels directly. A captured guard
+proves that active rows are initialized; its padding and trailing bytes remain
+unproven. Padded captures and formats needing SDK tail room therefore copy only
+active rows into the sender's reusable packed staging, zeroing required tail
+bytes. After warm-up, a stable staged shape needs no allocation. External
+borrowed buffers retain their explicit padding/tail opt-in; forwarding a capture
+never opts it in. `VideoSource::sends_in_place()` reports the chosen path without
+making an SDK call. Headers and per-frame metadata follow either path.
+
+Planar audio sends and all three native interleaved conversions (`i16`, `i32`,
+`f32`) use captured channel strides directly with no owned planar copy or
+wrapper allocation. Conversion writes only the required prefix of the caller's
+destination; integer output keeps its explicit reference-level and clipping
+semantics. The destination prefix may be partially modified on native failure.
+Synchronous calls finish borrowing their input when they return.
+`send_video_async_copy(&source)` accepts the same video inputs and allocates an
+owned packed pixel/metadata copy before submission, so the source can be freed
+immediately. `send_video_async(frame)` continues to require ownership and returns
+completed frames for reuse.
+
 ## Use FrameSync
 
 `FrameSync` is for pull-based capture when your application has its own clock: a GPU vsync loop, audio callback, timeline, or mixer. Video capture returns the frame appropriate for the requested time base, and audio capture can resample to the requested output shape.
@@ -172,6 +285,22 @@ let audio = frame_sync.capture_audio_ref(request)?;
 println!("audio: {} channels at {} Hz", audio.num_channels(), audio.sample_rate());
 ```
 
+For an interleaved playback sink, convert the borrowed output directly:
+
+```rust
+use grafton_ndi::audio_conversion::AudioConverter;
+let converter = AudioConverter::new(&ndi)?;
+let mut interleaved = vec![0.0f32; 2 * 1024]; // allocate once, reuse each tick
+let audio = frame_sync.capture_audio_ref(request)?;
+let written = converter.to_interleaved_f32(&audio, &mut interleaved)?;
+// Submit interleaved[..written] to the audio sink at its playback cadence.
+```
+
+The complete [`framesync_audio_playback`](../examples/framesync_audio_playback.rs)
+example writes clocked interleaved PCM to stdout, with reusable output storage
+and no intermediate owned planar frame. Its software timer demonstrates the
+pipeline; a real device's callback supplies the playback clock.
+
 An audio capture always returns samples in the requested shape. FrameSync can
 insert silence whenever current input is unavailable, including after input
 previously worked. Source-provided all-zero samples are also valid input.
@@ -191,6 +320,52 @@ video or audio capture: a raw audio capture beside a FrameSync would take audio
 frames that the FrameSync then replaces with silence. Use
 `frame_sync.into_receiver()` to recover an ordinary `Receiver` with raw video
 and audio capture.
+
+With `advanced` enabled, `frame_sync.controls()` reaches the receiver's
+exclusive stream/tier controls and KVM without exposing a mutable receiver.
+A refused or redundant stream change remains `SettingChange::Unchanged` and
+need not clear the synchronizer's cached output. To hold remote input while
+clocked output continues, split capture from receiver controls:
+
+```rust
+use grafton_ndi::{FrameSync, FrameSyncAudioRequest, ScanType};
+use grafton_ndi::advanced::MouseButton;
+
+fn drag(sync: &mut FrameSync) -> grafton_ndi::Result<()> {
+    let (capture, controls) = sync.split();
+    let mut session = controls.kvm()?;
+    session.mouse_down(MouseButton::Left)?;
+    let video = capture.capture_video_ref(ScanType::Progressive)?;
+    let audio = capture.capture_audio_ref(FrameSyncAudioRequest::capture_at(48_000, 2, 480)?)?;
+    session.move_pointer(0.75, 0.5)?;
+    session.release_all()?;
+    drop((video, audio));
+    Ok(())
+}
+```
+
+Creating the views makes no SDK call or allocation. Their capture costs and
+threading preserve the owner's contracts. Split views stay on the borrowing
+thread, keeping exclusive stream changes sequenced with capture. Share the
+complete FrameSync for concurrent capture instead. Returned frame guards also
+remain on their capture thread. Release all held inputs before changing source,
+and drop the views, sessions and frames before recovering the receiver.
+
+The receiver operation matrix is:
+
+| Owner | Raw capture through `receiver()` | Media output | Exclusive controls with `advanced` |
+| --- | --- | --- | --- |
+| `Receiver` | Video, audio, metadata and events | Typed or combined capture | Direct receiver methods |
+| `FrameSync` | Metadata and events | Clocked video/audio | `controls()`; `split()` also lends clocked capture |
+| `advanced::AvSync` | Video, metadata and events | Audio matched to video | `controls()`; `split()` also lends synchronization |
+| `advanced::PacketReceiver` | None | `capture()` packets/decoded media/events | `controls()`; KVM sessions also `capture()` |
+| `advanced::AllocatedReceiver` | Video, audio, metadata and events | Typed or combined capture | `controls()` |
+| `advanced::AllocatedPacketReceiver` | None | `capture()` packets/decoded media/events | `controls()`; KVM sessions also `capture()` |
+
+Every owner's `receiver()` retains connection control, diagnostics, tally,
+metadata submission, delay and PTZ operations; Advanced receivers also retain
+keyframe requests. The restricted view reaches setters and KVM on that same
+native receiver. It never permits replacing or recovering an attached receiver.
 
 ### Monitor reception of the expected media
 

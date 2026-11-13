@@ -24,6 +24,15 @@ API, see the [README](README.md) and the migration guides for
 
 ### Added
 
+- Standard receivers capture whichever video, audio, metadata or invalidation
+  arrives next with `capture_any_ref` and `capture_any`. Tokio and smol expose
+  owned combined capture with the same deadline and cancellation rules.
+- Configured finders select a source by exact name or predicate without losing
+  discovery scope. Host caches retain complete feed sets and borrow their finder.
+- FrameSync, AvSync and packet/allocated receivers expose restricted exclusive
+  controls. Synchronizers can split capture from controls so KVM sessions can
+  hold remote input while synchronized output continues.
+
 - Configuration values expose read-only `configured_*()` accessors, and
   `FrameSyncAudioRequest` exposes its validated dimensions, without requiring
   an NDI runtime.
@@ -31,6 +40,18 @@ API, see the [README](README.md) and the migration guides for
   across startup, silence, disconnect and recovery.
 
 ### Changed
+
+- Synchronous video/audio sends and planar-to-interleaved audio conversion
+  consume shared references to validated `VideoSource`/`AudioSource` inputs,
+  including receiver and FrameSync captures. Eligible video sends and strided
+  audio avoid intermediate owned copies; padded video uses reusable safe staging.
+  Copied async video submissions accept the same inputs and retain owned storage.
+- `SourceCache::new(&finder)` and `sources_by_host` replace host-to-first-feed
+  lookup. Addressed sources convert to direct recorder endpoints by default;
+  `SourceSpec::new(name)` explicitly requests logical name discovery.
+- Sender inputs no longer need owned-to-borrowed adapter conversions, and owning
+  receiver wrappers use `controls()` instead of exposing mutable receivers or
+  duplicating exclusive setters.
 
 - Receiver connection targets now follow the latest successful `connect_to`
   request. `connection_target()` replaces `source()` and returns an owned
@@ -52,6 +73,10 @@ API, see the [README](README.md) and the migration guides for
   as failures.
 
 ### Fixed
+
+- Owned and borrowed video builders default to the SDK's square-pixel aspect
+  sentinel (`0.0`), so non-16:9 images display according to their dimensions.
+  Explicit anamorphic overrides and captured aspect values are preserved.
 
 - Receiver video, audio and metadata drop percentages now divide native drops
   by the native received total, which already includes those drops. Existing
