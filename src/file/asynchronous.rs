@@ -784,18 +784,18 @@ type Job<H> = Box<dyn FnOnce(&mut H) + Send + 'static>;
 /// refused like any other command. The queue therefore never holds more than
 /// `capacity + 1` commands.
 struct Admission {
-    waiting: AtomicUsize,
+    // The low bit owns the extra stop place; the remaining bits count normal
+    // places. One atomic word makes admission and release of either kind
+    // indivisible with respect to the queue limit.
+    state: AtomicUsize,
     capacity: usize,
-    /// A request to stop is waiting beyond the capacity.
-    reserve_taken: AtomicBool,
 }
 
 impl Admission {
     fn new(capacity: usize) -> Self {
         Self {
-            waiting: AtomicUsize::new(0),
+            state: AtomicUsize::new(0),
             capacity,
-            reserve_taken: AtomicBool::new(false),
         }
     }
 
@@ -806,18 +806,28 @@ impl Admission {
     /// [`Error::QueueFull`] with [`QueueLimit::FileCommands`] when the queue
     /// is full and, for a request to stop, another one already waits beyond it.
     fn admit(self: &Arc<Self>, stop: bool) -> Result<Place> {
-        let place = |reserve| Place {
-            admission: Arc::clone(self),
-            reserve,
-        };
-        if self.waiting.fetch_add(1, Ordering::AcqRel) < self.capacity {
-            return Ok(place(false));
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            let (next, reserve) = if state >> 1 < self.capacity {
+                (state + 2, false)
+            } else if stop && state & 1 == 0 {
+                (state | 1, true)
+            } else {
+                return Err(Error::QueueFull(QueueLimit::FileCommands));
+            };
+            match self
+                .state
+                .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    return Ok(Place {
+                        admission: Arc::clone(self),
+                        reserve,
+                    });
+                }
+                Err(current) => state = current,
+            }
         }
-        if stop && !self.reserve_taken.swap(true, Ordering::AcqRel) {
-            return Ok(place(true));
-        }
-        self.waiting.fetch_sub(1, Ordering::AcqRel);
-        Err(Error::QueueFull(QueueLimit::FileCommands))
     }
 }
 
@@ -831,9 +841,12 @@ struct Place {
 
 impl Drop for Place {
     fn drop(&mut self) {
-        self.admission.waiting.fetch_sub(1, Ordering::AcqRel);
         if self.reserve {
-            self.admission.reserve_taken.store(false, Ordering::Release);
+            let previous = self.admission.state.fetch_and(!1, Ordering::AcqRel);
+            debug_assert_ne!(previous & 1, 0);
+        } else {
+            let previous = self.admission.state.fetch_sub(2, Ordering::AcqRel);
+            debug_assert_ne!(previous >> 1, 0);
         }
     }
 }
@@ -1950,10 +1963,68 @@ mod tests {
             111
         );
         // Every place was given back, the one beyond the capacity too.
-        assert_eq!(worker.admission.waiting.load(Ordering::Acquire), 0);
-        assert!(!worker.admission.reserve_taken.load(Ordering::Acquire));
+        assert_eq!(worker.admission.state.load(Ordering::Acquire), 0);
         drop(worker);
         dropped.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn a_reserved_stop_does_not_consume_a_normal_queue_place() {
+        let admission = Arc::new(Admission::new(1));
+        let normal = admission.admit(false).unwrap();
+        let reserved = admission.admit(true).unwrap();
+        assert!(matches!(
+            admission.admit(true),
+            Err(Error::QueueFull(QueueLimit::FileCommands))
+        ));
+
+        // The normal command starts while the extra stop still waits.
+        drop(normal);
+        let next_normal = admission.admit(false).unwrap();
+        assert!(matches!(
+            admission.admit(false),
+            Err(Error::QueueFull(QueueLimit::FileCommands))
+        ));
+
+        drop(reserved);
+        let next_reserved = admission.admit(true).unwrap();
+        drop(next_normal);
+        drop(next_reserved);
+        assert_eq!(admission.state.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn concurrent_admissions_never_exceed_the_queue_and_one_stop() {
+        use std::sync::Barrier;
+
+        const CAPACITY: usize = 2;
+        const THREADS: usize = 8;
+        let admission = Arc::new(Admission::new(CAPACITY));
+        let active = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(THREADS));
+        thread::scope(|scope| {
+            for thread_index in 0..THREADS {
+                let admission = Arc::clone(&admission);
+                let active = Arc::clone(&active);
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..2_000 {
+                        if let Ok(place) = admission.admit(thread_index % 2 == 0) {
+                            let count = active.fetch_add(1, Ordering::AcqRel) + 1;
+                            assert!(count <= CAPACITY + 1, "admitted {count} commands");
+                            thread::yield_now();
+                            active.fetch_sub(1, Ordering::AcqRel);
+                            drop(place);
+                        } else {
+                            thread::yield_now();
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert_eq!(admission.state.load(Ordering::Acquire), 0);
     }
 
     /// Captured by a command that never runs: the owner thread drops it with
