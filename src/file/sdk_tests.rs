@@ -13,7 +13,7 @@ use crate::{
 };
 use std::{
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -210,6 +210,117 @@ fn await_event(recorder: &mut FileRecorder, kind: RecorderEventKind) -> Recorder
     panic!("no {kind:?} event arrived");
 }
 
+/// The events a test has taken from a recorder, with the time each arrived.
+///
+/// A test waits on it for an event about one particular file, whatever order
+/// the SDK reports the events of a rollover in, and prints it when a check
+/// fails, so that the failure says what the SDK reported and when.
+struct Timeline {
+    began: Instant,
+    events: Vec<(Duration, RecorderEvent)>,
+}
+
+impl Timeline {
+    fn new() -> Self {
+        Self {
+            began: Instant::now(),
+            events: Vec::new(),
+        }
+    }
+
+    /// Where the events that follow an operation begin.
+    fn mark(&self) -> usize {
+        self.events.len()
+    }
+
+    /// The path of the first event of `kind` at or after `since`, about
+    /// `file` when one is given. Polls `recorder` until such an event
+    /// arrives, failing on a recorder error.
+    fn await_event(
+        &mut self,
+        recorder: &mut FileRecorder,
+        since: usize,
+        kind: RecorderEventKind,
+        file: Option<&Path>,
+    ) -> PathBuf {
+        let deadline = Instant::now() + PATIENCE;
+        let mut checked = since;
+        loop {
+            for (_, event) in &self.events[checked..] {
+                let path = PathBuf::from(event.path().to_string_lossy().into_owned());
+                if event.kind() == kind && file.is_none_or(|file| file == path) {
+                    return path;
+                }
+            }
+            checked = self.events.len();
+            assert!(
+                Instant::now() < deadline,
+                "no {kind:?} event for {file:?} arrived; the recorder reported:\n{self}"
+            );
+            if let Some(event) = recorder.poll_event(Duration::from_millis(50)).unwrap() {
+                let failed = matches!(
+                    event.kind(),
+                    RecorderEventKind::Error | RecorderEventKind::OpenFailed
+                );
+                self.events.push((self.began.elapsed(), event));
+                assert!(!failed, "the recorder failed:\n{self}");
+            }
+        }
+    }
+
+    /// Wait until a change of file requested at `since` has run its course:
+    /// the SDK reported the file it opened, the file it `left` closed, and the
+    /// first frame written to the new one, which it returns. A test that goes
+    /// on only then never overlaps the next change, or its stop, with this one.
+    fn await_change(&mut self, recorder: &mut FileRecorder, since: usize, left: &Path) -> PathBuf {
+        let next = self.await_event(recorder, since, RecorderEventKind::Rollover, None);
+        self.await_event(recorder, since, RecorderEventKind::FileClosed, Some(left));
+        self.await_event(recorder, since, RecorderEventKind::FirstFrame, Some(&next));
+        assert_eq!(recorder.state(), RecorderState::Recording, "{self}");
+        next
+    }
+}
+
+impl std::fmt::Display for Timeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (at, event) in &self.events {
+            writeln!(
+                f,
+                "  {at:?} {:?} {} {:?}",
+                event.kind(),
+                event.path().to_string_lossy(),
+                event.message().to_string_lossy()
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Fail because `file`, which the SDK reported closed, is not finalized.
+///
+/// Before failing it keeps probing for as long as a test waits for anything,
+/// so that the message tells a finalization that came after the file was
+/// reported closed from one that never came.
+fn panic_unfinalized(api: &FileApi, file: &Path, info: &FileInfo, timeline: &Timeline) -> ! {
+    let reported = Instant::now();
+    let bytes = std::fs::metadata(file).map(|metadata| metadata.len());
+    let later = loop {
+        if api.probe(file).is_ok_and(|info| info.duration().is_final()) {
+            break format!("a probe found it finalized {:?} later", reported.elapsed());
+        }
+        if reported.elapsed() >= PATIENCE {
+            break format!("it was still not finalized {PATIENCE:?} later");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    panic!(
+        "{} was reported closed but is not finalized: duration {} ticks, {bytes:?} bytes; \
+         {later}. The recorder reported:\n{timeline}",
+        file.display(),
+        info.duration().value().ticks()
+    );
+}
+
 /// Record a short clip of `source` to `file` and return its report.
 fn record_clip(api: &FileApi, source: &LiveSource, file: &PathBuf) -> RecordingReport {
     let mut recorder = api.create_recorder(&exact_video(source)).unwrap();
@@ -341,30 +452,50 @@ fn rollovers_and_a_source_switch_end_in_a_confirmed_close_of_every_file() {
         .proxy(false)
         .tracks(MediaTypes::VIDEO);
     let mut recorder = api.create_recorder(&options).unwrap();
+    let mut timeline = Timeline::new();
+    let started = timeline.mark();
     recorder
         .start(
             &RecordingTarget::new(scratch.path("first")).unwrap(),
             RecordingTimecode::Preserve,
         )
         .unwrap();
-    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+    let first = timeline.await_event(&mut recorder, started, RecorderEventKind::Started, None);
+    timeline.await_event(
+        &mut recorder,
+        started,
+        RecorderEventKind::FirstFrame,
+        Some(&first),
+    );
 
+    let since = timeline.mark();
     recorder
         .rollover(&RecordingTarget::new(scratch.path("second")).unwrap())
         .unwrap();
-    await_event(&mut recorder, RecorderEventKind::FirstFrame);
+    let second = timeline.await_change(&mut recorder, since, &first);
+    let since = timeline.mark();
     recorder.set_source(&source.spec).unwrap();
-    await_event(&mut recorder, RecorderEventKind::FirstFrame);
-    assert_eq!(recorder.state(), RecorderState::Recording);
+    let third = timeline.await_change(&mut recorder, since, &second);
+    let files = [first, second, third];
 
     let outcome = recorder.finish(PATIENCE).unwrap();
     let FinishStatus::Closed(report) = outcome else {
-        panic!("the session did not reach a confirmed close: {outcome:?}");
+        panic!("the session did not reach a confirmed close: {outcome:?}\n{timeline}");
     };
-    assert_eq!(report.closed_files(), 3);
-    for entry in std::fs::read_dir(&scratch.0).unwrap() {
-        let file = entry.unwrap().path();
-        assert!(api.probe(&file).unwrap().duration().is_final(), "{file:?}");
+    assert_eq!(report.closed_files(), 3, "{timeline}");
+    let mut written: Vec<_> = std::fs::read_dir(&scratch.0)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    written.sort();
+    let mut reported = files.to_vec();
+    reported.sort();
+    assert_eq!(written, reported, "the files on disk:\n{timeline}");
+    for file in &files {
+        let info = api.probe(file).unwrap();
+        if !info.duration().is_final() {
+            panic_unfinalized(&api, file, &info, &timeline);
+        }
     }
 }
 
