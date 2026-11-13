@@ -151,6 +151,9 @@ support scoped worker threads; FrameSync frame guards remain on their capture th
 Video, audio and standalone metadata copies retain text capacity, so changing
 metadata lengths needs no allocation when the destination holds the text and
 its trailing NUL. Absent video/audio metadata releases its text storage.
+Video/audio builders and metadata constructors also retain an owned metadata
+string's allocation when its capacity holds the trailing NUL; otherwise they
+grow it once. Invalid settings return builders with their original storage.
 
 ### Receive whichever media arrives next
 

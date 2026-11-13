@@ -116,7 +116,7 @@ impl Pixels {
         }
     }
 
-    /// The first pixel. `len` bytes and then [`Self::tail_room`] zero bytes
+    /// The first pixel. `len` bytes and then `tail` zero bytes
     /// are readable from it, until the storage is next changed or dropped.
     pub(crate) fn as_ptr(&self) -> *const u8 {
         self.bytes.as_ptr()
@@ -133,6 +133,7 @@ impl Pixels {
     }
 
     /// The number of zero bytes that follow the pixels.
+    #[cfg(test)]
     pub(crate) fn tail_room(&self) -> usize {
         self.tail
     }

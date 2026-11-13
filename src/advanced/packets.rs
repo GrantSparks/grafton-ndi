@@ -1,12 +1,12 @@
 //! Compressed frames and the packet envelope that frames H.264, HEVC and AAC
 //! payloads on the wire.
 
-use std::ffi::{c_char, CString};
+use std::ffi::c_char;
 
 use super::{aliasable::AliasableVec, descriptors, invalid_frame, sdk_quantity};
 use crate::{
-    sys::bindings::*, Error, FourCc, FrameRate, Rejected, Result, ScanType, SdkTimestamp,
-    StreamTier, Timecode,
+    frames::FrameMetadata, sys::bindings::*, Error, FourCc, FrameRate, Rejected, Result, ScanType,
+    SdkTimestamp, StreamTier, Timecode,
 };
 
 /// Maximum compressed frame size, in bytes, that this module sends or accepts.
@@ -719,14 +719,6 @@ impl VideoPacketFormat {
     }
 }
 
-/// Text attached to a frame, checked against the frame metadata limit.
-pub(crate) fn frame_metadata(value: String) -> Result<CString> {
-    if value.len() >= crate::frames::MAX_METADATA_BYTES {
-        return Err(invalid_frame("Packet metadata exceeds its size limit"));
-    }
-    Ok(CString::new(value)?)
-}
-
 /// The timecode, timestamp and metadata every compressed and scatter frame
 /// carries, with the single checked way to set the metadata.
 ///
@@ -736,7 +728,7 @@ pub(crate) fn frame_metadata(value: String) -> Result<CString> {
 pub(crate) struct FrameExtras {
     timecode: Timecode,
     timestamp: Option<SdkTimestamp>,
-    metadata: Option<CString>,
+    metadata: Option<FrameMetadata>,
 }
 
 impl FrameExtras {
@@ -750,7 +742,8 @@ impl FrameExtras {
             timecode: Timecode::from_ticks(timecode),
             timestamp: SdkTimestamp::from_sdk(timestamp),
             // SAFETY: forwarded to the caller's obligation.
-            metadata: unsafe { copy_metadata(metadata)? },
+            metadata: unsafe { crate::frames::validate_frame_metadata(metadata)? }
+                .map(|text| FrameMetadata::copy_from(text, None)),
         })
     }
 
@@ -766,15 +759,14 @@ impl FrameExtras {
 
     /// The metadata text, if any.
     pub(crate) fn metadata(&self) -> Option<&str> {
-        // Metadata is only ever stored from a `String` or from validated UTF-8.
-        self.metadata.as_deref().and_then(|text| text.to_str().ok())
+        self.metadata.as_ref().map(FrameMetadata::as_str)
     }
 
-    /// Bytes the metadata keeps allocated, terminator included.
+    /// Bytes the metadata keeps allocated, including terminator and spare capacity.
     pub(crate) fn retained_bytes(&self) -> usize {
         self.metadata
             .as_ref()
-            .map_or(0, |metadata| metadata.as_bytes_with_nul().len())
+            .map_or(0, FrameMetadata::retained_bytes)
     }
 
     /// The timecode, timestamp and metadata fields of a native descriptor.
@@ -807,7 +799,7 @@ pub(crate) fn attach_metadata<T: HasExtras>(
     mut frame: T,
     value: String,
 ) -> std::result::Result<T, Rejected<T>> {
-    match frame_metadata(value) {
+    match FrameMetadata::new(value) {
         Ok(metadata) => {
             frame.extras_mut().metadata = Some(metadata);
             Ok(frame)
@@ -1385,17 +1377,6 @@ impl CompressedAudioFrame {
     }
 }
 
-/// Copy a frame's metadata text.
-///
-/// # Safety
-///
-/// `pointer` is null or a readable NUL-terminated string.
-unsafe fn copy_metadata(pointer: *const c_char) -> Result<Option<CString>> {
-    // SAFETY: forwarded to the caller's obligation, for the copy below.
-    let text = unsafe { crate::frames::validate_frame_metadata(pointer)? };
-    Ok(text.map(CString::from))
-}
-
 /// The bytes of a compressed native frame.
 ///
 /// # Safety
@@ -1886,6 +1867,59 @@ mod tests {
         assert_eq!(frame.metadata(), None);
         let frame = frame.with_metadata("<ok/>").unwrap();
         assert_eq!(frame.metadata(), Some("<ok/>"));
+    }
+
+    #[test]
+    fn compressed_and_scatter_metadata_retain_owned_storage() {
+        use crate::advanced::{ScatterAudioFrame, ScatterVideoFrame};
+
+        fn check<F: HasExtras + std::fmt::Debug>(frame: F) {
+            let mut text = String::with_capacity(1024);
+            text.push_str("<metadata label='é'/>");
+            let (pointer, capacity) = (text.as_ptr(), text.capacity());
+            let (mut frame, allocations) =
+                crate::test_alloc::allocation_count(|| attach_metadata(frame, text).unwrap());
+            assert_eq!(allocations, 0);
+            let extras = frame.extras_mut();
+            assert_eq!(extras.metadata().unwrap().as_ptr(), pointer);
+            assert_eq!(extras.retained_bytes(), capacity);
+            assert_eq!(extras.to_sdk().2.cast::<u8>(), pointer);
+
+            let mut frame = attach_metadata(frame, "bad\0metadata".into())
+                .unwrap_err()
+                .into_inner();
+            assert_eq!(frame.extras_mut().metadata(), Some("<metadata label='é'/>"));
+            assert_eq!(frame.extras_mut().metadata().unwrap().as_ptr(), pointer);
+            assert_eq!(frame.extras_mut().retained_bytes(), capacity);
+        }
+
+        let format = VideoPacketFormat::new(VideoCodec::SpeedHq422, 18, 6).unwrap();
+        check(CompressedVideoFrame::new(format, vec![0; 4]).unwrap());
+        check(ScatterVideoFrame::new(format, vec![vec![0; 4]]).unwrap());
+        check(CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1]).unwrap());
+        check(ScatterAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![vec![1]]).unwrap());
+    }
+
+    #[test]
+    fn received_metadata_preserves_presence_and_rejects_invalid_utf8() {
+        // SAFETY: all non-null pointers below name live terminated byte strings.
+        unsafe {
+            let absent = FrameExtras::received(123, 456, std::ptr::null()).unwrap();
+            assert_eq!(absent.metadata(), None);
+            assert!(absent.to_sdk().2.is_null());
+            for text in [c"", c"<received/>"] {
+                let extras = FrameExtras::received(123, 456, text.as_ptr()).unwrap();
+                assert_eq!(extras.metadata(), Some(text.to_str().unwrap()));
+                assert_eq!(extras.retained_bytes(), text.to_bytes_with_nul().len());
+                assert_eq!(std::ffi::CStr::from_ptr(extras.to_sdk().2), text);
+                assert_eq!(extras.timecode().ticks(), 123);
+                assert_eq!(extras.timestamp().unwrap().ticks(), 456);
+            }
+            assert!(matches!(
+                FrameExtras::received(123, 456, c"\xff".as_ptr()),
+                Err(Error::InvalidUtf8(_))
+            ));
+        }
     }
 
     #[test]

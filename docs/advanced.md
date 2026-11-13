@@ -261,13 +261,13 @@ reports it sent, so submission does not wait for a slow connection.
 
 - It takes uncompressed `VideoFrame`s and `CompressedVideoFrame`s, both as a
   `QueuedVideoFrame`.
-- Submission moves owned pixels and metadata and does not scan retained frames.
-  It allocates a native descriptor; an uncompressed frame can also grow its
-  pixel allocation when its scan type requires extra SDK tail room.
+- Submission moves owned pixels and metadata without copies or growth and does
+  not scan retained frames. It allocates a native descriptor; owned uncompressed
+  frames already hold their complete SDK tail room.
 - `QueueOptions` bounds the queue by frame count and by bytes. A frame counts
   from submission until the application takes it back. The byte budget includes
   unused retained payload capacity, including spare capacity in compressed
-  vectors. The defaults are 8 frames and 512 MiB.
+  vectors and metadata strings. The defaults are 8 frames and 512 MiB.
 - `try_submit` returns a `SubmissionId`, or returns the frame in a `Rejected`.
   Its error is `Error::QueueFull` when the frame would take the queue past its
   frame or byte limit (`QueueLimit::Frames` or `QueueLimit::Bytes`): collect

@@ -435,7 +435,7 @@ impl in_flight::Lend for VideoFrame {
     /// which holds the room the SDK reads after them, and its metadata
     /// `CString`; moving the frame moves neither.
     fn lend(&mut self) -> in_flight::Lent {
-        in_flight::Lent::Frame(self.lend_raw())
+        in_flight::Lent::Frame(self.to_raw())
     }
 }
 
@@ -2379,6 +2379,61 @@ mod tests {
             sender.send_video(&owned).unwrap();
         });
         assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn owned_video_preparation_preserves_storage_for_every_scan_type() {
+        for format in PixelFormat::ALL {
+            for height in [4, 6] {
+                for scan in ScanType::ALL {
+                    let frame = VideoFrame::builder()
+                        .resolution(18, height)
+                        .pixel_format(format)
+                        .scan_type(scan)
+                        .metadata("<owned/>")
+                        .build()
+                        .unwrap();
+                    let mut staging = Pixels::default();
+                    let (raw, allocations) = crate::test_alloc::allocation_count(|| {
+                        PreparedVideo::new(&frame, &mut staging).raw
+                    });
+                    assert_eq!(allocations, 0, "{format:?} {height} {scan:?}");
+                    assert_eq!(raw.p_data.cast_const(), frame.data().as_ptr());
+                    assert_eq!(raw.p_metadata, frame.to_raw().p_metadata);
+                    assert_eq!(raw.frame_format_type, scan.to_sdk());
+                    assert!(staging.as_slice().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode owned video preparation benchmark"]
+    fn benchmark_owned_video_preparation() {
+        use std::{hint::black_box, time::Instant};
+        for format in [PixelFormat::Uyvy, PixelFormat::Uyva] {
+            for (width, height) in [(720, 486), (1920, 1082), (3840, 2162)] {
+                let frame = VideoFrame::builder()
+                    .resolution(width, height)
+                    .pixel_format(format)
+                    .scan_type(ScanType::Interlaced)
+                    .build()
+                    .unwrap();
+                let mut staging = Pixels::default();
+                black_box(PreparedVideo::new(&frame, &mut staging));
+                let start = Instant::now();
+                for _ in 0..200 {
+                    black_box(PreparedVideo::new(
+                        black_box(&frame),
+                        black_box(&mut staging),
+                    ));
+                }
+                eprintln!(
+                    "{format:?} {width}x{height}: {:.3} us/frame",
+                    start.elapsed().as_secs_f64() * 1_000_000.0 / 200.0
+                );
+            }
+        }
     }
 
     #[test]

@@ -134,7 +134,7 @@ impl QueuedVideoFrame {
     /// to a compressed frame's bytes for as long as it holds the descriptor.
     fn raw(&mut self) -> NDIlib_video_frame_v2_t {
         match self {
-            Self::Pixels(v) => v.lend_raw(),
+            Self::Pixels(v) => v.to_raw(),
             Self::Compressed(v) => v.raw(),
         }
     }
@@ -480,9 +480,9 @@ impl QueuedSender {
     /// The queue owns the frame until it is collected: the SDK writes to a
     /// compressed frame's bytes while it sends them. A collected frame can be
     /// submitted again. Submission does not scan previously submitted frames.
-    /// It allocates one retained native descriptor. Lending an uncompressed
-    /// frame can also grow its pixel allocation to provide the SDK tail room
-    /// its scan type needs; otherwise pixels and metadata move without copies.
+    /// It allocates one retained native descriptor. Pixels and metadata move
+    /// without copies or growth; owned uncompressed frames already hold all
+    /// SDK tail room their layout and scan type need.
     ///
     /// # Errors
     ///
@@ -511,7 +511,6 @@ impl QueuedSender {
                 frame,
             ));
         }
-        // Lending can grow a frame's pixel allocation: count it afterwards.
         let header = AliasableBox::new(Box::new(frame.raw()));
         let bytes = frame.retained_bytes();
         let key = header.p_data as usize;

@@ -186,8 +186,8 @@ fn frames_that_end_where_memory_ends_are_sent() {
                 for _ in 0..2 {
                     sender.send_video(&frame).unwrap();
                 }
-                // The copies these make are owned frames, which hold the
-                // room or are given it when lent.
+                // Every owned copy already holds the complete scan-dependent
+                // room, so sending never needs to grow its allocation.
                 let owned = frame.to_owned();
                 sender.send_video(&owned).unwrap();
                 sender.send_video_async_copy(&frame).unwrap();

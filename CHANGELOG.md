@@ -11,6 +11,16 @@ API, see the [README](README.md) and the migration guides for
 
 ## [Unreleased]
 
+### Fixed
+
+- Owned video frames keep complete scan-dependent SDK tail room after
+  construction, copying, pixel replacement and scan-type changes. Synchronous
+  sends avoid full-frame staging, and asynchronous sends no longer grow pixels
+  during submission.
+- Video/audio builders and standalone, compressed and scatter metadata retain
+  owned string capacity. Advanced frames reuse validated metadata without UTF-8
+  rescans; queued sends charge its full retained capacity to their byte budget.
+
 ## [3.0.0] - 2026-11-13
 
 Version 3.0.0 loads the NDI library when the program selects a runtime instead

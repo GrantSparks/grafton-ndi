@@ -294,6 +294,29 @@ with it against direct sending of the same frame with room: 0.15 ms longer at 12
 at 1920×1080 and 1.1 ms at 3840×2160 with the 6.3.2 and 6.4.0.2 runtimes, in
 a release build on Linux x86-64: 18%, 15% and 54% of the send.
 
+Owned frames establish their complete scan-dependent room during construction,
+copying, pixel replacement and scan-type changes. This removes a full-frame
+staging copy that synchronous sends previously made for interlaced or
+single-field UYVY/UYVA with heights not divisible by four, and removes deferred
+allocation growth from asynchronous submission. Pointer-identity and allocation
+tests cover every pixel format and scan type, including reused destinations.
+
+On Linux x86-64, Xeon w7-2475X, Rust 1.100.0, a release measurement over 200
+preparations after warming staging gave the following microseconds per frame.
+This measures wrapper preparation only, excluding SDK encoding and construction:
+
+| Format | Resolution | Before | After |
+| --- | --- | ---: | ---: |
+| UYVY | 720×486 | 16.7 | <0.1 |
+| UYVY | 1920×1082 | 138.8 | <0.1 |
+| UYVY | 3840×2162 | 613.2 | <0.1 |
+| UYVA | 720×486 | 19.9 | <0.1 |
+| UYVA | 1920×1082 | 271.0 | <0.1 |
+| UYVA | 3840×2162 | 884.8 | <0.1 |
+
+Reproduce with
+`cargo test --locked --release --lib benchmark_owned_video_preparation -- --ignored --nocapture`.
+
 The final packed staging path was benchmarked on 2026-11-13 in a release
 build with Rust 1.99.1 on Linux x86-64, over 200 frames after warming the
 reused allocation. These are wrapper staging times per frame, excluding SDK

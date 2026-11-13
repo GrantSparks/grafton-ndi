@@ -410,6 +410,38 @@ fn child(case: &str) {
             ));
             assert_eq!(small.retained_frames(), 0);
             assert_eq!(log().matches("sender-submit-return\n").count(), 2);
+
+            // Compressed metadata retains its caller's string allocation;
+            // unused capacity must count towards the queue limit too.
+            use grafton_ndi::advanced::{CompressedVideoFrame, VideoCodec, VideoPacketFormat};
+            let mut metadata = String::with_capacity(1024);
+            metadata.push_str("<pooled/>");
+            let metadata_pointer = metadata.as_ptr();
+            let packet = CompressedVideoFrame::new(
+                VideoPacketFormat::new(VideoCodec::SpeedHq422, 16, 16).unwrap(),
+                vec![0; 4],
+            )
+            .unwrap()
+            .with_metadata(metadata)
+            .unwrap();
+            let mut bounded = QueuedSender::new(
+                &ndi,
+                &SenderOptions::new("queue metadata capacity"),
+                QueueOptions::default().max_bytes(512),
+            )
+            .unwrap();
+            let rejected = bounded.try_submit(packet).unwrap_err();
+            assert!(matches!(
+                rejected.error(),
+                Error::QueueFull(QueueLimit::Bytes)
+            ));
+            let grafton_ndi::advanced::QueuedVideoFrame::Compressed(packet) = rejected.into_inner()
+            else {
+                panic!("the rejected frame changed type");
+            };
+            assert_eq!(packet.metadata().unwrap().as_ptr(), metadata_pointer);
+            assert_eq!(bounded.retained_frames(), 0);
+            assert_eq!(log().matches("sender-submit-return\n").count(), 2);
         }
         #[cfg(feature = "advanced")]
         "queue_backlog" => {

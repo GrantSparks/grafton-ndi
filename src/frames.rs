@@ -386,10 +386,10 @@ impl PixelFormat {
     /// The crate keeps this room for the SDK, and fills it with zeros, so a
     /// program needs the number only to avoid a copy or a reallocation:
     ///
-    /// - A [`VideoFrame`] has the room. A frame allocates its pixels with
-    ///   it, and a vector given to [`VideoFrameBuilder::data`] or
-    ///   [`VideoFrame::replace_data`] is grown once when its spare capacity
-    ///   is smaller.
+    /// - A [`VideoFrame`] has the complete room for its layout and scan
+    ///   type. Construction, copying, pixel replacement and scan-type
+    ///   changes grow its allocation when necessary, so sending it needs
+    ///   no wrapper pixel copy or reallocation.
     /// - [`Sender::send_video`](crate::Sender::send_video) sends a
     ///   [`BorrowedVideoFrame`](crate::BorrowedVideoFrame) through a packed,
     ///   zero-tailed copy by default when this room is nonzero. Direct sending
@@ -404,8 +404,9 @@ impl PixelFormat {
     /// One kind of frame needs two rows more, twice the line stride: an
     /// interlaced or single-field UYVY or UYVA frame whose height is not a
     /// multiple of four, which the SDK reads as far as the row after next.
-    /// The crate sends such a frame from a copy unless its buffer has that
-    /// room too.
+    /// Owned frames keep these extra rows too. A borrowed frame is sent
+    /// from a copy unless its buffer has that room and direct sending was
+    /// explicitly enabled.
     ///
     /// # Examples
     ///
@@ -740,7 +741,7 @@ pub(crate) trait VideoParts {
         let metadata = self
             .metadata_text()
             .map(|text| FrameMetadata::copy_from(text, None));
-        let room = packed.pixel_format.send_tail_room();
+        let room = crate::pixels::send_room(&packed, self.header().scan_type);
         packed_video(
             self,
             packed,
@@ -754,7 +755,7 @@ pub(crate) trait VideoParts {
     ///
     /// `destination` becomes exactly the frame [`Self::owned_copy`] returns,
     /// whatever it held before. Its pixel buffer is reused when its capacity
-    /// holds the packed frame and the format's
+    /// holds the packed frame and its scan-dependent SDK
     /// [room](PixelFormat::send_tail_room), and otherwise replaced without
     /// copying its old contents; its metadata string is reused as
     /// [`FrameMetadata::copy_from`] describes.
@@ -766,7 +767,7 @@ pub(crate) trait VideoParts {
     fn copy_into_owned(&self, destination: &mut VideoFrame) {
         let packed = self.layout().packed();
         let len = packed.data_len_bytes;
-        let room = packed.pixel_format.send_tail_room();
+        let room = crate::pixels::send_room(&packed, self.header().scan_type);
         let replacement =
             (!destination.data.holds(len, room)).then(|| Pixels::with_room(len, room));
         let storage = destination.metadata.take();
@@ -902,7 +903,7 @@ pub trait VideoSource: VideoParts {
 }
 
 /// The owned copy of `source`: `packed`, its packed layout, with `data`,
-/// which holds `packed` and its format's [room](PixelFormat::send_tail_room),
+/// which holds `packed` and its scan-dependent [room](PixelFormat::send_tail_room),
 /// filled with every plane's active rows. Every owned video copy is made
 /// here. Filling storage that holds the copy neither allocates nor panics.
 fn packed_video<P: VideoParts + ?Sized>(
@@ -911,7 +912,7 @@ fn packed_video<P: VideoParts + ?Sized>(
     mut data: Pixels,
     metadata: Option<FrameMetadata>,
 ) -> VideoFrame {
-    let room = packed.pixel_format.send_tail_room();
+    let room = crate::pixels::send_room(&packed, source.header().scan_type);
     source.copy_active_pixels(&mut data, &packed, room);
 
     VideoFrame {
@@ -1344,14 +1345,14 @@ pub(crate) use video_accessors;
 ///
 /// The allocation that holds the pixels also holds the
 /// [room](PixelFormat::send_tail_room) the SDK needs after a frame of this
-/// format, so an owned frame is sent in place. The one frame that needs more
-/// room, an interlaced or single-field UYVY or UYVA frame whose height is
-/// not a multiple of four, is given it when it is sent.
+/// layout and scan type, so an owned frame is sent in place. Construction,
+/// copies, pixel replacement and scan-type changes preserve this invariant;
+/// sending requires no pixel copy or allocation growth.
 #[derive(Clone)]
 pub struct VideoFrame {
     layout: ValidatedVideoLayout,
     header: VideoHeader,
-    /// The pixels, with the room of the layout's format after them.
+    /// The pixels, followed by the room required by the layout and scan type.
     data: Pixels,
     metadata: Option<FrameMetadata>,
     timestamp: Option<SdkTimestamp>,
@@ -1382,7 +1383,9 @@ impl VideoParts for VideoFrame {
     }
 
     fn can_send_direct(&self) -> bool {
-        self.tail_room() >= crate::pixels::send_room(&self.layout, self.header.scan_type)
+        // Every construction and mutation preserves the complete initialized
+        // SDK read extent, including the current scan type's extra rows.
+        true
     }
 }
 
@@ -1443,20 +1446,8 @@ impl VideoFrame {
         self.data.capacity().saturating_add(
             self.metadata
                 .as_ref()
-                .map_or(0, |metadata| metadata.inner.capacity()),
+                .map_or(0, FrameMetadata::retained_bytes),
         )
-    }
-
-    /// The SDK descriptor that lends this frame to an asynchronous send,
-    /// after giving its pixels the [room](crate::pixels::send_room) the SDK
-    /// needs with the frame's present scan type. Only a frame whose scan
-    /// type asks for more than its format's room is grown, once.
-    pub(crate) fn lend_raw(&mut self) -> NDIlib_video_frame_v2_t {
-        self.data.reserve_room(crate::pixels::send_room(
-            &self.layout,
-            self.header.scan_type,
-        ));
-        self.to_raw()
     }
 
     /// The SDK descriptor of this frame, borrowing its pixels and metadata.
@@ -1470,7 +1461,13 @@ impl VideoFrame {
     }
 
     /// Set the scan type without changing the frame's validated layout.
+    ///
+    /// Grows the pixel allocation if this scan type needs more SDK tail
+    /// room. Existing capacity is reused and never shrunk, so switching
+    /// among scan types allocates at most once after construction.
     pub fn set_scan_type(&mut self, scan_type: ScanType) {
+        self.data
+            .reserve_room(crate::pixels::send_room(&self.layout, scan_type));
         self.header.scan_type = scan_type;
     }
 
@@ -1517,7 +1514,10 @@ impl VideoFrame {
         if let Err(error) = check_video_data_len(&self.layout, data.len()) {
             return Err(Rejected::new(error, data));
         }
-        let replacement = Pixels::adopt(data, self.layout.pixel_format.send_tail_room());
+        let replacement = Pixels::adopt(
+            data,
+            crate::pixels::send_room(&self.layout, self.header.scan_type),
+        );
         Ok(std::mem::replace(&mut self.data, replacement).into_vec())
     }
 
@@ -1528,7 +1528,8 @@ impl VideoFrame {
     }
 
     /// The zero bytes that follow the pixels in the frame's allocation for
-    /// the SDK to read: the format's room.
+    /// the SDK to read, including any scan-dependent extra rows.
+    #[cfg(test)]
     pub(crate) fn tail_room(&self) -> usize {
         self.data.tail_room()
     }
@@ -1536,8 +1537,9 @@ impl VideoFrame {
     /// Replace the owned frame data while preserving the validated layout.
     ///
     /// The frame keeps `data`'s allocation when its spare capacity holds the
-    /// format's [room](PixelFormat::send_tail_room), which is nothing for
-    /// most formats, and otherwise grows it once, which may move the pixels.
+    /// layout and scan type's [room](PixelFormat::send_tail_room), which is
+    /// nothing for most formats, and otherwise grows it once, which may move
+    /// the pixels.
     ///
     /// # Errors
     ///
@@ -1611,7 +1613,10 @@ impl VideoFrame {
                 scan_type: ScanType::Progressive,
                 timecode: Timecode::from_ticks(0),
             },
-            data: Pixels::adopt(data, pixel_format.send_tail_room()),
+            data: Pixels::adopt(
+                data,
+                crate::pixels::send_room(&layout, ScanType::Progressive),
+            ),
             metadata: metadata.map(|text| FrameMetadata::new(text).unwrap()),
             timestamp: None,
         }
@@ -1694,6 +1699,8 @@ impl VideoFrameBuilder {
     }
 
     /// Set the metadata text.
+    /// An owned string retains its allocation when there is capacity for
+    /// the trailing NUL; invalid metadata leaves a rejected builder unchanged.
     #[must_use]
     pub fn metadata<S: Into<String>>(mut self, metadata: S) -> Self {
         self.metadata = Some(metadata.into());
@@ -1703,8 +1710,8 @@ impl VideoFrameBuilder {
     /// Supply owned pixels without an intermediate zero-filled allocation.
     ///
     /// `build` requires exactly the validated layout size. The frame keeps
-    /// this allocation when its spare capacity holds the format's
-    /// [room](PixelFormat::send_tail_room), which is nothing for most
+    /// this allocation when its spare capacity holds the layout and scan
+    /// type's [room](PixelFormat::send_tail_room), which is nothing for most
     /// formats, and otherwise grows it once, which may move the pixels. Use
     /// `data_mut` on the resulting frame for reuse.
     #[must_use]
@@ -1763,8 +1770,8 @@ impl VideoFrameBuilder {
     /// length do not form a
     /// valid frame, and [`Error::InvalidCString`] for metadata containing a
     /// NUL byte.
-    pub fn build(self) -> std::result::Result<VideoFrame, Rejected<Self>> {
-        let validate = || -> Result<_> {
+    pub fn build(mut self) -> std::result::Result<VideoFrame, Rejected<Self>> {
+        let mut validate = || -> Result<_> {
             validate_picture_aspect_ratio(self.picture_aspect_ratio)?;
             let layout = ValidatedVideoLayout::new_uncompressed(
                 self.pixel_format,
@@ -1775,18 +1782,16 @@ impl VideoFrameBuilder {
             if let Some(data) = &self.data {
                 check_video_data_len(&layout, data.len())?;
             }
-            let metadata = self
-                .metadata
-                .as_deref()
-                .map(FrameMetadata::new)
-                .transpose()?;
+            // The last fallible check transfers metadata only on success,
+            // preserving the complete builder on every rejected input.
+            let metadata = FrameMetadata::take_from(&mut self.metadata)?;
             Ok((layout, metadata))
         };
         let (layout, metadata) = match validate() {
             Ok(parts) => parts,
             Err(error) => return Err(Rejected::new(error, self)),
         };
-        let room = self.pixel_format.send_tail_room();
+        let room = crate::pixels::send_room(&layout, self.scan_type);
         let data = match self.data {
             Some(data) => Pixels::adopt(data, room),
             None => Pixels::zeroed(layout.data_len_bytes, room),
@@ -2613,6 +2618,8 @@ impl AudioFrameBuilder {
     }
 
     /// Set the metadata text.
+    /// An owned string retains its allocation when there is capacity for
+    /// the trailing NUL; invalid metadata leaves a rejected builder unchanged.
     #[must_use]
     pub fn metadata<S: Into<String>>(mut self, metadata: S) -> Self {
         self.metadata = Some(metadata.into());
@@ -2670,8 +2677,8 @@ impl AudioFrameBuilder {
     /// do not form a valid
     /// frame, and [`Error::InvalidCString`] for metadata containing a NUL
     /// byte.
-    pub fn build(self) -> std::result::Result<AudioFrame, Rejected<Self>> {
-        let validate = || -> Result<_> {
+    pub fn build(mut self) -> std::result::Result<AudioFrame, Rejected<Self>> {
+        let mut validate = || -> Result<_> {
             let layout = validate_outbound_audio_layout(
                 self.sample_rate,
                 self.num_channels,
@@ -2681,12 +2688,9 @@ impl AudioFrameBuilder {
             if let Some(data) = &self.data {
                 check_audio_data_len(&layout, data.len())?;
             }
-            // Validate metadata before interleaving conversion or changing input storage.
-            let metadata = self
-                .metadata
-                .as_deref()
-                .map(FrameMetadata::new)
-                .transpose()?;
+            // Transfer metadata only after every rejection check, before
+            // interleaving conversion or changing sample storage.
+            let metadata = FrameMetadata::take_from(&mut self.metadata)?;
             Ok((layout, metadata))
         };
         let (audio_layout, metadata) = match validate() {
@@ -2824,6 +2828,8 @@ pub struct MetadataFrame {
 impl MetadataFrame {
     /// Create a metadata frame from UTF-8 text, with
     /// [`Timecode::SYNTHESIZE`].
+    /// An owned string retains its allocation when there is capacity for
+    /// the trailing NUL, and otherwise grows once.
     ///
     /// # Errors
     ///
@@ -3057,15 +3063,6 @@ impl fmt::Debug for MetadataText<'_> {
     }
 }
 
-impl From<MetadataText<'_>> for CString {
-    /// Copy the text into a new C string: one allocation, of exactly its
-    /// size.
-    fn from(text: MetadataText<'_>) -> Self {
-        // SAFETY: validated text ends in its only NUL, copied with it.
-        unsafe { CString::from_vec_with_nul_unchecked(text.with_nul.as_bytes().to_vec()) }
-    }
-}
-
 /// Validate standalone metadata frame layout from raw FFI fields.
 ///
 /// The SDK `length` field includes the trailing NUL terminator. The accepted
@@ -3213,18 +3210,33 @@ pub(crate) struct FrameMetadata {
 
 impl FrameMetadata {
     pub(crate) fn new<S: Into<String>>(metadata: S) -> Result<Self> {
-        let metadata = metadata.into();
-        let len_with_nul = metadata.len().checked_add(1).ok_or_else(|| {
+        Ok(Self::take_from(&mut Some(metadata.into()))?
+            .expect("a supplied metadata string produces a value"))
+    }
+
+    /// Validate and take an optional owned string, retaining its capacity.
+    /// Failure leaves the original option and text unchanged, so builders
+    /// can return their complete input without copying successful metadata.
+    fn take_from(metadata: &mut Option<String>) -> Result<Option<Self>> {
+        let Some(text) = metadata.as_mut() else {
+            return Ok(None);
+        };
+        let len_with_nul = text.len().checked_add(1).ok_or_else(|| {
             Error::InvalidFrame("Frame metadata length overflow while adding terminator".into())
         })?;
         validate_metadata_len_with_nul(len_with_nul)?;
-
-        let bytes = CString::new(metadata)
-            .map_err(Error::InvalidCString)?
-            .into_bytes_with_nul();
-        // SAFETY: CString::new only added a NUL to a valid UTF-8 String.
-        let inner = unsafe { String::from_utf8_unchecked(bytes) };
-        Ok(Self { inner })
+        if text.as_bytes().contains(&0) {
+            // Construct the existing owned diagnostic only on the error path;
+            // the builder keeps its original string and capacity.
+            return Err(Error::InvalidCString(
+                CString::new(text.as_str()).expect_err("metadata contains an interior NUL"),
+            ));
+        }
+        // String already guarantees UTF-8; adding its only NUL needs no
+        // CString round trip, allocation shrink or unchecked UTF-8 conversion.
+        text.reserve_exact(1);
+        text.push('\0');
+        Ok(metadata.take().map(|inner| Self { inner }))
     }
 
     /// The text with its terminator.
@@ -3247,12 +3259,18 @@ impl FrameMetadata {
         self.inner.as_ptr().cast()
     }
 
+    /// All bytes retained by this metadata, including spare string capacity.
+    #[cfg(feature = "advanced")]
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.inner.capacity()
+    }
+
     /// Copy validated text into owned metadata, reusing the allocation of
     /// `storage` when there is one.
     ///
     /// Without `storage` this allocates once. With it, it allocates nothing
     /// when the capacity holds the new text and its terminator.
-    fn copy_from(text: MetadataText<'_>, storage: Option<Self>) -> Self {
+    pub(crate) fn copy_from(text: MetadataText<'_>, storage: Option<Self>) -> Self {
         match storage {
             Some(mut storage) => {
                 storage.copy_text(text);
@@ -4840,7 +4858,7 @@ macro_rules! borrowed_video_methods {
             /// timestamp and metadata.
             ///
             /// Its pixel buffer is reused when its capacity holds the packed frame
-            /// and its format's [room](PixelFormat::send_tail_room), and otherwise
+            /// and its scan-dependent [room](PixelFormat::send_tail_room), and otherwise
             /// replaced by one allocation of exactly that size. Its
             /// metadata string is reused when its capacity holds the new text and
             /// its terminator; otherwise it grows once. With sufficient pixel and
@@ -7503,6 +7521,84 @@ mod tests {
     }
 
     #[test]
+    fn metadata_construction_retains_owned_storage() {
+        fn text() -> String {
+            let mut text = String::with_capacity(1024);
+            text.push_str("<metadata label='é'/>");
+            text
+        }
+        let supplied = text();
+        let (pointer, capacity) = (supplied.as_ptr(), supplied.capacity());
+        let (metadata, allocations) =
+            crate::test_alloc::allocation_count(|| MetadataFrame::new(supplied).unwrap());
+        assert_eq!(allocations, 0);
+        assert_eq!(metadata.data().as_ptr(), pointer);
+        assert_eq!(metadata.into_data().capacity(), capacity);
+
+        let supplied = text();
+        let (pointer, capacity) = (supplied.as_ptr(), supplied.capacity());
+        let builder = VideoFrame::builder()
+            .resolution(2, 2)
+            .data(vec![7; 16])
+            .metadata(supplied);
+        let (video, allocations) = crate::test_alloc::allocation_count(|| builder.build().unwrap());
+        assert_eq!(allocations, 0);
+        assert_eq!(video.metadata().unwrap().as_ptr(), pointer);
+        assert_eq!(video.metadata.as_ref().unwrap().inner.capacity(), capacity);
+
+        let supplied = text();
+        let (pointer, capacity) = (supplied.as_ptr(), supplied.capacity());
+        let builder = AudioFrame::builder()
+            .num_channels(2)
+            .num_samples(2)
+            .data(vec![0.25; 4])
+            .metadata(supplied);
+        let (audio, allocations) = crate::test_alloc::allocation_count(|| builder.build().unwrap());
+        assert_eq!(allocations, 0);
+        assert_eq!(audio.metadata().unwrap().as_ptr(), pointer);
+        assert_eq!(audio.metadata.as_ref().unwrap().inner.capacity(), capacity);
+    }
+
+    #[test]
+    fn rejected_metadata_keeps_builder_text_and_sample_storage() {
+        for text in ["bad\0metadata".to_owned(), "x".repeat(MAX_METADATA_BYTES)] {
+            let video_text = text.clone();
+            let pointer = video_text.as_ptr();
+            let mut pixels = Vec::with_capacity(64);
+            pixels.resize(16, 7);
+            let pixels_pointer = pixels.as_ptr();
+            let builder = VideoFrame::builder()
+                .resolution(2, 2)
+                .data(pixels)
+                .metadata(video_text)
+                .build()
+                .unwrap_err()
+                .into_inner();
+            assert_eq!(builder.metadata.as_deref(), Some(text.as_str()));
+            assert_eq!(builder.metadata.as_ref().unwrap().as_ptr(), pointer);
+            assert_eq!(builder.supplied_data().unwrap().as_ptr(), pixels_pointer);
+
+            let audio_text = text.clone();
+            let pointer = audio_text.as_ptr();
+            let samples = vec![1.0, 3.0, 2.0, 4.0];
+            let samples_pointer = samples.as_ptr();
+            let builder = AudioFrame::builder()
+                .num_channels(2)
+                .num_samples(2)
+                .layout(AudioLayout::Interleaved)
+                .data(samples)
+                .metadata(audio_text)
+                .build()
+                .unwrap_err()
+                .into_inner();
+            assert_eq!(builder.metadata.as_deref(), Some(text.as_str()));
+            assert_eq!(builder.metadata.as_ref().unwrap().as_ptr(), pointer);
+            assert_eq!(builder.supplied_data().unwrap().as_ptr(), samples_pointer);
+            assert_eq!(builder.supplied_data().unwrap(), [1.0, 3.0, 2.0, 4.0]);
+        }
+    }
+
+    #[test]
     fn metadata_copies_reuse_storage_across_lengths() {
         let sources = ["same", "é", "", "longer text", "same"].map(|text| {
             MetadataFrame::new(text)
@@ -9262,81 +9358,109 @@ mod tests {
     #[test]
     fn owned_frames_hold_the_room_the_sdk_reads_after_them() {
         for format in PixelFormat::ALL {
-            let room = format.send_tail_room();
             // The x86 SDK reads past these two formats; the SDK for 64-bit
             // ARM Linux reads every frame exactly.
             let read_past = matches!(format, PixelFormat::Uyvy | PixelFormat::Uyva)
                 && !cfg!(all(target_os = "linux", target_arch = "aarch64"));
-            assert_eq!(room, if read_past { 64 } else { 0 }, "{format:?}");
-            let builder = || VideoFrame::builder().resolution(18, 4).pixel_format(format);
-            let holds_room = |frame: &VideoFrame, label: &str| {
-                assert_eq!(frame.tail_room(), room, "{format:?} {label}");
-                assert_eq!(frame.data.room(), vec![0; room], "{format:?} {label}");
-                assert!(VideoSource::sends_in_place(frame), "{format:?} {label}");
-            };
+            assert_eq!(
+                format.send_tail_room(),
+                if read_past { 64 } else { 0 },
+                "{format:?}"
+            );
+            for height in [4, 6] {
+                for scan in ScanType::ALL {
+                    let builder = || {
+                        VideoFrame::builder()
+                            .resolution(18, height)
+                            .pixel_format(format)
+                            .scan_type(scan)
+                    };
+                    let room = format.send_buffer_len(18, height, None, scan).unwrap()
+                        - format.buffer_len(18, height).unwrap();
+                    let holds_room = |frame: &VideoFrame, label: &str| {
+                        assert_eq!(frame.tail_room(), room, "{format:?} {label}");
+                        assert_eq!(frame.data.room(), vec![0; room], "{format:?} {label}");
+                        assert!(VideoSource::sends_in_place(frame), "{format:?} {label}");
+                    };
 
-            let (built, allocations) =
-                crate::test_alloc::allocation_count(|| builder().build().unwrap());
-            assert_eq!(allocations, 1, "{format:?}");
-            let len = built.data().len();
-            assert_eq!(built.data.capacity(), len + room, "{format:?}");
-            holds_room(&built, "built");
+                    let (built, allocations) =
+                        crate::test_alloc::allocation_count(|| builder().build().unwrap());
+                    assert_eq!(allocations, 1, "{format:?}");
+                    let len = built.data().len();
+                    assert_eq!(built.data.capacity(), len + room, "{format:?}");
+                    holds_room(&built, "built");
 
-            // A vector that ends with the frame is kept only when the format
-            // needs no room.
-            let exact = vec![7; len];
-            let address = exact.as_ptr();
-            let supplied = builder().data(exact).build().unwrap();
-            assert_eq!(supplied.data(), vec![7; len], "{format:?}");
-            if room == 0 {
-                assert_eq!(
-                    (supplied.data().as_ptr(), supplied.data.capacity()),
-                    (address, len),
-                    "{format:?}"
-                );
+                    // A vector that ends with the frame is kept only when the format
+                    // needs no room.
+                    let exact = vec![7; len];
+                    let address = exact.as_ptr();
+                    let supplied = builder().data(exact).build().unwrap();
+                    assert_eq!(supplied.data(), vec![7; len], "{format:?}");
+                    if room == 0 {
+                        assert_eq!(
+                            (supplied.data().as_ptr(), supplied.data.capacity()),
+                            (address, len),
+                            "{format:?}"
+                        );
+                    }
+                    holds_room(&supplied, "supplied");
+
+                    // A vector with the room is always kept, whatever its spare
+                    // capacity held.
+                    let mut roomy = vec![9; len + room];
+                    roomy.truncate(len);
+                    let address = roomy.as_ptr();
+                    let (kept, allocations) = crate::test_alloc::allocation_count(|| {
+                        builder().data(roomy).build().unwrap()
+                    });
+                    assert_eq!(allocations, 0, "{format:?}");
+                    assert_eq!(kept.data().as_ptr(), address, "{format:?}");
+                    holds_room(&kept, "kept");
+
+                    let mut replaced = built;
+                    replaced.replace_data(vec![5; len]).unwrap();
+                    assert_eq!(replaced.data(), vec![5; len], "{format:?}");
+                    holds_room(&replaced, "replaced");
+                    let rejected = replaced.replace_data(vec![5; len + 1]).unwrap_err();
+                    assert_eq!(rejected.into_inner().len(), len + 1);
+                    holds_room(&replaced, "after a rejected replacement");
+
+                    let (clone, allocations) =
+                        crate::test_alloc::allocation_count(|| replaced.clone());
+                    assert_eq!(allocations, 1, "{format:?}");
+                    assert_eq!(clone.data(), replaced.data(), "{format:?}");
+                    holds_room(&clone, "cloned");
+
+                    let borrowed =
+                        crate::BorrowedVideoFrame::builder(replaced.data(), 18, height, format)
+                            .scan_type(scan)
+                            .build()
+                            .unwrap();
+                    assert_eq!(borrowed.sends_in_place(), room == 0, "{format:?}");
+                    let (copy, allocations) =
+                        crate::test_alloc::allocation_count(|| borrowed.to_owned());
+                    assert_eq!(allocations, 1, "{format:?}");
+                    assert_eq!(copy.data.capacity(), len + room, "{format:?}");
+                    holds_room(&copy, "copied");
+                    let mut destination = VideoFrame::builder().resolution(2, 2).build().unwrap();
+                    borrowed.copy_into(&mut destination);
+                    holds_room(&destination, "copied into");
+                    let pointer = destination.data().as_ptr();
+                    let ((), allocations) = crate::test_alloc::allocation_count(|| {
+                        borrowed.copy_into(&mut destination);
+                    });
+                    assert_eq!(allocations, 0);
+                    assert_eq!(destination.data().as_ptr(), pointer);
+                    holds_room(&destination, "copied again");
+                }
             }
-            holds_room(&supplied, "supplied");
-
-            // A vector with the room is always kept, whatever its spare
-            // capacity held.
-            let mut roomy = vec![9; len + room];
-            roomy.truncate(len);
-            let address = roomy.as_ptr();
-            let (kept, allocations) =
-                crate::test_alloc::allocation_count(|| builder().data(roomy).build().unwrap());
-            assert_eq!(allocations, 0, "{format:?}");
-            assert_eq!(kept.data().as_ptr(), address, "{format:?}");
-            holds_room(&kept, "kept");
-
-            let mut replaced = built;
-            replaced.replace_data(vec![5; len]).unwrap();
-            assert_eq!(replaced.data(), vec![5; len], "{format:?}");
-            holds_room(&replaced, "replaced");
-            let rejected = replaced.replace_data(vec![5; len + 1]).unwrap_err();
-            assert_eq!(rejected.into_inner().len(), len + 1);
-            holds_room(&replaced, "after a rejected replacement");
-
-            let (clone, allocations) = crate::test_alloc::allocation_count(|| replaced.clone());
-            assert_eq!(allocations, 1, "{format:?}");
-            assert_eq!(clone.data(), replaced.data(), "{format:?}");
-            holds_room(&clone, "cloned");
-
-            let borrowed = crate::BorrowedVideoFrame::builder(replaced.data(), 18, 4, format)
-                .build()
-                .unwrap();
-            assert_eq!(borrowed.sends_in_place(), room == 0, "{format:?}");
-            let (copy, allocations) = crate::test_alloc::allocation_count(|| borrowed.to_owned());
-            assert_eq!(allocations, 1, "{format:?}");
-            assert_eq!(copy.data.capacity(), len + room, "{format:?}");
-            holds_room(&copy, "copied");
         }
     }
 
-    /// A frame whose scan type makes the SDK read rows past it is given the
-    /// room for them when it is lent to an asynchronous send, once, and until
-    /// then is not sent in place.
+    /// Changing the scan type establishes its complete read extent before
+    /// the frame can be borrowed, without moving pixels again on later changes.
     #[test]
-    fn lending_gives_a_frame_the_room_its_scan_type_needs() {
+    fn scan_type_changes_preserve_owned_send_room() {
         for format in PixelFormat::ALL {
             let room = format.send_tail_room();
             // Six rows: not a multiple of four.
@@ -9353,32 +9477,48 @@ mod tests {
                 2 * frame.line_stride_bytes()
             };
             for scan in ScanType::ALL {
-                let mut lent = frame.clone();
-                lent.set_scan_type(scan);
-                let needed = crate::pixels::send_room(&lent.layout, scan);
+                frame.set_scan_type(scan);
+                let needed = crate::pixels::send_room(&frame.layout, scan);
                 let more = scan != ScanType::Progressive;
                 assert_eq!(
                     needed,
                     room + if more { rows } else { 0 },
                     "{format:?} {scan:?}"
                 );
-                assert_eq!(
-                    VideoSource::sends_in_place(&lent),
-                    needed == room,
-                    "{format:?} {scan:?}"
-                );
-                let raw = lent.lend_raw();
-                assert_eq!(raw.p_data.cast_const(), lent.data().as_ptr());
-                assert_eq!(lent.tail_room(), needed, "{format:?} {scan:?}");
-                assert_eq!(lent.data.room(), vec![0; needed], "{format:?} {scan:?}");
-                assert_eq!(lent.data(), vec![7; len], "{format:?} {scan:?}");
-                assert!(VideoSource::sends_in_place(&lent));
-                // Lending again changes nothing.
+                let raw = frame.to_raw();
+                assert_eq!(raw.p_data.cast_const(), frame.data().as_ptr());
+                assert_eq!(frame.tail_room(), needed, "{format:?} {scan:?}");
+                assert_eq!(frame.data.room(), vec![0; needed], "{format:?} {scan:?}");
+                assert_eq!(frame.data(), vec![7; len], "{format:?} {scan:?}");
+                assert!(VideoSource::sends_in_place(&frame));
+                // Repeating this scan type and every already-covered type
+                // preserves the allocation and its initialized tail.
                 let ((), allocations) = crate::test_alloc::allocation_count(|| {
-                    assert_eq!(lent.lend_raw().p_data, raw.p_data);
+                    frame.set_scan_type(scan);
+                    frame.set_scan_type(ScanType::Progressive);
+                    frame.set_scan_type(scan);
+                    assert_eq!(frame.to_raw().p_data, raw.p_data);
                 });
                 assert_eq!(allocations, 0, "{format:?} {scan:?}");
             }
+            // Even the first change needs no growth when the caller supplied
+            // enough capacity. Stale bytes in that capacity must be zeroed.
+            let mut pixels = frame.into_data();
+            let address = pixels.as_ptr();
+            pixels.resize(pixels.capacity(), 255);
+            pixels.truncate(len);
+            let mut frame = VideoFrame::builder()
+                .resolution(18, 6)
+                .pixel_format(format)
+                .data(pixels)
+                .build()
+                .unwrap();
+            let ((), allocations) = crate::test_alloc::allocation_count(|| {
+                frame.set_scan_type(ScanType::Interlaced);
+            });
+            assert_eq!(allocations, 0);
+            assert_eq!(frame.data().as_ptr(), address);
+            assert!(frame.data.room().iter().all(|&byte| byte == 0));
         }
     }
 
@@ -9418,7 +9558,7 @@ mod tests {
         }
         fn assert_same(&self, expected: &Self) {
             assert_eq!(self.data.len(), self.layout.data_len_bytes);
-            let room = self.layout.pixel_format.send_tail_room();
+            let room = crate::pixels::send_room(&self.layout, self.header.scan_type);
             assert_eq!(self.data.room(), vec![0; room]);
             assert_eq!(
                 format!("{:?}", self.layout),
