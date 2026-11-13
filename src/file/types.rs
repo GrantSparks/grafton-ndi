@@ -677,7 +677,7 @@ impl NamePattern {
         Ok(if file.is_absolute() {
             file
         } else {
-            std::env::current_dir()?.join(file)
+            std::path::absolute(file)?
         })
     }
 
@@ -755,8 +755,7 @@ impl RecordingTarget {
     ///
     /// [`Error::InvalidInput`] when the path is empty or is not UTF-8,
     /// [`Error::InvalidCString`] when it contains a NUL, and [`Error::Io`]
-    /// when a relative path cannot be resolved because the current directory
-    /// is unavailable.
+    /// when the operating system cannot resolve a relative path.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let (path, prefix) = resolve_path(path.as_ref(), "recording target")?;
         Ok(Self { prefix, path })
@@ -776,16 +775,25 @@ impl RecordingTarget {
 ///
 /// [`Error::InvalidInput`] naming `what` when the path is empty or is not
 /// UTF-8, [`Error::InvalidCString`] when it contains a NUL, and
-/// [`Error::Io`] when a relative path cannot be resolved because the current
-/// directory is unavailable.
+/// [`Error::Io`] when the operating system cannot resolve a relative path.
 pub(super) fn resolve_path(path: &Path, what: &str) -> Result<(PathBuf, CString)> {
     if path.as_os_str().is_empty() {
         return Err(Error::InvalidInput(format!("{what} must not be empty")));
     }
+    let text = path
+        .to_str()
+        .ok_or_else(|| Error::InvalidInput(format!("{what} is not lossless UTF-8")))?;
+    // Windows path resolution rejects NULs as an I/O error. Keep the SDK
+    // string error consistent with absolute paths and the other platforms.
+    if text.contains('\0') {
+        return Err(CString::new(text).unwrap_err().into());
+    }
     let absolute = if path.is_absolute() {
         path.to_owned()
     } else {
-        std::env::current_dir()?.join(path)
+        // Joining a drive-relative Windows path (C:take.mkv) discards the
+        // current directory and leaves it relative. Resolve its drive too.
+        std::path::absolute(path)?
     };
     let text = absolute
         .to_str()
@@ -1650,6 +1658,40 @@ mod tests {
             RecordingTarget::new("take.mkv").unwrap().path(),
             absolute.as_path()
         );
+    }
+
+    #[test]
+    fn relative_paths_reject_nul_as_a_c_string_error() {
+        let path = Path::new("take\0.mkv");
+        assert_eq!(nul_position(path_string(path)), 4);
+        assert_eq!(nul_position(RecordingTarget::new(path)), 4);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_relative_paths_are_made_absolute() {
+        for path in [r"C:take.mkv", r"C:folder\take.mkv", r"\take.mkv"] {
+            let (absolute, text) = resolve_path(Path::new(path), "file path").unwrap();
+            assert!(absolute.is_absolute(), "{absolute:?}");
+            assert!(absolute.ends_with("take.mkv"));
+            assert_eq!(text.to_str().unwrap(), absolute.to_str().unwrap());
+            assert_eq!(path_string(Path::new(path)).unwrap(), text);
+            assert_eq!(RecordingTarget::new(path).unwrap().path(), absolute);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_relative_patterns_name_absolute_files() {
+        let target = RecordingTarget::new("take").unwrap();
+        for pattern in [r"C:take_{index:03}.mkv", r"\take_{index:03}.mkv"] {
+            let file = NamePattern::new(pattern)
+                .unwrap()
+                .first_file(&target)
+                .unwrap();
+            assert!(file.is_absolute(), "{file:?}");
+            assert!(file.ends_with("take_001.mkv"));
+        }
     }
 
     #[test]

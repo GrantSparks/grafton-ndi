@@ -11,128 +11,6 @@ API, see the [README](README.md) and the migration guides for
 
 ## [Unreleased]
 
-### Security
-
-- Discovery Server snapshots and event batches charge native scans, complete
-  owned collection storage, identifier copies and lossy UTF-8 expansion to
-  their shared 16 MiB budget before fallible allocation. Malformed null event
-  batches with nonzero counts are rejected.
-- Borrowed UYVY/UYVA sends pack active rows and zero trailing SDK room by default
-  on targets that need it. Direct sending from caller padding and trailing
-  memory requires `allow_send_from_padding_and_tail(true)`; `readable_after`
-  requires initialized, stable bytes in the same allocation.
-- Finder snapshots and distinct results over a discovery window have count and
-  aggregate byte limits, fallible reservations and `Error::ResourceLimit` errors.
-- Document recorder preflight races and the Linux 6.4.0.2 exclusive-open evidence,
-  and require trusted native search directories or explicit first-load paths.
-
-### Added
-
-- Lossy WebP with `ImageFormat::WebpLossy(quality)`, quality 0 to 100,
-  SharpYUV color conversion and exact alpha, through a pure Rust encoder.
-  All image methods, pixel formats, color policies and downscaling support it.
-- CI tests the File API with `file-io` alone. Its independent Cargo feature
-  and platform-specific native runtime requirements are documented explicitly.
-
-- Tokio and smol `AsyncCapture::capture_with` and
-  `AsyncReceiver::capture_any_with` process validated borrowed media in the
-  capture's blocking task without wrapper payload allocations or copies. Only
-  a `Send + 'static` result leaves the callback. Callbacks retain an SDK buffer
-  and worker until they return, and may execute after future cancellation once
-  the task passes its gate. Owned capture uses the same scoped path.
-- Owned video/audio builders return `Rejected<Builder>` so invalid settings can
-  be repaired without losing supplied buffers. Frames expose `into_data` and
-  allocation-preserving `swap_data`; compressed and scatter frames retain
-  payload capacity, and scatter frames expose `into_blocks` for buffer pools.
-- `BorrowedAudioFrame` accepts application planar samples and channel strides.
-  Sealed video/audio source traits support layout inspection, copying and reuse
-  through generic functions and trait objects. `MetadataSource` forwards owned
-  and captured text directly through synchronous send, connection metadata and
-  recording injection operations.
-- `PixelFormat::send_buffer_len` checks complete direct-send allocation sizes,
-  including stride, scan-dependent extra rows and SDK tail room. Options expose
-  complete readback, `clear_*` reset methods and replacement of required choices
-  for cloned templates.
-- Standard receivers capture whichever video, audio, metadata or invalidation
-  arrives next with `capture_any_ref` and `capture_any`. Tokio and smol expose
-  owned combined capture with the same deadline and cancellation rules.
-- Configured finders select a source by exact name or predicate without losing
-  discovery scope. Host caches retain complete feed sets and borrow their finder.
-- FrameSync, AvSync and packet/allocated receivers expose restricted exclusive
-  controls. Synchronizers can split capture from controls so KVM sessions can
-  hold remote input while synchronized output continues.
-
-- Configuration values expose read-only `configured_*()` accessors, and
-  `FrameSyncAudioRequest` exposes its validated dimensions, without requiring
-  an NDI runtime.
-- A FrameSync example and guide show per-media recent-reception monitoring
-  across startup, silence, disconnect and recovery.
-
-### Changed
-
-- Frame copies retain validated UTF-8 metadata capacity across text-length
-  changes. Standalone metadata copies also avoid temporary string allocations;
-  Advanced send queues charge retained metadata capacity to their byte limit.
-- Sender metadata capture follows the SDK's guaranteed NUL-terminated text when
-  native positive lengths omit the terminator, retaining bounded UTF-8 validation
-  and releasing the original descriptor. Strict declared-length frame validation
-  remains unchanged.
-- Async File operations start on first poll. `FileOperation::submit()` explicitly
-  submits eagerly. Once submitted, stop/finish/close retain their cancellation
-  guarantees; dropping the last handle still waits for native finalization.
-- Native P216-to-V210 conversion accepts any validated `VideoSource`, including
-  padded captures and external borrowed inputs, without a preliminary pixel copy.
-- `Error::ResourceLimit` uses a typed `ResourceKind` for Finder and Discovery
-  Server budgets. Exact host matching consistently uses `matches_host`, and
-  byte-stride APIs consistently use `*_stride_bytes` names. `NoSourcesFound`
-  remains an explicitly caller-constructed convenience.
-- Advanced queued video submission uses exclusive frame ownership to guarantee
-  distinct pixel allocations, removing a scan of completed frames on every send.
-- Synchronous video/audio sends and planar-to-interleaved audio conversion
-  consume shared references to validated `VideoSource`/`AudioSource` inputs,
-  including receiver and FrameSync captures. Eligible video sends and strided
-  audio avoid intermediate owned copies; padded video uses reusable safe staging.
-  Copied async video submissions accept the same inputs and retain owned storage.
-- `SourceCache::new(&finder)` and `sources_by_host` replace host-to-first-feed
-  lookup. Addressed sources convert to direct recorder endpoints by default;
-  `SourceSpec::new(name)` explicitly requests logical name discovery.
-- Sender inputs no longer need owned-to-borrowed adapter conversions, and owning
-  receiver wrappers use `controls()` instead of exposing mutable receivers or
-  duplicating exclusive setters.
-
-- Receiver connection targets now follow the latest successful `connect_to`
-  request. `connection_target()` replaces `source()` and returns an owned
-  snapshot; `disconnect` retains the target and `reconnect` retries it. The
-  async adapters follow the same rules.
-- `FrameRate` compares and hashes equivalent fractions equally while retaining
-  the supplied components for accessors and SDK submission.
-- Owned audio and video frames set metadata with `set_metadata(text)` and
-  remove it with the infallible `clear_metadata()`.
-- `advanced::UnsentVideo` is renamed `ReclaimedVideo`: returned frames are
-  ready for reuse, without reporting whether they were delivered.
-- Sender ownership types and generic borrowed-frame implementations no longer
-  have public paths. Use the supported receiver and FrameSync frame aliases.
-
-- Examples use the native v3 audio converter, borrowed capture views where
-  appropriate, reusable send buffers, and application pacing for queued sends.
-  Concurrent capture propagates worker errors, command-line options reject
-  malformed input, and file examples report unsuccessful playback or recording
-  as failures.
-
-### Fixed
-
-- Owned and borrowed video builders default to the SDK's square-pixel aspect
-  sentinel (`0.0`), so non-16:9 images display according to their dimensions.
-  Explicit anamorphic overrides and captured aspect values are preserved.
-- Finder selection and enumeration spend their discovery deadline while waiting
-  for the snapshot lock; a zero-timeout lookup makes a non-waiting attempt.
-
-- Receiver video, audio and metadata drop percentages now divide native drops
-  by the native received total, which already includes those drops. Existing
-  diagnostic percentages may rise; raw counters retain their meanings.
-- Color metadata ignores XML processing instructions, so text inside them
-  cannot trigger false HDR detection or image-encoding errors.
-
 ## [3.0.0] - 2026-11-13
 
 Version 3.0.0 loads the NDI library when the program selects a runtime instead
@@ -169,6 +47,21 @@ as `None`. Most programs need changes; see the
 - The build no longer refuses targets for which the NDI SDK supplies no
   library, such as musl Linux, `windows-gnu` and Windows on ARM64. They are not
   supported.
+
+### Security
+
+- Discovery Server snapshots and event batches charge native scans, complete
+  owned collection storage, identifier copies and lossy UTF-8 expansion to
+  their shared 16 MiB budget before fallible allocation. Malformed null event
+  batches with nonzero counts are rejected.
+- Borrowed UYVY/UYVA sends pack active rows and zero trailing SDK room by default
+  on targets that need it. Direct sending from caller padding and trailing
+  memory requires `allow_send_from_padding_and_tail(true)`; `readable_after`
+  requires initialized, stable bytes in the same allocation.
+- Finder snapshots and distinct results over a discovery window have count and
+  aggregate byte limits, fallible reservations and `Error::ResourceLimit` errors.
+- Document recorder preflight races and the Linux 6.4.0.2 exclusive-open evidence,
+  and require trusted native search directories or explicit first-load paths.
 
 ### Breaking Changes
 
@@ -217,7 +110,7 @@ as `None`. Most programs need changes; see the
     its bytes differ from 2.0's. Untagged and BT.601 or BT.709 SDR frames in
     the four RGB formats encode to 2.0's bytes.
   - `ImageFormat` is at the crate root only, no longer also in `frames`, and
-    gains `WebpLossless`.
+    gains `WebpLossless` and `WebpLossy(quality)`.
 - The `advanced_sdk` Cargo feature, which had no effect, is removed.
 - The `tokio` feature enables only Tokio's `rt` feature. A program that uses
   `#[tokio::main]` or the multi-threaded runtime enables those features in its
@@ -368,8 +261,9 @@ as `None`. Most programs need changes; see the
   `picture_aspect_ratio`, `FourCc::from(frame.pixel_format())`, and
   `data().len()`: `data()` returns the frame's storage, no longer the whole
   buffer the frame was built from.
-- `SourceCache::find_by_host` takes the `Ndi` handle as its first argument. The
-  cache no longer starts NDI by itself.
+- `SourceCache::new(&finder)` borrows its finder and retains every feed for each
+  host. `sources_by_host` replaces the old host-to-first-feed lookup; the cache
+  no longer starts NDI by itself.
 - `NDI::is_supported_cpu` is removed. Use `Runtime::is_supported_cpu` on a
   selected runtime, or `ndi.runtime().is_supported_cpu()`.
 - `NDI::version` is removed. Use `ndi.info().raw_version()`, or
@@ -397,6 +291,46 @@ as `None`. Most programs need changes; see the
   that value any more.
 
 ### Added
+
+- Lossy WebP with `ImageFormat::WebpLossy(quality)`, quality 0 to 100,
+  SharpYUV color conversion and exact alpha, through a pure Rust encoder.
+  All image methods, pixel formats, color policies and downscaling support it.
+- CI tests the File API with `file-io` alone. Its independent Cargo feature
+  and platform-specific native runtime requirements are documented explicitly.
+
+- Tokio and smol `AsyncCapture::capture_with` and
+  `AsyncReceiver::capture_any_with` process validated borrowed media in the
+  capture's blocking task without wrapper payload allocations or copies. Only
+  a `Send + 'static` result leaves the callback. Callbacks retain an SDK buffer
+  and worker until they return, and may execute after future cancellation once
+  the task passes its gate. Owned capture uses the same scoped path.
+- Owned video/audio builders return `Rejected<Builder>` so invalid settings can
+  be repaired without losing supplied buffers. Frames expose `into_data` and
+  allocation-preserving `swap_data`; compressed and scatter frames retain
+  payload capacity, and scatter frames expose `into_blocks` for buffer pools.
+- `BorrowedAudioFrame` accepts application planar samples and channel strides.
+  Sealed video/audio source traits support layout inspection, copying and reuse
+  through generic functions and trait objects. `MetadataSource` forwards owned
+  and captured text directly through synchronous send, connection metadata and
+  recording injection operations.
+- `PixelFormat::send_buffer_len` checks complete direct-send allocation sizes,
+  including stride, scan-dependent extra rows and SDK tail room. Options expose
+  complete readback, `clear_*` reset methods and replacement of required choices
+  for cloned templates.
+- Standard receivers capture whichever video, audio, metadata or invalidation
+  arrives next with `capture_any_ref` and `capture_any`. Tokio and smol expose
+  owned combined capture with the same deadline and cancellation rules.
+- Configured finders select a source by exact name or predicate without losing
+  discovery scope. Host caches retain complete feed sets and borrow their finder.
+- FrameSync, AvSync and packet/allocated receivers expose restricted exclusive
+  controls. Synchronizers can split capture from controls so KVM sessions can
+  hold remote input while synchronized output continues.
+
+- Configuration values expose read-only `configured_*()` accessors, and
+  `FrameSyncAudioRequest` exposes its validated dimensions, without requiring
+  an NDI runtime.
+- A FrameSync example and guide show per-media recent-reception monitoring
+  across startup, silence, disconnect and recovery.
 
 - Image encoding covers every uncompressed pixel format and every video frame
   type, through one options value, `ImageOptions`, and three methods on
@@ -619,8 +553,57 @@ as `None`. Most programs need changes; see the
 
 ### Changed
 
-- The `image-encoding` feature adds the `image-webp` dependency, which is
-  pure Rust with no `unsafe` code. `Error::Io` exists with `image-encoding`
+- Frame copies retain validated UTF-8 metadata capacity across text-length
+  changes. Standalone metadata copies also avoid temporary string allocations;
+  Advanced send queues charge retained metadata capacity to their byte limit.
+- Sender metadata capture follows the SDK's guaranteed NUL-terminated text when
+  native positive lengths omit the terminator, retaining bounded UTF-8 validation
+  and releasing the original descriptor. Strict declared-length frame validation
+  remains unchanged.
+- Async File operations start on first poll. `FileOperation::submit()` explicitly
+  submits eagerly. Once submitted, stop/finish/close retain their cancellation
+  guarantees; dropping the last handle still waits for native finalization.
+- Native P216-to-V210 conversion accepts any validated `VideoSource`, including
+  padded captures and external borrowed inputs, without a preliminary pixel copy.
+- `Error::ResourceLimit` uses a typed `ResourceKind` for Finder and Discovery
+  Server budgets. Exact host matching consistently uses `matches_host`, and
+  byte-stride APIs consistently use `*_stride_bytes` names. `NoSourcesFound`
+  remains an explicitly caller-constructed convenience.
+- Advanced queued video submission uses exclusive frame ownership to guarantee
+  distinct pixel allocations, removing a scan of completed frames on every send.
+- Synchronous video/audio sends and planar-to-interleaved audio conversion
+  consume shared references to validated `VideoSource`/`AudioSource` inputs,
+  including receiver and FrameSync captures. Eligible video sends and strided
+  audio avoid intermediate owned copies; padded video uses reusable safe staging.
+  Copied async video submissions accept the same inputs and retain owned storage.
+- `SourceCache::new(&finder)` and `sources_by_host` replace host-to-first-feed
+  lookup. Addressed sources convert to direct recorder endpoints by default;
+  `SourceSpec::new(name)` explicitly requests logical name discovery.
+- Sender inputs no longer need owned-to-borrowed adapter conversions, and owning
+  receiver wrappers use `controls()` instead of exposing mutable receivers or
+  duplicating exclusive setters.
+
+- Receiver connection targets now follow the latest successful `connect_to`
+  request. `connection_target()` replaces `source()` and returns an owned
+  snapshot; `disconnect` retains the target and `reconnect` retries it. The
+  async adapters follow the same rules.
+- `FrameRate` compares and hashes equivalent fractions equally while retaining
+  the supplied components for accessors and SDK submission.
+- Owned audio and video frames set metadata with `set_metadata(text)` and
+  remove it with the infallible `clear_metadata()`.
+- `advanced::UnsentVideo` is renamed `ReclaimedVideo`: returned frames are
+  ready for reuse, without reporting whether they were delivered.
+- Sender ownership types and generic borrowed-frame implementations no longer
+  have public paths. Use the supported receiver and FrameSync frame aliases.
+
+- Examples use the native v3 audio converter, borrowed capture views where
+  appropriate, reusable send buffers, and application pacing for queued sends.
+  Concurrent capture propagates worker errors, command-line options reject
+  malformed input, and file examples report unsuccessful playback or recording
+  as failures.
+
+- The `image-encoding` feature adds the pure Rust `image-webp` and `libwebpop`
+  dependencies. `Error::Io` exists with `image-encoding`
   as well as `file-io`, for the writer given to `encode_image_to`.
 - `Receiver`, in every mode, and `FrameSync` are `RefUnwindSafe`, so a shared
   reference to one can cross `catch_unwind`. Their shared state has no lock
@@ -669,6 +652,20 @@ as `None`. Most programs need changes; see the
 
 ### Fixed
 
+- File paths, recording targets and recorder filename preflight resolve Windows
+  drive-relative paths such as `C:take.mkv` to absolute paths before use.
+- Owned and borrowed video builders default to the SDK's square-pixel aspect
+  sentinel (`0.0`), so non-16:9 images display according to their dimensions.
+  Explicit anamorphic overrides and captured aspect values are preserved.
+- Finder selection and enumeration spend their discovery deadline while waiting
+  for the snapshot lock; a zero-timeout lookup makes a non-waiting attempt.
+
+- Receiver video, audio and metadata drop percentages now divide native drops
+  by the native received total, which already includes those drops. Existing
+  diagnostic percentages may rise; raw counters retain their meanings.
+- Color metadata ignores XML processing instructions, so text inside them
+  cannot trigger false HDR detection or image-encoding errors.
+
 - The SDK no longer reads past the buffer of a UYVY or UYVA frame the crate
   sends. The x86 builds of the SDK read up to 28 bytes after the last pixel
   of many such frames, a 720×480 or an interlaced 1920×1080 frame among them
@@ -684,10 +681,10 @@ as `None`. Most programs need changes; see the
     copy when its buffer ends within that many bytes of the frame's last
     pixel, in one buffer that the sender keeps and reuses. The copy adds
     about 15% to the time of a 1920×1080 send and 54% to a 3840×2160 one. A
-    buffer that extends further, by padding its last row or by being longer
-    than the frame, is sent in place as before, and so is one whose caller
-    vouches for readable memory after it with the new `unsafe`
-    `BorrowedVideoFrameBuilder::readable_after`.
+    buffer with sufficient initialized padding and tail room can be sent in
+    place by opting in with `allow_send_from_padding_and_tail(true)`. The new
+    `unsafe` `BorrowedVideoFrameBuilder::readable_after` can establish tail
+    room in the same allocation beyond the supplied slice.
     `BorrowedVideoFrame::sends_in_place` tells which a frame is.
   - An interlaced or single-field UYVY or UYVA frame whose height is not a
     multiple of four, which the SDK reads up to two rows past, gets two line
