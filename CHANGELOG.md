@@ -8,7 +8,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Entries and examples describe the API of their named release. For the current
 API, see the [README](README.md) and [2.0 migration guide](docs/migration/1.x-to-2.0.md).
 
-## [Unreleased]
+## [2.1.0] - 2026-11-13
+
+A maintenance release retaining the 2.0 API, default features, build-time SDK
+linkage and Rust 1.88 baseline.
+
+### Fixed
+
+- Unchanged Cargo builds no longer rebuild because bindgen tracked the
+  generated wrapper header as an input (#121). Real SDK headers remain tracked.
+- Received and borrowed NV12 frames accept valid odd padded line strides,
+  consistently with the buffer-sizing API. YV12/I420 still require even
+  strides and heights; NV12 still requires an even height.
+- Windows async-video flushes on independent senders no longer wait for a
+  process-wide flush lock. Each sender retains its own synchronization.
+- Positive SDK waits round up to whole milliseconds instead of becoming
+  nonblocking polls below one millisecond. The existing `MAX_TIMEOUT` and
+  accepted input range are retained; individual native waits are capped one
+  millisecond below it to avoid an indefinite-wait sentinel.
+- Receiver status polling releases its capture guard between waits of at most
+  100 ms, allowing reconnects to proceed without waiting for the whole status
+  timeout. It keeps one wait budget and preserves pending notifications.
+- SDK source names, addresses and version strings must terminate within 4 MiB
+  including NUL. Finder skips over-limit entries and keeps valid ones. Source
+  decoding remains lossy; version text still requires UTF-8.
+- Removed unsolicited debug diagnostics from Finder and Windows initialization.
+
+### Added
+
+- `Error::UnexpectedSdkResult(String)` reports newly rejected over-limit SDK
+  strings. The error enum remains non-exhaustive and all existing variants stay.
+
+### Documentation
+
+- Explain FrameSync/raw-audio competition, explicit-rate startup silence,
+  borrowed format queries, and the measured basis and limits of thread safety.
+- Clarify that unchanged tally polls can return `None`, and that async receiver
+  wrappers do not expose retained status notifications.
 
 ## [2.0.1] - 2026-11-10
 

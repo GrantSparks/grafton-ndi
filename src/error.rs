@@ -30,6 +30,12 @@ pub enum Error {
     #[error("Encountered a null pointer in function: {0}")]
     NullPointer(String),
 
+    /// The SDK returned data outside the supported native contract.
+    ///
+    /// Source and version strings must terminate within 4 MiB, including NUL.
+    #[error("Unexpected NDI SDK result: {0}")]
+    UnexpectedSdkResult(String),
+
     /// Invalid UTF-8 data in a string from the NDI SDK.
     #[error("Invalid UTF-8 string in data: {0}")]
     InvalidUtf8(String),

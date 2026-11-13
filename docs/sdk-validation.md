@@ -235,3 +235,26 @@ libraries. Possessing that package does not provide Apple's platform headers,
 frameworks, or a runnable Apple environment. Run the existing native tests on
 macOS with Xcode's tools before release. Adding Apple mobile target selection,
 static-link dependencies, and device/simulator coverage remains separate work.
+
+## FrameSync findings retained from 3.0 development
+
+On Linux x86_64 with Standard 6.3.2 and 6.4, raw audio capture on a FrameSync's
+receiver took frames away from the synchronizer: each incoming frame reached
+only one capture path. In the measured runs the FrameSync returned silence for
+65–90% of samples with raw capture active. In 2.x that API remains available;
+use FrameSync audio capture alone or recover the receiver first.
+
+Source-rate requests can return an invalid zero rate before source audio
+arrives. Use `FrameSyncAudioRequest::capture_with(Some(48_000), channels, samples)`
+when the application needs startup silence at a known rate. Read input-format
+queries through the borrowed `capture_audio(query_input())` result: the owned
+convenience method has no samples to copy and returns `None` for such a query.
+
+The FrameSync headers do not explicitly specify threading guarantees. During
+3.0 development, NDI 6.1.1, 6.3.2 and 6.4 runtimes were measured on Linux x86_64:
+video/audio capture and video free took the instance lock; audio free used
+atomic operations; queue depth was read outside that lock. A sixteen-thread,
+120-second stress run per runtime returned no torn video, invalid samples or
+errors. These measurements support retaining the existing 2.x `Send`/`Sync`
+implementations; they do not qualify other platforms or establish an SDK-wide
+threading guarantee.

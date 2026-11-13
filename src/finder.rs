@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    ffi::{CStr, CString},
+    ffi::CString,
     fmt::{self, Display, Formatter},
     net::IpAddr,
     ptr,
@@ -303,15 +303,8 @@ impl Finder {
         let mut sources = Vec::with_capacity(num_sources as usize);
         for i in 0..num_sources {
             let source_ptr = unsafe { sources_ptr.add(i as usize) };
-            match copy(source_ptr) {
-                Ok(source) => sources.push(source),
-                Err(_e) => {
-                    // Skip invalid sources (null pointers from SDK)
-                    // This is a defensive measure - the SDK should not return null entries,
-                    // but we handle it gracefully if it does
-                    #[cfg(debug_assertions)]
-                    eprintln!("Warning: Skipping invalid source at index {i}: {_e}");
-                }
+            if let Ok(source) = copy(source_ptr) {
+                sources.push(source);
             }
         }
         Ok(sources)
@@ -337,8 +330,7 @@ impl Finder {
     ) -> Result<Option<T>> {
         // Validate up front so an over-long timeout is rejected even when the
         // first snapshot already satisfies `accept`.
-        to_ms_checked(timeout)?;
-        let deadline = Instant::now() + timeout;
+        let deadline = crate::timeout_deadline(timeout)?;
         loop {
             if let Some(selected) = accept(self.current_sources()?) {
                 return Ok(Some(selected));
@@ -807,11 +799,14 @@ impl Source {
     /// - The source pointer itself is null
     /// - Both the `p_ndi_name` and source address fields are null
     ///
+    /// Returns [`Error::UnexpectedSdkResult`] if a name or address has no NUL
+    /// terminator within 4 MiB.
+    ///
     /// # Safety
     ///
     /// A non-null `source_ptr` must point to a live `NDIlib_source_t`. Its non-null
     /// string pointers must remain readable through their NUL terminators until
-    /// copying finishes.
+    /// copying finishes, or for 4 MiB when no terminator is present.
     pub(crate) unsafe fn try_from_raw(source_ptr: *const NDIlib_source_t) -> Result<Self> {
         // Check top-level pointer
         if source_ptr.is_null() {
@@ -827,11 +822,12 @@ impl Source {
             }
             String::new()
         } else {
-            unsafe {
-                CStr::from_ptr(ndi_source.p_ndi_name)
-                    .to_string_lossy()
-                    .into_owned()
-            }
+            // SAFETY: the SDK keeps this source string readable through its
+            // terminator or the string limit while the caller retains storage.
+            String::from_utf8_lossy(unsafe {
+                crate::sdk_text::read(ndi_source.p_ndi_name, "NDI source name")?
+            })
+            .into_owned()
         };
 
         // For unions, we need to determine which field is active.
@@ -840,9 +836,13 @@ impl Source {
         // typically used for newer/HX sources.
         let address = unsafe {
             if !ndi_source.__bindgen_anon_1.p_url_address.is_null() {
-                let url_str = CStr::from_ptr(ndi_source.__bindgen_anon_1.p_url_address)
-                    .to_string_lossy()
-                    .into_owned();
+                // SAFETY: both union members are the same pointer type; the
+                // SDK keeps its text live through the terminator or scan limit.
+                let url_str = String::from_utf8_lossy(crate::sdk_text::read(
+                    ndi_source.__bindgen_anon_1.p_url_address,
+                    "NDI source address",
+                )?)
+                .into_owned();
                 if url_str.contains("://") {
                     SourceAddress::Url(url_str)
                 } else {
@@ -1546,6 +1546,70 @@ mod tests {
         assert!(cache.is_empty());
     }
     use std::ffi::CString;
+
+    #[test]
+    fn source_string_bounds_preserve_decoding_and_snapshot_skipping() {
+        use crate::sdk_text::MAX_SDK_STRING_BYTES;
+        let mut longest = vec![b'x'; MAX_SDK_STRING_BYTES];
+        *longest.last_mut().unwrap() = 0;
+        let mut too_long = vec![b'x'; MAX_SDK_STRING_BYTES + 1];
+        *too_long.last_mut().unwrap() = 0;
+        let descriptor = |name: *const std::ffi::c_char, address| NDIlib_source_t {
+            p_ndi_name: name,
+            __bindgen_anon_1: NDIlib_source_t__bindgen_ty_1 {
+                p_url_address: address,
+            },
+        };
+        let fits = descriptor(longest.as_ptr().cast(), ptr::null());
+        // SAFETY: all test descriptors point to live allocations readable
+        // through NUL or the scan limit, retained through every conversion.
+        unsafe {
+            assert_eq!(
+                Source::try_from_raw(&fits).unwrap().name.len(),
+                MAX_SDK_STRING_BYTES - 1
+            );
+            for raw in [
+                descriptor(too_long.as_ptr().cast(), ptr::null()),
+                descriptor(c"Camera".as_ptr(), too_long.as_ptr().cast()),
+            ] {
+                assert!(matches!(
+                    Source::try_from_raw(&raw),
+                    Err(Error::UnexpectedSdkResult(_))
+                ));
+            }
+            let lossy = descriptor(c"bad\xff".as_ptr(), c"ndi://host:5960".as_ptr());
+            let source = Source::try_from_raw(&lossy).unwrap();
+            assert_eq!(source.name, "bad\u{fffd}");
+            assert!(matches!(source.address, SourceAddress::Url(_)));
+            assert!(matches!(
+                Source::try_from_raw(ptr::null()),
+                Err(Error::NullPointer(_))
+            ));
+        }
+        let ndi = NDI::new().unwrap();
+        let finder = Finder::new(&ndi, &FinderOptions::default()).unwrap();
+        let entries = [
+            descriptor(c"First".as_ptr(), ptr::null()),
+            descriptor(too_long.as_ptr().cast(), ptr::null()),
+            descriptor(ptr::null(), ptr::null()),
+            descriptor(c"Last".as_ptr(), ptr::null()),
+        ];
+        // SAFETY: entries and their strings outlive the locked snapshot copy.
+        let sources = unsafe {
+            finder.current_sources_with(
+                |count| {
+                    *count = entries.len() as u32;
+                    entries.as_ptr()
+                },
+                |raw| Source::try_from_raw(raw),
+            )
+        }
+        .unwrap();
+        assert_eq!(
+            sources.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["First", "Last"]
+        );
+    }
 
     #[test]
     fn defaults_include_local_sources() {

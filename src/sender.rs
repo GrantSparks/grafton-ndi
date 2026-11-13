@@ -23,9 +23,6 @@ compile_error!(
     "This crate requires atomic pointer support. Please use a target with atomics enabled."
 );
 
-#[cfg(target_os = "windows")]
-static FLUSH_MUTEX: Mutex<()> = Mutex::new(());
-
 /// Flush the async video pipeline by passing a true NULL pointer.
 ///
 /// The NDI SDK documentation specifies that calling
@@ -36,18 +33,11 @@ fn async_flush_frame_ptr() -> *const NDIlib_video_frame_v2_t {
     ptr::null()
 }
 
+// Every caller holds this sender's video lock or exclusive access during drop.
+// Different senders do not need to wait for one another's SDK synchronization.
 fn flush_null_frame(instance: NDIlib_send_instance_t) {
-    #[cfg(target_os = "windows")]
-    {
-        let _lock = FLUSH_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        unsafe {
-            NDIlib_send_send_video_async_v2(instance, async_flush_frame_ptr());
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
+    // SAFETY: the instance is live, and Processing.NDI.Send.h documents a null
+    // frame pointer as the synchronous release of the previous async buffer.
     unsafe {
         NDIlib_send_send_video_async_v2(instance, async_flush_frame_ptr());
     }
@@ -669,7 +659,10 @@ impl Sender {
         }
     }
 
-    /// Get the current tally state for this sender.
+    /// Wait for a tally change reported by the SDK.
+    ///
+    /// `None` means no change was reported; it does not mean the source is off
+    /// program or preview. Keep the last observed tally between calls.
     ///
     /// # Arguments
     ///
@@ -678,7 +671,8 @@ impl Sender {
     ///
     /// # Returns
     ///
-    /// `Ok(Some(tally))` if tally was successfully retrieved, `Ok(None)` on timeout.
+    /// `Ok(Some(tally))` when the SDK reports a change, `Ok(None)` otherwise.
+    /// Even a zero-timeout poll of an unchanged tally can return `None`.
     ///
     /// # Errors
     ///
@@ -694,11 +688,12 @@ impl Sender {
     /// let options = SenderOptions::builder("Test Sender").build();
     /// let sender = grafton_ndi::Sender::new(&ndi, &options)?;
     ///
-    /// // Try to get tally with 1 second timeout
-    /// if let Some(tally) = sender.tally(Duration::from_secs(1))? {
-    ///     println!("On program: {}, On preview: {}", tally.on_program, tally.on_preview);
-    /// } else {
-    ///     println!("Tally request timed out");
+    /// let mut last_tally = grafton_ndi::Tally::new(false, false);
+    /// for _ in 0..10 {
+    ///     if let Some(changed) = sender.tally(Duration::from_millis(100))? {
+    ///         last_tally = changed;
+    ///     }
+    ///     println!("On program: {}, On preview: {}", last_tally.on_program, last_tally.on_preview);
     /// }
     /// # Ok(())
     /// # }

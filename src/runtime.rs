@@ -104,16 +104,6 @@ impl<B: RuntimeBackend> RuntimeManager<B> {
                     drop(guard);
 
                     // Call NDIlib_initialize outside the lock
-                    #[cfg(all(target_os = "windows", debug_assertions))]
-                    {
-                        if std::env::var("CI").is_ok() {
-                            eprintln!("[NDI] Initializing NDI runtime in CI environment...");
-                            if let Ok(sdk_dir) = std::env::var("NDI_SDK_DIR") {
-                                eprintln!("[NDI] NDI_SDK_DIR: {}", sdk_dir);
-                            }
-                        }
-                    }
-
                     let succeeded = self.backend.initialize();
 
                     // Re-acquire lock to update state
@@ -268,7 +258,8 @@ impl NDI {
     /// # Errors
     ///
     /// Returns an error if the version string cannot be retrieved or contains
-    /// invalid UTF-8.
+    /// invalid UTF-8. [`Error::UnexpectedSdkResult`] reports version text with
+    /// no NUL terminator within 4 MiB.
     ///
     /// # Examples
     ///
@@ -288,9 +279,10 @@ impl NDI {
             if version_ptr.is_null() {
                 return Err(Error::NullPointer("NDIlib_version".into()));
             }
-            let c_str = std::ffi::CStr::from_ptr(version_ptr);
-            c_str
-                .to_str()
+            // SAFETY: NDIlib_version supplies a live string from the linked
+            // runtime, readable through its terminator or the scan limit.
+            let bytes = crate::sdk_text::read(version_ptr, "NDIlib_version")?;
+            std::str::from_utf8(bytes)
                 .map(|s| s.to_owned())
                 .map_err(|e| Error::InvalidUtf8(e.to_string()))
         }

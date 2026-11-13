@@ -189,7 +189,8 @@ impl PixelFormatInfo {
     ///   - Y plane: `y_stride * height`
     ///   - U plane: `(y_stride/2) * (height/2)`
     ///   - V plane: `(y_stride/2) * (height/2)`
-    /// - **Semi-planar 4:2:0 NV12**: requires even height, then `Y + UV` where:
+    /// - **Semi-planar 4:2:0 NV12**: requires even height (any stride), then
+    ///   `Y + UV` where:
     ///   - Y plane: `y_stride * height`
     ///   - UV plane: `y_stride * (height/2)`
     pub fn try_buffer_len(&self, y_stride: i32, height: i32) -> Result<usize> {
@@ -2303,7 +2304,7 @@ impl ValidatedVideoLayout {
         height: i32,
         line_stride: Option<i32>,
     ) -> Result<Self> {
-        validate_video_dimensions_for_format(pixel_format, width, height)?;
+        validate_video_dimensions(width, height)?;
 
         let width_usize = usize::try_from(width)
             .map_err(|_| Error::InvalidFrame(format!("Invalid width value: {width}")))?;
@@ -2334,12 +2335,6 @@ impl ValidatedVideoLayout {
             }
             None => min_stride,
         };
-
-        if pixel_format.info().is_planar_420() && !line_stride_usize.is_multiple_of(2) {
-            return Err(Error::InvalidFrame(format!(
-                "Planar 4:2:0 video frame has odd line_stride_in_bytes: {line_stride_usize}"
-            )));
-        }
 
         let (plane_layouts, plane_count, data_len_bytes, payload_len_bytes) = video_plane_layouts(
             pixel_format.info(),
@@ -2422,22 +2417,11 @@ pub(crate) fn validate_video_layout(raw: &NDIlib_video_frame_v2_t) -> Result<Val
     ValidatedVideoLayout::new_uncompressed(pixel_format, raw.xres, raw.yres, Some(line_stride))
 }
 
-fn validate_video_dimensions_for_format(
-    pixel_format: PixelFormat,
-    width: i32,
-    height: i32,
-) -> Result<()> {
+fn validate_video_dimensions(width: i32, height: i32) -> Result<()> {
     validate_video_width(width)?;
     if height <= 0 {
         return Err(Error::InvalidFrame(format!(
             "Video frame has invalid height: {height}"
-        )));
-    }
-
-    if pixel_format.info().is_planar_420() && height % 2 != 0 {
-        return Err(Error::InvalidFrame(format!(
-            "Planar 4:2:0 video frames require even dimensions, got {}x{}",
-            width, height
         )));
     }
 
@@ -2554,9 +2538,9 @@ fn video_plane_layouts(
         FormatCategory::Packed => 1,
         FormatCategory::Planar420 => {
             if !height.is_multiple_of(2) || !stride.is_multiple_of(2) {
-                return Err(Error::InvalidFrame(
-                    "Planar 4:2:0 video frames require even height and stride".into(),
-                ));
+                return Err(Error::InvalidFrame(format!(
+                    "Planar 4:2:0 (YV12/I420) video frames require even height and line stride, got height {height} and stride {stride}"
+                )));
             }
             dimensions[1] = (stride / 2, active / 2, height / 2);
             dimensions[2] = dimensions[1];
@@ -2564,18 +2548,18 @@ fn video_plane_layouts(
         }
         FormatCategory::SemiPlanar420 => {
             if !height.is_multiple_of(2) {
-                return Err(Error::InvalidFrame(
-                    "Semi-planar 4:2:0 video frames require even height".into(),
-                ));
+                return Err(Error::InvalidFrame(format!(
+                    "Semi-planar 4:2:0 (NV12) video frames require even height, got {height}"
+                )));
             }
             dimensions[1] = (stride, active, height / 2);
             2
         }
         FormatCategory::PackedAlpha => {
             if !stride.is_multiple_of(2) {
-                return Err(Error::InvalidFrame(
-                    "UYVA video frames require even stride".into(),
-                ));
+                return Err(Error::InvalidFrame(format!(
+                    "UYVA video frames require even line stride, got {stride}"
+                )));
             }
             dimensions[1] = (stride / 2, active / 2, height);
             2
@@ -4950,6 +4934,55 @@ mod tests {
             .info()
             .try_buffer_len(y_stride, 1081)
             .is_err());
+    }
+
+    /// 4:2:0 parity is decided only by the shared plane layout, so every path
+    /// answers alike: NV12 accepts an odd stride, YV12/I420 reject odd stride
+    /// and odd height, and all three reject odd height.
+    #[test]
+    fn test_420_parity_is_consistent_across_paths() {
+        // (format, height, stride, accepted)
+        let cases = [
+            (PixelFormat::NV12, 1080, 1921, true),
+            (PixelFormat::NV12, 1080, 1920, true),
+            (PixelFormat::NV12, 1081, 1920, false),
+            (PixelFormat::YV12, 1080, 1921, false),
+            (PixelFormat::I420, 1080, 1921, false),
+            (PixelFormat::YV12, 1081, 1920, false),
+            (PixelFormat::I420, 1081, 1920, false),
+            (PixelFormat::YV12, 1080, 1920, true),
+            (PixelFormat::I420, 1080, 1920, true),
+        ];
+        for (format, height, stride, accepted) in cases {
+            let label = format!("{format:?} {stride}x{height}");
+            let info_len = format.info().try_buffer_len(stride, height);
+            let layout = ValidatedVideoLayout::new_uncompressed(format, 1920, height, Some(stride));
+            assert_eq!(info_len.is_ok(), accepted, "try_buffer_len {label}");
+            assert_eq!(layout.is_ok(), accepted, "new_uncompressed {label}");
+
+            let data = vec![0u8; stride as usize * height as usize * 2];
+            let sender = crate::BorrowedVideoFrame::builder(&data, 1920, height, format)
+                .line_stride(stride)
+                .build();
+            assert_eq!(sender.is_ok(), accepted, "BorrowedVideoFrame {label}");
+
+            if let (Ok(len), Ok(layout)) = (info_len, layout) {
+                assert_eq!(layout.data_len_bytes, len, "{label}");
+            }
+            if !accepted && height % 2 == 0 {
+                let msg = format.info().try_buffer_len(stride, height).unwrap_err();
+                let msg = msg.to_string();
+                assert!(
+                    msg.contains(&stride.to_string()) && msg.contains("4:2:0"),
+                    "{label}: {msg}"
+                );
+            }
+        }
+        // NV12 odd stride: the UV plane is height/2 rows of the full stride.
+        assert_eq!(
+            PixelFormat::NV12.info().try_buffer_len(1921, 1080).unwrap(),
+            1921 * 1080 + 1921 * 540
+        );
     }
 
     /// Test PixelFormat::line_stride for all formats

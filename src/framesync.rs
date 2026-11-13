@@ -133,6 +133,8 @@ pub struct FrameSyncAudioRequest {
 impl FrameSyncAudioRequest {
     /// Query the current incoming audio format without requesting sample data.
     /// The result has zero sample rate and channels if no input format is known.
+    /// Read it through [`FrameSync::capture_audio`]; the owned convenience
+    /// method returns `None` for a query because there are no samples to own.
     pub const fn query_input() -> Self {
         Self {
             sample_rate: 0,
@@ -142,6 +144,10 @@ impl FrameSyncAudioRequest {
     }
 
     /// Capture samples using the source sample rate and explicit output channels.
+    ///
+    /// Before source audio arrives the SDK can return a zero sample rate,
+    /// producing [`Error::InvalidFrame`]. Use [`Self::capture_with`] with an
+    /// explicit positive rate when startup silence is required.
     ///
     /// # Errors
     ///
@@ -155,6 +161,9 @@ impl FrameSyncAudioRequest {
     /// Capture samples with an optional source-derived sample rate.
     ///
     /// `None` uses the current source rate. `Some(rate)` must be positive.
+    /// Before source audio arrives, `None` can produce [`Error::InvalidFrame`]
+    /// because the source rate is not known. `Some(48_000)`, for example,
+    /// requests silence at 48 kHz until audio arrives.
     /// Channels and samples per channel must always be explicitly positive.
     /// A request can be copied and reused across borrowed and owned captures.
     ///
@@ -191,8 +200,11 @@ impl FrameSyncAudioRequest {
 ///
 /// # Thread Safety
 ///
-/// `FrameSync` is `Send + Sync` like `Receiver`, as the underlying NDI SDK
-/// frame-sync functions are thread-safe. Frames returned by capture methods
+/// `FrameSync` is `Send + Sync` like `Receiver`. This relies on measured SDK
+/// behavior on Linux x86_64 with NDI 6.1.1, 6.3.2 and 6.4, rather than an
+/// explicit threading guarantee in the FrameSync headers. Other platforms were
+/// not measured. See the repository's SDK validation guide.
+/// Frames returned by capture methods
 /// borrow from the FrameSync and are neither `Send` nor `Sync`. Convert them
 /// to owned frames to transfer ownership to another thread. Immutable video
 /// plane/row views can instead be moved or shared with scoped workers while
@@ -201,6 +213,10 @@ impl FrameSyncAudioRequest {
 /// Raw video capture through the underlying receiver is disabled while this
 /// FrameSync exists. [`Self::into_receiver`] destroys the synchronizer and
 /// restores raw video capture before returning the receiver.
+/// Raw audio capture on [`Self::receiver`] remains available for compatibility,
+/// but competes with FrameSync for the same incoming audio and can cause the
+/// synchronizer to return silence. Use FrameSync's audio methods, or recover the
+/// receiver first, rather than mixing the two capture paths.
 ///
 /// # Example
 ///
@@ -433,7 +449,26 @@ impl FrameSync {
     /// Use [`FrameSyncAudioRequest::query_input`] to query the current input
     /// format without capturing samples. The returned frame contains the
     /// input's sample rate and channel count, or a validated empty no-source
-    /// state when no audio format has been received yet.
+    /// state when no audio format has been received yet. Inspect the borrowed
+    /// query before dropping it; `capture_audio_owned(query_input())` returns
+    /// `None` and therefore does not retain the queried format:
+    ///
+    /// ```no_run
+    /// # use grafton_ndi::{FrameSync, FrameSyncAudioRequest};
+    /// # fn query(fs: &FrameSync) -> grafton_ndi::Result<()> {
+    /// let input = fs.capture_audio(FrameSyncAudioRequest::query_input())?;
+    /// let rate = input.sample_rate();
+    /// let channels = input.num_channels();
+    /// drop(input);
+    /// if rate > 0 && channels > 0 {
+    ///     let request = FrameSyncAudioRequest::capture_with(Some(rate), channels, 480)?;
+    ///     let audio = fs.capture_audio(request)?;
+    ///     // Process the samples here; query again to follow format changes.
+    ///     # drop(audio);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
@@ -523,6 +558,8 @@ impl FrameSync {
     /// Query the current audio queue depth.
     ///
     /// Returns the approximate number of audio samples currently buffered.
+    /// Linux runtime measurements found this SDK read is outside its capture
+    /// lock; it is an approximate observation, not a synchronized snapshot.
     /// This can be useful when using an inaccurate timer for audio playback.
     ///
     /// **Note:** This value may change immediately after being read as new
@@ -553,7 +590,8 @@ impl FrameSync {
 
 /// # Safety
 ///
-/// The NDI SDK documentation states that framesync operations are thread-safe.
+/// Linux x86_64 measurements on NDI 6.1.1, 6.3.2 and 6.4 support moving and
+/// concurrently using a FrameSync (see the type's thread-safety section).
 /// The FrameSync owns its receiver, keeping the SDK runtime alive. Borrowed
 /// frame guards cannot be moved between threads and keep this owner borrowed
 /// until their buffers are freed; destruction requires exclusive ownership.
@@ -561,8 +599,9 @@ unsafe impl Send for FrameSync {}
 
 /// # Safety
 ///
-/// The NDI SDK guarantees that framesync capture functions are internally
-/// synchronized and can be called concurrently from multiple threads. Receiver
+/// In the measured Linux runtimes, video/audio capture and video free take an
+/// instance lock; audio free uses atomics. The queue-depth read is unlocked.
+/// The SDK headers do not explicitly guarantee this on all platforms. Receiver
 /// attachment disables raw video capture until the synchronizer is destroyed,
 /// including when the receiver is accessed through [`FrameSync::receiver`].
 unsafe impl Sync for FrameSync {}

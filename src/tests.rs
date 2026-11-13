@@ -315,6 +315,36 @@ fn test_retry_logic_constants() {
 }
 
 #[test]
+fn sdk_waits_round_up_and_preserve_the_2x_maximum() {
+    use crate::{to_ms_checked, Error, MAX_TIMEOUT};
+    use std::time::Duration;
+    assert_eq!(MAX_TIMEOUT, Duration::from_millis(u64::from(u32::MAX)));
+    for (wait, expected) in [
+        (Duration::ZERO, 0),
+        (Duration::from_nanos(1), 1),
+        (Duration::from_nanos(999_999), 1),
+        (Duration::from_millis(1), 1),
+        (Duration::from_nanos(1_000_001), 2),
+        (MAX_TIMEOUT - Duration::from_millis(1), u32::MAX - 1),
+        (MAX_TIMEOUT - Duration::from_nanos(1), u32::MAX - 1),
+        (MAX_TIMEOUT, u32::MAX - 1),
+    ] {
+        assert_eq!(to_ms_checked(wait).unwrap(), expected, "{wait:?}");
+    }
+    for wait in [MAX_TIMEOUT + Duration::from_nanos(1), Duration::MAX] {
+        assert!(matches!(
+            to_ms_checked(wait),
+            Err(Error::InvalidConfiguration(_))
+        ));
+        assert!(matches!(
+            crate::timeout_deadline(wait),
+            Err(Error::InvalidConfiguration(_))
+        ));
+    }
+    assert!(crate::timeout_deadline(Duration::ZERO).unwrap() <= std::time::Instant::now());
+}
+
+#[test]
 fn test_timeout_duration_calculation() {
     let timeout_ms: u32 = 5000;
     let timeout_duration = std::time::Duration::from_millis(timeout_ms.into());
