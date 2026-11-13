@@ -360,7 +360,102 @@ row, a receiver got nothing for 15 seconds, and the tests could not say whether
 it had connected. On Linux the namespace leaves the SDK no address but
 loopback, and on macOS it is given a loopback discovery address; on Windows it
 sees the machine's network adapter and is given nothing, and the log shows
-which addresses it used.
+which addresses it used. In run 43342188690 the three Windows Advanced rows
+printed it; the Windows Standard 6.4 row's failed executable printed none,
+although the Linux Standard 6.4 runtime writes the log with the same
+configuration.
+
+### Receivers that never connect on Windows
+
+In run 43342188690 the SDK logs of the three Windows Advanced rows show 70
+receivers that `tests/advanced_runtime.rs` opened at `127.0.0.1:<port>` to a
+sender of its own (one test's 16 simultaneous receivers counted once). 15
+never connected: the receiver reported no connection for the whole 15 s, and
+its sender logged no `connection opened`. Where a test opened a second receiver
+3 to 10 ms later to the same address, that one connected within 2 ms; every
+receiver that connected did so within 4 ms. The failures move between tests
+and rows from run to run. What preceded each receiver:
+
+| Within 150 ms before the receiver was opened | Receivers | Never connected |
+| --- | --- | --- |
+| a receiver of the process closed, and a sender shut down | 43 | 12 |
+| a sender shut down, but no receiver the log shows closed within 300 ms | 15 | 1 |
+| neither | 12 | 2 |
+
+The three in the last two rows each followed a test whose receivers' teardown
+the log does not show: one had created receivers by name only and with no
+source, and in the other two rows the test just before had no sender and only
+a genlock without a reference. So the failures follow the teardown of
+receivers in the same process more closely than they follow the reuse of the
+port. Two more things count against a listener of the previous sender that
+outlives it and takes the next connection, which a socket of the new sender
+would have to share the port with:
+
+- On Linux, `strace` of the Advanced 6.4 runtime shows that a sender binds its
+  listener on `0.0.0.0` without `SO_REUSEADDR`, and a sender created while
+  another socket holds 5961 is given 5962 (both measured with
+  `ci/offline/linux.sh`). If the Windows runtime binds the same way, a
+  listener that outlived its sender would have moved the next sender off 5961;
+  on Windows every such sender was given 5961.
+- On the Advanced 6.3.2 row, the 15 receivers opened within 100 ms after the
+  one that failed in the 16-receiver test all connected to the same sender, as
+  did the second receivers above: the sender's listener accepted connections
+  throughout.
+
+`tests/receiver_video_only.rs` failed differently, on the Windows Standard 6.4
+row of runs 43332050213 and 43342188690 (no other Windows row has run it with a
+runtime that has video-only receiving): both times its `VideoOnlyLowest`
+receiver, opened as soon as the `VideoOnlyHighest` one was dropped, was given
+no video in 15 s while the ordinary receiver was given audio throughout, and in
+the second run, which reported the counts, it counted no connection while the
+sender counted two, its ordinary receiver and one more. In
+`a_genlock_moves_between_threads` on the x64 Advanced 6.4 row of run
+43342188690 the genlock's receiver connected and received, and the genlock
+never acquired the reference: a third failure, not one of a connection.
+
+`tests/common` therefore gives every receiver on Windows a loopback address no
+receiver of its process was given before: `loopback_endpoint` names
+127.0.0.2, 127.0.0.3 and so on with the port the SDK advertises (see
+`loopback_host`). Every address in 127.0.0.0/8 reaches a sender's listener on
+`0.0.0.0`, so a receiver never connects to a destination that a torn-down
+connection used, whatever the SDK or the operating system keeps for one.
+Linux and macOS keep 127.0.0.1: neither has shown the failure, and macOS has
+no other loopback address. The helper first checks that 127.0.0.2 reaches a
+listener on `0.0.0.0`, and otherwise keeps 127.0.0.1 and says why on standard
+error. Tests that open several receivers resolve the endpoint once for each.
+
+`tests/peer_recreation.rs` asserts that receivers connect to senders and as
+receivers that are recreated in quick succession, and prints a line for each
+receiver: the sender's port and the one before, the address, when the receiver
+first counted a connection and when it was given a frame, and both ends'
+connection counts. On Windows each arm also runs as an unasserted control whose
+receivers are given `127.0.0.1:<port>`. Read with this table, its report
+separates the explanations:
+
+| The report shows | A listener that outlives its sender | State per destination, left by a connection's teardown | State per process, left by a receiver's teardown |
+| --- | --- | --- | --- |
+| control `sender` arm, gaps of 0 and 50 ms | failures | failures | failures |
+| helper `sender` arm, gaps of 0 and 50 ms | failures | none | failures |
+| `settled` arms, receiver dropped 500 ms before its sender | failures | none | none |
+| control `receiver` arm | none | failures | failures |
+| helper `receiver` arm | none | none | failures |
+
+The gaps of 250 ms and 1 s show how long whatever the failure needs lasts. The
+port probe, which runs first, says whether the first explanation is possible
+at all: it needs the SDK's listener to share a port with another socket, which
+the probe shows as a sender given the port it holds, and a port that cannot be
+bound as soon as its sender is dropped is a socket that outlived it. A
+receiver that has not connected after 2 s is diagnosed with the Windows TCP
+table of its port (`common::socket_table`, also added to the failure messages
+of `tests/advanced_runtime.rs` and `tests/receiver_video_only.rs`): two
+`LISTENING` rows for `0.0.0.0:<port>` owned by the test, told apart by their
+`CreationTime`, are a listener that outlived its sender; a row from the
+receiver to the port that is `ESTABLISHED` while the sender counts no
+connection is a connection nobody services; `SYN_SENT` is a connection
+attempt nobody answers; and no row at all is a receiver that has not tried,
+which is state in the SDK rather than in TCP. A second receiver is then opened
+to the same address, which shows whether the sender takes connections at that
+moment.
 
 On Linux the same run works locally:
 
@@ -525,9 +620,13 @@ New, and so unverified anywhere but Linux x86_64:
   once inside the wrapper but that the mDNS datagram is `reached`, because the
   firewall discards it silently; the check reports that as a limitation on
   Windows, and run 43332050213 passed that way on every Windows row;
-- the Windows wrapper's SDK log: that the Windows runtime honours
-  `NDI_CONFIG_DIR` and the log settings as the Linux one does, and that the log
-  is printed after a failed executable;
+- the Windows wrapper's SDK log with the Standard runtime: run 43342188690
+  printed the Advanced runtime's log after a failed executable, but the
+  Standard 6.4 row's failed executable printed none;
+- the distinct loopback addresses that `tests/common` gives receivers on
+  Windows, and `tests/peer_recreation.rs` with its control, port probe and TCP
+  tables there (see
+  [Receivers that never connect on Windows](#receivers-that-never-connect-on-windows));
 - every promise of the Windows and macOS rows, in particular `file` beside a
   Standard runtime in the Windows x64 Standard 6.4 row;
 - the Advanced lint on Windows and macOS;
