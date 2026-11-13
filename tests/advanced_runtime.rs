@@ -14,8 +14,9 @@ use grafton_ndi::{
     advanced::*,
     capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, SdkEdition},
     AudioFrame, Error, Finder, FinderOptions, FrameRate, MediaTypes, MetadataFrame, Ndi, Receiver,
-    ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions, ScanType, Sender, SenderMode,
-    SenderOptions, SettingChange, Source, StreamTier, Tally, Timecode, VideoFrame, VideoFrameRef,
+    ReceiverBandwidth, ReceiverColorFormat, ReceiverMode, ReceiverOptions, ScanType, Sender,
+    SenderMode, SenderOptions, SettingChange, Source, StreamTier, Tally, Timecode, VideoFrame,
+    VideoFrameRef,
 };
 use std::{
     sync::{
@@ -53,6 +54,26 @@ fn video() -> VideoFrame {
 
 fn unconnected_receiver(ndi: &Ndi) -> Receiver {
     Receiver::new(ndi, &ReceiverOptions::new(Source::new(""))).unwrap()
+}
+
+/// What `receiver` says about its connection, for the message of a test that
+/// waited for media in vain: the source it was given, and its connection
+/// count and frame counters, which tell a receiver that never connected from
+/// one that connected and was given nothing.
+fn link<M: ReceiverMode>(receiver: &Receiver<M>) -> String {
+    format!(
+        "the receiver of {:?} reports {:?}",
+        receiver.source(),
+        receiver.connection_stats()
+    )
+}
+
+/// How many receivers `sender` counts, for the same messages.
+fn served<M: SenderMode>(sender: &Sender<M>) -> String {
+    match sender.connection_count(Duration::ZERO) {
+        Ok(count) => format!("the sender counts {count} connections"),
+        Err(error) => format!("the sender's connection count failed: {error}"),
+    }
 }
 
 #[test]
@@ -403,10 +424,16 @@ fn an_advertised_packet_receiver_outlives_its_allocators() {
         .unwrap();
     let frame = video();
     let deadline = Instant::now() + PATIENCE;
+    let mut events = 0;
     while count.load(Ordering::Relaxed) == 0 {
-        assert!(Instant::now() < deadline, "the policy made no allocation");
+        assert!(
+            Instant::now() < deadline,
+            "the policy made no allocation, and {events} events were captured; {}; {}",
+            link(packets.receiver()),
+            served(&sender)
+        );
         sender.send_video(&frame).unwrap();
-        let _ = packets.capture(SLICE).unwrap();
+        events += usize::from(packets.capture(SLICE).unwrap().is_some());
     }
 
     let mut advertiser =
@@ -708,18 +735,24 @@ fn await_audio(receiver: &mut PacketReceiver, timecode: i64) -> CompressedAudioF
     )
 }
 
-/// Send frames with `probe` until `receiver` is given one.
-fn connect(receiver: &mut PacketReceiver, mut probe: impl FnMut(i64)) {
+/// Send frames with `probe` until `receiver` is given one. A failure names
+/// the receiver `what`.
+fn connect(receiver: &mut PacketReceiver, what: &str, mut probe: impl FnMut(i64)) {
     let deadline = Instant::now() + PATIENCE;
+    let mut events = 0;
     for timecode in 0.. {
         probe(timecode);
-        if matches!(
-            receiver.capture(SLICE).unwrap(),
-            Some(PacketEvent::Video(_) | PacketEvent::Audio(_))
-        ) {
-            return;
+        match receiver.capture(SLICE).unwrap() {
+            Some(PacketEvent::Video(_) | PacketEvent::Audio(_)) => return,
+            Some(_) => events += 1,
+            None => {}
         }
-        assert!(Instant::now() < deadline, "the receiver did not connect");
+        assert!(
+            Instant::now() < deadline,
+            "{what} did not connect: {} probes sent, {events} other events captured; {}",
+            timecode + 1,
+            link(receiver.receiver())
+        );
     }
 }
 
@@ -890,7 +923,7 @@ fn compressed_video_arrives_as_sent_by_every_kind_of_send() {
         (&mut program, StreamTier::Program),
         (&mut preview, StreamTier::Preview),
     ] {
-        connect(receiver, |timecode| {
+        connect(receiver, &format!("the {tier:?} receiver"), |timecode| {
             sender
                 .send_video(&mut keyframe(VideoCodec::H264, tier, timecode))
                 .unwrap();
@@ -1097,7 +1130,7 @@ fn every_audio_frame_the_wrapper_admits_is_delivered_as_sent() {
         &sender.sender().source().unwrap(),
         ReceiverBandwidth::Highest,
     );
-    connect(&mut receiver, |timecode| {
+    connect(&mut receiver, "the receiver", |timecode| {
         let mut probe = CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 64])
             .unwrap()
             .with_timecode(Timecode::from_ticks(timecode));
@@ -1253,7 +1286,7 @@ fn every_video_frame_the_wrapper_admits_is_delivered() {
         (&mut program, StreamTier::Program),
         (&mut preview, StreamTier::Preview),
     ] {
-        connect(receiver, |timecode| {
+        connect(receiver, &format!("the {tier:?} receiver"), |timecode| {
             sender
                 .send_video(&mut keyframe(VideoCodec::H264, tier, timecode))
                 .unwrap();
@@ -1369,8 +1402,11 @@ fn a_relay_delivers_every_packet_it_receives() {
         &relay.sender().source().unwrap(),
         ReceiverBandwidth::Highest,
     );
-    for (sender, receiver) in [(&mut origin, &mut upstream), (&mut relay, &mut downstream)] {
-        connect(receiver, |timecode| {
+    for (what, sender, receiver) in [
+        ("the upstream receiver", &mut origin, &mut upstream),
+        ("the downstream receiver", &mut relay, &mut downstream),
+    ] {
+        connect(receiver, what, |timecode| {
             sender
                 .send_video(&mut keyframe(
                     VideoCodec::H264,
@@ -1463,7 +1499,7 @@ fn a_frame_can_be_sent_again_after_the_sdk_has_written_to_it() {
         &sender.sender().source().unwrap(),
         ReceiverBandwidth::Highest,
     );
-    connect(&mut receiver, |timecode| {
+    connect(&mut receiver, "the receiver", |timecode| {
         sender
             .send_video(&mut keyframe(
                 VideoCodec::H264,
@@ -1566,7 +1602,7 @@ fn a_frame_returned_by_a_queued_sender_can_be_resubmitted() {
         &queue.sender().source().unwrap(),
         ReceiverBandwidth::Highest,
     );
-    connect(&mut receiver, |timecode| {
+    connect(&mut receiver, "the receiver", |timecode| {
         queue
             .try_submit(keyframe(VideoCodec::H264, StreamTier::Program, timecode))
             .unwrap();
@@ -1620,7 +1656,7 @@ fn a_queued_sender_moves_between_threads() {
         &queue.sender().source().unwrap(),
         ReceiverBandwidth::Highest,
     );
-    connect(&mut receiver, |timecode| {
+    connect(&mut receiver, "the receiver", |timecode| {
         queue
             .try_submit(keyframe(VideoCodec::H264, StreamTier::Program, timecode))
             .unwrap();
@@ -1711,7 +1747,11 @@ fn a_packet_receiver_moves_between_threads() {
             let deadline = Instant::now() + PATIENCE;
             let mut verified = 0;
             while verified < 4 {
-                assert!(Instant::now() < deadline, "{verified} packets arrived");
+                assert!(
+                    Instant::now() < deadline,
+                    "{verified} packets arrived; {}",
+                    link(receiver.receiver())
+                );
                 if let Some(PacketEvent::Video(ReceivedVideo::Compressed(frame))) =
                     receiver.capture(SLICE).unwrap()
                 {
@@ -1785,20 +1825,28 @@ fn an_allocated_packet_receiver_moves_between_threads() {
             let _stop = StopOnDrop(&stop);
             let mut packets = packets;
             // Capture until video arrives after `count`'s policy has run.
-            let used = |packets: &mut AllocatedPacketReceiver, count: &AtomicUsize| {
+            let used = |packets: &mut AllocatedPacketReceiver, count: &AtomicUsize, which: &str| {
                 let deadline = Instant::now() + PATIENCE;
+                let mut videos = 0;
                 loop {
-                    assert!(Instant::now() < deadline, "the policy was not used");
+                    assert!(
+                        Instant::now() < deadline,
+                        "the {which} policy was not used: {videos} video frames arrived and it \
+                         made {} allocations; {}",
+                        count.load(Ordering::Relaxed),
+                        link(packets.receiver())
+                    );
                     let video =
                         matches!(packets.capture(SLICE).unwrap(), Some(PacketEvent::Video(_)));
+                    videos += usize::from(video);
                     if video && count.load(Ordering::Relaxed) > 0 {
                         return;
                     }
                 }
             };
-            used(&mut packets, &first);
+            used(&mut packets, &first, "first");
             packets.set_video_allocator(policy(&second)).unwrap();
-            used(&mut packets, &second);
+            used(&mut packets, &second, "second");
             packets
         });
         let frame = video();
@@ -1845,7 +1893,10 @@ fn exchange_metadata<M: SenderMode>(ndi: &Ndi, sender: &Sender<M>, kind: &str) -
     while !(connected && delivered && returned) {
         assert!(
             Instant::now() < deadline,
-            "{kind}: connection metadata {connected}, sent {delivered}, returned {returned}"
+            "{kind}: connection metadata {connected}, sent {delivered}, returned {returned}; \
+             {}; {}",
+            link(&receiver),
+            served(sender)
         );
         sender.send_metadata(&downstream);
         if let Some(frame) = receiver.metadata().capture(SLICE).unwrap() {
@@ -1940,15 +1991,22 @@ fn synchronized_audio(
 ) -> Vec<(AudioFrame, bool)> {
     let deadline = Instant::now() + PATIENCE;
     let mut audio = Vec::new();
+    // Video frames captured, and the requests answered with no audio stream,
+    // with no matching samples and with no samples.
+    let (mut videos, mut no_stream, mut no_match, mut empty) = (0, 0, 0, 0);
     while audio.len() < count {
         assert!(
             Instant::now() < deadline,
-            "AVSync returned audio {} times, not {count}",
-            audio.len()
+            "AVSync returned audio {} times, not {count}, for {videos} video frames; it found \
+             no audio stream {no_stream} times, no matching samples {no_match} times and no \
+             samples {empty} times; {}",
+            audio.len(),
+            link(sync.receiver())
         );
         let Some(video) = sync.receiver().video().capture_ref(SLICE).unwrap() else {
             continue;
         };
+        videos += 1;
         let outcome = match pass {
             Pass::Captured => sync.synchronize(Some(&video), request),
             Pass::Owned => sync.synchronize(Some(&video.to_owned()), request),
@@ -1961,9 +2019,9 @@ fn synchronized_audio(
             } => audio.push((frame, samples_adjusted)),
             // The streams are starting, or this frame's audio is still on
             // its way.
-            AvSyncOutcome::NoAudioStream
-            | AvSyncOutcome::NoMatchingSamples
-            | AvSyncOutcome::Empty { .. } => {}
+            AvSyncOutcome::NoAudioStream => no_stream += 1,
+            AvSyncOutcome::NoMatchingSamples => no_match += 1,
+            AvSyncOutcome::Empty { .. } => empty += 1,
             other => panic!("unexpected AVSync outcome {other:?}"),
         }
     }
@@ -2661,18 +2719,27 @@ fn avsync_follows_source_format_changes_and_preserves_audio_samples() {
             phase.store(index, Ordering::Release);
             let deadline = Instant::now() + PATIENCE;
             let mut matches = 0;
+            // Video frames captured, those of this format, and the audio
+            // returned for them.
+            let (mut videos, mut of_format, mut audio) = (0, 0, 0);
             while matches < 4 {
                 assert!(
                     Instant::now() < deadline,
-                    "AVSync did not follow format {index}"
+                    "AVSync did not follow format {index}: {videos} video frames arrived, \
+                     {of_format} of them {width} wide, audio was returned {audio} times and \
+                     matched {matches} times; {}",
+                    link(sync.receiver())
                 );
                 let Some(video) = sync.receiver().video().capture_ref(SLICE).unwrap() else {
                     continue;
                 };
+                videos += 1;
+                of_format += usize::from(video.width() == width);
                 if let AvSyncOutcome::Audio { frame, .. } = sync
                     .synchronize(Some(&video), AvSyncRequest::automatic())
                     .unwrap()
                 {
+                    audio += 1;
                     if video.width() == width
                         && frame.sample_rate() == rate
                         && frame.num_channels() == channels
@@ -2727,15 +2794,7 @@ fn genlock_follows_a_local_reference_and_returns_to_the_system_clock() {
                 sender.send_audio(&audio);
             }
         });
-        let deadline = Instant::now() + PATIENCE;
-        while !genlock.is_active() {
-            assert!(
-                Instant::now() < deadline,
-                "genlock did not acquire the reference"
-            );
-            let (mut video, _) = genlock.clocks();
-            video.wait(thirty, ScanType::Progressive);
-        }
+        await_reference(&mut genlock, &sender);
         let (mut video, mut audio) = genlock.clocks();
         let deadline = Instant::now() + PATIENCE;
         loop {
@@ -2763,6 +2822,24 @@ fn genlock_follows_a_local_reference_and_returns_to_the_system_clock() {
             Instant::now() < deadline,
             "the clocks did not fall back after disconnect"
         );
+    }
+}
+
+/// Wait on `genlock`'s video clock until the genlock receives the reference
+/// that `sender` sends.
+fn await_reference(genlock: &mut Genlock, sender: &Sender) {
+    let thirty = FrameRate::new(30, 1).unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    let mut waits = 0;
+    while !genlock.is_active() {
+        assert!(
+            Instant::now() < deadline,
+            "genlock did not acquire the reference in {waits} waits on its video clock; {}",
+            served(sender)
+        );
+        let (mut video, _) = genlock.clocks();
+        video.wait(thirty, ScanType::Progressive);
+        waits += 1;
     }
 }
 
@@ -2815,20 +2892,12 @@ fn a_genlock_moves_between_threads() {
                 sender.send_audio(&audio);
             }
         });
-        let source = &source;
+        let (source, sender) = (&source, &sender);
         let genlock = scope
             .spawn(move || {
                 let mut genlock = genlock;
                 genlock.connect(Some(source)).unwrap();
-                let deadline = Instant::now() + PATIENCE;
-                while !genlock.is_active() {
-                    assert!(
-                        Instant::now() < deadline,
-                        "genlock did not acquire the reference"
-                    );
-                    let (mut video, _) = genlock.clocks();
-                    video.wait(thirty, ScanType::Progressive);
-                }
+                await_reference(&mut genlock, sender);
                 let (mut video, mut audio) = genlock.clocks();
                 std::thread::scope(|clocks| {
                     clocks.spawn(move || {

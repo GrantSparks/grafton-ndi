@@ -78,8 +78,19 @@ fn video_only_modes_deliver_video_while_an_ordinary_receiver_also_gets_audio() {
             {
                 break;
             }
-            assert!(Instant::now() < deadline,
-                "{bandwidth:?}: received {videos} video frames and {ordinary_audio} ordinary audio frames");
+            // What the video-only receiver, the ordinary one and the sender
+            // report tells a receiver that never connected from one that was
+            // given no stream at this bandwidth.
+            assert!(
+                Instant::now() < deadline,
+                "{bandwidth:?}: received {videos} video frames and {ordinary_audio} ordinary \
+                 audio frames; the {bandwidth:?} receiver of {:?} reports {:?}, the ordinary \
+                 one {:?}, and the sender counts {:?} connections",
+                receiver.source(),
+                receiver.connection_stats(),
+                ordinary.connection_stats(),
+                sender.connection_count(Duration::ZERO)
+            );
         }
     }
 }

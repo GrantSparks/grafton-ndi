@@ -280,6 +280,7 @@ rustdoc, which starts each compiled doctest through it, with or without
 | Host daemons | `/run` replaced by an empty tmpfs: no D-Bus, no Avahi | mDNSResponder socket denied; the SDK is given a loopback discovery address through `NDI_CONFIG_DIR` | untouched |
 | Machine's own name | resolves to `127.0.0.1` through a private `/etc/hosts` | cannot be relied on to resolve | resolves as usual |
 | `TMPDIR` | private tmpfs (`/run/tmp`) | private directory, removed afterwards | untouched |
+| SDK log | off | off | on, through `NDI_CONFIG_DIR`; printed when the executable fails |
 | Needs | `bubblewrap`, unprivileged user namespaces | nothing | an elevated shell |
 
 What each wrapper confines, and what it does not:
@@ -346,6 +347,19 @@ Two parts of the wrappers exist because of how the SDK behaves:
   "Failed to create NDI send instance", and the files are left behind. This was
   observed on Linux; the macOS wrapper isolates `TMPDIR` as a precaution and
   the Windows wrapper leaves it alone.
+
+The Windows wrapper also turns on the SDK's own log, at level `info`, through
+an `NDI_CONFIG_DIR` whose configuration sets nothing else, and prints the log
+after an executable that failed. The log names the port each sender listens
+on, the address each receiver opens and whether it connected, and the
+transport it receives over (`single-TCP` over loopback on Linux with 6.4.0.2).
+It exists because the first Windows runs (run 43332050213) failed tests that
+wait for media from a sender of their own: in a different set of tests on each
+row, a receiver got nothing for 15 seconds, and the tests could not say whether
+it had connected. On Linux the namespace leaves the SDK no address but
+loopback, and on macOS it is given a loopback discovery address; on Windows it
+sees the machine's network adapter and is given nothing, and the log shows
+which addresses it used.
 
 On Linux the same run works locally:
 
@@ -510,6 +524,9 @@ New, and so unverified anywhere but Linux x86_64:
   once inside the wrapper but that the mDNS datagram is `reached`, because the
   firewall discards it silently; the check reports that as a limitation on
   Windows, and run 43332050213 passed that way on every Windows row;
+- the Windows wrapper's SDK log: that the Windows runtime honours
+  `NDI_CONFIG_DIR` and the log settings as the Linux one does, and that the log
+  is printed after a failed executable;
 - every promise of the Windows and macOS rows, in particular `file` beside a
   Standard runtime in the Windows x64 Standard 6.4 row;
 - the Advanced lint on Windows and macOS;

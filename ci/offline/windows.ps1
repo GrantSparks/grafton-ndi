@@ -11,6 +11,13 @@
 # change how the machine's own name resolves, tests address their senders as
 # 127.0.0.1:<port> in any case, and the name-lock files that the Linux runner
 # isolates have only been observed on Linux.
+#
+# The SDK is given a configuration, through NDI_CONFIG_DIR, that only turns on
+# its own log. The log names the port each sender listens on, the address each
+# receiver connects to and whether it connected, and the transport it receives
+# over. It is printed when the executable fails: here the SDK sees the machine's
+# network adapter and, unlike under the Linux and macOS runners, is given no
+# loopback-only address to use, and a test's messages cannot show which it used.
 $ErrorActionPreference = 'Stop'
 
 # `$program, $arguments = $args` would make $arguments a scalar string when exactly
@@ -63,8 +70,16 @@ public static class GraftonNdiLongPath
     $program = [GraftonNdiLongPath]::Of($program)
 }
 $rule = 'grafton-ndi-ci-' + [guid]::NewGuid().ToString('N')
+$scratch = Join-Path ([System.IO.Path]::GetTempPath()) $rule
+$config = Join-Path $scratch 'config'
+$log = Join-Path $scratch 'log'
 $result = 1
 try {
+    New-Item -ItemType Directory -Path $config, $log | Out-Null
+    @{ ndi = @{ log = @{ enable = $true; level = 'info'; dir = $log } } } |
+        ConvertTo-Json -Depth 4 |
+        Set-Content -LiteralPath (Join-Path $config 'ndi-config.v1.json') -Encoding utf8NoBOM
+    $env:NDI_CONFIG_DIR = $config
     Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled True
     foreach ($direction in 'Outbound', 'Inbound') {
         try {
@@ -78,8 +93,15 @@ try {
     $env:CARGO_NET_OFFLINE = 'true'
     & $program @arguments
     $result = $LASTEXITCODE
+    if ($result -ne 0) {
+        foreach ($file in Get-ChildItem -LiteralPath $log -File) {
+            Write-Output "NDI SDK log $($file.Name), written while $program ran:"
+            Get-Content -LiteralPath $file.FullName | Write-Output
+        }
+    }
 }
 finally {
     Get-NetFirewallRule -DisplayName $rule -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+    Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
 }
 exit $result
