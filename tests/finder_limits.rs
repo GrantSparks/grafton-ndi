@@ -3,7 +3,7 @@
 #[path = "support/fixture.rs"]
 mod fixture;
 use fixture::{FakeRuntime, FixtureDir};
-use grafton_ndi::{Error, Finder, FinderOptions, Ndi, RuntimeOptions};
+use grafton_ndi::{Error, Finder, FinderOptions, Ndi, ResourceKind, RuntimeOptions};
 use std::{path::PathBuf, process::Command, time::Duration};
 
 #[test]
@@ -13,17 +13,22 @@ fn finder_enforces_snapshot_and_whole_window_limits() {
         let ndi = Ndi::with_options(&RuntimeOptions::new().library_path(path)).unwrap();
         let finder = Finder::new(&ndi, &FinderOptions::new()).unwrap();
         let limited = |result: grafton_ndi::Result<Vec<grafton_ndi::Source>>| {
+            let (expected, maximum) = if scenario == "count" {
+                (ResourceKind::FinderSnapshotSources, 16_384)
+            } else {
+                (ResourceKind::FinderSnapshotBytes, 16 * 1024 * 1024)
+            };
             assert!(
-                matches!(result, Err(Error::ResourceLimit { .. })),
+                matches!(result, Err(Error::ResourceLimit { resource, limit }) if resource == expected && limit == maximum),
                 "{result:?}"
             );
         };
         if scenario.starts_with("retained") {
             assert_eq!(finder.current_sources().unwrap().len(), 1);
             let resource = if scenario == "retained-count" {
-                "Finder discovery source count"
+                ResourceKind::FinderDiscoverySources
             } else {
-                "Finder discovery bytes"
+                ResourceKind::FinderDiscoveryBytes
             };
             assert!(
                 matches!(finder.find_sources(Duration::from_secs(10)), Err(Error::ResourceLimit { resource: actual, .. }) if actual == resource)

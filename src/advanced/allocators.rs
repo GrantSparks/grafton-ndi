@@ -77,6 +77,36 @@ impl Default for AllocatorLimits {
 }
 
 impl AllocatorLimits {
+    /// Requested maximum number of live policy generations.
+    #[must_use]
+    pub fn configured_max_generations(&self) -> usize {
+        self.max_generations
+    }
+
+    /// Requested maximum allocation count, including policy calls in progress.
+    #[must_use]
+    pub fn configured_max_allocations(&self) -> usize {
+        self.max_allocations
+    }
+
+    /// Requested maximum retained and granted bytes in total.
+    #[must_use]
+    pub fn configured_max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// Requested maximum number of concurrent policy calls.
+    #[must_use]
+    pub fn configured_max_concurrent_calls(&self) -> usize {
+        self.max_concurrent_calls
+    }
+
+    /// Requested maximum bytes granted to one allocation.
+    #[must_use]
+    pub fn configured_max_allocation_bytes(&self) -> usize {
+        self.max_allocation_bytes
+    }
+
     /// The default limits: 256 generations, 1024 allocations, 1 GiB in total,
     /// 16 concurrent calls and 64 MiB per allocation.
     pub fn new() -> Self {
@@ -162,7 +192,7 @@ impl AllocatorLimits {
 /// Planar audio is laid out as a picture is, one channel to a line: its
 /// [`width`](Self::width) is the number of samples per channel, its
 /// [`height`](Self::height) the number of channels, and its
-/// [`stride`](Self::stride) the distance between channels.
+/// [`stride_bytes`](Self::stride_bytes) the distance between channels in bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AllocationRequest {
     bytes: usize,
@@ -203,7 +233,7 @@ impl AllocationRequest {
 
     /// Bytes per video line or per audio channel. For a compressed frame,
     /// which has no stride, this is its size.
-    pub fn stride(self) -> usize {
+    pub fn stride_bytes(self) -> usize {
         self.stride
     }
 
@@ -232,7 +262,7 @@ impl AllocationRequest {
     /// four bytes; a 4:2:0 or UYVA video stride is even), the frame is
     /// compressed (it has no stride to change), or the buffer would exceed
     /// the [`capacity_limit`](Self::capacity_limit).
-    pub fn with_stride(self, stride: usize) -> Result<Self> {
+    pub fn with_stride_bytes(self, stride: usize) -> Result<Self> {
         if stride < self.stride {
             return Err(invalid_input(format!(
                 "Allocator stride {stride} is smaller than the requested stride {}",
@@ -1001,8 +1031,8 @@ enum Stream {
 ///
 /// // Pad every video line to a multiple of 256 bytes.
 /// receiver.set_video_allocator(|request: AllocationRequest| {
-///     let stride = request.stride().next_multiple_of(256);
-///     AllocationBuffer::zeroed(request.with_stride(stride)?)
+///     let stride = request.stride_bytes().next_multiple_of(256);
+///     AllocationBuffer::zeroed(request.with_stride_bytes(stride)?)
 /// })?;
 /// if let Some(frame) = receiver.receiver().video().capture(Duration::from_secs(1))? {
 ///     println!("line stride: {} bytes", frame.line_stride_bytes());
@@ -1350,7 +1380,7 @@ mod tests {
             AllocationFormat::CompressedVideo(FourCc::from_raw(protected_video))
         );
         assert_eq!(
-            (request.width(), request.height(), request.stride()),
+            (request.width(), request.height(), request.stride_bytes()),
             (16, 16, 64)
         );
         video.xres = -16;
@@ -1362,7 +1392,7 @@ mod tests {
         let request = video_request(&video).unwrap();
         assert_eq!(request.format(), AllocationFormat::Video(PixelFormat::Bgra));
         assert_eq!(
-            (request.width(), request.height(), request.stride()),
+            (request.width(), request.height(), request.stride_bytes()),
             (16, 16, 64)
         );
         assert_eq!(request.minimum_bytes(), 16 * 64);
@@ -1642,7 +1672,7 @@ mod tests {
                     capacity_limit: MAX_ALLOCATION,
                     ..request
                 };
-                AllocationBuffer::zeroed(padded.with_stride(request.stride() * 4)?)
+                AllocationBuffer::zeroed(padded.with_stride_bytes(request.stride_bytes() * 4)?)
             })
             .unwrap();
         assert!(registry.allocate(token, request()).is_none());
@@ -1776,22 +1806,22 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(planar.stride(), 16);
-        let padded = planar.with_stride(32).unwrap();
+        assert_eq!(planar.stride_bytes(), 16);
+        let padded = planar.with_stride_bytes(32).unwrap();
         assert_eq!(
-            (padded.stride(), padded.minimum_bytes()),
+            (padded.stride_bytes(), padded.minimum_bytes()),
             (32, 32 * 16 * 3 / 2)
         );
-        assert!(input(planar.with_stride(15)).contains("smaller"));
-        assert!(input(planar.with_stride(17)).contains("even"));
+        assert!(input(planar.with_stride_bytes(15)).contains("smaller"));
+        assert!(input(planar.with_stride_bytes(17)).contains("even"));
 
         let audio = request();
-        assert!(input(audio.with_stride(34)).contains("whole number"));
+        assert!(input(audio.with_stride_bytes(34)).contains("whole number"));
         let limited = AllocationRequest {
             capacity_limit: 64,
             ..audio
         };
-        assert!(input(limited.with_stride(36)).contains("capacity limit"));
+        assert!(input(limited.with_stride_bytes(36)).contains("capacity limit"));
 
         let compressed = AllocationRequest {
             format: AllocationFormat::CompressedAudio(FourCc::from_raw(
@@ -1799,8 +1829,8 @@ mod tests {
             )),
             ..audio
         };
-        assert_eq!(compressed.with_stride(32).unwrap(), compressed);
-        assert!(input(compressed.with_stride(36)).contains("Compressed"));
+        assert_eq!(compressed.with_stride_bytes(32).unwrap(), compressed);
+        assert!(input(compressed.with_stride_bytes(36)).contains("Compressed"));
     }
 
     #[test]

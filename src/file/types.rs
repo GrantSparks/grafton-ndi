@@ -184,6 +184,20 @@ pub struct PlayerOptions {
 }
 
 impl PlayerOptions {
+    /// Replace the advertised player name, preserving every other setting.
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// Inherit discovery groups from the NDI configuration.
+    #[must_use]
+    pub fn clear_groups(mut self) -> Self {
+        self.groups = None;
+        self
+    }
+
     /// Requested advertised player name.
     #[must_use]
     pub fn configured_name(&self) -> &str {
@@ -326,6 +340,20 @@ pub struct RecorderOptions {
 }
 
 impl RecorderOptions {
+    /// Replace the recording source, preserving every other setting.
+    #[must_use]
+    pub fn source(mut self, source: SourceSpec) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// Derive format-change rollover from the final naming policy again.
+    #[must_use]
+    pub fn clear_format_change_rollover(mut self) -> Self {
+        self.format_change_rollover = None;
+        self
+    }
+
     /// Requested source descriptor, before any live source change.
     #[must_use]
     pub fn configured_source(&self) -> &SourceSpec {
@@ -1855,6 +1883,39 @@ mod tests {
                 .naming(FileNaming::Pattern("{prefix}-{index:2}.mkv".into()))
                 .format_change_rollover(true)
         ));
+    }
+
+    #[test]
+    fn clearing_rollover_override_recomputes_the_policy_for_the_final_template() {
+        let template = options().format_change_rollover(true);
+        assert!(template
+            .clone()
+            .naming(FileNaming::Exact)
+            .resolve()
+            .is_err());
+        let exact = template
+            .clone()
+            .naming(FileNaming::Exact)
+            .clear_format_change_rollover()
+            .resolve()
+            .unwrap();
+        assert!(!exact.format_change_rollover);
+        let indexed = template
+            .format_change_rollover(false)
+            .clear_format_change_rollover()
+            .resolve()
+            .unwrap();
+        assert!(indexed.format_change_rollover);
+    }
+
+    #[test]
+    fn player_template_clear_groups_restores_the_native_null_default() {
+        let template = PlayerOptions::new("Replay A").groups("");
+        let override_groups = template.resolve().unwrap();
+        assert!(override_groups.groups.is_some());
+        let inherited = template.name("Replay B").clear_groups().resolve().unwrap();
+        assert_eq!(inherited.name.as_bytes(), b"Replay B");
+        assert!(inherited.groups.is_none());
     }
 
     #[test]

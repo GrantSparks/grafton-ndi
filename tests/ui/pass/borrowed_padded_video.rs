@@ -2,7 +2,7 @@ use grafton_ndi::{BorrowedVideoFrame, FrameRate, PixelFormat, ScanType, Timecode
 fn main() {
     let pixels = [0; 48];
     let frame = BorrowedVideoFrame::builder(&pixels, 2, 4, PixelFormat::Bgra)
-        .line_stride(12)
+        .line_stride_bytes(12)
         .metadata(c"<video/>")
         .scan_type(ScanType::Interlaced)
         .frame_rate(FrameRate::new(30000, 1001).unwrap())

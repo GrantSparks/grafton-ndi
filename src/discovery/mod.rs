@@ -113,9 +113,13 @@
 //! replacement bytes and identifier terminators. Array storage is reserved
 //! for every reported element, even when null fields or list terminators are
 //! omitted from the result. A single native string must be shorter than 4 MiB.
-//! Exceeding either limit returns [`Error::UnexpectedSdkResult`](crate::Error::UnexpectedSdkResult)
-//! before reserving the offending output; a rejected event batch is freed and
-//! its events are lost. Allocation failures return the same error variant.
+//! Exceeding the aggregate copy budget returns
+//! [`Error::ResourceLimit`](crate::Error::ResourceLimit), identifying
+//! [`ResourceKind::DiscoveryServerCopyBytes`](crate::ResourceKind::DiscoveryServerCopyBytes),
+//! before reserving the offending output. Malformed descriptors, strings that
+//! exceed their individual bound, and allocation failures return
+//! [`Error::UnexpectedSdkResult`](crate::Error::UnexpectedSdkResult). A rejected
+//! event batch is freed and its events are lost.
 //!
 //! # Example
 //!

@@ -18,7 +18,7 @@ use grafton_ndi::{
     },
     routing::{Router, RouterOptions},
     runtime::RuntimeOptions,
-    Error, Ndi, Receiver, ReceiverOptions, Sender, SenderOptions, Source,
+    Error, Ndi, Receiver, ReceiverOptions, ResourceKind, Sender, SenderOptions, Source,
 };
 use std::{fs, path::PathBuf, process::Command, time::Duration};
 
@@ -534,22 +534,31 @@ fn child(scenario: &str) {
             std::env::set_var("GRAFTON_FAKE_EVENT_COUNT", "250000");
             assert!(matches!(
                 listener.capture_events(wait),
-                Err(Error::UnexpectedSdkResult(_))
+                Err(Error::ResourceLimit {
+                    resource: ResourceKind::DiscoveryServerCopyBytes,
+                    limit: 16_777_216,
+                })
             ));
             let mut receivers = RecvListener::new(&ndi, &listeners).unwrap();
             assert!(matches!(
                 receivers.capture_events(wait),
-                Err(Error::UnexpectedSdkResult(_))
+                Err(Error::ResourceLimit {
+                    resource: ResourceKind::DiscoveryServerCopyBytes,
+                    limit: 16_777_216,
+                })
             ));
             assert_eq!(log().matches("recv-listener-free-events\n").count(), 1);
 
             // A batch whose descriptors alone exceed 16 MiB is refused for its
             // size, and released: the listener keeps working afterwards.
             std::env::set_var("GRAFTON_FAKE_EVENT_COUNT", "1500000");
-            let Err(Error::UnexpectedSdkResult(reason)) = listener.capture_events(wait) else {
+            let Err(Error::ResourceLimit {
+                resource: ResourceKind::DiscoveryServerCopyBytes,
+                limit: 16_777_216,
+            }) = listener.capture_events(wait)
+            else {
                 panic!("a batch larger than the copy limit must be refused");
             };
-            assert!(reason.contains("16 MiB"), "{reason}");
             assert_eq!(log().matches("send-listener-free-events\n").count(), 3);
             std::env::remove_var("GRAFTON_FAKE_EVENT_COUNT");
             assert_eq!(listener.capture_events(wait).unwrap().len(), 2);
@@ -587,10 +596,13 @@ fn child(scenario: &str) {
                         .snapshot()
                         .map(drop)
                 };
-                let Err(Error::UnexpectedSdkResult(reason)) = result else {
+                let Err(Error::ResourceLimit {
+                    resource: ResourceKind::DiscoveryServerCopyBytes,
+                    limit: 16_777_216,
+                }) = result
+                else {
                     panic!("the owned {array} must spend the snapshot budget");
                 };
-                assert!(reason.contains("16 MiB"), "{reason}");
             }
             std::env::remove_var("GRAFTON_FAKE_DISCOVERY_ARRAY");
             assert_eq!(

@@ -115,6 +115,10 @@
 //! bound event waits only. The values they return are owned and can be sent
 //! anywhere. [`AsyncFilePlayer`] and [`AsyncFileRecorder`] keep each native
 //! object on a dedicated thread and expose futures that work with any executor.
+//! Those futures submit work on their first poll; [`FileOperation::submit`]
+//! explicitly submits immediately. Submitted stop, finish and close operations
+//! survive cancellation of their futures. Dropping the last async handle can
+//! block; await its `close()` operation before dropping it on an executor.
 //!
 //! # Examples
 //!
@@ -209,6 +213,13 @@ pub struct FileRuntimeOptions {
 }
 
 impl FileRuntimeOptions {
+    /// Restore the normal File library search instead of an explicit path.
+    #[must_use]
+    pub fn clear_library_path(mut self) -> Self {
+        self.library_path = None;
+        self
+    }
+
     /// Requested exact File library path, or `None` for the normal search.
     #[must_use]
     pub fn configured_library_path(&self) -> Option<&Path> {

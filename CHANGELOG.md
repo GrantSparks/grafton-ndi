@@ -28,6 +28,19 @@ API, see the [README](README.md) and the migration guides for
 
 ### Added
 
+- Owned video/audio builders return `Rejected<Builder>` so invalid settings can
+  be repaired without losing supplied buffers. Frames expose `into_data` and
+  allocation-preserving `swap_data`; compressed and scatter frames retain
+  payload capacity, and scatter frames expose `into_blocks` for buffer pools.
+- `BorrowedAudioFrame` accepts application planar samples and channel strides.
+  Sealed video/audio source traits support layout inspection, copying and reuse
+  through generic functions and trait objects. `MetadataSource` forwards owned
+  and captured text directly through synchronous send, connection metadata and
+  recording injection operations.
+- `PixelFormat::send_buffer_len` checks complete direct-send allocation sizes,
+  including stride, scan-dependent extra rows and SDK tail room. Options expose
+  complete readback, `clear_*` reset methods and replacement of required choices
+  for cloned templates.
 - Standard receivers capture whichever video, audio, metadata or invalidation
   arrives next with `capture_any_ref` and `capture_any`. Tokio and smol expose
   owned combined capture with the same deadline and cancellation rules.
@@ -45,6 +58,15 @@ API, see the [README](README.md) and the migration guides for
 
 ### Changed
 
+- Async File operations start on first poll. `FileOperation::submit()` explicitly
+  submits eagerly. Once submitted, stop/finish/close retain their cancellation
+  guarantees; dropping the last handle still waits for native finalization.
+- Native P216-to-V210 conversion accepts any validated `VideoSource`, including
+  padded captures and external borrowed inputs, without a preliminary pixel copy.
+- `Error::ResourceLimit` uses a typed `ResourceKind` for Finder and Discovery
+  Server budgets. Exact host matching consistently uses `matches_host`, and
+  byte-stride APIs consistently use `*_stride_bytes` names. `NoSourcesFound`
+  remains an explicitly caller-constructed convenience.
 - Advanced queued video submission uses exclusive frame ownership to guarantee
   distinct pixel allocations, removing a scan of completed frames on every send.
 - Synchronous video/audio sends and planar-to-interleaved audio conversion

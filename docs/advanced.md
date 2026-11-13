@@ -265,8 +265,9 @@ reports it sent, so submission does not wait for a slow connection.
   It allocates a native descriptor; an uncompressed frame can also grow its
   pixel allocation when its scan type requires extra SDK tail room.
 - `QueueOptions` bounds the queue by frame count and by bytes. A frame counts
-  from submission until the application takes it back. The defaults are 8
-  frames and 512 MiB.
+  from submission until the application takes it back. The byte budget includes
+  unused retained payload capacity, including spare capacity in compressed
+  vectors. The defaults are 8 frames and 512 MiB.
 - `try_submit` returns a `SubmissionId`, or returns the frame in a `Rejected`.
   Its error is `Error::QueueFull` when the frame would take the queue past its
   frame or byte limit (`QueueLimit::Frames` or `QueueLimit::Bytes`): collect
@@ -316,8 +317,8 @@ fn customize(ndi: &Ndi, receiver: Receiver) -> grafton_ndi::Result<Receiver> {
     let mut receiver = service.attach(receiver)?;
     // Pad every video line to a multiple of 256 bytes.
     receiver.set_video_allocator(|request: AllocationRequest| {
-        let stride = request.stride().next_multiple_of(256);
-        AllocationBuffer::zeroed(request.with_stride(stride)?)
+        let stride = request.stride_bytes().next_multiple_of(256);
+        AllocationBuffer::zeroed(request.with_stride_bytes(stride)?)
     })?;
     // ... capture through `receiver.receiver()` ...
     receiver.reset_video_allocator();

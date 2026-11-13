@@ -420,7 +420,19 @@ and can be sent anywhere.
 
 `AsyncFilePlayer` and `AsyncFileRecorder` keep each native object on a thread
 of its own and expose its operations as futures that work with any executor.
-Clones share one object.
+Clones share one object. Operations submit no work until their first poll,
+matching ordinary Rust async functions. An unpolled `start`, setter, `finish`,
+`request_stop` or `close` does nothing when dropped. Queue admission, relative
+player/probe path resolution and timeout budgets begin at submission, so a timeout includes
+time spent waiting in the command queue.
+
+For deliberate eager execution, call `FileOperation::submit()` and keep the
+returned future to await its result. For example,
+`drop(recorder.request_stop().submit())` requests a stop immediately without
+waiting. Submitted stop, finish and close requests continue after their future
+is dropped. Ordinary queued commands can still be cancelled before they start;
+native work already started completes on the owner thread. A pending operation
+does not keep a handle alive or postpone last-handle shutdown.
 
 ```rust
 use grafton_ndi::file::{

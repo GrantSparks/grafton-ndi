@@ -12,8 +12,8 @@ use std::{
 use crate::{
     finder::Source,
     frames::{
-        AudioSource, MetadataFrame, MetadataText, PixelFormat, ScanType, ValidatedVideoLayout,
-        VideoFrame, VideoHeader, VideoParts, VideoSource,
+        AudioSource, MetadataFrame, MetadataSource, MetadataText, PixelFormat, ScanType,
+        ValidatedVideoLayout, VideoFrame, VideoHeader, VideoParts, VideoSource,
     },
     pixels::{send_room, Pixels},
     receiver::Tally,
@@ -1033,7 +1033,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// for shade in 0..=255u8 {
     ///     buffer.fill(shade); // the application draws into its own buffer
     ///     let frame = BorrowedVideoFrame::builder(&buffer, 64, 32, PixelFormat::Bgra)
-    ///         .line_stride(512)
+    ///         .line_stride_bytes(512)
     ///         .build()?;
     ///     let owned = match spare.take() {
     ///         Some(mut reused) => {
@@ -1160,8 +1160,15 @@ pub struct BorrowedVideoFrameBuilder<'buf> {
 impl<'buf> BorrowedVideoFrameBuilder<'buf> {
     /// Set the first-plane stride in bytes. Zero selects the packed stride.
     #[must_use]
-    pub fn line_stride(mut self, stride: usize) -> Self {
+    pub fn line_stride_bytes(mut self, stride: usize) -> Self {
         self.line_stride = Some(stride);
+        self
+    }
+
+    /// Reset the first-plane stride override to the packed stride.
+    #[must_use]
+    pub fn clear_line_stride_bytes(mut self) -> Self {
+        self.line_stride = None;
         self
     }
     /// Set the frame rate.
@@ -1192,6 +1199,13 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
     #[must_use]
     pub fn metadata(mut self, metadata: &'buf CStr) -> Self {
         self.metadata = Some(metadata);
+        self
+    }
+
+    /// Remove the optional metadata override.
+    #[must_use]
+    pub fn clear_metadata(mut self) -> Self {
+        self.metadata = None;
         self
     }
 
@@ -1487,7 +1501,7 @@ impl Sender {
     /// // 64 pixels per row, padded to a 512-byte stride.
     /// let mut buffer = vec![0u8; 512 * 32];
     /// let frame = BorrowedVideoFrame::builder(&buffer, 64, 32, PixelFormat::Bgra)
-    ///     .line_stride(512)
+    ///     .line_stride_bytes(512)
     ///     .build()?;
     /// sender.send_video(&frame)?;
     /// buffer.fill(0xff); // the SDK is done with the buffer
@@ -1762,8 +1776,10 @@ impl<M: SenderMode> Sender<M> {
 
     /// Sends a metadata frame.
     ///
-    pub fn send_metadata(&self, metadata_frame: &MetadataFrame) {
-        let raw = metadata_frame.to_raw();
+    /// Accepts owned or captured metadata without copying its text in the
+    /// wrapper. The SDK copies the text before returning.
+    pub fn send_metadata<S: MetadataSource + ?Sized>(&self, metadata_frame: &S) {
+        let raw = metadata_frame.metadata_raw();
         // The borrowed C string remains live through this synchronous SDK call.
         // SAFETY: the sender instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
@@ -1911,10 +1927,12 @@ impl<M: SenderMode> Sender<M> {
         }
     }
 
-    /// Adds connection metadata.
+    /// Register metadata sent now and to every new connection.
     ///
-    pub fn add_connection_metadata(&self, metadata_frame: &MetadataFrame) {
-        let raw = metadata_frame.to_raw();
+    /// Accepts owned or captured metadata. The SDK retains its own copy, so
+    /// the input can be released as soon as this method returns.
+    pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata_frame: &S) {
+        let raw = metadata_frame.metadata_raw();
         // The borrowed C string remains live through this synchronous SDK call.
         // SAFETY: the sender instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
@@ -2016,6 +2034,28 @@ pub struct SenderOptions {
 }
 
 impl SenderOptions {
+    /// Replace the advertised name; an empty name lets the SDK choose.
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// Inherit discovery groups from the NDI configuration.
+    #[must_use]
+    pub fn clear_groups(mut self) -> Self {
+        self.groups = None;
+        self
+    }
+
+    /// Remove the per-instance Advanced configuration override.
+    #[cfg(feature = "advanced")]
+    #[must_use]
+    pub fn clear_config(mut self) -> Self {
+        self.config = None;
+        self
+    }
+
     /// Requested advertised name; an empty name lets the SDK choose.
     #[must_use]
     pub fn configured_name(&self) -> &str {
@@ -2157,13 +2197,13 @@ mod tests {
         for format in PixelFormat::ALL {
             for scan in ScanType::ALL {
                 for padding in [0, 8] {
-                    let stride = format.line_stride(4).unwrap() + padding;
+                    let stride = format.line_stride_bytes(4).unwrap() + padding;
                     let len = ValidatedVideoLayout::new_uncompressed(format, 4, 6, Some(stride))
                         .unwrap()
                         .data_len_bytes;
                     let initialized = vec![71; len];
                     let template = BorrowedVideoFrame::builder(&initialized, 4, 6, format)
-                        .line_stride(stride)
+                        .line_stride_bytes(stride)
                         .scan_type(scan)
                         .frame_rate(FrameRate::new(30_000, 1_001).unwrap())
                         .picture_aspect_ratio(1.25)
@@ -2314,7 +2354,7 @@ mod tests {
         let data = vec![5u8; 96 * 16];
         let metadata = c"<padded/>";
         let borrowed = BorrowedVideoFrame::builder(&data, 16, 16, PixelFormat::Bgra)
-            .line_stride(96)
+            .line_stride_bytes(96)
             .metadata(metadata)
             .build()
             .unwrap();
@@ -2360,7 +2400,7 @@ mod tests {
                                 let mut buffer = vec![padding; len + extra + vouched];
                                 let ranges: Vec<_> = {
                                     let frame = BorrowedVideoFrame::builder(&buffer, 18, 6, format)
-                                        .line_stride(stride)
+                                        .line_stride_bytes(stride)
                                         .build()
                                         .unwrap();
                                     frame
@@ -2386,7 +2426,7 @@ mod tests {
                                     6,
                                     format,
                                 )
-                                .line_stride(stride)
+                                .line_stride_bytes(stride)
                                 .scan_type(scan);
                                 // SAFETY: the same initialized allocation extends
                                 // `vouched` bytes past the slice and stays unchanged.
@@ -2435,7 +2475,7 @@ mod tests {
                             .data_len_bytes;
                     let buffer = vec![128; len + format.send_tail_room()];
                     let frame = BorrowedVideoFrame::builder(&buffer, width, height, format)
-                        .line_stride(stride)
+                        .line_stride_bytes(stride)
                         .build()
                         .unwrap();
                     let mut staging = Pixels::default();
@@ -2469,7 +2509,7 @@ mod tests {
                 .scan_type(scan)
                 .allow_send_from_padding_and_tail(true);
             if let Some(stride) = stride {
-                builder = builder.line_stride(stride);
+                builder = builder.line_stride_bytes(stride);
             }
             // SAFETY: `buffer` extends at least `vouched` bytes past every
             // length used here.
@@ -2556,7 +2596,7 @@ mod tests {
         let buffer: Vec<u8> = (0..160).map(|i| i as u8).collect();
         let metadata = c"<staged/>";
         let frame = BorrowedVideoFrame::builder(&buffer, 18, 4, PixelFormat::Uyvy)
-            .line_stride(40)
+            .line_stride_bytes(40)
             .frame_rate(FrameRate::new(30000, 1001).unwrap())
             .picture_aspect_ratio(1.25)
             .scan_type(ScanType::Interlaced)
@@ -2610,7 +2650,7 @@ mod tests {
         // The next frame of the same size reuses the allocation.
         let other = vec![9u8; 160];
         let next = BorrowedVideoFrame::builder(&other, 18, 4, PixelFormat::Uyvy)
-            .line_stride(40)
+            .line_stride_bytes(40)
             .build()
             .unwrap();
         let address = staging.as_ptr();
@@ -2627,7 +2667,7 @@ mod tests {
         let roomy = vec![1u8; 160 + 64];
         let direct = BorrowedVideoFrame::builder(&roomy, 18, 4, PixelFormat::Uyvy)
             .allow_send_from_padding_and_tail(true)
-            .line_stride(40)
+            .line_stride_bytes(40)
             .build()
             .unwrap();
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
@@ -3073,8 +3113,8 @@ mod tests {
         ] {
             for stride in [
                 0,
-                format.line_stride(4).unwrap(),
-                format.line_stride(4).unwrap() + 8,
+                format.line_stride_bytes(4).unwrap(),
+                format.line_stride_bytes(4).unwrap() + 8,
             ] {
                 let layout =
                     ValidatedVideoLayout::new_uncompressed(format, 4, 4, Some(stride)).unwrap();
@@ -3084,7 +3124,7 @@ mod tests {
                 let rate = FrameRate::new(30000, 1001).unwrap();
                 let (borrowed, allocations) = crate::test_alloc::allocation_count(|| {
                     let frame = BorrowedVideoFrame::builder(&data, 4, 4, format)
-                        .line_stride(stride)
+                        .line_stride_bytes(stride)
                         .frame_rate(rate)
                         .picture_aspect_ratio(1.25)
                         .scan_type(ScanType::Interlaced)
@@ -3124,14 +3164,14 @@ mod tests {
                     4,
                     format
                 )
-                .line_stride(stride)
+                .line_stride_bytes(stride)
                 .build()
                 .is_err());
             }
             for stride in [1, i32::MAX.unsigned_abs() as usize, usize::MAX] {
                 let expected = ValidatedVideoLayout::new_uncompressed(format, 4, 4, Some(stride));
                 let result = BorrowedVideoFrame::builder(&[], 4, 4, format)
-                    .line_stride(stride)
+                    .line_stride_bytes(stride)
                     .build();
                 assert!(expected.is_err());
                 assert!(result.is_err());

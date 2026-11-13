@@ -46,6 +46,11 @@ copies and caller predicates cannot be interrupted and may finish after the wait
 budget. `current_sources()` itself retains ordinary blocking snapshot serialization.
 Neither selection nor enumeration guarantees continued availability.
 
+Finder and Discovery Server copy budgets report `Error::ResourceLimit` with a
+typed `ResourceKind` identifying the scope and count/byte units. Match the enum
+to handle a budget limit; its displayed text is diagnostic. Malformed native
+descriptors and allocation failures remain separate errors.
+
 A host can publish several feeds. `SourceCache::new(&finder)` binds a cache to
 that finder's groups, IP hints and configuration. `sources_by_host` observes the
 full window and caches every distinct matching descriptor, leaving feed selection
@@ -109,6 +114,18 @@ assert_eq!(options.configured_source().name(), "Venue (Audio)");
 
 These accessors report stored requests, including unset values that ask the
 SDK to choose a default. They do not query a live object's effective settings.
+
+Clone options to reuse a configuration, then replace its required source/name
+with the corresponding chainable setter. `clear_*` restores an optional setting
+to its inherited default; supplying empty text remains an explicit override:
+
+```rust
+let other = options.clone()
+    .source(grafton_ndi::Source::new("Venue (Backup)"))
+    .clear_name();
+assert_eq!(other.configured_name(), None);
+assert_eq!(other.configured_bandwidth(), options.configured_bandwidth());
+```
 
 Borrowed receiver and FrameSync video expose only initialized active pixels.
 `frame.data()` returns `Some(&[u8])` when all active pixels are contiguous, and
@@ -270,6 +287,34 @@ Synchronous calls finish borrowing their input when they return.
 owned packed pixel/metadata copy before submission, so the source can be freed
 immediately. `send_video_async(frame)` continues to require ownership and returns
 completed frames for reuse.
+
+Use `BorrowedAudioFrame::builder(&samples, rate, channels, samples_per_channel)`
+for application-owned planar audio. `channel_stride_bytes` supports gaps between
+channels; only active samples are exposed. Borrowed video/audio keep application
+storage borrowed through each synchronous send or conversion. Generic helpers can
+inspect `VideoSource` and `AudioSource`, including `&dyn` trait objects, without
+allocating. `to_owned()` packs active data; `copy_into(&mut frame)` reuses storage
+when possible.
+
+Metadata can also forward a capture directly: `sender.send_metadata(&captured)`
+and `receiver.send_metadata(&captured)` preserve its text and timecode. The same
+`MetadataSource` input works for connection metadata; the SDK copies text during
+registration, so the capture can be freed after the call returns. Async File
+metadata injection takes an owned frame because it outlives the caller's borrow.
+
+For buffer pools, recover owned video/audio vectors with `into_data()`, or use
+`swap_data(new_buffer)` to return the previous vector. Invalid replacement input
+is returned in `Rejected`, with the frame unchanged. A failed owned frame build
+likewise returns its builder; `into_inner()` permits repair and retry, and the
+builder's `into_data()` returns the original supplied storage. Compressed/scatter
+frames retain payload capacities; scatter `into_blocks()` returns the original
+ordered blocks without copying payloads.
+
+Direct external video allocations should use
+`format.send_buffer_len(width, height, stride, scan_type)` to include required
+trailing rows and SDK room. Initialize the complete returned extent and explicitly
+opt in with `allow_send_from_padding_and_tail(true)` as its rustdoc describes.
+The default sanitized send path remains suitable when padding is not picture data.
 
 ## Use FrameSync
 

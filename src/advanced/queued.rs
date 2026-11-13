@@ -27,7 +27,9 @@ use super::aliasable::AliasableBox;
 ///
 /// A frame counts from submission until the application takes it back, so a
 /// frame the SDK has finished with but that has not been collected still uses
-/// its share. The defaults are 8 frames and 512 MiB.
+/// its share. The byte budget includes retained payload capacity, even when a
+/// compressed frame uses only part of a pooled vector. The defaults are 8 frames
+/// and 512 MiB.
 #[derive(Debug, Clone, Copy)]
 pub struct QueueOptions {
     frames: usize,
@@ -68,7 +70,8 @@ impl QueueOptions {
         self
     }
 
-    /// Set the maximum number of bytes of frame data and metadata held.
+    /// Set the maximum retained bytes of frame data and metadata, including
+    /// unused payload capacity reserved by pooled vectors.
     #[must_use]
     pub fn max_bytes(mut self, bytes: usize) -> Self {
         self.bytes = bytes;
@@ -540,7 +543,7 @@ impl QueuedSender {
             state.bytes = total;
             // Both QueuedVideoFrame variants own nonempty allocations:
             // VideoFrame's validated Pixels and CompressedVideoFrame's
-            // AliasableBox<[u8]>. Neither exposes shared ownership, cloning
+            // AliasableVec<u8>. Neither exposes shared ownership, cloning
             // copies the bytes, and submission moves the frame here until
             // collection. Its data address is therefore non-null and distinct
             // from every retained frame, without searching either collection.

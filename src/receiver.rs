@@ -47,8 +47,8 @@ use crate::{
     finder::{RawSource, Source},
     sys::{self, bindings::*},
     timeout::{self, Deadline},
-    AudioFrame, AudioFrameRef, Error, MetadataFrame, MetadataFrameRef, Ndi, Result, VideoFrame,
-    VideoFrameRef,
+    AudioFrame, AudioFrameRef, Error, MetadataFrame, MetadataFrameRef, MetadataSource, Ndi, Result,
+    VideoFrame, VideoFrameRef,
 };
 
 /// A string the receiver API returned, released when dropped.
@@ -405,6 +405,28 @@ pub(crate) struct RawRecvCreateV3 {
 }
 
 impl ReceiverOptions {
+    /// Replace the source, preserving every other receiver setting.
+    #[must_use]
+    pub fn source(mut self, source: Source) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// Let the SDK choose the receiver name again.
+    #[must_use]
+    pub fn clear_name(mut self) -> Self {
+        self.name = None;
+        self
+    }
+
+    /// Remove the per-instance Advanced configuration override.
+    #[cfg(feature = "advanced")]
+    #[must_use]
+    pub fn clear_config(mut self) -> Self {
+        self.config = None;
+        self
+    }
+
     /// The requested source, independent of later live source changes.
     #[must_use]
     pub fn configured_source(&self) -> &Source {
@@ -1063,9 +1085,12 @@ impl<M: ReceiverMode> Receiver<M> {
     }
 
     /// Add validated metadata sent immediately and again on each connection.
-    pub fn add_connection_metadata(&self, metadata: &MetadataFrame) -> Result<()> {
+    ///
+    /// Accepts owned or captured metadata. The SDK copies the text during
+    /// this call, so the input need not outlive the registration.
+    pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
         let table = self.core.connection_metadata()?;
-        let raw = metadata.to_raw();
+        let raw = metadata.metadata_raw();
         // SAFETY: The metadata C string remains live for the synchronous SDK call.
         unsafe { table.NDIlib_recv_add_connection_metadata(self.core.instance, &raw) };
         Ok(())
@@ -1153,12 +1178,15 @@ impl<M: ReceiverMode> Receiver<M> {
 
     /// Send metadata upstream, to the source this receiver is connected to.
     ///
+    /// Accepts owned or captured metadata without copying its text in the
+    /// wrapper. The SDK copies the text before returning.
+    ///
     /// # Errors
     ///
     /// [`Error::NotConnected`] when the receiver is connected to no source,
     /// so nothing was sent.
-    pub fn send_metadata(&self, metadata: &MetadataFrame) -> Result<()> {
-        let raw = metadata.to_raw();
+    pub fn send_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
+        let raw = metadata.metadata_raw();
         // SAFETY: the receiver instance is live for this borrow, and the
         // borrowed C string outlives the synchronous call.
         let sent = unsafe {

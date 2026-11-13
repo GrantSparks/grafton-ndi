@@ -185,6 +185,13 @@ pub struct ImageOptions {
 }
 
 impl ImageOptions {
+    /// Replace the output format, preserving every other encoding setting.
+    #[must_use]
+    pub fn format(mut self, format: ImageFormat) -> Self {
+        self.format = format;
+        self
+    }
+
     /// Requested encoded image format.
     #[must_use]
     pub fn configured_format(&self) -> ImageFormat {

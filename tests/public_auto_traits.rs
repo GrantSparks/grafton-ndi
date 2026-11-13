@@ -67,6 +67,7 @@ fn crate_root_types_keep_their_auto_traits() {
     #[allow(unused_imports)]
     use grafton_ndi::*;
     has! {
+        AudioChannels<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         AudioFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
         AudioFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
         AudioFrameBuilder: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -74,6 +75,8 @@ fn crate_root_types_keep_their_auto_traits() {
         AudioInputFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
         AudioKind: Send, Sync, UnwindSafe, RefUnwindSafe;
         AudioLayout: Send, Sync, UnwindSafe, RefUnwindSafe;
+        BorrowedAudioFrame<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
+        BorrowedAudioFrameBuilder<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         BorrowedVideoFrame<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         BorrowedVideoFrameBuilder<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         Capabilities: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -105,6 +108,7 @@ fn crate_root_types_keep_their_auto_traits() {
         ProcessLifetimeRuntime: Send, Sync, UnwindSafe, RefUnwindSafe;
         Ptz<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         QueueLimit: Send, Sync, UnwindSafe, RefUnwindSafe;
+        ResourceKind: Send, Sync, UnwindSafe, RefUnwindSafe;
         RawCapture: Send, Sync, UnwindSafe, RefUnwindSafe;
         RawSend: Send, Sync, UnwindSafe, RefUnwindSafe;
         Receiver: Send, Sync, UnwindSafe, RefUnwindSafe;

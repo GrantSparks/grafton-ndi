@@ -324,7 +324,7 @@ Two parts of the wrappers exist because of how the SDK behaves:
   (<sender name>)`, and looking a source up by host name asks the SDK to resolve
   that name. Only loopback exists in the namespace, so the name has to resolve
   to `127.0.0.1`: with the machine's usual address, or with no answer, the
-  lookup fails with `NoSourcesFound { criteria: "host: …" }`. The wrapper
+  host lookup returns no sources. The wrapper
   therefore binds a private `/etc/hosts` that maps the name, and the name with
   a trailing dot, to loopback. One test depends on this,
   `tests/video_padding_sdk.rs`, and it is compiled for Linux only; every other
