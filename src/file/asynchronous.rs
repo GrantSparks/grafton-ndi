@@ -1956,24 +1956,75 @@ mod tests {
         dropped.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
+    /// Captured by a command that never runs: the owner thread drops it with
+    /// the rest of its queue only after it has completed its close, and is
+    /// held there until the test lets it go, so that a handle dropped
+    /// meanwhile would wait for a thread that is still running.
+    struct HoldsOwnerThread {
+        held: mpsc::Sender<()>,
+        let_go: Receiver<()>,
+        released: mpsc::Sender<bool>,
+    }
+    impl Drop for HoldsOwnerThread {
+        fn drop(&mut self) {
+            let _ = self.held.send(());
+            // Bounded, so that a handle drop that waits for this thread fails
+            // the test instead of hanging it.
+            let let_go = self.let_go.recv_timeout(Duration::from_secs(5)).is_ok();
+            let _ = self.released.send(let_go);
+        }
+    }
+
     #[test]
     fn closes_made_while_one_is_awaited_complete_with_it() {
-        let (device, recorder) = mock_recorder(Closing::After(Duration::from_millis(150)));
+        let (device, recorder) = mock_recorder(Closing::AtStop);
+        // The owner thread runs this until every close below has been made.
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker = recorder.worker.call(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(())
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (let_go_tx, let_go_rx) = mpsc::channel();
+        let (released_tx, released_rx) = mpsc::channel();
+        let hold = HoldsOwnerThread {
+            held: held_tx,
+            let_go: let_go_rx,
+            released: released_tx,
+        };
+        let never_run = recorder.worker.call(move |_| {
+            drop(hold);
+            Ok(())
+        });
         let clone = recorder.clone();
         let first = recorder.close();
         let second = clone.close();
         // A close whose future is dropped neither blocks nor cancels the others.
         drop(recorder.close());
+        release_tx.send(()).unwrap();
+        block_on(blocker).unwrap();
         block_on(second).unwrap();
         block_on(first).unwrap();
         assert_eq!(device.destroys.load(Ordering::Acquire), 1);
         // The handles stay usable for what a closed handle can do.
         block_on(recorder.close()).unwrap();
         closed(block_on(clone.state()));
-        // No clone blocks when dropped once the object is closed.
-        let begun = Instant::now();
+        // The owner thread has completed the close, and is still running.
+        held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // No clone waits for it when dropped once the object is closed.
         drop((recorder, clone));
-        assert!(begun.elapsed() < Duration::from_millis(100));
+        let _ = let_go_tx.send(());
+        assert!(
+            released_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "dropping the last handle waited for the owner thread"
+        );
+        // The command left in the queue was not carried out.
+        closed(block_on(never_run));
+        assert_eq!(device.stops.load(Ordering::Acquire), 1);
+        assert_eq!(device.destroys.load(Ordering::Acquire), 1);
     }
 
     /// A probe of a [`gated_api`] waits here until a test opens the gate.
