@@ -26,6 +26,47 @@ Advanced native operations need Advanced SDK headers and `libclang`; Apple
 mobile targets need a static SDK archive. tvOS and visionOS also need a later
 Rust toolchain. See [build requirements](docs/setup.md#build-requirements).
 
+## Supported platforms and NDI SDK versions
+
+`grafton-ndi` 3.0 supports NDI 6 runtimes from the Standard and Advanced SDKs.
+SDK version coverage is:
+
+| NDI SDK version | Editions tested |
+| --- | --- |
+| 6.4.0.2 | Standard and Advanced; the crate's bindings use these headers |
+| 6.3.2 | Standard and Advanced |
+| 6.1.1 | Standard |
+| Other NDI 6 releases, including 6.0 | Not tested |
+| NDI 5 and earlier | Not supported |
+
+Platform coverage varies by architecture and SDK edition:
+
+| Platform | Architecture | Validation and SDK versions |
+| --- | --- | --- |
+| Linux (glibc) | x86-64 | Runtime tests: Standard 6.1.1, 6.3.2 and 6.4.0.2; Advanced 6.3.2 and 6.4.0.2 |
+| Linux (glibc) | x86, ARM64 | Runtime tests: Standard 6.4.0.2 |
+| Linux (glibc) | ARMv7 hard-float | Compiled and linted; no runtime tests |
+| Windows (MSVC) | x64 | Runtime tests: Standard and Advanced 6.3.2 and 6.4.0.2 |
+| Windows (MSVC) | x86 | Runtime tests: Advanced 6.4.0.2 |
+| macOS | Apple Silicon (ARM64) | Runtime tests: Standard and Advanced 6.3.2 and 6.4.0.2 |
+| macOS | Intel (x86-64) | Runtime tests: Standard 6.4.0.2 |
+| Android | ARM64, ARMv7, x86, x86-64 | Compiled and linted; no runtime tests |
+| iOS | ARM64 devices, x86-64 simulator | Built with NDI SDK for Apple 6.4; no runtime tests |
+| tvOS | ARM64 devices, x86-64 simulator | Built with NDI SDK for Apple 6.4; no runtime tests |
+| visionOS | ARM64 devices | Built with NDI SDK for Apple 6.4; no runtime tests |
+
+Apple mobile targets link the SDK statically. ARM64 Apple simulators, Mac
+Catalyst and Windows ARM64 are not supported; other targets, including musl,
+BSD and Windows GNU, have not been compiled or tested. See the
+[full platform matrix](docs/setup.md#platforms) for Rust target triples and
+Apple toolchain requirements.
+
+Optional APIs depend on the selected runtime's capabilities. Discovery Server
+APIs and the File API require NDI 6.4 or later; the File API also needs the
+Advanced runtime on Linux, macOS and Android. See
+[version compatibility](docs/setup.md#supported-ndi-versions-and-platforms)
+and [SDK validation](docs/sdk-validation.md) for details.
+
 ## Quick start
 
 ```rust
