@@ -1,8 +1,8 @@
 //! Advanced SDK controls on senders and receivers of every mode.
 
-use std::time::Duration;
+use std::{marker::PhantomData, time::Duration};
 
-use super::{invalid_input, VideoCodec, VideoPacketFormat};
+use super::{invalid_input, KvmSession, VideoCodec, VideoPacketFormat};
 use crate::{
     sys::{
         advanced::{
@@ -14,6 +14,77 @@ use crate::{
     Error, MediaTypes, Receiver, ReceiverMode, Result, Sender, SenderMode, SettingChange,
     StreamTier, Tally,
 };
+
+/// Exclusive controls for a receiver held by another resource.
+///
+/// FrameSync, AVSync and allocator registrations depend on one particular
+/// native receiver. Their `controls()` methods lend this view instead of a
+/// mutable receiver, so the receiver cannot be replaced while those resources
+/// exist. Ordinary shared controls remain available through the owner's
+/// `receiver()` method, or [`Self::receiver`].
+///
+/// The view allocates nothing and stays on its borrowing thread (`!Send` and
+/// `!Sync`). This keeps exclusive stream changes sequenced with split capture;
+/// the SDK does not document their overlap across application threads. Its
+/// exclusive borrow prevents changing streams or starting a second KVM session
+/// while a session is live. Use the synchronizer's `split()` method to keep
+/// capturing synchronized output during a KVM session.
+pub struct ReceiverControls<'a, M: ReceiverMode> {
+    receiver: &'a mut Receiver<M>,
+    _thread: PhantomData<*mut ()>,
+}
+
+impl<'a, M: ReceiverMode> ReceiverControls<'a, M> {
+    pub(crate) fn new(receiver: &'a mut Receiver<M>) -> Self {
+        Self {
+            receiver,
+            _thread: PhantomData,
+        }
+    }
+
+    /// The receiver for shared controls and the capture allowed by its mode.
+    /// This borrow never permits replacement or recovery of the receiver.
+    pub fn receiver(&self) -> &Receiver<M> {
+        self.receiver
+    }
+
+    /// Switch between program and preview; see [`Receiver::set_stream_tier`].
+    /// This makes the same synchronous native call without allocating.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Receiver::set_stream_tier`]. A refused or redundant change
+    /// remains [`SettingChange::Unchanged`].
+    pub fn set_stream_tier(&mut self, tier: StreamTier) -> Result<SettingChange> {
+        self.receiver.set_stream_tier(tier)
+    }
+
+    /// Choose the enabled media; see [`Receiver::set_streams`].
+    /// This makes the same synchronous native call without allocating. It
+    /// does not promise to flush a synchronizer's cached output or format.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Receiver::set_streams`]. A refused or redundant change
+    /// remains [`SettingChange::Unchanged`].
+    pub fn set_streams(&mut self, streams: MediaTypes) -> Result<SettingChange> {
+        self.receiver.set_streams(streams)
+    }
+
+    /// Start KVM, retaining this view's exclusive receiver borrow.
+    ///
+    /// This consumes the view, so a temporary `owner.controls()` can create
+    /// a session lasting until it is dropped. Session creation allocates
+    /// nothing; holding inputs can allocate for tracking. Release all inputs
+    /// before changing source through the session's lent receiver.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Receiver::kvm`].
+    pub fn kvm(self) -> Result<KvmSession<'a, M>> {
+        self.receiver.kvm()
+    }
+}
 
 /// Encoder guidance that `operation` returned, which `Processing.NDI.Advanced.h`
 /// describes as a size, a bit rate or a quality: a negative value breaks that

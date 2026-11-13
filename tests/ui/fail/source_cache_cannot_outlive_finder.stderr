@@ -1,0 +1,8 @@
+error[E0515]: cannot return value referencing function parameter `finder`
+ --> tests/ui/fail/source_cache_cannot_outlive_finder.rs:4:5
+  |
+4 |     SourceCache::new(&finder)
+  |     ^^^^^^^^^^^^^^^^^-------^
+  |     |                |
+  |     |                `finder` is borrowed here
+  |     returns a value referencing data owned by the current function

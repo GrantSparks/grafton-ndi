@@ -3,6 +3,8 @@
 //! Each test binary uses a different subset, so unused helpers are expected.
 #![allow(dead_code, unused_imports)]
 
+#[cfg(feature = "file-io")]
+use grafton_ndi::file;
 use grafton_ndi::{capabilities, Error, Finder, FinderOptions, Ndi, Sender, Source, SourceAddress};
 use std::{
     net::Ipv4Addr,
@@ -14,6 +16,8 @@ pub mod discovery_server;
 
 #[path = "../../src/test_support.rs"]
 mod test_support;
+#[cfg(feature = "file-io")]
+pub use test_support::file_api;
 pub use test_support::{
     advanced_ndi, assert_expected_identity, hx_decoder, is_hx_placeholder, ndi, skip, unique_name,
     unsupported, Requirement,

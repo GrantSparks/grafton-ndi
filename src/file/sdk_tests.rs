@@ -8,7 +8,7 @@
 
 use super::*;
 use crate::{
-    test_support::{self, Requirement},
+    test_support::{self, file_api},
     MediaTypes,
 };
 use std::{
@@ -25,23 +25,6 @@ use std::{
 
 /// The longest any single SDK step is given before a test fails.
 const PATIENCE: Duration = Duration::from_secs(15);
-
-/// The selected runtime and its File library, or `None` when either is absent.
-fn file_api() -> Option<(crate::Ndi, FileApi)> {
-    let ndi = test_support::ndi()?;
-    match FileApi::open(&ndi, &FileRuntimeOptions::default()) {
-        Ok(api) => Some((ndi, api)),
-        // Without a File library, or beside a runtime it cannot accompany.
-        Err(Error::RuntimeLoadFailed(reason) | Error::RuntimeConflict(reason)) => {
-            test_support::skip(
-                Requirement::File,
-                &format!("the NDI File library is unavailable: {reason}"),
-            );
-            None
-        }
-        Err(error) => panic!("the NDI File library could not be selected: {error}"),
-    }
-}
 
 /// A directory for one test's recordings, removed when the test ends.
 ///
@@ -137,19 +120,20 @@ impl LiveSource {
         let name = sender.source().unwrap().name().to_owned();
         let finder =
             crate::Finder::new(ndi, &crate::FinderOptions::new().extra_ips("127.0.0.1")).unwrap();
-        let deadline = Instant::now() + PATIENCE;
-        loop {
-            for source in finder.current_sources().unwrap() {
-                if let (true, Some(crate::SourceAddress::Ip(address))) =
-                    (source.name() == name, source.address())
-                {
-                    let port = address.rsplit(':').next().expect("an address with a port");
-                    return SourceSpec::from_url(format!("127.0.0.1:{port}")).unwrap();
-                }
-            }
-            assert!(Instant::now() < deadline, "{name} was not discovered");
-            finder.wait_for_sources(Duration::from_millis(50)).unwrap();
-        }
+        let source = finder
+            .find_source(PATIENCE, |source| {
+                source.name() == name
+                    && matches!(source.address(), Some(crate::SourceAddress::Ip(_)))
+            })
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name} was not discovered"));
+        let port = source
+            .address()
+            .unwrap()
+            .port()
+            .expect("an address with a port");
+        let selected = source.with_address(crate::SourceAddress::Ip(format!("127.0.0.1:{port}")));
+        SourceSpec::try_from(&selected).unwrap()
     }
 }
 

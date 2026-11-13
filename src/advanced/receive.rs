@@ -3,7 +3,8 @@
 use std::time::Duration;
 
 use super::{
-    packets, AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedVideoFrame, VideoCodec,
+    packets, AdvancedConfig, AudioCodec, CompressedAudioFrame, CompressedVideoFrame,
+    ReceiverControls, VideoCodec,
 };
 use crate::{
     capture::{
@@ -110,7 +111,7 @@ pub enum PacketEvent {
 /// [`PacketEvent`]; every result owns its data. It cannot feed a
 /// [`FrameSync`](crate::framesync::FrameSync), which needs decoded frames.
 ///
-/// [`receiver`](Self::receiver) and [`receiver_mut`](Self::receiver_mut) reach
+/// [`receiver`](Self::receiver) and [`controls`](Self::controls) reach
 /// the [`Receiver`] it holds, in the [`PacketAttached`] mode, for the common
 /// controls: tally, PTZ, statistics, upstream metadata, keyframe requests,
 /// stream selection, reconnecting and KVM. Its own frame and event capture is
@@ -209,11 +210,11 @@ impl PacketReceiver {
         &self.receiver
     }
 
-    /// The receiver this holds, for the controls that borrow it exclusively:
-    /// [`Receiver::set_stream_tier`], [`Receiver::set_streams`] and
-    /// [`Receiver::kvm`].
-    pub fn receiver_mut(&mut self) -> &mut Receiver<PacketAttached> {
-        &mut self.receiver
+    /// Borrow exclusive stream controls or start KVM, without permitting
+    /// receiver replacement. This allocates nothing and makes no SDK call.
+    /// A KVM session captures packets through its own `capture` method.
+    pub fn controls(&mut self) -> ReceiverControls<'_, PacketAttached> {
+        ReceiverControls::new(&mut self.receiver)
     }
 
     /// Wait up to `timeout` for the next frame or event, or return `None`

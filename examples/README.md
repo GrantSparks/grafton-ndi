@@ -24,8 +24,8 @@ Discovery Server. PTZ and KVM control examples need a source offering those
 controls.
 
 The examples borrow capture buffers when they only inspect or encode a frame.
-The 16-bit audio example uses an owned capture for `AudioConverter` and reuses
-its interleaved output allocation. Synchronous senders reuse their input frame;
+The 16-bit audio example passes a borrowed capture directly to `AudioConverter`
+and reuses its interleaved output allocation. Synchronous senders reuse their input frame;
 async senders recover completed frames before reusing them.
 
 ## Discovery and monitoring
@@ -44,10 +44,13 @@ async senders recover completed frames before reusing them.
 | --- | --- | --- |
 | `NDIlib_Recv_Audio.rs` | `cargo run --example NDIlib_Recv_Audio` | Receive and inspect audio. |
 | `NDIlib_Recv_Audio_16bpp.rs` | `cargo run --example NDIlib_Recv_Audio_16bpp` | Convert received audio with the native v3 API and explicit headroom. |
+| `framesync_audio_playback.rs` | `cargo run --example framesync_audio_playback -- 'HOST (Audio)' > output.f32` | Convert borrowed FrameSync audio directly into reusable interleaved f32 PCM output. |
 | `NDIlib_Recv_FrameSync.rs` | `cargo run --example NDIlib_Recv_FrameSync` | Clock-corrected capture with `FrameSync`. |
 | `NDIlib_Recv_PNG.rs` | `cargo run --features image-encoding --example NDIlib_Recv_PNG` | Receive video and save a PNG. Needs the `image-encoding` feature. |
 | `NDIlib_Recv_PTZ.rs` | `cargo run --example NDIlib_Recv_PTZ` | Control PTZ cameras. |
 | `concurrent_capture.rs` | `cargo run --example concurrent_capture` | Capture video, audio and metadata from one receiver on separate threads. |
+| `mixed_media_relay.rs` | `cargo run --example mixed_media_relay -- "HOST (Camera)" "Relay"` | Relay borrowed video/audio and metadata from one mixed-media wait; Ctrl-C stops it. |
+| `mixed_media_async.rs` | `cargo run --features tokio --example mixed_media_async -- "HOST (Camera)"` | Analyze owned mixed-media items on Tokio; use `--features smol` for smol. |
 
 ## Sending
 

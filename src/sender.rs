@@ -12,8 +12,8 @@ use std::{
 use crate::{
     finder::Source,
     frames::{
-        AudioFrame, MetadataFrame, MetadataText, PixelFormat, ScanType, ValidatedVideoLayout,
-        VideoFrame, VideoHeader,
+        AudioSource, MetadataFrame, MetadataText, PixelFormat, ScanType, ValidatedVideoLayout,
+        VideoFrame, VideoHeader, VideoParts, VideoSource,
     },
     pixels::{send_room, Pixels},
     receiver::Tally,
@@ -351,10 +351,10 @@ impl VideoPipeline {
     }
 
     /// Send `frame` synchronously, which also releases the frame in flight.
-    fn send(&self, frame: BorrowedVideoFrame<'_>) {
+    fn send(&self, frame: &(impl VideoSource + ?Sized)) {
         self.synchronize(|state, sender| {
             // The SDK reads the copy only during the send, under this lock.
-            let frame = frame.staged(&mut state.staging);
+            let frame = PreparedVideo::new(frame, &mut state.staging);
             // A synchronous video send also releases the previous async frame,
             // which completes once the send has returned.
             let synchronized = state.in_flight.send(sender, frame);
@@ -494,7 +494,7 @@ pub(crate) mod in_flight {
 
     #[cfg(feature = "advanced")]
     use super::Exclusive;
-    use super::{async_flush_frame_ptr, BorrowedVideoFrame, SendHandle};
+    use super::{async_flush_frame_ptr, PreparedVideo, SendHandle};
     #[cfg(feature = "advanced")]
     use crate::sys::advanced::{native, FrameScatter, ScatterSend};
     use crate::{sys::bindings::NDIlib_video_frame_v2_t, VideoFrame};
@@ -727,10 +727,9 @@ pub(crate) mod in_flight {
         pub(crate) fn send(
             &mut self,
             sender: SendHandle,
-            frame: BorrowedVideoFrame<'_>,
+            frame: PreparedVideo<'_>,
         ) -> Synchronized {
-            debug_assert!(frame.sends_in_place());
-            let raw = frame.to_raw();
+            let raw = frame.raw;
             // SAFETY: `sender` is the live sender whose stream this slot
             // holds. `raw` points into pixels and metadata that `frame`
             // borrows for longer than this call, and the pixels are followed
@@ -873,6 +872,45 @@ impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
     fn sdk_timestamp(&self) -> Option<crate::SdkTimestamp> {
         None
     }
+
+    fn can_send_direct(&self) -> bool {
+        self.sends_in_place()
+    }
+}
+
+impl VideoSource for BorrowedVideoFrame<'_> {}
+
+/// A descriptor borrowing either a proven direct input or initialized packed
+/// staging. Its lifetime keeps both input metadata and staging alive until the
+/// synchronous native call returns. It never forms slices over capture padding.
+pub(crate) struct PreparedVideo<'a> {
+    raw: NDIlib_video_frame_v2_t,
+    _borrow: PhantomData<&'a ()>,
+}
+
+impl<'a> PreparedVideo<'a> {
+    fn new(frame: &'a (impl VideoParts + ?Sized), staging: &'a mut Pixels) -> Self {
+        let raw = if frame.can_send_direct() {
+            frame.video_descriptor()
+        } else {
+            let packed = frame.layout().packed();
+            let room = send_room(&packed, frame.header().scan_type);
+            frame.copy_active_pixels(staging, &packed, room);
+            crate::frames::sdk_video_frame(
+                &packed,
+                frame.header(),
+                staging.as_ptr(),
+                frame
+                    .metadata_text()
+                    .map_or(ptr::null(), MetadataText::as_ptr),
+                frame.sdk_timestamp(),
+            )
+        };
+        Self {
+            raw,
+            _borrow: PhantomData,
+        }
+    }
 }
 
 crate::frames::video_accessors! {
@@ -907,8 +945,8 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// `data` includes extra room. Direct sending requires an explicit
     /// [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`] opt-in.
     ///
-    /// Its defaults are the packed line stride, 30/1 frames per second, a
-    /// 16:9 picture aspect ratio, progressive scan, [`Timecode::SYNTHESIZE`]
+    /// Its defaults are the packed line stride, 30/1 frames per second,
+    /// square pixels (picture aspect ratio `0.0`), progressive scan, [`Timecode::SYNTHESIZE`]
     /// and no metadata. All validation occurs in
     /// [`BorrowedVideoFrameBuilder::build`].
     ///
@@ -938,7 +976,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
             pixel_format,
             line_stride: None,
             frame_rate: const { FrameRate::per_second(30) },
-            picture_aspect_ratio: 16.0 / 9.0,
+            picture_aspect_ratio: VideoHeader::SQUARE_PIXELS,
             scan_type: ScanType::Progressive,
             timecode: Timecode::SYNTHESIZE,
             metadata: None,
@@ -1063,7 +1101,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     ///     .resolution(720, 480)
     ///     .pixel_format(uyvy)
     ///     .build()?;
-    /// assert!(BorrowedVideoFrame::from(&owned).sends_in_place());
+    /// assert!(grafton_ndi::VideoSource::sends_in_place(&owned));
     /// # Ok(())
     /// # }
     /// ```
@@ -1071,30 +1109,6 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     pub fn sends_in_place(&self) -> bool {
         let room = send_room(&self.layout, self.header.scan_type);
         room == 0 || (self.allow_padding_and_tail && self.tail_room >= room)
-    }
-
-    /// This frame with the room after its pixels that the SDK reads: itself
-    /// when it [sends in place](Self::sends_in_place), and otherwise a copy
-    /// of its active rows in packed `staging`, with the same header and
-    /// metadata and a zeroed tail. The copy reuses `staging`'s allocation
-    /// when it is large enough.
-    fn staged<'s>(self, staging: &'s mut Pixels) -> BorrowedVideoFrame<'s>
-    where
-        'buf: 's,
-    {
-        if self.sends_in_place() {
-            return self;
-        }
-        let layout = self.layout.packed();
-        let room = send_room(&layout, self.header.scan_type);
-        crate::frames::VideoParts::copy_active_pixels(&self, staging, &layout, room);
-        BorrowedVideoFrame {
-            layout,
-            data: staging.as_slice(),
-            tail_room: staging.tail_room(),
-            allow_padding_and_tail: true,
-            ..self
-        }
     }
 
     /// Return this frame with `timecode`.
@@ -1118,14 +1132,9 @@ impl<'buf> BorrowedVideoFrame<'buf> {
         self
     }
 
+    #[cfg(test)]
     fn to_raw(self) -> NDIlib_video_frame_v2_t {
-        crate::frames::sdk_video_frame(
-            &self.layout,
-            &self.header,
-            self.data.as_ptr(),
-            self.metadata.map_or(ptr::null(), MetadataText::as_ptr),
-            None,
-        )
+        self.video_descriptor()
     }
 }
 
@@ -1296,26 +1305,6 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
     }
 }
 
-impl<'buf> From<&'buf VideoFrame> for BorrowedVideoFrame<'buf> {
-    fn from(frame: &'buf VideoFrame) -> Self {
-        let layout = *crate::frames::VideoParts::layout(frame);
-        BorrowedVideoFrame {
-            layout,
-            header: *crate::frames::VideoParts::header(frame),
-            data: frame.data(),
-            tail_room: layout.trailing_padding() + frame.tail_room(),
-            allow_padding_and_tail: true,
-            metadata: crate::frames::VideoParts::metadata_text(frame),
-        }
-    }
-}
-
-impl<'a, 'buf> From<&'a BorrowedVideoFrame<'buf>> for BorrowedVideoFrame<'buf> {
-    fn from(frame: &'a BorrowedVideoFrame<'buf>) -> Self {
-        *frame
-    }
-}
-
 impl<M: SenderMode> Sender<M> {
     /// Create a sender in this mode, through the creation path of
     /// [`Sender::new`]: the configured entry point when the options carry an
@@ -1463,11 +1452,14 @@ impl Sender {
 
     /// Send a video frame synchronously.
     ///
-    /// Accepts `&VideoFrame`, a [`BorrowedVideoFrame`], or `&BorrowedVideoFrame`.
+    /// Accepts every [`VideoSource`]: owned frames, checked external buffers,
+    /// receiver captures and FrameSync captures, all by shared reference.
     /// Borrowed UYVY/UYVA frames are copied into packed storage with a zeroed
     /// tail wherever [`PixelFormat::send_tail_room`] is nonzero, so padding
     /// and trailing bytes cannot affect the encoded picture. The sender
-    /// reuses one staging allocation. Other formats send in place. Owned
+    /// reuses one staging allocation. Captures with padded rows also stage,
+    /// since their guard guarantees only active pixels are initialized. Packed
+    /// captures needing no trailing room send in place. Owned
     /// frames use their zeroed tail; a scan type requiring extra strides may
     /// still need staging until the owned buffer has that room. To permit
     /// direct sending from initialized caller padding
@@ -1497,14 +1489,13 @@ impl Sender {
     /// let frame = BorrowedVideoFrame::builder(&buffer, 64, 32, PixelFormat::Bgra)
     ///     .line_stride(512)
     ///     .build()?;
-    /// sender.send_video(frame)?;
+    /// sender.send_video(&frame)?;
     /// buffer.fill(0xff); // the SDK is done with the buffer
     /// # Ok(())
     /// # }
     /// ```
-    pub fn send_video<'a>(&self, frame: impl Into<BorrowedVideoFrame<'a>>) -> Result<()> {
-        let frame: BorrowedVideoFrame<'a> = frame.into();
-        self.require_video_format(frame.pixel_format())?;
+    pub fn send_video(&self, frame: &(impl VideoSource + ?Sized)) -> Result<()> {
+        self.require_video_format(frame.layout().pixel_format)?;
         self.native.video.send(frame);
         Ok(())
     }
@@ -1563,10 +1554,10 @@ impl Sender {
     /// copied. No pending send is changed on failure.
     pub fn send_video_async_copy(
         &mut self,
-        frame: &BorrowedVideoFrame<'_>,
+        frame: &(impl VideoSource + ?Sized),
     ) -> Result<Option<VideoFrame>> {
-        self.require_video_format(frame.pixel_format())?;
-        let owned = frame.to_owned();
+        self.require_video_format(frame.layout().pixel_format)?;
+        let owned = frame.owned_copy();
         Ok(self.native.video.submit(owned))
     }
 
@@ -1614,6 +1605,9 @@ impl Sender {
 impl<M: AudioSendMode> Sender<M> {
     /// Sends an audio frame synchronously.
     ///
+    /// Accepts every [`AudioSource`], including receiver and FrameSync captures.
+    /// Samples and metadata are submitted in place with the original channel
+    /// stride; no intermediate planar copy or wrapper allocation is made.
     /// The SDK has released the input buffer when this returns, so the caller
     /// may then reuse or release it. This calls `NDIlib_send_send_audio_v3`.
     /// It is available in the modes that implement [`AudioSendMode`]: on an
@@ -1652,13 +1646,13 @@ impl<M: AudioSendMode> Sender<M> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn send_audio(&self, audio_frame: &AudioFrame) {
+    pub fn send_audio(&self, audio_frame: &(impl AudioSource + ?Sized)) {
         // SAFETY: the sender instance is live for this borrow, and every pointer
         // passed outlives the synchronous call.
         unsafe {
             self.inner
                 .core
-                .NDIlib_send_send_audio_v3(self.inner.instance.0, &audio_frame.to_raw());
+                .NDIlib_send_send_audio_v3(self.inner.instance.0, &audio_frame.audio_descriptor());
         }
     }
 }
@@ -2109,6 +2103,131 @@ mod tests {
     use crate::RuntimeFeature;
     use std::sync::Arc;
 
+    #[test]
+    fn captured_video_sending_uses_initialized_active_rows_and_preserves_descriptors() {
+        use crate::capture::{FrameSyncVideoFree, Guard, VideoKind};
+        use crate::frames::VideoRef;
+        use std::{
+            mem::MaybeUninit,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        fn verify(source: &(impl VideoSource + ?Sized), original: &NDIlib_video_frame_v2_t) {
+            let expected = source.owned_copy();
+            let mut staging = Pixels::default();
+            let (raw, allocations) = crate::test_alloc::allocation_count(|| {
+                PreparedVideo::new(source, &mut staging).raw
+            });
+            let direct = source.sends_in_place();
+            assert_eq!(allocations, usize::from(!direct));
+            assert_eq!(raw.p_metadata, original.p_metadata);
+            assert_eq!(raw.timestamp, original.timestamp);
+            assert_eq!(raw.timecode, original.timecode);
+            assert_eq!(raw.picture_aspect_ratio, original.picture_aspect_ratio);
+            assert_eq!(raw.frame_format_type, original.frame_format_type);
+            assert_eq!(
+                (raw.xres, raw.yres, raw.FourCC),
+                (original.xres, original.yres, original.FourCC)
+            );
+            assert_eq!(
+                (raw.frame_rate_N, raw.frame_rate_D),
+                (original.frame_rate_N, original.frame_rate_D)
+            );
+            if direct {
+                assert_eq!(raw.p_data, original.p_data);
+                assert!(staging.as_slice().is_empty());
+            } else {
+                assert_eq!(raw.p_data, staging.as_ptr().cast_mut());
+                assert_ne!(raw.p_data, original.p_data);
+                assert_eq!(staging.as_slice(), expected.data());
+                assert!(staging.room().iter().all(|&byte| byte == 0));
+                assert_eq!(
+                    staging.tail_room(),
+                    send_room(&source.layout().packed(), source.header().scan_type)
+                );
+            }
+            let pointer = raw.p_data;
+            let (next, allocations) = crate::test_alloc::allocation_count(|| {
+                PreparedVideo::new(source, &mut staging).raw
+            });
+            assert_eq!(allocations, 0);
+            assert_eq!(next.p_data, pointer);
+        }
+
+        for format in PixelFormat::ALL {
+            for scan in ScanType::ALL {
+                for padding in [0, 8] {
+                    let stride = format.line_stride(4).unwrap() + padding;
+                    let len = ValidatedVideoLayout::new_uncompressed(format, 4, 6, Some(stride))
+                        .unwrap()
+                        .data_len_bytes;
+                    let initialized = vec![71; len];
+                    let template = BorrowedVideoFrame::builder(&initialized, 4, 6, format)
+                        .line_stride(stride)
+                        .scan_type(scan)
+                        .frame_rate(FrameRate::new(30_000, 1_001).unwrap())
+                        .picture_aspect_ratio(1.25)
+                        .timecode(Timecode::from_ticks(12345))
+                        .metadata(c"<captured/>")
+                        .build()
+                        .unwrap();
+                    // Only active rows are initialized. Reading any capture padding
+                    // or unproven SDK tail is invalid under Miri as well as Rust.
+                    let mut storage = vec![MaybeUninit::<u8>::uninit(); len];
+                    for plane in template.planes() {
+                        for row in plane.rows() {
+                            let start = row.as_ptr() as usize - initialized.as_ptr() as usize;
+                            for byte in &mut storage[start..start + row.len()] {
+                                byte.write(71);
+                            }
+                        }
+                    }
+                    let raw = NDIlib_video_frame_v2_t {
+                        p_data: storage.as_mut_ptr().cast(),
+                        timestamp: 912,
+                        ..template.to_raw()
+                    };
+                    let frees = AtomicUsize::new(0);
+                    let instance = (&frees as *const AtomicUsize).cast_mut().cast();
+                    // SAFETY: each guard borrows the still-live storage and static
+                    // metadata. Its callback counts release and frees no memory.
+                    let receiver = unsafe {
+                        VideoRef::new(Guard::<VideoKind>::with_test_free(
+                            instance,
+                            raw,
+                            |instance, _| {
+                                (*(instance as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst);
+                            },
+                        ))
+                    }
+                    .unwrap();
+                    let framesync = unsafe {
+                        VideoRef::new(Guard::<FrameSyncVideoFree>::with_test_free(
+                            instance.cast(),
+                            raw,
+                            |instance, _| {
+                                (*(instance as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst);
+                            },
+                        ))
+                    }
+                    .unwrap();
+                    let eligible = padding == 0 && send_room(receiver.layout(), scan) == 0;
+                    assert_eq!(
+                        receiver.sends_in_place(),
+                        eligible,
+                        "{format:?} {scan:?} padding={padding}"
+                    );
+                    verify(&receiver, &raw);
+                    verify(&framesync, &raw);
+                    assert_eq!(frees.load(Ordering::SeqCst), 0);
+                    drop(receiver);
+                    drop(framesync);
+                    assert_eq!(frees.load(Ordering::SeqCst), 2);
+                }
+            }
+        }
+    }
+
     fn test_owned_frame(value: u8) -> VideoFrame {
         let mut frame = VideoFrame::builder()
             .resolution(16, 16)
@@ -2200,9 +2319,9 @@ mod tests {
             .build()
             .unwrap();
         // Warm any lazily created SDK or runtime state before counting.
-        sender.send_video(borrowed).unwrap();
+        sender.send_video(&borrowed).unwrap();
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
-            sender.send_video(borrowed).unwrap();
+            sender.send_video(&borrowed).unwrap();
             // Lint allowed: the by-reference form is what is under test.
             #[allow(clippy::needless_borrows_for_generic_args)]
             sender.send_video(&borrowed).unwrap();
@@ -2274,21 +2393,23 @@ mod tests {
                                 let frame =
                                     unsafe { builder.readable_after(vouched) }.build().unwrap();
                                 assert!(!frame.sends_in_place());
-                                let staged = frame.staged(&mut staging);
-                                assert!(staged.sends_in_place());
-                                assert_eq!(staged.line_stride_bytes(), 36);
-                                assert_eq!(staged.scan_type(), scan);
-                                assert_eq!(staged.data(), frame.to_owned().data());
+                                let raw = PreparedVideo::new(&frame, &mut staging).raw;
+                                assert_eq!(
+                                    unsafe { raw.__bindgen_anon_1.line_stride_in_bytes },
+                                    36
+                                );
+                                assert_eq!(raw.frame_format_type, scan.to_sdk());
+                                assert_eq!(staging.as_slice(), frame.to_owned().data());
                                 if let Some(expected) = &expected {
-                                    assert_eq!(staged.data(), expected);
+                                    assert_eq!(staging.as_slice(), expected);
                                 } else {
-                                    expected = Some(staged.data().to_vec());
+                                    expected = Some(staging.as_slice().to_vec());
                                 }
                                 assert_eq!(staging.tail_room(), send_room(&layout.packed(), scan));
                                 assert!(staging.room().iter().all(|&byte| byte == 0));
                                 let address = staging.as_ptr();
                                 let ((), allocations) = crate::test_alloc::allocation_count(|| {
-                                    let _ = frame.staged(&mut staging);
+                                    let _ = PreparedVideo::new(&frame, &mut staging);
                                 });
                                 assert_eq!(allocations, 0);
                                 assert_eq!(staging.as_ptr(), address);
@@ -2318,10 +2439,13 @@ mod tests {
                         .build()
                         .unwrap();
                     let mut staging = Pixels::default();
-                    black_box(frame.staged(&mut staging));
+                    black_box(PreparedVideo::new(&frame, &mut staging));
                     let start = Instant::now();
                     for _ in 0..200 {
-                        black_box(black_box(frame).staged(black_box(&mut staging)));
+                        black_box(PreparedVideo::new(
+                            black_box(&frame),
+                            black_box(&mut staging),
+                        ));
                     }
                     eprintln!(
                         "{format:?} {width}x{height} padding={padding}: {:.3} ms/frame",
@@ -2448,12 +2572,7 @@ mod tests {
         let original = frame.to_raw();
 
         let mut staging = Pixels::default();
-        let raw = {
-            let staged = frame.staged(&mut staging);
-            assert!(staged.sends_in_place());
-            assert_eq!(staged.data(), frame.to_owned().data());
-            staged.to_raw()
-        };
+        let raw = PreparedVideo::new(&frame, &mut staging).raw;
         assert_eq!(raw.p_data, staging.as_ptr().cast_mut());
         assert_ne!(raw.p_data, original.p_data);
         assert_eq!(staging.as_slice(), frame.to_owned().data());
@@ -2496,7 +2615,7 @@ mod tests {
             .unwrap();
         let address = staging.as_ptr();
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
-            let _ = next.staged(&mut staging);
+            let _ = PreparedVideo::new(&next, &mut staging);
         });
         assert_eq!(allocations, 0);
         assert_eq!(
@@ -2512,8 +2631,8 @@ mod tests {
             .build()
             .unwrap();
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
-            let staged = direct.staged(&mut staging);
-            assert_eq!(staged.data().as_ptr(), roomy.as_ptr());
+            let raw = PreparedVideo::new(&direct, &mut staging).raw;
+            assert_eq!(raw.p_data.cast_const(), roomy.as_ptr());
         });
         assert_eq!(allocations, 0);
         assert_eq!(staging.as_slice(), next.to_owned().data());
@@ -2545,18 +2664,18 @@ mod tests {
         if frame.sends_in_place() {
             // The SDK reads frames exactly here, so the sender copies none.
             assert_eq!(PixelFormat::Uyvy.send_tail_room(), 0);
-            sender.send_video(frame).unwrap();
+            sender.send_video(&frame).unwrap();
             assert!(staging(&sender).1.is_empty());
             return;
         }
-        sender.send_video(frame).unwrap();
+        sender.send_video(&frame).unwrap();
         let (address, copy, room) = staging(&sender);
         assert_eq!(copy, exact);
         assert_eq!(room, [0; 64]);
 
         // The steady state: the same buffer, and no allocation.
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
-            sender.send_video(frame).unwrap();
+            sender.send_video(&frame).unwrap();
         });
         assert_eq!(allocations, 0);
         assert_eq!(staging(&sender).0, address);
@@ -2572,7 +2691,7 @@ mod tests {
         assert!(direct.sends_in_place());
         let owned = direct.to_owned();
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
-            sender.send_video(direct).unwrap();
+            sender.send_video(&direct).unwrap();
             sender.send_video(&owned).unwrap();
         });
         assert_eq!(allocations, 0);
@@ -2584,7 +2703,7 @@ mod tests {
             .build()
             .unwrap();
         let ((), allocations) = crate::test_alloc::allocation_count(|| {
-            sender.send_video(frame).unwrap();
+            sender.send_video(&frame).unwrap();
         });
         assert_eq!(allocations, 1);
         assert_eq!(staging(&sender).1, larger);
@@ -2593,8 +2712,8 @@ mod tests {
     #[test]
     fn synchronous_send_describes_an_owned_frame_as_the_frame_itself() {
         let owned = test_owned_frame(8);
-        let borrowed = BorrowedVideoFrame::from(&owned);
-        let (expected, lent) = (owned.to_raw(), borrowed.to_raw());
+        let mut staging = Pixels::default();
+        let (expected, lent) = (owned.to_raw(), PreparedVideo::new(&owned, &mut staging).raw);
         assert_eq!(lent.p_data, expected.p_data);
         assert_eq!(lent.p_metadata, expected.p_metadata);
         // SAFETY: both descriptors are uncompressed, so the union holds the stride.
@@ -2992,11 +3111,13 @@ mod tests {
                     (Timecode::from_ticks(0), None)
                 );
                 assert_eq!(owned.metadata(), borrowed.metadata());
-                let (reborrowed, allocations) =
-                    crate::test_alloc::allocation_count(|| BorrowedVideoFrame::from(&owned));
+                let mut staging = Pixels::default();
+                let (raw, allocations) = crate::test_alloc::allocation_count(|| {
+                    PreparedVideo::new(&owned, &mut staging).raw
+                });
                 assert_eq!(allocations, 0);
-                assert_eq!(reborrowed.metadata(), borrowed.metadata());
-                assert_eq!(reborrowed.frame_rate(), rate);
+                assert_eq!(raw.p_metadata, owned.to_raw().p_metadata);
+                assert_eq!(raw.p_data, owned.to_raw().p_data);
                 assert!(BorrowedVideoFrame::builder(
                     &data[..layout.data_len_bytes - 1],
                     4,
@@ -3059,7 +3180,7 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(frame.timecode(), Timecode::SYNTHESIZE);
-        assert_eq!(frame.picture_aspect_ratio(), 16.0 / 9.0);
+        assert_eq!(frame.picture_aspect_ratio(), 0.0);
 
         let frame = BorrowedVideoFrame::builder(&buffer, 64, 36, PixelFormat::Uyvy)
             .picture_aspect_ratio(0.0)
@@ -3080,6 +3201,29 @@ mod tests {
                     .is_err(),
                 "{bad}"
             );
+        }
+    }
+
+    #[test]
+    fn borrowed_video_aspect_defaults_and_copies_preserve_the_sdk_sentinel() {
+        for (width, height) in [(640, 480), (1920, 1080), (1080, 1920), (64, 64)] {
+            let pixels = vec![0; width as usize * height as usize * 4];
+            for ratio in [None, Some(0.0), Some(1.25)] {
+                let mut builder =
+                    BorrowedVideoFrame::builder(&pixels, width, height, PixelFormat::Bgra);
+                if let Some(ratio) = ratio {
+                    builder = builder.picture_aspect_ratio(ratio);
+                }
+                let frame = builder.build().unwrap();
+                let expected = ratio.unwrap_or(0.0);
+                assert_eq!(frame.picture_aspect_ratio(), expected);
+                assert_eq!(frame.to_raw().picture_aspect_ratio, expected);
+                let mut copied = frame.to_owned();
+                assert_eq!(copied.picture_aspect_ratio(), expected);
+                copied.set_picture_aspect_ratio(2.0).unwrap();
+                frame.copy_into(&mut copied);
+                assert_eq!(copied.picture_aspect_ratio(), expected);
+            }
         }
     }
 
@@ -3173,7 +3317,7 @@ mod tests {
         assert_eq!(frame.height(), 1080);
         assert_eq!(frame.pixel_format(), PixelFormat::Bgra);
         assert_eq!(frame.frame_rate(), FrameRate::new(60, 1).unwrap());
-        assert_eq!(frame.picture_aspect_ratio(), 16.0 / 9.0);
+        assert_eq!(frame.picture_aspect_ratio(), 0.0);
         assert_eq!(frame.scan_type(), ScanType::Progressive);
         assert_eq!(frame.timecode(), Timecode::SYNTHESIZE);
         assert_eq!(frame.data().len(), buffer.len());

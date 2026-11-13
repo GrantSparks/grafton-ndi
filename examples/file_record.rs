@@ -9,7 +9,11 @@
 //!
 //! Arguments: the source's NDI name, the output prefix (the default naming
 //! writes `take_001.mkv`, `take_002.mkv`, ...), and optionally the number of
-//! seconds to record (10 by default). A source that contains no parenthesis,
+//! seconds to record (10 by default), followed by optional `--groups Studio`,
+//! `--ip 192.0.2.10`, or `--by-name`. A complete NDI name is selected exactly
+//! through the configured finder and recorded at its discovered endpoint.
+//! `--by-name` explicitly asks the File SDK to rediscover by logical name instead.
+//! A source that contains no parenthesis,
 //! such as `192.168.1.20:5961`, is taken as an address instead of a name, which
 //! records it without discovering it first.
 //!
@@ -30,7 +34,7 @@ use grafton_ndi::{
         FileApi, FileRuntimeOptions, FinishStatus, RecorderEventKind, RecorderOptions,
         RecordingTarget, RecordingTimecode, SourceSpec,
     },
-    Ndi,
+    Finder, FinderOptions, Ndi,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,7 +43,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("usage: file_record <NDI source name or address> <output prefix> [seconds]");
         std::process::exit(2);
     };
-    let seconds = arguments.next().map_or(Ok(10), |text| text.parse())?;
+    let mut arguments = arguments.peekable();
+    let seconds: u64 = if arguments
+        .peek()
+        .is_some_and(|value| !value.starts_with("--"))
+    {
+        arguments.next().unwrap().parse()?
+    } else {
+        10
+    };
+    let mut discovery = FinderOptions::new();
+    let mut by_name = false;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--groups" => {
+                discovery = discovery.groups(arguments.next().ok_or("--groups needs a value")?)
+            }
+            "--ip" => {
+                discovery = discovery.extra_ips(arguments.next().ok_or("--ip needs a value")?)
+            }
+            "--by-name" => by_name = true,
+            _ => return Err(format!("unknown option: {argument}").into()),
+        }
+    }
 
     if seconds == 0 {
         return Err("recording duration must be positive".into());
@@ -49,8 +75,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("File library: {:?}", file.library_path());
 
     // NDI names read "MACHINE (Source)"; anything else is an address.
-    let spec = if source.contains('(') {
+    let spec = if by_name {
         SourceSpec::new(&source)?
+    } else if source.contains('(') {
+        let finder = Finder::new(&ndi, &discovery)?;
+        let selected = finder
+            .find_source_by_name(&source, Duration::from_secs(10))?
+            .ok_or_else(|| grafton_ndi::Error::NoSourcesFound {
+                criteria: source.clone(),
+            })?;
+        println!("Selected {selected}");
+        SourceSpec::try_from(&selected)?
     } else {
         SourceSpec::from_url(&source)?
     };

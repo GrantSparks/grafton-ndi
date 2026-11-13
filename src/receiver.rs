@@ -41,12 +41,14 @@ use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::{
     capabilities::RuntimeFeature,
     capture::{
-        capture_raw, AudioKind, CaptureKind, CaptureResult, MetadataKind, Notification, VideoKind,
+        capture_any, capture_raw, AudioKind, CaptureKind, CaptureResult, CaptureStrategy,
+        Delivered, MetadataKind, Notification, VideoKind,
     },
     finder::{RawSource, Source},
     sys::{self, bindings::*},
     timeout::{self, Deadline},
-    Error, MetadataFrame, Ndi, Result,
+    AudioFrame, AudioFrameRef, Error, MetadataFrame, MetadataFrameRef, Ndi, Result, VideoFrame,
+    VideoFrameRef,
 };
 
 /// A string the receiver API returned, released when dropped.
@@ -834,6 +836,53 @@ pub(crate) struct ReceiverCore {
 }
 
 impl Receiver {
+    /// Wait up to `timeout` for video, audio, metadata, or a receiver event,
+    /// borrowing delivered media directly from the SDK without a payload
+    /// copy or allocation. No Advanced feature or runtime is required.
+    ///
+    /// A single native wait requests every media kind, so a silent stream
+    /// does not delay other kinds behind its own timeout. See [`Capture`]
+    /// for the shared wait budget, reconnect locking, and zero-timeout
+    /// behavior. The returned item borrows this receiver; media references
+    /// may move to scoped worker threads while that borrow remains live.
+    ///
+    /// Pending and native events are consumed once, competing with
+    /// [`Self::poll_event`] and other combined captures. They are coalesced
+    /// invalidations, with no ordered history or broadcast guarantee. Typed
+    /// media captures retain their events for these consumers.
+    /// [`ReceiverEvent::SourceChanged`] requires the separate
+    /// [`Self::poll_source_name_change`] query for the new name.
+    ///
+    /// This operation exists only in ordinary raw-capture mode. FrameSync,
+    /// AvSync and packet receivers reserve some or all native media slots.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`],
+    /// [`Error::CaptureFailed`] when the SDK reports a lost connection, and
+    /// the same frame-validation errors as typed borrowed capture. Rejected
+    /// frames are freed through their matching native free operation.
+    pub fn capture_any_ref(&self, timeout: Duration) -> Result<Option<ReceiverItemRef<'_>>> {
+        self.core.capture_any_ref_until(Deadline::after(timeout)?)
+    }
+
+    /// Wait up to `timeout` for any media or receiver event and return an
+    /// owned item. See [`Self::capture_any_ref`] for delivery and wait rules.
+    ///
+    /// Media is copied through the same validated paths as typed capture:
+    /// active video rows are packed, audio channel padding is omitted, and
+    /// timing and metadata are preserved. Video/audio allocate one payload
+    /// buffer plus metadata when present; standalone metadata allocates its
+    /// text. Events allocate nothing. Copying may finish after the wait
+    /// budget expires. Use [`Self::capture_any_ref`] for in-place processing.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::capture_any_ref`].
+    pub fn capture_any(&self, timeout: Duration) -> Result<Option<ReceiverItem>> {
+        self.core.capture_any_until(Deadline::after(timeout)?)
+    }
+
     /// Create a receiver and connect it to the configured source.
     ///
     /// # Errors
@@ -908,12 +957,12 @@ impl<M: VideoMode> Receiver<M> {
     /// timeout for a frame:
     ///
     /// - [`capture`](Capture::capture) copies the frame into an owned
-    ///   [`VideoFrame`](crate::VideoFrame);
+    ///   [`VideoFrame`];
     /// - [`capture_ref`](Capture::capture_ref) borrows the SDK's buffer in
     ///   place.
     ///
     /// Video frames may carry per-row padding (e.g. RGBX/BGRX); see
-    /// [`VideoFrame`](crate::VideoFrame) for how to read them correctly.
+    /// [`VideoFrame`] for how to read them correctly.
     ///
     /// # Examples
     ///
@@ -1338,7 +1387,7 @@ impl<M: MetadataMode> Receiver<M> {
     ///
     /// Events are coalesced invalidations, including those that media capture
     /// passed over and kept, not an ordered history or broadcast stream.
-    /// Concurrent pollers compete to consume a pending one. The new source
+    /// Concurrent pollers and combined captures compete to consume a pending one. The new source
     /// name is read with the SDK's separate [`Self::poll_source_name_change`]
     /// API.
     ///
@@ -1462,7 +1511,7 @@ impl ReceiverCore {
     }
 
     /// Hold the lock a reconnect holds, so that a test can contend with capture.
-    #[cfg(all(test, feature = "advanced"))]
+    #[cfg(all(test, any(feature = "advanced", feature = "tokio")))]
     pub(crate) fn reconnect_lock(&self) -> parking_lot::RwLockWriteGuard<'_, Source> {
         self.capture_guard.write()
     }
@@ -1521,6 +1570,71 @@ impl ReceiverCore {
             .capture_ref_until::<K>(deadline)?
             .as_ref()
             .map(K::ref_to_owned))
+    }
+
+    /// All-slot capture through the same attempt/deadline kernel as typed
+    /// capture, with pending invalidations consumed by the combined reader.
+    pub(crate) fn capture_any_ref_until(
+        &self,
+        deadline: Deadline,
+    ) -> Result<Option<ReceiverItemRef<'_>>> {
+        capture_within(deadline, |attempt| {
+            if let Some(event) = self.take_pending_event() {
+                return Ok(Some(ReceiverItemRef::Event(event)));
+            }
+            let Some(lock) = self.capture_lock(attempt) else {
+                return Ok(self.take_pending_event().map(ReceiverItemRef::Event));
+            };
+            if let Some(event) = self.take_pending_event() {
+                return Ok(Some(ReceiverItemRef::Event(event)));
+            }
+            let delivered = capture_any(&lock)?;
+            drop(lock);
+            self.combined_result(delivered)
+        })
+    }
+
+    fn combined_result<'rx>(
+        &'rx self,
+        delivered: Delivered<'rx>,
+    ) -> Result<Option<ReceiverItemRef<'rx>>> {
+        Ok(Some(match delivered {
+            // SAFETY: all-slot dispatch guards each delivered descriptor
+            // with its matching capture kind and free operation. Construction
+            // validates the active layout without reading native padding.
+            Delivered::Video(guard) => {
+                ReceiverItemRef::Video(unsafe { VideoKind::make_ref(guard)? })
+            }
+            Delivered::Audio(guard) => {
+                ReceiverItemRef::Audio(unsafe { AudioKind::make_ref(guard)? })
+            }
+            Delivered::Metadata(guard) => {
+                ReceiverItemRef::Metadata(unsafe { MetadataKind::make_ref(guard)? })
+            }
+            Delivered::Notification(notification) => {
+                let Some(event) = self.event(notification) else {
+                    return Ok(None);
+                };
+                ReceiverItemRef::Event(event)
+            }
+        }))
+    }
+
+    /// Combined capture copied while its native guards are still local.
+    pub(crate) fn capture_any_until(&self, deadline: Deadline) -> Result<Option<ReceiverItem>> {
+        Ok(self
+            .capture_any_ref_until(deadline)?
+            .as_ref()
+            .map(ReceiverItemRef::to_owned))
+    }
+
+    /// Coalesce the native notification with any invalidation a concurrent
+    /// typed capture retained during this wait, then consume one. A pending
+    /// event returned before the native wait never comes through this path
+    /// and is never published again.
+    fn event(&self, notification: Notification) -> Option<ReceiverEvent> {
+        self.retain(notification);
+        self.take_pending_event()
     }
 
     fn take_pending_status(&self) -> Option<ReceiverStatus> {
@@ -1645,8 +1759,7 @@ impl ReceiverCore {
         // Null media slots request notifications only; no frame allocation escapes.
         let frame_type = lock.capture(None, None, None);
         drop(lock);
-        self.retain(Notification::classify(frame_type)?);
-        Ok(self.take_pending_event())
+        Ok(self.event(Notification::classify(frame_type)?))
     }
 }
 
@@ -1752,8 +1865,9 @@ pub(crate) mod native_capture_calls {
 /// - [`capture_ref`](Self::capture_ref) borrows the SDK's buffer in place,
 ///   with no allocation and no copy. It is the one for in-place processing:
 ///   for a 1920×1080 BGRA frame it avoids ~8.3 MB of copying per frame
-///   (~475 MB/s at 60 fps). Convert it with `to_owned` when you need to
-///   keep or send it.
+///   (~475 MB/s at 60 fps). Synchronous sends accept these references;
+///   convert with `to_owned` when you need to retain a frame or submit an
+///   owned asynchronous send.
 ///
 /// Both wait up to their timeout for a frame. The SDK returns from a capture
 /// early, without a frame, while a new connection synchronizes and whenever
@@ -2092,6 +2206,60 @@ pub enum SourceNameChange {
     Disconnected,
 }
 
+/// An owned item delivered by [`Receiver::capture_any`] or an async
+/// receiver's combined capture. Media buffers and metadata can outlive the
+/// receiver and move between threads.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum ReceiverItem {
+    /// Validated uncompressed video with packed active rows.
+    Video(VideoFrame),
+    /// Validated planar floating-point audio with packed channels.
+    Audio(AudioFrame),
+    /// Standalone frame metadata.
+    Metadata(MetadataFrame),
+    /// A consumed, coalesced receiver invalidation.
+    Event(ReceiverEvent),
+}
+
+/// An item delivered by [`Receiver::capture_any_ref`]. Media borrows native
+/// storage and keeps the receiver borrowed until its matching guard is
+/// dropped. Borrowed capture allocates and copies no payload; video row and
+/// audio channel padding are never exposed as initialized slices.
+///
+/// These items implement `Send + Sync` under the same SDK contract as the
+/// typed receiver references. They may move to scoped worker threads while
+/// retaining their receiver borrow. Use [`Self::to_owned`] to keep an item
+/// after releasing the receiver.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ReceiverItemRef<'rx> {
+    /// Validated uncompressed video, possibly with padded rows or planes.
+    Video(VideoFrameRef<'rx>),
+    /// Validated planar audio, possibly with padded channels.
+    Audio(AudioFrameRef<'rx>),
+    /// Standalone frame metadata.
+    Metadata(MetadataFrameRef<'rx>),
+    /// A consumed, coalesced receiver invalidation; no native buffer.
+    Event(ReceiverEvent),
+}
+
+impl ReceiverItemRef<'_> {
+    /// Copy media into an owned item using the typed capture copy paths.
+    /// Video rows and audio channels become packed; timing and metadata are
+    /// preserved. Video/audio allocate one payload buffer and metadata when
+    /// present; metadata allocates its text; events simply copy their value.
+    /// This makes no SDK call and retains no native frame or receiver borrow.
+    pub fn to_owned(&self) -> ReceiverItem {
+        match self {
+            Self::Video(frame) => ReceiverItem::Video(frame.to_owned()),
+            Self::Audio(frame) => ReceiverItem::Audio(frame.to_owned()),
+            Self::Metadata(frame) => ReceiverItem::Metadata(frame.to_owned()),
+            Self::Event(event) => ReceiverItem::Event(*event),
+        }
+    }
+}
+
 /// A coalesced receiver invalidation, not an ordered event history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -2329,6 +2497,10 @@ pub(crate) mod lifecycle_test_events {
         EVENTS.with(|events| events.borrow_mut().take().unwrap())
     }
 }
+
+#[cfg(test)]
+#[path = "receiver_mixed_tests.rs"]
+mod mixed_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2758,6 +2930,8 @@ mod tests {
             receiver.video().capture(excessive).map(drop),
             receiver.audio().capture_ref(excessive).map(drop),
             receiver.metadata().capture(excessive).map(drop),
+            receiver.capture_any(excessive).map(drop),
+            receiver.capture_any_ref(excessive).map(drop),
             receiver.poll_event(excessive).map(drop),
             receiver.poll_source_name_change(excessive).map(drop),
         ] {
@@ -2795,6 +2969,99 @@ mod tests {
         });
         receiver.core.pending_status.store(true, Ordering::Release);
         assert!(receiver.core.take_pending_status().is_some());
+    }
+
+    #[test]
+    fn combined_capture_consumes_pending_events_once_even_during_reconnect() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        receiver.core.retain(Notification::SourceChanged);
+        let _exclusive = receiver.core.capture_guard.write();
+        native_capture_calls::take();
+        assert!(matches!(
+            receiver.capture_any_ref(Duration::ZERO).unwrap(),
+            Some(ReceiverItemRef::Event(ReceiverEvent::SourceChanged))
+        ));
+        assert_eq!(native_capture_calls::take(), 0);
+        assert!(receiver.capture_any_ref(Duration::ZERO).unwrap().is_none());
+        assert_eq!(native_capture_calls::take(), 0);
+        let began = Instant::now();
+        assert!(receiver
+            .capture_any(Duration::from_millis(20))
+            .unwrap()
+            .is_none());
+        assert!(began.elapsed() >= Duration::from_millis(20));
+        assert_eq!(native_capture_calls::take(), 0);
+    }
+
+    #[test]
+    fn combined_and_event_consumers_compete_for_one_retained_invalidation() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        receiver
+            .core
+            .capture_result::<VideoKind>(CaptureResult::Notification(Notification::Unknown(987)))
+            .unwrap();
+        let barrier = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            let combined = scope.spawn(|| {
+                barrier.wait();
+                matches!(
+                    receiver.capture_any(Duration::ZERO).unwrap(),
+                    Some(ReceiverItem::Event(ReceiverEvent::Unknown(987)))
+                )
+            });
+            let events = scope.spawn(|| {
+                barrier.wait();
+                matches!(
+                    receiver.poll_event(Duration::ZERO).unwrap(),
+                    Some(ReceiverEvent::Unknown(987))
+                )
+            });
+            barrier.wait();
+            assert_eq!(
+                usize::from(combined.join().unwrap()) + usize::from(events.join().unwrap()),
+                1
+            );
+        });
+        receiver.core.retain(Notification::Unknown(988));
+        assert!(matches!(
+            receiver.capture_any(Duration::ZERO).unwrap(),
+            Some(ReceiverItem::Event(ReceiverEvent::Unknown(988)))
+        ));
+    }
+
+    #[test]
+    fn combined_native_notifications_coalesce_with_events_retained_during_the_wait() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        receiver.core.retain(Notification::SourceChanged);
+        assert!(matches!(
+            receiver
+                .core
+                .combined_result(Delivered::Notification(Notification::SourceChanged))
+                .unwrap(),
+            Some(ReceiverItemRef::Event(ReceiverEvent::SourceChanged))
+        ));
+        assert!(
+            receiver.core.take_pending_event().is_none(),
+            "same invalidation must not replay"
+        );
+        receiver.core.retain(Notification::Unknown(987));
+        assert!(matches!(
+            receiver
+                .core
+                .combined_result(Delivered::Notification(Notification::None))
+                .unwrap(),
+            Some(ReceiverItemRef::Event(ReceiverEvent::Unknown(987)))
+        ));
+        assert!(receiver.core.take_pending_event().is_none());
     }
 
     #[test]

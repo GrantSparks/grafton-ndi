@@ -6,7 +6,7 @@
 //! descriptors, which have no metadata or timestamp fields.
 
 use crate::{
-    frames::validate_packed_audio_dimensions,
+    frames::{validate_packed_audio_dimensions, AudioSource},
     sender::AudioSendMode,
     sys::{self, bindings::*},
     AudioFrame, Error, Ndi, Result, Sender, Timecode,
@@ -74,17 +74,18 @@ impl AudioShape {
         Self::new(sample_rate, num_channels, num_samples)
     }
 
-    /// The shape of an owned frame. An `AudioFrame` is packed FLTP whose
-    /// layout was validated when it was built or copied: a sample rate in
+    /// The shape of a planar source whose layout was validated at construction
+    /// or capture: a sample rate in
     /// `1..=i32::MAX`, positive channel and sample counts whose packed size is
     /// within the shared payload limit, and exactly `channels * samples`
     /// samples. Nothing is checked again.
-    fn from_planar(frame: &AudioFrame) -> Self {
+    fn from_planar(frame: &(impl AudioSource + ?Sized)) -> Self {
+        let layout = frame.layout();
         Self {
-            sample_rate: frame.sample_rate(),
-            num_channels: frame.num_channels(),
-            num_samples: frame.num_samples(),
-            count: frame.data().len(),
+            sample_rate: layout.sample_rate,
+            num_channels: layout.no_channels as u32,
+            num_samples: layout.no_samples as u32,
+            count: layout.no_channels * layout.no_samples,
         }
     }
 
@@ -229,10 +230,12 @@ macro_rules! conversions {
         /// Returns the number of elements written; excess destination elements are
         /// untouched. Integer output can clip depending on the explicit reference
         /// level. On native failure the active prefix may be partially modified.
-        pub fn $to_method(&self, source: &AudioFrame, destination: &mut [$sample] $(, $reference: AudioReferenceLevel)?) -> Result<usize> {
+        /// Accepts every [`AudioSource`], preserving the original channel stride
+        /// without allocating or first copying captured samples into owned FLTP.
+        pub fn $to_method(&self, source: &(impl AudioSource + ?Sized), destination: &mut [$sample] $(, $reference: AudioReferenceLevel)?) -> Result<usize> {
             let shape = AudioShape::from_planar(source);
             shape.check_output(destination.len())?;
-            let source = source.to_raw();
+            let source = source.audio_descriptor();
             let (sample_rate, no_channels, no_samples) = shape.to_sdk();
             let mut destination = $raw {
                 sample_rate, no_channels, no_samples,
@@ -357,6 +360,184 @@ impl<M: AudioSendMode> Sender<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_audio_sources_lend_the_original_strided_descriptor() {
+        use crate::capture::{AudioKind, FrameSyncAudioFree, Guard};
+        use crate::frames::AudioRef;
+        use std::{
+            mem::MaybeUninit,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+        let mut samples = [MaybeUninit::<f32>::uninit(); 11];
+        for (start, values) in [(0, [0.125, 0.25, 0.5]), (8, [-0.125, -0.25, -0.5])] {
+            for (index, value) in values.into_iter().enumerate() {
+                samples[start + index].write(value);
+            }
+        }
+        let raw = NDIlib_audio_frame_v3_t {
+            sample_rate: 44_100,
+            no_channels: 2,
+            no_samples: 3,
+            timecode: 1234,
+            FourCC: crate::AudioFormat::Fltp.to_sdk(),
+            p_data: samples.as_mut_ptr().cast(),
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: 32,
+            },
+            p_metadata: c"<audio/>".as_ptr(),
+            timestamp: 4567,
+        };
+        let frees = AtomicUsize::new(0);
+        let instance = (&frees as *const AtomicUsize).cast_mut().cast();
+        // SAFETY: the initialized channels, uninitialized inter-channel padding,
+        // and static metadata stay live until both non-owning guards are dropped.
+        let receiver = unsafe {
+            AudioRef::<AudioKind>::new(Guard::with_test_free(instance, raw, |instance, _| {
+                (*(instance as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst);
+            }))
+        }
+        .unwrap();
+        let framesync = unsafe {
+            AudioRef::<FrameSyncAudioFree>::new(Guard::with_test_free(
+                instance.cast(),
+                raw,
+                |instance, _| {
+                    (*(instance as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst);
+                },
+            ))
+        }
+        .unwrap();
+        fn verify(source: &(impl AudioSource + ?Sized), raw: &NDIlib_audio_frame_v3_t) {
+            let ((descriptor, shape), allocations) = crate::test_alloc::allocation_count(|| {
+                (source.audio_descriptor(), AudioShape::from_planar(source))
+            });
+            assert_eq!(allocations, 0);
+            assert_eq!(descriptor.p_data, raw.p_data);
+            assert_eq!(descriptor.p_metadata, raw.p_metadata);
+            assert_eq!(descriptor.timecode, raw.timecode);
+            assert_eq!(descriptor.timestamp, raw.timestamp);
+            assert_eq!(
+                unsafe { descriptor.__bindgen_anon_1.channel_stride_in_bytes },
+                32
+            );
+            assert_eq!(
+                shape.count, 6,
+                "padding is not an interleaved destination sample"
+            );
+            assert!(shape.check_output(5).is_err());
+            assert!(shape.check_output(6).is_ok());
+            let owned = source.owned_copy();
+            assert_eq!(owned.data(), &[0.125, 0.25, 0.5, -0.125, -0.25, -0.5]);
+            assert_eq!(owned.metadata(), Some("<audio/>"));
+            assert_eq!(owned.timecode().ticks(), 1234);
+            assert_eq!(owned.timestamp().unwrap().ticks(), 4567);
+        }
+        assert!(receiver.data().is_none());
+        assert!(framesync.data().is_none());
+        verify(&receiver, &raw);
+        verify(&framesync, &raw);
+        assert_eq!(frees.load(Ordering::SeqCst), 0);
+        drop(receiver);
+        drop(framesync);
+        assert_eq!(frees.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn native_strided_captures_convert_all_sample_types_without_planar_copies() {
+        use crate::capture::{AudioKind, FrameSyncAudioFree, Guard};
+        use crate::frames::AudioRef;
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let converter = AudioConverter::new(&ndi).unwrap();
+        let samples: [f32; 11] = [
+            0.25, -0.125, 0.5, 91.0, 92.0, 93.0, 94.0, 95.0, -0.25, 0.125, -0.5,
+        ];
+        let raw = NDIlib_audio_frame_v3_t {
+            sample_rate: 44_100,
+            no_channels: 2,
+            no_samples: 3,
+            timecode: 1234,
+            FourCC: crate::AudioFormat::Fltp.to_sdk(),
+            p_data: samples.as_ptr().cast_mut().cast(),
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: 32,
+            },
+            p_metadata: c"<audio/>".as_ptr(),
+            timestamp: 4567,
+        };
+        // SAFETY: both synthetic guards borrow the initialized storage and static
+        // metadata for this test; neither callback frees independently owned data.
+        let receiver = unsafe {
+            AudioRef::<AudioKind>::new(Guard::with_test_free(std::ptr::null_mut(), raw, |_, _| {}))
+        }
+        .unwrap();
+        let framesync = unsafe {
+            AudioRef::<FrameSyncAudioFree>::new(Guard::with_test_free(
+                std::ptr::null_mut(),
+                raw,
+                |_, _| {},
+            ))
+        }
+        .unwrap();
+        fn verify(converter: &AudioConverter, source: &(impl AudioSource + ?Sized)) {
+            let owned = source.owned_copy();
+            let mut floats = [99.0; 8];
+            let mut expected = [99.0; 8];
+            converter.to_interleaved_f32(&owned, &mut expected).unwrap();
+            // Warm native lazy state before counting wrapper allocations.
+            converter.to_interleaved_f32(source, &mut floats).unwrap();
+            let (count, allocations) = crate::test_alloc::allocation_count(|| {
+                converter.to_interleaved_f32(source, &mut floats).unwrap()
+            });
+            assert_eq!((count, allocations), (6, 0));
+            assert_eq!(floats, expected);
+            assert_eq!(&floats[..6], &[0.25, -0.25, -0.125, 0.125, 0.5, -0.5]);
+            for level in [
+                AudioReferenceLevel::SEND,
+                AudioReferenceLevel::RECEIVE_HEADROOM,
+            ] {
+                let mut actual = [99i16; 8];
+                let mut expected = [99i16; 8];
+                converter
+                    .to_interleaved_i16(&owned, &mut expected, level)
+                    .unwrap();
+                converter
+                    .to_interleaved_i16(source, &mut actual, level)
+                    .unwrap();
+                let (count, allocations) = crate::test_alloc::allocation_count(|| {
+                    converter
+                        .to_interleaved_i16(source, &mut actual, level)
+                        .unwrap()
+                });
+                assert_eq!((count, allocations), (6, 0));
+                assert_eq!(actual, expected);
+                let mut actual = [99i32; 8];
+                let mut expected = [99i32; 8];
+                converter
+                    .to_interleaved_i32(&owned, &mut expected, level)
+                    .unwrap();
+                converter
+                    .to_interleaved_i32(source, &mut actual, level)
+                    .unwrap();
+                let (count, allocations) = crate::test_alloc::allocation_count(|| {
+                    converter
+                        .to_interleaved_i32(source, &mut actual, level)
+                        .unwrap()
+                });
+                assert_eq!((count, allocations), (6, 0));
+                assert_eq!(actual, expected);
+            }
+            let mut too_short = [77.0; 5];
+            assert!(converter
+                .to_interleaved_f32(source, &mut too_short)
+                .is_err());
+            assert_eq!(too_short, [77.0; 5]);
+        }
+        verify(&converter, &receiver);
+        verify(&converter, &framesync);
+    }
 
     #[test]
     fn interleaved_validation_rejects_bad_dimensions_lengths_and_limits() {

@@ -51,9 +51,9 @@ fn zero_copy(sync: &AvSync) -> grafton_ndi::Result<()> {
     Ok(())
 }
 fn exclusive(sync: &mut AvSync) {
-    let _ = sync.set_stream_tier(StreamTier::Preview);
-    let _ = sync.set_streams(MediaTypes::ALL);
-    let _ = sync.kvm().map(|session| session.is_supported());
+    let _ = sync.controls().set_stream_tier(StreamTier::Preview);
+    let _ = sync.controls().set_streams(MediaTypes::ALL);
+    let _ = sync.controls().kvm().map(|session| session.is_supported());
 }
 fn scoped(sync: &AvSync) {
     // Another thread uses the lent receiver while this one synchronizes.

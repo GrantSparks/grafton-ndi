@@ -50,26 +50,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
 
     println!("Looking for NDI sources...");
-    let sources = finder.find_sources(Duration::from_secs(5))?;
-
-    if sources.is_empty() {
-        println!("No NDI sources found on the network");
-        return Ok(());
-    }
-
-    // Select source
     let source = if let Some(name) = source_name {
-        sources
-            .into_iter()
-            .find(|s| s.name().contains(&name))
+        finder
+            .find_source(Duration::from_secs(5), |source| {
+                source.name().contains(&name)
+            })?
             .ok_or_else(|| format!("Source '{name}' not found"))?
     } else {
+        let sources = finder.find_sources(Duration::from_secs(5))?;
+        let Some(first) = sources.first() else {
+            println!("No NDI sources found on the network");
+            return Ok(());
+        };
         println!("\nAvailable sources:");
         for (i, source) in sources.iter().enumerate() {
             println!("  {i}: {source}");
         }
-        println!("\nUsing first source: {}", sources[0]);
-        sources[0].clone()
+        println!("\nUsing first source: {first}");
+        first.clone()
     };
 
     // Create receiver with metadata-only bandwidth to focus on status changes

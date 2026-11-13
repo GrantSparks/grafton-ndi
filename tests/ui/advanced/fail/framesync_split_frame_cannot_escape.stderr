@@ -1,0 +1,10 @@
+error[E0515]: cannot return value referencing function parameter `sync`
+ --> tests/ui/advanced/fail/framesync_split_frame_cannot_escape.rs:4:5
+  |
+3 |       let (capture, _) = sync.split();
+  |                          ---- `sync` is borrowed here
+4 | /     capture
+5 | |         .capture_video_ref(ScanType::Progressive)
+6 | |         .unwrap()
+7 | |         .unwrap()
+  | |_________________^ returns a value referencing data owned by the current function

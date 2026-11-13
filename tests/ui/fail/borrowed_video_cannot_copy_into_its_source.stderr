@@ -1,9 +1,10 @@
 error[E0502]: cannot borrow `frame` as mutable because it is also borrowed as immutable
- --> tests/ui/fail/borrowed_video_cannot_copy_into_its_source.rs:7:20
-  |
-6 |     let view = BorrowedVideoFrame::from(&frame);
-  |                                         ------ immutable borrow occurs here
-7 |     view.copy_into(&mut frame);
-  |          --------- ^^^^^^^^^^ mutable borrow occurs here
-  |          |
-  |          immutable borrow later used by call
+  --> tests/ui/fail/borrowed_video_cannot_copy_into_its_source.rs:14:20
+   |
+ 7 |         frame.data(),
+   |         ----- immutable borrow occurs here
+...
+14 |     view.copy_into(&mut frame);
+   |          --------- ^^^^^^^^^^ mutable borrow occurs here
+   |          |
+   |          immutable borrow later used by call

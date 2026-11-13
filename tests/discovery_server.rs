@@ -121,13 +121,15 @@ fn advertised_senders_and_receivers_reach_listeners() {
         send_listener
             .wait_for_changes(Duration::from_millis(100))
             .unwrap();
-        send_listener
+        let advertised = send_listener
             .snapshot()
             .unwrap()
             .into_iter()
-            .find(|advertised| advertised.name() == Some(sender_name.as_str()))
+            .find(|advertised| advertised.name() == Some(sender_name.as_str()))?;
+        // Membership and connection status are separate asynchronous SDK
+        // observations; a populated snapshot need not publish status first.
+        send_listener.is_connected().then_some(advertised)
     });
-    assert!(send_listener.is_connected());
     let sender_id = advertised_sender.id().unwrap().clone();
     send_listener.subscribe(&sender_id);
 
@@ -169,13 +171,15 @@ fn advertised_senders_and_receivers_reach_listeners() {
             .wait_for_changes(Duration::from_millis(100))
             .unwrap();
         let receivers = recv_listener.snapshot().unwrap();
+        if !recv_listener.is_connected() {
+            return None;
+        }
         Some([
             named(&receivers, "grafton discovery loopback controllable")?,
             named(&receivers, "grafton discovery loopback monitored")?,
             named(&receivers, "grafton discovery loopback grouped")?,
         ])
     });
-    assert!(recv_listener.is_connected());
 
     // Control was granted to the receivers it was set for, and to no other.
     assert!(controllable.commands().contains(&ReceiverCommand::Connect));

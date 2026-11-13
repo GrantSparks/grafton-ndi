@@ -24,6 +24,43 @@ macro_rules! has {
     };
 }
 
+/// Infer one marker implementation only while the type lacks the bound.
+/// If the type gains the bound, inference becomes ambiguous and compilation
+/// fails. This keeps negative auto-trait checks independent of SDK-private
+/// handle names in compiler diagnostics.
+macro_rules! lacks {
+    ($($type:ty: $bound:ident;)+) => {
+        $({
+            trait AmbiguousIfImplemented<A> { fn check() {} }
+            impl<T: ?Sized> AmbiguousIfImplemented<()> for T {}
+            impl<T: ?Sized + $bound> AmbiguousIfImplemented<u8> for T {}
+            let _ = <$type as AmbiguousIfImplemented<_>>::check;
+        })+
+    };
+}
+
+#[test]
+fn split_views_stay_on_the_borrowing_thread() {
+    use grafton_ndi::FrameSyncCapture;
+    lacks! {
+        FrameSyncCapture<'static>: Send;
+        FrameSyncCapture<'static>: Sync;
+    }
+    #[cfg(feature = "advanced")]
+    {
+        use grafton_ndi::{
+            advanced::{AvSyncCapture, ReceiverControls},
+            RawCapture,
+        };
+        lacks! {
+            AvSyncCapture<'static>: Send;
+            AvSyncCapture<'static>: Sync;
+            ReceiverControls<'static, RawCapture>: Send;
+            ReceiverControls<'static, RawCapture>: Sync;
+        }
+    }
+}
+
 /// The public types of the crate root and its modules other than those below.
 #[test]
 fn crate_root_types_keep_their_auto_traits() {
@@ -56,6 +93,7 @@ fn crate_root_types_keep_their_auto_traits() {
         FrameSyncAttached: Send, Sync, UnwindSafe, RefUnwindSafe;
         FrameSyncAudioRef<'static>: UnwindSafe, RefUnwindSafe;
         FrameSyncAudioRequest: Send, Sync, UnwindSafe, RefUnwindSafe;
+        FrameSyncCapture<'static>: UnwindSafe, RefUnwindSafe;
         FrameSyncVideoRef<'static>: UnwindSafe, RefUnwindSafe;
         MediaTypes: Send, Sync, UnwindSafe, RefUnwindSafe;
         MetadataFrame: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -74,6 +112,8 @@ fn crate_root_types_keep_their_auto_traits() {
         ReceiverBandwidth: Send, Sync, UnwindSafe, RefUnwindSafe;
         ReceiverColorFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
         ReceiverEvent: Send, Sync, UnwindSafe, RefUnwindSafe;
+        ReceiverItem: Send, Sync, UnwindSafe, RefUnwindSafe;
+        ReceiverItemRef<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         ReceiverOptions: Send, Sync, UnwindSafe, RefUnwindSafe;
         ReceiverStatus: Send, Sync, UnwindSafe, RefUnwindSafe;
         Rejected<VideoFrame>: Send, Sync;
@@ -87,7 +127,7 @@ fn crate_root_types_keep_their_auto_traits() {
         SettingChange: Send, Sync, UnwindSafe, RefUnwindSafe;
         Source: Send, Sync, UnwindSafe, RefUnwindSafe;
         SourceAddress: Send, Sync, UnwindSafe, RefUnwindSafe;
-        SourceCache: Send, Sync, UnwindSafe, RefUnwindSafe;
+        SourceCache<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         SourceNameChange: Send, Sync, UnwindSafe, RefUnwindSafe;
         StreamTier: Send, Sync, UnwindSafe, RefUnwindSafe;
         Tally: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -226,6 +266,8 @@ fn advanced_types_keep_their_auto_traits() {
         AudioClock<'static>: Send, UnwindSafe, RefUnwindSafe;
         AudioCodec: Send, Sync, UnwindSafe, RefUnwindSafe;
         AvSync: Send, UnwindSafe, RefUnwindSafe;
+        AvSyncCapture<'static>: UnwindSafe, RefUnwindSafe;
+        ReceiverControls<'static, RawCapture>: RefUnwindSafe;
         AvSyncAttached: Send, Sync, UnwindSafe, RefUnwindSafe;
         AvSyncOutcome: Send, Sync, UnwindSafe, RefUnwindSafe;
         AvSyncRequest: Send, Sync, UnwindSafe, RefUnwindSafe;

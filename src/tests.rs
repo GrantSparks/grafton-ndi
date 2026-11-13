@@ -481,52 +481,6 @@ fn test_source_matching_real_world_example() {
 }
 
 #[test]
-fn test_source_cache_creation() {
-    use crate::finder::SourceCache;
-
-    let cache = SourceCache::new();
-    assert_eq!(cache.len(), 0);
-    assert!(cache.is_empty());
-}
-
-#[test]
-fn test_source_cache_default() {
-    use crate::finder::SourceCache;
-
-    let cache = SourceCache::default();
-    assert_eq!(cache.len(), 0);
-    assert!(cache.is_empty());
-}
-
-#[test]
-fn test_source_cache_invalidation() {
-    use crate::finder::SourceCache;
-
-    let cache = SourceCache::default();
-
-    cache.invalidate("192.168.0.107");
-    assert_eq!(cache.len(), 0);
-
-    cache.clear();
-    assert_eq!(cache.len(), 0);
-    assert!(cache.is_empty());
-}
-
-#[test]
-fn test_source_cache_len_and_is_empty() {
-    use crate::finder::SourceCache;
-
-    let cache = SourceCache::default();
-
-    assert_eq!(cache.len(), 0);
-    assert!(cache.is_empty());
-
-    cache.clear();
-    assert_eq!(cache.len(), 0);
-    assert!(cache.is_empty());
-}
-
-#[test]
 fn test_receiver_snapshot_preset() {
     use crate::{
         finder::{Source, SourceAddress},

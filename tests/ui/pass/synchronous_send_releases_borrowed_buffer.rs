@@ -7,7 +7,7 @@ fn borrowed(sender: &Sender, buffer: &mut Vec<u8>) {
         .line_stride(512)
         .build()
         .unwrap();
-    sender.send_video(frame).unwrap();
+    sender.send_video(&frame).unwrap();
     buffer.fill(0);
 }
 
@@ -17,7 +17,7 @@ fn borrowed_by_reference(sender: &Sender, buffer: &mut [u8]) {
         .build()
         .unwrap();
     sender.send_video(&frame).unwrap();
-    sender.send_video(frame).unwrap();
+    sender.send_video(&frame).unwrap();
     buffer[0] = 1;
 }
 

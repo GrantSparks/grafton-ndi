@@ -219,6 +219,28 @@ pub fn skip(requirement: Requirement, reason: &str) {
     );
 }
 
+/// The selected runtime and its File library, or a reported prerequisite skip.
+///
+/// Runtime identity and `GRAFTON_NDI_REQUIRE_RUNTIME` use the same policy as
+/// [`ndi`]. Missing File libraries and incompatible runtime editions report
+/// [`Requirement::File`]; every other File-loading error fails the test.
+#[cfg(feature = "file-io")]
+pub fn file_api() -> Option<(Ndi, super::file::FileApi)> {
+    use super::file::{FileApi, FileRuntimeOptions};
+    let ndi = ndi()?;
+    match FileApi::open(&ndi, &FileRuntimeOptions::default()) {
+        Ok(api) => Some((ndi, api)),
+        Err(Error::RuntimeLoadFailed(reason) | Error::RuntimeConflict(reason)) => {
+            skip(
+                Requirement::File,
+                &format!("the NDI File library is unavailable: {reason}"),
+            );
+            None
+        }
+        Err(error) => panic!("the NDI File library could not be selected: {error}"),
+    }
+}
+
 /// `label` made unique to this process, for naming a sender or a router.
 ///
 /// The NDI runtime takes a lock in the temporary directory named after each

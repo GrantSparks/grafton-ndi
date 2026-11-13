@@ -501,7 +501,6 @@ impl Slots {
     }
 
     /// All three media slots.
-    #[cfg(feature = "advanced")]
     fn all() -> Self {
         Self {
             video: Some(NDIlib_video_frame_v2_t::default()),
@@ -590,7 +589,6 @@ pub(crate) fn capture_raw<'rx, K: CaptureKind>(
 
 /// What one capture with all three media slots delivered: a frame of any
 /// kind, or what the SDK reported in its place.
-#[cfg(feature = "advanced")]
 pub(crate) enum Delivered<'rx> {
     /// A video frame.
     Video(Guard<'rx, VideoKind>),
@@ -612,7 +610,6 @@ pub(crate) enum Delivered<'rx> {
 /// # Errors
 ///
 /// As for [`Notification::classify`].
-#[cfg(feature = "advanced")]
 pub(crate) fn capture_any<'rx>(lock: &CaptureLock<'rx>) -> Result<Delivered<'rx>> {
     let mut captured = Captured::capture(lock, Slots::all());
     Ok(if let Some(frame) = captured.take::<VideoKind>() {

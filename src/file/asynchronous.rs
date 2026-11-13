@@ -1811,6 +1811,45 @@ mod tests {
         (device, recorder)
     }
 
+    #[test]
+    fn async_source_commands_keep_the_selected_endpoint_after_inputs_are_dropped() {
+        use crate::{Source, SourceAddress};
+        let device = mock::Recorder::new(Closing::AtStop);
+        let installed = Arc::clone(&device);
+        let selected = Source::new("STUDIO (Camera 2)")
+            .with_address(SourceAddress::Ip("192.0.2.10:5962".into()));
+        let options = RecorderOptions::new(SourceSpec::try_from(&selected).unwrap());
+        let recorder = block_on(spawn_owner(
+            "file-endpoint-copy",
+            move || {
+                installed.install();
+                mock::recorder_api().create_recorder(&options)
+            },
+            AsyncFileOptions::new(),
+            |worker| AsyncFileRecorder { worker },
+        ))
+        .unwrap();
+        drop(selected);
+        let command = {
+            let selected = Source::new("STUDIO (Program)")
+                .with_address(SourceAddress::Url("ndi://camera.local:5963/path".into()));
+            let source = SourceSpec::try_from(&selected).unwrap();
+            recorder.set_source(&source)
+        };
+        block_on(command).unwrap();
+        let remembered = block_on(recorder.last_accepted_source()).unwrap().unwrap();
+        assert_eq!(remembered.name(), None);
+        assert_eq!(remembered.url(), Some("ndi://camera.local:5963/path"));
+        assert_eq!(
+            *device.selected_sources.lock().unwrap(),
+            vec![
+                (None, Some("192.0.2.10:5962".into())),
+                (None, Some("ndi://camera.local:5963/path".into())),
+            ]
+        );
+        block_on(recorder.close()).unwrap();
+    }
+
     /// Wait until the owner thread has stopped `device`'s session.
     fn await_stop(device: &mock::Recorder) {
         let deadline = Instant::now() + Duration::from_secs(5);

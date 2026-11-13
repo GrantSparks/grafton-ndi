@@ -40,7 +40,7 @@ pub enum WheelAxis {
 /// across them. The lent receiver offers what any `&Receiver` offers: capture,
 /// tally, PTZ, statistics, metadata and reconnecting. For a
 /// [`PacketReceiver`](super::PacketReceiver), which has no frame capture of its
-/// own, [`KvmSession::capture`] on a session from `packets.receiver_mut().kvm()`
+/// own, [`KvmSession::capture`] on a session from `packets.controls().kvm()`
 /// delivers its packets and events.
 ///
 /// A source change through the lent receiver (`connect_to`, `reconnect` or

@@ -575,6 +575,9 @@ pub(crate) struct VideoHeader {
 }
 
 impl VideoHeader {
+    /// Let the SDK derive display aspect from the frame dimensions.
+    pub(crate) const SQUARE_PIXELS: f32 = 0.0;
+
     /// Validate the header of a frame the SDK delivered.
     fn from_sdk(raw: &NDIlib_video_frame_v2_t) -> Result<Self> {
         let frame_rate = FrameRate::from_sdk(raw.frame_rate_N, raw.frame_rate_D)?;
@@ -654,6 +657,25 @@ pub(crate) trait VideoParts {
 
     /// The time the sender submitted the frame, when it is known.
     fn sdk_timestamp(&self) -> Option<SdkTimestamp>;
+
+    /// Whether the SDK's complete synchronous read is known to be initialized.
+    /// Capture guarantees only active pixels, never padding or trailing room.
+    fn can_send_direct(&self) -> bool {
+        self.active_data().is_some()
+            && crate::pixels::send_room(self.layout(), self.header().scan_type) == 0
+    }
+
+    /// Borrow this validated frame's SDK descriptor without copying pixels.
+    fn video_descriptor(&self) -> NDIlib_video_frame_v2_t {
+        sdk_video_frame(
+            self.layout(),
+            self.header(),
+            self.pixels(),
+            self.metadata_text()
+                .map_or(ptr::null(), MetadataText::as_ptr),
+            self.sdk_timestamp(),
+        )
+    }
 
     /// One plane, or `None` for an invalid index: the view behind every
     /// generated `plane`.
@@ -735,6 +757,35 @@ pub(crate) trait VideoParts {
                 }
             }
         });
+    }
+}
+
+/// A validated uncompressed video input for synchronous sending and owned copies.
+///
+/// Implemented by [`VideoFrame`], [`crate::BorrowedVideoFrame`],
+/// [`VideoFrameRef`] and [`FrameSyncVideoRef`]. This trait is sealed: applications
+/// cannot claim that unchecked storage is a valid frame. It exposes no SDK
+/// pointers or allocation ownership. Operations borrow their input and preserve
+/// its lifetime and thread restrictions; converting a captured frame is unnecessary.
+#[allow(private_bounds)]
+pub trait VideoSource: VideoParts {
+    /// Copy active pixels and metadata into an owned destination, preserving
+    /// the header and timestamp. Row padding is omitted. Pixel and metadata
+    /// allocations are reused when their capacities/layouts permit; this has
+    /// the same allocation behavior as a captured frame's `copy_into`.
+    fn copy_into(&self, destination: &mut VideoFrame) {
+        self.copy_into_owned(destination);
+    }
+
+    /// Whether synchronous sending can read this frame directly, without a
+    /// wrapper pixel copy. The query allocates nothing and makes no SDK call.
+    ///
+    /// Captured padding is never assumed initialized. Padded captures and
+    /// formats requiring trailing SDK room therefore use reusable staging;
+    /// owned frames and eligible packed captures send directly. An external
+    /// [`crate::BorrowedVideoFrame`] retains its explicit padding/tail policy.
+    fn sends_in_place(&self) -> bool {
+        self.can_send_direct()
     }
 }
 
@@ -1215,7 +1266,13 @@ impl VideoParts for VideoFrame {
     fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
         self.timestamp
     }
+
+    fn can_send_direct(&self) -> bool {
+        self.tail_room() >= crate::pixels::send_room(&self.layout, self.header.scan_type)
+    }
 }
+
+impl VideoSource for VideoFrame {}
 
 video_accessors! {
     impl[] VideoFrame;
@@ -1243,8 +1300,8 @@ video_accessors! {
 impl VideoFrame {
     /// Create a builder for a frame to send.
     ///
-    /// Its defaults are 1920x1080 BGRA at 60/1 frames per second, a 16:9
-    /// picture aspect ratio, progressive scan, [`Timecode::SYNTHESIZE`], no
+    /// Its defaults are 1920x1080 BGRA at 60/1 frames per second, square
+    /// pixels (picture aspect ratio `0.0`), progressive scan, [`Timecode::SYNTHESIZE`], no
     /// metadata and zero-filled pixels.
     pub fn builder() -> VideoFrameBuilder {
         VideoFrameBuilder {
@@ -1252,7 +1309,7 @@ impl VideoFrame {
             height: 1080,
             pixel_format: PixelFormat::Bgra,
             frame_rate: const { FrameRate::per_second(60) },
-            picture_aspect_ratio: 16.0 / 9.0,
+            picture_aspect_ratio: VideoHeader::SQUARE_PIXELS,
             scan_type: ScanType::Progressive,
             timecode: Timecode::SYNTHESIZE,
             metadata: None,
@@ -1284,15 +1341,7 @@ impl VideoFrame {
 
     /// The SDK descriptor of this frame, borrowing its pixels and metadata.
     pub(crate) fn to_raw(&self) -> NDIlib_video_frame_v2_t {
-        sdk_video_frame(
-            &self.layout,
-            &self.header,
-            self.data.as_ptr(),
-            self.metadata
-                .as_ref()
-                .map_or(ptr::null(), FrameMetadata::as_ptr),
-            self.timestamp,
-        )
+        self.video_descriptor()
     }
 
     /// Set the timecode without reallocating the pixels.
@@ -1417,7 +1466,7 @@ impl VideoFrame {
             layout,
             header: VideoHeader {
                 frame_rate: FrameRate::new(60, 1).unwrap(),
-                picture_aspect_ratio: 16.0 / 9.0,
+                picture_aspect_ratio: VideoHeader::SQUARE_PIXELS,
                 scan_type: ScanType::Progressive,
                 timecode: Timecode::from_ticks(0),
             },
@@ -1601,6 +1650,26 @@ pub(crate) trait AudioParts {
     /// The validated metadata text, or `None` when the frame has none.
     fn metadata_text(&self) -> Option<MetadataText<'_>>;
 
+    /// Borrow the original validated channel stride, samples and metadata.
+    fn audio_descriptor(&self) -> NDIlib_audio_frame_v3_t {
+        let layout = self.layout();
+        NDIlib_audio_frame_v3_t {
+            sample_rate: layout.sdk_sample_rate(),
+            no_channels: layout.sdk_num_channels(),
+            no_samples: layout.sdk_num_samples(),
+            timecode: self.timecode().ticks(),
+            FourCC: AudioFormat::Fltp.to_sdk(),
+            p_data: self.samples().cast_mut().cast(),
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: layout.sdk_channel_stride(),
+            },
+            p_metadata: self
+                .metadata_text()
+                .map_or(ptr::null(), MetadataText::as_ptr),
+            timestamp: SdkTimestamp::to_sdk(self.sdk_timestamp()),
+        }
+    }
+
     /// One channel's samples, or `None` for an invalid channel: the view
     /// behind every generated `channel_data`.
     #[inline]
@@ -1663,6 +1732,16 @@ pub(crate) trait AudioParts {
         *destination = packed_audio(self, packed, data, metadata);
     }
 }
+
+/// A validated planar audio input for synchronous sending and conversion.
+///
+/// Implemented by [`AudioFrame`], [`AudioFrameRef`] and [`FrameSyncAudioRef`].
+/// This sealed trait prevents unchecked sample pointers or channel layouts.
+/// Native operations borrow the original samples and channel stride directly,
+/// with no intermediate owned planar copy or wrapper allocation. The input's
+/// lifetime and thread restrictions still apply.
+#[allow(private_bounds)]
+pub trait AudioSource: AudioParts {}
 
 /// The owned copy of `source`: `packed`, its packed layout, with `data`,
 /// whose capacity holds `packed`, filled with the channels back to back.
@@ -1846,6 +1925,8 @@ impl AudioParts for AudioFrame {
     }
 }
 
+impl AudioSource for AudioFrame {}
+
 audio_accessors! {
     impl[] AudioFrame;
     debug("AudioFrame");
@@ -1887,22 +1968,7 @@ impl AudioFrame {
 
     /// The SDK descriptor of this frame, borrowing its samples and metadata.
     pub(crate) fn to_raw(&self) -> NDIlib_audio_frame_v3_t {
-        NDIlib_audio_frame_v3_t {
-            sample_rate: self.layout.sdk_sample_rate(),
-            no_channels: self.layout.sdk_num_channels(),
-            no_samples: self.layout.sdk_num_samples(),
-            timecode: self.timecode.ticks(),
-            FourCC: self.format().to_sdk(),
-            p_data: self.data.as_ptr().cast_mut().cast(),
-            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
-                channel_stride_in_bytes: self.layout.sdk_channel_stride(),
-            },
-            p_metadata: self
-                .metadata
-                .as_ref()
-                .map_or(ptr::null(), FrameMetadata::as_ptr),
-            timestamp: SdkTimestamp::to_sdk(self.timestamp),
-        }
+        self.audio_descriptor()
     }
 
     #[cfg(test)]
@@ -4065,6 +4131,9 @@ macro_rules! borrowed_video_methods {
 borrowed_video_methods!(VideoFrameRef);
 borrowed_video_methods!(FrameSyncVideoRef);
 
+impl VideoSource for VideoFrameRef<'_> {}
+impl VideoSource for FrameSyncVideoRef<'_> {}
+
 /// Every part comes from the one [`ValidatedFrame`].
 impl<S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoParts for VideoRef<'_, S> {
     #[inline]
@@ -4212,6 +4281,9 @@ macro_rules! borrowed_audio_methods {
 }
 borrowed_audio_methods!(AudioFrameRef);
 borrowed_audio_methods!(FrameSyncAudioRef);
+
+impl AudioSource for AudioFrameRef<'_> {}
+impl AudioSource for FrameSyncAudioRef<'_> {}
 
 /// Every part comes from the one [`ValidatedFrame`].
 impl<S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioParts for AudioRef<'_, S> {
@@ -4619,7 +4691,7 @@ mod tests {
                         .collect::<Vec<_>>(),
                     expected
                 );
-                let recopy = crate::BorrowedVideoFrame::from(&owned).to_owned();
+                let recopy = owned.clone();
                 assert_eq!(recopy.data(), expected);
             }
         }
@@ -5240,10 +5312,7 @@ mod tests {
                 // and a frame borrowing that copy views them unchanged.
                 let owned = frame.to_owned();
                 assert_eq!(rows_of(owned.planes()), expected);
-                assert_eq!(
-                    rows_of(crate::BorrowedVideoFrame::from(&owned).planes()),
-                    expected
-                );
+                assert_eq!(rows_of(owned.planes()), expected);
                 assert!(owned.planes().all(|plane| plane.data().is_some()));
             }
         }
@@ -5431,7 +5500,7 @@ mod tests {
         assert_eq!(built.pixel_format(), PixelFormat::Bgra);
         assert_eq!(built.scan_type(), ScanType::Progressive);
         assert_eq!(built.frame_rate(), FrameRate::new(60, 1).unwrap());
-        assert_eq!(built.picture_aspect_ratio(), 16.0 / 9.0);
+        assert_eq!(built.picture_aspect_ratio(), 0.0);
         assert_eq!(built.timecode(), Timecode::SYNTHESIZE);
         assert_eq!(built.timestamp(), None);
         assert!(built.data().iter().all(|&byte| byte == 0));
@@ -7192,14 +7261,51 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_aspect_ratio_uses_sdk_square_pixel_sentinel() {
-        let frame = VideoFrame::builder()
-            .resolution(16, 16)
-            .picture_aspect_ratio(0.0)
-            .build()
-            .unwrap();
-        assert_eq!(frame.picture_aspect_ratio(), 0.0);
-        assert_eq!(frame.to_raw().picture_aspect_ratio, 0.0);
+    fn video_aspect_defaults_follow_dimensions_and_override_order_is_independent() {
+        for (width, height) in [(640, 480), (1920, 1080), (1080, 1920), (64, 64)] {
+            let frame = VideoFrame::builder()
+                .resolution(width, height)
+                .build()
+                .unwrap();
+            assert_eq!(frame.picture_aspect_ratio(), 0.0);
+            assert_eq!(frame.to_raw().picture_aspect_ratio, 0.0);
+            for builder in [
+                VideoFrame::builder()
+                    .picture_aspect_ratio(1.25)
+                    .resolution(width, height),
+                VideoFrame::builder()
+                    .resolution(width, height)
+                    .picture_aspect_ratio(1.25),
+            ] {
+                let frame = builder.build().unwrap();
+                assert_eq!(frame.picture_aspect_ratio(), 1.25);
+                assert_eq!(frame.to_raw().picture_aspect_ratio, 1.25);
+            }
+        }
+        for ratio in [0.0, 1.25] {
+            let frame = VideoFrame::builder()
+                .resolution(16, 16)
+                .picture_aspect_ratio(ratio)
+                .build()
+                .unwrap();
+            let raw = frame.to_raw();
+            // SAFETY: `raw` borrows this live owned frame's initialized pixels.
+            let captured = unsafe { ValidatedVideo::video(&raw).unwrap() };
+            let mut copy = captured.owned_copy();
+            assert_eq!(copy.picture_aspect_ratio(), ratio);
+            copy.set_picture_aspect_ratio(2.0).unwrap();
+            captured.copy_into_owned(&mut copy);
+            assert_eq!(copy.to_raw().picture_aspect_ratio, ratio);
+        }
+        for ratio in [-1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(matches!(
+                VideoFrame::builder()
+                    .resolution(16, 16)
+                    .picture_aspect_ratio(ratio)
+                    .build(),
+                Err(Error::InvalidFrame(_))
+            ));
+        }
     }
 
     #[test]
@@ -8158,10 +8264,7 @@ mod tests {
             let holds_room = |frame: &VideoFrame, label: &str| {
                 assert_eq!(frame.tail_room(), room, "{format:?} {label}");
                 assert_eq!(frame.data.room(), vec![0; room], "{format:?} {label}");
-                assert!(
-                    crate::BorrowedVideoFrame::from(frame).sends_in_place(),
-                    "{format:?} {label}"
-                );
+                assert!(VideoSource::sends_in_place(frame), "{format:?} {label}");
             };
 
             let (built, allocations) =
@@ -8252,7 +8355,7 @@ mod tests {
                     "{format:?} {scan:?}"
                 );
                 assert_eq!(
-                    crate::BorrowedVideoFrame::from(&lent).sends_in_place(),
+                    VideoSource::sends_in_place(&lent),
                     needed == room,
                     "{format:?} {scan:?}"
                 );
@@ -8261,7 +8364,7 @@ mod tests {
                 assert_eq!(lent.tail_room(), needed, "{format:?} {scan:?}");
                 assert_eq!(lent.data.room(), vec![0; needed], "{format:?} {scan:?}");
                 assert_eq!(lent.data(), vec![7; len], "{format:?} {scan:?}");
-                assert!(crate::BorrowedVideoFrame::from(&lent).sends_in_place());
+                assert!(VideoSource::sends_in_place(&lent));
                 // Lending again changes nothing.
                 let ((), allocations) = crate::test_alloc::allocation_count(|| {
                     assert_eq!(lent.lend_raw().p_data, raw.p_data);

@@ -60,16 +60,20 @@ fn main() -> Result<(), Error> {
     // Run for one minute
     let start = Instant::now();
     while !exit_loop.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(60) {
-        if let Some(audio_frame) = receiver.audio().capture(Duration::from_millis(250))? {
+        if let Some(audio_frame) = receiver.audio().capture_ref(Duration::from_millis(250))? {
             println!(
                 "Audio data received ({num_samples} samples).",
                 num_samples = audio_frame.num_samples()
             );
 
+            // Convert the borrowed capture directly, including a padded channel stride.
             // Use the SDK's current v3 converter with explicit receive headroom.
             // Keep the output allocation across captures, resizing if the source
             // changes its channel count or number of samples.
-            audio_16bit.resize(audio_frame.data().len(), 0);
+            audio_16bit.resize(
+                audio_frame.num_channels() as usize * audio_frame.num_samples() as usize,
+                0,
+            );
             let written = converter.to_interleaved_i16(
                 &audio_frame,
                 &mut audio_16bit,

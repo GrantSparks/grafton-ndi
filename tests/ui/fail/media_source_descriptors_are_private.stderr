@@ -1,0 +1,43 @@
+error[E0624]: method `pixels` is private
+ --> tests/ui/fail/media_source_descriptors_are_private.rs:4:19
+  |
+4 |     let _ = frame.pixels();
+  |                   ^^^^^^ private method
+  |
+ ::: src/frames.rs
+  |
+  |     fn pixels(&self) -> *const u8;
+  |     ------------------------------ private method defined here
+
+error[E0624]: method `video_descriptor` is private
+ --> tests/ui/fail/media_source_descriptors_are_private.rs:5:19
+  |
+5 |     let _ = frame.video_descriptor();
+  |                   ^^^^^^^^^^^^^^^^ private method
+  |
+ ::: src/frames.rs
+  |
+  |     fn video_descriptor(&self) -> NDIlib_video_frame_v2_t {
+  |     ----------------------------------------------------- private method defined here
+
+error[E0624]: method `samples` is private
+ --> tests/ui/fail/media_source_descriptors_are_private.rs:9:19
+  |
+9 |     let _ = frame.samples();
+  |                   ^^^^^^^ private method
+  |
+ ::: src/frames.rs
+  |
+  |     fn samples(&self) -> *const f32;
+  |     -------------------------------- private method defined here
+
+error[E0624]: method `audio_descriptor` is private
+  --> tests/ui/fail/media_source_descriptors_are_private.rs:10:19
+   |
+10 |     let _ = frame.audio_descriptor();
+   |                   ^^^^^^^^^^^^^^^^ private method
+   |
+  ::: src/frames.rs
+   |
+   |     fn audio_descriptor(&self) -> NDIlib_audio_frame_v3_t {
+   |     ----------------------------------------------------- private method defined here

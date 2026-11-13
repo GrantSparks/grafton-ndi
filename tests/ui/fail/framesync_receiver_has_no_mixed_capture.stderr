@@ -1,0 +1,11 @@
+error[E0599]: no method named `capture_any_ref` found for reference `&grafton_ndi::Receiver<FrameSyncAttached>` in the current scope
+ --> tests/ui/fail/framesync_receiver_has_no_mixed_capture.rs:5:34
+  |
+5 |     let _ = framesync.receiver().capture_any_ref(Duration::ZERO);
+  |                                  ^^^^^^^^^^^^^^^ method not found in `&grafton_ndi::Receiver<FrameSyncAttached>`
+
+error[E0599]: no method named `capture_any` found for reference `&grafton_ndi::Receiver<FrameSyncAttached>` in the current scope
+ --> tests/ui/fail/framesync_receiver_has_no_mixed_capture.rs:6:34
+  |
+6 |     let _ = framesync.receiver().capture_any(Duration::ZERO);
+  |                                  ^^^^^^^^^^^ method not found in `&grafton_ndi::Receiver<FrameSyncAttached>`

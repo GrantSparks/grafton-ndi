@@ -1,6 +1,6 @@
 //! Explicit copying convenience for pixels owned by another subsystem.
 //!
-//! `Sender::send_video(frame)` sends the same borrowed frame synchronously
+//! `Sender::send_video(&frame)` sends the same borrowed frame synchronously
 //! without copying it; copy only when the asynchronous pipeline is wanted.
 //! `send_video_async_copy` copies into a new frame on every call, while
 //! `BorrowedVideoFrame::copy_into` copies into a frame a send has returned, so

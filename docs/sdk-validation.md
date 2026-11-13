@@ -381,6 +381,55 @@ documentation of the affected methods says how to stay clear of them.
     registrations at once.
   - `tests/discovery_server.rs` checks the two halves that work.
 
+### Source selection and recording
+
+`Finder::find_source` uses the existing configured finder and copies each SDK
+snapshot before running the caller's predicate. Deterministic fake-runtime tests
+in `tests/finder_selection.rs` cover staggered and reversed discovery, duplicate
+names at different endpoints, predicate reentry, full-window host result sets,
+and cache isolation between configured finders. Existing snapshot and accumulated
+result budget tests also cover the public selection/cache paths. The gated fake
+runtime in `tests/finder_deadlines.rs` holds a native snapshot open while other
+lookups make zero, bounded, and already-expired attempts: they finish within their
+own lock-wait budgets without another native fetch. Enumeration and host-cache
+misses return observations accumulated before expiry. Releasing the gate permits
+later selection; a native source-list wait by itself holds no snapshot mutex.
+All paths retain the same bounded descriptor-copy kernel.
+
+On Linux x86_64 with Advanced 6.4.0.2 and its File library, under the loopback-only
+runner, `tests/file_source_selection.rs` selects a feed through a finder with a
+unique nondefault group and a loopback IP hint. Converting that named, addressed
+source to `SourceSpec` preserves the native URL field alone, as required by
+`Processing.NDI.Lib.File.Recorder.h`'s name precedence rule. Recording and probing
+the finalized file confirms the selected 640×360 feed rather than the available
+320×180 distractor.
+
+This single-test executable installs a private `NDI_CONFIG_DIR` before loading
+NDI, with loopback IP queries and `Public` send/receive defaults. On macOS only,
+it retains the offline runner's loopback discovery setting to suppress sender
+mDNS. Linux and Windows leave the Discovery Server unset, avoiding the
+[known Windows failure with an unreachable server](troubleshooting.md#receiving-and-sending).
+It also uses a private temporary directory for native state. Its native runtime
+runs apart from the concurrent File unit tests: running a second SDK process beside those
+tests produced source-discovery timeouts, even with a private child configuration.
+No system configuration or CI network policy is changed.
+
+The test requires deliberate name-only recording of a separate default-group
+480×270 source. Both recordings must contain video and probe with the expected
+distinct dimensions. An unavailable `127.0.0.1:9` endpoint paired with that proven
+reachable public name must record no video, demonstrating no hidden name fallback.
+The shared prerequisite helper reports missing runtimes/File libraries and applies
+`GRAFTON_NDI_REQUIRE_RUNTIME`; once those exist, every native assertion is required.
+SDK-independent recorder-boundary and async-command tests also verify the native
+name/URL fields and endpoint copies after caller inputs are dropped.
+
+Reproduce with `NDI_RUNTIME_DIR_V6` selecting the 6.4 Advanced runtime and
+`GRAFTON_NDI_REQUIRE_RUNTIME=file`:
+
+```sh
+cargo test --config ci/offline.toml --features file-io --test file_source_selection -- --nocapture
+```
+
 Tests of `FileRecorder::reset` check that it returns the old session's report
 without claiming that the files were finalized, that late events of the old
 session do not reach later ones, and that the original recorder stays usable

@@ -103,17 +103,20 @@ pub use {
     error::*,
     finder::{Finder, FinderOptions, Source, SourceAddress, SourceCache},
     frames::{
-        AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout, FormatCategory,
-        MetadataFrame, MetadataFrameRef, PixelFormat, PixelFormatInfo, ScanType, VideoFrame,
-        VideoFrameBuilder, VideoFrameRef, VideoPlane, VideoPlanes, VideoRows,
+        AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout, AudioSource,
+        FormatCategory, MetadataFrame, MetadataFrameRef, PixelFormat, PixelFormatInfo, ScanType,
+        VideoFrame, VideoFrameBuilder, VideoFrameRef, VideoPlane, VideoPlanes, VideoRows,
+        VideoSource,
     },
     framesync::{
-        AudioInputFormat, FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncVideoRef,
+        AudioInputFormat, FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncCapture,
+        FrameSyncVideoRef,
     },
     receiver::{
         Capture, CaptureMode, ConnectionStats, FrameSyncAttached, MetadataMode, Ptz, RawCapture,
-        Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverEvent, ReceiverMode,
-        ReceiverOptions, ReceiverStatus, SettingChange, SourceNameChange, Tally, VideoMode,
+        Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverEvent, ReceiverItem,
+        ReceiverItemRef, ReceiverMode, ReceiverOptions, ReceiverStatus, SettingChange,
+        SourceNameChange, Tally, VideoMode,
     },
     runtime::{Ndi, ProcessLifetimeRuntime, Runtime, RuntimeOptions},
     sender::{

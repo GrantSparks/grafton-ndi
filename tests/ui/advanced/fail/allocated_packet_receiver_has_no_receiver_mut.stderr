@@ -1,11 +1,11 @@
 error[E0599]: no method named `receiver_mut` found for mutable reference `&mut AllocatedPacketReceiver` in the current scope
- --> tests/ui/advanced/fail/allocated_packet_receiver_has_no_receiver_mut.rs:6:30
+ --> tests/ui/advanced/fail/allocated_packet_receiver_has_no_receiver_mut.rs:7:15
   |
-6 |     std::mem::swap(allocated.receiver_mut(), plain.receiver_mut());
-  |                              ^^^^^^^^^^^^
+7 |     allocated.receiver_mut()
+  |               ^^^^^^^^^^^^
   |
 help: there is a method `receiver` with a similar name
   |
-6 -     std::mem::swap(allocated.receiver_mut(), plain.receiver_mut());
-6 +     std::mem::swap(allocated.receiver(), plain.receiver_mut());
+7 -     allocated.receiver_mut()
+7 +     allocated.receiver()
   |

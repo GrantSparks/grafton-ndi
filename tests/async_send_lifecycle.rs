@@ -226,8 +226,7 @@ fn copied_send_retains_metadata_after_source_drop() -> Result<(), grafton_ndi::E
         .clock_audio(false);
     let mut sender = Sender::new(&ndi, &options)?;
     let source = frame(8);
-    let borrowed = BorrowedVideoFrame::from(&source);
-    let _ = sender.send_video_async_copy(&borrowed)?;
+    let _ = sender.send_video_async_copy(&source)?;
     drop(source);
     // Both source pixels and metadata have been released before the SDK drain.
     let recovered = sender.finish_video_async().unwrap();

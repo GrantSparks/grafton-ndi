@@ -1,0 +1,139 @@
+error[E0277]: `*mut ()` cannot be sent between threads safely
+ --> tests/ui/advanced/fail/split_views_stay_on_borrowing_thread.rs:5:12
+  |
+5 |     send::<FrameSyncCapture<'static>>();
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^ `*mut ()` cannot be sent between threads safely
+  |
+  = help: within `FrameSyncCapture<'static>`, the trait `Send` is not implemented for `*mut ()`
+note: required because it appears within the type `PhantomData<*mut ()>`
+ --> $RUST/core/src/marker.rs
+  |
+  | pub struct PhantomData<T: PointeeSized>;
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `FrameSyncCapture<'static>`
+ --> src/framesync.rs
+  |
+  | pub struct FrameSyncCapture<'a> {
+  |            ^^^^^^^^^^^^^^^^
+note: required by a bound in `send`
+ --> tests/ui/advanced/fail/split_views_stay_on_borrowing_thread.rs:2:12
+  |
+2 | fn send<T: Send>() {}
+  |            ^^^^ required by this bound in `send`
+
+error[E0277]: `*mut grafton_ndi::sys::bindings::NDIlib_framesync_instance_type` cannot be shared between threads safely
+ --> tests/ui/advanced/fail/split_views_stay_on_borrowing_thread.rs:5:12
+  |
+5 |     send::<FrameSyncCapture<'static>>();
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^ `*mut grafton_ndi::sys::bindings::NDIlib_framesync_instance_type` cannot be shared between threads safely
+  |
+  = help: within `framesync::FrameSyncResource`, the trait `Sync` is not implemented for `*mut grafton_ndi::sys::bindings::NDIlib_framesync_instance_type`
+note: required because it appears within the type `framesync::FrameSyncResource`
+ --> src/framesync.rs
+  |
+  | struct FrameSyncResource {
+  |        ^^^^^^^^^^^^^^^^^
+  = note: required for `&'static framesync::FrameSyncResource` to implement `Send`
+note: required because it appears within the type `FrameSyncCapture<'static>`
+ --> src/framesync.rs
+  |
+  | pub struct FrameSyncCapture<'a> {
+  |            ^^^^^^^^^^^^^^^^
+note: required by a bound in `send`
+ --> tests/ui/advanced/fail/split_views_stay_on_borrowing_thread.rs:2:12
+  |
+2 | fn send<T: Send>() {}
+  |            ^^^^ required by this bound in `send`
+
+error[E0277]: `*mut ()` cannot be shared between threads safely
+ --> tests/ui/advanced/fail/split_views_stay_on_borrowing_thread.rs:6:12
+  |
+6 |     sync::<FrameSyncCapture<'static>>();
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^ `*mut ()` cannot be shared between threads safely
+  |
+  = help: within `FrameSyncCapture<'static>`, the trait `Sync` is not implemented for `*mut ()`
+note: required because it appears within the type `PhantomData<*mut ()>`
+ --> $RUST/core/src/marker.rs
+  |
+  | pub struct PhantomData<T: PointeeSized>;
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `FrameSyncCapture<'static>`
+ --> src/framesync.rs
+  |
+  | pub struct FrameSyncCapture<'a> {
+  |            ^^^^^^^^^^^^^^^^
+note: required by a bound in `sync`
+ --> tests/ui/advanced/fail/split_views_stay_on_borrowing_thread.rs:3:12
+  |
+3 | fn sync<T: Sync>() {}
+  |            ^^^^ required by this bound in `sync`
+
+error[E0277]: `*mut grafton_ndi::sys::bindings::NDIlib_framesync_instance_type` cannot be shared between threads safely
+ --> tests/ui/advanced/fail/split_views_stay_on_borrowing_thread.rs:6:12
+  |
+6 |     sync::<FrameSyncCapture<'static>>();
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^ `*mut grafton_ndi::sys::bindings::NDIlib_framesync_instance_type` cannot be shared between threads safely
+  |
+  = help: within `FrameSyncCapture<'static>`, the trait `Sync` is not implemented for `*mut grafton_ndi::sys::bindings::NDIlib_framesync_instance_type`
+note: required because it appears within the type `framesync::FrameSyncResource`
+ --> src/framesync.rs
+  |
+  | struct FrameSyncResource {
+  |        ^^^^^^^^^^^^^^^^^
+  = note: required because it appears within the type `&'static framesync::FrameSyncResource`
+note: required because it appears within the type `FrameSyncCapture<'static>`
+ --> src/framesync.rs
+  |
+  | pub struct FrameSyncCapture<'a> {
+  |            ^^^^^^^^^^^^^^^^
+note: required by a bound in `sync`
+ --> tests/ui/advanced/fail/split_views_stay_on_borrowing_thread.rs:3:12
+  |
+3 | fn sync<T: Sync>() {}
+  |            ^^^^ required by this bound in `sync`
+
+error[E0277]: `*mut ()` cannot be sent between threads safely
+ --> tests/ui/advanced/fail/split_views_stay_on_borrowing_thread.rs:7:12
+  |
+7 |     send::<ReceiverControls<'static, FrameSyncAttached>>();
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*mut ()` cannot be sent between threads safely
+  |
+  = help: within `ReceiverControls<'static, FrameSyncAttached>`, the trait `Send` is not implemented for `*mut ()`
+note: required because it appears within the type `PhantomData<*mut ()>`
+ --> $RUST/core/src/marker.rs
+  |
+  | pub struct PhantomData<T: PointeeSized>;
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `ReceiverControls<'static, FrameSyncAttached>`
+ --> src/advanced/controls.rs
+  |
+  | pub struct ReceiverControls<'a, M: ReceiverMode> {
+  |            ^^^^^^^^^^^^^^^^
+note: required by a bound in `send`
+ --> tests/ui/advanced/fail/split_views_stay_on_borrowing_thread.rs:2:12
+  |
+2 | fn send<T: Send>() {}
+  |            ^^^^ required by this bound in `send`
+
+error[E0277]: `*mut ()` cannot be shared between threads safely
+ --> tests/ui/advanced/fail/split_views_stay_on_borrowing_thread.rs:8:12
+  |
+8 |     sync::<ReceiverControls<'static, FrameSyncAttached>>();
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*mut ()` cannot be shared between threads safely
+  |
+  = help: within `ReceiverControls<'static, FrameSyncAttached>`, the trait `Sync` is not implemented for `*mut ()`
+note: required because it appears within the type `PhantomData<*mut ()>`
+ --> $RUST/core/src/marker.rs
+  |
+  | pub struct PhantomData<T: PointeeSized>;
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `ReceiverControls<'static, FrameSyncAttached>`
+ --> src/advanced/controls.rs
+  |
+  | pub struct ReceiverControls<'a, M: ReceiverMode> {
+  |            ^^^^^^^^^^^^^^^^
+note: required by a bound in `sync`
+ --> tests/ui/advanced/fail/split_views_stay_on_borrowing_thread.rs:3:12
+  |
+3 | fn sync<T: Sync>() {}
+  |            ^^^^ required by this bound in `sync`
