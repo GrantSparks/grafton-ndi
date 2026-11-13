@@ -70,6 +70,9 @@ API, see the [README](README.md) and the migration guides for
 
 ### Changed
 
+- Frame copies retain validated UTF-8 metadata capacity across text-length
+  changes. Standalone metadata copies also avoid temporary string allocations;
+  Advanced send queues charge retained metadata capacity to their byte limit.
 - Sender metadata capture follows the SDK's guaranteed NUL-terminated text when
   native positive lengths omit the terminator, retaining bounded UTF-8 validation
   and releasing the original descriptor. Strict declared-length frame validation

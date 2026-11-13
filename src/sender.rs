@@ -1007,11 +1007,11 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     ///
     /// Its pixel buffer is reused when its capacity holds the packed frame
     /// and its format's [room](PixelFormat::send_tail_room), and otherwise
-    /// replaced by one allocation of exactly that size. Its
-    /// metadata string is reused when the new text has the same length, and
-    /// otherwise the text takes one allocation. Copying frames of one shape
-    /// into the same destination therefore allocates nothing after the first
-    /// copy. The copy makes no SDK call and can run on any thread.
+    /// replaced by one allocation of exactly that size. Its metadata string
+    /// is reused when its capacity holds the new text and its terminator;
+    /// otherwise it grows once. With sufficient pixel and metadata capacity,
+    /// subsequent copies allocate nothing. The copy makes no SDK call and can
+    /// run on any thread.
     ///
     /// # Example
     ///

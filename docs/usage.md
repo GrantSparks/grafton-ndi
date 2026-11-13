@@ -148,6 +148,9 @@ Owned capture packs active rows. Use `to_owned()` when pixels must outlive the
 capture buffer, or `copy_into(&mut frame)` to reuse an owned allocation. Copies
 preserve media properties but may reduce stride. Immutable plane and row views
 support scoped worker threads; FrameSync frame guards remain on their capture thread.
+Video, audio and standalone metadata copies retain text capacity, so changing
+metadata lengths needs no allocation when the destination holds the text and
+its trailing NUL. Absent video/audio metadata releases its text storage.
 
 ### Receive whichever media arrives next
 
