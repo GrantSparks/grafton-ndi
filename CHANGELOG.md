@@ -9,7 +9,7 @@ Entries and examples describe the API of their named release. For the current
 API, see the [README](README.md) and the migration guides for
 [2.0](docs/migration/1.x-to-2.0.md) and [3.0](docs/migration/2.0-to-3.0.md).
 
-## [3.0.0] - Unreleased
+## [3.0.0] - 2026-11-13
 
 Version 3.0.0 loads the NDI library when the program selects a runtime instead
 of linking it when the program is built, so building the crate no longer needs
