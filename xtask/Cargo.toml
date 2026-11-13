@@ -1,0 +1,9 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Maintenance tasks for grafton-ndi: regenerate and verify the vendored NDI bindings."
+
+[dependencies]
+bindgen = "0.72.1"

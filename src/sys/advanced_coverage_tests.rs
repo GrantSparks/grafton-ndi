@@ -1,0 +1,63 @@
+//! Every function the Advanced-only headers declare must be classified.
+
+use std::collections::BTreeMap;
+
+use super::TABLES;
+
+/// Declared functions this crate deliberately does not call, with the reason.
+const UNWRAPPED: &[(&str, &str)] = &[];
+
+/// Names of the foreign functions the installed Advanced headers declare.
+fn declared_functions() -> Vec<String> {
+    let declarations = include_str!(concat!(env!("OUT_DIR"), "/ndi_advanced_declarations.rs"));
+    let mut names = Vec::new();
+    for item in syn::parse_file(declarations)
+        .expect("generated Advanced declarations parse")
+        .items
+    {
+        let syn::Item::ForeignMod(block) = item else {
+            continue;
+        };
+        for item in block.items {
+            if let syn::ForeignItem::Fn(function) = item {
+                names.push(function.sig.ident.to_string());
+            }
+        }
+    }
+    names
+}
+
+#[test]
+fn every_declared_function_is_in_one_table_or_explicitly_unwrapped() {
+    // Where each classified name lives; inserting twice is a duplicate.
+    let mut classified = BTreeMap::new();
+    let mut classify = |name: String, owner: String| {
+        if let Some(earlier) = classified.insert(name.clone(), owner.clone()) {
+            panic!("{name} is classified twice: {earlier} and {owner}");
+        }
+    };
+    for (table, symbols) in TABLES {
+        for symbol in *symbols {
+            classify(
+                symbol.to_str().unwrap().to_owned(),
+                format!("table {table}"),
+            );
+        }
+    }
+    for (name, reason) in UNWRAPPED {
+        assert!(!reason.is_empty());
+        classify((*name).to_owned(), "the unwrapped list".to_owned());
+    }
+
+    let declared = declared_functions();
+    assert!(!declared.is_empty());
+    for name in &declared {
+        assert!(
+            classified.remove(name).is_some(),
+            "{name} is declared by the Advanced SDK headers but is in no table and not in UNWRAPPED"
+        );
+    }
+    // Known families absent from older headers remain classified, but are
+    // disabled by the declaration selector. Every declaration present above
+    // must still have exactly one owner.
+}

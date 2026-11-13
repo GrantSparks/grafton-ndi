@@ -1,0 +1,134 @@
+name: Publish
+
+# A `v<version>` tag on a commit of main publishes that version to crates.io.
+# docs.rs builds the API documentation from the published crate.
+#
+# Nothing in this file decides who may publish. A tag runs the workflow of the
+# commit it points at, so whoever can push a tag can also change every check
+# below. The controls are repository settings, listed in order in ci/README.md:
+# the reviewers the `crates-io` environment requires, the crates.io trusted
+# publisher bound to that environment, and the rule on who may create `v*` tags.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: release tag
+    if: github.repository == 'GrantSparks/grafton-ndi'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Tag names the crate version and its commit is on main
+        run: |
+          python3 ci/release.py "$GITHUB_REF_NAME"
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            echo "::error::$GITHUB_REF_NAME does not point at a commit of main"
+            exit 1
+          fi
+
+  ci:
+    name: ci
+    needs: release
+    uses: ./.github/workflows/rust.yml
+    secrets:
+      NDI_SDK_SOURCES_JSON: ${{ secrets.NDI_SDK_SOURCES_JSON }}
+      NDI_SDK_ARCHIVE_TOKEN: ${{ secrets.NDI_SDK_ARCHIVE_TOKEN }}
+
+  # Builds the packaged crate, including every dependency build script, in a
+  # job that cannot obtain a registry token.
+  verify:
+    name: verify package
+    needs: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      sha256: ${{ steps.package.outputs.sha256 }}
+      toolchain: ${{ steps.package.outputs.toolchain }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Package and build the packaged crate
+        id: package
+        run: |
+          cargo package --locked --package grafton-ndi
+          crate="target/package/grafton-ndi-${GITHUB_REF_NAME#v}.crate"
+          {
+            echo "sha256=$(sha256sum "$crate" | cut -d' ' -f1)"
+            echo "toolchain=$(rustc --version | cut -d' ' -f2)"
+          } >> "$GITHUB_OUTPUT"
+          mkdir "$RUNNER_TEMP/release"
+          cp "$crate" "$RUNNER_TEMP/release/"
+      # For inspection only: the publish job does not read this artifact.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: crate
+          path: ${{ runner.temp }}/release
+          if-no-files-found: error
+          retention-days: 7
+
+  # Holds the crates.io trusted-publishing identity, so it runs nothing from the
+  # repository. Cargo is started outside the checkout, where it reads no Cargo
+  # configuration and no toolchain file from the repository, and with
+  # --no-verify, so no build script or crate code is compiled. From the job that
+  # built code it takes two values, each checked for its exact form before use:
+  # the SHA-256 of the verified package, which the package re-created here must
+  # have, and the toolchain version that produced it.
+  publish:
+    name: publish to crates.io
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERIFIED_SHA256: ${{ needs.verify.outputs.sha256 }}
+      VERIFIED_TOOLCHAIN: ${{ needs.verify.outputs.toolchain }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Re-create the verified package
+        working-directory: ${{ runner.temp }}
+        run: |
+          if ! [[ "$VERIFIED_SHA256" =~ ^[0-9a-f]{64}$ && "$VERIFIED_TOOLCHAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::the verify job did not report a SHA-256 and a toolchain version"
+            exit 1
+          fi
+          rustup toolchain install "$VERIFIED_TOOLCHAIN" --profile minimal
+          export RUSTUP_TOOLCHAIN="$VERIFIED_TOOLCHAIN" CARGO_TARGET_DIR="$RUNNER_TEMP/target"
+          {
+            echo "RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN"
+            echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+          } >> "$GITHUB_ENV"
+          cargo package --locked --no-verify --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --package grafton-ndi
+          actual=$(sha256sum "$CARGO_TARGET_DIR/package/grafton-ndi-${GITHUB_REF_NAME#v}.crate" | cut -d' ' -f1)
+          if [ "$actual" != "$VERIFIED_SHA256" ]; then
+            echo "::error::this package is $actual, the verified package is $VERIFIED_SHA256"
+            exit 1
+          fi
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+      - name: Publish
+        working-directory: ${{ runner.temp }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked --no-verify --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" --package grafton-ndi

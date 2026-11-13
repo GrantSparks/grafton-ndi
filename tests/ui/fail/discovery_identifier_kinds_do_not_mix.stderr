@@ -1,0 +1,111 @@
+error[E0308]: mismatched types
+ --> tests/ui/fail/discovery_identifier_kinds_do_not_mix.rs:9:23
+  |
+9 |     senders.subscribe(receiver);
+  |             --------- ^^^^^^^^ expected `&SenderId`, found `&ReceiverId`
+  |             |
+  |             arguments to this method are incorrect
+  |
+  = note: expected reference `&SenderId`
+             found reference `&ReceiverId`
+note: method defined here
+ --> src/discovery/listener.rs
+  |
+  |         pub fn subscribe(&mut self, id: &$Id) {
+  |                ^^^^^^^^^
+...
+  |     listener_methods!(SenderId);
+  |     --------------------------- in this macro invocation
+  = note: this error originates in the macro `listener_methods` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0308]: mismatched types
+  --> tests/ui/fail/discovery_identifier_kinds_do_not_mix.rs:10:25
+   |
+10 |     senders.unsubscribe(group);
+   |             ----------- ^^^^^ expected `&SenderId`, found `&InputGroupId`
+   |             |
+   |             arguments to this method are incorrect
+   |
+   = note: expected reference `&SenderId`
+              found reference `&InputGroupId`
+note: method defined here
+  --> src/discovery/listener.rs
+   |
+   |         pub fn unsubscribe(&mut self, id: &$Id) {
+   |                ^^^^^^^^^^^
+...
+   |     listener_methods!(SenderId);
+   |     --------------------------- in this macro invocation
+   = note: this error originates in the macro `listener_methods` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0308]: mismatched types
+  --> tests/ui/fail/discovery_identifier_kinds_do_not_mix.rs:11:25
+   |
+11 |     receivers.subscribe(sender);
+   |               --------- ^^^^^^ expected `&ReceiverId`, found `&SenderId`
+   |               |
+   |               arguments to this method are incorrect
+   |
+   = note: expected reference `&ReceiverId`
+              found reference `&SenderId`
+note: method defined here
+  --> src/discovery/listener.rs
+   |
+   |         pub fn subscribe(&mut self, id: &$Id) {
+   |                ^^^^^^^^^
+...
+   |     listener_methods!(ReceiverId);
+   |     ----------------------------- in this macro invocation
+   = note: this error originates in the macro `listener_methods` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0308]: mismatched types
+  --> tests/ui/fail/discovery_identifier_kinds_do_not_mix.rs:12:27
+   |
+12 |     receivers.unsubscribe(group);
+   |               ----------- ^^^^^ expected `&ReceiverId`, found `&InputGroupId`
+   |               |
+   |               arguments to this method are incorrect
+   |
+   = note: expected reference `&ReceiverId`
+              found reference `&InputGroupId`
+note: method defined here
+  --> src/discovery/listener.rs
+   |
+   |         pub fn unsubscribe(&mut self, id: &$Id) {
+   |                ^^^^^^^^^^^
+...
+   |     listener_methods!(ReceiverId);
+   |     ----------------------------- in this macro invocation
+   = note: this error originates in the macro `listener_methods` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0308]: mismatched types
+  --> tests/ui/fail/discovery_identifier_kinds_do_not_mix.rs:13:39
+   |
+13 |     let _ = receivers.request_connect(sender, "Camera 1");
+   |                       --------------- ^^^^^^ expected `&ReceiverId`, found `&SenderId`
+   |                       |
+   |                       arguments to this method are incorrect
+   |
+   = note: expected reference `&ReceiverId`
+              found reference `&SenderId`
+note: method defined here
+  --> src/discovery/listener.rs
+   |
+   |     pub fn request_connect(&mut self, id: &ReceiverId, source: &str) -> Result<()> {
+   |            ^^^^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+  --> tests/ui/fail/discovery_identifier_kinds_do_not_mix.rs:14:42
+   |
+14 |     let _ = receivers.request_disconnect(group);
+   |                       ------------------ ^^^^^ expected `&ReceiverId`, found `&InputGroupId`
+   |                       |
+   |                       arguments to this method are incorrect
+   |
+   = note: expected reference `&ReceiverId`
+              found reference `&InputGroupId`
+note: method defined here
+  --> src/discovery/listener.rs
+   |
+   |     pub fn request_disconnect(&mut self, id: &ReceiverId) -> Result<()> {
+   |            ^^^^^^^^^^^^^^^^^^

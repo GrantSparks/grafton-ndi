@@ -3,7 +3,12 @@ error[E0382]: borrow of moved value: `frame`
   |
 3 | fn reuse(sender: &mut Sender, mut frame: VideoFrame) {
   |                               --------- move occurs because `frame` has type `VideoFrame`, which does not implement the `Copy` trait
-4 |     sender.send_video_async(frame);
-  |                             ----- value moved here
+4 |     let _ = sender.send_video_async(frame);
+  |                                     ----- value moved here
 5 |     frame.data_mut().fill(0);
   |     ^^^^^ value borrowed here after move
+  |
+help: consider cloning the value if the performance cost is acceptable
+  |
+4 |     let _ = sender.send_video_async(frame.clone());
+  |                                          ++++++++

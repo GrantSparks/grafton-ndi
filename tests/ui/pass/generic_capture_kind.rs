@@ -2,9 +2,11 @@
 use grafton_ndi::{Capture, CaptureKind};
 use std::time::Duration;
 fn capture<K: CaptureKind>(view: &Capture<'_, K>) -> Result<Option<K::Owned>, grafton_ndi::Error> {
-    view.try_capture(Duration::ZERO)
+    view.capture(Duration::ZERO)
 }
-fn copy<K: CaptureKind>(frame: &K::Ref<'_>) -> Result<K::Owned, grafton_ndi::Error> {
-    K::ref_to_owned(frame)
+fn capture_ref<'rx, K: CaptureKind>(
+    view: &Capture<'rx, K>,
+) -> Result<Option<K::Ref<'rx>>, grafton_ndi::Error> {
+    view.capture_ref(Duration::ZERO)
 }
 fn main() {}

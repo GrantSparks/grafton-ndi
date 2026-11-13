@@ -16,7 +16,7 @@
 //! - Ensure NDI sources are running on your network
 //! - Check firewall settings (NDI uses UDP port 5353 for discovery)
 
-use grafton_ndi::{Error, NDI};
+use grafton_ndi::{Error, Ndi};
 
 use std::{
     env,
@@ -34,7 +34,7 @@ fn main() -> Result<(), Error> {
     println!("============================\n");
 
     // Initialize the NDI library
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
     println!("NDI initialized successfully\n");
 
     // Create the finder instance

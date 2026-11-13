@@ -6,7 +6,607 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Entries and examples describe the API of their named release. For the current
-API, see the [README](README.md) and [2.0 migration guide](docs/migration/1.x-to-2.0.md).
+API, see the [README](README.md) and the migration guides for
+[2.0](docs/migration/1.x-to-2.0.md) and [3.0](docs/migration/2.0-to-3.0.md).
+
+## [3.0.0] - 2026-11-13
+
+Version 3.0.0 loads the NDI library when the program selects a runtime instead
+of linking it when the program is built, so building the crate no longer needs
+an NDI SDK. The public API now follows one set of conventions: Rust casing,
+options types with chainable setters, unsigned dimensions and counts, typed
+timecodes and frame rates, one error type, and captures that report a timeout
+as `None`. Most programs need changes; see the
+[2.0 to 3.0 migration guide](docs/migration/2.0-to-3.0.md).
+
+### SDK and platform compatibility
+
+- The crate works with NDI 6 runtimes from the Standard and the Advanced SDK.
+  The minimum Rust version remains 1.88; the tvOS and visionOS targets need a
+  later release.
+- The test suite runs against real runtimes on Linux x86-64 (Standard 6.1.1,
+  and Standard and Advanced 6.3.2 and 6.4.0.2), Linux x86 and arm64 (Standard
+  6.4.0.2), macOS arm64 (Standard and Advanced 6.3.2 and 6.4.0.2) and x86-64
+  (Standard 6.4.0.2), and Windows x64 (Standard and Advanced 6.3.2 and
+  6.4.0.2) and x86 (Advanced 6.4.0.2). On Linux, macOS and Windows, builds with
+  one version's Advanced headers also run against another version's runtime,
+  and peers of the earlier versions exchange video, audio and metadata with 6.4
+  peers in both directions. Other NDI 6 releases, including 6.0, were not
+  tested.
+- 32-bit ARM Linux and Android are compiled and linted, and iOS, tvOS and
+  visionOS are built against the NDI SDK for Apple 6.4; nothing runs on them.
+  See [SDK validation](docs/sdk-validation.md) and the
+  [README](README.md#supported-ndi-versions-and-platforms).
+- The bindings are generated from the NDI SDK 6.4.0.2 headers. A runtime that
+  lacks a newer capability reports it unavailable, and the operations that need
+  it return `Error::UnsupportedCapability`.
+- iOS, tvOS and visionOS are new targets. They link the static archive from the
+  NDI SDK for Apple named by `NDI_SDK_DIR`.
+- The build no longer refuses targets for which the NDI SDK supplies no
+  library, such as musl Linux, `windows-gnu` and Windows on ARM64. They are not
+  supported.
+
+### Breaking Changes
+
+- The NDI library is loaded at run time. A program whose NDI library is
+  missing now starts, and `Ndi::new` returns `Error::RuntimeLoadFailed` naming
+  every location tried and the reason for each. In 2.0 such a program did not
+  start.
+- The build no longer passes the NDI library to the linker for Windows, macOS,
+  Linux and Android targets. Code that declares its own NDI functions, and C or
+  C++ code that calls NDI, must link the library itself. Tools that collect a
+  program's libraries from the executable no longer find it.
+- The library is searched for next to the executable, then in the directory
+  named by `NDI_RUNTIME_DIR_V6`, then by the operating system's loader. A
+  library in either directory is used even where 2.0 loaded another one from
+  the loader's path.
+- Unless the program requests an edition, each location is searched for the
+  runtime libraries of both the Standard and the Advanced SDK, the Advanced
+  name first in builds with the `advanced` feature or, outside Windows, the
+  `file-io` feature, and the Standard name first otherwise. Nothing installed
+  on the build machine changes the search. A 2.0
+  build on a Linux or Android machine with the Advanced SDK linked the Advanced
+  library and needed that runtime wherever it ran; the same program built with
+  3.0 also runs with the Standard runtime, and loads it where both are
+  installed in one place. Request `SdkEdition::Advanced` where the Advanced
+  runtime is required.
+- Identifiers use Rust casing, with an acronym written as one word. `NDI` is
+  `Ndi`; the `PixelFormat` variants are `Uyvy`, `Uyva`, `P216`, `Pa16`,
+  `Yv12`, `I420`, `Nv12`, `Bgra`, `Bgrx`, `Rgba` and `Rgbx`; the
+  `ReceiverColorFormat` variants `BgrxBgra`, `UyvyBgra`, `RgbxRgba` and
+  `UyvyRgba`; and `AudioFormat::FLTP` is `AudioFormat::Fltp`.
+- `image-encoding` is no longer a default feature, and the crate has no
+  default features. `encode_png`, `encode_jpeg`, `encode_data_url` and
+  `ImageFormat` need it enabled.
+- The image encoders' errors and output follow `ImageOptions`, which
+  `encode_png`, `encode_jpeg` and `encode_data_url` now use with their
+  default settings:
+  - `encode_jpeg` with a quality outside 1 to 100 returns
+    `Error::InvalidInput`; 2.0 returned `InvalidFrame`.
+  - A frame whose `ndi_color_info` metadata gives the PQ or HLG transfer is
+    refused with `Error::InvalidFrame`, in RGB formats too, where 2.0 encoded
+    its code values untagged. `HdrPolicy::CodeValues` encodes them to a
+    tagged PNG.
+  - A frame whose `ndi_color_info` cannot be read is refused with
+    `Error::InvalidFrame` under the default `ColorPolicy::Sdk`.
+  - A PNG of a frame tagged with BT.2020 primaries carries a `cICP` chunk, so
+    its bytes differ from 2.0's. Untagged and BT.601 or BT.709 SDR frames in
+    the four RGB formats encode to 2.0's bytes.
+  - `ImageFormat` is at the crate root only, no longer also in `frames`, and
+    gains `WebpLossless`.
+- The `advanced_sdk` Cargo feature, which had no effect, is removed.
+- The `tokio` feature enables only Tokio's `rt` feature. A program that uses
+  `#[tokio::main]` or the multi-threaded runtime enables those features in its
+  own Tokio dependency.
+- The async receivers moved to the `asynchronous` module:
+  `grafton_ndi::tokio::AsyncReceiver` is
+  `grafton_ndi::asynchronous::tokio::AsyncReceiver`, and `grafton_ndi::smol`
+  is `grafton_ndi::asynchronous::smol`. A glob import of the crate root no
+  longer shadows the `tokio` and `smol` crates. `AsyncCapture::capture`
+  returns `Ok(None)` when nothing arrives in time, and
+  `AsyncCapture::try_capture` is removed, as for `Capture` below.
+- `FinderOptions`, `ReceiverOptions` and `SenderOptions` have private fields
+  and chainable setters. `FinderOptions::new()`, `ReceiverOptions::new(source)`
+  and `SenderOptions::new(name)` replace their `builder()` functions, and
+  `FinderOptionsBuilder`, `ReceiverOptionsBuilder` and `SenderOptionsBuilder`
+  are removed. The receiver presets are `ReceiverOptions::snapshot_preset`,
+  `high_quality_preset` and `monitoring_preset`, the builder's `color` is
+  `color_format`, and the `ndi_recv_name` field is set with `name`.
+- `ReceiverOptions` no longer implements `Default`. `ReceiverOptions::new`
+  allows video fields, as 2.0's builder and the SDK do; 2.0's
+  `ReceiverOptions::default()` did not.
+- `Source` has private fields: `Source::new(name)` and `with_address` create
+  one, and `name()` and `address()` read it. `address()` returns `None` for a
+  source without an address, and `SourceAddress::None` is removed. `Source`
+  and `SourceAddress` no longer implement `Default`.
+- `Source::ip_address` is removed; `Source::host` returns the same value, which
+  for a URL source is a host name.
+- `Tally`, `ReceiverStatus` and `ConnectionStats` have private fields, read
+  with getters of the same names, such as `tally.on_program()` and
+  `status.connections()`.
+- Widths, heights, frame-rate parts, sample rates and channel and sample
+  counts are `u32`, and strides and buffer lengths are `usize`, where 2.0 used
+  `i32`: in frames, frame references, frame builders, pixel-format sizing,
+  `FrameSyncAudioRequest` and `FrameSync::audio_queue_depth`. A value the SDK
+  cannot represent is refused before it reaches the SDK.
+- Frame rates are `FrameRate` values. `frame_rate()` replaces `frame_rate_n()`
+  and `frame_rate_d()`, and `VideoFrameBuilder::frame_rate`,
+  `BorrowedVideoFrameBuilder::frame_rate` and `VideoFrame::set_frame_rate`
+  take a `FrameRate`, so `set_frame_rate` no longer returns a `Result`.
+- Timecodes are `Timecode` values instead of `i64`, and every sendable frame
+  starts with `Timecode::SYNTHESIZE`, the SDK's request to generate one.
+  `MetadataFrame::new` takes the text, and the empty `MetadataFrame::new()`
+  and `MetadataFrame::with_data(data, timecode)` are removed; set a timecode
+  with `with_timecode`.
+- A received frame's `timestamp()` returns `Option<SdkTimestamp>`, `None` where
+  the SDK has none. Sendable frames have no timestamp, which the SDK generates
+  when it sends a frame: `VideoFrame::set_timestamp`, the `timestamp` setters
+  of the frame builders and `BorrowedVideoFrame::timestamp` are removed.
+- `VideoFrameBuilder::new`, `AudioFrameBuilder::new` and the builders'
+  `Default` are removed; `VideoFrame::builder()` and `AudioFrame::builder()`
+  start a builder. `VideoFrame`, `AudioFrame` and `MetadataFrame` no longer
+  implement `Default`. `VideoFrameBuilder::aspect_ratio` is
+  `picture_aspect_ratio`, `AudioFrameBuilder::channels` and `samples` are
+  `num_channels` and `num_samples`, and `channel_stride_in_bytes() -> i32` is
+  `channel_stride_bytes() -> usize` on `AudioFrame` and `AudioRef`.
+- `AudioFrameBuilder::format` is removed. `AudioFormat::Fltp` is the only
+  format and every frame uses it.
+- `LineStrideOrSize` is removed. `VideoFrame`, `VideoFrameRef` and
+  `BorrowedVideoFrame` report the first plane's stride with
+  `line_stride_bytes() -> usize` instead of `line_stride_or_size()`.
+- `PixelFormat::try_line_stride` and `try_buffer_size` are `line_stride` and
+  `buffer_len`, and `PixelFormatInfo::try_buffer_len` is `buffer_len`.
+  `PixelFormat`, `ScanType` and `AudioFormat` no longer convert to or from
+  `u32` and `i32`. A pixel format's FourCC is a `FourCc`:
+  `FourCc::from(format)` gives it and `PixelFormat::try_from(fourcc)` reverses
+  it.
+- `to_owned` on `VideoRef` and `AudioRef`, FrameSync's included, returns the
+  owned frame instead of a `Result`: a copy of a validated frame cannot fail.
+  `VideoFrame::replace_data` and `AudioFrame::replace_data` hand a refused
+  buffer back in a `Rejected`. The unsafe `VideoFrame::from_raw` is removed.
+- `Capture::capture` returns `Ok(None)` when no frame arrives within the
+  timeout, and `Error::FrameTimeout` is removed. `Capture::try_capture` is
+  removed, and `try_capture_ref` is `capture_ref`. Both captures go on
+  capturing through the SDK's early returns, while a new connection
+  synchronizes or after a status change, until the timeout is spent, as 2.0's
+  `capture` did; 2.0's `try_capture` and `try_capture_ref` returned `None`
+  after one SDK call. `CaptureKind::ref_to_owned` is no longer public.
+- PTZ control moved to the `Ptz` handle that `Receiver::ptz` returns. Each
+  `Receiver::ptz_*` method is the `Ptz` method without the prefix, and
+  `ptz_exposure_manual_v2` is `exposure_manual_detailed`. `store_preset` and
+  `recall_preset` take the preset as a `u8`; they took an `i32` and a `u32`.
+- `Receiver::set_tally` takes the `Tally` by value and returns nothing: the SDK
+  keeps the state and sends it to every source the receiver connects to.
+  `Receiver::send_metadata` returns `Result<()>`, with `Error::NotConnected`
+  where it returned `false`.
+- `Receiver::poll_status_change` is removed. `Receiver::poll_event` returns the
+  same status as `ReceiverEvent::StatusChanged`, together with the other
+  receiver events, and is the only poller, so two pollers no longer compete for
+  one notification.
+- `Receiver::metadata` and `poll_event` need the receiver's mode to implement
+  the new sealed `MetadataMode`, `Receiver::audio` the new sealed
+  `CaptureMode`, which extends it, and `Receiver::video` the new sealed
+  `VideoMode`. `RawCapture` implements all three, `FrameSyncAttached` only
+  `MetadataMode`, and the Advanced `AvSyncAttached` `MetadataMode` and
+  `VideoMode`. Generic code bounded by `M: ReceiverMode` that captures audio
+  bounds `M: CaptureMode`, code that only captures metadata or polls events
+  can bound `M: MetadataMode`, and the common controls keep `ReceiverMode`.
+- A FrameSync's receiver no longer captures audio: `framesync.receiver().audio()`
+  does not compile, as its video capture already did not. The FrameSync reads
+  the same receiver audio, so each audio frame reached only one of them, and
+  the FrameSync returned silence for every frame the raw capture took.
+  Capture audio with `FrameSync::capture_audio` or `capture_audio_ref`, or
+  recover the receiver with `FrameSync::into_receiver`. Metadata capture and
+  event polling on a FrameSync's receiver are unchanged.
+- FrameSync's owned captures take the short names: `capture_video` and
+  `capture_audio` return owned frames, as `capture_video_owned` and
+  `capture_audio_owned` did, and the borrowing captures are
+  `capture_video_ref` and `capture_audio_ref`. `FrameSync::new` hands the
+  receiver back in a `Rejected` when the SDK does not create the FrameSync.
+  `FrameSyncAudioRequest::capture_with(Some(rate), ..)` is
+  `capture_at(rate, ..)`. `capture_with(None, ..)`, a request at the source's
+  sample rate, has no equivalent: until the source's audio arrives the SDK
+  answers such a request with a zero sample rate, so it could not return the
+  silence every other request returns. A request always names a positive
+  sample rate; `FrameSyncAudioRequest::for_input` builds one from the format
+  `FrameSync::audio_input_format()` reports.
+- FrameSync's audio input-format query is separate from capture.
+  `FrameSyncAudioRequest::query_input()` is removed, and
+  `FrameSync::audio_input_format()` returns `Result<Option<AudioInputFormat>>`:
+  the source's positive sample rate and channel count, or `None` before any
+  audio arrives. Every request captures samples, so `capture_audio` returns
+  `Result<AudioFrame>`, and `FrameSyncAudioRef` loses `is_empty()`; its
+  `format()` returns `AudioFormat` and its `to_owned()` returns an
+  `AudioFrame`, as `AudioFrameRef`'s does. A capture the SDK answers
+  without samples is an `Error::InvalidFrame`. In 2.0 an owned
+  `capture_audio(query_input())` returned `Ok(None)` and lost the format it
+  queried.
+- `Sender::send_video` returns `Result<()>`, and `Sender::send_video_async`
+  hands a refused frame back in a `Rejected`. Every video send checks that the
+  sender's runtime supports the frame's pixel format before anything reaches
+  the SDK.
+- `Sender::tally(timeout)` is replaced by `Sender::tally()`, which returns the
+  current `Tally` every time, and `Sender::wait_for_tally_change(timeout)`,
+  which returns `Some` with the new tally when it changes and `None` when the
+  timeout passes first. 2.0's `tally` returned `None` whenever the tally had
+  not changed since the previous query, so a poll of a source that stayed on
+  program reported it only once.
+- `Sender` has sealed modes, as receivers do: `Sender<M: SenderMode = RawSend>`,
+  and `Sender` still names the ordinary sender with every operation. The
+  source, metadata in both directions, tally, connection count and connection
+  metadata, failover and the Advanced encoder guidance, keyframe and external
+  tally controls work in every mode; `send_audio` and the interleaved audio
+  sends in the modes that implement `AudioSendMode`; the uncompressed video
+  sends, completion handlers and flush in `RawSend` only.
+- `BorrowedVideoFrame::try_from_uncompressed`, `with_picture_aspect_ratio`,
+  `fourcc` and `validated_data_len` are removed. Use
+  `BorrowedVideoFrame::builder` with its `frame_rate` and
+  `picture_aspect_ratio`, `FourCc::from(frame.pixel_format())`, and
+  `data().len()`: `data()` returns the frame's storage, no longer the whole
+  buffer the frame was built from.
+- `SourceCache::find_by_host` takes the `Ndi` handle as its first argument. The
+  cache no longer starts NDI by itself.
+- `NDI::is_supported_cpu` is removed. Use `Runtime::is_supported_cpu` on a
+  selected runtime, or `ndi.runtime().is_supported_cpu()`.
+- `NDI::version` is removed. Use `ndi.info().raw_version()`, or
+  `Runtime::select(&options)?.info().raw_version()` before NDI is started. Both
+  return a `&'static str` instead of a `String`.
+- `Error::InvalidConfiguration` is renamed `Error::InvalidInput`.
+- A runtime that does not start because the CPU lacks instructions it needs is
+  reported as `Error::UnsupportedCpu` instead of `Error::InitializationFailed`.
+- A finder, receiver, sender, FrameSync or other object the SDK does not create
+  is reported as `Error::NativeOperationFailed`, whose `operation` names the
+  creating function, instead of `Error::InitializationFailed`, which now means
+  only that the runtime did not start. A source descriptor the SDK does not
+  supply, which was `Error::NullPointer`, is reported the same way, and
+  `Error::NullPointer` is removed.
+- `Error::SourceUnavailable` and `Error::Disconnected`, which the crate never
+  returned, are removed. `Error::Timeout`, returned only by
+  `Sender::connection_count` for a negative count from the SDK, is removed;
+  that count is now `Error::UnexpectedSdkResult`. `Error::PtzCommandFailed` is
+  removed; a PTZ command the SDK rejects is `Error::NativeOperationFailed`
+  naming the PTZ function. `Error::Io`, which 2.0 never returned, exists only
+  with the `file-io` feature, for the File API's operating-system errors.
+- `MAX_TIMEOUT` is `u32::MAX - 1` milliseconds, one millisecond less than in
+  2.0, and a timeout of exactly the old value is refused. The SDK reads
+  0xFFFFFFFF as a wait without a limit, so no finite timeout is passed to it as
+  that value any more.
+
+### Added
+
+- Image encoding covers every uncompressed pixel format and every video frame
+  type, through one options value, `ImageOptions`, and three methods on
+  `VideoFrame`, `VideoFrameRef`, `FrameSyncVideoRef` and, new to encoding,
+  `BorrowedVideoFrame`: `encode_image`, `encode_image_to`, which writes into
+  any `io::Write` as it encodes, and `encode_image_data_url`. See the
+  [image encoding guide](docs/image-encoding.md).
+  - UYVY, UYVA, P216, PA16, NV12, I420, YV12, NA48, NB48, NA4G and NB4G
+    frames encode, where 2.0 returned `InvalidFrame`. YUV is converted as the
+    6.4 SDK was measured to convert: with the frame's `ndi_color_info` matrix
+    or BT.709, limited range and repeated chroma, with exact coefficients.
+    `ColorPolicy::Override` sets the matrix (`YuvMatrix`) and range
+    (`YuvRange`).
+  - `ImageFormat::WebpLossless`: lossless WebP through `image-webp`, about 29
+    times faster than PNG at the default level on camera video and 17%
+    smaller.
+  - `PngCompression::Fast`, `Balanced` (the default) and `High`.
+  - `SampleDepth::Sixteen`: 16-bit PNG, keeping a high-bit-depth frame's
+    precision.
+  - `AlphaMode::Discard`: RGB rather than RGBA PNG and WebP.
+  - `HdrPolicy::CodeValues`: a PNG of a PQ or HLG frame's code values, tagged
+    with a `cICP` chunk.
+  - `Downscale::Half`, `Quarter` and `Eighth`: block averages inside the row
+    loop, weighted by alpha.
+- `ColorInfo`, with `ColorPrimaries`, `TransferFunction` and `YuvMatrix`, and
+  `color_info()` on every video frame type read the frame's `ndi_color_info`
+  metadata, with no feature.
+- `examples/file_thumbnails.rs`, with `file-io` and `image-encoding`, seeks
+  through a recording and writes a thumbnail at each position.
+
+- `AsyncReceiver::receiver` lends the wrapped `Receiver` for its controls:
+  tally, PTZ, upstream and connection metadata, delays, `web_control_url` and
+  `source`. `AsyncReceiver::poll_event`, `poll_source_name_change`,
+  `connect_to` and `disconnect` are the async versions of the `Receiver`
+  methods of the same names, on the runtime's blocking pool, with their
+  errors and `Error::SpawnFailed`; `disconnect` therefore returns
+  `Result<()>`. The two polls' timeouts start when the future is first polled
+  and include blocking-pool queue delay, as `AsyncCapture::capture`'s does.
+- `Sender::send_video` takes a `BorrowedVideoFrame`, by value or by reference,
+  as well as `&VideoFrame`, and sends it in place: a borrowed buffer, including
+  one with padded rows, is sent without being copied, and can be reused when
+  the call returns. In 2.0 a borrowed frame reached the SDK only through
+  `send_video_async_copy`, which copies the whole frame on every call.
+- `copy_into(&mut destination)` on `VideoFrameRef`, `FrameSyncVideoRef`,
+  `AudioFrameRef`, `FrameSyncAudioRef` and `BorrowedVideoFrame` copies the
+  frame into an existing `VideoFrame` or `AudioFrame`, which ends up exactly as
+  `to_owned` would have made it but keeps its pixel or sample buffer when
+  that is large enough, and its metadata string when the text has the same
+  length. Copying frames of one shape into the same destination allocates
+  nothing after the first copy, so copying borrowed pixels into the frame
+  `send_video_async` returns makes an asynchronous send loop that allocates no
+  frames. Neither `to_owned` nor `copy_into` can fail: a copy of a frame that
+  was validated when it was captured or built is valid.
+- `BorrowedVideoFrame::plane` and `planes` borrow the active rows of a frame
+  built over an application buffer, padded or not, without copying, as the
+  plane views of owned and captured frames do; its `data()` still returns the
+  whole validated storage, padding included.
+- Runtime selection in two explicit steps. `Runtime::select` loads the NDI
+  library and pins it for the process without starting NDI;
+  `Runtime::initialize` starts NDI and returns an `Ndi` handle. `Ndi::new` and
+  `Ndi::with_options` do both, and `Ndi::runtime` returns the selected runtime.
+  `RuntimeOptions` chooses an exact library path or an SDK edition. The edition
+  of the loaded library is detected from the functions it exports, and an
+  Advanced runtime meets a request for the Standard edition.
+- `Runtime::info` and `Ndi::info` return a `RuntimeInfo` with the loaded
+  library's path, edition, linkage and version.
+- Capability queries in the new `capabilities` module. `capabilities()` reports
+  each `RuntimeFeature`, the Advanced SDK's included, as available or gives the
+  reason it is not, and `require_feature` returns that reason as an error. Both
+  are on `Runtime` and on `Ndi`. A capability whose operations go on to use
+  another one's functions is unavailable whenever that one is, and then reports
+  that one's reason and evidence: `AdvancedRouterConfiguration` requires
+  `Routing`, and the four Advanced advertiser and listener configurations
+  require `SenderAdvertising`, `ReceiverAdvertising`, `SenderDiscovery` and
+  `ReceiverDiscovery`, and so NDI 6.4.0 or later. Creating such an object with
+  a configuration is refused under its own capability, exactly when
+  `capabilities()` says it is unavailable.
+- `Error::RuntimeLoadFailed`, `Error::RuntimeConflict`,
+  `Error::UnsupportedCpu`, `Error::UnsupportedCapability`,
+  `Error::NativeOperationFailed`, `Error::NotConnected`,
+  `Error::UnexpectedSdkResult`, `Error::ReceiverRequestNotAccepted`,
+  `Error::QueueFull` and, with the `file-io` feature, `Error::InvalidState`.
+  `QueueFull` carries the `QueueLimit` that was reached, an Advanced
+  `QueuedSender`'s frame or byte limit, an async File handle's command queue
+  or the queue of async File probes, and the same call can succeed once
+  queued work has completed.
+  `UnsupportedCapability` carries
+  the `RuntimeFeature` and the `CapabilityUnavailable` reason that
+  `capabilities()` reports, and a `detail` naming the missing entry point, the
+  version the runtime reports against the one required, or the declaration the
+  build lacks. `UnexpectedSdkResult` reports a value the SDK returned that
+  breaks its documented contract.
+- `Rejected<T>`, the error of an operation that takes ownership of a value and
+  hands it back when it fails. It converts into `Error`, so `?` still works.
+- Value types at the crate root: `FrameRate`, `Timecode`, `SdkTimestamp`,
+  `FourCc`, `StreamTier` (program or preview), `MediaTypes` (a set of video,
+  audio and metadata) and `SettingChange` (whether a setting changed or already
+  had the value).
+- NDI 6.4 media support: the planar 4:4:4 formats `Na48`, `Nb48`, `Na4g` and
+  `Nb4g` with `FormatCategory::Planar444` and `Planar444Alpha`,
+  `ReceiverColorFormat::Best444`, and the `ReceiverBandwidth::VideoOnlyLowest`
+  and `VideoOnlyHighest` modes. A sender whose runtime cannot send a frame's
+  format refuses it with `Error::UnsupportedCapability`.
+- Receiver controls: independent video and audio delay (`set_video_delay` and
+  `set_audio_delay`, which return a `SettingChange`, and their getters),
+  connection metadata, `web_control_url`, `poll_source_name_change`,
+  `poll_event` with `ReceiverEvent`, `connect_to` and `disconnect`.
+- `Sender::capture_metadata` for metadata sent back by connected receivers,
+  and `Sender::send_audio_interleaved_i16`, `_i32` and `_f32`.
+- `Ndi::timestamp`, the SDK's current timestamp as an `SdkTimestamp`.
+- `VideoFrame::plane` and `planes`, the plane views `VideoRef` already had,
+  and `AudioFrame::channels` and `AudioFrame::set_timecode`. `VideoFrame` and
+  `AudioFrame` implement `Clone`, and the value and status types implement
+  `Copy`, `PartialEq`, `Eq`, `Hash` and `Default` where they apply.
+- The `audio_conversion` module: `AudioConverter` converts between planar and
+  interleaved audio with explicit reference levels, and
+  `InterleavedAudioI16`, `InterleavedAudioI32` and `InterleavedAudioF32` take
+  the sample count from the length of their data.
+- The `video_conversion` module: `VideoConverter` converts between V210 and
+  P216. P216 samples may start at any address.
+- The `routing` module: a `Router` is a source that redirects its receivers to
+  another source.
+- The `discovery` module for NDI Discovery Servers. `SendAdvertiser` and
+  `RecvAdvertiser` register senders and receivers; `SendListener` and
+  `RecvListener` return owned snapshots and events and can request a receiver
+  connection, which is refused with `Error::ReceiverRequestNotAccepted` when
+  the listener lists no receiver that accepts it. These need NDI 6.4.0 or
+  later: a 6.3.2 runtime exports their functions, but destroying any of the
+  four while it is connected to a server aborts the process ("pure virtual
+  method called") within seconds of repeated use, and no order of calls
+  avoids it. An
+  advertiser keeps its registered senders and receivers alive until they are
+  unregistered or it is dropped. Text from the network is decoded lossily, and
+  the identifier types `SenderId`, `ReceiverId` and `InputGroupId` keep the
+  server's exact bytes.
+- The optional `advanced` feature and module for the NDI Advanced SDK: JSON
+  configuration (`AdvancedConfig`), passed to the `config` setter of
+  `FinderOptions`, `ReceiverOptions`, `SenderOptions`, `RouterOptions`,
+  `AdvertiserOptions` and `ListenerOptions`; compressed and scatter sending
+  (`CompressedSender`), compressed reception (`PacketReceiver`), queued sending
+  with completion (`QueuedSender`), custom receive allocators
+  (`AllocatorService`), `AvSync`, `Genlock`, encoder and keyframe controls,
+  stream tier and stream selection (`set_stream_tier`, `set_streams`), and
+  `KvmSession`. The declarations of the Advanced-only headers are generated on
+  the build machine from an installed Advanced SDK. Without one the same API
+  compiles and every native operation returns `Error::UnsupportedCapability`,
+  and older or partial Advanced headers disable only the operations they do not
+  declare. Every public type has the same auto traits with and without the
+  headers. `CompressedSender`, `QueuedSender`, `PacketReceiver` and
+  `AllocatedPacketReceiver` are `Send` and `Sync`, and `AvSync` and `Genlock`
+  are `Send`: each can be created on one thread and used and dropped on
+  another. See the [Advanced SDK guide](docs/advanced.md).
+- `advanced::CompressedSender::sender` and `advanced::QueuedSender::sender`
+  lend their native sender as `Sender<CompressedAttached>` and
+  `Sender<QueueAttached>`, with every operation the modes share, so a
+  compressed source receives metadata such as PTZ and KVM requests and a
+  queued source also carries audio. `SendAdvertiser::register` takes only
+  `Sender<RawSend>`, so a wrapped sender cannot be registered.
+- `advanced::PacketReceiver::receiver` and `receiver_mut` lend its receiver as
+  `Receiver<PacketAttached>`, with tally, PTZ, connection statistics, upstream
+  metadata and the keyframe and stream controls, but no audio, metadata or
+  event capture of its own, which packet capture takes. `AllocatedPacketReceiver`
+  lends it through `receiver` and has `set_stream_tier` and `set_streams`.
+  `PacketReceiver::new` checks against the runtime only the color format its
+  preset gives the SDK, not the options' own, which the preset replaces.
+- `advanced::AvSync::receiver` lends its receiver as
+  `Receiver<AvSyncAttached>`, with its own video and metadata capture,
+  `poll_event` and every control the modes share, but no audio capture, which
+  the synchronizer takes. It is never lent mutably, because the synchronizer
+  reads the receiver's native instance; `AvSync` has `set_stream_tier`,
+  `set_streams` and `kvm` itself. `AvSync::synchronize` takes `&self` and
+  reads the video frame in place, an owned `VideoFrame` or a `VideoFrameRef`
+  captured with `capture_ref`, so the capture-then-synchronize loop copies no
+  pixels. `AvSync` is `Send` but not `Sync`: it can move to another thread,
+  and synchronizes one call at a time.
+- `advanced::KvmSession::receiver` lends the session's receiver for the whole
+  session, so frames can be captured, and held, while keys, buttons and
+  touches stay pressed across them on one connection. `Receiver::kvm` still
+  borrows the receiver mutably, so a receiver has one session at a time. A
+  session started from `PacketReceiver::receiver_mut` captures packets and
+  events with `KvmSession::capture`. Inputs held when the lent receiver changes
+  source stay pressed on the previous source; call `release_all` first.
+- `Ndi::process_lifetime`, an explicit opt-in that keeps NDI started until the
+  process exits. Custom receive allocators require it.
+- The optional `file-io` feature and `file` module for the NDI File library of
+  the 6.4 SDK: `FileApi::open` finds the library, `FileRecorder` records a
+  source to disk with an explicit report of whether the file was finalized,
+  `FilePlayer` plays a recording as an NDI source, and `AsyncFileRecorder` and
+  `AsyncFilePlayer` offer the same operations as futures for any executor.
+  `reset` on either recorder replaces one whose session could not be confirmed
+  closed and returns that session's report, and `RecordingReport::stopped_by_sdk`
+  says whether a finalized session ran until it was asked to stop. A recorder
+  with an exact file name never overwrites a file and refuses the options and
+  operations that would need a second file of the same name, instead of
+  letting the SDK end the session. The File API returns the crate's `Error`;
+  an operation the current state does not allow is `Error::InvalidState`, whose
+  `StateError` says whether a retry can succeed, and an operation an async
+  handle's full command queue refuses is `Error::QueueFull`. Each request to
+  stop takes a place in that queue, and one more is accepted beyond a full
+  one. Async handles close by reference, so every close made while one is
+  awaited completes with it, and async probes run on one thread that the
+  process shares, at most 64 waiting. `Error::RuntimeLoadFailed` means only
+  that no File library could be selected. A selected library that lacks the
+  playback or the recording entry points refuses that family's operations
+  with `Error::UnsupportedCapability` under `RuntimeFeature::File(FileFamily)`,
+  naming the first missing entry point, and `FileApi::status` and
+  `FileApi::supports` report each family in advance. The runtime's own
+  `Capabilities` report the File families as
+  `CapabilityUnavailable::SeparateLibrary`. On Linux, macOS and Android the
+  File library needs the Advanced SDK runtime. See the
+  [File API guide](docs/file-io.md).
+- `FrameSync::audio_input_format` and `AudioInputFormat`: the format of the
+  audio a FrameSync is receiving, without capturing samples.
+- `FrameSyncAudioRequest::for_input(format, num_samples)`: a request at the
+  sample rate and channel count of an `AudioInputFormat`, to capture in the
+  source's format. Query the format again and rebuild the request to follow a
+  change.
+- Examples for runtime selection, routing, the Discovery Server, the File API
+  and each Advanced SDK capability.
+
+### Changed
+
+- The `image-encoding` feature adds the `image-webp` dependency, which is
+  pure Rust with no `unsafe` code. `Error::Io` exists with `image-encoding`
+  as well as `file-io`, for the writer given to `encode_image_to`.
+- `Receiver`, in every mode, and `FrameSync` are `RefUnwindSafe`, so a shared
+  reference to one can cross `catch_unwind`. Their shared state has no lock
+  that a panic can leave half-changed.
+- `AudioFrame`'s `Debug` output lists the same fields as `AudioFrameRef`'s
+  and `FrameSyncAudioRef`'s: sample rate, channel and sample counts,
+  timecode, format, channel stride, metadata and timestamp. It no longer
+  prints every sample or the frame's internal layout.
+- Without the `advanced` feature, building for Windows, macOS, Linux and
+  Android needs no NDI SDK, no `libclang` and no bindgen: the bindings are
+  generated from the SDK headers ahead of time and are part of the crate. The
+  documentation builds without an SDK, and the crate's `documentation` link
+  points to docs.rs.
+- `NDI_SDK_DIR` is read only by builds with the `advanced` feature, to find
+  the Advanced SDK headers, and by builds for Apple mobile targets, to find the
+  static archive. In those builds a set value must name an SDK installation;
+  every other build ignores it, and changing it no longer rebuilds them.
+  Without it, an `advanced` build looks only in the Advanced SDK installer's
+  default directory.
+- The package's license expression is `Apache-2.0 AND MIT`: the vendored
+  bindings carry the MIT notice of the SDK headers they are generated from.
+- The published package contains only the sources, examples, build scripts,
+  README, changelog and license. The tests and the guides under `docs/` are not
+  in it.
+- `Debug` for `Ndi` prints `Ndi { .. }`, and the derived `Debug` of `Sender`,
+  which holds an `Ndi`, changes with it.
+- An SDK error frame, which the SDK reports for a lost connection, gives the
+  same `Error::CaptureFailed` message from `Receiver` capture,
+  `Receiver::poll_event` and `advanced::PacketReceiver::capture`, and every
+  audio path reports an invalid sample rate with the same message.
+- On Windows, flushing one sender's async video (`flush_async_blocking`,
+  `finish_video_async`, or dropping it with a frame in flight) no longer
+  waits for other senders' flushes. Flushes of one sender were already
+  serialized by that sender.
+
+### Removed
+
+- The build-time dependency on bindgen for the default feature set. Without
+  the `advanced` feature the build no longer reads `LIBCLANG_PATH`,
+  `CLANG_PATH`, `BINDGEN_EXTRA_CLANG_ARGS` or `SDKROOT`. With it, bindgen and
+  libclang may still read some of them when an Advanced SDK is found, but
+  changing them no longer re-runs the build script.
+- The `num_enum` dependency.
+- The API documentation is no longer published to GitHub Pages. The reference
+  is on docs.rs.
+
+### Fixed
+
+- The SDK no longer reads past the buffer of a UYVY or UYVA frame the crate
+  sends. The x86 builds of the SDK read up to 28 bytes after the last pixel
+  of many such frames, a 720×480 or an interlaced 1920×1080 frame among them
+  though not a progressive 1280×720, 1920×1080 or 3840×2160 one, and compress
+  what they find into the picture's last blocks; the SDK documents no such
+  need. `PixelFormat::send_tail_room` is the room the crate now keeps after a
+  frame for it: 64 zero bytes for those two formats, none for the others, and
+  none on 64-bit ARM Linux, whose SDK reads frames exactly.
+  - A `VideoFrame` holds the room in its pixel allocation. A UYVY or UYVA
+    vector given to `VideoFrameBuilder::data` or `VideoFrame::replace_data`
+    without that much spare capacity is grown once, which may move it.
+  - `Sender::send_video` sends a UYVY or UYVA `BorrowedVideoFrame` from a
+    copy when its buffer ends within that many bytes of the frame's last
+    pixel, in one buffer that the sender keeps and reuses. The copy adds
+    about 15% to the time of a 1920×1080 send and 54% to a 3840×2160 one. A
+    buffer that extends further, by padding its last row or by being longer
+    than the frame, is sent in place as before, and so is one whose caller
+    vouches for readable memory after it with the new `unsafe`
+    `BorrowedVideoFrameBuilder::readable_after`.
+    `BorrowedVideoFrame::sends_in_place` tells which a frame is.
+  - An interlaced or single-field UYVY or UYVA frame whose height is not a
+    multiple of four, which the SDK reads up to two rows past, gets two line
+    strides more room.
+
+  See [SDK validation](docs/sdk-validation.md#reads-past-the-end-of-sent-video).
+- A status or source change that an `AsyncReceiver` capture passed over was
+  kept for `Receiver::poll_event`, which async code could not reach, so it was
+  never read. `AsyncReceiver::poll_event` returns it.
+- An unchanged Cargo invocation no longer rebuilds the crate and the crates
+  that depend on it. In 2.0.0 the build script's own generated file was one of
+  its inputs (#121).
+- On Linux, an Advanced SDK directory in the default location that is not a
+  usable SDK no longer fails the build; the build continues without the
+  Advanced declarations, as when no SDK is installed.
+- `Ndi::new` no longer writes diagnostics to standard error in Windows debug
+  builds when the `CI` environment variable is set.
+- `Finder` no longer writes a warning to standard error in debug builds when
+  it leaves a malformed source out of a snapshot.
+- Source names, addresses and advertised metadata are read from the SDK only
+  up to the 4 MiB that a Discovery Server string may take, instead of until a
+  terminator however far away. A `Finder` snapshot or `sources_with_metadata`
+  leaves out a source with a longer string, as it leaves out a malformed one,
+  and `Sender::source`, `Router::source` and `FilePlayer::advertised_source`
+  report it as `Error::UnexpectedSdkResult`.
+- Every SDK wait rounds its `Duration` up to whole milliseconds, so only
+  `Duration::ZERO` polls without blocking. A wait shorter than a millisecond
+  was a non-blocking poll, and the finder's, receiver's and packet receiver's
+  deadline loops repeated 0 ms SDK calls through the last fraction of every
+  budget instead of waiting it out.
+- NV12 frames with an odd line stride are accepted by every path, as 2.0's
+  `PixelFormatInfo::try_buffer_len`, now `buffer_len`, already accepted them:
+  received frames, `BorrowedVideoFrame` and the Advanced allocators refused
+  them. YV12 and I420 still need an even stride and height, and NV12 an even
+  height.
+- `Receiver::poll_event` held the receiver's capture guard for its whole
+  timeout in one SDK call, so `reconnect`, `connect_to` and `disconnect`, and
+  every capture queued behind them, waited up to that timeout. It now runs in
+  the capture verbs' loop: attempts of at most 100 ms, each taking a pending
+  event first. A reconnect waits for one attempt at most, and `poll_event`
+  returns `None` only once its whole timeout is spent; `Duration::ZERO` still
+  makes one non-blocking attempt. Every native receiver capture now takes the
+  guard's proof as an argument, so none can be made without it.
 
 ## [2.1.0] - 2026-11-13
 
@@ -45,15 +645,6 @@ linkage and Rust 1.88 baseline.
   borrowed format queries, and the measured basis and limits of thread safety.
 - Clarify that unchanged tally polls can return `None`, and that async receiver
   wrappers do not expose retained status notifications.
-
-## [2.0.1] - 2026-11-10
-
-### Fixed
-
-- Stop rebuilding grafton-ndi and dependent crates on unchanged Cargo invocations
-  by excluding the generated bindgen wrapper from build-script inputs. SDK headers
-  and `NDI_SDK_DIR` changes still trigger binding regeneration (#121).
-- Check repeated builds and test compilation in CI to catch unnecessary rebuilds.
 
 ## [2.0.0] - 2026-10-16
 

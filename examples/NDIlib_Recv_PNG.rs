@@ -9,20 +9,20 @@
 //!
 //! 1. Using `receiver.video().capture()` for reliable frame capture with
 //!    automatic retry logic (handles NDI SDK timeout quirks internally)
-//! 2. `VideoFrame::encode_png()` for crate-provided image conversion
-//! 3. Correct handling for RGBX/BGRX padding bytes and padded rows
+//! 2. `VideoFrame::encode_png()` for crate-provided image conversion, which
+//!    handles RGBX/BGRX padding bytes and padded rows
 //!
-//! Run with: `cargo run --example NDIlib_Recv_PNG`
+//! Run with: `cargo run --features image-encoding --example NDIlib_Recv_PNG`
 //!
-//! If default features are disabled, add `--features image-encoding`.
+//! The `image-encoding` feature is off by default and this example needs it.
 //!
 //! Optional arguments:
-//! - IP address to search: `cargo run --example NDIlib_Recv_PNG -- 192.168.0.100`
-//! - Multiple IPs: `cargo run --example NDIlib_Recv_PNG -- 192.168.0.100 10.0.0.0/24`
-//! - Custom output file: `cargo run --example NDIlib_Recv_PNG -- --output MyImage.png`
-//! - Both: `cargo run --example NDIlib_Recv_PNG -- 192.168.0.100 --output MyImage.png`
+//! - IP address to search: `cargo run --features image-encoding --example NDIlib_Recv_PNG -- 192.168.0.100`
+//! - Multiple IPs: `cargo run --features image-encoding --example NDIlib_Recv_PNG -- 192.168.0.100 10.0.0.0/24`
+//! - Custom output file: `cargo run --features image-encoding --example NDIlib_Recv_PNG -- --output MyImage.png`
+//! - Both: `cargo run --features image-encoding --example NDIlib_Recv_PNG -- 192.168.0.100 --output MyImage.png`
 
-use grafton_ndi::{Error, Receiver, ReceiverColorFormat, ReceiverOptions, NDI};
+use grafton_ndi::{Ndi, Receiver, ReceiverColorFormat, ReceiverOptions};
 
 use std::{
     env, fs,
@@ -32,7 +32,7 @@ use std::{
 #[path = "common/mod.rs"]
 mod common;
 
-fn main() -> Result<(), Error> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     let mut extra_ips = Vec::new();
     let mut output_file = "CoolNDIImage.png";
@@ -53,7 +53,7 @@ fn main() -> Result<(), Error> {
     println!("NDI Video Capture to PNG Example");
     println!("=================================\n");
 
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
     println!("NDI initialized successfully");
 
     if output_file != "CoolNDIImage.png" {
@@ -75,16 +75,18 @@ fn main() -> Result<(), Error> {
 
     let first_source = &sources[0];
     println!("\nCreating receiver for: {first_source}");
-    let options = ReceiverOptions::builder(sources[0].clone())
-        .color(ReceiverColorFormat::RGBX_RGBA)
-        .build();
+    let options =
+        ReceiverOptions::new(sources[0].clone()).color_format(ReceiverColorFormat::RgbxRgba);
     let receiver = Receiver::new(&ndi, &options)?;
 
     println!("Receiver created successfully");
     println!("Waiting for video frames...\n");
 
     let start_time = Instant::now();
-    let video_frame = receiver.video().capture(Duration::from_secs(60))?;
+    let Some(video_frame) = receiver.video().capture(Duration::from_secs(60))? else {
+        println!("No video frame arrived within 60 seconds.");
+        return Ok(());
+    };
 
     let elapsed = start_time.elapsed();
     println!("Frame received after {elapsed:?}");
@@ -95,17 +97,17 @@ fn main() -> Result<(), Error> {
     println!("  Resolution: {width}x{height}");
     let fourcc = video_frame.pixel_format();
     println!("  Format: {fourcc:?}");
-    match video_frame.line_stride_or_size() {
-        grafton_ndi::LineStrideOrSize::LineStrideBytes(stride) => {
-            println!("  Line stride: {stride} bytes");
-        }
-    }
+    let stride = video_frame.line_stride_bytes();
+    println!("  Line stride: {stride} bytes");
     let data_size = video_frame.data().len();
     println!("  Data size: {data_size} bytes");
-    let frame_rate_n = video_frame.frame_rate_n();
-    let frame_rate_d = video_frame.frame_rate_d();
-    println!("  Frame rate: {frame_rate_n}/{frame_rate_d}");
-    let timecode = video_frame.timecode();
+    let frame_rate = video_frame.frame_rate();
+    println!(
+        "  Frame rate: {}/{}",
+        frame_rate.numerator(),
+        frame_rate.denominator()
+    );
+    let timecode = video_frame.timecode().ticks();
     println!("  Timecode: {timecode:016x}");
 
     println!("\nSaving frame as PNG...");

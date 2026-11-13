@@ -1,4 +1,15 @@
-use grafton_ndi::{Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions, NDI};
+//! Example: capturing video, audio and metadata from one receiver on three threads.
+//!
+//! Connects to the first source found and shares the receiver between a
+//! video, an audio and a metadata thread, each of which captures a few frames
+//! and reports what it received.
+//!
+//! Run with: `cargo run --example concurrent_capture`
+//!
+//! Optional arguments:
+//! - IP addresses to search: `cargo run --example concurrent_capture -- 192.168.0.100`
+
+use grafton_ndi::{Ndi, Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions};
 
 use std::{env, sync::Arc, thread, time::Duration};
 
@@ -11,9 +22,8 @@ fn main() -> Result<(), grafton_ndi::Error> {
     let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
 
     // Initialize NDI
-    let ndi = NDI::new()?;
-    let version = NDI::version()?;
-    println!("NDI version: {version}");
+    let ndi = Ndi::new()?;
+    println!("NDI version: {}", ndi.info().raw_version());
 
     // Create a finder to discover sources
     let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
@@ -38,12 +48,11 @@ fn main() -> Result<(), grafton_ndi::Error> {
     println!("\nConnecting to: {source}");
 
     // Create receiver
-    let options = ReceiverOptions::builder(source)
-        .color(ReceiverColorFormat::BGRX_BGRA)
+    let options = ReceiverOptions::new(source)
+        .color_format(ReceiverColorFormat::BgrxBgra)
         .bandwidth(ReceiverBandwidth::Highest)
         .allow_video_fields(true)
-        .name("Concurrent Capture Example")
-        .build();
+        .name("Concurrent Capture Example");
     let receiver = Receiver::new(&ndi, &options)?;
 
     // Wrap receiver in Arc for sharing between threads
@@ -58,13 +67,13 @@ fn main() -> Result<(), grafton_ndi::Error> {
             let mut frame_count = 0;
 
             for _ in 0..10 {
-                match recv_video.video().try_capture(Duration::from_secs(5)) {
+                match recv_video.video().capture(Duration::from_secs(5)) {
                     Ok(Some(frame)) => {
                         frame_count += 1;
                         let width = frame.width();
                         let height = frame.height();
-                        let frame_rate_n = frame.frame_rate_n();
-                        let frame_rate_d = frame.frame_rate_d();
+                        let frame_rate_n = frame.frame_rate().numerator();
+                        let frame_rate_d = frame.frame_rate().denominator();
                         println!(
                             "[VIDEO] Frame {frame_count}: {width}x{height} @ {frame_rate_n}/{frame_rate_d} fps"
                         );
@@ -90,7 +99,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
             let mut sample_count = 0;
 
             for _ in 0..10 {
-                match recv_audio.audio().try_capture(Duration::from_secs(5)) {
+                match recv_audio.audio().capture(Duration::from_secs(5)) {
                     Ok(Some(frame)) => {
                         sample_count += frame.num_samples();
                         let num_samples = frame.num_samples();
@@ -123,7 +132,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
             for _ in 0..20 {
                 match recv_metadata
                     .metadata()
-                    .try_capture(Duration::from_millis(2500))
+                    .capture(Duration::from_millis(2500))
                 {
                     Ok(Some(frame)) => {
                         metadata_count += 1;

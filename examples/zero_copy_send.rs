@@ -1,29 +1,27 @@
 //! Move owned frames into NDI and reuse two pixel allocations without per-send wrapper copies.
 //! SDK encoding and network processing may still copy data.
-use grafton_ndi::{PixelFormat, SenderOptions, VideoFrameBuilder, NDI};
+use grafton_ndi::{FrameRate, Ndi, PixelFormat, SenderOptions, VideoFrame};
 
 fn main() -> Result<(), grafton_ndi::Error> {
-    let ndi = NDI::new()?;
-    let options = SenderOptions::builder("Zero Copy Async Sender")
-        .clock_video(true)
-        .build();
+    let ndi = Ndi::new()?;
+    let options = SenderOptions::new("Zero Copy Async Sender").clock_video(true);
     let mut sender = grafton_ndi::Sender::new(&ndi, &options)?;
     let make_frame = || {
-        VideoFrameBuilder::new()
+        VideoFrame::builder()
             .resolution(1920, 1080)
-            .pixel_format(PixelFormat::BGRA)
-            .frame_rate(60, 1)
+            .pixel_format(PixelFormat::Bgra)
+            .frame_rate(FrameRate::new(60, 1)?)
             .build()
     };
     let first = make_frame()?;
     let mut available = make_frame()?;
-    assert!(sender.send_video_async(first).is_none());
+    assert!(sender.send_video_async(first)?.is_none());
 
     for frame_num in 1..300 {
         generate_test_pattern(available.data_mut(), 1920, 1080, frame_num);
         // The next submission completes the previous send before returning its frame.
         // Moving VideoFrame transfers its allocation; it does not copy its pixels.
-        available = sender.send_video_async(available).expect("previous frame");
+        available = sender.send_video_async(available)?.expect("previous frame");
     }
     let final_frame = sender.finish_video_async().expect("final pending frame");
     println!(
@@ -41,7 +39,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
 /// * `width` - Frame width in pixels
 /// * `height` - Frame height in pixels
 /// * `frame_num` - Current frame number for animation
-fn generate_test_pattern(buffer: &mut [u8], width: i32, height: i32, frame_num: u32) {
+fn generate_test_pattern(buffer: &mut [u8], width: u32, height: u32, frame_num: u32) {
     let width = width as usize;
     let height = height as usize;
 

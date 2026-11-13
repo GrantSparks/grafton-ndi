@@ -1,5 +1,5 @@
-error[E0451]: field `_private` of struct `NDI` is private
- --> tests/ui/fail/ndi_struct_constructor.rs:4:16
+error: cannot construct `Ndi` with struct literal syntax due to private fields
+ --> tests/ui/fail/ndi_struct_constructor.rs:4:10
   |
-4 |     drop(NDI { _private: () });
-  |                ^^^^^^^^ private field
+4 |     drop(Ndi {});
+  |          ^^^

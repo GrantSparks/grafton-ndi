@@ -1,25 +1,20 @@
 #![allow(unused)]
 
-use grafton_ndi::{
-    FrameSync, FrameSyncAudioRequest, Receiver, ReceiverOptions, Source, SourceAddress, NDI,
-};
+use grafton_ndi::{FrameSync, FrameSyncAudioRequest, Ndi, Receiver, ReceiverOptions, Source};
 
-fn receiver(ndi: &NDI) -> Receiver {
-    let source = Source {
-        name: "compile-contract".to_owned(),
-        address: SourceAddress::None,
-    };
-    let options = ReceiverOptions::builder(source).build();
+fn receiver(ndi: &Ndi) -> Receiver {
+    let source = Source::new("compile-contract");
+    let options = ReceiverOptions::new(source);
     Receiver::new(ndi, &options).unwrap()
 }
 
 fn main() {
-    let ndi = NDI::new().unwrap();
+    let ndi = Ndi::new().unwrap();
 
     let frame_ref = {
         let framesync = FrameSync::new(receiver(&ndi)).unwrap();
         framesync
-            .capture_audio(FrameSyncAudioRequest::query_input())
+            .capture_audio_ref(FrameSyncAudioRequest::capture_at(48_000, 2, 1024).unwrap())
             .unwrap()
     };
 

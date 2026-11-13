@@ -1,4 +1,17 @@
-use grafton_ndi::{Receiver, ReceiverBandwidth, ReceiverOptions, NDI};
+//! Example: monitoring a receiver's connection status.
+//!
+//! Connects a metadata-only receiver to the first source found, or to the
+//! first one whose name contains the `--source` text, and prints every status
+//! change it reports: the number of connections and whether the source
+//! supports PTZ. It runs until interrupted.
+//!
+//! Run with: `cargo run --example status_monitor`
+//!
+//! Optional arguments:
+//! - IP addresses to search: `cargo run --example status_monitor -- 192.168.0.100`
+//! - Source to monitor: `cargo run --example status_monitor -- --source "Camera 1"`
+
+use grafton_ndi::{Ndi, Receiver, ReceiverBandwidth, ReceiverEvent, ReceiverOptions};
 
 use std::{
     env,
@@ -29,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Initialize NDI
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
     println!("NDI initialized successfully");
 
     // Find sources
@@ -47,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source = if let Some(name) = source_name {
         sources
             .into_iter()
-            .find(|s| s.name.contains(&name))
+            .find(|s| s.name().contains(&name))
             .ok_or_else(|| format!("Source '{name}' not found"))?
     } else {
         println!("\nAvailable sources:");
@@ -59,9 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create receiver with metadata-only bandwidth to focus on status changes
-    let options = ReceiverOptions::builder(source.clone())
-        .bandwidth(ReceiverBandwidth::MetadataOnly)
-        .build();
+    let options = ReceiverOptions::new(source.clone()).bandwidth(ReceiverBandwidth::MetadataOnly);
     let receiver = Receiver::new(&ndi, &options)?;
 
     println!("\nMonitoring status changes for: {source}");
@@ -71,16 +82,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Multiple changes may coalesce; refresh capabilities on each notification.
     // Monitor status changes
     loop {
-        if let Some(status) = receiver.poll_status_change(Duration::from_secs(1))? {
-            println!(
-                "[Status Change] Connections: {} (source capabilities may also have changed)",
-                status.connections
-            );
-            println!("PTZ supported: {}", receiver.ptz_is_supported());
-        } else {
-            // Timeout - could show a heartbeat here
-            print!(".");
-            io::stdout().flush()?;
+        match receiver.poll_event(Duration::from_secs(1))? {
+            Some(ReceiverEvent::StatusChanged(status)) => {
+                println!(
+                    "[Status Change] Connections: {} (source capabilities may also have changed)",
+                    status.connections()
+                );
+                println!("PTZ supported: {}", receiver.ptz().is_supported());
+            }
+            Some(_) => {}
+            None => {
+                // Timeout - could show a heartbeat here
+                print!(".");
+                io::stdout().flush()?;
+            }
         }
     }
 }

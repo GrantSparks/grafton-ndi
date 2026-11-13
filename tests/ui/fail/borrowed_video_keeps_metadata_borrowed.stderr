@@ -3,13 +3,13 @@ error[E0505]: cannot move out of `metadata` because it is borrowed
    |
  4 |     let metadata = std::ffi::CString::new("<video/>").unwrap();
    |         -------- binding `metadata` declared here
- 5 |     let frame = BorrowedVideoFrame::builder(&pixels, 2, 2, PixelFormat::BGRA)
+ 5 |     let frame = BorrowedVideoFrame::builder(&pixels, 2, 2, PixelFormat::Bgra)
  6 |         .metadata(&metadata)
    |                   --------- borrow of `metadata` occurs here
 ...
  9 |     drop(metadata);
    |          ^^^^^^^^ move out of `metadata` occurs here
-10 |     let _ = frame.try_to_owned();
+10 |     let _ = frame.to_owned();
    |             ----- borrow later used here
    |
 help: consider cloning the value if the performance cost is acceptable

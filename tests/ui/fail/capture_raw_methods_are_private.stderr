@@ -8,3 +8,16 @@ error[E0624]: associated constant `FRAME_TYPE` is private
   |
   |     const FRAME_TYPE: NDIlib_frame_type_e;
   |     ------------------------------------- private associated constant defined here
+
+error[E0624]: associated function `ref_to_owned` is private
+ --> tests/ui/fail/capture_raw_methods_are_private.rs:6:8
+  |
+6 |       K::ref_to_owned(frame)
+  |          ^^^^^^^^^^^^ private associated function
+  |
+ ::: src/capture.rs
+  |
+  | /     fn ref_to_owned(frame: &<Self as CaptureKind>::Ref<'_>) -> <Self as CaptureKind>::Owned
+  | |     where
+  | |         Self: CaptureKind;
+  | |__________________________- private associated function defined here

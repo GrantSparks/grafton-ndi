@@ -1,359 +1,430 @@
-name: Rust CI/CD
+name: CI
 
 on:
   push:
-    branches: ["main", "release/2.x-maintenance"]
-    tags: ["*"]
+    branches: [main]
   pull_request:
-    branches: ["main", "release/2.x-maintenance"]
+    branches: [main]
   workflow_dispatch:
+  workflow_call:
+    secrets:
+      NDI_SDK_SOURCES_JSON:
+        required: false
+      NDI_SDK_ARCHIVE_TOKEN:
+        required: false
 
+permissions:
+  contents: read
+
+# A new push to a pull request replaces its running check. Runs for main, for
+# manual dispatches and for releases are never cancelled or queued behind each other.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
-  NDI_SDK_URL: ${{ secrets.NDI_SDK_URL || 'https://downloads.ndi.tv/SDK/NDI_SDK/NDI%206%20SDK.exe' }}
-  NDI_SDK_URL_MACOS: ${{ secrets.NDI_SDK_URL_MACOS || 'https://downloads.ndi.tv/SDK/NDI_SDK_Mac/Install_NDI_SDK_v6_Apple.pkg' }}
-  NDI_SDK_URL_LINUX: ${{ secrets.NDI_SDK_URL_LINUX || 'https://downloads.ndi.tv/SDK/NDI_SDK_Linux/Install_NDI_SDK_v6_Linux.tar.gz' }}
-  NDI_SDK_URL_ANDROID: ${{ secrets.NDI_SDK_URL_ANDROID || 'https://downloads.ndi.tv/SDK/NDI_SDK_Android/Install_NDI_SDK_v6_Android.tar.gz' }}
-  LLVM_VERSION: "20.1.8"
-  CACHE_VERSION: v1
+  ACTIONLINT_VERSION: 1.7.12
+  ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
 
 jobs:
-  # Quick format check (no dependencies needed)
-  format:
-    name: Format Check
+  # The crate builds without an NDI SDK, so everything in lint, test and cross
+  # runs for every event, including pull requests from forks.
+  lint:
+    name: lint
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: CI scripts and workflows
+        run: |
+          python -m unittest discover -s ci/tests
+          shellcheck ci/*.sh ci/offline/*.sh scripts/*.sh
+          curl --fail --silent --show-error --location --output "$RUNNER_TEMP/actionlint.tar.gz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check --quiet
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint"
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: |
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+          for features in "" image-encoding tokio smol advanced file-io advanced,file-io; do
+            cargo clippy --locked --all-targets --no-default-features ${features:+--features "$features"} -- -D warnings
+          done
+      - name: Bindings generator tests
+        run: cargo test --locked --package xtask
+      - name: Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps --all-features
+      - name: Minimum supported Rust version
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          cargo +1.88.0 check --locked --workspace --all-targets --all-features
+      - name: Packaged crate builds
+        run: cargo package --locked --package grafton-ndi
+      # Skipped while the crate's major version is ahead of every published
+      # release: nothing constrains a new major version.
+      - name: Semver check against the last release
+        run: python ci/semver.py
+      - name: Dependency advisories
+        run: |
+          cargo install cargo-audit --version 0.23.0 --locked
+          cargo audit --deny warnings
 
-  audit:
-    name: Dependency audit
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-      # Libraries do not track Cargo.lock; resolve all optional/target dependencies.
-      - run: cargo generate-lockfile
-      - run: cargo audit --deny warnings
-
-  # Combined setup and test job
-  test-and-lint:
-    name: Test & Lint
+  test:
+    name: test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-latest, macos-latest]
+        os: [ubuntu-24.04, macos-15, windows-2025]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # No NDI runtime is installed here: tests that need one report a skip.
+      - name: Tests, all features
+        run: cargo test --locked --all-features
+      - name: Tests, default features
+        run: cargo test --locked
 
-      # Setup NDI SDK (Windows)
-      - uses: ./.github/actions/setup-ndi-windows
-        if: runner.os == 'Windows'
-        with:
-          save-cache: 'true'
-
-      # Setup NDI SDK (macOS)
-      - uses: ./.github/actions/setup-ndi-macos
-        if: runner.os == 'macOS'
-        with:
-          save-cache: 'true'
-
-      # Setup NDI SDK (Linux)
-      - uses: ./.github/actions/setup-ndi-linux
-        if: runner.os == 'Linux'
-        with:
-          save-cache: 'true'
-
-      # Setup Rust
-      - uses: dtolnay/rust-toolchain@stable
+  cross:
+    name: cross
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      TARGETS: >-
+        aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf i686-unknown-linux-gnu
+        aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+        x86_64-pc-windows-msvc i686-pc-windows-msvc
+        aarch64-apple-darwin x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
-
-      # Rust caching with optimizations
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # Don't cache the entire target directory, just dependencies
-          cache-targets: false
-          # Use a shared cache key to avoid saving the same dependencies multiple times
-          shared-key: "rust-cache-2.0-${{ matrix.os }}"
-          # Only save cache on main branch to avoid cache thrashing
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Check unchanged builds stay fresh
-        shell: bash
-        env:
-          CARGO_TERM_COLOR: never
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Clippy for every dynamically loaded target
         run: |
-          cargo build
-          build_log=$(mktemp)
-          cargo build 2>&1 | tee "$build_log"
-          if grep -Eq '^[[:space:]]*Compiling grafton-ndi v' "$build_log"; then
-            echo "Unchanged cargo build recompiled grafton-ndi"
+          read -r -a targets <<< "$TARGETS"
+          rustup target add "${targets[@]}"
+          failed=()
+          for target in "${targets[@]}"; do
+            cargo clippy --locked --all-targets --all-features --target "$target" -- -D warnings || failed+=("$target")
+          done
+          if [ "${#failed[@]}" -ne 0 ]; then
+            echo "::error::clippy failed for: ${failed[*]}"
             exit 1
           fi
+      - name: Link the examples for Android
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" scripts/build-android.sh aarch64-linux-android
 
-          cargo test --no-run
-          cargo test --no-run 2>&1 | tee "$build_log"
-          if grep -Eq '^[[:space:]]*Compiling grafton-ndi v' "$build_log"; then
-            echo "Unchanged cargo test --no-run recompiled grafton-ndi"
-            exit 1
-          fi
-          rm "$build_log"
-
-      - name: Run receiver status SDK regression
-        run: cargo test --all-features --test receiver_status_notifications -- --ignored --nocapture
-
-      # Run all checks
-      - name: Run tests
-        run: |
-          # First run diagnostic tests on Windows
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            echo "Running Windows DLL diagnostics..."
-            cargo test --test windows_dll_check -- --nocapture
-            cargo test --test diagnose_windows_ci test_ndi_environment -- --nocapture
-          fi
-
-          # Run all tests including integration tests
-          # The NDI runtime libraries are now available via the setup actions
-          cargo test --all-features --verbose
-        shell: bash
-        env:
-          TMPDIR: ${{ runner.temp }}
-
-      - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Build and test examples
-        run: |
-          cargo build --examples
-          cargo build --examples --all-features
-          cargo test --examples --all-features
-
-      - name: Run SDK lifecycle regressions
-        run: cargo test --all-features --test async_send_lifecycle --test sender_lifecycle_stress -- --ignored
-
-      - name: Run video padding and FrameSync recovery SDK regression
-        if: runner.os == 'Linux'
-        run: cargo test --all-features --test video_padding_sdk -- --ignored --nocapture
-
-      - name: Run FrameSync audio SDK regression
-        run: cargo test --all-features --test framesync_audio_requests -- --ignored --nocapture
-
-      - name: Check independent feature configurations
-        if: runner.os == 'Linux'
-        run: |
-          cargo test --no-default-features
-          cargo build --examples --no-default-features
-          cargo test --no-default-features --features tokio
-          cargo build --examples --no-default-features --features tokio
-          cargo test --no-default-features --features smol
-          cargo build --examples --no-default-features --features smol
-          cargo test --no-default-features --features tokio,smol
-          cargo build --examples --no-default-features --features tokio,smol
-          cargo test
-          cargo check --no-default-features --features advanced_sdk
-
-      # Documentation lint runs once; rustdoc lints are platform-independent.
-      - name: Check documentation
-        if: runner.os == 'Linux'
-        run: cargo doc --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-
-      # rust-cache v2 scans target/tests even with cache-targets disabled. Its
-      # unawaited nested cleanup reports ENOENT for trybuild's absent
-      # target/tests/target. Keep consumed, uncached outputs outside its traversal.
-      - name: Move compile-contract scratch artifacts out of the workspace
-        shell: python
-        run: |
-          import os
-          from pathlib import Path
-          import shutil
-          import tempfile
-
-          scratch = Path("target/tests")
-          if scratch.exists():
-              destination = tempfile.mkdtemp(prefix="grafton-contracts-", dir=os.environ["RUNNER_TEMP"])
-              shutil.move(str(scratch), destination)
-
-  android:
-    name: Android (${{ matrix.target }})
-    runs-on: ubuntu-24.04
+  # This job needs the private SDK archives, so it runs only where the secrets
+  # exist: not for pull requests from forks, and not for Dependabot, whose runs
+  # are given none. The repository variable NDI_CI_RELEASED switches it on, and
+  # required-ci treats a skip anywhere else as a failure.
+  #
+  # The job as a whole is the trust boundary for those secrets. Only the
+  # provisioning step is given them in its environment, but every step runs on
+  # the machine they were sent to, with administrator rights: the tests, every
+  # build script and procedural macro in Cargo.lock, and whatever a step installs.
+  #
+  # No dependency cache and no uploads: SDK files and the Advanced bindings
+  # generated into the target directory must stay on the runner.
+  sdk:
+    name: sdk (${{ matrix.name }})
+    if: >-
+      vars.NDI_CI_RELEASED == 'true' && github.actor != 'dependabot[bot]' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     strategy:
       fail-fast: false
+      # `require` lists what the row's SDK lets an all-features build check. The
+      # tests read it from GRAFTON_NDI_REQUIRE_RUNTIME and fail where they would
+      # otherwise skip:
+      #   1                 an NDI runtime (implied by every other entry)
+      #   advanced          an Advanced runtime, compiled with its headers
+      #   file              a File library the selected runtime can drive
+      #   discovery-server  the SDK's Discovery Server program (Linux, 6.4)
+      #   h264-decoder      an NDI|HX decoder for H.264 (built into the runtime
+      #                     on macOS; on Linux, the driver package a row names
+      #                     in `hx-driver`, copied beside its runtime)
+      #   hevc-444-decoder  the same for HEVC 4:4:4, with a 6.4 runtime
+      # No Windows row promises a decoder yet: the hosted Windows runners gave
+      # black placeholder frames for HEVC 4:4:4, and H.264 is unmeasured there.
+      # Each step promises exactly what its build can check. A build without the
+      # advanced and file-io features can check only `1` and `discovery-server`, so
+      # the no-default-features step promises `require-no-default`, or `1` in a
+      # row that does not set it.
       matrix:
-        target: [aarch64-linux-android, armv7-linux-androideabi, i686-linux-android, x86_64-linux-android]
+        include:
+          - name: linux-x64 standard-6.1.1
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            package: 6.1.1-standard-linux
+            require: '1'
+          - name: linux-x64 standard-6.3.2
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            package: 6.3.2-standard-linux
+            require: '1'
+          - name: linux-x64 advanced-6.3.2
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            package: 6.3.2-advanced-linux
+            require: advanced
+          - name: linux-x64 standard-6.4
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            package: current-standard-linux
+            require: 1,discovery-server
+            require-no-default: 1,discovery-server
+            bindings: true
+          - name: linux-x64 advanced-6.4
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            package: current-advanced-linux
+            hx-driver: current-hx-driver-linux
+            compatibility: 6.1.1-standard-linux
+            compatibility-advanced: 6.3.2-advanced-linux
+            require: advanced,file,discovery-server,h264-decoder,hevc-444-decoder
+            require-no-default: 1,discovery-server
+          - name: linux-x86 standard-6.4
+            runner: ubuntu-24.04
+            target: i686-unknown-linux-gnu
+            package: current-standard-linux
+            require: 1,discovery-server
+            require-no-default: 1,discovery-server
+          - name: linux-arm64 standard-6.4
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            package: current-standard-linux
+            require: 1,discovery-server
+            require-no-default: 1,discovery-server
+          - name: windows-x64 standard-6.3.2
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            package: 6.3.2-standard-windows
+            require: '1'
+          - name: windows-x64 advanced-6.3.2
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            package: 6.3.2-advanced-windows
+            require: advanced,h264-decoder
+          - name: windows-x64 standard-6.4
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            package: current-standard-windows
+            require: 1,file
+          - name: windows-x64 advanced-6.4
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            package: current-advanced-windows
+            compatibility: 6.3.2-standard-windows
+            compatibility-advanced: 6.3.2-advanced-windows
+            require: advanced,file,h264-decoder
+          - name: windows-x86 advanced-6.4
+            runner: windows-2025
+            target: i686-pc-windows-msvc
+            package: current-advanced-windows
+            require: advanced,h264-decoder
+          - name: macos-arm64 standard-6.3.2
+            runner: macos-15
+            target: aarch64-apple-darwin
+            package: 6.3.2-standard-apple
+            require: '1'
+          - name: macos-arm64 advanced-6.3.2
+            runner: macos-15
+            target: aarch64-apple-darwin
+            package: 6.3.2-advanced-apple
+            require: advanced,h264-decoder
+          - name: macos-arm64 standard-6.4
+            runner: macos-15
+            target: aarch64-apple-darwin
+            package: current-standard-apple
+            require: '1'
+            apple-mobile: true
+          - name: macos-arm64 advanced-6.4
+            runner: macos-15
+            target: aarch64-apple-darwin
+            package: current-advanced-apple
+            compatibility: 6.3.2-standard-apple
+            compatibility-advanced: 6.3.2-advanced-apple
+            require: advanced,file,h264-decoder,hevc-444-decoder
+            apple-mobile: true
+          - name: macos-x64 standard-6.4
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            package: current-standard-apple
+            require: '1'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      TARGET: ${{ matrix.target }}
+      PACKAGE: ${{ matrix.package }}
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: ./.github/actions/setup-ndi-linux
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
-          platform: android
-      - uses: dtolnay/rust-toolchain@stable
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
-      - name: Install Android NDK
-        run: |
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'ndk;27.3.13750724'
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.3.13750724" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: android-${{ matrix.target }}
-      - name: Link examples with the Android SDK
-        run: scripts/build-android.sh "$NDI_TARGET"
-        env:
-          NDI_TARGET: ${{ matrix.target }}
-
-  msrv:
-    name: Library MSRV (Rust 1.88)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: ./.github/actions/setup-ndi-linux
-        with:
-          save-cache: 'false'
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - run: cargo check --all-targets --all-features
-      # Compile-diagnostic fixtures remain on stable in test-and-lint.
-      - run: cargo test --lib --all-features
-
-  # Semver check runs on all platforms
-  semver:
-    name: Check semver
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7.0.1
-        with:
-          fetch-depth: 0
-
-      # Setup NDI SDK (Windows)
-      - uses: ./.github/actions/setup-ndi-windows
-        if: runner.os == 'Windows'
-        with:
-          save-cache: 'false'
-
-      # Setup NDI SDK (macOS)
-      - uses: ./.github/actions/setup-ndi-macos
-        if: runner.os == 'macOS'
-        with:
-          save-cache: 'false'
-
-      # Setup NDI SDK (Linux)
-      - uses: ./.github/actions/setup-ndi-linux
+          components: clippy, rustfmt
+      - name: Linux prerequisites
         if: runner.os == 'Linux'
-        with:
-          save-cache: 'false'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap libavahi-client3
+          # Ubuntu 24.04 denies the unprivileged user namespace that bwrap needs.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      # Only the Advanced headers and the bindings check run bindgen.
+      - name: Linux libclang
+        if: runner.os == 'Linux' && (contains(matrix.package, 'advanced') || matrix.bindings)
+        run: sudo apt-get install --yes --no-install-recommends libclang-dev
+      - name: 32-bit Linux linker and runtime dependencies
+        if: matrix.target == 'i686-unknown-linux-gnu'
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends gcc-multilib libc6-dev:i386 libavahi-client3:i386
+      - name: Windows libclang
+        if: runner.os == 'Windows' && contains(matrix.package, 'advanced')
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'C:\Program Files\LLVM\bin\clang.exe')) { choco install llvm --version=20.1.8 -y }
+          'LIBCLANG_PATH=C:\Program Files\LLVM\bin' | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      # The only step that is given the acquisition secrets. It exports
+      # NDI_SDK_DIR and NDI_RUNTIME_DIR_V6 for the steps that follow, and copies
+      # a row's `hx-driver` beside that runtime. The compatibility runs' baseline
+      # runtimes get none: those runs promise no decoder, and a driver is pinned
+      # together with the SDK release of its own build.
+      - name: Provision the SDK
+        id: sdk
+        env:
+          NDI_SDK_SOURCES_JSON: ${{ secrets.NDI_SDK_SOURCES_JSON }}
+          NDI_SDK_ARCHIVE_TOKEN: ${{ secrets.NDI_SDK_ARCHIVE_TOKEN }}
+        run: |
+          python ci/sdk.py install "$PACKAGE" --dest "$RUNNER_TEMP/ndi-sdk" --target "$TARGET" --github-env "$GITHUB_ENV" --github-output "$GITHUB_OUTPUT"
+          if [ -n "${{ matrix.hx-driver }}" ]; then
+            python ci/sdk.py install-driver "${{ matrix.hx-driver }}" --sdk "$RUNNER_TEMP/ndi-sdk" --target "$TARGET"
+          fi
+          if [ -n "${{ matrix.compatibility }}" ]; then
+            python ci/sdk.py install "${{ matrix.compatibility }}" --dest "$RUNNER_TEMP/ndi-compat" --target "$TARGET" --github-env "$RUNNER_TEMP/ndi-compat-standard.env"
+            python ci/sdk.py install "${{ matrix.compatibility-advanced }}" --dest "$RUNNER_TEMP/ndi-compat-advanced" --target "$TARGET" --github-env "$RUNNER_TEMP/ndi-compat-advanced.env"
+          fi
+      # Windows has no test runner to check: its tests run unconfined
+      # (ci/README.md, "Windows").
+      - name: Test runner leaves loopback networking only
+        id: isolation
+        run: |
+          case "$RUNNER_OS" in
+            Linux) python ci/offline/check.py --online && ci/offline/linux.sh python3 ci/offline/check.py ;;
+            macOS) python ci/offline/check.py --online && ci/offline/macos.sh python3 ci/offline/check.py ;;
+            Windows) echo 'Windows runs the runtime tests without a loopback-only runner.' ;;
+          esac
+      # Each runtime step is bounded well inside the job's limit (it takes 7
+      # minutes at most when it passes), so that a test that never returns
+      # fails its step, and every test binary runs, so that one failing does
+      # not hide the outcomes of the rest. For the same reason every step from here on runs
+      # whatever the steps before it did, once the runner was shown to isolate:
+      # a run then reports everything that is wrong with a row, not the first
+      # thing.
+      - name: Tests against the real runtime, all features
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' }}
+        timeout-minutes: 20
+        env:
+          GRAFTON_NDI_REQUIRE_RUNTIME: ${{ matrix.require }}
+        run: cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features
+      - name: Tests against the real runtime, no default features
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' }}
+        timeout-minutes: 10
+        env:
+          GRAFTON_NDI_REQUIRE_RUNTIME: ${{ matrix.require-no-default || '1' }}
+        run: cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --no-default-features
+      # Without the Advanced headers the advanced feature compiles to stubs, so
+      # only a build that has them lints and documents the real implementation.
+      - name: Lint and document the Advanced implementation
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && contains(matrix.package, 'advanced') }}
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo clippy --locked --all-targets --target "$TARGET" --all-features -- -D warnings
+          cargo clippy --locked --all-targets --target "$TARGET" --no-default-features --features advanced -- -D warnings
+          cargo clippy --locked --all-targets --target "$TARGET" --no-default-features --features advanced,file-io -- -D warnings
+          cargo doc --locked --no-deps --target "$TARGET" --all-features
+      - name: Vendored bindings are current
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.bindings }}
+        run: cargo xtask bindgen --check --sdk "$NDI_SDK_DIR"
+      - name: Build for the statically linked Apple mobile targets
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.apple-mobile }}
+        run: ci/apple-mobile.sh
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Current Advanced headers with baseline runtimes
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.compatibility }}
+        timeout-minutes: 25
+        run: |
+          export GRAFTON_NDI_PEER_RUNTIME="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_RUNTIME }}"
+          export GRAFTON_NDI_PEER_VERSION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_VERSION }}"
+          export GRAFTON_NDI_PEER_EDITION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_EDITION }}"
+          for edition in standard advanced; do
+            while IFS='=' read -r name value; do export "$name=$value"; done < "$RUNNER_TEMP/ndi-compat-$edition.env"
+            export NDI_SDK_DIR="${{ steps.sdk.outputs.NDI_SDK_DIR }}"
+            if [ "$edition" = advanced ]; then export GRAFTON_NDI_REQUIRE_RUNTIME=advanced; else export GRAFTON_NDI_REQUIRE_RUNTIME=1; fi
+            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features
+          done
+      # A Standard baseline SDK has no headers a build reads, so its pass is a
+      # build without Advanced declarations, which cannot check `advanced`. No
+      # compatibility pass promises an NDI|HX decoder; the row's own runs do.
+      - name: Baseline SDK builds with the current Advanced runtime
+        if: ${{ !cancelled() && steps.isolation.outcome == 'success' && matrix.compatibility }}
+        timeout-minutes: 25
+        run: |
+          for edition in standard advanced; do
+            while IFS='=' read -r name value; do export "$name=$value"; done < "$RUNNER_TEMP/ndi-compat-$edition.env"
+            export GRAFTON_NDI_PEER_RUNTIME="$GRAFTON_NDI_EXPECTED_RUNTIME"
+            export GRAFTON_NDI_PEER_VERSION="$GRAFTON_NDI_EXPECTED_VERSION"
+            export GRAFTON_NDI_PEER_EDITION="$GRAFTON_NDI_EXPECTED_EDITION"
+            export NDI_RUNTIME_DIR_V6="${{ steps.sdk.outputs.NDI_RUNTIME_DIR_V6 }}"
+            export GRAFTON_NDI_EXPECTED_RUNTIME="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_RUNTIME }}"
+            export GRAFTON_NDI_EXPECTED_VERSION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_VERSION }}"
+            export GRAFTON_NDI_EXPECTED_EDITION="${{ steps.sdk.outputs.GRAFTON_NDI_EXPECTED_EDITION }}"
+            require="${{ matrix.require }}"
+            require="${require/,h264-decoder/}"; require="${require/,hevc-444-decoder/}"
+            if [ "$edition" = standard ]; then require="${require/advanced/1}"; fi
+            export GRAFTON_NDI_REQUIRE_RUNTIME="$require"
+            cargo test --locked --config ci/offline.toml --target "$TARGET" --no-fail-fast --all-features
+          done
 
-      # Rust caching - read-only, don't save
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: false
-          shared-key: "rust-cache-2.0-${{ matrix.os }}"
-          save-if: false  # Let test-and-lint job handle saving
-
-      - uses: obi1kenobi/cargo-semver-checks-action@v2
-        with:
-          baseline-rev: v2.0.0
-          release-type: minor
-
-  # Build and publish API documentation to GitHub Pages.
-  #
-  # Bindgen needs an installed NDI SDK. The docs.rs environment does not
-  # include that installation, so build and host documentation from CI,
-  # where the SDK is configured by the platform setup action.
-  docs:
-    name: Publish docs
-    needs: [format, audit, test-and-lint, android, semver, msrv]
-    if: github.ref == 'refs/heads/main'
+  required-ci:
+    name: required-ci
+    if: always()
+    needs: [lint, test, cross, sdk]
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7.0.1
-
-      - uses: ./.github/actions/setup-ndi-linux
-        with:
-          save-cache: 'false'
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: false
-          shared-key: "rust-cache-2.0-ubuntu-24.04"
-          save-if: false
-
-      - name: Build documentation
-        run: cargo doc --no-deps --all-features
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Every job this event requires succeeded
         env:
-          RUSTDOCFLAGS: "-D warnings"
-
-      # docs.rs serves the crate root; replicate that with a redirect so the
-      # Pages root lands on the crate documentation.
-      - name: Add root redirect to crate docs
-        run: echo '<meta http-equiv="refresh" content="0; url=grafton_ndi/index.html">' > target/doc/index.html
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v5.0.0
-        with:
-          path: target/doc
-
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v5.0.1
-
-  # Publish job
-  publish:
-    name: Publish
-    needs: [format, audit, test-and-lint, android, msrv, semver]
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: windows-latest
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v7.0.1
-
-      # Setup NDI SDK and LLVM
-      - uses: ./.github/actions/setup-ndi-windows
-        with:
-          save-cache: 'false'
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      # Rust caching - read-only for publish job
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: false
-          shared-key: "rust-cache-2.0-windows-latest"
-          save-if: false  # Don't save cache in publish job
-
-      - name: Authenticate with crates.io
-        id: auth
-        uses: rust-lang/crates-io-auth-action@v1.0.5
-
-      - name: Publish to crates.io
-        run: cargo publish
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          RESULTS: ${{ toJSON(needs) }}
+          # The condition of the sdk job, without the switch that turns it on.
+          SDK_EXPECTED: >-
+            ${{ github.actor != 'dependabot[bot]' &&
+            (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        run: python3 ci/gate.py

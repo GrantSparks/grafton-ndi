@@ -1,0 +1,109 @@
+error[E0277]: `*mut grafton_ndi::sys::bindings::NDIlib_routing_instance_type` cannot be shared between threads safely
+  --> tests/ui/fail/discovery_and_routing_owners_are_not_sync.rs:15:19
+   |
+15 |     assert_sync::<Router>();
+   |                   ^^^^^^ `*mut grafton_ndi::sys::bindings::NDIlib_routing_instance_type` cannot be shared between threads safely
+   |
+   = help: within `Router`, the trait `Sync` is not implemented for `*mut grafton_ndi::sys::bindings::NDIlib_routing_instance_type`
+note: required because it appears within the type `Router`
+  --> src/routing.rs
+   |
+   | pub struct Router {
+   |            ^^^^^^
+note: required by a bound in `assert_sync`
+  --> tests/ui/fail/discovery_and_routing_owners_are_not_sync.rs:6:19
+   |
+ 6 | fn assert_sync<T: Sync>() {}
+   |                   ^^^^ required by this bound in `assert_sync`
+
+error[E0277]: `*mut grafton_ndi::sys::bindings::NDIlib_send_advertiser_instance_type` cannot be shared between threads safely
+  --> tests/ui/fail/discovery_and_routing_owners_are_not_sync.rs:16:19
+   |
+16 |     assert_sync::<SendAdvertiser>();
+   |                   ^^^^^^^^^^^^^^ `*mut grafton_ndi::sys::bindings::NDIlib_send_advertiser_instance_type` cannot be shared between threads safely
+   |
+   = help: within `SendAdvertiser`, the trait `Sync` is not implemented for `*mut grafton_ndi::sys::bindings::NDIlib_send_advertiser_instance_type`
+note: required because it appears within the type `discovery::advertiser::Advertiser<grafton_ndi::sys::api::SenderAdvertising>`
+  --> src/discovery/advertiser.rs
+   |
+   | struct Advertiser<A: AdvertiserApi> {
+   |        ^^^^^^^^^^
+note: required because it appears within the type `SendAdvertiser`
+  --> src/discovery/advertiser.rs
+   |
+   | pub struct SendAdvertiser {
+   |            ^^^^^^^^^^^^^^
+note: required by a bound in `assert_sync`
+  --> tests/ui/fail/discovery_and_routing_owners_are_not_sync.rs:6:19
+   |
+ 6 | fn assert_sync<T: Sync>() {}
+   |                   ^^^^ required by this bound in `assert_sync`
+
+error[E0277]: `*mut grafton_ndi::sys::bindings::NDIlib_recv_advertiser_instance_type` cannot be shared between threads safely
+  --> tests/ui/fail/discovery_and_routing_owners_are_not_sync.rs:17:19
+   |
+17 |     assert_sync::<RecvAdvertiser>();
+   |                   ^^^^^^^^^^^^^^ `*mut grafton_ndi::sys::bindings::NDIlib_recv_advertiser_instance_type` cannot be shared between threads safely
+   |
+   = help: within `RecvAdvertiser`, the trait `Sync` is not implemented for `*mut grafton_ndi::sys::bindings::NDIlib_recv_advertiser_instance_type`
+note: required because it appears within the type `discovery::advertiser::Advertiser<grafton_ndi::sys::api::ReceiverAdvertising>`
+  --> src/discovery/advertiser.rs
+   |
+   | struct Advertiser<A: AdvertiserApi> {
+   |        ^^^^^^^^^^
+note: required because it appears within the type `RecvAdvertiser`
+  --> src/discovery/advertiser.rs
+   |
+   | pub struct RecvAdvertiser {
+   |            ^^^^^^^^^^^^^^
+note: required by a bound in `assert_sync`
+  --> tests/ui/fail/discovery_and_routing_owners_are_not_sync.rs:6:19
+   |
+ 6 | fn assert_sync<T: Sync>() {}
+   |                   ^^^^ required by this bound in `assert_sync`
+
+error[E0277]: `*mut grafton_ndi::sys::bindings::NDIlib_send_listener_instance_type` cannot be shared between threads safely
+  --> tests/ui/fail/discovery_and_routing_owners_are_not_sync.rs:18:19
+   |
+18 |     assert_sync::<SendListener>();
+   |                   ^^^^^^^^^^^^ `*mut grafton_ndi::sys::bindings::NDIlib_send_listener_instance_type` cannot be shared between threads safely
+   |
+   = help: within `SendListener`, the trait `Sync` is not implemented for `*mut grafton_ndi::sys::bindings::NDIlib_send_listener_instance_type`
+note: required because it appears within the type `discovery::listener::Listener<grafton_ndi::sys::api::SenderDiscovery>`
+  --> src/discovery/listener.rs
+   |
+   | struct Listener<A: ListenerApi> {
+   |        ^^^^^^^^
+note: required because it appears within the type `SendListener`
+  --> src/discovery/listener.rs
+   |
+   | pub struct SendListener {
+   |            ^^^^^^^^^^^^
+note: required by a bound in `assert_sync`
+  --> tests/ui/fail/discovery_and_routing_owners_are_not_sync.rs:6:19
+   |
+ 6 | fn assert_sync<T: Sync>() {}
+   |                   ^^^^ required by this bound in `assert_sync`
+
+error[E0277]: `*mut grafton_ndi::sys::bindings::NDIlib_recv_listener_instance_type` cannot be shared between threads safely
+  --> tests/ui/fail/discovery_and_routing_owners_are_not_sync.rs:19:19
+   |
+19 |     assert_sync::<RecvListener>();
+   |                   ^^^^^^^^^^^^ `*mut grafton_ndi::sys::bindings::NDIlib_recv_listener_instance_type` cannot be shared between threads safely
+   |
+   = help: within `RecvListener`, the trait `Sync` is not implemented for `*mut grafton_ndi::sys::bindings::NDIlib_recv_listener_instance_type`
+note: required because it appears within the type `discovery::listener::Listener<grafton_ndi::sys::api::ReceiverDiscovery>`
+  --> src/discovery/listener.rs
+   |
+   | struct Listener<A: ListenerApi> {
+   |        ^^^^^^^^
+note: required because it appears within the type `RecvListener`
+  --> src/discovery/listener.rs
+   |
+   | pub struct RecvListener {
+   |            ^^^^^^^^^^^^
+note: required by a bound in `assert_sync`
+  --> tests/ui/fail/discovery_and_routing_owners_are_not_sync.rs:6:19
+   |
+ 6 | fn assert_sync<T: Sync>() {}
+   |                   ^^^^ required by this bound in `assert_sync`

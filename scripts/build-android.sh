@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
-# Build and link every example; device/runtime testing is a separate step.
+# Build and link every example for an Android target with the NDK.
+#
+#   ANDROID_NDK_HOME=/path/to/ndk scripts/build-android.sh aarch64-linux-android
+#
+# The crate loads the NDI runtime when the application starts, so no NDI SDK is
+# needed to build. Set NDI_SDK_DIR to an NDI Advanced SDK for Android to compile
+# the Advanced implementation from its headers; device and runtime testing is a
+# separate step either way.
 set -euo pipefail
 
-: "${NDI_SDK_DIR:?Set NDI_SDK_DIR to the extracted NDI SDK for Android}"
 : "${ANDROID_NDK_HOME:?Set ANDROID_NDK_HOME to the Android NDK installation}"
 target="${1:?Usage: scripts/build-android.sh <Rust Android target>}"
 case "$target" in
   aarch64-linux-android|i686-linux-android|x86_64-linux-android)
     clang_target="$target"
-    header_target="$target"
     ;;
   armv7-linux-androideabi)
     clang_target=armv7a-linux-androideabi
-    header_target=arm-linux-androideabi
     ;;
   *) echo "Unsupported Android target: $target" >&2; exit 1 ;;
 esac
@@ -29,9 +33,6 @@ if [ ! -x "$linker" ]; then
   exit 1
 fi
 linker_var="CARGO_TARGET_$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')_LINKER"
-bindgen_var="BINDGEN_EXTRA_CLANG_ARGS_${target//-/_}"
 export "$linker_var=$linker"
-# Target-specific args override host/global bindgen args. Keep paths quoted for
-# bindgen's shell-word parser when the SDK/NDK directory contains spaces.
-export "$bindgen_var=--sysroot=\"$toolchain/sysroot\" -isystem \"$toolchain/sysroot/usr/include/$header_target\" -D__ANDROID_API__=$api"
-cargo build --examples --all-features --target "$target"
+rustup target add "$target"
+cargo build --locked --examples --all-features --target "$target"

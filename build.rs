@@ -1,151 +1,278 @@
+//! Build configuration for grafton-ndi.
+//!
+//! Dynamically loaded targets build without an NDI SDK: the vendored bindings in
+//! `src/sys` describe the ABI and the runtime library is located when the
+//! program runs. Nothing installed on the build machine changes which runtime a
+//! program looks for. This script only
+//!
+//! * with the `advanced` feature, generates declarations for the Advanced-only
+//!   headers of an installed Advanced SDK, which may not be redistributed;
+//! * for statically linked Apple targets, selects, validates and links the
+//!   vendor archive of the SDK in `NDI_SDK_DIR`, whose edition is the one the
+//!   program runs.
+
 use std::{
     env, fs,
     path::{Path, PathBuf},
 };
 
+#[cfg(feature = "advanced")]
+mod build_advanced;
+mod build_apple;
 mod build_support;
 
+use build_support::{Edition, Sdk};
+
 fn main() {
-    println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=build_support.rs");
-    for name in [
-        "NDI_SDK_DIR",
-        "LIBCLANG_PATH",
-        "CLANG_PATH",
-        "BINDGEN_EXTRA_CLANG_ARGS",
-        "SDKROOT",
+    for path in [
+        "build.rs",
+        "build_support.rs",
+        "build_apple.rs",
+        "build_advanced.rs",
     ] {
-        println!("cargo:rerun-if-env-changed={name}");
+        println!("cargo:rerun-if-changed={path}");
     }
+    for cfg in [
+        "ndi_link_static",
+        "ndi_has_advanced_header",
+        "ndi_has_complete_advanced_header",
+    ] {
+        println!("cargo:rustc-check-cfg=cfg({cfg})");
+    }
+
     let target = env::var("TARGET").expect("Cargo TARGET missing");
-    let host = env::var("HOST").expect("Cargo HOST missing");
-    let target_os = env::var("CARGO_CFG_TARGET_OS").expect("Cargo target OS missing");
-    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("Cargo target architecture missing");
-    build_support::library_subdirs(&target_os, &target_arch, &target)
-        .unwrap_or_else(|error| panic!("{error}"));
-    if target != host && env::var_os("NDI_SDK_DIR").is_none() {
-        panic!("Cross-compiling {host} to {target} requires NDI_SDK_DIR pointing to the target SDK, plus target headers/sysroot configured through BINDGEN_EXTRA_CLANG_ARGS or the target C toolchain");
+    let os = env::var("CARGO_CFG_TARGET_OS").expect("Cargo target OS missing");
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").expect("Cargo target architecture missing");
+    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR missing"));
+    println!("cargo:rustc-env=GRAFTON_NDI_TARGET={target}");
+
+    let links_statically = build_support::links_statically(&os);
+    // Only the Advanced headers and a static archive come from an SDK; any
+    // other build ignores whatever is installed, and the variables that
+    // describe it.
+    let needs_sdk = links_statically || cfg!(feature = "advanced");
+    if needs_sdk {
+        println!("cargo:rerun-if-env-changed=NDI_SDK_DIR");
+    }
+    if cfg!(feature = "advanced") {
+        println!("cargo:rerun-if-changed=src/sys/advanced_tables.rs");
+    }
+    if links_statically {
+        println!("cargo:rerun-if-changed=src/sys/declarations.rs");
+        for name in [
+            "IPHONEOS_DEPLOYMENT_TARGET",
+            "TVOS_DEPLOYMENT_TARGET",
+            "XROS_DEPLOYMENT_TARGET",
+        ] {
+            println!("cargo:rerun-if-env-changed={name}");
+        }
+    }
+    let sdk = if needs_sdk {
+        Sdk::locate(env::var_os("NDI_SDK_DIR").as_deref().map(Path::new), &os)
+            .unwrap_or_else(|error| panic!("{error}"))
+    } else {
+        None
+    };
+    if let Some(sdk) = &sdk {
+        println!("cargo:rerun-if-changed={}", sdk.include_dir.display());
     }
 
-    // Determine the base NDI SDK directory.
-    let ndi_sdk_path = env::var("NDI_SDK_DIR").unwrap_or_else(|_| {
-        if target_os == "macos" {
-            // Try multiple possible NDI SDK locations on macOS
-            let possible_paths = vec![
-                "/Library/NDI SDK for macOS",
-                "/Library/NDI SDK for Apple",
-                "/Library/NDI 6 SDK",
-                "/Library/NDI SDK",
-                "/Library/NewTek/NDI SDK",
-                "/Library/Application Support/NDI SDK for Apple",
-                "/Applications/NDI SDK for Apple",
-                "/Applications/NDI 6 SDK",
-            ];
+    #[cfg(feature = "advanced")]
+    let advanced_declarations = sdk
+        .as_ref()
+        .filter(|sdk| sdk.is_advanced())
+        .map(|sdk| generate_advanced_bindings(sdk, &target, &out));
+    #[cfg(not(feature = "advanced"))]
+    let advanced_declarations: Option<String> = None;
+    #[cfg(feature = "advanced")]
+    if advanced_declarations.is_none() {
+        fs::write(
+            out.join("ndi_advanced_selection.rs"),
+            build_advanced::selection("", "").source,
+        )
+        .expect("Write unavailable Advanced declarations");
+    }
+    if advanced_declarations.is_some() {
+        println!("cargo:rustc-cfg=ndi_has_advanced_header");
+    }
 
-            for path in &possible_paths {
-                if Path::new(path).exists() {
-                    return path.to_string();
-                }
-            }
+    if links_statically {
+        let sdk = sdk.as_ref().unwrap_or_else(|| {
+            panic!("{target} links the NDI SDK statically; set NDI_SDK_DIR to the Apple SDK")
+        });
+        let edition = link_static(sdk, &os, &arch, advanced_declarations.as_deref(), &out);
+        println!("cargo:rustc-env=GRAFTON_NDI_EDITION={}", edition.as_str());
+    }
+}
 
-            // Default to the most common location
-            "/Library/NDI SDK for macOS".to_string()
-        } else if target_os == "linux" {
-            // For Linux, try the Advanced SDK directory first.
-            let advanced = "/usr/share/NDI Advanced SDK for Linux";
-            let standard = "/usr/share/NDI SDK for Linux";
-            if Path::new(advanced).exists() {
-                advanced.to_string()
-            } else {
-                standard.to_string()
-            }
-        } else if target_os == "windows" {
-            // NDI 6 SDK default installation path
-            "C:\\Program Files\\NDI\\NDI 6 SDK".to_string()
-        } else {
-            panic!("Unsupported platform, please set NDI_SDK_DIR manually.");
-        }
-    });
-
-    // Construct the include path and header file location.
-    let ndi_include_path =
-        if target_os == "windows" && Path::new(&ndi_sdk_path).join("Include").is_dir() {
-            format!("{ndi_sdk_path}/Include")
-        } else {
-            format!("{ndi_sdk_path}/include")
-        };
-
-    // Create wrapper.h in OUT_DIR for bindgen
-    let out_dir = env::var("OUT_DIR").expect("OUT_DIR environment variable not set");
-    let wrapper_path = Path::new(&out_dir).join("wrapper.h");
-
-    // Check for the actual header file name (case variations)
-    let header_file = {
-        let possible_headers = vec![
-            "Processing.NDI.Lib.h",
-            "Processing.NDI.lib.h",
-            "Processing.ndi.lib.h",
-            "processing.ndi.lib.h",
-        ];
-
-        let mut found_header = None;
-        for header in &possible_headers {
-            let header_path = format!("{ndi_include_path}/{header}");
-            if Path::new(&header_path).exists() {
-                found_header = Some(header.to_string());
-                break;
-            }
-        }
-
-        found_header.unwrap_or_else(|| {
-            panic!(
-                "NDI header file not found in {ndi_include_path}. Searched for: {possible_headers:?}"
-            )
-        })
-    };
-
-    // Write wrapper.h content
-    let wrapper_content = format!(
-        r#"// wrapper.h - Include file for bindgen to properly generate NDI bindings
-
-// DO NOT define NDI_NO_PROTOTYPES or NDILIB_NO_PROTOTYPES here!
-// We need full prototypes so bindgen can generate bindings for all functions.
-
-// Include the main NDI header
-#include <{header_file}>
-"#
-    );
-    fs::write(&wrapper_path, wrapper_content).expect("Failed to create wrapper.h");
-
-    let main_header = wrapper_path.to_str().unwrap().to_string();
-
-    let (library_dir, library_name, link_kind) =
-        build_support::select_library(Path::new(&ndi_sdk_path), &target_os, &target_arch, &target)
+/// Select, validate and link the vendor archive, and write the static
+/// provider's symbol map. Returns the archive's edition.
+fn link_static(
+    sdk: &Sdk,
+    os: &str,
+    arch: &str,
+    advanced_declarations: Option<&str>,
+    out: &Path,
+) -> Edition {
+    let library =
+        build_support::static_library(sdk, os, env::var_os("CARGO_FEATURE_FILE_IO").is_some())
             .unwrap_or_else(|error| panic!("{error}"));
-    println!("cargo:rustc-link-search=native={}", library_dir.display());
-    println!("cargo:rustc-link-lib={link_kind}={library_name}");
-    println!("cargo:rerun-if-changed={}", library_dir.display());
+    println!("cargo:rerun-if-changed={}", library.archive.display());
+    let archive = build_apple::inspect(&library.archive, arch, os)
+        .unwrap_or_else(|error| panic!("Invalid Apple static SDK artifact: {error}"));
 
-    // Generate the bindings using bindgen.
-    let bindings = bindgen::Builder::default()
-        .header(main_header)
-        .clang_arg(format!("-I{ndi_include_path}"))
-        .clang_arg(format!("--target={target}"))
-        // wrapper.h is generated above, so tracking it would make every build stale.
-        // In bindgen 0.72.1 this skips only the main header; include_file still
-        // tracks the SDK headers, and NDI_SDK_DIR is tracked explicitly above.
-        .parse_callbacks(Box::new(
-            bindgen::CargoCallbacks::new().rerun_on_header_files(false),
-        ))
+    let (deployment_variable, floor) = (
+        match os {
+            "ios" => "IPHONEOS_DEPLOYMENT_TARGET",
+            "tvos" => "TVOS_DEPLOYMENT_TARGET",
+            _ => "XROS_DEPLOYMENT_TARGET",
+        },
+        archive.deployment_floor,
+    );
+    // An unset deployment target is left to the application's linker, which
+    // rejects objects built for a newer OS than it targets.
+    if let Ok(value) = env::var(deployment_variable) {
+        if !deployment_target_at_least(&value, floor) {
+            panic!(
+                "{deployment_variable}={value} is invalid or below the selected SDK minimum {}.{}.{}",
+                floor >> 16,
+                (floor >> 8) & 255,
+                floor & 255
+            );
+        }
+    }
+
+    println!("cargo:rustc-cfg=ndi_link_static");
+
+    // Rust's static bundling accepts an ordinary archive, not a universal one.
+    let thin_directory = out.join("ndi-static");
+    fs::create_dir_all(&thin_directory).expect("Create selected Apple archive directory");
+    let thin_archive = thin_directory.join(
+        library
+            .archive
+            .file_name()
+            .expect("Selected Apple archive filename"),
+    );
+    archive
+        .write_thin(&thin_archive)
+        .unwrap_or_else(|error| panic!("Materialize selected Apple static archive: {error}"));
+    println!(
+        "cargo:rustc-link-search=native={}",
+        thin_directory.display()
+    );
+    println!("cargo:rustc-link-lib=static={}", library.link_name);
+    for framework in [
+        "AudioToolbox",
+        "CoreFoundation",
+        "CoreMedia",
+        "CoreVideo",
+        "Foundation",
+        "VideoToolbox",
+        "Accelerate",
+    ] {
+        println!("cargo:rustc-link-lib=framework={framework}");
+    }
+    // Apple exposes DNS-SD through libSystem; no separate dns_sd library exists.
+    for system_library in ["c++", "objc", "z"] {
+        println!("cargo:rustc-link-lib=dylib={system_library}");
+    }
+
+    let vendored =
+        fs::read_to_string("src/sys/declarations.rs").expect("Read vendored declarations");
+    let mut declarations = vec![("crate::sys::declarations", vendored.as_str())];
+    if let Some(advanced) = advanced_declarations {
+        declarations.push(("crate::sys::advanced_declarations", advanced));
+    }
+    let symbols = build_support::static_symbol_map(&declarations, &archive.symbols)
+        .unwrap_or_else(|error| panic!("{error}"));
+    fs::write(out.join("ndi_static_symbols.rs"), symbols).expect("Write static symbol map");
+    library.edition
+}
+
+/// Whether `value` (`major[.minor[.patch]]`) is a valid version at or above
+/// `floor`, packed as Mach-O encodes it.
+fn deployment_target_at_least(value: &str, floor: u32) -> bool {
+    let parts: Vec<Option<u32>> = value
+        .split('.')
+        .map(|part| part.parse().ok().filter(|&number: &u32| number <= 255))
+        .collect();
+    let [major, rest @ ..] = parts.as_slice() else {
+        return false;
+    };
+    if rest.len() > 2 || parts.iter().any(Option::is_none) {
+        return false;
+    }
+    let component = |index: usize| rest.get(index).copied().flatten().unwrap_or(0);
+    ((major.unwrap_or(0) << 16) | (component(0) << 8) | component(1)) >= floor
+}
+
+/// Generate bindings for the headers of `sdk` that may not be redistributed:
+/// types into `OUT_DIR/ndi_advanced.rs` and foreign functions into
+/// `OUT_DIR/ndi_advanced_declarations.rs`. Returns the function declarations.
+///
+/// Common SDK types are not re-emitted: the generated code names them and the
+/// including modules import the vendored bindings.
+#[cfg(feature = "advanced")]
+fn generate_advanced_bindings(sdk: &Sdk, target: &str, out: &Path) -> String {
+    // visionOS is called xros by Apple's Clang; Rust's target name differs.
+    let clang_target = if target == "aarch64-apple-visionos" {
+        "aarch64-apple-xros"
+    } else {
+        target
+    };
+    // Only the compiler's own freestanding headers are visible, so no target
+    // sysroot is needed. The SDK includes <string.h> without using it.
+    let freestanding = out.join("ndi-freestanding");
+    fs::create_dir_all(&freestanding)
+        .and_then(|()| fs::write(freestanding.join("string.h"), ""))
+        .expect("Create freestanding header directory");
+    let mut builder = bindgen::Builder::default()
+        .header_contents("wrapper.h", "#include <Processing.NDI.Advanced.h>\n")
+        .clang_arg(format!("--target={clang_target}"))
+        .clang_args(["-ffreestanding", "-nostdlibinc"])
+        .clang_arg(format!("-I{}", freestanding.display()))
+        .clang_arg(format!("-I{}", sdk.include_dir.display()))
         .derive_default(true)
-        .generate()
-        .unwrap_or_else(|error| panic!("Unable to generate NDI bindings for {target}: {error}. For cross builds, configure target C headers and sysroot via BINDGEN_EXTRA_CLANG_ARGS."));
-
-    // Write the bindings to the $OUT_DIR/ndi_lib.rs file.
-    let out_path =
-        PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR environment variable not set"));
-    let bindings_path = out_path.join("ndi_lib.rs");
-    bindings
-        .write_to_file(&bindings_path)
-        .expect("Couldn't write bindings!");
+        .allowlist_recursively(false)
+        .formatter(bindgen::Formatter::Prettyplease);
+    let restricted = sdk
+        .restricted_headers()
+        .unwrap_or_else(|error| panic!("{error}"));
+    for header in &restricted {
+        let escaped: String = header
+            .chars()
+            .flat_map(|character| {
+                let literal = character.is_ascii_alphanumeric() || character == '_';
+                (!literal).then_some('\\').into_iter().chain([character])
+            })
+            .collect();
+        builder = builder.allowlist_file(format!(r".*[/\\]{escaped}"));
+    }
+    let generate = |codegen: bindgen::CodegenConfig, file: &str| {
+        let bindings = builder
+            .clone()
+            .with_codegen_config(codegen)
+            .generate()
+            .unwrap_or_else(|error| {
+                panic!("Unable to generate Advanced SDK bindings for {target}: {error}")
+            })
+            .to_string();
+        fs::write(out.join(file), &bindings).expect("Write Advanced SDK bindings");
+        bindings
+    };
+    let types = generate(
+        bindgen::CodegenConfig::all() - bindgen::CodegenConfig::FUNCTIONS,
+        "ndi_advanced.rs",
+    );
+    let functions = generate(
+        bindgen::CodegenConfig::FUNCTIONS,
+        "ndi_advanced_declarations.rs",
+    );
+    let selection = build_advanced::selection(&types, &functions);
+    if selection.complete {
+        println!("cargo:rustc-cfg=ndi_has_complete_advanced_header");
+    }
+    fs::write(out.join("ndi_advanced_selection.rs"), selection.source)
+        .expect("Write Advanced declaration availability");
+    functions
 }

@@ -1,0 +1,1205 @@
+//! Async receivers for Tokio and smol.
+//!
+//! [`AsyncReceiver`] wraps the synchronous NDI receiver API for an async
+//! runtime, and its `video`, `audio` and `metadata` return an
+//! [`AsyncCapture`] view that captures one kind of frame. Both are generic
+//! over the [`AsyncRuntime`] whose blocking thread pool runs the NDI operations:
+//! [`Tokio`] with the `tokio` Cargo feature, [`Smol`] with the `smol` feature.
+//! The [`tokio`] and [`smol`] submodules name both types for one runtime, for
+//! example `grafton_ndi::asynchronous::tokio::AsyncReceiver`. This module
+//! exists when either feature is enabled, and each runtime only with its own
+//! feature; the crate root does not re-export any of it.
+//!
+//! The NDI SDK operations are inherently synchronous and blocking, so these wrappers
+//! use `spawn_blocking` internally to run NDI operations on a thread pool without
+//! blocking the async runtime. Besides capture, [`AsyncReceiver`] has async
+//! versions of the receiver's other waiting calls:
+//! [`poll_event`](AsyncReceiver::poll_event), which returns the status and
+//! source changes that captures pass over and keep,
+//! [`poll_source_name_change`](AsyncReceiver::poll_source_name_change),
+//! [`connect_to`](AsyncReceiver::connect_to),
+//! [`disconnect`](AsyncReceiver::disconnect) and
+//! [`reconnect`](AsyncReceiver::reconnect). It lends the [`Receiver`] itself,
+//! through [`receiver`](AsyncReceiver::receiver), for the controls that do not
+//! wait.
+//!
+//! For `capture`, `poll_event` and `poll_source_name_change`, the timeout
+//! budget starts when the future is first polled, rather than when it is
+//! constructed. The same deadline covers blocking-pool queue delay, receiver
+//! capture-gate contention, and SDK waits.
+//! This is a wait budget, not a hard completion deadline: scheduling, frame copying,
+//! and other processing can delay the result beyond it.
+//!
+//! Dropping a future sets a cancellation flag. Work is skipped if the blocking
+//! closure observes that flag at its entry gate. After passing that gate, work
+//! continues, including waiting for receiver access; it cannot be interrupted by
+//! dropping the future.
+//!
+//! # Features
+//!
+//! - `tokio` - Enable Tokio runtime support
+//! - `smol` - Enable smol runtime support
+//!
+//! # Example with Tokio
+//!
+//! ```no_run
+//! # #[cfg(feature = "tokio")]
+//! # {
+//! use grafton_ndi::{Ndi, ReceiverOptions, asynchronous::tokio::AsyncReceiver};
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), grafton_ndi::Error> {
+//!     let ndi = Ndi::new()?;
+//!     // ... obtain source from finder ...
+//!     # let source = grafton_ndi::Source::new("CAMERA (Program)");
+//!
+//!     let options = ReceiverOptions::snapshot_preset(source);
+//!     let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
+//!
+//!     let async_receiver = AsyncReceiver::new(receiver);
+//!
+//!     // Capture frame asynchronously without blocking the runtime
+//!     if let Some(frame) = async_receiver.video().capture(std::time::Duration::from_secs(5)).await? {
+//!         println!("Captured {}x{} frame", frame.width(), frame.height());
+//!     }
+//!
+//!     Ok(())
+//! }
+//! # }
+//! ```
+
+use std::{
+    future::Future,
+    marker::PhantomData,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+use crate::{
+    capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
+    timeout::Deadline,
+    ConnectionStats, Error, Receiver, ReceiverEvent, Result, Source, SourceNameChange,
+};
+
+mod private {
+    use std::future::Future;
+
+    use crate::Result;
+
+    /// Proof that the caller is this crate.
+    ///
+    /// A bound on [`AsyncRuntime`](super::AsyncRuntime) makes [`Spawn::spawn_blocking`]
+    /// reachable from other crates even though they cannot name [`Spawn`];
+    /// they cannot name this type either, so they cannot call it.
+    pub struct Token;
+
+    /// How a runtime runs blocking work on its thread pool.
+    ///
+    /// It is not nameable outside the crate, which keeps it out of the API
+    /// and seals [`AsyncRuntime`](super::AsyncRuntime).
+    pub trait Spawn {
+        /// Run `f` on the runtime's blocking thread pool and return its result.
+        ///
+        /// # Errors
+        ///
+        /// [`Error::SpawnFailed`](crate::Error::SpawnFailed) when the work
+        /// cannot be submitted, is cancelled before it starts, or panics.
+        fn spawn_blocking<F, T>(token: Token, f: F) -> impl Future<Output = Result<T>> + Send
+        where
+            F: FnOnce() -> T + Send + 'static,
+            T: Send + 'static;
+    }
+}
+
+// Dropping a future prevents its queued closure from starting SDK work. Work
+// that has already passed this gate cannot be interrupted safely.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+fn blocking_operation<F, T>(operation: F) -> (CancelOnDrop, impl FnOnce() -> Result<T> + Send)
+where
+    F: FnOnce() -> T + Send,
+{
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let guard = CancelOnDrop(Arc::clone(&cancelled));
+    let work = move || {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(Error::SpawnFailed(
+                "Blocking operation cancelled before starting".into(),
+            ));
+        }
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).map_err(|payload| {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload");
+            Error::SpawnFailed(format!("Blocking operation panicked: {message}"))
+        })
+    };
+    (guard, work)
+}
+
+/// An async runtime whose blocking thread pool runs the NDI operations of an
+/// [`AsyncReceiver`] and its [`AsyncCapture`] views: [`Tokio`] or [`Smol`].
+///
+/// The trait is sealed and has no items of its own; it only selects the
+/// runtime.
+pub trait AsyncRuntime: private::Spawn + Send + Sync {}
+
+/// The Tokio runtime, which runs blocking work with
+/// `tokio::task::spawn_blocking`.
+///
+/// The work runs on the runtime of the task that awaits it; awaiting outside
+/// a Tokio runtime fails with [`Error::SpawnFailed`]. Only a type, never a
+/// value. Requires the `tokio` feature.
+#[cfg(feature = "tokio")]
+#[derive(Debug)]
+pub enum Tokio {}
+
+#[cfg(feature = "tokio")]
+impl AsyncRuntime for Tokio {}
+
+#[cfg(feature = "tokio")]
+impl private::Spawn for Tokio {
+    // Using `impl Future` instead of `async fn` in trait because we need explicit
+    // Send bounds on the returned future. This pattern is intentional.
+    #[allow(clippy::manual_async_fn)]
+    fn spawn_blocking<F, T>(_: private::Token, f: F) -> impl Future<Output = Result<T>> + Send
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        async {
+            let handle = ::tokio::runtime::Handle::try_current()
+                .map_err(|e| Error::SpawnFailed(e.to_string()))?;
+            let (_cancellation, work) = blocking_operation(f);
+            handle
+                .spawn_blocking(work)
+                .await
+                .map_err(|e| Error::SpawnFailed(e.to_string()))?
+        }
+    }
+}
+
+/// The smol runtime, which runs blocking work with `smol::unblock`.
+///
+/// Only a type, never a value. Requires the `smol` feature.
+#[cfg(feature = "smol")]
+#[derive(Debug)]
+pub enum Smol {}
+
+#[cfg(feature = "smol")]
+impl AsyncRuntime for Smol {}
+
+#[cfg(feature = "smol")]
+impl private::Spawn for Smol {
+    // Using `impl Future` instead of `async fn` in trait because we need explicit
+    // Send bounds on the returned future. This pattern is intentional.
+    #[allow(clippy::manual_async_fn)]
+    fn spawn_blocking<F, T>(_: private::Token, f: F) -> impl Future<Output = Result<T>> + Send
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        async {
+            let (_cancellation, work) = blocking_operation(f);
+            ::smol::unblock(work).await
+        }
+    }
+}
+
+/// An async wrapper over a [`Receiver`] that runs its blocking NDI operations
+/// on the blocking thread pool of the runtime `R`, so that they do not block
+/// the async runtime.
+///
+/// [`tokio::AsyncReceiver`] and [`smol::AsyncReceiver`] name it for each
+/// runtime.
+///
+/// # Thread Safety
+///
+/// The underlying [`Receiver`] is wrapped in an [`Arc`] to allow sharing across
+/// async tasks and safe cloning. The NDI SDK receiver is inherently thread-safe.
+///
+/// # Events and controls
+///
+/// A capture that the SDK answers with a status or source change instead of
+/// a frame keeps that change for [`poll_event`](Self::poll_event), as the
+/// synchronous captures keep it for [`Receiver::poll_event`]: both read the
+/// same pending events. [`receiver`](Self::receiver) lends the receiver for
+/// its controls that do not wait, such as tally, PTZ and upstream metadata.
+///
+/// # Error Handling
+///
+/// The methods that run on the blocking pool convert a panic there, or the
+/// cancellation of the blocking task, into [`Error::SpawnFailed`] rather than
+/// propagating it.
+///
+/// # Example
+///
+/// ```no_run
+/// # #[cfg(feature = "tokio")]
+/// # {
+/// use grafton_ndi::{Ndi, ReceiverOptions, asynchronous::tokio::AsyncReceiver};
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), grafton_ndi::Error> {
+///     let ndi = Ndi::new()?;
+///     // ... obtain source ...
+///     # let source = grafton_ndi::Source::new("CAMERA (Program)");
+///
+///     let options = ReceiverOptions::snapshot_preset(source);
+///     let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
+///     let async_receiver = AsyncReceiver::new(receiver);
+///
+///     // Capture without blocking the runtime
+///     match async_receiver.video().capture(std::time::Duration::from_millis(100)).await? {
+///         Some(frame) => println!("Got frame: {}x{}", frame.width(), frame.height()),
+///         None => println!("No frame available"),
+///     }
+///
+///     Ok(())
+/// }
+/// # }
+/// ```
+pub struct AsyncReceiver<R: AsyncRuntime> {
+    inner: Arc<Receiver>,
+    _runtime: PhantomData<R>,
+}
+
+// Starts the budget on the future's first poll, so that blocking-pool queue
+// delay is spent from it.
+async fn with_timeout_budget<R, F, T>(timeout: Duration, operation: F) -> Result<T>
+where
+    R: AsyncRuntime,
+    F: FnOnce(Deadline) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let deadline = Deadline::after(timeout)?;
+    R::spawn_blocking(private::Token, move || operation(deadline)).await?
+}
+
+impl<R: AsyncRuntime> AsyncReceiver<R> {
+    /// Create a new async receiver wrapper.
+    ///
+    /// The receiver is wrapped in an [`Arc`] to allow sharing across async tasks.
+    pub fn new(receiver: Receiver) -> Self {
+        Self {
+            inner: Arc::new(receiver),
+            _runtime: PhantomData,
+        }
+    }
+
+    /// The receiver this wraps, lent for its controls: tally, PTZ, upstream
+    /// and connection metadata, delays, the web-control URL and the original
+    /// [`source`](Receiver::source).
+    ///
+    /// The receiver is shared with every clone of this `AsyncReceiver` and
+    /// with the async operations they have in flight. Its methods run on the
+    /// calling thread, and those that wait block it: captures with a timeout,
+    /// [`poll_event`](Receiver::poll_event),
+    /// [`poll_source_name_change`](Receiver::poll_source_name_change),
+    /// [`connect_to`](Receiver::connect_to),
+    /// [`disconnect`](Receiver::disconnect) and
+    /// [`reconnect`](Receiver::reconnect), the last three for as long as a
+    /// capture attempt in flight takes to return. Async code should use this
+    /// type's async methods for those instead.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "tokio")]
+    /// # {
+    /// # use grafton_ndi::{Ndi, ReceiverOptions, Tally, asynchronous::tokio::AsyncReceiver};
+    /// # fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = Ndi::new()?;
+    /// # let source = grafton_ndi::Source::new("CAMERA (Program)");
+    /// # let receiver = grafton_ndi::Receiver::new(&ndi, &ReceiverOptions::new(source))?;
+    /// let async_receiver = AsyncReceiver::new(receiver);
+    /// async_receiver.receiver().set_tally(Tally::new(true, false));
+    /// if async_receiver.receiver().ptz().is_supported() {
+    ///     async_receiver.receiver().ptz().zoom(0.5)?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    pub fn receiver(&self) -> &Receiver {
+        &self.inner
+    }
+
+    /// Capture **video** frames without blocking the async runtime.
+    ///
+    /// Returns an [`AsyncCapture`] view; see [`AsyncCapture::capture`].
+    /// Mirrors [`Receiver::video`], running each capture on the blocking pool.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "tokio")]
+    /// # {
+    /// # use grafton_ndi::{Ndi, ReceiverOptions, asynchronous::tokio::AsyncReceiver};
+    /// # use std::time::Duration;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), grafton_ndi::Error> {
+    /// # let ndi = Ndi::new()?;
+    /// # let source = grafton_ndi::Source::new("CAMERA (Program)");
+    /// # let receiver = grafton_ndi::Receiver::new(&ndi, &ReceiverOptions::new(source))?;
+    /// let async_receiver = AsyncReceiver::new(receiver);
+    /// if let Some(frame) = async_receiver.video().capture(Duration::from_secs(5)).await? {
+    ///     println!("Captured {}x{} frame", frame.width(), frame.height());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    #[must_use = "the AsyncCapture view does nothing until a capture verb is awaited"]
+    pub fn video(&self) -> AsyncCapture<'_, R, VideoKind> {
+        AsyncCapture::new(self)
+    }
+
+    /// Capture **audio** frames without blocking the async runtime.
+    ///
+    /// Returns an [`AsyncCapture`] view; see [`video`](Self::video) for usage.
+    /// Mirrors [`Receiver::audio`].
+    #[must_use = "the AsyncCapture view does nothing until a capture verb is awaited"]
+    pub fn audio(&self) -> AsyncCapture<'_, R, AudioKind> {
+        AsyncCapture::new(self)
+    }
+
+    /// Capture **metadata** frames without blocking the async runtime.
+    ///
+    /// Returns an [`AsyncCapture`] view; see [`video`](Self::video) for usage.
+    /// Mirrors [`Receiver::metadata`].
+    #[must_use = "the AsyncCapture view does nothing until a capture verb is awaited"]
+    pub fn metadata(&self) -> AsyncCapture<'_, R, MetadataKind> {
+        AsyncCapture::new(self)
+    }
+
+    /// Async version of [`Receiver::poll_event`]: wait up to `timeout` for a
+    /// status or source change, or return `None` when none came, running on
+    /// the blocking pool.
+    ///
+    /// The events include those that [`AsyncCapture::capture`] and the
+    /// receiver's synchronous captures passed over and kept. They are
+    /// coalesced invalidations, not an ordered history; concurrent pollers,
+    /// through this type, its clones or the lent [`receiver`](Self::receiver),
+    /// compete to consume a pending one.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Total budget to wait for an event, starting when the
+    ///   future is first polled and spent as [`Receiver::poll_event`] spends
+    ///   it. Blocking-pool queue delay and capture-gate contention count
+    ///   against the same budget, and `None` comes only once all of it is
+    ///   spent. [`Duration::ZERO`], like a budget that queue delay has
+    ///   already spent, makes one attempt without waiting. Completion can
+    ///   occur after this budget because scheduling is not bounded by it.
+    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Receiver::poll_event`], and [`Error::SpawnFailed`]
+    /// when the blocking task panicked or was cancelled.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future skips work if the blocking closure observes the
+    /// cancellation flag at its entry gate. After passing that gate, work
+    /// continues, including waiting for receiver access, and can consume an
+    /// event whose result is discarded.
+    pub async fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
+        let receiver = Arc::clone(&self.inner);
+        with_timeout_budget::<R, _, _>(timeout, move |deadline| {
+            receiver.core.poll_event_until(deadline)
+        })
+        .await
+    }
+
+    /// Async version of [`Receiver::poll_source_name_change`]: wait up to
+    /// `timeout` for a change to the name of the source the receiver is
+    /// actually connected to, running on the blocking pool.
+    ///
+    /// `None` means no change within the budget; see
+    /// [`Receiver::poll_source_name_change`] for what a change reports.
+    /// Concurrent pollers compete for changes.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Total budget to wait for a change, starting when the
+    ///   future is first polled. Blocking-pool queue delay and waiting for a
+    ///   concurrent poller count against the same budget. Completion can
+    ///   occur after this budget because scheduling is not bounded by it.
+    ///   Must not exceed [`crate::MAX_TIMEOUT`] (~49.7 days).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Receiver::poll_source_name_change`]:
+    /// [`Error::InvalidInput`] when `timeout` exceeds [`crate::MAX_TIMEOUT`],
+    /// [`Error::UnsupportedCapability`] without
+    /// [`RuntimeFeature::ConnectedSourceName`](crate::RuntimeFeature::ConnectedSourceName),
+    /// and [`Error::UnexpectedSdkResult`] for a name the SDK did not
+    /// terminate; and [`Error::SpawnFailed`] when the blocking task panicked
+    /// or was cancelled.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future skips work if the blocking closure observes the
+    /// cancellation flag at its entry gate. After passing that gate, work
+    /// continues, including waiting for a concurrent poller, and can consume
+    /// a change whose result is discarded; the SDK reports each change once.
+    pub async fn poll_source_name_change(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<SourceNameChange>> {
+        let receiver = Arc::clone(&self.inner);
+        with_timeout_budget::<R, _, _>(timeout, move |deadline| {
+            receiver.core.poll_source_name_change_until(deadline)
+        })
+        .await
+    }
+
+    /// Whether the underlying receiver currently has at least one active
+    /// connection to its source. See [`Receiver::is_connected`].
+    ///
+    /// A cheap, non-blocking SDK query, so it runs inline rather than on
+    /// the blocking pool.
+    pub fn is_connected(&self) -> bool {
+        self.inner.is_connected()
+    }
+
+    /// Connection and frame-throughput statistics for the underlying
+    /// receiver. See [`Receiver::connection_stats`].
+    ///
+    /// A cheap, non-blocking SDK query, so it runs inline rather than on
+    /// the blocking pool. `connection_stats().video_frames_received()` is
+    /// the canonical liveness signal: it advances as the receiver pulls
+    /// frames off the network, independent of how often the caller
+    /// captures, so a frozen counter means the feed itself has stalled.
+    pub fn connection_stats(&self) -> ConnectionStats {
+        self.inner.connection_stats()
+    }
+
+    /// Point the underlying receiver at a different source, without changing
+    /// the original target that [`Self::reconnect`] returns to. See
+    /// [`Receiver::connect_to`].
+    ///
+    /// Like [`Self::reconnect`], this takes the receiver's capture guard
+    /// exclusively, so it blocks until the capture attempts in flight return:
+    /// one attempt of at most 100 ms each, whatever their timeouts. It
+    /// therefore runs on the blocking pool, and is safe to call while
+    /// captures on this receiver are in flight. Success means the request was
+    /// issued, not that the source is available; watch
+    /// [`Self::poll_source_name_change`] or [`Self::connection_stats`].
+    /// `source` is copied, so that the blocking task can own it.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Receiver::connect_to`]: [`Error::InvalidCString`] when
+    /// the source's name or address contains a NUL byte; and
+    /// [`Error::SpawnFailed`] when the blocking task panicked or was
+    /// cancelled.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future skips work if the blocking closure observes the
+    /// cancellation flag at its entry gate. After passing that gate, the
+    /// connection change continues, including waiting for in-flight captures,
+    /// and may take effect after this future is dropped.
+    pub async fn connect_to(&self, source: &Source) -> Result<()> {
+        let receiver = Arc::clone(&self.inner);
+        let source = source.clone();
+        R::spawn_blocking(private::Token, move || receiver.connect_to(&source)).await?
+    }
+
+    /// Disconnect the underlying receiver from its source, retaining the
+    /// original target that [`Self::reconnect`] returns to. See
+    /// [`Receiver::disconnect`].
+    ///
+    /// Like [`Self::reconnect`], this waits for the capture attempts in
+    /// flight, at most 100 ms each, and therefore runs on the blocking pool.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SpawnFailed`] when the blocking task panicked or was
+    /// cancelled; [`Receiver::disconnect`] itself does not fail.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future skips work if the blocking closure observes the
+    /// cancellation flag at its entry gate. After passing that gate,
+    /// disconnect continues, including waiting for in-flight captures, and may
+    /// disconnect after this future is dropped.
+    pub async fn disconnect(&self) -> Result<()> {
+        let receiver = Arc::clone(&self.inner);
+        R::spawn_blocking(private::Token, move || receiver.disconnect()).await
+    }
+
+    /// Re-establish the underlying receiver's connection to its source
+    /// in place. See [`Receiver::reconnect`].
+    ///
+    /// Unlike the liveness probes above, a reconnect takes the receiver's
+    /// capture guard exclusively, so it blocks until the capture attempts in
+    /// flight (which run on the blocking pool) return: one attempt of at most
+    /// 100 ms each, whatever their timeouts. It therefore runs on the blocking
+    /// pool too, never on the async runtime's threads, and is safe to call
+    /// while captures on this receiver are in flight — they serialize instead
+    /// of racing. Confirm recovery via [`Self::connection_stats`].
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Receiver::reconnect`], and [`Error::SpawnFailed`] when
+    /// the blocking task panicked or was cancelled.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future skips work if the blocking closure observes the
+    /// cancellation flag at its entry gate. After passing that gate, reconnect
+    /// continues, including waiting for in-flight captures, and may reconnect
+    /// after this future is dropped.
+    pub async fn reconnect(&self) -> Result<()> {
+        let receiver = Arc::clone(&self.inner);
+        R::spawn_blocking(private::Token, move || receiver.reconnect()).await?
+    }
+}
+
+impl<R: AsyncRuntime> Clone for AsyncReceiver<R> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            _runtime: PhantomData,
+        }
+    }
+}
+
+/// A typed view over an async receiver for capturing frames of one kind,
+/// without blocking the async runtime.
+///
+/// Created by [`AsyncReceiver::video`], [`audio`](AsyncReceiver::audio),
+/// and [`metadata`](AsyncReceiver::metadata). Its
+/// [`capture`](Self::capture) runs the synchronous
+/// [`Capture::capture`](crate::Capture::capture) on the runtime's blocking
+/// pool, with the same semantics, and its timeout budget also covers the
+/// time the work waits for a blocking-pool thread.
+///
+/// There is no zero-copy `capture_ref` here: a borrowed frame is tied to
+/// the receiver and cannot cross the `spawn_blocking` boundary. Use
+/// [`Capture::capture_ref`](crate::Capture::capture_ref) on the synchronous
+/// receiver for in-place processing.
+pub struct AsyncCapture<'rx, R: AsyncRuntime, K: CaptureKind> {
+    recv: &'rx AsyncReceiver<R>,
+    _kind: PhantomData<K>,
+}
+
+impl<'rx, R: AsyncRuntime, K: CaptureKind> AsyncCapture<'rx, R, K>
+where
+    K::Owned: Send + 'static,
+{
+    fn new(recv: &'rx AsyncReceiver<R>) -> Self {
+        Self {
+            recv,
+            _kind: PhantomData,
+        }
+    }
+
+    /// Async version of [`Capture::capture`](crate::Capture::capture): wait
+    /// up to `timeout` for a frame and return an owned copy of it, or `None`
+    /// when none arrived in time, running on the blocking pool.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Total budget to wait for a frame, starting when the future
+    ///   is first polled. Blocking-pool queue delay and capture-gate contention
+    ///   count against the same budget, and `None` comes only once all of it
+    ///   is spent. Completion can occur after this budget because scheduling
+    ///   and frame processing are not bounded by it. Must not exceed
+    ///   [`crate::MAX_TIMEOUT`] (~49.7 days).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Capture::capture`](crate::Capture::capture), and
+    /// [`Error::SpawnFailed`] when the blocking task panicked or was
+    /// cancelled.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future skips work if the blocking closure observes the
+    /// cancellation flag at its entry gate. After passing that gate, work
+    /// continues, including waiting for receiver access, and can consume a frame
+    /// whose result is discarded.
+    pub async fn capture(&self, timeout: Duration) -> Result<Option<K::Owned>> {
+        let receiver = Arc::clone(&self.recv.inner);
+        with_timeout_budget::<R, _, _>(timeout, move |deadline| {
+            receiver.core.capture_until::<K>(deadline)
+        })
+        .await
+    }
+}
+
+#[cfg(feature = "tokio")]
+pub mod tokio {
+    //! [`AsyncReceiver`] and [`AsyncCapture`] on the Tokio runtime: the
+    //! generic [`asynchronous::AsyncReceiver`](super::AsyncReceiver) and
+    //! [`asynchronous::AsyncCapture`](super::AsyncCapture) with
+    //! [`Tokio`](super::Tokio), which run blocking work with
+    //! `tokio::task::spawn_blocking`.
+    //!
+    //! # Example
+    //!
+    //! ```no_run
+    //! use grafton_ndi::{Ndi, ReceiverOptions, asynchronous::tokio::AsyncReceiver};
+    //!
+    //! #[tokio::main]
+    //! async fn main() -> Result<(), grafton_ndi::Error> {
+    //!     let ndi = Ndi::new()?;
+    //!     // ... obtain source ...
+    //!     # let source = grafton_ndi::Source::new("CAMERA (Program)");
+    //!
+    //!     let options = ReceiverOptions::snapshot_preset(source);
+    //!     let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
+    //!     let async_receiver = AsyncReceiver::new(receiver);
+    //!
+    //!     // Capture without blocking the runtime
+    //!     match async_receiver.video().capture(std::time::Duration::from_millis(100)).await? {
+    //!         Some(frame) => println!("Got frame: {}x{}", frame.width(), frame.height()),
+    //!         None => println!("No frame available"),
+    //!     }
+    //!
+    //!     Ok(())
+    //! }
+    //! ```
+
+    /// An [`AsyncReceiver`](super::AsyncReceiver) on the Tokio runtime.
+    pub type AsyncReceiver = super::AsyncReceiver<super::Tokio>;
+    /// An [`AsyncCapture`](super::AsyncCapture) on the Tokio runtime.
+    pub type AsyncCapture<'rx, K> = super::AsyncCapture<'rx, super::Tokio, K>;
+}
+
+#[cfg(feature = "smol")]
+pub mod smol {
+    //! [`AsyncReceiver`] and [`AsyncCapture`] on the smol runtime: the
+    //! generic [`asynchronous::AsyncReceiver`](super::AsyncReceiver) and
+    //! [`asynchronous::AsyncCapture`](super::AsyncCapture) with
+    //! [`Smol`](super::Smol), which run blocking work with `smol::unblock`.
+    //!
+    //! # Example
+    //!
+    //! ```no_run
+    //! use grafton_ndi::{Ndi, ReceiverOptions, asynchronous::smol::AsyncReceiver};
+    //!
+    //! fn main() -> Result<(), grafton_ndi::Error> {
+    //!     ::smol::block_on(async {
+    //!         let ndi = Ndi::new()?;
+    //!         // ... obtain source ...
+    //!         # let source = grafton_ndi::Source::new("CAMERA (Program)");
+    //!
+    //!         let options = ReceiverOptions::snapshot_preset(source);
+    //!         let receiver = grafton_ndi::Receiver::new(&ndi, &options)?;
+    //!         let async_receiver = AsyncReceiver::new(receiver);
+    //!
+    //!         // Capture without blocking the runtime
+    //!         match async_receiver.video().capture(std::time::Duration::from_millis(100)).await? {
+    //!             Some(frame) => println!("Got frame: {}x{}", frame.width(), frame.height()),
+    //!             None => println!("No frame available"),
+    //!         }
+    //!
+    //!         Ok(())
+    //!     })
+    //! }
+    //! ```
+
+    /// An [`AsyncReceiver`](super::AsyncReceiver) on the smol runtime.
+    pub type AsyncReceiver = super::AsyncReceiver<super::Smol>;
+    /// An [`AsyncCapture`](super::AsyncCapture) on the smol runtime.
+    pub type AsyncCapture<'rx, K> = super::AsyncCapture<'rx, super::Smol, K>;
+}
+
+#[cfg(all(test, feature = "tokio"))]
+mod timeout_tests {
+    use super::*;
+    use std::{
+        sync::mpsc,
+        task::{Context, Poll, Waker},
+    };
+
+    fn runtime() -> ::tokio::runtime::Runtime {
+        ::tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn queued_work_uses_remaining_budget() {
+        let runtime = runtime();
+        runtime.block_on(async {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let blocker = ::tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            started_rx.recv().unwrap();
+
+            let budget = Duration::from_millis(20);
+            let mut capture = Box::pin(with_timeout_budget::<Tokio, _, _>(budget, |deadline| {
+                Ok((deadline.remaining(), deadline.remaining_ms()))
+            }));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(matches!(capture.as_mut().poll(&mut context), Poll::Pending));
+            // Keep the sole worker occupied until the whole budget has elapsed.
+            std::thread::sleep(budget + Duration::from_millis(5));
+            release_tx.send(()).unwrap();
+            // The queue delay spent the budget: the work starts with none left.
+            let (remaining, remaining_ms) = capture.await.unwrap();
+            assert_eq!((remaining, remaining_ms), (Duration::ZERO, 0));
+            blocker.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn budgeted_work_that_panics_reports_spawn_failed() {
+        // The path of `capture`, `poll_event` and `poll_source_name_change`.
+        let result = runtime()
+            .block_on(with_timeout_budget::<Tokio, _, ()>(Duration::ZERO, |_| {
+                panic!("budgeted panic")
+            }));
+        assert!(
+            matches!(result, Err(Error::SpawnFailed(message)) if message.contains("budgeted panic"))
+        );
+    }
+
+    #[test]
+    fn invalid_budget_is_rejected_before_spawning() {
+        // No entered runtime: trying to submit work would panic.
+        let mut capture = Box::pin(with_timeout_budget::<Tokio, _, ()>(
+            crate::MAX_TIMEOUT + Duration::from_nanos(1),
+            |_| panic!("invalid timeout must not execute blocking work"),
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            capture.as_mut().poll(&mut context),
+            Poll::Ready(Err(_))
+        ));
+    }
+}
+
+#[cfg(all(test, feature = "smol"))]
+mod smol_tests {
+    use super::{
+        private::{Spawn, Token},
+        *,
+    };
+    use std::{
+        sync::mpsc,
+        task::{Context, Poll, Waker},
+        time::Instant,
+    };
+
+    #[test]
+    fn dropping_unpolled_future_starts_no_work() {
+        let called = Arc::new(AtomicBool::new(false));
+        let worker_called = Arc::clone(&called);
+        let operation = Smol::spawn_blocking(Token, move || {
+            worker_called.store(true, Ordering::Release);
+        });
+        drop(operation);
+        assert!(!called.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn dropping_started_future_allows_work_to_finish() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let mut operation = Box::pin(Smol::spawn_blocking(Token, move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            finished_tx.send(42).unwrap();
+        }));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            operation.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(operation);
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            finished_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn invalid_budget_does_not_start_work() {
+        let called = Arc::new(AtomicBool::new(false));
+        let worker_called = Arc::clone(&called);
+        let result = ::smol::block_on(with_timeout_budget::<Smol, _, _>(
+            crate::MAX_TIMEOUT + Duration::from_nanos(1),
+            move |_| {
+                worker_called.store(true, Ordering::Release);
+                Ok(())
+            },
+        ));
+        assert!(result.is_err());
+        assert!(!called.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn budgeted_work_that_panics_reports_spawn_failed() {
+        // The path of `capture`, `poll_event` and `poll_source_name_change`.
+        let result = ::smol::block_on(with_timeout_budget::<Smol, _, ()>(Duration::ZERO, |_| {
+            panic!("budgeted panic")
+        }));
+        assert!(
+            matches!(result, Err(Error::SpawnFailed(message)) if message.contains("budgeted panic"))
+        );
+    }
+
+    #[test]
+    fn budget_starts_on_first_poll_and_keeps_one_deadline() {
+        let budget = Duration::from_millis(20);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut operation = Box::pin(with_timeout_budget::<Smol, _, _>(
+            budget,
+            move |deadline: Deadline| {
+                started_tx.send(deadline.end()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(deadline.remaining())
+            },
+        ));
+        // Construction must not consume the wait budget.
+        std::thread::sleep(budget);
+        let before_poll = Instant::now();
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            operation.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        let after_poll = Instant::now();
+        let deadline = started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(deadline >= before_poll + budget);
+        assert!(deadline <= after_poll + budget);
+        // A wait inside blocking work must not reset the shared capture deadline.
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        release_tx.send(()).unwrap();
+        assert_eq!(::smol::block_on(operation).unwrap(), Duration::ZERO);
+    }
+}
+
+#[cfg(test)]
+mod executor_tests {
+    use super::{
+        private::{Spawn, Token},
+        *,
+    };
+
+    #[test]
+    fn cancellation_skips_queued_operation() {
+        let (guard, work) = blocking_operation(|| panic!("cancelled work must not run"));
+        drop(guard);
+        assert!(matches!(work(), Err(Error::SpawnFailed(_))));
+    }
+
+    #[test]
+    fn cancellation_allows_started_operation_to_finish() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let (guard, work) = blocking_operation(move || {
+            started_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+            42
+        });
+        let worker = std::thread::spawn(work);
+        started_rx.recv().unwrap();
+        drop(guard);
+        finish_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap(), 42);
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn missing_tokio_context_returns_error() {
+        use std::task::{Context, Poll, Waker};
+        let mut operation = Box::pin(Tokio::spawn_blocking(Token, || 42));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            operation.as_mut().poll(&mut context),
+            Poll::Ready(Err(Error::SpawnFailed(_)))
+        ));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_converts_blocking_panic() {
+        let runtime = ::tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(Tokio::spawn_blocking(Token, || panic!("test panic")));
+        assert!(
+            matches!(result, Err(Error::SpawnFailed(message)) if message.contains("test panic"))
+        );
+    }
+
+    #[cfg(feature = "smol")]
+    #[test]
+    fn smol_converts_blocking_panic() {
+        let result = ::smol::block_on(Smol::spawn_blocking(Token, || panic!("test panic")));
+        assert!(
+            matches!(result, Err(Error::SpawnFailed(message)) if message.contains("test panic"))
+        );
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn dropping_tokio_future_skips_queued_work() {
+        use std::task::{Context, Poll, Waker};
+        let runtime = ::tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = ::tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            started_rx.recv().unwrap();
+            let called = Arc::new(AtomicBool::new(false));
+            let worker_called = Arc::clone(&called);
+            let mut operation = Box::pin(Tokio::spawn_blocking(Token, move || {
+                worker_called.store(true, Ordering::Release)
+            }));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(matches!(
+                operation.as_mut().poll(&mut context),
+                Poll::Pending
+            ));
+            drop(operation);
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            // The single worker processes the cancelled closure before this sentinel.
+            ::tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(!called.load(Ordering::Acquire));
+        });
+    }
+}
+
+#[cfg(test)]
+mod receiver_tests {
+    use super::*;
+    use crate::{Ndi, ReceiverOptions, RuntimeFeature};
+
+    /// An async receiver of `ndi` that stays unconnected: its source has no
+    /// name and no address.
+    fn unconnected<R: AsyncRuntime>(ndi: &Ndi) -> AsyncReceiver<R> {
+        AsyncReceiver::new(Receiver::new(ndi, &ReceiverOptions::new(Source::new(""))).unwrap())
+    }
+
+    /// Lending the receiver added no field: the auto traits are those the
+    /// type had before. It is not `UnwindSafe`, because its shared
+    /// [`Receiver`] is deliberately not `RefUnwindSafe`.
+    #[test]
+    fn async_receivers_keep_their_auto_traits() {
+        fn shared<T: Send + Sync + Clone + 'static>() {}
+        #[cfg(feature = "tokio")]
+        shared::<AsyncReceiver<Tokio>>();
+        #[cfg(feature = "smol")]
+        shared::<AsyncReceiver<Smol>>();
+    }
+
+    /// Every future can be spawned on a multi-threaded executor.
+    fn futures_are_send<R: AsyncRuntime>(receiver: &AsyncReceiver<R>, source: &Source) {
+        fn send<T: Send>(_: T) {}
+        send(receiver.video().capture(Duration::ZERO));
+        send(receiver.poll_event(Duration::ZERO));
+        send(receiver.poll_source_name_change(Duration::ZERO));
+        send(receiver.connect_to(source));
+        send(receiver.disconnect());
+        send(receiver.reconnect());
+    }
+
+    #[test]
+    fn async_receiver_futures_are_send() {
+        // Type checking is the test: the function is never called.
+        #[cfg(feature = "tokio")]
+        let _: fn(&AsyncReceiver<Tokio>, &Source) = futures_are_send::<Tokio>;
+        #[cfg(feature = "smol")]
+        let _: fn(&AsyncReceiver<Smol>, &Source) = futures_are_send::<Smol>;
+    }
+
+    /// Every async operation of `receiver`, which `unconnected` made.
+    async fn operations_of_an_unconnected_receiver<R: AsyncRuntime>(
+        ndi: &Ndi,
+        receiver: &AsyncReceiver<R>,
+    ) {
+        // The lent receiver is the one the operations use.
+        assert!(std::ptr::eq(receiver.receiver(), &*receiver.inner));
+        assert_eq!(receiver.receiver().source(), &Source::new(""));
+
+        let excessive = crate::MAX_TIMEOUT + Duration::from_nanos(1);
+        assert!(matches!(
+            receiver.poll_event(excessive).await,
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            receiver.poll_source_name_change(excessive).await,
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(receiver.poll_event(Duration::ZERO).await.unwrap().is_none());
+        let change = receiver.poll_source_name_change(Duration::ZERO).await;
+        if ndi
+            .require_feature(RuntimeFeature::ConnectedSourceName)
+            .is_ok()
+        {
+            assert!(change.is_ok(), "{change:?}");
+        } else {
+            assert!(
+                matches!(change, Err(Error::UnsupportedCapability { .. })),
+                "{change:?}"
+            );
+        }
+
+        assert!(matches!(
+            receiver.connect_to(&Source::new("NUL\0in name")).await,
+            Err(Error::InvalidCString(_))
+        ));
+        receiver.connect_to(&Source::new("")).await.unwrap();
+        receiver.disconnect().await.unwrap();
+        receiver.reconnect().await.unwrap();
+        // The original target is unchanged by connect_to and disconnect.
+        assert_eq!(receiver.receiver().source(), &Source::new(""));
+    }
+
+    #[cfg(feature = "smol")]
+    #[test]
+    fn smol_operations_of_an_unconnected_receiver() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = unconnected::<Smol>(&ndi);
+        ::smol::block_on(operations_of_an_unconnected_receiver(&ndi, &receiver));
+    }
+
+    #[cfg(feature = "tokio")]
+    mod tokio_runtime {
+        use super::*;
+        use crate::receiver::native_capture_calls;
+        use std::{
+            sync::mpsc,
+            task::{Context, Poll, Waker},
+            time::Instant,
+        };
+
+        /// A runtime with one blocking thread, so that work queues behind a
+        /// blocker, and every native capture is made, and counted, on that
+        /// one thread.
+        fn runtime() -> ::tokio::runtime::Runtime {
+            ::tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(1)
+                .build()
+                .unwrap()
+        }
+
+        /// The native captures made on the one blocking thread since the
+        /// previous call.
+        async fn worker_capture_calls() -> usize {
+            ::tokio::task::spawn_blocking(native_capture_calls::take)
+                .await
+                .unwrap()
+        }
+
+        /// Occupy the one blocking thread until the returned sender is used.
+        fn occupy_worker() -> (mpsc::Sender<()>, ::tokio::task::JoinHandle<()>) {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let blocker = ::tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            started_rx.recv().unwrap();
+            (release_tx, blocker)
+        }
+
+        #[test]
+        fn tokio_operations_of_an_unconnected_receiver() {
+            let Some(ndi) = crate::test_support::ndi() else {
+                return;
+            };
+            let receiver = unconnected::<Tokio>(&ndi);
+            runtime().block_on(operations_of_an_unconnected_receiver(&ndi, &receiver));
+        }
+
+        #[test]
+        fn poll_event_with_zero_timeout_makes_one_attempt_without_waiting() {
+            let Some(ndi) = crate::test_support::ndi() else {
+                return;
+            };
+            let receiver = unconnected::<Tokio>(&ndi);
+            runtime().block_on(async {
+                worker_capture_calls().await;
+                let began = Instant::now();
+                assert!(receiver.poll_event(Duration::ZERO).await.unwrap().is_none());
+                let waited = began.elapsed();
+                assert!(waited < Duration::from_millis(500), "{waited:?}");
+                assert_eq!(worker_capture_calls().await, 1);
+            });
+        }
+
+        #[test]
+        fn poll_event_spends_blocking_pool_queue_delay_from_its_budget() {
+            let Some(ndi) = crate::test_support::ndi() else {
+                return;
+            };
+            let receiver = unconnected::<Tokio>(&ndi);
+            runtime().block_on(async {
+                worker_capture_calls().await;
+                let (release, blocker) = occupy_worker();
+                let budget = Duration::from_millis(300);
+                let mut poll = Box::pin(receiver.poll_event(budget));
+                let mut context = Context::from_waker(Waker::noop());
+                assert!(matches!(poll.as_mut().poll(&mut context), Poll::Pending));
+                // Keep the one blocking thread until the whole budget is spent.
+                std::thread::sleep(budget + Duration::from_millis(20));
+                release.send(()).unwrap();
+                assert!(poll.await.unwrap().is_none());
+                blocker.await.unwrap();
+                // Nothing was left: one attempt without waiting, where a budget
+                // started on the blocking thread would have made three or more.
+                assert_eq!(worker_capture_calls().await, 1);
+            });
+        }
+
+        #[test]
+        fn dropping_a_queued_poll_event_makes_no_attempt() {
+            let Some(ndi) = crate::test_support::ndi() else {
+                return;
+            };
+            let receiver = unconnected::<Tokio>(&ndi);
+            runtime().block_on(async {
+                worker_capture_calls().await;
+                let (release, blocker) = occupy_worker();
+                let mut poll = Box::pin(receiver.poll_event(Duration::from_secs(5)));
+                let mut context = Context::from_waker(Waker::noop());
+                assert!(matches!(poll.as_mut().poll(&mut context), Poll::Pending));
+                drop(poll);
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                // The one blocking thread runs the cancelled closure before
+                // this count, and the closure stopped at its gate.
+                assert_eq!(worker_capture_calls().await, 0);
+            });
+        }
+    }
+}

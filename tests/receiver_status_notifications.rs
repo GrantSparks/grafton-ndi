@@ -1,6 +1,8 @@
 mod common;
 
-use grafton_ndi::{Error, MetadataFrame, Receiver, ReceiverOptions, Sender, SenderOptions, NDI};
+use grafton_ndi::{
+    Error, MetadataFrame, Receiver, ReceiverEvent, ReceiverOptions, Sender, SenderOptions, Timecode,
+};
 use std::time::{Duration, Instant};
 
 fn wait_until(stage: &str, mut condition: impl FnMut() -> bool) {
@@ -12,51 +14,41 @@ fn wait_until(stage: &str, mut condition: impl FnMut() -> bool) {
 }
 
 #[test]
-#[ignore = "Requires NDI runtime and loopback networking"]
 fn media_capture_retains_capability_notifications() -> Result<(), Error> {
-    let ndi = NDI::new()?;
-    eprintln!("SDK: {} on {}", NDI::version()?, std::env::consts::OS);
-    // Keep the endpoints distinct while exercising each capture API. Immediate
-    // port reuse after sender/receiver teardown can stall the Windows runtime.
+    let Some(ndi) = common::ndi() else {
+        return Ok(());
+    };
+    eprintln!(
+        "SDK: {} on {}",
+        ndi.info().raw_version(),
+        std::env::consts::OS
+    );
+    // Keep every source alive so each capture API uses a distinct live endpoint
+    // rather than immediately reusing a retired sender's address. Rapid sender
+    // teardown is covered by the separate lifecycle stress test.
     let senders = (0..6)
         .map(|kind| {
             Sender::new(
                 &ndi,
-                &SenderOptions::builder(format!("status retention {} {kind}", std::process::id()))
-                    .build(),
+                &SenderOptions::new(common::unique_name(&format!("status retention {kind}"))),
             )
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, Error>>()?;
     for (kind, sender) in senders.iter().enumerate() {
         let source = common::loopback_source(&ndi, sender)?;
         eprintln!("capture case {kind}: connecting to {source:?}");
-        let options = ReceiverOptions::builder(source).build();
-        // Windows 6.3.2 can fail to deliver a capability update to both idle
-        // receivers. Observe PTZ readiness on the receiver under test there;
-        // the other platforms also use a control for the web-control update.
-        let control = if cfg!(target_os = "windows") {
-            None
-        } else {
-            Some(Receiver::new(&ndi, &options)?)
-        };
+        // Each capture API must retain this receiver's own capability event.
+        let options = ReceiverOptions::new(source);
         let media = Receiver::new(&ndi, &options)?;
-        wait_until("initial receiver connections", || {
-            control.as_ref().is_none_or(Receiver::is_connected) && media.is_connected()
-        });
-        for receiver in control.iter().chain(std::iter::once(&media)) {
-            while receiver
-                .poll_status_change(Duration::from_millis(50))?
-                .is_some()
-            {}
-            assert!(!receiver.ptz_is_supported());
-        }
+        wait_until("initial receiver connection", || media.is_connected());
+        while media.poll_event(Duration::from_millis(50))?.is_some() {}
+        assert!(!media.ptz().is_supported());
         // Exercise two distinct capability invalidations using the SDK's
         // Send_VirtualPTZ / Send_Capabilities XML conventions. Capability flag
         // reset behavior on idle receivers is not part of notification retention.
-        // Windows SDK 6.3.2 delivers PTZ enable but does not reliably publish the
-        // subsequent idle web-control change to both receivers. Cover the first
-        // event for every kind there; repeated publication/consumption is also
-        // covered by deterministic receiver unit tests on every platform.
+        // Retain the existing single-invalidation coverage on Windows.
+        // Repeated publication/consumption is also covered by deterministic
+        // receiver unit tests on every platform.
         let updates = if cfg!(target_os = "windows") { 1 } else { 2 };
         for (update, capabilities) in [
             "<ndi_capabilities ntk_ptz=\"true\"/>",
@@ -68,25 +60,19 @@ fn media_capture_retains_capability_notifications() -> Result<(), Error> {
         {
             eprintln!("capture case {kind}: capability update {update}");
             sender.clear_connection_metadata();
-            sender.add_connection_metadata(&MetadataFrame::with_data(capabilities, 0)?);
+            sender.add_connection_metadata(
+                &MetadataFrame::new(capabilities)?.with_timecode(Timecode::from_ticks(0)),
+            );
             if update == 0 {
-                wait_until("PTZ capability enable", || {
-                    control.as_ref().is_none_or(Receiver::ptz_is_supported)
-                        && media.ptz_is_supported()
+                wait_until("PTZ capability enable", || media.ptz().is_supported());
+            } else {
+                wait_until("web-control capability update", || {
+                    media.web_control_url().unwrap().as_deref()
+                        == Some("http://127.0.0.1/status-control")
                 });
             }
-            if let Some(control) = &control {
-                wait_until("control status notification", || {
-                    control
-                        .poll_status_change(Duration::from_millis(10))
-                        .unwrap()
-                        .is_some()
-                });
-            }
-            // PTZ enable has a public readiness probe above. The independent
-            // web-control change has no public getter here, so allow its SDK
-            // notification to reach the media receiver during capture. Recv.h permits
-            // web-control publication to take a second or two after connection.
+            // Both capability getters observe this receiver without consuming
+            // its status notification. Keep the existing SDK capture budgets.
             let poll_timeout = if update == 0 {
                 Duration::ZERO
             } else {
@@ -98,27 +84,24 @@ fn media_capture_retains_capability_notifications() -> Result<(), Error> {
                 Duration::from_secs(3)
             };
             match kind {
-                0 => assert!(media.video().try_capture(poll_timeout)?.is_none()),
-                1 => assert!(media.video().try_capture_ref(poll_timeout)?.is_none()),
-                2 => assert!(media.audio().try_capture(poll_timeout)?.is_none()),
+                0 => assert!(media.video().capture(poll_timeout)?.is_none()),
+                1 => assert!(media.video().capture_ref(poll_timeout)?.is_none()),
+                2 => assert!(media.audio().capture(poll_timeout)?.is_none()),
                 3 => {
                     // SDK 6.3 can also deliver capability XML as ordinary
                     // metadata. Consume those valid frames until the status/no-
                     // frame result, rather than assuming a frameless stream.
                     let deadline = Instant::now() + Duration::from_secs(10);
-                    while media.metadata().try_capture(poll_timeout)?.is_some() {
+                    while media.metadata().capture(poll_timeout)?.is_some() {
                         assert!(Instant::now() < deadline, "metadata queue did not drain");
                     }
                 }
-                4 => assert!(matches!(
-                    media.video().capture(retry_timeout),
-                    Err(Error::FrameTimeout { .. })
-                )),
+                4 => assert!(media.video().capture(retry_timeout)?.is_none()),
                 _ => std::thread::scope(|scope| {
                     let workers: Vec<_> = (0..3)
                         .map(|_| {
                             scope.spawn(|| {
-                                assert!(media.video().try_capture(poll_timeout).unwrap().is_none());
+                                assert!(media.video().capture(poll_timeout).unwrap().is_none());
                             })
                         })
                         .collect();
@@ -128,11 +111,17 @@ fn media_capture_retains_capability_notifications() -> Result<(), Error> {
                 }),
             }
             assert!(
-                media.poll_status_change(Duration::ZERO)?.is_some(),
+                matches!(
+                    media.poll_event(Duration::ZERO)?,
+                    Some(ReceiverEvent::StatusChanged(_))
+                ),
                 "capture kind {kind} lost status"
             );
             assert!(
-                media.poll_status_change(Duration::ZERO)?.is_none(),
+                !matches!(
+                    media.poll_event(Duration::ZERO)?,
+                    Some(ReceiverEvent::StatusChanged(_))
+                ),
                 "notification replayed"
             );
         }

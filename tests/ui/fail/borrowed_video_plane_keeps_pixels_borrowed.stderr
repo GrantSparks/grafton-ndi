@@ -1,0 +1,10 @@
+error[E0502]: cannot borrow `pixels` as mutable because it is also borrowed as immutable
+  --> tests/ui/fail/borrowed_video_plane_keeps_pixels_borrowed.rs:9:5
+   |
+ 4 |     let frame = BorrowedVideoFrame::builder(&pixels, 2, 2, PixelFormat::Bgra)
+   |                                             ------- immutable borrow occurs here
+...
+ 9 |     pixels.fill(1);
+   |     ^^^^^^ mutable borrow occurs here
+10 |     let _ = plane.row(0);
+   |             ----- immutable borrow later used here

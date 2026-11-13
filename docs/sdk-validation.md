@@ -1,260 +1,446 @@
-# NDI SDK 6.3.2 validation for 2.0.0
+# SDK integration validation
 
-Validated on 2026-10-16 using Rust 1.99.0 on an x86_64 Debian 12 host. NDI's
-[developer page](https://ndi.video/for-developers/) and
-[release notes](https://docs.ndi.video/all/developing-with-ndi/sdk/release-notes)
-identify 6.3.2 as the current SDK. The downloaded Linux, Android, and Apple
-`Version.txt` files identify `v6.3.2.0`, dated 2026-04-13; the Linux x86_64
-runtime also reports `6.3.2.0` through `NDIlib_version()`. The Windows x86/x64
-DLL version resources identify 6.3.2.
+This document states what the tests of the current version cover, the
+measured behavior of the NDI SDK that the crate relies on, and how to repeat
+the tests on your own machine. The
+[README](../README.md#supported-ndi-versions-and-platforms) summarizes it. The
+crate supports NDI 6 runtimes and Rust 1.88 or later.
 
-This validates the wrapper's existing APIs against the new SDK. It does not add
-wrappers for every new NDI 6.3 discovery/advertiser API, or require 6.3.2 as a new
-minimum version. Bindings continue to be generated from the installed headers.
-The standard SDK was used; an actual Advanced SDK installation was not tested.
+## What the tests cover
 
-## SDK baseline coverage
+The test suite runs with `cargo test --locked` on the platforms and runtimes
+listed under [Platform coverage](#platform-coverage). Every run against a real
+runtime uses `--config ci/offline.toml`, which on Linux and macOS confines each
+test executable to loopback networking, and sets `GRAFTON_NDI_EXPECTED_RUNTIME`,
+`GRAFTON_NDI_EXPECTED_VERSION` and `GRAFTON_NDI_EXPECTED_EDITION`, so each test
+that loads a runtime checks that it has loaded exactly the intended file,
+version and edition.
 
-Every successful build below linked **all examples with all features**, rather
-than stopping at `cargo check` or an unlinked Rust library.
+### Runs with one SDK
 
-| Target | NDI library directory | Result on this host |
+Each row of the `sdk` CI job runs the suite against one runtime, with all
+features and with no default features; the
+[CI guide](../ci/README.md#the-sdk-job) lists the rows.
+`GRAFTON_NDI_REQUIRE_RUNTIME` states what the row's runtime provides, so that
+a test cannot pass by skipping, and each row visibly skips the Advanced or
+File operations that its build and runtime cannot provide. Without a runtime,
+the tests that need one report skips. The ignored tests are a manual
+benchmark, a slow stress test and, with all features or `image-encoding`, a
+second manual benchmark.
+
+`tests/receiver_video_only.rs` sends in real time, clocked 30 fps video with
+1/30 s of audio per frame. A sender that sends as fast as its loop turns, some
+500 times real time, on a machine with every core busy, makes the runtime drop
+a receiver's connection within the first second and not restore it within 30
+seconds, even after the load and the sending stop.
+
+### Runs that cross versions
+
+"Advanced headers" below is the Advanced SDK that `NDI_SDK_DIR` names for a
+build with the `advanced` feature, whose Advanced-only headers that build
+reads; "None" is a build that reads no SDK. The core bindings are always the
+vendored 6.4.0.2 ones. These are the crossed runs the `sdk` CI job makes on
+its Linux x64 Advanced 6.4.0.2 row, all with every feature enabled. In each, a
+second process on the "peer" runtime sends video, audio and metadata to a
+receiver on the run's runtime, and `tests/sdk_peers.rs` checks the decoded
+pixels, nonzero audio samples, frame timecodes and metadata. Both processes
+are confined to loopback, and each checks the identity of the runtime it
+loaded.
+
+| Advanced headers | Runtime | Peer sending | `GRAFTON_NDI_REQUIRE_RUNTIME` |
+| --- | --- | --- | --- |
+| Advanced 6.4.0.2 | Standard 6.1.1 | Advanced 6.4.0.2 | `1` |
+| Advanced 6.4.0.2 | Advanced 6.3.2 | Advanced 6.4.0.2 | `advanced` |
+| None | Advanced 6.4.0.2 | Standard 6.1.1 | `1,file,discovery-server` |
+| Advanced 6.3.2 | Advanced 6.4.0.2 | Advanced 6.3.2 | `advanced,file,discovery-server` |
+
+So 6.1.1 and 6.4 exchange media in both directions, as do Advanced 6.3.2 and
+6.4, and Advanced builds run against runtimes of another version in both
+directions.
+
+To require the peer test locally, set `GRAFTON_NDI_PEER_RUNTIME` to the second
+SDK's exact library path, `GRAFTON_NDI_PEER_VERSION` to its four-component
+version, and `GRAFTON_NDI_PEER_EDITION` to `standard` or `advanced`; the peer
+must be a different version from the runtime the tests load. With these set, a
+missing peer, an identity mismatch, a delivery failure or a failed shutdown of
+the child process fails the test. Without them it reports a skip.
+
+### What each runtime provides
+
+The Linux x86_64 runtimes report their versions as `6.1.1` (for 6.1.1),
+`6.3.2.0` and `6.4.0.2` at the end of their version text. A build with the
+Advanced SDK 6.4.0.2 headers reports these capabilities for them:
+
+| Capability | Standard 6.1.1 | Standard 6.3.2 | Advanced 6.3.2 | Standard 6.4.0.2 | Advanced 6.4.0.2 |
+| --- | --- | --- | --- | --- | --- |
+| `Planar444Video`, `ReceiveBest444`, `ReceiveVideoOnly` | `RuntimeTooOld` | `RuntimeTooOld` | `RuntimeTooOld` | Available | Available |
+| `ReceiveDelay`, `SdkTimestamp` | `SymbolUnavailable` | `SymbolUnavailable` | `SymbolUnavailable` | Available | Available |
+| `ConnectedSourceName` | `SymbolUnavailable` | Available | Available | Available | Available |
+| `SenderAdvertising`, `ReceiverAdvertising`, `SenderDiscovery`, `ReceiverDiscovery` | `SymbolUnavailable` | `RuntimeTooOld` | `RuntimeTooOld` | Available | Available |
+| `AdvancedSenderAdvertiserConfiguration`, `AdvancedReceiverAdvertiserConfiguration`, `AdvancedSenderListenerConfiguration`, `AdvancedReceiverListenerConfiguration` | `WrongEdition` | `WrongEdition` | `RuntimeTooOld` | `WrongEdition` | Available |
+| Every other Advanced capability, including `Passthrough` with each of the 15 presets | `WrongEdition` | `WrongEdition` | Available | `WrongEdition` | Available |
+| The other seven capabilities | Available | Available | Available | Available | Available |
+| `FileApi::open` | Refused: Standard runtime | Refused: Standard runtime | No File library | Refused: Standard runtime | Available |
+
+An operation whose capability is unavailable returns
+`Error::UnsupportedCapability` before any native call is made. The 6.1.1 and
+6.3.2 SDKs include no File library.
+
+### Image encoding
+
+`tests/image_color_sdk.rs` pins the SDK's color conversion: BT.709 at 720×576,
+1920×1080 and 3840×2160 whatever the tag, tags passed through, repeated
+chroma, RGB sent as BT.709 limited range, a PQ tag reaching an RGB receiver,
+and FrameSync frames. `tests/video_padding_sdk.rs` encodes UYVY and P216
+frames in place from the SDK's padded rows. See the
+[image encoding guide](image-encoding.md) and its
+[performance notes](image-encoding-performance.md).
+
+### Reads past the end of sent video
+
+The x86 builds of the SDK read past the last pixel of many UYVY and UYVA
+frames they send. The SDK's documentation gives a UYVY frame as its line
+stride times its height, asks for no alignment and no padding, and asks only
+that widths be even; its own examples allocate exactly that. The builds for
+64-bit ARM Linux read every frame exactly.
+
+#### x86-64
+
+Progressive frames, by size:
+
+| Runtimes | Formats | Sizes | Result |
+| --- | --- | --- | --- |
+| Standard 6.1.1, 6.3.2 and 6.4.0.2; Advanced 6.3.2 and 6.4.0.2 | UYVY | 640×480, 720×480, 720×576, 854×480, 1280×720, 1366×768, 1920×1080, 1918×1080, 1080×1920, 640×1080, 642×32, 3840×2160 | The same on every runtime. No read past 640×480, 1280×720, 1920×1080 and 3840×2160. 4 bytes past 720×480, 720×576 and 1918×1080, 12 past 640×1080, 16 past 1080×1920, 20 past 854×480 and 1366×768, 28 past 642×32 |
+| The same | UYVA | The same | The same on every runtime. 5 bytes past 854×480, 7 past 720×480, 720×576 and 642×32, 8 past 1366×768, 12 past 640×1080; none past the others |
+| The same | P216, PA16, NV12, I420, YV12, BGRA, BGRX, RGBA, RGBX | The same | No read past the frame |
+| Standard and Advanced 6.4.0.2 | NA48, NB48, NA4G, NB4G | Eight, from 18×32 to 3840×2160 | No read past the frame |
+| Standard 6.4.0.2 | UYVY | 605: every even width to 200 at heights of 32 and 480, and 135 wider ones to 4096 at heights of 32, 480 and 1080 | Reads past 443 of them, 28 bytes at most. Whenever the width is not a multiple of 16, by at least the bytes that would complete the row's last 16 pixels. At 231 of the 393 sizes whose width is a multiple of 16, by up to 12 |
+| Standard 6.4.0.2 | UYVA | The same 605 | Reads past 244 of them, 14 bytes at most |
+
+The scan type changes the answer. With Standard 6.4.0.2, in bytes past the
+frame, for progressive, interlaced and single-field frames:
+
+| Size | UYVY | UYVA |
 | --- | --- | --- |
-| `x86_64-unknown-linux-gnu` | `lib/x86_64-linux-gnu` | Full native test suite, SDK regressions, and examples passed |
-| `i686-unknown-linux-gnu` | `lib/i686-linux-gnu` | Examples linked; 262 library tests passed using the 32-bit glibc loader |
-| `aarch64-unknown-linux-gnu` | `lib/aarch64-rpi4-linux-gnueabi` | Examples linked; 262 library tests passed under QEMU |
-| `armv7-unknown-linux-gnueabihf` | `lib/arm-rpi4-linux-gnueabihf` | Examples linked; 262 library tests passed under QEMU |
-| `arm-unknown-linux-gnueabihf` | `lib/arm-rpi1-linux-gnueabihf` | Examples linked; 262 library tests passed under QEMU |
-| `x86_64-pc-windows-msvc` | `Lib/x64` | Examples linked using cargo-xwin; no Windows runtime tests here |
-| `i686-pc-windows-msvc` | `Lib/x86` | Examples linked using cargo-xwin; no Windows runtime tests here |
-| `aarch64-linux-android` | `lib/arm64-v8a` | Examples linked using NDK r27d, API 24 |
-| `armv7-linux-androideabi` | `lib/armeabi-v7a` | Examples linked using NDK r27d, API 24 |
-| `i686-linux-android` | `lib/x86` | Examples linked using NDK r27d, API 24 |
-| `x86_64-linux-android` | `lib/x86_64` | Examples linked using NDK r27d, API 24 |
-| `aarch64-apple-darwin`, `x86_64-apple-darwin` | `lib/macOS` | Installer/hash inspected; no Apple platform SDK or runtime on this host |
-| iOS and other Apple mobile targets | Apple static libraries | Not currently supported by the build script; no local build/runtime validation |
+| 1920×1080 | 0, 4, 12 | 0, 5, 14 |
+| 1280×720 | 0, 0, 12 | 0, 0, 14 |
+| 3840×2160 | 0, 0, 0 | 0, 0, 0 |
+| 720×480 | 4, 4, 4 | 7, 7, 4 |
+| 720×576 | 4, 4, 8 | 7, 7, 14 |
+| 720×486 | 4, 4, 12 | 7, 7, 13 |
+| 640×480 | 0, 0, 12 | 0, 0, 14 |
+| 642×32 | 28, 28, 28 | 7, 7, 7 |
 
-Each Linux library run also had one intentionally ignored test. QEMU coverage
-does not replace device testing. Android still needs device/emulator runtime
-testing, including discovery and application packaging. The Windows-hosted
-Android installer was downloaded and hashed; its four `libndi.so` files match
-the Linux-hosted installer byte for byte. Builds used the Linux-hosted one.
+Standard 6.1.1 and 6.3.2 and Advanced 6.4.0.2 give the same figures at the
+four of these sizes measured with them. Interlaced and single-field UYVY
+frames of 51 widths from 2 to 3840, and 32, 480 and 1080 rows high, are read
+at most 28 bytes past.
 
-Before the dependency/runtime migration in #114, native Linux checks passed: `cargo test --all-features`, all six build-selection
-tests, Clippy with warnings denied, examples with all features, Rust 1.87 library
-compatibility, and the normally ignored sender lifecycle, receiver status,
-FrameSync audio, and video-padding SDK regression suites. The full native run
-included 262 library tests, compile-contract fixtures, and 73 doctests.
+A height that is not a multiple of four is read further when the frame is
+interlaced or a single field. At 1920×1082, 1920×1086, 2560×1442, 3840×2162
+and 26 other sizes, all larger in area than 1920×1080, an interlaced UYVY
+frame is read to the end of the row after next, two line strides past the
+frame, on every runtime measured; single fields of 2560×1083 and 3840×1083
+are read one row past. No progressive frame is, no frame whose height is a
+multiple of four, and no UYVA frame of those sizes.
 
-CI retains native Linux, Windows, and macOS testing and adds cross-build jobs for
-all four Android ABIs. Linux ARM/x86 and Windows x86 cross-build results above
-were validated locally; they are not additional CI runtime jobs. The macOS CI
-job covers the architecture of its hosted runner, not both Mac architectures.
+Three more facts bear on what a program sees:
 
-## Dependency/runtime migration validation
+- The reads happen on every frame, whether or not a receiver is connected.
+- Where a frame ends within its page matters. On the five runtimes, a frame
+  whose width is a multiple of 16 and that ends exactly on a page boundary is
+  read exactly, while a 720×480 frame that ends elsewhere in a page is read 4
+  bytes past. The figures above are for frames that end near a page boundary,
+  so each is the furthest read measured and not a bound.
+- What the SDK reads is compressed into the picture. A 642×32 UYVY frame
+  followed by bytes of 16, and the same frame followed by bytes of 235,
+  arrive with 12 samples different, by up to 3, all in the last two columns
+  of the last eight rows.
 
-Additional validation on 2026-10-16 uses the same standard NDI SDK 6.3.2.0 on
-Debian 12 x86_64, with the new Rust 1.88 minimum and optional smol adapter. These
-results validate the implementation of #114 separately from the SDK baseline
-above and its historical Rust 1.87 check.
+#### 64-bit ARM
 
-- Rust 1.88: all-target/all-feature check and 266 library tests passed; one test
-  remains intentionally ignored. Compiler-diagnostic fixtures use stable Rust.
-- Stable Rust 1.99: all-feature tests passed, including 266 library tests,
-  39 compile-contract cases, and 73 doctests. Clippy and rustdoc passed with
-  warnings denied. Default/all-feature examples built and example tests passed.
-- All 10 normally ignored SDK regressions passed across async-send lifecycle,
-  sender stress, receiver status, FrameSync audio, and padded video. Padded-video
-  coverage exercises both Tokio and smol owned capture.
-- The resolved graph passed `cargo audit --deny warnings` with zero
-  vulnerabilities and zero warnings. It contains event-listener 5.4.2 and no
-  async-std or once_cell. Direct dependency floors are recorded in `Cargo.toml`;
-  consuming applications still need to refresh affected lockfiles.
+None of the Linux builds for 64-bit ARM, Standard 6.1.1, 6.3.2 and 6.4.0.2
+and Advanced 6.4.0.2, reads past a frame. With Standard 6.4.0.2 that holds
+for UYVY and UYVA frames of 38 widths, six heights and the four scan types,
+and for six other formats.
 
-The [release preparation PR](https://github.com/GrantSparks/grafton-ndi/pull/115)
-provides native Linux/Windows/macOS CI and four Android example-link checks.
-Those checks and the main-branch Pages deployment establish hosted coverage;
-local cross-linking from the SDK baseline is not native execution of this
-migration. Android device execution and an actual Advanced SDK installation
-remain untested.
+#### 32-bit x86
 
-## Final cache, snapshot, and pixel-view validation
+The 32-bit x86 Linux build of Standard 6.4.0.2 reads a progressive 642×32
+UYVY frame exactly, where the x86-64 builds read past it, and
+`tests/send_tail_room_sdk.rs` checks that it does. It is measured at no other
+size, so the crate keeps the x86 room for it.
 
-The final 2.0.0 fixes for #117–#119 add canonical cache identity, row-bounded
-image conversion, and scoped transfer of immutable video views. Their checks
-use stable Rust 1.99 on Debian 12 x86_64 with standard NDI SDK 6.3.2.0;
-library and compile-contract coverage also ran against standard SDK 6.1.1.
+The same runtime returns a 3840×2160 UYVY frame with the chroma inside flat
+areas off by up to 41 code values, and does not give two receivers of one
+stream the same picture; the luma, and frames of 720×576 and 1920×1080, are
+intact. `tests/image_color_sdk.rs` leaves 3840×2160 out on 32-bit x86.
 
-- All-feature library tests: 269 passed, with two manual throughput comparisons
-  intentionally ignored in ordinary runs. The public compile suite contains 45
-  pass/fail cases, including owner lifetimes and both FrameSync auto traits.
-- All-feature rustdoc examples: 74 passed. Strict Clippy and rustdoc builds pass.
-- All 13 examples build with default and all features. Example tests include the
-  two PCM conversion regressions. Contributor checks also build and test each
-  independent optional-runtime configuration; PNG requires `image-encoding`.
-- The live padded-video regression resolves the advertised machine through
-  hostname case/final-dot variants, invalidates and rediscovers it, connects a
-  receiver, transfers pixel views to scoped workers, and encodes both receiver
-  and FrameSync frames before freeing them on their permitted thread.
-- The same live regression passes under Valgrind Memcheck with zero errors.
-  It observes a 2592-byte SDK stride for 642-pixel BGRA, versus 2568 active bytes.
-  The synthetic uninitialized-padding library tests also pass Memcheck with
-  zero errors, including scoped reads of packed and multiplane formats.
-- Release-mode encoding comparisons cover 1080p/4K/8K, padding, pixel entropy,
-  PNG, and JPEG quality 1/85/100, with scalar and unified JPEG SIMD builds. See
-  [image encoding resources](image-encoding-performance.md) for the measured
-  conversion scratch, codec/output peak allocations, timings, and commands.
+#### What the crate does
 
-The existing native desktop, Android example-link, MSRV, audit, and semver CI
-checks apply to these fixes. See the
-[final release PR](https://github.com/GrantSparks/grafton-ndi/pull/120) for their
-results. An `--all-features` standard-SDK build still does not validate an actual
-Advanced SDK installation. Android device execution and physical PTZ/camera
-behavior remain outside the local coverage.
+`PixelFormat::send_tail_room` is the room the crate gives the SDK after a
+frame: 64 zero bytes for UYVY and UYVA, none for the other formats, and none
+at all on 64-bit ARM Linux. An interlaced or single-field UYVY or UYVA frame
+whose height is not a multiple of four gets two line strides more. An owned
+frame's allocation holds the room; `Sender::send_video` sends a borrowed
+frame in place when its buffer has the room, or the caller vouches for it
+with `BorrowedVideoFrameBuilder::readable_after`, and from a copy in a buffer
+the sender keeps when it does not. On other architectures and operating
+systems the crate takes the x86 figures.
 
-To repeat the live padding check on a configured Linux SDK installation:
+The copy costs time. Sending a UYVY frame from a buffer that ends with it,
+against the same frame with room, takes 0.15 ms longer at 1280×720, 0.28 ms
+at 1920×1080 and 1.1 ms at 3840×2160 with the 6.3.2 and 6.4.0.2 runtimes, in
+a release build on Linux x86-64: 18%, 15% and 54% of the send.
+
+`tests/send_tail_room_sdk.rs` sends UYVY and UYVA frames of nine sizes and the
+four scan types from memory that ends at an inaccessible page, with exactly
+the crate's room and with none, through every video send; and it pins what
+the bytes after a frame do to the picture, as room, after a buffer and
+vouched for, with the SDK's reading of them. With the room cut to one row, or
+to 24 bytes, or the copy disabled, its first test ends in a segmentation
+fault on x86-64. Under Valgrind Memcheck, with Standard 6.3.2 and 6.4.0.2 on
+x86-64, neither that test nor `tests/video_padding_sdk.rs`, sending from
+vectors that end with the frame, reads or writes outside an allocation,
+apart from four reports in glibc's dynamic loader with 6.3.2. The first also
+draws reports of uninitialised values, every one of them in memory the SDK
+allocated.
+
+On the five x86-64 runtimes, the audio sends, planar and interleaved, of 1 to
+16 channels and 1 to 1,920 samples, and the V210, P216 and audio conversion
+utilities read and write nothing outside their buffers.
+
+## Compatibility safeguards and additional runtime checks
+
+Which Advanced operations a build can perform follows from the declarations
+generated from the installed headers. A family of functions that the headers
+lack disables only that family, and types or receive presets that older headers
+lack do not stop them compiling. The build script and the runtime tables take
+the families from one registry, `src/sys/advanced_tables.rs`. The coverage test
+requires every Advanced function the installed headers declare to belong to a
+family or to be listed as deliberately not wrapped. `tests/advanced_headers.rs`
+builds the crate, with warnings denied, against synthetic partial headers and
+checks the capabilities that build reports. That tests the fallback.
+
+Further tests against 6.4 check a real lossless HEVC 4:4:4 frame, including
+every sample of its three full-resolution planes; audio suppression by both
+video-only bandwidth settings, with an ordinary receiver as a control; AVSync
+following changes in video size, frame rate, audio sample rate and channel
+count while preserving nonzero samples; and both Genlock clocks following a
+local source and falling back to paced system clocks. The KVM boundary test
+checks failed release, retry on drop, touch coordinates and clipboard
+ownership using stand-in functions.
+
+A FrameSync and raw audio capture on its receiver compete for the receiver's
+audio, which is why `Receiver<FrameSyncAttached>` has no audio capture.
+Measured on Linux x86_64 over loopback with Standard 6.3.2 and 6.4, with a
+clocked sender of 30 fps video, each frame with 1600 samples of 48 kHz stereo
+audio, and a FrameSync pulling 480 samples every 10 ms: without raw capture,
+every frame reaches the FrameSync and it returns no silence. With raw audio
+capture on the attached receiver, interleaved with the pulls or on a second
+thread, each audio frame reaches exactly one of the two, and the FrameSync
+returns silence for 65 to 90 per cent of the samples it pulls. Every metadata
+frame still reaches the attached receiver's own metadata capture.
+
+`FrameSync` is `Sync`, although neither its header nor the SDK documentation
+of 6.1.1, 6.3.2 or 6.4 says whether one FrameSync may be used from several
+threads at once. That rests on measurement on Linux x86_64 over loopback. In
+the runtimes of all three versions, video capture, audio capture and the video
+free take the instance's exclusive lock, the audio free returns its buffer
+through atomic operations, and the audio queue depth is read without the lock.
+Under helgrind, four threads making every `&FrameSync` call on one FrameSync
+of a live source conflict only in the unlocked queue-depth read and the atomic
+audio free, on 6.3.2 and 6.4. Sixteen threads making the same calls on each of
+the three runtimes receive no torn video frame, no invalid audio sample and no
+error. `tests/framesync_capture_boundary.rs` repeats a short version of the
+multi-thread check against every runtime the tests use.
+
+### Discovery Server objects
+
+The Discovery Server advertisers and listeners need NDI 6.4.0 because of a
+defect of the 6.3.2 runtime, not only because the vendor's change notes list a
+fix. Measured on Linux x86_64 with the SDK's own Discovery Server on loopback,
+destroying any of the four objects on 6.3.2 can abort the process with "pure
+virtual method called", raised on an SDK thread while the destroy call is in
+progress:
+- it happens with every object type whenever the object has a live server
+  connection;
+- it never happens without a server;
+- destroying an object soon after creating it is enough.
+
+The 6.4.0.2 runtime does not abort in the same cases.
+
+None of these workarounds makes it safe:
+- removing registrations first;
+- waiting for a settled connection;
+- serializing every destroy;
+- destroying on a dedicated thread;
+- delaying the destroy;
+- keeping objects for reuse instead of destroying them. This one fails
+  differently: an exit with live objects can itself crash 6.3.2.
+
+Never destroying them leaks about three threads and four descriptors per
+object. The crate therefore refuses the four objects before 6.4.0.
+
+Four defects remain in 6.4.0.2. The crate cannot prevent them; the
+documentation of the affected methods says how to stay clear of them.
+- **Listener crash on a quick move.** A listener on the server crashes when
+  the same sender or receiver is removed from one advertiser and added to
+  another on the same server within about 20 ms.
+  - With the listener in a second process, it crashes in 10 of 12 runs on
+    6.4.0.2 and 4 of 6 on 6.3.2.
+  - Moves 200 ms or 1 s apart do not crash it, nor does dropping the first
+    advertiser before the second registration.
+- **Receiver connect blocked by an unsubscribe.** `NDIlib_recv_connect` can
+  block for good in a receiver registered with a receiver advertiser when a
+  listener unsubscribes from that receiver's events while it connects. The
+  listener can be in the same process or another.
+  - It happens with 6.3.2 and 6.4.0.2.
+  - Dropping the listeners without unsubscribing does not block a connect.
+  - A listener of this crate unsubscribes only when asked to.
+- **Rare send-advertiser destroy hang.** `NDIlib_send_advertiser_destroy`
+  can block for good, waiting on one of the advertiser's own threads: once in
+  about 1.1 million destroys on 6.4.0.2 under heavy load.
+- **A late listener misses earlier registrations.** An advertiser or listener
+  that finds no server tries again every 10 s, with no backoff. A listener
+  that connects only on such a later attempt lists only what is registered
+  after it connected, never what reached the server before.
+  - The listener's first attempt sends its query and a second message that
+    the server answers with its registry; a retry sends only the query.
+  - Sender and receiver listeners behave alike, on Standard and Advanced
+    6.4.0.2.
+  - Such a listener lists a registration made after it connected within 2 ms.
+  - A listener created once the server is serving lists the earlier
+    registrations at once.
+  - `tests/discovery_server.rs` checks the two halves that work.
+
+Tests of `FileRecorder::reset` check that it returns the old session's report
+without claiming that the files were finalized, that late events of the old
+session do not reach later ones, and that the original recorder stays usable
+when its replacement cannot be created.
+
+Two File API functions are deliberately not called:
+`NDIlib_file_recorder_get_source` and `NDIlib_file_recorder_get_current_file`.
+They return borrowed strings that the SDK can invalidate on its own recording
+thread while it stops or rolls over, so copying them at once does not make them
+safe to read, and a Rust mutex around the calls cannot exclude the SDK's thread.
+The Rust API provides `last_accepted_source` and `reported_current_file` from
+its own state and the recorder's events instead, and documents how they differ
+from an instantaneous native query. These exceptions can go when the vendor
+provides a stable lifetime or a copying variant.
+
+`ci/sdk.py` exports the expected version, edition and exact library path of the
+package it provisions, and the tests compare them with the runtime loaded in
+their own process. `tests/runtime_identity.rs` checks that a mismatch of each
+fails the run, so knowing which archive was unpacked is not enough to pass.
+
+## Retained SDK packages
+
+[`ci/sdk-packages.json`](../ci/sdk-packages.json) pins the packages the tests
+use: Standard 6.1.1 for Linux, and Standard and Advanced 6.3.2 and 6.4.0.2 for
+Linux, Windows, Apple and Android. The CI matrix runs Standard 6.1.1 on Linux
+and Standard and Advanced 6.3.2 on Linux, Windows and macOS as baselines, and
+crosses the oldest retained Standard and Advanced packages with the current
+Advanced one in both directions: Standard 6.1.1 on Linux, 6.3.2 elsewhere.
+
+The Linux 6.1.1 installer comes from RPM Fusion's source cache and matches the
+SHA-512 in its
+[historical source manifest](https://github.com/rpmfusion/ndi-sdk/blob/d0147e01a716c8e27d03894d79c296054e8caf63/sources).
+Its `Version.txt` reads `NDI 2024-12-20 r143744 v6.1.1`. The unmodified vendor
+installer has its own SHA-256 pin in `ci/sdk-packages.json`.
+
+The crate is written for every NDI 6 runtime, and its capability checks keep a
+runtime from being asked for what it lacks.
+
+## Platform coverage
+
+| Platform | Coverage |
+| --- | --- |
+| Linux x86-64 | Test suite against Standard 6.1.1, 6.3.2 and 6.4.0.2 and Advanced 6.3.2 and 6.4.0.2 |
+| Linux x86, Linux arm64 | Test suite against Standard 6.4.0.2 |
+| macOS arm64 | Test suite against Standard and Advanced 6.3.2 and 6.4.0.2 |
+| macOS x86-64 | Test suite against Standard 6.4.0.2 |
+| Windows x64 | Test suite against Standard and Advanced 6.3.2 and 6.4.0.2 |
+| Windows x86 | Test suite against Advanced 6.4.0.2 |
+| 32-bit ARM Linux, Android | Linted with clippy, all features and warnings denied; nothing runs |
+| iOS, tvOS, visionOS | Library built against the NDI SDK for Apple 6.4; nothing runs |
+
+The test suites run in the `sdk` job of `.github/workflows/rust.yml`, on
+GitHub's hosted runners; the [CI guide](../ci/README.md) describes its rows and
+what each one checks. Tests leave out what a platform's runtime cannot do, and
+print that they did; the README's
+[known issues](../README.md#known-issues) list those limits.
+
+Not covered:
+
+- NDI 6 releases other than 6.1.1, 6.3.2 and 6.4.0.2.
+- Hardware-dependent behavior: PTZ devices, KVM devices, hardware codecs, and
+  interoperability of compressed streams with other products.
+- License entitlements. A capability reported as available says only that the
+  runtime exports the functions and has the required version.
+
+## Repeating the tests
+
+The commands below are for Linux x86_64. Replace the paths with those of your
+installation. The fake-runtime tests need `rustc` and `readelf` on the `PATH`.
+
+Without any NDI installation:
 
 ```bash
-cargo test --all-features --test video_padding_sdk -- --ignored --nocapture
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="valgrind --tool=memcheck --track-origins=yes --error-exitcode=99" \
-  cargo test --all-features --test video_padding_sdk -- --ignored --nocapture
+cargo test --locked --all-features
 ```
 
-## Installing and selecting the SDK
-
-Download installers outside the repository. The
-[CI maintenance guide](../.github/actions/README.md) records their hashes and
-explains URL secrets. Personalized links must not appear in tracked files or
-public change descriptions. CI needs URL secrets only when overriding the
-vendor fallback URLs; it does not need SDK binaries uploaded to public releases.
-
-Set `NDI_SDK_DIR` to the **target** SDK root containing headers and libraries.
-Android requires its own SDK, not the Linux libraries. Windows installers use
-`Include` and `Lib`; both their casing and the existing lowercase layout work.
-Cross-compilation also requires target Rust standard libraries, a linker, and
-target C headers for bindgen. The build script never substitutes host NDI
-binaries when target libraries are absent.
-
-The Linux tarball contains an installer script with an embedded SDK archive.
-The setup action extracts it and creates `libndi.so` and `libndi.so.6` symlinks
-beside every `libndi.so.6.3.2` binary. If extracting manually, create those links
-in **each target library directory** before building. For example:
+With a Standard SDK installed:
 
 ```bash
-export NDI_SDK_DIR='/path/to/NDI SDK for Linux'
-for library in "$NDI_SDK_DIR"/lib/*/libndi.so.6.3.2; do
-    directory="$(dirname "$library")"
-    ln -sfn libndi.so.6.3.2 "$directory/libndi.so"
-    ln -sfn libndi.so.6.3.2 "$directory/libndi.so.6"
-done
-export LD_LIBRARY_PATH="$NDI_SDK_DIR/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export NDI_RUNTIME_DIR_V6="/path/to/NDI SDK for Linux/lib/x86_64-linux-gnu"
+GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --locked --config ci/offline.toml --all-features
+```
+
+With an Advanced SDK installed:
+
+```bash
+export NDI_SDK_DIR="/path/to/NDI Advanced SDK for Linux"
 export NDI_RUNTIME_DIR_V6="$NDI_SDK_DIR/lib/x86_64-linux-gnu"
-cargo test --all-features
-cargo build --examples --all-features
+GRAFTON_NDI_REQUIRE_RUNTIME=advanced,file,discovery-server cargo test --locked --config ci/offline.toml --all-features
 ```
 
-## Linux cross-builds
+`--config ci/offline.toml` starts every test executable with loopback
+networking only and a private temporary directory, which on Linux needs
+`bubblewrap`. The tests that use a real runtime create NDI senders, receivers
+and finders. Without that option they announce themselves on the local
+network. The [CI guide](../ci/README.md#loopback-only-test-runs) describes the
+runner and why the tests need a private temporary directory.
 
-Install the appropriate cross GCC/glibc packages and Rust targets:
+[`ci/sdk.py`](../ci/README.md#sdk-packages) installs an SDK package into a
+directory of your choice and prints the variables above, together with the
+`GRAFTON_NDI_EXPECTED_*` values that make the tests check the runtime they
+load. The crossed runs set `NDI_SDK_DIR` to one SDK, `NDI_RUNTIME_DIR_V6` and
+the expected values to another, and the `GRAFTON_NDI_PEER_*` values to the SDK
+that is not loaded. The
+[CI workflow](../.github/workflows/rust.yml) shows each step.
 
-| Rust target | Linker | C sysroot on the Debian validation host |
-| --- | --- | --- |
-| `aarch64-unknown-linux-gnu` | `aarch64-linux-gnu-gcc` | `/usr/aarch64-linux-gnu` |
-| `armv7-unknown-linux-gnueabihf` | `arm-linux-gnueabihf-gcc` | `/usr/arm-linux-gnueabihf` |
-| `arm-unknown-linux-gnueabihf` | `arm-linux-gnueabihf-gcc` | `/usr/arm-linux-gnueabihf` |
-| `i686-unknown-linux-gnu` | `i686-linux-gnu-gcc` | `/usr/i686-linux-gnu` |
-
-The target runtime needs Avahi and its dependencies (including D-Bus). Install
-target-architecture packages in the sysroot or extract them into a separate
-directory. If the linker cannot locate these indirect dependencies, pass
-`-C link-arg=-Wl,-rpath-link,/path/to/target/libraries` in `RUSTFLAGS`, once per
-library directory. Do not use host x86_64 libraries or suppress unresolved
-shared-library errors to make a cross-link appear successful.
-
-For example, with ARM64 runtime dependencies installed in the target sysroot:
+To check that the crate still compiles for a target you cannot run:
 
 ```bash
-rustup target add aarch64-unknown-linux-gnu
-export NDI_SDK_DIR='/path/to/NDI SDK for Linux'
-export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-export BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu='--sysroot=/usr/aarch64-linux-gnu'
-cargo build --examples --all-features --target aarch64-unknown-linux-gnu
+rustup target add x86_64-pc-windows-msvc
+cargo clippy --all-features --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 ```
 
-To run library tests, configure Cargo's target runner to invoke `qemu-aarch64`
-or `qemu-arm` with `-L` pointing at the target glibc sysroot. The emulated
-process's `LD_LIBRARY_PATH` must include both the target NDI library directory
-and target Avahi/D-Bus dependencies. Then run `cargo test --lib --all-features
---target <target>`. On this host i686 tests ran directly through the 32-bit
-glibc loader; the QEMU i386 attempt stalled and was stopped.
-
-## Android cross-builds
-
-Use the NDI SDK for Android and an installed Android NDK. CI pins NDK r27d
-(`27.3.13750724`); the helper defaults to API 24. This is the configuration tested
-here, not a claim that every older Android API level is supported.
+iOS, tvOS and visionOS targets need the NDI SDK for Apple at build time:
 
 ```bash
-export NDI_SDK_DIR='/path/to/NDI SDK for Android'
-export ANDROID_NDK_HOME='/path/to/android-ndk-r27d'
-rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
-for target in aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android; do
-    scripts/build-android.sh "$target"
-done
+export NDI_SDK_DIR="/path/to/NDI SDK for Apple"
+cargo check --all-features --target aarch64-apple-ios
 ```
 
-The helper configures the target-specific linker and bindgen sysroot, including
-the ARMv7 NDK compiler/header naming difference. `ANDROID_API_LEVEL` overrides
-24. Applications must package the corresponding `libndi.so`, its required
-runtime dependencies, and configure Android network access; linking examples
-alone does not test those application responsibilities.
+The static checks, and the check that the generated bindings match an SDK, are
+listed in [CONTRIBUTING.md](../CONTRIBUTING.md#checks-before-review).
 
-## Windows cross-builds from Linux
+## When the supported versions change
 
-Install [cargo-xwin](https://github.com/rust-cross/cargo-xwin), Clang/LLD, and the
-Rust targets. Extract the Windows installer outside the repository (the
-validation used `innoextract`); select the extracted `app` directory containing
-`Include` and `Lib`. cargo-xwin provisions the Microsoft CRT and Windows SDK.
-
-```bash
-rustup target add x86_64-pc-windows-msvc i686-pc-windows-msvc
-export NDI_SDK_DIR='/path/to/extracted/windows/app'
-export XWIN_ARCH=x86,x86_64
-cargo xwin build --examples --all-features --target x86_64-pc-windows-msvc
-cargo xwin build --examples --all-features --target i686-pc-windows-msvc
-```
-
-Native Windows tests still require the corresponding NDI DLL on `PATH`.
-Windows GNU and Windows ARM64 targets are rejected because the standard SDK
-does not supply the import-library layout this crate supports for those ABIs.
-
-## Apple follow-up
-
-The Apple package contains macOS dynamic libraries and iOS/tvOS/visionOS static
-libraries. Possessing that package does not provide Apple's platform headers,
-frameworks, or a runnable Apple environment. Run the existing native tests on
-macOS with Xcode's tools before release. Adding Apple mobile target selection,
-static-link dependencies, and device/simulator coverage remains separate work.
-
-## FrameSync findings retained from 3.0 development
-
-On Linux x86_64 with Standard 6.3.2 and 6.4, raw audio capture on a FrameSync's
-receiver took frames away from the synchronizer: each incoming frame reached
-only one capture path. In the measured runs the FrameSync returned silence for
-65–90% of samples with raw capture active. In 2.x that API remains available;
-use FrameSync audio capture alone or recover the receiver first.
-
-Source-rate requests can return an invalid zero rate before source audio
-arrives. Use `FrameSyncAudioRequest::capture_with(Some(48_000), channels, samples)`
-when the application needs startup silence at a known rate. Read input-format
-queries through the borrowed `capture_audio(query_input())` result: the owned
-convenience method has no samples to copy and returns `None` for such a query.
-
-The FrameSync headers do not explicitly specify threading guarantees. During
-3.0 development, NDI 6.1.1, 6.3.2 and 6.4 runtimes were measured on Linux x86_64:
-video/audio capture and video free took the instance lock; audio free used
-atomic operations; queue depth was read outside that lock. A sixteen-thread,
-120-second stress run per runtime returned no torn video, invalid samples or
-errors. These measurements support retaining the existing 2.x `Send`/`Sync`
-implementations; they do not qualify other platforms or establish an SDK-wide
-threading guarantee.
+When an SDK version or platform is added, add it to
+[What each runtime provides](#what-each-runtime-provides), with the runtime's
+own version text (`ndi.info().raw_version()`), and to
+[Platform coverage](#platform-coverage), saying whether the test suite runs
+there or the target is only compiled.

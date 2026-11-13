@@ -1,5 +1,5 @@
-use grafton_ndi::NDI;
+use grafton_ndi::Ndi;
 
 fn main() {
-    drop(NDI { _private: () });
+    drop(Ndi {});
 }

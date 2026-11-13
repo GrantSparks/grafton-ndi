@@ -5,9 +5,8 @@
 mod common;
 
 use grafton_ndi::{
-    BorrowedVideoFrame, FrameSync, LineStrideOrSize, PixelFormat, Receiver, ReceiverColorFormat,
+    BorrowedVideoFrame, FrameSync, Ndi, PixelFormat, Receiver, ReceiverColorFormat,
     ReceiverOptions, ScanType, Sender, SenderOptions, Source, SourceCache, VideoFrame, VideoPlanes,
-    NDI,
 };
 use std::{
     sync::{
@@ -17,23 +16,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn receiver(ndi: &NDI, source: Source) -> Receiver {
+fn receiver(ndi: &Ndi, source: Source) -> Receiver {
     Receiver::new(
         ndi,
-        &ReceiverOptions::builder(source)
-            .color(ReceiverColorFormat::BGRX_BGRA)
-            .allow_video_fields(false)
-            .build(),
+        &ReceiverOptions::new(source)
+            .color_format(ReceiverColorFormat::BgrxBgra)
+            .allow_video_fields(false),
     )
     .unwrap()
 }
 
 fn verify_owned(frame: &VideoFrame) {
     assert_eq!((frame.width(), frame.height()), (642, 32));
-    assert_eq!(
-        frame.line_stride_or_size(),
-        LineStrideOrSize::LineStrideBytes(2568)
-    );
+    assert_eq!(frame.line_stride_bytes(), 2568);
     assert_eq!(frame.data().len(), 82_176);
     assert_eq!(frame.metadata(), Some("<padding-regression/>"));
     // System calls make uninitialized values observable to Memcheck.
@@ -80,35 +75,41 @@ fn scoped_reads(planes: VideoPlanes<'_>) {
 }
 
 #[test]
-#[ignore = "Requires NDI runtime and loopback networking; run alone"]
 fn live_receiver_framesync_and_owned_send_skip_padding() {
-    let ndi = NDI::new().unwrap();
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
     let sender = Sender::new(
         &ndi,
-        &SenderOptions::builder("video padding regression")
+        &SenderOptions::new(common::unique_name("video padding regression"))
             .clock_video(true)
-            .clock_audio(false)
-            .build(),
+            .clock_audio(false),
     )
     .unwrap();
     let source = common::loopback_source(&ndi, &sender).unwrap();
     // Resolve the advertised machine component through equivalent spellings.
     let advertised = sender.source().unwrap();
-    let host = advertised.name.split_once(" (").unwrap().0;
+    let host = advertised.name().split_once(" (").unwrap().0;
     let cache = SourceCache::new();
     let first = cache
-        .find_by_host(&host.to_ascii_uppercase(), Duration::from_secs(15))
+        .find_by_host(&ndi, &host.to_ascii_uppercase(), Duration::from_secs(15))
         .unwrap();
     assert_eq!(
         cache
-            .find_by_host(&format!("{}.", host.to_ascii_lowercase()), Duration::ZERO)
+            .find_by_host(
+                &ndi,
+                &format!("{}.", host.to_ascii_lowercase()),
+                Duration::ZERO
+            )
             .unwrap(),
         first
     );
     assert_eq!(cache.len(), 1);
     cache.invalidate(&host.to_ascii_lowercase());
     assert!(cache.is_empty());
-    let rediscovered = cache.find_by_host(host, Duration::from_secs(15)).unwrap();
+    let rediscovered = cache
+        .find_by_host(&ndi, host, Duration::from_secs(15))
+        .unwrap();
     let _connected = receiver(&ndi, rediscovered);
     let stop = Arc::new(AtomicBool::new(false));
     std::thread::scope(|scope| {
@@ -116,7 +117,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
         scope.spawn(move || {
             let mut frame = VideoFrame::builder()
                 .resolution(642, 32)
-                .pixel_format(PixelFormat::BGRA)
+                .pixel_format(PixelFormat::Bgra)
                 .metadata("<padding-regression/>")
                 .build()
                 .unwrap();
@@ -124,7 +125,7 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
                 pixel.copy_from_slice(&[40, 80, 120, 255]);
             }
             while !worker_stop.load(Ordering::Relaxed) {
-                sender.send_video(&frame);
+                sender.send_video(&frame).unwrap();
             }
         });
         struct Stop(Arc<AtomicBool>);
@@ -143,13 +144,13 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
             );
             if let Some(frame) = receiver
                 .video()
-                .try_capture_ref(Duration::from_millis(100))
+                .capture_ref(Duration::from_millis(100))
                 .unwrap()
             {
                 break frame;
             }
         };
-        eprintln!("receiver SDK stride: {:?}", borrowed.line_stride_or_size());
+        eprintln!("receiver SDK stride: {:?}", borrowed.line_stride_bytes());
         assert!(borrowed.data().is_none(), "expected padded SDK output");
         scoped_reads(borrowed.planes());
         let mut active = 0;
@@ -165,31 +166,49 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
             std::fs::write("/dev/null", borrowed.encode_png().unwrap()).unwrap();
             std::fs::write("/dev/null", borrowed.encode_jpeg(85).unwrap()).unwrap();
         }
-        let owned = borrowed.to_owned().unwrap();
+        let owned = borrowed.to_owned();
         verify_owned(&owned);
+        // A copy into a larger frame of another format reuses its pixels.
+        let mut reused = VideoFrame::builder()
+            .resolution(1280, 720)
+            .pixel_format(PixelFormat::Uyvy)
+            .build()
+            .unwrap();
+        let reused_pixels = reused.data().as_ptr();
+        borrowed.copy_into(&mut reused);
+        verify_owned(&reused);
+        assert_eq!(reused.data(), owned.data());
+        assert_eq!(reused.data().as_ptr(), reused_pixels);
         drop(borrowed);
-        let owned_capture = receiver.video().capture(Duration::from_secs(10)).unwrap();
+        let owned_capture = receiver
+            .video()
+            .capture(Duration::from_secs(10))
+            .unwrap()
+            .expect("a frame within the timeout");
         verify_owned(&owned_capture);
         #[cfg(feature = "tokio")]
         let receiver = {
-            use grafton_ndi::tokio::AsyncReceiver;
-            // Use a separate receiver because AsyncReceiver retains its owner.
+            use grafton_ndi::asynchronous::tokio::AsyncReceiver;
+            // Use a separate receiver: AsyncReceiver keeps the receiver it
+            // wraps, and FrameSync::new below takes this one by value.
             let async_receiver =
                 AsyncReceiver::new(self::receiver(&ndi, receiver.source().clone()));
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let frame = runtime
                 .block_on(async_receiver.video().capture(Duration::from_secs(10)))
-                .unwrap();
+                .unwrap()
+                .expect("a frame within the timeout");
             verify_owned(&frame);
             receiver
         };
         #[cfg(feature = "smol")]
         {
-            use grafton_ndi::smol::AsyncReceiver;
+            use grafton_ndi::asynchronous::smol::AsyncReceiver;
             let async_receiver =
                 AsyncReceiver::new(self::receiver(&ndi, receiver.source().clone()));
-            let frame =
-                smol::block_on(async_receiver.video().capture(Duration::from_secs(10))).unwrap();
+            let frame = smol::block_on(async_receiver.video().capture(Duration::from_secs(10)))
+                .unwrap()
+                .expect("a frame within the timeout");
             verify_owned(&frame);
         }
         let framesync = FrameSync::new(receiver).unwrap();
@@ -199,8 +218,8 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
                 Instant::now() < deadline,
                 "FrameSync did not produce a frame"
             );
-            if let Some(frame) = framesync.capture_video(ScanType::Progressive).unwrap() {
-                eprintln!("FrameSync SDK stride: {:?}", frame.line_stride_or_size());
+            if let Some(frame) = framesync.capture_video_ref(ScanType::Progressive).unwrap() {
+                eprintln!("FrameSync SDK stride: {:?}", frame.line_stride_bytes());
                 scoped_reads(frame.planes());
                 for plane in frame.planes() {
                     for row in plane.rows() {
@@ -212,38 +231,43 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
                     std::fs::write("/dev/null", frame.encode_png().unwrap()).unwrap();
                     std::fs::write("/dev/null", frame.encode_jpeg(85).unwrap()).unwrap();
                 }
-                verify_owned(&frame.to_owned().unwrap());
+                verify_owned(&frame.to_owned());
+                frame.copy_into(&mut reused);
+                verify_owned(&reused);
+                assert_eq!(reused.data().as_ptr(), reused_pixels);
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         verify_owned(
             &framesync
-                .capture_video_owned(ScanType::Progressive)
+                .capture_video(ScanType::Progressive)
                 .unwrap()
                 .unwrap(),
         );
         let _ = framesync
             .receiver()
             .metadata()
-            .try_capture(Duration::ZERO)
+            .capture(Duration::ZERO)
             .unwrap();
-        let _ = framesync
-            .receiver()
-            .poll_status_change(Duration::ZERO)
-            .unwrap();
+        let _ = framesync.receiver().poll_event(Duration::ZERO).unwrap();
         let receiver = framesync.into_receiver();
-        verify_owned(&receiver.video().capture(Duration::from_secs(10)).unwrap());
+        verify_owned(
+            &receiver
+                .video()
+                .capture(Duration::from_secs(10))
+                .unwrap()
+                .expect("a frame within the timeout"),
+        );
         let mut resend = Sender::new(
             &ndi,
-            &SenderOptions::builder("normalized padding resend")
+            &SenderOptions::new(common::unique_name("normalized padding resend"))
                 .clock_video(false)
-                .clock_audio(false)
-                .build(),
+                .clock_audio(false),
         )
         .unwrap();
         let original = owned.data().as_ptr();
-        assert!(resend.send_video_async(owned).is_none());
+        assert!(resend.send_video_async(owned).unwrap().is_none());
         let borrowed_send = BorrowedVideoFrame::from(&owned_capture);
         let recovered = resend
             .send_video_async_copy(&borrowed_send)
@@ -251,6 +275,132 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
             .unwrap();
         assert_eq!(recovered.data().as_ptr(), original);
         verify_owned(&recovered);
-        verify_owned(&resend.finish_video_async().unwrap());
+        // The recovered frame is the next copy's destination, as in the loop
+        // `BorrowedVideoFrame::copy_into` documents: the copied frame comes
+        // back from the next send and the recovered one from the finish.
+        let mut recovered = recovered;
+        borrowed_send.copy_into(&mut recovered);
+        let copied = resend.send_video_async(recovered).unwrap().unwrap();
+        verify_owned(&copied);
+        let last = resend.finish_video_async().unwrap();
+        assert_eq!(last.data().as_ptr(), original);
+        verify_owned(&last);
     });
+}
+
+/// The YUV readers on the SDK's own row layout: frames received as UYVY and
+/// P216 encode in place exactly as their packed copies do. Under Memcheck,
+/// writing every image makes a read of row padding observable.
+#[cfg(feature = "image-encoding")]
+#[test]
+fn live_yuv_frames_encode_from_sdk_rows() {
+    use grafton_ndi::{AlphaMode, Downscale, ImageFormat, ImageOptions, SampleDepth};
+
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
+    let outputs = [
+        ImageOptions::new(ImageFormat::Png),
+        ImageOptions::new(ImageFormat::Png).depth(SampleDepth::Sixteen),
+        ImageOptions::new(ImageFormat::Png)
+            .alpha(AlphaMode::Discard)
+            .downscale(Downscale::Quarter),
+        ImageOptions::new(ImageFormat::Jpeg(85)),
+        ImageOptions::new(ImageFormat::WebpLossless),
+    ];
+    let (width, height) = (642usize, 32usize);
+    // Levels that change slowly, as a picture's do: every byte of a row
+    // differs from its neighbours' rows, which is all the comparison needs.
+    let uyvy: Vec<u8> = (0..width * height * 2)
+        .map(|i| (64 + (i >> 10) % 128) as u8)
+        .collect();
+    let p216: Vec<u8> = (0..width * height * 2)
+        .flat_map(|i| (((64 + (i >> 9) % 128) as u16) << 8).to_ne_bytes())
+        .collect();
+    for (format, data, color_formats) in [
+        (
+            PixelFormat::Uyvy,
+            uyvy,
+            [ReceiverColorFormat::UyvyBgra, ReceiverColorFormat::Fastest],
+        ),
+        (
+            PixelFormat::P216,
+            p216,
+            [ReceiverColorFormat::Best, ReceiverColorFormat::UyvyBgra],
+        ),
+    ] {
+        // The vector ends with the frame. The SDK reads up to 28 bytes past
+        // a UYVY frame of this width, which the owned frame gives it room
+        // for: under Memcheck, a read past the room is an error.
+        let sent = VideoFrame::builder()
+            .resolution(width as u32, height as u32)
+            .pixel_format(format)
+            .data(data)
+            .build()
+            .unwrap();
+        let sender = Sender::new(
+            &ndi,
+            &SenderOptions::new(common::unique_name(&format!("yuv padding {format:?}")))
+                .clock_video(false),
+        )
+        .unwrap();
+        let source = common::loopback_source(&ndi, &sender).unwrap();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    sender.send_video(&sent).unwrap();
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+            // A scope joins its threads even when it unwinds: stop the loop
+            // then too, or a failed test would hang instead of reporting.
+            struct StopOnDrop<'a>(&'a AtomicBool);
+            impl Drop for StopOnDrop<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Relaxed);
+                }
+            }
+            let _stop = StopOnDrop(&stop);
+            for color_format in color_formats {
+                let receiver = Receiver::new(
+                    &ndi,
+                    &ReceiverOptions::new(source.clone()).color_format(color_format),
+                )
+                .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let frame = loop {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{format:?} {color_format:?}: no frame"
+                    );
+                    if let Some(frame) = receiver
+                        .video()
+                        .capture_ref(Duration::from_millis(100))
+                        .unwrap()
+                    {
+                        if frame.width() as usize == width {
+                            break frame;
+                        }
+                    }
+                };
+                eprintln!(
+                    "{format:?} to {color_format:?}: {:?}, SDK stride {}",
+                    frame.pixel_format(),
+                    frame.line_stride_bytes()
+                );
+                let owned = frame.to_owned();
+                for options in &outputs {
+                    let image = frame.encode_image(options).unwrap();
+                    std::fs::write("/dev/null", &image).unwrap();
+                    assert_eq!(
+                        image,
+                        owned.encode_image(options).unwrap(),
+                        "{format:?} to {:?} {options:?}",
+                        frame.pixel_format()
+                    );
+                }
+            }
+        });
+    }
 }

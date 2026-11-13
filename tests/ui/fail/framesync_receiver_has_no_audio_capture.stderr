@@ -1,0 +1,41 @@
+error[E0277]: the trait bound `FrameSyncAttached: CaptureMode` is not satisfied
+ --> tests/ui/fail/framesync_receiver_has_no_audio_capture.rs:6:22
+  |
+6 |     let _ = receiver.audio().capture(Duration::ZERO);
+  |                      ^^^^^ the trait `CaptureMode` is not implemented for `FrameSyncAttached`
+  |
+help: the trait `CaptureMode` is implemented for `RawCapture`
+ --> src/receiver.rs
+  |
+  | impl CaptureMode for RawCapture {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `grafton_ndi::Receiver::<M>::audio`
+ --> src/receiver.rs
+  |
+  | impl<M: MetadataMode> Receiver<M> {
+...
+  |     pub fn audio(&self) -> Capture<'_, AudioKind>
+  |     where
+  |         M: CaptureMode,
+  |            ^^^^^^^^^^^ required by this bound in `Receiver::<M>::audio`
+
+error[E0277]: the trait bound `FrameSyncAttached: CaptureMode` is not satisfied
+ --> tests/ui/fail/framesync_receiver_has_no_audio_capture.rs:9:34
+  |
+9 |     let _ = framesync.receiver().audio().capture_ref(Duration::ZERO);
+  |                                  ^^^^^ the trait `CaptureMode` is not implemented for `FrameSyncAttached`
+  |
+help: the trait `CaptureMode` is implemented for `RawCapture`
+ --> src/receiver.rs
+  |
+  | impl CaptureMode for RawCapture {}
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `grafton_ndi::Receiver::<M>::audio`
+ --> src/receiver.rs
+  |
+  | impl<M: MetadataMode> Receiver<M> {
+...
+  |     pub fn audio(&self) -> Capture<'_, AudioKind>
+  |     where
+  |         M: CaptureMode,
+  |            ^^^^^^^^^^^ required by this bound in `Receiver::<M>::audio`

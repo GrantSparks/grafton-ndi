@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use grafton_ndi::{Error, Receiver, ReceiverOptions, NDI};
+use grafton_ndi::{Error, Ndi, Receiver, ReceiverEvent, ReceiverOptions};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -36,7 +36,7 @@ fn main() -> Result<(), Error> {
     .expect("Error setting Ctrl-C handler");
 
     // Initialize NDI
-    let ndi = NDI::new()?;
+    let ndi = Ndi::new()?;
 
     // Create finder
     let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
@@ -49,20 +49,20 @@ fn main() -> Result<(), Error> {
     };
 
     // Create a receiver for the first source
-    let options = ReceiverOptions::builder(sources[0].clone())
-        .name("Example PTZ Receiver")
-        .build();
+    let options = ReceiverOptions::new(sources[0].clone()).name("Example PTZ Receiver");
     let receiver = Receiver::new(&ndi, &options)?;
 
     // Run for 30 seconds
     let start = Instant::now();
     while !exit_loop.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(30) {
-        // Use poll_status_change to check for status changes
-        if let Some(_status) = receiver.poll_status_change(Duration::from_secs(1))? {
+        // Use poll_event to check for status changes
+        if let Some(ReceiverEvent::StatusChanged(_status)) =
+            receiver.poll_event(Duration::from_secs(1))?
+        {
             // Check PTZ support on status change
-            if receiver.ptz_is_supported() {
+            if receiver.ptz().is_supported() {
                 println!("This source supports PTZ functionality. Moving to preset #3.");
-                receiver.ptz_recall_preset(3, 1.0)?;
+                receiver.ptz().recall_preset(3, 1.0)?;
             }
         }
     }
