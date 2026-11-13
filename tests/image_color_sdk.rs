@@ -280,6 +280,56 @@ fn where_they_differ(sent: &[u8], received: &[u8], width: usize) -> String {
     text
 }
 
+/// How far two UYVY pictures of 64x64 flat patches, of one size, are apart
+/// where codec loss leaves a flat patch flat: the largest difference, over
+/// every patch and component, between the means of a patch's interior, the
+/// pixels at least 8 from its edges, with the patch and component it is in.
+/// A wrong frame, or the SDK's black placeholder, differs here by tens of
+/// code values; loss at the patches' edges, which can be large, does not.
+fn interior_difference(sent: &[u8], received: &[u8], width: usize) -> (f64, String) {
+    const INSET: usize = 8;
+    let row = width * 2;
+    let height = sent.len() / row;
+    let (columns, rows) = (width.div_ceil(64), height.div_ceil(64));
+    let mut worst = (0.0, "every patch interior".to_owned());
+    for (py, px) in (0..rows).flat_map(|py| (0..columns).map(move |px| (py, px))) {
+        let (x0, y0) = (px * 64 + INSET, py * 64 + INSET);
+        let (x1, y1) = (
+            (px * 64 + 64).min(width) - INSET,
+            (py * 64 + 64).min(height) - INSET,
+        );
+        if x0 >= x1 || y0 >= y1 {
+            continue;
+        }
+        // Sums of Cb, Y and Cr, sent and received, over the pixel pairs
+        // inside; a pair is Cb, Y, Cr, Y.
+        let mut sums = [[0u64; 3]; 2];
+        let mut counts = [0u64; 3];
+        for y in y0..y1 {
+            for pair in x0.div_ceil(2)..x1 / 2 {
+                let at = y * row + pair * 4;
+                for (side, bytes) in [sent, received].into_iter().enumerate() {
+                    let [cb, y0, cr, y1] = [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]];
+                    sums[side][0] += u64::from(cb);
+                    sums[side][1] += u64::from(y0) + u64::from(y1);
+                    sums[side][2] += u64::from(cr);
+                }
+                counts[0] += 1;
+                counts[1] += 2;
+                counts[2] += 1;
+            }
+        }
+        for (component, name) in ["Cb", "Y", "Cr"].into_iter().enumerate() {
+            let count = counts[component] as f64;
+            let gap = (sums[0][component] as f64 - sums[1][component] as f64).abs() / count;
+            if gap > worst.0 {
+                worst = (gap, format!("{name} inside patch ({px}, {py})"));
+            }
+        }
+    }
+    worst
+}
+
 /// The largest and the mean difference between two images.
 fn difference(a: &[[u8; 3]], b: &[[u8; 3]]) -> (u8, f64) {
     assert_eq!(a.len(), b.len());
@@ -318,14 +368,19 @@ fn the_sdk_converts_with_bt709_at_every_size_whatever_the_tag_says() {
             let case = format!("{width}x{height} {:?}", sent.metadata());
             // Both receivers decode one stream, so the UYVY frame is what the
             // SDK converted to RGBX, whether or not it is the frame sent. It
-            // is the picture sent to within the codec's loss, which is none
-            // where that was measured.
+            // is the picture sent: each patch keeps its value away from its
+            // edges. The edges themselves need not survive. The 32-bit x86
+            // runtime, in run 43366775596, returned this picture at 3840x2160
+            // with 4% of its bytes changed, in 1812 of its 2040 patches and by
+            // up to 224, the most at a patch edge, where it had taken the
+            // neighbouring patch's chroma.
             assert_eq!(uyvy.pixel_format(), PixelFormat::Uyvy, "{case}");
             let (largest, mean) = byte_difference(uyvy.data(), sent.data());
+            let (interior, at) = interior_difference(sent.data(), uyvy.data(), width);
             assert!(
-                mean <= 2.0,
-                "{case}: the received UYVY is not the frame sent: it differs by up to {largest}, \
-                 {mean:.3} on average; {}",
+                interior <= 2.0,
+                "{case}: the received UYVY is not the picture sent: the mean of {at} differs by \
+                 {interior:.2}; the frame differs by up to {largest}, {mean:.3} on average; {}",
                 where_they_differ(sent.data(), uyvy.data(), width)
             );
             if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
