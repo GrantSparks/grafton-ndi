@@ -102,6 +102,7 @@ jobs:
             echo "Unchanged cargo build recompiled grafton-ndi"
             exit 1
           fi
+
           cargo test --no-run
           cargo test --no-run 2>&1 | tee "$build_log"
           if grep -Eq '^[[:space:]]*Compiling grafton-ndi v' "$build_log"; then
