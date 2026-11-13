@@ -29,7 +29,11 @@ $arguments = @($args | Select-Object -Skip 1)
 # name is the probable cause rather than an observed one. Resolve-Path keeps
 # short names; GetLongPathNameW replaces each short component with its long
 # name, and returns a path that has none unchanged.
-Add-Type -TypeDefinition @'
+$program = (Resolve-Path -LiteralPath $program).Path
+# Only a path with a short component needs expanding: compiling the helper
+# costs every test executable's start, and those under target\ have none.
+if ($program.Contains('~')) {
+    Add-Type -TypeDefinition @'
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -56,7 +60,8 @@ public static class GraftonNdiLongPath
     }
 }
 '@
-$program = [GraftonNdiLongPath]::Of((Resolve-Path -LiteralPath $program).Path)
+    $program = [GraftonNdiLongPath]::Of($program)
+}
 $rule = 'grafton-ndi-ci-' + [guid]::NewGuid().ToString('N')
 $result = 1
 try {
