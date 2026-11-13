@@ -16,6 +16,10 @@ use grafton_ndi::{Ndi, Receiver, ReceiverBandwidth, ReceiverEvent, ReceiverOptio
 use std::{
     env,
     io::{self, Write},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -23,23 +27,20 @@ use std::{
 mod common;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse command line arguments
-    let args: Vec<String> = env::args().collect();
-    let mut source_name = None;
+    let mut source_name: Option<String> = None;
     let mut extra_ips = Vec::new();
-
-    let mut i = 1;
-    while i < args.len() {
-        if args[i] == "--source" && i + 1 < args.len() {
-            source_name = Some(args[i + 1].clone());
-            i += 2;
-        } else if !args[i].starts_with("--") {
-            extra_ips.push(args[i].as_str());
-            i += 1;
-        } else {
-            i += 1;
+    let mut arguments = env::args().skip(1);
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--source" => source_name = Some(common::option_value(&mut arguments, &argument)?),
+            flag if flag.starts_with('-') => return Err(format!("unknown option: {flag}").into()),
+            _ => extra_ips.push(argument),
         }
     }
+    let extra_ips: Vec<&str> = extra_ips.iter().map(String::as_str).collect();
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal = stop.clone();
+    ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))?;
 
     // Initialize NDI
     let ndi = Ndi::new()?;
@@ -81,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Notifications consumed by concurrent media capture are retained here.
     // Multiple changes may coalesce; refresh capabilities on each notification.
     // Monitor status changes
-    loop {
+    while !stop.load(Ordering::Relaxed) {
         match receiver.poll_event(Duration::from_secs(1))? {
             Some(ReceiverEvent::StatusChanged(status)) => {
                 println!(
@@ -98,4 +99,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    Ok(())
 }

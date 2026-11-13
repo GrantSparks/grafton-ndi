@@ -8,7 +8,7 @@
 use grafton_ndi::{BorrowedVideoFrame, FrameRate, Ndi, PixelFormat, SenderOptions, VideoFrame};
 
 fn borrow(pixels: &[u8]) -> Result<BorrowedVideoFrame<'_>, grafton_ndi::Error> {
-    BorrowedVideoFrame::builder(pixels, 1920, 1080, PixelFormat::Bgra)
+    BorrowedVideoFrame::builder(pixels, 1920, 1080, PixelFormat::Bgrx)
         .frame_rate(FrameRate::new(30, 1)?)
         .metadata(c"<example/>")
         .build()

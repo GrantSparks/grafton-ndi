@@ -9,7 +9,10 @@
 //!
 //! Run with: `cargo run --features advanced --example advanced_queued_send`
 
-use std::{thread, time::Duration};
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
 
 use grafton_ndi::{
     advanced::{QueueOptions, QueuedSender, QueuedVideoFrame},
@@ -20,12 +23,15 @@ fn main() -> Result<(), Error> {
     let ndi = Ndi::new()?;
     let mut sender = QueuedSender::new(
         &ndi,
-        &SenderOptions::new("Queued Sender Example"),
+        // Completion-based sends are paced by the application below.
+        &SenderOptions::new("Queued Sender Example").clock_video(false),
         QueueOptions::default().max_frames(4),
     )?;
 
     // Frames the SDK has finished with, ready to be filled and sent again.
     let mut spare: Vec<QueuedVideoFrame> = Vec::new();
+    let mut next_tick = Instant::now();
+    let interval = Duration::from_secs_f64(1.0 / 60.0);
     for number in 0..300 {
         while let Some(done) = sender.try_take_completed() {
             spare.push(done.into_frame());
@@ -47,7 +53,10 @@ fn main() -> Result<(), Error> {
             // Any other rejection would not succeed by waiting.
             Err(rejected) => return Err(rejected.into_error()),
         }
-        thread::sleep(Duration::from_millis(16));
+        next_tick += interval;
+        thread::sleep(next_tick.saturating_duration_since(Instant::now()));
+        // Do not burst through missed ticks after queue backpressure.
+        next_tick = next_tick.max(Instant::now());
     }
     println!("{} frames still queued at exit", sender.retained_frames());
     Ok(())

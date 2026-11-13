@@ -9,6 +9,16 @@ Entries and examples describe the API of their named release. For the current
 API, see the [README](README.md) and the migration guides for
 [2.0](docs/migration/1.x-to-2.0.md) and [3.0](docs/migration/2.0-to-3.0.md).
 
+## [Unreleased]
+
+### Changed
+
+- Examples use the native v3 audio converter, borrowed capture views where
+  appropriate, reusable send buffers, and application pacing for queued sends.
+  Concurrent capture propagates worker errors, command-line options reject
+  malformed input, and file examples report unsuccessful playback or recording
+  as failures.
+
 ## [3.0.0] - 2026-11-13
 
 Version 3.0.0 loads the NDI library when the program selects a runtime instead

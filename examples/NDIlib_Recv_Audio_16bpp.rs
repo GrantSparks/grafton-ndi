@@ -8,7 +8,10 @@
 //! Optional arguments:
 //! - IP address to search: `cargo run --example NDIlib_Recv_Audio_16bpp -- 192.168.0.110`
 
-use grafton_ndi::{Error, Ndi, Receiver, ReceiverEvent, ReceiverOptions};
+use grafton_ndi::{
+    audio_conversion::{AudioConverter, AudioReferenceLevel},
+    Error, Ndi, Receiver, ReceiverBandwidth, ReceiverOptions,
+};
 
 use std::{
     env,
@@ -36,6 +39,8 @@ fn main() -> Result<(), Error> {
     .expect("Error setting Ctrl-C handler");
 
     let ndi = Ndi::new()?;
+    let converter = AudioConverter::new(&ndi)?;
+    let mut audio_16bit = Vec::new();
 
     let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
 
@@ -47,107 +52,37 @@ fn main() -> Result<(), Error> {
     };
 
     // Create a receiver for the first source
-    let options = ReceiverOptions::new(sources[0].clone()).name("Example Audio Converter Receiver");
+    let options = ReceiverOptions::new(sources[0].clone())
+        .bandwidth(ReceiverBandwidth::AudioOnly)
+        .name("Example Audio Converter Receiver");
     let receiver = Receiver::new(&ndi, &options)?;
 
     // Run for one minute
     let start = Instant::now();
     while !exit_loop.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(60) {
-        if let Some(video_frame) = receiver.video().capture(Duration::ZERO)? {
-            println!(
-                "Video data received ({width}x{height}).",
-                width = video_frame.width(),
-                height = video_frame.height()
-            );
-        }
-
-        if let Some(audio_frame) = receiver.audio().capture(Duration::ZERO)? {
+        if let Some(audio_frame) = receiver.audio().capture(Duration::from_millis(250))? {
             println!(
                 "Audio data received ({num_samples} samples).",
                 num_samples = audio_frame.num_samples()
             );
 
-            let audio_16bit = convert_to_16bit_interleaved(&audio_frame, 20); // 20dB headroom
+            // Use the SDK's current v3 converter with explicit receive headroom.
+            // Keep the output allocation across captures, resizing if the source
+            // changes its channel count or number of samples.
+            audio_16bit.resize(audio_frame.data().len(), 0);
+            let written = converter.to_interleaved_i16(
+                &audio_frame,
+                &mut audio_16bit,
+                AudioReferenceLevel::RECEIVE_HEADROOM,
+            )?;
 
             // Here you would process the 16-bit audio data
             println!(
                 "  Converted to 16-bit: {samples} samples",
-                samples = audio_16bit.len() / audio_frame.num_channels() as usize
+                samples = written / audio_frame.num_channels() as usize
             );
         }
-
-        if let Some(_metadata) = receiver.metadata().capture(Duration::ZERO)? {
-            println!("Meta data received.");
-        }
-
-        if let Some(ReceiverEvent::StatusChanged(_status)) = receiver.poll_event(Duration::ZERO)? {
-            println!("Receiver connection status changed.");
-        }
-
-        // Small delay to avoid busy-waiting
-        std::thread::sleep(Duration::from_millis(10));
     }
 
     Ok(())
-}
-
-/// Convert audio frame from float to 16-bit signed integer format
-///
-/// # Arguments
-/// * `audio_frame` - The input audio frame with float samples
-/// * `reference_level_db` - The reference level in dB for scaling
-fn convert_to_16bit_interleaved(
-    audio_frame: &grafton_ndi::AudioFrame,
-    reference_level_db: i32,
-) -> Vec<i16> {
-    let samples_per_channel = audio_frame.num_samples() as usize;
-    let channels = audio_frame.num_channels() as usize;
-    let mut output = Vec::with_capacity(audio_frame.data().len());
-
-    // NDI samples are planar; PCM output orders channels within each sample.
-    let scale = 10.0_f32.powf(-reference_level_db as f32 / 20.0) * 32767.0;
-    for sample in 0..samples_per_channel {
-        for channel in 0..channels {
-            let value = audio_frame
-                .channel_data(channel)
-                .expect("validated channel")[sample];
-            output.push((value * scale).clamp(-32768.0, 32767.0) as i16);
-        }
-    }
-    output
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use grafton_ndi::AudioFrame;
-
-    #[test]
-    fn converts_planar_stereo_into_scaled_interleaved_pcm() {
-        let frame = AudioFrame::builder()
-            .num_channels(2)
-            .num_samples(2)
-            .data(vec![0.25, -0.25, 0.5, -0.5])
-            .build()
-            .unwrap();
-        assert_eq!(
-            convert_to_16bit_interleaved(&frame, 0),
-            vec![8191, 16383, -8191, -16383]
-        );
-        assert_eq!(
-            convert_to_16bit_interleaved(&frame, 20),
-            vec![819, 1638, -819, -1638]
-        );
-    }
-
-    #[test]
-    fn clamps_pcm_to_signed_16_bit_limits() {
-        let frame = AudioFrame::builder()
-            .num_channels(1)
-            .num_samples(2)
-            .data(vec![-2.0, 2.0])
-            .build()
-            .unwrap();
-        assert_eq!(convert_to_16bit_interleaved(&frame, 0), vec![-32768, 32767]);
-    }
 }

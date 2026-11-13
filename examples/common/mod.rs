@@ -1,4 +1,4 @@
-//! Shared discovery helpers for the examples.
+//! Shared discovery and argument helpers for the examples.
 //!
 //! Every receiver/finder example needs the same two things: build a [`Finder`]
 //! that sees local sources plus any IP hints passed on the command line, and
@@ -14,7 +14,7 @@
 //! ```
 //!
 //! Each example is compiled as its own crate and uses only the helper it
-//! needs, so the unused one would otherwise trip `dead_code`.
+//! needs, so unused helpers would otherwise trip `dead_code`.
 #![allow(dead_code)]
 
 use std::time::Duration;
@@ -59,10 +59,23 @@ pub fn wait_for_first_source(
         if should_stop() {
             return Ok(None);
         }
-        finder.wait_for_sources(Duration::from_secs(1))?;
         let sources = finder.current_sources()?;
         if !sources.is_empty() {
             return Ok(Some(sources));
         }
+        finder.wait_for_sources(Duration::from_secs(1))?;
     }
+}
+
+/// Consume and parse a required option value, reporting malformed input.
+pub fn option_value<T: std::str::FromStr>(
+    arguments: &mut impl Iterator<Item = String>,
+    option: &str,
+) -> Result<T> {
+    let value = arguments
+        .next()
+        .ok_or_else(|| grafton_ndi::Error::InvalidInput(format!("{option} needs a value")))?;
+    value.parse().map_err(|_| {
+        grafton_ndi::Error::InvalidInput(format!("invalid value for {option}: {value}"))
+    })
 }

@@ -41,6 +41,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let seconds = arguments.next().map_or(Ok(10), |text| text.parse())?;
 
+    if seconds == 0 {
+        return Err("recording duration must be positive".into());
+    }
     let ndi = Ndi::new()?;
     let file = FileApi::open(&ndi, &FileRuntimeOptions::default())?;
     println!("File library: {:?}", file.library_path());
@@ -57,8 +60,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Take events throughout: the SDK discards those left waiting, and a
     // session that lost events cannot be confirmed closed.
-    let until = Instant::now() + Duration::from_secs(seconds);
-    while Instant::now() < until {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(seconds) {
         let Some(event) = recorder.poll_event(Duration::from_millis(250))? else {
             continue;
         };
@@ -89,11 +92,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 report.closed_files(),
                 report.error_events()
             );
+            if report.error_events() > 0 {
+                return Err(format!(
+                    "recording reported {} error event(s)",
+                    report.error_events()
+                )
+                .into());
+            }
             if report.stopped_by_sdk() {
                 println!("The SDK ended the session before it was asked to stop.");
             }
         }
-        other => println!("The recording was not confirmed complete: {other:?}"),
+        other => return Err(format!("recording was not confirmed complete: {other:?}").into()),
     }
     Ok(())
 }

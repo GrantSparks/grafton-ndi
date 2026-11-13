@@ -21,6 +21,13 @@ fn main() -> Result<(), Error> {
     let xres = 1920u32;
     let yres = 1080u32;
 
+    // Synchronous sends release the frame before returning. Reuse the same
+    // zero-initialized BGRX allocation for this black test image.
+    let video_frame = VideoFrame::builder()
+        .resolution(xres, yres)
+        .pixel_format(PixelFormat::Bgrx)
+        .build()?;
+
     // Send full batches until at least 10 seconds have elapsed.
     let start = Instant::now();
     while start.elapsed().as_secs() < 10 {
@@ -28,14 +35,6 @@ fn main() -> Result<(), Error> {
 
         // Send 200 frames
         for _idx in 0..200 {
-            // Create video frame with test pattern
-            let video_frame = VideoFrame::builder()
-                .resolution(xres, yres)
-                .pixel_format(PixelFormat::Bgrx)
-                .build()?;
-
-            // Zero-initialized BGRX pixels produce a black frame.
-
             // Send the frame (SDK handles timing)
             sender.send_video(&video_frame)?;
         }

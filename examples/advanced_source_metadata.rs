@@ -25,7 +25,8 @@ fn main() -> Result<(), Error> {
     let finder = Finder::new(&ndi, &FinderOptions::new().config(config))?;
 
     println!("Searching for NDI sources...");
-    finder.wait_for_sources(Duration::from_secs(5))?;
+    // Allow the full discovery window for late sources before taking metadata.
+    finder.find_sources(Duration::from_secs(5))?;
     let sources = finder.sources_with_metadata()?;
     if sources.is_empty() {
         println!("No NDI sources found!");

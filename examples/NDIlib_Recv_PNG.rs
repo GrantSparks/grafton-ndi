@@ -7,9 +7,9 @@
 //!
 //! IMPORTANT: This example demonstrates:
 //!
-//! 1. Using `receiver.video().capture()` for reliable frame capture with
+//! 1. Using `receiver.video().capture_ref()` for reliable frame capture with
 //!    automatic retry logic (handles NDI SDK timeout quirks internally)
-//! 2. `VideoFrame::encode_png()` for crate-provided image conversion, which
+//! 2. `ReceiverVideoFrameRef::encode_png()` for crate-provided image conversion, which
 //!    handles RGBX/BGRX padding bytes and padded rows
 //!
 //! Run with: `cargo run --features image-encoding --example NDIlib_Recv_PNG`
@@ -33,23 +33,17 @@ use std::{
 mod common;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
     let mut extra_ips = Vec::new();
-    let mut output_file = "CoolNDIImage.png";
-
-    let mut i = 1;
-    while i < args.len() {
-        if args[i] == "--output" && i + 1 < args.len() {
-            output_file = &args[i + 1];
-            i += 2;
-        } else if !args[i].starts_with("--") {
-            extra_ips.push(args[i].as_str());
-            i += 1;
-        } else {
-            eprintln!("Unknown argument: {arg}", arg = args[i]);
-            i += 1;
+    let mut output_file = String::from("CoolNDIImage.png");
+    let mut arguments = env::args().skip(1);
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--output" => output_file = common::option_value(&mut arguments, &argument)?,
+            flag if flag.starts_with('-') => return Err(format!("unknown option: {flag}").into()),
+            _ => extra_ips.push(argument),
         }
     }
+    let extra_ips: Vec<&str> = extra_ips.iter().map(String::as_str).collect();
     println!("NDI Video Capture to PNG Example");
     println!("=================================\n");
 
@@ -83,9 +77,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Waiting for video frames...\n");
 
     let start_time = Instant::now();
-    let Some(video_frame) = receiver.video().capture(Duration::from_secs(60))? else {
-        println!("No video frame arrived within 60 seconds.");
-        return Ok(());
+    let Some(video_frame) = receiver.video().capture_ref(Duration::from_secs(60))? else {
+        return Err("no video frame arrived within 60 seconds".into());
     };
 
     let elapsed = start_time.elapsed();
@@ -99,7 +92,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Format: {fourcc:?}");
     let stride = video_frame.line_stride_bytes();
     println!("  Line stride: {stride} bytes");
-    let data_size = video_frame.data().len();
+    let data_size: usize = video_frame
+        .planes()
+        .map(|plane| plane.active_row_bytes() * plane.row_count())
+        .sum();
     println!("  Data size: {data_size} bytes");
     let frame_rate = video_frame.frame_rate();
     println!(
@@ -112,7 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nSaving frame as PNG...");
     let png_bytes = video_frame.encode_png()?;
-    fs::write(output_file, png_bytes)?;
+    fs::write(&output_file, png_bytes)?;
 
     println!("✓ Saved frame as {output_file}");
     println!("\nExample completed successfully!");

@@ -4,6 +4,30 @@ Install a runtime using the [setup guide](../docs/setup.md).
 
 Run an example with `cargo run --example <name>`. Most accept extra IP addresses to search as arguments. The comment at the top of each file says what it does and lists its options.
 
+Build every example, including the feature-gated ones, with:
+
+```sh
+cargo build --locked --examples --all-features
+cargo clippy --locked --examples --all-features -- -D warnings
+```
+
+Compilation does not prove that a runtime supplies an optional capability. To
+exercise the Advanced examples, set `NDI_SDK_DIR` to the Advanced SDK before
+building and `NDI_RUNTIME_DIR_V6` to its runtime directory before running.
+
+Start a sender before a receiving example. Receivers generally choose the first
+discovered source, which must send the media they need: audio for the audio
+examples, video for PNG and FrameSync, and both for AVSync. Use a sustained audio
+source for receiving: the basic audio sender runs for only two seconds and can
+finish before discovery completes. For discovery in a loopback-only environment, pass `127.0.0.1` as an extra IP or configure a local
+Discovery Server. PTZ and KVM control examples need a source offering those
+controls.
+
+The examples borrow capture buffers when they only inspect or encode a frame.
+The 16-bit audio example uses an owned capture for `AudioConverter` and reuses
+its interleaved output allocation. Synchronous senders reuse their input frame;
+async senders recover completed frames before reusing them.
+
 ## Discovery and monitoring
 
 | Example | Command | What it shows |
@@ -19,7 +43,7 @@ Run an example with `cargo run --example <name>`. Most accept extra IP addresses
 | Example | Command | What it shows |
 | --- | --- | --- |
 | `NDIlib_Recv_Audio.rs` | `cargo run --example NDIlib_Recv_Audio` | Receive and inspect audio. |
-| `NDIlib_Recv_Audio_16bpp.rs` | `cargo run --example NDIlib_Recv_Audio_16bpp` | Receive audio and convert it to 16-bit samples. |
+| `NDIlib_Recv_Audio_16bpp.rs` | `cargo run --example NDIlib_Recv_Audio_16bpp` | Convert received audio with the native v3 API and explicit headroom. |
 | `NDIlib_Recv_FrameSync.rs` | `cargo run --example NDIlib_Recv_FrameSync` | Clock-corrected capture with `FrameSync`. |
 | `NDIlib_Recv_PNG.rs` | `cargo run --features image-encoding --example NDIlib_Recv_PNG` | Receive video and save a PNG. Needs the `image-encoding` feature. |
 | `NDIlib_Recv_PTZ.rs` | `cargo run --example NDIlib_Recv_PTZ` | Control PTZ cameras. |

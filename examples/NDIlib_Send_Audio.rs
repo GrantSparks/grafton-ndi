@@ -34,23 +34,18 @@ fn main() -> Result<(), Error> {
     let num_channels = 4;
     let num_samples = 1920;
 
-    // Create audio buffer (planar format)
-    let mut audio_data = vec![0.0f32; (num_samples * num_channels) as usize];
+    // Build the planar silence once. Synchronous sends borrow the samples only
+    // for the call, so the same allocation can be reused for every frame.
+    let audio_frame = AudioFrame::builder()
+        .sample_rate(sample_rate)
+        .num_channels(num_channels)
+        .num_samples(num_samples)
+        .build()?;
 
     for idx in 0..50 {
         if exit_loop.load(Ordering::Relaxed) {
             break;
         }
-
-        // Fill with silence (in real usage, you'd generate actual audio)
-        audio_data.fill(0.0);
-
-        let audio_frame = AudioFrame::builder()
-            .sample_rate(sample_rate)
-            .num_channels(num_channels)
-            .num_samples(num_samples)
-            .data(audio_data.clone())
-            .build()?;
 
         // Send the frame (clocked to 48kHz)
         sender.send_audio(&audio_frame);

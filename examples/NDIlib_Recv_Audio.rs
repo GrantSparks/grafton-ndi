@@ -11,7 +11,7 @@
 //! Optional arguments:
 //! - IP address to search: `cargo run --example NDIlib_Recv_Audio -- 192.168.0.110`
 
-use std::{env, thread, time::Duration};
+use std::{env, time::Duration};
 
 use grafton_ndi::{Error, Ndi, Receiver, ReceiverBandwidth, ReceiverOptions};
 
@@ -64,7 +64,7 @@ fn main() -> Result<(), Error> {
 
     // Capture a few audio frames
     for i in 0..5 {
-        match receiver.audio().capture(Duration::from_secs(5))? {
+        match receiver.audio().capture_ref(Duration::from_secs(5))? {
             Some(audio_frame) => {
                 println!("Frame {}: ", i + 1);
                 println!("  Sample rate: {} Hz", audio_frame.sample_rate());
@@ -76,16 +76,21 @@ fn main() -> Result<(), Error> {
                 }
                 println!("  Format: {:?}", audio_frame.format());
 
-                // Get the audio data as f32
-                let audio_data = audio_frame.data();
-                println!("  Total samples: {}", audio_data.len());
-
-                // Calculate RMS level for first 100 samples
-                let sample_count = audio_data.len().min(100);
-                if sample_count > 0 {
-                    let sum_squares: f32 = audio_data[..sample_count].iter().map(|&x| x * x).sum();
-                    let rms = (sum_squares / sample_count as f32).sqrt();
-                    println!("  RMS level (first {} samples): {:.4}", sample_count, rms);
+                // Borrow channels directly; SDK channel padding is excluded.
+                println!(
+                    "  Total samples: {}",
+                    audio_frame.channels().map(<[f32]>::len).sum::<usize>()
+                );
+                if let Some(channel) = audio_frame.channel_data(0) {
+                    let samples = &channel[..channel.len().min(100)];
+                    if !samples.is_empty() {
+                        let sum_squares: f32 = samples.iter().map(|&x| x * x).sum();
+                        let rms = (sum_squares / samples.len() as f32).sqrt();
+                        println!(
+                            "  RMS level (first channel, {} samples): {rms:.4}",
+                            samples.len()
+                        );
+                    }
                 }
 
                 // Show per-channel data if stereo or more
@@ -115,9 +120,6 @@ fn main() -> Result<(), Error> {
                 println!("No audio frame available");
             }
         }
-
-        // Small delay between captures
-        thread::sleep(Duration::from_millis(100));
     }
 
     println!("Audio capture complete!");

@@ -43,36 +43,32 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn main() -> Result<(), Error> {
-    let args: Vec<String> = env::args().collect();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut extra_ips = Vec::new();
-    let mut frame_count = 30; // Default to 30 frames
+    let mut frame_count: u32 = 30;
     let mut audio_sample_rate = 48000;
     let mut audio_channels = 2;
     let mut audio_samples = 1024;
-
-    let mut i = 1;
-    while i < args.len() {
-        if args[i] == "--frames" && i + 1 < args.len() {
-            frame_count = args[i + 1].parse().unwrap_or(30);
-            i += 2;
-        } else if args[i] == "--audio-rate" && i + 1 < args.len() {
-            audio_sample_rate = args[i + 1].parse().unwrap_or(48000);
-            i += 2;
-        } else if args[i] == "--audio-channels" && i + 1 < args.len() {
-            audio_channels = args[i + 1].parse().unwrap_or(2);
-            i += 2;
-        } else if args[i] == "--audio-samples" && i + 1 < args.len() {
-            audio_samples = args[i + 1].parse().unwrap_or(1024);
-            i += 2;
-        } else if !args[i].starts_with("--") {
-            extra_ips.push(args[i].as_str());
-            i += 1;
-        } else {
-            eprintln!("Unknown argument: {arg}", arg = args[i]);
-            i += 1;
+    let mut arguments = env::args().skip(1);
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--frames" => frame_count = common::option_value(&mut arguments, &argument)?,
+            "--audio-rate" => audio_sample_rate = common::option_value(&mut arguments, &argument)?,
+            "--audio-channels" => audio_channels = common::option_value(&mut arguments, &argument)?,
+            "--audio-samples" => audio_samples = common::option_value(&mut arguments, &argument)?,
+            flag if flag.starts_with('-') => {
+                return Err(Error::InvalidInput(format!("unknown option: {flag}")).into());
+            }
+            _ => extra_ips.push(argument),
         }
     }
+    if frame_count == 0 {
+        return Err(Error::InvalidInput("--frames must be positive".into()).into());
+    }
+    // Validate the requested shape before waiting for a source.
+    let audio_request =
+        FrameSyncAudioRequest::capture_at(audio_sample_rate, audio_channels, audio_samples)?;
+    let extra_ips: Vec<&str> = extra_ips.iter().map(String::as_str).collect();
 
     println!("NDI FrameSync Example");
     println!("=====================\n");
@@ -107,10 +103,7 @@ fn main() -> Result<(), Error> {
 
     println!("Creating FrameSync for clock-corrected capture...");
     let framesync = FrameSync::new(receiver)?;
-    let audio_request =
-        FrameSyncAudioRequest::capture_at(audio_sample_rate, audio_channels, audio_samples)?;
-
-    // The attached receiver exposes controls, audio, metadata, and status.
+    // The attached receiver exposes controls, metadata, and status.
     // Raw video becomes available again after framesync.into_receiver().
     println!(
         "PTZ supported: {}",
@@ -124,6 +117,7 @@ fn main() -> Result<(), Error> {
     let mut audio_samples_total = 0;
     let mut last_video_timecode = None;
     let mut repeated_timecodes = 0;
+    let mut last_video = Instant::now();
 
     // One audio block defines each software output tick. Video is sampled at
     // this same cadence and may repeat or skip source frames as needed.
@@ -160,11 +154,20 @@ fn main() -> Result<(), Error> {
             }
 
             video_frames += 1;
+            last_video = Instant::now();
         } else if video_frames == 0 {
             // Still waiting for first frame
             print!(".");
             use std::io::Write;
             std::io::stdout().flush().ok();
+        }
+
+        if last_video.elapsed() >= Duration::from_secs(10) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "no video available for 10 seconds",
+            )
+            .into());
         }
 
         // Request one output block; the SDK supplies silence if needed.

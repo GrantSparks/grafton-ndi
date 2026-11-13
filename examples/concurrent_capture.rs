@@ -11,7 +11,7 @@
 
 use grafton_ndi::{Ndi, Receiver, ReceiverBandwidth, ReceiverColorFormat, ReceiverOptions};
 
-use std::{env, sync::Arc, thread, time::Duration};
+use std::{env, thread, time::Duration};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -55,20 +55,17 @@ fn main() -> Result<(), grafton_ndi::Error> {
         .name("Concurrent Capture Example");
     let receiver = Receiver::new(&ndi, &options)?;
 
-    // Wrap receiver in Arc for sharing between threads
-    let receiver = Arc::new(receiver);
-
     // Use scoped threads to ensure proper lifetimes
-    thread::scope(|s| {
+    thread::scope(|s| -> grafton_ndi::Result<()> {
         // Spawn video capture thread
-        let recv_video = Arc::clone(&receiver);
-        let video_handle = s.spawn(move || {
+        let recv_video = &receiver;
+        let video_handle = s.spawn(move || -> grafton_ndi::Result<()> {
             println!("Video thread started");
             let mut frame_count = 0;
 
             for _ in 0..10 {
-                match recv_video.video().capture(Duration::from_secs(5)) {
-                    Ok(Some(frame)) => {
+                match recv_video.video().capture_ref(Duration::from_secs(5))? {
+                    Some(frame) => {
                         frame_count += 1;
                         let width = frame.width();
                         let height = frame.height();
@@ -78,29 +75,25 @@ fn main() -> Result<(), grafton_ndi::Error> {
                             "[VIDEO] Frame {frame_count}: {width}x{height} @ {frame_rate_n}/{frame_rate_d} fps"
                         );
                     }
-                    Ok(None) => {
+                    None => {
                         println!("[VIDEO] Timeout waiting for frame");
                     }
-                    Err(e) => {
-                        eprintln!("[VIDEO] Error capturing frame: {e}");
-                        break;
-                    }
                 }
-                thread::sleep(Duration::from_millis(100));
             }
 
             println!("Video thread finished - captured {frame_count} frames");
+            Ok(())
         });
 
         // Spawn audio capture thread
-        let recv_audio = Arc::clone(&receiver);
-        let audio_handle = s.spawn(move || {
+        let recv_audio = &receiver;
+        let audio_handle = s.spawn(move || -> grafton_ndi::Result<()> {
             println!("Audio thread started");
             let mut sample_count = 0;
 
             for _ in 0..10 {
-                match recv_audio.audio().capture(Duration::from_secs(5)) {
-                    Ok(Some(frame)) => {
+                match recv_audio.audio().capture_ref(Duration::from_secs(5))? {
+                    Some(frame) => {
                         sample_count += frame.num_samples();
                         let num_samples = frame.num_samples();
                         let sample_rate = frame.sample_rate();
@@ -109,32 +102,28 @@ fn main() -> Result<(), grafton_ndi::Error> {
                             "[AUDIO] {num_samples} samples @ {sample_rate} Hz, {num_channels} channels"
                         );
                     }
-                    Ok(None) => {
+                    None => {
                         println!("[AUDIO] Timeout waiting for frame");
                     }
-                    Err(e) => {
-                        eprintln!("[AUDIO] Error capturing frame: {e}");
-                        break;
-                    }
                 }
-                thread::sleep(Duration::from_millis(100));
             }
 
             println!("Audio thread finished - captured {sample_count} samples");
+            Ok(())
         });
 
         // Spawn metadata capture thread
-        let recv_metadata = Arc::clone(&receiver);
-        let metadata_handle = s.spawn(move || {
+        let recv_metadata = &receiver;
+        let metadata_handle = s.spawn(move || -> grafton_ndi::Result<()> {
             println!("Metadata thread started");
             let mut metadata_count = 0;
 
             for _ in 0..20 {
                 match recv_metadata
                     .metadata()
-                    .capture(Duration::from_millis(2500))
+                    .capture_ref(Duration::from_millis(2500))?
                 {
-                    Ok(Some(frame)) => {
+                    Some(frame) => {
                         metadata_count += 1;
                         let data = frame.data();
                         let data_len = data.len();
@@ -145,25 +134,22 @@ fn main() -> Result<(), grafton_ndi::Error> {
                         }
                         println!("[METADATA] Received {data_len} bytes: {preview}");
                     }
-                    Ok(None) => {
+                    None => {
                         // Metadata is less frequent, timeouts are normal
                     }
-                    Err(e) => {
-                        eprintln!("[METADATA] Error capturing frame: {e}");
-                        break;
-                    }
                 }
-                thread::sleep(Duration::from_millis(50));
             }
 
             println!("Metadata thread finished - captured {metadata_count} frames");
+            Ok(())
         });
 
         // Wait for all threads to complete
-        video_handle.join().unwrap();
-        audio_handle.join().unwrap();
-        metadata_handle.join().unwrap();
-    });
+        video_handle.join().expect("video worker panicked")?;
+        audio_handle.join().expect("audio worker panicked")?;
+        metadata_handle.join().expect("metadata worker panicked")?;
+        Ok(())
+    })?;
 
     println!("\nConcurrent capture workers finished.");
     Ok(())

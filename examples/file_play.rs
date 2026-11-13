@@ -53,7 +53,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(event) => match event.kind() {
                 PlayerEventKind::Ended => println!("Reached the end of the file."),
                 PlayerEventKind::Error => {
-                    println!("Playback failed: {}", event.message().to_string_lossy());
+                    return Err(
+                        format!("playback failed: {}", event.message().to_string_lossy()).into(),
+                    );
                 }
                 kind => println!("{kind:?}"),
             },

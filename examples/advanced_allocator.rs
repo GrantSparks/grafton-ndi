@@ -56,7 +56,7 @@ fn main() -> Result<(), Error> {
         if let Some(frame) = receiver
             .receiver()
             .video()
-            .capture(Duration::from_secs(1))?
+            .capture_ref(Duration::from_secs(1))?
         {
             let usage = service.usage();
             println!(
