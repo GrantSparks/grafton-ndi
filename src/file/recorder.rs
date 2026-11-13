@@ -585,8 +585,13 @@ impl FileRecorder {
     /// The recorder's [`FileNaming`](super::FileNaming) turns the target into
     /// file names. With the default indexed names the lowest unused index is
     /// chosen; with an exact file name a file that already exists is refused.
-    /// Nothing is overwritten or removed, and the directory the naming leads
-    /// to must exist.
+    /// The directory the naming leads to must exist. The check does not
+    /// reserve the file: a collision created afterwards reaches the SDK and
+    /// can cause a native open failure. Linux File SDK 6.4.0.2 uses exclusive
+    /// creation and preserves the colliding file; other platforms and SDK
+    /// releases have not been verified. Use a recorder-controlled directory
+    /// for uninterrupted recording and destination containment. Parent
+    /// directories are not pinned against replacement.
     ///
     /// The target is only read, so it stays with the caller whatever the
     /// outcome, for example to start again once a missing directory exists.
@@ -1013,6 +1018,13 @@ impl FileRecorder {
     /// and be writable, and with an exact file name the file must not exist.
     /// The usual mistakes then leave the session running, and the target,
     /// which is only read, stays with the caller to correct and try again.
+    /// The preflight is not a reservation: a path created after it can make
+    /// the later native open fail and end the session even after this method
+    /// returns `Ok(())`. Observe open-failed/error events and the final
+    /// [`RecordingReport`]. The exclusive-creation behavior tested on Linux
+    /// File SDK 6.4.0.2 preserves colliding regular files and symlinks; other
+    /// platforms and SDK releases have not been verified. A
+    /// recorder-controlled output directory avoids this race with other writers.
     ///
     /// # Errors
     ///

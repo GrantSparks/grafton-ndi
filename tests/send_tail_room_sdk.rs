@@ -157,6 +157,7 @@ fn frames_that_end_where_memory_ends_are_sent() {
                 let mut roomy = Guarded::new(len + room);
                 smooth(&mut roomy.bytes()[..len]);
                 let frame = BorrowedVideoFrame::builder(roomy.bytes(), width, height, format)
+                    .allow_send_from_padding_and_tail(true)
                     .scan_type(scan)
                     .build()
                     .unwrap();
@@ -203,6 +204,11 @@ impl Drop for StopOnDrop<'_> {
 /// The active pixels of the first 642x32 frame a new receiver gets while
 /// `frame` is sent.
 fn received(ndi: &Ndi, label: &str, frame: BorrowedVideoFrame<'_>) -> Vec<u8> {
+    let expected_format = if frame.pixel_format() == PixelFormat::Uyva {
+        PixelFormat::Bgra
+    } else {
+        PixelFormat::Uyvy
+    };
     let sender = sender(ndi, label);
     let receiver = uyvy_receiver(ndi, &sender);
     let stop = AtomicBool::new(false);
@@ -223,7 +229,7 @@ fn received(ndi: &Ndi, label: &str, frame: BorrowedVideoFrame<'_>) -> Vec<u8> {
                 .unwrap();
             if let Some(captured) = captured {
                 if captured.width() == 642 {
-                    assert_eq!(captured.pixel_format(), PixelFormat::Uyvy);
+                    assert_eq!(captured.pixel_format(), expected_format);
                     break captured.to_owned().data().to_vec();
                 }
             }
@@ -265,6 +271,7 @@ fn bytes_after_a_buffer_reach_the_picture_only_as_room() {
     // Offered as room, the bytes after the frame are sent in place.
     let in_place = |bytes: &[u8], label: &str| {
         let frame = BorrowedVideoFrame::builder(bytes, width, height, format)
+            .allow_send_from_padding_and_tail(true)
             .build()
             .unwrap();
         assert!(frame.sends_in_place());
@@ -302,12 +309,24 @@ fn bytes_after_a_buffer_reach_the_picture_only_as_room() {
     assert_eq!(exact(&bright, "bright after"), zero_room);
 
     // Vouched for, they are the room again, read where they lie.
-    let builder = BorrowedVideoFrame::builder(&bright[..len], width, height, format);
+    let builder = BorrowedVideoFrame::builder(&bright[..len], width, height, format)
+        .allow_send_from_padding_and_tail(true);
     // SAFETY: `after` more bytes of `bright` follow the slice, and nothing
     // writes them.
     let vouched = unsafe { builder.readable_after(after) }.build().unwrap();
     assert!(vouched.sends_in_place());
     assert_eq!(received(&ndi, "vouched", vouched), bright_room);
+
+    // Declaring initialized room alone must not bypass default staging.
+    let builder = BorrowedVideoFrame::builder(&bright[..len], width, height, format);
+    // SAFETY: the same initialized allocation extends `after` bytes past
+    // the slice and remains stable throughout the send.
+    let default = unsafe { builder.readable_after(after) }.build().unwrap();
+    assert_eq!(received(&ndi, "default vouched", default), zero_room);
+    let default = BorrowedVideoFrame::builder(&bright, width, height, format)
+        .build()
+        .unwrap();
+    assert_eq!(received(&ndi, "default trailing slice", default), zero_room);
 
     // An owned frame's room is zero too.
     let owned = BorrowedVideoFrame::builder(&bright[..len], width, height, format)
@@ -315,4 +334,113 @@ fn bytes_after_a_buffer_reach_the_picture_only_as_room() {
         .unwrap()
         .to_owned();
     assert_eq!(received(&ndi, "owned", (&owned).into()), zero_room);
+}
+
+/// Row padding and all forms of trailing room are excluded by default,
+/// including the extra strides needed by interlaced and field frames.
+#[test]
+fn default_yuv_sends_depend_only_on_active_pixels() {
+    let Some(ndi) = common::ndi() else {
+        return;
+    };
+    for format in [PixelFormat::Uyvy, PixelFormat::Uyva] {
+        if format.send_tail_room() == 0 {
+            continue;
+        }
+        for (label, padding, height, scan, extra, vouched, last_only) in [
+            (
+                "earlier rows",
+                4,
+                32,
+                ScanType::Progressive,
+                0,
+                false,
+                false,
+            ),
+            ("last row", 4, 32, ScanType::Progressive, 0, false, true),
+            (
+                "sufficient padding",
+                128,
+                32,
+                ScanType::Progressive,
+                0,
+                false,
+                false,
+            ),
+            (
+                "trailing slice",
+                0,
+                32,
+                ScanType::Progressive,
+                64,
+                false,
+                false,
+            ),
+            (
+                "asserted room",
+                0,
+                32,
+                ScanType::Progressive,
+                64,
+                true,
+                false,
+            ),
+            (
+                "interlaced",
+                4,
+                34,
+                ScanType::Interlaced,
+                2700,
+                false,
+                false,
+            ),
+        ] {
+            let width = 642;
+            let stride = width as usize * 2 + padding;
+            let len =
+                stride * height as usize * if format == PixelFormat::Uyva { 3 } else { 2 } / 2;
+            let make = |value| {
+                let mut data = vec![0; len + extra];
+                for y in 0..height as usize {
+                    smooth(&mut data[y * stride..y * stride + width as usize * 2]);
+                    if (y == height as usize - 1) == last_only {
+                        data[y * stride + width as usize * 2..(y + 1) * stride].fill(value);
+                    }
+                }
+                if format == PixelFormat::Uyva {
+                    let base = stride * height as usize;
+                    for y in 0..height as usize {
+                        data[base + y * stride / 2..base + y * stride / 2 + width as usize]
+                            .fill(255);
+                        if (y == height as usize - 1) == last_only {
+                            data[base + y * stride / 2 + width as usize
+                                ..base + (y + 1) * stride / 2]
+                                .fill(value);
+                        }
+                    }
+                }
+                data[len..].fill(value);
+                data
+            };
+            let (dark, bright) = (make(16), make(235));
+            let frame = |data: &[u8], name: &str| {
+                let slice = if vouched { &data[..len] } else { data };
+                let builder = BorrowedVideoFrame::builder(slice, width, height, format)
+                    .line_stride(stride)
+                    .scan_type(scan);
+                // SAFETY: `extra` initialized bytes follow the slice within
+                // the same allocation when vouched; all data stays stable.
+                let frame = unsafe { builder.readable_after(if vouched { extra } else { 0 }) }
+                    .build()
+                    .unwrap();
+                assert!(!frame.sends_in_place());
+                received(&ndi, &format!("{format:?} {label} {name}"), frame)
+            };
+            assert_eq!(
+                frame(&dark, "dark"),
+                frame(&bright, "bright"),
+                "{format:?} {label}"
+            );
+        }
+    }
 }

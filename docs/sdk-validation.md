@@ -182,16 +182,40 @@ intact. `tests/image_color_sdk.rs` leaves 3840×2160 out on 32-bit x86.
 frame: 64 zero bytes for UYVY and UYVA, none for the other formats, and none
 at all on 64-bit ARM Linux. An interlaced or single-field UYVY or UYVA frame
 whose height is not a multiple of four gets two line strides more. An owned
-frame's allocation holds the room; `Sender::send_video` sends a borrowed
-frame in place when its buffer has the room, or the caller vouches for it
-with `BorrowedVideoFrameBuilder::readable_after`, and from a copy in a buffer
-the sender keeps when it does not. On other architectures and operating
-systems the crate takes the x86 figures.
+frame's allocation holds the room. `Sender::send_video` packs active rows of
+borrowed UYVY/UYVA frames into reusable staging with a zeroed tail by default
+where that room is nonzero, regardless of supplied padding or tail room.
+`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail(true)` permits
+direct sending when sufficient initialized bytes follow the last pixel;
+`readable_after` alone never opts in. Native reads of row padding can also
+affect received pixels, so staging copies active rows only. On other
+architectures and operating systems the crate takes the x86 figures.
 
-The copy costs time. Sending a UYVY frame from a buffer that ends with it,
-against the same frame with room, takes 0.15 ms longer at 1280×720, 0.28 ms
+Earlier measurements compared sending a UYVY frame from a buffer that ends
+with it against direct sending of the same frame with room: 0.15 ms longer at 1280×720, 0.28 ms
 at 1920×1080 and 1.1 ms at 3840×2160 with the 6.3.2 and 6.4.0.2 runtimes, in
 a release build on Linux x86-64: 18%, 15% and 54% of the send.
+
+The final packed staging path was benchmarked on 2026-11-13 in a release
+build with Rust 1.99.1 on Linux x86-64, over 200 frames after warming the
+reused allocation. These are wrapper staging times per frame, excluding SDK
+encoding, rather than a comparison of total sends:
+
+| Format | Resolution | Packed source | Source with 4 padding bytes per row |
+| --- | --- | --- | --- |
+| UYVY | 1280×720 | 0.114 ms | 0.112 ms |
+| UYVY | 1920×1080 | 0.262 ms | 0.257 ms |
+| UYVY | 3840×2160 | 0.890 ms | 1.241 ms |
+| UYVA | 1280×720 | 0.178 ms | 0.187 ms |
+| UYVA | 1920×1080 | 0.390 ms | 0.383 ms |
+| UYVA | 3840×2160 | 1.509 ms | 2.275 ms |
+
+Reproduce with
+`cargo test --release --lib benchmark_borrowed_yuv_staging -- --ignored --nocapture`. Unit tests verify no allocations after staging warms.
+The received-picture regression varies earlier-row padding, last-row padding,
+trailing slice bytes and separately asserted initialized room, for both formats
+and interlaced layouts. The guard-page test retains explicit direct-send and
+single-field coverage.
 
 `tests/send_tail_room_sdk.rs` sends UYVY and UYVA frames of nine sizes and the
 four scan types from memory that ends at an inaccessible page, with exactly

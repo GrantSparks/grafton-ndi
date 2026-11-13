@@ -57,6 +57,30 @@ library name to that module, it returns the module again instead of looking
 further. The error names the file. Remove or fix it, or pass
 `FileRuntimeOptions::library_path`.
 
+Loading either native library executes its constructors before the wrapper
+checks symbols, even if the candidate is rejected. For services or elevated
+processes, make the first selection use absolute paths under application-owner
+control. Both options try only that file, with no search fallback:
+
+```rust
+use grafton_ndi::{Ndi, RuntimeOptions, file::{FileApi, FileRuntimeOptions}};
+# fn main() -> grafton_ndi::Result<()> {
+let ndi = Ndi::with_options(&RuntimeOptions::new()
+    .library_path("/opt/my-service/ndi/libndi_advanced.so.6"))?;
+let file = FileApi::open(&ndi, &FileRuntimeOptions::new()
+    .library_path("/opt/my-service/ndi/libndifile.so.6"))?;
+println!("Runtime: {:?}; File library: {:?}",
+    ndi.runtime().info().library_path(), file.library_path());
+# Ok(())
+# }
+```
+
+Use the native names for your platform. Dependencies still follow platform
+loader rules and also need trusted locations. If using default File discovery,
+trust the runtime's companion directory as well as every other searched
+directory. A later explicit selection cannot undo code already executed by an
+earlier load. See [runtime selection](setup.md#selecting-a-runtime).
+
 Which NDI runtime the File library works with depends on the platform:
 
 | Platform | Rule |
@@ -233,8 +257,9 @@ index. `FileNaming::Exact`, or a `FileNaming::Pattern` without `{index}` or
 `{index:N}`, names the file exactly instead. One target then names one file, so
 the session cannot move to a new file by itself:
 
-- `start` and `rollover` refuse a target whose file exists, so nothing is ever
-  overwritten. `rollover` to a new target works.
+- `start` and `rollover` refuse a target whose file exists at preflight with
+  `Error::Io(AlreadyExists)`, before calling the SDK. `rollover` to a new
+  target works.
 - A format change of the source closes the file and ends the session, because
   format-change rollover is off for an exact name unless set.
   `RecordingReport::stopped_by_sdk` then reports that the SDK ended it.
@@ -247,6 +272,22 @@ the session cannot move to a new file by itself:
 
 Use an indexed pattern for a recording that must survive a format change or a
 change of source.
+
+The preflight checks are not filesystem reservations. A file or symlink created
+between the check and the native open can make `start` fail in the SDK. A
+`rollover` can return `Ok(())` before that later open fails, closes the prior
+file and ends the session; observe open-failed/error events and the final
+`RecordingReport`, including `stopped_by_sdk`.
+
+On Linux x86-64 File SDK 6.4.0.2, native exact-name creation uses exclusive
+open: racing regular files, existing-target symlinks and dangling symlinks are
+preserved. This is verified only for that platform and release; Windows,
+macOS, Android and other releases have not been verified. The wrapper does not
+reserve the final path, since that would prevent the SDK's exclusive open.
+Use a recorder-controlled output directory when uninterrupted recording or
+destination containment matters. Parent directories are not pinned against
+replacement, and this API makes no containment promise for mutable parents.
+
 
 ### Finishing a recording
 

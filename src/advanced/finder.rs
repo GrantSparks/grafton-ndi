@@ -3,7 +3,7 @@
 use std::ffi::c_char;
 
 use crate::{
-    frames::copy_sdk_string,
+    finder::{snapshot_entry, SnapshotBudget},
     sys::{
         advanced::{native, SourceMetadata},
         bindings::*,
@@ -53,24 +53,28 @@ unsafe fn extended_source(
     name: *const c_char,
     address: *const c_char,
     metadata: *const c_char,
-) -> Option<ExtendedSource> {
-    const OPERATION: &str = "NDIlib_find_get_current_sources_v2";
+    budget: &mut SnapshotBudget,
+) -> Result<Option<ExtendedSource>> {
     let mut descriptor = NDIlib_source_t {
         p_ndi_name: name,
         ..Default::default()
     };
     descriptor.__bindgen_anon_1.p_url_address = address;
     // SAFETY: the descriptor points to the caller's readable strings.
-    let source = unsafe { Source::try_from_raw(&descriptor, OPERATION) }.ok()?;
+    let Some(source) = (unsafe { snapshot_entry(&descriptor, budget)? }) else {
+        return Ok(None);
+    };
     let metadata = if metadata.is_null() {
         None
     } else {
         // SAFETY: non-null was checked; the caller guarantees the terminator.
-        let text = unsafe { copy_sdk_string(metadata, OPERATION) }.ok()?;
+        let Some(text) = (unsafe { budget.text(metadata)? }) else {
+            return Ok(None);
+        };
         // The SDK gives a source that advertises nothing an empty string.
         (!text.is_empty()).then_some(text)
     };
-    Some(ExtendedSource { source, metadata })
+    Ok(Some(ExtendedSource { source, metadata }))
 }
 
 impl Finder {
@@ -83,6 +87,9 @@ impl Finder {
     ///
     /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
     /// without an Advanced runtime.
+    /// [`crate::Error::ResourceLimit`] when the descriptor count or total work
+    /// exceeds the limits of [`Self::current_sources`]. Advertised metadata
+    /// is included in that same byte budget, including lossy UTF-8 expansion.
     pub fn sources_with_metadata(&self) -> Result<Vec<ExtendedSource>> {
         let table = self.runtime().table::<SourceMetadata>()?;
         native!(SourceMetadata, table => {
@@ -91,14 +98,14 @@ impl Finder {
             // strings stay valid until the next snapshot call; the snapshot
             // lock excludes that call until every descriptor has been copied,
             // and each copy reads only its descriptor's strings meanwhile.
-            Ok(unsafe {
+            unsafe {
                 self.snapshot(
                     |instance, count| table.NDIlib_find_get_current_sources_v2(instance, count),
-                    |source| {
-                        extended_source(source.p_ndi_name, source.p_url_address, source.p_metadata)
+                    |source, budget| {
+                        extended_source(source.p_ndi_name, source.p_url_address, source.p_metadata, budget)
                     },
                 )
-            })
+            }
         })
     }
 }
@@ -118,7 +125,15 @@ mod tests {
         let copy = |name: Option<&CStr>, address: Option<&CStr>, metadata: Option<&CStr>| {
             let pointer = |text: Option<&CStr>| text.map_or(std::ptr::null(), CStr::as_ptr);
             // SAFETY: every pointer is null or a live C string literal.
-            unsafe { extended_source(pointer(name), pointer(address), pointer(metadata)) }
+            unsafe {
+                extended_source(
+                    pointer(name),
+                    pointer(address),
+                    pointer(metadata),
+                    &mut SnapshotBudget::new(),
+                )
+            }
+            .unwrap()
         };
 
         // A source without metadata, as a null pointer and as the empty

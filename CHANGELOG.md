@@ -11,6 +11,17 @@ API, see the [README](README.md) and the migration guides for
 
 ## [Unreleased]
 
+### Security
+
+- Borrowed UYVY/UYVA sends pack active rows and zero trailing SDK room by default
+  on targets that need it. Direct sending from caller padding and trailing
+  memory requires `allow_send_from_padding_and_tail(true)`; `readable_after`
+  requires initialized, stable bytes in the same allocation.
+- Finder snapshots and distinct results over a discovery window have count and
+  aggregate byte limits, fallible reservations and `Error::ResourceLimit` errors.
+- Document recorder preflight races and the Linux 6.4.0.2 exclusive-open evidence,
+  and require trusted native search directories or explicit first-load paths.
+
 ### Changed
 
 - Receiver connection targets now follow the latest successful `connect_to`

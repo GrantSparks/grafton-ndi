@@ -18,6 +18,8 @@
 //!   log every identifier passed back, byte for byte. An event batch holds
 //!   `GRAFTON_FAKE_EVENT_COUNT` events (two by default);
 //! * `fake_advanced` — also export the Advanced SDK entry points;
+//! * `fake_finder` — return the bounded-resource Finder fixtures in
+//!   `fake_finder.rs`, selected by `GRAFTON_FAKE_FINDER_CASE`;
 //! * `fake_receiver_v4` — also export only `NDIlib_recv_create_v4`, as a newer
 //!   Standard runtime might;
 //! * `fake_omit_required` — omit one required function;
@@ -171,10 +173,6 @@ export! {
 }
 
 stub! {
-    fn NDIlib_find_create_v2(p_create_settings: *const NDIlib_find_create_t) -> NDIlib_find_instance_t;
-    fn NDIlib_find_destroy(p_instance: NDIlib_find_instance_t);
-    fn NDIlib_find_get_current_sources(p_instance: NDIlib_find_instance_t, p_no_sources: *mut u32) -> *const NDIlib_source_t;
-    fn NDIlib_find_wait_for_sources(p_instance: NDIlib_find_instance_t, timeout_in_ms: u32) -> bool;
     fn NDIlib_recv_capture_v3(p_instance: NDIlib_recv_instance_t, p_video_data: *mut NDIlib_video_frame_v2_t, p_audio_data: *mut NDIlib_audio_frame_v3_t, p_metadata: *mut NDIlib_metadata_frame_t, timeout_in_ms: u32) -> NDIlib_frame_type_e;
     fn NDIlib_recv_free_video_v2(p_instance: NDIlib_recv_instance_t, p_video_data: *const NDIlib_video_frame_v2_t);
     fn NDIlib_recv_free_audio_v3(p_instance: NDIlib_recv_instance_t, p_audio_data: *const NDIlib_audio_frame_v3_t);
@@ -763,3 +761,15 @@ configured_creation! {
     NDIlib_send_listener_create_ex(NDIlib_send_listener_create_t) -> NDIlib_send_listener_instance_t;
     NDIlib_recv_listener_create_ex(NDIlib_recv_listener_create_t) -> NDIlib_recv_listener_instance_t;
 }
+
+#[cfg(not(fake_finder))]
+stub! {
+    fn NDIlib_find_create_v2(p_create_settings: *const NDIlib_find_create_t) -> NDIlib_find_instance_t;
+    fn NDIlib_find_destroy(p_instance: NDIlib_find_instance_t);
+    fn NDIlib_find_get_current_sources(p_instance: NDIlib_find_instance_t, p_no_sources: *mut u32) -> *const NDIlib_source_t;
+    fn NDIlib_find_wait_for_sources(p_instance: NDIlib_find_instance_t, timeout_in_ms: u32) -> bool;
+}
+
+#[cfg(fake_finder)]
+#[path = "fake_finder.rs"]
+mod finder;

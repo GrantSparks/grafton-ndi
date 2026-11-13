@@ -40,6 +40,32 @@
 //!
 //! # Where the runtime is loaded from
 //!
+//! **Deployment trust boundary:** [`Ndi::new`] uses a packaging-oriented
+//! search. Every searched directory must be controlled by a trusted owner.
+//! Loading a native library executes its constructors before its symbols or
+//! edition can be checked, including libraries later rejected during fallback.
+//! For services and elevated processes, make the very first selection use an
+//! absolute path in an application-owner-controlled directory:
+//!
+//! ```no_run
+//! # fn main() -> grafton_ndi::Result<()> {
+//! use grafton_ndi::{Runtime, RuntimeOptions};
+//! let runtime = Runtime::select(&RuntimeOptions::new()
+//!     .library_path("/opt/my-service/ndi/libndi.so.6"))?;
+//! println!("Selected runtime: {:?}", runtime.info().library_path());
+//! let ndi = runtime.initialize()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! An explicit path tries only that file and never falls back to executable,
+//! environment or platform search paths. A later explicit selection cannot
+//! undo code already run by an earlier load. Native dependencies still use
+//! platform loader rules and must also come from trusted locations. With the
+//! File API, explicitly select `FileRuntimeOptions::library_path`
+//! too, or establish that its companion and other search directories are
+//! trusted; inspect the selection through `FileApi::library_path`.
+//!
 //! Unless [`RuntimeOptions::library_path`] names an exact file, the first usable
 //! library in this order is selected:
 //!
@@ -618,6 +644,11 @@ impl Ndi {
     /// This is [`Runtime::select`] with the default [`RuntimeOptions`]
     /// followed by [`Runtime::initialize`]. It is thread-safe: the first
     /// handle starts NDI and later calls add handles to the running runtime.
+    /// The default search trusts every searched directory: native constructors
+    /// run before validation, including for rejected candidates. Services and
+    /// elevated processes should make their first selection through
+    /// [`Self::with_options`] with an absolute [`RuntimeOptions::library_path`]
+    /// under application-owner control.
     ///
     /// # Errors
     ///

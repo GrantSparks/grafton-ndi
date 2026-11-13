@@ -1,5 +1,9 @@
 //! NDI source discovery and network browsing.
 
+mod budget;
+
+pub(crate) use budget::SnapshotBudget;
+
 use std::{
     collections::{HashMap, HashSet},
     ffi::CString,
@@ -140,9 +144,35 @@ pub struct Finder {
 /// # Safety
 ///
 /// As for [`Source::try_from_raw`].
-unsafe fn snapshot_entry(source: *const NDIlib_source_t) -> Option<Source> {
-    // SAFETY: forwarded to the caller's obligations.
-    unsafe { Source::try_from_raw(source, "NDIlib_find_get_current_sources") }.ok()
+pub(crate) unsafe fn snapshot_entry(
+    source: &NDIlib_source_t,
+    budget: &mut SnapshotBudget,
+) -> Result<Option<Source>> {
+    // SAFETY: both union fields are pointers of the same type.
+    let address = unsafe { source.__bindgen_anon_1.p_url_address };
+    if source.p_ndi_name.is_null() && address.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: the caller keeps every non-null string live while copying.
+    let name = unsafe { budget.text(source.p_ndi_name)? };
+    if !source.p_ndi_name.is_null() && name.is_none() {
+        return Ok(None);
+    }
+    // SAFETY: as for the name above.
+    let copied_address = unsafe { budget.text(address)? };
+    if !address.is_null() && copied_address.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(Source {
+        name: name.unwrap_or_default(),
+        address: copied_address.map(|address| {
+            if address.contains("://") {
+                SourceAddress::Url(address)
+            } else {
+                SourceAddress::Ip(address)
+            }
+        }),
+    }))
 }
 
 impl Finder {
@@ -242,27 +272,17 @@ impl Finder {
     pub(crate) unsafe fn snapshot<D, T>(
         &self,
         fetch: impl FnOnce(NDIlib_find_instance_t, &mut u32) -> *const D,
-        mut copy: impl FnMut(&D) -> Option<T>,
-    ) -> Vec<T> {
+        copy: impl FnMut(&D, &mut SnapshotBudget) -> Result<Option<T>>,
+    ) -> Result<Vec<T>> {
         let _snapshot = self
             .sources_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut count = 0;
         let descriptors = fetch(self.instance, &mut count);
-        if descriptors.is_null() {
-            return Vec::new();
-        }
-        let mut copied = Vec::with_capacity(count as usize);
-        for index in 0..count as usize {
-            // SAFETY: `index` is below the count the SDK reported for this
-            // live, non-null array, which the lock keeps from being replaced
-            // until the loop ends; `copy` cannot keep the reference.
-            if let Some(value) = copy(unsafe { &*descriptors.add(index) }) {
-                copied.push(value);
-            }
-        }
-        copied
+        // SAFETY: fetch's contract supplies the array; the lock keeps it
+        // and its strings live until the complete bounded copy returns.
+        unsafe { budget::copy_snapshot(descriptors, count, copy) }
     }
 
     /// The runtime this finder was created through.
@@ -329,6 +349,12 @@ impl Finder {
     ///
     /// Available since NDI SDK 6.0.
     ///
+    /// Each snapshot permits at most 16,384 descriptors and 16 MiB total
+    /// native descriptors, result storage, scanned string bytes (including
+    /// rejected entries) and produced UTF-8. Exceeding either budget returns
+    /// [`Error::ResourceLimit`]; reservations are fallible. An isolated
+    /// malformed descriptor within the budget is skipped.
+    ///
     /// # Returns
     ///
     /// A vector of currently known sources. May be empty if no sources are found.
@@ -356,12 +382,12 @@ impl Finder {
         // valid until the next snapshot call; the snapshot lock excludes that
         // call until every descriptor has been copied, and each copy reads
         // only its own descriptor meanwhile.
-        Ok(unsafe {
+        unsafe {
             self.snapshot(
                 |instance, count| api.core.NDIlib_find_get_current_sources(instance, count),
-                |source| snapshot_entry(source),
+                |source, budget| snapshot_entry(source, budget),
             )
-        })
+        }
     }
 
     /// Poll discovery until `accept` selects a value or `timeout` elapses.
@@ -380,13 +406,13 @@ impl Finder {
     fn poll_until_deadline<T>(
         &self,
         timeout: Duration,
-        mut accept: impl FnMut(Vec<Source>) -> Option<T>,
+        mut accept: impl FnMut(Vec<Source>) -> Result<Option<T>>,
     ) -> Result<Option<T>> {
         // Validate up front so an over-long timeout is rejected even when the
         // first snapshot already satisfies `accept`.
         let deadline = Deadline::after(timeout)?;
         loop {
-            if let Some(selected) = accept(self.current_sources()?) {
+            if let Some(selected) = accept(self.current_sources()?)? {
                 return Ok(Some(selected));
             }
             if deadline.is_expired() {
@@ -427,6 +453,11 @@ impl Finder {
     /// # Errors
     ///
     /// Returns [`Error::InvalidInput`] if `timeout` exceeds [`crate::MAX_TIMEOUT`].
+    /// Returns [`Error::ResourceLimit`] if a snapshot exceeds the limits of
+    /// [`Self::current_sources`], or distinct results retained across the
+    /// whole window exceed 16,384 entries or 16 MiB. The retained byte budget
+    /// counts both copies of each source in the result vector and the
+    /// deduplication set, including their strings and container capacity.
     ///
     /// # Examples
     ///
@@ -449,9 +480,10 @@ impl Finder {
         // Preserve first-observed order and deduplicate by complete descriptor.
         let mut seen = HashSet::new();
         let mut discovered = Vec::new();
+        let mut retained_bytes = 0;
         self.poll_until_deadline(timeout, |sources| {
-            accumulate_sources(&mut discovered, &mut seen, sources);
-            None::<()>
+            accumulate_sources(&mut discovered, &mut seen, &mut retained_bytes, sources)?;
+            Ok(None::<()>)
         })?;
         Ok(discovered)
     }
@@ -483,13 +515,64 @@ unsafe impl std::marker::Sync for Finder {}
 fn accumulate_sources(
     discovered: &mut Vec<Source>,
     seen: &mut HashSet<Source>,
+    retained_bytes: &mut usize,
     sources: Vec<Source>,
-) {
+) -> Result<()> {
     for source in sources {
-        if seen.insert(source.clone()) {
-            discovered.push(source);
+        if seen.contains(&source) {
+            continue;
         }
+        if discovered.len() == budget::MAX_SOURCES {
+            return Err(budget::limit(
+                "Finder discovery source count",
+                budget::MAX_SOURCES,
+            ));
+        }
+        let text_bytes = source.name.capacity()
+            + source.address.as_ref().map_or(0, |a| match a {
+                SourceAddress::Ip(text) | SourceAddress::Url(text) => text.capacity(),
+            });
+        let bytes = retained_bytes
+            .checked_add(text_bytes * 2)
+            .ok_or_else(|| budget::limit("Finder discovery bytes", budget::MAX_BYTES))?;
+        // Check before growing either container or copying strings. Round
+        // up for vector growth, hash buckets and control bytes; the actual
+        // capacities are checked as well before retaining the source.
+        let next_capacity = (discovered.len() + 1).max(4).next_power_of_two();
+        let growth_bound = next_capacity * 4 * (std::mem::size_of::<Source>() + 1);
+        if bytes + growth_bound > budget::MAX_BYTES {
+            return Err(budget::limit("Finder discovery bytes", budget::MAX_BYTES));
+        }
+        discovered
+            .try_reserve(1)
+            .map_err(|_| budget::allocation_failed())?;
+        seen.try_reserve(1)
+            .map_err(|_| budget::allocation_failed())?;
+        // HashSet capacity excludes unused buckets. Charging twice its
+        // capacity covers bucket rounding and control bytes conservatively.
+        let containers = discovered.capacity() * std::mem::size_of::<Source>()
+            + seen.capacity() * 2 * (std::mem::size_of::<Source>() + 1);
+        if bytes + containers > budget::MAX_BYTES {
+            return Err(budget::limit("Finder discovery bytes", budget::MAX_BYTES));
+        }
+        let name = budget::copy_string(&source.name)?;
+        let address = source
+            .address
+            .as_ref()
+            .map(|a| -> Result<SourceAddress> {
+                let (SourceAddress::Ip(text) | SourceAddress::Url(text)) = a;
+                let text = budget::copy_string(text)?;
+                Ok(match a {
+                    SourceAddress::Ip(_) => SourceAddress::Ip(text),
+                    SourceAddress::Url(_) => SourceAddress::Url(text),
+                })
+            })
+            .transpose()?;
+        seen.insert(Source { name, address });
+        discovered.push(source);
+        *retained_bytes = bytes;
     }
+    Ok(())
 }
 
 struct Authority<'a> {
@@ -1106,9 +1189,9 @@ impl SourceCache {
             let options = FinderOptions::new().extra_ips(hint);
             let finder = Finder::new(ndi, &options)?;
             finder.poll_until_deadline(timeout, |sources| {
-                sources
+                Ok(sources
                     .into_iter()
-                    .find(|source| source.matches_query(query))
+                    .find(|source| source.matches_query(query)))
             })
         })
     }
@@ -1645,13 +1728,16 @@ mod tests {
             .with_address(SourceAddress::Url("192.0.2.1".into()));
         let mut seen = HashSet::new();
         let mut discovered = Vec::new();
-        accumulate_sources(&mut discovered, &mut seen, vec![first.clone()]);
-        accumulate_sources(&mut discovered, &mut seen, Vec::new());
+        let mut bytes = 0;
+        accumulate_sources(&mut discovered, &mut seen, &mut bytes, vec![first.clone()]).unwrap();
+        accumulate_sources(&mut discovered, &mut seen, &mut bytes, Vec::new()).unwrap();
         accumulate_sources(
             &mut discovered,
             &mut seen,
+            &mut bytes,
             vec![first.clone(), changed.clone(), distinct_variant.clone()],
-        );
+        )
+        .unwrap();
         assert_eq!(discovered, vec![first, changed, distinct_variant]);
     }
 
@@ -1719,16 +1805,16 @@ mod tests {
                             std::thread::yield_now();
                             &raw
                         },
-                        |source| {
+                        |source, budget| {
                             // Deterministically catches releasing the lock before
                             // copying, even if competing threads are not scheduled.
                             assert!(matches!(finder.sources_lock.try_lock(), Err(TryLockError::WouldBlock)));
                             std::thread::yield_now();
-                            let owned = snapshot_entry(source);
+                            let owned = snapshot_entry(source, budget);
                             assert_eq!(active_snapshot.fetch_sub(1, Ordering::SeqCst), 1);
                             owned
                         },
-                    ) };
+                    ) }.unwrap();
                     drop(name);
                     drop(address);
                     assert_eq!(sources[0].name(), format!("Camera {index}"));
@@ -1752,9 +1838,10 @@ mod tests {
         assert!(unsafe {
             finder.snapshot(
                 |_, _| ptr::null::<NDIlib_source_t>(),
-                |_| -> Option<Source> { panic!("empty snapshot must not copy") },
+                |_, _| -> Result<Option<Source>> { panic!("empty snapshot must not copy") },
             )
         }
+        .unwrap()
         .is_empty());
     }
 
@@ -1836,9 +1923,10 @@ mod tests {
                     *count = snapshot.len() as u32;
                     snapshot.as_ptr()
                 },
-                |source| snapshot_entry(source),
+                |source, budget| snapshot_entry(source, budget),
             )
         };
+        let sources = sources.unwrap();
         let names: Vec<_> = sources.iter().map(Source::name).collect();
         assert_eq!(names, ["First", "Last"]);
     }

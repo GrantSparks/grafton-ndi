@@ -123,8 +123,33 @@ features, even when the File library is available. See the [File guide](file-io.
 
 Package the native runtime explicitly: dependency scanners cannot discover a
 library loaded at run time. Use one of the search locations above or an absolute
-`RuntimeOptions::library_path`. Load trusted libraries; applications running with
-elevated privileges should select an explicit path.
+`RuntimeOptions::library_path`.
+
+**The default search trusts directory ownership.** `Ndi::new()` tries libraries
+beside the executable before environment and platform locations. Loading a
+candidate executes its native constructors before symbol or edition checks,
+even if that candidate is rejected and the search continues. For services and
+elevated processes, make the very first selection use an absolute path in an
+application-owner-controlled directory:
+
+```rust
+use grafton_ndi::{Ndi, RuntimeOptions};
+# fn main() -> grafton_ndi::Result<()> {
+let ndi = Ndi::with_options(&RuntimeOptions::new()
+    .library_path("/opt/my-service/ndi/libndi.so.6"))?;
+println!("Runtime: {:?}", ndi.info().library_path());
+# Ok(())
+# }
+```
+
+An explicit path tries only that file, with no executable, environment or
+platform fallback. Select it before any other component calls `Ndi::new()`;
+a later selection cannot undo native code already executed. Native dependencies
+still follow platform loader rules and need trusted locations too. File API
+users must also select an absolute `FileRuntimeOptions::library_path` or trust
+all of its search directories, beginning with the core runtime's companion
+directory. Inspect that selection with `FileApi::library_path`; see
+[File library deployment](file-io.md#requirements).
 
 ## Supported NDI versions and platforms
 

@@ -361,13 +361,14 @@ impl PixelFormat {
     ///   [`VideoFrame::replace_data`] is grown once when its spare capacity
     ///   is smaller.
     /// - [`Sender::send_video`](crate::Sender::send_video) sends a
-    ///   [`BorrowedVideoFrame`](crate::BorrowedVideoFrame) in place when the
-    ///   buffer it was built over extends this far past the frame's last
-    ///   pixel, and from a copy when it does not.
+    ///   [`BorrowedVideoFrame`](crate::BorrowedVideoFrame) through a packed,
+    ///   zero-tailed copy by default when this room is nonzero. Direct sending
+    ///   requires both sufficient room and explicit opt-in through
+    ///   [`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail`](crate::BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail).
     ///   [`BorrowedVideoFrame::sends_in_place`](crate::BorrowedVideoFrame::sends_in_place)
     ///   tells which.
     /// - A buffer that cannot be made longer, but is known to be followed by
-    ///   readable memory, can say so with
+    ///   initialized memory in the same allocation, can say so with
     ///   [`BorrowedVideoFrameBuilder::readable_after`](crate::BorrowedVideoFrameBuilder::readable_after).
     ///
     /// One kind of frame needs two rows more, twice the line stride: an
@@ -385,7 +386,9 @@ impl PixelFormat {
     ///
     /// let format = PixelFormat::Uyvy;
     /// let buffer = vec![0u8; 720 * 480 * 2 + format.send_tail_room()];
-    /// let frame = BorrowedVideoFrame::builder(&buffer, 720, 480, format).build()?;
+    /// let frame = BorrowedVideoFrame::builder(&buffer, 720, 480, format)
+    ///     .allow_send_from_padding_and_tail(true)
+    ///     .build()?;
     /// assert!(frame.sends_in_place());
     ///
     /// assert_eq!(PixelFormat::Bgra.send_tail_room(), 0);
@@ -721,6 +724,18 @@ pub(crate) trait VideoParts {
         let data = replacement.unwrap_or_else(|| std::mem::take(&mut destination.data));
         *destination = packed_video(self, packed, data, metadata);
     }
+
+    /// Fill reusable storage with packed active rows and a zeroed SDK tail.
+    fn copy_active_pixels(&self, data: &mut Pixels, packed: &ValidatedVideoLayout, room: usize) {
+        data.fill(packed.data_len_bytes, room, |bytes| {
+            for plane in self.plane_views() {
+                match plane.data() {
+                    Some(active) => bytes.extend_from_slice(active),
+                    None => plane.rows().for_each(|row| bytes.extend_from_slice(row)),
+                }
+            }
+        });
+    }
 }
 
 /// The owned copy of `source`: `packed`, its packed layout, with `data`,
@@ -734,15 +749,7 @@ fn packed_video<P: VideoParts + ?Sized>(
     metadata: Option<FrameMetadata>,
 ) -> VideoFrame {
     let room = packed.pixel_format.send_tail_room();
-    data.fill(packed.data_len_bytes, room, |bytes| {
-        // The views read active rows only, never row padding.
-        for plane in source.plane_views() {
-            match plane.data() {
-                Some(active) => bytes.extend_from_slice(active),
-                None => plane.rows().for_each(|row| bytes.extend_from_slice(row)),
-            }
-        }
-    });
+    source.copy_active_pixels(&mut data, &packed, room);
 
     VideoFrame {
         layout: packed,

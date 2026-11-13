@@ -127,8 +127,9 @@ reuse. Use two frames and call `finish_video_async()` to recover the last one.
 This is the SDK's send pipeline, not a Rust future; synchronization can block.
 
 For borrowed synchronous sends, `BorrowedVideoFrame::sends_in_place()` reports
-whether the wrapper copies pixels. Some UYVY/UYVA buffers need a staging copy
-because the SDK reads beyond the active frame. The method's
+whether the wrapper copies pixels. UYVY/UYVA buffers use packed, zero-tailed
+staging by default on targets where the SDK needs tail room. Direct sending
+from caller padding and trailing memory requires explicit opt-in. The method's
 [API documentation](https://docs.rs/grafton-ndi/latest/grafton_ndi/struct.BorrowedVideoFrame.html#method.sends_in_place)
 specifies the required trailing space, including field-layout exceptions.
 After `send_video` returns, you can reuse the input buffer.
@@ -239,3 +240,14 @@ if let Some(ReceiverEvent::StatusChanged(status)) = async_receiver.poll_event(Du
 - [Image encoding](image-encoding.md): save snapshots and thumbnails.
 - [Advanced SDK](advanced.md): compressed packets, queues, allocators, synchronization and KVM.
 - [File API](file-io.md): record sources and play recordings.
+
+## Borrowed YUV padding
+
+For UYVY/UYVA on targets with nonzero `PixelFormat::send_tail_room()`,
+`Sender::send_video` packs active rows into reusable staging and zeroes the tail
+by default. Caller row padding and trailing memory cannot change the picture.
+`BorrowedVideoFrameBuilder::allow_send_from_padding_and_tail(true)` explicitly
+permits direct sending when enough initialized room follows the pixels; those
+bytes may then affect the encoded picture. `unsafe readable_after` declares
+initialized, stable bytes in the same allocation and does not itself opt in.
+`BorrowedVideoFrame::sends_in_place()` reports the selected behavior.

@@ -229,8 +229,10 @@ pub(super) struct ResolvedPlayerOptions {
 
 /// How a recorder names the files of a session from its [`RecordingTarget`].
 ///
-/// Whatever the naming, nothing is ever overwritten or removed, and the
-/// directory the name leads to must exist.
+/// The directory the name leads to must exist. The wrapper rejects ordinary
+/// collisions at preflight; native creation after that check depends on the
+/// platform and SDK. See [`Self::Exact`] for the tested exclusive-open
+/// behavior and the limits of this check.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum FileNaming {
@@ -240,6 +242,14 @@ pub enum FileNaming {
     /// that already exists with an [`Error::Io`] of kind
     /// [`AlreadyExists`](std::io::ErrorKind::AlreadyExists), before the SDK is
     /// called.
+    /// This preflight does not reserve the path. A collision created after
+    /// the check is handled by the native library; a rollover may return
+    /// success before its later open fails and stops the session. Linux File
+    /// SDK 6.4.0.2 uses exclusive creation and preserves existing files,
+    /// including symlinks, in this race. Other platforms and SDK releases
+    /// have not been verified. Use a recorder-controlled output directory
+    /// when uninterrupted recording or destination containment matters;
+    /// mutable parent directories are not pinned by this API.
     ///
     /// One target names one file, so a session cannot move to a new file by
     /// itself:
@@ -598,8 +608,7 @@ impl NamePattern {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 format!(
-                    "the recording file {} already exists, and an exact file name never \
-                     replaces a file",
+                    "the recording file {} already exists at preflight",
                     file.display()
                 ),
             )));

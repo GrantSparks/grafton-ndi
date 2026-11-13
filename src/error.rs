@@ -242,6 +242,17 @@ pub enum Error {
     #[error("Unexpected NDI SDK result: {0}")]
     UnexpectedSdkResult(String),
 
+    /// Finder data exceeded a per-snapshot or whole-discovery resource limit.
+    /// No partial result is returned. `resource` identifies the exhausted
+    /// count or byte budget; `limit` is its maximum.
+    #[error("NDI resource limit exceeded: {resource} (limit {limit})")]
+    ResourceLimit {
+        /// The resource whose budget was exhausted.
+        resource: &'static str,
+        /// Maximum number of entries or bytes for that resource.
+        limit: usize,
+    },
+
     /// Source discovery finished without a source that matches.
     ///
     /// Returned by the finder's host lookups when no source on the requested

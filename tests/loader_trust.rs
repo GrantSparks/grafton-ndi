@@ -1,0 +1,125 @@
+//! Library constructors run before validation; explicit selection avoids
+//! untrusted search candidates. All search directories here are test-owned.
+#![cfg(all(target_os = "linux", not(ndi_link_static)))]
+#[path = "support/fixture.rs"]
+mod fixture;
+use fixture::{FakeRuntime, FixtureDir};
+use grafton_ndi::{Ndi, RuntimeOptions};
+use std::{fs, path::PathBuf, process::Command};
+
+#[test]
+fn explicit_paths_avoid_rejected_search_candidates() {
+    if let Ok(scenario) = std::env::var("GRAFTON_TRUST_SCENARIO") {
+        let root = PathBuf::from(std::env::var_os("GRAFTON_TRUST_ROOT").unwrap());
+        let marker = root.join("marker");
+        let trusted = root.join("trusted/libndi_advanced.so.6");
+        if scenario == "explicit-rejected" {
+            assert!(Ndi::with_options(
+                &RuntimeOptions::new().library_path(root.join("executable/libndi.so.6"))
+            )
+            .is_err());
+            assert!(marker.exists());
+            return;
+        }
+        let ndi = if scenario == "default" {
+            Ndi::new().unwrap()
+        } else {
+            Ndi::with_options(&RuntimeOptions::new().library_path(&trusted)).unwrap()
+        };
+        assert_eq!(ndi.info().library_path(), Some(trusted.as_path()));
+        assert_eq!(marker.exists(), scenario == "default");
+        #[cfg(feature = "file-io")]
+        if scenario.starts_with("file-") {
+            use grafton_ndi::file::{FileApi, FileRuntimeOptions};
+            let selected = if scenario == "file-companion" {
+                root.join("trusted/libndifile.so.6")
+            } else {
+                root.join("file-runtime/libndifile.so.6")
+            };
+            let options = if scenario == "file-explicit" {
+                FileRuntimeOptions::new().library_path(&selected)
+            } else {
+                FileRuntimeOptions::new()
+            };
+            let file = FileApi::open(&ndi, &options).unwrap();
+            assert_eq!(file.library_path(), Some(selected.as_path()));
+            assert_eq!(marker.exists(), scenario == "file-fallback");
+        }
+        return;
+    }
+    for scenario in [
+        "default",
+        "explicit",
+        "explicit-rejected",
+        "file-companion",
+        "file-fallback",
+        "file-explicit",
+    ] {
+        if scenario.starts_with("file-") && !cfg!(feature = "file-io") {
+            continue;
+        }
+        let directory = FixtureDir::create("loader-trust");
+        let root = directory.path();
+        for name in ["trusted", "executable", "file-runtime"] {
+            fs::create_dir(root.join(name)).unwrap();
+        }
+        let trusted = root.join("trusted/libndi_advanced.so.6");
+        FakeRuntime::new()
+            .with("fake_advanced")
+            .version("6.4.0.2")
+            .soname("libndi_advanced.so.6")
+            .build(&trusted);
+        let executable = root.join("executable/probe");
+        fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let rejected = root.join("executable/libndi.so.6");
+        fixture::run(
+            fixture::rustc("rejected_constructor.rs", &rejected),
+            &rejected,
+        );
+        #[cfg(feature = "file-io")]
+        if scenario.starts_with("file-") {
+            let rejected = root.join("executable/libndifile.so.6");
+            fixture::run(
+                fixture::rustc("rejected_constructor.rs", &rejected),
+                &rejected,
+            );
+            let output = root
+                .join(if scenario == "file-companion" {
+                    "trusted"
+                } else {
+                    "file-runtime"
+                })
+                .join("libndifile.so.6");
+            let mut rustc = fixture::rustc("fake_file_library.rs", &output);
+            rustc.arg(fixture::link_argument(trusted.as_os_str()));
+            fixture::run(rustc, &output);
+        }
+        let output = Command::new(&executable)
+            .args([
+                "--exact",
+                "explicit_paths_avoid_rejected_search_candidates",
+                "--nocapture",
+            ])
+            .env("GRAFTON_TRUST_SCENARIO", scenario)
+            .env("GRAFTON_TRUST_ROOT", root)
+            .env("GRAFTON_REJECTED_CONSTRUCTOR_MARKER", root.join("marker"))
+            .env(
+                "NDI_RUNTIME_DIR_V6",
+                root.join(if scenario.starts_with("file-") {
+                    "file-runtime"
+                } else {
+                    "trusted"
+                }),
+            )
+            .env_remove("LD_LIBRARY_PATH")
+            .env_remove("LD_PRELOAD")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{scenario}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
