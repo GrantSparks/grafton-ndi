@@ -480,10 +480,10 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// receiver. See [`Receiver::connection_stats`].
     ///
     /// A cheap, non-blocking SDK query, so it runs inline rather than on
-    /// the blocking pool. `connection_stats().video_frames_received()` is
-    /// the canonical liveness signal: it advances as the receiver pulls
-    /// frames off the network, independent of how often the caller
-    /// captures, so a frozen counter means the feed itself has stalled.
+    /// the blocking pool. Watch the received counter for the media the
+    /// application expects; connection state and a video counter alone do
+    /// not establish audio or metadata progress. See the
+    /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
     pub fn connection_stats(&self) -> ConnectionStats {
         self.inner.connection_stats()
     }
@@ -546,7 +546,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// Re-establish the underlying receiver's connection to its source
     /// in place. See [`Receiver::reconnect`].
     ///
-    /// Unlike the liveness probes above, a reconnect takes the receiver's
+    /// Unlike the inline connection and statistics queries above, a reconnect takes the receiver's
     /// capture guard exclusively, so it blocks until the capture attempts in
     /// flight (which run on the blocking pool) return: one attempt of at most
     /// 100 ms each, whatever their timeouts. It therefore runs on the blocking

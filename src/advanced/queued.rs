@@ -41,6 +41,18 @@ impl Default for QueueOptions {
 }
 
 impl QueueOptions {
+    /// Requested maximum frame count.
+    #[must_use]
+    pub fn configured_max_frames(&self) -> usize {
+        self.frames
+    }
+
+    /// Requested maximum retained bytes.
+    #[must_use]
+    pub fn configured_max_bytes(&self) -> usize {
+        self.bytes
+    }
+
     /// The default limits: 8 frames and 512 MiB.
     pub fn new() -> Self {
         Self {

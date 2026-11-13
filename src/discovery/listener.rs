@@ -194,6 +194,19 @@ pub struct ListenerOptions {
     config: Option<crate::advanced::AdvancedConfig>,
 }
 impl ListenerOptions {
+    /// Requested server endpoint, or `None` to inherit the NDI configuration.
+    #[must_use]
+    pub fn configured_server(&self) -> Option<&str> {
+        self.server.as_deref()
+    }
+
+    /// The stored Advanced configuration handle, if any.
+    #[cfg(feature = "advanced")]
+    #[must_use]
+    pub fn configured_config(&self) -> Option<&crate::advanced::AdvancedConfig> {
+        self.config.as_ref()
+    }
+
     /// The default options: the Discovery Server of the NDI configuration.
     pub fn new() -> Self {
         Self::default()
@@ -870,7 +883,8 @@ impl fmt::Debug for RecvListener {
 macro_rules! listener_methods {
     ($Id:ty) => {
         /// Whether the listener is connected to its Discovery Server right
-        /// now. A listener that is not connected keeps trying.
+        /// now. A listener that is not connected keeps trying. This reports
+        /// registry connectivity, not progress of any receiver media.
         pub fn is_connected(&self) -> bool {
             self.inner.is_connected()
         }

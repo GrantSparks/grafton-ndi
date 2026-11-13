@@ -62,6 +62,18 @@ impl Default for AsyncFileOptions {
 }
 
 impl AsyncFileOptions {
+    /// Requested pending command capacity.
+    #[must_use]
+    pub fn configured_command_capacity(&self) -> usize {
+        self.command_capacity
+    }
+
+    /// Requested undelivered event capacity.
+    #[must_use]
+    pub fn configured_event_capacity(&self) -> usize {
+        self.event_capacity
+    }
+
     /// The default sizes: 64 pending commands and 256 undelivered events.
     pub fn new() -> Self {
         Self {

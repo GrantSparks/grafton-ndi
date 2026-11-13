@@ -136,6 +136,18 @@ pub struct RuntimeOptions {
 }
 
 impl RuntimeOptions {
+    /// Requested exact library path, or `None` for the normal search.
+    #[must_use]
+    pub fn configured_library_path(&self) -> Option<&std::path::Path> {
+        self.library_path.as_deref()
+    }
+
+    /// Requested edition, or `None` to accept either edition.
+    #[must_use]
+    pub fn configured_edition(&self) -> Option<SdkEdition> {
+        self.edition
+    }
+
     /// The default options: the runtime library of either edition, from the
     /// [documented search](crate::runtime#where-the-runtime-is-loaded-from).
     pub fn new() -> Self {

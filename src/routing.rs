@@ -39,6 +39,25 @@ pub struct RouterOptions {
     config: Option<crate::advanced::AdvancedConfig>,
 }
 impl RouterOptions {
+    /// Requested advertised name.
+    #[must_use]
+    pub fn configured_name(&self) -> &str {
+        &self.name
+    }
+
+    /// Requested discovery groups, or `None` to inherit the NDI configuration.
+    #[must_use]
+    pub fn configured_groups(&self) -> Option<&str> {
+        self.groups.as_deref()
+    }
+
+    /// The stored Advanced configuration handle, if any.
+    #[cfg(feature = "advanced")]
+    #[must_use]
+    pub fn configured_config(&self) -> Option<&crate::advanced::AdvancedConfig> {
+        self.config.as_ref()
+    }
+
     /// Configure a named routing source. Creating the Router advertises it.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
@@ -227,6 +246,7 @@ impl Router {
         }
     }
     /// Count the receivers connected to this router.
+    /// This count does not establish progress of their media streams.
     ///
     /// A zero `timeout` reads the current count; a longer one waits up to that
     /// long for the first connection.

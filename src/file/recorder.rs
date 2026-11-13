@@ -1093,6 +1093,8 @@ impl FileRecorder {
     }
 
     /// The recorder's running counters, when the SDK has any.
+    /// Interpret these with the recorder session state and events; they do
+    /// not use receiver drop-percentage semantics.
     ///
     /// # Errors
     ///

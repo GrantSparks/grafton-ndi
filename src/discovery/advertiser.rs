@@ -28,6 +28,19 @@ pub struct AdvertiserOptions {
     config: Option<crate::advanced::AdvancedConfig>,
 }
 impl AdvertiserOptions {
+    /// Requested server endpoints, or `None` to inherit the NDI configuration.
+    #[must_use]
+    pub fn configured_servers(&self) -> Option<&str> {
+        self.servers.as_deref()
+    }
+
+    /// The stored Advanced configuration handle, if any.
+    #[cfg(feature = "advanced")]
+    #[must_use]
+    pub fn configured_config(&self) -> Option<&crate::advanced::AdvancedConfig> {
+        self.config.as_ref()
+    }
+
     /// The default options: the Discovery Server of the NDI configuration.
     pub fn new() -> Self {
         Self::default()
@@ -60,6 +73,12 @@ pub struct SendAdvertisement {
     monitoring: bool,
 }
 impl SendAdvertisement {
+    /// Whether remote monitoring was requested.
+    #[must_use]
+    pub fn configured_monitoring(&self) -> bool {
+        self.monitoring
+    }
+
     /// The default advertisement: no remote monitoring.
     pub fn new() -> Self {
         Self::default()
@@ -80,6 +99,24 @@ pub struct RecvAdvertisement {
     input_group: Option<String>,
 }
 impl RecvAdvertisement {
+    /// Whether remote monitoring was requested.
+    #[must_use]
+    pub fn configured_monitoring(&self) -> bool {
+        self.monitoring
+    }
+
+    /// Whether remote source control was requested.
+    #[must_use]
+    pub fn configured_controlling(&self) -> bool {
+        self.controlling
+    }
+
+    /// Requested input group, if any.
+    #[must_use]
+    pub fn configured_input_group(&self) -> Option<&str> {
+        self.input_group.as_deref()
+    }
+
     /// The default advertisement: no remote monitoring or source control, and
     /// no input group.
     pub fn new() -> Self {

@@ -55,6 +55,31 @@ impl Default for FinderOptions {
 }
 
 impl FinderOptions {
+    /// Whether local sources were requested.
+    #[must_use]
+    pub fn configured_show_local_sources(&self) -> bool {
+        self.show_local_sources
+    }
+
+    /// Requested discovery groups, or `None` to inherit the NDI configuration.
+    #[must_use]
+    pub fn configured_groups(&self) -> Option<&str> {
+        self.groups.as_deref()
+    }
+
+    /// Requested comma-separated direct IP addresses, if any.
+    #[must_use]
+    pub fn configured_extra_ips(&self) -> Option<&str> {
+        self.extra_ips.as_deref()
+    }
+
+    /// The stored Advanced configuration handle, if any.
+    #[cfg(feature = "advanced")]
+    #[must_use]
+    pub fn configured_config(&self) -> Option<&crate::advanced::AdvancedConfig> {
+        self.config.as_ref()
+    }
+
     /// The default options: local sources included, the groups of the NDI
     /// configuration, and no extra addresses.
     pub fn new() -> Self {

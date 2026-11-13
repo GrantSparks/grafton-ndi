@@ -189,6 +189,24 @@ pub struct FrameSyncAudioRequest {
 }
 
 impl FrameSyncAudioRequest {
+    /// Requested output sample rate in Hz.
+    #[must_use]
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate as u32
+    }
+
+    /// Requested number of output channels.
+    #[must_use]
+    pub fn num_channels(&self) -> u32 {
+        self.num_channels as u32
+    }
+
+    /// Requested number of output samples per channel.
+    #[must_use]
+    pub fn num_samples(&self) -> u32 {
+        self.num_samples as u32
+    }
+
     /// Capture samples resampled to `sample_rate` Hz, converted to
     /// `num_channels` channels of `num_samples` samples each.
     ///
@@ -580,7 +598,8 @@ impl FrameSync {
     ///
     /// # Returns
     ///
-    /// * `Ok(Some(FrameSyncVideoRef))` - A validated zero-copy reference to the captured frame
+    /// * `Ok(Some(FrameSyncVideoRef))` - A validated zero-copy output frame; it
+    ///   may repeat or retain earlier input and does not prove new reception
     /// * `Ok(None)` - The SDK returned the documented all-zero "no video yet" state
     ///
     /// # Errors
@@ -619,8 +638,8 @@ impl FrameSync {
     /// # Returns
     ///
     /// An owned copy of the captured samples, in the request's channels and
-    /// samples per channel. The SDK supplies silence when no audio has
-    /// arrived. To read the source's format instead, use
+    /// samples per channel. The SDK can supply silence whenever current
+    /// input is unavailable. To read the SDK's known source format, use
     /// [`Self::audio_input_format`].
     ///
     /// # Errors
@@ -661,8 +680,10 @@ impl FrameSync {
     /// without copying them.
     ///
     /// Resampling is as for [`Self::capture_audio`]. The frame always holds
-    /// the request's channels and samples per channel; the SDK supplies
-    /// silence when no audio has arrived.
+    /// the request's channels and samples per channel; the SDK can supply
+    /// silence whenever current input is unavailable, including after input
+    /// previously arrived. Successful output does not prove fresh reception.
+    /// See the [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
     ///
     /// # Following the source's format
     ///
@@ -723,9 +744,10 @@ impl FrameSync {
     ///
     /// # Returns
     ///
-    /// * `Ok(Some(format))` - The source's sample rate and channel count, both
-    ///   positive
-    /// * `Ok(None)` - No audio format has been received yet
+    /// * `Ok(Some(format))` - The SDK's known source sample rate and channel
+    ///   count, both positive. This knowledge may persist across starvation,
+    ///   disconnect, reconnect or source changes; it is not a freshness signal.
+    /// * `Ok(None)` - The SDK reports no known audio format
     ///
     /// # Errors
     ///
@@ -770,6 +792,8 @@ impl FrameSync {
     /// lock its captures take, so a capture on another thread may be under
     /// way. For most applications, simply call `capture_audio` at your desired
     /// rate and let the SDK handle timing.
+    /// A positive depth does not establish fresh input; see the
+    /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
     ///
     /// # Example
     ///

@@ -65,6 +65,22 @@ let audio = receiver.audio().capture(Duration::from_millis(100))?;
 let metadata = receiver.metadata().capture(Duration::from_millis(100))?;
 ```
 
+Options can be inspected before constructing an SDK object, including in
+tests with no runtime installed:
+
+```rust
+use grafton_ndi::{ReceiverBandwidth, ReceiverOptions, Source};
+let options = ReceiverOptions::new(Source::new("Venue (Audio)"))
+    .bandwidth(ReceiverBandwidth::AudioOnly)
+    .name("venue-audio");
+assert_eq!(options.configured_bandwidth(), ReceiverBandwidth::AudioOnly);
+assert_eq!(options.configured_name(), Some("venue-audio"));
+assert_eq!(options.configured_source().name(), "Venue (Audio)");
+```
+
+These accessors report stored requests, including unset values that ask the
+SDK to choose a default. They do not query a live object's effective settings.
+
 Borrowed receiver and FrameSync video expose only initialized active pixels.
 `frame.data()` returns `Some(&[u8])` when all active pixels are contiguous, and
 `None` when row or plane padding separates them. Traverse padded frames without
@@ -156,12 +172,16 @@ let audio = frame_sync.capture_audio_ref(request)?;
 println!("audio: {} channels at {} Hz", audio.num_channels(), audio.sample_rate());
 ```
 
-An audio capture always returns samples in the requested shape, silence until
-the source's audio arrives. `frame_sync.audio_input_format()` reports the
-source's sample rate and channel count, or `None` before any audio arrives; to
-follow the source's format, wait for `Some` and build the request with
-`FrameSyncAudioRequest::for_input(format, 1024)`; query again and rebuild to
-follow later changes.
+An audio capture always returns samples in the requested shape. FrameSync can
+insert silence whenever current input is unavailable, including after input
+previously worked. Source-provided all-zero samples are also valid input.
+`frame_sync.audio_input_format()` reports the SDK's known source sample rate
+and channel count, or `None` when it has no known format. A known format can
+persist across a pause, disconnect, reconnect or source change; it does not
+establish fresh reception. The query and a later capture are separate
+operations. To follow the source's format, wait for `Some` and build the
+request with `FrameSyncAudioRequest::for_input(format, 1024)`; query again
+and rebuild to follow later changes.
 
 `FrameSync::new` hands the receiver back inside `Rejected` when the SDK creates no
 synchronizer. `FrameSync` owns its receiver. `frame_sync.receiver()` provides controls,
@@ -172,9 +192,53 @@ frames that the FrameSync then replaces with silence. Use
 `frame_sync.into_receiver()` to recover an ordinary `Receiver` with raw video
 and audio capture.
 
+### Monitor reception of the expected media
+
+Poll `frame_sync.receiver().connection_stats()` on a control or diagnostics
+path. Choose `audio_frames_received()`, `video_frames_received()` or
+`metadata_frames_received()` for the media this application expects. A
+receiver configured for audio only has no reason to advance its video counter.
+Each counter counts incoming frames or audio packets, not samples played or
+individual output buffers. Receiver queue/processing drops are included in
+the native received total; the matching drop percentage is cumulative within
+that native counter interval. It is not packet loss or an instantaneous
+quality score. Keep drop deltas and expected throughput checks separate from
+recent-reception status.
+
+For each source or receiver observation interval, record the first counter
+value as a baseline. Even a positive initial total has no known arrival time.
+On later polls, an increase establishes recent reception at the local
+`Instant` of that poll. With a connection, classify the stream as awaiting
+first observed progress, recently receiving, or starved after a
+**caller-chosen positive grace period** with no progress. Choose the grace
+from expected packet cadence, jitter and startup/recovery budgets.
+Disconnection takes precedence. Reset the baseline and prior progress after
+receiver replacement, explicit connect/disconnect/reconnect, an observed
+source or connection transition, or a decrease in the selected counter.
+Recovery requires new growth in the current interval. The compilable
+[mono borrowing example](../examples/framesync_reception_monitor.rs) shows
+this monitor beside `capture_audio_ref`, without raw audio capture or an
+owned-frame copy.
+
+`is_connected()` reports native connection state, not media progress.
+Discovery membership and status events are not media heartbeats. A positive
+queue depth is advisory; it can persist during starvation. Capture success,
+zero amplitude, a known format, output timestamps and timecodes cannot prove
+fresh input or establish which source produced a resampled buffer. FrameSync
+may repeat or retain video, including when input stops: `Some(frame)` means
+output is available, not that a new input frame arrived since the previous
+call. Normal output at a faster cadence than the source repeats frames.
+Likewise a raw receiver or packet receiver can deliver a queued frame, while
+a timeout alone does not prove disconnection. After reconnect or source
+change, cached formats and queued output may still belong to earlier input.
+Polling cannot detect every rapid automatic reconnect or source transition
+between polls, and the native connection, performance and queue calls are not
+an atomic snapshot. This recipe is a recent-reception heuristic, not proof
+of freshness for each capture. It does not trigger automatic reconnects.
+
 ## Monitor and control
 
-Receivers report connection health and frame-drop statistics, and control a PTZ camera through `receiver.ptz()`. Use `set_tally` to send program/preview state upstream, where the SDK keeps it for every connection; sender tally reports receiver state. `send_metadata` sends metadata upstream and returns `Error::NotConnected` when there is no source to send it to.
+Receivers report connection state and frame-drop statistics, and control a PTZ camera through `receiver.ptz()`. Use `set_tally` to send program/preview state upstream, where the SDK keeps it for every connection; sender tally reports receiver state. `send_metadata` sends metadata upstream and returns `Error::NotConnected` when there is no source to send it to.
 
 ```rust
 use grafton_ndi::ReceiverEvent;

@@ -219,6 +219,11 @@ impl PacketReceiver {
     /// Wait up to `timeout` for the next frame or event, or return `None`
     /// when none arrived in time.
     ///
+    /// A delivered packet may have been queued; a timeout alone does not
+    /// establish disconnection. Use the attached receiver's per-media
+    /// counters as described in the
+    /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
+    ///
     /// The timeout is spent as [`Capture::capture`](crate::Capture::capture)
     /// spends it. The SDK returns early, with neither a frame nor an event,
     /// while a new connection synchronizes; this captures again until

@@ -95,6 +95,8 @@
 //! A listener reports its connection through `is_connected`, and its snapshots
 //! are empty until it connects. An advertiser reports nothing; whether its
 //! registrations arrived shows in a listener on the same server.
+//! Registry connectivity and membership do not establish media progress;
+//! monitor the receiver's expected-media counter separately.
 //!
 //! # Text from the network
 //!

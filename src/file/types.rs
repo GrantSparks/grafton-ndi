@@ -185,6 +185,18 @@ pub struct PlayerOptions {
 }
 
 impl PlayerOptions {
+    /// Requested advertised player name.
+    #[must_use]
+    pub fn configured_name(&self) -> &str {
+        &self.name
+    }
+
+    /// Requested discovery groups, or `None` to inherit the NDI configuration.
+    #[must_use]
+    pub fn configured_groups(&self) -> Option<&str> {
+        self.groups.as_deref()
+    }
+
     /// A player that advertises its source as `name`, in the groups of the
     /// NDI configuration.
     pub fn new(name: impl Into<String>) -> Self {
@@ -315,6 +327,54 @@ pub struct RecorderOptions {
 }
 
 impl RecorderOptions {
+    /// Requested source descriptor, before any live source change.
+    #[must_use]
+    pub fn configured_source(&self) -> &SourceSpec {
+        &self.source
+    }
+
+    /// Requested track types.
+    #[must_use]
+    pub fn configured_tracks(&self) -> MediaTypes {
+        self.tracks
+    }
+
+    /// Whether planar audio storage was requested.
+    #[must_use]
+    pub fn configured_planar_audio(&self) -> bool {
+        self.planar_audio
+    }
+
+    /// Explicit rollover choice, or `None` to derive it from the final naming policy at creation.
+    #[must_use]
+    pub fn configured_format_change_rollover(&self) -> Option<bool> {
+        self.format_change_rollover
+    }
+
+    /// Requested file naming policy.
+    #[must_use]
+    pub fn configured_naming(&self) -> &FileNaming {
+        &self.naming
+    }
+
+    /// Whether recording the proxy was requested.
+    #[must_use]
+    pub fn configured_proxy(&self) -> bool {
+        self.proxy
+    }
+
+    /// Requested soft rollover threshold in bytes; zero disables it.
+    #[must_use]
+    pub fn configured_rollover_size(&self) -> u64 {
+        self.rollover_size
+    }
+
+    /// Requested maximum wait on drop.
+    #[must_use]
+    pub fn configured_drop_wait(&self) -> Duration {
+        self.drop_wait
+    }
+
     /// Record every track of `source`, including its proxy when it has one,
     /// in [`FileNaming::Indexed`] files.
     pub fn new(source: SourceSpec) -> Self {

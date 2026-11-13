@@ -163,6 +163,8 @@ impl FilePlayer {
     }
 
     /// Counters for the current or most recent file, when the SDK has any.
+    /// Interpret them alongside playback session state and events, rather
+    /// than as receiver-media progress.
     ///
     /// # Errors
     ///
@@ -311,6 +313,8 @@ impl FilePlayer {
     }
 
     /// The track layout of the current file, once one with audio or video is open.
+    /// A known layout alone does not establish current playback progress;
+    /// inspect the player state and events as well.
     ///
     /// # Errors
     ///

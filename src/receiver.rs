@@ -403,6 +403,45 @@ pub(crate) struct RawRecvCreateV3 {
 }
 
 impl ReceiverOptions {
+    /// The requested source, independent of later live source changes.
+    #[must_use]
+    pub fn configured_source(&self) -> &Source {
+        &self.source
+    }
+
+    /// The stored color choice. Packet passthrough presets may override this
+    /// when creating a native receiver.
+    #[must_use]
+    pub fn configured_color_format(&self) -> ReceiverColorFormat {
+        self.color_format
+    }
+
+    /// The requested bandwidth, before native creation.
+    #[must_use]
+    pub fn configured_bandwidth(&self) -> ReceiverBandwidth {
+        self.bandwidth
+    }
+
+    /// Whether the requested configuration permits video fields.
+    #[must_use]
+    pub fn configured_allow_video_fields(&self) -> bool {
+        self.allow_video_fields
+    }
+
+    /// The requested receiver name, or `None` to let the SDK choose one.
+    #[must_use]
+    pub fn configured_name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// The stored Advanced configuration, when explicitly set. Reading it
+    /// does not expose its JSON or test native support.
+    #[cfg(feature = "advanced")]
+    #[must_use]
+    pub fn configured_config(&self) -> Option<&crate::advanced::AdvancedConfig> {
+        self.config.as_ref()
+    }
+
     /// Receive from `source` with the default settings:
     /// [`ReceiverColorFormat::BgrxBgra`], [`ReceiverBandwidth::Highest`],
     /// video fields allowed, and a receiver name the SDK chooses.
@@ -1112,9 +1151,10 @@ impl<M: ReceiverMode> Receiver<M> {
 
     /// Check if the receiver is still connected to its source.
     ///
-    /// Returns `true` if there is at least one active connection to the source,
-    /// `false` otherwise. This can be used to detect when a source goes offline
-    /// or becomes unavailable.
+    /// Returns `true` if there is at least one native connection to the source,
+    /// `false` otherwise. A connection does not establish progress of any
+    /// particular media stream; see the
+    /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
     ///
     /// # Examples
     ///
@@ -1155,9 +1195,9 @@ impl<M: ReceiverMode> Receiver<M> {
     /// source-rediscovery round trip — and the discovery race — that
     /// tearing down and rebuilding the receiver would incur.
     ///
-    /// Liveness can be observed via [`Self::is_connected`] and
-    /// [`Self::connection_stats`] (`video_frames_received()` resuming its
-    /// climb indicates frames are flowing again).
+    /// Observe native connection state with [`Self::is_connected`] and
+    /// progress of the expected media with [`Self::connection_stats`]. A
+    /// reconnect alone does not establish that new media has arrived.
     ///
     /// # Thread safety
     ///
@@ -1222,8 +1262,11 @@ impl<M: ReceiverMode> Receiver<M> {
     /// - Dropped frames (video, audio, metadata)
     /// - Queued frames waiting to be processed
     ///
-    /// This is useful for monitoring receiver health and diagnosing
-    /// performance issues in production applications.
+    /// The native received totals include frames later dropped from the
+    /// receiver queue or processing. These three native calls do not form an
+    /// atomic connection/performance/queue snapshot. Counters may reset on
+    /// connection changes; see [`ConnectionStats`] and the
+    /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
     ///
     /// # Examples
     ///
@@ -1750,6 +1793,10 @@ impl<'rx, K: CaptureKind> Capture<'rx, K> {
     /// Wait up to `timeout` for a frame and return an owned copy of it, or
     /// `None` when none arrived in time.
     ///
+    /// A delivered frame may have waited in the native queue; `None` alone
+    /// does not establish disconnection or freshness. See the
+    /// [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
+    ///
     /// See [`Capture`] for how the timeout is spent; [`Duration::ZERO`]
     /// makes one attempt without waiting.
     ///
@@ -1764,6 +1811,9 @@ impl<'rx, K: CaptureKind> Capture<'rx, K> {
 
     /// Wait up to `timeout` for a frame and borrow the SDK's buffer in
     /// place, or return `None` when none arrived in time.
+    ///
+    /// A delivered frame may have waited in the native queue; `None` alone
+    /// does not establish disconnection or freshness.
     ///
     /// The returned reference borrows the [`Receiver`] (not this temporary
     /// view), so it may outlive the `Capture` while keeping the receiver
@@ -2137,7 +2187,13 @@ impl SettingChange {
 /// Connection and performance statistics for a receiver.
 ///
 /// Connection count, frame counts, drop rates and queue depths, from
-/// [`Receiver::connection_stats`]. Useful for monitoring and diagnostics.
+/// [`Receiver::connection_stats`]. These are native counter snapshots, not an
+/// atomic view of connection, performance and queue state. Counters can reset
+/// when a connection changes. Received totals include frames later dropped by
+/// the receiver queue or processing; drops are not a count of lost network
+/// packets or a measure of downstream playback quality. For interval rates,
+/// reset the baseline when either counter decreases or the source/connection
+/// is explicitly reset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ConnectionStats {
     connections: u32,
@@ -2159,19 +2215,19 @@ impl ConnectionStats {
         self.connections
     }
 
-    /// The total number of video frames received.
+    /// The native total number of video frames received, including later drops.
     #[must_use]
     pub const fn video_frames_received(&self) -> u64 {
         self.video_frames_received
     }
 
-    /// The total number of audio frames received.
+    /// The native total number of audio frames received, including later drops.
     #[must_use]
     pub const fn audio_frames_received(&self) -> u64 {
         self.audio_frames_received
     }
 
-    /// The total number of metadata frames received.
+    /// The native total number of metadata frames received, including later drops.
     #[must_use]
     pub const fn metadata_frames_received(&self) -> u64 {
         self.metadata_frames_received
@@ -2214,28 +2270,32 @@ impl ConnectionStats {
         self.metadata_frames_queued
     }
 
-    /// The percentage of video frames dropped, out of those received and
-    /// dropped; 0.0 when both counts are zero.
+    /// Cumulative receiver video queue/processing drops as a percentage of
+    /// the native received total. Returns 0.0 for zero received frames and is
+    /// bounded to 0..=100 even when native snapshots disagree.
     #[must_use]
     pub fn video_drop_percentage(&self) -> f64 {
         drop_percentage(self.video_frames_received, self.video_frames_dropped)
     }
 
-    /// The percentage of audio frames dropped, out of those received and
-    /// dropped; 0.0 when both counts are zero.
+    /// Cumulative receiver audio queue/processing drops as a percentage of
+    /// the native received total. Returns 0.0 for zero received frames and is
+    /// bounded to 0..=100 even when native snapshots disagree.
     #[must_use]
     pub fn audio_drop_percentage(&self) -> f64 {
         drop_percentage(self.audio_frames_received, self.audio_frames_dropped)
     }
 
-    /// The percentage of metadata frames dropped, out of those received and
-    /// dropped; 0.0 when both counts are zero.
+    /// Cumulative receiver metadata queue/processing drops as a percentage of
+    /// the native received total. Returns 0.0 for zero received frames and is
+    /// bounded to 0..=100 even when native snapshots disagree.
     #[must_use]
     pub fn metadata_drop_percentage(&self) -> f64 {
         drop_percentage(self.metadata_frames_received, self.metadata_frames_dropped)
     }
 
-    /// Whether there is at least one active connection.
+    /// Whether there is at least one native connection; this does not
+    /// establish progress of a particular media stream.
     #[must_use]
     pub const fn is_connected(&self) -> bool {
         self.connections > 0
@@ -2243,11 +2303,10 @@ impl ConnectionStats {
 }
 
 fn drop_percentage(received: u64, dropped: u64) -> f64 {
-    let total = u128::from(received) + u128::from(dropped);
-    if total == 0 {
+    if received == 0 {
         0.0
     } else {
-        (dropped as f64 / total as f64) * 100.0
+        100.0 * (dropped.min(received) as f64 / received as f64)
     }
 }
 
@@ -2810,9 +2869,18 @@ mod tests {
             ..idle
         };
         assert!(stats.is_connected());
-        assert_eq!(stats.video_drop_percentage(), 10.0);
+        assert!((stats.video_drop_percentage() - 100.0 / 9.0).abs() < 1e-12);
         assert_eq!(stats.audio_drop_percentage(), 0.0);
-        assert_eq!(stats.metadata_drop_percentage(), 100.0);
+        assert_eq!(stats.metadata_drop_percentage(), 0.0);
+        let per_media = ConnectionStats {
+            audio_frames_received: 1000,
+            audio_frames_dropped: 100,
+            metadata_frames_received: 350,
+            metadata_frames_dropped: 285,
+            ..stats
+        };
+        assert_eq!(per_media.audio_drop_percentage(), 10.0);
+        assert!((per_media.metadata_drop_percentage() - 81.42857142857143).abs() < 1e-12);
         assert_eq!(
             (
                 stats.video_frames_received(),
@@ -2827,9 +2895,14 @@ mod tests {
     #[test]
     fn drop_rates_handle_extreme_public_counters() {
         assert_eq!(drop_percentage(0, 0), 0.0);
-        assert_eq!(drop_percentage(900, 100), 10.0);
-        assert_eq!(drop_percentage(u64::MAX, u64::MAX), 50.0);
-        assert_eq!(drop_percentage(0, u64::MAX), 100.0);
+        assert_eq!(drop_percentage(1000, 0), 0.0);
+        assert_eq!(drop_percentage(1000, 1000), 100.0);
+        assert_eq!(drop_percentage(1000, 100), 10.0);
+        assert!((drop_percentage(900, 100) - 100.0 / 9.0).abs() < 1e-12);
+        assert!((drop_percentage(350, 285) - 81.42857142857143).abs() < 1e-12);
+        assert_eq!(drop_percentage(u64::MAX, u64::MAX), 100.0);
+        assert_eq!(drop_percentage(0, u64::MAX), 0.0);
+        assert_eq!(drop_percentage(1, u64::MAX), 100.0);
     }
 
     #[test]

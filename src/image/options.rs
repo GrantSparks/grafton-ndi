@@ -185,6 +185,48 @@ pub struct ImageOptions {
 }
 
 impl ImageOptions {
+    /// Requested encoded image format.
+    #[must_use]
+    pub fn configured_format(&self) -> ImageFormat {
+        self.format
+    }
+
+    /// Requested color conversion policy.
+    #[must_use]
+    pub fn configured_color(&self) -> ColorPolicy {
+        self.color
+    }
+
+    /// Requested bits per channel.
+    #[must_use]
+    pub fn configured_depth(&self) -> SampleDepth {
+        self.depth
+    }
+
+    /// Requested alpha handling.
+    #[must_use]
+    pub fn configured_alpha(&self) -> AlphaMode {
+        self.alpha
+    }
+
+    /// Requested HDR handling.
+    #[must_use]
+    pub fn configured_hdr(&self) -> HdrPolicy {
+        self.hdr
+    }
+
+    /// Requested image downscale factor.
+    #[must_use]
+    pub fn configured_downscale(&self) -> Downscale {
+        self.downscale
+    }
+
+    /// Requested PNG compression level.
+    #[must_use]
+    pub fn configured_png_compression(&self) -> PngCompression {
+        self.png_compression
+    }
+
     /// Options for `format`, with every other setting at its default:
     /// [`ColorPolicy::Sdk`], [`SampleDepth::Eight`], [`AlphaMode::Keep`],
     /// [`HdrPolicy::Refuse`], [`Downscale::Off`] and

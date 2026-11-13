@@ -234,6 +234,49 @@ On the five x86-64 runtimes, the audio sends, planar and interleaved, of 1 to
 16 channels and 1 to 1,920 samples, and the V210, P216 and audio conversion
 utilities read and write nothing outside their buffers.
 
+## Receiver counter and FrameSync lifecycle probes
+
+The loopback regression tests
+`tests/receiver_drop_totals.rs` and
+`tests/framesync_reception_lifecycle.rs` use externally paced 48 kHz stereo
+audio in 480-sample packets. The first leaves an AudioOnly receiver's raw
+queue unread until drops exceed half its received total. It checks that the
+public received total includes frames subsequently dropped and that the
+drop percentage uses that total. It asserts progress and a bounded deadline,
+not a particular native queue capacity. The lifecycle test attaches a
+FrameSync, requests fixed 48 kHz mono output through the borrowing path, and
+checks startup, zero-valued input, pause, explicit disconnect, reconnect,
+resumed input and sender disappearance. It never raw-captures audio beside
+FrameSync. Its video check compares retained output with the separate native
+received-video counter; video output retention is an observation, not a
+portable promise.
+
+Earlier isolated native probes on Linux x86_64 observed the same counter
+relationship and audio lifecycle on Standard 6.3.2.0, Standard 6.4.0.2 and
+Advanced 6.4.0.2. With a full receiver queue, a representative sample was
+350 audio frames received, 285 dropped and 65 queued; capacity and exact
+counts are implementation observations. Format knowledge persisted through
+pause and explicit disconnect in those probes, and the received total reset
+on explicit disconnect. The test does not require either behavior universally.
+Standard 6.4.0.2 also retained a FrameSync video output frame after input
+stopped. These loopback probes do not qualify a camera or venue network.
+
+The repository regressions passed under the offline runner on Linux x86_64
+with the following runtime identities:
+
+| Runtime | Queue-overflow test | FrameSync audio and retained-video tests |
+| --- | --- | --- |
+| Standard 6.3.2.0 | Pass | Pass |
+| Standard 6.4.0.2 | Pass | Pass |
+| Advanced 6.4.0.2 | Pass | Pass |
+
+Run the repository tests under the isolated runner with
+`cargo test --config ci/offline.toml --all-features --test receiver_drop_totals --test framesync_reception_lifecycle`.
+Set `NDI_RUNTIME_DIR_V6`, `NDI_SDK_DIR` and the expected identity variables
+as described above for each runtime. A missing runtime follows the usual
+skip/required-runtime convention. The runtime's version, edition and platform
+are printed by each audio regression.
+
 ## Compatibility safeguards and additional runtime checks
 
 Which Advanced operations a build can perform follows from the declarations

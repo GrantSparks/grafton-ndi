@@ -209,6 +209,12 @@ pub struct FileRuntimeOptions {
 }
 
 impl FileRuntimeOptions {
+    /// Requested exact File library path, or `None` for the normal search.
+    #[must_use]
+    pub fn configured_library_path(&self) -> Option<&Path> {
+        self.library_path.as_deref()
+    }
+
     /// The default options: the first usable File library from the
     /// [documented search](crate::file#where-the-file-library-is-loaded-from).
     pub fn new() -> Self {

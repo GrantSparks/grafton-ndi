@@ -184,6 +184,10 @@ impl Drop for AvResource {
 /// The receiver is lent in the [`AvSyncAttached`] mode, with its video and
 /// metadata capture, its events and every receiver control, but no audio
 /// capture of its own.
+/// [`AvSyncOutcome`] distinguishes no audio stream, no samples matching a
+/// video's time, a changed format and successful output. These outcomes do
+/// not replace monitoring progress of the media the application expects;
+/// see the [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
 ///
 /// # Threading
 ///
@@ -600,6 +604,8 @@ impl Drop for GenResource {
 /// so.
 ///
 /// The waits block their thread and cannot be cancelled or given a deadline.
+/// A completed paced wait does not prove live reference media; inspect the
+/// returned [`ClockSource`] for reference versus system-clock fallback.
 ///
 /// # Threading
 ///

@@ -2022,6 +2022,37 @@ pub struct SenderOptions {
 }
 
 impl SenderOptions {
+    /// Requested advertised name; an empty name lets the SDK choose.
+    #[must_use]
+    pub fn configured_name(&self) -> &str {
+        &self.name
+    }
+
+    /// Requested discovery groups, or `None` to inherit the NDI configuration.
+    #[must_use]
+    pub fn configured_groups(&self) -> Option<&str> {
+        self.groups.as_deref()
+    }
+
+    /// Whether video clocking was requested.
+    #[must_use]
+    pub fn configured_clock_video(&self) -> bool {
+        self.clock_video
+    }
+
+    /// Whether audio clocking was requested.
+    #[must_use]
+    pub fn configured_clock_audio(&self) -> bool {
+        self.clock_audio
+    }
+
+    /// The stored Advanced configuration handle, if any.
+    #[cfg(feature = "advanced")]
+    #[must_use]
+    pub fn configured_config(&self) -> Option<&crate::advanced::AdvancedConfig> {
+        self.config.as_ref()
+    }
+
     /// A sender advertised as `name`, which the SDK chooses when it is empty,
     /// with the default settings.
     pub fn new(name: impl Into<String>) -> Self {

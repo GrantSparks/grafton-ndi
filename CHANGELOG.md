@@ -22,6 +22,14 @@ API, see the [README](README.md) and the migration guides for
 - Document recorder preflight races and the Linux 6.4.0.2 exclusive-open evidence,
   and require trusted native search directories or explicit first-load paths.
 
+### Added
+
+- Configuration values expose read-only `configured_*()` accessors, and
+  `FrameSyncAudioRequest` exposes its validated dimensions, without requiring
+  an NDI runtime.
+- A FrameSync example and guide show per-media recent-reception monitoring
+  across startup, silence, disconnect and recovery.
+
 ### Changed
 
 - Receiver connection targets now follow the latest successful `connect_to`
@@ -45,6 +53,9 @@ API, see the [README](README.md) and the migration guides for
 
 ### Fixed
 
+- Receiver video, audio and metadata drop percentages now divide native drops
+  by the native received total, which already includes those drops. Existing
+  diagnostic percentages may rise; raw counters retain their meanings.
 - Color metadata ignores XML processing instructions, so text inside them
   cannot trigger false HDR detection or image-encoding errors.
 
