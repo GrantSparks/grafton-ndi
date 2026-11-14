@@ -147,6 +147,9 @@ recording report. Configure queue limits with `AsyncFileOptions` and handle
 Await `finish`, inspect its report, then await `close` to shut down all clones
 without blocking the executor. **Dropping the last clone blocks** until its
 worker exits; `drop_wait` does not bound native stop or destruction calls.
+When an executor callback drops the last clone on a File owner, timer or probe
+thread, it requests shutdown without waiting. This lets those threads keep
+delivering notifications; await `close` when cleanup must have completed.
 See [`AsyncFileRecorder`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.AsyncFileRecorder.html)
 for cancellation, queue and shutdown contracts.
 

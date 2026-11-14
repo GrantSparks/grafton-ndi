@@ -6,6 +6,8 @@
 //! `GRAFTON_NDI_REQUIRE_RUNTIME` promises `file`. Each test records its own
 //! material from a sender on the loopback interface; none needs a prepared file.
 
+mod async_shutdown;
+
 use super::*;
 use crate::{
     test_support::{self, file_api},

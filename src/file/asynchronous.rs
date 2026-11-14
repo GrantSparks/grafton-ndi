@@ -5,6 +5,9 @@
 //! need no player, share one thread for the whole process. The deadlines of
 //! event futures are kept by one timer thread for the whole process, so that a
 //! command that blocks its owner thread cannot make a wait overrun.
+//! Executor callbacks on these File threads may drop handles. Such a last-handle
+//! drop requests shutdown without joining another File thread, so notifications
+//! cannot stall behind cleanup or deadlock one another.
 
 use super::types::resolve_path;
 use super::{
@@ -15,6 +18,7 @@ use super::{
 };
 use crate::{timeout::Deadline, Error, MetadataSource, QueueLimit, Result, Source, Timecode};
 use std::{
+    cell::Cell,
     collections::{BTreeMap, VecDeque},
     future::Future,
     panic::{catch_unwind, AssertUnwindSafe},
@@ -38,6 +42,16 @@ const MAX_CAPACITY: usize = 4096;
 
 /// How many probes may wait for the thread that runs them.
 const PROBE_CAPACITY: usize = 64;
+
+thread_local! {
+    /// Joining an owner here can stall the shared timer/probe worker, or form
+    /// a cycle with another owner whose executor callbacks release handles.
+    static FILE_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+fn mark_file_thread() {
+    FILE_THREAD.set(true);
+}
 
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value.lock().unwrap_or_else(PoisonError::into_inner)
@@ -481,6 +495,7 @@ impl DeadlineTimer {
 
     /// The timer thread: end each registered wait once its deadline passes.
     fn run(&self) {
+        mark_file_thread();
         let mut state = lock(&self.state);
         loop {
             let now = Instant::now();
@@ -626,6 +641,8 @@ impl<E: Send> Expire for EventQueue<E> {
 /// thread failed; that happens as soon as the handle's thread stops taking
 /// events, before the native object is destroyed. Dropping the
 /// future does not stop events from being pumped.
+/// Executor callbacks run on File threads; a handle's last clone dropped
+/// there requests shutdown without waiting for native cleanup.
 ///
 /// # Errors
 ///
@@ -990,9 +1007,10 @@ impl<H: Owner> Drop for Worker<H> {
         let Some(thread) = lock(&self.thread).take() else {
             return;
         };
-        // The owner thread drops the last handle itself when the caller gave
-        // up on a command that carried it; it cannot wait for itself.
-        if !closing && thread.thread().id() != thread::current().id() {
+        // A File thread may release this last handle through an executor's
+        // waker callback. It must not stall the timer/probe thread or join
+        // an owner that could join it back while releasing another handle.
+        if !closing && !FILE_THREAD.get() {
             // A panic on the owner thread was already reported to its commands.
             let _ = thread.join();
         }
@@ -1128,6 +1146,7 @@ fn spawn_owner_now<H: Owner, T: Send + 'static>(
     let thread_control = Arc::clone(&control);
     let thread_events = Arc::clone(&events);
     let spawned = thread::Builder::new().name(name.into()).spawn(move || {
+        mark_file_thread();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             if ready.cancelled.load(Ordering::Acquire) {
                 return;
@@ -1292,6 +1311,7 @@ impl ProbeQueue {
                 thread::Builder::new()
                     .name("ndi-file-probe".into())
                     .spawn(move || {
+                        mark_file_thread();
                         for job in jobs {
                             // A probe that panics fails alone: its reply,
                             // dropped while unwinding, reports a failed owner.
@@ -1326,6 +1346,9 @@ impl ProbeQueue {
 /// returns, the source is gone. A caller that must not block, such as a task
 /// on an async executor, awaits [`close`](Self::close) instead, which does the
 /// same without blocking; dropping the clones afterwards does not block.
+/// A last-clone drop performed by an executor callback on a File owner, timer
+/// or probe thread requests shutdown without waiting, so those threads can
+/// keep delivering notifications. Await `close` to observe cleanup completing.
 #[derive(Clone)]
 pub struct AsyncFilePlayer {
     worker: Arc<Worker<FilePlayer>>,
@@ -1515,6 +1538,9 @@ impl AsyncFilePlayer {
 /// be reported. A caller that must not block, such as a task on an async
 /// executor, awaits [`close`](Self::close) instead, which does the same
 /// without blocking; dropping the clones afterwards does not block.
+/// A last-clone drop performed by an executor callback on a File owner, timer
+/// or probe thread requests shutdown without waiting for finalization or
+/// destruction. Await `close` to observe cleanup completing.
 #[derive(Clone)]
 pub struct AsyncFileRecorder {
     worker: Arc<Worker<FileRecorder>>,
@@ -1755,7 +1781,7 @@ mod tests {
         (Waker::from(Arc::new(PanickingWake(called))), calls)
     }
 
-    fn block_on<F: Future>(future: F) -> F::Output {
+    pub(super) fn block_on<F: Future>(future: F) -> F::Output {
         let signal = Arc::new(Signal(Mutex::new(false), Condvar::new()));
         let waker = Waker::from(Arc::clone(&signal));
         let mut future = std::pin::pin!(future);

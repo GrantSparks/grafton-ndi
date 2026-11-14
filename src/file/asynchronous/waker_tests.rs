@@ -1,4 +1,5 @@
 //! Executor callbacks may reenter File handles, including from clone and drop.
+use super::tests::block_on;
 use super::*;
 use std::task::{RawWaker, RawWakerVTable, Wake};
 
@@ -283,4 +284,148 @@ fn expiration_and_close_wake_without_cloning_and_pending_polls_rearm() {
         poll(&mut future, &waker),
         Poll::Ready(Err(Error::InvalidState(StateError::Closed)))
     ));
+}
+
+/// Its destructor cannot finish until the test releases it. A joining
+/// callback would therefore stall the File thread for the whole bounded wait.
+struct HeldOwner {
+    release: Receiver<()>,
+    destroyed: Sender<()>,
+}
+
+impl Owner for HeldOwner {
+    type Event = ();
+
+    fn poll_native(&mut self) -> Result<Option<()>> {
+        Ok(None)
+    }
+}
+
+impl Drop for HeldOwner {
+    fn drop(&mut self) {
+        let _ = self.release.recv_timeout(Duration::from_secs(5));
+        let _ = self.destroyed.send(());
+    }
+}
+
+fn held_owner() -> (Arc<Worker<HeldOwner>>, Sender<()>, Receiver<()>) {
+    let (release, released) = mpsc::channel();
+    let (destroyed, destruction) = mpsc::channel();
+    let worker = block_on(spawn_owner(
+        "file-test-held-owner",
+        move || {
+            Ok(HeldOwner {
+                release: released,
+                destroyed,
+            })
+        },
+        AsyncFileOptions::new(),
+        |worker| worker,
+    ))
+    .unwrap();
+    (worker, release, destruction)
+}
+
+fn owner_releasing_waker(worker: Arc<Worker<HeldOwner>>) -> (Waker, Receiver<()>) {
+    let owner = Mutex::new(Some(worker));
+    let (released, release) = mpsc::channel();
+    let waker = Waker::from(Arc::new(OnDrop(move || {
+        drop(lock(&owner).take());
+        let _ = released.send(());
+    })));
+    (waker, release)
+}
+
+#[test]
+fn a_timer_callback_can_release_the_last_owner_without_delaying_other_deadlines() {
+    let (worker, release_owner, destroyed) = held_owner();
+    let events = Arc::new(EventQueue::<()>::new(1));
+    let mut expiry = events.wait(Duration::from_millis(40));
+    let (waker, released) = owner_releasing_waker(worker);
+    assert!(poll(&mut expiry, &waker).is_pending());
+    drop(waker);
+
+    let other = Arc::new(EventQueue::<()>::new(1));
+    let mut independent = other.wait(Duration::from_millis(80));
+    let (expired, expiration) = mpsc::channel();
+    let waker = Waker::from(Arc::new(OnDrop(move || {
+        let _ = expired.send(());
+    })));
+    assert!(poll(&mut independent, &waker).is_pending());
+    drop(waker);
+    // Shutdown is still held, so neither callback can rely on it completing.
+    released.recv_timeout(Duration::from_secs(1)).unwrap();
+    expiration.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(destroyed.try_recv().is_err());
+    release_owner.send(()).unwrap();
+    destroyed.recv_timeout(Duration::from_secs(1)).unwrap();
+}
+
+#[test]
+fn a_probe_completion_can_release_the_last_owner_without_delaying_the_next_probe() {
+    let (worker, release_owner, destroyed) = held_owner();
+    let (reply, mut response) = operation::<()>();
+    let (waker, released) = owner_releasing_waker(worker);
+    assert!(poll(&mut response, &waker).is_pending());
+    drop(waker);
+    let probes = ProbeQueue::new(2);
+    probes
+        .submit(Box::new(move || reply.complete(Ok(()))))
+        .unwrap();
+    let (next, ran_next) = mpsc::channel();
+    probes
+        .submit(Box::new(move || {
+            let _ = next.send(());
+        }))
+        .unwrap();
+    released.recv_timeout(Duration::from_secs(1)).unwrap();
+    ran_next.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(destroyed.try_recv().is_err());
+    release_owner.send(()).unwrap();
+    destroyed.recv_timeout(Duration::from_secs(1)).unwrap();
+}
+
+#[test]
+fn owners_whose_callbacks_release_each_others_last_handles_do_not_join_in_a_cycle() {
+    let (first, release_first, first_destroyed) = held_owner();
+    let (second, release_second, second_destroyed) = held_owner();
+    release_first.send(()).unwrap();
+    release_second.send(()).unwrap();
+    let first_events = Arc::clone(&first.events);
+    let second_events = Arc::clone(&second.events);
+    let first_control = Arc::clone(&first.control);
+    let second_control = Arc::clone(&second.control);
+
+    // Hold the notification until both event queues own the cross references.
+    let (trigger, triggered) = mpsc::channel();
+    let notify = Arc::clone(&first_events);
+    let sending = first
+        .call(move |_| {
+            triggered.recv_timeout(Duration::from_secs(5)).unwrap();
+            notify.push(Ok(()));
+            Ok(())
+        })
+        .submit();
+    let mut first_event = first_events.wait(Duration::from_secs(60));
+    let mut second_event = second_events.wait(Duration::from_secs(60));
+    let (first_waker, second_released) = owner_releasing_waker(second);
+    let (second_waker, first_released) = owner_releasing_waker(first);
+    assert!(poll(&mut first_event, &first_waker).is_pending());
+    assert!(poll(&mut second_event, &second_waker).is_pending());
+    drop(first_waker);
+    drop(second_waker);
+    trigger.send(()).unwrap();
+    first_released.recv_timeout(Duration::from_secs(1)).unwrap();
+    second_released
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    first_destroyed
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    second_destroyed
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    block_on(sending).unwrap();
+    block_on(first_control.request_close()).unwrap();
+    block_on(second_control.request_close()).unwrap();
 }
