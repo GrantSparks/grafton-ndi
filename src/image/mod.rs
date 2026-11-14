@@ -376,11 +376,38 @@ impl Plan {
                 }
             }
         };
+        let alpha = options.alpha == AlphaMode::Keep && !matches!(codec, Codec::Jpeg { .. });
+        let channels = if alpha { 4 } else { 3 };
+        let wide = matches!(
+            codec,
+            Codec::Png {
+                depth: SampleDepth::Sixteen,
+                ..
+            }
+        );
+        // Check conversion geometry before any codec can write a header.
+        // In particular, 16-bit PNG rows can exceed the source row size on
+        // 32-bit targets. Row codecs must not require a whole-image product.
+        match codec {
+            Codec::Png { .. } => {
+                packed_len(width, 1, channels * if wide { 2 } else { 1 })?;
+            }
+            Codec::WebpLossless => {
+                packed_len(width, height, channels)?;
+            }
+            Codec::WebpLossy { .. } => {
+                packed_len(width, height, 4)?;
+            }
+            Codec::Jpeg { .. } => {}
+        }
+        if shift > 0 {
+            packed_len(width, 1, if wide { 32 } else { 16 })?;
+        }
         Ok(Self {
             codec,
             matrix,
             range,
-            alpha: options.alpha == AlphaMode::Keep && !matches!(codec, Codec::Jpeg { .. }),
+            alpha,
             shift,
         })
     }

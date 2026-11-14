@@ -1963,6 +1963,26 @@ fn reduced_images_are_the_block_averages_of_the_full_image() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn conversion_geometry_overflow_is_refused_before_output_or_row_access() {
+    let frame = VideoFrame::builder()
+        .resolution(2, 2)
+        .data(vec![0; 16])
+        .build()
+        .unwrap();
+    let mut source = Source::new(&frame);
+    // A private preflight fixture: no rows of this synthetic geometry may be
+    // accessed. Actual public sources obtain geometry from a validated layout.
+    source.width = usize::MAX / 8 + 1;
+    let options = options(ImageFormat::Png).depth(SampleDepth::Sixteen);
+    let mut output = Recorder {
+        written: 0,
+        fail_after: None,
+    };
+    assert!(invalid_frame(super::encode_to(source, &options, &mut output)).contains("overflow"));
+    assert_eq!(output.written, 0);
+}
+
+#[test]
 fn workspace_reuses_conversion_capacity_across_formats_sizes_and_failures() {
     let mut workspace = crate::ImageWorkspace::new();
     assert_eq!(workspace.retained_bytes(), 0);
