@@ -2110,6 +2110,10 @@ fn image_encoding_resources() {
     let input = |name: &str| std::env::var_os(name).map(|path| std::fs::read(path).unwrap());
     let (photo, graphics) = (input("GRAFTON_NDI_PHOTO"), input("GRAFTON_NDI_GRAPHICS"));
     let selected = std::env::var("GRAFTON_NDI_OUTPUTS").ok();
+    let dump = std::env::var_os("GRAFTON_NDI_IMAGE_DUMP").map(std::path::PathBuf::from);
+    if let Some(path) = &dump {
+        std::fs::create_dir_all(path).unwrap();
+    }
     let sizes: Vec<(usize, usize)> = std::env::var("GRAFTON_NDI_SIZES")
         .unwrap_or_else(|_| "1920x1080,3840x2160,7680x4320".into())
         .split(',')
@@ -2122,6 +2126,14 @@ fn image_encoding_resources() {
     for (width, height) in sizes {
         for (content, input) in [("photographic", &photo), ("graphics", &graphics)] {
             let rgba = content_rgba(content, width, height, input.as_deref());
+            eprintln!(
+                "input,{content},{width},{height},sha256={:02x?}",
+                sha256(&rgba)
+            );
+            if let Some(path) = &dump {
+                std::fs::write(path.join(format!("{content}-{width}x{height}.rgba")), &rgba)
+                    .unwrap();
+            }
             for format in [
                 PixelFormat::Rgba,
                 PixelFormat::Uyvy,
@@ -2193,13 +2205,27 @@ fn image_encoding_resources() {
                     let runs = if slow || width > 3840 { 1 } else { 5 };
                     let mut times = Vec::new();
                     let (mut peak, mut len) = (0, 0);
-                    for _ in 0..runs {
+                    black_box(frame.encode_image(&options).unwrap());
+                    for sample in 0..runs {
                         let start = Instant::now();
                         let (image, bytes) =
                             peak_bytes(|| frame.encode_image(black_box(&options)).unwrap());
-                        times.push(start.elapsed().as_secs_f64() * 1000.0);
+                        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                        times.push(elapsed);
                         peak = peak.max(bytes);
                         len = image.len();
+                        eprintln!("sample,{format:?},{content},{width},{height},{name},{sample},{elapsed:.6},{bytes},{len}");
+                        if sample == 0 {
+                            if let Some(path) = &dump {
+                                std::fs::write(
+                                    path.join(format!(
+                                        "{format:?}-{content}-{width}x{height}-{name}.image"
+                                    )),
+                                    &image,
+                                )
+                                .unwrap();
+                            }
+                        }
                         black_box(image);
                     }
                     times.sort_by(f64::total_cmp);
