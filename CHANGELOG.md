@@ -209,6 +209,9 @@ linkage and Rust 1.88 baseline.
 
 ### Fixed
 
+- FrameSync audio reports no timestamp when the synchronizer supplies its
+  zero marker for unknown source timing, including in owned copies.
+
 - Video and audio copies retain metadata storage across frames without text,
   avoiding allocations when per-frame metadata alternates in a reused buffer.
 

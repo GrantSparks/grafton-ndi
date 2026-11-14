@@ -86,6 +86,10 @@ pub(crate) unsafe trait FrameFree: sealed::Sealed + 'static {
     /// `Debug` impls render the historically-correct type name.
     const REF_DEBUG_NAME: &'static str;
 
+    /// Additional unknown-timestamp marker for audio from this capture family.
+    /// Receiver capture uses the header marker; FrameSync also reports zero.
+    const AUDIO_TIMESTAMP_UNDEFINED: i64 = NDIlib_recv_timestamp_undefined;
+
     /// Free a single captured frame through its owning instance.
     ///
     /// # Safety
@@ -284,6 +288,7 @@ unsafe impl FrameFree for FrameSyncAudioFree {
     type Instance = NDIlib_framesync_instance_t;
     type RawFrame = NDIlib_audio_frame_v3_t;
     const REF_DEBUG_NAME: &'static str = "FrameSyncAudioRef";
+    const AUDIO_TIMESTAMP_UNDEFINED: i64 = 0;
 
     unsafe fn free(core: &sys::Core, instance: Self::Instance, frame: &mut Self::RawFrame) {
         #[cfg(test)]

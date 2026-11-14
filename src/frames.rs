@@ -4638,6 +4638,11 @@ pub(crate) trait HoldsDescriptor {
 
     /// The descriptor.
     fn descriptor(&self) -> &Self::Descriptor;
+
+    /// Normalize an audio timestamp for this descriptor's capture family.
+    fn audio_timestamp(&self, ticks: i64) -> Option<SdkTimestamp> {
+        SdkTimestamp::from_sdk(ticks)
+    }
 }
 
 impl<S: FrameFree> HoldsDescriptor for Guard<'_, S>
@@ -4648,6 +4653,14 @@ where
 
     fn descriptor(&self) -> &S::RawFrame {
         self.frame()
+    }
+
+    fn audio_timestamp(&self, ticks: i64) -> Option<SdkTimestamp> {
+        if ticks == S::AUDIO_TIMESTAMP_UNDEFINED {
+            None
+        } else {
+            SdkTimestamp::from_sdk(ticks)
+        }
     }
 }
 
@@ -4854,7 +4867,7 @@ unsafe impl<F: HoldsDescriptor<Descriptor = NDIlib_audio_frame_v3_t>> AudioParts
     }
     #[inline]
     fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
-        SdkTimestamp::from_sdk(self.descriptor().timestamp)
+        self.frame.audio_timestamp(self.descriptor().timestamp)
     }
     #[inline]
     fn samples(&self) -> *const f32 {
@@ -5355,9 +5368,14 @@ macro_rules! borrowed_audio_accessors {
         audio_accessors! {
             impl['a] $name<'a>;
             debug(<$strategy as FrameFree>::REF_DEBUG_NAME);
-            timecode {}
+            timecode {
+                /// FrameSync output without a source timecode carries
+                /// [`Timecode::SYNTHESIZE`].
+            }
             timestamp {
-                /// It is `None` when the SDK does not know it.
+                /// It is `None` when the SDK does not know it. FrameSync audio
+                /// also treats its zero timestamp marker as unknown; that
+                /// marker alone does not identify synthesized silence.
             }
             channel_stride_bytes {
                 /// It includes any padding between channels.

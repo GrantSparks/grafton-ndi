@@ -158,7 +158,9 @@ source change; querying it and capturing are separate operations.
 borrowed output directly into reusable interleaved PCM. Its software timer is
 a demonstration; a playback device supplies its own cadence. FrameSync may
 insert silence or repeat video when input is unavailable. Successful clocked
-output therefore does not establish recent reception.
+output therefore does not establish recent reception. FrameSync audio without
+an SDK source timestamp reports `None`; output without a source timecode carries
+`Timecode::SYNTHESIZE`. The missing timestamp alone does not identify silence.
 
 With `advanced`, `controls()` reaches exclusive stream/tier controls and KVM.
 `split()` separates clocked capture from those controls so held remote input

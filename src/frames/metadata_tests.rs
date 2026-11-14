@@ -338,3 +338,54 @@ fn alternating_metadata_copies_keep_storage_for_borrowed_owned_and_captured_sour
     });
     assert_eq!(allocations, 0);
 }
+
+#[test]
+fn audio_timestamp_normalization_depends_on_the_capture_family() {
+    fn check<S>(ticks: i64, expected: Option<SdkTimestamp>)
+    where
+        S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>,
+        S::Instance: Default,
+    {
+        let mut samples = [0.25f32; 4];
+        let raw = NDIlib_audio_frame_v3_t {
+            sample_rate: 48_000,
+            no_channels: 2,
+            no_samples: 2,
+            FourCC: AudioFormat::Fltp.to_sdk(),
+            p_data: samples.as_mut_ptr().cast(),
+            timestamp: ticks,
+            timecode: Timecode::SYNTHESIZE.ticks(),
+            __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 {
+                channel_stride_in_bytes: 8,
+            },
+            ..Default::default()
+        };
+        // SAFETY: the guard borrows these live initialized samples; release
+        // only updates the counter and does not free their borrowed storage.
+        let frame = unsafe {
+            AudioRef::<S>::from_guard(Guard::with_test_free(
+                S::Instance::default(),
+                raw,
+                count_free,
+            ))
+            .unwrap()
+        };
+        assert_eq!(frame.sdk_timestamp(), expected);
+        let mut owned = frame.owned_copy();
+        assert_eq!(owned.timestamp(), expected);
+        assert_eq!(owned.timecode(), Timecode::SYNTHESIZE);
+        frame.copy_into_owned(&mut owned);
+        assert_eq!(owned.timestamp(), expected);
+    }
+    for ticks in [0, NDIlib_recv_timestamp_undefined, 123_456] {
+        check::<AudioKind>(ticks, SdkTimestamp::from_sdk(ticks));
+        check::<FrameSyncAudioFree>(
+            ticks,
+            if ticks == 0 {
+                None
+            } else {
+                SdkTimestamp::from_sdk(ticks)
+            },
+        );
+    }
+}

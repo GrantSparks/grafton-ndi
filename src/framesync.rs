@@ -823,6 +823,8 @@ impl FrameSync {
     /// the request's channels and samples per channel; the SDK can supply
     /// silence whenever current input is unavailable, including after input
     /// previously arrived. Successful output does not prove fresh reception.
+    /// Output without a source timestamp reports `timestamp() == None`; without
+    /// a source timecode it carries [`crate::Timecode::SYNTHESIZE`].
     /// See the [reception monitoring guide](https://github.com/GrantSparks/grafton-ndi/blob/main/docs/usage.md#monitor-reception-of-the-expected-media).
     ///
     /// # Following the source's format
@@ -1253,10 +1255,12 @@ mod tests {
                 assert!(frame
                     .channels()
                     .all(|channel| channel.iter().all(|&s| s == 0.0)));
+                assert_eq!(frame.timestamp(), None);
             });
             assert_eq!(allocations, 0);
             assert_eq!(audio_test_calls::take(), (1, 1));
             let owned = fs.capture_audio(request).unwrap();
+            assert_eq!(owned.timestamp(), None);
             assert_eq!((owned.num_channels(), owned.num_samples()), (2, 1024));
             assert_eq!(audio_test_calls::take(), (1, 1));
         }
