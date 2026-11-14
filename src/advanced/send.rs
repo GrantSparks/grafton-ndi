@@ -30,6 +30,10 @@ use crate::sys::advanced::FrameScatter;
 /// Maximum number of blocks in one scatter frame.
 pub const MAX_SCATTER_BLOCKS: usize = 65_536;
 
+#[cfg(all(test, ndi_has_advanced_scatter_send, ndi_has_advanced_send_completion))]
+#[path = "scatter_completion_tests.rs"]
+mod scatter_completion_tests;
+
 /// The blocks of one frame and the null-terminated arrays that describe them
 /// to the SDK.
 ///
