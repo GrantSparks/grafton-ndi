@@ -87,7 +87,7 @@ fn native_scatter_completions_preserve_the_submitted_data_key() {
                 mut frame,
                 scatter: list,
                 ..
-            } = frames.last_mut().unwrap().lend()
+            } = frames.last_mut().unwrap().lend(())
             else {
                 unreachable!("a scatter frame was prepared");
             };
