@@ -29,6 +29,9 @@
 //! * `fake_changes` — consumable Finder and Advanced keyframe changes, with
 //!   explicit source announcements and one native wake per change;
 //! * `fake_tally` — poll/wait share a consumable tally change on each sender;
+
+//! * `fake_capability_descriptors` — log synchronous sends, receiver settings
+//!   and Advanced AV sync descriptors after their capability checks;
 //! * `fake_capture` — script native media/notification delivery with
 //!   `GRAFTON_FAKE_CAPTURE_SCRIPT`; only active rows/channels are initialized;
 //! * `fake_receiver_controls` — clocked capture, stream controls and KVM log
@@ -242,13 +245,17 @@ stub! {
     fn NDIlib_recv_ptz_exposure_auto(p_instance: NDIlib_recv_instance_t) -> bool;
     fn NDIlib_recv_ptz_exposure_manual(p_instance: NDIlib_recv_instance_t, exposure_level: f32) -> bool;
     fn NDIlib_recv_ptz_exposure_manual_v2(p_instance: NDIlib_recv_instance_t, iris: f32, gain: f32, shutter_speed: f32) -> bool;
-    fn NDIlib_send_send_video_v2(p_instance: NDIlib_send_instance_t, p_video_data: *const NDIlib_video_frame_v2_t);
     fn NDIlib_send_send_metadata(p_instance: NDIlib_send_instance_t, p_metadata: *const NDIlib_metadata_frame_t);
     fn NDIlib_send_get_no_connections(p_instance: NDIlib_send_instance_t, timeout_in_ms: u32) -> ::std::os::raw::c_int;
     fn NDIlib_send_clear_connection_metadata(p_instance: NDIlib_send_instance_t);
     fn NDIlib_send_add_connection_metadata(p_instance: NDIlib_send_instance_t, p_metadata: *const NDIlib_metadata_frame_t);
     fn NDIlib_send_get_source_name(p_instance: NDIlib_send_instance_t) -> *const NDIlib_source_t;
 
+}
+
+#[cfg(not(fake_capability_descriptors))]
+stub! {
+    fn NDIlib_send_send_video_v2(p_instance: NDIlib_send_instance_t, p_video_data: *const NDIlib_video_frame_v2_t);
 }
 
 export! {
@@ -368,6 +375,11 @@ mod objects {
     export! {
         fn NDIlib_recv_create_v3(_p_create_settings: *const NDIlib_recv_create_v3_t) -> NDIlib_recv_instance_t {
             log("receiver-create");
+            #[cfg(fake_capability_descriptors)]
+            {
+                let settings = unsafe { &*_p_create_settings };
+                log(&format!("receiver-settings:{}:{}", settings.color_format, settings.bandwidth));
+            }
             handle()
         }
 
@@ -935,3 +947,7 @@ mod changes;
 #[cfg(fake_tally)]
 #[path = "fake_tally.rs"]
 mod tally;
+
+#[cfg(fake_capability_descriptors)]
+#[path = "fake_capability_descriptors.rs"]
+mod capability_descriptors;

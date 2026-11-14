@@ -46,6 +46,33 @@ export! {
             std::thread::sleep(std::time::Duration::from_millis(delay.min(timeout_in_ms.into())));
         }
         match kind.as_str() {
+            gate if gate.starts_with("gate-") && !p_video_data.is_null() => {
+                // One full-resolution row per plane fits the same allocation
+                // the ordinary video fixtures free. Initialize its entire
+                // storage so these capability fixtures add no padding concern.
+                let pixels = Box::new([MaybeUninit::<u8>::new(0); 64]);
+                let (format, stride) = if gate.starts_with("gate-nb4g") {
+                    (NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NB4G, 16)
+                } else if gate.starts_with("gate-na4g") {
+                    (NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NA4G, 16)
+                } else if gate.starts_with("gate-nb48") {
+                    (NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NB48, 8)
+                } else if gate.starts_with("gate-na48") {
+                    (NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_NA48, 8)
+                } else {
+                    panic!("unknown gated fixture {gate}");
+                };
+                unsafe { *p_video_data = NDIlib_video_frame_v2_t {
+                    xres: 4, yres: 1, FourCC: format,
+                    frame_rate_N: 30, frame_rate_D: 1, picture_aspect_ratio: 4.0,
+                    frame_format_type: NDIlib_frame_format_type_e_NDIlib_frame_format_type_progressive,
+                    timecode: 1234, timestamp: 5678,
+                    p_data: Box::into_raw(pixels).cast(),
+                    __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 { line_stride_in_bytes: stride },
+                    p_metadata: media_metadata(&kind, c"<video/>"),
+                }; }
+                NDIlib_frame_type_e_NDIlib_frame_type_video
+            }
             "video" | "planar" | "alpha" | "bad-video" | "video-invalid-metadata" | "video-unterminated-metadata" if !p_video_data.is_null() => {
                 let mut pixels = Box::new([MaybeUninit::<u8>::uninit(); 64]);
                 let (format, height, stride, planes): (_, _, _, &[(usize, usize, usize, usize)]) = match kind.as_str() {
