@@ -432,7 +432,7 @@ mod tests {
         for (index, byte) in source.data_mut().iter_mut().enumerate() {
             *byte = index as u8;
         }
-        let (event, releases) = deliver::<VideoKind>(source.to_raw(), video_event);
+        let (event, releases) = deliver::<VideoKind>(source.as_test_raw(), video_event);
         assert_eq!(releases, 1);
         let PacketItem::Video(ReceivedVideo::Decoded(frame)) = event.unwrap() else {
             panic!("an uncompressed frame is decoded");
@@ -445,11 +445,11 @@ mod tests {
 
         let no_pixels = NDIlib_video_frame_v2_t {
             p_data: ptr::null_mut(),
-            ..source.to_raw()
+            ..source.as_test_raw()
         };
         let bad_metadata = NDIlib_video_frame_v2_t {
             p_metadata: NOT_UTF8.as_ptr().cast(),
-            ..source.to_raw()
+            ..source.as_test_raw()
         };
         for raw in [no_pixels, bad_metadata] {
             let (event, releases) = deliver::<VideoKind>(raw, video_event);
@@ -670,7 +670,7 @@ mod tests {
             };
             let packets = creation_options(&best, color_format);
             packets.validate_runtime(require).unwrap();
-            let settings = packets.to_raw().unwrap().raw;
+            let settings = packets.as_test_raw().unwrap().raw;
             assert_eq!(settings.color_format, color_format, "{preset:?}");
             assert!(settings.allow_video_fields);
 

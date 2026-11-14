@@ -15,6 +15,7 @@ use std::ffi::c_void;
 
 use super::CompressedVideoFrame;
 use crate::{
+    frames::{SendableVideoLayout, VideoParts},
     sys::{
         advanced::{native, SendCompletion},
         bindings::*,
@@ -134,12 +135,20 @@ impl From<CompressedVideoFrame> for QueuedVideoFrame {
     }
 }
 
+enum QueuedAuthorization {
+    Pixels(SendableVideoLayout),
+    Compressed,
+}
+
 impl QueuedVideoFrame {
     /// A native descriptor that lends this frame to the SDK, which may write
     /// to a compressed frame's bytes for as long as it holds the descriptor.
-    fn raw(&mut self) -> NDIlib_video_frame_v2_t {
+    fn raw(&mut self, authorized: QueuedAuthorization) -> NDIlib_video_frame_v2_t {
         match self {
-            Self::Pixels(v) => v.to_raw(),
+            Self::Pixels(v) => match authorized {
+                QueuedAuthorization::Pixels(proof) => v.to_raw(proof),
+                _ => unreachable!("authorization matches queued frame"),
+            },
             Self::Compressed(v) => v.raw(),
         }
     }
@@ -152,10 +161,14 @@ impl QueuedVideoFrame {
     }
 
     /// Check that `sender` can send this frame, as its own send methods do.
-    fn validate(&self, sender: &Sender<QueueAttached>) -> Result<()> {
+    fn validate(&self, sender: &Sender<QueueAttached>) -> Result<QueuedAuthorization> {
         match self {
-            Self::Pixels(v) => sender.require_video_format(v.pixel_format()),
-            Self::Compressed(v) => v.validate_for_send(),
+            Self::Pixels(v) => sender
+                .require_video_layout(*v.layout())
+                .map(QueuedAuthorization::Pixels),
+            Self::Compressed(v) => v
+                .validate_for_send()
+                .map(|()| QueuedAuthorization::Compressed),
         }
     }
 }
@@ -526,9 +539,10 @@ impl QueuedSender {
     ) -> std::result::Result<SubmissionId, Rejected<QueuedVideoFrame>> {
         let mut frame = frame.into();
         let failure = Rejected::new;
-        if let Err(error) = frame.validate(&self.sender) {
-            return Err(failure(error, frame));
-        }
+        let authorized = match frame.validate(&self.sender) {
+            Ok(proof) => proof,
+            Err(error) => return Err(failure(error, frame)),
+        };
         let bytes = frame.retained_bytes();
         if let Err(error) = self.callback.validate_frame_size(bytes) {
             return Err(failure(error, frame));
@@ -541,7 +555,7 @@ impl QueuedSender {
                 frame,
             ));
         }
-        let header = AliasableBox::new(Box::new(frame.raw()));
+        let header = AliasableBox::new(Box::new(frame.raw(authorized)));
         let key = header.p_data as usize;
         let pointer = header.as_ptr();
         let id = {
@@ -702,7 +716,12 @@ mod tests {
     fn insert(state: &CallbackState, id: u64) -> usize {
         let mut frame =
             QueuedVideoFrame::Pixels(VideoFrame::builder().resolution(2, 2).build().unwrap());
-        let header = AliasableBox::new(Box::new(frame.raw()));
+        let header = AliasableBox::new(Box::new(frame.raw(match &frame {
+            QueuedVideoFrame::Pixels(v) => {
+                QueuedAuthorization::Pixels(SendableVideoLayout::for_test(*v.layout()))
+            }
+            QueuedVideoFrame::Compressed(_) => QueuedAuthorization::Compressed,
+        })));
         let key = header.p_data as usize;
         let bytes = frame.retained_bytes();
         let mut s = state.state.lock().unwrap();

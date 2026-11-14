@@ -123,6 +123,22 @@ pub(crate) trait Table: Sized + 'static {
     fn within(evidence: Evidence<'_>) -> Result<&'_ Self>;
 }
 
+// Version-only enum values have no entry points of their own. These private
+// proofs use the same gate as tables, so descriptor builders cannot bypass it.
+macro_rules! version_gates {
+    ($($gate:ident),+ $(,)?) => {$(
+        pub(crate) struct $gate(());
+        impl Table for $gate {
+            fn within(evidence: Evidence<'_>) -> Result<&'_ Self> {
+                evidence.require(RuntimeFeature::$gate)?;
+                static PROOF: $gate = $gate(());
+                Ok(&PROOF)
+            }
+        }
+    )+};
+}
+version_gates!(Planar444Video, ReceiveBest444, ReceiveVideoOnly);
+
 /// What the gate of an optional capability decides from: the tables resolved
 /// from one implementation, its identity, and the capabilities derived from
 /// them.

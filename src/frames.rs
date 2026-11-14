@@ -528,7 +528,7 @@ impl PixelFormat {
             self.info().category(),
             FormatCategory::Planar444 | FormatCategory::Planar444Alpha
         ) {
-            ndi.require_feature(crate::RuntimeFeature::Planar444Video)?;
+            ndi.table::<sys::Planar444Video>()?;
         }
         Ok(())
     }
@@ -631,12 +631,13 @@ impl VideoHeader {
 /// The SDK descriptor of an uncompressed frame. It borrows `data` and
 /// `metadata` (null for none), which must outlive every use of it.
 pub(crate) fn sdk_video_frame(
-    layout: &ValidatedVideoLayout,
+    authorized: SendableVideoLayout,
     header: &VideoHeader,
     data: *const u8,
     metadata: *const c_char,
     timestamp: Option<SdkTimestamp>,
 ) -> NDIlib_video_frame_v2_t {
+    let layout = authorized.layout();
     let (frame_rate_n, frame_rate_d) = header.frame_rate.to_sdk();
     NDIlib_video_frame_v2_t {
         xres: layout.sdk_width(),
@@ -700,9 +701,9 @@ pub(crate) unsafe trait VideoParts {
     }
 
     /// Borrow this validated frame's SDK descriptor without copying pixels.
-    fn video_descriptor(&self) -> NDIlib_video_frame_v2_t {
+    fn video_descriptor(&self, authorized: SendableVideoLayout) -> NDIlib_video_frame_v2_t {
         sdk_video_frame(
-            self.layout(),
+            authorized,
             self.header(),
             self.pixels(),
             self.metadata_text()
@@ -1455,8 +1456,13 @@ impl VideoFrame {
     }
 
     /// The SDK descriptor of this frame, borrowing its pixels and metadata.
-    pub(crate) fn to_raw(&self) -> NDIlib_video_frame_v2_t {
-        self.video_descriptor()
+    pub(crate) fn to_raw(&self, authorized: SendableVideoLayout) -> NDIlib_video_frame_v2_t {
+        self.video_descriptor(authorized)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_test_raw(&self) -> NDIlib_video_frame_v2_t {
+        self.to_raw(SendableVideoLayout::for_test(*self.layout()))
     }
 
     /// Set the timecode without reallocating the pixels.
@@ -1634,7 +1640,7 @@ impl VideoFrame {
         unsafe {
             VideoRef::new(Guard::<crate::capture::FrameSyncVideoFree>::with_test_free(
                 ptr::null_mut(),
-                self.to_raw(),
+                self.as_test_raw(),
                 |_, _| {},
             ))
         }
@@ -3433,6 +3439,32 @@ pub(crate) struct ValidatedVideoLayout {
     plane_count: usize,
     /// The validated first-plane line stride in bytes.
     line_stride_bytes: usize,
+}
+
+/// A validated layout authorized for the selected runtime. Its fields are
+/// private: a proof for one format cannot be used to write another FourCC.
+#[derive(Clone, Copy)]
+pub(crate) struct SendableVideoLayout(ValidatedVideoLayout);
+
+impl SendableVideoLayout {
+    pub(crate) fn new(layout: ValidatedVideoLayout, ndi: &crate::Ndi) -> Result<Self> {
+        layout.pixel_format().require_sendable(ndi)?;
+        Ok(Self(layout))
+    }
+
+    pub(crate) const fn layout(&self) -> &ValidatedVideoLayout {
+        &self.0
+    }
+
+    /// Packing preserves format and dimensions, and therefore authorization.
+    pub(crate) fn packed(self) -> Self {
+        Self(self.0.packed())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(layout: ValidatedVideoLayout) -> Self {
+        Self(layout)
+    }
 }
 
 // The width, height and line stride of a valid layout are each at most its
@@ -6312,7 +6344,7 @@ mod tests {
         frame.set_frame_rate(FrameRate::new(30000, 1001).unwrap());
         frame.set_picture_aspect_ratio(0.0).unwrap();
         assert!(frame.set_picture_aspect_ratio(f32::NAN).is_err());
-        let raw = frame.to_raw();
+        let raw = frame.as_test_raw();
         assert_eq!(raw.timecode, 123);
         assert_eq!(raw.timestamp, NDIlib_recv_timestamp_undefined);
         assert_eq!((raw.frame_rate_N, raw.frame_rate_D), (30000, 1001));
@@ -8105,7 +8137,7 @@ mod tests {
     fn test_owned_frame_metadata_builders_setters_and_raw_conversion() {
         let mut video = VideoFrame::builder().metadata("").build().unwrap();
         assert_eq!(video.metadata(), Some(""));
-        let raw = video.to_raw();
+        let raw = video.as_test_raw();
         assert!(!raw.p_metadata.is_null());
         assert_eq!(
             unsafe { slice::from_raw_parts(raw.p_metadata.cast::<u8>(), 1) },
@@ -8114,7 +8146,7 @@ mod tests {
 
         video.set_metadata("video meta").unwrap();
         assert_eq!(video.metadata(), Some("video meta"));
-        let raw = video.to_raw();
+        let raw = video.as_test_raw();
         assert_eq!(
             unsafe { slice::from_raw_parts(raw.p_metadata.cast::<u8>(), 11) },
             b"video meta\0"
@@ -8122,7 +8154,7 @@ mod tests {
 
         video.clear_metadata();
         assert!(video.metadata().is_none());
-        assert!(video.to_raw().p_metadata.is_null());
+        assert!(video.as_test_raw().p_metadata.is_null());
 
         let mut audio = AudioFrame::builder().metadata("").build().unwrap();
         assert_eq!(audio.metadata(), Some(""));
@@ -8187,7 +8219,7 @@ mod tests {
             audio.clear_metadata();
             assert_eq!(video.metadata(), None);
             assert_eq!(audio.metadata(), None);
-            assert!(video.to_raw().p_metadata.is_null());
+            assert!(video.as_test_raw().p_metadata.is_null());
             assert!(audio.to_raw().p_metadata.is_null());
         }
     }
@@ -8340,7 +8372,10 @@ mod tests {
     fn test_default_outbound_timecodes_are_synthesized() {
         let video = VideoFrame::builder().resolution(16, 16).build().unwrap();
         assert_eq!(video.timecode(), Timecode::SYNTHESIZE);
-        assert_eq!(video.to_raw().timecode, NDIlib_send_timecode_synthesize);
+        assert_eq!(
+            video.as_test_raw().timecode,
+            NDIlib_send_timecode_synthesize
+        );
         let audio = AudioFrame::builder().num_samples(1).build().unwrap();
         assert_eq!(audio.timecode(), Timecode::SYNTHESIZE);
         assert_eq!(audio.to_raw().timecode, NDIlib_send_timecode_synthesize);
@@ -8355,7 +8390,7 @@ mod tests {
                 .timecode(zero)
                 .build()
                 .unwrap()
-                .to_raw()
+                .as_test_raw()
                 .timecode,
             0
         );
@@ -8407,7 +8442,7 @@ mod tests {
                 .build()
                 .unwrap();
             assert_eq!(frame.picture_aspect_ratio(), 0.0);
-            assert_eq!(frame.to_raw().picture_aspect_ratio, 0.0);
+            assert_eq!(frame.as_test_raw().picture_aspect_ratio, 0.0);
             for builder in [
                 VideoFrame::builder()
                     .picture_aspect_ratio(1.25)
@@ -8418,7 +8453,7 @@ mod tests {
             ] {
                 let frame = builder.build().unwrap();
                 assert_eq!(frame.picture_aspect_ratio(), 1.25);
-                assert_eq!(frame.to_raw().picture_aspect_ratio, 1.25);
+                assert_eq!(frame.as_test_raw().picture_aspect_ratio, 1.25);
             }
         }
         for ratio in [0.0, 1.25] {
@@ -8427,14 +8462,14 @@ mod tests {
                 .picture_aspect_ratio(ratio)
                 .build()
                 .unwrap();
-            let raw = frame.to_raw();
+            let raw = frame.as_test_raw();
             // SAFETY: `raw` borrows this live owned frame's initialized pixels.
             let captured = unsafe { ValidatedVideo::video(&raw).unwrap() };
             let mut copy = captured.owned_copy();
             assert_eq!(copy.picture_aspect_ratio(), ratio);
             copy.set_picture_aspect_ratio(2.0).unwrap();
             captured.copy_into_owned(&mut copy);
-            assert_eq!(copy.to_raw().picture_aspect_ratio, ratio);
+            assert_eq!(copy.as_test_raw().picture_aspect_ratio, ratio);
         }
         for ratio in [-1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert!(matches!(
@@ -9521,7 +9556,7 @@ mod tests {
                     room + if more { rows } else { 0 },
                     "{format:?} {scan:?}"
                 );
-                let raw = frame.to_raw();
+                let raw = frame.as_test_raw();
                 assert_eq!(raw.p_data.cast_const(), frame.data().as_ptr());
                 assert_eq!(frame.tail_room(), needed, "{format:?} {scan:?}");
                 assert_eq!(frame.data.room(), vec![0; needed], "{format:?} {scan:?}");
@@ -9533,7 +9568,7 @@ mod tests {
                     frame.set_scan_type(scan);
                     frame.set_scan_type(ScanType::Progressive);
                     frame.set_scan_type(scan);
-                    assert_eq!(frame.to_raw().p_data, raw.p_data);
+                    assert_eq!(frame.as_test_raw().p_data, raw.p_data);
                 });
                 assert_eq!(allocations, 0, "{format:?} {scan:?}");
             }

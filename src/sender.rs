@@ -13,7 +13,8 @@ use crate::{
     finder::Source,
     frames::{
         AudioSource, MetadataFrame, MetadataSource, MetadataText, PixelFormat, ScanType,
-        ValidatedVideoLayout, VideoFrame, VideoHeader, VideoParts, VideoSource,
+        SendableVideoLayout, ValidatedVideoLayout, VideoFrame, VideoHeader, VideoParts,
+        VideoSource,
     },
     pixels::{send_room, Pixels},
     receiver::Tally,
@@ -321,10 +322,10 @@ impl VideoPipeline {
     }
 
     /// Send `frame` synchronously, which also releases the frame in flight.
-    fn send(&self, frame: &(impl VideoSource + ?Sized)) {
+    fn send(&self, frame: &(impl VideoSource + ?Sized), authorized: SendableVideoLayout) {
         self.synchronize(|state, sender| {
             // The SDK reads the copy only during the send, under this lock.
-            let frame = PreparedVideo::new(frame, &mut state.staging);
+            let frame = PreparedVideo::authorized(frame, &mut state.staging, authorized);
             // A synchronous video send also releases the previous async frame,
             // which completes once the send has returned.
             let synchronized = state.in_flight.send(sender, frame);
@@ -333,13 +334,13 @@ impl VideoPipeline {
     }
 
     /// Hand a checked frame to the SDK and return the previous one, if any.
-    fn submit(&self, frame: VideoFrame) -> Option<VideoFrame> {
+    fn submit(&self, frame: VideoFrame, authorized: SendableVideoLayout) -> Option<VideoFrame> {
         self.synchronize(|state, sender| {
             // The pipeline owns the new frame before the SDK sees it. The
             // previous frame stays owned by `displaced` until the submission,
             // which synchronizes the SDK's access to it, has returned; only
             // the proof of that return completes it.
-            let (mut displaced, synchronized) = state.in_flight.submit(sender, frame);
+            let (mut displaced, synchronized) = state.in_flight.submit(sender, frame, authorized);
             displaced.completed(synchronized);
             displaced.take_retained()
         })
@@ -383,8 +384,10 @@ impl Drop for VideoPipeline {
 // tail, and terminated FrameMetadata. Moving the frame moves none of those
 // allocations, which InFlight keeps inaccessible until the SDK releases them.
 unsafe impl in_flight::Lend for VideoFrame {
-    fn lend(&mut self) -> in_flight::Lent {
-        in_flight::Lent::Frame(self.to_raw())
+    type Authorization = SendableVideoLayout;
+
+    fn lend(&mut self, authorized: Self::Authorization) -> in_flight::Lent {
+        in_flight::Lent::Frame(self.to_raw(authorized))
     }
 }
 
@@ -469,7 +472,9 @@ pub(crate) mod in_flight {
     /// the slot gives no access to a frame in flight.
     pub(crate) unsafe trait Lend {
         /// The descriptors that lend this frame to the SDK.
-        fn lend(&mut self) -> Lent;
+        type Authorization;
+
+        fn lend(&mut self, authorization: Self::Authorization) -> Lent;
     }
 
     /// What an asynchronous video send hands the SDK.
@@ -592,8 +597,13 @@ pub(crate) mod in_flight {
         /// Make `next` the frame in flight and lend it to the SDK. Returns
         /// the state it displaced, whose frame the SDK has released, with the
         /// proof of that release.
-        pub(crate) fn submit(&mut self, sender: SendHandle, mut next: T) -> (Self, Synchronized) {
-            let lent = next.lend();
+        pub(crate) fn submit(
+            &mut self,
+            sender: SendHandle,
+            mut next: T,
+            authorization: T::Authorization,
+        ) -> (Self, Synchronized) {
+            let lent = next.lend(authorization);
             // The slot owns the new frame before the SDK sees it. Moving the
             // frame does not move what `lent` points to (the contract of
             // `Lend`).
@@ -825,15 +835,28 @@ pub(crate) struct PreparedVideo<'a> {
 }
 
 impl<'a> PreparedVideo<'a> {
+    #[cfg(test)]
     fn new(frame: &'a (impl VideoParts + ?Sized), staging: &'a mut Pixels) -> Self {
+        Self::authorized(
+            frame,
+            staging,
+            SendableVideoLayout::for_test(*frame.layout()),
+        )
+    }
+
+    fn authorized(
+        frame: &'a (impl VideoParts + ?Sized),
+        staging: &'a mut Pixels,
+        authorized: SendableVideoLayout,
+    ) -> Self {
         let raw = if frame.can_send_direct() {
-            frame.video_descriptor()
+            frame.video_descriptor(authorized)
         } else {
-            let packed = frame.layout().packed();
-            let room = send_room(&packed, frame.header().scan_type);
-            frame.copy_active_pixels(staging, &packed, room);
+            let packed = authorized.packed();
+            let room = send_room(packed.layout(), frame.header().scan_type);
+            frame.copy_active_pixels(staging, packed.layout(), room);
             crate::frames::sdk_video_frame(
-                &packed,
+                packed,
                 frame.header(),
                 staging.as_ptr(),
                 frame
@@ -1070,7 +1093,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
 
     #[cfg(test)]
     fn to_raw(self) -> NDIlib_video_frame_v2_t {
-        self.video_descriptor()
+        self.video_descriptor(SendableVideoLayout::for_test(*self.layout()))
     }
 }
 
@@ -1445,8 +1468,8 @@ impl Sender {
     /// # }
     /// ```
     pub fn send_video(&self, frame: &(impl VideoSource + ?Sized)) -> Result<()> {
-        self.require_video_format(frame.layout().pixel_format())?;
-        self.native.video.send(frame);
+        let authorized = self.require_video_layout(*frame.layout())?;
+        self.native.video.send(frame, authorized);
         Ok(())
     }
 
@@ -1472,10 +1495,11 @@ impl Sender {
         &mut self,
         frame: VideoFrame,
     ) -> std::result::Result<Option<VideoFrame>, Rejected<VideoFrame>> {
-        if let Err(error) = self.require_video_format(frame.pixel_format()) {
-            return Err(Rejected::new(error, frame));
-        }
-        Ok(self.native.video.submit(frame))
+        let authorized = match self.require_video_layout(*frame.layout()) {
+            Ok(authorized) => authorized,
+            Err(error) => return Err(Rejected::new(error, frame)),
+        };
+        Ok(self.native.video.submit(frame, authorized))
     }
 
     /// Drain the SDK and return the final owned frame, if any.
@@ -1502,9 +1526,9 @@ impl Sender {
         &mut self,
         frame: &(impl VideoSource + ?Sized),
     ) -> Result<Option<VideoFrame>> {
-        self.require_video_format(frame.layout().pixel_format())?;
+        let authorized = self.require_video_layout(*frame.layout())?;
         let owned = frame.owned_copy();
-        Ok(self.native.video.submit(owned))
+        Ok(self.native.video.submit(owned, authorized.packed()))
     }
 
     /// Flush pending async video operations synchronously.
@@ -1602,8 +1626,11 @@ impl<M: SenderMode> Sender<M> {
 
     /// Check that this sender's runtime can send `pixel_format`: the one
     /// check every video send makes before anything reaches the SDK.
-    pub(crate) fn require_video_format(&self, pixel_format: PixelFormat) -> Result<()> {
-        pixel_format.require_sendable(&self._ndi)
+    pub(crate) fn require_video_layout(
+        &self,
+        layout: ValidatedVideoLayout,
+    ) -> Result<SendableVideoLayout> {
+        SendableVideoLayout::new(layout, &self._ndi)
     }
 
     /// Capture metadata sent back by connected receivers.
@@ -2240,8 +2267,8 @@ mod tests {
             let Some(frame) = video.in_flight.frame() else {
                 panic!("missing owned frame")
             };
-            assert_eq!(frame.to_raw().p_data, pixels as *mut u8);
-            assert_eq!(frame.to_raw().p_metadata, metadata);
+            assert_eq!(frame.as_test_raw().p_data, pixels as *mut u8);
+            assert_eq!(frame.as_test_raw().p_metadata, metadata);
         }
         let second = test_owned_frame(22);
         let second_pixels = second.data().as_ptr();
@@ -2302,7 +2329,7 @@ mod tests {
                     });
                     assert_eq!(allocations, 0, "{format:?} {height} {scan:?}");
                     assert_eq!(raw.p_data.cast_const(), frame.data().as_ptr());
-                    assert_eq!(raw.p_metadata, frame.to_raw().p_metadata);
+                    assert_eq!(raw.p_metadata, frame.as_test_raw().p_metadata);
                     assert_eq!(raw.frame_format_type, scan.to_sdk());
                     assert!(staging.as_slice().is_empty());
                 }
@@ -2653,7 +2680,10 @@ mod tests {
     fn synchronous_send_describes_an_owned_frame_as_the_frame_itself() {
         let owned = test_owned_frame(8);
         let mut staging = Pixels::default();
-        let (expected, lent) = (owned.to_raw(), PreparedVideo::new(&owned, &mut staging).raw);
+        let (expected, lent) = (
+            owned.as_test_raw(),
+            PreparedVideo::new(&owned, &mut staging).raw,
+        );
         assert_eq!(lent.p_data, expected.p_data);
         assert_eq!(lent.p_metadata, expected.p_metadata);
         // SAFETY: both descriptors are uncompressed, so the union holds the stride.
@@ -2927,8 +2957,8 @@ mod tests {
                     PreparedVideo::new(&owned, &mut staging).raw
                 });
                 assert_eq!(allocations, 0);
-                assert_eq!(raw.p_metadata, owned.to_raw().p_metadata);
-                assert_eq!(raw.p_data, owned.to_raw().p_data);
+                assert_eq!(raw.p_metadata, owned.as_test_raw().p_metadata);
+                assert_eq!(raw.p_data, owned.as_test_raw().p_data);
                 assert!(BorrowedVideoFrame::builder(
                     &data[..layout.data_len_bytes() - 1],
                     4,

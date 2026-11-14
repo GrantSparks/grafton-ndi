@@ -493,7 +493,9 @@ impl PendingVideo {
 // Scatter additionally owns its list in stable storage. Moving PendingVideo
 // moves none of those allocations. InFlight prevents access until release.
 unsafe impl Lend for PendingVideo {
-    fn lend(&mut self) -> Lent {
+    type Authorization = ();
+
+    fn lend(&mut self, (): ()) -> Lent {
         match self {
             Self::Contiguous(frame) => Lent::Frame(frame.raw()),
             #[cfg(ndi_has_advanced_scatter_send)]
@@ -527,7 +529,7 @@ impl PendingStreams {
             StreamTier::Preview => &mut self.preview,
         };
         // The other stream's frame stays in flight in its own slot.
-        let (displaced, synchronized) = slot.submit(sender, next);
+        let (displaced, synchronized) = slot.submit(sender, next, ());
         displaced
             .release(synchronized)
             .map(PendingVideo::into_submitted)
@@ -1066,7 +1068,7 @@ mod tests {
         let frame = CompressedVideoFrame::new(format, bytes.clone()).unwrap();
         let data = frame.data().as_ptr();
         let mut pending = PendingVideo::Contiguous(frame);
-        let (lent, allocations) = crate::test_alloc::allocation_count(|| pending.lend());
+        let (lent, allocations) = crate::test_alloc::allocation_count(|| pending.lend(()));
         assert_eq!(allocations, 0);
         #[cfg(not(ndi_has_advanced_scatter_send))]
         let Lent::Frame(descriptor) = lent;
@@ -1094,13 +1096,13 @@ mod tests {
         // The scatter list is the only new allocation: its arrays belong to
         // the frame.
         assert_eq!(allocations, 1);
-        let Lent::Scatter { scatter, .. } = pending.lend() else {
+        let Lent::Scatter { scatter, .. } = pending.lend(()) else {
             panic!("a scatter frame is lent with its scatter list");
         };
         // Moving the entry, as its stream's slot does, leaves the list where
         // the SDK was told it is, still naming the frame's arrays.
         let mut moved = Box::new(pending);
-        let Lent::Scatter { scatter: after, .. } = moved.lend() else {
+        let Lent::Scatter { scatter: after, .. } = moved.lend(()) else {
             panic!("a scatter frame is lent with its scatter list");
         };
         assert_eq!(after, scatter);

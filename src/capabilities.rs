@@ -762,6 +762,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn version_only_tables_apply_the_same_gate_as_capability_queries() {
+        use crate::sys::{Planar444Video, ReceiveBest444, ReceiveVideoOnly, Table};
+        for (version, supported) in [("6.3.2.0", false), ("6.4.0.2", true), ("7.0.0.0", true)] {
+            let fixture = Fixture::new(|_| true, Some(version), SdkEdition::Standard);
+            for result in [
+                Planar444Video::within(fixture.evidence()).map(|_| ()),
+                ReceiveBest444::within(fixture.evidence()).map(|_| ()),
+                ReceiveVideoOnly::within(fixture.evidence()).map(|_| ()),
+            ] {
+                assert_eq!(result.is_ok(), supported, "{version}: {result:?}");
+                if !supported {
+                    assert!(matches!(
+                        result,
+                        Err(crate::Error::UnsupportedCapability {
+                            reason: CapabilityUnavailable::RuntimeTooOld,
+                            ..
+                        })
+                    ));
+                }
+            }
+        }
+    }
+
     fn detect(
         exported: impl Fn(&str) -> bool,
         version: Option<&str>,

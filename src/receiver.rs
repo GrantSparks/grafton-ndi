@@ -743,18 +743,40 @@ impl ReceiverOptions {
     }
 
     /// The native creation settings, with the strings they point to.
-    pub(crate) fn to_raw(&self) -> Result<RawRecvCreateV3> {
-        let source = self.source.to_raw()?;
-        let name = self.name.as_deref().map(CString::new).transpose()?;
+    pub(crate) fn to_raw(&self, ndi: &Ndi) -> Result<RawRecvCreateV3> {
+        self.validate_runtime(|feature| match feature {
+            RuntimeFeature::ReceiveBest444 => ndi.table::<sys::ReceiveBest444>().map(|_| ()),
+            RuntimeFeature::ReceiveVideoOnly => ndi.table::<sys::ReceiveVideoOnly>().map(|_| ()),
+            _ => unreachable!("receiver option gate"),
+        })?;
+        ValidatedReceiveOptions { options: self }.to_raw()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_test_raw(&self) -> Result<RawRecvCreateV3> {
+        ValidatedReceiveOptions { options: self }.to_raw()
+    }
+}
+
+// Created only after the selected runtime has authorized the options. Unit
+// fixtures construct it without a runtime to inspect enum/descriptor mappings.
+struct ValidatedReceiveOptions<'a> {
+    options: &'a ReceiverOptions,
+}
+
+impl ValidatedReceiveOptions<'_> {
+    fn to_raw(&self) -> Result<RawRecvCreateV3> {
+        let source = self.options.source.to_raw()?;
+        let name = self.options.name.as_deref().map(CString::new).transpose()?;
         let p_ndi_recv_name = name.as_ref().map_or(ptr::null(), |n| n.as_ptr());
         let source_raw = source.raw;
 
         Ok(RawRecvCreateV3 {
             raw: NDIlib_recv_create_v3_t {
                 source_to_connect_to: source_raw,
-                color_format: self.sdk_color_format(),
-                bandwidth: self.bandwidth.to_sdk(),
-                allow_video_fields: self.allow_video_fields,
+                color_format: self.options.sdk_color_format(),
+                bandwidth: self.options.bandwidth.to_sdk(),
+                allow_video_fields: self.options.allow_video_fields,
                 p_ndi_recv_name,
             },
             _source: source,
@@ -1015,8 +1037,7 @@ impl Receiver {
         #[cfg(feature = "advanced")] config: Option<crate::advanced::AdvancedConfig>,
         create: impl FnOnce(&'static sys::Core, &NDIlib_recv_create_v3_t) -> NDIlib_recv_instance_t,
     ) -> Result<Self> {
-        options.validate_runtime(|feature| ndi.require_feature(feature))?;
-        let raw = options.to_raw()?;
+        let raw = options.to_raw(ndi)?;
         let instance = create(&ndi.api().core, &raw.raw);
         if instance.is_null() {
             return Err(Error::NativeOperationFailed { operation });
@@ -2700,7 +2721,7 @@ mod tests {
             return;
         };
         let best = ReceiverOptions::new(test_source()).color_format(ReceiverColorFormat::Best444);
-        assert_eq!(best.to_raw().unwrap().raw.color_format, 102);
+        assert_eq!(best.as_test_raw().unwrap().raw.color_format, 102);
         assert_eq!(
             best.validate_runtime(|feature| ndi.require_feature(feature))
                 .is_ok(),
@@ -2711,7 +2732,7 @@ mod tests {
             (ReceiverBandwidth::VideoOnlyHighest, 101),
         ] {
             let options = ReceiverOptions::new(test_source()).bandwidth(bandwidth);
-            assert_eq!(options.to_raw().unwrap().raw.bandwidth, value);
+            assert_eq!(options.as_test_raw().unwrap().raw.bandwidth, value);
             assert_eq!(
                 options
                     .validate_runtime(|feature| ndi.require_feature(feature))
@@ -3649,7 +3670,7 @@ mod tests {
 
     #[test]
     fn receiver_options_defaults_emit_operational_raw_modes() {
-        let raw = unconnected().to_raw().unwrap();
+        let raw = unconnected().as_test_raw().unwrap();
 
         assert_raw_receiver_modes(
             &raw,
@@ -3662,7 +3683,7 @@ mod tests {
     #[test]
     fn snapshot_preset_emits_operational_raw_modes() {
         let raw = ReceiverOptions::snapshot_preset(test_source())
-            .to_raw()
+            .as_test_raw()
             .unwrap();
 
         assert_raw_receiver_modes(
@@ -3676,7 +3697,7 @@ mod tests {
     #[test]
     fn high_quality_preset_emits_operational_raw_modes() {
         let raw = ReceiverOptions::high_quality_preset(test_source())
-            .to_raw()
+            .as_test_raw()
             .unwrap();
 
         assert_raw_receiver_modes(
@@ -3690,7 +3711,7 @@ mod tests {
     #[test]
     fn monitoring_preset_emits_operational_raw_modes() {
         let raw = ReceiverOptions::monitoring_preset(test_source())
-            .to_raw()
+            .as_test_raw()
             .unwrap();
 
         assert_raw_receiver_modes(

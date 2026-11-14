@@ -3,7 +3,12 @@ use super::*;
 fn retain(state: &CallbackState, id: u64) -> usize {
     let mut frame =
         QueuedVideoFrame::Pixels(VideoFrame::builder().resolution(2, 2).build().unwrap());
-    let header = AliasableBox::new(Box::new(frame.raw()));
+    let header = AliasableBox::new(Box::new(frame.raw(match &frame {
+        QueuedVideoFrame::Pixels(v) => {
+            QueuedAuthorization::Pixels(SendableVideoLayout::for_test(*v.layout()))
+        }
+        QueuedVideoFrame::Compressed(_) => QueuedAuthorization::Compressed,
+    })));
     let key = header.p_data as usize;
     let bytes = frame.retained_bytes();
     let mut locked = state.state.lock().unwrap();

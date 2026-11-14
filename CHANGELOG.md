@@ -132,6 +132,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Performance and correctness
 
+- Runtime-authorized layouts now guard caller video descriptors, including
+  owned AV-sync input. Older runtimes reject planar 4:4:4 video consistently
+  before native calls; receiver settings carry the same structural checks.
+
 - Dropped async receiver waits stop before their next bounded attempt, releasing
   their receiver and blocking worker without waiting for the original timeout.
   Source-name polling now uses the same bounded attempts.
