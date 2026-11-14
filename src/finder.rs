@@ -10,7 +10,7 @@ use std::{
     fmt::{self, Display, Formatter},
     net::IpAddr,
     ptr,
-    sync::{Mutex, MutexGuard, TryLockError},
+    sync::{Arc, Mutex, MutexGuard, TryLockError},
     time::Duration,
 };
 
@@ -1277,7 +1277,7 @@ struct CachedSources {
 }
 
 struct CacheState {
-    entries: HashMap<HostKey, Vec<Source>>,
+    entries: HashMap<HostKey, Arc<Vec<Source>>>,
     generation: Option<u64>,
 }
 
@@ -1425,25 +1425,51 @@ impl CachedSources {
         timeout: Duration,
         discover: impl FnOnce(HostQuery<'_>) -> Result<Vec<Source>>,
     ) -> Result<Vec<Source>> {
+        self.sources_by_host_with_copy(host, timeout, discover, copy_sources)
+    }
+
+    fn sources_by_host_with_copy(
+        &self,
+        host: &str,
+        timeout: Duration,
+        discover: impl FnOnce(HostQuery<'_>) -> Result<Vec<Source>>,
+        mut copy: impl FnMut(&[Source]) -> Result<Vec<Source>>,
+    ) -> Result<Vec<Source>> {
         let query = HostQuery::parse(host).ok_or_else(|| {
             Error::InvalidInput("Host must be a bare hostname or IP address".into())
         })?;
         to_ms_checked(timeout)?;
         let key = HostKeyBuffer::new(query);
-        let generation = {
+        let (snapshot, generation) = {
             let cache = self
                 .cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(cached) = cache.entries.get(key.as_str()) {
-                return copy_sources(cached);
-            }
-            cache.generation
+            (cache.entries.get(key.as_str()).cloned(), cache.generation)
         };
+        if let Some(snapshot) = snapshot {
+            return copy(&snapshot);
+        }
         // SDK waits and user discovery run outside the cache mutex. Invalidation
         // changes the generation, so an old result cannot repopulate the cache.
         let sources = discover(query)?;
         if !sources.is_empty() {
+            {
+                let cache = self
+                    .cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if generation.is_none()
+                    || cache.generation != generation
+                    || cache.entries.contains_key(key.as_str())
+                {
+                    return Ok(sources);
+                }
+            }
+            // The bounded, fallible deep copy happens outside the mutex.
+            // Publication must still recheck both generation and key: another
+            // discovery or invalidation may have completed during this copy.
+            let snapshot = Arc::new(copy(&sources)?);
             let mut cache = self
                 .cache
                 .lock()
@@ -1452,12 +1478,11 @@ impl CachedSources {
                 && cache.generation == generation
                 && !cache.entries.contains_key(key.as_str())
             {
-                let copy = copy_sources(&sources)?;
                 cache
                     .entries
                     .try_reserve(1)
                     .map_err(|_| budget::allocation_failed())?;
-                cache.entries.insert(key.into_owned(), copy);
+                cache.entries.insert(key.into_owned(), snapshot);
             }
         }
         Ok(sources)
@@ -1499,6 +1524,113 @@ impl CachedSources {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "manual owned-source cache hit contention; no native discovery"]
+    fn cache_hit_resources() {
+        use std::time::Instant;
+        for count in [1, 128, 4096] {
+            for lanes in [1, 8] {
+                for sample in 0..3 {
+                    for old_lock in [true, false] {
+                        let cache = CachedSources::default();
+                        let sources = (0..count)
+                            .map(|n| {
+                                Source::new(format!("camera (Program {n:04} {})", "x".repeat(128)))
+                            })
+                            .collect();
+                        cache
+                            .sources_by_host_with("camera", Duration::ZERO, |_| Ok(sources))
+                            .unwrap();
+                        let gate = std::sync::Barrier::new(lanes);
+                        std::thread::scope(|scope| {
+                            for lane in 0..lanes {
+                                let (cache, gate) = (&cache, &gate);
+                                scope.spawn(move || {
+                                    gate.wait();
+                                    let start = Instant::now();
+                                    for _ in 0..100 {
+                                        let sources = if old_lock {
+                                            let cache = cache.cache.lock().unwrap();
+                                            copy_sources(cache.entries.get("camera").unwrap())
+                                                .unwrap()
+                                        } else {
+                                            cache
+                                                .sources_by_host_with(
+                                                    "camera",
+                                                    Duration::ZERO,
+                                                    |_| panic!("cache hit must not discover"),
+                                                )
+                                                .unwrap()
+                                        };
+                                        std::hint::black_box(sources);
+                                    }
+                                    eprintln!(
+                                        "cache,{old_lock},{count},{lanes},{sample},{lane},{:.6}",
+                                        start.elapsed().as_secs_f64() * 1000.0
+                                    );
+                                });
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cache_descriptor_copies_release_the_global_mutex_and_recheck_publication() {
+        let cache = CachedSources::default();
+        let sources = vec![Source::new("camera (Program)")];
+        for hit in [false, true] {
+            let result = cache
+                .sources_by_host_with_copy(
+                    "camera",
+                    Duration::ZERO,
+                    |_| {
+                        assert!(!hit);
+                        Ok(sources.clone())
+                    },
+                    |snapshot| {
+                        assert!(
+                            cache.cache.try_lock().is_ok(),
+                            "descriptor copies must not hold the cache mutex"
+                        );
+                        copy_sources(snapshot)
+                    },
+                )
+                .unwrap();
+            assert_eq!(result, sources);
+        }
+        cache.clear();
+        let result = cache
+            .sources_by_host_with_copy(
+                "camera",
+                Duration::ZERO,
+                |_| Ok(sources.clone()),
+                |snapshot| {
+                    cache.invalidate("camera");
+                    copy_sources(snapshot)
+                },
+            )
+            .unwrap();
+        assert_eq!(result, sources);
+        assert!(
+            cache.is_empty(),
+            "invalidation during snapshot preparation suppresses publication"
+        );
+        cache
+            .sources_by_host_with_copy(
+                "camera",
+                Duration::ZERO,
+                |_| {
+                    cache.clear();
+                    Ok(sources.clone())
+                },
+                |_| panic!("stale discovery must not allocate a publication copy"),
+            )
+            .unwrap();
+    }
 
     #[test]
     fn source_cache_moves_its_finder_without_allocating_or_recreating_it() {
@@ -1878,7 +2010,7 @@ mod tests {
         let cache = CachedSources::default();
         cache.cache.lock().unwrap().entries.insert(
             HostKeyBuffer::new(HostQuery::parse("camera").unwrap()).into_owned(),
-            vec![Source::new("camera")],
+            Arc::new(vec![Source::new("camera")]),
         );
         for host in ["camera", "not_cached"] {
             assert!(matches!(
