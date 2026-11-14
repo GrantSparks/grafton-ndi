@@ -420,6 +420,10 @@ impl Ledger {
     /// outcome is final: confirmed when every opened file was closed, and
     /// indeterminate otherwise. A stop that is still being carried out leaves
     /// a file open, and the session keeps waiting for its closure.
+    /// Finality here relies on rollovers reporting the next file open before
+    /// the previous file closes: an empty ledger then cannot hide a pending
+    /// open. The SDK headers do not specify the order; the native test
+    /// `rollovers_open_the_next_file_before_closing_the_previous_file` pins it.
     fn drained(&mut self, native_recording: bool) {
         if native_recording || !self.session_open() {
             return;
@@ -719,6 +723,9 @@ impl FileRecorder {
         let event = self.capture(wait_ms);
         self.ledger.dropped(self.dropped_event_count());
         let Some(event) = event.inspect_err(|_| self.ledger.uncertain = true)? else {
+            // This empty-capture/recording check relies on open-before-close
+            // rollover events, pinned by the native File test
+            // `rollovers_open_the_next_file_before_closing_the_previous_file`.
             self.ledger.drained(self.is_recording());
             if !self.ledger.session_open() {
                 // The session is over. When the SDK ended it itself, this is
@@ -1213,8 +1220,11 @@ mod tests {
 
     #[test]
     fn a_rollover_reports_the_next_file_open_before_the_previous_one_closed() {
-        // The order the SDK emits: the new file's rollover, then the old
-        // file's close.
+        // Finality in `drained` and `poll_event_ms` relies on this observed
+        // SDK order. The native File test
+        // `rollovers_open_the_next_file_before_closing_the_previous_file`
+        // pins it for explicit, source-switch and size rollovers, with and
+        // without proxy recording.
         let mut ledger = session();
         ledger.observe(Started, path("first.mkv"));
         ledger.observe(Rollover, path("second.mkv"));

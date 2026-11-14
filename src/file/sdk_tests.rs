@@ -198,9 +198,9 @@ fn await_event(recorder: &mut FileRecorder, kind: RecorderEventKind) -> Recorder
 
 /// The events a test has taken from a recorder, with the time each arrived.
 ///
-/// A test waits on it for an event about one particular file, whatever order
-/// the SDK reports the events of a rollover in, and prints it when a check
-/// fails, so that the failure says what the SDK reported and when.
+/// A test waits on it for an event about one particular file. Rollover checks
+/// assert that the next file opens before the previous one closes, and print
+/// the timeline on failure so the report includes native event order and time.
 struct Timeline {
     began: Instant,
     events: Vec<(Duration, RecorderEvent)>,
@@ -262,6 +262,21 @@ impl Timeline {
         let next = self.await_event(recorder, since, RecorderEventKind::Rollover, None);
         self.await_event(recorder, since, RecorderEventKind::FileClosed, Some(left));
         self.await_event(recorder, since, RecorderEventKind::FirstFrame, Some(&next));
+        let position = |kind, file: &Path| {
+            self.events[since..]
+                .iter()
+                .position(|(_, event)| {
+                    event.kind() == kind
+                        && Path::new(event.path().to_string_lossy().as_ref()) == file
+                })
+                .unwrap_or_else(|| panic!("no {kind:?} for {file:?}:\n{self}"))
+        };
+        assert!(
+            position(RecorderEventKind::Rollover, &next)
+                < position(RecorderEventKind::FileClosed, left),
+            "the next file must open before the previous file closes; recorder finality \
+             depends on this native event order:\n{self}"
+        );
         assert_eq!(recorder.state(), RecorderState::Recording, "{self}");
         next
     }
@@ -493,6 +508,69 @@ fn rollovers_and_a_source_switch_end_in_a_confirmed_close_of_every_file() {
             continue;
         }
         panic_unfinalized(&api, file, &info, &timeline);
+    }
+}
+
+#[test]
+fn rollovers_open_the_next_file_before_closing_the_previous_file() {
+    let Some((ndi, api)) = file_api() else {
+        return;
+    };
+    let scratch = Scratch::new("rollover-order");
+    let source = LiveSource::start(&ndi, "rollover-order");
+    // Sixteen changes per case pin thirty-two rollovers for each mechanism,
+    // including recording both with and without the source's proxy stream.
+    const CHANGES: usize = 16;
+    for proxy in [false, true] {
+        for mechanism in ["explicit", "source", "size"] {
+            let prefix = format!("{mechanism}-proxy-{proxy}");
+            let options = RecorderOptions::new(source.spec.clone())
+                .naming(FileNaming::Indexed)
+                .proxy(proxy)
+                .tracks(MediaTypes::VIDEO)
+                .rollover_size(if mechanism == "size" { 65_536 } else { 0 });
+            let mut recorder = api.create_recorder(&options).unwrap();
+            let mut timeline = Timeline::new();
+            recorder
+                .start(
+                    &RecordingTarget::new(scratch.path(&prefix)).unwrap(),
+                    RecordingTimecode::Preserve,
+                )
+                .unwrap();
+            let mut current =
+                timeline.await_event(&mut recorder, 0, RecorderEventKind::Started, None);
+            timeline.await_event(
+                &mut recorder,
+                0,
+                RecorderEventKind::FirstFrame,
+                Some(&current),
+            );
+            for index in 0..CHANGES {
+                let since = timeline.mark();
+                match mechanism {
+                    "explicit" => recorder
+                        .rollover(
+                            &RecordingTarget::new(scratch.path(&format!("{prefix}-{index}")))
+                                .unwrap(),
+                        )
+                        .unwrap(),
+                    "source" => recorder.set_source(&source.spec).unwrap(),
+                    "size" => {} // The configured size threshold triggers this change.
+                    _ => unreachable!(),
+                }
+                current = timeline.await_change(&mut recorder, since, &current);
+            }
+            let outcome = recorder.finish(PATIENCE).unwrap();
+            let FinishStatus::Closed(report) = outcome else {
+                panic!("{prefix} did not reach confirmed closure: {outcome:?}\n{timeline}");
+            };
+            assert!(report.closure_confirmed(), "{prefix}: {timeline}");
+            assert!(
+                report.closed_files() > CHANGES as u64,
+                "{prefix}: {timeline}"
+            );
+            assert_eq!(report.dropped_events(), 0, "{prefix}: {timeline}");
+        }
     }
 }
 
