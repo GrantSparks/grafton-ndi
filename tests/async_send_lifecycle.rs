@@ -59,7 +59,7 @@ fn copied_send_survives_released_source() -> Result<(), grafton_ndi::Error> {
     let mut sender = Sender::new(&ndi, &options)?;
     let mut buffer = vec![7; 16 * 16 * 4];
     let borrowed = BorrowedVideoFrame::builder(&buffer, 16, 16, PixelFormat::Bgra).build()?;
-    let _ = sender.send_video_async_copy(&borrowed)?;
+    sender.send_video_async_copy(&borrowed)?;
     buffer.fill(9);
     drop(buffer);
     let _ = sender.finish_video_async();
@@ -80,11 +80,16 @@ fn mixed_owned_and_copy_send_recovers_the_released_frames() -> Result<(), grafto
     sender.send_video_async(owned)?;
     let source = vec![4; 16 * 16 * 4];
     let borrowed = BorrowedVideoFrame::builder(&source, 16, 16, PixelFormat::Bgra).build()?;
-    let recovered = sender.send_video_async_copy(&borrowed)?.unwrap();
-    assert_eq!(recovered.data().as_ptr(), pixels);
-    assert_eq!(recovered.data()[0], 3);
+    sender.send_video_async_copy(&borrowed)?;
+    let recovered = sender.send_video_async(frame(5))?.unwrap();
+    assert_eq!(recovered.data()[0], 4);
+    // A later copy reuses the original owned buffer, which only copying
+    // retained; an owned submission still returns the frame it displaces.
+    sender.send_video_async_copy(&borrowed)?;
     sender.flush_async_blocking();
-    assert_eq!(sender.finish_video_async().unwrap().data()[0], 4);
+    let recovered = sender.finish_video_async().unwrap();
+    assert_eq!(recovered.data().as_ptr(), pixels);
+    assert_eq!(recovered.data()[0], 4);
     assert!(sender.finish_video_async().is_none());
     sender.send_video_async(frame(5))?;
     drop(sender);
@@ -174,7 +179,7 @@ fn copied_send_retains_metadata_after_source_drop() -> Result<(), grafton_ndi::E
         .clock_audio(false);
     let mut sender = Sender::new(&ndi, &options)?;
     let source = frame(8);
-    let _ = sender.send_video_async_copy(&source)?;
+    sender.send_video_async_copy(&source)?;
     drop(source);
     // Both source pixels and metadata have been released before the SDK drain.
     let recovered = sender.finish_video_async().unwrap();

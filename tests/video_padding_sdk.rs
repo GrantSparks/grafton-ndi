@@ -10,7 +10,6 @@ common_helpers!(runtime, name, loopback);
 use grafton_ndi::{
     Finder, FinderOptions, FrameSync, Ndi, PixelFormat, Receiver, ReceiverColorFormat,
     ReceiverOptions, ScanType, Sender, SenderOptions, Source, SourceCache, VideoFrame, VideoPlanes,
-    VideoSource,
 };
 use std::{
     sync::{
@@ -271,19 +270,9 @@ fn live_receiver_framesync_and_owned_send_skip_padding() {
         .unwrap();
         let original = owned.data().as_ptr();
         assert!(resend.send_video_async(owned).unwrap().is_none());
-        let recovered = resend
-            .send_video_async_copy(&owned_capture)
-            .unwrap()
-            .unwrap();
-        assert_eq!(recovered.data().as_ptr(), original);
-        verify_owned(&recovered);
-        // The recovered frame is the next copy's destination, as in the loop
-        // `VideoSource::copy_into` documents: the copied frame comes
-        // back from the next send and the recovered one from the finish.
-        let mut recovered = recovered;
-        owned_capture.copy_into(&mut recovered);
-        let copied = resend.send_video_async(recovered).unwrap().unwrap();
-        verify_owned(&copied);
+        resend.send_video_async_copy(&owned_capture).unwrap();
+        // The next copy reuses the released original allocation.
+        resend.send_video_async_copy(&owned_capture).unwrap();
         let last = resend.finish_video_async().unwrap();
         assert_eq!(last.data().as_ptr(), original);
         verify_owned(&last);

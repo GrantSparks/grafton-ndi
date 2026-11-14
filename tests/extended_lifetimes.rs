@@ -78,6 +78,7 @@ fn native_resource_ownership() {
     let advanced = fixture(&directory, true);
     let mut scenarios = vec![
         "sender_unregistered",
+        "sender_copy_reuse",
         "sender_registration",
         "dropped_sender_advertiser",
         "receiver_registration",
@@ -171,6 +172,42 @@ fn child(case: &str) {
         }
     }
     match case {
+        "sender_copy_reuse" => {
+            use grafton_ndi::{BorrowedVideoFrame, PixelFormat};
+            std::env::set_var("GRAFTON_FAKE_VALIDATE_VIDEO_COPY", "1");
+            let mut sender = sender(&ndi);
+            let mut pixels = vec![0; 16 * 16 * 4];
+            // The fake SDK rereads each previous submission during the next
+            // native call, before returning its release proof. Refilling the
+            // frame still in flight would change the byte it expects.
+            for value in 1..=6 {
+                pixels.fill(value);
+                let source = BorrowedVideoFrame::builder(&pixels, 16, 16, PixelFormat::Bgra)
+                    .build()
+                    .unwrap();
+                sender.send_video_async_copy(&source).unwrap();
+            }
+            pixels.fill(9);
+            drop(pixels);
+            drop(sender);
+            let events = log();
+            for value in 1..=6 {
+                assert_eq!(
+                    events
+                        .matches(&format!("sender-copy-released={value}\n"))
+                        .count(),
+                    1
+                );
+            }
+            assert_eq!(events.matches("sender-submit-return\n").count(), 6);
+            assert!(
+                position(&events, "sender-flush") < position(&events, "sender-copy-released=6")
+            );
+            assert!(
+                position(&events, "sender-copy-released=6")
+                    < position(&events, "sender-destroy-begin")
+            );
+        }
         "sender_unregistered" => {
             let mut sender = sender(&ndi);
             sender.send_video_async(frame()).unwrap();

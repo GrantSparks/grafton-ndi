@@ -307,6 +307,9 @@ struct VideoState {
     /// read from here instead. Empty until such a frame is sent, then kept
     /// for the next one.
     staging: Pixels,
+    /// A released frame kept for the next asynchronous copy. This is never
+    /// the allocation the SDK is still reading from `in_flight`.
+    spare: Option<VideoFrame>,
 }
 
 impl VideoPipeline {
@@ -348,6 +351,24 @@ impl VideoPipeline {
         })
     }
 
+    /// Copy into released storage, then retain the displaced frame for reuse.
+    fn copy(&self, frame: &(impl VideoSource + ?Sized), authorized: SendableVideoLayout) {
+        self.synchronize(|state, sender| {
+            let owned = match state.spare.take() {
+                Some(mut spare) => {
+                    frame.copy_into_owned(&mut spare);
+                    spare
+                }
+                None => frame.owned_copy(),
+            };
+            let (mut displaced, synchronized) = state.in_flight.submit(sender, owned, authorized);
+            // Only the submission's return proves that the SDK has released
+            // the displaced storage. A later copy may refill it after this.
+            displaced.completed(synchronized);
+            state.spare = displaced.take_retained();
+        });
+    }
+
     /// Wait for the SDK to release the frame in flight, which stays retained.
     fn flush(&self) {
         self.synchronize(|state, sender| drain(&mut state.in_flight, sender));
@@ -357,6 +378,7 @@ impl VideoPipeline {
     fn finish(&self) -> Option<VideoFrame> {
         self.synchronize(|state, sender| {
             drain(&mut state.in_flight, sender);
+            state.spare = None;
             state.in_flight.take_retained()
         })
     }
@@ -981,8 +1003,8 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     /// [`Sender::send_video_async`] keeps the frame it is given until the next
     /// send, and returns the previous one, which the SDK has finished with:
     /// that frame is the destination of the next copy.
-    /// [`Sender::send_video_async_copy`] makes the same copy into a new frame
-    /// on every call instead.
+    /// [`Sender::send_video_async_copy`] keeps its own reusable frames for
+    /// this copy instead.
     ///
     /// ```no_run
     /// # use grafton_ndi::{BorrowedVideoFrame, Ndi, PixelFormat, Sender, SenderOptions, VideoFrame};
@@ -1482,8 +1504,10 @@ impl Sender {
     ///
     /// The sender takes ownership before calling the SDK. The next async send
     /// synchronizes the previous send and returns its owned frame for reuse.
-    /// The first send returns `None`. Owned and copied submissions share this
-    /// recovery behavior. Call [`Self::finish_video_async`] to recover the final frame.
+    /// The first send returns `None`. The returned frame may have been submitted
+    /// by ownership or copying. A copied submission instead retains the frame
+    /// it displaces for its next copy. Call [`Self::finish_video_async`] to
+    /// recover the final frame.
     ///
     /// Synchronous sends and explicit flushes complete the operation but retain
     /// the owned frame for recovery by the next async send or finish call.
@@ -1510,30 +1534,34 @@ impl Sender {
     /// Drain the SDK and return the final owned frame, if any.
     ///
     /// Frames submitted through either owned or copied sending are returned.
-    /// Repeated calls return `None`.
+    /// Any spare storage retained for copying is released. Repeated calls
+    /// return `None`.
     pub fn finish_video_async(&mut self) -> Option<VideoFrame> {
         self.native.video.finish()
     }
 
     /// Copy borrowed pixels and metadata, then submit the owned copy asynchronously.
     ///
-    /// This uses the same pipeline as [`Self::send_video_async`], returning the
-    /// previous completed frame whether it was submitted by ownership or copying.
     /// The caller may immediately reuse or release the source buffer and metadata.
-    /// Recover the final copy with [`Self::finish_video_async`].
+    /// The sender keeps the previous completed frame as spare storage for its
+    /// next copy, whether that frame was submitted by ownership or copying.
+    /// Once both frames have enough pixel and metadata capacity, repeated
+    /// copies reuse their allocations. Larger layouts or longer metadata grow
+    /// each buffer as needed.
+    ///
+    /// Recover the final copy with [`Self::finish_video_async`], which also
+    /// releases the spare. Owned submissions through [`Self::send_video_async`]
+    /// still return the frame they displace.
     ///
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedCapability`] if this sender's runtime
     /// cannot send the frame's pixel format, checked before anything is
     /// copied. No pending send is changed on failure.
-    pub fn send_video_async_copy(
-        &mut self,
-        frame: &(impl VideoSource + ?Sized),
-    ) -> Result<Option<VideoFrame>> {
+    pub fn send_video_async_copy(&mut self, frame: &(impl VideoSource + ?Sized)) -> Result<()> {
         let authorized = self.require_video_layout(*frame.layout())?;
-        let owned = frame.owned_copy();
-        Ok(self.native.video.submit(owned, authorized.packed()))
+        self.native.video.copy(frame, authorized.packed());
+        Ok(())
     }
 
     /// Flush pending async video operations synchronously.
@@ -2325,6 +2353,96 @@ mod tests {
     }
 
     #[test]
+    fn copied_async_sends_reuse_pixels_and_metadata_after_warmup() {
+        let Some(mut sender) = test_sender() else {
+            return;
+        };
+        let pixels = vec![128; 16 * 16 * 4];
+        let source = BorrowedVideoFrame::builder(&pixels, 16, 16, PixelFormat::Bgra)
+            .frame_rate(FrameRate::new(30, 1).unwrap())
+            .picture_aspect_ratio(1.25)
+            .timecode(Timecode::from_ticks(1234))
+            .metadata(c"<metadata/>")
+            .build()
+            .unwrap();
+        let shorter = BorrowedVideoFrame::builder(&pixels, 16, 16, PixelFormat::Bgra)
+            .metadata(c"<short/>")
+            .build()
+            .unwrap();
+        sender.send_video_async_copy(&source).unwrap();
+        sender.send_video_async_copy(&source).unwrap();
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            for _ in 0..4 {
+                sender.send_video_async_copy(&shorter).unwrap();
+                sender.send_video_async_copy(&shorter).unwrap();
+                sender.send_video_async_copy(&source).unwrap();
+                sender.send_video_async_copy(&source).unwrap();
+            }
+        });
+        assert_eq!(allocations, 0);
+        let copy = sender.finish_video_async().unwrap();
+        assert_eq!(copy.data(), pixels);
+        assert_eq!(copy.frame_rate(), source.frame_rate());
+        assert_eq!(copy.picture_aspect_ratio(), 1.25);
+        assert_eq!(copy.timecode(), Timecode::from_ticks(1234));
+        assert_eq!(copy.metadata(), Some("<metadata/>"));
+        assert!(sender.native.video.state.lock().unwrap().spare.is_none());
+        assert!(sender.finish_video_async().is_none());
+    }
+
+    #[test]
+    fn copied_async_storage_grows_once_per_buffer_then_reuses_capacity() {
+        let Some(mut sender) = test_sender() else {
+            return;
+        };
+        let small_pixels = vec![128; 16 * 16 * 4];
+        let large_pixels = vec![128; 64 * 16 * 4];
+        let small = BorrowedVideoFrame::builder(&small_pixels, 16, 16, PixelFormat::Bgra)
+            .metadata(c"<a/>")
+            .build()
+            .unwrap();
+        let large = BorrowedVideoFrame::builder(&large_pixels, 64, 16, PixelFormat::Bgra)
+            .metadata(c"<a/>")
+            .build()
+            .unwrap();
+        let metadata = CString::new("x".repeat(256)).unwrap();
+        let longer = BorrowedVideoFrame::builder(&large_pixels, 64, 16, PixelFormat::Bgra)
+            .metadata(&metadata)
+            .build()
+            .unwrap();
+        sender.send_video_async_copy(&small).unwrap();
+        sender.send_video_async_copy(&small).unwrap();
+        // Each of the two reusable pixel buffers grows once, with no new
+        // metadata storage needed. No further growth is needed afterward.
+        for _ in 0..2 {
+            let ((), allocations) = crate::test_alloc::allocation_count(|| {
+                sender.send_video_async_copy(&large).unwrap();
+            });
+            assert_eq!(allocations, 1);
+        }
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            sender.send_video_async_copy(&large).unwrap();
+            sender.send_video_async_copy(&large).unwrap();
+        });
+        assert_eq!(allocations, 0);
+        // Longer metadata likewise grows each reusable metadata buffer once.
+        for _ in 0..2 {
+            let ((), allocations) = crate::test_alloc::allocation_count(|| {
+                sender.send_video_async_copy(&longer).unwrap();
+            });
+            assert_eq!(allocations, 1);
+        }
+        let ((), allocations) = crate::test_alloc::allocation_count(|| {
+            for _ in 0..4 {
+                sender.send_video_async_copy(&longer).unwrap();
+                sender.send_video_async_copy(&large).unwrap();
+            }
+        });
+        assert_eq!(allocations, 0);
+        sender.finish_video_async();
+    }
+
+    #[test]
     fn owned_video_preparation_preserves_storage_for_every_scan_type() {
         for format in PixelFormat::ALL {
             for height in [4, 6] {
@@ -2739,8 +2857,10 @@ mod tests {
         sender.flush_async_blocking();
         assert_eq!(sender.finish_video_async().unwrap().data().as_ptr(), pixels);
 
-        // A copied send recovers the previous owned frame after synchronization.
-        sender.send_video_async(test_owned_frame(2)).unwrap();
+        // A copied send retains the released owned frame for its next copy.
+        let owned = test_owned_frame(2);
+        let owned_pixels = owned.data().as_ptr();
+        sender.send_video_async(owned).unwrap();
         let data = vec![3; 1024];
         let metadata = CString::new("<copy/>").unwrap();
         {
@@ -2748,14 +2868,7 @@ mod tests {
                 .metadata(&metadata)
                 .build()
                 .unwrap();
-            assert_eq!(
-                sender
-                    .send_video_async_copy(&borrowed)
-                    .unwrap()
-                    .unwrap()
-                    .data()[0],
-                2
-            );
+            sender.send_video_async_copy(&borrowed).unwrap();
         }
         {
             let video = sender.native.video.state.lock().unwrap();
@@ -2764,6 +2877,9 @@ mod tests {
             };
             assert_ne!(copy.data().as_ptr(), data.as_ptr());
             assert_ne!(copy.metadata_cstr().unwrap().as_ptr(), metadata.as_ptr());
+            let spare = video.spare.as_ref().unwrap();
+            assert_eq!(spare.data().as_ptr(), owned_pixels);
+            assert_eq!(spare.data()[0], 2);
         }
         drop(data);
         drop(metadata);
@@ -2879,8 +2995,21 @@ mod tests {
             sender.send_video(&frame).unwrap();
             let previous = sender.send_video_async(frame).unwrap().unwrap();
             assert_eq!(previous.data()[0], 1);
-            let previous = sender.send_video_async_copy(&borrowed).unwrap().unwrap();
-            assert_eq!(previous.data().as_ptr(), pixels);
+            sender.send_video_async_copy(&borrowed).unwrap();
+            assert_eq!(
+                sender
+                    .native
+                    .video
+                    .state
+                    .lock()
+                    .unwrap()
+                    .spare
+                    .as_ref()
+                    .unwrap()
+                    .data()
+                    .as_ptr(),
+                pixels
+            );
         } else {
             let unsupported = |error: &Error| {
                 matches!(

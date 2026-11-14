@@ -12,7 +12,8 @@
 //!   `GRAFTON_FAKE_NDI_LOG`, and the optional sender-metadata, routing and
 //!   advertiser functions are exported. Registrations log the flags they were
 //!   given, and a receiver's input-group name is read only when its
-//!   registration ends;
+//!   registration ends. `GRAFTON_FAKE_VALIDATE_VIDEO_COPY=1` makes ordinary
+//!   async sends retain and check each frame's first pixel until synchronization;
 //! * `fake_discovery` — export the sender and receiver listener functions over
 //!   a fixed membership whose identifiers and text are partly not UTF-8, and
 //!   log every identifier passed back, byte for byte. An event batch holds
@@ -305,11 +306,21 @@ mod objects {
         pub(super) opaque: *mut c_void,
         pub(super) completion: Option<Completion>,
         pending: Vec<NDIlib_video_frame_v2_t>,
+        copied: Option<(NDIlib_video_frame_v2_t, u8)>,
     }
 
     impl Sender {
+        /// Read the previous copy before the native synchronization returns.
+        unsafe fn release_copy(&mut self) {
+            if let Some((frame, expected)) = self.copied.take() {
+                assert_eq!(unsafe { frame.p_data.read_volatile() }, expected);
+                log(&format!("sender-copy-released={expected}"));
+            }
+        }
+
         /// Report every retained frame as complete, most recent first.
         unsafe fn complete(&mut self) {
+            unsafe { self.release_copy() };
             let Some(completion) = self.completion else {
                 return;
             };
@@ -366,6 +377,7 @@ mod objects {
                 opaque: std::ptr::null_mut(),
                 completion: None,
                 pending: Vec::new(),
+                copied: None,
             }))
             .cast()
         }
@@ -385,6 +397,15 @@ mod objects {
                 return;
             }
             log("sender-submit");
+            if sender.completion.is_none() && std::env::var_os("GRAFTON_FAKE_VALIDATE_VIDEO_COPY").is_some() {
+                unsafe { sender.release_copy() };
+                let frame = unsafe { *p_video_data };
+                let first = unsafe { frame.p_data.read_volatile() };
+                sender.copied = Some((frame, first));
+                log(&format!("sender-copy-submitted={first}"));
+                log("sender-submit-return");
+                return;
+            }
             let Some(completion) = sender.completion else {
                 return;
             };

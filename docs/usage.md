@@ -110,7 +110,7 @@ Choose the send method by storage ownership:
 | --- | --- | --- |
 | Owned or borrowed media | `send_video`, `send_audio`, `send_metadata` | When the synchronous call returns |
 | Owned video | `send_video_async` | When a later call returns the completed frame |
-| Borrowed video | `send_video_async_copy` | Input is copied before submission |
+| Borrowed video | `send_video_async_copy` | Input is copied into reusable sender storage before submission |
 
 The SDK's asynchronous send pipeline is separate from Rust futures and may
 block while synchronizing. Reuse two owned frames and recover the final one
