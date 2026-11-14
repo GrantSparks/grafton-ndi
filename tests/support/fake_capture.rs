@@ -23,6 +23,18 @@ fn next() -> String {
     item
 }
 
+
+fn media_metadata(kind: &str, valid: &'static std::ffi::CStr) -> *const std::ffi::c_char {
+    static UNTERMINATED: [u8; 4 * 1024 * 1024] = [b'x'; 4 * 1024 * 1024];
+    if kind.ends_with("invalid-metadata") {
+        c"\xff".as_ptr()
+    } else if kind.ends_with("unterminated-metadata") {
+        UNTERMINATED.as_ptr().cast()
+    } else {
+        valid.as_ptr()
+    }
+}
+
 export! {
     fn NDIlib_recv_capture_v3(_p_instance: NDIlib_recv_instance_t, p_video_data: *mut NDIlib_video_frame_v2_t, p_audio_data: *mut NDIlib_audio_frame_v3_t, p_metadata: *mut NDIlib_metadata_frame_t, timeout_in_ms: u32) -> NDIlib_frame_type_e {
         let kind = next();
@@ -34,7 +46,7 @@ export! {
             std::thread::sleep(std::time::Duration::from_millis(delay.min(timeout_in_ms.into())));
         }
         match kind.as_str() {
-            "video" | "planar" | "alpha" | "bad-video" if !p_video_data.is_null() => {
+            "video" | "planar" | "alpha" | "bad-video" | "video-invalid-metadata" | "video-unterminated-metadata" if !p_video_data.is_null() => {
                 let mut pixels = Box::new([MaybeUninit::<u8>::uninit(); 64]);
                 let (format, height, stride, planes): (_, _, _, &[(usize, usize, usize, usize)]) = match kind.as_str() {
                     "planar" => (NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_I420, 4, 8, &[(0, 8, 4, 4), (32, 4, 2, 2), (40, 4, 2, 2)]),
@@ -57,11 +69,11 @@ export! {
                     frame_format_type: NDIlib_frame_format_type_e_NDIlib_frame_format_type_field_1,
                     timecode: 1234, p_data: data,
                     __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 { line_stride_in_bytes: stride },
-                    p_metadata: c"<video/>".as_ptr(), timestamp: 5678,
+                    p_metadata: media_metadata(&kind, c"<video/>"), timestamp: 5678,
                 }};
                 NDIlib_frame_type_e_NDIlib_frame_type_video
             }
-            "audio" | "bad-audio" if !p_audio_data.is_null() => {
+            "audio" | "bad-audio" | "audio-invalid-metadata" | "audio-unterminated-metadata" if !p_audio_data.is_null() => {
                 let mut samples = Box::new([MaybeUninit::<f32>::uninit(); 16]);
                 for (index, value) in [(0, 0.25), (1, 0.5), (4, -0.25), (5, -0.5)] { samples[index].write(value); }
                 let data = Box::into_raw(samples).cast::<u8>();
@@ -71,7 +83,7 @@ export! {
                     timecode: 2345, FourCC: NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP,
                     p_data: data,
                     __bindgen_anon_1: NDIlib_audio_frame_v3_t__bindgen_ty_1 { channel_stride_in_bytes: 16 },
-                    p_metadata: c"<audio/>".as_ptr(), timestamp: 6789,
+                    p_metadata: media_metadata(&kind, c"<audio/>"), timestamp: 6789,
                 }};
                 NDIlib_frame_type_e_NDIlib_frame_type_audio
             }

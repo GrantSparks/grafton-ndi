@@ -736,13 +736,13 @@ impl FrameExtras {
     ///
     /// # Safety
     ///
-    /// `metadata` is null or a readable NUL-terminated string.
+    /// `metadata` is null or readable through its first NUL or the metadata cap.
     unsafe fn received(timecode: i64, timestamp: i64, metadata: *const c_char) -> Result<Self> {
         Ok(Self {
             timecode: Timecode::from_ticks(timecode),
             timestamp: SdkTimestamp::from_sdk(timestamp),
             // SAFETY: forwarded to the caller's obligation.
-            metadata: unsafe { crate::frames::validate_frame_metadata(metadata)? }
+            metadata: unsafe { crate::frames::FrameMetadataState::scan(metadata).text(metadata) }
                 .map(|text| FrameMetadata::copy_from(text, None)),
         })
     }
@@ -810,7 +810,7 @@ macro_rules! frame_extras_accessors {
             self.extras.set_timecode(timecode);
         }
 
-        /// The per-frame metadata, if any.
+        /// The per-frame metadata, if any. Unreadable received text is omitted.
         pub fn metadata(&self) -> Option<&str> {
             self.extras.metadata()
         }
@@ -1359,7 +1359,7 @@ unsafe fn packet_bytes<'a>(data: *const u8, size: i32) -> Result<&'a [u8]> {
 ///
 /// `raw` describes a compressed frame: its union holds the data size, its data
 /// pointer is readable for that size, and its metadata pointer is null or a
-/// NUL-terminated string.
+/// readable string through its first NUL or the metadata cap.
 pub(crate) unsafe fn copy_video_packet(
     raw: &NDIlib_video_frame_v2_t,
 ) -> Result<CompressedVideoFrame> {
@@ -1864,7 +1864,7 @@ mod tests {
     }
 
     #[test]
-    fn received_metadata_preserves_presence_and_rejects_invalid_utf8() {
+    fn received_metadata_preserves_presence_and_omits_unreadable_text() {
         // SAFETY: all non-null pointers below name live terminated byte strings.
         unsafe {
             let absent = FrameExtras::received(123, 456, std::ptr::null()).unwrap();
@@ -1878,10 +1878,15 @@ mod tests {
                 assert_eq!(extras.timecode().ticks(), 123);
                 assert_eq!(extras.timestamp().unwrap().ticks(), 456);
             }
-            assert!(matches!(
-                FrameExtras::received(123, 456, c"\xff".as_ptr()),
-                Err(Error::InvalidUtf8(_))
-            ));
+            let unterminated = vec![b'x'; crate::frames::MAX_METADATA_BYTES];
+            for pointer in [c"\xff".as_ptr(), unterminated.as_ptr().cast()] {
+                let (extras, allocations) = crate::test_alloc::allocation_count(|| {
+                    FrameExtras::received(123, 456, pointer).unwrap()
+                });
+                assert_eq!(allocations, 0);
+                assert_eq!(extras.metadata(), None);
+                assert!(extras.to_sdk().2.is_null());
+            }
         }
     }
 

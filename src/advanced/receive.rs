@@ -451,11 +451,16 @@ mod tests {
             p_metadata: NOT_UTF8.as_ptr().cast(),
             ..source.as_test_raw()
         };
-        for raw in [no_pixels, bad_metadata] {
-            let (event, releases) = deliver::<VideoKind>(raw, video_event);
-            assert!(event.is_err());
-            assert_eq!(releases, 1);
-        }
+        let (event, releases) = deliver::<VideoKind>(bad_metadata, video_event);
+        let PacketItem::Video(ReceivedVideo::Decoded(frame)) = event.unwrap() else {
+            panic!("valid media survives unreadable optional metadata");
+        };
+        assert_eq!(frame.data(), source.data());
+        assert_eq!(frame.metadata(), None);
+        assert_eq!(releases, 1);
+        let (event, releases) = deliver::<VideoKind>(no_pixels, video_event);
+        assert!(event.is_err());
+        assert_eq!(releases, 1);
 
         let format = VideoPacketFormat::new(VideoCodec::H264, 16, 16).unwrap();
         let packet =
@@ -505,11 +510,16 @@ mod tests {
             p_metadata: NOT_UTF8.as_ptr().cast(),
             ..source.to_raw()
         };
-        for raw in [no_samples, bad_metadata] {
-            let (event, releases) = deliver::<AudioKind>(raw, audio_event);
-            assert!(event.is_err());
-            assert_eq!(releases, 1);
-        }
+        let (event, releases) = deliver::<AudioKind>(bad_metadata, audio_event);
+        let PacketItem::Audio(ReceivedAudio::Decoded(frame)) = event.unwrap() else {
+            panic!("valid media survives unreadable optional metadata");
+        };
+        assert_eq!(frame.data(), source.data());
+        assert_eq!(frame.metadata(), None);
+        assert_eq!(releases, 1);
+        let (event, releases) = deliver::<AudioKind>(no_samples, audio_event);
+        assert!(event.is_err());
+        assert_eq!(releases, 1);
 
         let mut sent =
             CompressedAudioFrame::new(AudioCodec::Opus, 48_000, 2, 960, vec![1; 8]).unwrap();

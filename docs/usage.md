@@ -130,6 +130,14 @@ metadata with `set_metadata` and `clear_metadata`; invalid replacement text
 preserves the old value. [`media_buffers`](../examples/media_buffers.rs) shows
 buffer reuse, borrowed planar audio and checked native video conversion.
 
+Optional per-frame metadata does not prevent reception of valid video or
+samples. `metadata()` returns `None` when that text is not UTF-8 or has no
+terminator within the 4 MiB cap; `metadata_status()` distinguishes these
+conditions from absent text. The borrowed frame keeps this status without
+allocation. Forwarding omits unreadable text, and owned copies retain only
+valid metadata, so their status becomes `Absent`. Standalone metadata frames
+remain strict because their text is the entire payload.
+
 ## Use FrameSync
 
 Use `FrameSync` when output follows an application clock such as a playback

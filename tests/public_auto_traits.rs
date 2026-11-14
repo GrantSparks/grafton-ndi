@@ -91,6 +91,7 @@ fn crate_root_types_keep_their_auto_traits() {
         FormatCategory: Send, Sync, UnwindSafe, RefUnwindSafe;
         FourCc: Send, Sync, UnwindSafe, RefUnwindSafe;
         FrameRate: Send, Sync, UnwindSafe, RefUnwindSafe;
+        FrameMetadataStatus: Send, Sync, UnwindSafe, RefUnwindSafe;
         FrameSync: Send, Sync, UnwindSafe, RefUnwindSafe;
         FrameSyncAttached: Send, Sync, UnwindSafe, RefUnwindSafe;
         FrameSyncAudioRef<'static>: UnwindSafe, RefUnwindSafe;

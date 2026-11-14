@@ -647,7 +647,11 @@ impl AvSyncFrame for VideoFrame {}
 
 impl video_sealed::Sealed for VideoFrameRef<'_> {
     fn descriptor(&self, _: &crate::Ndi) -> crate::Result<NDIlib_video_frame_v2_t> {
-        Ok(*self.raw())
+        let mut raw = *self.raw();
+        if self.metadata().is_none() {
+            raw.p_metadata = std::ptr::null();
+        }
+        Ok(raw)
     }
 
     fn receive_timestamp(&self) -> Option<SdkTimestamp> {

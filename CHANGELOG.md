@@ -24,6 +24,9 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   asynchronous video completion through frames returned by `send_video_async`
   and `finish_video_async`. Ordinary senders now implement `UnwindSafe` and
   `RefUnwindSafe`.
+- Received video and audio survive unreadable optional per-frame metadata.
+  `metadata_status()` reports why text was withheld; forwarding and owned
+  copies omit it. Standalone metadata capture remains strict.
 
 - `KvmSession::receiver()` returns a restricted `KvmReceiver<'_, M>` instead
   of `&Receiver<M>`. Compatible capture and shared controls remain available;

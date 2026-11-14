@@ -155,9 +155,10 @@ pub enum Error {
 
     /// Text the SDK delivered is not UTF-8.
     ///
-    /// Reported for the metadata of a captured frame, a received metadata
-    /// frame, and the strings a receiver returns, such as its source's
-    /// web-control URL. Text a peer advertises through a Discovery Server is
+    /// Reported for standalone received metadata frames and strings a receiver
+    /// returns, such as its source's web-control URL. Unreadable per-frame
+    /// video/audio metadata is withheld without discarding the media; inspect
+    /// [`crate::FrameMetadataStatus`] instead. Text a peer advertises through a Discovery Server is
     /// decoded lossily instead.
     #[error("Invalid UTF-8 string in data: {0}")]
     InvalidUtf8(String),
@@ -179,13 +180,16 @@ pub enum Error {
     ///
     /// * A frame the SDK delivered (video, audio, metadata or a compressed
     ///   packet) fails validation: its dimensions, format, strides, sizes or
-    ///   pointers are inconsistent, or its metadata has no terminator within
-    ///   the limit.
+    ///   pointers are inconsistent, or a standalone metadata frame has no
+    ///   terminator within the limit.
     /// * A frame, packet or buffer being built, converted or sent does not
     ///   match its format: a buffer is too small, a dimension, stride or rate
     ///   is out of range, or a format cannot be used for the operation. This
     ///   includes a compressed frame the SDK would discard instead of
     ///   delivering it.
+    ///
+    /// Unreadable optional video/audio metadata is withheld instead of failing
+    /// capture; [`crate::FrameMetadataStatus`] reports its condition.
     ///
     /// A value that describes no one frame, such as a compressed video format
     /// or an allocation, AV sync, clock or remote-control value of the

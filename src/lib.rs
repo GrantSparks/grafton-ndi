@@ -105,9 +105,10 @@ pub use {
     finder::{Finder, FinderOptions, Source, SourceAddress, SourceCache},
     frames::{
         AudioChannels, AudioFormat, AudioFrame, AudioFrameBuilder, AudioFrameRef, AudioLayout,
-        AudioSource, BorrowedAudioFrame, BorrowedAudioFrameBuilder, FormatCategory, MetadataFrame,
-        MetadataFrameRef, MetadataSource, PixelFormat, PixelFormatInfo, ScanType, VideoFrame,
-        VideoFrameBuilder, VideoFrameRef, VideoPlane, VideoPlanes, VideoRows, VideoSource,
+        AudioSource, BorrowedAudioFrame, BorrowedAudioFrameBuilder, FormatCategory,
+        FrameMetadataStatus, MetadataFrame, MetadataFrameRef, MetadataSource, PixelFormat,
+        PixelFormatInfo, ScanType, VideoFrame, VideoFrameBuilder, VideoFrameRef, VideoPlane,
+        VideoPlanes, VideoRows, VideoSource,
     },
     framesync::{
         AudioInputFormat, FrameSync, FrameSyncAudioRef, FrameSyncAudioRequest, FrameSyncCapture,

@@ -748,7 +748,8 @@ impl FrameSync {
     ///
     /// Returns [`Error::InvalidFrame`] when the SDK returned an unsupported
     /// format or malformed frame descriptor, including invalid dimensions,
-    /// stride, buffers, or metadata.
+    /// stride, or buffers. Unreadable per-frame metadata is withheld; inspect
+    /// [`VideoSource::metadata_status`](crate::VideoSource::metadata_status).
     pub fn capture_video_ref(&self, scan_type: ScanType) -> Result<Option<FrameSyncVideoRef<'_>>> {
         FrameSyncCapture {
             resource: &self.resource,
@@ -834,7 +835,8 @@ impl FrameSync {
     /// # Errors
     ///
     /// Returns frame-validation errors only if the SDK returns malformed audio
-    /// dimensions, sample layout, buffers, or metadata. A capture before any
+    /// dimensions, sample layout, or buffers. Unreadable per-frame metadata is
+    /// withheld; inspect [`AudioSource::metadata_status`](crate::AudioSource::metadata_status). A capture before any
     /// audio has arrived is not an error. Request dimensions were already
     /// validated at construction.
     ///
@@ -1383,7 +1385,7 @@ mod tests {
     }
 
     #[test]
-    fn test_framesync_video_ref_rejects_malformed_metadata() {
+    fn test_framesync_video_ref_withholds_malformed_metadata() {
         let width = 16;
         let height = 8;
         let stride = width * 4;
@@ -1410,10 +1412,13 @@ mod tests {
 
         let guard =
             unsafe { Guard::<FrameSyncVideoFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        assert!(matches!(
-            unsafe { FrameSyncVideoRef::new(guard) },
-            Err(Error::InvalidFrame(_))
-        ));
+        let frame = unsafe { FrameSyncVideoRef::new(guard) }.unwrap();
+        assert_eq!(frame.metadata(), None);
+        assert_eq!(
+            frame.metadata_status(),
+            crate::FrameMetadataStatus::Unterminated
+        );
+        assert_eq!(frame.to_owned().metadata(), None);
     }
 
     #[test]
@@ -1576,7 +1581,7 @@ mod tests {
     }
 
     #[test]
-    fn test_framesync_audio_ref_rejects_invalid_utf8_metadata() {
+    fn test_framesync_audio_ref_withholds_invalid_utf8_metadata() {
         let no_samples = 4;
         let no_channels = 2;
         let mut data = vec![0.0f32; (no_samples * no_channels) as usize];
@@ -1598,9 +1603,9 @@ mod tests {
 
         let guard =
             unsafe { Guard::<FrameSyncAudioFree>::with_test_free(ptr::null_mut(), raw, |_, _| {}) };
-        assert!(matches!(
-            unsafe { FrameSyncAudioRef::new(guard) },
-            Err(Error::InvalidUtf8(_))
-        ));
+        let frame = unsafe { FrameSyncAudioRef::new(guard) }.unwrap();
+        assert_eq!(frame.metadata(), None);
+        assert_eq!(frame.metadata_status(), crate::FrameMetadataStatus::NotUtf8);
+        assert_eq!(frame.to_owned().metadata(), None);
     }
 }

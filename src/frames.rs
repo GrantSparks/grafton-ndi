@@ -690,6 +690,15 @@ pub(crate) unsafe trait VideoParts {
     /// The validated metadata text, or `None` when the frame has none.
     fn metadata_text(&self) -> Option<MetadataText<'_>>;
 
+    /// The cached receive status, or the presence of validated sending text.
+    fn metadata_state(&self) -> FrameMetadataStatus {
+        if self.metadata_text().is_some() {
+            FrameMetadataStatus::Text
+        } else {
+            FrameMetadataStatus::Absent
+        }
+    }
+
     /// The time the sender submitted the frame, when it is known.
     fn sdk_timestamp(&self) -> Option<SdkTimestamp>;
 
@@ -850,8 +859,14 @@ pub trait VideoSource: VideoParts {
     }
 
     /// UTF-8 frame metadata; an explicit empty string differs from no metadata.
+    /// Unreadable received text is withheld; inspect [`Self::metadata_status`].
     fn metadata(&self) -> Option<&str> {
         self.metadata_text().map(MetadataText::as_str)
+    }
+
+    /// Whether per-frame metadata is absent, readable, or withheld as unreadable.
+    fn metadata_status(&self) -> FrameMetadataStatus {
+        self.metadata_state()
     }
 
     /// Read the frame's `ndi_color_info` description without copying metadata.
@@ -1070,11 +1085,21 @@ macro_rules! video_accessors {
             /// Get frame metadata as UTF-8 text, if present.
             ///
             /// Empty metadata, `Some("")`, is distinct from none, `None`.
+            /// Unreadable received text returns `None`; use
+            /// [`Self::metadata_status`] to distinguish it from absent text.
             #[inline]
             pub fn metadata(&self) -> Option<&str> {
                 $crate::frames::VideoParts::metadata_text(self)
                     .map($crate::frames::MetadataText::as_str)
             }
+
+            /// The metadata's presence or the reason unreadable received text
+            /// was withheld. Querying the cached status allocates nothing.
+            #[inline]
+            pub fn metadata_status(&self) -> $crate::FrameMetadataStatus {
+                $crate::frames::VideoParts::metadata_state(self)
+            }
+
 
             /// Read the color description in the frame's `ndi_color_info`
             /// metadata.
@@ -1858,6 +1883,15 @@ pub(crate) unsafe trait AudioParts {
     /// The validated metadata text, or `None` when the frame has none.
     fn metadata_text(&self) -> Option<MetadataText<'_>>;
 
+    /// The cached receive status, or the presence of validated sending text.
+    fn metadata_state(&self) -> FrameMetadataStatus {
+        if self.metadata_text().is_some() {
+            FrameMetadataStatus::Text
+        } else {
+            FrameMetadataStatus::Absent
+        }
+    }
+
     /// Borrow the original validated channel stride, samples and metadata.
     fn audio_descriptor(&self) -> NDIlib_audio_frame_v3_t {
         let layout = self.layout();
@@ -1988,8 +2022,14 @@ pub trait AudioSource: AudioParts {
     }
 
     /// UTF-8 metadata; an explicit empty string differs from no metadata.
+    /// Unreadable received text is withheld; inspect [`Self::metadata_status`].
     fn metadata(&self) -> Option<&str> {
         self.metadata_text().map(MetadataText::as_str)
+    }
+
+    /// Whether per-frame metadata is absent, readable, or withheld as unreadable.
+    fn metadata_status(&self) -> FrameMetadataStatus {
+        self.metadata_state()
     }
 
     /// One channel's initialized samples, excluding any inter-channel padding.
@@ -2323,10 +2363,20 @@ macro_rules! audio_accessors {
             /// Get frame metadata as UTF-8 text, if present.
             ///
             /// Empty metadata, `Some("")`, is distinct from none, `None`.
+            /// Unreadable received text returns `None`; use
+            /// [`Self::metadata_status`] to distinguish it from absent text.
             #[inline]
             pub fn metadata(&self) -> Option<&str> {
                 AudioParts::metadata_text(self).map(MetadataText::as_str)
             }
+
+            /// The metadata's presence or the reason unreadable received text
+            /// was withheld. Querying the cached status allocates nothing.
+            #[inline]
+            pub fn metadata_status(&self) -> crate::FrameMetadataStatus {
+                AudioParts::metadata_state(self)
+            }
+
 
             /// Get one channel's samples, or `None` for an invalid channel.
             ///
@@ -3222,6 +3272,96 @@ fn metadata_len_to_i32(len_with_nul: usize) -> Result<i32> {
             "Metadata length {len_with_nul} exceeds SDK i32 range"
         ))
     })
+}
+
+/// The state of optional per-frame metadata attached to video or audio.
+///
+/// Unreadable metadata does not discard otherwise valid media. Its text is
+/// withheld from [`VideoSource::metadata`] and [`AudioSource::metadata`], from
+/// forwarding descriptors, and from owned copies. Owned frames contain only
+/// valid text, so a copy of unreadable metadata has [`Self::Absent`] status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum FrameMetadataStatus {
+    /// No per-frame metadata pointer was supplied.
+    Absent,
+    /// Valid UTF-8 text, including an explicitly empty string.
+    Text,
+    /// A terminated string contained bytes that are not UTF-8.
+    NotUtf8,
+    /// No NUL terminator appeared within the 4 MiB metadata cap.
+    Unterminated,
+}
+
+/// Cached validation of one optional per-frame metadata pointer.
+/// Private fields prevent a caller from forging a validated text length.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FrameMetadataState {
+    status: FrameMetadataStatus,
+    len_with_nul: usize,
+}
+
+impl FrameMetadataState {
+    /// Scan once without allocation, retaining media when its side text is bad.
+    ///
+    /// # Safety
+    ///
+    /// A non-null pointer must be readable through its first NUL or the
+    /// metadata cap, whichever comes first.
+    pub(crate) unsafe fn scan(pointer: *const c_char) -> Self {
+        if pointer.is_null() {
+            return Self::from_text(None);
+        }
+        // SAFETY: the caller guarantees the bounded readable extent.
+        let Some(bytes) = (unsafe { bounded_sdk_text(pointer, MAX_METADATA_BYTES) }) else {
+            return Self {
+                status: FrameMetadataStatus::Unterminated,
+                len_with_nul: 0,
+            };
+        };
+        Self {
+            status: if str::from_utf8(bytes).is_ok() {
+                FrameMetadataStatus::Text
+            } else {
+                FrameMetadataStatus::NotUtf8
+            },
+            len_with_nul: bytes.len() + 1,
+        }
+    }
+
+    /// Cache text that was already validated, including standalone metadata.
+    pub(crate) fn from_text(text: Option<MetadataText<'_>>) -> Self {
+        Self {
+            status: if text.is_some() {
+                FrameMetadataStatus::Text
+            } else {
+                FrameMetadataStatus::Absent
+            },
+            len_with_nul: text.map_or(0, MetadataText::len_with_nul),
+        }
+    }
+
+    pub(crate) const fn status(self) -> FrameMetadataStatus {
+        self.status
+    }
+
+    /// Reborrow validated text without rescanning it.
+    ///
+    /// # Safety
+    ///
+    /// `pointer` must name the same bytes used to construct this state, live
+    /// and unchanged for `'a`. This includes the measured terminal NUL.
+    pub(crate) unsafe fn text<'a>(self, pointer: *const c_char) -> Option<MetadataText<'a>> {
+        if self.status != FrameMetadataStatus::Text {
+            return None;
+        }
+        // SAFETY: construction validated UTF-8 and the terminator; the caller
+        // keeps those same bytes live and unchanged for the returned borrow.
+        let with_nul = unsafe {
+            str::from_utf8_unchecked(slice::from_raw_parts(pointer.cast(), self.len_with_nul))
+        };
+        Some(MetadataText { with_nul })
+    }
 }
 
 /// Owned video/audio per-frame metadata.
@@ -4502,8 +4642,7 @@ impl<D: SdkDescriptor> HoldsDescriptor for &D {
 }
 
 /// An SDK frame validated as a whole: the holder `F` of its descriptor, what
-/// was validated from that descriptor, `V`, and the length of its metadata
-/// text.
+/// was validated from that descriptor, `V`, and its cached metadata state.
 ///
 /// Only the validation functions construct one, each from the one descriptor
 /// its holder holds: [`ValidatedVideo::video`], [`ValidatedAudio::audio`],
@@ -4520,9 +4659,8 @@ impl<D: SdkDescriptor> HoldsDescriptor for &D {
 pub(crate) struct ValidatedFrame<F, V> {
     frame: F,
     validated: V,
-    /// The length of the metadata text, terminator included, or `None` for
-    /// none.
-    text_len_with_nul: Option<usize>,
+    /// Text length when valid, or the reason optional metadata was withheld.
+    metadata_state: FrameMetadataState,
 }
 
 /// A video frame validated with its layout and header.
@@ -4546,9 +4684,10 @@ impl<F: HoldsDescriptor, V> ValidatedFrame<F, V> {
     /// descriptor for as long as it lives.
     unsafe fn with_frame_metadata(frame: F, validated: V) -> Result<Self> {
         // SAFETY: forwarded to the caller.
-        let text = unsafe { validate_frame_metadata(frame.descriptor().metadata_pointer())? };
+        let metadata_state =
+            unsafe { FrameMetadataState::scan(frame.descriptor().metadata_pointer()) };
         Ok(Self {
-            text_len_with_nul: text.map(MetadataText::len_with_nul),
+            metadata_state,
             frame,
             validated,
         })
@@ -4561,16 +4700,12 @@ impl<F: HoldsDescriptor, V> ValidatedFrame<F, V> {
 
     /// The validated metadata text, or `None` when the frame has none.
     pub(crate) fn metadata(&self) -> Option<MetadataText<'_>> {
-        let len_with_nul = self.text_len_with_nul?;
-        let data = self.descriptor().metadata_pointer().cast::<u8>();
-        // SAFETY: a validation function measured `len_with_nul` bytes of
-        // text at this descriptor's metadata pointer, which `frame` holds
-        // unchanged: UTF-8 whose only NUL is its last byte, within the cap.
-        // The function's caller keeps those bytes live and unchanged until
-        // `frame` is dropped, and the text borrows `self`, which holds it.
-        let with_nul =
-            unsafe { str::from_utf8_unchecked(slice::from_raw_parts(data, len_with_nul)) };
-        Some(MetadataText { with_nul })
+        // SAFETY: construction scanned this descriptor's pointer; the holder
+        // keeps the same bytes allocated and unchanged for this borrow.
+        unsafe {
+            self.metadata_state
+                .text(self.descriptor().metadata_pointer())
+        }
     }
 }
 
@@ -4644,7 +4779,7 @@ impl<F: HoldsDescriptor<Descriptor = NDIlib_metadata_frame_t>> ValidatedMetadata
         // SAFETY: forwarded to the caller.
         let text = unsafe { validate_metadata_layout(frame.descriptor())? };
         Ok(Self {
-            text_len_with_nul: text.map(MetadataText::len_with_nul),
+            metadata_state: FrameMetadataState::from_text(text),
             frame,
             validated: (),
         })
@@ -4674,6 +4809,10 @@ unsafe impl<F: HoldsDescriptor<Descriptor = NDIlib_video_frame_v2_t>> VideoParts
     fn metadata_text(&self) -> Option<MetadataText<'_>> {
         self.metadata()
     }
+    fn metadata_state(&self) -> FrameMetadataStatus {
+        self.metadata_state.status()
+    }
+
     #[inline]
     fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
         SdkTimestamp::from_sdk(self.descriptor().timestamp)
@@ -4706,6 +4845,9 @@ unsafe impl<F: HoldsDescriptor<Descriptor = NDIlib_audio_frame_v3_t>> AudioParts
     #[inline]
     fn metadata_text(&self) -> Option<MetadataText<'_>> {
         self.metadata()
+    }
+    fn metadata_state(&self) -> FrameMetadataStatus {
+        self.metadata_state.status()
     }
 }
 
@@ -5020,6 +5162,10 @@ unsafe impl<S: FrameFree<RawFrame = NDIlib_video_frame_v2_t>> VideoParts for Vid
     fn metadata_text(&self) -> Option<MetadataText<'_>> {
         self.frame.metadata()
     }
+    fn metadata_state(&self) -> FrameMetadataStatus {
+        self.frame.metadata_state.status()
+    }
+
     #[inline]
     fn sdk_timestamp(&self) -> Option<SdkTimestamp> {
         self.frame.sdk_timestamp()
@@ -5176,6 +5322,9 @@ unsafe impl<S: FrameFree<RawFrame = NDIlib_audio_frame_v3_t>> AudioParts for Aud
     #[inline]
     fn metadata_text(&self) -> Option<MetadataText<'_>> {
         self.frame.metadata()
+    }
+    fn metadata_state(&self) -> FrameMetadataStatus {
+        self.frame.metadata_state.status()
     }
 }
 
@@ -8095,7 +8244,7 @@ mod tests {
     }
 
     #[test]
-    fn test_owned_video_from_raw_rejects_malformed_frame_metadata() {
+    fn test_owned_video_from_raw_omits_malformed_frame_metadata() {
         let width = 16;
         let height = 8;
         let stride = width * 4;
@@ -8120,17 +8269,17 @@ mod tests {
             timestamp: 0,
         };
 
-        assert!(matches!(
-            unsafe { VideoFrame::from_raw(&raw) },
-            Err(Error::InvalidFrame(_))
-        ));
+        let frame = unsafe { VideoFrame::from_raw(&raw) }.unwrap();
+        assert_eq!(frame.metadata(), None);
+        assert_eq!(frame.data(), data);
+        assert!(frame.to_raw().p_metadata.is_null());
 
         metadata[0] = 0xFF;
         metadata[1] = 0;
-        assert!(matches!(
-            unsafe { VideoFrame::from_raw(&raw) },
-            Err(Error::InvalidUtf8(_))
-        ));
+        let frame = unsafe { VideoFrame::from_raw(&raw) }.unwrap();
+        assert_eq!(frame.metadata(), None);
+        assert_eq!(frame.data(), data);
+        assert!(frame.to_raw().p_metadata.is_null());
     }
 
     #[test]
@@ -9906,3 +10055,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "frames/metadata_tests.rs"]
+mod metadata_tests;
