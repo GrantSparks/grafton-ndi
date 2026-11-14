@@ -295,7 +295,8 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     }
 
     /// Report the current touch points, each an `[x, y]` fraction of the
-    /// source's screen. An empty slice lifts every touch.
+    /// source's screen. An empty slice sends the same lift as
+    /// [`finish_touch`](Self::finish_touch).
     ///
     /// # Errors
     ///
@@ -303,6 +304,9 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     /// there are more points than the SDK can count, and
     /// [`Error::NativeOperationFailed`] when the SDK did not send them.
     pub fn touch(&mut self, _points: &[[f32; 2]]) -> Result<()> {
+        if _points.is_empty() {
+            return self.finish_touch();
+        }
         native!(Kvm, self.kvm => {
             let count = i32::try_from(_points.len()).map_err(|_| {
                 invalid_input(format!(
@@ -320,7 +324,7 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
                 count,
                 _points.as_ptr().cast()
             )?;
-            self.touching = !_points.is_empty();
+            self.touching = true;
             Ok(())
         })
     }

@@ -1926,6 +1926,54 @@ fn exchange_metadata<M: SenderMode>(ndi: &Ndi, sender: &Sender<M>, kind: &str) -
     receiver
 }
 
+#[test]
+fn kvm_empty_touch_and_cleanup_send_the_explicit_finish_message() {
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let sender = Sender::new(&ndi, &options("kvm-touch-finish")).unwrap();
+    let mut receiver = exchange_metadata(&ndi, &sender, "kvm-touch-finish");
+    // Drain incidental connection messages before comparing messages from
+    // the same connection. The native KVM encoding is deliberately opaque.
+    while sender.capture_metadata(Duration::ZERO).unwrap().is_some() {}
+    let next_kvm = || {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            assert!(Instant::now() < deadline, "KVM message was not delivered");
+            if let Some(frame) = sender.capture_metadata(SLICE).unwrap() {
+                if frame.data().starts_with("<ndi_kvm ") {
+                    return frame.data().to_owned();
+                }
+            }
+        }
+    };
+    let mut session = receiver.kvm().unwrap();
+    session.finish_touch().unwrap();
+    let finish = next_kvm();
+    // The SDK owns the opaque wire encoding. Some released Linux libraries
+    // leave bytes in the touch header uninitialized, even for consecutive
+    // explicit finish calls. Check delivery and payload length here;
+    // deterministic boundary tests assert the exact function called. Byte
+    // equality cannot establish equivalence on those native libraries.
+    session.finish_touch().unwrap();
+    let other_finish = next_kvm();
+    let assert_finish = |message: String| {
+        assert_eq!(message.len(), finish.len());
+        assert_eq!(other_finish.len(), finish.len());
+    };
+    session.touch(&[]).unwrap();
+    assert_finish(next_kvm());
+    session.touch(&[[0.25, 0.5]]).unwrap();
+    assert_ne!(next_kvm(), finish);
+    session.release_all().unwrap();
+    assert_finish(next_kvm());
+    session.touch(&[[0.25, 0.5]]).unwrap();
+    assert_ne!(next_kvm(), finish);
+    drop(session);
+    assert_finish(next_kvm());
+}
+
 /// The sender a `CompressedSender` or a `QueuedSender` lends exchanges
 /// metadata with its receivers as an ordinary one does, and a queued source
 /// carries uncompressed audio beside the video it queues.
