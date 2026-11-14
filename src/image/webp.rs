@@ -1,7 +1,7 @@
 //! WebP from one buffer of the whole image: lossless through `image-webp`,
 //! lossy through the scalar Rust port of libwebp, `libwebpop`.
 
-use std::{borrow::Cow, io::Write};
+use std::io::Write;
 
 use super::Pixels;
 use crate::{Error, Result};
@@ -20,17 +20,18 @@ pub(super) fn encode_lossless(
     pixels: &mut Pixels<'_, u8>,
     channels: usize,
     out: &mut dyn Write,
+    scratch: &mut Vec<u8>,
 ) -> Result<()> {
     let (width, height) = (to_u32(pixels.width()), to_u32(pixels.height()));
     let encoder = image_webp::WebPEncoder::new(out);
-    let image = image(pixels, channels);
+    let image = image_with(pixels, channels, scratch)?;
     let color = if channels == 4 {
         image_webp::ColorType::Rgba8
     } else {
         image_webp::ColorType::Rgb8
     };
     encoder
-        .encode(&image, width, height, color)
+        .encode(image, width, height, color)
         .map_err(|error| match error {
             image_webp::EncodingError::IoError(error) => Error::Io(error),
             error => Error::InvalidFrame(format!("WebP encoding failed: {error}")),
@@ -45,11 +46,12 @@ pub(super) fn encode_lossy(
     quality: u8,
     effort: u8,
     sharp_yuv: bool,
+    scratch: &mut Vec<u8>,
 ) -> Result<Vec<u8>> {
     use libwebpop::{OpConfig, OpImage, OpQuality};
 
     let (width, height) = (to_u32(pixels.width()), to_u32(pixels.height()));
-    let image = image(pixels, 4);
+    let image = image_with(pixels, 4, scratch)?;
     let mut config = OpConfig::new(OpQuality::Lossy {
         quality: f32::from(quality),
         alpha_quality: 100,
@@ -58,7 +60,7 @@ pub(super) fn encode_lossy(
     config.method = effort;
     libwebpop::encode(
         OpImage::Rgba {
-            pixels: &image,
+            pixels: image,
             width,
             height,
             stride: width as usize * 4,
@@ -68,23 +70,37 @@ pub(super) fn encode_lossy(
     .map_err(|error| Error::InvalidFrame(format!("WebP encoding failed: {error}")))
 }
 
-/// Borrow contiguous RGBA when eligible; otherwise convert active rows only.
-pub(super) fn image<'a>(pixels: &mut Pixels<'a, u8>, channels: usize) -> Cow<'a, [u8]> {
-    match pixels.rgba_rows().and_then(|plane| plane.data()) {
-        Some(data) => Cow::Borrowed(data),
-        None => Cow::Owned(image_buffer(pixels, channels)),
+/// Borrow only initialized active pixels; otherwise reuse a converted image.
+pub(super) fn image_with<'s, 'a: 's>(
+    pixels: &mut Pixels<'a, u8>,
+    channels: usize,
+    scratch: &'s mut Vec<u8>,
+) -> Result<&'s [u8]> {
+    if let Some(data) = pixels.rgba_rows().and_then(|plane| plane.data()) {
+        return Ok(data);
     }
-}
-
-/// The whole converted image, `channels` bytes a pixel: exactly width ×
-/// height × channels bytes.
-fn image_buffer(pixels: &mut Pixels<'_, u8>, channels: usize) -> Vec<u8> {
+    let len = super::packed_len(pixels.width(), pixels.height(), channels)?;
+    super::resize_scratch(scratch, len)?;
     let row_len = pixels.width() * channels;
-    let mut image = vec![0; row_len * pixels.height()];
-    for (y, row) in image.chunks_exact_mut(row_len).enumerate() {
+    for (y, row) in scratch.chunks_exact_mut(row_len).enumerate() {
         pixels.pack_row(y, channels, row);
     }
-    image
+    Ok(scratch)
+}
+
+#[cfg(test)]
+pub(super) fn image<'a>(
+    pixels: &mut Pixels<'a, u8>,
+    channels: usize,
+) -> std::borrow::Cow<'a, [u8]> {
+    match pixels.rgba_rows().and_then(|plane| plane.data()) {
+        Some(data) => std::borrow::Cow::Borrowed(data),
+        None => {
+            let mut scratch = Vec::new();
+            image_with(pixels, channels, &mut scratch).unwrap();
+            std::borrow::Cow::Owned(scratch)
+        }
+    }
 }
 
 /// A WebP dimension, which the plan checked against the codec's limit.

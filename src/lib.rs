@@ -136,8 +136,8 @@ pub use time::{SdkTimestamp, Timecode};
 
 #[cfg(feature = "image-encoding")]
 pub use image::{
-    AlphaMode, ColorPolicy, Downscale, HdrPolicy, ImageFormat, ImageOptions, PngCompression,
-    SampleDepth, YuvRange,
+    AlphaMode, ColorPolicy, Downscale, HdrPolicy, ImageFormat, ImageOptions, ImageWorkspace,
+    PngCompression, SampleDepth, YuvRange,
 };
 
 /// Alias for Result with our Error type

@@ -23,12 +23,25 @@ pub(super) struct Downscaler<P: Sample> {
 impl<P: Sample> Downscaler<P> {
     /// A reduction of `reader` by 2 to the power `shift`. With
     /// `reader.has_alpha()`, color is weighted by alpha.
+    #[cfg(test)]
     pub(super) fn new(reader: &Reader<'_, P>, shift: u32) -> Self {
         Self {
             shift,
             weighted: reader.has_alpha(),
             sums: vec![Default::default(); reduced(reader.width(), shift)],
         }
+    }
+
+    pub(super) fn with_sums(reader: &Reader<'_, P>, shift: u32, sums: Vec<[P::Sum; 4]>) -> Self {
+        Self {
+            shift,
+            weighted: reader.has_alpha(),
+            sums,
+        }
+    }
+
+    pub(super) fn into_sums(self) -> Vec<[P::Sum; 4]> {
+        self.sums
     }
 
     /// log2 of the factor.

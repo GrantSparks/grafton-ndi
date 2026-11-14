@@ -17,9 +17,10 @@ pub(super) fn encode<P: Sample>(
     compression: PngCompression,
     cicp: Option<[u8; 4]>,
     out: &mut dyn Write,
+    row: &mut Vec<u8>,
 ) -> Result<()> {
     let mut out = KeepError { out, error: None };
-    let result = write(pixels, channels, compression, cicp, &mut out);
+    let result = write(pixels, channels, compression, cicp, &mut out, row);
     match out.error {
         Some(error) if result.is_err() => Err(Error::Io(error)),
         _ => result,
@@ -32,6 +33,7 @@ fn write<P: Sample>(
     compression: PngCompression,
     cicp: Option<[u8; 4]>,
     out: &mut KeepError<'_>,
+    row: &mut Vec<u8>,
 ) -> Result<()> {
     let (width, height) = (pixels.width(), pixels.height());
     let mut encoder = ::png::Encoder::new(out, to_u32(width), to_u32(height));
@@ -65,10 +67,10 @@ fn write<P: Sample>(
                 stream.write_all(row)?;
             }
         } else {
-            let mut row = row_buffer::<P>(width, channels);
+            super::resize_scratch(row, super::packed_len(width, 1, channels * P::BYTES)?)?;
             for y in 0..height {
-                pixels.pack_row(y, channels, &mut row);
-                stream.write_all(&row)?;
+                pixels.pack_row(y, channels, row);
+                stream.write_all(row)?;
             }
         }
         stream.finish().map_err(png_error)?;
@@ -109,6 +111,7 @@ impl Write for KeepError<'_> {
 }
 
 /// The one row of scratch a converted PNG needs.
+#[cfg(test)]
 pub(super) fn row_buffer<P: Sample>(width: usize, channels: usize) -> Vec<u8> {
     vec![0; width * channels * P::BYTES]
 }

@@ -56,6 +56,101 @@ impl<'a> Source<'a> {
     }
 }
 
+/// Reusable conversion storage for still-image encoding.
+///
+/// Keeps one PNG row, WebP's complete converted image, and downscale sums
+/// at each sample depth. Capacity grows to the largest encode and remains
+/// retained until [`release`](Self::release) or drop. Each concurrent worker
+/// needs its own workspace. Codec state and encoded output are not retained;
+/// lossy WebP still allocates its complete encoded result in the backend.
+/// Eligible RGBA input is borrowed without populating conversion scratch.
+#[derive(Debug, Default)]
+pub struct ImageWorkspace {
+    row: Vec<u8>,
+    image: Vec<u8>,
+    sums8: Vec<[u32; 4]>,
+    sums16: Vec<[u64; 4]>,
+}
+
+impl ImageWorkspace {
+    /// Create an empty workspace without allocating.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bytes retained in wrapper scratch, excluding source, codec and output.
+    pub fn retained_bytes(&self) -> usize {
+        self.row.capacity()
+            + self.image.capacity()
+            + self.sums8.capacity() * std::mem::size_of::<[u32; 4]>()
+            + self.sums16.capacity() * std::mem::size_of::<[u64; 4]>()
+    }
+
+    /// Release all retained scratch. The workspace remains usable.
+    pub fn release(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Encode a frame into a newly allocated result, reusing conversion scratch.
+    ///
+    /// Uses the same options, validation and errors as `frame.encode_image`.
+    /// All frame types implementing [`crate::VideoSource`] are accepted.
+    pub fn encode<F: crate::VideoSource + ?Sized>(
+        &mut self,
+        frame: &F,
+        options: &ImageOptions,
+    ) -> Result<Vec<u8>> {
+        self.encode_source(Source::new(frame), options)
+    }
+
+    /// Encode into a writer, reusing conversion scratch. A cleared `Vec<u8>`
+    /// also reuses output capacity. Lossy WebP buffers its complete result
+    /// before writing; other codecs write incrementally. Validation happens
+    /// before writing; a codec/writer failure may leave partial output.
+    ///
+    /// ```
+    /// use grafton_ndi::{ImageWorkspace, ImageOptions, ImageFormat, PixelFormat, VideoFrame};
+    /// let frame = VideoFrame::builder().resolution(2, 2)
+    ///     .pixel_format(PixelFormat::Bgra).data(vec![255; 16]).build()?;
+    /// let mut workspace = ImageWorkspace::new();
+    /// let mut output = Vec::new();
+    /// for _ in 0..3 {
+    ///     output.clear();
+    ///     workspace.encode_to(&frame, &ImageOptions::new(ImageFormat::WebpLossless), &mut output)?;
+    /// }
+    /// workspace.release();
+    /// # Ok::<(), grafton_ndi::Error>(())
+    /// ```
+    pub fn encode_to<F: crate::VideoSource + ?Sized, W: Write>(
+        &mut self,
+        frame: &F,
+        options: &ImageOptions,
+        mut out: W,
+    ) -> Result<()> {
+        let source = Source::new(frame);
+        let plan = Plan::new(&source, options)?;
+        write_image(&source, plan, &mut out, self)
+    }
+
+    fn encode_source(&mut self, source: Source<'_>, options: &ImageOptions) -> Result<Vec<u8>> {
+        let plan = Plan::new(&source, options)?;
+        // Preserve the backend's output buffer: no second lossy WebP copy.
+        if let Codec::WebpLossy {
+            quality,
+            effort,
+            sharp_yuv,
+        } = plan.codec
+        {
+            return plan.with_pixels::<u8, _>(&source, &mut self.sums8, |pixels| {
+                webp::encode_lossy(pixels, quality, effort, sharp_yuv, &mut self.image)
+            });
+        }
+        let mut image = Vec::new();
+        write_image(&source, plan, &mut image, self)?;
+        Ok(image)
+    }
+}
+
 /// Encode `source` as `options` describes into `out`.
 pub(crate) fn encode_to(
     source: Source<'_>,
@@ -63,67 +158,79 @@ pub(crate) fn encode_to(
     out: &mut dyn Write,
 ) -> Result<()> {
     let plan = Plan::new(&source, options)?;
-    write_image(&source, plan, out)
+    write_image(&source, plan, out, &mut ImageWorkspace::new())
 }
 
-/// Write a validated image. Lossy WebP buffers its output; the other codecs
-/// write as they encode.
-fn write_image(source: &Source<'_>, plan: Plan, out: &mut dyn Write) -> Result<()> {
+fn write_image(
+    source: &Source<'_>,
+    plan: Plan,
+    out: &mut dyn Write,
+    workspace: &mut ImageWorkspace,
+) -> Result<()> {
     match plan.codec {
-        Codec::Png {
-            depth: SampleDepth::Eight,
-            compression,
-            cicp,
-        } => png::encode(
-            &mut plan.pixels::<u8>(source),
-            plan.channels(),
-            compression,
-            cicp,
-            out,
-        ),
         Codec::Png {
             depth: SampleDepth::Sixteen,
             compression,
             cicp,
-        } => png::encode(
-            &mut plan.pixels::<u16>(source),
-            plan.channels(),
-            compression,
-            cicp,
-            out,
-        ),
-        Codec::Jpeg { quality } => jpeg::encode(&mut plan.pixels::<u8>(source), quality, out),
-        Codec::WebpLossless => {
-            webp::encode_lossless(&mut plan.pixels::<u8>(source), plan.channels(), out)
-        }
-        Codec::WebpLossy {
-            quality,
-            effort,
-            sharp_yuv,
-        } => {
-            let image =
-                webp::encode_lossy(&mut plan.pixels::<u8>(source), quality, effort, sharp_yuv)?;
-            out.write_all(&image).map_err(Error::Io)
-        }
+        } => plan.with_pixels::<u16, _>(source, &mut workspace.sums16, |pixels| {
+            png::encode(
+                pixels,
+                plan.channels(),
+                compression,
+                cicp,
+                out,
+                &mut workspace.row,
+            )
+        }),
+        codec => plan.with_pixels::<u8, _>(source, &mut workspace.sums8, |pixels| match codec {
+            Codec::Png {
+                compression, cicp, ..
+            } => png::encode(
+                pixels,
+                plan.channels(),
+                compression,
+                cicp,
+                out,
+                &mut workspace.row,
+            ),
+            Codec::Jpeg { quality } => jpeg::encode(pixels, quality, out),
+            Codec::WebpLossless => {
+                webp::encode_lossless(pixels, plan.channels(), out, &mut workspace.image)
+            }
+            Codec::WebpLossy {
+                quality,
+                effort,
+                sharp_yuv,
+            } => {
+                let image =
+                    webp::encode_lossy(pixels, quality, effort, sharp_yuv, &mut workspace.image)?;
+                out.write_all(&image).map_err(Error::Io)
+            }
+        }),
     }
 }
 
 /// Encode `source` into a new buffer.
 pub(crate) fn encode(source: Source<'_>, options: &ImageOptions) -> Result<Vec<u8>> {
-    let plan = Plan::new(&source, options)?;
-    // Take the backend's complete buffer directly, avoiding a second output
-    // allocation and copy for Vec and data URL callers.
-    if let Codec::WebpLossy {
-        quality,
-        effort,
-        sharp_yuv,
-    } = plan.codec
-    {
-        return webp::encode_lossy(&mut plan.pixels::<u8>(&source), quality, effort, sharp_yuv);
-    }
-    let mut image = Vec::new();
-    write_image(&source, plan, &mut image)?;
-    Ok(image)
+    ImageWorkspace::new().encode_source(source, options)
+}
+
+/// Resize only after checked geometry; retain capacity between encodes.
+fn resize_scratch<T: Default + Clone>(scratch: &mut Vec<T>, len: usize) -> Result<()> {
+    scratch
+        .try_reserve_exact(len.saturating_sub(scratch.len()))
+        .map_err(|error| {
+            Error::InvalidFrame(format!("image scratch allocation failed: {error}"))
+        })?;
+    scratch.resize(len, T::default());
+    Ok(())
+}
+
+fn packed_len(width: usize, height: usize, channels: usize) -> Result<usize> {
+    width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(channels))
+        .ok_or_else(|| Error::InvalidFrame("image scratch size overflow".into()))
 }
 
 /// Encode `source` as a base64 data URL, allocated at its exact final
@@ -287,7 +394,36 @@ impl Plan {
         }
     }
 
-    /// The pixel pipeline for `source`.
+    /// Lend the retained sums to a single encode, restoring them even when
+    /// the codec or writer returns an error. A panic may drop scratch but
+    /// leaves the workspace valid for reuse.
+    fn with_pixels<P: Sample, T>(
+        &self,
+        source: &Source<'_>,
+        sums: &mut Vec<[P::Sum; 4]>,
+        encode: impl FnOnce(&mut Pixels<'_, P>) -> Result<T>,
+    ) -> Result<T> {
+        let reader = Reader::new(source, self.matrix, self.range, self.alpha);
+        let downscaler = if self.shift > 0 {
+            resize_scratch(sums, reduced(reader.width(), self.shift))?;
+            Some(Downscaler::with_sums(
+                &reader,
+                self.shift,
+                std::mem::take(sums),
+            ))
+        } else {
+            None
+        };
+        let mut pixels = Pixels { reader, downscaler };
+        let result = encode(&mut pixels);
+        if let Some(downscaler) = pixels.downscaler {
+            *sums = downscaler.into_sums();
+        }
+        result
+    }
+
+    /// The pixel pipeline for tests of individual conversion stages.
+    #[cfg(test)]
     fn pixels<'a, P: Sample>(&self, source: &Source<'a>) -> Pixels<'a, P> {
         let reader = Reader::new(source, self.matrix, self.range, self.alpha);
         let downscaler = (self.shift > 0).then(|| Downscaler::new(&reader, self.shift));

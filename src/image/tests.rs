@@ -799,7 +799,7 @@ fn every_frame_type_encodes_the_same_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// The four RGB formats keep 2.0's bytes
+// PNG and the scalar JPEG backend keep 2.0's bytes
 // ---------------------------------------------------------------------------
 
 /// SHA-256 of grafton-ndi 2.0's output for the RGB formats, recorded from the
@@ -1962,6 +1962,157 @@ fn reduced_images_are_the_block_averages_of_the_full_image() {
 // Memory
 // ---------------------------------------------------------------------------
 
+#[test]
+fn workspace_reuses_conversion_capacity_across_formats_sizes_and_failures() {
+    let mut workspace = crate::ImageWorkspace::new();
+    assert_eq!(workspace.retained_bytes(), 0);
+    for (width, height, seed) in [(34, 18, 7), (18, 6, 89), (2, 2, 42)] {
+        for format in PixelFormat::ALL {
+            let bytes = any_frame_bytes(format, width, height, seed);
+            let frame = padded(format, width as u32, height as u32, &bytes, 16);
+            for options in every_output() {
+                let expected = frame.encode_image(&options).unwrap();
+                assert_eq!(workspace.encode(&frame, &options).unwrap(), expected);
+                let mut output = Vec::new();
+                workspace.encode_to(&frame, &options, &mut output).unwrap();
+                assert_eq!(output, expected, "{format:?} {options:?}");
+                let error = workspace
+                    .encode_to(
+                        &frame,
+                        &options,
+                        Recorder {
+                            written: 0,
+                            fail_after: Some(0),
+                        },
+                    )
+                    .unwrap_err();
+                assert!(matches!(error, Error::Io(_)));
+                assert_eq!(workspace.encode(&frame, &options).unwrap(), expected);
+            }
+        }
+    }
+    assert!(workspace.retained_bytes() > 0);
+    let frame = VideoFrame::builder()
+        .resolution(2, 2)
+        .data(vec![255; 16])
+        .build()
+        .unwrap();
+    let mut output = Vec::new();
+    assert!(workspace
+        .encode_to(&frame, &options(ImageFormat::Jpeg(0)), &mut output)
+        .is_err());
+    assert!(output.is_empty());
+    workspace.release();
+    assert_eq!(workspace.retained_bytes(), 0);
+    assert_eq!(
+        workspace
+            .encode(&frame, &options(ImageFormat::Png))
+            .unwrap(),
+        frame.encode_png().unwrap()
+    );
+}
+
+#[test]
+fn warm_workspace_conversion_does_not_allocate() {
+    use crate::test_alloc::allocation_count;
+    let mut workspace = crate::ImageWorkspace::new();
+    for format in PixelFormat::ALL {
+        for (width, height) in [(34, 18), (18, 6), (2, 2)] {
+            let bytes = any_frame_bytes(format, width, height, 23);
+            let frame = padded(format, width as u32, height as u32, &bytes, 16);
+            let source = Source::new(&frame);
+            for reduction in [
+                Downscale::Off,
+                Downscale::Half,
+                Downscale::Quarter,
+                Downscale::Eighth,
+            ] {
+                for alpha in [AlphaMode::Keep, AlphaMode::Discard] {
+                    for depth in [SampleDepth::Eight, SampleDepth::Sixteen] {
+                        let options = options(ImageFormat::Png)
+                            .depth(depth)
+                            .alpha(alpha)
+                            .downscale(reduction);
+                        let plan = Plan::new(&source, &options).unwrap();
+                        macro_rules! convert {
+                            ($sample:ty, $sums:ident) => {
+                                plan.with_pixels::<$sample, _>(
+                                    &source,
+                                    &mut workspace.$sums,
+                                    |pixels| {
+                                        super::resize_scratch(
+                                            &mut workspace.row,
+                                            pixels.width()
+                                                * plan.channels()
+                                                * std::mem::size_of::<$sample>(),
+                                        )?;
+                                        for y in 0..pixels.height() {
+                                            pixels.pack_row(y, plan.channels(), &mut workspace.row);
+                                        }
+                                        Ok(())
+                                    },
+                                )
+                                .unwrap()
+                            };
+                        }
+                        if depth == SampleDepth::Eight {
+                            convert!(u8, sums8);
+                        } else {
+                            convert!(u16, sums16);
+                        }
+                        let (_, allocations) = allocation_count(|| {
+                            if depth == SampleDepth::Eight {
+                                convert!(u8, sums8);
+                            } else {
+                                convert!(u16, sums16);
+                            }
+                        });
+                        assert_eq!(allocations, 0, "{format:?} {options:?}");
+                    }
+                    for codec in [ImageFormat::WebpLossless, ImageFormat::WebpLossy(75)] {
+                        let options = options(codec).alpha(alpha).downscale(reduction);
+                        let plan = Plan::new(&source, &options).unwrap();
+                        let channels = if codec == ImageFormat::WebpLossless {
+                            plan.channels()
+                        } else {
+                            4
+                        };
+                        let mut convert = || {
+                            plan.with_pixels::<u8, _>(&source, &mut workspace.sums8, |pixels| {
+                                webp::image_with(pixels, channels, &mut workspace.image)?;
+                                Ok(())
+                            })
+                            .unwrap()
+                        };
+                        convert();
+                        let (_, allocations) = allocation_count(convert);
+                        assert_eq!(allocations, 0, "{format:?} {options:?}");
+                    }
+                }
+            }
+        }
+    }
+    workspace.release();
+    let rgba = VideoFrame::builder()
+        .resolution(2, 2)
+        .pixel_format(PixelFormat::Rgba)
+        .data(vec![255; 16])
+        .build()
+        .unwrap();
+    for format in [
+        ImageFormat::Png,
+        ImageFormat::WebpLossless,
+        ImageFormat::WebpLossy(75),
+    ] {
+        workspace.encode(&rgba, &options(format)).unwrap();
+        assert_eq!(
+            workspace.retained_bytes(),
+            0,
+            "eligible RGBA should still be borrowed"
+        );
+    }
+}
+
 /// Conversion allocates at most one output row, never in proportion to the
 /// frame's height, apart from WebP's one buffer of exactly the image.
 #[test]
@@ -2093,6 +2244,66 @@ fn conversion_scratch_is_bounded_and_webp_holds_exactly_the_image() {
                     }
                 });
                 assert_eq!(allocations, 0, "{format:?} {height} {options:?}");
+            }
+        }
+    }
+}
+
+/// Public workspace/convenience comparison. The warmed scratch predates peak
+/// tracking and is reported separately; RSS includes the entire test process.
+#[test]
+#[ignore = "manual workspace allocations, retained memory and public encode timing"]
+fn workspace_resources() {
+    use crate::test_alloc::{allocation_count, peak_bytes};
+    use std::{hint::black_box, time::Instant};
+    let rss = || {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("VmRSS:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|s| s.parse::<usize>().ok())
+            })
+            .unwrap_or(0)
+    };
+    for (width, height) in [(1920, 1080), (3840, 2160)] {
+        let rgba = content_rgba("photographic", width, height, None);
+        let frame = padded(PixelFormat::Bgra, width as u32, height as u32, &rgba, 16);
+        for (name, options) in [
+            (
+                "png",
+                options(ImageFormat::Png).png_compression(PngCompression::Fast),
+            ),
+            ("webp", options(ImageFormat::WebpLossless)),
+            (
+                "webp-quarter",
+                options(ImageFormat::WebpLossless).downscale(Downscale::Quarter),
+            ),
+            (
+                "webp-lossy-fast",
+                options(ImageFormat::WebpLossy(75))
+                    .webp_effort(0)
+                    .webp_sharp_yuv(false),
+            ),
+        ] {
+            for warm in [false, true] {
+                let mut workspace = crate::ImageWorkspace::new();
+                black_box(workspace.encode(&frame, &options).unwrap());
+                for sample in 0..3 {
+                    if !warm {
+                        workspace.release();
+                    }
+                    let retained_before = workspace.retained_bytes();
+                    let rss_before = rss();
+                    let start = Instant::now();
+                    let ((image, allocations), peak) = peak_bytes(|| {
+                        allocation_count(|| workspace.encode(&frame, &options).unwrap())
+                    });
+                    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("workspace,{width},{height},{name},{warm},{sample},{elapsed:.6},{allocations},{peak},{retained_before},{},{},{},{rss_before},{}", workspace.retained_bytes(), frame.data().len(), image.len(), rss());
+                    black_box(image);
+                }
             }
         }
     }
