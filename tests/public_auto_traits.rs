@@ -269,6 +269,7 @@ fn advanced_types_keep_their_auto_traits() {
         AvSyncAttached: Send, Sync, UnwindSafe, RefUnwindSafe;
         AvSyncOutcome: Send, Sync, UnwindSafe, RefUnwindSafe;
         AvSyncRequest: Send, Sync, UnwindSafe, RefUnwindSafe;
+        AvSyncVideo<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
         ClockSource: Send, Sync, UnwindSafe, RefUnwindSafe;
         CompletedVideo: Send, Sync, UnwindSafe, RefUnwindSafe;
         CompressedAudioFrame: Send, Sync, UnwindSafe, RefUnwindSafe;

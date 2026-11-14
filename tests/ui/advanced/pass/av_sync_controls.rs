@@ -1,8 +1,9 @@
 // The Receiver an AvSync lends, in the AvSyncAttached mode, keeps its video
 // and metadata capture, its events and every common control, and a frame
-// captured through it is synchronized in place, without a copy.
+// captured through it is synchronized in place, without a copy, once it is
+// known to carry its sender's timestamp.
 use grafton_ndi::{
-    advanced::{AvSync, AvSyncAttached, AvSyncOutcome, AvSyncRequest},
+    advanced::{AvSync, AvSyncAttached, AvSyncOutcome, AvSyncRequest, AvSyncVideo},
     MediaTypes, MetadataFrame, MetadataMode, Receiver, ReceiverMode, Source, StreamTier, Tally,
     VideoMode,
 };
@@ -37,17 +38,23 @@ fn zero_copy(sync: &AvSync) -> grafton_ndi::Result<()> {
         .video()
         .capture_ref(Duration::from_millis(100))?
     {
+        let Some(stamped) = AvSyncVideo::new(&video) else {
+            continue;
+        };
         if let AvSyncOutcome::Audio { frame, .. } =
-            sync.synchronize(Some(&video), AvSyncRequest::automatic())?
+            sync.synchronize(stamped, AvSyncRequest::automatic())?
         {
-            let _ = (video.width(), frame.num_samples());
+            let _ = (video.width(), frame.num_samples(), stamped.timestamp());
         }
     }
-    // An owned frame, and no frame at all, are taken as well.
+    // An owned copy of a captured frame keeps its timestamp, and the queued
+    // audio is taken without a frame.
     if let Some(owned) = sync.receiver().video().capture(Duration::ZERO)? {
-        let _ = sync.synchronize(Some(&owned), AvSyncRequest::automatic())?;
+        if let Some(stamped) = AvSyncVideo::new(&owned) {
+            let _ = sync.synchronize(stamped, AvSyncRequest::automatic())?;
+        }
     }
-    let _ = sync.synchronize(None, AvSyncRequest::automatic())?;
+    let _ = sync.queued_audio(AvSyncRequest::automatic())?;
     Ok(())
 }
 fn exclusive(sync: &mut AvSync) {
@@ -63,7 +70,7 @@ fn scoped(sync: &AvSync) {
             let _ = receiver.metadata().capture(Duration::ZERO);
             let _ = receiver.reconnect();
         });
-        let _ = sync.synchronize(None, AvSyncRequest::automatic());
+        let _ = sync.queued_audio(AvSyncRequest::automatic());
     });
 }
 fn main() {

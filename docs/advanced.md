@@ -173,8 +173,11 @@ explicit process-lifetime opt-in and padded-stride policy.
 
 `AvSync` matches audio to a captured video's timestamp. It owns the receiver
 and reserves audio capture; capture video through `sync.receiver()`, then pass
-the borrowed or owned video to `synchronize`. `AvSyncRequest::automatic()` lets
-the SDK choose audio shape. `AvSyncOutcome` distinguishes audio, no matching
+it to `synchronize` as an `AvSyncVideo`. `AvSyncVideo::new` accepts a borrowed
+capture or an owned copy of one, and returns `None` for a frame without its
+sender's timestamp, such as one the application built. `queued_audio` takes
+the queued audio without a frame. `AvSyncRequest::automatic()` lets the SDK
+choose audio shape. `AvSyncOutcome` distinguishes audio, no matching
 samples, format changes and absent audio; SDK internal failures return
 `Error::NativeOperationFailed`, unknown codes `Error::UnexpectedSdkResult`.
 These successful absence outcomes do not prove recent reception; use the

@@ -1,5 +1,5 @@
 use grafton_ndi::{
-    advanced::{AllocatedReceiver, AvSync, AvSyncRequest, MouseButton},
+    advanced::{AllocatedReceiver, AvSync, AvSyncRequest, AvSyncVideo, MouseButton},
     FrameSync, FrameSyncAudioRequest, MediaTypes, Result, ScanType, StreamTier, Tally,
 };
 
@@ -38,7 +38,9 @@ fn avsync(sync: &mut AvSync) -> Result<()> {
         .video()
         .capture_ref(std::time::Duration::ZERO)?;
     if let Some(video) = &video {
-        let _ = capture.synchronize(Some(video), AvSyncRequest::automatic())?;
+        if let Some(stamped) = AvSyncVideo::new(video) {
+            let _ = capture.synchronize(stamped, AvSyncRequest::automatic())?;
+        }
     }
     session.release_all()?;
     drop(video);

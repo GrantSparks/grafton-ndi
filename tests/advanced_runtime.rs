@@ -1991,6 +1991,11 @@ enum Pass {
     Nothing,
 }
 
+/// A frame the runtime delivered, which carries its sender's timestamp.
+fn stamped<F: AvSyncFrame>(frame: &F) -> AvSyncVideo<'_> {
+    AvSyncVideo::new(frame).expect("a received frame carries its sender's timestamp")
+}
+
 /// Ask `sync` for audio, once for each video frame that arrives, until it has
 /// returned audio `count` times, passing along what `pass` says.
 fn synchronized_audio(
@@ -2018,9 +2023,9 @@ fn synchronized_audio(
         };
         videos += 1;
         let outcome = match pass {
-            Pass::Captured => sync.synchronize(Some(&video), request),
-            Pass::Owned => sync.synchronize(Some(&video.to_owned()), request),
-            Pass::Nothing => sync.synchronize(None, request),
+            Pass::Captured => sync.synchronize(stamped(&video), request),
+            Pass::Owned => sync.synchronize(stamped(&video.to_owned()), request),
+            Pass::Nothing => sync.queued_audio(request),
         };
         match outcome.unwrap() {
             AvSyncOutcome::Audio {
@@ -2161,7 +2166,7 @@ fn avsync_returns_the_audio_that_belongs_to_a_video_frame() {
             .unwrap()
             .expect("a frame within the wait");
         assert!(matches!(
-            sync.synchronize(Some(&frame), request).unwrap(),
+            sync.synchronize(stamped(&frame), request).unwrap(),
             AvSyncOutcome::FormatChanged {
                 sample_rate: 48_000,
                 num_channels: 2
@@ -2746,7 +2751,7 @@ fn avsync_follows_source_format_changes_and_preserves_audio_samples() {
                 videos += 1;
                 of_format += usize::from(video.width() == width);
                 if let AvSyncOutcome::Audio { frame, .. } = sync
-                    .synchronize(Some(&video), AvSyncRequest::automatic())
+                    .synchronize(stamped(&video), AvSyncRequest::automatic())
                     .unwrap()
                 {
                     audio += 1;

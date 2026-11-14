@@ -17,7 +17,7 @@
 use std::{env, time::Duration};
 
 use grafton_ndi::{
-    advanced::{AvSync, AvSyncOutcome, AvSyncRequest},
+    advanced::{AvSync, AvSyncOutcome, AvSyncRequest, AvSyncVideo},
     Error, Ndi, Receiver, ReceiverEvent, ReceiverOptions, RuntimeOptions, SdkEdition, Tally,
 };
 
@@ -64,7 +64,13 @@ fn main() -> Result<(), Error> {
             println!("No video yet...");
             continue;
         };
-        match sync.synchronize(Some(&video), AvSyncRequest::automatic())? {
+        // Audio is matched to the time the sender stamped on the frame. The
+        // SDK leaves a frame unstamped when it does not know that time.
+        let Some(stamped) = AvSyncVideo::new(&video) else {
+            println!("This frame carries no timestamp to match audio to");
+            continue;
+        };
+        match sync.synchronize(stamped, AvSyncRequest::automatic())? {
             AvSyncOutcome::Audio { frame, .. } => println!(
                 "{}x{} video with {} audio samples at {} Hz",
                 video.width(),

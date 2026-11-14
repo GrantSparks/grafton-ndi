@@ -21,6 +21,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   of `&Receiver<M>`. Compatible capture and shared controls remain available;
   connection changes require successful input release and session termination.
   The unrestricted accessor is removed across raw and attached KVM entry paths.
+- `AvSync::synchronize` takes an `AvSyncVideo`, which only a frame carrying
+  its sender's timestamp can become, because audio is matched to that
+  timestamp. Frames the application builds have none and are refused when the
+  `AvSyncVideo` is made. `queued_audio` replaces `synchronize(None, ..)`.
 - `NDI` becomes `Ndi`. Pixel formats, color formats and other enum variants use
   Rust casing. Options have private fields, chainable setters and `new`
   constructors in place of separate options builders.

@@ -13,8 +13,8 @@ use crate::{
         advanced::{native, AvSync as AvSyncTable, Genlock as GenlockTable},
         bindings::*,
     },
-    AudioFrame, FrameRate, Ndi, Receiver, Rejected, Result, ScanType, Source, VideoFrame,
-    VideoFrameRef,
+    AudioFrame, FrameRate, Ndi, Receiver, Rejected, Result, ScanType, SdkTimestamp, Source,
+    VideoFrame, VideoFrameRef,
 };
 
 use super::descriptors;
@@ -187,7 +187,9 @@ impl Drop for AvResource {
 /// The synchronizer takes over the receiver's audio, so it owns the receiver:
 /// capture video through [`receiver`](Self::receiver), then ask
 /// [`synchronize`](Self::synchronize) for the audio that belongs to each
-/// frame, passing the frame as it was captured, without copying it.
+/// frame. It matches audio to the frame's timestamp, so the frame is given
+/// as an [`AvSyncVideo`], which only a frame with a timestamp can be; the
+/// frame is read as it was captured, without copying it.
 /// [`into_receiver`](Self::into_receiver) returns the receiver.
 ///
 /// The receiver is lent in the [`AvSyncAttached`] mode, with its video and
@@ -212,7 +214,7 @@ impl Drop for AvResource {
 /// ```no_run
 /// use std::time::Duration;
 /// use grafton_ndi::{
-///     advanced::{AvSync, AvSyncOutcome, AvSyncRequest},
+///     advanced::{AvSync, AvSyncOutcome, AvSyncRequest, AvSyncVideo},
 ///     Receiver, ReceiverOptions, Source, Ndi,
 /// };
 ///
@@ -223,11 +225,14 @@ impl Drop for AvResource {
 /// let sync = AvSync::new(receiver)?;
 ///
 /// // The frame stays in the SDK's buffer: nothing is copied.
-/// if let Some(video) = sync.receiver().video().capture_ref(Duration::from_secs(1))? {
-///     if let AvSyncOutcome::Audio { frame, .. } =
-///         sync.synchronize(Some(&video), AvSyncRequest::automatic())?
-///     {
-///         println!("{} samples belong to this frame", frame.num_samples());
+/// if let Some(captured) = sync.receiver().video().capture_ref(Duration::from_secs(1))? {
+///     // A captured frame has its sender's timestamp when the SDK knows it.
+///     if let Some(video) = AvSyncVideo::new(&captured) {
+///         if let AvSyncOutcome::Audio { frame, .. } =
+///             sync.synchronize(video, AvSyncRequest::automatic())?
+///         {
+///             println!("{} samples belong to this frame", frame.num_samples());
+///         }
 ///     }
 /// }
 /// # Ok(())
@@ -292,8 +297,9 @@ impl AvSync {
     /// connecting, reconnecting and source-name changes.
     ///
     /// A video frame captured through it can be handed to
-    /// [`synchronize`](Self::synchronize) as it is. Its own audio capture
-    /// does not exist in this mode, because the synchronizer takes the audio:
+    /// [`synchronize`](Self::synchronize) as it is, through [`AvSyncVideo`].
+    /// Its own audio capture does not exist in this mode, because the
+    /// synchronizer takes the audio:
     ///
     /// ```compile_fail,E0277
     /// use grafton_ndi::advanced::AvSync;
@@ -345,14 +351,16 @@ impl AvSync {
         receiver.into_mode()
     }
 
-    /// Fetch the audio that belongs to `video`, or with `None` whatever audio
-    /// is currently queued.
+    /// Fetch the audio that belongs to `video`.
     ///
-    /// The frame is read in place: a [`VideoFrameRef`] captured through
-    /// [`receiver`](Self::receiver) is handed to the SDK as the SDK delivered
-    /// it, and an owned [`VideoFrame`] as it is, so no pixels are copied.
-    /// One call makes one native request: a changed format or missing audio
-    /// is reported, never retried or converted.
+    /// The audio is matched to the frame's timestamp, which [`AvSyncVideo`]
+    /// guarantees the frame has; [`queued_audio`](Self::queued_audio) takes
+    /// the queued audio without a frame. The frame is read in place: a
+    /// [`VideoFrameRef`] captured through [`receiver`](Self::receiver) is
+    /// handed to the SDK as the SDK delivered it, and an owned copy of one as
+    /// it is, so no pixels are copied. One call makes one native request: a
+    /// changed format or missing audio is reported, never retried or
+    /// converted.
     ///
     /// One call synchronizes at a time, on the thread that holds this
     /// `AvSync`, which is not `Sync`. Other threads may meanwhile capture
@@ -371,14 +379,32 @@ impl AvSync {
     /// not positive.
     pub fn synchronize(
         &self,
-        video: Option<&dyn AvSyncVideo>,
+        video: AvSyncVideo<'_>,
         request: AvSyncRequest,
     ) -> Result<AvSyncOutcome> {
+        self.capture().synchronize(video, request)
+    }
+
+    /// Fetch whatever audio is currently queued, matched to no video frame.
+    ///
+    /// With [`AvSyncRequest::automatic`] this takes all the queued audio;
+    /// with a sample count, that many samples. Otherwise as for
+    /// [`synchronize`](Self::synchronize).
+    ///
+    /// # Errors
+    ///
+    /// As for [`synchronize`](Self::synchronize).
+    pub fn queued_audio(&self, request: AvSyncRequest) -> Result<AvSyncOutcome> {
+        self.capture().queued_audio(request)
+    }
+
+    /// The synchronization view of this owner, which `&self` keeps on its
+    /// thread for as long as it is borrowed.
+    fn capture(&self) -> AvSyncCapture<'_> {
         AvSyncCapture {
             resource: &self.resource,
             _thread: PhantomData,
         }
-        .synchronize(video, request)
     }
 }
 
@@ -404,13 +430,33 @@ impl AvSyncCapture<'_> {
     /// As for [`AvSync::synchronize`].
     pub fn synchronize(
         &self,
-        _video: Option<&dyn AvSyncVideo>,
+        video: AvSyncVideo<'_>,
+        request: AvSyncRequest,
+    ) -> Result<AvSyncOutcome> {
+        self.request(Some(video), request)
+    }
+
+    /// Fetch the queued audio; see [`AvSync::queued_audio`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`AvSync::synchronize`].
+    pub fn queued_audio(&self, request: AvSyncRequest) -> Result<AvSyncOutcome> {
+        self.request(None, request)
+    }
+
+    /// One native synchronization: for `video`, or with `None` for the
+    /// queued audio.
+    fn request(
+        &self,
+        _video: Option<AvSyncVideo<'_>>,
         _request: AvSyncRequest,
     ) -> Result<AvSyncOutcome> {
         native!(AvSync, self.resource.table => {
             // A copy of the frame's descriptor, pointing into the frame's own
-            // buffers, which the borrow keeps allocated for the call.
-            let video = _video.map(video_sealed::Sealed::descriptor);
+            // buffers, which the borrow keeps allocated for the call, and
+            // carrying the timestamp `AvSyncVideo::new` checked.
+            let video = _video.map(|video| video.descriptor());
             let AvResource { handle, table } = *self.resource;
             let mut returned = Returned {
                 audio: _request.raw(),
@@ -556,37 +602,126 @@ unsafe fn outcome(status: Synchronized, audio: &NDIlib_audio_frame_v3_t) -> Resu
 }
 
 mod video_sealed {
-    use crate::sys::bindings::NDIlib_video_frame_v2_t;
+    use crate::{sys::bindings::NDIlib_video_frame_v2_t, SdkTimestamp};
 
-    pub trait Sealed {
+    /// What [`AvSyncVideo`](super::AvSyncVideo) reads from a frame. The
+    /// supertraits let a borrowed frame cross threads as the frame itself can.
+    pub trait Sealed: Sync + std::panic::RefUnwindSafe {
         /// A copy of the frame's SDK descriptor, which points into buffers
         /// that the borrow of `self` keeps allocated and unchanged.
         fn descriptor(&self) -> NDIlib_video_frame_v2_t;
+
+        /// The time the frame's sender submitted it, when known.
+        fn receive_timestamp(&self) -> Option<SdkTimestamp>;
     }
 }
 
-/// A video frame that [`AvSync::synchronize`] reads in place, without copying
-/// its pixels: an owned [`VideoFrame`], or a [`VideoFrameRef`] captured from a
-/// receiver, such as the one [`AvSync::receiver`] lends.
+/// A video frame [`AvSyncVideo::new`] accepts: a [`VideoFrameRef`] captured
+/// from a receiver, such as the one [`AvSync::receiver`] lends, or an owned
+/// [`VideoFrame`].
 ///
 /// The trait is sealed; those two are the only video frames it covers.
-pub trait AvSyncVideo: video_sealed::Sealed {}
+pub trait AvSyncFrame: video_sealed::Sealed {}
 
 impl video_sealed::Sealed for VideoFrame {
     fn descriptor(&self) -> NDIlib_video_frame_v2_t {
         self.to_raw()
     }
+
+    fn receive_timestamp(&self) -> Option<SdkTimestamp> {
+        self.timestamp()
+    }
 }
 
-impl AvSyncVideo for VideoFrame {}
+impl AvSyncFrame for VideoFrame {}
 
 impl video_sealed::Sealed for VideoFrameRef<'_> {
     fn descriptor(&self) -> NDIlib_video_frame_v2_t {
         *self.raw()
     }
+
+    fn receive_timestamp(&self) -> Option<SdkTimestamp> {
+        self.timestamp()
+    }
 }
 
-impl AvSyncVideo for VideoFrameRef<'_> {}
+impl AvSyncFrame for VideoFrameRef<'_> {}
+
+/// A video frame that carries the time its sender submitted it: what
+/// [`AvSync::synchronize`] matches audio to.
+///
+/// AV sync selects the audio whose timestamps belong to a video frame's
+/// timestamp (Advanced SDK manual, 25.6.1), so a frame without one gives it
+/// nothing to match. [`new`](Self::new) checks the timestamp once, and only
+/// this type is accepted, so synchronization is never given a frame without
+/// one. A frame captured from a receiver carries its sender's timestamp when
+/// the SDK knows it, and an owned copy keeps it. A frame the application
+/// builds has none.
+///
+/// The value borrows the frame, whose pixels the SDK reads in place: making
+/// it copies nothing and makes no SDK call. Like the frames it borrows, it is
+/// `Send` and `Sync`.
+///
+/// # Examples
+///
+/// ```
+/// use grafton_ndi::{advanced::AvSyncVideo, VideoFrame};
+///
+/// # fn main() -> Result<(), grafton_ndi::Error> {
+/// // A frame the application builds was never sent, so it has no timestamp.
+/// let built = VideoFrame::builder().resolution(64, 32).build()?;
+/// assert!(AvSyncVideo::new(&built).is_none());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Copy)]
+pub struct AvSyncVideo<'a> {
+    // The borrow is held in every build, so the type has the same lifetime
+    // and auto traits in all of them; only the native synchronization reads
+    // the frame, and a build without the AV sync declarations has none.
+    #[cfg_attr(
+        not(any(test, ndi_has_advanced_av_sync)),
+        expect(dead_code, reason = "only the native synchronization reads the frame")
+    )]
+    frame: &'a dyn video_sealed::Sealed,
+    timestamp: SdkTimestamp,
+}
+
+impl<'a> AvSyncVideo<'a> {
+    /// `frame`, when it carries the time its sender submitted it.
+    ///
+    /// Returns `None` for a frame without one: a frame the application
+    /// built, or a captured frame whose sender's timestamp the SDK did not
+    /// know.
+    pub fn new<F: AvSyncFrame>(frame: &'a F) -> Option<Self> {
+        Some(Self {
+            timestamp: frame.receive_timestamp()?,
+            frame,
+        })
+    }
+
+    /// The time the frame's sender submitted it.
+    pub fn timestamp(&self) -> SdkTimestamp {
+        self.timestamp
+    }
+
+    /// The frame's descriptor, carrying the timestamp [`Self::new`] checked.
+    #[cfg(any(test, ndi_has_advanced_av_sync))]
+    fn descriptor(&self) -> NDIlib_video_frame_v2_t {
+        NDIlib_video_frame_v2_t {
+            timestamp: self.timestamp.ticks(),
+            ..self.frame.descriptor()
+        }
+    }
+}
+
+impl std::fmt::Debug for AvSyncVideo<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AvSyncVideo")
+            .field("timestamp", &self.timestamp)
+            .finish_non_exhaustive()
+    }
+}
 
 /// What paced a completed [`VideoClock::wait`] or [`AudioClock::wait`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1029,6 +1164,64 @@ mod tests {
         let audio = audio_timing(48_000, 1600).unwrap();
         assert_eq!(audio.FourCC, planar_float);
         assert_eq!((audio.sample_rate, audio.no_samples), (48_000, 1600));
+    }
+
+    /// A captured 64x32 UYVY frame with `timestamp`, over `pixels`.
+    fn captured(pixels: &mut [u8], timestamp: i64) -> VideoFrameRef<'_> {
+        use crate::capture::{CaptureStrategy, Guard, VideoKind};
+        assert_eq!(pixels.len(), 128 * 32);
+        let raw = NDIlib_video_frame_v2_t {
+            xres: 64,
+            yres: 32,
+            FourCC: NDIlib_FourCC_video_type_e_NDIlib_FourCC_video_type_UYVY,
+            frame_rate_N: 30_000,
+            frame_rate_D: 1001,
+            frame_format_type: NDIlib_frame_format_type_e_NDIlib_frame_format_type_progressive,
+            p_data: pixels.as_mut_ptr(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: 128,
+            },
+            timestamp,
+            ..Default::default()
+        };
+        // SAFETY: `pixels` holds every row the descriptor describes and stays
+        // borrowed for as long as the frame; the synthetic free owns nothing.
+        unsafe { VideoKind::make_ref(Guard::with_test_free(ptr::null_mut(), raw, |_, _| {})) }
+            .unwrap()
+    }
+
+    /// Only a frame that carries its sender's timestamp can be synchronized,
+    /// and the SDK is handed that frame, read in place, with exactly the
+    /// timestamp that was checked.
+    #[test]
+    fn only_a_frame_with_a_timestamp_can_be_synchronized() {
+        let built = VideoFrame::builder().resolution(64, 32).build().unwrap();
+        assert!(AvSyncVideo::new(&built).is_none());
+
+        let mut unstamped = vec![16; 128 * 32];
+        let unstamped = captured(&mut unstamped, NDIlib_recv_timestamp_undefined);
+        assert!(AvSyncVideo::new(&unstamped).is_none());
+
+        let sent = 17_946_474_843_047_964;
+        let mut pixels = vec![16; 128 * 32];
+        let start = pixels.as_ptr();
+        let frame = captured(&mut pixels, sent);
+        let video = AvSyncVideo::new(&frame).unwrap();
+        assert_eq!(video.timestamp(), SdkTimestamp::from_ticks(sent));
+        let descriptor = video.descriptor();
+        assert_eq!(descriptor.timestamp, sent);
+        assert_eq!(descriptor.p_data.cast_const(), start);
+        assert!(format!("{video:?}").contains("timestamp"));
+
+        // An owned copy keeps the timestamp and is read in its own buffer.
+        let owned = frame.to_owned();
+        let video = AvSyncVideo::new(&owned).unwrap();
+        assert_eq!(video.timestamp(), SdkTimestamp::from_ticks(sent));
+        assert_eq!(video.descriptor().timestamp, sent);
+        assert_eq!(
+            video.descriptor().p_data.cast_const(),
+            owned.data().as_ptr()
+        );
     }
 
     /// Only `Sync` is withheld, which
