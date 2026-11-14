@@ -3,13 +3,15 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    ffi::c_void,
     sync::{
         atomic::{AtomicBool, Ordering},
         Condvar, Mutex,
     },
     time::Duration,
 };
+
+#[cfg(any(test, ndi_has_advanced_send_completion))]
+use std::ffi::c_void;
 
 use super::CompressedVideoFrame;
 use crate::{
@@ -78,6 +80,7 @@ impl QueueOptions {
         self
     }
 
+    #[cfg(any(test, ndi_has_advanced_send_completion))]
     fn validate(self) -> Result<Self> {
         if self.frames == 0
             || self.frames > 65_536
@@ -225,6 +228,7 @@ struct CallbackState {
 }
 
 impl CallbackState {
+    #[cfg(any(test, ndi_has_advanced_send_completion))]
     fn new(options: QueueOptions) -> Result<Box<Self>> {
         let options = options.validate()?;
         let unavailable =
@@ -265,6 +269,7 @@ impl CallbackState {
     /// frame the queue can hold before the callback was registered, while
     /// `try_submit` keeps the queue within that many. The entry is moved, so
     /// nothing is freed.
+    #[cfg(any(test, ndi_has_advanced_send_completion))]
     fn complete(&self, address: usize) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let State {
@@ -281,6 +286,7 @@ impl CallbackState {
 }
 /// The completion callback the SDK calls, on its own threads, when it has
 /// finished with an asynchronously sent frame.
+#[cfg(any(test, ndi_has_advanced_send_completion))]
 unsafe extern "C" fn completion(opaque: *mut c_void, frame: *const NDIlib_video_frame_v2_t) {
     if opaque.is_null() {
         return;
@@ -386,11 +392,13 @@ impl QueuedSender {
     /// [`Error::UnsupportedCapability`] without an Advanced runtime (or in a
     /// build without the Advanced SDK), [`Error::InvalidInput`] for
     /// limits outside their range, and the errors of [`Sender::new`].
-    pub fn new(ndi: &Ndi, options: &SenderOptions, limits: QueueOptions) -> Result<Self> {
+    pub fn new(ndi: &Ndi, _options: &SenderOptions, _limits: QueueOptions) -> Result<Self> {
         let table = ndi.table::<SendCompletion>()?;
-        let callback = CallbackState::new(limits)?;
-        let sender = Sender::open(ndi, options)?;
-        Ok(Self::install(sender, callback, table))
+        native!(SendCompletion, table => {
+            let callback = CallbackState::new(_limits)?;
+            let sender = Sender::open(ndi, _options)?;
+            Ok(Self::install(sender, callback, table))
+        })
     }
 
     /// Turn an existing sender into a queued one.
@@ -411,27 +419,29 @@ impl QueuedSender {
     /// value is dropped, when the completion state no longer exists).
     pub fn from_sender(
         sender: Sender,
-        limits: QueueOptions,
+        _limits: QueueOptions,
     ) -> std::result::Result<(Self, Option<VideoFrame>), Rejected<Sender>> {
-        let prepare = || {
-            let table = sender.runtime().table::<SendCompletion>()?;
-            Ok((table, CallbackState::new(limits)?))
-        };
-        let (table, callback) = match prepare() {
-            Ok(prepared) => prepared,
+        let table = match sender.runtime().table::<SendCompletion>() {
+            Ok(table) => table,
             Err(error) => return Err(Rejected::new(error, sender)),
         };
-        // The conversion takes the native sender only when no registration
-        // shares it, and retires the sender's asynchronous video pipeline.
-        match sender.into_attached() {
-            Ok((sender, earlier)) => Ok((Self::install(sender, callback, table), earlier)),
-            Err(sender) => Err(Rejected::new(
-                Error::InvalidInput(
-                    "queued conversion requires a sender without advertiser registrations".into(),
-                ),
-                sender,
-            )),
-        }
+        native!(SendCompletion, table => {
+            let callback = match CallbackState::new(_limits) {
+                Ok(callback) => callback,
+                Err(error) => return Err(Rejected::new(error, sender)),
+            };
+            // The conversion takes the native sender only when no registration
+            // shares it, and retires the sender's asynchronous video pipeline.
+            match sender.into_attached() {
+                Ok((sender, earlier)) => Ok((Self::install(sender, callback, table), earlier)),
+                Err(sender) => Err(Rejected::new(
+                    Error::InvalidInput(
+                        "queued conversion requires a sender without advertiser registrations".into(),
+                    ),
+                    sender,
+                )),
+            }
+        })
     }
 
     /// Register the completion callback before anything can be submitted.
@@ -439,6 +449,7 @@ impl QueuedSender {
     /// The sender's mode owns its native sender exclusively and has no
     /// asynchronous video pipeline, so nothing else is in flight on it: only
     /// the queue sends video on it from now on.
+    #[cfg(ndi_has_advanced_send_completion)]
     fn install(
         sender: Sender<QueueAttached>,
         callback: Box<CallbackState>,
@@ -449,13 +460,13 @@ impl QueuedSender {
         // SAFETY: the sender is live. The state is heap-allocated, the callback
         // only reads it through a shared reference, and the returned value
         // keeps it until after the sender has been destroyed.
-        native!(SendCompletion, table => unsafe {
+        unsafe {
             table.NDIlib_send_set_video_async_completion(
                 sender.native_instance(),
                 state.cast_mut().cast(),
                 Some(completion),
             )
-        });
+        };
         Self { sender, callback }
     }
 

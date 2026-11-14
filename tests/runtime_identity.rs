@@ -1,9 +1,14 @@
 //! Qualification must reject a different runtime even when it loads cleanly.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime);
 #[path = "support/fixture.rs"]
 mod fixture;
+#[path = "support/runtime_fixture.rs"]
+mod runtime_fixture;
 
 #[test]
 fn provisioned_identity_is_checked_in_the_process_that_loads_the_runtime() {
@@ -24,12 +29,13 @@ fn provisioned_identity_is_checked_in_the_process_that_loads_the_runtime() {
         ("libndi.so.6", "advanced")
     };
     let runtime = directory.path().join(name);
-    let fake = fixture::FakeRuntime::new().version("6.4.0.2");
-    let fake = if edition == "advanced" {
-        fake.with("fake_advanced")
-    } else {
-        fake
+    let mut fake = runtime_fixture::FakeRuntime {
+        version: Some("6.4.0.2"),
+        ..Default::default()
     };
+    if edition == "advanced" {
+        fake.cfgs.push("fake_advanced");
+    }
     fake.build(&runtime);
     let other = directory.path().join("other.so");
     std::fs::copy(&runtime, &other).unwrap();

@@ -1,11 +1,13 @@
 //! Test-owned native fixtures exercise ownership order without SDK discovery.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
-mod common;
-#[path = "support/fixture.rs"]
-mod fixture;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(policy, prerequisites);
+#[path = "support/runtime_fixture.rs"]
+mod runtime_fixture;
 
-use fixture::FakeRuntime;
 use grafton_ndi::{
     capabilities::{RuntimeFeature, SdkEdition},
     discovery::{
@@ -14,6 +16,7 @@ use grafton_ndi::{
     runtime::RuntimeOptions,
     Error, Ndi, Receiver, ReceiverOptions, Sender, SenderOptions, Source, VideoFrame,
 };
+use runtime_fixture::FakeRuntime;
 use std::{
     fs,
     io::Write,
@@ -25,11 +28,14 @@ use std::{
 /// Build a fake runtime whose senders, receivers and advertisers log their
 /// lifecycle. It reports the first version whose advertisers are usable.
 fn fixture(directory: &Path, advanced: bool) -> PathBuf {
-    let runtime = FakeRuntime::new().with("fake_objects").version("6.4.0.0");
+    let mut runtime = FakeRuntime {
+        cfgs: vec!["fake_objects"],
+        version: Some("6.4.0.0"),
+        ..Default::default()
+    };
     if advanced {
-        runtime
-            .with("fake_advanced")
-            .build(&directory.join("libndi_advanced.so"))
+        runtime.cfgs.push("fake_advanced");
+        runtime.build(&directory.join("libndi_advanced.so"))
     } else {
         runtime.build(&directory.join("libndi.so"))
     }

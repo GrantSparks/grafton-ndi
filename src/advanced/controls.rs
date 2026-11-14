@@ -2,17 +2,25 @@
 
 use std::{marker::PhantomData, time::Duration};
 
-use super::{invalid_input, KvmSession, VideoCodec, VideoPacketFormat};
+#[cfg(any(ndi_has_advanced_encoder_guidance, ndi_has_advanced_quality_planning))]
+use super::{invalid_input, VideoCodec};
+use super::{KvmSession, VideoPacketFormat};
+#[cfg(ndi_has_advanced_keyframe_demand)]
+use crate::sys::bindings::NDIlib_video_frame_v2_t;
+#[cfg(ndi_has_advanced_receiver_bandwidth_control)]
+use crate::sys::bindings::{
+    NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
+    NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest,
+};
+#[cfg(doc)]
+use crate::Error;
 use crate::{
-    sys::{
-        advanced::{
-            native, EncoderGuidance, KeyframeDemand, KeyframeRequest, QualityPlanning,
-            ReceiverBandwidthControl, ReceiverStreamControl, SenderTally,
-        },
-        bindings::*,
+    sys::advanced::{
+        native, EncoderGuidance, KeyframeDemand, KeyframeRequest, QualityPlanning,
+        ReceiverBandwidthControl, ReceiverStreamControl, SenderTally,
     },
-    Error, MediaTypes, Receiver, ReceiverMode, Result, Sender, SenderMode, SettingChange,
-    StreamTier, Tally,
+    MediaTypes, Receiver, ReceiverMode, Result, Sender, SenderMode, SettingChange, StreamTier,
+    Tally,
 };
 
 /// Exclusive controls for a receiver held by another resource.
@@ -89,15 +97,17 @@ impl<'a, M: ReceiverMode> ReceiverControls<'a, M> {
 /// Encoder guidance that `operation` returned, which `Processing.NDI.Advanced.h`
 /// describes as a size, a bit rate or a quality: a negative value breaks that
 /// contract.
+#[cfg(any(ndi_has_advanced_encoder_guidance, ndi_has_advanced_quality_planning))]
 fn guidance(value: i32, operation: &str) -> Result<u32> {
     u32::try_from(value)
-        .map_err(|_| Error::UnexpectedSdkResult(format!("{operation} returned {value}")))
+        .map_err(|_| crate::Error::UnexpectedSdkResult(format!("{operation} returned {value}")))
 }
 
 /// Refuse a format the quality factor does not apply to.
 ///
 /// `Processing.NDI.Advanced.h`: "If the frame passed in is not SpeedHQ then
 /// this will return a value of -1."
+#[cfg(any(ndi_has_advanced_encoder_guidance, ndi_has_advanced_quality_planning))]
 fn require_speedhq(format: VideoPacketFormat) -> Result<()> {
     match format.codec() {
         VideoCodec::SpeedHq420 | VideoCodec::SpeedHq422 | VideoCodec::SpeedHq422Alpha => Ok(()),
@@ -108,6 +118,7 @@ fn require_speedhq(format: VideoPacketFormat) -> Result<()> {
 }
 
 /// A null descriptor asks about any stream; otherwise the one `format` names.
+#[cfg(ndi_has_advanced_keyframe_demand)]
 fn stream(format: Option<&NDIlib_video_frame_v2_t>) -> *const NDIlib_video_frame_v2_t {
     format.map_or(std::ptr::null(), |format| format)
 }
@@ -122,17 +133,15 @@ impl<M: SenderMode> Sender<M> {
     ///
     /// [`Error::UnsupportedCapability`]
     /// without an Advanced runtime.
-    pub fn set_external_tally(&self, tally: Tally) -> Result<()> {
+    pub fn set_external_tally(&self, _tally: Tally) -> Result<()> {
         let table = self.runtime().table::<SenderTally>()?;
-        let tally = tally.to_sdk();
-        // `Processing.NDI.Advanced.h` describes this as control of the tally
-        // state, reflected downstream, and gives its flag no meaning, so it
-        // reports no failure.
-        // SAFETY: the sender instance is live for this borrow.
-        native!(SenderTally, table => unsafe {
-            table.NDIlib_send_set_tally(self.native_instance(), &tally)
-        });
-        Ok(())
+        native!(SenderTally, table => {
+            let tally = _tally.to_sdk();
+            // The SDK gives this control flag no failure meaning.
+            // SAFETY: the sender instance is live for this borrow.
+            unsafe { table.NDIlib_send_set_tally(self.native_instance(), &tally) };
+            Ok(())
+        })
     }
 
     /// The compressed frame size, in bytes, an encoder should aim for when
@@ -142,14 +151,16 @@ impl<M: SenderMode> Sender<M> {
     ///
     /// [`Error::UnsupportedCapability`] without an Advanced runtime, and
     /// [`Error::UnexpectedSdkResult`] when the SDK returns a negative size.
-    pub fn target_frame_bytes(&self, format: VideoPacketFormat) -> Result<u32> {
+    pub fn target_frame_bytes(&self, _format: VideoPacketFormat) -> Result<u32> {
         let table = self.runtime().table::<EncoderGuidance>()?;
-        let format = format.raw();
-        // SAFETY: the sender instance is live for this borrow.
-        let value = native!(EncoderGuidance, table => unsafe {
-            table.NDIlib_send_get_target_frame_size(self.native_instance(), &format)
-        });
-        guidance(value, "NDIlib_send_get_target_frame_size")
+        native!(EncoderGuidance, table => {
+            let format = _format.raw();
+            // SAFETY: the sender instance is live for this borrow.
+            let value = unsafe {
+                table.NDIlib_send_get_target_frame_size(self.native_instance(), &format)
+            };
+            guidance(value, "NDIlib_send_get_target_frame_size")
+        })
     }
 
     /// The bit rate, in bits per second, an encoder should aim for when
@@ -159,14 +170,16 @@ impl<M: SenderMode> Sender<M> {
     ///
     /// As for [`target_frame_bytes`](Self::target_frame_bytes), with a
     /// negative bit rate.
-    pub fn target_bit_rate(&self, format: VideoPacketFormat) -> Result<u32> {
+    pub fn target_bit_rate(&self, _format: VideoPacketFormat) -> Result<u32> {
         let table = self.runtime().table::<EncoderGuidance>()?;
-        let format = format.raw();
-        // SAFETY: the sender instance is live for this borrow.
-        let value = native!(EncoderGuidance, table => unsafe {
-            table.NDIlib_send_get_target_bit_rate(self.native_instance(), &format)
-        });
-        guidance(value, "NDIlib_send_get_target_bit_rate")
+        native!(EncoderGuidance, table => {
+            let format = _format.raw();
+            // SAFETY: the sender instance is live for this borrow.
+            let value = unsafe {
+                table.NDIlib_send_get_target_bit_rate(self.native_instance(), &format)
+            };
+            guidance(value, "NDIlib_send_get_target_bit_rate")
+        })
     }
 
     /// The SpeedHQ quality factor for `format`, as the original quality query
@@ -179,15 +192,15 @@ impl<M: SenderMode> Sender<M> {
     /// [`Error::InvalidInput`] when `format` is not SpeedHQ, and
     /// [`Error::UnexpectedSdkResult`] when the SDK returns a negative quality
     /// for one that is.
-    pub fn legacy_quality(&self, format: VideoPacketFormat) -> Result<u32> {
+    pub fn legacy_quality(&self, _format: VideoPacketFormat) -> Result<u32> {
         let table = self.runtime().table::<EncoderGuidance>()?;
-        require_speedhq(format)?;
-        let format = format.raw();
-        // SAFETY: the sender instance is live for this borrow.
-        let value = native!(EncoderGuidance, table => unsafe {
-            table.NDIlib_send_get_q_factor(self.native_instance(), &format)
-        });
-        guidance(value, "NDIlib_send_get_q_factor")
+        native!(EncoderGuidance, table => {
+            require_speedhq(_format)?;
+            let format = _format.raw();
+            // SAFETY: the sender instance is live for this borrow.
+            let value = unsafe { table.NDIlib_send_get_q_factor(self.native_instance(), &format) };
+            guidance(value, "NDIlib_send_get_q_factor")
+        })
     }
 
     /// The SpeedHQ quality for `format` and whether the connected receivers
@@ -199,34 +212,32 @@ impl<M: SenderMode> Sender<M> {
     /// As for [`legacy_quality`](Self::legacy_quality).
     pub fn quality_plan(
         &self,
-        format: VideoPacketFormat,
-        supports_new_format: bool,
+        _format: VideoPacketFormat,
+        _supports_new_format: bool,
     ) -> Result<QualityPlan> {
         let table = self.runtime().table::<QualityPlanning>()?;
-        require_speedhq(format)?;
-        let format = format.raw();
-        let mut short_dc = false;
-        // SAFETY: the sender instance is live for this borrow and `short_dc`
-        // is writable storage for the flag.
-        let value: i32 = native!(QualityPlanning, table => unsafe {
-            table.NDIlib_send_get_q_factor_v2(
-                self.native_instance(),
-                &format,
-                supports_new_format,
-                &mut short_dc,
-            )
-        });
-        let value = guidance(value, "NDIlib_send_get_q_factor_v2")?;
-        // A value of 100 or more permits the newer format; the quality is then
-        // the value less 100.
-        let (quality, new_format) = match value.checked_sub(100) {
-            Some(quality) => (quality, true),
-            None => (value, false),
-        };
-        Ok(QualityPlan {
-            quality,
-            new_format,
-            short_dc,
+        native!(QualityPlanning, table => {
+            require_speedhq(_format)?;
+            let format = _format.raw();
+            let mut short_dc = false;
+            // SAFETY: the sender instance is live for this borrow and `short_dc`
+            // is writable storage for the flag.
+            let value = unsafe {
+                table.NDIlib_send_get_q_factor_v2(
+                    self.native_instance(),
+                    &format,
+                    _supports_new_format,
+                    &mut short_dc,
+                )
+            };
+            let value = guidance(value, "NDIlib_send_get_q_factor_v2")?;
+            // A value of 100 or more permits the newer format; the quality is
+            // then the value less 100.
+            let (quality, new_format) = match value.checked_sub(100) {
+                Some(quality) => (quality, true),
+                None => (value, false),
+            };
+            Ok(QualityPlan { quality, new_format, short_dc })
         })
     }
 
@@ -237,13 +248,15 @@ impl<M: SenderMode> Sender<M> {
     ///
     /// [`Error::UnsupportedCapability`]
     /// without an Advanced runtime.
-    pub fn keyframe_required(&self, format: Option<VideoPacketFormat>) -> Result<bool> {
+    pub fn keyframe_required(&self, _format: Option<VideoPacketFormat>) -> Result<bool> {
         let table = self.runtime().table::<KeyframeDemand>()?;
-        let format = format.map(VideoPacketFormat::raw);
-        // SAFETY: the sender instance is live for this borrow.
-        Ok(native!(KeyframeDemand, table => unsafe {
-            table.NDIlib_send_is_keyframe_required(self.native_instance(), stream(format.as_ref()))
-        }))
+        native!(KeyframeDemand, table => {
+            let format = _format.map(VideoPacketFormat::raw);
+            // SAFETY: the sender instance is live for this borrow.
+            Ok(unsafe {
+                table.NDIlib_send_is_keyframe_required(self.native_instance(), stream(format.as_ref()))
+            })
+        })
     }
 
     /// Wait up to `timeout` for keyframe demand to change, on the stream
@@ -260,20 +273,20 @@ impl<M: SenderMode> Sender<M> {
     /// when `timeout` exceeds [`crate::MAX_TIMEOUT`].
     pub fn wait_for_keyframe_change(
         &self,
-        timeout: Duration,
-        format: Option<VideoPacketFormat>,
+        _timeout: Duration,
+        _format: Option<VideoPacketFormat>,
     ) -> Result<bool> {
         let table = self.runtime().table::<KeyframeDemand>()?;
-        let timeout = crate::to_ms_checked(timeout)?;
-        let format = format.map(VideoPacketFormat::raw);
-        // SAFETY: the sender instance is live for this borrow.
-        Ok(native!(KeyframeDemand, table => unsafe {
-            table.NDIlib_send_wait_for_keyframe_request(
-                self.native_instance(),
-                timeout,
-                stream(format.as_ref()),
-            )
-        }))
+        native!(KeyframeDemand, table => {
+            let timeout = crate::to_ms_checked(_timeout)?;
+            let format = _format.map(VideoPacketFormat::raw);
+            // SAFETY: the sender instance is live for this borrow.
+            Ok(unsafe {
+                table.NDIlib_send_wait_for_keyframe_request(
+                    self.native_instance(), timeout, stream(format.as_ref()),
+                )
+            })
+        })
     }
 }
 
@@ -312,9 +325,11 @@ impl<M: ReceiverMode> Receiver<M> {
     /// without an Advanced runtime.
     pub fn request_keyframe(&self) -> Result<()> {
         let table = self.core._ndi.table::<KeyframeRequest>()?;
-        // SAFETY: the receiver instance is live for this borrow.
-        native!(KeyframeRequest, table => unsafe { table.NDIlib_recv_request_keyframe(self.core.instance) });
-        Ok(())
+        native!(KeyframeRequest, table => {
+            // SAFETY: the receiver instance is live for this borrow.
+            unsafe { table.NDIlib_recv_request_keyframe(self.core.instance) };
+            Ok(())
+        })
     }
 
     /// Switch between the source's program and preview streams.
@@ -328,17 +343,17 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// [`Error::UnsupportedCapability`]
     /// without an Advanced runtime.
-    pub fn set_stream_tier(&mut self, tier: StreamTier) -> Result<SettingChange> {
+    pub fn set_stream_tier(&mut self, _tier: StreamTier) -> Result<SettingChange> {
         let table = self.core._ndi.table::<ReceiverBandwidthControl>()?;
-        let bandwidth = match tier {
-            StreamTier::Program => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
-            StreamTier::Preview => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest,
-        };
-        // SAFETY: the receiver instance is live for this borrow.
-        let switched = native!(ReceiverBandwidthControl, table => unsafe {
-            table.NDIlib_recv_set_bandwidth(self.core.instance, bandwidth)
-        });
-        Ok(SettingChange::from_sdk(switched))
+        native!(ReceiverBandwidthControl, table => {
+            let bandwidth = match _tier {
+                StreamTier::Program => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_highest,
+                StreamTier::Preview => NDIlib_recv_bandwidth_e_NDIlib_recv_bandwidth_lowest,
+            };
+            // SAFETY: the receiver instance is live for this borrow.
+            let switched = unsafe { table.NDIlib_recv_set_bandwidth(self.core.instance, bandwidth) };
+            Ok(SettingChange::from_sdk(switched))
+        })
     }
 
     /// Choose which streams the source sends to this receiver.
@@ -353,17 +368,19 @@ impl<M: ReceiverMode> Receiver<M> {
     ///
     /// [`Error::UnsupportedCapability`]
     /// without an Advanced runtime.
-    pub fn set_streams(&mut self, streams: MediaTypes) -> Result<SettingChange> {
+    pub fn set_streams(&mut self, _streams: MediaTypes) -> Result<SettingChange> {
         let table = self.core._ndi.table::<ReceiverStreamControl>()?;
-        // SAFETY: the receiver instance is live for this borrow.
-        let changed = native!(ReceiverStreamControl, table => unsafe {
-            table.NDIlib_recv_set_enabled_streams(
-                self.core.instance,
-                streams.contains(MediaTypes::VIDEO),
-                streams.contains(MediaTypes::AUDIO),
-                streams.contains(MediaTypes::METADATA),
-            )
-        });
-        Ok(SettingChange::from_sdk(changed))
+        native!(ReceiverStreamControl, table => {
+            // SAFETY: the receiver instance is live for this borrow.
+            let changed = unsafe {
+                table.NDIlib_recv_set_enabled_streams(
+                    self.core.instance,
+                    _streams.contains(MediaTypes::VIDEO),
+                    _streams.contains(MediaTypes::AUDIO),
+                    _streams.contains(MediaTypes::METADATA),
+                )
+            };
+            Ok(SettingChange::from_sdk(changed))
+        })
     }
 }

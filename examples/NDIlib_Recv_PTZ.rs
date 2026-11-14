@@ -19,8 +19,13 @@ use std::{
 
 use grafton_ndi::{Error, Ndi, Receiver, ReceiverEvent, ReceiverOptions};
 
-#[path = "common/mod.rs"]
-mod common;
+#[path = "common/finder.rs"]
+mod finder;
+#[path = "common/source_wait.rs"]
+mod source_wait;
+
+use finder::finder_with_extra_ips;
+use source_wait::wait_for_first_source;
 
 fn main() -> Result<(), Error> {
     // Parse command line arguments for extra IPs
@@ -39,11 +44,10 @@ fn main() -> Result<(), Error> {
     let ndi = Ndi::new()?;
 
     // Create finder
-    let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
+    let finder = finder_with_extra_ips(&ndi, &extra_ips)?;
 
     // Wait until there is at least one source (or Ctrl-C)
-    let Some(sources) =
-        common::wait_for_first_source(&finder, || exit_loop.load(Ordering::Relaxed))?
+    let Some(sources) = wait_for_first_source(&finder, || exit_loop.load(Ordering::Relaxed))?
     else {
         return Ok(());
     };

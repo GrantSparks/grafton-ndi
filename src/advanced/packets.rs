@@ -1446,131 +1446,128 @@ pub(crate) unsafe fn copy_audio_packet(
 // each value is checked against them.
 #[cfg(ndi_has_advanced_header)]
 const _: () = {
-    use crate::sys::advanced_bindings::*;
-    use std::mem::{offset_of, size_of};
-
     // Enum constants of the Advanced-only headers take the target's C enum
     // type, which is signed on some targets; compare bit patterns.
     macro_rules! same_bits {
         ($ours:expr, $native:ident) => {
             crate::sys::advanced::declared! { $native {
-                assert!($ours == u32::from_ne_bytes($native.to_ne_bytes()));
+                assert!($ours == u32::from_ne_bytes(
+                    crate::sys::advanced_bindings::$native.to_ne_bytes()
+                ));
             } else {} }
         };
     }
 
-    use StreamTier::{Preview, Program};
-    use VideoCodec::*;
     same_bits!(
-        SpeedHq420.outer(Program, false),
+        VideoCodec::SpeedHq420.outer(StreamTier::Program, false),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_SHQ0_highest_bandwidth
     );
     same_bits!(
-        SpeedHq420.outer(Program, true),
+        VideoCodec::SpeedHq420.outer(StreamTier::Program, true),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_SHQ0_highest_bandwidth_protected
     );
     same_bits!(
-        SpeedHq420.outer(Preview, false),
+        VideoCodec::SpeedHq420.outer(StreamTier::Preview, false),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_SHQ0_lowest_bandwidth
     );
     same_bits!(
-        SpeedHq420.outer(Preview, true),
+        VideoCodec::SpeedHq420.outer(StreamTier::Preview, true),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_SHQ0_lowest_bandwidth_protected
     );
     same_bits!(
-        SpeedHq422.outer(Program, false),
+        VideoCodec::SpeedHq422.outer(StreamTier::Program, false),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_SHQ2_highest_bandwidth
     );
     same_bits!(
-        SpeedHq422.outer(Program, true),
+        VideoCodec::SpeedHq422.outer(StreamTier::Program, true),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_SHQ2_highest_bandwidth_protected
     );
     same_bits!(
-        SpeedHq422.outer(Preview, false),
+        VideoCodec::SpeedHq422.outer(StreamTier::Preview, false),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_SHQ2_lowest_bandwidth
     );
     same_bits!(
-        SpeedHq422.outer(Preview, true),
+        VideoCodec::SpeedHq422.outer(StreamTier::Preview, true),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_SHQ2_lowest_bandwidth_protected
     );
     same_bits!(
-        SpeedHq422Alpha.outer(Program, false),
+        VideoCodec::SpeedHq422Alpha.outer(StreamTier::Program, false),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_SHQ7_highest_bandwidth
     );
     same_bits!(
-        SpeedHq422Alpha.outer(Program, true),
+        VideoCodec::SpeedHq422Alpha.outer(StreamTier::Program, true),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_SHQ7_highest_bandwidth_protected
     );
     same_bits!(
-        SpeedHq422Alpha.outer(Preview, false),
+        VideoCodec::SpeedHq422Alpha.outer(StreamTier::Preview, false),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_SHQ7_lowest_bandwidth
     );
     same_bits!(
-        SpeedHq422Alpha.outer(Preview, true),
+        VideoCodec::SpeedHq422Alpha.outer(StreamTier::Preview, true),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_SHQ7_lowest_bandwidth_protected
     );
     same_bits!(
-        H264.outer(Program, false),
+        VideoCodec::H264.outer(StreamTier::Program, false),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_H264_highest_bandwidth
     );
     same_bits!(
-        H264.outer(Program, true),
+        VideoCodec::H264.outer(StreamTier::Program, true),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_H264_highest_bandwidth_protected
     );
     same_bits!(
-        H264.outer(Preview, false),
+        VideoCodec::H264.outer(StreamTier::Preview, false),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_H264_lowest_bandwidth
     );
     same_bits!(
-        H264.outer(Preview, true),
+        VideoCodec::H264.outer(StreamTier::Preview, true),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_H264_lowest_bandwidth_protected
     );
     same_bits!(
-        Hevc.outer(Program, false),
+        VideoCodec::Hevc.outer(StreamTier::Program, false),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_HEVC_highest_bandwidth
     );
     same_bits!(
-        Hevc.outer(Program, true),
+        VideoCodec::Hevc.outer(StreamTier::Program, true),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_HEVC_highest_bandwidth_protected
     );
     same_bits!(
-        Hevc.outer(Preview, false),
+        VideoCodec::Hevc.outer(StreamTier::Preview, false),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_HEVC_lowest_bandwidth
     );
     same_bits!(
-        Hevc.outer(Preview, true),
+        VideoCodec::Hevc.outer(StreamTier::Preview, true),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_HEVC_lowest_bandwidth_protected
     );
     same_bits!(
-        H264Alpha.outer(Program, false),
+        VideoCodec::H264Alpha.outer(StreamTier::Program, false),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_H264_alpha_highest_bandwidth
     );
     same_bits!(
-        H264Alpha.outer(Program, true),
+        VideoCodec::H264Alpha.outer(StreamTier::Program, true),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_H264_alpha_highest_bandwidth_protected
     );
     same_bits!(
-        H264Alpha.outer(Preview, false),
+        VideoCodec::H264Alpha.outer(StreamTier::Preview, false),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_H264_alpha_lowest_bandwidth
     );
     same_bits!(
-        H264Alpha.outer(Preview, true),
+        VideoCodec::H264Alpha.outer(StreamTier::Preview, true),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_H264_alpha_lowest_bandwidth_protected
     );
     same_bits!(
-        HevcAlpha.outer(Program, false),
+        VideoCodec::HevcAlpha.outer(StreamTier::Program, false),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_HEVC_alpha_highest_bandwidth
     );
     same_bits!(
-        HevcAlpha.outer(Program, true),
+        VideoCodec::HevcAlpha.outer(StreamTier::Program, true),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_HEVC_alpha_highest_bandwidth_protected
     );
     same_bits!(
-        HevcAlpha.outer(Preview, false),
+        VideoCodec::HevcAlpha.outer(StreamTier::Preview, false),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_HEVC_alpha_lowest_bandwidth
     );
     same_bits!(
-        HevcAlpha.outer(Preview, true),
+        VideoCodec::HevcAlpha.outer(StreamTier::Preview, true),
         NDIlib_FourCC_video_type_ex_e_NDIlib_FourCC_video_type_ex_HEVC_alpha_lowest_bandwidth_protected
     );
 
@@ -1604,9 +1601,16 @@ const _: () = {
         NDIlib_compressed_FourCC_type_e_NDIlib_compressed_FourCC_type_AAC
     );
 
+    crate::sys::advanced::declared! { NDIlib_compressed_packet_flags_keyframe {
+        assert!(KEYFRAME == crate::sys::advanced_bindings::NDIlib_compressed_packet_flags_keyframe);
+    } else {} }
+    crate::sys::advanced::declared! { NDIlib_compressed_packet_version_0 {
+        assert!(ENVELOPE_HEADER_BYTES as i32 == crate::sys::advanced_bindings::NDIlib_compressed_packet_version_0);
+    } else {} }
     crate::sys::advanced::declared! { NDIlib_compressed_packet_t {
-    assert!(KEYFRAME == NDIlib_compressed_packet_flags_keyframe);
-    assert!(ENVELOPE_HEADER_BYTES as i32 == NDIlib_compressed_packet_version_0);
+    use crate::sys::advanced_bindings::NDIlib_compressed_packet_t;
+    use std::mem::{offset_of, size_of};
+
     assert!(size_of::<NDIlib_compressed_packet_t>() == ENVELOPE_HEADER_BYTES);
     assert!(offset_of!(NDIlib_compressed_packet_t, version) == VERSION_OFFSET);
     assert!(offset_of!(NDIlib_compressed_packet_t, fourCC) == CODEC_OFFSET);

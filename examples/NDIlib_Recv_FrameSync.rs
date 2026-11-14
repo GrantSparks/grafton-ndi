@@ -35,8 +35,16 @@ use grafton_ndi::{
     ScanType,
 };
 
-#[path = "common/mod.rs"]
-mod common;
+#[path = "common/arguments.rs"]
+mod arguments;
+#[path = "common/finder.rs"]
+mod finder;
+#[path = "common/source_wait.rs"]
+mod source_wait;
+
+use arguments::option_value;
+use finder::finder_with_extra_ips;
+use source_wait::wait_for_first_source;
 
 use std::{
     env, thread,
@@ -52,10 +60,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
-            "--frames" => frame_count = common::option_value(&mut arguments, &argument)?,
-            "--audio-rate" => audio_sample_rate = common::option_value(&mut arguments, &argument)?,
-            "--audio-channels" => audio_channels = common::option_value(&mut arguments, &argument)?,
-            "--audio-samples" => audio_samples = common::option_value(&mut arguments, &argument)?,
+            "--frames" => frame_count = option_value(&mut arguments, &argument)?,
+            "--audio-rate" => audio_sample_rate = option_value(&mut arguments, &argument)?,
+            "--audio-channels" => audio_channels = option_value(&mut arguments, &argument)?,
+            "--audio-samples" => audio_samples = option_value(&mut arguments, &argument)?,
             flag if flag.starts_with('-') => {
                 return Err(Error::InvalidInput(format!("unknown option: {flag}")).into());
             }
@@ -83,10 +91,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Audio samples per capture: {audio_samples}");
     println!();
 
-    let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
+    let finder = finder_with_extra_ips(&ndi, &extra_ips)?;
 
     println!("Looking for sources ...");
-    let sources = common::wait_for_first_source(&finder, || false)?
+    let sources = wait_for_first_source(&finder, || false)?
         .expect("wait_for_first_source returns None only when the stop closure fires");
     let count = sources.len();
     println!("Found {count} source(s):");

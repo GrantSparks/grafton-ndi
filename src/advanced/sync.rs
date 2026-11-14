@@ -1,23 +1,31 @@
 //! Audio matched to video timestamps, and clocks locked to a reference source.
 
-use std::{cell::Cell, marker::PhantomData, ptr};
+#[cfg(any(test, ndi_has_advanced_av_sync, ndi_has_advanced_genlock))]
+use std::ptr;
+use std::{cell::Cell, marker::PhantomData};
 
 use super::{invalid_input, sdk_quantity, AdvancedConfig, ReceiverControls};
 use crate::{
     finder::RawSource,
-    frames::{AudioParts, ReturnedAudio, ValidatedAudio, MAX_AUDIO_BYTES},
+    frames::MAX_AUDIO_BYTES,
     receiver::AvSyncAttached,
     sys::{
-        advanced::{
-            native, AvSync as AvSyncTable, AvSyncHandle, Genlock as GenlockTable, GenlockHandle,
-        },
+        advanced::{native, AvSync as AvSyncTable, Genlock as GenlockTable},
         bindings::*,
     },
-    AudioFrame, Error, FrameRate, Ndi, Receiver, Rejected, Result, ScanType, Source, VideoFrame,
+    AudioFrame, FrameRate, Ndi, Receiver, Rejected, Result, ScanType, Source, VideoFrame,
     VideoFrameRef,
 };
 
 use super::descriptors;
+#[cfg(any(test, ndi_has_advanced_av_sync))]
+use crate::frames::{AudioParts, ReturnedAudio, ValidatedAudio};
+#[cfg(ndi_has_advanced_av_sync)]
+use crate::sys::advanced::AvSyncHandle;
+#[cfg(ndi_has_advanced_genlock)]
+use crate::sys::advanced::GenlockHandle;
+#[cfg(any(doc, test, ndi_has_advanced_av_sync, ndi_has_advanced_genlock))]
+use crate::Error;
 
 /// What audio an [`AvSync::synchronize`] call asks for.
 ///
@@ -88,6 +96,7 @@ impl AvSyncRequest {
     /// The SDK reads zero as "not specified". It returns planar
     /// floating-point audio and leaves the format as it found it, so the
     /// descriptor must already name that format.
+    #[cfg(any(test, ndi_has_advanced_av_sync))]
     fn raw(self) -> NDIlib_audio_frame_v3_t {
         // Lossless: construction keeps both at or below i32::MAX.
         let field = |value: Option<u32>| value.map_or(0, |value| value as i32);
@@ -137,6 +146,7 @@ pub enum AvSyncOutcome {
 }
 
 /// How the SDK classified one synchronization.
+#[cfg(any(test, ndi_has_advanced_av_sync))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Synchronized {
     Matched,
@@ -150,6 +160,7 @@ enum Synchronized {
 
 /// A native synchronizer, destroyed when dropped.
 struct AvResource {
+    #[cfg(ndi_has_advanced_av_sync)]
     handle: AvSyncHandle,
     table: &'static AvSyncTable,
 }
@@ -257,23 +268,23 @@ impl AvSync {
             Ok(table) => table,
             Err(error) => return Err(Rejected::new(error, receiver)),
         };
-        // SAFETY: the receiver instance is live, and this value keeps it
-        // alive for longer than the synchronizer.
-        let handle: AvSyncHandle = native!(AvSync, table => unsafe {
-            table.NDIlib_avsync_create(receiver.core.instance)
-        });
-        if handle.is_null() {
-            return Err(Rejected::new(
-                Error::NativeOperationFailed {
-                    operation: "NDIlib_avsync_create",
-                },
-                receiver,
-            ));
-        }
-        Ok(Self {
-            resource: AvResource { handle, table },
-            receiver: receiver.into_mode(),
-            _not_sync: NotSync(PhantomData),
+        native!(AvSync, table => {
+            // SAFETY: the receiver instance is live, and this value keeps it
+            // alive for longer than the synchronizer.
+            let handle = unsafe { table.NDIlib_avsync_create(receiver.core.instance) };
+            if handle.is_null() {
+                return Err(Rejected::new(
+                    Error::NativeOperationFailed {
+                        operation: "NDIlib_avsync_create",
+                    },
+                    receiver,
+                ));
+            }
+            Ok(Self {
+                resource: AvResource { handle, table },
+                receiver: receiver.into_mode(),
+                _not_sync: NotSync(PhantomData),
+            })
         })
     }
 
@@ -393,90 +404,94 @@ impl AvSyncCapture<'_> {
     /// As for [`AvSync::synchronize`].
     pub fn synchronize(
         &self,
-        video: Option<&dyn AvSyncVideo>,
-        request: AvSyncRequest,
+        _video: Option<&dyn AvSyncVideo>,
+        _request: AvSyncRequest,
     ) -> Result<AvSyncOutcome> {
-        // A copy of the frame's descriptor, pointing into the frame's own
-        // buffers, which the borrow keeps allocated for the call.
-        let video = video.map(video_sealed::Sealed::descriptor);
-        let AvResource { handle, table } = *self.resource;
-        let mut returned = Returned {
-            audio: request.raw(),
-            release: |audio: &mut NDIlib_audio_frame_v3_t| {
-                // SAFETY: the synchronizer that filled the descriptor is live,
-                // and the descriptor is returned to it exactly once.
-                native!(AvSync, table => unsafe { table.NDIlib_avsync_free_audio(handle, audio) })
-            },
-        };
-        let status = native!(AvSync, table => {
-            // SAFETY: the synchronizer is live, and so is the receiver it
-            // reads, whose owner this view borrows. The video
-            // descriptor (if any) describes a frame borrowed for the call: an
-            // owned frame's buffers, or the SDK's own descriptor of a captured
-            // frame, whose guard keeps its buffers allocated. The SDK takes
-            // it as a const reference and only reads it
-            // (Processing.NDI.AVSync.h). The audio descriptor is writable.
-            //
-            // No other synchronization of this synchronizer runs, which the
-            // header does not document as safe: this takes `&self`, and an
-            // AvSync is not Sync. Captures through the lent
-            // receiver may run on other threads meanwhile. The synchronizer
-            // takes the receiver's audio as an audio capture of it would
-            // (Processing.NDI.AVSync.h), and the SDK lets video, audio and
-            // metadata be captured from one receiver on separate threads at
-            // once (Processing.NDI.Recv.h). The AvSyncAttached mode has no
-            // audio capture, so the synchronizer is the only audio consumer.
-            //
-            // The receiver's capture guard is not taken, as FrameSync's
-            // captures do not take it. The guard keeps the crate's own
-            // NDIlib_recv_capture_v3 calls from overlapping
-            // NDIlib_recv_connect. How a synchronizer reads its receiver,
-            // during this call or on its own, is internal to the SDK and not
-            // documented, so a lock around this call could not be shown to
-            // cover it. Processing.NDI.FrameSync.h leaves a frame
-            // synchronizer's receiver usable for its other operations, and a
-            // FrameSync's receiver already reconnects while it captures; this
-            // synchronizer is treated the same way.
-            let code = unsafe {
-                table.NDIlib_avsync_synchronize(
-                    handle,
-                    video.as_ref().map_or(ptr::null(), |video| video),
-                    &mut returned.audio,
-                )
+        native!(AvSync, self.resource.table => {
+            // A copy of the frame's descriptor, pointing into the frame's own
+            // buffers, which the borrow keeps allocated for the call.
+            let video = _video.map(video_sealed::Sealed::descriptor);
+            let AvResource { handle, table } = *self.resource;
+            let mut returned = Returned {
+                audio: _request.raw(),
+                release: |audio: &mut NDIlib_audio_frame_v3_t| {
+                    // SAFETY: the synchronizer that filled the descriptor is live,
+                    // and the descriptor is returned to it exactly once.
+                    native!(AvSync, table => unsafe { table.NDIlib_avsync_free_audio(handle, audio) })
+                },
             };
-            match code {
-                crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_success => Synchronized::Matched,
-                crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_success_num_samples_not_matched => {
-                    Synchronized::Adjusted
+            let status = {
+                // SAFETY: the synchronizer is live, and so is the receiver it
+                // reads, whose owner this view borrows. The video
+                // descriptor (if any) describes a frame borrowed for the call: an
+                // owned frame's buffers, or the SDK's own descriptor of a captured
+                // frame, whose guard keeps its buffers allocated. The SDK takes
+                // it as a const reference and only reads it
+                // (Processing.NDI.AVSync.h). The audio descriptor is writable.
+                //
+                // No other synchronization of this synchronizer runs, which the
+                // header does not document as safe: this takes `&self`, and an
+                // AvSync is not Sync. Captures through the lent
+                // receiver may run on other threads meanwhile. The synchronizer
+                // takes the receiver's audio as an audio capture of it would
+                // (Processing.NDI.AVSync.h), and the SDK lets video, audio and
+                // metadata be captured from one receiver on separate threads at
+                // once (Processing.NDI.Recv.h). The AvSyncAttached mode has no
+                // audio capture, so the synchronizer is the only audio consumer.
+                //
+                // The receiver's capture guard is not taken, as FrameSync's
+                // captures do not take it. The guard keeps the crate's own
+                // NDIlib_recv_capture_v3 calls from overlapping
+                // NDIlib_recv_connect. How a synchronizer reads its receiver,
+                // during this call or on its own, is internal to the SDK and not
+                // documented, so a lock around this call could not be shown to
+                // cover it. Processing.NDI.FrameSync.h leaves a frame
+                // synchronizer's receiver usable for its other operations, and a
+                // FrameSync's receiver already reconnects while it captures; this
+                // synchronizer is treated the same way.
+                let code = unsafe {
+                    table.NDIlib_avsync_synchronize(
+                        handle,
+                        video.as_ref().map_or(ptr::null(), |video| video),
+                        &mut returned.audio,
+                    )
+                };
+                match code {
+                    crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_success => Synchronized::Matched,
+                    crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_success_num_samples_not_matched => {
+                        Synchronized::Adjusted
+                    }
+                    crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_no_audio_stream_received => {
+                        Synchronized::NoAudioStream
+                    }
+                    crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_no_samples_found => {
+                        Synchronized::NoMatchingSamples
+                    }
+                    crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_format_changed => {
+                        Synchronized::FormatChanged
+                    }
+                    crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_internal_error => {
+                        Synchronized::InternalError
+                    }
+                    other => Synchronized::Unknown(other),
                 }
-                crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_no_audio_stream_received => {
-                    Synchronized::NoAudioStream
-                }
-                crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_no_samples_found => {
-                    Synchronized::NoMatchingSamples
-                }
-                crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_format_changed => {
-                    Synchronized::FormatChanged
-                }
-                crate::sys::advanced_bindings::NDIlib_avsync_ret_e_NDIlib_avsync_ret_internal_error => {
-                    Synchronized::InternalError
-                }
-                other => Synchronized::Unknown(other),
-            }
-        });
-        // SAFETY: the SDK owns whatever it returned until `returned` is
-        // dropped, which happens after the copy.
-        unsafe { outcome(status, &returned.audio) }
+            };
+            // SAFETY: the SDK owns whatever it returned until `returned` is
+            // dropped, which happens after the copy.
+            unsafe { outcome(status, &returned.audio) }
+        })
     }
 }
 
 /// The audio descriptor of one synchronization. Whatever the SDK allocated
 /// for it is handed to `release` when the descriptor is dropped.
+#[cfg(any(test, ndi_has_advanced_av_sync))]
 struct Returned<F: FnMut(&mut NDIlib_audio_frame_v3_t)> {
     audio: NDIlib_audio_frame_v3_t,
     release: F,
 }
 
+#[cfg(any(test, ndi_has_advanced_av_sync))]
 impl<F: FnMut(&mut NDIlib_audio_frame_v3_t)> Drop for Returned<F> {
     fn drop(&mut self) {
         // Every result, including the failures, can carry SDK allocations.
@@ -492,6 +507,7 @@ impl<F: FnMut(&mut NDIlib_audio_frame_v3_t)> Drop for Returned<F> {
 ///
 /// For the two successful statuses, `audio` is a frame descriptor whose data
 /// and metadata pointers are null or valid for the layout it describes.
+#[cfg(any(test, ndi_has_advanced_av_sync))]
 unsafe fn outcome(status: Synchronized, audio: &NDIlib_audio_frame_v3_t) -> Result<AvSyncOutcome> {
     Ok(match status {
         Synchronized::Matched | Synchronized::Adjusted => {
@@ -575,6 +591,7 @@ pub enum ClockSource {
 }
 
 impl ClockSource {
+    #[cfg(any(test, ndi_has_advanced_genlock))]
     fn from_active(active: bool) -> Self {
         if active {
             Self::ReferenceSignal
@@ -586,6 +603,7 @@ impl ClockSource {
 
 /// A native genlock, destroyed when dropped.
 struct GenResource {
+    #[cfg(ndi_has_advanced_genlock)]
     handle: GenlockHandle,
     table: &'static GenlockTable,
     _ndi: Ndi,
@@ -682,33 +700,35 @@ impl Genlock {
     /// creates no genlock.
     pub fn new(
         ndi: &Ndi,
-        source: Option<&Source>,
-        config: Option<&AdvancedConfig>,
+        _source: Option<&Source>,
+        _config: Option<&AdvancedConfig>,
     ) -> Result<Self> {
         let table = ndi.table::<GenlockTable>()?;
-        let source = source.map(Source::to_raw).transpose()?.map(Box::new);
-        // SAFETY: the source descriptor and the configuration point to
-        // strings that this value keeps alive for as long as the genlock.
-        let handle: GenlockHandle = native!(Genlock, table => unsafe {
-            table.NDIlib_genlock_create(
-                source.as_ref().map_or(ptr::null(), |source| &source.raw),
-                config.map_or(ptr::null(), AdvancedConfig::as_ptr),
-            )
-        });
-        if handle.is_null() {
-            return Err(Error::NativeOperationFailed {
-                operation: "NDIlib_genlock_create",
-            });
-        }
-        Ok(Self {
-            resource: GenResource {
-                handle,
-                table,
-                _ndi: ndi.clone(),
-            },
-            _source: source,
-            _config: config.cloned(),
-            _not_sync: NotSync(PhantomData),
+        native!(Genlock, table => {
+            let source = _source.map(Source::to_raw).transpose()?.map(Box::new);
+            // SAFETY: the source descriptor and the configuration point to
+            // strings that this value keeps alive for as long as the genlock.
+            let handle = unsafe {
+                table.NDIlib_genlock_create(
+                    source.as_ref().map_or(ptr::null(), |source| &source.raw),
+                    _config.map_or(ptr::null(), AdvancedConfig::as_ptr),
+                )
+            };
+            if handle.is_null() {
+                return Err(Error::NativeOperationFailed {
+                    operation: "NDIlib_genlock_create",
+                });
+            }
+            Ok(Self {
+                resource: GenResource {
+                    handle,
+                    table,
+                    _ndi: ndi.clone(),
+                },
+                _source: source,
+                _config: _config.cloned(),
+                _not_sync: NotSync(PhantomData),
+            })
         })
     }
 
@@ -721,25 +741,29 @@ impl Genlock {
     ///
     /// An invalid-string error for a source containing NUL.
     pub fn connect(&mut self, source: Option<&Source>) -> Result<()> {
-        let source = source.map(Source::to_raw).transpose()?.map(Box::new);
-        let GenResource { handle, table, .. } = self.resource;
-        // SAFETY: the genlock is live and no wait is in progress, and the new
-        // descriptor is stored below before the earlier one is released.
-        native!(Genlock, table => unsafe {
-            table.NDIlib_genlock_connect(
-                handle,
-                source.as_ref().map_or(ptr::null(), |source| &source.raw),
-            )
-        });
-        self._source = source;
-        Ok(())
+        // Validate before reaching the native boundary.
+        let _source = source.map(Source::to_raw).transpose()?.map(Box::new);
+        native!(Genlock, self.resource.table => {
+            let GenResource { handle, table, .. } = self.resource;
+            // SAFETY: the genlock is live and no wait is in progress, and the new
+            // descriptor is stored below before the earlier one is released.
+            unsafe {
+                table.NDIlib_genlock_connect(
+                    handle,
+                    _source.as_ref().map_or(ptr::null(), |source| &source.raw),
+                )
+            };
+            self._source = _source;
+            Ok(())
+        })
     }
 
     /// Whether a reference signal is being received.
     pub fn is_active(&self) -> bool {
-        let GenResource { handle, table, .. } = self.resource;
         // SAFETY: the genlock is live for this borrow.
-        native!(Genlock, table => unsafe { table.NDIlib_genlock_is_active(handle) })
+        native!(Genlock, self.resource.table => unsafe {
+            self.resource.table.NDIlib_genlock_is_active(self.resource.handle)
+        })
     }
 
     /// The video clock and the audio clock.
@@ -770,14 +794,16 @@ pub struct VideoClock<'a> {
 impl VideoClock<'_> {
     /// Block until the next frame of a stream with this frame rate and scan
     /// type is due, and report which clock timed it.
-    pub fn wait(&mut self, frame_rate: FrameRate, scan_type: ScanType) -> ClockSource {
-        let timing = video_timing(frame_rate, scan_type);
-        let GenResource { handle, table, .. } = *self.resource;
-        // SAFETY: the genlock outlives this clock, and only this clock waits
-        // for video.
-        ClockSource::from_active(native!(Genlock, table => unsafe {
-            table.NDIlib_genlock_wait_video(handle, &timing)
-        }))
+    pub fn wait(&mut self, _frame_rate: FrameRate, _scan_type: ScanType) -> ClockSource {
+        native!(Genlock, self.resource.table => {
+            let timing = video_timing(_frame_rate, _scan_type);
+            let GenResource { handle, table, .. } = *self.resource;
+            // SAFETY: the genlock outlives this clock, and only this clock waits
+            // for video.
+            ClockSource::from_active(unsafe {
+                table.NDIlib_genlock_wait_video(handle, &timing)
+            })
+        })
     }
 }
 
@@ -796,13 +822,16 @@ impl AudioClock<'_> {
     ///
     /// [`Error::InvalidInput`] when a value is zero or exceeds `i32::MAX`.
     pub fn wait(&mut self, sample_rate: u32, num_samples: u32) -> Result<ClockSource> {
-        let timing = audio_timing(sample_rate, num_samples)?;
-        let GenResource { handle, table, .. } = *self.resource;
-        // SAFETY: the genlock outlives this clock, and only this clock waits
-        // for audio.
-        Ok(ClockSource::from_active(native!(Genlock, table => unsafe {
-            table.NDIlib_genlock_wait_audio(handle, &timing)
-        })))
+        // Validate the request even in builds without the native family.
+        let _timing = audio_timing(sample_rate, num_samples)?;
+        native!(Genlock, self.resource.table => {
+            let GenResource { handle, table, .. } = *self.resource;
+            // SAFETY: the genlock outlives this clock, and only this clock waits
+            // for audio.
+            Ok(ClockSource::from_active(unsafe {
+                table.NDIlib_genlock_wait_audio(handle, &_timing)
+            }))
+        })
     }
 }
 
@@ -818,6 +847,7 @@ fn quantity(name: &str, value: u32) -> Result<u32> {
 }
 
 /// The descriptor a video clock reads its timing from.
+#[cfg(any(test, ndi_has_advanced_genlock))]
 fn video_timing(frame_rate: FrameRate, scan_type: ScanType) -> NDIlib_video_frame_v2_t {
     let (numerator, denominator) = frame_rate.to_sdk();
     NDIlib_video_frame_v2_t {

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use grafton_ndi::{
     Finder, FinderOptions, Ndi, Receiver, ReceiverOptions, Result, Source, SourceCache,
 };
@@ -30,8 +28,10 @@ fn core_owners(ndi: &Ndi, source: &Source) -> Result<()> {
         SenderOptions,
     };
     let options = ReceiverOptions::new(source.clone());
-    shared(server_state(ndi, &FinderOptions::new())?);
-    shared(Receiver::new(ndi, &options)?);
+    let state = server_state(ndi, &FinderOptions::new())?;
+    shared(state.sources.finder().current_sources()?);
+    shared(Receiver::new(&state.ndi, &options)?);
+    shared(state);
     shared(FrameSync::new(Receiver::new(ndi, &options)?)?);
     shared(Sender::new(ndi, &SenderOptions::new("service"))?);
     shared(AudioConverter::new(ndi)?);
@@ -111,4 +111,10 @@ fn discovery_owners(ndi: &Ndi) -> Result<()> {
     Ok(())
 }
 
-fn main() {}
+fn main() {
+    let _ = (core_owners, discovery_owners);
+    #[cfg(feature = "advanced")]
+    let _ = advanced_owners;
+    #[cfg(feature = "file-io")]
+    let _ = file_owners;
+}

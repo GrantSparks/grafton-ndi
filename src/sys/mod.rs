@@ -4,6 +4,8 @@
 //! Nothing outside this module converts an address into a function pointer or
 //! looks a symbol up by name.
 
+// Keep the complete generated ABI, including legacy types and constants that
+// safe wrappers do not expose. Coverage tests classify every declared function.
 #[allow(
     non_upper_case_globals,
     non_camel_case_types,
@@ -21,11 +23,14 @@ pub(crate) mod bindings;
 /// to name the symbols a statically linked archive defines. They are kept apart
 /// from the types so that importing [`bindings`] never brings a callable foreign
 /// function into scope: on dynamically loaded targets nothing links them.
+// Unwrapped functions remain here for signature and ABI coverage checks.
 #[allow(non_snake_case, dead_code, clippy::all, clippy::pedantic)]
 pub(crate) mod declarations;
 
 /// Types from the Advanced-only headers, generated at build time from the
 /// user's installed SDK because those headers may not be redistributed.
+// Preserve the installed header's full ABI even when only some families are
+// wrapped. These allowances apply only to generated declarations.
 #[cfg(ndi_has_advanced_header)]
 #[allow(
     non_upper_case_globals,
@@ -36,6 +41,7 @@ pub(crate) mod declarations;
     clippy::pedantic
 )]
 pub(crate) mod advanced_bindings {
+    // Bindgen may reference core types; which imports it needs varies by SDK.
     #[allow(unused_imports)]
     use super::bindings::*;
     include!(concat!(env!("OUT_DIR"), "/ndi_advanced.rs"));
@@ -45,6 +51,7 @@ pub(crate) mod advanced_bindings {
 #[cfg(ndi_has_advanced_header)]
 #[allow(non_snake_case, dead_code, clippy::all, clippy::pedantic)]
 pub(crate) mod advanced_declarations {
+    // A partial header may declare functions using only one of these modules.
     #[allow(unused_imports)]
     use super::{advanced_bindings::*, bindings::*};
     include!(concat!(env!("OUT_DIR"), "/ndi_advanced_declarations.rs"));

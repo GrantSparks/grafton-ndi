@@ -157,8 +157,8 @@ macro_rules! configurable {
                         options,
                         stringify!($create),
                         config,
-                        |table: &'static $Table, settings, text| {
-                            native!($Table, table => table.$create(settings, text))
+                        |table: &'static $Table, _settings, _text| {
+                            native!($Table, table => table.$create(_settings, _text))
                         },
                     )
                 }

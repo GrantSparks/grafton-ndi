@@ -1,6 +1,9 @@
 //! A routing source through the real runtime.
 
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, name);
 
 use grafton_ndi::{
     routing::{Router, RouterOptions},

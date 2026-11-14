@@ -10,7 +10,6 @@
 use std::{
     alloc::{alloc_zeroed, dealloc, Layout},
     collections::HashMap,
-    ffi::c_void,
     mem::ManuallyDrop,
     panic::{catch_unwind, AssertUnwindSafe},
     ptr::NonNull,
@@ -20,20 +19,18 @@ use std::{
     },
 };
 
-use super::{
-    invalid_frame, invalid_input, sdk_quantity, AudioCodec, PacketEvent, PacketReceiver,
-    ReceiverControls, VideoCodec,
-};
+#[cfg(any(test, ndi_has_advanced_receive_allocators))]
+use super::{invalid_frame, sdk_quantity, AudioCodec, VideoCodec};
+use super::{invalid_input, PacketEvent, PacketReceiver, ReceiverControls};
+#[cfg(any(test, ndi_has_advanced_receive_allocators))]
+use crate::sys::bindings::*;
 use crate::{
-    frames::ValidatedVideoLayout,
-    receiver::PacketAttached,
-    runtime::ProcessLifetimeRuntime,
-    sys::{
-        advanced::{native, ReceiveAllocators},
-        bindings::*,
-    },
-    Error, FourCc, PixelFormat, RawCapture, Receiver, ReceiverMode, Rejected, Result,
+    frames::ValidatedVideoLayout, receiver::PacketAttached, runtime::ProcessLifetimeRuntime,
+    sys::advanced::ReceiveAllocators, Error, FourCc, PixelFormat, RawCapture, Receiver,
+    ReceiverMode, Rejected, Result,
 };
+#[cfg(ndi_has_advanced_receive_allocators)]
+use std::ffi::c_void;
 
 const MIB: usize = 1024 * 1024;
 
@@ -396,6 +393,7 @@ pub struct AllocationBuffer {
     // the registry keeps each buffer behind its mutex, which needs only Send,
     // and frees it by value.
     storage: Box<dyn ExternalAllocation>,
+    #[cfg(any(test, ndi_has_advanced_receive_allocators))]
     request: AllocationRequest,
 }
 
@@ -409,6 +407,7 @@ impl AllocationBuffer {
     pub fn zeroed(request: AllocationRequest) -> Result<Self> {
         Ok(Self {
             storage: Box::new(OwnedStorage::zeroed(request.bytes)?),
+            #[cfg(any(test, ndi_has_advanced_receive_allocators))]
             request,
         })
     }
@@ -438,6 +437,7 @@ impl AllocationBuffer {
             Some(problem) => Err(Rejected::new(invalid_input(problem), storage)),
             None => Ok(Self {
                 storage: Box::new(storage),
+                #[cfg(any(test, ndi_has_advanced_receive_allocators))]
                 request,
             }),
         }
@@ -475,6 +475,7 @@ impl<F: Fn(AllocationRequest) -> Result<AllocationBuffer> + Send + Sync + 'stati
 }
 
 /// Where a generation is in its life.
+#[cfg(any(test, ndi_has_advanced_receive_allocators))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     /// Registered with a receiver: it may allocate.
@@ -487,6 +488,7 @@ enum Phase {
 
 /// One registered policy.
 struct Generation {
+    #[cfg(any(test, ndi_has_advanced_receive_allocators))]
     phase: Mutex<Phase>,
     policy: ManuallyDrop<Arc<dyn ReceiveAllocator>>,
     count: Arc<AtomicUsize>,
@@ -507,6 +509,7 @@ impl Drop for Generation {
 /// One allocation the SDK holds, and the generation that made it.
 struct Lease {
     _buffer: AllocationBuffer,
+    #[cfg(any(test, ndi_has_advanced_receive_allocators))]
     bytes: usize,
     _generation: Arc<Generation>,
 }
@@ -525,6 +528,7 @@ struct State {
     /// the address under another generation.
     leases: HashMap<(usize, usize), Lease>,
     bytes: usize,
+    #[cfg(any(test, ndi_has_advanced_receive_allocators))]
     reserved_bytes: usize,
     calls: usize,
     reclaiming: usize,
@@ -563,11 +567,13 @@ fn advance(counter: &AtomicUsize, next: impl Fn(usize) -> Option<usize>) -> Opti
 
 /// The policy call that an admission covers: its count and the bytes it was
 /// granted stay charged until the call ends or its buffer is published.
+#[cfg(any(test, ndi_has_advanced_receive_allocators))]
 struct Reservation<'a> {
     registry: &'a Registry,
     bytes: usize,
 }
 
+#[cfg(any(test, ndi_has_advanced_receive_allocators))]
 impl Reservation<'_> {
     /// End the call under a lock the caller already holds, so that the
     /// buffer it publishes is never charged beside its own grant.
@@ -578,6 +584,7 @@ impl Reservation<'_> {
     }
 }
 
+#[cfg(any(test, ndi_has_advanced_receive_allocators))]
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
         let mut state = lock(&self.registry.state);
@@ -606,6 +613,7 @@ impl Registry {
         lock(&self.state).active.insert(
             token,
             Arc::new(Generation {
+                #[cfg(any(test, ndi_has_advanced_receive_allocators))]
                 phase: Mutex::new(Phase::Active),
                 policy: ManuallyDrop::new(Arc::new(policy)),
                 count: self.generations.clone(),
@@ -627,6 +635,7 @@ impl Registry {
         })
     }
 
+    #[cfg(any(test, ndi_has_advanced_receive_allocators))]
     fn closing(&self, token: usize) {
         let generation = lock(&self.state).active.get(&token).cloned();
         if let Some(g) = generation {
@@ -634,6 +643,7 @@ impl Registry {
         }
     }
 
+    #[cfg(any(test, ndi_has_advanced_receive_allocators))]
     fn retire(&self, token: usize) {
         self.closing(token);
         let generation = lock(&self.state).active.remove(&token);
@@ -643,6 +653,7 @@ impl Registry {
         }
     }
 
+    #[cfg(any(test, ndi_has_advanced_receive_allocators))]
     fn allocate(&self, token: usize, mut request: AllocationRequest) -> Option<(NonNull<u8>, i32)> {
         let (generation, reservation) = {
             let mut s = lock(&self.state);
@@ -721,6 +732,7 @@ impl Registry {
         Some((pointer, stride))
     }
 
+    #[cfg(any(test, ndi_has_advanced_receive_allocators))]
     fn free(&self, token: usize, pointer: *mut u8) -> bool {
         if pointer.is_null() {
             return true;
@@ -895,7 +907,9 @@ impl AllocatorService {
             Ok(table) => Ok(Allocation {
                 receiver: Some(receiver),
                 table,
+                #[cfg(ndi_has_advanced_receive_allocators)]
                 video_token: None,
+                #[cfg(ndi_has_advanced_receive_allocators)]
                 audio_token: None,
                 _service: self,
             }),
@@ -1111,7 +1125,9 @@ struct Allocation<M: ReceiverMode> {
     // `None` only once `into_receiver` has taken it.
     receiver: Option<Receiver<M>>,
     table: &'static ReceiveAllocators,
+    #[cfg(ndi_has_advanced_receive_allocators)]
     video_token: Option<usize>,
+    #[cfg(ndi_has_advanced_receive_allocators)]
     audio_token: Option<usize>,
     // The promise that the runtime outlives every callback registered here.
     _service: AllocatorService,
@@ -1138,6 +1154,7 @@ impl<M: ReceiverMode> Allocation<M> {
 
     /// Register generation `token` (or the SDK's own allocator) for `stream`
     /// and retire the generation it replaces.
+    #[cfg(ndi_has_advanced_receive_allocators)]
     fn install(&mut self, stream: Stream, token: Option<usize>) {
         let registry = registry();
         let slot = match stream {
@@ -1155,7 +1172,7 @@ impl<M: ReceiverMode> Allocation<M> {
         // SAFETY: the receiver is live. The callbacks are functions of this
         // program, which stays loaded, and the opaque value is a token they
         // look up, never a pointer they follow.
-        native!(ReceiveAllocators, table => unsafe {
+        unsafe {
             match stream {
                 Stream::Video => table.NDIlib_recv_set_video_allocator(
                     instance,
@@ -1170,10 +1187,17 @@ impl<M: ReceiverMode> Allocation<M> {
                     token.map(|_| audio_free as _),
                 ),
             }
-        });
+        }
         if let Some(earlier) = earlier {
             registry.retire(earlier);
         }
+    }
+
+    // A build without this declaration family cannot create an Allocation.
+    // Its uninhabited table proves that no allocator can be installed here.
+    #[cfg(not(ndi_has_advanced_receive_allocators))]
+    fn install(&mut self, _: Stream, _: Option<usize>) {
+        match *self.table {}
     }
 
     /// Return to the SDK's own memory and give the receiver back.
@@ -1198,6 +1222,7 @@ impl<M: ReceiverMode> Drop for Allocation<M> {
 }
 
 /// A compressed frame's size, which the SDK passes in the stride union.
+#[cfg(any(test, ndi_has_advanced_receive_allocators))]
 fn compressed_size(size: i32) -> Result<usize> {
     usize::try_from(size)
         .ok()
@@ -1206,12 +1231,14 @@ fn compressed_size(size: i32) -> Result<usize> {
 }
 
 /// A dimension of a compressed frame the SDK is about to receive.
+#[cfg(any(test, ndi_has_advanced_receive_allocators))]
 fn compressed_dimension(value: i32) -> Result<u32> {
     u32::try_from(value)
         .map_err(|_| invalid_frame(format!("Negative compressed allocation dimension {value}")))
 }
 
 /// The request for the video frame the SDK is about to receive.
+#[cfg(any(test, ndi_has_advanced_receive_allocators))]
 fn video_request(frame: &NDIlib_video_frame_v2_t) -> Result<AllocationRequest> {
     let fourcc = FourCc::from_raw(frame.FourCC);
     if VideoCodec::from_outer(frame.FourCC).is_some() {
@@ -1240,6 +1267,7 @@ fn video_request(frame: &NDIlib_video_frame_v2_t) -> Result<AllocationRequest> {
 }
 
 /// The request for the audio frame the SDK is about to receive.
+#[cfg(any(test, ndi_has_advanced_receive_allocators))]
 fn audio_request(frame: &NDIlib_audio_frame_v3_t) -> Result<AllocationRequest> {
     if frame.FourCC != NDIlib_FourCC_audio_type_e_NDIlib_FourCC_audio_type_FLTP {
         if AudioCodec::from_outer(frame.FourCC).is_none() {
@@ -1280,6 +1308,7 @@ fn audio_request(frame: &NDIlib_audio_frame_v3_t) -> Result<AllocationRequest> {
     })
 }
 /// The SDK's request for video memory. `opaque` is the generation token.
+#[cfg(ndi_has_advanced_receive_allocators)]
 unsafe extern "C" fn video_allocate(
     opaque: *mut c_void,
     frame: *mut NDIlib_video_frame_v2_t,
@@ -1306,6 +1335,7 @@ unsafe extern "C" fn video_allocate(
 }
 
 /// The SDK's request for audio memory. `opaque` is the generation token.
+#[cfg(ndi_has_advanced_receive_allocators)]
 unsafe extern "C" fn audio_allocate(
     opaque: *mut c_void,
     frame: *mut NDIlib_audio_frame_v3_t,
@@ -1332,6 +1362,7 @@ unsafe extern "C" fn audio_allocate(
 }
 
 /// Release the allocation at `data` that generation `opaque` made.
+#[cfg(ndi_has_advanced_receive_allocators)]
 fn free(opaque: *mut c_void, data: *mut u8) -> bool {
     catch_unwind(AssertUnwindSafe(|| {
         REGISTRY
@@ -1342,6 +1373,7 @@ fn free(opaque: *mut c_void, data: *mut u8) -> bool {
 }
 
 /// The SDK's release of video memory. `opaque` is the generation token.
+#[cfg(ndi_has_advanced_receive_allocators)]
 unsafe extern "C" fn video_free(
     opaque: *mut c_void,
     frame: *const NDIlib_video_frame_v2_t,
@@ -1351,6 +1383,7 @@ unsafe extern "C" fn video_free(
 }
 
 /// The SDK's release of audio memory. `opaque` is the generation token.
+#[cfg(ndi_has_advanced_receive_allocators)]
 unsafe extern "C" fn audio_free(
     opaque: *mut c_void,
     frame: *const NDIlib_audio_frame_v3_t,

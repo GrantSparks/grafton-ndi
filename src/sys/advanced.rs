@@ -13,6 +13,8 @@ use crate::{
 use std::ffi::CStr;
 
 #[cfg(ndi_has_advanced_header)]
+// The shared registry's selected families determine which generated ABI names
+// it uses. Partial headers can leave either glob (or native_table) unused.
 #[allow(unused_imports)]
 use super::{advanced_bindings::*, bindings::*, table::native_table};
 
@@ -21,21 +23,12 @@ pub(crate) use declared;
 
 // Stored types follow their family, rather than the presence of an umbrella
 // header: an earlier Advanced SDK may have neither AV sync nor genlock.
-declared! { AvSync {
-    pub(crate) use super::advanced_bindings::NDIlib_avsync_instance_t as AvSyncHandle;
-} else {
-    pub(crate) type AvSyncHandle = *mut std::ffi::c_void;
-}}
-declared! { Genlock {
-    pub(crate) use super::advanced_bindings::NDIlib_genlock_instance_t as GenlockHandle;
-} else {
-    pub(crate) type GenlockHandle = *mut std::ffi::c_void;
-}}
-declared! { ScatterSend {
-    pub(crate) use super::advanced_bindings::NDIlib_frame_scatter_t as FrameScatter;
-} else {
-    pub(crate) enum FrameScatter {}
-}}
+#[cfg(ndi_has_advanced_av_sync)]
+pub(crate) use super::advanced_bindings::NDIlib_avsync_instance_t as AvSyncHandle;
+#[cfg(ndi_has_advanced_scatter_send)]
+pub(crate) use super::advanced_bindings::NDIlib_frame_scatter_t as FrameScatter;
+#[cfg(ndi_has_advanced_genlock)]
+pub(crate) use super::advanced_bindings::NDIlib_genlock_instance_t as GenlockHandle;
 
 /// Compile a native expression only when its entire declaration family exists.
 /// Otherwise its table is uninhabited, proving the expression unreachable.

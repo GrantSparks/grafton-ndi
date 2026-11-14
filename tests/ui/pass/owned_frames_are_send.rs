@@ -1,5 +1,3 @@
-#![allow(unused)]
-
 use grafton_ndi::{
     AudioFrame, FrameRate, MetadataFrame, PixelFormat, ScanType, Timecode, VideoFrame,
 };

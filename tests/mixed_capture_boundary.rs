@@ -3,6 +3,8 @@
 
 #[path = "support/fixture.rs"]
 mod fixture;
+#[path = "support/runtime_fixture.rs"]
+mod runtime_fixture;
 
 use grafton_ndi::{
     Error, FrameRate, Ndi, Receiver, ReceiverEvent, ReceiverItem, ReceiverItemRef, ReceiverOptions,
@@ -22,10 +24,11 @@ fn mixed_capture_dispatch_and_lifecycle() {
     }
     let directory = fixture::FixtureDir::create("mixed-capture");
     let library = directory.path().join("libndi_capture.so");
-    fixture::FakeRuntime::new()
-        .with("fake_objects")
-        .with("fake_capture")
-        .build(&library);
+    runtime_fixture::FakeRuntime {
+        cfgs: vec!["fake_objects", "fake_capture"],
+        ..Default::default()
+    }
+    .build(&library);
     let result = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",

@@ -2,8 +2,11 @@
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 #[path = "support/fixture.rs"]
 mod fixture;
-use fixture::{FakeRuntime, FixtureDir};
+#[path = "support/runtime_fixture.rs"]
+mod runtime_fixture;
+use fixture::FixtureDir;
 use grafton_ndi::{Error, Finder, FinderOptions, Ndi, ResourceKind, RuntimeOptions};
+use runtime_fixture::FakeRuntime;
 use std::{path::PathBuf, process::Command, time::Duration};
 
 #[test]
@@ -68,11 +71,12 @@ fn finder_enforces_snapshot_and_whole_window_limits() {
     }
     let directory = FixtureDir::create("finder-limits");
     let library = directory.path().join("finder.so");
-    FakeRuntime::new()
-        .version("6.4.0.2")
-        .with("fake_advanced")
-        .with("fake_finder")
-        .build(&library);
+    FakeRuntime {
+        cfgs: vec!["fake_advanced", "fake_finder"],
+        version: Some("6.4.0.2"),
+        ..Default::default()
+    }
+    .build(&library);
     for scenario in [
         "count",
         "many-short",

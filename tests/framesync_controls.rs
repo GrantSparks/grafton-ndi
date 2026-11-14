@@ -3,6 +3,8 @@
 
 #[path = "support/fixture.rs"]
 mod fixture;
+#[path = "support/runtime_fixture.rs"]
+mod runtime_fixture;
 
 use grafton_ndi::{
     advanced::MouseButton, Error, FrameSync, FrameSyncAudioRequest, MediaTypes, Ndi, Receiver,
@@ -19,14 +21,13 @@ fn controls_keep_the_same_receiver_and_synchronizer() {
     let directory = fixture::FixtureDir::create("framesync-controls");
     for advanced in [false, true] {
         let library = directory.path().join(format!("libcontrols-{advanced}.so"));
-        let fake = fixture::FakeRuntime::new()
-            .with("fake_objects")
-            .with("fake_receiver_controls");
-        let fake = if advanced {
-            fake.with("fake_advanced")
-        } else {
-            fake
+        let mut fake = runtime_fixture::FakeRuntime {
+            cfgs: vec!["fake_objects", "fake_receiver_controls"],
+            ..Default::default()
         };
+        if advanced {
+            fake.cfgs.push("fake_advanced");
+        }
         fake.build(&library);
         let output = Command::new(std::env::current_exe().unwrap())
             .args([

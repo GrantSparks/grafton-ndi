@@ -1,5 +1,3 @@
-#![allow(unused)]
-
 use grafton_ndi::{
     FrameSync, FrameSyncAudioRequest, Ndi, Receiver, ReceiverOptions, ScanType, Source,
 };
@@ -42,4 +40,6 @@ fn compile_contract() -> Result<(), grafton_ndi::Error> {
     Ok(())
 }
 
-fn main() {}
+fn main() {
+    let _ = compile_contract;
+}

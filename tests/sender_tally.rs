@@ -1,5 +1,8 @@
 //! A sender's tally query reports the state a receiver published, every time.
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, name, loopback);
 
 use grafton_ndi::{
     Error, FrameRate, Receiver, ReceiverOptions, Sender, SenderOptions, Tally, VideoFrame,

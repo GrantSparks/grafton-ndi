@@ -24,7 +24,7 @@ fn next() -> String {
 }
 
 export! {
-    fn NDIlib_recv_capture_v3(p_instance: NDIlib_recv_instance_t, p_video_data: *mut NDIlib_video_frame_v2_t, p_audio_data: *mut NDIlib_audio_frame_v3_t, p_metadata: *mut NDIlib_metadata_frame_t, timeout_in_ms: u32) -> NDIlib_frame_type_e {
+    fn NDIlib_recv_capture_v3(_p_instance: NDIlib_recv_instance_t, p_video_data: *mut NDIlib_video_frame_v2_t, p_audio_data: *mut NDIlib_audio_frame_v3_t, p_metadata: *mut NDIlib_metadata_frame_t, timeout_in_ms: u32) -> NDIlib_frame_type_e {
         let kind = next();
         log(&format!("capture:{kind}:{}{}{}:{timeout_in_ms}",
             u8::from(!p_video_data.is_null()), u8::from(!p_audio_data.is_null()), u8::from(!p_metadata.is_null())));
@@ -90,15 +90,15 @@ export! {
         }
     }
 
-    fn NDIlib_recv_free_video_v2(p_instance: NDIlib_recv_instance_t, p_video_data: *const NDIlib_video_frame_v2_t) {
+    fn NDIlib_recv_free_video_v2(_p_instance: NDIlib_recv_instance_t, p_video_data: *const NDIlib_video_frame_v2_t) {
         log("free-video");
         unsafe { drop(Box::from_raw((*p_video_data).p_data.cast::<[MaybeUninit<u8>; 64]>())); }
     }
-    fn NDIlib_recv_free_audio_v3(p_instance: NDIlib_recv_instance_t, p_audio_data: *const NDIlib_audio_frame_v3_t) {
+    fn NDIlib_recv_free_audio_v3(_p_instance: NDIlib_recv_instance_t, p_audio_data: *const NDIlib_audio_frame_v3_t) {
         log("free-audio");
         unsafe { drop(Box::from_raw((*p_audio_data).p_data.cast::<[MaybeUninit<f32>; 16]>())); }
     }
-    fn NDIlib_recv_free_metadata(p_instance: NDIlib_recv_instance_t, p_metadata: *const NDIlib_metadata_frame_t) {
+    fn NDIlib_recv_free_metadata(_p_instance: NDIlib_recv_instance_t, p_metadata: *const NDIlib_metadata_frame_t) {
         log("free-metadata");
         unsafe { drop(CString::from_raw((*p_metadata).p_data)); }
     }

@@ -17,7 +17,10 @@
 //! asking again revives it. After [`ENOUGH`] stalls the answer is in and the
 //! run stops. The report names the configuration the SDK read, and is printed
 //! whether the test passes or not.
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, name, loopback, socket);
 
 use grafton_ndi::{
     ConnectionStats, Ndi, Receiver, ReceiverOptions, Sender, SenderOptions, Source, VideoFrame,

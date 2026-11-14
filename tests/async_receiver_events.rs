@@ -4,7 +4,10 @@
 //! its async connection changes reach the SDK receiver.
 #![cfg(any(feature = "tokio", feature = "smol"))]
 
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, name, loopback);
 
 use grafton_ndi::{
     asynchronous::{AsyncReceiver, AsyncRuntime},

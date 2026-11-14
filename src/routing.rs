@@ -223,7 +223,7 @@ impl Router {
     }
 
     /// The native router, for calls through an Advanced table.
-    #[cfg(feature = "advanced")]
+    #[cfg(all(feature = "advanced", ndi_has_advanced_router_connection_metadata))]
     pub(crate) fn native_instance(&self) -> NDIlib_routing_instance_t {
         self.instance
     }

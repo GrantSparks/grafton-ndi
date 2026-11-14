@@ -27,4 +27,6 @@ fn owned(sender: &Sender, frame: &mut VideoFrame) {
     frame.data_mut().fill(0);
 }
 
-fn main() {}
+fn main() {
+    let _ = (borrowed, borrowed_by_reference, owned);
+}

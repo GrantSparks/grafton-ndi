@@ -16,7 +16,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[cfg(feature = "advanced")]
 mod build_advanced;
 mod build_apple;
 mod build_support;
@@ -32,11 +31,10 @@ fn main() {
     ] {
         println!("cargo:rerun-if-changed={path}");
     }
-    for cfg in [
-        "ndi_link_static",
-        "ndi_has_advanced_header",
-        "ndi_has_complete_advanced_header",
-    ] {
+    for cfg in ["ndi_link_static", "ndi_has_advanced_header"] {
+        println!("cargo:rustc-check-cfg=cfg({cfg})");
+    }
+    for cfg in build_advanced::cfgs() {
         println!("cargo:rustc-check-cfg=cfg({cfg})");
     }
 
@@ -269,8 +267,8 @@ fn generate_advanced_bindings(sdk: &Sdk, target: &str, out: &Path) -> String {
         "ndi_advanced_declarations.rs",
     );
     let selection = build_advanced::selection(&types, &functions);
-    if selection.complete {
-        println!("cargo:rustc-cfg=ndi_has_complete_advanced_header");
+    for cfg in &selection.cfgs {
+        println!("cargo:rustc-cfg={cfg}");
     }
     fs::write(out.join("ndi_advanced_selection.rs"), selection.source)
         .expect("Write Advanced declaration availability");

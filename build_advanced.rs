@@ -5,6 +5,7 @@
 //! an older SDK fail to compile. Individual constants and types are selected by
 //! the same mechanism, without guessing from an SDK version or file name.
 
+#[cfg(feature = "advanced")]
 use std::collections::BTreeSet;
 
 // Only the families and their functions matter here, not the `RuntimeFeature`
@@ -16,22 +17,33 @@ macro_rules! advanced_tables {
             $(fn $name:ident($($argument:ident: $type:ty),* $(,)?) $(-> $return:ty)?;)+
         }
     )+) => {
-        const FAMILIES: &[(&str, &[&str])] = &[
-            $((stringify!($Table), &[$(stringify!($name)),+])),+
+        const FAMILIES: &[(&str, &str, &[&str])] = &[
+            $((
+                stringify!($Table),
+                concat!("ndi_has_advanced_", stringify!($field)),
+                &[$(stringify!($name)),+],
+            )),+
         ];
     };
 }
 
 include!("src/sys/advanced_tables.rs");
 
-/// The available declaration selector and whether every known family exists.
+/// The declaration selector and cfgs for complete, available families.
+#[cfg(feature = "advanced")]
 pub struct Selection {
     pub source: String,
-    pub complete: bool,
+    pub cfgs: Vec<&'static str>,
+}
+
+/// All declaration-family cfg names, including families absent from this SDK.
+pub fn cfgs() -> impl Iterator<Item = &'static str> {
+    FAMILIES.iter().map(|(_, cfg, _)| *cfg)
 }
 
 /// Generate a token selector. An unavailable branch is discarded before Rust
 /// resolves its names, so wrappers keep one public API even with partial SDKs.
+#[cfg(feature = "advanced")]
 pub fn selection(types: &str, functions: &str) -> Selection {
     let mut names = BTreeSet::new();
     for source in [types, functions] {
@@ -60,12 +72,13 @@ pub fn selection(types: &str, functions: &str) -> Selection {
             }
         }
     }
-    for (family, functions) in FAMILIES {
+    let mut cfgs = Vec::new();
+    for (family, cfg, functions) in FAMILIES {
         if functions.iter().all(|name| names.contains(*name)) {
             names.insert((*family).to_owned());
+            cfgs.push(*cfg);
         }
     }
-    let complete = FAMILIES.iter().all(|(family, _)| names.contains(*family));
     let mut source = String::from("macro_rules! declared {\n");
     for name in names {
         source.push_str(&format!(
@@ -73,5 +86,5 @@ pub fn selection(types: &str, functions: &str) -> Selection {
         ));
     }
     source.push_str("    ($name:ident { $($yes:tt)* } else { $($no:tt)* }) => { $($no)* };\n}\n");
-    Selection { source, complete }
+    Selection { source, cfgs }
 }

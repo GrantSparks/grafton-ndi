@@ -40,7 +40,7 @@ export! {
             timestamp: 5678,
         }; }
     }
-    fn NDIlib_framesync_free_video(instance: NDIlib_framesync_instance_t, frame: *mut NDIlib_video_frame_v2_t) {
+    fn NDIlib_framesync_free_video(instance: NDIlib_framesync_instance_t, _frame: *mut NDIlib_video_frame_v2_t) {
         log(&format!("fs-video-free:{instance:p}"));
     }
     fn NDIlib_framesync_capture_audio_v2(instance: NDIlib_framesync_instance_t, frame: *mut NDIlib_audio_frame_v3_t, rate: i32, channels: i32, samples: i32) {
@@ -70,7 +70,7 @@ export! {
             drop(unsafe { Box::from_raw(samples) });
         }
     }
-    fn NDIlib_framesync_audio_queue_depth(instance: NDIlib_framesync_instance_t) -> i32 { 42 }
+    fn NDIlib_framesync_audio_queue_depth(_instance: NDIlib_framesync_instance_t) -> i32 { 42 }
 }
 
 // These functions are declared only by installed Advanced headers. The crate's
@@ -102,14 +102,14 @@ advanced! {
         let xy = unsafe { std::slice::from_raw_parts(position, 2) };
         log(&format!("position:{receiver:p}:{}:{}", xy[0], xy[1])); !refused()
     }
-    fn NDIlib_recv_kvm_send_clipboard_contents(receiver: NDIlib_recv_instance_t, text: *const c_char) -> bool {
+    fn NDIlib_recv_kvm_send_clipboard_contents(receiver: NDIlib_recv_instance_t, _text: *const c_char) -> bool {
         log(&format!("clipboard:{receiver:p}")); !refused()
     }
-    fn NDIlib_recv_kvm_send_touch_positions(receiver: NDIlib_recv_instance_t, count: i32, positions: *const f32) -> bool {
+    fn NDIlib_recv_kvm_send_touch_positions(receiver: NDIlib_recv_instance_t, count: i32, _positions: *const f32) -> bool {
         log(&format!("touch:{receiver:p}:{count}")); !refused()
     }
-    fn NDIlib_recv_kvm_send_vertical_mouse_wheel(receiver: NDIlib_recv_instance_t, units: f32) -> bool { !refused() }
-    fn NDIlib_recv_kvm_send_horizontal_mouse_wheel(receiver: NDIlib_recv_instance_t, units: f32) -> bool { !refused() }
+    fn NDIlib_recv_kvm_send_vertical_mouse_wheel(_receiver: NDIlib_recv_instance_t, _units: f32) -> bool { !refused() }
+    fn NDIlib_recv_kvm_send_horizontal_mouse_wheel(_receiver: NDIlib_recv_instance_t, _units: f32) -> bool { !refused() }
 }
 
 macro_rules! button {

@@ -17,16 +17,16 @@ impl Router {
     ///
     /// [`Error::UnsupportedCapability`](crate::Error::UnsupportedCapability)
     /// without an Advanced runtime (or in a build without the Advanced SDK).
-    pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, metadata: &S) -> Result<()> {
+    pub fn add_connection_metadata<S: MetadataSource + ?Sized>(&self, _metadata: &S) -> Result<()> {
         let table = self.runtime().table::<RouterConnectionMetadata>()?;
-        let router = self.native_instance();
-        let metadata = metadata.metadata_raw();
-        // SAFETY: the router is live for this borrow, and the descriptor
-        // borrows the caller's frame, which outlives the call.
-        native!(RouterConnectionMetadata, table => unsafe {
-            table.NDIlib_routing_add_connection_metadata(router, &metadata)
-        });
-        Ok(())
+        native!(RouterConnectionMetadata, table => {
+            let router = self.native_instance();
+            let metadata = _metadata.metadata_raw();
+            // SAFETY: the router is live for this borrow, and the descriptor
+            // borrows the caller's frame, which outlives the call.
+            unsafe { table.NDIlib_routing_add_connection_metadata(router, &metadata) };
+            Ok(())
+        })
     }
 
     /// Forget the metadata added with
@@ -37,9 +37,11 @@ impl Router {
     /// As for [`add_connection_metadata`](Self::add_connection_metadata).
     pub fn clear_connection_metadata(&self) -> Result<()> {
         let table = self.runtime().table::<RouterConnectionMetadata>()?;
-        let router = self.native_instance();
-        // SAFETY: the router is live for this borrow.
-        native!(RouterConnectionMetadata, table => unsafe { table.NDIlib_routing_clear_connection_metadata(router) });
-        Ok(())
+        native!(RouterConnectionMetadata, table => {
+            let router = self.native_instance();
+            // SAFETY: the router is live for this borrow.
+            unsafe { table.NDIlib_routing_clear_connection_metadata(router) };
+            Ok(())
+        })
     }
 }

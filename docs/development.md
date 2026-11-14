@@ -21,7 +21,7 @@
 | `src/rejected.rs`, `src/error.rs` | `Rejected<T>`, the error that hands a consumed value back, and the crate's `Error` |
 | `src/audio_conversion.rs`, `src/video_conversion.rs` | Checked SDK audio/video conversions |
 | `src/media.rs`, `src/time.rs` | Shared media values (`FrameRate`, `FourCc`, `StreamTier`, `MediaTypes`) and time values (`Timecode`, `SdkTimestamp`) |
-| `src/sys/advanced.rs`, `src/sys/advanced_tables.rs` | The Advanced SDK's function tables, grouped into families, and the one place that depends on which families the installed headers declare |
+| `src/sys/advanced.rs`, `src/sys/advanced_tables.rs` | The Advanced SDK's function tables, grouped into families, and their shared declaration selectors |
 | `build.rs`, `build_support.rs`, `build_apple.rs`, `build_advanced.rs` | Advanced declarations for the `advanced` feature and the selection of the families they declare, static linking for Apple mobile targets |
 | `xtask/` | The generator for the checked-in bindings |
 | `.github/workflows/`, `ci/`, `scripts/` | The CI and release workflows and their scripts; see the [CI guide](../ci/README.md) |
@@ -45,6 +45,14 @@ state without borrowing another field. Borrowed frame, capture, clock and
 control views express buffer lifetimes or exclusive operations; obtain them
 from the owning handle where they are used. Preserve those constraints in
 compile contracts rather than adding shared ownership to every view.
+
+Keep handwritten code free of `dead_code` and blanket `unused` suppressions.
+Remove obsolete code, compile native-only helpers under their declaration
+family, and include shared test or example helpers only in their consumers.
+Compile-only contracts should explicitly reference their function items from
+`main`, without running native operations. Generated ABI modules retain narrowly
+scoped allowances because they mirror complete headers, including declarations
+classified as deliberately unwrapped by the coverage tests.
 
 ## Native functions and bindings
 
@@ -141,7 +149,13 @@ reads the same file, through `build_advanced.rs`, and makes a family available
 only when the installed headers declare every one of its functions, so an older
 Advanced SDK that lacks a family still builds the same public API. Code that
 calls a family is written inside `native!(Family, table => ...)`, which compiles
-the body only when that family is declared. The Advanced coverage test in
+the body only when that family is declared. Keep setup and result handling
+inside that body too. Use `declared!` to select whole definitions, or the
+registry-derived `ndi_has_advanced_<field>` cfg for native-only fields and
+helpers. Pure Rust helpers exercised by unit tests can use
+`any(test, ndi_has_advanced_<field>)`. These selectors must follow the specific
+family rather than the availability of every Advanced declaration.
+The Advanced coverage test in
 `src/sys/advanced_coverage_tests.rs`, which has its own `UNWRAPPED` list, runs
 only in a build with Advanced headers. Lint and test Advanced changes with
 `NDI_SDK_DIR` naming an Advanced SDK, and check them against the oldest
@@ -284,8 +298,23 @@ fn sender_reports_its_source() {
 }
 ```
 
-The helpers live in `src/test_support.rs`. Unit tests use them as
-`crate::test_support`, and integration tests through `mod common;`:
+The shared policy and runtime helpers live in `src/test_support/`. Unit tests
+select them through `src/test_support.rs`. Integration tests import
+`tests/common/mod.rs` as a macro module and select the groups they use:
+
+```rust
+#[macro_use]
+#[path = "common/mod.rs"]
+mod common_helpers;
+common_helpers!(runtime, name, loopback);
+```
+
+This provides `common::ndi`, `common::unique_name`, and
+`common::loopback_source` and checks all included helpers for actual use.
+See the macro's group list when adding a test; native-library compilation
+helpers are separate from the temporary-directory helper in `tests/support/`.
+Fake native libraries compile with warnings denied too, so their test-owned
+implementations follow the same unused-code checks as Rust test binaries.
 
 | Helper | Reports a skip, and returns `None` or `false`, when |
 | --- | --- |
@@ -430,7 +459,9 @@ clock restrictions. Run against a consistent source tree: an unrelated dependenc
 build failure invalidates a compile-contract result, even if a harness reports
 that the individual case compiled.
 Pass fixtures that reference SDK resources keep that code in uncalled contract
-functions with an empty `main`, so trybuild checks types without starting NDI.
+functions. Their `main` references those function items (instantiating generic
+contracts for the types they cover), so trybuild checks types without starting
+NDI and unused-code warnings remain effective.
 
 ```bash
 cargo test --all-features --test compile_contracts --test advanced_contracts

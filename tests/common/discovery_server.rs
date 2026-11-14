@@ -3,10 +3,7 @@
 //! The server program ships in the SDK beside the runtime library:
 //! `<root>/bin/<target>/ndi-discovery-server` next to `<root>/lib/<target>/`.
 
-use grafton_ndi::{
-    discovery::{AdvertiserOptions, ListenerOptions},
-    Ndi,
-};
+use grafton_ndi::Ndi;
 use std::{
     io::{BufRead, BufReader, Read},
     net::{Ipv4Addr, TcpListener, TcpStream},
@@ -192,14 +189,6 @@ impl Server {
 
     pub fn endpoint(&self) -> String {
         format!("127.0.0.1:{}", self.port)
-    }
-
-    pub fn advertisers(&self) -> AdvertiserOptions {
-        AdvertiserOptions::default().servers(self.endpoint())
-    }
-
-    pub fn listeners(&self) -> ListenerOptions {
-        ListenerOptions::default().server(self.endpoint())
     }
 }
 

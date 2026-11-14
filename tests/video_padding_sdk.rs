@@ -2,7 +2,10 @@
 //! Valgrind: `--tool=memcheck --track-origins=yes --error-exitcode=99`.
 #![cfg(target_os = "linux")]
 
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, name, loopback);
 
 use grafton_ndi::{
     Finder, FinderOptions, FrameSync, Ndi, PixelFormat, Receiver, ReceiverColorFormat,

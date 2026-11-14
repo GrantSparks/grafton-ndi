@@ -1,5 +1,8 @@
 //! One Standard capture wait receives whichever stream is actually present.
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, name, loopback);
 
 use grafton_ndi::{
     AudioFrame, Error, MetadataFrame, Receiver, ReceiverItem, ReceiverOptions, Sender,

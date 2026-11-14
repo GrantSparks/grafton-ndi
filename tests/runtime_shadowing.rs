@@ -8,9 +8,12 @@
 
 #[path = "support/fixture.rs"]
 mod fixture;
+#[path = "support/runtime_fixture.rs"]
+mod runtime_fixture;
 
-use fixture::{FakeRuntime, FixtureDir};
+use fixture::FixtureDir;
 use grafton_ndi::{capabilities::SdkEdition, runtime::RuntimeOptions, Error, Ndi};
+use runtime_fixture::FakeRuntime;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -52,19 +55,23 @@ fn loader_search_reports_what_the_platform_resolved() {
         fs::create_dir(root.join(directory)).unwrap();
     }
     // Different libraries that carry the same name.
-    FakeRuntime::new()
-        .with("fake_omit_required")
-        .soname(NAME)
-        .build(&root.join("rejected").join(NAME));
-    FakeRuntime::new()
-        .soname(NAME)
-        .build(&root.join("usable").join(NAME));
+    FakeRuntime {
+        cfgs: vec!["fake_omit_required"],
+        soname: Some(NAME),
+        ..Default::default()
+    }
+    .build(&root.join("rejected").join(NAME));
+    FakeRuntime {
+        soname: Some(NAME),
+        ..Default::default()
+    }
+    .build(&root.join("usable").join(NAME));
     // One that is no NDI runtime at all: it lacks even the symbol a runtime
     // is identified by.
     let anchorless = root.join("anchorless").join(NAME);
-    let mut rustc = fixture::rustc("fake_dependency.rs", &anchorless);
+    let mut rustc = runtime_fixture::rustc("fake_dependency.rs", &anchorless);
     rustc.arg(format!("-Clink-arg=-Wl,-soname,{NAME}"));
-    fixture::run(rustc, &anchorless);
+    runtime_fixture::run(rustc, &anchorless);
 
     for (scenario, runtime_directory, loader_directory) in SCENARIOS {
         let mut command = Command::new(std::env::current_exe().unwrap());

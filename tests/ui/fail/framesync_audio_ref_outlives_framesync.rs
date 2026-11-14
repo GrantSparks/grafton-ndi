@@ -1,5 +1,3 @@
-#![allow(unused)]
-
 use grafton_ndi::{FrameSync, FrameSyncAudioRequest, Ndi, Receiver, ReceiverOptions, Source};
 
 fn receiver(ndi: &Ndi) -> Receiver {

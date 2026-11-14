@@ -1,5 +1,8 @@
 //! Owned async send lifecycle stress. The default path has no SDK callback.
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, name);
 
 use grafton_ndi::{Sender, SenderOptions, VideoFrame};
 

@@ -1,4 +1,3 @@
-#![allow(unused)]
 use grafton_ndi::{AudioFrameRef, MetadataFrameRef, VideoFrameRef};
 
 fn assert_send_sync<T: Send + Sync>() {}
@@ -20,6 +19,7 @@ fn handoff(video: VideoFrameRef<'_>, audio: AudioFrameRef<'_>, metadata: Metadat
 }
 
 fn main() {
+    let _ = handoff;
     assert_send_sync::<VideoFrameRef<'static>>();
     assert_send_sync::<AudioFrameRef<'static>>();
     assert_send_sync::<MetadataFrameRef<'static>>();

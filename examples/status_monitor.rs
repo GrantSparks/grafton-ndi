@@ -23,8 +23,13 @@ use std::{
     time::Duration,
 };
 
-#[path = "common/mod.rs"]
-mod common;
+#[path = "common/arguments.rs"]
+mod arguments;
+#[path = "common/finder.rs"]
+mod finder;
+
+use arguments::option_value;
+use finder::finder_with_extra_ips;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut source_name: Option<String> = None;
@@ -32,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
-            "--source" => source_name = Some(common::option_value(&mut arguments, &argument)?),
+            "--source" => source_name = Some(option_value(&mut arguments, &argument)?),
             flag if flag.starts_with('-') => return Err(format!("unknown option: {flag}").into()),
             _ => extra_ips.push(argument),
         }
@@ -47,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("NDI initialized successfully");
 
     // Find sources
-    let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
+    let finder = finder_with_extra_ips(&ndi, &extra_ips)?;
 
     println!("Looking for NDI sources...");
     let source = if let Some(name) = source_name {

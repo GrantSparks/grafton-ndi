@@ -1,14 +1,17 @@
 //! The metadata sources advertise to a finder.
 
+#[cfg(any(test, ndi_has_advanced_source_metadata))]
 use std::ffi::c_char;
 
 use crate::{
-    finder::{snapshot_entry, SnapshotBudget},
-    sys::{
-        advanced::{native, SourceMetadata},
-        bindings::*,
-    },
+    sys::advanced::{native, SourceMetadata},
     Finder, Result, Source,
+};
+
+#[cfg(any(test, ndi_has_advanced_source_metadata))]
+use crate::{
+    finder::{snapshot_entry, SnapshotBudget},
+    sys::bindings::*,
 };
 
 /// A discovered source together with the metadata it advertises.
@@ -49,6 +52,7 @@ impl ExtendedSource {
 ///
 /// Every non-null argument is a NUL-terminated string that stays readable
 /// until this returns.
+#[cfg(any(test, ndi_has_advanced_source_metadata))]
 unsafe fn extended_source(
     name: *const c_char,
     address: *const c_char,

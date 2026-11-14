@@ -2,11 +2,14 @@
 #![cfg(target_os = "linux")]
 #[path = "support/fixture.rs"]
 mod fixture;
+#[path = "support/runtime_fixture.rs"]
+mod runtime_fixture;
 
-use fixture::{FakeRuntime, FixtureDir};
+use fixture::FixtureDir;
 use grafton_ndi::{
     Error, Finder, FinderOptions, Ndi, RuntimeOptions, Source, SourceAddress, SourceCache,
 };
+use runtime_fixture::FakeRuntime;
 use std::{
     path::PathBuf,
     process::Command,
@@ -78,10 +81,12 @@ fn owning_cache_retains_discovery_scope_and_runtime_across_server_workers() {
     }
     let directory = FixtureDir::create("owned-source-cache");
     let library = directory.path().join("finder.so");
-    FakeRuntime::new()
-        .version("6.4.0.2")
-        .with("fake_finder")
-        .build(&library);
+    FakeRuntime {
+        cfgs: vec!["fake_finder"],
+        version: Some("6.4.0.2"),
+        ..Default::default()
+    }
+    .build(&library);
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -243,10 +248,12 @@ fn exact_selection_preserves_scope_and_complete_host_sets() {
     }
     let directory = FixtureDir::create("finder-selection");
     let library = directory.path().join("finder.so");
-    FakeRuntime::new()
-        .version("6.4.0.2")
-        .with("fake_finder")
-        .build(&library);
+    FakeRuntime {
+        cfgs: vec!["fake_finder"],
+        version: Some("6.4.0.2"),
+        ..Default::default()
+    }
+    .build(&library);
     for scenario in ["selection-forward", "selection-reverse"] {
         let output = Command::new(std::env::current_exe().unwrap())
             .args([

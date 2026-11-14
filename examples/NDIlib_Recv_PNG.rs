@@ -29,8 +29,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[path = "common/mod.rs"]
-mod common;
+#[path = "common/arguments.rs"]
+mod arguments;
+#[path = "common/finder.rs"]
+mod finder;
+#[path = "common/source_wait.rs"]
+mod source_wait;
+
+use arguments::option_value;
+use finder::finder_with_extra_ips;
+use source_wait::wait_for_first_source;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut extra_ips = Vec::new();
@@ -38,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
-            "--output" => output_file = common::option_value(&mut arguments, &argument)?,
+            "--output" => output_file = option_value(&mut arguments, &argument)?,
             flag if flag.starts_with('-') => return Err(format!("unknown option: {flag}").into()),
             _ => extra_ips.push(argument),
         }
@@ -55,10 +63,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
+    let finder = finder_with_extra_ips(&ndi, &extra_ips)?;
 
     println!("Looking for sources ...");
-    let sources = common::wait_for_first_source(&finder, || false)?
+    let sources = wait_for_first_source(&finder, || false)?
         .expect("wait_for_first_source returns None only when the stop closure fires");
     let count = sources.len();
     println!("Found {count} source(s):");

@@ -20,8 +20,10 @@ use grafton_ndi::{
 
 use std::{env, thread, time::Duration};
 
-#[path = "common/mod.rs"]
-mod common;
+#[path = "common/finder.rs"]
+mod finder;
+
+use finder::finder_with_extra_ips;
 
 /// How long each source stays routed.
 const DWELL: Duration = Duration::from_secs(5);
@@ -45,7 +47,7 @@ fn main() -> Result<(), Error> {
     let mut router = Router::new(&ndi, &RouterOptions::new(name))?;
     println!("Advertising router: {}", router.source()?);
 
-    let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
+    let finder = finder_with_extra_ips(&ndi, &extra_ips)?;
     let own = router.source()?;
     let sources: Vec<_> = finder
         .find_sources(Duration::from_secs(5))?

@@ -7,7 +7,10 @@
     not(ndi_link_static),
     feature = "file-io"
 ))]
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, prerequisites);
 #[path = "support/fixture.rs"]
 mod fixture;
 use fixture::FixtureDir;

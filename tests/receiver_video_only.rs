@@ -1,5 +1,8 @@
 //! The 6.4 bandwidth values must suppress audio in a real connection.
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, name, loopback, socket);
 
 use grafton_ndi::{
     capabilities::RuntimeFeature, AudioFrame, FrameRate, Receiver, ReceiverBandwidth,

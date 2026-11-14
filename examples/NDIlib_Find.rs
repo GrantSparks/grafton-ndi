@@ -23,8 +23,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[path = "common/mod.rs"]
-mod common;
+#[path = "common/finder.rs"]
+mod finder;
+
+use finder::finder_with_extra_ips;
 
 fn main() -> Result<(), Error> {
     // Parse command line arguments for extra IPs
@@ -38,7 +40,7 @@ fn main() -> Result<(), Error> {
     println!("NDI initialized successfully\n");
 
     // Create the finder instance
-    let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
+    let finder = finder_with_extra_ips(&ndi, &extra_ips)?;
     println!("Searching for NDI sources...");
     println!("(Will run for 60 seconds)\n");
 

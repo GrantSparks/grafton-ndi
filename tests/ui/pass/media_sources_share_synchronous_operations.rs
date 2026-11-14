@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use grafton_ndi::{
     audio_conversion::{AudioConverter, AudioReferenceLevel},
     AudioFrame, AudioFrameRef, AudioSource, BorrowedVideoFrame, FrameSyncAudioRef,
@@ -39,4 +38,6 @@ fn sources(
     audio(sender, converter, synced_audio);
 }
 
-fn main() {}
+fn main() {
+    let _ = sources;
+}

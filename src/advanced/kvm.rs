@@ -1,14 +1,17 @@
 //! Remote keyboard, mouse, touch and clipboard control of a source.
 
-use std::{collections::BTreeSet, ffi::CString, time::Duration};
+#[cfg(ndi_has_advanced_kvm)]
+use std::ffi::CString;
+use std::{collections::BTreeSet, time::Duration};
 
 use super::{invalid_input, PacketAttached, PacketEvent, PacketReceiver};
+#[cfg(ndi_has_advanced_kvm)]
+use crate::sys::bindings::NDIlib_recv_instance_t;
+#[cfg(any(doc, test, ndi_has_advanced_kvm))]
+use crate::Error;
 use crate::{
-    sys::{
-        advanced::{native, Kvm},
-        bindings::NDIlib_recv_instance_t,
-    },
-    Error, Receiver, ReceiverMode, Result,
+    sys::advanced::{native, Kvm},
+    Receiver, ReceiverMode, Result,
 };
 
 /// A mouse button.
@@ -94,21 +97,17 @@ impl<M: ReceiverMode> Receiver<M> {
 /// message to the source the receiver is connected to, and gives its result
 /// no other meaning, so `false` is a message the SDK did not send:
 /// [`Error::NativeOperationFailed`] naming `$func`.
+#[cfg(ndi_has_advanced_kvm)]
 macro_rules! kvm_send {
     ($session:expr, $func:ident $(, $arg:expr)*) => {{
-        let (kvm, instance) = ($session.kvm, $session.instance());
         // SAFETY: the receiver instance is live for the session's shared
-        // borrow of the receiver, and every argument outlives the synchronous
-        // call. Like the receiver's PTZ commands, which run through `&self`,
-        // these functions take the instance alone, so concurrent use of the
-        // receiver through `receiver()` does not conflict with them.
-        let sent = native!(Kvm, kvm => unsafe { kvm.$func(instance $(, $arg)*) });
+        // borrow, and every argument outlives this synchronous call. Like
+        // PTZ controls, this call may overlap shared use of the receiver.
+        let sent = unsafe { $session.kvm.$func($session.instance() $(, $arg)*) };
         if sent {
             Ok(())
         } else {
-            Err(Error::NativeOperationFailed {
-                operation: stringify!($func),
-            })
+            Err(Error::NativeOperationFailed { operation: stringify!($func) })
         }
     }};
 }
@@ -123,6 +122,7 @@ fn key_symbol(keysym: u32) -> Result<i32> {
 }
 
 /// Positions are fractions of the source's screen: `0.0..=1.0` on each axis.
+#[cfg(any(test, ndi_has_advanced_kvm))]
 fn validate_position(x: f32, y: f32) -> Result<()> {
     let in_range = |value: f32| (0.0..=1.0).contains(&value);
     if in_range(x) && in_range(y) {
@@ -145,6 +145,7 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
         self.receiver
     }
 
+    #[cfg(ndi_has_advanced_kvm)]
     fn instance(&self) -> NDIlib_recv_instance_t {
         self.receiver.core.instance
     }
@@ -161,14 +162,16 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     /// # Errors
     ///
     /// [`Error::NativeOperationFailed`] when the SDK did not send the press.
-    pub fn mouse_down(&mut self, button: MouseButton) -> Result<()> {
-        match button {
-            MouseButton::Left => kvm_send!(self, NDIlib_recv_kvm_send_left_mouse_click),
-            MouseButton::Middle => kvm_send!(self, NDIlib_recv_kvm_send_middle_mouse_click),
-            MouseButton::Right => kvm_send!(self, NDIlib_recv_kvm_send_right_mouse_click),
-        }?;
-        self.buttons.insert(button);
-        Ok(())
+    pub fn mouse_down(&mut self, _button: MouseButton) -> Result<()> {
+        native!(Kvm, self.kvm => {
+            match _button {
+                MouseButton::Left => kvm_send!(self, NDIlib_recv_kvm_send_left_mouse_click),
+                MouseButton::Middle => kvm_send!(self, NDIlib_recv_kvm_send_middle_mouse_click),
+                MouseButton::Right => kvm_send!(self, NDIlib_recv_kvm_send_right_mouse_click),
+            }?;
+            self.buttons.insert(_button);
+            Ok(())
+        })
     }
 
     /// Release a mouse button.
@@ -177,14 +180,16 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     ///
     /// [`Error::NativeOperationFailed`] when the SDK did not send the release;
     /// the button stays recorded as pressed.
-    pub fn mouse_up(&mut self, button: MouseButton) -> Result<()> {
-        match button {
-            MouseButton::Left => kvm_send!(self, NDIlib_recv_kvm_send_left_mouse_release),
-            MouseButton::Middle => kvm_send!(self, NDIlib_recv_kvm_send_middle_mouse_release),
-            MouseButton::Right => kvm_send!(self, NDIlib_recv_kvm_send_right_mouse_release),
-        }?;
-        self.buttons.remove(&button);
-        Ok(())
+    pub fn mouse_up(&mut self, _button: MouseButton) -> Result<()> {
+        native!(Kvm, self.kvm => {
+            match _button {
+                MouseButton::Left => kvm_send!(self, NDIlib_recv_kvm_send_left_mouse_release),
+                MouseButton::Middle => kvm_send!(self, NDIlib_recv_kvm_send_middle_mouse_release),
+                MouseButton::Right => kvm_send!(self, NDIlib_recv_kvm_send_right_mouse_release),
+            }?;
+            self.buttons.remove(&_button);
+            Ok(())
+        })
     }
 
     /// Press a key, identified by its X11 key symbol.
@@ -210,16 +215,20 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
         self.release(key)
     }
 
-    fn press(&mut self, key: i32) -> Result<()> {
-        kvm_send!(self, NDIlib_recv_kvm_send_keyboard_press, key)?;
-        self.keys.insert(key);
-        Ok(())
+    fn press(&mut self, _key: i32) -> Result<()> {
+        native!(Kvm, self.kvm => {
+            kvm_send!(self, NDIlib_recv_kvm_send_keyboard_press, _key)?;
+            self.keys.insert(_key);
+            Ok(())
+        })
     }
 
-    fn release(&mut self, key: i32) -> Result<()> {
-        kvm_send!(self, NDIlib_recv_kvm_send_keyboard_release, key)?;
-        self.keys.remove(&key);
-        Ok(())
+    fn release(&mut self, _key: i32) -> Result<()> {
+        native!(Kvm, self.kvm => {
+            kvm_send!(self, NDIlib_recv_kvm_send_keyboard_release, _key)?;
+            self.keys.remove(&_key);
+            Ok(())
+        })
     }
 
     /// Turn a mouse wheel by `units` notches; the sign gives the direction.
@@ -228,20 +237,22 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     ///
     /// [`Error::InvalidInput`] when `units` is not finite, and
     /// [`Error::NativeOperationFailed`] when the SDK did not send the turn.
-    pub fn wheel(&mut self, axis: WheelAxis, units: f32) -> Result<()> {
-        if !units.is_finite() {
-            return Err(invalid_input(format!(
-                "KVM wheel units {units} are not finite"
-            )));
-        }
-        match axis {
-            WheelAxis::Vertical => {
-                kvm_send!(self, NDIlib_recv_kvm_send_vertical_mouse_wheel, units)
+    pub fn wheel(&mut self, _axis: WheelAxis, _units: f32) -> Result<()> {
+        native!(Kvm, self.kvm => {
+            if !_units.is_finite() {
+                return Err(invalid_input(format!(
+                    "KVM wheel units {_units} are not finite"
+                )));
             }
-            WheelAxis::Horizontal => {
-                kvm_send!(self, NDIlib_recv_kvm_send_horizontal_mouse_wheel, units)
+            match _axis {
+                WheelAxis::Vertical => {
+                    kvm_send!(self, NDIlib_recv_kvm_send_vertical_mouse_wheel, _units)
+                }
+                WheelAxis::Horizontal => {
+                    kvm_send!(self, NDIlib_recv_kvm_send_horizontal_mouse_wheel, _units)
+                }
             }
-        }
+        })
     }
 
     /// Move the pointer to `(x, y)`, each a fraction of the source's screen
@@ -251,11 +262,17 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     ///
     /// [`Error::InvalidInput`] when a coordinate is outside `0.0..=1.0`, and
     /// [`Error::NativeOperationFailed`] when the SDK did not send the move.
-    pub fn move_pointer(&mut self, x: f32, y: f32) -> Result<()> {
-        validate_position(x, y)?;
-        // The SDK reads the two coordinates through the pointer.
-        let position = [x, y];
-        kvm_send!(self, NDIlib_recv_kvm_send_mouse_position, position.as_ptr())
+    pub fn move_pointer(&mut self, _x: f32, _y: f32) -> Result<()> {
+        native!(Kvm, self.kvm => {
+            validate_position(_x, _y)?;
+            // The SDK reads the two coordinates through the pointer.
+            let position = [_x, _y];
+            kvm_send!(
+                self,
+                NDIlib_recv_kvm_send_mouse_position,
+                position.as_ptr()
+            )
+        })
     }
 
     /// Replace the source's clipboard text.
@@ -264,9 +281,15 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     ///
     /// [`Error::InvalidCString`] when `text` contains a NUL, and
     /// [`Error::NativeOperationFailed`] when the SDK did not send the text.
-    pub fn set_clipboard_text(&mut self, text: &str) -> Result<()> {
-        let text = CString::new(text)?;
-        kvm_send!(self, NDIlib_recv_kvm_send_clipboard_contents, text.as_ptr())
+    pub fn set_clipboard_text(&mut self, _text: &str) -> Result<()> {
+        native!(Kvm, self.kvm => {
+            let text = CString::new(_text)?;
+            kvm_send!(
+                self,
+                NDIlib_recv_kvm_send_clipboard_contents,
+                text.as_ptr()
+            )
+        })
     }
 
     /// Report the current touch points, each an `[x, y]` fraction of the
@@ -277,25 +300,27 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     /// [`Error::InvalidInput`] when a coordinate is outside `0.0..=1.0` or
     /// there are more points than the SDK can count, and
     /// [`Error::NativeOperationFailed`] when the SDK did not send them.
-    pub fn touch(&mut self, points: &[[f32; 2]]) -> Result<()> {
-        let count = i32::try_from(points.len()).map_err(|_| {
-            invalid_input(format!(
-                "{} KVM touch points are more than the SDK can count",
-                points.len()
-            ))
-        })?;
-        for [x, y] in points {
-            validate_position(*x, *y)?;
-        }
-        // The SDK reads `count` consecutive coordinate pairs.
-        kvm_send!(
-            self,
-            NDIlib_recv_kvm_send_touch_positions,
-            count,
-            points.as_ptr().cast()
-        )?;
-        self.touching = !points.is_empty();
-        Ok(())
+    pub fn touch(&mut self, _points: &[[f32; 2]]) -> Result<()> {
+        native!(Kvm, self.kvm => {
+            let count = i32::try_from(_points.len()).map_err(|_| {
+                invalid_input(format!(
+                    "{} KVM touch points are more than the SDK can count",
+                    _points.len()
+                ))
+            })?;
+            for [x, y] in _points {
+                validate_position(*x, *y)?;
+            }
+            // The SDK reads `count` consecutive coordinate pairs.
+            kvm_send!(
+                self,
+                NDIlib_recv_kvm_send_touch_positions,
+                count,
+                _points.as_ptr().cast()
+            )?;
+            self.touching = !_points.is_empty();
+            Ok(())
+        })
     }
 
     /// Lift every touch.
@@ -305,9 +330,11 @@ impl<'a, M: ReceiverMode> KvmSession<'a, M> {
     /// [`Error::NativeOperationFailed`] when the SDK did not send the lift;
     /// the touches stay recorded.
     pub fn finish_touch(&mut self) -> Result<()> {
-        kvm_send!(self, NDIlib_recv_kvm_send_touch_finish)?;
-        self.touching = false;
-        Ok(())
+        native!(Kvm, self.kvm => {
+            kvm_send!(self, NDIlib_recv_kvm_send_touch_finish)?;
+            self.touching = false;
+            Ok(())
+        })
     }
 
     /// Release every key, button and touch this session has pressed.

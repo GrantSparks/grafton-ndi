@@ -19,15 +19,17 @@ use grafton_ndi::{
     Error, Ndi, Receiver, ReceiverOptions,
 };
 
-#[path = "common/mod.rs"]
-mod common;
+#[path = "common/finder.rs"]
+mod finder;
+
+use finder::finder_with_extra_ips;
 
 fn main() -> Result<(), Error> {
     let args: Vec<String> = env::args().collect();
     let extra_ips: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
 
     let ndi = Ndi::new()?;
-    let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
+    let finder = finder_with_extra_ips(&ndi, &extra_ips)?;
     let Some(source) = finder
         .find_sources(Duration::from_secs(5))?
         .into_iter()

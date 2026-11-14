@@ -2,15 +2,15 @@
 //! selection is intentionally irreversible, while failed selection is retryable.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
-#[path = "support/fixture.rs"]
-mod fixture;
+#[path = "support/runtime_fixture.rs"]
+mod runtime_fixture;
 
-use fixture::FakeRuntime;
 use grafton_ndi::{
     capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, SdkEdition},
     runtime::{Runtime, RuntimeOptions},
     Error, Ndi,
 };
+use runtime_fixture::FakeRuntime;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -46,43 +46,65 @@ impl Fixtures {
         let fixtures = Self {
             root: root.to_owned(),
         };
-        FakeRuntime::new().build(&fixtures.complete());
-        FakeRuntime::new()
-            .with("fake_omit_required")
-            .build(&fixtures.missing());
+        FakeRuntime::default().build(&fixtures.complete());
+        FakeRuntime {
+            cfgs: vec!["fake_omit_required"],
+            ..Default::default()
+        }
+        .build(&fixtures.missing());
         // A dependency may export an entry point the module itself lacks. A
         // lookup through the module's handle finds it; the loader must not.
-        let dependency = fixture::build_dependency(&root.join("libndi_dependency.so"));
-        FakeRuntime::new()
-            .with("fake_omit_required")
-            .depending_on(&dependency)
-            .build(&fixtures.foreign());
-        FakeRuntime::new()
-            .with("fake_receiver_v4")
-            .build(&fixtures.newer_standard());
-        FakeRuntime::new()
-            .with("fake_advanced")
-            .build(&fixtures.advanced());
-        FakeRuntime::new()
-            .with("fake_advanced")
-            .with("fake_configured_creation")
-            .version("6.4.0.0")
-            .build(&fixtures.configured_only());
-        FakeRuntime::new()
-            .version("7.0.0.1")
-            .build(&fixtures.next_major());
-        FakeRuntime::new()
-            .with("fake_long_version")
-            .build(&fixtures.long_version());
-        FakeRuntime::new()
-            .version(BESIDE_EXECUTABLE)
-            .build(&fixtures.bundle().join(STANDARD_NAME));
-        FakeRuntime::new()
-            .version(IN_RUNTIME_DIRECTORY)
-            .build(&fixtures.runtime().join(STANDARD_NAME));
-        FakeRuntime::new()
-            .version(ON_LOADER_PATH)
-            .build(&fixtures.loader().join(STANDARD_NAME));
+        let dependency = runtime_fixture::run(
+            runtime_fixture::rustc("fake_dependency.rs", &root.join("libndi_dependency.so")),
+            &root.join("libndi_dependency.so"),
+        );
+        FakeRuntime {
+            cfgs: vec!["fake_omit_required"],
+            dependency: Some(&dependency),
+            ..Default::default()
+        }
+        .build(&fixtures.foreign());
+        FakeRuntime {
+            cfgs: vec!["fake_receiver_v4"],
+            ..Default::default()
+        }
+        .build(&fixtures.newer_standard());
+        FakeRuntime {
+            cfgs: vec!["fake_advanced"],
+            ..Default::default()
+        }
+        .build(&fixtures.advanced());
+        FakeRuntime {
+            cfgs: vec!["fake_advanced", "fake_configured_creation"],
+            version: Some("6.4.0.0"),
+            ..Default::default()
+        }
+        .build(&fixtures.configured_only());
+        FakeRuntime {
+            version: Some("7.0.0.1"),
+            ..Default::default()
+        }
+        .build(&fixtures.next_major());
+        FakeRuntime {
+            cfgs: vec!["fake_long_version"],
+            ..Default::default()
+        }
+        .build(&fixtures.long_version());
+        FakeRuntime {
+            version: Some(BESIDE_EXECUTABLE),
+            ..Default::default()
+        }
+        .build(&fixtures.bundle().join(STANDARD_NAME));
+        FakeRuntime {
+            version: Some(IN_RUNTIME_DIRECTORY),
+            ..Default::default()
+        }
+        .build(&fixtures.runtime().join(STANDARD_NAME));
+        FakeRuntime {
+            version: Some(ON_LOADER_PATH),
+            ..Default::default()
+        }
+        .build(&fixtures.loader().join(STANDARD_NAME));
         // A Standard module under the Advanced runtime's file name.
         fs::copy(
             fixtures.complete(),

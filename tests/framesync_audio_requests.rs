@@ -1,7 +1,10 @@
 //! SDK regression: an application follows the source's channels through
 //! `FrameSync::audio_input_format`, and a capture request keeps its own
 //! channel count when the source changes.
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, name, loopback);
 
 use grafton_ndi::{
     AudioFrame, FrameSync, FrameSyncAudioRequest, Receiver, ReceiverOptions, Sender, SenderOptions,

@@ -16,6 +16,7 @@ fn captured(sender: &Sender, receiver: &Receiver, metadata: &MetadataFrameRef<'_
 }
 
 fn main() {
+    let _ = captured;
     let owned = MetadataFrame::new("<metadata/>").unwrap();
     let source: &dyn MetadataSource = &owned;
     assert_eq!(source.to_owned(), owned.to_owned());

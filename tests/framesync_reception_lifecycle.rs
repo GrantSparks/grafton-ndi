@@ -1,5 +1,8 @@
 //! Real-runtime checks for FrameSync output and per-media reception.
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, name, loopback);
 #[path = "../examples/common/reception_monitor.rs"]
 mod reception_monitor;
 

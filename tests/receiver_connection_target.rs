@@ -3,6 +3,8 @@
 
 #[path = "support/fixture.rs"]
 mod fixture;
+#[path = "support/runtime_fixture.rs"]
+mod runtime_fixture;
 
 use grafton_ndi::{Error, Ndi, Receiver, ReceiverOptions, RuntimeOptions, Source};
 use std::{fs, process::Command, sync::Barrier};
@@ -15,9 +17,11 @@ fn connection_target_tracks_native_requests() {
     }
     let directory = fixture::FixtureDir::create("connection-target");
     let library = directory.path().join("libndi_target.so");
-    fixture::FakeRuntime::new()
-        .with("fake_objects")
-        .build(&library);
+    runtime_fixture::FakeRuntime {
+        cfgs: vec!["fake_objects"],
+        ..Default::default()
+    }
+    .build(&library);
     let result = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",

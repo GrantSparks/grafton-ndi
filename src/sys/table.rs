@@ -55,9 +55,10 @@ macro_rules! native_table {
             $(const _: unsafe extern "C" fn($($type),*) $(-> $return)? = declarations::$name;)+
         };
 
-        #[allow(non_snake_case, dead_code, clippy::too_many_arguments)]
+        #[allow(non_snake_case, clippy::too_many_arguments)]
         impl $Table {
             /// Exported names, in declaration order.
+            #[cfg(test)]
             pub(crate) const SYMBOLS: &'static [&'static ::std::ffi::CStr] = &[
                 $($crate::sys::table::symbol_name(concat!(stringify!($name), "\0")),)+
             ];
@@ -145,6 +146,39 @@ mod tests {
             .unwrap()
             .err();
         assert_eq!(missing, Some(c"NDIlib_recv_destroy"));
+    }
+
+    #[test]
+    fn a_loaded_table_forwards_arguments_and_return_values() {
+        unsafe extern "C" fn initialize() -> bool {
+            true
+        }
+        unsafe extern "C" fn destroy(instance: NDIlib_recv_instance_t) {
+            // SAFETY: this stub receives the uniquely borrowed flag below,
+            // passed through the opaque native handle without dereferencing it.
+            unsafe { instance.cast::<bool>().write(true) };
+        }
+
+        struct Stubs;
+        impl Resolver for Stubs {
+            fn resolve(&self, name: &CStr) -> Result<Option<NonNull<c_void>>> {
+                Ok(NonNull::new(match name.to_bytes() {
+                    b"NDIlib_initialize" => initialize as *mut c_void,
+                    b"NDIlib_recv_destroy" => destroy as *mut c_void,
+                    _ => return Ok(None),
+                }))
+            }
+        }
+
+        let table = Pair::load(&Stubs).unwrap().ok().unwrap();
+        let mut destroyed = false;
+        // SAFETY: this table resolved the callable stubs above. Initialization
+        // has no preconditions, and destruction receives the flag it expects.
+        unsafe {
+            assert!(table.NDIlib_initialize());
+            table.NDIlib_recv_destroy(std::ptr::from_mut(&mut destroyed).cast());
+        }
+        assert!(destroyed);
     }
 
     #[test]

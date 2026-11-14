@@ -2,9 +2,12 @@
 #![cfg(target_os = "linux")]
 #[path = "support/fixture.rs"]
 mod fixture;
+#[path = "support/runtime_fixture.rs"]
+mod runtime_fixture;
 
-use fixture::{FakeRuntime, FixtureDir};
+use fixture::FixtureDir;
 use grafton_ndi::{Finder, FinderOptions, Ndi, RuntimeOptions, SourceCache};
+use runtime_fixture::FakeRuntime;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -249,10 +252,12 @@ fn finder_lookup_snapshot_contention_spends_one_wait_budget() {
     }
     let directory = FixtureDir::create("finder-deadlines");
     let library = directory.path().join("finder.so");
-    FakeRuntime::new()
-        .version("6.4.0.2")
-        .with("fake_finder")
-        .build(&library);
+    FakeRuntime {
+        cfgs: vec!["fake_finder"],
+        version: Some("6.4.0.2"),
+        ..Default::default()
+    }
+    .build(&library);
     run_child(directory.path(), &library);
 }
 

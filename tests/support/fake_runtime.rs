@@ -51,8 +51,10 @@
 //! advertisers remove nothing and return false, as the SDK does for an object
 //! it does not know.
 
-#![allow(non_snake_case, unused_variables, clippy::missing_safety_doc)]
+#![allow(non_snake_case, clippy::missing_safety_doc)]
 
+// Generated SDK declarations intentionally include APIs outside this fake
+// library; only the exported implementations below are test-owned code.
 #[rustfmt::skip]
 #[path = "../../src/sys/bindings.rs"]
 #[allow(non_upper_case_globals, non_camel_case_types, dead_code, unused_imports)]
@@ -111,7 +113,7 @@ macro_rules! names_a_server {
 /// Export functions under their SDK names, each checked against the vendored
 /// declaration of the same name.
 macro_rules! export {
-    ($(fn $name:ident($($argument:ident: $type:ty),* $(,)?) $(-> $return:ty)? $body:block)+) => {$(
+    ($(fn $name:ident($($argument:tt: $type:ty),* $(,)?) $(-> $return:ty)? $body:block)+) => {$(
         #[no_mangle]
         pub unsafe extern "C" fn $name($($argument: $type),*) $(-> $return)? $body
         const _: unsafe extern "C" fn($($type),*) $(-> $return)? = declarations::$name;
@@ -122,7 +124,7 @@ macro_rules! export {
 macro_rules! stub {
     ($(fn $name:ident($($argument:ident: $type:ty),* $(,)?) $(-> $return:ty)?;)+) => {
         export! {$(
-            fn $name($($argument: $type),*) $(-> $return)? {
+            fn $name($(_: $type),*) $(-> $return)? {
                 // SAFETY: every stubbed return type is an integer, a boolean or
                 // a raw pointer, for which all-zero bytes are a valid value.
                 unsafe { std::mem::zeroed() }
@@ -164,7 +166,7 @@ export! {
 // Record native connection requests so tests can compare the remembered target
 // with what actually crossed the FFI boundary, including concurrent requests.
 export! {
-    fn NDIlib_recv_connect(p_instance: NDIlib_recv_instance_t, p_src: *const NDIlib_source_t) {
+    fn NDIlib_recv_connect(_p_instance: NDIlib_recv_instance_t, p_src: *const NDIlib_source_t) {
         let name = if p_src.is_null() {
             "<disconnected>".into()
         } else {
@@ -315,7 +317,7 @@ mod objects {
     }
 
     export! {
-        fn NDIlib_recv_create_v3(p_create_settings: *const NDIlib_recv_create_v3_t) -> NDIlib_recv_instance_t {
+        fn NDIlib_recv_create_v3(_p_create_settings: *const NDIlib_recv_create_v3_t) -> NDIlib_recv_instance_t {
             log("receiver-create");
             handle()
         }
@@ -325,7 +327,7 @@ mod objects {
             unsafe { release(p_instance) };
         }
 
-        fn NDIlib_send_create(p_create_settings: *const NDIlib_send_create_t) -> NDIlib_send_instance_t {
+        fn NDIlib_send_create(_p_create_settings: *const NDIlib_send_create_t) -> NDIlib_send_instance_t {
             log("sender-create");
             Box::into_raw(Box::new(Sender {
                 opaque: std::ptr::null_mut(),
@@ -365,7 +367,7 @@ mod objects {
             }
         }
 
-        fn NDIlib_send_capture(p_instance: NDIlib_send_instance_t, p_metadata: *mut NDIlib_metadata_frame_t, timeout_in_ms: u32) -> NDIlib_frame_type_e {
+        fn NDIlib_send_capture(_p_instance: NDIlib_send_instance_t, p_metadata: *mut NDIlib_metadata_frame_t, _timeout_in_ms: u32) -> NDIlib_frame_type_e {
             // Default text is not UTF-8, so capture must free it on rejection.
             // The alternate valid C string deliberately reports a count that
             // excludes the terminator; SDK freeing still gets that exact count.
@@ -380,7 +382,7 @@ mod objects {
             NDIlib_frame_type_e_NDIlib_frame_type_metadata
         }
 
-        fn NDIlib_send_free_metadata(p_instance: NDIlib_send_instance_t, p_metadata: *const NDIlib_metadata_frame_t) {
+        fn NDIlib_send_free_metadata(_p_instance: NDIlib_send_instance_t, p_metadata: *const NDIlib_metadata_frame_t) {
             log("sender-metadata-free");
             log(&format!("sender-metadata-free-count={}", unsafe { (*p_metadata).length }));
             drop(unsafe { Box::from_raw((*p_metadata).p_data.cast::<[u8; 2]>()) });
@@ -399,12 +401,12 @@ mod objects {
             unsafe { release(p_instance) };
         }
 
-        fn NDIlib_send_advertiser_add_sender(p_instance: NDIlib_send_advertiser_instance_t, p_sender: NDIlib_send_instance_t, allow_monitoring: bool) -> bool {
+        fn NDIlib_send_advertiser_add_sender(_p_instance: NDIlib_send_advertiser_instance_t, _p_sender: NDIlib_send_instance_t, allow_monitoring: bool) -> bool {
             log(&format!("send-advertiser-add monitoring={allow_monitoring}"));
             true
         }
 
-        fn NDIlib_send_advertiser_del_sender(p_instance: NDIlib_send_advertiser_instance_t, p_sender: NDIlib_send_instance_t) -> bool {
+        fn NDIlib_send_advertiser_del_sender(_p_instance: NDIlib_send_advertiser_instance_t, _p_sender: NDIlib_send_instance_t) -> bool {
             if refuses_removal() {
                 return false;
             }
@@ -461,18 +463,18 @@ mod objects {
             drop(unsafe { Box::from_raw(p_instance.cast::<Router>()) });
         }
 
-        fn NDIlib_routing_change(p_instance: NDIlib_routing_instance_t, p_source: *const NDIlib_source_t) -> bool {
+        fn NDIlib_routing_change(_p_instance: NDIlib_routing_instance_t, p_source: *const NDIlib_source_t) -> bool {
             let name = unsafe { CStr::from_ptr((*p_source).p_ndi_name) };
             log(&format!("router-change {}", name.to_string_lossy()));
             true
         }
 
-        fn NDIlib_routing_clear(p_instance: NDIlib_routing_instance_t) -> bool {
+        fn NDIlib_routing_clear(_p_instance: NDIlib_routing_instance_t) -> bool {
             log("router-clear");
             true
         }
 
-        fn NDIlib_routing_get_no_connections(p_instance: NDIlib_routing_instance_t, timeout_in_ms: u32) -> ::std::os::raw::c_int {
+        fn NDIlib_routing_get_no_connections(_p_instance: NDIlib_routing_instance_t, _timeout_in_ms: u32) -> ::std::os::raw::c_int {
             0
         }
 
@@ -605,11 +607,11 @@ mod discovery {
             drop(unsafe { Box::from_raw(p_instance.cast::<SendListener>()) });
         }
 
-        fn NDIlib_send_listener_is_connected(p_instance: NDIlib_send_listener_instance_t) -> bool {
+        fn NDIlib_send_listener_is_connected(_p_instance: NDIlib_send_listener_instance_t) -> bool {
             true
         }
 
-        fn NDIlib_send_listener_get_server_url(p_instance: NDIlib_send_listener_instance_t) -> *const c_char {
+        fn NDIlib_send_listener_get_server_url(_p_instance: NDIlib_send_listener_instance_t) -> *const c_char {
             c"192.0.2.1:5959".as_ptr()
         }
 
@@ -619,15 +621,15 @@ mod discovery {
             listener.senders.as_ptr()
         }
 
-        fn NDIlib_send_listener_wait_for_senders(p_instance: NDIlib_send_listener_instance_t, timeout_in_ms: u32) -> bool {
+        fn NDIlib_send_listener_wait_for_senders(_p_instance: NDIlib_send_listener_instance_t, _timeout_in_ms: u32) -> bool {
             false
         }
 
-        fn NDIlib_send_listener_subscribe_events(p_instance: NDIlib_send_listener_instance_t, p_sender_uuid: *const c_char) {
+        fn NDIlib_send_listener_subscribe_events(_p_instance: NDIlib_send_listener_instance_t, p_sender_uuid: *const c_char) {
             log(&format!("send-listener-subscribe {}", unsafe { bytes(p_sender_uuid) }));
         }
 
-        fn NDIlib_send_listener_unsubscribe_events(p_instance: NDIlib_send_listener_instance_t, p_sender_uuid: *const c_char) {
+        fn NDIlib_send_listener_unsubscribe_events(_p_instance: NDIlib_send_listener_instance_t, p_sender_uuid: *const c_char) {
             log(&format!("send-listener-unsubscribe {}", unsafe { bytes(p_sender_uuid) }));
         }
 
@@ -696,11 +698,11 @@ mod discovery {
             drop(unsafe { Box::from_raw(p_instance.cast::<RecvListener>()) });
         }
 
-        fn NDIlib_recv_listener_is_connected(p_instance: NDIlib_recv_listener_instance_t) -> bool {
+        fn NDIlib_recv_listener_is_connected(_p_instance: NDIlib_recv_listener_instance_t) -> bool {
             true
         }
 
-        fn NDIlib_recv_listener_get_server_url(p_instance: NDIlib_recv_listener_instance_t) -> *const c_char {
+        fn NDIlib_recv_listener_get_server_url(_p_instance: NDIlib_recv_listener_instance_t) -> *const c_char {
             c"192.0.2.1:5959".as_ptr()
         }
 
@@ -710,15 +712,15 @@ mod discovery {
             listener.receivers.as_ptr()
         }
 
-        fn NDIlib_recv_listener_wait_for_receivers(p_instance: NDIlib_recv_listener_instance_t, timeout_in_ms: u32) -> bool {
+        fn NDIlib_recv_listener_wait_for_receivers(_p_instance: NDIlib_recv_listener_instance_t, _timeout_in_ms: u32) -> bool {
             false
         }
 
-        fn NDIlib_recv_listener_subscribe_events(p_instance: NDIlib_recv_listener_instance_t, p_receiver_uuid: *const c_char) {
+        fn NDIlib_recv_listener_subscribe_events(_p_instance: NDIlib_recv_listener_instance_t, p_receiver_uuid: *const c_char) {
             log(&format!("recv-listener-subscribe {}", unsafe { bytes(p_receiver_uuid) }));
         }
 
-        fn NDIlib_recv_listener_unsubscribe_events(p_instance: NDIlib_recv_listener_instance_t, p_receiver_uuid: *const c_char) {
+        fn NDIlib_recv_listener_unsubscribe_events(_p_instance: NDIlib_recv_listener_instance_t, p_receiver_uuid: *const c_char) {
             log(&format!("recv-listener-unsubscribe {}", unsafe { bytes(p_receiver_uuid) }));
         }
 
@@ -734,7 +736,7 @@ mod discovery {
             unsafe { free_events(&mut listener.batch, p_events) };
         }
 
-        fn NDIlib_recv_listener_send_connect(p_instance: NDIlib_recv_listener_instance_t, p_receiver_uuid: *const c_char, p_source_name: *const c_char) -> bool {
+        fn NDIlib_recv_listener_send_connect(_p_instance: NDIlib_recv_listener_instance_t, p_receiver_uuid: *const c_char, p_source_name: *const c_char) -> bool {
             log(&format!("recv-listener-connect {} {}", unsafe { bytes(p_receiver_uuid) }, unsafe { bytes(p_source_name) }));
             true
         }
@@ -753,7 +755,7 @@ use objects::NDIlib_send_create;
 #[no_mangle]
 pub unsafe extern "C" fn NDIlib_recv_create_v4(
     p_create_settings: *const NDIlib_recv_create_v3_t,
-    p_config_data: *const c_char,
+    _p_config_data: *const c_char,
 ) -> NDIlib_recv_instance_t {
     unsafe { NDIlib_recv_create_v3(p_create_settings) }
 }
@@ -762,7 +764,7 @@ pub unsafe extern "C" fn NDIlib_recv_create_v4(
 #[no_mangle]
 pub unsafe extern "C" fn NDIlib_send_create_v2(
     p_create_settings: *const NDIlib_send_create_t,
-    p_config_data: *const c_char,
+    _p_config_data: *const c_char,
 ) -> NDIlib_send_instance_t {
     unsafe { NDIlib_send_create(p_create_settings) }
 }
@@ -786,8 +788,8 @@ macro_rules! configured_creation {
     ($($name:ident($Settings:ty) -> $Instance:ty;)+) => {$(
         #[no_mangle]
         pub unsafe extern "C" fn $name(
-            p_create_settings: *const $Settings,
-            p_config_data: *const c_char,
+            _p_create_settings: *const $Settings,
+            _p_config_data: *const c_char,
         ) -> $Instance {
             log(stringify!($name));
             std::ptr::null_mut()

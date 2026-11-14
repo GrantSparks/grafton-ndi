@@ -21,4 +21,5 @@ fn configured(finder: Finder) -> Result<()> {
 
 fn main() {
     cache_contract::<SourceCache>();
+    let _ = configured;
 }

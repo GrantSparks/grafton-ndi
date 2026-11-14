@@ -1,14 +1,14 @@
 error[E0382]: use of moved value: `frame`
- --> tests/ui/fail/owned_async_prevents_double_send.rs:5:37
+ --> tests/ui/fail/owned_async_prevents_double_send.rs:4:37
   |
-3 | fn resend(sender: &mut Sender, frame: VideoFrame) {
+2 | fn resend(sender: &mut Sender, frame: VideoFrame) {
   |                                ----- move occurs because `frame` has type `VideoFrame`, which does not implement the `Copy` trait
-4 |     let _ = sender.send_video_async(frame);
+3 |     let _ = sender.send_video_async(frame);
   |                                     ----- value moved here
-5 |     let _ = sender.send_video_async(frame);
+4 |     let _ = sender.send_video_async(frame);
   |                                     ^^^^^ value used here after move
   |
 help: consider cloning the value if the performance cost is acceptable
   |
-4 |     let _ = sender.send_video_async(frame.clone());
+3 |     let _ = sender.send_video_async(frame.clone());
   |                                          ++++++++

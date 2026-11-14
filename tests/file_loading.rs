@@ -5,14 +5,17 @@
 
 #[path = "support/fixture.rs"]
 mod fixture;
+#[path = "support/runtime_fixture.rs"]
+mod runtime_fixture;
 
-use fixture::{FakeRuntime, FixtureDir};
+use fixture::FixtureDir;
 use grafton_ndi::{
     capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, SdkEdition},
     file::{FileApi, FileFamily, FileRuntimeOptions, PlayerOptions, RecorderOptions, SourceSpec},
     runtime::RuntimeOptions,
     Error, Ndi,
 };
+use runtime_fixture::FakeRuntime;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -30,14 +33,14 @@ const FILE_LIBRARY: &str = "libndifile.so.6";
 /// `core` the way the vendor's is: it imports the runtime's entry points and
 /// looks for the runtime beside itself.
 fn build_file_library(output: &Path, core: &Path, cfgs: &[&str]) -> PathBuf {
-    let mut rustc = fixture::rustc("fake_file_library.rs", output);
+    let mut rustc = runtime_fixture::rustc("fake_file_library.rs", output);
     for cfg in cfgs {
         rustc.args(["--cfg", cfg]);
     }
     rustc
-        .arg(fixture::link_argument(core.as_os_str()))
+        .arg(runtime_fixture::link_argument(core.as_os_str()))
         .arg("-Clink-arg=-Wl,--disable-new-dtags,-rpath,$ORIGIN");
-    fixture::run(rustc, output)
+    runtime_fixture::run(rustc, output)
 }
 
 /// One arrangement of libraries: a directory, the build number its Advanced
@@ -108,16 +111,20 @@ impl Fixtures {
             &paired,
             &["fake_omit_recording_entry"],
         );
-        FakeRuntime::new().build(&fixtures.standard_core());
+        FakeRuntime::default().build(&fixtures.standard_core());
         fixtures
     }
 
     fn build_core(&self, arrangement: &Arrangement) -> PathBuf {
         fs::create_dir(self.root.join(arrangement.directory)).unwrap();
         let version = format!("6.4.0.{}", arrangement.build);
-        let mut runtime = FakeRuntime::new().with("fake_advanced").version(&version);
+        let mut runtime = FakeRuntime {
+            cfgs: vec!["fake_advanced"],
+            version: Some(&version),
+            ..Default::default()
+        };
         if arrangement.named {
-            runtime = runtime.soname(ADVANCED_CORE);
+            runtime.soname = Some(ADVANCED_CORE);
         }
         runtime.build(&self.core(arrangement))
     }

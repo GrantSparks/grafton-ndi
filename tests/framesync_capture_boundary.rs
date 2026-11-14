@@ -1,4 +1,7 @@
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, name, loopback);
 
 use grafton_ndi::{
     AudioFrame, Error, FrameRate, FrameSync, FrameSyncAudioRequest, Receiver, ReceiverOptions,

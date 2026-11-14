@@ -1,5 +1,3 @@
-#![allow(unused)]
-
 use std::time::Duration;
 
 use grafton_ndi::{Ndi, Receiver, ReceiverOptions, Source};
@@ -50,4 +48,6 @@ fn compile_contract() -> Result<(), grafton_ndi::Error> {
     Ok(())
 }
 
-fn main() {}
+fn main() {
+    let _ = compile_contract;
+}

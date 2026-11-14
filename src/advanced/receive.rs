@@ -190,7 +190,7 @@ impl PacketReceiver {
                 &options,
                 "NDIlib_recv_create_v4",
                 &config,
-                |table: &'static ReceiverConfiguration, settings, text| native!(ReceiverConfiguration, table => table.NDIlib_recv_create_v4(settings, text)),
+                |table: &'static ReceiverConfiguration, _settings, _text| native!(ReceiverConfiguration, table => table.NDIlib_recv_create_v4(_settings, _text)),
             )
         }?;
         Ok(Self::from_receiver(receiver.into_mode()))

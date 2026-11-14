@@ -13,7 +13,10 @@
 //! Frames hold slowly varying levels, as pictures do.
 #![cfg(target_os = "linux")]
 
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, name, loopback);
 
 // Standard 6.1.1 produces different lossy pixels for identical initialized
 // submissions when this binary's guard-page stress sender runs concurrently.

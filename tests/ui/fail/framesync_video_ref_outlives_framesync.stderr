@@ -1,12 +1,12 @@
 error[E0597]: `framesync` does not live long enough
-  --> tests/ui/fail/framesync_video_ref_outlives_framesync.rs:16:9
+  --> tests/ui/fail/framesync_video_ref_outlives_framesync.rs:14:9
    |
-14 |     let frame_ref = {
+12 |     let frame_ref = {
    |         --------- borrow later stored here
-15 |         let framesync = FrameSync::new(receiver(&ndi)).unwrap();
+13 |         let framesync = FrameSync::new(receiver(&ndi)).unwrap();
    |             --------- binding `framesync` declared here
-16 |         framesync
+14 |         framesync
    |         ^^^^^^^^^ borrowed value does not live long enough
 ...
-20 |     };
+18 |     };
    |     - `framesync` dropped here while still borrowed

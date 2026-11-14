@@ -2155,12 +2155,10 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let blocker = worker
-            .call(move |_| {
+            .call(move |_| -> Result<()> {
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 panic!("mock owner failure");
-                #[allow(unreachable_code)]
-                Ok(())
             })
             .submit();
         entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();

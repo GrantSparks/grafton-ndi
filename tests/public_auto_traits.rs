@@ -64,7 +64,6 @@ fn split_views_stay_on_the_borrowing_thread() {
 /// The public types of the crate root and its modules other than those below.
 #[test]
 fn crate_root_types_keep_their_auto_traits() {
-    #[allow(unused_imports)]
     use grafton_ndi::*;
     has! {
         AudioChannels<'static>: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -185,7 +184,6 @@ fn image_encoding_types_keep_their_auto_traits() {
 #[cfg(feature = "tokio")]
 #[test]
 fn tokio_types_keep_their_auto_traits() {
-    #[allow(unused_imports)]
     use grafton_ndi::asynchronous::{AsyncReceiver, Tokio};
     has! {
         AsyncReceiver<Tokio>: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -197,7 +195,6 @@ fn tokio_types_keep_their_auto_traits() {
 #[cfg(feature = "smol")]
 #[test]
 fn smol_types_keep_their_auto_traits() {
-    #[allow(unused_imports)]
     use grafton_ndi::asynchronous::{AsyncReceiver, Smol};
     has! {
         AsyncReceiver<Smol>: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -208,7 +205,6 @@ fn smol_types_keep_their_auto_traits() {
 /// The public types of the `discovery` module.
 #[test]
 fn discovery_types_keep_their_auto_traits() {
-    #[allow(unused_imports)]
     use grafton_ndi::discovery::*;
     has! {
         AdvertisedReceiver: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -237,7 +233,6 @@ fn discovery_types_keep_their_auto_traits() {
 #[cfg(feature = "advanced")]
 #[test]
 fn advanced_modes_types_keep_their_auto_traits() {
-    #[allow(unused_imports)]
     use grafton_ndi::{
         advanced::{AvSyncAttached, PacketAttached},
         CompressedAttached, QueueAttached, Receiver, Sender,
@@ -255,7 +250,6 @@ fn advanced_modes_types_keep_their_auto_traits() {
 #[cfg(feature = "advanced")]
 #[test]
 fn advanced_types_keep_their_auto_traits() {
-    #[allow(unused_imports)]
     use grafton_ndi::{advanced::*, RawCapture};
     has! {
         AdvancedConfig: Send, Sync, UnwindSafe, RefUnwindSafe;
@@ -312,7 +306,6 @@ fn advanced_types_keep_their_auto_traits() {
 #[cfg(feature = "file-io")]
 #[test]
 fn file_types_keep_their_auto_traits() {
-    #[allow(unused_imports)]
     use grafton_ndi::file::*;
     has! {
         AsyncFileOptions: Send, Sync, UnwindSafe, RefUnwindSafe;

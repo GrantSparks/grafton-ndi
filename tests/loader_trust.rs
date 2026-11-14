@@ -3,8 +3,11 @@
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 #[path = "support/fixture.rs"]
 mod fixture;
-use fixture::{FakeRuntime, FixtureDir};
+#[path = "support/runtime_fixture.rs"]
+mod runtime_fixture;
+use fixture::FixtureDir;
 use grafton_ndi::{Ndi, RuntimeOptions};
+use runtime_fixture::FakeRuntime;
 use std::{fs, path::PathBuf, process::Command};
 
 #[test]
@@ -64,23 +67,25 @@ fn explicit_paths_avoid_rejected_search_candidates() {
             fs::create_dir(root.join(name)).unwrap();
         }
         let trusted = root.join("trusted/libndi_advanced.so.6");
-        FakeRuntime::new()
-            .with("fake_advanced")
-            .version("6.4.0.2")
-            .soname("libndi_advanced.so.6")
-            .build(&trusted);
+        FakeRuntime {
+            cfgs: vec!["fake_advanced"],
+            version: Some("6.4.0.2"),
+            soname: Some("libndi_advanced.so.6"),
+            ..Default::default()
+        }
+        .build(&trusted);
         let executable = root.join("executable/probe");
         fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
         let rejected = root.join("executable/libndi.so.6");
-        fixture::run(
-            fixture::rustc("rejected_constructor.rs", &rejected),
+        runtime_fixture::run(
+            runtime_fixture::rustc("rejected_constructor.rs", &rejected),
             &rejected,
         );
         #[cfg(feature = "file-io")]
         if scenario.starts_with("file-") {
             let rejected = root.join("executable/libndifile.so.6");
-            fixture::run(
-                fixture::rustc("rejected_constructor.rs", &rejected),
+            runtime_fixture::run(
+                runtime_fixture::rustc("rejected_constructor.rs", &rejected),
                 &rejected,
             );
             let output = root
@@ -90,9 +95,9 @@ fn explicit_paths_avoid_rejected_search_candidates() {
                     "file-runtime"
                 })
                 .join("libndifile.so.6");
-            let mut rustc = fixture::rustc("fake_file_library.rs", &output);
-            rustc.arg(fixture::link_argument(trusted.as_os_str()));
-            fixture::run(rustc, &output);
+            let mut rustc = runtime_fixture::rustc("fake_file_library.rs", &output);
+            rustc.arg(runtime_fixture::link_argument(trusted.as_os_str()));
+            runtime_fixture::run(rustc, &output);
         }
         let output = Command::new(&executable)
             .args([

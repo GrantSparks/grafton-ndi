@@ -6,7 +6,10 @@
 //! loopback. Each process retains exactly one native implementation.
 #![cfg(not(ndi_link_static))]
 
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, identity, name, loopback);
 
 use grafton_ndi::{
     capabilities::SdkEdition, AudioFrame, FrameRate, MetadataFrame, Ndi, PixelFormat, Receiver,

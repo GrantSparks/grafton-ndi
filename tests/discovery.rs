@@ -5,10 +5,9 @@
 //! runtime once.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
-#[path = "support/fixture.rs"]
-mod fixture;
+#[path = "support/runtime_fixture.rs"]
+mod runtime_fixture;
 
-use fixture::FakeRuntime;
 use grafton_ndi::{
     capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, SdkEdition},
     discovery::{
@@ -20,6 +19,7 @@ use grafton_ndi::{
     runtime::RuntimeOptions,
     Error, Ndi, Receiver, ReceiverOptions, ResourceKind, Sender, SenderOptions, Source,
 };
+use runtime_fixture::FakeRuntime;
 use std::{fs, path::PathBuf, process::Command, time::Duration};
 
 /// The capabilities whose objects talk to a Discovery Server, with the names
@@ -98,9 +98,12 @@ fn discovery_server_objects() {
         std::env::temp_dir().join(format!("grafton-ndi-discovery-{}", std::process::id()));
     fs::create_dir_all(&directory).unwrap();
     for variant in VARIANTS {
-        let mut runtime = FakeRuntime::new().version(variant.version);
+        let mut runtime = FakeRuntime {
+            version: Some(variant.version),
+            ..Default::default()
+        };
         if variant.exports_functions {
-            runtime = runtime.with("fake_objects").with("fake_discovery");
+            runtime.cfgs.extend(["fake_objects", "fake_discovery"]);
         }
         let library = runtime.build(&directory.join(variant.file));
         for scenario in variant.scenarios {

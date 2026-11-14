@@ -1,5 +1,8 @@
 //! Synchronous forwarding and conversion of receiver and FrameSync captures.
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, name, loopback);
 
 use grafton_ndi::{
     audio_conversion::{AudioConverter, AudioReferenceLevel},

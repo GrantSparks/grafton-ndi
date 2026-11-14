@@ -398,7 +398,7 @@ impl VideoPipeline {
     /// a handler that would panic cannot unwind out of the conversion and
     /// lose what its caller is converting. Nothing is left in flight once
     /// this returns.
-    #[cfg(feature = "advanced")]
+    #[cfg(all(feature = "advanced", ndi_has_advanced_send_completion))]
     fn retire(mut self) -> Option<VideoFrame> {
         self.callback = None;
         let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
@@ -495,8 +495,8 @@ pub(crate) mod in_flight {
     #[cfg(feature = "advanced")]
     use super::Exclusive;
     use super::{async_flush_frame_ptr, PreparedVideo, SendHandle};
-    #[cfg(feature = "advanced")]
-    use crate::sys::advanced::{native, FrameScatter, ScatterSend};
+    #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
+    use crate::sys::advanced::{FrameScatter, ScatterSend};
     use crate::{sys::bindings::NDIlib_video_frame_v2_t, VideoFrame};
 
     /// Proof that the SDK has returned from a call that synchronizes a
@@ -541,7 +541,7 @@ pub(crate) mod in_flight {
         /// A frame descriptor without data, and the scatter list of the
         /// frame's blocks, for `NDIlib_send_send_video_scatter_async`. No
         /// header says the SDK copies the list, so the frame owns it too.
-        #[cfg(feature = "advanced")]
+        #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
         Scatter {
             table: &'static ScatterSend,
             frame: NDIlib_video_frame_v2_t,
@@ -676,16 +676,12 @@ pub(crate) mod in_flight {
                         .core
                         .NDIlib_send_send_video_async_v2(sender.instance.0, &frame)
                 },
-                // A build whose headers lack the scatter family compiles no
-                // `native!` body, which leaves the descriptors unread, as the
-                // Advanced module allows for the same reason.
-                #[cfg(feature = "advanced")]
-                #[cfg_attr(not(ndi_has_complete_advanced_header), allow(unused_variables))]
+                #[cfg(all(feature = "advanced", ndi_has_advanced_scatter_send))]
                 Lent::Scatter {
                     table,
                     frame,
                     scatter,
-                } => native!(ScatterSend, table => {
+                } => {
                     // SAFETY: as for a contiguous frame. The scatter
                     // submission follows the rules of the asynchronous send
                     // (`Processing.NDI.Advanced.h`), and what it reads after
@@ -700,7 +696,7 @@ pub(crate) mod in_flight {
                             scatter,
                         )
                     }
-                }),
+                }
             }
             (displaced, Synchronized(()))
         }
@@ -1426,7 +1422,7 @@ impl Sender {
     /// when an advertiser registration shares its native sender: the
     /// registration could keep it alive after the frames an Advanced sender
     /// lends the SDK are freed.
-    #[cfg(feature = "advanced")]
+    #[cfg(all(feature = "advanced", ndi_has_advanced_send_completion))]
     // The refusal hands the sender back, so it is as large as the sender, as
     // the errors of the Advanced module that return their input are.
     #[allow(clippy::result_large_err)]

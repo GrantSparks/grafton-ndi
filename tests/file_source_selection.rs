@@ -1,7 +1,10 @@
 //! Native selection/recording acceptance in its own SDK process and CI sandbox.
 #![cfg(feature = "file-io")]
 
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, file);
 #[path = "support/fixture.rs"]
 mod fixture;
 

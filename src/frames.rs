@@ -4504,7 +4504,7 @@ impl<F: HoldsDescriptor<Descriptor = NDIlib_audio_frame_v3_t>> ValidatedAudio<F>
     /// # Safety
     ///
     /// As for [`Self::audio`], for a descriptor that holds samples.
-    #[cfg(feature = "advanced")]
+    #[cfg(all(feature = "advanced", any(test, ndi_has_advanced_av_sync)))]
     pub(crate) unsafe fn returned_audio(frame: F) -> Result<ReturnedAudio<Self>> {
         Ok(match validate_returned_audio(frame.descriptor())? {
             ReturnedAudio::Empty(format) => ReturnedAudio::Empty(format),

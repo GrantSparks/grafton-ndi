@@ -1,5 +1,8 @@
 //! Display geometry survives outbound construction, receive, and owned copies.
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, name, loopback);
 
 use grafton_ndi::{
     BorrowedVideoFrame, PixelFormat, Receiver, ReceiverOptions, Sender, SenderOptions, Timecode,

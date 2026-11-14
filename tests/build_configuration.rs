@@ -19,9 +19,20 @@ use std::{
 fn advanced_availability_discards_missing_functions_types_and_constants_before_resolution() {
     let selection = build_advanced::selection(
         "pub const Present: u32 = 7; pub type Handle = *mut u8;",
-        "unsafe extern \"C\" { pub fn NDIlib_recv_set_bandwidth(); }",
+        "unsafe extern \"C\" {
+            pub fn NDIlib_recv_set_bandwidth();
+            pub fn NDIlib_recv_set_video_allocator();
+        }",
     );
-    assert!(!selection.complete);
+    assert_eq!(
+        selection.cfgs,
+        ["ndi_has_advanced_receiver_bandwidth_control"]
+    );
+    assert!(selection
+        .cfgs
+        .iter()
+        .all(|selected| build_advanced::cfgs().any(|known| known == *selected)));
+    assert!(build_advanced::selection("", "").cfgs.is_empty());
     // Exercise the actual macro expansion, including discarded tokens which
     // deliberately refer to nonexistent types. A table family needs all of
     // its functions, while individual constants can be checked independently.
@@ -31,6 +42,7 @@ fn advanced_availability_discards_missing_functions_types_and_constants_before_r
         fn main() {{
             assert_eq!(declared! {{ Present {{ 7 }} else {{ 0 }} }}, 7);
             assert!(declared! {{ ReceiverBandwidthControl {{ true }} else {{ false }} }});
+            assert!(!declared! {{ ReceiveAllocators {{ NotAType::missing() }} else {{ false }} }});
             assert!(!declared! {{ ScatterSend {{ NotAType::missing() }} else {{ false }} }});
             assert!(!declared! {{ Genlock {{ NotAType::missing() }} else {{ false }} }});
         }}"#,

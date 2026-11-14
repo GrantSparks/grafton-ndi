@@ -1,5 +1,8 @@
 //! Native receive-queue overflow establishes the meaning of received totals.
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, name, loopback);
 
 use grafton_ndi::{
     AudioFrame, Receiver, ReceiverBandwidth, ReceiverOptions, Sender, SenderOptions,

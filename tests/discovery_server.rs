@@ -7,7 +7,10 @@
 //! provides both lists `discovery-server` in `GRAFTON_NDI_REQUIRE_RUNTIME`.
 #![cfg(all(target_os = "linux", not(ndi_link_static)))]
 
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, prerequisites, name, discovery_server);
 
 use grafton_ndi::{
     capabilities::RuntimeFeature,
@@ -112,11 +115,16 @@ fn advertised_senders_and_receivers_reach_listeners() {
     // A sender registered with one advertiser appears to a sender listener.
     let sender = sender(&ndi, "grafton discovery loopback sender");
     let sender_name = sender.source().unwrap().name().to_owned();
-    let mut send_advertiser = SendAdvertiser::new(&ndi, &server.advertisers()).unwrap();
+    let mut send_advertiser = SendAdvertiser::new(
+        &ndi,
+        &AdvertiserOptions::default().servers(server.endpoint()),
+    )
+    .unwrap();
     let sender_registration = send_advertiser
         .register(&sender, SendAdvertisement::default().allow_monitoring(true))
         .unwrap();
-    let mut send_listener = SendListener::new(&ndi, &server.listeners()).unwrap();
+    let mut send_listener =
+        SendListener::new(&ndi, &ListenerOptions::default().server(server.endpoint())).unwrap();
     let advertised_sender = eventually("the sender to be advertised", || {
         send_listener
             .wait_for_changes(Duration::from_millis(100))
@@ -140,7 +148,11 @@ fn advertised_senders_and_receivers_reach_listeners() {
     let controllable_receiver = receiver(&ndi, "grafton discovery loopback controllable");
     let monitored_receiver = receiver(&ndi, "grafton discovery loopback monitored");
     let grouped_receiver = receiver(&ndi, "grafton discovery loopback grouped");
-    let mut recv_advertiser = RecvAdvertiser::new(&ndi, &server.advertisers()).unwrap();
+    let mut recv_advertiser = RecvAdvertiser::new(
+        &ndi,
+        &AdvertiserOptions::default().servers(server.endpoint()),
+    )
+    .unwrap();
     let controllable_registration = recv_advertiser
         .register(
             &controllable_receiver,
@@ -165,7 +177,8 @@ fn advertised_senders_and_receivers_reach_listeners() {
                 .input_group(GROUP),
         )
         .unwrap();
-    let mut recv_listener = RecvListener::new(&ndi, &server.listeners()).unwrap();
+    let mut recv_listener =
+        RecvListener::new(&ndi, &ListenerOptions::default().server(server.endpoint())).unwrap();
     let [controllable, monitored, grouped] = eventually("the receivers to be advertised", || {
         recv_listener
             .wait_for_changes(Duration::from_millis(100))

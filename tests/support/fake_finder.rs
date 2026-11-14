@@ -141,7 +141,7 @@ export! {
         unsafe { *p_no_sources = snapshot.plain.len() as u32 };
         snapshot.plain.as_ptr()
     }
-    fn NDIlib_find_wait_for_sources(p_instance: NDIlib_find_instance_t, timeout_in_ms: u32) -> bool {
+    fn NDIlib_find_wait_for_sources(_p_instance: NDIlib_find_instance_t, timeout_in_ms: u32) -> bool {
         if std::env::var("GRAFTON_FAKE_FINDER_CASE").unwrap() == "deadline" {
             deadline_gate("hold-wait", "waiting", "wait-release");
             return false;

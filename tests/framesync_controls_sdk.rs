@@ -1,7 +1,10 @@
 //! Stream changes preserve a live FrameSync; KVM support is queried without
 //! injecting real keyboard, mouse, touch or clipboard input.
 #![cfg(feature = "advanced")]
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, prerequisites, name, advanced, loopback);
 
 use grafton_ndi::{
     AudioFrame, FrameSync, FrameSyncAudioRequest, MediaTypes, Receiver, ReceiverOptions,

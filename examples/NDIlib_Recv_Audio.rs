@@ -15,8 +15,10 @@ use std::{env, time::Duration};
 
 use grafton_ndi::{Error, Ndi, Receiver, ReceiverBandwidth, ReceiverOptions};
 
-#[path = "common/mod.rs"]
-mod common;
+#[path = "common/finder.rs"]
+mod finder;
+
+use finder::finder_with_extra_ips;
 
 fn main() -> Result<(), Error> {
     // Parse command line arguments for extra IPs
@@ -31,7 +33,7 @@ fn main() -> Result<(), Error> {
     println!("NDI initialized successfully\n");
 
     // Configure the finder
-    let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
+    let finder = finder_with_extra_ips(&ndi, &extra_ips)?;
 
     // Wait for sources to appear
     println!("Searching for NDI sources...\n");

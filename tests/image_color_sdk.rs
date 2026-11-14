@@ -18,7 +18,10 @@
 //! frame exactly.
 #![cfg(feature = "image-encoding")]
 
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(runtime, name, unsupported, loopback);
 
 use grafton_ndi::{
     capabilities::SdkEdition, ColorInfo, ColorPolicy, Error, FrameSync, ImageFormat, ImageOptions,

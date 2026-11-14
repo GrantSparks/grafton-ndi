@@ -1,4 +1,3 @@
-#![allow(unused)]
 use grafton_ndi::{FrameSyncVideoRef, VideoFrameRef, VideoPlane, VideoPlanes, VideoRows};
 fn assert_send_sync<T: Send + Sync>() {}
 fn views(plane: VideoPlane<'_>, rows: VideoRows<'_>, planes: VideoPlanes<'_>) {
@@ -41,6 +40,7 @@ fn framesync(frame: FrameSyncVideoRef<'_>) {
     drop(frame);
 }
 fn main() {
+    let _ = (receiver, framesync);
     assert_send_sync::<VideoPlane<'static>>();
     assert_send_sync::<VideoRows<'static>>();
     assert_send_sync::<VideoPlanes<'static>>();

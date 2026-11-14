@@ -15,8 +15,10 @@
 //!
 //! `--cfg fake_omit_recording_entry` omits one function of the recording family.
 
-#![allow(non_snake_case, unused_variables, clippy::missing_safety_doc)]
+#![allow(non_snake_case, clippy::missing_safety_doc)]
 
+// Generated SDK declarations intentionally include APIs outside this fake
+// library; only the exported implementations below are test-owned code.
 #[rustfmt::skip]
 #[path = "../../src/sys/bindings.rs"]
 #[allow(non_upper_case_globals, non_camel_case_types, dead_code, unused_imports)]
@@ -32,7 +34,7 @@ use std::ffi::{c_char, CStr};
 /// Export functions under their SDK names, each checked against the vendored
 /// declaration of the same name.
 macro_rules! export {
-    ($(fn $name:ident($($argument:ident: $type:ty),* $(,)?) $(-> $return:ty)? $body:block)+) => {$(
+    ($(fn $name:ident($($argument:tt: $type:ty),* $(,)?) $(-> $return:ty)? $body:block)+) => {$(
         #[no_mangle]
         pub unsafe extern "C" fn $name($($argument: $type),*) $(-> $return)? $body
         const _: unsafe extern "C" fn($($type),*) $(-> $return)? = declarations::$name;
@@ -43,7 +45,7 @@ macro_rules! export {
 macro_rules! stub {
     ($(fn $name:ident($($argument:ident: $type:ty),* $(,)?) $(-> $return:ty)?;)+) => {
         export! {$(
-            fn $name($($argument: $type),*) $(-> $return)? {
+            fn $name($(_: $type),*) $(-> $return)? {
                 // SAFETY: every stubbed return type is an integer, a boolean or
                 // a raw pointer, for which all-zero bytes are a valid value.
                 unsafe { std::mem::zeroed() }
@@ -67,7 +69,7 @@ fn bound_runtime_build() -> u32 {
 }
 
 export! {
-    fn NDIlib_file_player_probe_file(p_file_path: *const c_char, p_out_info: *mut NDIlib_file_player_file_info_t) -> bool {
+    fn NDIlib_file_player_probe_file(_p_file_path: *const c_char, p_out_info: *mut NDIlib_file_player_file_info_t) -> bool {
         // SAFETY: the caller passes storage for one structure.
         unsafe { (*p_out_info).track_count = bound_runtime_build() };
         true

@@ -15,14 +15,6 @@ use std::{
     time::Duration,
 };
 
-/// The Advanced entry point that creates a listener of table `A` from its
-/// settings and a JSON configuration, returning null when the SDK creates none.
-#[cfg(feature = "advanced")]
-type ConfiguredEntry<A> = unsafe extern "C" fn(
-    *const <A as ListenerApi>::Settings,
-    *const c_char,
-) -> <A as ListenerApi>::Instance;
-
 /// The operations the sender and receiver listener tables have in common.
 trait ListenerApi: sys::Table + Sync {
     /// The native listener handle.
@@ -52,9 +44,18 @@ trait ListenerApi: sys::Table + Sync {
     /// outlives the call.
     unsafe fn create(&self, settings: &Self::Settings) -> Self::Instance;
 
-    /// The entry point of `table` that also takes a configuration.
+    /// Create a listener with a per-instance configuration.
+    ///
+    /// # Safety
+    ///
+    /// `settings` must satisfy [`Self::create`]'s contract, and `config` must
+    /// point to a NUL-terminated configuration string that outlives the call.
     #[cfg(feature = "advanced")]
-    fn configured_entry(table: &'static Self::Configured) -> ConfiguredEntry<Self>;
+    unsafe fn create_configured(
+        table: &'static Self::Configured,
+        settings: *const Self::Settings,
+        config: *const c_char,
+    ) -> Self::Instance;
 
     /// # Safety
     ///
@@ -100,9 +101,24 @@ macro_rules! listener_api {
                 self.$create(settings)
             }
             #[cfg(feature = "advanced")]
-            fn configured_entry(table: &'static Self::Configured) -> ConfiguredEntry<Self> {
-                sys::advanced::native!($Configured, table => table.$create_configured)
-            }
+            sys::advanced::declared! { $Configured {
+                unsafe fn create_configured(
+                    table: &'static Self::Configured,
+                    settings: *const Self::Settings,
+                    config: *const c_char,
+                ) -> Self::Instance {
+                    // SAFETY: forwarded to the caller's obligations.
+                    unsafe { table.$create_configured(settings, config) }
+                }
+            } else {
+                unsafe fn create_configured(
+                    table: &'static Self::Configured,
+                    _: *const Self::Settings,
+                    _: *const c_char,
+                ) -> Self::Instance {
+                    match *table {}
+                }
+            }}
             unsafe fn destroy(&self, instance: Self::Instance) {
                 self.$destroy(instance)
             }
@@ -726,7 +742,7 @@ impl<A: ListenerApi> Listener<A> {
                     A::CONFIGURED,
                     config,
                     |table: &'static A::Configured, settings, text| {
-                        A::configured_entry(table)(settings, text)
+                        A::create_configured(table, settings, text)
                     },
                 )
             };

@@ -7,7 +7,21 @@
 //! build: the Advanced API is the same with and without the SDK's headers.
 #![cfg(feature = "advanced")]
 
-mod common;
+#[macro_use]
+#[path = "common/mod.rs"]
+mod helpers;
+common_helpers!(
+    runtime,
+    prerequisites,
+    name,
+    advanced,
+    hx,
+    unsupported,
+    loopback,
+    endpoint,
+    socket,
+    discovery_server
+);
 
 use common::Requirement::{H264Decoder, Hevc444Decoder};
 use grafton_ndi::{

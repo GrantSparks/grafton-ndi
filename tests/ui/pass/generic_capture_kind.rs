@@ -1,4 +1,3 @@
-#![allow(unused)]
 use grafton_ndi::{Capture, CaptureKind};
 use std::time::Duration;
 fn capture<K: CaptureKind>(view: &Capture<'_, K>) -> Result<Option<K::Owned>, grafton_ndi::Error> {
@@ -9,4 +8,9 @@ fn capture_ref<'rx, K: CaptureKind>(
 ) -> Result<Option<K::Ref<'rx>>, grafton_ndi::Error> {
     view.capture_ref(Duration::ZERO)
 }
-fn main() {}
+fn main() {
+    use grafton_ndi::{AudioKind, MetadataKind, VideoKind};
+    let _ = (capture::<VideoKind>, capture_ref::<VideoKind>);
+    let _ = (capture::<AudioKind>, capture_ref::<AudioKind>);
+    let _ = (capture::<MetadataKind>, capture_ref::<MetadataKind>);
+}

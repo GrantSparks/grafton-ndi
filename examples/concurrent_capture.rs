@@ -13,8 +13,10 @@ use grafton_ndi::{Ndi, Receiver, ReceiverBandwidth, ReceiverColorFormat, Receive
 
 use std::{env, thread, time::Duration};
 
-#[path = "common/mod.rs"]
-mod common;
+#[path = "common/finder.rs"]
+mod finder;
+
+use finder::finder_with_extra_ips;
 
 fn main() -> Result<(), grafton_ndi::Error> {
     // Parse command line arguments for extra IPs
@@ -26,7 +28,7 @@ fn main() -> Result<(), grafton_ndi::Error> {
     println!("NDI version: {}", ndi.info().raw_version());
 
     // Create a finder to discover sources
-    let finder = common::finder_with_extra_ips(&ndi, &extra_ips)?;
+    let finder = finder_with_extra_ips(&ndi, &extra_ips)?;
 
     // Discover sources across the full 5s window so late responders on
     // staggered/unicast networks are not missed.

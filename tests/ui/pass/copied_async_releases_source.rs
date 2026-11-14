@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use grafton_ndi::{BorrowedVideoFrame, PixelFormat, Sender, VideoFrame};
 
 fn submit(sender: &mut Sender, mut source: VideoFrame) {
@@ -15,4 +14,6 @@ fn submit(sender: &mut Sender, mut source: VideoFrame) {
     let _ = sender.finish_video_async();
     drop(previous);
 }
-fn main() {}
+fn main() {
+    let _ = submit;
+}

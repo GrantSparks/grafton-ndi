@@ -38,4 +38,10 @@ async fn asynchronous<R: grafton_ndi::asynchronous::AsyncRuntime>(
     Ok(owned_static(item))
 }
 
-fn main() {}
+fn main() {
+    let _ = (borrowed, owned);
+    #[cfg(feature = "tokio")]
+    let _ = asynchronous::<grafton_ndi::asynchronous::Tokio>;
+    #[cfg(feature = "smol")]
+    let _ = asynchronous::<grafton_ndi::asynchronous::Smol>;
+}

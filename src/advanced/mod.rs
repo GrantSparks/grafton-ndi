@@ -47,19 +47,6 @@
 // would add an allocation to the very paths (back-pressure, validation) that
 // exist so that nothing is lost.
 #![allow(clippy::result_large_err)]
-// A build without the Advanced SDK declarations compiles no `native!` body,
-// which leaves the parameters, imports and helpers those bodies use without a
-// reader. Every build that has the declarations enforces these lints.
-#![cfg_attr(
-    not(ndi_has_complete_advanced_header),
-    allow(
-        dead_code,
-        unreachable_code,
-        unused_imports,
-        unused_mut,
-        unused_variables
-    )
-)]
 
 mod aliasable;
 mod allocators;
