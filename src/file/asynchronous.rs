@@ -1033,20 +1033,23 @@ impl RecorderOwner {
 
     /// Take the bounded final drain once for every waiter that is due, then
     /// resolve all waiters from the same ledger before another command runs.
-    fn settle(
+    fn settle_at(
         &mut self,
         mut drained: bool,
         events: &EventQueue<RecorderEvent>,
         control: &Control,
         cleanup_expired: bool,
+        at: Instant,
     ) -> bool {
         self.waiters
             .retain(|waiter| !waiter.reply.cancelled.load(Ordering::Acquire));
-        if !drained
-            && self
-                .waiters
-                .iter()
-                .any(|waiter| cleanup_expired || waiter.deadline.is_expired())
+        // An empty pump poll may precede expiry: the owner can be paused
+        // before settlement while a closure enters the native queue. Always
+        // establish fresh post-expiry drain evidence for this due batch.
+        if self
+            .waiters
+            .iter()
+            .any(|waiter| cleanup_expired || waiter.deadline.end() <= at)
         {
             for _ in 0..super::recorder::STALE_EVENT_LIMIT {
                 match self.poll_native() {
@@ -1060,6 +1063,9 @@ impl RecorderOwner {
             drained = true;
         }
         let session = self.recorder.report().session();
+        // Reply callbacks can run arbitrary executor code and outlast another
+        // waiter's deadline. Only the fixed due batch above may time out;
+        // later deadlines receive a fresh drain on the next owner iteration.
         let mut index = 0;
         while index < self.waiters.len() {
             let waiter = &self.waiters[index];
@@ -1067,7 +1073,7 @@ impl RecorderOwner {
                 Some(Err(stopped(false)))
             } else {
                 self.recorder
-                    .settle_wait(cleanup_expired || waiter.deadline.is_expired(), drained)
+                    .settle_wait(cleanup_expired || waiter.deadline.end() <= at, drained)
                     .map(|outcome| {
                         if matches!(outcome, FinishStatus::TimedOut(_))
                             && control.shutdown.load(Ordering::Acquire)
@@ -1115,7 +1121,7 @@ impl Owner for RecorderOwner {
                 .waiters
                 .iter()
                 .any(|waiter| !waiter.reply.cancelled.load(Ordering::Acquire));
-        self.settle(drained, events, control, false);
+        self.settle_at(drained, events, control, false, Instant::now());
     }
 
     fn wait_timeout(&self) -> Duration {
@@ -1158,12 +1164,12 @@ impl Owner for RecorderOwner {
                     events.push(event);
                 }
             }
-            let drained = self.settle(drained, events, control, expired);
+            let drained = self.settle_at(drained, events, control, expired, Instant::now());
             if expired && drained {
                 break;
             }
         }
-        self.settle(true, events, control, true);
+        self.settle_at(true, events, control, true, Instant::now());
     }
 }
 
@@ -3096,7 +3102,13 @@ mod tests {
         let mut owner = RecorderOwner::new(recorder);
         let (reply, finishing) = operation();
         owner.finish(Deadline::after(Duration::ZERO).unwrap(), true, reply);
-        owner.settle(false, &EventQueue::new(16), &Control::new(), false);
+        owner.settle_at(
+            false,
+            &EventQueue::new(16),
+            &Control::new(),
+            false,
+            Instant::now(),
+        );
         assert!(matches!(
             block_on(finishing).unwrap(),
             FinishStatus::TimedOut(_)
@@ -3105,6 +3117,96 @@ mod tests {
             owner.poll_native().unwrap().is_some(),
             "the final drain consumed the whole backlog"
         );
+        owner.recorder.abandon();
+    }
+
+    fn local_finishing_recorder(
+        deadline: Deadline,
+    ) -> (
+        Arc<mock::Recorder>,
+        RecorderOwner,
+        FileOperation<FinishStatus>,
+    ) {
+        let device = mock::Recorder::new(Closing::WhenTold);
+        device.install();
+        let mut recorder = mock::recorder_api()
+            .create_recorder(&RecorderOptions::new(SourceSpec::new("mock").unwrap()))
+            .unwrap();
+        recorder
+            .start(
+                &RecordingTarget::new(std::env::temp_dir().join("mock-expiry-drain")).unwrap(),
+                RecordingTimecode::Preserve,
+            )
+            .unwrap();
+        recorder.poll_event(Duration::ZERO).unwrap();
+        let mut owner = RecorderOwner::new(recorder);
+        let (reply, finishing) = operation();
+        owner.finish(deadline, true, reply);
+        (device, owner, finishing)
+    }
+
+    #[test]
+    fn expiry_redrains_after_a_pump_poll_that_was_empty_before_the_deadline() {
+        let deadline = Deadline::after(Duration::from_secs(1)).unwrap();
+        let (device, mut owner, finishing) = local_finishing_recorder(deadline);
+        assert!(owner.poll_native().unwrap().is_none());
+        device.close();
+        // Advance the settlement clock past the earlier empty poll. The
+        // closure was queued in between, before this wait's logical expiry.
+        owner.settle_at(
+            true,
+            &EventQueue::new(16),
+            &Control::new(),
+            false,
+            deadline.end(),
+        );
+        assert!(matches!(
+            block_on(finishing).unwrap(),
+            FinishStatus::Closed(_)
+        ));
+        owner.recorder.abandon();
+    }
+
+    #[test]
+    fn a_deadline_crossed_during_another_reply_gets_its_own_fresh_drain() {
+        struct QueueClosure(Arc<mock::Recorder>);
+
+        impl Wake for QueueClosure {
+            fn wake(self: Arc<Self>) {
+                self.0.close();
+            }
+        }
+
+        // Supply a logical snapshot between two deadlines, with the wall
+        // clock already past both. Any expiry recheck during reply delivery
+        // would incorrectly time out the later waiter using the first drain.
+        let at = Instant::now() - Duration::from_secs(1);
+        let first_deadline = Deadline::starting(at, Duration::ZERO).unwrap();
+        let later_deadline = Deadline::starting(at, Duration::from_nanos(1)).unwrap();
+        let (device, mut owner, first) = local_finishing_recorder(first_deadline);
+        let mut first = Box::pin(first);
+        let waker = Waker::from(Arc::new(QueueClosure(Arc::clone(&device))));
+        assert!(first
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        let (reply, later) = operation();
+        owner.finish(later_deadline, false, reply);
+        let events = EventQueue::new(16);
+        let control = Control::new();
+        owner.settle_at(false, &events, &control, false, at);
+        assert!(matches!(
+            block_on(first).unwrap(),
+            FinishStatus::TimedOut(_)
+        ));
+        assert!(
+            !lock(&later.response).completed,
+            "the later waiter reused the earlier drain"
+        );
+        // Simulate the first reply's callback taking the owner past the
+        // later deadline. Its queued closure needs a new native drain.
+        owner.settle_at(true, &events, &control, false, later_deadline.end());
+        assert!(matches!(block_on(later).unwrap(), FinishStatus::Closed(_)));
         owner.recorder.abandon();
     }
 
