@@ -3435,8 +3435,7 @@ fn borrowed_packet_payload_stays_in_external_allocator_memory() {
         })
         .expect("payload must be inside the application's granted allocation");
     assert!(!freed.load(Ordering::Acquire));
-    let retained = service.usage().retained_allocations();
-    assert!(retained > 0);
+    assert!(service.usage().retained_allocations() > 0);
     std::thread::sleep(Duration::from_millis(20));
     assert!(
         !freed.load(Ordering::Acquire),
@@ -3452,9 +3451,23 @@ fn borrowed_packet_payload_stays_in_external_allocator_memory() {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert!(service.usage().retained_allocations() < retained);
+    // The exact buffer is now released, but Storage::drop sets its flag
+    // before the registry finishes bookkeeping, and the SDK may still own
+    // other queued buffers. Destroying the receiver drains those callbacks
+    // and prevents new grants before inspecting the process-wide counters.
     drop(receiver);
     drop(sender);
+    let usage = service.usage();
+    assert_eq!(
+        (
+            usage.retained_allocations(),
+            usage.retained_bytes(),
+            usage.generations(),
+            usage.active_generations(),
+        ),
+        (0, 0, 0, 0),
+        "an allocation or generation outlived its receiver: {usage:?}"
+    );
 }
 
 #[test]
