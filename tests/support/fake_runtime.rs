@@ -28,6 +28,7 @@
 //!   `fake_finder.rs`, selected by `GRAFTON_FAKE_FINDER_CASE`;
 //! * `fake_changes` — consumable Finder and Advanced keyframe changes, with
 //!   explicit source announcements and one native wake per change;
+//! * `fake_tally` — poll/wait share a consumable tally change on each sender;
 //! * `fake_capture` — script native media/notification delivery with
 //!   `GRAFTON_FAKE_CAPTURE_SCRIPT`; only active rows/channels are initialized;
 //! * `fake_receiver_controls` — clocked capture, stream controls and KVM log
@@ -243,7 +244,6 @@ stub! {
     fn NDIlib_recv_ptz_exposure_manual_v2(p_instance: NDIlib_recv_instance_t, iris: f32, gain: f32, shutter_speed: f32) -> bool;
     fn NDIlib_send_send_video_v2(p_instance: NDIlib_send_instance_t, p_video_data: *const NDIlib_video_frame_v2_t);
     fn NDIlib_send_send_metadata(p_instance: NDIlib_send_instance_t, p_metadata: *const NDIlib_metadata_frame_t);
-    fn NDIlib_send_get_tally(p_instance: NDIlib_send_instance_t, p_tally: *mut NDIlib_tally_t, timeout_in_ms: u32) -> bool;
     fn NDIlib_send_get_no_connections(p_instance: NDIlib_send_instance_t, timeout_in_ms: u32) -> ::std::os::raw::c_int;
     fn NDIlib_send_clear_connection_metadata(p_instance: NDIlib_send_instance_t);
     fn NDIlib_send_add_connection_metadata(p_instance: NDIlib_send_instance_t, p_metadata: *const NDIlib_metadata_frame_t);
@@ -257,7 +257,12 @@ export! {
     }
 }
 
-#[cfg(not(fake_receiver_controls))]
+#[cfg(not(fake_tally))]
+stub! {
+    fn NDIlib_send_get_tally(p_instance: NDIlib_send_instance_t, p_tally: *mut NDIlib_tally_t, timeout_in_ms: u32) -> bool;
+}
+
+#[cfg(not(any(fake_receiver_controls, fake_tally)))]
 stub! {
     fn NDIlib_recv_set_tally(p_instance: NDIlib_recv_instance_t, p_tally: *const NDIlib_tally_t) -> bool;
 }
@@ -373,19 +378,24 @@ mod objects {
 
         fn NDIlib_send_create(_p_create_settings: *const NDIlib_send_create_t) -> NDIlib_send_instance_t {
             log("sender-create");
-            Box::into_raw(Box::new(Sender {
+            let sender = Box::into_raw(Box::new(Sender {
                 opaque: std::ptr::null_mut(),
                 completion: None,
                 pending: Vec::new(),
                 copied: None,
             }))
-            .cast()
+            .cast();
+            #[cfg(fake_tally)]
+            super::tally::created(sender);
+            sender
         }
 
         fn NDIlib_send_destroy(p_instance: NDIlib_send_instance_t) {
             let mut sender = unsafe { Box::from_raw(p_instance.cast::<Sender>()) };
             log("sender-destroy-begin");
             unsafe { sender.complete() };
+            #[cfg(fake_tally)]
+            super::tally::destroyed(p_instance);
             log("sender-destroy");
         }
 
@@ -921,3 +931,7 @@ mod finder;
 #[cfg(fake_changes)]
 #[path = "fake_changes.rs"]
 mod changes;
+
+#[cfg(fake_tally)]
+#[path = "fake_tally.rs"]
+mod tally;

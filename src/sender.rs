@@ -5,7 +5,10 @@ use std::{
     fmt,
     marker::PhantomData,
     ptr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU8, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -86,15 +89,38 @@ struct Inner {
     // The entry points of the runtime that created `instance`.
     core: &'static sys::Core,
     metadata_capture: parking_lot::Mutex<()>,
+    tally: TallyState,
     #[cfg(ndi_has_advanced_keyframe_demand)]
     keyframe_changes: crate::change_feed::ChangeFeed,
 }
 
-// A panic cannot leave metadata capture half-changed: its lock guards `()`,
-// and no application code runs while it is held. The `parking_lot` lock does not
-// poison and so does not declare this itself, which would otherwise leave
+// A panic cannot leave metadata capture or tally half-changed: their locks
+// guard native queries, and no application code runs while held. Those locks
+// do not poison or declare this themselves, which would otherwise leave
 // senders short of `RefUnwindSafe`. The change feed uses unwind-safe standard locks.
 impl std::panic::RefUnwindSafe for Inner {}
+
+/// Polling must preserve the SDK's consumable change report for a later wait.
+#[derive(Default)]
+struct TallyState {
+    query: parking_lot::Mutex<()>,
+    value: AtomicU8,
+    pending: AtomicBool,
+}
+
+impl TallyState {
+    fn current(&self) -> Tally {
+        let bits = self.value.load(Ordering::Acquire);
+        Tally::new(bits & 1 != 0, bits & 2 != 0)
+    }
+
+    fn remember(&self, tally: Tally) {
+        self.value.store(
+            u8::from(tally.on_program()) | (u8::from(tally.on_preview()) << 1),
+            Ordering::Release,
+        );
+    }
+}
 
 mod ownership {
     use super::*;
@@ -274,8 +300,9 @@ impl AudioSendMode for QueueAttached {}
 /// itself, and it cannot be registered with an advertiser.
 ///
 /// A sender is `Send` and `Sync`. Its operations take `&self` and may run on
-/// several threads at once, except the asynchronous video submissions, which
-/// take `&mut self`.
+/// several threads at once, except asynchronous video submissions, which
+/// take `&mut self`. Tally polls preserve changes for a waiting thread;
+/// concurrent tally waits serialize and each change is consumed once.
 #[derive(Debug)]
 pub struct Sender<M: SenderMode = RawSend> {
     inner: Inner,
@@ -1363,6 +1390,7 @@ impl<M: SenderMode> Sender<M> {
                 instance,
                 core,
                 metadata_capture: parking_lot::Mutex::new(()),
+                tally: TallyState::default(),
                 #[cfg(ndi_has_advanced_keyframe_demand)]
                 keyframe_changes: crate::change_feed::ChangeFeed::default(),
             },
@@ -1770,10 +1798,13 @@ impl<M: SenderMode> Sender<M> {
 
     /// The tally this sender currently reports.
     ///
-    /// Polls without waiting and returns the current state every time, whether
-    /// or not it has changed since the last query. Call
+    /// Polls without waiting and returns the most recent state the SDK reported
+    /// to this sender, whether or not it has changed since the last query. Call
     /// [`Self::wait_for_tally_change`] to block until it changes. Never fails
     /// and may be called from any thread.
+    /// While another thread waits, returns the cached state without a native
+    /// query. That state may lag the change until the waiter wakes. Polling
+    /// preserves a change for [`Self::wait_for_tally_change`] to report.
     ///
     /// # Examples
     ///
@@ -1790,7 +1821,16 @@ impl<M: SenderMode> Sender<M> {
     /// # }
     /// ```
     pub fn tally(&self) -> Tally {
-        self.get_tally(0).1
+        let state = &self.inner.tally;
+        let Some(_query) = state.query.try_lock() else {
+            return state.current();
+        };
+        let (changed, tally) = self.get_tally(0);
+        state.remember(tally);
+        if changed {
+            state.pending.store(true, Ordering::Release);
+        }
+        tally
     }
 
     /// Wait up to `timeout` for the tally to change.
@@ -1798,6 +1838,10 @@ impl<M: SenderMode> Sender<M> {
     /// Returns `Ok(Some(tally))` with the new state when the SDK reports a
     /// change, and `Ok(None)` when `timeout` elapses first. Use
     /// [`Self::tally`] to read the current state without waiting.
+    /// A change observed by polling is kept for the next wait. Changes
+    /// coalesce, and each report goes to one waiter, rather than broadcasting
+    /// to every waiter. Concurrent waits serialize their native queries;
+    /// contention spends the same timeout budget as the native wait.
     ///
     /// # Errors
     ///
@@ -1823,8 +1867,16 @@ impl<M: SenderMode> Sender<M> {
     /// # }
     /// ```
     pub fn wait_for_tally_change(&self, timeout: Duration) -> Result<Option<Tally>> {
-        let timeout_ms = to_ms_checked(timeout)?;
-        let (changed, tally) = self.get_tally(timeout_ms);
+        let deadline = Deadline::after(timeout)?;
+        let state = &self.inner.tally;
+        let Some(_query) = state.query.try_lock_until(deadline.end()) else {
+            return Ok(None);
+        };
+        if state.pending.swap(false, Ordering::AcqRel) {
+            return Ok(Some(state.current()));
+        }
+        let (changed, tally) = self.get_tally(deadline.remaining_ms());
+        state.remember(tally);
         Ok(changed.then_some(tally))
     }
 

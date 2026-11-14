@@ -2157,6 +2157,38 @@ fn wrapped_senders_exchange_metadata_and_audio_through_the_sender_they_lend() {
     assert_eq!(queue.retained_frames(), 0);
 }
 
+/// The common tally state belongs to every sender mode, including the
+/// restricted sender views lent by both Advanced sending owners.
+#[test]
+fn wrapped_sender_tally_polls_preserve_waiters_changes() {
+    fn check<M: SenderMode>(sender: &Sender<M>, receiver: &Receiver) {
+        for next in [Tally::new(true, false), Tally::new(false, true)] {
+            receiver.set_tally(next);
+            let end = Instant::now() + PATIENCE;
+            while sender.tally() != next {
+                assert!(
+                    Instant::now() < end,
+                    "wrapped sender did not observe {next:?}"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(sender.wait_for_tally_change(SLICE).unwrap(), Some(next));
+            assert_eq!(sender.wait_for_tally_change(Duration::ZERO).unwrap(), None);
+        }
+    }
+    let Some(ndi) = common::advanced_ndi() else {
+        return;
+    };
+    let _turn = sockets();
+    let compressed = CompressedSender::new(&ndi, &options("tally-compressed")).unwrap();
+    let receiver = exchange_metadata(&ndi, compressed.sender(), "tally-compressed");
+    check(compressed.sender(), &receiver);
+    drop((receiver, compressed));
+    let queue = QueuedSender::new(&ndi, &options("tally-queue"), QueueOptions::default()).unwrap();
+    let receiver = exchange_metadata(&ndi, queue.sender(), "tally-queue");
+    check(queue.sender(), &receiver);
+}
+
 /// Sets a flag when it goes out of scope, so that a thread that runs until
 /// the flag is set also stops when the test fails.
 struct StopOnDrop<'a>(&'a AtomicBool);
