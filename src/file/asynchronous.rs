@@ -2751,26 +2751,53 @@ mod tests {
 
     #[test]
     fn close_spends_one_drop_wait_and_reports_closed_instead_of_a_false_timeout() {
+        struct ObserveFinish {
+            device: Arc<mock::Recorder>,
+            replied: Sender<(usize, Instant)>,
+        }
+
+        impl Wake for ObserveFinish {
+            fn wake(self: Arc<Self>) {
+                // Reply completion calls this on the owner, before it can
+                // proceed to destruction. Caller scheduling cannot move the
+                // observation past a mistakenly restarted cleanup wait.
+                let _ = self
+                    .replied
+                    .send((self.device.waits.load(Ordering::Acquire), Instant::now()));
+            }
+        }
+
         let budget = Duration::from_millis(160);
         let (device, recorder) =
             mock_recorder_with_drop_wait(Closing::WhenTold, AsyncFileOptions::new(), budget);
-        let finishing = recorder.finish(Duration::from_secs(30)).submit();
+        let mut finishing = Box::pin(recorder.finish(Duration::from_secs(30)).submit());
         await_wait(&device, 0);
-        let began = Instant::now();
+        let (replied, reply) = mpsc::channel();
+        let waker = Waker::from(Arc::new(ObserveFinish {
+            device: Arc::clone(&device),
+            replied,
+        }));
+        assert!(finishing
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
         let closed = recorder.close().submit();
+        let requested = recorder.worker.control.shutdown_requested_at().unwrap();
+        let (waits_at_reply, replied_at) = reply.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(matches!(
             block_on(finishing),
             Err(Error::InvalidState(StateError::Closed))
         ));
         block_on(closed).unwrap();
-        let elapsed = began.elapsed();
+        let elapsed = replied_at.duration_since(requested);
         assert!(
             elapsed >= budget,
             "shutdown skipped its finalization wait: {elapsed:?}"
         );
-        assert!(
-            elapsed < budget + Duration::from_millis(130),
-            "destruction started a second finalization wait: {elapsed:?}"
+        assert_eq!(
+            device.waits.load(Ordering::Acquire),
+            waits_at_reply,
+            "destruction started another native event wait after the finish reply"
         );
         assert_eq!(device.destroys.load(Ordering::Acquire), 1);
         assert!(!device.closed_before_destroy.load(Ordering::Acquire));
