@@ -46,7 +46,10 @@
 //! it before each subsequent attempt. An attempt already in flight, lasting at
 //! most 100 ms in the SDK, can still consume an item and run its scoped callback
 //! after the future was dropped. Callback time and side effects are not cancelled
-//! by the wait timeout either; callback panics become [`Error::SpawnFailed`].
+//! by the wait timeout either. A panic is caught on the worker, where SDK guards
+//! are released, then resumed on the awaiting task with its original payload.
+//! It unwinds through `select!` or `join!` as any other task panic does. If the
+//! future was dropped, its panic payload is discarded with the result.
 //!
 //! # Features
 //!
@@ -96,7 +99,7 @@ use crate::{
     capture::{AudioKind, CaptureKind, MetadataKind, VideoKind},
     timeout::Deadline,
     ConnectionStats, Error, Receiver, ReceiverEvent, ReceiverItem, ReceiverItemRef, Result, Source,
-    SourceNameChange,
+    SourceNameChange, SpawnFailure,
 };
 
 mod private {
@@ -121,7 +124,8 @@ mod private {
         /// # Errors
         ///
         /// [`Error::SpawnFailed`](crate::Error::SpawnFailed) when the work
-        /// cannot be submitted, is cancelled before it starts, or panics.
+        /// has no runtime context or its task is cancelled. Panics are resumed
+        /// on the awaiting task after worker-owned resources are released.
         fn spawn_blocking<F, T>(token: Token, f: F) -> impl Future<Output = Result<T>> + Send
         where
             F: FnOnce() -> T + Send + 'static,
@@ -152,12 +156,16 @@ fn blocking_operation<F, T>(operation: F) -> (CancelOnDrop, impl FnOnce() -> Res
 where
     F: FnOnce() -> T + Send,
 {
-    blocking_operation_with_stop(move |_| operation())
+    let (guard, work) = blocking_operation_with_stop(move |_| operation());
+    (guard, move || work().map(resume_work))
 }
 
 fn blocking_operation_with_stop<F, T>(
     operation: F,
-) -> (CancelOnDrop, impl FnOnce() -> Result<T> + Send)
+) -> (
+    CancelOnDrop,
+    impl FnOnce() -> Result<std::thread::Result<T>> + Send,
+)
 where
     F: FnOnce(&AtomicBool) -> T + Send,
 {
@@ -165,22 +173,28 @@ where
     let guard = CancelOnDrop(Arc::clone(&cancelled));
     let work = move || {
         if cancelled.load(Ordering::Acquire) {
-            return Err(Error::SpawnFailed(
-                "Blocking operation cancelled before starting".into(),
-            ));
+            return Err(Error::SpawnFailed(SpawnFailure::TaskCancelled));
         }
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(&cancelled))).map_err(
-            |payload| {
-                let message = payload
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| payload.downcast_ref::<&str>().copied())
-                    .unwrap_or("non-string panic payload");
-                Error::SpawnFailed(format!("Blocking operation panicked: {message}"))
-            },
-        )
+        Ok(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || operation(&cancelled),
+        )))
     };
     (guard, work)
+}
+
+fn resume_work<T>(outcome: std::thread::Result<T>) -> T {
+    match outcome {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+#[cfg(feature = "tokio")]
+fn tokio_join_error(error: ::tokio::task::JoinError) -> Error {
+    if error.is_panic() {
+        std::panic::resume_unwind(error.into_panic());
+    }
+    Error::SpawnFailed(SpawnFailure::TaskCancelled)
 }
 
 /// An async runtime whose blocking thread pool runs the NDI operations of an
@@ -215,12 +229,13 @@ impl private::Spawn for Tokio {
     {
         async {
             let handle = ::tokio::runtime::Handle::try_current()
-                .map_err(|e| Error::SpawnFailed(e.to_string()))?;
+                .map_err(|_| Error::SpawnFailed(SpawnFailure::NoRuntime))?;
             let (_cancellation, work) = blocking_operation_with_stop(f);
-            handle
+            let outcome = handle
                 .spawn_blocking(work)
                 .await
-                .map_err(|e| Error::SpawnFailed(e.to_string()))?
+                .map_err(tokio_join_error)??;
+            Ok(resume_work(outcome))
         }
     }
 }
@@ -247,7 +262,7 @@ impl private::Spawn for Smol {
     {
         async {
             let (_cancellation, work) = blocking_operation_with_stop(f);
-            ::smol::unblock(work).await
+            Ok(resume_work(::smol::unblock(work).await?))
         }
     }
 }
@@ -274,9 +289,10 @@ impl private::Spawn for Smol {
 ///
 /// # Error Handling
 ///
-/// The methods that run on the blocking pool convert a panic there, or the
-/// cancellation of the blocking task, into [`Error::SpawnFailed`] rather than
-/// propagating it.
+/// [`Error::SpawnFailed`] carries a typed [`SpawnFailure`] for a missing Tokio
+/// context or a cancelled task. A panic on the worker is resumed on the awaiting
+/// task with its original payload, after SDK guards are released on the worker.
+/// An abandoned operation discards its result and any caught panic payload.
 ///
 /// # Example
 ///
@@ -448,7 +464,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// # Errors
     ///
     /// The errors of [`Receiver::capture_any`], and [`Error::SpawnFailed`]
-    /// when the blocking task panicked or was cancelled. Oversize timeouts
+    /// when no runtime context is entered or the blocking task is cancelled. Oversize timeouts
     /// are rejected before submitting work.
     ///
     /// # Cancellation
@@ -486,8 +502,13 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// # Errors
     ///
     /// The errors of [`Receiver::capture_any_ref`], and [`Error::SpawnFailed`]
-    /// for a blocking-task failure or callback panic. Oversize timeouts are
+    /// for a missing runtime context or cancelled task. Oversize timeouts are
     /// rejected before submitting work.
+    ///
+    /// # Panics
+    ///
+    /// A callback or blocking-operation panic is resumed on the awaiting task
+    /// with its original payload, after the native frame is freed on the worker.
     pub async fn capture_any_with<F, T>(&self, timeout: Duration, process: F) -> Result<Option<T>>
     where
         F: for<'frame> FnOnce(&ReceiverItemRef<'frame>) -> T + Send + 'static,
@@ -527,7 +548,7 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// # Errors
     ///
     /// The errors of [`Receiver::poll_event`], and [`Error::SpawnFailed`]
-    /// when the blocking task panicked or was cancelled.
+    /// when no runtime context is entered or the blocking task is cancelled.
     ///
     /// # Cancellation
     ///
@@ -565,8 +586,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     /// [`Error::UnsupportedCapability`] without
     /// [`RuntimeFeature::ConnectedSourceName`](crate::RuntimeFeature::ConnectedSourceName),
     /// and [`Error::UnexpectedSdkResult`] for a name the SDK did not
-    /// terminate; and [`Error::SpawnFailed`] when the blocking task panicked
-    /// or was cancelled.
+    /// terminate; and [`Error::SpawnFailed`] for a missing runtime context or
+    /// cancelled blocking task.
     ///
     /// # Cancellation
     ///
@@ -623,8 +644,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     ///
     /// The errors of [`Receiver::connect_to`]: [`Error::InvalidCString`] when
     /// the source's name or address contains a NUL byte; and
-    /// [`Error::SpawnFailed`] when the blocking task panicked or was
-    /// cancelled.
+    /// [`Error::SpawnFailed`] for a missing runtime context or
+    /// cancelled blocking task.
     ///
     /// # Cancellation
     ///
@@ -647,8 +668,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     ///
     /// # Errors
     ///
-    /// [`Error::SpawnFailed`] when the blocking task panicked or was
-    /// cancelled; [`Receiver::disconnect`] itself does not fail.
+    /// [`Error::SpawnFailed`] for a missing runtime context or
+    /// cancelled blocking task; [`Receiver::disconnect`] itself does not fail.
     ///
     /// # Cancellation
     ///
@@ -674,8 +695,8 @@ impl<R: AsyncRuntime> AsyncReceiver<R> {
     ///
     /// # Errors
     ///
-    /// The errors of [`Receiver::reconnect`], and [`Error::SpawnFailed`] when
-    /// the blocking task panicked or was cancelled.
+    /// The errors of [`Receiver::reconnect`], and [`Error::SpawnFailed`] for a
+    /// missing runtime context or cancelled blocking task.
     ///
     /// # Cancellation
     ///
@@ -746,8 +767,8 @@ where
     /// # Errors
     ///
     /// The errors of [`Capture::capture`](crate::Capture::capture), and
-    /// [`Error::SpawnFailed`] when the blocking task panicked or was
-    /// cancelled.
+    /// [`Error::SpawnFailed`] for a missing runtime context or
+    /// cancelled blocking task.
     ///
     /// # Cancellation
     ///
@@ -783,8 +804,13 @@ where
     /// # Errors
     ///
     /// The errors of [`Capture::capture_ref`](crate::Capture::capture_ref), and
-    /// [`Error::SpawnFailed`] for a blocking-task failure or callback panic.
+    /// [`Error::SpawnFailed`] for a missing runtime context or cancelled task.
     /// Oversize timeouts are rejected before submitting work.
+    ///
+    /// # Panics
+    ///
+    /// A callback or blocking-operation panic is resumed on the awaiting task
+    /// with its original payload, after the native frame is freed on the worker.
     ///
     /// # Example
     ///
@@ -943,15 +969,15 @@ mod timeout_tests {
     }
 
     #[test]
-    fn budgeted_work_that_panics_reports_spawn_failed() {
-        // The path of `capture`, `poll_event` and `poll_source_name_change`.
-        let result = runtime().block_on(with_timeout_budget::<Tokio, _, ()>(
-            Duration::ZERO,
-            |_, _| panic!("budgeted panic"),
-        ));
-        assert!(
-            matches!(result, Err(Error::SpawnFailed(message)) if message.contains("budgeted panic"))
-        );
+    fn budgeted_work_resumes_the_original_panic() {
+        let panic = std::panic::catch_unwind(|| {
+            runtime().block_on(with_timeout_budget::<Tokio, _, ()>(
+                Duration::ZERO,
+                |_, _| std::panic::panic_any(42_u32),
+            ))
+        })
+        .expect_err("a worker panic must unwind the awaiting caller");
+        assert_eq!(*panic.downcast::<u32>().unwrap(), 42);
     }
 
     #[test]
@@ -1032,15 +1058,15 @@ mod smol_tests {
     }
 
     #[test]
-    fn budgeted_work_that_panics_reports_spawn_failed() {
-        // The path of `capture`, `poll_event` and `poll_source_name_change`.
-        let result = ::smol::block_on(with_timeout_budget::<Smol, _, ()>(
-            Duration::ZERO,
-            |_, _| panic!("budgeted panic"),
-        ));
-        assert!(
-            matches!(result, Err(Error::SpawnFailed(message)) if message.contains("budgeted panic"))
-        );
+    fn budgeted_work_resumes_the_original_panic() {
+        let panic = std::panic::catch_unwind(|| {
+            ::smol::block_on(with_timeout_budget::<Smol, _, ()>(
+                Duration::ZERO,
+                |_, _| std::panic::panic_any(42_u32),
+            ))
+        })
+        .expect_err("a worker panic must unwind the awaiting caller");
+        assert_eq!(*panic.downcast::<u32>().unwrap(), 42);
     }
 
     #[test]
@@ -1086,7 +1112,10 @@ mod executor_tests {
     fn cancellation_skips_queued_operation() {
         let (guard, work) = blocking_operation(|| panic!("cancelled work must not run"));
         drop(guard);
-        assert!(matches!(work(), Err(Error::SpawnFailed(_))));
+        assert!(matches!(
+            work(),
+            Err(Error::SpawnFailed(SpawnFailure::TaskCancelled))
+        ));
     }
 
     #[test]
@@ -1113,29 +1142,47 @@ mod executor_tests {
         let mut context = Context::from_waker(Waker::noop());
         assert!(matches!(
             operation.as_mut().poll(&mut context),
-            Poll::Ready(Err(Error::SpawnFailed(_)))
+            Poll::Ready(Err(Error::SpawnFailed(SpawnFailure::NoRuntime)))
         ));
     }
 
     #[cfg(feature = "tokio")]
     #[test]
-    fn tokio_converts_blocking_panic() {
+    fn tokio_resumes_blocking_panic() {
         let runtime = ::tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        let result = runtime.block_on(Tokio::spawn_blocking(Token, || panic!("test panic")));
-        assert!(
-            matches!(result, Err(Error::SpawnFailed(message)) if message.contains("test panic"))
-        );
+        let panic = std::panic::catch_unwind(|| {
+            runtime.block_on(Tokio::spawn_blocking(Token, || panic!("test panic")))
+        })
+        .unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"test panic"));
     }
 
     #[cfg(feature = "smol")]
     #[test]
-    fn smol_converts_blocking_panic() {
-        let result = ::smol::block_on(Smol::spawn_blocking(Token, || panic!("test panic")));
-        assert!(
-            matches!(result, Err(Error::SpawnFailed(message)) if message.contains("test panic"))
-        );
+    fn smol_resumes_blocking_panic() {
+        let panic = std::panic::catch_unwind(|| {
+            ::smol::block_on(Smol::spawn_blocking(Token, || panic!("test panic")))
+        })
+        .unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"test panic"));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn cancelled_tokio_task_reports_a_typed_reason() {
+        let runtime = ::tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let task = ::tokio::spawn(std::future::pending::<()>());
+            task.abort();
+            assert!(matches!(
+                tokio_join_error(task.await.unwrap_err()),
+                Error::SpawnFailed(SpawnFailure::TaskCancelled)
+            ));
+        });
     }
 
     #[cfg(feature = "tokio")]

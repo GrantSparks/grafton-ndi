@@ -129,6 +129,7 @@ fn crate_root_types_keep_their_auto_traits() {
         Sender<RawSend>: Send, Sync, UnwindSafe, RefUnwindSafe;
         SenderOptions: Send, Sync, UnwindSafe, RefUnwindSafe;
         SettingChange: Send, Sync, UnwindSafe, RefUnwindSafe;
+        SpawnFailure: Send, Sync, UnwindSafe, RefUnwindSafe;
         Source: Send, Sync, UnwindSafe, RefUnwindSafe;
         SourceAddress: Send, Sync, UnwindSafe, RefUnwindSafe;
         SourceCache: Send, Sync, UnwindSafe, RefUnwindSafe;

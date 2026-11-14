@@ -6,6 +6,21 @@ use std::{ffi::NulError, fmt};
 
 use crate::capabilities::{CapabilityUnavailable, RuntimeFeature};
 
+/// Why an async blocking operation could not run.
+///
+/// Panics are resumed on the awaiting task rather than reported as spawn
+/// failures. This discriminator does not depend on diagnostic text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum SpawnFailure {
+    /// The Tokio operation was polled outside a Tokio runtime.
+    #[error("no Tokio runtime is entered")]
+    NoRuntime,
+    /// The runtime cancelled the blocking task, or its abandoned closure never started.
+    #[error("the blocking task was cancelled")]
+    TaskCancelled,
+}
+
 /// Every error this crate reports, from the core API, the `advanced` module
 /// and the File API alike.
 ///
@@ -303,29 +318,32 @@ pub enum Error {
         advertised: bool,
     },
 
-    /// An async blocking operation could not run or finish normally.
+    /// An async blocking operation could not run.
     ///
-    /// Covers a missing Tokio runtime context, task cancellation or join failure,
-    /// and a panic caught while executing a blocking operation. Dropping a future
-    /// discards its result; cancellation does not deliver an error to that caller.
+    /// [`SpawnFailure`] distinguishes a missing Tokio runtime context from a
+    /// cancelled blocking task. A panic in the operation or its callback is
+    /// resumed on the awaiting task with its original payload, after SDK frame
+    /// guards are released on the worker. Dropping the future discards its
+    /// result and any panic payload; it does not deliver an error to that caller.
     ///
     /// # Example
     ///
     /// ```
-    /// use grafton_ndi::Error;
-    ///
-    /// fn handle_error(err: Error) {
-    ///     match err {
-    ///         Error::SpawnFailed(reason) => {
-    ///             eprintln!("Async spawn failed: {}", reason);
-    ///             // Could retry or gracefully shutdown
+    /// use grafton_ndi::{Error, SpawnFailure};
+    /// fn handle_error(error: Error) {
+    ///     match error {
+    ///         Error::SpawnFailed(SpawnFailure::NoRuntime) => {
+    ///             eprintln!("Await this operation inside a Tokio runtime");
     ///         }
-    ///         e => eprintln!("Other error: {}", e),
+    ///         Error::SpawnFailed(SpawnFailure::TaskCancelled) => {
+    ///             eprintln!("The runtime cancelled the blocking task");
+    ///         }
+    ///         error => eprintln!("{error}"),
     ///     }
     /// }
     /// ```
-    #[error("Failed to spawn blocking task: {0}")]
-    SpawnFailed(String),
+    #[error("Could not run blocking task: {0}")]
+    SpawnFailed(SpawnFailure),
 
     /// A File API operation is not permitted in the current state of its
     /// recorder or async handle.

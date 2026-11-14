@@ -354,6 +354,23 @@ fn exercise_async(ndi: &Ndi) {
 }
 
 #[cfg(any(feature = "tokio", feature = "smol"))]
+async fn catch_future<T>(future: impl std::future::Future<Output = T>) -> std::thread::Result<T> {
+    use std::{
+        panic::{catch_unwind, AssertUnwindSafe},
+        task::Poll,
+    };
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|context| {
+        match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(context))) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
+            Err(payload) => Poll::Ready(Err(payload)),
+        }
+    })
+    .await
+}
+
+#[cfg(any(feature = "tokio", feature = "smol"))]
 async fn scoped_checks<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
     receiver: &grafton_ndi::asynchronous::AsyncReceiver<R>,
     serial: usize,
@@ -613,34 +630,79 @@ async fn scoped_checks<R: grafton_ndi::asynchronous::AsyncRuntime + 'static>(
     ] {
         script(serial + index, &format!("{token},{token}"));
         let before = frees(family);
-        let result: grafton_ndi::Result<Option<()>> = match family {
-            "video" => {
-                receiver
-                    .video()
-                    .capture_with(Duration::ZERO, |_| panic!("callback panic"))
-                    .await
+        let result = catch_future(async {
+            match family {
+                "video" => {
+                    receiver
+                        .video()
+                        .capture_with(Duration::ZERO, |_| panic!("callback panic"))
+                        .await
+                }
+                "audio" => {
+                    receiver
+                        .audio()
+                        .capture_with(Duration::ZERO, |_| panic!("callback panic"))
+                        .await
+                }
+                _ => {
+                    receiver
+                        .metadata()
+                        .capture_with(Duration::ZERO, |_| panic!("callback panic"))
+                        .await
+                }
             }
-            "audio" => {
-                receiver
-                    .audio()
-                    .capture_with(Duration::ZERO, |_| panic!("callback panic"))
-                    .await
-            }
-            _ => {
-                receiver
-                    .metadata()
-                    .capture_with(Duration::ZERO, |_| panic!("callback panic"))
-                    .await
-            }
-        };
-        assert!(
-            matches!(result, Err(Error::SpawnFailed(message)) if message.contains("callback panic"))
-        );
-        assert!(
-            matches!(receiver.capture_any_with(Duration::ZERO, |_| panic!("mixed panic")).await,
-            Err(Error::SpawnFailed(message)) if message.contains("mixed panic"))
-        );
+        })
+        .await
+        .expect_err("callback panic must unwind the awaiting task");
+        assert_eq!(result.downcast_ref::<&str>(), Some(&"callback panic"));
+        let panic = catch_future(
+            receiver.capture_any_with(Duration::ZERO, move |_| std::panic::panic_any(42_u32)),
+        )
+        .await
+        .expect_err("mixed callback panic must unwind the awaiting task");
+        assert_eq!(*panic.downcast::<u32>().unwrap(), 42);
         assert_eq!(frees(family), before + 2);
+    }
+
+    {
+        use std::{
+            future::Future,
+            sync::mpsc,
+            task::{Context, Poll, Waker},
+        };
+        script(serial + 45, "video,video");
+        let before = frees("video");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let video = receiver.video();
+        let mut abandoned = Box::pin(video.capture_with(Duration::ZERO, move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            std::panic::panic_any(77_u32);
+        }));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            abandoned.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(abandoned);
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while frees("video") == before {
+            assert!(
+                Instant::now() < deadline,
+                "abandoned panicking callback leaked its frame"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(receiver
+            .video()
+            .capture(Duration::ZERO)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(frees("video"), before + 2);
     }
 
     // Reentry would deadlock if application code still held the capture lock.

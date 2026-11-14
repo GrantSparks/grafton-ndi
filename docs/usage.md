@@ -242,7 +242,10 @@ Use typed `capture_with(timeout, callback)` or mixed
 callback borrows validated media on the capturing worker; only its
 `Send + 'static` result crosses back to the task. The callback and its captures
 must also be `Send + 'static`. It runs only for a delivered value. A panic
-becomes `Error::SpawnFailed` and the SDK guard is freed on that worker.
+is resumed on the awaiting task with its original payload, after the SDK guard
+is freed on that worker. An abandoned future discards its panic payload.
+`Error::SpawnFailed(SpawnFailure)` distinguishes a missing Tokio runtime from a
+cancelled blocking task.
 
 Keep callbacks bounded: they hold an SDK buffer and occupy a worker. The wait
 timeout does not bound callback duration or cancel its side effects. Scoped
