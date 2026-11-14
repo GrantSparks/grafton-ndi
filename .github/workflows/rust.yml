@@ -75,6 +75,23 @@ jobs:
         run: cargo doc --locked --no-deps --all-features
       - name: Documentation links and examples
         run: python ci/docs.py --compile --rustdoc target/doc
+      - name: Redirect the site root to the API reference
+        if: github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main'
+        run: |
+          cat > target/doc/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+          <meta charset="utf-8">
+          <title>grafton-ndi API reference</title>
+          <meta http-equiv="refresh" content="0; url=grafton_ndi/">
+          <a href="grafton_ndi/">grafton-ndi API reference</a>
+          </html>
+          HTML
+      - name: Upload Pages artifact
+        if: github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: target/doc
       - name: Minimum supported Rust version
         run: |
           rustup toolchain install 1.88.0 --profile minimal
@@ -435,3 +452,24 @@ jobs:
             ${{ github.actor != 'dependabot[bot]' &&
             (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
         run: python3 ci/gate.py
+
+  deploy-docs:
+    name: publish documentation
+    needs: required-ci
+    if: ${{ !cancelled() && needs.required-ci.result == 'success' && github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main' }}
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -6,6 +6,14 @@ receiving, image encoding, async adapters and recording.
 
 ## Running the checks locally
 
+CI builds the API reference and checks documentation links and examples once
+in its cached lint job. Pushes to `main` upload that HTML for GitHub Pages;
+the deployment job publishes it only after `required-ci` succeeds. Pull
+requests, manual CI runs and release-tag runs validate docs without publishing.
+Pages write permissions are confined to the deployment job, which runs no
+repository scripts. The release caller forwards those permissions for reusable
+workflow validation; its tag ref keeps the Pages job disabled.
+
 Use the selected stable Rust toolchain with Clippy and rustfmt:
 
 ```sh

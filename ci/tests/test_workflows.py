@@ -20,15 +20,15 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / '.github' / 'workflows'
 
 READ_ONLY = {'contents': 'read'}
-# Only the registry and Pages deployment jobs may hold more than read access.
+# Only deployment jobs and the reusable-workflow caller may request write permissions.
 JOB_PERMISSIONS = {
+    ('publish.yml', 'ci'): {'contents': 'read', 'pages': 'write', 'id-token': 'write'},
     ('publish.yml', 'publish'): {'contents': 'read', 'id-token': 'write'},
-    ('docs.yml', 'deploy'): {'contents': 'read', 'pages': 'write', 'id-token': 'write'},
+    ('rust.yml', 'deploy-docs'): {'contents': 'read', 'pages': 'write', 'id-token': 'write'},
 }
 PASSED_SECRETS = {name: f'${{{{ secrets.{name} }}}}' for name in ('NDI_SDK_SOURCES_JSON', 'NDI_SDK_ARCHIVE_TOKEN')}
 # Every place where the word `secrets` may occur, as a key or inside any scalar.
 SECRET_USES = {
-    'docs.yml': set(),
     'rust.yml': {'on.workflow_call.secrets (key)', *(f'jobs.sdk.steps[Provision the SDK].env.{name}'
                                                     for name in PASSED_SECRETS)},
     'publish.yml': {'jobs.ci.secrets (key)', *(f'jobs.ci.secrets.{name}' for name in PASSED_SECRETS)},
@@ -37,12 +37,10 @@ SECRET_USES = {
 SECRETS_AVAILABLE = ("github.actor != 'dependabot[bot]' && (github.event_name != 'pull_request' || "
                      "github.event.pull_request.head.repo.full_name == github.repository)")
 JOB_CONDITIONS = {
-    'docs.yml': {'build': "github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main'"},
-    'rust.yml': {'sdk': f"vars.NDI_CI_RELEASED == 'true' && {SECRETS_AVAILABLE}", 'required-ci': 'always()'},
+    'rust.yml': {'sdk': f"vars.NDI_CI_RELEASED == 'true' && {SECRETS_AVAILABLE}", 'required-ci': 'always()', 'deploy-docs': "${{ !cancelled() && needs.required-ci.result == 'success' && github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main' }}"},
     'publish.yml': {'release': "github.repository == 'GrantSparks/grafton-ndi'"},
 }
 TRIGGERS = {
-    'docs.yml': {'push': {'branches': ['main']}, 'workflow_dispatch': None},
     'rust.yml': {'push': {'branches': ['main']}, 'pull_request': {'branches': ['main']}, 'workflow_dispatch': None,
                  'workflow_call': {'secrets': {name: {'required': 'false'} for name in PASSED_SECRETS}}},
     'publish.yml': {'push': {'tags': ['v*']}},
@@ -50,16 +48,13 @@ TRIGGERS = {
 # The actions each job uses, in order. The sdk job has SDK files on disk, so it has no
 # cache and no artifact action; the publish job holds the registry identity.
 ACTIONS = {
-    'docs.yml': {
-        'build': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain', 'actions/upload-pages-artifact'],
-        'deploy': ['actions/deploy-pages'],
-    },
     'rust.yml': {
-        'lint': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache'],
+        'lint': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache', 'actions/upload-pages-artifact'],
         'test': ['actions/checkout', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache'],
         'cross': ['actions/checkout', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache'],
         'sdk': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain'],
         'required-ci': ['actions/checkout'],
+        'deploy-docs': ['actions/deploy-pages'],
     },
     'publish.yml': {
         'release': ['actions/checkout'],
@@ -110,27 +105,29 @@ def violations(texts):
             if 'runs-on' in body and not re.fullmatch(r'\d+', body.get('timeout-minutes', '')):
                 found.append(f'{name}: {job} has no timeout')
     return (found + gate_violations(parsed['rust.yml']) + publish_violations(parsed['publish.yml'])
-            + docs_violations(parsed['docs.yml']))
+            + docs_violations(parsed['rust.yml']))
 
 
 def docs_violations(docs):
     """Only the checked HTML build reaches the Pages deployment identity."""
     jobs = docs['jobs']
-    deploy = jobs['deploy']
-    return (differs('docs.yml: job order', {name: body.get('needs') for name, body in jobs.items()},
-                    {'build': None, 'deploy': 'build'})
-            + differs('docs.yml: deployment environment', deploy.get('environment'),
+    deploy = jobs['deploy-docs']
+    upload = next(step for step in jobs['lint']['steps'] if step.get('name') == 'Upload Pages artifact')
+    return (differs('rust.yml: job order', deploy.get('needs'), 'required-ci')
+            + differs('rust.yml: artifact condition', upload.get('if'), "github.event_name == 'push' && github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main'")
+            + differs('rust.yml: artifact source', upload.get('with'), {'path': 'target/doc'})
+            + differs('rust.yml: deployment environment', deploy.get('environment'),
                       {'name': 'github-pages', 'url': '${{ steps.deployment.outputs.page_url }}'})
-            + differs('docs.yml: deployment scripts', [step for step in deploy['steps'] if 'run' in step], []))
+            + differs('rust.yml: deployment scripts', [step for step in deploy['steps'] if 'run' in step], []))
 
 
 def gate_violations(rust):
-    """required-ci must wait for every other job, always run, and expect the sdk job exactly when it can run."""
+    """required-ci waits for every check; deployment follows the gate."""
     jobs = rust['jobs']
     gate = jobs['required-ci']
     step = gate['steps'][-1]
     return (differs('rust.yml: jobs required-ci waits for', sorted(gate.get('needs') or []),
-                    sorted(set(jobs) - {'required-ci'}))
+                    sorted(set(jobs) - {'required-ci', 'deploy-docs'}))
             + differs('rust.yml: the gate step', (step.get('run'), step.get('env')), ('python3 ci/gate.py', {
                 'RESULTS': '${{ toJSON(needs) }}', 'SDK_EXPECTED': f'${{{{ {SECRETS_AVAILABLE} }}}}'}))
             + differs('rust.yml: the step given the secrets',
@@ -173,13 +170,12 @@ def publish_violations(publish):
 
 # Plausible wrong edits: (name, workflow, text to replace, replacement, words the report must contain).
 WRONG_EDITS = (
-    ('Pages build can write', 'docs.yml', '    name: build documentation\n',
-     '    name: build documentation\n    permissions:\n      contents: write\n', 'permissions of build'),
-    ('Pages deploy without waiting for the build', 'docs.yml', '    needs: build\n', '', 'job order'),
-    ('Pages deploy runs a repository script', 'docs.yml', '      - name: Deploy to GitHub Pages\n',
+    ('Pages deploy without CI', 'rust.yml', '    needs: required-ci\n', '', 'job order'),
+    ('Pages deploy runs a repository script', 'rust.yml', '      - name: Deploy to GitHub Pages\n',
      '      - run: python ci/docs.py\n      - name: Deploy to GitHub Pages\n', 'deployment scripts'),
-    ('Pages build allows a manual branch to publish', 'docs.yml',
-     " && github.ref == 'refs/heads/main'", '', 'job conditions'),
+    ('Pages deploy allows failed CI', 'rust.yml', "!cancelled() && needs.required-ci.result == 'success' &&", "!cancelled() &&", 'job conditions'),
+    ('Pages uploads unvalidated files', 'rust.yml', '          path: target/doc\n',
+     '          path: target\n', 'artifact source'),
     ('workflow-level id-token', 'publish.yml', 'permissions:\n  contents: read\n\n',
      'permissions:\n  contents: read\n  id-token: write\n\n', 'default permissions'),
     ('write-all on verify', 'publish.yml', '    name: verify package\n',

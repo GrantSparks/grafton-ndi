@@ -1,7 +1,7 @@
 name: Publish
 
 # A `v<version>` tag on a commit of main publishes that version to crates.io.
-# docs.yml publishes the authoritative API reference to GitHub Pages from main.
+# CI publishes the authoritative API reference to GitHub Pages from main.
 # docs.rs may also build the published crate as a supplementary reference.
 #
 # Nothing in this file decides who may publish. A tag runs the workflow of the
@@ -49,6 +49,10 @@ jobs:
   ci:
     name: ci
     needs: release
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     uses: ./.github/workflows/rust.yml
     secrets:
       NDI_SDK_SOURCES_JSON: ${{ secrets.NDI_SDK_SOURCES_JSON }}
