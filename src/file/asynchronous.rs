@@ -1124,19 +1124,50 @@ fn run_owner<H: Owner>(
     control: &Control,
     events: &EventQueue<H::Event>,
 ) {
+    run_owner_wait(owner, control, events, |wait| {
+        if wait {
+            receiver.recv_timeout(TICK)
+        } else {
+            receiver.try_recv().map_err(|error| match error {
+                mpsc::TryRecvError::Empty => RecvTimeoutError::Timeout,
+                mpsc::TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
+            })
+        }
+    });
+}
+
+/// The wait is injectable so tests can assert command fairness and idle
+/// backoff without making wall-clock scheduling assertions.
+fn run_owner_wait<H: Owner>(
+    owner: &mut H,
+    control: &Control,
+    events: &EventQueue<H::Event>,
+    mut command: impl FnMut(bool) -> std::result::Result<Job<H>, RecvTimeoutError>,
+) {
     while !control.shutdown.load(Ordering::Acquire) {
         // Limit each drain burst so a busy source cannot starve commands.
+        let mut full = true;
         for _ in 0..16 {
             match owner.poll_native() {
                 Ok(Some(event)) => events.push(Ok(event)),
-                Ok(None) => break,
+                Ok(None) => {
+                    full = false;
+                    break;
+                }
                 Err(error) => {
                     events.push(Err(error));
+                    full = false;
                     break;
                 }
             }
         }
-        match receiver.recv_timeout(TICK) {
+        if control.shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        // A full burst may have left a backlog. Service commands without
+        // inserting a tick before the next burst. Empty/error paths retain
+        // the timed wait to avoid spinning.
+        match command(!full) {
             Ok(job) => {
                 if control.shutdown.load(Ordering::Acquire) {
                     break;
@@ -1690,6 +1721,128 @@ mod tests {
             }
             *notified = false;
         }
+    }
+
+    struct BurstOwner {
+        remaining: usize,
+        polls: usize,
+        fail: bool,
+    }
+
+    #[test]
+    #[ignore = "manual fake-owner event burst throughput; no native File runtime"]
+    fn file_event_burst_resources() {
+        for sample in 0..5 {
+            for old_wait in [true, false] {
+                let mut owner = BurstOwner {
+                    remaining: 1600,
+                    polls: 0,
+                    fail: false,
+                };
+                let control = Control::new();
+                let events = EventQueue::new(16);
+                let start = Instant::now();
+                let mut last_burst = Duration::ZERO;
+                let mut waits = 0;
+                run_owner_wait(&mut owner, &control, &events, |wait| {
+                    if wait {
+                        return Err(RecvTimeoutError::Disconnected);
+                    }
+                    last_burst = start.elapsed();
+                    if old_wait {
+                        waits += 1;
+                        thread::sleep(TICK);
+                    }
+                    Err(RecvTimeoutError::Timeout)
+                });
+                assert_eq!(owner.polls, 1601);
+                assert_eq!(lock(&events.0).dropped, 1584);
+                eprintln!(
+                    "burst,{old_wait},{sample},1600,{:.6},{waits}",
+                    last_burst.as_secs_f64() * 1000.0
+                );
+            }
+        }
+    }
+    impl Owner for BurstOwner {
+        type Event = usize;
+        fn poll_native(&mut self) -> Result<Option<usize>> {
+            self.polls += 1;
+            if self.fail {
+                return Err(Error::InvalidFrame("malformed fake event".into()));
+            }
+            if self.remaining == 0 {
+                return Ok(None);
+            }
+            self.remaining -= 1;
+            Ok(Some(self.polls))
+        }
+    }
+
+    #[test]
+    fn event_backlogs_continue_without_ticks_and_keep_command_fairness() {
+        let control = Control::new();
+        let events = EventQueue::new(20);
+        let mut owner = BurstOwner {
+            remaining: 40,
+            polls: 0,
+            fail: false,
+        };
+        let mut waits = Vec::new();
+        run_owner_wait(&mut owner, &control, &events, |wait| {
+            waits.push(wait);
+            match waits.len() {
+                1 => Ok(Box::new(|owner: &mut BurstOwner| {
+                    assert_eq!(owner.polls, 16)
+                })),
+                2 => Ok(Box::new(|owner: &mut BurstOwner| {
+                    assert_eq!(owner.polls, 32)
+                })),
+                _ => Err(RecvTimeoutError::Disconnected),
+            }
+        });
+        assert_eq!(waits, [false, false, true]);
+        assert_eq!(owner.polls, 41);
+        let events = lock(&events.0);
+        assert_eq!(events.queue.len(), 20);
+        assert_eq!(events.dropped, 20);
+        assert_eq!(events.queue.front().unwrap().as_ref().unwrap(), &21);
+        assert_eq!(events.queue.back().unwrap().as_ref().unwrap(), &40);
+    }
+
+    #[test]
+    fn event_idle_and_error_paths_wait_and_shutdown_ends_continuous_bursts() {
+        for fail in [false, true] {
+            let mut owner = BurstOwner {
+                remaining: 0,
+                polls: 0,
+                fail,
+            };
+            let events = EventQueue::new(10);
+            run_owner_wait(&mut owner, &Control::new(), &events, |wait| {
+                assert!(wait, "idle and malformed-event paths must back off");
+                Err(RecvTimeoutError::Disconnected)
+            });
+            assert_eq!(owner.polls, 1);
+            assert_eq!(lock(&events.0).queue.len(), usize::from(fail));
+        }
+        let control = Arc::new(Control::new());
+        let mut owner = BurstOwner {
+            remaining: usize::MAX,
+            polls: 0,
+            fail: false,
+        };
+        let mut commands = 0;
+        run_owner_wait(&mut owner, &control, &EventQueue::new(16), |wait| {
+            assert!(!wait);
+            commands += 1;
+            let control = Arc::clone(&control);
+            Ok(Box::new(move |_: &mut BurstOwner| {
+                control.shutdown.store(true, Ordering::Release);
+            }))
+        });
+        assert_eq!(commands, 1);
+        assert_eq!(owner.polls, 16);
     }
 
     struct LocalOwner {
