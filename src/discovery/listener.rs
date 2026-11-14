@@ -532,6 +532,73 @@ fn copy_budget() -> CopyBudget {
     CopyBudget::new(COPY_LIMIT, ResourceKind::DiscoveryServerCopyBytes)
 }
 
+/// Compare only the prefix that could match, including its exact terminator.
+/// No native string, including one compared with a longer caller-supplied ID,
+/// is read beyond the SDK string bound.
+///
+/// # Safety
+/// A non-null `value` must remain readable byte by byte until the first NUL,
+/// mismatching byte, or `MAX_SDK_STRING_BYTES`, whichever comes first.
+unsafe fn receiver_id_matches(value: *const c_char, id: &ReceiverId) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    for (offset, &expected) in id
+        .as_c_str()
+        .to_bytes_with_nul()
+        .iter()
+        .take(MAX_SDK_STRING_BYTES)
+        .enumerate()
+    {
+        // SAFETY: the comparison stops at the first mismatch or NUL, and the
+        // iterator caps every native read at the SDK string bound.
+        let byte = unsafe { value.cast::<u8>().add(offset).read() };
+        if byte != expected {
+            return false;
+        }
+        if byte == 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Validate one receiver's connection-request precondition without copying
+/// the registry or inspecting fields unrelated to its ID and commands.
+///
+/// # Safety
+/// Every non-null UUID must satisfy `receiver_id_matches`'s readable bound.
+/// A matched entry's non-null commands pointer must hold its stated number
+/// of initialized commands. All of this storage must remain unchanged for
+/// the call. Other pointer fields are never read.
+pub(crate) unsafe fn require_receiver_connect(
+    receivers: &[NDIlib_receiver_t],
+    id: &ReceiverId,
+    budget: &mut CopyBudget,
+) -> Result<()> {
+    let Some(receiver) = receivers.iter().find(|receiver| {
+        // SAFETY: the caller keeps each UUID's bounded prefix readable.
+        unsafe { receiver_id_matches(receiver.p_uuid, id) }
+    }) else {
+        return Err(Error::ReceiverRequestNotAccepted { advertised: false });
+    };
+    // SAFETY: the caller keeps the matched command array readable. Preflight
+    // validates its pointer, count, span and budget before constructing a slice.
+    let commands =
+        match unsafe { budget.slice(receiver.p_commands.cast_const(), receiver.num_commands) } {
+            Ok(commands) => commands,
+            Err(CopyError::Malformed(_)) => {
+                return Err(Error::ReceiverRequestNotAccepted { advertised: true });
+            }
+            Err(CopyError::Failed(error)) => return Err(error),
+        };
+    if commands.contains(&NDIlib_receiver_command_e_NDIlib_receiver_command_connect) {
+        Ok(())
+    } else {
+        Err(Error::ReceiverRequestNotAccepted { advertised: true })
+    }
+}
+
 /// Copy the Discovery Server endpoint a listener reports: `None` for a null
 /// pointer, or for a string with no terminator within
 /// [`MAX_SDK_STRING_BYTES`], and bytes that are not UTF-8 replaced with
@@ -1010,10 +1077,11 @@ impl RecvListener {
     /// Ask the receiver `id` names to connect to the NDI source called
     /// `source`.
     ///
-    /// The request is sent only to a receiver that the listener lists, in a
-    /// snapshot taken by this call, as advertising
-    /// [`ReceiverCommand::Connect`]. Success means the request was sent, not
-    /// that the receiver acted on it.
+    /// The request checks the listener's current borrowed membership, comparing
+    /// exact identifiers and reading only the matched receiver's commands. It
+    /// is sent only when that receiver advertises [`ReceiverCommand::Connect`].
+    /// Malformed names, input groups, addresses or streams do not prevent a
+    /// request. Success means it was sent, not that the receiver acted on it.
     ///
     /// # Errors
     ///
@@ -1021,10 +1089,14 @@ impl RecvListener {
     /// [`Error::ReceiverRequestNotAccepted`] when no receiver the listener
     /// lists has this identifier (`advertised` is false: the listener may not
     /// have connected yet, the receiver may not be registered, or its entry
-    /// may have been omitted as malformed; a later request can succeed) or the
+    /// may have an unreadable identifier; a later request can succeed) or the
     /// receiver does not accept connection requests
-    /// (`advertised` is true); [`Error::NativeOperationFailed`] when the SDK
-    /// cannot send the request; and the errors of [`Self::snapshot`].
+    /// (`advertised` is true, including a malformed command array);
+    /// [`Error::NativeOperationFailed`] when the SDK cannot send the request;
+    /// [`Error::UnexpectedSdkResult`] for a malformed top-level membership
+    /// array; and [`Error::ResourceLimit`] when that array and the target's
+    /// commands exceed the 16 MiB inspection budget. Unrelated fields are
+    /// neither scanned nor copied and cannot spend that budget.
     pub fn request_connect(&mut self, id: &ReceiverId, source: &str) -> Result<()> {
         self.request(id, Some(source))
     }
@@ -1032,6 +1104,8 @@ impl RecvListener {
     ///
     /// This is the connection request without a source, so it too is sent
     /// only to a receiver that advertises [`ReceiverCommand::Connect`].
+    /// It compares exact identifiers and reads only the matched command array;
+    /// unrelated fields are neither scanned nor copied.
     ///
     /// # Errors
     ///
@@ -1042,16 +1116,12 @@ impl RecvListener {
     fn request(&mut self, id: &ReceiverId, source: Option<&str>) -> Result<()> {
         let source = source.map(CString::new).transpose()?;
         // The SDK accepts this command only for a receiver that advertises it.
-        // Check a fresh snapshot rather than trust what the caller last saw.
-        let receivers = self.snapshot()?;
-        let listed = receivers
-            .iter()
-            .find(|receiver| receiver.id.as_ref() == Some(id));
-        if !listed.is_some_and(|receiver| receiver.commands.contains(&ReceiverCommand::Connect)) {
-            return Err(Error::ReceiverRequestNotAccepted {
-                advertised: listed.is_some(),
-            });
-        }
+        // Read current membership rather than trust what the caller last saw.
+        let mut budget = copy_budget();
+        let receivers = self.inner.entries(&mut budget)?;
+        // SAFETY: the exclusive listener borrow keeps its SDK-owned entries,
+        // UUIDs and matched commands unchanged until this inspection finishes.
+        unsafe { require_receiver_connect(receivers, id, &mut budget)? };
         // SAFETY: the listener instance is live and both strings outlive the call.
         if unsafe {
             self.inner.api.NDIlib_recv_listener_send_connect(
@@ -1072,6 +1142,190 @@ impl RecvListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receiver_request_lookup_uses_exact_ids_and_only_the_matched_commands() {
+        let mut commands = [
+            999,
+            NDIlib_receiver_command_e_NDIlib_receiver_command_connect,
+            NDIlib_receiver_command_e_NDIlib_receiver_command_none,
+        ];
+        let target = ReceiverId::new(b"receiver-\xff".to_vec()).unwrap();
+        let matching = NDIlib_receiver_t {
+            p_uuid: c"receiver-\xff".as_ptr(),
+            // Unrelated fields are intentionally not usable as a snapshot.
+            p_name: ptr::dangling(),
+            p_input_uuid: ptr::dangling(),
+            p_input_name: ptr::dangling(),
+            p_address: ptr::dangling(),
+            num_streams: 1,
+            p_commands: commands.as_mut_ptr(),
+            num_commands: commands.len() as u32,
+            ..Default::default()
+        };
+        let unrelated = NDIlib_receiver_t {
+            p_uuid: c"receiver-\xff-longer".as_ptr(),
+            p_commands: ptr::null_mut(),
+            num_commands: 1,
+            ..Default::default()
+        };
+        // SAFETY: UUIDs and the matched commands remain live and unchanged;
+        // malformed unrelated fields and unmatched commands are not read.
+        unsafe {
+            require_receiver_connect(&[unrelated, matching], &target, &mut copy_budget()).unwrap();
+            for id in [c"receiver-\xff-longer", c"receiver", c"", c"other"] {
+                let receiver = NDIlib_receiver_t {
+                    p_uuid: id.as_ptr(),
+                    ..matching
+                };
+                assert!(matches!(
+                    require_receiver_connect(&[receiver], &target, &mut copy_budget()),
+                    Err(Error::ReceiverRequestNotAccepted { advertised: false })
+                ));
+            }
+            for (pointer, count) in [
+                (ptr::null_mut(), 0),
+                (ptr::null_mut(), 1),
+                (commands.as_mut_ptr(), 1),
+            ] {
+                let receiver = NDIlib_receiver_t {
+                    p_commands: pointer,
+                    num_commands: count,
+                    ..matching
+                };
+                assert!(matches!(
+                    require_receiver_connect(&[receiver], &target, &mut copy_budget()),
+                    Err(Error::ReceiverRequestNotAccepted { advertised: true })
+                ));
+            }
+            assert!(matches!(
+                require_receiver_connect(&[], &target, &mut copy_budget()),
+                Err(Error::ReceiverRequestNotAccepted { advertised: false })
+            ));
+            let no_id = NDIlib_receiver_t {
+                p_uuid: ptr::null(),
+                ..matching
+            };
+            assert!(matches!(
+                require_receiver_connect(&[no_id], &target, &mut copy_budget()),
+                Err(Error::ReceiverRequestNotAccepted { advertised: false })
+            ));
+        }
+    }
+
+    #[test]
+    fn receiver_request_lookup_does_not_copy_or_budget_unrelated_strings() {
+        let text = CString::new(vec![b'x'; MAX_SDK_STRING_BYTES - 1]).unwrap();
+        let unrelated = NDIlib_receiver_t {
+            p_uuid: c"unrelated".as_ptr(),
+            p_name: text.as_ptr(),
+            p_input_uuid: text.as_ptr(),
+            p_input_name: text.as_ptr(),
+            p_address: text.as_ptr(),
+            num_streams: 1,
+            num_commands: 1,
+            ..Default::default()
+        };
+        let mut receivers = vec![unrelated; 1_000];
+        let mut connect = [NDIlib_receiver_command_e_NDIlib_receiver_command_connect];
+        receivers.push(NDIlib_receiver_t {
+            p_uuid: c"target".as_ptr(),
+            p_commands: connect.as_mut_ptr(),
+            num_commands: 1,
+            ..unrelated
+        });
+        // Even one unrelated entry cannot be copied within the shared
+        // snapshot budget once its four large text fields are included.
+        let mut budget = copy_budget();
+        // SAFETY: `text` is a live terminated string for every attempted copy.
+        unsafe {
+            budget.text(text.as_ptr()).unwrap();
+            budget.text(text.as_ptr()).unwrap();
+            assert!(matches!(
+                budget.text(text.as_ptr()),
+                Err(CopyError::Failed(Error::ResourceLimit {
+                    resource: ResourceKind::DiscoveryServerCopyBytes,
+                    ..
+                }))
+            ));
+        }
+        let target = ReceiverId::new("target").unwrap();
+        let (result, allocations) = crate::test_alloc::allocation_count(|| {
+            // SAFETY: all UUIDs and the target's commands remain readable.
+            // The malformed unrelated arrays are never inspected.
+            unsafe { require_receiver_connect(&receivers, &target, &mut copy_budget()) }
+        });
+        result.unwrap();
+        assert_eq!(allocations, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn receiver_id_comparison_stops_at_nul_mismatch_and_the_native_string_cap() {
+        struct Guarded {
+            mapping: *mut libc::c_void,
+            mapped: usize,
+            data: *mut u8,
+        }
+        impl Guarded {
+            fn new(bytes: &[u8]) -> Self {
+                // SAFETY: the private mapping owns its initialized prefix and
+                // inaccessible last page until Drop releases it.
+                unsafe {
+                    let page = usize::try_from(libc::sysconf(libc::_SC_PAGESIZE)).unwrap();
+                    let body = bytes.len().div_ceil(page) * page;
+                    let mapped = body + page;
+                    let mapping = libc::mmap(
+                        ptr::null_mut(),
+                        mapped,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    );
+                    assert_ne!(mapping, libc::MAP_FAILED);
+                    let guard = mapping.cast::<u8>().add(body);
+                    assert_eq!(libc::mprotect(guard.cast(), page, libc::PROT_NONE), 0);
+                    let data = guard.sub(bytes.len());
+                    ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
+                    Self {
+                        mapping,
+                        mapped,
+                        data,
+                    }
+                }
+            }
+        }
+        impl Drop for Guarded {
+            fn drop(&mut self) {
+                // SAFETY: this is the mapping allocated in new, with no live borrows.
+                assert_eq!(unsafe { libc::munmap(self.mapping, self.mapped) }, 0);
+            }
+        }
+        let target = ReceiverId::new("target").unwrap();
+        for bytes in [b"t\0".as_slice(), b"\0", b"u", b"target\0", b"targetx"] {
+            let native = Guarded::new(bytes);
+            // SAFETY: the bytewise comparison's required prefix is readable:
+            // it must stop at NUL, mismatch, or the target's exact terminator.
+            assert_eq!(
+                unsafe { receiver_id_matches(native.data.cast(), &target) },
+                bytes == b"target\0"
+            );
+        }
+        let bytes = vec![b'x'; MAX_SDK_STRING_BYTES];
+        let native = Guarded::new(&bytes);
+        let long_target = ReceiverId::new(vec![b'x'; MAX_SDK_STRING_BYTES + 10]).unwrap();
+        // SAFETY: the complete native scan cap is readable; its next byte is
+        // intentionally inaccessible even though the caller's ID is longer.
+        assert!(!unsafe { receiver_id_matches(native.data.cast(), &long_target) });
+        let mut terminated = bytes;
+        *terminated.last_mut().unwrap() = 0;
+        let native = Guarded::new(&terminated);
+        let longest_target = ReceiverId::new(vec![b'x'; MAX_SDK_STRING_BYTES - 1]).unwrap();
+        // SAFETY: the longest permitted native string includes its final NUL.
+        assert!(unsafe { receiver_id_matches(native.data.cast(), &longest_target) });
+    }
+
     #[test]
     fn list_terminators_are_dropped_and_unknown_values_kept() {
         assert_eq!(

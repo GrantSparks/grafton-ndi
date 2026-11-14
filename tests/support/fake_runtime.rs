@@ -837,7 +837,16 @@ mod discovery {
                     events_subscribed: false,
                 },
             ];
-            match malformed().as_str() {
+            let malformed = malformed();
+            // The baseline fixed receiver refuses control. These variants
+            // explicitly grant Connect so an unrelated bad field is the only
+            // reason the old snapshot-based request would have refused it.
+            if matches!(malformed.as_str(), "receiver-name" | "receiver-input-id"
+                | "receiver-input-name" | "receiver-address" | "streams-null") {
+                receivers[1].p_commands = commands.as_mut_ptr();
+                receivers[1].num_commands = 1;
+            }
+            match malformed.as_str() {
                 "receiver-id" => receivers[1].p_uuid = oversized_text(),
                 "receiver-name" => receivers[1].p_name = oversized_text(),
                 "receiver-input-id" => receivers[1].p_input_uuid = oversized_text(),
@@ -845,6 +854,16 @@ mod discovery {
                 "receiver-address" => receivers[1].p_address = oversized_text(),
                 "streams-null" => receivers[1].num_streams = 1,
                 "commands-null" => receivers[1].num_commands = 1,
+                "receiver-copy-budget" => {
+                    // Shift the oversized allocation by one byte so its NUL
+                    // falls just inside the 4 MiB string bound. These valid
+                    // fields together exceed the 16 MiB snapshot copy budget.
+                    let text = unsafe { oversized_text().add(1) };
+                    receivers[1].p_name = text;
+                    receivers[1].p_input_uuid = text;
+                    receivers[1].p_input_name = text;
+                    receivers[1].p_address = text;
+                }
                 _ => {}
             }
             Box::into_raw(Box::new(RecvListener { receivers, _streams: streams, _commands: commands, batch: Batch::new() })).cast()
