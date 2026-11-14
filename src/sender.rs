@@ -430,10 +430,10 @@ impl Drop for VideoPipeline {
     }
 }
 
-impl in_flight::Lend for VideoFrame {
-    /// The frame's descriptor. It points into the frame's pixel allocation,
-    /// which holds the room the SDK reads after them, and its metadata
-    /// `CString`; moving the frame moves neither.
+// SAFETY: The descriptor borrows owned initialized pixels, scan-dependent SDK
+// tail, and terminated FrameMetadata. Moving the frame moves none of those
+// allocations, which InFlight keeps inaccessible until the SDK releases them.
+unsafe impl in_flight::Lend for VideoFrame {
     fn lend(&mut self) -> in_flight::Lent {
         in_flight::Lent::Frame(self.to_raw())
     }
@@ -524,11 +524,13 @@ pub(crate) mod in_flight {
 
     /// A frame an asynchronous video send can lend to the SDK.
     ///
+    /// # Safety
+    ///
     /// The descriptors [`lend`](Self::lend) returns point only into
     /// allocations the frame owns, which moving the frame does not move: the
     /// SDK goes on using them after the frame has moved into its slot, and
     /// the slot gives no access to a frame in flight.
-    pub(crate) trait Lend {
+    pub(crate) unsafe trait Lend {
         /// The descriptors that lend this frame to the SDK.
         fn lend(&mut self) -> Lent;
     }
@@ -842,7 +844,11 @@ pub struct BorrowedVideoFrame<'buf> {
     metadata: Option<MetadataText<'buf>>,
 }
 
-impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
+// SAFETY: Construction checks the initialized byte slice covers the validated
+// layout; its borrow also retains validated terminated metadata unchanged.
+// sends_in_place checks the initialized stride/tail extent before direct SDK
+// reads. The default descriptor never points outside those borrowed buffers.
+unsafe impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
     #[inline]
     fn layout(&self) -> &ValidatedVideoLayout {
         &self.layout
@@ -851,9 +857,6 @@ impl crate::frames::VideoParts for BorrowedVideoFrame<'_> {
     fn header(&self) -> &VideoHeader {
         &self.header
     }
-    /// `data` is exactly the storage the layout describes, as construction
-    /// checked, initialized like any slice, and borrowed unchanged for
-    /// `'buf`.
     #[inline]
     fn pixels(&self) -> *const u8 {
         self.data.as_ptr()
@@ -1289,12 +1292,12 @@ impl<'buf> BorrowedVideoFrameBuilder<'buf> {
             self.height,
             self.line_stride,
         )?;
-        let Some(data) = self.data.get(..layout.data_len_bytes) else {
+        let Some(data) = self.data.get(..layout.data_len_bytes()) else {
             return Err(Error::InvalidFrame(format!(
                 "Buffer too small for {:?}: got {} bytes, expected at least {}",
                 self.pixel_format,
                 self.data.len(),
-                layout.data_len_bytes,
+                layout.data_len_bytes(),
             )));
         };
         let metadata = self.metadata.map(MetadataText::from_cstr).transpose()?;
@@ -1505,7 +1508,7 @@ impl Sender {
     /// # }
     /// ```
     pub fn send_video(&self, frame: &(impl VideoSource + ?Sized)) -> Result<()> {
-        self.require_video_format(frame.layout().pixel_format)?;
+        self.require_video_format(frame.layout().pixel_format())?;
         self.native.video.send(frame);
         Ok(())
     }
@@ -1566,7 +1569,7 @@ impl Sender {
         &mut self,
         frame: &(impl VideoSource + ?Sized),
     ) -> Result<Option<VideoFrame>> {
-        self.require_video_format(frame.layout().pixel_format)?;
+        self.require_video_format(frame.layout().pixel_format())?;
         let owned = frame.owned_copy();
         Ok(self.native.video.submit(owned))
     }
@@ -2202,7 +2205,7 @@ mod tests {
                     let stride = format.line_stride_bytes(4).unwrap() + padding;
                     let len = ValidatedVideoLayout::new_uncompressed(format, 4, 6, Some(stride))
                         .unwrap()
-                        .data_len_bytes;
+                        .data_len_bytes();
                     let initialized = vec![71; len];
                     let template = BorrowedVideoFrame::builder(&initialized, 4, 6, format)
                         .line_stride_bytes(stride)
@@ -2418,7 +2421,7 @@ mod tests {
                     let layout =
                         ValidatedVideoLayout::new_uncompressed(format, 18, 6, Some(stride))
                             .unwrap();
-                    let len = layout.data_len_bytes;
+                    let len = layout.data_len_bytes();
                     let room = send_room(&layout, scan);
                     let mut staging = Pixels::default();
                     let mut expected = None;
@@ -3112,7 +3115,7 @@ mod tests {
                 let layout =
                     ValidatedVideoLayout::new_uncompressed(format, 4, 4, Some(stride)).unwrap();
                 // A longer buffer is accepted; the frame is its layout's extent.
-                let data = vec![19; layout.data_len_bytes + 3];
+                let data = vec![19; layout.data_len_bytes() + 3];
                 let metadata = c"<pixels>é</pixels>";
                 let rate = FrameRate::new(30000, 1001).unwrap();
                 let (borrowed, allocations) = crate::test_alloc::allocation_count(|| {
@@ -3127,7 +3130,7 @@ mod tests {
                         .unwrap();
                     for _ in 0..3 {
                         assert_eq!(frame.metadata(), Some("<pixels>é</pixels>"));
-                        assert_eq!(frame.data(), &data[..layout.data_len_bytes]);
+                        assert_eq!(frame.data(), &data[..layout.data_len_bytes()]);
                         assert_eq!(frame.pixel_format(), format);
                     }
                     frame
@@ -3152,7 +3155,7 @@ mod tests {
                 assert_eq!(raw.p_metadata, owned.to_raw().p_metadata);
                 assert_eq!(raw.p_data, owned.to_raw().p_data);
                 assert!(BorrowedVideoFrame::builder(
-                    &data[..layout.data_len_bytes - 1],
+                    &data[..layout.data_len_bytes() - 1],
                     4,
                     4,
                     format

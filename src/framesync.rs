@@ -1039,7 +1039,8 @@ fn input_format(returned: &NDIlib_audio_frame_v3_t) -> Result<Option<AudioInputF
         ReturnedAudio::Empty(format) => Ok(format),
         ReturnedAudio::Samples(layout) => Err(Error::InvalidFrame(format!(
             "FrameSync audio input-format query returned {} channels of {} samples",
-            layout.no_channels, layout.no_samples
+            layout.no_channels(),
+            layout.no_samples()
         ))),
     }
 }

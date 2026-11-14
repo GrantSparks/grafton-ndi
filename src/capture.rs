@@ -73,7 +73,7 @@ mod sealed {
 ///
 /// Implementors must ensure [`free`](Self::free) releases a frame that was
 /// populated by the matching SDK capture call through the same `instance`.
-pub(crate) trait FrameFree: sealed::Sealed + 'static {
+pub(crate) unsafe trait FrameFree: sealed::Sealed + 'static {
     /// The SDK instance handle that owns the frame buffers (and through which
     /// they must be freed).
     type Instance: Copy;
@@ -151,7 +151,9 @@ pub(crate) trait CaptureStrategy:
 /// Marker type for video frame capture operations.
 pub struct VideoKind;
 
-impl FrameFree for VideoKind {
+// SAFETY: This strategy pairs its raw frame and instance types with the
+// matching NDIlib_recv_free_video_v2 release through the owning runtime.
+unsafe impl FrameFree for VideoKind {
     type Instance = NDIlib_recv_instance_t;
     type RawFrame = NDIlib_video_frame_v2_t;
     const REF_DEBUG_NAME: &'static str = "VideoFrameRef";
@@ -185,7 +187,9 @@ impl CaptureStrategy for VideoKind {
 /// Marker type for audio frame capture operations.
 pub struct AudioKind;
 
-impl FrameFree for AudioKind {
+// SAFETY: This strategy pairs its raw frame and instance types with the
+// matching NDIlib_recv_free_audio_v3 release through the owning runtime.
+unsafe impl FrameFree for AudioKind {
     type Instance = NDIlib_recv_instance_t;
     type RawFrame = NDIlib_audio_frame_v3_t;
     const REF_DEBUG_NAME: &'static str = "AudioFrameRef";
@@ -219,7 +223,9 @@ impl CaptureStrategy for AudioKind {
 /// Marker type for metadata frame capture operations.
 pub struct MetadataKind;
 
-impl FrameFree for MetadataKind {
+// SAFETY: This strategy pairs its raw frame and instance types with the
+// matching NDIlib_recv_free_metadata release through the owning runtime.
+unsafe impl FrameFree for MetadataKind {
     type Instance = NDIlib_recv_instance_t;
     type RawFrame = NDIlib_metadata_frame_t;
     const REF_DEBUG_NAME: &'static str = "MetadataFrameRef";
@@ -255,7 +261,9 @@ impl CaptureStrategy for MetadataKind {
 /// Frees via `NDIlib_framesync_free_video`.
 pub struct FrameSyncVideoFree;
 
-impl FrameFree for FrameSyncVideoFree {
+// SAFETY: This strategy pairs its raw frame and instance types with the
+// matching NDIlib_framesync_free_video release through the owning runtime.
+unsafe impl FrameFree for FrameSyncVideoFree {
     type Instance = NDIlib_framesync_instance_t;
     type RawFrame = NDIlib_video_frame_v2_t;
     const REF_DEBUG_NAME: &'static str = "FrameSyncVideoRef";
@@ -270,7 +278,9 @@ impl FrameFree for FrameSyncVideoFree {
 /// Frees via `NDIlib_framesync_free_audio_v2`.
 pub struct FrameSyncAudioFree;
 
-impl FrameFree for FrameSyncAudioFree {
+// SAFETY: This strategy pairs its raw frame and instance types with the
+// matching NDIlib_framesync_free_audio_v2 release through the owning runtime.
+unsafe impl FrameFree for FrameSyncAudioFree {
     type Instance = NDIlib_framesync_instance_t;
     type RawFrame = NDIlib_audio_frame_v3_t;
     const REF_DEBUG_NAME: &'static str = "FrameSyncAudioRef";

@@ -489,11 +489,10 @@ impl PendingVideo {
     }
 }
 
-impl Lend for PendingVideo {
-    /// The video descriptor to submit this entry with, which the SDK reads
-    /// only during the call, and for a scatter frame its scatter list. The
-    /// descriptor lends the frame's bytes, or for a scatter frame only its
-    /// metadata; the list lends the blocks. All of them belong to the entry.
+// SAFETY: Each variant owns the initialized payload and terminated metadata;
+// Scatter additionally owns its list in stable storage. Moving PendingVideo
+// moves none of those allocations. InFlight prevents access until release.
+unsafe impl Lend for PendingVideo {
     fn lend(&mut self) -> Lent {
         match self {
             Self::Contiguous(frame) => Lent::Frame(frame.raw()),

@@ -82,10 +82,10 @@ impl AudioShape {
     fn from_planar(frame: &(impl AudioSource + ?Sized)) -> Self {
         let layout = frame.layout();
         Self {
-            sample_rate: layout.sample_rate,
-            num_channels: layout.no_channels as u32,
-            num_samples: layout.no_samples as u32,
-            count: layout.no_channels * layout.no_samples,
+            sample_rate: layout.sample_rate(),
+            num_channels: layout.no_channels() as u32,
+            num_samples: layout.no_samples() as u32,
+            count: layout.no_channels() * layout.no_samples(),
         }
     }
 

@@ -275,7 +275,7 @@ impl AllocationRequest {
                         Error::InvalidFrame(reason) => invalid_input(reason),
                         other => other,
                     })?
-                    .data_len_bytes
+                    .data_len_bytes()
             }
             AllocationFormat::AudioPlanarF32 => {
                 if !stride.is_multiple_of(size_of::<f32>()) {
@@ -1257,11 +1257,11 @@ fn video_request(frame: &NDIlib_video_frame_v2_t) -> Result<AllocationRequest> {
         .map_err(|_| invalid_frame("Unknown allocator video format"))?;
     let layout = ValidatedVideoLayout::from_sdk(pixel, frame.xres, frame.yres, 0)?;
     Ok(AllocationRequest {
-        bytes: layout.data_len_bytes,
-        stride: layout.line_stride_bytes,
+        bytes: layout.data_len_bytes(),
+        stride: layout.line_stride_bytes(),
         format: AllocationFormat::Video(pixel),
-        width: layout.width,
-        height: layout.height,
+        width: layout.width(),
+        height: layout.height(),
         capacity_limit: MAX_ALLOCATION,
     })
 }

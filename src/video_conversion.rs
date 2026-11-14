@@ -151,10 +151,10 @@ impl V210Layout {
             self.height,
             None,
         )?;
-        if len != p216.data_len_bytes {
+        if len != p216.data_len_bytes() {
             return Err(Error::InvalidFrame(format!(
                 "P216 buffer has {len} bytes, requires {}",
-                p216.data_len_bytes
+                p216.data_len_bytes()
             )));
         }
         // The utilities convert samples; the header only has to be valid.

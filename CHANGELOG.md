@@ -188,6 +188,9 @@ linkage and Rust 1.88 baseline.
 
 ### Fixed
 
+- Sending a captured single-row video frame with a padded stride uses staging
+  so the SDK reads only initialized pixels and padding.
+
 - Unchanged Cargo builds no longer rebuild because bindgen tracked the
   generated wrapper header as an input (#121). Real SDK headers remain tracked.
 - Received and borrowed NV12 frames accept valid odd padded line strides,

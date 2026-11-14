@@ -23,11 +23,11 @@ use crate::{frames::ValidatedVideoLayout, ScanType};
 /// which include the frame's area, are not modeled: every such frame gets the
 /// rows.
 pub(crate) fn send_room(layout: &ValidatedVideoLayout, scan: ScanType) -> usize {
-    let room = layout.pixel_format.send_tail_room();
-    if room == 0 || scan == ScanType::Progressive || layout.height.is_multiple_of(4) {
+    let room = layout.pixel_format().send_tail_room();
+    if room == 0 || scan == ScanType::Progressive || layout.height().is_multiple_of(4) {
         room
     } else {
-        room + 2 * layout.line_stride_bytes
+        room + 2 * layout.line_stride_bytes()
     }
 }
 
