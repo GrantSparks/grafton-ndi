@@ -10,7 +10,7 @@ mod runtime_fixture;
 
 use fixture::FixtureDir;
 use grafton_ndi::{
-    capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, SdkEdition},
+    capabilities::{CapabilityStatus, CapabilityUnavailable, SdkEdition},
     file::{FileApi, FileFamily, FileRuntimeOptions, PlayerOptions, RecorderOptions, SourceSpec},
     runtime::RuntimeOptions,
     Error, Ndi,
@@ -398,13 +398,8 @@ fn child(name: &str, fixtures: &Fixtures) {
             assert!(api.supports(FileFamily::Playback));
             let options = RecorderOptions::new(SourceSpec::new("a source").unwrap());
             match api.create_recorder(&options) {
-                Err(Error::UnsupportedCapability {
-                    feature,
-                    reason,
-                    detail,
-                }) => {
-                    assert_eq!(feature, RuntimeFeature::File(FileFamily::Recording));
-                    assert_eq!(reason, CapabilityUnavailable::SymbolUnavailable);
+                Err(Error::FileFamilyUnavailable { family, detail }) => {
+                    assert_eq!(family, FileFamily::Recording);
                     assert_eq!(detail, "NDIlib_file_recorder_rollover");
                 }
                 other => panic!("expected recording to be unavailable: {other:?}"),
@@ -416,12 +411,6 @@ fn child(name: &str, fixtures: &Fixtures) {
                 Some(fixtures.file("partial").as_path())
             );
             assert!(!reopened.supports(FileFamily::Recording));
-            // The runtime's own capabilities claim nothing about the library.
-            assert_eq!(
-                ndi.capabilities()
-                    .status(RuntimeFeature::File(FileFamily::Playback)),
-                CapabilityStatus::Unavailable(CapabilityUnavailable::SeparateLibrary)
-            );
             // Playback is complete in this library and still reaches it.
             assert_eq!(bound_runtime(&api), PAIRED.build);
             assert!(matches!(

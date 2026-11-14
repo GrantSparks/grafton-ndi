@@ -60,11 +60,8 @@
 //! probes recordings, and recording. A library is selected when it provides
 //! at least one family completely. [`FileApi::status`] reports each family,
 //! and an operation that needs a family the selected library lacks fails with
-//! [`Error::UnsupportedCapability`] for
-//! [`RuntimeFeature::File`](crate::capabilities::RuntimeFeature::File), naming
-//! the entry point the library does not export. The runtime's own
-//! [`Capabilities`](crate::capabilities::Capabilities) do not know what the
-//! File library provides.
+//! [`Error::FileFamilyUnavailable`], naming the family and the first entry
+//! point the library does not export.
 //!
 //! # Finishing a recording
 //!
@@ -186,9 +183,8 @@ use out_param::OutParam;
 ///
 /// [`FileApi::status`] reports whether the selected library provides one, and
 /// an operation that needs a family the library lacks fails with
-/// [`Error::UnsupportedCapability`] for
-/// [`RuntimeFeature::File`](crate::capabilities::RuntimeFeature::File) and
-/// that family.
+/// [`Error::FileFamilyUnavailable`], naming that family and its first missing
+/// entry point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum FileFamily {
@@ -317,7 +313,7 @@ impl FileApi {
     /// [`SymbolUnavailable`](crate::capabilities::CapabilityUnavailable::SymbolUnavailable)
     /// when it does not export one of the family's entry points. Every
     /// operation that needs the family then fails with
-    /// [`Error::UnsupportedCapability`], and keeps failing: the library stays
+    /// [`Error::FileFamilyUnavailable`], and keeps failing: the library stays
     /// selected for the life of the process.
     pub fn status(&self, family: FileFamily) -> CapabilityStatus {
         self.runtime.status(family)
@@ -339,7 +335,7 @@ impl FileApi {
     /// [`Error::InvalidInput`] when the path is empty or is not UTF-8,
     /// [`Error::InvalidCString`] when it contains a NUL, [`Error::Io`] when a
     /// relative path cannot be resolved because the current directory is
-    /// unavailable, and [`Error::UnsupportedCapability`] when the library
+    /// unavailable, and [`Error::FileFamilyUnavailable`] when the library
     /// does not provide [`FileFamily::Playback`].
     pub fn probe(&self, path: impl AsRef<Path>) -> Result<FileInfo> {
         let playback = self.table::<sys::FilePlayback>()?;
@@ -369,7 +365,7 @@ impl FileApi {
     /// [`Error::InvalidInput`] when the player's name is empty, and
     /// [`Error::InvalidCString`] when its name or groups contain a NUL.
     /// [`Error::NativeOperationFailed`] when the SDK cannot create the player
-    /// and [`Error::UnsupportedCapability`] when the library does not provide
+    /// and [`Error::FileFamilyUnavailable`] when the library does not provide
     /// [`FileFamily::Playback`].
     pub fn create_player(&self, options: &PlayerOptions) -> Result<FilePlayer> {
         FilePlayer::create(self.clone(), options)
@@ -390,7 +386,7 @@ impl FileApi {
     /// format-change rollover switched on or a nonzero rollover size.
     /// [`Error::InvalidCString`] when the filename pattern contains a NUL.
     /// [`Error::NativeOperationFailed`] when the SDK cannot create the
-    /// recorder and [`Error::UnsupportedCapability`] when the library does not
+    /// recorder and [`Error::FileFamilyUnavailable`] when the library does not
     /// provide [`FileFamily::Recording`].
     pub fn create_recorder(&self, options: &RecorderOptions) -> Result<FileRecorder> {
         FileRecorder::create(self.clone(), options)

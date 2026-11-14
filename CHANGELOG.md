@@ -17,6 +17,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- File-family refusals use `Error::FileFamilyUnavailable { family, detail }`.
+  `RuntimeFeature::File` and `CapabilityUnavailable::SeparateLibrary` are
+  removed; use `FileApi::status` or `supports` for File availability.
+
 - Runtime and File library selection require absolute explicit paths on every
   target. Relative `NDI_RUNTIME_DIR_V6` directories are refused and skipped,
   with the reason retained in load-failure diagnostics.

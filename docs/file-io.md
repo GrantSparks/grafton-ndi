@@ -29,7 +29,7 @@ their dependencies, as described in [runtime selection](setup.md#selecting-a-run
 
 Check `FileApi::status` or `supports` for `FileFamily::Playback` and
 `FileFamily::Recording`. Missing family symbols produce
-`Error::UnsupportedCapability`; loading the core runtime does not establish
+`Error::FileFamilyUnavailable`; loading the core runtime does not establish
 File availability. See the [File API reference](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/index.html)
 for loading errors and the full family contract.
 
@@ -156,7 +156,7 @@ for cancellation, queue and shutdown contracts.
 ## Errors
 
 File operations use the crate's `Error`. Distinguish unavailable libraries or
-families (`RuntimeLoadFailed`, `UnsupportedCapability`), conflicting selections
+families (`RuntimeLoadFailed`, `FileFamilyUnavailable`), conflicting selections
 (`RuntimeConflict`), invalid arguments or state, queue saturation (`QueueFull`),
 native failures and filesystem errors. Method rustdoc describes which errors
 leave an existing session running and which reports require recovery.

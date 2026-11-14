@@ -464,9 +464,6 @@ impl<'a> Evidence<'a> {
             | CapabilityUnavailable::BuildAbiUnavailable => self
                 .missing(evidence)
                 .map(|symbol| symbol.to_string_lossy().into_owned()),
-            // The runtime holds no evidence about the File library.
-            #[cfg(feature = "file-io")]
-            CapabilityUnavailable::SeparateLibrary => None,
         };
         Error::UnsupportedCapability {
             feature,

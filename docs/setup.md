@@ -96,8 +96,8 @@ Availability does not establish hardware support or license entitlement.
 Discovery Server advertisers and listeners require NDI 6.4 or later. Other
 operations may depend on exported entry points, version, edition and build
 headers. Query the selected runtime instead of inferring support from a version
-matrix. The separate File library has its own `FileApi::status` and `supports`;
-the core reports `SeparateLibrary` even when it is installed. See the [File guide](file-io.md).
+matrix. The separate File library reports its families through `FileApi::status`
+and `supports`; operations refuse a missing family with `FileFamilyUnavailable`. See the [File guide](file-io.md).
 
 ## Deploy an application
 

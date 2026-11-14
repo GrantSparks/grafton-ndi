@@ -25,7 +25,7 @@ use super::{
     Api,
 };
 use crate::{
-    capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, RuntimeInfo},
+    capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeInfo},
     file::FileFamily,
     Error, Result,
 };
@@ -215,16 +215,14 @@ impl FileRuntime {
     ///
     /// # Errors
     ///
-    /// [`Error::UnsupportedCapability`] for [`RuntimeFeature::File`] with the
-    /// family, [`CapabilityUnavailable::SymbolUnavailable`] and the first
+    /// [`Error::FileFamilyUnavailable`] with the family and the first
     /// entry point the library does not export, exactly when
     /// [`Self::status`] reports the family unavailable.
     pub(crate) fn table<T: FileTable>(&self) -> Result<&T> {
         T::resolved(self)
             .as_ref()
-            .map_err(|symbol| Error::UnsupportedCapability {
-                feature: RuntimeFeature::File(T::FAMILY),
-                reason: CapabilityUnavailable::SymbolUnavailable,
+            .map_err(|symbol| Error::FileFamilyUnavailable {
+                family: T::FAMILY,
                 detail: symbol.to_string_lossy().into_owned(),
             })
     }
@@ -420,15 +418,11 @@ mod tests {
         })
     }
 
-    /// A refusal's feature, reason and detail.
-    fn refusal<T>(result: Result<T>) -> Option<(RuntimeFeature, CapabilityUnavailable, String)> {
+    /// A refusal's family and missing entry point.
+    fn refusal<T>(result: Result<T>) -> Option<(FileFamily, String)> {
         match result {
             Ok(_) => None,
-            Err(Error::UnsupportedCapability {
-                feature,
-                reason,
-                detail,
-            }) => Some((feature, reason, detail)),
+            Err(Error::FileFamilyUnavailable { family, detail }) => Some((family, detail)),
             Err(other) => panic!("unexpected error: {other}"),
         }
     }
@@ -448,8 +442,7 @@ mod tests {
         assert_eq!(
             refusal(library.table::<FileRecording>()),
             Some((
-                RuntimeFeature::File(FileFamily::Recording),
-                CapabilityUnavailable::SymbolUnavailable,
+                FileFamily::Recording,
                 "NDIlib_file_recorder_rollover".into()
             ))
         );
@@ -474,9 +467,13 @@ mod tests {
                 match library.status(family) {
                     CapabilityStatus::Available => assert_eq!(refused, None, "{context}"),
                     CapabilityStatus::Unavailable(reason) => {
-                        let (feature, refused_for, detail) = refused.expect(&context);
-                        assert_eq!(feature, RuntimeFeature::File(family), "{context}");
-                        assert_eq!(refused_for, reason, "{context}");
+                        let (refused_family, detail) = refused.expect(&context);
+                        assert_eq!(refused_family, family, "{context}");
+                        assert_eq!(
+                            reason,
+                            CapabilityUnavailable::SymbolUnavailable,
+                            "{context}"
+                        );
                         assert_eq!(Some(detail.as_str()), lacking, "{context}");
                     }
                 }

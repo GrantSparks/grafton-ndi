@@ -60,12 +60,9 @@ pub enum Error {
     /// [`Capabilities::status`] reports for it, so a caller can branch on
     /// either without reading text. Every operation that needs the capability
     /// is refused this way before anything reaches the SDK, and
-    /// [`Ndi::require_feature`] reports the same error in advance. A family
-    /// of the NDI File library (`RuntimeFeature::File`) is refused by the File
-    /// API operations that need it, when the selected File library does not
-    /// export one of its entry points, and `file::FileApi::status` reports its
-    /// status in advance. The condition lasts for the life of the process:
-    /// the runtime and the File library are each selected once, and a build
+    /// [`Ndi::require_feature`] reports the same error in advance. The
+    /// condition lasts for the life of the process: the runtime is selected
+    /// once, and a build
     /// that lacks a declaration has to be rebuilt, with the `advanced` feature
     /// and with `NDI_SDK_DIR` naming an NDI Advanced SDK whose headers declare
     /// it.
@@ -82,8 +79,7 @@ pub enum Error {
         feature: RuntimeFeature,
         /// Why it is unavailable.
         reason: CapabilityUnavailable,
-        /// The evidence: the entry point the runtime, or for a File family
-        /// the File library, lacks (for [`SymbolUnavailable`] and
+        /// The evidence: the entry point the runtime lacks (for [`SymbolUnavailable`] and
         /// [`WrongEdition`]), the version the runtime reports
         /// against the version required (for [`RuntimeTooOld`] and
         /// [`RuntimeVersionUnknown`]), or the declaration this build lacks (for
@@ -98,6 +94,18 @@ pub enum Error {
         /// [`RuntimeTooOld`]: CapabilityUnavailable::RuntimeTooOld
         /// [`RuntimeVersionUnknown`]: CapabilityUnavailable::RuntimeVersionUnknown
         /// [`BuildAbiUnavailable`]: CapabilityUnavailable::BuildAbiUnavailable
+        detail: String,
+    },
+
+    /// The selected File library does not export every entry point of a
+    /// family an operation needs. `FileApi::status` reports the same family
+    /// unavailable; its status cannot change after selection.
+    #[cfg(feature = "file-io")]
+    #[error("NDI capability {} is unavailable: the selected library does not export a required function: {detail}", .family.name())]
+    FileFamilyUnavailable {
+        /// The family the operation needs.
+        family: crate::file::FileFamily,
+        /// The first entry point of the family the library does not export.
         detail: String,
     },
 
@@ -463,8 +471,6 @@ impl fmt::Display for Unavailability<'_> {
             CapabilityUnavailable::SymbolUnavailable
             | CapabilityUnavailable::RuntimeTooOld
             | CapabilityUnavailable::RuntimeVersionUnknown => write!(f, "{reason}: {detail}"),
-            #[cfg(feature = "file-io")]
-            CapabilityUnavailable::SeparateLibrary => write!(f, "{reason}: {detail}"),
         }
     }
 }
@@ -492,6 +498,16 @@ mod tests {
         .to_string()
     }
 
+    #[cfg(feature = "file-io")]
+    #[test]
+    fn file_family_errors_name_the_family_and_missing_entry_point() {
+        let error = Error::FileFamilyUnavailable {
+            family: crate::file::FileFamily::Recording,
+            detail: "NDIlib_file_recorder_rollover".into(),
+        };
+        assert_eq!(error.to_string(), "NDI capability file recording is unavailable: the selected library does not export a required function: NDIlib_file_recorder_rollover");
+    }
+
     #[test]
     fn capability_errors_name_their_evidence_and_never_end_in_empty_punctuation() {
         use CapabilityUnavailable::*;
@@ -502,8 +518,6 @@ mod tests {
             SymbolUnavailable,
             BuildAbiUnavailable,
             WrongEdition,
-            #[cfg(feature = "file-io")]
-            SeparateLibrary,
         ] {
             assert_eq!(unsupported(reason, ""), format!("{prefix}{reason}"));
         }
