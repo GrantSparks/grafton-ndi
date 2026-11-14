@@ -16,6 +16,13 @@ encoded result before `encode_image_to` writes it. These are conversion/output
 costs; codec state, source frames, reduction scratch and consumer buffers add to
 memory use.
 
+`ImageWorkspace` reuses wrapper conversion capacity across frames, with
+`retained_bytes()` for accounting and `release()` to discard it. Warm reuse
+removes scratch allocation churn; the full WebP image still occupies memory.
+Each concurrent worker needs its own workspace. Codec/output allocations
+remain separate. The [#140 report](benchmarks/issue-140/README.md) retains raw
+public-API measurements and their limitations.
+
 Bound both active workers and pending requests. Run synchronous encoding on
 blocking workers when using an async executor. Downscaling can reduce the
 converted image and output dimensions without allocating a full-size RGB

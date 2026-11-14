@@ -18,6 +18,19 @@ timecodes and frame rates, one error type, and captures that report a timeout
 as `None`. Most programs need changes; see the
 [2.0 to 3.0 migration guide](docs/migration/2.0-to-3.0.md).
 
+### Performance
+
+- Performance work for [#140](https://github.com/GrantSparks/grafton-ndi/issues/140):
+  enable runtime JPEG SIMD and direct contiguous packed-RGB input; retry
+  capture notifications immediately within bounded bursts; continue File
+  event draining between full bursts without a timed command wait; copy
+  cached source descriptors outside the global mutex; add `ImageWorkspace`
+  for reusable conversion storage. JPEG bytes and decoded pixels can vary
+  with CPU capabilities. Existing capture deadlines, idle backoff, owned cache
+  results and convenience image methods are preserved. See the
+  [measurement report](docs/benchmarks/issue-140/README.md) for evidence and
+  remaining profiling/qualification gates.
+
 ### SDK and platform compatibility
 
 - The crate works with NDI 6 runtimes from the Standard and the Advanced SDK.

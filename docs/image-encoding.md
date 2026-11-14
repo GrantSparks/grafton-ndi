@@ -30,6 +30,13 @@ encode. Reuse a cleared `Vec<u8>` with `encode_image_to` when retaining output
 capacity is useful. For files or sockets, consider `BufWriter` for the codecs
 that write incrementally.
 
+For repeated snapshots, `ImageWorkspace::new()` provides `encode(&frame,
+&options)` and `encode_to(&frame, &options, &mut output)`. It retains conversion
+scratch across calls, including WebP's whole converted image, PNG rows and
+downscale sums. `retained_bytes()` reports wrapper capacity; `release()` frees
+it. Use a separate workspace for each concurrent worker. Codec allocations
+and the encoded result are separate; lossy WebP still buffers its output.
+
 Encoding is synchronous CPU work. Keep it on a blocking worker in async
 applications, with an owned frame if the worker outlives the capture borrow.
 Bound active workers and pending snapshots. [Performance guidance](image-encoding-performance.md)
@@ -52,6 +59,12 @@ JPEG drops alpha. PNG and WebP keep it by default; `AlphaMode::Discard`
 removes it. Lossy WebP quality 100 is still lossy for color. Its default effort
 is 4 and SharpYUV is enabled. Effort and conversion settings affect only lossy
 WebP; they impose no time or memory limit. Measure their effect on your content.
+
+JPEG uses runtime AVX2 acceleration where supported, with a scalar fallback.
+Full-size contiguous RGBA/RGBX/BGRA/BGRX input goes directly to the backend;
+padded rows, YUV and downscaling retain incremental conversion. Encoded JPEG
+bytes and reconstructed pixels can differ between accelerated and scalar
+execution. Compare decoded quality rather than relying on byte identity.
 
 `SampleDepth::Sixteen` is PNG-only: high-bit-depth sources retain precision,
 while 8-bit inputs scale by 257. JPEG and WebP reject that setting. Codec

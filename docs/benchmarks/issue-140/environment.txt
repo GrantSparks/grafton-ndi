@@ -1,0 +1,74 @@
+$ uname -a
+Linux dev 6.8.0-139-generic #139-Ubuntu SMP PREEMPT_DYNAMIC Sat Aug  1 03:52:05 UTC 2026 x86_64 GNU/Linux
+$ rustc -Vv
+rustc 1.100.0 (0ef1bc386 2026-11-09)
+binary: rustc
+commit-hash: 0ef1bc386059596dada8fb65b50425aab2ea637a
+commit-date: 2026-11-09
+host: x86_64-unknown-linux-gnu
+release: 1.100.0
+LLVM version: 23.1.5
+$ rustc +1.88.0 -Vv
+rustc 1.88.0 (6b00bc388 2025-06-23)
+binary: rustc
+commit-hash: 6b00bc3880198600130e1cf62b8f8a93494488cc
+commit-date: 2025-06-23
+host: x86_64-unknown-linux-gnu
+release: 1.88.0
+LLVM version: 20.1.5
+$ lscpu
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           52 bits physical, 57 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  40
+On-line CPU(s) list:                     0-39
+Vendor ID:                               GenuineIntel
+Model name:                              Intel(R) Xeon(R) w7-2475X
+CPU family:                              6
+Model:                                   143
+Thread(s) per core:                      2
+Core(s) per socket:                      20
+Socket(s):                               1
+Stepping:                                8
+CPU(s) scaling MHz:                      27%
+CPU max MHz:                             4800.0000
+CPU min MHz:                             800.0000
+BogoMIPS:                                5184.00
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid dca sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb cat_l3 cat_l2 cdp_l3 intel_ppin cdp_l2 ssbd mba ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb intel_pt avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local split_lock_detect user_shstk avx_vnni avx512_bf16 wbnoinvd dtherm ida arat pln pts hwp hwp_act_window hwp_epp hwp_pkg_req vnmi avx512vbmi umip pku ospke waitpkg avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg tme avx512_vpopcntdq la57 rdpid bus_lock_detect cldemote movdiri movdir64b enqcmd fsrm md_clear serialize tsxldtrk pconfig arch_lbr ibt amx_bf16 avx512_fp16 amx_tile amx_int8 flush_l1d arch_capabilities ibpb_exit_to_user
+Virtualization:                          VT-x
+L1d cache:                               960 KiB (20 instances)
+L1i cache:                               640 KiB (20 instances)
+L2 cache:                                40 MiB (20 instances)
+L3 cache:                                37.5 MiB (1 instance)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-39
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Not affected
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI BHI_DIS_S
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Not affected
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Mitigation; IBPB before exit to userspace
+$ cargo tree --locked -e features -i jpeg-encoder --features image-encoding
+    Blocking waiting for file lock on package cache
+jpeg-encoder v0.7.1
+├── jpeg-encoder feature "default"
+│   └── grafton-ndi v3.0.0 (/workspace/grafton-ndi)
+│       ├── grafton-ndi feature "default" (command-line)
+│       └── grafton-ndi feature "image-encoding" (command-line)
+├── jpeg-encoder feature "simd"
+│   └── grafton-ndi v3.0.0 (/workspace/grafton-ndi) (*)
+└── jpeg-encoder feature "std"
+    ├── jpeg-encoder feature "default" (*)
+    └── jpeg-encoder feature "simd" (*)

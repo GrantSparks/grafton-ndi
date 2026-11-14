@@ -15,7 +15,7 @@ from PIL import Image
 
 
 def compare(directories):
-    writer = csv.writer(sys.stdout)
+    writer = csv.writer(sys.stdout, lineterminator="\n")
     writer.writerow(["variant", "image", "bytes", "psnr_source_rgb_db", "scalar_mae", "scalar_max"])
     baseline = Path(directories[0])
     for directory in map(Path, directories):

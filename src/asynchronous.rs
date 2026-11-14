@@ -1061,6 +1061,52 @@ mod executor_tests {
         *,
     };
 
+    /// Isolates the existing adapter's scheduling/cancellation gate. This is
+    /// not a stream benchmark and cannot justify a continuous-worker API.
+    #[test]
+    #[ignore = "manual blocking-dispatch measurement; no native capture"]
+    fn async_dispatch_resources() {
+        async fn samples<R: AsyncRuntime>(name: &str, lanes: usize, lane: usize) {
+            for sample in 0..110 {
+                let start = std::time::Instant::now();
+                let value = R::spawn_blocking(Token, || std::hint::black_box(42))
+                    .await
+                    .unwrap();
+                assert_eq!(value, 42);
+                if sample >= 10 {
+                    eprintln!(
+                        "dispatch,{name},{lanes},{lane},{},{:.3}",
+                        sample - 10,
+                        start.elapsed().as_secs_f64() * 1e6
+                    );
+                }
+            }
+        }
+        for lanes in [1, 8] {
+            #[cfg(feature = "tokio")]
+            {
+                let runtime = ::tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .build()
+                    .unwrap();
+                std::thread::scope(|scope| {
+                    for lane in 0..lanes {
+                        let runtime = &runtime;
+                        scope.spawn(move || {
+                            runtime.block_on(samples::<Tokio>("tokio", lanes, lane))
+                        });
+                    }
+                });
+            }
+            #[cfg(feature = "smol")]
+            std::thread::scope(|scope| {
+                for lane in 0..lanes {
+                    scope.spawn(move || ::smol::block_on(samples::<Smol>("smol", lanes, lane)));
+                }
+            });
+        }
+    }
+
     #[test]
     fn cancellation_skips_queued_operation() {
         let (guard, work) = blocking_operation(|| panic!("cancelled work must not run"));
