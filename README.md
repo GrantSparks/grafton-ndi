@@ -1,7 +1,7 @@
 # grafton-ndi
 
 [![Crates.io](https://img.shields.io/crates/v/grafton-ndi.svg)](https://crates.io/crates/grafton-ndi)
-[![Documentation](https://docs.rs/grafton-ndi/badge.svg)](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/)
+[![Documentation](https://img.shields.io/badge/docs-grantsparks.github.io-blue.svg)](https://grantsparks.github.io/grafton-ndi/grafton_ndi/)
 [![CI](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml/badge.svg)](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml)
 [![License](https://img.shields.io/crates/l/grafton-ndi.svg)](https://github.com/GrantSparks/grafton-ndi/blob/v3.0.0/LICENSE)
 
@@ -65,9 +65,14 @@ before depending on optional native operations.
 
 ## Guides and examples
 
+The authoritative API reference is built in CI and published to GitHub Pages
+from `main`. It shows the crate version it documents; for an older release,
+check out its tag and run `cargo doc --locked --no-deps --all-features`.
+docs.rs is supplementary and publication does not depend on its build service.
+
 - [Setup](https://github.com/GrantSparks/grafton-ndi/blob/v3.0.0/docs/setup.md): build, runtime selection, platforms and deployment.
 - [Usage](https://github.com/GrantSparks/grafton-ndi/blob/v3.0.0/docs/usage.md): discovery, capture, sending, synchronization and async workflows.
-- [API reference](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/): ownership, errors, units and method contracts.
+- [API reference](https://grantsparks.github.io/grafton-ndi/grafton_ndi/): ownership, errors, units and method contracts.
 - [Troubleshooting](https://github.com/GrantSparks/grafton-ndi/blob/v3.0.0/docs/troubleshooting.md): runtime errors and operational precautions.
 - [Migration](https://github.com/GrantSparks/grafton-ndi/blob/v3.0.0/docs/migration/README.md) and [changelog](https://github.com/GrantSparks/grafton-ndi/blob/v3.0.0/CHANGELOG.md).
 - [Contributing](https://github.com/GrantSparks/grafton-ndi/blob/v3.0.0/CONTRIBUTING.md): development setup and checks.

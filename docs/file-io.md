@@ -29,7 +29,7 @@ their dependencies, as described in [runtime selection](setup.md#selecting-a-run
 Check `FileApi::status` or `supports` for `FileFamily::Playback` and
 `FileFamily::Recording`. Missing family symbols produce
 `Error::UnsupportedCapability`; loading the core runtime does not establish
-File availability. See the [File API reference](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/file/index.html)
+File availability. See the [File API reference](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/index.html)
 for loading errors and the full family contract.
 
 ## Probing a recording
@@ -49,7 +49,7 @@ reports video counters. `create_player` advertises from creation until drop,
 including between files. Use `start` and `stop` for files, `set_paused` and
 `set_looping` for playback control, and `seek` or `seek_frame_approximate` for
 positioning. Poll events to observe progress and errors. Exact units and seek
-semantics are in [`FilePlayer`](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/file/struct.FilePlayer.html).
+semantics are in [`FilePlayer`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.FilePlayer.html).
 
 ## Recording a source
 
@@ -84,7 +84,7 @@ Use indexed naming for recordings that must span source or format changes.
 `FileNaming::Exact`, or a pattern without an index, limits a target to one file.
 For an exact name, the wrapper rejects format-change rollover, a nonzero
 rollover size, and source changes during a session. See
-[`RecorderOptions`](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/file/struct.RecorderOptions.html).
+[`RecorderOptions`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.RecorderOptions.html).
 
 `start` and `rollover` preflight the output directory and reject an existing
 exact target. This does not reserve the path or pin parent directories against
@@ -108,7 +108,7 @@ waiting. Either can leave an unfinished file.
 
 Drop requests a stop and waits for closure events up to `drop_wait` (five
 seconds by default), but cannot report the outcome. Use explicit finishing when
-the result matters. See [`FileRecorder`](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/file/struct.FileRecorder.html)
+the result matters. See [`FileRecorder`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.FileRecorder.html)
 for state transitions, error conditions and recovery.
 
 ## Limits of the NDI 6.4 File library
@@ -146,7 +146,7 @@ recording report. Configure queue limits with `AsyncFileOptions` and handle
 Await `finish`, inspect its report, then await `close` to shut down all clones
 without blocking the executor. **Dropping the last clone blocks** until its
 worker exits; `drop_wait` does not bound native stop or destruction calls.
-See [`AsyncFileRecorder`](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/file/struct.AsyncFileRecorder.html)
+See [`AsyncFileRecorder`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/file/struct.AsyncFileRecorder.html)
 for cancellation, queue and shutdown contracts.
 
 ## Errors

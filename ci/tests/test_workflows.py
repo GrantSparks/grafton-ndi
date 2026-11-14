@@ -20,11 +20,15 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / '.github' / 'workflows'
 
 READ_ONLY = {'contents': 'read'}
-# The one job that may hold more than read access: the crates.io publishing identity.
-JOB_PERMISSIONS = {('publish.yml', 'publish'): {'contents': 'read', 'id-token': 'write'}}
+# Only the registry and Pages deployment jobs may hold more than read access.
+JOB_PERMISSIONS = {
+    ('publish.yml', 'publish'): {'contents': 'read', 'id-token': 'write'},
+    ('docs.yml', 'deploy'): {'contents': 'read', 'pages': 'write', 'id-token': 'write'},
+}
 PASSED_SECRETS = {name: f'${{{{ secrets.{name} }}}}' for name in ('NDI_SDK_SOURCES_JSON', 'NDI_SDK_ARCHIVE_TOKEN')}
 # Every place where the word `secrets` may occur, as a key or inside any scalar.
 SECRET_USES = {
+    'docs.yml': set(),
     'rust.yml': {'on.workflow_call.secrets (key)', *(f'jobs.sdk.steps[Provision the SDK].env.{name}'
                                                     for name in PASSED_SECRETS)},
     'publish.yml': {'jobs.ci.secrets (key)', *(f'jobs.ci.secrets.{name}' for name in PASSED_SECRETS)},
@@ -33,10 +37,12 @@ SECRET_USES = {
 SECRETS_AVAILABLE = ("github.actor != 'dependabot[bot]' && (github.event_name != 'pull_request' || "
                      "github.event.pull_request.head.repo.full_name == github.repository)")
 JOB_CONDITIONS = {
+    'docs.yml': {'build': "github.repository == 'GrantSparks/grafton-ndi' && github.ref == 'refs/heads/main'"},
     'rust.yml': {'sdk': f"vars.NDI_CI_RELEASED == 'true' && {SECRETS_AVAILABLE}", 'required-ci': 'always()'},
     'publish.yml': {'release': "github.repository == 'GrantSparks/grafton-ndi'"},
 }
 TRIGGERS = {
+    'docs.yml': {'push': {'branches': ['main']}, 'workflow_dispatch': None},
     'rust.yml': {'push': {'branches': ['main']}, 'pull_request': {'branches': ['main']}, 'workflow_dispatch': None,
                  'workflow_call': {'secrets': {name: {'required': 'false'} for name in PASSED_SECRETS}}},
     'publish.yml': {'push': {'tags': ['v*']}},
@@ -44,6 +50,10 @@ TRIGGERS = {
 # The actions each job uses, in order. The sdk job has SDK files on disk, so it has no
 # cache and no artifact action; the publish job holds the registry identity.
 ACTIONS = {
+    'docs.yml': {
+        'build': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain', 'actions/upload-pages-artifact'],
+        'deploy': ['actions/deploy-pages'],
+    },
     'rust.yml': {
         'lint': ['actions/checkout', 'actions/setup-python', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache'],
         'test': ['actions/checkout', 'dtolnay/rust-toolchain', 'Swatinem/rust-cache'],
@@ -99,7 +109,19 @@ def violations(texts):
                              pinned[0] if isinstance(used, str) else pinned, ACTIONS[name].get(job))
             if 'runs-on' in body and not re.fullmatch(r'\d+', body.get('timeout-minutes', '')):
                 found.append(f'{name}: {job} has no timeout')
-    return found + gate_violations(parsed['rust.yml']) + publish_violations(parsed['publish.yml'])
+    return (found + gate_violations(parsed['rust.yml']) + publish_violations(parsed['publish.yml'])
+            + docs_violations(parsed['docs.yml']))
+
+
+def docs_violations(docs):
+    """Only the checked HTML build reaches the Pages deployment identity."""
+    jobs = docs['jobs']
+    deploy = jobs['deploy']
+    return (differs('docs.yml: job order', {name: body.get('needs') for name, body in jobs.items()},
+                    {'build': None, 'deploy': 'build'})
+            + differs('docs.yml: deployment environment', deploy.get('environment'),
+                      {'name': 'github-pages', 'url': '${{ steps.deployment.outputs.page_url }}'})
+            + differs('docs.yml: deployment scripts', [step for step in deploy['steps'] if 'run' in step], []))
 
 
 def gate_violations(rust):
@@ -151,6 +173,13 @@ def publish_violations(publish):
 
 # Plausible wrong edits: (name, workflow, text to replace, replacement, words the report must contain).
 WRONG_EDITS = (
+    ('Pages build can write', 'docs.yml', '    name: build documentation\n',
+     '    name: build documentation\n    permissions:\n      contents: write\n', 'permissions of build'),
+    ('Pages deploy without waiting for the build', 'docs.yml', '    needs: build\n', '', 'job order'),
+    ('Pages deploy runs a repository script', 'docs.yml', '      - name: Deploy to GitHub Pages\n',
+     '      - run: python ci/docs.py\n      - name: Deploy to GitHub Pages\n', 'deployment scripts'),
+    ('Pages build allows a manual branch to publish', 'docs.yml',
+     " && github.ref == 'refs/heads/main'", '', 'job conditions'),
     ('workflow-level id-token', 'publish.yml', 'permissions:\n  contents: read\n\n',
      'permissions:\n  contents: read\n  id-token: write\n\n', 'default permissions'),
     ('write-all on verify', 'publish.yml', '    name: verify package\n',

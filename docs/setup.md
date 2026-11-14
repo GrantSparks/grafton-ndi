@@ -89,7 +89,7 @@ it does not establish license entitlement.
 Cargo features expose Rust APIs; `ndi.capabilities()` reports optional native
 operations. Use `ndi.require_feature(RuntimeFeature::ReceiveDelay)?` to require
 one. `UnsupportedCapability` identifies its feature, reason and detail; see
-[`CapabilityUnavailable`](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/capabilities/enum.CapabilityUnavailable.html).
+[`CapabilityUnavailable`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/capabilities/enum.CapabilityUnavailable.html).
 Availability does not establish hardware support or license entitlement.
 
 Discovery Server advertisers and listeners require NDI 6.4 or later. Other

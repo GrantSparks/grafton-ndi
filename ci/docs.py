@@ -6,7 +6,8 @@ immutable historical GitHub links are checked against local Git objects when
 available. External pages are outside this check. With --compile, standalone
 Rust fences are compiled (never run) against the current crate and locked
 versions of its dependencies. Use a linked runnable example for code fragments.
-With --rustdoc, current-version docs.rs URLs are checked against generated HTML.
+With --rustdoc, GitHub Pages API URLs and current-version docs.rs URLs are
+checked against generated HTML.
 """
 import argparse
 from collections import Counter
@@ -26,6 +27,7 @@ from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = 'https://github.com/GrantSparks/grafton-ndi'
+API_SITE = 'https://grantsparks.github.io/grafton-ndi/'
 FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})([^\n]*)$')
 HEADING = re.compile(r'^ {0,3}#{1,6}\s+(.*?)\s*#*\s*$')
 
@@ -304,7 +306,7 @@ class HtmlAnchors(HTMLParser):
 
 
 def rustdoc_violations(root, directory):
-    """Check current-version docs.rs destinations against generated rustdoc."""
+    """Check primary Pages and current-version docs.rs links against rustdoc."""
     root, directory = root.resolve(), directory.resolve()
     release = version(root)
     found, cache = [], {}
@@ -315,9 +317,12 @@ def rustdoc_violations(root, directory):
         for url, line in links(prose(text)):
             parsed = urlsplit(url)
             parts = parsed.path.strip('/').split('/')
-            if parsed.netloc != 'docs.rs' or parts[:2] != ['grafton-ndi', release]:
+            if url.startswith(API_SITE):
+                relative = unquote('/'.join(parts[1:])) or 'grafton_ndi'
+            elif parsed.netloc == 'docs.rs' and parts[:2] == ['grafton-ndi', release]:
+                relative = unquote('/'.join(parts[2:])) or 'grafton_ndi'
+            else:
                 continue
-            relative = unquote('/'.join(parts[2:])) or 'grafton_ndi'
             path = (directory / relative).resolve()
             label = f'{source.relative_to(root)}:{line}'
             if not path.is_relative_to(directory):
@@ -370,7 +375,7 @@ def compile_snippets(root, snippets):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--compile', action='store_true', help='also compile standalone Rust fences; never run them')
-    parser.add_argument('--rustdoc', type=Path, help='check versioned docs.rs links against this generated rustdoc directory')
+    parser.add_argument('--rustdoc', type=Path, help='check Pages and versioned docs.rs API links against this generated rustdoc directory')
     args = parser.parse_args()
     found, snippets = check(ROOT)
     if args.rustdoc:

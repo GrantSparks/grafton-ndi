@@ -119,17 +119,29 @@ class Documentation(unittest.TestCase):
         self.write('target/doc/grafton_ndi/index.html', '<html><main id="modules"></main></html>')
         self.write('target/doc/grafton_ndi/finder/struct.Finder.html',
                    '<html><section id="method.new"></section><a name="legacy"></a></html>')
-        prefix = 'https://docs.rs/grafton-ndi/3.0.0/'
-        self.write('README.md', f'[root]({prefix}) [index]({prefix}grafton_ndi/#modules) '
-                   f'[constructor]({prefix}grafton_ndi/finder/struct.Finder.html#method.new) '
-                   f'[old anchor]({prefix}grafton_ndi/finder/struct.Finder.html#legacy)')
+        for prefix in (docs.API_SITE, 'https://docs.rs/grafton-ndi/3.0.0/'):
+            with self.subTest(prefix=prefix):
+                self.write('README.md', f'[root]({prefix}) [index]({prefix}grafton_ndi/#modules) '
+                           f'[constructor]({prefix}grafton_ndi/finder/struct.Finder.html#method.new) '
+                           f'[old anchor]({prefix}grafton_ndi/finder/struct.Finder.html#legacy)')
+                self.assertEqual(docs.rustdoc_violations(self.root, self.root / 'target/doc'), [])
+                self.write('README.md', f'[bad page]({prefix}grafton_ndi/struct.Finder.html) '
+                           f'[bad method]({prefix}grafton_ndi/finder/struct.Finder.html#method.wrong)')
+                errors = docs.rustdoc_violations(self.root, self.root / 'target/doc')
+                self.assertEqual(len(errors), 2)
+                self.assertIn('missing generated rustdoc page', errors[0])
+                self.assertIn('missing generated rustdoc anchor', errors[1])
+
+    def test_api_links_cannot_escape_rustdoc_or_match_another_pages_site(self):
+        for prefix in (docs.API_SITE, 'https://docs.rs/grafton-ndi/3.0.0/'):
+            with self.subTest(prefix=prefix):
+                self.write('README.md', f'[escape]({prefix}%2e%2e/secret.html)')
+                errors = docs.rustdoc_violations(self.root, self.root / 'target/doc')
+                self.assertEqual(len(errors), 1)
+                self.assertIn('escapes the generated directory', errors[0])
+        self.write('README.md', '[other project](https://grantsparks.github.io/another-project/missing.html) '
+                   '[similar name](https://grantsparks.github.io/grafton-ndi-other/missing.html)')
         self.assertEqual(docs.rustdoc_violations(self.root, self.root / 'target/doc'), [])
-        self.write('README.md', f'[bad page]({prefix}grafton_ndi/struct.Finder.html) '
-                   f'[bad method]({prefix}grafton_ndi/finder/struct.Finder.html#method.wrong)')
-        errors = docs.rustdoc_violations(self.root, self.root / 'target/doc')
-        self.assertEqual(len(errors), 2)
-        self.assertIn('missing generated rustdoc page', errors[0])
-        self.assertIn('missing generated rustdoc anchor', errors[1])
 
     def test_rustdoc_check_ignores_other_versions_and_repository_links(self):
         self.write('README.md', '[old release](https://docs.rs/grafton-ndi/2.0.0/grafton_ndi/) '
@@ -141,7 +153,7 @@ class Documentation(unittest.TestCase):
         self.assertIn('src/lib.rs:1: missing generated rustdoc page', errors[0])
 
     def test_nested_module_api_urls_check_pages_and_anchors_at_source_line(self):
-        url = 'https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/frames/struct.VideoFrame.html#method.new'
+        url = docs.API_SITE + 'grafton_ndi/frames/struct.VideoFrame.html#method.new'
         self.write('src/nested/mod.rs', f'// ordinary\n\n/// Read [frame]({url}).\n')
         errors = docs.rustdoc_violations(self.root, self.root / 'target/doc')
         self.assertIn('src/nested/mod.rs:3: missing generated rustdoc page', errors[0])

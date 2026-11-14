@@ -21,7 +21,7 @@ It selects the first discovered source, captures one frame and writes
 `snapshot.png`. Use `ImageOptions::new(format)` with a frame's `encode_image`
 to allocate a `Vec<u8>`, `encode_image_to` to write to an `io::Write`, or
 `encode_image_data_url` for a base64 URL. `encode_png` and `encode_jpeg` are
-conveniences. See [`ImageOptions`](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/struct.ImageOptions.html)
+conveniences. See [`ImageOptions`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/struct.ImageOptions.html)
 for compile-checked examples and exact option/error contracts.
 
 All frame and option validation occurs before writing. A later codec or writer
@@ -45,7 +45,7 @@ explains the buffering choices and measurement boundaries.
 ## Formats
 
 All `PixelFormat` uncompressed variants are accepted; row padding is skipped.
-See [pixel layouts](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/frames/enum.PixelFormat.html)
+See [pixel layouts](https://grantsparks.github.io/grafton-ndi/grafton_ndi/frames/enum.PixelFormat.html)
 instead of repacking a captured frame solely for encoding.
 
 | Output | Choose it for | Relevant settings |
@@ -85,7 +85,7 @@ Malformed or conflicting descriptions produce `InvalidFrame`. The default
 encoding policy refuses them; an explicit override ignores unreadable color
 metadata and treats it as SDR with unknown primaries. Readable metadata still
 controls the HDR check and PNG tagging. See
-[`ColorInfo`](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/struct.ColorInfo.html)
+[`ColorInfo`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/struct.ColorInfo.html)
 for accepted metadata values.
 
 ## HDR
@@ -100,7 +100,7 @@ explicitly if that is what the consumer needs.
 
 The encoder writes a `cICP` color tag for BT.2020 primaries or PQ/HLG transfer
 metadata. It leaves BT.601/BT.709 SDR and untagged inputs without that chunk.
-See [`HdrPolicy`](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/enum.HdrPolicy.html)
+See [`HdrPolicy`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/enum.HdrPolicy.html)
 for the code-value contract.
 
 ## Reducing an image
@@ -125,7 +125,7 @@ for application planning.
 Inspect the method's `Result`: invalid quality, effort or depth settings return
 `InvalidInput`; malformed color descriptions, HDR refusal, excessive dimensions
 or codec failures return `InvalidFrame`; writer failures retain their `Io`
-error. The [API reference](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/struct.ImageOptions.html#errors)
+error. The [API reference](https://grantsparks.github.io/grafton-ndi/grafton_ndi/struct.ImageOptions.html#errors)
 lists the complete option rules.
 
 ## Thumbnails from a recording

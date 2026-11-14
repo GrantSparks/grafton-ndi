@@ -29,7 +29,7 @@ Advertisers and listeners require NDI 6.4 or later; the wrapper rejects older
 versions. For deployment testing, exercise advertiser handover, server startup
 and reconnection, listener teardown, and receiver connection changes. Avoid
 rapid re-registration of the same source, and keep the server reachable during
-these operations. See the [Discovery Server API](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/discovery/index.html).
+these operations. See the [Discovery Server API](https://grantsparks.github.io/grafton-ndi/grafton_ndi/discovery/index.html).
 
 ## Receiving and sending
 

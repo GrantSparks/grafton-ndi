@@ -45,7 +45,7 @@ tests check that fallback when Advanced headers are available for the build.
 The wrapper reserves initialized send room for UYVY/UYVA and stages borrowed
 frames unless their direct-send contract is explicitly met. Its room calculation
 also accounts for non-progressive layouts. These are current defensive rules in
-[`PixelFormat::send_tail_room`](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/frames/enum.PixelFormat.html#method.send_tail_room)
+[`PixelFormat::send_tail_room`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/frames/enum.PixelFormat.html#method.send_tail_room)
 and the sender; they do not prove that an arbitrary SDK binary stays within that
 room. `tests/send_tail_room_sdk.rs` uses guard pages, and
 `tests/video_padding_sdk.rs` checks padding-sensitive pictures. Run them against
@@ -57,7 +57,7 @@ The capability registry requires NDI 6.4.0 or later for advertisers and listener
 `tests/discovery_server.rs` exercises the configured server interaction. This gate
 does not establish that all native object lifecycles are safe. Avoid rapid
 unregister/register churn and qualify shutdown under application load; see the
-[current API precautions](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/discovery/index.html).
+[current API precautions](https://grantsparks.github.io/grafton-ndi/grafton_ndi/discovery/index.html).
 Historical incident frequencies and timing thresholds are not portable guarantees.
 
 ### File API distribution and runtime dependencies

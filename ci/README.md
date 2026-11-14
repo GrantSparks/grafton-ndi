@@ -4,6 +4,8 @@
 `main`, manual runs and calls from the release workflow.
 [`publish.yml`](../.github/workflows/publish.yml) handles `v*` tags. These files
 state configured checks; a successful run must be established from its logs.
+[`docs.yml`](../.github/workflows/docs.yml) builds and publishes the API reference
+on pushes to `main` and manual runs on `main`.
 For user platform selection, see [setup](../docs/setup.md#platforms).
 
 ## Jobs in `rust.yml`
@@ -237,7 +239,30 @@ toolchain, runs no repository scripts and compiles no code. It validates the
 digest/toolchain strings before use. Review changes to this boundary against
 [`tests/test_workflows.py`](tests/test_workflows.py). Package contents follow
 `Cargo.toml`'s `include` list; `docs/` and `ci/` are not included. docs.rs builds
-the published crate; this workflow does not deploy a guide website.
+the published crate as a supplementary service; release publication does not
+depend on it. The authoritative API reference is hosted on
+[GitHub Pages](https://grantsparks.github.io/grafton-ndi/grafton_ndi/).
+
+### API documentation publication
+
+`docs.yml` builds all Cargo features with the lockfile and rustdoc warnings as
+errors, then checks guide links, generated API pages/anchors and standalone
+Rust examples. The build needs no NDI SDK and receives only read access. A
+separate deployment job receives Pages/OIDC permissions and deploys the checked
+HTML through the `github-pages` environment. It runs no repository code.
+
+The site root redirects to `grafton_ndi/`, preserving the existing public URL.
+The site tracks `main`, including unreleased changes, and rustdoc displays its
+crate version. It is not an archive of release-specific API references. For an
+older version, check out its tag and generate rustdoc with that version's build
+prerequisites. docs.rs remains configured as a secondary host, but failures
+there do not prevent repository-owned documentation publication.
+
+In repository **Settings → Pages**, select **GitHub Actions** as the build
+source. Configure the `github-pages` environment to allow deployments only
+from `main`. The workflow also checks the repository and branch before building;
+manual dispatches on other branches cannot publish. This workflow publishes
+rustdoc, while the guides remain in the repository.
 
 ### Repository settings, in order
 

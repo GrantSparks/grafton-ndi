@@ -5,7 +5,7 @@ allocation, AV synchronization, genlock and KVM. Start with
 [SDK editions and build requirements](setup.md#sdk-editions); the
 [example index](../examples/README.md#advanced-sdk) supplies complete programs.
 Exact per-method contracts are in the
-[3.0 Advanced API reference](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/advanced/).
+[3.0 Advanced API reference](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/).
 
 ## Requirements
 
@@ -27,7 +27,7 @@ Before an optional workflow, call `ndi.require_feature(feature)` or inspect
 detail: for example `BuildAbiUnavailable`, `WrongEdition` or
 `SymbolUnavailable`. Missing header families disable their own operations.
 Packet formats, envelopes and options are usable independently of native
-support. Consult [`RuntimeFeature`](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/capabilities/enum.RuntimeFeature.html)
+support. Consult [`RuntimeFeature`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/capabilities/enum.RuntimeFeature.html)
 for the capability to check.
 
 ## Ownership
@@ -93,8 +93,8 @@ bitstreams**. Supply valid encoded media and required codec configuration.
 Received envelopes can preserve unknown header fields that sending refuses;
 call `validate_for_send` before forwarding an arbitrary received packet.
 Protection flags describe packet conventions and do not encrypt content.
-The [packet types](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/advanced/struct.CompressedVideoFrame.html)
-and [envelope reference](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/advanced/struct.PacketEnvelope.html)
+The [packet types](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/struct.CompressedVideoFrame.html)
+and [envelope reference](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/struct.PacketEnvelope.html)
 specify exact limits and send validation.
 
 Owned compressed/scatter frames edit timecode and metadata with `set_timecode`,
@@ -124,7 +124,7 @@ Use `QueuedSender` to submit multiple owned raw or compressed video frames
 without waiting for the previous frame's completion on each submission.
 `QueueOptions` bounds retained frames and bytes, including completed frames not
 yet collected and spare payload/metadata capacity. Check defaults and exact
-accounting in [`QueueOptions`](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/advanced/struct.QueueOptions.html).
+accounting in [`QueueOptions`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/struct.QueueOptions.html).
 
 `try_submit` returns a `SubmissionId` or the rejected frame. For `QueueFull`,
 collect completions and retry; inspect other errors before retrying.
@@ -159,7 +159,7 @@ to inspect retained allocations.
 `AllocationBuffer::zeroed(request)` provides zeroed, 64-byte-aligned memory.
 Use `request.with_stride_bytes(stride)` for permitted line/channel padding.
 `AllocationBuffer::from_external` supports a custom pool only under the
-[`ExternalAllocation` unsafe contract](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/advanced/trait.ExternalAllocation.html):
+[`ExternalAllocation` unsafe contract](https://grantsparks.github.io/grafton-ndi/grafton_ndi/advanced/trait.ExternalAllocation.html):
 initialized CPU-accessible memory, stable address/capacity, required alignment
 and exclusive SDK access until release. Do not infer these guarantees from a
 buffer's size alone.

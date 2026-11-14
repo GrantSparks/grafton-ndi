@@ -648,8 +648,11 @@ as `None`. Most programs need changes; see the
 - Without the `advanced` feature, building for Windows, macOS, Linux and
   Android needs no NDI SDK, no `libclang` and no bindgen: the bindings are
   generated from the SDK headers ahead of time and are part of the crate. The
-  documentation builds without an SDK, and the crate's `documentation` link
-  points to docs.rs.
+  documentation builds without an SDK.
+- The authoritative API documentation is built in CI and published to GitHub
+  Pages at <https://grantsparks.github.io/grafton-ndi/grafton_ndi/>, tracking
+  `main`. The README badge, crate `documentation` metadata and current API links
+  use that site; docs.rs remains a supplementary host.
 - `NDI_SDK_DIR` is read only by builds with the `advanced` feature, to find
   the Advanced SDK headers, and by builds for Apple mobile targets, to find the
   static archive. In those builds a set value must name an SDK installation;
@@ -680,8 +683,6 @@ as `None`. Most programs need changes; see the
   libclang may still read some of them when an Advanced SDK is found, but
   changing them no longer re-runs the build script.
 - The `num_enum` dependency.
-- The API documentation is no longer published to GitHub Pages. The reference
-  is on docs.rs.
 
 ### Fixed
 

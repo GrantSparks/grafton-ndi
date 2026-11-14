@@ -3,7 +3,7 @@
 Install the runtime using [setup](setup.md), then choose a workflow below. The
 linked examples are complete programs that CI is configured to compile. Method-level units, errors,
 allocation and threading contracts live in the
-[3.0 API reference](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/).
+[3.0 API reference](https://grantsparks.github.io/grafton-ndi/grafton_ndi/).
 
 ## Discover sources
 
@@ -29,7 +29,7 @@ Snapshots and accumulated results have bounded, fallible allocations.
 `Error::ResourceLimit` identifies the resource and units through `ResourceKind`.
 Invalid snapshot arrays and allocation failures return `UnexpectedSdkResult`;
 individual malformed descriptors can be skipped. See
-[`Finder`](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/finder/struct.Finder.html)
+[`Finder`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/finder/struct.Finder.html)
 for exact limits. Run [`NDIlib_Find`](../examples/NDIlib_Find.rs) to inspect the
 names your network advertises.
 
@@ -46,7 +46,7 @@ returns owned descriptor copies. Empty results are not cached. Entries remain
 stale until `invalidate(host)` or `clear()` removes them: choose an invalidation
 policy for your service. IP hints belong on the finder; a lookup never changes
 its scope. See the compilable server-state example in
-[`SourceCache::new`](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/finder/struct.SourceCache.html#method.new).
+[`SourceCache::new`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/finder/struct.SourceCache.html#method.new).
 
 Keep other owning handles in service state or workers too. Create borrowed
 capture/control views for an operation; retain owned media or encoded bytes
@@ -253,4 +253,4 @@ change the picture. Direct external sending requires enough initialized space
 and `allow_send_from_padding_and_tail(true)`. The unsafe `readable_after`
 declaration alone does not opt in; padding/tail bytes may affect encoded output
 once opted in. Allocate with `PixelFormat::send_buffer_len` and follow the
-[`BorrowedVideoFrameBuilder` safety contract](https://docs.rs/grafton-ndi/3.0.0/grafton_ndi/sender/struct.BorrowedVideoFrameBuilder.html).
+[`BorrowedVideoFrameBuilder` safety contract](https://grantsparks.github.io/grafton-ndi/grafton_ndi/sender/struct.BorrowedVideoFrameBuilder.html).

@@ -1,7 +1,8 @@
 name: Publish
 
 # A `v<version>` tag on a commit of main publishes that version to crates.io.
-# docs.rs builds the API documentation from the published crate.
+# docs.yml publishes the authoritative API reference to GitHub Pages from main.
+# docs.rs may also build the published crate as a supplementary reference.
 #
 # Nothing in this file decides who may publish. A tag runs the workflow of the
 # commit it points at, so whoever can push a tag can also change every check
