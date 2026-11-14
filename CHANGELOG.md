@@ -121,6 +121,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 - `QueuedSender::split` and `CompressedSender::split` lend video and audio
   operations to separate scoped threads without an external lock.
+- `AllocationDecline` and process-wide custom receive allocation decline
+  counters in `AllocatorUsage`, distinguishing limits, invalid requests,
+  unavailable generations, policy errors/panics and refused buffers.
+
 - `Runtime::select`, runtime information and capability queries. Optional
   operations report availability by entry points, runtime edition, version
   and build declarations instead of assuming support from a version number.

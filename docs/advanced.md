@@ -162,7 +162,13 @@ quickly. An error or contained panic declines the allocation. Replacing a policy
 keeps the old one alive until the SDK releases its outstanding buffers.
 Process-wide `AllocatorLimits` include those older allocations and are fixed by
 the first service; later services must request identical limits. Use `usage()`
-to inspect retained allocations.
+to inspect retained allocations and decline counters. `declined_allocations()`
+reports the process-wide total; `declined(AllocationDecline::ByteLimit)` and
+the other typed reasons distinguish exhausted budgets, invalid requests,
+unavailable generations, policy errors/panics and refused buffers. Counters
+never reset, include retired policies and saturate at `u64::MAX`. Each declined
+request increments one reason. Updates add no allocation, callback or logging
+on SDK threads.
 
 `AllocationBuffer::zeroed(request)` provides zeroed, 64-byte-aligned memory.
 Use `request.with_stride_bytes(stride)` for permitted line/channel padding.

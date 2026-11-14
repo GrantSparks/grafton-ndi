@@ -258,6 +258,7 @@ fn advanced_types_keep_their_auto_traits() {
         AllocatedPacketReceiver: Send, Sync, UnwindSafe, RefUnwindSafe;
         AllocatedReceiver: Send, Sync, UnwindSafe, RefUnwindSafe;
         AllocationBuffer: Send;
+        AllocationDecline: Send, Sync, UnwindSafe, RefUnwindSafe;
         AllocationFormat: Send, Sync, UnwindSafe, RefUnwindSafe;
         AllocationRequest: Send, Sync, UnwindSafe, RefUnwindSafe;
         AllocatorLimits: Send, Sync, UnwindSafe, RefUnwindSafe;
