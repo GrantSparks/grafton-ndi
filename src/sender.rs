@@ -354,15 +354,20 @@ impl VideoPipeline {
     }
 
     /// Send `frame` synchronously, which also releases the frame in flight.
-    fn send(&self, frame: &(impl VideoSource + ?Sized), authorized: SendableVideoLayout) {
+    fn send(
+        &self,
+        frame: &(impl VideoSource + ?Sized),
+        authorized: SendableVideoLayout,
+    ) -> Result<()> {
         self.synchronize(|state, sender| {
             // The SDK reads the copy only during the send, under this lock.
-            let frame = PreparedVideo::authorized(frame, &mut state.staging, authorized);
+            let frame = PreparedVideo::authorized(frame, &mut state.staging, authorized)?;
             // A synchronous video send also releases the previous async frame,
             // which completes once the send has returned.
             let synchronized = state.in_flight.send(sender, frame);
             state.in_flight.completed(synchronized);
-        });
+            Ok(())
+        })
     }
 
     /// Hand a checked frame to the SDK and return the previous one, if any.
@@ -431,14 +436,22 @@ impl Drop for VideoPipeline {
     }
 }
 
-// SAFETY: The descriptor borrows owned initialized pixels, scan-dependent SDK
+// SAFETY: The descriptor uses this frame's own validated geometry and borrows
+// its owned initialized pixels, scan-dependent SDK
 // tail, and terminated FrameMetadata. Moving the frame moves none of those
 // allocations, which InFlight keeps inaccessible until the SDK releases them.
 unsafe impl in_flight::Lend for VideoFrame {
     type Authorization = SendableVideoLayout;
 
     fn lend(&mut self, authorized: Self::Authorization) -> in_flight::Lent {
-        in_flight::Lent::Frame(self.to_raw(authorized))
+        // The private caller acquired this format proof from this frame before
+        // moving it here; VideoFrame's pixel format cannot change meanwhile.
+        // A violated internal contract fails before InFlight or queue admission
+        // changes ownership, and no descriptor reaches the SDK.
+        in_flight::Lent::Frame(
+            self.to_raw(authorized)
+                .expect("frame's own format is authorized"),
+        )
     }
 }
 
@@ -895,33 +908,64 @@ impl<'a> PreparedVideo<'a> {
             staging,
             SendableVideoLayout::for_test(*frame.layout()),
         )
+        .unwrap()
     }
 
     fn authorized(
         frame: &'a (impl VideoParts + ?Sized),
         staging: &'a mut Pixels,
         authorized: SendableVideoLayout,
-    ) -> Self {
+    ) -> Result<Self> {
         let raw = if frame.can_send_direct() {
-            frame.video_descriptor(authorized)
+            frame.video_descriptor(authorized)?
         } else {
-            let packed = authorized.packed();
-            let room = send_room(packed.layout(), frame.header().scan_type);
-            frame.copy_active_pixels(staging, packed.layout(), room);
-            crate::frames::sdk_video_frame(
-                packed,
-                frame.header(),
-                staging.as_ptr(),
-                frame
-                    .metadata_text()
-                    .map_or(ptr::null(), MetadataText::as_ptr),
-                frame.sdk_timestamp(),
-            )
+            let layout = frame.layout().packed();
+            let room = send_room(&layout, frame.header().scan_type);
+            frame.copy_active_pixels(staging, &layout, room);
+            StagedVideo {
+                layout,
+                pixels: staging,
+                header: frame.header(),
+                metadata: frame.metadata_text(),
+                timestamp: frame.sdk_timestamp(),
+            }
+            .video_descriptor(authorized)?
         };
-        Self {
+        Ok(Self {
             raw,
             _borrow: PhantomData,
-        }
+        })
+    }
+}
+
+/// A packed view borrowing the actual staging allocation and the source's
+/// header and metadata. PreparedVideo retains both borrows through the call.
+struct StagedVideo<'a> {
+    layout: ValidatedVideoLayout,
+    pixels: &'a Pixels,
+    header: &'a VideoHeader,
+    metadata: Option<MetadataText<'a>>,
+    timestamp: Option<crate::SdkTimestamp>,
+}
+
+// SAFETY: construction follows copy_active_pixels, which initializes the
+// packed layout in pixels, including its send room. Every borrowed field stays
+// live and unchanged for the view's lifetime; the layout comes from that copy.
+unsafe impl VideoParts for StagedVideo<'_> {
+    fn layout(&self) -> &ValidatedVideoLayout {
+        &self.layout
+    }
+    fn header(&self) -> &VideoHeader {
+        self.header
+    }
+    fn pixels(&self) -> *const u8 {
+        self.pixels.as_ptr()
+    }
+    fn metadata_text(&self) -> Option<MetadataText<'_>> {
+        self.metadata
+    }
+    fn sdk_timestamp(&self) -> Option<crate::SdkTimestamp> {
+        self.timestamp
     }
 }
 
@@ -1149,6 +1193,7 @@ impl<'buf> BorrowedVideoFrame<'buf> {
     #[cfg(test)]
     fn to_raw(self) -> NDIlib_video_frame_v2_t {
         self.video_descriptor(SendableVideoLayout::for_test(*self.layout()))
+            .unwrap()
     }
 }
 
@@ -1524,8 +1569,7 @@ impl Sender {
     /// ```
     pub fn send_video(&self, frame: &(impl VideoSource + ?Sized)) -> Result<()> {
         let authorized = self.require_video_layout(*frame.layout())?;
-        self.native.video.send(frame, authorized);
-        Ok(())
+        self.native.video.send(frame, authorized)
     }
 
     /// Submit an owned frame without copying its pixel or metadata allocations.
@@ -1588,7 +1632,7 @@ impl Sender {
     /// copied. No pending send is changed on failure.
     pub fn send_video_async_copy(&mut self, frame: &(impl VideoSource + ?Sized)) -> Result<()> {
         let authorized = self.require_video_layout(*frame.layout())?;
-        self.native.video.copy(frame, authorized.packed());
+        self.native.video.copy(frame, authorized);
         Ok(())
     }
 
@@ -2307,6 +2351,72 @@ mod tests {
                     drop(framesync);
                     assert_eq!(frees.load(Ordering::SeqCst), 2);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn padded_prepared_and_copied_descriptors_fit_their_own_storage() {
+        use crate::{
+            capture::{Guard, VideoKind},
+            frames::{descriptor_tests::assert_extent, VideoRef},
+        };
+        for (format, stride) in [
+            (PixelFormat::Bgra, 512),
+            (PixelFormat::Uyvy, 256),
+            (PixelFormat::P216, 256),
+        ] {
+            let planes = if format == PixelFormat::P216 { 2 } else { 1 };
+            let storage = vec![0u8; stride * 32 * planes];
+            let frame = BorrowedVideoFrame::builder(&storage, 64, 32, format)
+                .line_stride_bytes(stride)
+                .build()
+                .unwrap();
+            let proof = SendableVideoLayout::for_test(*frame.layout());
+            // Captured rows are padded and need staging even for BGRA.
+            // SAFETY: the guard borrows the initialized, still-live storage;
+            // the synthetic release callback owns and frees nothing.
+            let captured = unsafe {
+                VideoRef::<VideoKind>::new(Guard::with_test_free(
+                    ptr::null_mut(),
+                    frame.video_descriptor(proof).unwrap(),
+                    |_, _| {},
+                ))
+            }
+            .unwrap();
+            let mut staging = Pixels::default();
+            let prepared = PreparedVideo::authorized(&captured, &mut staging, proof).unwrap();
+            let raw = prepared.raw;
+            assert_ne!(raw.p_data.cast_const(), storage.as_ptr());
+            assert_extent(&raw, staging.as_ptr(), staging.len() + staging.tail_room());
+            // This is the packed copy submitted by send_video_async_copy;
+            // its authorization is still that of the padded source.
+            let mut owned = frame.owned_copy();
+            #[allow(irrefutable_let_patterns)]
+            let in_flight::Lent::Frame(raw) = in_flight::Lend::lend(&mut owned, proof) else {
+                panic!("pixels")
+            };
+            assert_eq!(
+                unsafe { raw.__bindgen_anon_1.line_stride_in_bytes } as usize,
+                64 * if format == PixelFormat::Bgra { 4 } else { 2 }
+            );
+            assert_extent(
+                &raw,
+                owned.data().as_ptr(),
+                owned.data().len() + owned.tail_room(),
+            );
+            if let Some(mut sender) = test_sender() {
+                sender.send_video_async_copy(&frame).unwrap();
+                {
+                    let state = sender.native.video.state.lock().unwrap();
+                    let retained = state.in_flight.frame().unwrap();
+                    assert_extent(
+                        &retained.as_test_raw(),
+                        retained.data().as_ptr(),
+                        retained.data().len() + retained.tail_room(),
+                    );
+                }
+                sender.finish_video_async();
             }
         }
     }

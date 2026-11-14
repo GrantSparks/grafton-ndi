@@ -628,35 +628,6 @@ impl VideoHeader {
     }
 }
 
-/// The SDK descriptor of an uncompressed frame. It borrows `data` and
-/// `metadata` (null for none), which must outlive every use of it.
-pub(crate) fn sdk_video_frame(
-    authorized: SendableVideoLayout,
-    header: &VideoHeader,
-    data: *const u8,
-    metadata: *const c_char,
-    timestamp: Option<SdkTimestamp>,
-) -> NDIlib_video_frame_v2_t {
-    let layout = authorized.layout();
-    let (frame_rate_n, frame_rate_d) = header.frame_rate.to_sdk();
-    NDIlib_video_frame_v2_t {
-        xres: layout.sdk_width(),
-        yres: layout.sdk_height(),
-        FourCC: FourCc::from(layout.pixel_format).raw(),
-        frame_rate_N: frame_rate_n,
-        frame_rate_D: frame_rate_d,
-        picture_aspect_ratio: header.picture_aspect_ratio,
-        frame_format_type: header.scan_type.to_sdk(),
-        timecode: header.timecode.ticks(),
-        p_data: data.cast_mut(),
-        __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
-            line_stride_in_bytes: layout.sdk_line_stride(),
-        },
-        p_metadata: metadata,
-        timestamp: SdkTimestamp::to_sdk(timestamp),
-    }
-}
-
 /// The parts of a video frame that its shared accessors and owned copies
 /// read.
 ///
@@ -711,15 +682,33 @@ pub(crate) unsafe trait VideoParts {
     }
 
     /// Borrow this validated frame's SDK descriptor without copying pixels.
-    fn video_descriptor(&self, authorized: SendableVideoLayout) -> NDIlib_video_frame_v2_t {
-        sdk_video_frame(
-            authorized,
-            self.header(),
-            self.pixels(),
-            self.metadata_text()
+    fn video_descriptor(&self, authorized: SendableVideoLayout) -> Result<NDIlib_video_frame_v2_t> {
+        let layout = self.layout();
+        if authorized.0 != layout.pixel_format() {
+            return Err(Error::InvalidFrame(
+                "video send authorization does not match the storage's pixel format".into(),
+            ));
+        }
+        let header = self.header();
+        let (frame_rate_n, frame_rate_d) = header.frame_rate.to_sdk();
+        Ok(NDIlib_video_frame_v2_t {
+            xres: layout.sdk_width(),
+            yres: layout.sdk_height(),
+            FourCC: FourCc::from(layout.pixel_format()).raw(),
+            frame_rate_N: frame_rate_n,
+            frame_rate_D: frame_rate_d,
+            picture_aspect_ratio: header.picture_aspect_ratio,
+            frame_format_type: header.scan_type.to_sdk(),
+            timecode: header.timecode.ticks(),
+            p_data: self.pixels().cast_mut(),
+            __bindgen_anon_1: NDIlib_video_frame_v2_t__bindgen_ty_1 {
+                line_stride_in_bytes: layout.sdk_line_stride(),
+            },
+            p_metadata: self
+                .metadata_text()
                 .map_or(ptr::null(), MetadataText::as_ptr),
-            self.sdk_timestamp(),
-        )
+            timestamp: SdkTimestamp::to_sdk(self.sdk_timestamp()),
+        })
     }
 
     /// One plane, or `None` for an invalid index: the view behind every
@@ -1483,13 +1472,17 @@ impl VideoFrame {
     }
 
     /// The SDK descriptor of this frame, borrowing its pixels and metadata.
-    pub(crate) fn to_raw(&self, authorized: SendableVideoLayout) -> NDIlib_video_frame_v2_t {
+    pub(crate) fn to_raw(
+        &self,
+        authorized: SendableVideoLayout,
+    ) -> Result<NDIlib_video_frame_v2_t> {
         self.video_descriptor(authorized)
     }
 
     #[cfg(test)]
     pub(crate) fn as_test_raw(&self) -> NDIlib_video_frame_v2_t {
         self.to_raw(SendableVideoLayout::for_test(*self.layout()))
+            .unwrap()
     }
 
     /// Set the timecode without reallocating the pixels.
@@ -3605,29 +3598,20 @@ pub(crate) struct ValidatedVideoLayout {
     line_stride_bytes: usize,
 }
 
-/// A validated layout authorized for the selected runtime. Its fields are
-/// private: a proof for one format cannot be used to write another FourCC.
+/// A pixel format authorized for the selected runtime. Geometry belongs only
+/// to the storage described by `VideoParts`, never to this capability proof.
 #[derive(Clone, Copy)]
-pub(crate) struct SendableVideoLayout(ValidatedVideoLayout);
+pub(crate) struct SendableVideoLayout(PixelFormat);
 
 impl SendableVideoLayout {
     pub(crate) fn new(layout: ValidatedVideoLayout, ndi: &crate::Ndi) -> Result<Self> {
         layout.pixel_format().require_sendable(ndi)?;
-        Ok(Self(layout))
-    }
-
-    pub(crate) const fn layout(&self) -> &ValidatedVideoLayout {
-        &self.0
-    }
-
-    /// Packing preserves format and dimensions, and therefore authorization.
-    pub(crate) fn packed(self) -> Self {
-        Self(self.0.packed())
+        Ok(Self(layout.pixel_format()))
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(layout: ValidatedVideoLayout) -> Self {
-        Self(layout)
+        Self(layout.pixel_format())
     }
 }
 
@@ -10098,6 +10082,10 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "frames/descriptor_tests.rs"]
+pub(crate) mod descriptor_tests;
 
 #[cfg(test)]
 #[path = "frames/metadata_tests.rs"]

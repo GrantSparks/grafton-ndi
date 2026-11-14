@@ -233,7 +233,7 @@ impl QueuedStorage {
 }
 
 // SAFETY: Pixels owns initialized payload and terminated metadata, and lending
-// takes the runtime proof for that exact validated layout. Packet/Scatter delegate to
+// uses its own validated geometry and a runtime proof for its format. Packet/Scatter delegate to
 // PendingVideo, which owns all payload, metadata and stable scatter-list
 // storage. The completion key points into the retained, nonempty first block.
 // Moving this value moves none of its allocations; Entry gives no access to
@@ -931,6 +931,41 @@ mod tests {
             crate::test_alloc::allocation_count(|| state.validate_frame_size(4));
         result.unwrap();
         assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn queued_pixel_descriptor_fits_packed_copy_of_padded_source() {
+        for (format, stride) in [
+            (crate::PixelFormat::Bgra, 512),
+            (crate::PixelFormat::Uyvy, 256),
+            (crate::PixelFormat::P216, 256),
+        ] {
+            let planes = if format == crate::PixelFormat::P216 {
+                2
+            } else {
+                1
+            };
+            let storage = vec![0u8; stride * 32 * planes];
+            let borrowed = crate::BorrowedVideoFrame::builder(&storage, 64, 32, format)
+                .line_stride_bytes(stride)
+                .build()
+                .unwrap();
+            let authorized =
+                QueuedAuthorization::Pixels(SendableVideoLayout::for_test(*borrowed.layout()));
+            let mut frame = QueuedStorage::new(borrowed.owned_copy().into(), authorized);
+            #[allow(irrefutable_let_patterns)]
+            let Lent::Frame(raw) = frame.lend(authorized) else {
+                panic!("pixels")
+            };
+            let QueuedStorage::Pixels(pixels) = &frame else {
+                panic!("pixels")
+            };
+            crate::frames::descriptor_tests::assert_extent(
+                &raw,
+                pixels.data().as_ptr(),
+                pixels.data().len() + pixels.tail_room(),
+            );
+        }
     }
 
     fn insert(state: &CallbackState, id: u64) -> usize {

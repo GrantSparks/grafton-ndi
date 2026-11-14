@@ -5,10 +5,11 @@
 //! bits. Widths must be multiples of six; partial groups are deliberately rejected.
 //! These are sample-packing conversions, without color-space or HDR transforms.
 
+#[cfg(test)]
 use std::ptr;
 
 use crate::{
-    frames::{sdk_video_frame, ValidatedVideoLayout, VideoHeader, MAX_VIDEO_BYTES},
+    frames::{MetadataText, ValidatedVideoLayout, VideoHeader, VideoParts, MAX_VIDEO_BYTES},
     sys::{self, bindings::NDIlib_video_frame_v2_t},
     Error, Ndi, PixelFormat, Result, ScanType, Timecode, VideoFrame, VideoSource,
 };
@@ -132,8 +133,8 @@ impl V210Layout {
     }
 
     /// The SDK descriptor of the packed P216 frame of this layout's
-    /// dimensions, two full-height planes of 16-bit samples, over the `len`
-    /// bytes at `data`.
+    /// dimensions, two full-height planes of 16-bit samples, over the borrowed
+    /// initialized bytes in `data`.
     ///
     /// The samples may start at any address. The NDI SDK documentation of
     /// video frames gives a frame's `p_data` no alignment requirement, and
@@ -142,13 +143,9 @@ impl V210Layout {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidFrame`] when `len` is not exactly that frame's size.
-    fn p216_descriptor(
-        self,
-        ndi: &Ndi,
-        data: *const u8,
-        len: usize,
-    ) -> Result<NDIlib_video_frame_v2_t> {
+    /// [`Error::InvalidFrame`] when `data` is not exactly that frame's size.
+    #[cfg(test)]
+    fn p216_descriptor(self, ndi: &Ndi, data: &[u8]) -> Result<NDIlib_video_frame_v2_t> {
         // `with_line_stride_bytes` validated this layout for these dimensions.
         let p216 = ValidatedVideoLayout::new_uncompressed(
             PixelFormat::P216,
@@ -156,26 +153,33 @@ impl V210Layout {
             self.height,
             None,
         )?;
+        let len = data.len();
         if len != p216.data_len_bytes() {
             return Err(Error::InvalidFrame(format!(
                 "P216 buffer has {len} bytes, requires {}",
                 p216.data_len_bytes()
             )));
         }
-        // The utilities convert samples; the header only has to be valid.
-        let header = VideoHeader {
-            frame_rate: crate::media::DEFAULT_VIDEO_FRAME_RATE,
-            picture_aspect_ratio: 0.0,
-            scan_type: ScanType::Progressive,
-            timecode: Timecode::SYNTHESIZE,
-        };
-        Ok(sdk_video_frame(
-            crate::frames::SendableVideoLayout::new(p216, ndi)?,
-            &header,
-            data,
-            ptr::null(),
+        // BorrowedVideoFrame keeps geometry paired with the validated slice.
+        // Conversion needs no metadata and uses the builder's valid header.
+        let frame =
+            crate::BorrowedVideoFrame::builder(data, self.width, self.height, PixelFormat::P216)
+                .build()?;
+        frame.video_descriptor(crate::frames::SendableVideoLayout::new(p216, ndi)?)
+    }
+
+    /// Borrow writable P216 storage without deriving the output pointer from
+    /// a shared slice: the native converter writes through the original
+    /// exclusive borrow's pointer.
+    fn p216_output_descriptor(self, ndi: &Ndi, data: &mut [u8]) -> Result<NDIlib_video_frame_v2_t> {
+        let layout = ValidatedVideoLayout::new_uncompressed(
+            PixelFormat::P216,
+            self.width,
+            self.height,
             None,
-        ))
+        )?;
+        let frame = P216Output::new(layout, data)?;
+        frame.video_descriptor(crate::frames::SendableVideoLayout::new(layout, ndi)?)
     }
 
     /// The SDK descriptor of this layout's V210 words at `data`: `p216`, the
@@ -193,6 +197,59 @@ impl V210Layout {
         v210.p_data = data.cast_mut().cast();
         v210.__bindgen_anon_1.line_stride_in_bytes = self.sdk_line_stride();
         v210
+    }
+}
+
+/// A view whose pixel pointer retains writable provenance from its exclusive
+/// input slice. It never exposes shared references to those pixels.
+struct P216Output<'a> {
+    layout: ValidatedVideoLayout,
+    header: VideoHeader,
+    pointer: *mut u8,
+    _borrow: std::marker::PhantomData<&'a mut [u8]>,
+}
+
+impl<'a> P216Output<'a> {
+    fn new(layout: ValidatedVideoLayout, data: &'a mut [u8]) -> Result<Self> {
+        if data.len() != layout.data_len_bytes() {
+            return Err(Error::InvalidFrame(format!(
+                "P216 buffer has {} bytes, requires {}",
+                data.len(),
+                layout.data_len_bytes()
+            )));
+        }
+        Ok(Self {
+            layout,
+            header: VideoHeader {
+                frame_rate: crate::media::DEFAULT_VIDEO_FRAME_RATE,
+                picture_aspect_ratio: 0.0,
+                scan_type: ScanType::Progressive,
+                timecode: Timecode::SYNTHESIZE,
+            },
+            pointer: data.as_mut_ptr(),
+            _borrow: std::marker::PhantomData,
+        })
+    }
+}
+
+// SAFETY: construction checks the exclusive slice has exactly the layout's
+// initialized storage. The borrow keeps it allocated and inaccessible until
+// the view is consumed; metadata is absent and the header is valid.
+unsafe impl VideoParts for P216Output<'_> {
+    fn layout(&self) -> &ValidatedVideoLayout {
+        &self.layout
+    }
+    fn header(&self) -> &VideoHeader {
+        &self.header
+    }
+    fn pixels(&self) -> *const u8 {
+        self.pointer.cast_const()
+    }
+    fn metadata_text(&self) -> Option<MetadataText<'_>> {
+        None
+    }
+    fn sdk_timestamp(&self) -> Option<crate::SdkTimestamp> {
+        None
     }
 }
 
@@ -246,7 +303,7 @@ impl VideoConverter {
     /// `layout`'s dimensions, which may start at any address.
     fn unpack(&self, layout: V210Layout, source: &[u32], p216: &mut [u8]) -> Result<()> {
         layout.check_storage(source.len())?;
-        let mut output = layout.p216_descriptor(&self._ndi, p216.as_mut_ptr(), p216.len())?;
+        let mut output = layout.p216_output_descriptor(&self._ndi, p216)?;
         let input = layout.v210_descriptor(output, source.as_ptr());
         // SAFETY: `source` holds every word of the layout's rows and `p216`
         // exactly the P216 frame `output` describes, both initialized and
@@ -289,7 +346,7 @@ impl VideoConverter {
             source.video_descriptor(crate::frames::SendableVideoLayout::new(
                 *source.layout(),
                 &self._ndi,
-            )?),
+            )?)?,
             destination,
         )
     }
@@ -298,7 +355,7 @@ impl VideoConverter {
     /// dimensions, which may start at any address, into `destination`.
     #[cfg(test)]
     fn pack(&self, layout: V210Layout, p216: &[u8], destination: &mut [u32]) -> Result<()> {
-        let input = layout.p216_descriptor(&self._ndi, p216.as_ptr(), p216.len())?;
+        let input = layout.p216_descriptor(&self._ndi, p216)?;
         self.pack_descriptor(layout, input, destination)
     }
 
@@ -337,6 +394,22 @@ impl VideoConverter {
 mod tests {
     use super::*;
     use crate::Timecode;
+
+    #[test]
+    fn p216_conversion_descriptor_fits_its_borrowed_storage() {
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let layout = V210Layout::new(12, 32).unwrap();
+        let mut storage = vec![0u8; 12 * 2 * 32 * 2];
+        let raw = layout.p216_output_descriptor(&ndi, &mut storage).unwrap();
+        crate::frames::descriptor_tests::assert_extent(&raw, storage.as_ptr(), storage.len());
+        let raw = layout.p216_descriptor(&ndi, &storage).unwrap();
+        crate::frames::descriptor_tests::assert_extent(&raw, storage.as_ptr(), storage.len());
+        assert!(layout
+            .p216_descriptor(&ndi, &storage[..storage.len() - 1])
+            .is_err());
+    }
 
     #[test]
     fn complete_group_geometry_and_checked_caps() {
@@ -578,9 +651,11 @@ mod tests {
                             .metadata(c"<p216/>")
                             .build()
                             .unwrap();
-                    let raw = borrowed.video_descriptor(
-                        crate::frames::SendableVideoLayout::for_test(*borrowed.layout()),
-                    );
+                    let raw = borrowed
+                        .video_descriptor(crate::frames::SendableVideoLayout::for_test(
+                            *borrowed.layout(),
+                        ))
+                        .unwrap();
                     // SAFETY: Both synthetic guards borrow storage and static
                     // metadata for this test, and neither callback frees them.
                     let receiver = unsafe {
@@ -616,6 +691,7 @@ mod tests {
                                 .video_descriptor(crate::frames::SendableVideoLayout::for_test(
                                     *source.layout()
                                 ))
+                                .unwrap()
                                 .p_data,
                             raw.p_data
                         );

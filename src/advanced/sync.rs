@@ -642,7 +642,7 @@ impl video_sealed::Sealed for VideoFrame {
     fn descriptor(&self, ndi: &crate::Ndi) -> crate::Result<NDIlib_video_frame_v2_t> {
         use crate::frames::VideoParts;
         let authorized = crate::frames::SendableVideoLayout::new(*self.layout(), ndi)?;
-        Ok(self.to_raw(authorized))
+        self.to_raw(authorized)
     }
 
     fn receive_timestamp(&self) -> Option<SdkTimestamp> {
@@ -1308,6 +1308,36 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn avsync_descriptors_fit_owned_copies_of_padded_sources() {
+        let Some(ndi) = crate::test_support::advanced_ndi() else {
+            return;
+        };
+        for (format, stride) in [
+            (crate::PixelFormat::Bgra, 512),
+            (crate::PixelFormat::Uyvy, 256),
+            (crate::PixelFormat::P216, 256),
+        ] {
+            let planes = if format == crate::PixelFormat::P216 {
+                2
+            } else {
+                1
+            };
+            let storage = vec![0u8; stride * 32 * planes];
+            let borrowed = crate::BorrowedVideoFrame::builder(&storage, 64, 32, format)
+                .line_stride_bytes(stride)
+                .build()
+                .unwrap();
+            let frame = crate::VideoSource::to_owned(&borrowed);
+            let raw = video_sealed::Sealed::descriptor(&frame, &ndi).unwrap();
+            crate::frames::descriptor_tests::assert_extent(
+                &raw,
+                frame.data().as_ptr(),
+                frame.data().len() + frame.tail_room(),
+            );
         }
     }
 
