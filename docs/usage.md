@@ -223,8 +223,9 @@ Enable `tokio` or `smol` and wrap the receiver in the corresponding
 `asynchronous::<runtime>::AsyncReceiver`. It runs blocking SDK work on workers.
 Capture/event timeouts start at the future's first poll and include queue and
 receiver-lock waits; processing can finish after that wait budget. Dropping a
-future skips work only before its cancellation gate. Started work can consume
-a frame/event or execute a callback even after its result is discarded.
+future skips queued work and stops a started wait before its next attempt.
+The attempt already in flight can still consume a frame/event and execute its
+callback; each native wait lasts at most 100 ms.
 
 Use typed `capture_with(timeout, callback)` or mixed
 `capture_any_with(timeout, callback)` for immediate inspection. A synchronous

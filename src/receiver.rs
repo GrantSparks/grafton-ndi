@@ -171,6 +171,31 @@ impl<T> From<Option<T>> for Retry<T> {
     }
 }
 
+mod stop_sealed {
+    pub trait Sealed {}
+    impl Sealed for super::NeverStop {}
+    impl Sealed for &std::sync::atomic::AtomicBool {}
+}
+
+/// Whether a wait may begin another attempt. Checked only between attempts,
+/// so a delivered frame is always guarded and processed before cancellation.
+pub(crate) trait Stop: stop_sealed::Sealed {
+    fn is_stopped(&self) -> bool;
+}
+
+/// Synchronous waits have no cancellation state or atomic loads.
+pub(crate) struct NeverStop;
+impl Stop for NeverStop {
+    fn is_stopped(&self) -> bool {
+        false
+    }
+}
+impl Stop for &AtomicBool {
+    fn is_stopped(&self) -> bool {
+        self.load(Ordering::Acquire)
+    }
+}
+
 /// Run `attempt` until it returns a value or `deadline` is spent: the one
 /// capture loop behind every receiver capture, for all frame kinds, for both
 /// [`Capture`] verbs and the async ones, and behind [`Receiver::poll_event`]
@@ -186,9 +211,10 @@ impl<T> From<Option<T>> for Retry<T> {
 /// an attempt ends the loop.
 fn capture_within<T, R: Into<Retry<T>>>(
     deadline: Deadline,
+    stop: impl Stop,
     attempt: impl FnMut(Attempt) -> Result<R>,
 ) -> Result<Option<T>> {
-    capture_within_clock(deadline, attempt, Instant::now, std::thread::sleep)
+    capture_within_clock_with_stop(deadline, stop, attempt, Instant::now, std::thread::sleep)
 }
 
 /// [`capture_within`] with `now` reading the clock and `sleep` pausing, so
@@ -202,8 +228,19 @@ fn capture_within<T, R: Into<Retry<T>>>(
 /// otherwise retry immediately. An attempt that waited
 /// until its end is followed at once by the next, so that a frame arriving in
 /// between is not delayed by a pause.
+#[cfg(test)]
 fn capture_within_clock<T, R: Into<Retry<T>>>(
     deadline: Deadline,
+    attempt: impl FnMut(Attempt) -> Result<R>,
+    now: impl FnMut() -> Instant,
+    sleep: impl FnMut(Duration),
+) -> Result<Option<T>> {
+    capture_within_clock_with_stop(deadline, NeverStop, attempt, now, sleep)
+}
+
+fn capture_within_clock_with_stop<T, R: Into<Retry<T>>>(
+    deadline: Deadline,
+    stop: impl Stop,
     mut attempt: impl FnMut(Attempt) -> Result<R>,
     mut now: impl FnMut() -> Instant,
     mut sleep: impl FnMut(Duration),
@@ -231,7 +268,7 @@ fn capture_within_clock<T, R: Into<Retry<T>>>(
         } else {
             notifications = 0;
         }
-        if deadline.remaining_at(returned).is_zero() {
+        if deadline.remaining_at(returned).is_zero() || stop.is_stopped() {
             return Ok(None);
         }
     }
@@ -913,7 +950,8 @@ impl Receiver {
     /// the same frame-validation errors as typed borrowed capture. Rejected
     /// frames are freed through their matching native free operation.
     pub fn capture_any_ref(&self, timeout: Duration) -> Result<Option<ReceiverItemRef<'_>>> {
-        self.core.capture_any_ref_until(Deadline::after(timeout)?)
+        self.core
+            .capture_any_ref_until(Deadline::after(timeout)?, NeverStop)
     }
 
     /// Wait up to `timeout` for any media or receiver event and return an
@@ -1159,7 +1197,7 @@ impl<M: ReceiverMode> Receiver<M> {
     /// [`Finder`](crate::Finder) does for discovered source names.
     pub fn poll_source_name_change(&self, timeout: Duration) -> Result<Option<SourceNameChange>> {
         self.core
-            .poll_source_name_change_until(Deadline::after(timeout)?)
+            .poll_source_name_change_until(Deadline::after(timeout)?, NeverStop)
     }
 
     /// Request a different source and remember it as the connection target.
@@ -1462,7 +1500,8 @@ impl<M: MetadataMode> Receiver<M> {
     /// (~49.7 days), and [`Error::CaptureFailed`] when the SDK reports a lost
     /// connection.
     pub fn poll_event(&self, timeout: Duration) -> Result<Option<ReceiverEvent>> {
-        self.core.poll_event_until(Deadline::after(timeout)?)
+        self.core
+            .poll_event_until(Deadline::after(timeout)?, NeverStop)
     }
 
     /// Capture **audio** frames from this receiver.
@@ -1619,8 +1658,9 @@ impl ReceiverCore {
     pub(crate) fn capture_ref_until<K: CaptureKind>(
         &self,
         deadline: Deadline,
+        stop: impl Stop,
     ) -> Result<Option<K::Ref<'_>>> {
-        capture_within(deadline, |attempt| self.poll_ref_until::<K>(attempt))
+        capture_within(deadline, stop, |attempt| self.poll_ref_until::<K>(attempt))
     }
 
     /// [`Self::capture_ref_until`], copied into an owned frame: behind
@@ -1630,7 +1670,7 @@ impl ReceiverCore {
         deadline: Deadline,
     ) -> Result<Option<K::Owned>> {
         Ok(self
-            .capture_ref_until::<K>(deadline)?
+            .capture_ref_until::<K>(deadline, NeverStop)?
             .as_ref()
             .map(K::ref_to_owned))
     }
@@ -1640,8 +1680,9 @@ impl ReceiverCore {
     pub(crate) fn capture_any_ref_until(
         &self,
         deadline: Deadline,
+        stop: impl Stop,
     ) -> Result<Option<ReceiverItemRef<'_>>> {
-        self.capture_any_until_with(deadline, ReceiverItemRef::Event, |delivered| {
+        self.capture_any_until_with(deadline, stop, ReceiverItemRef::Event, |delivered| {
             self.combined_result(delivered)
         })
     }
@@ -1652,10 +1693,11 @@ impl ReceiverCore {
     pub(crate) fn capture_any_until_with<'rx, T>(
         &'rx self,
         deadline: Deadline,
+        stop: impl Stop,
         mut event: impl FnMut(ReceiverEvent) -> T,
         mut convert: impl FnMut(Delivered<'rx>) -> Result<Option<T>>,
     ) -> Result<Option<T>> {
-        capture_within(deadline, |attempt| {
+        capture_within(deadline, stop, |attempt| {
             if let Some(pending) = self.take_pending_event() {
                 return Ok(Some(event(pending)));
             }
@@ -1700,7 +1742,7 @@ impl ReceiverCore {
     /// Combined capture copied while its native guards are still local.
     pub(crate) fn capture_any_until(&self, deadline: Deadline) -> Result<Option<ReceiverItem>> {
         Ok(self
-            .capture_any_ref_until(deadline)?
+            .capture_any_ref_until(deadline, NeverStop)?
             .as_ref()
             .map(ReceiverItemRef::to_owned))
     }
@@ -1762,8 +1804,12 @@ impl ReceiverCore {
     /// capture loop until `deadline` is spent, which may have started before
     /// this call. An expired `deadline`, like a zero timeout, makes one
     /// attempt without waiting.
-    pub(crate) fn poll_event_until(&self, deadline: Deadline) -> Result<Option<ReceiverEvent>> {
-        capture_within(deadline, |attempt| self.poll_event_once(attempt))
+    pub(crate) fn poll_event_until(
+        &self,
+        deadline: Deadline,
+        stop: impl Stop,
+    ) -> Result<Option<ReceiverEvent>> {
+        capture_within(deadline, stop, |attempt| self.poll_event_once(attempt))
     }
 
     /// The one implementation of [`Receiver::poll_source_name_change`], also
@@ -1775,12 +1821,13 @@ impl ReceiverCore {
     pub(crate) fn poll_source_name_change_until(
         &self,
         deadline: Deadline,
+        stop: impl Stop,
     ) -> Result<Option<SourceNameChange>> {
         // The query comes with the function that releases what it returns.
         let (source_name, strings) = self
             ._ndi
             .table::<(sys::ReceiverSourceName, sys::ReceiverStrings)>()?;
-        self.poll_source_name_change_with(source_name, strings, deadline)
+        self.poll_source_name_change_with(source_name, strings, deadline, stop)
     }
 
     /// [`Self::poll_source_name_change_until`] through the given tables, so
@@ -1790,31 +1837,34 @@ impl ReceiverCore {
         source_name: &sys::ReceiverSourceName,
         strings: &sys::ReceiverStrings,
         deadline: Deadline,
+        stop: impl Stop,
     ) -> Result<Option<SourceNameChange>> {
-        let Some(_query) = self.source_query_guard.try_lock_until(deadline.end()) else {
-            return Ok(None);
-        };
-        let mut pointer = ptr::null();
-        let remaining = deadline.remaining_ms();
-        // SAFETY: the receiver instance is live for this borrow and `pointer` is
-        // writable storage for the returned string.
-        let changed = unsafe {
-            source_name.NDIlib_recv_get_source_name(self.instance, &mut pointer, remaining)
-        };
-        let guard = RecvStringGuard {
-            core: self,
-            pointer,
-            strings,
-        };
-        if !changed {
-            return Ok(None);
-        }
-        // The SDK reports a change only once, since the previous call, so a
-        // strict decoding error here would lose the name for good.
-        Ok(Some(match guard.copy_lossy()? {
-            Some(name) => SourceNameChange::Connected(name),
-            None => SourceNameChange::Disconnected,
-        }))
+        capture_within(deadline, stop, |attempt| {
+            let Some(_query) = self.source_query_guard.try_lock_until(attempt.0.end()) else {
+                return Ok(None);
+            };
+            let mut pointer = ptr::null();
+            let remaining = attempt.0.remaining_ms();
+            // SAFETY: the receiver instance is live for this borrow and `pointer` is
+            // writable storage for the returned string.
+            let changed = unsafe {
+                source_name.NDIlib_recv_get_source_name(self.instance, &mut pointer, remaining)
+            };
+            let guard = RecvStringGuard {
+                core: self,
+                pointer,
+                strings,
+            };
+            if !changed {
+                return Ok(None);
+            }
+            // The SDK reports a change only once, since the previous call, so a
+            // strict decoding error here would lose the name for good.
+            Ok(Some(match guard.copy_lossy()? {
+                Some(name) => SourceNameChange::Connected(name),
+                None => SourceNameChange::Disconnected,
+            }))
+        })
     }
 
     /// One attempt of [`Self::poll_event_until`]: a pending event, or what one SDK
@@ -2019,7 +2069,7 @@ impl<'rx, K: CaptureKind> Capture<'rx, K> {
         // Bind through `'rx` so the returned borrow is tied to the receiver, not
         // to this short-lived view.
         let rx: &'rx ReceiverCore = self.rx;
-        rx.capture_ref_until::<K>(Deadline::after(timeout)?)
+        rx.capture_ref_until::<K>(Deadline::after(timeout)?, NeverStop)
     }
 }
 
@@ -2888,6 +2938,7 @@ mod tests {
                 &source_name,
                 &strings,
                 Deadline::after(Duration::ZERO).unwrap(),
+                NeverStop,
             );
             (change.unwrap(), FREES.load(Ordering::Relaxed) - before)
         };
@@ -2908,6 +2959,76 @@ mod tests {
         // A string returned without a change is still released.
         assert_eq!(poll(false, Some(b"\xff")), (None, 1));
         assert_eq!(poll(false, None), (None, 0));
+    }
+
+    #[test]
+    fn source_name_wait_retries_bounded_queries_and_honors_cancellation() {
+        use std::cell::RefCell;
+        std::thread_local! {
+            static CALLS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+        }
+        unsafe extern "C" fn get_source_name(
+            _instance: NDIlib_recv_instance_t,
+            name: *mut *const c_char,
+            timeout_ms: u32,
+        ) -> bool {
+            let changed = CALLS.with(|calls| {
+                let mut calls = calls.borrow_mut();
+                calls.push(timeout_ms);
+                calls.len() == 3
+            });
+            unsafe {
+                name.write(if changed {
+                    c"later source".as_ptr()
+                } else {
+                    ptr::null()
+                })
+            };
+            changed
+        }
+        unsafe extern "C" fn free(_instance: NDIlib_recv_instance_t, _name: *const c_char) {}
+        let Some(ndi) = crate::test_support::ndi() else {
+            return;
+        };
+        let receiver = Receiver::new(&ndi, &unconnected()).unwrap();
+        let source_name = sys::ReceiverSourceName {
+            NDIlib_recv_get_source_name: get_source_name,
+        };
+        let strings = sys::ReceiverStrings {
+            NDIlib_recv_free_string: free,
+        };
+        let result = receiver
+            .core
+            .poll_source_name_change_with(
+                &source_name,
+                &strings,
+                Deadline::after(Duration::from_secs(2)).unwrap(),
+                NeverStop,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            Some(SourceNameChange::Connected("later source".into()))
+        );
+        CALLS.with(|calls| {
+            assert_eq!(calls.borrow().len(), 3);
+            assert!(calls.borrow().iter().all(|&wait| wait <= 100));
+            calls.borrow_mut().clear();
+        });
+        // The entry gate already authorized the first attempt; stopping affects
+        // later attempts even when a query returns immediately with no change.
+        let stopped = AtomicBool::new(true);
+        assert!(receiver
+            .core
+            .poll_source_name_change_with(
+                &source_name,
+                &strings,
+                Deadline::after(Duration::from_secs(2)).unwrap(),
+                &stopped,
+            )
+            .unwrap()
+            .is_none());
+        CALLS.with(|calls| assert_eq!(calls.borrow().len(), 1));
     }
 
     /// A source no receiver can connect to: no name and no address.
@@ -3604,6 +3725,54 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_stops_before_another_attempt_or_pending_event() {
+        assert_eq!(std::mem::size_of::<NeverStop>(), 0);
+        for progress in [false, true] {
+            let clock = FakeClock::new();
+            let cancelled = AtomicBool::new(false);
+            let mut calls = 0;
+            let mut pending = false;
+            let result: Result<Option<()>> = capture_within_clock_with_stop(
+                clock.deadline(Duration::from_secs(30)),
+                &cancelled,
+                |_| {
+                    calls += 1;
+                    assert!(!pending, "a stopped retry consumed the pending event");
+                    pending = true;
+                    cancelled.store(true, Ordering::Release);
+                    Ok(if progress {
+                        Retry::Progress
+                    } else {
+                        Retry::Idle
+                    })
+                },
+                || clock.now(),
+                |pause| clock.advance(pause),
+            );
+            assert!(result.unwrap().is_none());
+            assert_eq!(calls, 1);
+            assert!(pending);
+        }
+    }
+
+    #[test]
+    fn cancellation_preserves_the_item_from_the_attempt_in_flight() {
+        let clock = FakeClock::new();
+        let cancelled = AtomicBool::new(false);
+        let result = capture_within_clock_with_stop(
+            clock.deadline(Duration::from_secs(30)),
+            &cancelled,
+            |_| {
+                cancelled.store(true, Ordering::Release);
+                Ok(Some(42))
+            },
+            || clock.now(),
+            |_| panic!("delivered items must not wait again"),
+        );
+        assert_eq!(result.unwrap(), Some(42));
+    }
+
+    #[test]
     fn retry_notification_storm_is_bounded_and_idle_still_backs_off() {
         for idle in [false, true] {
             let clock = FakeClock::new();
@@ -3939,7 +4108,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         let mut polls = Vec::new();
 
-        let result: Result<Option<i32>> = capture_within(deadline, |attempt| {
+        let result: Result<Option<i32>> = capture_within(deadline, NeverStop, |attempt| {
             polls.push(attempt.0.remaining());
             Ok(None)
         });

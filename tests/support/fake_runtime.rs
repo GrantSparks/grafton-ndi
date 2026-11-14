@@ -163,6 +163,24 @@ export! {
     }
 }
 
+// A bounded no-change wait used to observe async source-query cancellation.
+#[cfg(fake_source_name)]
+export! {
+    fn NDIlib_recv_get_source_name(_p_instance: NDIlib_recv_instance_t, name: *mut *const c_char, timeout_in_ms: u32) -> bool {
+        log(&format!("source-name:{timeout_in_ms}"));
+        let delay = std::env::var("GRAFTON_FAKE_SOURCE_NAME_DELAY_MS")
+            .unwrap_or_default().parse::<u64>().unwrap_or(0);
+        std::thread::sleep(std::time::Duration::from_millis(delay.min(timeout_in_ms.into())));
+        unsafe { name.write(std::ptr::null()) };
+        false
+    }
+    fn NDIlib_recv_free_string(_p_instance: NDIlib_recv_instance_t, name: *const c_char) {
+        if !name.is_null() {
+            unsafe { drop(CString::from_raw(name.cast_mut())) };
+        }
+    }
+}
+
 // Record native connection requests so tests can compare the remembered target
 // with what actually crossed the FFI boundary, including concurrent requests.
 export! {

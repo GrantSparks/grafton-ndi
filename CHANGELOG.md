@@ -132,6 +132,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Performance and correctness
 
+- Dropped async receiver waits stop before their next bounded attempt, releasing
+  their receiver and blocking worker without waiting for the original timeout.
+  Source-name polling now uses the same bounded attempts.
+
 - [#140](https://github.com/GrantSparks/grafton-ndi/issues/140): enable runtime
   JPEG SIMD with scalar fallback and direct contiguous packed-RGB input;
   retry capture notifications immediately within bounded bursts; continue File

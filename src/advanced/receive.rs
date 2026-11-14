@@ -253,6 +253,7 @@ impl PacketReceiver {
     ) -> Result<Option<PacketItem>> {
         receiver.core.capture_any_until_with(
             Deadline::after(timeout)?,
+            crate::receiver::NeverStop,
             PacketItem::Event,
             |delivered| Self::capture_result(receiver, delivered),
         )
