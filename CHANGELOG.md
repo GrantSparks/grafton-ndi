@@ -169,9 +169,10 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
   caller padding/tail storage require explicit opt-in and initialized storage.
 - Frame and metadata copies reuse retained capacity. Advanced send queues
   account for retained payload and metadata capacity in their byte limits.
-- Finder and Discovery Server collections enforce count/byte budgets with
-  fallible allocation and typed resource-limit errors. Discovery strings have
-  bounded scans, and malformed native event batches are rejected.
+- Finder and Discovery Server collections share bounded copy accounting with
+  fallible allocation and typed resource-limit errors. Listeners omit entries
+  and events with over-limit strings, and entries with malformed nested arrays,
+  while retaining valid peers. Malformed top-level arrays are rejected.
 - Receiver drop percentages use the native received total, which includes
   native drops. Color metadata ignores XML processing instructions.
 - Recording preflight rejects existing exact filenames and normalizes paths;

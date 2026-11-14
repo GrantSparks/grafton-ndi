@@ -212,13 +212,7 @@ pub(crate) unsafe fn snapshot_entry(
     }
     Ok(Some(Source {
         name: name.unwrap_or_default(),
-        address: copied_address.map(|address| {
-            if address.contains("://") {
-                SourceAddress::Url(address)
-            } else {
-                SourceAddress::Ip(address)
-            }
-        }),
+        address: copied_address.map(SourceAddress::from_sdk_text),
     }))
 }
 
@@ -721,20 +715,7 @@ fn accumulate_sources(
                 budget::MAX_BYTES,
             ));
         }
-        let name = budget::copy_string(&source.name)?;
-        let address = source
-            .address
-            .as_ref()
-            .map(|a| -> Result<SourceAddress> {
-                let (SourceAddress::Ip(text) | SourceAddress::Url(text)) = a;
-                let text = budget::copy_string(text)?;
-                Ok(match a {
-                    SourceAddress::Ip(_) => SourceAddress::Ip(text),
-                    SourceAddress::Url(_) => SourceAddress::Url(text),
-                })
-            })
-            .transpose()?;
-        seen.insert(Source { name, address });
+        seen.insert(source.try_copy()?);
         discovered.push(source);
         *retained_bytes = bytes;
     }
@@ -895,6 +876,14 @@ pub enum SourceAddress {
 }
 
 impl SourceAddress {
+    fn from_sdk_text(address: String) -> Self {
+        if address.contains("://") {
+            Self::Url(address)
+        } else {
+            Self::Ip(address)
+        }
+    }
+
     /// Check whether this address has the exact host or IP.
     ///
     /// Hostnames compare without ASCII case or a final DNS dot. Invalid bare-host
@@ -1008,6 +997,22 @@ unsafe impl Send for RawSource {}
 unsafe impl Sync for RawSource {}
 
 impl Source {
+    /// Copy strings with exact reservations while preserving address variants.
+    fn try_copy(&self) -> Result<Self> {
+        let name = budget::copy_string(&self.name)?;
+        let address = self
+            .address
+            .as_ref()
+            .map(|address| -> Result<SourceAddress> {
+                Ok(match address {
+                    SourceAddress::Ip(text) => SourceAddress::Ip(budget::copy_string(text)?),
+                    SourceAddress::Url(text) => SourceAddress::Url(budget::copy_string(text)?),
+                })
+            })
+            .transpose()?;
+        Ok(Self { name, address })
+    }
+
     /// The source named `name`, without an address.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
@@ -1160,11 +1165,7 @@ impl Source {
         } else {
             // SAFETY: the caller keeps the address readable through its terminator.
             let address = unsafe { copy_sdk_string(address, operation) }?;
-            Some(if address.contains("://") {
-                SourceAddress::Url(address)
-            } else {
-                SourceAddress::Ip(address)
-            })
+            Some(SourceAddress::from_sdk_text(address))
         };
 
         Ok(Source { name, address })
@@ -1407,18 +1408,7 @@ fn copy_sources(sources: &[Source]) -> Result<Vec<Source>> {
     copy.try_reserve_exact(sources.len())
         .map_err(|_| budget::allocation_failed())?;
     for source in sources {
-        let name = budget::copy_string(&source.name)?;
-        let address = source
-            .address
-            .as_ref()
-            .map(|address| -> Result<SourceAddress> {
-                Ok(match address {
-                    SourceAddress::Ip(text) => SourceAddress::Ip(budget::copy_string(text)?),
-                    SourceAddress::Url(text) => SourceAddress::Url(budget::copy_string(text)?),
-                })
-            })
-            .transpose()?;
-        copy.push(Source { name, address });
+        copy.push(source.try_copy()?);
     }
     Ok(copy)
 }

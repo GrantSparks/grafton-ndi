@@ -1,86 +1,53 @@
-//! Resource bounds shared by plain and Advanced Finder snapshots.
+//! Finder-specific count bounds and the shared discovery snapshot copier.
 
 use std::{ffi::c_char, mem::size_of};
 
 use crate::{
-    frames::{bounded_sdk_text, MAX_SDK_STRING_BYTES},
-    sdk_copy::LossyText,
+    sdk_copy::{CopyBudget, CopyError},
     Error, ResourceKind, Result,
 };
 
+pub(super) use crate::sdk_copy::{allocation_failed, COPY_LIMIT as MAX_BYTES};
 pub(super) const MAX_SOURCES: usize = 16_384;
-pub(super) const MAX_BYTES: usize = 16 * 1024 * 1024;
 
 pub(super) fn limit(resource: ResourceKind, limit: usize) -> Error {
     Error::ResourceLimit { resource, limit }
 }
 
-pub(super) fn allocation_failed() -> Error {
-    Error::UnexpectedSdkResult("could not reserve memory for Finder results".into())
-}
-
-/// Check the native span before pointer arithmetic, even on 32-bit targets.
+/// Finder keeps its own descriptor count limit in addition to shared spans.
 pub(super) fn descriptor_bytes(count: usize, element_size: usize) -> Result<usize> {
     if count > MAX_SOURCES {
         return Err(limit(ResourceKind::FinderSnapshotSources, MAX_SOURCES));
     }
-    let bytes = count
-        .checked_mul(element_size)
-        .filter(|&bytes| bytes <= isize::MAX as usize)
-        .ok_or_else(|| Error::UnexpectedSdkResult("Finder descriptor span overflow".into()))?;
-    Ok(bytes)
+    CopyBudget::span_bytes(count, element_size).map_err(CopyError::into_error)
 }
 
-pub(crate) struct SnapshotBudget {
-    remaining: usize,
-}
+/// Finder's policy omits an entry whose optional string exceeds its bound.
+/// All byte accounting and copying are performed by the shared budget.
+pub(crate) struct SnapshotBudget(CopyBudget);
 
 impl SnapshotBudget {
     pub(crate) fn new() -> Self {
-        Self {
-            remaining: MAX_BYTES,
-        }
+        Self(CopyBudget::new(
+            MAX_BYTES,
+            ResourceKind::FinderSnapshotBytes,
+        ))
     }
 
-    fn take(&mut self, bytes: usize) -> Result<()> {
-        self.remaining = self
-            .remaining
-            .checked_sub(bytes)
-            .ok_or_else(|| limit(ResourceKind::FinderSnapshotBytes, MAX_BYTES))?;
-        Ok(())
-    }
-
-    /// Copy one optional string. An unterminated individual string is left
-    /// out, but its entire scan is charged, including for rejected entries.
-    ///
     /// # Safety
-    /// A non-null pointer must remain initialized and readable through its
-    /// first NUL or `MAX_SDK_STRING_BYTES`, whichever comes first.
+    /// A non-null pointer remains readable through its first NUL or the SDK
+    /// string bound, whichever comes first.
     pub(crate) unsafe fn text(&mut self, pointer: *const c_char) -> Result<Option<String>> {
-        if pointer.is_null() {
-            return Ok(None);
+        // SAFETY: forwarded to the caller's obligations.
+        match unsafe { self.0.text(pointer) } {
+            Ok(text) => Ok(text),
+            Err(CopyError::Malformed(_)) => Ok(None),
+            Err(error) => Err(error.into_error()),
         }
-        let scan_limit = self.remaining.min(MAX_SDK_STRING_BYTES);
-        // SAFETY: the caller provides a live string, and the scan stops at
-        // the first NUL or the smaller of the work and individual limits.
-        let bytes = unsafe { bounded_sdk_text(pointer, scan_limit) };
-        let Some(bytes) = bytes else {
-            self.take(scan_limit)?;
-            return if scan_limit < MAX_SDK_STRING_BYTES {
-                Err(limit(ResourceKind::FinderSnapshotBytes, MAX_BYTES))
-            } else {
-                Ok(None)
-            };
-        };
-        self.take(bytes.len() + 1)?;
-        let text = LossyText::new(bytes);
-        self.take(text.len())?;
-        Ok(Some(text.copy().map_err(|_| allocation_failed())?))
     }
 }
 
-/// Deep-copy one SDK snapshot. Used under the Finder snapshot lock; kept
-/// separate so limits can be tested without an installed native runtime.
+/// Deep-copy one SDK snapshot under the Finder snapshot lock.
 ///
 /// # Safety
 /// `descriptors` is null or points to `count` initialized descriptors that
@@ -90,29 +57,15 @@ pub(super) unsafe fn copy_snapshot<D, T>(
     count: u32,
     mut copy: impl FnMut(&D, &mut SnapshotBudget) -> Result<Option<T>>,
 ) -> Result<Vec<T>> {
-    let count = count as usize;
-    let bytes = descriptor_bytes(count, size_of::<D>())?;
+    descriptor_bytes(count as usize, size_of::<D>())?;
+    descriptor_bytes(count as usize, size_of::<T>())?;
     let mut budget = SnapshotBudget::new();
-    budget.take(bytes)?;
-    // Include the returned vector's storage as well as the native scan.
-    budget.take(descriptor_bytes(count, size_of::<T>())?)?;
-    if descriptors.is_null() {
-        return if count == 0 {
-            Ok(Vec::new())
-        } else {
-            Err(Error::UnexpectedSdkResult(
-                "Finder returned a nonzero source count with a null array".into(),
-            ))
-        };
-    }
-    let mut copied = Vec::new();
-    copied
-        .try_reserve_exact(count)
-        .map_err(|_| allocation_failed())?;
-    for index in 0..count {
-        // SAFETY: the count and descriptor span passed preflight; the
-        // caller keeps this array live and excludes snapshot replacement.
-        if let Some(value) = copy(unsafe { &*descriptors.add(index) }, &mut budget)? {
+    // SAFETY: the count and native span passed preflight; the caller keeps
+    // this array live and excludes snapshot replacement.
+    let raw = unsafe { budget.0.slice(descriptors, count) }.map_err(CopyError::into_error)?;
+    let mut copied = budget.0.reserve(raw.len()).map_err(CopyError::into_error)?;
+    for entry in raw {
+        if let Some(value) = copy(entry, &mut budget)? {
             copied.push(value);
         }
     }
@@ -130,7 +83,10 @@ pub(super) fn copy_string(text: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{finder::snapshot_entry, sys::bindings::NDIlib_source_t, Source};
+    use crate::{
+        finder::snapshot_entry, frames::MAX_SDK_STRING_BYTES, sys::bindings::NDIlib_source_t,
+        Source,
+    };
     use std::{ffi::CString, ptr};
 
     fn named(pointer: *const c_char) -> NDIlib_source_t {
@@ -222,10 +178,6 @@ mod tests {
         // SAFETY: live literal, including a NUL terminator.
         let copied = unsafe { budget.text(bytes.as_ptr()) }.unwrap().unwrap();
         assert_eq!(copied, bytes.to_string_lossy());
-        assert_eq!(
-            budget.remaining,
-            MAX_BYTES - bytes.to_bytes_with_nul().len() - copied.len()
-        );
     }
 
     #[test]
