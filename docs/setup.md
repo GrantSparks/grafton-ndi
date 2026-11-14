@@ -99,6 +99,13 @@ headers. Query the selected runtime instead of inferring support from a version
 matrix. The separate File library reports its families through `FileApi::status`
 and `supports`; operations refuse a missing family with `FileFamilyUnavailable`. See the [File guide](file-io.md).
 
+Selection failures are structured. `RuntimeLoadFailed(failure)` exposes each
+attempt's location, `LoadOrigin`, and `LoadRefusal`; `failure.loaded_any()`
+distinguishes libraries that could not be opened from ones loaded and refused.
+`RuntimeConflict { kind, detail }` carries a `SelectionConflict` for a selected
+library mismatch, edition mismatch, linked implementation or other conflict.
+Use these fields for decisions and `Display` for diagnostics.
+
 ## Deploy an application
 
 Package the runtime explicitly; a dynamically loaded library is not a static

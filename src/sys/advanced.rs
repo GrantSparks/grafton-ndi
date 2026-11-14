@@ -8,7 +8,7 @@ use super::{bindings::NDIlib_recv_color_format_e, table::Resolver, Evidence, Tab
 use crate::{
     advanced::PassthroughPreset,
     capabilities::{CapabilityUnavailable, RuntimeFeature},
-    Result,
+    LoadRefusal, Result,
 };
 use std::ffi::CStr;
 
@@ -85,7 +85,7 @@ macro_rules! advanced_tables {
                         Self::SYMBOLS[index]
                     };
 
-                    fn load(_: &dyn Resolver) -> Result<std::result::Result<Self, &'static CStr>> {
+                    fn load(_: &dyn Resolver) -> std::result::Result<std::result::Result<Self, &'static CStr>, LoadRefusal> {
                         Ok(Err(Self::UNDECLARED))
                     }
                 }
@@ -104,7 +104,7 @@ macro_rules! advanced_tables {
         }
 
         impl AdvancedApi {
-            pub(crate) fn load(resolver: &dyn Resolver) -> Result<Self> {
+            pub(crate) fn load(resolver: &dyn Resolver) -> std::result::Result<Self, LoadRefusal> {
                 Ok(Self { $($field: $Table::load(resolver)?,)+ })
             }
 

@@ -17,7 +17,7 @@ use crate::{
     capabilities::{
         Capabilities, CapabilityStatus, CapabilityUnavailable, RuntimeFeature, RuntimeInfo,
     },
-    Error, Result,
+    Error, LoadRefusal, Result,
 };
 
 native_table! {
@@ -217,12 +217,9 @@ macro_rules! optional_tables {
             ///
             /// Fails when a [`Core`] entry point is missing or any entry point
             /// resolves outside the selected implementation.
-            pub(crate) fn load(resolver: &dyn Resolver) -> Result<Self> {
+            pub(crate) fn load(resolver: &dyn Resolver) -> std::result::Result<Self, LoadRefusal> {
                 let core = Core::load(resolver)?.map_err(|symbol| {
-                    Error::RuntimeLoadFailed(format!(
-                        "it does not export the required entry point {}",
-                        symbol.to_string_lossy()
-                    ))
+                    LoadRefusal::MissingEntryPoint { symbol: symbol.to_string_lossy().into_owned(), required: true, detail: None }
                 })?;
                 Ok(Self {
                     core,

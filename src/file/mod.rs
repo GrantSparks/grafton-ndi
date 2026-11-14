@@ -30,8 +30,11 @@
 //!    are recorded as refused locations and never searched;
 //! 4. the platform loader's own search for the library name.
 //!
-//! When nothing is usable, [`Error::RuntimeLoadFailed`] names every location
-//! tried and the operating system's reason for each. Like the NDI runtime, a
+//! When nothing is usable, [`Error::RuntimeLoadFailed`] carries a
+//! [`crate::LoadFailure`] for [`crate::LibraryKind::File`], with each attempted
+//! location, origin and typed refusal. `loaded_any()` reports whether any
+//! native code loaded before being refused. `Display` retains the diagnostic
+//! text for each attempt, including the operating system's reason. Like the NDI runtime, a
 //! loaded File library stays selected and loaded for the life of the process.
 //!
 //! On Linux, macOS and Android the 6.4.0.2 File library imports the NDI runtime's entry
@@ -285,10 +288,13 @@ impl FileApi {
     /// # Errors
     ///
     /// * [`Error::RuntimeLoadFailed`] when no usable File library can be
-    ///   loaded. This is retryable, and the rest of the crate keeps working.
+    ///   loaded. Its [`crate::LoadFailure`] records typed attempts and whether
+    ///   any native code loaded before being refused. This is retryable, and
+    ///   the rest of the crate keeps working.
     /// * [`Error::RuntimeConflict`] when the selected NDI runtime is not one
     ///   the File library can accompany, or `options` names a library other
-    ///   than the one already selected.
+    ///   than the one already selected. [`crate::SelectionConflict`] identifies
+    ///   the cause; `detail` retains the diagnostic context.
     /// * [`Error::InvalidInput`] when `options` names a relative path.
     pub fn open(ndi: &Ndi, options: &FileRuntimeOptions) -> Result<Self> {
         let runtime = sys::select_file(ndi.info(), ndi.api(), options.library_path.as_deref())?;

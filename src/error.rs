@@ -1,5 +1,10 @@
 //! The crate's one error type.
 
+mod loading;
+pub use loading::{
+    LibraryKind, LoadAttempt, LoadFailure, LoadOrigin, LoadRefusal, SelectionConflict,
+};
+
 use thiserror::Error;
 
 use std::{ffi::NulError, fmt};
@@ -35,6 +40,11 @@ pub enum SpawnFailure {
 pub enum Error {
     /// No usable NDI library could be selected.
     ///
+    /// [`LoadFailure`] records the library, attempted locations, their origins
+    /// and typed [`LoadRefusal`] causes. [`LoadFailure::loaded_any`] distinguishes
+    /// code that loaded and was refused from locations that could not be opened.
+    /// `Display` retains the diagnostic text for every attempt.
+    ///
     /// * Selecting the NDI runtime ([`Runtime::select`] and every constructor
     ///   that selects one): no usable runtime library was found. The message
     ///   names every location tried and why each was rejected: the file was
@@ -46,12 +56,12 @@ pub enum Error {
     ///
     /// Nothing is selected, so the call can be repeated, for example once the
     /// library is installed. A selected File library that lacks the entry
-    /// points of one family is reported as [`Error::UnsupportedCapability`]
+    /// points of one family is reported as `Error::FileFamilyUnavailable`
     /// instead, by every operation that needs that family.
     ///
     /// [`Runtime::select`]: crate::Runtime::select
     #[error("Failed to load an NDI library: {0}")]
-    RuntimeLoadFailed(String),
+    RuntimeLoadFailed(LoadFailure),
 
     /// An operation needs a capability this build or the selected runtime
     /// does not provide.
@@ -62,8 +72,7 @@ pub enum Error {
     /// is refused this way before anything reaches the SDK, and
     /// [`Ndi::require_feature`] reports the same error in advance. The
     /// condition lasts for the life of the process: the runtime is selected
-    /// once, and a build
-    /// that lacks a declaration has to be rebuilt, with the `advanced` feature
+    /// once, and a build that lacks a declaration has to be rebuilt, with the `advanced` feature
     /// and with `NDI_SDK_DIR` naming an NDI Advanced SDK whose headers declare
     /// it.
     ///
@@ -79,8 +88,8 @@ pub enum Error {
         feature: RuntimeFeature,
         /// Why it is unavailable.
         reason: CapabilityUnavailable,
-        /// The evidence: the entry point the runtime lacks (for [`SymbolUnavailable`] and
-        /// [`WrongEdition`]), the version the runtime reports
+        /// The evidence: the entry point the runtime lacks (for
+        /// [`SymbolUnavailable`] and [`WrongEdition`]), the version the runtime reports
         /// against the version required (for [`RuntimeTooOld`] and
         /// [`RuntimeVersionUnknown`]), or the declaration this build lacks (for
         /// [`BuildAbiUnavailable`]).
@@ -112,6 +121,9 @@ pub enum Error {
     /// The request cannot be met by the implementation already selected for
     /// this process, which cannot be replaced.
     ///
+    /// `kind` identifies the [`SelectionConflict`] without parsing `detail`;
+    /// the latter preserves the diagnostic text.
+    ///
     /// * The runtime options name a library file other than the selected one,
     ///   ask for the Advanced SDK when the selected runtime is not one, or
     ///   name any file when the SDK is linked into the program.
@@ -123,8 +135,13 @@ pub enum Error {
     ///   macOS and Android it needs the Advanced SDK runtime, and it is
     ///   refused while the process's global symbol scope holds an NDI runtime
     ///   other than the selected one, which it would bind to.
-    #[error("Conflicting NDI runtime selection: {0}")]
-    RuntimeConflict(String),
+    #[error("Conflicting NDI runtime selection: {detail}")]
+    RuntimeConflict {
+        /// The typed cause of the conflict.
+        kind: SelectionConflict,
+        /// Diagnostic context, retained for display and logging.
+        detail: String,
+    },
 
     /// The native SDK did not perform an operation.
     ///
@@ -379,6 +396,13 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
+
+// The existing largest payload is NulError. Selection diagnostics must not
+// enlarge the error returned by hot capture/send paths (40 bytes on x86-64).
+const _: () = assert!(
+    std::mem::size_of::<Error>()
+        <= std::mem::size_of::<NulError>() + std::mem::align_of::<NulError>()
+);
 
 /// The resource budget exhausted by a discovery operation.
 ///

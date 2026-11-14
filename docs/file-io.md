@@ -162,6 +162,13 @@ for cancellation, queue and shutdown contracts.
 
 ## Errors
 
+Library selection reports `RuntimeLoadFailed(failure)` with
+`failure.library() == LibraryKind::File` and typed search attempts. Inspect
+`LoadRefusal` and `failure.loaded_any()` before treating a load failure as an
+uninstalled library. `RuntimeConflict { kind, detail }` distinguishes a
+`FileNeedsAdvancedRuntime` conflict from a different selected library, linked
+implementation or foreign runtime in the global symbol scope.
+
 File operations use the crate's `Error`. Distinguish unavailable libraries or
 families (`RuntimeLoadFailed`, `FileFamilyUnavailable`), conflicting selections
 (`RuntimeConflict`), invalid arguments or state, queue saturation (`QueueFull`),

@@ -11,7 +11,7 @@ use crate::{
     capabilities::{Capabilities, RuntimeInfo, SdkEdition, SdkVersion},
     frames::{bounded_sdk_text, MAX_SDK_STRING_BYTES},
     runtime::RuntimeOptions,
-    Error, Result,
+    Error, LoadRefusal, Result, SelectionConflict,
 };
 
 static SELECTED: Selection<Runtime> = Selection::new();
@@ -40,7 +40,7 @@ struct AdvancedEntryPoints {
 }
 
 impl AdvancedEntryPoints {
-    fn detect(resolver: &dyn Resolver) -> Result<Self> {
+    fn detect(resolver: &dyn Resolver) -> std::result::Result<Self, LoadRefusal> {
         Ok(Self {
             sender_configuration: resolver.resolve(ADVANCED_SENDER)?.is_some(),
             receiver_configuration: resolver.resolve(ADVANCED_RECEIVER)?.is_some(),
@@ -117,30 +117,45 @@ impl Runtime {
     /// Resolve the tables of an opened implementation and describe it.
     ///
     /// The error is the reason this implementation cannot be used.
-    fn describe(provider: Provider, requested: SdkEdition) -> std::result::Result<Self, String> {
-        let api = Api::load(&provider).map_err(reason)?;
+    fn describe(
+        provider: Provider,
+        requested: SdkEdition,
+    ) -> std::result::Result<Self, LoadRefusal> {
+        let api = Api::load(&provider)?;
         #[cfg(feature = "advanced")]
-        let advanced_tables = super::advanced::AdvancedApi::load(&provider).map_err(reason)?;
-        let advanced = AdvancedEntryPoints::detect(&provider).map_err(reason)?;
+        let advanced_tables = super::advanced::AdvancedApi::load(&provider)?;
+        let advanced = AdvancedEntryPoints::detect(&provider)?;
         let edition = provider.edition(advanced);
         if !meets(requested, edition) {
-            return Err("it does not export the Advanced SDK entry points".into());
+            return Err(LoadRefusal::EditionNotMet);
         }
         // SAFETY: NDIlib_version takes no arguments and may be called before
         // initialization; it returns a static NUL-terminated string or null.
         let version = unsafe { api.core.NDIlib_version() };
         if version.is_null() {
-            return Err("NDIlib_version returned no version text".into());
+            return Err(LoadRefusal::UnreadableVersion {
+                detail: "NDIlib_version returned no version text".into(),
+            });
         }
         // Read as far as the first NUL, but no further than one SDK string may
         // reach: a text without a terminator that close is not a version.
         // SAFETY: non-null was checked, and the SDK keeps the string alive for
         // as long as the implementation is loaded, which is the whole process.
         // The scan stops at its terminator or at the limit.
-        let raw_version = unsafe { bounded_sdk_text(version, MAX_SDK_STRING_BYTES) }
-            .ok_or("its version text has no terminator within the 4 MiB one SDK string may take")?;
+        let raw_version =
+            unsafe { bounded_sdk_text(version, MAX_SDK_STRING_BYTES) }.ok_or_else(|| {
+                LoadRefusal::UnreadableVersion {
+                    detail: concat!(
+                        "its version text has no terminator within the 4 MiB ",
+                        "one SDK string may take"
+                    )
+                    .into(),
+                }
+            })?;
         let raw_version = std::str::from_utf8(raw_version)
-            .map_err(|error| format!("its version text is not UTF-8: {error}"))?
+            .map_err(|error| LoadRefusal::UnreadableVersion {
+                detail: format!("its version text is not UTF-8: {error}"),
+            })?
             .to_owned();
         let version = SdkVersion::parse(&raw_version);
         let info = RuntimeInfo {
@@ -177,20 +192,13 @@ impl Runtime {
             .edition
             .is_some_and(|requested| !meets(requested, self.info.edition))
         {
-            return Err(Error::RuntimeConflict(
-                "the selected NDI implementation is not an Advanced SDK".into(),
-            ));
+            return Err(Error::RuntimeConflict {
+                kind: SelectionConflict::EditionNotMet,
+                detail: "the selected NDI implementation is not an Advanced SDK".into(),
+            });
         }
         self.provider
             .confirm_location(options.library_path.as_deref())
-    }
-}
-
-/// The text of a loader error without its variant prefix.
-pub(in crate::sys) fn reason(error: Error) -> String {
-    match error {
-        Error::RuntimeLoadFailed(reason) => reason,
-        other => other.to_string(),
     }
 }
 
@@ -219,7 +227,8 @@ mod shared {
     use crate::{
         capabilities::{SdkEdition, SdkLinkage},
         runtime::RuntimeOptions,
-        Error, Result,
+        Error, LibraryKind, LoadAttempt, LoadFailure, LoadOrigin as Origin, LoadRefusal, Result,
+        SelectionConflict,
     };
 
     /// The environment variable naming the directory of an installed NDI runtime.
@@ -245,7 +254,7 @@ mod shared {
     /// Why a location cannot be used, and the module it left loaded when it
     /// got as far as loading one.
     pub(super) struct Refusal {
-        reason: String,
+        reason: LoadRefusal,
         loaded: Option<Loaded>,
     }
 
@@ -258,9 +267,9 @@ mod shared {
 
     impl Refusal {
         /// A location that loaded nothing.
-        fn unloaded(reason: impl Into<String>) -> Self {
+        fn unloaded(reason: LoadRefusal) -> Self {
             Self {
-                reason: reason.into(),
+                reason,
                 loaded: None,
             }
         }
@@ -274,10 +283,13 @@ mod shared {
         /// text, and the identity of the module when the location was loaded
         /// before it was refused: it stays loaded.
         pub(super) fn open(location: &OsStr, anchor: &CStr) -> std::result::Result<Self, Refusal> {
-            let (library, handle) =
-                open_library(location).map_err(|error| Refusal::unloaded(error_chain(&error)))?;
+            let (library, handle) = open_library(location).map_err(|error| {
+                Refusal::unloaded(LoadRefusal::PlatformLoader {
+                    detail: error_chain(&error),
+                })
+            })?;
             let library = ManuallyDrop::new(library);
-            let refused = |reason: String, path: Option<PathBuf>| Refusal {
+            let refused = |reason: LoadRefusal, path: Option<PathBuf>| Refusal {
                 reason,
                 loaded: Some(Loaded { handle, path }),
             };
@@ -285,18 +297,20 @@ mod shared {
             let address = unsafe { library.get::<*const c_void>(anchor.to_bytes_with_nul()) }
                 .map(|symbol| *symbol)
                 .map_err(|error| {
-                    let reason = format!(
-                        "it does not export {}: {}",
-                        anchor.to_string_lossy(),
-                        error_chain(&error)
-                    );
+                    let reason = LoadRefusal::MissingEntryPoint {
+                        symbol: anchor.to_string_lossy().into_owned(),
+                        required: false,
+                        detail: Some(error_chain(&error)),
+                    };
                     refused(reason, None)
                 })?;
-            let (base, path) =
-                containing_module(address).map_err(|reason| refused(reason, None))?;
+            let (base, path) = containing_module(address)
+                .map_err(|detail| refused(LoadRefusal::NotIdentifiable { detail }, None))?;
             let path = path.canonicalize().unwrap_or(path);
             if Path::new(location).is_absolute() && !same_path(Path::new(location), &path) {
-                let reason = format!("the loader resolved it to {}", path.display());
+                let reason = LoadRefusal::ResolvedToAnotherFile {
+                    resolved: path.clone(),
+                };
                 return Err(refused(reason, Some(path)));
             }
             Ok(Self {
@@ -320,14 +334,15 @@ mod shared {
         fn lookup(
             &self,
             name: &CStr,
-        ) -> std::result::Result<Option<(NonNull<c_void>, usize)>, String> {
+        ) -> std::result::Result<Option<(NonNull<c_void>, usize)>, LoadRefusal> {
             // SAFETY: the symbol is read only as an address; a caller that
             // goes on to call it applies the function type.
             let symbol = unsafe { self.library.get::<*mut c_void>(name.to_bytes_with_nul()) };
             let Some(address) = symbol.ok().and_then(|symbol| NonNull::new(*symbol)) else {
                 return Ok(None);
             };
-            let (base, _) = containing_module(address.as_ptr())?;
+            let (base, _) = containing_module(address.as_ptr())
+                .map_err(|detail| LoadRefusal::NotIdentifiable { detail })?;
             Ok(Some((address, base)))
         }
 
@@ -338,7 +353,7 @@ mod shared {
         pub(in crate::sys) fn binding(
             &self,
             name: &CStr,
-        ) -> std::result::Result<Option<NonNull<c_void>>, String> {
+        ) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal> {
             Ok(self.lookup(name)?.map(|(address, _)| address))
         }
 
@@ -362,17 +377,19 @@ mod shared {
     }
 
     impl Resolver for Module {
-        fn resolve(&self, name: &CStr) -> Result<Option<NonNull<c_void>>> {
-            let Some((address, base)) = self.lookup(name).map_err(Error::RuntimeLoadFailed)? else {
+        fn resolve(
+            &self,
+            name: &CStr,
+        ) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal> {
+            let Some((address, base)) = self.lookup(name)? else {
                 return Ok(None);
             };
             // Accept a symbol only when this module itself defines it.
             if base != self.base {
-                return Err(Error::RuntimeLoadFailed(format!(
-                    "{} resolves outside {}",
-                    name.to_string_lossy(),
-                    self.path.display()
-                )));
+                return Err(LoadRefusal::EntryPointOutsideModule {
+                    symbol: name.to_string_lossy().into_owned(),
+                    module: self.path.clone(),
+                });
             }
             Ok(Some(address))
         }
@@ -398,6 +415,7 @@ mod shared {
             // Without a request any edition is acceptable, as it is for Standard.
             let requested = options.edition.unwrap_or(SdkEdition::Standard);
             Search {
+                kind: LibraryKind::Runtime,
                 explicit: options.library_path.as_deref(),
                 beside: None,
                 names: &names,
@@ -421,16 +439,21 @@ mod shared {
         if same_path(requested, selected) {
             Ok(())
         } else {
-            Err(Error::RuntimeConflict(format!(
-                "{} is already selected; it cannot be switched to {}",
-                selected.display(),
-                requested.display()
-            )))
+            Err(Error::RuntimeConflict {
+                kind: SelectionConflict::DifferentLibrary,
+                detail: format!(
+                    "{} is already selected; it cannot be switched to {}",
+                    selected.display(),
+                    requested.display()
+                ),
+            })
         }
     }
 
     /// A native library to locate and open.
     pub(in crate::sys) struct Search<'a> {
+        /// Which library is being sought.
+        pub(in crate::sys) kind: LibraryKind,
         /// The only acceptable location, when the caller named one.
         pub(in crate::sys) explicit: Option<&'a Path>,
         /// The file of an already selected library this one is installed
@@ -455,7 +478,7 @@ mod shared {
         /// and the reason each was rejected.
         pub(in crate::sys) fn open<T>(
             &self,
-            accept: impl Fn(Module) -> std::result::Result<T, String>,
+            accept: impl Fn(Module) -> std::result::Result<T, LoadRefusal>,
         ) -> Result<T> {
             super::validate_library_path(self.explicit)?;
             let executable = std::env::current_exe().ok();
@@ -490,10 +513,10 @@ mod shared {
                 };
                 failures.push(candidate.describe(refusal));
             }
-            Err(Error::RuntimeLoadFailed(format!(
-                "no usable {}; tried {}",
+            Err(Error::RuntimeLoadFailed(LoadFailure::searched(
+                self.kind,
                 self.description,
-                failures.join("; ")
+                failures,
             )))
         }
     }
@@ -508,21 +531,6 @@ mod shared {
     /// searching for another file.
     static REJECTED: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
 
-    /// Where a candidate location came from.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) enum Origin {
-        /// A path the caller named.
-        Explicit,
-        /// The directory of the library this one is installed beside.
-        Companion,
-        /// The directory containing the running executable.
-        Executable,
-        /// The directory named by `NDI_RUNTIME_DIR_V6`.
-        RuntimeDirectory,
-        /// The platform loader's own search for a library name.
-        LoaderSearch,
-    }
-
     /// One place the runtime library may be loaded from.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(super) struct Candidate {
@@ -532,14 +540,7 @@ mod shared {
 
     impl fmt::Display for Candidate {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            let origin = match self.origin {
-                Origin::Explicit => "explicit library path",
-                Origin::Companion => "next to the NDI runtime",
-                Origin::Executable => "next to the executable",
-                Origin::RuntimeDirectory => RUNTIME_DIRECTORY,
-                Origin::LoaderSearch => "system library search",
-            };
-            write!(f, "{} ({origin})", self.location.display())
+            write!(f, "{} ({})", self.location.display(), self.origin)
         }
     }
 
@@ -548,7 +549,7 @@ mod shared {
             // A relative environment directory is a refused location, never
             // a request to load code relative to the working directory.
             if self.origin == Origin::RuntimeDirectory && !self.location.is_absolute() {
-                return Err(Refusal::unloaded("the runtime directory must be absolute"));
+                return Err(Refusal::unloaded(LoadRefusal::RelativeRuntimeDirectory));
             }
             // A directory candidate names one exact file. Skipping an absent
             // one keeps the loader from searching elsewhere for that path.
@@ -557,7 +558,7 @@ mod shared {
                 Origin::Companion | Origin::Executable | Origin::RuntimeDirectory
             ) && !self.location.is_file()
             {
-                return Err(Refusal::unloaded("not found"));
+                return Err(Refusal::unloaded(LoadRefusal::Absent));
             }
             Module::open(self.location.as_os_str(), anchor)
         }
@@ -569,10 +570,10 @@ mod shared {
         /// and whether it is a module refused before: the loader keeps
         /// returning such a module for its name, so the search cannot reach
         /// any other library of that name.
-        fn describe(&self, refusal: Refusal) -> String {
+        fn describe(&self, refusal: Refusal) -> LoadAttempt {
             let Refusal { reason, loaded } = refusal;
             let Some(loaded) = loaded else {
-                return format!("{self}: {reason}");
+                return LoadAttempt::new(self.location.clone(), self.origin, reason, false, None);
             };
             let refused_before = {
                 let mut rejected = REJECTED.lock().unwrap_or_else(PoisonError::into_inner);
@@ -586,18 +587,20 @@ mod shared {
                 }
                 earlier
             };
-            match (self.origin, refused_before, loaded.path) {
-                (Origin::LoaderSearch, Some(path), _) => format!(
-                    "{self}: the platform loader returned {}, which is already loaded and was \
-                     rejected ({reason}); no other library of that name can be found by name in \
-                     this process, so remove or fix that file or pass an explicit library path",
-                    path.display()
-                ),
-                (Origin::LoaderSearch, None, Some(path)) => {
-                    format!("{self} resolved to {}: {reason}", path.display())
-                }
-                _ => format!("{self}: {reason}"),
-            }
+            let reason = match (self.origin, refused_before) {
+                (Origin::LoaderSearch, Some(path)) => LoadRefusal::AlreadyRefused {
+                    path,
+                    refusal: Box::new(reason),
+                },
+                _ => reason,
+            };
+            LoadAttempt::new(
+                self.location.clone(),
+                self.origin,
+                reason,
+                true,
+                loaded.path,
+            )
         }
     }
 
@@ -819,6 +822,14 @@ mod shared {
     mod tests {
         use super::*;
 
+        fn runtime_directory() -> &'static Path {
+            Path::new(if cfg!(windows) {
+                "C:/runtime"
+            } else {
+                "/runtime"
+            })
+        }
+
         fn locations(plan: &[Candidate]) -> Vec<(PathBuf, Origin)> {
             plan.iter()
                 .map(|candidate| (candidate.location.clone(), candidate.origin))
@@ -831,7 +842,7 @@ mod shared {
                 Some(Path::new("/opt/ndi/libndi.so.6")),
                 Some(Path::new("/core")),
                 Some(Path::new("/app")),
-                Some(Path::new("/runtime")),
+                Some(runtime_directory()),
                 &["libndi.so.6"],
             );
             assert_eq!(
@@ -846,13 +857,13 @@ mod shared {
                 None,
                 None,
                 Some(Path::new("/app")),
-                Some(Path::new("/runtime")),
+                Some(runtime_directory()),
                 &["libndi.so.6"],
             );
             let mut expected = vec![
                 (PathBuf::from("/app/libndi.so.6"), Origin::Executable),
                 (
-                    PathBuf::from("/runtime/libndi.so.6"),
+                    runtime_directory().join("libndi.so.6"),
                     Origin::RuntimeDirectory,
                 ),
             ];
@@ -895,7 +906,7 @@ mod shared {
                 Err(refusal) => refusal,
             };
             assert!(refusal.loaded.is_none());
-            let diagnostic = refused.describe(refusal);
+            let diagnostic = refused.describe(refusal).to_string();
             assert!(diagnostic.contains("NDI_RUNTIME_DIR_V6"), "{diagnostic}");
             assert!(diagnostic.contains("must be absolute"), "{diagnostic}");
             assert_eq!(plan.last().unwrap().origin, Origin::LoaderSearch);
@@ -903,16 +914,17 @@ mod shared {
 
         #[test]
         fn one_directory_named_twice_is_tried_once() {
+            let directory = std::env::current_dir().unwrap().join("app");
             let plan = search_plan(
                 None,
                 None,
-                Some(Path::new("/app")),
-                Some(Path::new("/app")),
+                Some(directory.as_path()),
+                Some(directory.as_path()),
                 &["libndi.so.6"],
             );
             let bundled = plan
                 .iter()
-                .filter(|candidate| candidate.location == Path::new("/app/libndi.so.6"))
+                .filter(|candidate| candidate.location == directory.join("libndi.so.6"))
                 .count();
             assert_eq!(bundled, 1);
         }
@@ -923,7 +935,7 @@ mod shared {
                 None,
                 Some(Path::new("/core")),
                 Some(Path::new("/app")),
-                Some(Path::new("/runtime")),
+                Some(runtime_directory()),
                 &["libndifile.so.6"],
             );
             assert_eq!(
@@ -932,7 +944,7 @@ mod shared {
                     (PathBuf::from("/core/libndifile.so.6"), Origin::Companion),
                     (PathBuf::from("/app/libndifile.so.6"), Origin::Executable),
                     (
-                        PathBuf::from("/runtime/libndifile.so.6"),
+                        runtime_directory().join("libndifile.so.6"),
                         Origin::RuntimeDirectory
                     ),
                 ]
@@ -949,7 +961,7 @@ mod shared {
                 None,
                 None,
                 Some(Path::new("/app")),
-                Some(Path::new("/runtime")),
+                Some(runtime_directory()),
                 &["libndi.so.6", "libndi_advanced.so.6"],
             );
             let mut expected = vec![
@@ -959,11 +971,11 @@ mod shared {
                     Origin::Executable,
                 ),
                 (
-                    PathBuf::from("/runtime/libndi.so.6"),
+                    runtime_directory().join("libndi.so.6"),
                     Origin::RuntimeDirectory,
                 ),
                 (
-                    PathBuf::from("/runtime/libndi_advanced.so.6"),
+                    runtime_directory().join("libndi_advanced.so.6"),
                     Origin::RuntimeDirectory,
                 ),
             ];
@@ -1018,7 +1030,7 @@ mod linked {
     use crate::{
         capabilities::{SdkEdition, SdkLinkage},
         runtime::RuntimeOptions,
-        Error, Result,
+        Error, LibraryKind, LoadFailure, LoadRefusal, Result, SelectionConflict,
     };
 
     // `fn linked_address(name: &[u8]) -> Option<*const c_void>`, generated by the
@@ -1040,10 +1052,13 @@ mod linked {
         pub(super) fn confirm_location(&self, requested: Option<&Path>) -> Result<()> {
             match requested {
                 None => Ok(()),
-                Some(requested) => Err(Error::RuntimeConflict(format!(
-                    "the NDI SDK is linked into this program, so {} cannot be loaded instead",
-                    requested.display()
-                ))),
+                Some(requested) => Err(Error::RuntimeConflict {
+                    kind: SelectionConflict::LinkedImplementation,
+                    detail: format!(
+                        "the NDI SDK is linked into this program, so {} cannot be loaded instead",
+                        requested.display()
+                    ),
+                }),
             }
         }
 
@@ -1054,7 +1069,10 @@ mod linked {
     }
 
     impl Resolver for Linked {
-        fn resolve(&self, name: &CStr) -> Result<Option<NonNull<c_void>>> {
+        fn resolve(
+            &self,
+            name: &CStr,
+        ) -> std::result::Result<Option<NonNull<c_void>>, LoadRefusal> {
             Ok(
                 linked_address(name.to_bytes())
                     .and_then(|address| NonNull::new(address.cast_mut())),
@@ -1067,8 +1085,13 @@ mod linked {
         /// plays no part here: it is checked against the archive exactly as
         /// against any implementation that is already selected.
         pub(in crate::sys) fn load(_: &RuntimeOptions) -> Result<Self> {
-            Self::describe(Linked, super::linked_edition())
-                .map_err(|reason| Error::RuntimeLoadFailed(format!("the linked SDK: {reason}")))
+            Self::describe(Linked, super::linked_edition()).map_err(|reason| {
+                Error::RuntimeLoadFailed(LoadFailure::linked(
+                    LibraryKind::Runtime,
+                    "the linked SDK",
+                    reason,
+                ))
+            })
         }
     }
 }

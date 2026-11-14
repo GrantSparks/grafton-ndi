@@ -2,6 +2,14 @@
 
 ## Runtime loading
 
+Match typed selection causes. `RuntimeLoadFailed(failure)` retains the search
+attempts with their paths, origins and refusals. When `failure.loaded_any()` is
+true, native code loaded but was refused; inspect `attempt.refusal()` for a
+missing entry point, incompatible edition, invalid version or other cause.
+When it is false, no candidate could be opened; platform-loader diagnostics
+can also describe problems other than an absent file. `RuntimeConflict`
+carries a `SelectionConflict` in `kind` and diagnostic text in `detail`.
+
 Use absolute paths for `library_path` and `NDI_RUNTIME_DIR_V6`. A relative
 explicit path returns `Error::InvalidInput` before selection on every target.
 A relative environment directory is recorded as refused and never opened;

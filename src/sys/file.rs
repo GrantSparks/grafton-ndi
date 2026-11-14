@@ -19,15 +19,16 @@ use super::loader::Linked;
 use super::loader::{confirm_selected, Module, Search};
 use super::{
     bindings::*,
-    loader::reason,
     selection::Selection,
     table::{native_table, Resolver},
     Api,
 };
+#[cfg(ndi_link_static)]
+use crate::LoadFailure;
 use crate::{
     capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeInfo},
     file::FileFamily,
-    Error, Result,
+    Error, LibraryKind, LoadRefusal, Result, SelectionConflict,
 };
 
 /// A family's table as one library resolved it, or the first of its entry
@@ -86,19 +87,17 @@ macro_rules! file_families {
             /// The error is the reason this implementation cannot be used at
             /// all: an entry point resolves outside it, or it provides no
             /// family.
-            fn load(resolver: &dyn Resolver) -> std::result::Result<Self, String> {
+            fn load(resolver: &dyn Resolver) -> std::result::Result<Self, LoadRefusal> {
                 let families = Self {
-                    $($field: $Table::load(resolver).map_err(reason)?,)+
+                    $($field: $Table::load(resolver)?,)+
                 };
                 // The first entry point each family lacks, in declaration order.
                 let missing = [$(families.$field.as_ref().err().copied()),+];
                 if let [Some(first), ..] = missing {
                     if missing.iter().all(Option::is_some) {
-                        return Err(format!(
-                            "it provides no family of NDI File entry points (it does not \
-                             export {})",
-                            first.to_string_lossy()
-                        ));
+                        return Err(LoadRefusal::NoCompleteFileFamily {
+                            first_missing: first.to_string_lossy().into_owned(),
+                        });
                     }
                 }
                 Ok(families)
@@ -271,11 +270,13 @@ impl FileRuntime {
         // process, so it is refused before anything is opened. The Windows
         // File library carries its own implementation and imports none.
         if cfg!(unix) && core.edition() != crate::capabilities::SdkEdition::Advanced {
-            return Err(Error::RuntimeConflict(
-                "the NDI File library needs the Advanced SDK runtime, and the selected runtime \
+            return Err(Error::RuntimeConflict {
+                kind: SelectionConflict::FileNeedsAdvancedRuntime,
+                detail:
+                    "the NDI File library needs the Advanced SDK runtime, and the selected runtime \
                  is the Standard one"
-                    .into(),
-            ));
+                        .into(),
+            });
         }
         // Where libraries are ELF objects, the platform loader binds the File
         // library's imports from the process's global scope before it looks
@@ -287,12 +288,13 @@ impl FileRuntime {
             Self::CORE_ENTRY,
             api.core.NDIlib_initialize as *mut std::ffi::c_void,
         ) {
-            return Err(Error::RuntimeConflict(format!(
-                "the process's global symbol scope already holds an NDI runtime that is not the \
-                 selected one ({file}); the NDI File library would bind to it"
-            )));
+            return Err(Error::RuntimeConflict { kind: SelectionConflict::ForeignRuntimeInScope,
+                detail: format!("the process's global symbol scope already holds an NDI runtime that is not the \
+                 selected one ({file}); the NDI File library would bind to it"),
+            });
         }
         Search {
+            kind: LibraryKind::File,
             explicit,
             beside: core.library_path(),
             names: &[Self::LIBRARY_NAME],
@@ -305,7 +307,7 @@ impl FileRuntime {
     /// Resolve the tables of an opened File library.
     ///
     /// The error is the reason this library cannot be used.
-    fn describe(module: Module, api: &Api) -> std::result::Result<Self, String> {
+    fn describe(module: Module, api: &Api) -> std::result::Result<Self, LoadRefusal> {
         // A lookup through the library's handle shows which module the platform
         // loader bound its core imports to. That must be the selected core: a
         // second copy of the runtime would not share its initialization. The
@@ -313,13 +315,13 @@ impl FileRuntime {
         // there the lookup finds nothing and there is no binding to check.
         if let Some(bound) = module.binding(Self::CORE_ENTRY)? {
             if bound.as_ptr() != api.core.NDIlib_initialize as *mut std::ffi::c_void {
-                return Err("it is bound to an NDI runtime other than the selected one".into());
+                return Err(LoadRefusal::BoundToAnotherRuntime);
             }
         }
         let families = Families::load(&module)?;
-        let path = module
-            .path()
-            .ok_or("the loader did not report where it was loaded from")?;
+        let path = module.path().ok_or_else(|| LoadRefusal::NotIdentifiable {
+            detail: "the loader did not report where it was loaded from".into(),
+        })?;
         Ok(Self { families, path })
     }
 
@@ -364,7 +366,11 @@ impl FileRuntime {
     fn load(_core: &RuntimeInfo, _api: &Api, explicit: Option<&Path>) -> Result<Self> {
         Self::reject_path(explicit)?;
         let families = Families::load(&Linked).map_err(|reason| {
-            Error::RuntimeLoadFailed(format!("the linked NDI SDK archive: {reason}"))
+            Error::RuntimeLoadFailed(LoadFailure::linked(
+                LibraryKind::File,
+                "the linked NDI SDK archive",
+                reason,
+            ))
         })?;
         Ok(Self { families })
     }
@@ -375,10 +381,12 @@ impl FileRuntime {
 
     fn reject_path(requested: Option<&Path>) -> Result<()> {
         if requested.is_some() {
-            return Err(Error::RuntimeConflict(
-                "a statically linked NDI File implementation cannot be replaced by a library"
-                    .into(),
-            ));
+            return Err(Error::RuntimeConflict {
+                kind: SelectionConflict::LinkedImplementation,
+                detail:
+                    "a statically linked NDI File implementation cannot be replaced by a library"
+                        .into(),
+            });
         }
         Ok(())
     }
@@ -410,7 +418,7 @@ mod tests {
     use crate::sys::table::ExportsWhere;
 
     /// A library that exports the names `exported` accepts.
-    fn library(exported: impl Fn(&str) -> bool) -> std::result::Result<FileRuntime, String> {
+    fn library(exported: impl Fn(&str) -> bool) -> std::result::Result<FileRuntime, LoadRefusal> {
         Ok(FileRuntime {
             families: Families::load(&ExportsWhere(exported))?,
             #[cfg(not(ndi_link_static))]
@@ -491,6 +499,11 @@ mod tests {
         }) else {
             panic!("a library without any family was accepted");
         };
-        assert!(reason.contains("NDIlib_file_player_create"), "{reason}");
+        assert_eq!(
+            reason,
+            LoadRefusal::NoCompleteFileFamily {
+                first_missing: "NDIlib_file_player_create".into()
+            }
+        );
     }
 }

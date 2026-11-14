@@ -17,6 +17,11 @@ encoding. Upgrading from 2.x requires API and deployment changes; follow the
 
 ### Breaking changes
 
+- Runtime selection conflicts carry `SelectionConflict` beside their diagnostic
+  text. `RuntimeLoadFailed` carries a boxed `LoadFailure` with typed candidate
+  locations, origins and refusals. Test prerequisite helpers skip unavailable
+  libraries, and fail when native code loads but is refused.
+
 - File-family refusals use `Error::FileFamilyUnavailable { family, detail }`.
   `RuntimeFeature::File` and `CapabilityUnavailable::SeparateLibrary` are
   removed; use `FileApi::status` or `supports` for File availability.

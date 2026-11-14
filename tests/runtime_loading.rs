@@ -8,7 +8,7 @@ mod runtime_fixture;
 use grafton_ndi::{
     capabilities::{CapabilityStatus, CapabilityUnavailable, RuntimeFeature, SdkEdition},
     runtime::{Runtime, RuntimeOptions},
-    Error, Ndi,
+    Error, LibraryKind, LoadFailure, LoadOrigin, LoadRefusal, Ndi, SelectionConflict,
 };
 use runtime_fixture::FakeRuntime;
 use std::{
@@ -312,9 +312,13 @@ fn is_loaded(library: &Path) -> bool {
         .contains(library.to_str().unwrap())
 }
 
-fn load_failure(result: Result<Ndi, Error>) -> String {
+fn load_failure(result: Result<Ndi, Error>) -> LoadFailure {
     match result {
-        Err(Error::RuntimeLoadFailed(reason)) => reason,
+        Err(Error::RuntimeLoadFailed(reason)) => {
+            assert_eq!(reason.library(), LibraryKind::Runtime);
+            assert!(!reason.attempts().is_empty());
+            reason
+        }
         Err(other) => panic!("expected a load failure, got {other}"),
         Ok(_) => panic!("expected a load failure, but a runtime loaded"),
     }
@@ -340,7 +344,18 @@ fn child(name: &str, fixtures: &Fixtures) {
         }
         "retry_and_capabilities" => {
             let reason = load_failure(Ndi::with_options(&explicit(fixtures.missing())));
-            assert!(reason.contains("NDIlib_send_set_failover"), "{reason}");
+            assert!(reason.loaded_any());
+            let attempt = &reason.attempts()[0];
+            assert_eq!(attempt.origin(), LoadOrigin::Explicit);
+            assert_eq!(attempt.location(), fixtures.missing());
+            assert_eq!(
+                attempt.refusal(),
+                &LoadRefusal::MissingEntryPoint {
+                    symbol: "NDIlib_send_set_failover".into(),
+                    required: true,
+                    detail: None
+                }
+            );
             assert!(!Ndi::is_running());
             let ndi = Ndi::with_options(&options).unwrap();
             assert!(Ndi::is_running());
@@ -368,11 +383,17 @@ fn child(name: &str, fixtures: &Fixtures) {
             let ndi = Ndi::with_options(&options).unwrap();
             assert!(matches!(
                 Ndi::with_options(&explicit(fixtures.missing())),
-                Err(Error::RuntimeConflict(_))
+                Err(Error::RuntimeConflict {
+                    kind: SelectionConflict::DifferentLibrary,
+                    ..
+                })
             ));
             assert!(matches!(
                 Ndi::with_options(&RuntimeOptions::default().edition(SdkEdition::Advanced)),
-                Err(Error::RuntimeConflict(_))
+                Err(Error::RuntimeConflict {
+                    kind: SelectionConflict::EditionNotMet,
+                    ..
+                })
             ));
             // The selected module satisfies a request that names no other one.
             drop(Ndi::with_options(&standard()).unwrap());
@@ -385,7 +406,9 @@ fn child(name: &str, fixtures: &Fixtures) {
                 let reason = load_failure(Ndi::with_options(
                     &explicit(standard_module).edition(SdkEdition::Advanced),
                 ));
-                assert!(reason.contains("Advanced SDK entry points"), "{reason}");
+                assert!(reason.loaded_any());
+                assert_eq!(reason.attempts()[0].origin(), LoadOrigin::Explicit);
+                assert_eq!(reason.attempts()[0].refusal(), &LoadRefusal::EditionNotMet);
             }
             // The failed request leaves selection open.
             let ndi = Ndi::with_options(&options).unwrap();
@@ -422,10 +445,11 @@ fn child(name: &str, fixtures: &Fixtures) {
             // Its terminator lies past the limit: the module is refused for
             // that, rather than read until the terminator however far away.
             let reason = load_failure(Ndi::with_options(&explicit(fixtures.long_version())));
-            assert!(
-                reason.contains("version text has no terminator within the 4 MiB"),
-                "{reason}"
-            );
+            assert!(reason.loaded_any());
+            assert!(matches!(
+                reason.attempts()[0].refusal(),
+                LoadRefusal::UnreadableVersion { .. }
+            ));
             // A refused module selects nothing.
             drop(Ndi::with_options(&options).unwrap());
         }
@@ -449,9 +473,13 @@ fn child(name: &str, fixtures: &Fixtures) {
         }
         "foreign_symbol" => {
             let reason = load_failure(Ndi::with_options(&explicit(fixtures.foreign())));
-            assert!(
-                reason.contains("NDIlib_send_set_failover resolves outside"),
-                "{reason}"
+            assert!(reason.loaded_any());
+            assert_eq!(
+                reason.attempts()[0].refusal(),
+                &LoadRefusal::EntryPointOutsideModule {
+                    symbol: "NDIlib_send_set_failover".into(),
+                    module: fixtures.foreign()
+                }
             );
             drop(Ndi::with_options(&options).unwrap());
         }
@@ -501,12 +529,15 @@ fn child(name: &str, fixtures: &Fixtures) {
             // path, but an explicit path names the only acceptable one.
             let absent = fixtures.empty().join(STANDARD_NAME);
             let reason = load_failure(Ndi::with_options(&explicit(absent.clone())));
-            assert!(reason.contains(absent.to_str().unwrap()), "{reason}");
-            assert!(reason.contains("No such file or directory"), "{reason}");
-            assert!(
-                !reason.contains(fixtures.runtime().to_str().unwrap()),
-                "{reason}"
-            );
+            assert!(!reason.loaded_any());
+            assert_eq!(reason.attempts().len(), 1);
+            let attempt = &reason.attempts()[0];
+            assert_eq!(attempt.location(), absent);
+            assert_eq!(attempt.origin(), LoadOrigin::Explicit);
+            assert!(matches!(
+                attempt.refusal(),
+                LoadRefusal::PlatformLoader { .. }
+            ));
             assert!(matches!(
                 Ndi::with_options(&standard().library_path("libndi.so.6")),
                 Err(Error::InvalidInput(_))
@@ -544,26 +575,24 @@ fn child(name: &str, fixtures: &Fixtures) {
                 .unwrap()
                 .with_file_name(ADVANCED_NAME);
             let in_runtime_directory = fixtures.mislabelled().join(ADVANCED_NAME);
-            let on_loader_path = fixtures.unloadable().join(ADVANCED_NAME);
-            for expected in [
-                format!(
-                    "{} (next to the executable): not found",
-                    beside_executable.display()
-                ),
-                format!(
-                    "{} (NDI_RUNTIME_DIR_V6): it does not export the Advanced SDK entry points",
-                    in_runtime_directory.display()
-                ),
-                // The search by name is reported with the platform loader's
-                // own reason, which alone knows the file that search reached.
-                format!("{ADVANCED_NAME} (system library search): dlopen failed: "),
-                format!("{}: ", on_loader_path.display()),
-            ] {
-                assert!(
-                    reason.contains(&expected),
-                    "missing `{expected}` in: {reason}"
-                );
-            }
+            assert!(reason.loaded_any());
+            assert_eq!(reason.attempts().len(), 3);
+            let attempts = reason.attempts();
+            assert_eq!(attempts[0].location(), beside_executable);
+            assert_eq!(attempts[0].origin(), LoadOrigin::Executable);
+            assert_eq!(attempts[0].refusal(), &LoadRefusal::Absent);
+            assert!(!attempts[0].loaded());
+            assert_eq!(attempts[1].location(), in_runtime_directory);
+            assert_eq!(attempts[1].origin(), LoadOrigin::RuntimeDirectory);
+            assert_eq!(attempts[1].refusal(), &LoadRefusal::EditionNotMet);
+            assert!(attempts[1].loaded());
+            assert_eq!(attempts[2].location(), Path::new(ADVANCED_NAME));
+            assert_eq!(attempts[2].origin(), LoadOrigin::LoaderSearch);
+            assert!(matches!(
+                attempts[2].refusal(),
+                LoadRefusal::PlatformLoader { .. }
+            ));
+            assert!(!attempts[2].loaded());
             // Nothing was selected, so a usable runtime can still be chosen.
             drop(Ndi::with_options(&options).unwrap());
         }
