@@ -28,8 +28,8 @@ as `None`. Most programs need changes; see the
   for reusable conversion storage. JPEG bytes and decoded pixels can vary
   with CPU capabilities. Existing capture deadlines, idle backoff, owned cache
   results and convenience image methods are preserved. See the
-  [measurement report](docs/benchmarks/issue-140/README.md) for evidence and
-  final scope decisions and measurement limits.
+  [image performance guide](docs/image-encoding-performance.md) for settings,
+  buffering and workspace use.
 
 ### SDK and platform compatibility
 
@@ -47,8 +47,8 @@ as `None`. Most programs need changes; see the
   tested.
 - 32-bit ARM Linux and Android are compiled and linted, and iOS, tvOS and
   visionOS are built against the NDI SDK for Apple 6.4; nothing runs on them.
-  See [SDK validation](docs/sdk-validation.md) and the
-  [platform support](docs/setup.md#supported-ndi-versions-and-platforms).
+  See [platform support](docs/setup.md#supported-ndi-versions-and-platforms)
+  and the [CI results](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml).
 - The bindings are generated from the NDI SDK 6.4.0.2 headers. A runtime that
   lacks a newer capability reports it unavailable, and the operations that need
   it return `Error::UnsupportedCapability`.
@@ -737,7 +737,7 @@ as `None`. Most programs need changes; see the
     multiple of four, which the SDK reads up to two rows past, gets two line
     strides more room.
 
-  See [SDK validation](docs/sdk-validation.md#reads-past-the-end-of-sent-video).
+  See [`PixelFormat::send_tail_room`](https://grantsparks.github.io/grafton-ndi/grafton_ndi/frames/enum.PixelFormat.html#method.send_tail_room).
 - A status or source change that an `AsyncReceiver` capture passed over was
   kept for `Receiver::poll_event`, which async code could not reach, so it was
   never read. `AsyncReceiver::poll_event` returns it.

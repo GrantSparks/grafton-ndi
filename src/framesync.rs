@@ -980,7 +980,8 @@ unsafe impl Send for FrameSync {}
 /// borrowed frames. Neither `Processing.NDI.FrameSync.h` nor the SDK
 /// documentation of NDI 6.1.1, 6.3.2 or 6.4 says whether that is safe (the
 /// one threading statement, in `Processing.NDI.Recv.h`, covers receiver
-/// capture), so this rests on measurement, recorded in docs/sdk-validation.md:
+/// capture). The safety argument relies on these native implementation
+/// observations and concurrent capture tests:
 ///
 /// - In the Linux x86_64 runtimes of all three versions, video capture, audio
 ///   capture (and with it the input-format query) and the video free take the

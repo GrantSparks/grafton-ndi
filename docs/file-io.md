@@ -122,8 +122,8 @@ no archived run log is available here to qualify their platform or frequency.
 Plan recording as a fallible operation, and isolate it in a worker process when
 a native crash must not end the service.
 Native calls can block inside the vendor library; wrapper timeouts cannot
-interrupt them. The [validation guide](sdk-validation.md) describes configured
-tests and the evidence needed for claims about a particular runtime.
+interrupt them. Test recording and recovery with your selected runtime,
+platform and storage.
 
 ## Threads and async code
 
@@ -159,6 +159,5 @@ leave an existing session running and which reports require recovery.
 
 ## Validation
 
-See [SDK validation](sdk-validation.md) for the test scope and
-[contributing](../CONTRIBUTING.md) for commands. For thumbnails, use the
+See [testing from source](../ci/README.md) for runtime checks. For thumbnails, use the
 [combined File/image example](image-encoding.md#thumbnails-from-a-recording).

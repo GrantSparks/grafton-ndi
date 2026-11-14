@@ -20,8 +20,8 @@ memory use.
 `retained_bytes()` for accounting and `release()` to discard it. Warm reuse
 removes scratch allocation churn; the full WebP image still occupies memory.
 Each concurrent worker needs its own workspace. Codec/output allocations
-remain separate. The [#140 report](benchmarks/issue-140/README.md) retains raw
-public-API measurements and their limitations.
+remain separate. Warm reuse changes allocation frequency, while the retained
+conversion image still contributes to the working set.
 
 Bound both active workers and pending requests. Run synchronous encoding on
 blocking workers when using an async executor. Downscaling can reduce the
@@ -58,14 +58,19 @@ See the [harness](../src/image/tests.rs) for its output selections and repetitio
 rules. Synthetic measurements demonstrate controls, rather than establish a
 production default.
 
-## Historical measurements
+## Compare workspace reuse
 
-The [archived report](https://github.com/GrantSparks/grafton-ndi/blob/9db3bf6a0305e1aa9c1da10288cbe6bc3c42f298/docs/image-encoding-performance.md)
-preserves earlier single-encode tables and the dated downstream snapshot and
-effort experiments. Their inputs and measurement boundaries differ. The
-[snapshot CSV](https://github.com/GrantSparks/grafton-ndi/blob/9db3bf6a0305e1aa9c1da10288cbe6bc3c42f298/docs/benchmarks/image-formats-2026-11-13.csv)
-and [effort CSV](https://github.com/GrantSparks/grafton-ndi/blob/9db3bf6a0305e1aa9c1da10288cbe6bc3c42f298/docs/benchmarks/image-effort-2026-11-13.csv)
-are retained evidence for those experiments. The report's original timing and
-memory tables have no accompanying raw results in this checkout, and its
-downstream harness is not included. Treat those observations as historical,
-with their stated scope, rather than current performance guarantees.
+The workspace measurement compares cold and warm conversion storage for PNG,
+lossless WebP, downscaled WebP and lossy WebP at 1080p and 4K:
+
+```sh
+cargo test --release --locked --lib --features image-encoding \
+  workspace_resources -- --ignored --nocapture
+```
+
+It reports allocation counts, output size, retained scratch and elapsed time.
+Peak newly allocated thread heap excludes buffers retained before tracking;
+account for those retained bytes when comparing total memory. Linux process
+RSS includes the entire test process and allocator retention, so it may remain
+unchanged even when an encode allocates less scratch. Use representative inputs
+and a bounded workload before choosing application settings.

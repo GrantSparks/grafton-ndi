@@ -19,9 +19,9 @@ license entitlement.
 ## SDK limitations
 
 Native behavior needs validation with the runtime, platform and network you
-deploy. The [SDK validation guide](sdk-validation.md) distinguishes configured
-tests from recorded observations. Older incident reports do not establish that
-a different runtime is safe.
+deploy. Use [runtime checks](../ci/README.md#test-against-an-installed-runtime)
+with your installation. Older incident reports do not establish that a different
+runtime is safe.
 
 ## Discovery Server
 

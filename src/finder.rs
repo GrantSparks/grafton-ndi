@@ -1526,59 +1526,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "manual owned-source cache hit contention; no native discovery"]
-    fn cache_hit_resources() {
-        use std::time::Instant;
-        for count in [1, 128, 4096] {
-            for lanes in [1, 8] {
-                for sample in 0..3 {
-                    for old_lock in [true, false] {
-                        let cache = CachedSources::default();
-                        let sources = (0..count)
-                            .map(|n| {
-                                Source::new(format!("camera (Program {n:04} {})", "x".repeat(128)))
-                            })
-                            .collect();
-                        cache
-                            .sources_by_host_with("camera", Duration::ZERO, |_| Ok(sources))
-                            .unwrap();
-                        let gate = std::sync::Barrier::new(lanes);
-                        std::thread::scope(|scope| {
-                            for lane in 0..lanes {
-                                let (cache, gate) = (&cache, &gate);
-                                scope.spawn(move || {
-                                    gate.wait();
-                                    let start = Instant::now();
-                                    for _ in 0..100 {
-                                        let sources = if old_lock {
-                                            let cache = cache.cache.lock().unwrap();
-                                            copy_sources(cache.entries.get("camera").unwrap())
-                                                .unwrap()
-                                        } else {
-                                            cache
-                                                .sources_by_host_with(
-                                                    "camera",
-                                                    Duration::ZERO,
-                                                    |_| panic!("cache hit must not discover"),
-                                                )
-                                                .unwrap()
-                                        };
-                                        std::hint::black_box(sources);
-                                    }
-                                    eprintln!(
-                                        "cache,{old_lock},{count},{lanes},{sample},{lane},{:.6}",
-                                        start.elapsed().as_secs_f64() * 1000.0
-                                    );
-                                });
-                            }
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
     fn cache_descriptor_copies_release_the_global_mutex_and_recheck_publication() {
         let cache = CachedSources::default();
         let sources = vec![Source::new("camera (Program)")];

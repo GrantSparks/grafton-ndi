@@ -129,9 +129,9 @@ The crate targets NDI 6 Standard and Advanced runtimes. Checked-in core bindings
 come from the 6.4.0.2 headers. CI is configured for Standard 6.1.1 and Standard
 and Advanced 6.3.2/6.4.0.2, with the target coverage below. Other NDI releases
 have no configured runtime coverage; NDI 5 and earlier are outside the support
-policy. This is a coverage description, not a record of successful runs. See
-[SDK validation](sdk-validation.md) for evidence requirements and
-[CI configuration](../ci/README.md) for the exact package/job matrix.
+policy. This is a coverage description, not a record of successful runs. See the
+[CI workflow](../.github/workflows/rust.yml) for the exact package/job matrix and [GitHub Actions](https://github.com/GrantSparks/grafton-ndi/actions/workflows/rust.yml)
+for execution results.
 
 ### NDI versions
 

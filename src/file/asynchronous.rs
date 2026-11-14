@@ -33,9 +33,6 @@ use std::{
 /// How long the owner thread waits for a command between event pumps.
 const TICK: Duration = Duration::from_millis(10);
 
-#[cfg(all(test, target_os = "linux"))]
-mod performance;
-
 /// The largest command or event queue an owner may be given.
 const MAX_CAPACITY: usize = 4096;
 
@@ -1732,41 +1729,6 @@ mod tests {
         fail: bool,
     }
 
-    #[test]
-    #[ignore = "manual fake-owner event burst throughput; no native File runtime"]
-    fn file_event_burst_resources() {
-        for sample in 0..5 {
-            for old_wait in [true, false] {
-                let mut owner = BurstOwner {
-                    remaining: 1600,
-                    polls: 0,
-                    fail: false,
-                };
-                let control = Control::new();
-                let events = EventQueue::new(16);
-                let start = Instant::now();
-                let mut last_burst = Duration::ZERO;
-                let mut waits = 0;
-                run_owner_wait(&mut owner, &control, &events, |wait| {
-                    if wait {
-                        return Err(RecvTimeoutError::Disconnected);
-                    }
-                    last_burst = start.elapsed();
-                    if old_wait {
-                        waits += 1;
-                        thread::sleep(TICK);
-                    }
-                    Err(RecvTimeoutError::Timeout)
-                });
-                assert_eq!(owner.polls, 1601);
-                assert_eq!(lock(&events.0).dropped, 1584);
-                eprintln!(
-                    "burst,{old_wait},{sample},1600,{:.6},{waits}",
-                    last_burst.as_secs_f64() * 1000.0
-                );
-            }
-        }
-    }
     impl Owner for BurstOwner {
         type Event = usize;
         fn poll_native(&mut self) -> Result<Option<usize>> {

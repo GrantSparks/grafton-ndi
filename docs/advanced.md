@@ -225,6 +225,6 @@ See [`advanced_kvm`](../examples/advanced_kvm.rs).
 
 ## Validation
 
-[SDK validation](sdk-validation.md) describes configured tests and how to record
-runtime evidence. Compiling these APIs does not establish runtime capabilities,
-hardware interoperability or license entitlements.
+Use [runtime checks](../ci/README.md#test-against-an-installed-runtime) with
+your selected SDK and platform. Compiling these APIs does not establish runtime
+capabilities, hardware interoperability or license entitlements.

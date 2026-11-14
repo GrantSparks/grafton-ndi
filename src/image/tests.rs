@@ -2329,8 +2329,8 @@ fn workspace_resources() {
     }
 }
 
-/// Manual measurement of encoding time and peak memory, whose results
-/// `docs/image-encoding-performance.md` records:
+/// Measure image settings and resource use on local hardware;
+/// see `docs/image-encoding-performance.md` for interpretation:
 ///
 /// `cargo test --release --lib --features image-encoding image_encoding_resources -- --ignored --nocapture`
 ///

@@ -144,5 +144,5 @@ workflow with your media. See [File API requirements](file-io.md#requirements).
 
 ## Validation
 
-See [SDK validation](sdk-validation.md) for configured coverage and
+See [testing from source](../ci/README.md) for runtime checks and
 [performance guidance](image-encoding-performance.md) for the resource harness.

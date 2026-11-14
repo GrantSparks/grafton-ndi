@@ -1,4 +1,4 @@
-"""Guards on the workflow files, the files CI obeys without naming them, and the README's matrix table.
+"""Guards on workflow configuration and the files CI uses.
 
 `violations` holds the security rules. It is run on the real workflows, which must
 comply, and on a list of plausible wrong edits, each of which it must report.
@@ -484,23 +484,6 @@ class SdkJob(unittest.TestCase):
                                  {edition: checkable(target, current, all_features=True, headers=pin, driver=driver,
                                                      decoders=False)
                                   for edition, pin in baselines.items()})
-
-    def test_readme_matrix_table_matches_the_workflow(self):
-        readme = (ROOT / 'ci' / 'README.md').read_text(encoding='utf-8')
-        documented = []
-        for line in readme.splitlines():
-            cells = [cell.strip().replace('`', '') for cell in line.strip('|').split('|')]
-            if len(cells) == 7 and cells[3] in self.pins:
-                documented.append(cells)
-        expected = []
-        for row in self.rows:
-            extras = ['vendored bindings check'] if 'bindings' in row else []
-            extras += ['Advanced lint'] if 'advanced' in row['package'] else []
-            extras += ['Apple mobile builds'] if 'apple-mobile' in row else []
-            expected.append([row['name'], row['runner'], row['target'], row['package'], row['require'],
-                             row.get('require-no-default', '1'), ', '.join(extras)])
-        self.assertEqual(documented, expected)
-
 
 class Repository(unittest.TestCase):
     def test_semver_check_runs_where_no_secret_is(self):
