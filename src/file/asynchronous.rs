@@ -33,6 +33,9 @@ use std::{
 /// How long the owner thread waits for a command between event pumps.
 const TICK: Duration = Duration::from_millis(10);
 
+#[cfg(all(test, target_os = "linux"))]
+mod performance;
+
 /// The largest command or event queue an owner may be given.
 const MAX_CAPACITY: usize = 4096;
 

@@ -1,0 +1,61 @@
+   Compiling grafton-ndi v3.0.0 (/workspace/grafton-ndi)
+    Finished `release` profile [optimized] target(s) in 17.93s
+     Running unittests src/lib.rs (target/release/build/grafton-ndi/67c2640eb012bee4/out/grafton_ndi-67c2640eb012bee4)
+
+running 2 tests
+test file::asynchronous::performance::native_file_idle_resources ... runtime,NDI SDK LINUX 10:14:14 Nov  6 2026 6.4.0.2 Advanced,file=Some("/opt/gms-ndi-bootstrap-retry-735190532/sdk-store/artifacts/ndi-6.4.0.2-advanced-linux-5f2ee43a5a4d91b0367c25a26c1b85c547d2635e0ac2243faa312b06b1f6278d/unpacked/NDI Advanced SDK for Linux/lib/x86_64-linux-gnu/libndifile.so.6.4.0")
+file-idle,true,0,100,100,1000.234683,1.262812,0.126252
+file-idle,false,0,99,99,1000.114281,1.565068,0.156489
+file-idle,false,1,100,100,1000.141166,0.996082,0.099594
+file-idle,true,1,100,100,1000.174705,1.085236,0.108505
+file-idle,true,2,100,100,1000.120753,1.128350,0.112821
+file-idle,false,2,100,100,1000.256997,1.281555,0.128123
+file-idle,false,3,100,100,1000.165988,1.227358,0.122715
+file-idle,true,3,100,100,1000.168418,1.493335,0.149308
+file-idle,true,4,100,100,1000.189261,1.205000,0.120477
+file-idle,false,4,100,100,1000.162373,1.171550,0.117136
+ok
+test receiver::performance::native_notification_capture_resources ... runtime,NDI SDK LINUX 10:14:14 Nov  6 2026 6.4.0.2 Advanced
+notification,false,0,2,0,0,0.000000,0.014220,0.008386
+notification,true,0,2,0,2,20.000000,20.138216,20.133517
+notification,true,1,2,0,2,20.000000,20.139180,20.133767
+notification,false,1,2,0,0,0.000000,0.006254,0.003426
+notification,false,2,2,0,0,0.000000,0.014576,0.008568
+notification,true,2,2,0,2,20.000000,20.141459,20.134937
+notification,true,3,2,0,2,20.000000,20.142376,20.136100
+notification,false,3,2,0,0,0.000000,0.014087,0.008492
+notification,false,4,2,0,0,0.000000,0.009846,0.006351
+notification,true,4,2,0,2,20.000000,20.134631,20.131437
+notification,true,5,2,0,2,20.000000,20.124228,20.121343
+notification,false,5,2,0,0,0.000000,0.010133,0.006628
+notification,false,6,2,0,0,0.000000,0.004853,0.002951
+notification,true,6,2,0,2,20.000000,20.135512,20.131649
+notification,true,7,2,0,2,20.000000,20.132910,20.130781
+notification,false,7,2,0,0,0.000000,0.008434,0.006031
+notification,false,8,2,0,0,0.000000,0.011869,0.007517
+notification,true,8,2,0,2,20.000000,20.146208,20.138809
+notification,true,9,2,0,2,20.000000,20.136122,20.132019
+notification,false,9,2,0,0,0.000000,0.008321,0.005652
+notification,false,10,2,0,0,0.000000,0.008554,0.005687
+notification,true,10,2,0,2,20.000000,20.139714,20.132913
+notification,true,11,2,0,2,20.000000,20.159114,20.153345
+notification,false,11,2,0,0,0.000000,0.015375,0.007473
+notification,false,12,2,0,0,0.000000,0.015188,0.007416
+notification,true,12,2,0,2,20.000000,20.146761,20.139404
+notification,true,13,2,0,2,20.000000,20.136519,20.127095
+notification,false,13,2,0,0,0.000000,0.013681,0.008975
+notification,false,14,2,0,0,0.000000,0.025511,0.022274
+notification,true,14,2,0,2,20.000000,20.131236,20.128867
+notification,true,15,2,0,2,20.000000,20.136292,20.131326
+notification,false,15,2,0,0,0.000000,0.008374,0.004032
+notification,false,16,2,0,0,0.000000,0.010396,0.006778
+notification,true,16,2,0,2,20.000000,20.161612,20.153119
+notification,true,17,2,0,2,20.000000,20.138596,20.133141
+notification,false,17,2,0,0,0.000000,0.009556,0.006451
+notification,false,18,2,0,0,0.000000,0.008397,0.005730
+notification,true,18,2,0,2,20.000000,20.134901,20.131929
+notification,true,19,2,0,2,20.000000,20.132450,20.130159
+notification,false,19,2,0,0,0.000000,0.010350,0.006497
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 720 filtered out; finished in 13.91s

@@ -29,7 +29,7 @@ as `None`. Most programs need changes; see the
   with CPU capabilities. Existing capture deadlines, idle backoff, owned cache
   results and convenience image methods are preserved. See the
   [measurement report](docs/benchmarks/issue-140/README.md) for evidence and
-  remaining profiling/qualification gates.
+  final scope decisions and measurement limits.
 
 ### SDK and platform compatibility
 

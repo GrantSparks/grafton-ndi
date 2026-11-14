@@ -24,6 +24,9 @@
 //! # }
 //! ```
 
+#[cfg(test)]
+mod performance;
+
 use std::{
     ffi::CString,
     marker::PhantomData,

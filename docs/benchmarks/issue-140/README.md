@@ -6,30 +6,46 @@ owned-source cache critical sections, and reusable image conversion scratch.
 Existing borrowed/scoped captures, reusable owned copies and sender staging
 remain the preferred application paths.
 
-## Scope and remaining gates
+## Final scope and decisions
 
-| Area | Implemented behavior | Qualification boundary |
+The agreed disposition for #140 is to retain the implemented optimizations,
+complete the bounded validation below, and decline both optional API designs.
+No follow-up issues or deferred implementation obligations are created.
+
+| Area | Final decision | Evidence and limits |
 | --- | --- | --- |
-| JPEG SIMD | `jpeg-encoder` runtime AVX2 dispatch with portable fallback | Independent decoder, x86 AVX2 and emulated scalar tests; ARM64 compile |
-| JPEG input | Borrow full-size contiguous RGBA/RGBX/BGRA/BGRX; retain rows for padding, YUV and reductions | No full-image conversion buffer added; metadata/HDR validated first |
-| Capture | Retry eight notifications immediately, back off on the ninth or on an idle early return | Fake-clock storm/deadline tests and native notification/reconnect regressions; no native notification-to-frame latency claim |
-| File | Check commands without waiting after 16 events; wait after empty/error | Deterministic fairness/shutdown/error/drop tests and native File regressions; fake-owner burst throughput only |
-| Cache | Clone immutable snapshot handles while locked, copy descriptors after unlocking; prepare publications outside the mutex | Invalidation during copying/discovery, generation exhaustion and public input validation covered |
-| Workspace | Retain PNG row, WebP conversion image and 8/16-bit reduction sums; explicit capacity release | Warm conversion allocation tests, output/error recovery tests and public encode measurements |
-| Continuous async | Keep one-shot APIs; add dispatch and public audio baseline harnesses | No streaming API ships: representative loaded-pool, slow-consumer, memory/backpressure and worker-prototype comparison remains a gate |
+| JPEG SIMD | Keep runtime AVX2 dispatch and scalar fallback | Independent decoding, AVX2 and emulated fallback, compile/size measurements and cross-target lint; accept documented byte/pixel differences and code-size cost |
+| JPEG input | Keep direct contiguous RGBA/RGBX/BGRA/BGRX | Preserve metadata/HDR checks, initialized active data, padded/YUV/reduced row fallbacks and row memory bounds |
+| Capture | Keep bounded immediate notification retries | Deterministic contracts and native queued-notification latency comparisons on Standard 6.3.2 and Advanced 6.4.0.2 |
+| File | Keep nonblocking command checks after full bursts | Deterministic fairness/shutdown/drop tests, native correctness and idle owner-thread CPU comparison; no native backlog-throughput claim |
+| Cache | Keep shared internal snapshots and copies outside the mutex | Contention measurements and timeout/invalidation/resource-limit regressions; public results stay owned |
+| Workspace | Keep reusable conversion storage; implementation complete | Allocation, memory accounting, output and failure-recovery coverage; retained scratch does not reduce the complete working set |
+| Continuous async | Do not add a persistent-worker API under #140 | Measured dispatch cost does not establish a benefit sufficient to justify additional backpressure, cancellation, shutdown and resource-management complexity |
 
-Miss coalescing is deliberately separate from the cache critical-section change.
-Two calls with different start times require different complete observation
-windows, even with equal timeout durations. This series does not elect leaders
-or change those windows. A shared-window API or a demonstrably compatible
-request identity needs its own design and validation. Existing independent
-misses retain their failure, panic and cancellation behavior.
+Miss coalescing is rejected for the existing API. Callers starting at different
+times require different complete discovery windows, even with equal timeout
+values. No measured duplicate-miss benefit justifies changing those semantics,
+adding coordination, or introducing a shared-window API. Independent misses
+retain their existing failure, panic and cancellation behavior. No leader or
+follower state is introduced, so its proposed cleanup tests do not apply.
 
-These changes do not close the issue's platform/native/performance qualification
-checklist. In particular, synthetic fixtures and one host do not establish
-release speedups, native File backlog rates, production discovery throughput,
-or streaming-worker benefits. No codec defaults other than enabling runtime
-JPEG SIMD changed; WebP effort and SharpYUV defaults remain unchanged.
+The continuous async investigation is concluded with a decision against adding
+the API. The 9–11 us dispatch measurement is not proof that a persistent worker
+could never help. It is insufficient evidence for adding that public lifecycle
+and queueing surface. The existing one-shot/scoped APIs and their cancellation
+contracts remain the supported choice; no worker prototype is required for an
+API that is not selected to ship.
+
+Performance claims are restricted to the recorded workloads. We do not assert
+production discovery throughput, native File backlog throughput, a reduction
+in total workspace memory, or end-to-end NDI/JPEG speedups. WebP effort and
+SharpYUV defaults remain unchanged. A broader production-performance campaign
+is not part of this issue's final scope.
+
+Closure requires the published implementation's existing `required-ci` check
+to pass, including the configured native SDK and platform jobs. The issue's
+resolution records the exact commit and CI run. Local cross-compilation is
+reported separately from actual Windows, Apple and ARM native execution.
 
 ## Reproduction environment
 
@@ -141,8 +157,8 @@ after full bursts fell from 100 to zero. Both paths drop 1584 notifications in
 the intentionally tiny 16-entry consumer queue. This measures the artificial
 wait alone, with cheap fake events. Deterministic tests verify that idle/error
 paths request a timed wait, commands run between bursts, and shutdown is
-serviced after at most one burst. Native event rates and idle CPU need separate
-qualification.
+serviced after at most one burst. Native event rates are not inferred from this
+fixture. The native idle-CPU comparison below completes the idle check.
 
 The dispatch harness measures the existing cancellation gate and blocking-pool
 round trip (no SDK), 10 warmups then 100 samples per lane, with 1/8 callers,
@@ -160,6 +176,76 @@ without callback work; p99 was 79–150 us. With callback work, p50 was 100–14
 and p99 123–190 us. No hard latency assertion or continuous-worker benefit is
 inferred. This is a small loopback baseline, not a loaded-pool, retention,
 shutdown or overload qualification; it does not count dropped audio or RSS.
+These limitations support the decision not to add a continuous-worker API;
+they are not promises of later work under #140.
+
+## Native retry latency and File idle CPU
+
+The new ignored harnesses live in `src/receiver/performance.rs` and
+`src/file/asynchronous/performance.rs`. `completion-environment.txt` records
+the starting commit, toolchain, kernel and exact harness SHA-256 identities. Run through the loopback-only runner,
+selecting each SDK/runtime before the command:
+
+```sh
+GRAFTON_NDI_REQUIRE_RUNTIME=1 cargo test --release --locked --lib \
+  --config ci/offline.toml native_notification_capture_resources -- \
+  --ignored --nocapture --test-threads=1
+
+GRAFTON_NDI_REQUIRE_RUNTIME=advanced,file cargo test --release --locked \
+  --all-features --lib --config ci/offline.toml native_ -- \
+  --ignored --nocapture --test-threads=1
+```
+
+For the first command, `NDI_SDK_DIR` and `NDI_RUNTIME_DIR_V6` select the installed
+Standard 6.3.2 SDK. For the second, they select Advanced 6.4.0.2 and its x86-64
+library directory. The loaded runtime version/edition and File path are printed
+in `native-notification-standard.txt` and `native-policy-advanced.txt`.
+
+The capture harness continuously submits initialized black 640×360 video at an
+8 ms cadence, creates a fresh receiver, observes connection without consuming
+notifications, and lets native video queue for 50 ms. Setup/discovery/queue fill
+are outside timing. It alternates old/new policy order over three warmup pairs
+and twenty measured pairs. The previous notification policy is reproduced by
+mapping real typed `Progress` results back to `Idle` in the same deadline kernel;
+this isolates the changed retry decision with the same native SDK, locks,
+frame validation and frees. It is a policy comparison, not a checkout-to-checkout
+comparison of the complete library or a network-arrival benchmark.
+
+Every measured capture observed two real notifications, zero idle results and
+one valid frame. Notifications were retained for event consumers. Before, each
+notification requested a 10 ms pause (20 ms total); after, neither requested a
+pause. From the first observed notification to validated frame delivery:
+
+| Runtime | Previous median | New median | Previous p95 | New p95 |
+| --- | ---: | ---: | ---: | ---: |
+| Standard 6.3.2 | 20.128310 ms | 0.006924 ms | 20.142664 ms | 0.007999 ms |
+| Advanced 6.4.0.2 | 20.132466 ms | 0.006563 ms | 20.153345 ms | 0.022274 ms |
+
+These figures concern notifications followed by already queued media. They
+are not a steady-state penalty or a guarantee of single-digit-microsecond
+transport latency. Raw `notification` columns are previous-policy flag,
+sample, notification count, idle count, pause count, requested pause ms,
+whole-capture ms and notification-to-frame ms. Quantiles use the sorted sample
+at floor(q × n), capped at n−1; medians average the two central samples.
+
+The File harness creates, uses and destroys an unstarted native recorder on
+one thread, without opening output files. It compares the actual current
+owner loop with the retained pre-`a017d01` loop. Each run warms ten native polls
+then measures one second while another thread eventually disconnects the
+command channel. Five paired rounds alternate order. Linux
+`CLOCK_THREAD_CPUTIME_ID` measures only the owner thread, excluding SDK background
+threads, source creation and destruction. All measured polls returned empty;
+there were no events or errors. Both policies made 99–100 polls per second.
+
+Median owner CPU was 1.205 ms/s before and 1.227358 ms/s after, or 0.120477%
+and 0.122715% of one core. Ranges overlapped: 1.085236–1.493335 ms before and
+0.996082–1.565068 ms after. The median difference is about 22 us per second
+(0.00224 percentage points of a core), within the observed run variation.
+Together with unchanged timed idle waits and deterministic backoff tests,
+this shows no busy-spin or material idle-CPU increase in this workload; it
+does not claim identical CPU use or measure native backlog throughput.
+Raw `file-idle` columns are previous-policy flag, round, polls, empty results,
+wall ms, owner CPU ms and percentage of one core.
 
 ## Workspace memory
 
@@ -207,7 +293,13 @@ different images, writer failure, invalid options and release/reuse.
   combinations also run by the repository's commit hooks.
 - Rust 1.88: all-feature library checks on x86-64 and ARM64. Its preexisting
   `RuntimeFeature::is_ungated` dead-code warning remains; stable Clippy is clean.
-- ARM64 was compiled only. Windows/Apple and oldest Advanced headers were not
-  exercised in this implementation session. Runtime SIMD fallback was emulated.
+- Completion checks: warnings-denied all-target/all-feature Clippy passed for
+  Linux ARM64, ARMv7 and x86; Android ARM64, ARMv7, x86 and x86-64; Windows MSVC
+  x86/x86-64; Apple Darwin ARM64/x86-64. `cross-completion.txt` retains commands
+  and results. These are compile/lint checks, not native execution.
+- Rust 1.88 workspace/all-target/all-feature checks passed, including the new
+  measurement harnesses. Runtime SIMD fallback remains explicitly emulated.
+  Actual non-host platform/runtime results come from the existing CI matrix,
+  required to pass before issue closure.
 - New public workspace API is covered by a compile-pass trait-object fixture,
   runnable rustdoc and image tests. Existing ownership/cancellation gates remain.
