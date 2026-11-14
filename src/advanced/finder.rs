@@ -9,10 +9,7 @@ use crate::{
 };
 
 #[cfg(any(test, ndi_has_advanced_source_metadata))]
-use crate::{
-    finder::{snapshot_entry, SnapshotBudget},
-    sys::bindings::*,
-};
+use crate::finder::{decode_source, SnapshotBudget};
 
 /// A discovered source together with the metadata it advertises.
 ///
@@ -59,13 +56,10 @@ unsafe fn extended_source(
     metadata: *const c_char,
     budget: &mut SnapshotBudget,
 ) -> Result<Option<ExtendedSource>> {
-    let mut descriptor = NDIlib_source_t {
-        p_ndi_name: name,
-        ..Default::default()
-    };
-    descriptor.__bindgen_anon_1.p_url_address = address;
-    // SAFETY: the descriptor points to the caller's readable strings.
-    let Some(source) = (unsafe { snapshot_entry(&descriptor, budget)? }) else {
+    // SAFETY: the caller keeps the strings readable while the snapshot policy
+    // copies them, omitting malformed entries without losing their scan charges.
+    let Some(source) = (unsafe { decode_source(name, address, |pointer| budget.text(pointer))? })
+    else {
         return Ok(None);
     };
     let metadata = if metadata.is_null() {
@@ -155,11 +149,12 @@ mod tests {
         // Neither a name nor an address: there is nothing to connect to.
         assert!(copy(None, None, Some(invalid_utf8)).is_none());
 
-        // A name or metadata whose terminator lies past the string limit.
+        // A name, address or metadata whose terminator lies past the string limit.
         let mut too_long = vec![b'x'; MAX_SDK_STRING_BYTES + 1];
         too_long[MAX_SDK_STRING_BYTES] = 0;
         let too_long = CStr::from_bytes_with_nul(&too_long).unwrap();
         assert!(copy(Some(too_long), Some(address), None).is_none());
+        assert!(copy(Some(name), Some(too_long), None).is_none());
         assert!(copy(Some(name), Some(address), Some(too_long)).is_none());
     }
 }
